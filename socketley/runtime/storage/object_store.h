@@ -6,7 +6,8 @@
 // and never as a loop that stopped serving its other connections.
 //
 // ─── LAYOUT ─────────────────────────────────────────────────────────────────
-//   <dir>/<bucket>/created            decimal milliseconds since the epoch
+//   <dir>/<bucket>/created            decimal milliseconds since the epoch, and on a second line the
+//                                     id of the user that owns the bucket when it is not the default
 //   <dir>/<bucket>/cors               the bucket's CORSConfiguration, when it has one, written by shard 0
 //   <dir>/<bucket>/encryption         its ServerSideEncryptionConfiguration, likewise
 //   <dir>/<bucket>/index.<shard>      the journal of puts and deletes
@@ -123,6 +124,8 @@ struct bucket_info
 {
     std::string name;
     int64_t     created_ms{0};
+    // Empty for the default owner.
+    std::string owner;
 };
 
 struct list_query
@@ -550,13 +553,16 @@ public:
     // ── Buckets ─────────────────────────────────────────────────────────────
     bool has_bucket(std::string_view name) const;
     std::vector<bucket_info> buckets() const;
-    void create_bucket(std::string name, std::function<void(st)> cb);
+    // `owner` is the id of the user that made it, empty for the default owner.
+    void create_bucket(std::string name, std::string owner, std::function<void(st)> cb);
     void delete_bucket(std::string name, std::function<void(st)> cb);
+    // The id of the user that owns a bucket, empty for the default owner or a bucket that is not here.
+    std::string_view bucket_owner(std::string_view name) const;
 
     // The halves of a bucket's life that a sharded runtime runs on more than
     // one shard: the others take up a bucket shard 0 made, and drop one in
     // three steps so that no shard is left holding a directory that moved.
-    void adopt_bucket(std::string name, int64_t created_ms, std::function<void(st)> cb);
+    void adopt_bucket(std::string name, int64_t created_ms, std::string owner, std::function<void(st)> cb);
     int64_t bucket_created_ms(std::string_view name) const;
     // Refuses a bucket that holds objects or work, and otherwise stops it
     // taking any until it is dropped or the drop is aborted.
@@ -838,6 +844,7 @@ private:
         // Tells this bucket from one made again under its name.
         uint64_t    gen{++s_bucket_gen};
         int64_t     created_ms{0};
+        std::string owner;
         int         dir_fd{-1};
         int         data_fd{-1};
         int         tmp_fd{-1};
@@ -1004,7 +1011,7 @@ private:
     // What a quota lets this shard hold: an equal share, since the shards
     // cannot see each other's bytes.
     uint64_t quota() const;
-    void create_bucket_impl(std::string name, bool adopt, int64_t created_ms,
+    void create_bucket_impl(std::string name, bool adopt, int64_t created_ms, std::string owner,
                             std::function<void(st)> cb);
     void forget_bucket(const std::string& name);
 

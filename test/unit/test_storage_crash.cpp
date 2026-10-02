@@ -254,7 +254,7 @@ void put_run::step()
     if (!e.store->has_bucket(bucket))
     {
         bool done = false;
-        e.store->create_bucket(bucket, [&](st) { done = true; });
+        e.store->create_bucket(bucket, {}, [&](st) { done = true; });
         while (!done)
             e.loop.poll_completions(1);
     }

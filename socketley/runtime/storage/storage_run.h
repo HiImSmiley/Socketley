@@ -26,6 +26,7 @@
 #include "object_store.h"
 #include "post_policy.h"
 #include "s3_auth.h"
+#include "s3_users.h"
 #include "../../shared/storage_rpc.h"
 #include "shard_node.h"
 #include "storage_transport.h"
@@ -352,6 +353,8 @@ struct conn
     std::string peer;
     // Who the authenticator said made the request, for the script.
     std::string principal;
+    // The user its key signs for, null for a request with no credentials.
+    std::shared_ptr<const user_identity> user;
     // The CORS header lines every answer to this request carries, empty unless a rule allows its origin.
     std::string cors_head;
     // The peer's address as a policy condition compares it, read the first time one does.
@@ -593,8 +596,8 @@ public:
     void op_create_bucket(const std::shared_ptr<conn>& c);
     void op_delete_bucket(const std::shared_ptr<conn>& c);
     void op_head_bucket(const std::shared_ptr<conn>& c);
-    // False with `err` S3's refusal when a write asks for an ACL other than its owner's full control.
-    bool acl_headers_ok(const s3_request& r, bool bucket, s3_error& err) const;
+    // False with `err` S3's refusal when a write asks for an ACL other than full control for `owner`.
+    bool acl_headers_ok(const s3_request& r, bool bucket, std::string_view owner, s3_error& err) const;
     // False with `err` when a write asks for a storage class S3 does not have.
     static bool storage_class_ok(const s3_request& r, s3_error& err);
     void op_get_acl(const std::shared_ptr<conn>& c);
@@ -613,10 +616,27 @@ public:
     void op_get_policy(const std::shared_ptr<conn>& c);
     void op_delete_policy(const std::shared_ptr<conn>& c);
     void op_get_policy_status(const std::shared_ptr<conn>& c);
-    // Judges an authenticated or anonymous request by the policies of the buckets it touches, changing `v`.
+    // Whether a request by `user` (null for none) is judged by more than its signature: a bucket has a policy, or
+    // the user is not an admin free of an identity policy.
+    bool needs_judging(const user_identity* user) const
+    {
+        return m_store.any_policy() || (user && !user->unrestricted());
+    }
+    // Judges an authenticated or anonymous request by ownership and the policies of the buckets it touches,
+    // changing `v`.
     void apply_policy(const std::shared_ptr<conn>& c, const request_view& rv, auth_verdict& v);
-    // What the policy of `bucket` says to `q` from this connection, none when the bucket has none that could apply.
-    policy_effect policy_effect_of(const std::shared_ptr<conn>& c, std::string_view bucket, const policy_request& q);
+    // What ownership and every policy say to `q` by `user` (null for no credentials) on `bucket`: deny when a Deny
+    // matches, allow when the user owns the bucket, is an admin or is let by a policy, and none otherwise.
+    policy_effect access_of(const std::shared_ptr<conn>& c, std::string_view bucket, const policy_request& q,
+                            const user_identity* user);
+    // The id of the user that owns `bucket`, the default owner for one that names none.
+    std::string_view owner_of(std::string_view bucket) const
+    {
+        const std::string_view o = m_store.bucket_owner(bucket);
+        return o.empty() ? default_owner : o;
+    }
+    // The display name an Owner element gives user `id`.
+    std::string display_of(std::string_view id) const { return m_auth->display_name(id); }
     // Whether this request's policies let it remove version `version_id`'s key, which DeleteObjects names only in its body.
     bool policy_allows_version_delete(const std::shared_ptr<conn>& c, std::string_view key);
     // Whether the bucket's policy lets this request do `action` to `key` as well as what it was judged for.
@@ -758,8 +778,6 @@ public:
     void op_delete_object_tagging(const std::shared_ptr<conn>& c);
     bool object_meta_from_headers(const std::shared_ptr<conn>& c, object_meta& m, s3_error& err);
     void new_request_id(std::string& id);
-
-    std::string owner_id() const { return "socketley"; }
 
     storage_instance& owner() { return m_owner; }
 

@@ -109,7 +109,7 @@ struct rig : io_handler
     {
         st got = st::io_error;
         bool fired = false;
-        store->create_bucket(name, [&](st s) { got = s; fired = true; });
+        store->create_bucket(name, {}, [&](st s) { got = s; fired = true; });
         REQUIRE(until([&] { return fired; }));
         return got;
     }
@@ -1926,7 +1926,7 @@ std::string reference_list_xml(const list_render& r, const list_page& p)
              std::to_string(e.meta.size) + "</Size>";
         if (!r.v2 || r.fetch_owner)
             x += "<Owner><ID>" + reference_escape(r.owner_id) + "</ID><DisplayName>" +
-                 reference_escape(r.owner_id) + "</DisplayName></Owner>";
+                 reference_escape(r.owner_name) + "</DisplayName></Owner>";
         x += "<StorageClass>STANDARD</StorageClass></Contents>";
     }
     for (const std::string& c : p.prefixes)
@@ -1992,6 +1992,7 @@ TEST_CASE("a listing built in place is the listing built by joining pieces, for 
         r.fetch_owner        = next() % 2;
         r.v2                 = next() % 2;
         r.owner_id           = next() % 2 ? "socketley" : "o<w&ner";
+        r.owner_name         = next() % 2 ? "M. Tester" : "dis<p&lay";
 
         const std::string want = reference_list_xml(r, page), got = list_xml(r, page);
         if (want != got && ++bad <= 2)
@@ -2050,6 +2051,7 @@ TEST_CASE("a listing rendered while the index is walked is the listing rendered 
                             lr.url_encode_keys = encode;
                             lr.v2              = v2;
                             lr.owner_id        = "socketley";
+                            lr.owner_name      = "socketley";
 
                             list_xml_writer walk(lr);
                             REQUIRE(r.store->list_walk("bkt", q, walk) == st::ok);

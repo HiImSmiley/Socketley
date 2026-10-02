@@ -1494,6 +1494,7 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->trickle  = false;
     c->pace_due = false;
     c->principal.clear();
+    c->user.reset();
     c->anonymous       = false;
     c->policy_admitted = false;
     c->cors_head.clear();

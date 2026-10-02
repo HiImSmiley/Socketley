@@ -263,7 +263,7 @@ struct cluster : shard_transport
     {
         st got = st::io_error;
         bool fired = false;
-        m[s]->node->create_bucket(name, [&](st r) { got = r; fired = true; });
+        m[s]->node->create_bucket(name, {}, [&](st r) { got = r; fired = true; });
         REQUIRE(until([&] { return fired; }));
         return got;
     }

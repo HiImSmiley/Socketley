@@ -219,9 +219,10 @@ inline std::string error_xml(const s3_error& e, const error_context& c)
 inline std::string quoted_etag(const object_meta& m) { return "&quot;" + m.etag() + "&quot;"; }
 
 // The ACL of every bucket and object, which S3 gives each when ObjectOwnership is BucketOwnerEnforced.
-inline std::string owner_acl_xml(std::string_view owner)
+inline std::string owner_acl_xml(std::string_view owner, std::string_view display_name)
 {
-    const std::string id = "<ID>" + xml_escape(owner) + "</ID><DisplayName>" + xml_escape(owner) + "</DisplayName>";
+    const std::string id =
+        "<ID>" + xml_escape(owner) + "</ID><DisplayName>" + xml_escape(display_name) + "</DisplayName>";
     return std::string(xml_decl) + "<AccessControlPolicy xmlns=\"" + std::string(s3_xmlns) + "\"><Owner>" + id +
            "</Owner><AccessControlList><Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" "
            "xsi:type=\"CanonicalUser\">" + id + "</Grantee><Permission>FULL_CONTROL</Permission></Grant>"
@@ -289,7 +290,9 @@ struct list_render
     bool             url_encode_keys{false};
     bool             fetch_owner{false};
     bool             v2{true};
-    std::string_view owner_id;
+    // Held here, since a listing that crosses shards outlives the bucket's own copy.
+    std::string      owner_id;
+    std::string      owner_name;
 };
 
 // The digits of a number appended without a temporary string.
@@ -406,7 +409,7 @@ inline void list_xml_object(std::string& x, const list_render& r, const std::str
         x += "<Owner><ID>";
         xml_escape_to(x, r.owner_id);
         x += "</ID><DisplayName>";
-        xml_escape_to(x, r.owner_id);
+        xml_escape_to(x, r.owner_name);
         x += "</DisplayName></Owner><StorageClass>STANDARD</StorageClass></Contents>";
         return;
     }
@@ -427,7 +430,7 @@ inline std::string list_xml(const list_render& r, const list_page& p)
     size_t room = 1024 + r.prefix.size() + r.marker.size() + r.next_marker.size() + r.start_after.size() +
                   r.continuation_token.size() + r.next_token.size() + r.delimiter.size();
     for (const list_entry& e : p.objects)
-        room += e.key.size() + 240 + (r.v2 && !r.fetch_owner ? 0 : 110 + 2 * r.owner_id.size());
+        room += e.key.size() + 240 + (r.v2 && !r.fetch_owner ? 0 : 110 + r.owner_id.size() + r.owner_name.size());
     for (const std::string& c : p.prefixes)
         room += c.size() + 48;
     std::string x;

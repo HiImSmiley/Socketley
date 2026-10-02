@@ -12,30 +12,50 @@
 #include <vector>
 
 #include "s3_auth.h"
+#include "s3_users.h"
 #include "../../shared/s3_sigv4.h"
 
 namespace socketley::storage
 {
 
-// The access keys the runtime accepts, and the secret of each.
+// The access keys the runtime accepts, the secret of each and the user it signs for.
 class credential_set
 {
 public:
-    // False with `err` for a key or secret that cannot be used.
-    bool add(std::string_view access_key, std::string_view secret, std::string& err);
+    // False with `err` for a key or secret that cannot be used; a null `user` is the default owner, an admin.
+    bool add(std::string_view access_key, std::string_view secret, std::string& err,
+             std::shared_ptr<const user_identity> user = nullptr);
+    // False with `err` for a second user of the same id.
+    bool add_user(std::shared_ptr<const user_identity> user, std::string& err);
 
     // Empty for an access key that is not here.
     std::string_view secret(std::string_view access_key) const;
+    // The user of an access key that is here.
+    std::shared_ptr<const user_identity> user_of(std::string_view access_key) const;
+    // The user of that id a section declared, null for none.
+    const user_identity* find_user(std::string_view id) const;
 
     size_t size() const { return m_map.size(); }
+    size_t user_count() const { return m_users.size(); }
 
 private:
-    std::map<std::string, std::string, std::less<>> m_map;
+    struct entry
+    {
+        std::string secret;
+        std::shared_ptr<const user_identity> user;
+    };
+    std::map<std::string, entry, std::less<>> m_map;
+    std::map<std::string, std::shared_ptr<const user_identity>, std::less<>> m_users;
 };
 
 // One `access:secret` per line; blank lines and lines starting with '#' are
 // skipped, and the secret is everything after the first ':' so it may hold one.
-bool parse_credentials(std::string_view text, credential_set& out, std::string& err);
+// A line `[id]` begins a user, whose `name = ...`, `admin = true|false` and
+// `policy = <inline JSON or a file>` lines and keys follow it; a key before any
+// user is the default owner's.  A relative policy file is under `dir`, and every
+// file read is added to `files`.
+bool parse_credentials(std::string_view text, credential_set& out, std::string& err, std::string_view dir = {},
+                       std::vector<std::string>* files = nullptr);
 
 struct sigv4_config
 {
@@ -64,6 +84,7 @@ public:
     auth_verdict authorize_post(const post_signature& sig) override;
 
     size_t credential_count() const { return m_creds.size(); }
+    std::string display_name(std::string_view id) const override;
 
 private:
     // Re-reads the file when it has changed, at most once a second.  A file
@@ -83,6 +104,15 @@ private:
     uint64_t m_stamp_size{0};
     uint64_t m_stamp_ino{0};
     bool m_have_stamp{false};
+    // The policy files the users name, by what each looked like when it was read.
+    struct file_stamp
+    {
+        std::string path;
+        int64_t     mtime_ns{0};
+        uint64_t    size{0};
+        uint64_t    ino{0};
+    };
+    std::vector<file_stamp> m_policy_stamps;
 };
 
 // The hook for a body that is aws-chunked with no signature, which a request

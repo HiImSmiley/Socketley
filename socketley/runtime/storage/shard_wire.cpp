@@ -278,23 +278,27 @@ bool decode_list(std::string_view payload, std::string& bucket, list_query& q)
     return true;
 }
 
-std::string encode_bucket(op o, std::string_view bucket, int64_t created_ms)
+std::string encode_bucket(op o, std::string_view bucket, int64_t created_ms, std::string_view owner)
 {
     bytes::writer w = begin(o);
     w.bytes(bucket);
     w.u64(static_cast<uint64_t>(created_ms));
+    w.bytes(owner);
     return w.take();
 }
 
-bool decode_bucket(std::string_view payload, std::string& bucket, int64_t& created_ms)
+bool decode_bucket(std::string_view payload, std::string& bucket, int64_t& created_ms, std::string* owner)
 {
     bytes::reader r(payload);
     uint32_t m = 0;
     uint8_t  o = 0;
     uint64_t ms = 0;
-    if (!r.u32(m) || m != magic || !r.u8(o) || !r.bytes(bucket, name_cap) || !r.u64(ms))
+    std::string who;
+    if (!r.u32(m) || m != magic || !r.u8(o) || !r.bytes(bucket, name_cap) || !r.u64(ms) || !r.bytes(who, name_cap))
         return false;
     created_ms = static_cast<int64_t>(ms);
+    if (owner)
+        *owner = std::move(who);
     return true;
 }
 
@@ -315,11 +319,12 @@ std::string encode_removed(const remove_result& r)
     return w.take();
 }
 
-std::string encode_created(st s, int64_t created_ms)
+std::string encode_created(st s, int64_t created_ms, std::string_view owner)
 {
     bytes::writer w;
     w.u8(static_cast<uint8_t>(s));
     w.u64(static_cast<uint64_t>(created_ms));
+    w.bytes(owner);
     return w.take();
 }
 
@@ -336,13 +341,16 @@ bool decode_removed(std::string_view reply, remove_result& out)
     return status_byte(r, out.status) && r.flag(out.existed) && r.flag(out.marker) && r.bytes(out.version_id, 256);
 }
 
-bool decode_created(std::string_view reply, st& s, int64_t& created_ms)
+bool decode_created(std::string_view reply, st& s, int64_t& created_ms, std::string* owner)
 {
     bytes::reader r(reply);
     uint64_t ms = 0;
-    if (!status_byte(r, s) || !r.u64(ms))
+    std::string who;
+    if (!status_byte(r, s) || !r.u64(ms) || !r.bytes(who, name_cap))
         return false;
     created_ms = static_cast<int64_t>(ms);
+    if (owner)
+        *owner = std::move(who);
     return true;
 }
 

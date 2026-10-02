@@ -26,6 +26,8 @@ struct versions_render
     std::string_view version_marker;
     size_t           max_keys{1000};
     bool             url_encode{false};
+    std::string      owner_id;
+    std::string      owner_name;
 };
 
 void text(std::string& x, const versions_render& r, std::string_view s)
@@ -107,7 +109,11 @@ std::string versions_xml(const versions_render& r, const version_page& p)
             append_number(x, it.meta.size);
             x += "</Size><StorageClass>STANDARD</StorageClass>";
         }
-        x += "<Owner><ID>socketley</ID><DisplayName>socketley</DisplayName></Owner>";
+        x += "<Owner><ID>";
+        xml_escape_to(x, r.owner_id);
+        x += "</ID><DisplayName>";
+        xml_escape_to(x, r.owner_name);
+        x += "</DisplayName></Owner>";
         x += marker ? "</DeleteMarker>" : "</Version>";
     }
     x += "</ListVersionsResult>";
@@ -283,6 +289,8 @@ void storage_run::op_list_versions(const std::shared_ptr<conn>& c)
     vr.version_marker = q.get_query("version-id-marker");
     vr.max_keys       = vq.max_keys;
     vr.url_encode     = url;
+    vr.owner_id       = std::string(owner_of(q.bucket));
+    vr.owner_name     = display_of(vr.owner_id);
     // The views are into the request, which the connection keeps for as long as it waits.
     std::weak_ptr<conn> weak = c;
     m_node.list_versions(q.bucket, vq, [this, weak, vr](st s, version_page page)

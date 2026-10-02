@@ -90,7 +90,8 @@ public:
     uint64_t holders(uint32_t slot) const { return m_holders[slot]; }
 
     // ── Buckets are made and dropped by shard 0 and told to the rest ────────
-    void create_bucket(std::string name, std::function<void(st)> cb);
+    // `owner` is the id of the user that makes it, empty for the default owner.
+    void create_bucket(std::string name, std::string owner, std::function<void(st)> cb);
     void delete_bucket(std::string name, std::function<void(st)> cb);
     // Sets a bucket's configuration document of `kind`, or removes it when `xml` is empty; every shard has it before `cb`.
     void set_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb);
@@ -132,7 +133,7 @@ public:
     void stop();
 
 private:
-    void run_create(std::string name, std::function<void(st, int64_t)> cb);
+    void run_create(std::string name, std::string owner, std::function<void(st, int64_t)> cb);
     void run_drop(std::string name, std::function<void(st)> cb);
     // Shard 0's half of set_doc, one change of a bucket at a time so every shard hears them in one order.
     void run_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb);

@@ -116,8 +116,10 @@ std::string encode_list(std::string_view bucket, const list_query& q);
 bool        decode_list(std::string_view payload, std::string& bucket, list_query& q);
 
 // A request that names a bucket, and for an adoption when it was made.
-std::string encode_bucket(op o, std::string_view bucket, int64_t created_ms = 0);
-bool        decode_bucket(std::string_view payload, std::string& bucket, int64_t& created_ms);
+// `owner` is the id of the user a bucket is made or taken up for, empty for the default owner.
+std::string encode_bucket(op o, std::string_view bucket, int64_t created_ms = 0, std::string_view owner = {});
+bool        decode_bucket(std::string_view payload, std::string& bucket, int64_t& created_ms,
+                          std::string* owner = nullptr);
 
 // A bucket's configuration document of one kind, empty for none, and the change of shard 0's it belongs to.
 std::string encode_doc(op o, bucket_doc kind, std::string_view bucket, std::string_view xml, uint64_t seq = 0);
@@ -176,10 +178,10 @@ bool        decode_upload_list(std::string_view reply, std::vector<upload_stub>&
 std::string encode_status(st s);
 // The remove's answer says what it removed or made, and a bucket's creation when it was made.
 std::string encode_removed(const remove_result& r);
-std::string encode_created(st s, int64_t created_ms);
+std::string encode_created(st s, int64_t created_ms, std::string_view owner = {});
 bool        decode_status(std::string_view reply, st& s);
 bool        decode_removed(std::string_view reply, remove_result& r);
-bool        decode_created(std::string_view reply, st& s, int64_t& created_ms);
+bool        decode_created(std::string_view reply, st& s, int64_t& created_ms, std::string* owner = nullptr);
 
 // The most of a page that goes in one reply, so a shard's answer fits in what a
 // link carries whatever the metadata of its objects weighs.

@@ -228,11 +228,11 @@ void shard_node::announce_start(std::function<void(bool)> done)
 
 // ─── Buckets ────────────────────────────────────────────────────────────────
 
-void shard_node::create_bucket(std::string name, std::function<void(st)> cb)
+void shard_node::create_bucket(std::string name, std::string owner, std::function<void(st)> cb)
 {
     if (m_store.shard() == 0)
     {
-        run_create(std::move(name), [cb](st s, int64_t) { cb(s); });
+        run_create(std::move(name), std::move(owner), [cb](st s, int64_t) { cb(s); });
         return;
     }
     if (!valid_bucket_name(name))
@@ -247,14 +247,15 @@ void shard_node::create_bucket(std::string name, std::function<void(st)> cb)
     }
     ++m_c.bucket_ops;
     auto alive = m_alive;
-    m_transport.call(0, wire::encode_bucket(wire::op::bucket_create, name),
+    m_transport.call(0, wire::encode_bucket(wire::op::bucket_create, name, 0, owner),
         [this, alive, name, cb](bool ok, std::string_view reply)
         {
             if (!*alive)
                 return;
             st s = st::io_error;
             int64_t ms = 0;
-            if (!ok || !wire::decode_created(reply, s, ms))
+            std::string made_for;
+            if (!ok || !wire::decode_created(reply, s, ms, &made_for))
             {
                 ++m_c.peer_failures;
                 cb(st::io_error);
@@ -264,18 +265,18 @@ void shard_node::create_bucket(std::string name, std::function<void(st)> cb)
             // that notice was lost the answer carries what is needed to take it up.
             if ((s == st::ok || s == st::bucket_exists) && !m_store.has_bucket(name))
             {
-                m_store.adopt_bucket(name, ms, [cb, s](st a) { cb(a == st::ok ? s : a); });
+                m_store.adopt_bucket(name, ms, std::move(made_for), [cb, s](st a) { cb(a == st::ok ? s : a); });
                 return;
             }
             cb(s);
         });
 }
 
-void shard_node::run_create(std::string name, std::function<void(st, int64_t)> cb)
+void shard_node::run_create(std::string name, std::string owner, std::function<void(st, int64_t)> cb)
 {
     ++m_c.bucket_ops;
     auto alive = m_alive;
-    m_store.create_bucket(name, [this, alive, name, cb](st s)
+    m_store.create_bucket(name, std::move(owner), [this, alive, name, cb](st s)
     {
         if (!*alive)
             return;
@@ -287,7 +288,9 @@ void shard_node::run_create(std::string name, std::function<void(st, int64_t)> c
             return;
         }
         const int64_t ms = m_store.bucket_created_ms(name);
-        each_peer([name, ms](uint32_t) { return wire::encode_bucket(wire::op::bucket_adopt, name, ms); },
+        // The owner it has, which for a bucket that was there already is not the one this request asked for.
+        const std::string owner(m_store.bucket_owner(name));
+        each_peer([name, ms, owner](uint32_t) { return wire::encode_bucket(wire::op::bucket_adopt, name, ms, owner); },
                   [name](uint32_t peer, bool ok, std::string_view reply)
                   {
                       st a = st::io_error;
@@ -1283,7 +1286,8 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
 
     std::string name;
     int64_t     ms = 0;
-    if (!wire::decode_bucket(payload, name, ms))
+    std::string owner;
+    if (!wire::decode_bucket(payload, name, ms, &owner))
     {
         reply(false, {});
         return;
@@ -1296,7 +1300,8 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
                 reply(false, {});
                 return;
             }
-            run_create(std::move(name), [reply](st s, int64_t created) { reply(true, wire::encode_created(s, created)); });
+            run_create(std::move(name), std::move(owner), [this, name, reply](st s, int64_t created)
+                       { reply(true, wire::encode_created(s, created, m_store.bucket_owner(name))); });
             return;
         case wire::op::bucket_delete:
             if (m_store.shard() != 0)
@@ -1307,7 +1312,7 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             run_drop(std::move(name), [reply](st s) { reply(true, wire::encode_status(s)); });
             return;
         case wire::op::bucket_adopt:
-            m_store.adopt_bucket(std::move(name), ms, [reply](st s) { reply(true, wire::encode_status(s)); });
+            m_store.adopt_bucket(std::move(name), ms, std::move(owner), [reply](st s) { reply(true, wire::encode_status(s)); });
             return;
         case wire::op::drop_prepare:
             reply(true, wire::encode_status(m_store.drop_check(name)));

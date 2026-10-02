@@ -343,7 +343,7 @@ struct rig : io_handler
     {
         st got = st::io_error;
         bool fired = false;
-        store->create_bucket(name, [&](st s) { got = s; fired = true; });
+        store->create_bucket(name, {}, [&](st s) { got = s; fired = true; });
         REQUIRE(until([&] { return fired; }));
         REQUIRE(got == st::ok);
     }

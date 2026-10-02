@@ -17,6 +17,8 @@
 namespace socketley::storage
 {
 
+struct user_identity;
+
 // An S3 error as a client sees it: the code in the XML, the message, and the
 // HTTP status it travels with.
 struct s3_error
@@ -103,6 +105,8 @@ struct auth_verdict
     s3_error                    error;
     // Who the request was made by, for the log and for scripts.
     std::string                 principal;
+    // The user the access key belongs to, null when the request carried no credentials.
+    std::shared_ptr<const user_identity> user;
     // The request carried no credentials, which a bucket policy may still let in.
     bool                        anonymous{false};
     // Present when the body has to be decoded or verified on its way in.
@@ -136,6 +140,8 @@ public:
         v.error   = {"InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403};
         return v;
     }
+    // The display name of user `id` as an Owner element gives it, the id itself for one no longer known.
+    virtual std::string display_name(std::string_view id) const { return std::string(id); }
 };
 
 // `--anonymous`: every request is allowed and nobody is named.  A body that is

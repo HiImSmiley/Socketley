@@ -202,55 +202,6 @@ std::unique_ptr<body_hook> unsigned_trailer_hook(const request_view& req)
 
 // ─── Credentials ────────────────────────────────────────────────────────────
 
-bool credential_set::add(std::string_view access_key, std::string_view secret, std::string& err)
-{
-    if (!valid_access_key(access_key))
-    {
-        err = "an access key must be 1 to 127 printable characters without '/', ':', '=' or ','";
-        return false;
-    }
-    if (secret.empty())
-    {
-        err = "the secret of access key " + std::string(access_key) + " is empty";
-        return false;
-    }
-    m_map[std::string(access_key)] = std::string(secret);
-    return true;
-}
-
-std::string_view credential_set::secret(std::string_view access_key) const
-{
-    const auto it = m_map.find(access_key);
-    return it == m_map.end() ? std::string_view{} : std::string_view(it->second);
-}
-
-bool parse_credentials(std::string_view text, credential_set& out, std::string& err)
-{
-    size_t line_no = 0;
-    while (!text.empty())
-    {
-        const size_t nl = text.find('\n');
-        std::string_view line = trim(text.substr(0, nl));
-        text = nl == std::string_view::npos ? std::string_view{} : text.substr(nl + 1);
-        ++line_no;
-        if (line.empty() || line.front() == '#')
-            continue;
-        const size_t colon = line.find(':');
-        if (colon == std::string_view::npos)
-        {
-            err = "line " + std::to_string(line_no) + " is not access:secret";
-            return false;
-        }
-        std::string why;
-        if (!out.add(trim(line.substr(0, colon)), trim(line.substr(colon + 1)), why))
-        {
-            err = "line " + std::to_string(line_no) + ": " + why;
-            return false;
-        }
-    }
-    return true;
-}
-
 namespace
 {
 
@@ -285,7 +236,255 @@ bool read_file(const std::string& path, std::string& out, std::string& err, stru
     return true;
 }
 
+std::string dir_of(const std::string& path)
+{
+    const size_t slash = path.rfind('/');
+    return slash == std::string::npos ? std::string(".") : slash == 0 ? std::string("/") : path.substr(0, slash);
+}
+
+// What a file looks like now, all zero for one that is not there.
+bool stamp_of(const std::string& path, int64_t& mtime_ns, uint64_t& size, uint64_t& ino)
+{
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0)
+    {
+        mtime_ns = 0;
+        size = ino = 0;
+        return false;
+    }
+    mtime_ns = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
+    size     = static_cast<uint64_t>(st.st_size);
+    ino      = static_cast<uint64_t>(st.st_ino);
+    return true;
+}
+
+const std::shared_ptr<const user_identity>& default_user()
+{
+    static const std::shared_ptr<const user_identity> u = []
+    {
+        auto p          = std::make_shared<user_identity>();
+        p->id           = std::string(default_owner);
+        p->display_name = std::string(default_owner);
+        p->admin        = true;
+        return std::shared_ptr<const user_identity>(std::move(p));
+    }();
+    return u;
+}
+
+// A user id goes into an ARN and an Owner element, so it is printable and has no character either gives a meaning.
+bool valid_user_id(std::string_view id)
+{
+    if (id.empty() || id.size() > 128)
+        return false;
+    for (unsigned char c : id)
+        if (c <= ' ' || c >= 0x7f || c == '/' || c == ':' || c == '*' || c == '?' || c == ',' || c == '=' ||
+            c == '[' || c == ']' || c == '"' || c == '<' || c == '>' || c == '&')
+            return false;
+    return true;
+}
+
 }   // namespace
+
+bool credential_set::add(std::string_view access_key, std::string_view secret, std::string& err,
+                         std::shared_ptr<const user_identity> user)
+{
+    if (!valid_access_key(access_key))
+    {
+        err = "an access key must be 1 to 127 printable characters without '/', ':', '=' or ','";
+        return false;
+    }
+    if (secret.empty())
+    {
+        err = "the secret of access key " + std::string(access_key) + " is empty";
+        return false;
+    }
+    if (!user)
+        user = default_user();
+    if (const auto it = m_map.find(access_key); it != m_map.end() && it->second.user != user)
+    {
+        err = "access key " + std::string(access_key) + " is given to two users";
+        return false;
+    }
+    m_map[std::string(access_key)] = {std::string(secret), std::move(user)};
+    return true;
+}
+
+bool credential_set::add_user(std::shared_ptr<const user_identity> user, std::string& err)
+{
+    if (m_users.contains(user->id))
+    {
+        err = "user " + user->id + " is declared twice";
+        return false;
+    }
+    m_users.emplace(user->id, std::move(user));
+    return true;
+}
+
+std::string_view credential_set::secret(std::string_view access_key) const
+{
+    const auto it = m_map.find(access_key);
+    return it == m_map.end() ? std::string_view{} : std::string_view(it->second.secret);
+}
+
+std::shared_ptr<const user_identity> credential_set::user_of(std::string_view access_key) const
+{
+    const auto it = m_map.find(access_key);
+    return it == m_map.end() ? nullptr : it->second.user;
+}
+
+const user_identity* credential_set::find_user(std::string_view id) const
+{
+    const auto it = m_users.find(id);
+    return it == m_users.end() ? nullptr : it->second.get();
+}
+
+bool parse_credentials(std::string_view text, credential_set& out, std::string& err, std::string_view dir,
+                       std::vector<std::string>* files)
+{
+    size_t line_no = 0;
+    // The user being declared, which is complete once the next one begins or the text ends.
+    std::shared_ptr<user_identity> user;
+    std::vector<std::pair<std::string, std::string>> keys;
+    bool named = false;
+    auto finish_user = [&]() -> bool
+    {
+        if (!user)
+            return true;
+        if (!named)
+            user->display_name = user->id;
+        std::shared_ptr<const user_identity> done = std::move(user);
+        user.reset();
+        if (!out.add_user(done, err))
+            return false;
+        for (const auto& [k, s] : keys)
+            if (!out.add(k, s, err, done))
+                return false;
+        keys.clear();
+        return true;
+    };
+    while (!text.empty())
+    {
+        const size_t nl = text.find('\n');
+        std::string_view line = trim(text.substr(0, nl));
+        text = nl == std::string_view::npos ? std::string_view{} : text.substr(nl + 1);
+        ++line_no;
+        const std::string where = "line " + std::to_string(line_no);
+        if (line.empty() || line.front() == '#')
+            continue;
+        if (line.front() == '[')
+        {
+            if (line.back() != ']' || !valid_user_id(trim(line.substr(1, line.size() - 2))))
+            {
+                err = where + ": a user is [id], an id of 1 to 128 printable characters without spaces or any of "
+                              "/:*?,=[]\"<>&";
+                return false;
+            }
+            if (!finish_user())
+            {
+                err = where + ": " + err;
+                return false;
+            }
+            user     = std::make_shared<user_identity>();
+            user->id = std::string(trim(line.substr(1, line.size() - 2)));
+            user->configured = true;
+            named = false;
+            continue;
+        }
+        // A setting has its '=' before any ':', which an access key cannot hold.
+        const size_t sep = line.find_first_of(":=");
+        if (sep != std::string_view::npos && line[sep] == '=')
+        {
+            const std::string_view name  = trim(line.substr(0, sep));
+            const std::string_view value = trim(line.substr(sep + 1));
+            if (!user)
+            {
+                err = where + ": " + std::string(name) + " is a setting of a user, and no [id] line came before it";
+                return false;
+            }
+            if (name == "name")
+            {
+                if (value.empty())
+                {
+                    err = where + ": the name of user " + user->id + " is empty";
+                    return false;
+                }
+                user->display_name = std::string(value);
+                named = true;
+            }
+            else if (name == "admin")
+            {
+                if (value != "true" && value != "false")
+                {
+                    err = where + ": admin is true or false";
+                    return false;
+                }
+                user->admin = value == "true";
+            }
+            else if (name == "policy")
+            {
+                std::string doc;
+                if (!value.starts_with('{'))
+                {
+                    std::string path(value);
+                    if (!path.empty() && path.front() != '/' && !dir.empty())
+                        path = std::string(dir) + "/" + path;
+                    if (files)
+                        files->push_back(path);
+                    if (!read_file(path, doc, err))
+                    {
+                        err = where + ": " + err;
+                        return false;
+                    }
+                }
+                else
+                    doc = std::string(value);
+                s3_error e;
+                if (!bucket_policy::compile_identity(doc, user->policy, e))
+                {
+                    err = where + ": the policy of user " + user->id + ": " + e.message;
+                    return false;
+                }
+                user->has_policy = true;
+            }
+            else
+            {
+                err = where + ": " + std::string(name) + " is not a setting of a user (name, admin, policy)";
+                return false;
+            }
+            continue;
+        }
+        if (sep == std::string_view::npos)
+        {
+            err = where + " is not access:secret";
+            return false;
+        }
+        const std::string_view key = trim(line.substr(0, sep)), secret = trim(line.substr(sep + 1));
+        if (user)
+        {
+            // Checked here so the line it is on is the one named.
+            credential_set probe;
+            if (!probe.add(key, secret, err))
+            {
+                err = where + ": " + err;
+                return false;
+            }
+            keys.emplace_back(key, secret);
+            continue;
+        }
+        std::string why;
+        if (!out.add(key, secret, why))
+        {
+            err = where + ": " + why;
+            return false;
+        }
+    }
+    if (!finish_user())
+    {
+        err = "line " + std::to_string(line_no) + ": " + err;
+        return false;
+    }
+    return true;
+}
 
 std::string sigv4_config_error(const sigv4_config& cfg)
 {
@@ -300,7 +499,7 @@ std::string sigv4_config_error(const sigv4_config& cfg)
         std::string text;
         if (!read_file(cfg.credentials_file, text, err))
             return err;
-        if (!parse_credentials(text, set, err))
+        if (!parse_credentials(text, set, err, dir_of(cfg.credentials_file)))
             return cfg.credentials_file + ": " + err;
         if (set.size() == 0)
             return cfg.credentials_file + " holds no credentials";
@@ -323,7 +522,18 @@ bool sigv4_authenticator::rebuild(std::string& err)
         struct stat st{};
         if (!read_file(m_cfg.credentials_file, text, err, &st))
             return false;
-        if (!parse_credentials(text, set, err))
+        std::vector<std::string> files;
+        const bool parsed = parse_credentials(text, set, err, dir_of(m_cfg.credentials_file), &files);
+        // The policy files this text names are watched whether or not they compiled, so a fix to one is seen.
+        m_policy_stamps.clear();
+        for (std::string& f : files)
+        {
+            file_stamp fs;
+            fs.path = std::move(f);
+            stamp_of(fs.path, fs.mtime_ns, fs.size, fs.ino);
+            m_policy_stamps.push_back(std::move(fs));
+        }
+        if (!parsed)
         {
             err = m_cfg.credentials_file + ": " + err;
             return false;
@@ -342,6 +552,13 @@ bool sigv4_authenticator::rebuild(std::string& err)
     return true;
 }
 
+std::string sigv4_authenticator::display_name(std::string_view id) const
+{
+    if (const user_identity* u = m_creds.find_user(id))
+        return u->display_name;
+    return std::string(id);
+}
+
 bool sigv4_authenticator::load(std::string& err)
 {
     m_last_check = std::chrono::steady_clock::now();
@@ -357,24 +574,31 @@ void sigv4_authenticator::maybe_reload()
         return;
     m_last_check = now;
 
-    struct stat st{};
-    if (::stat(m_cfg.credentials_file.c_str(), &st) != 0)
+    int64_t  mtime = 0;
+    uint64_t size = 0, ino = 0;
+    if (!stamp_of(m_cfg.credentials_file, mtime, size, ino))
         return;
-    const int64_t  mtime = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
-    const uint64_t size  = static_cast<uint64_t>(st.st_size);
-    const uint64_t ino   = static_cast<uint64_t>(st.st_ino);
-    if (m_have_stamp && mtime == m_stamp_mtime_ns && size == m_stamp_size && ino == m_stamp_ino)
+    bool same = m_have_stamp && mtime == m_stamp_mtime_ns && size == m_stamp_size && ino == m_stamp_ino;
+    for (size_t i = 0; same && i < m_policy_stamps.size(); ++i)
+    {
+        file_stamp now_fs;
+        stamp_of(m_policy_stamps[i].path, now_fs.mtime_ns, now_fs.size, now_fs.ino);
+        same = now_fs.mtime_ns == m_policy_stamps[i].mtime_ns && now_fs.size == m_policy_stamps[i].size &&
+               now_fs.ino == m_policy_stamps[i].ino;
+    }
+    if (same)
         return;
 
     std::string err;
-    const size_t before = m_creds.size();
+    const size_t before = m_creds.size(), users_before = m_creds.user_count();
     if (rebuild(err))
     {
         LOG_INFO(("storage: credentials reloaded from " + m_cfg.credentials_file + " (" +
-                  std::to_string(before) + " -> " + std::to_string(m_creds.size()) + " keys)").c_str());
+                  std::to_string(before) + " -> " + std::to_string(m_creds.size()) + " keys, " +
+                  std::to_string(users_before) + " -> " + std::to_string(m_creds.user_count()) + " users)").c_str());
         return;
     }
-    // Remembered, so a file that stays broken is reported once and not every second.
+    // Remembered, so files that stay broken are reported once and not every second.
     m_stamp_mtime_ns = mtime;
     m_stamp_size     = size;
     m_stamp_ino      = ino;
@@ -421,6 +645,7 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
         return v;
     }
     v.principal = std::string(vr.access_key());
+    v.user      = m_creds.user_of(v.principal);
 
     switch (vr.payload)
     {
@@ -471,6 +696,7 @@ auth_verdict sigv4_authenticator::authorize_post(const post_signature& sig)
             return refuse("SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided. Check your key and signing method.", 403);
         v.allowed   = true;
         v.principal = std::string(sig.v2_access_key);
+        v.user      = m_creds.user_of(v.principal);
         return v;
     }
     if (sig.algorithm != "AWS4-HMAC-SHA256")
@@ -509,6 +735,7 @@ auth_verdict sigv4_authenticator::authorize_post(const post_signature& sig)
         return refuse("SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided. Check your key and signing method.", 403);
     v.allowed   = true;
     v.principal = std::string(rest);
+    v.user      = m_creds.user_of(v.principal);
     return v;
 }
 

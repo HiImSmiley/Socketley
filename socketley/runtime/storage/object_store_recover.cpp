@@ -657,6 +657,14 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
             }
         }
         b->created_ms = ms;
+        // The owner is the second line, which a bucket made before there were users does not have.
+        if (const size_t nl = created.find('\n'); nl != std::string::npos && r.ec == std::errc{})
+        {
+            std::string_view owner = std::string_view(created).substr(nl + 1);
+            while (!owner.empty() && (owner.back() == '\n' || owner.back() == '\r' || owner.back() == ' '))
+                owner.remove_suffix(1);
+            b->owner = std::string(owner);
+        }
     }
 
     // The configuration documents shard 0 last synced, and not what a write it was cut short in left.

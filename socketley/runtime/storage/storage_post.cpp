@@ -136,7 +136,7 @@ void storage_run::post_form_ready(const std::shared_ptr<conn>& c)
     rv.bucket  = r.bucket;
     rv.key     = r.key;
     rv.tls     = c->ssl != nullptr;
-    if (m_store.any_policy() && (v.allowed || v.anonymous))
+    if ((v.allowed || v.anonymous) && needs_judging(v.anonymous ? nullptr : v.user.get()))
         apply_policy(c, rv, v);
     if (!v.allowed)
     {
@@ -144,6 +144,7 @@ void storage_run::post_form_ready(const std::shared_ptr<conn>& c)
         return;
     }
     c->principal = std::move(v.principal);
+    c->user      = std::move(v.user);
     c->anonymous = v.anonymous;
 
     // The fields become the headers a PutObject would have carried, in place of the form's own.

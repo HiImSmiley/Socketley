@@ -625,7 +625,7 @@ std::vector<bucket_info> object_store::buckets() const
     out.reserve(m_buckets.size());
     for (const auto& [name, b] : m_buckets)
         if (!b->closing)
-            out.push_back({name, b->created_ms});
+            out.push_back({name, b->created_ms, b->owner});
     return out;
 }
 
@@ -2549,6 +2549,7 @@ struct create_state
     int         stage{0};
     int         fd{-1};
     int64_t     created_ms{0};
+    std::string owner;
     // The next of the 256 object directories to make; 256 when they are all there.
     int         fan{256};
     // Taken up from shard 0 rather than made here.
@@ -2559,14 +2560,20 @@ struct create_state
 
 }   // namespace
 
-void object_store::create_bucket(std::string name, std::function<void(st)> cb)
+void object_store::create_bucket(std::string name, std::string owner, std::function<void(st)> cb)
 {
-    create_bucket_impl(std::move(name), false, 0, std::move(cb));
+    create_bucket_impl(std::move(name), false, 0, std::move(owner), std::move(cb));
 }
 
-void object_store::adopt_bucket(std::string name, int64_t created_ms, std::function<void(st)> cb)
+void object_store::adopt_bucket(std::string name, int64_t created_ms, std::string owner, std::function<void(st)> cb)
 {
-    create_bucket_impl(std::move(name), true, created_ms, std::move(cb));
+    create_bucket_impl(std::move(name), true, created_ms, std::move(owner), std::move(cb));
+}
+
+std::string_view object_store::bucket_owner(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b ? std::string_view(b->owner) : std::string_view{};
 }
 
 int64_t object_store::bucket_created_ms(std::string_view name) const
@@ -2575,7 +2582,7 @@ int64_t object_store::bucket_created_ms(std::string_view name) const
     return b ? b->created_ms : 0;
 }
 
-void object_store::create_bucket_impl(std::string name, bool adopt, int64_t created_ms,
+void object_store::create_bucket_impl(std::string name, bool adopt, int64_t created_ms, std::string owner,
                                       std::function<void(st)> cb)
 {
     if (!adopt && !valid_bucket_name(name))
@@ -2602,7 +2609,10 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
     cs->cb   = std::move(cb);
     cs->adopt = adopt;
     cs->created_ms = adopt ? created_ms : static_cast<int64_t>(now_ms());
+    cs->owner = std::move(owner);
     cs->text = std::to_string(cs->created_ms);
+    if (!cs->owner.empty())
+        cs->text += "\n" + cs->owner;
     // The directories and the creation stamp are shard 0's, so an adopting
     // shard begins at its own journal.
     cs->stage = adopt ? 6 : 0;
@@ -2728,6 +2738,7 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
                 auto b = std::make_unique<bucket>();
                 b->name       = cs->name;
                 b->created_ms = cs->created_ms;
+                b->owner      = cs->owner;
                 b->dir_fd     = dir_fd;
                 b->data_fd    = data_fd;
                 b->tmp_fd     = static_cast<int>(res);

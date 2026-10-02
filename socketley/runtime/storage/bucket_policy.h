@@ -103,12 +103,16 @@ client_ip client_ip_of(int fd);
 struct policy_request
 {
     s3_action        action{s3_action::none};
+    // The bucket it acts on, which only an identity policy's resources are matched against.
+    std::string_view bucket;
     // The object's key, for an action on an object.
     std::string_view key;
     // The request carried no credentials.
     bool             anonymous{false};
     // The access key it was signed with.
     std::string_view principal;
+    // The id of the user the key belongs to, empty for the runtime's one owner of a file without users.
+    std::string_view user;
     bool             tls{false};
     const client_ip* ip{nullptr};
     // The keys are named in the body, so only a statement over every key in the bucket can allow it.
@@ -133,6 +137,8 @@ class bucket_policy
 public:
     // False with a MalformedPolicy `err` for a document this runtime cannot honour exactly.
     static bool compile(std::string_view json, std::string_view bucket, bucket_policy& out, s3_error& err);
+    // A user's identity policy, which names no principal and whose resources may be in any bucket.
+    static bool compile_identity(std::string_view json, bucket_policy& out, s3_error& err);
     // A stored document that no longer compiles, which denies every request it is asked about.
     static bucket_policy refusing(std::string_view json, std::string why);
 
@@ -172,6 +178,8 @@ public:
         uint64_t actions{0};
         bool     bucket_resource{false};
         std::vector<key_pattern> objects;
+        // An identity policy's resources, each an ARN without "arn:aws:s3:::" matched as IAM matches it.
+        std::vector<std::string> arns;
         bool     has_ip_in{false};
         std::vector<cidr> ip_in;
         bool     has_ip_out{false};
@@ -192,6 +200,10 @@ public:
 private:
     // Whether the request's encryption is what the statement's conditions on it ask for.
     static bool sse_matches(const statement& s, const policy_request& r);
+    static bool compile_doc(std::string_view json, std::string_view bucket, bool identity, bucket_policy& out,
+                            s3_error& err);
+
+    bool m_identity{false};
 
     std::string m_text;
     std::string m_broken;

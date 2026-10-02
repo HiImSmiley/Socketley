@@ -67,16 +67,21 @@ bool body_integrity_ok(const s3_request& r, std::string_view body, s3_error& err
 
 bool storage_run::policy_allows(const std::shared_ptr<conn>& c, s3_action action, std::string_view key)
 {
-    if (!m_store.any_policy())
+    const user_identity* u = c->anonymous ? nullptr : c->user.get();
+    if (!needs_judging(u))
         return true;
     policy_request q;
     q.action    = action;
+    q.bucket    = c->req.bucket;
     q.key       = key;
     q.anonymous = c->anonymous;
     q.principal = c->principal;
+    q.user      = u && u->configured ? std::string_view(u->id) : std::string_view{};
     q.tls       = c->ssl != nullptr;
     q.ip        = &c->ip;
-    const policy_effect e = policy_effect_of(c, c->req.bucket, q);
+    const policy_effect e = access_of(c, c->req.bucket, q, u);
+    if (u)
+        return e == policy_effect::allow;
     // A request a policy let in is let do this only by an Allow of it too.
     return e != policy_effect::deny && (!c->policy_admitted || e == policy_effect::allow);
 }

@@ -215,7 +215,8 @@ struct list_parts_render
     std::string_view bucket;
     std::string_view key;
     std::string_view upload_id;
-    std::string_view owner_id;
+    std::string      owner_id;
+    std::string      owner_name;
     uint32_t         part_number_marker{0};
     uint32_t         next_part_number_marker{0};
     uint32_t         max_parts{1000};
@@ -237,9 +238,9 @@ inline std::string list_parts_xml(const list_parts_render& r, const std::vector<
         x += "<Part><PartNumber>" + std::to_string(p.number) + "</PartNumber><LastModified>" + iso8601(p.mtime_ms) +
              "</LastModified><ETag>&quot;" + xml_escape(p.etag) + "&quot;</ETag><Size>" + std::to_string(p.size) +
              "</Size>" + checksum_element(p.algo, p.checksum_b64) + "</Part>";
-    x += "<Initiator><ID>" + xml_escape(r.owner_id) + "</ID><DisplayName>" + xml_escape(r.owner_id) +
+    x += "<Initiator><ID>" + xml_escape(r.owner_id) + "</ID><DisplayName>" + xml_escape(r.owner_name) +
          "</DisplayName></Initiator><Owner><ID>" + xml_escape(r.owner_id) + "</ID><DisplayName>" +
-         xml_escape(r.owner_id) + "</DisplayName></Owner><StorageClass>STANDARD</StorageClass>";
+         xml_escape(r.owner_name) + "</DisplayName></Owner><StorageClass>STANDARD</StorageClass>";
     if (r.algo != checksum_algo::none)
         x += "<ChecksumAlgorithm>" + std::string(checksum_name(r.algo)) + "</ChecksumAlgorithm>";
     x += "</ListPartsResult>";
@@ -262,7 +263,8 @@ struct list_uploads_render
     std::string_view upload_id_marker;
     std::string_view next_key_marker;
     std::string_view next_upload_id_marker;
-    std::string_view owner_id;
+    std::string      owner_id;
+    std::string      owner_name;
     uint32_t         max_uploads{1000};
     bool             truncated{false};
     bool             url_encode_keys{false};
@@ -291,9 +293,9 @@ inline std::string list_uploads_xml(const list_uploads_render& r, const std::vec
         x += "<EncodingType>url</EncodingType>";
     for (const upload_row& u : uploads)
         x += "<Upload><Key>" + enc(u.key) + "</Key><UploadId>" + xml_escape(u.upload_id) +
-             "</UploadId><Initiator><ID>" + xml_escape(r.owner_id) + "</ID><DisplayName>" + xml_escape(r.owner_id) +
+             "</UploadId><Initiator><ID>" + xml_escape(r.owner_id) + "</ID><DisplayName>" + xml_escape(r.owner_name) +
              "</DisplayName></Initiator><Owner><ID>" + xml_escape(r.owner_id) + "</ID><DisplayName>" +
-             xml_escape(r.owner_id) + "</DisplayName></Owner><StorageClass>STANDARD</StorageClass><Initiated>" +
+             xml_escape(r.owner_name) + "</DisplayName></Owner><StorageClass>STANDARD</StorageClass><Initiated>" +
              iso8601(u.initiated_ms) + "</Initiated></Upload>";
     for (const std::string& p : prefixes)
         x += "<CommonPrefixes><Prefix>" + enc(p) + "</Prefix></CommonPrefixes>";

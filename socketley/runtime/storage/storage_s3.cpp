@@ -216,8 +216,8 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     }
 
     auth_verdict v = m_auth->authorize(rv);
-    // A bucket's policy may let in a request that carries no credentials, and may refuse one that does.
-    if (m_store.any_policy() && (v.allowed || v.anonymous))
+    // A policy may let in a request with no credentials, and ownership or a policy may refuse one with them.
+    if ((v.allowed || v.anonymous) && needs_judging(v.anonymous ? nullptr : v.user.get()))
         apply_policy(c, rv, v);
     if (!v.allowed)
     {
@@ -226,6 +226,7 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     }
     c->hook = std::move(v.hook);
     c->principal = std::move(v.principal);
+    c->user      = std::move(v.user);
     c->anonymous = v.anonymous;
 
     // A client that signs its payload in chunks, talking to a runtime with no
@@ -259,7 +260,10 @@ void storage_run::route(const std::shared_ptr<conn>& c)
 
     // A write that asks for an ACL other than its owner's full control is refused, as S3 refuses it on a bucket
     // whose ACLs are disabled, and never stored without it.
-    if (s3_error e; !r.has_query("acl") && !acl_headers_ok(r, bucket_level && !r.form, e))
+    // The owner a grant may name is the bucket's, or for a bucket being made the user making it.
+    const std::string_view acl_owner = m_store.has_bucket(r.bucket) || !c->user ? owner_of(r.bucket)
+                                                                                : std::string_view(c->user->id);
+    if (s3_error e; !r.has_query("acl") && !acl_headers_ok(r, bucket_level && !r.form, acl_owner, e))
     {
         deny_request(c, e);
         return;
@@ -539,9 +543,15 @@ void storage_run::op_list_buckets(const std::shared_ptr<conn>& c)
         return;
     }
     page.after = after;
+    // A user is shown the buckets it owns, and an admin every bucket.
+    const user_identity* u = c->user.get();
+    const std::string_view me = u ? std::string_view(u->id) : default_owner;
+    std::vector<bucket_info> all = m_store.buckets();
+    if (u && !u->admin)
+        std::erase_if(all, [me](const bucket_info& b) { return (b.owner.empty() ? default_owner : b.owner) != me; });
     response r;
     r.headers.emplace_back("Content-Type", "application/xml");
-    r.body = list_buckets_xml(m_store.buckets(), owner_id(), owner_id(), page);
+    r.body = list_buckets_xml(all, me, display_of(me), page);
     send_response(c, std::move(r));
 }
 
@@ -550,13 +560,20 @@ void storage_run::op_create_bucket(const std::shared_ptr<conn>& c)
     std::weak_ptr<conn> weak = c;
     const std::string name = c->req.bucket;
     const bool lock = http_token_equals(c->req.header("x-amz-bucket-object-lock-enabled"), "true", 4);
-    m_node.create_bucket(name, [this, weak, name, lock](st s)
+    // The default owner is recorded as no owner at all, as every bucket made before there were users is.
+    const std::string me = c->user ? c->user->id : std::string(default_owner);
+    m_node.create_bucket(name, me == default_owner ? std::string() : me, [this, weak, name, lock, me](st s)
     {
-        auto answer = [this, weak, name](st a)
+        auto answer = [this, weak, name, me](st a)
         {
             auto cc = weak.lock();
             if (!cc || cc->dead)
                 return;
+            if (a == st::bucket_exists && owner_of(name) != me)
+            {
+                send_error(cc, make_error("BucketAlreadyExists"));
+                return;
+            }
             if (a != st::ok)
             {
                 send_error_st(cc, a);
@@ -615,11 +632,11 @@ void storage_run::op_delete_bucket(const std::shared_ptr<conn>& c)
 
 // ─── ACLs and ownership controls ────────────────────────────────────────────
 
-bool storage_run::acl_headers_ok(const s3_request& r, bool bucket, s3_error& err) const
+bool storage_run::acl_headers_ok(const s3_request& r, bool bucket, std::string_view owner, s3_error& err) const
 {
     if (r.method != "PUT" && r.method != "POST")
         return true;
-    const std::string grant = "id=\"" + owner_id() + "\"";
+    const std::string grant = "id=\"" + std::string(owner) + "\"";
     bool ok = true;
     for (const auto& h : r.headers)
     {
@@ -676,7 +693,8 @@ void storage_run::op_get_acl(const std::shared_ptr<conn>& c)
         }
         response resp;
         resp.headers.emplace_back("Content-Type", "application/xml");
-        resp.body = owner_acl_xml(owner_id());
+        const std::string_view owner = owner_of(cc->req.bucket);
+        resp.body = owner_acl_xml(owner, display_of(owner));
         send_response(cc, std::move(resp));
     };
     if (r.key.empty())
@@ -710,7 +728,8 @@ void storage_run::op_put_acl(const std::shared_ptr<conn>& c)
     // An ACL is taken when it is the one the object has: by canned name or grant header, or as a document whose
     // every grant is FULL_CONTROL to the owner.
     s3_error err;
-    bool ok = acl_headers_ok(r, false, err);
+    const std::string_view owner = owner_of(r.bucket);
+    bool ok = acl_headers_ok(r, false, owner, err);
     if (ok && !c->body.empty())
     {
         xml_node root;
@@ -743,7 +762,7 @@ void storage_run::op_put_acl(const std::shared_ptr<conn>& c)
                         }
                     }
                     ++grants;
-                    ok = ok && !other && id == owner_id() && permission == "FULL_CONTROL";
+                    ok = ok && !other && id == owner && permission == "FULL_CONTROL";
                 }
         ok = ok && grants > 0;
     }
@@ -894,7 +913,8 @@ void storage_run::op_list_objects(const std::shared_ptr<conn>& c, bool v2)
     lr.max_keys  = max_keys;
     lr.url_encode_keys = url_enc;
     lr.v2        = v2;
-    lr.owner_id  = "socketley";
+    lr.owner_id   = std::string(owner_of(q.bucket));
+    lr.owner_name = display_of(lr.owner_id);
 
     std::string token_text;
     if (v2)
@@ -1065,7 +1085,7 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
             continue;
         }
         // An entry that names a version is s3:DeleteObjectVersion, which the dispatch could not see in the body.
-        if (!res.version_id.empty() && m_store.any_policy() && !policy_allows_version_delete(c, res.key))
+        if (!res.version_id.empty() && !policy_allows_version_delete(c, res.key))
         {
             res.ok    = false;
             res.error = make_error("AccessDenied");

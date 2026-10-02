@@ -89,6 +89,26 @@ bool any_cidr(const std::vector<bucket_policy::cidr>& list, const client_ip* ip)
     return false;
 }
 
+// Whether an identity policy's resource pattern names what `r` acts on: its bucket, or bucket/key for an object.
+bool arn_covers(std::string_view pat, const policy_request& r, bool object, bool deny)
+{
+    if (!object)
+        return wild_match(pat, r.bucket, false);
+    std::string res;
+    res.reserve(r.bucket.size() + 1 + r.key.size());
+    res.append(r.bucket).push_back('/');
+    if (!r.every_key)
+        return wild_match(pat, res.append(r.key), false);
+    // Keys named in the body: an Allow has to cover every key of the bucket, which a trailing '*' after it does.
+    if (!deny)
+        return pat.ends_with('*') && wild_match(pat, res, false);
+    // A Deny over any key the body could name refuses them all.
+    const std::string_view lit = pat.substr(0, pat.find_first_of("*?"));
+    if (lit.size() == pat.size())
+        return lit.starts_with(res);
+    return lit.starts_with(res) || std::string_view(res).starts_with(lit);
+}
+
 // ─── The actions ────────────────────────────────────────────────────────────
 
 enum class res_kind : uint8_t { object, bucket, service };
@@ -200,6 +220,7 @@ struct compiler
 {
     std::string_view bucket;
     s3_error&        err;
+    bool             identity{false};
 
     bool fail(std::string message)
     {
@@ -330,11 +351,23 @@ struct compiler
         for (const std::string& r : list)
         {
             std::string_view rv = r;
+            if (identity && rv == "*")
+            {
+                s.arns.emplace_back("*");
+                continue;
+            }
             if (!rv.starts_with(s3_arn))
                 return fail("Policy has invalid resource: " + r);
             rv.remove_prefix(s3_arn.size());
             if (rv.find("${") != std::string_view::npos)
                 return fail("Policy has invalid resource: policy variables are not supported: " + r);
+            if (identity)
+            {
+                if (rv.empty())
+                    return fail("Policy has invalid resource: " + r);
+                s.arns.emplace_back(rv);
+                continue;
+            }
             if (rv == bucket)
             {
                 s.bucket_resource = true;
@@ -551,7 +584,9 @@ struct compiler
         }
         if (!effect)
             return fail("Missing required field Effect");
-        if (!who)
+        if (identity && who)
+            return fail("Policy document should not specify a principal");
+        if (!identity && !who)
             return fail("Missing required field Principal");
         if (!action)
             return fail("Missing required field Action");
@@ -561,9 +596,9 @@ struct compiler
             return fail("Invalid effect: Effect is Allow or Deny");
         s.deny = effect->s == "Deny";
         bool on_object = false, on_bucket = false;
-        if (!principal(*who, s) || !actions(*action, s, on_object, on_bucket) || !resources(*res, s))
+        if ((who && !principal(*who, s)) || !actions(*action, s, on_object, on_bucket) || !resources(*res, s))
             return false;
-        if (!(on_object && !s.objects.empty()) && !(on_bucket && s.bucket_resource))
+        if (!identity && !(on_object && !s.objects.empty()) && !(on_bucket && s.bucket_resource))
             return fail("Action does not apply to any resource(s) in statement");
         return !cond || condition(*cond, s);
     }
@@ -717,7 +752,18 @@ client_ip client_ip_of(int fd)
 
 bool bucket_policy::compile(std::string_view json, std::string_view bucket, bucket_policy& out, s3_error& err)
 {
-    compiler cc{bucket, err};
+    return compile_doc(json, bucket, false, out, err);
+}
+
+bool bucket_policy::compile_identity(std::string_view json, bucket_policy& out, s3_error& err)
+{
+    return compile_doc(json, {}, true, out, err);
+}
+
+bool bucket_policy::compile_doc(std::string_view json, std::string_view bucket, bool identity, bucket_policy& out,
+                                s3_error& err)
+{
+    compiler cc{bucket, err, identity};
     if (json.size() > policy_max_bytes)
         return cc.fail("Policy exceeds the maximum allowed document size of 20 KiB");
     jvalue doc;
@@ -775,7 +821,8 @@ bool bucket_policy::compile(std::string_view json, std::string_view bucket, buck
     else
         return cc.fail("Statement must be a statement or a non-empty list of them");
 
-    p.m_text = std::string(json);
+    p.m_text     = std::string(json);
+    p.m_identity = identity;
     out = std::move(p);
     return true;
 }
@@ -814,18 +861,23 @@ policy_effect bucket_policy::evaluate(const policy_request& r) const
     {
         if (!(s.actions & bit))
             continue;
-        if (!s.any_principal)
+        if (!m_identity && !s.any_principal)
         {
             if (r.anonymous)
                 continue;
             bool named = s.any_signed;
             for (size_t i = 0; !named && i < s.keys.size(); ++i)
-                named = s.keys[i] == r.principal;
+                named = s.keys[i] == r.principal || (!r.user.empty() && s.keys[i] == r.user);
             if (!named)
                 continue;
         }
         bool covered = false;
-        if (!object)
+        if (m_identity)
+        {
+            for (size_t i = 0; !covered && i < s.arns.size(); ++i)
+                covered = arn_covers(s.arns[i], r, object, s.deny);
+        }
+        else if (!object)
             covered = s.bucket_resource;
         else if (r.every_key)
         {

@@ -572,8 +572,8 @@ void storage_run::op_list_parts(const std::shared_ptr<conn>& c)
             lr.bucket    = cc->req.bucket;
             lr.key       = pg.key;
             lr.upload_id = pg.id;
-            const std::string owner = owner_id();
-            lr.owner_id  = owner;
+            lr.owner_id   = std::string(owner_of(cc->req.bucket));
+            lr.owner_name = display_of(lr.owner_id);
             lr.part_number_marker = marker;
             lr.max_parts = max_parts;
             lr.algo      = pg.algo;
@@ -733,8 +733,8 @@ void storage_run::op_list_uploads(const std::shared_ptr<conn>& c)
     lr.upload_id_marker = id_marker;
     lr.next_key_marker  = last_key;
     lr.next_upload_id_marker = last_id;
-    const std::string owner = owner_id();
-    lr.owner_id         = owner;
+    lr.owner_id         = std::string(owner_of(cc->req.bucket));
+    lr.owner_name       = display_of(lr.owner_id);
     lr.max_uploads      = max_uploads;
     lr.url_encode_keys  = url_enc;
 
