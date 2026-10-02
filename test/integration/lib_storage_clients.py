@@ -323,10 +323,38 @@ def acls_disabled():
     check("and the ownership controls say BucketOwnerEnforced", own == [{"ObjectOwnership": "BucketOwnerEnforced"}], own)
 
 
+# ─── A bucket's own tags ────────────────────────────────────────────────────
+# s3-tests test_set_bucket_tagging: PutBucketTagging was 501.
+def bucket_tags():
+    print("=== PutBucketTagging, GetBucketTagging, DeleteBucketTagging ===")
+    s3.create_bucket(Bucket="cl-btag")
+    check("a bucket without tags is NoSuchTagSet", code_of(lambda: s3.get_bucket_tagging(Bucket="cl-btag")) ==
+          ("NoSuchTagSet", 404))
+    tags = [{"Key": "team", "Value": "storage"}, {"Key": "cost centre", "Value": "42"}]
+    s3.put_bucket_tagging(Bucket="cl-btag", Tagging={"TagSet": tags})
+    check("the tags set are read back, in their order", s3.get_bucket_tagging(Bucket="cl-btag")["TagSet"] == tags)
+    fifty = [{"Key": "k%d" % i, "Value": "v"} for i in range(50)]
+    check("fifty tags are a bucket's limit", code_of(lambda: s3.put_bucket_tagging(Bucket="cl-btag",
+                                                                                   Tagging={"TagSet": fifty})) == (None, None))
+    check("and fifty-one are InvalidTag, leaving the fifty",
+          code_of(lambda: s3.put_bucket_tagging(Bucket="cl-btag", Tagging={"TagSet": fifty + [{"Key": "x", "Value": "y"}]})) ==
+          ("InvalidTag", 400) and len(s3.get_bucket_tagging(Bucket="cl-btag")["TagSet"]) == 50)
+    check("a key beginning aws: is InvalidTag", code_of(lambda: s3.put_bucket_tagging(
+        Bucket="cl-btag", Tagging={"TagSet": [{"Key": "aws:x", "Value": "y"}]}))[0] == "InvalidTag")
+    s3.delete_bucket_tagging(Bucket="cl-btag")
+    check("DeleteBucketTagging removes them", code_of(lambda: s3.get_bucket_tagging(Bucket="cl-btag"))[0] == "NoSuchTagSet")
+    s3.put_bucket_tagging(Bucket="cl-btag", Tagging={"TagSet": tags})
+    s3.delete_bucket(Bucket="cl-btag")
+    s3.create_bucket(Bucket="cl-btag")
+    check("and a bucket made again under the name has none",
+          code_of(lambda: s3.get_bucket_tagging(Bucket="cl-btag"))[0] == "NoSuchTagSet")
+    check("a missing bucket is NoSuchBucket", code_of(lambda: s3.get_bucket_tagging(Bucket="cl-nobucket"))[0] == "NoSuchBucket")
+
+
 # A section that raises fails as one assertion and the next still runs, so a runtime without the feature reads red, not dead.
 for section in (delete_bucket_with_uploads, date_header, empty_content_md5, aws_chunked_coding, list_buckets_paged,
                 object_attributes, conditional_writes, completion_sent_twice, full_object_checksums,
-                expiration_header, acls_disabled):
+                expiration_header, acls_disabled, bucket_tags):
     try:
         section()
     except Exception as e:

@@ -722,6 +722,10 @@ public:
     // PutObjectTagging, GetObjectTagging and DeleteObjectTagging, in storage_tagging.cpp.
     void op_put_object_tagging(const std::shared_ptr<conn>& c);
     void op_get_object_tagging(const std::shared_ptr<conn>& c);
+    // A bucket's own tags, in storage_tagging.cpp, kept as a bucket document like its CORS rules.
+    void op_put_bucket_tagging(const std::shared_ptr<conn>& c);
+    void op_get_bucket_tagging(const std::shared_ptr<conn>& c);
+    void op_delete_bucket_tagging(const std::shared_ptr<conn>& c);
     void op_delete_object_tagging(const std::shared_ptr<conn>& c);
     bool object_meta_from_headers(const std::shared_ptr<conn>& c, object_meta& m, s3_error& err);
     void new_request_id(std::string& id);

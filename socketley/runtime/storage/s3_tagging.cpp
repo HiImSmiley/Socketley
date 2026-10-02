@@ -91,11 +91,12 @@ bool next_tag(std::string_view stored, size_t& pos, std::string_view& key, std::
 
 }   // namespace
 
-bool check_tags(const tag_set& tags, s3_error& err)
+bool check_tags(const tag_set& tags, s3_error& err, size_t max_tags)
 {
-    if (tags.size() > max_object_tags)
+    if (tags.size() > max_tags)
     {
-        err = tag_error("BadRequest", "Object tags cannot be greater than 10");
+        err = max_tags == max_object_tags ? tag_error("BadRequest", "Object tags cannot be greater than 10")
+                                          : tag_error("InvalidTag", "Bucket tags cannot be greater than 50");
         return false;
     }
     for (size_t i = 0; i < tags.size(); ++i)
@@ -137,7 +138,7 @@ bool check_tags(const tag_set& tags, s3_error& err)
     return true;
 }
 
-bool parse_tagging_xml(std::string_view xml, tag_set& out, s3_error& err)
+bool parse_tagging_xml(std::string_view xml, tag_set& out, s3_error& err, size_t max_tags)
 {
     out.clear();
     err = make_error("MalformedXML");
@@ -162,7 +163,7 @@ bool parse_tagging_xml(std::string_view xml, tag_set& out, s3_error& err)
             return false;
         out.emplace_back(key->text, value->text);
     }
-    return check_tags(out, err);
+    return check_tags(out, err, max_tags);
 }
 
 bool parse_tagging_header(std::string_view header, tag_set& out, s3_error& err)

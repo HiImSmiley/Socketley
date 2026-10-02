@@ -253,7 +253,7 @@ def mode_main(port):
     st, _, data = raw("POST", "/%s/a" % B, "tagging")
     check("POST ?tagging is MethodNotAllowed", (st, xml_code(data)) == (405, "MethodNotAllowed"), (st, data))
     st, _, data = raw("GET", "/" + B, "tagging")
-    check("a bucket's own ?tagging is still NotImplemented", (st, xml_code(data)) == (501, "NotImplemented"), (st, data))
+    check("a bucket's own ?tagging, never set, is NoSuchTagSet", (st, xml_code(data)) == (404, "NoSuchTagSet"), (st, data))
 
     # ── x-amz-tagging on PutObject ──
     c.put_object(Bucket=B, Key="p", Body=b"put", Tagging="k1=v1&k2=v%202&k3=")

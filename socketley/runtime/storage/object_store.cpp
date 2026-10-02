@@ -13,6 +13,7 @@
 #include "bucket_policy.h"
 #include "disk_chain.h"
 #include "lifecycle.h"
+#include "s3_tagging.h"
 #include "s3_cors.h"
 #include "s3_encryption.h"
 #include "s3_names.h"
@@ -2833,7 +2834,7 @@ void object_store::drop_rename(std::string name, std::function<void(st)> cb)
 
 static_assert(cors_max_bytes <= doc_max_bytes && lifecycle_max_bytes <= doc_max_bytes &&
               policy_max_bytes <= doc_max_bytes && versioning_max_bytes <= doc_max_bytes &&
-              encryption_max_bytes <= doc_max_bytes);
+              encryption_max_bytes <= doc_max_bytes && bucket_tagging_max_bytes <= doc_max_bytes);
 static_assert(std::size(all_bucket_docs) <= 8, "doc_doubt has a bit per kind");
 
 const char* object_store::doc_file(bucket_doc kind)
@@ -2845,6 +2846,7 @@ const char* object_store::doc_file(bucket_doc kind)
         case bucket_doc::policy:     return "policy";
         case bucket_doc::versioning: return "versioning";
         case bucket_doc::encryption: return "encryption";
+        case bucket_doc::tagging:    return "tagging";
     }
     return "?";
 }
@@ -2860,6 +2862,12 @@ const bucket_policy* object_store::policy(std::string_view name) const
     // Kept while the bucket is being dropped, so its denials hold until it is gone.
     const bucket* b = find_bucket(name);
     return b ? b->policy.get() : nullptr;
+}
+
+std::shared_ptr<const std::string> object_store::bucket_tagging(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b && !b->closing ? b->tagging : nullptr;
 }
 
 const cors_config* object_store::bucket_cors(std::string_view name) const
@@ -2926,6 +2934,18 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml, st
         if ((v == versioning::off) != (b.vstate == versioning::off))
             hot_drop_bucket(b.name);
         b.vstate = v;
+        return true;
+    }
+    if (kind == bucket_doc::tagging)
+    {
+        tag_set tags;
+        if (!xml.empty() && !parse_tagging_xml(xml, tags, err, max_bucket_tags))
+        {
+            if (why)
+                *why = err.message;
+            return false;
+        }
+        b.tagging = xml.empty() ? nullptr : std::make_shared<const std::string>(xml);
         return true;
     }
     if (kind == bucket_doc::encryption)

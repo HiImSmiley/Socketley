@@ -61,10 +61,11 @@ enum class bucket_doc : uint8_t
     policy,
     versioning,
     encryption,
+    tagging,
 };
 // Every kind, for the walks that settle or take up all of a bucket's documents.
 inline constexpr bucket_doc all_bucket_docs[] = {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy,
-                                                 bucket_doc::versioning, bucket_doc::encryption};
+                                                 bucket_doc::versioning, bucket_doc::encryption, bucket_doc::tagging};
 
 // A bucket's versioning: never configured, keeping every version, or writing the null version.
 enum class versioning : uint8_t
@@ -575,6 +576,8 @@ public:
     bool any_cors() const { return m_cors_buckets != 0; }
     // The bucket's CORS rules, null when it has none; valid until they next change.
     const cors_config* bucket_cors(std::string_view name) const;
+    // The bucket's Tagging document, null when it has none.
+    std::shared_ptr<const std::string> bucket_tagging(std::string_view name) const;
     // The bucket's lifecycle rules, null when it has none.
     std::shared_ptr<const lifecycle_config> lifecycle(std::string_view name) const;
     // How many buckets have lifecycle rules.
@@ -817,6 +820,8 @@ private:
         std::shared_ptr<const cors_config> cors;
         std::shared_ptr<const lifecycle_config> lifecycle;
         std::shared_ptr<const bucket_policy> policy;
+        // The bucket's own Tagging document, as it was set.
+        std::shared_ptr<const std::string> tagging;
         versioning  vstate{versioning::off};
         // Per key, every version but a latest that is not a delete marker, newest first: the key's
         // noncurrent versions, behind its latest when that is a marker; empty unless the bucket was versioned.

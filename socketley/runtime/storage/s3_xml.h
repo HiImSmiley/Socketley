@@ -115,6 +115,7 @@ inline s3_error make_error(std::string_view code)
         {"AccessForbidden", 403, "CORSResponse: This CORS request is not allowed. This is usually because the evalution of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted by the resource's CORS spec."},
         {"NoSuchCORSConfiguration", 404, "The CORS configuration does not exist"},
         {"NoSuchBucketPolicy", 404, "The bucket policy does not exist"},
+        {"NoSuchTagSet", 404, "The TagSet does not exist"},
         {"ServerSideEncryptionConfigurationNotFoundError", 404, "The server side encryption configuration was not found"},
         {"InvalidEncryptionAlgorithmError", 400, "The encryption request you specified is not valid. The valid value is AES256."},
         {"MalformedPolicy", 400, "Policies must be valid JSON and the first byte must be '{'"},
@@ -184,7 +185,7 @@ inline std::string error_xml(const s3_error& e, const error_context& c)
              std::string(c.extra_name) + ">";
     if (e.code == "NoSuchBucket" || e.code == "BucketNotEmpty" || e.code == "InvalidBucketName" ||
         e.code == "NoSuchCORSConfiguration" || e.code == "NoSuchLifecycleConfiguration" ||
-        e.code == "NoSuchBucketPolicy")
+        e.code == "NoSuchBucketPolicy" || e.code == "NoSuchTagSet")
         x += "<BucketName>" + xml_escape(c.bucket) + "</BucketName>";
     if (e.code == "NoSuchKey")
         x += "<Key>" + xml_escape(c.key) + "</Key>";

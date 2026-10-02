@@ -17,16 +17,19 @@ namespace socketley::storage
 using tag_set = std::vector<std::pair<std::string, std::string>>;
 
 inline constexpr size_t max_object_tags     = 10;
+inline constexpr size_t max_bucket_tags     = 50;
+// The most a bucket's Tagging document is kept as.
+inline constexpr size_t bucket_tagging_max_bytes = 64 * 1024;
 inline constexpr size_t max_tag_key_chars   = 128;
 inline constexpr size_t max_tag_value_chars = 256;
 
 // False with `err` when the set breaks S3's rules: at most ten tags, keys of 1
 // to 128 and values of up to 256 characters, of letters, digits, spaces and
 // + - = . _ : / @, keys unique and none beginning "aws:".
-bool check_tags(const tag_set& tags, s3_error& err);
+bool check_tags(const tag_set& tags, s3_error& err, size_t max_tags = max_object_tags);
 
-// A PutObjectTagging body, checked; false with `err` the S3 error a client is given.
-bool parse_tagging_xml(std::string_view xml, tag_set& out, s3_error& err);
+// A PutObjectTagging body, checked; false with `err` the S3 error a client is given.  A bucket's takes `max_tags` 50.
+bool parse_tagging_xml(std::string_view xml, tag_set& out, s3_error& err, size_t max_tags = max_object_tags);
 
 // An x-amz-tagging header, a URL-encoded query string, checked the same way.
 bool parse_tagging_header(std::string_view header, tag_set& out, s3_error& err);

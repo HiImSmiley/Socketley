@@ -59,6 +59,8 @@ std::string_view storage_run::operation_name(const s3_request& r)
         return m == "GET" ? "ListBuckets" : "Unknown";
     if (r.has_query("acl"))
         return bucket_level ? (m == "GET" ? "GetBucketAcl" : "PutBucketAcl") : (m == "GET" ? "GetObjectAcl" : "PutObjectAcl");
+    if (bucket_level && r.has_query("tagging"))
+        return m == "GET" ? "GetBucketTagging" : m == "PUT" ? "PutBucketTagging" : m == "DELETE" ? "DeleteBucketTagging" : "Unknown";
     if (bucket_level && r.has_query("ownershipControls"))
         return m == "GET" ? "GetBucketOwnershipControls" : "PutBucketOwnershipControls";
     if (bucket_level && r.has_query("cors"))

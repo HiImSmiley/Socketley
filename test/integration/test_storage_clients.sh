@@ -10,7 +10,9 @@
 #              header in RFC 2822 form, an empty Content-MD5, aws-chunked named
 #              on an empty body, ListBuckets in pages, GetObjectAttributes,
 #              If-Match and If-None-Match on PutObject and on a completion, and a
-#              completion sent twice
+#              completion sent twice, FULL_OBJECT checksums, x-amz-expiration,
+#              ACLs as with ACLs disabled and a bucket's own tags -- on one
+#              process and again over two shards
 #   aws        AWS CLI v2: mb, a 100 MiB multipart cp both ways, sync up and down
 #              and again, ls, list-buckets --max-buckets, get-object-attributes,
 #              presign, rm --recursive, and rb --force over an open upload
@@ -31,7 +33,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 daemon_isolate stgclients
 
 PORT=$((SL_PORT_BASE+1615))
+PORT2=$((SL_PORT_BASE+1616))
 DATA="$SOCKETLEY_TMPD/objects"
+DATA2="$SOCKETLEY_TMPD/objects2"
 WORK="$SOCKETLEY_TMPD/work"
 EP="http://127.0.0.1:$PORT"
 AK=AKIACLIENTSTEST00001
@@ -39,8 +43,10 @@ SK='clients/test+secret/with=signs0123456789'
 
 cleanup() {
     "$BIN" stop stgcl >/dev/null 2>&1 || true
+    "$BIN" stop stgcl2 >/dev/null 2>&1 || true
     sleep 0.3
     "$BIN" remove stgcl >/dev/null 2>&1 || true
+    "$BIN" remove stgcl2 >/dev/null 2>&1 || true
     daemon_stop
 }
 trap cleanup EXIT
@@ -86,6 +92,19 @@ if command -v python3 >/dev/null 2>&1 && python3 -c 'import boto3' 2>/dev/null; 
     python3 "$HERE/lib_storage_clients.py" "$PORT" "$AK" "$SK"
     rc=$?
     [ "$rc" -eq 0 ] && pass "the boto3 half" || fail "the boto3 half" "$rc assertions failed"
+    # Again over two shards, where a key's owner, an upload's and a document's are often another process.
+    if "$BIN" create storage stgcl2 -p "$PORT2" --dir "$DATA2" --shards 2 --access-key "$AK" --secret-key "$SK" -s >/dev/null 2>&1; then
+        for _ in $(seq 1 100); do
+            curl -s -o /dev/null "http://127.0.0.1:$PORT2/" 2>/dev/null && break
+            sleep 0.1
+        done
+        echo "--- the same over two shards ---"
+        python3 "$HERE/lib_storage_clients.py" "$PORT2" "$AK" "$SK"
+        rc=$?
+        [ "$rc" -eq 0 ] && pass "the boto3 half over two shards" || fail "the boto3 half over two shards" "$rc assertions failed"
+    else
+        fail "create over two shards" "the sharded runtime was not created"
+    fi
 else
     echo "  SKIP: boto3 is not installed"
 fi

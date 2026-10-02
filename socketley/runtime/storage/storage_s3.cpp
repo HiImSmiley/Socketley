@@ -53,9 +53,9 @@ bool unsupported_subresource(const s3_request& r, bool object)
         return true;
     for (const auto& q : r.query)
         for (std::string_view n : names)
-            // An object's tags and attributes are implemented, and a bucket's are not; ACLs are read and set, as
-            // S3 does for a bucket whose ACLs are disabled, and a bucket's ownership controls are read.
-            if (q.first == n && ((n != "tagging" && n != "attributes") || r.key.empty() ||
+            // Tags are an object's and a bucket's, an object's attributes are read, ACLs are read and set as S3 does
+            // for a bucket whose ACLs are disabled, and a bucket's ownership controls are read.
+            if (q.first == n && ((n != "tagging" && n != "attributes") || (n == "attributes" && r.key.empty()) ||
                                  (n == "attributes" && r.method != "GET")) &&
                 (n != "acl" || (r.method != "GET" && r.method != "PUT")) &&
                 (n != "ownershipControls" || !r.key.empty() || (r.method != "GET" && r.method != "PUT")))
@@ -302,6 +302,18 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
     if (bkt && q.has_query("ownershipControls"))
     {
         op_ownership_controls(c);
+        return;
+    }
+    if (bkt && q.has_query("tagging"))
+    {
+        if (m == "GET")
+            op_get_bucket_tagging(c);
+        else if (m == "PUT")
+            op_put_bucket_tagging(c);
+        else if (m == "DELETE")
+            op_delete_bucket_tagging(c);
+        else
+            send_error(c, make_error("MethodNotAllowed"));
         return;
     }
     if (bkt && q.has_query("cors"))

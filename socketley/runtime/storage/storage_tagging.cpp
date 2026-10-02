@@ -63,6 +63,82 @@ void storage_run::op_put_object_tagging(const std::shared_ptr<conn>& c)
     });
 }
 
+void storage_run::op_put_bucket_tagging(const std::shared_ptr<conn>& c)
+{
+    const s3_request& q = c->req;
+    if (!m_store.has_bucket(q.bucket))
+    {
+        send_error_st(c, st::no_such_bucket);
+        return;
+    }
+    s3_error err;
+    tag_set  tags;
+    if (!body_md5_ok(q, c->body, err) || !parse_tagging_xml(c->body, tags, err, max_bucket_tags))
+    {
+        send_error(c, err);
+        return;
+    }
+    // Kept as the set it holds, so GetBucketTagging answers the tags in the order they were given.
+    std::weak_ptr<conn> weak = c;
+    m_node.set_doc(bucket_doc::tagging, q.bucket, tagging_xml(tags), [this, weak](st s)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        if (s != st::ok)
+        {
+            send_error_st(cc, s);
+            return;
+        }
+        response r;
+        r.status = 204;
+        send_response(cc, std::move(r));
+    });
+}
+
+void storage_run::op_get_bucket_tagging(const std::shared_ptr<conn>& c)
+{
+    if (!m_store.has_bucket(c->req.bucket))
+    {
+        send_error_st(c, st::no_such_bucket);
+        return;
+    }
+    const auto xml = m_store.bucket_tagging(c->req.bucket);
+    if (!xml)
+    {
+        send_error(c, make_error("NoSuchTagSet"));
+        return;
+    }
+    response r;
+    r.headers.emplace_back("Content-Type", "application/xml");
+    r.body = *xml;
+    send_response(c, std::move(r));
+}
+
+void storage_run::op_delete_bucket_tagging(const std::shared_ptr<conn>& c)
+{
+    if (!m_store.has_bucket(c->req.bucket))
+    {
+        send_error_st(c, st::no_such_bucket);
+        return;
+    }
+    std::weak_ptr<conn> weak = c;
+    m_node.set_doc(bucket_doc::tagging, c->req.bucket, {}, [this, weak](st s)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        if (s != st::ok)
+        {
+            send_error_st(cc, s);
+            return;
+        }
+        response r;
+        r.status = 204;
+        send_response(cc, std::move(r));
+    });
+}
+
 void storage_run::op_get_object_tagging(const std::shared_ptr<conn>& c)
 {
     const s3_request& q = c->req;
