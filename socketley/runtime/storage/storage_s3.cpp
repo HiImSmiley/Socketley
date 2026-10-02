@@ -1125,7 +1125,7 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
                     one.marker_version_id = rr.version_id;
             }
             done_one(b);
-        }, bypass);
+        }, bypass, origin_of(*c));
     }
 }
 
@@ -1329,6 +1329,7 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
         return;
     }
     op->set_cause(r.form ? change_cause::post : change_cause::put);
+    op->set_origin(origin_of(*c));
     if (ck.algo != checksum_algo::none)
     {
         op->track_checksum(ck.algo, std::move(ck.expected_b64));
@@ -1577,7 +1578,7 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
         resp.body = copy_result_xml(p.meta);
         send_response(cc, std::move(resp));
         notify_put(cc->req.bucket, cc->req.key, p.meta);
-    });
+    }, origin_of(*c));
 }
 
 // ─── DeleteObject ───────────────────────────────────────────────────────────
@@ -1612,7 +1613,7 @@ void storage_run::op_delete_object(const std::shared_ptr<conn>& c)
         if (!rr.version_id.empty())
             r.headers.emplace_back("x-amz-version-id", rr.version_id);
         send_response(cc, std::move(r));
-    }, bypass);
+    }, bypass, origin_of(*c));
 }
 
 // ─── GetObject, HeadObject ──────────────────────────────────────────────────

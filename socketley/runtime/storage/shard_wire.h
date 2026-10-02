@@ -73,15 +73,17 @@ bool        decode_committed(std::string_view reply, put_result& r);
 
 // A delete of the key, or of its version `version_id` when that is not empty, `bypass` going past a GOVERNANCE retention.
 std::string encode_remove(std::string_view bucket, std::string_view key, std::string_view version_id = {},
-                          bool bypass = false);
+                          bool bypass = false, const change_origin& who = {});
 bool        decode_remove(std::string_view payload, std::string& bucket, std::string& key,
-                          std::string* version_id = nullptr, bool* bypass = nullptr);
+                          std::string* version_id = nullptr, bool* bypass = nullptr, change_origin* who = nullptr);
 
 // A header change: `value` is the tags, the retention or the legal hold as header_change::kind `what` says.
 std::string encode_set_tags(std::string_view bucket, std::string_view key, std::string_view version_id,
-                            std::string_view value, uint8_t what = 0, bool bypass = false);
+                            std::string_view value, uint8_t what = 0, bool bypass = false,
+                            const change_origin& who = {});
 bool        decode_set_tags(std::string_view payload, std::string& bucket, std::string& key, std::string& version_id,
-                            std::string& value, uint8_t* what = nullptr, bool* bypass = nullptr);
+                            std::string& value, uint8_t* what = nullptr, bool* bypass = nullptr,
+                            change_origin* who = nullptr);
 // The answer to a header change: its status and the version it changed.
 std::string encode_tagged(st s, std::string_view version_id);
 bool        decode_tagged(std::string_view reply, st& s, std::string& version_id);

@@ -298,6 +298,13 @@ struct put_condition
 // ok, precondition_failed, or no_such_key for an If-Match with nothing to match.
 st check_put_condition(const put_condition& c, const object_meta* current);
 
+// Who asked for a change, as an event record names them: the user id or "anonymous", and the client's address.
+struct change_origin
+{
+    std::string principal;
+    std::string source_ip;
+};
+
 // A change of what a version keeps in its header's slots, made in place by the owner of its key.
 struct header_change
 {
@@ -307,6 +314,7 @@ struct header_change
     std::string value;
     // The caller may shorten, remove or change a GOVERNANCE retention.
     bool        bypass{false};
+    change_origin who{};
 };
 
 // What made a change, which decides the event a bucket's notification configuration is told of it as.
@@ -325,6 +333,7 @@ struct change_note
 {
     std::string bucket;
     std::string key;
+    change_origin who;
     // One notify_event bit.
     uint16_t    event{0};
     // The object's size and ETag, which a removal has none of.
@@ -348,6 +357,7 @@ struct commit_request
     // was written, so the answer waits for the rename and not for its sync.
     bool        pooled{false};
     change_cause cause{change_cause::put};
+    change_origin who;
 };
 
 // A body being written, from the first byte to the commit.
@@ -425,8 +435,9 @@ public:
     // The object's key and bucket, for the caller's log line.
     const std::string& key() const { return m_key; }
 
-    // What the commit is told it is, for the event it may make.
+    // What the commit is told it is and who asked for it, for the event it may make.
     void set_cause(change_cause c) { m_cause = c; }
+    void set_origin(change_origin who) { m_who = std::move(who); }
 
 private:
     friend class object_store;
@@ -524,6 +535,7 @@ private:
     std::array<char, sse_overhead> m_tail{};
     committer   m_committer;
     change_cause m_cause{change_cause::put};
+    change_origin m_who;
     st         m_status{st::ok};
     // A body placed into another file by place_body(), and the syncs still owed before the commit.
     bool        m_placed{false};
@@ -556,7 +568,7 @@ public:
     // `version_id` empty deletes the key as the bucket's versioning says, and otherwise that version of it.
     // `bypass` lets the removal of a version go past a GOVERNANCE retention.
     virtual void remove(uint32_t owner, std::string bucket, std::string key, std::string version_id, bool bypass,
-                        std::function<void(remove_result)> cb) = 0;
+                        change_origin who, std::function<void(remove_result)> cb) = 0;
     virtual void change_header(uint32_t owner, std::string bucket, std::string key, std::string version_id,
                                header_change change, std::function<void(st, std::string version_id)> cb) = 0;
     // Tells every sibling that may hold the key to drop it, and `done` runs once each has answered or is gone.
@@ -748,16 +760,16 @@ public:
     // `only_if`, when given, is asked under the key's lane and keeps an object it says no to.
     void remove_local(std::string_view bucket, std::string_view key, std::function<void(st, bool existed)> cb,
                       std::function<bool(const object_meta&)> only_if = {},
-                      change_cause cause = change_cause::remove);
+                      change_cause cause = change_cause::remove, change_origin who = {});
     // The same with the version: `version_id` empty deletes the key, and otherwise removes that version for good,
     // which a retention or legal hold refuses as st::locked unless `bypass` lifts a GOVERNANCE retention.
     void remove_version(std::string_view bucket, std::string_view key, std::string version_id,
-                        std::function<void(remove_result)> cb, bool bypass = false);
+                        std::function<void(remove_result)> cb, bool bypass = false, change_origin who = {});
     // `only_if` is asked of the version that would be removed, or of the latest before a marker covers it.
     void remove_version_local(std::string_view bucket, std::string_view key, std::string version_id,
                               std::function<void(remove_result)> cb,
                               std::function<bool(const object_meta&)> only_if = {}, bool bypass = false,
-                              change_cause cause = change_cause::remove);
+                              change_cause cause = change_cause::remove, change_origin who = {});
 
     // Makes `change` of an object or of its version `version_id`, keeping its bytes, ETag and time; `cb` is told
     // the version it changed.
@@ -768,10 +780,10 @@ public:
                              header_change change, std::function<void(st, std::string)> cb);
     // Makes `tags`, in the encoding of tags_of(), the tags of an object or of its version `version_id`.
     void set_tags(std::string_view bucket, std::string_view key, std::string version_id, std::string tags,
-                  std::function<void(st, std::string)> cb)
+                  std::function<void(st, std::string)> cb, change_origin who = {})
     {
-        change_header(bucket, key, std::move(version_id), header_change{header_change::kind::tags, std::move(tags)},
-                      std::move(cb));
+        change_header(bucket, key, std::move(version_id),
+                      header_change{header_change::kind::tags, std::move(tags), false, std::move(who)}, std::move(cb));
     }
     void set_tags(std::string_view bucket, std::string_view key, std::string tags, std::function<void(st)> cb)
     {
@@ -782,7 +794,7 @@ public:
     // metadata `meta` names.
     void copy(std::string_view src_bucket, std::string_view src_key, std::string src_version,
               std::string_view dst_bucket, std::string_view dst_key, object_meta meta,
-              std::function<void(put_result)> cb);
+              std::function<void(put_result)> cb, change_origin who = {});
     void copy(std::string_view src_bucket, std::string_view src_key, std::string_view dst_bucket,
               std::string_view dst_key, object_meta meta, std::function<void(put_result)> cb)
     {
@@ -1074,7 +1086,8 @@ private:
     std::function<void(put_result)> noted_commit(const bucket& b, const commit_request& req,
                                                  std::function<void(put_result)> cb);
     std::function<void(remove_result)> noted_remove(const bucket& b, std::string_view key, bool by_version,
-                                                    change_cause cause, std::function<void(remove_result)> cb);
+                                                    change_cause cause, change_origin who,
+                                                    std::function<void(remove_result)> cb);
     std::function<void(st, std::string)> noted_header(const bucket& b, std::string_view key, const header_change& c,
                                                       std::function<void(st, std::string)> cb);
     // A test hook: a commit of a key with this prefix kills the process after

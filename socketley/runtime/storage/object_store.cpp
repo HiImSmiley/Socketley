@@ -1542,19 +1542,20 @@ void object_store::remove(std::string_view bucket_name, std::string_view key_sv,
 
 void object_store::remove_local(std::string_view bucket_name, std::string_view key_sv,
                                 std::function<void(st, bool)> cb, std::function<bool(const object_meta&)> only_if,
-                                change_cause cause)
+                                change_cause cause, change_origin who)
 {
     remove_version_local(bucket_name, key_sv, {}, [cb = std::move(cb)](remove_result r) { cb(r.status, r.existed); },
-                         std::move(only_if), false, cause);
+                         std::move(only_if), false, cause, std::move(who));
 }
 
 void object_store::remove_version(std::string_view bucket_name, std::string_view key_sv, std::string version_id,
-                                  std::function<void(remove_result)> cb, bool bypass)
+                                  std::function<void(remove_result)> cb, bool bypass, change_origin who)
 {
     const uint32_t owner = owner_of(bucket_name, key_sv);
     if (owner == m_opts.shard)
     {
-        remove_version_local(bucket_name, key_sv, std::move(version_id), std::move(cb), {}, bypass);
+        remove_version_local(bucket_name, key_sv, std::move(version_id), std::move(cb), {}, bypass,
+                             change_cause::remove, std::move(who));
         return;
     }
 
@@ -1568,7 +1569,7 @@ void object_store::remove_version(std::string_view bucket_name, std::string_view
     ++m_inflight;
     auto alive = m_alive;
     const std::string bname(bucket_name);
-    m_peers->remove(owner, bname, std::string(key_sv), std::move(version_id), bypass,
+    m_peers->remove(owner, bname, std::string(key_sv), std::move(version_id), bypass, std::move(who),
                     [this, alive, bname, cb](remove_result r)
     {
         if (!*alive)
@@ -1583,7 +1584,7 @@ void object_store::remove_version(std::string_view bucket_name, std::string_view
 void object_store::remove_version_local(std::string_view bucket_name, std::string_view key_sv,
                                         std::string version_id, std::function<void(remove_result)> cb,
                                         std::function<bool(const object_meta&)> only_if, bool bypass,
-                                        change_cause cause)
+                                        change_cause cause, change_origin who)
 {
     bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
@@ -1591,7 +1592,7 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
         cb({st::no_such_bucket});
         return;
     }
-    cb = noted_remove(*b, key_sv, !version_id.empty(), cause, std::move(cb));
+    cb = noted_remove(*b, key_sv, !version_id.empty(), cause, std::move(who), std::move(cb));
     if (!owns(bucket_name, key_sv))
     {
         LOG_WARN(("storage: a delete for a key that shard " + std::to_string(owner_of(bucket_name, key_sv)) +
@@ -2298,6 +2299,7 @@ struct copy_state
     bool        rehash{false};
     md5_stream  digest;
     std::string header;
+    change_origin who;
     std::function<void(put_result)> cb;
 };
 
@@ -2305,7 +2307,7 @@ struct copy_state
 
 void object_store::copy(std::string_view src_bucket, std::string_view src_key, std::string src_version,
                         std::string_view dst_bucket, std::string_view dst_key, object_meta meta,
-                        std::function<void(put_result)> cb)
+                        std::function<void(put_result)> cb, change_origin who)
 {
     bucket* sb = find_bucket(src_bucket);
     bucket* db = find_bucket(dst_bucket);
@@ -2325,6 +2327,7 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
     cs->dst_key    = std::string(dst_key);
     cs->meta       = std::move(meta);
     cs->cb         = std::move(cb);
+    cs->who        = std::move(who);
     // The copy is a new object, whose version only its owner gives.
     clear_version_extra(cs->meta);
     ++db->active_ops;
@@ -2460,6 +2463,7 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
                                     cr.tmp_name = cs->tmp;
                                     cr.meta     = cs->meta;
                                     cr.cause    = change_cause::copy;
+                                    cr.who      = cs->who;
                                     commit(std::move(cr),
                                         [this, alive, cs, finish](put_result pr)
                                         {
@@ -2941,7 +2945,7 @@ std::function<void(put_result)> object_store::noted_commit(const bucket& b, cons
         case change_cause::complete: bit = ev_complete; break;
         default:                     break;
     }
-    return [this, bucket = req.bucket, key = req.key, bit, cb = std::move(cb)](put_result r)
+    return [this, bucket = req.bucket, key = req.key, who = req.who, bit, cb = std::move(cb)](put_result r)
     {
         if (r.status != st::ok)
         {
@@ -2951,6 +2955,7 @@ std::function<void(put_result)> object_store::noted_commit(const bucket& b, cons
         change_note n;
         n.bucket     = bucket;
         n.key        = key;
+        n.who        = who;
         n.event      = bit;
         n.has_object = true;
         n.size       = r.meta.size;
@@ -2962,12 +2967,14 @@ std::function<void(put_result)> object_store::noted_commit(const bucket& b, cons
 }
 
 std::function<void(remove_result)> object_store::noted_remove(const bucket& b, std::string_view key, bool by_version,
-                                                              change_cause cause, std::function<void(remove_result)> cb)
+                                                              change_cause cause, change_origin who,
+                                                              std::function<void(remove_result)> cb)
 {
     if (!b.notify || !m_change_listener)
         return cb;
     const bool lc = cause == change_cause::lifecycle;
-    return [this, bucket = b.name, key = std::string(key), by_version, lc, cb = std::move(cb)](remove_result r)
+    return [this, bucket = b.name, key = std::string(key), who = std::move(who), by_version, lc,
+            cb = std::move(cb)](remove_result r)
     {
         if (r.status != st::ok || (!r.existed && !r.marker))
         {
@@ -2981,6 +2988,7 @@ std::function<void(remove_result)> object_store::noted_remove(const bucket& b, s
         n.key        = key;
         n.event      = made_marker ? (lc ? ev_lc_marker : ev_marker) : (lc ? ev_lc_delete : ev_delete);
         n.version_id = r.version_id;
+        n.who        = who;
         m_change_listener(std::move(n), [cb, r = std::move(r)]() mutable { cb(std::move(r)); });
     };
 }
@@ -2992,7 +3000,7 @@ std::function<void(st, std::string)> object_store::noted_header(const bucket& b,
     if (!b.notify || !m_change_listener || c.what != header_change::kind::tags)
         return cb;
     const uint16_t bit = c.value.empty() ? ev_tagging_del : ev_tagging_put;
-    return [this, bucket = b.name, key = std::string(key), bit, cb = std::move(cb)](st s, std::string id)
+    return [this, bucket = b.name, key = std::string(key), who = c.who, bit, cb = std::move(cb)](st s, std::string id)
     {
         if (s != st::ok)
         {
@@ -3002,6 +3010,7 @@ std::function<void(st, std::string)> object_store::noted_header(const bucket& b,
         change_note n;
         n.bucket     = bucket;
         n.key        = key;
+        n.who        = who;
         n.event      = bit;
         n.version_id = id;
         m_change_listener(std::move(n), [cb, s, id = std::move(id)]() mutable { cb(s, std::move(id)); });

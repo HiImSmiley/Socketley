@@ -60,7 +60,7 @@ void storage_run::op_put_object_tagging(const std::shared_ptr<conn>& c)
             return;
         }
         send_response(cc, tagged(200, id));
-    });
+    }, origin_of(*c));
 }
 
 void storage_run::op_put_bucket_tagging(const std::shared_ptr<conn>& c)
@@ -192,7 +192,7 @@ void storage_run::op_delete_object_tagging(const std::shared_ptr<conn>& c)
             return;
         }
         send_response(cc, tagged(204, id));
-    });
+    }, origin_of(*c));
 }
 
 }   // namespace socketley::storage

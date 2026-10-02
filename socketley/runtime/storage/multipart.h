@@ -232,7 +232,7 @@ public:
     // runs as the bytes move, so the caller can tell a slow assembly from a stuck one.
     void complete(std::string bucket, std::string id, std::vector<complete_part> parts,
                   std::function<void()> progress, std::function<void(complete_result)> cb,
-                  complete_binder bind = {}, put_condition cond = {});
+                  complete_binder bind = {}, put_condition cond = {}, change_origin who = {});
 
     // The two halves of `complete`, for a completion whose assembly runs on
     // another shard: this one validates the list against the upload and seals it,
@@ -244,7 +244,7 @@ public:
     // owner of the key is the one that renames it; the upload is not touched.
     void assemble_plan_object(assemble_plan plan, std::function<void()> progress,
                               std::function<void(complete_result)> cb, complete_binder bind = {},
-                              put_condition cond = {});
+                              put_condition cond = {}, change_origin who = {});
     void finish_complete(std::string bucket, std::string id, bool ok);
 
     // The parts of an upload, `max_parts` of them after `marker`.

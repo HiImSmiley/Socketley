@@ -226,6 +226,7 @@ struct assemble_state
     complete_binder bind;
     // If-Match and If-None-Match of the completion, decided by the key's owner at the commit.
     put_condition cond;
+    change_origin who;
     // The part list written after the body, when the header has no room for it.
     std::string trailer;
 };
@@ -864,11 +865,11 @@ void multipart_store::finish_part(const std::shared_ptr<part_commit>& pc, int64_
 
 void multipart_store::complete(std::string bucket, std::string id, std::vector<complete_part> parts,
                                std::function<void()> progress, std::function<void(complete_result)> cb,
-                               complete_binder bind, put_condition cond)
+                               complete_binder bind, put_condition cond, change_origin who)
 {
     prepare_complete(bucket, id, std::move(parts),
         [this, alive = m_alive, progress = std::move(progress), cb, bind = std::move(bind),
-         cond = std::move(cond)](s3_error err, assemble_plan plan) mutable
+         cond = std::move(cond), who = std::move(who)](s3_error err, assemble_plan plan) mutable
         {
             if (!*alive)
                 return;
@@ -894,13 +895,14 @@ void multipart_store::complete(std::string bucket, std::string id, std::vector<c
             a->progress     = std::move(progress);
             a->bind         = std::move(bind);
             a->cond         = std::move(cond);
+            a->who          = std::move(who);
             assemble(std::move(a));
         });
 }
 
 void multipart_store::assemble_plan_object(assemble_plan plan, std::function<void()> progress,
                                            std::function<void(complete_result)> cb, complete_binder bind,
-                                           put_condition cond)
+                                           put_condition cond, change_origin who)
 {
     auto a = std::make_shared<assemble_state>();
     a->bucket       = std::move(plan.bucket);
@@ -918,6 +920,7 @@ void multipart_store::assemble_plan_object(assemble_plan plan, std::function<voi
     a->local        = false;
     a->bind         = std::move(bind);
     a->cond         = std::move(cond);
+    a->who          = std::move(who);
     assemble(std::move(a));
 }
 
@@ -1458,6 +1461,7 @@ void multipart_store::assemble_commit(const std::shared_ptr<assemble_state>& a)
     req.meta     = a->meta;
     req.cond     = a->cond;
     req.cause    = change_cause::complete;
+    req.who      = a->who;
     m_store->commit(std::move(req), [this, alive = m_alive, a](put_result pr)
     {
         if (!*alive)

@@ -785,6 +785,7 @@ void put_op::synced(int64_t res)
     req.cond        = m_cond;
     req.pooled      = m_pooled;
     req.cause       = m_cause;
+    req.who         = m_who;
     auto self = shared_from_this();
     auto done = [self](put_result r2)
     {

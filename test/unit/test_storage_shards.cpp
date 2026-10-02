@@ -1396,6 +1396,7 @@ TEST_CASE("the wire forms round-trip and refuse what is not theirs")
     req.cond.if_match = "\"abc\"";
     req.cond.if_none_match = "*";
     req.cause = change_cause::complete;
+    req.who   = {"alice", "192.0.2.7"};
     const std::string enc = wire::encode_commit(req);
     commit_request back;
     REQUIRE(wire::decode_commit(enc, back));
@@ -1407,10 +1408,24 @@ TEST_CASE("the wire forms round-trip and refuse what is not theirs")
     CHECK(back.cond.if_none_match == "*");
     // The cause decides the event its owner sends, so one past the last is refused rather than guessed.
     CHECK(back.cause == change_cause::complete);
-    std::string bad_cause = enc;
-    bad_cause.back() = static_cast<char>(static_cast<uint8_t>(change_cause::lifecycle) + 1);
+    // And who asked for it, which the event the owner sends names.
+    CHECK(back.who.principal == "alice");
+    CHECK(back.who.source_ip == "192.0.2.7");
+    commit_request bad = req;
+    bad.cause = static_cast<change_cause>(static_cast<uint8_t>(change_cause::lifecycle) + 1);
     commit_request junk_cause;
-    CHECK_FALSE(wire::decode_commit(bad_cause, junk_cause));
+    CHECK_FALSE(wire::decode_commit(wire::encode_commit(bad), junk_cause));
+    {
+        std::string b, k, v, val;
+        bool by = false;
+        uint8_t what = 0;
+        change_origin w;
+        REQUIRE(wire::decode_remove(wire::encode_remove("bkt", "k", "", false, {"bob", "::1"}), b, k, &v, &by, &w));
+        CHECK((w.principal == "bob" && w.source_ip == "::1"));
+        REQUIRE(wire::decode_set_tags(wire::encode_set_tags("bkt", "k", "", "t", 0, false, {"anonymous", "10.0.0.1"}),
+                                      b, k, v, val, &what, &by, &w));
+        CHECK((w.principal == "anonymous" && w.source_ip == "10.0.0.1"));
+    }
     wire::op o{};
     REQUIRE(wire::request_op(enc, o));
     CHECK(o == wire::op::commit);
@@ -1424,7 +1439,9 @@ TEST_CASE("the wire forms round-trip and refuse what is not theirs")
     CHECK_FALSE(wire::request_op("*1\r\n$4\r\nPING\r\n", o));
     CHECK_FALSE(wire::request_op("", o));
     std::string flipped = enc;
-    flipped[flipped.size() - 5] ^= 0x10;
+    // A byte of the record, which ends before the cause and the origin's two strings.
+    const size_t tail = 1 + 8 + req.who.principal.size() + req.who.source_ip.size();
+    flipped[flipped.size() - tail - 5] ^= 0x10;
     commit_request junk;
     CHECK_FALSE(wire::decode_commit(flipped, junk));
 

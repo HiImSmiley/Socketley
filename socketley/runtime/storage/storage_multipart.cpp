@@ -428,7 +428,7 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
             // A completed upload is a put like any other, whatever shard it was assembled on.
             send_completed(cc, res.meta, res.checksum_b64);
             notify_put(bucket, key, res.meta);
-        }, std::move(bind), std::move(cond));
+        }, std::move(bind), std::move(cond), origin_of(*c));
 }
 
 void storage_run::send_completed(const std::shared_ptr<conn>& c, const object_meta& m, const std::string& checksum_b64)

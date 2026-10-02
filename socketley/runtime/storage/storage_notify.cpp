@@ -2,6 +2,10 @@
 // owner of a key queues for each change it makes.
 #include "storage_run.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include "s3_notify.h"
 #include "s3_xml.h"
 
@@ -69,6 +73,32 @@ void storage_run::op_get_notification(const std::shared_ptr<conn>& c)
     send_response(c, std::move(r));
 }
 
+change_origin storage_run::origin_of(const conn& c) const
+{
+    if (!m_store.bucket_notify(c.req.bucket))
+        return {};
+    change_origin o;
+    o.principal = c.user ? c.user->id : "anonymous";
+    struct sockaddr_storage ss{};
+    socklen_t len = sizeof(ss);
+    if (::getpeername(c.fd, reinterpret_cast<struct sockaddr*>(&ss), &len) < 0)
+        return o;
+    char host[INET6_ADDRSTRLEN] = {};
+    if (ss.ss_family == AF_INET)
+        ::inet_ntop(AF_INET, &reinterpret_cast<const struct sockaddr_in*>(&ss)->sin_addr, host, sizeof(host));
+    else if (ss.ss_family == AF_INET6)
+    {
+        const auto& a6 = reinterpret_cast<const struct sockaddr_in6*>(&ss)->sin6_addr;
+        // An IPv4 client on a dual-stack socket is named by its IPv4 address, as S3 names it.
+        if (IN6_IS_ADDR_V4MAPPED(&a6))
+            ::inet_ntop(AF_INET, &a6.s6_addr[12], host, sizeof(host));
+        else
+            ::inet_ntop(AF_INET6, &a6, host, sizeof(host));
+    }
+    o.source_ip = host;
+    return o;
+}
+
 void storage_run::notify_change(change_note n, std::function<void()> answer)
 {
     const auto cfg = m_store.bucket_notify(n.bucket);
@@ -88,6 +118,8 @@ void storage_run::notify_change(change_note n, std::function<void()> answer)
         f.bucket     = n.bucket;
         f.key        = n.key;
         f.owner      = owner_of(n.bucket);
+        f.principal  = n.who.principal;
+        f.source_ip  = n.who.source_ip;
         f.etag       = n.etag;
         f.version_id = n.version_id;
         f.sequencer  = seq;

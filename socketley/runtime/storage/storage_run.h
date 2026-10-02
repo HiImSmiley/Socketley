@@ -655,6 +655,11 @@ public:
     // A change the owner of its key made, queued for every rule of its bucket that asks for it; `answer` runs once
     // their records are synced.
     void notify_change(change_note n, std::function<void()> answer);
+    // Who a request's change is told as: its user or "anonymous", and the client's address, left empty for a
+    // bucket that sends no events.
+    change_origin origin_of(const conn& c) const;
+    // A lifecycle rule's expiry, which S3's records name as S3 itself.
+    static change_origin lifecycle_origin() { return {"s3.amazonaws.com", {}}; }
 
     // Object lock, in storage_object_lock.cpp.
     void op_put_object_lock_config(const std::shared_ptr<conn>& c);

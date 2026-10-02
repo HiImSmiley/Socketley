@@ -41,6 +41,18 @@ bool decode_record(std::string_view record, std::string& key, object_meta& meta)
     return true;
 }
 
+// Who asked for a change, carried to the owner of the key so the event it sends names them.
+void put_origin(bytes::writer& w, const change_origin& who)
+{
+    w.bytes(who.principal);
+    w.bytes(who.source_ip);
+}
+
+bool get_origin(bytes::reader& r, change_origin& who)
+{
+    return r.bytes(who.principal, 1024) && r.bytes(who.source_ip, 64);
+}
+
 bool status_byte(bytes::reader& r, st& s)
 {
     uint8_t b = 0;
@@ -80,6 +92,7 @@ std::string encode_commit(const commit_request& req)
     encode_put_record(rec, req.key, req.meta);
     w.bytes(rec);
     w.u8(static_cast<uint8_t>(req.cause));
+    put_origin(w, req.who);
     return w.take();
 }
 
@@ -93,40 +106,46 @@ bool decode_commit(std::string_view payload, commit_request& out)
     if (!open_request(r, op::commit) || !r.bytes(out.bucket, name_cap) || !r.bytes(out.key, name_cap) ||
         !r.bytes(out.tmp_name, name_cap) || !r.flag(conditional) ||
         (conditional && (!r.bytes(out.cond.if_match, name_cap) || !r.bytes(out.cond.if_none_match, name_cap))) ||
-        !r.view(rec, record_cap) || !r.u8(cause) || cause > static_cast<uint8_t>(change_cause::lifecycle))
+        !r.view(rec, record_cap) || !r.u8(cause) || cause > static_cast<uint8_t>(change_cause::lifecycle) ||
+        !get_origin(r, out.who))
         return false;
     out.cause = static_cast<change_cause>(cause);
     return decode_record(rec, key, out.meta) && key == out.key;
 }
 
-std::string encode_remove(std::string_view bucket, std::string_view key, std::string_view version_id, bool bypass)
+std::string encode_remove(std::string_view bucket, std::string_view key, std::string_view version_id, bool bypass,
+                          const change_origin& who)
 {
     bytes::writer w = begin(op::remove);
     w.bytes(bucket);
     w.bytes(key);
     w.bytes(version_id);
     w.u8(bypass ? 1 : 0);
+    put_origin(w, who);
     return w.take();
 }
 
 bool decode_remove(std::string_view payload, std::string& bucket, std::string& key, std::string* version_id,
-                   bool* bypass)
+                   bool* bypass, change_origin* who)
 {
     bytes::reader r(payload);
     std::string id;
     bool by = false;
+    change_origin o;
     if (!open_request(r, op::remove) || !r.bytes(bucket, name_cap) || !r.bytes(key, name_cap) || !r.bytes(id, 256) ||
-        !r.flag(by))
+        !r.flag(by) || !get_origin(r, o))
         return false;
     if (version_id)
         *version_id = std::move(id);
     if (bypass)
         *bypass = by;
+    if (who)
+        *who = std::move(o);
     return true;
 }
 
 std::string encode_set_tags(std::string_view bucket, std::string_view key, std::string_view version_id,
-                            std::string_view value, uint8_t what, bool bypass)
+                            std::string_view value, uint8_t what, bool bypass, const change_origin& who)
 {
     bytes::writer w = begin(op::set_tags);
     w.bytes(bucket);
@@ -135,22 +154,26 @@ std::string encode_set_tags(std::string_view bucket, std::string_view key, std::
     w.bytes(value);
     w.u8(what);
     w.u8(bypass ? 1 : 0);
+    put_origin(w, who);
     return w.take();
 }
 
 bool decode_set_tags(std::string_view payload, std::string& bucket, std::string& key, std::string& version_id,
-                     std::string& value, uint8_t* what, bool* bypass)
+                     std::string& value, uint8_t* what, bool* bypass, change_origin* who)
 {
     bytes::reader r(payload);
     uint8_t kind = 0;
     bool    by   = false;
+    change_origin o;
     if (!open_request(r, op::set_tags) || !r.bytes(bucket, name_cap) || !r.bytes(key, name_cap) ||
-        !r.bytes(version_id, 256) || !r.bytes(value, record_cap) || !r.u8(kind) || !r.flag(by))
+        !r.bytes(version_id, 256) || !r.bytes(value, record_cap) || !r.u8(kind) || !r.flag(by) || !get_origin(r, o))
         return false;
     if (what)
         *what = kind;
     if (bypass)
         *bypass = by;
+    if (who)
+        *who = std::move(o);
     return true;
 }
 

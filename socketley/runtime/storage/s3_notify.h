@@ -349,6 +349,9 @@ struct notify_fields
     std::string_view key;
     std::string_view config_id;
     std::string_view owner;
+    // Who asked for the change and from where.
+    std::string_view principal;
+    std::string_view source_ip;
     std::string_view etag;
     std::string_view version_id;
     std::string_view sequencer;
@@ -368,8 +371,10 @@ inline std::string notify_event_json(uint16_t bit, const notify_fields& f)
     j += R"(","eventName":)";
     notify_json_string(j, notify_event_name(bit));
     j += R"(,"userIdentity":{"principalId":)";
-    notify_json_string(j, f.owner);
-    j += R"(},"requestParameters":{"sourceIPAddress":""},"responseElements":{},"s3":{"s3SchemaVersion":"1.0","configurationId":)";
+    notify_json_string(j, f.principal);
+    j += R"(},"requestParameters":{"sourceIPAddress":)";
+    notify_json_string(j, f.source_ip);
+    j += R"(},"responseElements":{},"s3":{"s3SchemaVersion":"1.0","configurationId":)";
     notify_json_string(j, f.config_id);
     j += R"(,"bucket":{"name":)";
     notify_json_string(j, f.bucket);

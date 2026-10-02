@@ -102,11 +102,11 @@ void shard_node::commit(uint32_t owner, commit_request req, std::function<void(p
 }
 
 void shard_node::remove(uint32_t owner, std::string bucket, std::string key, std::string version_id, bool bypass,
-                        std::function<void(remove_result)> cb)
+                        change_origin who, std::function<void(remove_result)> cb)
 {
     ++m_c.removes_out;
     auto alive = m_alive;
-    m_transport.call(owner, wire::encode_remove(bucket, key, version_id, bypass),
+    m_transport.call(owner, wire::encode_remove(bucket, key, version_id, bypass, who),
                      [this, alive, cb](bool ok, std::string_view reply)
     {
         if (!*alive)
@@ -127,7 +127,7 @@ void shard_node::change_header(uint32_t owner, std::string bucket, std::string k
     ++m_c.tags_out;
     auto alive = m_alive;
     m_transport.call(owner, wire::encode_set_tags(bucket, key, version_id, change.value,
-                                                  static_cast<uint8_t>(change.what), change.bypass),
+                                                  static_cast<uint8_t>(change.what), change.bypass, change.who),
                      [this, alive, cb](bool ok, std::string_view reply)
     {
         if (!*alive)
@@ -820,7 +820,8 @@ put_op::committer shard_node::mpu_part_committer(std::string bucket, std::string
 
 void shard_node::mpu_complete(std::string bucket, std::string key, std::string id,
                               std::vector<complete_part> parts, std::function<void()> progress,
-                              std::function<void(complete_result)> cb, complete_binder bind, put_condition cond)
+                              std::function<void(complete_result)> cb, complete_binder bind, put_condition cond,
+                              change_origin who)
 {
     if (!m_mpu)
     {
@@ -839,7 +840,7 @@ void shard_node::mpu_complete(std::string bucket, std::string key, std::string i
             return;
         }
         m_mpu->complete(std::move(bucket), std::move(id), std::move(parts), std::move(progress), std::move(cb),
-                        std::move(bind), std::move(cond));
+                        std::move(bind), std::move(cond), std::move(who));
         return;
     }
 
@@ -853,7 +854,7 @@ void shard_node::mpu_complete(std::string bucket, std::string key, std::string i
     wire::mpu_ref ref{bucket, key, id, 0, 0, false};
     m_transport.call(owner, wire::encode_mpu_prepare(ref, parts),
         [this, alive, owner, bucket, key, id, progress = std::move(progress), cb,
-         bind = std::move(bind), cond = std::move(cond)](bool ok, std::string_view reply) mutable
+         bind = std::move(bind), cond = std::move(cond), who = std::move(who)](bool ok, std::string_view reply) mutable
         {
             if (!*alive)
                 return;
@@ -891,7 +892,7 @@ void shard_node::mpu_complete(std::string bucket, std::string key, std::string i
                                              ++m_c.peer_failures;
                                          cb(std::move(res));
                                      });
-                }, std::move(bind), std::move(cond));
+                }, std::move(bind), std::move(cond), std::move(who));
         });
 }
 
@@ -1154,14 +1155,16 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
         {
             std::string bucket, key, version_id;
             bool bypass = false;
-            if (!wire::decode_remove(payload, bucket, key, &version_id, &bypass))
+            change_origin who;
+            if (!wire::decode_remove(payload, bucket, key, &version_id, &bypass, &who))
             {
                 reply(false, {});
                 return;
             }
             ++m_c.removes_in;
             m_store.remove_version_local(bucket, key, std::move(version_id),
-                [reply](remove_result r) { reply(true, wire::encode_removed(r)); }, {}, bypass);
+                [reply](remove_result r) { reply(true, wire::encode_removed(r)); }, {}, bypass,
+                change_cause::remove, std::move(who));
             return;
         }
         case wire::op::set_tags:
@@ -1169,7 +1172,8 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             std::string bucket, key, version_id;
             header_change change;
             uint8_t what = 0;
-            if (!wire::decode_set_tags(payload, bucket, key, version_id, change.value, &what, &change.bypass) ||
+            if (!wire::decode_set_tags(payload, bucket, key, version_id, change.value, &what, &change.bypass,
+                                       &change.who) ||
                 what > static_cast<uint8_t>(header_change::kind::legal_hold))
             {
                 reply(false, {});
