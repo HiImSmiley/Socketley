@@ -513,7 +513,6 @@ void notifier::maybe_rotate()
     {
         LOG_WARN(("storage: the event outbox could not be started again empty: " + std::string(why)).c_str());
         m_rotating = false;
-        m_off      = 0;
         kick();
     };
     const bool q = m_io.openat(m_dir_fd, tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644,
