@@ -1331,6 +1331,10 @@ domain	string	T{
 .ad l
 The domains of virtual\-hosted\-style addressing, comma\-separated, as \fB\-\-domain\fR \fB(requires restart)\fR
 T}
+notify_targets	string	T{
+.ad l
+The event notification webhooks file, as \fB\-\-notify\-targets\fR \fB(requires restart)\fR
+T}
 .TE
 .PP
 .B Cache fields:
@@ -6214,6 +6218,35 @@ compared without regard to case; anything else is refused at
 See
 .BR "Virtual\-hosted\-style addressing" .
 .TP
+.BI \-\-notify\-targets " file"
+The webhooks a bucket's event notifications may be sent to, one
+.I name url
+per line, with an optional third field
+.BI ca= file
+naming the CA an https webhook's certificate is checked against (the system's
+when absent); blank lines and what follows a
+.B #
+are skipped:
+.RS
+.PP
+.nf
+# name   url
+audit    http://10.0.0.5:8080/s3\-events
+thumbs   https://thumbs.internal/hook ca=/etc/ssl/internal\-ca.pem
+.fi
+.RE
+.IP
+A configuration names one as
+.BI arn:socketley:webhook::: name\fR.
+The file is refused at
+.B create
+and
+.B start
+if a line does not parse, is read at every start, and its hosts are resolved then
+(a host that does not resolve is logged and its events wait for a start that
+resolves it). Without it every destination is refused. See
+.BR "Event notifications" .
+.TP
 .B \-\-anonymous
 Accept requests that carry no credentials at all. Required unless
 credentials are given: a runtime made with neither is refused, so an endpoint is
@@ -6253,7 +6286,7 @@ and stores nothing, and the quota can be changed on a serving runtime with
 .B edit
 does not change these; \fBimport\fR does, as it does for a cache, and
 refuses to move \fBdir\fR, \fBanonymous\fR, \fBdomain\fR or the access key, secret key,
-credentials file or SSE key file while the runtime is running (the contents of a credentials
+credentials file, SSE key file or notification targets file while the runtime is running (the contents of a credentials
 file are re\-read by themselves). The quota and the expiry move under a serving
 runtime.
 .B \-\-shards
@@ -6515,6 +6548,14 @@ T}
 GetBucketPolicyStatus	GET /bucket?policyStatus	T{
 .ad l
 IsPublic: whether an Allow lets everyone in from any address; NoSuchBucketPolicy (404) when there is none.
+T}
+PutBucketNotificationConfiguration	PUT /bucket?notification	T{
+.ad l
+A NotificationConfiguration whose destinations are webhooks of \fB\-\-notify\-targets\fR, replacing the one before; an empty one removes it. See \fBEvent notifications\fR below.
+T}
+GetBucketNotificationConfiguration	GET /bucket?notification	T{
+.ad l
+The configuration as it is kept, an Id given to a rule that had none; an empty one for a bucket without.
 T}
 .TE
 .PP
@@ -7232,6 +7273,125 @@ whole. A version that never had a lock keeps the slot an older binary reads. Wit
 a change or a removal through a shard that does not own the key is decided by its
 owner, the bypass travelling with it, and the bucket's configuration, like
 versioning, is decided by shard 0 in the order of the bucket's changes.
+.SS Event notifications
+A bucket's
+.B NotificationConfiguration
+(PutBucketNotificationConfiguration, GetBucketNotificationConfiguration) sends
+S3's event records to webhooks. Its
+.BR QueueConfiguration ,
+.B TopicConfiguration
+and
+.B CloudFunctionConfiguration
+entries are taken alike: an
+.BR Id ,
+a destination
+.BI arn:socketley:webhook::: name
+that names a line of
+.BR \-\-notify\-targets ,
+one or more
+.B Event
+and an optional
+.B Filter
+of an
+.B S3Key
+prefix rule and suffix rule. The events emitted are
+.BR s3:ObjectCreated:Put ,
+.B :Post
+(a form upload),
+.B :Copy
+and
+.BR :CompleteMultipartUpload ;
+.B s3:ObjectRemoved:Delete
+(a key deleted, or a version removed by its id) and
+.B :DeleteMarkerCreated
+(a delete in a versioned bucket);
+.B s3:LifecycleExpiration:Delete
+and
+.B :DeleteMarkerCreated
+(a lifecycle rule's expiry, which sends no ObjectRemoved); and
+.B s3:ObjectTagging:Put
+and
+.BR :Delete ,
+each of them by its name or by
+.BR * .
+The other names S3 has (ObjectRestore, Replication, .\|.\|.) are taken and send
+nothing. A destination that is not a webhook's ARN, or names one the targets file
+does not give, is
+.B "400 InvalidArgument"
+("Unable to validate the following destination configurations", the ARN as
+.BR ArgumentName )
+unless the request sends
+.BR "x\-amz\-skip\-destination\-validation: true" ;
+so are an unknown event, a filter rule other than one prefix and one suffix, two
+configurations with one Id, two that share an event on overlapping keys, and
+.BR EventBridgeConfiguration ,
+which this endpoint cannot reach; a document that is not a configuration is
+.BR "400 MalformedXML" .
+An empty
+.B NotificationConfiguration
+removes it. It is kept in
+.IB dir / bucket /notification
+and changed by shard 0 like a bucket's other configuration documents.
+.PP
+Each event is POSTed to its webhook as S3's message, one record in a
+.B Records
+array, with
+.BR "Content\-Type: application/json" ,
+.B "Connection: close"
+and
+.BR X\-Socketley\-Event\-Id ,
+a number a receiver can deduplicate by:
+.RS
+.PP
+.nf
+{"Records":[{"eventVersion":"2.1","eventSource":"aws:s3",
+  "awsRegion":"us\-east\-1","eventTime":"2026\-10\-02T12:00:00.123Z",
+  "eventName":"ObjectCreated:Put",
+  "userIdentity":{"principalId":"socketley"}, .\|.\|.,
+  "s3":{"s3SchemaVersion":"1.0","configurationId":"thumbs",
+    "bucket":{"name":"photos","ownerIdentity":{.\|.\|.},
+              "arn":"arn:aws:s3:::photos"},
+    "object":{"key":"2026/a+b.jpg","size":5821,
+      "eTag":"9b2cf535f27731c974343645a3985328",
+      "versionId":".\|.\|.","sequencer":"00063F7A2B1C0D9E"}}}]}
+.fi
+.RE
+.PP
+The key is form\-encoded as S3 encodes it (a space as
+.BR + ,
+.B /
+kept, other bytes as
+.BI % XX\fR),
+a removal's record has no size or eTag, versionId is given in a versioned bucket,
+and the sequencer is sixteen hex digits that grow with every event of the shard
+that owns the key, so a key's events sort by it. The principal is the bucket's
+owner, not the requester's, and sourceIPAddress is empty.
+.PP
+The shard that owns a key emits its events, whichever shard took the request, so a
+change is one event. Before the change is answered, its record is appended to
+.IB dir /.notify/outbox. shard
+and synced, together with every other record waiting at that moment, so an
+answered change's event survives a crash; nothing else of the delivery is on the
+request's path. A webhook is sent one event at a time, in order: a 2xx answer
+delivers it, and anything else, a refused or failed connection, or no answer in 10
+seconds, is a failure tried again after 0.25 s, doubling to 8 s. A delivered
+event's record is followed by one saying so, and a start sends again every event
+without one, so an event is delivered at least once, and more than once only when
+a crash or a 2xx lost on the way leaves its delivery unrecorded. The outbox is
+written again with only the undelivered events at every start, and empty once it
+has passed a megabyte with nothing left to send. At most 10000 events wait per
+shard: past that a new one is dropped, counted in
+.BR notify_dropped ,
+and its change answered all the same.
+.B stats
+shows
+.BR notify_sent ,
+.B notify_failed
+(attempts),
+.B notify_queued
+(waiting now) and
+.BR notify_dropped ,
+per shard.
 .SS Server\-side encryption
 .B "x\-amz\-server\-side\-encryption: AES256"
 on PutObject, CreateMultipartUpload or CopyObject (SSE\-S3) stores the object
@@ -7558,7 +7718,8 @@ ListObjectVersions. Object lock has GetBucketObjectLockConfiguration and
 PutBucketObjectLockConfiguration, GetObjectRetention and PutObjectRetention (also a
 write that names a retention), GetObjectLegalHold and PutObjectLegalHold (also a
 write that names a hold), and BypassGovernanceRetention, asked beside the action of a
-request that sends the bypass header.
+request that sends the bypass header. GetBucketNotification and PutBucketNotification
+cover the two notification configuration operations.
 .TP
 .B Resource
 one or a list of
