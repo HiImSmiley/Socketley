@@ -6154,7 +6154,12 @@ A file of several pairs, one
 per line. Blank lines and lines starting with
 .B #
 are skipped, and the secret is everything after the first colon, so it may hold
-one. The path is made absolute against the caller's directory. The file is
+one. A line
+.BI [ id ]
+begins a user, whose settings and keys follow it until the next; a file without
+one is a single owner, as described under
+.BR Users .
+The path is made absolute against the caller's directory. The file is
 read at start, refused at
 .B create
 and
@@ -6163,7 +6168,8 @@ if it does not parse or holds nothing, and read again when it changes
 (checked at most once a second, on the next request): a key added to it works at
 once, a key taken out stops, and a file that has gone, is empty or no longer
 parses leaves the keys in force until it is repaired, with a warning in the log,
-so a half\-written edit locks nobody out. A key given with
+so a half\-written edit locks nobody out. A user's policy file is watched the same
+way. Connections are not dropped by a reload. A key given with
 .B \-\-access\-key
 is one of the set too.
 .TP
@@ -6295,11 +6301,11 @@ Operation	Request	Notes
 _
 ListBuckets	GET /	T{
 .ad l
-Sorted by name, with creation dates; max\-buckets (1 to 10000), continuation\-token and prefix page it as S3 does.
+The buckets the caller owns, or every bucket for an admin (see \fBUsers\fR), sorted by name, with creation dates; max\-buckets (1 to 10000), continuation\-token and prefix page it as S3 does.
 T}
 CreateBucket	PUT /bucket	T{
 .ad l
-BucketAlreadyOwnedByYou (409) if it exists; InvalidBucketName (400) for a name S3 would refuse. x\-amz\-bucket\-object\-lock\-enabled: true makes it versioned and locked for good; see \fBObject lock\fR below.
+BucketAlreadyOwnedByYou (409) if the caller owns it, BucketAlreadyExists (409) if another user does; InvalidBucketName (400) for a name S3 would refuse. x\-amz\-bucket\-object\-lock\-enabled: true makes it versioned and locked for good; see \fBObject lock\fR below.
 T}
 DeleteBucket	DELETE /bucket	T{
 .ad l
@@ -6604,6 +6610,119 @@ the request, and for a request a bucket policy denies, and
 .B AuthorizationHeaderMalformed
 (400). A denied request is answered before its body is read and the connection is
 closed.
+.SS Users
+A credentials file may name users. Each has an id, a display name, its own keys,
+optionally an identity policy, and optionally the admin flag:
+.PP
+.nf
+# a key outside any user is the default owner, socketley, an admin
+AKIAOPS000000000001:ops\-secret
+
+[alice]
+name = Alice Example
+AKIAALICE0000000001:alice\-secret\-1
+AKIAALICE0000000002:alice\-secret\-2
+
+[bob]
+policy = bob.json
+AKIABOB000000000001:bob\-secret
+
+[root]
+admin = true
+AKIAROOT00000000001:root\-secret
+.fi
+.PP
+.BI [ id ]
+begins a user: 1 to 128 printable characters without spaces or any of
+.BR "/:*?,=[]\(dq<>&" .
+The lines after it, up to the next, are its keys
+.RI ( access : secret )
+and its settings
+.RI ( name " = " value ):
+.B name
+is the display name (the id when it is not given),
+.B admin
+is
+.B true
+or
+.BR false ,
+and
+.B policy
+is the user's identity policy, the JSON itself on that one line when it begins with
+.BR { ,
+and otherwise a file, relative to the credentials file's directory. A setting has its
+.B =
+before any colon, which an access key cannot hold. A key outside any user, and the
+pair given with
+.BR \-\-access\-key ,
+belong to the default owner,
+.BR socketley ,
+an admin. A file without users is that one owner, exactly as before users existed:
+every key may do everything to every bucket that no bucket policy denies. A user
+declared twice, a key given to two users, an unknown setting, or a policy that does
+not compile is refused at
+.B create
+and
+.B start
+naming the line, and on a reload leaves the users in force.
+.PP
+An identity policy is a bucket policy's grammar (see
+.BR "Bucket policy" ),
+with the same actions and conditions, without
+.B Principal
+(it is the user's own), and with resources in any bucket:
+.BR * ,
+or
+.BI arn:aws:s3::: pattern
+matched as IAM matches an ARN, against the bucket name for a bucket action and
+.IB bucket / key
+for an object action, where
+.B *
+spans
+.BR / :
+.B arn:aws:s3:::logs\-*
+names those buckets and every object in them, and
+.B arn:aws:s3:::logs\-*/*
+the objects alone.
+.PP
+A bucket is owned by the user that made it, recorded on the second line of its
+.IB dir / bucket /created
+(none for the default owner, as for every bucket made before users) and taken by
+every shard, at its making and at every start. ListBuckets shows a user the
+buckets it owns and an admin every bucket; every Owner element \(em ListBuckets,
+ListObjects, ListObjectVersions, the uploads and parts listings, GetBucketAcl and
+GetObjectAcl \(em is the bucket's owner with its display name, since an object of a
+bucket with ACLs disabled is its bucket owner's.
+.PP
+A signed request is decided in this order:
+.IP 1. 4
+An applying
+.B Deny
+in the user's identity policy or in the bucket's policy refuses it with
+.BR "403 AccessDenied" .
+.IP 2. 4
+An admin, the bucket's owner, and anybody on a bucket that is not there (which the
+operation answers
+.BR NoSuchBucket )
+are let in.
+.IP 3. 4
+An applying
+.B Allow
+in the identity policy or in the bucket's policy (naming the user by id, one of its
+keys, or
+.BR * )
+lets it in.
+.IP 4. 4
+Anything else is
+.BR "403 AccessDenied" .
+.PP
+A copy is also judged as a GetObject of its source in the source bucket.
+CreateBucket is anybody's whose identity policy does not deny
+.B s3:CreateBucket
+on the name. The bucket policy's own operations stay open to the owner and admins
+whatever the policy says, and so do what no action names (ownership controls and the
+operations answered NotImplemented); another user needs an Allow for the former and
+is refused the latter.
 .SS CORS
 A bucket's CORS rules let a page served from another origin use it from a
 browser: read objects, and upload with a presigned URL. They are set with
@@ -7319,9 +7438,9 @@ or
 .B {"AWS": "*"}
 for everyone, signed or not; or
 .B {"AWS": [...]}
-naming this runtime's access keys, each as the key itself, as
-.BI arn:aws:iam:: account :user/ key
-(the user name is the access key), or as
+naming this runtime's users and access keys, each as the key itself, as
+.BI arn:aws:iam:: account :user/ name
+(the name is a user's id or an access key), or as
 .BI arn:aws:iam:: account :root
 for every key. Service, federated and canonical\-user principals and roles are refused.
 .TP
@@ -7415,9 +7534,10 @@ refuses the request with
 whatever else applies, and an applying
 .B Allow
 lets in a request that carries no credentials, on a runtime without
-.BR \-\-anonymous .
-A signed request is never let in by a policy, since every key of the runtime may
-already do everything, and one whose signature is wrong is refused as before and
+.BR \-\-anonymous ,
+and a signed request of a user that does not own the bucket (see
+.BR Users ).
+A request whose signature is wrong is refused as before and
 never taken for an anonymous request; a presigned URL is a signed request. On a
 runtime with
 .B \-\-anonymous
@@ -7434,9 +7554,9 @@ over any key refuses it, and only an
 over
 .BI arn:aws:s3::: bucket /*
 lets an anonymous one in. A request a policy refuses is answered before its body
-is read. The policy's own four operations answer to the credentials alone, so a
-policy can neither let an anonymous request read or change it nor lock the keys out
-of removing it. A request let in by a policy is still the Lua
+is read. The policy's own four operations answer to ownership alone for the bucket's owner and
+an admin, so a policy can neither let an anonymous request read or change it nor lock
+the owner out of removing it. A request let in by a policy is still the Lua
 .B on_request
 hook's to refuse (see
 .BR Lua ),
