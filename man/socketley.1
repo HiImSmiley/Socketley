@@ -6299,7 +6299,7 @@ Sorted by name, with creation dates; max\-buckets (1 to 10000), continuation\-to
 T}
 CreateBucket	PUT /bucket	T{
 .ad l
-BucketAlreadyOwnedByYou (409) if it exists; InvalidBucketName (400) for a name S3 would refuse.
+BucketAlreadyOwnedByYou (409) if it exists; InvalidBucketName (400) for a name S3 would refuse. x\-amz\-bucket\-object\-lock\-enabled: true makes it versioned and locked for good; see \fBObject lock\fR below.
 T}
 DeleteBucket	DELETE /bucket	T{
 .ad l
@@ -6320,6 +6320,30 @@ T}
 GetBucketVersioning	GET /bucket?versioning	T{
 .ad l
 An empty VersioningConfiguration for a bucket never versioned.
+T}
+PutObjectLockConfiguration	PUT /bucket?object\-lock	T{
+.ad l
+ObjectLockEnabled Enabled and an optional default retention; only while versioning is Enabled; Content\-MD5 or a checksum required. See \fBObject lock\fR below.
+T}
+GetObjectLockConfiguration	GET /bucket?object\-lock	T{
+.ad l
+ObjectLockConfigurationNotFoundError (404) for a bucket without object lock.
+T}
+PutObjectRetention	PUT /bucket/key?retention	T{
+.ad l
+Mode and RetainUntilDate, or an empty Retention to remove one; versionId; x\-amz\-bypass\-governance\-retention; Content\-MD5 or a checksum required.
+T}
+GetObjectRetention	GET /bucket/key?retention	T{
+.ad l
+NoSuchObjectLockConfiguration (404) for a version without one.
+T}
+PutObjectLegalHold	PUT /bucket/key?legal\-hold	T{
+.ad l
+Status ON or OFF; versionId; Content\-MD5 or a checksum required.
+T}
+GetObjectLegalHold	GET /bucket/key?legal\-hold	T{
+.ad l
+NoSuchObjectLockConfiguration (404) for a version whose hold was never set.
 T}
 PutBucketEncryption	PUT /bucket?encryption	T{
 .ad l
@@ -6481,16 +6505,12 @@ A bucket's own tags (PutBucketTagging, GetBucketTagging, DeleteBucketTagging)
 are at most 50 under the rules of an object's, NoSuchTagSet (404) when there are
 none, and are kept and carried between shards like its CORS rules, in
 .IB dir / bucket /tagging .
-Object lock is not built: a CreateBucket that enables it and a write that names a
-retention or a legal hold (\fBx\-amz\-object\-lock\-*\fR) are
-.B "501 NotImplemented"
-and change nothing, rather than an object taken as locked that can be deleted.
 Every storage class S3 has is taken and stored as STANDARD, the one this storage
 has, and one it does not have is
 .BR "400 InvalidStorageClass" ;
 .B x\-amz\-website\-redirect\-location
 is kept and returned like the other stored headers.
-Anything else \(em object lock configuration, other ownership controls \(em is answered
+Anything else \(em other ownership controls, logging, replication \(em is answered
 .B "501 NotImplemented"
 and never mistaken for the plain operation. A single put is at most 5 GiB and a
 key at most 1024 bytes.
@@ -6934,6 +6954,80 @@ rename moved it meanwhile, and a held copy of a latest is dropped on every shard
 before a new version, a marker or a removal that changes the latest is answered.
 .B ListObjectVersions
 asks every shard and merges their pages.
+.SS Object lock
+A bucket made with
+.B "x\-amz\-bucket\-object\-lock\-enabled: true"
+is versioned and locked from the start, and
+.B PutObjectLockConfiguration
+locks a bucket whose versioning is
+.BR Enabled ,
+as S3 now allows (409
+.B InvalidBucketState
+otherwise). A locked bucket's versioning cannot be suspended (409
+.BR InvalidBucketState )
+and its lock cannot be removed; a configuration without a
+.B Rule
+only drops the default retention. The default,
+.B GOVERNANCE
+or
+.B COMPLIANCE
+for a number of
+.B Days
+or calendar
+.BR Years ,
+is given to every new version that names no retention itself, counted from the
+moment it is written.
+.PP
+A version's retention is set by
+.B x\-amz\-object\-lock\-mode
+and
+.B x\-amz\-object\-lock\-retain\-until\-date
+on PutObject, CopyObject and CreateMultipartUpload (whose completed object has it),
+or by PutObjectRetention; its legal hold by
+.B x\-amz\-object\-lock\-legal\-hold
+or PutObjectLegalHold. GET and HEAD return all three headers. A copy never takes
+its source's lock, only what its own request or bucket gives it. A lock asked of a
+bucket without object lock is
+.BR "400 InvalidRequest" ,
+a date that is not in the future
+.BR "400 InvalidArgument" .
+PutObjectLockConfiguration, PutObjectRetention, PutObjectLegalHold, and a PutObject
+that names a retention or a legal hold, need
+.B Content\-MD5
+or an
+.B x\-amz\-checksum\-*
+of the body (checked), as S3 requires; a PutObject that only receives the default
+does not.
+.PP
+A version under a legal hold that is ON, or under a retention whose date the
+server's clock (UTC) has not reached, cannot be removed: a DELETE or DeleteObjects
+entry that names it is
+.BR "403 AccessDenied" ,
+and a DELETE without a version id still puts a delete marker in front of it.
+.B COMPLIANCE
+yields to nobody and is only lengthened.
+.B GOVERNANCE
+is lengthened by anyone and shortened, removed, made COMPLIANCE or deleted through
+only by a request with
+.B "x\-amz\-bypass\-governance\-retention: true"
+whose caller has
+.B s3:BypassGovernanceRetention
+\(em every key the runtime has, unless the bucket's policy denies it, and an
+anonymous caller only by an Allow of it. A legal hold yields to no bypass. A
+lifecycle rule never expires a locked version (a current one's expiry puts a
+delete marker, as it may), and DeleteBucket refuses a bucket that still holds
+versions.
+.PP
+The retention and the hold are entries of the version's header, so the journal
+and the index carry them too. A change is made by the key's owner under its lane
+and written in place into the header's tag slots, crash\-safe as a tag change is:
+once a version has a lock its slot holds its tags, retention and hold together, so
+a torn write leaves the previous slot, and a header with no room is written again
+whole. A version that never had a lock keeps the slot an older binary reads. With
+.BR \-\-shards ,
+a change or a removal through a shard that does not own the key is decided by its
+owner, the bypass travelling with it, and the bucket's configuration, like
+versioning, is decided by shard 0 in the order of the bucket's changes.
 .SS Server\-side encryption
 .B "x\-amz\-server\-side\-encryption: AES256"
 on PutObject, CreateMultipartUpload or CopyObject (SSE\-S3) stores the object
@@ -7241,7 +7335,7 @@ and
 wildcards, compared without case, or
 .B *
 alone. A name must be one of S3's, and those this runtime does not implement
-(s3:PutObjectAcl, s3:GetObjectRetention, .\|.\|.) are taken and match nothing.
+(s3:RestoreObject, s3:GetBucketLogging, .\|.\|.) are taken and match nothing.
 GetObject covers GetObject and HeadObject, by part too; PutObject covers PutObject,
 CopyObject, CreateMultipartUpload, UploadPart, UploadPartCopy and
 CompleteMultipartUpload; DeleteObject covers DeleteObject and DeleteObjects; ListBucket
@@ -7256,7 +7350,11 @@ and HEAD (and for a copy's source named key?versionId=), DeleteObjectVersion for
 and for each DeleteObjects entry with a VersionId (judged per entry, a refused one
 answered AccessDenied in the result), and GetObjectVersionTagging,
 PutObjectVersionTagging and DeleteObjectVersionTagging; ListBucketVersions covers
-ListObjectVersions.
+ListObjectVersions. Object lock has GetBucketObjectLockConfiguration and
+PutBucketObjectLockConfiguration, GetObjectRetention and PutObjectRetention (also a
+write that names a retention), GetObjectLegalHold and PutObjectLegalHold (also a
+write that names a hold), and BypassGovernanceRetention, asked beside the action of a
+request that sends the bypass header.
 .TP
 .B Resource
 one or a list of
