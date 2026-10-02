@@ -23,6 +23,7 @@
 #include "bucket_policy.h"
 #include "checksum.h"
 #include "multipart.h"
+#include "notifier.h"
 #include "object_store.h"
 #include "post_policy.h"
 #include "s3_auth.h"
@@ -474,6 +475,8 @@ public:
         m_auth       = m_auth_owned.get();
     }
     multipart_store& multipart() { return m_mpu; }
+    notifier& notifications() { return m_notify; }
+    const notifier& notifications() const { return m_notify; }
     // Uploads left open this many seconds are aborted; zero keeps them until they are.
     void set_mpu_expire_secs(uint32_t s)
     {
@@ -646,6 +649,13 @@ public:
     // Whether the bucket's policy lets this request do `action` to `key` as well as what it was judged for.
     bool policy_allows(const std::shared_ptr<conn>& c, s3_action action, std::string_view key);
 
+    // Event notifications, in storage_notify.cpp: the configuration's two operations, and the events of a change.
+    void op_put_notification(const std::shared_ptr<conn>& c);
+    void op_get_notification(const std::shared_ptr<conn>& c);
+    // A change the owner of its key made, queued for every rule of its bucket that asks for it; `answer` runs once
+    // their records are synced.
+    void notify_change(change_note n, std::function<void()> answer);
+
     // Object lock, in storage_object_lock.cpp.
     void op_put_object_lock_config(const std::shared_ptr<conn>& c);
     void op_get_object_lock_config(const std::shared_ptr<conn>& c);
@@ -794,6 +804,9 @@ private:
     hash_pool         m_hash;
     object_store      m_store;
     multipart_store   m_mpu;
+    notifier          m_notify;
+    // The last sequencer an event was given, which only grows.
+    uint64_t          m_notify_seq{0};
     // What carries a request to a sibling shard, and the logic that makes one
     // and answers one; a runtime of one shard never calls the transport.
     channel_transport m_transport;

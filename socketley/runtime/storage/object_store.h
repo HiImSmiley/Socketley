@@ -13,6 +13,7 @@
 //   <dir>/<bucket>/index.<shard>      the journal of puts and deletes
 //   <dir>/<bucket>/tmp/<random>       a body on its way in
 //   <dir>/<bucket>/lifecycle          its LifecycleConfiguration, likewise
+//   <dir>/<bucket>/notification       its NotificationConfiguration, likewise
 //   <dir>/<bucket>/object-lock        its ObjectLockConfiguration, likewise, which is never removed
 //   <dir>/<bucket>/policy             its bucket policy, likewise
 //   <dir>/<bucket>/versioning         its VersioningConfiguration, likewise
@@ -54,6 +55,7 @@ namespace socketley::storage
 struct cors_config;
 struct lifecycle_config;
 struct lock_config;
+struct notify_config;
 class bucket_policy;
 
 // The configuration documents a bucket keeps beside its objects, each in a file named for it.
@@ -66,11 +68,12 @@ enum class bucket_doc : uint8_t
     encryption,
     tagging,
     object_lock,
+    notification,
 };
 // Every kind, for the walks that settle or take up all of a bucket's documents.
 inline constexpr bucket_doc all_bucket_docs[] = {bucket_doc::cors,       bucket_doc::lifecycle, bucket_doc::policy,
                                                  bucket_doc::versioning, bucket_doc::encryption, bucket_doc::tagging,
-                                                 bucket_doc::object_lock};
+                                                 bucket_doc::object_lock, bucket_doc::notification};
 
 // A bucket's versioning: never configured, keeping every version, or writing the null version.
 enum class versioning : uint8_t
@@ -306,6 +309,31 @@ struct header_change
     bool        bypass{false};
 };
 
+// What made a change, which decides the event a bucket's notification configuration is told of it as.
+enum class change_cause : uint8_t
+{
+    put,
+    post,
+    copy,
+    complete,
+    remove,
+    lifecycle,
+};
+
+// A change to an object, told by the owner of its key to whoever sends its bucket's events.
+struct change_note
+{
+    std::string bucket;
+    std::string key;
+    // One notify_event bit.
+    uint16_t    event{0};
+    // The object's size and ETag, which a removal has none of.
+    bool        has_object{false};
+    uint64_t    size{0};
+    std::string etag;
+    std::string version_id;
+};
+
 // What the owner of a key needs to make a body a visible object.
 struct commit_request
 {
@@ -319,6 +347,7 @@ struct commit_request
     // A file from the bucket's pool, whose name was durable before the body
     // was written, so the answer waits for the rename and not for its sync.
     bool        pooled{false};
+    change_cause cause{change_cause::put};
 };
 
 // A body being written, from the first byte to the commit.
@@ -395,6 +424,9 @@ public:
 
     // The object's key and bucket, for the caller's log line.
     const std::string& key() const { return m_key; }
+
+    // What the commit is told it is, for the event it may make.
+    void set_cause(change_cause c) { m_cause = c; }
 
 private:
     friend class object_store;
@@ -491,6 +523,7 @@ private:
     bool        m_tail_writing{false};
     std::array<char, sse_overhead> m_tail{};
     committer   m_committer;
+    change_cause m_cause{change_cause::put};
     st         m_status{st::ok};
     // A body placed into another file by place_body(), and the syncs still owed before the commit.
     bool        m_placed{false};
@@ -620,6 +653,12 @@ public:
     const bucket_policy* policy(std::string_view name) const;
     // Told whenever a bucket's lifecycle rules change here.
     void set_lifecycle_listener(std::function<void()> fn) { m_lifecycle_listener = std::move(fn); }
+    // The bucket's notification configuration, null when it has none.
+    std::shared_ptr<const notify_config> bucket_notify(std::string_view name) const;
+    // Told by the owner of a key of each change to an object of a bucket with a notification configuration; the
+    // change is answered once the listener runs `answer`.
+    using change_listener = std::function<void(change_note, std::function<void()> answer)>;
+    void set_change_listener(change_listener fn) { m_change_listener = std::move(fn); }
 
     // ── Sharding ────────────────────────────────────────────────────────────
     uint32_t shard() const { return m_opts.shard; }
@@ -708,7 +747,8 @@ public:
     void remove(std::string_view bucket, std::string_view key, std::function<void(st, bool existed)> cb);
     // `only_if`, when given, is asked under the key's lane and keeps an object it says no to.
     void remove_local(std::string_view bucket, std::string_view key, std::function<void(st, bool existed)> cb,
-                      std::function<bool(const object_meta&)> only_if = {});
+                      std::function<bool(const object_meta&)> only_if = {},
+                      change_cause cause = change_cause::remove);
     // The same with the version: `version_id` empty deletes the key, and otherwise removes that version for good,
     // which a retention or legal hold refuses as st::locked unless `bypass` lifts a GOVERNANCE retention.
     void remove_version(std::string_view bucket, std::string_view key, std::string version_id,
@@ -716,7 +756,8 @@ public:
     // `only_if` is asked of the version that would be removed, or of the latest before a marker covers it.
     void remove_version_local(std::string_view bucket, std::string_view key, std::string version_id,
                               std::function<void(remove_result)> cb,
-                              std::function<bool(const object_meta&)> only_if = {}, bool bypass = false);
+                              std::function<bool(const object_meta&)> only_if = {}, bool bypass = false,
+                              change_cause cause = change_cause::remove);
 
     // Makes `change` of an object or of its version `version_id`, keeping its bytes, ETag and time; `cb` is told
     // the version it changed.
@@ -863,6 +904,7 @@ private:
         std::shared_ptr<const std::string> tagging;
         // Its object lock configuration, which once set is never removed.
         std::shared_ptr<const lock_config> lock;
+        std::shared_ptr<const notify_config> notify;
         versioning  vstate{versioning::off};
         // Per key, every version but a latest that is not a delete marker, newest first: the key's
         // noncurrent versions, behind its latest when that is a marker; empty unless the bucket was versioned.
@@ -1026,6 +1068,15 @@ private:
     std::function<bool(std::string_view)> m_drop_guard;
     std::function<void(const std::string&)> m_forget_listener;
     std::function<void()> m_lifecycle_listener;
+    change_listener m_change_listener;
+    // The answers to a commit, a removal and a header change, which wait for the event they make when the bucket has
+    // a notification configuration.
+    std::function<void(put_result)> noted_commit(const bucket& b, const commit_request& req,
+                                                 std::function<void(put_result)> cb);
+    std::function<void(remove_result)> noted_remove(const bucket& b, std::string_view key, bool by_version,
+                                                    change_cause cause, std::function<void(remove_result)> cb);
+    std::function<void(st, std::string)> noted_header(const bucket& b, std::string_view key, const header_change& c,
+                                                      std::function<void(st, std::string)> cb);
     // A test hook: a commit of a key with this prefix kills the process after
     // its rename and before its journal record.
     std::string m_kill_after_rename;

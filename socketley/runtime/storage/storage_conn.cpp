@@ -114,6 +114,7 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
     : m_owner(owner), m_loop(loop), m_io(loop, this), m_hash(hash_threads()),
       m_store(loop, m_io, std::move(opts)),
       m_mpu(loop, m_io, m_store),
+      m_notify(loop, m_io, this),
       m_transport(owner.get_runtime_manager() ? &owner.get_runtime_manager()->requests() : nullptr,
                   std::string(owner.get_name())),
       m_node(m_store, m_transport), m_auth(auth)
@@ -124,6 +125,8 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
     m_store.set_drop_guard([this](std::string_view bucket) { return m_mpu.bucket_uploads_busy(bucket); });
     m_store.set_forget_listener([this](const std::string& bucket) { m_mpu.drop_bucket(bucket); });
     m_store.set_lifecycle_listener([this]() { lifecycle_changed(); });
+    m_store.set_change_listener([this](change_note n, std::function<void()> answer)
+                                { notify_change(std::move(n), std::move(answer)); });
     m_lc_day_ms = lifecycle_day_ms;
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS"))
     {
@@ -175,6 +178,8 @@ bool storage_run::open(std::string& err)
     if (!m_store.open(err, &rep))
         return false;
     if (!m_mpu.open(err))
+        return false;
+    if (!m_notify.open(m_store.options().dir, m_store.shard(), err))
         return false;
     reap_uploads();
     LOG_INFO(("storage: " + std::to_string(rep.buckets) + " bucket(s), " +
@@ -301,6 +306,11 @@ void storage_run::on_cqe(struct io_uring_cqe* cqe)
         m_accept_backoff.armed = false;
         if (!m_stopped)
             arm_accept();
+        return;
+    }
+    if (m_notify.owns(req))
+    {
+        m_notify.on_timer();
         return;
     }
 
@@ -572,6 +582,7 @@ void storage_run::stop()
     // No crossing is answered from here on, and none that is out will be.
     m_node.stop();
     m_transport.stop();
+    m_notify.stop();
 
     // The digest threads end first, so none of them writes to a descriptor the
     // loop is about to close, and the read waiting on it is cancelled with it.

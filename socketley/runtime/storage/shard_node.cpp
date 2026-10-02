@@ -432,6 +432,7 @@ std::string doc_label(bucket_doc kind)
         case bucket_doc::encryption: return "encryption configuration";
         case bucket_doc::tagging:    return "tag set";
         case bucket_doc::object_lock: return "object lock configuration";
+        case bucket_doc::notification: return "notification configuration";
     }
     return "configuration";
 }

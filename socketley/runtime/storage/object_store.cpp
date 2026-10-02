@@ -17,6 +17,7 @@
 #include "s3_cors.h"
 #include "s3_encryption.h"
 #include "s3_names.h"
+#include "s3_notify.h"
 #include "s3_object_lock.h"
 #include "s3_versioning.h"
 #include "shard_owner.h"
@@ -1342,8 +1343,8 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
 
     auto c   = std::make_shared<commit_state>();
     c->alive = m_alive;
+    c->cb    = noted_commit(*b, req, std::move(cb));
     c->req   = std::move(req);
-    c->cb    = std::move(cb);
     lane_enter(*b, c->req.key, [this, c]()
     {
         const commit_request& rq = c->req;
@@ -1540,10 +1541,11 @@ void object_store::remove(std::string_view bucket_name, std::string_view key_sv,
 }
 
 void object_store::remove_local(std::string_view bucket_name, std::string_view key_sv,
-                                std::function<void(st, bool)> cb, std::function<bool(const object_meta&)> only_if)
+                                std::function<void(st, bool)> cb, std::function<bool(const object_meta&)> only_if,
+                                change_cause cause)
 {
     remove_version_local(bucket_name, key_sv, {}, [cb = std::move(cb)](remove_result r) { cb(r.status, r.existed); },
-                         std::move(only_if));
+                         std::move(only_if), false, cause);
 }
 
 void object_store::remove_version(std::string_view bucket_name, std::string_view key_sv, std::string version_id,
@@ -1580,7 +1582,8 @@ void object_store::remove_version(std::string_view bucket_name, std::string_view
 
 void object_store::remove_version_local(std::string_view bucket_name, std::string_view key_sv,
                                         std::string version_id, std::function<void(remove_result)> cb,
-                                        std::function<bool(const object_meta&)> only_if, bool bypass)
+                                        std::function<bool(const object_meta&)> only_if, bool bypass,
+                                        change_cause cause)
 {
     bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
@@ -1588,6 +1591,7 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
         cb({st::no_such_bucket});
         return;
     }
+    cb = noted_remove(*b, key_sv, !version_id.empty(), cause, std::move(cb));
     if (!owns(bucket_name, key_sv))
     {
         LOG_WARN(("storage: a delete for a key that shard " + std::to_string(owner_of(bucket_name, key_sv)) +
@@ -1867,8 +1871,8 @@ void object_store::change_header_local(std::string_view bucket_name, std::string
     tc->bname = std::string(bucket_name);
     tc->key   = std::string(key);
     tc->version_id = std::move(version_id);
+    tc->cb    = noted_header(*b, key, change, std::move(cb));
     tc->change = std::move(change);
-    tc->cb    = std::move(cb);
 
     lane_enter(*b, tc->key, [this, tc]()
     {
@@ -2455,6 +2459,7 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
                                     cr.key      = cs->dst_key;
                                     cr.tmp_name = cs->tmp;
                                     cr.meta     = cs->meta;
+                                    cr.cause    = change_cause::copy;
                                     commit(std::move(cr),
                                         [this, alive, cs, finish](put_result pr)
                                         {
@@ -2898,7 +2903,7 @@ void object_store::drop_rename(std::string name, std::function<void(st)> cb)
 static_assert(cors_max_bytes <= doc_max_bytes && lifecycle_max_bytes <= doc_max_bytes &&
               policy_max_bytes <= doc_max_bytes && versioning_max_bytes <= doc_max_bytes &&
               encryption_max_bytes <= doc_max_bytes && bucket_tagging_max_bytes <= doc_max_bytes &&
-              object_lock_max_bytes <= doc_max_bytes);
+              object_lock_max_bytes <= doc_max_bytes && notification_max_bytes <= doc_max_bytes);
 static_assert(std::size(all_bucket_docs) <= 8, "doc_doubt has a bit per kind");
 
 const char* object_store::doc_file(bucket_doc kind)
@@ -2912,8 +2917,95 @@ const char* object_store::doc_file(bucket_doc kind)
         case bucket_doc::encryption: return "encryption";
         case bucket_doc::tagging:    return "tagging";
         case bucket_doc::object_lock: return "object-lock";
+        case bucket_doc::notification: return "notification";
     }
     return "?";
+}
+
+std::shared_ptr<const notify_config> object_store::bucket_notify(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b && !b->closing ? b->notify : nullptr;
+}
+
+std::function<void(put_result)> object_store::noted_commit(const bucket& b, const commit_request& req,
+                                                           std::function<void(put_result)> cb)
+{
+    if (!b.notify || !m_change_listener)
+        return cb;
+    uint16_t bit = ev_put;
+    switch (req.cause)
+    {
+        case change_cause::post:     bit = ev_post; break;
+        case change_cause::copy:     bit = ev_copy; break;
+        case change_cause::complete: bit = ev_complete; break;
+        default:                     break;
+    }
+    return [this, bucket = req.bucket, key = req.key, bit, cb = std::move(cb)](put_result r)
+    {
+        if (r.status != st::ok)
+        {
+            cb(std::move(r));
+            return;
+        }
+        change_note n;
+        n.bucket     = bucket;
+        n.key        = key;
+        n.event      = bit;
+        n.has_object = true;
+        n.size       = r.meta.size;
+        n.etag       = r.meta.etag();
+        if (has_version(r.meta))
+            n.version_id = version_of(r.meta).id;
+        m_change_listener(std::move(n), [cb, r = std::move(r)]() mutable { cb(std::move(r)); });
+    };
+}
+
+std::function<void(remove_result)> object_store::noted_remove(const bucket& b, std::string_view key, bool by_version,
+                                                              change_cause cause, std::function<void(remove_result)> cb)
+{
+    if (!b.notify || !m_change_listener)
+        return cb;
+    const bool lc = cause == change_cause::lifecycle;
+    return [this, bucket = b.name, key = std::string(key), by_version, lc, cb = std::move(cb)](remove_result r)
+    {
+        if (r.status != st::ok || (!r.existed && !r.marker))
+        {
+            cb(std::move(r));
+            return;
+        }
+        // A marker removed by its id is a removal, and one a delete put in front of the key is a marker made.
+        const bool made_marker = r.marker && !by_version;
+        change_note n;
+        n.bucket     = bucket;
+        n.key        = key;
+        n.event      = made_marker ? (lc ? ev_lc_marker : ev_marker) : (lc ? ev_lc_delete : ev_delete);
+        n.version_id = r.version_id;
+        m_change_listener(std::move(n), [cb, r = std::move(r)]() mutable { cb(std::move(r)); });
+    };
+}
+
+std::function<void(st, std::string)> object_store::noted_header(const bucket& b, std::string_view key,
+                                                                const header_change& c,
+                                                                std::function<void(st, std::string)> cb)
+{
+    if (!b.notify || !m_change_listener || c.what != header_change::kind::tags)
+        return cb;
+    const uint16_t bit = c.value.empty() ? ev_tagging_del : ev_tagging_put;
+    return [this, bucket = b.name, key = std::string(key), bit, cb = std::move(cb)](st s, std::string id)
+    {
+        if (s != st::ok)
+        {
+            cb(s, std::move(id));
+            return;
+        }
+        change_note n;
+        n.bucket     = bucket;
+        n.key        = key;
+        n.event      = bit;
+        n.version_id = id;
+        m_change_listener(std::move(n), [cb, s, id = std::move(id)]() mutable { cb(s, std::move(id)); });
+    };
 }
 
 std::shared_ptr<const lock_config> object_store::bucket_lock(std::string_view name) const
@@ -3042,6 +3134,23 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml, st
             }
         }
         b.lock = std::move(l);
+        return true;
+    }
+    if (kind == bucket_doc::notification)
+    {
+        std::shared_ptr<notify_config> n;
+        if (!xml.empty())
+        {
+            n = std::make_shared<notify_config>();
+            if (!parse_notify_config(xml, *n, err))
+            {
+                if (why)
+                    *why = err.message;
+                return false;
+            }
+        }
+        // A configuration of no rules asks for nothing, so its bucket's changes are not told of at all.
+        b.notify = n && !n->rules.empty() ? std::move(n) : nullptr;
         return true;
     }
     if (kind == bucket_doc::tagging)

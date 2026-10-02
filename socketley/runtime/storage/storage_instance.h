@@ -70,6 +70,11 @@ public:
     void set_domain(std::string_view d) { m_domain = std::string(d); }
     std::string_view get_domain() const { return m_domain; }
 
+    // The file of `name url` lines naming the webhooks event notifications go to, read at every start; none refuses
+    // every destination.
+    void set_notify_targets(std::string_view f) { m_notify_targets = std::string(f); }
+    std::string_view get_notify_targets() const { return m_notify_targets; }
+
     // What decides whether a request may go on.  Given, it is used instead of
     // the anonymous default; the SigV4 authenticator arrives here.
     void set_authenticator(std::unique_ptr<socketley::storage::authenticator> a);
@@ -120,6 +125,7 @@ private:
     std::string m_credentials_file;
     std::string m_sse_key_file;
     std::string m_domain;
+    std::string m_notify_targets;
     uint32_t    m_mpu_expire_secs{0};
     std::unique_ptr<socketley::storage::authenticator> m_auth;
     std::unique_ptr<socketley::storage::anonymous_authenticator> m_anon;

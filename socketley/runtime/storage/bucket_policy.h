@@ -75,6 +75,8 @@ enum class s3_action : uint8_t
     put_object_legal_hold,
     // Asked of a request that would go past a GOVERNANCE retention, beside the action it is.
     bypass_governance_retention,
+    get_bucket_notification,
+    put_bucket_notification,
     count,
 };
 static_assert(static_cast<int>(s3_action::count) <= 64);

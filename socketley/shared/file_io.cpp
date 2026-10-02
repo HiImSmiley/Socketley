@@ -1,7 +1,10 @@
 #include "file_io.h"
 
 #include <cerrno>
+#include <cstring>
 #include <utility>
+
+#include <sys/socket.h>
 
 namespace socketley
 {
@@ -28,6 +31,9 @@ struct file_io::op
     uint64_t    off{0};
     // What a write has put on disk so far, because a short write continues.
     uint32_t    written{0};
+
+    struct sockaddr_storage addr{};
+    socklen_t   addr_len{0};
 };
 
 file_io::file_io(event_loop& loop, io_handler* owner) : m_loop(&loop), m_owner(owner)
@@ -76,6 +82,10 @@ bool file_io::submit(op* o)
         case op_file_write:
             queued = m_loop->submit_file_write(o->fd, o->wbuf + o->written, o->len - o->written,
                                                o->off + o->written, &o->req, false);
+            break;
+        case op_connect:
+            queued = m_loop->submit_connect(o->fd, reinterpret_cast<const struct sockaddr*>(&o->addr), o->addr_len,
+                                            &o->req);
             break;
         default:
             break;
@@ -213,6 +223,25 @@ bool file_io::pwrite(int fd, const char* buf, uint32_t len, uint64_t off, done c
     o->wbuf = buf;
     o->len = len;
     o->off = off;
+    o->cb = std::move(cb);
+    if (!submit(o))
+    {
+        delete o;
+        return false;
+    }
+    m_live.insert(o);
+    return true;
+}
+
+bool file_io::connect(int fd, const struct sockaddr* addr, socklen_t len, done cb)
+{
+    if (len > sizeof(sockaddr_storage))
+        return false;
+    auto* o = new op;
+    o->kind = op_connect;
+    o->fd = fd;
+    std::memcpy(&o->addr, addr, len);
+    o->addr_len = len;
     o->cb = std::move(cb);
     if (!submit(o))
     {

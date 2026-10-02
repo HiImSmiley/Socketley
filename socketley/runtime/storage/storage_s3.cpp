@@ -32,7 +32,7 @@ constexpr size_t   user_meta_limit  = 2048;
 bool unsupported_subresource(const s3_request& r, bool object)
 {
     static constexpr std::string_view names[] = {
-        "acl", "tagging", "website", "notification",
+        "acl", "tagging", "website",
         "replication", "accelerate",
         "requestPayment", "logging", "analytics", "metrics", "inventory", "ownershipControls",
         "publicAccessBlock", "intelligent-tiering", "attributes", "restore", "select", "torrent",
@@ -49,6 +49,9 @@ bool unsupported_subresource(const s3_request& r, bool object)
     if (r.has_query("versioning") && (object || (r.method != "GET" && r.method != "PUT")))
         return true;
     if (r.has_query("versions") && (object || r.method != "GET"))
+        return true;
+    // A bucket's notification configuration is read and set, and an object has none.
+    if (r.has_query("notification") && (object || (r.method != "GET" && r.method != "PUT")))
         return true;
     // A bucket's object lock is read and set, and a version's retention and legal hold likewise.
     const bool lock_attr = r.has_query("retention") || r.has_query("legal-hold");
@@ -403,6 +406,14 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
     if (bkt && q.has_query("versions"))
     {
         op_list_versions(c);
+        return;
+    }
+    if (bkt && q.has_query("notification"))
+    {
+        if (m == "GET")
+            op_get_notification(c);
+        else
+            op_put_notification(c);
         return;
     }
     if (bkt && q.has_query("object-lock"))
@@ -1317,6 +1328,7 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
         send_error_st(c, op->status());
         return;
     }
+    op->set_cause(r.form ? change_cause::post : change_cause::put);
     if (ck.algo != checksum_algo::none)
     {
         op->track_checksum(ck.algo, std::move(ck.expected_b64));

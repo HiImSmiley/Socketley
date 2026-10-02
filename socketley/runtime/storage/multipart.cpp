@@ -1457,6 +1457,7 @@ void multipart_store::assemble_commit(const std::shared_ptr<assemble_state>& a)
     req.tmp_name = a->tmp_name;
     req.meta     = a->meta;
     req.cond     = a->cond;
+    req.cause    = change_cause::complete;
     m_store->commit(std::move(req), [this, alive = m_alive, a](put_result pr)
     {
         if (!*alive)

@@ -79,6 +79,9 @@ std::string_view storage_run::operation_name(const s3_request& r)
     if (bucket_level && r.has_query("encryption"))
         return m == "GET" ? "GetBucketEncryption" : m == "PUT" ? "PutBucketEncryption"
              : m == "DELETE" ? "DeleteBucketEncryption" : "Unknown";
+    if (bucket_level && r.has_query("notification"))
+        return m == "GET" ? "GetBucketNotificationConfiguration" : m == "PUT" ? "PutBucketNotificationConfiguration"
+             : "Unknown";
     if (bucket_level && r.has_query("object-lock"))
         return m == "GET" ? "GetObjectLockConfiguration" : m == "PUT" ? "PutObjectLockConfiguration" : "Unknown";
     if (bucket_level && r.has_query("lifecycle"))

@@ -46,12 +46,15 @@ public:
     bool pread(int fd, char* buf, uint32_t len, uint64_t off, done cb);
     bool pwrite(int fd, const char* buf, uint32_t len, uint64_t off, done cb);
 
+    // A non-blocking socket's connect, the address copied so the caller need not keep it.
+    bool connect(int fd, const struct sockaddr* addr, socklen_t len, done cb);
+
     // Whether a completion of this kind is one of this object's.
     static bool owns_type(uint8_t type)
     {
         return type == op_file_read || type == op_file_write || type == op_fsync ||
                type == op_rename || type == op_unlink || type == op_openat ||
-               type == op_mkdir || type == op_link;
+               type == op_mkdir || type == op_link || type == op_connect;
     }
 
     // Runs the callback of the operation `cqe` completes.

@@ -88,6 +88,12 @@ std::string storage_instance::config_refusal() const
     if (std::vector<std::string> d; !m_domain.empty())
         if (std::string why; !socketley::storage::parse_domains(m_domain, d, why))
             return "storage: " + why + "\n";
+    if (!m_notify_targets.empty())
+    {
+        std::vector<socketley::storage::notify_target> targets;
+        if (std::string why; !socketley::storage::load_notify_targets(m_notify_targets, targets, why, false))
+            return "storage: " + why + "\n";
+    }
     return {};
 }
 
@@ -254,6 +260,20 @@ bool storage_instance::setup(event_loop& loop)
         }
         run->set_sse_master(key);
     }
+    // Read here, at every start, so an edited targets file is the one a restart delivers to.
+    if (!m_notify_targets.empty())
+    {
+        std::vector<socketley::storage::notify_target> targets;
+        std::string why;
+        if (!socketley::storage::load_notify_targets(m_notify_targets, targets, why))
+        {
+            LOG_ERROR(("storage: " + why).c_str());
+            run->stop();
+            m_graveyard.push_back(std::move(run));
+            return false;
+        }
+        run->notifications().set_targets(std::move(targets));
+    }
 
     // The one blocking step: reading the directory and reconciling the journals
     // happens here, before the listener exists, so no connection waits behind it.
@@ -419,7 +439,11 @@ std::string storage_instance::stats_lines() const
         << "hash_handoffs:" << m_run->hash_handoffs() << "\n"
         << "sse:" << (m_run->has_sse_master() ? 1 : 0) << "\n"
         << "sse_puts:" << c.sse_puts << "\n"
-        << "sse_gets:" << c.sse_gets << "\n";
+        << "sse_gets:" << c.sse_gets << "\n"
+        << "notify_sent:" << m_run->notifications().counters().sent << "\n"
+        << "notify_failed:" << m_run->notifications().counters().failed << "\n"
+        << "notify_queued:" << m_run->notifications().queued() << "\n"
+        << "notify_dropped:" << m_run->notifications().counters().dropped << "\n";
     // One line per code answered, so a client's mistakes and the runtime's own
     // are told apart without reading a log.
     for (const auto& [code, n] : c.errors)

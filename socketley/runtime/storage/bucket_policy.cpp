@@ -179,8 +179,8 @@ constexpr action_name action_names[] = {
     {"GetBucketWebsite", res_kind::bucket, s3_action::none},
     {"PutBucketWebsite", res_kind::bucket, s3_action::none},
     {"DeleteBucketWebsite", res_kind::bucket, s3_action::none},
-    {"GetBucketNotification", res_kind::bucket, s3_action::none},
-    {"PutBucketNotification", res_kind::bucket, s3_action::none},
+    {"GetBucketNotification", res_kind::bucket, s3_action::get_bucket_notification},
+    {"PutBucketNotification", res_kind::bucket, s3_action::put_bucket_notification},
     {"GetBucketLogging", res_kind::bucket, s3_action::none},
     {"PutBucketLogging", res_kind::bucket, s3_action::none},
     {"GetEncryptionConfiguration", res_kind::bucket, s3_action::get_encryption_configuration},
@@ -664,6 +664,8 @@ s3_action action_of_operation(std::string_view op)
         {"PutObjectRetention", s3_action::put_object_retention},
         {"GetObjectLegalHold", s3_action::get_object_legal_hold},
         {"PutObjectLegalHold", s3_action::put_object_legal_hold},
+        {"GetBucketNotificationConfiguration", s3_action::get_bucket_notification},
+        {"PutBucketNotificationConfiguration", s3_action::put_bucket_notification},
     };
     for (const row& r : table)
         if (r.op == op)

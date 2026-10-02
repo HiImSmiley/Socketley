@@ -681,6 +681,7 @@ void storage_run::copy_sealed(const std::shared_ptr<conn>& c, std::string src_bu
         send_error_st(c, why);
         return;
     }
+    op->set_cause(change_cause::copy);
     if (dst.mode != sse_mode::none)
         ++m_c.sse_puts;
     feed_copy(c, std::move(op), src_bucket, src_key, src_version, std::move(src_customer), 0, src.size,

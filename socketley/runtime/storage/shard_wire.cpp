@@ -79,6 +79,7 @@ std::string encode_commit(const commit_request& req)
     std::string rec;
     encode_put_record(rec, req.key, req.meta);
     w.bytes(rec);
+    w.u8(static_cast<uint8_t>(req.cause));
     return w.take();
 }
 
@@ -88,11 +89,13 @@ bool decode_commit(std::string_view payload, commit_request& out)
     std::string_view rec;
     std::string key;
     bool conditional = false;
+    uint8_t cause = 0;
     if (!open_request(r, op::commit) || !r.bytes(out.bucket, name_cap) || !r.bytes(out.key, name_cap) ||
         !r.bytes(out.tmp_name, name_cap) || !r.flag(conditional) ||
         (conditional && (!r.bytes(out.cond.if_match, name_cap) || !r.bytes(out.cond.if_none_match, name_cap))) ||
-        !r.view(rec, record_cap))
+        !r.view(rec, record_cap) || !r.u8(cause) || cause > static_cast<uint8_t>(change_cause::lifecycle))
         return false;
+    out.cause = static_cast<change_cause>(cause);
     return decode_record(rec, key, out.meta) && key == out.key;
 }
 

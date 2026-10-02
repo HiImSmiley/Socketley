@@ -112,6 +112,8 @@ void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool
         stg.set_sse_key_file(cfg.storage_sse_key_file);
     if (asked("domain", !cfg.storage_domain.empty()))
         stg.set_domain(cfg.storage_domain);
+    if (asked("notify_targets", !cfg.storage_notify_targets.empty()))
+        stg.set_notify_targets(cfg.storage_notify_targets);
     if (asked("mpu_expire", cfg.storage_mpu_expire_secs > 0))
         stg.set_mpu_expire_secs(cfg.storage_mpu_expire_secs);
 }

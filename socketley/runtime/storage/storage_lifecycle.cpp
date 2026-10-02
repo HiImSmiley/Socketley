@@ -341,7 +341,7 @@ void storage_run::lifecycle_issue(lifecycle_pass& p)
                 LOG_WARN(("storage: lifecycle could not remove a version of " + bucket + "/" + key + ": " +
                           status_name(r.status)).c_str());
             lifecycle_done(id);
-        }, std::move(still));
+        }, std::move(still), false, change_cause::lifecycle);
         return;
     }
     // Asked under the key's lane, so an object written again or retagged after the walk saw it is judged as it is.
@@ -363,7 +363,7 @@ void storage_run::lifecycle_issue(lifecycle_pass& p)
         else if (s != st::ok && s != st::no_such_bucket)
             LOG_WARN(("storage: lifecycle could not remove " + bucket + "/" + key + ": " + status_name(s)).c_str());
         lifecycle_done(id);
-    }, std::move(still_due));
+    }, std::move(still_due), change_cause::lifecycle);
 }
 
 void storage_run::lifecycle_done(uint64_t pass_id)
