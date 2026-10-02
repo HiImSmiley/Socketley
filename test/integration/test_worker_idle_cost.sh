@@ -230,23 +230,36 @@ EOF
 "$BIN" create server idlert -p $((PORT + N + 1)) --lua "$LUA" -s >/dev/null 2>&1
 sleep 1
 
-S=$(date +%s%3N)
-"$BIN" reload-lua idlert >/dev/null 2>&1
-E=$(date +%s%3N)
-MS=$((E - S))
-echo "  reload-lua against an idle worker: ${MS} ms"
+# The bound is on what the reload adds to one CLI round trip, because under
+# Sanitize the CLI process alone costs ~170 ms before it reaches the daemon.
+RT=""
+for _ in $(seq 1 5); do
+    t0=$(date +%s%3N); "$BIN" stats idlert >/dev/null 2>&1
+    RT="$RT $(( $(date +%s%3N) - t0 ))"
+done
+RT_MS=$(printf '%s\n' $RT | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
 
-# 150 ms: an order of magnitude above the 6 ms this takes when the arm ends the
-# wait, and safely below the 250 ms publish period a loop woken only by its own
-# deadline cannot beat.
+# A median of three, each after a second's quiet so the worker is back in its idle wait.
+RL=""
+for _ in $(seq 1 3); do
+    sleep 1
+    t0=$(date +%s%3N); "$BIN" reload-lua idlert >/dev/null 2>&1
+    RL="$RL $(( $(date +%s%3N) - t0 ))"
+done
+RL_MS=$(printf '%s\n' $RL | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+MS=$((RL_MS - RT_MS))
+echo "  reload-lua against an idle worker: median ${RL_MS} ms ($RL ), one stats round trip ${RT_MS} ms ($RT ), ${MS} ms added"
+
+# 150 ms past one round trip: over ten times what a reload adds when the arm ends
+# the wait, and far below the 2000 ms await_routes() deadline a deaf worker reads.
 if [ "$MS" -le 150 ]; then
-    ok "a control frame ended the worker's wait in ${MS} ms (bound 150; a broken arm reads ~230)"
+    ok "a control frame ended the worker's wait ${MS} ms past one round trip (bound 150; a broken arm adds ~2000)"
 else
-    bad "reload-lua took ${MS} ms against an idle worker (bound 150)." \
-        " At or above one publish period the frame is waiting for the loop's"
-    echo "         deadline instead of waking it.  The poll armed on the control"
+    bad "reload-lua took ${RL_MS} ms against an idle worker, ${MS} ms past one round trip (bound 150)." \
+        " The frame is waiting for the loop's deadline, or for the daemon's,"
+    echo "         instead of waking the worker.  The recv armed on the control"
     echo "         socket is what makes a long wait safe, and it is not working —"
-    echo "         see arm_control() and m_ctl_armed in proxy_worker.cpp."
+    echo "         see arm_control() and m_ctl_armed in worker_main.cpp."
 fi
 
 echo ""
