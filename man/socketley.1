@@ -6893,6 +6893,26 @@ nothing of such an object is kept in memory between requests, and a script's
 .B socketley.storage.get
 of one is refused, since it has no key to give.
 .PP
+An SSE\-C upload's part list is bound to its key when it completes, so a header
+rewritten to drop trailing parts does not read. S3 does not ask CompleteMultipartUpload
+for the customer key, but boto3 and the AWS CLI can send the three headers with it:
+then the key must be the upload's
+.RB ( "403 AccessDenied"
+otherwise) and the data key is wrapped again with the digest of the part list, as
+SSE\-S3 does. A completion without them is bound instead by an HMAC\-SHA256 of the
+object's encryption record and its part list, under a key derived from the
+.B \-\-sse\-key\-file
+master key (HKDF), recorded in the header as
+.B x\-socketley\-sse\-parts
+and checked before every read, which then needs that master key too. With neither, the
+completion is
+.B "400 InvalidRequest"
+naming both ways out and the upload stays open to be completed again. An object of an
+upload begun since is never read with its list unbound, a missing or wrong HMAC being
+.BR "500 InternalError" ;
+one completed without the key before this binding existed is read as it was, unless
+it carries an HMAC that does not hold.
+.PP
 On disk an encrypted object is its header, which records the scheme
 .RB ( x\-socketley\-sse :
 format, SSE\-S3 or SSE\-C, the chunk size, whether the body is one stream or one per
@@ -6912,9 +6932,7 @@ chunk that does not open ends the response there with a line in the log, and an
 object small enough to be read whole with its header, or whose data key does not
 unwrap, is answered
 .B "500 InternalError"
-before anything else. An SSE\-C completion that does not carry the customer's key,
-which S3 does not ask of it, leaves the key wrapped as the upload had it, so the part
-list of such an object is bound only by its parts' own chunks. Objects written in
+before anything else. Objects written in
 format 1, which bound a chunk to its index alone, are read as they were, and so are
 parts of an upload begun under it. The parts of a multipart upload are each a stream
 of their own, written where the object needs them as unencrypted ones are, and found

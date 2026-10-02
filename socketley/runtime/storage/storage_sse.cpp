@@ -5,6 +5,8 @@
 
 #include <cstring>
 
+#include <openssl/crypto.h>
+
 #include "s3_encryption.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
@@ -41,6 +43,14 @@ const customer_names& names_of(std::string_view prefix)
     return prefix == sse_c_copy_prefix ? copy_names : own_names;
 }
 
+const std::string* parts_mac_of(const object_meta& m)
+{
+    for (const auto& [n, v] : m.extra)
+        if (n == sse_parts_extra)
+            return &v;
+    return nullptr;
+}
+
 }   // namespace
 
 void sse_headers(const s3_request& r, const object_meta& m, std::vector<std::pair<std::string, std::string>>& out,
@@ -68,6 +78,7 @@ void storage_run::set_sse_master(const sse_key& k)
 {
     m_master     = k;
     m_master_kid = sse_key_id(k);
+    m_parts_mac_key = sse_parts_mac_key(k);
     m_has_master = true;
 }
 
@@ -188,8 +199,10 @@ bool storage_run::sse_new_key(const sse_ask& ask, bool per_part, object_meta& me
     seal.opaque_etag = ask.mode == sse_mode::c;
     if (ask.mode == sse_mode::s3)
         rec.kid = m_master_kid;
+    // An SSE-C upload's wrap opens its parts, and a completed object only once its part list is bound.
     if ((ask.mode == sse_mode::c && !ask.customer) ||
-        !sse_wrap(ask.mode == sse_mode::c ? *ask.customer : m_master, seal.key, rec.wrapped))
+        !sse_wrap(ask.mode == sse_mode::c ? *ask.customer : m_master, seal.key, rec.wrapped, rec.version, nullptr,
+                  ask.mode == sse_mode::c && per_part))
     {
         err = sse_error("InternalError", "The object's data key could not be wrapped");
         return false;
@@ -229,14 +242,29 @@ bool storage_run::sse_data_key(const object_meta& m, const std::optional<sse_key
                                               "correct parameters must be provided to retrieve the object.");
             return false;
         }
-        // A completion that was not given the client's key left it wrapped as its upload had it.
-        if (!sse_unwrap(*customer, rec.wrapped, out, rec.version, parts) &&
-            !(parts && sse_unwrap(*customer, rec.wrapped, out, rec.version, nullptr)))
+        const bool upload_wrap = rec.version != sse_format_v1 && rec.per_part;
+        auto denied = [&err]
         {
             err = sse_error("AccessDenied", "The SSE-C key provided does not match the key the object was stored with");
             return false;
+        };
+        if (!parts)
+        {
+            if (sse_unwrap(*customer, rec.wrapped, out, rec.version) ||
+                (upload_wrap && sse_unwrap(*customer, rec.wrapped, out, rec.version, nullptr, true)))
+                return true;
+            return denied();
         }
-        return true;
+        if (sse_unwrap(*customer, rec.wrapped, out, rec.version, parts))
+            return true;
+        // A completion that was not given the client's key left it wrapped as its upload had it.
+        const bool before_binding = sse_unwrap(*customer, rec.wrapped, out, rec.version);
+        if (!before_binding && !sse_unwrap(*customer, rec.wrapped, out, rec.version, nullptr, true))
+            return denied();
+        // An upload begun before part lists were bound reads as it did, unless it carries a MAC that does not hold.
+        if (before_binding && !parts_mac_of(m))
+            return true;
+        return sse_parts_mac_ok(m, *v, *parts, err);
     }
     if (customer)
     {
@@ -269,6 +297,8 @@ s3_error storage_run::sse_bind_parts(object_meta& m, const std::optional<sse_key
 {
     const std::string* v = sse_value(m);
     sse_record rec;
+    if (customer && (!v || sse_mode_of(m) != sse_mode::c))
+        return sse_error("InvalidRequest", "The encryption parameters are not applicable to this object.");
     if (!v)
         return {};
     if (!decode_sse(*v, rec))
@@ -288,10 +318,21 @@ s3_error storage_run::sse_bind_parts(object_meta& m, const std::optional<sse_key
     }
     else if (customer)
         kek = &*customer;
+    else if (m_has_master)
+    {
+        // S3 does not ask a completion for the client's key, so the master key vouches for the list instead.
+        std::string mac = encode_parts_mac(m_master_kid, sse_parts_mac(m_parts_mac_key, *v, parts));
+        std::erase_if(m.extra, [](const auto& e) { return e.first == sse_parts_extra; });
+        m.extra.emplace_back(std::string(sse_parts_extra), std::move(mac));
+        return {};
+    }
     else
-        return {};   // S3 does not ask a completion for the client's key, and without it the list stays unbound.
+        return sse_error("InvalidRequest", "An SSE-C multipart upload completes only with its part list bound: send "
+                                           "the x-amz-server-side-encryption-customer-* headers with "
+                                           "CompleteMultipartUpload, or give the runtime an --sse-key-file");
     sse_key data{};
-    if (!sse_unwrap(*kek, rec.wrapped, data, rec.version))
+    if (!sse_unwrap(*kek, rec.wrapped, data, rec.version) &&
+        !(rec.mode == sse_mode::c && sse_unwrap(*kek, rec.wrapped, data, rec.version, nullptr, true)))
         return rec.mode == sse_mode::c
                    ? sse_error("AccessDenied", "The SSE-C key provided does not match the key the upload was "
                                                "created with")
@@ -302,6 +343,35 @@ s3_error storage_run::sse_bind_parts(object_meta& m, const std::optional<sse_key
         if (n == sse_extra)
             val = encode_sse(rec);
     return {};
+}
+
+bool storage_run::sse_parts_mac_ok(const object_meta& m, const std::string& record, const sse_digest& parts,
+                                   s3_error& err) const
+{
+    const std::string* v = parts_mac_of(m);
+    std::array<uint8_t, 4> kid{};
+    sse_digest mac{};
+    if (!v || !decode_parts_mac(*v, kid, mac))
+    {
+        LOG_WARN("storage: an SSE-C object's part list is bound by neither its key nor a MAC, so its header was "
+                 "altered");
+        err = sse_error("InternalError", "The object's part list is not bound to its key: its header was altered");
+        return false;
+    }
+    if (!m_has_master || kid != m_master_kid)
+    {
+        err = sse_error("InternalError", "The object's part list is sealed under a master key this runtime was not "
+                                         "given as its --sse-key-file");
+        return false;
+    }
+    const sse_digest want = sse_parts_mac(m_parts_mac_key, record, parts);
+    if (CRYPTO_memcmp(want.data(), mac.data(), mac.size()) != 0)
+    {
+        LOG_WARN("storage: an SSE-C object's part list does not match its MAC, so its header was altered");
+        err = sse_error("InternalError", "The object's part list does not match its MAC: its header was altered");
+        return false;
+    }
+    return true;
 }
 
 bool storage_run::sse_read_key(const std::shared_ptr<conn>& c, const object_meta& m, std::string_view prefix,

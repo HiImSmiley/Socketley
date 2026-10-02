@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 
 #include "checksum.h"
@@ -49,7 +50,7 @@ size_t chunk_aad(uint8_t* aad, uint8_t version, uint32_t stream, uint64_t index,
 }
 
 // The additional data a data key is wrapped with.
-std::string wrap_aad(uint8_t version, const sse_digest* parts)
+std::string wrap_aad(uint8_t version, const sse_digest* parts, bool upload)
 {
     std::string aad(version == sse_format_v1 ? wrap_aad_v1 : wrap_aad_v2);
     if (parts && version != sse_format_v1)
@@ -57,7 +58,25 @@ std::string wrap_aad(uint8_t version, const sse_digest* parts)
         aad += "/parts/";
         aad.append(reinterpret_cast<const char*>(parts->data()), parts->size());
     }
+    else if (upload && version != sse_format_v1)
+        aad += "/upload";
     return aad;
+}
+
+// What the master key is expanded with for the part list MAC, so that key is never the master's other uses.
+constexpr std::string_view parts_mac_info  = "socketley-sse-c-parts-mac";
+// What a part list MAC is taken over first, so it is never taken for anything else.
+constexpr std::string_view parts_mac_label = "socketley-sse-c-parts-v1";
+
+sse_digest hmac_sha256(const uint8_t* key, size_t key_len, std::string_view data)
+{
+    sse_digest out{};
+    unsigned int len = 0;
+    if (!HMAC(EVP_sha256(), key, static_cast<int>(key_len), reinterpret_cast<const unsigned char*>(data.data()),
+              data.size(), out.data(), &len) ||
+        len != out.size())
+        std::abort();
+    return out;
 }
 
 bool hex_nibble(char ch, uint8_t& out)
@@ -348,28 +367,73 @@ std::array<uint8_t, 4> sse_key_id(const sse_key& master)
 }
 
 bool sse_wrap(const sse_key& kek, const sse_key& data, std::string& wrapped, uint8_t version,
-              const sse_digest* parts)
+              const sse_digest* parts, bool upload)
 {
     wrapped.assign(sse_wrapped_bytes, '\0');
     auto* w = reinterpret_cast<uint8_t*>(wrapped.data());
     if (RAND_bytes(w, static_cast<int>(sse_nonce)) != 1)
         return false;
-    const std::string aad = wrap_aad(version, parts);
+    const std::string aad = wrap_aad(version, parts, upload);
     gcm g(kek.data(), true);
     return g.seal(w, reinterpret_cast<const uint8_t*>(aad.data()), aad.size(), data.data(), data.size(),
                   w + sse_nonce, w + sse_nonce + sse_key_bytes);
 }
 
 bool sse_unwrap(const sse_key& kek, std::string_view wrapped, sse_key& data, uint8_t version,
-                const sse_digest* parts)
+                const sse_digest* parts, bool upload)
 {
     if (wrapped.size() != sse_wrapped_bytes)
         return false;
     const auto* w = reinterpret_cast<const uint8_t*>(wrapped.data());
-    const std::string aad = wrap_aad(version, parts);
+    const std::string aad = wrap_aad(version, parts, upload);
     gcm g(kek.data(), false);
     return g.open(w, reinterpret_cast<const uint8_t*>(aad.data()), aad.size(), w + sse_nonce, sse_key_bytes,
                   w + sse_nonce + sse_key_bytes, data.data());
+}
+
+sse_key sse_parts_mac_key(const sse_key& master)
+{
+    // HKDF-SHA256 of RFC 5869 with no salt, whose one block of output is the key.
+    const uint8_t zero_salt[32] = {};
+    const sse_digest prk = hmac_sha256(zero_salt, sizeof zero_salt,
+                                       std::string_view(reinterpret_cast<const char*>(master.data()), master.size()));
+    std::string info(parts_mac_info);
+    info += '\x01';
+    return hmac_sha256(prk.data(), prk.size(), info);
+}
+
+sse_digest sse_parts_mac(const sse_key& mac_key, std::string_view record, const sse_digest& parts)
+{
+    std::string msg(parts_mac_label);
+    msg += '\0';
+    msg += record;
+    msg += '\0';
+    msg.append(reinterpret_cast<const char*>(parts.data()), parts.size());
+    return hmac_sha256(mac_key.data(), mac_key.size(), msg);
+}
+
+std::string encode_parts_mac(const std::array<uint8_t, 4>& kid, const sse_digest& mac)
+{
+    return hex(kid.data(), kid.size()) + ";" + hex(mac.data(), mac.size());
+}
+
+bool decode_parts_mac(std::string_view v, std::array<uint8_t, 4>& kid, sse_digest& mac)
+{
+    if (v.size() != 2 * kid.size() + 1 + 2 * mac.size() || v[2 * kid.size()] != ';')
+        return false;
+    auto bytes = [](std::string_view h, uint8_t* out, size_t n)
+    {
+        for (size_t i = 0; i < n; ++i)
+        {
+            uint8_t hi = 0, lo = 0;
+            if (!hex_nibble(h[2 * i], hi) || !hex_nibble(h[2 * i + 1], lo))
+                return false;
+            out[i] = static_cast<uint8_t>(hi << 4 | lo);
+        }
+        return true;
+    };
+    return bytes(v.substr(0, 2 * kid.size()), kid.data(), kid.size()) &&
+           bytes(v.substr(2 * kid.size() + 1), mac.data(), mac.size());
 }
 
 // ─── Chunks ─────────────────────────────────────────────────────────────────

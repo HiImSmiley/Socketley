@@ -123,6 +123,9 @@ uint64_t place_base_of(std::string_view key, const object_meta& meta, checksum_a
                              std::string(checksum_b64_len(algo) + std::to_string(mpu_max_parts).size() + 1, 'A'));
     // Parts placed in the data file are of one size, so their sizes are one number.
     m.extra.emplace_back(std::string(part_sizes_extra), std::string(20, '9'));
+    // An SSE-C upload completed without its client's key takes a MAC of its part list.
+    if (sse_mode_of(meta) == sse_mode::c)
+        m.extra.emplace_back(std::string(sse_parts_extra), encode_parts_mac({}, {}));
     return object_header_len(key, m);
 }
 

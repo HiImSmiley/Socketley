@@ -86,6 +86,8 @@ std::string encode_part_list(const part_list& l, uint64_t total);
 // The extra entry of a multipart object whose part list did not fit in its header and follows its body
 // instead, in the canonical encoding: the body's length on disk, a semicolon, and the list's SHA-256 in hex.
 inline constexpr std::string_view part_layout_extra = "x-socketley-part-layout";
+// The extra entry an SSE-C object completed without its client's key keeps its part list's MAC in.
+inline constexpr std::string_view sse_parts_extra = "x-socketley-sse-parts";
 
 // Where a part list kept after the body lies, counted from the body's start, and the digest it must have.
 struct part_trailer

@@ -395,7 +395,10 @@ bool part_list_of(const object_meta& m, part_list& out)
 void clear_part_layout(object_meta& m)
 {
     std::erase_if(m.extra, [](const auto& e)
-                  { return e.first == part_sizes_extra || e.first == part_numbers_extra || e.first == part_layout_extra; });
+                  {
+                      return e.first == part_sizes_extra || e.first == part_numbers_extra ||
+                             e.first == part_layout_extra || e.first == sse_parts_extra;
+                  });
 }
 
 bool part_trailer_of(const object_meta& m, part_trailer& out)

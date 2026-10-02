@@ -19,7 +19,12 @@
 // every stream ends in a last chunk shorter than 64 KiB, empty when the
 // stream's length is a multiple of it.  A completed multipart object's data
 // key is wrapped again with the digest of its part list, so a header that
-// names fewer parts, or other ones, no longer unwraps it.
+// names fewer parts, or other ones, no longer unwraps it.  An SSE-C upload
+// begun since that binding was enforced wraps its key as an upload's, which a
+// completed object opens only with its list bound: by the client's key, or,
+// when the completion did not carry it, by a MAC under the master key.
+//
+//   x-socketley-sse-parts: <master key id>;<HMAC-SHA256 of the record and the part list, hex>
 #include <array>
 #include <cstdint>
 #include <string>
@@ -147,10 +152,18 @@ sse_key sse_random_key();
 // A short name of a master key, which is what its objects record.
 std::array<uint8_t, 4> sse_key_id(const sse_key& master);
 // `parts`, when given, binds the wrap to a completed object's part list, which a version 2 per-part record needs.
+// `upload` marks an SSE-C upload's wrap, which a completed object is read with only beside a part list MAC.
 bool sse_wrap(const sse_key& kek, const sse_key& data, std::string& wrapped, uint8_t version = sse_format,
-              const sse_digest* parts = nullptr);
+              const sse_digest* parts = nullptr, bool upload = false);
 bool sse_unwrap(const sse_key& kek, std::string_view wrapped, sse_key& data, uint8_t version = sse_format,
-                const sse_digest* parts = nullptr);
+                const sse_digest* parts = nullptr, bool upload = false);
+
+// The key an SSE-C object's part list is MACed with, derived from the master key by HKDF-SHA256.
+sse_key sse_parts_mac_key(const sse_key& master);
+// The MAC of an object's encryption record, which names its upload's data key, and of its part list.
+sse_digest sse_parts_mac(const sse_key& mac_key, std::string_view record, const sse_digest& parts);
+std::string encode_parts_mac(const std::array<uint8_t, 4>& kid, const sse_digest& mac);
+bool decode_parts_mac(std::string_view v, std::array<uint8_t, 4>& kid, sse_digest& mac);
 
 // Seals `n` plaintext bytes of stream `stream` chunk by chunk into `out`, the first chunk having index `first`.
 // `last` says the bytes end the stream, which in version 2 closes it with a short chunk; otherwise `n` is

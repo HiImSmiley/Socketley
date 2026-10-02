@@ -628,8 +628,12 @@ public:
     // an empty record seals nothing.
     bool sse_part_key(const std::shared_ptr<conn>& c, const std::string& record, uint32_t number, object_meta& meta,
                       sse_seal_spec& seal, s3_error& err);
-    // Wraps a completed upload's data key again with its part list, when the key that wraps it is at hand.
+    // Binds a completed upload's part list to its data key: wrapped again with it under the key at hand, or for an
+    // SSE-C upload completed without its client's key, MACed under the master key; refused when neither can be.
     s3_error sse_bind_parts(object_meta& m, const std::optional<sse_key>& customer) const;
+    // Whether an SSE-C object's part list MAC is there and holds, false with `err` when it does not.
+    bool sse_parts_mac_ok(const object_meta& m, const std::string& record, const sse_digest& parts,
+                          s3_error& err) const;
     // The key the SSE-C headers under `prefix` give, none when they are absent; false with `err` when they are refused.
     bool sse_customer(const std::shared_ptr<conn>& c, std::string_view prefix, std::optional<sse_key>& out,
                       s3_error& err);
@@ -742,6 +746,8 @@ private:
     bool        m_has_master{false};
     sse_key     m_master{};
     std::array<uint8_t, 4> m_master_kid{};
+    // The key an SSE-C part list is MACed with when its completion did not carry the client's key.
+    sse_key     m_parts_mac_key{};
 
     int         m_listen_fd{-1};
     io_request  m_accept_req{};
