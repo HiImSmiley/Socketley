@@ -7,6 +7,7 @@
 #include <openssl/evp.h>
 
 #if defined(__x86_64__)
+#include <immintrin.h>
 #endif
 
 #include "../../shared/raft_storage.h"
@@ -61,12 +62,76 @@ uint32_t crc32_update(uint32_t crc, const unsigned char* p, size_t n)
     return ~crc;
 }
 
+uint64_t crc64_bytes(uint64_t crc, const unsigned char* p, size_t n)
+{
+    for (size_t i = 0; i < n; ++i)
+        crc = crc64_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    return crc;
+}
+
+// x^e mod P, bit-reflected so that bit j is the coefficient of x^(63-j).
+constexpr uint64_t crc64_xpow(unsigned e)
+{
+    uint64_t v = 1ull << 63;
+    for (unsigned i = 0; i < e; ++i)
+        v = (v & 1) ? (v >> 1) ^ crc64_poly : v >> 1;
+    return v;
+}
+
+#if defined(__x86_64__)
+// Folding 128 bits of pending CRC across D bits multiplies its halves by x^(D+63) and x^(D-1) mod P, one less than
+// the distance because a carry-less product of two reflected values lands one bit low.
+struct fold_keys
+{
+    uint64_t far;
+    uint64_t near;
+};
+constexpr fold_keys fold_128  = {crc64_xpow(128 + 63), crc64_xpow(128 - 1)};
+constexpr fold_keys fold_1024 = {crc64_xpow(1024 + 63), crc64_xpow(1024 - 1)};
+
+__attribute__((target("pclmul,sse4.1")))
+inline __m128i fold(__m128i acc, __m128i keys, __m128i next)
+{
+    return _mm_xor_si128(_mm_xor_si128(_mm_clmulepi64_si128(acc, keys, 0x00), _mm_clmulepi64_si128(acc, keys, 0x11)),
+                         next);
+}
+
+// Eight lanes of 128 bits fold 128 bytes a step, then into one lane, whose CRC the table finishes; n >= 128.
+__attribute__((target("pclmul,sse4.1")))
+uint64_t crc64_pclmul(uint64_t crc, const unsigned char*& p, size_t& n)
+{
+    auto load = [](const unsigned char* q) { return _mm_loadu_si128(reinterpret_cast<const __m128i*>(q)); };
+    const __m128i k1024 = _mm_set_epi64x(static_cast<long long>(fold_1024.near), static_cast<long long>(fold_1024.far));
+    const __m128i k128  = _mm_set_epi64x(static_cast<long long>(fold_128.near), static_cast<long long>(fold_128.far));
+    __m128i x[8];
+    for (int i = 0; i < 8; ++i)
+        x[i] = load(p + 16 * i);
+    x[0] = _mm_xor_si128(x[0], _mm_cvtsi64_si128(static_cast<long long>(crc)));
+    p += 128;
+    n -= 128;
+    for (; n >= 128; p += 128, n -= 128)
+        for (int i = 0; i < 8; ++i)
+            x[i] = fold(x[i], k1024, load(p + 16 * i));
+    __m128i acc = x[0];
+    for (int i = 1; i < 8; ++i)
+        acc = fold(acc, k128, x[i]);
+    for (; n >= 16; p += 16, n -= 16)
+        acc = fold(acc, k128, load(p));
+    alignas(16) unsigned char lane[16];
+    _mm_store_si128(reinterpret_cast<__m128i*>(lane), acc);
+    return crc64_bytes(0, lane, 16);
+}
+#endif
+
 uint64_t crc64_update(uint64_t crc, const unsigned char* p, size_t n)
 {
     crc = ~crc;
-    for (size_t i = 0; i < n; ++i)
-        crc = crc64_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
-    return ~crc;
+#if defined(__x86_64__)
+    static const bool hw = __builtin_cpu_supports("pclmul") && __builtin_cpu_supports("sse4.1");
+    if (hw && n >= 128)
+        crc = crc64_pclmul(crc, p, n);
+#endif
+    return ~crc64_bytes(crc, p, n);
 }
 
 uint32_t crc32c_update(uint32_t crc, const unsigned char* p, size_t n)
@@ -300,47 +365,40 @@ namespace
 {
 
 // The CRC of A then B from those of A and B, as zlib's crc32_combine does it for any reflected CRC whose
-// initial value and final xor are the same: the CRC of A is moved past len_b zero bytes by squaring an operator.
-uint64_t gf2_times(const uint64_t* mat, uint64_t vec)
+// initial value and final xor are the same: the CRC of A times x^(8 len_b) mod P, plus the CRC of B.
+struct crc_field
 {
-    uint64_t sum = 0;
-    for (; vec; vec >>= 1, ++mat)
-        if (vec & 1)
-            sum ^= *mat;
-    return sum;
-}
+    uint64_t poly;
+    int      width;
 
-void gf2_square(uint64_t* sq, const uint64_t* mat, int width)
-{
-    for (int n = 0; n < width; ++n)
-        sq[n] = gf2_times(mat, mat[n]);
-}
+    uint64_t top() const { return 1ull << (width - 1); }
 
-uint64_t crc_combine(uint64_t crc_a, uint64_t crc_b, uint64_t len_b, uint64_t poly, int width)
-{
-    if (len_b == 0)
-        return crc_a;
-    uint64_t even[64], odd[64];
-    odd[0] = poly;
-    for (int n = 1; n < width; ++n)
-        odd[n] = 1ull << (n - 1);
-    gf2_square(even, odd, width);
-    gf2_square(odd, even, width);
-    do
+    // a * b mod P, both reflected with x^0 at the top bit.
+    uint64_t mul(uint64_t a, uint64_t b) const
     {
-        gf2_square(even, odd, width);
-        if (len_b & 1)
-            crc_a = gf2_times(even, crc_a);
-        len_b >>= 1;
-        if (!len_b)
-            break;
-        gf2_square(odd, even, width);
-        if (len_b & 1)
-            crc_a = gf2_times(odd, crc_a);
-        len_b >>= 1;
-    } while (len_b);
-    return crc_a ^ crc_b;
-}
+        uint64_t p = 0;
+        for (uint64_t m = top(); m; m >>= 1)
+        {
+            if (a & m)
+                p ^= b;
+            b = (b & 1) ? (b >> 1) ^ poly : b >> 1;
+        }
+        return p;
+    }
+
+    // x^(n 2^k) mod P, from x^(2^k) squared once per bit of n.
+    uint64_t xpow2n(uint64_t n, unsigned k) const
+    {
+        uint64_t sq = top() >> 1;
+        for (unsigned i = 0; i < k; ++i)
+            sq = mul(sq, sq);
+        uint64_t p = top();
+        for (; n; n >>= 1, sq = mul(sq, sq))
+            if (n & 1)
+                p = mul(sq, p);
+        return p;
+    }
+};
 
 }   // namespace
 
@@ -355,8 +413,11 @@ std::string full_object_checksum_b64(checksum_algo a, const std::vector<std::pai
         return {};
     const size_t bytes = checksum_raw_len(a);
     const int width = static_cast<int>(bytes * 8);
-    const uint64_t poly = a == checksum_algo::crc32 ? crc32_poly : a == checksum_algo::crc32c ? 0x82F63B78u : crc64_poly;
+    const crc_field f{a == checksum_algo::crc32 ? crc32_poly : a == checksum_algo::crc32c ? 0x82F63B78u : crc64_poly,
+                      width};
     uint64_t crc = 0;
+    // Parts are of one size but the last, so the shift past one is worked out once.
+    uint64_t shift_len = UINT64_MAX, shift = 0;
     for (const auto& [raw, len] : parts)
     {
         if (raw.size() != bytes)
@@ -364,7 +425,12 @@ std::string full_object_checksum_b64(checksum_algo a, const std::vector<std::pai
         uint64_t v = 0;
         for (unsigned char ch : raw)
             v = (v << 8) | ch;
-        crc = crc_combine(crc, v, len, poly, width);
+        if (len != shift_len)
+        {
+            shift_len = len;
+            shift     = f.xpow2n(len, 3);
+        }
+        crc = f.mul(shift, crc) ^ v;
     }
     return base64_encode(be_bytes(crc, bytes));
 }

@@ -174,6 +174,43 @@ TEST_CASE("the composite checksum is the algorithm over the part checksums, with
     CHECK(got.substr(0, got.size() - 2) == b64_of(checksum_algo::sha256, raw));
 }
 
+TEST_CASE("CRC64NVME is the bit-at-a-time CRC at every length around the folds and every alignment")
+{
+    // The definition, one bit at a time, which no table or carry-less multiply shares a line with.
+    auto reference = [](const unsigned char* p, size_t n)
+    {
+        uint64_t c = ~0ull;
+        for (size_t i = 0; i < n; ++i)
+        {
+            c ^= p[i];
+            for (int k = 0; k < 8; ++k)
+                c = (c & 1) ? (c >> 1) ^ 0x9A6C9329AC4BC9B5ull : c >> 1;
+        }
+        return ~c;
+    };
+    auto b64 = [](uint64_t v)
+    {
+        std::string raw(8, '\0');
+        for (int i = 0; i < 8; ++i)
+            raw[7 - i] = static_cast<char>((v >> (8 * i)) & 0xFF);
+        return base64_encode(raw);
+    };
+    const std::string data = pattern(4096 + 300, 11);
+    const auto* base = reinterpret_cast<const unsigned char*>(data.data());
+    for (size_t off : {size_t{0}, size_t{1}, size_t{7}, size_t{15}})
+        for (size_t n = 0; n <= 4096 + 260; n += (n < 400 || (n > 3800 && n < 4300)) ? 1 : 61)
+        {
+            INFO("offset " << off << ", length " << n);
+            REQUIRE(b64_of(checksum_algo::crc64nvme, std::string_view(data).substr(off, n)) == b64(reference(base + off, n)));
+        }
+    // A stream fed in pieces that straddle the 128-byte folds is the same as one fed whole.
+    const std::string big = pattern(1 << 20, 5);
+    checksum_stream s(checksum_algo::crc64nvme);
+    for (size_t at = 0, step = 1; at < big.size(); at += step, step = step * 3 % 1031 + 1)
+        s.update(big.data() + at, std::min(step, big.size() - at));
+    CHECK(s.peek_b64() == b64(reference(reinterpret_cast<const unsigned char*>(big.data()), big.size())));
+}
+
 TEST_CASE("the full-object checksum of parts is the CRC of their bytes joined, for every CRC and every cut")
 {
     const std::string whole = pattern(70001, 3);
