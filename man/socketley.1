@@ -6491,7 +6491,7 @@ Up to 1000 keys, each with or without a VersionId, Quiet, Content\-MD5 checked.
 T}
 CopyObject	PUT /bucket/key + x\-amz\-copy\-source	T{
 .ad l
-Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-tagging\-directive COPY (the default, the source's tags) or REPLACE (those x\-amz\-tagging names, or none); x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE, from an older version or naming an encryption; a source of key?versionId=ID copies that version. The copy is a single\-part object whose ETag is the md5 of its bytes, encrypted as its own request or its bucket asks whatever its source's was; x\-amz\-copy\-source\-server\-side\-encryption\-customer\-* open an SSE\-C source. Its checksum is FULL_OBJECT, of its own bytes, in the algorithm x\-amz\-checksum\-algorithm names or else its source's (see \fBChecksums\fR below).
+Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-tagging\-directive COPY (the default, the source's tags) or REPLACE (those x\-amz\-tagging names, or none); x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE, from an older version or naming an encryption or a checksum algorithm; a source of key?versionId=ID copies that version. The copy is a single\-part object whose ETag is the md5 of its bytes, encrypted as its own request or its bucket asks whatever its source's was; x\-amz\-copy\-source\-server\-side\-encryption\-customer\-* open an SSE\-C source. Its checksum is FULL_OBJECT, of its own bytes, in the algorithm x\-amz\-checksum\-algorithm names or else its source's (see \fBChecksums\fR below).
 T}
 PutObjectTagging	PUT /bucket/key?tagging	T{
 .ad l
@@ -6987,6 +6987,17 @@ part 1 with its own checksum, and a copy, which keeps none of its source's part
 checksums, answers part 1 with its own whole one. An object completed before part
 checksums were kept answers its parts without one.
 .PP
+An object that arrives with no checksum is given S3's default, the
+.B CRC64NVME
+of its whole bytes, FULL_OBJECT: a PutObject, a POST form upload and an object a
+script puts take it on the pass that takes the ETag's MD5, and answer it as they
+would one the client named. An upload created with no algorithm keeps a CRC64NVME
+of each part beside it, shown to no client (UploadPart, ListParts and
+GetObjectAttributes answer none, and its parts by number are read without one),
+and its CompleteMultipartUpload combines them into the object's default without
+reading the parts again. An object stored before this, and an upload whose parts
+were written before it, has none, and is not given one until it is copied.
+.PP
 A CopyObject's checksum is of the copy's own bytes, FULL_OBJECT, as S3 makes it: in
 the algorithm
 .B x\-amz\-checksum\-algorithm
@@ -6998,9 +7009,13 @@ another algorithm, has the copy's taken from the bytes on the copy's one pass
 through them, as is every copy that is sealed or opened on its way. The
 CopyObjectResult carries it with its
 .BR ChecksumType .
-A source with no checksum gives a copy with none unless the request names one,
-where S3 would add CRC64NVME, since a PutObject here adds no checksum the request
-did not ask for either. A copy made before this answers with its source's COMPOSITE
+A source with no checksum gives a copy the default, CRC64NVME, unless the request
+names another. A copy onto itself that names
+.B x\-amz\-checksum\-algorithm
+is allowed under either directive, as S3 documents it for adding or changing an
+object's checksum; one that names nothing new is still
+.BR "400 InvalidRequest" .
+A copy made before this answers with its source's COMPOSITE
 value as it was stored. UploadPartCopy takes the upload's algorithm over the bytes
 it copies, whatever its source's checksum, and answers it in its CopyPartResult.
 .SS Object tags
@@ -12572,7 +12587,7 @@ Inherited by worker processes, which have no command line of their own.
 .TP
 .B SOCKETLEY_STORAGE_HASH_THREADS
 How many helper threads a storage worker takes the digests of large uploads on
-(the ETag's MD5, any \fBx\-amz\-checksum\-\fR the request asked for, and the SHA\-256
+(the ETag's MD5, any \fBx\-amz\-checksum\-\fR the request asked for or the default CRC64NVME, and the SHA\-256
 that verifies a signed body: a hex payload hash or aws\-chunked signatures), so
 that the worker's loop is not the one core every upload's hashing has to fit in. Default
 .BR 3 ;
