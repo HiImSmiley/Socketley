@@ -6480,7 +6480,7 @@ Up to 1000 keys, each with or without a VersionId, Quiet, Content\-MD5 checked.
 T}
 CopyObject	PUT /bucket/key + x\-amz\-copy\-source	T{
 .ad l
-Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-tagging\-directive COPY (the default, the source's tags) or REPLACE (those x\-amz\-tagging names, or none); x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE, from an older version or naming an encryption; a source of key?versionId=ID copies that version. The copy is a single\-part object whose ETag is the md5 of its bytes, encrypted as its own request or its bucket asks whatever its source's was; x\-amz\-copy\-source\-server\-side\-encryption\-customer\-* open an SSE\-C source.
+Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-tagging\-directive COPY (the default, the source's tags) or REPLACE (those x\-amz\-tagging names, or none); x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE, from an older version or naming an encryption; a source of key?versionId=ID copies that version. The copy is a single\-part object whose ETag is the md5 of its bytes, encrypted as its own request or its bucket asks whatever its source's was; x\-amz\-copy\-source\-server\-side\-encryption\-customer\-* open an SSE\-C source. Its checksum is FULL_OBJECT, of its own bytes, in the algorithm x\-amz\-checksum\-algorithm names or else its source's (see \fBChecksums\fR below).
 T}
 PutObjectTagging	PUT /bucket/key?tagging	T{
 .ad l
@@ -6972,10 +6972,26 @@ so a GetObject or HeadObject by part number with
 answers the part's checksum, with the object's
 .BR x\-amz\-checksum\-type ,
 and GetObjectAttributes lists it beside each part. A single\-part object answers
-part 1 with its own checksum; a copy keeps none of its source's part checksums, and
-one of a COMPOSITE source answers part 1 with no checksum, since the value it
-carries is of parts it does not have. An object completed before part checksums
-were kept answers its parts without one.
+part 1 with its own checksum, and a copy, which keeps none of its source's part
+checksums, answers part 1 with its own whole one. An object completed before part
+checksums were kept answers its parts without one.
+.PP
+A CopyObject's checksum is of the copy's own bytes, FULL_OBJECT, as S3 makes it: in
+the algorithm
+.B x\-amz\-checksum\-algorithm
+names (one the runtime does not take is
+.BR "400 InvalidRequest" ),
+or else in its source's, under either metadata directive. A source whose checksum
+is already of its whole bytes gives the copy that value; a COMPOSITE one, or one in
+another algorithm, has the copy's taken from the bytes on the copy's one pass
+through them, as is every copy that is sealed or opened on its way. The
+CopyObjectResult carries it with its
+.BR ChecksumType .
+A source with no checksum gives a copy with none unless the request names one,
+where S3 would add CRC64NVME, since a PutObject here adds no checksum the request
+did not ask for either. A copy made before this answers with its source's COMPOSITE
+value as it was stored. UploadPartCopy takes the upload's algorithm over the bytes
+it copies, whatever its source's checksum, and answers it in its CopyPartResult.
 .SS Object tags
 An object has at most 10 tags, set with PutObjectTagging or with
 .B x\-amz\-tagging
@@ -7127,7 +7143,8 @@ rather than a guess; a plain GET or a Range reads it as before.
 .PP
 CopyObject makes a single\-part object, as S3 does: a multipart source's bytes
 are hashed on the way through and the copy's ETag is their md5, with no
-.BR \-N .
+.BR \-N ,
+and its checksum, when it needs one taken, is taken on that same pass.
 .SS Versioning
 .B PutBucketVersioning
 with
