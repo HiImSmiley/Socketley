@@ -247,6 +247,42 @@ def ck_wrong(key, parts, algo, typ, node=None):
         part_sums_wrong(key, parts, algo, typ, "HEAD", node=node) + attrs_wrong(key, parts, algo, node)
 
 
+def whole_sum_wrong(key, algo, whole, node=None):
+    """How the checksum GET, HEAD and GetObjectAttributes give `key` differs from `algo` of `whole`, FULL_OBJECT,
+    or from none at all when `algo` is None."""
+    name = "x-amz-checksum-" + algo.lower() if algo else None
+    want = (b64_sum(algo, whole), "FULL_OBJECT") if algo else (None, None)
+    wrong = []
+    for method in ("GET", "HEAD"):
+        st, h, body = req(method, "/%s/%s" % (B, key), headers={"x-amz-checksum-mode": "ENABLED"}, node=node)
+        others = sorted(n for n in h if n.startswith("x-amz-checksum-") and n not in (name, "x-amz-checksum-type"))
+        got = (st, h.get(name) if name else None, h.get("x-amz-checksum-type"), others)
+        if got != (200,) + want + ([],):
+            wrong.append((method, got, want))
+        if method == "GET" and body != whole:
+            wrong.append(("body", len(body)))
+    st, _, body = req("GET", "/%s/%s?attributes" % (B, key), headers={"x-amz-object-attributes": "Checksum"},
+                      node=node)
+    x = ET.fromstring(body) if st == 200 else None
+    got = None if x is None else (x.findtext("%sChecksum/%sChecksum%s" % (NS, NS, algo)) if algo else None,
+                                  x.findtext("%sChecksum/%sChecksumType" % (NS, NS)))
+    if got != want:
+        wrong.append(("attributes", st, got, want))
+    return wrong
+
+
+def copy_ck(dst, src, headers=None, node=None):
+    """CopyObject of `src` to `dst`; its status, ChecksumType and every Checksum<ALGO> of its CopyObjectResult."""
+    h = {"x-amz-copy-source": "/%s/%s" % (B, src)}
+    h.update(headers or {})
+    st, _, body = req("PUT", "/%s/%s" % (B, dst), headers=h, node=node)
+    if st != 200:
+        return st, xml_code(body)
+    x = ET.fromstring(body)
+    sums = {c.tag[len(NS):]: c.text for c in x if c.tag.startswith(NS + "Checksum")}
+    return st, sums
+
+
 def blob(n, seed):
     out = bytearray()
     h = hashlib.sha256(seed.encode()).digest()
@@ -272,6 +308,19 @@ CK = {
     "ck-unequal": ("CRC32", "COMPOSITE", UNEQUAL, False),
     "ck-varied": ("SHA1", "COMPOSITE", VARIED, False),
 }
+
+# Copies of those: the copy, its source, the request's headers, the algorithm of the copy's checksum and its bytes.
+# A COMPOSITE source's checksum is taken again of the bytes, a whole one is kept, and a named algorithm wins.
+COPIES = [
+    ("ck-copy2", "ck-equal", None, "SHA256", b"".join(EQUAL)),
+    ("ck-copy-replace", "ck-equal", {"x-amz-metadata-directive": "REPLACE"}, "SHA256", b"".join(EQUAL)),
+    ("ck-copy-sha1", "ck-unequal", {"x-amz-checksum-algorithm": "SHA1"}, "SHA1", b"".join(UNEQUAL)),
+    ("ck-copy-kept", "ck-copy-sha1", None, "SHA1", b"".join(UNEQUAL)),
+    ("ck-crc-copy2", "ck-crc", None, "CRC32", b"".join(EQUAL)),
+    ("ck-crc-sha256", "ck-crc", {"x-amz-checksum-algorithm": "sha256"}, "SHA256", b"".join(EQUAL)),
+    ("ck-single-copy", "single", None, None, SINGLE),
+    ("ck-single-crc", "single", {"x-amz-checksum-algorithm": "CRC32"}, "CRC32", SINGLE),
+]
 
 
 # ── an object header as object_format.cpp writes it ─────────────────────────
@@ -574,8 +623,47 @@ def mode_main(port, data):
     check("the copy of a FULL_OBJECT CRC32 object gives that CRC32 for its one part",
           h.get("x-amz-checksum-crc32") == b64_sum("CRC32", b"".join(EQUAL)), h.get("x-amz-checksum-crc32"))
     st, h, _ = req("GET", "/%s/ck-copy?partNumber=1" % B, headers={"x-amz-checksum-mode": "ENABLED"})
-    check("and the copy of a COMPOSITE one gives none, its value being of parts the copy does not have",
-          "x-amz-checksum-sha256" not in h, h.get("x-amz-checksum-sha256"))
+    check("and the copy of a COMPOSITE one gives the SHA-256 of all of it, the copy's own",
+          h.get("x-amz-checksum-sha256") == b64_sum("SHA256", b"".join(EQUAL)), h.get("x-amz-checksum-sha256"))
+
+    # ── a copy's checksum is of its own bytes, in its source's algorithm or the one it names ──
+    uneq = b"".join(UNEQUAL)
+    for dst, src, headers, algo, whole in COPIES:
+        st, sums = copy_ck(dst, src, headers)
+        want = {"ChecksumType": "FULL_OBJECT", "Checksum" + algo: b64_sum(algo, whole)} if algo else {}
+        check("%s: CopyObject of %s%s answers %s" % (dst, src, " " + str(headers) if headers else "", want or "no checksum"),
+              (st, sums) == (200, want), (st, sums))
+        wrong = whole_sum_wrong(dst, algo, whole)
+        check("%s: GET, HEAD and GetObjectAttributes give %s" %
+              (dst, "its %s, FULL_OBJECT, and no other" % algo if algo else "no checksum"), not wrong, wrong[:2])
+    for dst in ("ck-copy", "ck-copy-replace", "ck-copy-sha1"):
+        extra = dict(read_header(object_file(data, dst))["extra"])
+        sums = [(n, v) for n, v in extra.items() if n.startswith(b"x-amz-checksum-")]
+        check("%s: its header keeps one checksum, with no -N" % dst, len(sums) == 1 and b"-" not in sums[0][1], sums)
+    st, sums = copy_ck("ck-copy-bad", "ck-equal", {"x-amz-checksum-algorithm": "MD4"})
+    st2, _, _ = req("HEAD", "/%s/ck-copy-bad" % B)
+    check("a copy naming an algorithm the runtime does not take is 400 InvalidRequest, and makes nothing",
+          (st, sums, st2) == (400, "InvalidRequest", 404), (st, sums, st2))
+    # UploadPartCopy takes the upload's algorithm over the bytes it copies, whatever its source's checksum is.
+    st, _, body = req("POST", "/%s/ck-pc?uploads" % B, headers={"x-amz-checksum-algorithm": "SHA256"})
+    uid = ET.fromstring(body).findtext(NS + "UploadId")
+    pieces, rows = [(1, "ck-unequal", 3, 6 * MiB + 2), (2, "ck-copy-sha1", None, None)], []
+    for n, src, lo, hi in pieces:
+        h = {"x-amz-copy-source": "/%s/%s" % (B, src)}
+        if lo is not None:
+            h["x-amz-copy-source-range"] = "bytes=%d-%d" % (lo, hi)
+        st, _, body = req("PUT", "/%s/ck-pc?partNumber=%d&uploadId=%s" % (B, n, uid), headers=h)
+        x = ET.fromstring(body)
+        rows.append((st, x.findtext(NS + "ETag"), x.findtext(NS + "ChecksumSHA256"),
+                     sorted(c.tag[len(NS):] for c in x if c.tag.startswith(NS + "Checksum"))))
+    parts = [uneq[3:6 * MiB + 3], uneq]
+    check("UploadPartCopy into a SHA-256 upload answers each part's SHA-256 of the bytes it copied",
+          [r[2:] for r in rows] == [(b64_sum("SHA256", p), ["ChecksumSHA256"]) for p in parts], [r[2:] for r in rows])
+    x = "<CompleteMultipartUpload>" + "".join("<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>" % (i + 1, r[1])
+                                              for i, r in enumerate(rows)) + "</CompleteMultipartUpload>"
+    req("POST", "/%s/ck-pc?uploadId=%s" % (B, uid), x.encode())
+    wrong = ck_wrong("ck-pc", parts, "SHA256", "COMPOSITE")
+    check("and the object it completes has those as its parts' checksums", not wrong, wrong[:2])
 
     try:
         import boto3
@@ -645,6 +733,8 @@ def mode_restart(port, data):
     for key, (algo, typ, parts, _) in CK.items():
         wrong += [(key, w) for w in ck_wrong(key, parts, algo, typ)]
     check("and with its own checksum, from the journal", not wrong, wrong[:2])
+    wrong = [(dst, w) for dst, _, _, algo, whole in COPIES for w in whole_sum_wrong(dst, algo, whole)]
+    check("and every copy with its own whole checksum", not wrong, wrong[:2])
     ok, removed = restart(port, data)
     check("and again with every journal removed", ok and removed > 0, (ok, removed))
     wrong = part_answers("equal", EQUAL) + part_answers("unequal", UNEQUAL, "HEAD") + \
@@ -654,6 +744,8 @@ def mode_restart(port, data):
     for key, (algo, typ, parts, _) in CK.items():
         wrong += [(key, w) for w in ck_wrong(key, parts, algo, typ)]
     check("and every part's checksum comes back from the header or the list after the body", not wrong, wrong[:2])
+    wrong = [(dst, w) for dst, _, _, algo, whole in COPIES for w in whole_sum_wrong(dst, algo, whole)]
+    check("and every copy's whole checksum from its header", not wrong, wrong[:2])
 
 
 def mode_shards(nodes):
@@ -687,6 +779,20 @@ def mode_shards(nodes):
         for node in nodes:
             wrong += [(key, node, w) for w in ck_wrong("s-" + key, parts, algo, typ, node=node)]
     check("each part's checksum, after the body or in the header, is answered alike by both shards", not wrong, wrong[:3])
+    # Copies through either shard, of a source the other may own, take their checksum of the bytes alike.
+    wrong = []
+    for i, (src, headers, algo, whole) in enumerate((("s-ck-equal", None, "SHA256", b"".join(EQUAL)),
+                                                     ("s-ck-unequal", {"x-amz-checksum-algorithm": "SHA1"}, "SHA1",
+                                                      b"".join(UNEQUAL)))):
+        for j, via in enumerate(nodes):
+            dst = "s-copy-%d-%d" % (i, j)
+            st, sums = copy_ck(dst, src, headers, node=via)
+            if (st, sums) != (200, {"ChecksumType": "FULL_OBJECT", "Checksum" + algo: b64_sum(algo, whole)}):
+                wrong.append((dst, st, sums))
+            for node in nodes:
+                wrong += [(dst, node, w) for w in whole_sum_wrong(dst, algo, whole, node=node)]
+    check("a copy of a COMPOSITE object through either shard has its own whole checksum, read alike through both",
+          not wrong, wrong[:3])
     for node in nodes:
         st, _, body = req("GET", "/%s/s-eq-0?partNumber=4" % B, node=node)
         check("part 4 of 3 is 416 on %s" % os.path.basename(node), (st, xml_code(body)) == (416, "InvalidPartNumber"),

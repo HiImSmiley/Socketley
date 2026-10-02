@@ -7,7 +7,9 @@
 #               answered with it; GET, HEAD, ranges across chunk and part
 #               boundaries, partNumber, multipart in place and copied,
 #               UploadPartCopy and copies in every direction read the plaintext;
-#               the ETag stays the plaintext's MD5
+#               the ETag stays the plaintext's MD5, and a copy of a COMPOSITE
+#               source, sealed or opened, has the FULL_OBJECT checksum of its
+#               plaintext
 #   on disk     an object's file never holds its plaintext, which a clear
 #               object's file does, so the search can fail
 #   default     PutBucketEncryption / Get / Delete, AES256 only, aws:kms refused;

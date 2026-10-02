@@ -1131,6 +1131,48 @@ TEST_CASE("a copy makes a whole second object with the metadata it is given")
     CHECK(out.status == st::no_such_key);
 }
 
+TEST_CASE("a copy's checksum is of its whole bytes, kept from a source that has one and otherwise taken")
+{
+    tmpdir d;
+    rig r(d.path);
+    REQUIRE(r.make_bucket("ckb") == st::ok);
+    const std::string body = pattern((2u << 20) + 77, 3);
+    // A composite value is of parts, and a whole one is kept as it is even when nothing checks it.
+    object_meta comp;
+    comp.extra = {{"x-amz-checksum-sha256", "Zm9v-3"}};
+    REQUIRE(r.put("ckb", "comp", body, comp).status == st::ok);
+    object_meta whole;
+    whole.extra = {{"x-amz-checksum-crc32", "AAAAAA=="}};
+    REQUIRE(r.put("ckb", "whole", body, whole).status == st::ok);
+
+    auto sum_of = [&](checksum_algo a)
+    {
+        checksum_stream s(a);
+        s.update(body.data(), body.size());
+        return s.peek_b64();
+    };
+    auto copied = [&](const std::string& src, const std::string& dst, checksum_algo a)
+    {
+        put_result out;
+        bool fired = false;
+        r.store->copy("ckb", src, "ckb", dst, object_meta{}, [&](put_result p) { out = std::move(p); fired = true; }, a);
+        REQUIRE(r.until([&] { return fired; }));
+        REQUIRE(out.status == st::ok);
+        std::string got;
+        object_meta gm;
+        REQUIRE(r.get("ckb", dst, got, &gm) == st::ok);
+        CHECK(got == body);
+        CHECK(gm.extra == out.meta.extra);
+        return gm.extra;
+    };
+    using extras = std::vector<std::pair<std::string, std::string>>;
+    CHECK(copied("comp", "c-sha", checksum_algo::sha256) == extras{{"x-amz-checksum-sha256", sum_of(checksum_algo::sha256)}});
+    CHECK(copied("comp", "c-crc", checksum_algo::crc32c) == extras{{"x-amz-checksum-crc32c", sum_of(checksum_algo::crc32c)}});
+    CHECK(copied("comp", "c-none", checksum_algo::none).empty());
+    CHECK(copied("whole", "w-kept", checksum_algo::crc32) == extras{{"x-amz-checksum-crc32", "AAAAAA=="}});
+    CHECK(copied("whole", "w-sha1", checksum_algo::sha1) == extras{{"x-amz-checksum-sha1", sum_of(checksum_algo::sha1)}});
+}
+
 TEST_CASE("a quota refuses a body that would not fit and counts what it holds")
 {
     tmpdir d;

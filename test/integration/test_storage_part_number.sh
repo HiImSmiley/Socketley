@@ -31,6 +31,13 @@
 #               the body (SHA-256 in place, SHA-1 copied), through restarts, on two
 #               shards; a copy keeps none, a single-part object answers with its
 #               own, and an object completed before they were kept with none
+#   copy sums   a CopyObject's checksum is FULL_OBJECT of its own bytes, in the
+#               algorithm x-amz-checksum-algorithm names or its source's: taken
+#               again of a COMPOSITE source, kept from a whole one, under COPY and
+#               REPLACE, in the CopyObjectResult, GET, HEAD and GetObjectAttributes,
+#               none for a source with none, an unknown algorithm refused; through
+#               restarts and through either of two shards; UploadPartCopy answers
+#               the upload's algorithm of the bytes it copied
 #
 # The assertions live in lib_storage_part_number.py, which prints one line each.
 set -uo pipefail

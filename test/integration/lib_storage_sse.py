@@ -45,6 +45,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+import zlib
 
 MODE = sys.argv[1]
 BIN = os.environ.get("BIN", "")
@@ -414,6 +415,31 @@ def mode_main(port, data):
     check("and reads back", s3.get_object(Bucket=B, Key="c-mp")["Body"].read() == whole)
     check("and by partNumber=1 is all of it", s3.get_object(Bucket=B, Key="c-mp", PartNumber=1)["Body"].read() == whole)
     expect["c-mp"] = md5(whole)
+    # A copy's checksum is of its own plaintext, whichever way it is sealed, and not its source's composite.
+    ck = {"ChecksumAlgorithm": "SHA256"}
+    mpu(s3, "ck-mp", p, create=dict(ck, ServerSideEncryption="AES256"), part_args=ck)
+    mpu(s3, "ck-clear", q, create={"ChecksumAlgorithm": "SHA1"}, part_args={"ChecksumAlgorithm": "SHA1"})
+    sha = lambda algo, b: base64.b64encode(hashlib.new(algo, b).digest()).decode()
+    crc = lambda b: base64.b64encode(struct.pack(">I", zlib.crc32(b))).decode()
+    for dst, src, args, algo, want in (
+            ("ck-enc2enc", "ck-mp", {"ServerSideEncryption": "AES256"}, "SHA256", sha("sha256", whole)),
+            ("ck-enc2clear", "ck-mp", {"ChecksumAlgorithm": "CRC32"}, "CRC32", crc(whole)),
+            ("ck-clear2enc", "ck-clear", {"ServerSideEncryption": "AES256"}, "SHA1", sha("sha1", wq))):
+        r = s3.copy_object(Bucket=B, Key=dst, CopySource={"Bucket": B, "Key": src}, **args)
+        h = s3.head_object(Bucket=B, Key=dst, ChecksumMode="ENABLED")
+        st, hh, _ = req("HEAD", "/%s/%s" % (B, dst), headers={"x-amz-checksum-mode": "ENABLED"})
+        got = (r["CopyObjectResult"].get("Checksum" + algo), h.get("Checksum" + algo), hh.get("x-amz-checksum-type"),
+               sorted(n for n in hh if n.startswith("x-amz-checksum-")))
+        check("a copy %s of %s has the %s of its whole plaintext, FULL_OBJECT, in its answer and its HEAD" %
+              (dst, src, algo), got == (want, want, "FULL_OBJECT",
+                                        sorted(["x-amz-checksum-" + algo.lower(), "x-amz-checksum-type"])), got)
+        check("and is sealed as it asked", (h.get("ServerSideEncryption") == "AES256") ==
+              ("ServerSideEncryption" in args), h.get("ServerSideEncryption"))
+    expect["ck-mp"] = md5(whole)
+    expect["ck-clear"] = md5(wq)
+    expect["ck-enc2enc"] = md5(whole)
+    expect["ck-enc2clear"] = md5(whole)
+    expect["ck-clear2enc"] = md5(wq)
     s3.put_object(Bucket=B, Key="self", Body=clear)
     r = s3.copy_object(Bucket=B, Key="self", CopySource={"Bucket": B, "Key": "self"}, ServerSideEncryption="AES256")
     g = s3.get_object(Bucket=B, Key="self")
