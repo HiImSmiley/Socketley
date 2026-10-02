@@ -211,10 +211,11 @@ struct rig : io_handler
         REQUIRE(until([&] { return committed; }));
     }
 
-    void settle(int turns = 50)
+    // Runs the ring until it owes the store nothing but the pool's standing read, since a loaded disk outruns any fixed number of turns.
+    void settle()
     {
-        for (int i = 0; i < turns; ++i)
-            loop.poll_completions(1);
+        const size_t standing = pool ? 1 : 0;
+        REQUIRE(until([&] { return io->inflight() <= standing; }, 60000));
     }
 };
 
@@ -989,7 +990,7 @@ TEST_CASE("the journal is compacted once garbage outweighs the live objects, and
         // The same key over and over is all garbage.
         for (int i = 0; i < 200; ++i)
             REQUIRE(r.put("bkt", "hot", "v" + std::to_string(i)).status == st::ok);
-        r.settle(200);
+        r.settle();
         compactions = r.store->totals().compactions;
         CHECK(compactions >= 1);
         // Bounded by the floor and the live set, not by the 205 puts.
@@ -1249,7 +1250,7 @@ TEST_CASE("an aborted put leaves nothing behind")
             break;
         off += took;
     }
-    r.settle(20);
+    r.settle();
     op->abort();
     // The unlink is on the ring, and a loaded disk takes longer than a fixed number of turns.
     CHECK(r.until([&] { return fs::is_empty(d.path + "/bkt/tmp"); }));
@@ -2129,7 +2130,7 @@ TEST_CASE("a plain put takes a pooled file and is answered before its directorie
     // The first finds the pool empty and has it made; its files join once pool/ is synced.
     REQUIRE(r.put("bkt", "first", "v").status == st::ok);
     REQUIRE(r.until([&] { return !r.store->busy() && count_pool_files(d.path, "bkt") > 0; }));
-    r.settle(20);
+    r.settle();
     const size_t pooled = count_pool_files(d.path, "bkt");
     CHECK(pooled >= 8);
 
@@ -2163,7 +2164,7 @@ TEST_CASE("a put with a condition or a committer never takes a pooled file")
     REQUIRE(r.make_bucket("bkt") == st::ok);
     REQUIRE(r.put("bkt", "first", "v").status == st::ok);
     REQUIRE(r.until([&] { return !r.store->busy() && count_pool_files(d.path, "bkt") > 0; }));
-    r.settle(20);
+    r.settle();
     // A caller that marks a pooled put conditional afterwards is refused rather than rolled forward.
     st why = st::ok;
     auto op = r.store->begin_put("bkt", "k", {}, 1, true, why, true);
@@ -2171,7 +2172,7 @@ TEST_CASE("a put with a condition or a committer never takes a pooled file")
     op->set_create_only(true);
     CHECK(op->failed());
     // And one that says so at the start writes to a file of its own.
-    r.settle(20);
+    r.settle();
     const size_t pooled = count_pool_files(d.path, "bkt");
     auto op2 = r.store->begin_put("bkt", "k2", {}, 1, true, why, false);
     REQUIRE(op2);
@@ -2179,7 +2180,7 @@ TEST_CASE("a put with a condition or a committer never takes a pooled file")
     CHECK_FALSE(op2->failed());
     CHECK(count_pool_files(d.path, "bkt") == pooled);
     op2->abort();
-    r.settle(20);
+    r.settle();
 }
 
 namespace {
@@ -2375,7 +2376,7 @@ TEST_CASE("the next operation on a key waits until the pooled put before it is s
     REQUIRE(r.make_bucket("bkt") == st::ok);
     REQUIRE(r.put("bkt", "first", "v").status == st::ok);
     REQUIRE(r.until([&] { return !r.store->busy() && count_pool_files(d.path, "bkt") >= 16; }));
-    r.settle(20);
+    r.settle();
     // Eight takes leave the pool above the mark that makes more, so no other sync is counted.
     for (int i = 0; i < 8; ++i)
     {
@@ -2518,7 +2519,7 @@ TEST_CASE("a versioned bucket's journal holds every version through a compaction
         // Removed for good: garbage enough for a compaction, which must carry the versions left.
         for (size_t i = 1; i < 10; ++i)
             purge(r, "a", ids[i]);
-        r.settle(200);
+        r.settle();
         CHECK(r.store->totals().compactions >= 1);
         before = listing(r);
         // The latest of a and the two left behind it, b, and c's marker in front of its one version.
