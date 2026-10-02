@@ -6460,7 +6460,7 @@ The headers of a GET, from memory, or from the object's header when another shar
 T}
 GetObjectAttributes	GET /bucket/key?attributes	T{
 .ad l
-x\-amz\-object\-attributes of ETag, Checksum, ObjectParts, StorageClass and ObjectSize; the parts of a multipart object paged by x\-amz\-max\-parts and x\-amz\-part\-number\-marker, with their numbers and sizes and not their checksums; ?versionId= and the SSE\-C headers as for HeadObject.
+x\-amz\-object\-attributes of ETag, Checksum, ObjectParts, StorageClass and ObjectSize; the parts of a multipart object paged by x\-amz\-max\-parts and x\-amz\-part\-number\-marker, with their numbers, sizes and, when the upload had a checksum algorithm, each part's own checksum; ?versionId= and the SSE\-C headers as for HeadObject.
 T}
 GetObject, HeadObject by part	GET|HEAD /bucket/key?partNumber=N	T{
 .ad l
@@ -6964,8 +6964,18 @@ with SHA\-1 or SHA\-256, or COMPOSITE with CRC64NVME, is
 A checksum a CompleteMultipartUpload carries is compared with the one the parts
 make, and a mismatch is
 .B "400 BadDigest"
-with nothing stored. A part's own checksum is not kept once its upload completes, so a
-read by part number and GetObjectAttributes' parts carry none.
+with nothing stored. Each part's own checksum is kept with the completed object,
+beside its size (see
+.BR "Reading by part number" ),
+so a GetObject or HeadObject by part number with
+.B x\-amz\-checksum\-mode: ENABLED
+answers the part's checksum, with the object's
+.BR x\-amz\-checksum\-type ,
+and GetObjectAttributes lists it beside each part. A single\-part object answers
+part 1 with its own checksum; a copy keeps none of its source's part checksums, and
+one of a COMPOSITE source answers part 1 with no checksum, since the value it
+carries is of parts it does not have. An object completed before part checksums
+were kept answers its parts without one.
 .SS Object tags
 An object has at most 10 tags, set with PutObjectTagging or with
 .B x\-amz\-tagging
@@ -7096,15 +7106,20 @@ The part sizes are recorded in the object's header at CompleteMultipartUpload
 (as
 .BR x\-socketley\-part\-sizes ,
 never sent to a client): one size when every part but the last has it, which
-is every in\-place completion, and otherwise the list, up to 4 KiB of it. The
-journal carries them as it carries the rest of the header. A longer list, which
+is every in\-place completion, and otherwise the list, up to 4 KiB of it. An
+upload with a checksum algorithm adds its parts' checksums, in base64, up to 4 KiB
+of them
+.RB ( x\-socketley\-part\-checksums ).
+The journal carries them as it carries the rest of the header. A longer list, which
 any upload S3 takes may need, follows the object's body in the file instead, 20
-bytes and 12 more per part, with the header naming where it begins and its
-SHA\-256
+bytes and 12 more per part (24, and 12 and the checksum's width per part, when it
+holds checksums), with the header naming where it begins and its SHA\-256
 .RB ( x\-socketley\-part\-layout );
 a part number of such an object reads the list from the file first, and a list
 that does not match its digest is
 .BR "500 InternalError" .
+An in\-place completion whose checksums do not fit the room its header was given
+writes them after the last part in the same way, and still copies nothing.
 A multipart object completed before part sizes were recorded answers any part
 number within its count with
 .B "501 NotImplemented"
@@ -12458,9 +12473,9 @@ put a crash at the one step that leaves a file the journal does not name. Unset
 by default.
 .TP
 .B SOCKETLEY_STORAGE_PART_LIST_MAX
-A test hook: the bytes a multipart object's part sizes, and the numbers of an
-encrypted one's parts, may take in its header before the list is kept after its
-body instead. Default
+A test hook: the bytes a multipart object's part sizes, the numbers of an
+encrypted one's parts, and its parts' checksums may each take in its header before
+the list is kept after its body instead. Default
 .BR 4096 ,
 which takes some five hundred parts of unequal sizes to pass; a small value lets a
 test reach the list after the body with a few parts.
