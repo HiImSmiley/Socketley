@@ -508,6 +508,82 @@ struct object_store::recovering
     std::vector<std::pair<std::string, object_meta>> noncurrent;
 };
 
+bool object_store::lock_shard(std::string& err)
+{
+    const auto give_up = std::chrono::steady_clock::now() + dir_lock_wait;
+    const std::string held_by_other = " of " + m_opts.dir + " is still held by another process";
+
+    // The process this one replaces on its shard may still be finishing its stop, and must not write a journal or a marker beside it.
+    const std::string lock = m_opts.dir + "/.lock." + std::to_string(m_opts.shard);
+    m_lock_fd = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (m_lock_fd < 0)
+    {
+        err = "cannot open " + lock + ": " + errstr(errno);
+        return false;
+    }
+    while (::flock(m_lock_fd, LOCK_EX | LOCK_NB) < 0)
+    {
+        if ((errno != EWOULDBLOCK && errno != EINTR) || std::chrono::steady_clock::now() >= give_up)
+        {
+            err = errno == EWOULDBLOCK ? "shard " + std::to_string(m_opts.shard) + held_by_other
+                                       : "cannot lock " + lock + ": " + errstr(errno);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // The shard count this shard runs under, fixed width so a read beside the write never matches a count it does not hold.
+    char layout[16];
+    std::snprintf(layout, sizeof layout, "%08u", m_opts.nshards);
+    if (::pwrite(m_lock_fd, layout, 8, 0) != 8)
+    {
+        err = "cannot write " + lock + ": " + errstr(errno);
+        return false;
+    }
+
+    // A shard under another count owns other keys, whose files this one reads and takes over, so it is waited out; one under this count owns its own.
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(m_opts.dir, ec))
+    {
+        uint32_t k = 0;
+        if (!suffix_number(e.path().filename().string(), ".lock.", k) || k == m_opts.shard)
+            continue;
+        const int fd = ::open(e.path().c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            continue;
+        bool waited = false;
+        for (;;)
+        {
+            if (::flock(fd, LOCK_EX | LOCK_NB) == 0)
+            {
+                waited = true;
+                break;
+            }
+            if (errno != EWOULDBLOCK && errno != EINTR)
+            {
+                err = "cannot lock " + e.path().string() + ": " + errstr(errno);
+                break;
+            }
+            char got[8];
+            if (::pread(fd, got, sizeof got, 0) == 8 && std::memcmp(got, layout, 8) == 0)
+            {
+                waited = true;
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= give_up)
+            {
+                err = "shard " + std::to_string(k) + ", under another shard count," + held_by_other;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ::close(fd);
+        if (!waited)
+            return false;
+    }
+    return true;
+}
+
 bool object_store::open(std::string& err, recovery_report* report)
 {
     recovery_report rep;
@@ -526,26 +602,9 @@ bool object_store::open(std::string& err, recovery_report* report)
         return false;
     }
 
-    // The process this one replaces may still be finishing its stop, and must not write a journal or a marker beside this one.
-    const std::string lock = m_opts.dir + "/.lock." + std::to_string(m_opts.shard);
-    m_lock_fd = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (m_lock_fd < 0)
-    {
-        err = "cannot open " + lock + ": " + errstr(errno);
+    // Before anything below reads or removes what another process may still be writing.
+    if (!lock_shard(err))
         return false;
-    }
-    const auto give_up = std::chrono::steady_clock::now() + dir_lock_wait;
-    while (::flock(m_lock_fd, LOCK_EX | LOCK_NB) < 0)
-    {
-        if ((errno != EWOULDBLOCK && errno != EINTR) || std::chrono::steady_clock::now() >= give_up)
-        {
-            err = errno == EWOULDBLOCK ? "shard " + std::to_string(m_opts.shard) + " of " + m_opts.dir +
-                                             " is still held by another process"
-                                       : "cannot lock " + lock + ": " + errstr(errno);
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
 
     // A bucket deleted by a rename into .trash is removed here, where walking
     // its tree blocks nobody.  Shard 0 alone does it, because it is also the

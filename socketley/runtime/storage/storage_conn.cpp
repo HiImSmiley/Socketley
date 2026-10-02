@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
+#include <thread>
 
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -579,15 +581,19 @@ void storage_run::stop()
     for (auto& c : all)
         close_conn(c);
 
-    // No crossing is answered from here on, and none that is out will be.
-    m_node.stop();
+    // No crossing is answered from here on, and every one still out is answered as failed while the node can still hear it, so the work waiting on a sibling finishes in the drain below.
     m_transport.stop();
+    m_node.stop();
     m_notify.stop();
 
     // Nothing new can arrive, so the journal writes, syncs and compaction already begun are let finish, which is what lets close() mark the stop clean.
     const auto give_up = std::chrono::steady_clock::now() + stop_drain_bound;
     while (m_store.busy() && std::chrono::steady_clock::now() < give_up)
         m_loop.poll_completions(10);
+    // A test's stop held past its drain, longer the higher the shard, so a start beside it meets shards that let go one by one.
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_STOP_HOLD_MS"))
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::clamp(std::strtol(e, nullptr, 10), 0L, 500L) *
+                                                              (m_store.options().shard + 1)));
 
     // The digest threads end first, so none of them writes to a descriptor the
     // loop is about to close, and the read waiting on it is cancelled with it.

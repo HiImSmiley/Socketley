@@ -1416,40 +1416,78 @@ TEST_CASE("a clean stop right behind the last answer still leaves a journal the 
     CHECK(again.store->find("bkt", "k19") != nullptr);
 }
 
-TEST_CASE("a store on a shard another still holds waits, is refused, and opens once the first has closed")
+namespace {
+
+// An open of shard `shard` of `nshards` on `dir` by a store of its own, as a process starting beside another does.
+bool open_beside(const std::string& dir, uint32_t shard, uint32_t nshards, std::string& err)
 {
-    tmpdir d;
     struct quiet : io_handler
     {
         void on_cqe(struct io_uring_cqe*) override {}
     } h;
-    auto second = [&](std::string& err)
-    {
-        event_loop loop{64};
-        REQUIRE(loop.init());
-        file_io io(loop, &h);
-        store_options o;
-        o.dir = d.path;
-        object_store s(loop, io, o);
-        return s.open(err);
-    };
-    rig r(d.path);
-    REQUIRE(r.make_bucket("bkt") == st::ok);
-    REQUIRE(r.put("bkt", "k", "v").status == st::ok);
-    // Another shard of the same directory is not this one's to wait for.
-    {
-        rig other(d.path, 4096, 0, 0, 1, 2);
-    }
+    event_loop loop{64};
+    REQUIRE(loop.init());
+    file_io io(loop, &h);
+    store_options o;
+    o.dir     = dir;
+    o.shard   = shard;
+    o.nshards = nshards;
+    object_store s(loop, io, o);
+    return s.open(err);
+}
 
+}   // namespace
+
+TEST_CASE("a store on a shard another still holds waits, is refused, and opens once the first has closed")
+{
+    tmpdir d;
+    rig r(d.path, 4096, 0, 0, 0, 2);
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    // Another shard under the same count is not this one's to wait for.
     std::string err;
-    const auto began = std::chrono::steady_clock::now();
-    CHECK_FALSE(second(err));
+    auto began = std::chrono::steady_clock::now();
+    CHECK(open_beside(d.path, 1, 2, err));
+    CHECK(std::chrono::steady_clock::now() - began < dir_lock_wait);
+
+    began = std::chrono::steady_clock::now();
+    CHECK_FALSE(open_beside(d.path, 0, 2, err));
     CHECK(std::chrono::steady_clock::now() - began >= dir_lock_wait);
-    CHECK(err.find("still held") != std::string::npos);
+    CHECK(err.find("shard 0 of") != std::string::npos);
 
     r.settle();
     r.store->close(true);
-    CHECK(second(err));
+    CHECK(open_beside(d.path, 0, 2, err));
+    INFO(err);
+}
+
+TEST_CASE("a store under another shard count waits for every shard of the old count still held, and not for its siblings")
+{
+    tmpdir d;
+    // Two shards of four still stopping, the second of a number the new count of two does not have.
+    auto old1 = std::make_unique<rig>(d.path, 4096, 0, 0, 1, 4);
+    auto old3 = std::make_unique<rig>(d.path, 4096, 0, 0, 3, 4);
+    std::string err;
+    // A sibling under the old count is not waited for.
+    auto began = std::chrono::steady_clock::now();
+    CHECK(open_beside(d.path, 2, 4, err));
+    CHECK(std::chrono::steady_clock::now() - began < dir_lock_wait);
+
+    // Shard 0 of two has no old process on its own number and waits for those under four.
+    began = std::chrono::steady_clock::now();
+    CHECK_FALSE(open_beside(d.path, 0, 2, err));
+    CHECK(std::chrono::steady_clock::now() - began >= dir_lock_wait);
+    CHECK(err.find("under another shard count") != std::string::npos);
+
+    // With shard 1 of four gone, shard 3 of four, which no shard of two replaces, still holds both back.
+    old1->store->close(true);
+    old1.reset();
+    CHECK_FALSE(open_beside(d.path, 0, 2, err));
+    CHECK(err.find("shard 3, under another shard count") != std::string::npos);
+
+    old3->store->close(true);
+    old3.reset();
+    CHECK(open_beside(d.path, 0, 2, err));
+    CHECK(open_beside(d.path, 1, 2, err));
     INFO(err);
 }
 

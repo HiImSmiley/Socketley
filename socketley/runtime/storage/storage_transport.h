@@ -25,20 +25,29 @@ public:
     {
     }
 
-    ~channel_transport() override { stop(); }
+    // Requests still out are dropped unanswered here, since whoever asked has gone before this.
+    ~channel_transport() override
+    {
+        if (m_channel)
+            m_channel->drop_origin(this);
+        m_pending.clear();
+    }
 
     channel_transport(const channel_transport&)            = delete;
     channel_transport& operator=(const channel_transport&) = delete;
 
     // Nothing is told to this transport after this, which the channel is told
-    // too because an origin is a bare pointer.  Requests still out are left
-    // unanswered: whoever asked is going away with it.
+    // too because an origin is a bare pointer, and every request still out is
+    // answered as failed so the work waiting on it can finish during the stop.
     void stop()
     {
         if (m_channel)
             m_channel->drop_origin(this);
         m_channel = nullptr;
+        auto owed = std::move(m_pending);
         m_pending.clear();
+        for (auto& [cookie, fn] : owed)
+            fn(false, {});
     }
 
     void call(uint32_t peer, std::string payload,

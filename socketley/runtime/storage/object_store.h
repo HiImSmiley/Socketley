@@ -286,7 +286,7 @@ struct store_options
 
 // How long a stop lets the store's writes finish before it gives up on a clean marker, inside the daemon's two-second startup bound together with the wait below.
 inline constexpr std::chrono::milliseconds stop_drain_bound{1000};
-// How long an open waits for the process before it on the same shard to finish its stop and let go of the directory.
+// How long an open waits, in all, for the processes before it on its shard or under another shard count to finish their stops.
 inline constexpr std::chrono::milliseconds dir_lock_wait{1500};
 
 class object_store;
@@ -955,6 +955,8 @@ private:
     const bucket* find_bucket(std::string_view name) const;
 
     // Startup, blocking.
+    // Takes this shard's lock, and waits out every process still holding a shard's lock under another shard count.
+    bool lock_shard(std::string& err);
     struct recovering;
     bool recover_bucket(const std::string& name, recovery_report& rep, std::vector<recovering>& out,
                         std::string& err);
@@ -1080,7 +1082,7 @@ private:
     file_io*      m_io;
     store_options m_opts;
     int           m_root_fd{-1};
-    // An exclusive flock on .lock.<shard>, held from open until close has written or declined the marker.
+    // An exclusive flock on .lock.<shard>, holding the shard count, from open until close has written or declined the marker.
     int           m_lock_fd{-1};
     std::map<std::string, std::unique_ptr<bucket>, std::less<>> m_buckets;
     std::unordered_set<std::string> m_creating;
