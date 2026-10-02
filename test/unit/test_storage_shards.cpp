@@ -1395,6 +1395,7 @@ TEST_CASE("the wire forms round-trip and refuse what is not theirs")
     req.meta.extra = {{"x-amz-meta-a", "b"}};
     req.cond.if_match = "\"abc\"";
     req.cond.if_none_match = "*";
+    req.cause = change_cause::complete;
     const std::string enc = wire::encode_commit(req);
     commit_request back;
     REQUIRE(wire::decode_commit(enc, back));
@@ -1404,6 +1405,12 @@ TEST_CASE("the wire forms round-trip and refuse what is not theirs")
     CHECK(back.meta == req.meta);
     CHECK(back.cond.if_match == req.cond.if_match);
     CHECK(back.cond.if_none_match == "*");
+    // The cause decides the event its owner sends, so one past the last is refused rather than guessed.
+    CHECK(back.cause == change_cause::complete);
+    std::string bad_cause = enc;
+    bad_cause.back() = static_cast<char>(static_cast<uint8_t>(change_cause::lifecycle) + 1);
+    commit_request junk_cause;
+    CHECK_FALSE(wire::decode_commit(bad_cause, junk_cause));
     wire::op o{};
     REQUIRE(wire::request_op(enc, o));
     CHECK(o == wire::op::commit);
