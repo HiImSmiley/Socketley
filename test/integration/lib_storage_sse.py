@@ -1365,10 +1365,11 @@ def mode_pool(port, data):
     # SOCKETLEY_STORAGE_KILL_AFTER_RENAME=killme/ kills the worker right after the rename that answers a pooled put.
     def killed_put(key, body):
         pid = stats().get("pid")
+        # Sent once: botocore retries a cut connection, and a retry the respawned worker takes is a second put.
         try:
-            s3.put_object(Bucket=PB, Key=key, Body=body, ServerSideEncryption="AES256")
+            req("PUT", "/%s/%s" % (PB, key), body, {"x-amz-server-side-encryption": "AES256"})
             answered = True
-        except Exception:  # noqa: BLE001
+        except (http.client.HTTPException, OSError):
             answered = False
         back = wait_for(lambda: (lambda p: p if p and p != pid and probe(port) else None)(stats().get("pid")), 40)
         return answered, back
