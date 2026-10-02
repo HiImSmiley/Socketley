@@ -7975,8 +7975,13 @@ writes, directory syncs and compaction already begun finish, for at most a
 second; one that cannot finish them in that time is read by the next start as a
 crash. Each shard holds a lock on
 .BI .lock. n
-in the directory until its stop is done, and a start of the same shard waits up to
-a second and a half for the process it replaces to let go, and fails if it does not.
+in the directory until its stop is done, and a start waits up to a second and a
+half, in all, for the process it replaces on its shard and for every process still
+holding a shard under another
+.BR \-\-shards ,
+whose files it takes over, and fails if they do not let go. A request a shard has
+sent a sibling and not had answered when the stop comes is answered as failed, so
+it does not hold the stop.
 .PP
 The start after a crash reads every header even of a file the journal names with
 the same size, since an overwrite whose record was lost can leave exactly that: the
