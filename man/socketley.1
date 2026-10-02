@@ -6647,8 +6647,8 @@ to the loopback. The usual settings are boto3's
 .BR "s3 = addressing_style = virtual" ),
 rclone's
 .B "force_path_style = false"
-and mc's
-.BR "\-\-path off" .
+and an mc alias set with path lookup
+.BR off .
 .PP
 A bucket whose name is not a single DNS label \(em one with dots \(em is still
 served path style, and the clients fall back to it for such names over TLS. Over
