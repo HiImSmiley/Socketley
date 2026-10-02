@@ -30,6 +30,7 @@
 // the file, its rename and its directory, and never for the journal, which is
 // written behind it and synced in a group.
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <list>
@@ -282,6 +283,11 @@ struct store_options
     // live objects need, and no sooner than the floor below.
     uint64_t    compact_floor{4096};
 };
+
+// How long a stop lets the store's writes finish before it gives up on a clean marker, inside the daemon's two-second startup bound together with the wait below.
+inline constexpr std::chrono::milliseconds stop_drain_bound{1000};
+// How long an open waits for the process before it on the same shard to finish its stop and let go of the directory.
+inline constexpr std::chrono::milliseconds dir_lock_wait{1500};
 
 class object_store;
 
@@ -1074,6 +1080,8 @@ private:
     file_io*      m_io;
     store_options m_opts;
     int           m_root_fd{-1};
+    // An exclusive flock on .lock.<shard>, held from open until close has written or declined the marker.
+    int           m_lock_fd{-1};
     std::map<std::string, std::unique_ptr<bucket>, std::less<>> m_buckets;
     std::unordered_set<std::string> m_creating;
     shard_peers* m_peers{nullptr};

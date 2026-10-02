@@ -584,6 +584,11 @@ void storage_run::stop()
     m_transport.stop();
     m_notify.stop();
 
+    // Nothing new can arrive, so the journal writes, syncs and compaction already begun are let finish, which is what lets close() mark the stop clean.
+    const auto give_up = std::chrono::steady_clock::now() + stop_drain_bound;
+    while (m_store.busy() && std::chrono::steady_clock::now() < give_up)
+        m_loop.poll_completions(10);
+
     // The digest threads end first, so none of them writes to a descriptor the
     // loop is about to close, and the read waiting on it is cancelled with it.
     m_hash.stop();

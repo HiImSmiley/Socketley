@@ -217,6 +217,12 @@ struct rig : io_handler
         const size_t standing = pool ? 1 : 0;
         REQUIRE(until([&] { return io->inflight() <= standing; }, 60000));
     }
+
+    // Gone as a killed process goes, with no marker, so the next rig on the directory may open while this one is in scope.
+    void crash()
+    {
+        store->close(false);
+    }
 };
 
 std::string pattern(size_t n, unsigned seed = 1)
@@ -924,6 +930,7 @@ TEST_CASE("a torn journal tail is cut off and the object behind it comes back fr
     // behind it: another restart reads a journal that is whole.
     REQUIRE(again.put("bkt", "three", "333").status == st::ok);
     again.settle();
+    again.crash();
     rig third(d.path);
     CHECK(third.report.torn_tails == 0);
     CHECK(third.report.rebuilt_journals == 0);
@@ -972,6 +979,7 @@ TEST_CASE("a journal that is lost or damaged in the middle is rebuilt from the f
         }
         // And the journal on disk now says the same, so the next start needs no repair.
         again.settle();
+        again.crash();
         rig third(d.path);
         CHECK(third.store->totals().objects == 19);
         CHECK(third.report.adopted == 0);
@@ -1077,6 +1085,7 @@ TEST_CASE("concurrent puts to one key end with one whole object every reader agr
     CHECK(r.store->totals().bytes == got.size());
 
     r.settle();
+    r.crash();
     rig again(d.path);
     const object_meta* am = again.store->find("bkt", "same");
     REQUIRE(am != nullptr);
@@ -1405,6 +1414,43 @@ TEST_CASE("a clean stop right behind the last answer still leaves a journal the 
     CHECK(p.objects.size() == 19);
     CHECK(again.store->find("bkt", "k3") == nullptr);
     CHECK(again.store->find("bkt", "k19") != nullptr);
+}
+
+TEST_CASE("a store on a shard another still holds waits, is refused, and opens once the first has closed")
+{
+    tmpdir d;
+    struct quiet : io_handler
+    {
+        void on_cqe(struct io_uring_cqe*) override {}
+    } h;
+    auto second = [&](std::string& err)
+    {
+        event_loop loop{64};
+        REQUIRE(loop.init());
+        file_io io(loop, &h);
+        store_options o;
+        o.dir = d.path;
+        object_store s(loop, io, o);
+        return s.open(err);
+    };
+    rig r(d.path);
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    REQUIRE(r.put("bkt", "k", "v").status == st::ok);
+    // Another shard of the same directory is not this one's to wait for.
+    {
+        rig other(d.path, 4096, 0, 0, 1, 2);
+    }
+
+    std::string err;
+    const auto began = std::chrono::steady_clock::now();
+    CHECK_FALSE(second(err));
+    CHECK(std::chrono::steady_clock::now() - began >= dir_lock_wait);
+    CHECK(err.find("still held") != std::string::npos);
+
+    r.settle();
+    r.store->close(true);
+    CHECK(second(err));
+    INFO(err);
 }
 
 TEST_CASE("an object directory that has gone is made again by the next put and by the next start")

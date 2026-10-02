@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <liburing.h>
 #include <sched.h>
+#include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -523,6 +524,27 @@ bool object_store::open(std::string& err, recovery_report* report)
     {
         err = "cannot open " + m_opts.dir + ": " + errstr(errno);
         return false;
+    }
+
+    // The process this one replaces may still be finishing its stop, and must not write a journal or a marker beside this one.
+    const std::string lock = m_opts.dir + "/.lock." + std::to_string(m_opts.shard);
+    m_lock_fd = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (m_lock_fd < 0)
+    {
+        err = "cannot open " + lock + ": " + errstr(errno);
+        return false;
+    }
+    const auto give_up = std::chrono::steady_clock::now() + dir_lock_wait;
+    while (::flock(m_lock_fd, LOCK_EX | LOCK_NB) < 0)
+    {
+        if ((errno != EWOULDBLOCK && errno != EINTR) || std::chrono::steady_clock::now() >= give_up)
+        {
+            err = errno == EWOULDBLOCK ? "shard " + std::to_string(m_opts.shard) + " of " + m_opts.dir +
+                                             " is still held by another process"
+                                       : "cannot lock " + lock + ": " + errstr(errno);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     // A bucket deleted by a rename into .trash is removed here, where walking
@@ -1414,6 +1436,12 @@ void object_store::close(bool clean)
     {
         m_loop->close_fd(m_root_fd);
         m_root_fd = -1;
+    }
+    // Closed here and not on the ring, so the next process on this shard may open the moment this one is done.
+    if (m_lock_fd >= 0)
+    {
+        ::close(m_lock_fd);
+        m_lock_fd = -1;
     }
 }
 

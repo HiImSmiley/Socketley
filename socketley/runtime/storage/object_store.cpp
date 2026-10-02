@@ -96,6 +96,9 @@ object_store::object_store(event_loop& loop, file_io& io, store_options opts)
     // The hot-object budget per shard, 0 to keep nothing.
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_HOT_BYTES"))
         m_hot_budget = std::strtoull(e, nullptr, 10);
+    // A lower compaction floor, for a test that wants compactions without thousands of writes.
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_COMPACT_FLOOR"))
+        m_opts.compact_floor = std::strtoull(e, nullptr, 10);
 }
 
 const std::string& object_store::hot_id(std::string_view bucket_name, std::string_view key)
