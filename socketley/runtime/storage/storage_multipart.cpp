@@ -187,7 +187,7 @@ void storage_run::op_upload_part(const std::shared_ptr<conn>& c)
             return;
         }
         ++m_c.mpu_parts;
-        start_put(cc, part_key, std::move(meta), m_node.mpu_part_committer(q.bucket, q.key, id, number), algo, false,
+        start_put(cc, part_key, std::move(meta), m_node.mpu_part_committer(q.bucket, q.key, id, number), algo, {},
                   place, place.sse.empty() ? nullptr : &seal);
     });
 }
@@ -348,8 +348,15 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
 
     const std::string   bucket = r.bucket;
     const std::string   key    = r.key;
-    const std::string   host(r.host);
     const std::string   id     = std::string(r.get_query("uploadId"));
+    const put_condition cond{std::string(r.header("if-match")), std::string(r.header("if-none-match"))};
+    // Refused here when this shard holds the key, so no copy is made only to be refused at its commit.
+    if (cond.any() && m_store.owns(bucket, key))
+        if (const st cs = check_put_condition(cond, m_store.find(bucket, key)); cs != st::ok)
+        {
+            send_error(c, cs == st::no_such_key ? make_error("NoSuchKey") : make_error("PreconditionFailed"));
+            return;
+        }
     std::weak_ptr<conn> weak = c;
     auto bind = [this, customer](object_meta& m) { return sse_bind_parts(m, customer); };
     m_node.mpu_complete(bucket, key, id, std::move(parts),
@@ -358,38 +365,84 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
             if (auto cc = weak.lock(); cc && !cc->dead)
                 cc->last_progress = std::chrono::steady_clock::now();
         },
-        [this, weak, bucket, key, host, id](complete_result res)
+        [this, weak, bucket, key, id](complete_result res)
         {
             auto cc = weak.lock();
             if (!cc || cc->dead)
                 return;
+            if (res.error.code == "NoSuchUpload")
+            {
+                completed_before(cc, id, std::move(res.error));
+                return;
+            }
             if (!res.error.code.empty())
             {
-                send_error(cc, res.error, false,
-                           res.error.code == "NoSuchUpload" ? "UploadId" : std::string_view{},
-                           res.error.code == "NoSuchUpload" ? std::string_view(id) : std::string_view{});
+                send_error(cc, res.error);
                 return;
             }
             ++m_c.mpu_completed;
             ++m_c.puts;
             // A completed upload is a put like any other, whatever shard it was assembled on.
-            const checksum_algo algo = [&]
-            {
-                for (const auto& [n, v] : res.meta.extra)
-                    if (const checksum_algo a = checksum_from_header(n); a != checksum_algo::none)
-                        return a;
-                return checksum_algo::none;
-            }();
-            response resp;
-            resp.headers.emplace_back("Content-Type", "application/xml");
-            if (has_version(res.meta))
-                resp.headers.emplace_back("x-amz-version-id", version_of(res.meta).id);
-            sse_headers(cc->req, res.meta, resp.headers);
-            resp.body = complete_multipart_xml("http://" + host + "/" + bucket + "/" + key, bucket, key,
-                                               res.meta.etag(), algo, res.checksum_b64);
-            send_response(cc, std::move(resp));
+            send_completed(cc, res.meta, res.checksum_b64);
             notify_put(bucket, key, res.meta);
-        }, std::move(bind));
+        }, std::move(bind), std::move(cond));
+}
+
+void storage_run::send_completed(const std::shared_ptr<conn>& c, const object_meta& m, const std::string& checksum_b64)
+{
+    const s3_request& r = c->req;
+    const checksum_algo algo = [&]
+    {
+        for (const auto& [n, v] : m.extra)
+            if (const checksum_algo a = checksum_from_header(n); a != checksum_algo::none)
+                return a;
+        return checksum_algo::none;
+    }();
+    response resp;
+    resp.headers.emplace_back("Content-Type", "application/xml");
+    if (has_version(m))
+        resp.headers.emplace_back("x-amz-version-id", version_of(m).id);
+    sse_headers(r, m, resp.headers);
+    resp.body = complete_multipart_xml("http://" + std::string(r.host) + "/" + r.bucket + "/" + r.key, r.bucket, r.key,
+                                       m.etag(), algo, checksum_b64);
+    send_response(c, std::move(resp));
+}
+
+void storage_run::completed_before(const std::shared_ptr<conn>& c, const std::string& id, s3_error missing)
+{
+    // A completion sent again, after an answer that never arrived, finds the object it made and is answered as before.
+    auto answer = [this, id, missing = std::move(missing)](const std::shared_ptr<conn>& cc, const object_meta* m) mutable
+    {
+        const std::string* from = nullptr;
+        if (m)
+            for (const auto& [n, v] : m->extra)
+                if (n == upload_id_extra)
+                    from = &v;
+        if (from && *from == id)
+        {
+            std::string checksum;
+            for (const auto& [n, v] : m->extra)
+                if (checksum_from_header(n) != checksum_algo::none)
+                    checksum = v;
+            send_completed(cc, *m, checksum);
+            return;
+        }
+        send_error(cc, missing, false, "UploadId", id);
+    };
+    const s3_request& r = c->req;
+    if (m_store.owns(r.bucket, r.key))
+    {
+        answer(c, m_store.find(r.bucket, r.key));
+        return;
+    }
+    std::weak_ptr<conn> weak = c;
+    m_store.stat_foreign(r.bucket, r.key, [weak, answer](st s, const object_meta& m) mutable
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        answer(cc, s == st::ok ? &m : nullptr);
+    });
 }
 
 // ─── AbortMultipartUpload ───────────────────────────────────────────────────

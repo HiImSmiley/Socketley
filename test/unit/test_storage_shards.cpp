@@ -1393,7 +1393,8 @@ TEST_CASE("the wire forms round-trip and refuse what is not theirs")
     req.meta.md5  = md5_of("x");
     req.meta.content_type = "text/plain";
     req.meta.extra = {{"x-amz-meta-a", "b"}};
-    req.create_only = true;
+    req.cond.if_match = "\"abc\"";
+    req.cond.if_none_match = "*";
     const std::string enc = wire::encode_commit(req);
     commit_request back;
     REQUIRE(wire::decode_commit(enc, back));
@@ -1401,7 +1402,8 @@ TEST_CASE("the wire forms round-trip and refuse what is not theirs")
     CHECK(back.key == req.key);
     CHECK(back.tmp_name == req.tmp_name);
     CHECK(back.meta == req.meta);
-    CHECK(back.create_only);
+    CHECK(back.cond.if_match == req.cond.if_match);
+    CHECK(back.cond.if_none_match == "*");
     wire::op o{};
     REQUIRE(wire::request_op(enc, o));
     CHECK(o == wire::op::commit);

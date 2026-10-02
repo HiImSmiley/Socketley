@@ -123,6 +123,7 @@ uint64_t place_base_of(std::string_view key, const object_meta& meta, checksum_a
                              std::string(checksum_b64_len(algo) + std::to_string(mpu_max_parts).size() + 1, 'A'));
     // Parts placed in the data file are of one size, so their sizes are one number.
     m.extra.emplace_back(std::string(part_sizes_extra), std::string(20, '9'));
+    m.extra.emplace_back(std::string(upload_id_extra), std::string(32, '0'));
     // An SSE-C upload completed without its client's key takes a MAC of its part list.
     if (sse_mode_of(meta) == sse_mode::c)
         m.extra.emplace_back(std::string(sse_parts_extra), encode_parts_mac({}, {}));
@@ -223,6 +224,8 @@ struct assemble_state
     // The format the parts are sealed in, 0 for none, since their bytes on disk are more than their sizes say.
     uint8_t  sealed{0};
     complete_binder bind;
+    // If-Match and If-None-Match of the completion, decided by the key's owner at the commit.
+    put_condition cond;
     // The part list written after the body, when the header has no room for it.
     std::string trailer;
 };
@@ -842,11 +845,11 @@ void multipart_store::finish_part(const std::shared_ptr<part_commit>& pc, int64_
 
 void multipart_store::complete(std::string bucket, std::string id, std::vector<complete_part> parts,
                                std::function<void()> progress, std::function<void(complete_result)> cb,
-                               complete_binder bind)
+                               complete_binder bind, put_condition cond)
 {
     prepare_complete(bucket, id, std::move(parts),
-        [this, alive = m_alive, progress = std::move(progress), cb, bind = std::move(bind)](s3_error err,
-                                                                                           assemble_plan plan) mutable
+        [this, alive = m_alive, progress = std::move(progress), cb, bind = std::move(bind),
+         cond = std::move(cond)](s3_error err, assemble_plan plan) mutable
         {
             if (!*alive)
                 return;
@@ -871,12 +874,14 @@ void multipart_store::complete(std::string bucket, std::string id, std::vector<c
             a->cb           = std::move(cb);
             a->progress     = std::move(progress);
             a->bind         = std::move(bind);
+            a->cond         = std::move(cond);
             assemble(std::move(a));
         });
 }
 
 void multipart_store::assemble_plan_object(assemble_plan plan, std::function<void()> progress,
-                                           std::function<void(complete_result)> cb, complete_binder bind)
+                                           std::function<void(complete_result)> cb, complete_binder bind,
+                                           put_condition cond)
 {
     auto a = std::make_shared<assemble_state>();
     a->bucket       = std::move(plan.bucket);
@@ -893,6 +898,7 @@ void multipart_store::assemble_plan_object(assemble_plan plan, std::function<voi
     a->progress     = std::move(progress);
     a->local        = false;
     a->bind         = std::move(bind);
+    a->cond         = std::move(cond);
     assemble(std::move(a));
 }
 
@@ -1094,6 +1100,7 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
         }
         // A version 2 stream is sealed as the part number it was uploaded as, so its object keeps the numbers.
         const bool trailer = !record_part_list(plan.meta, list, body, sealed >= sse_format, m_list_max).empty();
+        plan.meta.extra.emplace_back(std::string(upload_id_extra), id);
         m_trailers += trailer ? 1 : 0;
         plan.in_place = !trailer && copy_free(*u, plan.parts);
         u->place_planned = plan.in_place;
@@ -1422,6 +1429,7 @@ void multipart_store::assemble_commit(const std::shared_ptr<assemble_state>& a)
     req.key      = a->key;
     req.tmp_name = a->tmp_name;
     req.meta     = a->meta;
+    req.cond     = a->cond;
     m_store->commit(std::move(req), [this, alive = m_alive, a](put_result pr)
     {
         if (!*alive)

@@ -70,7 +70,12 @@ std::string encode_commit(const commit_request& req)
     w.bytes(req.bucket);
     w.bytes(req.key);
     w.bytes(req.tmp_name);
-    w.u8(req.create_only ? 1 : 0);
+    w.u8(req.cond.any() ? 1 : 0);
+    if (req.cond.any())
+    {
+        w.bytes(req.cond.if_match);
+        w.bytes(req.cond.if_none_match);
+    }
     std::string rec;
     encode_put_record(rec, req.key, req.meta);
     w.bytes(rec);
@@ -82,11 +87,12 @@ bool decode_commit(std::string_view payload, commit_request& out)
     bytes::reader r(payload);
     std::string_view rec;
     std::string key;
-    bool create_only = false;
+    bool conditional = false;
     if (!open_request(r, op::commit) || !r.bytes(out.bucket, name_cap) || !r.bytes(out.key, name_cap) ||
-        !r.bytes(out.tmp_name, name_cap) || !r.flag(create_only) || !r.view(rec, record_cap))
+        !r.bytes(out.tmp_name, name_cap) || !r.flag(conditional) ||
+        (conditional && (!r.bytes(out.cond.if_match, name_cap) || !r.bytes(out.cond.if_none_match, name_cap))) ||
+        !r.view(rec, record_cap))
         return false;
-    out.create_only = create_only;
     return decode_record(rec, key, out.meta) && key == out.key;
 }
 

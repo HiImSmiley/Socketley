@@ -42,6 +42,9 @@ struct object_meta
     bool operator==(const object_meta&) const = default;
 };
 
+// Whether a comma-separated If-Match / If-None-Match list names `etag`, quoted or weak, or is "*".
+bool etag_list_matches(std::string_view list, std::string_view etag);
+
 // The extra entry an object's tags are kept in: each tag's key and value, each followed by a NUL.
 inline constexpr std::string_view tags_extra = "x-amz-tagging";
 
@@ -113,6 +116,9 @@ std::string record_part_list(object_meta& m, const part_list& l, uint64_t body_s
 // The extra entry of a sealed body written to a pooled file: the MD5 of its bytes as they lie on disk, in hex,
 // which is how a start knows the file is whole without the key that opens it.
 inline constexpr std::string_view stored_md5_extra = "x-socketley-stored-md5";
+
+// The extra entry naming the upload a multipart object was completed from, so a retried completion finds it.
+inline constexpr std::string_view upload_id_extra = "x-socketley-upload-id";
 
 // The extra entry a version of a key in a versioned bucket is named by: its order among the
 // key's versions, whether it is a delete marker, and its id.

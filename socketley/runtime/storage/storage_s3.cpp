@@ -58,30 +58,6 @@ bool unsupported_subresource(const s3_request& r, bool object)
     return false;
 }
 
-// One entity tag out of a header, unquoted and without a weak marker.
-std::string_view strip_etag(std::string_view e)
-{
-    e = http_trim_ows(e);
-    if (e.starts_with("W/"))
-        e.remove_prefix(2);
-    if (e.size() >= 2 && e.front() == '"' && e.back() == '"')
-        e = e.substr(1, e.size() - 2);
-    return e;
-}
-
-// Whether a comma-separated If-Match / If-None-Match list names `etag`.
-bool etag_list_matches(std::string_view list, std::string_view etag)
-{
-    while (!list.empty())
-    {
-        const size_t comma = list.find(',');
-        const std::string_view one = strip_etag(list.substr(0, comma));
-        if (one == "*" || one == etag)
-            return true;
-        list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
-    }
-    return false;
-}
 
 bool parse_uint(std::string_view s, uint64_t& out)
 {
@@ -884,15 +860,15 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
         return;
     }
 
-    // S3's conditional write: refuse to replace what is there.  A key another
-    // shard owns is not known here, so its owner decides at commit, which is
-    // also where two racing creators are told apart.
-    const bool create_only = r.header("if-none-match") == "*";
-    if (create_only && m_store.owns(r.bucket, r.key) && m_store.find(r.bucket, r.key))
-    {
-        deny_request(c, make_error("PreconditionFailed"));
-        return;
-    }
+    // S3's conditional write.  A key another shard owns is not known here, so its
+    // owner decides at commit, which is also where two racing writers are told apart.
+    const put_condition cond{std::string(r.header("if-match")), std::string(r.header("if-none-match"))};
+    if (cond.any() && m_store.owns(r.bucket, r.key))
+        if (const st cs = check_put_condition(cond, m_store.find(r.bucket, r.key)); cs != st::ok)
+        {
+            deny_request(c, cs == st::no_such_key ? make_error("NoSuchKey") : make_error("PreconditionFailed"));
+            return;
+        }
 
     sse_ask ask;
     sse_seal_spec seal;
@@ -902,7 +878,7 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
         deny_request(c, err);
         return;
     }
-    start_put(c, r.key, std::move(meta), {}, checksum_algo::none, create_only, {},
+    start_put(c, r.key, std::move(meta), {}, checksum_algo::none, cond, {},
               ask.mode != sse_mode::none ? &seal : nullptr);
 }
 
@@ -924,7 +900,7 @@ bool storage_run::body_length(const conn& c, uint64_t& expected)
 // the finished file goes when it is not the object namespace, and a checksum
 // algorithm is taken whether or not the client named one when `forced_algo` says so.
 void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, object_meta meta,
-                            put_op::committer committer, checksum_algo forced_algo, bool create_only,
+                            put_op::committer committer, checksum_algo forced_algo, const put_condition& cond,
                             const part_place& place, const sse_seal_spec* seal)
 {
     s3_request& r = c->req;
@@ -989,7 +965,7 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
     }
 
     st why = st::ok;
-    auto op = m_store.begin_put(r.bucket, key, std::move(meta), expected, known, why, !committer && !create_only, seal);
+    auto op = m_store.begin_put(r.bucket, key, std::move(meta), expected, known, why, !committer && !cond.any(), seal);
     if (!op)
     {
         // The body is not read, so the connection cannot be reused.
@@ -1010,7 +986,7 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
     }
     if (committer)
         op->set_committer(std::move(committer));
-    op->set_create_only(create_only);
+    op->set_condition(cond);
     if (place.off)
         op->place_body(place.path, place.off, place.room);
     if (seal)

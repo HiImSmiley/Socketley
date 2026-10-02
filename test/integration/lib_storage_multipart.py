@@ -228,10 +228,14 @@ def main_mode():
     check("a completed upload is no longer listed", ("manual/obj", uid) not in open_uploads(c))
     check("list_parts of a completed upload is NoSuchUpload",
           code_of(lambda: c.list_parts(Bucket=B, Key="manual/obj", UploadId=uid)) == ("NoSuchUpload", 404))
-    check("and so is completing it a second time",
-          code_of(lambda: complete(c, "manual/obj", uid, [e1, e2b, e3])) == ("NoSuchUpload", 404))
+    # A client whose answer was lost sends the completion again, and S3 answers it as the first time.
+    again = complete(c, "manual/obj", uid, [e1, e2b, e3])
+    check("completing it a second time answers the same ETag, as S3 does", again["ETag"].strip('"') == want_etag, again)
     check("the listing of objects shows it once with its size",
           [o["Size"] for o in c.list_objects_v2(Bucket=B, Prefix="manual/")["Contents"]] == [len(p1 + p2b + p3)])
+    check("and an upload id that never completed this key is still NoSuchUpload",
+          code_of(lambda: c.complete_multipart_upload(Bucket=B, Key="manual/obj", UploadId="0" * 32,
+                  MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": e1}]})) == ("NoSuchUpload", 404))
 
     # A single small part is a whole upload: only the last part may be small.
     uid1, e = upload_all(c, "tiny", [b"just this"])

@@ -1246,6 +1246,20 @@ void object_store::ensure_dirs(const std::string& bucket_name, const std::string
 
 // ─── Commit ─────────────────────────────────────────────────────────────────
 
+st check_put_condition(const put_condition& c, const object_meta* current)
+{
+    if (!c.if_match.empty())
+    {
+        if (!current)
+            return st::no_such_key;
+        if (!etag_list_matches(c.if_match, current->etag()))
+            return st::precondition_failed;
+    }
+    if (!c.if_none_match.empty() && current && etag_list_matches(c.if_none_match, current->etag()))
+        return st::precondition_failed;
+    return st::ok;
+}
+
 void object_store::commit(commit_request req, std::function<void(put_result)> cb)
 {
     const uint32_t owner = owner_of(req.bucket, req.key);
@@ -1335,11 +1349,16 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
             commit_done(c, st::no_such_bucket);
             return;
         }
-        if (rq.create_only && bp->objects.contains(rq.key))
+        if (rq.cond.any())
         {
-            if (!m_io->unlinkat(bp->tmp_fd, rq.tmp_name, 0, [](int64_t) {})) {}
-            commit_done(c, st::precondition_failed);
-            return;
+            const auto cur = bp->objects.find(rq.key);
+            if (const st cs = check_put_condition(rq.cond, cur == bp->objects.end() ? nullptr : &cur->second);
+                cs != st::ok)
+            {
+                if (!m_io->unlinkat(bp->tmp_fd, rq.tmp_name, 0, [](int64_t) {})) {}
+                commit_done(c, cs);
+                return;
+            }
         }
         // The landing shard judged the quota from its own bytes, which is only a
         // sample of the owner's, so the owner judges it again for the key it holds.

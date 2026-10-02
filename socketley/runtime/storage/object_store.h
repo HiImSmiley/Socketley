@@ -270,6 +270,19 @@ struct store_options
 
 class object_store;
 
+// The preconditions of a conditional write, If-Match and If-None-Match as the request gave them.
+struct put_condition
+{
+    std::string if_match;
+    std::string if_none_match;
+
+    bool any() const { return !if_match.empty() || !if_none_match.empty(); }
+};
+
+// Whether a write under `c` may replace `current`, null for a key that is not there:
+// ok, precondition_failed, or no_such_key for an If-Match with nothing to match.
+st check_put_condition(const put_condition& c, const object_meta* current);
+
 // What the owner of a key needs to make a body a visible object.
 struct commit_request
 {
@@ -278,9 +291,8 @@ struct commit_request
     // In the bucket's tmp directory, written and synced.
     std::string tmp_name;
     object_meta meta;
-    // Refused with precondition_failed when the key already exists, decided by
-    // the owner under the key's lane so two racing creators cannot both win.
-    bool        create_only{false};
+    // Decided by the owner under the key's lane, so two racing conditional writers cannot both win.
+    put_condition cond;
     // A file from the bucket's pool, whose name was durable before the body
     // was written, so the answer waits for the rename and not for its sync.
     bool        pooled{false};
@@ -309,14 +321,16 @@ public:
 
     void on_ready(std::function<void()> cb) { m_ready_cb = std::move(cb); }
 
-    // The commit refuses to replace an object that is already there.
-    void set_create_only(bool on)
+    // The commit is refused unless what the key holds then meets `c`.
+    void set_condition(put_condition c)
     {
-        m_create_only = on;
+        m_cond = std::move(c);
         // A pooled file is rolled forward after a crash, which a condition would have refused.
-        if (on && m_pooled)
+        if (m_cond.any() && m_pooled)
             fail(st::io_error);
     }
+    // The commit refuses to replace an object that is already there.
+    void set_create_only(bool on) { set_condition(on ? put_condition{{}, "*"} : put_condition{}); }
 
     // Called once, with the reason, if the write fails before finish().
     void on_failed(std::function<void(st)> cb) { m_failed_cb = std::move(cb); }
@@ -469,7 +483,7 @@ private:
     bool                             m_header_writing{false};
     bool                             m_sync_started{false};
     bool                             m_tmp_committed{false};
-    bool                             m_create_only{false};
+    put_condition                    m_cond;
     mutable bool                     m_want_ready{false};
     std::function<void(put_result)>  m_done;
     std::function<void()>            m_ready_cb;

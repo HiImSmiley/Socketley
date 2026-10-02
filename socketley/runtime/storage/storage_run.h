@@ -608,7 +608,7 @@ public:
     void op_put_object(const std::shared_ptr<conn>& c);
     void start_put(const std::shared_ptr<conn>& c, std::string key, object_meta meta,
                    put_op::committer committer, checksum_algo forced_algo = checksum_algo::none,
-                   bool create_only = false, const part_place& place = {}, const sse_seal_spec* seal = nullptr);
+                   const put_condition& cond = {}, const part_place& place = {}, const sse_seal_spec* seal = nullptr);
     // The size the body will have, and whether the request says it.
     static bool body_length(const conn& c, uint64_t& expected);
     void op_copy_object(const std::shared_ptr<conn>& c);
@@ -668,6 +668,10 @@ public:
     void op_upload_part(const std::shared_ptr<conn>& c);
     void op_upload_part_copy(const std::shared_ptr<conn>& c);
     void op_complete_multipart(const std::shared_ptr<conn>& c);
+    // The answer to a completion, for the object it made.
+    void send_completed(const std::shared_ptr<conn>& c, const object_meta& m, const std::string& checksum_b64);
+    // A completion of an upload that is gone, answered as before when the key still holds what it made.
+    void completed_before(const std::shared_ptr<conn>& c, const std::string& id, s3_error missing);
     void op_abort_multipart(const std::shared_ptr<conn>& c);
     void op_list_parts(const std::shared_ptr<conn>& c);
     void op_list_uploads(const std::shared_ptr<conn>& c);

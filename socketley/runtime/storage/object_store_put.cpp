@@ -782,7 +782,7 @@ void put_op::synced(int64_t res)
     req.key      = m_key;
     req.tmp_name = m_tmp_name;
     req.meta     = m_meta;
-    req.create_only = m_create_only;
+    req.cond        = m_cond;
     req.pooled      = m_pooled;
     auto self = shared_from_this();
     auto done = [self](put_result r2)
