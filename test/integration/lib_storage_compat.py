@@ -523,6 +523,17 @@ s3.copy_object(Bucket="meta-bucket", Key="src", CopySource={"Bucket": "meta-buck
 r = s3.head_object(Bucket="meta-bucket", Key="src")
 check("a REPLACE copy onto itself rewrites the metadata and keeps the bytes",
       r["Metadata"] == {"origin": "rewritten"} and r["ETag"] == src_etag and r["ContentLength"] == 13000, r)
+# S3 documents a copy onto itself as the way to add or change an object's checksum.
+try:
+    c = s3.copy_object(Bucket="meta-bucket", Key="src", CopySource={"Bucket": "meta-bucket", "Key": "src"},
+                       ChecksumAlgorithm="SHA256")["CopyObjectResult"]
+except ClientError as e:
+    c = e.response["Error"]
+r = s3.head_object(Bucket="meta-bucket", Key="src", ChecksumMode="ENABLED")
+want = base64.b64encode(hashlib.sha256(b"source bytes " * 1000).digest()).decode()
+check("a copy onto itself naming ChecksumAlgorithm SHA256 is allowed, and gives it the SHA-256 of its bytes",
+      (c.get("ChecksumSHA256"), r.get("ChecksumSHA256"), r["Metadata"], r["ETag"]) ==
+      (want, want, {"origin": "rewritten"}, src_etag), (c, r))
 s3.create_bucket(Bucket="meta-other")
 s3.copy_object(Bucket="meta-other", Key="dir/x y+z", CopySource={"Bucket": "meta-bucket", "Key": "cp-default"})
 check("a copy across buckets, to a key that needs escaping",

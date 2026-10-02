@@ -47,12 +47,15 @@ import time
 import xml.etree.ElementTree as ET
 import zlib
 
+import lib_s3_signing as sig
+
 MODE = sys.argv[1]
 BIN = os.environ.get("BIN", "")
 RUNTIME = os.environ.get("RUNTIME", "sse")
 NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 B = "sseb"
 STATE = "sse-expected.json"
+DEFAULTS_STATE = "sse-defaults.json"
 MARK = b"PLAINTEXT-MARKER-0123456789-"
 MIB = 1 << 20
 
@@ -246,6 +249,19 @@ def write_bytes():
 def save_expect(data, expect):
     with open(os.path.join(data, STATE), "w") as f:
         json.dump(expect, f)
+
+
+def default_sums_wrong(want):
+    """How HEAD and GET with x-amz-checksum-mode differ, for each key, from its CRC64NVME FULL_OBJECT and no other."""
+    wrong = []
+    for key, crc in want.items():
+        for method in ("HEAD", "GET"):
+            st, h, _ = req(method, "/%s/%s" % (B, key), headers={"x-amz-checksum-mode": "ENABLED"})
+            got = (st, h.get("x-amz-checksum-crc64nvme"), h.get("x-amz-checksum-type"),
+                   sorted(n for n in h if n.startswith("x-amz-checksum-")))
+            if got != (200, crc, "FULL_OBJECT", ["x-amz-checksum-crc64nvme", "x-amz-checksum-type"]):
+                wrong.append((key, method, got, crc))
+    return wrong
 
 
 # ─── main ───────────────────────────────────────────────────────────────────
@@ -449,6 +465,29 @@ def mode_main(port, data):
     code = err_code(lambda: s3.copy_object(Bucket=B, Key="self", CopySource={"Bucket": B, "Key": "self"}))
     check("one that names nothing new is still refused", code == (400, "InvalidRequest"), code)
 
+    # S3's default checksum of an object sent without one is of its plaintext, whichever way it is sealed or copied.
+    defaults = {}
+    dp = [marked(5 * MIB, "dp1"), marked(MIB + 3, "dp2")]
+    for key, body in (("d-small", marked(3000, "dsmall")), ("d-big", marked(2 * MIB + 99, "dbig"))):
+        st, h, _ = req("PUT", "/%s/%s" % (B, key), body, headers={"x-amz-server-side-encryption": "AES256"})
+        check("%s: an SSE-S3 PutObject with no checksum answers the CRC64NVME of its plaintext" % key,
+              (st, h.get("x-amz-checksum-crc64nvme"), h.get("x-amz-server-side-encryption")) ==
+              (200, sig.crc64nvme_b64(body), "AES256"), (st, h))
+        defaults[key] = body
+        expect[key] = md5(body)
+    mpu(s3, "d-mp", dp, create={"ServerSideEncryption": "AES256"})
+    defaults["d-mp"] = b"".join(dp)
+    expect["d-mp"] = md5(b"".join(dp))
+    # The clear source was given the default when it was put, which every copy of it, sealed or not, keeps.
+    for key, body in (("clear", clear), ("big", big), ("c-clear2enc", clear), ("c-enc2clear", big)):
+        defaults[key] = body
+    defaults = {k: sig.crc64nvme_b64(v) for k, v in defaults.items()}
+    wrong = default_sums_wrong(defaults)
+    check("each answers it to a HEAD and a GET with x-amz-checksum-mode, FULL_OBJECT and no other: an SSE-S3 upload "
+          "with no algorithm and copies into and out of a sealed body included", not wrong, wrong[:2])
+    with open(os.path.join(data, DEFAULTS_STATE), "w") as f:
+        json.dump(defaults, f)
+
     # ── refusals ────────────────────────────────────────────────────────────
     st, _, b = req("PUT", "/%s/kms" % B, b"x", {"x-amz-server-side-encryption": "aws:kms"})
     check("aws:kms is refused as not implemented", (st, xml_code(b)) == (501, "NotImplemented"), (st, b[:200]))
@@ -618,6 +657,10 @@ def mode_recovery(port, data):
     check("and is listed", set(expect) <= listed, set(expect) - listed)
     check("no object file was set aside as corrupt", "corrupt" not in subprocess.run(
         [BIN, "stats", RUNTIME], capture_output=True, text=True).stdout)
+    with open(os.path.join(data, DEFAULTS_STATE)) as f:
+        wrong = default_sums_wrong(json.load(f))
+    check("and every default checksum is read back from its sealed object's header", not wrong, wrong[:2])
+    os.unlink(os.path.join(data, DEFAULTS_STATE))
     # The upload open across the crash keeps its sealed part, and completes into an object that opens.
     p2 = s3.upload_part(Bucket=B, Key="openmp", UploadId=up["UploadId"], PartNumber=2, Body=marked(9999, "o2"))
     s3.complete_multipart_upload(Bucket=B, Key="openmp", UploadId=up["UploadId"], MultipartUpload={"Parts": [
@@ -683,6 +726,10 @@ def mode_tls(port, cert, data):
     check("and not the key", key not in raw and base64.b64encode(key) not in raw)
     lst = {o["Key"]: o["ETag"].strip('"') for o in s3.list_objects_v2(Bucket=B).get("Contents", [])}
     check("a listing gives the same opaque ETag", lst.get("c") == etag, lst.get("c"))
+    st, hh, _ = req("HEAD", "/%s/c" % B, headers=dict(c_headers(key), **{"x-amz-checksum-mode": "ENABLED"}))
+    check("the SSE-C object sent without a checksum has S3's default, the CRC64NVME of its plaintext",
+          (st, hh.get("x-amz-checksum-crc64nvme"), hh.get("x-amz-checksum-type")) ==
+          (200, sig.crc64nvme_b64(body), "FULL_OBJECT"), (st, hh))
 
     # A small SSE-C object is never held, so every read asks for the key again.
     small = marked(4000, "cs")

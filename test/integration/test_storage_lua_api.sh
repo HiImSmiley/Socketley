@@ -6,8 +6,8 @@
 #   calls       put, get, head, delete and list from a server's handler, waiting
 #               on the answer without stopping the daemon, against an object
 #               store in another process; what a script puts is what an S3 client
-#               reads, with its content type and user metadata, and the other way
-#               round, byte for byte for binary data
+#               reads, with its content type, user metadata and S3's default
+#               CRC64NVME, and the other way round, byte for byte for binary data
 #   lists       prefix, delimiter, max_keys and the token that pages through
 #               all of them return the keys an S3 listing does
 #   errors      NoSuchKey, NoSuchBucket, an invalid bucket name, an object over
@@ -217,6 +217,9 @@ hdrs=$(curl -s -I "$S/bkt/greeting" | tr -d '\r')
 contains "with the content type" "$hdrs" "Content-Type: text/x-api"
 contains "and the user metadata, lowercased" "$hdrs" "x-amz-meta-owner: alice"
 contains "and a number written as its text" "$hdrs" "x-amz-meta-n: 7"
+crc=$(cd "$HERE" && python3 -c 'import lib_s3_signing as s; print(s.crc64nvme_b64(b"hello from lua"))')
+contains "and S3's default checksum, the CRC64NVME of its bytes, as a client's put gets" \
+    "$(curl -s -I -H 'x-amz-checksum-mode: ENABLED' "$S/bkt/greeting" | tr -d '\r')" "x-amz-checksum-crc64nvme: $crc"
 
 # ── get, head, and binary data ──────────────────────────────────────────────
 out=$(ask "get bkt seed")

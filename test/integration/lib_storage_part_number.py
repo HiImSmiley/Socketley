@@ -27,6 +27,8 @@ import time
 import xml.etree.ElementTree as ET
 import zlib
 
+import lib_s3_signing as sig
+
 MODE = sys.argv[1]
 BIN = os.environ.get("BIN", "")
 RUNTIME = os.environ.get("RUNTIME", "pn")
@@ -96,18 +98,25 @@ def mp_etag(parts):
     return "%s-%d" % (hashlib.md5(b"".join(hashlib.md5(p).digest() for p in parts)).hexdigest(), len(parts))
 
 
-def upload(key, parts, node=None, data=None):
+# The answers the last upload() was given: each UploadPart's headers, and the CompleteMultipartUpload document.
+LAST = {}
+
+
+def upload(key, parts, node=None, data=None, part_headers=None):
     """Uploads `parts` as one multipart object; returns the ETag and whether its data file became the object."""
     st, _, body = req("POST", "/%s/%s?uploads" % (B, key), node=node)
     if st != 200:
         raise RuntimeError("create %s: %d %r" % (key, st, body[:200]))
     uid = ET.fromstring(body).findtext(NS + "UploadId")
     etags = []
+    LAST["parts"] = []
     for i, p in enumerate(parts):
-        st, h, body = req("PUT", "/%s/%s?partNumber=%d&uploadId=%s" % (B, key, i + 1, uid), p, node=node)
+        st, h, body = req("PUT", "/%s/%s?partNumber=%d&uploadId=%s" % (B, key, i + 1, uid), p, node=node,
+                          headers=part_headers(p) if part_headers else None)
         if st != 200:
             raise RuntimeError("part %d of %s: %d %r" % (i + 1, key, st, body[:200]))
         etags.append(h["etag"].strip('"'))
+        LAST["parts"].append(h)
     ino = None
     if data:
         try:
@@ -120,6 +129,7 @@ def upload(key, parts, node=None, data=None):
     st, _, body = req("POST", "/%s/%s?uploadId=%s" % (B, key, uid), x.encode(), node=node)
     if st != 200:
         raise RuntimeError("complete %s: %d %r" % (key, st, body[:200]))
+    LAST["complete"] = ET.fromstring(body)
     etag = ET.fromstring(body).findtext(NS + "ETag").strip('"')
     in_place = ino is not None and object_file(data, key) is not None and \
         os.stat(object_file(data, key)).st_ino == ino
@@ -155,6 +165,8 @@ MULTI = {}
 def b64_sum(algo, data):
     if algo == "CRC32":
         raw = struct.pack(">I", zlib.crc32(data))
+    elif algo == "CRC64NVME":
+        return sig.crc64nvme_b64(data)
     else:
         raw = hashlib.new(algo.lower(), data).digest()
     return base64.b64encode(raw).decode()
@@ -318,9 +330,58 @@ COPIES = [
     ("ck-copy-kept", "ck-copy-sha1", None, "SHA1", b"".join(UNEQUAL)),
     ("ck-crc-copy2", "ck-crc", None, "CRC32", b"".join(EQUAL)),
     ("ck-crc-sha256", "ck-crc", {"x-amz-checksum-algorithm": "sha256"}, "SHA256", b"".join(EQUAL)),
-    ("ck-single-copy", "single", None, None, SINGLE),
+    ("ck-single-copy", "single", None, "CRC64NVME", SINGLE),
     ("ck-single-crc", "single", {"x-amz-checksum-algorithm": "CRC32"}, "CRC32", SINGLE),
 ]
+
+# S3's default checksum, a CRC64NVME of the whole bytes, which every new object sent without one is given: a small
+# body hashed on the loop, a large one hashed on the helper threads, and multipart objects of every layout.
+DFLT_SMALL = blob(4096, "d1")
+DFLT_BIG = blob(3 * MiB + 5, "d2")
+PC_WHOLE = b"".join(UNEQUAL)[3:6 * MiB + 3] + SINGLE
+# What a restart and the shards read again: each key, the algorithm its checksum is in, and its bytes.
+DEFAULTS = {
+    "dflt-small": ("CRC64NVME", DFLT_SMALL),
+    "dflt-big": ("CRC64NVME", DFLT_BIG),
+    "dflt-empty": ("CRC64NVME", b""),
+    "dflt-crc32": ("CRC32", DFLT_SMALL),
+    "single": ("CRC64NVME", SINGLE),
+    "equal": ("CRC64NVME", b"".join(EQUAL)),
+    "unequal": ("CRC64NVME", b"".join(UNEQUAL)),
+    "varied": ("CRC64NVME", b"".join(VARIED)),
+    "dflt-mp-crc32": ("CRC64NVME", b"".join(EQUAL)),
+    "dflt-pc": ("CRC64NVME", PC_WHOLE),
+    "dflt-self": ("SHA256", DFLT_SMALL),
+    "dflt-self-comp": ("CRC32", b"".join(UNEQUAL)),
+    "dflt-legacy": ("CRC64NVME", DFLT_SMALL),
+    "dflt-legacy-copy": ("CRC64NVME", DFLT_SMALL),
+    "dflt-oldparts": (None, b"".join(EQUAL[:2])),
+    "dflt-keptparts": ("CRC64NVME", b"".join(EQUAL[:2])),
+}
+
+
+def defaults_wrong(node=None):
+    return [(key, w) for key, (algo, whole) in DEFAULTS.items() for w in whole_sum_wrong(key, algo, whole, node=node)]
+
+
+def open_upload(key, parts):
+    """An upload of `parts` left open: its id and its parts' ETags."""
+    st, _, body = req("POST", "/%s/%s?uploads" % (B, key))
+    uid = ET.fromstring(body).findtext(NS + "UploadId")
+    etags = [req("PUT", "/%s/%s?partNumber=%d&uploadId=%s" % (B, key, i + 1, uid), p)[1]["etag"]
+             for i, p in enumerate(parts)]
+    return uid, etags
+
+
+def complete(key, uid, etags):
+    x = "<CompleteMultipartUpload>" + "".join("<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>" % (i + 1, e)
+                                              for i, e in enumerate(etags)) + "</CompleteMultipartUpload>"
+    st, _, body = req("POST", "/%s/%s?uploadId=%s" % (B, key, uid), x.encode())
+    return st, ET.fromstring(body) if st == 200 else xml_code(body)
+
+
+def result_sums(x):
+    return {c.tag[len(NS):]: c.text for c in x if c.tag.startswith(NS + "Checksum")}
 
 
 # ── an object header as object_format.cpp writes it ─────────────────────────
@@ -683,6 +744,98 @@ def mode_main(port, data):
     except ImportError:
         print("  SKIP: boto3 is not installed")
 
+    # ── S3's default checksum, for every new object sent without one ──
+    for key, body in (("dflt-small", DFLT_SMALL), ("dflt-big", DFLT_BIG), ("dflt-empty", b"")):
+        st, h, _ = req("PUT", "/%s/%s" % (B, key), body)
+        got = (st, h.get("x-amz-checksum-crc64nvme"), h.get("x-amz-checksum-type"))
+        check("%s: a PutObject of %d bytes with no checksum answers the CRC64NVME of its bytes, FULL_OBJECT" %
+              (key, len(body)), got == (200, b64_sum("CRC64NVME", body), "FULL_OBJECT"), got)
+    st, h, _ = req("PUT", "/%s/dflt-crc32" % B, DFLT_SMALL, headers={"x-amz-checksum-crc32": b64_sum("CRC32", DFLT_SMALL)})
+    check("a PutObject with a checksum of its own is given no other",
+          (st, sorted(n for n in h if n.startswith("x-amz-checksum-"))) == (200, ["x-amz-checksum-crc32",
+                                                                                  "x-amz-checksum-type"]), h)
+    MULTI["dflt-small"] = False
+    st, h, _ = req("GET", "/%s/dflt-small?partNumber=1" % B, headers={"x-amz-checksum-mode": "ENABLED"})
+    check("partNumber=1 of a single-part object answers its default checksum",
+          (st, h.get("x-amz-checksum-crc64nvme")) == (206, b64_sum("CRC64NVME", DFLT_SMALL)), (st, h))
+    etag, in_place = upload("dflt-mp", EQUAL[:2] + [EQUAL[3]], data=data)
+    whole = b"".join(EQUAL[:2] + [EQUAL[3]])
+    check("an upload created with no algorithm still completes in place, with the default in its header", in_place)
+    check("its UploadParts answer no checksum",
+          [sorted(n for n in h if n.startswith("x-amz-checksum-")) for h in LAST["parts"]] == [[]] * 3, LAST["parts"])
+    check("its CompleteMultipartUpload answers the CRC64NVME of the whole bytes, FULL_OBJECT",
+          result_sums(LAST["complete"]) == {"ChecksumCRC64NVME": b64_sum("CRC64NVME", whole),
+                                            "ChecksumType": "FULL_OBJECT"}, result_sums(LAST["complete"]))
+    wrong = whole_sum_wrong("dflt-mp", "CRC64NVME", whole)
+    check("and GET, HEAD and GetObjectAttributes give it", not wrong, wrong[:2])
+    st, h, _ = req("GET", "/%s/dflt-mp?partNumber=2" % B, headers={"x-amz-checksum-mode": "ENABLED"})
+    rows, _ = attr_parts("dflt-mp")
+    check("while its parts, which no client gave a checksum, are read and listed with none",
+          (st, [n for n in h if n.startswith("x-amz-checksum-")], [r[2] for r in rows]) == (206, [], [None] * 3),
+          (st, h, rows))
+    upload("dflt-mp-crc32", EQUAL, data=data, part_headers=lambda p: {"x-amz-checksum-crc32": b64_sum("CRC32", p)})
+    check("an upload with no algorithm whose parts each carry a CRC32 answers each part's CRC32",
+          [h.get("x-amz-checksum-crc32") for h in LAST["parts"]] == [b64_sum("CRC32", p) for p in EQUAL],
+          [h.get("x-amz-checksum-crc32") for h in LAST["parts"]])
+    check("and completes with the default of its whole bytes, not a CRC32",
+          result_sums(LAST["complete"]) == {"ChecksumCRC64NVME": b64_sum("CRC64NVME", b"".join(EQUAL)),
+                                            "ChecksumType": "FULL_OBJECT"}, result_sums(LAST["complete"]))
+    # UploadPartCopy into an upload with no algorithm answers none, and its object takes the default of what it copied.
+    st, _, body = req("POST", "/%s/dflt-pc?uploads" % B)
+    uid = ET.fromstring(body).findtext(NS + "UploadId")
+    rows = []
+    for n, src, rng in ((1, "unequal", "bytes=3-%d" % (6 * MiB + 2)), (2, "single", None)):
+        h = {"x-amz-copy-source": "/%s/%s" % (B, src)}
+        if rng:
+            h["x-amz-copy-source-range"] = rng
+        st, _, body = req("PUT", "/%s/dflt-pc?partNumber=%d&uploadId=%s" % (B, n, uid), headers=h)
+        x = ET.fromstring(body)
+        rows.append((st, x.findtext(NS + "ETag"), result_sums(x)))
+    check("UploadPartCopy into an upload with no algorithm answers no checksum", [r[2] for r in rows] == [{}, {}], rows)
+    st, x = complete("dflt-pc", uid, [r[1] for r in rows])
+    check("and its completion answers the default of the bytes copied",
+          st == 200 and result_sums(x) == {"ChecksumCRC64NVME": b64_sum("CRC64NVME", PC_WHOLE),
+                                           "ChecksumType": "FULL_OBJECT"}, (st, x if st != 200 else result_sums(x)))
+    # A copy onto itself that names a checksum algorithm is allowed, as S3 documents it for adding or changing one.
+    req("PUT", "/%s/dflt-self" % B, DFLT_SMALL, headers={"x-amz-meta-colour": "blue", "Content-Type": "text/x-self"})
+    st, sums = copy_ck("dflt-self", "dflt-self")
+    check("a copy onto itself that changes nothing is still 400 InvalidRequest", (st, sums) == (400, "InvalidRequest"),
+          (st, sums))
+    st, sums = copy_ck("dflt-self", "dflt-self", {"x-amz-checksum-algorithm": "SHA256"})
+    check("one naming SHA256 under COPY answers the SHA-256 of its bytes",
+          (st, sums) == (200, {"ChecksumType": "FULL_OBJECT", "ChecksumSHA256": b64_sum("SHA256", DFLT_SMALL)}),
+          (st, sums))
+    wrong = whole_sum_wrong("dflt-self", "SHA256", DFLT_SMALL)
+    st, h, _ = req("HEAD", "/%s/dflt-self" % B)
+    check("which replaces its default checksum, its metadata kept", not wrong and
+          (h.get("x-amz-meta-colour"), h.get("content-type")) == ("blue", "text/x-self"), (wrong[:2], h))
+    upload_ck("dflt-self-comp", UNEQUAL, "CRC32", data=data)
+    st, sums = copy_ck("dflt-self-comp", "dflt-self-comp", {"x-amz-checksum-algorithm": "CRC32"})
+    wrong = whole_sum_wrong("dflt-self-comp", "CRC32", b"".join(UNEQUAL))
+    check("and one naming the algorithm a COMPOSITE object already has makes it the FULL_OBJECT CRC32 of its bytes",
+          (st, isinstance(sums, dict) and sums.get("ChecksumType"), wrong) == (200, "FULL_OBJECT", []),
+          (st, sums, wrong[:2]))
+    # An object and parts stored before the default, as the journal-less start below finds them in their files.
+    req("PUT", "/%s/dflt-legacy" % B, DFLT_SMALL)
+    path = object_file(data, "dflt-legacy")
+    h = read_header(path)
+    check("the default checksum is in the object's header",
+          dict(h["extra"]).get(b"x-amz-checksum-crc64nvme") == b64_sum("CRC64NVME", DFLT_SMALL).encode(), h["extra"])
+    h["extra"] = [(n, v) for n, v in h["extra"] if not n.startswith(b"x-amz-checksum-")]
+    write_header(path, h)
+    old_uid, old_etags = open_upload("dflt-oldparts", EQUAL[:2])
+    kept_uid, kept_etags = open_upload("dflt-keptparts", EQUAL[:2])
+    wrong = []
+    for n, p in ((1, EQUAL[0]), (2, EQUAL[1])):
+        ppath = os.path.join(data, B, "mpu", old_uid, str(n))
+        h = read_header(ppath)
+        if dict(h["extra"]).get(b"x-socketley-part-crc64nvme") != b64_sum("CRC64NVME", p).encode():
+            wrong.append((n, h["extra"]))
+        h["extra"] = [(k, v) for k, v in h["extra"] if k != b"x-socketley-part-crc64nvme"]
+        write_header(ppath, h)
+    check("each part of an upload with no algorithm keeps its own CRC64NVME in its header, for the completion",
+          not wrong, wrong)
+
     # ── an object completed before part sizes were recorded ──
     upload("legacy", EQUAL, data=data)
     path = object_file(data, "legacy")
@@ -718,6 +871,25 @@ def mode_main(port, data):
     rows, _ = attr_parts("ck-legacy")
     check("and listed by GetObjectAttributes with their sizes and no checksum",
           rows == [(i + 1, len(p), None) for i, p in enumerate(EQUAL)], rows)
+    wrong = whole_sum_wrong("dflt-legacy", None, DFLT_SMALL)
+    check("an object stored before the default is read with no checksum, none being made up for it", not wrong, wrong)
+    st, sums = copy_ck("dflt-legacy-copy", "dflt-legacy")
+    check("a copy of it is given the default of its bytes",
+          (st, sums) == (200, {"ChecksumType": "FULL_OBJECT", "ChecksumCRC64NVME": b64_sum("CRC64NVME", DFLT_SMALL)}),
+          (st, sums))
+    st, sums = copy_ck("dflt-legacy", "dflt-legacy", {"x-amz-checksum-algorithm": "CRC64NVME"})
+    check("and a copy of it onto itself naming CRC64NVME gives it one",
+          (st, sums) == (200, {"ChecksumType": "FULL_OBJECT", "ChecksumCRC64NVME": b64_sum("CRC64NVME", DFLT_SMALL)}),
+          (st, sums))
+    st, x = complete("dflt-oldparts", old_uid, old_etags)
+    check("an upload whose parts were written before they kept a CRC completes with no checksum",
+          st == 200 and result_sums(x) == {}, (st, x if st != 200 else result_sums(x)))
+    st, x = complete("dflt-keptparts", kept_uid, kept_etags)
+    check("while one whose parts kept theirs, through the same start, completes with the default",
+          st == 200 and result_sums(x) == {"ChecksumCRC64NVME": b64_sum("CRC64NVME", b"".join(EQUAL[:2])),
+                                           "ChecksumType": "FULL_OBJECT"}, (st, x if st != 200 else result_sums(x)))
+    wrong = defaults_wrong()
+    check("every object above answers its checksum to GET, HEAD and GetObjectAttributes", not wrong, wrong[:2])
 
 
 def mode_restart(port, data):
@@ -735,6 +907,8 @@ def mode_restart(port, data):
     check("and with its own checksum, from the journal", not wrong, wrong[:2])
     wrong = [(dst, w) for dst, _, _, algo, whole in COPIES for w in whole_sum_wrong(dst, algo, whole)]
     check("and every copy with its own whole checksum", not wrong, wrong[:2])
+    wrong = defaults_wrong()
+    check("and every default checksum, and the objects stored without one with none", not wrong, wrong[:2])
     ok, removed = restart(port, data)
     check("and again with every journal removed", ok and removed > 0, (ok, removed))
     wrong = part_answers("equal", EQUAL) + part_answers("unequal", UNEQUAL, "HEAD") + \
@@ -746,6 +920,8 @@ def mode_restart(port, data):
     check("and every part's checksum comes back from the header or the list after the body", not wrong, wrong[:2])
     wrong = [(dst, w) for dst, _, _, algo, whole in COPIES for w in whole_sum_wrong(dst, algo, whole)]
     check("and every copy's whole checksum from its header", not wrong, wrong[:2])
+    wrong = defaults_wrong()
+    check("and every default checksum from its header", not wrong, wrong[:2])
 
 
 def mode_shards(nodes):
@@ -793,6 +969,30 @@ def mode_shards(nodes):
                 wrong += [(dst, node, w) for w in whole_sum_wrong(dst, algo, whole, node=node)]
     check("a copy of a COMPOSITE object through either shard has its own whole checksum, read alike through both",
           not wrong, wrong[:3])
+    # The default checksum is given through either shard and read alike through both.
+    wrong = []
+    for i, (key, body) in enumerate((("s-dflt-small", DFLT_SMALL), ("s-dflt-big", DFLT_BIG))):
+        for j, via in enumerate(nodes):
+            st, h, _ = req("PUT", "/%s/%s-%d" % (B, key, j), body, node=via)
+            if (st, h.get("x-amz-checksum-crc64nvme")) != (200, b64_sum("CRC64NVME", body)):
+                wrong.append((key, j, st, h))
+            for node in nodes:
+                wrong += [(key, j, node, w) for w in whole_sum_wrong("%s-%d" % (key, j), "CRC64NVME", body, node=node)]
+    for key, parts in keys:
+        for node in nodes:
+            wrong += [(key, node, w) for w in whole_sum_wrong(key, "CRC64NVME", b"".join(parts), node=node)]
+    check("the default checksum of a PutObject and of an upload with no algorithm, through either shard, is read "
+          "alike through both", not wrong, wrong[:3])
+    wrong = []
+    for j, via in enumerate(nodes):
+        key = "s-self-%d" % j
+        req("PUT", "/%s/%s" % (B, key), SINGLE, node=nodes[1 - j])
+        st, sums = copy_ck(key, key, {"x-amz-checksum-algorithm": "SHA1"}, node=via)
+        if (st, sums) != (200, {"ChecksumType": "FULL_OBJECT", "ChecksumSHA1": b64_sum("SHA1", SINGLE)}):
+            wrong.append((key, st, sums))
+        for node in nodes:
+            wrong += [(key, node, w) for w in whole_sum_wrong(key, "SHA1", SINGLE, node=node)]
+    check("a copy onto itself naming SHA1, through either shard, replaces the default for both", not wrong, wrong[:3])
     for node in nodes:
         st, _, body = req("GET", "/%s/s-eq-0?partNumber=4" % B, node=node)
         check("part 4 of 3 is 416 on %s" % os.path.basename(node), (st, xml_code(body)) == (416, "InvalidPartNumber"),

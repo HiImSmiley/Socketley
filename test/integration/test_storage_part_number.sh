@@ -35,9 +35,16 @@
 #               algorithm x-amz-checksum-algorithm names or its source's: taken
 #               again of a COMPOSITE source, kept from a whole one, under COPY and
 #               REPLACE, in the CopyObjectResult, GET, HEAD and GetObjectAttributes,
-#               none for a source with none, an unknown algorithm refused; through
+#               CRC64NVME for a source with none, an unknown algorithm refused; through
 #               restarts and through either of two shards; UploadPartCopy answers
 #               the upload's algorithm of the bytes it copied
+#   default     S3's CRC64NVME FULL_OBJECT for every object sent without a
+#               checksum: PutObject small, large and empty, an upload with no
+#               algorithm in place, copied, with a list after the body, with CRC32
+#               parts and by UploadPartCopy, combined from parts' CRCs no client
+#               sees; none for an object or parts stored before it, a copy of
+#               which gets it; a copy onto itself naming an algorithm allowed;
+#               through restarts and either of two shards
 #
 # The assertions live in lib_storage_part_number.py, which prints one line each.
 set -uo pipefail

@@ -23,6 +23,7 @@ and exit with the number of failures.
   slow_put NODE BUCKET KEY BYTES READY RELEASE
                                    a put whose body is sent in two halves
 """
+import base64
 import hashlib
 import http.client
 import os
@@ -34,7 +35,9 @@ import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 
-NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+import lib_s3_signing as sig
+
+NS ="{http://s3.amazonaws.com/doc/2006-03-01/}"
 
 passed = failed = 0
 
@@ -343,6 +346,7 @@ def mode_copy(nodes):
     check("the bucket is made", st in (200, 409), st)
     bad = 0
     made = 0
+    copied = []
     for i in range(40):
         src, dst = "src%d" % i, "dst%d" % i
         if n > 1 and owner(bucket, src, n) == owner(bucket, dst, n):
@@ -359,11 +363,32 @@ def mode_copy(nodes):
             bad += 1
             continue
         made += 1
+        copied.append(i)
         for node in nodes:
             s, _, got = req(node, "GET", "/%s/%s" % (bucket, dst))
             bad += s != 200 or got != body
     check("copies made through a shard that owns neither key are whole on every shard", bad == 0 and made >= 10,
           "%d wrong, %d made" % (bad, made))
+    # The default checksum a put is given wherever it lands, which its copy keeps, read alike through every shard.
+    wrong = []
+    for i in copied:
+        for key in ("src%d" % i, "dst%d" % i):
+            for node in nodes:
+                s, h, _ = req(node, "HEAD", "/%s/%s" % (bucket, key), headers={"x-amz-checksum-mode": "ENABLED"})
+                if (s, h.get("x-amz-checksum-crc64nvme")) != (200, sig.crc64nvme_b64(body_for(i))):
+                    wrong.append((key, node, s, h.get("x-amz-checksum-crc64nvme")))
+    check("every source and copy answers the CRC64NVME of its bytes through every shard", not wrong and made >= 10,
+          wrong[:3])
+    # A copy onto itself naming an algorithm is allowed through a shard that does not own the key.
+    key = "dst%d" % copied[0]
+    landing = next((x for x in range(n) if x != owner(bucket, key, n)), 0)
+    s, _, cb = req(nodes[landing], "PUT", "/%s/%s" % (bucket, key),
+                   headers={"x-amz-copy-source": "/%s/%s" % (bucket, key), "x-amz-checksum-algorithm": "SHA256"})
+    want = base64.b64encode(hashlib.sha256(body_for(copied[0])).digest()).decode()
+    got = [req(node, "HEAD", "/%s/%s" % (bucket, key), headers={"x-amz-checksum-mode": "ENABLED"})[1].get(
+        "x-amz-checksum-sha256") for node in nodes]
+    check("a copy onto itself naming SHA256 through another shard gives it the SHA-256 on every shard",
+          s == 200 and got == [want] * n, (s, cb[:200], got))
     # A copy onto itself is refused, and so is a missing source, wherever they are asked.
     for node in nodes:
         s, _, _ = req(node, "PUT", "/%s/src1" % bucket, headers={"x-amz-copy-source": "/%s/nothing" % bucket})

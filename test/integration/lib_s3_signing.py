@@ -10,6 +10,7 @@ import base64
 import datetime
 import hashlib
 import hmac
+import struct
 import urllib.parse
 import zlib
 
@@ -131,3 +132,36 @@ def crc32c(data, crc=0):
 
 def crc32c_b64(data):
     return base64.b64encode(crc32c(data).to_bytes(4, "big")).decode()
+
+
+# CRC-64/NVME, S3's default checksum, eight bytes a step through eight tables since Python has none of its own.
+_CRC64_TABLES = [[]]
+for _i in range(256):
+    _c = _i
+    for _ in range(8):
+        _c = (_c >> 1) ^ 0x9A6C9329AC4BC9B5 if _c & 1 else _c >> 1
+    _CRC64_TABLES[0].append(_c)
+for _k in range(1, 8):
+    _CRC64_TABLES.append([(_v >> 8) ^ _CRC64_TABLES[0][_v & 0xFF] for _v in _CRC64_TABLES[_k - 1]])
+_CRC64_SEEN = {}
+
+
+def crc64nvme(data):
+    t0, t1, t2, t3, t4, t5, t6, t7 = _CRC64_TABLES
+    crc = 0xFFFFFFFFFFFFFFFF
+    n8 = len(data) // 8 * 8
+    for (v,) in struct.iter_unpack("<Q", data[:n8]):
+        crc ^= v
+        crc = t7[crc & 0xFF] ^ t6[(crc >> 8) & 0xFF] ^ t5[(crc >> 16) & 0xFF] ^ t4[(crc >> 24) & 0xFF] ^ \
+            t3[(crc >> 32) & 0xFF] ^ t2[(crc >> 40) & 0xFF] ^ t1[(crc >> 48) & 0xFF] ^ t0[crc >> 56]
+    for b in data[n8:]:
+        crc = t0[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFFFFFFFFFF
+
+
+def crc64nvme_b64(data):
+    # Remembered by digest, since a test asks for the same large body more than once and each takes Python a second.
+    k = hashlib.sha1(data).digest()
+    if k not in _CRC64_SEEN:
+        _CRC64_SEEN[k] = base64.b64encode(crc64nvme(data).to_bytes(8, "big")).decode()
+    return _CRC64_SEEN[k]

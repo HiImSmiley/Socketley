@@ -24,6 +24,9 @@
 #   tcp          behind one port (SO_REUSEPORT) connections land where the
 #                kernel puts them and the answers are the same
 #   stats        per-shard figures, and every crossing sent is a crossing served
+#   copies       through a shard that owns neither key, whole on every shard, with
+#                the default CRC64NVME a put is given wherever it lands; a copy
+#                onto itself naming SHA256 through a shard that does not own it
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"

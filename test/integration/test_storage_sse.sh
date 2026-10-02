@@ -9,7 +9,10 @@
 #               UploadPartCopy and copies in every direction read the plaintext;
 #               the ETag stays the plaintext's MD5, and a copy of a COMPOSITE
 #               source, sealed or opened, has the FULL_OBJECT checksum of its
-#               plaintext
+#               plaintext; an object sent without a checksum, SSE-S3, SSE-C or an
+#               SSE-S3 upload with no algorithm, and every copy into or out of a
+#               sealed body, has S3's default CRC64NVME of its plaintext, which a
+#               SIGKILL with every journal removed reads back from its header
 #   on disk     an object's file never holds its plaintext, which a clear
 #               object's file does, so the search can fail
 #   default     PutBucketEncryption / Get / Delete, AES256 only, aws:kms refused;

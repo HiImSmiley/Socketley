@@ -17,7 +17,8 @@
 #               and delimiters, compared with a model of S3's ordering, and
 #               listed again while keys are put and deleted under it
 #   headers     the round trip of every stored header and user metadata
-#   copy        the COPY and REPLACE directives and the copy conditions
+#   copy        the COPY and REPLACE directives and the copy conditions, and a
+#               copy onto itself that names a checksum algorithm
 #   delete      DeleteObjects that half fails
 #   races       twelve writers of one key against readers that must never see a
 #               torn body, and acknowledged order that must be commit order
