@@ -12,6 +12,7 @@
 #include "s3_object_lock.h"
 #include "s3_tagging.h"
 #include "s3_versioning.h"
+#include "s3_vhost.h"
 #include "s3_xml_tree.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
@@ -580,7 +581,9 @@ void storage_run::op_create_bucket(const std::shared_ptr<conn>& c)
                 return;
             }
             response r;
-            r.headers.emplace_back("Location", "/" + name);
+            // Path style names the bucket's path, as S3 in us-east-1 does, and virtual-hosted style its URL.
+            r.headers.emplace_back("Location", cc->req.vhost ? object_url(cc->ssl != nullptr, cc->req.host, true, name, {})
+                                                             : "/" + name);
             send_response(cc, std::move(r));
         };
         if (s != st::ok || !lock)

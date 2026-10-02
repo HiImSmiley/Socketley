@@ -157,6 +157,7 @@ struct runtime_config
     std::string storage_secret_key;
     std::string storage_credentials;
     std::string storage_sse_key_file;
+    std::string storage_domain;
     uint32_t storage_mpu_expire_secs = 0;
 
     // A registered type's own fields in declaration order, opaque here, held

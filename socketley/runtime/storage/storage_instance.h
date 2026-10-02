@@ -66,6 +66,10 @@ public:
     void set_sse_key_file(std::string_view f) { m_sse_key_file = std::string(f); }
     std::string_view get_sse_key_file() const { return m_sse_key_file; }
 
+    // The comma-separated domains under which a Host of `<bucket>.<domain>` addresses a bucket; empty is path style only.
+    void set_domain(std::string_view d) { m_domain = std::string(d); }
+    std::string_view get_domain() const { return m_domain; }
+
     // What decides whether a request may go on.  Given, it is used instead of
     // the anonymous default; the SigV4 authenticator arrives here.
     void set_authenticator(std::unique_ptr<socketley::storage::authenticator> a);
@@ -115,6 +119,7 @@ private:
     std::string m_secret_key;
     std::string m_credentials_file;
     std::string m_sse_key_file;
+    std::string m_domain;
     uint32_t    m_mpu_expire_secs{0};
     std::unique_ptr<socketley::storage::authenticator> m_auth;
     std::unique_ptr<socketley::storage::anonymous_authenticator> m_anon;

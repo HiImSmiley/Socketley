@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "s3_sigv4_auth.h"
+#include "s3_vhost.h"
 #include "sse.h"
 #include "shard_wire.h"
 #include "storage_run.h"
@@ -84,6 +85,9 @@ std::string storage_instance::config_refusal() const
         if (std::string why; !socketley::storage::load_sse_master(m_sse_key_file, key, why))
             return "storage: " + why + "\n";
     }
+    if (std::vector<std::string> d; !m_domain.empty())
+        if (std::string why; !socketley::storage::parse_domains(m_domain, d, why))
+            return "storage: " + why + "\n";
     return {};
 }
 
@@ -224,6 +228,18 @@ bool storage_instance::setup(event_loop& loop)
         run->adopt_authenticator(std::move(signed_auth));
     run->set_mpu_expire_secs(m_mpu_expire_secs);
     run->set_tls(std::move(tls));
+    if (std::vector<std::string> d; !m_domain.empty())
+    {
+        std::string why;
+        if (!socketley::storage::parse_domains(m_domain, d, why))
+        {
+            LOG_ERROR(("storage: " + why).c_str());
+            run->stop();
+            m_graveyard.push_back(std::move(run));
+            return false;
+        }
+        run->set_domains(std::move(d));
+    }
     // Read here, at every start, so a replaced key file is the one a restart serves with.
     if (!m_sse_key_file.empty())
     {

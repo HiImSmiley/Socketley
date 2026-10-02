@@ -13,6 +13,7 @@
 
 #include "lifecycle.h"
 #include "s3_names.h"
+#include "s3_vhost.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
 #include "../../shared/logging.h"
@@ -221,6 +222,7 @@ void s3_request::reset()
     method = version = raw_path = raw_query = host = payload_hash = {};
     bucket.clear();
     key.clear();
+    vhost = false;
     headers.clear();
     query.clear();
     request_id.clear();
@@ -1640,10 +1642,16 @@ bool storage_run::parse_head(const std::shared_ptr<conn>& c, std::string_view he
     if (!percent_decode(r.raw_path, path, false))
         return bad("InvalidRequest");
     const std::string_view rest_path = std::string_view(path).substr(1);
-    const size_t slash = rest_path.find('/');
-    r.bucket.assign(rest_path.substr(0, slash));
-    if (slash != std::string_view::npos)
-        r.key.assign(rest_path.substr(slash + 1));
+    r.vhost = !m_domains.empty() && vhost_bucket(r.host, m_domains, r.bucket);
+    if (r.vhost)
+        r.key.assign(rest_path);
+    else
+    {
+        const size_t slash = rest_path.find('/');
+        r.bucket.assign(rest_path.substr(0, slash));
+        if (slash != std::string_view::npos)
+            r.key.assign(rest_path.substr(slash + 1));
+    }
 
     // The query as key=value pairs, a bare key meaning an empty value -- which
     // is what marks a subresource such as ?delete.

@@ -123,6 +123,8 @@ struct s3_request
     bool   chunked{false};
     bool   keep_alive{true};
     bool   expect_continue{false};
+    // The bucket came from the Host header and the whole path is the key.
+    bool   vhost{false};
     // A browser's upload by form, whose fields became the key and the headers of a PutObject.
     std::unique_ptr<post_form> form;
 
@@ -444,6 +446,8 @@ public:
     // cleartext.
     void set_tls(std::unique_ptr<tls_context> ctx) { m_tls = std::move(ctx); }
     bool tls_enabled() const { return m_tls != nullptr; }
+    // The domains a Host of `<bucket>.<domain>` addresses a bucket under; none serves path style only.
+    void set_domains(std::vector<std::string> d) { m_domains = std::move(d); }
 
     void on_cqe(struct io_uring_cqe* cqe) override;
 
@@ -807,6 +811,7 @@ private:
     // The rules changed during a pass, so the next starts when it ends.
     bool              m_lc_again{false};
     std::unique_ptr<tls_context> m_tls;
+    std::vector<std::string> m_domains;
     // The key every SSE-S3 data key is wrapped with, and its name, when the runtime was given one.
     bool        m_has_master{false};
     sse_key     m_master{};

@@ -3466,7 +3466,8 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                 (pa.hashes[i] == fnv1a("--dir") || pa.hashes[i] == fnv1a("--anonymous") ||
                  pa.hashes[i] == fnv1a("--max-bytes") || pa.hashes[i] == fnv1a("--access-key") ||
                  pa.hashes[i] == fnv1a("--secret-key") || pa.hashes[i] == fnv1a("--credentials") ||
-                 pa.hashes[i] == fnv1a("--mpu-expire") || pa.hashes[i] == fnv1a("--sse-key-file")))
+                 pa.hashes[i] == fnv1a("--mpu-expire") || pa.hashes[i] == fnv1a("--sse-key-file") ||
+                 pa.hashes[i] == fnv1a("--domain")))
             {
                 restore_edit();
                 std::cout << pa.args[i] << " cannot be changed with `edit`\n"
@@ -3942,6 +3943,12 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             if (cfg.has("sse_key_file") && cfg.storage_sse_key_file != std::string(stg->get_sse_key_file()))
             {
                 conn->write_buf = "cannot change the SSE key file while running; stop, import, and start\n";
+                return 1;
+            }
+            // The domains are parsed into each worker's run at start.
+            if (cfg.has("domain") && cfg.storage_domain != std::string(stg->get_domain()))
+            {
+                conn->write_buf = "cannot change the domain while running; stop, import, and start\n";
                 return 1;
             }
         }

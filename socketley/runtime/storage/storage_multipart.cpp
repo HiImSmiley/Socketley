@@ -8,6 +8,7 @@
 
 #include "s3_multipart_xml.h"
 #include "s3_names.h"
+#include "s3_vhost.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
 #include "../../shared/logging.h"
@@ -445,8 +446,8 @@ void storage_run::send_completed(const std::shared_ptr<conn>& c, const object_me
     if (has_version(m))
         resp.headers.emplace_back("x-amz-version-id", version_of(m).id);
     sse_headers(r, m, resp.headers);
-    resp.body = complete_multipart_xml("http://" + std::string(r.host) + "/" + r.bucket + "/" + r.key, r.bucket, r.key,
-                                       m.etag(), algo, checksum_b64);
+    resp.body = complete_multipart_xml(object_url(c->ssl != nullptr, r.host, r.vhost, r.bucket, r.key), r.bucket,
+                                       r.key, m.etag(), algo, checksum_b64);
     send_response(c, std::move(resp));
 }
 

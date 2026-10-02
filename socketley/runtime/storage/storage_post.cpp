@@ -5,6 +5,7 @@
 
 #include "s3_names.h"
 #include "s3_tagging.h"
+#include "s3_vhost.h"
 #include "s3_xml.h"
 
 namespace socketley::storage
@@ -182,8 +183,7 @@ void storage_run::send_post_result(const std::shared_ptr<conn>& c, const object_
     const s3_request& r = c->req;
     const post_form& f = *r.form;
     const std::string etag = "\"" + m.etag() + "\"";
-    const std::string location = (c->ssl ? "https://" : "http://") + std::string(r.host) + "/" + url_encode(r.bucket) +
-                                 "/" + url_encode(r.key);
+    const std::string location = object_url(c->ssl != nullptr, r.host, r.vhost, r.bucket, r.key);
     response resp;
     resp.headers.emplace_back("ETag", etag);
     if (has_version(m))

@@ -15,6 +15,7 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/storage/storage_instance.h"
+#include "../runtime/storage/s3_vhost.h"
 
 // Five flags that describe inbound traffic are refused on a client, which
 // accepts none, because they were stored and reported by `show` while no code
@@ -1303,6 +1304,20 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
                 return 1;
             }
             stg->set_sse_key_file(pa.args[++i]);
+            return 0;
+        }
+        // The endpoint's own names, under which a Host of `<bucket>.<domain>` is virtual-hosted style.
+        case fnv1a("--domain"):
+        {
+            std::vector<std::string> domains;
+            std::string why;
+            if (i + 1 >= pa.count || !socketley::storage::parse_domains(pa.args[i + 1], domains, why))
+            {
+                std::cout << (why.empty() ? "--domain requires a domain name, or several separated by commas" : why)
+                          << "\n";
+                return 1;
+            }
+            stg->set_domain(pa.args[++i]);
             return 0;
         }
         // Open multipart uploads are aborted after this long, and never when it is absent.
