@@ -6,6 +6,7 @@
 
 #include <openssl/evp.h>
 
+#include "lifecycle.h"
 #include "s3_cors.h"
 #include "s3_names.h"
 #include "s3_tagging.h"
@@ -1536,6 +1537,16 @@ std::string attributes_xml(const object_meta& m, const attr_query& a, const part
 
 }   // namespace
 
+void storage_run::expiration_header(std::string_view bucket, std::string_view key, const object_meta& m,
+                                    std::vector<std::pair<std::string, std::string>>& headers) const
+{
+    const auto cfg = m_store.lifecycle(bucket);
+    int64_t at = 0;
+    const lifecycle_rule* rule = nullptr;
+    if (cfg && !is_delete_marker(m) && lifecycle_expiry(*cfg, key, m, m_lc_day_ms, at, rule))
+        headers.emplace_back("x-amz-expiration", "expiry-date=\"" + http_date(at) + "\", rule-id=\"" + rule->id + "\"");
+}
+
 void storage_run::read_part_list(const std::shared_ptr<conn>& c, const object_meta& m, int fd, uint64_t data_off,
                                  bool head,
                                  std::function<void(const object_meta&, int, uint64_t, bool, const part_list&)> then)
@@ -1804,6 +1815,8 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
         }
 
         object_headers(rq, m, r, ranged, m_store.bucket_versioning(rq.bucket) != versioning::off);
+        if (!rq.has_query("versionId"))
+            expiration_header(rq.bucket, rq.key, m, r.headers);
         if (ranged)
         {
             r.status = 206;
@@ -1953,8 +1966,10 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
     if (held)
     {
         ++m_c.hot_gets;
-        // A GET that asks for nothing but the object gets the headers kept with the copy.
+        // A GET that asks for nothing but the object gets the headers kept with the copy, which do not follow the
+        // bucket's lifecycle rules.
         if (q.query.empty() && q.header("range").empty() && q.header("x-amz-checksum-mode").empty() &&
+            !m_store.lifecycle(q.bucket) &&
             !q.has_header("x-amz-server-side-encryption-customer-algorithm") && evaluate(q, *hot.meta) == cond::proceed)
         {
             if (hot.head->empty())

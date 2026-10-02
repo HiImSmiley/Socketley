@@ -561,40 +561,56 @@ int64_t lifecycle_due_ms(int64_t from_ms, uint32_t days, int64_t day_ms)
     return at + (rem > 0 ? day_ms - rem : -rem);
 }
 
-bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t now_ms,
-                          int64_t day_ms)
+namespace
 {
-    if (!r.expires() || !key.starts_with(r.prefix))
+
+// Whether the rule's filter takes the object: its prefix, its size bounds and every tag it names.
+bool filter_takes(const lifecycle_rule& r, std::string_view key, const object_meta& m)
+{
+    if (!key.starts_with(r.prefix))
         return false;
     if ((r.has_size_gt && m.size <= r.size_gt) || (r.has_size_lt && m.size >= r.size_lt))
         return false;
-    if (!r.tags.empty())
-    {
-        const std::string_view stored = tags_of(m);
-        for (const auto& [k, v] : r.tags)
-            if (!tags_have(stored, k, v))
-                return false;
-    }
-    if (r.has_date)
-        return now_ms >= r.expire_date_ms;
-    return now_ms >= lifecycle_due_ms(m.mtime_ms, r.expire_days, day_ms);
+    const std::string_view stored = r.tags.empty() ? std::string_view{} : tags_of(m);
+    for (const auto& [k, v] : r.tags)
+        if (!tags_have(stored, k, v))
+            return false;
+    return true;
+}
+
+// When an object the rule takes expires under it.
+int64_t expiry_of(const lifecycle_rule& r, const object_meta& m, int64_t day_ms)
+{
+    return r.has_date ? r.expire_date_ms : lifecycle_due_ms(m.mtime_ms, r.expire_days, day_ms);
+}
+
+}   // namespace
+
+bool lifecycle_expiry(const lifecycle_config& c, std::string_view key, const object_meta& m, int64_t day_ms,
+                      int64_t& at_ms, const lifecycle_rule*& rule)
+{
+    rule = nullptr;
+    for (const lifecycle_rule& r : c.rules)
+        if (r.expires() && filter_takes(r, key, m))
+            if (const int64_t at = expiry_of(r, m, day_ms); !rule || at < at_ms)
+            {
+                at_ms = at;
+                rule  = &r;
+            }
+    return rule != nullptr;
+}
+
+bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t now_ms,
+                          int64_t day_ms)
+{
+    return r.expires() && filter_takes(r, key, m) && now_ms >= expiry_of(r, m, day_ms);
 }
 
 bool lifecycle_noncurrent_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t since_ms,
                               int64_t now_ms, int64_t day_ms)
 {
-    if (!r.enabled || r.noncurrent_days == 0 || !key.starts_with(r.prefix))
-        return false;
-    if ((r.has_size_gt && m.size <= r.size_gt) || (r.has_size_lt && m.size >= r.size_lt))
-        return false;
-    if (!r.tags.empty())
-    {
-        const std::string_view stored = tags_of(m);
-        for (const auto& [k, v] : r.tags)
-            if (!tags_have(stored, k, v))
-                return false;
-    }
-    return now_ms >= lifecycle_due_ms(since_ms, r.noncurrent_days, day_ms);
+    return r.enabled && r.noncurrent_days != 0 && filter_takes(r, key, m) &&
+           now_ms >= lifecycle_due_ms(since_ms, r.noncurrent_days, day_ms);
 }
 
 bool lifecycle_upload_due(const lifecycle_rule& r, std::string_view key, int64_t initiated_ms, int64_t now_ms,

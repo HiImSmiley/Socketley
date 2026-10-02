@@ -78,6 +78,11 @@ std::string lifecycle_xml(const lifecycle_config& c);
 // does: with a real day that boundary is midnight UTC, and `day_ms` is shorter only for a test.
 int64_t lifecycle_due_ms(int64_t from_ms, uint32_t days, int64_t day_ms);
 
+// When the object `key` with metadata `m` expires under `c`, and by the rule that expires it first; false when
+// no rule expires it.  This is what x-amz-expiration says of an object.
+bool lifecycle_expiry(const lifecycle_config& c, std::string_view key, const object_meta& m, int64_t day_ms,
+                      int64_t& at_ms, const lifecycle_rule*& rule);
+
 // Whether the object `key` with metadata `m` has expired under `r` at `now_ms`.
 bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t now_ms,
                           int64_t day_ms);

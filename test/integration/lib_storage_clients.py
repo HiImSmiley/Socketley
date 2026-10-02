@@ -265,9 +265,38 @@ def full_object_checksums():
           ("InvalidRequest", 400))
 
 
+# ─── x-amz-expiration ───────────────────────────────────────────────────────
+# s3-tests test_lifecycle_expiration_header_*: an object a rule will expire says when, and by which rule.
+def expiration_header():
+    print("=== x-amz-expiration on PutObject, HeadObject and GetObject ===")
+    s3.create_bucket(Bucket="cl-exp")
+    s3.put_bucket_lifecycle_configuration(Bucket="cl-exp", LifecycleConfiguration={"Rules": [
+        {"ID": "soon", "Status": "Enabled", "Filter": {"Prefix": "tmp/"}, "Expiration": {"Days": 1}},
+        {"ID": "later", "Status": "Enabled", "Filter": {"Prefix": "tmp/"}, "Expiration": {"Days": 30}},
+        {"ID": "tagged", "Status": "Enabled", "Filter": {"Tag": {"Key": "gone", "Value": "yes"}},
+         "Expiration": {"Days": 2}}]})
+
+    def exp(resp):
+        return resp["ResponseMetadata"]["HTTPHeaders"].get("x-amz-expiration", "")
+
+    put = exp(s3.put_object(Bucket="cl-exp", Key="tmp/a", Body=b"x"))
+    check("a put a rule covers is told when it expires, by the earliest rule",
+          put.startswith('expiry-date="') and put.endswith(' GMT", rule-id="soon"'), put)
+    check("and HEAD and GET say the same", put != "" and exp(s3.head_object(Bucket="cl-exp", Key="tmp/a")) == put and
+          exp(s3.get_object(Bucket="cl-exp", Key="tmp/a")) == put and
+          exp(s3.get_object(Bucket="cl-exp", Key="tmp/a")) == put)
+    check("an object no rule covers is told nothing", exp(s3.put_object(Bucket="cl-exp", Key="keep", Body=b"x")) == "" and
+          exp(s3.get_object(Bucket="cl-exp", Key="keep")) == "")
+    s3.put_object_tagging(Bucket="cl-exp", Key="keep", Tagging={"TagSet": [{"Key": "gone", "Value": "yes"}]})
+    check("until it is tagged for a rule", 'rule-id="tagged"' in exp(s3.head_object(Bucket="cl-exp", Key="keep")))
+    s3.delete_bucket_lifecycle(Bucket="cl-exp")
+    check("and nothing once the rules are gone", put != "" and exp(s3.get_object(Bucket="cl-exp", Key="tmp/a")) == "")
+
+
 # A section that raises fails as one assertion and the next still runs, so a runtime without the feature reads red, not dead.
 for section in (delete_bucket_with_uploads, date_header, empty_content_md5, aws_chunked_coding, list_buckets_paged,
-                object_attributes, conditional_writes, completion_sent_twice, full_object_checksums):
+                object_attributes, conditional_writes, completion_sent_twice, full_object_checksums,
+                expiration_header):
     try:
         section()
     except Exception as e:

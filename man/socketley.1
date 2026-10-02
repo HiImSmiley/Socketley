@@ -7080,6 +7080,12 @@ and
 .BR lifecycle_aborted ,
 and each pass that removed anything says so in the log.
 .PP
+A PutObject's answer, and a GetObject's or HeadObject's of the latest version,
+carry
+.B x\-amz\-expiration
+(\fBexpiry\-date="\fIdate\fB", rule\-id="\fIid\fB"\fR) when a rule will expire the
+object, naming the rule that does so first, as S3 does.
+.PP
 .B SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS
 is a test aid: read by the sweep alone, it makes a lifecycle day that many
 seconds (at most 86400) so a rule can be watched taking effect, with passes as

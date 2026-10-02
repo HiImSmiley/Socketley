@@ -701,6 +701,9 @@ public:
     void lifecycle_done(uint64_t pass_id);
     // A HEAD finds the object as GetObjectAttributes does, which `attributes` answers instead.
     void op_get_object(const std::shared_ptr<conn>& c, bool head, bool attributes = false);
+    // x-amz-expiration for the latest object `key`, when a lifecycle rule of its bucket will expire it.
+    void expiration_header(std::string_view bucket, std::string_view key, const object_meta& m,
+                           std::vector<std::pair<std::string, std::string>>& headers) const;
     void op_delete_object(const std::shared_ptr<conn>& c);
     // Versioning, in storage_versioning.cpp: the bucket's configuration, ListObjectVersions, and the
     // answers a request naming a version or meeting a delete marker is given.

@@ -2061,6 +2061,8 @@ void storage_run::put_body_complete(const std::shared_ptr<conn>& c)
                 resp.headers.emplace_back("x-amz-version-id", version_of(r.meta).id);
             else if (n == sse_extra)
                 sse_headers(cc->req, r.meta, resp.headers);
+        if (!is_part)
+            expiration_header(cc->req.bucket, cc->req.key, r.meta, resp.headers);
         const std::string bucket = cc->req.bucket;
         const std::string key    = cc->req.key;
         send_response(cc, std::move(resp));
