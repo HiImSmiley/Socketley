@@ -129,10 +129,8 @@ uint64_t place_base_of(std::string_view key, const object_meta& meta, checksum_a
     if (algo != checksum_algo::none)
         m.extra.emplace_back(std::string(checksum_header(algo)),
                              std::string(checksum_b64_len(algo) + std::to_string(mpu_max_parts).size() + 1, 'A'));
-    else
-        m.extra.emplace_back(std::string(checksum_header(default_checksum_algo)),
-                             std::string(checksum_b64_len(default_checksum_algo), 'A'));
-    // Parts placed in the data file are of one size, so their list is one number or names its checksums after the body.
+    // Parts placed in the data file are of one size, so their list is one number or names its checksums after the body,
+    // and with no algorithm the room that one number leaves holds the default checksum.
     m.extra.emplace_back(std::string(part_layout_extra), std::string(20 + 1 + 64 + 1 + 2, '9'));
     m.extra.emplace_back(std::string(upload_id_extra), std::string(32, '0'));
     return completed_header_len(key, m);

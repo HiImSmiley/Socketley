@@ -13,6 +13,7 @@
 #include "shared/raft_storage.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -174,41 +175,53 @@ TEST_CASE("the composite checksum is the algorithm over the part checksums, with
     CHECK(got.substr(0, got.size() - 2) == b64_of(checksum_algo::sha256, raw));
 }
 
-TEST_CASE("CRC64NVME is the bit-at-a-time CRC at every length around the folds and every alignment")
+TEST_CASE("CRC32 and CRC64NVME are the bit-at-a-time CRC at every length around the folds and every alignment")
 {
-    // The definition, one bit at a time, which no table or carry-less multiply shares a line with.
-    auto reference = [](const unsigned char* p, size_t n)
+    struct crc_def
     {
-        uint64_t c = ~0ull;
-        for (size_t i = 0; i < n; ++i)
-        {
-            c ^= p[i];
-            for (int k = 0; k < 8; ++k)
-                c = (c & 1) ? (c >> 1) ^ 0x9A6C9329AC4BC9B5ull : c >> 1;
-        }
-        return ~c;
+        checksum_algo algo;
+        uint64_t      poly;
+        int           bytes;
     };
-    auto b64 = [](uint64_t v)
+    for (const crc_def def : {crc_def{checksum_algo::crc32, 0xEDB88320ull, 4},
+                              crc_def{checksum_algo::crc64nvme, 0x9A6C9329AC4BC9B5ull, 8}})
     {
-        std::string raw(8, '\0');
-        for (int i = 0; i < 8; ++i)
-            raw[7 - i] = static_cast<char>((v >> (8 * i)) & 0xFF);
-        return base64_encode(raw);
-    };
-    const std::string data = pattern(4096 + 300, 11);
-    const auto* base = reinterpret_cast<const unsigned char*>(data.data());
-    for (size_t off : {size_t{0}, size_t{1}, size_t{7}, size_t{15}})
-        for (size_t n = 0; n <= 4096 + 260; n += (n < 400 || (n > 3800 && n < 4300)) ? 1 : 61)
+        INFO(checksum_name(def.algo));
+        const uint64_t ones = ~0ull >> (64 - 8 * def.bytes);
+        // The definition, one bit at a time, which no table or carry-less multiply shares a line with.
+        auto reference = [&](const unsigned char* p, size_t n)
         {
-            INFO("offset " << off << ", length " << n);
-            REQUIRE(b64_of(checksum_algo::crc64nvme, std::string_view(data).substr(off, n)) == b64(reference(base + off, n)));
-        }
-    // A stream fed in pieces that straddle the 128-byte folds is the same as one fed whole.
-    const std::string big = pattern(1 << 20, 5);
-    checksum_stream s(checksum_algo::crc64nvme);
-    for (size_t at = 0, step = 1; at < big.size(); at += step, step = step * 3 % 1031 + 1)
-        s.update(big.data() + at, std::min(step, big.size() - at));
-    CHECK(s.peek_b64() == b64(reference(reinterpret_cast<const unsigned char*>(big.data()), big.size())));
+            uint64_t c = ones;
+            for (size_t i = 0; i < n; ++i)
+            {
+                c ^= p[i];
+                for (int k = 0; k < 8; ++k)
+                    c = (c & 1) ? (c >> 1) ^ def.poly : c >> 1;
+            }
+            return c ^ ones;
+        };
+        auto b64 = [&](uint64_t v)
+        {
+            std::string raw(static_cast<size_t>(def.bytes), '\0');
+            for (int i = 0; i < def.bytes; ++i)
+                raw[static_cast<size_t>(def.bytes - 1 - i)] = static_cast<char>((v >> (8 * i)) & 0xFF);
+            return base64_encode(raw);
+        };
+        const std::string data = pattern(4096 + 300, 11);
+        const auto* base = reinterpret_cast<const unsigned char*>(data.data());
+        for (size_t off : {size_t{0}, size_t{1}, size_t{7}, size_t{15}})
+            for (size_t n = 0; n <= 4096 + 260; n += (n < 400 || (n > 3800 && n < 4300)) ? 1 : 61)
+            {
+                INFO("offset " << off << ", length " << n);
+                REQUIRE(b64_of(def.algo, std::string_view(data).substr(off, n)) == b64(reference(base + off, n)));
+            }
+        // A stream fed in pieces that straddle the 128-byte folds is the same as one fed whole.
+        const std::string big = pattern(1 << 20, 5);
+        checksum_stream s(def.algo);
+        for (size_t at = 0, step = 1; at < big.size(); at += step, step = step * 3 % 1031 + 1)
+            s.update(big.data() + at, std::min(step, big.size() - at));
+        CHECK(s.peek_b64() == b64(reference(reinterpret_cast<const unsigned char*>(big.data()), big.size())));
+    }
 }
 
 TEST_CASE("the full-object checksum of parts is the CRC of their bytes joined, for every CRC and every cut")
@@ -411,6 +424,8 @@ struct rig : io_handler
         object_meta meta;
         if (algo != checksum_algo::none)
             meta.extra.emplace_back(std::string(checksum_header(algo)), std::string(checksum_b64_len(algo), 'A'));
+        else if (part_crcs)
+            meta.extra.emplace_back(std::string(part_crc_extra), std::string(checksum_b64_len(checksum_algo::crc64nvme), 'A'));
         if (place.off)
             meta.extra.emplace_back(std::string(mpu_place_extra), encode_place(place.off));
         if (seal)
@@ -421,6 +436,8 @@ struct rig : io_handler
         REQUIRE(op);
         if (algo != checksum_algo::none)
             op->track_checksum(algo, {});
+        else if (part_crcs)
+            op->track_part_crc();
         op->set_committer(mp->part_committer(b, id, n));
         if (place.off)
             op->place_body(place.path, place.off, place.room);
@@ -481,6 +498,8 @@ struct rig : io_handler
         return st::ok;
     }
 
+    // Parts of an upload with no algorithm keep the CRC its object's default is combined from, as the runtime's do.
+    bool part_crcs{false};
     std::vector<std::shared_ptr<put_op>> held;
     struct waiting { std::shared_ptr<put_result> out; std::shared_ptr<bool> fired; };
     std::vector<waiting> pending;
@@ -881,6 +900,51 @@ TEST_CASE("equal parts are written into the data file at their place and the fil
     CHECK(r.until([&] { return !r.mp->busy(); }));
     CHECK(!fs::exists(d.path + "/bkt/mpu/" + id));
     CHECK(r.until([&] { return names_in(d.path + "/bkt/tmp").empty(); }));
+}
+
+TEST_CASE("the room in front of part 1 of an upload with no algorithm holds its object's default checksum")
+{
+    tmpdir d;
+    std::optional<rig> r(std::in_place, d.path);
+    r->bucket("bkt");
+    r->part_crcs = true;
+    const std::string body = pattern(5 * MiB, 61);
+    // Completes `key` with `pad` bytes of user metadata: the bytes its header uses, and whether its data file became it.
+    auto complete_with = [&](const std::string& key, size_t pad)
+    {
+        object_meta meta;
+        meta.extra.emplace_back("x-amz-meta-pad", std::string(pad, 'p'));
+        const std::string id = r->create("bkt", key, checksum_algo::none, meta);
+        part_place g;
+        REQUIRE(r->part("bkt", id, 1, body, true, &g).status == st::ok);
+        REQUIRE(g.off != 0);
+        const ino_t data_ino = inode_of(d.path + "/bkt/mpu/" + id + "/data");
+        REQUIRE(r->finish("bkt", id, {listed(1, body)}).error.code.empty());
+        const std::string path = d.path + "/bkt/data/" + object_rel_path(key);
+        std::ifstream f(path, std::ios::binary);
+        char head[24] = {};
+        f.read(head, sizeof head);
+        uint32_t record = 0;
+        std::memcpy(&record, head + 16, 4);
+        return std::pair<size_t, bool>{sizeof head + record, inode_of(path) == data_ino};
+    };
+    const auto [used0, in_place0] = complete_with("probe", 1);
+    CHECK(in_place0);
+    // A header one byte past a page, which completes in place only when the room reserved took the next page for it.
+    const size_t page = (used0 + 4095) / 4096 * 4096;
+    const auto [used, in_place] = complete_with("edge0", page + 1 - used0 + 1);
+    REQUIRE(used == page + 1);
+    CHECK(in_place);
+    std::string got;
+    object_meta m;
+    REQUIRE(r->object("bkt", "edge0", got, &m) == st::ok);
+    CHECK(got == body);
+    const std::string* sum = nullptr;
+    for (const auto& [n, v] : m.extra)
+        if (n == checksum_header(checksum_algo::crc64nvme))
+            sum = &v;
+    REQUIRE(sum);
+    CHECK(*sum == b64_of(checksum_algo::crc64nvme, body));
 }
 
 TEST_CASE("parts that are not where the object needs them are copied, from the data file and their own")
