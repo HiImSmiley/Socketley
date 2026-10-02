@@ -171,7 +171,7 @@ bool tagging_from_header(const s3_request& r, object_meta& m, s3_error& err)
 bool body_md5_ok(const s3_request& r, std::string_view body, s3_error& err)
 {
     const std::string_view md5h = r.header("content-md5");
-    if (md5h.empty())
+    if (!r.has_header("content-md5"))
         return true;
     std::string raw;
     if (!base64_decode(md5h, raw) || raw.size() != 16)
@@ -232,9 +232,10 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     c->anonymous = v.anonymous;
 
     // A client that signs its payload in chunks, talking to a runtime with no
-    // decoder for them, would have the framing stored as the object.
+    // decoder for them, would have the framing stored as the object; an empty body has none.
+    const bool has_body = r.chunked || (r.has_content_length && r.content_length > 0);
     if (!c->hook && (r.payload_hash.starts_with("STREAMING-") ||
-                     http_list_has_token(r.header("content-encoding"), "aws-chunked", 11)))
+                     (has_body && http_list_has_token(r.header("content-encoding"), "aws-chunked", 11))))
     {
         r.keep_alive = false;
         s3_error e = make_error("NotImplemented");
@@ -899,7 +900,7 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
     s3_request& r = c->req;
 
     // The digest the client promises, checked when the body is in.
-    if (const std::string_view md5h = r.header("content-md5"); !md5h.empty())
+    if (const std::string_view md5h = r.header("content-md5"); r.has_header("content-md5"))
     {
         std::string raw;
         if (!base64_decode(md5h, raw) || raw.size() != 16)

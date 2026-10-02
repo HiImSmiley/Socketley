@@ -19,7 +19,7 @@ void storage_run::op_put_cors(const std::shared_ptr<conn>& c)
         send_error_st(c, st::no_such_bucket);
         return;
     }
-    if (const std::string_view md5h = q.header("content-md5"); !md5h.empty())
+    if (const std::string_view md5h = q.header("content-md5"); q.has_header("content-md5"))
     {
         std::string raw;
         if (!base64_decode(md5h, raw) || raw.size() != 16)

@@ -504,11 +504,14 @@ bool parse_amz_date(std::string_view v, stamp& out)
     return make_stamp(y, mo, d, h, mi, s, out);
 }
 
-// The RFC 1123 form of the Date header, "Fri, 24 May 2013 00:00:00 GMT".
+// The RFC 1123 form of the Date header, "Fri, 24 May 2013 00:00:00 GMT", or its RFC 2822 zone "+0000" or "-0000" that botocore sends.
 bool parse_http_date(std::string_view v, stamp& out)
 {
     v = trim(v);
-    if (v.size() != 29 || v[3] != ',' || v[4] != ' ' || v[7] != ' ' || v[11] != ' ' || v[16] != ' ' || v[19] != ':' || v[22] != ':' || v.substr(25) != " GMT")
+    if (v.size() < 29 || v[3] != ',' || v[4] != ' ' || v[7] != ' ' || v[11] != ' ' || v[16] != ' ' || v[19] != ':' || v[22] != ':')
+        return false;
+    const std::string_view zone = v.substr(25);
+    if (zone != " GMT" && zone != " UTC" && zone != " +0000" && zone != " -0000")
         return false;
     static constexpr std::string_view months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
     int mo = 0;
