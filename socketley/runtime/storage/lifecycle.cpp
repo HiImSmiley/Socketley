@@ -39,70 +39,6 @@ bool positive_days(const xml_node& n, uint32_t& out)
     return true;
 }
 
-int64_t days_from_civil(int64_t y, unsigned m, unsigned d)
-{
-    y -= m <= 2;
-    const int64_t era = (y >= 0 ? y : y - 399) / 400;
-    const auto yoe = static_cast<unsigned>(y - era * 400);
-    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + static_cast<int64_t>(doe) - 719468;
-}
-
-// YYYY-MM-DD, optionally with THH:MM:SS, a fraction and Z or +00:00; `midnight` says whether the time was 00:00:00.000.
-bool parse_date(std::string_view s, int64_t& ms, bool& midnight)
-{
-    auto num = [&](size_t at, size_t n, unsigned& v) -> bool
-    {
-        if (at + n > s.size())
-            return false;
-        v = 0;
-        for (size_t i = at; i < at + n; ++i)
-        {
-            if (s[i] < '0' || s[i] > '9')
-                return false;
-            v = v * 10 + static_cast<unsigned>(s[i] - '0');
-        }
-        return true;
-    };
-    unsigned y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
-    if (!num(0, 4, y) || s.size() < 10 || s[4] != '-' || !num(5, 2, mo) || s[7] != '-' || !num(8, 2, d))
-        return false;
-    static constexpr unsigned month_days[] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    if (mo < 1 || mo > 12 || d < 1 || d > month_days[mo - 1])
-        return false;
-    const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    if (mo == 2 && d == 29 && !leap)
-        return false;
-    size_t at = 10;
-    bool zero_fraction = true;
-    if (at < s.size())
-    {
-        if (s[at] != 'T' || !num(at + 1, 2, h) || s.size() < at + 9 || s[at + 3] != ':' || !num(at + 4, 2, mi) ||
-            s[at + 6] != ':' || !num(at + 7, 2, se) || h > 23 || mi > 59 || se > 59)
-            return false;
-        at += 9;
-        if (at < s.size() && s[at] == '.')
-        {
-            ++at;
-            const size_t from = at;
-            while (at < s.size() && s[at] >= '0' && s[at] <= '9')
-            {
-                zero_fraction = zero_fraction && s[at] == '0';
-                ++at;
-            }
-            if (at == from)
-                return false;
-        }
-        const std::string_view zone = s.substr(at);
-        if (zone != "Z" && zone != "+00:00" && zone != "-00:00" && !zone.empty())
-            return false;
-    }
-    ms = (days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se) * 1000;
-    midnight = h == 0 && mi == 0 && se == 0 && zero_fraction;
-    return true;
-}
-
 std::string new_rule_id()
 {
     static constexpr char digits[] = "abcdefghijklmnopqrstuvwxyz234567";
@@ -343,7 +279,7 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
         if (date)
         {
             bool midnight = false;
-            if (!parse_date(date->text, r.expire_date_ms, midnight))
+            if (!parse_iso8601(date->text, r.expire_date_ms, midnight))
             {
                 err = fail("InvalidArgument", "'Date' must be an ISO 8601 date");
                 return false;
