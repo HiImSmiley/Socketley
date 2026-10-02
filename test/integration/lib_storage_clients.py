@@ -48,6 +48,11 @@ def code_of(fn):
         return e.response["Error"].get("Code"), e.response["ResponseMetadata"]["HTTPStatusCode"]
     return None, None
 
+def md5_b64(body):
+    import base64
+    import hashlib
+    return base64.b64encode(hashlib.md5(body).digest()).decode()
+
 def with_headers(c, op, headers):
     """A client that adds `headers` to every `op` before it is signed, for what this boto3 has no parameter for."""
     c.meta.events.register("before-call.s3." + op, lambda **kw: kw["params"]["headers"].update(headers))
@@ -443,23 +448,30 @@ def post_object():
 
 
 # ─── Object lock and storage classes ────────────────────────────────────────
-# Object lock is not built, and a retention taken without being kept let a "COMPLIANCE" object be deleted.
-def object_lock_refused():
-    print("=== object lock is refused, never taken and ignored ===")
+# A lock asked of a bucket without object lock is refused and nothing is stored; one with it keeps what it was told.
+def object_lock():
+    print("=== object lock is kept, or refused where the bucket has none ===")
     import datetime
-    until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
-    check("CreateBucket with object lock is NotImplemented, and makes no bucket",
-          code_of(lambda: s3.create_bucket(Bucket="cl-lock", ObjectLockEnabledForBucket=True)) == ("NotImplemented", 501) and
-          code_of(lambda: s3.head_bucket(Bucket="cl-lock"))[1] == 404)
-    check("a put with a retention is NotImplemented, and stores nothing",
+    until = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0) + datetime.timedelta(days=1)
+    check("a put with a retention into a bucket without object lock is InvalidRequest, and stores nothing",
           code_of(lambda: s3.put_object(Bucket="cl-misc", Key="locked", Body=b"x", ObjectLockMode="COMPLIANCE",
-                                        ObjectLockRetainUntilDate=until)) == ("NotImplemented", 501) and
+                                        ObjectLockRetainUntilDate=until, ContentMD5=md5_b64(b"x")))
+          == ("InvalidRequest", 400) and
           code_of(lambda: s3.head_object(Bucket="cl-misc", Key="locked"))[1] == 404)
     check("as are a legal hold and an upload with a retention",
-          code_of(lambda: s3.put_object(Bucket="cl-misc", Key="locked", Body=b"x", ObjectLockLegalHoldStatus="ON"))[0] ==
-          "NotImplemented" and
+          code_of(lambda: s3.put_object(Bucket="cl-misc", Key="locked", Body=b"x", ObjectLockLegalHoldStatus="ON",
+                                        ContentMD5=md5_b64(b"x")))[0] == "InvalidRequest" and
           code_of(lambda: s3.create_multipart_upload(Bucket="cl-misc", Key="locked", ObjectLockMode="GOVERNANCE",
-                                                     ObjectLockRetainUntilDate=until))[0] == "NotImplemented")
+                                                     ObjectLockRetainUntilDate=until))[0] == "InvalidRequest")
+    s3.create_bucket(Bucket="cl-lock", ObjectLockEnabledForBucket=True)
+    v = s3.put_object(Bucket="cl-lock", Key="locked", Body=b"x", ObjectLockMode="COMPLIANCE",
+                      ObjectLockRetainUntilDate=until, ContentMD5=md5_b64(b"x"))["VersionId"]
+    h = s3.head_object(Bucket="cl-lock", Key="locked")
+    check("a bucket made with object lock keeps a COMPLIANCE retention",
+          (h.get("ObjectLockMode"), h.get("ObjectLockRetainUntilDate")) == ("COMPLIANCE", until), h)
+    check("and refuses the removal of that version, bypass or not",
+          code_of(lambda: s3.delete_object(Bucket="cl-lock", Key="locked", VersionId=v,
+                                           BypassGovernanceRetention=True)) == ("AccessDenied", 403))
     check("a storage class S3 has is taken", code_of(lambda: s3.put_object(Bucket="cl-misc", Key="glacier", Body=b"x",
                                                                            StorageClass="GLACIER")) == (None, None))
     check("one it does not is InvalidStorageClass", code_of(lambda: s3.put_object(Bucket="cl-misc", Key="bogus", Body=b"x",
@@ -473,7 +485,7 @@ def object_lock_refused():
 # A section that raises fails as one assertion and the next still runs, so a runtime without the feature reads red, not dead.
 for section in (delete_bucket_with_uploads, date_header, empty_content_md5, aws_chunked_coding, list_buckets_paged,
                 object_attributes, conditional_writes, completion_sent_twice, full_object_checksums,
-                expiration_header, acls_disabled, bucket_tags, post_object, object_lock_refused):
+                expiration_header, acls_disabled, bucket_tags, post_object, object_lock):
     try:
         section()
     except Exception as e:
