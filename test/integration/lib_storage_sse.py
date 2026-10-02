@@ -10,7 +10,11 @@ usage: lib_storage_sse.py MODE ARGS...
   recovery PORT DATA        what main left, after a clean restart and after a SIGKILL with every
                             journal removed, read back byte for byte
   tls PORT CERT DATA        a TLS runtime with a master key: SSE-C with the right, a wrong and no
-                            key, ranges, multipart, copies between SSE-C and SSE-S3, nothing held
+                            key, ranges, multipart, copies between SSE-C and SSE-S3, nothing held;
+                            an SSE-C upload's part list bound by its key or by the master key's MAC,
+                            and a header that drops the last part of either reads nothing
+  tlsnokey PORT CERT DATA   a TLS runtime without a master key refuses an SSE-C completion that does
+                            not carry the key, leaves the upload open, and completes it with the key
   nokey PORT                a runtime without a master key refuses SSE-S3 and a bucket default
   shards NODE0 NODE1 DATA   two shards, one unix node each: a default set through one is honoured
                             by both, and every object reads alike through the owner and the other
@@ -718,6 +722,202 @@ def mode_tls(port, cert, data):
     s3.put_object(Bucket=B, Key="s3tls", Body=body, ServerSideEncryption="AES256")
     check("SSE-S3 works over TLS as well", s3.get_object(Bucket=B, Key="s3tls")["Body"].read() == body)
 
+    bound_parts(s3, data, key, other)
+
+
+# ─── an SSE-C upload's part list, bound at completion ───────────────────────
+
+PARTS_MAC = b"x-socketley-sse-parts"
+# Two parts of one size and a shorter last one, so the header's part sizes stay one number with the last dropped.
+BOUND_SIZES = [5 * MIB, 5 * MIB, MIB + 7]
+
+
+def c_args(key):
+    return {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": key}
+
+
+def c_headers(key):
+    return {"x-amz-server-side-encryption-customer-algorithm": "AES256",
+            "x-amz-server-side-encryption-customer-key": base64.b64encode(key).decode(),
+            "x-amz-server-side-encryption-customer-key-MD5": base64.b64encode(hashlib.md5(key).digest()).decode()}
+
+
+def c_upload(s3, name, key, seed, create=None):
+    """An SSE-C upload of BOUND_SIZES left open: its id, its completion list and its parts."""
+    p = [marked(n, "%s%d" % (seed, i)) for i, n in enumerate(BOUND_SIZES)]
+    uid = s3.create_multipart_upload(Bucket=B, Key=name, **c_args(key), **(create or {}))["UploadId"]
+    done = []
+    for i, part in enumerate(p, 1):
+        r = s3.upload_part(Bucket=B, Key=name, UploadId=uid, PartNumber=i, Body=part, **c_args(key))
+        done.append({"PartNumber": i, "ETag": r["ETag"]})
+    return uid, done, p
+
+
+def drop_last_part(path, h):
+    """Rewrites the header as one that names the object's parts but the last, its sizes and checksum agreeing."""
+    t = dict(h)
+    t["parts"] = h["parts"] - 1
+    t["size"] = h["size"] - BOUND_SIZES[-1]
+    write_header(path, t)
+
+
+def as_before_binding(h, key):
+    """`h` as an upload begun before part lists were bound completes without its key: a plain wrap, no MAC."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    rec = extra_of(h, b"x-socketley-sse").split(b";")
+    w = base64.b64decode(rec[5])
+    data_key = AESGCM(key).decrypt(w[:12], w[12:], b"socketley-sse-key-v2/upload")
+    nonce = os.urandom(12)
+    rec[5] = base64.b64encode(nonce + AESGCM(key).encrypt(nonce, data_key, b"socketley-sse-key-v2"))
+    t = dict(h)
+    t["extra"] = [(n, b";".join(rec) if n == b"x-socketley-sse" else v) for n, v in h["extra"] if n != PARTS_MAC]
+    return t
+
+
+def bound_parts(s3, data, key, other):
+    ka = c_args(key)
+    hdrs = c_headers(key)
+
+    # Bound by the key a completion carries, as boto3 and the AWS CLI can send it.
+    uid, done, p = c_upload(s3, "bykey", key, "bk")
+    code = err_code(lambda: s3.complete_multipart_upload(Bucket=B, Key="bykey", UploadId=uid,
+                                                         MultipartUpload={"Parts": done}, **c_args(other)))
+    check("a completion carrying another key than the upload's is refused", code == (403, "AccessDenied"), code)
+    s3.complete_multipart_upload(Bucket=B, Key="bykey", UploadId=uid, MultipartUpload={"Parts": done}, **ka)
+    check("the upload completes with its own key after that",
+          s3.get_object(Bucket=B, Key="bykey", **ka)["Body"].read() == b"".join(p))
+    path = obj_file(data, "bykey")
+    h = read_header(path)
+    check("a list bound by the key needs no MAC", h and h["crc_ok"] and extra_of(h, PARTS_MAC) is None,
+          h and h["extra"])
+    drop_last_part(path, h)
+    st, got = fetch("/%s/bykey" % B, hdrs)
+    check("a key-bound object whose header drops its last part does not open",
+          (st, xml_code(got)) == (403, "AccessDenied"), (st, got[:200]))
+    st, got = fetch("/%s/bykey?partNumber=1" % B, hdrs)
+    check("and nor does its first part by number", st == 403, (st, got[:200]))
+
+    # Bound by a MAC under the master key, when the completion does not carry the client's key.
+    uid, done, p = c_upload(s3, "bymaster", key, "bm")
+    s3.complete_multipart_upload(Bucket=B, Key="bymaster", UploadId=uid, MultipartUpload={"Parts": done})
+    check("an upload completed without its key reads back whole with the key",
+          s3.get_object(Bucket=B, Key="bymaster", **ka)["Body"].read() == b"".join(p))
+    check("and its last part by number",
+          s3.get_object(Bucket=B, Key="bymaster", PartNumber=3, **ka)["Body"].read() == p[2])
+    code = err_code(lambda: s3.get_object(Bucket=B, Key="bymaster", **c_args(other)))
+    check("while another key is still refused", code == (403, "AccessDenied"), code)
+    path = obj_file(data, "bymaster")
+    h = read_header(path)
+    mac = extra_of(h, PARTS_MAC) if h else None
+    check("its header carries the part list's MAC",
+          mac is not None and re.fullmatch(rb"[0-9a-f]{8};[0-9a-f]{64}", mac), h and h["extra"])
+
+    # Tags that bring the header's room to within a MAC of its 4 KiB edge: the upload kept room for one.
+    mac_entry = 8 + len(PARTS_MAC) + len(mac or b"")
+    sizes_room = 20 - len(extra_of(h, b"x-socketley-part-sizes") or b"")
+    want = 4096 - mac_entry // 2 - (24 + len(header_body(h)) - mac_entry + sizes_room) - (8 + len(b"x-amz-tagging"))
+    tags = []
+    for i in range(10):
+        # A tag takes its key, its value and a NUL after each, up to 128 + 256 + 2 bytes.
+        n = min(386, want)
+        if n < 4:
+            break
+        k = ("k%d" % i + "k" * 128)[:min(128, n - 2)]
+        v = "v" * (n - 2 - len(k))
+        want -= n
+        tags.append("%s=%s" % (k, v))
+    uid, done, pe = c_upload(s3, "edge", key, "edge", {"Tagging": "&".join(tags)})
+    w0 = write_bytes()
+    s3.complete_multipart_upload(Bucket=B, Key="edge", UploadId=uid, MultipartUpload={"Parts": done})
+    written = write_bytes() - w0
+    e = read_header(obj_file(data, "edge"))
+    used = 24 + len(header_body(e)) if e else 0
+    check("an upload whose header would cross 4 KiB only with its MAC is answered from a header past it",
+          want == 0 and 4096 < used <= 4096 + mac_entry and e["header_len"] == 8192, (want, used, e and e["header_len"]))
+    check("and is still linked in place, its parts not copied", written < MIB, written)
+    check("and reads back whole", s3.get_object(Bucket=B, Key="edge", **ka)["Body"].read() == b"".join(pe))
+    drop_last_part(path, h)
+    st, got = fetch("/%s/bymaster" % B, hdrs)
+    check("a MAC-bound object whose header drops its last part is a 500, not the first two parts",
+          (st, xml_code(got)) == (500, "InternalError"), (st, got[:200]))
+    st, got = fetch("/%s/bymaster?partNumber=1" % B, hdrs)
+    check("and nor does its first part read by number", st == 500, (st, got[:200]))
+    write_header(path, h)
+    st, got = fetch("/%s/bymaster" % B, hdrs)
+    check("the header as written reads again, so the refusals were the dropped part's",
+          (st, got) == (200, b"".join(p)), st)
+    t = dict(h)
+    t["extra"] = [(n, v) for n, v in h["extra"] if n != PARTS_MAC]
+    write_header(path, t)
+    st, got = fetch("/%s/bymaster" % B, hdrs)
+    check("an object of an upload begun now with its MAC removed is a 500, never read unbound",
+          (st, xml_code(got)) == (500, "InternalError"), (st, got[:200]))
+    t["parts"], t["size"] = h["parts"] - 1, h["size"] - BOUND_SIZES[-1]
+    write_header(path, t)
+    st, got = fetch("/%s/bymaster" % B, hdrs)
+    check("and so is one with its MAC and its last part both removed",
+          (st, xml_code(got)) == (500, "InternalError"), (st, got[:200]))
+    try:
+        legacy = as_before_binding(h, key)
+    except ImportError:
+        legacy = None
+        print("  SKIP: python3-cryptography is needed to write an object as before part lists were bound")
+    if legacy:
+        write_header(path, legacy)
+        st, got = fetch("/%s/bymaster" % B, hdrs)
+        check("an SSE-C object completed unbound before this change still reads",
+              (st, got) == (200, b"".join(p)), (st, got[:200]))
+        t = dict(legacy)
+        t["extra"] = legacy["extra"] + [(PARTS_MAC, b"0" * 8 + b";" + b"0" * 64)]
+        write_header(path, t)
+        st, got = fetch("/%s/bymaster" % B, hdrs)
+        check("unless it carries a MAC that does not hold", st == 500, st)
+
+    # A completion naming the customer key of an upload that has none is refused.
+    up = s3.create_multipart_upload(Bucket=B, Key="s3mpu", ServerSideEncryption="AES256")
+    r = s3.upload_part(Bucket=B, Key="s3mpu", UploadId=up["UploadId"], PartNumber=1, Body=b"x" * 1000)
+    code = err_code(lambda: s3.complete_multipart_upload(
+        Bucket=B, Key="s3mpu", UploadId=up["UploadId"],
+        MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": r["ETag"]}]}, **ka))
+    check("SSE-C headers on the completion of an SSE-S3 upload are refused", code == (400, "InvalidRequest"), code)
+
+
+def mode_tlsnokey(port, cert, data):
+    global NODE, CERT
+    NODE, CERT = port, cert
+    s3 = boto(port, https=True)
+    s3.create_bucket(Bucket=B)
+    key = os.urandom(32)
+    ka = c_args(key)
+    uid, done, p = c_upload(s3, "nomaster", key, "nm")
+    doc = "<CompleteMultipartUpload>" + "".join(
+        "<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>" % (d["PartNumber"], d["ETag"]) for d in done) + \
+        "</CompleteMultipartUpload>"
+    st, _, b = req("POST", "/%s/nomaster?uploadId=%s" % (B, uid), doc.encode())
+    check("without a master key an SSE-C completion that does not carry the key is a 400 InvalidRequest",
+          (st, xml_code(b)) == (400, "InvalidRequest"), (st, b[:300]))
+    check("which names both ways out", b"x-amz-server-side-encryption-customer" in b and b"--sse-key-file" in b,
+          b[:400])
+    check("and completes nothing", req("HEAD", "/%s/nomaster" % B, headers=c_headers(key))[0] == 404)
+    lp = s3.list_parts(Bucket=B, Key="nomaster", UploadId=uid)
+    check("the upload stays open with its parts", len(lp.get("Parts", [])) == 3, lp.get("Parts"))
+    s3.complete_multipart_upload(Bucket=B, Key="nomaster", UploadId=uid, MultipartUpload={"Parts": done}, **ka)
+    check("and completes when the key is sent",
+          s3.get_object(Bucket=B, Key="nomaster", **ka)["Body"].read() == b"".join(p))
+    path = obj_file(data, "nomaster")
+    h = read_header(path)
+    check("bound by that key alone", h and h["crc_ok"] and extra_of(h, PARTS_MAC) is None, h and h["extra"])
+    drop_last_part(path, h)
+    st, got = fetch("/%s/nomaster" % B, c_headers(key))
+    check("so a header that drops its last part does not open", (st, xml_code(got)) == (403, "AccessDenied"),
+          (st, got[:200]))
+    uid = s3.create_multipart_upload(Bucket=B, Key="plainmpu")["UploadId"]
+    r = s3.upload_part(Bucket=B, Key="plainmpu", UploadId=uid, PartNumber=1, Body=b"y" * 1000)
+    s3.complete_multipart_upload(Bucket=B, Key="plainmpu", UploadId=uid,
+                                 MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": r["ETag"]}]})
+    check("while a plain upload completes as before",
+          s3.get_object(Bucket=B, Key="plainmpu")["Body"].read() == b"y" * 1000)
+
 
 # ─── no master key ──────────────────────────────────────────────────────────
 
@@ -856,12 +1056,16 @@ def read_header(path):
                 parts=parts, key=key, ctype=ctype, extra=extra)
 
 
-def write_header(path, h):
-    """Writes `h` over the header of the file at `path`, its checksum made again, as someone who can write the disk can."""
+def header_body(h):
     def s(v):
         return struct.pack("<I", len(v)) + v
-    body = struct.pack("<QQ", h["size"], h["mtime"]) + h["md5"] + struct.pack("<I", h["parts"]) + s(h["key"]) + \
+    return struct.pack("<QQ", h["size"], h["mtime"]) + h["md5"] + struct.pack("<I", h["parts"]) + s(h["key"]) + \
         s(h["ctype"]) + struct.pack("<I", len(h["extra"])) + b"".join(s(n) + s(v) for n, v in h["extra"])
+
+
+def write_header(path, h):
+    """Writes `h` over the header of the file at `path`, its checksum made again, as someone who can write the disk can."""
+    body = header_body(h)
     pre = b"SKLOBJ\x01\x00" + struct.pack("<III", 1, h["header_len"], len(body))
     out = pre + struct.pack("<I", crc32c(pre + body)) + body
     out += b"\0" * (h["header_len"] - len(out))
@@ -1231,6 +1435,8 @@ def main():
         mode_recovery(int(sys.argv[2]), sys.argv[3])
     elif MODE == "tls":
         mode_tls(int(sys.argv[2]), sys.argv[3], sys.argv[4])
+    elif MODE == "tlsnokey":
+        mode_tlsnokey(int(sys.argv[2]), sys.argv[3], sys.argv[4])
     elif MODE == "nokey":
         mode_nokey(int(sys.argv[2]))
     elif MODE == "shards":

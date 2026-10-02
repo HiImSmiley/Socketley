@@ -2624,6 +2624,31 @@ TEST_CASE("a data key unwraps only under the key and the part list that wrapped 
     CHECK_FALSE(sse_unwrap(master, bound, out));
     CHECK_FALSE(sse_unwrap(master, wrapped, out, sse_format, &parts));
 
+    // An SSE-C upload's wrap is neither a plain one nor a bound one, so a completed object cannot pass it off as either.
+    std::string upload;
+    REQUIRE(sse_wrap(master, data, upload, sse_format, nullptr, true));
+    REQUIRE(sse_unwrap(master, upload, out, sse_format, nullptr, true));
+    CHECK(out == data);
+    CHECK_FALSE(sse_unwrap(master, upload, out));
+    CHECK_FALSE(sse_unwrap(master, upload, out, sse_format, &parts));
+    CHECK_FALSE(sse_unwrap(master, wrapped, out, sse_format, nullptr, true));
+
+    // The part list MAC is under a key of its own, and moves with the record and with the list.
+    const sse_key mac_key = sse_parts_mac_key(master);
+    CHECK(mac_key != master);
+    CHECK(mac_key == sse_parts_mac_key(master));
+    const sse_digest mac = sse_parts_mac(mac_key, "2;c;65536;p;00000000;x", parts);
+    CHECK(mac == sse_parts_mac(mac_key, "2;c;65536;p;00000000;x", parts));
+    CHECK(mac != sse_parts_mac(mac_key, "2;c;65536;p;00000000;y", parts));
+    CHECK(mac != sse_parts_mac(mac_key, "2;c;65536;p;00000000;x", other));
+    CHECK(mac != sse_parts_mac(sse_parts_mac_key(sse_random_key()), "2;c;65536;p;00000000;x", parts));
+    std::array<uint8_t, 4> kid{};
+    sse_digest got{};
+    REQUIRE(decode_parts_mac(encode_parts_mac(sse_key_id(master), mac), kid, got));
+    CHECK((kid == sse_key_id(master) && got == mac));
+    CHECK_FALSE(decode_parts_mac(encode_parts_mac(kid, mac).substr(1), kid, got));
+    CHECK_FALSE(decode_parts_mac(std::string(8, '0') + ":" + std::string(64, '0'), kid, got));
+
     sse_record r;
     r.mode     = sse_mode::c;
     r.per_part = true;

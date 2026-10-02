@@ -15,6 +15,9 @@
 #   SSE-C       over TLS only: the right key reads, a missing one is 400, another
 #               is 403, a key whose MD5 does not match is 400; the ETag is not
 #               the MD5; nothing of it is held in memory; multipart and copies
+#   SSE-C list  a completion binds the part list with the key it carries, else
+#               with a MAC under the master key, else is refused 400; a header
+#               that drops the last part, or the MAC, reads nothing
 #   refusals    SSE-C over plain HTTP, aws:kms, an unknown algorithm, AES256 on a
 #               runtime with no key, a key file others may read or of the wrong length
 #   recovery    a clean restart and a SIGKILL with every journal removed bring
@@ -60,7 +63,7 @@ has() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
 expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2', want '$3'"; fi; }
 contains() { if has "$2" "$3"; then ok "$1"; else bad "$1" "no '$3' in: $2"; fi; }
 
-RUNTIMES="sse ssetls ssenokey sses x1 x2 x3"
+RUNTIMES="sse ssetls ssenokey ssetlsnokey sses x1 x2 x3"
 cleanup() {
     for r in $RUNTIMES; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
     sleep 0.3
@@ -169,6 +172,16 @@ else
     wait_up "http://127.0.0.1:$P3/" || bad "the keyless runtime comes up" "no answer on $P3"
     run_lib "the keyless half ran" ssenokey nokey "$P3"
     "$BIN" stop ssenokey >/dev/null 2>&1
+fi
+
+# ── a TLS runtime without one, so an SSE-C completion has only the key to bind with ──
+if ! "$BIN" create storage ssetlsnokey -p "$P3" --dir "$T/tlsnokey" --anonymous \
+        --tls --cert "$CERTS/srv.pem" --key "$CERTS/srv-key.pem" -s >/dev/null 2>&1; then
+    bad "create with --tls and no key" "the runtime was not created"
+else
+    wait_up "https://localhost:$P3/" --cacert "$CERTS/srv.pem" || bad "the keyless TLS runtime comes up" "no answer on $P3"
+    run_lib "the keyless TLS half ran" ssetlsnokey tlsnokey "$P3" "$CERTS/srv.pem" "$T/tlsnokey"
+    "$BIN" stop ssetlsnokey >/dev/null 2>&1
 fi
 
 # ── two shards ──────────────────────────────────────────────────────────────
