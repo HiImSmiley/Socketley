@@ -16,6 +16,7 @@
 #               Delete, each with S3's record: the key form-encoded, size, eTag,
 #               versionId and a growing sequencer
 #   filters     prefix and suffix rules send exactly the keys they match
+#   vhost       a virtual-hosted PUT's event names the bucket its Host gave
 #   https       an https webhook whose certificate the target's ca= file trusts
 #   requester   userIdentity is the signed request's user, "anonymous" for one a
 #               bucket policy let in or on an --anonymous runtime, and
@@ -139,7 +140,8 @@ out=$("$BIN" create storage nbad -p "$P1" --dir "$SOCKETLEY_TMPD/bad" --anonymou
 
 # ── one shard ───────────────────────────────────────────────────────────────
 DATA="$SOCKETLEY_TMPD/objects"
-if ! "$BIN" create storage nt -p "$P1" --dir "$DATA" --anonymous --notify-targets "$TARGETS" -s >/dev/null 2>&1; then
+if ! "$BIN" create storage nt -p "$P1" --dir "$DATA" --anonymous --notify-targets "$TARGETS" \
+     --domain s3.notify.test -s >/dev/null 2>&1; then
     echo "  FAIL [create]: the runtime was not created"
     exit 1
 fi

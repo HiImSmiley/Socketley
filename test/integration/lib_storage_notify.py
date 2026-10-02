@@ -340,6 +340,13 @@ def mode_main(port, hook_port, other_port):
     check("it is POSTed as JSON with an event id to deduplicate by",
           hk.get("Content-Type") == "application/json" and hk.get("X-Socketley-Event-Id", "").isdigit(), hk)
 
+    # A virtual-hosted request names its bucket in the Host, and its event names the bucket and the key it parsed.
+    st, _, _ = req("PUT", "/c/vhost/key", b"vhost", {"Host": "%s.s3.notify.test:%d" % (B, port)})
+    check("a virtual-hosted PUT is answered", st == 200, st)
+    check("its event names the bucket from the Host and the whole path as the key",
+          wait_event(hook, "c/vhost/key", "ObjectCreated:Put") and
+          [r["s3"]["bucket"]["name"] for _, r in events_for(hook, "c/vhost/key")] == [B], events_for(hook, "c/vhost/key"))
+
     # Every other event.
     st, _, _ = post_form(B, "c/form", b"by a form")
     check("a form upload is answered", st in (200, 204), st)

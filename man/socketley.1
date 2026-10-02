@@ -12525,6 +12525,23 @@ runtime holding data anyone wants (see Bucket lifecycle).
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_STORAGE_NOTIFY_HOSTS
+A test aid: a file of
+.I name address
+lines that the resolver of a storage runtime's notification webhooks reads before
+the system resolver, on every resolve, so a test can point a webhook's host name at
+another address. Unset, only the system resolver is asked (see Event notifications).
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_STORAGE_NOTIFY_QUEUE
+The most events a storage shard holds undelivered, beyond which a new one is
+dropped and counted in
+.BR notify_dropped .
+Default: 10000. A test lowers it to reach the bound.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_STORAGE_RECOVERY_THREADS
 How many threads a storage worker reads its object headers on at a start after a
 stop that was not clean, 1 to 64. Default: the CPUs the worker may run on, at most
