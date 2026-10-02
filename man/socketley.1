@@ -848,6 +848,17 @@ first:
 socketley edit api \-p 9001
 socketley restart api
 .fi
+.IP
+A runtime's new worker is forked only once its previous worker has exited, since
+that process holds the ports, unix paths and files until then; the
+.BR start ,
+.B reload
+or
+.B create \-s
+that brought it up answers after that fork, and the daemon serves everything else
+meanwhile. The previous worker is given five seconds before it is killed, or a
+cache writing its dump that dump's own bound, so a command can outlast the CLI's
+five-second wait for an answer while the runtime still comes up.
 .TP
 .BI "reload " "name|pattern" "..."
 Restart one or more running runtimes (stop + start). Accepts multiple
@@ -7979,7 +7990,11 @@ in the directory until its stop is done, and a start waits up to a second and a
 half, in all, for the process it replaces on its shard and for every process still
 holding a shard under another
 .BR \-\-shards ,
-whose files it takes over, and fails if they do not let go. A request a shard has
+whose files it takes over, and fails if they do not let go \(em a safety net, since
+the daemon forks a runtime's workers only once its previous ones have exited
+(see
+.BR restart ).
+A request a shard has
 sent a sibling and not had answered when the stop comes is answered as failed, so
 it does not hold the stop.
 .PP
