@@ -2945,3 +2945,177 @@ TEST_CASE("a sealed pooled put whose rename a crash took is rolled forward by th
         CHECK(back == v2);
     }
 }
+
+TEST_CASE("a retention and a legal hold take a slot of their own, keep the tags beside them, and survive a torn write")
+{
+    object_meta m;
+    m.size     = 5;
+    m.mtime_ms = 1700000000000;
+    m.md5      = md5_of("bytes");
+    set_tags_extra(m, std::string("a\0" "1\0", 4));
+    std::string h = encode_object_header("key", m);
+    decoded_header d = decode_object_header(h);
+    REQUIRE(d.status == header_status::ok);
+
+    // A tag change of a version that never had a lock writes the slot an older binary reads.
+    uint64_t at = 0;
+    std::string slot = encode_tag_slot(d, std::string("b\0" "2\0", 4), at);
+    REQUIRE_FALSE(slot.empty());
+    CHECK(slot.substr(0, 8) == std::string_view("SKLTAG\x01\x00", 8));
+    h.replace(at, slot.size(), slot);
+    d = decode_object_header(h);
+    REQUIRE(d.status == header_status::ok);
+    CHECK_FALSE(d.lock_slot);
+
+    // A retention: the slot holds the tags, the retention and the hold, and the header reads as the change made it.
+    object_meta want = d.meta;
+    set_retention_extra(want, retention{lock_mode::governance, 1800000000000});
+    slot = encode_tag_slot(d, want, at);
+    REQUIRE_FALSE(slot.empty());
+    CHECK(slot.substr(0, 8) == std::string_view("SKLTAG\x02\x00", 8));
+    h.replace(at, slot.size(), slot);
+    d = decode_object_header(h);
+    REQUIRE(d.status == header_status::ok);
+    CHECK(d.lock_slot);
+    CHECK(d.meta == want);
+
+    // A legal hold and new tags after it keep the retention, in the other slot.
+    const uint64_t before_at = at;
+    want = d.meta;
+    set_tags_extra(want, std::string("c\0" "3\0", 4));
+    set_retention_extra(want, retention_of(want));
+    set_legal_hold_extra(want, "ON");
+    slot = encode_tag_slot(d, want, at);
+    REQUIRE_FALSE(slot.empty());
+    CHECK(at != before_at);
+    h.replace(at, slot.size(), slot);
+    d = decode_object_header(h);
+    REQUIRE(d.status == header_status::ok);
+    CHECK(d.meta == want);
+    CHECK(retention_of(d.meta) == retention{lock_mode::governance, 1800000000000});
+    CHECK(legal_hold_of(d.meta) == "ON");
+    CHECK(tags_of(d.meta) == std::string("c\0" "3\0", 4));
+
+    // Torn: the slot before it is the truth again, without the hold and with the tags it had.
+    h[at + 30] ^= 0x01;
+    d = decode_object_header(h);
+    REQUIRE(d.status == header_status::ok);
+    CHECK(legal_hold_of(d.meta).empty());
+    CHECK(retention_of(d.meta).mode == lock_mode::governance);
+    CHECK(tags_of(d.meta) == std::string("b\0" "2\0", 4));
+
+    // A retention removed in a slot stays removed over the one the header was written with.
+    object_meta locked = m;
+    set_retention_extra(locked, retention{lock_mode::compliance, 1900000000000});
+    std::string h2 = encode_object_header("key", locked);
+    decoded_header d2 = decode_object_header(h2);
+    object_meta none = d2.meta;
+    set_retention_extra(none, retention{});
+    slot = encode_tag_slot(d2, none, at);
+    REQUIRE_FALSE(slot.empty());
+    h2.replace(at, slot.size(), slot);
+    d2 = decode_object_header(h2);
+    REQUIRE(d2.status == header_status::ok);
+    CHECK(retention_of(d2.meta).mode == lock_mode::none);
+    // And a tag change after it does not bring the header's retention back.
+    slot = encode_tag_slot(d2, std::string("z\0" "9\0", 4), at);
+    REQUIRE_FALSE(slot.empty());
+    h2.replace(at, slot.size(), slot);
+    d2 = decode_object_header(h2);
+    CHECK(retention_of(d2.meta).mode == lock_mode::none);
+    CHECK(tags_of(d2.meta) == std::string("z\0" "9\0", 4));
+}
+
+TEST_CASE("what a lock lets go: a legal hold nothing, COMPLIANCE nothing until it runs out, GOVERNANCE the bypass")
+{
+    const int64_t now = 1800000000000;
+    object_meta m;
+    CHECK_FALSE(lock_holds(m, now, false));
+    set_retention_extra(m, retention{lock_mode::governance, now + 1});
+    CHECK(lock_holds(m, now, false));
+    CHECK_FALSE(lock_holds(m, now, true));
+    CHECK_FALSE(lock_holds(m, now + 1, false));
+    set_retention_extra(m, retention{lock_mode::compliance, now + 1});
+    CHECK(lock_holds(m, now, true));
+    CHECK_FALSE(lock_holds(m, now + 1, true));
+    set_legal_hold_extra(m, "ON");
+    CHECK(lock_holds(m, now + 5, true));
+    set_legal_hold_extra(m, "OFF");
+    CHECK_FALSE(lock_holds(m, now + 5, true));
+
+    const retention gov{lock_mode::governance, now + 100};
+    const retention comp{lock_mode::compliance, now + 100};
+    CHECK(retention_change_allowed(gov, retention{lock_mode::governance, now + 200}, now, false));
+    CHECK_FALSE(retention_change_allowed(gov, retention{lock_mode::governance, now + 50}, now, false));
+    CHECK(retention_change_allowed(gov, retention{lock_mode::governance, now + 50}, now, true));
+    CHECK_FALSE(retention_change_allowed(gov, comp, now, false));
+    CHECK(retention_change_allowed(gov, comp, now, true));
+    CHECK_FALSE(retention_change_allowed(gov, retention{}, now, false));
+    CHECK(retention_change_allowed(comp, retention{lock_mode::compliance, now + 100}, now, false));
+    CHECK(retention_change_allowed(comp, retention{lock_mode::compliance, now + 101}, now, false));
+    CHECK_FALSE(retention_change_allowed(comp, retention{lock_mode::compliance, now + 99}, now, true));
+    CHECK_FALSE(retention_change_allowed(comp, gov, now, true));
+    CHECK_FALSE(retention_change_allowed(comp, retention{}, now, true));
+    // Run out, it is no retention at all.
+    CHECK(retention_change_allowed(comp, retention{}, now + 100, false));
+}
+
+TEST_CASE("the store refuses to remove a locked version, lets the bypass lift GOVERNANCE, and reads the lock from the file")
+{
+    tmpdir d;
+    auto change = [](rig& r, const std::string& key, const std::string& id, header_change c)
+    {
+        st got = st::io_error;
+        bool fired = false;
+        r.store->change_header("bkt", key, id, std::move(c), [&](st s, std::string) { got = s; fired = true; });
+        REQUIRE(r.until([&] { return fired; }));
+        return got;
+    };
+    auto purge = [](rig& r, const std::string& key, const std::string& id, bool bypass)
+    {
+        st got = st::io_error;
+        bool fired = false;
+        r.store->remove_version("bkt", key, id, [&](remove_result rr) { got = rr.status; fired = true; }, bypass);
+        REQUIRE(r.until([&] { return fired; }));
+        return got;
+    };
+    using kind = header_change::kind;
+    const int64_t later = 4102444800000;
+    std::string g, c;
+    {
+        rig r(d.path);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        r.set_doc(bucket_doc::versioning, "bkt",
+                  "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>");
+        g = version_of(r.put("bkt", "g", "governed").meta).id;
+        c = version_of(r.put("bkt", "c", "complied").meta).id;
+        CHECK(change(r, "g", g, {kind::retention, retention_value({lock_mode::governance, later}), false}) == st::ok);
+        CHECK(change(r, "c", c, {kind::retention, retention_value({lock_mode::compliance, later}), false}) == st::ok);
+        CHECK(change(r, "c", c, {kind::retention, retention_value({lock_mode::compliance, later - 1}), true}) ==
+              st::locked);
+        CHECK(change(r, "g", g, {kind::legal_hold, "ON", false}) == st::ok);
+        CHECK(purge(r, "g", g, true) == st::locked);
+        CHECK(change(r, "g", g, {kind::legal_hold, "OFF", false}) == st::ok);
+        CHECK(purge(r, "g", g, false) == st::locked);
+        CHECK(purge(r, "c", c, true) == st::locked);
+        // A delete marker in front of a locked version is no removal of it.
+        CHECK(r.del("bkt", "c") == st::ok);
+        CHECK(r.store->find_version("bkt", "c", c) != nullptr);
+        r.settle();
+    }
+    // The journals gone, the files alone say what is locked.
+    for (const auto& e : fs::directory_iterator(d.path + "/bkt"))
+        if (e.path().filename().string().starts_with("index."))
+            fs::remove(e.path());
+    rig again(d.path);
+    const object_meta* gm = again.store->find_version("bkt", "g", g);
+    const object_meta* cm = again.store->find_version("bkt", "c", c);
+    REQUIRE(gm != nullptr);
+    REQUIRE(cm != nullptr);
+    CHECK(retention_of(*gm) == retention{lock_mode::governance, later});
+    CHECK(legal_hold_of(*gm) == "OFF");
+    CHECK(retention_of(*cm) == retention{lock_mode::compliance, later});
+    CHECK(purge(again, "c", c, true) == st::locked);
+    CHECK(purge(again, "g", g, true) == st::ok);
+    CHECK(again.store->find_version("bkt", "g", g) == nullptr);
+}
