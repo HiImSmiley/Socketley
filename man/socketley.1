@@ -1327,6 +1327,10 @@ sse_key_file	string	T{
 .ad l
 The SSE\-S3 master key file, as \fB\-\-sse\-key\-file\fR \fB(requires restart)\fR
 T}
+domain	string	T{
+.ad l
+The domains of virtual\-hosted\-style addressing, comma\-separated, as \fB\-\-domain\fR \fB(requires restart)\fR
+T}
 .TE
 .PP
 .B Cache fields:
@@ -6114,7 +6118,9 @@ socketley create storage media \-p 9000 \-\-dir /srv/objects \\
 .fi
 .PP
 It runs in a worker process of its own like every other runtime, speaks
-HTTP/1.1 with path\-style addressing (\fB/bucket/key\fR), answers errors as S3 XML
+HTTP/1.1 with path\-style addressing (\fB/bucket/key\fR) and, given
+.BR \-\-domain ,
+virtual\-hosted style (\fBbucket.domain/key\fR) as well, answers errors as S3 XML
 (\fB<Error><Code>\fR\|.\|.\|.) and stamps every reply with an
 .BR x\-amz\-request\-id .
 The flags below are the runtime's own;
@@ -6193,6 +6199,21 @@ opened by another, and is answered
 saying so. See
 .BR "Server\-side encryption" .
 .TP
+.BI \-\-domain " name" [, name ...]
+The domains the endpoint is reached under, such as
+.BR s3.example.com :
+a request whose
+.B Host
+is
+.IB bucket . domain
+(with or without a port) addresses that bucket, and its whole path is the key.
+A Host equal to one of the domains, an address, or any other name is path style
+as without the flag, so both styles are served at once. Names are DNS names,
+compared without regard to case; anything else is refused at
+.BR create .
+See
+.BR "Virtual\-hosted\-style addressing" .
+.TP
 .B \-\-anonymous
 Accept requests that carry no credentials at all. Required unless
 credentials are given: a runtime made with neither is refused, so an endpoint is
@@ -6231,7 +6252,7 @@ and stores nothing, and the quota can be changed on a serving runtime with
 .PP
 .B edit
 does not change these; \fBimport\fR does, as it does for a cache, and
-refuses to move \fBdir\fR, \fBanonymous\fR or the access key, secret key,
+refuses to move \fBdir\fR, \fBanonymous\fR, \fBdomain\fR or the access key, secret key,
 credentials file or SSE key file while the runtime is running (the contents of a credentials
 file are re\-read by themselves). The quota and the expiry move under a serving
 runtime.
@@ -6573,6 +6594,70 @@ by a runtime with
 .BR \-\-anonymous ,
 or where the bucket policy lets anyone put the key. Either way the bucket policy and
 a script's on_request see it as PutObject.
+.SS Virtual\-hosted\-style addressing
+S3 clients address a bucket by host name by default against AWS
+(\fBhttps://\fIbucket\fB.s3.amazonaws.com/\fIkey\fR), and most can be told to
+against a custom endpoint. Given
+.BR "\-\-domain s3.example.com" ,
+a request with
+.B "Host: photos.s3.example.com"
+and path
+.B /2024/a.jpg
+is the object
+.B 2024/a.jpg
+in bucket
+.BR photos ,
+exactly as
+.B /photos/2024/a.jpg
+is with
+.B "Host: s3.example.com"
+or with any Host that is not a subdomain of a domain given, an address
+included. Everything before the domain is the bucket, dots and all; with
+several domains the longest that fits decides, and a Host equal to one is that
+endpoint, so
+.B "\-\-domain example.com,s3.example.com"
+reads
+.B s3.example.com
+as the endpoint and not as bucket
+.BR s3 .
+.PP
+The signature needs nothing of its own: SigV4 signs the path as sent and the
+Host header, so a virtual\-hosted request is verified over
+.BI / key
+and its own host, and a presigned URL in either style verifies as it was
+written. What the runtime writes back follows the style of the request: the
+.B Location
+of CreateBucket
+.RB ( / bucket
+path style, the bucket's URL virtual\-hosted), of a form upload and in
+.BR CompleteMultipartUploadResult .
+.B x\-amz\-copy\-source
+names
+.IB bucket / key
+in both styles, as in S3. Clients need the bucket names to resolve to the
+runtime: a wildcard DNS record
+.RB ( *.s3.example.com ),
+or on one machine
+.B \-\-domain localhost
+since glibc resolves every
+.IB name .localhost
+to the loopback. The usual settings are boto3's
+.B "addressing_style: virtual"
+(in the AWS CLI's config,
+.BR "s3 = addressing_style = virtual" ),
+rclone's
+.B "force_path_style = false"
+and mc's
+.BR "\-\-path off" .
+.PP
+A bucket whose name is not a single DNS label \(em one with dots \(em is still
+served path style, and the clients fall back to it for such names over TLS. Over
+.B \-\-tls
+the certificate must cover every bucket's host name, which takes a wildcard
+certificate for
+.BI *. domain
+next to the domain itself; a wildcard matches one label only, so a bucket with
+dots in its name fails verification virtual\-hosted and is reached path style.
 .SS Authentication
 Requests are verified as AWS Signature Version 4, in both forms: the
 .B Authorization
