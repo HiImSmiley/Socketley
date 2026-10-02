@@ -643,16 +643,7 @@ void put_op::finish_now()
             fail(st::bad_digest);
             return;
         }
-        const std::string_view name = checksum_header(m_hs->ck->algo());
-        bool stored = false;
-        for (auto& [n, v] : m_meta.extra)
-            if (n == name)
-            {
-                v      = got;
-                stored = true;
-            }
-        if (!stored)
-            m_meta.extra.emplace_back(std::string(name), got);
+        set_checksum(m_meta, m_hs->ck->algo(), got);
     }
 
     // The version goes into the header before the body is synced, so the owner need not write the header again

@@ -511,11 +511,25 @@ private:
     std::string        m_resume_at;
 };
 
+// "Checksum" and the algorithm's name, which is how the XML spells the element.
+inline std::string checksum_element(checksum_algo a, std::string_view value_b64)
+{
+    if (a == checksum_algo::none || value_b64.empty())
+        return {};
+    const std::string name = "Checksum" + std::string(checksum_name(a));
+    return "<" + name + ">" + xml_escape(value_b64) + "</" + name + ">";
+}
+
 inline std::string copy_result_xml(const object_meta& m)
 {
     std::string x(xml_decl);
     x += "<CopyObjectResult xmlns=\"" + std::string(s3_xmlns) + "\"><LastModified>" +
-         iso8601(m.mtime_ms) + "</LastModified><ETag>" + quoted_etag(m) + "</ETag></CopyObjectResult>";
+         iso8601(m.mtime_ms) + "</LastModified><ETag>" + quoted_etag(m) + "</ETag>";
+    // A copy's checksum is always of its whole bytes.
+    for (const auto& [n, v] : m.extra)
+        if (const checksum_algo a = checksum_from_header(n); a != checksum_algo::none)
+            x += "<ChecksumType>FULL_OBJECT</ChecksumType>" + checksum_element(a, v);
+    x += "</CopyObjectResult>";
     return x;
 }
 

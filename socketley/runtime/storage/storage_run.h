@@ -174,6 +174,9 @@ struct checksum_request
 // or names two that disagree.
 bool parse_checksum_request(const s3_request& r, checksum_request& out, s3_error& err);
 
+// The algorithm x-amz-checksum-algorithm names, none without it; false with `err` for one the runtime cannot take.
+bool checksum_algorithm_header(const s3_request& r, checksum_algo& out, s3_error& err);
+
 // The tags an x-amz-tagging header names, put into `m`; false with `err` when S3 would refuse them.
 bool tagging_from_header(const s3_request& r, object_meta& m, s3_error& err);
 
@@ -734,7 +737,7 @@ public:
     // CopyObject when the source or the copy is encrypted, which a copy of the bytes cannot be.
     void copy_sealed(const std::shared_ptr<conn>& c, std::string src_bucket, std::string src_key,
                      std::string src_version, object_meta meta, const object_meta& src, const sse_ask& dst,
-                     std::optional<sse_key> src_customer, std::string source_id);
+                     std::optional<sse_key> src_customer, std::string source_id, checksum_algo algo);
 
     // Multipart, in storage_multipart.cpp.
     void op_create_multipart(const std::shared_ptr<conn>& c);

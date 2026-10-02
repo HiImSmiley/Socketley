@@ -660,13 +660,15 @@ void storage_run::feed_copy(const std::shared_ptr<conn>& c, std::shared_ptr<put_
 
 void storage_run::copy_sealed(const std::shared_ptr<conn>& c, std::string src_bucket, std::string src_key,
                               std::string src_version, object_meta meta, const object_meta& src, const sse_ask& dst,
-                              std::optional<sse_key> src_customer, std::string source_id)
+                              std::optional<sse_key> src_customer, std::string source_id, checksum_algo algo)
 {
     s3_request& r = c->req;
     // The copy is one stream of its own, under a key of its own, and a version only its owner gives.
     std::erase_if(meta.extra, [](const auto& e) { return e.first == sse_extra; });
     clear_part_layout(meta);
     clear_version_extra(meta);
+    // The checksum is taken of the bytes read, since the source opened below may be newer than `src`.
+    const bool take_checksum = copy_checksum(meta, object_meta{}, algo);
     sse_seal_spec seal;
     if (s3_error err; dst.mode != sse_mode::none && !sse_new_key(dst, false, meta, seal, err))
     {
@@ -683,6 +685,8 @@ void storage_run::copy_sealed(const std::shared_ptr<conn>& c, std::string src_bu
     }
     op->set_cause(change_cause::copy);
     op->set_origin(origin_of(*c));
+    if (take_checksum)
+        op->track_checksum(algo, {});
     if (dst.mode != sse_mode::none)
         ++m_c.sse_puts;
     feed_copy(c, std::move(op), src_bucket, src_key, src_version, std::move(src_customer), 0, src.size,

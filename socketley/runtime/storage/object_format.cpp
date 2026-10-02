@@ -563,6 +563,30 @@ void clear_part_layout(object_meta& m)
                   });
 }
 
+bool copy_checksum(object_meta& copy, const object_meta& src, checksum_algo algo)
+{
+    std::erase_if(copy.extra, [](const auto& e) { return is_checksum_header(e.first); });
+    if (algo == checksum_algo::none)
+        return false;
+    // A composite value, with its -N, is of the source's parts and not of the bytes the copy holds.
+    const std::string* have = extra_of(src, checksum_header(algo));
+    const bool whole = have && have->find('-') == std::string::npos;
+    copy.extra.emplace_back(std::string(checksum_header(algo)),
+                            whole ? *have : std::string(checksum_b64_len(algo), 'A'));
+    return !whole;
+}
+
+void set_checksum(object_meta& m, checksum_algo algo, std::string b64)
+{
+    for (auto& [n, v] : m.extra)
+        if (n == checksum_header(algo))
+        {
+            v = std::move(b64);
+            return;
+        }
+    m.extra.emplace_back(std::string(checksum_header(algo)), std::move(b64));
+}
+
 bool part_trailer_of(const object_meta& m, part_trailer& out)
 {
     const std::string* v = extra_of(m, part_layout_extra);

@@ -150,6 +150,21 @@ bool parse_checksum_request(const s3_request& r, checksum_request& out, s3_error
     return true;
 }
 
+bool checksum_algorithm_header(const s3_request& r, checksum_algo& out, s3_error& err)
+{
+    out = checksum_algo::none;
+    const std::string_view name = r.header("x-amz-checksum-algorithm");
+    if (name.empty())
+        return true;
+    out = checksum_from_name(name);
+    if (out != checksum_algo::none)
+        return true;
+    err = make_error("InvalidRequest");
+    err.message = "Checksum algorithm provided is unsupported. Please try again with any of the valid types: "
+                  "[CRC32, CRC32C, CRC64NVME, SHA1, SHA256]";
+    return false;
+}
+
 bool tagging_from_header(const s3_request& r, object_meta& m, s3_error& err)
 {
     if (!r.has_header("x-amz-tagging"))
@@ -1464,11 +1479,16 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
     // What the copy is encrypted with, and the key that opens its source, are refused before anything is read.
     sse_ask dst;
     std::optional<sse_key> src_customer;
-    if (s3_error err; !sse_for_write(c, r.bucket, dst, err) || !sse_customer(c, sse_c_copy_prefix, src_customer, err))
+    // The copy's checksum is of its own bytes, in the algorithm the request names or else its source's, as in S3.
+    checksum_algo algo = checksum_algo::none;
+    if (s3_error err; !sse_for_write(c, r.bucket, dst, err) || !sse_customer(c, sse_c_copy_prefix, src_customer, err) ||
+                      !checksum_algorithm_header(r, algo, err))
     {
         send_error(c, err);
         return;
     }
+    if (algo == checksum_algo::none)
+        algo = checksum_algo_of(src);
     if (sse_key probe{}; is_encrypted(src) || src_customer)
     {
         s3_error err;
@@ -1555,10 +1575,10 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
     if (is_encrypted(src) || dst.mode != sse_mode::none)
     {
         copy_sealed(c, std::move(src_bucket), std::move(src_key), std::move(src_version), std::move(meta), src, dst,
-                    std::move(src_customer), source_id);
+                    std::move(src_customer), source_id, algo);
         return;
     }
-    m_store.copy(src_bucket, src_key, std::move(src_version), r.bucket, r.key, std::move(meta),
+    m_store.copy(src_bucket, src_key, std::move(src_version), r.bucket, r.key, std::move(meta), algo,
                  [this, weak, source_id](put_result p)
     {
         auto cc = weak.lock();

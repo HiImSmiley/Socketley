@@ -176,15 +176,6 @@ inline std::string initiate_multipart_xml(std::string_view bucket, std::string_v
     return x;
 }
 
-// "Checksum" and the algorithm's name, which is how the XML spells the element.
-inline std::string checksum_element(checksum_algo a, std::string_view value_b64)
-{
-    if (a == checksum_algo::none || value_b64.empty())
-        return {};
-    const std::string name = "Checksum" + std::string(checksum_name(a));
-    return "<" + name + ">" + xml_escape(value_b64) + "</" + name + ">";
-}
-
 inline std::string complete_multipart_xml(std::string_view location, std::string_view bucket,
                                           std::string_view key, std::string_view etag,
                                           checksum_algo algo, std::string_view checksum_b64)

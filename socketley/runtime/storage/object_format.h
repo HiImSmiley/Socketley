@@ -92,6 +92,13 @@ bool part_list_of(const object_meta& m, part_list& out);
 // Removes what `m` records of its parts, for a copy that is one part whatever its source was.
 void clear_part_layout(object_meta& m);
 
+// Gives `copy` the checksum `algo` of its whole bytes in place of any other: `src`'s own when that is one, else a
+// placeholder of its length; true when the value must be taken from the bytes.
+bool copy_checksum(object_meta& copy, const object_meta& src, checksum_algo algo);
+
+// Puts `b64` in place of `m`'s value of `algo`.
+void set_checksum(object_meta& m, checksum_algo algo, std::string b64);
+
 // The list in one canonical encoding, of 20 + 12 bytes per part, which is what a digest of it is taken over;
 // a list with checksums is 24 bytes and then 12 and the checksum's width per part.
 std::string encode_part_list(const part_list& l, uint64_t total);

@@ -791,14 +791,15 @@ public:
     }
 
     // A new body made of an existing object's, or of its version `src_version` when that is not empty, with the
-    // metadata `meta` names.
+    // metadata `meta` names and the checksum `algo` of its bytes, or none.
     void copy(std::string_view src_bucket, std::string_view src_key, std::string src_version,
-              std::string_view dst_bucket, std::string_view dst_key, object_meta meta,
+              std::string_view dst_bucket, std::string_view dst_key, object_meta meta, checksum_algo algo,
               std::function<void(put_result)> cb, change_origin who = {});
     void copy(std::string_view src_bucket, std::string_view src_key, std::string_view dst_bucket,
-              std::string_view dst_key, object_meta meta, std::function<void(put_result)> cb)
+              std::string_view dst_key, object_meta meta, std::function<void(put_result)> cb,
+              checksum_algo algo = checksum_algo::none)
     {
-        copy(src_bucket, src_key, {}, dst_bucket, dst_key, std::move(meta), std::move(cb));
+        copy(src_bucket, src_key, {}, dst_bucket, dst_key, std::move(meta), algo, std::move(cb));
     }
 
     // ── Versions ────────────────────────────────────────────────────────────

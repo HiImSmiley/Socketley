@@ -115,17 +115,10 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
         return;
     }
     checksum_algo algo = checksum_algo::none;
-    if (const std::string_view name = r.header("x-amz-checksum-algorithm"); !name.empty())
+    if (!checksum_algorithm_header(r, algo, err))
     {
-        algo = checksum_from_name(name);
-        if (algo == checksum_algo::none)
-        {
-            err = make_error("InvalidRequest");
-            err.message = "Checksum algorithm provided is unsupported. Please try again with any of the valid types: "
-                          "[CRC32, CRC32C, CRC64NVME, SHA1, SHA256]";
-            send_error(c, err);
-            return;
-        }
+        send_error(c, err);
+        return;
     }
     // S3 combines only a CRC into the checksum of the whole object, and CRC64NVME into nothing else.
     const std::string_view type = r.header("x-amz-checksum-type");

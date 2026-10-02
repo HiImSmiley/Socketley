@@ -2295,9 +2295,12 @@ struct copy_state
     uint64_t    copied{0};
     uint64_t    reserved{0};
     std::string buf;
-    // The ETag is taken from the bytes, and the header written again with it.
+    // The ETag, the checksum or both are taken from the bytes, and the header written again with them.
     bool        rehash{false};
+    bool        new_md5{false};
     md5_stream  digest;
+    checksum_algo algo{checksum_algo::none};
+    std::unique_ptr<checksum_stream> ck;
     std::string header;
     change_origin who;
     std::function<void(put_result)> cb;
@@ -2306,7 +2309,7 @@ struct copy_state
 }   // namespace
 
 void object_store::copy(std::string_view src_bucket, std::string_view src_key, std::string src_version,
-                        std::string_view dst_bucket, std::string_view dst_key, object_meta meta,
+                        std::string_view dst_bucket, std::string_view dst_key, object_meta meta, checksum_algo algo,
                         std::function<void(put_result)> cb, change_origin who)
 {
     bucket* sb = find_bucket(src_bucket);
@@ -2328,6 +2331,7 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
     cs->meta       = std::move(meta);
     cs->cb         = std::move(cb);
     cs->who        = std::move(who);
+    cs->algo       = algo;
     // The copy is a new object, whose version only its owner gives.
     clear_version_extra(cs->meta);
     ++db->active_ops;
@@ -2387,8 +2391,12 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
             // A copy is one part, as in S3, so a multipart source's ETag is replaced by the MD5 of its bytes.
             cs->meta.md5    = o.meta.md5;
             cs->meta.parts  = 0;
-            cs->rehash      = o.meta.parts != 0;
+            cs->new_md5     = o.meta.parts != 0;
             clear_part_layout(cs->meta);
+            // Its checksum is of its whole bytes too, which the source's header is the one to say it has.
+            if (copy_checksum(cs->meta, o.meta, cs->algo))
+                cs->ck = std::make_unique<checksum_stream>(cs->algo);
+            cs->rehash = cs->new_md5 || cs->ck;
             cs->meta.mtime_ms = static_cast<int64_t>(now_ms());
 
             bucket* bp = find_bucket(cs->dst_bucket);
@@ -2424,9 +2432,12 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
                         auto self = wpump.lock();
                         if (cs->copied >= cs->meta.size && cs->rehash)
                         {
-                            cs->rehash   = false;
-                            cs->meta.md5 = cs->digest.finish();
-                            cs->header   = encode_object_header(cs->dst_key, cs->meta);
+                            cs->rehash = false;
+                            if (cs->new_md5)
+                                cs->meta.md5 = cs->digest.finish();
+                            if (cs->ck)
+                                set_checksum(cs->meta, cs->algo, cs->ck->peek_b64());
+                            cs->header = encode_object_header(cs->dst_key, cs->meta);
                             const bool qh = cs->header.size() == cs->hdr_len &&
                                 m_io->pwrite(cs->dst_fd, cs->header.data(), static_cast<uint32_t>(cs->header.size()), 0,
                                     [alive, cs, finish, self](int64_t rh)
@@ -2506,8 +2517,10 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
                                             (*finish)({errno_status(rw), cs->meta});
                                             return;
                                         }
-                                        if (cs->rehash)
+                                        if (cs->new_md5)
                                             cs->digest.update(cs->buf.data(), static_cast<size_t>(rn));
+                                        if (cs->ck)
+                                            cs->ck->update(cs->buf.data(), static_cast<size_t>(rn));
                                         cs->copied += static_cast<uint64_t>(rn);
                                         if (self)
                                             (*self)();
