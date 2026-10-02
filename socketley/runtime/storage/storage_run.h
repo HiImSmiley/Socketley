@@ -24,6 +24,7 @@
 #include "checksum.h"
 #include "multipart.h"
 #include "object_store.h"
+#include "post_policy.h"
 #include "s3_auth.h"
 #include "../../shared/storage_rpc.h"
 #include "shard_node.h"
@@ -121,6 +122,8 @@ struct s3_request
     bool   chunked{false};
     bool   keep_alive{true};
     bool   expect_continue{false};
+    // A browser's upload by form, whose fields became the key and the headers of a PutObject.
+    std::unique_ptr<post_form> form;
 
     std::string_view header(std::string_view lower) const
     {
@@ -210,6 +213,8 @@ enum class phase : uint8_t
     // A script's on_request has the request and has not answered yet; nothing is
     // read until it does.
     hook_wait,
+    // Reading a browser's form up to its file, whose fields say what the upload is.
+    form_head,
 };
 
 class storage_run;
@@ -576,6 +581,12 @@ public:
     void dispatch(const std::shared_ptr<conn>& c);
     // From the request's head as far as the operation, after auth and the hook.
     void route(const std::shared_ptr<conn>& c);
+    // A browser's upload by form (POST Object), in storage_post.cpp: its fields are read, its policy and
+    // signature checked, and it goes on as the PutObject its fields describe.
+    void begin_post_form(const std::shared_ptr<conn>& c);
+    void post_form_more(const std::shared_ptr<conn>& c);
+    void post_form_ready(const std::shared_ptr<conn>& c);
+    void send_post_result(const std::shared_ptr<conn>& c, const object_meta& m);
     void op_list_buckets(const std::shared_ptr<conn>& c);
     void op_create_bucket(const std::shared_ptr<conn>& c);
     void op_delete_bucket(const std::shared_ptr<conn>& c);

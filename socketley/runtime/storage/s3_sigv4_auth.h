@@ -61,6 +61,7 @@ public:
     bool load(std::string& err);
 
     auth_verdict authorize(const request_view& req) override;
+    auth_verdict authorize_post(const post_signature& sig) override;
 
     size_t credential_count() const { return m_creds.size(); }
 

@@ -351,10 +351,96 @@ def bucket_tags():
     check("a missing bucket is NoSuchBucket", code_of(lambda: s3.get_bucket_tagging(Bucket="cl-nobucket"))[0] == "NoSuchBucket")
 
 
+# ─── POST Object, a browser's upload by form ────────────────────────────────
+# s3-tests test_post_object_*: every form upload was refused; boto3's generate_presigned_post signs V2 by default.
+def form_upload(bucket, fields, body, filename="up.bin", extra_head=None):
+    """(status, headers, body) of a multipart/form-data POST of `fields` and then the file."""
+    import http.client
+    import uuid
+    b = uuid.uuid4().hex
+    out = b""
+    for k, v in fields.items():
+        out += b"--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" % (
+            b.encode(), k.encode(), v.encode() if isinstance(v, str) else v)
+    out += b"--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n" \
+           b"Content-Type: application/octet-stream\r\n\r\n" % (b.encode(), filename.encode())
+    out += body + b"\r\n--%s--\r\n" % b.encode()
+    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=60)
+    head = {"Content-Type": "multipart/form-data; boundary=" + b}
+    head.update(extra_head or {})
+    conn.request("POST", "/" + bucket, body=out, headers=head)
+    r = conn.getresponse()
+    data = r.read()
+    conn.close()
+    return r.status, {k.lower(): v for k, v in r.getheaders()}, data
+
+
+def post_object():
+    print("=== POST Object: a form signed V2 and V4, its policy, its answer ===")
+    import re
+    s3.create_bucket(Bucket="cl-post")
+    signed = s3.generate_presigned_post("cl-post", "up/${filename}", Fields={"Content-Type": "text/plain"},
+                                        Conditions=[["starts-with", "$Content-Type", "text/"],
+                                                    ["content-length-range", 1, 4096]], ExpiresIn=600)
+    v2 = "signature" in signed["fields"]
+    st, hd, _ = form_upload("cl-post", signed["fields"], b"form body", "a b.txt")
+    got = s3.get_object(Bucket="cl-post", Key="up/a b.txt")
+    check("boto3's default presigned POST stores the file under ${filename}, 204",
+          st == 204 and got["Body"].read() == b"form body" and got["ContentType"] == "text/plain", (v2, st))
+    check("and answers its ETag and Location", hd.get("etag") == got["ETag"] and hd.get("location", "").endswith("/cl-post/up/a%20b.txt"),
+          hd)
+    st, _, data = form_upload("cl-post", signed["fields"], b"x" * 5000)
+    check("a file past content-length-range is EntityTooLarge", st == 400 and b"EntityTooLarge" in data, (st, data[:200]))
+    st, _, data = form_upload("cl-post", dict(signed["fields"], **{"x-amz-meta-sneaky": "1"}), b"x")
+    check("a field no condition names is refused", st == 403 and b"Extra input fields: x-amz-meta-sneaky" in data, (st, data[:200]))
+    bad = dict(signed["fields"])
+    sig = "signature" if v2 else "x-amz-signature"
+    bad[sig] = ("A" if v2 else "0") + bad[sig][1:]
+    st, _, data = form_upload("cl-post", bad, b"x")
+    check("a signature that is not the policy's is SignatureDoesNotMatch", st == 403 and b"SignatureDoesNotMatch" in data,
+          (st, data[:200]))
+    v4c = boto3.client("s3", endpoint_url="http://127.0.0.1:%d" % PORT, region_name="us-east-1",
+                       aws_access_key_id=ACCESS, aws_secret_access_key=SECRET,
+                       config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+    four = v4c.generate_presigned_post("cl-post", "four", Fields={"success_action_status": "201"},
+                                       Conditions=[{"success_action_status": "201"}], ExpiresIn=600)
+    st, hd, data = form_upload("cl-post", four["fields"], b"signed v4")
+    check("a V4 form with success_action_status 201 answers its PostResponse",
+          st == 201 and b"<Key>four</Key>" in data and s3.get_object(Bucket="cl-post", Key="four")["Body"].read() == b"signed v4",
+          (st, data[:200]))
+    redirect = v4c.generate_presigned_post("cl-post", "redir", Fields={"success_action_redirect": "http://example.test/done"},
+                                           Conditions=[{"success_action_redirect": "http://example.test/done"}])
+    st, hd, _ = form_upload("cl-post", redirect["fields"], b"r")
+    check("and with success_action_redirect a 303 to it, naming what was stored",
+          st == 303 and re.match(r"http://example\.test/done\?bucket=cl-post&key=redir&etag=", hd.get("location", "")), hd)
+    expired = v4c.generate_presigned_post("cl-post", "late", ExpiresIn=-10)
+    st, _, data = form_upload("cl-post", expired["fields"], b"x")
+    check("an expired policy is AccessDenied", st == 403 and b"Policy expired" in data, (st, data[:200]))
+    st, _, data = form_upload("cl-post", {"key": "anon"}, b"x")
+    check("a form with no policy is anonymous, and refused without a policy that lets it in",
+          st == 403 and b"AccessDenied" in data, (st, data[:200]))
+    s3.put_bucket_policy(Bucket="cl-post", Policy='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",'
+                                                  '"Action":"s3:PutObject","Resource":"arn:aws:s3:::cl-post/drop/*"}]}')
+    st, _, _ = form_upload("cl-post", {"key": "drop/${filename}"}, b"dropped", "box.txt")
+    check("and stored where the bucket policy lets anyone put",
+          st == 204 and s3.get_object(Bucket="cl-post", Key="drop/box.txt")["Body"].read() == b"dropped", st)
+    st, _, data = form_upload("cl-post", {"key": "outside"}, b"x")
+    check("but not outside it", st == 403, st)
+    big = bytes(range(256)) * (12 << 12)
+    st, _, _ = form_upload("cl-post", {"key": "drop/big"}, big, "big")
+    check("a 12 MiB file streams through the form byte for byte",
+          st == 204 and s3.get_object(Bucket="cl-post", Key="drop/big")["Body"].read() == big, st)
+    tricky = (b"\r\n--" + b"0123456789abcdef" * 2 + b"\r\n-") * 40000
+    st, _, _ = form_upload("cl-post", {"key": "drop/tricky"}, tricky, "t")
+    check("a file full of near-boundaries is not cut at any of them",
+          st == 204 and s3.get_object(Bucket="cl-post", Key="drop/tricky")["Body"].read() == tricky, st)
+    s3.delete_bucket_policy(Bucket="cl-post")
+
+
 # A section that raises fails as one assertion and the next still runs, so a runtime without the feature reads red, not dead.
 for section in (delete_bucket_with_uploads, date_header, empty_content_md5, aws_chunked_coding, list_buckets_paged,
                 object_attributes, conditional_writes, completion_sent_twice, full_object_checksums,
-                expiration_header, acls_disabled, bucket_tags):
+                expiration_header, acls_disabled, bucket_tags, post_object):
     try:
         section()
     except Exception as e:

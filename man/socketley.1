@@ -6385,6 +6385,10 @@ DeleteObject	DELETE /bucket/key	T{
 .ad l
 204 whether or not the key existed; in a versioned bucket a delete marker, and with ?versionId= that version removed for good.
 T}
+PostObject	POST /bucket (multipart/form-data)	T{
+.ad l
+A browser's upload by HTML form; see \fBUploads by form\fR below.
+T}
 DeleteObjects	POST /bucket?delete	T{
 .ad l
 Up to 1000 keys, each with or without a VersionId, Quiet, Content\-MD5 checked.
@@ -6481,6 +6485,59 @@ Anything else \(em object lock, other ownership controls \(em is answered
 .B "501 NotImplemented"
 and never mistaken for the plain operation. A single put is at most 5 GiB and a
 key at most 1024 bytes.
+.SS Uploads by form
+A POST to a bucket whose body is
+.B multipart/form\-data
+is S3's POST Object, the upload a web page makes with an HTML form and the
+fields
+.B generate_presigned_post
+and the SDKs' presigned POST write. The fields in front of the file (at most
+20 KiB of them, else
+.BR MaxPostPreDataLengthExceeded )
+say what the upload is:
+.B key
+(with
+.B ${filename}
+given the file's name), the headers a PutObject would carry (Content\-Type,
+Cache\-Control, Content\-Disposition, Content\-Encoding, Expires,
+x\-amz\-meta\-*, x\-amz\-checksum\-*, x\-amz\-server\-side\-encryption*),
+.B acl
+and
+.B tagging
+(a Tagging document), and
+.B success_action_status
+(200, 201 with a PostResponse document, or 204, the default) or
+.BR success_action_redirect ,
+a 303 to that address with the bucket, key and ETag in its query. The file is
+streamed into the object like a put's body, and fields after it are ignored, as
+S3 does.
+.PP
+A form with a
+.B policy
+is signed in its fields: as SigV4 (\fBx\-amz\-algorithm\fR,
+\fBx\-amz\-credential\fR, \fBx\-amz\-date\fR and \fBx\-amz\-signature\fR,
+an HMAC\-SHA256 of the policy) or in the older form boto3 still writes by default
+(\fBAWSAccessKeyId\fR and \fBsignature\fR, a base64 HMAC\-SHA1 of the policy),
+the one place a signature other than SigV4 is taken, since it covers nothing but
+the policy. The policy is a base64 JSON document with an
+.B expiration
+(an expired one is AccessDenied) and
+.BR conditions :
+{"field": "value"}, ["eq", "$field", "value"], ["starts\-with", "$field",
+"prefix"] and ["content\-length\-range", min, max], field names compared without
+case, "$bucket" being the bucket posted to and a field the form leaves out being
+the empty string. A condition a field does not meet, or a field no condition
+names (but the signature and its key, the policy, the file and x\-ignore\-*), is
+.B "403 AccessDenied"
+("Invalid according to Policy: ..."), and a file outside the range is
+.B EntityTooLarge
+or
+.BR EntityTooSmall ,
+with nothing stored. A form without a policy is an anonymous PutObject: taken
+by a runtime with
+.BR \-\-anonymous ,
+or where the bucket policy lets anyone put the key. Either way the bucket policy and
+a script's on_request see it as PutObject.
 .SS Authentication
 Requests are verified as AWS Signature Version 4, in both forms: the
 .B Authorization

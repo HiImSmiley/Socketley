@@ -9,6 +9,11 @@
 #include <unistd.h>
 #include <optional>
 
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+
+#include "checksum.h"
 #include "digest.h"
 #include "../../shared/logging.h"
 #include "../../shared/s3_sigv4.h"
@@ -438,6 +443,72 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
             v.hook = std::make_unique<stream_hook>(vr.stream);
             break;
     }
+    return v;
+}
+
+auth_verdict sigv4_authenticator::authorize_post(const post_signature& sig)
+{
+    maybe_reload();
+    auth_verdict v;
+    v.allowed = false;
+    auto refuse = [&](std::string code, std::string message, int status)
+    {
+        v.error = {std::move(code), std::move(message), status};
+        return std::move(v);
+    };
+    if (sig.algorithm.empty() && !sig.v2_access_key.empty())
+    {
+        const std::string_view key = m_creds.secret(sig.v2_access_key);
+        if (key.empty())
+            return refuse("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403);
+        unsigned char raw[20];
+        unsigned int len = sizeof raw;
+        HMAC(EVP_sha1(), key.data(), static_cast<int>(key.size()), reinterpret_cast<const unsigned char*>(sig.policy.data()),
+             sig.policy.size(), raw, &len);
+        const std::string want = base64_encode(std::string_view(reinterpret_cast<const char*>(raw), len));
+        if (sig.v2_signature.size() != want.size() ||
+            CRYPTO_memcmp(sig.v2_signature.data(), want.data(), want.size()) != 0)
+            return refuse("SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided. Check your key and signing method.", 403);
+        v.allowed   = true;
+        v.principal = std::string(sig.v2_access_key);
+        return v;
+    }
+    if (sig.algorithm != "AWS4-HMAC-SHA256")
+        return refuse("InvalidRequest", "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256.", 400);
+    // AKID/20130524/us-east-1/s3/aws4_request, split from the right since the key may hold a slash.
+    std::string_view rest = sig.credential;
+    std::string_view parts[4];
+    for (int i = 3; i >= 0; --i)
+    {
+        const size_t slash = rest.rfind('/');
+        if (slash == std::string_view::npos)
+            return refuse("InvalidArgument", "The x-amz-credential of the form is malformed.", 400);
+        parts[i] = rest.substr(slash + 1);
+        rest     = rest.substr(0, slash);
+    }
+    const std::string_view date = parts[0], region = parts[1], service = parts[2];
+    if (rest.empty() || date.size() != 8 || parts[3] != "aws4_request" || service != "s3" || region.empty() ||
+        !sig.amz_date.starts_with(date))
+        return refuse("InvalidArgument", "The x-amz-credential or x-amz-date of the form is malformed.", 400);
+    const std::string_view secret = m_creds.secret(rest);
+    if (secret.empty())
+        return refuse("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403);
+    auto mac = [](std::string_view key, std::string_view msg)
+    {
+        std::string out(32, '\0');
+        unsigned int len = 32;
+        HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), reinterpret_cast<const unsigned char*>(msg.data()),
+             msg.size(), reinterpret_cast<unsigned char*>(out.data()), &len);
+        return out;
+    };
+    const std::string signing = mac(mac(mac(mac("AWS4" + std::string(secret), date), region), service), "aws4_request");
+    const std::string want = mac(signing, sig.policy);
+    const std::string got_hex(sig.signature);
+    const std::string want_hex = hex(reinterpret_cast<const uint8_t*>(want.data()), want.size());
+    if (got_hex.size() != want_hex.size() || CRYPTO_memcmp(got_hex.data(), want_hex.data(), want_hex.size()) != 0)
+        return refuse("SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided. Check your key and signing method.", 403);
+    v.allowed   = true;
+    v.principal = std::string(rest);
     return v;
 }
 

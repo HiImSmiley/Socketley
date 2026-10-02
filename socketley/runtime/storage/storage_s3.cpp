@@ -199,6 +199,14 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     // Every answer to a cross-origin request a rule allows carries the rule, refusals included.
     if (m_store.any_cors())
         cors_actual(c);
+    // A browser's form is signed in its fields, which are read before anything is decided.
+    if (r.method == "POST" && !r.bucket.empty() && r.key.empty() && r.raw_query.empty() &&
+        http_token_equals(http_trim_ows(r.header("content-type").substr(0, r.header("content-type").find(';'))),
+                          "multipart/form-data", 19))
+    {
+        begin_post_form(c);
+        return;
+    }
 
     auth_verdict v = m_auth->authorize(rv);
     // A bucket's policy may let in a request that carries no credentials, and may refuse one that does.
@@ -244,9 +252,15 @@ void storage_run::route(const std::shared_ptr<conn>& c)
 
     // A write that asks for an ACL other than its owner's full control is refused, as S3 refuses it on a bucket
     // whose ACLs are disabled, and never stored without it.
-    if (s3_error e; !r.has_query("acl") && !acl_headers_ok(r, bucket_level, e))
+    if (s3_error e; !r.has_query("acl") && !acl_headers_ok(r, bucket_level && !r.form, e))
     {
         deny_request(c, e);
+        return;
+    }
+    // A form is the PutObject its fields describe, with its file as the body.
+    if (r.form)
+    {
+        op_put_object(c);
         return;
     }
 
@@ -1102,7 +1116,7 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
 bool storage_run::body_length(const conn& c, uint64_t& expected)
 {
     expected   = c.req.content_length;
-    bool known = c.req.has_content_length && !c.req.chunked;
+    bool known = c.req.has_content_length && !c.req.chunked && (!c.hook || c.hook->length_from_body());
     if (c.hook)
         if (auto d = c.hook->decoded_length())
         {

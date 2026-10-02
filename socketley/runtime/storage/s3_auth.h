@@ -92,6 +92,9 @@ public:
     // A header the body carried after its last chunk, such as
     // x-amz-checksum-crc32c, valid once finish() has returned true.
     virtual std::string trailer_value(std::string_view /*lowercase_name*/) const { return {}; }
+
+    // Whether the payload is as long as the body less its framing, which a stage that stops at a delimiter is not.
+    virtual bool length_from_body() const { return true; }
 };
 
 struct auth_verdict
@@ -106,11 +109,33 @@ struct auth_verdict
     std::unique_ptr<body_hook>  hook;
 };
 
+// The fields a browser's form is signed with, which travel in the body and not in a header (SigV4 POST policy).
+struct post_signature
+{
+    std::string_view algorithm;
+    std::string_view credential;
+    std::string_view amz_date;
+    // The base64 policy exactly as the form carried it, which is what was signed.
+    std::string_view policy;
+    std::string_view signature;
+    // The older form, AWSAccessKeyId and a base64 HMAC-SHA1 of the policy, which boto3's presigned POST still writes.
+    std::string_view v2_access_key;
+    std::string_view v2_signature;
+};
+
 class authenticator
 {
 public:
     virtual ~authenticator() = default;
     virtual auth_verdict authorize(const request_view& req) = 0;
+    // A signed form's verdict; an authenticator that holds no credentials can verify none.
+    virtual auth_verdict authorize_post(const post_signature& /*sig*/)
+    {
+        auth_verdict v;
+        v.allowed = false;
+        v.error   = {"InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403};
+        return v;
+    }
 };
 
 // `--anonymous`: every request is allowed and nobody is named.  A body that is

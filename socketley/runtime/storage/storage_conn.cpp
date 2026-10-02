@@ -229,6 +229,7 @@ void s3_request::reset()
     chunked            = false;
     keep_alive         = true;
     expect_continue    = false;
+    form.reset();
 }
 
 void storage_run::new_request_id(std::string& id)
@@ -491,6 +492,7 @@ void storage_run::sweep()
             case phase::body_small:
             case phase::body_put:
             case phase::body_discard:
+            case phase::form_head:
                 kill = quiet > body_stall_secs;
                 break;
             case phase::respond:
@@ -1099,6 +1101,10 @@ void storage_run::plain_in(const std::shared_ptr<conn>& c, const char* p, size_t
         case phase::hook_wait:
             // The next request, sent ahead of the answer to this one.
             c->in.append(p, n);
+            return;
+        case phase::form_head:
+            c->in.append(p, n);
+            post_form_more(c);
             return;
     }
 }
@@ -2043,6 +2049,14 @@ void storage_run::put_body_complete(const std::shared_ptr<conn>& c)
             // A body that failed after it was all read is answered on this
             // connection, which is still in step.
             send_error_st(cc, r.status);
+            return;
+        }
+        if (cc->req.form)
+        {
+            const std::string bucket = cc->req.bucket;
+            const std::string key    = cc->req.key;
+            send_post_result(cc, r.meta);
+            notify_put(bucket, key, r.meta);
             return;
         }
         // A part is not an object: the completed upload is the put the script is told of.

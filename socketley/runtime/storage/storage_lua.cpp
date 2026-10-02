@@ -57,6 +57,9 @@ std::string_view storage_run::operation_name(const s3_request& r)
     const std::string_view m = r.method;
     if (service)
         return m == "GET" ? "ListBuckets" : "Unknown";
+    // A browser's form is a PutObject, as S3's policy judges it.
+    if (r.form)
+        return "PutObject";
     if (r.has_query("acl"))
         return bucket_level ? (m == "GET" ? "GetBucketAcl" : "PutBucketAcl") : (m == "GET" ? "GetObjectAcl" : "PutObjectAcl");
     if (bucket_level && r.has_query("tagging"))
