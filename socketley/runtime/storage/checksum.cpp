@@ -54,12 +54,11 @@ constexpr std::array<uint64_t, 256> make_crc64_table()
 constexpr auto crc32_table = make_crc32_table();
 constexpr auto crc64_table = make_crc64_table();
 
-uint32_t crc32_update(uint32_t crc, const unsigned char* p, size_t n)
+uint64_t crc32_bytes(uint64_t crc, const unsigned char* p, size_t n)
 {
-    crc = ~crc;
     for (size_t i = 0; i < n; ++i)
         crc = crc32_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
-    return ~crc;
+    return crc;
 }
 
 uint64_t crc64_bytes(uint64_t crc, const unsigned char* p, size_t n)
@@ -69,26 +68,34 @@ uint64_t crc64_bytes(uint64_t crc, const unsigned char* p, size_t n)
     return crc;
 }
 
-// x^e mod P, bit-reflected so that bit j is the coefficient of x^(63-j).
-constexpr uint64_t crc64_xpow(unsigned e)
+// x^e mod P for a reflected CRC of `width` bits, placed so that bit j is the coefficient of x^(63-j) whatever the width.
+constexpr uint64_t crc_xpow(uint64_t poly, int width, unsigned e)
 {
-    uint64_t v = 1ull << 63;
+    uint64_t v = 1ull << (width - 1);
     for (unsigned i = 0; i < e; ++i)
-        v = (v & 1) ? (v >> 1) ^ crc64_poly : v >> 1;
-    return v;
+        v = (v & 1) ? (v >> 1) ^ poly : v >> 1;
+    return v << (64 - width);
 }
 
-#if defined(__x86_64__)
-// Folding 128 bits of pending CRC across D bits multiplies its halves by x^(D+63) and x^(D-1) mod P, one less than
+// A reflected CRC whose initial value and final xor are all ones: its table step, and the keys that fold it, since
+// folding 128 bits of pending CRC across D bits multiplies its halves by x^(D+63) and x^(D-1) mod P, one less than
 // the distance because a carry-less product of two reflected values lands one bit low.
-struct fold_keys
+struct crc_kind
 {
-    uint64_t far;
-    uint64_t near;
+    uint64_t ones;
+    uint64_t (*bytes)(uint64_t, const unsigned char*, size_t);
+    uint64_t far128, near128, far1024, near1024;
 };
-constexpr fold_keys fold_128  = {crc64_xpow(128 + 63), crc64_xpow(128 - 1)};
-constexpr fold_keys fold_1024 = {crc64_xpow(1024 + 63), crc64_xpow(1024 - 1)};
 
+constexpr crc_kind make_crc_kind(uint64_t poly, int width, uint64_t (*bytes)(uint64_t, const unsigned char*, size_t))
+{
+    return {~0ull >> (64 - width), bytes, crc_xpow(poly, width, 128 + 63), crc_xpow(poly, width, 128 - 1),
+            crc_xpow(poly, width, 1024 + 63), crc_xpow(poly, width, 1024 - 1)};
+}
+constexpr crc_kind crc32_kind = make_crc_kind(crc32_poly, 32, crc32_bytes);
+constexpr crc_kind crc64_kind = make_crc_kind(crc64_poly, 64, crc64_bytes);
+
+#if defined(__x86_64__)
 __attribute__((target("pclmul,sse4.1")))
 inline __m128i fold(__m128i acc, __m128i keys, __m128i next)
 {
@@ -98,11 +105,11 @@ inline __m128i fold(__m128i acc, __m128i keys, __m128i next)
 
 // Eight lanes of 128 bits fold 128 bytes a step, then into one lane, whose CRC the table finishes; n >= 128.
 __attribute__((target("pclmul,sse4.1")))
-uint64_t crc64_pclmul(uint64_t crc, const unsigned char*& p, size_t& n)
+uint64_t crc_pclmul(const crc_kind& k, uint64_t crc, const unsigned char*& p, size_t& n)
 {
     auto load = [](const unsigned char* q) { return _mm_loadu_si128(reinterpret_cast<const __m128i*>(q)); };
-    const __m128i k1024 = _mm_set_epi64x(static_cast<long long>(fold_1024.near), static_cast<long long>(fold_1024.far));
-    const __m128i k128  = _mm_set_epi64x(static_cast<long long>(fold_128.near), static_cast<long long>(fold_128.far));
+    const __m128i k1024 = _mm_set_epi64x(static_cast<long long>(k.near1024), static_cast<long long>(k.far1024));
+    const __m128i k128  = _mm_set_epi64x(static_cast<long long>(k.near128), static_cast<long long>(k.far128));
     __m128i x[8];
     for (int i = 0; i < 8; ++i)
         x[i] = load(p + 16 * i);
@@ -119,19 +126,20 @@ uint64_t crc64_pclmul(uint64_t crc, const unsigned char*& p, size_t& n)
         acc = fold(acc, k128, load(p));
     alignas(16) unsigned char lane[16];
     _mm_store_si128(reinterpret_cast<__m128i*>(lane), acc);
-    return crc64_bytes(0, lane, 16);
+    return k.bytes(0, lane, 16);
 }
 #endif
 
-uint64_t crc64_update(uint64_t crc, const unsigned char* p, size_t n)
+// Folded where the CPU can, and by table for what is left.
+uint64_t crc_update(const crc_kind& k, uint64_t crc, const unsigned char* p, size_t n)
 {
-    crc = ~crc;
+    crc ^= k.ones;
 #if defined(__x86_64__)
     static const bool hw = __builtin_cpu_supports("pclmul") && __builtin_cpu_supports("sse4.1");
     if (hw && n >= 128)
-        crc = crc64_pclmul(crc, p, n);
+        crc = crc_pclmul(k, crc, p, n);
 #endif
-    return ~crc64_bytes(crc, p, n);
+    return k.bytes(crc, p, n) ^ k.ones;
 }
 
 uint32_t crc32c_update(uint32_t crc, const unsigned char* p, size_t n)
@@ -259,9 +267,9 @@ void checksum_stream::update(const void* data, size_t n)
     const auto* p = static_cast<const unsigned char*>(data);
     switch (m_algo)
     {
-        case checksum_algo::crc32:     m_crc = crc32_update(static_cast<uint32_t>(m_crc), p, n); break;
+        case checksum_algo::crc32:     m_crc = crc_update(crc32_kind, m_crc, p, n); break;
         case checksum_algo::crc32c:    m_crc = crc32c_update(static_cast<uint32_t>(m_crc), p, n); break;
-        case checksum_algo::crc64nvme: m_crc = crc64_update(m_crc, p, n); break;
+        case checksum_algo::crc64nvme: m_crc = crc_update(crc64_kind, m_crc, p, n); break;
         case checksum_algo::sha1:
         case checksum_algo::sha256:
             if (m_digest && m_digest->ctx)
