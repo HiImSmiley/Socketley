@@ -400,7 +400,9 @@ def post_object():
     check("a field no condition names is refused", st == 403 and b"Extra input fields: x-amz-meta-sneaky" in data, (st, data[:200]))
     bad = dict(signed["fields"])
     sig = "signature" if v2 else "x-amz-signature"
-    bad[sig] = ("A" if v2 else "0") + bad[sig][1:]
+    # A first character other than the one there, so the signature always changes.
+    swap = ("AB" if v2 else "01")[bad[sig][0] == ("A" if v2 else "0")]
+    bad[sig] = swap + bad[sig][1:]
     st, _, data = form_upload("cl-post", bad, b"x")
     check("a signature that is not the policy's is SignatureDoesNotMatch", st == 403 and b"SignatureDoesNotMatch" in data,
           (st, data[:200]))
