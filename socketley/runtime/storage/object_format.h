@@ -99,6 +99,13 @@ bool copy_checksum(object_meta& copy, const object_meta& src, checksum_algo algo
 // Puts `b64` in place of `m`'s value of `algo`.
 void set_checksum(object_meta& m, checksum_algo algo, std::string b64);
 
+// The algorithm S3 gives the checksum of a new object that arrives without one.
+inline constexpr checksum_algo default_checksum_algo = checksum_algo::crc64nvme;
+
+// The extra entry of a part of an upload with no algorithm: the part's own CRC64NVME in base64, which no client is
+// shown and which the completion combines into the object's default checksum.
+inline constexpr std::string_view part_crc_extra = "x-socketley-part-crc64nvme";
+
 // The list in one canonical encoding, of 20 + 12 bytes per part, which is what a digest of it is taken over;
 // a list with checksums is 24 bytes and then 12 and the checksum's width per part.
 std::string encode_part_list(const part_list& l, uint64_t total);

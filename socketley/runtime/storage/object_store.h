@@ -422,6 +422,9 @@ public:
     void track_checksum(checksum_algo algo, std::string expected_b64);
     // The value a trailer carried after the body, which is checked at finish().
     void expect_checksum(std::string b64);
+    // Takes the CRC64NVME of a part's body besides any checksum its client named, into part_crc_extra, an entry the
+    // caller has put in the meta given to begin_put with a value of the right length.
+    void track_part_crc();
 
     // Where a finished body goes instead of into the object namespace: a
     // multipart part, which the caller renames and keeps track of itself.
@@ -474,6 +477,7 @@ private:
     {
         md5_stream                       md5;
         std::unique_ptr<checksum_stream> ck;
+        std::unique_ptr<checksum_stream> part_crc;
     };
 
     void on_hashed(int stage_index);

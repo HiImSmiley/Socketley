@@ -287,6 +287,8 @@ void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint3
     object_meta meta;
     if (algo != checksum_algo::none)
         meta.extra.emplace_back(std::string(checksum_header(algo)), std::string(checksum_b64_len(algo), 'A'));
+    else
+        meta.extra.emplace_back(std::string(part_crc_extra), std::string(checksum_b64_len(checksum_algo::crc64nvme), 'A'));
     // The key that opens the source and the one the part is sealed under, both refused before a byte is read.
     std::optional<sse_key> src_customer;
     sse_seal_spec seal;
@@ -309,6 +311,8 @@ void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint3
     }
     if (algo != checksum_algo::none)
         op->track_checksum(algo, {});
+    else
+        op->track_part_crc();
     op->set_committer(m_node.mpu_part_committer(r.bucket, r.key, id, number));
     ++m_c.mpu_parts;
     ++m_c.copies;

@@ -1312,9 +1312,16 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
         }
         ck.algo = forced_algo;
     }
+    // An object sent without a checksum is given S3's default, and a part of an upload with no algorithm keeps the
+    // CRC its completion gives the object that default from.
+    const bool part_crc = committer && forced_algo == checksum_algo::none;
+    if (!committer && ck.algo == checksum_algo::none)
+        ck.algo = default_checksum_algo;
     // A placeholder of the value's length, so the header reserves room for it.
     if (ck.algo != checksum_algo::none)
         meta.extra.emplace_back(std::string(checksum_header(ck.algo)), std::string(checksum_b64_len(ck.algo), 'A'));
+    if (part_crc)
+        meta.extra.emplace_back(std::string(part_crc_extra), std::string(checksum_b64_len(checksum_algo::crc64nvme), 'A'));
 
     uint64_t expected = 0;
     const bool known  = body_length(*c, expected);
@@ -1350,6 +1357,8 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
         op->track_checksum(ck.algo, std::move(ck.expected_b64));
         c->ck_trailer = std::move(ck.trailer_name);
     }
+    if (part_crc)
+        op->track_part_crc();
     if (committer)
         op->set_committer(std::move(committer));
     op->set_condition(cond);
@@ -1487,8 +1496,12 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
         send_error(c, err);
         return;
     }
+    // A copy that names an algorithm says what it changes, as a copy of an object onto itself to take a checksum does.
+    const bool names_checksum = algo != checksum_algo::none;
     if (algo == checksum_algo::none)
         algo = checksum_algo_of(src);
+    if (algo == checksum_algo::none)
+        algo = default_checksum_algo;
     if (sse_key probe{}; is_encrypted(src) || src_customer)
     {
         s3_error err;
@@ -1505,8 +1518,8 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
         }
     }
     // A version copied over its own key is a new latest made of an old one, which S3 allows as it is, and so is a
-    // copy that names the encryption it changes to.
-    if (src_bucket == r.bucket && src_key == r.key && !replace && src_version.empty() && !dst.named)
+    // copy that names the encryption or the checksum algorithm it changes to.
+    if (src_bucket == r.bucket && src_key == r.key && !replace && src_version.empty() && !dst.named && !names_checksum)
     {
         s3_error e = make_error("InvalidRequest");
         e.message = "This copy request is illegal because it is trying to copy an object to itself "

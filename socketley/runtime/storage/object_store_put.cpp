@@ -310,6 +310,8 @@ void put_op::hash_staged(bool last)
                 hs->md5.update(p, n);
                 if (hs->ck)
                     hs->ck->update(p, n);
+                if (hs->part_crc)
+                    hs->part_crc->update(p, n);
             },
             [self = shared_from_this(), index] { self->on_hashed(index); });
         return;
@@ -317,6 +319,8 @@ void put_op::hash_staged(bool last)
     m_hs->md5.update(p, n);
     if (m_hs->ck)
         m_hs->ck->update(p, n);
+    if (m_hs->part_crc)
+        m_hs->part_crc->update(p, n);
 }
 
 size_t put_op::append(const char* p, size_t n)
@@ -645,6 +649,10 @@ void put_op::finish_now()
         }
         set_checksum(m_meta, m_hs->ck->algo(), got);
     }
+    if (m_hs->part_crc)
+        for (auto& [n, v] : m_meta.extra)
+            if (n == part_crc_extra)
+                v = m_hs->part_crc->peek_b64();
 
     // The version goes into the header before the body is synced, so the owner need not write the header again
     // unless a newer version of the key or a change of the bucket's versioning comes before its commit.
@@ -827,6 +835,11 @@ void put_op::track_checksum(checksum_algo algo, std::string expected_b64)
 void put_op::expect_checksum(std::string b64)
 {
     m_ck_expect = std::move(b64);
+}
+
+void put_op::track_part_crc()
+{
+    m_hs->part_crc = std::make_unique<checksum_stream>(checksum_algo::crc64nvme);
 }
 
 void put_op::abort()

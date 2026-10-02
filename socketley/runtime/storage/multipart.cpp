@@ -129,6 +129,9 @@ uint64_t place_base_of(std::string_view key, const object_meta& meta, checksum_a
     if (algo != checksum_algo::none)
         m.extra.emplace_back(std::string(checksum_header(algo)),
                              std::string(checksum_b64_len(algo) + std::to_string(mpu_max_parts).size() + 1, 'A'));
+    else
+        m.extra.emplace_back(std::string(checksum_header(default_checksum_algo)),
+                             std::string(checksum_b64_len(default_checksum_algo), 'A'));
     // Parts placed in the data file are of one size, so their list is one number or names its checksums after the body.
     m.extra.emplace_back(std::string(part_layout_extra), std::string(20 + 1 + 64 + 1 + 2, '9'));
     m.extra.emplace_back(std::string(upload_id_extra), std::string(32, '0'));
@@ -490,6 +493,8 @@ bool multipart_store::recover_bucket(const std::string& bucket, std::string& err
                         part.in_place = at != 0;
                         if (const std::string* v = extra_value(pd.meta, checksum_header(up->algo)))
                             part.checksum_b64 = *v;
+                        if (const std::string* v = extra_value(pd.meta, part_crc_extra))
+                            part.crc_b64 = *v;
                     }
                 }
             }
@@ -863,6 +868,8 @@ void multipart_store::finish_part(const std::shared_ptr<part_commit>& pc, int64_
         part.in_place = pc->place_off != 0;
         if (const std::string* v = extra_value(pc->req.meta, checksum_header(up->algo)))
             part.checksum_b64 = *v;
+        if (const std::string* v = extra_value(pc->req.meta, part_crc_extra))
+            part.crc_b64 = *v;
 
         const auto old = up->parts.find(pc->number);
         if (old != up->parts.end())
@@ -1116,6 +1123,9 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
                 raw_checksums += raw;
                 part_checksums.emplace_back(std::move(raw), have.size);
             }
+            // A part written before parts kept their CRC leaves the object without the default, as it was then.
+            else if (std::string raw; base64_decode(have.crc_b64, raw) && !raw.empty())
+                part_checksums.emplace_back(std::move(raw), have.size);
             plan.parts.push_back(have);
         }
         if (total > m_store->options().max_object_bytes)
@@ -1142,6 +1152,13 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
             plan.checksum_b64 = full ? full_object_checksum_b64(u->algo, part_checksums)
                                      : composite_checksum_b64(u->algo, raw_checksums, parts.size());
             plan.meta.extra.emplace_back(std::string(checksum_header(u->algo)), plan.checksum_b64);
+        }
+        // An upload with no algorithm gives its object S3's default, of the whole bytes, combined from its parts' CRCs.
+        else if (part_checksums.size() == parts.size())
+        {
+            plan.checksum_b64 = full_object_checksum_b64(default_checksum_algo, part_checksums);
+            if (!plan.checksum_b64.empty())
+                plan.meta.extra.emplace_back(std::string(checksum_header(default_checksum_algo)), plan.checksum_b64);
         }
         // Kept in the header when it fits and after the body otherwise, so any list S3 takes completes.
         const part_list list = list_of(plan.parts, plan.meta);

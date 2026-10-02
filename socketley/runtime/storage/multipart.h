@@ -79,6 +79,9 @@ struct mpu_part
     bool        in_place{false};
     // In the upload's algorithm, empty when it has none.
     std::string checksum_b64;
+    // The CRC64NVME the object's default checksum is combined from when the upload has no algorithm, empty when
+    // the part was written without one.
+    std::string crc_b64;
 
     std::string etag() const { return hex(md5); }
 };

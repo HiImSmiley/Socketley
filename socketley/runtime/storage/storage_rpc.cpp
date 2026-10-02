@@ -345,6 +345,9 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                                                           "--sse-key-file"));
                 return true;
             }
+            // A script's object is given S3's default checksum like a client's.
+            meta.extra.emplace_back(std::string(checksum_header(default_checksum_algo)),
+                                    std::string(checksum_b64_len(default_checksum_algo), 'A'));
             st why = st::ok;
             auto op_ptr = m_store.begin_put(rq.bucket, rq.key, std::move(meta), rq.data.size(), true, why, true,
                                             sealed ? &seal : nullptr);
@@ -353,6 +356,7 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                 answer(rq.kind, refusal_for(why));
                 return true;
             }
+            op_ptr->track_checksum(default_checksum_algo, {});
             auto state = std::make_shared<rpc_state>();
             state->ticket = ticket;
             state->bucket = rq.bucket;
