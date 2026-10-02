@@ -12561,6 +12561,15 @@ holds, never what a GET returns.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_STORAGE_COMPACT_FLOOR
+A test aid: the fewest records a bucket's journal holds before a storage shard
+rewrites it without its superseded records. Default
+.BR 4096 .
+A test lowers it to see compactions without thousands of writes. This changes how
+often a journal is rewritten, never what it holds.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_STORAGE_HASH_THREADS
 How many helper threads a storage worker takes the digests of large uploads on
 (the ETag's MD5, any \fBx\-amz\-checksum\-\fR the request asked for, and the SHA\-256
@@ -12598,6 +12607,15 @@ The most events a storage shard holds undelivered, beyond which a new one is
 dropped and counted in
 .BR notify_dropped .
 Default: 10000. A test lowers it to reach the bound.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_STORAGE_STOP_HOLD_MS
+A test aid: milliseconds, 0 to 3000, that a storage shard's stop waits after its
+in\-flight work has finished and before it lets go of its directory, multiplied by
+the shard's number plus one, so a test can start a runtime beside shards that are
+still stopping. Unset, a stop waits for nothing but its own work. It slows every
+stop and restart, so it is never for a runtime in use.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
