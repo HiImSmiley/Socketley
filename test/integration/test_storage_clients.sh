@@ -11,14 +11,16 @@
 #              on an empty body, ListBuckets in pages, GetObjectAttributes,
 #              If-Match and If-None-Match on PutObject and on a completion, and a
 #              completion sent twice, FULL_OBJECT checksums, x-amz-expiration,
-#              ACLs as with ACLs disabled and a bucket's own tags -- on one
+#              ACLs as with ACLs disabled, a bucket's own tags, POST Object
+#              forms signed V2 and V4, and object lock refused -- on one
 #              process and again over two shards
 #   aws        AWS CLI v2: mb, a 100 MiB multipart cp both ways, sync up and down
 #              and again, ls, list-buckets --max-buckets, get-object-attributes,
 #              presign, rm --recursive, and rb --force over an open upload
 #   rclone     sync, check --download, a 100 MiB copy, server-side copy, purge
 #   restic     init, two backups, check --read-data, restore, forget --prune
-#   mc         cp -r, mirror both ways, ls -r, stat, tag, versioning, rm -r, rb
+#   mc         cp -r, mirror both ways, ls -r, stat, tag, versioning, share
+#              upload (a POST form, sent with curl), rm -r, rb
 #
 # A client that is not on PATH is skipped and said so; put the binaries on PATH
 # (aws, rclone, restic, mc) to run them.  The boto3 half needs python3 and boto3.
@@ -180,6 +182,9 @@ if command -v mc >/dev/null 2>&1 && mc --version 2>/dev/null | grep -qi minio; t
     step "mc: stat" mc stat sl/mcb/big.bin
     step "mc: mirror up and down, identical" bash -c "mc mirror --overwrite '$WORK/src' sl/mcb/mirror && mc mirror sl/mcb/mirror '$WORK/mc-down' && diff -r '$WORK/src' '$WORK/mc-down'"
     step "mc: tag set and list" bash -c "mc tag set sl/mcb/tree/a/f1.bin 'k1=v1&k2=v2' && mc tag list sl/mcb/tree/a/f1.bin | grep -q k2"
+    if command -v curl >/dev/null 2>&1; then
+        step "mc: share upload, a POST form sent with curl" bash -c "cmd=\$(mc share upload --json sl/mcb/form.txt | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"share\"])') && eval \"\${cmd/<FILE>/$WORK/src/a/b/t2.txt}\" && mc cat sl/mcb/form.txt | grep -q 'hello 2'"
+    fi
     step "mc: version enable, two versions" bash -c "mc version enable sl/mcb && mc cp '$WORK/src/a/f2.bin' sl/mcb/v && mc cp '$WORK/src/a/f3.bin' sl/mcb/v && [ \"\$(mc ls --versions sl/mcb/v | wc -l)\" = 2 ]"
     step "mc: rm -r --force --versions" mc rm -r --force --versions sl/mcb
     step "mc: rb --force" mc rb --force sl/mcb
