@@ -6295,7 +6295,7 @@ Operation	Request	Notes
 _
 ListBuckets	GET /	T{
 .ad l
-Sorted by name, with creation dates.
+Sorted by name, with creation dates; max\-buckets (1 to 10000), continuation\-token and prefix page it as S3 does.
 T}
 CreateBucket	PUT /bucket	T{
 .ad l
@@ -6363,7 +6363,7 @@ marker and NextMarker.
 T}
 PutObject	PUT /bucket/key	T{
 .ad l
-Streamed; Content\-MD5 checked; Content\-Type, Cache\-Control, Content\-Disposition, Content\-Encoding, Content\-Language, Expires and x\-amz\-meta\-* stored and returned; x\-amz\-tagging sets the object's tags; Expect: 100\-continue and chunked request bodies accepted; If\-None\-Match: * refuses to overwrite; x\-amz\-server\-side\-encryption: AES256 or the SSE\-C headers encrypt it.
+Streamed; Content\-MD5 checked; Content\-Type, Cache\-Control, Content\-Disposition, Content\-Encoding, Content\-Language, Expires and x\-amz\-meta\-* stored and returned; x\-amz\-tagging sets the object's tags; Expect: 100\-continue and chunked request bodies accepted; If\-Match (an ETag or *) writes only over that object, NoSuchKey (404) when the key holds none, and If\-None\-Match (* or an ETag) only when the key holds no such object, decided when the object is committed so two racing writers cannot both win; PreconditionFailed (412) otherwise; x\-amz\-server\-side\-encryption: AES256 or the SSE\-C headers encrypt it.
 T}
 GetObject	GET /bucket/key	T{
 .ad l
@@ -6372,6 +6372,10 @@ T}
 HeadObject	HEAD /bucket/key	T{
 .ad l
 The headers of a GET, from memory, or from the object's header when another shard owns the key; ?versionId= as for GET.
+T}
+GetObjectAttributes	GET /bucket/key?attributes	T{
+.ad l
+x\-amz\-object\-attributes of ETag, Checksum, ObjectParts, StorageClass and ObjectSize; the parts of a multipart object paged by x\-amz\-max\-parts and x\-amz\-part\-number\-marker, with their numbers and sizes and not their checksums; ?versionId= and the SSE\-C headers as for HeadObject.
 T}
 GetObject, HeadObject by part	GET|HEAD /bucket/key?partNumber=N	T{
 .ad l
@@ -6415,7 +6419,7 @@ The whole source or x\-amz\-copy\-source\-range=bytes=first\-last; a source of k
 T}
 CompleteMultipartUpload	POST /bucket/key?uploadId=ID	T{
 .ad l
-InvalidPart, InvalidPartOrder, EntityTooSmall (a part but the last under 5 MiB), NoSuchUpload, MalformedXML.
+InvalidPart, InvalidPartOrder, EntityTooSmall (a part but the last under 5 MiB), NoSuchUpload, MalformedXML; If\-Match and If\-None\-Match as for PutObject. A completion sent again after it succeeded is answered as the first was, for as long as the key holds the object it made.
 T}
 AbortMultipartUpload	DELETE /bucket/key?uploadId=ID	T{
 .ad l
