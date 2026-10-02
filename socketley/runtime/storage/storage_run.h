@@ -175,6 +175,8 @@ bool tagging_from_header(const s3_request& r, object_meta& m, s3_error& err);
 
 // False with `err` when the request carries a Content-MD5 its body does not match.
 bool body_md5_ok(const s3_request& r, std::string_view body, s3_error& err);
+// The same for an x-amz-checksum-* header too, and false when the request carries neither, as S3 requires of some.
+bool body_integrity_ok(const s3_request& r, std::string_view body, s3_error& err);
 
 // The encryption a request names for what it writes, or the one its bucket gives it.
 struct sse_ask
@@ -593,8 +595,8 @@ public:
     void op_head_bucket(const std::shared_ptr<conn>& c);
     // False with `err` S3's refusal when a write asks for an ACL other than its owner's full control.
     bool acl_headers_ok(const s3_request& r, bool bucket, s3_error& err) const;
-    // False with `err` when a write asks for object lock, which is not built, or a storage class S3 does not have.
-    static bool lock_and_class_ok(const s3_request& r, s3_error& err);
+    // False with `err` when a write asks for a storage class S3 does not have.
+    static bool storage_class_ok(const s3_request& r, s3_error& err);
     void op_get_acl(const std::shared_ptr<conn>& c);
     void op_put_acl(const std::shared_ptr<conn>& c);
     void op_ownership_controls(const std::shared_ptr<conn>& c);
@@ -617,6 +619,20 @@ public:
     policy_effect policy_effect_of(const std::shared_ptr<conn>& c, std::string_view bucket, const policy_request& q);
     // Whether this request's policies let it remove version `version_id`'s key, which DeleteObjects names only in its body.
     bool policy_allows_version_delete(const std::shared_ptr<conn>& c, std::string_view key);
+    // Whether the bucket's policy lets this request do `action` to `key` as well as what it was judged for.
+    bool policy_allows(const std::shared_ptr<conn>& c, s3_action action, std::string_view key);
+
+    // Object lock, in storage_object_lock.cpp.
+    void op_put_object_lock_config(const std::shared_ptr<conn>& c);
+    void op_get_object_lock_config(const std::shared_ptr<conn>& c);
+    // PutObjectRetention and PutObjectLegalHold, and the two Gets.
+    void op_put_lock_attr(const std::shared_ptr<conn>& c, bool legal_hold);
+    void op_get_lock_attr(const std::shared_ptr<conn>& c, bool legal_hold);
+    // Whether the request asks to go past a GOVERNANCE retention of `key` and may.
+    bool bypass_allowed(const std::shared_ptr<conn>& c, std::string_view key);
+    // The retention and legal hold a write's headers ask for, or its bucket's default, put into `m`; false with
+    // `err` when S3 would refuse them.
+    bool lock_from_headers(const std::shared_ptr<conn>& c, object_meta& m, s3_error& err);
     // False, with the request refused, while a bucket it touches is waiting to learn of a change to its documents.
     bool docs_settled(const std::shared_ptr<conn>& c);
     void op_list_objects(const std::shared_ptr<conn>& c, bool v2);

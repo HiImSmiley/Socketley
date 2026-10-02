@@ -101,12 +101,12 @@ void shard_node::commit(uint32_t owner, commit_request req, std::function<void(p
     });
 }
 
-void shard_node::remove(uint32_t owner, std::string bucket, std::string key, std::string version_id,
+void shard_node::remove(uint32_t owner, std::string bucket, std::string key, std::string version_id, bool bypass,
                         std::function<void(remove_result)> cb)
 {
     ++m_c.removes_out;
     auto alive = m_alive;
-    m_transport.call(owner, wire::encode_remove(bucket, key, version_id),
+    m_transport.call(owner, wire::encode_remove(bucket, key, version_id, bypass),
                      [this, alive, cb](bool ok, std::string_view reply)
     {
         if (!*alive)
@@ -121,12 +121,13 @@ void shard_node::remove(uint32_t owner, std::string bucket, std::string key, std
     });
 }
 
-void shard_node::set_tags(uint32_t owner, std::string bucket, std::string key, std::string version_id,
-                          std::string tags, std::function<void(st, std::string)> cb)
+void shard_node::change_header(uint32_t owner, std::string bucket, std::string key, std::string version_id,
+                               header_change change, std::function<void(st, std::string)> cb)
 {
     ++m_c.tags_out;
     auto alive = m_alive;
-    m_transport.call(owner, wire::encode_set_tags(bucket, key, version_id, tags),
+    m_transport.call(owner, wire::encode_set_tags(bucket, key, version_id, change.value,
+                                                  static_cast<uint8_t>(change.what), change.bypass),
                      [this, alive, cb](bool ok, std::string_view reply)
     {
         if (!*alive)
@@ -412,6 +413,7 @@ std::string doc_label(bucket_doc kind)
         case bucket_doc::versioning: return "versioning configuration";
         case bucket_doc::encryption: return "encryption configuration";
         case bucket_doc::tagging:    return "tag set";
+        case bucket_doc::object_lock: return "object lock configuration";
     }
     return "configuration";
 }
@@ -454,6 +456,13 @@ void shard_node::run_doc(bucket_doc kind, std::string name, std::string xml, std
     auto alive = m_alive;
     auto run = [this, alive, kind, name, xml = std::move(xml), cb = std::move(cb)]()
     {
+        // Judged here, in the order shard 0 makes the bucket's changes, so two that conflict cannot both pass.
+        if (const st c = m_store.doc_conflict(kind, name, xml); c != st::ok)
+        {
+            cb(c);
+            doc_next(name);
+            return;
+        }
         // The change is a file beside the document until every shard has promised to serve nothing of the bucket
         // without first learning how it ended, so no shard that missed the outcome can go on with the old one.
         m_store.stage_doc(kind, name, xml, [this, alive, kind, name, xml, cb](st s)
@@ -1122,27 +1131,32 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
         case wire::op::remove:
         {
             std::string bucket, key, version_id;
-            if (!wire::decode_remove(payload, bucket, key, &version_id))
+            bool bypass = false;
+            if (!wire::decode_remove(payload, bucket, key, &version_id, &bypass))
             {
                 reply(false, {});
                 return;
             }
             ++m_c.removes_in;
             m_store.remove_version_local(bucket, key, std::move(version_id),
-                [reply](remove_result r) { reply(true, wire::encode_removed(r)); });
+                [reply](remove_result r) { reply(true, wire::encode_removed(r)); }, {}, bypass);
             return;
         }
         case wire::op::set_tags:
         {
-            std::string bucket, key, version_id, tags;
-            if (!wire::decode_set_tags(payload, bucket, key, version_id, tags))
+            std::string bucket, key, version_id;
+            header_change change;
+            uint8_t what = 0;
+            if (!wire::decode_set_tags(payload, bucket, key, version_id, change.value, &what, &change.bypass) ||
+                what > static_cast<uint8_t>(header_change::kind::legal_hold))
             {
                 reply(false, {});
                 return;
             }
+            change.what = static_cast<header_change::kind>(what);
             ++m_c.tags_in;
-            m_store.set_tags_local(bucket, key, std::move(version_id), std::move(tags),
-                                   [reply](st s, std::string id) { reply(true, wire::encode_tagged(s, id)); });
+            m_store.change_header_local(bucket, key, std::move(version_id), std::move(change),
+                                        [reply](st s, std::string id) { reply(true, wire::encode_tagged(s, id)); });
             return;
         }
         case wire::op::list_versions:

@@ -44,7 +44,7 @@ bool decode_record(std::string_view record, std::string& key, object_meta& meta)
 bool status_byte(bytes::reader& r, st& s)
 {
     uint8_t b = 0;
-    if (!r.u8(b) || b > static_cast<uint8_t>(st::unavailable))
+    if (!r.u8(b) || b > static_cast<uint8_t>(st::invalid_bucket_state))
         return false;
     s = static_cast<st>(b);
     return true;
@@ -96,43 +96,59 @@ bool decode_commit(std::string_view payload, commit_request& out)
     return decode_record(rec, key, out.meta) && key == out.key;
 }
 
-std::string encode_remove(std::string_view bucket, std::string_view key, std::string_view version_id)
+std::string encode_remove(std::string_view bucket, std::string_view key, std::string_view version_id, bool bypass)
 {
     bytes::writer w = begin(op::remove);
     w.bytes(bucket);
     w.bytes(key);
     w.bytes(version_id);
+    w.u8(bypass ? 1 : 0);
     return w.take();
 }
 
-bool decode_remove(std::string_view payload, std::string& bucket, std::string& key, std::string* version_id)
+bool decode_remove(std::string_view payload, std::string& bucket, std::string& key, std::string* version_id,
+                   bool* bypass)
 {
     bytes::reader r(payload);
     std::string id;
-    if (!open_request(r, op::remove) || !r.bytes(bucket, name_cap) || !r.bytes(key, name_cap) || !r.bytes(id, 256))
+    bool by = false;
+    if (!open_request(r, op::remove) || !r.bytes(bucket, name_cap) || !r.bytes(key, name_cap) || !r.bytes(id, 256) ||
+        !r.flag(by))
         return false;
     if (version_id)
         *version_id = std::move(id);
+    if (bypass)
+        *bypass = by;
     return true;
 }
 
 std::string encode_set_tags(std::string_view bucket, std::string_view key, std::string_view version_id,
-                            std::string_view tags)
+                            std::string_view value, uint8_t what, bool bypass)
 {
     bytes::writer w = begin(op::set_tags);
     w.bytes(bucket);
     w.bytes(key);
     w.bytes(version_id);
-    w.bytes(tags);
+    w.bytes(value);
+    w.u8(what);
+    w.u8(bypass ? 1 : 0);
     return w.take();
 }
 
 bool decode_set_tags(std::string_view payload, std::string& bucket, std::string& key, std::string& version_id,
-                     std::string& tags)
+                     std::string& value, uint8_t* what, bool* bypass)
 {
     bytes::reader r(payload);
-    return open_request(r, op::set_tags) && r.bytes(bucket, name_cap) && r.bytes(key, name_cap) &&
-           r.bytes(version_id, 256) && r.bytes(tags, record_cap);
+    uint8_t kind = 0;
+    bool    by   = false;
+    if (!open_request(r, op::set_tags) || !r.bytes(bucket, name_cap) || !r.bytes(key, name_cap) ||
+        !r.bytes(version_id, 256) || !r.bytes(value, record_cap) || !r.u8(kind) || !r.flag(by))
+        return false;
+    if (what)
+        *what = kind;
+    if (bypass)
+        *bypass = by;
+    return true;
 }
 
 std::string encode_hot_drop(std::string_view bucket, std::string_view key)

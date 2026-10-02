@@ -98,8 +98,9 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
 
     object_meta meta;
     s3_error    err;
-    // The tags are kept with the upload and land on the object its completion makes.
-    if (!object_meta_from_headers(c, meta, err) || !tagging_from_header(r, meta, err))
+    // The tags and the lock are kept with the upload and land on the object its completion makes.
+    if (!object_meta_from_headers(c, meta, err) || !tagging_from_header(r, meta, err) ||
+        !lock_from_headers(c, meta, err))
     {
         send_error(c, err);
         return;

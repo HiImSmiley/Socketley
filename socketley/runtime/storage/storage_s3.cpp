@@ -9,7 +9,9 @@
 #include "lifecycle.h"
 #include "s3_cors.h"
 #include "s3_names.h"
+#include "s3_object_lock.h"
 #include "s3_tagging.h"
+#include "s3_versioning.h"
 #include "s3_xml_tree.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
@@ -30,7 +32,7 @@ bool unsupported_subresource(const s3_request& r, bool object)
 {
     static constexpr std::string_view names[] = {
         "acl", "tagging", "website", "notification",
-        "object-lock", "retention", "legal-hold", "replication", "accelerate",
+        "replication", "accelerate",
         "requestPayment", "logging", "analytics", "metrics", "inventory", "ownershipControls",
         "publicAccessBlock", "intelligent-tiering", "attributes", "restore", "select", "torrent",
         "acl", "location-constraint",
@@ -47,9 +49,14 @@ bool unsupported_subresource(const s3_request& r, bool object)
         return true;
     if (r.has_query("versions") && (object || r.method != "GET"))
         return true;
+    // A bucket's object lock is read and set, and a version's retention and legal hold likewise.
+    const bool lock_attr = r.has_query("retention") || r.has_query("legal-hold");
+    if ((r.has_query("object-lock") && (object || (r.method != "GET" && r.method != "PUT"))) ||
+        (lock_attr && (!object || (r.method != "GET" && r.method != "PUT"))))
+        return true;
     if (r.has_query("versionId") &&
         (!object || r.has_query("uploadId") ||
-         (r.method != "GET" && r.method != "HEAD" && r.method != "DELETE" && !r.has_query("tagging"))))
+         (r.method != "GET" && r.method != "HEAD" && r.method != "DELETE" && !r.has_query("tagging") && !lock_attr)))
         return true;
     for (const auto& q : r.query)
         for (std::string_view n : names)
@@ -257,7 +264,7 @@ void storage_run::route(const std::shared_ptr<conn>& c)
         deny_request(c, e);
         return;
     }
-    if (s3_error e; !lock_and_class_ok(r, e))
+    if (s3_error e; !storage_class_ok(r, e))
     {
         deny_request(c, e);
         return;
@@ -271,15 +278,16 @@ void storage_run::route(const std::shared_ptr<conn>& c)
 
     // A part's body streams into the upload like an object's into a file.
     const bool part_request = !service && !bucket_level && r.has_query("uploadId") && r.has_query("partNumber");
+    const bool lock_attr = r.has_query("retention") || r.has_query("legal-hold");
     if (r.method == "PUT" && part_request && !r.has_header("x-amz-copy-source") && !r.has_query("tagging") &&
-        !r.has_query("acl") && !unsupported_subresource(r, true))
+        !r.has_query("acl") && !lock_attr && !unsupported_subresource(r, true))
     {
         op_upload_part(c);
         return;
     }
 
     if (r.method == "PUT" && !service && !bucket_level && !r.has_header("x-amz-copy-source") &&
-        !r.has_query("tagging") && !r.has_query("acl") && !unsupported_subresource(r, true))
+        !r.has_query("tagging") && !r.has_query("acl") && !lock_attr && !unsupported_subresource(r, true))
     {
         op_put_object(c);
         return;
@@ -390,6 +398,22 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
     if (bkt && q.has_query("versions"))
     {
         op_list_versions(c);
+        return;
+    }
+    if (bkt && q.has_query("object-lock"))
+    {
+        if (m == "GET")
+            op_get_object_lock_config(c);
+        else
+            op_put_object_lock_config(c);
+        return;
+    }
+    if (!bkt && (q.has_query("retention") || q.has_query("legal-hold")))
+    {
+        if (m == "GET")
+            op_get_lock_attr(c, q.has_query("legal-hold"));
+        else
+            op_put_lock_attr(c, q.has_query("legal-hold"));
         return;
     }
     if (bkt && q.has_query("lifecycle"))
@@ -525,19 +549,48 @@ void storage_run::op_create_bucket(const std::shared_ptr<conn>& c)
 {
     std::weak_ptr<conn> weak = c;
     const std::string name = c->req.bucket;
-    m_node.create_bucket(name, [this, weak, name](st s)
+    const bool lock = http_token_equals(c->req.header("x-amz-bucket-object-lock-enabled"), "true", 4);
+    m_node.create_bucket(name, [this, weak, name, lock](st s)
     {
-        auto cc = weak.lock();
-        if (!cc || cc->dead)
-            return;
-        if (s != st::ok)
+        auto answer = [this, weak, name](st a)
         {
-            send_error_st(cc, s);
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            if (a != st::ok)
+            {
+                send_error_st(cc, a);
+                return;
+            }
+            response r;
+            r.headers.emplace_back("Location", "/" + name);
+            send_response(cc, std::move(r));
+        };
+        if (s != st::ok || !lock)
+        {
+            answer(s);
             return;
         }
-        response r;
-        r.headers.emplace_back("Location", "/" + name);
-        send_response(cc, std::move(r));
+        // Versioning first, since object lock is refused on a bucket without it, and a bucket left without the
+        // lock it was asked for is not left at all.
+        m_node.set_doc(bucket_doc::versioning, name, versioning_xml(versioning::enabled), [this, name, answer](st v)
+        {
+            auto locked = [this, name, answer](st l)
+            {
+                if (l == st::ok)
+                {
+                    answer(st::ok);
+                    return;
+                }
+                m_node.delete_bucket(name, [answer, l](st) { answer(l); });
+            };
+            if (v != st::ok)
+            {
+                locked(v);
+                return;
+            }
+            m_node.set_doc(bucket_doc::object_lock, name, lock_config_xml(lock_config{}), std::move(locked));
+        });
     });
 }
 
@@ -583,20 +636,12 @@ bool storage_run::acl_headers_ok(const s3_request& r, bool bucket, s3_error& err
     return ok;
 }
 
-bool storage_run::lock_and_class_ok(const s3_request& r, s3_error& err)
+bool storage_run::storage_class_ok(const s3_request& r, s3_error& err)
 {
     if (r.method != "PUT" && r.method != "POST")
         return true;
     for (const auto& h : r.headers)
     {
-        // A retention or a legal hold taken and not kept would let an object go that its writer meant to keep.
-        if (h.name.starts_with("x-amz-object-lock-") ||
-            (h.name == "x-amz-bucket-object-lock-enabled" && http_token_equals(h.value, "true", 4)))
-        {
-            err = make_error("NotImplemented");
-            err.message = "Object lock is not implemented by this storage runtime.";
-            return false;
-        }
         // Every class S3 has is stored as STANDARD, the one this storage has, which keeps at least what was asked.
         if (h.name == "x-amz-storage-class")
         {
@@ -1028,6 +1073,7 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
             continue;
         }
         ++m_c.deletes;
+        const bool bypass = !res.version_id.empty() && bypass_allowed(c, res.key);
         m_store.remove_version(b->bucket, res.key, res.version_id, [this, b, i, done_one](remove_result rr)
         {
             delete_result& one = b->results[i];
@@ -1045,7 +1091,7 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
                     one.marker_version_id = rr.version_id;
             }
             done_one(b);
-        });
+        }, bypass);
     }
 }
 
@@ -1122,7 +1168,8 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
     s3_error err;
     // Refused before the body is read, and the body is read off after the
     // answer, so a client still sending it hears the refusal and not a reset.
-    if (!object_meta_from_headers(c, meta, err) || !tagging_from_header(r, meta, err))
+    if (!object_meta_from_headers(c, meta, err) || !tagging_from_header(r, meta, err) ||
+        (m_store.has_bucket(r.bucket) && !lock_from_headers(c, meta, err)))
     {
         deny_request(c, err);
         return;
@@ -1455,6 +1502,12 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
     }
     else
         set_tags_extra(meta, tags_of(*src_meta));
+    // A copy is a new version, whose lock is what this request or the bucket's default gives it and never its source's.
+    if (s3_error err; !lock_from_headers(c, meta, err))
+    {
+        send_error(c, err);
+        return;
+    }
 
     ++m_c.copies;
     std::weak_ptr<conn> weak = c;
@@ -1500,6 +1553,7 @@ void storage_run::op_delete_object(const std::shared_ptr<conn>& c)
     if (!version_param(c, version_id))
         return;
     ++m_c.deletes;
+    const bool bypass = !version_id.empty() && bypass_allowed(c, c->req.key);
     std::weak_ptr<conn> weak = c;
     m_store.remove_version(c->req.bucket, c->req.key, std::move(version_id),
                            [this, weak, bucket = c->req.bucket, key = c->req.key](remove_result rr)
@@ -1523,7 +1577,7 @@ void storage_run::op_delete_object(const std::shared_ptr<conn>& c)
         if (!rr.version_id.empty())
             r.headers.emplace_back("x-amz-version-id", rr.version_id);
         send_response(cc, std::move(r));
-    });
+    }, bypass);
 }
 
 // ─── GetObject, HeadObject ──────────────────────────────────────────────────
@@ -1602,6 +1656,17 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
         if (n == version_extra)
         {
             r.headers.emplace_back("x-amz-version-id", version_of(m).id);
+            continue;
+        }
+        if (retention ret; n == retention_extra && retention_from_value(v, ret))
+        {
+            r.headers.emplace_back("x-amz-object-lock-mode", std::string(lock_mode_name(ret.mode)));
+            r.headers.emplace_back("x-amz-object-lock-retain-until-date", iso8601(ret.until_ms));
+            continue;
+        }
+        if (n == legal_hold_extra)
+        {
+            r.headers.emplace_back("x-amz-object-lock-legal-hold", v);
             continue;
         }
         // What the store keeps for itself about the object's bytes is no header of the object.

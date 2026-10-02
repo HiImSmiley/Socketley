@@ -143,6 +143,46 @@ void set_version_extra(object_meta& m, const version_tag& v);
 void clear_version_extra(object_meta& m);
 // A version id the store could have given, which is also what keeps one out of a path.
 bool valid_version_id(std::string_view id);
+
+// The extra entries of a version's object lock: its retention, 'G' or 'C' and the retain-until time in decimal
+// milliseconds, and its legal hold, ON or OFF once one was ever set.
+inline constexpr std::string_view retention_extra  = "x-socketley-retention";
+inline constexpr std::string_view legal_hold_extra = "x-socketley-legal-hold";
+
+enum class lock_mode : uint8_t
+{
+    none,
+    governance,
+    compliance,
+};
+
+struct retention
+{
+    lock_mode mode{lock_mode::none};
+    int64_t   until_ms{0};
+
+    bool operator==(const retention&) const = default;
+};
+
+// The retention's entry, empty for none, and the retention an entry names, false for one that names none.
+std::string retention_value(const retention& r);
+bool        retention_from_value(std::string_view v, retention& out);
+retention retention_of(const object_meta& m);
+// Makes `r` the version's retention, as an entry after the tags, or removes it when its mode is none.
+void set_retention_extra(object_meta& m, const retention& r);
+// ON, OFF, or empty for a version whose legal hold was never set.
+std::string_view legal_hold_of(const object_meta& m);
+void set_legal_hold_extra(object_meta& m, std::string_view status);
+// Whether `m` carries either entry, which is what makes its slot record them.
+bool has_lock_extra(const object_meta& m);
+// Removes both, for a copy, whose lock is its own and never its source's.
+void clear_lock_extras(object_meta& m);
+// Whether the version may not be removed or replaced at `now_ms`: a legal hold is on, or a retention is in force
+// that `bypass` does not lift, which it does only for GOVERNANCE.
+bool lock_holds(const object_meta& m, int64_t now_ms, bool bypass);
+// Whether a version retained as `cur` may be retained as `want` at `now_ms`: a COMPLIANCE retention in force only
+// lengthened, a GOVERNANCE one lengthened freely and shortened, removed or made COMPLIANCE only with `bypass`.
+bool retention_change_allowed(const retention& cur, const retention& want, int64_t now_ms, bool bypass);
 // The path of a key's noncurrent version below its bucket directory.
 std::string version_rel_path(std::string_view key, std::string_view id);
 
@@ -201,16 +241,20 @@ struct decoded_header
     // The slot in that padding whose tags replaced the ones the header was written with, -1 for none.
     int8_t        tag_slot{-1};
     uint64_t      tag_seq{0};
+    // That slot replaced the object lock entries too, as only one written for a version with a lock does.
+    bool          lock_slot{false};
 };
 
-// Tags changed after an object was written go into one of two slots in the
-// padding of its header's first 4 KiB, whole 512-byte sectors written in turn
-// and checksummed with a sequence number, so a torn write of one leaves the
-// other and the object's bytes, ETag and time never move.
+// Tags, a retention and a legal hold changed after an object was written go
+// into one of two slots in the padding of its header's first 4 KiB, whole
+// 512-byte sectors written in turn and checksummed with a sequence number, so a
+// torn write of one leaves the other and the object's bytes, ETag and time never move.
 decoded_header decode_object_header(std::string_view bytes);
 
-// The bytes that make `tags` the tags of the object `d` decoded, and the offset
+// The bytes that make `want`'s tags, retention and legal hold those of the object `d` decoded, and the offset
 // they go at, or empty when its header has no room for them.
+std::string encode_tag_slot(const decoded_header& d, const object_meta& want, uint64_t& at);
+// The same for a change of the tags alone.
 std::string encode_tag_slot(const decoded_header& d, std::string_view tags, uint64_t& at);
 
 // ─── The index journal ──────────────────────────────────────────────────────

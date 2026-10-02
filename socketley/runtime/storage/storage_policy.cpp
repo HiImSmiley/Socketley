@@ -240,16 +240,7 @@ policy_effect storage_run::policy_effect_of(const std::shared_ptr<conn>& c, std:
 
 bool storage_run::policy_allows_version_delete(const std::shared_ptr<conn>& c, std::string_view key)
 {
-    policy_request q;
-    q.action    = s3_action::delete_object_version;
-    q.key       = key;
-    q.anonymous = c->anonymous;
-    q.principal = c->principal;
-    q.tls       = c->ssl != nullptr;
-    q.ip        = &c->ip;
-    const policy_effect e = policy_effect_of(c, c->req.bucket, q);
-    // A request a policy let in is let delete a version only by an Allow of that too.
-    return e != policy_effect::deny && (!c->policy_admitted || e == policy_effect::allow);
+    return policy_allows(c, s3_action::delete_object_version, key);
 }
 
 }   // namespace socketley::storage

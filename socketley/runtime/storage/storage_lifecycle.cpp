@@ -270,7 +270,8 @@ bool storage_run::lifecycle_walk(lifecycle_pass& p)
                 const object_meta* newer = latest;
                 for (const object_meta& v : versions)
                 {
-                    if (newer && !is_delete_marker(v) &&
+                    // A version under a retention or a legal hold is not expired, whatever the rule says.
+                    if (newer && !is_delete_marker(v) && !lock_holds(v, now, false) &&
                         lifecycle_noncurrent_due(rule, key, v, newer->mtime_ms, now, m_lc_day_ms))
                         p.due.push_back({name, key, p.cfg, p.rule, false, version_of(v).id});
                     newer = &v;
@@ -336,7 +337,7 @@ void storage_run::lifecycle_issue(lifecycle_pass& p)
                 if (m_lc && m_lc->id == id)
                     ++m_lc->expired;
             }
-            else if (r.status != st::ok && r.status != st::no_such_bucket)
+            else if (r.status != st::ok && r.status != st::no_such_bucket && r.status != st::locked)
                 LOG_WARN(("storage: lifecycle could not remove a version of " + bucket + "/" + key + ": " +
                           status_name(r.status)).c_str());
             lifecycle_done(id);

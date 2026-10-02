@@ -138,11 +138,11 @@ constexpr action_name action_names[] = {
     {"DeleteObjectVersionTagging", res_kind::object, s3_action::delete_object_version_tagging},
     {"GetObjectAttributes", res_kind::object, s3_action::get_object_attributes},
     {"GetObjectVersionAttributes", res_kind::object, s3_action::get_object_version_attributes},
-    {"GetObjectRetention", res_kind::object, s3_action::none},
-    {"PutObjectRetention", res_kind::object, s3_action::none},
-    {"GetObjectLegalHold", res_kind::object, s3_action::none},
-    {"PutObjectLegalHold", res_kind::object, s3_action::none},
-    {"BypassGovernanceRetention", res_kind::object, s3_action::none},
+    {"GetObjectRetention", res_kind::object, s3_action::get_object_retention},
+    {"PutObjectRetention", res_kind::object, s3_action::put_object_retention},
+    {"GetObjectLegalHold", res_kind::object, s3_action::get_object_legal_hold},
+    {"PutObjectLegalHold", res_kind::object, s3_action::put_object_legal_hold},
+    {"BypassGovernanceRetention", res_kind::object, s3_action::bypass_governance_retention},
     {"RestoreObject", res_kind::object, s3_action::none},
     {"GetObjectTorrent", res_kind::object, s3_action::none},
     {"GetObjectVersionTorrent", res_kind::object, s3_action::none},
@@ -167,8 +167,8 @@ constexpr action_name action_names[] = {
     {"PutEncryptionConfiguration", res_kind::bucket, s3_action::put_encryption_configuration},
     {"GetReplicationConfiguration", res_kind::bucket, s3_action::none},
     {"PutReplicationConfiguration", res_kind::bucket, s3_action::none},
-    {"GetBucketObjectLockConfiguration", res_kind::bucket, s3_action::none},
-    {"PutBucketObjectLockConfiguration", res_kind::bucket, s3_action::none},
+    {"GetBucketObjectLockConfiguration", res_kind::bucket, s3_action::get_bucket_object_lock_configuration},
+    {"PutBucketObjectLockConfiguration", res_kind::bucket, s3_action::put_bucket_object_lock_configuration},
     {"GetBucketPublicAccessBlock", res_kind::bucket, s3_action::none},
     {"PutBucketPublicAccessBlock", res_kind::bucket, s3_action::none},
     {"GetBucketOwnershipControls", res_kind::bucket, s3_action::none},
@@ -623,6 +623,12 @@ s3_action action_of_operation(std::string_view op)
         {"GetBucketEncryption", s3_action::get_encryption_configuration},
         {"PutBucketEncryption", s3_action::put_encryption_configuration},
         {"DeleteBucketEncryption", s3_action::put_encryption_configuration},
+        {"GetObjectLockConfiguration", s3_action::get_bucket_object_lock_configuration},
+        {"PutObjectLockConfiguration", s3_action::put_bucket_object_lock_configuration},
+        {"GetObjectRetention", s3_action::get_object_retention},
+        {"PutObjectRetention", s3_action::put_object_retention},
+        {"GetObjectLegalHold", s3_action::get_object_legal_hold},
+        {"PutObjectLegalHold", s3_action::put_object_legal_hold},
     };
     for (const row& r : table)
         if (r.op == op)
@@ -653,6 +659,11 @@ bool action_on_object(s3_action a)
         case s3_action::put_object_acl:
         case s3_action::get_object_version_acl:
         case s3_action::put_object_version_acl:
+        case s3_action::get_object_retention:
+        case s3_action::put_object_retention:
+        case s3_action::get_object_legal_hold:
+        case s3_action::put_object_legal_hold:
+        case s3_action::bypass_governance_retention:
             return true;
         default:
             return false;

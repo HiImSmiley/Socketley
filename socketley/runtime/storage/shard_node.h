@@ -71,10 +71,10 @@ public:
 
     // ── Asked of the owner of a key ─────────────────────────────────────────
     void commit(uint32_t owner, commit_request req, std::function<void(put_result)> cb) override;
-    void remove(uint32_t owner, std::string bucket, std::string key, std::string version_id,
+    void remove(uint32_t owner, std::string bucket, std::string key, std::string version_id, bool bypass,
                 std::function<void(remove_result)> cb) override;
-    void set_tags(uint32_t owner, std::string bucket, std::string key, std::string version_id, std::string tags,
-                  std::function<void(st, std::string)> cb) override;
+    void change_header(uint32_t owner, std::string bucket, std::string key, std::string version_id,
+                       header_change change, std::function<void(st, std::string)> cb) override;
     // Sent by the owner before it answers a commit or a delete, so no sibling answers the old bytes after it.
     void invalidate(std::string bucket, std::string key, std::function<void()> done) override;
     void hold(uint32_t owner, std::string bucket, std::string key, const object_meta& read,

@@ -79,6 +79,8 @@ std::string_view storage_run::operation_name(const s3_request& r)
     if (bucket_level && r.has_query("encryption"))
         return m == "GET" ? "GetBucketEncryption" : m == "PUT" ? "PutBucketEncryption"
              : m == "DELETE" ? "DeleteBucketEncryption" : "Unknown";
+    if (bucket_level && r.has_query("object-lock"))
+        return m == "GET" ? "GetObjectLockConfiguration" : m == "PUT" ? "PutObjectLockConfiguration" : "Unknown";
     if (bucket_level && r.has_query("lifecycle"))
         return m == "GET" ? "GetBucketLifecycleConfiguration" : m == "PUT" ? "PutBucketLifecycleConfiguration"
              : m == "DELETE" ? "DeleteBucketLifecycle" : "Unknown";
@@ -101,6 +103,10 @@ std::string_view storage_run::operation_name(const s3_request& r)
     if (r.has_query("tagging"))
         return m == "GET" ? "GetObjectTagging" : m == "PUT" ? "PutObjectTagging"
              : m == "DELETE" ? "DeleteObjectTagging" : "Unknown";
+    if (r.has_query("retention"))
+        return m == "GET" ? "GetObjectRetention" : m == "PUT" ? "PutObjectRetention" : "Unknown";
+    if (r.has_query("legal-hold"))
+        return m == "GET" ? "GetObjectLegalHold" : m == "PUT" ? "PutObjectLegalHold" : "Unknown";
     const bool upload = r.has_query("uploadId");
     if (m == "GET")
         return upload ? "ListParts" : r.has_query("attributes") ? "GetObjectAttributes" : "GetObject";

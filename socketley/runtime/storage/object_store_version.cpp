@@ -494,10 +494,25 @@ void object_store::vop_install(std::shared_ptr<vop> v)
     }
     // A null version written over a key whose null version is noncurrent replaces that one.
     bool drop_null = false;
+    bool locked    = false;
+    const int64_t now = static_cast<int64_t>(now_ms());
     if (null_new)
+    {
         if (const auto vs = b->versions.find(v->key); vs != b->versions.end())
             for (const object_meta& m : vs->second)
-                drop_null = drop_null || (&m != latest && version_of(m).id == "null");
+                if (&m != latest && version_of(m).id == "null")
+                {
+                    drop_null = true;
+                    locked    = locked || lock_holds(m, now, false);
+                }
+        locked = locked || (latest && keep_id.empty() && lock_holds(*latest, now, false));
+    }
+    // A null version replaced in place is gone, which no lock on it allows.
+    if (locked)
+    {
+        vop_end(std::move(v), st::locked);
+        return;
+    }
 
     const int data_fd = b->data_fd;
     const int dir_fd  = b->dir_fd;
@@ -636,8 +651,8 @@ void object_store::vop_end(std::shared_ptr<vop> v, st s)
 // ─── Deletes ────────────────────────────────────────────────────────────────
 
 void object_store::remove_versioned(std::string bucket_name, std::string key, std::string version_id,
-                                    std::function<bool(const object_meta&)> only_if, std::function<void()> release,
-                                    std::function<void(remove_result)> cb)
+                                    std::function<bool(const object_meta&)> only_if, bool bypass,
+                                    std::function<void()> release, std::function<void(remove_result)> cb)
 {
     auto v        = std::make_shared<vop>();
     v->alive      = m_alive;
@@ -716,6 +731,11 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
     if (!f || (v->only_if && !v->only_if(*f)))
     {
         answer({st::ok, false, false, v->version_id});
+        return;
+    }
+    if (lock_holds(*f, static_cast<int64_t>(now_ms()), bypass))
+    {
+        answer({st::locked, true, false, v->version_id});
         return;
     }
     v->rr = {st::ok, true, is_delete_marker(*f), v->version_id};

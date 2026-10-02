@@ -121,6 +121,10 @@ inline s3_error make_error(std::string_view code)
         {"NoSuchCORSConfiguration", 404, "The CORS configuration does not exist"},
         {"NoSuchBucketPolicy", 404, "The bucket policy does not exist"},
         {"NoSuchTagSet", 404, "The TagSet does not exist"},
+        {"ObjectLockConfigurationNotFoundError", 404, "Object Lock configuration does not exist for this bucket"},
+        {"NoSuchObjectLockConfiguration", 404, "The specified object does not have a ObjectLock configuration"},
+        {"InvalidRetentionPeriod", 400, "Default retention period must be a positive integer value."},
+        {"InvalidBucketState", 409, "The request is not valid with the current state of the bucket."},
         {"ServerSideEncryptionConfigurationNotFoundError", 404, "The server side encryption configuration was not found"},
         {"InvalidEncryptionAlgorithmError", 400, "The encryption request you specified is not valid. The valid value is AES256."},
         {"MalformedPolicy", 400, "Policies must be valid JSON and the first byte must be '{'"},
@@ -164,6 +168,19 @@ inline s3_error error_for(st s)
         // A delete marker has no bytes, tags or metadata to act on.
         case st::delete_marker:       return make_error("MethodNotAllowed");
         case st::unavailable:         return make_error("ServiceUnavailable");
+        case st::locked:
+        {
+            s3_error e = make_error("AccessDenied");
+            e.message  = "Access Denied because object protected by object lock.";
+            return e;
+        }
+        case st::invalid_bucket_state:
+        {
+            s3_error e = make_error("InvalidBucketState");
+            e.message  = "Object Lock configuration cannot be enabled on existing buckets unless versioning is "
+                         "Enabled, and versioning cannot be changed on a bucket with object lock.";
+            return e;
+        }
         case st::ok:
         case st::io_error:
             break;

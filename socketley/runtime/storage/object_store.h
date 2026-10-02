@@ -12,6 +12,7 @@
 //   <dir>/<bucket>/index.<shard>      the journal of puts and deletes
 //   <dir>/<bucket>/tmp/<random>       a body on its way in
 //   <dir>/<bucket>/lifecycle          its LifecycleConfiguration, likewise
+//   <dir>/<bucket>/object-lock        its ObjectLockConfiguration, likewise, which is never removed
 //   <dir>/<bucket>/policy             its bucket policy, likewise
 //   <dir>/<bucket>/versioning         its VersioningConfiguration, likewise
 //   <dir>/<bucket>/versions/ab/<hash>.<id>
@@ -51,6 +52,7 @@ namespace socketley::storage
 
 struct cors_config;
 struct lifecycle_config;
+struct lock_config;
 class bucket_policy;
 
 // The configuration documents a bucket keeps beside its objects, each in a file named for it.
@@ -62,10 +64,12 @@ enum class bucket_doc : uint8_t
     versioning,
     encryption,
     tagging,
+    object_lock,
 };
 // Every kind, for the walks that settle or take up all of a bucket's documents.
-inline constexpr bucket_doc all_bucket_docs[] = {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy,
-                                                 bucket_doc::versioning, bucket_doc::encryption, bucket_doc::tagging};
+inline constexpr bucket_doc all_bucket_docs[] = {bucket_doc::cors,       bucket_doc::lifecycle, bucket_doc::policy,
+                                                 bucket_doc::versioning, bucket_doc::encryption, bucket_doc::tagging,
+                                                 bucket_doc::object_lock};
 
 // A bucket's versioning: never configured, keeping every version, or writing the null version.
 enum class versioning : uint8_t
@@ -103,6 +107,10 @@ enum class st : uint8_t
     delete_marker,
     // A shard that had to take part could not be reached, so nothing was changed.
     unavailable,
+    // The version is under a retention or a legal hold that the request may not lift.
+    locked,
+    // The change does not fit the bucket's other configuration: object lock and versioning that is not Enabled.
+    invalid_bucket_state,
 };
 
 const char* status_name(st s);
@@ -283,6 +291,17 @@ struct put_condition
 // Whether a write under `c` may replace `current`, null for a key that is not there:
 // ok, precondition_failed, or no_such_key for an If-Match with nothing to match.
 st check_put_condition(const put_condition& c, const object_meta* current);
+
+// A change of what a version keeps in its header's slots, made in place by the owner of its key.
+struct header_change
+{
+    enum class kind : uint8_t { tags, retention, legal_hold };
+    kind        what{kind::tags};
+    // The tags in the encoding of tags_of(), the retention in retention_extra's (empty to remove it), or ON or OFF.
+    std::string value;
+    // The caller may shorten, remove or change a GOVERNANCE retention.
+    bool        bypass{false};
+};
 
 // What the owner of a key needs to make a body a visible object.
 struct commit_request
@@ -499,10 +518,11 @@ public:
     virtual ~shard_peers() = default;
     virtual void commit(uint32_t owner, commit_request req, std::function<void(put_result)> cb) = 0;
     // `version_id` empty deletes the key as the bucket's versioning says, and otherwise that version of it.
-    virtual void remove(uint32_t owner, std::string bucket, std::string key, std::string version_id,
+    // `bypass` lets the removal of a version go past a GOVERNANCE retention.
+    virtual void remove(uint32_t owner, std::string bucket, std::string key, std::string version_id, bool bypass,
                         std::function<void(remove_result)> cb) = 0;
-    virtual void set_tags(uint32_t owner, std::string bucket, std::string key, std::string version_id,
-                          std::string tags, std::function<void(st, std::string version_id)> cb) = 0;
+    virtual void change_header(uint32_t owner, std::string bucket, std::string key, std::string version_id,
+                               header_change change, std::function<void(st, std::string version_id)> cb) = 0;
     // Tells every sibling that may hold the key to drop it, and `done` runs once each has answered or is gone.
     virtual void invalidate(std::string bucket, std::string key, std::function<void()> done) = 0;
     // Asks the owner whether `read` is the version it indexes, which also has it tell this shard when that changes.
@@ -578,6 +598,10 @@ public:
     const cors_config* bucket_cors(std::string_view name) const;
     // The bucket's Tagging document, null when it has none.
     std::shared_ptr<const std::string> bucket_tagging(std::string_view name) const;
+    // The bucket's object lock configuration, null when object lock was never enabled on it.
+    std::shared_ptr<const lock_config> bucket_lock(std::string_view name) const;
+    // Whether a document of `kind` may become `xml` beside the bucket's others, which shard 0 asks in the order of its changes.
+    st doc_conflict(bucket_doc kind, std::string_view name, std::string_view xml) const;
     // The bucket's lifecycle rules, null when it has none.
     std::shared_ptr<const lifecycle_config> lifecycle(std::string_view name) const;
     // How many buckets have lifecycle rules.
@@ -679,21 +703,29 @@ public:
     // `only_if`, when given, is asked under the key's lane and keeps an object it says no to.
     void remove_local(std::string_view bucket, std::string_view key, std::function<void(st, bool existed)> cb,
                       std::function<bool(const object_meta&)> only_if = {});
-    // The same with the version: `version_id` empty deletes the key, and otherwise removes that version for good.
+    // The same with the version: `version_id` empty deletes the key, and otherwise removes that version for good,
+    // which a retention or legal hold refuses as st::locked unless `bypass` lifts a GOVERNANCE retention.
     void remove_version(std::string_view bucket, std::string_view key, std::string version_id,
-                        std::function<void(remove_result)> cb);
+                        std::function<void(remove_result)> cb, bool bypass = false);
     // `only_if` is asked of the version that would be removed, or of the latest before a marker covers it.
     void remove_version_local(std::string_view bucket, std::string_view key, std::string version_id,
                               std::function<void(remove_result)> cb,
-                              std::function<bool(const object_meta&)> only_if = {});
+                              std::function<bool(const object_meta&)> only_if = {}, bool bypass = false);
 
-    // Makes `tags`, in the encoding of tags_of(), the tags of an object or of its version `version_id`, keeping
-    // its bytes, ETag and time; `cb` is told the version it changed.
-    void set_tags(std::string_view bucket, std::string_view key, std::string version_id, std::string tags,
-                  std::function<void(st, std::string)> cb);
+    // Makes `change` of an object or of its version `version_id`, keeping its bytes, ETag and time; `cb` is told
+    // the version it changed.
+    void change_header(std::string_view bucket, std::string_view key, std::string version_id, header_change change,
+                       std::function<void(st, std::string)> cb);
     // The step itself, which only the owner of the key may run.
-    void set_tags_local(std::string_view bucket, std::string_view key, std::string version_id, std::string tags,
-                        std::function<void(st, std::string)> cb);
+    void change_header_local(std::string_view bucket, std::string_view key, std::string version_id,
+                             header_change change, std::function<void(st, std::string)> cb);
+    // Makes `tags`, in the encoding of tags_of(), the tags of an object or of its version `version_id`.
+    void set_tags(std::string_view bucket, std::string_view key, std::string version_id, std::string tags,
+                  std::function<void(st, std::string)> cb)
+    {
+        change_header(bucket, key, std::move(version_id), header_change{header_change::kind::tags, std::move(tags)},
+                      std::move(cb));
+    }
     void set_tags(std::string_view bucket, std::string_view key, std::string tags, std::function<void(st)> cb)
     {
         set_tags(bucket, key, {}, std::move(tags), [cb = std::move(cb)](st s, std::string) { cb(s); });
@@ -822,6 +854,8 @@ private:
         std::shared_ptr<const bucket_policy> policy;
         // The bucket's own Tagging document, as it was set.
         std::shared_ptr<const std::string> tagging;
+        // Its object lock configuration, which once set is never removed.
+        std::shared_ptr<const lock_config> lock;
         versioning  vstate{versioning::off};
         // Per key, every version but a latest that is not a delete marker, newest first: the key's
         // noncurrent versions, behind its latest when that is a marker; empty unless the bucket was versioned.
@@ -942,8 +976,8 @@ private:
     void commit_versioned(std::string bucket, std::string key, std::string tmp, bool pooled, object_meta meta,
                           std::function<void()> release, std::function<void(put_result)> cb);
     void remove_versioned(std::string bucket, std::string key, std::string version_id,
-                          std::function<bool(const object_meta&)> only_if, std::function<void()> release,
-                          std::function<void(remove_result)> cb);
+                          std::function<bool(const object_meta&)> only_if, bool bypass,
+                          std::function<void()> release, std::function<void(remove_result)> cb);
     void vop_header(std::shared_ptr<vop> v);
     void vop_copy(std::shared_ptr<vop> v, int src, uint64_t data_off);
     void vop_install(std::shared_ptr<vop> v);
@@ -959,7 +993,7 @@ private:
     void version_probe_step(std::shared_ptr<version_probe> p);
     // The bytes of noncurrent versions, counted with the bucket's.
     void version_bytes(bucket& b, int64_t delta);
-    // A tag change whose header is read: written into one of its slots, or the object written again with it.
+    // A header change whose header is read: written into one of its slots, or the object written again with it.
     struct tag_change;
     void tags_in_place(std::shared_ptr<tag_change> tc, std::string slot, uint64_t at);
     void tags_rewrite(std::shared_ptr<tag_change> tc, uint64_t data_off);

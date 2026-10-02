@@ -681,6 +681,9 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
         else if (kind == bucket_doc::encryption)
             LOG_ERROR(("storage: the encryption configuration of bucket " + name + " does not parse (" + why +
                        "), so its new objects are encrypted with AES256 until it is replaced or deleted").c_str());
+        else if (kind == bucket_doc::object_lock)
+            LOG_ERROR(("storage: the object lock configuration of bucket " + name + " does not parse (" + why +
+                       "), so the bucket keeps object lock with no default retention until it is replaced").c_str());
         else
             LOG_WARN(("storage: the " + std::string(doc_file(kind)) + " configuration of bucket " + name +
                       " does not parse and is not applied: " + why).c_str());

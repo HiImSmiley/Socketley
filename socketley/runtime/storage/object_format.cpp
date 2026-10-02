@@ -21,6 +21,8 @@ constexpr size_t           prelude_len = 24;
 constexpr size_t           max_record_bytes = 64 * 1024;
 
 constexpr std::string_view slot_magic = std::string_view("SKLTAG\x01\x00", 8);
+// A slot whose payload is the tags, the retention and the legal hold, each a length and its bytes.
+constexpr std::string_view lock_slot_magic = std::string_view("SKLTAG\x02\x00", 8);
 constexpr std::string_view part_list_magic = std::string_view("SKLPRT\x01\x00", 8);
 // magic, sequence, payload length, crc.
 constexpr size_t           slot_head  = 24;
@@ -254,6 +256,93 @@ void set_version_extra(object_meta& m, const version_tag& v)
 void clear_version_extra(object_meta& m)
 {
     std::erase_if(m.extra, [](const auto& e) { return e.first == version_extra; });
+}
+
+std::string retention_value(const retention& r)
+{
+    if (r.mode == lock_mode::none)
+        return {};
+    return (r.mode == lock_mode::governance ? "G" : "C") + std::to_string(r.until_ms);
+}
+
+bool retention_from_value(std::string_view v, retention& out)
+{
+    out = retention{};
+    if (v.size() < 2 || (v[0] != 'G' && v[0] != 'C'))
+        return false;
+    int64_t until = 0;
+    const auto p = std::from_chars(v.data() + 1, v.data() + v.size(), until);
+    if (p.ec != std::errc{} || p.ptr != v.data() + v.size())
+        return false;
+    out.mode     = v[0] == 'G' ? lock_mode::governance : lock_mode::compliance;
+    out.until_ms = until;
+    return true;
+}
+
+retention retention_of(const object_meta& m)
+{
+    retention r;
+    for (const auto& [n, v] : m.extra)
+        if (n == retention_extra && retention_from_value(v, r))
+            return r;
+    return {};
+}
+
+void set_retention_extra(object_meta& m, const retention& r)
+{
+    std::erase_if(m.extra, [](const auto& e) { return e.first == retention_extra; });
+    if (r.mode != lock_mode::none)
+        m.extra.emplace_back(std::string(retention_extra), retention_value(r));
+}
+
+std::string_view legal_hold_of(const object_meta& m)
+{
+    for (const auto& [n, v] : m.extra)
+        if (n == legal_hold_extra)
+            return v;
+    return {};
+}
+
+void set_legal_hold_extra(object_meta& m, std::string_view status)
+{
+    std::string kept(status);
+    std::erase_if(m.extra, [](const auto& e) { return e.first == legal_hold_extra; });
+    if (!kept.empty())
+        m.extra.emplace_back(std::string(legal_hold_extra), std::move(kept));
+}
+
+bool has_lock_extra(const object_meta& m)
+{
+    for (const auto& [n, v] : m.extra)
+        if (n == retention_extra || n == legal_hold_extra)
+            return true;
+    return false;
+}
+
+void clear_lock_extras(object_meta& m)
+{
+    std::erase_if(m.extra, [](const auto& e) { return e.first == retention_extra || e.first == legal_hold_extra; });
+}
+
+bool lock_holds(const object_meta& m, int64_t now_ms, bool bypass)
+{
+    if (!has_lock_extra(m))
+        return false;
+    if (legal_hold_of(m) == "ON")
+        return true;
+    const retention r = retention_of(m);
+    if (r.mode == lock_mode::none || r.until_ms <= now_ms)
+        return false;
+    return r.mode == lock_mode::compliance || !bypass;
+}
+
+bool retention_change_allowed(const retention& cur, const retention& want, int64_t now_ms, bool bypass)
+{
+    if (cur.mode == lock_mode::none || cur.until_ms <= now_ms)
+        return true;
+    if (cur.mode == lock_mode::compliance)
+        return want.mode == lock_mode::compliance && want.until_ms >= cur.until_ms;
+    return (want.mode == lock_mode::governance && want.until_ms >= cur.until_ms) || bypass;
 }
 
 std::string version_rel_path(std::string_view key, std::string_view id)
@@ -617,7 +706,8 @@ decoded_header decode_object_header(std::string_view bytes)
     for (int i = 0; i < 2 && l.room; ++i)
     {
         const size_t off = l.off[i];
-        if (bytes.size() < off + slot_head || bytes.substr(off, 8) != slot_magic)
+        if (bytes.size() < off + slot_head ||
+            (bytes.substr(off, 8) != slot_magic && bytes.substr(off, 8) != lock_slot_magic))
             continue;
         uint64_t seq;
         uint32_t len, scrc;
@@ -631,29 +721,77 @@ decoded_header decode_object_header(std::string_view bytes)
         c          = raft::storage::crc32c(payload.data(), payload.size(), c);
         if (c != scrc)
             continue;
-        d.tag_slot = static_cast<int8_t>(i);
-        d.tag_seq  = seq;
-        tags       = payload;
+        if (bytes.substr(off, 8) == lock_slot_magic)
+        {
+            reader r{payload};
+            r.str();
+            r.str();
+            r.str();
+            if (!r.ok || !r.in.empty())
+                continue;
+        }
+        d.tag_slot  = static_cast<int8_t>(i);
+        d.tag_seq   = seq;
+        d.lock_slot = bytes.substr(off, 8) == lock_slot_magic;
+        tags        = payload;
     }
-    if (d.tag_slot >= 0)
+    if (d.tag_slot < 0)
+        return d;
+    if (!d.lock_slot)
+    {
         set_tags_extra(d.meta, tags);
+        return d;
+    }
+    reader r{tags};
+    const std::string_view t    = r.str();
+    const std::string_view ret  = r.str();
+    const std::string_view hold = r.str();
+    set_tags_extra(d.meta, t);
+    std::erase_if(d.meta.extra, [](const auto& e) { return e.first == retention_extra; });
+    if (!ret.empty())
+        d.meta.extra.emplace_back(std::string(retention_extra), std::string(ret));
+    set_legal_hold_extra(d.meta, hold);
     return d;
+}
+
+std::string encode_tag_slot(const decoded_header& d, const object_meta& want, uint64_t& at)
+{
+    const slot_layout l = layout_of(d.meta_end, d.header_len);
+    if (d.status != header_status::ok || l.room == 0)
+        return {};
+    // The tags alone while no lock was ever recorded, so a header no version of the lock touched reads as it did.
+    const bool lock = d.lock_slot || has_lock_extra(d.meta) || has_lock_extra(want);
+    std::string payload;
+    if (lock)
+    {
+        std::string ret;
+        for (const auto& [n, v] : want.extra)
+            if (n == retention_extra)
+                ret = v;
+        put_str(payload, tags_of(want));
+        put_str(payload, ret);
+        put_str(payload, legal_hold_of(want));
+    }
+    else
+        payload = std::string(tags_of(want));
+    if (slot_head + payload.size() > l.room)
+        return {};
+    std::string s(lock ? lock_slot_magic : slot_magic);
+    put_u64(s, d.tag_seq + 1);
+    put_u32(s, static_cast<uint32_t>(payload.size()));
+    uint32_t c = raft::storage::crc32c(s.data(), s.size());
+    c          = raft::storage::crc32c(payload.data(), payload.size(), c);
+    put_u32(s, c);
+    s.append(payload);
+    at = l.off[d.tag_slot == 0 ? 1 : 0];
+    return s;
 }
 
 std::string encode_tag_slot(const decoded_header& d, std::string_view tags, uint64_t& at)
 {
-    const slot_layout l = layout_of(d.meta_end, d.header_len);
-    if (d.status != header_status::ok || l.room == 0 || slot_head + tags.size() > l.room)
-        return {};
-    std::string s(slot_magic);
-    put_u64(s, d.tag_seq + 1);
-    put_u32(s, static_cast<uint32_t>(tags.size()));
-    uint32_t c = raft::storage::crc32c(s.data(), s.size());
-    c          = raft::storage::crc32c(tags.data(), tags.size(), c);
-    put_u32(s, c);
-    s.append(tags);
-    at = l.off[d.tag_slot == 0 ? 1 : 0];
-    return s;
+    object_meta want = d.meta;
+    set_tags_extra(want, tags);
+    return encode_tag_slot(d, want, at);
 }
 
 std::string encode_journal_header(uint32_t shard, uint32_t nshards)

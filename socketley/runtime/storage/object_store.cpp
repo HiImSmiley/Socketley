@@ -17,6 +17,7 @@
 #include "s3_cors.h"
 #include "s3_encryption.h"
 #include "s3_names.h"
+#include "s3_object_lock.h"
 #include "s3_versioning.h"
 #include "shard_owner.h"
 #include "../../shared/logging.h"
@@ -78,6 +79,8 @@ const char* status_name(st s)
         case st::no_such_version:     return "no such version";
         case st::delete_marker:       return "delete marker";
         case st::unavailable:         return "unavailable";
+        case st::locked:              return "locked";
+        case st::invalid_bucket_state: return "invalid bucket state";
     }
     return "unknown";
 }
@@ -1544,12 +1547,12 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
 }
 
 void object_store::remove_version(std::string_view bucket_name, std::string_view key_sv, std::string version_id,
-                                  std::function<void(remove_result)> cb)
+                                  std::function<void(remove_result)> cb, bool bypass)
 {
     const uint32_t owner = owner_of(bucket_name, key_sv);
     if (owner == m_opts.shard)
     {
-        remove_version_local(bucket_name, key_sv, std::move(version_id), std::move(cb));
+        remove_version_local(bucket_name, key_sv, std::move(version_id), std::move(cb), {}, bypass);
         return;
     }
 
@@ -1563,7 +1566,7 @@ void object_store::remove_version(std::string_view bucket_name, std::string_view
     ++m_inflight;
     auto alive = m_alive;
     const std::string bname(bucket_name);
-    m_peers->remove(owner, bname, std::string(key_sv), std::move(version_id),
+    m_peers->remove(owner, bname, std::string(key_sv), std::move(version_id), bypass,
                     [this, alive, bname, cb](remove_result r)
     {
         if (!*alive)
@@ -1577,7 +1580,7 @@ void object_store::remove_version(std::string_view bucket_name, std::string_view
 
 void object_store::remove_version_local(std::string_view bucket_name, std::string_view key_sv,
                                         std::string version_id, std::function<void(remove_result)> cb,
-                                        std::function<bool(const object_meta&)> only_if)
+                                        std::function<bool(const object_meta&)> only_if, bool bypass)
 {
     bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
@@ -1606,6 +1609,7 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
         std::shared_ptr<bool>         alive;
         std::string                   bname, key, dir, version_id;
         bool                          existed{false};
+        bool                          bypass{false};
         std::function<void(remove_result)> cb;
         std::function<bool(const object_meta&)> only_if;
     };
@@ -1617,6 +1621,7 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
     rm->version_id = std::move(version_id);
     rm->cb    = std::move(cb);
     rm->only_if = std::move(only_if);
+    rm->bypass  = bypass;
 
     const auto done = [this](const removal_ptr& r, st s, bool existed)
     {
@@ -1662,8 +1667,8 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
                 --m_inflight;
                 lane_leave(bname, key);
             };
-            remove_versioned(rm->bname, rm->key, rm->version_id, std::move(rm->only_if), std::move(release),
-                             std::move(rm->cb));
+            remove_versioned(rm->bname, rm->key, rm->version_id, std::move(rm->only_if), rm->bypass,
+                             std::move(release), std::move(rm->cb));
             return;
         }
         const auto found = bp->objects.find(rm->key);
@@ -1671,6 +1676,11 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
         if (rm->only_if && (!rm->existed || !rm->only_if(found->second)))
         {
             done(rm, st::ok, false);
+            return;
+        }
+        if (rm->existed && lock_holds(found->second, static_cast<int64_t>(now_ms()), rm->bypass))
+        {
+            done(rm, st::locked, true);
             return;
         }
         std::string rel = object_rel_path(rm->key);
@@ -1742,12 +1752,13 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
     });
 }
 
-// ─── Tags ───────────────────────────────────────────────────────────────────
+// ─── Tags, retention and legal hold ─────────────────────────────────────────
 
 struct object_store::tag_change
 {
     std::shared_ptr<bool>    alive;
-    std::string              bname, key, tags, rel;
+    std::string              bname, key, rel;
+    header_change            change;
     // The version asked for, empty for the latest, and the one changed, empty for an object with none.
     std::string              version_id;
     std::string              changed_id;
@@ -1760,13 +1771,49 @@ struct object_store::tag_change
     std::function<void(st, std::string)> cb;
 };
 
-void object_store::set_tags(std::string_view bucket_name, std::string_view key, std::string version_id,
-                            std::string tags, std::function<void(st, std::string)> cb)
+namespace
+{
+
+// Makes `c` of the version `m` is at `now_ms`, or answers why its lock refuses it; the entries a lock slot holds
+// end the metadata in the order the slot gives them, so the index and the file agree.
+st apply_header_change(object_meta& m, const header_change& c, int64_t now_ms)
+{
+    switch (c.what)
+    {
+        case header_change::kind::tags:
+            set_tags_extra(m, c.value);
+            break;
+        case header_change::kind::retention:
+        {
+            retention want;
+            if (!c.value.empty() && !retention_from_value(c.value, want))
+                return st::io_error;
+            if (!retention_change_allowed(retention_of(m), want, now_ms, c.bypass))
+                return st::locked;
+            set_retention_extra(m, want);
+            break;
+        }
+        case header_change::kind::legal_hold:
+            if (c.value != "ON" && c.value != "OFF")
+                return st::io_error;
+            set_legal_hold_extra(m, c.value);
+            break;
+    }
+    set_tags_extra(m, tags_of(m));
+    set_retention_extra(m, retention_of(m));
+    set_legal_hold_extra(m, legal_hold_of(m));
+    return st::ok;
+}
+
+}   // namespace
+
+void object_store::change_header(std::string_view bucket_name, std::string_view key, std::string version_id,
+                                 header_change change, std::function<void(st, std::string)> cb)
 {
     const uint32_t owner = owner_of(bucket_name, key);
     if (owner == m_opts.shard)
     {
-        set_tags_local(bucket_name, key, std::move(version_id), std::move(tags), std::move(cb));
+        change_header_local(bucket_name, key, std::move(version_id), std::move(change), std::move(cb));
         return;
     }
     bucket* b = find_bucket(bucket_name);
@@ -1779,8 +1826,8 @@ void object_store::set_tags(std::string_view bucket_name, std::string_view key, 
     ++m_inflight;
     auto alive = m_alive;
     const std::string bname(bucket_name);
-    m_peers->set_tags(owner, bname, std::string(key), std::move(version_id), std::move(tags),
-                      [this, alive, bname, cb](st s, std::string id)
+    m_peers->change_header(owner, bname, std::string(key), std::move(version_id), std::move(change),
+                           [this, alive, bname, cb](st s, std::string id)
     {
         if (!*alive)
             return;
@@ -1791,8 +1838,8 @@ void object_store::set_tags(std::string_view bucket_name, std::string_view key, 
     });
 }
 
-void object_store::set_tags_local(std::string_view bucket_name, std::string_view key, std::string version_id,
-                                  std::string tags, std::function<void(st, std::string)> cb)
+void object_store::change_header_local(std::string_view bucket_name, std::string_view key, std::string version_id,
+                                       header_change change, std::function<void(st, std::string)> cb)
 {
     bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
@@ -1802,7 +1849,7 @@ void object_store::set_tags_local(std::string_view bucket_name, std::string_view
     }
     if (!owns(bucket_name, key))
     {
-        LOG_WARN(("storage: a tag change for a key that shard " + std::to_string(owner_of(bucket_name, key)) +
+        LOG_WARN(("storage: a header change for a key that shard " + std::to_string(owner_of(bucket_name, key)) +
                   " owns reached shard " + std::to_string(m_opts.shard)).c_str());
         cb(st::io_error, {});
         return;
@@ -1820,7 +1867,7 @@ void object_store::set_tags_local(std::string_view bucket_name, std::string_view
     tc->bname = std::string(bucket_name);
     tc->key   = std::string(key);
     tc->version_id = std::move(version_id);
-    tc->tags  = std::move(tags);
+    tc->change = std::move(change);
     tc->cb    = std::move(cb);
 
     lane_enter(*b, tc->key, [this, tc]()
@@ -1850,13 +1897,18 @@ void object_store::set_tags_local(std::string_view bucket_name, std::string_view
         }
         if (has_version(*found) || bp->vstate != versioning::off)
             tc->changed_id = version_of(*found).id;
-        if (tags_of(*found) == tc->tags)
+        tc->meta = *found;
+        if (const st s = apply_header_change(tc->meta, tc->change, static_cast<int64_t>(now_ms())); s != st::ok)
+        {
+            tags_written(tc, s, false);
+            return;
+        }
+        if (tags_of(tc->meta) == tags_of(*found) && retention_of(tc->meta) == retention_of(*found) &&
+            legal_hold_of(tc->meta) == legal_hold_of(*found))
         {
             tags_written(tc, st::ok, false);
             return;
         }
-        tc->meta = *found;
-        set_tags_extra(tc->meta, tc->tags);
         tc->rel = tc->noncurrent ? version_rel_path(tc->key, tc->changed_id) : object_rel_path(tc->key);
         const bool q = m_io->openat(tc->noncurrent ? bp->dir_fd : bp->data_fd, tc->rel, O_RDWR | O_CLOEXEC, 0,
                                     [this, tc](int64_t fd)
@@ -1887,12 +1939,12 @@ void object_store::set_tags_local(std::string_view bucket_name, std::string_view
                     if (d.status != header_status::ok || d.key != tc->key || !same_version(d.meta, tc->meta))
                     {
                         LOG_WARN(("storage: the header of the object \"" + tc->key +
-                                  "\" is not the version its index names; its tags are left").c_str());
+                                  "\" is not the version its index names; its header is left").c_str());
                         tags_written(tc, st::io_error, false);
                         return;
                     }
                     uint64_t at = 0;
-                    std::string slot = encode_tag_slot(d, tc->tags, at);
+                    std::string slot = encode_tag_slot(d, tc->meta, at);
                     if (slot.empty())
                         tags_rewrite(tc, d.header_len);
                     else
@@ -2834,7 +2886,8 @@ void object_store::drop_rename(std::string name, std::function<void(st)> cb)
 
 static_assert(cors_max_bytes <= doc_max_bytes && lifecycle_max_bytes <= doc_max_bytes &&
               policy_max_bytes <= doc_max_bytes && versioning_max_bytes <= doc_max_bytes &&
-              encryption_max_bytes <= doc_max_bytes && bucket_tagging_max_bytes <= doc_max_bytes);
+              encryption_max_bytes <= doc_max_bytes && bucket_tagging_max_bytes <= doc_max_bytes &&
+              object_lock_max_bytes <= doc_max_bytes);
 static_assert(std::size(all_bucket_docs) <= 8, "doc_doubt has a bit per kind");
 
 const char* object_store::doc_file(bucket_doc kind)
@@ -2847,8 +2900,33 @@ const char* object_store::doc_file(bucket_doc kind)
         case bucket_doc::versioning: return "versioning";
         case bucket_doc::encryption: return "encryption";
         case bucket_doc::tagging:    return "tagging";
+        case bucket_doc::object_lock: return "object-lock";
     }
     return "?";
+}
+
+std::shared_ptr<const lock_config> object_store::bucket_lock(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b && !b->closing ? b->lock : nullptr;
+}
+
+st object_store::doc_conflict(bucket_doc kind, std::string_view name, std::string_view xml) const
+{
+    const bucket* b = find_bucket(name);
+    if (!b)
+        return st::no_such_bucket;
+    // Object lock keeps versions only while versioning is Enabled, so neither may leave the other behind.
+    if (kind == bucket_doc::object_lock && (b->vstate != versioning::enabled || (xml.empty() && b->lock)))
+        return st::invalid_bucket_state;
+    if (kind == bucket_doc::versioning && b->lock)
+    {
+        versioning v = versioning::off;
+        s3_error   ignored;
+        if (xml.empty() || !parse_versioning(xml, v, ignored) || v != versioning::enabled)
+            return st::invalid_bucket_state;
+    }
+    return st::ok;
 }
 
 bool object_store::bucket_encrypts(std::string_view name) const
@@ -2934,6 +3012,25 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml, st
         if ((v == versioning::off) != (b.vstate == versioning::off))
             hot_drop_bucket(b.name);
         b.vstate = v;
+        return true;
+    }
+    if (kind == bucket_doc::object_lock)
+    {
+        std::shared_ptr<lock_config> l;
+        if (!xml.empty())
+        {
+            l = std::make_shared<lock_config>();
+            // A document that does not parse still locks, since its bucket asked for object lock once.
+            if (!parse_lock_config(xml, *l, err))
+            {
+                *l = lock_config{};
+                b.lock = std::move(l);
+                if (why)
+                    *why = err.message;
+                return false;
+            }
+        }
+        b.lock = std::move(l);
         return true;
     }
     if (kind == bucket_doc::tagging)
