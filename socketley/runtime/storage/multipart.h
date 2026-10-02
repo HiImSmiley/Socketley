@@ -200,6 +200,9 @@ public:
     std::vector<const mpu_upload*> uploads_of(std::string_view bucket) const;
     // Whether an upload of a bucket is being written, completed or removed, which stops it being deleted.
     bool bucket_uploads_busy(std::string_view bucket) const;
+    // Runs `then` once no upload of `bucket` that was completed or aborted is still removing its files, at once
+    // when none is, since its client was answered before the files went.
+    void after_removals(std::string_view bucket, std::function<void()> then);
     // Lets go of the uploads of a deleted bucket, whose files went with its directory.
     void drop_bucket(std::string_view bucket);
     mpu_totals totals() const;
@@ -293,11 +296,14 @@ private:
     void assemble_finish(const std::shared_ptr<assemble_state>& a);
 
     bool recover_bucket(const std::string& bucket, std::string& err);
+    bool removing_in(std::string_view bucket) const;
 
     event_loop*  m_loop;
     file_io*     m_io;
     object_store* m_store;
     std::map<key_t, std::unique_ptr<mpu_upload>> m_uploads;
+    // What waits, by bucket, for its removing uploads to be gone.
+    std::map<std::string, std::vector<std::function<void()>>, std::less<>> m_removal_waiters;
     std::shared_ptr<bool> m_alive;
     uint32_t     m_inflight{0};
     // The most a part list may take in a header before it is kept after the body, and how many have been.

@@ -134,7 +134,9 @@ public:
 
 private:
     void run_create(std::string name, std::string owner, std::function<void(st, int64_t)> cb);
+    // Waits out the uploads of the bucket still removing their files, whose clients were already answered.
     void run_drop(std::string name, std::function<void(st)> cb);
+    void run_drop_settled(std::string name, std::function<void(st)> cb);
     // Shard 0's half of set_doc, one change of a bucket at a time so every shard hears them in one order.
     void run_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb);
     // Removes a change no shard will make and tells the others so, then runs `then` and the next change.

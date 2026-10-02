@@ -298,6 +298,25 @@ bool multipart_store::bucket_uploads_busy(std::string_view bucket) const
     return false;
 }
 
+bool multipart_store::removing_in(std::string_view bucket) const
+{
+    const std::string prefix = std::string(bucket) + "/";
+    for (auto it = m_uploads.lower_bound(prefix); it != m_uploads.end() && it->first.starts_with(prefix); ++it)
+        if (it->second->state == mpu_state::removing)
+            return true;
+    return false;
+}
+
+void multipart_store::after_removals(std::string_view bucket, std::function<void()> then)
+{
+    if (!removing_in(bucket))
+    {
+        then();
+        return;
+    }
+    m_removal_waiters[std::string(bucket)].push_back(std::move(then));
+}
+
 void multipart_store::drop_bucket(std::string_view bucket)
 {
     const std::string prefix = std::string(bucket) + "/";
@@ -1600,6 +1619,13 @@ void multipart_store::forget(const std::string& bucket, const std::string& id)
     for (auto& [n, waiting] : up->lanes)
         for (auto& fn : waiting)
             fn();
+    if (const auto w = m_removal_waiters.find(bucket); w != m_removal_waiters.end() && !removing_in(bucket))
+    {
+        std::vector<std::function<void()>> ready = std::move(w->second);
+        m_removal_waiters.erase(w);
+        for (auto& fn : ready)
+            fn();
+    }
 }
 
 }   // namespace socketley::storage

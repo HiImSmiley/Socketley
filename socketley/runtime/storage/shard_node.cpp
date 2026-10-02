@@ -338,6 +338,21 @@ void shard_node::delete_bucket(std::string name, std::function<void(st)> cb)
 void shard_node::run_drop(std::string name, std::function<void(st)> cb)
 {
     ++m_c.bucket_ops;
+    if (m_mpu)
+    {
+        auto alive = m_alive;
+        m_mpu->after_removals(name, [this, alive, name, cb]()
+        {
+            if (*alive)
+                run_drop_settled(name, cb);
+        });
+        return;
+    }
+    run_drop_settled(std::move(name), std::move(cb));
+}
+
+void shard_node::run_drop_settled(std::string name, std::function<void(st)> cb)
+{
     if (const st s = m_store.drop_check(name); s != st::ok)
     {
         cb(s);
@@ -865,13 +880,16 @@ void shard_node::mpu_complete(std::string bucket, std::string key, std::string i
                         return;
                     wire::mpu_ref fin{bucket, key, id, 0, 0, res.error.code.empty()};
                     ++m_c.mpu_out;
+                    // The client hears once the owner has, so no request it sends next finds the upload sealed.
                     m_transport.call(owner, wire::encode_mpu_ref(wire::op::mpu_finish, fin),
-                                     [this, alive](bool fok, std::string_view)
+                                     [this, alive, cb, res = std::move(res)](bool fok, std::string_view) mutable
                                      {
-                                         if (*alive && !fok)
+                                         if (!*alive)
+                                             return;
+                                         if (!fok)
                                              ++m_c.peer_failures;
+                                         cb(std::move(res));
                                      });
-                    cb(std::move(res));
                 }, std::move(bind), std::move(cond));
         });
 }
@@ -1315,8 +1333,21 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             m_store.adopt_bucket(std::move(name), ms, std::move(owner), [reply](st s) { reply(true, wire::encode_status(s)); });
             return;
         case wire::op::drop_prepare:
-            reply(true, wire::encode_status(m_store.drop_check(name)));
+        {
+            auto judge = [this, name, reply]() { reply(true, wire::encode_status(m_store.drop_check(name))); };
+            if (!m_mpu)
+            {
+                judge();
+                return;
+            }
+            auto alive = m_alive;
+            m_mpu->after_removals(name, [alive, judge]()
+            {
+                if (*alive)
+                    judge();
+            });
             return;
+        }
         case wire::op::drop_abort:
             m_store.drop_abort(name);
             reply(true, wire::encode_status(st::ok));

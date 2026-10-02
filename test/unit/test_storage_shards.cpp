@@ -2718,3 +2718,70 @@ TEST_CASE("a key's versions through any shard: markers, removal for good, a list
     CHECK(read_version(other, ids[2], body) == st::ok);
     CHECK(body == bodies[2]);
 }
+
+TEST_CASE("a bucket dropped while an upload it held is still removing its files waits for them and is dropped")
+{
+    for (const uint32_t shards : {1u, 2u})
+    {
+        INFO("shards " << shards);
+        tmpdir d;
+        cluster c(d.path, shards);
+        REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+        const uint32_t owner = shards - 1;
+        const std::string key = key_owned_by("bkt", owner, shards);
+        const std::string id = c.mpu_create(0, "bkt", key);
+        // Enough parts that removing them takes more than one turn of the ring.
+        for (uint32_t n = 1; n <= 40; ++n)
+            REQUIRE(c.mpu_put_part(0, "bkt", key, id, n, pattern(100, n)) == st::ok);
+
+        // The upload is going away, as one is once its completion has been answered, and its files are still there.
+        REQUIRE(c.m[owner]->mpu->abort("bkt", id, {}));
+        REQUIRE(fs::exists(d.path + "/bkt/mpu/" + id));
+        st got = st::io_error;
+        bool fired = false;
+        c.m[0]->node->delete_bucket("bkt", [&](st r) { got = r; fired = true; });
+        REQUIRE(c.until([&] { return fired; }));
+        CHECK(got == st::ok);
+        for (uint32_t s = 0; s < shards; ++s)
+        {
+            CHECK_FALSE(c.m[s]->store->has_bucket("bkt"));
+            CHECK(c.m[s]->mpu->totals().uploads == 0);
+        }
+    }
+}
+
+TEST_CASE("a completion assembled on another shard is answered only once the upload's owner has let it go")
+{
+    tmpdir d;
+    cluster c(d.path, 2);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    const std::string key = key_owned_by("bkt", 1, 2);
+    const std::string id = c.mpu_create(0, "bkt", key);
+    const std::string p1 = pattern(1000, 7);
+    REQUIRE(c.mpu_put_part(0, "bkt", key, id, 1, p1) == st::ok);
+
+    c.hold_back = [](const cluster::task& t)
+    {
+        wire::op o{};
+        return wire::request_op(t.payload, o) && o == wire::op::mpu_finish;
+    };
+    complete_result out;
+    bool fired = false;
+    c.m[0]->node->mpu_complete("bkt", key, id, {complete_part{1, hex(md5_of(p1)), checksum_algo::none, {}}}, [] {},
+                               [&](complete_result r) { out = std::move(r); fired = true; });
+    REQUIRE(c.until([&] { return !c.held_back.empty(); }));
+    c.settle();
+    // The object is committed, and the owner, not yet told, still holds the upload sealed.
+    CHECK_FALSE(fired);
+    REQUIRE(c.m[1]->mpu->find("bkt", id) != nullptr);
+    CHECK(c.m[1]->mpu->find("bkt", id)->state == mpu_state::sealed);
+    c.release();
+    REQUIRE(c.until([&] { return fired; }));
+    CHECK(out.error.code.empty());
+    const mpu_upload* u = c.m[1]->mpu->find("bkt", id);
+    CHECK((u == nullptr || u->state == mpu_state::removing));
+
+    // So the client's next requests, deleting the object and then the bucket, find nothing in the way.
+    CHECK(c.del(0, "bkt", key) == st::ok);
+    CHECK(c.drop_bucket(0, "bkt") == st::ok);
+}
