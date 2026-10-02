@@ -461,8 +461,8 @@ constexpr action_name action_names[] = {
     {"GetObjectVersionTagging", res_kind::object, s3_action::get_object_version_tagging},
     {"PutObjectVersionTagging", res_kind::object, s3_action::put_object_version_tagging},
     {"DeleteObjectVersionTagging", res_kind::object, s3_action::delete_object_version_tagging},
-    {"GetObjectAttributes", res_kind::object, s3_action::none},
-    {"GetObjectVersionAttributes", res_kind::object, s3_action::none},
+    {"GetObjectAttributes", res_kind::object, s3_action::get_object_attributes},
+    {"GetObjectVersionAttributes", res_kind::object, s3_action::get_object_version_attributes},
     {"GetObjectRetention", res_kind::object, s3_action::none},
     {"PutObjectRetention", res_kind::object, s3_action::none},
     {"GetObjectLegalHold", res_kind::object, s3_action::none},
@@ -904,6 +904,7 @@ s3_action action_of_operation(std::string_view op)
     static constexpr row table[] = {
         {"GetObject", s3_action::get_object},
         {"HeadObject", s3_action::get_object},
+        {"GetObjectAttributes", s3_action::get_object_attributes},
         {"PutObject", s3_action::put_object},
         {"CopyObject", s3_action::put_object},
         {"UploadPart", s3_action::put_object},
@@ -964,6 +965,8 @@ bool action_on_object(s3_action a)
         case s3_action::get_object_version_tagging:
         case s3_action::put_object_version_tagging:
         case s3_action::delete_object_version_tagging:
+        case s3_action::get_object_attributes:
+        case s3_action::get_object_version_attributes:
             return true;
         default:
             return false;
@@ -979,6 +982,7 @@ s3_action version_action(s3_action a)
         case s3_action::get_object_tagging:    return s3_action::get_object_version_tagging;
         case s3_action::put_object_tagging:    return s3_action::put_object_version_tagging;
         case s3_action::delete_object_tagging: return s3_action::delete_object_version_tagging;
+        case s3_action::get_object_attributes: return s3_action::get_object_version_attributes;
         default:                               return a;
     }
 }

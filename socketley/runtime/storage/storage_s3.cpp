@@ -51,8 +51,9 @@ bool unsupported_subresource(const s3_request& r, bool object)
         return true;
     for (const auto& q : r.query)
         for (std::string_view n : names)
-            // An object's tags are implemented, and a bucket's are not.
-            if (q.first == n && (n != "tagging" || r.key.empty()))
+            // An object's tags and attributes are implemented, and a bucket's are not.
+            if (q.first == n && ((n != "tagging" && n != "attributes") || r.key.empty() ||
+                                 (n == "attributes" && r.method != "GET")))
                 return true;
     return false;
 }
@@ -420,6 +421,8 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
     {
         if (upload)
             op_list_parts(c);
+        else if (q.has_query("attributes"))
+            op_get_object(c, true, true);
         else
             op_get_object(c, false);
     }
@@ -1427,6 +1430,130 @@ cond evaluate(const s3_request& q, const object_meta& m)
     return cond::proceed;
 }
 
+// What a GetObjectAttributes request asks for, from x-amz-object-attributes and the part paging headers.
+struct attr_query
+{
+    bool     etag{false};
+    bool     checksum{false};
+    bool     parts{false};
+    bool     storage_class{false};
+    bool     size{false};
+    uint32_t max_parts{1000};
+    uint32_t marker{0};
+};
+
+// False with `bad` naming the header when the request is not one S3 would take.
+bool parse_attr_query(const s3_request& q, attr_query& a, std::string_view& bad)
+{
+    std::string_view list = q.header("x-amz-object-attributes");
+    bad = "x-amz-object-attributes";
+    if (http_trim_ows(list).empty())
+        return false;
+    while (!list.empty())
+    {
+        const size_t comma = list.find(',');
+        const std::string_view one = http_trim_ows(list.substr(0, comma));
+        list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+        if (one == "ETag")
+            a.etag = true;
+        else if (one == "Checksum")
+            a.checksum = true;
+        else if (one == "ObjectParts")
+            a.parts = true;
+        else if (one == "StorageClass")
+            a.storage_class = true;
+        else if (one == "ObjectSize")
+            a.size = true;
+        else
+            return false;
+    }
+    uint64_t v = 0;
+    bad = "x-amz-max-parts";
+    if (q.has_header("x-amz-max-parts"))
+    {
+        if (!parse_uint(q.header("x-amz-max-parts"), v))
+            return false;
+        a.max_parts = static_cast<uint32_t>(std::min<uint64_t>(v, 1000));
+    }
+    bad = "x-amz-part-number-marker";
+    if (q.has_header("x-amz-part-number-marker"))
+    {
+        if (!parse_uint(q.header("x-amz-part-number-marker"), v) || v > mpu_max_parts)
+            return false;
+        a.marker = static_cast<uint32_t>(v);
+    }
+    return true;
+}
+
+// The element a stored checksum header is named by in a GetObjectAttributes answer, empty for none.
+std::string_view checksum_element(std::string_view header)
+{
+    switch (checksum_from_header(header))
+    {
+        case checksum_algo::crc32:     return "ChecksumCRC32";
+        case checksum_algo::crc32c:    return "ChecksumCRC32C";
+        case checksum_algo::crc64nvme: return "ChecksumCRC64NVME";
+        case checksum_algo::sha1:      return "ChecksumSHA1";
+        case checksum_algo::sha256:    return "ChecksumSHA256";
+        case checksum_algo::none:      break;
+    }
+    return {};
+}
+
+// The answer to GetObjectAttributes; `l` is the object's part list, or null for a single-part object.
+std::string attributes_xml(const object_meta& m, const attr_query& a, const part_list* l)
+{
+    std::string x(xml_decl);
+    x += "<GetObjectAttributesResponse xmlns=\"";
+    x += s3_xmlns;
+    x += "\">";
+    if (a.etag)
+        x += "<ETag>" + m.etag() + "</ETag>";
+    if (a.checksum)
+        for (const auto& [n, v] : m.extra)
+            if (const std::string_view el = checksum_element(n); !el.empty())
+            {
+                // A multipart object's checksum is of its parts' checksums, which the -N says.
+                const bool composite = v.find('-') != std::string::npos;
+                x += "<Checksum><" + std::string(el) + ">" + xml_escape(v) + "</" + std::string(el) + "><ChecksumType>" +
+                     (composite ? "COMPOSITE" : "FULL_OBJECT") + "</ChecksumType></Checksum>";
+                break;
+            }
+    if (a.parts && l)
+    {
+        x += "<ObjectParts><PartsCount>" + std::to_string(l->numbers.size()) + "</PartsCount>";
+        x += "<PartNumberMarker>" + std::to_string(a.marker) + "</PartNumberMarker>";
+        x += "<MaxParts>" + std::to_string(a.max_parts) + "</MaxParts>";
+        std::string rows;
+        uint32_t shown = 0, last = a.marker;
+        bool truncated = false;
+        for (size_t i = 0; i < l->numbers.size(); ++i)
+        {
+            if (l->numbers[i] <= a.marker)
+                continue;
+            if (shown == a.max_parts)
+            {
+                truncated = true;
+                break;
+            }
+            ++shown;
+            last = l->numbers[i];
+            rows += "<Part><PartNumber>" + std::to_string(l->numbers[i]) + "</PartNumber><Size>" +
+                    std::to_string(l->sizes[i]) + "</Size></Part>";
+        }
+        x += truncated ? "<IsTruncated>true</IsTruncated>" : "<IsTruncated>false</IsTruncated>";
+        if (truncated)
+            x += "<NextPartNumberMarker>" + std::to_string(last) + "</NextPartNumberMarker>";
+        x += rows + "</ObjectParts>";
+    }
+    if (a.storage_class)
+        x += "<StorageClass>STANDARD</StorageClass>";
+    if (a.size)
+        x += "<ObjectSize>" + std::to_string(m.size) + "</ObjectSize>";
+    x += "</GetObjectAttributesResponse>";
+    return x;
+}
+
 }   // namespace
 
 void storage_run::read_part_list(const std::shared_ptr<conn>& c, const object_meta& m, int fd, uint64_t data_off,
@@ -1498,13 +1625,22 @@ void storage_run::read_part_list(const std::shared_ptr<conn>& c, const object_me
         m_store.open_version(c->req.bucket, c->req.key, version, 0, std::move(opened));
 }
 
-void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
+void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool attributes)
 {
     s3_request& q = c->req;
     if (head)
         ++m_c.heads;
     else
         ++m_c.gets;
+
+    attr_query attrs;
+    if (std::string_view bad; attributes && !parse_attr_query(q, attrs, bad))
+    {
+        s3_error e = make_error("InvalidArgument");
+        e.message = "Invalid attribute name specified.";
+        send_error(c, e, false, "ArgumentName", bad);
+        return;
+    }
 
     // One part of the object asked for by its number, which S3 allows instead of a range and never beside one.
     uint32_t part = 0;
@@ -1550,7 +1686,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
     using answer_fn = std::function<void(const std::shared_ptr<conn>&, const object_meta&, int, uint64_t,
                                          const std::string&, bool, const part_list*)>;
     auto again = std::make_shared<answer_fn>();
-    *again = [this, head, part, weak_again = std::weak_ptr<answer_fn>(again)](
+    *again = [this, head, part, attributes, attrs, weak_again = std::weak_ptr<answer_fn>(again)](
                  const std::shared_ptr<conn>& cc, const object_meta& m, int fd, uint64_t data_off,
                  const std::string& prefetch, bool clear, const part_list* list)
     {
@@ -1583,6 +1719,40 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             r.head_only = true;
             r.headers.emplace_back("ETag", "\"" + m.etag() + "\"");
             r.headers.emplace_back("Last-Modified", http_date(m.mtime_ms));
+            send_response(cc, std::move(r));
+            return;
+        }
+
+        if (attributes)
+        {
+            // A multipart object's parts are listed from its header, or from after its body once that is read.
+            part_list own;
+            const part_list* parts = list;
+            if (attrs.parts && m.parts && !parts)
+            {
+                part_trailer t;
+                if (part_trailer_of(m, t))
+                {
+                    read_part_list(cc, m, fd, data_off, true,
+                        [weak = std::weak_ptr<conn>(cc), again = weak_again.lock()](
+                            const object_meta& m2, int fd2, uint64_t off2, bool clear2, const part_list& l)
+                        {
+                            if (auto c2 = weak.lock())
+                                (*again)(c2, m2, fd2, off2, {}, clear2, &l);
+                        });
+                    return;
+                }
+                if (part_list_of(m, own))
+                    parts = &own;
+            }
+            close_file();
+            r.headers.emplace_back("Content-Type", "application/xml");
+            r.headers.emplace_back("Last-Modified", http_date(m.mtime_ms));
+            if (has_version(m))
+                r.headers.emplace_back("x-amz-version-id", version_of(m).id);
+            else if (m_store.bucket_versioning(rq.bucket) != versioning::off)
+                r.headers.emplace_back("x-amz-version-id", "null");
+            r.body = attributes_xml(m, attrs, m.parts ? parts : nullptr);
             send_response(cc, std::move(r));
             return;
         }

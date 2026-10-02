@@ -695,7 +695,8 @@ public:
     // False when the pass has nothing left to walk.
     bool lifecycle_walk(lifecycle_pass& p);
     void lifecycle_done(uint64_t pass_id);
-    void op_get_object(const std::shared_ptr<conn>& c, bool head);
+    // A HEAD finds the object as GetObjectAttributes does, which `attributes` answers instead.
+    void op_get_object(const std::shared_ptr<conn>& c, bool head, bool attributes = false);
     void op_delete_object(const std::shared_ptr<conn>& c);
     // Versioning, in storage_versioning.cpp: the bucket's configuration, ListObjectVersions, and the
     // answers a request naming a version or meeting a delete marker is given.
