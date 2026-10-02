@@ -272,11 +272,12 @@ bool check_post_policy(post_form& f, std::string_view bucket, int64_t now_ms, s3
     }
 
     std::vector<std::string> covered;
-    // The bucket is the one the form was posted to, whether or not the form names it too.
+    // The bucket is the one the form was posted to, and the key the one stored, with ${filename} given its name.
     const std::string bucket_name(bucket);
+    const std::string key = post_key(f);
     auto value_of = [&](const std::string& name) -> const std::string*
     {
-        return name == "bucket" ? &bucket_name : f.field(name);
+        return name == "bucket" ? &bucket_name : name == "key" && f.field("key") ? &key : f.field(name);
     };
     // A field the form does not carry is the empty string, which only a condition on "" meets.
     auto test = [&](std::string_view op, const std::string& name, const std::string& want) -> bool

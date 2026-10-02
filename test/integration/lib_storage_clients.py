@@ -413,6 +413,11 @@ def post_object():
     st, hd, _ = form_upload("cl-post", redirect["fields"], b"r")
     check("and with success_action_redirect a 303 to it, naming what was stored",
           st == 303 and re.match(r"http://example\.test/done\?bucket=cl-post&key=redir&etag=", hd.get("location", "")), hd)
+    named = v4c.generate_presigned_post("cl-post", "${filename}", Conditions=[["starts-with", "$key", "fo"]])
+    st, _, _ = form_upload("cl-post", named["fields"], b"named", "foo.txt")
+    check("a condition on $key holds the key as stored, ${filename} given", st == 204, st)
+    st, _, _ = form_upload("cl-post", named["fields"], b"named", "bar.txt")
+    check("and refuses a file whose name makes another", st == 403, st)
     expired = v4c.generate_presigned_post("cl-post", "late", ExpiresIn=-10)
     st, _, data = form_upload("cl-post", expired["fields"], b"x")
     check("an expired policy is AccessDenied", st == 403 and b"Policy expired" in data, (st, data[:200]))
