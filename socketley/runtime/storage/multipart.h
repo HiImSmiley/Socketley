@@ -194,8 +194,10 @@ public:
     const mpu_upload* find(std::string_view bucket, std::string_view id) const;
     // The uploads of a bucket that are not being closed, in no particular order.
     std::vector<const mpu_upload*> uploads_of(std::string_view bucket) const;
-    // Whether a bucket has any, which stops it being deleted.
-    bool bucket_has_uploads(std::string_view bucket) const;
+    // Whether an upload of a bucket is being written, completed or removed, which stops it being deleted.
+    bool bucket_uploads_busy(std::string_view bucket) const;
+    // Lets go of the uploads of a deleted bucket, whose files went with its directory.
+    void drop_bucket(std::string_view bucket);
     mpu_totals totals() const;
 
     // The id is given to `cb` when st is ok.

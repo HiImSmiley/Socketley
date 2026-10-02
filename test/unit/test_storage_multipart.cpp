@@ -567,6 +567,7 @@ TEST_CASE("an upload being completed takes no new part")
     checksum_algo algo;
     CHECK(r.mp->begin_part("bkt", id, algo) != st::ok);
     CHECK(r.mp->find("bkt", id)->state != mpu_state::open);
+    CHECK(r.mp->bucket_uploads_busy("bkt"));
     CHECK(!r.mp->abort("bkt", id, {}));
     REQUIRE(r.until([&] { return fired; }));
     CHECK(out.error.code.empty());
@@ -580,10 +581,13 @@ TEST_CASE("an abort removes the files, gives the room back and refuses new parts
     const std::string id = r.create("bkt", "k");
     REQUIRE(r.part("bkt", id, 1, pattern(100000)).status == st::ok);
     REQUIRE(r.part("bkt", id, 2, pattern(50000)).status == st::ok);
-    CHECK(r.mp->bucket_has_uploads("bkt"));
+    CHECK(!r.mp->uploads_of("bkt").empty());
+    // An idle upload does not keep its bucket, which takes it along when it is deleted.
+    CHECK_FALSE(r.mp->bucket_uploads_busy("bkt"));
 
     bool done = false;
     REQUIRE(r.mp->abort("bkt", id, [&] { done = true; }));
+    CHECK(r.mp->bucket_uploads_busy("bkt"));
     // A second abort of the same upload finds it on its way out.
     CHECK(!r.mp->abort("bkt", id, {}));
     checksum_algo algo;
@@ -591,7 +595,8 @@ TEST_CASE("an abort removes the files, gives the room back and refuses new parts
     REQUIRE(r.until([&] { return done; }));
     REQUIRE(r.until([&] { return r.mp->find("bkt", id) == nullptr; }));
     CHECK(!fs::exists(d.path + "/bkt/mpu/" + id));
-    CHECK(!r.mp->bucket_has_uploads("bkt"));
+    CHECK(r.mp->uploads_of("bkt").empty());
+    CHECK_FALSE(r.mp->bucket_uploads_busy("bkt"));
     CHECK(r.mp->totals().bytes == 0);
     CHECK(r.part("bkt", id, 3, "late").status == st::cancelled);
     CHECK(names_in(d.path + "/bkt/tmp").empty());

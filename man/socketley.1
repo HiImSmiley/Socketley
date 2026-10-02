@@ -6303,7 +6303,7 @@ BucketAlreadyOwnedByYou (409) if it exists; InvalidBucketName (400) for a name S
 T}
 DeleteBucket	DELETE /bucket	T{
 .ad l
-BucketNotEmpty (409) while it holds objects, noncurrent versions or delete markers.
+BucketNotEmpty (409) while it holds objects, noncurrent versions or delete markers; open multipart uploads are aborted with it.
 T}
 HeadBucket	HEAD /bucket	T{
 .ad l
@@ -6705,8 +6705,8 @@ An upload is kept until it is completed or aborted unless
 .B \-\-mpu\-expire
 is set; its parts count against
 .B \-\-max\-bytes
-while they are held, and a bucket with an open upload cannot be deleted
-.RB ( BucketNotEmpty ).
+while they are held, and deleting a bucket that holds nothing but open uploads
+aborts them with it, as S3 does.
 A part sent again needs room for both copies until the new one lands.
 .SS Reading by part number
 .B "GET /bucket/key?partNumber=N"

@@ -293,15 +293,20 @@ def main_mode():
     check("completing with a body that is not XML is MalformedXML", status == 400 and xml_code(body_) == "MalformedXML", (status, body_[:200]))
     status, body_ = raw_signed("POST", "/%s/err/b" % B, "uploadId=" + uid, b"<CompleteMultipartUpload></CompleteMultipartUpload>")
     check("completing with no parts is MalformedXML", status == 400 and xml_code(body_) == "MalformedXML", (status, body_[:200]))
-    check("delete_bucket with an open upload is BucketNotEmpty",
+    check("delete_bucket with objects and an open upload is BucketNotEmpty",
           code_of(lambda: c.delete_bucket(Bucket=B)) == ("BucketNotEmpty", 409))
-    # A bucket with nothing in it but an upload: only the upload stops the delete.
+    # A bucket with nothing in it but an upload is deleted, and the upload goes with it, as in S3.
     c.create_bucket(Bucket="mpempty")
     eu = c.create_multipart_upload(Bucket="mpempty", Key="k")["UploadId"]
-    check("an empty bucket with an open upload cannot be deleted",
-          code_of(lambda: c.delete_bucket(Bucket="mpempty")) == ("BucketNotEmpty", 409))
-    c.abort_multipart_upload(Bucket="mpempty", Key="k", UploadId=eu)
-    check("and can once the upload is aborted", code_of(lambda: c.delete_bucket(Bucket="mpempty"))[0] is None)
+    c.upload_part(Bucket="mpempty", Key="k", UploadId=eu, PartNumber=1, Body=b"x" * 1000)
+    check("an empty bucket with an open upload is deleted", code_of(lambda: c.delete_bucket(Bucket="mpempty"))[0] is None)
+    check("and the upload is gone with it",
+          code_of(lambda: c.list_parts(Bucket="mpempty", Key="k", UploadId=eu))[0] in ("NoSuchBucket", "NoSuchUpload"))
+    c.create_bucket(Bucket="mpempty")
+    check("and a bucket made again under the name has no uploads",
+          c.list_multipart_uploads(Bucket="mpempty").get("Uploads", []) == [])
+    check("nor its part on the disk", not os.path.exists(os.path.join(DATA, "mpempty", "mpu", eu)))
+    c.delete_bucket(Bucket="mpempty")
     c.abort_multipart_upload(Bucket=B, Key="err/b", UploadId=uid)
     check("abort_multipart_upload answers 204 and the upload is gone",
           ("err/b", uid) not in open_uploads(c) and code_of(lambda: c.list_parts(Bucket=B, Key="err/b", UploadId=uid)) == ("NoSuchUpload", 404))

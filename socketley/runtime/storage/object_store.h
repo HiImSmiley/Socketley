@@ -529,9 +529,11 @@ public:
     void drop_abort(std::string_view name);
     void drop_rename(std::string name, std::function<void(st)> cb);
     void drop_forget(std::string_view name);
-    // Whatever else a bucket holds that a drop must not throw away, such as an
-    // upload begun and never completed: true keeps the bucket.
+    // Whatever else is at work in a bucket that a drop must wait out, such as a
+    // completion being assembled: true keeps the bucket.
     void set_drop_guard(std::function<bool(std::string_view bucket)> guard) { m_drop_guard = std::move(guard); }
+    // Told the name of each bucket this shard lets go of, so what else it kept of the bucket goes too.
+    void set_forget_listener(std::function<void(const std::string& bucket)> fn) { m_forget_listener = std::move(fn); }
     // Removes a body that will not become anything from the bucket's tmp directory.
     void remove_tmp(std::string_view bucket, std::string tmp_name);
 
@@ -962,6 +964,7 @@ private:
     shard_peers* m_peers{nullptr};
     hash_pool*   m_hash{nullptr};
     std::function<bool(std::string_view)> m_drop_guard;
+    std::function<void(const std::string&)> m_forget_listener;
     std::function<void()> m_lifecycle_listener;
     // A test hook: a commit of a key with this prefix kills the process after
     // its rename and before its journal record.

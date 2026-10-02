@@ -479,12 +479,6 @@ void storage_run::op_create_bucket(const std::shared_ptr<conn>& c)
 
 void storage_run::op_delete_bucket(const std::shared_ptr<conn>& c)
 {
-    // An upload that was never completed is something the bucket still holds.
-    if (m_mpu.bucket_has_uploads(c->req.bucket))
-    {
-        send_error_st(c, st::bucket_not_empty);
-        return;
-    }
     std::weak_ptr<conn> weak = c;
     m_node.delete_bucket(c->req.bucket, [this, weak](st s)
     {

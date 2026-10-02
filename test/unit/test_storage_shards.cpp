@@ -142,7 +142,8 @@ struct cluster : shard_transport
             mb->node = std::make_unique<shard_node>(*mb->store, *this);
             mb->node->set_multipart(mb->mpu.get());
             multipart_store* mp = mb->mpu.get();
-            mb->store->set_drop_guard([mp](std::string_view bucket) { return mp->bucket_has_uploads(bucket); });
+            mb->store->set_drop_guard([mp](std::string_view bucket) { return mp->bucket_uploads_busy(bucket); });
+            mb->store->set_forget_listener([mp](const std::string& bucket) { mp->drop_bucket(bucket); });
             m.push_back(std::move(mb));
         }
         if (announce)
@@ -1872,17 +1873,15 @@ TEST_CASE("a listing of uploads is every shard's, and a bucket with one anywhere
         CHECK(got == want);
     }
 
-    // No object in the bucket, and a drop through any shard is still refused while an upload is open.
+    // No object in the bucket: a drop through any shard takes the open uploads of every shard with it, as in S3.
+    CHECK(c.drop_bucket(1, "bkt") == st::ok);
     for (uint32_t s = 0; s < 4; ++s)
-        CHECK(c.drop_bucket(s, "bkt") == st::bucket_not_empty);
-    for (uint32_t s = 0; s < 4; ++s)
-        CHECK(c.m[s]->store->has_bucket("bkt"));
-    // Aborting them all, each through another shard than the one that made it, lets it go.
-    for (size_t i = 0; i < made.size(); ++i)
-        CHECK(c.mpu_abort(static_cast<uint32_t>(i + 1) % 4, "bkt", made[i].first, made[i].second));
+    {
+        CHECK_FALSE(c.m[s]->store->has_bucket("bkt"));
+        CHECK(c.m[s]->mpu->uploads_of("bkt").empty());
+        CHECK(c.m[s]->mpu->totals().uploads == 0);
+    }
     CHECK_FALSE(c.mpu_abort(0, "bkt", made[0].first, made[0].second));
-    CHECK(c.until([&] { return c.mpu_list(0, "bkt").empty(); }));
-    CHECK(c.drop_bucket(2, "bkt") == st::ok);
 }
 
 TEST_CASE("a part whose owner cannot be reached is refused and its temporary file removed")

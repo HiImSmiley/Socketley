@@ -314,23 +314,29 @@ def mode_main():
             bad += 1
     check("and twenty-four with an unknown key are all InvalidAccessKeyId", bad == 0, bad)
 
-    # ── a bucket that holds only an open upload is not dropped, wherever the request lands ──
+    # ── a bucket that holds only open uploads is dropped with them, as in S3, wherever the request lands ──
     s3.create_bucket(Bucket="e2edrop")
-    uid = s3.create_multipart_upload(Bucket="e2edrop", Key="held/upload")["UploadId"]
-    refused = 0
-    for i in range(16):
-        try:
-            client().delete_bucket(Bucket="e2edrop")
-        except botocore.exceptions.ClientError as e:
-            refused += code_of(e) == "BucketNotEmpty"
-    check("sixteen deletes of a bucket that holds an open upload, on fresh connections, are all BucketNotEmpty",
-          refused == 16, refused)
-    s3.abort_multipart_upload(Bucket="e2edrop", Key="held/upload", UploadId=uid)
+    held = [("held/upload%d" % i, s3.create_multipart_upload(Bucket="e2edrop", Key="held/upload%d" % i)["UploadId"])
+            for i in range(16)]
+    s3.upload_part(Bucket="e2edrop", Key=held[0][0], UploadId=held[0][1], PartNumber=1, Body=b"p" * 1000)
     try:
-        s3.delete_bucket(Bucket="e2edrop")
-        check("and once it is aborted the bucket goes", True)
+        client().delete_bucket(Bucket="e2edrop")
+        check("a bucket that holds sixteen open uploads on every shard is deleted", True)
     except botocore.exceptions.ClientError as e:
-        check("and once it is aborted the bucket goes", False, e.response["Error"])
+        check("a bucket that holds sixteen open uploads on every shard is deleted", False, e.response["Error"])
+    gone = 0
+    for k, u in held:
+        try:
+            client().list_parts(Bucket="e2edrop", Key=k, UploadId=u)
+        except botocore.exceptions.ClientError as e:
+            gone += code_of(e) in ("NoSuchBucket", "NoSuchUpload")
+    check("and every upload went with it, on every shard", gone == len(held), gone)
+    s3.create_bucket(Bucket="e2edrop")
+    left = []
+    for _ in range(16):
+        left += client().list_multipart_uploads(Bucket="e2edrop").get("Uploads", [])
+    check("and a bucket made again under the name has none of them", not left, left[:3])
+    s3.delete_bucket(Bucket="e2edrop")
 
     # Everything begun was completed or aborted, so no upload is left on any shard.
     left = []

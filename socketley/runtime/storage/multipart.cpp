@@ -283,11 +283,26 @@ std::vector<const mpu_upload*> multipart_store::uploads_of(std::string_view buck
     return out;
 }
 
-bool multipart_store::bucket_has_uploads(std::string_view bucket) const
+bool multipart_store::bucket_uploads_busy(std::string_view bucket) const
 {
     const std::string prefix = std::string(bucket) + "/";
-    const auto it = m_uploads.lower_bound(prefix);
-    return it != m_uploads.end() && it->first.starts_with(prefix);
+    for (auto it = m_uploads.lower_bound(prefix); it != m_uploads.end() && it->first.starts_with(prefix); ++it)
+    {
+        const mpu_upload& u = *it->second;
+        if (u.state != mpu_state::open || u.committing > 0 || !u.placing.empty() || !u.lanes.empty())
+            return true;
+    }
+    return false;
+}
+
+void multipart_store::drop_bucket(std::string_view bucket)
+{
+    const std::string prefix = std::string(bucket) + "/";
+    std::vector<std::string> ids;
+    for (auto it = m_uploads.lower_bound(prefix); it != m_uploads.end() && it->first.starts_with(prefix); ++it)
+        ids.push_back(it->second->id);
+    for (const std::string& id : ids)
+        forget(std::string(bucket), id);
 }
 
 mpu_totals multipart_store::totals() const

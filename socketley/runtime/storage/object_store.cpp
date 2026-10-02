@@ -2740,6 +2740,8 @@ void object_store::forget_bucket(const std::string& name)
     }
     hot_drop_bucket(name);
     m_buckets.erase(it);
+    if (m_forget_listener)
+        m_forget_listener(name);
 }
 
 void object_store::drop_forget(std::string_view name)
