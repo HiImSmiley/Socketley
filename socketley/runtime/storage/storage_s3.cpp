@@ -452,9 +452,36 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
 void storage_run::op_list_buckets(const std::shared_ptr<conn>& c)
 {
     ++m_c.lists;
+    const s3_request& q = c->req;
+    auto bad_arg = [&](std::string_view name, std::string_view msg)
+    {
+        s3_error e = make_error("InvalidArgument");
+        e.message  = std::string(msg);
+        send_error(c, e, false, "ArgumentName", name);
+    };
+    bucket_page page;
+    page.prefix = q.get_query("prefix");
+    if (q.has_query("max-buckets"))
+    {
+        uint64_t v;
+        if (!parse_uint(q.get_query("max-buckets"), v) || v < 1 || v > 10000)
+        {
+            bad_arg("max-buckets", "max-buckets must be an integer from 1 to 10000");
+            return;
+        }
+        page.max = static_cast<size_t>(v);
+    }
+    std::string after;
+    if (q.has_query("continuation-token") &&
+        (q.get_query("continuation-token").empty() || !base64url_decode(q.get_query("continuation-token"), after)))
+    {
+        bad_arg("continuation-token", "The continuation token provided is incorrect");
+        return;
+    }
+    page.after = after;
     response r;
     r.headers.emplace_back("Content-Type", "application/xml");
-    r.body = list_buckets_xml(m_store.buckets(), owner_id(), owner_id());
+    r.body = list_buckets_xml(m_store.buckets(), owner_id(), owner_id(), page);
     send_response(c, std::move(r));
 }
 

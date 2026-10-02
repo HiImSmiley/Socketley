@@ -193,17 +193,44 @@ inline std::string error_xml(const s3_error& e, const error_context& c)
 
 inline std::string quoted_etag(const object_meta& m) { return "&quot;" + m.etag() + "&quot;"; }
 
+// What a ListBuckets request asks for: the buckets after `after` whose names begin with `prefix`, `max` of them.
+struct bucket_page
+{
+    std::string_view prefix;
+    std::string_view after;
+    size_t           max{SIZE_MAX};
+};
+
 inline std::string list_buckets_xml(const std::vector<bucket_info>& bs, std::string_view owner_id,
-                                    std::string_view owner_name)
+                                    std::string_view owner_name, const bucket_page& page = {})
 {
     std::string x(xml_decl);
     x += "<ListAllMyBucketsResult xmlns=\"" + std::string(s3_xmlns) + "\"><Owner><ID>" +
          xml_escape(owner_id) + "</ID><DisplayName>" + xml_escape(owner_name) +
          "</DisplayName></Owner><Buckets>";
+    size_t n = 0;
+    std::string_view last;
+    bool truncated = false;
     for (const bucket_info& b : bs)
+    {
+        if (!b.name.starts_with(page.prefix) || (!page.after.empty() && b.name <= page.after))
+            continue;
+        if (n == page.max)
+        {
+            truncated = true;
+            break;
+        }
+        ++n;
+        last = b.name;
         x += "<Bucket><Name>" + xml_escape(b.name) + "</Name><CreationDate>" + iso8601(b.created_ms) +
-             "</CreationDate></Bucket>";
-    x += "</Buckets></ListAllMyBucketsResult>";
+             "</CreationDate><BucketRegion>us-east-1</BucketRegion></Bucket>";
+    }
+    x += "</Buckets>";
+    if (truncated)
+        x += "<ContinuationToken>" + base64url_encode(last) + "</ContinuationToken>";
+    if (!page.prefix.empty())
+        x += "<Prefix>" + xml_escape(page.prefix) + "</Prefix>";
+    x += "</ListAllMyBucketsResult>";
     return x;
 }
 
