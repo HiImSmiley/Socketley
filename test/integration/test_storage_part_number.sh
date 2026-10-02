@@ -24,6 +24,13 @@
 #               removed reads them from the object headers
 #   shards      with --shards 2 every part is answered alike by the shard that
 #               owns the key and the one that does not
+#   checksums   an upload with a checksum algorithm keeps each part's own
+#               checksum: GET and HEAD by partNumber with x-amz-checksum-mode
+#               give it with the object's checksum type, GetObjectAttributes
+#               lists it per part, paged too; kept in the header (CRC32) or after
+#               the body (SHA-256 in place, SHA-1 copied), through restarts, on two
+#               shards; a copy keeps none, a single-part object answers with its
+#               own, and an object completed before they were kept with none
 #
 # The assertions live in lib_storage_part_number.py, which prints one line each.
 set -uo pipefail

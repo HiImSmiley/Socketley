@@ -1092,3 +1092,204 @@ TEST_CASE("a part list too long for the header follows the body, so any list S3 
         CHECK(part_trailer_of(*m, t));
     }
 }
+
+// ─── Each part's own checksum ───────────────────────────────────────────────
+
+namespace {
+
+std::string raw_of(checksum_algo a, std::string_view data)
+{
+    checksum_stream s(a);
+    s.update(data.data(), data.size());
+    return s.peek_raw();
+}
+
+}   // namespace
+
+TEST_CASE("a part list keeps each part's checksum in the header when it fits and after the body when not")
+{
+    const std::vector<std::string> bodies = {pattern(5000, 1), pattern(5000, 2), pattern(77, 3)};
+    part_list l;
+    object_meta m;
+    for (size_t i = 0; i < bodies.size(); ++i)
+    {
+        l.numbers.push_back(static_cast<uint32_t>(i + 1));
+        l.sizes.push_back(bodies[i].size());
+        l.checksums.push_back(raw_of(checksum_algo::sha256, bodies[i]));
+        m.size += bodies[i].size();
+    }
+    m.parts = 3;
+    m.extra.emplace_back("x-amz-checksum-sha256", "composite-3");
+    CHECK(checksum_algo_of(m) == checksum_algo::sha256);
+
+    SUBCASE("in the header")
+    {
+        object_meta h = m;
+        CHECK(record_part_list(h, l, m.size, false).empty());
+        std::string joined;
+        for (const std::string& c : l.checksums)
+            joined += c;
+        bool kept = false;
+        for (const auto& [n, v] : h.extra)
+            kept = kept || (n == part_checksums_extra && v == base64_encode(joined));
+        CHECK(kept);
+        part_list back;
+        REQUIRE(part_list_of(h, back));
+        CHECK(back.checksums == l.checksums);
+        uint64_t first = 0, len = 0;
+        part_list found;
+        REQUIRE(part_range(h, 2, first, len, &found) == part_status::ok);
+        CHECK(found.checksums.at(1) == l.checksums[1]);
+        // A copy is one part, and keeps none of them.
+        clear_part_layout(h);
+        for (const auto& [n, v] : h.extra)
+            CHECK(n != part_checksums_extra);
+        // A list whose checksums do not number its parts is still a list of sizes, with no checksum.
+        object_meta odd = m;
+        record_part_list(odd, l, m.size, false);
+        for (auto& [n, v] : odd.extra)
+            if (n == part_checksums_extra)
+                v = base64_encode(joined.substr(0, 64));
+        REQUIRE(part_list_of(odd, back));
+        CHECK(back.checksums.empty());
+    }
+    SUBCASE("after the body")
+    {
+        // 96 bytes of checksums are 128 of base64, which a room of 100 does not hold.
+        object_meta h = m;
+        const std::string bytes = record_part_list(h, l, 9999, false, 100);
+        REQUIRE(!bytes.empty());
+        part_trailer t;
+        REQUIRE(part_trailer_of(h, t));
+        CHECK(t.at == 9999);
+        CHECK(t.width == 32);
+        CHECK(t.len == 24 + 3 * (12 + 32));
+        CHECK(bytes.size() == t.len);
+        uint64_t first = 0, len = 0;
+        CHECK(part_range(h, 2, first, len) == part_status::in_trailer);
+        part_list back;
+        REQUIRE(decode_part_trailer(bytes, h, t, back));
+        CHECK(back.numbers == l.numbers);
+        CHECK(back.sizes == l.sizes);
+        CHECK(back.checksums == l.checksums);
+        // A checksum bent by a bit is not taken, and nor is the list read as one without checksums.
+        std::string bent = bytes;
+        bent[24 + 12] ^= 1;
+        CHECK_FALSE(decode_part_trailer(bent, h, t, back));
+        part_trailer narrow = t;
+        narrow.width = 0;
+        narrow.len   = 20 + 3 * 12;
+        CHECK_FALSE(decode_part_trailer(bytes, h, narrow, back));
+        // A list without checksums, of sizes that are no one number, is the format it always was.
+        part_list plain = l;
+        plain.checksums.clear();
+        plain.sizes = {5000, 4999, 78};
+        object_meta p = m;
+        const std::string old = record_part_list(p, plain, 9999, false, 0);
+        REQUIRE(part_trailer_of(p, t));
+        CHECK(t.width == 0);
+        CHECK(old.size() == 20 + 3 * 12);
+    }
+}
+
+TEST_CASE("a single-part object is its own part 1 with its own checksum, unless that is a composite one")
+{
+    object_meta m;
+    m.size = 4;
+    m.extra.emplace_back("x-amz-checksum-crc32", b64_of(checksum_algo::crc32, "abcd"));
+    part_list l;
+    REQUIRE(part_list_of(m, l));
+    REQUIRE(l.checksums.size() == 1);
+    CHECK(l.checksums[0] == raw_of(checksum_algo::crc32, "abcd"));
+    // A copy of a multipart object keeps a composite value, which is of parts it no longer has.
+    m.extra[0].second = b64_of(checksum_algo::crc32, "abcd") + "-3";
+    REQUIRE(part_list_of(m, l));
+    CHECK(l.checksums.empty());
+}
+
+TEST_CASE("a completed upload keeps each part's checksum, in the header copied or in place and after the body in place")
+{
+    tmpdir d;
+    std::optional<rig> r(std::in_place, d.path);
+    r->bucket("bkt");
+    const size_t P = 5 * MiB;
+    const std::string p1 = pattern(P, 51), p2 = pattern(P, 52), p3 = pattern(4321, 53);
+
+    struct shape { const char* key; checksum_algo algo; bool in_place; bool after; };
+    const std::vector<shape> shapes = {{"crc", checksum_algo::crc32, true, false},
+                                       {"sha", checksum_algo::sha256, true, true},
+                                       {"gap", checksum_algo::sha1, false, false}};
+    for (const shape& s : shapes)
+    {
+        INFO(std::string(s.key));
+        // Part 2 of the copied shape is longer than part 1, so it is not where the object needs it.
+        const std::vector<std::string> sent = {p1, s.in_place ? p2 : p2 + "x", p3};
+        std::string id;
+        if (!s.after)
+            id = r->create("bkt", s.key, s.algo);
+        // Tags that leave the room reserved in front of part 1 short of a header holding 3 SHA-256 checksums.
+        for (size_t tags = 3500; s.after && id.empty() && tags < 4096; tags += 8)
+        {
+            object_meta meta;
+            meta.extra.emplace_back("x-amz-tagging", std::string(tags, 't'));
+            const std::string cand = r->create("bkt", s.key, s.algo, meta);
+            object_meta full = meta;
+            full.parts = 3;
+            full.extra.emplace_back("x-amz-checksum-sha256", std::string(46, 'A'));
+            full.extra.emplace_back(std::string(part_sizes_extra), std::to_string(P));
+            full.extra.emplace_back(std::string(part_checksums_extra), std::string(128, 'A'));
+            full.extra.emplace_back(std::string(upload_id_extra), cand);
+            if (object_header_len(s.key, full) > r->mp->find("bkt", cand)->place_base)
+                id = cand;
+        }
+        REQUIRE(!id.empty());
+        std::vector<complete_part> list;
+        for (uint32_t n = 1; n <= 3; ++n)
+        {
+            REQUIRE(r->part("bkt", id, n, sent[n - 1]).status == st::ok);
+            list.push_back(listed(n, sent[n - 1]));
+        }
+        CHECK(r->mp->find("bkt", id)->parts.at(2).in_place == s.in_place);
+        const ino_t data_ino = inode_of(d.path + "/bkt/mpu/" + id + "/data");
+        const complete_result done = r->finish("bkt", id, list);
+        REQUIRE(done.error.code.empty());
+        CHECK((inode_of(d.path + "/bkt/data/" + object_rel_path(s.key)) == data_ino) == s.in_place);
+
+        const std::string file = slurp_file(d.path + "/bkt/data/" + object_rel_path(s.key));
+        const decoded_header h = decode_object_header(file);
+        REQUIRE(h.status == header_status::ok);
+        part_list l;
+        part_trailer t;
+        CHECK(part_trailer_of(h.meta, t) == s.after);
+        if (s.after)
+        {
+            CHECK(file.size() == h.header_len + t.at + t.len);
+            REQUIRE(decode_part_trailer(std::string_view(file).substr(h.header_len + t.at), h.meta, t, l));
+        }
+        else
+            REQUIRE(part_list_of(h.meta, l));
+        REQUIRE(l.checksums.size() == 3);
+        for (size_t i = 0; i < 3; ++i)
+            CHECK(l.checksums[i] == raw_of(s.algo, sent[i]));
+        std::string body;
+        REQUIRE(r->object("bkt", s.key, body) == st::ok);
+        CHECK(body == sent[0] + sent[1] + sent[2]);
+    }
+
+    // A start with the journals removed finds each list again from the files.
+    r.reset();
+    for (const auto& e : fs::directory_iterator(d.path + "/bkt"))
+        if (e.path().filename().string().starts_with("index."))
+            fs::remove(e.path());
+    rig again(d.path);
+    for (const shape& s : shapes)
+    {
+        INFO(std::string(s.key));
+        const object_meta* m = again.store->find("bkt", s.key);
+        REQUIRE(m != nullptr);
+        part_trailer t;
+        CHECK(part_trailer_of(*m, t) == s.after);
+        part_list l;
+        CHECK((s.after || (part_list_of(*m, l) && l.checksums.size() == 3)));
+    }
+}

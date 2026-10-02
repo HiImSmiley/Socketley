@@ -15,6 +15,7 @@ usage: lib_storage_part_number.py MODE ARGS...
 
 Prints one PASS or FAIL line per assertion and exits with the number of failures.
 """
+import base64
 import hashlib
 import http.client
 import os
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+import zlib
 
 MODE = sys.argv[1]
 BIN = os.environ.get("BIN", "")
@@ -149,6 +151,102 @@ def part_answers(key, parts, method="GET", node=None):
 MULTI = {}
 
 
+# ── each part's own checksum, kept after completion ─────────────────────────
+def b64_sum(algo, data):
+    if algo == "CRC32":
+        raw = struct.pack(">I", zlib.crc32(data))
+    else:
+        raw = hashlib.new(algo.lower(), data).digest()
+    return base64.b64encode(raw).decode()
+
+
+def upload_ck(key, parts, algo, full=False, node=None, data=None):
+    """Uploads `parts` with `algo`; returns whether the data file became the object and the parts' checksums."""
+    h = {"x-amz-checksum-algorithm": algo}
+    if full:
+        h["x-amz-checksum-type"] = "FULL_OBJECT"
+    st, _, body = req("POST", "/%s/%s?uploads" % (B, key), headers=h, node=node)
+    if st != 200:
+        raise RuntimeError("create %s: %d %r" % (key, st, body[:200]))
+    uid = ET.fromstring(body).findtext(NS + "UploadId")
+    etags, sums = [], []
+    for i, p in enumerate(parts):
+        st, h, body = req("PUT", "/%s/%s?partNumber=%d&uploadId=%s" % (B, key, i + 1, uid), p, node=node)
+        if st != 200:
+            raise RuntimeError("part %d of %s: %d %r" % (i + 1, key, st, body[:200]))
+        etags.append(h["etag"].strip('"'))
+        sums.append(h.get("x-amz-checksum-" + algo.lower()))
+    ino = os.stat(os.path.join(data, B, "mpu", uid, "data")).st_ino if data else None
+    x = "<CompleteMultipartUpload>" + "".join(
+        "<Part><PartNumber>%d</PartNumber><ETag>\"%s\"</ETag></Part>" % (i + 1, e) for i, e in enumerate(etags)) + \
+        "</CompleteMultipartUpload>"
+    st, _, body = req("POST", "/%s/%s?uploadId=%s" % (B, key, uid), x.encode(), node=node)
+    if st != 200:
+        raise RuntimeError("complete %s: %d %r" % (key, st, body[:200]))
+    in_place = ino is not None and os.stat(object_file(data, key)).st_ino == ino
+    return in_place, sums
+
+
+def part_sums_wrong(key, parts, algo, typ, method="GET", node=None):
+    """Every way a part read with x-amz-checksum-mode differs from its own checksum, or one without it shows one."""
+    name = "x-amz-checksum-" + algo.lower()
+    wrong = []
+    for i, p in enumerate(parts):
+        path = "/%s/%s?partNumber=%d" % (B, key, i + 1)
+        st, h, body = req(method, path, headers={"x-amz-checksum-mode": "ENABLED"}, node=node)
+        got = (st, h.get(name), h.get("x-amz-checksum-type"))
+        want = (206, b64_sum(algo, p), typ)
+        if got != want:
+            wrong.append((i + 1, got, want))
+        if method == "GET" and body != p:
+            wrong.append((i + 1, "body", len(body)))
+        st, h, _ = req(method, path, node=node)
+        if name in h:
+            wrong.append((i + 1, "a checksum not asked for", h[name]))
+    return wrong
+
+
+def attr_parts(key, node=None, max_parts=None, marker=None):
+    """GetObjectAttributes' ObjectParts of `key`: (number, size, checksum or None) per part, and NextPartNumberMarker."""
+    h = {"x-amz-object-attributes": "ObjectParts,Checksum"}
+    if max_parts:
+        h["x-amz-max-parts"] = str(max_parts)
+    if marker:
+        h["x-amz-part-number-marker"] = str(marker)
+    st, _, body = req("GET", "/%s/%s?attributes" % (B, key), headers=h, node=node)
+    if st != 200:
+        return st, body[:200]
+    x = ET.fromstring(body)
+    rows = []
+    for p in x.iter(NS + "Part"):
+        ck = [c.text for c in p if c.tag.startswith(NS + "Checksum")]
+        rows.append((int(p.findtext(NS + "PartNumber")), int(p.findtext(NS + "Size")), ck[0] if ck else None))
+    return rows, x.findtext(NS + "ObjectParts/" + NS + "NextPartNumberMarker")
+
+
+def attrs_wrong(key, parts, algo, node=None):
+    """How the parts GetObjectAttributes lists for `key`, in full and two at a time, differ from their checksums."""
+    want = [(i + 1, len(p), b64_sum(algo, p)) for i, p in enumerate(parts)]
+    got, _ = attr_parts(key, node)
+    wrong = [] if got == want else [("all", got, want)]
+    paged, marker = [], None
+    while True:
+        rows, marker = attr_parts(key, node, 2, marker)
+        if not isinstance(rows, list):
+            return wrong + [("page", rows, marker)]
+        paged += rows
+        if not marker:
+            break
+    if paged != want:
+        wrong.append(("paged", paged, want))
+    return wrong
+
+
+def ck_wrong(key, parts, algo, typ, node=None):
+    return part_sums_wrong(key, parts, algo, typ, node=node) + \
+        part_sums_wrong(key, parts, algo, typ, "HEAD", node=node) + attrs_wrong(key, parts, algo, node)
+
+
 def blob(n, seed):
     out = bytearray()
     h = hashlib.sha256(seed.encode()).digest()
@@ -163,6 +261,17 @@ UNEQUAL = [blob(6 * MiB, "u1"), blob(5 * MiB, "u2"), blob(7 * MiB + 3, "u3"), bl
 SINGLE = blob(10000, "s")
 # Every size its own, so the list is longer than the 48 bytes SOCKETLEY_STORAGE_PART_LIST_MAX leaves it in the header.
 VARIED = [blob(5 * MiB + 4099 * i + 1, "v%d" % i) for i in range(8)] + [blob(100, "vlast")]
+
+# Uploaded with a checksum algorithm: the algorithm, the object's checksum type, its parts, and whether its
+# data file becomes the object.  Against the 48 bytes the header may give a list here, 4 SHA-256 checksums
+# (172 bytes of base64) follow the body even in place, 4 CRC32 ones (24) stay in the header in place and copied,
+# and nine SHA-1 ones follow a copied body with the sizes.
+CK = {
+    "ck-equal": ("SHA256", "COMPOSITE", EQUAL, True),
+    "ck-crc": ("CRC32", "FULL_OBJECT", EQUAL, True),
+    "ck-unequal": ("CRC32", "COMPOSITE", UNEQUAL, False),
+    "ck-varied": ("SHA1", "COMPOSITE", VARIED, False),
+}
 
 
 # ── an object header as object_format.cpp writes it ─────────────────────────
@@ -402,6 +511,90 @@ def mode_main(port, data):
     except ImportError:
         print("  SKIP: boto3 is not installed")
 
+    # ── each part's own checksum, kept after completion ──
+    for key, (algo, typ, parts, place) in CK.items():
+        in_place, sums = upload_ck(key, parts, algo, typ == "FULL_OBJECT", data=data)
+        want = [b64_sum(algo, p) for p in parts]
+        check("%s: each UploadPart answers its part's %s" % (key, algo), sums == want, (sums, want))
+        check("%s: the data file %s the object" % (key, "became" if place else "did not become"), in_place == place)
+        wrong = ck_wrong(key, parts, algo, typ)
+        check("%s: GET and HEAD of each part with x-amz-checksum-mode give its own %s as %s, and GetObjectAttributes "
+              "lists it beside each part, whole and two at a time" % (key, algo, typ), not wrong, wrong[:2])
+        wrong = part_answers(key, parts)
+        check("%s: and the parts' bytes and boundaries are as without checksums" % key, not wrong, wrong[:2])
+    extra = dict(read_header(object_file(data, "ck-equal"))["extra"])
+    layout = extra.get(b"x-socketley-part-layout", b"")
+    check("in place, SHA-256 checksums too long for the header follow the body, the header naming their width",
+          layout.endswith(b";32") and b"x-socketley-part-checksums" not in extra and
+          extra.get(b"x-socketley-part-sizes") is None, list(extra))
+    with open(object_file(data, "ck-equal"), "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+    check("and the file is the header, the body and a list of number, size and checksum per part",
+          size == read_header(object_file(data, "ck-equal"))["header_len"] + sum(map(len, EQUAL)) + 24 + 44 * 4, size)
+    for key in ("ck-crc", "ck-unequal"):
+        extra = dict(read_header(object_file(data, key))["extra"])
+        want = base64.b64encode(b"".join(base64.b64decode(b64_sum("CRC32", p)) for p in CK[key][2]))
+        check("%s: its CRC32 checksums are kept in its header" % key,
+              extra.get(b"x-socketley-part-checksums") == want and b"x-socketley-part-layout" not in extra, list(extra))
+    st, h, _ = req("GET", "/%s/ck-equal?partNumber=2" % B,
+                   headers={"x-amz-checksum-mode": "ENABLED", "Range": "bytes=0-9"})
+    check("a Range beside partNumber is still refused before any checksum", st == 400, st)
+    st, h, _ = req("GET", "/%s/ck-equal" % B, headers={"x-amz-checksum-mode": "ENABLED", "Range": "bytes=0-9"})
+    check("and a ranged GET carries no checksum, as the bytes are no part's",
+          st == 206 and "x-amz-checksum-sha256" not in h, (st, h.get("x-amz-checksum-sha256")))
+    st, h, _ = req("GET", "/%s/ck-equal" % B, headers={"x-amz-checksum-mode": "ENABLED"})
+    check("while the whole object's GET carries the composite one",
+          h.get("x-amz-checksum-sha256", "").endswith("-4") and h.get("x-amz-checksum-type") == "COMPOSITE", h)
+
+    # A single-part object is its own part 1, with its own checksum.
+    one = blob(70000, "ck1")
+    req("PUT", "/%s/ck-single" % B, one, headers={"x-amz-checksum-sha256": b64_sum("SHA256", one)})
+    MULTI["ck-single"] = False
+    wrong = part_sums_wrong("ck-single", [one], "SHA256", "FULL_OBJECT") + \
+        part_sums_wrong("ck-single", [one], "SHA256", "FULL_OBJECT", "HEAD")
+    check("partNumber=1 of a single-part object with x-amz-checksum-mode gives its checksum", not wrong, wrong)
+
+    # A copy is one part, so it keeps none of its source's part checksums.
+    for src, dst in (("ck-equal", "ck-copy"), ("ck-crc", "ck-crc-copy")):
+        st, _, body = req("PUT", "/%s/%s" % (B, dst), headers={"x-amz-copy-source": "/%s/%s" % (B, src)})
+        check("%s is copied" % src, st == 200, (st, body[:200]))
+        MULTI[dst] = False
+        extra = dict(read_header(object_file(data, dst))["extra"])
+        check("%s: its header keeps no part list or part checksum" % dst,
+              not any(n.startswith(b"x-socketley-part") for n in extra), list(extra))
+        rows = attr_parts(dst)
+        check("%s: GetObjectAttributes lists no parts of it" % dst, rows[0] == [], rows)
+        st, h, body = req("GET", "/%s/%s?partNumber=1" % (B, dst), headers={"x-amz-checksum-mode": "ENABLED"})
+        algo = CK[src][0]
+        got = h.get("x-amz-checksum-" + algo.lower())
+        whole = b"".join(CK[src][2])
+        check("%s: its partNumber=1 is all of it, with no checksum of its source's part 1" % dst,
+              st == 206 and body == whole and got != b64_sum(algo, CK[src][2][0]), (st, got))
+    st, h, _ = req("GET", "/%s/ck-crc-copy?partNumber=1" % B, headers={"x-amz-checksum-mode": "ENABLED"})
+    check("the copy of a FULL_OBJECT CRC32 object gives that CRC32 for its one part",
+          h.get("x-amz-checksum-crc32") == b64_sum("CRC32", b"".join(EQUAL)), h.get("x-amz-checksum-crc32"))
+    st, h, _ = req("GET", "/%s/ck-copy?partNumber=1" % B, headers={"x-amz-checksum-mode": "ENABLED"})
+    check("and the copy of a COMPOSITE one gives none, its value being of parts the copy does not have",
+          "x-amz-checksum-sha256" not in h, h.get("x-amz-checksum-sha256"))
+
+    try:
+        import boto3
+        from botocore import UNSIGNED
+        from botocore.config import Config
+        c = boto3.client("s3", endpoint_url="http://127.0.0.1:%d" % port, region_name="us-east-1",
+                         config=Config(signature_version=UNSIGNED, s3={"addressing_style": "path"},
+                                       retries={"max_attempts": 1}))
+        a = c.get_object_attributes(Bucket=B, Key="ck-varied", ObjectAttributes=["ObjectParts"])
+        got = [(p["PartNumber"], p.get("ChecksumSHA1")) for p in a["ObjectParts"]["Parts"]]
+        check("boto3 reads each part's ChecksumSHA1 from GetObjectAttributes",
+              got == [(i + 1, b64_sum("SHA1", p)) for i, p in enumerate(VARIED)], got[:2])
+        g = c.get_object(Bucket=B, Key="ck-equal", PartNumber=3, ChecksumMode="ENABLED")
+        check("and part 3's ChecksumSHA256 from a GET, validating the body against it",
+              (g.get("ChecksumSHA256"), g["Body"].read() == EQUAL[2]) == (b64_sum("SHA256", EQUAL[2]), True),
+              g.get("ChecksumSHA256"))
+    except ImportError:
+        print("  SKIP: boto3 is not installed")
+
     # ── an object completed before part sizes were recorded ──
     upload("legacy", EQUAL, data=data)
     path = object_file(data, "legacy")
@@ -410,6 +603,12 @@ def mode_main(port, data):
     h["extra"] = [(n, v) for n, v in h["extra"] if n != b"x-socketley-part-sizes"]
     write_header(path, h)
     check("and the legacy header written in its place reads back sound", read_header(path)["crc_ok"])
+    # And one completed before part checksums were kept.
+    upload_ck("ck-legacy", EQUAL, "CRC32", data=data)
+    lpath = object_file(data, "ck-legacy")
+    h = read_header(lpath)
+    h["extra"] = [(n, v) for n, v in h["extra"] if n != b"x-socketley-part-checksums"]
+    write_header(lpath, h)
     ok, removed = restart(port, data)
     check("a start with the journals removed reads it from the file", ok and removed > 0, (ok, removed))
     for n in (1, 2, 4):
@@ -423,6 +622,14 @@ def mode_main(port, data):
           (st, body == b"".join(EQUAL), h.get("etag")) == (200, True, '"%s"' % mp_etag(EQUAL)), (st, h.get("etag")))
     wrong = part_answers("equal", EQUAL) + part_answers("unequal", UNEQUAL, "HEAD")
     check("while the others are still answered from their headers", not wrong, wrong[:2])
+    got = [req("GET", "/%s/ck-legacy?partNumber=%d" % (B, n), headers={"x-amz-checksum-mode": "ENABLED"})
+           for n in (1, 4)]
+    check("parts of an object completed before their checksums were kept are read with none",
+          [(st, body == EQUAL[n], "x-amz-checksum-crc32" in h) for (st, h, body), n in zip(got, (0, 3))] ==
+          [(206, True, False)] * 2, [(st, h.get("x-amz-checksum-crc32")) for st, h, _ in got])
+    rows, _ = attr_parts("ck-legacy")
+    check("and listed by GetObjectAttributes with their sizes and no checksum",
+          rows == [(i + 1, len(p), None) for i, p in enumerate(EQUAL)], rows)
 
 
 def mode_restart(port, data):
@@ -434,11 +641,19 @@ def mode_restart(port, data):
     wrong = part_answers("equal", EQUAL) + part_answers("unequal", UNEQUAL) + part_answers("single", [SINGLE]) + \
         part_answers("varied", VARIED)
     check("after a restart every part is answered as before", not wrong, wrong[:2])
+    wrong = []
+    for key, (algo, typ, parts, _) in CK.items():
+        wrong += [(key, w) for w in ck_wrong(key, parts, algo, typ)]
+    check("and with its own checksum, from the journal", not wrong, wrong[:2])
     ok, removed = restart(port, data)
     check("and again with every journal removed", ok and removed > 0, (ok, removed))
     wrong = part_answers("equal", EQUAL) + part_answers("unequal", UNEQUAL, "HEAD") + \
         part_answers("varied", VARIED, "HEAD")
     check("after which the boundaries come from the object headers and the list after a body", not wrong, wrong[:2])
+    wrong = []
+    for key, (algo, typ, parts, _) in CK.items():
+        wrong += [(key, w) for w in ck_wrong(key, parts, algo, typ)]
+    check("and every part's checksum comes back from the header or the list after the body", not wrong, wrong[:2])
 
 
 def mode_shards(nodes):
@@ -465,6 +680,13 @@ def mode_shards(nodes):
         wrong += [(node, w) for w in part_answers("s-var", VARIED, node=node)]
         wrong += [(node, w) for w in part_answers("s-var", VARIED, "HEAD", node=node)]
     check("and an object whose list follows its body is answered alike by both", not wrong, wrong[:3])
+    wrong = []
+    for i, key in enumerate(("ck-equal", "ck-unequal")):
+        algo, typ, parts, _ = CK[key]
+        upload_ck("s-" + key, parts, algo, node=nodes[i])
+        for node in nodes:
+            wrong += [(key, node, w) for w in ck_wrong("s-" + key, parts, algo, typ, node=node)]
+    check("each part's checksum, after the body or in the header, is answered alike by both shards", not wrong, wrong[:3])
     for node in nodes:
         st, _, body = req("GET", "/%s/s-eq-0?partNumber=4" % B, node=node)
         check("part 4 of 3 is 416 on %s" % os.path.basename(node), (st, xml_code(body)) == (416, "InvalidPartNumber"),

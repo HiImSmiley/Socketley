@@ -691,6 +691,26 @@ def mode_tls(port, cert, data):
     check("and its second part by number", s3.get_object(Bucket=B, Key="cmp", PartNumber=2, **ka)["Body"].read() == p[1])
     code = err_code(lambda: s3.get_object(Bucket=B, Key="cmp"))
     check("and is refused without it", code == (400, "InvalidRequest"), code)
+    # Completed without the key, so the master key's MAC binds a part list that carries the parts' checksums.
+    up = s3.create_multipart_upload(Bucket=B, Key="cmpck", ChecksumAlgorithm="SHA256", **ka)
+    parts = []
+    for i, part in enumerate(p, 1):
+        # The upload's algorithm is what the part is checksummed with, which over TLS boto3 would send in a trailer.
+        r = s3.upload_part(Bucket=B, Key="cmpck", UploadId=up["UploadId"], PartNumber=i, Body=part, **ka)
+        parts.append({"PartNumber": i, "ETag": r["ETag"], "ChecksumSHA256": r["ChecksumSHA256"]})
+    s3.complete_multipart_upload(Bucket=B, Key="cmpck", UploadId=up["UploadId"], MultipartUpload={"Parts": parts})
+    want = [base64.b64encode(hashlib.sha256(part).digest()).decode() for part in p]
+    got = [s3.get_object(Bucket=B, Key="cmpck", PartNumber=i, ChecksumMode="ENABLED", **ka) for i in (1, 2)]
+    check("an SSE-C upload's parts read by number with their own SHA-256, its list bound by a MAC",
+          [(g.get("ChecksumSHA256"), g["Body"].read()) for g in got] == list(zip(want, p)),
+          [g.get("ChecksumSHA256") for g in got])
+    st, got = fetch("/%s/cmpck?attributes" % B, dict(c_headers(key), **{"x-amz-object-attributes": "ObjectParts"}))
+    listed = re.findall(rb"<ChecksumSHA256>([^<]*)</ChecksumSHA256>", got) if st == 200 else got
+    check("and are listed with them by GetObjectAttributes", listed == [w.encode() for w in want], (st, listed))
+    h = read_header(obj_file(data, "cmpck"))
+    check("whose list follows the body, under the MAC",
+          (extra_of(h, b"x-socketley-part-layout") or b"").endswith(b";32") and
+          extra_of(h, b"x-socketley-sse-parts") is not None, h and h["extra"])
 
     # ── copies across the two kinds ─────────────────────────────────────────
     code = err_code(lambda: s3.copy_object(Bucket=B, Key="x", CopySource={"Bucket": B, "Key": "c"}))
@@ -1308,10 +1328,51 @@ def mode_layout(port, data):
             at += len(p)
         check("%s: every part by partNumber, GET and HEAD, and every range across a part boundary" % label, not bad, bad)
 
+    # Each part's SHA-256 kept after a sealed body, of parts copied into it and of parts sealed where they lie.
+    ck_objects = {"ck-varied": parts, "ck-equal": [marked(5 * MIB, "cke%d" % i) for i in range(3)] + [marked(777, "ckl")]}
+    for key, ps in ck_objects.items():
+        up = s3.create_multipart_upload(Bucket=LB, Key=key, ServerSideEncryption="AES256", ChecksumAlgorithm="SHA256")
+        done = []
+        for i, p in enumerate(ps, 1):
+            r = s3.upload_part(Bucket=LB, Key=key, UploadId=up["UploadId"], PartNumber=i, Body=p,
+                               ChecksumAlgorithm="SHA256")
+            done.append({"PartNumber": i, "ETag": r["ETag"], "ChecksumSHA256": r["ChecksumSHA256"]})
+        w0 = write_bytes()
+        s3.complete_multipart_upload(Bucket=LB, Key=key, UploadId=up["UploadId"], MultipartUpload={"Parts": done})
+        written = write_bytes() - w0
+        h = read_header(obj_file(data, key, LB))
+        with open(obj_file(data, key, LB), "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+        check("%s: an encrypted upload's SHA-256 part checksums follow its sealed body, the header naming their width"
+              % key, (extra_of(h, b"x-socketley-part-layout") or b"").endswith(b";32") and
+              size == h["header_len"] + sum(sealed_len(len(p)) for p in ps) + 24 + 44 * len(ps), (h["extra"], size))
+        if key == "ck-equal":
+            check("ck-equal: and its parts were sealed where they lie, the list written after them, not copied",
+                  written < MIB, written)
+
+    def ck_reads(label):
+        bad = []
+        for key, ps in ck_objects.items():
+            for i, p in enumerate(ps, 1):
+                want = base64.b64encode(hashlib.sha256(p).digest()).decode()
+                g = s3.get_object(Bucket=LB, Key=key, PartNumber=i, ChecksumMode="ENABLED")
+                if (g.get("ChecksumSHA256"), g["Body"].read() == p) != (want, True):
+                    bad.append((key, "get", i, g.get("ChecksumSHA256")))
+                hd = s3.head_object(Bucket=LB, Key=key, PartNumber=i, ChecksumMode="ENABLED")
+                if hd.get("ChecksumSHA256") != want:
+                    bad.append((key, "head", i, hd.get("ChecksumSHA256")))
+            a = s3.get_object_attributes(Bucket=LB, Key=key, ObjectAttributes=["ObjectParts"])
+            got = [(q["PartNumber"], q["Size"], q.get("ChecksumSHA256")) for q in a["ObjectParts"]["Parts"]]
+            if got != [(i, len(p), base64.b64encode(hashlib.sha256(p).digest()).decode()) for i, p in enumerate(ps, 1)]:
+                bad.append((key, "attributes", got[:2]))
+        check("%s: each encrypted part's own SHA-256 by GET, HEAD and GetObjectAttributes" % label, not bad, bad[:3])
+
     reads("before a restart")
+    ck_reads("before a restart")
     ok, removed = restart_runtime(port, data)
     check("it starts again with %d journal files removed" % removed, ok and removed > 0, (ok, removed))
     reads("after it, from the header and the list in the file")
+    ck_reads("after it, from the list in the file")
 
     # The list is checked against its digest, so one bent by a byte places nothing.
     flip(path, len(raw) - 5)

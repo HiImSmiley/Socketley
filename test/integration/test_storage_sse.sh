@@ -31,7 +31,8 @@
 #   part list   an encrypted upload of parts of nine sizes, numbered with gaps,
 #               whose list does not fit the header (made small here by
 #               SOCKETLEY_STORAGE_PART_LIST_MAX) completes and reads by range and
-#               partNumber, after a restart too
+#               partNumber, after a restart too; each part's SHA-256 follows a
+#               sealed body, copied or sealed in place, and under SSE-C a MAC
 #   pool        small SSE-S3 puts take a pooled file, and one whose worker is
 #               killed after its rename (SOCKETLEY_STORAGE_KILL_AFTER_RENAME) and
 #               whose rename is then lost is rolled forward by the next start
