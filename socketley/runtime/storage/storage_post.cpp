@@ -19,11 +19,13 @@ bool header_field(std::string_view name)
     static constexpr std::string_view kept[] = {
         "content-type", "cache-control", "content-disposition", "content-encoding", "content-language", "expires",
         "x-amz-storage-class", "x-amz-server-side-encryption", "x-amz-checksum-algorithm",
+        "x-amz-website-redirect-location",
     };
     for (std::string_view k : kept)
         if (name == k)
             return true;
     return name.starts_with("x-amz-meta-") || name.starts_with("x-amz-server-side-encryption-") ||
+           name.starts_with("x-amz-object-lock-") ||
            (name.starts_with("x-amz-checksum-") && name != "x-amz-checksum-type");
 }
 

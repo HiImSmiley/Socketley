@@ -110,6 +110,7 @@ inline s3_error make_error(std::string_view code)
         {"MethodNotAllowed", 405, "The specified method is not allowed against this resource."},
         {"NotImplemented", 501, "A header you provided implies functionality that is not implemented"},
         {"AccessControlListNotSupported", 400, "The bucket does not allow ACLs"},
+        {"InvalidStorageClass", 400, "The storage class you specified is not valid"},
         {"MalformedPOSTRequest", 400, "The body of your POST request is not well-formed multipart/form-data."},
         {"MaxPostPreDataLengthExceeded", 400, "Your POST request fields preceding the upload file were too large."},
         {"IncorrectNumberOfFilesInPostRequest", 400, "POST requires exactly one file upload per request."},

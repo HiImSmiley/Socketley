@@ -6481,7 +6481,16 @@ A bucket's own tags (PutBucketTagging, GetBucketTagging, DeleteBucketTagging)
 are at most 50 under the rules of an object's, NoSuchTagSet (404) when there are
 none, and are kept and carried between shards like its CORS rules, in
 .IB dir / bucket /tagging .
-Anything else \(em object lock, other ownership controls \(em is answered
+Object lock is not built: a CreateBucket that enables it and a write that names a
+retention or a legal hold (\fBx\-amz\-object\-lock\-*\fR) are
+.B "501 NotImplemented"
+and change nothing, rather than an object taken as locked that can be deleted.
+Every storage class S3 has is taken and stored as STANDARD, the one this storage
+has, and one it does not have is
+.BR "400 InvalidStorageClass" ;
+.B x\-amz\-website\-redirect\-location
+is kept and returned like the other stored headers.
+Anything else \(em object lock configuration, other ownership controls \(em is answered
 .B "501 NotImplemented"
 and never mistaken for the plain operation. A single put is at most 5 GiB and a
 key at most 1024 bytes.

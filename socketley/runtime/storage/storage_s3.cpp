@@ -257,6 +257,11 @@ void storage_run::route(const std::shared_ptr<conn>& c)
         deny_request(c, e);
         return;
     }
+    if (s3_error e; !lock_and_class_ok(r, e))
+    {
+        deny_request(c, e);
+        return;
+    }
     // A form is the PutObject its fields describe, with its file as the body.
     if (r.form)
     {
@@ -576,6 +581,37 @@ bool storage_run::acl_headers_ok(const s3_request& r, bool bucket, s3_error& err
     if (!ok)
         err = make_error(bucket && r.method == "PUT" ? "InvalidBucketAclWithObjectOwnership" : "AccessControlListNotSupported");
     return ok;
+}
+
+bool storage_run::lock_and_class_ok(const s3_request& r, s3_error& err)
+{
+    if (r.method != "PUT" && r.method != "POST")
+        return true;
+    for (const auto& h : r.headers)
+    {
+        // A retention or a legal hold taken and not kept would let an object go that its writer meant to keep.
+        if (h.name.starts_with("x-amz-object-lock-") ||
+            (h.name == "x-amz-bucket-object-lock-enabled" && http_token_equals(h.value, "true", 4)))
+        {
+            err = make_error("NotImplemented");
+            err.message = "Object lock is not implemented by this storage runtime.";
+            return false;
+        }
+        // Every class S3 has is stored as STANDARD, the one this storage has, which keeps at least what was asked.
+        if (h.name == "x-amz-storage-class")
+        {
+            static constexpr std::string_view classes[] = {
+                "STANDARD", "REDUCED_REDUNDANCY", "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING", "GLACIER",
+                "DEEP_ARCHIVE", "OUTPOSTS", "GLACIER_IR", "SNOW", "EXPRESS_ONEZONE",
+            };
+            if (std::find(std::begin(classes), std::end(classes), h.value) == std::end(classes))
+            {
+                err = make_error("InvalidStorageClass");
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void storage_run::op_get_acl(const std::shared_ptr<conn>& c)
@@ -1025,6 +1061,7 @@ bool storage_run::object_meta_from_headers(const std::shared_ptr<conn>& c, objec
 
     static constexpr std::string_view kept[] = {
         "cache-control", "content-disposition", "content-encoding", "content-language", "expires",
+        "x-amz-website-redirect-location",
     };
     size_t user = 0;
     for (const auto& [name, value] : q.headers)

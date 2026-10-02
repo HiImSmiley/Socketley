@@ -593,6 +593,8 @@ public:
     void op_head_bucket(const std::shared_ptr<conn>& c);
     // False with `err` S3's refusal when a write asks for an ACL other than its owner's full control.
     bool acl_headers_ok(const s3_request& r, bool bucket, s3_error& err) const;
+    // False with `err` when a write asks for object lock, which is not built, or a storage class S3 does not have.
+    static bool lock_and_class_ok(const s3_request& r, s3_error& err);
     void op_get_acl(const std::shared_ptr<conn>& c);
     void op_put_acl(const std::shared_ptr<conn>& c);
     void op_ownership_controls(const std::shared_ptr<conn>& c);
