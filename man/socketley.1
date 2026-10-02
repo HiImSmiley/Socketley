@@ -7970,6 +7970,13 @@ because its file is gone.
 That reading happens before the listener opens and takes as long as the object
 count makes it, and is the only place the loop blocks on the disk: every request
 is served on the runtime's io_uring.
+A stop closes the listener and the connections first and then lets the journal
+writes, directory syncs and compaction already begun finish, for at most a
+second; one that cannot finish them in that time is read by the next start as a
+crash. Each shard holds a lock on
+.BI .lock. n
+in the directory until its stop is done, and a start of the same shard waits up to
+a second and a half for the process it replaces to let go, and fails if it does not.
 .PP
 The start after a crash reads every header even of a file the journal names with
 the same size, since an overwrite whose record was lost can leave exactly that: the
