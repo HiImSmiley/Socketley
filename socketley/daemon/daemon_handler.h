@@ -2,6 +2,9 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
+#include <functional>
+#include <list>
 #include <memory>
 #include <vector>
 #include <chrono>
@@ -49,7 +52,15 @@ struct ipc_connection
 
     bool interactive = false;
     std::string interactive_name;
+
+    // Which connection this is, since a descriptor number is reused by the next one accepted.
+    uint64_t serial = 0;
+    // The least exit code a parked reply may answer with, for what the command said before it parked.
+    int parked_floor = 0;
 };
+
+// What a command handler returns when its reply waits for a worker that is not forked yet.
+inline constexpr int reply_parked = -1000;
 
 // route_relay::sink is the second base because the daemon is the only process
 // that can turn a runtime name into either an object it may call or a child's
@@ -353,12 +364,53 @@ private:
         // How long before SIGKILL: five seconds, or the dump's own bound for a
         // cache that writes one on its way out.
         std::chrono::seconds                  grace{5};
+        // The runtime it served, whose next worker is not forked until this one has exited.
+        std::string                           runtime;
     };
     std::vector<orphan_worker> m_orphan_workers;
 
     // waitpid(WNOHANG) over the list, and SIGKILL for anything still there a
     // few seconds after its SIGTERM.
     void reap_orphan_workers();
+
+    // ── A runtime's next worker waits for its last one to exit ──────────────
+    // A retired worker's pidfd, polled on the ring so its exit forks what was waiting for it; a list for stable addresses.
+    struct exit_watch
+    {
+        io_request req;
+        int        pidfd{-1};
+    };
+    std::list<exit_watch> m_exit_watches;
+    void watch_exit(pid_t pid);
+    void on_exit_watch(const io_request* req);
+
+    // Whether a retired worker of `name` is still running, reaping the ones that are not.
+    bool predecessor_running(const std::string& name);
+
+    // Runtimes wanted running whose fork the last reconcile held back for a predecessor.
+    std::unordered_set<std::string> m_spawn_waiting;
+
+    // A command's answer that waits for the workers of `names` to be forked, finished with `abandoned` false
+    // once none is held back and with true when the daemon goes down first.
+    struct deferred_start
+    {
+        std::vector<std::string>   names;
+        std::function<void(bool)>  finish;
+    };
+    std::vector<deferred_start> m_deferred_starts;
+    bool any_spawn_waiting(const std::vector<std::string>& names) const;
+    void finish_deferred_starts(bool abandoned);
+
+    // A CLI command's reply deferred until its starts can be waited for, resumed from where the packet left off.
+    void park_reply(ipc_connection* conn, std::vector<std::string> names,
+                    std::function<int(ipc_connection*)> verdict);
+    uint64_t m_next_serial{0};
+
+    // Runs the commands a connection's buffer holds, sending what they answered, unless one of them parks.
+    void serve_commands(client_map::iterator it, bool queued);
+
+    // Waits for each named runtime's worker and reads its on_start, writing what failed under `verb`; the count failed.
+    int await_started(std::string& out, const std::vector<std::string>& names, std::string_view verb);
 
     // Handlers the ring has not finished with, because both embed an
     // io_request in their own storage and the loop's staleness check reads the
@@ -533,7 +585,11 @@ private:
     void serve_map_requests();
 
     // One of the four against this daemon's map, with `err` filled in as the
-    // text the script is handed.
+    // text the script is handed, and `parked` set when a start's answer waits
+    // for its worker's predecessor to exit.
     bool serve_map_request(const std::string& op, const std::string& name,
-                           const std::string& config, std::string& err);
+                           const std::string& config, std::string& err, bool& parked);
+
+    // A started runtime's verdict as a map call reports it: its worker up and its on_start clean.
+    bool map_started(const std::string& name, std::string& err);
 };

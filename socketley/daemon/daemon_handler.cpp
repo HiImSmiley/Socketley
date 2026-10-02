@@ -56,6 +56,8 @@
 #include <filesystem>
 #include <fstream>
 #include <sys/wait.h>
+#include <sys/syscall.h>
+#include <poll.h>
 #include <csignal>
 #include "../shared/logging.h"
 
@@ -624,7 +626,7 @@ void daemon_handler::teardown()
     {
         sup->shutdown();
         if (const pid_t p = sup->release_pid(); p > 0)
-            m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false});
+            m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false, std::chrono::seconds(5), {}});
 
         // Retired here too, so "a supervisor is never destroyed while
         // something still holds it" holds on both paths rather than only on
@@ -691,6 +693,17 @@ void daemon_handler::teardown()
         // later arm hand the kernel a request it is already carrying one for.
     }
     m_torn_down = true;
+
+    // Nothing is forked from here on, so a reply waiting for a fork is given up, and every exit watch withdrawn.
+    finish_deferred_starts(true);
+    for (auto& w : m_exit_watches)
+    {
+        if (w.pidfd < 0)
+            continue;
+        if (!m_loop.submit_poll_remove(&w.req)) {}
+        m_loop.close_fd(w.pidfd);
+        w.pidfd = -1;
+    }
 
     // Anything a worker was still waiting on is refused rather than dropped,
     // because the nop that would serve it is not coming and silence costs the
@@ -790,6 +803,8 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
                     start_accept();
 
                 check_managed_health();
+                // The backstop for a start whose wait ended without an exit watch firing, the reconcile above having forked.
+                finish_deferred_starts(false);
                 // Release the retired runtimes the ring has finished with,
                 // because removal only ever reaps the ones retired before it
                 // and the last runtime a daemon removes would keep its whole
@@ -797,6 +812,9 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
                 m_manager.reap_retired(m_loop);
                 start_health_timer();
             }
+            break;
+        case op_poll:
+            on_exit_watch(req);
             break;
         default:
             break;
@@ -911,6 +929,7 @@ void daemon_handler::handle_accept(struct io_uring_cqe* cqe)
     {
         auto conn = std::make_unique<ipc_connection>();
         conn->fd = client_fd;
+        conn->serial = ++m_next_serial;
         conn->read_req = { this, conn->read_buf, client_fd, sizeof(conn->read_buf), op_read };
         conn->write_req = { this, nullptr, client_fd, 0, op_write };
 
@@ -1055,10 +1074,17 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
+    serve_commands(it, false);
+}
+
+void daemon_handler::serve_commands(client_map::iterator it, bool queued)
+{
+    auto* conn = it->second.get();
+    const int fd = conn->fd;
+
     // ─── TWO FRAMINGS ON ONE CONNECTION ─────────────────────────────────────
     // A command is a line unless it begins with the frame marker, and both are
     // handled in one loop because both can arrive in one packet.
-    bool queued = false;
     while (!conn->partial.empty())
     {
         std::string command;
@@ -1095,6 +1121,9 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
         conn->write_buf.clear();
         int exit_code = process_command(conn, command);
+        // Answered, after whatever is queued ahead of it, once its starts can be waited for.
+        if (exit_code == reply_parked)
+            return;
         append_response(conn, exit_code);
         queued = true;
     }
@@ -1196,6 +1225,11 @@ int daemon_handler::process_parsed(ipc_connection* conn, const parsed_args& pa)
                   << ".\n"
                      "  `socketley ls` lists what is there.\n";
         m_unresolved.clear();
+        if (rc == reply_parked)
+        {
+            conn->parked_floor = 1;
+            return rc;
+        }
         return rc == 0 ? 1 : rc;
     }
 
@@ -1503,41 +1537,50 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         // and the runtime is left `failed` rather than removed, so the
         // worker's reason is not the only record of a runtime the operator can
         // no longer ask about.
-        std::string wmsg;
-        const int   wrc = await_worker_startup(
-            name, wmsg, std::chrono::steady_clock::now() + worker_startup_bound);
-        if (wrc != 0)
+        const std::string created(name);
+        auto verdict = [this, created](std::string& out)
         {
-            std::cout << wmsg;
-            return wrc;
-        }
+            std::string wmsg;
+            const int   wrc = await_worker_startup(
+                created, wmsg, std::chrono::steady_clock::now() + worker_startup_bound);
+            if (wrc != 0)
+            {
+                out += wmsg;
+                return wrc;
+            }
 
-        // `instance` may not exist any more, because the wait serves map
-        // requests inline and a script's own `socketley.remove` frees a
-        // placeholder that never reached setup(), so the name is re-resolved
-        // rather than cached.
-        instance = m_manager.get(name);
-        if (!instance)
+            // The runtime may not exist any more, because the wait serves map
+            // requests inline and a script's own `socketley.remove` frees a
+            // placeholder that never reached setup(), so the name is re-resolved
+            // rather than cached.
+            if (!m_manager.get(created))
+                return 0;
+
+            // A script whose on_start raised is not a silent success, reported
+            // last because nothing above is undone, and as exit 1 because the
+            // fault is in the file the operator named; two places to ask,
+            // because on_start runs wherever the script runs.
+            if (std::string why = on_start_error(created); !why.empty())
+            {
+                out += "create " + created + ": " + why + "\n"
+                       "the runtime is created and running, with whatever "
+                       "on_start established before it raised; fix the script "
+                       "and run `reload-lua " + created + "` to re-run it.\n";
+                return 1;
+            }
             return 0;
-    }
+        };
 
-    // A script whose on_start raised is not a silent success, reported last
-    // because nothing above is undone, and as exit 1 because the fault is in
-    // the file the operator named.
-    if (autostart && !instance->get_test_mode())
-    {
-        // Two places to ask, because on_start runs wherever the script runs
-        // and the worker leg is the ordinary `create -s`.
-        std::string why = on_start_error(name);
-
-        if (!why.empty())
+        // A runtime of this name removed a moment ago may still have its worker, which this one's fork waits for.
+        if (conn && m_spawn_waiting.contains(created))
         {
-            std::cout << "create " << name << ": " << why << "\n"
-                      << "the runtime is created and running, with whatever "
-                         "on_start established before it raised; fix the script "
-                         "and run `reload-lua " << name << "` to re-run it.\n";
-            return 1;
+            park_reply(conn, {created}, [verdict](ipc_connection* c) { return verdict(c->write_buf); });
+            return reply_parked;
         }
+        std::string out;
+        const int   rc = verdict(out);
+        std::cout << out;
+        return rc;
     }
 
     // ─── A DRY RUN LEAVES NOTHING BEHIND ────────────────────────────────────
@@ -1746,32 +1789,47 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
     // on.
     if (!started.empty())
     {
-        const auto deadline = std::chrono::steady_clock::now() + worker_startup_bound;
-        for (const auto& n : started)
+        // A runtime whose last worker has not exited is forked when it has, and the reply waits for that, not the loop.
+        if (conn && any_spawn_waiting(started))
         {
-            std::string wmsg;
-            if (await_worker_startup(n, wmsg, deadline) != 0)
-            {
-                conn->write_buf += wmsg;
-                ++failed;
-                continue;   // it is not serving; on_start is the smaller news
-            }
-
-            // The runtime is up and its script's set-up is not, counted rather
-            // than returned, with was_running set anyway because the operator
-            // asked for this runtime to be up and it is.
-            if (std::string why = on_start_error(n); !why.empty())
-            {
-                conn->write_buf += "start " + std::string(n) + ": " + why + "\n"
-                                 + "the runtime is running, with whatever on_start "
-                                   "established before it raised; fix the script and "
-                                   "run `reload-lua " + std::string(n) + "` to re-run it.\n";
-                ++failed;
-            }
+            park_reply(conn, started, [this, started, failed](ipc_connection* c)
+                       { return failed + await_started(c->write_buf, started, "start") > 0 ? 1 : 0; });
+            return reply_parked;
         }
+        failed += await_started(conn->write_buf, started, "start");
     }
 
     return failed > 0 ? 1 : 0;
+}
+
+int daemon_handler::await_started(std::string& out, const std::vector<std::string>& names,
+                                  std::string_view verb)
+{
+    int failed = 0;
+    const auto deadline = std::chrono::steady_clock::now() + worker_startup_bound;
+    for (const auto& n : names)
+    {
+        std::string wmsg;
+        if (await_worker_startup(n, wmsg, deadline) != 0)
+        {
+            out += wmsg;
+            ++failed;
+            continue;   // it is not serving; on_start is the smaller news
+        }
+
+        // The runtime is up and its script's set-up is not, counted rather
+        // than returned, with was_running set anyway because the operator
+        // asked for this runtime to be up and it is.
+        if (std::string why = on_start_error(n); !why.empty())
+        {
+            out += std::string(verb) + " " + n + ": " + why + "\n"
+                 + "the runtime is running, with whatever on_start "
+                   "established before it raised; fix the script and "
+                   "run `reload-lua " + n + "` to re-run it.\n";
+            ++failed;
+        }
+    }
+    return failed;
 }
 
 int daemon_handler::cmd_stop(ipc_connection* conn, const parsed_args& pa)
@@ -4315,29 +4373,14 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
     {
         reconcile_proxy_workers();
 
-        const auto deadline = std::chrono::steady_clock::now() + worker_startup_bound;
-        for (const auto& n : restarted)
+        // The old workers were told to go a moment ago, so the new ones are forked as each exits, as for `start`.
+        if (conn && any_spawn_waiting(restarted))
         {
-            std::string wmsg;
-            if (await_worker_startup(n, wmsg, deadline) != 0)
-            {
-                conn->write_buf += wmsg;
-                ++refused;
-                continue;
-            }
-
-            // The same sentence applied to the other thing a start answers
-            // for, or the same raise is reported by `start` and not by the
-            // command that is a start.
-            if (std::string why = on_start_error(n); !why.empty())
-            {
-                conn->write_buf += "reload " + std::string(n) + ": " + why + "\n"
-                                 + "the runtime is running, with whatever on_start "
-                                   "established before it raised; fix the script and "
-                                   "run `reload-lua " + std::string(n) + "` to re-run it.\n";
-                ++refused;
-            }
+            park_reply(conn, restarted, [this, restarted, refused](ipc_connection* c)
+                       { return refused + await_started(c->write_buf, restarted, "reload") > 0 ? 1 : 0; });
+            return reply_parked;
         }
+        refused += await_started(conn->write_buf, restarted, "reload");
     }
 
     return refused > 0 ? 1 : 0;
@@ -5376,7 +5419,21 @@ void daemon_handler::serve_map_requests()
     for (auto& q : batch)
     {
         std::string err;
-        const bool ok = serve_map_request(q.op, q.name, q.config, err);
+        bool parked = false;
+        const bool ok = serve_map_request(q.op, q.name, q.config, err, parked);
+        if (parked)
+        {
+            m_deferred_starts.push_back({{q.name}, [this, ticket = q.ticket, reply_fd = q.reply_fd,
+                                                    name = q.name](bool abandoned)
+            {
+                std::string why = "the daemon is shutting down";
+                const bool up = !abandoned && map_started(name, why);
+                proxy_supervisor::answer_map_request(reply_fd, ticket, up, why);
+                if (reply_fd >= 0)
+                    ::close(reply_fd);
+            }});
+            continue;
+        }
 
         proxy_supervisor::answer_map_request(q.reply_fd, q.ticket, ok, err);
         if (q.reply_fd >= 0)
@@ -5394,7 +5451,7 @@ void daemon_handler::serve_map_requests()
 bool daemon_handler::serve_map_request(const std::string& op,
                                        const std::string& name,
                                        const std::string& config,
-                                       std::string& err)
+                                       std::string& err, bool& parked)
 {
     const uint32_t h = fnv1a(op.c_str());
 
@@ -5553,26 +5610,12 @@ bool daemon_handler::serve_map_request(const std::string& op,
         // and this is the whole reason the call waits at all: reporting the
         // fork rather than the listener is the defect cmd_start was fixed for.
         reconcile_proxy_workers();
-        if (inst->is_out_of_process())
+        if (m_spawn_waiting.contains(name))
         {
-            std::string wmsg;
-            const auto  deadline =
-                std::chrono::steady_clock::now() + worker_startup_bound;
-            if (await_worker_startup(name, wmsg, deadline) != 0)
-            {
-                err = wmsg.empty() ? "the worker did not come up" : wmsg;
-                return false;
-            }
+            parked = true;
+            return true;
         }
-
-        // The runtime is up and its script's set-up may not be, reported as a
-        // failure exactly as cmd_start reports it.
-        if (std::string why = on_start_error(name); !why.empty())
-        {
-            err = why;
-            return false;
-        }
-        return true;
+        return map_started(name, err);
     }
 
     // ── stop ───────────────────────────────────────────────────────────────
@@ -5623,6 +5666,30 @@ bool daemon_handler::serve_map_request(const std::string& op,
 
     err = "the daemon does not know the map call \"" + op + "\"";
     return false;
+}
+
+bool daemon_handler::map_started(const std::string& name, std::string& err)
+{
+    // Looked up again, since a parked start is answered on a later turn than the one that started it.
+    if (auto* inst = m_manager.get(name); inst && inst->is_out_of_process())
+    {
+        std::string wmsg;
+        const auto  deadline = std::chrono::steady_clock::now() + worker_startup_bound;
+        if (await_worker_startup(name, wmsg, deadline) != 0)
+        {
+            err = wmsg.empty() ? "the worker did not come up" : wmsg;
+            return false;
+        }
+    }
+
+    // The runtime is up and its script's set-up may not be, reported as a
+    // failure exactly as cmd_start reports it.
+    if (std::string why = on_start_error(name); !why.empty())
+    {
+        err = why;
+        return false;
+    }
+    return true;
 }
 
 void daemon_handler::on_worker_publish(proxy_supervisor* from,
@@ -5780,12 +5847,16 @@ void daemon_handler::reconcile_proxy_workers()
         const auto* ph = sup->placeholder();
         const bool dumps = ph && ph->get_type() == runtime_cache &&
             !static_cast<const cache_instance*>(ph)->get_persistent().empty();
+        const std::string runtime = ph ? std::string(ph->get_name()) : std::string{};
         sup->shutdown();
         // shutdown() reaps only a child that was already gone, so this is the
         // last moment anything knows the pid.
         if (const pid_t p = sup->release_pid(); p > 0)
+        {
             m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false,
-                std::chrono::seconds(dumps ? socketley::dump_exit_bound_sec : 5)});
+                std::chrono::seconds(dumps ? socketley::dump_exit_bound_sec : 5), runtime});
+            watch_exit(p);
+        }
 
         const uint32_t tok = sup->retire();
         m_retired_handlers.push_back({std::move(sup), tok});
@@ -5870,11 +5941,22 @@ void daemon_handler::reconcile_proxy_workers()
 
     // Children that should exist and do not — including the second, third and
     // fourth process of a runtime that already has its first.
+    m_spawn_waiting.clear();
     for (const auto& [name, want_count] : wanted)
     {
         auto& shards = m_proxy_workers[name];
         if (shards.size() >= want_count)
             continue;
+
+        // Every runtime type holds its ports, unix paths and files until its process exits, so a retired worker of
+        // this runtime still running holds back the fork, which its exit watch or the health tick resumes.
+        if (predecessor_running(name))
+        {
+            m_spawn_waiting.insert(name);
+            if (shards.empty())
+                m_proxy_workers.erase(name);
+            continue;
+        }
 
         auto* inst = m_manager.get(name);
         if (!inst)
@@ -6490,6 +6572,108 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
     out += " did not report back within 2s of starting; it is still being "
            "supervised -- check `socketley ls` for what it settled on\n";
     return 2;
+}
+
+void daemon_handler::watch_exit(pid_t pid)
+{
+    // A process already gone, or a kernel without pidfds, is left to the health tick's reap.
+    const int fd = static_cast<int>(::syscall(SYS_pidfd_open, pid, 0));
+    if (fd < 0)
+        return;
+    exit_watch& w = m_exit_watches.emplace_back();
+    w.pidfd = fd;
+    w.req   = { this, nullptr, fd, 0, op_poll };
+    if (!m_loop.submit_poll_add(fd, POLLIN, &w.req))
+    {
+        ::close(fd);
+        m_exit_watches.pop_back();
+    }
+}
+
+void daemon_handler::on_exit_watch(const io_request* req)
+{
+    const auto w = std::find_if(m_exit_watches.begin(), m_exit_watches.end(),
+                                [req](const exit_watch& x) { return &x.req == req; });
+    if (w == m_exit_watches.end())
+        return;
+    if (w->pidfd >= 0)
+        m_loop.close_fd(w->pidfd);
+    m_exit_watches.erase(w);
+    if (m_torn_down || (m_spawn_waiting.empty() && m_deferred_starts.empty()))
+        return;
+
+    // The reconcile reaps the exited worker in predecessor_running() and forks whatever no longer waits.
+    reconcile_proxy_workers();
+    finish_deferred_starts(false);
+}
+
+bool daemon_handler::predecessor_running(const std::string& name)
+{
+    bool running = false;
+    for (auto it = m_orphan_workers.begin(); it != m_orphan_workers.end();)
+    {
+        if (it->runtime != name)
+        {
+            ++it;
+            continue;
+        }
+        const pid_t r = ::waitpid(it->pid, nullptr, WNOHANG);
+        if (r > 0 || (r < 0 && errno == ECHILD))
+        {
+            it = m_orphan_workers.erase(it);
+            continue;
+        }
+        running = true;
+        ++it;
+    }
+    return running;
+}
+
+bool daemon_handler::any_spawn_waiting(const std::vector<std::string>& names) const
+{
+    return std::any_of(names.begin(), names.end(),
+                       [this](const std::string& n) { return m_spawn_waiting.contains(n); });
+}
+
+void daemon_handler::finish_deferred_starts(bool abandoned)
+{
+    // Taken out first, because a finish waits on workers, which serves map requests that may defer more.
+    std::vector<deferred_start> ready;
+    for (auto it = m_deferred_starts.begin(); it != m_deferred_starts.end();)
+    {
+        if (abandoned || !any_spawn_waiting(it->names))
+        {
+            ready.push_back(std::move(*it));
+            it = m_deferred_starts.erase(it);
+        }
+        else
+            ++it;
+    }
+    for (auto& d : ready)
+        d.finish(abandoned);
+}
+
+void daemon_handler::park_reply(ipc_connection* conn, std::vector<std::string> names,
+                                std::function<int(ipc_connection*)> verdict)
+{
+    const int      fd     = conn->fd;
+    const uint64_t serial = conn->serial;
+    m_deferred_starts.push_back({std::move(names), [this, fd, serial, verdict = std::move(verdict)](bool abandoned)
+    {
+        auto it = m_clients.find(fd);
+        if (abandoned || it == m_clients.end() || it->second->serial != serial)
+            return;
+        const int rc = verdict(it->second.get());
+
+        // Found again, since the wait inside the verdict serves map requests that may change the client map.
+        it = m_clients.find(fd);
+        if (it == m_clients.end() || it->second->serial != serial)
+            return;
+        ipc_connection* c = it->second.get();
+        append_response(c, std::max(rc, c->parked_floor));
+        c->parked_floor = 0;
+        serve_commands(it, true);
+    }});
 }
 
 void daemon_handler::reap_orphan_workers()
