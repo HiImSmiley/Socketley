@@ -193,6 +193,9 @@ inline std::string complete_multipart_xml(std::string_view location, std::string
     x += "<CompleteMultipartUploadResult xmlns=\"" + std::string(s3_xmlns) + "\"><Location>" +
          xml_escape(location) + "</Location><Bucket>" + xml_escape(bucket) + "</Bucket><Key>" + xml_escape(key) +
          "</Key><ETag>&quot;" + xml_escape(etag) + "&quot;</ETag>" + checksum_element(algo, checksum_b64) +
+         (algo == checksum_algo::none || checksum_b64.empty() ? ""
+          : checksum_b64.find('-') != std::string_view::npos ? "<ChecksumType>COMPOSITE</ChecksumType>"
+                                                              : "<ChecksumType>FULL_OBJECT</ChecksumType>") +
          "</CompleteMultipartUploadResult>";
     return x;
 }

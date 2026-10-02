@@ -296,6 +296,79 @@ bool base64_decode(std::string_view in, std::string& out)
     return true;
 }
 
+namespace
+{
+
+// The CRC of A then B from those of A and B, as zlib's crc32_combine does it for any reflected CRC whose
+// initial value and final xor are the same: the CRC of A is moved past len_b zero bytes by squaring an operator.
+uint64_t gf2_times(const uint64_t* mat, uint64_t vec)
+{
+    uint64_t sum = 0;
+    for (; vec; vec >>= 1, ++mat)
+        if (vec & 1)
+            sum ^= *mat;
+    return sum;
+}
+
+void gf2_square(uint64_t* sq, const uint64_t* mat, int width)
+{
+    for (int n = 0; n < width; ++n)
+        sq[n] = gf2_times(mat, mat[n]);
+}
+
+uint64_t crc_combine(uint64_t crc_a, uint64_t crc_b, uint64_t len_b, uint64_t poly, int width)
+{
+    if (len_b == 0)
+        return crc_a;
+    uint64_t even[64], odd[64];
+    odd[0] = poly;
+    for (int n = 1; n < width; ++n)
+        odd[n] = 1ull << (n - 1);
+    gf2_square(even, odd, width);
+    gf2_square(odd, even, width);
+    do
+    {
+        gf2_square(even, odd, width);
+        if (len_b & 1)
+            crc_a = gf2_times(even, crc_a);
+        len_b >>= 1;
+        if (!len_b)
+            break;
+        gf2_square(odd, even, width);
+        if (len_b & 1)
+            crc_a = gf2_times(odd, crc_a);
+        len_b >>= 1;
+    } while (len_b);
+    return crc_a ^ crc_b;
+}
+
+}   // namespace
+
+bool checksum_combinable(checksum_algo a)
+{
+    return a == checksum_algo::crc32 || a == checksum_algo::crc32c || a == checksum_algo::crc64nvme;
+}
+
+std::string full_object_checksum_b64(checksum_algo a, const std::vector<std::pair<std::string, uint64_t>>& parts)
+{
+    if (!checksum_combinable(a))
+        return {};
+    const size_t bytes = checksum_raw_len(a);
+    const int width = static_cast<int>(bytes * 8);
+    const uint64_t poly = a == checksum_algo::crc32 ? crc32_poly : a == checksum_algo::crc32c ? 0x82F63B78u : crc64_poly;
+    uint64_t crc = 0;
+    for (const auto& [raw, len] : parts)
+    {
+        if (raw.size() != bytes)
+            return {};
+        uint64_t v = 0;
+        for (unsigned char ch : raw)
+            v = (v << 8) | ch;
+        crc = crc_combine(crc, v, len, poly, width);
+    }
+    return base64_encode(be_bytes(crc, bytes));
+}
+
 std::string composite_checksum_b64(checksum_algo a, std::string_view concatenated_raw, size_t parts)
 {
     checksum_stream s(a);

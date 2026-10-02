@@ -47,6 +47,10 @@ namespace socketley::storage
 inline constexpr uint64_t mpu_min_part_bytes = 5ull << 20;
 inline constexpr uint32_t mpu_max_parts      = 10000;
 
+// The extra entry of an upload whose object takes the checksum of its whole bytes (FULL_OBJECT), not of its
+// parts' checksums; the object itself does not keep it, since a full-object value has no -N.
+inline constexpr std::string_view checksum_type_extra = "x-socketley-checksum-type";
+
 // The header entry of a part written into the upload's data file: where its bytes begin there.
 inline constexpr std::string_view mpu_place_extra = "x-socketley-mpu-at";
 // Fixed width, so the header's room is reserved before the part's offset is written into it.

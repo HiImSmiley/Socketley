@@ -6604,10 +6604,22 @@ or by
 and nothing is stored. The checksum is kept in the object, echoed in the
 answer, and returned by GetObject and HeadObject when the request has
 .B x\-amz\-checksum\-mode: ENABLED
-(except on a ranged read, which is not of the whole object). A multipart object
+(except on a ranged read, which is not of the whole object), with
+.B x\-amz\-checksum\-type
+saying what it is of. A multipart object
 has the checksum of its parts' checksums, and \fB\-N\fR after it for the number
-of parts, as S3 does; a part with no checksum of its own gets the upload's
-algorithm anyway.
+of parts (\fBCOMPOSITE\fR), as S3 does; a part with no checksum of its own gets the upload's
+algorithm anyway. An upload created with
+.B "x\-amz\-checksum\-type: FULL_OBJECT"
+and a CRC (and every CRC64NVME upload, as in S3) has instead the CRC of its whole
+bytes, combined from its parts' CRCs and lengths without reading them again; FULL_OBJECT
+with SHA\-1 or SHA\-256, or COMPOSITE with CRC64NVME, is
+.BR "400 InvalidRequest" .
+A checksum a CompleteMultipartUpload carries is compared with the one the parts
+make, and a mismatch is
+.B "400 BadDigest"
+with nothing stored. A part's own checksum is not kept once its upload completes, so a
+read by part number and GetObjectAttributes' parts carry none.
 .SS Object tags
 An object has at most 10 tags, set with PutObjectTagging or with
 .B x\-amz\-tagging

@@ -8,6 +8,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace socketley::storage
 {
@@ -64,5 +66,11 @@ bool        base64_decode(std::string_view in, std::string& out);
 // The checksum of a multipart object: the algorithm over the raw checksums of
 // its parts in order, in base64 with "-<parts>" after it.
 std::string composite_checksum_b64(checksum_algo a, std::string_view concatenated_raw, size_t parts);
+
+// Whether a multipart object may carry the checksum of its whole bytes, which a CRC alone can be combined into.
+bool checksum_combinable(checksum_algo a);
+
+// The CRC of the parts' bytes joined, in base64, from each part's raw CRC and length; empty for no CRC.
+std::string full_object_checksum_b64(checksum_algo a, const std::vector<std::pair<std::string, uint64_t>>& parts);
 
 }   // namespace socketley::storage

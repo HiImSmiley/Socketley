@@ -1033,6 +1033,7 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
         uint64_t total = 0;
         std::string md5s;
         std::string raw_checksums;
+        std::vector<std::pair<std::string, uint64_t>> part_checksums;
         for (size_t i = 0; i < parts.size(); ++i)
         {
             const complete_part& want = parts[i];
@@ -1066,6 +1067,7 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
                     return;
                 }
                 raw_checksums += raw;
+                part_checksums.emplace_back(std::move(raw), have.size);
             }
             plan.parts.push_back(have);
         }
@@ -1083,9 +1085,15 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
         plan.meta.md5   = md5_of(md5s);
         plan.meta.parts = static_cast<uint32_t>(parts.size());
         plan.meta.mtime_ms = static_cast<int64_t>(m_store->now_ms());
+        const auto type = std::find_if(plan.meta.extra.begin(), plan.meta.extra.end(),
+                                       [](const auto& e) { return e.first == checksum_type_extra; });
+        const bool full = type != plan.meta.extra.end();
+        if (full)
+            plan.meta.extra.erase(type);
         if (u->algo != checksum_algo::none)
         {
-            plan.checksum_b64 = composite_checksum_b64(u->algo, raw_checksums, parts.size());
+            plan.checksum_b64 = full ? full_object_checksum_b64(u->algo, part_checksums)
+                                     : composite_checksum_b64(u->algo, raw_checksums, parts.size());
             plan.meta.extra.emplace_back(std::string(checksum_header(u->algo)), plan.checksum_b64);
         }
         // Kept in the header when it fits and after the body otherwise, so any list S3 takes completes.

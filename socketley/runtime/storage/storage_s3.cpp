@@ -1318,8 +1318,12 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
         }
         if (is_checksum_header(n))
         {
+            // A multipart object's composite checksum carries -N, and every other is of the whole object.
             if (with_checksum)
+            {
                 r.headers.emplace_back(n, v);
+                r.headers.emplace_back("x-amz-checksum-type", v.find('-') != std::string::npos ? "COMPOSITE" : "FULL_OBJECT");
+            }
             continue;
         }
         if (n == sse_extra)

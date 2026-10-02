@@ -223,8 +223,51 @@ def completion_sent_twice():
           code_of(lambda: s3.complete_multipart_upload(Bucket="cl-misc", Key="twice", UploadId=uid,
                   MultipartUpload={"Parts": parts})) == ("NoSuchUpload", 404))
 
+# ─── A multipart object's checksum of its whole bytes ───────────────────────
+# s3-tests test_multipart_use_cksum_helper_*: an SDK asks for FULL_OBJECT and checks the CRC of the whole object.
+def full_object_checksums():
+    print("=== CreateMultipartUpload with x-amz-checksum-type ===")
+    import base64
+    import zlib
+    one, two = b"a" * (5 << 20), b"tail-bytes"
+    want = base64.b64encode(zlib.crc32(one + two).to_bytes(4, "big")).decode()
+
+    def upload(key, headers, promised=None):
+        c = with_headers(client(), "CreateMultipartUpload", headers)
+        made = c.create_multipart_upload(Bucket="cl-misc", Key=key, ChecksumAlgorithm="CRC32")
+        parts = [{"PartNumber": n, "ETag": r["ETag"], "ChecksumCRC32": r["ChecksumCRC32"]}
+                 for n, r in ((n, s3.upload_part(Bucket="cl-misc", Key=key, UploadId=made["UploadId"], PartNumber=n,
+                                                 Body=b, ChecksumAlgorithm="CRC32")) for n, b in ((1, one), (2, two)))]
+        extra = {"ChecksumCRC32": promised} if promised else {}
+        return made, lambda: s3.complete_multipart_upload(Bucket="cl-misc", Key=key, UploadId=made["UploadId"],
+                                                          MultipartUpload={"Parts": parts}, **extra)
+
+    made, finish = upload("full", {"x-amz-checksum-type": "FULL_OBJECT"}, want)
+    hdrs = made["ResponseMetadata"]["HTTPHeaders"]
+    check("the answer names the algorithm and the type",
+          hdrs.get("x-amz-checksum-algorithm") == "CRC32" and hdrs.get("x-amz-checksum-type") == "FULL_OBJECT", hdrs)
+    done = finish()
+    check("the completion's CRC32 is that of the whole object, with no -N", done.get("ChecksumCRC32") == want,
+          (done.get("ChecksumCRC32"), want))
+    head = s3.head_object(Bucket="cl-misc", Key="full", ChecksumMode="ENABLED")["ResponseMetadata"]["HTTPHeaders"]
+    check("and HEAD says so", head.get("x-amz-checksum-crc32") == want and head.get("x-amz-checksum-type") == "FULL_OBJECT",
+          head)
+    made, finish = upload("composite", {})
+    check("without a type the upload is COMPOSITE",
+          made["ResponseMetadata"]["HTTPHeaders"].get("x-amz-checksum-type") == "COMPOSITE")
+    check("and its checksum has -2", finish().get("ChecksumCRC32", "").endswith("-2"))
+    _, finish = upload("promised", {"x-amz-checksum-type": "FULL_OBJECT"}, "AAAAAA==")
+    check("a whole-object checksum the parts do not make is BadDigest", code_of(finish) == ("BadDigest", 400))
+    check("and stores nothing", code_of(lambda: s3.head_object(Bucket="cl-misc", Key="promised"))[1] == 404)
+    bad = with_headers(client(), "CreateMultipartUpload", {"x-amz-checksum-type": "FULL_OBJECT"})
+    check("FULL_OBJECT with a digest is InvalidRequest",
+          code_of(lambda: bad.create_multipart_upload(Bucket="cl-misc", Key="x", ChecksumAlgorithm="SHA256")) ==
+          ("InvalidRequest", 400))
+
+
 # A section that raises fails as one assertion and the next still runs, so a runtime without the feature reads red, not dead.
-for section in (delete_bucket_with_uploads, date_header, empty_content_md5, aws_chunked_coding, list_buckets_paged, object_attributes, conditional_writes, completion_sent_twice):
+for section in (delete_bucket_with_uploads, date_header, empty_content_md5, aws_chunked_coding, list_buckets_paged,
+                object_attributes, conditional_writes, completion_sent_twice, full_object_checksums):
     try:
         section()
     except Exception as e:

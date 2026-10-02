@@ -125,6 +125,20 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
             return;
         }
     }
+    // S3 combines only a CRC into the checksum of the whole object, and CRC64NVME into nothing else.
+    const std::string_view type = r.header("x-amz-checksum-type");
+    const bool full = type.empty() ? algo == checksum_algo::crc64nvme : type == "FULL_OBJECT";
+    if ((!type.empty() && type != "FULL_OBJECT" && type != "COMPOSITE") || (!type.empty() && algo == checksum_algo::none) ||
+        (full && !checksum_combinable(algo)) || (!full && algo == checksum_algo::crc64nvme))
+    {
+        err = make_error("InvalidRequest");
+        err.message = "The checksum type " + std::string(type) + " is not supported with the checksum algorithm " +
+                      std::string(checksum_name(algo)) + ".";
+        send_error(c, err);
+        return;
+    }
+    if (full)
+        meta.extra.emplace_back(std::string(checksum_type_extra), "FULL_OBJECT");
 
     ++m_c.mpu_created;
     std::weak_ptr<conn> weak = c;
@@ -133,7 +147,7 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
     object_meta shown;
     if (const std::string* v = sse_value(meta))
         shown.extra.emplace_back(std::string(sse_extra), *v);
-    m_node.mpu_create(bucket, key, std::move(meta), algo, [this, weak, bucket, key, shown](st s, std::string id)
+    m_node.mpu_create(bucket, key, std::move(meta), algo, [this, weak, bucket, key, shown, algo, full](st s, std::string id)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -146,6 +160,11 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
         response resp;
         resp.headers.emplace_back("Content-Type", "application/xml");
         sse_headers(cc->req, shown, resp.headers);
+        if (algo != checksum_algo::none)
+        {
+            resp.headers.emplace_back("x-amz-checksum-algorithm", std::string(checksum_name(algo)));
+            resp.headers.emplace_back("x-amz-checksum-type", full ? "FULL_OBJECT" : "COMPOSITE");
+        }
         resp.body = initiate_multipart_xml(bucket, key, id);
         send_response(cc, std::move(resp));
     });
@@ -358,7 +377,29 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
             return;
         }
     std::weak_ptr<conn> weak = c;
-    auto bind = [this, customer](object_meta& m) { return sse_bind_parts(m, customer); };
+    // The object's checksum as the client computed it, which the one made from the parts must be.
+    std::string promised;
+    for (const auto& h : r.headers)
+        if (is_checksum_header(h.name))
+            promised = std::string(h.name) + ":" + std::string(h.value);
+    auto bind = [this, customer, promised](object_meta& m)
+    {
+        if (!promised.empty())
+        {
+            std::string held;
+            for (const auto& [n, v] : m.extra)
+                if (is_checksum_header(n))
+                    held = n + ":" + v;
+            // A composite value may be given with or without its -N.
+            if (held != promised && held.substr(0, held.rfind('-')) != promised)
+            {
+                s3_error e = make_error("BadDigest");
+                e.message = "The " + promised.substr(0, promised.find(':')) + " you specified did not match the calculated checksum.";
+                return e;
+            }
+        }
+        return sse_bind_parts(m, customer);
+    };
     m_node.mpu_complete(bucket, key, id, std::move(parts),
         [weak]()
         {

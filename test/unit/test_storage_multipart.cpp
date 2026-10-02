@@ -174,6 +174,32 @@ TEST_CASE("the composite checksum is the algorithm over the part checksums, with
     CHECK(got.substr(0, got.size() - 2) == b64_of(checksum_algo::sha256, raw));
 }
 
+TEST_CASE("the full-object checksum of parts is the CRC of their bytes joined, for every CRC and every cut")
+{
+    const std::string whole = pattern(70001, 3);
+    for (const checksum_algo a : {checksum_algo::crc32, checksum_algo::crc32c, checksum_algo::crc64nvme})
+    {
+        INFO(checksum_name(a));
+        checksum_stream all(a);
+        all.update(whole.data(), whole.size());
+        for (const std::vector<size_t>& cuts : {std::vector<size_t>{0, 70001}, {0, 1, 70001}, {0, 4096, 9000, 70000, 70001},
+                                               {0, 0, 35000, 70001}})
+        {
+            std::vector<std::pair<std::string, uint64_t>> parts;
+            for (size_t i = 0; i + 1 < cuts.size(); ++i)
+            {
+                checksum_stream p(a);
+                p.update(whole.data() + cuts[i], cuts[i + 1] - cuts[i]);
+                parts.emplace_back(p.peek_raw(), cuts[i + 1] - cuts[i]);
+            }
+            CHECK(full_object_checksum_b64(a, parts) == all.peek_b64());
+        }
+    }
+    // A digest has no combination, and a part whose value is the wrong length has none either.
+    CHECK(full_object_checksum_b64(checksum_algo::sha256, {{std::string(32, 'x'), 1}}).empty());
+    CHECK(full_object_checksum_b64(checksum_algo::crc32, {{std::string(3, 'x'), 1}}).empty());
+}
+
 // ─── The part list of CompleteMultipartUpload ───────────────────────────────
 
 TEST_CASE("a CompleteMultipartUpload document is read for its parts, numbers, ETags and checksums")
