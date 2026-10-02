@@ -7,6 +7,9 @@ usage: lib_storage_notify.py MODE ARGS...
                             the payload S3 gives it, prefix and suffix filters, a webhook that answers 500 and
                             one that is down until it comes up, and the bound on what waits
   tls PORT SECURE CERT KEY  an https webhook with a certificate the target's ca= names
+  dns PORT HOOK HOSTS       a webhook named by a host the HOSTS file maps, followed when it maps it elsewhere
+  users PORT HOOK           a runtime with users: the principal and address of a signed request and of one a
+                            bucket policy lets in
   restart PORT HOOK        after a clean stop and a start: the configuration is still there and still sends
   crash PORT HOOK           the webhook is down while a PUT is answered, the worker is killed with SIGKILL before
                             the event could go, and the event arrives from the restarted worker's outbox
@@ -61,9 +64,10 @@ def wait_for(fn, timeout):
 class Hook:
     """A webhook on 127.0.0.1:port that keeps every POST it is sent and answers it with `status`."""
 
-    def __init__(self, port, tls=None):
+    def __init__(self, port, tls=None, host="127.0.0.1"):
         self.port = port
         self.tls = tls
+        self.host = host
         self.got = []
         self.status = 200
         self.server = None
@@ -87,7 +91,7 @@ class Hook:
                 pass
 
         http.server.ThreadingHTTPServer.allow_reuse_address = True
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        self.server = http.server.ThreadingHTTPServer((self.host, self.port), Handler)
         if self.tls:
             import ssl
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -328,6 +332,10 @@ def mode_main(port, hook_port, other_port):
     check("size and eTag are the object's", o.get("size") == 11 and '"' + o.get("eTag", "") + '"' == h.get("etag"),
           (o, h.get("etag")))
     check("a sequencer is given", len(o.get("sequencer", "")) == 16, o)
+    check("an unsigned request on an --anonymous runtime is the principal anonymous, from the client's address",
+          r.get("userIdentity", {}).get("principalId") == "anonymous" and
+          r.get("requestParameters", {}).get("sourceIPAddress") == "127.0.0.1", (r.get("userIdentity"),
+                                                                              r.get("requestParameters")))
     hk = hook.got[0]["headers"] if hook.got else {}
     check("it is POSTed as JSON with an event id to deduplicate by",
           hk.get("Content-Type") == "application/json" and hk.get("X-Socketley-Event-Id", "").isdigit(), hk)
@@ -412,6 +420,10 @@ def mode_main(port, hook_port, other_port):
     check("an expiry sends LifecycleExpiration:Delete and no ObjectRemoved",
           wait_event(hook, "old", "LifecycleExpiration:Delete", 30) and
           [n for n, _ in events_for(hook, "old")] == ["LifecycleExpiration:Delete"], events_for(hook, "old"))
+    lc_rec = [r for _, r in events_for(hook, "old")]
+    check("an expiry's principal is S3's own, and it has no client address",
+          lc_rec and lc_rec[0]["userIdentity"]["principalId"] == "s3.amazonaws.com" and
+          lc_rec[0]["requestParameters"]["sourceIPAddress"] == "", lc_rec)
 
     # A webhook that answers 500 is tried again until it answers 200.
     hook.status = 500
@@ -479,6 +491,68 @@ def mode_tls(port, secure_port, cert, key):
     check("put back for the restart", put_cfg(doc(rule("Queue", "created", ARN + "hook", ["s3:ObjectCreated:*"],
                                                        prefix="r/")))[:2] == (200, None))
     secure.down()
+
+
+def mode_users(port, hook_port):
+    """A runtime with users: a signed request names its user, one let in by a bucket policy names anonymous."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import lib_storage_policy as lp
+    alice = (os.environ["AKA"], os.environ["SKA"])
+    hook = Hook(hook_port)
+    hook.up()
+    ub = "alice-events"
+    check("alice makes a bucket", lp.req(port, "PUT", "/" + ub, key=alice).status == 200)
+    cfg = doc(rule("Queue", "all", ARN + "hook", ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"]))
+    check("and gives it a notification configuration",
+          lp.req(port, "PUT", "/" + ub, "notification", cfg, alice).status == 200)
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::%s/anon/*" % ub}]})
+    check("and a policy that lets anybody put under anon/", lp.put_policy(port, ub, policy, key=alice).status == 204)
+    check("a signed PUT is answered", lp.req(port, "PUT", "/%s/signed" % ub, "", b"by alice", alice).status == 200)
+    check("an unsigned PUT the policy lets in is answered", lp.req(port, "PUT", "/%s/anon/x" % ub, "", b"by anyone").status
+          == 200)
+    check("an unsigned PUT the policy does not let in is refused", lp.req(port, "PUT", "/%s/other" % ub, "", b"no").status
+          == 403)
+    wait_event(hook, "signed", "ObjectCreated:Put")
+    wait_event(hook, "anon/x", "ObjectCreated:Put")
+    s = [r for _, r in events_for(hook, "signed")]
+    a = [r for _, r in events_for(hook, "anon/x")]
+    check("a signed request's event names its user and the client's address",
+          s and s[0]["userIdentity"]["principalId"] == "alice" and
+          s[0]["requestParameters"]["sourceIPAddress"] == "127.0.0.1", s)
+    check("one let in by a bucket policy names anonymous and the client's address",
+          a and a[0]["userIdentity"]["principalId"] == "anonymous" and
+          a[0]["requestParameters"]["sourceIPAddress"] == "127.0.0.1", a)
+    check("the bucket's owner is still alice", s and s[0]["s3"]["bucket"]["ownerIdentity"]["principalId"] == "alice", s)
+    check("a refused PUT sends nothing", not events_for(hook, "other"), events_for(hook, "other"))
+    hook.down()
+
+
+def mode_dns(port, hook_port, hosts_file):
+    """A webhook named by a host: delivered to where the name points, and followed when it points elsewhere."""
+    global TARGET
+    TARGET = port
+    first = Hook(hook_port, host="127.0.0.1")
+    first.up()
+    check("a configuration naming a webhook by its host name is put",
+          put_cfg(doc(rule("Queue", "named", ARN + "named", ["s3:ObjectCreated:*"], prefix="dns/")))[:2] == (200, None))
+    req("PUT", "/%s/dns/one" % B, b"x")
+    check("an event reaches the address the name resolves to", wait_event(first, "dns/one", "ObjectCreated:Put"),
+          first.records())
+    resolves = stat("notify_resolves")
+    # The name now points at another address, and nothing listens at the old one.
+    with open(hosts_file, "w") as f:
+        f.write("hooky.test 127.0.0.2\n")
+    first.down()
+    second = Hook(hook_port, host="127.0.0.2")
+    second.up()
+    req("PUT", "/%s/dns/two" % B, b"x")
+    check("a refused connection asks for the name again, and the event reaches its new address",
+          wait_event(second, "dns/two", "ObjectCreated:Put", 20), (second.records(), nstats()))
+    check("which the resolver counts", wait_for(lambda: stat("notify_resolves") > resolves, 5), (resolves, nstats()))
+    check("and nothing reached the old address", not events_for(first, "dns/two"), first.records())
+    second.down()
+    put_cfg(doc(rule("Queue", "created", ARN + "hook", ["s3:ObjectCreated:*"], prefix="r/")))
 
 
 def mode_restart(port, hook_port):
@@ -549,6 +623,8 @@ def mode_shards(hook_port, nodes):
     got = sorted((name, k) for name, k, _ in hook.records())
     check("every change through either shard sends exactly one event", got == sorted(want),
           (len(got), [g for g in got if got.count(g) != 1][:6]))
+    who = {r["userIdentity"]["principalId"] for _, _, r in hook.records()}
+    check("and names the requester the shard that took it saw, carried to the owner", who == {"anonymous"}, who)
     def per():
         return {k: int(s.get("notify_sent", "0")) for k, s in stats_shards().items()}
     check("each event sent by the shard that owns its key, both shards owning some",
@@ -565,6 +641,10 @@ if __name__ == "__main__":
     args = sys.argv[2:]
     if MODE == "main":
         mode_main(int(args[0]), int(args[1]), int(args[2]))
+    elif MODE == "users":
+        mode_users(int(args[0]), int(args[1]))
+    elif MODE == "dns":
+        mode_dns(int(args[0]), int(args[1]), args[2])
     elif MODE == "tls":
         mode_tls(int(args[0]), int(args[1]), args[2], args[3])
     elif MODE == "restart":

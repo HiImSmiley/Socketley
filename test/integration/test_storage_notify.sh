@@ -17,6 +17,14 @@
 #               versionId and a growing sequencer
 #   filters     prefix and suffix rules send exactly the keys they match
 #   https       an https webhook whose certificate the target's ca= file trusts
+#   requester   userIdentity is the signed request's user, "anonymous" for one a
+#               bucket policy let in or on an --anonymous runtime, and
+#               s3.amazonaws.com for a lifecycle expiry; sourceIPAddress the
+#               client's; through a shard that does not own the key too
+#   resolving   a webhook named by a host (localhost, and one the
+#               SOCKETLEY_STORAGE_NOTIFY_HOSTS aid maps): when the name is
+#               pointed at another address and the old one refuses, it is
+#               resolved again off the loop and the event follows it
 #   delivery    a webhook answering 500 is retried until it answers 200, one
 #               that is down gets its events once it is up, and past the bound
 #               (SOCKETLEY_STORAGE_NOTIFY_QUEUE, lowered here) a new event is
@@ -45,6 +53,13 @@ P1=$((SL_PORT_BASE+1724))
 HOOK=$((SL_PORT_BASE+1733))
 OTHER=$((SL_PORT_BASE+1734))
 SECURE=$((SL_PORT_BASE+1735))
+NAMED=$((SL_PORT_BASE+1736))
+P2=$((SL_PORT_BASE+1737))
+export AKA="AKIANOTIFYALICE00001"
+export SKA="notify/alice/secret"
+# A test aid read by the resolver thread before the system resolver, so a name can be pointed elsewhere.
+export SOCKETLEY_STORAGE_NOTIFY_HOSTS="$SOCKETLEY_TMPD/hosts"
+echo "hooky.test 127.0.0.1" > "$SOCKETLEY_STORAGE_NOTIFY_HOSTS"
 # Read by each shard's sweep alone, so a test sees days pass in seconds.
 export SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS=2
 # The bound on what waits, lowered so a test reaches it.
@@ -55,9 +70,9 @@ ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 
 cleanup() {
-    for r in nt nts; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
+    for r in nt ntu nts; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
     sleep 0.3
-    for r in nt nts nbad; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
+    for r in nt ntu nts nbad; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
     daemon_stop
 }
 trap cleanup EXIT
@@ -99,7 +114,8 @@ TARGETS="$SOCKETLEY_TMPD/targets"
 cat > "$TARGETS" <<EOF
 # name  url
 hook    http://127.0.0.1:$HOOK/events
-other   http://127.0.0.1:$OTHER/
+other   http://localhost:$OTHER/
+named   http://hooky.test:$NAMED/
 EOF
 CERT="$SOCKETLEY_TMPD/hook.crt"
 KEY="$SOCKETLEY_TMPD/hook.key"
@@ -134,6 +150,7 @@ else
     bad "show names the targets file" "$("$BIN" show nt 2>&1)"
 fi
 run_lib "the main half ran" nt main "$P1" "$HOOK" "$OTHER"
+run_lib "the dns half ran" nt dns "$P1" "$NAMED" "$SOCKETLEY_STORAGE_NOTIFY_HOSTS"
 if [ -s "$CERT" ]; then
     run_lib "the tls half ran" nt tls "$P1" "$SECURE" "$CERT" "$KEY"
 else
@@ -147,6 +164,18 @@ wait_up "$P1" || bad "the runtime comes back" "no answer on $P1"
 run_lib "the restart half ran" nt restart "$P1" "$HOOK"
 run_lib "the crash half ran" nt crash "$P1" "$HOOK" "$DATA"
 "$BIN" stop nt >/dev/null 2>&1
+
+# ── users ───────────────────────────────────────────────────────────────────
+CREDS="$SOCKETLEY_TMPD/creds"
+printf '[alice]\n%s:%s\n' "$AKA" "$SKA" > "$CREDS"
+if ! "$BIN" create storage ntu -p "$P2" --dir "$SOCKETLEY_TMPD/users" --credentials "$CREDS" \
+     --notify-targets "$TARGETS" -s >/dev/null 2>&1; then
+    bad "create with --credentials" "the runtime was not created"
+else
+    wait_up "$P2" || bad "the users runtime comes up" "no answer on $P2"
+    run_lib "the users half ran" ntu users "$P2" "$HOOK"
+    "$BIN" stop ntu >/dev/null 2>&1
+fi
 
 # ── two shards ──────────────────────────────────────────────────────────────
 SDATA="$SOCKETLEY_TMPD/shardobjects"

@@ -6242,9 +6242,10 @@ The file is refused at
 .B create
 and
 .B start
-if a line does not parse, is read at every start, and its hosts are resolved then
-(a host that does not resolve is logged and its events wait for a start that
-resolves it). Without it every destination is refused. See
+if a line does not parse and is read at every start; its host names are resolved
+off the loop and again when a connection is refused (a host that does not resolve
+is logged and its events wait until it does). Without it every destination is
+refused. See
 .BR "Event notifications" .
 .TP
 .B \-\-anonymous
@@ -7364,8 +7365,35 @@ kept, other bytes as
 .BI % XX\fR),
 a removal's record has no size or eTag, versionId is given in a versioned bucket,
 and the sequencer is sixteen hex digits that grow with every event of the shard
-that owns the key, so a key's events sort by it. The principal is the bucket's
-owner, not the requester's, and sourceIPAddress is empty.
+that owns the key, so a key's events sort by it.
+.B userIdentity.principalId
+is the requester: the id of the user a signed request's key belongs to
+(\fBsocketley\fR for a key outside any user), or
+.B anonymous
+for a request without credentials, let in by
+.B \-\-anonymous
+or by a bucket policy;
+.B requestParameters.sourceIPAddress
+is the client's address (an IPv4 client on a dual\-stack socket by its IPv4
+address, a client on a unix socket by none). A lifecycle expiry names
+.B s3.amazonaws.com
+and no address, and a change a script makes through
+.B socketley.storage
+names neither. With
+.B \-\-shards
+both travel to the shard that owns the key with the change.
+.PP
+A webhook named by a host name is resolved on a thread of its own, whose answer
+the loop reads from an eventfd through its ring, so no delivery and no request
+waits on the resolver: once at start, again after every address the host had
+refused a connection (at most once a second), and every minute while it is
+delivered to. A host with several addresses is tried address by address before it
+is resolved again. A stop waits for a resolve in progress, which the system
+resolver's own timeout bounds.
+.B SOCKETLEY_STORAGE_NOTIFY_HOSTS
+names a file of
+.I name address
+lines consulted before the system resolver, a test aid.
 .PP
 The shard that owns a key emits its events, whichever shard took the request, so a
 change is one event. Before the change is answered, its record is appended to
@@ -7389,9 +7417,11 @@ shows
 .B notify_failed
 (attempts),
 .B notify_queued
-(waiting now) and
-.BR notify_dropped ,
-per shard.
+(waiting now),
+.B notify_dropped
+and
+.B notify_resolves
+(host names resolved), per shard.
 .SS Server\-side encryption
 .B "x\-amz\-server\-side\-encryption: AES256"
 on PutObject, CreateMultipartUpload or CopyObject (SSE\-S3) stores the object
