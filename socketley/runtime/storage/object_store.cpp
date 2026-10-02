@@ -628,7 +628,8 @@ std::vector<bucket_info> object_store::buckets() const
 store_totals object_store::totals() const
 {
     store_totals t = m_totals;
-    t.buckets = m_buckets.size();
+    t.buckets    = m_buckets.size();
+    t.pool_ready = m_pool_fds;
     return t;
 }
 

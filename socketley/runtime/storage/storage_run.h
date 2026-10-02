@@ -629,7 +629,8 @@ public:
     bool sse_part_key(const std::shared_ptr<conn>& c, const std::string& record, uint32_t number, object_meta& meta,
                       sse_seal_spec& seal, s3_error& err);
     // Binds a completed upload's part list to its data key: wrapped again with it under the key at hand, or for an
-    // SSE-C upload completed without its client's key, MACed under the master key; refused when neither can be.
+    // SSE-C upload begun with an upload's wrap and completed without its client's key, MACed under the master key;
+    // refused when neither can be.
     s3_error sse_bind_parts(object_meta& m, const std::optional<sse_key>& customer) const;
     // Whether an SSE-C object's part list MAC is there and holds, false with `err` when it does not.
     bool sse_parts_mac_ok(const object_meta& m, const std::string& record, const sse_digest& parts,

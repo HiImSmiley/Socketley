@@ -382,6 +382,7 @@ std::string storage_instance::stats_lines() const
         << "tag_rewrites:" << t.tag_rewrites << "\n"
         << "fsyncs:" << t.fsyncs << "\n"
         << "start_files_read:" << t.start_files_read << "\n"
+        << "pool_ready:" << t.pool_ready << "\n"
         << "timeouts:" << c.timeouts << "\n"
         << "multipart_uploads:" << mp.uploads << "\n"
         << "multipart_parts:" << mp.parts << "\n"

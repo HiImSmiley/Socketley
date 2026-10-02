@@ -207,8 +207,10 @@ bool storage_run::sse_new_key(const sse_ask& ask, bool per_part, object_meta& me
         err = sse_error("InternalError", "The object's data key could not be wrapped");
         return false;
     }
-    std::erase_if(meta.extra, [](const auto& e) { return e.first == sse_extra; });
+    std::erase_if(meta.extra, [](const auto& e) { return e.first == sse_extra || e.first == sse_upload_wrap_extra; });
     meta.extra.emplace_back(std::string(sse_extra), encode_sse(rec));
+    if (ask.mode == sse_mode::c && per_part)
+        meta.extra.emplace_back(std::string(sse_upload_wrap_extra), "upload");
     return true;
 }
 
@@ -295,6 +297,7 @@ bool storage_run::sse_data_key(const object_meta& m, const std::optional<sse_key
 
 s3_error storage_run::sse_bind_parts(object_meta& m, const std::optional<sse_key>& customer) const
 {
+    const bool upload_wrap = std::erase_if(m.extra, [](const auto& e) { return e.first == sse_upload_wrap_extra; }) > 0;
     const std::string* v = sse_value(m);
     sse_record rec;
     if (customer && (!v || sse_mode_of(m) != sse_mode::c))
@@ -318,6 +321,11 @@ s3_error storage_run::sse_bind_parts(object_meta& m, const std::optional<sse_key
     }
     else if (customer)
         kek = &*customer;
+    else if (!upload_wrap)
+        // Its key unwraps as a completed object's, so only the key itself can bind its list.
+        return sse_error("InvalidRequest", "This SSE-C multipart upload was begun before its part list could be bound "
+                                           "without its key, so CompleteMultipartUpload must send the "
+                                           "x-amz-server-side-encryption-customer-* headers");
     else if (m_has_master)
     {
         // S3 does not ask a completion for the client's key, so the master key vouches for the list instead.

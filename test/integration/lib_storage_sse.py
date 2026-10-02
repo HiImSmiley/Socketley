@@ -728,6 +728,7 @@ def mode_tls(port, cert, data):
 # ─── an SSE-C upload's part list, bound at completion ───────────────────────
 
 PARTS_MAC = b"x-socketley-sse-parts"
+UPLOAD_WRAP = b"x-socketley-sse-wrap"
 # Two parts of one size and a shorter last one, so the header's part sizes stay one number with the last dropped.
 BOUND_SIZES = [5 * MIB, 5 * MIB, MIB + 7]
 
@@ -762,7 +763,7 @@ def drop_last_part(path, h):
 
 
 def as_before_binding(h, key):
-    """`h` as an upload begun before part lists were bound completes without its key: a plain wrap, no MAC."""
+    """`h` with its key wrapped as before part lists were bound: a plain wrap, no MAC and no upload's mark."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     rec = extra_of(h, b"x-socketley-sse").split(b";")
     w = base64.b64decode(rec[5])
@@ -770,7 +771,8 @@ def as_before_binding(h, key):
     nonce = os.urandom(12)
     rec[5] = base64.b64encode(nonce + AESGCM(key).encrypt(nonce, data_key, b"socketley-sse-key-v2"))
     t = dict(h)
-    t["extra"] = [(n, b";".join(rec) if n == b"x-socketley-sse" else v) for n, v in h["extra"] if n != PARTS_MAC]
+    t["extra"] = [(n, b";".join(rec) if n == b"x-socketley-sse" else v) for n, v in h["extra"]
+                  if n not in (PARTS_MAC, UPLOAD_WRAP)]
     return t
 
 
@@ -809,8 +811,9 @@ def bound_parts(s3, data, key, other):
     path = obj_file(data, "bymaster")
     h = read_header(path)
     mac = extra_of(h, PARTS_MAC) if h else None
-    check("its header carries the part list's MAC",
-          mac is not None and re.fullmatch(rb"[0-9a-f]{8};[0-9a-f]{64}", mac), h and h["extra"])
+    check("its header carries the part list's MAC, and not the upload's mark",
+          mac is not None and re.fullmatch(rb"[0-9a-f]{8};[0-9a-f]{64}", mac) and extra_of(h, UPLOAD_WRAP) is None,
+          h and h["extra"])
 
     # Tags that bring the header's room to within a MAC of its 4 KiB edge: the upload kept room for one.
     mac_entry = 8 + len(PARTS_MAC) + len(mac or b"")
@@ -880,6 +883,38 @@ def bound_parts(s3, data, key, other):
         Bucket=B, Key="s3mpu", UploadId=up["UploadId"],
         MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": r["ETag"]}]}, **ka))
     check("SSE-C headers on the completion of an SSE-S3 upload are refused", code == (400, "InvalidRequest"), code)
+
+    # An upload begun before part lists were bound, its meta file rewritten as that runtime wrote it.
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
+    except ImportError:
+        print("  SKIP: python3-cryptography is needed to write an upload as before part lists were bound")
+        return
+    uid, done, p = c_upload(s3, "oldform", key, "of")
+    meta = os.path.join(data, B, "mpu", uid, "meta")
+    h = read_header(meta)
+    check("a new SSE-C upload's meta file carries the upload's mark", h and extra_of(h, UPLOAD_WRAP) == b"upload",
+          h and h["extra"])
+    ok, _ = restart_runtime(NODE, None, lambda: write_header(meta, as_before_binding(h, key)))
+    check("the runtime starts again with the upload rewritten", ok)
+    doc = "<CompleteMultipartUpload>" + "".join(
+        "<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>" % (d["PartNumber"], d["ETag"]) for d in done) + \
+        "</CompleteMultipartUpload>"
+    st, _, b = req("POST", "/%s/oldform?uploadId=%s" % (B, uid), doc.encode())
+    check("an upload begun before binding is refused a completion without its key, though a master key is at hand",
+          (st, xml_code(b)) == (400, "InvalidRequest") and b"begun before" in b and
+          b"x-amz-server-side-encryption-customer" in b, (st, b[:400]))
+    check("and nothing is completed", req("HEAD", "/%s/oldform" % B, headers=hdrs)[0] == 404)
+    s3.complete_multipart_upload(Bucket=B, Key="oldform", UploadId=uid, MultipartUpload={"Parts": done}, **ka)
+    check("it completes with its key", s3.get_object(Bucket=B, Key="oldform", **ka)["Body"].read() == b"".join(p))
+    path = obj_file(data, "oldform")
+    h = read_header(path)
+    check("bound by the key, with no MAC", h and extra_of(h, PARTS_MAC) is None and extra_of(h, UPLOAD_WRAP) is None,
+          h and h["extra"])
+    drop_last_part(path, h)
+    st, got = fetch("/%s/oldform" % B, hdrs)
+    check("so a header that drops its last part does not open", (st, xml_code(got)) == (403, "AccessDenied"),
+          (st, got[:200]))
 
 
 def mode_tlsnokey(port, cert, data):
@@ -1116,11 +1151,13 @@ def flip(path, at):
         os.fsync(f.fileno())
 
 
-def restart_runtime(port, data=None):
-    """Stops and starts the runtime, every journal removed in between when `data` is given."""
+def restart_runtime(port, data=None, between=None):
+    """Stops and starts the runtime, every journal removed in between when `data` is given, `between` run there."""
     subprocess.run([BIN, "stop", RUNTIME], capture_output=True)
     time.sleep(0.5)
     removed = remove_journals(data) if data else 0
+    if between:
+        between()
     subprocess.run([BIN, "start", RUNTIME], capture_output=True)
     return wait_for(lambda: probe(port), 30), removed
 
@@ -1341,15 +1378,14 @@ def mode_pool(port, data):
     restart_runtime(port)
     for key, torn in (("killme/whole", False), ("killme/torn", True)):
         body = marked(100000, key)
-        # A start leaves the pool empty and a put fills it once pool/ is synced, which a busy disk makes slow, so
-        # puts are made until one took a file; the pool then holds more than the one put after it takes.
-        warm = iter(range(1000))
+        # A start leaves the pool empty and its first put asks for a refill, which is ready once pool/ is synced;
+        # a snapshot counting exactly that one put is this worker's and was taken after the put looked in the pool.
+        s3.put_object(Bucket=PB, Key="warm/" + key, Body=b"w", ServerSideEncryption="AES256")
 
-        def pooled_put():
-            k = "warm/%s/%d" % (key, next(warm))
-            s3.put_object(Bucket=PB, Key=k, Body=b"w", ServerSideEncryption="AES256")
-            return extra_of(read_header(obj_file(data, k, PB)), b"x-socketley-stored-md5") is not None
-        check("%s: the pool is filled again" % key, wait_for(pooled_put, 20))
+        def pool_ready():
+            st = stats()
+            return st.get("puts") == "1" and int(st.get("pool_ready", "0")) >= 1
+        check("%s: the pool is filled again" % key, wait_for(pool_ready, 20), stats().get("pool_ready"))
         answered, back = killed_put(key, body)
         check("%s: the worker is killed after the rename, before it answers, and comes back" % key,
               not answered and back, (answered, back))

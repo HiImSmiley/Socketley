@@ -228,6 +228,8 @@ struct store_totals
     uint64_t tag_rewrites{0};
     // Object and version files whose headers the start read, zero when every journal was trusted.
     uint64_t start_files_read{0};
+    // Empty files every bucket's pool holds ready for a small put, durable in pool/.
+    uint64_t pool_ready{0};
 };
 
 struct recovery_report

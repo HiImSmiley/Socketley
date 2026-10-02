@@ -88,6 +88,8 @@ std::string encode_part_list(const part_list& l, uint64_t total);
 inline constexpr std::string_view part_layout_extra = "x-socketley-part-layout";
 // The extra entry an SSE-C object completed without its client's key keeps its part list's MAC in.
 inline constexpr std::string_view sse_parts_extra = "x-socketley-sse-parts";
+// The extra entry of an SSE-C upload whose key is wrapped as an upload's, which its completion removes.
+inline constexpr std::string_view sse_upload_wrap_extra = "x-socketley-sse-wrap";
 
 // Where a part list kept after the body lies, counted from the body's start, and the digest it must have.
 struct part_trailer

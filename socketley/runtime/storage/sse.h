@@ -22,7 +22,8 @@
 // names fewer parts, or other ones, no longer unwraps it.  An SSE-C upload
 // begun since that binding was enforced wraps its key as an upload's, which a
 // completed object opens only with its list bound: by the client's key, or,
-// when the completion did not carry it, by a MAC under the master key.
+// when the completion did not carry it, by a MAC under the master key.  An
+// upload begun before then has no such wrap, so it completes only with the key.
 //
 //   x-socketley-sse-parts: <master key id>;<HMAC-SHA256 of the record and the part list, hex>
 #include <array>
