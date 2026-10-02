@@ -21,6 +21,7 @@
 
 #include "../../shared/event_loop.h"
 #include "../../shared/file_io.h"
+#include "../../shared/hash_pool.h"
 #include "../../shared/tls_context.h"
 
 namespace socketley::storage
@@ -37,24 +38,32 @@ struct notify_target
     std::string path;
     // The CA an https target's certificate is checked against, the system's when empty.
     std::string ca_file;
-    struct sockaddr_storage addr{};
-    socklen_t   addr_len{0};
 };
 
 // The targets a file's text names, one `name url [ca=file]` per line with '#' starting a comment; false with `why`
 // for a line that is none of these or a name given twice.  Nothing is resolved.
 bool parse_notify_targets(std::string_view text, std::vector<notify_target>& out, std::string& why);
 
-// The same read from `path`, with each host resolved when `resolve` asks, which blocks and so runs at start; a host
-// that does not resolve is kept, and its events wait until a start that resolves it.
-bool load_notify_targets(const std::string& path, std::vector<notify_target>& out, std::string& why,
-                         bool resolve = true);
+// The same read from `path`.
+bool load_notify_targets(const std::string& path, std::vector<notify_target>& out, std::string& why);
+
+// One address a host resolved to.
+struct notify_endpoint
+{
+    struct sockaddr_storage addr{};
+    socklen_t len{0};
+};
+
+// The addresses `host` has, in the order the resolver gives them, a name in `hosts_file` (`name address` lines, a
+// test aid) before the system's; blocking, so it runs on the resolver thread.
+std::vector<notify_endpoint> resolve_notify_host(const std::string& host, uint16_t port, const std::string& hosts_file);
 
 struct notify_counters
 {
     uint64_t sent{0};
     uint64_t failed{0};
     uint64_t dropped{0};
+    uint64_t resolves{0};
 };
 
 class notifier
@@ -67,6 +76,10 @@ public:
     // The pause after a target's first failure, doubled by each further one up to the cap.
     static constexpr int64_t backoff_first_ms = 250;
     static constexpr int64_t backoff_cap_ms   = 8000;
+    // A host's addresses are asked for again this often while it is delivered to, and at once after every address
+    // it had refused a connection, but not twice within the floor.
+    static constexpr int resolve_every_secs = 60;
+    static constexpr int resolve_floor_ms   = 1000;
 
     // `owner` is the handler the timer's completion is delivered to, which hands it to on_timer().
     notifier(event_loop& loop, file_io& io, io_handler* owner);
@@ -109,6 +122,12 @@ private:
     {
         notify_target target;
         std::unique_ptr<tls_context> tls;
+        // The host's addresses and the one tried next; a literal address is its own and never resolved.
+        std::vector<notify_endpoint> addrs;
+        size_t      cur{0};
+        bool        literal{false};
+        bool        resolving{false};
+        std::chrono::steady_clock::time_point resolved_at{};
         std::deque<pending> q;
         // Bumped at the end of each attempt, so a completion of an earlier one is told from the current one's.
         uint64_t    gen{0};
@@ -125,6 +144,11 @@ private:
     };
 
     lane* find_lane(std::string_view name);
+    // Asks the resolver thread for the host's addresses unless it was asked within the floor; false when it cannot be asked.
+    bool resolve(lane& l);
+    void resolved(lane& l, std::vector<notify_endpoint> addrs);
+    // A delivery that did not happen is tried again after a pause that grows with each failure in a row.
+    void back_off(lane& l);
     void start(lane& l);
     void connected(lane& l, int64_t res);
     // The next step of an attempt: what is owed to the socket is written, or else the answer is read.
@@ -165,6 +189,11 @@ private:
     bool        m_writing{false};
     bool        m_rotating{false};
     bool        m_write_failed{false};
+
+    // One thread that resolves hosts, its answers handed back through an eventfd the ring reads, and the test aid's
+    // hosts file (SOCKETLEY_STORAGE_NOTIFY_HOSTS).
+    hash_pool   m_resolver{1};
+    std::string m_hosts_file;
 
     io_request  m_timer_req{};
     struct __kernel_timespec m_timer_ts{};

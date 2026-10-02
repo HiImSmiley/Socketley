@@ -91,7 +91,7 @@ std::string storage_instance::config_refusal() const
     if (!m_notify_targets.empty())
     {
         std::vector<socketley::storage::notify_target> targets;
-        if (std::string why; !socketley::storage::load_notify_targets(m_notify_targets, targets, why, false))
+        if (std::string why; !socketley::storage::load_notify_targets(m_notify_targets, targets, why))
             return "storage: " + why + "\n";
     }
     return {};
@@ -443,7 +443,8 @@ std::string storage_instance::stats_lines() const
         << "notify_sent:" << m_run->notifications().counters().sent << "\n"
         << "notify_failed:" << m_run->notifications().counters().failed << "\n"
         << "notify_queued:" << m_run->notifications().queued() << "\n"
-        << "notify_dropped:" << m_run->notifications().counters().dropped << "\n";
+        << "notify_dropped:" << m_run->notifications().counters().dropped << "\n"
+        << "notify_resolves:" << m_run->notifications().counters().resolves << "\n";
     // One line per code answered, so a client's mistakes and the runtime's own
     // are told apart without reading a log.
     for (const auto& [code, n] : c.errors)

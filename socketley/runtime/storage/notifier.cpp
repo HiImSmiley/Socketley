@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -173,7 +174,7 @@ bool parse_notify_targets(std::string_view text, std::vector<notify_target>& out
     return true;
 }
 
-bool load_notify_targets(const std::string& path, std::vector<notify_target>& out, std::string& why, bool resolve)
+bool load_notify_targets(const std::string& path, std::vector<notify_target>& out, std::string& why)
 {
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0)
@@ -198,26 +199,83 @@ bool load_notify_targets(const std::string& path, std::vector<notify_target>& ou
         why = path + ": " + why;
         return false;
     }
-    if (!resolve)
-        return true;
-    for (notify_target& t : out)
-    {
-        struct addrinfo hints{};
-        hints.ai_family   = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        struct addrinfo* res = nullptr;
-        const std::string port = std::to_string(t.port);
-        if (::getaddrinfo(t.host.c_str(), port.c_str(), &hints, &res) != 0 || !res)
-        {
-            LOG_WARN(("storage: the notification target " + t.name + " names host " + t.host +
-                      ", which does not resolve; its events wait until a start that resolves it").c_str());
-            continue;
-        }
-        std::memcpy(&t.addr, res->ai_addr, std::min<size_t>(res->ai_addrlen, sizeof(t.addr)));
-        t.addr_len = static_cast<socklen_t>(std::min<size_t>(res->ai_addrlen, sizeof(t.addr)));
-        ::freeaddrinfo(res);
-    }
     return true;
+}
+
+namespace
+{
+
+// `host` as an address literal, false when it is a name.
+bool literal_endpoint(const std::string& host, uint16_t port, notify_endpoint& out)
+{
+    out = notify_endpoint{};
+    auto* v4 = reinterpret_cast<struct sockaddr_in*>(&out.addr);
+    if (::inet_pton(AF_INET, host.c_str(), &v4->sin_addr) == 1)
+    {
+        v4->sin_family = AF_INET;
+        v4->sin_port   = htons(port);
+        out.len        = sizeof(struct sockaddr_in);
+        return true;
+    }
+    auto* v6 = reinterpret_cast<struct sockaddr_in6*>(&out.addr);
+    if (::inet_pton(AF_INET6, host.c_str(), &v6->sin6_addr) == 1)
+    {
+        v6->sin6_family = AF_INET6;
+        v6->sin6_port   = htons(port);
+        out.len         = sizeof(struct sockaddr_in6);
+        return true;
+    }
+    return false;
+}
+
+}   // namespace
+
+std::vector<notify_endpoint> resolve_notify_host(const std::string& host, uint16_t port, const std::string& hosts_file)
+{
+    std::vector<notify_endpoint> out;
+    if (!hosts_file.empty())
+    {
+        std::string text;
+        if (const int fd = ::open(hosts_file.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0)
+        {
+            char buf[4096];
+            ssize_t n;
+            while ((n = ::read(fd, buf, sizeof(buf))) > 0 && text.size() < (1u << 20))
+                text.append(buf, static_cast<size_t>(n));
+            ::close(fd);
+        }
+        std::string_view rest = text;
+        while (!rest.empty())
+        {
+            const size_t nl = rest.find('\n');
+            std::string_view line = trim(rest.substr(0, nl));
+            rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+            const size_t sp = line.find_first_of(" \t");
+            if (sp == std::string_view::npos || line.substr(0, sp) != host)
+                continue;
+            notify_endpoint e;
+            if (literal_endpoint(std::string(trim(line.substr(sp))), port, e))
+                out.push_back(e);
+        }
+        if (!out.empty())
+            return out;
+    }
+    struct addrinfo hints{};
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = nullptr;
+    const std::string p = std::to_string(port);
+    if (::getaddrinfo(host.c_str(), p.c_str(), &hints, &res) != 0 || !res)
+        return out;
+    for (const struct addrinfo* a = res; a; a = a->ai_next)
+    {
+        notify_endpoint e;
+        e.len = static_cast<socklen_t>(std::min<size_t>(a->ai_addrlen, sizeof(e.addr)));
+        std::memcpy(&e.addr, a->ai_addr, e.len);
+        out.push_back(e);
+    }
+    ::freeaddrinfo(res);
+    return out;
 }
 
 // ─── The notifier ───────────────────────────────────────────────────────────
@@ -231,6 +289,8 @@ notifier::notifier(event_loop& loop, file_io& io, io_handler* owner) : m_loop(lo
         if (end != e && v > 0)
             m_queue_max = static_cast<size_t>(v);
     }
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_NOTIFY_HOSTS"))
+        m_hosts_file = e;
 }
 
 notifier::~notifier()
@@ -257,9 +317,68 @@ void notifier::set_targets(std::vector<notify_target> targets)
                 l->tls.reset();
             }
         }
+        notify_endpoint e;
+        l->literal = literal_endpoint(t.host, t.port, e);
+        if (l->literal)
+            l->addrs.push_back(e);
         l->target = std::move(t);
         m_lanes.push_back(std::move(l));
     }
+    bool names = false;
+    for (const auto& l : m_lanes)
+        names = names || !l->literal;
+    if (names && !m_resolver.attach(m_io))
+        LOG_ERROR("storage: the notification resolver cannot be waited for, so webhooks named by a host are not delivered to");
+    // Every name is asked for now, so the first event does not wait for its answer.
+    for (auto& l : m_lanes)
+        if (!l->literal && !resolve(*l)) {}
+}
+
+bool notifier::resolve(lane& l)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (l.literal || m_stopped || !m_resolver.enabled())
+        return false;
+    if (l.resolving)
+        return true;
+    if (l.resolved_at != std::chrono::steady_clock::time_point{} &&
+        now - l.resolved_at < std::chrono::milliseconds(resolve_floor_ms))
+        return false;
+    l.resolving = true;
+    auto out = std::make_shared<std::vector<notify_endpoint>>();
+    auto alive = m_alive;
+    lane* lp = &l;
+    m_resolver.submit(0,
+        [out, host = l.target.host, port = l.target.port, hosts = m_hosts_file]()
+        { *out = resolve_notify_host(host, port, hosts); },
+        [this, alive, lp, out]()
+        {
+            if (*alive)
+                resolved(*lp, std::move(*out));
+        });
+    return true;
+}
+
+void notifier::resolved(lane& l, std::vector<notify_endpoint> addrs)
+{
+    l.resolving   = false;
+    l.resolved_at = std::chrono::steady_clock::now();
+    ++m_c.resolves;
+    if (m_stopped)
+        return;
+    if (addrs.empty())
+    {
+        LOG_WARN(("storage: the notification target " + l.target.name + " names host " + l.target.host +
+                  ", which does not resolve; its events wait and it is asked again").c_str());
+        // A host known before keeps its addresses, since a resolver that does not answer says nothing about them.
+        if (l.addrs.empty() && !l.q.empty() && !l.busy)
+            back_off(l);
+        return;
+    }
+    l.addrs = std::move(addrs);
+    l.cur   = 0;
+    if (!l.busy && !l.q.empty())
+        start(l);
 }
 
 bool notifier::has_target(std::string_view name) const
@@ -604,6 +723,16 @@ void notifier::start(lane& l)
         arm_timer();
         return;
     }
+    // A host with no address yet waits for the resolver, which starts the delivery when it answers.
+    if (l.addrs.empty())
+    {
+        if (!resolve(l))
+            back_off(l);
+        return;
+    }
+    // A host is asked again now and then while it is used, without holding up this delivery.
+    if (!l.literal && now - l.resolved_at > std::chrono::seconds(resolve_every_secs))
+        if (!resolve(l)) {}
     l.busy          = true;
     l.handshaken    = false;
     l.request_given = false;
@@ -611,12 +740,13 @@ void notifier::start(lane& l)
     l.response.clear();
     l.deadline = now + std::chrono::seconds(attempt_secs);
     arm_timer();
-    if (l.target.addr_len == 0 || (l.target.tls && !l.tls))
+    if (l.target.tls && !l.tls)
     {
         finish(l, false);
         return;
     }
-    l.fd = ::socket(l.target.addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    const notify_endpoint& ep = l.addrs[l.cur % l.addrs.size()];
+    l.fd = ::socket(ep.addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (l.fd < 0)
     {
         finish(l, false);
@@ -625,7 +755,7 @@ void notifier::start(lane& l)
     const uint64_t gen = l.gen;
     auto alive = m_alive;
     lane* lp = &l;
-    if (!m_io.connect(l.fd, reinterpret_cast<const struct sockaddr*>(&l.target.addr), l.target.addr_len,
+    if (!m_io.connect(l.fd, reinterpret_cast<const struct sockaddr*>(&ep.addr), ep.len,
                       [this, alive, lp, gen](int64_t res)
                       {
                           if (*alive && lp->gen == gen)
@@ -638,6 +768,18 @@ void notifier::connected(lane& l, int64_t res)
 {
     if (res < 0)
     {
+        // The host's next address is tried at once, and once every one has refused, its name is asked again.
+        if (++l.cur < l.addrs.size())
+        {
+            ++l.gen;
+            l.busy = false;
+            m_loop.close_fd(l.fd);
+            l.fd = -1;
+            start(l);
+            return;
+        }
+        l.cur = 0;
+        if (!resolve(l)) {}
         finish(l, false);
         return;
     }
@@ -834,6 +976,11 @@ void notifier::finish(lane& l, bool delivered)
         start(l);
         return;
     }
+    back_off(l);
+}
+
+void notifier::back_off(lane& l)
+{
     ++m_c.failed;
     ++l.failures;
     const int64_t pause = std::min(backoff_cap_ms, backoff_first_ms << std::min<uint32_t>(l.failures - 1, 16));
@@ -851,6 +998,10 @@ void notifier::stop()
             finish(*l, false);
     if (m_timer_armed)
         m_loop.submit_timeout_remove(&m_timer_req);
+    // A resolve in progress is waited out here, which the system resolver's own timeout bounds.
+    m_resolver.stop();
+    if (const int fd = m_resolver.release_wake_fd(); fd >= 0)
+        m_loop.close_fd(fd);
     // The delivery records not yet written are written here, blocking as a stop may, so a restart does not send them again.
     if (m_fd >= 0 && !m_buf.empty() && !m_rotating)
     {
