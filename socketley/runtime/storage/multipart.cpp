@@ -114,6 +114,14 @@ const std::string* extra_value(const object_meta& m, std::string_view name)
     return nullptr;
 }
 
+// The header a completed object takes, with room for the MAC of its part list an SSE-C completion may add.
+size_t completed_header_len(std::string_view key, object_meta m)
+{
+    if (sse_mode_of(m) == sse_mode::c)
+        m.extra.emplace_back(std::string(sse_parts_extra), encode_parts_mac({}, {}));
+    return object_header_len(key, m);
+}
+
 // The room the finished object's header needs in front of part 1, whatever its size and part count.
 uint64_t place_base_of(std::string_view key, const object_meta& meta, checksum_algo algo)
 {
@@ -121,13 +129,30 @@ uint64_t place_base_of(std::string_view key, const object_meta& meta, checksum_a
     if (algo != checksum_algo::none)
         m.extra.emplace_back(std::string(checksum_header(algo)),
                              std::string(checksum_b64_len(algo) + std::to_string(mpu_max_parts).size() + 1, 'A'));
-    // Parts placed in the data file are of one size, so their sizes are one number.
-    m.extra.emplace_back(std::string(part_sizes_extra), std::string(20, '9'));
+    // Parts placed in the data file are of one size, so their list is one number or names its checksums after the body.
+    m.extra.emplace_back(std::string(part_layout_extra), std::string(20 + 1 + 64 + 1 + 2, '9'));
     m.extra.emplace_back(std::string(upload_id_extra), std::string(32, '0'));
-    // An SSE-C upload completed without its client's key takes a MAC of its part list.
-    if (sse_mode_of(meta) == sse_mode::c)
-        m.extra.emplace_back(std::string(sse_parts_extra), encode_parts_mac({}, {}));
-    return object_header_len(key, m);
+    return completed_header_len(key, m);
+}
+
+// The list a completed object records of `parts`, with their checksums when each has one in the object's algorithm.
+part_list list_of(const std::vector<mpu_part>& parts, const object_meta& meta)
+{
+    part_list l;
+    const checksum_algo a = checksum_algo_of(meta);
+    bool sums = a != checksum_algo::none;
+    for (const mpu_part& p : parts)
+    {
+        l.numbers.push_back(p.number);
+        l.sizes.push_back(p.size);
+        std::string raw;
+        sums = sums && base64_decode(p.checksum_b64, raw) && raw.size() == checksum_raw_len(a);
+        if (sums)
+            l.checksums.push_back(std::move(raw));
+    }
+    if (!sums)
+        l.checksums.clear();
+    return l;
 }
 
 // How far apart the parts of an upload lie in its data file: their size, or what that size takes sealed.
@@ -1119,20 +1144,22 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
             plan.meta.extra.emplace_back(std::string(checksum_header(u->algo)), plan.checksum_b64);
         }
         // Kept in the header when it fits and after the body otherwise, so any list S3 takes completes.
-        part_list list;
+        const part_list list = list_of(plan.parts, plan.meta);
         const uint8_t sealed = sse_version_of(plan.meta);
         uint64_t body = 0;
         for (const mpu_part& p : plan.parts)
-        {
-            list.numbers.push_back(p.number);
-            list.sizes.push_back(p.size);
             body += sealed ? sse_stored_len(p.size, sealed) : p.size;
-        }
         // A version 2 stream is sealed as the part number it was uploaded as, so its object keeps the numbers.
-        const bool trailer = !record_part_list(plan.meta, list, body, sealed >= sse_format, m_list_max).empty();
+        bool trailer = !record_part_list(plan.meta, list, body, sealed >= sse_format, m_list_max).empty();
         plan.meta.extra.emplace_back(std::string(upload_id_extra), id);
+        plan.in_place = copy_free(*u, plan.parts);
+        // The room in front of part 1 was reserved without the parts' checksums, which follow the body when it is short.
+        if (plan.in_place && !trailer && completed_header_len(plan.key, plan.meta) > u->place_base)
+        {
+            trailer = !record_part_list(plan.meta, list, body, sealed >= sse_format, 0).empty();
+            plan.meta.extra.emplace_back(std::string(upload_id_extra), id);
+        }
         m_trailers += trailer ? 1 : 0;
-        plan.in_place = !trailer && copy_free(*u, plan.parts);
         u->place_planned = plan.in_place;
         cb({}, std::move(plan));
     };
@@ -1146,16 +1173,10 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
 void multipart_store::assemble(std::shared_ptr<assemble_state> a)
 {
     a->sealed = sse_version_of(a->meta);
-    if (part_trailer t; part_trailer_of(a->meta, t))
-    {
-        part_list list;
-        for (const mpu_part& p : a->parts)
-        {
-            list.numbers.push_back(p.number);
-            list.sizes.push_back(p.size);
-        }
-        a->trailer = encode_part_list(list, a->meta.size);
-    }
+    part_trailer t;
+    const bool listed_after = part_trailer_of(a->meta, t);
+    if (listed_after)
+        a->trailer = encode_part_list(list_of(a->parts, a->meta), a->meta.size);
     if (a->bind)
         if (s3_error e = a->bind(a->meta); !e.code.empty())
         {
@@ -1165,8 +1186,8 @@ void multipart_store::assemble(std::shared_ptr<assemble_state> a)
         }
     const uint64_t base = a->in_place && !a->parts.empty() ? a->parts.front().data_off : 0;
     auto header = std::make_shared<std::string>(encode_object_header(a->key, a->meta, base));
-    // A header that outgrew the room its upload reserved would be written over part 1, and a trailer is only copied.
-    if (!a->in_place || header->size() != base || !a->trailer.empty())
+    // A header that outgrew the room its upload reserved would be written over part 1.
+    if (!a->in_place || header->size() != base)
     {
         a->in_place = false;
         assemble_copy(std::move(a));
@@ -1174,13 +1195,15 @@ void multipart_store::assemble(std::shared_ptr<assemble_state> a)
     }
     ++m_inflight;
 
-    // The data file is the object already: its header goes in front, it is synced and
-    // given a name in tmp/, and that name is committed like any assembled object.
+    // The data file is the object already: its header goes in front, its part list after
+    // the last part when the header names one there, it is synced and given a name in tmp/,
+    // and that name is committed like any assembled object.
     const std::string data = a->dir_path + "/data";
     auto fd    = hold_fd(m_loop, m_alive, -1);
     auto probe = std::make_shared<std::array<char, 2>>();
     auto linking = std::make_shared<bool>(false);
-    const uint64_t end = base + stored_size(a->meta);
+    auto list  = std::make_shared<std::string>(a->trailer);
+    const uint64_t end = base + (listed_after ? t.at : stored_size(a->meta));
     file_io* io = m_io;
     auto ch = std::make_shared<disk_chain>(m_alive);
     ch->then([io, data, fd](file_io::done d)
@@ -1197,6 +1220,17 @@ void multipart_store::assemble(std::shared_ptr<assemble_state> a)
     {
         return io->pwrite(*fd, header->data(), static_cast<uint32_t>(header->size()), 0, std::move(d));
     });
+    ch->then([io, fd, list, end](file_io::done d)
+    {
+        if (list->empty())
+        {
+            d(0);
+            return true;
+        }
+        const int64_t want = static_cast<int64_t>(list->size());
+        return io->pwrite(*fd, list->data(), static_cast<uint32_t>(list->size()), end,
+                          [d, want](int64_t r) { d(r == want ? 0 : r < 0 ? r : -EIO); });
+    });
     ch->then([io, fd](file_io::done d) { return io->fsync(*fd, true, std::move(d)); });
     ch->then([io, data, a, linking](file_io::done d)
     {
@@ -1204,7 +1238,7 @@ void multipart_store::assemble(std::shared_ptr<assemble_state> a)
         return io->linkat(AT_FDCWD, data, AT_FDCWD, a->tmp_path, std::move(d));
     });
     // The buffers a step hands the kernel live as long as the chain, since a launched step lets go of its captures.
-    ch->run([this, alive = m_alive, a, fd, linking, header, probe](int64_t r) mutable
+    ch->run([this, alive = m_alive, a, fd, linking, header, probe, list](int64_t r) mutable
     {
         if (!*alive)
             return;

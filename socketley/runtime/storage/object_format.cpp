@@ -24,6 +24,8 @@ constexpr std::string_view slot_magic = std::string_view("SKLTAG\x01\x00", 8);
 // A slot whose payload is the tags, the retention and the legal hold, each a length and its bytes.
 constexpr std::string_view lock_slot_magic = std::string_view("SKLTAG\x02\x00", 8);
 constexpr std::string_view part_list_magic = std::string_view("SKLPRT\x01\x00", 8);
+// A part list that carries each part's checksum after its number and size.
+constexpr std::string_view part_list_sums_magic = std::string_view("SKLPRT\x02\x00", 8);
 // magic, sequence, payload length, crc.
 constexpr size_t           slot_head  = 24;
 constexpr size_t           sector     = 512;
@@ -91,7 +93,10 @@ struct reader
     }
     std::string_view str()
     {
-        const uint32_t n = u32();
+        return raw(u32());
+    }
+    std::string_view raw(size_t n)
+    {
         if (!ok || in.size() < n) { ok = false; return {}; }
         std::string_view s = in.substr(0, n);
         in.remove_prefix(n);
@@ -389,7 +394,43 @@ bool each_item(std::string_view v, F take)
     }
 }
 
+// The width of the list's checksums, 0 unless every part has one and all are as wide.
+uint32_t checksum_width(const part_list& l)
+{
+    if (l.checksums.empty() || l.checksums.size() != l.sizes.size())
+        return 0;
+    for (const std::string& c : l.checksums)
+        if (c.empty() || c.size() != l.checksums.front().size())
+            return 0;
+    return static_cast<uint32_t>(l.checksums.front().size());
+}
+
+// The checksums the header of `m` keeps of its `count` parts, a single-part object's being its own.
+void header_checksums(const object_meta& m, uint32_t count, std::vector<std::string>& out)
+{
+    const checksum_algo a = checksum_algo_of(m);
+    if (a == checksum_algo::none)
+        return;
+    // A composite value is of parts a copy no longer has, so it is no part's checksum.
+    const std::string* v = extra_of(m, m.parts ? part_checksums_extra : checksum_header(a));
+    std::string raw;
+    const size_t width = checksum_raw_len(a);
+    if (!v || (!m.parts && v->find('-') != std::string::npos) || !base64_decode(*v, raw) ||
+        raw.size() != width * count)
+        return;
+    for (uint32_t i = 0; i < count; ++i)
+        out.push_back(raw.substr(i * width, width));
+}
+
 }   // namespace
+
+checksum_algo checksum_algo_of(const object_meta& m)
+{
+    for (const auto& [n, v] : m.extra)
+        if (const checksum_algo a = checksum_from_header(n); a != checksum_algo::none)
+            return a;
+    return checksum_algo::none;
+}
 
 std::string encode_part_numbers(const std::vector<uint32_t>& numbers, size_t max)
 {
@@ -445,6 +486,7 @@ bool part_list_of(const object_meta& m, part_list& out)
 {
     out.numbers.clear();
     out.sizes.clear();
+    out.checksums.clear();
     const uint32_t count = m.parts ? m.parts : 1;
     if (count == 1)
         out.sizes.push_back(m.size);
@@ -483,27 +525,32 @@ bool part_list_of(const object_meta& m, part_list& out)
     {
         for (uint32_t i = 1; i <= count; ++i)
             out.numbers.push_back(i);
-        return true;
     }
-    // Ascending and within S3's bounds, which is all a completion can have recorded.
-    const bool ok = each_item(*nv, [&](std::string_view item)
+    else
     {
-        const size_t dash = item.find('-');
-        uint64_t lo = 0, hi = 0;
-        if (!decimal(item.substr(0, dash), lo))
+        // Ascending and within S3's bounds, which is all a completion can have recorded.
+        const bool ok = each_item(*nv, [&](std::string_view item)
+        {
+            const size_t dash = item.find('-');
+            uint64_t lo = 0, hi = 0;
+            if (!decimal(item.substr(0, dash), lo))
+                return false;
+            if (dash == std::string_view::npos)
+                hi = lo;
+            else if (!decimal(item.substr(dash + 1), hi))
+                return false;
+            if (lo < 1 || hi < lo || hi > 10000 || (!out.numbers.empty() && lo <= out.numbers.back()) ||
+                out.numbers.size() + (hi - lo + 1) > count)
+                return false;
+            for (uint64_t n = lo; n <= hi; ++n)
+                out.numbers.push_back(static_cast<uint32_t>(n));
+            return true;
+        });
+        if (!ok || out.numbers.size() != count)
             return false;
-        if (dash == std::string_view::npos)
-            hi = lo;
-        else if (!decimal(item.substr(dash + 1), hi))
-            return false;
-        if (lo < 1 || hi < lo || hi > 10000 || (!out.numbers.empty() && lo <= out.numbers.back()) ||
-            out.numbers.size() + (hi - lo + 1) > count)
-            return false;
-        for (uint64_t n = lo; n <= hi; ++n)
-            out.numbers.push_back(static_cast<uint32_t>(n));
-        return true;
-    });
-    return ok && out.numbers.size() == count;
+    }
+    header_checksums(m, count, out.checksums);
+    return true;
 }
 
 void clear_part_layout(object_meta& m)
@@ -511,8 +558,8 @@ void clear_part_layout(object_meta& m)
     std::erase_if(m.extra, [](const auto& e)
                   {
                       return e.first == part_sizes_extra || e.first == part_numbers_extra ||
-                             e.first == part_layout_extra || e.first == sse_parts_extra ||
-                             e.first == upload_id_extra;
+                             e.first == part_checksums_extra || e.first == part_layout_extra ||
+                             e.first == sse_parts_extra || e.first == upload_id_extra;
                   });
 }
 
@@ -521,9 +568,14 @@ bool part_trailer_of(const object_meta& m, part_trailer& out)
     const std::string* v = extra_of(m, part_layout_extra);
     if (!v || m.parts == 0)
         return false;
-    const size_t semi = v->find(';');
-    const std::string_view hexd = semi == std::string::npos ? std::string_view{} : std::string_view(*v).substr(semi + 1);
-    if (!decimal(std::string_view(*v).substr(0, semi), out.at) || hexd.size() != 2 * out.digest.size())
+    const std::string_view s(*v);
+    const size_t semi  = s.find(';');
+    const size_t semi2 = semi == std::string_view::npos ? semi : s.find(';', semi + 1);
+    const std::string_view hexd = semi == std::string_view::npos ? std::string_view{}
+                                                                  : s.substr(semi + 1, semi2 - semi - 1);
+    uint64_t width = 0;
+    if (!decimal(s.substr(0, semi), out.at) || hexd.size() != 2 * out.digest.size() ||
+        (semi2 != std::string_view::npos && (!decimal(s.substr(semi2 + 1), width) || width == 0 || width > 64)))
         return false;
     for (size_t i = 0; i < out.digest.size(); ++i)
     {
@@ -533,35 +585,43 @@ bool part_trailer_of(const object_meta& m, part_trailer& out)
             return false;
         out.digest[i] = static_cast<uint8_t>(b);
     }
-    out.len = part_list_magic.size() + 12 + 12ull * m.parts;
+    out.width = static_cast<uint32_t>(width);
+    out.len   = width ? part_list_sums_magic.size() + 16 + (12 + width) * m.parts
+                      : part_list_magic.size() + 12 + 12ull * m.parts;
     return true;
 }
 
 bool decode_part_trailer(std::string_view bytes, const object_meta& m, const part_trailer& t, part_list& out)
 {
-    if (bytes.size() != t.len || bytes.substr(0, part_list_magic.size()) != part_list_magic)
+    const std::string_view magic = t.width ? part_list_sums_magic : part_list_magic;
+    if (bytes.size() != t.len || bytes.substr(0, magic.size()) != magic)
         return false;
     digest_stream d(EVP_sha256());
     d.update(bytes.data(), bytes.size());
     if (d.finish<32>() != t.digest)
         return false;
-    reader r{bytes.substr(part_list_magic.size())};
+    reader r{bytes.substr(magic.size())};
     const uint64_t total = r.u64();
     const uint32_t count = r.u32();
-    if (!r.ok || total != m.size || count != m.parts)
+    const uint32_t width = t.width ? r.u32() : 0;
+    if (!r.ok || total != m.size || count != m.parts || width != t.width)
         return false;
     out.numbers.clear();
     out.sizes.clear();
+    out.checksums.clear();
     uint64_t sum = 0;
     for (uint32_t i = 0; i < count; ++i)
     {
         const uint32_t n = r.u32();
         const uint64_t s = r.u64();
+        const std::string_view sum_of_part = r.raw(width);
         if (!r.ok || n < 1 || n > 10000 || (!out.numbers.empty() && n <= out.numbers.back()) || s > total - sum)
             return false;
         sum += s;
         out.numbers.push_back(n);
         out.sizes.push_back(s);
+        if (width)
+            out.checksums.emplace_back(sum_of_part);
     }
     return r.in.empty() && sum == total;
 }
@@ -574,35 +634,50 @@ std::string record_part_list(object_meta& m, const part_list& l, uint64_t body_s
         one_to_n = one_to_n && l.numbers[i] == i + 1;
     std::string sizes = encode_part_sizes(l.sizes, max);
     std::string nums  = numbers && !one_to_n ? encode_part_numbers(l.numbers, max) : std::string{};
-    if (!sizes.empty() && (!numbers || one_to_n || !nums.empty()))
+    const uint32_t width = checksum_width(l);
+    std::string sums;
+    for (size_t i = 0; width && i < l.checksums.size(); ++i)
+        sums += l.checksums[i];
+    sums = sums.empty() ? std::string{} : base64_encode(sums);
+    if (!sizes.empty() && (!numbers || one_to_n || !nums.empty()) && sums.size() <= max)
     {
         m.extra.emplace_back(std::string(part_sizes_extra), std::move(sizes));
         if (!nums.empty())
             m.extra.emplace_back(std::string(part_numbers_extra), std::move(nums));
+        if (!sums.empty())
+            m.extra.emplace_back(std::string(part_checksums_extra), std::move(sums));
         return {};
     }
     std::string bytes = encode_part_list(l, m.size);
     digest_stream d(EVP_sha256());
     d.update(bytes.data(), bytes.size());
     const auto h = d.finish<32>();
-    m.extra.emplace_back(std::string(part_layout_extra), std::to_string(body_stored) + ";" + hex(h.data(), h.size()));
+    std::string layout = std::to_string(body_stored) + ";" + hex(h.data(), h.size());
+    if (width)
+        layout += ";" + std::to_string(width);
+    m.extra.emplace_back(std::string(part_layout_extra), std::move(layout));
     return bytes;
 }
 
 std::string encode_part_list(const part_list& l, uint64_t total)
 {
-    std::string out(part_list_magic);
+    const uint32_t width = checksum_width(l);
+    std::string out(width ? part_list_sums_magic : part_list_magic);
     put_u64(out, total);
     put_u32(out, static_cast<uint32_t>(l.sizes.size()));
+    if (width)
+        put_u32(out, width);
     for (size_t i = 0; i < l.sizes.size(); ++i)
     {
         put_u32(out, i < l.numbers.size() ? l.numbers[i] : 0);
         put_u64(out, l.sizes[i]);
+        if (width)
+            out += l.checksums[i];
     }
     return out;
 }
 
-part_status part_range(const object_meta& m, uint32_t n, uint64_t& first, uint64_t& len)
+part_status part_range(const object_meta& m, uint32_t n, uint64_t& first, uint64_t& len, part_list* list)
 {
     const uint32_t count = m.parts ? m.parts : 1;
     if (n < 1 || n > count)
@@ -610,7 +685,8 @@ part_status part_range(const object_meta& m, uint32_t n, uint64_t& first, uint64
     part_trailer t;
     if (part_trailer_of(m, t))
         return part_status::in_trailer;
-    part_list l;
+    part_list own;
+    part_list& l = list ? *list : own;
     if (!part_list_of(m, l))
         return part_status::unknown;
     return part_range_in(l, n, first, len);

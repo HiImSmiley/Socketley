@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "checksum.h"
 #include "digest.h"
 
 namespace socketley::storage
@@ -69,25 +70,35 @@ inline constexpr std::string_view part_numbers_extra = "x-socketley-part-numbers
 // The entry for these ascending numbers, empty when they are 1..N or the entry would be longer than `max`.
 std::string encode_part_numbers(const std::vector<uint32_t>& numbers, size_t max = max_part_sizes_bytes);
 
-// A multipart object's parts in order: the number each was uploaded as, and its size.
+// The extra entry a multipart object's part checksums are kept in: the raw checksums in part order, in base64.
+inline constexpr std::string_view part_checksums_extra = "x-socketley-part-checksums";
+
+// The algorithm of the object's own checksum, which its parts' checksums are kept in too.
+checksum_algo checksum_algo_of(const object_meta& m);
+
+// A multipart object's parts in order: the number each was uploaded as, its size, and its raw checksum.
 struct part_list
 {
     std::vector<uint32_t> numbers;
     std::vector<uint64_t> sizes;
+    // One per part in the object's algorithm, or none when the parts' checksums were not kept.
+    std::vector<std::string> checksums;
 };
 
-// The parts `m`'s header records, a single-part object being its own part 1; false when they are not
-// recorded there or do not add up to the object.
+// The parts `m`'s header records, a single-part object being its own part 1 with its own full-object checksum;
+// false when they are not recorded there or do not add up to the object.
 bool part_list_of(const object_meta& m, part_list& out);
 
 // Removes what `m` records of its parts, for a copy that is one part whatever its source was.
 void clear_part_layout(object_meta& m);
 
-// The list in one canonical encoding, of 20 + 12 bytes per part, which is what a digest of it is taken over.
+// The list in one canonical encoding, of 20 + 12 bytes per part, which is what a digest of it is taken over;
+// a list with checksums is 24 bytes and then 12 and the checksum's width per part.
 std::string encode_part_list(const part_list& l, uint64_t total);
 
 // The extra entry of a multipart object whose part list did not fit in its header and follows its body
-// instead, in the canonical encoding: the body's length on disk, a semicolon, and the list's SHA-256 in hex.
+// instead, in the canonical encoding: the body's length on disk, a semicolon, and the list's SHA-256 in hex,
+// and after another semicolon the width of each part's checksum when the list holds them.
 inline constexpr std::string_view part_layout_extra = "x-socketley-part-layout";
 // The extra entry an SSE-C object completed without its client's key keeps its part list's MAC in.
 inline constexpr std::string_view sse_parts_extra = "x-socketley-sse-parts";
@@ -100,6 +111,8 @@ struct part_trailer
     uint64_t at{0};
     uint64_t len{0};
     std::array<uint8_t, 32> digest{};
+    // Bytes of each part's checksum in the list, 0 for a list without them.
+    uint32_t width{0};
 };
 
 // False when `m` keeps no part list after its body.
@@ -108,8 +121,8 @@ bool part_trailer_of(const object_meta& m, part_trailer& out);
 // The list `bytes` hold, false unless they are the ones `t` names and describe `m`.
 bool decode_part_trailer(std::string_view bytes, const object_meta& m, const part_trailer& t, part_list& out);
 
-// Records `l` in `m`'s header when it fits in `max` bytes, the numbers only when `numbers` asks and they are not
-// 1..N, and otherwise names a trailer after a body of `body_stored` bytes, whose bytes are returned.
+// Records `l` in `m`'s header when each entry fits in `max` bytes, the numbers only when `numbers` asks and they are
+// not 1..N, and otherwise names a trailer after a body of `body_stored` bytes, whose bytes are returned.
 std::string record_part_list(object_meta& m, const part_list& l, uint64_t body_stored, bool numbers,
                              size_t max = max_part_sizes_bytes);
 
@@ -197,9 +210,9 @@ enum class part_status : uint8_t
     in_trailer,
 };
 
-// Where part `n` (from 1) of the object begins and how long it is; a
-// single-part object is its own part 1.
-part_status part_range(const object_meta& m, uint32_t n, uint64_t& first, uint64_t& len);
+// Where part `n` (from 1) of the object begins and how long it is, a single-part object being its own
+// part 1, and into `list` when given the list that says so.
+part_status part_range(const object_meta& m, uint32_t n, uint64_t& first, uint64_t& len, part_list* list = nullptr);
 // The same from a list read after the body, which part_range() says it needs with in_trailer.
 part_status part_range_in(const part_list& l, uint32_t n, uint64_t& first, uint64_t& len);
 

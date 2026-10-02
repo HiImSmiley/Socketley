@@ -1623,8 +1623,10 @@ namespace
 
 // The headers an object's stored metadata puts on a response, with the
 // response-* query overrides a presigned URL may add; in a `versioned` bucket an
-// object written before it was versioned is named as the null version.
-void object_headers(const s3_request& q, const object_meta& m, response& r, bool ranged, bool versioned)
+// object written before it was versioned is named as the null version, and `part`
+// is the checksum of the part asked for by number, empty when it was not kept.
+void object_headers(const s3_request& q, const object_meta& m, response& r, bool ranged, bool versioned,
+                    const std::string* part = nullptr)
 {
     if (versioned && !has_version(m))
         r.headers.emplace_back("x-amz-version-id", "null");
@@ -1658,9 +1660,10 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
     else
         r.headers.emplace_back("Content-Type", m.content_type);
 
-    // The checksum a client asked to see, which describes the whole object and
-    // so is left off an answer that holds only part of it.
-    const bool with_checksum = !ranged && http_token_equals(q.header("x-amz-checksum-mode"), "enabled", 7);
+    // The checksum a client asked to see, of the part it asked for by number or else of the whole object,
+    // which an answer holding only a range of it does not get.
+    const bool with_checksum = http_token_equals(q.header("x-amz-checksum-mode"), "enabled", 7) &&
+                               (part ? !part->empty() : !ranged);
     for (const auto& [n, v] : m.extra)
     {
         if (n.starts_with("x-amz-meta-"))
@@ -1679,7 +1682,7 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
             // A multipart object's composite checksum carries -N, and every other is of the whole object.
             if (with_checksum)
             {
-                r.headers.emplace_back(n, v);
+                r.headers.emplace_back(n, part ? *part : v);
                 r.headers.emplace_back("x-amz-checksum-type", v.find('-') != std::string::npos ? "COMPOSITE" : "FULL_OBJECT");
             }
             continue;
@@ -1870,6 +1873,7 @@ std::string attributes_xml(const object_meta& m, const attr_query& a, const part
             }
     if (a.parts && l)
     {
+        const checksum_algo algo = checksum_algo_of(m);
         x += "<ObjectParts><PartsCount>" + std::to_string(l->numbers.size()) + "</PartsCount>";
         x += "<PartNumberMarker>" + std::to_string(a.marker) + "</PartNumberMarker>";
         x += "<MaxParts>" + std::to_string(a.max_parts) + "</MaxParts>";
@@ -1888,7 +1892,9 @@ std::string attributes_xml(const object_meta& m, const attr_query& a, const part
             ++shown;
             last = l->numbers[i];
             rows += "<Part><PartNumber>" + std::to_string(l->numbers[i]) + "</PartNumber><Size>" +
-                    std::to_string(l->sizes[i]) + "</Size></Part>";
+                    std::to_string(l->sizes[i]) + "</Size>" +
+                    (i < l->checksums.size() ? checksum_element(algo, base64_encode(l->checksums[i])) : std::string{}) +
+                    "</Part>";
         }
         x += truncated ? "<IsTruncated>true</IsTruncated>" : "<IsTruncated>false</IsTruncated>";
         if (truncated)
@@ -2118,9 +2124,13 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
 
         uint64_t first = 0, len = m.size;
         bool ranged = false;
+        std::string part_checksum;
         if (part)
         {
-            const part_status ps = list ? part_range_in(*list, part, first, len) : part_range(m, part, first, len);
+            part_list own;
+            const part_status ps = list ? part_range_in(*list, part, first, len) : part_range(m, part, first, len, &own);
+            if (const part_list& pl = list ? *list : own; ps == part_status::ok && part <= pl.checksums.size())
+                part_checksum = base64_encode(pl.checksums[part - 1]);
             if (ps == part_status::in_trailer)
             {
                 // The answer is given again once the list is read, from the file whose list it is.
@@ -2182,7 +2192,8 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
             }
         }
 
-        object_headers(rq, m, r, ranged, m_store.bucket_versioning(rq.bucket) != versioning::off);
+        object_headers(rq, m, r, ranged, m_store.bucket_versioning(rq.bucket) != versioning::off,
+                       part ? &part_checksum : nullptr);
         if (!rq.has_query("versionId"))
             expiration_header(rq.bucket, rq.key, m, r.headers);
         if (ranged)
