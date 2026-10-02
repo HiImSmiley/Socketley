@@ -453,10 +453,10 @@ constexpr action_name action_names[] = {
 
     {"ListAllMyBuckets", res_kind::service, s3_action::none},
     {"GetObjectVersion", res_kind::object, s3_action::get_object_version},
-    {"GetObjectAcl", res_kind::object, s3_action::none},
-    {"PutObjectAcl", res_kind::object, s3_action::none},
-    {"GetObjectVersionAcl", res_kind::object, s3_action::none},
-    {"PutObjectVersionAcl", res_kind::object, s3_action::none},
+    {"GetObjectAcl", res_kind::object, s3_action::get_object_acl},
+    {"PutObjectAcl", res_kind::object, s3_action::put_object_acl},
+    {"GetObjectVersionAcl", res_kind::object, s3_action::get_object_version_acl},
+    {"PutObjectVersionAcl", res_kind::object, s3_action::put_object_version_acl},
     {"DeleteObjectVersion", res_kind::object, s3_action::delete_object_version},
     {"GetObjectVersionTagging", res_kind::object, s3_action::get_object_version_tagging},
     {"PutObjectVersionTagging", res_kind::object, s3_action::put_object_version_tagging},
@@ -475,8 +475,8 @@ constexpr action_name action_names[] = {
     {"ReplicateDelete", res_kind::object, s3_action::none},
     {"ReplicateTags", res_kind::object, s3_action::none},
     {"ListBucketVersions", res_kind::bucket, s3_action::list_bucket_versions},
-    {"GetBucketAcl", res_kind::bucket, s3_action::none},
-    {"PutBucketAcl", res_kind::bucket, s3_action::none},
+    {"GetBucketAcl", res_kind::bucket, s3_action::get_bucket_acl},
+    {"PutBucketAcl", res_kind::bucket, s3_action::put_bucket_acl},
     {"GetBucketVersioning", res_kind::bucket, s3_action::get_bucket_versioning},
     {"PutBucketVersioning", res_kind::bucket, s3_action::put_bucket_versioning},
     {"GetBucketTagging", res_kind::bucket, s3_action::none},
@@ -905,6 +905,10 @@ s3_action action_of_operation(std::string_view op)
         {"GetObject", s3_action::get_object},
         {"HeadObject", s3_action::get_object},
         {"GetObjectAttributes", s3_action::get_object_attributes},
+        {"GetBucketAcl", s3_action::get_bucket_acl},
+        {"PutBucketAcl", s3_action::put_bucket_acl},
+        {"GetObjectAcl", s3_action::get_object_acl},
+        {"PutObjectAcl", s3_action::put_object_acl},
         {"PutObject", s3_action::put_object},
         {"CopyObject", s3_action::put_object},
         {"UploadPart", s3_action::put_object},
@@ -967,6 +971,10 @@ bool action_on_object(s3_action a)
         case s3_action::delete_object_version_tagging:
         case s3_action::get_object_attributes:
         case s3_action::get_object_version_attributes:
+        case s3_action::get_object_acl:
+        case s3_action::put_object_acl:
+        case s3_action::get_object_version_acl:
+        case s3_action::put_object_version_acl:
             return true;
         default:
             return false;
@@ -983,6 +991,8 @@ s3_action version_action(s3_action a)
         case s3_action::put_object_tagging:    return s3_action::put_object_version_tagging;
         case s3_action::delete_object_tagging: return s3_action::delete_object_version_tagging;
         case s3_action::get_object_attributes: return s3_action::get_object_version_attributes;
+        case s3_action::get_object_acl:        return s3_action::get_object_version_acl;
+        case s3_action::put_object_acl:        return s3_action::put_object_version_acl;
         default:                               return a;
     }
 }

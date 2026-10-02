@@ -109,6 +109,8 @@ inline s3_error make_error(std::string_view code)
         {"PreconditionFailed", 412, "At least one of the pre-conditions you specified did not hold"},
         {"MethodNotAllowed", 405, "The specified method is not allowed against this resource."},
         {"NotImplemented", 501, "A header you provided implies functionality that is not implemented"},
+        {"AccessControlListNotSupported", 400, "The bucket does not allow ACLs"},
+        {"InvalidBucketAclWithObjectOwnership", 400, "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting"},
         {"AccessDenied", 403, "Access Denied"},
         {"AccessForbidden", 403, "CORSResponse: This CORS request is not allowed. This is usually because the evalution of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted by the resource's CORS spec."},
         {"NoSuchCORSConfiguration", 404, "The CORS configuration does not exist"},
@@ -192,6 +194,22 @@ inline std::string error_xml(const s3_error& e, const error_context& c)
 }
 
 inline std::string quoted_etag(const object_meta& m) { return "&quot;" + m.etag() + "&quot;"; }
+
+// The ACL of every bucket and object, which S3 gives each when ObjectOwnership is BucketOwnerEnforced.
+inline std::string owner_acl_xml(std::string_view owner)
+{
+    const std::string id = "<ID>" + xml_escape(owner) + "</ID><DisplayName>" + xml_escape(owner) + "</DisplayName>";
+    return std::string(xml_decl) + "<AccessControlPolicy xmlns=\"" + std::string(s3_xmlns) + "\"><Owner>" + id +
+           "</Owner><AccessControlList><Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" "
+           "xsi:type=\"CanonicalUser\">" + id + "</Grantee><Permission>FULL_CONTROL</Permission></Grant>"
+           "</AccessControlList></AccessControlPolicy>";
+}
+
+inline std::string ownership_controls_xml()
+{
+    return std::string(xml_decl) + "<OwnershipControls xmlns=\"" + std::string(s3_xmlns) +
+           "\"><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>";
+}
 
 // What a ListBuckets request asks for: the buckets after `after` whose names begin with `prefix`, `max` of them.
 struct bucket_page

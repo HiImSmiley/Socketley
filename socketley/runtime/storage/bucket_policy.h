@@ -59,6 +59,12 @@ enum class s3_action : uint8_t
     put_encryption_configuration,
     get_object_attributes,
     get_object_version_attributes,
+    get_bucket_acl,
+    put_bucket_acl,
+    get_object_acl,
+    put_object_acl,
+    get_object_version_acl,
+    put_object_version_acl,
     count,
 };
 static_assert(static_cast<int>(s3_action::count) <= 64);

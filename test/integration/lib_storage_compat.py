@@ -176,9 +176,15 @@ check("a Content-MD5 that is not base64 is InvalidDigest 400", st_ == 400 and b"
       (st_, body_[:200]))
 expect_err("a Range past the end is InvalidRange 416",
            lambda: s3.get_object(Bucket="err-bucket", Key="present", Range="bytes=10-"), "InvalidRange", 416)
-resp = expect_err("PutObjectAcl is NotImplemented 501",
-                  lambda: s3.put_object_acl(Bucket="err-bucket", Key="present", ACL="private"),
-                  "NotImplemented", 501)
+check("PutObjectAcl of the ACL every object has is taken",
+      err_of(lambda: s3.put_object_acl(Bucket="err-bucket", Key="present", ACL="private"))[0] is None)
+resp = expect_err("PutObjectAcl of any other is AccessControlListNotSupported 400, as with ACLs disabled",
+                  lambda: s3.put_object_acl(Bucket="err-bucket", Key="present", ACL="public-read"),
+                  "AccessControlListNotSupported", 400)
+expect_err("and so is a put that asks for one",
+           lambda: s3.put_object(Bucket="err-bucket", Key="acl-put", Body=b"x", ACL="public-read"),
+           "AccessControlListNotSupported", 400)
+expect_err("which stored nothing", lambda: s3.head_object(Bucket="err-bucket", Key="acl-put"), "404", 404)
 expect_err("GetBucketPolicy on a bucket without one is NoSuchBucketPolicy 404",
            lambda: s3.get_bucket_policy(Bucket="err-bucket"), "NoSuchBucketPolicy", 404)
 st_, hd_, body_ = raw("PUT", "/err-bucket/present", body=b"x", headers={"If-None-Match": "*"})

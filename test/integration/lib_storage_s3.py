@@ -399,7 +399,10 @@ check("the server answers after a client abandoned a download", request("GET", B
 
 # Unsupported operations are refused as such.
 r = request("GET", B + "plain.bin?acl")
-check("?acl is NotImplemented 501", r.status == 501 and r.code() == "NotImplemented", (r.status, r.body[:200]))
+check("?acl answers the owner's FULL_CONTROL, as a bucket whose ACLs are disabled does",
+      r.status == 200 and b"<Permission>FULL_CONTROL</Permission>" in r.body, (r.status, r.body[:200]))
+r = request("GET", B + "plain.bin?object-lock")
+check("?object-lock is NotImplemented 501", r.status == 501 and r.code() == "NotImplemented", (r.status, r.body[:200]))
 r = request("POST", B + "plain.bin?restore")
 check("POST ?restore is NotImplemented 501", r.status == 501, r.status)
 r = request("PUT", B + "chunkedsigned", body=b"x", headers={"x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"})

@@ -10,6 +10,7 @@
 #include "s3_cors.h"
 #include "s3_names.h"
 #include "s3_tagging.h"
+#include "s3_xml_tree.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
 #include "../../shared/logging.h"
@@ -52,9 +53,12 @@ bool unsupported_subresource(const s3_request& r, bool object)
         return true;
     for (const auto& q : r.query)
         for (std::string_view n : names)
-            // An object's tags and attributes are implemented, and a bucket's are not.
+            // An object's tags and attributes are implemented, and a bucket's are not; ACLs are read and set, as
+            // S3 does for a bucket whose ACLs are disabled, and a bucket's ownership controls are read.
             if (q.first == n && ((n != "tagging" && n != "attributes") || r.key.empty() ||
-                                 (n == "attributes" && r.method != "GET")))
+                                 (n == "attributes" && r.method != "GET")) &&
+                (n != "acl" || (r.method != "GET" && r.method != "PUT")) &&
+                (n != "ownershipControls" || !r.key.empty() || (r.method != "GET" && r.method != "PUT")))
                 return true;
     return false;
 }
@@ -238,17 +242,25 @@ void storage_run::route(const std::shared_ptr<conn>& c)
     const bool service = r.bucket.empty();
     const bool bucket_level = !service && r.key.empty();
 
+    // A write that asks for an ACL other than its owner's full control is refused, as S3 refuses it on a bucket
+    // whose ACLs are disabled, and never stored without it.
+    if (s3_error e; !r.has_query("acl") && !acl_headers_ok(r, bucket_level, e))
+    {
+        deny_request(c, e);
+        return;
+    }
+
     // A part's body streams into the upload like an object's into a file.
     const bool part_request = !service && !bucket_level && r.has_query("uploadId") && r.has_query("partNumber");
     if (r.method == "PUT" && part_request && !r.has_header("x-amz-copy-source") && !r.has_query("tagging") &&
-        !unsupported_subresource(r, true))
+        !r.has_query("acl") && !unsupported_subresource(r, true))
     {
         op_upload_part(c);
         return;
     }
 
     if (r.method == "PUT" && !service && !bucket_level && !r.has_header("x-amz-copy-source") &&
-        !r.has_query("tagging") && !unsupported_subresource(r, true))
+        !r.has_query("tagging") && !r.has_query("acl") && !unsupported_subresource(r, true))
     {
         op_put_object(c);
         return;
@@ -277,6 +289,19 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
             op_list_buckets(c);
         else
             send_error(c, make_error("MethodNotAllowed"));
+        return;
+    }
+    if (q.has_query("acl"))
+    {
+        if (m == "GET")
+            op_get_acl(c);
+        else
+            op_put_acl(c);
+        return;
+    }
+    if (bkt && q.has_query("ownershipControls"))
+    {
+        op_ownership_controls(c);
         return;
     }
     if (bkt && q.has_query("cors"))
@@ -502,6 +527,185 @@ void storage_run::op_delete_bucket(const std::shared_ptr<conn>& c)
         r.status = 204;
         send_response(cc, std::move(r));
     });
+}
+
+// ─── ACLs and ownership controls ────────────────────────────────────────────
+
+bool storage_run::acl_headers_ok(const s3_request& r, bool bucket, s3_error& err) const
+{
+    if (r.method != "PUT" && r.method != "POST")
+        return true;
+    const std::string grant = "id=\"" + owner_id() + "\"";
+    bool ok = true;
+    for (const auto& h : r.headers)
+    {
+        // The two canned ACLs that give the owner full control and nobody else anything, which every object has.
+        if (h.name == "x-amz-acl")
+            ok = ok && (h.value == "private" || h.value == "bucket-owner-full-control");
+        else if (h.name == "x-amz-grant-full-control")
+            ok = ok && http_trim_ows(h.value) == grant;
+        else if (h.name.starts_with("x-amz-grant-"))
+            ok = false;
+    }
+    if (!ok)
+        err = make_error(bucket && r.method == "PUT" ? "InvalidBucketAclWithObjectOwnership" : "AccessControlListNotSupported");
+    return ok;
+}
+
+void storage_run::op_get_acl(const std::shared_ptr<conn>& c)
+{
+    const s3_request& r = c->req;
+    if (!m_store.has_bucket(r.bucket))
+    {
+        send_error_st(c, st::no_such_bucket);
+        return;
+    }
+    auto answer = [this](const std::shared_ptr<conn>& cc, st s)
+    {
+        if (s != st::ok)
+        {
+            send_error_st(cc, s == st::delete_marker ? st::no_such_key : s);
+            return;
+        }
+        response resp;
+        resp.headers.emplace_back("Content-Type", "application/xml");
+        resp.body = owner_acl_xml(owner_id());
+        send_response(cc, std::move(resp));
+    };
+    if (r.key.empty())
+    {
+        answer(c, st::ok);
+        return;
+    }
+    // The object must be there, as S3 answers NoSuchKey for one that is not.
+    std::weak_ptr<conn> weak = c;
+    auto then = [weak, answer](st s, const object_meta& m)
+    {
+        if (auto cc = weak.lock(); cc && !cc->dead)
+            answer(cc, s == st::ok && is_delete_marker(m) ? st::no_such_key : s);
+    };
+    if (const std::string version(r.get_query("versionId")); !version.empty())
+        m_store.stat_version(r.bucket, r.key, version, std::move(then));
+    else if (m_store.owns(r.bucket, r.key))
+        answer(c, m_store.find(r.bucket, r.key) ? st::ok : st::no_such_key);
+    else
+        m_store.stat_foreign(r.bucket, r.key, std::move(then));
+}
+
+void storage_run::op_put_acl(const std::shared_ptr<conn>& c)
+{
+    const s3_request& r = c->req;
+    if (!m_store.has_bucket(r.bucket))
+    {
+        send_error_st(c, st::no_such_bucket);
+        return;
+    }
+    // An ACL is taken when it is the one the object has: by canned name or grant header, or as a document whose
+    // every grant is FULL_CONTROL to the owner.
+    s3_error err;
+    bool ok = acl_headers_ok(r, false, err);
+    if (ok && !c->body.empty())
+    {
+        xml_node root;
+        xml_reader reader(c->body);
+        if (!reader.document(root) || root.name != "AccessControlPolicy")
+        {
+            send_error(c, make_error("MalformedXML"));
+            return;
+        }
+        size_t grants = 0;
+        for (const xml_node& list : root.kids)
+            if (list.name == "AccessControlList")
+                for (const xml_node& g : list.kids)
+                {
+                    std::string id, permission;
+                    bool other = false;
+                    for (const xml_node& f : g.kids)
+                    {
+                        if (f.name == "Permission")
+                            permission = f.text;
+                        else if (f.name == "Grantee")
+                        {
+                            for (const xml_node& who : f.kids)
+                            {
+                                if (who.name == "ID")
+                                    id = who.text;
+                                else if (who.name != "DisplayName")
+                                    other = true;
+                            }
+                        }
+                    }
+                    ++grants;
+                    ok = ok && !other && id == owner_id() && permission == "FULL_CONTROL";
+                }
+        ok = ok && grants > 0;
+    }
+    if (!ok)
+    {
+        send_error(c, make_error("AccessControlListNotSupported"));
+        return;
+    }
+    auto done = [this](const std::shared_ptr<conn>& cc, st s)
+    {
+        if (s != st::ok)
+        {
+            send_error_st(cc, s == st::delete_marker ? st::no_such_key : s);
+            return;
+        }
+        send_response(cc, response{});
+    };
+    if (r.key.empty())
+    {
+        done(c, st::ok);
+        return;
+    }
+    std::weak_ptr<conn> weak = c;
+    auto then = [weak, done](st s, const object_meta& m)
+    {
+        if (auto cc = weak.lock(); cc && !cc->dead)
+            done(cc, s == st::ok && is_delete_marker(m) ? st::no_such_key : s);
+    };
+    if (m_store.owns(r.bucket, r.key))
+        done(c, m_store.find(r.bucket, r.key) ? st::ok : st::no_such_key);
+    else
+        m_store.stat_foreign(r.bucket, r.key, std::move(then));
+}
+
+void storage_run::op_ownership_controls(const std::shared_ptr<conn>& c)
+{
+    const s3_request& r = c->req;
+    if (!m_store.has_bucket(r.bucket))
+    {
+        send_error_st(c, st::no_such_bucket);
+        return;
+    }
+    if (r.method == "GET")
+    {
+        response resp;
+        resp.headers.emplace_back("Content-Type", "application/xml");
+        resp.body = ownership_controls_xml();
+        send_response(c, std::move(resp));
+        return;
+    }
+    // Every bucket is BucketOwnerEnforced, which may be set again, and an owner other than the bucket's is not had.
+    xml_node root;
+    xml_reader reader(c->body);
+    if (!reader.document(root) || root.name != "OwnershipControls")
+    {
+        send_error(c, make_error("MalformedXML"));
+        return;
+    }
+    bool enforced = false, other = false;
+    for (const xml_node& rule : root.kids)
+        for (const xml_node& f : rule.kids)
+            if (f.name == "ObjectOwnership")
+                (f.text == "BucketOwnerEnforced" ? enforced : other) = true;
+    if (!enforced || other)
+    {
+        send_error(c, make_error("NotImplemented"));
+        return;
+    }
+    send_response(c, response{});
 }
 
 void storage_run::op_head_bucket(const std::shared_ptr<conn>& c)

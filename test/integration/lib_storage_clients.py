@@ -293,10 +293,40 @@ def expiration_header():
     check("and nothing once the rules are gone", put != "" and exp(s3.get_object(Bucket="cl-exp", Key="tmp/a")) == "")
 
 
+# ─── ACLs, as S3 answers them on a bucket whose ACLs are disabled ───────────
+# rclone and s3fs send x-amz-acl: private by default; s3-tests' ACL tests sent public-read and it was dropped silently.
+def acls_disabled():
+    print("=== ACLs: the owner's full control, and nothing else ===")
+    s3.create_bucket(Bucket="cl-acl", ACL="private")
+    acl = s3.get_bucket_acl(Bucket="cl-acl")
+    check("GetBucketAcl answers one grant, FULL_CONTROL to the owner",
+          [g["Permission"] for g in acl["Grants"]] == ["FULL_CONTROL"] and acl["Grants"][0]["Grantee"]["ID"] == acl["Owner"]["ID"],
+          acl.get("Grants"))
+    check("a put with x-amz-acl: private is taken", code_of(lambda: s3.put_object(Bucket="cl-acl", Key="k", Body=b"x",
+                                                                                  ACL="private")) == (None, None))
+    check("GetObjectAcl of it says the same", s3.get_object_acl(Bucket="cl-acl", Key="k")["Grants"] == acl["Grants"])
+    check("GetObjectAcl of a missing key is NoSuchKey",
+          code_of(lambda: s3.get_object_acl(Bucket="cl-acl", Key="nope")) == ("NoSuchKey", 404))
+    check("a put asking for public-read is AccessControlListNotSupported, not stored private",
+          code_of(lambda: s3.put_object(Bucket="cl-acl", Key="pub", Body=b"x", ACL="public-read")) ==
+          ("AccessControlListNotSupported", 400) and code_of(lambda: s3.head_object(Bucket="cl-acl", Key="pub"))[1] == 404)
+    check("as is a grant to anyone else",
+          code_of(lambda: s3.put_object(Bucket="cl-acl", Key="pub", Body=b"x", GrantRead='uri="http://acs.amazonaws.com/groups/global/AllUsers"')) ==
+          ("AccessControlListNotSupported", 400))
+    check("CreateBucket with public-read is InvalidBucketAclWithObjectOwnership",
+          code_of(lambda: s3.create_bucket(Bucket="cl-acl-pub", ACL="public-read")) ==
+          ("InvalidBucketAclWithObjectOwnership", 400))
+    check("PutBucketAcl of private is taken, of public-read refused",
+          code_of(lambda: s3.put_bucket_acl(Bucket="cl-acl", ACL="private")) == (None, None) and
+          code_of(lambda: s3.put_bucket_acl(Bucket="cl-acl", ACL="public-read")) == ("AccessControlListNotSupported", 400))
+    own = s3.get_bucket_ownership_controls(Bucket="cl-acl")["OwnershipControls"]["Rules"]
+    check("and the ownership controls say BucketOwnerEnforced", own == [{"ObjectOwnership": "BucketOwnerEnforced"}], own)
+
+
 # A section that raises fails as one assertion and the next still runs, so a runtime without the feature reads red, not dead.
 for section in (delete_bucket_with_uploads, date_header, empty_content_md5, aws_chunked_coding, list_buckets_paged,
                 object_attributes, conditional_writes, completion_sent_twice, full_object_checksums,
-                expiration_header):
+                expiration_header, acls_disabled):
     try:
         section()
     except Exception as e:
