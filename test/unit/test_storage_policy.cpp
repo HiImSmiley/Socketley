@@ -284,3 +284,86 @@ TEST_CASE("a condition on the encryption is refused where it cannot be honoured 
         CHECK_FALSE(err.message.empty());
     }
 }
+
+namespace {
+
+bucket_policy identity(const std::string& json)
+{
+    bucket_policy p;
+    s3_error err;
+    const bool ok = bucket_policy::compile_identity(json, p, err);
+    INFO(err.message);
+    REQUIRE(ok);
+    return p;
+}
+
+policy_effect user_does(const bucket_policy& p, s3_action a, std::string_view bucket, std::string_view key = {},
+                        bool every_key = false)
+{
+    policy_request r;
+    r.action    = a;
+    r.bucket    = bucket;
+    r.key       = key;
+    r.principal = "AKIAUSER";
+    r.user      = "alice";
+    r.every_key = every_key;
+    return p.evaluate(r);
+}
+
+}   // namespace
+
+TEST_CASE("an identity policy names no principal and matches its resources against bucket and bucket/key as IAM does")
+{
+    s3_error err;
+    bucket_policy p;
+    CHECK_FALSE(bucket_policy::compile_identity(
+        R"({"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":"*","Action":"s3:*","Resource":"*"}})", p, err));
+    CHECK(err.message.find("principal") != std::string::npos);
+    CHECK_FALSE(bucket_policy::compile_identity(
+        R"({"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::${aws:username}/*"}})", p, err));
+    CHECK_FALSE(bucket_policy::compile_identity(
+        R"({"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:iam:::user/x"}})", p, err));
+
+    const bucket_policy all = identity(R"({"Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}})");
+    CHECK(user_does(all, s3_action::get_object, "any", "k") == policy_effect::allow);
+    CHECK(user_does(all, s3_action::delete_bucket, "any") == policy_effect::allow);
+
+    const bucket_policy logs = identity(R"({"Statement":[
+        {"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::logs-*","arn:aws:s3:::logs-*/2026/*"]},
+        {"Effect":"Deny","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::logs-a/keep/*"},
+        {"Effect":"Allow","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::logs-b/*"}]})");
+    CHECK(user_does(logs, s3_action::list_bucket, "logs-a") == policy_effect::allow);
+    CHECK(user_does(logs, s3_action::list_bucket, "other") == policy_effect::none);
+    CHECK(user_does(logs, s3_action::get_object, "logs-a", "2026/x") == policy_effect::allow);
+    CHECK(user_does(logs, s3_action::delete_object, "logs-a", "keep/x") == policy_effect::deny);
+    CHECK(user_does(logs, s3_action::delete_object, "logs-a", "other") == policy_effect::none);
+    // DeleteObjects names its keys in the body: a Deny over any key refuses it, and only an Allow over all lets it in.
+    CHECK(user_does(logs, s3_action::delete_object, "logs-a", {}, true) == policy_effect::deny);
+    CHECK(user_does(logs, s3_action::delete_object, "logs-b", {}, true) == policy_effect::allow);
+    CHECK(user_does(logs, s3_action::delete_object, "logs-c", {}, true) == policy_effect::none);
+
+    // '*' spans '/' as it does in IAM, so a pattern for buckets names their objects too, which is why
+    // "logs-*" lets the user read 2025/x though "logs-*/2026/*" would not.
+    const bucket_policy star = identity(R"({"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::logs-*"}})");
+    CHECK(user_does(star, s3_action::get_object, "logs-a", "any/key") == policy_effect::allow);
+    CHECK(user_does(star, s3_action::get_object, "other", "logs-a") == policy_effect::none);
+    CHECK(user_does(logs, s3_action::get_object, "logs-a", "2025/x") == policy_effect::allow);
+}
+
+TEST_CASE("a bucket policy's principal names a user by its id as well as by an access key")
+{
+    bucket_policy p;
+    s3_error err;
+    REQUIRE(bucket_policy::compile(R"({"Statement":[
+        {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/alice"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/a/*"},
+        {"Effect":"Allow","Principal":{"AWS":"AKIAUSER"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/b/*"}]})",
+                                   "pub", p, err));
+    CHECK(user_does(p, s3_action::get_object, "pub", "a/x") == policy_effect::allow);
+    CHECK(user_does(p, s3_action::get_object, "pub", "b/x") == policy_effect::allow);
+    policy_request bob;
+    bob.action    = s3_action::get_object;
+    bob.key       = "a/x";
+    bob.principal = "AKIABOB";
+    bob.user      = "bob";
+    CHECK(p.evaluate(bob) == policy_effect::none);
+}
