@@ -10,6 +10,7 @@
 #include <immintrin.h>
 #endif
 
+#include "digest.h"
 #include "../../shared/raft_storage.h"
 
 namespace socketley::storage
@@ -253,9 +254,9 @@ bool is_checksum_header(std::string_view h)
 checksum_stream::checksum_stream(checksum_algo a) : m_algo(a)
 {
     if (a == checksum_algo::sha1)
-        m_digest = std::make_unique<digest>(EVP_sha1());
+        m_digest = std::make_unique<digest>(fetched_sha1());
     else if (a == checksum_algo::sha256)
-        m_digest = std::make_unique<digest>(EVP_sha256());
+        m_digest = std::make_unique<digest>(fetched_sha256());
 }
 
 checksum_stream::~checksum_stream() = default;

@@ -98,8 +98,8 @@ class gcm
 public:
     gcm(const uint8_t* key, bool encrypt) : m_ctx(EVP_CIPHER_CTX_new()), m_encrypt(encrypt)
     {
-        m_ok = m_ctx && (encrypt ? EVP_EncryptInit_ex(m_ctx, EVP_aes_256_gcm(), nullptr, key, nullptr)
-                                 : EVP_DecryptInit_ex(m_ctx, EVP_aes_256_gcm(), nullptr, key, nullptr)) == 1;
+        m_ok = m_ctx && (encrypt ? EVP_EncryptInit_ex(m_ctx, fetched_aes_256_gcm(), nullptr, key, nullptr)
+                                 : EVP_DecryptInit_ex(m_ctx, fetched_aes_256_gcm(), nullptr, key, nullptr)) == 1;
     }
     ~gcm() { EVP_CIPHER_CTX_free(m_ctx); }
     gcm(const gcm&)            = delete;
@@ -327,7 +327,7 @@ sse_digest sse_layout::parts_digest() const
     l.numbers = m_stream;
     l.sizes   = m_len;
     const std::string bytes = encode_part_list(l, m_size);
-    digest_stream d(EVP_sha256());
+    digest_stream d(fetched_sha256());
     d.update(bytes.data(), bytes.size());
     return d.finish<32>();
 }
@@ -358,7 +358,7 @@ sse_key sse_random_key()
 
 std::array<uint8_t, 4> sse_key_id(const sse_key& master)
 {
-    digest_stream d(EVP_sha256());
+    digest_stream d(fetched_sha256());
     static constexpr std::string_view label = "socketley-sse-kid";
     d.update(label.data(), label.size());
     d.update(master.data(), master.size());
@@ -480,7 +480,7 @@ bool sse_open(const sse_key& key, uint8_t version, const sse_layout::chunk* chun
 
 md5_t sse_opaque_etag(const sse_key& data, const md5_t& md5)
 {
-    digest_stream d(EVP_sha256());
+    digest_stream d(fetched_sha256());
     static constexpr std::string_view label = "socketley-sse-etag";
     d.update(label.data(), label.size());
     d.update(data.data(), data.size());

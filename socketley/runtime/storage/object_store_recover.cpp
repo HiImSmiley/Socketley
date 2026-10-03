@@ -231,8 +231,7 @@ enum class file_verdict : uint8_t { skip, unsound, ok, failed };
 // What a thread of the walk keeps from file to file: the digest files are named by, and whose keys it looks at.
 struct walker
 {
-    // Fetched once, since EVP_sha256() looks the digest up behind a lock on every call.
-    EVP_MD*          md{EVP_MD_fetch(nullptr, "SHA256", nullptr)};
+    const EVP_MD*    md{fetched_sha256()};
     EVP_MD_CTX*      ctx{EVP_MD_CTX_new()};
     std::string_view bucket;
     uint32_t         shard{0};
@@ -246,7 +245,6 @@ struct walker
     ~walker()
     {
         EVP_MD_CTX_free(ctx);
-        EVP_MD_free(md);
     }
 
     // Whether `name` is the hash of `key`, the one name a file of that key may have.

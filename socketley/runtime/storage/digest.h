@@ -11,6 +11,29 @@
 namespace socketley::storage
 {
 
+// The algorithms looked up once for the process, since libcrypto looks EVP_sha256() and the like up behind a lock at
+// every init they are given to.
+inline const EVP_MD* fetched_md5()
+{
+    static EVP_MD* const md = EVP_MD_fetch(nullptr, "MD5", nullptr);
+    return md;
+}
+inline const EVP_MD* fetched_sha1()
+{
+    static EVP_MD* const md = EVP_MD_fetch(nullptr, "SHA1", nullptr);
+    return md;
+}
+inline const EVP_MD* fetched_sha256()
+{
+    static EVP_MD* const md = EVP_MD_fetch(nullptr, "SHA256", nullptr);
+    return md;
+}
+inline const EVP_CIPHER* fetched_aes_256_gcm()
+{
+    static EVP_CIPHER* const c = EVP_CIPHER_fetch(nullptr, "AES-256-GCM", nullptr);
+    return c;
+}
+
 class digest_stream
 {
 public:
@@ -66,7 +89,7 @@ using md5_t = std::array<uint8_t, 16>;
 class md5_stream : public digest_stream
 {
 public:
-    md5_stream() : digest_stream(EVP_md5()) {}
+    md5_stream() : digest_stream(fetched_md5()) {}
     md5_t finish() { return digest_stream::finish<16>(); }
     md5_t peek() const { return digest_stream::peek<16>(); }
 };
@@ -90,7 +113,7 @@ inline std::string sha256_hex(std::string_view s)
 {
     uint8_t  out[EVP_MAX_MD_SIZE];
     unsigned len = 0;
-    EVP_Digest(s.data(), s.size(), out, &len, EVP_sha256(), nullptr);
+    EVP_Digest(s.data(), s.size(), out, &len, fetched_sha256(), nullptr);
     return hex(out, len);
 }
 

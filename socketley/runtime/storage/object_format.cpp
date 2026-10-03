@@ -772,7 +772,7 @@ bool decode_part_trailer(std::string_view bytes, const object_meta& m, const par
     const std::string_view magic = t.width ? part_list_sums_magic : part_list_magic;
     if (bytes.size() != t.len || bytes.substr(0, magic.size()) != magic)
         return false;
-    digest_stream d(EVP_sha256());
+    digest_stream d(fetched_sha256());
     d.update(bytes.data(), bytes.size());
     if (d.finish<32>() != t.digest)
         return false;
@@ -825,7 +825,7 @@ std::string record_part_list(object_meta& m, const part_list& l, uint64_t body_s
         return {};
     }
     std::string bytes = encode_part_list(l, m.size);
-    digest_stream d(EVP_sha256());
+    digest_stream d(fetched_sha256());
     d.update(bytes.data(), bytes.size());
     const auto h = d.finish<32>();
     std::string layout = std::to_string(body_stored) + ";" + hex(h.data(), h.size());
