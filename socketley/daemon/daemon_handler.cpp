@@ -1272,6 +1272,7 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("daemon-cluster"): return cmd_daemon_cluster(conn, pa);
         case fnv1a("dashboard"):     return cmd_dashboard(conn);
         case fnv1a("ping"):          return cmd_ping(conn);
+        case fnv1a("startup"):       return cmd_startup(conn, pa);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
             return 1;
@@ -2366,6 +2367,45 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
 // The one command whose answer is the daemon itself, leading with a literal no
 // other program produces by accident and carrying the version and pid, cheap
 // enough to run ahead of every CLI command.
+int daemon_handler::cmd_startup(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count < 2 || !conn)
+        return 1;
+    const std::string name(pa.args[1]);
+    std::string out;
+    const int rc = await_worker_startup(name, out, std::chrono::steady_clock::now());
+    if (rc != 2)
+    {
+        conn->write_buf = std::move(out);
+        return rc;
+    }
+    // Still starting: the CPU its workers have used, which grows while one reads its files and not while one is wedged.
+    uint64_t ticks = 0;
+    if (auto it = m_proxy_workers.find(name); it != m_proxy_workers.end())
+        for (const auto& sup : it->second)
+            if (sup->pid() > 0)
+            {
+                std::ifstream f("/proc/" + std::to_string(sup->pid()) + "/stat");
+                std::string line;
+                std::getline(f, line);
+                // utime and stime are the 14th and 15th fields, counted after the command's closing parenthesis.
+                if (const size_t at = line.rfind(')'); at != std::string::npos)
+                {
+                    std::istringstream rest(line.substr(at + 2));
+                    std::string field;
+                    uint64_t utime = 0, stime = 0;
+                    for (int i = 3; i <= 15 && rest >> field; ++i)
+                        if (i == 14)
+                            utime = std::strtoull(field.c_str(), nullptr, 10);
+                        else if (i == 15)
+                            stime = std::strtoull(field.c_str(), nullptr, 10);
+                    ticks += utime + stime;
+                }
+            }
+    conn->write_buf = "starting " + std::to_string(ticks) + "\n";
+    return 2;
+}
+
 int daemon_handler::cmd_ping(ipc_connection* conn)
 {
     if (!conn)

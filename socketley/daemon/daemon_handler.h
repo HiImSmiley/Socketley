@@ -206,6 +206,9 @@ private:
     // "something accepted my connection" stops being read as "a daemon is
     // here".
     int cmd_ping(ipc_connection* conn);
+    // Whether a runtime a command left starting is serving yet, without waiting: what the CLI asks while a worker
+    // reads its files for longer than a command waits.
+    int cmd_startup(ipc_connection* conn, const parsed_args& pa);
 
     // Bring cluster discovery up under NAME in DIR, leaving nothing running on
     // failure and m_cluster_error saying why in the operator's words.

@@ -641,7 +641,15 @@ its configuration, and carries the reason if the script's
 raised. One budget of two seconds is spent for the whole command, not one per
 runtime: the children are forked together and come up concurrently, so a
 .B start
-of twenty costs about the same wait as a start of one.
+of twenty costs about the same wait as a start of one. A child still starting
+after that, such as a storage runtime reading a large store's files after a
+crash, is waited for by the CLI rather than the daemon, which stays free: the CLI
+asks the daemon whether it serves yet five times a second, for as long as its
+workers keep using CPU, and answers 2 once they have used none for 15 seconds.
+.BR create " \-s"
+and
+.B restart
+wait the same way.
 .TP
 .BI "stop " "name|pattern" "..."
 Stop one or more running runtimes. Accepts multiple names, glob patterns
@@ -13035,6 +13043,18 @@ in\-flight work has finished and before it lets go of its directory, multiplied 
 the shard's number plus one, so a test can start a runtime beside shards that are
 still stopping. Unset, a stop waits for nothing but its own work. It slows every
 stop and restart, so it is never for a runtime in use.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_STORAGE_START_SPIN_MS
+A test aid: milliseconds, 0 to 30000, that a storage shard's start works through
+before it opens its store, using CPU as one reading a large store's files does.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_STORAGE_START_SLEEP_MS
+A test aid: milliseconds, 0 to 60000, that a storage shard's start waits doing
+nothing before it opens its store, as a wedged start would.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

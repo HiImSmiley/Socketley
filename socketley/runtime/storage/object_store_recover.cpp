@@ -588,6 +588,19 @@ bool object_store::open(std::string& err, recovery_report* report)
     recovery_report rep;
     std::error_code ec;
 
+    // A test aid: a start that works this long, as one reading a large store's files does.
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_START_SPIN_MS"))
+    {
+        const auto until = std::chrono::steady_clock::now() +
+                           std::chrono::milliseconds(std::clamp(std::strtol(e, nullptr, 10), 0L, 30000L));
+        volatile uint64_t spin = 0;
+        while (std::chrono::steady_clock::now() < until)
+            spin = spin + 1;
+    }
+    // And one that waits this long doing nothing, as a wedged start does.
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_START_SLEEP_MS"))
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::clamp(std::strtol(e, nullptr, 10), 0L, 60000L)));
+
     fs::create_directories(m_opts.dir, ec);
     if (ec)
     {

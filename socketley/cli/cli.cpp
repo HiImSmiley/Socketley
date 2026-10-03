@@ -24,6 +24,7 @@
 #include "../shared/paths.h"
 #include <algorithm>
 #include <filesystem>
+#include <chrono>
 
 // Has this tree been rebuilt under a running daemon, decided on the inode
 // because two builds a minute apart carry the same version, and reported only
@@ -172,6 +173,8 @@ static bool ensure_daemon(char* /*argv0*/)
     std::cerr << "failed to start daemon\n";
     return false;
 }
+
+static int settle_startup(int rc, std::string& data);
 
 int cli_dispatch(int argc, char** argv)
 {
@@ -645,6 +648,7 @@ int cli_dispatch(int argc, char** argv)
             {
                 return ipc_report_failure(rc);
             }
+            rc = settle_startup(rc, start_data);
             if (!start_data.empty())
                 std::cout << start_data;
             return rc;
@@ -725,6 +729,66 @@ std::string cli_caller_path(std::string_view flag, std::string_view value)
     return std::string(prefix) + abs.lexically_normal().string();
 }
 
+// A runtime a start left starting past the daemon's two seconds, as await_worker_startup() says it, is waited for
+// here, where waiting holds no daemon: while its workers use CPU, reading their files, and until 15 s pass without.
+static int settle_startup(int rc, std::string& data)
+{
+    static constexpr std::string_view tail = " did not report back within 2s of starting";
+    if (rc != 1 && rc != 2)
+        return rc;
+    std::vector<std::string> names;
+    std::string kept;
+    std::istringstream lines(data);
+    for (std::string line; std::getline(lines, line);)
+    {
+        const size_t at = line.find(tail);
+        if (line.starts_with("runtime ") && at != std::string::npos)
+            names.push_back(line.substr(8, at - 8));
+        else
+            kept += line + "\n";
+    }
+    if (names.empty())
+        return rc;
+    // What else the command said is a failure of its own, which a runtime that comes up does not undo.
+    int worst = kept.empty() ? 0 : 1;
+    std::string said = kept;
+    for (const std::string& name : names)
+    {
+        uint64_t last = UINT64_MAX;
+        auto moved = std::chrono::steady_clock::now();
+        for (;;)
+        {
+            std::string got;
+            const int r = ipc_send("startup " + name, got);
+            if (r == 0 || r == 1 || r < 0)
+            {
+                if (r == 1)
+                    said += got;
+                worst = r < 0 ? 2 : std::max(worst, r);
+                break;
+            }
+            const uint64_t ticks = got.starts_with("starting ") ? std::strtoull(got.c_str() + 9, nullptr, 10) : 0;
+            const auto now = std::chrono::steady_clock::now();
+            if (ticks != last)
+            {
+                last  = ticks;
+                moved = now;
+            }
+            else if (now - moved > std::chrono::seconds(15))
+            {
+                said += "runtime " + name + std::string(tail) +
+                        " and has used no CPU for 15s; it is still being supervised -- check `socketley ls` for what "
+                        "it settled on\n";
+                worst = 2;
+                break;
+            }
+            ::usleep(200 * 1000);
+        }
+    }
+    data = std::move(said);
+    return worst;
+}
+
 int cli_forward(int argc, char** argv)
 {
     const std::string_view verb = argc > 1 ? argv[1] : "";
@@ -744,6 +808,8 @@ int cli_forward(int argc, char** argv)
 
     if (exit_code < 0)
         return ipc_report_failure(exit_code);
+    if (verb == "start" || verb == "create")
+        exit_code = settle_startup(exit_code, data);
 
     if (!data.empty())
         std::cout << data;
