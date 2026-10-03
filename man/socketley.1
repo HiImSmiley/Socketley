@@ -6691,6 +6691,14 @@ DeleteBucketWebsite	DELETE /bucket?website	T{
 .ad l
 204 whether or not there was one.
 T}
+GetSessionToken	POST / Action=GetSessionToken	T{
+.ad l
+STS's: temporary credentials for the signing user, DurationSeconds 900 to 129600 (43200). See \fBTemporary credentials\fR below.
+T}
+AssumeRole	POST / Action=AssumeRole	T{
+.ad l
+STS's: the same, DurationSeconds 900 to 43200 (3600), any RoleArn, and a Policy that bounds the session.
+T}
 .TE
 .PP
 ACLs are those of a bucket whose ACLs are disabled, which S3 makes the default
@@ -6987,6 +6995,48 @@ on the name. The bucket policy's own operations stay open to the owner and admin
 whatever the policy says, and so do what no action names (ownership controls and the
 operations answered NotImplemented); another user needs an Allow for the former and
 is refused the latter.
+.SS Temporary credentials
+A user may ask the endpoint itself for temporary credentials, as of STS, with
+any STS client pointed at the runtime's URL:
+.RS
+.PP
+.nf
+POST / HTTP/1.1
+Content\-Type: application/x\-www\-form\-urlencoded
+
+Action=AssumeRole&Version=2011\-06\-15&DurationSeconds=3600
+    &RoleArn=arn:aws:iam::000000000000:role/reader&RoleSessionName=ci
+    &Policy=<an identity policy, URL\-encoded>
+.fi
+.RE
+.PP
+The answer is an access key starting
+.BR ASIA ,
+a secret and a session token, which sign as the user whose key asked for them,
+with the token in
+.B x\-amz\-security\-token
+or a presigned URL's
+.BR X\-Amz\-Security\-Token .
+The token carries the user's key, the expiry and the session policy, sealed with
+that key's secret, from which the session's secret is derived too: nothing is kept,
+so every shard and every restart takes it, and it ends at its expiry
+.RB ( "400 ExpiredToken" ),
+or as soon as the key is gone from the credentials file
+.RB ( "400 InvalidToken" ).
+The request is a form posted to
+.BR / ,
+signed for the service
+.B sts
+or
+.BR s3 ;
+temporary credentials cannot ask for more, and a runtime without keys gives none.
+AssumeRole takes any RoleArn, since the runtime has no roles: the session is the
+user's, bounded by its
+.B Policy
+(an identity policy's grammar, at most 2048 bytes), which only narrows it:
+what the policy does not allow is refused even to an admin or a bucket's owner,
+the bucket policy's operations included. A browser's form upload is not signed with
+temporary credentials.
 .SS CORS
 A bucket's CORS rules let a page served from another origin use it from a
 browser: read objects, and upload with a presigned URL. They are set with
