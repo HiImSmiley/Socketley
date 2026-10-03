@@ -80,6 +80,14 @@ public:
     void set_replication_targets(std::string_view f) { m_replication_targets = std::string(f); }
     std::string_view get_replication_targets() const { return m_replication_targets; }
 
+    // When an answered write is synced: always before its answer (empty), within --fsync-interval after it, or never
+    // before a stop.
+    void set_fsync(std::string_view m) { m_fsync = std::string(m); }
+    std::string_view get_fsync() const { return m_fsync; }
+    // The interval of --fsync interval, 0 for its default of a second.
+    void set_fsync_interval_secs(uint32_t s) { m_fsync_interval_secs = s; }
+    uint32_t get_fsync_interval_secs() const { return m_fsync_interval_secs; }
+
     // What decides whether a request may go on.  Given, it is used instead of
     // the anonymous default; the SigV4 authenticator arrives here.
     void set_authenticator(std::unique_ptr<socketley::storage::authenticator> a);
@@ -132,6 +140,8 @@ private:
     std::string m_domain;
     std::string m_notify_targets;
     std::string m_replication_targets;
+    std::string m_fsync;
+    uint32_t    m_fsync_interval_secs{0};
     uint32_t    m_mpu_expire_secs{0};
     std::unique_ptr<socketley::storage::authenticator> m_auth;
     std::unique_ptr<socketley::storage::anonymous_authenticator> m_anon;

@@ -602,7 +602,7 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
             d(0);
             return true;
         }
-        return io->fsync(*s->sync_fd, false, std::move(d));
+        return io->sync(*s->sync_fd, false, std::move(d));
     });
     ch->then([io, s](file_io::done d)
     {
@@ -622,14 +622,14 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
     {
         return io->pwrite(*s->file_fd, s->header.data(), static_cast<uint32_t>(s->header.size()), 0, std::move(d));
     });
-    ch->then([io, s](file_io::done d) { return io->fsync(*s->file_fd, true, std::move(d)); });
+    ch->then([io, s](file_io::done d) { return io->sync(*s->file_fd, true, std::move(d)); });
     // The file the parts are written into where the object will hold them, empty until they are.
     ch->then([io, s](file_io::done d)
     {
         return io->openat(*s->dir_fd, "data", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600,
                           [s, d](int64_t r) { if (r >= 0) *s->data_fd = static_cast<int>(r); d(r < 0 ? r : 0); });
     });
-    ch->then([io, s](file_io::done d) { return io->fsync(*s->dir_fd, false, std::move(d)); });
+    ch->then([io, s](file_io::done d) { return io->sync(*s->dir_fd, false, std::move(d)); });
     // The upload's own directory is an entry of the bucket's, which the id must survive.
     ch->then([io, s](file_io::done d)
     {
@@ -645,7 +645,7 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
                               d(r < 0 ? r : 0);
                           });
     });
-    ch->then([io, s](file_io::done d) { return io->fsync(*s->sync_fd, false, std::move(d)); });
+    ch->then([io, s](file_io::done d) { return io->sync(*s->sync_fd, false, std::move(d)); });
 
     ch->run([this, alive = m_alive, s](int64_t r)
     {
@@ -837,7 +837,7 @@ void multipart_store::run_part_commit(std::shared_ptr<part_commit> pc)
             d(-ENOENT);
             return true;
         }
-        return m_io->fsync(u->dir_fd, false, std::move(d));
+        return m_io->sync(u->dir_fd, false, std::move(d));
     });
     ch->run([this, alive = m_alive, pc, renamed](int64_t r)
     {
@@ -1252,7 +1252,7 @@ void multipart_store::assemble(std::shared_ptr<assemble_state> a)
         return io->pwrite(*fd, list->data(), static_cast<uint32_t>(list->size()), end,
                           [d, want](int64_t r) { d(r == want ? 0 : r < 0 ? r : -EIO); });
     });
-    ch->then([io, fd](file_io::done d) { return io->fsync(*fd, true, std::move(d)); });
+    ch->then([io, fd](file_io::done d) { return io->sync(*fd, true, std::move(d)); });
     ch->then([io, data, a, linking](file_io::done d)
     {
         *linking = true;
@@ -1491,7 +1491,7 @@ void multipart_store::assemble_finish(const std::shared_ptr<assemble_state>& a)
             assemble_fail(a, st::io_error);
         return;
     }
-    const bool q = m_io->fsync(*a->dst, true, [this, alive = m_alive, a](int64_t r)
+    const bool q = m_io->sync(*a->dst, true, [this, alive = m_alive, a](int64_t r)
     {
         if (!*alive)
             return;

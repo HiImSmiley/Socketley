@@ -88,6 +88,8 @@ std::string storage_instance::config_refusal() const
     if (std::vector<std::string> d; !m_domain.empty())
         if (std::string why; !socketley::storage::parse_domains(m_domain, d, why))
             return "storage: " + why + "\n";
+    if (socketley::storage::sync_mode m; !m_fsync.empty() && !socketley::storage::parse_sync_mode(m_fsync, m))
+        return "storage: --fsync is always, interval or never, not " + m_fsync + "\n";
     if (!m_notify_targets.empty())
     {
         std::vector<socketley::storage::notify_target> targets;
@@ -234,6 +236,12 @@ bool storage_instance::setup(event_loop& loop)
     opts.shard     = get_shard_index();
     opts.nshards   = std::max<uint32_t>(get_shards(), 1);
     opts.max_bytes = m_max_bytes;
+    if (!m_fsync.empty() && !socketley::storage::parse_sync_mode(m_fsync, opts.sync))
+    {
+        LOG_ERROR(("storage: --fsync is always, interval or never, not " + m_fsync).c_str());
+        return false;
+    }
+    opts.sync_interval_ms = (m_fsync_interval_secs ? m_fsync_interval_secs : 1) * 1000;
 
     auto run = std::make_unique<storage_run>(*this, loop, opts, auth);
     if (signed_auth)
@@ -435,7 +443,10 @@ std::string storage_instance::stats_lines() const
         << "journal_compactions:" << t.compactions << "\n"
         << "tag_writes:" << t.tag_writes << "\n"
         << "tag_rewrites:" << t.tag_rewrites << "\n"
-        << "fsyncs:" << t.fsyncs << "\n"
+        << "fsyncs:" << m_run->io().syncs() << "\n"
+        << "fsyncs_skipped:" << m_run->io().skipped_syncs() << "\n"
+        << "syncfs_rounds:" << m_run->store().syncfs_rounds() << "\n"
+        << "syncfs_failed:" << m_run->store().syncfs_failed() << "\n"
         << "start_files_read:" << t.start_files_read << "\n"
         << "pool_ready:" << t.pool_ready << "\n"
         << "timeouts:" << c.timeouts << "\n"

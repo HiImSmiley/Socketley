@@ -130,6 +130,8 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
     // Uploads are each on the shard that owns their key; a bucket is dropped only
     // when no shard is at work on one, and the idle ones are aborted with it, as in S3.
     m_node.set_multipart(&m_mpu);
+    // --fsync interval and never answer a write without the syncs only a crash of the machine needs.
+    m_io.set_relaxed(m_store.options().sync != sync_mode::always);
     m_store.set_drop_guard([this](std::string_view bucket) { return m_mpu.bucket_uploads_busy(bucket); });
     m_store.set_forget_listener([this](const std::string& bucket) { m_mpu.drop_bucket(bucket); });
     m_store.set_lifecycle_listener([this]() { lifecycle_changed(); });

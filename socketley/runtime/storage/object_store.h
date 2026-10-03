@@ -31,14 +31,18 @@
 // the file, its rename and its directory, and never for the journal, which is
 // written behind it and synced in a group.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -46,6 +50,7 @@
 #include "checksum.h"
 #include "object_format.h"
 #include "sse.h"
+#include "sync_mode.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/file_io.h"
 #include "../../shared/cache_shard_map.h"
@@ -286,6 +291,8 @@ struct store_options
     // A journal is rewritten once it holds this many records more than the
     // live objects need, and no sooner than the floor below.
     uint64_t    compact_floor{4096};
+    sync_mode   sync{sync_mode::always};
+    uint32_t    sync_interval_ms{1000};
 };
 
 // How long a stop lets the store's writes finish before it gives up on a clean marker, inside the daemon's two-second startup bound together with the wait below.
@@ -884,6 +891,9 @@ public:
                      std::function<void(open_result)> cb);
 
     store_totals totals() const;
+    // The filesystem syncs --fsync interval made, and those that failed.
+    uint64_t syncfs_rounds() const { return m_syncfs_rounds.load(std::memory_order_relaxed); }
+    uint64_t syncfs_failed() const { return m_syncfs_failed.load(std::memory_order_relaxed); }
     const store_options& options() const { return m_opts; }
 
     // The quota may move under a serving store; what is held stays held.
@@ -1247,6 +1257,16 @@ private:
     bool     m_sync_lost{false};
     // Descriptors held by every bucket's pool.
     uint32_t m_pool_fds{0};
+
+    // The thread --fsync interval syncs the store's filesystem on, and the rounds it made and failed.
+    std::thread             m_syncer;
+    std::mutex              m_syncer_mx;
+    std::condition_variable m_syncer_cv;
+    bool                    m_syncer_stop{false};
+    std::atomic<uint64_t>   m_syncfs_rounds{0};
+    std::atomic<uint64_t>   m_syncfs_failed{0};
+    void start_syncer();
+    void stop_syncer();
 };
 
 }   // namespace socketley::storage

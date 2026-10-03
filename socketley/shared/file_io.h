@@ -40,6 +40,14 @@ public:
     bool renameat(int olddirfd, std::string oldpath, int newdirfd, std::string newpath, done cb);
     bool linkat(int olddirfd, std::string oldpath, int newdirfd, std::string newpath, done cb);
     bool fsync(int fd, bool datasync, done cb);
+    // The same for a sync that only makes an answered write survive a crash of the machine, which a runtime that
+    // traded that away makes a no-op with set_relaxed(); a crash of the process loses nothing either way.
+    bool sync(int fd, bool datasync, done cb);
+    void set_relaxed(bool relaxed) { m_relaxed = relaxed; }
+    bool relaxed() const { return m_relaxed; }
+    // The syncs that ran and succeeded, and those set_relaxed() skipped.
+    uint64_t syncs() const { return m_syncs; }
+    uint64_t skipped_syncs() const { return m_skipped; }
 
     // One read, short at the end of the file, and the whole of the range or an
     // error for the write, which is continued across a short count.
@@ -73,6 +81,9 @@ private:
     event_loop*         m_loop;
     io_handler*         m_owner;
     std::unordered_set<op*> m_live;
+    bool                m_relaxed{false};
+    uint64_t            m_syncs{0};
+    uint64_t            m_skipped{0};
 };
 
 }   // namespace socketley

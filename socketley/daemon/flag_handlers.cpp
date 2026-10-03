@@ -16,6 +16,7 @@
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/storage/s3_vhost.h"
+#include "../runtime/storage/sync_mode.h"
 
 // Five flags that describe inbound traffic are refused on a client, which
 // accepts none, because they were stored and reported by `show` while no code
@@ -1318,6 +1319,31 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
                 return 1;
             }
             stg->set_domain(pa.args[++i]);
+            return 0;
+        }
+        // When an answered write reaches the disk: before its answer, within --fsync-interval after it, or at a stop.
+        case fnv1a("--fsync"):
+        {
+            socketley::storage::sync_mode m;
+            if (i + 1 >= pa.count || !socketley::storage::parse_sync_mode(pa.args[i + 1], m))
+            {
+                std::cout << "--fsync requires always, interval or never\n";
+                return 1;
+            }
+            stg->set_fsync(pa.args[++i]);
+            return 0;
+        }
+        case fnv1a("--fsync-interval"):
+        {
+            uint64_t secs = 0;
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            if (parse_duration_seconds(v, 3600, secs) != duration_parse::ok || secs == 0)
+            {
+                std::cout << "--fsync-interval requires a duration from 1s to 1h\n";
+                return 1;
+            }
+            ++i;
+            stg->set_fsync_interval_secs(static_cast<uint32_t>(secs));
             return 0;
         }
         // The webhooks event notifications go to, a file of `name url` lines read at every start.

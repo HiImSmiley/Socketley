@@ -566,7 +566,7 @@ void object_store::sync_pool_round(const std::string& bucket_name)
             c(r >= 0);
         sync_pool_round(bucket_name);
     };
-    if (!m_io->fsync(b->pool_fd, false, [this, alive, end](int64_t r)
+    if (!m_io->sync(b->pool_fd, false, [this, alive, end](int64_t r)
         {
             if (*alive)
                 ++m_totals.fsyncs;
@@ -852,7 +852,7 @@ void object_store::journal_kick(bucket& b)
             bp->j.writing     = false;
             journal_kick(*bp);
         };
-        if (!m_io->fsync(b.j.fd, true, done))
+        if (!m_io->sync(b.j.fd, true, done))
             done(-EIO);
         return;
     }
@@ -1404,7 +1404,7 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
         }
         // The body's sync runs beside the event's, and the commit goes on once the body is durable.
         const int fd = rq.body_fd;
-        if (!m_io->fsync(fd, true, [this, c, restamp, fd](int64_t r)
+        if (!m_io->sync(fd, true, [this, c, restamp, fd](int64_t r)
             {
                 if (!*c->alive)
                     return;
@@ -1523,7 +1523,7 @@ void object_store::commit_staged(const commit_ptr& c, bool restamp)
                 }
                 // The rename is in the directory now and durable once the
                 // directory is synced; only then may the journal say so.
-                const bool q2 = m_io->fsync(leaf, false, [this, c, leaf](int64_t r2)
+                const bool q2 = m_io->sync(leaf, false, [this, c, leaf](int64_t r2)
                 {
                     if (!*c->alive)
                         return;
@@ -1622,7 +1622,7 @@ void object_store::commit_pooled(bucket& b, const commit_ptr& c, int leaf)
         }
         commit_release(*c, true);
     };
-    if (!m_io->fsync(leaf, false, [this, c, leaf, part](int64_t r)
+    if (!m_io->sync(leaf, false, [this, c, leaf, part](int64_t r)
         {
             if (!*c->alive)
                 return;
@@ -1850,7 +1850,7 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
                             return;
                         }
                         const int fd = static_cast<int>(dfd);
-                        const bool q3 = m_io->fsync(fd, false,
+                        const bool q3 = m_io->sync(fd, false,
                             [this, rm, done, journal_it, fd](int64_t r3)
                             {
                                 if (!*rm->alive)
@@ -2107,7 +2107,7 @@ void object_store::tags_in_place(std::shared_ptr<tag_change> tc, std::string slo
                 tags_written(tc, r < 0 ? errno_status(r) : st::io_error, false);
                 return;
             }
-            const bool q2 = m_io->fsync(tc->fd, true, [this, tc](int64_t r2)
+            const bool q2 = m_io->sync(tc->fd, true, [this, tc](int64_t r2)
             {
                 if (!*tc->alive)
                     return;
@@ -2171,7 +2171,7 @@ void object_store::tags_rewrite(std::shared_ptr<tag_change> tc, uint64_t data_of
             return m_io->pwrite(*dst, buf.get(), n, at, [buf, n, d](int64_t r) { d(r == n ? 0 : r < 0 ? r : -EIO); });
         });
     }
-    ch->then([this, dst](file_io::done d) { return m_io->fsync(*dst, true, std::move(d)); });
+    ch->then([this, dst](file_io::done d) { return m_io->sync(*dst, true, std::move(d)); });
     ch->then([this, tmp_dir, tmp, data_dir, rel = tc->rel, renamed](file_io::done d)
     {
         return m_io->renameat(tmp_dir, tmp, data_dir, rel, [renamed, d](int64_t r)
@@ -2189,7 +2189,7 @@ void object_store::tags_rewrite(std::shared_ptr<tag_change> tc, uint64_t data_of
             d(r);
         });
     });
-    ch->then([this, leaf](file_io::done d) { return m_io->fsync(*leaf, false, std::move(d)); });
+    ch->then([this, leaf](file_io::done d) { return m_io->sync(*leaf, false, std::move(d)); });
     ch->run([this, tc, tmp, dst, leaf, renamed](int64_t r)
     {
         for (int* fd : {dst.get(), leaf.get()})
@@ -2587,7 +2587,7 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
                         }
                         if (cs->copied >= cs->meta.size)
                         {
-                            const bool qs = m_io->fsync(cs->dst_fd, true,
+                            const bool qs = m_io->sync(cs->dst_fd, true,
                                 [this, alive, cs, finish](int64_t rs)
                                 {
                                     if (!*alive)

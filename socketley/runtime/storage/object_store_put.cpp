@@ -757,8 +757,8 @@ void put_op::maybe_finish()
             return;
         self->synced(r);
     };
-    if (!m_store->m_io->fsync(m_tmp_fd, true, on_sync) ||
-        (m_placed && !m_store->m_io->fsync(m_place_fd, true, on_sync)))
+    if (!m_store->m_io->sync(m_tmp_fd, true, on_sync) ||
+        (m_placed && !m_store->m_io->sync(m_place_fd, true, on_sync)))
         fail(st::io_error);
 }
 

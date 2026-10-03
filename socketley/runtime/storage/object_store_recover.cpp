@@ -673,7 +673,40 @@ bool object_store::open(std::string& err, recovery_report* report)
     m_totals.start_files_read = rep.files_read;
     if (report)
         *report = rep;
+    if (m_opts.sync == sync_mode::interval)
+        start_syncer();
     return true;
+}
+
+void object_store::start_syncer()
+{
+    const int fd = m_root_fd;
+    const auto every = std::chrono::milliseconds(std::max<uint32_t>(m_opts.sync_interval_ms, 1));
+    m_syncer = std::thread([this, fd, every]()
+    {
+        std::unique_lock lk(m_syncer_mx);
+        while (!m_syncer_cv.wait_for(lk, every, [this]() { return m_syncer_stop; }))
+        {
+            lk.unlock();
+            // The whole filesystem, which is every write the answers since the last round promised.
+            if (::syncfs(fd) < 0)
+                m_syncfs_failed.fetch_add(1, std::memory_order_relaxed);
+            m_syncfs_rounds.fetch_add(1, std::memory_order_relaxed);
+            lk.lock();
+        }
+    });
+}
+
+void object_store::stop_syncer()
+{
+    if (!m_syncer.joinable())
+        return;
+    {
+        std::lock_guard lk(m_syncer_mx);
+        m_syncer_stop = true;
+    }
+    m_syncer_cv.notify_all();
+    m_syncer.join();
 }
 
 bool object_store::recover_bucket(const std::string& name, recovery_report& rep, std::vector<recovering>& out,
@@ -1507,11 +1540,15 @@ bool object_store::settle_journals()
 void object_store::close(bool clean)
 {
     *m_alive = false;
+    stop_syncer();
 
     // The marker only when nothing is half done, because a stop that left a
     // rename without its journal record is exactly what the next start must
     // go and look for.
-    if (clean && !working() && !m_journal_lost && !m_sync_lost && settle_journals() && m_root_fd >= 0)
+    // A mode that skips syncs syncs everything here, since the marker says the files need not be read again.
+    const bool synced = m_opts.sync == sync_mode::always ||
+                        (m_root_fd >= 0 && ::syncfs(m_root_fd) == 0 && m_syncfs_failed.load() == 0);
+    if (clean && synced && !working() && !m_journal_lost && !m_sync_lost && settle_journals() && m_root_fd >= 0)
     {
         const std::string marker = m_opts.dir + "/.clean." + std::to_string(m_opts.shard);
         const int fd = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);

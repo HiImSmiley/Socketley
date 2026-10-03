@@ -3526,7 +3526,8 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                  pa.hashes[i] == fnv1a("--secret-key") || pa.hashes[i] == fnv1a("--credentials") ||
                  pa.hashes[i] == fnv1a("--mpu-expire") || pa.hashes[i] == fnv1a("--sse-key-file") ||
                  pa.hashes[i] == fnv1a("--domain") || pa.hashes[i] == fnv1a("--notify-targets") ||
-                 pa.hashes[i] == fnv1a("--replication-targets")))
+                 pa.hashes[i] == fnv1a("--replication-targets") || pa.hashes[i] == fnv1a("--fsync") ||
+                 pa.hashes[i] == fnv1a("--fsync-interval")))
             {
                 restore_edit();
                 std::cout << pa.args[i] << " cannot be changed with `edit`\n"
@@ -4002,6 +4003,13 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             if (cfg.has("sse_key_file") && cfg.storage_sse_key_file != std::string(stg->get_sse_key_file()))
             {
                 conn->write_buf = "cannot change the SSE key file while running; stop, import, and start\n";
+                return 1;
+            }
+            // The sync mode is each worker's store's from its start.
+            if ((cfg.has("fsync") && cfg.storage_fsync != std::string(stg->get_fsync())) ||
+                (cfg.has("fsync_interval") && cfg.storage_fsync_interval_secs != stg->get_fsync_interval_secs()))
+            {
+                conn->write_buf = "cannot change the sync mode while running; stop, import, and start\n";
                 return 1;
             }
             // The domains are parsed into each worker's run at start.

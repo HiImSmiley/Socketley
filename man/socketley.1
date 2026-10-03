@@ -1350,6 +1350,14 @@ replication_targets	string	T{
 .ad l
 The replication endpoints file, as \fB\-\-replication\-targets\fR \fB(requires restart)\fR
 T}
+fsync	string	T{
+.ad l
+"always", "interval" or "never", as \fB\-\-fsync\fR \fB(requires restart)\fR
+T}
+fsync_interval	number	T{
+.ad l
+Seconds between the filesystem syncs of \fB\-\-fsync interval\fR, as \fB\-\-fsync\-interval\fR \fB(requires restart)\fR
+T}
 .TE
 .PP
 .B Cache fields:
@@ -6233,6 +6241,25 @@ compared without regard to case; anything else is refused at
 See
 .BR "Virtual\-hosted\-style addressing" .
 .TP
+.BI \-\-fsync " always" | interval | never
+When a write a client was answered for is on the disk.
+.B always
+(the default) syncs the object's file and its directory before the answer, so an
+answered write survives a crash of the machine.
+.B interval
+answers without those syncs and syncs the whole filesystem every
+.BR \-\-fsync\-interval ;
+.B never
+leaves it to the kernel's own writeback. Either way a crash of the process loses
+nothing, and a stop syncs everything before it says it was clean. See
+.BR Durability .
+.TP
+.BI \-\-fsync\-interval " duration"
+How often
+.B \-\-fsync interval
+syncs the filesystem, 1 second to an hour; default
+.BR 1s .
+.TP
 .BI \-\-notify\-targets " file"
 The webhooks a bucket's event notifications may be sent to, one
 .I name url
@@ -6331,7 +6358,7 @@ and stores nothing, and the quota can be changed on a serving runtime with
 .PP
 .B edit
 does not change these; \fBimport\fR does, as it does for a cache, and
-refuses to move \fBdir\fR, \fBanonymous\fR, \fBdomain\fR or the access key, secret key,
+refuses to move \fBdir\fR, \fBanonymous\fR, \fBdomain\fR, \fBfsync\fR, \fBfsync_interval\fR or the access key, secret key,
 credentials file, SSE key file or notification targets file while the runtime is running (the contents of a credentials
 file are re\-read by themselves). The quota and the expiry move under a serving
 runtime.
@@ -8355,6 +8382,57 @@ threads 64 KiB at a time. A 1 MiB put sent in 1448\-byte segments at 0.8 MB/s,
 eight at once, took about 35 to 60 ms of worker CPU per MiB before and about 6
 to 9 after, against about 3 to 5 for the same put sent at loopback speed.
 .
+.SS Durability
+.B \-\-fsync
+decides when a write a client was answered for is on the disk, as a cache's
+journal and Redis's appendfsync do. Every mode keeps what a crash of the process
+would take, because the page cache outlives the process, and every mode syncs the
+whole filesystem at a stop before it writes the clean marker.
+.TP
+.B always
+The default. A put is answered once its file, its name and its directory are
+synced, a delete once its directory is; versions, tags, uploads and parts alike,
+and the entries of event notifications and replication beside them. An answered
+write survives a crash of the machine. Small puts cost about 2 syncs each, which
+is most of their time: about 1,500 4 KiB puts a second on one shard of the
+measuring box, about 700 into a versioned bucket.
+.TP
+.B interval
+Those syncs are skipped, and a thread syncs the filesystem (\fBsyncfs\fR) every
+.B \-\-fsync\-interval
+(default 1 second). A crash of the machine loses at most the writes of the last
+interval; about 18,000 puts a second on the same box, about 9,600 versioned.
+.TP
+.B never
+The syncs are skipped and only the kernel's own writeback (typically within
+30 seconds) and a stop put the writes on the disk; for data that can be made again,
+such as caches and build artefacts.
+.PP
+What a crash of the machine leaves behind under
+.B interval
+and
+.B never
+depends on the filesystem: ext4 in its default data=ordered mode leaves either
+an object as it was or as it was written, never part of one, and a start that
+finds a file whose header does not check out leaves it unserved; on other
+filesystems a file written in the last interval may hold zeros where its data
+was not yet written. Bucket creation and removal and the configuration documents
+are synced in every mode. Backups and anything else that deletes its own copy
+once a put is answered want
+.BR always .
+.B stats
+counts the syncs that ran in
+.BR fsyncs ,
+those a mode skipped in
+.BR fsyncs_skipped ,
+and the filesystem syncs of
+.B interval
+in
+.B syncfs_rounds
+and
+.BR syncfs_failed ;
+a stop after a failed round is not a clean one.
+.
 .SS Sharding
 .B \-\-shards
 .I N
@@ -8504,7 +8582,18 @@ reports
 .BR journal_records ,
 .BR journal_compactions ,
 .B fsyncs
-(of files and directories alike),
+(of files and directories alike, that ran),
+.B fsyncs_skipped
+(those
+.B \-\-fsync interval
+or
+.B never
+skipped),
+.B syncfs_rounds
+and
+.B syncfs_failed
+(the filesystem syncs of
+.BR "\-\-fsync interval" ),
 .B start_files_read
 (object and version files whose headers the last start read: 0 when every journal was trusted),
 .B pool_ready

@@ -277,7 +277,7 @@ void outbox::kick()
             written(res, upto, false);
             return;
         }
-        if (res >= 0 && !m_io.fsync(m_fd, true, [this, alive, upto](int64_t r2)
+        if (res >= 0 && !m_io.sync(m_fd, true, [this, alive, upto](int64_t r2)
             {
                 if (*alive)
                     written(r2, upto, true);

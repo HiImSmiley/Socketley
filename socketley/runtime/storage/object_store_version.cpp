@@ -68,7 +68,7 @@ void sync_dir(disk_chain& ch, file_io* io, event_loop* loop, int base, std::stri
     });
     ch.then([io, loop, fd, alive = std::move(alive), fsyncs](file_io::done d)
     {
-        const bool q = io->fsync(*fd, false, [loop, fd, d, alive, fsyncs](int64_t r)
+        const bool q = io->sync(*fd, false, [loop, fd, d, alive, fsyncs](int64_t r)
         {
             loop->close_fd(*fd);
             *fd = -1;
@@ -394,7 +394,7 @@ void object_store::vop_header(std::shared_ptr<vop> v)
                                     d2(w == static_cast<int64_t>(header->size()) ? 0 : w < 0 ? w : -EIO);
                                 });
         });
-        ch2->then([this, v](file_io::done d2) { return m_io->fsync(v->fd, true, std::move(d2)); });
+        ch2->then([this, v](file_io::done d2) { return m_io->sync(v->fd, true, std::move(d2)); });
         ch2->run([this, v](int64_t r2)
         {
             m_loop->close_fd(v->fd);
@@ -453,7 +453,7 @@ void object_store::vop_copy(std::shared_ptr<vop> v, int src, uint64_t data_off)
             return m_io->pwrite(*dst, buf.get(), n, at, [buf, n, d](int64_t r) { d(r == n ? 0 : r < 0 ? r : -EIO); });
         });
     }
-    ch->then([this, dst](file_io::done d) { return m_io->fsync(*dst, true, std::move(d)); });
+    ch->then([this, dst](file_io::done d) { return m_io->sync(*dst, true, std::move(d)); });
     ch->run([this, v, fresh, dst](int64_t r)
     {
         m_loop->close_fd(v->fd);
@@ -734,7 +734,7 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
             return m_io->pwrite(v->fd, header->data(), static_cast<uint32_t>(header->size()), 0,
                                 [header, d](int64_t r) { d(r == static_cast<int64_t>(header->size()) ? 0 : r < 0 ? r : -EIO); });
         });
-        ch->then([this, v](file_io::done d) { return m_io->fsync(v->fd, true, std::move(d)); });
+        ch->then([this, v](file_io::done d) { return m_io->sync(v->fd, true, std::move(d)); });
         ch->run([this, v](int64_t r)
         {
             m_loop->close_fd(v->fd);

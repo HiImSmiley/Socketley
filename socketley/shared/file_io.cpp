@@ -24,6 +24,9 @@ struct file_io::op
     int         flags{0};
     mode_t      mode{0};
     bool        datasync{false};
+    // A sync the runtime's durability mode may skip.
+    bool        skippable{false};
+    bool        skipped{false};
 
     char*       rbuf{nullptr};
     const char* wbuf{nullptr};
@@ -74,7 +77,9 @@ bool file_io::submit(op* o)
             queued = m_loop->submit_linkat(o->fd, o->path.c_str(), o->fd2, o->path2.c_str(), &o->req);
             break;
         case op_fsync:
-            queued = m_loop->submit_fsync(o->fd, o->datasync, &o->req, false);
+            o->skipped = o->skippable && m_relaxed;
+            queued = o->skipped ? m_loop->submit_nop(&o->req)
+                                : m_loop->submit_fsync(o->fd, o->datasync, &o->req, false);
             break;
         case op_file_read:
             queued = m_loop->submit_file_read(o->fd, o->rbuf, o->len, o->off, &o->req);
@@ -197,6 +202,23 @@ bool file_io::fsync(int fd, bool datasync, done cb)
     return true;
 }
 
+bool file_io::sync(int fd, bool datasync, done cb)
+{
+    auto* o = new op;
+    o->kind = op_fsync;
+    o->fd = fd;
+    o->datasync = datasync;
+    o->skippable = true;
+    o->cb = std::move(cb);
+    if (!submit(o))
+    {
+        delete o;
+        return false;
+    }
+    m_live.insert(o);
+    return true;
+}
+
 bool file_io::pread(int fd, char* buf, uint32_t len, uint64_t off, done cb)
 {
     auto* o = new op;
@@ -257,6 +279,13 @@ void file_io::finish(op* o, int64_t res)
     // Out of the set and freed before the callback, because the callback is
     // free to queue the next step of its chain.
     done cb = std::move(o->cb);
+    if (o->kind == op_fsync)
+    {
+        if (o->skipped)
+            ++m_skipped;
+        else if (res >= 0)
+            ++m_syncs;
+    }
     m_live.erase(o);
     delete o;
     if (cb)

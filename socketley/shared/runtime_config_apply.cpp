@@ -116,6 +116,10 @@ void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool
         stg.set_notify_targets(cfg.storage_notify_targets);
     if (asked("replication_targets", !cfg.storage_replication_targets.empty()))
         stg.set_replication_targets(cfg.storage_replication_targets);
+    if (asked("fsync", !cfg.storage_fsync.empty()))
+        stg.set_fsync(cfg.storage_fsync);
+    if (asked("fsync_interval", cfg.storage_fsync_interval_secs > 0))
+        stg.set_fsync_interval_secs(cfg.storage_fsync_interval_secs);
     if (asked("mpu_expire", cfg.storage_mpu_expire_secs > 0))
         stg.set_mpu_expire_secs(cfg.storage_mpu_expire_secs);
 }
