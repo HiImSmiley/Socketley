@@ -136,6 +136,7 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
     m_store.set_forget_listener([this](const std::string& bucket) { m_mpu.drop_bucket(bucket); });
     m_store.set_lifecycle_listener([this]() { lifecycle_changed(); });
     m_store.set_change_sink(this);
+    m_store.set_owner_quota([this](std::string_view owner) { return m_auth ? m_auth->max_bytes_of(owner) : 0; });
     m_lc_day_ms = lifecycle_day_ms;
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS"))
     {

@@ -18,6 +18,7 @@
 #include "s3_encryption.h"
 #include "s3_names.h"
 #include "s3_notify.h"
+#include "s3_quota.h"
 #include "s3_replication.h"
 #include "s3_object_lock.h"
 #include "s3_versioning.h"
@@ -83,6 +84,7 @@ const char* status_name(st s)
         case st::unavailable:         return "unavailable";
         case st::locked:              return "locked";
         case st::invalid_bucket_state: return "invalid bucket state";
+        case st::quota_exceeded:      return "quota exceeded";
     }
     return "unknown";
 }
@@ -329,6 +331,30 @@ uint32_t object_store::owner_of(std::string_view bucket_name, std::string_view k
     if (m_opts.nshards == 1)
         return 0;
     return object_owner(bucket_name, key, m_opts.nshards);
+}
+
+st object_store::quota_room(const bucket& b, uint64_t add, uint64_t held, bool grows) const
+{
+    // Each shard holds its share of a quota, as it does of --max-bytes.
+    const auto share = [this](uint64_t q) { return m_opts.nshards <= 1 ? q : (q + m_opts.nshards - 1) / m_opts.nshards; };
+    if (const auto& q = b.quota)
+    {
+        if (q->max_bytes && b.bytes - std::min(b.bytes, held) + add > share(q->max_bytes))
+            return st::quota_exceeded;
+        if (q->max_objects && grows && b.objects.size() + b.nversions + 1 > share(q->max_objects))
+            return st::quota_exceeded;
+    }
+    if (m_owner_quota)
+        if (const uint64_t uq = m_owner_quota(b.owner); uq)
+        {
+            uint64_t owned = 0;
+            for (const auto& [n, bp] : m_buckets)
+                if (bp->owner == b.owner)
+                    owned += bp->bytes;
+            if (owned - std::min(owned, held) + add > share(uq))
+                return st::quota_exceeded;
+        }
+    return st::ok;
 }
 
 uint64_t object_store::quota() const
@@ -1392,6 +1418,17 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
                 return;
             }
         }
+        // The bucket's quota and its owner's are judged here, where every write of the key is, one at a time.
+        {
+            const auto old = bp->objects.find(rq.key);
+            const bool keeps_old = versioned(*bp, rq.key);
+            const uint64_t held = old == bp->objects.end() || keeps_old ? 0 : old->second.size;
+            if (const st q = quota_room(*bp, rq.meta.size, held, old == bp->objects.end() || keeps_old); q != st::ok)
+            {
+                commit_refuse(c, q);
+                return;
+            }
+        }
         // The version is decided before the event is staged, which names it.
         const bool restamp = decide_version(*bp, c->req);
         c->ticket = stage_change(*bp, commit_note(rq));
@@ -2401,6 +2438,18 @@ std::shared_ptr<put_op> object_store::begin_put(std::string_view bucket_name, st
         why = st::storage_full;
         return nullptr;
     }
+    // A body a quota will refuse is refused before it is read, where this shard knows the key; the owner judges again.
+    if (size_known && owns(bucket_name, key))
+    {
+        const auto old = b->objects.find(key);
+        const bool keeps_old = versioned(*b, std::string(key));
+        const uint64_t held = old == b->objects.end() || keeps_old ? 0 : old->second.size;
+        if (const st q = quota_room(*b, expected, held, old == b->objects.end() || keeps_old); q != st::ok)
+        {
+            why = q;
+            return nullptr;
+        }
+    }
     std::shared_ptr<put_op> op(new put_op);
     op->begin(this, std::string(bucket_name), std::string(key), std::move(meta), expected, size_known, plain, seal);
     why = st::ok;
@@ -3070,8 +3119,15 @@ const char* object_store::doc_file(bucket_doc kind)
         case bucket_doc::object_lock: return "object-lock";
         case bucket_doc::notification: return "notification";
         case bucket_doc::replication: return "replication";
+        case bucket_doc::quota:      return "quota";
     }
     return "?";
+}
+
+std::shared_ptr<const bucket_quota> object_store::bucket_quota_of(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b && !b->closing ? b->quota : nullptr;
 }
 
 std::shared_ptr<const notify_config> object_store::bucket_notify(std::string_view name) const
@@ -3249,6 +3305,22 @@ std::shared_ptr<const lifecycle_config> object_store::lifecycle(std::string_view
 bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml, std::string* why)
 {
     s3_error err;
+    if (kind == bucket_doc::quota)
+    {
+        std::shared_ptr<bucket_quota> q;
+        if (!xml.empty())
+        {
+            q = std::make_shared<bucket_quota>();
+            if (!parse_bucket_quota(xml, *q, err))
+            {
+                if (why)
+                    *why = err.message;
+                return false;
+            }
+        }
+        b.quota = q && q->any() ? std::move(q) : nullptr;
+        return true;
+    }
     if (kind == bucket_doc::cors)
     {
         std::shared_ptr<cors_config> c;

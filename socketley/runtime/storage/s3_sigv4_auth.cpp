@@ -11,6 +11,8 @@
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+
+#include "../../shared/size_suffix.h"
 #include <openssl/hmac.h>
 
 #include "checksum.h"
@@ -446,9 +448,19 @@ bool parse_credentials(std::string_view text, credential_set& out, std::string& 
                 }
                 user->has_policy = true;
             }
+            else if (name == "max_bytes")
+            {
+                size_t bytes = 0;
+                if (!parse_size_suffix(value, bytes) || bytes == 0)
+                {
+                    err = where + ": max_bytes is a size such as 10G, 500M or a count of bytes";
+                    return false;
+                }
+                user->max_bytes = bytes;
+            }
             else
             {
-                err = where + ": " + std::string(name) + " is not a setting of a user (name, admin, policy)";
+                err = where + ": " + std::string(name) + " is not a setting of a user (name, admin, policy, max_bytes)";
                 return false;
             }
             continue;
@@ -557,6 +569,12 @@ std::string sigv4_authenticator::display_name(std::string_view id) const
     if (const user_identity* u = m_creds.find_user(id))
         return u->display_name;
     return std::string(id);
+}
+
+uint64_t sigv4_authenticator::max_bytes_of(std::string_view id) const
+{
+    const user_identity* u = id.empty() ? nullptr : m_creds.find_user(id);
+    return u ? u->max_bytes : 0;
 }
 
 bool sigv4_authenticator::load(std::string& err)

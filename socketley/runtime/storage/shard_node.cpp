@@ -441,6 +441,7 @@ std::string doc_label(bucket_doc kind)
         case bucket_doc::object_lock: return "object lock configuration";
         case bucket_doc::notification: return "notification configuration";
         case bucket_doc::replication: return "replication configuration";
+        case bucket_doc::quota:       return "quota";
     }
     return "configuration";
 }

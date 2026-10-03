@@ -85,6 +85,7 @@ public:
 
     size_t credential_count() const { return m_creds.size(); }
     std::string display_name(std::string_view id) const override;
+    uint64_t max_bytes_of(std::string_view id) const override;
 
 private:
     // Re-reads the file when it has changed, at most once a second.  A file

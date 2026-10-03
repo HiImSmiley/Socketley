@@ -135,6 +135,8 @@ inline s3_error make_error(std::string_view code)
         {"InvalidAccessKeyId", 403, "The AWS Access Key Id you provided does not exist in our records."},
         {"RequestTimeout", 400, "Your socket connection to the server was not read from or written to within the timeout period."},
         {"StorageFull", 507, "The storage is full and cannot take more data."},
+        {"QuotaExceeded", 403, "The write would take the bucket, or the user who owns it, past its quota."},
+        {"NoSuchBucketQuota", 404, "The bucket has no quota."},
         {"SlowDown", 503, "Please reduce your request rate."},
         {"InternalError", 500, "We encountered an internal error. Please try again."},
         {"ServiceUnavailable", 503, "Service is unable to handle request."},
@@ -160,6 +162,7 @@ inline s3_error error_for(st s)
         case st::too_large:           return make_error("EntityTooLarge");
         case st::bad_digest:          return make_error("BadDigest");
         case st::storage_full:        return make_error("StorageFull");
+        case st::quota_exceeded:      return make_error("QuotaExceeded");
         case st::busy:                return make_error("OperationAborted");
         // A part whose upload was aborted while its body was arriving, which is
         // the only way a cancelled body still has someone to answer.

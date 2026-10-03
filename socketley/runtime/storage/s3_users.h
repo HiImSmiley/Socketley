@@ -23,6 +23,8 @@ struct user_identity
     bool        configured{false};
     bool        has_policy{false};
     bucket_policy policy;
+    // The most bytes the buckets this user owns may hold together, 0 for no bound.
+    uint64_t    max_bytes{0};
 
     // Nothing but a bucket policy's Deny can refuse this user anything.
     bool unrestricted() const { return admin && !has_policy; }

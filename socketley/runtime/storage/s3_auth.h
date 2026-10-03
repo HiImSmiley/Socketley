@@ -142,6 +142,8 @@ public:
     }
     // The display name of user `id` as an Owner element gives it, the id itself for one no longer known.
     virtual std::string display_name(std::string_view id) const { return std::string(id); }
+    // The quota on the bytes of the buckets user `id` owns, 0 for none or for a user no longer known.
+    virtual uint64_t max_bytes_of(std::string_view /*id*/) const { return 0; }
 };
 
 // `--anonymous`: every request is allowed and nobody is named.  A body that is

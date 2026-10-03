@@ -676,6 +676,11 @@ public:
     // Replication, in storage_replication.cpp: the configuration's three operations, the status a new version is
     // written with, and the copies a change queues.
     void op_put_replication(const std::shared_ptr<conn>& c);
+    // A bucket's quota, in storage_quota.cpp: its three operations, which only an admin may ask.
+    void op_put_quota(const std::shared_ptr<conn>& c);
+    void op_get_quota(const std::shared_ptr<conn>& c);
+    void op_delete_quota(const std::shared_ptr<conn>& c);
+    bool quota_admin(const std::shared_ptr<conn>& c);
     void op_get_replication(const std::shared_ptr<conn>& c);
     void op_delete_replication(const std::shared_ptr<conn>& c);
     // Puts into `m` the status a new version of `key` is written with: REPLICA for a replica a replication wrote,
