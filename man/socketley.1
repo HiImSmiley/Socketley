@@ -8436,6 +8436,22 @@ was not yet written. Bucket creation and removal and the configuration documents
 are synced in every mode. Backups and anything else that deletes its own copy
 once a put is answered want
 .BR always .
+.PP
+What
+.B always
+costs is the disk's: a drive with power\-loss protection (most enterprise NVMe and
+SATA SSDs) answers a sync from its protected cache in microseconds, and there it
+costs little, while a consumer or virtual disk answers it only once the data is on
+the medium. XFS writes less per sync than ext4, and ext4's
+.B fast_commit
+feature (\fBtune2fs \-O fast_commit\fR) shortens a sync after a small change.
+Concurrent puts already share the filesystem's journal commits, so
+.B always
+gains throughput with concurrency. A sync of the whole filesystem shared by every
+put waiting, files written before they are needed and overwritten, and
+.B O_DSYNC
+writes were each measured against it and none did better under a sustained load
+of small puts.
 .B stats
 counts the syncs that ran in
 .BR fsyncs ,
