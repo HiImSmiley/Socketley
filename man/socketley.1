@@ -1346,6 +1346,10 @@ notify_targets	string	T{
 .ad l
 The event notification webhooks file, as \fB\-\-notify\-targets\fR \fB(requires restart)\fR
 T}
+replication_targets	string	T{
+.ad l
+The replication endpoints file, as \fB\-\-replication\-targets\fR \fB(requires restart)\fR
+T}
 .TE
 .PP
 .B Cache fields:
@@ -6235,9 +6239,9 @@ The webhooks a bucket's event notifications may be sent to, one
 per line, with an optional third field
 .BI ca= file
 naming the CA an https webhook's certificate is checked against (the system's
-when absent); blank lines and what follows a
+when absent); blank lines are skipped, and so is a field that begins with
 .B #
-are skipped:
+and the rest of its line:
 .RS
 .PP
 .nf
@@ -6258,6 +6262,36 @@ off the loop and again when a connection is refused (a host that does not resolv
 is logged and its events wait until it does). Without it every destination is
 refused. See
 .BR "Event notifications" .
+.TP
+.BI \-\-replication\-targets " file"
+The S3 endpoints a bucket's replication may write to, one
+.I name url region access_key secret
+per line, with an optional sixth field
+.BI ca= file
+for an https endpoint, comments and blank lines as in
+.BR \-\-notify\-targets :
+.RS
+.PP
+.nf
+# name   url                          region     access key            secret
+backup   https://s3.backup.internal   eu\-west\-1  AKIAREPLICATOR000001  wJal.../replicator
+.fi
+.RE
+.IP
+A configuration's
+.B Role
+names one by its last path segment, as
+.BI arn:aws:iam:: account :role/ name\fR;
+every copy to that endpoint is signed with the line's key and secret for the
+line's region. The file is refused at
+.B create
+and
+.B start
+if a line does not parse and is read at every start;
+.B show
+and the state file keep its path, and its secrets are never logged. Without it
+every replication configuration is refused. See
+.BR Replication .
 .TP
 .B \-\-anonymous
 Accept requests that carry no credentials at all. Required unless
@@ -6568,6 +6602,18 @@ T}
 GetBucketNotificationConfiguration	GET /bucket?notification	T{
 .ad l
 The configuration as it is kept, an Id given to a rule that had none; an empty one for a bucket without.
+T}
+PutBucketReplication	PUT /bucket?replication	T{
+.ad l
+A ReplicationConfiguration whose Role names a target of \fB\-\-replication\-targets\fR, on a bucket whose versioning is Enabled, replacing the one before. See \fBReplication\fR below.
+T}
+GetBucketReplication	GET /bucket?replication	T{
+.ad l
+The configuration as it is kept, an ID given to a rule that had none; ReplicationConfigurationNotFoundError (404) when there is none.
+T}
+DeleteBucketReplication	DELETE /bucket?replication	T{
+.ad l
+204 whether or not there was one; versions already queued are still copied.
 T}
 .TE
 .PP
@@ -7487,6 +7533,155 @@ shows
 and
 .B notify_resolves
 (host names resolved), per shard.
+.SS Replication
+A bucket's
+.B ReplicationConfiguration
+(PutBucketReplication, GetBucketReplication, DeleteBucketReplication) copies its
+new versions, and the delete markers its clients make, to buckets of another S3
+endpoint \(em another storage runtime, or any S3. It is S3's document: a
+.B Role
+and one or more
+.BR Rule s,
+each with an
+.BR ID ,
+a
+.BR Priority ,
+a
+.B Status
+of Enabled or Disabled, the keys it names (a rule\-level
+.B Prefix
+in the first schema, or a
+.B Filter
+of a
+.BR Prefix ,
+a
+.B Tag
+or an
+.B And
+of both, in the second), a
+.B Destination
+with the
+.B Bucket
+as
+.BI arn:aws:s3::: bucket
+and optionally an
+.BR Account ,
+a
+.B StorageClass
+(sent as the replica's
+.BR x\-amz\-storage\-class )
+and an
+.B AccessControlTranslation
+to Destination, and
+.BR DeleteMarkerReplication .
+The Role's last path segment names a target of
+.BR \-\-replication\-targets ,
+whose endpoint and credentials every rule of the configuration writes with:
+.RS
+.PP
+.nf
+<ReplicationConfiguration>
+  <Role>arn:aws:iam::123456789012:role/backup</Role>
+  <Rule><ID>docs</ID><Priority>1</Priority><Status>Enabled</Status>
+    <Filter><Prefix>docs/</Prefix></Filter>
+    <Destination><Bucket>arn:aws:s3:::docs\-copy</Bucket></Destination>
+    <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+  </Rule>
+</ReplicationConfiguration>
+.fi
+.RE
+.PP
+As in S3, a bucket whose versioning is not Enabled is refused one
+.RB ( "400 InvalidRequest" ),
+and versioning cannot be suspended while it has one
+.RB ( "409 InvalidBucketState" );
+so are a second\-schema rule without DeleteMarkerReplication, delete marker
+replication with a tag filter, rules of both schemas, two rules with one ID or one
+priority, and overlapping first\-schema prefixes (all
+.B 400
+InvalidRequest or InvalidArgument); a Role that names no target is
+.BR "400 InvalidArgument" ,
+and a document that is not one
+.BR "400 MalformedXML" .
+.B ExistingObjectReplication
+Enabled, ReplicaModifications Enabled, a
+.B ReplicaKmsKeyID
+and replication time control or metrics are
+.B "501 NotImplemented"
+rather than taken and not honoured; the destination bucket is not checked when
+the configuration is put. The document is kept in
+.IB dir / bucket /replication
+and changed by shard 0 like a bucket's other configuration documents.
+.PP
+For every destination bucket the matching enabled rule of the highest priority
+decides; a version is copied when one does, and a delete marker when that rule
+replicates delete markers (a rule with a tag filter never names a marker; the
+first schema always replicates them). A version is written with
+.B "x\-amz\-replication\-status: PENDING"
+in its header, which GET and HEAD answer, and becomes
+.B COMPLETED
+once every destination has it, or
+.B FAILED
+once one refused it, which stays FAILED; the status is written in place into the
+header's slot, which then carries it with the tags, the retention and the hold.
+What a version is copied by is decided when its metadata is made: a PutObject or
+POST, a CopyObject (whose source's status is never copied), a
+CreateMultipartUpload for the object its completion makes, and a script's put.
+Not copied, as in S3: a version removed by its id, a delete marker a lifecycle
+rule made, a version written before the configuration, a later tag change, and an
+SSE\-C version, which has no status.
+.PP
+A version is copied by a signed PutObject streamed from its file \(em with its
+Content\-Type, Cache\-Control, Content\-Disposition, Content\-Encoding,
+Content\-Language, Expires, website redirect, user metadata and tags, its MD5 as
+Content\-MD5 and its full\-object checksum, which the destination checks the bytes
+against \(em and a multipart version by a multipart upload in the same parts and
+part numbers, so the replica has the same ETag and composite checksum. An SSE\-S3
+version is read in the clear, over the target's https when its URL is one, and
+written with
+.BR "x\-amz\-server\-side\-encryption: AES256" ,
+which a destination without a master key refuses; a delete marker is a signed
+DeleteObject of the key. Every request carries
+.BR "x\-amz\-replication\-status: REPLICA" .
+A storage runtime that is the destination judges such a write as
+.B s3:ReplicateObject
+and such a delete as
+.B s3:ReplicateDelete
+(see
+.BR "Bucket policy" ),
+marks the version REPLICA, and never copies a replica or a replica's delete
+marker on, so two buckets that replicate to each other copy each change once.
+Another S3 stores the header as it does. A replica's version id, time and owner
+are the destination's own.
+.PP
+The shard that owns a key queues its copies, one entry per destination bucket,
+in
+.IB dir /.replicate/outbox. shard\fR,
+synced before the change is answered, with the change's events. Each target is
+sent one copy at a time, in order. A refused connection, a stall of 10 seconds,
+no answer within 120 seconds of the whole request, and an answer of 408, 409,
+429 or a 5xx other than 501 are tried again after 0.25 s, doubling to 8 s, and
+logged at the first of a run; any other answer, or a version whose bytes cannot be
+read, is FAILED and logged with the destination's error code. An entry is retired
+after the version's status is written, so a crash between the two copies the
+version again, which is harmless. A start queues the outbox again, and every
+version its index still calls PENDING with no entry, so an answered version is
+copied even if its entry was lost. A target's host name is resolved off the loop
+as a webhook's is;
+.B SOCKETLEY_STORAGE_REPLICATION_HOSTS
+is the test aid that points one elsewhere.
+.B stats
+shows
+.B replication_pending
+(entries waiting now),
+.B replication_completed
+and
+.B replication_failed
+(versions and delete markers),
+.B replication_retries
+and
+.B replication_bytes
+(body bytes a destination took), per shard.
 .SS Server\-side encryption
 .B "x\-amz\-server\-side\-encryption: AES256"
 on PutObject, CreateMultipartUpload or CopyObject (SSE\-S3) stores the object
@@ -7814,7 +8009,12 @@ PutBucketObjectLockConfiguration, GetObjectRetention and PutObjectRetention (als
 write that names a retention), GetObjectLegalHold and PutObjectLegalHold (also a
 write that names a hold), and BypassGovernanceRetention, asked beside the action of a
 request that sends the bypass header. GetBucketNotification and PutBucketNotification
-cover the two notification configuration operations.
+cover the two notification configuration operations, and GetReplicationConfiguration
+and PutReplicationConfiguration the three replication ones. A write that sends
+.B "x\-amz\-replication\-status: REPLICA"
+(PutObject and the steps of a multipart upload) is ReplicateObject instead of
+PutObject, and such a DeleteObject is ReplicateDelete: a user allowed those two and
+nothing else can be the destination's replication user.
 .TP
 .B Resource
 one or a list of
@@ -12682,6 +12882,15 @@ The most events a storage shard holds undelivered, beyond which a new one is
 dropped and counted in
 .BR notify_dropped .
 Default: 10000. A test lowers it to reach the bound.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_STORAGE_REPLICATION_HOSTS
+A test aid: a file of
+.I name address
+lines that the resolver of a storage runtime's replication targets reads before
+the system resolver, on every resolve, so a test can name a target by a host.
+Unset, only the system resolver is asked (see Replication).
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
