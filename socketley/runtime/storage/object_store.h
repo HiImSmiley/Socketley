@@ -316,7 +316,7 @@ struct change_origin
     // The change is a replica another runtime's replication made, which this one's replication does not send on.
     bool        replica{false};
     // The version id the replica's source gave it, which a delete marker it makes keeps when it can.
-    std::string source_version;
+    std::string source_version{};
 };
 
 // A change of what a version keeps in its header's slots, made in place by the owner of its key.

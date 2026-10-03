@@ -691,7 +691,7 @@ public:
     // bucket that sends no events.
     change_origin origin_of(const conn& c) const;
     // A lifecycle rule's expiry, which S3's records name as S3 itself.
-    static change_origin lifecycle_origin() { return {"s3.amazonaws.com", {}, false, {}}; }
+    static change_origin lifecycle_origin() { return {"s3.amazonaws.com", {}}; }
 
     // Object lock, in storage_object_lock.cpp.
     void op_put_object_lock_config(const std::shared_ptr<conn>& c);
