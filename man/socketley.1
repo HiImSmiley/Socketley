@@ -6650,6 +6650,18 @@ DeleteBucketReplication	DELETE /bucket?replication	T{
 .ad l
 204 whether or not there was one; versions already queued are still copied.
 T}
+PutBucketQuota	PUT /bucket?quota	T{
+.ad l
+socketley's own: a BucketQuota of MaxBytes and MaxObjects, admins only. See \fBQuotas\fR below.
+T}
+GetBucketQuota	GET /bucket?quota	T{
+.ad l
+The quota as it is kept; NoSuchBucketQuota (404) when there is none. Admins only.
+T}
+DeleteBucketQuota	DELETE /bucket?quota	T{
+.ad l
+204 whether or not there was one. Admins only.
+T}
 .TE
 .PP
 ACLs are those of a bucket whose ACLs are disabled, which S3 makes the default
@@ -6865,11 +6877,15 @@ is
 .B true
 or
 .BR false ,
-and
 .B policy
 is the user's identity policy, the JSON itself on that one line when it begins with
 .BR { ,
-and otherwise a file, relative to the credentials file's directory. A setting has its
+and otherwise a file, relative to the credentials file's directory, and
+.B max_bytes
+is the most the buckets the user owns may hold together, a size such as
+.B 10G
+(see
+.BR Quotas ). A setting has its
 .B =
 before any colon, which an access key cannot hold. A key outside any user, and the
 pair given with
@@ -8405,6 +8421,47 @@ receive and a wakeup per TCP segment; its digests are handed to the hashing
 threads 64 KiB at a time. A 1 MiB put sent in 1448\-byte segments at 0.8 MB/s,
 eight at once, took about 35 to 60 ms of worker CPU per MiB before and about 6
 to 9 after, against about 3 to 5 for the same put sent at loopback speed.
+.
+.SS Quotas
+A bucket's quota bounds the bytes its objects and versions hold and how many there
+are; it is socketley's own document, which S3 has no counterpart of:
+.RS
+.PP
+.nf
+PUT /photos?quota
+<BucketQuota>
+  <MaxBytes>10737418240</MaxBytes>
+  <MaxObjects>100000</MaxObjects>
+</BucketQuota>
+.fi
+.RE
+.PP
+Either element may be left out, and 0 is no bound. Only an admin, or the runtime's
+own key, or anyone on an
+.B \-\-anonymous
+runtime, may set, read or delete one, since a quota bounds what the bucket's owner
+may store; it is kept in
+.IB dir / bucket /quota
+and changed by shard 0 like a bucket's other configuration documents, and a restart
+keeps it. A user's
+.B max_bytes
+(see
+.BR Users )
+bounds what every bucket that user owns holds together.
+.PP
+A write that would take a bucket or its owner past a quota is answered
+.B "403 QuotaExceeded"
+and stores nothing: a PUT, a POST, a copy and the completion of a multipart upload
+alike. An overwrite counts the bytes it adds over the object it replaces and adds no
+object; in a versioned bucket every version counts, delete markers among them. A
+quota is judged by the shard that owns the key, at the commit, one write at a time,
+so writes racing each other cannot pass it together; a shard that owns the key also
+refuses a body of known length before reading it. Under
+.B \-\-shards
+each shard holds its share of a quota, as it does of
+.BR \-\-max\-bytes ,
+so a bucket whose keys fall unevenly is refused somewhat before the whole is
+reached. The parts of a multipart upload are not counted until it is completed.
 .
 .SS Durability
 .B \-\-fsync
