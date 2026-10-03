@@ -201,7 +201,8 @@ if "$BIN" create storage stgu --listen "unix:$SOCK" --dir "$SOCKETLEY_TMPD/unixo
     expect "a unix listener stores" "$(curl -s --unix-socket "$SOCK" -X PUT --data-binary hi http://x/unix-bucket/k -o /dev/null -w '%{http_code}')" 200
     expect "and reads back" "$(curl -s --unix-socket "$SOCK" http://x/unix-bucket/k)" "hi"
     "$BIN" stop stgu >/dev/null 2>&1
-    sleep 0.5
+    # A stop is answered before the worker has finished, and the worker removes the node as it ends.
+    for _ in $(seq 1 100); do [ -e "$SOCK" ] || break; sleep 0.1; done
     if [ -e "$SOCK" ]; then bad "stop removes the socket node" "$SOCK is still there"; else ok "stop removes the socket node"; fi
 else bad "a runtime listens on a unix path" "create was refused"; fi
 
