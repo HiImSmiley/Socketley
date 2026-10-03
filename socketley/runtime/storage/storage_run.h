@@ -690,6 +690,8 @@ public:
     // A bucket's website, in storage_website.cpp: the configuration's three operations, and a request to the website.
     void op_put_website(const std::shared_ptr<conn>& c);
     void op_get_website(const std::shared_ptr<conn>& c);
+    // STS's GetSessionToken and AssumeRole, POST / with a form, answered with temporary credentials.
+    void op_sts(const std::shared_ptr<conn>& c);
     // A request to a bucket's website: an object, its index document, a redirect, or an error page.
     void op_website(const std::shared_ptr<conn>& c);
     // A website request that failed with `e`: a redirect, the error document, or an HTML page.

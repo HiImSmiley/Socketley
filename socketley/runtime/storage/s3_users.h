@@ -2,6 +2,7 @@
 // The users of a storage runtime: who an access key signs for, what that user
 // may do beyond the buckets it owns, and the owner a bucket made before there
 // were users belongs to.
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -25,9 +26,11 @@ struct user_identity
     bucket_policy policy;
     // The most bytes the buckets this user owns may hold together, 0 for no bound.
     uint64_t    max_bytes{0};
+    // A session's own policy, which bounds whatever else lets the user in, for temporary credentials given with one.
+    std::shared_ptr<const bucket_policy> session_policy;
 
     // Nothing but a bucket policy's Deny can refuse this user anything.
-    bool unrestricted() const { return admin && !has_policy; }
+    bool unrestricted() const { return admin && !has_policy && !session_policy; }
 };
 
 }   // namespace socketley::storage

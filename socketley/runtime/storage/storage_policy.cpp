@@ -164,17 +164,19 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
     // operation.
     if (action == s3_action::create_bucket)
     {
-        if (u && u->has_policy && u->policy.evaluate(pr) == policy_effect::deny)
+        if (u && ((u->has_policy && u->policy.evaluate(pr) == policy_effect::deny) ||
+                  (u->session_policy && u->session_policy->evaluate(pr) != policy_effect::allow)))
             refuse(make_error("AccessDenied"));
         return;
     }
     // The owner of a bucket and an admin answer to their credentials alone for the bucket's policy, so a policy
-    // that shuts everyone out can be removed, and for what no policy names.
+    // that shuts everyone out can be removed, and for what no policy names; a session's policy still bounds them.
     const bool policy_op = action == s3_action::put_bucket_policy || action == s3_action::get_bucket_policy ||
                            action == s3_action::delete_bucket_policy || action == s3_action::get_bucket_policy_status;
     if (action == s3_action::none || policy_op)
     {
-        if (!restricted || u->admin || !m_store.has_bucket(r.bucket) || owner_of(r.bucket) == u->id)
+        if (!restricted || !m_store.has_bucket(r.bucket) ||
+            ((u->admin || owner_of(r.bucket) == u->id) && !u->session_policy))
             return;
         if (action == s3_action::none || access_of(c, r.bucket, pr, u) != policy_effect::allow)
             refuse(make_error("AccessDenied"));
@@ -271,6 +273,18 @@ bool storage_run::docs_settled(const std::shared_ptr<conn>& c)
 policy_effect storage_run::access_of(const std::shared_ptr<conn>& c, std::string_view bucket, const policy_request& q,
                                      const user_identity* u)
 {
+    if (const bucket_policy* bound = u ? u->session_policy.get() : nullptr)
+    {
+        if (bound->needs_ip() && !c->ip_known)
+        {
+            c->ip       = client_ip_of(c->fd);
+            c->ip_known = true;
+        }
+        // A session's policy bounds everything else: what it does not allow nothing else can.
+        const policy_effect e = bound->evaluate(q);
+        if (e != policy_effect::allow)
+            return e == policy_effect::deny ? policy_effect::deny : policy_effect::none;
+    }
     const policy_effect own = u && u->has_policy ? u->policy.evaluate(q) : policy_effect::none;
     if (own == policy_effect::deny)
         return policy_effect::deny;

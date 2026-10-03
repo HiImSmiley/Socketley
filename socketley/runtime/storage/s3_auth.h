@@ -56,6 +56,10 @@ struct request_view
     std::string_view key;
     // Whether the connection is TLS, which decides what a presigned URL says.
     bool tls{false};
+    // The service the signature's scope must name: s3, or sts for a request for temporary credentials.
+    std::string_view service{"s3"};
+    // The body's sha256 in hex, for a body read before its request is judged that names no x-amz-content-sha256.
+    std::string_view body_sha256_hex;
 
     std::string_view header(std::string_view lower_name) const
     {
@@ -109,8 +113,20 @@ struct auth_verdict
     std::shared_ptr<const user_identity> user;
     // The request carried no credentials, which a bucket policy may still let in.
     bool                        anonymous{false};
+    // The request was signed with temporary credentials, which may not ask for more.
+    bool                        session{false};
     // Present when the body has to be decoded or verified on its way in.
     std::unique_ptr<body_hook>  hook;
+};
+
+// Temporary credentials as STS answers them.
+struct session_credentials
+{
+    std::string access_key;
+    std::string secret;
+    std::string token;
+    // Unix seconds.
+    int64_t     expires{0};
 };
 
 // The fields a browser's form is signed with, which travel in the body and not in a header (SigV4 POST policy).
@@ -144,6 +160,13 @@ public:
     virtual std::string display_name(std::string_view id) const { return std::string(id); }
     // The quota on the bytes of the buckets user `id` owns, 0 for none or for a user no longer known.
     virtual uint64_t max_bytes_of(std::string_view /*id*/) const { return 0; }
+    // Temporary credentials signing for the user of long-term key `access_key` until `expires`, bounded by `policy`
+    // when it is not empty; false for a key that is not one, which an authenticator without keys has none of.
+    virtual bool issue_session(std::string_view /*access_key*/, int64_t /*expires*/, std::string_view /*policy*/,
+                               session_credentials& /*out*/)
+    {
+        return false;
+    }
 };
 
 // `--anonymous`: every request is allowed and nobody is named.  A body that is

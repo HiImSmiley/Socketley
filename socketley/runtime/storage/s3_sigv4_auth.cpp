@@ -12,13 +12,15 @@
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 
-#include "../../shared/size_suffix.h"
 #include <openssl/hmac.h>
 
 #include "checksum.h"
 #include "digest.h"
+#include "s3_names.h"
+#include "s3_sts.h"
 #include "../../shared/logging.h"
 #include "../../shared/s3_sigv4.h"
+#include "../../shared/size_suffix.h"
 
 namespace socketley::storage
 {
@@ -577,6 +579,70 @@ uint64_t sigv4_authenticator::max_bytes_of(std::string_view id) const
     return u ? u->max_bytes : 0;
 }
 
+bool sigv4_authenticator::issue_session(std::string_view access_key, int64_t expires, std::string_view policy,
+                                        session_credentials& out)
+{
+    const std::string_view parent = m_creds.secret(access_key);
+    if (parent.empty())
+        return false;
+    session_grant g;
+    g.parent_key = access_key;
+    g.access_key = sts_new_access_key();
+    g.expires    = expires;
+    g.policy     = policy;
+    if (g.access_key.empty())
+        return false;
+    out.access_key = g.access_key;
+    out.secret     = sts_secret(g, parent);
+    out.token      = sts_token(g, parent);
+    out.expires    = expires;
+    return true;
+}
+
+std::string_view sigv4_authenticator::session_secret(std::string_view token, std::string_view access_key, int64_t now,
+                                                     std::shared_ptr<const user_identity>& user, bool& expired)
+{
+    session_grant g;
+    if (!sts_parse(token, g) || g.access_key != access_key)
+        return {};
+    if (g.expires <= now)
+    {
+        expired = true;
+        return {};
+    }
+    const std::string_view parent = m_creds.secret(g.parent_key);
+    std::shared_ptr<const user_identity> base = m_creds.user_of(g.parent_key);
+    if (parent.empty() || !base)
+        return {};
+    // The session last signed for is taken again while its key and its user are the ones it was sealed with.
+    session_entry& e = m_session;
+    if (e.token == token && e.parent_secret == parent && e.parent_user == base)
+    {
+        user = e.user;
+        return e.secret;
+    }
+    if (!sts_sealed_by(token, parent))
+        return {};
+    std::shared_ptr<const user_identity> u = base;
+    if (!g.policy.empty())
+    {
+        auto bound = std::make_shared<bucket_policy>();
+        s3_error err;
+        if (!bucket_policy::compile_identity(g.policy, *bound, err))
+            return {};
+        auto copy = std::make_shared<user_identity>(*base);
+        copy->session_policy = std::move(bound);
+        u = std::move(copy);
+    }
+    e.token         = std::string(token);
+    e.parent_secret = std::string(parent);
+    e.parent_user   = base;
+    e.secret        = sts_secret(g, parent);
+    e.user          = u;
+    user = std::move(u);
+    return e.secret;
+}
+
 bool sigv4_authenticator::load(std::string& err)
 {
     m_last_check = std::chrono::steady_clock::now();
@@ -647,23 +713,46 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
     sv.raw_path  = req.raw_path;
     sv.raw_query = req.raw_query;
     sv.headers   = m_fields;
+    sv.body_sha256_hex = req.body_sha256_hex;
+    s3::verify_options opts = m_opts;
+    opts.service = req.service;
 
-    // A named object, because the lookup keeps a pointer to what it is built from.
-    const auto lookup = [this](std::string_view access_key) -> std::string_view
-    {
-        return m_creds.secret(access_key);
-    };
+    // Temporary credentials name their session in a token, as a header or in a presigned URL's query.
+    std::string token(req.header("x-amz-security-token"));
+    if (token.empty())
+        for (std::string_view q = req.raw_query; !q.empty();)
+        {
+            const size_t amp = q.find('&');
+            const std::string_view part = q.substr(0, amp);
+            q = amp == std::string_view::npos ? std::string_view{} : q.substr(amp + 1);
+            if (part.starts_with("X-Amz-Security-Token=") && !percent_decode(part.substr(21), token, false))
+                token.clear();
+        }
+    std::shared_ptr<const user_identity> session_user;
+    bool expired = false;
     const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    const s3::verify_result vr = s3::verify(sv, m_opts, lookup, now);
+    // A named object, because the lookup keeps a pointer to what it is built from.
+    const auto lookup = [&](std::string_view access_key) -> std::string_view
+    {
+        if (token.empty())
+            return m_creds.secret(access_key);
+        return session_secret(token, access_key, now, session_user, expired);
+    };
+    const s3::verify_result vr = s3::verify(sv, opts, lookup, now);
     if (!vr.ok())
     {
         v.allowed = false;
         v.error   = to_error(vr);
+        if (expired)
+            v.error = {"ExpiredToken", "The provided token has expired.", 400};
+        else if (!token.empty() && v.error.code == "InvalidAccessKeyId")
+            v.error = {"InvalidToken", "The provided token is malformed or otherwise invalid.", 400};
         return v;
     }
     v.principal = std::string(vr.access_key());
-    v.user      = m_creds.user_of(v.principal);
+    v.user      = token.empty() ? m_creds.user_of(v.principal) : std::move(session_user);
+    v.session   = !token.empty();
 
     switch (vr.payload)
     {

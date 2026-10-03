@@ -86,8 +86,15 @@ public:
     size_t credential_count() const { return m_creds.size(); }
     std::string display_name(std::string_view id) const override;
     uint64_t max_bytes_of(std::string_view id) const override;
+    bool issue_session(std::string_view access_key, int64_t expires, std::string_view policy,
+                       session_credentials& out) override;
 
 private:
+    // The secret of the session `token` gives `access_key`, with its user, empty for a token that is not one this
+    // runtime sealed for that key or that ended before `now`, which `expired` then says.
+    std::string_view session_secret(std::string_view token, std::string_view access_key, int64_t now,
+                                    std::shared_ptr<const user_identity>& user, bool& expired);
+
     // Re-reads the file when it has changed, at most once a second.  A file
     // that has gone or no longer parses leaves the set as it was, because a
     // half-written edit must not lock every client out.
@@ -114,6 +121,17 @@ private:
         uint64_t    ino{0};
     };
     std::vector<file_stamp> m_policy_stamps;
+
+    // The last session a request was signed for, which a client signs for again and again.
+    struct session_entry
+    {
+        std::string token;
+        std::string parent_secret;
+        std::shared_ptr<const user_identity> parent_user;
+        std::string secret;
+        std::shared_ptr<const user_identity> user;
+    };
+    session_entry m_session;
 };
 
 // The hook for a body that is aws-chunked with no signature, which a request

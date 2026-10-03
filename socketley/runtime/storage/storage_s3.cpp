@@ -26,6 +26,8 @@ namespace
 
 constexpr uint64_t small_body_limit = 4ull << 20;
 constexpr size_t   user_meta_limit  = 2048;
+// A form asking for temporary credentials, read before anyone is known to have sent it.
+constexpr uint64_t sts_max_body     = 16 * 1024;
 
 // The subresources of the S3 API this runtime does not implement, so a request
 // naming one is refused as such and never mistaken for the plain operation.
@@ -233,6 +235,12 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
         op_website(c);
         return;
     }
+    // A request for temporary credentials is signed over its form, which is read before it is judged.
+    if (r.method == "POST" && r.bucket.empty())
+    {
+        collect_body(c, sts_max_body);
+        return;
+    }
     // A browser asks before a cross-origin request, and cannot sign the asking.
     if (r.method == "OPTIONS")
     {
@@ -358,6 +366,8 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
     {
         if (m == "GET")
             op_list_buckets(c);
+        else if (m == "POST")
+            op_sts(c);
         else
             send_error(c, make_error("MethodNotAllowed"));
         return;
