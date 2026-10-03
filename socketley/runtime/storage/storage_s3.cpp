@@ -38,6 +38,9 @@ bool unsupported_subresource(const s3_request& r, bool object)
         "publicAccessBlock", "intelligent-tiering", "attributes", "restore", "select", "torrent",
         "acl", "location-constraint",
     };
+    // Every subresource is a query parameter, and most requests have none.
+    if (r.query.empty())
+        return false;
     // CORS and lifecycle rules, a policy and a default encryption belong to a bucket and to nothing else.
     if (object && (r.has_query("cors") || r.has_query("lifecycle") || r.has_query("policy") ||
                    r.has_query("policyStatus") || r.has_query("encryption")))
@@ -280,12 +283,16 @@ void storage_run::route(const std::shared_ptr<conn>& c)
     // A write that asks for an ACL other than its owner's full control is refused, as S3 refuses it on a bucket
     // whose ACLs are disabled, and never stored without it.
     // The owner a grant may name is the bucket's, or for a bucket being made the user making it.
-    const std::string_view acl_owner = m_store.has_bucket(r.bucket) || !c->user ? owner_of(r.bucket)
-                                                                                : std::string_view(c->user->id);
-    if (s3_error e; !r.has_query("acl") && !acl_headers_ok(r, bucket_level && !r.form, acl_owner, e))
+    // Only a write carries ACL headers, so a read looks up no owner.
+    if ((r.method == "PUT" || r.method == "POST") && !r.has_query("acl"))
     {
-        deny_request(c, e);
-        return;
+        const std::string_view acl_owner = m_store.has_bucket(r.bucket) || !c->user ? owner_of(r.bucket)
+                                                                                    : std::string_view(c->user->id);
+        if (s3_error e; !acl_headers_ok(r, bucket_level && !r.form, acl_owner, e))
+        {
+            deny_request(c, e);
+            return;
+        }
     }
     if (s3_error e; !storage_class_ok(r, e))
     {
@@ -1784,13 +1791,12 @@ enum class cond { proceed, not_modified, precondition_failed };
 // If-None-Match, If-Modified-Since.
 cond evaluate(const s3_request& q, const object_meta& m)
 {
-    const std::string etag = m.etag();
     const int64_t mtime_s = m.mtime_ms / 1000;
 
     const std::string_view im = q.header("if-match");
     if (!im.empty())
     {
-        if (!etag_list_matches(im, etag))
+        if (!etag_list_matches(im, m.etag()))
             return cond::precondition_failed;
     }
     else if (const std::string_view ius = q.header("if-unmodified-since"); !ius.empty())
@@ -1803,7 +1809,7 @@ cond evaluate(const s3_request& q, const object_meta& m)
     const std::string_view inm = q.header("if-none-match");
     if (!inm.empty())
     {
-        if (etag_list_matches(inm, etag))
+        if (etag_list_matches(inm, m.etag()))
             return cond::not_modified;
     }
     else if (const std::string_view ims = q.header("if-modified-since"); !ims.empty())
@@ -2081,12 +2087,10 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
     // Answers a request whose object is known, from a HEAD's memory or a GET's file; `clear` says the bytes
     // already in hand are the object's own rather than what its file holds, and `list` is a part list read
     // after the body, for a partNumber the header alone cannot place.
-    using answer_fn = std::function<void(const std::shared_ptr<conn>&, const object_meta&, int, uint64_t,
-                                         const std::string&, bool, const part_list*)>;
-    auto again = std::make_shared<answer_fn>();
-    *again = [this, head, part, attributes, attrs, weak_again = std::weak_ptr<answer_fn>(again)](
-                 const std::shared_ptr<conn>& cc, const object_meta& m, int fd, uint64_t data_off,
-                 const std::string& prefetch, bool clear, const part_list* list)
+    // Takes itself as `self` to be given again once a part list is read, so a read that needs none allocates nothing for it.
+    const auto again = [this, head, part, attributes, attrs](
+                 const auto& self, const std::shared_ptr<conn>& cc, const object_meta& m, int fd, uint64_t data_off,
+                 const std::string& prefetch, bool clear, const part_list* list) -> void
     {
         const s3_request& rq = cc->req;
 
@@ -2132,11 +2136,11 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
                 if (part_trailer_of(m, t))
                 {
                     read_part_list(cc, m, fd, data_off, true,
-                        [weak = std::weak_ptr<conn>(cc), again = weak_again.lock()](
+                        [weak = std::weak_ptr<conn>(cc), self](
                             const object_meta& m2, int fd2, uint64_t off2, bool clear2, const part_list& l)
                         {
                             if (auto c2 = weak.lock())
-                                (*again)(c2, m2, fd2, off2, {}, clear2, &l);
+                                self(self, c2, m2, fd2, off2, {}, clear2, &l);
                         });
                     return;
                 }
@@ -2168,11 +2172,11 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
             {
                 // The answer is given again once the list is read, from the file whose list it is.
                 read_part_list(cc, m, fd, data_off, head,
-                    [weak = std::weak_ptr<conn>(cc), again = weak_again.lock()](
+                    [weak = std::weak_ptr<conn>(cc), self](
                         const object_meta& m2, int fd2, uint64_t off2, bool clear2, const part_list& l)
                     {
                         if (auto c2 = weak.lock())
-                            (*again)(c2, m2, fd2, off2, {}, clear2, &l);
+                            self(self, c2, m2, fd2, off2, {}, clear2, &l);
                     });
                 return;
             }
@@ -2290,7 +2294,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
     };
     auto answer = [again](const std::shared_ptr<conn>& cc, const object_meta& m, int fd, uint64_t data_off,
                           const std::string& prefetch, bool clear)
-    { (*again)(cc, m, fd, data_off, prefetch, clear, nullptr); };
+    { again(again, cc, m, fd, data_off, prefetch, clear, nullptr); };
 
     // A version asked for by its id is read where it is, and never from or into a held copy, which is the latest's.
     if (!version_id.empty())
