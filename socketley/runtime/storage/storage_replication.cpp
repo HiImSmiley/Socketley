@@ -145,6 +145,14 @@ bool storage_run::replicate_change(const change_note& n)
     const auto cfg = m_store.bucket_replication(n.bucket);
     if (!cfg || n.who.replica)
         return false;
+    // A tag change follows a version that was copied or is on its way, as in S3.
+    if (n.event == ev_tagging_put || n.event == ev_tagging_del)
+    {
+        const object_meta* m = m_store.find_version(n.bucket, n.key, n.version_id);
+        const std::string_view status = m ? replication_status_of(*m) : std::string_view{};
+        return (status == replication_completed || status == replication_pending) &&
+               m_repl.enqueue_tags(*cfg, n.bucket, n.key, n.version_id, n.tags);
+    }
     if (n.has_object)
         return n.replication == replication_pending && m_repl.enqueue(*cfg, n.bucket, n.key, n.version_id, false, n.tags);
     // A delete marker a client made is copied, and one a lifecycle rule made is not, as in S3.

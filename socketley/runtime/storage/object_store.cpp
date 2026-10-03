@@ -3163,10 +3163,11 @@ std::function<void(st, std::string)> object_store::noted_header(const bucket& b,
                                                                 const header_change& c,
                                                                 std::function<void(st, std::string)> cb)
 {
-    if (!b.notify || !m_sink || c.what != header_change::kind::tags)
+    if ((!b.notify && !b.replication) || !m_sink || c.what != header_change::kind::tags)
         return cb;
     const uint16_t bit = c.value.empty() ? ev_tagging_del : ev_tagging_put;
-    return [this, bucket = b.name, key = std::string(key), who = c.who, bit, cb = std::move(cb)](st s, std::string id)
+    return [this, bucket = b.name, key = std::string(key), who = c.who, bit, tags = c.value,
+            cb = std::move(cb)](st s, std::string id)
     {
         if (s != st::ok)
         {
@@ -3179,6 +3180,7 @@ std::function<void(st, std::string)> object_store::noted_header(const bucket& b,
         n.who        = who;
         n.event      = bit;
         n.version_id = id;
+        n.tags       = tags;
         m_sink->made(std::move(n), [cb, s, id = std::move(id)]() mutable { cb(s, std::move(id)); });
     };
 }

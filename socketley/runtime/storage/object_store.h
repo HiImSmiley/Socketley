@@ -1167,7 +1167,8 @@ private:
     void lane_settle(const std::string& bucket_name, const std::string& key, uint64_t ticket, bool made);
     // True when a test aid takes the change over: it dies once the events are durable and before the change is made.
     bool killed_after_event(uint64_t ticket, std::string_view key);
-    // The answer to a header change, which waits for its event when the bucket has a notification configuration.
+    // The answer to a tag change, which waits for its event and its copy when the bucket has a notification or a
+    // replication configuration.
     std::function<void(st, std::string)> noted_header(const bucket& b, std::string_view key, const header_change& c,
                                                       std::function<void(st, std::string)> cb);
     // A test hook: a commit of a key with this prefix kills the process after

@@ -7627,9 +7627,11 @@ header's slot, which then carries it with the tags, the retention and the hold.
 What a version is copied by is decided when its metadata is made: a PutObject or
 POST, a CopyObject (whose source's status is never copied), a
 CreateMultipartUpload for the object its completion makes, and a script's put.
-Not copied, as in S3: a version removed by its id, a delete marker a lifecycle
-rule made, a version written before the configuration, a later tag change, and an
-SSE\-C version, which has no status.
+A later tag change or tag removal of a version that is COMPLETED or PENDING is
+copied too, to the same version id there, as in S3; it has no status of its own,
+and one the destination refuses is logged and given up. Not copied, as in S3: a
+version removed by its id, a delete marker a lifecycle rule made, a version written
+before the configuration, and an SSE\-C version, which has no status.
 .PP
 A version is copied by a signed PutObject streamed from its file \(em with its
 Content\-Type, Cache\-Control, Content\-Disposition, Content\-Encoding,
@@ -7641,12 +7643,15 @@ version is read in the clear, over the target's https when its URL is one, and
 written with
 .BR "x\-amz\-server\-side\-encryption: AES256" ,
 which a destination without a master key refuses; a delete marker is a signed
-DeleteObject of the key. Every request carries
+DeleteObject of the key, and a tag change a signed PutObjectTagging or
+DeleteObjectTagging of the version. Every request carries
 .BR "x\-amz\-replication\-status: REPLICA" .
 A storage runtime that is the destination judges such a write as
-.B s3:ReplicateObject
-and such a delete as
+.BR s3:ReplicateObject ,
+such a delete as
 .B s3:ReplicateDelete
+and such a tag change as
+.B s3:ReplicateTags
 (see
 .BR "Bucket policy" ),
 marks the version REPLICA, and never copies a replica or a replica's delete
@@ -8021,8 +8026,9 @@ cover the two notification configuration operations, and GetReplicationConfigura
 and PutReplicationConfiguration the three replication ones. A write that sends
 .B "x\-amz\-replication\-status: REPLICA"
 (PutObject and the steps of a multipart upload) is ReplicateObject instead of
-PutObject, and such a DeleteObject is ReplicateDelete: a user allowed those two and
-nothing else can be the destination's replication user.
+PutObject, such a DeleteObject is ReplicateDelete, and such a PutObjectTagging or
+DeleteObjectTagging is ReplicateTags: a user allowed those three and nothing else can
+be the destination's replication user.
 .TP
 .B Resource
 one or a list of

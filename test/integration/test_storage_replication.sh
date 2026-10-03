@@ -13,15 +13,16 @@
 #               an overwrite is a new version on the replica, a delete marker is
 #               copied where the rule says and not where it does not; the
 #               replica keeps the ETag, type, cache control, disposition, user
-#               metadata, tags and checksum; a multipart version is copied in
-#               its parts (same multipart ETag, parts count and composite
-#               checksum); an SSE-S3 version is written SSE-S3
+#               metadata, tags, checksum and version id; a later tag change and
+#               a tag removal follow the version; a multipart version is copied
+#               in its parts (same multipart ETag, parts count, composite
+#               checksum and version id); an SSE-S3 version is written SSE-S3
 #   status      PENDING, then COMPLETED on the source, REPLICA on the replica,
 #               FAILED for a destination user that may not replicate and for a
 #               destination bucket that is not there; replication_pending,
 #               _completed, _failed, _retries and _bytes in stats
-#   policy      a destination user allowed s3:ReplicateObject and
-#               s3:ReplicateDelete only: its copies land, its own writes and
+#   policy      a destination user allowed s3:ReplicateObject,
+#               s3:ReplicateDelete and s3:ReplicateTags only: its copies land, its own writes and
 #               reads are refused; a user that may only read cannot write a
 #               replica; a client cannot set another status
 #   down        a destination stopped while versions are answered gets them
@@ -118,7 +119,7 @@ cat > "$CREDS" <<EOF
 $ADMIN_AK:$ADMIN_SK
 
 [replicator]
-policy = {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ReplicateObject","s3:ReplicateDelete"],"Resource":"arn:aws:s3:::*/*"}]}
+policy = {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ReplicateObject","s3:ReplicateDelete","s3:ReplicateTags"],"Resource":"arn:aws:s3:::*/*"}]}
 $REPL_AK:$REPL_SK
 
 [reader]

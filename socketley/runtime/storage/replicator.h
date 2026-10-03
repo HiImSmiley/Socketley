@@ -89,6 +89,10 @@ public:
     // `cfg` that replicates it; true when anything was queued, whose entries sync() then waits for.
     bool enqueue(const replication_config& cfg, const std::string& bucket, const std::string& key,
                  const std::string& version_id, bool marker, std::string_view tags);
+    // Queues the tags `tags` of version `version_id` of `key`, an empty set for tags removed, for every rule of `cfg`
+    // that replicates the version as tagged so; true when anything was queued.
+    bool enqueue_tags(const replication_config& cfg, const std::string& bucket, const std::string& key,
+                      const std::string& version_id, std::string_view tags);
     // The same for a change about to be made, its entries written and their sync started beside the change's, held
     // back until settle(); returns the change's ticket, 0 when nothing would be copied.
     uint64_t stage(std::string_view check, const replication_config& cfg, const std::string& bucket,
@@ -116,11 +120,14 @@ private:
     {
         uint64_t    id{0};
         bool        marker{false};
+        // A version's tags, set or removed, rather than the version itself; `tags` is the set in tags_of()'s encoding.
+        bool        tagging{false};
         std::string bucket;
         std::string key;
         std::string version_id;
         std::string dest_bucket;
         std::string storage_class;
+        std::string tags;
     };
     struct job;
     // One target's queue, the one copy it has in flight, and its pause after a failure.
@@ -155,6 +162,7 @@ private:
 
     // The steps of one copy, in replicator.cpp.
     void run_marker(lane& l, const std::shared_ptr<job>& j);
+    void run_tags(lane& l, const std::shared_ptr<job>& j);
     void run_put(lane& l, const std::shared_ptr<job>& j);
     void opened(lane& l, const std::shared_ptr<job>& j, open_result o);
     void send_single(lane& l, const std::shared_ptr<job>& j);

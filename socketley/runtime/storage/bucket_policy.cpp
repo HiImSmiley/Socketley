@@ -168,7 +168,7 @@ constexpr action_name action_names[] = {
     {"GetObjectVersionTorrent", res_kind::object, s3_action::none},
     {"ReplicateObject", res_kind::object, s3_action::replicate_object},
     {"ReplicateDelete", res_kind::object, s3_action::replicate_delete},
-    {"ReplicateTags", res_kind::object, s3_action::none},
+    {"ReplicateTags", res_kind::object, s3_action::replicate_tags},
     {"ListBucketVersions", res_kind::bucket, s3_action::list_bucket_versions},
     {"GetBucketAcl", res_kind::bucket, s3_action::get_bucket_acl},
     {"PutBucketAcl", res_kind::bucket, s3_action::put_bucket_acl},
@@ -706,6 +706,7 @@ bool action_on_object(s3_action a)
         case s3_action::bypass_governance_retention:
         case s3_action::replicate_object:
         case s3_action::replicate_delete:
+        case s3_action::replicate_tags:
             return true;
         default:
             return false;

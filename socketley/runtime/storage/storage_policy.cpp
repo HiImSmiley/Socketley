@@ -134,6 +134,8 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
         plain = s3_action::replicate_object;
     else if (replica_request(r) && plain == s3_action::delete_object && !r.key.empty())
         plain = s3_action::replicate_delete;
+    else if (replica_request(r) && (plain == s3_action::put_object_tagging || plain == s3_action::delete_object_tagging))
+        plain = s3_action::replicate_tags;
     const s3_action action = r.has_query("versionId") ? version_action(plain) : plain;
 
     policy_request pr;

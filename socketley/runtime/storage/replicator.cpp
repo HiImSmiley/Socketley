@@ -233,7 +233,7 @@ bool replicator::open(const std::string& dir, uint32_t shard, const outbox::chan
         t.id = id;
         if (!r.u8(kind) || !r.bytes(target, 4096) || !r.bytes(t.bucket, 4096) || !r.bytes(t.key, 4096) ||
             !r.bytes(t.version_id, 4096) || !r.bytes(t.dest_bucket, 4096) || !r.bytes(t.storage_class, 4096) ||
-            (kind != 'P' && kind != 'M'))
+            (kind != 'P' && kind != 'M' && kind != 'G') || (kind == 'G' && !r.bytes(t.tags, 64 * 1024)))
         {
             ++dropped;
             return false;
@@ -244,8 +244,9 @@ bool replicator::open(const std::string& dir, uint32_t shard, const outbox::chan
             ++dropped;
             return false;
         }
-        t.marker = kind == 'M';
-        if (!t.marker)
+        t.marker  = kind == 'M';
+        t.tagging = kind == 'G';
+        if (kind == 'P')
             ++m_open[version_key(t.bucket, t.key, t.version_id)];
         l->q.push_back(std::move(t));
         ++m_pending;
@@ -312,13 +313,15 @@ replicator::lane* replicator::tasks_for(const replication_config& cfg, const std
 std::string replicator::encode_task(const lane& l, const task& t)
 {
     bytes::writer w;
-    w.u8(t.marker ? 'M' : 'P');
+    w.u8(t.tagging ? 'G' : t.marker ? 'M' : 'P');
     w.bytes(l.target.name);
     w.bytes(t.bucket);
     w.bytes(t.key);
     w.bytes(t.version_id);
     w.bytes(t.dest_bucket);
     w.bytes(t.storage_class);
+    if (t.tagging)
+        w.bytes(t.tags);
     return w.take();
 }
 
@@ -338,6 +341,22 @@ bool replicator::enqueue(const replication_config& cfg, const std::string& bucke
         m_open[version_key(bucket, key, version_id)] += static_cast<uint32_t>(tasks.size());
     for (task& t : tasks)
         push(*l, std::move(t), false);
+    return true;
+}
+
+bool replicator::enqueue_tags(const replication_config& cfg, const std::string& bucket, const std::string& key,
+                             const std::string& version_id, std::string_view tags)
+{
+    std::vector<task> tasks;
+    lane* l = tasks_for(cfg, bucket, key, version_id, false, tags, tasks);
+    if (!l)
+        return false;
+    for (task& t : tasks)
+    {
+        t.tagging = true;
+        t.tags    = std::string(tags);
+        push(*l, std::move(t), false);
+    }
     return true;
 }
 
@@ -439,7 +458,9 @@ void replicator::start(lane& l)
     j->t     = l.q.front();
     l.active = j;
     arm_timer();
-    if (j->t.marker)
+    if (j->t.tagging)
+        run_tags(l, j);
+    else if (j->t.marker)
         run_marker(l, j);
     else
         run_put(l, j);
@@ -484,9 +505,12 @@ void replicator::ended(lane& l, outcome o, uint64_t bytes)
     const task& t = j->t;
     // A streak of failures is said once, at its start, and a refusal every time.
     if ((o == outcome::retry && l.failures == 0) || o == outcome::refused)
-        LOG_WARN(("storage: copying " + t.bucket + "/" + t.key + (t.marker ? " (a delete marker)" : "") + " to " +
-                  l.target.name + ":" + t.dest_bucket + " failed (" + j->why + ")" +
-                  (o == outcome::retry ? "; it is tried again until it is taken" : "; the version is FAILED"))
+        LOG_WARN(("storage: copying " + t.bucket + "/" + t.key +
+                  (t.tagging ? " (its tags)" : t.marker ? " (a delete marker)" : "") + " to " + l.target.name + ":" +
+                  t.dest_bucket + " failed (" + j->why + ")" +
+                  (o == outcome::retry        ? "; it is tried again until it is taken"
+                   : t.marker || t.tagging    ? "; it is given up"
+                                              : "; the version is FAILED"))
                      .c_str());
     if (o == outcome::retry)
     {
@@ -512,7 +536,8 @@ void replicator::ended(lane& l, outcome o, uint64_t bytes)
         l.next_try = {};
         start(l);
     };
-    if (t.marker)
+    // A delete marker and a tag change have no status of their own to write.
+    if (t.marker || t.tagging)
     {
         retire();
         return;
@@ -634,6 +659,28 @@ void replicator::run_marker(lane& l, const std::shared_ptr<job>& j)
     rq.head = signed_head(l, "DELETE", object_path(l.target.http, j->t.dest_bucket, j->t.key), {},
                           {{"x-amz-replication-status", "REPLICA"},
                            {std::string(replica_version_header), j->t.version_id}}, 0);
+    exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>&, http_answer a)
+    {
+        ended(lp, a.status / 100 == 2 ? outcome::done : judge(a), 0);
+    });
+}
+
+void replicator::run_tags(lane& l, const std::shared_ptr<job>& j)
+{
+    const std::string query = "tagging=&versionId=" + url_encode(j->t.version_id, false);
+    const std::string path  = object_path(l.target.http, j->t.dest_bucket, j->t.key);
+    std::vector<std::pair<std::string, std::string>> h{{"x-amz-replication-status", "REPLICA"}};
+    http_request rq;
+    if (j->t.tags.empty())
+        rq.head = signed_head(l, "DELETE", path, query, std::move(h), 0);
+    else
+    {
+        rq.body = tagging_xml(decode_tags(j->t.tags));
+        const auto md5 = md5_of(rq.body);
+        h.emplace_back("content-md5", base64_encode(std::string_view(reinterpret_cast<const char*>(md5.data()), 16)));
+        h.emplace_back("content-type", "application/xml");
+        rq.head = signed_head(l, "PUT", path, query, std::move(h), rq.body.size());
+    }
     exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>&, http_answer a)
     {
         ended(lp, a.status / 100 == 2 ? outcome::done : judge(a), 0);

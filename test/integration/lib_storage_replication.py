@@ -263,6 +263,19 @@ def mode_main(sp, dp):
           [("level", "1"), ("team", "core")], tags)
     check("and its bytes", body(dst, DB, "docs/a") == data)
 
+    # A later tag change of a copied version follows it to the same version id there.
+    def dst_tags():
+        r = call(dst.get_object_tagging, Bucket=DB, Key="docs/a", VersionId=put["VersionId"])
+        return sorted((t["Key"], t["Value"]) for t in r["TagSet"]) if isinstance(r, dict) else r
+    call(src.put_object_tagging, Bucket=SB, Key="docs/a", VersionId=put["VersionId"],
+         Tagging={"TagSet": [{"Key": "team", "Value": "ops"}]})
+    check("a tag change of a copied version is copied", wait_for(lambda: dst_tags() == [("team", "ops")], 20),
+          dst_tags())
+    call(src.delete_object_tagging, Bucket=SB, Key="docs/a", VersionId=put["VersionId"])
+    check("and so is the removal of its tags", wait_for(lambda: dst_tags() == [], 20), dst_tags())
+    check("which leaves the version's status as it was", status(src, SB, "docs/a") == "COMPLETED",
+          status(src, SB, "docs/a"))
+
     # The tag rule, and what no rule names.
     src.put_object(Bucket=SB, Key="img/x", Body=b"hot image", Tagging="class=hot")
     src.put_object(Bucket=SB, Key="img/y", Body=b"cold image", Tagging="class=cold")
@@ -340,10 +353,10 @@ def mode_main(sp, dp):
           wait_for(lambda: status(src, "rsrc-gone", "k") == "FAILED", 20), status(src, "rsrc-gone", "k"))
 
     sizes = 100 * 1024 + 9 + 5000 + 11 * (1 << 20) + 70000 + 1
-    # The counters `stats` shows are a moment old, so the wait is for them to catch up.
+    # The counters `stats` shows are a moment old, so the wait is for them to catch up; the two tag changes count.
     check("stats count what was copied, its bytes, what failed, and that nothing waits",
           wait_for(lambda: stat("rsrc", "replication_pending") == 0 and
-                   stat("rsrc", "replication_completed") == 7 and stat("rsrc", "replication_bytes") == sizes and
+                   stat("rsrc", "replication_completed") == 9 and stat("rsrc", "replication_bytes") == sizes and
                    stat("rsrc", "replication_failed") == 2, 10), rstats("rsrc"))
 
     check("a configuration is deleted", isinstance(call(src.delete_bucket_replication, Bucket="rsrc-gone"), dict) and

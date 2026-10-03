@@ -82,6 +82,7 @@ enum class s3_action : uint8_t
     // A write or a delete marker another runtime's replication makes, which is asked instead of the plain action.
     replicate_object,
     replicate_delete,
+    replicate_tags,
     count,
 };
 static_assert(static_cast<int>(s3_action::count) <= 64);
