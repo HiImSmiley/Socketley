@@ -5,6 +5,7 @@
 // Pure encoding with no I/O, so a unit test and a fuzz target reach it without a ring.
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -16,6 +17,46 @@
 namespace socketley::storage
 {
 
+// An object's own checksum as raw bytes, which is base64 only in an answer and on disk.
+struct object_checksum
+{
+    checksum_algo algo{checksum_algo::none};
+    // The N of a COMPOSITE value's -N, and 0 for a checksum of the object's whole bytes.
+    uint16_t composite{0};
+    std::array<uint8_t, 32> raw{};
+
+    explicit operator bool() const { return algo != checksum_algo::none; }
+    std::string_view raw_bytes() const
+    {
+        return {reinterpret_cast<const char*>(raw.data()), checksum_raw_len(algo)};
+    }
+    // The value as S3 shows it: base64, with -N after a composite one.
+    std::string b64() const;
+    // FULL_OBJECT or COMPOSITE.
+    std::string_view type() const { return composite ? "COMPOSITE" : "FULL_OBJECT"; }
+
+    bool operator==(const object_checksum&) const = default;
+};
+
+// A content type, which the objects of a store share one copy of for the first few hundred types it sees.
+class content_type_ref
+{
+public:
+    content_type_ref() = default;
+    content_type_ref& operator=(std::string_view v);
+
+    const std::string& str() const;
+    operator const std::string&() const { return str(); }
+    size_t size() const { return str().size(); }
+    bool   empty() const { return str().empty(); }
+
+    friend bool operator==(const content_type_ref& a, const content_type_ref& b) { return a.str() == b.str(); }
+    friend bool operator==(const content_type_ref& a, std::string_view b) { return a.str() == b; }
+
+private:
+    std::shared_ptr<const std::string> m_v;
+};
+
 // Everything S3 tells a client about an object beyond its bytes.
 struct object_meta
 {
@@ -25,7 +66,9 @@ struct object_meta
     md5_t    md5{};
     // Zero for a single-part object, else the part count of the multipart ETag.
     uint32_t parts{0};
-    std::string content_type;
+    // On disk it is the extra entry checksum_header(algo), so a header or journal written before reads the same.
+    object_checksum checksum;
+    content_type_ref content_type;
     // Lowercase header name and value: cache-control, content-disposition,
     // content-encoding, content-language, expires and every x-amz-meta-*.
     std::vector<std::pair<std::string, std::string>> extra;
@@ -96,8 +139,15 @@ void clear_part_layout(object_meta& m);
 // placeholder of its length; true when the value must be taken from the bytes.
 bool copy_checksum(object_meta& copy, const object_meta& src, checksum_algo algo);
 
-// Puts `b64` in place of `m`'s value of `algo`.
-void set_checksum(object_meta& m, checksum_algo algo, std::string b64);
+// Makes `raw` `m`'s checksum of its whole bytes in `algo`.
+void set_checksum(object_meta& m, checksum_algo algo, std::string_view raw);
+// Makes `b64`, as S3 shows it, `m`'s checksum in `algo`, kept as an extra entry when it is not as b64() renders.
+void set_checksum_b64(object_meta& m, checksum_algo algo, std::string b64);
+// A checksum `algo` of no bytes yet, as wide as the value or, with `composite`, the -N it will have, so a header
+// reserves room for it.
+void reserve_checksum(object_meta& m, checksum_algo algo, uint16_t composite = 0);
+// The bytes of the extra entry `m`'s checksum is on disk, 0 for none.
+size_t checksum_meta_bytes(const object_meta& m);
 
 // The algorithm S3 gives the checksum of a new object that arrives without one.
 inline constexpr checksum_algo default_checksum_algo = checksum_algo::crc64nvme;

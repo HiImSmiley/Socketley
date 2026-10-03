@@ -396,7 +396,7 @@ bool page_writer::fits(const std::string& name, size_t cost)
 
 void page_writer::object(const std::string& key, const object_meta& meta)
 {
-    size_t cost = key.size() + meta.content_type.size() + 96;
+    size_t cost = key.size() + meta.content_type.size() + checksum_meta_bytes(meta) + 96;
     for (const auto& [n, v] : meta.extra)
         cost += n.size() + v.size() + 8;
     if (!fits(key, cost))

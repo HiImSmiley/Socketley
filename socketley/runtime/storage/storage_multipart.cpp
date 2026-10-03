@@ -286,7 +286,7 @@ void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint3
 
     object_meta meta;
     if (algo != checksum_algo::none)
-        meta.extra.emplace_back(std::string(checksum_header(algo)), std::string(checksum_b64_len(algo), 'A'));
+        reserve_checksum(meta, algo);
     else
         meta.extra.emplace_back(std::string(part_crc_extra), std::string(checksum_b64_len(checksum_algo::crc64nvme), 'A'));
     // The key that opens the source and the one the part is sealed under, both refused before a byte is read.
@@ -329,9 +329,7 @@ void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint3
         std::string x(xml_decl);
         x += "<CopyPartResult xmlns=\"" + std::string(s3_xmlns) + "\"><LastModified>" + iso8601(pr.meta.mtime_ms) +
              "</LastModified><ETag>" + quoted_etag(pr.meta) + "</ETag>";
-        for (const auto& [n, v] : pr.meta.extra)
-            if (const checksum_algo a = checksum_from_header(n); a != checksum_algo::none)
-                x += checksum_element(a, v);
+        x += checksum_element(pr.meta.checksum.algo, pr.meta.checksum.b64());
         x += "</CopyPartResult>";
         resp.body = std::move(x);
         send_response(cc, std::move(resp));
@@ -386,9 +384,8 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
         if (!promised.empty())
         {
             std::string held;
-            for (const auto& [n, v] : m.extra)
-                if (is_checksum_header(n))
-                    held = n + ":" + v;
+            if (m.checksum)
+                held = std::string(checksum_header(m.checksum.algo)) + ":" + m.checksum.b64();
             // A composite value may be given with or without its -N.
             if (held != promised && held.substr(0, held.rfind('-')) != promised)
             {
@@ -431,13 +428,7 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
 void storage_run::send_completed(const std::shared_ptr<conn>& c, const object_meta& m, const std::string& checksum_b64)
 {
     const s3_request& r = c->req;
-    const checksum_algo algo = [&]
-    {
-        for (const auto& [n, v] : m.extra)
-            if (const checksum_algo a = checksum_from_header(n); a != checksum_algo::none)
-                return a;
-        return checksum_algo::none;
-    }();
+    const checksum_algo algo = m.checksum.algo;
     response resp;
     resp.headers.emplace_back("Content-Type", "application/xml");
     if (has_version(m))
@@ -460,11 +451,7 @@ void storage_run::completed_before(const std::shared_ptr<conn>& c, const std::st
                     from = &v;
         if (from && *from == id)
         {
-            std::string checksum;
-            for (const auto& [n, v] : m->extra)
-                if (checksum_from_header(n) != checksum_algo::none)
-                    checksum = v;
-            send_completed(cc, *m, checksum);
+            send_completed(cc, *m, m->checksum.b64());
             return;
         }
         send_error(cc, missing, false, "UploadId", id);

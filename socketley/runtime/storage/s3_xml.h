@@ -526,9 +526,8 @@ inline std::string copy_result_xml(const object_meta& m)
     x += "<CopyObjectResult xmlns=\"" + std::string(s3_xmlns) + "\"><LastModified>" +
          iso8601(m.mtime_ms) + "</LastModified><ETag>" + quoted_etag(m) + "</ETag>";
     // A copy's checksum is always of its whole bytes.
-    for (const auto& [n, v] : m.extra)
-        if (const checksum_algo a = checksum_from_header(n); a != checksum_algo::none)
-            x += "<ChecksumType>FULL_OBJECT</ChecksumType>" + checksum_element(a, v);
+    if (m.checksum)
+        x += "<ChecksumType>FULL_OBJECT</ChecksumType>" + checksum_element(m.checksum.algo, m.checksum.b64());
     x += "</CopyObjectResult>";
     return x;
 }

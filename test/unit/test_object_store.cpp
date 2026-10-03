@@ -323,6 +323,132 @@ TEST_CASE("a journal record decodes whole, torn and corrupt")
     CHECK(decode_journal_record(flipped).status == record_status::corrupt);
 }
 
+TEST_CASE("a checksum is held as raw bytes and written as the extra entry headers and journals always had")
+{
+    auto sum = [](checksum_algo a, std::string_view data)
+    {
+        checksum_stream s(a);
+        s.update(data.data(), data.size());
+        return s.peek_b64();
+    };
+    object_meta base;
+    base.size     = 5;
+    base.mtime_ms = 1700000000123;
+    base.md5      = md5_of("hello");
+    base.content_type = "text/plain";
+    base.extra = {{"x-amz-meta-a", "1"}, {"cache-control", "no-cache"}};
+    auto record_of = [](const object_meta& m)
+    {
+        std::string rec;
+        encode_put_record(rec, "k", m);
+        return rec;
+    };
+    auto decoded = [](std::string_view rec)
+    {
+        decoded_record d = decode_journal_record(rec);
+        REQUIRE(d.status == record_status::ok);
+        return d.rec.meta;
+    };
+
+    for (checksum_algo a : {checksum_algo::crc32, checksum_algo::crc32c, checksum_algo::crc64nvme,
+                            checksum_algo::sha1, checksum_algo::sha256})
+    {
+        INFO(checksum_name(a));
+        for (const std::string& value : {sum(a, "hello"), sum(a, "hello") + "-3", sum(a, "hello") + "-10000"})
+        {
+            INFO(value);
+            // What an earlier build wrote: the checksum an extra entry, anywhere among the others.
+            object_meta old = base;
+            old.extra.insert(old.extra.begin() + 1, {std::string(checksum_header(a)), value});
+            const object_meta back = decoded(record_of(old));
+            CHECK(back.checksum.algo == a);
+            CHECK(back.checksum.b64() == value);
+            CHECK(back.checksum.type() == (value.find('-') != std::string::npos ? "COMPOSITE" : "FULL_OBJECT"));
+            CHECK(back.extra == base.extra);
+            CHECK(checksum_algo_of(back) == a);
+
+            // What this build writes is that encoding with the entry last, which an earlier build reads as it wrote.
+            object_meta last = base;
+            last.extra.emplace_back(std::string(checksum_header(a)), value);
+            CHECK(record_of(back) == record_of(last));
+            CHECK(encode_object_header("k", back) == encode_object_header("k", last));
+            const decoded_header h = decode_object_header(encode_object_header("k", back));
+            REQUIRE(h.status == header_status::ok);
+            CHECK(h.meta == back);
+
+            // Room reserved before the value is known is the room the value takes.
+            object_meta reserved = base;
+            reserve_checksum(reserved, a, back.checksum.composite);
+            CHECK(record_of(reserved).size() == record_of(back).size());
+            CHECK(checksum_meta_bytes(back) == checksum_header(a).size() + value.size());
+        }
+    }
+
+    // A value no build of the store writes is kept as it was, byte for byte, and never taken for the checksum.
+    const std::vector<std::pair<std::string, std::string>> odd = {
+        {"x-amz-checksum-crc64nvme", std::string(12, 'A')},
+        {"x-amz-checksum-sha256", "Zm9v-3"},
+        {"x-amz-checksum-crc32", "AAAAAA==-03"},
+        {"x-amz-checksum-crc32", "AAAAAA==-"},
+        {"x-amz-checksum-crc32", "AAAAAA==-70000"},
+        {"x-amz-checksum-crc32", "AAAAAB=="},
+        {"x-amz-checksum-md5", "AAAAAA=="},
+    };
+    for (const auto& e : odd)
+    {
+        INFO(e.first << ": " << e.second);
+        object_meta m = base;
+        m.extra.push_back(e);
+        const object_meta back = decoded(record_of(m));
+        CHECK(!back.checksum);
+        CHECK(back.extra == m.extra);
+        CHECK(record_of(back) == record_of(m));
+    }
+
+    // Only the first value is the checksum, and a second stays an entry.
+    object_meta two = base;
+    two.extra.emplace_back("x-amz-checksum-crc32", sum(checksum_algo::crc32, "a"));
+    two.extra.emplace_back("x-amz-checksum-sha1", sum(checksum_algo::sha1, "a"));
+    const object_meta back = decoded(record_of(two));
+    CHECK(back.checksum.algo == checksum_algo::crc32);
+    REQUIRE(back.extra.size() == 3);
+    CHECK(back.extra.back().first == "x-amz-checksum-sha1");
+
+    // With its content type shared, an index entry holds the widest raw value in 16 bytes more than before checksums.
+    CHECK(sizeof(object_meta) <= 112);
+}
+
+TEST_CASE("objects share one copy of a content type, up to a bound past which each keeps its own")
+{
+    object_meta a, b;
+    a.content_type = std::string("text/x-shared");
+    b.content_type = "text/x-shared";
+    CHECK(a.content_type == "text/x-shared");
+    CHECK(&a.content_type.str() == &b.content_type.str());
+    CHECK(a == b);
+    a.content_type = "";
+    CHECK(a.content_type.empty());
+    CHECK(a.content_type == "");
+
+    // Past the bound a type is still what it was set to, held by the object alone.
+    std::vector<object_meta> many(1000);
+    for (size_t i = 0; i < many.size(); ++i)
+        many[i].content_type = "type/" + std::to_string(i);
+    for (size_t i = 0; i < many.size(); ++i)
+        CHECK(many[i].content_type == "type/" + std::to_string(i));
+    object_meta c, d;
+    c.content_type = "type/after-the-bound";
+    d.content_type = "type/after-the-bound";
+    CHECK(c.content_type == d.content_type);
+    CHECK(&c.content_type.str() != &d.content_type.str());
+    // A type longer than any shared one is kept whole.
+    c.content_type = std::string(300, 'z');
+    CHECK(c.content_type.size() == 300);
+    // One shared before the bound is still shared.
+    d.content_type = "text/x-shared";
+    CHECK(&d.content_type.str() == &b.content_type.str());
+}
+
 TEST_CASE("part sizes are one number when all but the last agree, and a list that does not add up is trusted for nothing")
 {
     CHECK(encode_part_sizes({}).empty());
@@ -1149,10 +1275,12 @@ TEST_CASE("a copy's checksum is of its whole bytes, kept from a source that has 
     const std::string body = pattern((2u << 20) + 77, 3);
     // A composite value is of parts, and a whole one is kept as it is even when nothing checks it.
     object_meta comp;
-    comp.extra = {{"x-amz-checksum-sha256", "Zm9v-3"}};
+    set_checksum_b64(comp, checksum_algo::sha256, base64_encode(std::string(32, 'f')) + "-3");
+    REQUIRE(comp.checksum.composite == 3);
     REQUIRE(r.put("ckb", "comp", body, comp).status == st::ok);
     object_meta whole;
-    whole.extra = {{"x-amz-checksum-crc32", "AAAAAA=="}};
+    set_checksum_b64(whole, checksum_algo::crc32, "AAAAAA==");
+    REQUIRE(whole.checksum);
     REQUIRE(r.put("ckb", "whole", body, whole).status == st::ok);
 
     auto sum_of = [&](checksum_algo a)
@@ -1172,15 +1300,16 @@ TEST_CASE("a copy's checksum is of its whole bytes, kept from a source that has 
         object_meta gm;
         REQUIRE(r.get("ckb", dst, got, &gm) == st::ok);
         CHECK(got == body);
+        CHECK(gm.extra.empty());
         CHECK(gm.extra == out.meta.extra);
-        return gm.extra;
+        CHECK(gm.checksum == out.meta.checksum);
+        return gm.checksum ? std::string(checksum_header(gm.checksum.algo)) + ":" + gm.checksum.b64() : std::string{};
     };
-    using extras = std::vector<std::pair<std::string, std::string>>;
-    CHECK(copied("comp", "c-sha", checksum_algo::sha256) == extras{{"x-amz-checksum-sha256", sum_of(checksum_algo::sha256)}});
-    CHECK(copied("comp", "c-crc", checksum_algo::crc32c) == extras{{"x-amz-checksum-crc32c", sum_of(checksum_algo::crc32c)}});
+    CHECK(copied("comp", "c-sha", checksum_algo::sha256) == "x-amz-checksum-sha256:" + sum_of(checksum_algo::sha256));
+    CHECK(copied("comp", "c-crc", checksum_algo::crc32c) == "x-amz-checksum-crc32c:" + sum_of(checksum_algo::crc32c));
     CHECK(copied("comp", "c-none", checksum_algo::none).empty());
-    CHECK(copied("whole", "w-kept", checksum_algo::crc32) == extras{{"x-amz-checksum-crc32", "AAAAAA=="}});
-    CHECK(copied("whole", "w-sha1", checksum_algo::sha1) == extras{{"x-amz-checksum-sha1", sum_of(checksum_algo::sha1)}});
+    CHECK(copied("whole", "w-kept", checksum_algo::crc32) == "x-amz-checksum-crc32:AAAAAA==");
+    CHECK(copied("whole", "w-sha1", checksum_algo::sha1) == "x-amz-checksum-sha1:" + sum_of(checksum_algo::sha1));
 }
 
 TEST_CASE("a quota refuses a body that would not fit and counts what it holds")

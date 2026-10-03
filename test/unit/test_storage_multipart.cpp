@@ -423,7 +423,7 @@ struct rig : io_handler
             *given = place;
         object_meta meta;
         if (algo != checksum_algo::none)
-            meta.extra.emplace_back(std::string(checksum_header(algo)), std::string(checksum_b64_len(algo), 'A'));
+            reserve_checksum(meta, algo);
         else if (part_crcs)
             meta.extra.emplace_back(std::string(part_crc_extra), std::string(checksum_b64_len(checksum_algo::crc64nvme), 'A'));
         if (place.off)
@@ -773,24 +773,18 @@ TEST_CASE("uploads and their parts are found again by a new store on the same di
     CHECK(got.content_type == "text/kept");
     CHECK(got.parts == 2);
     // The checksum of the whole is the SHA-256 of the part checksums, and it is stored.
-    bool found = false;
-    for (const auto& [n, v] : got.extra)
-        if (n == "x-amz-checksum-sha256")
+    const std::string raw = [&] {
+        std::string x;
+        for (std::string_view part : {std::string_view(p1), std::string_view("tail")})
         {
-            found = true;
-            const std::string raw = [&] {
-                std::string x;
-                for (std::string_view part : {std::string_view(p1), std::string_view("tail")})
-                {
-                    checksum_stream cs(checksum_algo::sha256);
-                    cs.update(part.data(), part.size());
-                    x += cs.peek_raw();
-                }
-                return x;
-            }();
-            CHECK(v == composite_checksum_b64(checksum_algo::sha256, raw, 2));
+            checksum_stream cs(checksum_algo::sha256);
+            cs.update(part.data(), part.size());
+            x += cs.peek_raw();
         }
-    CHECK(found);
+        return x;
+    }();
+    CHECK(got.checksum.algo == checksum_algo::sha256);
+    CHECK(got.checksum.b64() == composite_checksum_b64(checksum_algo::sha256, raw, 2));
 }
 
 TEST_CASE("the parts count against the quota and complete gives them back")
@@ -891,10 +885,7 @@ TEST_CASE("equal parts are written into the data file at their place and the fil
     CHECK(got.content_type == "text/y");
     CHECK(got.parts == 4);
     CHECK(got.etag() == done.meta.etag());
-    bool has_ck = false;
-    for (const auto& [n, v] : got.extra)
-        has_ck = has_ck || n == "x-amz-checksum-crc32";
-    CHECK(has_ck);
+    CHECK(got.checksum.algo == checksum_algo::crc32);
     REQUIRE(r.until([&] { return r.mp->find("bkt", id) == nullptr; }));
     // Nothing of the completion is still counted as in flight.
     CHECK(r.until([&] { return !r.mp->busy(); }));
@@ -939,12 +930,8 @@ TEST_CASE("the room in front of part 1 of an upload with no algorithm holds its 
     object_meta m;
     REQUIRE(r->object("bkt", "edge0", got, &m) == st::ok);
     CHECK(got == body);
-    const std::string* sum = nullptr;
-    for (const auto& [n, v] : m.extra)
-        if (n == checksum_header(checksum_algo::crc64nvme))
-            sum = &v;
-    REQUIRE(sum);
-    CHECK(*sum == b64_of(checksum_algo::crc64nvme, body));
+    REQUIRE(m.checksum.algo == checksum_algo::crc64nvme);
+    CHECK(m.checksum.b64() == b64_of(checksum_algo::crc64nvme, body));
 }
 
 TEST_CASE("parts that are not where the object needs them are copied, from the data file and their own")
@@ -1220,7 +1207,7 @@ TEST_CASE("a part list keeps each part's checksum in the header when it fits and
         m.size += bodies[i].size();
     }
     m.parts = 3;
-    m.extra.emplace_back("x-amz-checksum-sha256", "composite-3");
+    reserve_checksum(m, checksum_algo::sha256, 3);
     CHECK(checksum_algo_of(m) == checksum_algo::sha256);
 
     SUBCASE("in the header")
@@ -1297,13 +1284,14 @@ TEST_CASE("a single-part object is its own part 1 with its own checksum, unless 
 {
     object_meta m;
     m.size = 4;
-    m.extra.emplace_back("x-amz-checksum-crc32", b64_of(checksum_algo::crc32, "abcd"));
+    set_checksum_b64(m, checksum_algo::crc32, b64_of(checksum_algo::crc32, "abcd"));
     part_list l;
     REQUIRE(part_list_of(m, l));
     REQUIRE(l.checksums.size() == 1);
     CHECK(l.checksums[0] == raw_of(checksum_algo::crc32, "abcd"));
     // A copy of a multipart object keeps a composite value, which is of parts it no longer has.
-    m.extra[0].second = b64_of(checksum_algo::crc32, "abcd") + "-3";
+    set_checksum_b64(m, checksum_algo::crc32, b64_of(checksum_algo::crc32, "abcd") + "-3");
+    CHECK(m.checksum.composite == 3);
     REQUIRE(part_list_of(m, l));
     CHECK(l.checksums.empty());
 }
@@ -1336,7 +1324,7 @@ TEST_CASE("a completed upload keeps each part's checksum, in the header copied o
             const std::string cand = r->create("bkt", s.key, s.algo, meta);
             object_meta full = meta;
             full.parts = 3;
-            full.extra.emplace_back("x-amz-checksum-sha256", std::string(46, 'A'));
+            reserve_checksum(full, checksum_algo::sha256, 3);
             full.extra.emplace_back(std::string(part_sizes_extra), std::to_string(P));
             full.extra.emplace_back(std::string(part_checksums_extra), std::string(128, 'A'));
             full.extra.emplace_back(std::string(upload_id_extra), cand);

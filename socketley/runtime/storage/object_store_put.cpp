@@ -641,8 +641,8 @@ void put_op::finish_now()
         m_meta.md5 = sse_opaque_etag(m_seal->key, m_meta.md5);
     if (m_hs->ck)
     {
-        const std::string got = m_hs->ck->peek_b64();
-        if (!m_ck_expect.empty() && got != m_ck_expect)
+        const std::string got = m_hs->ck->peek_raw();
+        if (!m_ck_expect.empty() && base64_encode(got) != m_ck_expect)
         {
             fail(st::bad_digest);
             return;

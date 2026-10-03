@@ -4,6 +4,8 @@
 #include <charconv>
 #include <cstring>
 #include <cstdio>
+#include <mutex>
+#include <unordered_map>
 
 #include "../../shared/raft_storage.h"
 
@@ -104,6 +106,45 @@ struct reader
     }
 };
 
+bool decimal(std::string_view s, uint64_t& out)
+{
+    const auto r = std::from_chars(s.data(), s.data() + s.size(), out);
+    return !s.empty() && r.ec == std::errc{} && r.ptr == s.data() + s.size();
+}
+
+// The checksum `v` is in `a`, false unless b64() renders it back byte for byte.
+bool parse_checksum(checksum_algo a, std::string_view v, object_checksum& out)
+{
+    const size_t width = checksum_raw_len(a);
+    const size_t chars = checksum_b64_len(a);
+    if (width == 0 || v.size() < chars)
+        return false;
+    object_checksum c;
+    c.algo = a;
+    if (const std::string_view n = v.substr(chars); !n.empty())
+    {
+        uint64_t parts = 0;
+        if (n.size() < 2 || n[0] != '-' || n[1] == '0' || !decimal(n.substr(1), parts) || parts > UINT16_MAX)
+            return false;
+        c.composite = static_cast<uint16_t>(parts);
+    }
+    std::string raw;
+    if (!base64_decode(v.substr(0, chars), raw) || raw.size() != width || base64_encode(raw) != v.substr(0, chars))
+        return false;
+    std::memcpy(c.raw.data(), raw.data(), width);
+    out = c;
+    return true;
+}
+
+// Takes an extra entry that is the object's checksum into `m.checksum`, false for any other entry.
+bool lift_checksum(object_meta& m, std::string_view name, std::string_view value)
+{
+    if (m.checksum || !name.starts_with("x-amz-checksum-"))
+        return false;
+    const checksum_algo a = checksum_from_header(name);
+    return a != checksum_algo::none && parse_checksum(a, value, m.checksum);
+}
+
 bool decode_meta(std::string_view body, std::string& key, object_meta& m)
 {
     reader r{body};
@@ -115,23 +156,76 @@ bool decode_meta(std::string_view body, std::string& key, object_meta& m)
     r.in.remove_prefix(16);
     m.parts = r.u32();
     key     = std::string(r.str());
-    m.content_type = std::string(r.str());
+    m.content_type = r.str();
     const uint32_t n = r.u32();
     if (!r.ok || n > 4096)
         return false;
     m.extra.clear();
+    m.checksum = {};
     for (uint32_t i = 0; i < n; ++i)
     {
-        std::string name(r.str());
-        std::string val(r.str());
+        const std::string_view name = r.str();
+        const std::string_view val  = r.str();
         if (!r.ok)
             return false;
-        m.extra.emplace_back(std::move(name), std::move(val));
+        if (!lift_checksum(m, name, val))
+            m.extra.emplace_back(std::string(name), std::string(val));
     }
     return r.ok && r.in.empty() && key.size() <= max_key_bytes;
 }
 
+// How many content types are shared and how long one may be, so a client cannot grow what is never freed.
+constexpr size_t shared_types    = 512;
+constexpr size_t shared_type_len = 128;
+
 }   // namespace
+
+content_type_ref& content_type_ref::operator=(std::string_view v)
+{
+    using pool_t = std::unordered_map<std::string_view, std::shared_ptr<const std::string>>;
+    // Leaked on purpose, so an assignment made while statics are torn down never meets a destroyed pool.
+    static std::mutex& mu   = *new std::mutex;
+    static pool_t&     pool = *new pool_t;
+    if (v.empty())
+    {
+        m_v.reset();
+        return *this;
+    }
+    if (v.size() <= shared_type_len)
+    {
+        std::lock_guard<std::mutex> g(mu);
+        if (const auto it = pool.find(v); it != pool.end())
+        {
+            m_v = it->second;
+            return *this;
+        }
+        if (pool.size() < shared_types)
+        {
+            auto s = std::make_shared<const std::string>(v);
+            pool.emplace(*s, s);
+            m_v = std::move(s);
+            return *this;
+        }
+    }
+    m_v = std::make_shared<const std::string>(v);
+    return *this;
+}
+
+const std::string& content_type_ref::str() const
+{
+    static const std::string none;
+    return m_v ? *m_v : none;
+}
+
+std::string object_checksum::b64() const
+{
+    if (algo == checksum_algo::none)
+        return {};
+    std::string v = base64_encode(raw_bytes());
+    if (composite)
+        v += "-" + std::to_string(composite);
+    return v;
+}
 
 std::string_view tags_of(const object_meta& m)
 {
@@ -156,12 +250,17 @@ void encode_meta(std::string& out, std::string_view key, const object_meta& m)
     out.append(reinterpret_cast<const char*>(m.md5.data()), 16);
     put_u32(out, m.parts);
     put_str(out, key);
-    put_str(out, m.content_type);
-    put_u32(out, static_cast<uint32_t>(m.extra.size()));
+    put_str(out, m.content_type.str());
+    put_u32(out, static_cast<uint32_t>(m.extra.size() + (m.checksum ? 1 : 0)));
     for (const auto& [n, v] : m.extra)
     {
         put_str(out, n);
         put_str(out, v);
+    }
+    if (m.checksum)
+    {
+        put_str(out, checksum_header(m.checksum.algo));
+        put_str(out, m.checksum.b64());
     }
 }
 
@@ -365,12 +464,6 @@ std::string version_rel_path(std::string_view key, std::string_view id)
 namespace
 {
 
-bool decimal(std::string_view s, uint64_t& out)
-{
-    const auto r = std::from_chars(s.data(), s.data() + s.size(), out);
-    return !s.empty() && r.ec == std::errc{} && r.ptr == s.data() + s.size();
-}
-
 const std::string* extra_of(const object_meta& m, std::string_view name)
 {
     for (const auto& [n, v] : m.extra)
@@ -411,12 +504,17 @@ void header_checksums(const object_meta& m, uint32_t count, std::vector<std::str
     const checksum_algo a = checksum_algo_of(m);
     if (a == checksum_algo::none)
         return;
-    // A composite value is of parts a copy no longer has, so it is no part's checksum.
-    const std::string* v = extra_of(m, m.parts ? part_checksums_extra : checksum_header(a));
-    std::string raw;
     const size_t width = checksum_raw_len(a);
-    if (!v || (!m.parts && v->find('-') != std::string::npos) || !base64_decode(*v, raw) ||
-        raw.size() != width * count)
+    if (!m.parts)
+    {
+        // A composite value is of parts a copy no longer has, so it is no part's checksum.
+        if (!m.checksum.composite && count == 1)
+            out.emplace_back(m.checksum.raw_bytes());
+        return;
+    }
+    const std::string* v = extra_of(m, part_checksums_extra);
+    std::string raw;
+    if (!v || !base64_decode(*v, raw) || raw.size() != width * count)
         return;
     for (uint32_t i = 0; i < count; ++i)
         out.push_back(raw.substr(i * width, width));
@@ -426,10 +524,7 @@ void header_checksums(const object_meta& m, uint32_t count, std::vector<std::str
 
 checksum_algo checksum_algo_of(const object_meta& m)
 {
-    for (const auto& [n, v] : m.extra)
-        if (const checksum_algo a = checksum_from_header(n); a != checksum_algo::none)
-            return a;
-    return checksum_algo::none;
+    return m.checksum.algo;
 }
 
 std::string encode_part_numbers(const std::vector<uint32_t>& numbers, size_t max)
@@ -566,25 +661,43 @@ void clear_part_layout(object_meta& m)
 bool copy_checksum(object_meta& copy, const object_meta& src, checksum_algo algo)
 {
     std::erase_if(copy.extra, [](const auto& e) { return is_checksum_header(e.first); });
+    copy.checksum = {};
     if (algo == checksum_algo::none)
         return false;
     // A composite value, with its -N, is of the source's parts and not of the bytes the copy holds.
-    const std::string* have = extra_of(src, checksum_header(algo));
-    const bool whole = have && have->find('-') == std::string::npos;
-    copy.extra.emplace_back(std::string(checksum_header(algo)),
-                            whole ? *have : std::string(checksum_b64_len(algo), 'A'));
+    const bool whole = src.checksum.algo == algo && !src.checksum.composite;
+    if (whole)
+        copy.checksum = src.checksum;
+    else
+        reserve_checksum(copy, algo);
     return !whole;
 }
 
-void set_checksum(object_meta& m, checksum_algo algo, std::string b64)
+void set_checksum(object_meta& m, checksum_algo algo, std::string_view raw)
 {
-    for (auto& [n, v] : m.extra)
-        if (n == checksum_header(algo))
-        {
-            v = std::move(b64);
-            return;
-        }
+    m.checksum      = {};
+    m.checksum.algo = algo;
+    std::memcpy(m.checksum.raw.data(), raw.data(), std::min(raw.size(), m.checksum.raw.size()));
+}
+
+void set_checksum_b64(object_meta& m, checksum_algo algo, std::string b64)
+{
+    if (parse_checksum(algo, b64, m.checksum))
+        return;
+    m.checksum = {};
     m.extra.emplace_back(std::string(checksum_header(algo)), std::move(b64));
+}
+
+size_t checksum_meta_bytes(const object_meta& m)
+{
+    return m.checksum ? checksum_header(m.checksum.algo).size() + m.checksum.b64().size() : 0;
+}
+
+void reserve_checksum(object_meta& m, checksum_algo algo, uint16_t composite)
+{
+    m.checksum           = {};
+    m.checksum.algo      = algo;
+    m.checksum.composite = composite;
 }
 
 bool part_trailer_of(const object_meta& m, part_trailer& out)

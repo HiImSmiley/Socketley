@@ -2095,14 +2095,14 @@ void storage_run::put_body_complete(const std::shared_ptr<conn>& c)
         response resp;
         resp.status = 200;
         resp.headers.emplace_back("ETag", "\"" + r.meta.etag() + "\"");
+        if (r.meta.checksum)
+        {
+            resp.headers.emplace_back(checksum_header(r.meta.checksum.algo), r.meta.checksum.b64());
+            if (!is_part)
+                resp.headers.emplace_back("x-amz-checksum-type", "FULL_OBJECT");
+        }
         for (const auto& [n, v] : r.meta.extra)
-            if (is_checksum_header(n))
-            {
-                resp.headers.emplace_back(n, v);
-                if (!is_part)
-                    resp.headers.emplace_back("x-amz-checksum-type", "FULL_OBJECT");
-            }
-            else if (n == version_extra)
+            if (n == version_extra)
                 resp.headers.emplace_back("x-amz-version-id", version_of(r.meta).id);
             else if (n == sse_extra)
                 sse_headers(cc->req, r.meta, resp.headers);

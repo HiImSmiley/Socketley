@@ -2254,7 +2254,7 @@ std::shared_ptr<put_op> object_store::begin_put(std::string_view bucket_name, st
         return nullptr;
     }
     // Tags have limits of their own, checked where they are parsed.
-    size_t meta_bytes = meta.content_type.size();
+    size_t meta_bytes = meta.content_type.size() + checksum_meta_bytes(meta);
     for (const auto& [n, v] : meta.extra)
         if (n != tags_extra)
             meta_bytes += n.size() + v.size();
@@ -2439,7 +2439,7 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
                             if (cs->new_md5)
                                 cs->meta.md5 = cs->digest.finish();
                             if (cs->ck)
-                                set_checksum(cs->meta, cs->algo, cs->ck->peek_b64());
+                                set_checksum(cs->meta, cs->algo, cs->ck->peek_raw());
                             cs->header = encode_object_header(cs->dst_key, cs->meta);
                             const bool qh = cs->header.size() == cs->hdr_len &&
                                 m_io->pwrite(cs->dst_fd, cs->header.data(), static_cast<uint32_t>(cs->header.size()), 0,

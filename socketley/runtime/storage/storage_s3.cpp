@@ -1157,7 +1157,7 @@ bool storage_run::object_meta_from_headers(const std::shared_ptr<conn>& c, objec
 {
     const s3_request& q = c->req;
     m = object_meta{};
-    m.content_type = std::string(q.header("content-type"));
+    m.content_type = q.header("content-type");
     if (m.content_type.empty())
         m.content_type = "binary/octet-stream";
 
@@ -1326,7 +1326,7 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
         ck.algo = default_checksum_algo;
     // A placeholder of the value's length, so the header reserves room for it.
     if (ck.algo != checksum_algo::none)
-        meta.extra.emplace_back(std::string(checksum_header(ck.algo)), std::string(checksum_b64_len(ck.algo), 'A'));
+        reserve_checksum(meta, ck.algo);
     if (part_crc)
         meta.extra.emplace_back(std::string(part_crc_extra), std::string(checksum_b64_len(checksum_algo::crc64nvme), 'A'));
 
@@ -1717,16 +1717,9 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
             r.headers.emplace_back("x-amz-tagging-count", std::to_string(tag_count(v)));
             continue;
         }
+        // A value the store would not have written is kept but never shown.
         if (is_checksum_header(n))
-        {
-            // A multipart object's composite checksum carries -N, and every other is of the whole object.
-            if (with_checksum)
-            {
-                r.headers.emplace_back(n, part ? *part : v);
-                r.headers.emplace_back("x-amz-checksum-type", v.find('-') != std::string::npos ? "COMPOSITE" : "FULL_OBJECT");
-            }
             continue;
-        }
         if (n == sse_extra)
         {
             sse_headers(q, m, r.headers);
@@ -1761,6 +1754,11 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
         if (overridden(display))
             continue;
         r.headers.emplace_back(display, v);
+    }
+    if (with_checksum && m.checksum)
+    {
+        r.headers.emplace_back(checksum_header(m.checksum.algo), part ? *part : m.checksum.b64());
+        r.headers.emplace_back("x-amz-checksum-type", m.checksum.type());
     }
     for (const auto& o : overrides)
         if (o.header != "Content-Type" && q.has_query(o.query))
@@ -1876,10 +1874,10 @@ bool parse_attr_query(const s3_request& q, attr_query& a, std::string_view& bad)
     return true;
 }
 
-// The element a stored checksum header is named by in a GetObjectAttributes answer, empty for none.
-std::string_view checksum_element(std::string_view header)
+// The element a stored checksum is named by in a GetObjectAttributes answer, empty for none.
+std::string_view checksum_attribute(checksum_algo a)
 {
-    switch (checksum_from_header(header))
+    switch (a)
     {
         case checksum_algo::crc32:     return "ChecksumCRC32";
         case checksum_algo::crc32c:    return "ChecksumCRC32C";
@@ -1900,16 +1898,10 @@ std::string attributes_xml(const object_meta& m, const attr_query& a, const part
     x += "\">";
     if (a.etag)
         x += "<ETag>" + m.etag() + "</ETag>";
-    if (a.checksum)
-        for (const auto& [n, v] : m.extra)
-            if (const std::string_view el = checksum_element(n); !el.empty())
-            {
-                // A multipart object's checksum is of its parts' checksums, which the -N says.
-                const bool composite = v.find('-') != std::string::npos;
-                x += "<Checksum><" + std::string(el) + ">" + xml_escape(v) + "</" + std::string(el) + "><ChecksumType>" +
-                     (composite ? "COMPOSITE" : "FULL_OBJECT") + "</ChecksumType></Checksum>";
-                break;
-            }
+    // A multipart object's checksum is of its parts' checksums, which the -N says.
+    if (const std::string_view el = checksum_attribute(m.checksum.algo); a.checksum && !el.empty())
+        x += "<Checksum><" + std::string(el) + ">" + xml_escape(m.checksum.b64()) + "</" + std::string(el) +
+             "><ChecksumType>" + std::string(m.checksum.type()) + "</ChecksumType></Checksum>";
     if (a.parts && l)
     {
         const checksum_algo algo = checksum_algo_of(m);

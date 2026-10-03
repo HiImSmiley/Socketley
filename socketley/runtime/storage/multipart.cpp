@@ -114,6 +114,15 @@ const std::string* extra_value(const object_meta& m, std::string_view name)
     return nullptr;
 }
 
+// A part's checksum in the upload's algorithm, empty when the part has none in it.
+std::string part_checksum_b64(const object_meta& m, checksum_algo algo)
+{
+    if (algo != checksum_algo::none && m.checksum.algo == algo)
+        return m.checksum.b64();
+    const std::string* v = algo != checksum_algo::none ? extra_value(m, checksum_header(algo)) : nullptr;
+    return v ? *v : std::string{};
+}
+
 // The header a completed object takes, with room for the MAC of its part list an SSE-C completion may add.
 size_t completed_header_len(std::string_view key, object_meta m)
 {
@@ -127,8 +136,7 @@ uint64_t place_base_of(std::string_view key, const object_meta& meta, checksum_a
 {
     object_meta m = meta;
     if (algo != checksum_algo::none)
-        m.extra.emplace_back(std::string(checksum_header(algo)),
-                             std::string(checksum_b64_len(algo) + std::to_string(mpu_max_parts).size() + 1, 'A'));
+        reserve_checksum(m, algo, static_cast<uint16_t>(mpu_max_parts));
     // Parts placed in the data file are of one size, so their list is one number or names its checksums after the body,
     // and with no algorithm the room that one number leaves holds the default checksum.
     m.extra.emplace_back(std::string(part_layout_extra), std::string(20 + 1 + 64 + 1 + 2, '9'));
@@ -489,8 +497,7 @@ bool multipart_store::recover_bucket(const std::string& bucket, std::string& err
                         part.mtime_ms = pd.meta.mtime_ms;
                         part.data_off = at ? at : pd.header_len;
                         part.in_place = at != 0;
-                        if (const std::string* v = extra_value(pd.meta, checksum_header(up->algo)))
-                            part.checksum_b64 = *v;
+                        part.checksum_b64 = part_checksum_b64(pd.meta, up->algo);
                         if (const std::string* v = extra_value(pd.meta, part_crc_extra))
                             part.crc_b64 = *v;
                     }
@@ -864,8 +871,7 @@ void multipart_store::finish_part(const std::shared_ptr<part_commit>& pc, int64_
         part.mtime_ms = pc->req.meta.mtime_ms;
         part.data_off = pc->place_off ? pc->place_off : object_header_len(pc->req.key, pc->req.meta);
         part.in_place = pc->place_off != 0;
-        if (const std::string* v = extra_value(pc->req.meta, checksum_header(up->algo)))
-            part.checksum_b64 = *v;
+        part.checksum_b64 = part_checksum_b64(pc->req.meta, up->algo);
         if (const std::string* v = extra_value(pc->req.meta, part_crc_extra))
             part.crc_b64 = *v;
 
@@ -1149,14 +1155,14 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
         {
             plan.checksum_b64 = full ? full_object_checksum_b64(u->algo, part_checksums)
                                      : composite_checksum_b64(u->algo, raw_checksums, parts.size());
-            plan.meta.extra.emplace_back(std::string(checksum_header(u->algo)), plan.checksum_b64);
+            set_checksum_b64(plan.meta, u->algo, plan.checksum_b64);
         }
         // An upload with no algorithm gives its object S3's default, of the whole bytes, combined from its parts' CRCs.
         else if (part_checksums.size() == parts.size())
         {
             plan.checksum_b64 = full_object_checksum_b64(default_checksum_algo, part_checksums);
             if (!plan.checksum_b64.empty())
-                plan.meta.extra.emplace_back(std::string(checksum_header(default_checksum_algo)), plan.checksum_b64);
+                set_checksum_b64(plan.meta, default_checksum_algo, plan.checksum_b64);
         }
         // Kept in the header when it fits and after the body otherwise, so any list S3 takes completes.
         const part_list list = list_of(plan.parts, plan.meta);
