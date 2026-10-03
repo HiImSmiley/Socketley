@@ -28,6 +28,8 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 
+import lib_s3_signing as sig
+
 MODE = sys.argv[1]
 BIN = os.environ.get("BIN", "")
 RUNTIME = os.environ.get("RUNTIME", "ver")
@@ -709,7 +711,8 @@ def mode_recovery(port, data):
     src = os.path.join(data, B, "data", h[:2], h)
     dup = os.path.join(data, B, "versions", h[:2], h + "." + vid)
     subprocess.run([BIN, "stop", RUNTIME], capture_output=True)
-    time.sleep(0.5)
+    # A stop is answered before the worker has finished, so its files are changed only once it lets go of them.
+    sig.wait_released(data)
     os.link(src, dup)
     remove_journals(data)
     subprocess.run([BIN, "start", RUNTIME], capture_output=True)
@@ -742,7 +745,7 @@ def rollforward(port, data):
     st, v_new = put("rv", b"the answered version")
     new_v = open(key_file(data, B, "rv"), "rb").read()
     subprocess.run([BIN, "stop", RUNTIME], capture_output=True)
-    time.sleep(0.5)
+    sig.wait_released(data)
     # The rename never reached the disk: the old file at the key's path, the answered one under its pool name.
     for bucket, key, was, answered in ((rb, "rf", old, new), (B, "rv", old_v, new_v)):
         os.makedirs(os.path.join(data, bucket, "pool"), exist_ok=True)

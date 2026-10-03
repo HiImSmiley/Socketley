@@ -468,7 +468,11 @@ def remove_journals(data):
 
 def restart(port, data=None):
     subprocess.run([BIN, "stop", RUNTIME], capture_output=True)
-    time.sleep(0.5)
+    # A stop is answered before the worker has finished, so its files are changed only once it lets go of them.
+    if data:
+        sig.wait_released(data)
+    else:
+        time.sleep(0.5)
     removed = remove_journals(data) if data else 0
     subprocess.run([BIN, "start", RUNTIME], capture_output=True)
     ok = wait_for(lambda: probe(port), 30)

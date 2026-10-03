@@ -165,3 +165,23 @@ def crc64nvme_b64(data):
     if k not in _CRC64_SEEN:
         _CRC64_SEEN[k] = base64.b64encode(crc64nvme(data).to_bytes(8, "big")).decode()
     return _CRC64_SEEN[k]
+
+
+def wait_released(data, timeout=30.0):
+    """Waits until no stopping worker holds a shard of the runtime whose directory is `data`, so its files are the test's to change."""
+    import fcntl
+    import os
+    import time
+    give_up = time.monotonic() + timeout
+    for name in sorted(n for n in os.listdir(data) if n.startswith(".lock.")):
+        with open(os.path.join(data, name), "rb") as f:
+            while True:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(f, fcntl.LOCK_UN)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() > give_up:
+                        return False
+                    time.sleep(0.05)
+    return True

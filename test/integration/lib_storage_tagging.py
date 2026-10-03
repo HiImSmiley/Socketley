@@ -485,7 +485,9 @@ def mode_crash(port, data):
     for i in range(5):
         put_tags(c, "crash/%02d" % i, [("journal", "gone"), ("i", str(i))])
     subprocess.run([BIN, "stop", RUNTIME], capture_output=True)
-    time.sleep(0.5)
+    import lib_s3_signing as sig
+    # A stop is answered before the worker has finished, so its files are changed only once it lets go of them.
+    sig.wait_released(data)
     removed = 0
     for root, _, files in os.walk(data):
         for f in files:
