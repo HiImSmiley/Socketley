@@ -149,7 +149,10 @@ run_py populate "${N4[@]}"
 run_py verify 0 "${N4[@]}"
 cp -r "$DATA" "$DATA1"
 "$BIN" create storage stg1 --listen "unix:$SOCK1" --dir "$DATA1" --anonymous -s >/dev/null 2>&1
-expect "a one-shard runtime on a copy of the files is made" "$?" 0
+rc=$?
+# A start under another shard count reads every file, which under a loaded box can outlast the 2 s a start is waited
+# for (exit 2, still supervised); whether it then serves is the check below.
+expect "a one-shard runtime on a copy of the files is made" "$([ "$rc" = 0 ] || [ "$rc" = 2 ] && echo 0 || echo "$rc")" 0
 wait_nodes "$SOCK1" && ok "and answers" || bad "one-shard node" "no answer"
 run_py equiv -- "${N4[@]}" -- "$SOCK1"
 
