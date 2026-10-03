@@ -187,6 +187,8 @@ private:
     std::string m_buf;
     std::vector<std::function<void()>> m_buf_cbs;
     bool        m_writing{false};
+    // Delivery records written and not yet synced, which a stop syncs.
+    bool        m_unsynced{false};
     bool        m_rotating{false};
     bool        m_write_failed{false};
 

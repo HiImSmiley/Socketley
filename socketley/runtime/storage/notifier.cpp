@@ -589,13 +589,17 @@ void notifier::kick()
             return;
         if (res >= 0 && !must_sync)
         {
+            m_unsynced = true;
             written(res, buf, cbs);
             return;
         }
         if (res >= 0 && !m_io.fsync(m_fd, true, [this, alive, buf, cbs](int64_t r2)
             {
-                if (*alive)
-                    written(r2, buf, cbs);
+                if (!*alive)
+                    return;
+                if (r2 >= 0)
+                    m_unsynced = false;
+                written(r2, buf, cbs);
             }))
             res = -EIO;
         if (res < 0)
@@ -666,6 +670,7 @@ void notifier::maybe_rotate()
                 m_loop.close_fd(m_fd);
                 m_fd  = static_cast<int>(fd);
                 m_off = 0;
+                m_unsynced = false;
                 if (!m_io.fsync(m_dir_fd, false, [this, alive](int64_t)
                     {
                         if (!*alive)
@@ -1011,12 +1016,14 @@ void notifier::stop()
     if (const int fd = m_resolver.release_wake_fd(); fd >= 0)
         m_loop.close_fd(fd);
     // The delivery records not yet written are written here, blocking as a stop may, so a restart does not send them again.
-    if (m_fd >= 0 && !m_buf.empty() && !m_rotating)
+    if (m_fd >= 0 && (!m_buf.empty() || m_unsynced) && !m_rotating)
     {
-        if (::pwrite(m_fd, m_buf.data(), m_buf.size(), static_cast<off_t>(m_off)) == static_cast<ssize_t>(m_buf.size()) &&
+        if ((m_buf.empty() ||
+             ::pwrite(m_fd, m_buf.data(), m_buf.size(), static_cast<off_t>(m_off)) == static_cast<ssize_t>(m_buf.size())) &&
             ::fdatasync(m_fd) == 0)
             m_off += m_buf.size();
         m_buf.clear();
+        m_unsynced = false;
     }
     if (m_fd >= 0)
         m_loop.close_fd(m_fd);
