@@ -46,7 +46,10 @@ public:
     bool pread(int fd, char* buf, uint32_t len, uint64_t off, done cb);
     bool pwrite(int fd, const char* buf, uint32_t len, uint64_t off, done cb);
 
-    // A non-blocking socket's connect, the address copied so the caller need not keep it.
+    // The offset of a descriptor with no position of its own, a socket's, which a continued write keeps.
+    static constexpr uint64_t at_stream = UINT64_MAX;
+
+    // A socket's connect, the address copied so the caller need not keep it.
     bool connect(int fd, const struct sockaddr* addr, socklen_t len, done cb);
 
     // Whether a completion of this kind is one of this object's.

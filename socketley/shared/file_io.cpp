@@ -81,7 +81,7 @@ bool file_io::submit(op* o)
             break;
         case op_file_write:
             queued = m_loop->submit_file_write(o->fd, o->wbuf + o->written, o->len - o->written,
-                                               o->off + o->written, &o->req, false);
+                                               o->off == at_stream ? at_stream : o->off + o->written, &o->req, false);
             break;
         case op_connect:
             queued = m_loop->submit_connect(o->fd, reinterpret_cast<const struct sockaddr*>(&o->addr), o->addr_len,
