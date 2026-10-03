@@ -67,10 +67,13 @@ def wait_for(fn, timeout):
 class Hook:
     """A webhook on 127.0.0.1:port that keeps every POST it is sent and answers it with `status`."""
 
-    def __init__(self, port, tls=None, host="127.0.0.1"):
+    def __init__(self, port, tls=None, host="127.0.0.1", keepalive=False, idle=None):
         self.port = port
         self.tls = tls
         self.host = host
+        # HTTP/1.1 keeps a connection for the next POST, until `idle` seconds pass with nothing on it.
+        self.keepalive = keepalive
+        self.idle = idle
         self.got = []
         self.status = 200
         self.server = None
@@ -93,6 +96,9 @@ class Hook:
             def log_message(self, *a):
                 pass
 
+        if self.keepalive:
+            Handler.protocol_version = "HTTP/1.1"
+            Handler.timeout = self.idle
         http.server.ThreadingHTTPServer.allow_reuse_address = True
         self.server = http.server.ThreadingHTTPServer((self.host, self.port), Handler)
         if self.tls:
@@ -503,6 +509,58 @@ def mode_tls(port, secure_port, cert, key):
     secure.down()
 
 
+def mode_keep(port, hook_port, secure_port=None, cert=None, key=None):
+    global TARGET
+    TARGET = port
+    hook = Hook(hook_port, keepalive=True, idle=1.5)
+    hook.up()
+    rules = [rule("Queue", "kept", ARN + "hook", ["s3:ObjectCreated:*"], prefix="ka/")]
+    if cert:
+        rules.append(rule("Queue", "kepts", ARN + "secure", ["s3:ObjectCreated:*"], prefix="kas/"))
+    check("a configuration for kept connections is put", put_cfg(doc(*rules))[:2] == (200, None))
+    time.sleep(1.5)
+    c0, r0, f0 = stat("notify_connects"), stat("notify_reuses"), stat("notify_failed")
+    for i in range(20):
+        req("PUT", "/%s/ka/%02d" % (B, i), b"kept")
+    got = lambda: len([k for _, k, _ in hook.records() if k.startswith("ka/")])
+    check("twenty events reach a webhook that keeps its connections", wait_for(lambda: got() == 20, 20), got())
+    # The counters reach `stats` a moment after the deliveries they count.
+    check("over one connection, the rest going on the one kept",
+          wait_for(lambda: stat("notify_reuses") - r0 >= 18, 5) and stat("notify_connects") - c0 <= 2, nstats())
+    # The host gives up on the connection while it is kept, and the next event goes on a new one.
+    time.sleep(2.5)
+    c1 = stat("notify_connects")
+    req("PUT", "/%s/ka/late" % B, b"kept")
+    check("an event after the host closed the kept connection is delivered on a new one, nothing failing",
+          wait_event(hook, "ka/late", "ObjectCreated:Put") and
+          wait_for(lambda: stat("notify_connects") == c1 + 1, 5) and stat("notify_failed") == f0, nstats())
+    hook.down()
+    # A host that answers HTTP/1.0 keeps nothing, and every event connects.
+    plain = Hook(hook_port)
+    plain.up()
+    time.sleep(1.5)
+    c2, r2 = stat("notify_connects"), stat("notify_reuses")
+    for i in range(5):
+        req("PUT", "/%s/ka/old%d" % (B, i), b"kept")
+    check("every event to an HTTP/1.0 webhook gets a connection of its own",
+          wait_for(lambda: len([k for _, k, _ in plain.records() if k.startswith("ka/old")]) == 5, 15) and
+          wait_for(lambda: stat("notify_connects") - c2 == 5, 5) and stat("notify_reuses") == r2, nstats())
+    plain.down()
+    if cert:
+        secure = Hook(secure_port, (cert, key), keepalive=True, idle=5)
+        secure.up()
+        time.sleep(1.5)
+        c3, r3 = stat("notify_connects"), stat("notify_reuses")
+        for i in range(10):
+            req("PUT", "/%s/kas/%02d" % (B, i), b"kept")
+        check("ten events to an https webhook share one handshake",
+              wait_for(lambda: len([k for _, k, _ in secure.records() if k.startswith("kas/")]) == 10, 20) and
+              wait_for(lambda: stat("notify_reuses") - r3 >= 8, 5) and stat("notify_connects") - c3 <= 2, nstats())
+        secure.down()
+    check("put back for the next half", put_cfg(doc(rule("Queue", "created", ARN + "hook", ["s3:ObjectCreated:*"],
+                                                        prefix="r/")))[:2] == (200, None))
+
+
 def mode_users(port, hook_port):
     """A runtime with users: a signed request names its user, one let in by a bucket policy names anonymous."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -763,6 +821,8 @@ if __name__ == "__main__":
     args = sys.argv[2:]
     if MODE == "main":
         mode_main(int(args[0]), int(args[1]), int(args[2]))
+    elif MODE == "keep":
+        mode_keep(*([int(args[0]), int(args[1])] + ([int(args[2]), args[3], args[4]] if len(args) > 2 else [])))
     elif MODE == "users":
         mode_users(int(args[0]), int(args[1]))
     elif MODE == "dns":

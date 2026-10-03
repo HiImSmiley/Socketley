@@ -10,7 +10,10 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
+
+#include <openssl/ssl.h>
 
 #include "../../shared/http_framing.h"
 #include "../../shared/logging.h"
@@ -313,6 +316,9 @@ http_peer::~http_peer()
     *m_alive = false;
     if (m_ssl)
         tls_context::free_ssl(m_ssl);
+    // A kept connection a stop did not close, which nothing in the ring names any more.
+    if (m_fd >= 0)
+        ::close(m_fd);
 }
 
 void http_peer::prime()
@@ -379,12 +385,26 @@ void http_peer::exchange(http_request req, std::function<void(http_answer)> done
     m_source_done  = false;
     m_sent         = false;
     m_write_failed = false;
+    m_eof          = false;
     m_in.clear();
     m_deadline = now + std::chrono::seconds(stall_secs);
     if (m_stopped || (m_target.tls && !m_tls))
     {
         finish(false, "there is no TLS context for the host");
         return;
+    }
+    // The connection the last exchange kept goes on at once, its TLS session with it, unless the host closed it since
+    // or it is as old as the addresses it was made to.
+    if (m_fd >= 0)
+    {
+        if (now - m_connected_at < std::chrono::seconds(resolve_every_secs) && still_open())
+        {
+            ++m_reuses;
+            m_handshaken = m_ssl != nullptr;
+            advance();
+            return;
+        }
+        close_socket();
     }
     // A host with no address yet waits for the resolver, which goes on with the exchange when it answers.
     if (m_addrs.empty())
@@ -409,6 +429,8 @@ void http_peer::connect()
         finish(false, "no socket could be made");
         return;
     }
+    ++m_connects;
+    m_connected_at = std::chrono::steady_clock::now();
     const uint64_t gen = m_gen;
     auto alive = m_alive;
     if (!m_io.connect(m_fd, reinterpret_cast<const struct sockaddr*>(&ep.addr), ep.len,
@@ -609,6 +631,7 @@ void http_peer::receive()
             // The host closed after answering, which is how an answer to a Connection: close request ends.
             if (res <= 0)
             {
+                m_eof = true;
                 finish(true);
                 return;
             }
@@ -656,12 +679,12 @@ void http_peer::got(const char* p, size_t n)
     receive();
 }
 
-bool http_peer::answer_complete() const
+bool http_peer::answer_complete(bool framed) const
 {
     const size_t end = m_in.find("\r\n\r\n");
     if (end == std::string::npos)
         return false;
-    if (m_req.head_only)
+    if (m_req.head_only && !framed)
         return status_of(m_in) != 0;
     const std::string_view head(m_in.data(), end + 2);
     const std::string_view body = std::string_view(m_in).substr(end + 4);
@@ -687,11 +710,56 @@ bool http_peer::answer_complete() const
     return false;
 }
 
+bool http_peer::keepable() const
+{
+    if (m_eof || m_write_failed || !m_sent || m_stopped || !answer_complete(true) || !m_in.starts_with("HTTP/1.1 "))
+        return false;
+    const size_t end = m_in.find("\r\n\r\n");
+    const std::string_view head(m_in.data(), end + 2);
+    if (http_list_has_token(head_value(head, "connection"), "close", 5))
+        return false;
+    // Bytes past the answer would be read as the next one's, so only an answer that ends where the bytes do is kept.
+    size_t length = 0;
+    if (http_list_has_token(head_value(head, "transfer-encoding"), "chunked", 7))
+    {
+        http_chunked_decoder d;
+        std::string_view in = std::string_view(m_in).substr(end + 4), out;
+        chunk_step s;
+        while ((s = http_chunked_next(d, in, out)) == chunk_step::payload) {}
+        return s == chunk_step::done && in.empty();
+    }
+    if (http_whole_decimal(head_value(head, "content-length"), length))
+        return m_in.size() == end + 4 + length;
+    const int status = status_of(head);
+    return (status == 204 || status == 304) && m_in.size() == end + 4;
+}
+
+bool http_peer::still_open()
+{
+    char buf[16384];
+    for (;;)
+    {
+        const ssize_t r = ::recv(m_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (r < 0)
+            return errno == EAGAIN || errno == EWOULDBLOCK;
+        // Closed, or bytes nobody asked for on a plain connection.
+        if (r == 0 || !m_ssl || tls_context::bio_write_in(m_ssl, buf, static_cast<int>(r)) < 0)
+            return false;
+        // A record after the answer is a session ticket or a close; an application byte would be no answer's.
+        char app[1];
+        if (tls_context::ssl_read(m_ssl, app, sizeof(app)) > 0 || (SSL_get_shutdown(m_ssl) & SSL_RECEIVED_SHUTDOWN))
+            return false;
+    }
+}
+
 void http_peer::finish(bool answered, std::string why)
 {
     ++m_gen;
     m_busy = false;
-    close_socket();
+    if (answered && keepable())
+        m_idle_since = std::chrono::steady_clock::now();
+    else
+        close_socket();
     http_answer a;
     if (const size_t end = m_in.find("\r\n\r\n"); answered && end != std::string::npos && status_of(m_in) != 0)
     {
@@ -754,6 +822,8 @@ void http_peer::tick(std::chrono::steady_clock::time_point now)
 {
     if (m_busy && now >= m_deadline)
         finish(false, "nothing moved for " + std::to_string(stall_secs) + "s");
+    else if (!m_busy && m_fd >= 0 && now - m_idle_since >= std::chrono::seconds(keep_idle_secs))
+        close_socket();
 }
 
 void http_peer::stop()
@@ -761,6 +831,7 @@ void http_peer::stop()
     m_stopped = true;
     if (m_busy)
         finish(false, "the runtime stopped");
+    close_socket();
 }
 
 }   // namespace socketley::storage

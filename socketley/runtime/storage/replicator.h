@@ -114,6 +114,9 @@ public:
     const replication_counters& counters() const { return m_c; }
     // Versions and delete markers waiting to be copied, across every target.
     uint64_t pending() const { return m_pending; }
+    // Connections made to every target, and requests that went on one kept from the request before.
+    uint64_t connects() const;
+    uint64_t reuses() const;
 
 private:
     struct task

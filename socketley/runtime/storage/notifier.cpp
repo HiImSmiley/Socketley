@@ -139,6 +139,22 @@ uint64_t notifier::resolves() const
     return n;
 }
 
+uint64_t notifier::connects() const
+{
+    uint64_t n = 0;
+    for (const auto& l : m_lanes)
+        n += l->peer->connects();
+    return n;
+}
+
+uint64_t notifier::reuses() const
+{
+    uint64_t n = 0;
+    for (const auto& l : m_lanes)
+        n += l->peer->reuses();
+    return n;
+}
+
 bool notifier::open(const std::string& dir, uint32_t shard, const outbox::change_made& made, std::string& err)
 {
     if (m_lanes.empty())
@@ -295,11 +311,10 @@ void notifier::start(lane& l)
     http_request rq;
     rq.head = "POST " + t.path + " HTTP/1.1\r\nHost: " + t.authority() +
               "\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(ev.json.size()) +
-              "\r\nConnection: close\r\nUser-Agent: socketley-storage\r\nX-Socketley-Event-Id: " +
+              "\r\nConnection: keep-alive\r\nUser-Agent: socketley-storage\r\nX-Socketley-Event-Id: " +
               std::to_string(ev.id) + "\r\n\r\n";
+    // A webhook says all it has to say in its status, but its whole answer is read so the connection carries the next.
     rq.body      = ev.json;
-    // A webhook says all it has to say in its status.
-    rq.head_only = true;
     l.busy = true;
     arm_timer();
     auto alive = m_alive;

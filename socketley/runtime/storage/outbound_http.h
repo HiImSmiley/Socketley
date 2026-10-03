@@ -1,7 +1,7 @@
 #pragma once
 // The HTTP(S) requests a storage runtime makes of other hosts, for the webhooks its events go to and the endpoints its
-// buckets replicate to: a target's URL, its addresses, and one exchange at a time on a fresh connection, every step on
-// the loop and the resolving on a thread of the owner's.
+// buckets replicate to: a target's URL, its addresses, and one exchange at a time on a connection kept between them,
+// every step on the loop and the resolving on a thread of the owner's.
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -100,12 +100,15 @@ struct http_request
     int         answer_secs{10};
 };
 
-// The exchanges of one target, one at a time, each on a connection of its own that the answer closes.
+// The exchanges of one target, one at a time, on a connection kept for the next while the host keeps it, as a proxy
+// keeps its backends'.
 class http_peer
 {
 public:
     // An exchange with no progress for this long has failed.
     static constexpr int stall_secs = 10;
+    // A connection kept this long with nothing to send is closed, sooner than a host commonly gives up on one.
+    static constexpr int keep_idle_secs = 4;
     // A host's addresses are asked for again this often while it is used, and at once after every address it had
     // refused a connection, but not twice within the floor.
     static constexpr int resolve_every_secs = 60;
@@ -132,6 +135,9 @@ public:
     void stop();
 
     uint64_t resolves() const { return m_resolves; }
+    // The connections made, and the exchanges that went on one kept from the exchange before.
+    uint64_t connects() const { return m_connects; }
+    uint64_t reuses() const { return m_reuses; }
 
 private:
     bool resolve();
@@ -146,8 +152,13 @@ private:
     bool flush_cipher();
     void receive();
     void got(const char* p, size_t n);
-    // Whether the answer read so far is whole.
-    bool answer_complete() const;
+    // Whether the answer read so far is whole, for the exchange or, with `framed`, to its last byte.
+    bool answer_complete(bool framed = false) const;
+    // Whether the connection of the exchange that just ended may carry the next one.
+    bool keepable() const;
+    // Whether a kept connection is still open, which a host that gave up on it no longer has; what TLS sent on it
+    // since, a session ticket, is taken in.
+    bool still_open();
     // The exchange ends, answered or failed for `why`, and `done` hears the answer.
     void finish(bool answered, std::string why = {});
     void close_socket();
@@ -168,6 +179,8 @@ private:
     bool        m_resolving{false};
     std::chrono::steady_clock::time_point m_resolved_at{};
     uint64_t    m_resolves{0};
+    uint64_t    m_connects{0};
+    uint64_t    m_reuses{0};
 
     // The exchange in progress, and a generation bumped at its end so a late completion is told from a current one.
     bool        m_busy{false};
@@ -183,8 +196,13 @@ private:
     bool        m_sent{false};
     // A write failed, so the answer the host may have sent before closing is all that is left to read.
     bool        m_write_failed{false};
+    // The host closed the connection, which then carries no further exchange.
+    bool        m_eof{false};
     std::string m_in;
     std::chrono::steady_clock::time_point m_deadline{};
+    // When the connection was made, and since when, kept from the last exchange, it has had nothing on it.
+    std::chrono::steady_clock::time_point m_connected_at{};
+    std::chrono::steady_clock::time_point m_idle_since{};
 };
 
 }   // namespace socketley::storage

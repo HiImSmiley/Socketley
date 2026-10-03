@@ -475,10 +475,14 @@ std::string storage_instance::stats_lines() const
         << "notify_queued:" << m_run->notifications().queued() << "\n"
         << "notify_dropped:" << m_run->notifications().counters().dropped << "\n"
         << "notify_resolves:" << m_run->notifications().resolves() << "\n"
+        << "notify_connects:" << m_run->notifications().connects() << "\n"
+        << "notify_reuses:" << m_run->notifications().reuses() << "\n"
         << "replication_pending:" << m_run->replication().pending() << "\n"
         << "replication_completed:" << m_run->replication().counters().completed << "\n"
         << "replication_failed:" << m_run->replication().counters().failed << "\n"
         << "replication_retries:" << m_run->replication().counters().retries << "\n"
+        << "replication_connects:" << m_run->replication().connects() << "\n"
+        << "replication_reuses:" << m_run->replication().reuses() << "\n"
         << "replication_bytes:" << m_run->replication().counters().bytes << "\n";
     // One line per code answered, so a client's mistakes and the runtime's own
     // are told apart without reading a log.

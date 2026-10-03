@@ -211,6 +211,22 @@ bool replicator::has_target(std::string_view name) const
     return false;
 }
 
+uint64_t replicator::connects() const
+{
+    uint64_t n = 0;
+    for (const auto& l : m_lanes)
+        n += l->peer->connects();
+    return n;
+}
+
+uint64_t replicator::reuses() const
+{
+    uint64_t n = 0;
+    for (const auto& l : m_lanes)
+        n += l->peer->reuses();
+    return n;
+}
+
 replicator::lane* replicator::find_lane(std::string_view name)
 {
     for (auto& l : m_lanes)
@@ -631,7 +647,7 @@ std::string replicator::signed_head(const lane& l, std::string_view method, cons
     head += " " + path + (query.empty() ? "" : "?" + query) + " HTTP/1.1\r\n";
     for (const auto& [n, v] : headers)
         head += n + ": " + v + "\r\n";
-    head += "authorization: " + s3::sign(in) + "\r\nconnection: close\r\nuser-agent: socketley-storage-replication\r\n\r\n";
+    head += "authorization: " + s3::sign(in) + "\r\nconnection: keep-alive\r\nuser-agent: socketley-storage-replication\r\n\r\n";
     return head;
 }
 

@@ -94,6 +94,9 @@ public:
     const notify_counters& counters() const { return m_c; }
     // Times a target's host was resolved, across every target.
     uint64_t resolves() const;
+    // Connections made to every target, and deliveries that went on one kept from the delivery before.
+    uint64_t connects() const;
+    uint64_t reuses() const;
     // Events waiting for delivery, across every target.
     uint64_t queued() const { return m_queued; }
 

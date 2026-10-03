@@ -165,8 +165,10 @@ run_lib "the main half ran" nt main "$P1" "$HOOK" "$OTHER"
 run_lib "the dns half ran" nt dns "$P1" "$NAMED" "$SOCKETLEY_STORAGE_NOTIFY_HOSTS"
 if [ -s "$CERT" ]; then
     run_lib "the tls half ran" nt tls "$P1" "$SECURE" "$CERT" "$KEY"
+    run_lib "the keep half ran" nt keep "$P1" "$HOOK" "$SECURE" "$CERT" "$KEY"
 else
     echo "  SKIP: openssl is required for the https webhook"
+    run_lib "the keep half ran" nt keep "$P1" "$HOOK"
 fi
 
 "$BIN" stop nt >/dev/null 2>&1

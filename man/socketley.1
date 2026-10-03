@@ -7469,7 +7469,7 @@ Each event is POSTed to its webhook as S3's message, one record in a
 .B Records
 array, with
 .BR "Content\-Type: application/json" ,
-.B "Connection: close"
+.B "Connection: keep\-alive"
 and
 .BR X\-Socketley\-Event\-Id ,
 a number a receiver can deduplicate by:
@@ -7556,10 +7556,22 @@ shows
 (attempts),
 .B notify_queued
 (waiting now),
-.B notify_dropped
-and
+.BR notify_dropped ,
 .B notify_resolves
-(host names resolved), per shard.
+(host names resolved),
+.B notify_connects
+and
+.B notify_reuses
+(deliveries that went on a connection kept from the delivery before), per shard.
+.PP
+A webhook's connection is kept for its next event, as a proxy keeps its backends',
+when the answer is HTTP/1.1, says nothing of
+.BR "Connection: close" ,
+and ends where its framing says; it is closed after 4 seconds with nothing on it,
+after a minute, so a moved host name is followed, and whenever the webhook has
+closed it, which is looked at before it is used. Over https this spares a
+handshake per event: 3,000 events to a local https webhook took 4.5 seconds on a
+connection each and 0.6 on one kept.
 .SS Replication
 A bucket's
 .B ReplicationConfiguration
@@ -7718,10 +7730,14 @@ shows
 and
 .B replication_failed
 (versions and delete markers),
-.B replication_retries
-and
+.BR replication_retries ,
 .B replication_bytes
-(body bytes a destination took), per shard.
+(body bytes a destination took),
+.B replication_connects
+and
+.B replication_reuses
+(requests that went on a connection kept from the request before, as a webhook's
+is), per shard.
 .SS Server\-side encryption
 .B "x\-amz\-server\-side\-encryption: AES256"
 on PutObject, CreateMultipartUpload or CopyObject (SSE\-S3) stores the object
