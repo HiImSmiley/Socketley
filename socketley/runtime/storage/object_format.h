@@ -254,6 +254,13 @@ void set_legal_hold_extra(object_meta& m, std::string_view status);
 bool has_lock_extra(const object_meta& m);
 // Removes both, for a copy, whose lock is its own and never its source's.
 void clear_lock_extras(object_meta& m);
+// The extra entry a version's replication status is kept in, PENDING, COMPLETED, FAILED or REPLICA, which a GET and a
+// HEAD answer as their header of the same name.
+inline constexpr std::string_view replication_status_extra = "x-amz-replication-status";
+// The status `m` records, empty for none.
+std::string_view replication_status_of(const object_meta& m);
+// Makes `status` the version's replication status, as an entry after the legal hold, or removes it when it is empty.
+void set_replication_status(object_meta& m, std::string_view status);
 // Whether the version may not be removed or replaced at `now_ms`: a legal hold is on, or a retention is in force
 // that `bypass` does not lift, which it does only for GOVERNANCE.
 bool lock_holds(const object_meta& m, int64_t now_ms, bool bypass);
@@ -320,9 +327,11 @@ struct decoded_header
     uint64_t      tag_seq{0};
     // That slot replaced the object lock entries too, as only one written for a version with a lock does.
     bool          lock_slot{false};
+    // And the replication status, as only one written for a version with a status does.
+    bool          repl_slot{false};
 };
 
-// Tags, a retention and a legal hold changed after an object was written go
+// Tags, a retention, a legal hold and a replication status changed after an object was written go
 // into one of two slots in the padding of its header's first 4 KiB, whole
 // 512-byte sectors written in turn and checksummed with a sequence number, so a
 // torn write of one leaves the other and the object's bytes, ETag and time never move.

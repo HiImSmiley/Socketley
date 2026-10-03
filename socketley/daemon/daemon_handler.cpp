@@ -3525,7 +3525,8 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                  pa.hashes[i] == fnv1a("--max-bytes") || pa.hashes[i] == fnv1a("--access-key") ||
                  pa.hashes[i] == fnv1a("--secret-key") || pa.hashes[i] == fnv1a("--credentials") ||
                  pa.hashes[i] == fnv1a("--mpu-expire") || pa.hashes[i] == fnv1a("--sse-key-file") ||
-                 pa.hashes[i] == fnv1a("--domain") || pa.hashes[i] == fnv1a("--notify-targets")))
+                 pa.hashes[i] == fnv1a("--domain") || pa.hashes[i] == fnv1a("--notify-targets") ||
+                 pa.hashes[i] == fnv1a("--replication-targets")))
             {
                 restore_edit();
                 std::cout << pa.args[i] << " cannot be changed with `edit`\n"
@@ -4013,6 +4014,12 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             if (cfg.has("notify_targets") && cfg.storage_notify_targets != std::string(stg->get_notify_targets()))
             {
                 conn->write_buf = "cannot change the notification targets file while running; stop, import, and start\n";
+                return 1;
+            }
+            if (cfg.has("replication_targets") &&
+                cfg.storage_replication_targets != std::string(stg->get_replication_targets()))
+            {
+                conn->write_buf = "cannot change the replication targets file while running; stop, import, and start\n";
                 return 1;
             }
         }

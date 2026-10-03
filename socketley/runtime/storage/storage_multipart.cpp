@@ -134,6 +134,8 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
     }
     if (full)
         meta.extra.emplace_back(std::string(checksum_type_extra), "FULL_OBJECT");
+    // The object the upload completes is replicated as its bucket's rules said when it began.
+    replication_mark(r.bucket, r.key, meta, ask.mode == sse_mode::c, replica_request(r));
 
     ++m_c.mpu_created;
     std::weak_ptr<conn> weak = c;

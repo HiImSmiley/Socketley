@@ -345,6 +345,7 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                                                           "--sse-key-file"));
                 return true;
             }
+            replication_mark(rq.bucket, rq.key, meta, false, false);
             // A script's object is given S3's default checksum like a client's.
             reserve_checksum(meta, default_checksum_algo);
             st why = st::ok;

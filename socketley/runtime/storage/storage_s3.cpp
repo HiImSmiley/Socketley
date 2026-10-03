@@ -33,7 +33,7 @@ bool unsupported_subresource(const s3_request& r, bool object)
 {
     static constexpr std::string_view names[] = {
         "acl", "tagging", "website",
-        "replication", "accelerate",
+        "accelerate",
         "requestPayment", "logging", "analytics", "metrics", "inventory", "ownershipControls",
         "publicAccessBlock", "intelligent-tiering", "attributes", "restore", "select", "torrent",
         "acl", "location-constraint",
@@ -55,6 +55,9 @@ bool unsupported_subresource(const s3_request& r, bool object)
         return true;
     // A bucket's notification configuration is read and set, and an object has none.
     if (r.has_query("notification") && (object || (r.method != "GET" && r.method != "PUT")))
+        return true;
+    // A bucket's replication configuration is read, set and deleted, and an object has none.
+    if (r.has_query("replication") && (object || (r.method != "GET" && r.method != "PUT" && r.method != "DELETE")))
         return true;
     // A bucket's object lock is read and set, and a version's retention and legal hold likewise.
     const bool lock_attr = r.has_query("retention") || r.has_query("legal-hold");
@@ -436,6 +439,16 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
             op_get_notification(c);
         else
             op_put_notification(c);
+        return;
+    }
+    if (bkt && q.has_query("replication"))
+    {
+        if (m == "GET")
+            op_get_replication(c);
+        else if (m == "PUT")
+            op_put_replication(c);
+        else
+            op_delete_replication(c);
         return;
     }
     if (bkt && q.has_query("object-lock"))
@@ -1249,6 +1262,7 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
         deny_request(c, err);
         return;
     }
+    replication_mark(r.bucket, r.key, meta, ask.mode == sse_mode::c, replica_request(r));
     start_put(c, r.key, std::move(meta), {}, checksum_algo::none, cond, {},
               ask.mode != sse_mode::none ? &seal : nullptr);
 }
@@ -1584,6 +1598,8 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
         send_error(c, err);
         return;
     }
+    // And whose replication is its own bucket's.
+    replication_mark(r.bucket, r.key, meta, dst.mode == sse_mode::c, false);
 
     ++m_c.copies;
     std::weak_ptr<conn> weak = c;

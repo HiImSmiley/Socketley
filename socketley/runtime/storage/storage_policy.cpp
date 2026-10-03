@@ -127,8 +127,13 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
             return;
     }
 
-    // A request that names a version is the version's own action, as S3 judges it.
-    const s3_action plain  = action_of_operation(operation_name(r));
+    // A request that names a version is the version's own action, as S3 judges it, and a replica's write is a
+    // replication's.
+    s3_action plain = action_of_operation(operation_name(r));
+    if (replica_request(r) && (plain == s3_action::put_object || plain == s3_action::abort_multipart_upload))
+        plain = s3_action::replicate_object;
+    else if (replica_request(r) && plain == s3_action::delete_object && !r.key.empty())
+        plain = s3_action::replicate_delete;
     const s3_action action = r.has_query("versionId") ? version_action(plain) : plain;
 
     policy_request pr;

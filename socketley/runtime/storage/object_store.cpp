@@ -18,6 +18,7 @@
 #include "s3_encryption.h"
 #include "s3_names.h"
 #include "s3_notify.h"
+#include "s3_replication.h"
 #include "s3_object_lock.h"
 #include "s3_versioning.h"
 #include "shard_owner.h"
@@ -1447,6 +1448,8 @@ change_note object_store::commit_note(const commit_request& rq)
     n.size       = rq.meta.size;
     n.etag       = rq.meta.etag();
     n.mtime_ms   = rq.meta.mtime_ms;
+    n.tags        = std::string(tags_of(rq.meta));
+    n.replication = std::string(replication_status_of(rq.meta));
     if (has_version(rq.meta))
         n.version_id = version_of(rq.meta).id;
     return n;
@@ -1921,10 +1924,18 @@ st apply_header_change(object_meta& m, const header_change& c, int64_t now_ms)
                 return st::io_error;
             set_legal_hold_extra(m, c.value);
             break;
+        case header_change::kind::replication:
+            // A version that failed to replicate keeps saying so, whatever another destination's copy came to.
+            if (c.value != "COMPLETED" && c.value != "FAILED")
+                return st::io_error;
+            if (replication_status_of(m) != "FAILED")
+                set_replication_status(m, c.value);
+            break;
     }
     set_tags_extra(m, tags_of(m));
     set_retention_extra(m, retention_of(m));
     set_legal_hold_extra(m, legal_hold_of(m));
+    set_replication_status(m, replication_status_of(m));
     return st::ok;
 }
 
@@ -2027,7 +2038,8 @@ void object_store::change_header_local(std::string_view bucket_name, std::string
             return;
         }
         if (tags_of(tc->meta) == tags_of(*found) && retention_of(tc->meta) == retention_of(*found) &&
-            legal_hold_of(tc->meta) == legal_hold_of(*found))
+            legal_hold_of(tc->meta) == legal_hold_of(*found) &&
+            replication_status_of(tc->meta) == replication_status_of(*found))
         {
             tags_written(tc, st::ok, false);
             return;
@@ -3041,8 +3053,9 @@ void object_store::drop_rename(std::string name, std::function<void(st)> cb)
 static_assert(cors_max_bytes <= doc_max_bytes && lifecycle_max_bytes <= doc_max_bytes &&
               policy_max_bytes <= doc_max_bytes && versioning_max_bytes <= doc_max_bytes &&
               encryption_max_bytes <= doc_max_bytes && bucket_tagging_max_bytes <= doc_max_bytes &&
-              object_lock_max_bytes <= doc_max_bytes && notification_max_bytes <= doc_max_bytes);
-static_assert(std::size(all_bucket_docs) <= 8, "doc_doubt has a bit per kind");
+              object_lock_max_bytes <= doc_max_bytes && notification_max_bytes <= doc_max_bytes &&
+              replication_max_bytes <= doc_max_bytes);
+static_assert(std::size(all_bucket_docs) <= 16, "doc_doubt has a bit per kind");
 
 const char* object_store::doc_file(bucket_doc kind)
 {
@@ -3056,6 +3069,7 @@ const char* object_store::doc_file(bucket_doc kind)
         case bucket_doc::tagging:    return "tagging";
         case bucket_doc::object_lock: return "object-lock";
         case bucket_doc::notification: return "notification";
+        case bucket_doc::replication: return "replication";
     }
     return "?";
 }
@@ -3066,9 +3080,28 @@ std::shared_ptr<const notify_config> object_store::bucket_notify(std::string_vie
     return b && !b->closing ? b->notify : nullptr;
 }
 
+std::shared_ptr<const replication_config> object_store::bucket_replication(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b && !b->closing ? b->replication : nullptr;
+}
+
+void object_store::each_version(std::string_view name,
+                                const std::function<void(const std::string& key, const object_meta& m)>& fn) const
+{
+    const bucket* b = find_bucket(name);
+    if (!b)
+        return;
+    for (const auto& [key, m] : b->objects)
+        fn(key, m);
+    for (const auto& [key, list] : b->versions)
+        for (const object_meta& m : list)
+            fn(key, m);
+}
+
 uint64_t object_store::stage_change(const bucket& b, const change_note& n)
 {
-    return b.notify && m_sink ? m_sink->stage(n) : 0;
+    return (b.notify || b.replication) && m_sink ? m_sink->stage(n) : 0;
 }
 
 void object_store::after_staged(uint64_t ticket, std::function<void()> answer)
@@ -3164,7 +3197,10 @@ st object_store::doc_conflict(bucket_doc kind, std::string_view name, std::strin
     // Object lock keeps versions only while versioning is Enabled, so neither may leave the other behind.
     if (kind == bucket_doc::object_lock && (b->vstate != versioning::enabled || (xml.empty() && b->lock)))
         return st::invalid_bucket_state;
-    if (kind == bucket_doc::versioning && b->lock)
+    // Replication keeps a bucket's versions too, so it neither comes without versioning nor lets it go.
+    if (kind == bucket_doc::replication && !xml.empty() && b->vstate != versioning::enabled)
+        return st::invalid_bucket_state;
+    if (kind == bucket_doc::versioning && (b->lock || b->replication))
     {
         versioning v = versioning::off;
         s3_error   ignored;
@@ -3293,6 +3329,22 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml, st
         }
         // A configuration of no rules asks for nothing, so its bucket's changes are not told of at all.
         b.notify = n && !n->rules.empty() ? std::move(n) : nullptr;
+        return true;
+    }
+    if (kind == bucket_doc::replication)
+    {
+        std::shared_ptr<replication_config> r;
+        if (!xml.empty())
+        {
+            r = std::make_shared<replication_config>();
+            if (!parse_replication_config(xml, *r, err))
+            {
+                if (why)
+                    *why = err.message;
+                return false;
+            }
+        }
+        b.replication = std::move(r);
         return true;
     }
     if (kind == bucket_doc::tagging)
@@ -3512,16 +3564,16 @@ void object_store::set_doubt(bucket& b, bucket_doc kind, uint64_t seq)
 {
     if (b.doc_doubt == 0)
         ++m_doubt_buckets;
-    b.doc_doubt |= static_cast<uint8_t>(1u << static_cast<unsigned>(kind));
+    b.doc_doubt |= static_cast<uint16_t>(1u << static_cast<unsigned>(kind));
     b.doc_doubt_seq[static_cast<size_t>(kind)] = seq;
 }
 
 void object_store::clear_doubt(bucket& b, bucket_doc kind)
 {
-    const uint8_t bit = static_cast<uint8_t>(1u << static_cast<unsigned>(kind));
+    const uint16_t bit = static_cast<uint16_t>(1u << static_cast<unsigned>(kind));
     if (!(b.doc_doubt & bit))
         return;
-    b.doc_doubt &= static_cast<uint8_t>(~bit);
+    b.doc_doubt &= static_cast<uint16_t>(~bit);
     if (b.doc_doubt == 0)
         --m_doubt_buckets;
 }
@@ -3537,7 +3589,7 @@ st object_store::doubt_doc(bucket_doc kind, std::string_view name, uint64_t seq)
 void object_store::decided_doc(bucket_doc kind, std::string_view name, uint64_t seq, const std::string* xml)
 {
     bucket* b = find_bucket(name);
-    const uint8_t bit = static_cast<uint8_t>(1u << static_cast<unsigned>(kind));
+    const uint16_t bit = static_cast<uint16_t>(1u << static_cast<unsigned>(kind));
     // Word of an earlier change, overtaken by a later one this shard was told of, settles nothing.
     if (!b || !(b->doc_doubt & bit) || b->doc_doubt_seq[static_cast<size_t>(kind)] != seq)
         return;
@@ -3599,7 +3651,7 @@ bool object_store::settle_bucket(bucket& b)
 
 bool object_store::versioning_settled(bucket& b)
 {
-    const uint8_t bit = static_cast<uint8_t>(1u << static_cast<unsigned>(bucket_doc::versioning));
+    const uint16_t bit = static_cast<uint16_t>(1u << static_cast<unsigned>(bucket_doc::versioning));
     return !(b.doc_doubt & bit) || settle_bucket(b) || !(b.doc_doubt & bit);
 }
 

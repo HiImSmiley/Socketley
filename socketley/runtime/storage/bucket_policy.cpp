@@ -166,8 +166,8 @@ constexpr action_name action_names[] = {
     {"RestoreObject", res_kind::object, s3_action::none},
     {"GetObjectTorrent", res_kind::object, s3_action::none},
     {"GetObjectVersionTorrent", res_kind::object, s3_action::none},
-    {"ReplicateObject", res_kind::object, s3_action::none},
-    {"ReplicateDelete", res_kind::object, s3_action::none},
+    {"ReplicateObject", res_kind::object, s3_action::replicate_object},
+    {"ReplicateDelete", res_kind::object, s3_action::replicate_delete},
     {"ReplicateTags", res_kind::object, s3_action::none},
     {"ListBucketVersions", res_kind::bucket, s3_action::list_bucket_versions},
     {"GetBucketAcl", res_kind::bucket, s3_action::get_bucket_acl},
@@ -185,8 +185,8 @@ constexpr action_name action_names[] = {
     {"PutBucketLogging", res_kind::bucket, s3_action::none},
     {"GetEncryptionConfiguration", res_kind::bucket, s3_action::get_encryption_configuration},
     {"PutEncryptionConfiguration", res_kind::bucket, s3_action::put_encryption_configuration},
-    {"GetReplicationConfiguration", res_kind::bucket, s3_action::none},
-    {"PutReplicationConfiguration", res_kind::bucket, s3_action::none},
+    {"GetReplicationConfiguration", res_kind::bucket, s3_action::get_replication_configuration},
+    {"PutReplicationConfiguration", res_kind::bucket, s3_action::put_replication_configuration},
     {"GetBucketObjectLockConfiguration", res_kind::bucket, s3_action::get_bucket_object_lock_configuration},
     {"PutBucketObjectLockConfiguration", res_kind::bucket, s3_action::put_bucket_object_lock_configuration},
     {"GetBucketPublicAccessBlock", res_kind::bucket, s3_action::none},
@@ -666,6 +666,9 @@ s3_action action_of_operation(std::string_view op)
         {"PutObjectLegalHold", s3_action::put_object_legal_hold},
         {"GetBucketNotificationConfiguration", s3_action::get_bucket_notification},
         {"PutBucketNotificationConfiguration", s3_action::put_bucket_notification},
+        {"GetBucketReplication", s3_action::get_replication_configuration},
+        {"PutBucketReplication", s3_action::put_replication_configuration},
+        {"DeleteBucketReplication", s3_action::put_replication_configuration},
     };
     for (const row& r : table)
         if (r.op == op)
@@ -701,6 +704,8 @@ bool action_on_object(s3_action a)
         case s3_action::get_object_legal_hold:
         case s3_action::put_object_legal_hold:
         case s3_action::bypass_governance_retention:
+        case s3_action::replicate_object:
+        case s3_action::replicate_delete:
             return true;
         default:
             return false;

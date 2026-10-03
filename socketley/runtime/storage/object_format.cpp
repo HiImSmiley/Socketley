@@ -25,6 +25,8 @@ constexpr size_t           max_record_bytes = 64 * 1024;
 constexpr std::string_view slot_magic = std::string_view("SKLTAG\x01\x00", 8);
 // A slot whose payload is the tags, the retention and the legal hold, each a length and its bytes.
 constexpr std::string_view lock_slot_magic = std::string_view("SKLTAG\x02\x00", 8);
+// The same with the replication status after them.
+constexpr std::string_view repl_slot_magic = std::string_view("SKLTAG\x03\x00", 8);
 constexpr std::string_view part_list_magic = std::string_view("SKLPRT\x01\x00", 8);
 // A part list that carries each part's checksum after its number and size.
 constexpr std::string_view part_list_sums_magic = std::string_view("SKLPRT\x02\x00", 8);
@@ -413,6 +415,22 @@ void set_legal_hold_extra(object_meta& m, std::string_view status)
     std::erase_if(m.extra, [](const auto& e) { return e.first == legal_hold_extra; });
     if (!kept.empty())
         m.extra.emplace_back(std::string(legal_hold_extra), std::move(kept));
+}
+
+std::string_view replication_status_of(const object_meta& m)
+{
+    for (const auto& [n, v] : m.extra)
+        if (n == replication_status_extra)
+            return v;
+    return {};
+}
+
+void set_replication_status(object_meta& m, std::string_view status)
+{
+    std::string kept(status);
+    std::erase_if(m.extra, [](const auto& e) { return e.first == replication_status_extra; });
+    if (!kept.empty())
+        m.extra.emplace_back(std::string(replication_status_extra), std::move(kept));
 }
 
 bool has_lock_extra(const object_meta& m)
@@ -920,7 +938,8 @@ decoded_header decode_object_header(std::string_view bytes)
     {
         const size_t off = l.off[i];
         if (bytes.size() < off + slot_head ||
-            (bytes.substr(off, 8) != slot_magic && bytes.substr(off, 8) != lock_slot_magic))
+            (bytes.substr(off, 8) != slot_magic && bytes.substr(off, 8) != lock_slot_magic &&
+             bytes.substr(off, 8) != repl_slot_magic))
             continue;
         uint64_t seq;
         uint32_t len, scrc;
@@ -934,18 +953,22 @@ decoded_header decode_object_header(std::string_view bytes)
         c          = raft::storage::crc32c(payload.data(), payload.size(), c);
         if (c != scrc)
             continue;
-        if (bytes.substr(off, 8) == lock_slot_magic)
+        const bool repl = bytes.substr(off, 8) == repl_slot_magic;
+        if (repl || bytes.substr(off, 8) == lock_slot_magic)
         {
             reader r{payload};
             r.str();
             r.str();
             r.str();
+            if (repl)
+                r.str();
             if (!r.ok || !r.in.empty())
                 continue;
         }
         d.tag_slot  = static_cast<int8_t>(i);
         d.tag_seq   = seq;
-        d.lock_slot = bytes.substr(off, 8) == lock_slot_magic;
+        d.repl_slot = repl;
+        d.lock_slot = repl || bytes.substr(off, 8) == lock_slot_magic;
         tags        = payload;
     }
     if (d.tag_slot < 0)
@@ -964,6 +987,8 @@ decoded_header decode_object_header(std::string_view bytes)
     if (!ret.empty())
         d.meta.extra.emplace_back(std::string(retention_extra), std::string(ret));
     set_legal_hold_extra(d.meta, hold);
+    if (d.repl_slot)
+        set_replication_status(d.meta, r.str());
     return d;
 }
 
@@ -973,7 +998,8 @@ std::string encode_tag_slot(const decoded_header& d, const object_meta& want, ui
     if (d.status != header_status::ok || l.room == 0)
         return {};
     // The tags alone while no lock was ever recorded, so a header no version of the lock touched reads as it did.
-    const bool lock = d.lock_slot || has_lock_extra(d.meta) || has_lock_extra(want);
+    const bool repl = d.repl_slot || !replication_status_of(d.meta).empty() || !replication_status_of(want).empty();
+    const bool lock = repl || d.lock_slot || has_lock_extra(d.meta) || has_lock_extra(want);
     std::string payload;
     if (lock)
     {
@@ -984,12 +1010,14 @@ std::string encode_tag_slot(const decoded_header& d, const object_meta& want, ui
         put_str(payload, tags_of(want));
         put_str(payload, ret);
         put_str(payload, legal_hold_of(want));
+        if (repl)
+            put_str(payload, replication_status_of(want));
     }
     else
         payload = std::string(tags_of(want));
     if (slot_head + payload.size() > l.room)
         return {};
-    std::string s(lock ? lock_slot_magic : slot_magic);
+    std::string s(repl ? repl_slot_magic : lock ? lock_slot_magic : slot_magic);
     put_u64(s, d.tag_seq + 1);
     put_u32(s, static_cast<uint32_t>(payload.size()));
     uint32_t c = raft::storage::crc32c(s.data(), s.size());

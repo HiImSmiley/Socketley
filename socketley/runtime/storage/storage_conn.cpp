@@ -117,6 +117,12 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
       m_store(loop, m_io, std::move(opts)),
       m_mpu(loop, m_io, m_store),
       m_notify(loop, m_io, this),
+      m_repl(loop, m_io, this, m_store, m_hash,
+             [this](const object_meta& m, sse_key& out)
+             {
+                 s3_error ignored;
+                 return sse_data_key(m, std::nullopt, out, ignored);
+             }),
       m_transport(owner.get_runtime_manager() ? &owner.get_runtime_manager()->requests() : nullptr,
                   std::string(owner.get_name())),
       m_node(m_store, m_transport), m_auth(auth)
@@ -186,6 +192,8 @@ bool storage_run::open(std::string& err)
         return decode_change_check(check, n) && m_store.change_on_disk(n);
     };
     if (!m_notify.open(m_store.options().dir, m_store.shard(), made, err))
+        return false;
+    if (!m_repl.open(m_store.options().dir, m_store.shard(), made, err))
         return false;
     reap_uploads();
     LOG_INFO(("storage: " + std::to_string(rep.buckets) + " bucket(s), " +
@@ -317,6 +325,11 @@ void storage_run::on_cqe(struct io_uring_cqe* cqe)
     if (m_notify.owns(req))
     {
         m_notify.on_timer();
+        return;
+    }
+    if (m_repl.owns(req))
+    {
+        m_repl.on_timer();
         return;
     }
 
@@ -589,6 +602,7 @@ void storage_run::stop()
     m_transport.stop();
     m_node.stop();
     m_notify.stop();
+    m_repl.stop();
 
     // Nothing new can arrive, so the journal writes, syncs and compaction already begun are let finish, which is what lets close() mark the stop clean.
     const auto give_up = std::chrono::steady_clock::now() + stop_drain_bound;

@@ -866,6 +866,60 @@ verify_result verify(const request_view& req, const verify_options& opts, const 
     return r;
 }
 
+std::string sign(const sign_input& in)
+{
+    std::vector<std::string_view> names;
+    names.reserve(in.headers.size());
+    for (const header_field& h : in.headers)
+        names.push_back(h.name);
+    std::sort(names.begin(), names.end());
+    std::string signed_list;
+    for (std::string_view n : names)
+    {
+        if (!signed_list.empty())
+            signed_list.push_back(';');
+        signed_list.append(n);
+    }
+
+    const std::string_view raw = in.raw_path.empty() ? std::string_view("/") : in.raw_path;
+    std::string path;
+    if (canonical_already(raw))
+        path = std::string(raw);
+    else
+        uri_encode_append(path, decode_component(raw, false), true);
+    std::string query;
+    canonical_query(query, in.raw_query, {});
+
+    std::string creq;
+    append(creq, {in.method, "\n", path, "\n", query, "\n"});
+    if (!append_canonical_headers(creq, in.headers, signed_list))
+        return {};
+    append(creq, {"\n", signed_list, "\n", in.payload_hash});
+
+    const std::string_view date = in.amz_date.substr(0, 8);
+    std::string scope;
+    append(scope, {date, "/", in.region, "/", in.service, "/aws4_request"});
+    uint8_t creq_hash[32];
+    char creq_hex[64];
+    sha256_of(creq, creq_hash);
+    hex_encode32(creq_hash, creq_hex);
+    std::string sts;
+    append(sts, {algorithm, "\n", in.amz_date, "\n", scope, "\n", std::string_view(creq_hex, 64)});
+
+    uint8_t key[32];
+    derive_signing_key(in.secret, date, in.region, in.service, key);
+    uint8_t mac[32];
+    hmac_sha256(as_sv(key, 32), {sts}, mac);
+    OPENSSL_cleanse(key, sizeof(key));
+    char sig[64];
+    hex_encode32(mac, sig);
+
+    std::string out;
+    append(out, {algorithm, " Credential=", in.access_key, "/", scope, ", SignedHeaders=", signed_list,
+                 ", Signature=", std::string_view(sig, 64)});
+    return out;
+}
+
 // ---- payload_hasher ----
 
 payload_hasher::payload_hasher() : ctx_(EVP_MD_CTX_new())

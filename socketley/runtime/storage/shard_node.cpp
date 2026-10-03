@@ -440,6 +440,7 @@ std::string doc_label(bucket_doc kind)
         case bucket_doc::tagging:    return "tag set";
         case bucket_doc::object_lock: return "object lock configuration";
         case bucket_doc::notification: return "notification configuration";
+        case bucket_doc::replication: return "replication configuration";
     }
     return "configuration";
 }
@@ -1181,7 +1182,7 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             uint8_t what = 0;
             if (!wire::decode_set_tags(payload, bucket, key, version_id, change.value, &what, &change.bypass,
                                        &change.who) ||
-                what > static_cast<uint8_t>(header_change::kind::legal_hold))
+                what > static_cast<uint8_t>(header_change::kind::replication))
             {
                 reply(false, {});
                 return;

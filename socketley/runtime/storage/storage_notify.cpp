@@ -77,9 +77,10 @@ void storage_run::op_get_notification(const std::shared_ptr<conn>& c)
 
 change_origin storage_run::origin_of(const conn& c) const
 {
-    if (!m_store.bucket_notify(c.req.bucket))
-        return {};
     change_origin o;
+    o.replica = replica_request(c.req);
+    if (!m_store.bucket_notify(c.req.bucket))
+        return o;
     o.principal = c.user ? c.user->id : "anonymous";
     struct sockaddr_storage ss{};
     socklen_t len = sizeof(ss);
@@ -141,31 +142,74 @@ std::vector<std::pair<std::string, std::string>> storage_run::change_events(cons
 
 uint64_t storage_run::stage(const change_note& n)
 {
-    auto events = change_events(n);
-    return events.empty() ? 0 : m_notify.stage(encode_change_check(n), std::move(events));
+    const std::string check = encode_change_check(n);
+    staged_change s;
+    if (auto events = change_events(n); !events.empty())
+        s.notify = m_notify.stage(check, std::move(events));
+    s.copies = stage_copies(n, check);
+    // A version written PENDING that nothing copies is marked FAILED once it is made, as a change already made is.
+    if (s.copies == 0 && n.has_object && n.replication == replication_pending)
+        s.uncopied = n;
+    if (s.notify == 0 && s.copies == 0 && !s.uncopied)
+        return 0;
+    const uint64_t ticket = m_next_ticket++;
+    m_staged.emplace(ticket, std::move(s));
+    return ticket;
 }
 
 void storage_run::staged(uint64_t ticket, std::function<void()> then)
 {
-    m_notify.staged(ticket, std::move(then));
+    const auto it = m_staged.find(ticket);
+    if (it == m_staged.end())
+    {
+        then();
+        return;
+    }
+    const uint64_t copies = it->second.copies;
+    m_notify.staged(it->second.notify, [this, copies, then = std::move(then)]() mutable
+    {
+        m_repl.staged(copies, std::move(then));
+    });
 }
 
 void storage_run::settle(uint64_t ticket, bool made, std::function<void()> then)
 {
-    m_notify.settle(ticket, made, std::move(then));
+    const auto it = m_staged.find(ticket);
+    if (it == m_staged.end())
+    {
+        then();
+        return;
+    }
+    staged_change s = std::move(it->second);
+    m_staged.erase(it);
+    std::optional<change_note> uncopied = made ? std::move(s.uncopied) : std::nullopt;
+    m_notify.settle(s.notify, made, [this, copies = s.copies, made, uncopied = std::move(uncopied),
+                                     then = std::move(then)]() mutable
+    {
+        m_repl.settle(copies, made, [this, uncopied = std::move(uncopied), then = std::move(then)]() mutable
+        {
+            // The key's lane is handed on by `then`, so the status written after it does not wait on itself.
+            then();
+            if (uncopied)
+                replicate_change(*uncopied);
+        });
+    });
 }
 
 void storage_run::made(change_note n, std::function<void()> answer)
 {
+    const bool copied = replicate_change(n);
     bool queued = false;
     for (auto& [target, json] : change_events(n))
         queued = m_notify.add(target, std::move(json)) || queued;
-    if (!queued)
-    {
+    if (queued && copied)
+        m_notify.sync([this, answer = std::move(answer)]() mutable { m_repl.sync(std::move(answer)); });
+    else if (queued)
+        m_notify.sync(std::move(answer));
+    else if (copied)
+        m_repl.sync(std::move(answer));
+    else
         answer();
-        return;
-    }
-    m_notify.sync(std::move(answer));
 }
 
 std::string storage_run::encode_change_check(const change_note& n)

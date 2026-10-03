@@ -46,11 +46,16 @@ void put_origin(bytes::writer& w, const change_origin& who)
 {
     w.bytes(who.principal);
     w.bytes(who.source_ip);
+    w.u8(who.replica ? 1 : 0);
 }
 
 bool get_origin(bytes::reader& r, change_origin& who)
 {
-    return r.bytes(who.principal, 1024) && r.bytes(who.source_ip, 64);
+    uint8_t replica = 0;
+    if (!r.bytes(who.principal, 1024) || !r.bytes(who.source_ip, 64) || !r.u8(replica))
+        return false;
+    who.replica = replica != 0;
+    return true;
 }
 
 bool status_byte(bytes::reader& r, st& s)

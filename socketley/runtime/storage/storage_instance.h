@@ -75,6 +75,11 @@ public:
     void set_notify_targets(std::string_view f) { m_notify_targets = std::string(f); }
     std::string_view get_notify_targets() const { return m_notify_targets; }
 
+    // The file of `name url region access_key secret` lines naming the endpoints buckets replicate to, read at every
+    // start; none refuses every replication configuration.
+    void set_replication_targets(std::string_view f) { m_replication_targets = std::string(f); }
+    std::string_view get_replication_targets() const { return m_replication_targets; }
+
     // What decides whether a request may go on.  Given, it is used instead of
     // the anonymous default; the SigV4 authenticator arrives here.
     void set_authenticator(std::unique_ptr<socketley::storage::authenticator> a);
@@ -126,6 +131,7 @@ private:
     std::string m_sse_key_file;
     std::string m_domain;
     std::string m_notify_targets;
+    std::string m_replication_targets;
     uint32_t    m_mpu_expire_secs{0};
     std::unique_ptr<socketley::storage::authenticator> m_auth;
     std::unique_ptr<socketley::storage::anonymous_authenticator> m_anon;

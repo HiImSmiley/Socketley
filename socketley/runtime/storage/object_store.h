@@ -16,6 +16,7 @@
 //   <dir>/<bucket>/notification       its NotificationConfiguration, likewise
 //   <dir>/<bucket>/object-lock        its ObjectLockConfiguration, likewise, which is never removed
 //   <dir>/<bucket>/policy             its bucket policy, likewise
+//   <dir>/<bucket>/replication        its ReplicationConfiguration, likewise
 //   <dir>/<bucket>/versioning         its VersioningConfiguration, likewise
 //   <dir>/<bucket>/versions/ab/<hash>.<id>
 //                                     a noncurrent version of a key in a versioned bucket, made
@@ -57,6 +58,7 @@ struct cors_config;
 struct lifecycle_config;
 struct lock_config;
 struct notify_config;
+struct replication_config;
 class bucket_policy;
 
 // The configuration documents a bucket keeps beside its objects, each in a file named for it.
@@ -70,11 +72,13 @@ enum class bucket_doc : uint8_t
     tagging,
     object_lock,
     notification,
+    replication,
 };
 // Every kind, for the walks that settle or take up all of a bucket's documents.
 inline constexpr bucket_doc all_bucket_docs[] = {bucket_doc::cors,       bucket_doc::lifecycle, bucket_doc::policy,
                                                  bucket_doc::versioning, bucket_doc::encryption, bucket_doc::tagging,
-                                                 bucket_doc::object_lock, bucket_doc::notification};
+                                                 bucket_doc::object_lock, bucket_doc::notification,
+                                                 bucket_doc::replication};
 
 // A bucket's versioning: never configured, keeping every version, or writing the null version.
 enum class versioning : uint8_t
@@ -309,14 +313,17 @@ struct change_origin
 {
     std::string principal;
     std::string source_ip;
+    // The change is a replica another runtime's replication made, which this one's replication does not send on.
+    bool        replica{false};
 };
 
 // A change of what a version keeps in its header's slots, made in place by the owner of its key.
 struct header_change
 {
-    enum class kind : uint8_t { tags, retention, legal_hold };
+    enum class kind : uint8_t { tags, retention, legal_hold, replication };
     kind        what{kind::tags};
-    // The tags in the encoding of tags_of(), the retention in retention_extra's (empty to remove it), or ON or OFF.
+    // The tags in the encoding of tags_of(), the retention in retention_extra's (empty to remove it), ON or OFF, or
+    // the replication status a version's replication came to.
     std::string value;
     // The caller may shorten, remove or change a GOVERNANCE retention.
     bool        bypass{false};
@@ -334,7 +341,7 @@ enum class change_cause : uint8_t
     lifecycle,
 };
 
-// A change to an object, told by the owner of its key to whoever sends its bucket's events.
+// A change to an object, told by the owner of its key to whoever sends its bucket's events and replicates it.
 struct change_note
 {
     std::string bucket;
@@ -349,9 +356,12 @@ struct change_note
     std::string version_id;
     // The time the object or delete marker records, which tells it from another of the same bytes.
     int64_t     mtime_ms{0};
+    // A new version's tags, in the encoding of tags_of(), and the replication status it was written with.
+    std::string tags;
+    std::string replication;
 };
 
-// Whoever sends a bucket's events, told of each change by the owner of its key.
+// Whoever sends a bucket's events and copies, told of each change by the owner of its key.
 class change_sink
 {
 public:
@@ -701,10 +711,16 @@ public:
     void set_lifecycle_listener(std::function<void()> fn) { m_lifecycle_listener = std::move(fn); }
     // The bucket's notification configuration, null when it has none.
     std::shared_ptr<const notify_config> bucket_notify(std::string_view name) const;
-    // Told by the owner of a key of each change to an object of a bucket with a notification configuration.
+    // Told by the owner of a key of each change to an object of a bucket with a notification or a replication
+    // configuration.
     void set_change_sink(change_sink* sink) { m_sink = sink; }
     // Whether the change `n` describes is in the files, for a start deciding a staged event; blocking.
     bool change_on_disk(const change_note& n) const;
+    // The bucket's replication configuration, null when it has none.
+    std::shared_ptr<const replication_config> bucket_replication(std::string_view name) const;
+    // Every version of `bucket` this shard indexes, the latest of each key and the others, delete markers included.
+    void each_version(std::string_view bucket,
+                      const std::function<void(const std::string& key, const object_meta& m)>& fn) const;
 
     // ── Sharding ────────────────────────────────────────────────────────────
     uint32_t shard() const { return m_opts.shard; }
@@ -952,12 +968,13 @@ private:
         // Its object lock configuration, which once set is never removed.
         std::shared_ptr<const lock_config> lock;
         std::shared_ptr<const notify_config> notify;
+        std::shared_ptr<const replication_config> replication;
         versioning  vstate{versioning::off};
         // Per key, every version but a latest that is not a delete marker, newest first: the key's
         // noncurrent versions, behind its latest when that is a marker; empty unless the bucket was versioned.
         std::map<std::string, std::vector<object_meta>, std::less<>> versions;
         // The documents, a bit per kind, this shard may hold an old copy of, and the change each is waiting on.
-        uint8_t     doc_doubt{0};
+        uint16_t    doc_doubt{0};
         uint64_t    doc_doubt_seq[std::size(all_bucket_docs)]{};
         // New objects are encrypted with the master key when they ask for nothing else.
         bool        encrypts{false};
@@ -1136,7 +1153,8 @@ private:
     std::function<void(const std::string&)> m_forget_listener;
     std::function<void()> m_lifecycle_listener;
     change_sink* m_sink{nullptr};
-    // Stages the events of a change of an object about to be made under its key's lane, 0 when the bucket sends none.
+    // Stages the events and copies of a change of an object about to be made under its key's lane, 0 when the bucket
+    // makes none.
     uint64_t stage_change(const bucket& b, const change_note& n);
     // The answer of a change that staged events waits for them to be durable.
     void after_staged(uint64_t ticket, std::function<void()> answer);

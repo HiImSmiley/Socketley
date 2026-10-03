@@ -77,6 +77,11 @@ enum class s3_action : uint8_t
     bypass_governance_retention,
     get_bucket_notification,
     put_bucket_notification,
+    get_replication_configuration,
+    put_replication_configuration,
+    // A write or a delete marker another runtime's replication makes, which is asked instead of the plain action.
+    replicate_object,
+    replicate_delete,
     count,
 };
 static_assert(static_cast<int>(s3_action::count) <= 64);

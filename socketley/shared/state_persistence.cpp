@@ -791,6 +791,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.storage_sse_key_file = std::string(stg->get_sse_key_file());
             cfg.storage_domain = std::string(stg->get_domain());
             cfg.storage_notify_targets = std::string(stg->get_notify_targets());
+            cfg.storage_replication_targets = std::string(stg->get_replication_targets());
             cfg.storage_mpu_expire_secs = stg->get_mpu_expire_secs();
             break;
         }
@@ -1063,6 +1064,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("domain", cfg.storage_domain);
             if (!cfg.storage_notify_targets.empty())
                 append_str_field("notify_targets", cfg.storage_notify_targets);
+            if (!cfg.storage_replication_targets.empty())
+                append_str_field("replication_targets", cfg.storage_replication_targets);
             if (cfg.storage_mpu_expire_secs > 0)
                 append_int_field("mpu_expire", cfg.storage_mpu_expire_secs);
             break;
@@ -1230,6 +1233,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.storage_sse_key_file = json_get_string(json, "sse_key_file");
             cfg.storage_domain = json_get_string(json, "domain");
             cfg.storage_notify_targets = json_get_string(json, "notify_targets");
+            cfg.storage_replication_targets = json_get_string(json, "replication_targets");
             cfg.storage_mpu_expire_secs = static_cast<uint32_t>(json_get_size(json, "mpu_expire"));
             break;
     }

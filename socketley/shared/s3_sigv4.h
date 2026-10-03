@@ -50,6 +50,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 #include <type_traits>
 
@@ -169,6 +170,28 @@ struct verify_options
 };
 
 verify_result verify(const request_view& req, const verify_options& opts, const secret_lookup& secrets, int64_t now_unix);
+
+// What a client signs one request with, in the terms verify() checks it in.
+struct sign_input
+{
+    std::string_view method;
+    // The path and the query as they go on the wire, already encoded, the query without its '?'.
+    std::string_view raw_path;
+    std::string_view raw_query;
+    // Every header the signature covers, host and x-amz-date among them, each name once and in lower case.
+    std::span<const header_field> headers;
+    // What x-amz-content-sha256 says: a hex digest, or UNSIGNED-PAYLOAD.
+    std::string_view payload_hash;
+    std::string_view access_key;
+    std::string_view secret;
+    std::string_view region;
+    std::string_view service = "s3";
+    // YYYYMMDDTHHMMSSZ, the request's x-amz-date.
+    std::string_view amz_date;
+};
+
+// The Authorization header's value that signs `in`.
+std::string sign(const sign_input& in);
 
 // Incremental sha256 for a declared payload hash; one allocation at construction, none per byte.
 class payload_hasher

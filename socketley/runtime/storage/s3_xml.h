@@ -126,6 +126,7 @@ inline s3_error make_error(std::string_view code)
         {"InvalidRetentionPeriod", 400, "Default retention period must be a positive integer value."},
         {"InvalidBucketState", 409, "The request is not valid with the current state of the bucket."},
         {"ServerSideEncryptionConfigurationNotFoundError", 404, "The server side encryption configuration was not found"},
+        {"ReplicationConfigurationNotFoundError", 404, "The replication configuration was not found"},
         {"InvalidEncryptionAlgorithmError", 400, "The encryption request you specified is not valid. The valid value is AES256."},
         {"MalformedPolicy", 400, "Policies must be valid JSON and the first byte must be '{'"},
         {"BadRequest", 400, "Bad Request"},
@@ -207,7 +208,7 @@ inline std::string error_xml(const s3_error& e, const error_context& c)
              std::string(c.extra_name) + ">";
     if (e.code == "NoSuchBucket" || e.code == "BucketNotEmpty" || e.code == "InvalidBucketName" ||
         e.code == "NoSuchCORSConfiguration" || e.code == "NoSuchLifecycleConfiguration" ||
-        e.code == "NoSuchBucketPolicy" || e.code == "NoSuchTagSet")
+        e.code == "NoSuchBucketPolicy" || e.code == "NoSuchTagSet" || e.code == "ReplicationConfigurationNotFoundError")
         x += "<BucketName>" + xml_escape(c.bucket) + "</BucketName>";
     if (e.code == "NoSuchKey")
         x += "<Key>" + xml_escape(c.key) + "</Key>";

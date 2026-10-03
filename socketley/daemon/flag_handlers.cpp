@@ -1331,6 +1331,17 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
             stg->set_notify_targets(pa.args[++i]);
             return 0;
         }
+        // The endpoints buckets replicate to, a file of `name url region access_key secret` lines read at every start.
+        case fnv1a("--replication-targets"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << "--replication-targets requires a file path\n";
+                return 1;
+            }
+            stg->set_replication_targets(pa.args[++i]);
+            return 0;
+        }
         // Open multipart uploads are aborted after this long, and never when it is absent.
         case fnv1a("--mpu-expire"):
         {

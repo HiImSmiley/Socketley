@@ -26,6 +26,7 @@
 #include "notifier.h"
 #include "object_store.h"
 #include "post_policy.h"
+#include "replicator.h"
 #include "s3_auth.h"
 #include "s3_users.h"
 #include "../../shared/storage_rpc.h"
@@ -176,6 +177,10 @@ bool parse_checksum_request(const s3_request& r, checksum_request& out, s3_error
 
 // The algorithm x-amz-checksum-algorithm names, none without it; false with `err` for one the runtime cannot take.
 bool checksum_algorithm_header(const s3_request& r, checksum_algo& out, s3_error& err);
+
+// Whether the request writes or deletes a replica for another runtime's replication, which it says with its
+// x-amz-replication-status header and is judged for as s3:ReplicateObject or s3:ReplicateDelete.
+bool replica_request(const s3_request& r);
 
 // The tags an x-amz-tagging header names, put into `m`; false with `err` when S3 would refuse them.
 bool tagging_from_header(const s3_request& r, object_meta& m, s3_error& err);
@@ -480,6 +485,8 @@ public:
     multipart_store& multipart() { return m_mpu; }
     notifier& notifications() { return m_notify; }
     const notifier& notifications() const { return m_notify; }
+    replicator& replication() { return m_repl; }
+    const replicator& replication() const { return m_repl; }
     // Uploads left open this many seconds are aborted; zero keeps them until they are.
     void set_mpu_expire_secs(uint32_t s)
     {
@@ -657,7 +664,7 @@ public:
     void op_get_notification(const std::shared_ptr<conn>& c);
     // The events of a change, one `{target, json}` for every rule of its bucket that asks for it.
     std::vector<std::pair<std::string, std::string>> change_events(const change_note& n);
-    // The store's sink for the events of the changes the owner of their key makes.
+    // The store's sink for the events and copies of the changes the owner of their key makes.
     uint64_t stage(const change_note& n) override;
     void staged(uint64_t ticket, std::function<void()> then) override;
     void settle(uint64_t ticket, bool made, std::function<void()> then) override;
@@ -665,6 +672,19 @@ public:
     // What a staged change's outbox record keeps of it, for the start that asks the files whether it was made.
     static std::string encode_change_check(const change_note& n);
     static bool decode_change_check(std::string_view b, change_note& n);
+
+    // Replication, in storage_replication.cpp: the configuration's three operations, the status a new version is
+    // written with, and the copies a change queues.
+    void op_put_replication(const std::shared_ptr<conn>& c);
+    void op_get_replication(const std::shared_ptr<conn>& c);
+    void op_delete_replication(const std::shared_ptr<conn>& c);
+    // Puts into `m` the status a new version of `key` is written with: REPLICA for a replica a replication wrote,
+    // PENDING when a rule of `bucket` copies it, and none for an SSE-C version, which is never copied.
+    void replication_mark(std::string_view bucket, std::string_view key, object_meta& m, bool sse_c, bool replica);
+    // Queues the copies a change already made makes, true when any was.
+    bool replicate_change(const change_note& n);
+    // Stages the copies of a change about to be made, its ticket in the replication outbox or 0.
+    uint64_t stage_copies(const change_note& n, std::string_view check);
     // Who a request's change is told as: its user or "anonymous", and the client's address, left empty for a
     // bucket that sends no events.
     change_origin origin_of(const conn& c) const;
@@ -820,6 +840,17 @@ private:
     object_store      m_store;
     multipart_store   m_mpu;
     notifier          m_notify;
+    replicator        m_repl;
+    // Each change staged and not yet settled, by the ticket the store holds: its tickets in the two outboxes, and the
+    // change itself when it was written PENDING and nothing was staged to copy it, which settle() then marks FAILED.
+    struct staged_change
+    {
+        uint64_t notify{0};
+        uint64_t copies{0};
+        std::optional<change_note> uncopied;
+    };
+    std::unordered_map<uint64_t, staged_change> m_staged;
+    uint64_t          m_next_ticket{1};
     // The last sequencer an event was given, which only grows.
     uint64_t          m_notify_seq{0};
     // What carries a request to a sibling shard, and the logic that makes one

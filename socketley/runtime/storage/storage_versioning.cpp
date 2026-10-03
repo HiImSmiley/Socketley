@@ -212,6 +212,14 @@ void storage_run::op_put_versioning(const std::shared_ptr<conn>& c)
         send_error(c, err);
         return;
     }
+    // Replication copies versions, so a bucket that replicates keeps them.
+    if (v != versioning::enabled && m_store.bucket_replication(q.bucket))
+    {
+        err = make_error("InvalidBucketState");
+        err.message = "A replication configuration is present on this bucket, so the versioning state cannot be changed.";
+        send_error(c, err);
+        return;
+    }
     std::weak_ptr<conn> weak = c;
     m_node.set_doc(bucket_doc::versioning, q.bucket, versioning_xml(v), [this, weak](st s)
     {

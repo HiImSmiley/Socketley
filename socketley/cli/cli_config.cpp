@@ -114,6 +114,7 @@ constexpr config_key config_keys[] = {
     { "sse_key_file",       "--sse-key-file",       key_kind::text    },
     { "domain",             "--domain",             key_kind::text    },
     { "notify_targets",     "--notify-targets",     key_kind::text    },
+    { "replication_targets", "--replication-targets", key_kind::text   },
     { "mpu_expire",         "--mpu-expire",         key_kind::scalar  },
 };
 

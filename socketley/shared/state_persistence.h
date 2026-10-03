@@ -159,6 +159,7 @@ struct runtime_config
     std::string storage_sse_key_file;
     std::string storage_domain;
     std::string storage_notify_targets;
+    std::string storage_replication_targets;
     uint32_t storage_mpu_expire_secs = 0;
 
     // A registered type's own fields in declaration order, opaque here, held

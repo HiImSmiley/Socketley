@@ -94,6 +94,12 @@ std::string storage_instance::config_refusal() const
         if (std::string why; !socketley::storage::load_notify_targets(m_notify_targets, targets, why))
             return "storage: " + why + "\n";
     }
+    if (!m_replication_targets.empty())
+    {
+        std::vector<socketley::storage::replication_target> targets;
+        if (std::string why; !socketley::storage::load_replication_targets(m_replication_targets, targets, why))
+            return "storage: " + why + "\n";
+    }
     return {};
 }
 
@@ -274,6 +280,19 @@ bool storage_instance::setup(event_loop& loop)
         }
         run->notifications().set_targets(std::move(targets));
     }
+    if (!m_replication_targets.empty())
+    {
+        std::vector<socketley::storage::replication_target> targets;
+        std::string why;
+        if (!socketley::storage::load_replication_targets(m_replication_targets, targets, why))
+        {
+            LOG_ERROR(("storage: " + why).c_str());
+            run->stop();
+            m_graveyard.push_back(std::move(run));
+            return false;
+        }
+        run->replication().set_targets(std::move(targets));
+    }
 
     // The one blocking step: reading the directory and reconciling the journals
     // happens here, before the listener exists, so no connection waits behind it.
@@ -444,7 +463,12 @@ std::string storage_instance::stats_lines() const
         << "notify_failed:" << m_run->notifications().counters().failed << "\n"
         << "notify_queued:" << m_run->notifications().queued() << "\n"
         << "notify_dropped:" << m_run->notifications().counters().dropped << "\n"
-        << "notify_resolves:" << m_run->notifications().resolves() << "\n";
+        << "notify_resolves:" << m_run->notifications().resolves() << "\n"
+        << "replication_pending:" << m_run->replication().pending() << "\n"
+        << "replication_completed:" << m_run->replication().counters().completed << "\n"
+        << "replication_failed:" << m_run->replication().counters().failed << "\n"
+        << "replication_retries:" << m_run->replication().counters().retries << "\n"
+        << "replication_bytes:" << m_run->replication().counters().bytes << "\n";
     // One line per code answered, so a client's mistakes and the runtime's own
     // are told apart without reading a log.
     for (const auto& [code, n] : c.errors)
