@@ -7651,13 +7651,21 @@ and such a delete as
 .BR "Bucket policy" ),
 marks the version REPLICA, and never copies a replica or a replica's delete
 marker on, so two buckets that replicate to each other copy each change once.
-Another S3 stores the header as it does. A replica's version id, time and owner
-are the destination's own.
+The request also names the source's version id in
+.BR x\-socketley\-replica\-version\-id ,
+which a storage runtime that is the destination gives the replica or its delete
+marker, as S3 does, as long as that id is still newer than every version the key
+has there; otherwise the replica gets an id of its own. Another S3 stores the
+replication header as it does and ignores the other, so there a replica's version
+id is its own. A replica's time and owner are the destination's own.
 .PP
 The shard that owns a key queues its copies, one entry per destination bucket,
 in
 .IB dir /.replicate/outbox. shard\fR,
-synced before the change is answered, with the change's events. Each target is
+synced beside the change itself and before it is answered, as its events are
+(see
+.BR "Event notifications" ),
+so a crash never copies a change that was not made. Each target is
 sent one copy at a time, in order. A refused connection, a stall of 10 seconds,
 no answer within 120 seconds of the whole request, and an answer of 408, 409,
 429 or a 5xx other than 501 are tried again after 0.25 s, doubling to 8 s, and

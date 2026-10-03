@@ -315,6 +315,27 @@ bool valid_version_id(std::string_view id)
     return true;
 }
 
+bool version_of_id(std::string_view id, bool marker, version_tag& out)
+{
+    if (id == "null" || !valid_version_id(id))
+        return false;
+    uint64_t seq = 0;
+    for (char c : id.substr(0, 16))
+        seq = seq << 4 | static_cast<uint64_t>(c <= '9' ? c - '0' : c - 'a' + 10);
+    out.seq    = seq;
+    out.id     = std::string(id);
+    out.marker = marker;
+    return seq != 0;
+}
+
+std::string_view replica_source_of(const object_meta& m)
+{
+    for (const auto& [n, v] : m.extra)
+        if (n == replica_version_extra)
+            return v;
+    return {};
+}
+
 version_tag version_of(const object_meta& m)
 {
     version_tag t;

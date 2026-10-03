@@ -1426,7 +1426,7 @@ bool object_store::decide_version(const bucket& b, commit_request& rq) const
 {
     if (!versioned(b, rq.key) || stamp_holds(b, rq.key, rq.meta))
         return false;
-    set_version_extra(rq.meta, next_version(b, rq.key, false));
+    set_version_extra(rq.meta, next_version(b, rq.key, false, replica_source_of(rq.meta)));
     return true;
 }
 

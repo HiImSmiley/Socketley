@@ -118,6 +118,12 @@ def versions(c, bucket, prefix):
             [(m["Key"], m["IsLatest"]) for m in r.get("DeleteMarkers", [])])
 
 
+def version_ids(c, bucket, key):
+    r = c.list_object_versions(Bucket=bucket, Prefix=key)
+    return ([v["VersionId"] for v in r.get("Versions", []) if v["Key"] == key],
+            [m["VersionId"] for m in r.get("DeleteMarkers", []) if m["Key"] == key])
+
+
 def stats(runtime):
     out = subprocess.run([BIN, "stats", runtime], capture_output=True, text=True).stdout
     shards, cur = {}, 0
@@ -275,6 +281,9 @@ def mode_main(sp, dp):
     check("a delete marker is copied by a rule that says so",
           wait_for(lambda: versions(dst, DB, "docs/a")[1] == [("docs/a", True)], 20), versions(dst, DB, "docs/a"))
     check("and the replica's latest is gone", body(dst, DB, "docs/a") == "NoSuchKey")
+    check("every version and the marker keep the version id the source gave them",
+          version_ids(dst, DB, "docs/a") == version_ids(src, SB, "docs/a") and
+          len(version_ids(src, SB, "docs/a")[0]) == 2, (version_ids(src, SB, "docs/a"), version_ids(dst, DB, "docs/a")))
     src.delete_object(Bucket=SB, Key="img/x")
 
     # A multipart version is copied in the same parts.
@@ -299,6 +308,8 @@ def mode_main(sp, dp):
           h["Metadata"] == {"part": "y"}, (h, big["ETag"], hs.get("ChecksumCRC32")))
     check("and the same bytes", hashlib.sha256(body(dst, DB, "docs/big")).hexdigest() ==
           hashlib.sha256(b"".join(parts)).hexdigest())
+    check("and the same version id", version_ids(dst, DB, "docs/big") == version_ids(src, SB, "docs/big"),
+          (version_ids(src, SB, "docs/big"), version_ids(dst, DB, "docs/big")))
 
     # An object encrypted with SSE-S3 is read in the clear and written encrypted again.
     secret = os.urandom(70000)
@@ -579,11 +590,13 @@ def mode_shards(dp, nodes):
 
     check("every version through either shard is copied",
           wait_for(lambda: all(s == "COMPLETED" for s in statuses()), 40), statuses())
+    # A delete marker has no status to wait on, and is copied after the version it hides.
+    check("and every delete marker through either shard",
+          wait_for(lambda: all(versions(dst, "rdst-s", "s%02d" % i)[1] == [("s%02d" % i, True)]
+                               for i in range(0, n, 6)), 40))
     check("and is on the destination once, as it was",
           all(body(dst, "rdst-s", "s%02d" % i) == (b"v" * (100 + i) if i % 6 else "NoSuchKey") for i in range(n)) and
           all(len(versions(dst, "rdst-s", "s%02d" % i)[0]) == 1 for i in range(n)))
-    check("and every delete marker through either shard",
-          all(versions(dst, "rdst-s", "s%02d" % i)[1] == [("s%02d" % i, True)] for i in range(0, n, 6)))
 
     def per():
         return {k: int(s.get("replication_completed", "0")) for k, s in stats("rshard").items()}

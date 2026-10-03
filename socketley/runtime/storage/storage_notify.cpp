@@ -79,6 +79,8 @@ change_origin storage_run::origin_of(const conn& c) const
 {
     change_origin o;
     o.replica = replica_request(c.req);
+    if (o.replica)
+        o.source_version = std::string(c.req.header(replica_version_header));
     if (!m_store.bucket_notify(c.req.bucket))
         return o;
     o.principal = c.user ? c.user->id : "anonymous";

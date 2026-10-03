@@ -659,7 +659,7 @@ void put_op::finish_now()
     if (const object_store::bucket* vb = m_store->find_bucket(m_bucket);
         vb && vb->vstate != versioning::off && !m_committer)
     {
-        set_version_extra(m_meta, m_store->next_version(*vb, m_key, false));
+        set_version_extra(m_meta, m_store->next_version(*vb, m_key, false, replica_source_of(m_meta)));
         // A bucket versioned since the room was reserved leaves the version to the owner.
         if (object_header_len(m_key, m_meta) > m_header_len)
             clear_version_extra(m_meta);

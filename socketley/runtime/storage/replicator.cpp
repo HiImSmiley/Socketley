@@ -632,7 +632,8 @@ void replicator::run_marker(lane& l, const std::shared_ptr<job>& j)
 {
     http_request rq;
     rq.head = signed_head(l, "DELETE", object_path(l.target.http, j->t.dest_bucket, j->t.key), {},
-                          {{"x-amz-replication-status", "REPLICA"}}, 0);
+                          {{"x-amz-replication-status", "REPLICA"},
+                           {std::string(replica_version_header), j->t.version_id}}, 0);
     exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>&, http_answer a)
     {
         ended(lp, a.status / 100 == 2 ? outcome::done : judge(a), 0);
@@ -775,6 +776,8 @@ std::vector<std::pair<std::string, std::string>> replica_headers(const object_me
         h.emplace_back("x-amz-tagging", std::move(q));
     }
     h.emplace_back("x-amz-replication-status", "REPLICA");
+    if (has_version(m))
+        h.emplace_back(std::string(replica_version_header), version_of(m).id);
     if (is_encrypted(m))
         h.emplace_back("x-amz-server-side-encryption", "AES256");
     if (!storage_class.empty())

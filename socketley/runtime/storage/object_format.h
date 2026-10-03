@@ -220,6 +220,15 @@ void set_version_extra(object_meta& m, const version_tag& v);
 void clear_version_extra(object_meta& m);
 // A version id the store could have given, which is also what keeps one out of a path.
 bool valid_version_id(std::string_view id);
+// The version an id the store gave in a versioned bucket names, its order being the id's first sixteen digits; false
+// for "null" and anything else.
+bool version_of_id(std::string_view id, bool marker, version_tag& out);
+
+// The extra entry of a replica naming the version id its source gave it, which the replica keeps when it is still the
+// newest of its key.
+inline constexpr std::string_view replica_version_extra = "x-socketley-replica-version";
+// That id, empty for anything but a replica.
+std::string_view replica_source_of(const object_meta& m);
 
 // The extra entries of a version's object lock: its retention, 'G' or 'C' and the retain-until time in decimal
 // milliseconds, and its legal hold, ON or OFF once one was ever set.

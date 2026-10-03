@@ -158,9 +158,12 @@ uint64_t object_store::newest_seq(const bucket& b, std::string_view key)
     return top;
 }
 
-version_tag object_store::next_version(const bucket& b, const std::string& key, bool marker) const
+version_tag object_store::next_version(const bucket& b, const std::string& key, bool marker,
+                                       std::string_view source_id) const
 {
     version_tag t;
+    if (b.vstate == versioning::enabled && version_of_id(source_id, marker, t) && t.seq > newest_seq(b, key))
+        return t;
     // Newer than every version the key has even when the clock stepped back.
     t.seq    = std::max(now_us(), newest_seq(b, key) + 1);
     t.marker = marker;
@@ -675,6 +678,7 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
     };
     // The removal's events are staged once what it removes or makes is decided, and before the disk is touched.
     const bool lc = cause == change_cause::lifecycle;
+    const std::string source_version = who.source_version;
     const auto stage = [this, v, b, lc, who = std::move(who)](bool marker)
     {
         change_note n;
@@ -706,7 +710,7 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
         v->meta = object_meta{};
         v->meta.mtime_ms = static_cast<int64_t>(now_ms());
         v->meta.md5      = md5_of({});
-        const version_tag t = next_version(*b, v->key, true);
+        const version_tag t = next_version(*b, v->key, true, source_version);
         set_version_extra(v->meta, t);
         v->rr = {st::ok, o != b->objects.end(), true, t.id};
         v->tmp = tmp_name();

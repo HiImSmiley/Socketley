@@ -26,6 +26,10 @@ inline constexpr std::string_view replication_completed = "COMPLETED";
 inline constexpr std::string_view replication_failed    = "FAILED";
 inline constexpr std::string_view replication_replica   = "REPLICA";
 
+// The header a replication names the source's version id in, which a socketley destination gives the replica and any
+// other S3 ignores.
+inline constexpr std::string_view replica_version_header = "x-socketley-replica-version-id";
+
 struct replication_rule
 {
     std::string id;

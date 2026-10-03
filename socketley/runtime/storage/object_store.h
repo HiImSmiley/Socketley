@@ -315,6 +315,8 @@ struct change_origin
     std::string source_ip;
     // The change is a replica another runtime's replication made, which this one's replication does not send on.
     bool        replica{false};
+    // The version id the replica's source gave it, which a delete marker it makes keeps when it can.
+    std::string source_version;
 };
 
 // A change of what a version keeps in its header's slots, made in place by the owner of its key.
@@ -1090,8 +1092,10 @@ private:
     }
     // The order of the newest version `key` has, zero for none.
     static uint64_t newest_seq(const bucket& b, std::string_view key);
-    // The version a new latest of `key` is given, newer than every one it has.
-    version_tag next_version(const bucket& b, const std::string& key, bool marker) const;
+    // The version a new latest of `key` is given, newer than every one it has: `source_id`, a replica's id at its
+    // source, when that still is.
+    version_tag next_version(const bucket& b, const std::string& key, bool marker,
+                             std::string_view source_id = {}) const;
     // Whether the version a writer put in a body's header is one the owner can give it as it stands.
     bool stamp_holds(const bucket& b, const std::string& key, const object_meta& meta) const;
     // The index's other versions of a key, each change journaled: `m` in its place by order, or the version `id` gone.

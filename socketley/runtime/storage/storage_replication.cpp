@@ -120,6 +120,8 @@ void storage_run::replication_mark(std::string_view bucket, std::string_view key
                                    bool replica)
 {
     set_replication_status(m, {});
+    // A copy of a replica is no replica, so the source's version id it carried goes with the status.
+    std::erase_if(m.extra, [](const auto& e) { return e.first == replica_version_extra; });
     // A replica is not copied on, which is what keeps two buckets that replicate to each other from doing so forever.
     if (replica)
     {
@@ -129,6 +131,13 @@ void storage_run::replication_mark(std::string_view bucket, std::string_view key
     const auto cfg = m_store.bucket_replication(bucket);
     if (cfg && !sse_c && !replication_rules_for(*cfg, key, tags_of(m), false).empty())
         set_replication_status(m, replication_pending);
+}
+
+void storage_run::replica_source(const s3_request& r, object_meta& m)
+{
+    const std::string_view id = http_trim_ows(r.header(replica_version_header));
+    if (replica_request(r) && valid_version_id(id) && id != "null")
+        m.extra.emplace_back(std::string(replica_version_extra), std::string(id));
 }
 
 bool storage_run::replicate_change(const change_note& n)

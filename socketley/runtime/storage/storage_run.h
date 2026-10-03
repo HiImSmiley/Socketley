@@ -681,6 +681,8 @@ public:
     // Puts into `m` the status a new version of `key` is written with: REPLICA for a replica a replication wrote,
     // PENDING when a rule of `bucket` copies it, and none for an SSE-C version, which is never copied.
     void replication_mark(std::string_view bucket, std::string_view key, object_meta& m, bool sse_c, bool replica);
+    // Puts into `m` the version id a replica's source gave it, which the store gives the replica when it can.
+    void replica_source(const s3_request& r, object_meta& m);
     // Queues the copies a change already made makes, true when any was.
     bool replicate_change(const change_note& n);
     // Stages the copies of a change about to be made, its ticket in the replication outbox or 0.
@@ -689,7 +691,7 @@ public:
     // bucket that sends no events.
     change_origin origin_of(const conn& c) const;
     // A lifecycle rule's expiry, which S3's records name as S3 itself.
-    static change_origin lifecycle_origin() { return {"s3.amazonaws.com", {}}; }
+    static change_origin lifecycle_origin() { return {"s3.amazonaws.com", {}, false, {}}; }
 
     // Object lock, in storage_object_lock.cpp.
     void op_put_object_lock_config(const std::shared_ptr<conn>& c);

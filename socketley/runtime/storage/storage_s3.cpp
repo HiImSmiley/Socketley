@@ -1263,6 +1263,7 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
         return;
     }
     replication_mark(r.bucket, r.key, meta, ask.mode == sse_mode::c, replica_request(r));
+    replica_source(r, meta);
     start_put(c, r.key, std::move(meta), {}, checksum_algo::none, cond, {},
               ask.mode != sse_mode::none ? &seal : nullptr);
 }
