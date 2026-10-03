@@ -93,6 +93,10 @@ object_store::object_store(event_loop& loop, file_io& io, store_options opts)
         m_opts.nshards = 1;
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_KILL_AFTER_RENAME"))
         m_kill_after_rename = e;
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_KILL_AFTER_EVENT"))
+        m_kill_after_event = e;
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_HOLD_CONFIRM"))
+        m_hold_confirm = e;
     // The hot-object budget per shard, 0 to keep nothing.
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_HOT_BYTES"))
         m_hot_budget = std::strtoull(e, nullptr, 10);
@@ -1319,9 +1323,16 @@ void object_store::commit(commit_request req, std::function<void(put_result)> cb
 void object_store::commit_local(commit_request req, std::function<void(put_result)> cb)
 {
     bucket* b = find_bucket(req.bucket);
+    // A refusal before the commit starts lets go of a body descriptor it was handed.
+    const auto refuse = [this, &req, &cb](st s)
+    {
+        if (req.body_fd >= 0)
+            m_loop->close_fd(req.body_fd);
+        cb({s, req.meta});
+    };
     if (!b || b->closing)
     {
-        cb({st::no_such_bucket, req.meta});
+        refuse(st::no_such_bucket);
         return;
     }
     if (!owns(req.bucket, req.key))
@@ -1331,14 +1342,14 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
         LOG_WARN(("storage: a commit for a key that shard " + std::to_string(owner_of(req.bucket, req.key)) +
                   " owns reached shard " + std::to_string(m_opts.shard)).c_str());
         if (!m_io->unlinkat(b->tmp_fd, req.tmp_name, 0, [](int64_t) {})) {}
-        cb({st::io_error, req.meta});
+        refuse(st::io_error);
         return;
     }
     // The owner decides whether a write makes a version, so it writes nothing by a versioning it may hold an old copy of.
     if (!versioning_settled(*b))
     {
         if (!m_io->unlinkat(b->tmp_fd, req.tmp_name, 0, [](int64_t) {})) {}
-        cb({st::unavailable, req.meta});
+        refuse(st::unavailable);
         return;
     }
     ++b->active_ops;
@@ -1346,7 +1357,7 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
 
     auto c   = std::make_shared<commit_state>();
     c->alive = m_alive;
-    c->cb    = noted_commit(*b, req, std::move(cb));
+    c->cb    = std::move(cb);
     c->req   = std::move(req);
     lane_enter(*b, c->req.key, [this, c]()
     {
@@ -1380,104 +1391,191 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
                 return;
             }
         }
-        if (versioned(*bp, rq.key))
+        // The version is decided before the event is staged, which names it.
+        const bool restamp = decide_version(*bp, c->req);
+        c->ticket = stage_change(*bp, commit_note(rq));
+        if (killed_after_event(c->ticket, rq.key))
+            return;
+        if (rq.body_fd < 0)
         {
-            commit_versioned(rq.bucket, rq.key, rq.tmp_name, rq.pooled, rq.meta, [this, c]() { commit_release(*c); },
-                             std::move(c->cb));
+            commit_staged(c, restamp);
             return;
         }
-        c->rel = object_rel_path(rq.key);
-        ensure_dirs(rq.bucket, c->rel, [this, c](int leaf, st why)
-        {
-            if (!*c->alive)
-                return;
-            bucket* bq = find_bucket(c->req.bucket);
-            if (!bq || why != st::ok)
+        // The body's sync runs beside the event's, and the commit goes on once the body is durable.
+        const int fd = rq.body_fd;
+        if (!m_io->fsync(fd, true, [this, c, restamp, fd](int64_t r)
             {
-                commit_refuse(c, why == st::ok ? st::no_such_bucket : why);
-                return;
-            }
-            const bool q = m_io->renameat(c->req.pooled ? bq->pool_fd : bq->tmp_fd, c->req.tmp_name, bq->data_fd, c->rel,
-                [this, c, leaf](int64_t r)
+                if (!*c->alive)
+                    return;
+                ++m_totals.fsyncs;
+                m_loop->close_fd(fd);
+                c->req.body_fd = -1;
+                if (r < 0)
+                {
+                    commit_refuse(c, errno_status(r));
+                    return;
+                }
+                commit_staged(c, restamp);
+            }))
+            commit_refuse(c, st::io_error);
+    });
+}
+
+bool object_store::decide_version(const bucket& b, commit_request& rq) const
+{
+    if (!versioned(b, rq.key) || stamp_holds(b, rq.key, rq.meta))
+        return false;
+    set_version_extra(rq.meta, next_version(b, rq.key, false));
+    return true;
+}
+
+change_note object_store::commit_note(const commit_request& rq)
+{
+    change_note n;
+    n.bucket = rq.bucket;
+    n.key    = rq.key;
+    n.who    = rq.who;
+    n.event  = ev_put;
+    switch (rq.cause)
+    {
+        case change_cause::post:     n.event = ev_post; break;
+        case change_cause::copy:     n.event = ev_copy; break;
+        case change_cause::complete: n.event = ev_complete; break;
+        default:                     break;
+    }
+    n.has_object = true;
+    n.size       = rq.meta.size;
+    n.etag       = rq.meta.etag();
+    n.mtime_ms   = rq.meta.mtime_ms;
+    if (has_version(rq.meta))
+        n.version_id = version_of(rq.meta).id;
+    return n;
+}
+
+void object_store::commit_staged(const commit_ptr& c, bool restamp)
+{
+    const commit_request& rq = c->req;
+    bucket* bp = find_bucket(rq.bucket);
+    if (!bp)
+    {
+        commit_done(c, st::no_such_bucket);
+        return;
+    }
+    // A change of the bucket's versioning while the body was synced gives it another version, and its event with it.
+    if (decide_version(*bp, c->req))
+    {
+        restamp = true;
+        if (c->ticket)
+        {
+            const uint64_t was = c->ticket;
+            c->ticket = stage_change(*bp, commit_note(rq));
+            m_sink->settle(was, false, []() {});
+        }
+    }
+    if (restamp || versioned(*bp, rq.key))
+    {
+        const uint64_t ticket = c->ticket;
+        commit_versioned(rq.bucket, rq.key, rq.tmp_name, rq.pooled, rq.meta, restamp,
+                         [this, c](bool made) { commit_release(*c, made); },
+                         [this, ticket, cb = std::move(c->cb)](put_result r)
+                         {
+                             after_staged(ticket, [cb, r = std::move(r)]() mutable { cb(std::move(r)); });
+                         });
+        return;
+    }
+    c->rel = object_rel_path(rq.key);
+    ensure_dirs(rq.bucket, c->rel, [this, c](int leaf, st why)
+    {
+        if (!*c->alive)
+            return;
+        bucket* bq = find_bucket(c->req.bucket);
+        if (!bq || why != st::ok)
+        {
+            commit_refuse(c, why == st::ok ? st::no_such_bucket : why);
+            return;
+        }
+        const bool q = m_io->renameat(c->req.pooled ? bq->pool_fd : bq->tmp_fd, c->req.tmp_name, bq->data_fd, c->rel,
+            [this, c, leaf](int64_t r)
+            {
+                if (!*c->alive)
+                    return;
+                bucket* br = find_bucket(c->req.bucket);
+                if (!br)
+                {
+                    commit_done(c, st::no_such_bucket);
+                    return;
+                }
+                if (r < 0)
+                {
+                    m_loop->close_fd(leaf);
+                    commit_refuse(c, errno_status(r));
+                    return;
+                }
+                if (!m_kill_after_rename.empty() && c->req.key.starts_with(m_kill_after_rename))
+                    ::raise(SIGKILL);
+                if (c->req.pooled)
+                {
+                    commit_pooled(*br, c, leaf);
+                    return;
+                }
+                // The rename is in the directory now and durable once the
+                // directory is synced; only then may the journal say so.
+                const bool q2 = m_io->fsync(leaf, false, [this, c, leaf](int64_t r2)
                 {
                     if (!*c->alive)
                         return;
-                    bucket* br = find_bucket(c->req.bucket);
-                    if (!br)
+                    ++m_totals.fsyncs;
+                    m_loop->close_fd(leaf);
+                    bucket* bs = find_bucket(c->req.bucket);
+                    if (!bs)
                     {
                         commit_done(c, st::no_such_bucket);
                         return;
                     }
-                    if (r < 0)
+                    if (r2 < 0)
                     {
-                        m_loop->close_fd(leaf);
-                        commit_refuse(c, errno_status(r));
-                        return;
-                    }
-                    if (!m_kill_after_rename.empty() && c->req.key.starts_with(m_kill_after_rename))
-                        ::raise(SIGKILL);
-                    if (c->req.pooled)
-                    {
-                        commit_pooled(*br, c, leaf);
-                        return;
-                    }
-                    // The rename is in the directory now and durable once the
-                    // directory is synced; only then may the journal say so.
-                    const bool q2 = m_io->fsync(leaf, false, [this, c, leaf](int64_t r2)
-                    {
-                        if (!*c->alive)
-                            return;
-                        ++m_totals.fsyncs;
-                        m_loop->close_fd(leaf);
-                        bucket* bs = find_bucket(c->req.bucket);
-                        if (!bs)
-                        {
-                            commit_done(c, st::no_such_bucket);
-                            return;
-                        }
-                        if (r2 < 0)
-                        {
-                            commit_done(c, st::io_error);
-                            return;
-                        }
-                        // The object is durable: its file is synced, renamed and its
-                        // directory synced.  The journal record is only the index
-                        // of it, written behind the answer and synced in a group.
-                        std::string rec;
-                        encode_put_record(rec, c->req.key, c->req.meta);
-                        journal_append(*bs, rec, nullptr);
-                        apply_put(*bs, c->req.key, c->req.meta);
-                        invalidate_siblings(c->req.bucket, c->req.key, [this, c]() { commit_done(c, st::ok); });
-                    });
-                    if (!q2)
-                    {
-                        m_loop->close_fd(leaf);
                         commit_done(c, st::io_error);
+                        return;
                     }
+                    // The object is durable: its file is synced, renamed and its
+                    // directory synced.  The journal record is only the index
+                    // of it, written behind the answer and synced in a group.
+                    std::string rec;
+                    encode_put_record(rec, c->req.key, c->req.meta);
+                    journal_append(*bs, rec, nullptr);
+                    apply_put(*bs, c->req.key, c->req.meta);
+                    invalidate_siblings(c->req.bucket, c->req.key, [this, c]() { commit_done(c, st::ok); });
                 });
-            if (!q)
-            {
-                m_loop->close_fd(leaf);
-                commit_done(c, st::io_error);
-            }
-        });
+                if (!q2)
+                {
+                    m_loop->close_fd(leaf);
+                    commit_done(c, st::io_error);
+                }
+            });
+        if (!q)
+        {
+            m_loop->close_fd(leaf);
+            commit_done(c, st::io_error);
+        }
     });
 }
 
-void object_store::commit_release(const commit_state& c)
+void object_store::commit_release(const commit_state& c, bool made)
 {
+    if (c.req.body_fd >= 0)
+        m_loop->close_fd(c.req.body_fd);
     if (bucket* bp = find_bucket(c.req.bucket))
         --bp->active_ops;
     --m_inflight;
-    lane_leave(c.req.bucket, c.req.key);
+    lane_settle(c.req.bucket, c.req.key, c.ticket, made);
 }
 
 void object_store::commit_done(const commit_ptr& c, st s)
 {
     if (!*c->alive)
         return;
-    commit_release(*c);
-    c->cb({s, c->req.meta});
+    commit_release(*c, s == st::ok);
+    after_staged(c->ticket, [c, s]() { c->cb({s, c->req.meta}); });
 }
 
 void object_store::commit_refuse(const commit_ptr& c, st s)
@@ -1519,7 +1617,7 @@ void object_store::commit_pooled(bucket& b, const commit_ptr& c, int leaf)
             encode_put_record(rec, c->req.key, c->req.meta);
             journal_append(*bs, rec, nullptr);
         }
-        commit_release(*c);
+        commit_release(*c, true);
     };
     if (!m_io->fsync(leaf, false, [this, c, leaf, part](int64_t r)
         {
@@ -1534,7 +1632,8 @@ void object_store::commit_pooled(bucket& b, const commit_ptr& c, int leaf)
         part(false);
     }
     sync_pool(b, part);
-    invalidate_siblings(c->req.bucket, c->req.key, [c]() { c->cb({st::ok, c->req.meta}); });
+    invalidate_siblings(c->req.bucket, c->req.key,
+                        [this, c]() { after_staged(c->ticket, [c]() { c->cb({st::ok, c->req.meta}); }); });
 }
 
 void object_store::remove(std::string_view bucket_name, std::string_view key_sv,
@@ -1595,7 +1694,6 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
         cb({st::no_such_bucket});
         return;
     }
-    cb = noted_remove(*b, key_sv, !version_id.empty(), cause, std::move(who), std::move(cb));
     if (!owns(bucket_name, key_sv))
     {
         LOG_WARN(("storage: a delete for a key that shard " + std::to_string(owner_of(bucket_name, key_sv)) +
@@ -1618,6 +1716,10 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
         std::string                   bname, key, dir, version_id;
         bool                          existed{false};
         bool                          bypass{false};
+        change_cause                  cause{change_cause::remove};
+        change_origin                 who;
+        // The events the removal staged, 0 for none.
+        uint64_t                      ticket{0};
         std::function<void(remove_result)> cb;
         std::function<bool(const object_meta&)> only_if;
     };
@@ -1630,6 +1732,8 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
     rm->cb    = std::move(cb);
     rm->only_if = std::move(only_if);
     rm->bypass  = bypass;
+    rm->cause   = cause;
+    rm->who     = std::move(who);
 
     const auto done = [this](const removal_ptr& r, st s, bool existed)
     {
@@ -1638,8 +1742,8 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
         if (bucket* bp = find_bucket(r->bname))
             --bp->active_ops;
         --m_inflight;
-        lane_leave(r->bname, r->key);
-        r->cb({s, existed});
+        lane_settle(r->bname, r->key, r->ticket, s == st::ok);
+        after_staged(r->ticket, [r, s, existed]() { r->cb({s, existed}); });
     };
 
     // The unlink is durable, so the object cannot come back whatever happens to the record that says it is gone.
@@ -1668,15 +1772,15 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
         }
         if (!rm->version_id.empty() || versioned(*bp, rm->key))
         {
-            auto release = [this, bname = rm->bname, key = rm->key]()
+            auto release = [this, bname = rm->bname, key = rm->key](uint64_t ticket, bool made)
             {
                 if (bucket* bq = find_bucket(bname))
                     --bq->active_ops;
                 --m_inflight;
-                lane_leave(bname, key);
+                lane_settle(bname, key, ticket, made);
             };
-            remove_versioned(rm->bname, rm->key, rm->version_id, std::move(rm->only_if), rm->bypass,
-                             std::move(release), std::move(rm->cb));
+            remove_versioned(rm->bname, rm->key, rm->version_id, std::move(rm->only_if), rm->bypass, rm->cause,
+                             std::move(rm->who), std::move(release), std::move(rm->cb));
             return;
         }
         const auto found = bp->objects.find(rm->key);
@@ -1690,6 +1794,17 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
         {
             done(rm, st::locked, true);
             return;
+        }
+        if (rm->existed)
+        {
+            change_note n;
+            n.bucket = rm->bname;
+            n.key    = rm->key;
+            n.who    = rm->who;
+            n.event  = rm->cause == change_cause::lifecycle ? ev_lc_delete : ev_delete;
+            rm->ticket = stage_change(*bp, n);
+            if (killed_after_event(rm->ticket, rm->key))
+                return;
         }
         std::string rel = object_rel_path(rm->key);
         rm->dir = rel.substr(0, 2);
@@ -2791,12 +2906,15 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
 
 void object_store::delete_bucket(std::string name, std::function<void(st)> cb)
 {
-    if (const st s = drop_check(name); s != st::ok)
+    after_settled(name, [this, name, cb]()
     {
-        cb(s);
-        return;
-    }
-    drop_rename(std::move(name), std::move(cb));
+        if (const st s = drop_check(name); s != st::ok)
+        {
+            cb(s);
+            return;
+        }
+        drop_rename(name, cb);
+    });
 }
 
 st object_store::drop_check(std::string_view name)
@@ -2948,72 +3066,71 @@ std::shared_ptr<const notify_config> object_store::bucket_notify(std::string_vie
     return b && !b->closing ? b->notify : nullptr;
 }
 
-std::function<void(put_result)> object_store::noted_commit(const bucket& b, const commit_request& req,
-                                                           std::function<void(put_result)> cb)
+uint64_t object_store::stage_change(const bucket& b, const change_note& n)
 {
-    if (!b.notify || !m_change_listener)
-        return cb;
-    uint16_t bit = ev_put;
-    switch (req.cause)
-    {
-        case change_cause::post:     bit = ev_post; break;
-        case change_cause::copy:     bit = ev_copy; break;
-        case change_cause::complete: bit = ev_complete; break;
-        default:                     break;
-    }
-    return [this, bucket = req.bucket, key = req.key, who = req.who, bit, cb = std::move(cb)](put_result r)
-    {
-        if (r.status != st::ok)
-        {
-            cb(std::move(r));
-            return;
-        }
-        change_note n;
-        n.bucket     = bucket;
-        n.key        = key;
-        n.who        = who;
-        n.event      = bit;
-        n.has_object = true;
-        n.size       = r.meta.size;
-        n.etag       = r.meta.etag();
-        if (has_version(r.meta))
-            n.version_id = version_of(r.meta).id;
-        m_change_listener(std::move(n), [cb, r = std::move(r)]() mutable { cb(std::move(r)); });
-    };
+    return b.notify && m_sink ? m_sink->stage(n) : 0;
 }
 
-std::function<void(remove_result)> object_store::noted_remove(const bucket& b, std::string_view key, bool by_version,
-                                                              change_cause cause, change_origin who,
-                                                              std::function<void(remove_result)> cb)
+void object_store::after_staged(uint64_t ticket, std::function<void()> answer)
 {
-    if (!b.notify || !m_change_listener)
-        return cb;
-    const bool lc = cause == change_cause::lifecycle;
-    return [this, bucket = b.name, key = std::string(key), who = std::move(who), by_version, lc,
-            cb = std::move(cb)](remove_result r)
+    if (ticket == 0 || !m_sink)
     {
-        if (r.status != st::ok || (!r.existed && !r.marker))
-        {
-            cb(std::move(r));
+        answer();
+        return;
+    }
+    m_sink->staged(ticket, std::move(answer));
+}
+
+void object_store::lane_settle(const std::string& bucket_name, const std::string& key, uint64_t ticket, bool made)
+{
+    // The test aid leaves the change's end unwritten and its events held, as a crash right after its answer would.
+    if (ticket == 0 || !m_sink || (!m_hold_confirm.empty() && key.starts_with(m_hold_confirm)))
+    {
+        lane_leave(bucket_name, key);
+        return;
+    }
+    if (bucket* b = find_bucket(bucket_name))
+        ++b->settling;
+    auto alive = m_alive;
+    m_sink->settle(ticket, made, [this, alive, bucket_name, key]()
+    {
+        if (!*alive)
             return;
-        }
-        // A marker removed by its id is a removal, and one a delete put in front of the key is a marker made.
-        const bool made_marker = r.marker && !by_version;
-        change_note n;
-        n.bucket     = bucket;
-        n.key        = key;
-        n.event      = made_marker ? (lc ? ev_lc_marker : ev_marker) : (lc ? ev_lc_delete : ev_delete);
-        n.version_id = r.version_id;
-        n.who        = who;
-        m_change_listener(std::move(n), [cb, r = std::move(r)]() mutable { cb(std::move(r)); });
-    };
+        lane_leave(bucket_name, key);
+        bucket* b = find_bucket(bucket_name);
+        if (!b || --b->settling > 0)
+            return;
+        auto cbs = std::move(b->settled_cbs);
+        b->settled_cbs.clear();
+        for (auto& cb : cbs)
+            cb();
+    });
+}
+
+void object_store::after_settled(std::string_view bucket_name, std::function<void()> then)
+{
+    bucket* b = find_bucket(bucket_name);
+    if (!b || b->settling == 0)
+    {
+        then();
+        return;
+    }
+    b->settled_cbs.push_back(std::move(then));
+}
+
+bool object_store::killed_after_event(uint64_t ticket, std::string_view key)
+{
+    if (ticket == 0 || m_kill_after_event.empty() || !key.starts_with(m_kill_after_event))
+        return false;
+    m_sink->staged(ticket, []() { ::raise(SIGKILL); });
+    return true;
 }
 
 std::function<void(st, std::string)> object_store::noted_header(const bucket& b, std::string_view key,
                                                                 const header_change& c,
                                                                 std::function<void(st, std::string)> cb)
 {
-    if (!b.notify || !m_change_listener || c.what != header_change::kind::tags)
+    if (!b.notify || !m_sink || c.what != header_change::kind::tags)
         return cb;
     const uint16_t bit = c.value.empty() ? ev_tagging_del : ev_tagging_put;
     return [this, bucket = b.name, key = std::string(key), who = c.who, bit, cb = std::move(cb)](st s, std::string id)
@@ -3029,7 +3146,7 @@ std::function<void(st, std::string)> object_store::noted_header(const bucket& b,
         n.who        = who;
         n.event      = bit;
         n.version_id = id;
-        m_change_listener(std::move(n), [cb, s, id = std::move(id)]() mutable { cb(s, std::move(id)); });
+        m_sink->made(std::move(n), [cb, s, id = std::move(id)]() mutable { cb(s, std::move(id)); });
     };
 }
 

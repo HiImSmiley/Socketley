@@ -6,8 +6,10 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include "s3_names.h"
 #include "s3_notify.h"
 #include "s3_xml.h"
+#include "../../shared/byte_codec.h"
 
 namespace socketley::storage
 {
@@ -99,10 +101,10 @@ change_origin storage_run::origin_of(const conn& c) const
     return o;
 }
 
-void storage_run::notify_change(change_note n, std::function<void()> answer)
+std::vector<std::pair<std::string, std::string>> storage_run::change_events(const change_note& n)
 {
+    std::vector<std::pair<std::string, std::string>> out;
     const auto cfg = m_store.bucket_notify(n.bucket);
-    bool queued = false;
     if (cfg)
     {
         // Sixteen hex digits that grow with every event of this shard, which owns the key, so a key's events sort by it.
@@ -131,15 +133,69 @@ void storage_run::notify_change(change_note n, std::function<void()> answer)
             if (!notify_matches(r, n.event, n.key))
                 continue;
             f.config_id = r.id;
-            queued      = m_notify.add(r.target, notify_event_json(n.event, f)) || queued;
+            out.emplace_back(r.target, notify_event_json(n.event, f));
         }
     }
+    return out;
+}
+
+uint64_t storage_run::stage(const change_note& n)
+{
+    auto events = change_events(n);
+    return events.empty() ? 0 : m_notify.stage(encode_change_check(n), std::move(events));
+}
+
+void storage_run::staged(uint64_t ticket, std::function<void()> then)
+{
+    m_notify.staged(ticket, std::move(then));
+}
+
+void storage_run::settle(uint64_t ticket, bool made, std::function<void()> then)
+{
+    m_notify.settle(ticket, made, std::move(then));
+}
+
+void storage_run::made(change_note n, std::function<void()> answer)
+{
+    bool queued = false;
+    for (auto& [target, json] : change_events(n))
+        queued = m_notify.add(target, std::move(json)) || queued;
     if (!queued)
     {
         answer();
         return;
     }
     m_notify.sync(std::move(answer));
+}
+
+std::string storage_run::encode_change_check(const change_note& n)
+{
+    bytes::writer w;
+    w.u32(n.event);
+    w.bytes(n.bucket);
+    w.bytes(n.key);
+    w.bytes(n.version_id);
+    w.u8(n.has_object ? 1 : 0);
+    w.u64(n.size);
+    w.bytes(n.etag);
+    w.u64(static_cast<uint64_t>(n.mtime_ms));
+    return w.take();
+}
+
+bool storage_run::decode_change_check(std::string_view b, change_note& n)
+{
+    bytes::reader r(b);
+    uint8_t  has = 0;
+    uint32_t event = 0;
+    uint64_t mtime = 0;
+    if (!r.u32(event) || !r.bytes(n.bucket, 1024) || !r.bytes(n.key, 4096) || !r.bytes(n.version_id, 256) ||
+        !r.u8(has) || !r.u64(n.size) || !r.bytes(n.etag, 256) || !r.u64(mtime))
+        return false;
+    n.event      = static_cast<uint16_t>(event);
+    n.has_object = has != 0;
+    n.mtime_ms   = static_cast<int64_t>(mtime);
+    // A bucket's name is a directory the check reads below, so anything else is no change this store made.
+    return valid_bucket_name(n.bucket) && !n.key.empty();
 }
 
 }   // namespace socketley::storage

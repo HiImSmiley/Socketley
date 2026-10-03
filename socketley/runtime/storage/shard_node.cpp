@@ -338,17 +338,24 @@ void shard_node::delete_bucket(std::string name, std::function<void(st)> cb)
 void shard_node::run_drop(std::string name, std::function<void(st)> cb)
 {
     ++m_c.bucket_ops;
-    if (m_mpu)
+    // Judged once the bucket's removing uploads are forgotten and no answered change holds a lane for its events.
+    auto alive   = m_alive;
+    auto settled = [this, alive, name, cb]()
     {
-        auto alive = m_alive;
-        m_mpu->after_removals(name, [this, alive, name, cb]()
+        if (!*alive)
+            return;
+        m_store.after_settled(name, [this, alive, name, cb]()
         {
             if (*alive)
                 run_drop_settled(name, cb);
         });
+    };
+    if (m_mpu)
+    {
+        m_mpu->after_removals(name, settled);
         return;
     }
-    run_drop_settled(std::move(name), std::move(cb));
+    settled();
 }
 
 void shard_node::run_drop_settled(std::string name, std::function<void(st)> cb)
@@ -1339,7 +1346,11 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             return;
         case wire::op::drop_prepare:
         {
-            auto judge = [this, name, reply]() { reply(true, wire::encode_status(m_store.drop_check(name))); };
+            auto judge = [this, name, reply]()
+            {
+                m_store.after_settled(name, [this, name, reply]()
+                                      { reply(true, wire::encode_status(m_store.drop_check(name))); });
+            };
             if (!m_mpu)
             {
                 judge();

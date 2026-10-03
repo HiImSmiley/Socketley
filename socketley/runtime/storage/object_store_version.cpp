@@ -18,6 +18,7 @@
 #include <fcntl.h>
 
 #include "disk_chain.h"
+#include "s3_notify.h"
 #include "../../shared/logging.h"
 #include "../../shared/random_id.h"
 
@@ -105,7 +106,10 @@ struct object_store::vop
     int         fd{-1};
     std::string head;
     remove_result rr;
-    std::function<void()> release;
+    // The events a removal staged, 0 for none.
+    uint64_t    ticket{0};
+    // Hands the key's lane on, told whether the key changed.
+    std::function<void(bool made)> release;
     std::function<void(put_result)> put_cb;
     std::function<void(remove_result)> rm_cb;
 };
@@ -298,7 +302,8 @@ bool object_store::version_forget(bucket& b, const std::string& key, const std::
 // ─── A new latest version ───────────────────────────────────────────────────
 
 void object_store::commit_versioned(std::string bucket_name, std::string key, std::string tmp, bool pooled,
-                                    object_meta meta, std::function<void()> release, std::function<void(put_result)> cb)
+                                    object_meta meta, bool restamp, std::function<void(bool made)> release,
+                                    std::function<void(put_result)> cb)
 {
     auto v     = std::make_shared<vop>();
     v->alive   = m_alive;
@@ -318,12 +323,11 @@ void object_store::commit_versioned(std::string bucket_name, std::string key, st
     v->what = vop::kind::commit;
     // The version the writer put in the header before the body was synced, unless a newer one or a change of
     // the bucket's versioning came between, when the header is written again.
-    if (stamp_holds(*b, v->key, v->meta))
+    if (!restamp)
     {
         vop_install(std::move(v));
         return;
     }
-    set_version_extra(v->meta, next_version(*b, v->key, false));
     vop_header(std::move(v));
 }
 
@@ -587,7 +591,7 @@ void object_store::vop_pooled(std::shared_ptr<vop> v, bool drop_null)
         // A start that finds the old null version beside the new one keeps the newer, so this is not waited on.
         if (const bucket* bp = find_bucket(v->bname); bp && drop_null)
             if (!m_io->unlinkat(bp->dir_fd, version_rel_path(v->key, "null"), 0, [](int64_t) {})) {}
-        v->release();
+        v->release(true);
     };
     auto ch = std::make_shared<disk_chain>(m_alive);
     sync_dir(*ch, m_io, m_loop, b->data_fd, parent_of(object_rel_path(v->key)), m_alive, &m_totals.fsyncs);
@@ -613,13 +617,13 @@ void object_store::vop_end(std::shared_ptr<vop> v, st s)
     const bool put = v->what == vop::kind::commit;
     if (!v->changed)
     {
-        auto refuse = [v, s, put]()
+        auto refuse = [this, v, s, put]()
         {
-            v->release();
+            v->release(false);
             if (put)
                 v->put_cb({s == st::ok ? st::io_error : s, v->meta});
             else
-                v->rm_cb({s == st::ok ? st::io_error : s});
+                after_staged(v->ticket, [v, s]() { v->rm_cb({s == st::ok ? st::io_error : s}); });
         };
         // The new file did not become anything and is nobody's.
         if (b && !v->tmp.empty())
@@ -633,17 +637,17 @@ void object_store::vop_end(std::shared_ptr<vop> v, st s)
         version_install(*b, v->key, v->meta);
     if (s != st::ok)
         m_sync_lost = true;
-    invalidate_siblings(v->bname, v->key, [v, s, put]()
+    invalidate_siblings(v->bname, v->key, [this, v, s, put]()
     {
         if (!*v->alive)
             return;
-        v->release();
+        v->release(s == st::ok);
         if (put)
             v->put_cb({s, v->meta});
         else
         {
             v->rr.status = s;
-            v->rm_cb(v->rr);
+            after_staged(v->ticket, [v]() { v->rm_cb(v->rr); });
         }
     });
 }
@@ -651,8 +655,9 @@ void object_store::vop_end(std::shared_ptr<vop> v, st s)
 // ─── Deletes ────────────────────────────────────────────────────────────────
 
 void object_store::remove_versioned(std::string bucket_name, std::string key, std::string version_id,
-                                    std::function<bool(const object_meta&)> only_if, bool bypass,
-                                    std::function<void()> release, std::function<void(remove_result)> cb)
+                                    std::function<bool(const object_meta&)> only_if, bool bypass, change_cause cause,
+                                    change_origin who, std::function<void(uint64_t ticket, bool made)> release,
+                                    std::function<void(remove_result)> cb)
 {
     auto v        = std::make_shared<vop>();
     v->alive      = m_alive;
@@ -660,13 +665,27 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
     v->key        = std::move(key);
     v->version_id = std::move(version_id);
     v->only_if    = std::move(only_if);
-    v->release    = std::move(release);
+    v->release    = [vp = v.get(), release = std::move(release)](bool made) { release(vp->ticket, made); };
     v->rm_cb      = std::move(cb);
     bucket* b = find_bucket(v->bname);
     auto answer = [v](remove_result r)
     {
-        v->release();
+        v->release(false);
         v->rm_cb(std::move(r));
+    };
+    // The removal's events are staged once what it removes or makes is decided, and before the disk is touched.
+    const bool lc = cause == change_cause::lifecycle;
+    const auto stage = [this, v, b, lc, who = std::move(who)](bool marker)
+    {
+        change_note n;
+        n.bucket     = v->bname;
+        n.key        = v->key;
+        n.who        = who;
+        n.event      = marker ? (lc ? ev_lc_marker : ev_marker) : (lc ? ev_lc_delete : ev_delete);
+        n.version_id = v->rr.version_id;
+        n.mtime_ms   = marker ? v->meta.mtime_ms : 0;
+        v->ticket    = stage_change(*b, n);
+        return killed_after_event(v->ticket, v->key);
     };
     if (!b)
     {
@@ -691,6 +710,8 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
         set_version_extra(v->meta, t);
         v->rr = {st::ok, o != b->objects.end(), true, t.id};
         v->tmp = tmp_name();
+        if (stage(true))
+            return;
 
         const int tmp_dir = b->tmp_fd;
         auto header = std::make_shared<std::string>(encode_object_header(v->key, v->meta));
@@ -739,6 +760,8 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
         return;
     }
     v->rr = {st::ok, true, is_delete_marker(*f), v->version_id};
+    if (stage(false))
+        return;
     const auto o = b->objects.find(v->key);
     const bool in_objects = o != b->objects.end() && &o->second == f;
     const bool latest = in_objects || f == latest_marker(v->bname, v->key);
@@ -783,8 +806,8 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
         bucket* bp = find_bucket(v->bname);
         if (!v->changed || !bp)
         {
-            v->release();
-            v->rm_cb({s == st::ok ? st::io_error : s});
+            v->release(false);
+            after_staged(v->ticket, [v, s]() { v->rm_cb({s == st::ok ? st::io_error : s}); });
             return;
         }
         if (s != st::ok)
@@ -792,16 +815,16 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
         v->rr.status = s;
         if (!version_forget(*bp, v->key, v->version_id))
         {
-            v->release();
-            v->rm_cb(v->rr);
+            v->release(s == st::ok);
+            after_staged(v->ticket, [v]() { v->rm_cb(v->rr); });
             return;
         }
-        invalidate_siblings(v->bname, v->key, [v]()
+        invalidate_siblings(v->bname, v->key, [this, v, s]()
         {
             if (!*v->alive)
                 return;
-            v->release();
-            v->rm_cb(v->rr);
+            v->release(s == st::ok);
+            after_staged(v->ticket, [v]() { v->rm_cb(v->rr); });
         });
     });
 }

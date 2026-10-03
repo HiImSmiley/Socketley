@@ -431,7 +431,7 @@ struct response
     bool        close{false};
 };
 
-class storage_run : public io_handler
+class storage_run : public io_handler, public change_sink
 {
 public:
     storage_run(storage_instance& owner, event_loop& loop, store_options opts, authenticator* auth);
@@ -655,9 +655,16 @@ public:
     // Event notifications, in storage_notify.cpp: the configuration's two operations, and the events of a change.
     void op_put_notification(const std::shared_ptr<conn>& c);
     void op_get_notification(const std::shared_ptr<conn>& c);
-    // A change the owner of its key made, queued for every rule of its bucket that asks for it; `answer` runs once
-    // their records are synced.
-    void notify_change(change_note n, std::function<void()> answer);
+    // The events of a change, one `{target, json}` for every rule of its bucket that asks for it.
+    std::vector<std::pair<std::string, std::string>> change_events(const change_note& n);
+    // The store's sink for the events of the changes the owner of their key makes.
+    uint64_t stage(const change_note& n) override;
+    void staged(uint64_t ticket, std::function<void()> then) override;
+    void settle(uint64_t ticket, bool made, std::function<void()> then) override;
+    void made(change_note n, std::function<void()> answer) override;
+    // What a staged change's outbox record keeps of it, for the start that asks the files whether it was made.
+    static std::string encode_change_check(const change_note& n);
+    static bool decode_change_check(std::string_view b, change_note& n);
     // Who a request's change is told as: its user or "anonymous", and the client's address, left empty for a
     // bucket that sends no events.
     change_origin origin_of(const conn& c) const;

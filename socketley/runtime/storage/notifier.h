@@ -3,11 +3,20 @@
 // POSTs that empty it, each on the loop and none on a request's path.
 //
 // ─── THE OUTBOX ─────────────────────────────────────────────────────────────
-//   <dir>/.notify/outbox.<shard>   records `u32 length | u32 crc32 | payload`, the payload an event ('E', its id,
-//                                  its target and its JSON) or the delivery of one ('D', its id)
+//   <dir>/.notify/outbox.<shard>   records `u32 length | u32 crc32 | payload`, the payload one of
+//                                    'E' id target json   an event of a change that was made
+//                                    'S' change check     a change about to be made, and what tells a start whether it was
+//                                    'T' id change target json   an event of such a change
+//                                    'C' change / 'X' change     the change was made / was not
+//                                    'D' id               the event was delivered
 //
-// An event's record is synced before the change it is about is answered, so an answered change's event survives a
-// crash; a start sends again every event with no delivery record, so an event is delivered at least once.
+// A change's events are synced beside the change itself and it is answered once both are durable, so an answered
+// change's events survive a crash.
+//
+// A start keeps the events of a change with neither 'C' nor 'X' only when the check finds it in the files, so no
+// event is sent for a change that was never made.
+//
+// A start sends again every event with no delivery record, so an event is delivered at least once.
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -15,6 +24,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <sys/socket.h>
@@ -92,13 +103,23 @@ public:
     bool has_target(std::string_view name) const;
     bool enabled() const { return !m_lanes.empty(); }
 
+    // Whether the change a staged event's check describes is in the files, asked at start of every change the outbox
+    // does not say the end of.
+    using change_made = std::function<bool(std::string_view check)>;
     // Opens the shard's outbox under `dir` and queues again what it holds undelivered; blocking, so it runs at start.
-    bool open(const std::string& dir, uint32_t shard, std::string& err);
+    bool open(const std::string& dir, uint32_t shard, const change_made& made, std::string& err);
 
     // Queues `json` for `target`, its record written with the next batch; false when it was dropped.
     bool add(std::string_view target, std::string json);
+    // Writes the events, each `{target, json}`, of a change about to be made, held back until settle(), and starts
+    // their sync; returns the change's ticket, 0 when every event was dropped.
+    uint64_t stage(std::string_view check, std::vector<std::pair<std::string, std::string>> events);
+    // Runs `then` once the records of the change `ticket` names are synced.
+    void staged(uint64_t ticket, std::function<void()> then) { wait_for(ticket, std::move(then)); }
+    // The change was made or not: its events are queued or dropped, and `then` runs once that record is synced.
+    void settle(uint64_t ticket, bool made, std::function<void()> then);
     // Runs `then` once every record added so far is synced.
-    void sync(std::function<void()> then);
+    void sync(std::function<void()> then) { wait_for(m_appended, std::move(then)); }
 
     // Whether `req` is the timer's, which the owner then hands to on_timer().
     bool owns(const io_request* req) const { return req == &m_timer_req; }
@@ -163,9 +184,14 @@ private:
     // A tick soon, which looks at every lane's deadline and pause.
     void arm_timer();
 
-    void append_record(char type, uint64_t id, std::string_view target, std::string_view json);
+    // An 'E' or 'T' record carries a target and its JSON, a 'T' and an 'S' the change's number first.
+    void append_record(char type, uint64_t id, std::string_view target = {}, std::string_view json = {},
+                       uint64_t change = 0);
+    // Runs `then`, which may be empty, once the first `at` bytes appended since the outbox was opened are synced.
+    void wait_for(uint64_t at, std::function<void()> then);
     void kick();
-    void written(int64_t res, std::shared_ptr<std::string> buf, std::vector<std::function<void()>> cbs);
+    // A write that took the appended bytes up to `upto` ended, synced or not.
+    void written(int64_t res, uint64_t upto, bool synced);
     void maybe_rotate();
 
     event_loop& m_loop;
@@ -175,6 +201,13 @@ private:
     size_t      m_queue_max{default_queue_max};
     uint64_t    m_queued{0};
     uint64_t    m_next_id{1};
+    // The number and the events of each change staged and not yet settled, by ticket, the events counted in m_queued.
+    struct staged_change
+    {
+        uint64_t change{0};
+        std::vector<std::pair<lane*, pending>> events;
+    };
+    std::unordered_map<uint64_t, staged_change> m_staged;
     notify_counters m_c;
     bool        m_stopped{false};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
@@ -185,7 +218,15 @@ private:
     std::string m_name;
     uint64_t    m_off{0};
     std::string m_buf;
-    std::vector<std::function<void()>> m_buf_cbs;
+    // Bytes appended since the outbox was opened, which a ticket is a count of, and how many of them are synced.
+    uint64_t    m_appended{0};
+    uint64_t    m_synced{0};
+    struct waiter
+    {
+        uint64_t at;
+        std::function<void()> then;
+    };
+    std::vector<waiter> m_waiters;
     bool        m_writing{false};
     // Delivery records written and not yet synced, which a stop syncs.
     bool        m_unsynced{false};

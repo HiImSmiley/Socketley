@@ -34,6 +34,13 @@
 #   crash       a PUT answered while the webhook is down, the worker killed with
 #               SIGKILL before the event could go: the restarted worker sends it
 #               from its outbox
+#   staged      a change's event is written while the change is made: a PUT or
+#               DELETE killed once its event is durable and before it is made
+#               (SOCKETLEY_STORAGE_KILL_AFTER_EVENT) sends nothing after the
+#               restart, and an answered one killed before its confirmation is
+#               written (SOCKETLEY_STORAGE_HOLD_CONFIRM) sends its event, in an
+#               unversioned and a versioned bucket; and a DeleteBucket sent the
+#               moment a notifying DELETE emptied the bucket is not refused
 #   shards      with --shards 2 every change through either shard is one event,
 #               sent by the shard that owns the key
 #   flag        --notify-targets refuses a file that does not parse
@@ -65,6 +72,9 @@ echo "hooky.test 127.0.0.1" > "$SOCKETLEY_STORAGE_NOTIFY_HOSTS"
 export SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS=2
 # The bound on what waits, lowered so a test reaches it.
 export SOCKETLEY_STORAGE_NOTIFY_QUEUE=40
+# Crash aids for the keys of the staged half alone: killed once an event is durable, and a confirmation never written.
+export SOCKETLEY_STORAGE_KILL_AFTER_EVENT=r/kae/
+export SOCKETLEY_STORAGE_HOLD_CONFIRM=r/hold/
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -165,6 +175,15 @@ sleep 0.5
 wait_up "$P1" || bad "the runtime comes back" "no answer on $P1"
 run_lib "the restart half ran" nt restart "$P1" "$HOOK"
 run_lib "the crash half ran" nt crash "$P1" "$HOOK" "$DATA"
+# Four kills each, so a stop and a start between them keep under the supervisor's bound on restarts in a burst.
+for sb in nstage notifyb; do
+    "$BIN" stop nt >/dev/null 2>&1
+    sleep 0.5
+    "$BIN" start nt >/dev/null 2>&1
+    wait_up "$P1" || bad "the runtime comes back for $sb" "no answer on $P1"
+    run_lib "the staged half ran on $sb" nt staged "$P1" "$HOOK" "$sb"
+done
+run_lib "the drop half ran" nt drop "$P1" "$HOOK"
 "$BIN" stop nt >/dev/null 2>&1
 
 # ── users ───────────────────────────────────────────────────────────────────

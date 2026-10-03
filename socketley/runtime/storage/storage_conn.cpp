@@ -127,8 +127,7 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
     m_store.set_drop_guard([this](std::string_view bucket) { return m_mpu.bucket_uploads_busy(bucket); });
     m_store.set_forget_listener([this](const std::string& bucket) { m_mpu.drop_bucket(bucket); });
     m_store.set_lifecycle_listener([this]() { lifecycle_changed(); });
-    m_store.set_change_listener([this](change_note n, std::function<void()> answer)
-                                { notify_change(std::move(n), std::move(answer)); });
+    m_store.set_change_sink(this);
     m_lc_day_ms = lifecycle_day_ms;
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS"))
     {
@@ -181,7 +180,12 @@ bool storage_run::open(std::string& err)
         return false;
     if (!m_mpu.open(err))
         return false;
-    if (!m_notify.open(m_store.options().dir, m_store.shard(), err))
+    const auto made = [this](std::string_view check)
+    {
+        change_note n;
+        return decode_change_check(check, n) && m_store.change_on_disk(n);
+    };
+    if (!m_notify.open(m_store.options().dir, m_store.shard(), made, err))
         return false;
     reap_uploads();
     LOG_INFO(("storage: " + std::to_string(rep.buckets) + " bucket(s), " +

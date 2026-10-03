@@ -399,7 +399,7 @@ notifier::lane* notifier::find_lane(std::string_view name)
 
 // ─── The outbox ─────────────────────────────────────────────────────────────
 
-bool notifier::open(const std::string& dir, uint32_t shard, std::string& err)
+bool notifier::open(const std::string& dir, uint32_t shard, const change_made& made, std::string& err)
 {
     if (m_lanes.empty())
         return true;
@@ -439,9 +439,18 @@ bool notifier::open(const std::string& dir, uint32_t shard, std::string& err)
         uint64_t    id;
         std::string target;
         std::string json;
+        // The staged change the event is of, 0 for one that was made before its event was written.
+        uint64_t    change{0};
+    };
+    // A staged change's check, and what the outbox says of its end: 'C', 'X', or 0 for nothing.
+    struct staged_change
+    {
+        std::string check;
+        char        end{0};
     };
     std::vector<held> events;
     std::vector<uint64_t> delivered;
+    std::unordered_map<uint64_t, staged_change> changes;
     size_t pos = 0;
     while (text.size() - pos >= 8)
     {
@@ -464,13 +473,42 @@ bool notifier::open(const std::string& dir, uint32_t shard, std::string& err)
             delivered.push_back(id);
             continue;
         }
-        held e{id, {}, {}};
-        if (type != 'E' || !r.bytes(e.target, 4096) || !r.bytes(e.json, record_cap))
+        if (type == 'C' || type == 'X')
+        {
+            changes[id].end = static_cast<char>(type);
+            continue;
+        }
+        if (type == 'S')
+        {
+            if (!r.bytes(changes[id].check, record_cap))
+                break;
+            continue;
+        }
+        held e{id, {}, {}, 0};
+        if ((type == 'T' && !r.u64(e.change)) || (type != 'E' && type != 'T') || !r.bytes(e.target, 4096) ||
+            !r.bytes(e.json, record_cap))
             break;
         events.push_back(std::move(e));
     }
     std::sort(delivered.begin(), delivered.end());
     std::erase_if(events, [&](const held& e) { return std::binary_search(delivered.begin(), delivered.end(), e.id); });
+
+    // A staged change the outbox does not say the end of is asked of the files once, and its events go only if it is there.
+    uint64_t unmade = 0;
+    for (const held& e : events)
+        if (const auto it = changes.find(e.change); e.change != 0 && it != changes.end() && it->second.end == 0)
+        {
+            it->second.end = made && made(it->second.check) ? 'C' : '?';
+            unmade += it->second.end == '?';
+        }
+    std::erase_if(events, [&](const held& e)
+    {
+        const auto it = changes.find(e.change);
+        return e.change != 0 && (it == changes.end() || it->second.end != 'C');
+    });
+    if (unmade)
+        LOG_INFO(("storage: the events of " + std::to_string(unmade) +
+                  " change(s) a crash cut short before they were made are dropped").c_str());
 
     // Written again with only what is left to deliver, so the outbox never outgrows its undelivered events.
     const std::string tmp = m_name + ".new";
@@ -504,6 +542,7 @@ bool notifier::open(const std::string& dir, uint32_t shard, std::string& err)
     }
     m_off = m_buf.size();
     m_buf.clear();
+    m_appended = m_synced = 0;
     m_fd = ::openat(m_dir_fd, m_name.c_str(), O_WRONLY | O_CLOEXEC);
     if (m_fd < 0)
     {
@@ -524,12 +563,17 @@ bool notifier::open(const std::string& dir, uint32_t shard, std::string& err)
     return true;
 }
 
-void notifier::append_record(char type, uint64_t id, std::string_view target, std::string_view json)
+void notifier::append_record(char type, uint64_t id, std::string_view target, std::string_view json,
+                             uint64_t change)
 {
     bytes::writer w;
     w.u8(static_cast<uint8_t>(type));
     w.u64(id);
-    if (type == 'E')
+    if (type == 'T')
+        w.u64(change);
+    if (type == 'S')
+        w.bytes(json);
+    if (type == 'E' || type == 'T')
     {
         w.bytes(target);
         w.bytes(json);
@@ -540,6 +584,7 @@ void notifier::append_record(char type, uint64_t id, std::string_view target, st
     h.u32(journal_detail::crc32(payload));
     m_buf += h.take();
     m_buf += payload;
+    m_appended += 8 + payload.size();
 }
 
 bool notifier::add(std::string_view target, std::string json)
@@ -559,51 +604,108 @@ bool notifier::add(std::string_view target, std::string json)
     return true;
 }
 
-void notifier::sync(std::function<void()> then)
+uint64_t notifier::stage(std::string_view check, std::vector<std::pair<std::string, std::string>> events)
 {
-    if (m_fd < 0 || (m_buf.empty() && !m_writing))
+    std::vector<std::pair<lane*, pending>> kept;
+    for (auto& [target, json] : events)
+    {
+        lane* l = find_lane(target);
+        if (!l || m_stopped || m_queued + kept.size() >= m_queue_max)
+        {
+            ++m_c.dropped;
+            continue;
+        }
+        kept.emplace_back(l, pending{0, std::move(json)});
+    }
+    if (kept.empty())
+        return 0;
+    const uint64_t change = m_next_id++;
+    append_record('S', change, {}, check);
+    for (auto& [l, ev] : kept)
+    {
+        ev.id = m_next_id++;
+        append_record('T', ev.id, l->target.name, ev.json, change);
+    }
+    m_queued += kept.size();
+    // The ticket is where the change's records end, and their sync starts now, beside the change's own.
+    const uint64_t ticket = m_appended;
+    m_staged.emplace(ticket, staged_change{change, std::move(kept)});
+    wait_for(ticket, {});
+    return ticket;
+}
+
+void notifier::settle(uint64_t ticket, bool made, std::function<void()> then)
+{
+    const auto it = m_staged.find(ticket);
+    if (it == m_staged.end())
     {
         then();
         return;
     }
-    m_buf_cbs.push_back(std::move(then));
+    staged_change sc = std::move(it->second);
+    m_staged.erase(it);
+    if (m_stopped)
+    {
+        then();
+        return;
+    }
+    append_record(made ? 'C' : 'X', sc.change);
+    for (auto& [l, ev] : sc.events)
+    {
+        if (!made)
+        {
+            --m_queued;
+            continue;
+        }
+        l->q.push_back(std::move(ev));
+        if (!l->busy)
+            start(*l);
+    }
+    sync(std::move(then));
+}
+
+void notifier::wait_for(uint64_t at, std::function<void()> then)
+{
+    if (m_fd < 0 || at <= m_synced)
+    {
+        if (then)
+            then();
+        return;
+    }
+    m_waiters.push_back({at, std::move(then)});
     kick();
 }
 
 void notifier::kick()
 {
-    if (m_writing || m_rotating || m_fd < 0 || (m_buf.empty() && m_buf_cbs.empty()))
+    // Only what somebody waits for is synced; a delivery record lost to a crash costs a second delivery, and the
+    // next sync covers it anyway.
+    const bool must_sync = !m_waiters.empty();
+    if (m_writing || m_rotating || m_fd < 0 || (m_buf.empty() && !must_sync))
         return;
     m_writing = true;
     auto buf  = std::make_shared<std::string>(std::move(m_buf));
-    auto cbs  = std::move(m_buf_cbs);
     m_buf.clear();
-    m_buf_cbs.clear();
+    const uint64_t upto = m_appended;
     auto alive = m_alive;
-    // Only an event's record is waited on; a delivery record lost to a crash costs a second delivery, and the next
-    // event's sync covers it anyway.
-    const bool must_sync = !cbs.empty();
-    auto sync_then = [this, alive, buf, cbs, must_sync](int64_t res)
+    auto sync_then = [this, alive, buf, upto, must_sync](int64_t res)
     {
         if (!*alive)
             return;
         if (res >= 0 && !must_sync)
         {
             m_unsynced = true;
-            written(res, buf, cbs);
+            written(res, upto, false);
             return;
         }
-        if (res >= 0 && !m_io.fsync(m_fd, true, [this, alive, buf, cbs](int64_t r2)
+        if (res >= 0 && !m_io.fsync(m_fd, true, [this, alive, upto](int64_t r2)
             {
-                if (!*alive)
-                    return;
-                if (r2 >= 0)
-                    m_unsynced = false;
-                written(r2, buf, cbs);
+                if (*alive)
+                    written(r2, upto, true);
             }))
             res = -EIO;
         if (res < 0)
-            written(res, buf, cbs);
+            written(res, upto, false);
     };
     if (buf->empty())
     {
@@ -613,10 +715,10 @@ void notifier::kick()
     const uint64_t at = m_off;
     m_off += buf->size();
     if (!m_io.pwrite(m_fd, buf->data(), static_cast<uint32_t>(buf->size()), at, std::move(sync_then)))
-        written(-EIO, buf, cbs);
+        written(-EIO, upto, false);
 }
 
-void notifier::written(int64_t res, std::shared_ptr<std::string>, std::vector<std::function<void()>> cbs)
+void notifier::written(int64_t res, uint64_t upto, bool synced)
 {
     m_writing = false;
     // A failed write leaves the events in memory, delivered as long as this process lives, and is said once.
@@ -626,7 +728,23 @@ void notifier::written(int64_t res, std::shared_ptr<std::string>, std::vector<st
         LOG_ERROR(("storage: writing the event outbox failed (" + std::string(std::strerror(static_cast<int>(-res))) +
                    "); events are delivered but would not survive a crash").c_str());
     }
-    for (auto& cb : cbs)
+    if (res >= 0 && synced)
+    {
+        m_synced   = upto;
+        m_unsynced = false;
+    }
+    // Whoever waited on a write that failed is let go too, since nothing would ever sync it.
+    const uint64_t done = res < 0 ? upto : m_synced;
+    std::vector<std::function<void()>> ready;
+    std::erase_if(m_waiters, [&](waiter& w)
+    {
+        if (w.at > done)
+            return false;
+        if (w.then)
+            ready.push_back(std::move(w.then));
+        return true;
+    });
+    for (auto& cb : ready)
         cb();
     kick();
     maybe_rotate();
@@ -634,8 +752,8 @@ void notifier::written(int64_t res, std::shared_ptr<std::string>, std::vector<st
 
 void notifier::maybe_rotate()
 {
-    if (m_queued != 0 || m_writing || m_rotating || !m_buf.empty() || m_off < rotate_bytes || m_fd < 0 ||
-        m_stopped)
+    if (m_queued != 0 || m_writing || m_rotating || !m_buf.empty() || !m_waiters.empty() || m_off < rotate_bytes ||
+        m_fd < 0 || m_stopped)
         return;
     m_rotating = true;
     auto alive = m_alive;
@@ -671,6 +789,8 @@ void notifier::maybe_rotate()
                 m_fd  = static_cast<int>(fd);
                 m_off = 0;
                 m_unsynced = false;
+                // What the old file held is let go of, so only what waits to be written is not yet synced.
+                m_synced = m_appended - m_buf.size();
                 if (!m_io.fsync(m_dir_fd, false, [this, alive](int64_t)
                     {
                         if (!*alive)

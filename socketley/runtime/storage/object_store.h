@@ -347,6 +347,23 @@ struct change_note
     uint64_t    size{0};
     std::string etag;
     std::string version_id;
+    // The time the object or delete marker records, which tells it from another of the same bytes.
+    int64_t     mtime_ms{0};
+};
+
+// Whoever sends a bucket's events, told of each change by the owner of its key.
+class change_sink
+{
+public:
+    virtual ~change_sink() = default;
+    // Writes the events of a change about to be made, held back until settle(); 0 when it sends none.
+    virtual uint64_t stage(const change_note& n) = 0;
+    // Runs `then` once what stage() wrote is durable.
+    virtual void staged(uint64_t ticket, std::function<void()> then) = 0;
+    // Whether the change was made, which sends or drops its events; `then` runs once that is durable.
+    virtual void settle(uint64_t ticket, bool made, std::function<void()> then) = 0;
+    // A change already made and durable, whose answer runs once its events are durable.
+    virtual void made(change_note n, std::function<void()> answer) = 0;
 };
 
 // What the owner of a key needs to make a body a visible object.
@@ -364,6 +381,8 @@ struct commit_request
     bool        pooled{false};
     change_cause cause{change_cause::put};
     change_origin who;
+    // The body's descriptor when its sync is left to the owner's commit, which runs it beside the event's record.
+    int         body_fd{-1};
 };
 
 // A body being written, from the first byte to the commit.
@@ -501,6 +520,8 @@ private:
     void fail(st why);
     void maybe_finish();
     void synced(int64_t res);
+    // Hands the written body to its commit, with its descriptor when the commit is to sync it.
+    void commit_body(int body_fd);
     void cleanup_tmp();
     void release();
 
@@ -623,6 +644,9 @@ public:
     // taking any until it is dropped or the drop is aborted.
     st   drop_check(std::string_view name);
     void drop_abort(std::string_view name);
+    // Runs `then` once no change of the bucket holds its key's lane for the record of its events' end, which an
+    // answered change may still do and a drop must not mistake for work.
+    void after_settled(std::string_view name, std::function<void()> then);
     void drop_rename(std::string name, std::function<void(st)> cb);
     void drop_forget(std::string_view name);
     // Whatever else is at work in a bucket that a drop must wait out, such as a
@@ -677,10 +701,10 @@ public:
     void set_lifecycle_listener(std::function<void()> fn) { m_lifecycle_listener = std::move(fn); }
     // The bucket's notification configuration, null when it has none.
     std::shared_ptr<const notify_config> bucket_notify(std::string_view name) const;
-    // Told by the owner of a key of each change to an object of a bucket with a notification configuration; the
-    // change is answered once the listener runs `answer`.
-    using change_listener = std::function<void(change_note, std::function<void()> answer)>;
-    void set_change_listener(change_listener fn) { m_change_listener = std::move(fn); }
+    // Told by the owner of a key of each change to an object of a bucket with a notification configuration.
+    void set_change_sink(change_sink* sink) { m_sink = sink; }
+    // Whether the change `n` describes is in the files, for a start deciding a staged event; blocking.
+    bool change_on_disk(const change_note& n) const;
 
     // ── Sharding ────────────────────────────────────────────────────────────
     uint32_t shard() const { return m_opts.shard; }
@@ -953,6 +977,9 @@ private:
         // Syncs of pool/: whoever asks while one runs is covered by the next.
         bool        pool_syncing{false};
         std::vector<std::function<void(bool)>> pool_sync_next;
+        // Lanes held until the end of a change's events is durable, and what waits for there to be none.
+        uint32_t    settling{0};
+        std::vector<std::function<void()>> settled_cbs;
     };
 
     bucket* find_bucket(std::string_view name);
@@ -1002,10 +1029,19 @@ private:
         // The syncs a pooled commit hands the lane on after, and whether every one of them held.
         int                             syncs_left{2};
         bool                            synced{true};
+        // The events the commit staged, 0 for none.
+        uint64_t                        ticket{0};
     };
     using commit_ptr = std::shared_ptr<commit_state>;
-    // The lane is handed on and the bucket released once nothing of the commit is left to do.
-    void commit_release(const commit_state& c);
+    // The lane is handed on and the bucket released once nothing of the commit is left to do; `made` says whether
+    // the object changed, for the events it staged.
+    void commit_release(const commit_state& c, bool made);
+    // The commit's own steps once its events are staged and its body is synced.
+    void commit_staged(const commit_ptr& c, bool restamp);
+    // Gives a versioned commit the version it writes, true when that is not the one its header was written with.
+    bool decide_version(const bucket& b, commit_request& rq) const;
+    // The change a commit makes, as its events describe it.
+    static change_note commit_note(const commit_request& rq);
     // Every way out but a pooled commit's answer, which releases before the caller hears because it may start the next operation.
     void commit_done(const commit_ptr& c, st s);
     // A refusal after the body was synced, which for a pooled file first makes its removal durable.
@@ -1047,11 +1083,15 @@ private:
     // The same on a list alone, for the journal's replay: the version of `m`'s id replaced, or false when it was not there.
     static bool place_version(std::vector<object_meta>& list, const object_meta& m, uint64_t* replaced_size = nullptr);
     static bool erase_version(std::vector<object_meta>& list, std::string_view id, uint64_t* size = nullptr);
+    // `restamp` writes the header again for the version `meta` now holds; `release(made)` is told whether the key
+    // changed, before the answer.
     void commit_versioned(std::string bucket, std::string key, std::string tmp, bool pooled, object_meta meta,
-                          std::function<void()> release, std::function<void(put_result)> cb);
+                          bool restamp, std::function<void(bool made)> release, std::function<void(put_result)> cb);
+    // `release` is handed the events the removal staged, and whether the key changed, before the answer.
     void remove_versioned(std::string bucket, std::string key, std::string version_id,
-                          std::function<bool(const object_meta&)> only_if, bool bypass,
-                          std::function<void()> release, std::function<void(remove_result)> cb);
+                          std::function<bool(const object_meta&)> only_if, bool bypass, change_cause cause,
+                          change_origin who, std::function<void(uint64_t ticket, bool made)> release,
+                          std::function<void(remove_result)> cb);
     void vop_header(std::shared_ptr<vop> v);
     void vop_copy(std::shared_ptr<vop> v, int src, uint64_t data_off);
     void vop_install(std::shared_ptr<vop> v);
@@ -1095,19 +1135,27 @@ private:
     std::function<bool(std::string_view)> m_drop_guard;
     std::function<void(const std::string&)> m_forget_listener;
     std::function<void()> m_lifecycle_listener;
-    change_listener m_change_listener;
-    // The answers to a commit, a removal and a header change, which wait for the event they make when the bucket has
-    // a notification configuration.
-    std::function<void(put_result)> noted_commit(const bucket& b, const commit_request& req,
-                                                 std::function<void(put_result)> cb);
-    std::function<void(remove_result)> noted_remove(const bucket& b, std::string_view key, bool by_version,
-                                                    change_cause cause, change_origin who,
-                                                    std::function<void(remove_result)> cb);
+    change_sink* m_sink{nullptr};
+    // Stages the events of a change of an object about to be made under its key's lane, 0 when the bucket sends none.
+    uint64_t stage_change(const bucket& b, const change_note& n);
+    // The answer of a change that staged events waits for them to be durable.
+    void after_staged(uint64_t ticket, std::function<void()> answer);
+    // The key's lane is handed on once whether the change was made is durable, so no later change of the key reaches
+    // the disk while a crash would leave its events undecided.
+    void lane_settle(const std::string& bucket_name, const std::string& key, uint64_t ticket, bool made);
+    // True when a test aid takes the change over: it dies once the events are durable and before the change is made.
+    bool killed_after_event(uint64_t ticket, std::string_view key);
+    // The answer to a header change, which waits for its event when the bucket has a notification configuration.
     std::function<void(st, std::string)> noted_header(const bucket& b, std::string_view key, const header_change& c,
                                                       std::function<void(st, std::string)> cb);
     // A test hook: a commit of a key with this prefix kills the process after
     // its rename and before its journal record.
     std::string m_kill_after_rename;
+    // Test hooks for a change of a key with these prefixes: killed once its events are durable, and never confirmed.
+    std::string m_kill_after_event;
+    std::string m_hold_confirm;
+    // What a start's roll forward found at a key's path before it and moved there, null for nothing, by bucket NUL key.
+    std::unordered_map<std::string, std::vector<std::shared_ptr<const object_meta>>> m_rolled_over;
 
     struct hot_entry
     {

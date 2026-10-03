@@ -741,6 +741,15 @@ void put_op::maybe_finish()
     }
 
     m_sync_started = true;
+    // A body whose bucket sends events is synced by its owner's commit, beside the record of its event.
+    if (!m_placed && !m_committer && m_store->owns(m_bucket, m_key) && m_store->m_sink &&
+        m_store->bucket_notify(m_bucket))
+    {
+        const int fd = m_tmp_fd;
+        m_tmp_fd = -1;
+        commit_body(fd);
+        return;
+    }
     m_syncs_left   = m_placed ? 2 : 1;
     auto on_sync = [self](int64_t r)
     {
@@ -774,6 +783,11 @@ void put_op::synced(int64_t res)
         m_store->m_loop->close_fd(m_place_fd);
         m_place_fd = -1;
     }
+    commit_body(-1);
+}
+
+void put_op::commit_body(int body_fd)
+{
     m_tmp_committed = true;
 
     commit_request req;
@@ -785,6 +799,7 @@ void put_op::synced(int64_t res)
     req.pooled      = m_pooled;
     req.cause       = m_cause;
     req.who         = m_who;
+    req.body_fd     = body_fd;
     auto self = shared_from_this();
     auto done = [self](put_result r2)
     {

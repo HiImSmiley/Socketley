@@ -7454,11 +7454,17 @@ names a file of
 lines consulted before the system resolver, a test aid.
 .PP
 The shard that owns a key emits its events, whichever shard took the request, so a
-change is one event. Before the change is answered, its record is appended to
+change is one event. Its record is appended to
 .IB dir /.notify/outbox. shard
-and synced, together with every other record waiting at that moment, so an
-answered change's event survives a crash; nothing else of the delivery is on the
-request's path. A webhook is sent one event at a time, in order: a 2xx answer
+when the change starts and synced beside the change's own syncs, together with
+every other record waiting at that moment, and the change is answered once both
+are durable, so an answered change's event survives a crash at no second sync on
+the request's path. The event is sent only once the change is durable, after a
+record saying it was made, which is synced before the next change of the key may
+start. A start keeps an event whose change has no such record only when the object
+files show the change (its ETag, size, time and version, or the key or version gone
+for a removal), so a crash never sends an event for a change that was not made.
+A webhook is sent one event at a time, in order: a 2xx answer
 delivers it, and anything else, a refused or failed connection, or no answer in 10
 seconds, is a failure tried again after 0.25 s, doubling to 8 s. A delivered
 event's record is followed by one saying so, written at once and synced with the
@@ -12566,6 +12572,24 @@ string kills the worker with
 after renaming the body into place and before the journal record, so a test can
 put a crash at the one step that leaves a file the journal does not name. Unset
 by default.
+.TP
+.B SOCKETLEY_STORAGE_KILL_AFTER_EVENT
+A test hook: a change of a key that begins with this string, in a bucket that sends
+events for it, kills the worker with
+.B SIGKILL
+once the change's event record is durable and before the change itself is made,
+so a test can show that the restarted worker sends no event for it. Unset by
+default.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_STORAGE_HOLD_CONFIRM
+A test hook: a change of a key that begins with this string is made and answered
+but the record saying it was made is never written and its events never go out,
+as a crash right after the answer would leave them, so a test can kill the worker
+and show that the restarted one sends them. Unset by default.
+.IP
+Inherited by worker processes, which have no command line of their own.
 .TP
 .B SOCKETLEY_STORAGE_PART_LIST_MAX
 A test hook: the bytes a multipart object's part sizes, the numbers of an

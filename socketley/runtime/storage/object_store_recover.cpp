@@ -30,6 +30,7 @@
 #include "lifecycle.h"
 #include "s3_cors.h"
 #include "s3_names.h"
+#include "s3_notify.h"
 #include "shard_owner.h"
 #include "../../shared/logging.h"
 
@@ -954,10 +955,14 @@ uint64_t object_store::roll_forward_pooled(bucket& b, std::unordered_set<std::st
         }
         const std::string rel = object_rel_path(d.key);
         std::string to = base + "/data/" + rel;
+        const decoded_header cur = decode_object_header(slurp(to, 64 * 1024));
+        // What was at the key's path and what replaces it, so a start can tell an event's change from one it overwrote.
+        auto& seen = m_rolled_over[b.name + '\0' + d.key];
+        seen.push_back(cur.status == header_status::ok && cur.key == d.key ? std::make_shared<object_meta>(cur.meta)
+                                                                          : nullptr);
         // In a bucket that keeps versions the file at the usual path is one, kept as the commit would have kept it.
         if (versioned)
         {
-            const decoded_header cur = decode_object_header(slurp(to, 64 * 1024));
             const version_tag mine = version_of(d.meta);
             const version_tag was  = version_of(cur.meta);
             if (cur.status == header_status::ok && cur.key == d.key && was.id != mine.id)
@@ -982,6 +987,7 @@ uint64_t object_store::roll_forward_pooled(bucket& b, std::unordered_set<std::st
             keep.insert(name);
             continue;
         }
+        seen.push_back(std::make_shared<object_meta>(d.meta));
         leaves.insert(to.substr(0, to.rfind('/')));
         ++rolled;
     }
@@ -989,6 +995,45 @@ uint64_t object_store::roll_forward_pooled(bucket& b, std::unordered_set<std::st
         if (!fsync_dir_path(leaf)) {}
     if (rolled && !fsync_dir_path(base + "/pool")) {}
     return rolled;
+}
+
+bool object_store::change_on_disk(const change_note& n) const
+{
+    const std::string base = m_opts.dir + "/" + n.bucket;
+    const auto header_at = [&n](const std::string& path, object_meta& out)
+    {
+        const decoded_header d = decode_object_header(slurp(path, 64 * 1024));
+        if (d.status != header_status::ok || d.key != n.key)
+            return false;
+        out = d.meta;
+        return true;
+    };
+    const auto same = [&n](const object_meta& m)
+    {
+        const std::string id = has_version(m) ? version_of(m).id : std::string();
+        return id == n.version_id && m.mtime_ms == n.mtime_ms &&
+               (!n.has_object || (m.size == n.size && m.etag() == n.etag));
+    };
+    const auto rolled = m_rolled_over.find(n.bucket + '\0' + n.key);
+    object_meta latest, kept;
+    const bool has_latest = header_at(base + "/data/" + object_rel_path(n.key), latest);
+    const bool has_kept   = !n.version_id.empty() && header_at(base + "/" + version_rel_path(n.key, n.version_id), kept);
+
+    if (n.event == ev_delete || n.event == ev_lc_delete)
+    {
+        // A version removed for good is under neither of its names.
+        if (!n.version_id.empty())
+            return !has_kept && !(has_latest && has_version(latest) && version_of(latest).id == n.version_id);
+        // A key removed is not there, or was not before a start rolled a put forward onto it.
+        if (!has_latest)
+            return true;
+        return rolled != m_rolled_over.end() &&
+               std::any_of(rolled->second.begin(), rolled->second.end(), [](const auto& m) { return !m; });
+    }
+    if ((has_latest && same(latest)) || (has_kept && same(kept)))
+        return true;
+    return rolled != m_rolled_over.end() &&
+           std::any_of(rolled->second.begin(), rolled->second.end(), [&same](const auto& m) { return m && same(*m); });
 }
 
 bool object_store::load_journal(bucket& b, std::string& bad_why, bool& torn, bool& corrupt,

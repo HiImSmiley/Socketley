@@ -13,6 +13,9 @@ usage: lib_storage_notify.py MODE ARGS...
   restart PORT HOOK        after a clean stop and a start: the configuration is still there and still sends
   crash PORT HOOK           the webhook is down while a PUT is answered, the worker is killed with SIGKILL before
                             the event could go, and the event arrives from the restarted worker's outbox
+  staged PORT HOOK BUCKET   a change killed once its event is durable and before it is made sends nothing, and an
+                            answered one killed before its confirmation is written sends its event
+  drop PORT HOOK            a bucket emptied by a notifying DELETE is dropped the moment the DELETE is answered
   shards HOOK NODE0 NODE1   two shards, one node each: every change sends one event, whichever shard took it
 
 HOOK and OTHER are the ports the two webhook targets listen on.
@@ -605,6 +608,118 @@ def mode_crash(port, hook_port, data):
     hook.down()
 
 
+def kill_and_wait(pid):
+    """SIGKILLs the worker unless it is already gone, and waits for its successor to answer."""
+    try:
+        os.kill(int(pid), signal.SIGKILL)
+    except (OSError, TypeError, ValueError):
+        pass
+
+    def back():
+        p = worker_pid()
+        try:
+            return p and p != pid and os.path.isdir("/proc/%s" % p) and req("GET", "/")[0] == 200
+        except OSError:
+            return False
+
+    return wait_for(back, 40)
+
+
+def answered(method, path, body=b"", headers=None):
+    """The status of a request, None when the worker died before it answered."""
+    try:
+        return req(method, path, body, headers)
+    except (OSError, http.client.HTTPException):
+        return None
+
+
+def mode_staged(port, hook_port, bucket):
+    """A change's event is written while the change is made: a crash between them sends no event for a change that was
+    not made (SOCKETLEY_STORAGE_KILL_AFTER_EVENT, keys under r/kae/), and loses none of an answered one whose
+    confirmation it took (SOCKETLEY_STORAGE_HOLD_CONFIRM, keys under r/hold/).  Four kills, under the supervisor's
+    bound on restarts in a burst."""
+    global TARGET
+    TARGET = port
+    hook = Hook(hook_port)
+    hook.up()
+    big = b"b" * (2 << 20)
+    req("PUT", "/" + bucket)
+    st, _, b = req("GET", "/%s?versioning" % bucket)
+    vers = b"<Status>Enabled</Status>" in b
+    tag = "%s (%s)" % (bucket, "versioned" if vers else "unversioned")
+    check("%s: a configuration for the crash keys is put" % tag,
+          put_cfg(doc(rule("Queue", "kp", ARN + "hook", ["s3:ObjectCreated:*"], prefix="r/kae/p"),
+                      rule("Queue", "kd", ARN + "hook", ["s3:ObjectRemoved:*"], prefix="r/kae/d"),
+                      rule("Queue", "h", ARN + "hook", ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+                           prefix="r/hold/")), bucket)[:2] == (200, None))
+    # A key its PUT sends no event for, so the aid kills only its DELETE.
+    check("%s: a key whose PUT sends nothing is put" % tag, req("PUT", "/%s/r/kae/d" % bucket, b"stays")[0] == 200)
+
+    # A PUT too large for a pool file, whose body a start removes: killed with its event durable and the object not made.
+    pid = worker_pid()
+    got = answered("PUT", "/%s/r/kae/p" % bucket, big)
+    check("%s: a PUT killed once its event is durable is not answered" % tag, got is None, got and got[0])
+    check("%s: the worker comes back" % tag, kill_and_wait(pid), worker_pid())
+    check("%s: the PUT was not made" % tag, req("GET", "/%s/r/kae/p" % bucket)[0] == 404)
+    pid = worker_pid()
+    got = answered("DELETE", "/%s/r/kae/d" % bucket)
+    check("%s: a DELETE killed once its event is durable is not answered" % tag, got is None, got and got[0])
+    check("%s: the worker comes back again" % tag, kill_and_wait(pid), worker_pid())
+    st, _, b = req("GET", "/%s/r/kae/d" % bucket)
+    check("%s: the DELETE was not made" % tag, st == 200 and b == b"stays", st)
+    time.sleep(2)
+    check("%s: and neither sends an event" % tag,
+          not events_for(hook, "r/kae/p") and not events_for(hook, "r/kae/d"), hook.records())
+
+    # Answered changes whose confirmation is never written, then a SIGKILL: the start finds each in the files.
+    st, h, _ = req("PUT", "/%s/r/hold/p" % bucket, b"answered")
+    check("%s: a PUT whose confirmation is held is answered" % tag, st == 200, st)
+    time.sleep(1)
+    check("%s: its event waits for the confirmation" % tag, not events_for(hook, "r/hold/p"), hook.records())
+    check("%s: the worker is killed and comes back" % tag, kill_and_wait(worker_pid()), worker_pid())
+    put_ev = [r for n, r in events_for(hook, "r/hold/p") if n == "ObjectCreated:Put"] \
+        if wait_event(hook, "r/hold/p", "ObjectCreated:Put", 20) else []
+    check("%s: the answered PUT's event arrives from the outbox" % tag,
+          len(put_ev) == 1 and '"' + put_ev[0]["s3"]["object"].get("eTag", "") + '"' == h.get("etag") and
+          put_ev[0]["s3"]["object"].get("versionId") == h.get("x-amz-version-id"), (h, put_ev))
+    st, h, _ = req("DELETE", "/%s/r/hold/p" % bucket)
+    check("%s: a DELETE whose confirmation is held is answered" % tag, st == 204, st)
+    time.sleep(1)
+    name = "ObjectRemoved:DeleteMarkerCreated" if vers else "ObjectRemoved:Delete"
+    check("%s: its event waits for the confirmation" % tag,
+          not [n for n, _ in events_for(hook, "r/hold/p") if n == name], hook.records())
+    check("%s: the worker is killed and comes back once more" % tag, kill_and_wait(worker_pid()), worker_pid())
+    rm_ev = [r for n, r in events_for(hook, "r/hold/p") if n == name] \
+        if wait_event(hook, "r/hold/p", name, 20) else []
+    check("%s: the answered DELETE's event arrives from the outbox" % tag,
+          len(rm_ev) == 1 and rm_ev[0]["s3"]["object"].get("versionId") == h.get("x-amz-version-id"), (h, rm_ev))
+    hook.down()
+
+
+def mode_drop(port, hook_port):
+    """A DeleteBucket sent the moment the last object's DELETE is answered is not refused while that change's lane
+    waits for the record that it was made."""
+    global TARGET
+    TARGET = port
+    hook = Hook(hook_port)
+    hook.up()
+    refused = []
+    for i in range(20):
+        b = "ndrop%02d" % i
+        req("PUT", "/" + b)
+        put_cfg(doc(rule("Queue", "all", ARN + "hook", ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"])), b)
+        req("PUT", "/%s/k" % b, b"x")
+        req("DELETE", "/%s/k" % b)
+        st, _, body = req("DELETE", "/" + b)
+        if st != 204:
+            refused.append((b, st, code_of(body)))
+    check("a bucket emptied by a notifying DELETE is dropped at once, 20 of 20", not refused, refused)
+    check("and every removal sent its event",
+          wait_for(lambda: sum(1 for n, _, _ in hook.records() if n == "ObjectRemoved:Delete") == 20, 10),
+          len(hook.records()))
+    hook.down()
+
+
 def mode_shards(hook_port, nodes):
     global TARGET
     TARGET = nodes[0]
@@ -658,6 +773,10 @@ if __name__ == "__main__":
         mode_restart(int(args[0]), int(args[1]))
     elif MODE == "crash":
         mode_crash(int(args[0]), int(args[1]), args[2])
+    elif MODE == "staged":
+        mode_staged(int(args[0]), int(args[1]), args[2])
+    elif MODE == "drop":
+        mode_drop(int(args[0]), int(args[1]))
     elif MODE == "shards":
         mode_shards(int(args[0]), args[1:])
     sys.exit(min(failed, 100))
