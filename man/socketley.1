@@ -1350,6 +1350,10 @@ domain	string	T{
 .ad l
 The domains of virtual\-hosted\-style addressing, comma\-separated, as \fB\-\-domain\fR \fB(requires restart)\fR
 T}
+website_domain	string	T{
+.ad l
+The domains buckets' websites are served under, comma\-separated, as \fB\-\-website\-domain\fR \fB(requires restart)\fR
+T}
 notify_targets	string	T{
 .ad l
 The event notification webhooks file, as \fB\-\-notify\-targets\fR \fB(requires restart)\fR
@@ -6249,6 +6253,19 @@ compared without regard to case; anything else is refused at
 See
 .BR "Virtual\-hosted\-style addressing" .
 .TP
+.BI \-\-website\-domain " name" [, name ...]
+The domains buckets' websites are reached under, such as
+.BR web.example.com :
+a request whose
+.B Host
+is
+.IB bucket . domain
+is a browser's request to that bucket's website rather than to the S3 API, and is
+answered from the bucket's WebsiteConfiguration. Names are checked as for
+.BR \-\-domain ,
+and a Host under both is the website's. See
+.BR "Website hosting" .
+.TP
 .BI \-\-fsync " always" | interval | never
 When a write a client was answered for is on the disk.
 .B always
@@ -6661,6 +6678,18 @@ T}
 DeleteBucketQuota	DELETE /bucket?quota	T{
 .ad l
 204 whether or not there was one. Admins only.
+T}
+PutBucketWebsite	PUT /bucket?website	T{
+.ad l
+A WebsiteConfiguration: an IndexDocument, an ErrorDocument and up to 50 RoutingRules, or a RedirectAllRequestsTo alone. See \fBWebsite hosting\fR below.
+T}
+GetBucketWebsite	GET /bucket?website	T{
+.ad l
+The configuration as it is kept; NoSuchWebsiteConfiguration (404) when there is none.
+T}
+DeleteBucketWebsite	DELETE /bucket?website	T{
+.ad l
+204 whether or not there was one.
 T}
 .TE
 .PP
@@ -8462,6 +8491,73 @@ each shard holds its share of a quota, as it does of
 .BR \-\-max\-bytes ,
 so a bucket whose keys fall unevenly is refused somewhat before the whole is
 reached. The parts of a multipart upload are not counted until it is completed.
+.
+.SS Website hosting
+A bucket with a website configuration is served to browsers under
+.BR \-\-website\-domain ,
+as S3's website endpoints serve it:
+.RS
+.PP
+.nf
+socketley create storage media \-p 9000 \-\-dir /srv/objects \\
+    \-\-credentials /etc/socketley/s3.keys \-\-website\-domain web.example.com \-s
+.fi
+.RE
+.PP
+with the site's configuration put on its bucket and its files uploaded by any S3
+client:
+.RS
+.PP
+.nf
+PUT /docs?website
+<WebsiteConfiguration>
+  <IndexDocument><Suffix>index.html</Suffix></IndexDocument>
+  <ErrorDocument><Key>404.html</Key></ErrorDocument>
+</WebsiteConfiguration>
+.fi
+.RE
+.PP
+after which
+.B http://docs.web.example.com:9000/
+is the bucket's
+.BR index.html .
+A request to a website signs nothing and is judged as one with no credentials,
+whatever it carries, so a page is read only when the bucket's policy lets anyone
+read it (\fBPrincipal "*"\fR, \fBs3:GetObject\fR); on an
+.B \-\-anonymous
+runtime every page is. Only GET and HEAD are served, the query is ignored, and the
+latest version of a key is the page.
+.PP
+A key that is empty or ends in
+.B /
+is given the index document's suffix, so
+.B /guide/
+is
+.BR guide/index.html ,
+and a key without the slash whose folder has an index document is answered
+.B "302"
+to the folder, where the page's relative links resolve. An object stored with
+.B x\-amz\-website\-redirect\-location
+is answered
+.B "301"
+to that location. A routing rule whose condition is a KeyPrefixEquals alone
+redirects before the object is looked for, and one with an
+HttpErrorCodeReturnedEquals redirects a failure with that status; its Redirect may
+replace the key or its prefix and name a host, a protocol and a 3xx code, the
+request's own host and protocol and 301 otherwise. A RedirectAllRequestsTo sends
+every request to its host with the key kept.
+.PP
+A failure no rule redirects is answered with the ErrorDocument and the failure's
+status, when the policy lets anyone read it, and otherwise with an HTML page
+naming the error's code, message and request id, and an
+.B x\-amz\-error\-code
+header. A missing key is
+.B "403 AccessDenied"
+rather than
+.B "404 NoSuchKey"
+when the policy lets anyone read the bucket's keys but not list them, as on S3.
+The S3 API is served on the same port as before, so a site is uploaded and read
+over both.
 .
 .SS Durability
 .B \-\-fsync
