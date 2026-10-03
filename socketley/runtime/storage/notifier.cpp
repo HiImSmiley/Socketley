@@ -580,10 +580,18 @@ void notifier::kick()
     m_buf.clear();
     m_buf_cbs.clear();
     auto alive = m_alive;
-    auto sync_then = [this, alive, buf, cbs](int64_t res)
+    // Only an event's record is waited on; a delivery record lost to a crash costs a second delivery, and the next
+    // event's sync covers it anyway.
+    const bool must_sync = !cbs.empty();
+    auto sync_then = [this, alive, buf, cbs, must_sync](int64_t res)
     {
         if (!*alive)
             return;
+        if (res >= 0 && !must_sync)
+        {
+            written(res, buf, cbs);
+            return;
+        }
         if (res >= 0 && !m_io.fsync(m_fd, true, [this, alive, buf, cbs](int64_t r2)
             {
                 if (*alive)

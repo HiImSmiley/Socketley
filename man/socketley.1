@@ -7461,7 +7461,8 @@ answered change's event survives a crash; nothing else of the delivery is on the
 request's path. A webhook is sent one event at a time, in order: a 2xx answer
 delivers it, and anything else, a refused or failed connection, or no answer in 10
 seconds, is a failure tried again after 0.25 s, doubling to 8 s. A delivered
-event's record is followed by one saying so, and a start sends again every event
+event's record is followed by one saying so, written at once and synced with the
+next event's record rather than on its own, and a start sends again every event
 without one, so an event is delivered at least once, and more than once only when
 a crash or a 2xx lost on the way leaves its delivery unrecorded. The outbox is
 written again with only the undelivered events at every start, and empty once it
