@@ -139,11 +139,11 @@ const object_meta* object_store::find_version(std::string_view bucket_name, std:
     const bucket* b = find_bucket(bucket_name);
     if (!b)
         return nullptr;
-    if (const auto o = b->objects.find(key); o != b->objects.end() && version_of(o->second).id == version_id)
+    if (const auto o = b->objects.find(key); o != b->objects.end() && version_id_of(o->second) == version_id)
         return &o->second;
     if (const auto v = b->versions.find(key); v != b->versions.end())
         for (const object_meta& m : v->second)
-            if (version_of(m).id == version_id)
+            if (version_id_of(m) == version_id)
                 return &m;
     return nullptr;
 }
@@ -152,9 +152,9 @@ uint64_t object_store::newest_seq(const bucket& b, std::string_view key)
 {
     uint64_t top = 0;
     if (const auto o = b.objects.find(key); o != b.objects.end())
-        top = version_of(o->second).seq;
+        top = version_seq_of(o->second);
     if (const auto v = b.versions.find(key); v != b.versions.end() && !v->second.empty())
-        top = std::max(top, version_of(v->second.front()).seq);
+        top = std::max(top, version_seq_of(v->second.front()));
     return top;
 }
 
@@ -185,9 +185,16 @@ bool object_store::stamp_holds(const bucket& b, const std::string& key, const ob
 bool object_store::place_version(std::vector<object_meta>& list, const object_meta& m, uint64_t* replaced_size)
 {
     const version_tag t = version_of(m);
+    // A new latest, newer than every version the key has, cannot share an id with one, since an id begins with its
+    // order; only the null version, the same version placed again or an older one looks through the list.
+    if (t.id != "null" && (list.empty() || version_seq_of(list.front()) < t.seq))
+    {
+        list.insert(list.begin(), m);
+        return false;
+    }
     const bool replaced = erase_version(list, t.id, replaced_size);
     const auto at = std::find_if(list.begin(), list.end(),
-                                 [&](const object_meta& o) { return version_of(o).seq < t.seq; });
+                                 [&](const object_meta& o) { return version_seq_of(o) < t.seq; });
     list.insert(at, m);
     return replaced;
 }
@@ -195,7 +202,7 @@ bool object_store::place_version(std::vector<object_meta>& list, const object_me
 bool object_store::erase_version(std::vector<object_meta>& list, std::string_view id, uint64_t* size)
 {
     for (auto it = list.begin(); it != list.end(); ++it)
-        if (version_of(*it).id == id)
+        if (version_id_of(*it) == id)
         {
             if (size)
                 *size = it->size;
@@ -242,11 +249,11 @@ void object_store::version_drop(bucket& b, const std::string& key, std::string_v
 void object_store::version_install(bucket& b, const std::string& key, const object_meta& meta)
 {
     // A null version replaces the key's one null version, wherever that is behind the latest.
-    const bool null_new = version_of(meta).id == "null";
+    const bool null_new = version_id_of(meta) == "null";
     if (null_new)
         version_drop(b, key, "null");
     // The latest moves behind the new one, unless both are the key's one null version.
-    if (const auto o = b.objects.find(key); o != b.objects.end() && !(null_new && version_of(o->second).id == "null"))
+    if (const auto o = b.objects.find(key); o != b.objects.end() && !(null_new && version_id_of(o->second) == "null"))
         version_add(b, key, o->second);
 
     std::string rec;
@@ -272,7 +279,7 @@ void object_store::version_install(bucket& b, const std::string& key, const obje
 bool object_store::version_forget(bucket& b, const std::string& key, const std::string& id)
 {
     bool latest = false;
-    if (const auto o = b.objects.find(key); o != b.objects.end() && version_of(o->second).id == id)
+    if (const auto o = b.objects.find(key); o != b.objects.end() && version_id_of(o->second) == id)
     {
         std::string rec;
         encode_delete_record(rec, key, static_cast<int64_t>(now_ms()));
@@ -283,7 +290,7 @@ bool object_store::version_forget(bucket& b, const std::string& key, const std::
     else if (const auto v = b.versions.find(key); v != b.versions.end())
     {
         const object_meta& front = v->second.front();
-        latest = is_delete_marker(front) && version_of(front).id == id && b.objects.find(key) == b.objects.end();
+        latest = is_delete_marker(front) && version_id_of(front) == id && b.objects.find(key) == b.objects.end();
         version_drop(b, key, id);
     }
     // The newest version left is the latest now, which a delete marker stays as at the front.
@@ -487,7 +494,7 @@ void object_store::vop_install(std::shared_ptr<vop> v)
         return;
     }
     const std::string rel = object_rel_path(v->key);
-    const bool null_new = version_of(v->meta).id == "null";
+    const bool null_new = version_id_of(v->meta) == "null";
 
     // The latest the new file replaces is kept under its id first, unless both are the key's one null version.
     const auto o = b->objects.find(v->key);
@@ -507,7 +514,7 @@ void object_store::vop_install(std::shared_ptr<vop> v)
     {
         if (const auto vs = b->versions.find(v->key); vs != b->versions.end())
             for (const object_meta& m : vs->second)
-                if (&m != latest && version_of(m).id == "null")
+                if (&m != latest && version_id_of(m) == "null")
                 {
                     drop_null = true;
                     locked    = locked || lock_holds(m, now, false);
@@ -896,7 +903,7 @@ void object_store::version_probe_step(std::shared_ptr<version_probe> p)
     {
         if (!*p->alive)
             return;
-        const bool found = (o.status == st::ok || o.delete_marker) && version_of(o.meta).id == p->version_id;
+        const bool found = (o.status == st::ok || o.delete_marker) && version_id_of(o.meta) == p->version_id;
         if (found)
         {
             if (o.delete_marker)
@@ -1032,7 +1039,7 @@ st object_store::list_versions(std::string_view bucket_name, const version_query
         {
             i = metas.size();
             for (size_t j = 0; j < metas.size(); ++j)
-                if (version_of(*metas[j]).id == q.version_marker)
+                if (version_id_of(*metas[j]) == q.version_marker)
                 {
                     i = j + 1;
                     break;

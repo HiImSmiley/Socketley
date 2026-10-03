@@ -270,7 +270,7 @@ bool named_right(walker& w, const decoded_header& d, std::string_view name)
 {
     if (!w.versions)
         return w.named_for(d.key, name);
-    return name.size() > 65 && w.named_for(d.key, name.substr(0, 64)) && version_of(d.meta).id == name.substr(65);
+    return name.size() > 65 && w.named_for(d.key, name.substr(0, 64)) && version_id_of(d.meta) == name.substr(65);
 }
 
 // The verdict on an open object file whose first `n` bytes are in `head`, which closes it.
@@ -1054,7 +1054,7 @@ bool object_store::change_on_disk(const change_note& n) const
     {
         // A version removed for good is under neither of its names.
         if (!n.version_id.empty())
-            return !has_kept && !(has_latest && has_version(latest) && version_of(latest).id == n.version_id);
+            return !has_kept && !(has_latest && has_version(latest) && version_id_of(latest) == n.version_id);
         // A key removed is not there, or was not before a start rolled a put forward onto it.
         if (!has_latest)
             return true;
@@ -1394,7 +1394,7 @@ void object_store::load_versions(recovering& r, recovery_report& rep, bool& chan
         for (object_meta& m : list)
         {
             // Linked before the rename that replaced it, and the rename then landed: the copy at the usual path wins.
-            if (version_of(m).id == latest_id)
+            if (version_id_of(m) == latest_id)
             {
                 if (::unlink((base + version_rel_path(key, latest_id)).c_str()) < 0) {}
                 ++rep.version_duplicates;
@@ -1406,7 +1406,7 @@ void object_store::load_versions(recovering& r, recovery_report& rep, bool& chan
         }
         std::sort(older.begin(), older.end(), [](const object_meta& a, const object_meta& z)
         {
-            return version_of(a).seq > version_of(z).seq;
+            return version_seq_of(a) > version_seq_of(z);
         });
         for (object_meta& m : older)
             kept.push_back(std::move(m));

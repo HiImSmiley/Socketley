@@ -336,26 +336,58 @@ std::string_view replica_source_of(const object_meta& m)
     return {};
 }
 
+namespace
+{
+
+// The order and id the version entry of `m` holds, false for an object with none or one that does not parse.
+bool parse_version(const object_meta& m, uint64_t& seq, std::string_view& id, bool& marker)
+{
+    const std::string* v = version_value(m);
+    if (!v || v->size() <= version_seq_digits + 1 || ((*v)[version_seq_digits] != 'm' && (*v)[version_seq_digits] != 'v'))
+        return false;
+    const auto r = std::from_chars(v->data(), v->data() + version_seq_digits, seq, 16);
+    id = std::string_view(*v).substr(version_seq_digits + 1);
+    marker = (*v)[version_seq_digits] == 'm';
+    return r.ec == std::errc{} && r.ptr == v->data() + version_seq_digits && valid_version_id(id);
+}
+
+// The order of the null version an object written without versioning is.
+uint64_t null_seq(const object_meta& m)
+{
+    return m.mtime_ms > 0 ? static_cast<uint64_t>(m.mtime_ms) * 1000 : 0;
+}
+
+}   // namespace
+
 version_tag version_of(const object_meta& m)
 {
     version_tag t;
-    const std::string* v = version_value(m);
-    if (v && v->size() > version_seq_digits + 1 && ((*v)[version_seq_digits] == 'm' || (*v)[version_seq_digits] == 'v'))
+    std::string_view id;
+    if (parse_version(m, t.seq, id, t.marker))
     {
-        uint64_t seq = 0;
-        const auto r = std::from_chars(v->data(), v->data() + version_seq_digits, seq, 16);
-        const std::string_view id = std::string_view(*v).substr(version_seq_digits + 1);
-        if (r.ec == std::errc{} && r.ptr == v->data() + version_seq_digits && valid_version_id(id))
-        {
-            t.seq    = seq;
-            t.id     = std::string(id);
-            t.marker = (*v)[version_seq_digits] == 'm';
-            return t;
-        }
+        t.id = std::string(id);
+        return t;
     }
-    t.seq = m.mtime_ms > 0 ? static_cast<uint64_t>(m.mtime_ms) * 1000 : 0;
-    t.id  = "null";
+    t.seq    = null_seq(m);
+    t.id     = "null";
+    t.marker = false;
     return t;
+}
+
+std::string_view version_id_of(const object_meta& m)
+{
+    uint64_t seq = 0;
+    std::string_view id;
+    bool marker = false;
+    return parse_version(m, seq, id, marker) ? id : std::string_view("null");
+}
+
+uint64_t version_seq_of(const object_meta& m)
+{
+    uint64_t seq = 0;
+    std::string_view id;
+    bool marker = false;
+    return parse_version(m, seq, id, marker) ? seq : null_seq(m);
 }
 
 bool has_version(const object_meta& m)

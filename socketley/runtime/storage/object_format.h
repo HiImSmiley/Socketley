@@ -212,6 +212,9 @@ struct version_tag
 
 // The version `m` records; an object written without versioning is the null version of its own time.
 version_tag version_of(const object_meta& m);
+// Its id and its order alone, the id viewed where `m` keeps it, for the loops over a key's versions.
+std::string_view version_id_of(const object_meta& m);
+uint64_t version_seq_of(const object_meta& m);
 // Whether `m` records a version, which only an object written to a versioned bucket does.
 bool has_version(const object_meta& m);
 // Whether `m` is a delete marker, cheaply false for an object with no version.
