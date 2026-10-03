@@ -444,7 +444,7 @@ std::string storage_instance::stats_lines() const
         << "notify_failed:" << m_run->notifications().counters().failed << "\n"
         << "notify_queued:" << m_run->notifications().queued() << "\n"
         << "notify_dropped:" << m_run->notifications().counters().dropped << "\n"
-        << "notify_resolves:" << m_run->notifications().counters().resolves << "\n";
+        << "notify_resolves:" << m_run->notifications().resolves() << "\n";
     // One line per code answered, so a client's mistakes and the runtime's own
     // are told apart without reading a log.
     for (const auto& [code, n] : c.errors)

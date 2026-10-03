@@ -1,0 +1,190 @@
+#pragma once
+// The HTTP(S) requests a storage runtime makes of other hosts, for the webhooks its events go to and the endpoints its
+// buckets replicate to: a target's URL, its addresses, and one exchange at a time on a fresh connection, every step on
+// the loop and the resolving on a thread of the owner's.
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <sys/socket.h>
+
+#include "../../shared/event_loop.h"
+#include "../../shared/file_io.h"
+#include "../../shared/hash_pool.h"
+#include "../../shared/tls_context.h"
+
+namespace socketley::storage
+{
+
+// Where a target's requests go: the URL's scheme, host, port and path, and the CA an https host is checked against.
+struct http_target
+{
+    std::string url;
+    bool        tls{false};
+    std::string host;
+    uint16_t    port{0};
+    std::string path;
+    // The CA an https target's certificate is checked against, the system's when empty.
+    std::string ca_file;
+
+    // What a Host header names: the host, bracketed when it is IPv6, and the port when it is not the scheme's.
+    std::string authority() const;
+};
+
+// `http://host[:port][/path]` or `https://...`, a host in brackets for IPv6; false with `why` for anything else.
+bool parse_http_url(std::string_view url, http_target& t, std::string& why);
+
+// One line of a targets file, split into its fields at spaces and tabs.
+struct target_line
+{
+    size_t line_no{0};
+    std::vector<std::string_view> fields;
+};
+
+// The lines of a targets file that say something: a field that begins with '#' begins a comment to the end of its line.
+std::vector<target_line> split_target_lines(std::string_view text);
+
+// A targets file read whole, false with `why` when it cannot be; `what` names the file in `why`.
+bool read_targets_file(const std::string& path, std::string_view what, std::string& out, std::string& why);
+
+// Whether `name` is a target's name: letters, digits, '-', '_' and '.'.
+bool valid_target_name(std::string_view name);
+
+// One address a host resolved to.
+struct http_endpoint
+{
+    struct sockaddr_storage addr{};
+    socklen_t len{0};
+};
+
+// `host` as an address literal, false when it is a name.
+bool literal_endpoint(const std::string& host, uint16_t port, http_endpoint& out);
+
+// The addresses `host` has, in the order the resolver gives them, a name in `hosts_file` (`name address` lines, a
+// test aid) before the system's; blocking, so it runs on the resolver thread.
+std::vector<http_endpoint> resolve_http_host(const std::string& host, uint16_t port, const std::string& hosts_file);
+
+// What a host answered, status 0 when no whole answer came.
+struct http_answer
+{
+    int         status{0};
+    // The status line and the header lines, and the body with any chunked framing taken off.
+    std::string head;
+    std::string body;
+    // Why no whole answer came, empty when one did.
+    std::string failure;
+
+    // The value of the header named `lower`, empty when there is none.
+    std::string_view header(std::string_view lower) const;
+};
+
+// The next bytes of a request's body, handed to `give`: empty after the last, and `ok` false when they cannot be had.
+using http_body_give   = std::function<void(bool ok, std::string_view piece)>;
+using http_body_source = std::function<void(http_body_give give)>;
+
+struct http_request
+{
+    // The request line and the header lines, ending with the blank line.
+    std::string head;
+    // A body held whole, sent after the head.
+    std::string body;
+    // A body handed out a piece at a time after the head and `body`, none when empty.
+    http_body_source source;
+    // The exchange ends once the answer's head is in, for a host whose answer has nothing more to say.
+    bool        head_only{false};
+    // How long the answer may take once the whole request is written.
+    int         answer_secs{10};
+};
+
+// The exchanges of one target, one at a time, each on a connection of its own that the answer closes.
+class http_peer
+{
+public:
+    // An exchange with no progress for this long has failed.
+    static constexpr int stall_secs = 10;
+    // A host's addresses are asked for again this often while it is used, and at once after every address it had
+    // refused a connection, but not twice within the floor.
+    static constexpr int resolve_every_secs = 60;
+    static constexpr int resolve_floor_ms   = 1000;
+
+    // `resolver` asks for a named host's addresses, `hosts_file` is the test aid, and `what` names the target in the log.
+    http_peer(event_loop& loop, file_io& io, hash_pool& resolver, http_target target, std::string hosts_file,
+              std::string what);
+    ~http_peer();
+
+    http_peer(const http_peer&)            = delete;
+    http_peer& operator=(const http_peer&) = delete;
+
+    const http_target& target() const { return m_target; }
+    bool busy() const { return m_busy; }
+    // Asks for a named host's addresses now, so the first exchange does not wait for them.
+    void prime();
+
+    // Starts an exchange, whose end `done` hears exactly once; a host with no address yet is resolved first.
+    void exchange(http_request req, std::function<void(http_answer)> done);
+    // Ends an exchange that has stalled.
+    void tick(std::chrono::steady_clock::time_point now);
+    // Ends the exchange in progress without telling anyone, for a stop.
+    void stop();
+
+    uint64_t resolves() const { return m_resolves; }
+
+private:
+    bool resolve();
+    void resolved(std::vector<http_endpoint> addrs);
+    void connect();
+    void connected(int64_t res);
+    // The next step: the handshake, the next bytes owed to the socket, or a read of the answer.
+    void advance();
+    // Writes `bytes` whole, then advances.
+    void send(std::shared_ptr<std::string> bytes, size_t off);
+    // Hands what the record layer has to say to send(); false when it had nothing.
+    bool flush_cipher();
+    void receive();
+    void got(const char* p, size_t n);
+    // Whether the answer read so far is whole.
+    bool answer_complete() const;
+    // The exchange ends, answered or failed for `why`, and `done` hears the answer.
+    void finish(bool answered, std::string why = {});
+    void close_socket();
+
+    event_loop& m_loop;
+    file_io&    m_io;
+    hash_pool&  m_resolver;
+    http_target m_target;
+    std::string m_hosts_file;
+    std::string m_what;
+    std::unique_ptr<tls_context> m_tls;
+    std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
+
+    // The host's addresses and the one tried next; a literal address is its own and never resolved.
+    std::vector<http_endpoint> m_addrs;
+    size_t      m_cur{0};
+    bool        m_literal{false};
+    bool        m_resolving{false};
+    std::chrono::steady_clock::time_point m_resolved_at{};
+    uint64_t    m_resolves{0};
+
+    // The exchange in progress, and a generation bumped at its end so a late completion is told from a current one.
+    bool        m_busy{false};
+    bool        m_stopped{false};
+    uint64_t    m_gen{0};
+    http_request m_req;
+    std::function<void(http_answer)> m_done;
+    int         m_fd{-1};
+    SSL*        m_ssl{nullptr};
+    bool        m_handshaken{false};
+    bool        m_head_given{false};
+    bool        m_source_done{false};
+    bool        m_sent{false};
+    // A write failed, so the answer the host may have sent before closing is all that is left to read.
+    bool        m_write_failed{false};
+    std::string m_in;
+    std::chrono::steady_clock::time_point m_deadline{};
+};
+
+}   // namespace socketley::storage

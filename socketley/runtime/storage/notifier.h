@@ -3,24 +3,15 @@
 // POSTs that empty it, each on the loop and none on a request's path.
 //
 // ─── THE OUTBOX ─────────────────────────────────────────────────────────────
-//   <dir>/.notify/outbox.<shard>   records `u32 length | u32 crc32 | payload`, the payload one of
-//                                    'E' id target json   an event of a change that was made
-//                                    'S' change check     a change about to be made, and what tells a start whether it was
-//                                    'T' id change target json   an event of such a change
-//                                    'C' change / 'X' change     the change was made / was not
-//                                    'D' id               the event was delivered
+//   <dir>/.notify/outbox.<shard>   an entry's payload is its target's name and its JSON, each length-prefixed
 //
-// A change's events are synced beside the change itself and it is answered once both are durable, so an answered
-// change's events survive a crash.
-//
-// A start keeps the events of a change with neither 'C' nor 'X' only when the check finds it in the files, so no
-// event is sent for a change that was never made.
+// A change's events are synced beside the change and it is answered once both are durable, so an answered change's
+// events survive a crash, and none is sent for a change a crash kept from being made (see outbox.h).
 //
 // A start sends again every event with no delivery record, so an event is delivered at least once.
 #include <chrono>
 #include <cstdint>
 #include <deque>
-#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -28,12 +19,11 @@
 #include <utility>
 #include <vector>
 
-#include <sys/socket.h>
-
+#include "outbound_http.h"
+#include "outbox.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/file_io.h"
 #include "../../shared/hash_pool.h"
-#include "../../shared/tls_context.h"
 
 namespace socketley::storage
 {
@@ -42,13 +32,7 @@ namespace socketley::storage
 struct notify_target
 {
     std::string name;
-    std::string url;
-    bool        tls{false};
-    std::string host;
-    uint16_t    port{0};
-    std::string path;
-    // The CA an https target's certificate is checked against, the system's when empty.
-    std::string ca_file;
+    http_target http;
 };
 
 // The targets a file's text names, one `name url [ca=file]` per line with '#' starting a comment; false with `why`
@@ -58,23 +42,11 @@ bool parse_notify_targets(std::string_view text, std::vector<notify_target>& out
 // The same read from `path`.
 bool load_notify_targets(const std::string& path, std::vector<notify_target>& out, std::string& why);
 
-// One address a host resolved to.
-struct notify_endpoint
-{
-    struct sockaddr_storage addr{};
-    socklen_t len{0};
-};
-
-// The addresses `host` has, in the order the resolver gives them, a name in `hosts_file` (`name address` lines, a
-// test aid) before the system's; blocking, so it runs on the resolver thread.
-std::vector<notify_endpoint> resolve_notify_host(const std::string& host, uint16_t port, const std::string& hosts_file);
-
 struct notify_counters
 {
     uint64_t sent{0};
     uint64_t failed{0};
     uint64_t dropped{0};
-    uint64_t resolves{0};
 };
 
 class notifier
@@ -82,15 +54,9 @@ class notifier
 public:
     // The most events a shard holds undelivered, beyond which a new one is dropped and counted.
     static constexpr size_t default_queue_max = 10000;
-    // A POST that has not been answered in this long has failed.
-    static constexpr int attempt_secs = 10;
     // The pause after a target's first failure, doubled by each further one up to the cap.
     static constexpr int64_t backoff_first_ms = 250;
     static constexpr int64_t backoff_cap_ms   = 8000;
-    // A host's addresses are asked for again this often while it is delivered to, and at once after every address
-    // it had refused a connection, but not twice within the floor.
-    static constexpr int resolve_every_secs = 60;
-    static constexpr int resolve_floor_ms   = 1000;
 
     // `owner` is the handler the timer's completion is delivered to, which hands it to on_timer().
     notifier(event_loop& loop, file_io& io, io_handler* owner);
@@ -103,11 +69,8 @@ public:
     bool has_target(std::string_view name) const;
     bool enabled() const { return !m_lanes.empty(); }
 
-    // Whether the change a staged event's check describes is in the files, asked at start of every change the outbox
-    // does not say the end of.
-    using change_made = std::function<bool(std::string_view check)>;
     // Opens the shard's outbox under `dir` and queues again what it holds undelivered; blocking, so it runs at start.
-    bool open(const std::string& dir, uint32_t shard, const change_made& made, std::string& err);
+    bool open(const std::string& dir, uint32_t shard, const outbox::change_made& made, std::string& err);
 
     // Queues `json` for `target`, its record written with the next batch; false when it was dropped.
     bool add(std::string_view target, std::string json);
@@ -115,11 +78,11 @@ public:
     // their sync; returns the change's ticket, 0 when every event was dropped.
     uint64_t stage(std::string_view check, std::vector<std::pair<std::string, std::string>> events);
     // Runs `then` once the records of the change `ticket` names are synced.
-    void staged(uint64_t ticket, std::function<void()> then) { wait_for(ticket, std::move(then)); }
+    void staged(uint64_t ticket, std::function<void()> then) { m_box.staged(ticket, std::move(then)); }
     // The change was made or not: its events are queued or dropped, and `then` runs once that record is synced.
     void settle(uint64_t ticket, bool made, std::function<void()> then);
     // Runs `then` once every record added so far is synced.
-    void sync(std::function<void()> then) { wait_for(m_appended, std::move(then)); }
+    void sync(std::function<void()> then) { m_box.sync(std::move(then)); }
 
     // Whether `req` is the timer's, which the owner then hands to on_timer().
     bool owns(const io_request* req) const { return req == &m_timer_req; }
@@ -129,6 +92,8 @@ public:
     void stop();
 
     const notify_counters& counters() const { return m_c; }
+    // Times a target's host was resolved, across every target.
+    uint64_t resolves() const;
     // Events waiting for delivery, across every target.
     uint64_t queued() const { return m_queued; }
 
@@ -141,58 +106,22 @@ private:
     // One target's queue and the one delivery it has in flight.
     struct lane
     {
-        notify_target target;
-        std::unique_ptr<tls_context> tls;
-        // The host's addresses and the one tried next; a literal address is its own and never resolved.
-        std::vector<notify_endpoint> addrs;
-        size_t      cur{0};
-        bool        literal{false};
-        bool        resolving{false};
-        std::chrono::steady_clock::time_point resolved_at{};
+        std::string name;
+        std::unique_ptr<http_peer> peer;
         std::deque<pending> q;
-        // Bumped at the end of each attempt, so a completion of an earlier one is told from the current one's.
-        uint64_t    gen{0};
         bool        busy{false};
-        int         fd{-1};
-        SSL*        ssl{nullptr};
-        bool        handshaken{false};
-        bool        request_given{false};
-        bool        wrote_request{false};
-        std::string response;
         uint32_t    failures{0};
-        std::chrono::steady_clock::time_point deadline{};
         std::chrono::steady_clock::time_point next_try{};
     };
 
     lane* find_lane(std::string_view name);
-    // Asks the resolver thread for the host's addresses unless it was asked within the floor; false when it cannot be asked.
-    bool resolve(lane& l);
-    void resolved(lane& l, std::vector<notify_endpoint> addrs);
+    void start(lane& l);
+    // The delivery at the front of the queue ended, delivered or not.
+    void finish(lane& l, bool delivered);
     // A delivery that did not happen is tried again after a pause that grows with each failure in a row.
     void back_off(lane& l);
-    void start(lane& l);
-    void connected(lane& l, int64_t res);
-    // The next step of an attempt: what is owed to the socket is written, or else the answer is read.
-    void advance(lane& l);
-    void send(lane& l, std::string bytes);
-    void receive(lane& l);
-    void got(lane& l, const char* p, size_t n);
-    // The attempt ends here, delivered or not; true when what was read is a complete 2xx answer.
-    void finish(lane& l, bool delivered);
-    // A complete answer's status, 0 while the head has not all arrived.
-    static int response_status(std::string_view r);
     // A tick soon, which looks at every lane's deadline and pause.
     void arm_timer();
-
-    // An 'E' or 'T' record carries a target and its JSON, a 'T' and an 'S' the change's number first.
-    void append_record(char type, uint64_t id, std::string_view target = {}, std::string_view json = {},
-                       uint64_t change = 0);
-    // Runs `then`, which may be empty, once the first `at` bytes appended since the outbox was opened are synced.
-    void wait_for(uint64_t at, std::function<void()> then);
-    void kick();
-    // A write that took the appended bytes up to `upto` ended, synced or not.
-    void written(int64_t res, uint64_t upto, bool synced);
-    void maybe_rotate();
 
     event_loop& m_loop;
     file_io&    m_io;
@@ -200,38 +129,12 @@ private:
     std::vector<std::unique_ptr<lane>> m_lanes;
     size_t      m_queue_max{default_queue_max};
     uint64_t    m_queued{0};
-    uint64_t    m_next_id{1};
-    // The number and the events of each change staged and not yet settled, by ticket, the events counted in m_queued.
-    struct staged_change
-    {
-        uint64_t change{0};
-        std::vector<std::pair<lane*, pending>> events;
-    };
-    std::unordered_map<uint64_t, staged_change> m_staged;
+    // The events of each change staged and not yet settled, by ticket, counted in m_queued.
+    std::unordered_map<uint64_t, std::vector<std::pair<lane*, pending>>> m_staged;
     notify_counters m_c;
     bool        m_stopped{false};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
-
-    // The outbox: its directory and file, where the next record goes, and what waits to be written and synced.
-    int         m_dir_fd{-1};
-    int         m_fd{-1};
-    std::string m_name;
-    uint64_t    m_off{0};
-    std::string m_buf;
-    // Bytes appended since the outbox was opened, which a ticket is a count of, and how many of them are synced.
-    uint64_t    m_appended{0};
-    uint64_t    m_synced{0};
-    struct waiter
-    {
-        uint64_t at;
-        std::function<void()> then;
-    };
-    std::vector<waiter> m_waiters;
-    bool        m_writing{false};
-    // Delivery records written and not yet synced, which a stop syncs.
-    bool        m_unsynced{false};
-    bool        m_rotating{false};
-    bool        m_write_failed{false};
+    outbox      m_box;
 
     // One thread that resolves hosts, its answers handed back through an eventfd the ring reads, and the test aid's
     // hosts file (SOCKETLEY_STORAGE_NOTIFY_HOSTS).
