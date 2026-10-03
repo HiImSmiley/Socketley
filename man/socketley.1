@@ -8146,6 +8146,41 @@ Clients see one runtime. Every shard serves a GET or HEAD itself by opening the
 object's file, whose header says what it is, so object bytes never move between
 shards.
 .PP
+.B "One shard is the default, and on a machine of a few cores it is the right one."
+One shard answered 95,000 signed GETs of 4 KiB a second on one core, about
+3 Gbit/s of payload, so a runtime behind a 1 or 10 Gbit link runs out of network
+before it runs out of its core. Shards pay only where small reads saturate that
+core, and they cost wherever a request crosses shards. Measured on one box with
+the runtime confined by
+.B taskset
+and a
+.B wrk
+client replaying signed GETs of 64 keys on cores of its own:
+.PP
+.RS
+.TS
+l l r.
+CPUs	shards	GET 4 KiB
+_
+2	1	96,000 req/s
+2	2	185,000 req/s
+2	4	177,000 req/s
+4	2	187,000 req/s
+4	4	253,000 req/s
+4	8	218,000 req/s
+8	4	258,000 req/s
+8	8	359,000 req/s
+.TE
+.RE
+.PP
+The last row is the client's six threads at their limit. More shards than CPUs is
+slower, never faster. The price on the same box: a ListObjectsV2 page of 1000 keys
+took 2.1x the CPU at two shards and 2.4 to 2.5x at four, since every shard walks up
+to a page and one merges them; a 4 KiB PUT took 1.2 to 1.3x the CPU at two shards
+and 1.4 to 1.6x at four, since at four shards three keys in four are committed by
+another shard than the one the body landed on. Large objects move at the same rate
+at any count: a 64 MiB GET was bound by the client and a 64 MiB PUT by the disk.
+.PP
 A key's
 .I owner
 is the shard that commits its changes: the CRC16/XMODEM of the string
