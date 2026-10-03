@@ -64,34 +64,6 @@ constexpr size_t   tls_write_slice     = 64 * 1024;
 constexpr size_t   tls_write_cap       = 512 * 1024;
 constexpr int      write_stall_secs    = 120;
 
-const char* reason_phrase(int status)
-{
-    switch (status)
-    {
-        case 100: return "Continue";
-        case 200: return "OK";
-        case 204: return "No Content";
-        case 206: return "Partial Content";
-        case 304: return "Not Modified";
-        case 400: return "Bad Request";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 409: return "Conflict";
-        case 411: return "Length Required";
-        case 412: return "Precondition Failed";
-        case 413: return "Payload Too Large";
-        case 416: return "Range Not Satisfiable";
-        case 431: return "Request Header Fields Too Large";
-        case 500: return "Internal Server Error";
-        case 501: return "Not Implemented";
-        case 503: return "Service Unavailable";
-        case 505: return "HTTP Version Not Supported";
-        case 507: return "Insufficient Storage";
-        default:  return "Status";
-    }
-}
-
 }   // namespace
 
 namespace
@@ -245,6 +217,7 @@ void s3_request::reset()
     bucket.clear();
     key.clear();
     vhost = false;
+    website = false;
     headers.clear();
     query.clear();
     request_id.clear();
@@ -1437,6 +1410,39 @@ std::string storage_run::response_head(const conn& c, const response& r, size_t 
     return h;
 }
 
+const char* reason_phrase(int status)
+{
+    switch (status)
+    {
+        case 100: return "Continue";
+        case 200: return "OK";
+        case 204: return "No Content";
+        case 206: return "Partial Content";
+        case 301: return "Moved Permanently";
+        case 302: return "Found";
+        case 303: return "See Other";
+        case 307: return "Temporary Redirect";
+        case 308: return "Permanent Redirect";
+        case 304: return "Not Modified";
+        case 400: return "Bad Request";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
+        case 411: return "Length Required";
+        case 412: return "Precondition Failed";
+        case 413: return "Payload Too Large";
+        case 416: return "Range Not Satisfiable";
+        case 431: return "Request Header Fields Too Large";
+        case 500: return "Internal Server Error";
+        case 501: return "Not Implemented";
+        case 503: return "Service Unavailable";
+        case 505: return "HTTP Version Not Supported";
+        case 507: return "Insufficient Storage";
+        default:  return "Status";
+    }
+}
+
 void storage_run::send_response(const std::shared_ptr<conn>& c, response r)
 {
     if (c->dead)
@@ -1463,6 +1469,13 @@ void storage_run::send_error(const std::shared_ptr<conn>& c, const s3_error& e, 
     if (c->hide_missing && e.code == "NoSuchKey")
     {
         send_error(c, make_error("AccessDenied"), close, extra_name, extra_value);
+        return;
+    }
+    // A website answers its failures in HTML, or as its configuration says.
+    if (c->req.website)
+    {
+        c->req.keep_alive = c->req.keep_alive && !close;
+        website_failure(c, e);
         return;
     }
     count_error(e.code);
@@ -1544,6 +1557,9 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->policy_admitted = false;
     c->cors_head.clear();
     c->hide_missing = false;
+    c->website_key.clear();
+    c->website_error = {};
+    c->website_status = 0;
 }
 
 void storage_run::finish_request(const std::shared_ptr<conn>& c)
@@ -1685,8 +1701,9 @@ bool storage_run::parse_head(const std::shared_ptr<conn>& c, std::string_view he
     if (!percent_decode(r.raw_path, path, false))
         return bad("InvalidRequest");
     const std::string_view rest_path = std::string_view(path).substr(1);
-    r.vhost = !m_domains.empty() && vhost_bucket(r.host, m_domains, r.bucket);
-    if (r.vhost)
+    r.website = !m_website_domains.empty() && vhost_bucket(r.host, m_website_domains, r.bucket);
+    r.vhost = !r.website && !m_domains.empty() && vhost_bucket(r.host, m_domains, r.bucket);
+    if (r.vhost || r.website)
         r.key.assign(rest_path);
     else
     {

@@ -69,6 +69,9 @@ public:
     // The comma-separated domains under which a Host of `<bucket>.<domain>` addresses a bucket; empty is path style only.
     void set_domain(std::string_view d) { m_domain = std::string(d); }
     std::string_view get_domain() const { return m_domain; }
+    // The comma-separated domains under which a Host of `<bucket>.<domain>` is that bucket's website.
+    void set_website_domain(std::string_view d) { m_website_domain = std::string(d); }
+    std::string_view get_website_domain() const { return m_website_domain; }
 
     // The file of `name url` lines naming the webhooks event notifications go to, read at every start; none refuses
     // every destination.
@@ -138,6 +141,7 @@ private:
     std::string m_credentials_file;
     std::string m_sse_key_file;
     std::string m_domain;
+    std::string m_website_domain;
     std::string m_notify_targets;
     std::string m_replication_targets;
     std::string m_fsync;

@@ -88,6 +88,9 @@ std::string storage_instance::config_refusal() const
     if (std::vector<std::string> d; !m_domain.empty())
         if (std::string why; !socketley::storage::parse_domains(m_domain, d, why))
             return "storage: " + why + "\n";
+    if (std::vector<std::string> d; !m_website_domain.empty())
+        if (std::string why; !socketley::storage::parse_domains(m_website_domain, d, why))
+            return "storage: --website-domain: " + why + "\n";
     if (socketley::storage::sync_mode m; !m_fsync.empty() && !socketley::storage::parse_sync_mode(m_fsync, m))
         return "storage: --fsync is always, interval or never, not " + m_fsync + "\n";
     if (!m_notify_targets.empty())
@@ -259,6 +262,18 @@ bool storage_instance::setup(event_loop& loop)
             return false;
         }
         run->set_domains(std::move(d));
+    }
+    if (std::vector<std::string> d; !m_website_domain.empty())
+    {
+        std::string why;
+        if (!socketley::storage::parse_domains(m_website_domain, d, why))
+        {
+            LOG_ERROR(("storage: --website-domain: " + why).c_str());
+            run->stop();
+            m_graveyard.push_back(std::move(run));
+            return false;
+        }
+        run->set_website_domains(std::move(d));
     }
     // Read here, at every start, so a replaced key file is the one a restart serves with.
     if (!m_sse_key_file.empty())

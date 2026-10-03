@@ -127,6 +127,8 @@ struct s3_request
     bool   expect_continue{false};
     // The bucket came from the Host header and the whole path is the key.
     bool   vhost{false};
+    // The Host header named a bucket's website, which serves its objects to anyone a policy lets read them.
+    bool   website{false};
     // A browser's upload by form, whose fields became the key and the headers of a PutObject.
     std::unique_ptr<post_form> form;
 
@@ -376,11 +378,19 @@ struct conn
     bool        policy_admitted{false};
     // A missing key is answered AccessDenied, for a requester a policy lets read and not list, as S3 does.
     bool        hide_missing{false};
+    // The key a website request asked for, before its index document was added.
+    std::string website_key;
+    // The failure a website request is serving its error document for, and its status.
+    s3_error    website_error;
+    int         website_status{0};
 };
 
 // An object's metadata as a script sees it: the user metadata without its
 // header prefix, and the fields S3 reports.
 storage_rpc::object_info rpc_info_of(const object_meta& m, std::string key = {});
+
+// The text a status line gives after the code.
+const char* reason_phrase(int status);
 
 // A pass of the lifecycle sweep over every bucket with rules, which keeps its place between steps.
 struct lifecycle_pass
@@ -456,6 +466,7 @@ public:
     void set_tls(std::unique_ptr<tls_context> ctx) { m_tls = std::move(ctx); }
     bool tls_enabled() const { return m_tls != nullptr; }
     // The domains a Host of `<bucket>.<domain>` addresses a bucket under; none serves path style only.
+    void set_website_domains(std::vector<std::string> d) { m_website_domains = std::move(d); }
     void set_domains(std::vector<std::string> d) { m_domains = std::move(d); }
 
     void on_cqe(struct io_uring_cqe* cqe) override;
@@ -676,6 +687,18 @@ public:
     // Replication, in storage_replication.cpp: the configuration's three operations, the status a new version is
     // written with, and the copies a change queues.
     void op_put_replication(const std::shared_ptr<conn>& c);
+    // A bucket's website, in storage_website.cpp: the configuration's three operations, and a request to the website.
+    void op_put_website(const std::shared_ptr<conn>& c);
+    void op_get_website(const std::shared_ptr<conn>& c);
+    // A request to a bucket's website: an object, its index document, a redirect, or an error page.
+    void op_website(const std::shared_ptr<conn>& c);
+    // A website request that failed with `e`: a redirect, the error document, or an HTML page.
+    void website_failure(const std::shared_ptr<conn>& c, const s3_error& e);
+    void website_error_page(const std::shared_ptr<conn>& c, const s3_error& e);
+    void website_redirect_to(const std::shared_ptr<conn>& c, int status, std::string location);
+    // Whether a website request with no credentials may read `c->req.key`, as GetObject.
+    bool website_readable(const std::shared_ptr<conn>& c);
+    void op_delete_website(const std::shared_ptr<conn>& c);
     // A bucket's quota, in storage_quota.cpp: its three operations, which only an admin may ask.
     void op_put_quota(const std::shared_ptr<conn>& c);
     void op_get_quota(const std::shared_ptr<conn>& c);
@@ -878,6 +901,8 @@ private:
     bool              m_lc_again{false};
     std::unique_ptr<tls_context> m_tls;
     std::vector<std::string> m_domains;
+    // The domains under which a Host names a bucket's website.
+    std::vector<std::string> m_website_domains;
     // The key every SSE-S3 data key is wrapped with, and its name, when the runtime was given one.
     bool        m_has_master{false};
     sse_key     m_master{};

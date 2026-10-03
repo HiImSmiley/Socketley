@@ -158,6 +158,7 @@ struct runtime_config
     std::string storage_credentials;
     std::string storage_sse_key_file;
     std::string storage_domain;
+    std::string storage_website_domain;
     std::string storage_notify_targets;
     std::string storage_replication_targets;
     std::string storage_fsync;

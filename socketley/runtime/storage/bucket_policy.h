@@ -83,6 +83,9 @@ enum class s3_action : uint8_t
     replicate_object,
     replicate_delete,
     replicate_tags,
+    get_bucket_website,
+    put_bucket_website,
+    delete_bucket_website,
     count,
 };
 static_assert(static_cast<int>(s3_action::count) <= 64);

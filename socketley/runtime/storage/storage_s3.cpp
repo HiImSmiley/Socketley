@@ -32,7 +32,7 @@ constexpr size_t   user_meta_limit  = 2048;
 bool unsupported_subresource(const s3_request& r, bool object)
 {
     static constexpr std::string_view names[] = {
-        "acl", "tagging", "website",
+        "acl", "tagging",
         "accelerate",
         "requestPayment", "logging", "analytics", "metrics", "inventory", "ownershipControls",
         "publicAccessBlock", "intelligent-tiering", "attributes", "restore", "select", "torrent",
@@ -59,7 +59,9 @@ bool unsupported_subresource(const s3_request& r, bool object)
     // A bucket's replication configuration is read, set and deleted, and an object has none.
     if (r.has_query("replication") && (object || (r.method != "GET" && r.method != "PUT" && r.method != "DELETE")))
         return true;
-    // And its quota likewise.
+    // And its website configuration and its quota likewise.
+    if (r.has_query("website") && (object || (r.method != "GET" && r.method != "PUT" && r.method != "DELETE")))
+        return true;
     if (r.has_query("quota") && (object || (r.method != "GET" && r.method != "PUT" && r.method != "DELETE")))
         return true;
     // A bucket's object lock is read and set, and a version's retention and legal hold likewise.
@@ -225,6 +227,12 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     // A bucket whose documents this shard may hold old copies of is served nothing, preflights included.
     if (m_store.any_doubt() && !docs_settled(c))
         return;
+    // A website is read by browsers, which sign nothing and are judged by the bucket's policy alone.
+    if (r.website)
+    {
+        op_website(c);
+        return;
+    }
     // A browser asks before a cross-origin request, and cannot sign the asking.
     if (r.method == "OPTIONS")
     {
@@ -442,6 +450,16 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
             op_get_notification(c);
         else
             op_put_notification(c);
+        return;
+    }
+    if (bkt && q.has_query("website"))
+    {
+        if (m == "GET")
+            op_get_website(c);
+        else if (m == "PUT")
+            op_put_website(c);
+        else
+            op_delete_website(c);
         return;
     }
     if (bkt && q.has_query("quota"))
@@ -1691,6 +1709,15 @@ void storage_run::op_delete_object(const std::shared_ptr<conn>& c)
 namespace
 {
 
+// Where a website sends a request for an object stored as a redirect, empty for an object served as itself.
+std::string_view website_target(const object_meta& m)
+{
+    for (const auto& [name, value] : m.extra)
+        if (name == "x-amz-website-redirect-location")
+            return value;
+    return {};
+}
+
 // The headers an object's stored metadata puts on a response, with the
 // response-* query overrides a presigned URL may add; in a `versioned` bucket an
 // object written before it was versioned is named as the null version, and `part`
@@ -2129,7 +2156,17 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
         }
 
         response r;
-        const cond cd = evaluate(rq, m);
+        // A website's object can stand for a redirect, and its error document is answered with the failure's status.
+        if (rq.website)
+        {
+            if (const std::string_view to = website_target(m); !to.empty() && !cc->website_status)
+            {
+                close_file();
+                website_redirect_to(cc, 301, std::string(to));
+                return;
+            }
+        }
+        const cond cd = cc->website_status ? cond::proceed : evaluate(rq, m);
         if (cd == cond::precondition_failed)
         {
             close_file();
@@ -2214,7 +2251,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
             // An empty part has no byte a Content-Range could name.
             ranged = len > 0;
         }
-        else if (const std::string_view rh = rq.header("range"); !rh.empty())
+        else if (const std::string_view rh = rq.header("range"); !rh.empty() && !cc->website_status)
         {
             const http_range hr = http_parse_range(rh, static_cast<size_t>(m.size));
             if (hr.unsatisfiable)
@@ -2255,6 +2292,8 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
                        part ? &part_checksum : nullptr);
         if (!rq.has_query("versionId"))
             expiration_header(rq.bucket, rq.key, m, r.headers);
+        if (cc->website_status)
+            r.status = cc->website_status;
         if (ranged)
         {
             r.status = 206;
@@ -2407,7 +2446,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
         // A GET that asks for nothing but the object gets the headers kept with the copy, which do not follow the
         // bucket's lifecycle rules.
         if (q.query.empty() && q.header("range").empty() && q.header("x-amz-checksum-mode").empty() &&
-            !m_store.lifecycle(q.bucket) &&
+            !m_store.lifecycle(q.bucket) && (!q.website || (!c->website_status && website_target(*hot.meta).empty())) &&
             !q.has_header("x-amz-server-side-encryption-customer-algorithm") && evaluate(q, *hot.meta) == cond::proceed)
         {
             if (hot.head->empty())

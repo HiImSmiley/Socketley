@@ -1346,6 +1346,21 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
             stg->set_fsync_interval_secs(static_cast<uint32_t>(secs));
             return 0;
         }
+        // The domains under which a Host of `<bucket>.<domain>` is that bucket's website rather than the S3 API.
+        case fnv1a("--website-domain"):
+        {
+            std::vector<std::string> domains;
+            std::string why;
+            if (i + 1 >= pa.count || !socketley::storage::parse_domains(pa.args[i + 1], domains, why))
+            {
+                std::cout << (why.empty() ? "--website-domain requires a domain name, or several separated by commas"
+                                          : "--website-domain: " + why)
+                          << "\n";
+                return 1;
+            }
+            stg->set_website_domain(pa.args[++i]);
+            return 0;
+        }
         // The webhooks event notifications go to, a file of `name url` lines read at every start.
         case fnv1a("--notify-targets"):
         {

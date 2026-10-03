@@ -790,6 +790,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.storage_credentials = std::string(stg->get_credentials_file());
             cfg.storage_sse_key_file = std::string(stg->get_sse_key_file());
             cfg.storage_domain = std::string(stg->get_domain());
+            cfg.storage_website_domain = std::string(stg->get_website_domain());
             cfg.storage_notify_targets = std::string(stg->get_notify_targets());
             cfg.storage_replication_targets = std::string(stg->get_replication_targets());
             cfg.storage_fsync = std::string(stg->get_fsync());
@@ -1064,6 +1065,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("sse_key_file", cfg.storage_sse_key_file);
             if (!cfg.storage_domain.empty())
                 append_str_field("domain", cfg.storage_domain);
+            if (!cfg.storage_website_domain.empty())
+                append_str_field("website_domain", cfg.storage_website_domain);
             if (!cfg.storage_notify_targets.empty())
                 append_str_field("notify_targets", cfg.storage_notify_targets);
             if (!cfg.storage_replication_targets.empty())
@@ -1238,6 +1241,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.storage_credentials = json_get_string(json, "credentials");
             cfg.storage_sse_key_file = json_get_string(json, "sse_key_file");
             cfg.storage_domain = json_get_string(json, "domain");
+            cfg.storage_website_domain = json_get_string(json, "website_domain");
             cfg.storage_notify_targets = json_get_string(json, "notify_targets");
             cfg.storage_replication_targets = json_get_string(json, "replication_targets");
             cfg.storage_fsync = json_get_string(json, "fsync");

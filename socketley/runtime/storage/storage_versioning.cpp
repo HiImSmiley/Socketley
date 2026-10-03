@@ -141,6 +141,12 @@ bool storage_run::version_param(const std::shared_ptr<conn>& c, std::string& out
 
 void storage_run::send_delete_marker(const std::shared_ptr<conn>& c, const object_meta& m, bool by_version)
 {
+    // A website has no versions to tell of, and a deleted key is one it does not have.
+    if (c->req.website)
+    {
+        send_error(c, make_error("NoSuchKey"));
+        return;
+    }
     const s3_error err = make_error(by_version ? "MethodNotAllowed" : "NoSuchKey");
     count_error(err.code);
     response r;

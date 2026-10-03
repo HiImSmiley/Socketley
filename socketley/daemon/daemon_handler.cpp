@@ -3566,6 +3566,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                  pa.hashes[i] == fnv1a("--secret-key") || pa.hashes[i] == fnv1a("--credentials") ||
                  pa.hashes[i] == fnv1a("--mpu-expire") || pa.hashes[i] == fnv1a("--sse-key-file") ||
                  pa.hashes[i] == fnv1a("--domain") || pa.hashes[i] == fnv1a("--notify-targets") ||
+                 pa.hashes[i] == fnv1a("--website-domain") ||
                  pa.hashes[i] == fnv1a("--replication-targets") || pa.hashes[i] == fnv1a("--fsync") ||
                  pa.hashes[i] == fnv1a("--fsync-interval")))
             {
@@ -4050,6 +4051,12 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                 (cfg.has("fsync_interval") && cfg.storage_fsync_interval_secs != stg->get_fsync_interval_secs()))
             {
                 conn->write_buf = "cannot change the sync mode while running; stop, import, and start\n";
+                return 1;
+            }
+            // The website's domains likewise.
+            if (cfg.has("website_domain") && cfg.storage_website_domain != std::string(stg->get_website_domain()))
+            {
+                conn->write_buf = "cannot change the website domain while running; stop, import, and start\n";
                 return 1;
             }
             // The domains are parsed into each worker's run at start.
