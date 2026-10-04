@@ -8212,7 +8212,13 @@ for its objects, with
 .B *
 for any run of characters and
 .B ?
-for one; the bucket must be this one, and a statement must have an action that applies
+for one; the bucket must be this one, or a pattern that covers it, as
+.B arn:aws:s3:::*
+does (that one, ending in
+.BR * ,
+covering the bucket's objects too, since IAM's
+.B *
+spans a slash), and a statement must have an action that applies
 to one of its resources (an object action to a key pattern, a bucket action to the
 bucket). Policy variables are refused.
 .TP

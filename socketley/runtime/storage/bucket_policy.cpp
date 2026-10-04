@@ -25,6 +25,35 @@ char lower(char c)
     return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
 }
 
+// IAM's StringLike: * any run of characters, ? one.
+bool glob(std::string_view pat, std::string_view text)
+{
+    size_t p = 0, t = 0, star = std::string_view::npos, mark = 0;
+    while (t < text.size())
+    {
+        if (p < pat.size() && (pat[p] == '?' || pat[p] == text[t]))
+        {
+            ++p;
+            ++t;
+        }
+        else if (p < pat.size() && pat[p] == '*')
+        {
+            star = p++;
+            mark = t;
+        }
+        else if (star != std::string_view::npos)
+        {
+            p = star + 1;
+            t = ++mark;
+        }
+        else
+            return false;
+    }
+    while (p < pat.size() && pat[p] == '*')
+        ++p;
+    return p == pat.size();
+}
+
 std::string lowered(std::string_view in)
 {
     std::string out;
@@ -372,6 +401,7 @@ struct compiler
         std::vector<std::string> list;
         if (!strings(v, "Resource", list))
             return false;
+        std::string widened;
         for (const std::string& r : list)
         {
             std::string_view rv = r;
@@ -396,6 +426,23 @@ struct compiler
             {
                 s.bucket_resource = true;
                 continue;
+            }
+            // A bucket named by a pattern that covers this one, as arn:aws:s3:::* does: the bucket and, since IAM's
+            // * spans a slash, every object when the pattern ends in one.
+            const std::string_view bpart = rv.substr(0, rv.find('/'));
+            if (bpart.find_first_of("*?") != std::string_view::npos)
+            {
+                if (!glob(bpart, bucket))
+                    return fail("Policy has invalid resource: " + r + " does not cover this bucket");
+                if (bpart.size() == rv.size())
+                {
+                    s.bucket_resource = true;
+                    if (rv.back() == '*')
+                        s.objects.push_back(bucket_policy::key_pattern{});
+                    continue;
+                }
+                widened = std::string(bucket) + std::string(rv.substr(bpart.size()));
+                rv      = widened;
             }
             if (!rv.starts_with(bucket) || rv.size() <= bucket.size() || rv[bucket.size()] != '/')
                 return fail("Policy has invalid resource: " + r + " is not this bucket or an object in it");
@@ -1123,35 +1170,6 @@ policy_effect bucket_policy::evaluate(const policy_request& r) const
 
 namespace
 {
-
-// IAM's StringLike: * any run of characters, ? one.
-bool glob(std::string_view pat, std::string_view text)
-{
-    size_t p = 0, t = 0, star = std::string_view::npos, mark = 0;
-    while (t < text.size())
-    {
-        if (p < pat.size() && (pat[p] == '?' || pat[p] == text[t]))
-        {
-            ++p;
-            ++t;
-        }
-        else if (p < pat.size() && pat[p] == '*')
-        {
-            star = p++;
-            mark = t;
-        }
-        else if (star != std::string_view::npos)
-        {
-            p = star + 1;
-            t = ++mark;
-        }
-        else
-            return false;
-    }
-    while (p < pat.size() && pat[p] == '*')
-        ++p;
-    return p == pat.size();
-}
 
 bool equal_ci(std::string_view a, std::string_view b)
 {

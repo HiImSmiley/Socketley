@@ -237,7 +237,6 @@ def mode_config(port):
         ("an action S3 does not have", policy(stmt("Allow", "*", "s3:FlyToTheMoon", "arn:aws:s3:::pub/*")), "invalid action"),
         ("an action of another service", policy(stmt("Allow", "*", "ec2:RunInstances", "arn:aws:s3:::pub/*")), "invalid action"),
         ("a resource in another bucket", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::other/*")), "invalid resource"),
-        ("a wildcard in the bucket name", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pu*/x")), "invalid resource"),
         ("a resource that is not an S3 ARN", policy(stmt("Allow", "*", "s3:GetObject", "pub/*")), "invalid resource"),
         ("a policy variable", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/${aws:username}/*")), "variables"),
         ("an object action on the bucket alone", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub")), "does not apply"),
@@ -312,6 +311,18 @@ def mode_config(port):
     check("not one with another value", anon("/pub/cond/t2", method="PUT", body=b"t",
                                                headers={"x-amz-tagging": "project=beta"}).status == 403)
     check("nor one with no tags", anon("/pub/cond/t3", method="PUT", body=b"t").status == 403)
+    delete_policy(T, "pub")
+
+    # A bucket named by a pattern that covers it: arn:aws:s3:::* is the bucket and, IAM's * spanning a slash, its objects.
+    r = put_policy(T, "pub", policy(stmt("Allow", "*", ["s3:GetObject", "s3:ListBucket"], "arn:aws:s3:::*")))
+    check("arn:aws:s3:::* is taken", r.status == 204, repr(r))
+    check("and covers the bucket's listing", anon("/pub", "list-type=2&prefix=cond/").status == 200)
+    check("and its objects", anon("/pub/cond/x").status == 200)
+    r = put_policy(T, "pub", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::p*/cond/*")))
+    check("a bucket pattern with a key pattern is taken", r.status == 204, repr(r))
+    check("and covers the keys it names", anon("/pub/cond/x").status == 200 and anon("/pub/public/a").status == 403)
+    malformed(T, "pub", "a bucket pattern that does not cover this bucket",
+              policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::other*/*")), "does not cover")
     delete_policy(T, "pub")
 
     # A statement for a service alone is taken, and lets in no request, whatever its conditions.
