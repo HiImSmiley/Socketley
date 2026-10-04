@@ -235,68 +235,127 @@ async function download(it) {
   try { const id = await tempLink(it, 600); location.href = '/~share/' + id + '?download'; } catch (e) { fail(e); }
 }
 
-// A player for a browser without HLS of its own: the master's H.264 renditions through Media Source Extensions,
-// the one the bandwidth carries chosen at every segment, and a seek begun at the segment it lands in.
+// The master's streams through Media Source Extensions, for every browser that has them: the stream the bandwidth
+// carries chosen at every segment, positions kept in seconds so that the copied stream and the renditions, whose
+// segments begin at different times, follow one another, and a seek begun where it lands.
 class MsePlayer {
-  constructor(video, master, fixed) { this.v = video; this.master = master; this.fixed = fixed; this.alive = true; }
+  constructor(video, master, choice) { this.v = video; this.master = master; this.choice = choice; this.alive = true; this.lists = {}; }
   stop() { this.alive = false; if (this.ctl) this.ctl.abort(); this.v.removeAttribute('src'); this.v.load(); }
+  static source() { return window.ManagedMediaSource || window.MediaSource; }
   async start(at) {
+    const MS = MsePlayer.source();
     const text = await (await fetch(this.master)).text();
     const lines = text.split('\n');
     this.levels = [];
     for (let i = 0; i < lines.length; i++) {
-      if (!lines[i].startsWith('#EXT-X-STREAM-INF:') || !lines[i + 1] || lines[i + 1].includes('/hls-copy/')) continue;
+      if (!lines[i].startsWith('#EXT-X-STREAM-INF:') || !lines[i + 1]) continue;
       const bw = +(/BANDWIDTH=(\d+)/.exec(lines[i]) || [0, 0])[1];
       const codecs = (/CODECS="([^"]+)"/.exec(lines[i]) || [0, ''])[1];
-      const h = +(/\/hls-(\d+)\//.exec(lines[i + 1]) || [0, 0])[1];
-      if (MediaSource.isTypeSupported('video/mp4; codecs="' + codecs + '"')) this.levels.push({ bw, codecs, h, url: new URL(lines[i + 1], location.href).href });
+      const h = +(/RESOLUTION=\d+x(\d+)/.exec(lines[i]) || [0, 0])[1];
+      const copy = lines[i + 1].includes('/hls-copy/');
+      const rung = +(/\/hls-(\d+)\//.exec(lines[i + 1]) || [0, 0])[1];
+      if (MS.isTypeSupported('video/mp4; codecs="' + codecs + '"'))
+        this.levels.push({ bw, codecs, h, rung, copy, url: new URL(lines[i + 1], location.href).href });
     }
-    if (!this.levels.length) return;
+    if (!this.levels.length) return false;
     this.levels.sort((a, b) => a.bw - b.bw);
-    this.level = this.fixed ? Math.max(0, this.levels.findIndex(l => l.h === this.fixed)) : this.levels.reduce((best, l, i) => l.bw <= 4500000 ? i : best, 0);
-    const pl = await (await fetch(this.levels[this.level].url)).text();
-    this.durs = pl.split('\n').filter(l => l.startsWith('#EXTINF:')).map(l => parseFloat(l.slice(8)));
-    this.ms = new MediaSource();
+    const pick = c => this.levels.findIndex(c);
+    // The copied picture where the browser takes it and the line plausibly carries it, which costs the server
+    // almost nothing; else 720p or the largest rendition below about 4.5 Mbit/s.
+    if (this.choice === 'copy') this.level = Math.max(0, pick(l => l.copy));
+    else if (this.choice !== 'auto') this.level = Math.max(0, pick(l => l.rung === +this.choice));
+    else this.level = pick(l => l.copy && l.bw <= 12000000) >= 0 ? pick(l => l.copy) : this.levels.reduce((best, l, i) => !l.copy && l.bw <= 4500000 ? i : best, 0);
+    this.fixed = this.choice !== 'auto';
+    const first = await this.list(this.level);
+    this.ms = new MS();
+    if (window.ManagedMediaSource) this.v.disableRemotePlayback = true;
     this.v.src = URL.createObjectURL(this.ms);
     await new Promise(r => this.ms.addEventListener('sourceopen', r, { once: true }));
-    this.ms.duration = this.durs.reduce((a, b) => a + b, 0);
+    this.ms.duration = first.total;
     this.sb = this.ms.addSourceBuffer('video/mp4; codecs="' + this.levels[this.level].codecs + '"');
     this.inited = -1;
-    this.seg = Math.floor((at || 0) / 4);
-    this.v.addEventListener('seeking', () => { this.seg = Math.floor(this.v.currentTime / 4); this.inited = -1; if (this.ctl) this.ctl.abort(); });
+    this.v.addEventListener('seeking', () => { if (this.ctl) this.ctl.abort(); });
+    // A hole of a few milliseconds where two of the server's jobs meet is stepped over rather than stalled in.
+    this.v.addEventListener('waiting', () => {
+      const b = this.sb.buffered, t = this.v.currentTime;
+      for (let i = 0; i < b.length; i++) if (b.start(i) > t && b.start(i) - t < 0.5) { this.v.currentTime = b.start(i) + 0.01; break; }
+    });
     if (at) this.v.currentTime = at;
     this.v.play().catch(() => {});
     this.pump();
+    return true;
   }
-  ahead() { const b = this.sb.buffered, t = this.v.currentTime; for (let i = 0; i < b.length; i++) if (b.start(i) <= t + 0.5 && b.end(i) > t) return b.end(i) - t; return 0; }
-  async append(data) { this.sb.appendBuffer(data); await new Promise(r => this.sb.addEventListener('updateend', r, { once: true })); }
+  // A stream's playlist as segments with their start times; a copied stream's grows, and is read again until it ends.
+  async list(level) {
+    const known = this.lists[level];
+    if (known && known.ended) return known;
+    const url = this.levels[level].url;
+    const text = await (await fetch(url, { cache: 'no-cache' })).text();
+    const segs = []; let t = 0, init = null, dur = 0;
+    for (const l of text.split('\n')) {
+      if (l.startsWith('#EXT-X-MAP:')) init = new URL((/URI="([^"]+)"/.exec(l) || [0, 'init.mp4'])[1], url).href;
+      else if (l.startsWith('#EXTINF:')) dur = parseFloat(l.slice(8));
+      else if (l && !l.startsWith('#')) { segs.push({ url: new URL(l, url).href, start: t, dur }); t += dur; }
+    }
+    const ended = text.includes('#EXT-X-ENDLIST');
+    const out = { segs, init, total: ended ? t : Math.max(t, this.ms ? this.ms.duration : 0), ended, at: performance.now() };
+    this.lists[level] = out;
+    return out;
+  }
+  bufferedEnd() { const b = this.sb.buffered, t = this.v.currentTime; for (let i = 0; i < b.length; i++) if (b.start(i) <= t + 0.3 && b.end(i) > t) return b.end(i); return t; }
+  async append(data) {
+    for (let tries = 0; ; tries++) {
+      try { this.sb.appendBuffer(data); break; }
+      catch (e) {
+        // A full buffer gives up what lies well behind the playhead, and takes the segment after.
+        if (e.name !== 'QuotaExceededError' || tries > 2) throw e;
+        const keep = Math.max(0, this.v.currentTime - 10);
+        if (keep <= 0) throw e;
+        this.sb.remove(0, keep);
+        await new Promise(r => this.sb.addEventListener('updateend', r, { once: true }));
+      }
+    }
+    await new Promise(r => this.sb.addEventListener('updateend', r, { once: true }));
+  }
   async pump() {
     // A player whose dialog was closed stops with it.
     while (this.alive && this.v.isConnected) {
-      if (this.seg >= this.durs.length || this.ahead() > 30 || this.sb.updating) { await new Promise(r => setTimeout(r, 500)); continue; }
-      const lvl = this.levels[this.level];
-      const dir = lvl.url.replace(/index\.m3u8$/, '');
+      const end = this.bufferedEnd();
+      if (end - this.v.currentTime > 30 || this.sb.updating) { await new Promise(r => setTimeout(r, 300)); continue; }
+      const level = this.level, lvl = this.levels[level];
       try {
         this.ctl = new AbortController();
-        if (this.inited !== this.level) {
-          this.sb.changeType && this.sb.changeType('video/mp4; codecs="' + lvl.codecs + '"');
-          await this.append(await (await fetch(dir + 'init.mp4', { signal: this.ctl.signal })).arrayBuffer());
-          this.inited = this.level;
+        let list = await this.list(level);
+        let seg = list.segs.find(s => s.start + s.dur > end + 0.05);
+        if (!seg) {
+          if (list.ended || end >= list.total - 0.1) {
+            if (this.ms.readyState === 'open' && end >= this.ms.duration - 0.5) { this.ms.endOfStream(); return; }
+            await new Promise(r => setTimeout(r, 500)); continue;
+          }
+          // A copied stream not yet made this far is read again in a moment.
+          await new Promise(r => setTimeout(r, 1000)); delete this.lists[level]; continue;
         }
-        const n = this.seg;
-        const res = await fetch(dir + 'seg' + String(n).padStart(5, '0') + '.m4s', { signal: this.ctl.signal });
-        // Timed from the answer's head, so that a segment the server is still making is not taken for a slow line.
+        // The init of a stream just switched to is fetched beside its first segment, not before it.
         const t0 = performance.now();
+        const want = [fetch(seg.url, { signal: this.ctl.signal })];
+        if (this.inited !== level) want.push(fetch(list.init, { signal: this.ctl.signal }));
+        const [res, ires] = await Promise.all(want);
+        const t1 = performance.now();
         const data = await res.arrayBuffer();
-        const bps = data.byteLength * 8 / Math.max(0.05, (performance.now() - t0) / 1000);
-        if (n !== this.seg) continue;
+        const bps = data.byteLength * 8 / Math.max(0.05, (performance.now() - t1) / 1000);
+        if (ires) {
+          if (this.sb.changeType) this.sb.changeType('video/mp4; codecs="' + lvl.codecs + '"');
+          await this.append(await ires.arrayBuffer());
+          this.inited = level;
+        }
         await this.append(data);
-        this.seg = n + 1;
-        // Up when the next rendition fits the measured rate twice over, down when this one does not fit it.
+        // Up when the next stream fits the measured rate twice over and answers at once; down when this one does not
+        // fit it, or the server takes more than half a segment to answer, as it does when it cannot keep up.
         if (!this.fixed) {
-          const up = this.levels[this.level + 1];
-          if (up && bps > up.bw * 2) this.level++;
-          else if (this.level > 0 && bps < lvl.bw * 1.1) this.level--;
+          const ttfb = (t1 - t0) / 1000;
+          const up = this.levels[level + 1];
+          if (up && bps > up.bw * 2 && ttfb < seg.dur / 4) this.level = level + 1;
+          else if (level > 0 && (bps < lvl.bw * 1.1 || ttfb > seg.dur / 2)) this.level = level - 1;
         }
         const t = this.v.currentTime;
         if (t > 90 && !this.sb.updating) { this.sb.remove(0, t - 60); await new Promise(r => this.sb.addEventListener('updateend', r, { once: true })); }
@@ -336,22 +395,29 @@ async function preview(it) {
       const base = '/~share/' + id;
       let meta = null;
       try { const r = await fetch('/~media/info' + base); if (r.ok) meta = await r.json(); } catch (e) {}
+      const MS = MsePlayer.source();
       const native = m.canPlayType('application/vnd.apple.mpegurl') !== '';
-      const mse = 'MediaSource' in window;
-      const streams = meta && meta.video && (native || mse);
+      const streams = meta && meta.video && (MS || native);
       const q = el('select', {}, el('option', { value: 'orig', text: 'Original file' }));
       if (streams) {
         q.append(el('option', { value: 'auto', text: 'Auto' }));
+        if (meta.copy && (MS ? MS.isTypeSupported('video/mp4; codecs="' + meta.copy + '"') : native))
+          q.append(el('option', { value: 'copy', text: 'Original quality (stream)' }));
         for (const h of meta.renditions) q.append(el('option', { value: String(h), text: h + 'p' }));
       }
+      // Text subtitles as tracks, which the file itself and every stream show alike.
+      if (meta) for (const s of meta.subtitles || [])
+        m.append(el('track', { kind: 'subtitles', src: '/~media/sub-' + s.index + base + '/subs.vtt?v=' + meta.version,
+                               srclang: (s.lang || 'und').slice(0, 3), label: s.title || s.lang || 'Track ' + s.index }));
       let player = null;
-      const setSrc = () => {
+      const setSrc = async () => {
         const t = m.currentTime || 0;
         if (player) { player.stop(); player = null; }
         const v = q.value;
         if (v === 'orig') m.src = base;
-        else if (native) m.src = '/~media/' + (v === 'auto' ? 'hls' + base + '/master.m3u8' : 'hls-' + v + base + '/index.m3u8');
-        else { player = new MsePlayer(m, '/~media/hls' + base + '/master.m3u8', v === 'auto' ? 0 : +v); player.start(t); return; }
+        // The browser's own HLS only where it has no Media Source at all: Chrome's says it plays HLS and fails on some.
+        else if (!MS) m.src = '/~media/' + (v === 'auto' ? 'hls' + base + '/master.m3u8' : (v === 'copy' ? 'hls-copy' : 'hls-' + v) + base + '/index.m3u8');
+        else { player = new MsePlayer(m, '/~media/hls' + base + '/master.m3u8', v); if (!(await player.start(t))) { q.value = 'orig'; m.src = base; } return; }
         if (t) m.currentTime = t;
         m.play().catch(() => {});
       };
@@ -361,7 +427,7 @@ async function preview(it) {
       q.value = direct || !streams ? 'orig' : 'auto';
       setSrc();
       acts.append(el('span', { class: 'mut', text: 'Quality' }), q);
-      if (meta) acts.append(el('span', { class: 'mut', text: (meta.width ? meta.width + '×' + meta.height + ' ' : '') + (meta.video || '') + (meta.hdr ? ' HDR' : '') }));
+      if (meta) acts.append(el('span', { class: 'mut', text: (meta.width ? meta.width + '×' + meta.height + ' ' : '') + (meta.video || '') + (meta.hdr ? ' HDR' : '') + ((meta.subtitles || []).length ? ' · subtitles' : '') }));
     } else if (k === 'text' && it.size < 1 << 20) {
       const r = await must(await api('GET', '/~dav/' + enc(it.segs)));
       view.style.background = 'none';

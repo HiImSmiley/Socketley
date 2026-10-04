@@ -1,8 +1,9 @@
-// Media made from the objects: a thumbnail of a picture or a film, and a film or a song as HLS. A master playlist
-// names a ladder of renditions a player switches between as its bandwidth allows; each rendition's playlist is
-// written up front from the film's length, so a player seeks anywhere at once, and its segments are made on demand
-// by ffmpeg, started again where a player seeks to and held still when it runs too far ahead of every player.
-// ffmpeg reads the object through this runtime's own listener, and what it made is kept under <dir>/.media/ for
+// Media made from the objects: a thumbnail of a picture or a film, subtitles as WebVTT, and a film or a song as
+// HLS. A master playlist names a ladder of renditions a player switches between as its bandwidth allows, the
+// source's own picture copied, and the subtitles; each rendition's playlist is written up front from the film's
+// length, so a player seeks anywhere at once, and its segments are made on demand by ffmpeg, started again where
+// a player seeks to and held still when it runs ahead of every player. ffmpeg reads an unencrypted object's file
+// directly and any other through this runtime's own listener, and what it made is kept under <dir>/.media/ for
 // every later request, on whichever shard it lands.
 #include "storage_run.h"
 
@@ -26,8 +27,10 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <thread>
 
 #include "digest.h"
 #include "json_doc.h"
@@ -46,19 +49,23 @@ enum media_kind : uint8_t
 {
     k_thumb,
     k_probe,
-    // The source's own video, its sound made AAC, as ffmpeg's growing playlist.
+    // The source's own picture, its sound made AAC unless it is AAC already, as ffmpeg's growing playlist.
     k_copy,
     // A transcoded rendition: playlist written here, segments made on demand.
     k_rendition,
     k_master,
     // What the object is, as JSON, for a player to choose between the file itself and a stream.
     k_info,
+    // One text subtitle stream as WebVTT, and its playlist of one segment.
+    k_sub,
 };
 
 // Thumbnails queue behind a few at a time; a stream is someone waiting to watch, and never waits for another's film.
 constexpr int     thumb_jobs_max   = 2;
 constexpr int     hls_jobs_max     = 8;
 constexpr int64_t media_tick_ms    = 100;
+// The look again for a request waiting on a segment, which is the most a made segment waits to be sent.
+constexpr int64_t media_wait_tick_ms = 20;
 constexpr int64_t media_wait_ms    = 60000;
 constexpr int64_t thumb_job_ms     = 60000;
 // A stream nobody has asked for in this long is let go; what it made is kept.
@@ -71,9 +78,20 @@ constexpr uint64_t cache_default_mb = 10240;
 constexpr int64_t seg_seconds      = 4;
 // A segment this close past where a job is gets waited for; one further is a seek, and the job starts again there.
 constexpr int64_t seek_beyond      = 5;
-// A job this far past every player is held still, and goes on once one is within resume_within of it.
+// A job this far past every player is held still, and goes on once one is within resume_within of it; one nobody
+// has asked of for a while is held once it is a little ahead, as a player that sought elsewhere left it.
 constexpr int64_t pause_ahead      = 15;
 constexpr int64_t resume_within    = 8;
+constexpr int64_t unasked_ms       = 10000;
+// An init segment asked for with no job running waits this long for the segment request that begins the right one.
+constexpr int64_t init_grace_ms    = 1500;
+// A use of a medium is written to its lock's time at most this often, and eviction runs at most this often.
+constexpr int64_t touch_every_ms   = 60000;
+constexpr int64_t evict_every_ms   = 30000;
+// An object's open file is kept this long after its last use.
+constexpr int64_t source_keep_ms   = 60000;
+// A medium's file this small is read and sent in one write.
+constexpr uint64_t small_file      = 64 * 1024;
 
 // The rendition ladder, by the height of the 16:9 box a picture fits in, with the peak bitrate each is held to.
 struct rung
@@ -117,6 +135,15 @@ const rung* rendition_of(std::string_view v)
         if (static_cast<uint64_t>(r.height) == h)
             return &r;
     return nullptr;
+}
+
+bool sub_index(std::string_view v, int64_t& index)
+{
+    uint64_t n = 0;
+    if (!v.starts_with("sub-") || !parse_uint(v.substr(4), n) || n > 1000)
+        return false;
+    index = static_cast<int64_t>(n);
+    return true;
 }
 
 // A stream's segment number from its file name, -1 for the init segment, and false for anything else.
@@ -201,6 +228,39 @@ bool read_small(const std::string& path, std::string& out)
     return n == 0;
 }
 
+// Written aside and renamed in, so that a reader on any shard sees the old value or the new one and never neither.
+void write_small(const std::string& path, std::string_view data)
+{
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return;
+    const bool ok = ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size());
+    ::close(fd);
+    if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0)
+        ::unlink(tmp.c_str());
+}
+
+// A lock taken on a file another shard deleted since it was opened is a lock on nothing anyone else will look at.
+bool locked_fresh(int fd, const std::string& path)
+{
+    struct stat a{}, b{};
+    return ::fstat(fd, &a) == 0 && ::stat(path.c_str(), &b) == 0 && a.st_ino == b.st_ino && a.st_dev == b.st_dev;
+}
+
+// An ffmpeg a worker that died left running is found by the pid its job wrote, and only if it is still that job's.
+void kill_orphan(const std::string& pid_file, const std::string& dir)
+{
+    std::string v, cmdline;
+    if (!read_small(pid_file, v) || v.empty())
+        return;
+    const long pid = std::strtol(v.c_str(), nullptr, 10);
+    if (pid <= 1 || !read_small("/proc/" + std::to_string(pid) + "/cmdline", cmdline) ||
+        cmdline.find(dir) == std::string::npos)
+        return;
+    ::kill(static_cast<pid_t>(pid), SIGKILL);
+}
+
 std::string search_path(std::string_view name)
 {
     const char* path = std::getenv("PATH");
@@ -272,17 +332,6 @@ std::string media_key(const std::string& media_dir)
 
 // ─── What ffprobe said ──────────────────────────────────────────────────────
 
-struct probe
-{
-    double  duration{0};
-    int64_t width{0}, height{0}, bitrate{0};
-    std::string vcodec, vprofile, transfer;
-    int64_t vlevel{0};
-    bool    audio{false};
-    std::string format, acodec;
-    bool    hdr() const { return transfer == "smpte2084" || transfer == "arib-std-b67"; }
-};
-
 const jvalue* member(const jvalue& o, std::string_view n)
 {
     for (const auto& [k, v] : o.members)
@@ -302,11 +351,18 @@ int64_t int_of(const jvalue& o, std::string_view n)
     return std::strtoll(str_of(o, n).c_str(), nullptr, 10);
 }
 
-bool read_probe(const std::string& probe_dir, probe& p)
+double rate_of(const std::string& r)
 {
-    std::string text;
+    const size_t slash = r.find('/');
+    const double num = std::strtod(r.c_str(), nullptr);
+    const double den = slash == std::string::npos ? 1.0 : std::strtod(r.c_str() + slash + 1, nullptr);
+    return den > 0 ? num / den : 0;
+}
+
+bool parse_probe(const std::string& text, media_probe& p)
+{
     jvalue root;
-    if (!exists(probe_dir + "/done") || !read_small(probe_dir + "/probe.json", text) || !json_reader(text).document(root))
+    if (!json_reader(text).document(root))
         return false;
     if (const jvalue* f = member(root, "format"))
     {
@@ -314,6 +370,7 @@ bool read_probe(const std::string& probe_dir, probe& p)
         p.bitrate = int_of(*f, "bit_rate");
         p.format = str_of(*f, "format_name");
     }
+    double vduration = 0;
     if (const jvalue* streams = member(root, "streams"))
         for (const jvalue& s : streams->items)
         {
@@ -328,18 +385,42 @@ bool read_probe(const std::string& probe_dir, probe& p)
                 p.width = int_of(s, "width");
                 p.height = int_of(s, "height");
                 p.transfer = str_of(s, "color_transfer");
+                p.fps = rate_of(str_of(s, "avg_frame_rate"));
+                if (p.fps <= 0 || p.fps > 240)
+                    p.fps = rate_of(str_of(s, "r_frame_rate"));
+                vduration = std::strtod(str_of(s, "duration").c_str(), nullptr);
             }
             else if (type == "audio" && !p.audio)
             {
                 p.audio = true;
                 p.acodec = str_of(s, "codec_name");
+                p.achannels = int_of(s, "channels");
+            }
+            else if (type == "subtitle")
+            {
+                const std::string codec = str_of(s, "codec_name");
+                if (codec != "subrip" && codec != "ass" && codec != "ssa" && codec != "mov_text" && codec != "webvtt" &&
+                    codec != "text")
+                    continue;
+                media_probe::subtitle sub;
+                sub.index = int_of(s, "index");
+                sub.codec = codec;
+                if (const jvalue* tags = member(s, "tags"))
+                {
+                    sub.lang = str_of(*tags, "language");
+                    sub.title = str_of(*tags, "title");
+                }
+                p.subtitles.push_back(std::move(sub));
             }
         }
+    // The picture's own length where the container's runs on past it, so the last segment is one the picture has.
+    if (vduration > 0 && vduration < p.duration)
+        p.duration = vduration;
     return true;
 }
 
 // A rendition's picture, fitted into the 16:9 box of its rung and never enlarged, with even sides.
-void fitted(const probe& p, int64_t box_h, int64_t& w, int64_t& h)
+void fitted(const media_probe& p, int64_t box_h, int64_t& w, int64_t& h)
 {
     const double box_w = static_cast<double>(box_h * 16 / 9 / 2 * 2);
     const double scale = std::min({1.0, box_w / static_cast<double>(p.width), static_cast<double>(box_h) / static_cast<double>(p.height)});
@@ -348,7 +429,7 @@ void fitted(const probe& p, int64_t box_h, int64_t& w, int64_t& h)
 }
 
 // The rungs worth making of a source: those its picture fills in at least one side, and the one that keeps its size.
-std::vector<const rung*> rungs_of(const probe& p)
+std::vector<const rung*> rungs_of(const media_probe& p)
 {
     std::vector<const rung*> out;
     if (p.width <= 0 || p.height <= 0)
@@ -362,24 +443,27 @@ std::vector<const rung*> rungs_of(const probe& p)
     // And one that keeps its size when no rung does exactly.
     if (out.front()->height < p.height || out.front()->height * 16 / 9 / 2 * 2 < p.width)
         for (const rung& r : ladder)
-            if (&r < out.front() && (r.height >= p.height || r.height * 16 / 9 / 2 * 2 >= p.width))
+            if (&r + 1 == out.front() && (r.height >= p.height || r.height * 16 / 9 / 2 * 2 >= p.width))
             {
-                if (&r + 1 == out.front())
-                {
-                    out.insert(out.begin(), &r);
-                    break;
-                }
+                out.insert(out.begin(), &r);
+                break;
             }
     return out;
 }
 
+// The H.264 level a rung is encoded at, which its CODECS entry names: 4.2 holds 1080p at 60, 5.2 holds 2160p at 60.
+const char* avc_level(int64_t height)
+{
+    return height > 1080 ? "5.2" : "4.2";
+}
+
 std::string avc_codecs(int64_t height)
 {
-    return height > 1080 ? "avc1.640033" : "avc1.640028";
+    return height > 1080 ? "avc1.640034" : "avc1.64002a";
 }
 
 // The source's own codec as a CODECS entry, for the stream that copies it; empty when no browser plays it.
-std::string source_codecs(const probe& p)
+std::string source_codecs(const media_probe& p)
 {
     char buf[48];
     if (p.vcodec == "h264")
@@ -398,6 +482,12 @@ std::string source_codecs(const probe& p)
     return {};
 }
 
+// Sound that is AAC with two channels or fewer is copied as it is; any other is made stereo AAC.
+bool audio_copies(const media_probe& p)
+{
+    return p.acodec == "aac" && p.achannels > 0 && p.achannels <= 2;
+}
+
 void url_path(std::string& out, std::string_view variant, std::string_view source)
 {
     out += "/~media/";
@@ -406,20 +496,44 @@ void url_path(std::string& out, std::string_view variant, std::string_view sourc
     url_encode_to(out, source, true);
 }
 
-std::string master_text(const probe& p, std::string_view source)
+std::string fps_attr(const media_probe& p)
+{
+    if (p.fps <= 0)
+        return {};
+    char buf[32];
+    std::snprintf(buf, sizeof buf, ",FRAME-RATE=%.3f", p.fps);
+    return buf;
+}
+
+std::string master_text(const media_probe& p, std::string_view source, std::string_view version)
 {
     std::string m = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n";
+    const std::string v = "?v=" + std::string(version);
+    // Subtitles as their own renditions, which every stream names.
+    for (const media_probe::subtitle& s : p.subtitles)
+    {
+        std::string name = !s.title.empty() ? s.title : !s.lang.empty() ? s.lang : "Track " + std::to_string(s.index);
+        std::erase(name, '"');
+        m += "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"" + name + "\"";
+        if (!s.lang.empty())
+            m += ",LANGUAGE=\"" + s.lang + "\"";
+        m += ",AUTOSELECT=YES,DEFAULT=NO,URI=\"";
+        url_path(m, "sub-" + std::to_string(s.index), source);
+        m += "/index.m3u8" + v + "\"\n";
+    }
+    const std::string subs = p.subtitles.empty() ? "" : ",SUBTITLES=\"subs\"";
     const std::string audio = p.audio ? ",mp4a.40.2" : "";
     std::vector<std::string> lines;
     for (const rung* r : rungs_of(p))
     {
         int64_t w = 0, h = 0;
         fitted(p, r->height, w, h);
-        std::string l = "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string((r->kbps + (p.audio ? audio_kbps : 0)) * 1000) +
+        // A segment holds at most a quarter more than the cap over its four seconds, with a buffer of one second's cap.
+        std::string l = "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string((r->kbps * 5 / 4 + (p.audio ? audio_kbps : 0)) * 1000) +
                         ",RESOLUTION=" + std::to_string(w) + "x" + std::to_string(h) + ",CODECS=\"" + avc_codecs(r->height) +
-                        audio + "\"\n";
+                        audio + "\"" + fps_attr(p) + subs + "\n";
         url_path(l, "hls-" + std::to_string(r->height), source);
-        l += "/index.m3u8\n";
+        l += "/index.m3u8" + v + "\n";
         lines.push_back(std::move(l));
     }
     // The first listed is where a player begins: 720p, or the largest below it, before the rest.
@@ -428,16 +542,30 @@ std::string master_text(const probe& p, std::string_view source)
         m += l;
     if (const std::string codecs = source_codecs(p); !codecs.empty())
     {
-        m += "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string(std::max<int64_t>(p.bitrate, 1000000) + audio_kbps * 1000) +
-             ",RESOLUTION=" + std::to_string(p.width) + "x" + std::to_string(p.height) + ",CODECS=\"" + codecs + audio + "\"\n";
+        m += "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string(std::max<int64_t>(p.bitrate, 1000000) * 3 / 2 + audio_kbps * 1000) +
+             ",RESOLUTION=" + std::to_string(p.width) + "x" + std::to_string(p.height) + ",CODECS=\"" + codecs + audio + "\"" +
+             fps_attr(p) + (p.hdr() ? (p.transfer == "smpte2084" ? ",VIDEO-RANGE=PQ" : ",VIDEO-RANGE=HLG") : "") + subs + "\n";
         url_path(m, "hls-copy", source);
-        m += "/index.m3u8\n";
+        m += "/index.m3u8" + v + "\n";
     }
     return m;
 }
 
+void json_str(std::string& o, std::string_view v)
+{
+    o += '"';
+    for (char ch : v)
+    {
+        if (ch == '"' || ch == '\\')
+            o += '\\';
+        if (static_cast<unsigned char>(ch) >= 0x20)
+            o += ch;
+    }
+    o += '"';
+}
+
 // What a browser is asked whether it plays the file itself: its container and codecs as a MIME type.
-std::string info_text(const probe& p)
+std::string info_text(const media_probe& p, std::string_view version)
 {
     std::string mime;
     const std::string v = source_codecs(p);
@@ -453,31 +581,54 @@ std::string info_text(const probe& p)
     if (!mime.empty() && !codecs.empty())
         mime += "; codecs=\"" + codecs + "\"";
     std::string o = "{\"duration\":" + std::to_string(p.duration) + ",\"width\":" + std::to_string(p.width) +
-                    ",\"height\":" + std::to_string(p.height) + ",\"video\":\"" + p.vcodec + "\",\"audio\":\"" + p.acodec +
-                    "\",\"hdr\":" + (p.hdr() ? "true" : "false") + ",\"mime\":\"";
-    for (char ch : mime)
-    {
-        if (ch == '"' || ch == '\\')
-            o += '\\';
-        o += ch;
-    }
-    o += "\",\"renditions\":[";
+                    ",\"height\":" + std::to_string(p.height) + ",\"fps\":" + std::to_string(p.fps) + ",\"video\":";
+    json_str(o, p.vcodec);
+    o += ",\"audio\":";
+    json_str(o, p.acodec);
+    o += ",\"hdr\":";
+    o += p.hdr() ? "true" : "false";
+    o += ",\"mime\":";
+    json_str(o, mime);
+    o += ",\"copy\":";
+    json_str(o, v.empty() ? std::string{} : v + (p.audio ? ",mp4a.40.2" : ""));
+    o += ",\"version\":";
+    json_str(o, version);
+    o += ",\"renditions\":[";
     bool first = true;
     for (const rung* r : rungs_of(p))
     {
         o += (first ? "" : ",") + std::to_string(r->height);
         first = false;
     }
+    o += "],\"subtitles\":[";
+    first = true;
+    for (const media_probe::subtitle& s : p.subtitles)
+    {
+        o += first ? "{" : ",{";
+        first = false;
+        o += "\"index\":" + std::to_string(s.index) + ",\"lang\":";
+        json_str(o, s.lang);
+        o += ",\"title\":";
+        json_str(o, s.title);
+        o += "}";
+    }
     o += "]}";
     return o;
 }
 
-// A rendition's playlist, whole from the start: every segment four seconds, as the job's forced keyframes cut them.
-std::string rendition_text(const probe& p)
+int64_t segments_of(const media_probe& p)
 {
-    const int64_t total = static_cast<int64_t>(std::ceil(p.duration / seg_seconds));
+    return static_cast<int64_t>(std::ceil(p.duration / seg_seconds));
+}
+
+// A rendition's playlist, whole from the start: every segment four seconds, as the job's forced keyframes cut them.
+std::string rendition_text(const media_probe& p, std::string_view version)
+{
+    const int64_t total = segments_of(p);
+    const std::string v = version.empty() ? std::string{} : "?v=" + std::string(version);
     std::string t = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:" + std::to_string(seg_seconds) +
-                    "\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4\"\n";
+                    "\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4" +
+                    v + "\"\n";
     char buf[48];
     for (int64_t i = 0; i < total; ++i)
     {
@@ -485,20 +636,27 @@ std::string rendition_text(const probe& p)
         std::snprintf(buf, sizeof buf, "#EXTINF:%.3f,\n", std::max(d, 0.001));
         t += buf;
         t += seg_name(i);
+        t += v;
         t += '\n';
     }
     t += "#EXT-X-ENDLIST\n";
     return t;
 }
 
-int64_t segments_of(const probe& p)
+// A subtitle's playlist: the whole track as one WebVTT segment as long as the film.
+std::string subtitle_text(const media_probe& p, std::string_view version)
 {
-    return static_cast<int64_t>(std::ceil(p.duration / seg_seconds));
+    const int64_t secs = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(p.duration)));
+    char buf[48];
+    std::snprintf(buf, sizeof buf, "#EXTINF:%.3f,\n", std::max(p.duration, 1.0));
+    return "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:" + std::to_string(secs) +
+           "\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n" + buf + "subs.vtt" +
+           (version.empty() ? std::string{} : "?v=" + std::string(version)) + "\n#EXT-X-ENDLIST\n";
 }
 
 // ─── A rendition's jobs, one per stretch of the film ────────────────────────
-// Each job has three files under <dir>/jobs/: <from>.lock, held by the shard running it; <from>.pos, the next
-// segment it writes; <from>.want, the furthest segment its players asked for, touched at every ask.
+// Each job has files under <dir>/jobs/: <from>.lock, held by the shard running it; <from>.pos, the next segment it
+// writes; <from>.want, the furthest segment its players asked for, touched at every ask; <from>.pid, its ffmpeg.
 
 std::string job_file(const std::string& dir, int64_t from, std::string_view ext)
 {
@@ -515,12 +673,7 @@ int64_t read_int(const std::string& path, int64_t fallback)
 
 void write_int(const std::string& path, int64_t v)
 {
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0)
-        return;
-    const std::string s = std::to_string(v);
-    if (::write(fd, s.data(), s.size()) < 0) {}
-    ::close(fd);
+    write_small(path, std::to_string(v));
 }
 
 // A player's ask, which moves the job's furthest point forward and says, by the file's time, that it is watched.
@@ -534,7 +687,7 @@ void note_asked(const std::string& path, int64_t seg)
 
 void drop_job_files(const std::string& dir, int64_t from)
 {
-    for (const char* ext : {".pos", ".want", ".log", ".m3u8", ".lock"})
+    for (const char* ext : {".pos", ".want", ".log", ".m3u8", ".pid", ".lock"})
         ::unlink(job_file(dir, from, ext).c_str());
     ::unlink(job_file(dir, from, "-init.mp4").c_str());
 }
@@ -544,7 +697,8 @@ struct region
     int64_t from, next;
 };
 
-// The jobs of a rendition that are running, on any shard; one whose lock nobody holds is gone, and is cleared away.
+// The jobs of a rendition that are running, on any shard; one whose lock nobody holds is gone, and is cleared away
+// with any ffmpeg of it a dead worker left.
 std::vector<region> live_regions(const std::string& dir)
 {
     std::vector<region> out;
@@ -562,12 +716,17 @@ std::vector<region> live_regions(const std::string& dir)
     ::closedir(d);
     for (const int64_t from : froms)
     {
-        const int fd = ::open(job_file(dir, from, ".lock").c_str(), O_RDWR | O_CLOEXEC);
+        const std::string lock = job_file(dir, from, ".lock");
+        const int fd = ::open(lock.c_str(), O_RDWR | O_CLOEXEC);
         if (fd < 0)
             continue;
         if (::flock(fd, LOCK_EX | LOCK_NB) == 0)
         {
-            drop_job_files(dir, from);
+            if (locked_fresh(fd, lock))
+            {
+                kill_orphan(job_file(dir, from, ".pid"), dir);
+                drop_job_files(dir, from);
+            }
             ::close(fd);
             continue;
         }
@@ -584,6 +743,47 @@ bool all_made(const std::string& dir, int64_t total)
         if (!exists(dir + "/" + seg_name(i)))
             return false;
     return total > 0;
+}
+
+// A medium's ETag: the object's version and the file, which is all a medium's bytes depend on.
+std::string media_etag(std::string_view version, std::string_view file)
+{
+    return "\"" + std::string(version) + "-" + std::string(file) + "\"";
+}
+
+bool etag_matches(std::string_view if_none_match, std::string_view etag)
+{
+    return !if_none_match.empty() && (if_none_match == "*" || if_none_match.find(etag) != std::string_view::npos);
+}
+
+// A Range header's one range over a body of `len`: false when there is none or it is not one this answers.
+bool one_range(std::string_view h, uint64_t len, uint64_t& off, uint64_t& n)
+{
+    if (!h.starts_with("bytes=") || h.find(',') != std::string_view::npos || len == 0)
+        return false;
+    h.remove_prefix(6);
+    const size_t dash = h.find('-');
+    if (dash == std::string_view::npos)
+        return false;
+    uint64_t a = 0, b = 0;
+    const std::string_view first = h.substr(0, dash), last = h.substr(dash + 1);
+    if (first.empty())
+    {
+        if (!parse_uint(last, b) || b == 0)
+            return false;
+        off = b >= len ? 0 : len - b;
+        n = len - off;
+        return true;
+    }
+    if (!parse_uint(first, a) || a >= len)
+        return false;
+    if (last.empty())
+        b = len - 1;
+    else if (!parse_uint(last, b) || b < a)
+        return false;
+    off = a;
+    n = std::min(b, len - 1) - a + 1;
+    return true;
 }
 
 }   // namespace
@@ -609,6 +809,7 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
     w.variant.assign(variant);
     w.head = r.method == "HEAD";
     uint64_t size = 0;
+    int64_t index = 0;
     std::string_view source = rest;
     const size_t last = source.rfind('/');
     const std::string_view file = last == std::string_view::npos ? std::string_view{} : source.substr(last + 1);
@@ -628,6 +829,12 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         w.file.assign(file);
         source = source.substr(0, last);
     }
+    else if (sub_index(variant, index) && (file == "index.m3u8" || file == "subs.vtt"))
+    {
+        w.kind = k_sub;
+        w.file.assign(file);
+        source = source.substr(0, last);
+    }
     else if ((variant == "hls-copy" || rendition_of(variant)) && (file == "index.m3u8" || stream_file(file, w.seg)))
     {
         w.kind = variant == "hls-copy" ? k_copy : k_rendition;
@@ -636,8 +843,8 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
     }
     else
     {
-        app_reply(c, 404, "No such medium: thumb-<width>/<object>, hls/<object>/master.m3u8, or hls-<height>|hls-copy/"
-                          "<object>/index.m3u8 and its segments.\n");
+        app_reply(c, 404, "No such medium: thumb-<width>/<object>, info/<object>, hls/<object>/master.m3u8, "
+                          "hls-<height>|hls-copy/<object>/index.m3u8 and its segments, or sub-<stream>/<object>/subs.vtt.\n");
         return;
     }
     w.source.assign(source);
@@ -699,26 +906,89 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         }
         // A medium is the object's as it is now, so a new version of it is made anew.
         const std::string media_dir = m_store.options().dir + "/.media";
-        if (::mkdir(media_dir.c_str(), 0700) < 0 && errno != EEXIST)
+        if (!m_media_dir_ready)
         {
-            app_reply(cc, 500, "The media cache cannot be made.\n");
+            if (::mkdir(media_dir.c_str(), 0700) < 0 && errno != EEXIST)
+            {
+                app_reply(cc, 500, "The media cache cannot be made.\n");
+                return;
+            }
+            m_media_dir_ready = true;
+        }
+        const std::string etag = m.etag();
+        w.image = m.content_type.str().starts_with("image/");
+        w.object = w.bucket + '\n' + w.key + '\n' + etag;
+        w.version = etag.substr(0, 16);
+        w.dir = media_dir + "/" + sha256_hex(w.variant + '\n' + w.object);
+        w.probe_dir = media_dir + "/" + sha256_hex("probe\n" + w.object);
+        w.asked_ms = now_ms();
+        w.deadline_ms = w.asked_ms + media_wait_ms;
+        // An unencrypted object's file, opened once a minute a shard, is what ffmpeg reads; a medium made needs none.
+        const bool made = m_media_done.contains(w.dir);
+        if (made || is_encrypted(m) || m_media_srcs.contains(w.object))
+        {
+            media_continue(cc, std::move(w));
             return;
         }
-        w.image = m.content_type.str().starts_with("image/");
-        const std::string object = '\n' + w.bucket + '\n' + w.key + '\n' + m.etag();
-        w.dir = media_dir + "/" + sha256_hex(w.variant + object);
-        w.probe_dir = media_dir + "/" + sha256_hex("probe" + object);
-        w.deadline_ms = now_ms() + media_wait_ms;
-        if (media_try(cc, w))
-            return;
-        m_media_waits.emplace_back(cc, std::move(w));
-        media_arm();
+        std::weak_ptr<conn> weak2 = cc;
+        const std::string b = w.bucket, k = w.key;
+        m_store.open_object(b, k, 0, [this, weak2, want2 = std::move(w), etag](open_result o) mutable
+        {
+            if (o.status == st::ok && o.fd >= 0 && !is_encrypted(o.meta) && o.meta.etag() == etag &&
+                !m_media_srcs.contains(want2.object))
+            {
+                m_media_srcs[want2.object] = {o.fd, o.data_off, o.meta.size, now_ms()};
+                o.fd = -1;
+            }
+            if (o.fd >= 0)
+                m_loop.close_fd(o.fd);
+            if (auto c2 = weak2.lock(); c2 && !c2->dead)
+                media_continue(c2, std::move(want2));
+        });
     });
+}
+
+void storage_run::media_continue(const std::shared_ptr<conn>& c, media_want w)
+{
+    if (media_try(c, w))
+        return;
+    m_media_waits.emplace_back(c, std::move(w));
+    media_arm();
+}
+
+std::shared_ptr<const media_probe> storage_run::media_probe_of(const std::string& probe_dir)
+{
+    if (auto it = m_media_probes.find(probe_dir); it != m_media_probes.end())
+    {
+        media_touch(probe_dir);
+        return it->second;
+    }
+    std::string text;
+    auto p = std::make_shared<media_probe>();
+    if (!exists(probe_dir + "/done") || !read_small(probe_dir + "/probe.json", text) || !parse_probe(text, *p))
+        return nullptr;
+    if (m_media_probes.size() > 1024)
+        m_media_probes.clear();
+    m_media_probes.emplace(probe_dir, p);
+    return p;
+}
+
+void storage_run::media_touch(const std::string& dir)
+{
+    const int64_t now = now_ms();
+    auto& last = m_media_touched[dir];
+    if (now - last < touch_every_ms)
+        return;
+    last = now;
+    ::utimensat(AT_FDCWD, (dir + "/lock").c_str(), nullptr, 0);
+    if (m_media_touched.size() > 4096)
+        m_media_touched.clear();
 }
 
 void storage_run::media_source(const std::shared_ptr<conn>& c, std::string_view rest)
 {
-    // ffmpeg's own reads, signed by the runtime that started it and good for a while.
+    // ffmpeg's own reads of an object it cannot read as a file, signed by the runtime that started it, good for a
+    // while, and for the version it was started for.
     s3_request& r = c->req;
     const size_t slash = rest.find('/');
     uint64_t expires = 0;
@@ -731,7 +1001,8 @@ void storage_run::media_source(const std::shared_ptr<conn>& c, std::string_view 
     if (m_media_key.empty())
         m_media_key = media_key(m_store.options().dir + "/.media");
     std::string bucket(rest.substr(0, slash)), key(rest.substr(slash + 1));
-    const std::string want = hmac_hex(m_media_key, bucket + '\n' + key + '\n' + std::to_string(expires));
+    const std::string etag(r.get_query("e"));
+    const std::string want = hmac_hex(m_media_key, bucket + '\n' + key + '\n' + etag + '\n' + std::to_string(expires));
     const std::string_view got = r.get_query("s");
     if (m_media_key.empty() || want.empty() || got.size() != want.size() ||
         CRYPTO_memcmp(got.data(), want.data(), want.size()) != 0)
@@ -744,6 +1015,12 @@ void storage_run::media_source(const std::shared_ptr<conn>& c, std::string_view 
     r.key    = std::move(key);
     r.query.clear();
     r.app = 0;
+    // An object written over since is refused, so a medium's cache never holds another version's bytes.
+    if (!etag.empty())
+    {
+        c->app_header = "\"" + etag + "\"";
+        r.headers.push_back({"if-match", c->app_header});
+    }
     c->anonymous = true;
     c->user.reset();
     c->hook = nullptr;
@@ -756,39 +1033,92 @@ bool storage_run::media_serve(const std::shared_ptr<conn>& c, const media_want& 
     if (fd < 0)
         return false;
     struct stat fs{};
-    ::fstat(fd, &fs);
-    ::utimensat(AT_FDCWD, (w.dir + "/lock").c_str(), nullptr, 0);
-    response head;
+    if (::fstat(fd, &fs) != 0)
+    {
+        ::close(fd);
+        return false;
+    }
+    media_touch(w.dir);
     const std::string_view f = w.file;
+    const std::string etag = media_etag(w.version, f);
+    response head;
     head.headers.emplace_back("Content-Type", f.ends_with(".jpg")  ? "image/jpeg"
                                             : f.ends_with(".m3u8") ? "application/vnd.apple.mpegurl"
+                                            : f.ends_with(".vtt")  ? "text/vtt; charset=utf-8"
                                             : f.ends_with(".mp4")  ? "video/mp4"
                                                                    : "video/iso.segment");
-    // A playlist still growing is asked for again, and what is done does not change.
-    head.headers.emplace_back("Cache-Control", growing ? "no-cache" : "private, max-age=86400");
-    const uint64_t len = static_cast<uint64_t>(fs.st_size);
+    // A URL that names the version never changes; one that does not is asked again, and answered 304 while it holds.
+    head.headers.emplace_back("Cache-Control", growing ? "no-cache"
+                                             : c->req.has_query("v") ? "private, max-age=31536000, immutable"
+                                                                     : "private, no-cache");
+    if (!growing)
+        head.headers.emplace_back("ETag", etag);
+    head.headers.emplace_back("Accept-Ranges", "bytes");
     ++m_c.media_served;
+    uint64_t off = 0, len = static_cast<uint64_t>(fs.st_size);
+    if (!growing && etag_matches(c->req.header("if-none-match"), etag))
+    {
+        ::close(fd);
+        head.status = 304;
+        head.head_only = true;
+        head.has_length_override = true;
+        head.length_override = 0;
+        send_response(c, std::move(head));
+        return true;
+    }
+    if (uint64_t ro = 0, rn = 0; one_range(c->req.header("range"), len, ro, rn))
+    {
+        head.status = 206;
+        head.headers.emplace_back("Content-Range", "bytes " + std::to_string(ro) + "-" + std::to_string(ro + rn - 1) + "/" +
+                                                       std::to_string(len));
+        off = ro;
+        len = rn;
+    }
     if (w.head)
     {
-        m_loop.close_fd(fd);
+        ::close(fd);
         head.head_only = true;
         head.has_length_override = true;
         head.length_override = len;
         send_response(c, std::move(head));
+        return true;
     }
-    else
-        send_file(c, std::move(head), fd, 0, len);
+    // A thumbnail, a playlist or an init segment goes out with its head in one write.
+    if (len <= small_file)
+    {
+        head.body.resize(len);
+        const ssize_t got = ::pread(fd, head.body.data(), len, static_cast<off_t>(off));
+        ::close(fd);
+        if (got != static_cast<ssize_t>(len))
+            return false;
+        send_response(c, std::move(head));
+        return true;
+    }
+    send_file(c, std::move(head), fd, off, len);
     return true;
 }
 
 bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
 {
     struct stat sb{};
-    // The playlists of a rendition and the master are written from the probe, which is made first and kept.
-    if (w.kind == k_master || w.kind == k_rendition || w.kind == k_info)
+    // A file of a medium made whole is served as it is, without the probe it was made from.
+    if (w.kind == k_thumb || w.kind == k_copy || (w.kind == k_sub && w.file == "subs.vtt") ||
+        (w.kind == k_rendition && w.file != "index.m3u8"))
     {
-        probe p;
-        if (!read_probe(w.probe_dir, p))
+        const bool done = m_media_done.contains(w.dir) || ::stat((w.dir + "/done").c_str(), &sb) == 0;
+        if (done)
+        {
+            m_media_done.insert(w.dir);
+            if (media_serve(c, w, false))
+                return true;
+        }
+    }
+    // Everything but a thumbnail is made from the probe, which is made first, once, and kept.
+    std::shared_ptr<const media_probe> pp;
+    if (w.kind != k_thumb)
+    {
+        pp = media_probe_of(w.probe_dir);
+        if (!pp)
         {
             if (::stat((w.probe_dir + "/failed").c_str(), &sb) == 0 && now_ms() - mtime_ms(sb) < failed_hold_ms)
             {
@@ -800,7 +1130,6 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
                 app_reply(c, 504, "The medium is still being looked at; ask again.\n");
                 return true;
             }
-            // The probe is made once, by whichever shard takes its lock, and every request waits on its answer.
             media_want pw = w;
             pw.kind = k_probe;
             pw.variant = "probe";
@@ -810,9 +1139,11 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
                 app_reply(c, 500, "The media cache cannot be written.\n");
                 return true;
             }
-            const int lock_fd = ::open((w.probe_dir + "/lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-            if (lock_fd >= 0 && ::flock(lock_fd, LOCK_EX | LOCK_NB) == 0)
+            const std::string lock = w.probe_dir + "/lock";
+            const int lock_fd = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+            if (lock_fd >= 0 && ::flock(lock_fd, LOCK_EX | LOCK_NB) == 0 && locked_fresh(lock_fd, lock))
             {
+                kill_orphan(w.probe_dir + "/pid", w.probe_dir);
                 if (exists(w.probe_dir + "/done") || !media_start(pw, lock_fd, 0))
                     ::close(lock_fd);
             }
@@ -820,48 +1151,75 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
                 ::close(lock_fd);
             return false;
         }
-        if (w.kind == k_info)
+    }
+    const media_probe* p = pp.get();
+    if (w.kind == k_info || w.kind == k_master || (w.kind == k_rendition && w.file == "index.m3u8") ||
+        (w.kind == k_sub && w.file == "index.m3u8"))
+    {
+        if (w.kind != k_info && p->vcodec.empty() && w.kind != k_master && w.kind != k_sub)
         {
-            app_reply(c, 200, info_text(p), "application/json");
+            app_reply(c, 415, "This object has no picture to stream.\n");
             return true;
         }
-        if (p.vcodec.empty() && w.kind != k_master)
+        if (w.kind == k_rendition && p->duration <= 0)
         {
-            app_reply(c, 415, "This object has no picture to stream; its master playlist has none either.\n");
+            app_reply(c, 415, "A stream of this length cannot be cut; ask for hls-copy.\n");
             return true;
         }
-        if (w.kind == k_master || w.file == "index.m3u8")
+        int64_t index = 0;
+        if (w.kind == k_sub && (!sub_index(w.variant, index) ||
+                                std::ranges::none_of(p->subtitles, [&](const auto& s) { return s.index == index; })))
         {
-            if (p.duration <= 0 && w.kind == k_rendition)
-            {
-                app_reply(c, 415, "A stream of this length cannot be cut; ask for hls-copy.\n");
-                return true;
-            }
-            std::string text = w.kind == k_master ? master_text(p, w.source) : rendition_text(p);
-            ++m_c.media_served;
-            response r;
-            r.headers.emplace_back("Content-Type", "application/vnd.apple.mpegurl");
-            r.headers.emplace_back("Cache-Control", "private, max-age=3600");
-            if (w.head)
-            {
-                r.head_only = true;
-                r.has_length_override = true;
-                r.length_override = text.size();
-            }
-            else
-                r.body = std::move(text);
-            send_response(c, std::move(r));
+            app_reply(c, 404, "No such text subtitle stream.\n");
             return true;
         }
-        if (w.seg >= segments_of(p))
+        std::string text = w.kind == k_info       ? info_text(*p, w.version)
+                         : w.kind == k_master     ? master_text(*p, w.source, w.version)
+                         : w.kind == k_rendition  ? rendition_text(*p, w.version)
+                                                  : subtitle_text(*p, w.version);
+        const std::string etag = media_etag(w.version, w.variant + "/" + w.file);
+        ++m_c.media_served;
+        response r;
+        r.headers.emplace_back("Content-Type", w.kind == k_info ? "application/json" : "application/vnd.apple.mpegurl");
+        // The master and the info name the object's current version, so they are asked again; the rest are fixed by it.
+        r.headers.emplace_back("Cache-Control", (w.kind == k_master || w.kind == k_info || !c->req.has_query("v"))
+                                                    ? "private, no-cache" : "private, max-age=31536000, immutable");
+        r.headers.emplace_back("ETag", etag);
+        if (etag_matches(c->req.header("if-none-match"), etag))
+        {
+            r.status = 304;
+            r.head_only = true;
+            r.has_length_override = true;
+            r.length_override = 0;
+        }
+        else
+            r.body = std::move(text);
+        send_response(c, std::move(r));
+        return true;
+    }
+    if (w.kind == k_rendition)
+    {
+        if (w.seg >= segments_of(*p))
         {
             app_reply(c, 404, "No such segment: the film is shorter.\n");
             return true;
         }
         return media_segment(c, w);
     }
+    if (w.kind == k_sub)
+    {
+        int64_t index = 0;
+        if (!sub_index(w.variant, index) || std::ranges::none_of(p->subtitles, [&](const auto& s) { return s.index == index; }))
+        {
+            app_reply(c, 404, "No such text subtitle stream.\n");
+            return true;
+        }
+    }
 
-    const bool done = ::stat((w.dir + "/done").c_str(), &sb) == 0;
+    // A thumbnail, a subtitle track and a copied stream: one job each, made whole, kept.
+    const bool done = m_media_done.contains(w.dir) || ::stat((w.dir + "/done").c_str(), &sb) == 0;
+    if (done)
+        m_media_done.insert(w.dir);
     const std::string lock = w.dir + "/lock";
     if ((done || w.kind == k_copy) && media_serve(c, w, w.kind == k_copy && !done && w.file == "index.m3u8"))
         return true;
@@ -881,7 +1239,7 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
         return true;
     }
     // Whoever holds the lock is making it, here or on another shard, and a request for it keeps it wanted.
-    ::utimensat(AT_FDCWD, lock.c_str(), nullptr, 0);
+    media_touch(w.dir);
     const bool stream = w.kind == k_copy;
     const auto same_kind = std::ranges::count_if(m_media_jobs, [&](const media_job& j) {
         return (j.want.kind == k_copy || j.want.kind == k_rendition) == stream;
@@ -899,11 +1257,12 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
         app_reply(c, 500, "The media cache cannot be written.\n");
         return true;
     }
-    if (::flock(lock_fd, LOCK_EX | LOCK_NB) != 0)
+    if (::flock(lock_fd, LOCK_EX | LOCK_NB) != 0 || !locked_fresh(lock_fd, lock))
     {
         ::close(lock_fd);
         return false;
     }
+    kill_orphan(w.dir + "/pid", w.dir);
     // It may have been finished between the look and the lock.
     if (::stat((w.dir + "/done").c_str(), &sb) == 0)
     {
@@ -922,6 +1281,10 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
 
 bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want& w)
 {
+    struct stat sb{};
+    // A rendition made whole is served without a look at its jobs.
+    if (m_media_done.contains(w.dir) && media_serve(c, w, false))
+        return true;
     const std::vector<region> live = live_regions(w.dir);
     // A player's progress, also through what was made ahead of it, is what lets a job held still go on.
     auto note = [&](const region& r, int64_t seg)
@@ -951,27 +1314,55 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
         app_reply(c, 504, "The segment is still being made; ask again.\n");
         return true;
     }
+    // A rendition ffmpeg failed on is answered so for a while, and segments past the picture's end are none.
+    if (::stat((w.dir + "/failed").c_str(), &sb) == 0 && now_ms() - mtime_ms(sb) < failed_hold_ms)
+    {
+        app_reply(c, 415, "ffmpeg could not make this from the object.\n");
+        return true;
+    }
     const int64_t seg = std::max<int64_t>(w.seg, 0);
-    ::utimensat(AT_FDCWD, (w.dir + "/lock").c_str(), nullptr, 0);
+    if (seg >= read_int(w.dir + "/end", INT64_MAX))
+    {
+        app_reply(c, 404, "No such segment: the picture ends before it.\n");
+        return true;
+    }
+    media_touch(w.dir);
     // A job at it or a little before it is waited for; the init segment comes from any job.
     for (const region& r : live)
         if (w.seg < 0 || (seg >= r.from && seg <= r.next + seek_beyond))
             return false;
-    // Nothing near it: a seek, or the first player, and a job begins at the segment asked for.
-    const auto streams = std::ranges::count_if(m_media_jobs, [](const media_job& j) {
+    // An init segment with no job waits a moment for the segment request that begins the job the player wants.
+    if (w.seg < 0 && now_ms() - w.asked_ms < init_grace_ms)
+        return false;
+    // Nothing near it: a seek, or the first player, and a job begins at the segment asked for, making room by
+    // ending a job held still that nobody asks of.
+    auto streams = std::ranges::count_if(m_media_jobs, [](const media_job& j) {
         return j.want.kind == k_copy || j.want.kind == k_rendition;
     });
     if (streams >= hls_jobs_max)
-        return false;
+    {
+        size_t oldest = m_media_jobs.size();
+        for (size_t i = 0; i < m_media_jobs.size(); ++i)
+            if (m_media_jobs[i].want.kind == k_rendition && m_media_jobs[i].paused &&
+                now_ms() - m_media_jobs[i].asked_ms > unasked_ms &&
+                (oldest == m_media_jobs.size() || m_media_jobs[i].asked_ms < m_media_jobs[oldest].asked_ms))
+                oldest = i;
+        if (oldest == m_media_jobs.size())
+            return false;
+        media_end_rendition(oldest, true);
+        --streams;
+    }
     if ((::mkdir(w.dir.c_str(), 0700) < 0 && errno != EEXIST) || (::mkdir((w.dir + "/jobs").c_str(), 0700) < 0 && errno != EEXIST))
     {
         app_reply(c, 500, "The media cache cannot be written.\n");
         return true;
     }
-    const int lock_fd = ::open(job_file(w.dir, seg, ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    const std::string lock = job_file(w.dir, seg, ".lock");
+    const int lock_fd = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     const int share_fd = ::open((w.dir + "/lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     // Another shard began here a moment ago, or the rendition is being evicted: either way, a look again shortly.
-    if (lock_fd < 0 || share_fd < 0 || ::flock(lock_fd, LOCK_EX | LOCK_NB) != 0 || ::flock(share_fd, LOCK_SH | LOCK_NB) != 0)
+    if (lock_fd < 0 || share_fd < 0 || ::flock(lock_fd, LOCK_EX | LOCK_NB) != 0 || !locked_fresh(lock_fd, lock) ||
+        ::flock(share_fd, LOCK_SH | LOCK_NB) != 0)
     {
         if (lock_fd >= 0)
             ::close(lock_fd);
@@ -995,46 +1386,75 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
 
 bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
 {
-    // ffmpeg reads the object over the listener, which serves it decrypted and in ranges as any client is.
-    sockaddr_storage ss{};
-    socklen_t sl = sizeof ss;
-    if (::getsockname(m_listen_fd, reinterpret_cast<sockaddr*>(&ss), &sl) < 0)
-        return false;
-    std::string host;
-    uint16_t port = 0;
-    if (ss.ss_family == AF_INET)
+    // An unencrypted object is read from its open file, past its header; any other over the listener, which
+    // serves it decrypted and in ranges as any client is.
+    int src_fd = -1;
+    std::string url;
+    if (auto it = m_media_srcs.find(w.object); it != m_media_srcs.end())
     {
-        const auto* a = reinterpret_cast<const sockaddr_in*>(&ss);
-        char buf[INET_ADDRSTRLEN];
-        host = a->sin_addr.s_addr == htonl(INADDR_ANY) ? "127.0.0.1" : ::inet_ntop(AF_INET, &a->sin_addr, buf, sizeof buf);
-        port = ntohs(a->sin_port);
-    }
-    else if (ss.ss_family == AF_INET6)
-    {
-        const auto* a = reinterpret_cast<const sockaddr_in6*>(&ss);
-        char buf[INET6_ADDRSTRLEN];
-        host = "[" + std::string(IN6_IS_ADDR_UNSPECIFIED(&a->sin6_addr) ? "::1" : ::inet_ntop(AF_INET6, &a->sin6_addr, buf, sizeof buf)) + "]";
-        port = ntohs(a->sin6_port);
+        it->second.used_ms = now_ms();
+        src_fd = it->second.fd;
+        url = "subfile,,start," + std::to_string(it->second.off) + ",end," + std::to_string(it->second.off + it->second.len) +
+              ",,:/proc/self/fd/3";
     }
     else
-        return false;
-    if (m_media_key.empty())
-        m_media_key = media_key(m_store.options().dir + "/.media");
-    if (m_media_key.empty())
-        return false;
-    const int64_t expires = now_ms() / 1000 + source_ttl_s;
-    std::string url = std::string(tls_enabled() ? "https://" : "http://") + host + ":" + std::to_string(port) + "/~media/src/";
-    url_encode_to(url, w.bucket, true);
-    url += '/';
-    url_encode_to(url, w.key, true);
-    url += "?t=" + std::to_string(expires) + "&s=" + hmac_hex(m_media_key, w.bucket + '\n' + w.key + '\n' + std::to_string(expires));
+    {
+        sockaddr_storage ss{};
+        socklen_t sl = sizeof ss;
+        if (::getsockname(m_listen_fd, reinterpret_cast<sockaddr*>(&ss), &sl) < 0)
+            return false;
+        std::string host;
+        uint16_t port = 0;
+        if (ss.ss_family == AF_INET)
+        {
+            const auto* a = reinterpret_cast<const sockaddr_in*>(&ss);
+            char buf[INET_ADDRSTRLEN];
+            host = a->sin_addr.s_addr == htonl(INADDR_ANY) ? "127.0.0.1" : ::inet_ntop(AF_INET, &a->sin_addr, buf, sizeof buf);
+            port = ntohs(a->sin_port);
+        }
+        else if (ss.ss_family == AF_INET6)
+        {
+            const auto* a = reinterpret_cast<const sockaddr_in6*>(&ss);
+            char buf[INET6_ADDRSTRLEN];
+            host = "[" + std::string(IN6_IS_ADDR_UNSPECIFIED(&a->sin6_addr) ? "::1" : ::inet_ntop(AF_INET6, &a->sin6_addr, buf, sizeof buf)) + "]";
+            port = ntohs(a->sin6_port);
+        }
+        else
+            return false;
+        if (m_media_key.empty())
+            m_media_key = media_key(m_store.options().dir + "/.media");
+        if (m_media_key.empty())
+            return false;
+        const int64_t expires = now_ms() / 1000 + source_ttl_s;
+        const std::string etag = w.object.substr(w.object.rfind('\n') + 1);
+        url = std::string(tls_enabled() ? "https://" : "http://") + host + ":" + std::to_string(port) + "/~media/src/";
+        url_encode_to(url, w.bucket, true);
+        url += '/';
+        url_encode_to(url, w.key, true);
+        url += "?t=" + std::to_string(expires) + "&e=" + etag + "&s=" +
+               hmac_hex(m_media_key, w.bucket + '\n' + w.key + '\n' + etag + '\n' + std::to_string(expires));
+    }
 
-    // ffmpeg's reads survive a pause long enough for the listener to let them go.
-    const std::vector<std::string> input = {"-reconnect", "1", "-reconnect_on_network_error", "1", "-i", url};
+    // Reads over the listener survive a pause long enough for it to let them go; a file's need nothing of the sort.
+    std::vector<std::string> input;
+    if (src_fd < 0)
+        input = {"-reconnect", "1", "-reconnect_on_network_error", "1"};
+    input.insert(input.end(), {"-i", url});
+    // As many encoder threads as cores, rather than x264's half again as many, when several jobs share them.
+    const std::string threads = std::to_string(std::max(1u, std::thread::hardware_concurrency()));
     std::vector<std::string> args = {m_ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"};
     std::string out_file;
     media_job j;
-    probe p;
+    std::shared_ptr<const media_probe> pp;
+    if (w.kind == k_copy || w.kind == k_rendition)
+    {
+        pp = media_probe_of(w.probe_dir);
+        if (!pp)
+            return false;
+    }
+    const std::vector<std::string> audio = !pp || !pp->audio ? std::vector<std::string>{}
+                                         : audio_copies(*pp) ? std::vector<std::string>{"-c:a", "copy"}
+                                         : std::vector<std::string>{"-c:a", "aac", "-aac_coder", "fast", "-b:a", "160k", "-ac", "2"};
     switch (w.kind)
     {
         case k_thumb:
@@ -1053,20 +1473,35 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
         case k_probe:
         {
             clear_dir(w.dir, true);
-            args = {ffprobe_path(m_ffmpeg), "-v", "error", "-print_format", "json", "-show_format", "-show_streams",
-                    "-reconnect", "1", url};
+            args = {ffprobe_path(m_ffmpeg), "-v", "error", "-print_format", "json", "-show_format", "-show_streams"};
             if (args.front().empty())
                 return false;
+            if (src_fd < 0)
+                args.insert(args.end(), {"-reconnect", "1"});
+            args.push_back(url);
             out_file = w.dir + "/probe.json.tmp";
+            break;
+        }
+        case k_sub:
+        {
+            int64_t index = 0;
+            sub_index(w.variant, index);
+            clear_dir(w.dir, true);
+            args.insert(args.end(), input.begin(), input.end());
+            args.insert(args.end(), {"-map", "0:" + std::to_string(index), "-c:s", "webvtt", "-f", "webvtt",
+                                     w.dir + "/subs.tmp.vtt"});
             break;
         }
         case k_copy:
         {
             clear_dir(w.dir, true);
             args.insert(args.end(), input.begin(), input.end());
-            // The picture as it is; the sound made AAC, which every player plays and AC3 or DTS is not.
-            args.insert(args.end(), {"-map", "0:v:0?", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
-                                     "-ac", "2", "-f", "hls", "-hls_time", std::to_string(seg_seconds),
+            args.insert(args.end(), {"-map", "0:v:0?", "-map", "0:a:0?", "-c:v", "copy"});
+            // HEVC as hvc1, the tag Apple's players take it in.
+            if (pp->vcodec == "hevc")
+                args.insert(args.end(), {"-tag:v", "hvc1"});
+            args.insert(args.end(), audio.begin(), audio.end());
+            args.insert(args.end(), {"-f", "hls", "-hls_time", std::to_string(seg_seconds),
                                      "-hls_playlist_type", "event", "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename",
                                      "init.mp4", "-hls_flags", "temp_file+independent_segments", "-hls_segment_filename",
                                      w.dir + "/seg%05d.m4s", w.dir + "/index.m3u8"});
@@ -1074,8 +1509,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
         }
         case k_rendition:
         {
-            if (!read_probe(w.probe_dir, p))
-                return false;
+            const media_probe& p = *pp;
             const rung* r = rendition_of(w.variant);
             int64_t width = 0, height = 0;
             fitted(p, r->height, width, height);
@@ -1091,17 +1525,18 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             args.insert(args.end(), {"-ss", offset});
             args.insert(args.end(), input.begin(), input.end());
             // Jellyfin's motion search: a fifth less CPU for an SSIM of 0.9690 against 0.9695, and no keyframe at a
-            // scene cut, so every segment is cut where the forced ones are.
+            // scene cut, so every segment is cut where the forced ones are. The buffer is one second of the cap, so a
+            // segment holds at most a quarter more than the cap over its four seconds, as BANDWIDTH says.
             args.insert(args.end(), {"-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                                      "-x264-params", "subme=0:me_range=16:rc_lookahead=10:me=hex:open_gop=0",
-                                     "-sc_threshold", "0",
-                                     "-maxrate", std::to_string(r->kbps) + "k", "-bufsize", std::to_string(r->kbps * 2) + "k",
+                                     "-sc_threshold", "0", "-threads", threads, "-level:v", avc_level(r->height),
+                                     "-maxrate", std::to_string(r->kbps) + "k", "-bufsize", std::to_string(r->kbps) + "k",
                                      "-vf", vf, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-                                     "-force_key_frames", "expr:gte(t,n_forced*" + std::to_string(seg_seconds) + ")",
-                                     "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-avoid_negative_ts", "disabled",
-                                     // The film's time in every fragment and none in the init, so that any job's init
-                                     // fits every job's segments.
-                                     "-output_ts_offset", offset, "-hls_segment_options", "movflags=+frag_discont",
+                                     "-force_key_frames", "expr:gte(t,n_forced*" + std::to_string(seg_seconds) + ")"});
+            args.insert(args.end(), audio.begin(), audio.end());
+            // The film's time in every fragment and none in the init, so that any job's init fits every job's segments.
+            args.insert(args.end(), {"-avoid_negative_ts", "disabled", "-output_ts_offset", offset,
+                                     "-hls_segment_options", "movflags=+frag_discont",
                                      "-f", "hls", "-hls_time", std::to_string(seg_seconds),
                                      "-hls_playlist_type", "event", "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename",
                                      std::to_string(from) + "-init.mp4", "-hls_flags", "temp_file+independent_segments",
@@ -1131,8 +1566,10 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
                                      O_WRONLY | O_CREAT | O_TRUNC, 0600);
     const std::string log = w.kind == k_rendition ? job_file(w.dir, from, ".log") : w.dir + "/log";
     posix_spawn_file_actions_addopen(&fa, 2, log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    // Nothing else of the worker's goes with it, so a listener or a ring is never held open by an ffmpeg.
-    posix_spawn_file_actions_addclosefrom_np(&fa, 3);
+    // The object's file as fd 3, and nothing else of the worker's, so a listener or a ring is never held by ffmpeg.
+    if (src_fd >= 0)
+        posix_spawn_file_actions_adddup2(&fa, src_fd, 3);
+    posix_spawn_file_actions_addclosefrom_np(&fa, src_fd >= 0 ? 4 : 3);
     // The worker ignores SIGPIPE, which ffmpeg is given back, and blocks nothing it should inherit.
     sigset_t def, none;
     sigemptyset(&def);
@@ -1147,6 +1584,10 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
     posix_spawnattr_destroy(&attr);
     if (rc != 0)
         return false;
+    if (src_fd >= 0)
+        ++m_c.media_direct;
+    // The pid, by which a later worker finds an ffmpeg this one leaves behind when it dies.
+    write_int(w.kind == k_rendition ? job_file(w.dir, from, ".pid") : w.dir + "/pid", pid);
     ::futimens(lock_fd, nullptr);
     j.pid = pid;
     j.lock_fd = lock_fd;
@@ -1161,16 +1602,43 @@ void storage_run::media_arm()
 {
     if (m_media_timer.armed || m_stopped)
         return;
-    m_media_timer.ts  = {0, media_tick_ms * 1000000};
+    const int64_t ms = m_media_waits.empty() ? media_tick_ms : media_wait_tick_ms;
+    m_media_timer.ts  = {0, ms * 1000000};
     m_media_timer.req = io_request{};
     m_media_timer.req.owner = this;
     m_media_timer.req.type  = op_timeout;
     m_media_timer.armed = m_loop.submit_timeout(&m_media_timer.ts, &m_media_timer.req);
 }
 
+void storage_run::media_end_rendition(size_t i, bool kill)
+{
+    media_job& j = m_media_jobs[i];
+    if (kill)
+    {
+        if (j.paused)
+            ::kill(j.pid, SIGCONT);
+        ::kill(j.pid, SIGKILL);
+        ::waitpid(j.pid, nullptr, 0);
+    }
+    if (all_made(j.want.dir, j.total) && !exists(j.want.dir + "/done"))
+    {
+        mark(j.want.dir, "done");
+        m_media_done.insert(j.want.dir);
+        ++m_c.media_made;
+    }
+    drop_job_files(j.want.dir, j.from);
+    ::close(j.lock_fd);
+    if (j.share_fd >= 0)
+        ::close(j.share_fd);
+    m_media_jobs.erase(m_media_jobs.begin() + static_cast<ptrdiff_t>(i));
+}
+
 void storage_run::media_tick()
 {
     bool finished = false;
+    // A stream finished is a large medium in: eviction runs at once, where a thumbnail's waits its turn.
+    bool large = false;
+    std::string made;
     for (size_t i = 0; i < m_media_jobs.size();)
     {
         media_job& j = m_media_jobs[i];
@@ -1198,7 +1666,7 @@ void storage_run::media_tick()
                     }
                 }
             }
-            // The rendition's init segment is the first job's, linked in whole.
+            // The rendition's init segment is the first job's, linked in whole; every job's is the same bytes.
             const std::string init = job_file(j.want.dir, j.from, "-init.mp4");
             if (j.next > j.from && !exists(j.want.dir + "/init.mp4") && exists(init) &&
                 ::link(init.c_str(), (j.want.dir + "/init.mp4").c_str()) != 0) {}
@@ -1218,12 +1686,13 @@ void storage_run::media_tick()
                 const bool abandoned = now - j.asked_ms > (j.paused ? 60000 : hls_idle_ms);
                 if (!merged && !abandoned)
                 {
-                    if (!j.paused && j.next > j.wanted + pause_ahead)
+                    const bool unasked = now - j.asked_ms > unasked_ms;
+                    if (!j.paused && (j.next > j.wanted + pause_ahead || (unasked && j.next > j.wanted + 2)))
                     {
                         ::kill(j.pid, SIGSTOP);
                         j.paused = true;
                     }
-                    else if (j.paused && j.wanted + resume_within >= j.next)
+                    else if (j.paused && !unasked && j.wanted + resume_within >= j.next)
                     {
                         ::kill(j.pid, SIGCONT);
                         j.paused = false;
@@ -1231,29 +1700,26 @@ void storage_run::media_tick()
                     ++i;
                     continue;
                 }
-                if (j.paused)
-                    ::kill(j.pid, SIGCONT);
-                ::kill(j.pid, SIGKILL);
-                ::waitpid(j.pid, nullptr, 0);
+                media_end_rendition(i, true);
+                continue;
             }
-            else if (r != j.pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            if (r != j.pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
             {
                 ++m_c.media_failed;
                 // A job that fails from its very start is the medium's failure, and is answered so for a while.
                 if (j.next == j.from)
                     mark(j.want.dir, "failed");
             }
-            if (all_made(j.want.dir, j.total) && !exists(j.want.dir + "/done"))
+            else if (j.next == j.from && j.from > 0)
             {
-                mark(j.want.dir, "done");
-                ++m_c.media_made;
-                finished = true;
+                // A job that ran to its end and made nothing began past the last frame: no segment from there exists.
+                if (read_int(j.want.dir + "/end", INT64_MAX) > j.from)
+                    write_int(j.want.dir + "/end", j.from);
             }
-            drop_job_files(j.want.dir, j.from);
-            ::close(j.lock_fd);
-            if (j.share_fd >= 0)
-                ::close(j.share_fd);
-            m_media_jobs.erase(m_media_jobs.begin() + static_cast<ptrdiff_t>(i));
+            made = m_media_jobs[i].want.dir;
+            media_end_rendition(i, false);
+            finished = true;
+            large = true;
             continue;
         }
         if (r == 0)
@@ -1266,7 +1732,7 @@ void storage_run::media_tick()
             }
             ::kill(j.pid, SIGKILL);
             ::waitpid(j.pid, nullptr, 0);
-            // A stream let go is begun again when asked for; a thumbnail or a probe that took too long is a failure.
+            // A stream let go is begun again when asked for; anything else that took too long is a failure.
             if (idle)
                 clear_dir(j.want.dir, true);
             else
@@ -1281,6 +1747,19 @@ void storage_run::media_tick()
             if (j.want.kind == k_probe)
                 ok = ok && ::stat((j.want.dir + "/probe.json.tmp").c_str(), &sb) == 0 && sb.st_size > 0 &&
                      ::rename((j.want.dir + "/probe.json.tmp").c_str(), (j.want.dir + "/probe.json").c_str()) == 0;
+            else if (j.want.kind == k_sub)
+            {
+                // The track's cues on the film's own clock, as an HLS player is told they are.
+                std::string vtt;
+                ok = ok && read_small(j.want.dir + "/subs.tmp.vtt", vtt) && vtt.starts_with("WEBVTT");
+                if (ok)
+                {
+                    const size_t eol = vtt.find('\n');
+                    vtt.insert(eol == std::string::npos ? vtt.size() : eol + 1, "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n");
+                    write_small(j.want.dir + "/subs.vtt", vtt);
+                    ::unlink((j.want.dir + "/subs.tmp.vtt").c_str());
+                }
+            }
             else
             {
                 const std::string out = j.want.dir + (j.want.kind == k_copy ? "/index.m3u8" : "/thumb.jpg");
@@ -1302,14 +1781,21 @@ void storage_run::media_tick()
                 continue;
             }
             mark(j.want.dir, ok ? "done" : "failed");
+            if (ok)
+                m_media_done.insert(j.want.dir);
+            large = large || j.want.kind == k_copy;
+            made = j.want.dir;
             if (j.want.kind != k_probe)
                 ++(ok ? m_c.media_made : m_c.media_failed);
             finished = true;
         }
+        ::unlink((j.want.dir + "/pid").c_str());
         ::close(j.lock_fd);
         m_media_jobs.erase(m_media_jobs.begin() + static_cast<ptrdiff_t>(i));
     }
-    // Each waiting request looks again, and may start what a finished one made room for.
+    // Each waiting request looks again, and may start what a finished one made room for; a request that waits is
+    // making progress as far as the idle sweep goes.
+    const auto now_steady = std::chrono::steady_clock::now();
     auto waits = std::move(m_media_waits);
     m_media_waits.clear();
     for (auto& [weak, w] : waits)
@@ -1317,15 +1803,31 @@ void storage_run::media_tick()
         auto c = weak.lock();
         if (!c || c->dead || media_try(c, w))
             continue;
+        c->last_progress = now_steady;
         m_media_waits.emplace_back(std::move(weak), std::move(w));
     }
-    if (finished)
-        media_evict();
-    if (!m_media_jobs.empty() || !m_media_waits.empty())
+    // An object's file no job has started from for a minute is let go.
+    const int64_t now = now_ms();
+    for (auto it = m_media_srcs.begin(); it != m_media_srcs.end();)
+    {
+        if (now - it->second.used_ms > source_keep_ms)
+        {
+            m_loop.close_fd(it->second.fd);
+            it = m_media_srcs.erase(it);
+        }
+        else
+            ++it;
+    }
+    if (finished && (large || now - m_media_evicted_ms > evict_every_ms))
+    {
+        m_media_evicted_ms = now;
+        media_evict(made);
+    }
+    if (!m_media_jobs.empty() || !m_media_waits.empty() || !m_media_srcs.empty())
         media_arm();
 }
 
-void storage_run::media_evict()
+void storage_run::media_evict(const std::string& keep)
 {
     // The least recently asked for media go first, once the cache is past its size, and none that is being made.
     uint64_t cap_mb = cache_default_mb;
@@ -1368,10 +1870,12 @@ void storage_run::media_evict()
     if (total <= cap)
         return;
     std::ranges::sort(all, {}, &entry::used_ms);
-    // The medium asked for last stays, so that one larger than the whole cache is still served once made.
-    for (size_t i = 0; i + 1 < all.size() && total > cap; ++i)
+    // The medium just made stays, so that one larger than the whole cache is still served once made.
+    for (size_t i = 0; i < all.size() && total > cap; ++i)
     {
         const entry& en = all[i];
+        if (en.dir == keep)
+            continue;
         const int fd = ::open((en.dir + "/lock").c_str(), O_RDWR | O_CLOEXEC);
         if (fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) != 0)
         {
@@ -1382,6 +1886,8 @@ void storage_run::media_evict()
         if (fd >= 0)
             ::close(fd);
         total -= en.bytes;
+        m_media_done.erase(en.dir);
+        m_media_probes.erase(en.dir);
     }
 }
 
@@ -1402,6 +1908,9 @@ void storage_run::media_stop()
     }
     m_media_jobs.clear();
     m_media_waits.clear();
+    for (auto& [object, src] : m_media_srcs)
+        m_loop.close_fd(src.fd);
+    m_media_srcs.clear();
     if (m_media_timer.armed)
         m_loop.submit_timeout_remove(&m_media_timer.req);
 }

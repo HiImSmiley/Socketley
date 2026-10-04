@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -95,6 +96,8 @@ struct storage_counters
     uint64_t media_made{0};
     uint64_t media_failed{0};
     uint64_t media_served{0};
+    // Jobs that read the object's file directly rather than over the listener.
+    uint64_t media_direct{0};
     // S3 errors answered, by the code in the XML.
     std::map<std::string, uint64_t, std::less<>> errors;
 };
@@ -135,6 +138,8 @@ struct s3_request
     bool   vhost{false};
     // The Host header named a bucket's website, which serves its objects to anyone a policy lets read them.
     bool   website{false};
+    // The client asked with HEAD, whatever an application rewrote the method to since: its answer carries no body.
+    bool   head_request{false};
     // The path began with a name no bucket can have (~dav, ~share, ~ui): the runtime's own applications.
     uint8_t app{0};
     // A browser's upload by form, whose fields became the key and the headers of a PutObject.
@@ -247,6 +252,24 @@ class storage_run;
 
 struct response;
 struct share_link;
+
+// What ffprobe said of an object: a stream's ladder, playlists and filters are made from it.
+struct media_probe
+{
+    double  duration{0};
+    double  fps{0};
+    int64_t width{0}, height{0}, bitrate{0}, vlevel{0}, achannels{0};
+    std::string vcodec, vprofile, transfer, acodec, format;
+    bool    audio{false};
+    struct subtitle
+    {
+        int64_t     index{0};
+        std::string codec, lang, title;
+    };
+    // Text subtitles only, which WebVTT carries; pictures of text are not.
+    std::vector<subtitle> subtitles;
+    bool hdr() const { return transfer == "smpte2084" || transfer == "arib-std-b67"; }
+};
 
 struct conn
 {
@@ -774,8 +797,19 @@ public:
         // The segment asked for, -1 for a stream's init segment.
         int64_t     seg{-1};
         int64_t     deadline_ms{0};
+        int64_t     asked_ms{0};
+        // The object as one string, bucket, key and ETag, which its open file is kept under; and the version the
+        // URLs of its playlists carry.
+        std::string object, version;
     };
     void op_media(const std::shared_ptr<conn>& c);
+    // A media request once its object is known, and its file open where ffmpeg may read it directly.
+    void media_continue(const std::shared_ptr<conn>& c, media_want w);
+    std::shared_ptr<const media_probe> media_probe_of(const std::string& probe_dir);
+    // A medium's use, written to its lock's time at most once a minute, which eviction orders by.
+    void media_touch(const std::string& dir);
+    // Ends the rendition job at `i`: killed when running, its files cleared, the rendition marked done when whole.
+    void media_end_rendition(size_t i, bool kill);
     void media_source(const std::shared_ptr<conn>& c, std::string_view rest);
     // Answers from the cache, or starts the making when no shard is at it; false while the request must wait.
     bool media_try(const std::shared_ptr<conn>& c, const media_want& w);
@@ -786,7 +820,8 @@ public:
     bool media_serve(const std::shared_ptr<conn>& c, const media_want& w, bool growing);
     void media_tick();
     void media_arm();
-    void media_evict();
+    // Evicts the least recently used media past the cache's size, never `keep`, the medium just made.
+    void media_evict(const std::string& keep);
     void media_stop();
     // STS's GetSessionToken and AssumeRole, POST / with a form, answered with temporary credentials.
     void op_sts(const std::shared_ptr<conn>& c);
@@ -1059,6 +1094,20 @@ private:
     std::vector<media_job> m_media_jobs;
     std::vector<std::pair<std::weak_ptr<conn>, media_want>> m_media_waits;
     timer       m_media_timer;
+    // What this shard knows of the cache without asking the disk again: probes, renditions whole, uses written.
+    std::unordered_map<std::string, std::shared_ptr<const media_probe>> m_media_probes;
+    std::unordered_set<std::string> m_media_done;
+    std::unordered_map<std::string, int64_t> m_media_touched;
+    // An unencrypted object's open file, which ffmpeg reads as its own fd 3 rather than over the listener.
+    struct media_src
+    {
+        int      fd{-1};
+        uint64_t off{0}, len{0};
+        int64_t  used_ms{0};
+    };
+    std::unordered_map<std::string, media_src> m_media_srcs;
+    int64_t     m_media_evicted_ms{0};
+    bool        m_media_dir_ready{false};
     // ffmpeg's path, looked up at the first media request; empty when there is none.
     std::string m_ffmpeg;
     bool        m_ffmpeg_known{false};
