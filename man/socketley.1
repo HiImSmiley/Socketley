@@ -8979,15 +8979,26 @@ Media made by ffmpeg from an object, and kept.
 (64, 128, 256, 320, 480, 640, 960, 1280 or 1920) is a JPEG still of a picture or
 of a film a few seconds in.
 .B info
-is what the object is, as JSON: its length, picture size, codecs, whether it is
-HDR, the MIME type with codecs a browser is asked whether it plays the file itself,
-and the renditions it has.
+is what the object is, as JSON: its length, picture size, frame rate, codecs,
+whether it is HDR, the MIME type with codecs a browser is asked whether it plays
+the file itself, the codecs of its copied stream, its renditions and its text
+subtitles.
+.BI sub\- stream /subs.vtt
+is a text subtitle stream (SubRip, ASS, mov_text, WebVTT) as WebVTT, on the film's
+clock, and
+.BI sub\- stream /index.m3u8
+its HLS playlist; subtitles that are pictures are not offered.
 .B hls/\fIbucket\fB/\fIkey\fB/master.m3u8
 is an HLS master playlist naming those renditions, with their size, peak bitrate
 and codecs, for a player to switch between as its bandwidth allows: one for every
 rung of 2160, 1440, 1080, 720, 480, 360 and 240 the picture fills in at least one
 side, each fitted into that rung's 16:9 box and never enlarged, 720 listed first,
-and the source's own picture copied when it is H.264 or HEVC.
+the source's own picture copied when it is H.264 or HEVC (HEVC tagged hvc1), and
+the text subtitles as a SUBTITLES group. BANDWIDTH is the most a segment can
+carry, a quarter over the rung's cap, and the levels are 4.2 up to 1080 and 5.2
+above. The URLs a master names carry the object's version, so what they answer
+is cached for good, and a medium's answers carry an ETag a client revalidates
+with, answered 304, and take a Range.
 .IP
 .BI hls\- height /index.m3u8
 is one rendition: H.264 held to its rung's bitrate and AAC, in CMAF segments of
@@ -8995,28 +9006,35 @@ four seconds. Its playlist is whole from the start, written from the film's leng
 so a player seeks anywhere at once, and its segments are made as they are asked
 for: a segment at or a little past where a job is making them is waited for, and
 one elsewhere starts a job there, on the film's own clock, so the segments of
-every job join up. Several jobs run over one film for viewers at different places;
+every job join up, and every job's init segment is the same bytes. An init
+segment asked for with no job running waits a moment for the segment request
+that begins the right one. Several jobs run over one film for viewers at different places;
 one that reaches segments made before ends, one fifteen segments ahead of every
-player that asks of it is held still until one comes within eight, and one nobody
-asks of for a minute while held, or for ten minutes running, ends. What they made
+player that asks of it, or two ahead when nobody has asked of it for ten seconds,
+is held still until one comes within eight, and one nobody asks of for a minute
+while held, or for ten minutes running, ends; a job held still and unasked gives
+its place to a new one when a shard has eight. What they made
 is kept: a film watched once streams from the cache afterwards. HDR (PQ or HLG) is
 tone-mapped to SDR for these renditions.
 .B hls\-copy
-streams the source's own picture without transcoding, and its sound made AAC.
+streams the source's own picture without transcoding, and its sound copied when
+it is AAC in two channels or fewer, and made AAC otherwise, as renditions do.
 .IP
 The object is read as a GET of it would be, by its user or, under
 .BI /~media/ variant /~share/ id\fR[\fB/\fIpath\fR],
-through a link. ffmpeg, and ffprobe beside it, read the object over the runtime's
+through a link. ffmpeg, and ffprobe beside it, read an unencrypted object's file
+directly, kept open by the shard for a minute, and any other over the runtime's
 own listener with an address signed by a key in
-.IR dir /.media/key,
-and what they made lies in
+.IR dir /.media/key
+for that version of it, and what they made lies in
 .IR dir /.media/
 under the variant, the object's key and its ETag, so a new version is made anew
 and every shard serves what one made; one thumbnail is made once however many
 ask for it at once. A shard runs two thumbnails and eight streams at once, a
-request waits a minute for its medium, and an object ffmpeg cannot read is
+request waits a minute for its medium, an object ffmpeg cannot read is
 .B 415
-for two minutes. See
+for two minutes, and an ffmpeg a dying worker left behind is found by its pid and
+ended. See
 .B SOCKETLEY_FFMPEG
 and
 .BR SOCKETLEY_MEDIA_CACHE_MB .
@@ -9025,10 +9043,11 @@ and
 A web interface, one page served from the binary, that signs in with an access
 key and its secret and browses, uploads (folders too, by dropping them), renames,
 deletes, shares, restores from the trash, previews pictures and text and plays
-films and music: the file itself where the browser plays it, which costs the
-server nothing, and otherwise the master playlist's renditions, chosen by
-bandwidth, through the browser's own HLS or, where it has none, through Media
-Source Extensions.
+films and music, with their subtitles: the file itself where the browser plays
+it, which costs the server nothing, and otherwise the master playlist's streams
+through Media Source Extensions, the copied one where the browser takes its codec
+and the line carries it, renditions by measured bandwidth otherwise, or through
+the browser's own HLS where it has no Media Source at all.
 .
 .SS Durability
 .B \-\-fsync
@@ -9291,6 +9310,8 @@ and
 .B media_served
 (thumbnails and streams ffmpeg made and failed to make, and the answers served
 from them),
+.B media_direct
+(ffmpeg jobs that read the object's file rather than through the listener),
 and one line
 .BI error_ Code
 for every S3 error code the runtime has answered, such as
@@ -13623,7 +13644,9 @@ How many helper threads a storage worker takes the digests of large uploads on
 (the ETag's MD5, any \fBx\-amz\-checksum\-\fR the request asked for or the default CRC64NVME, and the SHA\-256
 that verifies a signed body: a hex payload hash or aws\-chunked signatures), so
 that the worker's loop is not the one core every upload's hashing has to fit in. Default
-.BR 3 ;
+.BR 3 ,
+or the machine's cores divided by the runtime's shards when that is fewer, at
+least one, so that the shards' threads together do not outnumber the cores;
 .B 0
 hashes on the loop. The threads are started by the first upload of 256 KiB or
 more (or of unknown length) and end with the runtime; smaller bodies are hashed
@@ -13770,7 +13793,7 @@ Inherited by worker processes, which have no command line of their own.
 The size in MiB past which a storage runtime removes the media it made, least
 recently asked for first, from
 .IR dir /.media/.
-Default: 10240. The medium asked for last is kept even when it alone is larger,
+Default: 10240. The medium made last is kept even when it alone is larger,
 and none is removed while it is being made.
 .IP
 Inherited by worker processes, which have no command line of their own.
