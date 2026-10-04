@@ -490,6 +490,7 @@ std::string storage_instance::stats_lines() const
         << "media_failed:" << c.media_failed << "\n"
         << "media_served:" << c.media_served << "\n"
         << "media_direct:" << c.media_direct << "\n"
+        << "media_hw:" << c.media_hw << "\n"
         << "notify_sent:" << m_run->notifications().counters().sent << "\n"
         << "notify_failed:" << m_run->notifications().counters().failed << "\n"
         << "notify_queued:" << m_run->notifications().queued() << "\n"

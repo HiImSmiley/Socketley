@@ -266,7 +266,11 @@ class MsePlayer {
     else if (this.choice !== 'auto') this.level = Math.max(0, pick(l => l.rung === +this.choice));
     else this.level = pick(l => l.copy && l.bw <= 12000000) >= 0 ? pick(l => l.copy) : this.levels.reduce((best, l, i) => !l.copy && l.bw <= 4500000 ? i : best, 0);
     this.fixed = this.choice !== 'auto';
-    const first = await this.list(this.level);
+    let first = await this.list(this.level);
+    // The film's length is a rendition's, written whole up front; a copied stream's playlist is only as long as the
+    // remux has come.
+    const whole = this.levels.findIndex(l => !l.copy);
+    if (!first.ended && whole >= 0) first = await this.list(whole);
     this.ms = new MS();
     if (window.ManagedMediaSource) this.v.disableRemotePlayback = true;
     this.v.src = URL.createObjectURL(this.ms);
@@ -322,10 +326,18 @@ class MsePlayer {
     while (this.alive && this.v.isConnected) {
       const end = this.bufferedEnd();
       if (end - this.v.currentTime > 30 || this.sb.updating) { await new Promise(r => setTimeout(r, 300)); continue; }
-      const level = this.level, lvl = this.levels[level];
+      let level = this.level;
       try {
         this.ctl = new AbortController();
         let list = await this.list(level);
+        // The copied stream is remuxed from the start; a place it has not reached yet is played from a rendition,
+        // which the server begins anywhere at once, and the copy is taken up again once it has caught up.
+        if (this.levels[level].copy && !list.ended && end + 1 > list.total) {
+          const fb = this.levels.reduce((best, l, i) => !l.copy && l.bw <= 4500000 ? i : best, -1);
+          const any = this.levels.findIndex(l => !l.copy);
+          if (fb >= 0 || any >= 0) { level = fb >= 0 ? fb : any; list = await this.list(level); }
+        }
+        const lvl = this.levels[level];
         let seg = list.segs.find(s => s.start + s.dur > end + 0.05);
         if (!seg) {
           if (list.ended || end >= list.total - 0.1) {
@@ -351,7 +363,7 @@ class MsePlayer {
         await this.append(data);
         // Up when the next stream fits the measured rate twice over and answers at once; down when this one does not
         // fit it, or the server takes more than half a segment to answer, as it does when it cannot keep up.
-        if (!this.fixed) {
+        if (!this.fixed && level === this.level) {
           const ttfb = (t1 - t0) / 1000;
           const up = this.levels[level + 1];
           if (up && bps > up.bw * 2 && ttfb < seg.dur / 4) this.level = level + 1;

@@ -96,8 +96,9 @@ struct storage_counters
     uint64_t media_made{0};
     uint64_t media_failed{0};
     uint64_t media_served{0};
-    // Jobs that read the object's file directly rather than over the listener.
+    // Jobs that read the object's file directly rather than over the listener, and jobs encoded on the GPU.
     uint64_t media_direct{0};
+    uint64_t media_hw{0};
     // S3 errors answered, by the code in the XML.
     std::map<std::string, uint64_t, std::less<>> errors;
 };
@@ -1087,6 +1088,8 @@ private:
         // segments, the furthest one its players asked for and when, and whether it is held still for being ahead.
         int64_t     from{0}, next{0}, total{0}, wanted{0}, asked_ms{0};
         bool        paused{false};
+        // Encoded on the GPU, whose failure at its start sends the rendition back to x264.
+        bool        gpu{false};
         // A shared hold on the rendition, which keeps its eviction off while any of its jobs runs.
         int         share_fd{-1};
         int64_t     playlist_mtime{0}, want_mtime{0};
@@ -1111,6 +1114,14 @@ private:
     // ffmpeg's path, looked up at the first media request; empty when there is none.
     std::string m_ffmpeg;
     bool        m_ffmpeg_known{false};
+    // The GPU's encoder, found by a one-second test run: unknown, being tested, none, or VAAPI with or without the
+    // low-power encoder; and the render node it is on.
+    enum class media_hw : uint8_t { unknown, testing, none, vaapi, vaapi_lp };
+    media_hw    m_hw{media_hw::unknown};
+    bool        m_hw_tried_lp{false};
+    std::string m_hw_device;
+    void media_hw_detect();
+    bool media_hw_test(bool low_power);
     // The key that signs ffmpeg's reads of an object, shared by every shard through the cache's directory.
     std::string m_media_key;
 

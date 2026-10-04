@@ -58,6 +58,8 @@ enum media_kind : uint8_t
     k_info,
     // One text subtitle stream as WebVTT, and its playlist of one segment.
     k_sub,
+    // A second of video through the GPU's encoder, to learn whether renditions can be made there.
+    k_hwtest,
 };
 
 // Thumbnails queue behind a few at a time; a stream is someone waiting to watch, and never waits for another's film.
@@ -881,6 +883,8 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         m_ffmpeg = ffmpeg_path();
         m_ffmpeg_known = true;
     }
+    if (m_hw == media_hw::unknown && !m_ffmpeg.empty())
+        media_hw_detect();
     if (m_ffmpeg.empty())
     {
         app_reply(c, 501, "No ffmpeg: install it on the PATH, or name it in SOCKETLEY_FFMPEG.\n");
@@ -946,6 +950,63 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
                 media_continue(c2, std::move(want2));
         });
     });
+}
+
+void storage_run::media_hw_detect()
+{
+    // SOCKETLEY_MEDIA_HWACCEL: off, a render node, or vaapi-unchecked:<node>, which skips the test run so that a
+    // test can see a GPU job fail and its rendition fall back to x264.
+    const char* e = std::getenv("SOCKETLEY_MEDIA_HWACCEL");
+    const std::string_view v = e ? e : "";
+    m_hw = media_hw::none;
+    if (v == "off")
+        return;
+    if (v.starts_with("vaapi-unchecked:"))
+    {
+        m_hw_device.assign(v.substr(16));
+        m_hw = media_hw::vaapi;
+        return;
+    }
+    m_hw_device = v.empty() ? "/dev/dri/renderD128" : std::string(v);
+    if (::access(m_hw_device.c_str(), R_OK | W_OK) != 0)
+        return;
+    if (media_hw_test(false))
+        m_hw = media_hw::testing;
+}
+
+bool storage_run::media_hw_test(bool low_power)
+{
+    // The whole chain a rendition takes, upload, scale and encode, on a second of test picture.
+    std::vector<std::string> args = {m_ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-init_hw_device",
+                                     "vaapi=va:" + m_hw_device, "-filter_hw_device", "va", "-f", "lavfi", "-i",
+                                     "testsrc2=s=640x360:r=25:d=1", "-vf", "format=nv12,hwupload,scale_vaapi=w=320:h=180:format=nv12",
+                                     "-c:v", "h264_vaapi"};
+    if (low_power)
+        args.insert(args.end(), {"-low_power", "1"});
+    args.insert(args.end(), {"-force_key_frames", "expr:gte(t,n_forced*1)", "-f", "null", "-"});
+    std::vector<char*> argv;
+    for (std::string& a : args)
+        argv.push_back(a.data());
+    argv.push_back(nullptr);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addclosefrom_np(&fa, 3);
+    pid_t pid = -1;
+    const int rc = ::posix_spawn(&pid, m_ffmpeg.c_str(), &fa, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0)
+        return false;
+    media_job j;
+    j.pid = pid;
+    j.want.kind = k_hwtest;
+    j.started_ms = now_ms();
+    j.seeked = low_power;
+    m_media_jobs.push_back(std::move(j));
+    media_arm();
+    return true;
 }
 
 void storage_run::media_continue(const std::shared_ptr<conn>& c, media_want w)
@@ -1372,6 +1433,14 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
             ::close(share_fd);
         return false;
     }
+    // The encoder is the rendition's for good, written by its first job: one rendition never mixes a GPU's
+    // segments with x264's, whose inits differ.
+    if (!exists(w.dir + "/encoder"))
+    {
+        const auto pp = media_probe_of(w.probe_dir);
+        const bool gpu = (m_hw == media_hw::vaapi || m_hw == media_hw::vaapi_lp) && pp && pp->transfer != "arib-std-b67";
+        write_small(w.dir + "/encoder", gpu ? (m_hw == media_hw::vaapi_lp ? "vaapi-lp" : "vaapi") : "x264");
+    }
     write_int(job_file(w.dir, seg, ".pos"), seg);
     // A job begun for an init has been asked no segment yet, which is -1.
     write_int(job_file(w.dir, seg, ".want"), w.seg < 0 ? -1 : seg);
@@ -1526,19 +1595,42 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
                       "zscale=t=bt709:m=bt709:r=tv";
             vf += ",format=yuv420p";
             const std::string offset = std::to_string(from * seg_seconds);
+            std::string encoder;
+            read_small(w.dir + "/encoder", encoder);
+            const bool gpu = encoder.starts_with("vaapi") && !m_hw_device.empty();
+            // On the GPU the picture is decoded, scaled, tone-mapped and encoded there, and never copied back.
+            if (gpu)
+                args.insert(args.end(), {"-init_hw_device", "vaapi=va:" + m_hw_device, "-filter_hw_device", "va",
+                                         "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"});
             // Begun at a segment's own time, with its number, so that its segments are the ones a run from the start
             // would have made: keyframes every four seconds of the film, and the film's own timestamps.
             args.insert(args.end(), {"-ss", offset});
             args.insert(args.end(), input.begin(), input.end());
+            if (gpu)
+            {
+                std::string hwvf = "scale_vaapi=w=" + std::to_string(width) + ":h=" + std::to_string(height) + ":format=nv12";
+                if (p.hdr())
+                    hwvf = "tonemap_vaapi=format=nv12:p=bt709:t=bt709:m=bt709," + hwvf;
+                args.insert(args.end(), {"-map", "0:v:0", "-map", "0:a:0?", "-c:v", "h264_vaapi"});
+                if (encoder == "vaapi-lp")
+                    args.insert(args.end(), {"-low_power", "1"});
+                args.insert(args.end(), {"-rc_mode", "VBR", "-b:v", std::to_string(r->kbps * 3 / 5) + "k",
+                                         "-maxrate", std::to_string(r->kbps) + "k", "-bufsize", std::to_string(r->kbps) + "k",
+                                         "-profile:v", "high", "-level", avc_level(r->height), "-vf", hwvf,
+                                         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+                                         "-force_key_frames", "expr:gte(t,n_forced*" + std::to_string(seg_seconds) + ")"});
+                j.gpu = true;
+            }
+            else
             // Jellyfin's motion search: a fifth less CPU for an SSIM of 0.9690 against 0.9695, and no keyframe at a
             // scene cut, so every segment is cut where the forced ones are. The buffer is one second of the cap, so a
             // segment holds at most a quarter more than the cap over its four seconds, as BANDWIDTH says.
-            args.insert(args.end(), {"-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                                     "-x264-params", "subme=0:me_range=16:rc_lookahead=10:me=hex:open_gop=0",
-                                     "-sc_threshold", "0", "-threads", threads, "-level:v", avc_level(r->height),
-                                     "-maxrate", std::to_string(r->kbps) + "k", "-bufsize", std::to_string(r->kbps) + "k",
-                                     "-vf", vf, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-                                     "-force_key_frames", "expr:gte(t,n_forced*" + std::to_string(seg_seconds) + ")"});
+                args.insert(args.end(), {"-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                                         "-x264-params", "subme=0:me_range=16:rc_lookahead=10:me=hex:open_gop=0",
+                                         "-sc_threshold", "0", "-threads", threads, "-level:v", avc_level(r->height),
+                                         "-maxrate", std::to_string(r->kbps) + "k", "-bufsize", std::to_string(r->kbps) + "k",
+                                         "-vf", vf, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+                                         "-force_key_frames", "expr:gte(t,n_forced*" + std::to_string(seg_seconds) + ")"});
             args.insert(args.end(), audio.begin(), audio.end());
             // The film's time in every fragment and none in the init, so that any job's init fits every job's segments.
             args.insert(args.end(), {"-avoid_negative_ts", "disabled", "-output_ts_offset", offset,
@@ -1592,6 +1684,8 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
         return false;
     if (src_fd >= 0)
         ++m_c.media_direct;
+    if (j.gpu)
+        ++m_c.media_hw;
     // The pid, by which a later worker finds an ffmpeg this one leaves behind when it dies.
     write_int(w.kind == k_rendition ? job_file(w.dir, from, ".pid") : w.dir + "/pid", pid);
     ::futimens(lock_fd, nullptr);
@@ -1652,6 +1746,28 @@ void storage_run::media_tick()
         const pid_t r = ::waitpid(j.pid, &status, WNOHANG);
         struct stat sb{};
         const int64_t now = now_ms();
+        if (j.want.kind == k_hwtest)
+        {
+            if (r == 0 && now - j.started_ms < 15000)
+            {
+                ++i;
+                continue;
+            }
+            if (r == 0)
+            {
+                ::kill(j.pid, SIGKILL);
+                ::waitpid(j.pid, nullptr, 0);
+            }
+            const bool ok = r == j.pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            const bool lp = j.seeked;
+            m_media_jobs.erase(m_media_jobs.begin() + static_cast<ptrdiff_t>(i));
+            // The full encoder first, then the low-power one, which is all some GPUs have; else none.
+            if (ok)
+                m_hw = lp ? media_hw::vaapi_lp : media_hw::vaapi;
+            else if (lp || !media_hw_test(true))
+                m_hw = media_hw::none;
+            continue;
+        }
         if (j.want.kind == k_rendition)
         {
             // Where the job is, by its own playlist, so that segments another job made are not taken for its own.
@@ -1715,8 +1831,11 @@ void storage_run::media_tick()
             if (r != j.pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
             {
                 ++m_c.media_failed;
-                // A job that fails from its very start is the medium's failure, and is answered so for a while.
-                if (j.next == j.from)
+                // A GPU job that fails before the rendition has anything is the GPU's failure with this film: the
+                // rendition is made with x264 from then on. Any other that fails from its very start is the medium's.
+                if (j.gpu && j.next == j.from && !exists(j.want.dir + "/init.mp4"))
+                    write_small(j.want.dir + "/encoder", "x264");
+                else if (j.next == j.from)
                     mark(j.want.dir, "failed");
             }
             else if (j.next == j.from && j.from > 0)
