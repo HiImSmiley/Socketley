@@ -6601,7 +6601,7 @@ Streamed like a put, Content\-MD5 and the checksums checked; a part sent again r
 T}
 UploadPartCopy	PUT /bucket/key?partNumber=N&uploadId=ID + x\-amz\-copy\-source	T{
 .ad l
-The whole source or x\-amz\-copy\-source\-range=bytes=first\-last; a source of key?versionId=ID reads that version.
+The whole source or x\-amz\-copy\-source\-range=bytes=first\-last, a range past the source's end being 416 InvalidRange; a source of key?versionId=ID reads that version.
 T}
 CompleteMultipartUpload	POST /bucket/key?uploadId=ID	T{
 .ad l
@@ -8371,9 +8371,14 @@ PUT /photos?logging
 A line names the bucket's owner and the bucket, the time, the client's address,
 the requester's access key (\- for none), the request id, the operation
 .RB ( REST.GET.OBJECT ,
+.BR REST.PUT.PART ,
 .BR REST.PUT.VERSIONING ,
 .B WEBSITE.GET.OBJECT
-and so on), the key, the request line, the status, the error code, the bytes of
+and so on; a DeleteObjects is a
+.B REST.POST.MULTI_OBJECT_DELETE
+line and a
+.B BATCH.DELETE.OBJECT
+line for each key), the key, the request line, the status, the error code, the bytes of
 body sent, a put's size, the milliseconds from the request's start to its answer,
 the referer and user agent, the signature version and how it was given, the TLS
 cipher, the Host header and the TLS version; a field this runtime does not know
