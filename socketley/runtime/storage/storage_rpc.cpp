@@ -28,10 +28,7 @@ struct storage_run::rpc_state
     std::string bucket;
     std::string key;
     // put
-    std::shared_ptr<put_op> put;
-    std::string data;
-    size_t      off{0};
-    bool        finishing{false};
+    std::shared_ptr<whole_put> whole;
     // get
     int         fd{-1};
     size_t      data_off{0};
@@ -336,89 +333,123 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                 answer(rq.kind, refusal_for(st::metadata_too_large));
                 return true;
             }
-            // A bucket that encrypts its new objects encrypts a script's too.
-            sse_seal_spec seal;
-            const bool sealed = m_store.bucket_encrypts(rq.bucket);
-            if (s3_error err; sealed && (!m_has_master || !sse_new_key({sse_mode::s3, std::nullopt, false}, false, meta, seal, err)))
-            {
-                answer(rq.kind, refusal("NotImplemented", "the bucket encrypts its objects and this runtime has no "
-                                                          "--sse-key-file"));
-                return true;
-            }
-            replication_mark(rq.bucket, rq.key, meta, false, false);
-            // A script's object is given S3's default checksum like a client's.
-            reserve_checksum(meta, default_checksum_algo);
-            st why = st::ok;
-            auto op_ptr = m_store.begin_put(rq.bucket, rq.key, std::move(meta), rq.data.size(), true, why, true,
-                                            sealed ? &seal : nullptr);
-            if (!op_ptr)
-            {
-                answer(rq.kind, refusal_for(why));
-                return true;
-            }
-            op_ptr->track_checksum(default_checksum_algo, {});
             auto state = std::make_shared<rpc_state>();
             state->ticket = ticket;
-            state->bucket = rq.bucket;
-            state->key    = rq.key;
-            state->put    = std::move(op_ptr);
-            state->data   = std::move(rq.data);
             m_rpc[ticket] = state;
-
-            // The put takes what fits, says when it has room for more, and says
-            // once if it cannot go on; each of the three ends here.
-            auto finish_with = [this, state, answer](const storage_rpc::reply& r)
+            s3_error err;
+            state->whole = put_whole(rq.bucket, rq.key, std::move(meta), std::move(rq.data),
+                                     [state, answer](st s, const put_result* pr)
             {
                 if (state->done)
                     return;
                 state->done = true;
-                state->put->on_ready(nullptr);
-                state->put->on_failed(nullptr);
+                if (s != st::ok)
+                {
+                    answer(op::put, refusal_for(s));
+                    return;
+                }
+                storage_rpc::reply r;
+                r.info = rpc_info_of(pr->meta);
                 answer(op::put, r);
-            };
-            auto pump = std::make_shared<std::function<void()>>();
-            *pump = [this, state, finish_with]()
+            }, err);
+            if (!state->whole && !state->done)
             {
-                if (state->done || state->finishing)
-                    return;
-                if (state->put->failed())
-                {
-                    finish_with(refusal_for(state->put->status()));
-                    return;
-                }
-                while (state->off < state->data.size())
-                {
-                    const size_t took = state->put->append(state->data.data() + state->off,
-                                                           state->data.size() - state->off);
-                    state->off += took;
-                    if (state->done)
-                        return;
-                    if (took == 0)
-                        return;   // resumed by the put's ready callback
-                }
-                state->finishing = true;
-                state->put->finish(nullptr, [this, state, finish_with](put_result pr)
-                {
-                    if (pr.status != st::ok)
-                    {
-                        finish_with(refusal_for(pr.status));
-                        return;
-                    }
-                    storage_rpc::reply r;
-                    r.info = rpc_info_of(pr.meta);
-                    const std::string bucket = state->bucket;
-                    const std::string key    = state->key;
-                    finish_with(r);
-                    notify_put(bucket, key, pr.meta);
-                });
-            };
-            state->put->on_ready([pump]() { (*pump)(); });
-            state->put->on_failed([finish_with](st why) { finish_with(refusal_for(why)); });
-            (*pump)();
+                state->done = true;
+                answer(rq.kind, refusal(err.code, err.message));
+            }
             return true;
         }
     }
     return false;
+}
+
+std::shared_ptr<storage_run::whole_put> storage_run::put_whole(const std::string& bucket, const std::string& key,
+                                                              object_meta meta, std::string data,
+                                                              std::function<void(st, const put_result*)> done,
+                                                              s3_error& err)
+{
+    // A bucket that encrypts its new objects encrypts this one too.
+    sse_seal_spec seal;
+    const bool sealed = m_store.bucket_encrypts(bucket);
+    if (sealed && (!m_has_master || !sse_new_key({sse_mode::s3, std::nullopt, false}, false, meta, seal, err)))
+    {
+        if (!m_has_master)
+        {
+            err         = make_error("NotImplemented");
+            err.message = "the bucket encrypts its objects and this runtime has no --sse-key-file";
+        }
+        return nullptr;
+    }
+    replication_mark(bucket, key, meta, false, false);
+    // Given S3's default checksum like a client's object.
+    reserve_checksum(meta, default_checksum_algo);
+    st why = st::ok;
+    auto op_ptr = m_store.begin_put(bucket, key, std::move(meta), data.size(), true, why, true, sealed ? &seal : nullptr);
+    if (!op_ptr)
+    {
+        err = error_for(why);
+        return nullptr;
+    }
+    op_ptr->track_checksum(default_checksum_algo, {});
+    auto w  = std::make_shared<whole_put>();
+    w->put  = std::move(op_ptr);
+    w->data = std::move(data);
+
+    // The put takes what fits, says when it has room for more, and says once if it cannot go on; each ends here.
+    auto finish_with = [w, done](st s, const put_result* pr)
+    {
+        if (w->done)
+            return;
+        w->done = true;
+        w->put->on_ready(nullptr);
+        w->put->on_failed(nullptr);
+        done(s, pr);
+    };
+    auto pump = std::make_shared<std::function<void()>>();
+    *pump = [this, w, finish_with, bucket, key]()
+    {
+        if (w->done || w->finishing)
+            return;
+        if (w->put->failed())
+        {
+            finish_with(w->put->status(), nullptr);
+            return;
+        }
+        while (w->off < w->data.size())
+        {
+            const size_t took = w->put->append(w->data.data() + w->off, w->data.size() - w->off);
+            w->off += took;
+            if (w->done)
+                return;
+            if (took == 0)
+                return;   // resumed by the put's ready callback
+        }
+        w->finishing = true;
+        w->put->finish(nullptr, [this, finish_with, bucket, key](put_result pr)
+        {
+            if (pr.status != st::ok)
+            {
+                finish_with(pr.status, nullptr);
+                return;
+            }
+            finish_with(st::ok, &pr);
+            notify_put(bucket, key, pr.meta);
+        });
+    };
+    w->put->on_ready([pump]() { (*pump)(); });
+    w->put->on_failed([finish_with](st why) { finish_with(why, nullptr); });
+    (*pump)();
+    return w;
+}
+
+void storage_run::whole_put::abort()
+{
+    if (done)
+        return;
+    done = true;
+    put->on_ready(nullptr);
+    put->on_failed(nullptr);
+    put->abort();
 }
 
 // A stop answers what is still owed: a put that will not be finished is
@@ -433,12 +464,8 @@ void storage_run::stop_rpc()
         if (state->done)
             continue;
         state->done = true;
-        if (state->put)
-        {
-            state->put->on_ready(nullptr);
-            state->put->on_failed(nullptr);
-            state->put->abort();
-        }
+        if (state->whole)
+            state->whole->abort();
         if (state->fd >= 0)
         {
             m_loop.close_fd(state->fd);

@@ -957,6 +957,24 @@ private:
     std::string m_path_scratch;
     bool        m_stopped{false};
 
+    // A put of a body held whole in memory, fed to the store as it takes it.
+    struct whole_put
+    {
+        std::shared_ptr<put_op> put;
+        std::string data;
+        size_t      off{0};
+        bool        finishing{false};
+        bool        done{false};
+
+        // Removes what was written, and tells nobody.
+        void abort();
+    };
+    // Writes `data` as the object, encrypted when the bucket encrypts, marked for replication and with S3's default
+    // checksum as a client's put is, telling `done` once; null with `err` when it cannot start.
+    std::shared_ptr<whole_put> put_whole(const std::string& bucket, const std::string& key, object_meta meta,
+                                         std::string data, std::function<void(st, const put_result*)> done,
+                                         s3_error& err);
+
     // Calls from other runtimes' scripts still in flight, so a stop can answer them.
     struct rpc_state;
     std::unordered_map<uint64_t, std::shared_ptr<rpc_state>> m_rpc;
