@@ -36,8 +36,10 @@ check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "got '$2', want '$3'"; fi; 
 daemon_isolate stgmedia
 trap 'daemon_stop' EXIT
 # ffmpeg two seconds slow to start, so that a stream queued behind others is seen to wait.
-printf '#!/bin/sh\nsleep 2\nexec "%s" "$@"\n' "$FF" > "$SOCKETLEY_TMPD/slowff"; chmod +x "$SOCKETLEY_TMPD/slowff"
-export SOCKETLEY_FFMPEG="$SOCKETLEY_TMPD/slowff"
+mkdir -p "$SOCKETLEY_TMPD/bin"
+printf '#!/bin/sh\nsleep 2\nexec "%s" "$@"\n' "$FF" > "$SOCKETLEY_TMPD/bin/ffmpeg"; chmod +x "$SOCKETLEY_TMPD/bin/ffmpeg"
+ln -s "$FFPROBE" "$SOCKETLEY_TMPD/bin/ffprobe"
+export SOCKETLEY_FFMPEG="$SOCKETLEY_TMPD/bin/ffmpeg"
 # Small enough that the last film below overruns it, so that the cache's bound is seen to hold.
 export SOCKETLEY_MEDIA_CACHE_MB=2
 daemon_start "$BIN"
@@ -155,12 +157,79 @@ check "a file a stream has none of is 404" "$(code -u "$A" "$U/~media/hls-240/fi
 # Streams do not queue behind one another, as thumbnails do: five at once over two shards all start together,
 # where two per shard would hold one back until another's ffmpeg had run.
 t0=$(date +%s%N); pids=()
-for v in hls-240 hls-360 hls-480 hls-720 hls-copy; do
-    curl -s -m 60 -u "$A" -o /dev/null "$U/~media/$v/films/short.mp4/index.m3u8" & pids+=($!)
+for v in hls-240 hls-360 hls-480 hls-720; do
+    curl -s -m 60 -u "$A" -o /dev/null "$U/~media/$v/films/short.mp4/seg00000.m4s" & pids+=($!)
 done
+curl -s -m 60 -u "$A" -o /dev/null "$U/~media/hls-copy/films/short.mp4/index.m3u8" & pids+=($!)
 wait "${pids[@]}"
 ms=$(( ($(date +%s%N) - t0) / 1000000 ))
 [ "$ms" -lt 3800 ] && ok || bad "five streams at once start together" "the last playlist after $ms ms"
+
+# Adaptive streaming: what the object is, the ladder a player chooses from, and renditions written up front.
+info=$(curl -s -u "$A" "$U/~media/info/films/clip.mp4")
+check "info says what the film is" \
+      "$(python3 -c 'import json,sys; j=json.loads(sys.argv[1]); print(j["width"], j["height"], j["video"], j["audio"], j["hdr"], j["renditions"])' "$info")" \
+      "640 360 h264 aac False [360, 240]"
+check "and the type a browser is asked about" "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["mime"])' "$info")" \
+      'video/mp4; codecs="avc1.64001e, mp4a.40.2"'
+master=$(curl -s -u "$A" "$U/~media/hls/films/clip.mp4/master.m3u8")
+check "the master names a rendition for every rung the film fills" "$(grep -c '^/~media/hls-[0-9]*/films/clip.mp4/index.m3u8$' <<<"$master")" 2
+check "with its size and codecs" "$(grep -o 'RESOLUTION=[0-9x]*,CODECS="[^"]*"' <<<"$master" | head -2 | tr '\n' ' ')" \
+      'RESOLUTION=640x360,CODECS="avc1.640028,mp4a.40.2" RESOLUTION=426x240,CODECS="avc1.640028,mp4a.40.2" '
+check "and the film's own stream, copied" "$(grep -c '^/~media/hls-copy/films/clip.mp4/index.m3u8$' <<<"$master")" 1
+idx=$(curl -s -u "$A" "$U/~media/hls-240/films/clip.mp4/index.m3u8")
+check "a rendition's playlist is whole from the start" "$(grep -c '^seg' <<<"$idx") $(grep -c ENDLIST <<<"$idx") $(grep -c 'PLAYLIST-TYPE:VOD' <<<"$idx")" "3 1 1"
+
+# The cache directory of a variant of a stored file: its name hashes the variant, the object and its ETag.
+mdir() { printf '%s\nfilms\n%s\n%s' "$1" "$2" "$(md5sum < "$3" | cut -d' ' -f1)" | sha256sum | sed "s|  -||; s|^|$T/media/.media/|"; }
+secs() { awk '{printf "%.0f", $1}'; }
+
+# A seek: a segment far into a film is made from there, on the film's own clock, and the rest joins up with it.
+ff -f lavfi -i testsrc2=size=640x360:rate=25 -f lavfi -i sine=frequency=330 -t 180 -c:v libx264 -preset ultrafast \
+   -pix_fmt yuv420p -c:a aac -shortest "$T/long.mp4"
+code -u "$A" -T "$T/long.mp4" "$U/~dav/films/long.mp4" >/dev/null
+L="$U/~media/hls-240/films/long.mp4"
+get "$T/init.mp4" -u "$A" "$L/init.mp4" >/dev/null
+t0=$(date +%s%N)
+check "a segment 48 s in, asked for first" "$(get "$T/s12.m4s" -u "$A" "$L/seg00012.m4s")" 200
+cat "$T/init.mp4" "$T/s12.m4s" > "$T/s12.mp4"
+check "begins 48 s into the film" "$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=start_time -of csv=p=0 "$T/s12.mp4" | secs)" 48
+mkdir -p "$T/lng"
+for i in $(seq 0 44); do curl -s -u "$A" -o "$T/lng/$(printf 'seg%05d.m4s' $i)" "$L/$(printf 'seg%05d.m4s' $i)"; done
+cat "$T/init.mp4" "$T"/lng/seg*.m4s > "$T/lng.mp4"
+check "and the whole film joins up, seek and all" "$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$T/lng.mp4" | secs)" 180
+check "and decodes without an error" "$("$FF" -v error -i "$T/lng.mp4" -f null - 2>&1 | grep -c .)" 0
+for _ in $(seq 1 20); do [ -e "$(mdir hls-240 long.mp4 "$T/long.mp4")/done" ] && break; sleep 0.1; done
+check "and is done, from two jobs" "$([ -e "$(mdir hls-240 long.mp4 "$T/long.mp4")/done" ] && echo yes)" yes
+
+# Held still: a job far ahead of every player waits for one, and goes on when one comes near.
+R="$U/~media/hls-360/films/long.mp4"
+code -u "$A" "$R/seg00000.m4s" >/dev/null
+sleep 6
+dir=$(mdir hls-360 long.mp4 "$T/long.mp4")
+made=$(ls "$dir" | grep -c '^seg.*\.m4s$')
+[ "$made" -ge 14 ] && [ "$made" -le 20 ] && ok || bad "a job far ahead of its player is held still" "$made segments made"
+sleep 2
+check "and stays held" "$(ls "$dir" | grep -c '^seg.*\.m4s$')" "$made"
+code -u "$A" "$R/seg00010.m4s" >/dev/null
+for _ in $(seq 1 50); do [ "$(ls "$dir" | grep -c '^seg.*\.m4s$')" -gt "$made" ] && break; sleep 0.2; done
+[ "$(ls "$dir" | grep -c '^seg.*\.m4s$')" -gt "$made" ] && ok || bad "a player coming near lets it go on" "still $made"
+
+# HDR is made SDR for an H.264 rendition, and a sound no browser plays is made AAC in a copied stream.
+ff -f lavfi -i testsrc2=size=640x360:rate=25 -t 4 -c:v libx265 -pix_fmt yuv420p10le \
+   -x265-params colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:log-level=error "$T/hdr.mp4"
+code -u "$A" -T "$T/hdr.mp4" "$U/~dav/films/hdr.mp4" >/dev/null
+check "an HDR film is said to be one" "$(curl -s -u "$A" "$U/~media/info/films/hdr.mp4" | python3 -c 'import json,sys; j=json.load(sys.stdin); print(j["video"], j["hdr"])')" "hevc True"
+get "$T/hi.mp4" -u "$A" "$U/~media/hls-360/films/hdr.mp4/init.mp4" >/dev/null
+get "$T/h0.m4s" -u "$A" "$U/~media/hls-360/films/hdr.mp4/seg00000.m4s" >/dev/null
+cat "$T/hi.mp4" "$T/h0.m4s" > "$T/h0.mp4"
+check "and its rendition is SDR, 8 bit" "$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=pix_fmt,color_transfer -of csv=p=0 "$T/h0.mp4")" "yuv420p,bt709"
+ff -f lavfi -i testsrc2=size=320x240:rate=25 -f lavfi -i sine=frequency=500 -t 6 -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+   -c:a ac3 -shortest "$T/ac3.mkv"
+code -u "$A" -T "$T/ac3.mkv" "$U/~dav/films/ac3.mkv" >/dev/null
+stream hls-copy ac3.mkv "$T/hac3"
+check "a copied stream keeps the picture and makes the sound AAC" \
+      "$("$FFPROBE" -v error -show_entries stream=codec_name -of csv=p=0 "$T/hac3/all.mp4" | tr '\n' ' ')" "h264 aac "
 
 # A restart keeps what was made.
 "$BIN" stop media >/dev/null 2>&1; "$BIN" start media >/dev/null 2>&1; up
