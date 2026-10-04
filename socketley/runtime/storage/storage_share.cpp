@@ -318,6 +318,7 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
             return;
         }
         ::unlink(path.c_str());
+        ::unlink((path + ".lock").c_str());
         app_reply(c, 204);
         return;
     }
@@ -431,7 +432,9 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
     const std::string_view range = r.header("range");
     if (r.method == "GET" && s.max_downloads && (range.empty() || range.starts_with("bytes=0-")))
     {
-        const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+        // Locked by a file of its own: the link's file is renamed over at every count, and a lock on it would be on
+        // the inode another request no longer opens.
+        const int fd = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
         bool allowed = false;
         if (fd >= 0 && ::flock(fd, LOCK_EX) == 0)
         {
@@ -529,6 +532,7 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
                 if (s.expires_ms && now_ms() > s.expires_ms)
                 {
                     ::unlink((dir + "/" + std::string(n)).c_str());
+                    ::unlink((dir + "/" + std::string(n) + ".lock").c_str());
                     continue;
                 }
                 if (u && !u->admin && s.owner != u->id)

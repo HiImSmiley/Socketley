@@ -69,8 +69,9 @@ constexpr int      write_stall_secs    = 120;
 namespace
 {
 
-// Threads that hash large bodies: three by default, none to hash on the loop.
-unsigned hash_threads()
+// Threads that hash large bodies: three a shard, fewer when the shards would together hold more than the machine has
+// cores; none to hash on the loop.
+unsigned hash_threads(uint32_t shards)
 {
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_HASH_THREADS"))
     {
@@ -79,13 +80,14 @@ unsigned hash_threads()
         if (end != e && v >= 0 && v <= 16)
             return static_cast<unsigned>(v);
     }
-    return 3;
+    const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+    return std::clamp(cpus / std::max<uint32_t>(shards, 1), 1u, 3u);
 }
 
 }   // namespace
 
 storage_run::storage_run(storage_instance& owner, event_loop& loop, store_options opts, authenticator* auth)
-    : m_owner(owner), m_loop(loop), m_io(loop, this), m_hash(hash_threads()),
+    : m_owner(owner), m_loop(loop), m_io(loop, this), m_hash(hash_threads(opts.nshards)),
       m_store(loop, m_io, std::move(opts)),
       m_mpu(loop, m_io, m_store),
       m_notify(loop, m_io, this),
@@ -218,6 +220,7 @@ void s3_request::reset()
     key.clear();
     vhost = false;
     website = false;
+    head_request = false;
     app = 0;
     headers.clear();
     query.clear();
@@ -1474,6 +1477,16 @@ void storage_run::send_response(const std::shared_ptr<conn>& c, response r)
     else if (r.status >= 400)
         ++m_c.client_errors;
     r.close = r.close || !c->req.keep_alive;
+    // A HEAD's answer keeps the length its body would have had and leaves the body out, whoever built it.
+    if (c->req.head_request && !r.head_only)
+    {
+        if (!r.has_length_override)
+        {
+            r.has_length_override = true;
+            r.length_override = r.body_view.data() ? r.body_view.size() : r.body.size();
+        }
+        r.head_only = true;
+    }
 
     c->ph = phase::respond;
     const std::string_view body = r.head_only ? std::string_view{}
@@ -1608,6 +1621,11 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->on_answer = nullptr;
     c->app_header.clear();
     c->share_id.clear();
+    // A large GET's or a signed PUT's buffers are not kept for the rest of a keep-alive connection's life.
+    if (c->sbuf.capacity() > 64 * 1024)
+        std::string().swap(c->sbuf);
+    if (c->park.capacity() > 64 * 1024)
+        std::string().swap(c->park);
 }
 
 void storage_run::finish_request(const std::shared_ptr<conn>& c)
@@ -1688,6 +1706,7 @@ bool storage_run::parse_head(const std::shared_ptr<conn>& c, std::string_view he
     if (sp2 == std::string_view::npos)
         return bad("InvalidRequest");
     r.method  = line.substr(0, sp1);
+    r.head_request = r.method == "HEAD";
     const std::string_view target = line.substr(sp1 + 1, sp2 - sp1 - 1);
     r.version = line.substr(sp2 + 1);
     if (r.version != "HTTP/1.1" && r.version != "HTTP/1.0")
@@ -2338,6 +2357,8 @@ void storage_run::send_file(const std::shared_ptr<conn>& c, response head, int f
     head.head_only = true;
     head.has_length_override = true;
     head.length_override = len;
+    // A large body is read ahead in big steps, as a player's or a download's reading of it goes on in order.
+    if (len >= (1u << 20) && ::posix_fadvise(fd, static_cast<off_t>(off), static_cast<off_t>(len), POSIX_FADV_SEQUENTIAL) != 0) {}
 
     c->file_fd   = fd;
     c->file_off  = off;
