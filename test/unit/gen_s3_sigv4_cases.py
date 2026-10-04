@@ -58,8 +58,9 @@ def chunk_sig(key, amzdate, scope, prev, data):
 def trailer_sig(key, amzdate, scope, prev, trailer_text):
     return hm(key, '\n'.join(['AWS4-HMAC-SHA256-TRAILER', amzdate, scope, prev, H(trailer_text.encode())])).hex()
 
-def signed_stream(secret, region, amzdate, seed, pieces, trailers=None):
-    """aws-chunked body: signed chunks, and with `trailers` (list of (name, value)) a signed trailer."""
+def signed_stream(secret, region, amzdate, seed, pieces, trailers=None, minio=False):
+    """aws-chunked body: signed chunks, and with `trailers` (list of (name, value)) a signed trailer; `minio` ends each
+    trailer line as minio-go does, with a bare LF and then a CRLF of its own before the signature."""
     key = skey(secret, amzdate[:8], region, 's3'); scope = f'{amzdate[:8]}/{region}/s3/aws4_request'
     out = b''; prev = seed
     for p in pieces + [b'']:
@@ -69,7 +70,8 @@ def signed_stream(secret, region, amzdate, seed, pieces, trailers=None):
         return out + b'\r\n'
     text = ''.join(f'{n}:{v}\n' for n, v in trailers)
     ts = trailer_sig(key, amzdate, scope, prev, text)
-    return out + ''.join(f'{n}:{v}\r\n' for n, v in trailers).encode() + f'x-amz-trailer-signature:{ts}\r\n\r\n'.encode()
+    lines = ''.join(f'{n}:{v}\n' for n, v in trailers) + '\r\n' if minio else ''.join(f'{n}:{v}\r\n' for n, v in trailers)
+    return out + lines.encode() + f'x-amz-trailer-signature:{ts}\r\n\r\n'.encode()
 
 # ---------------------------------------------------------------- output
 
@@ -208,7 +210,7 @@ REF_AK, REF_SK = 'AKIDSTREAMING', 'ref/secret+key0123456789ABCDEFGHIJKLMNOPQR'
 REF_DATE = '20260929T120000Z'
 
 def ref_streams():
-    def one(name, region, kind, pieces, trailers=None, unsigned_trailer_body=None, extra=()):
+    def one(name, region, kind, pieces, trailers=None, unsigned_trailer_body=None, extra=(), minio=False):
         decoded = b''.join(pieces)
         hdrs = [('Host', 'storage.local:9000'), ('x-amz-date', REF_DATE), ('Content-Encoding', 'aws-chunked'),
                 ('x-amz-decoded-content-length', str(len(decoded))), ('x-amz-content-sha256', kind)]
@@ -220,7 +222,10 @@ def ref_streams():
         if kind == 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD':
             body = signed_stream(REF_SK, region, REF_DATE, seed, pieces)
         elif kind == 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER':
-            body = signed_stream(REF_SK, region, REF_DATE, seed, pieces, trailers)
+            body = signed_stream(REF_SK, region, REF_DATE, seed, pieces, trailers, minio)
+        elif minio:
+            # minio-go ends an unsigned trailer with its lines' bare LFs and one CRLF.
+            body = b''.join(f'{len(p):x}\r\n'.encode() + p + b'\r\n' for p in pieces) + b'0\r\n' + ''.join(f'{n}:{v}\n' for n, v in trailers or []).encode() + b'\r\n'
         else:
             body = b''.join(f'{len(p):x}\r\n'.encode() + p + b'\r\n' for p in pieces) + b'0\r\n' + ''.join(f'{n}:{v}\r\n' for n, v in trailers or []).encode() + b'\r\n'
         kmap = {'STREAMING-AWS4-HMAC-SHA256-PAYLOAD': 'streaming_signed', 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER': 'streaming_signed_trailer',
@@ -243,6 +248,9 @@ def ref_streams():
     one('unsigned-trailer-crc32', 'us-east-1', UT, [text[:150], text[150:]], [crc])
     one('unsigned-trailer-sha256', 'us-east-1', UT, [text], [sha])
     one('unsigned-trailer-empty', 'us-east-1', UT, [], [('x-amz-checksum-crc32', 'AAAAAA==')])
+    crc32c = ('x-amz-checksum-crc32c', 'GZjGfw==')
+    one('minio-go-signed-trailer-crc32c', 'us-east-1', ST, [text[:100]], [crc32c], minio=True)
+    one('minio-go-unsigned-trailer-crc32c', 'us-east-1', UT, [text[:100]], [crc32c], minio=True)
 
 def ref_paths():
     def one(name, path, query, verbatim=False):

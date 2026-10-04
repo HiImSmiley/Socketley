@@ -1119,12 +1119,20 @@ bool chunk_stream::on_trailer()
         if (!hex_decode32(sig_line.substr(name.size()), claimed))
             return bad(stream_status::malformed);
 
-        // The signed text is the trailer headers with each CRLF turned into a bare LF.
+        // The signed text is each trailer header line ended by a bare LF, whatever ended it on the wire.
         std::string canon;
-        std::string_view headers = body.substr(0, line_start);
-        for (char c : headers)
-            if (c != '\r')
-                canon.push_back(c);
+        for (std::string_view headers = body.substr(0, line_start); !headers.empty();)
+        {
+            const size_t eol = headers.find('\n');
+            std::string_view line = headers.substr(0, eol);
+            headers = eol == std::string_view::npos ? std::string_view{} : headers.substr(eol + 1);
+            if (!line.empty() && line.back() == '\r')
+                line.remove_suffix(1);
+            if (line.empty())
+                continue;
+            canon.append(line);
+            canon.push_back('\n');
+        }
         uint8_t h[32];
         char hex[64];
         sha256_of(canon, h);
@@ -1149,11 +1157,13 @@ std::string_view chunk_stream::trailer_value(std::string_view name) const
     std::string_view t(trailer_, trailer_len_);
     while (!t.empty())
     {
-        size_t eol = t.find("\r\n");
+        size_t eol = t.find('\n');
         if (eol == std::string_view::npos)
             break;
         std::string_view line = t.substr(0, eol);
-        t.remove_prefix(eol + 2);
+        t.remove_prefix(eol + 1);
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
         size_t colon = line.find(':');
         if (colon != std::string_view::npos && ieq(trim(line.substr(0, colon)), name))
             return trim(line.substr(colon + 1));
@@ -1221,10 +1231,13 @@ feed_result chunk_stream::feed(std::string_view in)
             trailer_[trailer_len_++] = c;
             if (c != '\n')
                 break;
-            if (trailer_len_ < 2 || trailer_[trailer_len_ - 2] != '\r')
-                return {fail(stream_status::malformed), pos, {}};
-            // The trailer ends at a blank line: "\r\n" alone, or a line ending followed directly by another.
-            bool blank = trailer_len_ == 2 || (trailer_len_ >= 4 && trailer_[trailer_len_ - 3] == '\n');
+            // A line ends in CRLF, or in a bare LF that minio-go follows with one CRLF: before its trailer's
+            // signature, or as the end of an unsigned trailer.  Otherwise the trailer ends at a CRLF after a CRLF.
+            const bool crlf     = trailer_len_ >= 2 && trailer_[trailer_len_ - 2] == '\r';
+            const bool after_lf = trailer_len_ >= 3 && trailer_[trailer_len_ - 3] == '\n';
+            const bool after_crlf = after_lf && trailer_len_ >= 4 && trailer_[trailer_len_ - 4] == '\r';
+            bool blank = crlf && (trailer_len_ == 2 || after_crlf ||
+                                  (after_lf && ctx_.kind == payload_kind::streaming_unsigned_trailer));
             if (!blank)
                 break;
             if (ctx_.kind == payload_kind::streaming_signed)

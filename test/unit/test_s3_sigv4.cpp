@@ -295,7 +295,7 @@ TEST_CASE("every case verifies, and says what its payload is")
             CHECK(std::string(kind_name(res.payload)) == std::string(c.kind));
         n++;
     }
-    CHECK(n == 88);
+    CHECK(n == 90);
 }
 
 TEST_CASE("every case that declares a body hash checks the body against it")
@@ -716,9 +716,14 @@ TEST_CASE("an unsigned trailer stream needs no request to be decoded")
     CHECK(d3.empty());
     CHECK(s3_.trailer_value("x").empty());
 
+    // minio-go ends each trailer line with a bare LF and the trailer with one CRLF, which ends it here as there.
     s3::chunk_stream s4(s3::stream_context::unsigned_trailer());
     std::string d4;
-    CHECK(feed_all(s4, "5\r\nhello\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\n\r\n", 40, d4) == s3::stream_status::malformed);
+    CHECK(feed_all(s4, "5\r\nhello\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\n\r\n", 40, d4) == s3::stream_status::done);
+    CHECK(s4.trailer_value("x-amz-checksum-crc32") == "AAAAAA==");
+    s3::chunk_stream s5(s3::stream_context::unsigned_trailer());
+    std::string d5;
+    CHECK(feed_all(s5, "5\r\nhello\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\nx", 40, d5) == s3::stream_status::need_more);
 }
 
 // ─── every field tampered ───
