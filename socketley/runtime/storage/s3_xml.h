@@ -290,6 +290,7 @@ struct list_render
     std::string_view delimiter;
     std::string_view start_after;
     std::string_view continuation_token;
+    bool             has_continuation{false};
     std::string_view next_token;
     std::string_view marker;        // V1
     std::string_view next_marker;   // V1
@@ -329,11 +330,15 @@ inline void list_xml_head(std::string& x, const list_render& r, size_t key_count
     x += "\"><Name>";
     xml_escape_to(x, r.bucket);
     x += "</Name><Prefix>";
-    list_xml_text(x, r, r.prefix);
+    // A version 1 listing gives its Prefix back as it was asked, which is how its clients read it.
+    if (r.v2)
+        list_xml_text(x, r, r.prefix);
+    else
+        xml_escape_to(x, r.prefix);
     x += "</Prefix>";
     if (r.v2)
     {
-        if (!r.continuation_token.empty())
+        if (r.has_continuation || !r.continuation_token.empty())
         {
             x += "<ContinuationToken>";
             xml_escape_to(x, r.continuation_token);

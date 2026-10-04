@@ -274,13 +274,18 @@ void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint3
         uint64_t lo = 0, hi = 0;
         const size_t dash = range.find('-');
         if (!range.starts_with("bytes=") || dash == std::string_view::npos ||
-            !parse_u64(range.substr(6, dash - 6), lo) || !parse_u64(range.substr(dash + 1), hi) ||
-            lo > hi || hi >= src->size)
+            !parse_u64(range.substr(6, dash - 6), lo) || !parse_u64(range.substr(dash + 1), hi) || lo > hi)
         {
             s3_error e = make_error("InvalidArgument");
             e.message  = "The x-amz-copy-source-range value must be of the form bytes=first-last where first and last "
                          "are the zero-based offsets of the first and last bytes to copy";
             send_error(c, e, false, "ArgumentName", "x-amz-copy-source-range");
+            return;
+        }
+        // A range past the source's end is one it cannot satisfy, as S3 answers it.
+        if (hi >= src->size)
+        {
+            send_error(c, make_error("InvalidRange"), false, "RangeRequested", range);
             return;
         }
         first = lo;

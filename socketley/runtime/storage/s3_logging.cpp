@@ -88,9 +88,10 @@ std::string logging_config_xml(const logging_config* c)
         x += "</TargetBucket><TargetPrefix>";
         xml_escape_to(x, c->target_prefix);
         x += "</TargetPrefix>";
-        if (c->partitioned)
-            x += "<TargetObjectKeyFormat><PartitionedPrefix><PartitionDateSource>DeliveryTime</PartitionDateSource>"
-                 "</PartitionedPrefix></TargetObjectKeyFormat>";
+        // The key format is told whether it was given or left to its default.
+        x += c->partitioned ? "<TargetObjectKeyFormat><PartitionedPrefix><PartitionDateSource>DeliveryTime"
+                              "</PartitionDateSource></PartitionedPrefix></TargetObjectKeyFormat>"
+                            : "<TargetObjectKeyFormat><SimplePrefix/></TargetObjectKeyFormat>";
         x += "</LoggingEnabled>";
     }
     x += "</BucketLoggingStatus>";

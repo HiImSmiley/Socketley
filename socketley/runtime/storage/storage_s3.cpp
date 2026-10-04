@@ -1037,13 +1037,15 @@ void storage_run::op_list_objects(const std::shared_ptr<conn>& c, bool v2)
         if (q.has_query("continuation-token"))
         {
             lr.continuation_token = q.get_query("continuation-token");
+            lr.has_continuation   = true;
             std::string bound;
-            if (lr.continuation_token.empty() || !base64url_decode(lr.continuation_token, bound))
+            // An empty token is the first page, and is given back as it came.
+            if (!lr.continuation_token.empty() && !base64url_decode(lr.continuation_token, bound))
             {
                 bad_arg("continuation-token", "The continuation token provided is incorrect");
                 return;
             }
-            lq.has_resume = true;
+            lq.has_resume = !lr.continuation_token.empty();
             lq.resume_at  = std::move(bound);
         }
     }
@@ -1170,6 +1172,10 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
         auto cc = bt->weak.lock();
         if (!cc || cc->dead)
             return;
+        // Each key is a line of the access log of its own, as S3 writes one for each in a batch.
+        for (const delete_result& one : bt->results)
+            access_log(cc, one.ok ? 204 : one.error.status, 0, "BATCH.DELETE.OBJECT", one.key,
+                       one.ok ? std::string_view{} : std::string_view(one.error.code));
         response r;
         r.headers.emplace_back("Content-Type", "application/xml");
         r.body = delete_result_xml(bt->results, bt->quiet);

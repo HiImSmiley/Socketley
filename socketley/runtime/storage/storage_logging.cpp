@@ -85,8 +85,10 @@ void operation_of(std::string& out, const s3_request& r)
     out += r.method;
     out += '.';
     if (!r.key.empty())
-        out += r.has_query("uploadId") ? "UPLOAD" : r.has_query("uploads") ? "UPLOADS"
+        out += r.has_query("partNumber") ? "PART" : r.has_query("uploadId") ? "UPLOAD" : r.has_query("uploads") ? "UPLOADS"
              : r.has_query("tagging") ? "OBJECT_TAGGING" : r.has_query("acl") ? "ACL" : "OBJECT";
+    else if (r.method == "POST" && r.has_query("delete"))
+        out += "MULTI_OBJECT_DELETE";
     else if (!r.query.empty() && r.query.front().second.empty() && !r.website)
         for (char ch : r.query.front().first)
             out += static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
@@ -148,7 +150,8 @@ void storage_run::op_get_logging(const std::shared_ptr<conn>& c)
 
 // ─── Lines ──────────────────────────────────────────────────────────────────
 
-void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_t bytes)
+void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_t bytes, std::string_view op,
+                             std::string_view key, std::string_view error)
 {
     const s3_request& r = c->req;
     if (!m_store.any_logging() || r.bucket.empty())
@@ -177,12 +180,19 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
     plain(l, ip);
     plain(l, c->anonymous ? std::string_view{} : std::string_view(c->principal));
     plain(l, r.request_id);
-    operation_of(l, r);
-    if (r.key.empty())
+    if (op.empty())
+        operation_of(l, r);
+    else
+    {
+        l += op;
+        l += ' ';
+    }
+    const std::string_view k = op.empty() ? std::string_view(r.key) : key;
+    if (k.empty())
         l += "- ";
     else
     {
-        url_encode_to(l, r.key, true);
+        url_encode_to(l, k, true);
         l += ' ';
     }
     l += '"';
@@ -198,7 +208,7 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
     l += r.version.empty() ? std::string_view("HTTP/1.1") : r.version;
     l += "\" ";
     number(l, static_cast<uint64_t>(status), false);
-    plain(l, c->error_code);
+    plain(l, op.empty() ? std::string_view(c->error_code) : error);
     number(l, bytes, true);
     number(l, r.method == "PUT" && r.has_content_length ? r.content_length : 0, true);
     number(l, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(

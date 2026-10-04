@@ -697,7 +697,9 @@ public:
     void op_get_logging(const std::shared_ptr<conn>& c);
     void op_put_logging(const std::shared_ptr<conn>& c);
     // Notes the answer to `c`'s request, `status` with `bytes` of body, in its bucket's access log when it has one.
-    void access_log(const std::shared_ptr<conn>& c, int status, uint64_t bytes);
+    // `op`, `key` and `error`, when given, stand for the request's own, as for each key of a DeleteObjects.
+    void access_log(const std::shared_ptr<conn>& c, int status, uint64_t bytes, std::string_view op = {},
+                    std::string_view key = {}, std::string_view error = {});
     // Delivers the access logs held longer than the delivery interval, or every one when `all`.
     void flush_access_logs(bool all);
     void deliver_access_log(const std::string& target, std::string key, bool partitioned, std::string data);

@@ -2154,7 +2154,8 @@ std::string reference_list_xml(const list_render& r, const list_page& p)
     std::string x(xml_decl);
     x += "<ListBucketResult xmlns=\"" + std::string(s3_xmlns) + "\">";
     x += "<Name>" + reference_escape(r.bucket) + "</Name>";
-    x += "<Prefix>" + enc(r.prefix) + "</Prefix>";
+    // Version 1 gives its prefix back as asked, which is how botocore reads it.
+    x += "<Prefix>" + (r.v2 ? enc(r.prefix) : reference_escape(r.prefix)) + "</Prefix>";
     if (r.v2)
     {
         if (!r.continuation_token.empty())
