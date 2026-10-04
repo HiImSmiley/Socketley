@@ -825,6 +825,23 @@ socketley daemon stats
 .fi
 .RE
 .TP
+.B acme issue \-\-domains \fIname\fR[\fB,\fIname\fR...] \fR[\fB\-\-cert \fIfile\fR] [\fB\-\-key \fIfile\fR] [\fB\-\-email \fIaddress\fR] [\fB\-\-directory \fIurl\fR] [\fB\-\-challenge http\-01\fR|\fBtls\-alpn\-01\fR]
+A certificate from an ACME CA by hand, as certbot gives one: the account is made
+once per CA and kept in
+.IR state\-dir /.acme/,
+the names are proven over HTTP-01 by the daemon's runtimes on port 80, or with
+.B "\-\-challenge tls\-alpn\-01"
+by its TLS runtime on port 443, as
+.B \-\-acme
+describes, and the chain and a new key are written to the files, the key first,
+by default those
+.B \-\-acme
+uses for the first name, so a runtime serving them takes them up. It needs no
+daemon to be running, only one of its runtimes on the port the challenge is asked on. Silent on
+success; the CA's reason and exit status 2 otherwise. It is what a runtime with
+.B \-\-acme
+runs to renew.
+.TP
 .B daemons
 Every daemon that has registered itself, with its pid, whether it still answers,
 and the executable serving it \(em which differs per socket once a daemon built
@@ -2206,9 +2223,14 @@ version. There is deliberately no skip-verify option: a TLS client that does
 not verify buys encryption against an eavesdropper and nothing at all against
 somebody in the path, while reporting itself as encrypted either way.
 .PP
-Certificates and trust stores are read when the runtime starts, so
-.B reload
-is how a renewed certificate is installed \(em on every role that has one. A
+Trust stores are read when the runtime starts, and a listener's certificate and
+key are looked at again every two seconds: replaced on disk \(em by
+.BR \-\-acme ,
+certbot or a copy \(em they are taken up for the handshakes from then on,
+without a restart and without dropping a connection, once both load and match.
+A pair that does not is kept out, said once in the log, and the old one goes on
+serving. The certificate file is sent with every certificate in it, so a CA's
+intermediates go with the leaf. A
 certificate that cannot be loaded, a key that does not match it, and any
 incomplete combination (\c
 .B \-\-tls
@@ -2237,6 +2259,50 @@ in the clear off a port that reports itself as encrypted. See
 .B TLS
 under
 .BR LIMITATIONS .
+.TP
+.BI "\-\-acme " "name" \fR[\fB,\fIname\fR...]
+.TQ
+.BI "\-\-acme\-email " "address"
+.B "server, proxy, cache, storage."
+A certificate for the names from an ACME CA, Let's Encrypt unless
+.B SOCKETLEY_ACME_DIRECTORY
+names another, issued and renewed by the runtime itself:
+.B \-\-acme
+turns on
+.B \-\-tls
+and keeps the certificate and its key in
+.IR state\-dir /.acme/ name /,
+for the first name. Until the CA has issued one, a self-signed certificate valid
+for a week stands in, so the listener starts at once; the issued one replaces it
+within seconds, and is renewed when it has less than thirty days left, tried
+again after a minute, then twice as long each time up to six hours, with the
+CA's reason in the log.
+.B \-\-acme\-email
+is the account's contact, where the CA writes before a certificate expires.
+.IP
+A runtime on port 443 proves its names over TLS-ALPN-01, on its own listener:
+the CA's handshake asks for
+.B acme\-tls/1
+by the name, is shown a challenge certificate for it, and no other handshake is,
+so a proxy on 443 alone is enough. Any other runtime proves them over HTTP-01: the CA asks
+.BI http:// name /.well\-known/acme\-challenge/ token
+on port 80, and every socketley
+.BR server ,
+.B proxy
+and
+.B storage
+of the daemon answers that path on any port, for a token the daemon is waiting
+on, before it routes, serves or runs a script, so a runtime on port 80 \(em the
+proxy that redirects to HTTPS, say \(em is all it takes. Any other token goes
+where the path would have gone, so a site's own files there, as certbot's
+webroot writes them, are served as before. A name is a DNS name with a dot: a wildcard, which needs
+DNS-01, and an address are refused.
+.IP
+.nf
+socketley create proxy web \-p 443 \-\-acme example.com,www.example.com \\
+    \-\-acme\-email ops@example.com \-\-backend 127.0.0.1:8080 \-s
+socketley create proxy plain \-p 80 \-\-backend 127.0.0.1:8080 \-s
+.fi
 .TP
 .BI "\-g " "name"
 .TQ
@@ -13641,6 +13707,25 @@ of its own for that one read, counted as
 in
 .BR stats .
 This changes the memory a worker holds and never what it returns.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_ACME_DIRECTORY
+The directory URL of the ACME CA that
+.B \-\-acme
+and
+.B acme issue
+use. Default: Let's Encrypt,
+.BR https://acme\-v02.api.letsencrypt.org/directory ;
+its staging CA is
+.BR https://acme\-staging\-v02.api.letsencrypt.org/directory .
+Each CA has an account of its own.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_ACME_CA
+A PEM file of the roots the ACME CA's own HTTPS is checked against, for a CA
+whose certificate no system store holds, as Pebble's. Default: the system's roots.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
