@@ -6647,6 +6647,14 @@ GetBucketPolicyStatus	GET /bucket?policyStatus	T{
 .ad l
 IsPublic: whether an Allow lets everyone in from any address; NoSuchBucketPolicy (404) when there is none.
 T}
+PutBucketLogging	PUT /bucket?logging	T{
+.ad l
+A BucketLoggingStatus naming a TargetBucket of the same owner, a TargetPrefix and SimplePrefix or PartitionedPrefix keys; an empty one turns logging off; TargetGrants is AccessControlListNotSupported (400). See \fBServer access logging\fR below.
+T}
+GetBucketLogging	GET /bucket?logging	T{
+.ad l
+The status as it is kept, an empty one for a bucket that is not logged.
+T}
 PutPublicAccessBlock	PUT /bucket?publicAccessBlock	T{
 .ad l
 A PublicAccessBlockConfiguration, every setting false when left out. See \fBPublic access block\fR below.
@@ -6732,7 +6740,7 @@ has, and one it does not have is
 .BR "400 InvalidStorageClass" ;
 .B x\-amz\-website\-redirect\-location
 is kept and returned like the other stored headers.
-Anything else \(em other ownership controls, logging, replication \(em is answered
+Anything else \(em other ownership controls, analytics, inventory \(em is answered
 .B "501 NotImplemented"
 and never mistaken for the plain operation. A single put is at most 5 GiB and a
 key at most 1024 bytes.
@@ -8337,6 +8345,48 @@ answered 503 the same way. A shard that starts while a change is undecided, or t
 bucket up later than the others, reads the bucket's documents the same way before
 serving it. This costs a runtime with no change in flight one counter load per
 request.
+.SS Server access logging
+A logged bucket's every answer is a line of S3's server access log format in
+objects delivered to its target bucket:
+.RS
+.PP
+.nf
+PUT /photos?logging
+<BucketLoggingStatus>
+  <LoggingEnabled>
+    <TargetBucket>logs</TargetBucket>
+    <TargetPrefix>photos/</TargetPrefix>
+  </LoggingEnabled>
+</BucketLoggingStatus>
+.fi
+.RE
+.PP
+A line names the bucket's owner and the bucket, the time, the client's address,
+the requester's access key (\- for none), the request id, the operation
+.RB ( REST.GET.OBJECT ,
+.BR REST.PUT.VERSIONING ,
+.B WEBSITE.GET.OBJECT
+and so on), the key, the request line, the status, the error code, the bytes of
+body sent, a put's size, the milliseconds from the request's start to its answer,
+the referer and user agent, the signature version and how it was given, the TLS
+cipher, the Host header and the TLS version; a field this runtime does not know
+is \-, as S3 writes one it has nothing for. A line is written when the answer
+starts, so a download that is cut off is logged as sent.
+.PP
+Each shard holds its lines for each target and delivers them as one object once
+a minute's worth or 1 MiB are held, named
+.IB prefix YYYY-MM-DD-hh-mm-ss- unique,
+or with a PartitionedPrefix
+.IB prefix owner /us\-east\-1/ bucket / YYYY / MM / DD / YYYY-MM-DD-hh-mm-ss- unique
+by the delivery's date. The object is put as a client's would be, encrypted when
+the target encrypts and replicated and notified when it is; one that cannot be
+put, the target having been deleted or gone past its quota, is dropped with a
+warning in the log. Lines still held when the runtime stops are lost, as at most
+a minute of them. The target must be a bucket with the same owner as the logged
+one; it may be the logged bucket itself, and the deliveries are not logged. The
+configuration is kept in
+.IB dir / bucket /logging
+and changed by shard 0 like the bucket's other documents.
 .SS Public access block
 A bucket's public access block keeps it from being opened to everyone by mistake:
 .RS
@@ -13301,6 +13351,12 @@ Inherited by worker processes, which have no command line of their own.
 .B SOCKETLEY_STORAGE_START_SLEEP_MS
 A test aid: milliseconds, 0 to 60000, that a storage shard's start waits doing
 nothing before it opens its store, as a wedged start would.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_STORAGE_LOG_FLUSH_MS
+A test aid: milliseconds, 100 to 3600000, that a storage shard holds a server
+access log's lines before it delivers them, instead of a minute.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
