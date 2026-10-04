@@ -37,7 +37,9 @@ namespace socketley::storage
 namespace
 {
 
-constexpr int     media_jobs_max   = 2;
+// Thumbnails queue behind a few at a time; a stream is someone waiting to watch, and never waits for another's film.
+constexpr int     thumb_jobs_max   = 2;
+constexpr int     hls_jobs_max     = 8;
 constexpr int64_t media_tick_ms    = 100;
 constexpr int64_t media_wait_ms    = 60000;
 constexpr int64_t thumb_job_ms     = 60000;
@@ -384,7 +386,8 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
     }
     // Whoever holds the lock is making it, here or on another shard, and a request for it keeps it wanted.
     ::utimensat(AT_FDCWD, lock.c_str(), nullptr, 0);
-    if (m_media_jobs.size() >= static_cast<size_t>(media_jobs_max))
+    const auto same_kind = std::ranges::count_if(m_media_jobs, [&](const media_job& j) { return j.want.hls == w.hls; });
+    if (same_kind >= (w.hls ? hls_jobs_max : thumb_jobs_max))
         return false;
     if (::mkdir(w.dir.c_str(), 0700) < 0 && errno != EEXIST)
     {
