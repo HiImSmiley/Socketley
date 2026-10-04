@@ -83,8 +83,8 @@ constexpr int64_t seek_beyond      = 5;
 constexpr int64_t pause_ahead      = 15;
 constexpr int64_t resume_within    = 8;
 constexpr int64_t unasked_ms       = 10000;
-// An init segment asked for with no job running waits this long for the segment request that begins the right one.
-constexpr int64_t init_grace_ms    = 1500;
+// A job begun for an init segment that no player has asked a segment of is held after this long.
+constexpr int64_t init_only_ms     = 2000;
 // A use of a medium is written to its lock's time at most this often, and eviction runs at most this often.
 constexpr int64_t touch_every_ms   = 60000;
 constexpr int64_t evict_every_ms   = 30000;
@@ -687,7 +687,7 @@ void note_asked(const std::string& path, int64_t seg)
 
 void drop_job_files(const std::string& dir, int64_t from)
 {
-    for (const char* ext : {".pos", ".want", ".log", ".m3u8", ".pid", ".lock"})
+    for (const char* ext : {".pos", ".want", ".log", ".m3u8", ".pid", ".drop", ".lock"})
         ::unlink(job_file(dir, from, ext).c_str());
     ::unlink(job_file(dir, from, "-init.mp4").c_str());
 }
@@ -1331,9 +1331,11 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
     for (const region& r : live)
         if (w.seg < 0 || (seg >= r.from && seg <= r.next + seek_beyond))
             return false;
-    // An init segment with no job waits a moment for the segment request that begins the job the player wants.
-    if (w.seg < 0 && now_ms() - w.asked_ms < init_grace_ms)
-        return false;
+    // A far segment is a seek, and a job begun only for an init, which no player asked a segment of, is let go.
+    if (w.seg >= 0)
+        for (const region& r : live)
+            if (read_int(job_file(w.dir, r.from, ".want"), 0) < 0)
+                mark(w.dir + "/jobs", (std::to_string(r.from) + ".drop").c_str());
     // Nothing near it: a seek, or the first player, and a job begins at the segment asked for, making room by
     // ending a job held still that nobody asks of.
     auto streams = std::ranges::count_if(m_media_jobs, [](const media_job& j) {
@@ -1371,7 +1373,8 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
         return false;
     }
     write_int(job_file(w.dir, seg, ".pos"), seg);
-    write_int(job_file(w.dir, seg, ".want"), seg);
+    // A job begun for an init has been asked no segment yet, which is -1.
+    write_int(job_file(w.dir, seg, ".want"), w.seg < 0 ? -1 : seg);
     if (!media_start(w, lock_fd, seg))
     {
         drop_job_files(w.dir, seg);
@@ -1452,9 +1455,12 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
         if (!pp)
             return false;
     }
+    // Sound is copied only by the copied stream, which never begins mid-film: a copy begun at a seek keeps the
+    // packets from the keyframe before it, and its segment starts there instead of at its own four seconds.
+    const std::vector<std::string> aac = {"-c:a", "aac", "-aac_coder", "fast", "-b:a", "160k", "-ac", "2"};
     const std::vector<std::string> audio = !pp || !pp->audio ? std::vector<std::string>{}
-                                         : audio_copies(*pp) ? std::vector<std::string>{"-c:a", "copy"}
-                                         : std::vector<std::string>{"-c:a", "aac", "-aac_coder", "fast", "-b:a", "160k", "-ac", "2"};
+                                         : w.kind == k_copy && audio_copies(*pp) ? std::vector<std::string>{"-c:a", "copy"}
+                                         : aac;
     switch (w.kind)
     {
         case k_thumb:
@@ -1544,7 +1550,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
                                      job_file(w.dir, from, ".m3u8")});
             j.from = from;
             j.next = from;
-            j.wanted = from;
+            j.wanted = w.seg < 0 ? -1 : from;
             j.asked_ms = now_ms();
             j.total = segments_of(p);
             break;
@@ -1682,11 +1688,14 @@ void storage_run::media_tick()
                 // Run into what another job made: this one's work is done. Two made ahead of it can only be another's.
                 const bool merged = j.next > j.from && exists(j.want.dir + "/" + seg_name(j.next)) &&
                                     (j.next + 1 >= j.total || exists(j.want.dir + "/" + seg_name(j.next + 1)));
-                // Held still with nobody asking for a minute, or running with nobody asking for the idle time.
-                const bool abandoned = now - j.asked_ms > (j.paused ? 60000 : hls_idle_ms);
+                // Held still with nobody asking for a minute, running with nobody asking for the idle time, or begun
+                // for an init and let go by the seek that followed it.
+                const bool abandoned = now - j.asked_ms > (j.paused ? 60000 : hls_idle_ms) ||
+                                       exists(job_file(j.want.dir, j.from, ".drop"));
                 if (!merged && !abandoned)
                 {
-                    const bool unasked = now - j.asked_ms > unasked_ms;
+                    const bool unasked = now - j.asked_ms > unasked_ms ||
+                                         (j.wanted < 0 && now - j.started_ms > init_only_ms);
                     if (!j.paused && (j.next > j.wanted + pause_ahead || (unasked && j.next > j.wanted + 2)))
                     {
                         ::kill(j.pid, SIGSTOP);
