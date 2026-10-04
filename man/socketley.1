@@ -6647,6 +6647,18 @@ GetBucketPolicyStatus	GET /bucket?policyStatus	T{
 .ad l
 IsPublic: whether an Allow lets everyone in from any address; NoSuchBucketPolicy (404) when there is none.
 T}
+PutPublicAccessBlock	PUT /bucket?publicAccessBlock	T{
+.ad l
+A PublicAccessBlockConfiguration, every setting false when left out. See \fBPublic access block\fR below.
+T}
+GetPublicAccessBlock	GET /bucket?publicAccessBlock	T{
+.ad l
+The four settings; NoSuchPublicAccessBlockConfiguration (404) when there is none.
+T}
+DeletePublicAccessBlock	DELETE /bucket?publicAccessBlock	T{
+.ad l
+204 whether or not there was one; answers to s3:PutBucketPublicAccessBlock, as on S3.
+T}
 PutBucketNotificationConfiguration	PUT /bucket?notification	T{
 .ad l
 A NotificationConfiguration whose destinations are webhooks of \fB\-\-notify\-targets\fR, replacing the one before; an empty one removes it. See \fBEvent notifications\fR below.
@@ -8325,6 +8337,37 @@ answered 503 the same way. A shard that starts while a change is undecided, or t
 bucket up later than the others, reads the bucket's documents the same way before
 serving it. This costs a runtime with no change in flight one counter load per
 request.
+.SS Public access block
+A bucket's public access block keeps it from being opened to everyone by mistake:
+.RS
+.PP
+.nf
+PUT /photos?publicAccessBlock
+<PublicAccessBlockConfiguration>
+  <BlockPublicPolicy>true</BlockPublicPolicy>
+  <RestrictPublicBuckets>true</RestrictPublicBuckets>
+</PublicAccessBlockConfiguration>
+.fi
+.RE
+.PP
+.B BlockPublicPolicy
+refuses a PutBucketPolicy whose policy is public, as GetBucketPolicyStatus judges
+it, with
+.BR "403 AccessDenied" ;
+a public policy already there stays.
+.B RestrictPublicBuckets
+keeps a public policy from letting in any request without credentials, the
+bucket's website's included, while the runtime's users keep what it and their
+credentials give them, since they are all of one account.
+.B BlockPublicAcls
+and
+.B IgnorePublicAcls
+are kept and read back and change nothing, since a public ACL is refused here
+whatever they say. The block is kept in
+.IB dir / bucket /public\-access\-block
+and changed by shard 0 like the bucket's other documents. A runtime started with
+.B \-\-anonymous
+lets everyone in whatever a bucket's block says, as it does whatever its policy says.
 .SS How objects are stored
 An object is one file at
 .IB dir / bucket /data/ ab / sha256(key)
