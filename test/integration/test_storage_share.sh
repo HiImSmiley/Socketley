@@ -110,6 +110,13 @@ check "a range past the start does not count" "$(for _ in 1 2 3; do code -r 2-3 
 check "a second time" "$(code "$U/~share/$l")" 200
 check "and then no more" "$(code "$U/~share/$l")" 410
 
+# Downloads at once against a limit: exactly as many as it allows, whichever shard each lands on.
+m=$(mk "$A" '{"bucket":"ann","key":"report.txt","max_downloads":3}')
+pids=(); : > "$T/many"
+for _ in 1 2 3 4 5 6 7 8; do curl -s -o /dev/null -w '%{http_code}\n' "$U/~share/$m" >> "$T/many" & pids+=($!); done
+wait "${pids[@]}"
+check "eight downloads at once of a link allowing three" "$(sort "$T/many" | uniq -c | awk '{print $1":"$2}' | tr '\n' ' ')" "3:200 5:410 "
+
 # An upload link.
 w=$(mk "$A" '{"bucket":"ann","key":"inbox/","upload":true}')
 check "an upload link takes a file" "$(printf 'dropped' | code -T - "$U/~share/$w/drop.txt")" 201
@@ -119,7 +126,7 @@ check "but not over a folder" "$(printf 'x' | code -T - "$U/~share/$w/")" 405
 
 # Listing and revoking.
 mine=$(curl -s -u "$A" "$U/~share" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
-check "the maker lists the links, the expired one gone" "$mine" 5
+check "the maker lists the links, the expired one gone" "$mine" 6
 check "another user lists none of them" "$(curl -s -u "$B" "$U/~share")" "[]"
 check "nor revokes one" "$(code -u "$B" -X DELETE "$U/~share/$f")" 403
 check "a link outlives a restart" \

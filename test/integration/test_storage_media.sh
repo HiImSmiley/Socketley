@@ -144,7 +144,7 @@ stream hls-240 clip.mp4 "$T/h240"
 check "a stream's playlist" "$(cat "$T/h240/code")" 200
 check "is HLS" "$(head -1 "$T/h240/index.m3u8")" "#EXTM3U"
 check "and ends" "$(grep -c EXT-X-ENDLIST "$T/h240/index.m3u8")" 1
-check "and maps its segments' start" "$(grep -c 'EXT-X-MAP:URI="init.mp4"' "$T/h240/index.m3u8")" 1
+check "and maps its segments' start" "$(grep -c 'EXT-X-MAP:URI="init.mp4?v=[0-9a-f]*"' "$T/h240/index.m3u8")" 1
 check "its segments are of the height asked for" "$(height "$T/h240/all.mp4")" 240
 dur=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$T/h240/all.mp4" | cut -d. -f1)
 check "and play to the film's end" "$dur" 10
@@ -173,10 +173,12 @@ check "info says what the film is" \
 check "and the type a browser is asked about" "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["mime"])' "$info")" \
       'video/mp4; codecs="avc1.64001e, mp4a.40.2"'
 master=$(curl -s -u "$A" "$U/~media/hls/films/clip.mp4/master.m3u8")
-check "the master names a rendition for every rung the film fills" "$(grep -c '^/~media/hls-[0-9]*/films/clip.mp4/index.m3u8$' <<<"$master")" 2
+check "the master names a rendition for every rung the film fills" "$(grep -c '^/~media/hls-[0-9]*/films/clip.mp4/index.m3u8?v=[0-9a-f]*$' <<<"$master")" 2
 check "with its size and codecs" "$(grep -o 'RESOLUTION=[0-9x]*,CODECS="[^"]*"' <<<"$master" | head -2 | tr '\n' ' ')" \
-      'RESOLUTION=640x360,CODECS="avc1.640028,mp4a.40.2" RESOLUTION=426x240,CODECS="avc1.640028,mp4a.40.2" '
-check "and the film's own stream, copied" "$(grep -c '^/~media/hls-copy/films/clip.mp4/index.m3u8$' <<<"$master")" 1
+      'RESOLUTION=640x360,CODECS="avc1.64002a,mp4a.40.2" RESOLUTION=426x240,CODECS="avc1.64002a,mp4a.40.2" '
+check "the bandwidth a segment can reach, and the frame rate" "$(grep -o 'BANDWIDTH=[0-9]*\|FRAME-RATE=[0-9.]*' <<<"$master" | head -2 | tr '\n' ' ')" \
+      "BANDWIDTH=1410000 FRAME-RATE=25.000 "
+check "and the film's own stream, copied" "$(grep -c '^/~media/hls-copy/films/clip.mp4/index.m3u8?v=[0-9a-f]*$' <<<"$master")" 1
 idx=$(curl -s -u "$A" "$U/~media/hls-240/films/clip.mp4/index.m3u8")
 check "a rendition's playlist is whole from the start" "$(grep -c '^seg' <<<"$idx") $(grep -c ENDLIST <<<"$idx") $(grep -c 'PLAYLIST-TYPE:VOD' <<<"$idx")" "3 1 1"
 
@@ -231,6 +233,85 @@ stream hls-copy ac3.mkv "$T/hac3"
 check "a copied stream keeps the picture and makes the sound AAC" \
       "$("$FFPROBE" -v error -show_entries stream=codec_name -of csv=p=0 "$T/hac3/all.mp4" | tr '\n' ' ')" "h264 aac "
 
+# A HEAD's answer has no body, so the next answer on the connection is read as itself.
+# What follows a HEAD's head on one connection, with a GET sent behind it: the GET's status line when the HEAD
+# carried no body, as curl would hide by opening another connection.
+after_head() { python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import socket, sys, base64
+port, auth, head, get = sys.argv[1:5]
+a = base64.b64encode(auth.encode()).decode()
+req = lambda m, p: ("%s %s HTTP/1.1\r\nHost: x\r\nAuthorization: Basic %s\r\n\r\n" % (m, p, a)).encode()
+s = socket.create_connection(("127.0.0.1", int(port)))
+s.sendall(req("HEAD", head) + req("GET", get))
+s.settimeout(3)
+data = b""
+try:
+    while b"\r\n\r\n" not in data[data.find(b"\r\n\r\n") + 4:]:
+        d = s.recv(65536)
+        if not d:
+            break
+        data += d
+except Exception:
+    pass
+i = data.find(b"\r\n\r\n")
+print(data[i + 4:i + 16].decode(errors="replace"))
+PYEOF
+}
+check "a HEAD of an application answers no body" "$(after_head "$P1" "$A" /~media/info/films/clip.mp4 /~media/info/films/clip.mp4)" "HTTP/1.1 200"
+
+# What a versioned URL is cached for, a revalidation, and a range.
+seg=$(grep -m1 '^seg' <<<"$idx")
+hdrs=$(curl -s -u "$A" -D - -o /dev/null "$U/~media/hls-240/films/clip.mp4/$seg")
+check "a segment by a versioned URL is cached for good" "$(grep -i '^cache-control' <<<"$hdrs" | tr -d '\r')" \
+      "Cache-Control: private, max-age=31536000, immutable"
+etag=$(grep -i '^etag' <<<"$hdrs" | cut -d' ' -f2 | tr -d '\r')
+check "and revalidates to 304" "$(code -u "$A" -H "If-None-Match: $etag" "$U/~media/hls-240/films/clip.mp4/$seg")" 304
+check "a range of it is 206" "$(curl -s -u "$A" -r 0-99 -o "$T/r.bin" -w '%{http_code}' "$U/~media/hls-240/films/clip.mp4/$seg") $(wc -c < "$T/r.bin")" "206 100"
+check "the master is asked again, and has an ETag" \
+      "$(curl -s -u "$A" -D - -o /dev/null "$U/~media/hls/films/clip.mp4/master.m3u8" | grep -ciE '^(cache-control: private, no-cache|etag:)')" 2
+
+# The object's file is read directly, not over the listener.
+check "ffmpeg reads an unencrypted object's file" "$( [ "$(stat media_direct)" -gt 0 ] && echo yes)" yes
+
+# An init asked for beside a far segment begins one job, there.
+L4="$U/~media/hls-480/films/long.mp4"
+curl -s -m 60 -u "$A" -o "$T/i4.mp4" "$L4/init.mp4" & ip=$!
+sleep 0.3
+check "a far segment asked beside the init" "$(get "$T/s4.m4s" -u "$A" "$L4/seg00020.m4s")" 200
+wait $ip
+check "begins the one job there, and none at the start" "$(ls "$(mdir hls-480 long.mp4 "$T/long.mp4")/jobs" | grep '\.lock$' | tr '\n' ' ')" "20.lock "
+cat "$T/i4.mp4" "$T/s4.m4s" > "$T/s4.mp4"
+check "and the init fits it" "$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=start_time -of csv=p=0 "$T/s4.mp4" | secs)" 80
+
+# A picture that ends before its sound: the last segment is the picture's, and none past it waits for ever.
+ff -f lavfi -i testsrc2=size=320x240:rate=25:duration=6 -f lavfi -i sine=frequency=600:duration=9 -c:v libx264 \
+   -preset ultrafast -pix_fmt yuv420p -c:a aac "$T/short_pic.mp4"
+code -u "$A" -T "$T/short_pic.mp4" "$U/~dav/films/short_pic.mp4" >/dev/null
+sp=$(curl -s -u "$A" "$U/~media/hls-240/films/short_pic.mp4/index.m3u8")
+check "a film whose sound outlasts its picture has the picture's segments" "$(grep -c '^seg' <<<"$sp")" 2
+check "and every one of them is made" "$(for s in $(grep '^seg' <<<"$sp"); do code -u "$A" "$U/~media/hls-240/films/short_pic.mp4/$s"; echo; done | tr '\n' ' ')" "200 200 "
+
+# Text subtitles as WebVTT, in the master and as a track.
+printf '1\n00:00:01,000 --> 00:00:03,000\nHello from the subtitles\n\n2\n00:00:04,000 --> 00:00:06,000\nSecond line\n' > "$T/s.srt"
+ff -f lavfi -i testsrc2=size=320x240:rate=25:duration=7 -i "$T/s.srt" -map 0:v -map 1:s -c:v libx264 -preset ultrafast \
+   -pix_fmt yuv420p -c:s srt -metadata:s:s:0 language=eng -metadata:s:s:0 title=English "$T/subbed.mkv"
+code -u "$A" -T "$T/subbed.mkv" "$U/~dav/films/subbed.mkv" >/dev/null
+sinfo=$(curl -s -u "$A" "$U/~media/info/films/subbed.mkv")
+check "info names the text subtitles" "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["subtitles"])' "$sinfo")" \
+      "[{'index': 1, 'lang': 'eng', 'title': 'English'}]"
+smaster=$(curl -s -u "$A" "$U/~media/hls/films/subbed.mkv/master.m3u8")
+check "the master offers them" "$(grep -c '^#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="eng"' <<<"$smaster") $(grep -c 'SUBTITLES="subs"' <<<"$smaster")" "1 2"
+vtt=$(curl -s -u "$A" "$U/~media/sub-1/films/subbed.mkv/subs.vtt")
+check "as WebVTT on the film's clock" "$(head -2 <<<"$vtt" | tr '\n' '|')" "WEBVTT|X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000|"
+check "with its cues" "$(grep -c 'Hello from the subtitles\|Second line' <<<"$vtt")" 2
+check "a stream that is no text subtitle is 404" "$(code -u "$A" "$U/~media/sub-0/films/subbed.mkv/subs.vtt")" 404
+
+# A copied HEVC stream is tagged hvc1, as Apple's players take it.
+get "$T/hvc.mp4" -u "$A" "$U/~media/hls-copy/films/hdr.mp4/index.m3u8" >/dev/null
+for _ in $(seq 1 100); do curl -s -u "$A" "$U/~media/hls-copy/films/hdr.mp4/index.m3u8" | grep -q ENDLIST && break; sleep 0.1; done
+curl -s -u "$A" -o "$T/hvc.mp4" "$U/~media/hls-copy/films/hdr.mp4/init.mp4"
+check "a copied HEVC stream is hvc1" "$(grep -c hvc1 "$T/hvc.mp4") $(grep -c hev1 "$T/hvc.mp4")" "1 0"
+
 # A restart keeps what was made.
 "$BIN" stop media >/dev/null 2>&1; "$BIN" start media >/dev/null 2>&1; up
 check "a thumbnail outlives a restart" "$(get "$T/t1c.jpg" -u "$A" "$U/~media/thumb-128/films/short.mp4")" 200
@@ -241,6 +322,8 @@ ff -f lavfi -i testsrc2=size=640x360:rate=25,noise=alls=30:allf=t -t 1 -c:v mpeg
 check "a film larger than the cache is stored" "$(code -u "$A" -T "$T/big.mp4" "$U/~dav/films/big.mp4")" 201
 stream hls-copy big.mp4 "$T/hbig"
 check "is streamed" "$(grep -c EXT-X-ENDLIST "$T/hbig/index.m3u8")" 1
+# The stream's playlist ends before ffmpeg does, and the cache is cut back at the turn that sees ffmpeg end.
+for _ in $(seq 1 30); do [ "$(ls "$T/media/.media" | grep -c '^[0-9a-f]\{64\}$')" = 1 ] && break; sleep 0.1; done
 check "and is all the cache keeps" "$(ls "$T/media/.media" | grep -c '^[0-9a-f]\{64\}$')" 1
 check "a thumbnail it pushed out is made again" "$(get "$T/t1d.jpg" -u "$A" "$U/~media/thumb-256/films/clip.mp4")" 200
 check "as it was" "$(cmp -s "$T/t1.jpg" "$T/t1d.jpg" && echo same)" same

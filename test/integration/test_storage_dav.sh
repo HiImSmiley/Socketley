@@ -80,6 +80,31 @@ check "a file's PROPFIND gives its length" \
 check "a folder without its slash is a folder" "$(curl -s -u "$A" -X PROPFIND -H 'Depth: 0' "$U/~dav/docs/a/sub" | grep -c '<D:collection/>')" 1
 check "a missing path is 404" "$(code -u "$A" -X PROPFIND -H 'Depth: 0' "$U/~dav/docs/nope")" 404
 check "a folder opened in a browser is a page" "$(curl -s -u "$A" "$U/~dav/docs/a/" | grep -c 'one.txt')" 1
+# What follows a HEAD's head on one connection, with a GET sent behind it: the GET's status line when the HEAD
+# carried no body, as curl would hide by opening another connection.
+after_head() { python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import socket, sys, base64
+port, auth, head, get = sys.argv[1:5]
+a = base64.b64encode(auth.encode()).decode()
+req = lambda m, p: ("%s %s HTTP/1.1\r\nHost: x\r\nAuthorization: Basic %s\r\n\r\n" % (m, p, a)).encode()
+s = socket.create_connection(("127.0.0.1", int(port)))
+s.sendall(req("HEAD", head) + req("GET", get))
+s.settimeout(3)
+data = b""
+try:
+    while b"\r\n\r\n" not in data[data.find(b"\r\n\r\n") + 4:]:
+        d = s.recv(65536)
+        if not d:
+            break
+        data += d
+except Exception:
+    pass
+i = data.find(b"\r\n\r\n")
+print(data[i + 4:i + 16].decode(errors="replace"))
+PYEOF
+}
+check "a HEAD of a folder's page answers no body, so the next answer is read as itself" \
+      "$(after_head "$P1" "$A" /~dav/docs/a/ /~dav/docs/a/one.txt)" "HTTP/1.1 200"
 check "PROPPATCH is answered" "$(code -u "$A" -X PROPPATCH "$U/~dav/docs/a/one.txt" -d '<x/>')" 207
 check "LOCK gives a token" "$(curl -s -u "$A" -X LOCK -D - -o /dev/null "$U/~dav/docs/a/one.txt" | grep -ci '^lock-token: <opaquelocktoken:')" 1
 check "UNLOCK is 204" "$(code -u "$A" -X UNLOCK -H 'Lock-Token: <x>' "$U/~dav/docs/a/one.txt")" 204
