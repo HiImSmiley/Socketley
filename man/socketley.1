@@ -8156,7 +8156,14 @@ naming this runtime's users and access keys, each as the key itself, as
 .BI arn:aws:iam:: account :user/ name
 (the name is a user's id or an access key), or as
 .BI arn:aws:iam:: account :root
-for every key. Service, federated and canonical\-user principals and roles are refused.
+for every key. A
+.B {"Service": ...}
+principal is taken and names no requester here, so a statement naming services
+alone matches nothing whatever its conditions, which are not checked: the policy
+S3 documents for a log target, letting
+.B logging.s3.amazonaws.com
+write, is taken as it is written. Federated and canonical\-user principals and
+roles are refused.
 .TP
 .B Action
 one or a list of
@@ -8168,7 +8175,7 @@ and
 wildcards, compared without case, or
 .B *
 alone. A name must be one of S3's, and those this runtime does not implement
-(s3:RestoreObject, s3:GetBucketLogging, .\|.\|.) are taken and match nothing.
+(s3:RestoreObject, s3:GetBucketAnalyticsConfiguration, .\|.\|.) are taken and match nothing.
 GetObject covers GetObject and HeadObject, by part too; PutObject covers PutObject,
 CopyObject, CreateMultipartUpload, UploadPart, UploadPartCopy and
 CompleteMultipartUpload; DeleteObject covers DeleteObject and DeleteObjects; ListBucket

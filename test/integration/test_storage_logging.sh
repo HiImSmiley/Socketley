@@ -4,6 +4,7 @@
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
 #   * a BucketLoggingStatus S3 refuses taken, or one taken and not read back
+#   * the policy S3 documents for a log target refused, or read as letting anyone in
 #   * an answer to a logged bucket's request missing from its log, or a line
 #     whose fields are not the request's
 #   * a log object named other than prefix, date and a unique suffix, or a
@@ -65,6 +66,10 @@ check "logging is turned on" \
     "$(code -X PUT "$U/src?logging" --data '<BucketLoggingStatus><LoggingEnabled><TargetBucket>logs</TargetBucket><TargetPrefix>site/</TargetPrefix></LoggingEnabled></BucketLoggingStatus>')" 200
 check "and read back" "$(curl -s "$U/src?logging" | grep -c '<TargetBucket>logs</TargetBucket><TargetPrefix>site/</TargetPrefix>')" 1
 check "an object has no logging" "$(code "$U/src/k?logging")" 501
+# The policy S3 documents for a log target names the delivery service, which is taken and lets nobody in.
+LOGPOL='{"Version":"2012-10-17","Statement":[{"Sid":"S3ServerAccessLogsPolicy","Effect":"Allow","Principal":{"Service":"logging.s3.amazonaws.com"},"Action":["s3:PutObject"],"Resource":"arn:aws:s3:::logs/site/*","Condition":{"ArnLike":{"aws:SourceArn":"arn:aws:s3:::src"},"StringEquals":{"aws:SourceAccount":"123456789012"}}}]}'
+check "a log target's policy naming the delivery service is taken" "$(code -X PUT "$U/logs?policy" --data "$LOGPOL")" 204
+check "and is not public" "$(curl -s "$U/logs?policyStatus" | grep -c '<IsPublic>false</IsPublic>')" 1
 
 # ── the lines ──
 curl -s -A 'logtest/1.0' -X PUT --data-binary hello "$U/src/a%20b" -o /dev/null

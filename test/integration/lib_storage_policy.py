@@ -254,7 +254,8 @@ def mode_config(port):
                                                  {"IpAddress": {"aws:SourceIp": "10.0.0.0/33"}})), None),
         ("SecureTransport neither true nor false", policy(stmt("Deny", "*", "s3:*", "arn:aws:s3:::pub/*",
                                                               {"Bool": {"aws:SecureTransport": "maybe"}})), "maybe"),
-        ("a service principal", policy(stmt("Allow", {"Service": "s3.amazonaws.com"}, "s3:GetObject", "arn:aws:s3:::pub/*")), "Service"),
+        ("a service principal that is no host name", policy(stmt("Allow", {"Service": "*"}, "s3:GetObject", "arn:aws:s3:::pub/*")), "principal"),
+        ("a federated principal", policy(stmt("Allow", {"Federated": "cognito-identity.amazonaws.com"}, "s3:GetObject", "arn:aws:s3:::pub/*")), "Federated"),
         ("a role principal", policy(stmt("Allow", {"AWS": "arn:aws:iam::123456789012:role/x"}, "s3:GetObject", "arn:aws:s3:::pub/*")), "principal"),
         ("a principal string that is not *", policy(stmt("Allow", AK1, "s3:GetObject", "arn:aws:s3:::pub/*")), "principal"),
         ("an empty action list", policy(stmt("Allow", "*", [], "arn:aws:s3:::pub/*")), "Action"),
@@ -266,6 +267,13 @@ def mode_config(port):
     for name, doc, msg in bad:
         malformed(T, "pub", name, doc, msg)
     check("no refused document was kept", get_policy(T, "pub").status == 404)
+    # A statement for a service alone is taken, and lets in no request, whatever its conditions.
+    r = put_policy(T, "pub", policy(stmt("Allow", {"Service": "logging.s3.amazonaws.com"}, "s3:GetObject", "arn:aws:s3:::pub/*",
+                                         {"ArnLike": {"aws:SourceArn": "arn:aws:s3:::src"}})))
+    check("a statement naming a service alone is taken, conditions unchecked", r.status == 204, repr(r))
+    r = req(T, "GET", "/pub/public/a")
+    check("and lets no anonymous request in", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    delete_policy(T, "pub")
     r = put_policy(T, "pub", good.replace("public", "publik"), md5=False, key=K1)
     r2 = req(T, "PUT", "/pub", "policy", good.encode(), K1,
              {"Content-MD5": base64.b64encode(hashlib.md5(b"other").digest()).decode()})

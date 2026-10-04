@@ -221,6 +221,8 @@ struct compiler
     std::string_view bucket;
     s3_error&        err;
     bool             identity{false};
+    // The statement being compiled names a Service principal.
+    bool             names_service{false};
 
     bool fail(std::string message)
     {
@@ -260,9 +262,20 @@ struct compiler
             return fail("Invalid principal in policy");
         for (const auto& [name, val] : v.members)
         {
-            if (name != "AWS")
-                return fail("Invalid principal in policy: only AWS principals are supported, not " + name);
             std::vector<std::string> list;
+            // An AWS service, such as the log delivery a target bucket's policy lets write, is no requester here.
+            if (name == "Service")
+            {
+                if (!strings(val, "Principal", list))
+                    return false;
+                for (const std::string& svc : list)
+                    if (svc.empty() || svc.find('.') == std::string::npos || svc.find_first_of(" *") != std::string::npos)
+                        return fail("Invalid principal in policy: " + svc);
+                names_service = true;
+                continue;
+            }
+            if (name != "AWS")
+                return fail("Invalid principal in policy: only AWS and Service principals are supported, not " + name);
             if (!strings(val, "Principal", list))
                 return false;
             for (const std::string& p : list)
@@ -549,6 +562,7 @@ struct compiler
 
     bool statement(const jvalue& v, bucket_policy::statement& s, std::vector<std::string>& sids)
     {
+        names_service = false;
         if (v.k != jvalue::kind::object)
             return fail("A statement must be an object");
         const jvalue* effect = nullptr;
@@ -600,6 +614,13 @@ struct compiler
             return false;
         if (!identity && !(on_object && !s.objects.empty()) && !(on_bucket && s.bucket_resource))
             return fail("Action does not apply to any resource(s) in statement");
+        // A statement for services alone applies to no request this runtime is sent, whatever its conditions say.
+        if (names_service && !s.any_principal && !s.any_signed && s.keys.empty())
+        {
+            s.actions = 0;
+            s.deny    = false;
+            return true;
+        }
         return !cond || condition(*cond, s);
     }
 };
