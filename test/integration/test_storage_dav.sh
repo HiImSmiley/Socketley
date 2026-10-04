@@ -63,6 +63,7 @@ check "MKCOL at the root makes a bucket" "$(code -u "$A" -X MKCOL "$U/~dav/docs/
 check "which S3 sees" "$(code --aws-sigv4 "aws:amz:us-east-1:s3" -u "$A" -I "$U/docs")" 200
 check "a second MKCOL of it is 405" "$(code -u "$A" -X MKCOL "$U/~dav/docs/")" 405
 check "MKCOL in a bucket makes a folder" "$(code -u "$A" -X MKCOL "$U/~dav/docs/a")" 201
+check "a second MKCOL of a folder is 405" "$(code -u "$A" -X MKCOL "$U/~dav/docs/a")" 405
 check "the folder is S3's marker object" "$(s3 -s -o /dev/null -w '%{http_code}' -I "$U/docs/a/")" 200
 printf 'one' > "$T/one"; head -c 300000 /dev/urandom > "$T/big"
 check "PUT of a file is 201" "$(code -u "$A" -T "$T/one" "$U/~dav/docs/a/one.txt")" 201
@@ -82,6 +83,13 @@ check "a folder opened in a browser is a page" "$(curl -s -u "$A" "$U/~dav/docs/
 check "PROPPATCH is answered" "$(code -u "$A" -X PROPPATCH "$U/~dav/docs/a/one.txt" -d '<x/>')" 207
 check "LOCK gives a token" "$(curl -s -u "$A" -X LOCK -D - -o /dev/null "$U/~dav/docs/a/one.txt" | grep -ci '^lock-token: <opaquelocktoken:')" 1
 check "UNLOCK is 204" "$(code -u "$A" -X UNLOCK -H 'Lock-Token: <x>' "$U/~dav/docs/a/one.txt")" 204
+
+# A folder past one page of a listing.
+curl -s -u "$A" -T "$T/one" -o /dev/null "$U/~dav/docs/many/f[1-1100]"
+check "a folder of 1100 files lists them all" \
+      "$(curl -s -u "$A" -X PROPFIND -H 'Depth: 1' "$U/~dav/docs/many/" | grep -o '<D:getcontentlength>' | wc -l)" 1100
+check "and so does its page" "$(curl -s -u "$A" "$U/~dav/docs/many/" | grep -o '<li>' | wc -l)" 1100
+check "and it is removed whole" "$(code -u "$A" -X DELETE "$U/~dav/docs/many/")" 204
 
 # Copy and move, of a file and of a folder.
 dst() { echo "Destination: $U/~dav/$1"; }
@@ -133,7 +141,7 @@ if [ -n "$RCLONE" ] && [ -x "$RCLONE" ]; then
     mkdir -p "$T/tree/x/y" "$T/back"
     for i in 1 2 3; do head -c $((i * 70000)) /dev/urandom > "$T/tree/x/f$i"; done
     printf 'deep' > "$T/tree/x/y/deep.txt"
-    rc() { "$RCLONE" --config /dev/null --webdav-url "$U/~dav/" --webdav-vendor other --webdav-user "${A%%:*}" \
+    rc() { "$RCLONE" --config /dev/null --webdav-url "$U/~dav/" --webdav-vendor other --webdav-pacer-min-sleep 0.01ms --webdav-user "${A%%:*}" \
                      --webdav-pass "$("$RCLONE" obscure "${A#*:}")" "$@" 2>&1; }
     out=$(rc copy "$T/tree" :webdav:docs/tree); check "rclone copies a tree in" "$out" ""
     out=$(rc copy :webdav:docs/tree "$T/back"); check "and out" "$out" ""
