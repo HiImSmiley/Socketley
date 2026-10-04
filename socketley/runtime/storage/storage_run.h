@@ -197,6 +197,8 @@ struct sse_ask
 {
     sse_mode mode{sse_mode::none};
     std::optional<sse_key> customer;
+    // The KMS key id an SSE-KMS write is sealed under.
+    std::string kms_key;
     // The request said so itself, which lets a copy of an object onto itself change nothing else.
     bool     named{false};
 };

@@ -144,34 +144,54 @@ private:
 
 // ─── The record ─────────────────────────────────────────────────────────────
 
+sse_key sse_kms_kek(const sse_key& master, std::string_view kms_key)
+{
+    std::string label = "socketley-sse-kms:";
+    label += kms_key;
+    const sse_digest d = hmac_sha256(master.data(), master.size(), label);
+    sse_key k{};
+    std::memcpy(k.data(), d.data(), k.size());
+    return k;
+}
+
 std::string encode_sse(const sse_record& r)
 {
     std::string v = std::to_string(r.version);
-    v += r.mode == sse_mode::c ? ";c;" : ";s3;";
+    v += r.mode == sse_mode::c ? ";c;" : r.mode == sse_mode::kms ? ";kms;" : ";s3;";
     v += chunk_text;
     v += r.per_part ? ";p;" : ";o;";
     v += hex(r.kid.data(), r.kid.size());
     v += ';';
     v += base64_encode(r.wrapped);
+    if (r.mode == sse_mode::kms)
+    {
+        v += ';';
+        v += base64_encode(r.kms_key);
+    }
     return v;
 }
 
 bool decode_sse(std::string_view v, sse_record& out)
 {
-    std::string_view f[6];
-    for (size_t i = 0; i < 6; ++i)
+    // Six fields, and a seventh, the KMS key id, for a kms record alone.
+    std::string_view f[7];
+    size_t n = 0;
+    while (n < 7)
     {
         const size_t semi = v.find(';');
-        if ((semi == std::string_view::npos) != (i == 5))
-            return false;
-        f[i] = v.substr(0, semi);
-        v    = i == 5 ? std::string_view{} : v.substr(semi + 1);
+        f[n++] = v.substr(0, semi);
+        if (semi == std::string_view::npos)
+            break;
+        v = v.substr(semi + 1);
     }
-    if ((f[0] != "1" && f[0] != "2") || (f[1] != "s3" && f[1] != "c") || f[2] != chunk_text ||
-        (f[3] != "o" && f[3] != "p") || f[4].size() != 8)
+    const bool kms = n == 7 && f[1] == "kms";
+    if ((n != 6 && !kms) || (f[0] != "1" && f[0] != "2") || (f[1] != "s3" && f[1] != "c" && !kms) ||
+        f[2] != chunk_text || (f[3] != "o" && f[3] != "p") || f[4].size() != 8)
         return false;
     out.version  = f[0] == "1" ? sse_format_v1 : sse_format;
-    out.mode     = f[1] == "c" ? sse_mode::c : sse_mode::s3;
+    out.mode     = kms ? sse_mode::kms : f[1] == "c" ? sse_mode::c : sse_mode::s3;
+    if (kms && (!base64_decode(f[6], out.kms_key) || out.kms_key.empty()))
+        return false;
     out.per_part = f[3] == "p";
     for (size_t i = 0; i < 4; ++i)
     {

@@ -3298,6 +3298,12 @@ bool object_store::bucket_encrypts(std::string_view name) const
     return b && b->encrypts;
 }
 
+std::shared_ptr<const encryption_config> object_store::bucket_encryption(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b ? b->encryption : nullptr;
+}
+
 const bucket_policy* object_store::policy(std::string_view name) const
 {
     // Kept while the bucket is being dropped, so its denials hold until it is gone.
@@ -3512,12 +3518,16 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml, st
     {
         // A document that does not parse still encrypts, since its bucket asked for it once.
         b.encrypts = !xml.empty();
-        if (!xml.empty() && !parse_encryption(xml, err))
+        b.encryption.reset();
+        auto cfg = std::make_shared<encryption_config>();
+        if (!xml.empty() && !parse_encryption(xml, *cfg, err))
         {
             if (why)
                 *why = err.message;
             return false;
         }
+        if (!xml.empty())
+            b.encryption = std::move(cfg);
         return true;
     }
     std::shared_ptr<lifecycle_config> l;

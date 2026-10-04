@@ -489,8 +489,26 @@ def mode_main(port, data):
         json.dump(defaults, f)
 
     # ── refusals ────────────────────────────────────────────────────────────
-    st, _, b = req("PUT", "/%s/kms" % B, b"x", {"x-amz-server-side-encryption": "aws:kms"})
-    check("aws:kms is refused as not implemented", (st, xml_code(b)) == (501, "NotImplemented"), (st, b[:200]))
+    # ── SSE-KMS, its keys derived from the master key ───────────────────────
+    kbody = marked(70000, "kms")
+    r = s3.put_object(Bucket=B, Key="kms", Body=kbody, ServerSideEncryption="aws:kms")
+    check("aws:kms is taken and answered with the default key",
+          r.get("ServerSideEncryption") == "aws:kms" and r.get("SSEKMSKeyId", "").endswith("alias/aws/s3"), r)
+    g = s3.get_object(Bucket=B, Key="kms")
+    check("and read back as itself, naming its key", g["Body"].read() == kbody and g.get("ServerSideEncryption") == "aws:kms"
+          and g.get("SSEKMSKeyId") == r.get("SSEKMSKeyId"), g.get("SSEKMSKeyId"))
+    check("and its bytes are not on the disk", marked(70000, "kms")[:4096] not in on_disk(data, "kms"))
+    r = s3.put_object(Bucket=B, Key="kms-named", Body=b"named key", ServerSideEncryption="aws:kms", SSEKMSKeyId="team-a")
+    h = s3.head_object(Bucket=B, Key="kms-named")
+    check("a named KMS key is the one its object names", r.get("SSEKMSKeyId") == "team-a" and h.get("SSEKMSKeyId") == "team-a",
+          (r.get("SSEKMSKeyId"), h.get("SSEKMSKeyId")))
+    check("and reads", s3.get_object(Bucket=B, Key="kms-named")["Body"].read() == b"named key")
+    rk = s3.get_object(Bucket=B, Key="kms", Range="bytes=65530-65545")["Body"].read()
+    check("a range of an SSE-KMS object crosses its chunks", rk == kbody[65530:65546], len(rk))
+    st, _, b = req("PUT", "/%s/kms2" % B, b"x", {"x-amz-server-side-encryption": "aws:kms:dsse"})
+    check("aws:kms:dsse is refused as not implemented", (st, xml_code(b)) == (501, "NotImplemented"), (st, b[:200]))
+    st, _, b = req("PUT", "/%s/kms3" % B, b"x", {"x-amz-server-side-encryption-aws-kms-key-id": "team-a"})
+    check("a KMS key without aws:kms is InvalidArgument", (st, xml_code(b)) == (400, "InvalidArgument"), (st, b[:200]))
     st, _, b = req("PUT", "/%s/bogus" % B, b"x", {"x-amz-server-side-encryption": "ROT13"})
     check("an unknown algorithm is refused", (st, xml_code(b)) == (400, "InvalidArgument"), (st, b[:200]))
     key = base64.b64encode(b"k" * 32).decode()
@@ -511,9 +529,17 @@ def mode_main(port, data):
     check("GetBucketEncryption of a bucket with none is ServerSideEncryptionConfigurationNotFoundError",
           code == (404, "ServerSideEncryptionConfigurationNotFoundError"), code)
     s3.create_bucket(Bucket="dflt")
-    kms = {"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms"}}]}
-    code = err_code(lambda: s3.put_bucket_encryption(Bucket="dflt", ServerSideEncryptionConfiguration=kms))
-    check("a default of aws:kms is refused", code == (501, "NotImplemented"), code)
+    kms = {"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": "team-b"}}]}
+    s3.put_bucket_encryption(Bucket="dflt", ServerSideEncryptionConfiguration=kms)
+    got = s3.get_bucket_encryption(Bucket="dflt")["ServerSideEncryptionConfiguration"]["Rules"][0]
+    check("a default of aws:kms under a key is taken and read back", got["ApplyServerSideEncryptionByDefault"] ==
+          {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": "team-b"}, got)
+    r = s3.put_object(Bucket="dflt", Key="dk", Body=b"by default")
+    check("a PUT that asks nothing of it is sealed under that key",
+          r.get("ServerSideEncryption") == "aws:kms" and r.get("SSEKMSKeyId") == "team-b", r)
+    check("and reads", s3.get_object(Bucket="dflt", Key="dk")["Body"].read() == b"by default")
+    s3.delete_object(Bucket="dflt", Key="dk")
+    s3.delete_bucket_encryption(Bucket="dflt")
     st, _, b = req("PUT", "/dflt?encryption", b"<ServerSideEncryptionConfiguration><Rule/></ServerSideEncryptionConfiguration>")
     check("a default with no algorithm is malformed", (st, xml_code(b)) == (400, "MalformedXML"), (st, b[:200]))
     cfg = {"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]}
@@ -1593,10 +1619,14 @@ def mode_policy(port):
         {"PartNumber": 1, "ETag": p1["ETag"]}, {"PartNumber": 2, "ETag": p2["ETag"]}]})
     check("one begun with it takes its parts and completes", c.get("ServerSideEncryption") == "AES256", c)
     check("and the policy says nothing of reads", s3.get_object(Bucket=YB, Key="mp")["Body"].read() == part + b"tail")
-    st, _, body = req("PUT", "/%s?policy" % YB, json.dumps({"Statement": [dict(pol["Statement"][0], Condition={
-        "StringEquals": {"s3:x-amz-server-side-encryption-aws-kms-key-id": "k"}})]}).encode())
-    check("a condition on a key it cannot honour is still refused", (st, xml_code(body)) == (400, "MalformedPolicy"),
-          (st, body[:200]))
+    st, _, body = req("PUT", "/%s?policy" % YB, json.dumps({"Version": "2012-10-17", "Statement": [
+        dict(pol["Statement"][0], Condition={"StringEquals": {"s3:x-amz-server-side-encryption-aws-kms-key-id": "k"}})]}).encode())
+    check("a condition on the KMS key a put names is taken", st == 204, (st, body[:200]))
+    st, _, _ = req("PUT", "/%s/kk" % YB, b"x", {"x-amz-server-side-encryption": "aws:kms",
+                                                 "x-amz-server-side-encryption-aws-kms-key-id": "k"})
+    st2, _, _ = req("PUT", "/%s/kk" % YB, b"x", {"x-amz-server-side-encryption": "aws:kms",
+                                                  "x-amz-server-side-encryption-aws-kms-key-id": "other"})
+    check("and refuses a put under that key and no other", (st, st2) == (403, 200), (st, st2))
     st, _, _ = req("DELETE", "/%s?policy" % YB)
     check("the policy is removed", st == 204, st)
     st, _, _ = req("PUT", "/%s/clear" % YB, b"x")

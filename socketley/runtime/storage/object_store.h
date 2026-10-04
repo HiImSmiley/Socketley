@@ -68,6 +68,7 @@ struct bucket_quota;
 struct website_config;
 struct public_access_block;
 struct logging_config;
+struct encryption_config;
 class bucket_policy;
 
 // The configuration documents a bucket keeps beside its objects, each in a file named for it.
@@ -725,6 +726,8 @@ public:
     bool any_policy() const { return m_policy_buckets != 0; }
     // Whether the bucket encrypts every new object it is given without being asked to.
     bool bucket_encrypts(std::string_view name) const;
+    // How it encrypts them, null for a bucket that does not or whose document no longer parses.
+    std::shared_ptr<const encryption_config> bucket_encryption(std::string_view name) const;
     // The bucket's policy, null when it has none; valid until it next changes.
     const bucket_policy* policy(std::string_view name) const;
     // Told whenever a bucket's lifecycle rules change here.
@@ -1016,6 +1019,7 @@ private:
         uint64_t    doc_doubt_seq[std::size(all_bucket_docs)]{};
         // New objects are encrypted with the master key when they ask for nothing else.
         bool        encrypts{false};
+        std::shared_ptr<const encryption_config> encryption;
         // How many entries `versions` holds across its keys.
         uint64_t    nversions{0};
         // The compaction's cursor: the key it goes on at, in objects and then in versions, valid while journal.frozen.

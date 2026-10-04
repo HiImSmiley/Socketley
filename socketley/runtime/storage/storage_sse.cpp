@@ -63,6 +63,14 @@ void sse_headers(const s3_request& r, const object_meta& m, std::vector<std::pai
         case sse_mode::s3:
             out.emplace_back("x-amz-server-side-encryption", "AES256");
             return;
+        case sse_mode::kms:
+        {
+            sse_record rec;
+            out.emplace_back("x-amz-server-side-encryption", "aws:kms");
+            if (const std::string* v = sse_value(m); v && decode_sse(*v, rec))
+                out.emplace_back("x-amz-server-side-encryption-aws-kms-key-id", rec.kms_key);
+            return;
+        }
         case sse_mode::c:
         {
             out.emplace_back("x-amz-server-side-encryption-customer-algorithm", "AES256");
@@ -146,30 +154,38 @@ bool storage_run::sse_for_write(const std::shared_ptr<conn>& c, std::string_view
     if (const std::string_view h = r.header("x-amz-server-side-encryption"); !h.empty())
     {
         out.named = true;
-        if (h == "aws:kms" || h == "aws:kms:dsse")
+        if (h == "aws:kms:dsse")
         {
-            err = sse_error("NotImplemented", "SSE-KMS is not supported by this runtime; AES256 is");
+            err = sse_error("NotImplemented", "DSSE-KMS is not supported by this runtime; aws:kms and AES256 are");
             return false;
         }
-        if (h != "AES256")
+        if (h != "AES256" && h != "aws:kms")
         {
             err = sse_error("InvalidArgument", "The encryption method specified is not supported");
             return false;
         }
-        out.mode = sse_mode::s3;
+        out.mode = h == "aws:kms" ? sse_mode::kms : sse_mode::s3;
     }
-    if (r.has_header("x-amz-server-side-encryption-aws-kms-key-id") ||
-        r.has_header("x-amz-server-side-encryption-context"))
+    if (out.mode != sse_mode::kms && (r.has_header("x-amz-server-side-encryption-aws-kms-key-id") ||
+                                      r.has_header("x-amz-server-side-encryption-context")))
     {
-        err = sse_error("InvalidArgument", "A KMS key or context is only valid with aws:kms, which this runtime "
-                                           "does not support");
+        err = sse_error("InvalidArgument", "A KMS key or context is only valid with aws:kms");
         return false;
+    }
+    if (out.mode == sse_mode::kms)
+    {
+        out.kms_key = std::string(r.header("x-amz-server-side-encryption-aws-kms-key-id"));
+        if (!out.kms_key.empty() && !valid_kms_key(out.kms_key))
+        {
+            err = sse_error("KMS.NotFoundException", "Invalid keyId " + out.kms_key);
+            return false;
+        }
     }
     if (!sse_customer(c, sse_c_prefix, out.customer, err))
         return false;
     if (out.customer)
     {
-        if (out.mode == sse_mode::s3)
+        if (out.mode == sse_mode::s3 || out.mode == sse_mode::kms)
         {
             err = sse_error("InvalidArgument", "Server Side Encryption with Customer provided key is incompatible "
                                                "with the encryption method specified");
@@ -178,12 +194,17 @@ bool storage_run::sse_for_write(const std::shared_ptr<conn>& c, std::string_view
         out.mode  = sse_mode::c;
         out.named = true;
     }
+    // A bucket's default applies to a write that names no encryption of its own, and its KMS key to one that names
+    // aws:kms and no key.
+    const auto def = m_store.bucket_encryption(bucket);
     if (out.mode == sse_mode::none && m_store.bucket_encrypts(bucket))
-        out.mode = sse_mode::s3;
-    if (out.mode == sse_mode::s3 && !m_has_master)
+        out.mode = def && def->kms ? sse_mode::kms : sse_mode::s3;
+    if (out.mode == sse_mode::kms && out.kms_key.empty())
+        out.kms_key = def && def->kms && !def->kms_key.empty() ? def->kms_key : std::string(default_kms_key);
+    if ((out.mode == sse_mode::s3 || out.mode == sse_mode::kms) && !m_has_master)
     {
-        err = sse_error("NotImplemented", "Server side encryption with AES256 needs a master key, and this runtime "
-                                          "was given no --sse-key-file");
+        err = sse_error("NotImplemented", "Server side encryption needs a master key, and this runtime was given no "
+                                          "--sse-key-file");
         return false;
     }
     return true;
@@ -197,12 +218,15 @@ bool storage_run::sse_new_key(const sse_ask& ask, bool per_part, object_meta& me
     rec.per_part = per_part;
     seal.key         = sse_random_key();
     seal.opaque_etag = ask.mode == sse_mode::c;
-    if (ask.mode == sse_mode::s3)
+    if (ask.mode == sse_mode::s3 || ask.mode == sse_mode::kms)
         rec.kid = m_master_kid;
+    if (ask.mode == sse_mode::kms)
+        rec.kms_key = ask.kms_key;
+    const sse_key kms_kek = ask.mode == sse_mode::kms ? sse_kms_kek(m_master, ask.kms_key) : sse_key{};
     // An SSE-C upload's wrap opens its parts, and a completed object only once its part list is bound.
     if ((ask.mode == sse_mode::c && !ask.customer) ||
-        !sse_wrap(ask.mode == sse_mode::c ? *ask.customer : m_master, seal.key, rec.wrapped, rec.version, nullptr,
-                  ask.mode == sse_mode::c && per_part))
+        !sse_wrap(ask.mode == sse_mode::c ? *ask.customer : ask.mode == sse_mode::kms ? kms_kek : m_master, seal.key,
+                  rec.wrapped, rec.version, nullptr, ask.mode == sse_mode::c && per_part))
     {
         err = sse_error("InternalError", "The object's data key could not be wrapped");
         return false;
@@ -285,7 +309,8 @@ bool storage_run::sse_data_key(const object_meta& m, const std::optional<sse_key
                                          "--sse-key-file");
         return false;
     }
-    if (!sse_unwrap(m_master, rec.wrapped, out, rec.version, parts))
+    const sse_key kek = rec.mode == sse_mode::kms ? sse_kms_kek(m_master, rec.kms_key) : m_master;
+    if (!sse_unwrap(kek, rec.wrapped, out, rec.version, parts))
     {
         LOG_WARN("storage: an object's data key does not unwrap under the master key its record names, so its "
                  "header was altered");
@@ -312,12 +337,15 @@ s3_error storage_run::sse_bind_parts(object_meta& m, const std::optional<sse_key
     if (!sse_parts_digest(m, parts))
         return sse_error("InternalError", "The completed object's part list cannot be read");
     const sse_key* kek = nullptr;
-    if (rec.mode == sse_mode::s3)
+    sse_key kms_kek{};
+    if (rec.mode == sse_mode::s3 || rec.mode == sse_mode::kms)
     {
         if (!m_has_master || rec.kid != m_master_kid)
             return sse_error("InternalError", "The upload was encrypted under another master key than this "
                                               "runtime's --sse-key-file");
-        kek = &m_master;
+        if (rec.mode == sse_mode::kms)
+            kms_kek = sse_kms_kek(m_master, rec.kms_key);
+        kek = rec.mode == sse_mode::kms ? &kms_kek : &m_master;
     }
     else if (customer)
         kek = &*customer;
@@ -396,7 +424,7 @@ bool storage_run::sse_read_key(const std::shared_ptr<conn>& c, const object_meta
         return false;
     }
     // A client's key is checked on every read, its bytes wanted or not, as S3 checks it on a HEAD.
-    if (!need_key && !customer && sse_mode_of(m) == sse_mode::s3)
+    if (!need_key && !customer && (sse_mode_of(m) == sse_mode::s3 || sse_mode_of(m) == sse_mode::kms))
         return true;
     return sse_data_key(m, customer, out, err);
 }
@@ -717,7 +745,8 @@ void storage_run::op_put_encryption(const std::shared_ptr<conn>& c)
         return;
     }
     s3_error err;
-    if (!body_md5_ok(q, c->body, err) || !parse_encryption(c->body, err))
+    encryption_config cfg;
+    if (!body_md5_ok(q, c->body, err) || !parse_encryption(c->body, cfg, err))
     {
         send_error(c, err);
         return;
@@ -725,11 +754,11 @@ void storage_run::op_put_encryption(const std::shared_ptr<conn>& c)
     // A default nobody could honour would refuse every put the bucket is given.
     if (!m_has_master)
     {
-        send_error(c, sse_error("NotImplemented", "Server side encryption with AES256 needs a master key, and this "
-                                                  "runtime was given no --sse-key-file"));
+        send_error(c, sse_error("NotImplemented", "Server side encryption needs a master key, and this runtime was "
+                                                  "given no --sse-key-file"));
         return;
     }
-    store_doc(c, bucket_doc::encryption, q.bucket, encryption_xml(), 200);
+    store_doc(c, bucket_doc::encryption, q.bucket, encryption_xml(cfg), 200);
 }
 
 void storage_run::op_get_encryption(const std::shared_ptr<conn>& c)
@@ -744,9 +773,10 @@ void storage_run::op_get_encryption(const std::shared_ptr<conn>& c)
         send_error(c, make_error("ServerSideEncryptionConfigurationNotFoundError"));
         return;
     }
+    const auto cfg = m_store.bucket_encryption(c->req.bucket);
     response r;
     r.headers.emplace_back("Content-Type", "application/xml");
-    r.body = encryption_xml();
+    r.body = encryption_xml(cfg ? *cfg : encryption_config{});
     send_response(c, std::move(r));
 }
 

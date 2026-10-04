@@ -9,6 +9,7 @@
 
 #include <algorithm>
 
+#include "s3_encryption.h"
 #include "s3_names.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
@@ -371,7 +372,16 @@ std::shared_ptr<storage_run::whole_put> storage_run::put_whole(const std::string
     // A bucket that encrypts its new objects encrypts this one too.
     sse_seal_spec seal;
     const bool sealed = m_store.bucket_encrypts(bucket);
-    if (sealed && (!m_has_master || !sse_new_key({sse_mode::s3, std::nullopt, false}, false, meta, seal, err)))
+    sse_ask ask;
+    if (sealed)
+    {
+        // The bucket's default decides between SSE-S3 and SSE-KMS under its key.
+        const auto def = m_store.bucket_encryption(bucket);
+        ask.mode = def && def->kms ? sse_mode::kms : sse_mode::s3;
+        if (ask.mode == sse_mode::kms)
+            ask.kms_key = def->kms_key.empty() ? std::string(default_kms_key) : def->kms_key;
+    }
+    if (sealed && (!m_has_master || !sse_new_key(ask, false, meta, seal, err)))
     {
         if (!m_has_master)
         {

@@ -2535,7 +2535,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
             sse_key key{};
             std::string plain;
             if (s3_error err; o.meta.size > 0 && o.meta.size <= object_store::hot_max_object &&
-                              sse_mode_of(o.meta) == sse_mode::s3 && o.prefetch.size() >= stored_size(o.meta) &&
+                              sse_mode_of(o.meta) != sse_mode::c && o.prefetch.size() >= stored_size(o.meta) &&
                               sse_read_key(cc, o.meta, sse_c_prefix, key, err) &&
                               sse_open_body(o.meta, key, o.prefetch, plain))
             {

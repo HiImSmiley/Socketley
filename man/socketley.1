@@ -6505,7 +6505,7 @@ NoSuchObjectLockConfiguration (404) for a version whose hold was never set.
 T}
 PutBucketEncryption	PUT /bucket?encryption	T{
 .ad l
-A ServerSideEncryptionConfiguration whose one rule is AES256; aws:kms is 501 NotImplemented, and so is any rule on a runtime without \fB\-\-sse\-key\-file\fR. See \fBServer\-side encryption\fR below.
+A ServerSideEncryptionConfiguration whose one rule is AES256, or aws:kms with an optional KMSMasterKeyID; aws:kms:dsse is 501 NotImplemented, and so is any rule on a runtime without \fB\-\-sse\-key\-file\fR. See \fBServer\-side encryption\fR below.
 T}
 GetBucketEncryption	GET /bucket?encryption	T{
 .ad l
@@ -7870,9 +7870,21 @@ steps, GET, HEAD, the copy \(em says so with the same header. A GET needs nothin
 the plaintext comes back, its ETag is the MD5 of the plaintext as for any object,
 and ranges, partNumber and conditions work as they do in the clear.
 .B aws:kms
+(SSE\-KMS) is the same, with the object's key wrapped by a key derived from the
+master key and the KMS key id the request names in
+.BR x\-amz\-server\-side\-encryption\-aws\-kms\-key\-id ,
+or the bucket default's, or
+.B arn:aws:kms:us\-east\-1:000000000000:alias/aws/s3
+when neither names one: any key id is taken, no key is kept but the master key,
+and every answer names the id as the write gave it. An encryption context is taken
+and not kept.
+.B aws:kms:dsse
 is
 .BR "501 NotImplemented" ,
 another value
+.BR "400 InvalidArgument" ,
+a KMS key or context without
+.B aws:kms
 .BR "400 InvalidArgument" ,
 and the header on a GET or HEAD, which only what writes an object chooses,
 .BR "400 InvalidArgument" .
@@ -7880,7 +7892,10 @@ and the header on a GET or HEAD, which only what writes an object chooses,
 .B PutBucketEncryption
 with an
 .B AES256
-rule makes every new object of the bucket SSE\-S3 when its request asks nothing else:
+rule makes every new object of the bucket SSE\-S3 when its request asks nothing else,
+and an
+.B aws:kms
+rule SSE\-KMS under its KMSMasterKeyID:
 puts, copies into it, uploads begun in it and a script's
 .BR socketley.storage.put .
 A bucket's rule is a document like its CORS rules, changed by shard 0 with every

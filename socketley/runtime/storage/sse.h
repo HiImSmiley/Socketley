@@ -10,7 +10,10 @@
 // one after another, each counted from zero, located by the part sizes and
 // numbers its header records.
 //
-//   x-socketley-sse: <version>;<s3|c>;65536;<o|p>;<master key id>;<wrapped key, base64>
+//   x-socketley-sse: <version>;<s3|c|kms>;65536;<o|p>;<master key id>;<wrapped key, base64>[;<KMS key id, base64>]
+//
+// SSE-KMS wraps the data key under a key derived from the master key and the KMS key id the request named, so
+// each named key opens only its own objects and nothing but the master key file is kept.
 //
 // Version 1 seals a chunk with its index alone, so nothing marks a stream's
 // end and the chunks at one index of two parts are interchangeable.  Version 2
@@ -62,6 +65,8 @@ enum class sse_mode : uint8_t
     s3,
     // Wrapped by the key the client sends with every request.
     c,
+    // Wrapped by the key derived from the master key for the KMS key id the record names.
+    kms,
 };
 
 struct sse_record
@@ -73,6 +78,8 @@ struct sse_record
     // Which master key wrapped it, so a runtime given another one says so instead of failing to open it.
     std::array<uint8_t, 4> kid{};
     std::string wrapped;
+    // The KMS key id the request named, as it named it, for kms alone.
+    std::string kms_key;
 };
 
 std::string encode_sse(const sse_record& r);
@@ -150,6 +157,8 @@ private:
 bool sse_parts_digest(const object_meta& m, sse_digest& out);
 
 sse_key sse_random_key();
+// The key an SSE-KMS key id wraps its objects' data keys under, derived from the master key.
+sse_key sse_kms_kek(const sse_key& master, std::string_view kms_key);
 // A short name of a master key, which is what its objects record.
 std::array<uint8_t, 4> sse_key_id(const sse_key& master);
 // `parts`, when given, binds the wrap to a completed object's part list, which a version 2 per-part record needs.
