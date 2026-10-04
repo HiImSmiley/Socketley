@@ -8974,28 +8974,47 @@ revokes one. Links are files in
 read by every shard.
 .TP
 .B /~media/\fIvariant\fB/\fIbucket\fB/\fIkey\fR
-Media made by ffmpeg from an object, and kept: a variant
+Media made by ffmpeg from an object, and kept.
 .BI thumb\- width
 (64, 128, 256, 320, 480, 640, 960, 1280 or 1920) is a JPEG still of a picture or
-of a film a few seconds in, and
+of a film a few seconds in.
+.B info
+is what the object is, as JSON: its length, picture size, codecs, whether it is
+HDR, the MIME type with codecs a browser is asked whether it plays the file itself,
+and the renditions it has.
+.B hls/\fIbucket\fB/\fIkey\fB/master.m3u8
+is an HLS master playlist naming those renditions, with their size, peak bitrate
+and codecs, for a player to switch between as its bandwidth allows: one for every
+rung of 2160, 1440, 1080, 720, 480, 360 and 240 the picture fills in at least one
+side, each fitted into that rung's 16:9 box and never enlarged, 720 listed first,
+and the source's own picture copied when it is H.264 or HEVC.
+.IP
 .BI hls\- height /index.m3u8
-(240, 360, 480, 720, 1080, 1440 or 2160) is an HLS stream of a film or a song,
-H.264 and AAC in CMAF segments of four seconds, which a player starts while the
-rest is still being made;
+is one rendition: H.264 held to its rung's bitrate and AAC, in CMAF segments of
+four seconds. Its playlist is whole from the start, written from the film's length,
+so a player seeks anywhere at once, and its segments are made as they are asked
+for: a segment at or a little past where a job is making them is waited for, and
+one elsewhere starts a job there, on the film's own clock, so the segments of
+every job join up. Several jobs run over one film for viewers at different places;
+one that reaches segments made before ends, one fifteen segments ahead of every
+player that asks of it is held still until one comes within eight, and one nobody
+asks of for a minute while held, or for ten minutes running, ends. What they made
+is kept: a film watched once streams from the cache afterwards. HDR (PQ or HLG) is
+tone-mapped to SDR for these renditions.
 .B hls\-copy
-streams the source's own codecs without transcoding. The object is read as a GET
-of it would be, by its user or, under
+streams the source's own picture without transcoding, and its sound made AAC.
+.IP
+The object is read as a GET of it would be, by its user or, under
 .BI /~media/ variant /~share/ id\fR[\fB/\fIpath\fR],
-through a link. ffmpeg reads the object over the runtime's own listener with an
-address signed by a key in
+through a link. ffmpeg, and ffprobe beside it, read the object over the runtime's
+own listener with an address signed by a key in
 .IR dir /.media/key,
-and what it made lies in
+and what they made lies in
 .IR dir /.media/
 under the variant, the object's key and its ETag, so a new version is made anew
-and every shard serves what one made; one medium is made once however many ask
-for it at once. A shard runs two ffmpegs at most, a request waits a minute for
-its medium, a stream nobody asks for in ten minutes is stopped, and an object
-ffmpeg cannot read is
+and every shard serves what one made; one thumbnail is made once however many
+ask for it at once. A shard runs two thumbnails and eight streams at once, a
+request waits a minute for its medium, and an object ffmpeg cannot read is
 .B 415
 for two minutes. See
 .B SOCKETLEY_FFMPEG
@@ -9006,9 +9025,10 @@ and
 A web interface, one page served from the binary, that signs in with an access
 key and its secret and browses, uploads (folders too, by dropping them), renames,
 deletes, shares, restores from the trash, previews pictures and text and plays
-films and music through
-.B /~media/
-streams where the browser plays HLS, and the original file otherwise.
+films and music: the file itself where the browser plays it, which costs the
+server nothing, and otherwise the master playlist's renditions, chosen by
+bandwidth, through the browser's own HLS or, where it has none, through Media
+Source Extensions.
 .
 .SS Durability
 .B \-\-fsync
@@ -13731,8 +13751,12 @@ Inherited by worker processes, which have no command line of their own.
 .TP
 .B SOCKETLEY_FFMPEG
 The ffmpeg a storage runtime makes thumbnails and streams with, under
-.BR /~media/ .
-Default: the first
+.BR /~media/ ,
+and the
+.B ffprobe
+beside it, or on
+.BR PATH ,
+that reads what a film is. Default: the first
 .B ffmpeg
 on
 .BR PATH ;
