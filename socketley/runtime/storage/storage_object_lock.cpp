@@ -184,19 +184,7 @@ void storage_run::op_put_object_lock_config(const std::shared_ptr<conn>& c)
         return;
     }
     // Shard 0 refuses it unless versioning is Enabled, in the order of the bucket's other changes.
-    std::weak_ptr<conn> weak = c;
-    m_node.set_doc(bucket_doc::object_lock, q.bucket, lock_config_xml(cfg), [this, weak](st s)
-    {
-        auto cc = weak.lock();
-        if (!cc || cc->dead)
-            return;
-        if (s != st::ok)
-        {
-            send_error_st(cc, s);
-            return;
-        }
-        send_response(cc, response{});
-    });
+    store_doc(c, bucket_doc::object_lock, q.bucket, lock_config_xml(cfg), 200);
 }
 
 void storage_run::op_get_object_lock_config(const std::shared_ptr<conn>& c)

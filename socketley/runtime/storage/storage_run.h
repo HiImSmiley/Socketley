@@ -554,6 +554,8 @@ public:
     void send_error(const std::shared_ptr<conn>& c, const s3_error& e, bool close = false,
                     std::string_view extra_name = {}, std::string_view extra_value = {});
     void send_error_st(const std::shared_ptr<conn>& c, st s);
+    // Sets the bucket's document of `kind`, or removes it for an empty `xml`, and answers `status` with no body.
+    void store_doc(const std::shared_ptr<conn>& c, bucket_doc kind, std::string bucket, std::string xml, int status);
     // One more answered with this S3 error code, for `stats` and the metrics.
     void count_error(std::string_view code);
     void finish_request(const std::shared_ptr<conn>& c);

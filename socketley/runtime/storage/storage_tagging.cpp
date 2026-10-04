@@ -79,21 +79,7 @@ void storage_run::op_put_bucket_tagging(const std::shared_ptr<conn>& c)
         return;
     }
     // Kept as the set it holds, so GetBucketTagging answers the tags in the order they were given.
-    std::weak_ptr<conn> weak = c;
-    m_node.set_doc(bucket_doc::tagging, q.bucket, tagging_xml(tags), [this, weak](st s)
-    {
-        auto cc = weak.lock();
-        if (!cc || cc->dead)
-            return;
-        if (s != st::ok)
-        {
-            send_error_st(cc, s);
-            return;
-        }
-        response r;
-        r.status = 204;
-        send_response(cc, std::move(r));
-    });
+    store_doc(c, bucket_doc::tagging, q.bucket, tagging_xml(tags), 204);
 }
 
 void storage_run::op_get_bucket_tagging(const std::shared_ptr<conn>& c)
@@ -122,21 +108,7 @@ void storage_run::op_delete_bucket_tagging(const std::shared_ptr<conn>& c)
         send_error_st(c, st::no_such_bucket);
         return;
     }
-    std::weak_ptr<conn> weak = c;
-    m_node.set_doc(bucket_doc::tagging, c->req.bucket, {}, [this, weak](st s)
-    {
-        auto cc = weak.lock();
-        if (!cc || cc->dead)
-            return;
-        if (s != st::ok)
-        {
-            send_error_st(cc, s);
-            return;
-        }
-        response r;
-        r.status = 204;
-        send_response(cc, std::move(r));
-    });
+    store_doc(c, bucket_doc::tagging, c->req.bucket, {}, 204);
 }
 
 void storage_run::op_get_object_tagging(const std::shared_ptr<conn>& c)

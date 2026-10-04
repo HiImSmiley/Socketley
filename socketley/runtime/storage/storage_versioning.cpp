@@ -226,19 +226,7 @@ void storage_run::op_put_versioning(const std::shared_ptr<conn>& c)
         send_error(c, err);
         return;
     }
-    std::weak_ptr<conn> weak = c;
-    m_node.set_doc(bucket_doc::versioning, q.bucket, versioning_xml(v), [this, weak](st s)
-    {
-        auto cc = weak.lock();
-        if (!cc || cc->dead)
-            return;
-        if (s != st::ok)
-        {
-            send_error_st(cc, s);
-            return;
-        }
-        send_response(cc, response{});
-    });
+    store_doc(c, bucket_doc::versioning, q.bucket, versioning_xml(v), 200);
 }
 
 void storage_run::op_list_versions(const std::shared_ptr<conn>& c)

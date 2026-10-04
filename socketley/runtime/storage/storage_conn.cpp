@@ -1525,6 +1525,26 @@ void storage_run::send_error_st(const std::shared_ptr<conn>& c, st s)
     send_error(c, error_for(s));
 }
 
+void storage_run::store_doc(const std::shared_ptr<conn>& c, bucket_doc kind, std::string bucket, std::string xml,
+                            int status)
+{
+    std::weak_ptr<conn> weak = c;
+    m_node.set_doc(kind, std::move(bucket), std::move(xml), [this, weak, status](st s)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        if (s != st::ok)
+        {
+            send_error_st(cc, s);
+            return;
+        }
+        response r;
+        r.status = status;
+        send_response(cc, std::move(r));
+    });
+}
+
 void storage_run::reset_request(const std::shared_ptr<conn>& c)
 {
     c->req.reset();

@@ -99,21 +99,7 @@ void storage_run::op_delete_replication(const std::shared_ptr<conn>& c)
         send_error_st(c, st::no_such_bucket);
         return;
     }
-    std::weak_ptr<conn> weak = c;
-    m_node.set_doc(bucket_doc::replication, c->req.bucket, {}, [this, weak](st s)
-    {
-        auto cc = weak.lock();
-        if (!cc || cc->dead)
-            return;
-        if (s != st::ok)
-        {
-            send_error_st(cc, s);
-            return;
-        }
-        response r;
-        r.status = 204;
-        send_response(cc, std::move(r));
-    });
+    store_doc(c, bucket_doc::replication, c->req.bucket, {}, 204);
 }
 
 void storage_run::replication_mark(std::string_view bucket, std::string_view key, object_meta& m, bool sse_c,

@@ -36,20 +36,8 @@ void storage_run::op_put_quota(const std::shared_ptr<conn>& c)
         send_error(c, err);
         return;
     }
-    std::weak_ptr<conn> weak = c;
     // A document of no bound is no quota, kept as none.
-    m_node.set_doc(bucket_doc::quota, q.bucket, cfg.any() ? bucket_quota_xml(cfg) : std::string{}, [this, weak](st s)
-    {
-        auto cc = weak.lock();
-        if (!cc || cc->dead)
-            return;
-        if (s != st::ok)
-        {
-            send_error_st(cc, s);
-            return;
-        }
-        send_response(cc, response{});
-    });
+    store_doc(c, bucket_doc::quota, q.bucket, cfg.any() ? bucket_quota_xml(cfg) : std::string{}, 200);
 }
 
 void storage_run::op_get_quota(const std::shared_ptr<conn>& c)
@@ -82,21 +70,7 @@ void storage_run::op_delete_quota(const std::shared_ptr<conn>& c)
         send_error_st(c, st::no_such_bucket);
         return;
     }
-    std::weak_ptr<conn> weak = c;
-    m_node.set_doc(bucket_doc::quota, c->req.bucket, {}, [this, weak](st s)
-    {
-        auto cc = weak.lock();
-        if (!cc || cc->dead)
-            return;
-        if (s != st::ok)
-        {
-            send_error_st(cc, s);
-            return;
-        }
-        response r;
-        r.status = 204;
-        send_response(cc, std::move(r));
-    });
+    store_doc(c, bucket_doc::quota, c->req.bucket, {}, 204);
 }
 
 }   // namespace socketley::storage
