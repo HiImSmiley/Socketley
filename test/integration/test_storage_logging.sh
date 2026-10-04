@@ -86,6 +86,12 @@ check "a miss its status and error code" "$(printf '%s\n' "$text" | grep -c 'RES
 check "a head" "$(printf '%s\n' "$text" | grep -c 'REST\.HEAD\.OBJECT a%20b ')" 1
 check "with the client's user agent and host" "$(printf '%s\n' "$text" | grep -c "\"logtest/1.0\" - - - - - 127.0.0.1:$P1 - - -$")" 4
 check "a bucket that is not logged is in no log" "$(printf '%s\n' "$text" | grep -c ' quiet ')" 0
+# A DeleteObjects is one line for the request and one for each key, as S3 writes a batch.
+DEL='<Delete><Object><Key>d1</Key></Object><Object><Key>d2</Key></Object></Delete>'
+curl -s -A 'batch/1.0' -X POST "$U/src?delete" -H "Content-MD5: $(printf '%s' "$DEL" | openssl md5 -binary | base64)" --data "$DEL" -o /dev/null
+text=$(logs_text site/ 3 batch/1.0)
+check "a DeleteObjects is a MULTI_OBJECT_DELETE line" "$(printf '%s\n' "$text" | grep -c 'REST\.POST\.MULTI_OBJECT_DELETE - "POST /src?delete HTTP/1\.1" 200 ')" 1
+check "and a BATCH.DELETE.OBJECT line for each key" "$(printf '%s\n' "$text" | grep -cE 'BATCH\.DELETE\.OBJECT d[12] .* 204 - ')" 2
 keys=$(curl -s "$U/logs?list-type=2&prefix=site/" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g')
 check "a log object is named prefix, delivery time and a unique suffix" \
     "$(printf '%s\n' "$keys" | grep -vcE '^site/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9A-F]{16}$')" 0

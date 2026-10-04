@@ -912,5 +912,17 @@ s3.delete_bucket(Bucket="tmp-bucket")
 check("no bucket directory of a deleted bucket is left behind", not os.path.exists(os.path.join(DATA, "tmp-bucket")),
       os.listdir(DATA))
 
+# A version 1 listing gives its prefix back as asked, which botocore does not decode, and a version 2 listing
+# takes an empty continuation token as the first page.
+s3.create_bucket(Bucket="echo-bucket")
+put("echo-bucket", "a", b"1")
+r = s3.list_objects(Bucket="echo-bucket", Prefix="\n")
+check("ListObjects gives an unreadable prefix back as it was asked", r.get("Prefix") == "\n", r.get("Prefix"))
+r = s3.list_objects_v2(Bucket="echo-bucket", ContinuationToken="")
+check("ListObjectsV2 with an empty continuation token is the first page, the token given back",
+      r.get("ContinuationToken") == "" and [o["Key"] for o in r.get("Contents", [])] == ["a"], r)
+s3.delete_object(Bucket="echo-bucket", Key="a")
+s3.delete_bucket(Bucket="echo-bucket")
+
 print("  Results: %d/%d passed (%d failed)" % (passed, passed + failed, failed))
 sys.exit(min(failed, 100))

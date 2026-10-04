@@ -340,9 +340,12 @@ def main_mode():
     check("upload_part_copy of a missing source is NoSuchKey",
           code_of(lambda: c.upload_part_copy(Bucket=B, Key="copy/whole", UploadId=mp["UploadId"], PartNumber=2,
                                              CopySource={"Bucket": B, "Key": "copy/none"})) == ("NoSuchKey", 404))
-    check("upload_part_copy of a range past the end is InvalidArgument",
+    check("upload_part_copy of a range past the end is 416 InvalidRange",
           code_of(lambda: c.upload_part_copy(Bucket=B, Key="copy/whole", UploadId=mp["UploadId"], PartNumber=2,
-                                             CopySource={"Bucket": B, "Key": "copy/src"}, CopySourceRange="bytes=0-%d" % len(src)))[0] == "InvalidArgument")
+                                             CopySource={"Bucket": B, "Key": "copy/src"}, CopySourceRange="bytes=0-%d" % len(src))) == ("InvalidRange", 416))
+    check("and one that is no range is InvalidArgument",
+          code_of(lambda: c.upload_part_copy(Bucket=B, Key="copy/whole", UploadId=mp["UploadId"], PartNumber=2,
+                                             CopySource={"Bucket": B, "Key": "copy/src"}, CopySourceRange="bytes=5-1"))[0] == "InvalidArgument")
     c.abort_multipart_upload(Bucket=B, Key="copy/whole", UploadId=mp["UploadId"])
     c.copy({"Bucket": B, "Key": "copy/src"}, B, "copy/managed", Config=tc)
     check("boto3 copy() of a big object copies it by parts", c.get_object(Bucket=B, Key="copy/managed")["Body"].read() == src)
