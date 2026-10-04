@@ -764,16 +764,26 @@ public:
     struct media_want
     {
         std::string bucket, key, variant, dir, file;
-        bool        hls{false};
+        // The path after the variant as asked for, which a master playlist names its streams by.
+        std::string source;
+        // Where the object's ffprobe is kept, which a stream's playlists and filters are made from.
+        std::string probe_dir;
+        uint8_t     kind{0};
         bool        image{false};
         bool        head{false};
+        // The segment asked for, -1 for a stream's init segment.
+        int64_t     seg{-1};
         int64_t     deadline_ms{0};
     };
     void op_media(const std::shared_ptr<conn>& c);
     void media_source(const std::shared_ptr<conn>& c, std::string_view rest);
     // Answers from the cache, or starts the making when no shard is at it; false while the request must wait.
     bool media_try(const std::shared_ptr<conn>& c, const media_want& w);
-    bool media_start(const media_want& w, int lock_fd, bool seek);
+    // A stream's segment: served, or waited for while a job nears it, or a job (re)started at it.
+    bool media_segment(const std::shared_ptr<conn>& c, const media_want& w);
+    // The job that makes `w`, from segment `from` for a stream; false when ffmpeg could not be started.
+    bool media_start(const media_want& w, int lock_fd, int64_t from);
+    bool media_serve(const std::shared_ptr<conn>& c, const media_want& w, bool growing);
     void media_tick();
     void media_arm();
     void media_evict();
@@ -1038,6 +1048,13 @@ private:
         media_want  want;
         int64_t     started_ms{0};
         bool        seeked{false};
+        // A rendition's job, one of several over one film: where it began, the next segment it writes, the film's
+        // segments, the furthest one its players asked for and when, and whether it is held still for being ahead.
+        int64_t     from{0}, next{0}, total{0}, wanted{0}, asked_ms{0};
+        bool        paused{false};
+        // A shared hold on the rendition, which keeps its eviction off while any of its jobs runs.
+        int         share_fd{-1};
+        int64_t     playlist_mtime{0}, want_mtime{0};
     };
     std::vector<media_job> m_media_jobs;
     std::vector<std::pair<std::weak_ptr<conn>, media_want>> m_media_waits;

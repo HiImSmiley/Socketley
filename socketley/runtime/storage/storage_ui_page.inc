@@ -235,6 +235,78 @@ async function download(it) {
   try { const id = await tempLink(it, 600); location.href = '/~share/' + id + '?download'; } catch (e) { fail(e); }
 }
 
+// A player for a browser without HLS of its own: the master's H.264 renditions through Media Source Extensions,
+// the one the bandwidth carries chosen at every segment, and a seek begun at the segment it lands in.
+class MsePlayer {
+  constructor(video, master, fixed) { this.v = video; this.master = master; this.fixed = fixed; this.alive = true; }
+  stop() { this.alive = false; if (this.ctl) this.ctl.abort(); this.v.removeAttribute('src'); this.v.load(); }
+  async start(at) {
+    const text = await (await fetch(this.master)).text();
+    const lines = text.split('\n');
+    this.levels = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (!lines[i].startsWith('#EXT-X-STREAM-INF:') || !lines[i + 1] || lines[i + 1].includes('/hls-copy/')) continue;
+      const bw = +(/BANDWIDTH=(\d+)/.exec(lines[i]) || [0, 0])[1];
+      const codecs = (/CODECS="([^"]+)"/.exec(lines[i]) || [0, ''])[1];
+      const h = +(/\/hls-(\d+)\//.exec(lines[i + 1]) || [0, 0])[1];
+      if (MediaSource.isTypeSupported('video/mp4; codecs="' + codecs + '"')) this.levels.push({ bw, codecs, h, url: new URL(lines[i + 1], location.href).href });
+    }
+    if (!this.levels.length) return;
+    this.levels.sort((a, b) => a.bw - b.bw);
+    this.level = this.fixed ? Math.max(0, this.levels.findIndex(l => l.h === this.fixed)) : this.levels.reduce((best, l, i) => l.bw <= 4500000 ? i : best, 0);
+    const pl = await (await fetch(this.levels[this.level].url)).text();
+    this.durs = pl.split('\n').filter(l => l.startsWith('#EXTINF:')).map(l => parseFloat(l.slice(8)));
+    this.ms = new MediaSource();
+    this.v.src = URL.createObjectURL(this.ms);
+    await new Promise(r => this.ms.addEventListener('sourceopen', r, { once: true }));
+    this.ms.duration = this.durs.reduce((a, b) => a + b, 0);
+    this.sb = this.ms.addSourceBuffer('video/mp4; codecs="' + this.levels[this.level].codecs + '"');
+    this.inited = -1;
+    this.seg = Math.floor((at || 0) / 4);
+    this.v.addEventListener('seeking', () => { this.seg = Math.floor(this.v.currentTime / 4); this.inited = -1; if (this.ctl) this.ctl.abort(); });
+    if (at) this.v.currentTime = at;
+    this.v.play().catch(() => {});
+    this.pump();
+  }
+  ahead() { const b = this.sb.buffered, t = this.v.currentTime; for (let i = 0; i < b.length; i++) if (b.start(i) <= t + 0.5 && b.end(i) > t) return b.end(i) - t; return 0; }
+  async append(data) { this.sb.appendBuffer(data); await new Promise(r => this.sb.addEventListener('updateend', r, { once: true })); }
+  async pump() {
+    // A player whose dialog was closed stops with it.
+    while (this.alive && this.v.isConnected) {
+      if (this.seg >= this.durs.length || this.ahead() > 30 || this.sb.updating) { await new Promise(r => setTimeout(r, 500)); continue; }
+      const lvl = this.levels[this.level];
+      const dir = lvl.url.replace(/index\.m3u8$/, '');
+      try {
+        this.ctl = new AbortController();
+        if (this.inited !== this.level) {
+          this.sb.changeType && this.sb.changeType('video/mp4; codecs="' + lvl.codecs + '"');
+          await this.append(await (await fetch(dir + 'init.mp4', { signal: this.ctl.signal })).arrayBuffer());
+          this.inited = this.level;
+        }
+        const n = this.seg;
+        const res = await fetch(dir + 'seg' + String(n).padStart(5, '0') + '.m4s', { signal: this.ctl.signal });
+        // Timed from the answer's head, so that a segment the server is still making is not taken for a slow line.
+        const t0 = performance.now();
+        const data = await res.arrayBuffer();
+        const bps = data.byteLength * 8 / Math.max(0.05, (performance.now() - t0) / 1000);
+        if (n !== this.seg) continue;
+        await this.append(data);
+        this.seg = n + 1;
+        // Up when the next rendition fits the measured rate twice over, down when this one does not fit it.
+        if (!this.fixed) {
+          const up = this.levels[this.level + 1];
+          if (up && bps > up.bw * 2) this.level++;
+          else if (this.level > 0 && bps < lvl.bw * 1.1) this.level--;
+        }
+        const t = this.v.currentTime;
+        if (t > 90 && !this.sb.updating) { this.sb.remove(0, t - 60); await new Promise(r => this.sb.addEventListener('updateend', r, { once: true })); }
+      } catch (e) {
+        if (e.name !== 'AbortError') await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+  }
+}
+
 function dialog(title, ...kids) {
   const d = el('div', { class: 'dlg' });
   const close = () => { d.remove(); document.removeEventListener('keydown', esc); d.querySelectorAll('video,audio').forEach(v => { v.pause(); v.removeAttribute('src'); v.load(); }); };
@@ -260,17 +332,36 @@ async function preview(it) {
       const id = await tempLink(it, 4 * 3600);
       const m = el(k === 'video' ? 'video' : 'audio', { controls: '', autoplay: '', playsinline: '' });
       if (k === 'audio') view.style.minHeight = '80px';
-      const native = m.canPlayType('application/vnd.apple.mpegurl') !== '';
-      const q = el('select', {}, el('option', { value: 'orig', text: 'Original file' }),
-        ...(native ? ['hls-copy', 'hls-1080', 'hls-720', 'hls-480', 'hls-360'].map(v => el('option', { value: v, text: v === 'hls-copy' ? 'Stream (no transcoding)' : 'Stream ' + v.slice(4) + 'p' })) : []));
-      const setSrc = () => { const t = m.currentTime || 0; m.src = q.value === 'orig' ? '/~share/' + id : '/~media/' + q.value + '/~share/' + id + '/index.m3u8'; if (t) m.currentTime = t; m.play().catch(() => {}); };
-      q.onchange = setSrc;
-      // A browser that plays the file itself plays it whole; one that does not is given a stream it can.
-      q.value = native && !m.canPlayType(it.type || 'video/mp4') ? 'hls-720' : 'orig';
-      setSrc();
       view.append(m);
+      const base = '/~share/' + id;
+      let meta = null;
+      try { const r = await fetch('/~media/info' + base); if (r.ok) meta = await r.json(); } catch (e) {}
+      const native = m.canPlayType('application/vnd.apple.mpegurl') !== '';
+      const mse = 'MediaSource' in window;
+      const streams = meta && meta.video && (native || mse);
+      const q = el('select', {}, el('option', { value: 'orig', text: 'Original file' }));
+      if (streams) {
+        q.append(el('option', { value: 'auto', text: 'Auto' }));
+        for (const h of meta.renditions) q.append(el('option', { value: String(h), text: h + 'p' }));
+      }
+      let player = null;
+      const setSrc = () => {
+        const t = m.currentTime || 0;
+        if (player) { player.stop(); player = null; }
+        const v = q.value;
+        if (v === 'orig') m.src = base;
+        else if (native) m.src = '/~media/' + (v === 'auto' ? 'hls' + base + '/master.m3u8' : 'hls-' + v + base + '/index.m3u8');
+        else { player = new MsePlayer(m, '/~media/hls' + base + '/master.m3u8', v === 'auto' ? 0 : +v); player.start(t); return; }
+        if (t) m.currentTime = t;
+        m.play().catch(() => {});
+      };
+      q.onchange = setSrc;
+      // The file itself where the browser plays it, which costs the server nothing; a stream where it does not.
+      const direct = meta ? meta.mime && m.canPlayType(meta.mime) !== '' : m.canPlayType(it.type || 'video/mp4') !== '';
+      q.value = direct || !streams ? 'orig' : 'auto';
+      setSrc();
       acts.append(el('span', { class: 'mut', text: 'Quality' }), q);
-      if (!native) acts.append(el('span', { class: 'mut', text: 'This browser plays the original file only.' }));
+      if (meta) acts.append(el('span', { class: 'mut', text: (meta.width ? meta.width + '×' + meta.height + ' ' : '') + (meta.video || '') + (meta.hdr ? ' HDR' : '') }));
     } else if (k === 'text' && it.size < 1 << 20) {
       const r = await must(await api('GET', '/~dav/' + enc(it.segs)));
       view.style.background = 'none';
