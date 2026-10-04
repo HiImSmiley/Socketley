@@ -345,7 +345,8 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
         const bool json = r.has_query("format") && r.get_query("format") == "json";
         std::weak_ptr<conn> weak = c;
         const std::string base = "/~share/" + id + "/";
-        m_node.list(s.bucket, q, [this, weak, json, base, prefix = q.prefix, folder_prefix = s.key, upload = s.upload](st st_, list_page p)
+        const std::string prefix = q.prefix;
+        app_list(s.bucket, std::move(q), [this, weak, json, base, prefix, folder_prefix = s.key, upload = s.upload](st st_, list_page p)
         {
             auto cc = weak.lock();
             if (!cc || cc->dead)

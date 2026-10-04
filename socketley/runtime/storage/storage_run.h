@@ -746,6 +746,8 @@ public:
     // Whether the request's user may do `method` to `bucket`/`key` as S3 would judge it.
     bool app_allowed(const std::shared_ptr<conn>& c, std::string_view method, std::string_view bucket,
                      std::string_view key, std::string_view query = {});
+    // Every page of a listing as one, up to the bound an application lists to.
+    void app_list(std::string bucket, list_query q, std::function<void(st, list_page)> done);
     // HTTP Basic credentials, or none on a runtime that takes none; false after answering 401.
     bool app_login(const std::shared_ptr<conn>& c, std::string_view realm);
     void app_reply(const std::shared_ptr<conn>& c, int status, std::string body = {},

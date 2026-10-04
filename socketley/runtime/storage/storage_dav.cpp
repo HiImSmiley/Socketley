@@ -268,6 +268,47 @@ void storage_run::app_forward(const std::shared_ptr<conn>& c, std::string_view m
     hook_request(c);
 }
 
+void storage_run::app_list(std::string bucket, list_query q, std::function<void(st, list_page)> done)
+{
+    // Page after page into one, each page's answer holding the walk, up to the bound of a listing.
+    struct pager
+    {
+        std::string bucket;
+        list_query q;
+        list_page all;
+        std::function<void(st, list_page)> done;
+        std::weak_ptr<pager> self;
+        std::function<void()> step;
+    };
+    auto p = std::make_shared<pager>();
+    p->bucket = std::move(bucket);
+    p->q = std::move(q);
+    p->done = std::move(done);
+    p->self = p;
+    pager* raw = p.get();
+    raw->step = [this, raw]()
+    {
+        m_node.list(raw->bucket, raw->q, [raw, hold = raw->self.lock()](st s, list_page page)
+        {
+            for (list_entry& e : page.objects)
+                raw->all.objects.push_back(std::move(e));
+            for (std::string& x : page.prefixes)
+                raw->all.prefixes.push_back(std::move(x));
+            if (s == st::ok && page.truncated && raw->all.objects.size() + raw->all.prefixes.size() < listing_max)
+            {
+                raw->q.resume_at  = page.resume_at;
+                raw->q.has_resume = true;
+                raw->step();
+                return;
+            }
+            raw->all.truncated = s == st::ok && page.truncated;
+            auto finish = std::move(raw->done);
+            finish(s, std::move(raw->all));
+        });
+    };
+    raw->step();
+}
+
 // ─── WebDAV ─────────────────────────────────────────────────────────────────
 
 void storage_run::op_dav(const std::shared_ptr<conn>& c)
@@ -394,17 +435,33 @@ void storage_run::dav_body(const std::shared_ptr<conn>& c)
         }
         // A folder is the empty object its name ends in a slash, which S3 browsers show as one too.
         std::string marker = key.back() == '/' ? key : key + "/";
-        s3_error err;
         std::weak_ptr<conn> weak = c;
-        object_meta meta;
-        meta.content_type = "application/x-directory";
-        auto w = put_whole(bucket, marker, std::move(meta), std::string{}, [this, weak](st s, const put_result*)
+        list_query q;
+        q.prefix   = marker;
+        q.max_keys = 1;
+        // A folder that exists, by its marker or by anything under it, is 405 and written nothing, as RFC 4918 has
+        // it: clients make a file's folder before each upload, and a write each time would queue them on one key.
+        m_node.list(bucket, q, [this, weak, bucket, marker](st s, list_page p)
         {
-            if (auto cc = weak.lock(); cc && !cc->dead)
-                app_reply(cc, s == st::ok ? 201 : s == st::no_such_bucket ? 409 : 507);
-        }, err);
-        if (!w)
-            app_reply(c, err.status ? err.status : 500, err.message + "\n");
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            if (s == st::ok && (!p.objects.empty() || !p.prefixes.empty()))
+            {
+                app_reply(cc, 405, "The folder exists.\n");
+                return;
+            }
+            s3_error err;
+            object_meta meta;
+            meta.content_type = "application/x-directory";
+            auto w = put_whole(bucket, marker, std::move(meta), std::string{}, [this, weak](st s2, const put_result*)
+            {
+                if (auto c2 = weak.lock(); c2 && !c2->dead)
+                    app_reply(c2, s2 == st::ok ? 201 : s2 == st::no_such_bucket ? 409 : 507);
+            }, err);
+            if (!w)
+                app_reply(cc, err.status ? err.status : 500, err.message + "\n");
+        });
         return;
     }
     if (bucket.empty())
@@ -614,7 +671,7 @@ void storage_run::dav_propfind(const std::shared_ptr<conn>& c, const std::string
         q.prefix    = prefix;
         q.delimiter = "/";
         q.max_keys  = children ? 1000 : 1;
-        m_node.list(bucket, q, [this, weak, bucket, prefix, children, must_exist](st s, list_page p)
+        auto answer = [this, weak, bucket, prefix, children, must_exist](st s, list_page p)
         {
             auto cc = weak.lock();
             if (!cc || cc->dead)
@@ -636,7 +693,12 @@ void storage_run::dav_propfind(const std::shared_ptr<conn>& c, const std::string
             }
             x += "</D:multistatus>";
             app_reply(cc, 207, std::move(x), "application/xml; charset=utf-8");
-        });
+        };
+        // Its children are every page of the folder; the folder alone is whether it has one entry.
+        if (children)
+            app_list(bucket, std::move(q), std::move(answer));
+        else
+            m_node.list(bucket, q, std::move(answer));
     };
     if (key.empty() || key.back() == '/')
     {
@@ -701,7 +763,8 @@ void storage_run::dav_collection(const std::shared_ptr<conn>& c, const std::stri
     list_query q;
     q.prefix    = key.empty() || key.back() == '/' ? key : key + "/";
     q.delimiter = "/";
-    m_node.list(bucket, q, [this, weak, bucket, prefix = q.prefix, page](st s, list_page p)
+    const std::string prefix = q.prefix;
+    app_list(bucket, std::move(q), [this, weak, bucket, prefix, page](st s, list_page p)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
