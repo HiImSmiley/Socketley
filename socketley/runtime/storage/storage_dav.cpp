@@ -802,10 +802,13 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
         std::string bucket, prefix, dst_bucket, dst_prefix;
         bool keep_source{false}, removing{false};
         std::vector<list_entry> keys;
-        size_t at{0}, failed{0};
+        size_t at{0}, failed{0}, inflight{0};
+        // A completion that comes back inside the loop that started it asks for one more turn instead of recursing.
+        bool pumping{false}, again{false}, answered{false};
         list_query q;
         std::weak_ptr<walk> self;
         std::function<void()> next, page;
+        std::function<void(const list_entry&)> one;
     };
     auto w = std::make_shared<walk>();
     w->self = w;
@@ -820,43 +823,41 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
     w->q.max_keys = 1000;
     walk* raw = w.get();
 
-    auto remove_then_next = [this, raw](const std::string& key)
+    // An object done, well or not, makes room for the next.
+    auto done = [raw]()
     {
-        m_store.remove_version(raw->bucket, key, {}, [this, raw, key, hold = raw->self.lock()](remove_result rr)
+        --raw->inflight;
+        raw->next();
+    };
+    auto remove_then_done = [this, raw, done](const std::string& key)
+    {
+        m_store.remove_version(raw->bucket, key, {}, [this, raw, key, done, hold = raw->self.lock()](remove_result rr)
         {
             if (rr.status != st::ok)
                 ++raw->failed;
             else if (rr.existed)
                 notify_delete(raw->bucket, key);
-            raw->next();
+            done();
         });
     };
-    w->next = [this, raw, remove_then_next]()
+    w->one = [this, raw, done, remove_then_done](const list_entry& e)
     {
-        if (raw->at == raw->keys.size())
-        {
-            if (auto cc = raw->who.lock(); cc && !cc->dead)
-                app_reply(cc, raw->failed ? 500 : raw->removing ? 204 : 201,
-                          raw->failed ? std::to_string(raw->failed) + " of the folder's objects failed.\n" : std::string{});
-            return;
-        }
-        const list_entry e = raw->keys[raw->at++];
         if (raw->removing)
         {
-            remove_then_next(e.key);
+            remove_then_done(e.key);
             return;
         }
         // A copy reads the object whole, so one past the bound, or one only its client's key opens, is not copied.
         if (e.meta.size > tree_object_max || sse_mode_of(e.meta) == sse_mode::c)
         {
             ++raw->failed;
-            raw->next();
+            done();
             return;
         }
         const std::string dst_key = raw->dst_prefix + e.key.substr(raw->prefix.size());
         const std::string src_key = e.key;
         m_store.open_object(raw->bucket, e.key, static_cast<size_t>(stored_size(e.meta)),
-                            [this, raw, remove_then_next, dst_key, src_key, hold = raw->self.lock()](open_result o)
+                            [this, raw, done, remove_then_done, dst_key, src_key, hold = raw->self.lock()](open_result o)
         {
             if (o.fd >= 0)
                 m_loop.close_fd(o.fd);
@@ -873,28 +874,59 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
             if (!ok || body.size() != o.meta.size)
             {
                 ++raw->failed;
-                raw->next();
+                done();
                 return;
             }
             object_meta meta;
             meta.content_type = o.meta.content_type;
             s3_error err;
             auto put = put_whole(raw->dst_bucket, dst_key, std::move(meta), std::move(body),
-                                 [raw, remove_then_next, src_key, hold](st s, const put_result*)
+                                 [raw, done, remove_then_done, src_key, hold](st s, const put_result*)
             {
                 if (s != st::ok)
                     ++raw->failed;
                 if (s == st::ok && !raw->keep_source)
-                    remove_then_next(src_key);
+                    remove_then_done(src_key);
                 else
-                    raw->next();
+                    done();
             }, err);
             if (!put)
             {
                 ++raw->failed;
-                raw->next();
+                done();
             }
         });
+    };
+    // Removals go 32 at a time, which their syncs share; copies 4, as each holds an object in memory.
+    w->next = [this, raw]()
+    {
+        if (raw->pumping)
+        {
+            raw->again = true;
+            return;
+        }
+        raw->pumping = true;
+        const size_t window = raw->removing ? 32 : 4;
+        do
+        {
+            raw->again = false;
+            while (raw->inflight < window && raw->at < raw->keys.size())
+            {
+                ++raw->inflight;
+                const list_entry e = raw->keys[raw->at++];
+                raw->one(e);
+            }
+        } while (raw->again);
+        raw->pumping = false;
+        if (raw->at == raw->keys.size() && raw->inflight == 0 && !raw->answered)
+        {
+            raw->answered = true;
+            if (auto cc = raw->who.lock(); cc && !cc->dead)
+                app_reply(cc, raw->failed ? 500 : raw->removing ? 204 : 201,
+                          raw->failed ? std::to_string(raw->failed) + " of the folder's objects failed.\n" : std::string{});
+            // The walk's functions hold nothing of it, so it goes with the last answer that held it.
+            raw->one = nullptr;
+        }
     };
     w->page = [this, raw]()
     {
