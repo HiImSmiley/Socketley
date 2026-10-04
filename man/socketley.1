@@ -7050,13 +7050,50 @@ signed for the service
 or
 .BR s3 ;
 temporary credentials cannot ask for more, and a runtime without keys gives none.
-AssumeRole takes any RoleArn, since the runtime has no roles: the session is the
-user's, bounded by its
+AssumeRole of a role the IAM API made (see
+.BR IAM )
+is refused unless the role's trust policy names the caller, for longer than the
+role's MaxSessionDuration, and its session holds the role's policies and not the
+caller's. Any other RoleArn makes the caller's own session, bounded by its
 .B Policy
 (an identity policy's grammar, at most 2048 bytes), which only narrows it:
 what the policy does not allow is refused even to an admin or a bucket's owner,
-the bucket policy's operations included. A browser's form upload is not signed with
-temporary credentials.
+the bucket policy's operations included. GetCallerIdentity names the user or the
+assumed role that signed. A browser's form upload is not signed with temporary
+credentials.
+.SS IAM
+The endpoint answers IAM's API too, to an admin and no session: CreateUser,
+GetUser, ListUsers, UpdateUser and DeleteUser; CreateAccessKey (at most two per
+user), ListAccessKeys, UpdateAccessKey and DeleteAccessKey; CreateGroup,
+GetGroup, ListGroups, DeleteGroup, AddUserToGroup, RemoveUserFromGroup and
+ListGroupsForUser; CreateRole, GetRole, ListRoles, UpdateRole and DeleteRole;
+and for users, groups and roles alike Put, Get, List and Delete of an inline
+policy and Attach, Detach and ListAttached of the AWS managed policies
+AmazonS3FullAccess, AmazonS3ReadOnlyAccess and AdministratorAccess. A request is a
+form posted to
+.BR / ,
+as
+.B aws iam
+and the SDKs send it, signed for
+.B iam
+with or without a region.
+.PP
+What it makes is kept in
+.IB dir /.iam.json,
+written under a lock and renamed over, and read by every shard beside the
+credentials file: a change is in force on the shard that made it at once and on the
+others within 50 milliseconds, and a restart keeps it. A user's identity policy is
+the statements of its inline and attached policies and its groups' together; a user
+with none owns and reaches the buckets it makes, as a credentials-file user without
+a policy does. A user of the credentials file cannot be made again, and policies
+put on one stand beside the file's own: either's Deny refuses and either's Allow
+admits; such a user is not listed. A user is deleted once it has no keys, policies or
+groups left, a group once it has no members or policies, and a role once it has no
+policies. Policies are checked as identity policies are; a trust policy's
+statements with a condition let nobody in. ARNs name no account,
+.BR arn:aws:iam:::user/ name ,
+as RGW writes them. OIDC providers, customer managed policies, tags and permission
+boundaries are not served.
 .SS CORS
 A bucket's CORS rules let a page served from another origin use it from a
 browser: read objects, and upload with a presigned URL. They are set with
