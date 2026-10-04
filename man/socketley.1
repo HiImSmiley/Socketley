@@ -8838,6 +8838,112 @@ when the policy lets anyone read the bucket's keys but not list them, as on S3.
 The S3 API is served on the same port as before, so a site is uploaded and read
 over both.
 .
+.SS Drive, links, media and the web interface
+Paths that begin with
+.BR ~ ,
+which no bucket name can, are the runtime's own applications, on the S3 port and
+under the S3 runtime's users, policies and versioning:
+.TP
+.B /~dav/
+A WebDAV drive (classes 1 and 2) for Windows, macOS, Linux file managers, rclone
+and phones. It signs in with HTTP Basic, an access key as the user name and its
+secret as the password; a runtime without credentials takes none. Its root is
+every bucket the user owns, every bucket for an admin, and a bucket's keys are
+files whose slashes are folders. A file's GET, PUT, DELETE, COPY and MOVE are the
+S3 operations, judged by the same policies; MKCOL at the root makes a bucket and
+within one an empty
+.I folder/
+marker object, as S3 browsers do. A folder's COPY, MOVE and DELETE go over every
+key under it, and a copy reads each object whole, so one past 256 MiB or under a
+client's own key is not copied and the answer is
+.BR 500 .
+Locks are granted and not enforced, and properties are not kept.
+.IP
+.nf
+[drive]                      # rclone.conf, then: rclone copy ~/photos drive:holiday
+type = webdav
+url = http://host:9000/~dav/
+user = AKIA...
+pass = <the secret, as rclone obscure prints it>
+.fi
+.IP
+In a versioned bucket a deleted file is a delete marker, and its versions stay:
+.B GET /~dav/\fIbucket\fB/\fIfolder\fB/?trash
+lists the files under the folder whose latest version is a marker, as JSON with
+the key, the time of the deletion and the size of the version behind it, and
+.B POST /~dav/\fIbucket\fB/\fIkey\fB?restore
+removes the marker and brings that version back. A lifecycle rule's
+NoncurrentVersionExpiration empties the trash.
+.TP
+.B /~share/
+Links to an object or a folder that anyone holding one reads without credentials.
+.B POST /~share
+with a JSON body makes one, signed with SigV4 or Basic as above:
+.IP
+.nf
+{"bucket": "holiday", "key": "2026/", "expires_in": 604800,
+ "password": "...", "max_downloads": 0, "upload": false, "note": "..."}
+.fi
+.IP
+A key ending in
+.B /
+or none is a folder, read as a page, as JSON with
+.BR ?format=json ,
+and file by file under it;
+.B upload
+lets a visitor PUT files into it. The maker must be able to read what the link
+names, and to write there for an upload link. A password is asked for with Basic,
+any user name, and kept salted and hashed;
+.B max_downloads
+counts each read from the start of a file and not a player's later ranges, and
+.B ?download
+asks a browser to save. An expired link is
+.BR 410 ,
+and is removed at the next listing.
+.B GET /~share
+lists the caller's links, every link for an admin, and
+.B DELETE /~share/\fIid\fR
+revokes one. Links are files in
+.IR dir /.shares/,
+read by every shard.
+.TP
+.B /~media/\fIvariant\fB/\fIbucket\fB/\fIkey\fR
+Media made by ffmpeg from an object, and kept: a variant
+.BI thumb\- width
+(64, 128, 256, 320, 480, 640, 960, 1280 or 1920) is a JPEG still of a picture or
+of a film a few seconds in, and
+.BI hls\- height /index.m3u8
+(240, 360, 480, 720, 1080, 1440 or 2160) is an HLS stream of a film or a song,
+H.264 and AAC in CMAF segments of four seconds, which a player starts while the
+rest is still being made;
+.B hls\-copy
+streams the source's own codecs without transcoding. The object is read as a GET
+of it would be, by its user or, under
+.BI /~media/ variant /~share/ id\fR[\fB/\fIpath\fR],
+through a link. ffmpeg reads the object over the runtime's own listener with an
+address signed by a key in
+.IR dir /.media/key,
+and what it made lies in
+.IR dir /.media/
+under the variant, the object's key and its ETag, so a new version is made anew
+and every shard serves what one made; one medium is made once however many ask
+for it at once. A shard runs two ffmpegs at most, a request waits a minute for
+its medium, a stream nobody asks for in ten minutes is stopped, and an object
+ffmpeg cannot read is
+.B 415
+for two minutes. See
+.B SOCKETLEY_FFMPEG
+and
+.BR SOCKETLEY_MEDIA_CACHE_MB .
+.TP
+.B /~ui/
+A web interface, one page served from the binary, that signs in with an access
+key and its secret and browses, uploads (folders too, by dropping them), renames,
+deletes, shares, restores from the trash, previews pictures and text and plays
+films and music through
+.B /~media/
+streams where the browser plays HLS, and the original file otherwise.
+.
 .SS Durability
 .B \-\-fsync
 decides when a write a client was answered for is on the disk, as a cache's
@@ -9093,6 +9199,12 @@ and
 and
 .B sse_gets
 (bodies written encrypted, and GETs answered by opening an object's chunks),
+.BR media_made ,
+.B media_failed
+and
+.B media_served
+(thumbnails and streams ffmpeg made and failed to make, and the answers served
+from them),
 and one line
 .BI error_ Code
 for every S3 error code the runtime has answered, such as
@@ -13529,6 +13641,28 @@ of its own for that one read, counted as
 in
 .BR stats .
 This changes the memory a worker holds and never what it returns.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_FFMPEG
+The ffmpeg a storage runtime makes thumbnails and streams with, under
+.BR /~media/ .
+Default: the first
+.B ffmpeg
+on
+.BR PATH ;
+with neither, a media request is answered
+.BR "501" .
+Read at a runtime's first media request.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MEDIA_CACHE_MB
+The size in MiB past which a storage runtime removes the media it made, least
+recently asked for first, from
+.IR dir /.media/.
+Default: 10240. The medium asked for last is kept even when it alone is larger,
+and none is removed while it is being made.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
