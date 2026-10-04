@@ -35,7 +35,9 @@ check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "got '$2', want '$3'"; fi; 
 
 daemon_isolate stgmedia
 trap 'daemon_stop' EXIT
-export SOCKETLEY_FFMPEG="$FF"
+# ffmpeg two seconds slow to start, so that a stream queued behind others is seen to wait.
+printf '#!/bin/sh\nsleep 2\nexec "%s" "$@"\n' "$FF" > "$SOCKETLEY_TMPD/slowff"; chmod +x "$SOCKETLEY_TMPD/slowff"
+export SOCKETLEY_FFMPEG="$SOCKETLEY_TMPD/slowff"
 # Small enough that the last film below overruns it, so that the cache's bound is seen to hold.
 export SOCKETLEY_MEDIA_CACHE_MB=2
 daemon_start "$BIN"
@@ -149,6 +151,16 @@ stream hls-copy clip.mp4 "$T/hcopy"
 check "a copied stream keeps the source's height" "$(height "$T/hcopy/all.mp4")" 360
 check "a segment past the end is 404" "$(code -u "$A" "$U/~media/hls-240/films/clip.mp4/seg00999.m4s")" 404
 check "a file a stream has none of is 404" "$(code -u "$A" "$U/~media/hls-240/films/clip.mp4/x.ts")" 404
+
+# Streams do not queue behind one another, as thumbnails do: five at once over two shards all start together,
+# where two per shard would hold one back until another's ffmpeg had run.
+t0=$(date +%s%N); pids=()
+for v in hls-240 hls-360 hls-480 hls-720 hls-copy; do
+    curl -s -m 60 -u "$A" -o /dev/null "$U/~media/$v/films/short.mp4/index.m3u8" & pids+=($!)
+done
+wait "${pids[@]}"
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+[ "$ms" -lt 3800 ] && ok || bad "five streams at once start together" "the last playlist after $ms ms"
 
 # A restart keeps what was made.
 "$BIN" stop media >/dev/null 2>&1; "$BIN" start media >/dev/null 2>&1; up
