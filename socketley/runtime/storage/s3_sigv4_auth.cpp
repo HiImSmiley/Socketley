@@ -16,6 +16,7 @@
 
 #include "checksum.h"
 #include "digest.h"
+#include "s3_iam.h"
 #include "s3_names.h"
 #include "s3_sts.h"
 #include "../../shared/logging.h"
@@ -336,6 +337,17 @@ std::shared_ptr<const user_identity> credential_set::user_of(std::string_view ac
     return it == m_map.end() ? nullptr : it->second.user;
 }
 
+void credential_set::replace_user(std::shared_ptr<const user_identity> user)
+{
+    const auto it = m_users.find(user->id);
+    if (it == m_users.end())
+        return;
+    for (auto& [k, e] : m_map)
+        if (e.user == it->second)
+            e.user = user;
+    it->second = std::move(user);
+}
+
 const user_identity* credential_set::find_user(std::string_view id) const
 {
     const auto it = m_users.find(id);
@@ -557,6 +569,10 @@ bool sigv4_authenticator::rebuild(std::string& err)
         m_stamp_ino      = static_cast<uint64_t>(st.st_ino);
         m_have_stamp     = true;
     }
+    m_file_users.clear();
+    for (std::string& id : set.user_ids())
+        m_file_users.insert(std::move(id));
+    add_iam(set);
     if (set.size() == 0 && !m_cfg.anonymous)
     {
         err = "no credentials to serve with";
@@ -564,6 +580,101 @@ bool sigv4_authenticator::rebuild(std::string& err)
     }
     m_creds = std::move(set);
     return true;
+}
+
+void sigv4_authenticator::add_iam(credential_set& set)
+{
+    m_roles.clear();
+    if (m_cfg.iam_file.empty())
+        return;
+    std::string text, err;
+    m_iam_stamp = file_stamp{m_cfg.iam_file};
+    stamp_of(m_iam_stamp.path, m_iam_stamp.mtime_ns, m_iam_stamp.size, m_iam_stamp.ino);
+    // No file is no IAM users yet.
+    if (::access(m_cfg.iam_file.c_str(), F_OK) != 0)
+        return;
+    iam_state st;
+    if (!read_file(m_cfg.iam_file, text, err) || !iam_parse(text, st, err))
+    {
+        LOG_WARN(("storage: the IAM file " + m_cfg.iam_file + " is not read: " + err).c_str());
+        return;
+    }
+    // The policies a user or role holds, compiled into one identity policy; one that does not compile leaves it none.
+    auto compiled = [](user_identity& u, const std::string& doc)
+    {
+        u.has_policy = true;
+        s3_error e;
+        if (!doc.empty() && !bucket_policy::compile_identity(doc, u.policy, e))
+            LOG_WARN(("storage: the IAM policies of " + u.id + " do not compile: " + e.message).c_str());
+    };
+    for (const auto& [name, iu] : st.users)
+    {
+        // A user the credentials file declares is that file's, with the IAM API's policies beside its own.
+        if (const user_identity* fu = set.find_user(name))
+        {
+            const std::string doc = iam_user_policy(st, iu);
+            auto extra = std::make_shared<bucket_policy>();
+            s3_error e;
+            if (doc.empty() || !bucket_policy::compile_identity(doc, *extra, e))
+                continue;
+            auto copy = std::make_shared<user_identity>(*fu);
+            copy->iam_policy = std::move(extra);
+            set.replace_user(std::move(copy));
+            continue;
+        }
+        if (iu.external)
+            continue;
+        auto u = std::make_shared<user_identity>();
+        u->id           = name;
+        u->display_name = name;
+        u->configured   = true;
+        const std::string doc = iam_user_policy(st, iu);
+        if (!doc.empty())
+            compiled(*u, doc);
+        std::shared_ptr<const user_identity> done = u;
+        if (!set.add_user(done, err))
+            continue;
+        for (const auto& [id, k] : st.keys)
+            if (k.user == name && k.active && !set.add(id, k.secret, err, done))
+                LOG_WARN(("storage: the IAM key " + id + " is not taken: " + err).c_str());
+    }
+    for (const auto& [name, r] : st.roles)
+    {
+        auto u = std::make_shared<user_identity>();
+        u->id           = "role/" + name;
+        u->display_name = name;
+        u->configured   = true;
+        // A role holds what its policies give and nothing else, none when it has none.
+        compiled(*u, iam_role_policy(r));
+        m_roles[name] = role_entry{r.trust, r.max_session, std::move(u)};
+    }
+}
+
+bool sigv4_authenticator::iam_changed()
+{
+    if (m_cfg.iam_file.empty())
+        return false;
+    file_stamp now;
+    stamp_of(m_cfg.iam_file, now.mtime_ns, now.size, now.ino);
+    return now.mtime_ns != m_iam_stamp.mtime_ns || now.size != m_iam_stamp.size || now.ino != m_iam_stamp.ino;
+}
+
+void sigv4_authenticator::refresh()
+{
+    std::string err;
+    if (!rebuild(err))
+        LOG_WARN(("storage: credentials not reloaded, the old set stays: " + err).c_str());
+}
+
+int sigv4_authenticator::role_check(std::string_view role, std::string_view user_id, int64_t& max_session)
+{
+    if (iam_changed())
+        refresh();
+    const auto it = m_roles.find(role);
+    if (it == m_roles.end())
+        return -1;
+    max_session = it->second.max_session;
+    return iam_trusts(it->second.trust, user_id) ? 1 : 0;
 }
 
 std::string sigv4_authenticator::display_name(std::string_view id) const
@@ -580,7 +691,7 @@ uint64_t sigv4_authenticator::max_bytes_of(std::string_view id) const
 }
 
 bool sigv4_authenticator::issue_session(std::string_view access_key, int64_t expires, std::string_view policy,
-                                        session_credentials& out)
+                                        std::string_view role, session_credentials& out)
 {
     const std::string_view parent = m_creds.secret(access_key);
     if (parent.empty())
@@ -590,6 +701,7 @@ bool sigv4_authenticator::issue_session(std::string_view access_key, int64_t exp
     g.access_key = sts_new_access_key();
     g.expires    = expires;
     g.policy     = policy;
+    g.role       = role;
     if (g.access_key.empty())
         return false;
     out.access_key = g.access_key;
@@ -614,6 +726,14 @@ std::string_view sigv4_authenticator::session_secret(std::string_view token, std
     std::shared_ptr<const user_identity> base = m_creds.user_of(g.parent_key);
     if (parent.empty() || !base)
         return {};
+    // A session of a role signs as the role, while the role is there.
+    if (!g.role.empty())
+    {
+        const auto r = m_roles.find(g.role);
+        if (r == m_roles.end())
+            return {};
+        base = r->second.identity;
+    }
     // The session last signed for is taken again while its key and its user are the ones it was sealed with.
     session_entry& e = m_session;
     if (e.token == token && e.parent_secret == parent && e.parent_user == base)
@@ -651,12 +771,29 @@ bool sigv4_authenticator::load(std::string& err)
 
 void sigv4_authenticator::maybe_reload()
 {
-    if (m_cfg.credentials_file.empty())
+    if (m_cfg.credentials_file.empty() && m_cfg.iam_file.empty())
         return;
     const auto now = std::chrono::steady_clock::now();
+    // A change another shard's IAM call wrote is taken within 50 ms, which costs a stat at that rate.
+    if (!m_cfg.iam_file.empty() && now - m_last_iam_probe >= std::chrono::milliseconds(50))
+    {
+        m_last_iam_probe = now;
+        if (iam_changed())
+        {
+            refresh();
+            return;
+        }
+    }
     if (now - m_last_check < std::chrono::seconds(1))
         return;
     m_last_check = now;
+    // The IAM file another shard wrote is read again here too, beside the credentials file.
+    if (m_cfg.credentials_file.empty())
+    {
+        if (iam_changed())
+            refresh();
+        return;
+    }
 
     int64_t  mtime = 0;
     uint64_t size = 0, ino = 0;
@@ -670,7 +807,7 @@ void sigv4_authenticator::maybe_reload()
         same = now_fs.mtime_ns == m_policy_stamps[i].mtime_ns && now_fs.size == m_policy_stamps[i].size &&
                now_fs.ino == m_policy_stamps[i].ino;
     }
-    if (same)
+    if (same && !iam_changed())
         return;
 
     std::string err;
@@ -736,7 +873,21 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
     const auto lookup = [&](std::string_view access_key) -> std::string_view
     {
         if (token.empty())
-            return m_creds.secret(access_key);
+        {
+            std::string_view s = m_creds.secret(access_key);
+            // A key the IAM API just made on another shard is looked for again in the file, at most every 20 ms.
+            if (s.empty() && !m_cfg.iam_file.empty() &&
+                std::chrono::steady_clock::now() - m_last_iam_probe > std::chrono::milliseconds(20))
+            {
+                m_last_iam_probe = std::chrono::steady_clock::now();
+                if (iam_changed())
+                {
+                    refresh();
+                    s = m_creds.secret(access_key);
+                }
+            }
+            return s;
+        }
         return session_secret(token, access_key, now, session_user, expired);
     };
     const s3::verify_result vr = s3::verify(sv, opts, lookup, now);

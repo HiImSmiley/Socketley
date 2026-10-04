@@ -274,6 +274,7 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
     if (action == s3_action::create_bucket)
     {
         if (u && ((u->has_policy && u->policy.evaluate(pr) == policy_effect::deny) ||
+                  (u->iam_policy && u->iam_policy->evaluate(pr) == policy_effect::deny) ||
                   (u->session_policy && u->session_policy->evaluate(pr) != policy_effect::allow)))
             refuse(make_error("AccessDenied"));
         return;
@@ -394,7 +395,15 @@ policy_effect storage_run::access_of(const std::shared_ptr<conn>& c, std::string
         if (e != policy_effect::allow)
             return e == policy_effect::deny ? policy_effect::deny : policy_effect::none;
     }
-    const policy_effect own = u && u->has_policy ? u->policy.evaluate(q) : policy_effect::none;
+    policy_effect own = u && u->has_policy ? u->policy.evaluate(q) : policy_effect::none;
+    // The IAM API's policies of a credentials-file user stand beside the file's: either's Deny refuses, either's Allow
+    // admits.
+    if (const bucket_policy* extra = u ? u->iam_policy.get() : nullptr)
+    {
+        const policy_effect e = extra->evaluate(q);
+        if (e == policy_effect::deny || (e == policy_effect::allow && own == policy_effect::none))
+            own = e;
+    }
     if (own == policy_effect::deny)
         return policy_effect::deny;
     // An admin, the owner, and anybody at all on a bucket that is not there, which the operation answers for.

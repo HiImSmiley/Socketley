@@ -28,9 +28,11 @@ struct user_identity
     uint64_t    max_bytes{0};
     // A session's own policy, which bounds whatever else lets the user in, for temporary credentials given with one.
     std::shared_ptr<const bucket_policy> session_policy;
+    // The policies the IAM API gave a user of the credentials file, beside the file's own.
+    std::shared_ptr<const bucket_policy> iam_policy;
 
     // Nothing but a bucket policy's Deny can refuse this user anything.
-    bool unrestricted() const { return admin && !has_policy && !session_policy; }
+    bool unrestricted() const { return admin && !has_policy && !session_policy && !iam_policy; }
 };
 
 }   // namespace socketley::storage

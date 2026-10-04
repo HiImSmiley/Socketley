@@ -1,0 +1,156 @@
+// IAM over the S3 endpoint: an admin's requests change the users, keys, groups and roles kept in the IAM file,
+// one change at a time under the file's lock, which every shard's authenticator then reads.
+#include "storage_run.h"
+
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
+#include <chrono>
+
+#include "s3_iam.h"
+#include "../../shared/logging.h"
+
+namespace socketley::storage
+{
+
+namespace
+{
+
+bool read_all(const std::string& path, std::string& out)
+{
+    out.clear();
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT;
+    char buf[65536];
+    for (;;)
+    {
+        const ssize_t n = ::read(fd, buf, sizeof buf);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+        {
+            ::close(fd);
+            return n == 0;
+        }
+        out.append(buf, static_cast<size_t>(n));
+    }
+}
+
+// Writes `text` beside `path`, syncs it and renames it over, so a crash leaves the old document or the new.
+bool replace_file(const std::string& path, const std::string& text)
+{
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return false;
+    size_t off = 0;
+    while (off < text.size())
+    {
+        const ssize_t n = ::write(fd, text.data() + off, text.size() - off);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+        {
+            ::close(fd);
+            ::unlink(tmp.c_str());
+            return false;
+        }
+        off += static_cast<size_t>(n);
+    }
+    if (::fsync(fd) < 0 || ::close(fd) < 0 || ::rename(tmp.c_str(), path.c_str()) < 0)
+    {
+        ::unlink(tmp.c_str());
+        return false;
+    }
+    const size_t slash = path.rfind('/');
+    const std::string dir = slash == std::string::npos ? "." : path.substr(0, slash);
+    if (const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC); dfd >= 0)
+    {
+        if (::fsync(dfd) < 0) {}
+        ::close(dfd);
+    }
+    return true;
+}
+
+}   // namespace
+
+void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::pair<std::string, std::string>>& fields,
+                         std::string_view action, const auth_verdict& v)
+{
+    auto answer = [this, &c](int status, std::string body)
+    {
+        response resp;
+        resp.status = status;
+        resp.headers.emplace_back("Content-Type", "text/xml");
+        resp.body = std::move(body);
+        send_response(c, std::move(resp));
+    };
+    auto fail = [&](int status, std::string_view code, std::string_view message)
+    {
+        count_error(*c, code);
+        answer(status, iam_error_xml(code, message, c->req.request_id));
+    };
+    const std::string file = m_auth->iam_file();
+    if (file.empty())
+    {
+        fail(400, "InvalidAction", "This runtime has no IAM: it was started without credentials.");
+        return;
+    }
+    // IAM is an admin's, as the credentials file is, and no session's.
+    if (!v.user || !v.user->admin || v.session)
+    {
+        fail(403, "AccessDenied", "User: " + (v.user ? v.user->id : std::string("anonymous")) +
+                                      " is not authorized to perform: iam:" + std::string(action));
+        return;
+    }
+
+    // The change is read, made and written under the file's lock, which another shard's change waits for; an
+    // admin's IAM call is rare, so the loop waits the few milliseconds with it.
+    const int lfd = ::open((file + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lfd < 0 || ::flock(lfd, LOCK_EX) < 0)
+    {
+        if (lfd >= 0)
+            ::close(lfd);
+        fail(500, "ServiceFailure", "The IAM file could not be locked.");
+        return;
+    }
+    std::string text, err;
+    iam_state st;
+    iam_result res;
+    if (!read_all(file, text) || !iam_parse(text, st, err))
+    {
+        LOG_WARN(("storage: the IAM file " + file + " is not read: " + err).c_str());
+        res.ok = false;
+        res.status = 500;
+        res.code = "ServiceFailure";
+        res.message = "The IAM file could not be read.";
+    }
+    else
+    {
+        const int64_t now_ms = static_cast<int64_t>(m_store.now_ms());
+        res = iam_apply(st, action, fields, now_ms, c->req.request_id,
+                        [](void* a, std::string_view id) { return static_cast<authenticator*>(a)->file_user(id); },
+                        m_auth);
+        if (res.ok && res.changed && !replace_file(file, iam_json(st)))
+        {
+            res.ok = false;
+            res.status = 500;
+            res.code = "ServiceFailure";
+            res.message = "The IAM file could not be written.";
+        }
+    }
+    ::flock(lfd, LOCK_UN);
+    ::close(lfd);
+    if (res.ok && res.changed)
+        m_auth->refresh();
+    if (!res.ok)
+    {
+        fail(res.status, res.code, res.message);
+        return;
+    }
+    answer(200, std::move(res.xml));
+}
+
+}   // namespace socketley::storage

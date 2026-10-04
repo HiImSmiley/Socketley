@@ -163,10 +163,22 @@ public:
     // Temporary credentials signing for the user of long-term key `access_key` until `expires`, bounded by `policy`
     // when it is not empty; false for a key that is not one, which an authenticator without keys has none of.
     virtual bool issue_session(std::string_view /*access_key*/, int64_t /*expires*/, std::string_view /*policy*/,
-                               session_credentials& /*out*/)
+                               std::string_view /*role*/, session_credentials& /*out*/)
     {
         return false;
     }
+    // Whether the IAM role `role` lets user `user_id` assume it: -1 for no such role, 0 for a refusal, 1 with
+    // `max_session` set to the longest session it gives.
+    virtual int role_check(std::string_view /*role*/, std::string_view /*user_id*/, int64_t& /*max_session*/)
+    {
+        return -1;
+    }
+    // The file the IAM API keeps its users, groups and roles in, empty for an authenticator without one.
+    virtual std::string iam_file() const { return {}; }
+    // Reads the credentials and the IAM file again now, as after the IAM API changed the latter.
+    virtual void refresh() {}
+    // Whether the credentials file declares user `id`, which the IAM API then makes none of.
+    virtual bool file_user(std::string_view /*id*/) const { return false; }
 };
 
 // `--anonymous`: every request is allowed and nobody is named.  A body that is

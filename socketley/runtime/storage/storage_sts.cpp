@@ -6,6 +6,7 @@
 
 #include "bucket_policy.h"
 #include "digest.h"
+#include "s3_iam.h"
 #include "s3_sts.h"
 
 namespace socketley::storage
@@ -54,7 +55,10 @@ void storage_run::op_sts(const std::shared_ptr<conn>& c)
     rv.headers         = &r.headers;
     rv.tls             = c->ssl != nullptr;
     rv.body_sha256_hex = body_hash;
-    rv.service = r.header("authorization").find("/sts/aws4_request") != std::string_view::npos ? "sts" : "s3";
+    const std::string_view authz = r.header("authorization");
+    rv.service = authz.find("/sts/aws4_request") != std::string_view::npos   ? "sts"
+               : authz.find("/iam/aws4_request") != std::string_view::npos ? "iam"
+                                                                           : "s3";
     const auth_verdict v = m_auth->authorize(rv);
     if (v.anonymous)
     {
@@ -68,13 +72,34 @@ void storage_run::op_sts(const std::shared_ptr<conn>& c)
              unknown ? "The security token included in the request is invalid." : v.error.message);
         return;
     }
+    const std::string* action = field("Action");
+    // IAM's API shares the endpoint and the form, as one service of the runtime's own.
+    if (action && iam_action(*action))
+    {
+        op_iam(c, fields, *action, v);
+        return;
+    }
+    // Who signed the request, a session included, as STS tells it.
+    if (action && *action == "GetCallerIdentity")
+    {
+        const std::string id = v.user ? v.user->id : std::string{};
+        const std::string arn = id.starts_with("role/") ? "arn:aws:sts:::assumed-role/" + id.substr(5)
+                                                        : "arn:aws:iam:::user/" + id;
+        response resp;
+        resp.headers.emplace_back("Content-Type", "text/xml");
+        resp.body = "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">"
+                    "<GetCallerIdentityResult><Arn>" + xml_escape(arn) + "</Arn><UserId>" + xml_escape(v.principal) +
+                    "</UserId><Account></Account></GetCallerIdentityResult><ResponseMetadata><RequestId>" +
+                    r.request_id + "</RequestId></ResponseMetadata></GetCallerIdentityResponse>";
+        send_response(c, std::move(resp));
+        return;
+    }
     if (v.session)
     {
         fail(403, "AccessDenied", "Temporary credentials cannot ask for more; sign with the user's own key.");
         return;
     }
 
-    const std::string* action = field("Action");
     const bool assume = action && *action == "AssumeRole";
     if (!action || (!assume && *action != "GetSessionToken"))
     {
@@ -93,7 +118,7 @@ void storage_run::op_sts(const std::shared_ptr<conn>& c)
             return;
         }
     }
-    std::string role_arn, session_name, policy;
+    std::string role_arn, session_name, policy, role;
     if (assume)
     {
         const std::string* arn  = field("RoleArn");
@@ -105,6 +130,25 @@ void storage_run::op_sts(const std::shared_ptr<conn>& c)
         }
         role_arn     = *arn;
         session_name = *name;
+        // A role the IAM API made is assumed only as its trust policy lets, for no longer than it allows; any
+        // other ARN is the caller's own session, bounded by its Policy.
+        int64_t longest_role = 0;
+        const std::string_view rname = iam_role_name_of(*arn);
+        const int rc = v.user ? m_auth->role_check(rname, v.user->id, longest_role) : -1;
+        if (rc == 0)
+        {
+            fail(403, "AccessDenied", "User " + v.user->id + " is not authorized to perform sts:AssumeRole on " + *arn);
+            return;
+        }
+        if (rc == 1)
+        {
+            if (field("DurationSeconds") && duration > longest_role)
+            {
+                fail(400, "ValidationError", "DurationSeconds exceeds the MaxSessionDuration of the role.");
+                return;
+            }
+            role = std::string(rname);
+        }
         if (const std::string* p = field("Policy"))
         {
             bucket_policy checked;
@@ -131,7 +175,7 @@ void storage_run::op_sts(const std::shared_ptr<conn>& c)
     const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     session_credentials sc;
-    if (!m_auth->issue_session(v.principal, now + duration, policy, sc))
+    if (!m_auth->issue_session(v.principal, now + duration, policy, role, sc))
     {
         fail(403, "AccessDenied", "This runtime's credentials cannot give out temporary ones.");
         return;

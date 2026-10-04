@@ -21,6 +21,8 @@ struct session_grant
     int64_t     expires{0};
     // The session policy, empty for none.
     std::string policy;
+    // The IAM role the session assumed, empty for one that signs as its parent key's user.
+    std::string role;
 };
 
 // The most a session policy may hold, as STS bounds a packed one.

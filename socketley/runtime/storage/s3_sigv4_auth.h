@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,6 +28,8 @@ public:
              std::shared_ptr<const user_identity> user = nullptr);
     // False with `err` for a second user of the same id.
     bool add_user(std::shared_ptr<const user_identity> user, std::string& err);
+    // Puts `user` in place of the user of its id, for that user's keys too.
+    void replace_user(std::shared_ptr<const user_identity> user);
 
     // Empty for an access key that is not here.
     std::string_view secret(std::string_view access_key) const;
@@ -36,6 +39,14 @@ public:
     const user_identity* find_user(std::string_view id) const;
 
     size_t size() const { return m_map.size(); }
+    // The ids of the users declared.
+    std::vector<std::string> user_ids() const
+    {
+        std::vector<std::string> out;
+        for (const auto& [id, u] : m_users)
+            out.push_back(id);
+        return out;
+    }
     size_t user_count() const { return m_users.size(); }
 
 private:
@@ -66,6 +77,8 @@ struct sigv4_config
     std::string credentials_file;
     // A request that names no credentials at all is let through as anonymous.
     bool        anonymous{false};
+    // The IAM API's document, beside the buckets, empty for none.
+    std::string iam_file;
 };
 
 // The empty string when the configuration can be served, and what is wrong
@@ -86,8 +99,12 @@ public:
     size_t credential_count() const { return m_creds.size(); }
     std::string display_name(std::string_view id) const override;
     uint64_t max_bytes_of(std::string_view id) const override;
-    bool issue_session(std::string_view access_key, int64_t expires, std::string_view policy,
+    bool issue_session(std::string_view access_key, int64_t expires, std::string_view policy, std::string_view role,
                        session_credentials& out) override;
+    int role_check(std::string_view role, std::string_view user_id, int64_t& max_session) override;
+    std::string iam_file() const override { return m_cfg.iam_file; }
+    void refresh() override;
+    bool file_user(std::string_view id) const override { return m_file_users.count(std::string(id)) != 0; }
 
 private:
     // The secret of the session `token` gives `access_key`, with its user, empty for a token that is not one this
@@ -132,6 +149,21 @@ private:
         std::shared_ptr<const user_identity> user;
     };
     session_entry m_session;
+
+    // The IAM file as last read, and its roles: each one's trust policy, longest session and identity.
+    file_stamp m_iam_stamp;
+    struct role_entry
+    {
+        std::string trust;
+        int64_t     max_session{3600};
+        std::shared_ptr<const user_identity> identity;
+    };
+    std::map<std::string, role_entry, std::less<>> m_roles;
+    std::set<std::string> m_file_users;
+    std::chrono::steady_clock::time_point m_last_iam_probe{};
+    // Reads the IAM file into `set`, its roles into m_roles.
+    void add_iam(credential_set& set);
+    bool iam_changed();
 };
 
 // The hook for a body that is aws-chunked with no signature, which a request

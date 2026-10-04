@@ -77,7 +77,7 @@ std::string storage_instance::config_refusal() const
                "accept every request without authentication\n";
     if (has_credentials())
         if (const std::string why = socketley::storage::sigv4_config_error(
-                {m_access_key, m_secret_key, m_credentials_file, m_anonymous}); !why.empty())
+                {m_access_key, m_secret_key, m_credentials_file, m_anonymous, {}}); !why.empty())
             return "storage: " + why + "\n";
     if (!m_sse_key_file.empty())
     {
@@ -217,8 +217,9 @@ bool storage_instance::setup(event_loop& loop)
     if (!auth && has_credentials())
     {
         // Made at every start, so a reload picks up a changed file and key.
-        auto a = std::make_unique<socketley::storage::sigv4_authenticator>(
-            socketley::storage::sigv4_config{m_access_key, m_secret_key, m_credentials_file, m_anonymous});
+        // The IAM API's users, groups and roles are kept beside the buckets, where every shard reads them.
+        auto a = std::make_unique<socketley::storage::sigv4_authenticator>(socketley::storage::sigv4_config{
+            m_access_key, m_secret_key, m_credentials_file, m_anonymous, m_dir + "/.iam.json"});
         std::string why;
         if (!a->load(why))
         {

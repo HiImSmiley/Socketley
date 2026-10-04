@@ -15,6 +15,7 @@ namespace
 {
 
 constexpr uint8_t     token_version = 1;
+constexpr uint8_t     token_role_version = 2;
 constexpr size_t      mac_bytes     = 32;
 constexpr std::string_view sts_xmlns = "https://sts.amazonaws.com/doc/2011-06-15/";
 
@@ -32,11 +33,12 @@ std::string mac(std::string_view key, std::string_view label, std::string_view m
     return out;
 }
 
-// The token's body: its version, the expiry, and the parent key, the access key and the policy, each after its length.
+// The token's body: its version, the expiry, and the parent key, the access key and the policy, each after its
+// length, and in version 2 the role assumed.
 std::string payload_of(const session_grant& g)
 {
     std::string p;
-    p.push_back(static_cast<char>(token_version));
+    p.push_back(static_cast<char>(g.role.empty() ? token_version : token_role_version));
     for (int s = 56; s >= 0; s -= 8)
         p.push_back(static_cast<char>((static_cast<uint64_t>(g.expires) >> s) & 0xFF));
     p.push_back(static_cast<char>(g.parent_key.size()));
@@ -46,6 +48,11 @@ std::string payload_of(const session_grant& g)
     p.push_back(static_cast<char>((g.policy.size() >> 8) & 0xFF));
     p.push_back(static_cast<char>(g.policy.size() & 0xFF));
     p += g.policy;
+    if (!g.role.empty())
+    {
+        p.push_back(static_cast<char>(g.role.size()));
+        p += g.role;
+    }
     return p;
 }
 
@@ -84,8 +91,9 @@ bool sts_parse(std::string_view token, session_grant& out)
 {
     std::string raw;
     if (token.size() > 8192 || !base64url_decode(token, raw) || raw.size() < 1 + 8 + 1 + 1 + 2 + mac_bytes ||
-        static_cast<uint8_t>(raw[0]) != token_version)
+        (static_cast<uint8_t>(raw[0]) != token_version && static_cast<uint8_t>(raw[0]) != token_role_version))
         return false;
+    const bool with_role = static_cast<uint8_t>(raw[0]) == token_role_version;
     std::string_view p(raw.data(), raw.size() - mac_bytes);
     size_t at = 1;
     uint64_t e = 0;
@@ -105,7 +113,11 @@ bool sts_parse(std::string_view token, session_grant& out)
         return false;
     const size_t plen = (static_cast<size_t>(static_cast<uint8_t>(p[at])) << 8) | static_cast<uint8_t>(p[at + 1]);
     at += 2;
-    return field(plen, out.policy) && at == p.size();
+    if (!field(plen, out.policy))
+        return false;
+    if (with_role && (at >= p.size() || !field(static_cast<uint8_t>(p[at++]), out.role) || out.role.empty()))
+        return false;
+    return at == p.size();
 }
 
 bool sts_sealed_by(std::string_view token, std::string_view parent_secret)

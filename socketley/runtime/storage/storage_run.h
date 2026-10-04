@@ -710,6 +710,9 @@ public:
     void op_delete_public_access(const std::shared_ptr<conn>& c);
     // STS's GetSessionToken and AssumeRole, POST / with a form, answered with temporary credentials.
     void op_sts(const std::shared_ptr<conn>& c);
+    // IAM's users, keys, groups, roles and their policies, in storage_iam.cpp, for an admin's request.
+    void op_iam(const std::shared_ptr<conn>& c, const std::vector<std::pair<std::string, std::string>>& fields,
+                std::string_view action, const auth_verdict& v);
     // A request to a bucket's website: an object, its index document, a redirect, or an error page.
     void op_website(const std::shared_ptr<conn>& c);
     // A website request that failed with `e`: a redirect, the error document, or an HTML page.
