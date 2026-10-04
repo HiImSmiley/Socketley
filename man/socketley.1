@@ -8251,7 +8251,72 @@ hold. A client on a unix socket has no address, so it is in no range: an
 .B IpAddress
 never holds for it and a
 .B NotIpAddress
-always does. Any other operator or key is refused.
+always does.
+.IP
+Beyond those, IAM's operator families on the keys a request here carries:
+.BR String (Not) Equals (IgnoreCase),
+.BR String (Not) Like
+with
+.B *
+and
+.BR ? ,
+.BR Arn (Not) Equals
+and
+.BR Arn (Not) Like
+as their string forms,
+.BR Numeric \&.\|.\|.
+and
+.BR Date \&.\|.\|.
+(an epoch second or an ISO 8601 time),
+.BR Bool ,
+.B Null
+and the IP pair, each with
+.B IfExists
+and the
+.B ForAnyValue:
+and
+.B ForAllValues:
+qualifiers. The keys:
+.BR aws:Referer ,
+.BR aws:UserAgent ,
+.BR aws:SourceIp ,
+.BR aws:SecureTransport ,
+.BR aws:CurrentTime ,
+.BR aws:EpochTime ,
+.BR aws:username
+and
+.B aws:userid
+(the user's id, absent for a request without credentials),
+.BR aws:PrincipalType ,
+.BR s3:prefix ,
+.B s3:delimiter
+and
+.B s3:max\-keys
+(a listing's query),
+.B s3:versionid
+and the
+.BR s3:x\-amz\- .\|.\|.
+and
+.BR s3:object\-lock\- .\|.\|.
+keys (the request's headers of those names),
+.B s3:RequestObjectTag/\fIkey\fR
+and
+.B s3:RequestObjectTagKeys
+(the request's
+.B x\-amz\-tagging
+header),
+.BR s3:signatureversion ,
+.B s3:authType
+and
+.BR s3:TlsVersion .
+A key the request does not carry fails its condition, except under
+.BR IfExists ,
+a negated operator or
+.BR ForAllValues ,
+as IAM has it.
+.B s3:ExistingObjectTag/\fIkey\fR
+is refused, since the object's tags are not read before the request is judged, and
+so is any other key or operator.
 .PP
 A request to a bucket with a policy is authenticated as it always is, and then
 judged: a statement applies when its action, principal and resource match the
@@ -8296,7 +8361,8 @@ a policy looks nothing up, a signed request to a bucket whose policy has no
 .B Deny
 looks up the bucket and nothing more, and only a statement that compares
 .B aws:SourceIp
-asks the kernel for the client's address, once per connection.
+asks the kernel for the client's address, once per connection; the other keys are
+read from the request only when a statement that names them applies.
 .PP
 As in S3, a request a policy lets in is told a key is not there only if it may
 list the bucket the key would be in: a GET, HEAD or other object request for a
