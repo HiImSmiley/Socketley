@@ -9007,8 +9007,9 @@ so a player seeks anywhere at once, and its segments are made as they are asked
 for: a segment at or a little past where a job is making them is waited for, and
 one elsewhere starts a job there, on the film's own clock, so the segments of
 every job join up, and every job's init segment is the same bytes. An init
-segment asked for with no job running waits a moment for the segment request
-that begins the right one. Several jobs run over one film for viewers at different places;
+segment asked for with no job running begins one at the start at once, which a
+seek that follows lets go, and which is held after two seconds if no segment of
+it is asked for. Several jobs run over one film for viewers at different places;
 one that reaches segments made before ends, one fifteen segments ahead of every
 player that asks of it, or two ahead when nobody has asked of it for ten seconds,
 is held still until one comes within eight, and one nobody asks of for a minute
@@ -9018,7 +9019,8 @@ is kept: a film watched once streams from the cache afterwards. HDR (PQ or HLG) 
 tone-mapped to SDR for these renditions.
 .B hls\-copy
 streams the source's own picture without transcoding, and its sound copied when
-it is AAC in two channels or fewer, and made AAC otherwise, as renditions do.
+it is AAC in two channels or fewer, and made AAC otherwise; renditions always make
+it AAC, as a copy begun at a seek would start at the keyframe before it.
 .IP
 The object is read as a GET of it would be, by its user or, under
 .BI /~media/ variant /~share/ id\fR[\fB/\fIpath\fR],
