@@ -1,11 +1,13 @@
 #include "bucket_policy.h"
 #include "json_doc.h"
+#include "s3_names.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -21,6 +23,15 @@ namespace
 char lower(char c)
 {
     return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+std::string lowered(std::string_view in)
+{
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in)
+        out += lower(c);
+    return out;
 }
 
 // IAM's wildcard: '*' is any run of characters, '?' is one, and nothing else is special.
@@ -473,6 +484,151 @@ struct compiler
 
     static constexpr std::string_view sse_key = "s3:x-amz-server-side-encryption";
 
+    // Whether `key`, lowercase, is one a request here carries a value for, or may.
+    static bool known_key(std::string_view key)
+    {
+        static constexpr std::string_view keys[] = {
+            "aws:referer", "aws:useragent", "aws:sourceip", "aws:securetransport", "aws:currenttime", "aws:epochtime",
+            "aws:username", "aws:userid", "aws:principaltype", "s3:prefix", "s3:delimiter", "s3:max-keys",
+            "s3:x-amz-acl", "s3:x-amz-server-side-encryption", "s3:x-amz-server-side-encryption-customer-algorithm",
+            "s3:x-amz-copy-source", "s3:x-amz-metadata-directive", "s3:x-amz-storage-class",
+            "s3:x-amz-content-sha256", "s3:versionid", "s3:requestobjecttagkeys", "s3:signatureversion",
+            "s3:authtype", "s3:tlsversion", "s3:object-lock-mode", "s3:object-lock-retain-until-date",
+            "s3:object-lock-legal-hold",
+        };
+        for (std::string_view k : keys)
+            if (key == k)
+                return true;
+        // The request's own headers of those names: x-amz-grant-*, the encryption's KMS key and the rest.
+        if ((key.starts_with("s3:x-amz-") && key.size() > 9) || (key.starts_with("s3:object-lock-") && key.size() > 15))
+            return true;
+        return key.starts_with("s3:requestobjecttag/") && key.size() > 20;
+    }
+
+    // A condition's values, which JSON may give as strings, numbers or booleans, alone or in a list.
+    bool scalars(const jvalue& v, std::string_view key, std::vector<std::string>& out)
+    {
+        auto one = [&](const jvalue& x)
+        {
+            if (x.k == jvalue::kind::string || x.k == jvalue::kind::number)
+                out.push_back(x.s);
+            else if (x.k == jvalue::kind::boolean)
+                out.push_back(x.b ? "true" : "false");
+            else
+                return false;
+            return true;
+        };
+        if (v.k == jvalue::kind::array ? v.items.empty() : !one(v))
+            return fail("Condition values of " + std::string(key) + " must be strings, numbers or booleans");
+        for (const jvalue& x : v.items)
+            if (!one(x))
+                return fail("Condition values of " + std::string(key) + " must be strings, numbers or booleans");
+        for (const std::string& t : out)
+            if (t.find("${") != std::string::npos)
+                return fail("Policy variables are not supported in condition values: " + t);
+        return true;
+    }
+
+    // An operator of any of IAM's families on any key known_key takes, with ForAnyValue:, ForAllValues: and
+    // IfExists as IAM writes them.
+    bool general(std::string_view op_text, const jvalue& block, bucket_policy::statement& s)
+    {
+        using cond = bucket_policy::condition;
+        cond proto;
+        std::string_view name = op_text;
+        if (name.starts_with("ForAnyValue:"))
+        {
+            proto.quantifier = cond::set::any_value;
+            name.remove_prefix(12);
+        }
+        else if (name.starts_with("ForAllValues:"))
+        {
+            proto.quantifier = cond::set::all_values;
+            name.remove_prefix(13);
+        }
+        if (name.ends_with("IfExists") && name != "Null")
+        {
+            proto.if_exists = true;
+            name.remove_suffix(8);
+        }
+        struct row { std::string_view name; cond::op o; };
+        static constexpr row ops[] = {
+            {"StringEquals", cond::op::str_eq}, {"StringNotEquals", cond::op::str_ne},
+            {"StringEqualsIgnoreCase", cond::op::str_eq_ci}, {"StringNotEqualsIgnoreCase", cond::op::str_ne_ci},
+            {"StringLike", cond::op::str_like}, {"StringNotLike", cond::op::str_not_like},
+            {"ArnEquals", cond::op::str_like}, {"ArnLike", cond::op::str_like},
+            {"ArnNotEquals", cond::op::str_not_like}, {"ArnNotLike", cond::op::str_not_like},
+            {"NumericEquals", cond::op::num_eq}, {"NumericNotEquals", cond::op::num_ne},
+            {"NumericLessThan", cond::op::num_lt}, {"NumericLessThanEquals", cond::op::num_le},
+            {"NumericGreaterThan", cond::op::num_gt}, {"NumericGreaterThanEquals", cond::op::num_ge},
+            {"DateEquals", cond::op::date_eq}, {"DateNotEquals", cond::op::date_ne},
+            {"DateLessThan", cond::op::date_lt}, {"DateLessThanEquals", cond::op::date_le},
+            {"DateGreaterThan", cond::op::date_gt}, {"DateGreaterThanEquals", cond::op::date_ge},
+            {"Bool", cond::op::boolean}, {"Null", cond::op::null},
+            {"IpAddress", cond::op::ip}, {"NotIpAddress", cond::op::not_ip},
+        };
+        bool found = false;
+        for (const row& r : ops)
+            if (r.name == name)
+            {
+                proto.o = r.o;
+                found   = true;
+            }
+        if (!found)
+            return fail("Condition operator " + std::string(op_text) + " is not supported");
+        if (block.k != jvalue::kind::object || block.members.empty())
+            return fail("Condition " + std::string(op_text) + " must name at least one key");
+        for (const auto& [key_text, val] : block.members)
+        {
+            cond c = proto;
+            for (char ch : key_text)
+                c.key += lower(ch);
+            if (c.key.starts_with("s3:requestobjecttag/"))
+                c.key = "s3:requestobjecttag/" + key_text.substr(20);
+            if (!known_key(c.key))
+                return fail("Condition key " + key_text + " is not supported");
+            if (!scalars(val, key_text, c.values))
+                return false;
+            const bool num  = c.o >= cond::op::num_eq && c.o <= cond::op::num_ge;
+            const bool date = c.o >= cond::op::date_eq && c.o <= cond::op::date_ge;
+            for (const std::string& t : c.values)
+            {
+                if (num || date)
+                {
+                    char* end = nullptr;
+                    double d  = std::strtod(t.c_str(), &end);
+                    if (date && (end == t.c_str() || *end))
+                    {
+                        // A date is an epoch second or an ISO 8601 time, compared as milliseconds.
+                        int64_t ms = 0;
+                        bool midnight = false;
+                        if (!parse_iso8601(t, ms, midnight))
+                            return fail("Invalid date in condition " + key_text + ": " + t);
+                        d = static_cast<double>(ms);
+                    }
+                    else if (date)
+                        d *= 1000;
+                    else if (end == t.c_str() || *end || d != d)
+                        return fail("Invalid number in condition " + key_text + ": " + t);
+                    c.numbers.push_back(d);
+                }
+                else if (c.o == cond::op::ip || c.o == cond::op::not_ip)
+                {
+                    bucket_policy::cidr cc;
+                    if (c.key != "aws:sourceip" || !parse_cidr(t, cc))
+                        return fail("Invalid IP address or CIDR in " + key_text + ": " + t);
+                    c.cidrs.push_back(cc);
+                }
+                else if ((c.o == cond::op::boolean || c.o == cond::op::null) && t != "true" && t != "false")
+                    return fail(std::string(op_text) + " takes \"true\" or \"false\", not " + t);
+            }
+            if ((c.o == cond::op::ip || c.o == cond::op::not_ip) != (c.key == "aws:sourceip") && c.o != cond::op::null)
+                return fail("Condition key " + key_text + " is not supported with " + std::string(op_text));
+            s.conds.push_back(std::move(c));
+        }
+        return true;
+    }
+
     bool condition(const jvalue& v, bucket_policy::statement& s)
     {
         if (v.k != jvalue::kind::object)
@@ -480,6 +636,17 @@ struct compiler
         for (const auto& [op, block] : v.members)
         {
             const jvalue* val = nullptr;
+            // The three conditions judged by fields of their own take one key; anything else is a general one.
+            const bool single = block.k == jvalue::kind::object && block.members.size() == 1;
+            const std::string first = single ? lowered(block.members[0].first) : std::string{};
+            if (!single || !(((op == "IpAddress" || op == "NotIpAddress") && first == "aws:sourceip") ||
+                             (op == "Bool" && first == "aws:securetransport") ||
+                             ((op == "StringEquals" || op == "StringNotEquals" || op == "Null") && first == sse_key)))
+            {
+                if (!general(op, block, s))
+                    return false;
+                continue;
+            }
             if (op == "IpAddress" || op == "NotIpAddress")
             {
                 if (!only_key(block, op, "aws:SourceIp", val))
@@ -552,10 +719,6 @@ struct compiler
                 s.sse_null = absent && present ? -1 : absent ? 1 : 0;
                 continue;
             }
-            return fail("Condition operator " + op +
-                        " is not supported (only IpAddress and NotIpAddress on aws:SourceIp, Bool on "
-                        "aws:SecureTransport, and StringEquals, StringNotEquals and Null on "
-                        "s3:x-amz-server-side-encryption)");
         }
         return true;
     }
@@ -840,6 +1003,19 @@ bool bucket_policy::compile_doc(std::string_view json, std::string_view bucket, 
         bool open_cidr = !s.has_ip_in;
         for (const cidr& c : s.ip_in)
             open_cidr = open_cidr || c.bits == 0;
+        for (const condition& c : s.conds)
+        {
+            if (c.key != "aws:sourceip")
+                continue;
+            p.m_needs_ip = true;
+            if (c.o == condition::op::ip && !c.if_exists)
+            {
+                bool any_open = false;
+                for (const cidr& r : c.cidrs)
+                    any_open = any_open || r.bits == 0;
+                open_cidr = open_cidr && any_open;
+            }
+        }
         p.m_public = p.m_public || (!s.deny && s.any_principal && s.actions != 0 && open_cidr);
         p.m_statements.push_back(std::move(s));
         return true;
@@ -936,11 +1112,169 @@ policy_effect bucket_policy::evaluate(const policy_request& r) const
             continue;
         if (s.sse_conditioned() && !sse_matches(s, r))
             continue;
+        if (!s.conds.empty() && !conditions_hold(s, r))
+            continue;
         if (s.deny)
             return policy_effect::deny;
         allowed = true;
     }
     return allowed ? policy_effect::allow : policy_effect::none;
+}
+
+namespace
+{
+
+// IAM's StringLike: * any run of characters, ? one.
+bool glob(std::string_view pat, std::string_view text)
+{
+    size_t p = 0, t = 0, star = std::string_view::npos, mark = 0;
+    while (t < text.size())
+    {
+        if (p < pat.size() && (pat[p] == '?' || pat[p] == text[t]))
+        {
+            ++p;
+            ++t;
+        }
+        else if (p < pat.size() && pat[p] == '*')
+        {
+            star = p++;
+            mark = t;
+        }
+        else if (star != std::string_view::npos)
+        {
+            p = star + 1;
+            t = ++mark;
+        }
+        else
+            return false;
+    }
+    while (p < pat.size() && pat[p] == '*')
+        ++p;
+    return p == pat.size();
+}
+
+bool equal_ci(std::string_view a, std::string_view b)
+{
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (lower(a[i]) != lower(b[i]))
+            return false;
+    return true;
+}
+
+// Whether one value of the request matches one of the condition's, before the operator's negation.
+bool matches_one(const bucket_policy::condition& c, std::string_view v)
+{
+    using op = bucket_policy::condition::op;
+    switch (c.o)
+    {
+        case op::str_eq: case op::str_ne:
+            for (const std::string& w : c.values)
+                if (w == v)
+                    return true;
+            return false;
+        case op::str_eq_ci: case op::str_ne_ci:
+            for (const std::string& w : c.values)
+                if (equal_ci(w, v))
+                    return true;
+            return false;
+        case op::str_like: case op::str_not_like:
+            for (const std::string& w : c.values)
+                if (glob(w, v))
+                    return true;
+            return false;
+        case op::boolean:
+            for (const std::string& w : c.values)
+                if (equal_ci(w, v))
+                    return true;
+            return false;
+        default:
+            break;
+    }
+    // Numbers and dates, the request's own value parsed the way the condition's were.
+    const std::string text(v);
+    char* end = nullptr;
+    double x  = std::strtod(text.c_str(), &end);
+    const bool date = c.o >= op::date_eq && c.o <= op::date_ge;
+    if (date && (end == text.c_str() || *end))
+    {
+        int64_t ms = 0;
+        bool midnight = false;
+        if (!parse_iso8601(text, ms, midnight))
+            return false;
+        x = static_cast<double>(ms);
+    }
+    else if (date)
+        x *= 1000;
+    else if (end == text.c_str() || *end || x != x)
+        return false;
+    for (double w : c.numbers)
+    {
+        switch (c.o)
+        {
+            case op::num_eq: case op::num_ne: case op::date_eq: case op::date_ne: if (x == w) return true; break;
+            case op::num_lt: case op::date_lt: if (x < w) return true; break;
+            case op::num_le: case op::date_le: if (x <= w) return true; break;
+            case op::num_gt: case op::date_gt: if (x > w) return true; break;
+            case op::num_ge: case op::date_ge: if (x >= w) return true; break;
+            default: break;
+        }
+    }
+    return false;
+}
+
+bool negated(bucket_policy::condition::op o)
+{
+    using op = bucket_policy::condition::op;
+    return o == op::str_ne || o == op::str_ne_ci || o == op::str_not_like || o == op::num_ne || o == op::date_ne;
+}
+
+}   // namespace
+
+bool bucket_policy::conditions_hold(const statement& s, const policy_request& r)
+{
+    std::vector<std::string> vals;
+    for (const condition& c : s.conds)
+    {
+        vals.clear();
+        bool present = false;
+        if (c.key == "aws:sourceip")
+            present = r.ip && r.ip->family != 0;
+        else if (r.ctx)
+            present = r.ctx->values(c.key, vals) && (!vals.empty() || c.quantifier != condition::set::single);
+        if (c.o == condition::op::null)
+        {
+            // Null: true asks that the key be absent, false that it be there.
+            if ((c.values.front() == "true") == present)
+                return false;
+            continue;
+        }
+        if (!present)
+        {
+            // An absent key satisfies IfExists, a negated operator and ForAllValues, as IAM has it, and nothing else.
+            if (c.if_exists || negated(c.o) || c.quantifier == condition::set::all_values)
+                continue;
+            return false;
+        }
+        if (c.o == condition::op::ip || c.o == condition::op::not_ip)
+        {
+            if (any_cidr(c.cidrs, r.ip) != (c.o == condition::op::ip))
+                return false;
+            continue;
+        }
+        // ForAllValues asks it of every value the request has, a single key and ForAnyValue of some value.
+        const bool all = c.quantifier == condition::set::all_values;
+        bool ok = all;
+        for (const std::string& v : vals)
+        {
+            const bool one = matches_one(c, v) != negated(c.o);
+            ok = all ? ok && one : ok || one;
+        }
+        if (!ok)
+            return false;
+    }
+    return true;
 }
 
 }   // namespace socketley::storage

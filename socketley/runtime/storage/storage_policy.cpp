@@ -3,13 +3,140 @@
 // authenticated and before a script's on_request sees it.
 #include "storage_run.h"
 
+#include <openssl/ssl.h>
+
 #include "bucket_policy.h"
+#include "s3_names.h"
 #include "s3_public_access.h"
 #include "s3_sigv4_auth.h"
 #include "s3_xml.h"
 
 namespace socketley::storage
 {
+
+namespace
+{
+
+// The condition keys of a request as this runtime parsed it.
+class request_context final : public policy_context
+{
+public:
+    request_context(const conn& c, const user_identity* u, bool anonymous, int64_t now_ms)
+        : m_c(c), m_u(u), m_anonymous(anonymous), m_now_ms(now_ms) {}
+
+    bool values(std::string_view key, std::vector<std::string>& out) const override
+    {
+        const s3_request& r = m_c.req;
+        auto header = [&](std::string_view name)
+        {
+            if (!r.has_header(name))
+                return false;
+            out.emplace_back(r.header(name));
+            return true;
+        };
+        auto query = [&](std::string_view name)
+        {
+            if (!r.has_query(name))
+                return false;
+            out.emplace_back(r.get_query(name));
+            return true;
+        };
+        if (key == "aws:referer")
+            return header("referer");
+        if (key == "aws:useragent")
+            return header("user-agent");
+        if (key == "aws:securetransport")
+            return out.emplace_back(m_c.ssl ? "true" : "false"), true;
+        if (key == "aws:currenttime")
+            return out.emplace_back(iso8601(m_now_ms)), true;
+        if (key == "aws:epochtime")
+            return out.emplace_back(std::to_string(m_now_ms / 1000)), true;
+        if (key == "aws:username" || key == "aws:userid")
+        {
+            if (m_anonymous || !m_u)
+                return false;
+            out.emplace_back(m_u->id);
+            return true;
+        }
+        if (key == "aws:principaltype")
+            return out.emplace_back(m_anonymous ? "Anonymous" : "User"), true;
+        if (key == "s3:prefix" || key == "s3:delimiter" || key == "s3:max-keys")
+            return query(key.substr(3));
+        if (key == "s3:versionid")
+            return query("versionId");
+        if (key == "s3:signatureversion" || key == "s3:authtype")
+        {
+            const bool by_header = !r.header("authorization").empty();
+            const bool by_query  = r.has_query("X-Amz-Algorithm");
+            if (m_anonymous || (!by_header && !by_query && !r.form))
+                return false;
+            out.emplace_back(key == "s3:signatureversion" ? "AWS4-HMAC-SHA256"
+                             : by_header ? "REST-HEADER" : by_query ? "REST-QUERY-STRING" : "POST");
+            return true;
+        }
+        if (key == "s3:tlsversion")
+        {
+            if (!m_c.ssl)
+                return false;
+            const int v = SSL_version(m_c.ssl);
+            out.emplace_back(v == TLS1_3_VERSION ? "1.3" : v == TLS1_2_VERSION ? "1.2" : "1.1");
+            return true;
+        }
+        if (key == "s3:requestobjecttagkeys" || key.starts_with("s3:requestobjecttag/"))
+        {
+            if (!r.has_header("x-amz-tagging"))
+                return false;
+            const std::string_view want = key.starts_with("s3:requestobjecttag/") ? key.substr(20) : std::string_view{};
+            std::vector<std::pair<std::string, std::string>> tags;
+            if (!parse_form_pairs(r.header("x-amz-tagging"), tags))
+                return false;
+            bool found = want.empty();
+            for (auto& [k, v] : tags)
+            {
+                if (want.empty())
+                    out.push_back(k);
+                else if (k == want)
+                {
+                    out.push_back(v);
+                    found = true;
+                }
+            }
+            return found;
+        }
+        // s3:x-amz-... and s3:object-lock-... are the request's headers of those names.
+        if (key.starts_with("s3:x-amz-"))
+            return header(key.substr(3));
+        if (key.starts_with("s3:object-lock-"))
+            return header("x-amz-" + std::string(key.substr(3)));
+        return false;
+    }
+
+private:
+    // The pairs of an x-amz-tagging header, k=v joined by &, each percent-encoded.
+    static bool parse_form_pairs(std::string_view text, std::vector<std::pair<std::string, std::string>>& out)
+    {
+        while (!text.empty())
+        {
+            const size_t amp = text.find('&');
+            const std::string_view part = text.substr(0, amp);
+            text = amp == std::string_view::npos ? std::string_view{} : text.substr(amp + 1);
+            const size_t eq = part.find('=');
+            std::string k, v;
+            if (!percent_decode(part.substr(0, eq), k, true) ||
+                !percent_decode(eq == std::string_view::npos ? std::string_view{} : part.substr(eq + 1), v, true))
+                return false;
+            out.emplace_back(std::move(k), std::move(v));
+        }
+        return true;
+    }
+
+    const conn& m_c;
+    const user_identity*     m_u;
+    bool                     m_anonymous;
+    int64_t                  m_now_ms;
+};
+
+}   // namespace
 
 void storage_run::op_put_policy(const std::shared_ptr<conn>& c)
 {
@@ -118,7 +245,9 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
         plain = s3_action::replicate_tags;
     const s3_action action = r.has_query("versionId") ? version_action(plain) : plain;
 
+    const request_context ctx(*c, u, v.anonymous, static_cast<int64_t>(m_store.now_ms()));
     policy_request pr;
+    pr.ctx       = &ctx;
     pr.action    = action;
     pr.bucket    = r.bucket;
     pr.key       = r.key;
@@ -291,6 +420,29 @@ policy_effect storage_run::access_of(const std::shared_ptr<conn>& c, std::string
     if (full || own == policy_effect::allow || pol == policy_effect::allow)
         return policy_effect::allow;
     return policy_effect::none;
+}
+
+bool storage_run::policy_allows(const std::shared_ptr<conn>& c, s3_action action, std::string_view key)
+{
+    const user_identity* u = c->anonymous ? nullptr : c->user.get();
+    if (!needs_judging(u))
+        return true;
+    const request_context ctx(*c, u, c->anonymous, static_cast<int64_t>(m_store.now_ms()));
+    policy_request q;
+    q.ctx       = &ctx;
+    q.action    = action;
+    q.bucket    = c->req.bucket;
+    q.key       = key;
+    q.anonymous = c->anonymous;
+    q.principal = c->principal;
+    q.user      = u && u->configured ? std::string_view(u->id) : std::string_view{};
+    q.tls       = c->ssl != nullptr;
+    q.ip        = &c->ip;
+    const policy_effect e = access_of(c, c->req.bucket, q, u);
+    if (u)
+        return e == policy_effect::allow;
+    // A request a policy let in is let do this only by an Allow of it too.
+    return e != policy_effect::deny && (!c->policy_admitted || e == policy_effect::allow);
 }
 
 bool storage_run::policy_allows_version_delete(const std::shared_ptr<conn>& c, std::string_view key)

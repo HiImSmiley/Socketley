@@ -1,14 +1,14 @@
 #pragma once
 // A bucket policy: S3's JSON document, checked and compiled once when it is set
 // or read back at start, into statements a request is judged against with no
-// parsing, no allocation and, unless a statement names aws:SourceIp, no syscall.
+// parsing of the document, the request's keys read only for a statement that
+// names them, and no syscall unless a statement names aws:SourceIp.
 //
 // What it takes is the subset that can be honoured exactly on this runtime:
 // Allow and Deny, a principal that is everyone or this runtime's access keys,
-// the actions the runtime implements, resources in this bucket, and the
-// aws:SourceIp, aws:SecureTransport and s3:x-amz-server-side-encryption
-// conditions.  Anything else is refused as MalformedPolicy, never accepted to
-// do less than it says.
+// the actions the runtime implements, resources in this bucket, and conditions
+// on the keys a request here carries.  Anything else is refused as
+// MalformedPolicy, never accepted to do less than it says.
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -114,6 +114,15 @@ struct client_ip
 // The address of the peer of a connected socket.
 client_ip client_ip_of(int fd);
 
+// What a request says to a condition key, which only the runtime that parsed it can tell.
+class policy_context
+{
+public:
+    virtual ~policy_context() = default;
+    // The values of `key`, lowercase, for this request; false when the request has none.
+    virtual bool values(std::string_view key, std::vector<std::string>& out) const = 0;
+};
+
 // One request as a policy sees it.
 struct policy_request
 {
@@ -138,6 +147,8 @@ struct policy_request
     // A part or the completion of an upload, whose encryption its creation chose and was judged on, so a
     // statement conditioned on the encryption is not about it.
     bool             sse_inherited{false};
+    // Every other condition key, null when nothing can be asked, which leaves each key absent.
+    const policy_context* ctx{nullptr};
 };
 
 enum class policy_effect : uint8_t
@@ -183,6 +194,25 @@ public:
         kind        k{kind::all};
         std::string text;
     };
+    // A condition on any key the compiler knows, its values ORed, every condition of a statement ANDed.
+    struct condition
+    {
+        enum class op : uint8_t
+        {
+            str_eq, str_ne, str_eq_ci, str_ne_ci, str_like, str_not_like,
+            num_eq, num_ne, num_lt, num_le, num_gt, num_ge,
+            date_eq, date_ne, date_lt, date_le, date_gt, date_ge,
+            boolean, null, ip, not_ip,
+        };
+        enum class set : uint8_t { single, any_value, all_values };
+        op          o{op::str_eq};
+        set         quantifier{set::single};
+        bool        if_exists{false};
+        std::string key;
+        std::vector<std::string> values;
+        std::vector<double>      numbers;
+        std::vector<cidr>        cidrs;
+    };
     struct statement
     {
         bool     deny{false};
@@ -210,11 +240,14 @@ public:
         std::vector<std::string> sse_ne;
         int8_t   sse_null{-1};
         bool sse_conditioned() const { return has_sse_eq || has_sse_ne || sse_null >= 0; }
+        std::vector<condition> conds;
     };
 
 private:
     // Whether the request's encryption is what the statement's conditions on it ask for.
     static bool sse_matches(const statement& s, const policy_request& r);
+    // Whether every condition on the other keys holds for the request.
+    static bool conditions_hold(const statement& s, const policy_request& r);
     static bool compile_doc(std::string_view json, std::string_view bucket, bool identity, bucket_policy& out,
                             s3_error& err);
 

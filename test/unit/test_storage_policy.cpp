@@ -266,22 +266,29 @@ TEST_CASE("s3:x-amz-server-side-encryption under StringEquals, StringNotEquals a
         CHECK(anonymous_put(*p, false, {}, true) == policy_effect::none);
 }
 
-TEST_CASE("a condition on the encryption is refused where it cannot be honoured exactly")
+TEST_CASE("a condition is refused where it cannot be honoured exactly, and taken on any key a request carries")
 {
-    for (const char* cond : {R"({"StringEquals":{"s3:x-amz-server-side-encryption-aws-kms-key-id":"k"}})",
-                             R"({"StringEquals":{"s3:prefix":"a"}})",
-                             R"({"StringEqualsIgnoreCase":{"s3:x-amz-server-side-encryption":"aes256"}})",
-                             R"({"StringNotEqualsIfExists":{"s3:x-amz-server-side-encryption":"AES256"}})",
-                             R"({"Null":{"s3:x-amz-server-side-encryption":"maybe"}})",
-                             R"({"Null":{"aws:SourceIp":"true"}})",
+    for (const char* cond : {R"({"Null":{"s3:x-amz-server-side-encryption":"maybe"}})",
                              R"({"StringEquals":{"s3:x-amz-server-side-encryption":[]}})",
                              R"({"StringEquals":{"s3:x-amz-server-side-encryption":7}})",
-                             R"({"StringEquals":{"s3:x-amz-server-side-encryption":"AES256","aws:SourceIp":"1.2.3.4"}})"})
+                             R"({"StringEquals":{"s3:x-amz-server-side-encryption":"AES256","aws:SourceIp":"1.2.3.4"}})",
+                             R"({"StringEquals":{"s3:ExistingObjectTag/team":"a"}})",
+                             R"({"BinaryEquals":{"aws:Referer":"eA=="}})",
+                             R"({"NumericLessThan":{"s3:max-keys":"ten"}})"})
     {
         INFO(cond);
         s3_error err;
         CHECK_FALSE(compiles(put_policy("Deny", cond), &err));
         CHECK_FALSE(err.message.empty());
+    }
+    for (const char* cond : {R"({"StringEquals":{"s3:x-amz-server-side-encryption-aws-kms-key-id":"k"}})",
+                             R"({"StringEquals":{"s3:prefix":"a"}})",
+                             R"({"StringEqualsIgnoreCase":{"s3:x-amz-server-side-encryption":"aes256"}})",
+                             R"({"StringNotEqualsIfExists":{"s3:x-amz-server-side-encryption":"AES256"}})",
+                             R"({"Null":{"aws:SourceIp":"true"}})"})
+    {
+        INFO(cond);
+        CHECK(compiles(put_policy("Deny", cond)));
     }
 }
 

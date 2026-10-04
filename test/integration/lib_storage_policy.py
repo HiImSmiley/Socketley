@@ -243,9 +243,16 @@ def mode_config(port):
         ("an object action on the bucket alone", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub")), "does not apply"),
         ("a bucket action on objects alone", policy(stmt("Allow", "*", "s3:ListBucket", "arn:aws:s3:::pub/*")), "does not apply"),
         ("a condition operator not supported", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
-                                                           {"StringEquals": {"aws:Referer": "x"}})), "StringEquals"),
-        ("an IfExists operator", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
-                                             {"IpAddressIfExists": {"aws:SourceIp": "127.0.0.1/32"}})), "IpAddressIfExists"),
+                                                           {"BinaryEquals": {"aws:Referer": "eA=="}})), "BinaryEquals"),
+        ("a condition key not supported", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
+                                                      {"StringEquals": {"aws:SourceVpc": "vpc-1"}})), "aws:SourceVpc"),
+        ("a tag of the object as it is, which is not read before the judgement",
+         policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
+                     {"StringEquals": {"s3:ExistingObjectTag/team": "a"}})), "ExistingObjectTag"),
+        ("a number that is none", policy(stmt("Allow", "*", "s3:ListBucket", "arn:aws:s3:::pub",
+                                              {"NumericLessThan": {"s3:max-keys": "ten"}})), "number"),
+        ("a date that is none", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
+                                            {"DateLessThan": {"aws:CurrentTime": "soon"}})), "date"),
         ("IpAddress on another key", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
                                                  {"IpAddress": {"aws:Referer": "127.0.0.1/32"}})), "aws:Referer"),
         ("an address that is not one", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
@@ -267,6 +274,46 @@ def mode_config(port):
     for name, doc, msg in bad:
         malformed(T, "pub", name, doc, msg)
     check("no refused document was kept", get_policy(T, "pub").status == 404)
+    # Conditions on the keys a request carries, each operator family once.
+    put_object(T, "pub", "cond/x", b"conditioned")
+    def anon(path, query="", headers=None, method="GET", body=b""):
+        return req(T, method, path, query, body, None, headers)
+    r = put_policy(T, "pub", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/cond/*",
+                                         {"StringLike": {"aws:Referer": "http://www.example.com/*"}})))
+    check("StringLike on aws:Referer is taken", r.status == 204, repr(r))
+    check("and lets in a request from a page it names", anon("/pub/cond/x", headers={"Referer": "http://www.example.com/a"}).status == 200)
+    check("not one from another", anon("/pub/cond/x", headers={"Referer": "http://evil.example/"}).status == 403)
+    check("nor one that names no page", anon("/pub/cond/x").status == 403)
+    put_policy(T, "pub", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/cond/*",
+                                     {"StringLikeIfExists": {"aws:Referer": "http://www.example.com/*"}})))
+    check("StringLikeIfExists lets in one that names no page", anon("/pub/cond/x").status == 200)
+    check("and still not one from another", anon("/pub/cond/x", headers={"Referer": "http://evil.example/"}).status == 403)
+    put_policy(T, "pub", policy(stmt("Allow", "*", "s3:ListBucket", "arn:aws:s3:::pub",
+                                     {"StringEquals": {"s3:prefix": "cond/"}, "NumericLessThanEquals": {"s3:max-keys": "10"}})))
+    check("s3:prefix and s3:max-keys let in the listing they name",
+          anon("/pub", "list-type=2&prefix=cond/&max-keys=5").status == 200)
+    check("not one of another prefix", anon("/pub", "list-type=2&prefix=public/&max-keys=5").status == 403)
+    check("nor one of more keys", anon("/pub", "list-type=2&prefix=cond/&max-keys=50").status == 403)
+    check("nor one that names no max-keys, the operator not being negated",
+          anon("/pub", "list-type=2&prefix=cond/").status == 403)
+    put_policy(T, "pub", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/cond/*",
+                                     {"DateGreaterThan": {"aws:CurrentTime": "2020-01-01T00:00:00Z"}}),
+                                stmt("Deny", "*", "s3:GetObject", "arn:aws:s3:::pub/cond/*",
+                                     {"StringNotEquals": {"aws:UserAgent": "good-agent"}})))
+    check("DateGreaterThan on aws:CurrentTime with a StringNotEquals Deny lets in the agent it names",
+          anon("/pub/cond/x", headers={"User-Agent": "good-agent"}).status == 200)
+    check("and denies any other, signed or not", anon("/pub/cond/x", headers={"User-Agent": "curl"}).status == 403
+          and req(T, "GET", "/pub/cond/x", key=K1, headers={"User-Agent": "curl"}).status == 403)
+    put_policy(T, "pub", policy(stmt("Allow", "*", "s3:PutObject", "arn:aws:s3:::pub/cond/*",
+                                     {"ForAnyValue:StringEquals": {"s3:RequestObjectTagKeys": ["project"]},
+                                      "StringEquals": {"s3:RequestObjectTag/project": "alpha"}})))
+    check("a tag the request sets lets in a put it names",
+          anon("/pub/cond/t", method="PUT", body=b"t", headers={"x-amz-tagging": "project=alpha"}).status == 200)
+    check("not one with another value", anon("/pub/cond/t2", method="PUT", body=b"t",
+                                               headers={"x-amz-tagging": "project=beta"}).status == 403)
+    check("nor one with no tags", anon("/pub/cond/t3", method="PUT", body=b"t").status == 403)
+    delete_policy(T, "pub")
+
     # A statement for a service alone is taken, and lets in no request, whatever its conditions.
     r = put_policy(T, "pub", policy(stmt("Allow", {"Service": "logging.s3.amazonaws.com"}, "s3:GetObject", "arn:aws:s3:::pub/*",
                                          {"ArnLike": {"aws:SourceArn": "arn:aws:s3:::src"}})))
