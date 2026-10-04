@@ -9016,7 +9016,11 @@ is held still until one comes within eight, and one nobody asks of for a minute
 while held, or for ten minutes running, ends; a job held still and unasked gives
 its place to a new one when a shard has eight. What they made
 is kept: a film watched once streams from the cache afterwards. HDR (PQ or HLG) is
-tone-mapped to SDR for these renditions.
+tone-mapped to SDR for these renditions. Where a GPU with VAAPI is there, a
+rendition is decoded, scaled, tone-mapped and encoded on it, as
+.B SOCKETLEY_MEDIA_HWACCEL
+describes, and the interface plays a place the copied stream has not been
+remuxed to yet from a rendition until the copy catches up.
 .B hls\-copy
 streams the source's own picture without transcoding, and its sound copied when
 it is AAC in two channels or fewer, and made AAC otherwise; renditions always make
@@ -9314,6 +9318,8 @@ and
 from them),
 .B media_direct
 (ffmpeg jobs that read the object's file rather than through the listener),
+.B media_hw
+(rendition jobs encoded on the GPU),
 and one line
 .BI error_ Code
 for every S3 error code the runtime has answered, such as
@@ -13788,6 +13794,24 @@ on
 with neither, a media request is answered
 .BR "501" .
 Read at a runtime's first media request.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MEDIA_HWACCEL
+Where a storage runtime's renditions are encoded:
+.B off
+for x264 on the CPU always, a render node such as
+.BR /dev/dri/renderD129 ,
+or, by default,
+.BR /dev/dri/renderD128 .
+At its first medium a worker runs one second of test picture through the GPU's
+whole chain (upload, scale, H.264 encode), with the full encoder and then the
+low-power one, and uses the GPU for renditions only when one of them works;
+until it knows, renditions use x264. A rendition keeps the encoder its first job
+chose, and one whose first GPU job fails before anything is made goes on with
+x264. HLG is tone-mapped on the CPU, HDR10 on the GPU.
+.B vaapi\-unchecked:\fInode\fR
+skips the test run, for a test of that fallback.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
