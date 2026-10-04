@@ -328,6 +328,14 @@ def modes():
           (st, mode, hold) == (200, "COMPLIANCE", None) and abs(until - (now + DAY) * 1000) < 1000, (st, mode, until))
     got = get_retention("lkb", "c")
     check("GetObjectRetention reads it", got[0] == "COMPLIANCE" and got[1] == until, got)
+    # A date with an offset from UTC, as clients in another zone write it (minio-go among them), is that instant.
+    r = put("lkb", "z", b"zoned")
+    zone = datetime.timezone(datetime.timedelta(hours=2))
+    local = datetime.datetime.fromtimestamp(int(now) + DAY, zone).strftime("%Y-%m-%dT%H:%M:%S.123456789+02:00")
+    r = put_retention("lkb", "z", "GOVERNANCE", local)
+    got = get_retention("lkb", "z")
+    check("a RetainUntilDate with an offset from UTC is taken as that instant",
+          r.status == 200 and got == ("GOVERNANCE", (int(now) + DAY) * 1000 + 123), (r, got))
     r = delete("lkb", "c", c1)
     check("DELETE of the version is AccessDenied", denied(r), r)
     r = delete("lkb", "c", c1, bypass=True)

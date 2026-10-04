@@ -376,6 +376,7 @@ inline bool parse_iso8601(std::string_view s, int64_t& ms, bool& midnight)
         return false;
     size_t at = 10;
     bool zero_fraction = true;
+    int64_t offset_s = 0;
     if (at < s.size())
     {
         if (s[at] != 'T' || !num(at + 1, 2, h) || s.size() < at + 9 || s[at + 3] != ':' || !num(at + 4, 2, mi) ||
@@ -394,12 +395,21 @@ inline bool parse_iso8601(std::string_view s, int64_t& ms, bool& midnight)
             if (at == from)
                 return false;
         }
+        // Z, nothing, or an offset from UTC as +hh:mm or -hh:mm, which the time is taken back by.
         const std::string_view zone = s.substr(at);
-        if (zone != "Z" && zone != "+00:00" && zone != "-00:00" && !zone.empty())
+        if (zone.size() == 6 && (zone[0] == '+' || zone[0] == '-') && zone[3] == ':')
+        {
+            unsigned oh = 0, om = 0;
+            if (!num(at + 1, 2, oh) || !num(at + 4, 2, om) || oh > 23 || om > 59)
+                return false;
+            offset_s = (zone[0] == '+' ? 1 : -1) * static_cast<int64_t>(oh * 3600 + om * 60);
+        }
+        else if (zone != "Z" && !zone.empty())
             return false;
     }
-    ms = (days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se) * 1000;
-    midnight = h == 0 && mi == 0 && se == 0 && zero_fraction;
+    const int64_t secs = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se - offset_s;
+    ms = secs * 1000;
+    midnight = secs % 86400 == 0 && zero_fraction;
     return true;
 }
 
