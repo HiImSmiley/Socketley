@@ -1,6 +1,8 @@
 // The S3 operations: routing a parsed request to one of them and answering it.
 #include "storage_run.h"
 
+#include "../../shared/cert_keeper.h"
+
 #include <algorithm>
 #include <charconv>
 
@@ -218,6 +220,15 @@ bool body_md5_ok(const s3_request& r, std::string_view body, s3_error& err)
 void storage_run::dispatch(const std::shared_ptr<conn>& c)
 {
     s3_request& r = c->req;
+    // A CA's HTTP-01 challenge for a token this daemon holds, before the path is taken for a bucket.
+    if (std::string answer; (r.method == "GET" || r.method == "HEAD") &&
+                            r.raw_path.starts_with(cert_keeper::challenge_prefix) &&
+                            !(answer = cert_keeper::challenge_answer(
+                                  r.raw_path.substr(cert_keeper::challenge_prefix.size()))).empty())
+    {
+        app_reply(c, 200, std::move(answer), "application/octet-stream");
+        return;
+    }
 
     request_view rv;
     rv.method       = r.method;

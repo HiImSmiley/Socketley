@@ -7,6 +7,7 @@
 #include <openssl/err.h>
 #include <openssl/bio.h>
 #include <openssl/x509v3.h>
+#include <openssl/pem.h>
 #include <arpa/inet.h>
 #else
 #define SOCKETLEY_HAS_TLS 0
@@ -15,6 +16,8 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+
+#include "cert_keeper.h"
 
 // The TLS configuration gate, next to the OpenSSL wrapper because whoever
 // wires up the next role will be reading this file.
@@ -190,6 +193,7 @@ tls_context::tls_context() = default;
 
 tls_context::~tls_context()
 {
+    cert_keeper::unwatch(this);
 #if SOCKETLEY_HAS_TLS
     if (m_saved_session)
         SSL_SESSION_free(m_saved_session);
@@ -280,6 +284,73 @@ static void apply_ctx_performance_options(SSL_CTX* ctx)
 }
 #endif
 
+#if SOCKETLEY_HAS_TLS
+namespace
+{
+
+// The protocol name a CA's TLS-ALPN-01 validation offers, length-prefixed as ALPN carries it.
+constexpr unsigned char acme_tls_alpn[] = {10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'};
+
+int acme_ex_index()
+{
+    static const int idx = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+    return idx;
+}
+
+// A CA asking for acme-tls/1 by a name whose challenge certificate is on disk is shown that one, on that handshake.
+int acme_client_hello(SSL* ssl, int* /*alert*/, void* /*arg*/)
+{
+    const unsigned char* alpn = nullptr;
+    size_t alpn_len = 0;
+    if (SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_application_layer_protocol_negotiation, &alpn, &alpn_len) != 1 ||
+        alpn_len < 2)
+        return SSL_CLIENT_HELLO_SUCCESS;
+    bool offered = false;
+    for (size_t p = 2; p < alpn_len && !offered;)
+    {
+        const size_t n = alpn[p];
+        offered = n == sizeof acme_tls_alpn - 1 && p + 1 + n <= alpn_len &&
+                  std::memcmp(alpn + p, acme_tls_alpn, sizeof acme_tls_alpn) == 0;
+        p += 1 + n;
+    }
+    const unsigned char* sni = nullptr;
+    size_t sni_len = 0;
+    if (!offered || SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_server_name, &sni, &sni_len) != 1 || sni_len < 5)
+        return SSL_CLIENT_HELLO_SUCCESS;
+    // server_name_list: a two-byte length, then a type byte and a two-byte length before the name.
+    const size_t name_len = (size_t(sni[3]) << 8) | sni[4];
+    if (sni[2] != 0 || 5 + name_len > sni_len)
+        return SSL_CLIENT_HELLO_SUCCESS;
+    const std::string name(reinterpret_cast<const char*>(sni + 5), name_len);
+    const std::string pem = cert_keeper::tls_alpn_answer(name);
+    if (pem.empty())
+        return SSL_CLIENT_HELLO_SUCCESS;
+    BIO* b = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    X509* x = b ? PEM_read_bio_X509(b, nullptr, nullptr, nullptr) : nullptr;
+    EVP_PKEY* k = b ? PEM_read_bio_PrivateKey(b, nullptr, nullptr, nullptr) : nullptr;
+    if (x && k && SSL_use_cert_and_key(ssl, x, k, nullptr, 1) == 1)
+        SSL_set_ex_data(ssl, acme_ex_index(), reinterpret_cast<void*>(1));
+    if (x) X509_free(x);
+    if (k) EVP_PKEY_free(k);
+    if (b) BIO_free(b);
+    ERR_clear_error();
+    return SSL_CLIENT_HELLO_SUCCESS;
+}
+
+// Only a handshake given the challenge certificate speaks acme-tls/1; every other one negotiates no protocol, as before.
+int acme_alpn_select(SSL* ssl, const unsigned char** out, unsigned char* outlen, const unsigned char* /*in*/,
+                     unsigned int /*inlen*/, void* /*arg*/)
+{
+    if (!SSL_get_ex_data(ssl, acme_ex_index()))
+        return SSL_TLSEXT_ERR_NOACK;
+    *out = acme_tls_alpn + 1;
+    *outlen = sizeof acme_tls_alpn - 1;
+    return SSL_TLSEXT_ERR_OK;
+}
+
+}   // namespace
+#endif
+
 bool tls_context::init_server(std::string_view cert_path, std::string_view key_path,
                               std::string_view client_ca)
 {
@@ -303,8 +374,11 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
 
     // Apply common performance options (tickets, modes, fragment size)
     apply_ctx_performance_options(m_ctx);
+    SSL_CTX_set_client_hello_cb(m_ctx, acme_client_hello, nullptr);
+    SSL_CTX_set_alpn_select_cb(m_ctx, acme_alpn_select, nullptr);
 
-    if (SSL_CTX_use_certificate_file(m_ctx, std::string(cert_path).c_str(), SSL_FILETYPE_PEM) <= 0)
+    // The chain, so a client is sent the intermediates a CA's certificate needs as well as the leaf.
+    if (SSL_CTX_use_certificate_chain_file(m_ctx, std::string(cert_path).c_str()) <= 0)
     {
         std::cerr << "[tls] failed to load certificate: " << cert_path << "\n";
         log_ssl_errors("certificate load");
@@ -345,9 +419,46 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
         SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
     }
 
+    cert_keeper::watch(this, cert_path, key_path);
     return true;
 #else
     std::cerr << "[tls] OpenSSL not available -- rebuild with OpenSSL development headers\n";
+    return false;
+#endif
+}
+
+bool tls_context::reload_cert(std::string_view cert_path, std::string_view key_path)
+{
+#if SOCKETLEY_HAS_TLS
+    if (!m_ctx)
+        return false;
+    // Read whole and checked against each other before the context is touched, so a file half written is no change.
+    BIO* cb = BIO_new_file(std::string(cert_path).c_str(), "r");
+    BIO* kb = BIO_new_file(std::string(key_path).c_str(), "r");
+    X509* leaf = cb ? PEM_read_bio_X509(cb, nullptr, nullptr, nullptr) : nullptr;
+    STACK_OF(X509)* chain = sk_X509_new_null();
+    while (leaf && chain)
+    {
+        X509* more = PEM_read_bio_X509(cb, nullptr, nullptr, nullptr);
+        if (!more)
+            break;
+        sk_X509_push(chain, more);
+    }
+    ERR_clear_error();
+    EVP_PKEY* key = kb ? PEM_read_bio_PrivateKey(kb, nullptr, nullptr, nullptr) : nullptr;
+    // A handshake already begun keeps what it was given; SSL_new copies the context's certificate.
+    const bool ok = leaf && key && chain && X509_check_private_key(leaf, key) == 1 &&
+                    SSL_CTX_use_cert_and_key(m_ctx, leaf, key, chain, 1) == 1;
+    ERR_clear_error();
+    if (cb) BIO_free(cb);
+    if (kb) BIO_free(kb);
+    if (leaf) X509_free(leaf);
+    if (key) EVP_PKEY_free(key);
+    if (chain) sk_X509_pop_free(chain, X509_free);
+    return ok;
+#else
+    (void)cert_path;
+    (void)key_path;
     return false;
 #endif
 }

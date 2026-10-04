@@ -1,3 +1,4 @@
+#include "../../shared/cert_keeper.h"
 #include "../../shared/socket_tuning.h"
 #include "../../shared/conn_alloc.h"
 #include "server_instance.h"
@@ -1837,6 +1838,21 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
     // Decided once, before anything can answer, so that every path below —
     // Lua, cached, disk, 404 — agrees about what the client asked for.
     conn->http_keep_alive = http_request_keep_alive(req);
+
+    // A CA's HTTP-01 challenge for a token this daemon holds is answered before a script or a file could be; any other
+    // token is the site's own, as certbot's webroot puts it, and is served as before.
+    if (std::string body; SOCKETLEY_UNLIKELY(req.path.starts_with(cert_keeper::challenge_prefix)) &&
+        !(body = cert_keeper::challenge_answer(req.path.substr(cert_keeper::challenge_prefix.size()))).empty())
+    {
+        queue_http_response(conn, std::make_shared<const std::string>(
+                                      build_http_response("application/octet-stream", body, conn->http_keep_alive)));
+        conn->partial.erase(0, total_consumed);
+        if (!conn->http_keep_alive)
+            conn->closing = true;
+        else
+            conn->proto = proto_unknown;
+        return;
+    }
 
 #ifndef SOCKETLEY_NO_LUA
     // ─── The Lua handler ────────────────────────────────────────────────────

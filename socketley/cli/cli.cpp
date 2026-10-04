@@ -352,6 +352,10 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("proxy-worker"):
             return worker_main(3);
 
+        // A certificate from an ACME CA, run by a worker for --acme and runnable by hand; it needs no daemon.
+        case fnv1a("acme"):
+            return acme_main(argc, argv);
+
         case fnv1a("daemon"):
         {
             // `stop` before the flag scan, because it is a verb and not a

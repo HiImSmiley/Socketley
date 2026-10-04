@@ -20,6 +20,7 @@
 #include "../proxy/proxy_instance.h"
 #include "../server/server_instance.h"
 #include "../client/client_instance.h"
+#include "../../shared/cert_keeper.h"
 #include "../../shared/request_channel.h"
 #include "../../shared/endpoint_table.h"
 #include "../../shared/event_loop.h"
@@ -433,6 +434,8 @@ public:
                 // place that runs every turn for every runtime type.
                 m_rt->refresh_pacing_watermark(now);
                 m_rt->on_loop_turn();
+                // Certificates replaced on disk, and the runtime's own --acme renewals, for every type alike.
+                cert_keeper::tick();
             }
 
             // A state the runtime reached on its own, reported as soon as it

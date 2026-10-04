@@ -127,6 +127,10 @@ public:
 
     bool is_initialized() const { return m_ctx != nullptr; }
 
+    // A server context's certificate chain and key taken again from their files, for handshakes from now on; false,
+    // and the old ones kept, when they do not load or do not match.
+    bool reload_cert(std::string_view cert_path, std::string_view key_path);
+
     // OpenSSL bounds a memory BIO nowhere, so without this a peer that never
     // completes a handshake is an unmetered allocator.
     static constexpr long max_bio_buffered = 512 * 1024;

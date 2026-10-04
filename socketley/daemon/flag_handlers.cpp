@@ -6,7 +6,9 @@
 #include "../shared/appending_file.h"
 #include "../shared/lua_context.h"
 #include "../shared/tls_context.h"
+#include "../shared/cert_keeper.h"
 #include <iostream>
+#include <algorithm>
 #include <charconv>
 #include <sys/un.h>
 #include "../shared/runtime_manager.h"
@@ -53,6 +55,63 @@ static int parse_listen_flag(runtime_instance* rt, const parsed_args& pa, size_t
 
 // Every duration flag parses through here, so the next one cannot grow a
 // second grammar and no site can forget the range check.
+// --acme and --acme-email, one decision for create and edit: the names are checked as a CA would take them for
+// HTTP-01, and the certificate's files become the ones --acme keeps.
+static int parse_acme_flag(runtime_instance* instance, const parsed_args& pa, size_t& i)
+{
+    const bool email = pa.hashes[i] == fnv1a("--acme-email");
+    const char* flag = email ? "--acme-email" : "--acme";
+    if (!tls_role_has_handshake(instance->get_type()) || instance->get_type() == runtime_client)
+    {
+        std::cout << flag << ": a certificate is issued for a runtime that listens: server, proxy, cache or storage\n";
+        return 1;
+    }
+    if (i + 1 >= pa.count)
+    {
+        std::cout << flag << (email ? " requires an address\n" : " requires a name, or several separated by commas\n");
+        return 1;
+    }
+    const std::string_view v = pa.args[++i];
+    if (email)
+    {
+        if (v.find('@') == std::string_view::npos || v.find_first_of(" ,\t") != std::string_view::npos)
+        {
+            std::cout << "--acme-email: '" << v << "' is not an address\n";
+            return 1;
+        }
+        instance->set_acme_email(v);
+        return 0;
+    }
+    instance->set_acme_domains(v);
+    const auto& names = instance->get_acme_domains();
+    if (names.empty())
+    {
+        std::cout << "--acme requires a name, or several separated by commas\n";
+        return 1;
+    }
+    for (const std::string& n : names)
+    {
+        // A name whose last label is all digits is an address, which HTTP-01 does not prove.
+        const std::string_view tld = std::string_view(n).substr(n.rfind('.') + 1);
+        const bool ok = n.size() <= 253 && n.find('.') != std::string::npos && n.front() != '.' && n.back() != '.' &&
+                        !std::all_of(tld.begin(), tld.end(), [](char ch) { return ch >= '0' && ch <= '9'; }) &&
+                        std::all_of(n.begin(), n.end(), [](char ch) {
+                            return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+                                   ch == '-' || ch == '.';
+                        });
+        if (!ok)
+        {
+            std::cout << "--acme: '" << n << "' is not a name a certificate is issued for over HTTP-01 "
+                         "(no wildcards, no addresses, at least one dot)\n";
+            return 1;
+        }
+    }
+    instance->set_tls(true);
+    instance->set_cert_path(cert_keeper::acme_cert_path(names.front()));
+    instance->set_key_path(cert_keeper::acme_key_path(names.front()));
+    return 0;
+}
+
 static bool parse_duration_flag(const char* flag, std::string_view value,
                                 uint64_t max_seconds, uint64_t& out)
 {
@@ -448,6 +507,10 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             }
             instance->set_tls(true);
             return 0;
+
+        case fnv1a("--acme"):
+        case fnv1a("--acme-email"):
+            return parse_acme_flag(instance, pa, i);
 
         case fnv1a("--cert"):
         case fnv1a("--key"):
@@ -1701,6 +1764,10 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             }
             instance->set_tls(true);
             return 0;
+
+        case fnv1a("--acme"):
+        case fnv1a("--acme-email"):
+            return parse_acme_flag(instance, pa, i);
 
         case fnv1a("--cert"):
         case fnv1a("--key"):

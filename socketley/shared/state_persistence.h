@@ -54,6 +54,9 @@ struct runtime_config
     bool tls = false;
     std::string cert_path;
     std::string key_path;
+    // --acme's names, comma-joined, and its account contact.
+    std::string acme_domains;
+    std::string acme_email;
     std::string ca_path;
     std::string target;
     std::string cache_name;

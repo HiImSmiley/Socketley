@@ -697,6 +697,9 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.tls = instance->get_tls();
     cfg.cert_path = instance->get_cert_path();
     cfg.key_path = instance->get_key_path();
+    for (const std::string& d : instance->get_acme_domains())
+        cfg.acme_domains += (cfg.acme_domains.empty() ? "" : ",") + d;
+    cfg.acme_email = instance->get_acme_email();
     cfg.ca_path = instance->get_ca_path();
     cfg.target = instance->get_target();
     cfg.listen_path = instance->get_listen_path();
@@ -912,6 +915,10 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         append_str_field("cert_path", cfg.cert_path);
     if (!cfg.key_path.empty())
         append_str_field("key_path", cfg.key_path);
+    if (!cfg.acme_domains.empty())
+        append_str_field("acme_domains", cfg.acme_domains);
+    if (!cfg.acme_email.empty())
+        append_str_field("acme_email", cfg.acme_email);
     if (!cfg.ca_path.empty())
         append_str_field("ca_path", cfg.ca_path);
     if (!cfg.target.empty())
@@ -1152,6 +1159,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.tls = json_get_bool(json, "tls");
     cfg.cert_path = json_get_string(json, "cert_path");
     cfg.key_path = json_get_string(json, "key_path");
+    cfg.acme_domains = json_get_string(json, "acme_domains");
+    cfg.acme_email = json_get_string(json, "acme_email");
     cfg.ca_path = json_get_string(json, "ca_path");
     cfg.target = json_get_string(json, "target");
     cfg.cache_name = json_get_string(json, "cache_name");

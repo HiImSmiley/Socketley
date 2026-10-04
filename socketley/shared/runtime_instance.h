@@ -285,6 +285,11 @@ public:
     std::string_view get_key_path() const;
     void set_ca_path(std::string_view path);
     std::string_view get_ca_path() const;
+    // --acme: the names its certificate is issued for, comma-separated as given, and the account's contact.
+    void set_acme_domains(std::string_view comma_list);
+    const std::vector<std::string>& get_acme_domains() const { return m_acme_domains; }
+    void set_acme_email(std::string_view email) { m_acme_email = email; }
+    std::string_view get_acme_email() const { return m_acme_email; }
 
     // get_stats() and get_connection_count() read this instance's live
     // connection tables and are therefore event-loop thread only, while the
@@ -947,6 +952,8 @@ private:
     std::string m_cert_path;
     std::string m_key_path;
     std::string m_ca_path;
+    std::vector<std::string> m_acme_domains;
+    std::string m_acme_email;
 
     // Lua script path for hot-reload
     std::string m_lua_script_path;

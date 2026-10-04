@@ -1,3 +1,4 @@
+#include "../../shared/cert_keeper.h"
 #include "../../shared/socket_tuning.h"
 #include "../../shared/conn_alloc.h"
 #include "proxy_instance.h"
@@ -3682,6 +3683,15 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
         // The block arrived; what happens next is the request's own business
         // and is timed by --backend-timeout, not by this.
         conn->awaiting_headers = false;
+
+        // A CA's HTTP-01 challenge for a token this daemon holds is answered whatever the prefix and the backends
+        // say; any other token is a backend's own, and is proxied as before.
+        if (std::string answer; SOCKETLEY_UNLIKELY(conn->path.starts_with(cert_keeper::challenge_prefix)) &&
+            !(answer = cert_keeper::challenge_answer(conn->path.substr(cert_keeper::challenge_prefix.size()))).empty())
+        {
+            send_error(conn, "200 OK", answer);
+            return;
+        }
 
         // Check path prefix (m_prefix = "/<name>/", strip trailing slash for bare match)
         std::string_view bare = std::string_view(m_prefix).substr(0, m_prefix.size() - 1);

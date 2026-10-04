@@ -5,6 +5,7 @@
 #include "lua_suspend.h"
 #include "logging.h"
 #include "tls_context.h"
+#include "cert_keeper.h"
 #include "blocking_write.h"
 #include "event_loop.h"
 #include "lua_context.h"
@@ -224,6 +225,14 @@ bool runtime_instance::start(event_loop& loop)
     // From here the kernel may hold addresses inside this object, so it can no
     // longer be freed on demand, and a failed setup() counts because it cannot
     // say what it armed before giving up.
+    // A certificate the CA has not issued yet is stood in for, so the listener starts and can answer for it.
+    if (std::string err;
+        !cert_keeper::prepare_acme(m_acme_domains, m_acme_email, get_cert_path(), get_key_path(), get_port() == 443, err))
+    {
+        LOG_ERROR(err.c_str());
+        store_state(runtime_failed);
+        return false;
+    }
     std::string_view mesh_ca, mesh_cert, mesh_key;
     get_mesh_tls_paths(mesh_ca, mesh_cert, mesh_key);
     if (const std::string msg = tls_config_refusal(get_type(),
@@ -1164,6 +1173,18 @@ int runtime_instance::get_reconnect() const { return m_reconnect; }
 void runtime_instance::set_tls(bool enabled) { m_tls = enabled; }
 bool runtime_instance::get_tls() const { return m_tls; }
 void runtime_instance::set_cert_path(std::string_view path) { m_cert_path = path; }
+void runtime_instance::set_acme_domains(std::string_view comma_list)
+{
+    m_acme_domains.clear();
+    while (!comma_list.empty())
+    {
+        const size_t comma = comma_list.find(',');
+        const std::string_view d = comma_list.substr(0, comma);
+        if (!d.empty())
+            m_acme_domains.emplace_back(d);
+        comma_list = comma == std::string_view::npos ? std::string_view{} : comma_list.substr(comma + 1);
+    }
+}
 std::string_view runtime_instance::get_cert_path() const { return m_cert_path; }
 void runtime_instance::set_key_path(std::string_view path) { m_key_path = path; }
 std::string_view runtime_instance::get_key_path() const { return m_key_path; }

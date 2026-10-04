@@ -149,6 +149,8 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
     if (cfg.tls)                     rt.set_tls(true);
     if (!cfg.cert_path.empty())      rt.set_cert_path(cfg.cert_path);
     if (!cfg.key_path.empty())       rt.set_key_path(cfg.key_path);
+    if (!cfg.acme_domains.empty())   rt.set_acme_domains(cfg.acme_domains);
+    if (!cfg.acme_email.empty())     rt.set_acme_email(cfg.acme_email);
     if (!cfg.ca_path.empty())        rt.set_ca_path(cfg.ca_path);
     if (!cfg.target.empty())         rt.set_target(cfg.target);
     if (!cfg.cache_name.empty())     rt.set_cache_name(cfg.cache_name);
