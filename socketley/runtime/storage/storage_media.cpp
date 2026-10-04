@@ -472,7 +472,9 @@ bool storage_run::media_start(const media_want& w, int lock_fd, bool seek)
             args.insert(args.end(), {"-c", "copy"});
         else
             args.insert(args.end(), {"-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-                                     "-vf", "scale=-2:'min(" + std::to_string(n) + ",trunc(ih/2)*2)'",
+                                     // A height names the 16:9 box the picture fits in, so a scope film at 720 is 1280 wide.
+                                     "-vf", "scale='min(" + std::to_string(n * 16 / 9 / 2 * 2) + ",iw)':'min(" + std::to_string(n) +
+                                         ",ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
                                      "-force_key_frames", "expr:gte(t,n_forced*" + std::string(hls_seconds) + ")",
                                      "-c:a", "aac", "-b:a", "160k", "-ac", "2"});
         // CMAF segments, which every HLS player of today plays, and which are fragments of one MP4.
