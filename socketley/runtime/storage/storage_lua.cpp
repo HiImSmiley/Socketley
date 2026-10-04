@@ -85,6 +85,9 @@ std::string_view storage_run::operation_name(const s3_request& r)
     if (bucket_level && r.has_query("website"))
         return m == "GET" ? "GetBucketWebsite" : m == "PUT" ? "PutBucketWebsite" : m == "DELETE" ? "DeleteBucketWebsite"
              : "Unknown";
+    if (bucket_level && r.has_query("publicAccessBlock"))
+        return m == "GET" ? "GetPublicAccessBlock" : m == "PUT" ? "PutPublicAccessBlock"
+             : m == "DELETE" ? "DeletePublicAccessBlock" : "Unknown";
     if (bucket_level && r.has_query("quota"))
         return m == "GET" ? "GetBucketQuota" : m == "PUT" ? "PutBucketQuota" : m == "DELETE" ? "DeleteBucketQuota"
              : "Unknown";

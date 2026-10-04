@@ -4,6 +4,7 @@
 #include "storage_run.h"
 
 #include "bucket_policy.h"
+#include "s3_public_access.h"
 #include "s3_sigv4_auth.h"
 #include "s3_xml.h"
 
@@ -28,6 +29,13 @@ void storage_run::op_put_policy(const std::shared_ptr<conn>& c)
     if (!bucket_policy::compile(c->body, q.bucket, checked, err))
     {
         send_error(c, err);
+        return;
+    }
+    if (const auto pab = m_store.bucket_public_access(q.bucket); pab && pab->block_public_policy && checked.is_public())
+    {
+        s3_error e = make_error("AccessDenied");
+        e.message  = "Access Denied because public policies are blocked by the BlockPublicPolicy block public access setting.";
+        send_error(c, e);
         return;
     }
     store_doc(c, bucket_doc::policy, q.bucket, c->body, 204);
@@ -273,6 +281,10 @@ policy_effect storage_run::access_of(const std::shared_ptr<conn>& c, std::string
             c->ip_known = true;
         }
         pol = p->evaluate(q);
+        // A public policy lets in nobody without credentials while the bucket restricts it.
+        if (!u && pol == policy_effect::allow && p->is_public())
+            if (const auto pab = m_store.bucket_public_access(bucket); pab && pab->restrict_public_buckets)
+                pol = policy_effect::none;
     }
     if (pol == policy_effect::deny)
         return policy_effect::deny;

@@ -37,7 +37,7 @@ bool unsupported_subresource(const s3_request& r, bool object)
         "acl", "tagging",
         "accelerate",
         "requestPayment", "logging", "analytics", "metrics", "inventory", "ownershipControls",
-        "publicAccessBlock", "intelligent-tiering", "attributes", "restore", "select", "torrent",
+        "intelligent-tiering", "attributes", "restore", "select", "torrent",
         "acl", "location-constraint",
     };
     // Every subresource is a query parameter, and most requests have none.
@@ -65,6 +65,8 @@ bool unsupported_subresource(const s3_request& r, bool object)
     if (r.has_query("website") && (object || (r.method != "GET" && r.method != "PUT" && r.method != "DELETE")))
         return true;
     if (r.has_query("quota") && (object || (r.method != "GET" && r.method != "PUT" && r.method != "DELETE")))
+        return true;
+    if (r.has_query("publicAccessBlock") && (object || (r.method != "GET" && r.method != "PUT" && r.method != "DELETE")))
         return true;
     // A bucket's object lock is read and set, and a version's retention and legal hold likewise.
     const bool lock_attr = r.has_query("retention") || r.has_query("legal-hold");
@@ -470,6 +472,16 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
             op_put_website(c);
         else
             op_delete_website(c);
+        return;
+    }
+    if (bkt && q.has_query("publicAccessBlock"))
+    {
+        if (m == "GET")
+            op_get_public_access(c);
+        else if (m == "PUT")
+            op_put_public_access(c);
+        else
+            op_delete_public_access(c);
         return;
     }
     if (bkt && q.has_query("quota"))

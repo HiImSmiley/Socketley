@@ -443,6 +443,7 @@ std::string doc_label(bucket_doc kind)
         case bucket_doc::replication: return "replication configuration";
         case bucket_doc::quota:       return "quota";
         case bucket_doc::website:     return "website configuration";
+        case bucket_doc::public_access: return "public access block";
     }
     return "configuration";
 }

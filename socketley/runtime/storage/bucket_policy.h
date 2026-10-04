@@ -86,6 +86,8 @@ enum class s3_action : uint8_t
     get_bucket_website,
     put_bucket_website,
     delete_bucket_website,
+    get_bucket_public_access_block,
+    put_bucket_public_access_block,
     count,
 };
 static_assert(static_cast<int>(s3_action::count) <= 64);

@@ -20,6 +20,7 @@
 #include "s3_notify.h"
 #include "s3_quota.h"
 #include "s3_website.h"
+#include "s3_public_access.h"
 #include "s3_replication.h"
 #include "s3_object_lock.h"
 #include "s3_versioning.h"
@@ -3122,6 +3123,7 @@ const char* object_store::doc_file(bucket_doc kind)
         case bucket_doc::replication: return "replication";
         case bucket_doc::quota:      return "quota";
         case bucket_doc::website:    return "website";
+        case bucket_doc::public_access: return "public-access-block";
     }
     return "?";
 }
@@ -3130,6 +3132,12 @@ std::shared_ptr<const website_config> object_store::bucket_website(std::string_v
 {
     const bucket* b = find_bucket(name);
     return b && !b->closing ? b->website : nullptr;
+}
+
+std::shared_ptr<const public_access_block> object_store::bucket_public_access(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b && !b->closing ? b->public_access : nullptr;
 }
 
 std::shared_ptr<const bucket_quota> object_store::bucket_quota_of(std::string_view name) const
@@ -3313,6 +3321,22 @@ std::shared_ptr<const lifecycle_config> object_store::lifecycle(std::string_view
 bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml, std::string* why)
 {
     s3_error err;
+    if (kind == bucket_doc::public_access)
+    {
+        std::shared_ptr<public_access_block> p;
+        if (!xml.empty())
+        {
+            p = std::make_shared<public_access_block>();
+            if (!parse_public_access_block(xml, *p, err))
+            {
+                if (why)
+                    *why = err.message;
+                return false;
+            }
+        }
+        b.public_access = std::move(p);
+        return true;
+    }
     if (kind == bucket_doc::website)
     {
         std::shared_ptr<website_config> w;
