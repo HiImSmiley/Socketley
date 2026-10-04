@@ -139,6 +139,7 @@ inline s3_error make_error(std::string_view code)
         {"NoSuchBucketQuota", 404, "The bucket has no quota."},
         {"NoSuchWebsiteConfiguration", 404, "The specified bucket does not have a website configuration"},
         {"NoSuchPublicAccessBlockConfiguration", 404, "The public access block configuration was not found"},
+        {"InvalidTargetBucketForLogging", 400, "The target bucket for logging does not exist"},
         {"SlowDown", 503, "Please reduce your request rate."},
         {"InternalError", 500, "We encountered an internal error. Please try again."},
         {"ServiceUnavailable", 503, "Service is unable to handle request."},

@@ -148,7 +148,7 @@ void storage_run::send_delete_marker(const std::shared_ptr<conn>& c, const objec
         return;
     }
     const s3_error err = make_error(by_version ? "MethodNotAllowed" : "NoSuchKey");
-    count_error(err.code);
+    count_error(*c, err.code);
     response r;
     r.status = err.status;
     r.headers.emplace_back("Content-Type", "application/xml");

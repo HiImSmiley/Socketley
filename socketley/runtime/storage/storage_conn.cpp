@@ -533,8 +533,9 @@ void storage_run::sweep()
     }
     lifecycle_tick();
     tell_started();
+    flush_access_logs(false);
     if (!m_conns.empty() || m_mpu_expire_secs != 0 || m_start_note != start_note::told || m_lc ||
-        m_store.lifecycle_buckets() != 0 || m_store.any_doubt())
+        m_store.lifecycle_buckets() != 0 || m_store.any_doubt() || !m_access_logs.empty())
         arm_sweep();
 }
 
@@ -550,6 +551,10 @@ void storage_run::stop()
         return;
     m_stopped = true;
     stop_rpc();
+    // Access log lines not yet delivered are dropped with the deliveries in flight.
+    for (auto& d : m_log_deliveries)
+        d->abort();
+    m_log_deliveries.clear();
 
     if (m_listen_fd >= 0)
     {
@@ -1456,6 +1461,7 @@ void storage_run::send_response(const std::shared_ptr<conn>& c, response r)
     c->ph = phase::respond;
     const std::string_view body = r.head_only ? std::string_view{}
                                 : r.body_view.data() ? r.body_view : std::string_view(r.body);
+    access_log(c, r.status, body.size());
     std::string out = response_head(*c, r, body.size());
     out += body;
     c->close_after_write = r.close;
@@ -1478,7 +1484,7 @@ void storage_run::send_error(const std::shared_ptr<conn>& c, const s3_error& e, 
         website_failure(c, e);
         return;
     }
-    count_error(e.code);
+    count_error(*c, e.code);
     response r;
     r.status = e.status;
     r.close  = close;
@@ -1507,10 +1513,11 @@ void storage_run::send_error(const std::shared_ptr<conn>& c, const s3_error& e, 
     send_response(c, std::move(r));
 }
 
-void storage_run::count_error(std::string_view code)
+void storage_run::count_error(conn& c, std::string_view code)
 {
     if (code.empty())
         return;
+    c.error_code = code;
     // The set of codes is the runtime's own and small; the bound is for a
     // future code that carries something a client chose.
     auto it = m_c.errors.find(code);
@@ -1580,6 +1587,7 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->website_key.clear();
     c->website_error = {};
     c->website_status = 0;
+    c->error_code.clear();
 }
 
 void storage_run::finish_request(const std::shared_ptr<conn>& c)
@@ -2326,6 +2334,7 @@ void storage_run::send_file(const std::shared_ptr<conn>& c, response head, int f
         ++m_c.copied_gets;
 
     c->after_write = conn::after_kind::pump;
+    access_log(c, head.status, len);
     queue_write(c, response_head(*c, head));
 }
 

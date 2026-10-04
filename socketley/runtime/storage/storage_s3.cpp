@@ -36,7 +36,7 @@ bool unsupported_subresource(const s3_request& r, bool object)
     static constexpr std::string_view names[] = {
         "acl", "tagging",
         "accelerate",
-        "requestPayment", "logging", "analytics", "metrics", "inventory", "ownershipControls",
+        "requestPayment", "analytics", "metrics", "inventory", "ownershipControls",
         "intelligent-tiering", "attributes", "restore", "select", "torrent",
         "acl", "location-constraint",
     };
@@ -65,6 +65,8 @@ bool unsupported_subresource(const s3_request& r, bool object)
     if (r.has_query("website") && (object || (r.method != "GET" && r.method != "PUT" && r.method != "DELETE")))
         return true;
     if (r.has_query("quota") && (object || (r.method != "GET" && r.method != "PUT" && r.method != "DELETE")))
+        return true;
+    if (r.has_query("logging") && (object || (r.method != "GET" && r.method != "PUT")))
         return true;
     if (r.has_query("publicAccessBlock") && (object || (r.method != "GET" && r.method != "PUT" && r.method != "DELETE")))
         return true;
@@ -472,6 +474,14 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
             op_put_website(c);
         else
             op_delete_website(c);
+        return;
+    }
+    if (bkt && q.has_query("logging"))
+    {
+        if (m == "GET")
+            op_get_logging(c);
+        else
+            op_put_logging(c);
         return;
     }
     if (bkt && q.has_query("publicAccessBlock"))
@@ -2284,7 +2294,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
                 e.headers.emplace_back("Content-Type", "application/xml");
                 e.headers.emplace_back("Content-Range", "bytes */" + std::to_string(m.size));
                 s3_error err = make_error("InvalidRange");
-                count_error(err.code);
+                count_error(*cc, err.code);
                 error_context ctx;
                 ctx.bucket = rq.bucket;
                 ctx.key = rq.key;

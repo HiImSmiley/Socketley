@@ -16,7 +16,7 @@ void storage_run::op_sts(const std::shared_ptr<conn>& c)
     const s3_request& r = c->req;
     auto fail = [this, &c](int status, std::string_view code, std::string_view message)
     {
-        count_error(code);
+        count_error(*c, code);
         response resp;
         resp.status = status;
         resp.headers.emplace_back("Content-Type", "text/xml");

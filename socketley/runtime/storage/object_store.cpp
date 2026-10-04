@@ -21,6 +21,7 @@
 #include "s3_quota.h"
 #include "s3_website.h"
 #include "s3_public_access.h"
+#include "s3_logging.h"
 #include "s3_replication.h"
 #include "s3_object_lock.h"
 #include "s3_versioning.h"
@@ -3124,6 +3125,7 @@ const char* object_store::doc_file(bucket_doc kind)
         case bucket_doc::quota:      return "quota";
         case bucket_doc::website:    return "website";
         case bucket_doc::public_access: return "public-access-block";
+        case bucket_doc::logging:    return "logging";
     }
     return "?";
 }
@@ -3138,6 +3140,12 @@ std::shared_ptr<const public_access_block> object_store::bucket_public_access(st
 {
     const bucket* b = find_bucket(name);
     return b && !b->closing ? b->public_access : nullptr;
+}
+
+std::shared_ptr<const logging_config> object_store::bucket_logging(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b && !b->closing ? b->logging : nullptr;
 }
 
 std::shared_ptr<const bucket_quota> object_store::bucket_quota_of(std::string_view name) const
@@ -3321,6 +3329,25 @@ std::shared_ptr<const lifecycle_config> object_store::lifecycle(std::string_view
 bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml, std::string* why)
 {
     s3_error err;
+    if (kind == bucket_doc::logging)
+    {
+        std::shared_ptr<logging_config> l;
+        if (!xml.empty())
+        {
+            l = std::make_shared<logging_config>();
+            if (!parse_logging_config(xml, *l, err))
+            {
+                if (why)
+                    *why = err.message;
+                return false;
+            }
+            if (l->target_bucket.empty())
+                l.reset();
+        }
+        m_logging_buckets += (l != nullptr) - (b.logging != nullptr);
+        b.logging = std::move(l);
+        return true;
+    }
     if (kind == bucket_doc::public_access)
     {
         std::shared_ptr<public_access_block> p;

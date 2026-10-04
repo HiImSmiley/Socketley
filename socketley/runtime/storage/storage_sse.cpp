@@ -455,6 +455,7 @@ void storage_run::send_sealed(const std::shared_ptr<conn>& c, response head, int
     ++m_c.copied_gets;
     ++m_c.sse_gets;
     c->after_write = conn::after_kind::pump;
+    access_log(c, head.status, len);
     queue_write(c, response_head(*c, head));
 }
 

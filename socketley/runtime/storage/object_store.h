@@ -67,6 +67,7 @@ struct replication_config;
 struct bucket_quota;
 struct website_config;
 struct public_access_block;
+struct logging_config;
 class bucket_policy;
 
 // The configuration documents a bucket keeps beside its objects, each in a file named for it.
@@ -84,13 +85,14 @@ enum class bucket_doc : uint8_t
     quota,
     website,
     public_access,
+    logging,
 };
 // Every kind, for the walks that settle or take up all of a bucket's documents.
 inline constexpr bucket_doc all_bucket_docs[] = {bucket_doc::cors,       bucket_doc::lifecycle, bucket_doc::policy,
                                                  bucket_doc::versioning, bucket_doc::encryption, bucket_doc::tagging,
                                                  bucket_doc::object_lock, bucket_doc::notification,
                                                  bucket_doc::replication, bucket_doc::quota, bucket_doc::website,
-                                                 bucket_doc::public_access};
+                                                 bucket_doc::public_access, bucket_doc::logging};
 
 // A bucket's versioning: never configured, keeping every version, or writing the null version.
 enum class versioning : uint8_t
@@ -742,6 +744,9 @@ public:
     std::shared_ptr<const website_config> bucket_website(std::string_view name) const;
     // The bucket's public access block, null when it has none.
     std::shared_ptr<const public_access_block> bucket_public_access(std::string_view name) const;
+    // Where the bucket's access log goes, null when it is not logged.
+    std::shared_ptr<const logging_config> bucket_logging(std::string_view name) const;
+    bool any_logging() const { return m_logging_buckets != 0; }
     // The quota on the bytes of every bucket user `owner` owns, 0 for none, asked of whoever knows the users.
     void set_owner_quota(std::function<uint64_t(std::string_view owner)> fn) { m_owner_quota = std::move(fn); }
     // Every version of `bucket` this shard indexes, the latest of each key and the others, delete markers included.
@@ -1001,6 +1006,7 @@ private:
         std::shared_ptr<const bucket_quota> quota;
         std::shared_ptr<const website_config> website;
         std::shared_ptr<const public_access_block> public_access;
+        std::shared_ptr<const logging_config> logging;
         versioning  vstate{versioning::off};
         // Per key, every version but a latest that is not a delete marker, newest first: the key's
         // noncurrent versions, behind its latest when that is a marker; empty unless the bucket was versioned.
@@ -1255,6 +1261,7 @@ private:
     uint64_t m_reserved{0};
     // Buckets with CORS rules, with lifecycle rules and with a policy.
     uint32_t m_cors_buckets{0};
+    uint32_t m_logging_buckets{0};
     uint32_t m_lifecycle_buckets{0};
     uint32_t m_policy_buckets{0};
     // Buckets with a document in doubt.

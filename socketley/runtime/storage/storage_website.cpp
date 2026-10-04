@@ -211,7 +211,7 @@ void storage_run::website_redirect_to(const std::shared_ptr<conn>& c, int status
 
 void storage_run::website_error_page(const std::shared_ptr<conn>& c, const s3_error& e)
 {
-    count_error(e.code);
+    count_error(*c, e.code);
     response r;
     r.status = e.status;
     r.headers.emplace_back("Content-Type", "text/html; charset=utf-8");

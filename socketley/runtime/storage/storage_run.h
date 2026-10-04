@@ -378,6 +378,8 @@ struct conn
     bool        policy_admitted{false};
     // A missing key is answered AccessDenied, for a requester a policy lets read and not list, as S3 does.
     bool        hide_missing{false};
+    // The S3 error code the answer carries, for the access log.
+    std::string error_code;
     // The key a website request asked for, before its index document was added.
     std::string website_key;
     // The failure a website request is serving its error document for, and its status.
@@ -556,8 +558,8 @@ public:
     void send_error_st(const std::shared_ptr<conn>& c, st s);
     // Sets the bucket's document of `kind`, or removes it for an empty `xml`, and answers `status` with no body.
     void store_doc(const std::shared_ptr<conn>& c, bucket_doc kind, std::string bucket, std::string xml, int status);
-    // One more answered with this S3 error code, for `stats` and the metrics.
-    void count_error(std::string_view code);
+    // One more answered with this S3 error code, for `stats` and the metrics, and `c`'s for its access log.
+    void count_error(conn& c, std::string_view code);
     void finish_request(const std::shared_ptr<conn>& c);
     void reset_request(const std::shared_ptr<conn>& c);
     // The status line and headers, with room reserved for `room` more bytes behind them.
@@ -692,6 +694,13 @@ public:
     // A bucket's website, in storage_website.cpp: the configuration's three operations, and a request to the website.
     void op_put_website(const std::shared_ptr<conn>& c);
     void op_get_website(const std::shared_ptr<conn>& c);
+    void op_get_logging(const std::shared_ptr<conn>& c);
+    void op_put_logging(const std::shared_ptr<conn>& c);
+    // Notes the answer to `c`'s request, `status` with `bytes` of body, in its bucket's access log when it has one.
+    void access_log(const std::shared_ptr<conn>& c, int status, uint64_t bytes);
+    // Delivers the access logs held longer than the delivery interval, or every one when `all`.
+    void flush_access_logs(bool all);
+    void deliver_access_log(const std::string& target, std::string key, bool partitioned, std::string data);
     void op_get_public_access(const std::shared_ptr<conn>& c);
     void op_put_public_access(const std::shared_ptr<conn>& c);
     void op_delete_public_access(const std::shared_ptr<conn>& c);
@@ -974,6 +983,21 @@ private:
     std::shared_ptr<whole_put> put_whole(const std::string& bucket, const std::string& key, object_meta meta,
                                          std::string data, std::function<void(st, const put_result*)> done,
                                          s3_error& err);
+
+    // Server access logging, in storage_logging.cpp: lines held per destination until they are delivered as one
+    // object, and the deliveries in flight, so a stop can drop them.
+    struct access_log_buffer
+    {
+        std::string target;
+        // The key in front of the object's name, the date partition excepted.
+        std::string prefix;
+        bool        partitioned{false};
+        std::string data;
+        std::chrono::steady_clock::time_point since{};
+    };
+    std::map<std::string, access_log_buffer, std::less<>> m_access_logs;
+    std::vector<std::shared_ptr<whole_put>> m_log_deliveries;
+    std::string m_log_line;
 
     // Calls from other runtimes' scripts still in flight, so a stop can answer them.
     struct rpc_state;
