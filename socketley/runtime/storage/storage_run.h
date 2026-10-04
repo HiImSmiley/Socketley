@@ -19,6 +19,8 @@
 #include <utility>
 #include <vector>
 
+#include <sys/types.h>
+
 #include "body_reader.h"
 #include "bucket_policy.h"
 #include "checksum.h"
@@ -89,6 +91,10 @@ struct storage_counters
     // Bodies written encrypted, and GETs answered by opening an encrypted object's chunks.
     uint64_t sse_puts{0};
     uint64_t sse_gets{0};
+    // Media ffmpeg made and failed to make, and the answers served from what it made.
+    uint64_t media_made{0};
+    uint64_t media_failed{0};
+    uint64_t media_served{0};
     // S3 errors answered, by the code in the XML.
     std::map<std::string, uint64_t, std::less<>> errors;
 };
@@ -129,6 +135,8 @@ struct s3_request
     bool   vhost{false};
     // The Host header named a bucket's website, which serves its objects to anyone a policy lets read them.
     bool   website{false};
+    // The path began with a name no bucket can have (~dav, ~share, ~ui): the runtime's own applications.
+    uint8_t app{0};
     // A browser's upload by form, whose fields became the key and the headers of a PutObject.
     std::unique_ptr<post_form> form;
 
@@ -236,6 +244,9 @@ enum class phase : uint8_t
 };
 
 class storage_run;
+
+struct response;
+struct share_link;
 
 struct conn
 {
@@ -382,6 +393,12 @@ struct conn
     bool        hide_missing{false};
     // The S3 error code the answer carries, for the access log.
     std::string error_code;
+    // Given the answer before it is sent, by an application that turns an S3 answer into its own; it sends it on.
+    std::function<void(const std::shared_ptr<conn>&, response&)> on_answer;
+    // What a header an application added to the request points into.
+    std::string app_header;
+    // The share a request to ~share was let in by, for what it may still do.
+    std::string share_id;
     // The key a website request asked for, before its index document was added.
     std::string website_key;
     // The failure a website request is serving its error document for, and its status.
@@ -708,6 +725,57 @@ public:
     void op_get_public_access(const std::shared_ptr<conn>& c);
     void op_put_public_access(const std::shared_ptr<conn>& c);
     void op_delete_public_access(const std::shared_ptr<conn>& c);
+    // The runtime's own applications under the paths no bucket can have, in storage_dav.cpp and its neighbours:
+    // true when the request was one, and is answered or under way.
+    bool app_request(const std::shared_ptr<conn>& c);
+    // A request whose body the application read whole, given on from route_small.
+    void app_body(const std::shared_ptr<conn>& c);
+    void op_dav(const std::shared_ptr<conn>& c);
+    void dav_body(const std::shared_ptr<conn>& c);
+    void dav_propfind(const std::shared_ptr<conn>& c, const std::string& bucket, const std::string& key);
+    void dav_collection(const std::shared_ptr<conn>& c, const std::string& bucket, const std::string& key);
+    void dav_tree(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix, std::string dst_bucket,
+                  std::string dst_prefix, bool keep_source);
+    // A versioned bucket's deleted files under a folder, and one of them brought back by removing its delete marker.
+    void dav_trash(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix);
+    void dav_restore(const std::shared_ptr<conn>& c, std::string bucket, std::string key);
+    // Turns the request into the S3 operation `method` on `bucket`/`key` and sends it down the S3 path, after the
+    // policy has had its say; `extra` is a header to add, name and value.
+    void app_forward(const std::shared_ptr<conn>& c, std::string_view method, std::string bucket, std::string key,
+                     std::string_view extra_name = {}, std::string extra_value = {});
+    // Whether the request's user may do `method` to `bucket`/`key` as S3 would judge it.
+    bool app_allowed(const std::shared_ptr<conn>& c, std::string_view method, std::string_view bucket,
+                     std::string_view key, std::string_view query = {});
+    // HTTP Basic credentials, or none on a runtime that takes none; false after answering 401.
+    bool app_login(const std::shared_ptr<conn>& c, std::string_view realm);
+    void app_reply(const std::shared_ptr<conn>& c, int status, std::string body = {},
+                   std::string_view type = "text/plain; charset=utf-8");
+    void op_share(const std::shared_ptr<conn>& c);
+    void share_body(const std::shared_ptr<conn>& c);
+    // The link `id` names, once it is current and its password given; false after answering.
+    bool share_open(const std::shared_ptr<conn>& c, std::string_view id, share_link& s);
+    // The bucket and key a link and the path under it name, as share_open admits them; false after answering.
+    bool share_target(const std::shared_ptr<conn>& c, std::string_view id, std::string_view rel, std::string& bucket,
+                      std::string& key);
+    void op_ui(const std::shared_ptr<conn>& c);
+    // Thumbnails and HLS made by ffmpeg and kept under <dir>/.media/, in storage_media.cpp.
+    struct media_want
+    {
+        std::string bucket, key, variant, dir, file;
+        bool        hls{false};
+        bool        image{false};
+        bool        head{false};
+        int64_t     deadline_ms{0};
+    };
+    void op_media(const std::shared_ptr<conn>& c);
+    void media_source(const std::shared_ptr<conn>& c, std::string_view rest);
+    // Answers from the cache, or starts the making when no shard is at it; false while the request must wait.
+    bool media_try(const std::shared_ptr<conn>& c, const media_want& w);
+    bool media_start(const media_want& w, int lock_fd, bool seek);
+    void media_tick();
+    void media_arm();
+    void media_evict();
+    void media_stop();
     // STS's GetSessionToken and AssumeRole, POST / with a form, answered with temporary credentials.
     void op_sts(const std::shared_ptr<conn>& c);
     // IAM's users, keys, groups, roles and their policies, in storage_iam.cpp, for an admin's request.
@@ -960,6 +1028,23 @@ private:
     // One timer for every trickling body, and the connections waiting for it.
     timer       m_pace_timer;
     std::vector<uint64_t> m_paced;
+
+    struct media_job
+    {
+        pid_t       pid{-1};
+        int         lock_fd{-1};
+        media_want  want;
+        int64_t     started_ms{0};
+        bool        seeked{false};
+    };
+    std::vector<media_job> m_media_jobs;
+    std::vector<std::pair<std::weak_ptr<conn>, media_want>> m_media_waits;
+    timer       m_media_timer;
+    // ffmpeg's path, looked up at the first media request; empty when there is none.
+    std::string m_ffmpeg;
+    bool        m_ffmpeg_known{false};
+    // The key that signs ffmpeg's reads of an object, shared by every shard through the cache's directory.
+    std::string m_media_key;
 
     // Asked again at each sweep until every sibling has heard this shard started, or it gave up.
     void tell_started();

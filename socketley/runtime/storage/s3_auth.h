@@ -156,6 +156,14 @@ public:
         v.error   = {"InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403};
         return v;
     }
+    // A WebDAV client's or a browser's HTTP Basic credentials, the access key as the user name and its secret as the
+    // password; an authenticator that holds no keys lets everyone in as with no credentials.
+    virtual auth_verdict authorize_basic(std::string_view /*access_key*/, std::string_view /*secret*/)
+    {
+        auth_verdict v;
+        v.anonymous = true;
+        return v;
+    }
     // The display name of user `id` as an Owner element gives it, the id itself for one no longer known.
     virtual std::string display_name(std::string_view id) const { return std::string(id); }
     // The quota on the bytes of the buckets user `id` owns, 0 for none or for a user no longer known.

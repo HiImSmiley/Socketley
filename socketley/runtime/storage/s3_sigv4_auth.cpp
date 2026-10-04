@@ -929,6 +929,28 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
     return v;
 }
 
+auth_verdict sigv4_authenticator::authorize_basic(std::string_view access_key, std::string_view secret)
+{
+    maybe_reload();
+    auth_verdict v;
+    std::string_view want = m_creds.secret(access_key);
+    if (want.empty() && iam_changed())
+    {
+        refresh();
+        want = m_creds.secret(access_key);
+    }
+    // Compared in constant time, as a signature is, so the secret is not guessed by how long a refusal takes.
+    if (want.empty() || want.size() != secret.size() || CRYPTO_memcmp(want.data(), secret.data(), want.size()) != 0)
+    {
+        v.allowed = false;
+        v.error   = {"AccessDenied", "The access key or secret given is not one of this runtime's.", 401};
+        return v;
+    }
+    v.principal = std::string(access_key);
+    v.user      = m_creds.user_of(access_key);
+    return v;
+}
+
 auth_verdict sigv4_authenticator::authorize_post(const post_signature& sig)
 {
     maybe_reload();

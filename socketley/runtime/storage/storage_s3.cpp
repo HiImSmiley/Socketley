@@ -239,6 +239,8 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
         op_website(c);
         return;
     }
+    if (app_request(c))
+        return;
     // A request for temporary credentials is signed over its form, which is read before it is judged.
     if (r.method == "POST" && r.bucket.empty())
     {
@@ -363,6 +365,11 @@ void storage_run::route(const std::shared_ptr<conn>& c)
 void storage_run::route_small(const std::shared_ptr<conn>& c)
 {
     s3_request& q = c->req;
+    if (q.app)
+    {
+        app_body(c);
+        return;
+    }
     const bool svc = q.bucket.empty();
     const bool bkt = !svc && q.key.empty();
     const std::string_view m = q.method;

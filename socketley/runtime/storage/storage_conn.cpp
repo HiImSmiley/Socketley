@@ -218,6 +218,7 @@ void s3_request::reset()
     key.clear();
     vhost = false;
     website = false;
+    app = 0;
     headers.clear();
     query.clear();
     request_id.clear();
@@ -282,6 +283,13 @@ void storage_run::on_cqe(struct io_uring_cqe* cqe)
             m_lc->scanned = 0;
             lifecycle_pump();
         }
+        return;
+    }
+    if (req == &m_media_timer.req)
+    {
+        m_media_timer.armed = false;
+        if (!m_stopped)
+            media_tick();
         return;
     }
     if (req == &m_pace_timer.req)
@@ -572,6 +580,7 @@ void storage_run::stop()
     if (m_pace_timer.armed)
         m_loop.submit_timeout_remove(&m_pace_timer.req);
     m_paced.clear();
+    media_stop();
 
     std::vector<std::shared_ptr<conn>> all;
     for (auto& [id, c] : m_conns)
@@ -1452,6 +1461,14 @@ void storage_run::send_response(const std::shared_ptr<conn>& c, response r)
 {
     if (c->dead)
         return;
+    // An application that sent its request down the S3 path answers in its own terms.
+    if (c->on_answer)
+    {
+        auto f = std::move(c->on_answer);
+        c->on_answer = nullptr;
+        f(c, r);
+        return;
+    }
     if (r.status >= 500)
         ++m_c.server_errors;
     else if (r.status >= 400)
@@ -1588,6 +1605,9 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->website_error = {};
     c->website_status = 0;
     c->error_code.clear();
+    c->on_answer = nullptr;
+    c->app_header.clear();
+    c->share_id.clear();
 }
 
 void storage_run::finish_request(const std::shared_ptr<conn>& c)
