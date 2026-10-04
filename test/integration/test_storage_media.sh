@@ -273,13 +273,15 @@ check "the master is asked again, and has an ETag" \
 # The object's file is read directly, not over the listener.
 check "ffmpeg reads an unencrypted object's file" "$( [ "$(stat media_direct)" -gt 0 ] && echo yes)" yes
 
-# An init asked for beside a far segment begins one job, there.
+# An init asked for before a far segment: the job it began at 0 goes, and the one at the far segment stays.
 L4="$U/~media/hls-480/films/long.mp4"
 curl -s -m 60 -u "$A" -o "$T/i4.mp4" "$L4/init.mp4" & ip=$!
 sleep 0.3
 check "a far segment asked beside the init" "$(get "$T/s4.m4s" -u "$A" "$L4/seg00020.m4s")" 200
 wait $ip
-check "begins the one job there, and none at the start" "$(ls "$(mdir hls-480 long.mp4 "$T/long.mp4")/jobs" | grep '\.lock$' | tr '\n' ' ')" "20.lock "
+# The job the init began at 0 is let go by the seek, on whichever shard it runs.
+for _ in $(seq 1 30); do [ "$(ls "$(mdir hls-480 long.mp4 "$T/long.mp4")/jobs" | grep -c '\.lock$')" = 1 ] && break; sleep 0.1; done
+check "leaves the one job there, and none at the start" "$(ls "$(mdir hls-480 long.mp4 "$T/long.mp4")/jobs" | grep '\.lock$' | tr '\n' ' ')" "20.lock "
 cat "$T/i4.mp4" "$T/s4.m4s" > "$T/s4.mp4"
 check "and the init fits it" "$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=start_time -of csv=p=0 "$T/s4.mp4" | secs)" 80
 
