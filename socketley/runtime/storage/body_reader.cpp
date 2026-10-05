@@ -11,6 +11,8 @@ namespace
 {
 
 constexpr uint64_t window_bytes = 1u << 20;
+// A window from elsewhere is half that, under the most of an answer the HTTP client keeps.
+constexpr uint64_t remote_window_bytes = 512u << 10;
 // A window this small is opened where it lands, since the hop to a thread costs more.
 constexpr size_t open_inline_max = 64 * 1024;
 
@@ -29,12 +31,23 @@ std::shared_ptr<body_reader> body_reader::make(file_io& io, hash_pool* pool, std
                                                uint64_t data_off, const object_meta& m, const sse_key* key,
                                                uint64_t first, uint64_t len)
 {
+    // A version moved to a tier has no bytes here, which only the tier's reader brings.
+    if (is_tiered(m))
+        return nullptr;
     std::shared_ptr<body_reader> r(new body_reader);
     // A part list kept after the body is read before the first window, which is the only one that needs it.
     if (key && part_trailer_of(m, r->m_trailer))
         r->m_meta = std::make_unique<object_meta>(m);
     else if (key && !r->m_layout.init(m))
         return nullptr;
+    else if (!key && is_compressed(m))
+    {
+        lz4_record rec;
+        if (!lz4_record_of(m, rec))
+            return nullptr;
+        r->m_squeezed = rec;
+        r->m_meta = std::make_unique<object_meta>(m);
+    }
     r->m_io       = &io;
     r->m_pool     = pool && pool->enabled() ? pool : nullptr;
     r->m_lane     = r->m_pool ? r->m_pool->next_lane() : 0;
@@ -45,6 +58,17 @@ std::shared_ptr<body_reader> body_reader::make(file_io& io, hash_pool* pool, std
         r->m_key = *key;
     r->m_pos = first;
     r->m_end = first + len;
+    return r;
+}
+
+std::shared_ptr<body_reader> body_reader::make_remote(std::shared_ptr<bool> alive, remote_fetch fetch, uint64_t first,
+                                                      uint64_t len)
+{
+    std::shared_ptr<body_reader> r(new body_reader);
+    r->m_alive  = std::move(alive);
+    r->m_remote = std::move(fetch);
+    r->m_pos    = first;
+    r->m_end    = first + len;
     return r;
 }
 
@@ -66,11 +90,51 @@ void body_reader::next(deliver cb)
     }
     if (m_meta)
     {
-        load_list();
+        if (m_squeezed)
+            load_table();
+        else
+            load_list();
         return;
     }
     fetch();
     hand_out();
+}
+
+void body_reader::load_table()
+{
+    if (m_list_reading)
+        return;
+    m_list_reading = true;
+    auto buf  = std::make_shared<std::string>(static_cast<size_t>(m_squeezed->chunks * 4), '\0');
+    auto self = shared_from_this();
+    auto failed = [this]
+    {
+        m_meta.reset();
+        m_list_failed = true;
+        auto cb = std::move(m_waiter);
+        m_waiter = nullptr;
+        if (cb)
+            cb(false, {});
+    };
+    const bool q = m_io->pread(m_fd, buf->data(), static_cast<uint32_t>(buf->size()),
+                               m_data_off + m_squeezed->table_at, [self, buf, failed](int64_t res)
+        {
+            if (!*self->m_alive)
+                return;
+            auto t = std::make_shared<lz4_table>();
+            if (res != static_cast<int64_t>(buf->size()) ||
+                !lz4_table_decode(*buf, *self->m_meta, *self->m_squeezed, *t))
+            {
+                failed();
+                return;
+            }
+            self->m_table = std::move(t);
+            self->m_meta.reset();
+            self->fetch();
+            self->hand_out();
+        });
+    if (!q)
+        failed();
 }
 
 void body_reader::load_list()
@@ -145,6 +209,7 @@ void body_reader::hand_out()
 
 void body_reader::fetch()
 {
+    m_fetching = true;
     while (m_pos < m_end && m_order.size() < 2)
     {
         int i = -1;
@@ -153,13 +218,59 @@ void body_reader::fetch()
                 std::find(m_order.begin(), m_order.end(), k) == m_order.end())
                 i = k;
         if (i < 0)
-            return;
+            break;
         slot& s = m_slots[i];
         if (!s.plain)
             s.plain = std::make_shared<std::string>();
         uint64_t off = 0, want = 0;
+        if (m_remote)
+        {
+            want   = std::min(remote_window_bytes, m_end - m_pos);
+            s.skip = 0;
+            s.len  = static_cast<size_t>(want);
+            s.state = slot_state::busy;
+            m_order.push_back(i);
+            const uint64_t at = m_pos;
+            m_pos += want;
+            m_remote(at, want, [self = shared_from_this(), i, want](bool ok, std::string bytes)
+            {
+                if (!*self->m_alive)
+                    return;
+                slot& sl = self->m_slots[i];
+                if (ok && bytes.size() == want)
+                {
+                    *sl.plain = std::move(bytes);
+                    sl.state  = slot_state::ready;
+                }
+                else
+                    sl.state = slot_state::failed;
+                if (!self->m_fetching)
+                    self->hand_out();
+            });
+            continue;
+        }
         auto chunks = std::make_shared<std::vector<sse_layout::chunk>>();
-        if (!m_key)
+        if (m_table)
+        {
+            // Whole chunks from the one that holds the next byte, as for a sealed body.
+            const uint64_t first = m_pos / lz4_chunk;
+            uint64_t last = first, plain = 0;
+            do
+                plain += m_table->plain_len(last++);
+            while (last < m_table->at.size() - 1 && last * lz4_chunk < m_end && plain < window_bytes);
+            off    = m_data_off + m_table->at[first];
+            want   = m_table->at[last] - m_table->at[first];
+            s.skip = static_cast<size_t>(m_pos - first * lz4_chunk);
+            s.len  = static_cast<size_t>(std::min(first * lz4_chunk + plain, m_end) - m_pos);
+            s.first_chunk = first;
+            s.chunk_count = last - first;
+            if (!s.cipher)
+                s.cipher = std::make_shared<std::string>();
+            s.cipher->resize(static_cast<size_t>(want));
+            s.plain->resize(static_cast<size_t>(plain));
+            m_pos = std::min(first * lz4_chunk + plain, m_end);
+        }
+        else if (!m_key)
         {
             want = std::min(window_bytes, m_end - m_pos);
             off  = m_data_off + m_pos;
@@ -194,7 +305,7 @@ void body_reader::fetch()
         }
         s.state = slot_state::busy;
         m_order.push_back(i);
-        char* into = m_key ? s.cipher->data() : s.plain->data();
+        char* into = m_key || m_table ? s.cipher->data() : s.plain->data();
         auto self = shared_from_this();
         const bool q = m_io->pread(m_fd, into, static_cast<uint32_t>(want), off,
             [self, i, want, chunks](int64_t res)
@@ -209,6 +320,7 @@ void body_reader::fetch()
             m_pos   = m_end;
         }
     }
+    m_fetching = false;
 }
 
 void body_reader::read_done(int index, int64_t res, uint64_t want, std::shared_ptr<std::vector<sse_layout::chunk>> chunks)
@@ -220,17 +332,24 @@ void body_reader::read_done(int index, int64_t res, uint64_t want, std::shared_p
         hand_out();
         return;
     }
-    if (!m_key)
+    if (!m_key && !m_table)
     {
         s.state = slot_state::ready;
         hand_out();
         return;
     }
     auto ok = std::make_shared<bool>(false);
-    auto work = [key = *m_key, version = m_layout.version(), chunks, cipher = s.cipher, plain = s.plain, ok]
-    {
-        *ok = sse_open(key, version, chunks->data(), chunks->size(), cipher->data(), plain->data());
-    };
+    std::function<void()> work;
+    if (m_table)
+        work = [table = m_table, first = s.first_chunk, n = s.chunk_count, cipher = s.cipher, plain = s.plain, ok]
+        {
+            *ok = lz4_open_chunks(*table, first, n, cipher->data(), plain->data());
+        };
+    else
+        work = [key = *m_key, version = m_layout.version(), chunks, cipher = s.cipher, plain = s.plain, ok]
+        {
+            *ok = sse_open(key, version, chunks->data(), chunks->size(), cipher->data(), plain->data());
+        };
     if (m_pool && want > open_inline_max)
     {
         m_pool->submit(m_lane, std::move(work), [self = shared_from_this(), index, ok]

@@ -80,7 +80,7 @@ void storage_run::op_website(const std::shared_ptr<conn>& c)
         website_error_page(c, make_error("NoSuchWebsiteConfiguration"));
         return;
     }
-    const std::string_view scheme = c->ssl ? "https" : "http";
+    const std::string_view scheme = secure(*c) ? "https" : "http";
     if (!cfg->redirect_all_host.empty())
     {
         website_redirect all;
@@ -120,7 +120,7 @@ bool storage_run::website_readable(const std::shared_ptr<conn>& c)
     rv.headers  = &no_headers;
     rv.bucket   = r.bucket;
     rv.key      = r.key;
-    rv.tls      = c->ssl != nullptr;
+    rv.tls      = secure(*c);
     auth_verdict v = m_auth->authorize(rv);
     if ((v.allowed || v.anonymous) && needs_judging(nullptr))
         apply_policy(c, rv, v);
@@ -156,7 +156,7 @@ void storage_run::website_failure(const std::shared_ptr<conn>& c, const s3_error
         {
             website_redirect_to(cc, rule->redirect.code,
                                 website_location(rule->redirect, rule->key_prefix.value_or(std::string{}),
-                                                 cc->website_key, cc->ssl ? "https" : "http", q.host));
+                                                 cc->website_key, secure(*cc) ? "https" : "http", q.host));
             return;
         }
         if (conf->error_key.empty())

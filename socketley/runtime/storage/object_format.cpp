@@ -7,6 +7,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "compression.h"
 #include "../../shared/raft_storage.h"
 
 namespace socketley::storage
@@ -121,20 +122,18 @@ bool parse_checksum(checksum_algo a, std::string_view v, object_checksum& out)
     const size_t chars = checksum_b64_len(a);
     if (width == 0 || v.size() < chars)
         return false;
-    object_checksum c;
-    c.algo = a;
+    uint16_t composite = 0;
     if (const std::string_view n = v.substr(chars); !n.empty())
     {
         uint64_t parts = 0;
         if (n.size() < 2 || n[0] != '-' || n[1] == '0' || !decimal(n.substr(1), parts) || parts > UINT16_MAX)
             return false;
-        c.composite = static_cast<uint16_t>(parts);
+        composite = static_cast<uint16_t>(parts);
     }
     std::string raw;
     if (!base64_decode(v.substr(0, chars), raw) || raw.size() != width || base64_encode(raw) != v.substr(0, chars))
         return false;
-    std::memcpy(c.raw.data(), raw.data(), width);
-    out = c;
+    out.set(a, raw, composite);
     return true;
 }
 
@@ -184,39 +183,53 @@ constexpr size_t shared_type_len = 128;
 
 content_type_ref& content_type_ref::operator=(std::string_view v)
 {
-    using pool_t = std::unordered_map<std::string_view, std::shared_ptr<const std::string>>;
+    using pool_t = std::unordered_map<std::string_view, const std::string*>;
     // Leaked on purpose, so an assignment made while statics are torn down never meets a destroyed pool.
     static std::mutex& mu   = *new std::mutex;
     static pool_t&     pool = *new pool_t;
+    release();
     if (v.empty())
-    {
-        m_v.reset();
         return *this;
-    }
     if (v.size() <= shared_type_len)
     {
         std::lock_guard<std::mutex> g(mu);
         if (const auto it = pool.find(v); it != pool.end())
         {
-            m_v = it->second;
+            m_p = reinterpret_cast<uintptr_t>(it->second);
             return *this;
         }
         if (pool.size() < shared_types)
         {
-            auto s = std::make_shared<const std::string>(v);
+            const std::string* s = new std::string(v);
             pool.emplace(*s, s);
-            m_v = std::move(s);
+            m_p = reinterpret_cast<uintptr_t>(s);
             return *this;
         }
     }
-    m_v = std::make_shared<const std::string>(v);
+    m_p = reinterpret_cast<uintptr_t>(new std::string(v)) | 1;
     return *this;
 }
 
 const std::string& content_type_ref::str() const
 {
     static const std::string none;
-    return m_v ? *m_v : none;
+    return m_p ? *ptr() : none;
+}
+
+void object_checksum::set(checksum_algo a, std::string_view raw, uint16_t composite_count)
+{
+    // The bytes may be this checksum's own, so they are kept before its storage is let go.
+    uint8_t keep[32]{};
+    std::memcpy(keep, raw.data(), std::min(raw.size(), sizeof keep));
+    release();
+    algo      = a;
+    composite = composite_count;
+    uint8_t* to = m_small;
+    if (big())
+        to = m_big = new uint8_t[32]{};
+    else
+        std::memset(m_small, 0, sizeof m_small);
+    std::memcpy(to, keep, std::min<size_t>(checksum_raw_len(a), sizeof keep));
 }
 
 std::string object_checksum::b64() const
@@ -240,9 +253,39 @@ std::string_view tags_of(const object_meta& m)
 void set_tags_extra(object_meta& m, std::string_view tags)
 {
     std::string kept(tags);
-    std::erase_if(m.extra, [](const auto& e) { return e.first == tags_extra; });
+    erase_if(m.extra, [](const auto& e) { return e.first == tags_extra; });
     if (!kept.empty())
         m.extra.emplace_back(std::string(tags_extra), std::move(kept));
+}
+
+bool tier_of(const object_meta& m, tier_record& out)
+{
+    for (const auto& [n, v] : m.extra)
+        if (n == tier_extra)
+        {
+            const size_t semi = v.find(';');
+            if (semi == std::string::npos || semi == 0 || semi + 1 == v.size())
+                return false;
+            out.tier       = v.substr(0, semi);
+            out.remote_key = v.substr(semi + 1);
+            return true;
+        }
+    return false;
+}
+
+void set_tier_record(object_meta& m, const tier_record* r)
+{
+    erase_if(m.extra, [](const auto& e) { return e.first == tier_extra; });
+    if (r)
+        m.extra.emplace_back(std::string(tier_extra), r->tier + ";" + r->remote_key);
+}
+
+std::string_view storage_class_of(const object_meta& m)
+{
+    for (const auto& [n, v] : m.extra)
+        if (n == tier_extra)
+            return std::string_view(v).substr(0, v.find(';'));
+    return "STANDARD";
 }
 
 void encode_meta(std::string& out, std::string_view key, const object_meta& m)
@@ -414,7 +457,7 @@ void set_version_extra(object_meta& m, const version_tag& v)
 
 void clear_version_extra(object_meta& m)
 {
-    std::erase_if(m.extra, [](const auto& e) { return e.first == version_extra; });
+    erase_if(m.extra, [](const auto& e) { return e.first == version_extra; });
 }
 
 std::string cluster_stamp_text(const cluster_stamp& s)
@@ -467,7 +510,7 @@ void set_cluster_extra(object_meta& m, const cluster_stamp& s)
 
 void clear_cluster_extra(object_meta& m)
 {
-    std::erase_if(m.extra, [](const auto& e) { return e.first == cluster_extra; });
+    erase_if(m.extra, [](const auto& e) { return e.first == cluster_extra; });
 }
 
 std::string retention_value(const retention& r)
@@ -502,7 +545,7 @@ retention retention_of(const object_meta& m)
 
 void set_retention_extra(object_meta& m, const retention& r)
 {
-    std::erase_if(m.extra, [](const auto& e) { return e.first == retention_extra; });
+    erase_if(m.extra, [](const auto& e) { return e.first == retention_extra; });
     if (r.mode != lock_mode::none)
         m.extra.emplace_back(std::string(retention_extra), retention_value(r));
 }
@@ -518,7 +561,7 @@ std::string_view legal_hold_of(const object_meta& m)
 void set_legal_hold_extra(object_meta& m, std::string_view status)
 {
     std::string kept(status);
-    std::erase_if(m.extra, [](const auto& e) { return e.first == legal_hold_extra; });
+    erase_if(m.extra, [](const auto& e) { return e.first == legal_hold_extra; });
     if (!kept.empty())
         m.extra.emplace_back(std::string(legal_hold_extra), std::move(kept));
 }
@@ -534,7 +577,7 @@ std::string_view replication_status_of(const object_meta& m)
 void set_replication_status(object_meta& m, std::string_view status)
 {
     std::string kept(status);
-    std::erase_if(m.extra, [](const auto& e) { return e.first == replication_status_extra; });
+    erase_if(m.extra, [](const auto& e) { return e.first == replication_status_extra; });
     if (!kept.empty())
         m.extra.emplace_back(std::string(replication_status_extra), std::move(kept));
 }
@@ -549,7 +592,7 @@ bool has_lock_extra(const object_meta& m)
 
 void clear_lock_extras(object_meta& m)
 {
-    std::erase_if(m.extra, [](const auto& e) { return e.first == retention_extra || e.first == legal_hold_extra; });
+    erase_if(m.extra, [](const auto& e) { return e.first == retention_extra || e.first == legal_hold_extra; });
 }
 
 bool lock_holds(const object_meta& m, int64_t now_ms, bool bypass)
@@ -774,17 +817,18 @@ bool part_list_of(const object_meta& m, part_list& out)
 
 void clear_part_layout(object_meta& m)
 {
-    std::erase_if(m.extra, [](const auto& e)
+    erase_if(m.extra, [](const auto& e)
                   {
                       return e.first == part_sizes_extra || e.first == part_numbers_extra ||
                              e.first == part_checksums_extra || e.first == part_layout_extra ||
-                             e.first == sse_parts_extra || e.first == upload_id_extra;
+                             e.first == sse_parts_extra || e.first == upload_id_extra || e.first == lz4_extra ||
+                             e.first == tier_extra;
                   });
 }
 
 bool copy_checksum(object_meta& copy, const object_meta& src, checksum_algo algo)
 {
-    std::erase_if(copy.extra, [](const auto& e) { return is_checksum_header(e.first); });
+    erase_if(copy.extra, [](const auto& e) { return is_checksum_header(e.first); });
     copy.checksum = {};
     if (algo == checksum_algo::none)
         return false;
@@ -799,9 +843,7 @@ bool copy_checksum(object_meta& copy, const object_meta& src, checksum_algo algo
 
 void set_checksum(object_meta& m, checksum_algo algo, std::string_view raw)
 {
-    m.checksum      = {};
-    m.checksum.algo = algo;
-    std::memcpy(m.checksum.raw.data(), raw.data(), std::min(raw.size(), m.checksum.raw.size()));
+    m.checksum.set(algo, raw);
 }
 
 void set_checksum_b64(object_meta& m, checksum_algo algo, std::string b64)
@@ -819,9 +861,7 @@ size_t checksum_meta_bytes(const object_meta& m)
 
 void reserve_checksum(object_meta& m, checksum_algo algo, uint16_t composite)
 {
-    m.checksum           = {};
-    m.checksum.algo      = algo;
-    m.checksum.composite = composite;
+    m.checksum.set(algo, {}, composite);
 }
 
 bool part_trailer_of(const object_meta& m, part_trailer& out)
@@ -1089,7 +1129,7 @@ decoded_header decode_object_header(std::string_view bytes)
     const std::string_view ret  = r.str();
     const std::string_view hold = r.str();
     set_tags_extra(d.meta, t);
-    std::erase_if(d.meta.extra, [](const auto& e) { return e.first == retention_extra; });
+    erase_if(d.meta.extra, [](const auto& e) { return e.first == retention_extra; });
     if (!ret.empty())
         d.meta.extra.emplace_back(std::string(retention_extra), std::string(ret));
     set_legal_hold_extra(d.meta, hold);

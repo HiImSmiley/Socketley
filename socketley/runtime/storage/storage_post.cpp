@@ -128,7 +128,7 @@ void storage_run::post_form_ready(const std::shared_ptr<conn>& c)
         rv.host     = r.host;
         rv.headers  = &r.headers;
         rv.bucket   = r.bucket;
-        rv.tls      = c->ssl != nullptr;
+        rv.tls      = secure(*c);
         v = m_auth->authorize(rv);
     }
     request_view rv;
@@ -136,7 +136,7 @@ void storage_run::post_form_ready(const std::shared_ptr<conn>& c)
     rv.headers = &r.headers;
     rv.bucket  = r.bucket;
     rv.key     = r.key;
-    rv.tls     = c->ssl != nullptr;
+    rv.tls     = secure(*c);
     if ((v.allowed || v.anonymous) && needs_judging(v.anonymous ? nullptr : v.user.get()))
         apply_policy(c, rv, v);
     if (!v.allowed)
@@ -183,7 +183,7 @@ void storage_run::send_post_result(const std::shared_ptr<conn>& c, const object_
     const s3_request& r = c->req;
     const post_form& f = *r.form;
     const std::string etag = "\"" + m.etag() + "\"";
-    const std::string location = object_url(c->ssl != nullptr, r.host, r.vhost, r.bucket, r.key);
+    const std::string location = object_url(secure(*c), r.host, r.vhost, r.bucket, r.key);
     response resp;
     resp.headers.emplace_back("ETag", etag);
     if (has_version(m))

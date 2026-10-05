@@ -3561,7 +3561,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                 if (pa.hashes[i] == h) { is_cache_flag = true; break; }
 
             if (type == runtime_storage &&
-                (pa.hashes[i] == fnv1a("--dir") || pa.hashes[i] == fnv1a("--anonymous") ||
+                (pa.hashes[i] == fnv1a("--dir") || pa.hashes[i] == fnv1a("--anonymous") || pa.hashes[i] == fnv1a("--acls") ||
                  pa.hashes[i] == fnv1a("--max-bytes") || pa.hashes[i] == fnv1a("--access-key") ||
                  pa.hashes[i] == fnv1a("--secret-key") || pa.hashes[i] == fnv1a("--credentials") ||
                  pa.hashes[i] == fnv1a("--mpu-expire") || pa.hashes[i] == fnv1a("--sse-key-file") ||
@@ -3569,6 +3569,8 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                  pa.hashes[i] == fnv1a("--website-domain") ||
                  pa.hashes[i] == fnv1a("--replication-targets") || pa.hashes[i] == fnv1a("--fsync") ||
                  pa.hashes[i] == fnv1a("--nodes") || pa.hashes[i] == fnv1a("--scrub") ||
+                 pa.hashes[i] == fnv1a("--compress") || pa.hashes[i] == fnv1a("--tiers") ||
+                 pa.hashes[i] == fnv1a("--federation") || pa.hashes[i] == fnv1a("--tls-offloaded") ||
                  pa.hashes[i] == fnv1a("--fsync-interval")))
             {
                 restore_edit();
@@ -4076,6 +4078,21 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                 cfg.storage_replication_targets != std::string(stg->get_replication_targets()))
             {
                 conn->write_buf = "cannot change the replication targets file while running; stop, import, and start\n";
+                return 1;
+            }
+            if (cfg.has("tls_offloaded") && cfg.storage_tls_offloaded != std::string(stg->get_tls_offloaded()))
+            {
+                conn->write_buf = "cannot change --tls-offloaded while running; stop, import, and start\n";
+                return 1;
+            }
+            if (cfg.has("federation") && cfg.storage_federation != std::string(stg->get_federation_file()))
+            {
+                conn->write_buf = "cannot change the federation file while running; stop, import, and start\n";
+                return 1;
+            }
+            if (cfg.has("tiers") && cfg.storage_tiers != std::string(stg->get_tiers_file()))
+            {
+                conn->write_buf = "cannot change the tiers file while running; stop, import, and start\n";
                 return 1;
             }
             if (cfg.has("nodes") && cfg.storage_nodes != std::string(stg->get_nodes_file()))

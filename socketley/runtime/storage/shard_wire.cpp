@@ -859,6 +859,7 @@ std::string encode_parts_page(const parts_page& pg)
         w.u64(p.size);
         w.bytes(p.checksum_b64);
     }
+    w.bytes(pg.owner);
     return w.take();
 }
 
@@ -884,7 +885,7 @@ bool decode_parts_page(std::string_view reply, parts_page& pg)
         p.algo     = pg.algo;
         pg.rows.push_back(std::move(p));
     }
-    return true;
+    return r.bytes(pg.owner, name_cap);
 }
 
 std::string encode_upload_list(const std::vector<upload_stub>& uploads)

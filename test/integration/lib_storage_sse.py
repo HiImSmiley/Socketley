@@ -779,7 +779,8 @@ def mode_tls(port, cert, data):
     code = err_code(lambda: s3.upload_part(Bucket=B, Key="cmp", UploadId=uid, PartNumber=1, Body=p[0]))
     check("a part of it without the key is refused", code is not None and code[0] == 400, code)
     code = err_code(lambda: s3.upload_part(Bucket=B, Key="cmp", UploadId=uid, PartNumber=1, Body=p[0], **wrong))
-    check("a part of it with another key is refused", code is not None and code[0] == 403, code)
+    check("a part of it with another key is refused as a bad argument, as S3 refuses it",
+          code == (400, "InvalidArgument"), code)
     parts = []
     for i, part in enumerate(p, 1):
         r = s3.upload_part(Bucket=B, Key="cmp", UploadId=uid, PartNumber=i, Body=part, **ka)

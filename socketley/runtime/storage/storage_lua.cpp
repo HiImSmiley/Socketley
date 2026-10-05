@@ -143,6 +143,8 @@ std::string_view storage_run::operation_name(const s3_request& r)
             return "CreateMultipartUpload";
         if (upload)
             return "CompleteMultipartUpload";
+        if (r.has_query("select"))
+            return "SelectObjectContent";
     }
     return "Unknown";
 }
@@ -255,7 +257,7 @@ void storage_run::hook_request(const std::shared_ptr<conn>& c)
     req["host"]        = r.host;
     req["request_id"]  = r.request_id;
     req["principal"]   = c->principal;
-    req["tls"]         = c->ssl != nullptr;
+    req["tls"]         = secure(*c);
     if (c->peer.empty())
         c->peer = peer_of(c->fd);
     req["client"]      = c->peer;

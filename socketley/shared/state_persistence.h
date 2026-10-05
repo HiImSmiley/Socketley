@@ -155,6 +155,7 @@ struct runtime_config
     // Storage
     std::string storage_dir;
     bool storage_anonymous = false;
+    bool storage_acls = false;
     uint64_t storage_max_bytes = 0;
     std::string storage_access_key;
     std::string storage_secret_key;
@@ -164,11 +165,15 @@ struct runtime_config
     std::string storage_website_domain;
     std::string storage_notify_targets;
     std::string storage_replication_targets;
+    std::string storage_tiers;
+    std::string storage_federation;
+    std::string storage_tls_offloaded;
     std::string storage_nodes;
     std::string storage_fsync;
     uint32_t storage_fsync_interval_secs = 0;
     uint32_t storage_mpu_expire_secs = 0;
     uint32_t storage_scrub_secs = 0;
+    uint32_t storage_compress_secs = 0;
 
     // A registered type's own fields in declaration order, opaque here, held
     // as strings because the schema that gives them kinds lives in a manifest.

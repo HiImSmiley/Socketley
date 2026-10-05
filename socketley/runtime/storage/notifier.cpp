@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cstdlib>
 
+#include "../../runtime/cache/stream_log.h"
 #include "../../shared/byte_codec.h"
+#include "../../shared/route_relay.h"
+#include "../../shared/runtime_manager.h"
 #include "../../shared/logging.h"
 
 namespace socketley::storage
@@ -37,7 +40,32 @@ bool parse_notify_targets(std::string_view text, std::vector<notify_target>& out
             why = where + "a target's name is letters, digits, '-', '_' and '.'";
             return false;
         }
-        if (std::string err; !parse_http_url(fields[1], t.http, err))
+        // Another runtime of the daemon: a cache's stream or channel, or a server's clients.
+        const std::string_view url = fields[1];
+        if (url.starts_with("cache://") || url.starts_with("server://"))
+        {
+            const bool cache = url.starts_with("cache://");
+            std::string_view rest = url.substr(cache ? 8 : 9);
+            const size_t slash = rest.find('/');
+            t.runtime = std::string(rest.substr(0, slash));
+            rest = slash == std::string_view::npos ? std::string_view{} : rest.substr(slash + 1);
+            if (cache && rest.starts_with("stream/"))
+                t.k = notify_target::kind::cache_stream;
+            else if (cache && rest.starts_with("channel/"))
+                t.k = notify_target::kind::cache_channel;
+            else if (!cache && rest.empty())
+                t.k = notify_target::kind::server;
+            if (cache)
+                t.topic = std::string(rest.substr(rest.find('/') + 1));
+            if (t.k == notify_target::kind::webhook || t.runtime.empty() || fields.size() == 3 ||
+                (cache && (t.topic.empty() || t.topic.find_first_of(" \t") != std::string::npos)))
+            {
+                why = where + "a runtime target is cache://<runtime>/stream/<key>, cache://<runtime>/channel/<channel> "
+                              "or server://<runtime>";
+                return false;
+            }
+        }
+        else if (std::string err; !parse_http_url(fields[1], t.http, err))
         {
             why = where + err;
             return false;
@@ -90,6 +118,8 @@ notifier::notifier(event_loop& loop, file_io& io, io_handler* owner)
 notifier::~notifier()
 {
     *m_alive = false;
+    if (m_channel)
+        m_channel->drop_origin(this);
 }
 
 void notifier::set_targets(std::vector<notify_target> targets)
@@ -99,7 +129,7 @@ void notifier::set_targets(std::vector<notify_target> targets)
     for (notify_target& t : targets)
     {
         http_endpoint e;
-        names = names || !literal_endpoint(t.http.host, t.http.port, e);
+        names = names || (t.k == notify_target::kind::webhook && !literal_endpoint(t.http.host, t.http.port, e));
     }
     if (names && !m_resolver.attach(m_io))
         LOG_ERROR("storage: the notification resolver cannot be waited for, so webhooks named by a host are not delivered to");
@@ -107,12 +137,36 @@ void notifier::set_targets(std::vector<notify_target> targets)
     {
         auto l  = std::make_unique<lane>();
         l->name = t.name;
-        l->peer = std::make_unique<http_peer>(m_loop, m_io, m_resolver, std::move(t.http), m_hosts_file,
-                                              "the notification target " + t.name);
-        // Every name is asked for now, so the first event does not wait for its answer.
-        l->peer->prime();
+        if (t.k == notify_target::kind::webhook)
+        {
+            l->peer = std::make_unique<http_peer>(m_loop, m_io, m_resolver, t.http, m_hosts_file,
+                                                  "the notification target " + t.name);
+            // Every name is asked for now, so the first event does not wait for its answer.
+            l->peer->prime();
+        }
+        l->target = std::move(t);
         m_lanes.push_back(std::move(l));
     }
+}
+
+void notifier::set_runtimes(runtime_manager* mgr, std::string self)
+{
+    m_mgr     = mgr;
+    m_channel = mgr ? &mgr->requests() : nullptr;
+    m_self    = std::move(self);
+}
+
+void notifier::on_request_reply(uint64_t cookie, request_status st, std::string_view reply)
+{
+    const auto it = m_asked.find(cookie);
+    if (it == m_asked.end())
+        return;
+    lane* l = it->second;
+    m_asked.erase(it);
+    // A cache answers a command it refused with a line that says so.
+    const bool taken = st == request_status::ok && !reply.starts_with("error") && !reply.starts_with("failed") &&
+                       !reply.starts_with("denied") && !reply.starts_with("-");
+    finish(*l, taken);
 }
 
 bool notifier::has_target(std::string_view name) const
@@ -135,7 +189,7 @@ uint64_t notifier::resolves() const
 {
     uint64_t n = 0;
     for (const auto& l : m_lanes)
-        n += l->peer->resolves();
+        n += l->peer ? l->peer->resolves() : 0;
     return n;
 }
 
@@ -143,7 +197,7 @@ uint64_t notifier::connects() const
 {
     uint64_t n = 0;
     for (const auto& l : m_lanes)
-        n += l->peer->connects();
+        n += l->peer ? l->peer->connects() : 0;
     return n;
 }
 
@@ -151,7 +205,7 @@ uint64_t notifier::reuses() const
 {
     uint64_t n = 0;
     for (const auto& l : m_lanes)
-        n += l->peer->reuses();
+        n += l->peer ? l->peer->reuses() : 0;
     return n;
 }
 
@@ -288,7 +342,8 @@ void notifier::on_timer()
     for (auto& lp : m_lanes)
     {
         lane& l = *lp;
-        l.peer->tick(now);
+        if (l.peer)
+            l.peer->tick(now);
         if (!l.busy && !l.q.empty() && now >= l.next_try)
             start(l);
         waiting = waiting || l.busy || !l.q.empty();
@@ -307,6 +362,11 @@ void notifier::start(lane& l)
         return;
     }
     const pending& ev = l.q.front();
+    if (!l.peer)
+    {
+        start_runtime(l, ev);
+        return;
+    }
     const http_target& t = l.peer->target();
     http_request rq;
     rq.head = "POST " + t.path + " HTTP/1.1\r\nHost: " + t.authority() +
@@ -326,23 +386,68 @@ void notifier::start(lane& l)
     });
 }
 
-void notifier::finish(lane& l, bool delivered)
+void notifier::start_runtime(lane& l, const pending& ev)
+{
+    const notify_target& t = l.target;
+    // A server is handed each event for its clients and answers nothing, so handing it over is the delivery, made for
+    // the whole queue in one turn rather than one call inside the last.
+    if (t.k == notify_target::kind::server)
+    {
+        while (!l.q.empty() && !m_stopped)
+        {
+            if (!m_mgr || !route_relay::broadcast(m_mgr, t.runtime, m_self, l.q.front().json))
+            {
+                back_off(l);
+                return;
+            }
+            delivered(l);
+        }
+        return;
+    }
+    l.busy = true;
+    arm_timer();
+    // A cache takes one command in its text protocol; a stream's entry goes in its exact bytes, since its words are
+    // split on spaces.
+    std::string cmd = "\x01skl-one\n";
+    if (t.k == notify_target::kind::cache_channel)
+        cmd += "publish " + t.topic + " " + ev.json;
+    else
+    {
+        const std::string_view args[] = {"xadd", t.topic, "*", "event", ev.json};
+        cmd += "xapply " + t.topic + " ";
+        stream_args_encode(cmd, args, std::size(args));
+    }
+    const uint64_t cookie = ++m_next_cookie;
+    m_asked.emplace(cookie, &l);
+    if (!m_channel || !m_channel->post(this, cookie, t.runtime, cmd, request_class::client))
+    {
+        m_asked.erase(cookie);
+        finish(l, false);
+    }
+}
+
+void notifier::finish(lane& l, bool ok)
 {
     l.busy = false;
     if (m_stopped)
         return;
-    if (delivered)
+    if (ok)
     {
-        ++m_c.sent;
-        m_box.done(l.q.front().id);
-        l.q.pop_front();
-        --m_queued;
-        l.failures = 0;
-        l.next_try = {};
+        delivered(l);
         start(l);
         return;
     }
     back_off(l);
+}
+
+void notifier::delivered(lane& l)
+{
+    ++m_c.sent;
+    m_box.done(l.q.front().id);
+    l.q.pop_front();
+    --m_queued;
+    l.failures = 0;
+    l.next_try = {};
 }
 
 void notifier::back_off(lane& l)
@@ -359,8 +464,13 @@ void notifier::stop()
     if (m_stopped)
         return;
     m_stopped = true;
+    if (m_channel)
+        m_channel->drop_origin(this);
+    m_channel = nullptr;
+    m_asked.clear();
     for (auto& l : m_lanes)
-        l->peer->stop();
+        if (l->peer)
+            l->peer->stop();
     if (m_timer_armed)
         m_loop.submit_timeout_remove(&m_timer_req);
     // A resolve in progress is waited out here, which the system resolver's own timeout bounds.

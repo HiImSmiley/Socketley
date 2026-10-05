@@ -3,6 +3,7 @@
 // of the log objects' keys, and whether those keys are partitioned by date.
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "s3_xml.h"
 
@@ -15,6 +16,15 @@ struct logging_config
     std::string target_prefix;
     // [prefix][owner]/[region]/[bucket]/[YYYY]/[MM]/[DD]/ in front of each object's name, rather than the prefix alone.
     bool        partitioned{false};
+    // What TargetGrants give each log object beside its owner's full control: a grantee as a grant header names one
+    // (id, uri or emailaddress, and its value) and a permission.
+    struct grant
+    {
+        std::string kind;
+        std::string value;
+        std::string permission;
+    };
+    std::vector<grant> grants;
 };
 
 // The document PutBucketLogging takes; false with `err` for anything S3 would refuse, and true with an empty

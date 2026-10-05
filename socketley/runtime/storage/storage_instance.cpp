@@ -114,7 +114,37 @@ std::string storage_instance::config_refusal() const
         if (std::string why; !socketley::storage::load_replication_targets(m_replication_targets, targets, why))
             return "storage: " + why + "\n";
     }
+    if (!m_tiers_file.empty())
+    {
+        std::vector<socketley::storage::replication_target> tiers;
+        if (std::string why; !socketley::storage::load_replication_targets(m_tiers_file, tiers, why))
+            return "storage: " + why + "\n";
+    }
+    if (!m_federation_file.empty())
+    {
+        socketley::storage::federation_config fed;
+        if (std::string why; !socketley::storage::load_federation(m_federation_file, fed, why))
+            return "storage: " + why + "\n";
+    }
+    if (std::vector<socketley::storage::bucket_policy::cidr> from; !tls_offloaded_blocks(from))
+        return "storage: --tls-offloaded takes addresses or blocks such as 10.0.0.5 or 10.0.0.0/24, comma-separated\n";
     return {};
+}
+
+bool storage_instance::tls_offloaded_blocks(std::vector<socketley::storage::bucket_policy::cidr>& out) const
+{
+    std::string_view rest = m_tls_offloaded;
+    while (!rest.empty())
+    {
+        const size_t comma = rest.find(',');
+        const std::string_view one = rest.substr(0, comma);
+        rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+        socketley::storage::bucket_policy::cidr c;
+        if (!socketley::storage::parse_cidr_text(one, c))
+            return false;
+        out.push_back(c);
+    }
+    return true;
 }
 
 void storage_instance::serve_request(std::string_view, std::string& out)
@@ -154,6 +184,7 @@ void storage_instance::refresh_cached_limits()
         m_run->store().set_max_bytes(m_max_bytes);
         m_run->set_mpu_expire_secs(m_mpu_expire_secs);
         m_run->set_scrub_secs(m_scrub_secs);
+        m_run->set_compress_secs(m_compress_secs);
     }
 }
 
@@ -272,6 +303,8 @@ bool storage_instance::setup(event_loop& loop)
         run->adopt_authenticator(std::move(signed_auth));
     run->set_mpu_expire_secs(m_mpu_expire_secs);
     run->set_scrub_secs(m_scrub_secs);
+    run->set_compress_secs(m_compress_secs);
+    run->set_acls_default(m_acls);
     run->set_tls(std::move(tls));
     if (std::vector<std::string> d; !m_domain.empty())
     {
@@ -324,6 +357,7 @@ bool storage_instance::setup(event_loop& loop)
             return false;
         }
         run->notifications().set_targets(std::move(targets));
+        run->notifications().set_runtimes(get_runtime_manager(), std::string(get_name()));
     }
     if (!m_replication_targets.empty())
     {
@@ -338,6 +372,34 @@ bool storage_instance::setup(event_loop& loop)
         }
         run->replication().set_targets(std::move(targets));
     }
+    if (!m_tiers_file.empty())
+    {
+        std::vector<socketley::storage::replication_target> tiers;
+        std::string why;
+        if (!socketley::storage::load_replication_targets(m_tiers_file, tiers, why))
+        {
+            LOG_ERROR(("storage: " + why).c_str());
+            run->stop();
+            m_graveyard.push_back(std::move(run));
+            return false;
+        }
+        run->set_tiers(std::move(tiers));
+    }
+    if (!m_federation_file.empty())
+    {
+        socketley::storage::federation_config fed;
+        std::string why;
+        if (!socketley::storage::load_federation(m_federation_file, fed, why))
+        {
+            LOG_ERROR(("storage: " + why).c_str());
+            run->stop();
+            m_graveyard.push_back(std::move(run));
+            return false;
+        }
+        run->set_federation(std::move(fed));
+    }
+    if (std::vector<socketley::storage::bucket_policy::cidr> from; tls_offloaded_blocks(from))
+        run->set_tls_offloaded(std::move(from));
     if (!m_cluster_file.empty())
         run->set_cluster(std::move(cluster));
 
@@ -470,6 +532,8 @@ std::string storage_instance::stats_lines() const
         << "puts:" << c.puts << "\n"
         << "deletes:" << c.deletes << "\n"
         << "copies:" << c.copies << "\n"
+        << "selects:" << c.selects << "\n"
+        << "select_scanned:" << c.select_scanned << "\n"
         << "lists:" << c.lists << "\n"
         << "client_errors:" << c.client_errors << "\n"
         << "server_errors:" << c.server_errors << "\n"
@@ -509,6 +573,7 @@ std::string storage_instance::stats_lines() const
         << "sse:" << (m_run->has_sse_master() ? 1 : 0) << "\n"
         << "sse_puts:" << c.sse_puts << "\n"
         << "sse_gets:" << c.sse_gets << "\n"
+        << "compressed_gets:" << c.compressed_gets << "\n"
         << "media_made:" << c.media_made << "\n"
         << "media_failed:" << c.media_failed << "\n"
         << "media_served:" << c.media_served << "\n"
@@ -545,6 +610,20 @@ std::string storage_instance::stats_lines() const
         << "scrub_last_pass_ms:" << m_run->scrub().counters().last_pass_ms << "\n"
         << "scrub_heals:" << m_run->counters().scrub_heals << "\n"
         << "scrub_unhealed:" << m_run->counters().scrub_unhealed << "\n"
+        << "compressed_objects:" << m_run->compaction().counters().objects << "\n"
+        << "compressed_skipped:" << m_run->compaction().counters().skipped << "\n"
+        << "compressed_failed:" << m_run->compaction().counters().failed << "\n"
+        << "compressed_bytes_in:" << m_run->compaction().counters().bytes_in << "\n"
+        << "compressed_bytes_out:" << m_run->compaction().counters().bytes_out << "\n"
+        << "compressed_passes:" << m_run->compaction().counters().passes << "\n"
+        << "tier_moved:" << m_run->tiers().counters().moved << "\n"
+        << "tier_moved_bytes:" << m_run->tiers().counters().bytes << "\n"
+        << "tier_failed:" << m_run->tiers().counters().failed << "\n"
+        << "tier_moving:" << m_run->tiers().moving() << "\n"
+        << "tier_reads:" << m_run->tiers().counters().reads << "\n"
+        << "tier_read_failures:" << m_run->tiers().counters().read_failures << "\n"
+        << "tier_swept:" << m_run->tiers().counters().swept << "\n"
+        << "tier_gets:" << c.tier_gets << "\n"
         << "replication_bytes:" << m_run->replication().counters().bytes << "\n";
     // One line per code answered, so a client's mistakes and the runtime's own
     // are told apart without reading a log.

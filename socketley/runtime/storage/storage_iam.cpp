@@ -1,5 +1,6 @@
-// IAM over the S3 endpoint: an admin's requests change the users, keys, groups and roles kept in the IAM file,
-// one change at a time under the file's lock, which every shard's authenticator then reads.
+// IAM over the S3 endpoint: an admin's requests, and another user's its own policies allow, change the users, keys,
+// groups and roles kept in the IAM file, one change at a time under the file's lock, which every shard's
+// authenticator then reads.
 #include "storage_run.h"
 
 #include <fcntl.h>
@@ -144,16 +145,29 @@ void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::
         fail(400, "InvalidAction", "This runtime has no IAM: it was started without credentials.");
         return;
     }
-    // IAM is an admin's, as the credentials file is, and no session's.
-    if (!v.user || !v.user->admin || v.session)
+    // IAM is no session's: an admin may do all of it, and another user what its own policies allow.
+    const user_identity* u = v.user.get();
+    const auto may_call = [](const user_identity& who)
+    { return (who.has_policy && who.policy.allows_iam()) || (who.iam_policy && who.iam_policy->allows_iam()); };
+    if (!u || v.session || (!u->admin && !may_call(*u)))
     {
-        fail(403, "AccessDenied", "User: " + (v.user ? v.user->id : std::string("anonymous")) +
+        fail(403, "AccessDenied", "User: " + (u ? u->id : std::string("anonymous")) +
                                       " is not authorized to perform: iam:" + std::string(action));
         return;
     }
+    // A request that names no user acts on its caller's, as IAM reads it.
+    iam_fields own;
+    const iam_fields* f = &fields;
+    if (iam_defaults_to_caller(action) &&
+        std::none_of(fields.begin(), fields.end(), [](const auto& kv) { return kv.first == "UserName"; }))
+    {
+        own = fields;
+        own.emplace_back("UserName", u->id);
+        f = &own;
+    }
 
-    // The change is read, made and written under the file's lock, which another shard's change waits for; an
-    // admin's IAM call is rare, so the loop waits the few milliseconds with it.
+    // The change is read, judged, made and written under the file's lock, which another shard's change waits for; an
+    // IAM call is rare, so the loop waits the few milliseconds with it.
     const int lfd = ::open((file + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lfd < 0 || ::flock(lfd, LOCK_EX) < 0)
     {
@@ -177,9 +191,35 @@ void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::
     else
     {
         const int64_t now_ms = static_cast<int64_t>(m_store.now_ms());
-        res = iam_apply(st, action, fields, now_ms, c->req.request_id,
-                        [](void* a, std::string_view id) { return static_cast<authenticator*>(a)->file_user(id); },
-                        m_auth);
+        auto refuse = [&](std::string message)
+        {
+            res.ok      = false;
+            res.status  = 403;
+            res.code    = "AccessDenied";
+            res.message = "User: " + u->id + " is not authorized to perform: iam:" + std::string(action) + message;
+        };
+        // Any other user is judged by its own policies on every resource the request acts on.
+        if (!u->admin)
+        {
+            const int index = iam_action_index(action);
+            for (const std::string& resource : iam_resources(st, action, *f))
+            {
+                const policy_effect e = iam_access(c, *u, v.principal, index, resource);
+                if (e == policy_effect::allow)
+                    continue;
+                refuse((resource.empty() ? std::string() : " on resource: arn:aws:iam::" + std::string(iam_account) +
+                                                               ":" + resource) +
+                       (e == policy_effect::deny ? " with an explicit deny" : ""));
+                break;
+            }
+            // Only an admin gives an identity the right to call IAM, so no delegate widens its own.
+            if (res.ok && iam_grants_iam(st, action, *f))
+                refuse(" with a policy or group that grants IAM actions, which only an admin may give");
+        }
+        if (res.ok)
+            res = iam_apply(st, action, *f, now_ms, c->req.request_id,
+                            [](void* a, std::string_view id) { return static_cast<authenticator*>(a)->file_user(id); },
+                            m_auth);
         // A node of a cluster notes when the document changed, so the one changed last is every node's.
         if (res.ok && res.changed)
         {

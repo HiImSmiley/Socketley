@@ -173,6 +173,8 @@ struct parts_page
     std::vector<part_row> rows;
     bool          truncated{false};
     uint32_t      next_marker{0};
+    // Who owns the upload, its writer where the bucket takes ACLs, empty for the bucket's owner.
+    std::string   owner;
 };
 
 struct mpu_totals

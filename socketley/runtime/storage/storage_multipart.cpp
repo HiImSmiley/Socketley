@@ -295,6 +295,14 @@ void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint3
         len   = hi - lo + 1;
     }
 
+    // A version moved to a tier is read from there by a GET alone.
+    if (is_tiered(*src))
+    {
+        s3_error err = make_error("InvalidObjectState");
+        err.message = "The source object is in the storage class " + std::string(storage_class_of(*src));
+        send_error(c, err);
+        return;
+    }
     object_meta meta;
     if (algo != checksum_algo::none)
         reserve_checksum(meta, algo);
@@ -445,7 +453,7 @@ void storage_run::send_completed(const std::shared_ptr<conn>& c, const object_me
     if (has_version(m))
         resp.headers.emplace_back("x-amz-version-id", version_of(m).id);
     sse_headers(r, m, resp.headers);
-    resp.body = complete_multipart_xml(object_url(c->ssl != nullptr, r.host, r.vhost, r.bucket, r.key), r.bucket,
+    resp.body = complete_multipart_xml(object_url(secure(*c), r.host, r.vhost, r.bucket, r.key), r.bucket,
                                        r.key, m.etag(), algo, checksum_b64);
     send_response(c, std::move(resp));
 }
@@ -568,7 +576,7 @@ void storage_run::op_list_parts(const std::shared_ptr<conn>& c)
             lr.bucket    = cc->req.bucket;
             lr.key       = pg.key;
             lr.upload_id = pg.id;
-            lr.owner_id   = std::string(owner_of(cc->req.bucket));
+            lr.owner_id   = pg.owner.empty() ? std::string(owner_of(cc->req.bucket)) : pg.owner;
             lr.owner_name = display_of(lr.owner_id);
             lr.part_number_marker = marker;
             lr.max_parts = max_parts;

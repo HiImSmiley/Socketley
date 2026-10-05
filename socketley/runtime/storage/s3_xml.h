@@ -111,6 +111,12 @@ inline s3_error make_error(std::string_view code)
         {"NotImplemented", 501, "A header you provided implies functionality that is not implemented"},
         {"AccessControlListNotSupported", 400, "The bucket does not allow ACLs"},
         {"InvalidStorageClass", 400, "The storage class you specified is not valid"},
+        {"MalformedACLError", 400, "The XML you provided was not well-formed or did not validate against our published schema."},
+        {"UnresolvableGrantByEmailAddress", 400, "The email address you provided does not match any account on record."},
+        {"OwnershipControlsNotFoundError", 404, "The bucket ownership controls were not found"},
+        {"MissingSecurityHeader", 400, "Your request was missing a required header"},
+        {"UnexpectedContent", 400, "This request does not support content"},
+        {"InvalidObjectState", 403, "The operation is not valid for the object's storage class"},
         {"MalformedPOSTRequest", 400, "The body of your POST request is not well-formed multipart/form-data."},
         {"MaxPostPreDataLengthExceeded", 400, "Your POST request fields preceding the upload file were too large."},
         {"IncorrectNumberOfFilesInPostRequest", 400, "POST requires exactly one file upload per request."},
@@ -422,11 +428,15 @@ inline void list_xml_object(std::string& x, const list_render& r, const std::str
         xml_escape_to(x, r.owner_id);
         x += "</ID><DisplayName>";
         xml_escape_to(x, r.owner_name);
-        x += "</DisplayName></Owner><StorageClass>STANDARD</StorageClass></Contents>";
+        x += "</DisplayName></Owner><StorageClass>";
+        x += storage_class_of(m);
+        x += "</StorageClass></Contents>";
         return;
     }
-    q = lit(q, "<StorageClass>STANDARD</StorageClass></Contents>");
     x.append(buf, static_cast<size_t>(q - buf));
+    x += "<StorageClass>";
+    x += storage_class_of(m);
+    x += "</StorageClass></Contents>";
 }
 
 inline void list_xml_prefix(std::string& x, const list_render& r, std::string_view common)

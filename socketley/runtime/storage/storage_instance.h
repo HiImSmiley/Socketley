@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "bucket_policy.h"
 #include "s3_auth.h"
 #include "../../shared/request_channel.h"
 #include "../../shared/runtime_instance.h"
@@ -39,6 +40,9 @@ public:
     // authenticate.
     void set_anonymous(bool on) { m_anonymous = on; }
     bool get_anonymous() const { return m_anonymous; }
+    // Buckets given no ownership controls take ACLs (--acls), as S3 did before it disabled them by default.
+    void set_acls(bool on) { m_acls = on; }
+    bool get_acls() const { return m_acls; }
 
     // The credentials requests are signed with, as a pair given here and as
     // a file of `access:secret` lines that is re-read when it changes.
@@ -60,6 +64,9 @@ public:
     // A whole scrub of every object in this long (--scrub), 0 for none.
     void set_scrub_secs(uint32_t s) { m_scrub_secs = s; }
     uint32_t get_scrub_secs() const { return m_scrub_secs; }
+    // Versions unwritten for this long are compressed (--compress), 0 for none.
+    void set_compress_secs(uint32_t s) { m_compress_secs = s; }
+    uint32_t get_compress_secs() const { return m_compress_secs; }
 
     // A quota on the bytes held, 0 for none.
     void set_max_bytes(uint64_t bytes) { m_max_bytes = bytes; }
@@ -85,6 +92,17 @@ public:
     // start; none refuses every replication configuration.
     void set_replication_targets(std::string_view f) { m_replication_targets = std::string(f); }
     std::string_view get_replication_targets() const { return m_replication_targets; }
+    // The tiers a lifecycle moves versions to (--tiers), a file of `name url region access_key secret` lines.
+    void set_tiers_file(std::string_view f) { m_tiers_file = std::string(f); }
+    std::string_view get_tiers_file() const { return m_tiers_file; }
+    // The OIDC provider and LDAP directory STS takes identities from (--federation), a file of lines read at start.
+    void set_federation_file(std::string_view f) { m_federation_file = std::string(f); }
+    std::string_view get_federation_file() const { return m_federation_file; }
+    // The proxies that terminate TLS before the runtime (--tls-offloaded), comma-separated addresses or blocks.
+    void set_tls_offloaded(std::string_view v) { m_tls_offloaded = std::string(v); }
+    std::string_view get_tls_offloaded() const { return m_tls_offloaded; }
+    // The blocks --tls-offloaded names, false for one that is none.
+    bool tls_offloaded_blocks(std::vector<socketley::storage::bucket_policy::cidr>& out) const;
 
     // The nodes file (--nodes) that names this runtime's node of a cluster, the others, and the key they sign with.
     void set_nodes_file(std::string_view f) { m_cluster_file = std::string(f); }
@@ -142,6 +160,7 @@ private:
 
     std::string m_dir;
     bool        m_anonymous{false};
+    bool        m_acls{false};
     uint64_t    m_max_bytes{0};
     std::string m_access_key;
     std::string m_secret_key;
@@ -151,11 +170,15 @@ private:
     std::string m_website_domain;
     std::string m_notify_targets;
     std::string m_replication_targets;
+    std::string m_tiers_file;
+    std::string m_federation_file;
+    std::string m_tls_offloaded;
     std::string m_cluster_file;
     std::string m_fsync;
     uint32_t    m_fsync_interval_secs{0};
     uint32_t    m_mpu_expire_secs{0};
     uint32_t    m_scrub_secs{0};
+    uint32_t    m_compress_secs{0};
     std::unique_ptr<socketley::storage::authenticator> m_auth;
     std::unique_ptr<socketley::storage::anonymous_authenticator> m_anon;
 

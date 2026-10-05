@@ -281,8 +281,26 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                                     return;
                                 }
                             }
+                            else if (is_tiered(state->meta))
+                            {
+                                answer(op::get, refusal("InvalidObjectState", "The object was moved to the tier " +
+                                                        std::string(storage_class_of(state->meta))));
+                                return;
+                            }
+                            else if (is_compressed(state->meta))
+                            {
+                                if (!lz4_open_body(state->meta, state->body, r.data))
+                                {
+                                    answer(op::get, refusal_for(st::io_error));
+                                    return;
+                                }
+                            }
                             else
+                            {
+                                // A multipart object's part list may follow its bytes, which are not the object's.
+                                state->body.resize(static_cast<size_t>(state->meta.size));
                                 r.data = std::move(state->body);
+                            }
                             answer(op::get, r);
                             return;
                         }

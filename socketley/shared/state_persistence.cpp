@@ -787,6 +787,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             auto* stg = static_cast<const storage_instance*>(instance);
             cfg.storage_dir = std::string(stg->get_dir());
             cfg.storage_anonymous = stg->get_anonymous();
+            cfg.storage_acls = stg->get_acls();
             cfg.storage_max_bytes = stg->get_max_bytes();
             cfg.storage_access_key = std::string(stg->get_access_key());
             cfg.storage_secret_key = std::string(stg->get_secret_key());
@@ -796,11 +797,15 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.storage_website_domain = std::string(stg->get_website_domain());
             cfg.storage_notify_targets = std::string(stg->get_notify_targets());
             cfg.storage_replication_targets = std::string(stg->get_replication_targets());
+            cfg.storage_tiers = std::string(stg->get_tiers_file());
+            cfg.storage_federation = std::string(stg->get_federation_file());
+            cfg.storage_tls_offloaded = std::string(stg->get_tls_offloaded());
             cfg.storage_nodes = std::string(stg->get_nodes_file());
             cfg.storage_fsync = std::string(stg->get_fsync());
             cfg.storage_fsync_interval_secs = stg->get_fsync_interval_secs();
             cfg.storage_mpu_expire_secs = stg->get_mpu_expire_secs();
             cfg.storage_scrub_secs = stg->get_scrub_secs();
+            cfg.storage_compress_secs = stg->get_compress_secs();
             break;
         }
     }
@@ -1062,6 +1067,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             append_str_field("dir", cfg.storage_dir);
             if (cfg.storage_anonymous)
                 append_bool_field("anonymous", true);
+            if (cfg.storage_acls)
+                append_bool_field("acls", true);
             if (cfg.storage_max_bytes > 0)
                 append_int_field("max_bytes", cfg.storage_max_bytes);
             if (!cfg.storage_access_key.empty())
@@ -1080,6 +1087,12 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("notify_targets", cfg.storage_notify_targets);
             if (!cfg.storage_replication_targets.empty())
                 append_str_field("replication_targets", cfg.storage_replication_targets);
+            if (!cfg.storage_tiers.empty())
+                append_str_field("tiers", cfg.storage_tiers);
+            if (!cfg.storage_federation.empty())
+                append_str_field("federation", cfg.storage_federation);
+            if (!cfg.storage_tls_offloaded.empty())
+                append_str_field("tls_offloaded", cfg.storage_tls_offloaded);
             if (!cfg.storage_nodes.empty())
                 append_str_field("nodes", cfg.storage_nodes);
             if (!cfg.storage_fsync.empty())
@@ -1090,6 +1103,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_int_field("mpu_expire", cfg.storage_mpu_expire_secs);
             if (cfg.storage_scrub_secs > 0)
                 append_int_field("scrub", cfg.storage_scrub_secs);
+            if (cfg.storage_compress_secs > 0)
+                append_int_field("compress", cfg.storage_compress_secs);
             break;
     }
 
@@ -1250,6 +1265,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
         case runtime_storage:
             cfg.storage_dir = json_get_string(json, "dir");
             cfg.storage_anonymous = json_get_bool(json, "anonymous");
+            cfg.storage_acls = json_get_bool(json, "acls");
             cfg.storage_max_bytes = json_get_size(json, "max_bytes");
             cfg.storage_access_key = json_get_string(json, "access_key");
             cfg.storage_secret_key = json_get_string(json, "secret_key");
@@ -1259,11 +1275,15 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.storage_website_domain = json_get_string(json, "website_domain");
             cfg.storage_notify_targets = json_get_string(json, "notify_targets");
             cfg.storage_replication_targets = json_get_string(json, "replication_targets");
+            cfg.storage_tiers = json_get_string(json, "tiers");
+            cfg.storage_federation = json_get_string(json, "federation");
+            cfg.storage_tls_offloaded = json_get_string(json, "tls_offloaded");
             cfg.storage_nodes = json_get_string(json, "nodes");
             cfg.storage_fsync = json_get_string(json, "fsync");
             cfg.storage_fsync_interval_secs = static_cast<uint32_t>(json_get_size(json, "fsync_interval"));
             cfg.storage_mpu_expire_secs = static_cast<uint32_t>(json_get_size(json, "mpu_expire"));
             cfg.storage_scrub_secs = static_cast<uint32_t>(json_get_size(json, "scrub"));
+            cfg.storage_compress_secs = static_cast<uint32_t>(json_get_size(json, "compress"));
             break;
     }
 

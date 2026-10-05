@@ -104,6 +104,8 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
                   return sse_data_key(m, std::nullopt, out, ignored);
               },
               [this](scrubber::finding f) { scrub_found(std::move(f)); }),
+      m_compact(loop, m_io, m_store, m_hash),
+      m_tier(loop, m_io, m_store, m_hash),
       m_transport(owner.get_runtime_manager() ? &owner.get_runtime_manager()->requests() : nullptr,
                   std::string(owner.get_name())),
       m_node(m_store, m_transport), m_auth(auth)
@@ -126,6 +128,7 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
         if (end != e && v > 0 && v <= 86400)
             m_lc_day_ms = static_cast<int64_t>(v) * 1000;
     }
+    m_tier.set_day_ms(m_lc_day_ms);
     m_rid_seq = random_u64();
     m_store.set_hash_pool(&m_hash);
     if (!m_hash.attach(m_io))
@@ -184,6 +187,7 @@ bool storage_run::open(std::string& err)
     if (!m_cluster_self.empty() && !load_cluster_id(err))
         return false;
     m_scrub.open(m_store.options().dir, m_store.shard());
+    m_compact.open(m_store.options().dir, m_store.shard());
     reap_uploads();
     LOG_INFO(("storage: " + std::to_string(rep.buckets) + " bucket(s), " +
               std::to_string(rep.objects) + " object(s) in " + m_store.options().dir +
@@ -556,10 +560,13 @@ void storage_run::sweep()
     }
     lifecycle_tick();
     m_scrub.tick();
+    m_compact.tick();
+    m_tier.tick();
     tell_started();
     flush_access_logs(false);
     if (!m_conns.empty() || m_mpu_expire_secs != 0 || m_start_note != start_note::told || m_lc ||
-        m_store.lifecycle_buckets() != 0 || m_store.any_doubt() || !m_access_logs.empty() || m_scrub.enabled())
+        m_store.lifecycle_buckets() != 0 || m_store.any_doubt() || !m_access_logs.empty() || m_scrub.enabled() ||
+        m_compact.enabled() || m_tier.enabled())
         arm_sweep();
 }
 
@@ -610,6 +617,8 @@ void storage_run::stop()
     m_notify.stop();
     m_repl.stop();
     m_scrub.stop();
+    m_compact.stop();
+    m_tier.stop();
 
     // Nothing new can arrive, so the journal writes, syncs and compaction already begun are let finish, which is what lets close() mark the stop clean.
     const auto give_up = std::chrono::steady_clock::now() + stop_drain_bound;
@@ -624,6 +633,10 @@ void storage_run::stop()
     // loop is about to close, and the read waiting on it is cancelled with it.
     m_hash.stop();
     if (const int fd = m_hash.release_wake_fd(); fd >= 0)
+        m_loop.close_fd(fd);
+    // A bind in progress is waited out here, which its own deadline bounds.
+    m_ldap_pool.stop();
+    if (const int fd = m_ldap_pool.release_wake_fd(); fd >= 0)
         m_loop.close_fd(fd);
 
     // Marked clean only when nothing is half done, which is decided inside.
@@ -645,6 +658,7 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
     if (c->put)
         c->put->abort();
     c->dec.reset();
+    c->sel.reset();
     if (c->file_fd >= 0)
     {
         m_loop.close_fd(c->file_fd);
@@ -1430,7 +1444,9 @@ std::string storage_run::response_head(const conn& c, const response& r, size_t 
     }
     h += r.headers_raw;
     h += c.cors_head;
-    if (r.status != 204 && r.status != 304 && r.status != 100)
+    if (r.chunked)
+        h += "Transfer-Encoding: chunked\r\n";
+    else if (r.status != 204 && r.status != 304 && r.status != 100)
     {
         h += "Content-Length: ";
         number(r.has_length_override ? r.length_override
@@ -1618,6 +1634,7 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->ck_trailer.clear();
     c->sent_body = 0;
     c->dec.reset();
+    c->sel.reset();
     c->rd_direct = false;
     c->hfill = 0;
     c->trickle  = false;
@@ -1629,6 +1646,8 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->policy_admitted = false;
     c->cors_head.clear();
     c->hide_missing = false;
+    c->acl_need = 0;
+    c->by_acl   = false;
     c->website_key.clear();
     c->website_error = {};
     c->website_status = 0;
@@ -2398,6 +2417,11 @@ void storage_run::file_pump(const std::shared_ptr<conn>& c)
 {
     if (c->dead)
         return;
+    if (c->sel)
+    {
+        select_pump(c);
+        return;
+    }
     if (c->file_left == 0)
     {
         file_done(c);

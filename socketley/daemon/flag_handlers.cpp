@@ -1331,6 +1331,10 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         case fnv1a("--anonymous"):
             stg->set_anonymous(true);
             return 0;
+        // Off by default, as S3 has ACLs: a bucket given no ownership controls takes them.
+        case fnv1a("--acls"):
+            stg->set_acls(true);
+            return 0;
         // The one pair every request is signed with.
         case fnv1a("--access-key"):
         case fnv1a("--secret-key"):
@@ -1446,6 +1450,39 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
             stg->set_replication_targets(pa.args[++i]);
             return 0;
         }
+        // The tiers a lifecycle moves versions to, a file of `name url region access_key secret` lines read at every start.
+        case fnv1a("--tiers"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << "--tiers requires a file path\n";
+                return 1;
+            }
+            stg->set_tiers_file(pa.args[++i]);
+            return 0;
+        }
+        // The OIDC provider and LDAP directory STS takes identities from, a file of lines read at every start.
+        case fnv1a("--federation"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << "--federation requires a file path\n";
+                return 1;
+            }
+            stg->set_federation_file(pa.args[++i]);
+            return 0;
+        }
+        // The proxies that terminate TLS before the runtime, whose connections count as secure ones.
+        case fnv1a("--tls-offloaded"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << "--tls-offloaded requires addresses such as 10.0.0.5 or 10.0.0.0/24\n";
+                return 1;
+            }
+            stg->set_tls_offloaded(pa.args[++i]);
+            return 0;
+        }
         // The nodes that each keep every bucket, a file of `self`, `node` and `key` lines read at every start.
         case fnv1a("--nodes"):
         {
@@ -1483,6 +1520,20 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
             }
             ++i;
             stg->set_scrub_secs(static_cast<uint32_t>(std::min<uint64_t>(secs, UINT32_MAX)));
+            return 0;
+        }
+        // Versions left unwritten this long are compressed where they lie.
+        case fnv1a("--compress"):
+        {
+            uint64_t secs = 0;
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            if (parse_duration_seconds(v, uint64_t{10} * 365 * 86400, secs) != duration_parse::ok || secs == 0)
+            {
+                std::cout << "--compress requires a duration such as 1h or 7d\n";
+                return 1;
+            }
+            ++i;
+            stg->set_compress_secs(static_cast<uint32_t>(std::min<uint64_t>(secs, UINT32_MAX)));
             return 0;
         }
         case fnv1a("--max-bytes"):

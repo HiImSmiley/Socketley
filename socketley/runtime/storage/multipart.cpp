@@ -326,8 +326,10 @@ bool multipart_store::bucket_uploads_busy(std::string_view bucket) const
     const std::string prefix = std::string(bucket) + "/";
     for (auto it = m_uploads.lower_bound(prefix); it != m_uploads.end() && it->first.starts_with(prefix); ++it)
     {
+        // A part's body on its way in is a put on the bucket, which keeps it, so a place given to a body that was then
+        // refused, and is never written, keeps nothing.
         const mpu_upload& u = *it->second;
-        if (u.state != mpu_state::open || u.committing > 0 || !u.placing.empty() || !u.lanes.empty())
+        if (u.state != mpu_state::open || u.committing > 0 || !u.lanes.empty())
             return true;
     }
     return false;
@@ -1005,6 +1007,8 @@ parts_page multipart_store::list_parts(std::string_view bucket, std::string_view
     pg.key  = up->key;
     pg.id   = up->id;
     pg.algo = up->algo;
+    if (acl_list a; decode_acl(object_acl_value(up->meta), a) && !object_acl_value(up->meta).empty())
+        pg.owner = a.owner;
     for (auto it = up->parts.upper_bound(marker); it != up->parts.end(); ++it)
     {
         if (pg.rows.size() == max_parts)

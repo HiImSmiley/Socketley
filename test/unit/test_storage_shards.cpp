@@ -2810,3 +2810,49 @@ TEST_CASE("a completion assembled on another shard is answered only once the upl
     CHECK(c.del(0, "bkt", key) == st::ok);
     CHECK(c.drop_bucket(0, "bkt") == st::ok);
 }
+
+TEST_CASE("an object's metadata in memory keeps every value through copies, moves and changes")
+{
+    // A CRC lies inline and a SHA-256 on the heap, and each copy is a value of its own.
+    object_meta a;
+    set_checksum(a, checksum_algo::sha256, std::string(32, '\x7f'));
+    a.content_type = "application/x-socketley-test";
+    a.extra.emplace_back("x-amz-meta-a", "1");
+    object_meta b = a;
+    CHECK(b == a);
+    set_checksum(a, checksum_algo::crc32, "\x01\x02\x03\x04");
+    CHECK(b.checksum.raw_bytes() == std::string(32, '\x7f'));
+    CHECK(a.checksum.raw_bytes() == std::string_view("\x01\x02\x03\x04", 4));
+    CHECK_FALSE(b == a);
+    object_meta c = std::move(b);
+    CHECK(c.checksum.raw_bytes() == std::string(32, '\x7f'));
+    c = c;
+    CHECK(c.checksum.raw_bytes() == std::string(32, '\x7f'));
+    reserve_checksum(c, checksum_algo::sha1);
+    CHECK(c.checksum.raw_bytes() == std::string(20, '\0'));
+
+    // A type past the shared ones is the value's own, and a shared one is shared.
+    std::string unique(200, 't');
+    object_meta d;
+    d.content_type = unique;
+    object_meta e = d;
+    d.content_type = "text/plain";
+    CHECK(e.content_type == std::string_view(unique));
+    CHECK(d.content_type == std::string_view("text/plain"));
+
+    // The extra entries hold nothing while empty and act as the list they are.
+    object_meta f;
+    CHECK(f.extra.empty());
+    CHECK(f.extra.begin() == f.extra.end());
+    f.extra = {{"a", "1"}, {"b", "2"}, {"c", "3"}};
+    CHECK(erase_if(f.extra, [](const auto& p) { return p.first == "b"; }) == 1);
+    CHECK(f.extra.size() == 2);
+    f.extra.insert(f.extra.begin() + 1, {"b", "4"});
+    CHECK(f.extra[1].second == "4");
+    f.extra.erase(f.extra.begin());
+    f.extra.pop_back();
+    CHECK((f.extra.size() == 1 && f.extra.back().first == "b"));
+    erase_if(f.extra, [](const auto&) { return true; });
+    CHECK(f.extra.empty());
+    CHECK(f.extra == object_meta{}.extra);
+}

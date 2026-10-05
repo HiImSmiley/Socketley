@@ -328,8 +328,9 @@ TEST_CASE("an identity policy names no principal and matches its resources again
     CHECK(err.message.find("principal") != std::string::npos);
     CHECK_FALSE(bucket_policy::compile_identity(
         R"({"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::${aws:username}/*"}})", p, err));
-    CHECK_FALSE(bucket_policy::compile_identity(
-        R"({"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:iam:::user/x"}})", p, err));
+    // An IAM resource is taken beside an S3 action, and covers no S3 request.
+    const bucket_policy cross = identity(R"({"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:iam:::user/x"}})");
+    CHECK(user_does(cross, s3_action::get_object, "user", "x") == policy_effect::none);
 
     const bucket_policy all = identity(R"({"Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}})");
     CHECK(user_does(all, s3_action::get_object, "any", "k") == policy_effect::allow);
@@ -373,4 +374,112 @@ TEST_CASE("a bucket policy's principal names a user by its id as well as by an a
     bob.principal = "AKIABOB";
     bob.user      = "bob";
     CHECK(p.evaluate(bob) == policy_effect::none);
+}
+
+namespace {
+
+// What `p` says to user `user` asking IAM action `action` on `resource`, after "arn:aws:iam::<account>:".
+policy_effect iam_does(const bucket_policy& p, std::string_view action, std::string_view resource,
+                       std::string_view user = "alice")
+{
+    policy_request r;
+    r.iam_action   = iam_action_index(action);
+    REQUIRE(r.iam_action >= 0);
+    r.iam_resource = resource;
+    r.principal    = "AKIAUSER";
+    r.user         = user;
+    return p.evaluate(r);
+}
+
+}   // namespace
+
+TEST_CASE("the IAM actions are the ones the endpoint answers, each with a bit of its own")
+{
+    CHECK(iam_action_index("CreateUser") == 0);
+    CHECK(iam_action_index("ListAttachedRolePolicies") == static_cast<int>(std::size(iam_action_names)) - 1);
+    CHECK(iam_action_index("ChangePassword") == -1);
+    CHECK(iam_action_index("createuser") == -1);
+}
+
+TEST_CASE("an identity policy names IAM actions and resources, with wildcards and ${aws:username}, and a Deny wins")
+{
+    const bucket_policy own = identity(R"({"Statement":[
+        {"Effect":"Allow","Action":["iam:CreateAccessKey","iam:ListAccessKeys"],"Resource":"arn:aws:iam:::user/${aws:username}"},
+        {"Effect":"Allow","Action":"iam:List*","Resource":"*"},
+        {"Effect":"Allow","Action":"iam:get*","Resource":"arn:aws:iam::123456789012:user/team/*"},
+        {"Effect":"Deny","Action":"iam:ListRoles","Resource":"*"}]})");
+    CHECK(iam_does(own, "CreateAccessKey", "user/alice") == policy_effect::allow);
+    CHECK(iam_does(own, "CreateAccessKey", "user/bob") == policy_effect::none);
+    CHECK(iam_does(own, "CreateAccessKey", "user/bob", "bob") == policy_effect::allow);
+    // The variable fills in the caller's name whole, so it is no prefix of another's.
+    CHECK(iam_does(own, "CreateAccessKey", "user/alice2") == policy_effect::none);
+    CHECK(iam_does(own, "CreateAccessKey", "user/team/alice") == policy_effect::none);
+    // A caller with no user id gives the variable no value, which matches nothing.
+    CHECK(iam_does(own, "CreateAccessKey", "user/", "") == policy_effect::none);
+    CHECK(iam_does(own, "DeleteAccessKey", "user/alice") == policy_effect::none);
+    // iam:List* is every List action, and an action on no resource is covered by "*" alone.
+    CHECK(iam_does(own, "ListUsers", "") == policy_effect::allow);
+    CHECK(iam_does(own, "ListGroupsForUser", "user/bob") == policy_effect::allow);
+    CHECK(iam_does(own, "ListRoles", "") == policy_effect::deny);
+    // Action names match without case, as IAM's do, and resources in any account.
+    CHECK(iam_does(own, "GetUser", "user/team/carol") == policy_effect::allow);
+    CHECK(iam_does(own, "GetUser", "user/carol") == policy_effect::none);
+    CHECK(iam_does(own, "CreateUser", "user/team/carol") == policy_effect::none);
+
+    const bucket_policy users = identity(R"({"Statement":{"Effect":"Allow","Action":"iam:ListUsers","Resource":"arn:aws:iam:::user/*"}})");
+    CHECK(iam_does(users, "ListUsers", "") == policy_effect::none);
+
+    // "*" is S3's actions alone, so a policy written before IAM could be delegated gives none of it.
+    const bucket_policy all = identity(R"({"Statement":{"Effect":"Allow","Action":"*","Resource":"*"}})");
+    CHECK(iam_does(all, "DeleteUser", "user/x") == policy_effect::none);
+    CHECK(user_does(all, s3_action::get_object, "any", "k") == policy_effect::allow);
+    CHECK_FALSE(all.allows_iam());
+    // iam:* names every IAM action, and an explicit Deny takes any of them back.
+    const bucket_policy every = identity(R"({"Statement":[{"Effect":"Allow","Action":"iam:*","Resource":"*"},
+        {"Effect":"Deny","Action":"iam:*","Resource":"arn:aws:iam:::user/root*"}]})");
+    CHECK(iam_does(every, "DeleteUser", "user/x") == policy_effect::allow);
+    CHECK(iam_does(every, "DeleteUser", "user/rooted") == policy_effect::deny);
+
+    // IAM's statements say nothing to S3's requests, nor S3's to IAM's.
+    const bucket_policy s3_only = identity(R"({"Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}})");
+    CHECK(iam_does(s3_only, "ListUsers", "") == policy_effect::none);
+    const bucket_policy iam_only = identity(R"({"Statement":{"Effect":"Allow","Action":"iam:*","Resource":"*"}})");
+    CHECK(user_does(iam_only, s3_action::get_object, "any", "k") == policy_effect::none);
+}
+
+TEST_CASE("an IAM action or resource this runtime cannot honour is refused, and one it does not answer is taken")
+{
+    s3_error err;
+    bucket_policy p;
+    // An IAM action IAM has and this runtime does not answer matches nothing, so a policy written for AWS compiles.
+    const bucket_policy other = identity(R"({"Statement":{"Effect":"Allow","Action":"iam:ChangePassword","Resource":"*"}})");
+    CHECK_FALSE(other.allows_iam());
+    CHECK_FALSE(bucket_policy::compile_identity(
+        R"({"Statement":{"Effect":"Allow","Action":"iam:Create-User","Resource":"*"}})", p, err));
+    CHECK_FALSE(bucket_policy::compile_identity(R"({"Statement":{"Effect":"Allow","Action":"iam:","Resource":"*"}})", p, err));
+    CHECK_FALSE(bucket_policy::compile_identity(
+        R"({"Statement":{"Effect":"Allow","Action":"iam:GetUser","Resource":"arn:aws:iam:::user/${aws:userid}"}})", p, err));
+    CHECK(err.message.find("${aws:username}") != std::string::npos);
+    CHECK_FALSE(bucket_policy::compile_identity(
+        R"({"Statement":{"Effect":"Allow","Action":"iam:GetUser","Resource":"arn:aws:iam::user/x"}})", p, err));
+    CHECK_FALSE(bucket_policy::compile_identity(
+        R"({"Statement":{"Effect":"Allow","Action":"iam:GetUser","Resource":"arn:aws:iam:::user/${aws:username"}})", p, err));
+    // The variable's name is read without case, as IAM reads it.
+    const bucket_policy upper = identity(R"({"Statement":{"Effect":"Allow","Action":"iam:GetUser","Resource":"arn:aws:iam:::user/${AWS:UserName}"}})");
+    CHECK(iam_does(upper, "GetUser", "user/alice") == policy_effect::allow);
+    // A bucket's policy names no IAM action.
+    CHECK_FALSE(bucket_policy::compile(
+        R"({"Statement":{"Effect":"Allow","Principal":"*","Action":"iam:ListUsers","Resource":"arn:aws:s3:::pub"}})", "pub", p, err));
+}
+
+TEST_CASE("allows_iam is an Allow of an IAM action on some IAM resource")
+{
+    CHECK(identity(R"({"Statement":{"Effect":"Allow","Action":"iam:ListUsers","Resource":"*"}})").allows_iam());
+    // "*" is S3's actions alone.
+    CHECK_FALSE(identity(R"({"Statement":{"Effect":"Allow","Action":"*","Resource":"*"}})").allows_iam());
+    CHECK(identity(R"({"Statement":{"Effect":"Allow","Action":["*","iam:*"],"Resource":"*"}})").allows_iam());
+    CHECK(identity(R"({"Statement":{"Effect":"Allow","Action":"iam:*","Resource":"arn:aws:iam:::user/a"}})").allows_iam());
+    CHECK_FALSE(identity(R"({"Statement":{"Effect":"Allow","Action":"*","Resource":"arn:aws:s3:::*"}})").allows_iam());
+    CHECK_FALSE(identity(R"({"Statement":{"Effect":"Deny","Action":"iam:*","Resource":"*"}})").allows_iam());
+    CHECK_FALSE(identity(R"({"Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}})").allows_iam());
 }

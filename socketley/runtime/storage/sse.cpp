@@ -13,6 +13,7 @@
 #include <openssl/rand.h>
 
 #include "checksum.h"
+#include "compression.h"
 
 namespace socketley::storage
 {
@@ -229,8 +230,13 @@ uint8_t sse_version_of(const object_meta& m)
 
 uint64_t stored_size(const object_meta& m)
 {
+    // A version moved to a tier keeps its header alone, its part list too being in its header.
+    if (is_tiered(m))
+        return 0;
     if (part_trailer t; part_trailer_of(m, t))
         return t.at + t.len;
+    if (lz4_record r; lz4_record_of(m, r))
+        return r.table_at + r.chunks * 4;
     const std::string* v = sse_value(m);
     if (!v)
         return m.size;

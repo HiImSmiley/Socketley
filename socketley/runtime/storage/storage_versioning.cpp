@@ -107,7 +107,9 @@ std::string versions_xml(const versions_render& r, const version_page& p)
             x += quoted_etag(it.meta);
             x += "</ETag><Size>";
             append_number(x, it.meta.size);
-            x += "</Size><StorageClass>STANDARD</StorageClass>";
+            x += "</Size><StorageClass>";
+            x += storage_class_of(it.meta);
+            x += "</StorageClass>";
         }
         x += "<Owner><ID>";
         xml_escape_to(x, r.owner_id);

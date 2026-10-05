@@ -40,12 +40,30 @@ bool parse_logging_config(std::string_view xml, logging_config& out, s3_error& e
                 bucket = true;
             else if (k.name == "TargetPrefix" && !prefix && leaf(k, out.target_prefix))
                 prefix = true;
-            else if (k.name == "TargetGrants")
+            else if (k.name == "TargetGrants" && out.grants.empty())
             {
-                // A bucket whose ACLs are disabled takes no grants, as S3 refuses them for one.
-                err         = make_error("AccessControlListNotSupported");
-                err.message = "The bucket does not allow ACLs";
-                return false;
+                for (const xml_node& g : k.kids)
+                {
+                    logging_config::grant one;
+                    for (const xml_node& f : g.kids)
+                    {
+                        if (f.name == "Permission" && (f.text == "FULL_CONTROL" || f.text == "READ" || f.text == "WRITE"))
+                            one.permission = f.text;
+                        else if (f.name == "Grantee")
+                            for (const xml_node& who : f.kids)
+                            {
+                                if (who.name == "ID")
+                                    one.kind = "id", one.value = who.text;
+                                else if (who.name == "URI")
+                                    one.kind = "uri", one.value = who.text;
+                                else if (who.name == "EmailAddress")
+                                    one.kind = "emailaddress", one.value = who.text;
+                            }
+                    }
+                    if (g.name != "Grant" || one.kind.empty() || one.permission.empty())
+                        return false;
+                    out.grants.push_back(std::move(one));
+                }
             }
             else if (k.name == "TargetObjectKeyFormat" && !format && k.kids.size() == 1)
             {
@@ -88,6 +106,22 @@ std::string logging_config_xml(const logging_config* c)
         x += "</TargetBucket><TargetPrefix>";
         xml_escape_to(x, c->target_prefix);
         x += "</TargetPrefix>";
+        if (!c->grants.empty())
+        {
+            x += "<TargetGrants>";
+            for (const logging_config::grant& g : c->grants)
+            {
+                x += "<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"";
+                x += g.kind == "id" ? "CanonicalUser\"><ID>" : g.kind == "uri" ? "Group\"><URI>"
+                                                                                 : "AmazonCustomerByEmail\"><EmailAddress>";
+                xml_escape_to(x, g.value);
+                x += g.kind == "id" ? "</ID>" : g.kind == "uri" ? "</URI>" : "</EmailAddress>";
+                x += "</Grantee><Permission>";
+                x += g.permission;
+                x += "</Permission></Grant>";
+            }
+            x += "</TargetGrants>";
+        }
         // The key format is told whether it was given or left to its default.
         x += c->partitioned ? "<TargetObjectKeyFormat><PartitionedPrefix><PartitionDateSource>DeliveryTime"
                               "</PartitionDateSource></PartitionedPrefix></TargetObjectKeyFormat>"

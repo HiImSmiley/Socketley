@@ -104,7 +104,7 @@ bool storage_run::sse_customer(const std::shared_ptr<conn>& c, std::string_view 
     if (alg.empty() && key.empty() && md5.empty())
         return true;
     // A key sent in the clear is a key given away, as S3 judges it, whatever else the request says.
-    if (!c->ssl)
+    if (!secure(*c))
     {
         err = sse_error("InvalidRequest", "Requests specifying Server Side Encryption with Customer provided keys "
                                           "must be made over a secure connection.");
@@ -231,7 +231,7 @@ bool storage_run::sse_new_key(const sse_ask& ask, bool per_part, object_meta& me
         err = sse_error("InternalError", "The object's data key could not be wrapped");
         return false;
     }
-    std::erase_if(meta.extra, [](const auto& e) { return e.first == sse_extra || e.first == sse_upload_wrap_extra; });
+    erase_if(meta.extra, [](const auto& e) { return e.first == sse_extra || e.first == sse_upload_wrap_extra; });
     meta.extra.emplace_back(std::string(sse_extra), encode_sse(rec));
     if (ask.mode == sse_mode::c && per_part)
         meta.extra.emplace_back(std::string(sse_upload_wrap_extra), "upload");
@@ -322,7 +322,7 @@ bool storage_run::sse_data_key(const object_meta& m, const std::optional<sse_key
 
 s3_error storage_run::sse_bind_parts(object_meta& m, const std::optional<sse_key>& customer) const
 {
-    const bool upload_wrap = std::erase_if(m.extra, [](const auto& e) { return e.first == sse_upload_wrap_extra; }) > 0;
+    const bool upload_wrap = erase_if(m.extra, [](const auto& e) { return e.first == sse_upload_wrap_extra; }) > 0;
     const std::string* v = sse_value(m);
     sse_record rec;
     if (customer && (!v || sse_mode_of(m) != sse_mode::c))
@@ -358,7 +358,7 @@ s3_error storage_run::sse_bind_parts(object_meta& m, const std::optional<sse_key
     {
         // S3 does not ask a completion for the client's key, so the master key vouches for the list instead.
         std::string mac = encode_parts_mac(m_master_kid, sse_parts_mac(m_parts_mac_key, *v, parts));
-        std::erase_if(m.extra, [](const auto& e) { return e.first == sse_parts_extra; });
+        erase_if(m.extra, [](const auto& e) { return e.first == sse_parts_extra; });
         m.extra.emplace_back(std::string(sse_parts_extra), std::move(mac));
         return {};
     }
@@ -440,7 +440,15 @@ bool storage_run::sse_part_key(const std::shared_ptr<conn>& c, const std::string
     if (record.empty())
         return sse_read_key(c, upload, sse_c_prefix, key, err);
     if (!sse_read_key(c, upload, sse_c_prefix, key, err))
+    {
+        // A part sent under another key than its upload's is a bad argument of the part, as S3 answers it.
+        if (err.code == "AccessDenied")
+        {
+            err = sse_error("InvalidArgument", "The provided encryption key does not match the key the multipart "
+                                               "upload was initiated with.");
+        }
         return false;
+    }
     seal.key         = key;
     seal.opaque_etag = sse_mode_of(upload) == sse_mode::c;
     seal.version     = sse_version_of(upload);
@@ -453,18 +461,18 @@ bool storage_run::sse_part_key(const std::shared_ptr<conn>& c, const std::string
 // ─── A sealed object on its way out ─────────────────────────────────────────
 
 void storage_run::send_sealed(const std::shared_ptr<conn>& c, response head, int fd, uint64_t data_off,
-                              const object_meta& m, const sse_key& key, uint64_t first, uint64_t len)
+                              const object_meta& m, const sse_key* key, uint64_t first, uint64_t len)
 {
     if (c->dead)
     {
         m_loop.close_fd(fd);
         return;
     }
-    auto reader = body_reader::make(m_io, &m_hash, m_store.alive_token(), fd, data_off, m, &key, first, len);
+    auto reader = body_reader::make(m_io, &m_hash, m_store.alive_token(), fd, data_off, m, key, first, len);
     if (!reader)
     {
         m_loop.close_fd(fd);
-        LOG_WARN(("storage: the chunks of the encrypted object \"" + c->req.key + "\" cannot be located").c_str());
+        LOG_WARN(("storage: the chunks of the object \"" + c->req.key + "\" cannot be located").c_str());
         send_error(c, make_error("InternalError"));
         return;
     }
@@ -481,7 +489,34 @@ void storage_run::send_sealed(const std::shared_ptr<conn>& c, response head, int
     c->close_after_write = head.close;
     c->spliced   = false;
     ++m_c.copied_gets;
-    ++m_c.sse_gets;
+    if (key)
+        ++m_c.sse_gets;
+    else
+        ++m_c.compressed_gets;
+    c->after_write = conn::after_kind::pump;
+    access_log(c, head.status, len);
+    queue_write(c, response_head(*c, head));
+}
+
+void storage_run::send_reader(const std::shared_ptr<conn>& c, response head, std::shared_ptr<body_reader> reader,
+                              uint64_t len)
+{
+    if (c->dead)
+        return;
+    head.close = head.close || !c->req.keep_alive;
+    head.head_only = true;
+    head.has_length_override = true;
+    head.length_override = len;
+
+    c->dec       = std::move(reader);
+    c->file_fd   = -1;
+    c->file_off  = 0;
+    c->file_left = len;
+    c->ph        = phase::respond;
+    c->close_after_write = head.close;
+    c->spliced   = false;
+    ++m_c.copied_gets;
+    ++m_c.tier_gets;
     c->after_write = conn::after_kind::pump;
     access_log(c, head.status, len);
     queue_write(c, response_head(*c, head));
@@ -498,7 +533,7 @@ void storage_run::sealed_pump(const std::shared_ptr<conn>& c)
         if (!ok || plain.empty() || plain.size() > cc->file_left)
         {
             // The headers promised the bytes, so a chunk that does not open can only end the connection.
-            LOG_WARN(("storage: the encrypted object \"" + cc->req.key + "\" could not be read whole: a chunk is "
+            LOG_WARN(("storage: the object \"" + cc->req.key + "\" could not be read whole: a chunk is "
                       "missing or does not open").c_str());
             close_conn(cc);
             return;
@@ -693,7 +728,7 @@ void storage_run::copy_sealed(const std::shared_ptr<conn>& c, std::string src_bu
 {
     s3_request& r = c->req;
     // The copy is one stream of its own, under a key of its own, and a version only its owner gives.
-    std::erase_if(meta.extra, [](const auto& e) { return e.first == sse_extra; });
+    erase_if(meta.extra, [](const auto& e) { return e.first == sse_extra; });
     clear_part_layout(meta);
     clear_version_extra(meta);
     // The checksum is taken of the bytes read, since the source opened below may be newer than `src`.

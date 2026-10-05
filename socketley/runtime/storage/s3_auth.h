@@ -175,6 +175,17 @@ public:
     {
         return false;
     }
+    // The same for user `user_id`, signed under one of its long-term keys, for an identity an outside provider vouched
+    // for; false for a user with no key here.
+    virtual bool issue_session_as(std::string_view /*user_id*/, int64_t /*expires*/, std::string_view /*policy*/,
+                                  std::string_view /*role*/, session_credentials& /*out*/)
+    {
+        return false;
+    }
+    // Whether user `id` is one the credentials or the IAM API declared.
+    virtual bool has_user(std::string_view /*id*/) const { return false; }
+    // The id of the user whose email is `email`, empty for none.
+    virtual std::string user_of_email(std::string_view /*email*/) const { return {}; }
     // Whether the IAM role `role` lets user `user_id` assume it: -1 for no such role, 0 for a refusal, 1 with
     // `max_session` set to the longest session it gives.
     virtual int role_check(std::string_view /*role*/, std::string_view /*user_id*/, int64_t& /*max_session*/)

@@ -41,7 +41,7 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
     m_meta.parts = 0;
 
     // A sealed body that may go to a pooled file has room in its header for the digest its roll forward checks.
-    std::erase_if(m_meta.extra, [](const auto& e) { return e.first == stored_md5_extra; });
+    erase_if(m_meta.extra, [](const auto& e) { return e.first == stored_md5_extra; });
     const bool may_pool = plain && size_known && expected <= object_store::pooled_max && store->owns(m_bucket, m_key);
     if (seal && may_pool)
         m_meta.extra.emplace_back(std::string(stored_md5_extra), std::string(2 * sizeof(md5_t), '0'));
@@ -109,7 +109,7 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
         return;
     }
     // The room stays reserved, which a header that pads to it does not miss.
-    std::erase_if(m_meta.extra, [](const auto& e) { return e.first == stored_md5_extra; });
+    erase_if(m_meta.extra, [](const auto& e) { return e.first == stored_md5_extra; });
     m_tmp_name = store->tmp_name();
     auto self = shared_from_this();
     const bool queued = store->m_io->openat(b->tmp_fd, m_tmp_name, O_WRONLY | O_CREAT | O_EXCL, 0600,

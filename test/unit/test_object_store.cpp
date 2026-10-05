@@ -3180,7 +3180,7 @@ TEST_CASE("a sealed pooled put whose rename a crash took is rolled forward by th
         {
             // A header that names no digest of its sealed bytes cannot be checked at all.
             object_meta m = h.meta;
-            std::erase_if(m.extra, [](const auto& e) { return e.first == stored_md5_extra; });
+            erase_if(m.extra, [](const auto& e) { return e.first == stored_md5_extra; });
             f = encode_object_header(h.key, m, h.header_len) + f.substr(h.header_len);
         }
         fs::rename(data_path(d.path, "bkt", "key"), pool);

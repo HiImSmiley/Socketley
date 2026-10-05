@@ -149,6 +149,44 @@ bool arn_covers(std::string_view pat, const policy_request& r, bool object, bool
     return lit.starts_with(res) || std::string_view(res).starts_with(lit);
 }
 
+// The one policy variable an IAM resource may hold, as the compiler writes it whatever case it was given in.
+constexpr std::string_view username_var = "${aws:username}";
+
+// Whether a statement's IAM resources name what `r` acts on, ${aws:username} read as the caller's user id.
+bool iam_covers(const bucket_policy::statement& s, const policy_request& r)
+{
+    if (s.iam_any)
+        return true;
+    if (r.iam_resource.empty())
+        return false;
+    std::string filled;
+    for (const std::string& pat : s.iam_arns)
+    {
+        if (pat.find(username_var) == std::string::npos)
+        {
+            if (wild_match(pat, r.iam_resource, false))
+                return true;
+            continue;
+        }
+        // A variable with no value matches nothing, as IAM has it.
+        if (r.user.empty())
+            continue;
+        filled.clear();
+        for (size_t at = 0; at < pat.size();)
+        {
+            const size_t v = pat.find(username_var, at);
+            filled.append(pat, at, v == std::string::npos ? std::string::npos : v - at);
+            if (v == std::string::npos)
+                break;
+            filled.append(r.user);
+            at = v + username_var.size();
+        }
+        if (wild_match(filled, r.iam_resource, false))
+            return true;
+    }
+    return false;
+}
+
 // ─── The actions ────────────────────────────────────────────────────────────
 
 enum class res_kind : uint8_t { object, bucket, service };
@@ -255,6 +293,7 @@ uint64_t action_bit(s3_action a)
 // ─── Compiling ──────────────────────────────────────────────────────────────
 
 constexpr std::string_view s3_arn = "arn:aws:s3:::";
+constexpr std::string_view iam_arn = "arn:aws:iam::";
 
 struct compiler
 {
@@ -373,6 +412,19 @@ struct compiler
         for (const std::string& a : list)
         {
             std::string_view pat = a;
+            // An identity policy may name IAM's actions, any IAM has, of which those this runtime answers get a bit.
+            if (identity && pat.size() > 4 && lower(pat[0]) == 'i' && lower(pat[1]) == 'a' && lower(pat[2]) == 'm' &&
+                pat[3] == ':')
+            {
+                pat.remove_prefix(4);
+                for (char ch : pat)
+                    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '*' || ch == '?'))
+                        return fail("Policy has invalid action: " + a);
+                for (size_t i = 0; i < std::size(iam_action_names); ++i)
+                    if (wild_match(pat, iam_action_names[i], true))
+                        s.iam_actions |= uint64_t{1} << i;
+                continue;
+            }
             if (pat != "*")
             {
                 if (pat.size() < 3 || lower(pat[0]) != 's' || pat[1] != '3' || pat[2] != ':')
@@ -396,6 +448,31 @@ struct compiler
         return true;
     }
 
+    // An IAM resource after "arn:aws:iam::": any account, then what it names, with ${aws:username} its one variable.
+    bool iam_resource(const std::string& whole, std::string_view rest, bucket_policy::statement& s)
+    {
+        const size_t colon = rest.find(':');
+        if (colon == std::string_view::npos || colon + 1 == rest.size() ||
+            rest.substr(0, colon).find('/') != std::string_view::npos)
+            return fail("Policy has invalid resource: " + whole);
+        rest.remove_prefix(colon + 1);
+        std::string pat;
+        for (size_t at = 0; at < rest.size();)
+        {
+            const size_t v = rest.find("${", at);
+            pat.append(rest.substr(at, v == std::string_view::npos ? std::string_view::npos : v - at));
+            if (v == std::string_view::npos)
+                break;
+            const size_t end = rest.find('}', v);
+            if (end == std::string_view::npos || lowered(rest.substr(v, end + 1 - v)) != username_var)
+                return fail("Policy has invalid resource: the only policy variable supported is ${aws:username}: " + whole);
+            pat += username_var;
+            at = end + 1;
+        }
+        s.iam_arns.push_back(std::move(pat));
+        return true;
+    }
+
     bool resources(const jvalue& v, bucket_policy::statement& s)
     {
         std::vector<std::string> list;
@@ -408,6 +485,13 @@ struct compiler
             if (identity && rv == "*")
             {
                 s.arns.emplace_back("*");
+                s.iam_any = true;
+                continue;
+            }
+            if (identity && rv.starts_with(iam_arn))
+            {
+                if (!iam_resource(r, rv.substr(iam_arn.size()), s))
+                    return false;
                 continue;
             }
             if (!rv.starts_with(s3_arn))
@@ -467,51 +551,7 @@ struct compiler
         return true;
     }
 
-    bool parse_cidr(std::string_view text, bucket_policy::cidr& c)
-    {
-        std::string addr(text);
-        int bits = -1;
-        if (const size_t slash = addr.find('/'); slash != std::string::npos)
-        {
-            const std::string_view b = std::string_view(addr).substr(slash + 1);
-            if (b.empty() || b.size() > 3)
-                return false;
-            bits = 0;
-            for (char ch : b)
-            {
-                if (ch < '0' || ch > '9')
-                    return false;
-                bits = bits * 10 + (ch - '0');
-            }
-            addr.resize(slash);
-        }
-        if (::inet_pton(AF_INET, addr.c_str(), c.addr) == 1)
-        {
-            c.family = 4;
-            if (bits > 32)
-                return false;
-            c.bits = static_cast<uint8_t>(bits < 0 ? 32 : bits);
-            return true;
-        }
-        if (::inet_pton(AF_INET6, addr.c_str(), c.addr) == 1)
-        {
-            c.family = 6;
-            if (bits > 128)
-                return false;
-            c.bits = static_cast<uint8_t>(bits < 0 ? 128 : bits);
-            // An IPv4 address written as IPv6 is compared as IPv4, as the client's own address is.
-            static constexpr uint8_t mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
-            if (std::memcmp(c.addr, mapped, 12) == 0 && c.bits >= 96)
-            {
-                std::memmove(c.addr, c.addr + 12, 4);
-                std::memset(c.addr + 4, 0, 12);
-                c.family = 4;
-                c.bits   = static_cast<uint8_t>(c.bits - 96);
-            }
-            return true;
-        }
-        return false;
-    }
+    bool parse_cidr(std::string_view text, bucket_policy::cidr& c) { return parse_cidr_text(text, c); }
 
     // The one key an operator takes here, compared without case as IAM compares condition keys.
     bool only_key(const jvalue& block, std::string_view op, std::string_view key, const jvalue*& val)
@@ -837,7 +877,66 @@ struct compiler
 
 }   // namespace
 
+bool parse_cidr_text(std::string_view text, bucket_policy::cidr& c)
+{
+    std::string addr(text);
+    int bits = -1;
+    if (const size_t slash = addr.find('/'); slash != std::string::npos)
+    {
+        const std::string_view b = std::string_view(addr).substr(slash + 1);
+        if (b.empty() || b.size() > 3)
+            return false;
+        bits = 0;
+        for (char ch : b)
+        {
+            if (ch < '0' || ch > '9')
+                return false;
+            bits = bits * 10 + (ch - '0');
+        }
+        addr.resize(slash);
+    }
+    if (::inet_pton(AF_INET, addr.c_str(), c.addr) == 1)
+    {
+        c.family = 4;
+        if (bits > 32)
+            return false;
+        c.bits = static_cast<uint8_t>(bits < 0 ? 32 : bits);
+        return true;
+    }
+    if (::inet_pton(AF_INET6, addr.c_str(), c.addr) == 1)
+    {
+        c.family = 6;
+        if (bits > 128)
+            return false;
+        c.bits = static_cast<uint8_t>(bits < 0 ? 128 : bits);
+        // An IPv4 address written as IPv6 is compared as IPv4, as the client's own address is.
+        static constexpr uint8_t mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+        if (std::memcmp(c.addr, mapped, 12) == 0 && c.bits >= 96)
+        {
+            std::memmove(c.addr, c.addr + 12, 4);
+            std::memset(c.addr + 4, 0, 12);
+            c.family = 4;
+            c.bits   = static_cast<uint8_t>(c.bits - 96);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool cidr_holds(const bucket_policy::cidr& c, const client_ip& ip)
+{
+    return cidr_matches(c, ip);
+}
+
 // ─── The interface ──────────────────────────────────────────────────────────
+
+int iam_action_index(std::string_view name)
+{
+    for (size_t i = 0; i < std::size(iam_action_names); ++i)
+        if (iam_action_names[i] == name)
+            return static_cast<int>(i);
+    return -1;
+}
 
 s3_action action_of_operation(std::string_view op)
 {
@@ -845,6 +944,7 @@ s3_action action_of_operation(std::string_view op)
     static constexpr row table[] = {
         {"GetObject", s3_action::get_object},
         {"HeadObject", s3_action::get_object},
+        {"SelectObjectContent", s3_action::get_object},
         {"GetObjectAttributes", s3_action::get_object_attributes},
         {"GetBucketAcl", s3_action::get_bucket_acl},
         {"GetBucketTagging", s3_action::get_bucket_tagging},
@@ -1114,12 +1214,13 @@ policy_effect bucket_policy::evaluate(const policy_request& r) const
 {
     if (!m_broken.empty())
         return policy_effect::deny;
-    const uint64_t bit = action_bit(r.action);
-    const bool object  = action_on_object(r.action);
+    const bool iam     = r.iam_action >= 0;
+    const uint64_t bit = iam ? uint64_t{1} << r.iam_action : action_bit(r.action);
+    const bool object  = !iam && action_on_object(r.action);
     bool allowed = false;
     for (const statement& s : m_statements)
     {
-        if (!(s.actions & bit))
+        if (!((iam ? s.iam_actions : s.actions) & bit))
             continue;
         if (!m_identity && !s.any_principal)
         {
@@ -1132,7 +1233,9 @@ policy_effect bucket_policy::evaluate(const policy_request& r) const
                 continue;
         }
         bool covered = false;
-        if (m_identity)
+        if (iam)
+            covered = iam_covers(s, r);
+        else if (m_identity)
         {
             for (size_t i = 0; !covered && i < s.arns.size(); ++i)
                 covered = arn_covers(s.arns[i], r, object, s.deny);
@@ -1166,6 +1269,14 @@ policy_effect bucket_policy::evaluate(const policy_request& r) const
         allowed = true;
     }
     return allowed ? policy_effect::allow : policy_effect::none;
+}
+
+bool bucket_policy::allows_iam() const
+{
+    for (const statement& s : m_statements)
+        if (!s.deny && s.iam_actions != 0 && (s.iam_any || !s.iam_arns.empty()))
+            return true;
+    return false;
 }
 
 namespace

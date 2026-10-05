@@ -927,9 +927,10 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         w.probe_dir = media_dir + "/" + sha256_hex("probe\n" + w.object);
         w.asked_ms = now_ms();
         w.deadline_ms = w.asked_ms + media_wait_ms;
-        // An unencrypted object's file, opened once a minute a shard, is what ffmpeg reads; a medium made needs none.
+        // An object's file whose bytes are stored as they are, opened once a minute a shard, is what ffmpeg reads; a
+        // medium made needs none.
         const bool made = m_media_done.contains(w.dir);
-        if (made || is_encrypted(m) || m_media_srcs.contains(w.object))
+        if (made || is_encrypted(m) || is_compressed(m) || is_tiered(m) || m_media_srcs.contains(w.object))
         {
             media_continue(cc, std::move(w));
             return;
@@ -938,7 +939,9 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         const std::string b = w.bucket, k = w.key;
         m_store.open_object(b, k, 0, [this, weak2, want2 = std::move(w), etag](open_result o) mutable
         {
-            if (o.status == st::ok && o.fd >= 0 && !is_encrypted(o.meta) && o.meta.etag() == etag &&
+            if (o.status == st::ok && o.fd >= 0 && !is_encrypted(o.meta) && !is_compressed(o.meta) &&
+                !is_tiered(o.meta) &&
+                o.meta.etag() == etag &&
                 !m_media_srcs.contains(want2.object))
             {
                 m_media_srcs[want2.object] = {o.fd, o.data_off, o.meta.size, now_ms()};

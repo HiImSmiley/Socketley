@@ -869,6 +869,10 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
                 s3_error err;
                 ok = sse_data_key(o.meta, std::nullopt, key, err) && sse_open_body(o.meta, key, o.prefetch, body);
             }
+            else if (ok && is_tiered(o.meta))
+                ok = false;
+            else if (ok && is_compressed(o.meta))
+                ok = lz4_open_body(o.meta, o.prefetch, body);
             else if (ok)
                 body = o.prefetch.substr(0, static_cast<size_t>(std::min<uint64_t>(o.meta.size, o.prefetch.size())));
             if (!ok || body.size() != o.meta.size)

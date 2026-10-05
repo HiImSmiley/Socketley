@@ -109,7 +109,7 @@ void storage_run::replication_mark(std::string_view bucket, std::string_view key
     set_replication_status(m, {});
     // A copy of a replica is no replica, so the source's version id it carried goes with the status, as does the stamp
     // of another node's write.
-    std::erase_if(m.extra, [](const auto& e) { return e.first == replica_version_extra; });
+    erase_if(m.extra, [](const auto& e) { return e.first == replica_version_extra; });
     clear_cluster_extra(m);
     // A replica is not copied on, which is what keeps two buckets that replicate to each other from doing so forever.
     if (replica)

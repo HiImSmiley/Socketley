@@ -11,7 +11,7 @@ namespace socketley::storage
 
 struct public_access_block
 {
-    // ACLs are disabled here, so a public ACL is refused whatever these two say.
+    // A public ACL is refused where the first is set, and counts for nothing where the second is.
     bool block_public_acls{false};
     bool ignore_public_acls{false};
     bool block_public_policy{false};

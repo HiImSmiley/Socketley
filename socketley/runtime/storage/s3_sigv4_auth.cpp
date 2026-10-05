@@ -354,6 +354,22 @@ const user_identity* credential_set::find_user(std::string_view id) const
     return it == m_users.end() ? nullptr : it->second.get();
 }
 
+std::string credential_set::user_of_email(std::string_view email) const
+{
+    for (const auto& [id, u] : m_users)
+        if (!u->email.empty() && u->email == email)
+            return id;
+    return {};
+}
+
+std::string_view credential_set::key_of(std::string_view id) const
+{
+    for (const auto& [key, e] : m_map)
+        if (e.user && e.user->id == id)
+            return key;
+    return {};
+}
+
 bool parse_credentials(std::string_view text, credential_set& out, std::string& err, std::string_view dir,
                        std::vector<std::string>* files)
 {
@@ -462,6 +478,15 @@ bool parse_credentials(std::string_view text, credential_set& out, std::string& 
                 }
                 user->has_policy = true;
             }
+            else if (name == "email")
+            {
+                if (value.find('@') == std::string_view::npos)
+                {
+                    err = where + ": the email of user " + user->id + " has no @";
+                    return false;
+                }
+                user->email = std::string(value);
+            }
             else if (name == "max_bytes")
             {
                 size_t bytes = 0;
@@ -474,7 +499,7 @@ bool parse_credentials(std::string_view text, credential_set& out, std::string& 
             }
             else
             {
-                err = where + ": " + std::string(name) + " is not a setting of a user (name, admin, policy, max_bytes)";
+                err = where + ": " + std::string(name) + " is not a setting of a user (name, email, admin, policy, max_bytes)";
                 return false;
             }
             continue;
@@ -726,6 +751,13 @@ bool sigv4_authenticator::issue_session(std::string_view access_key, int64_t exp
     out.token      = sts_token(g, parent);
     out.expires    = expires;
     return true;
+}
+
+bool sigv4_authenticator::issue_session_as(std::string_view user_id, int64_t expires, std::string_view policy,
+                                           std::string_view role, session_credentials& out)
+{
+    const std::string_view key = m_creds.key_of(user_id);
+    return !key.empty() && issue_session(key, expires, policy, role, out);
 }
 
 std::string_view sigv4_authenticator::session_secret(std::string_view token, std::string_view access_key, int64_t now,

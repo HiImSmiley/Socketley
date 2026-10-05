@@ -96,6 +96,25 @@ enum class s3_action : uint8_t
 };
 static_assert(static_cast<int>(s3_action::count) <= 64);
 
+// The IAM actions this runtime answers, by the name a policy gives them after "iam:"; an identity policy keeps a bit
+// for each by its place here.
+inline constexpr std::string_view iam_action_names[] = {
+    "CreateUser", "GetUser", "ListUsers", "UpdateUser", "DeleteUser",
+    "CreateAccessKey", "ListAccessKeys", "UpdateAccessKey", "DeleteAccessKey",
+    "PutUserPolicy", "GetUserPolicy", "ListUserPolicies", "DeleteUserPolicy",
+    "AttachUserPolicy", "DetachUserPolicy", "ListAttachedUserPolicies",
+    "CreateGroup", "GetGroup", "ListGroups", "DeleteGroup", "AddUserToGroup", "RemoveUserFromGroup",
+    "ListGroupsForUser", "PutGroupPolicy", "GetGroupPolicy", "ListGroupPolicies", "DeleteGroupPolicy",
+    "AttachGroupPolicy", "DetachGroupPolicy", "ListAttachedGroupPolicies",
+    "CreateRole", "GetRole", "ListRoles", "UpdateRole", "DeleteRole",
+    "PutRolePolicy", "GetRolePolicy", "ListRolePolicies", "DeleteRolePolicy",
+    "AttachRolePolicy", "DetachRolePolicy", "ListAttachedRolePolicies",
+};
+static_assert(std::size(iam_action_names) < 64);
+
+// The place of `name` in iam_action_names, -1 for an action this runtime does not answer.
+int iam_action_index(std::string_view name);
+
 // The action an operation, by the name storage_run::operation_name gives it, is checked as.
 s3_action action_of_operation(std::string_view operation);
 
@@ -129,6 +148,10 @@ public:
 struct policy_request
 {
     s3_action        action{s3_action::none};
+    // An IAM request's action by its place in iam_action_names, which `action` is then ignored for; -1 for S3's.
+    int              iam_action{-1};
+    // The IAM resource it acts on after "arn:aws:iam::<account>:", as user/<path><name>, empty for none.
+    std::string_view iam_resource;
     // The bucket it acts on, which only an identity policy's resources are matched against.
     std::string_view bucket;
     // The object's key, for an action on an object.
@@ -175,6 +198,8 @@ public:
 
     // Whether some statement denies, which is all a signed request is checked for.
     bool has_deny() const { return m_has_deny; }
+    // Whether some Allow names an IAM action on some resource, so the policy may let its holder call IAM.
+    bool allows_iam() const;
     // Whether some statement compares the client's address, so the caller has to know it.
     bool needs_ip() const { return m_needs_ip; }
     // Whether an Allow lets everyone in without narrowing them to some addresses, as GetBucketPolicyStatus answers.
@@ -227,6 +252,12 @@ public:
         std::vector<key_pattern> objects;
         // An identity policy's resources, each an ARN without "arn:aws:s3:::" matched as IAM matches it.
         std::vector<std::string> arns;
+        // The IAM actions, a bit for each by its place in iam_action_names.
+        uint64_t iam_actions{0};
+        // An identity policy's IAM resources after "arn:aws:iam::<account>:", ${aws:username} kept to be filled in.
+        std::vector<std::string> iam_arns;
+        // Resource "*", the one that covers an IAM action on no resource.
+        bool     iam_any{false};
         bool     has_ip_in{false};
         std::vector<cidr> ip_in;
         bool     has_ip_out{false};
@@ -262,5 +293,10 @@ private:
     bool m_needs_ip{false};
     bool m_public{false};
 };
+
+// An address or a block of them, `a.b.c.d[/n]` or an IPv6 one, as aws:SourceIp takes it; false for none.
+bool parse_cidr_text(std::string_view text, bucket_policy::cidr& out);
+// Whether `ip` is in the block.
+bool cidr_holds(const bucket_policy::cidr& c, const client_ip& ip);
 
 }   // namespace socketley::storage

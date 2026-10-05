@@ -31,7 +31,10 @@
 #include "post_policy.h"
 #include "cluster.h"
 #include "replicator.h"
+#include "compactor.h"
 #include "scrubber.h"
+#include "tierer.h"
+#include "s3_federation.h"
 #include "s3_auth.h"
 #include "s3_users.h"
 #include "../../shared/storage_rpc.h"
@@ -59,6 +62,9 @@ struct storage_counters
     uint64_t deletes{0};
     uint64_t lists{0};
     uint64_t copies{0};
+    // SelectObjectContent requests answered, and the object bytes they scanned.
+    uint64_t selects{0};
+    uint64_t select_scanned{0};
     uint64_t client_errors{0};
     uint64_t server_errors{0};
     // Body bytes sent to clients, and the part of them that never entered this
@@ -99,6 +105,10 @@ struct storage_counters
     // Bodies written encrypted, and GETs answered by opening an encrypted object's chunks.
     uint64_t sse_puts{0};
     uint64_t sse_gets{0};
+    // GETs of a compressed body that its chunks were opened for, beyond the ones from memory.
+    uint64_t compressed_gets{0};
+    // GETs of a version moved to a tier, read from there.
+    uint64_t tier_gets{0};
     // Media ffmpeg made and failed to make, and the answers served from what it made.
     uint64_t media_made{0};
     uint64_t media_failed{0};
@@ -259,6 +269,11 @@ enum class phase : uint8_t
 class storage_run;
 
 struct response;
+struct select_job;
+
+// What of a bucket's ACL, and of an object's own, a request of action `a` needs, none for one they say nothing to.
+uint8_t bucket_acl_need(s3_action a);
+uint8_t object_acl_need(s3_action a);
 struct share_link;
 
 // What ffprobe said of an object: a stream's ladder, playlists and filters are made from it.
@@ -394,6 +409,8 @@ struct conn
     // ── A file being sent ───────────────────────────────────────────────────
     // The chunks of an encrypted object, opened a window at a time, which the file's bytes are sent through.
     std::shared_ptr<body_reader> dec;
+    // A SelectObjectContent streaming its answer, which the pump feeds instead of a file's bytes.
+    std::shared_ptr<select_job> sel;
     int         file_fd{-1};
     uint64_t    file_off{0};
     uint64_t    file_left{0};
@@ -424,6 +441,10 @@ struct conn
     bool        policy_admitted{false};
     // A missing key is answered AccessDenied, for a requester a policy lets read and not list, as S3 does.
     bool        hide_missing{false};
+    // The grants the object's own ACL must give, the bucket's having left the request to them.
+    uint8_t     acl_need{0};
+    // An ACL's grant admitted the request, which its access log line says.
+    bool        by_acl{false};
     // The S3 error code the answer carries, for the access log.
     std::string error_code;
     // Given the answer before it is sent, by an application that turns an S3 answer into its own; it sends it on.
@@ -471,6 +492,8 @@ struct lifecycle_pass
         bool        upload{false};
         // A version removed for good, rather than the latest object expired.
         std::string version_id{};
+        // The tier the version moves to, rather than being removed.
+        std::string tier{};
     };
     std::deque<due_key> due;
     uint32_t inflight{0};
@@ -479,6 +502,7 @@ struct lifecycle_pass
     bool     pumping{false};
     uint64_t expired{0};
     uint64_t aborted{0};
+    uint64_t moved{0};
 };
 
 // One request's result, which every operation ends by giving to respond().
@@ -498,6 +522,8 @@ struct response
     bool        has_length_override{false};
     uint64_t    length_override{0};
     bool        close{false};
+    // The body follows in chunks of a length not known when the head is sent.
+    bool        chunked{false};
 };
 
 class storage_run : public io_handler, public change_sink
@@ -562,6 +588,32 @@ public:
             arm_sweep();
     }
     const scrubber& scrub() const { return m_scrub; }
+    // Versions unwritten for `secs` are compressed, 0 for none.
+    void set_compress_secs(uint32_t secs)
+    {
+        m_compact.set_age(secs);
+        if (secs)
+            arm_sweep();
+    }
+    const compactor& compaction() const { return m_compact; }
+    // The tiers a bucket's lifecycle may move versions to, each named as the storage class its rules give.
+    void set_tiers(std::vector<replication_target> tiers)
+    {
+        m_tier.set_tiers(std::move(tiers));
+        if (m_tier.enabled())
+            arm_sweep();
+    }
+    const tierer& tiers() const { return m_tier; }
+    // The addresses whose connections arrive from a proxy that terminated TLS for them (--tls-offloaded).
+    void set_tls_offloaded(std::vector<bucket_policy::cidr> from) { m_tls_offloaded = std::move(from); }
+    // Whether the client reached the runtime over TLS, here or at a proxy --tls-offloaded trusts.
+    bool secure(conn& c);
+    // The OIDC provider and LDAP directory STS takes identities from (--federation).
+    void set_federation(federation_config cfg)
+    {
+        m_fed  = std::make_unique<federation_config>(std::move(cfg));
+        m_oidc = m_fed->oidc.enabled() ? std::make_unique<oidc_verifier>(m_fed->oidc) : nullptr;
+    }
     // A version the scrub found corrupt: logged, and in a cluster taken away and sent again by a node that holds it.
     void scrub_found(scrubber::finding f);
     // Reads the id of this node's data, or makes it; blocking, so it runs at open().
@@ -695,9 +747,21 @@ public:
     void op_create_bucket(const std::shared_ptr<conn>& c);
     void op_delete_bucket(const std::shared_ptr<conn>& c);
     void op_head_bucket(const std::shared_ptr<conn>& c);
-    // False with `err` S3's refusal when a write asks for an ACL other than full control for `owner`.
-    bool acl_headers_ok(const s3_request& r, bool bucket, std::string_view owner, std::string_view requester,
-                        s3_error& err) const;
+    // False with `err` S3's refusal of a write's ACL headers, `bucket` for a bucket being made.
+    bool acl_headers_ok(const std::shared_ptr<conn>& c, bool bucket, s3_error& err);
+    // The bucket's ownership, its default when it was given none: ObjectWriter under --acls, else BucketOwnerEnforced.
+    object_ownership bucket_ownership(std::string_view bucket) const;
+    // Who an ACL's grant may name.
+    acl_resolver acl_users() const;
+    // Makes `m`, a new object's, hold the owner and grants its write asks for where the bucket takes ACLs.
+    bool object_acl_stamp(const std::shared_ptr<conn>& c, object_meta& m, s3_error& err);
+    // Whether the object's own grants give the requester what its request needs of them, when the bucket left that
+    // to them.
+    bool acl_admits(const std::shared_ptr<conn>& c, const object_meta& m);
+    // Makes a new bucket's ownership and ACL what its CreateBucket asked for, then runs `then`.
+    void create_bucket_docs(const std::shared_ptr<conn>& c, const std::string& name, std::function<void(st)> then);
+    // ACLs are taken by every bucket that was given no ownership controls (--acls).
+    void set_acls_default(bool on) { m_acls_default = on; }
     // False with `err` when a write asks for a storage class S3 does not have.
     static bool storage_class_ok(const s3_request& r, s3_error& err);
     void op_get_acl(const std::shared_ptr<conn>& c);
@@ -722,7 +786,7 @@ public:
     {
         if (user && user->cluster)
             return false;
-        return m_store.any_policy() || (user && !user->unrestricted());
+        return m_store.any_policy() || m_store.any_acls() || m_acls_default || (user && !user->unrestricted());
     }
     // Judges an authenticated or anonymous request by ownership and the policies of the buckets it touches,
     // changing `v`.
@@ -731,6 +795,9 @@ public:
     // matches, allow when the user owns the bucket, is an admin or is let by a policy, and none otherwise.
     policy_effect access_of(const std::shared_ptr<conn>& c, std::string_view bucket, const policy_request& q,
                             const user_identity* user);
+    // What a user's own policies say to IAM action `action`, its place in iam_action_names, on `resource`.
+    policy_effect iam_access(const std::shared_ptr<conn>& c, const user_identity& u, std::string_view principal,
+                             int action, std::string_view resource);
     // The id of the user that owns `bucket`, the default owner for one that names none.
     std::string_view owner_of(std::string_view bucket) const
     {
@@ -772,7 +839,8 @@ public:
                     std::string_view key = {}, std::string_view error = {});
     // Delivers the access logs held longer than the delivery interval, or every one when `all`.
     void flush_access_logs(bool all);
-    void deliver_access_log(const std::string& target, std::string key, bool partitioned, std::string data);
+    void deliver_access_log(const std::string& target, std::string key, bool partitioned, const std::string& acl,
+                            std::string data);
     void op_get_public_access(const std::shared_ptr<conn>& c);
     void op_put_public_access(const std::shared_ptr<conn>& c);
     void op_delete_public_access(const std::shared_ptr<conn>& c);
@@ -853,7 +921,17 @@ public:
     void media_stop();
     // STS's GetSessionToken and AssumeRole, POST / with a form, answered with temporary credentials.
     void op_sts(const std::shared_ptr<conn>& c);
-    // IAM's users, keys, groups, roles and their policies, in storage_iam.cpp, for an admin's request.
+    // AssumeRoleWithWebIdentity and AssumeRoleWithLDAPIdentity, which carry no signature: an outside provider vouches
+    // for the caller, and the session signs as the user the provider file maps it to.
+    void op_sts_federated(const std::shared_ptr<conn>& c, const std::vector<std::pair<std::string, std::string>>& fields,
+                          std::string_view action);
+    void sts_fail(const std::shared_ptr<conn>& c, int status, std::string_view code, std::string_view message);
+    // Mints the session of a federated caller mapped to `user`, as `action` answers it.
+    void sts_federated_session(const std::shared_ptr<conn>& c, std::string_view action, const std::string& user,
+                               const std::string& role_arn, const std::string& session_name, int64_t duration,
+                               const std::string& policy);
+    // IAM's users, keys, groups, roles and their policies, in storage_iam.cpp, for an admin, or a user its policies
+    // allow.
     void op_iam(const std::shared_ptr<conn>& c, const std::vector<std::pair<std::string, std::string>>& fields,
                 std::string_view action, const auth_verdict& v);
     // A request to a bucket's website: an object, its index document, a redirect, or an error page.
@@ -966,9 +1044,15 @@ public:
     // hands `then` the header of the file it came from, the file still open for a GET, and the list.
     void read_part_list(const std::shared_ptr<conn>& c, const object_meta& m, int fd, uint64_t data_off, bool head,
                         std::function<void(const object_meta&, int, uint64_t, bool, const part_list&)> then);
+    // A body that is sealed, opened with `key`, or compressed, opened with none.
     void send_sealed(const std::shared_ptr<conn>& c, response head, int fd, uint64_t data_off, const object_meta& m,
-                     const sse_key& key, uint64_t first, uint64_t len);
+                     const sse_key* key, uint64_t first, uint64_t len);
+    // A body `reader` brings from elsewhere, a version moved to a tier.
+    void send_reader(const std::shared_ptr<conn>& c, response head, std::shared_ptr<body_reader> reader, uint64_t len);
     void sealed_pump(const std::shared_ptr<conn>& c);
+    // SelectObjectContent: a SQL expression run over a CSV or JSON object, answered as an event stream.
+    void op_select(const std::shared_ptr<conn>& c);
+    void select_pump(const std::shared_ptr<conn>& c);
     // Feeds [first, first + len) of a source object's plaintext into `op`, opening it with the key `customer`
     // or the master gives, and runs `done` with the put's result; a failure on the way is answered here.
     struct copy_feed;
@@ -1056,6 +1140,15 @@ private:
     notifier          m_notify;
     replicator        m_repl;
     scrubber          m_scrub;
+    compactor         m_compact;
+    tierer            m_tier;
+    std::vector<bucket_policy::cidr> m_tls_offloaded;
+    bool              m_acls_default{false};
+    std::unique_ptr<federation_config> m_fed;
+    std::unique_ptr<oidc_verifier> m_oidc;
+    // The thread an LDAP bind waits on, apart from the digests', since a bind may take seconds.
+    hash_pool         m_ldap_pool{1};
+    bool              m_ldap_attached{false};
     // The name the cluster file gives this node, empty for a runtime that is no node of one, and the id of its data.
     std::string       m_cluster_self;
     std::string       m_cluster_id;
@@ -1216,9 +1309,13 @@ private:
         // The key in front of the object's name, the date partition excepted.
         std::string prefix;
         bool        partitioned{false};
+        // The ACL each log object is written with, empty for its owner's full control.
+        std::string acl;
         std::string data;
         std::chrono::steady_clock::time_point since{};
     };
+    // The ACL TargetGrants give a log object in `target`, false with `err` for a grantee that is no one.
+    bool logging_acl(const logging_config& cfg, std::string& out, s3_error& err) const;
     std::map<std::string, access_log_buffer, std::less<>> m_access_logs;
     std::vector<std::shared_ptr<whole_put>> m_log_deliveries;
     std::string m_log_line;

@@ -49,7 +49,9 @@
 #include <vector>
 
 #include "checksum.h"
+#include "compression.h"
 #include "object_format.h"
+#include "s3_acl.h"
 #include "sse.h"
 #include "sync_mode.h"
 #include "../../shared/event_loop.h"
@@ -88,13 +90,16 @@ enum class bucket_doc : uint8_t
     website,
     public_access,
     logging,
+    ownership,
+    acl,
 };
 // Every kind, for the walks that settle or take up all of a bucket's documents.
 inline constexpr bucket_doc all_bucket_docs[] = {bucket_doc::cors,       bucket_doc::lifecycle, bucket_doc::policy,
                                                  bucket_doc::versioning, bucket_doc::encryption, bucket_doc::tagging,
                                                  bucket_doc::object_lock, bucket_doc::notification,
                                                  bucket_doc::replication, bucket_doc::quota, bucket_doc::website,
-                                                 bucket_doc::public_access, bucket_doc::logging};
+                                                 bucket_doc::public_access, bucket_doc::logging,
+                                                 bucket_doc::ownership, bucket_doc::acl};
 
 // A bucket's versioning: never configured, keeping every version, or writing the null version.
 enum class versioning : uint8_t
@@ -359,10 +364,10 @@ struct change_origin
 // A change of what a version keeps in its header's slots, made in place by the owner of its key.
 struct header_change
 {
-    enum class kind : uint8_t { tags, retention, legal_hold, replication };
+    enum class kind : uint8_t { tags, retention, legal_hold, replication, acl };
     kind        what{kind::tags};
-    // The tags in the encoding of tags_of(), the retention in retention_extra's (empty to remove it), ON or OFF, or
-    // the replication status a version's replication came to.
+    // The tags in the encoding of tags_of(), the retention in retention_extra's (empty to remove it), ON or OFF, the
+    // replication status a version's replication came to, or the ACL in encode_acl()'s (empty for the default).
     std::string value;
     // The caller may shorten, remove or change a GOVERNANCE retention.
     bool        bypass{false};
@@ -785,7 +790,12 @@ public:
     std::shared_ptr<const public_access_block> bucket_public_access(std::string_view name) const;
     // Where the bucket's access log goes, null when it is not logged.
     std::shared_ptr<const logging_config> bucket_logging(std::string_view name) const;
+    // The bucket's ownership controls, unset when it was given none, and its ACL, null for its owner's full control.
+    object_ownership bucket_ownership(std::string_view name) const;
+    std::shared_ptr<const acl_list> bucket_acl(std::string_view name) const;
     bool any_logging() const { return m_logging_buckets != 0; }
+    // Whether a bucket takes ACLs, which every request then has its grants judged for.
+    bool any_acls() const { return m_acl_buckets != 0; }
     // The quota on the bytes of every bucket user `owner` owns, 0 for none, asked of whoever knows the users.
     void set_owner_quota(std::function<uint64_t(std::string_view owner)> fn) { m_owner_quota = std::move(fn); }
     // Every version of `bucket` this shard indexes, the latest of each key and the others, delete markers included.
@@ -907,6 +917,17 @@ public:
     // The step itself, which only the owner of the key may run.
     void change_header_local(std::string_view bucket, std::string_view key, std::string version_id,
                              header_change change, std::function<void(st, std::string)> cb);
+
+    // A new file among the bucket's temporary ones, for a version's bytes written again another way; `cb` is told
+    // its descriptor, -1 when it could not be made, and its name.  The bucket is held until the file is dropped or
+    // put in place.
+    void open_tmp(std::string_view bucket, std::function<void(int fd, std::string name)> cb);
+    void drop_tmp(std::string_view bucket, const std::string& name);
+    // Puts the synced temporary file `tmp`, a version's bytes stored another way under the header `now`, in place
+    // of the version `version_id` (empty for the latest) while the index still has it as `was`; `cb` is told
+    // precondition_failed when it no longer does, and the file is gone whatever it is told.
+    void replace_body(std::string bucket, std::string key, std::string version_id, object_meta was,
+                      object_meta now, std::string tmp, std::function<void(st)> cb);
     // Makes `tags`, in the encoding of tags_of(), the tags of an object or of its version `version_id`.
     void set_tags(std::string_view bucket, std::string_view key, std::string version_id, std::string tags,
                   std::function<void(st, std::string)> cb, change_origin who = {})
@@ -1055,6 +1076,8 @@ private:
         std::shared_ptr<const website_config> website;
         std::shared_ptr<const public_access_block> public_access;
         std::shared_ptr<const logging_config> logging;
+        object_ownership ownership{object_ownership::unset};
+        std::shared_ptr<const acl_list> acl;
         versioning  vstate{versioning::off};
         // Per key, every version but a latest that is not a delete marker, newest first: the key's
         // noncurrent versions, behind its latest when that is a marker; empty unless the bucket was versioned.
@@ -1329,6 +1352,7 @@ private:
     // Buckets with CORS rules, with lifecycle rules and with a policy.
     uint32_t m_cors_buckets{0};
     uint32_t m_logging_buckets{0};
+    uint32_t m_acl_buckets{0};
     uint32_t m_lifecycle_buckets{0};
     uint32_t m_policy_buckets{0};
     // Buckets with a document in doubt.

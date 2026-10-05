@@ -40,7 +40,7 @@ bool unsupported_subresource(const s3_request& r, bool object)
         "acl", "tagging",
         "accelerate",
         "requestPayment", "analytics", "metrics", "inventory", "ownershipControls",
-        "intelligent-tiering", "attributes", "restore", "select", "torrent",
+        "intelligent-tiering", "attributes", "restore", "torrent",
         "acl", "location-constraint",
     };
     // Every subresource is a query parameter, and most requests have none.
@@ -84,12 +84,13 @@ bool unsupported_subresource(const s3_request& r, bool object)
         return true;
     for (const auto& q : r.query)
         for (std::string_view n : names)
-            // Tags are an object's and a bucket's, an object's attributes are read, ACLs are read and set as S3 does
-            // for a bucket whose ACLs are disabled, and a bucket's ownership controls are read.
+            // Tags are an object's and a bucket's, an object's attributes are read, ACLs are read and set, and a
+            // bucket's ownership controls are read, set and removed.
             if (q.first == n && ((n != "tagging" && n != "attributes") || (n == "attributes" && r.key.empty()) ||
                                  (n == "attributes" && r.method != "GET")) &&
                 (n != "acl" || (r.method != "GET" && r.method != "PUT")) &&
-                (n != "ownershipControls" || !r.key.empty() || (r.method != "GET" && r.method != "PUT")))
+                (n != "ownershipControls" || !r.key.empty() ||
+                 (r.method != "GET" && r.method != "PUT" && r.method != "DELETE")))
                 return true;
     return false;
 }
@@ -240,7 +241,7 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     rv.headers      = &r.headers;
     rv.bucket       = r.bucket;
     rv.key          = r.key;
-    rv.tls          = c->ssl != nullptr;
+    rv.tls          = secure(*c);
 
     // A bucket whose documents this shard may hold old copies of is served nothing, preflights included.
     if (m_store.any_doubt() && !docs_settled(c))
@@ -321,17 +322,11 @@ void storage_run::route(const std::shared_ptr<conn>& c)
     const bool service = r.bucket.empty();
     const bool bucket_level = !service && r.key.empty();
 
-    // A write that asks for an ACL other than its owner's full control is refused, as S3 refuses it on a bucket
-    // whose ACLs are disabled, and never stored without it.
-    // The owner a grant may name is the bucket's, or for a bucket being made the user making it.
-    // Only a write carries ACL headers, so a read looks up no owner.
+    // A write's ACL headers are judged before its body comes: refused where the bucket takes no ACLs, and checked
+    // for grantees that are someone and for a public grant a bucket blocks.  Only a write carries them.
     if ((r.method == "PUT" || r.method == "POST") && !r.has_query("acl"))
     {
-        const std::string_view acl_owner = m_store.has_bucket(r.bucket) || !c->user ? owner_of(r.bucket)
-                                                                                    : std::string_view(c->user->id);
-        // A request with no credentials is the owner's on a runtime that takes them, as every one there is.
-        const std::string_view requester = c->user ? std::string_view(c->user->id) : acl_owner;
-        if (s3_error e; !acl_headers_ok(r, bucket_level && !r.form, acl_owner, requester, e))
+        if (s3_error e; !acl_headers_ok(c, bucket_level && !r.form, e))
         {
             deny_request(c, e);
             return;
@@ -642,6 +637,8 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
         else
             op_delete_object(c);
     }
+    else if (m == "POST" && q.has_query("select"))
+        op_select(c);
     else if (m == "POST" && q.has_query("uploads"))
         op_create_multipart(c);
     else if (m == "POST" && upload)
@@ -720,24 +717,33 @@ void storage_run::op_create_bucket(const std::shared_ptr<conn>& c)
             }
             response r;
             // Path style names the bucket's path, as S3 in us-east-1 does, and virtual-hosted style its URL.
-            r.headers.emplace_back("Location", cc->req.vhost ? object_url(cc->ssl != nullptr, cc->req.host, true, name, {})
+            r.headers.emplace_back("Location", cc->req.vhost ? object_url(secure(*cc), cc->req.host, true, name, {})
                                                              : "/" + name);
             send_response(cc, std::move(r));
         };
-        if (s != st::ok || !lock)
+        if (s != st::ok)
         {
             answer(s);
             return;
         }
+        if (!lock)
+        {
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            create_bucket_docs(cc, name, answer);
+            return;
+        }
         // Versioning first, since object lock is refused on a bucket without it, and a bucket left without the
         // lock it was asked for is not left at all.
-        m_node.set_doc(bucket_doc::versioning, name, versioning_xml(versioning::enabled), [this, name, answer](st v)
+        m_node.set_doc(bucket_doc::versioning, name, versioning_xml(versioning::enabled), [this, weak, name, answer](st v)
         {
-            auto locked = [this, name, answer](st l)
+            auto locked = [this, weak, name, answer](st l)
             {
                 if (l == st::ok)
                 {
-                    answer(st::ok);
+                    if (auto cc = weak.lock(); cc && !cc->dead)
+                        create_bucket_docs(cc, name, answer);
                     return;
                 }
                 m_node.delete_bucket(name, [answer, l](st) { answer(l); });
@@ -773,29 +779,6 @@ void storage_run::op_delete_bucket(const std::shared_ptr<conn>& c)
 
 // ─── ACLs and ownership controls ────────────────────────────────────────────
 
-bool storage_run::acl_headers_ok(const s3_request& r, bool bucket, std::string_view owner, std::string_view requester,
-                                 s3_error& err) const
-{
-    if (r.method != "PUT" && r.method != "POST")
-        return true;
-    const std::string grant = "id=\"" + std::string(owner) + "\"";
-    bool ok = true;
-    for (const auto& h : r.headers)
-    {
-        // The canned ACLs that give the owner full control and nobody else anything, which every object has: private
-        // only from the owner, since from anybody else it gives the writer the control.
-        if (h.name == "x-amz-acl")
-            ok = ok && ((h.value == "private" && requester == owner) || h.value == "bucket-owner-full-control");
-        else if (h.name == "x-amz-grant-full-control")
-            ok = ok && http_trim_ows(h.value) == grant;
-        else if (h.name.starts_with("x-amz-grant-"))
-            ok = false;
-    }
-    if (!ok)
-        err = make_error(bucket && r.method == "PUT" ? "InvalidBucketAclWithObjectOwnership" : "AccessControlListNotSupported");
-    return ok;
-}
-
 bool storage_run::storage_class_ok(const s3_request& r, s3_error& err)
 {
     if (r.method != "PUT" && r.method != "POST")
@@ -817,164 +800,6 @@ bool storage_run::storage_class_ok(const s3_request& r, s3_error& err)
         }
     }
     return true;
-}
-
-void storage_run::op_get_acl(const std::shared_ptr<conn>& c)
-{
-    const s3_request& r = c->req;
-    if (!m_store.has_bucket(r.bucket))
-    {
-        send_error_st(c, st::no_such_bucket);
-        return;
-    }
-    auto answer = [this](const std::shared_ptr<conn>& cc, st s)
-    {
-        if (s != st::ok)
-        {
-            send_error_st(cc, s == st::delete_marker ? st::no_such_key : s);
-            return;
-        }
-        response resp;
-        resp.headers.emplace_back("Content-Type", "application/xml");
-        const std::string_view owner = owner_of(cc->req.bucket);
-        resp.body = owner_acl_xml(owner, display_of(owner));
-        send_response(cc, std::move(resp));
-    };
-    if (r.key.empty())
-    {
-        answer(c, st::ok);
-        return;
-    }
-    // The object must be there, as S3 answers NoSuchKey for one that is not.
-    std::weak_ptr<conn> weak = c;
-    auto then = [weak, answer](st s, const object_meta& m)
-    {
-        if (auto cc = weak.lock(); cc && !cc->dead)
-            answer(cc, s == st::ok && is_delete_marker(m) ? st::no_such_key : s);
-    };
-    if (const std::string version(r.get_query("versionId")); !version.empty())
-        m_store.stat_version(r.bucket, r.key, version, std::move(then));
-    else if (m_store.owns(r.bucket, r.key))
-        answer(c, m_store.find(r.bucket, r.key) ? st::ok : st::no_such_key);
-    else
-        m_store.stat_foreign(r.bucket, r.key, std::move(then));
-}
-
-void storage_run::op_put_acl(const std::shared_ptr<conn>& c)
-{
-    const s3_request& r = c->req;
-    if (!m_store.has_bucket(r.bucket))
-    {
-        send_error_st(c, st::no_such_bucket);
-        return;
-    }
-    // An ACL is taken when it is the one the object has: by canned name or grant header, or as a document whose
-    // every grant is FULL_CONTROL to the owner.
-    s3_error err;
-    const std::string_view owner = owner_of(r.bucket);
-    bool ok = acl_headers_ok(r, false, owner, c->user ? std::string_view(c->user->id) : owner, err);
-    if (ok && !c->body.empty())
-    {
-        xml_node root;
-        xml_reader reader(c->body);
-        if (!reader.document(root) || root.name != "AccessControlPolicy")
-        {
-            send_error(c, make_error("MalformedXML"));
-            return;
-        }
-        size_t grants = 0;
-        for (const xml_node& list : root.kids)
-            if (list.name == "AccessControlList")
-                for (const xml_node& g : list.kids)
-                {
-                    std::string id, permission;
-                    bool other = false;
-                    for (const xml_node& f : g.kids)
-                    {
-                        if (f.name == "Permission")
-                            permission = f.text;
-                        else if (f.name == "Grantee")
-                        {
-                            for (const xml_node& who : f.kids)
-                            {
-                                if (who.name == "ID")
-                                    id = who.text;
-                                else if (who.name != "DisplayName")
-                                    other = true;
-                            }
-                        }
-                    }
-                    ++grants;
-                    ok = ok && !other && id == owner && permission == "FULL_CONTROL";
-                }
-        ok = ok && grants > 0;
-    }
-    if (!ok)
-    {
-        send_error(c, make_error("AccessControlListNotSupported"));
-        return;
-    }
-    auto done = [this](const std::shared_ptr<conn>& cc, st s)
-    {
-        if (s != st::ok)
-        {
-            send_error_st(cc, s == st::delete_marker ? st::no_such_key : s);
-            return;
-        }
-        send_response(cc, response{});
-    };
-    if (r.key.empty())
-    {
-        done(c, st::ok);
-        return;
-    }
-    std::weak_ptr<conn> weak = c;
-    auto then = [weak, done](st s, const object_meta& m)
-    {
-        if (auto cc = weak.lock(); cc && !cc->dead)
-            done(cc, s == st::ok && is_delete_marker(m) ? st::no_such_key : s);
-    };
-    if (m_store.owns(r.bucket, r.key))
-        done(c, m_store.find(r.bucket, r.key) ? st::ok : st::no_such_key);
-    else
-        m_store.stat_foreign(r.bucket, r.key, std::move(then));
-}
-
-void storage_run::op_ownership_controls(const std::shared_ptr<conn>& c)
-{
-    const s3_request& r = c->req;
-    if (!m_store.has_bucket(r.bucket))
-    {
-        send_error_st(c, st::no_such_bucket);
-        return;
-    }
-    if (r.method == "GET")
-    {
-        response resp;
-        resp.headers.emplace_back("Content-Type", "application/xml");
-        resp.body = ownership_controls_xml();
-        send_response(c, std::move(resp));
-        return;
-    }
-    // Every bucket is BucketOwnerEnforced, which may be set again, and an owner other than the bucket's is not had.
-    xml_node root;
-    xml_reader reader(c->body);
-    if (!reader.document(root) || root.name != "OwnershipControls")
-    {
-        send_error(c, make_error("MalformedXML"));
-        return;
-    }
-    bool enforced = false, other = false;
-    for (const xml_node& rule : root.kids)
-        for (const xml_node& f : rule.kids)
-            if (f.name == "ObjectOwnership")
-                (f.text == "BucketOwnerEnforced" ? enforced : other) = true;
-    if (!enforced || other)
-    {
-        send_error(c, make_error("NotImplemented"));
-        return;
-    }
-    send_response(c, response{});
 }
 
 void storage_run::op_head_bucket(const std::shared_ptr<conn>& c)
@@ -1355,6 +1180,9 @@ bool storage_run::object_meta_from_headers(const std::shared_ptr<conn>& c, objec
         err = make_error("MetadataTooLarge");
         return false;
     }
+    // The owner and grants a bucket that takes ACLs keeps for the object.
+    if (!object_acl_stamp(c, m, err))
+        return false;
     return true;
 }
 
@@ -1721,7 +1549,15 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
         }
     }
     else
+    {
         meta = *src_meta;
+        // A copy is a new object, whose owner and grants are its writer's and never its source's.
+        if (s3_error err; !object_acl_stamp(c, meta, err))
+        {
+            send_error(c, err);
+            return;
+        }
+    }
     // The tags follow their own directive, whatever the metadata's says.
     if (r.header("x-amz-tagging-directive") == "REPLACE")
     {
@@ -1749,8 +1585,17 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
     const std::string source_id = !src_version.empty() ? src_version
                                 : has_version(src) || m_store.bucket_versioning(src_bucket) != versioning::off
                                     ? version_of(src).id : std::string{};
-    // Bytes sealed under one key, or to be sealed under another, are opened and sealed again on their way through.
-    if (is_encrypted(src) || dst.mode != sse_mode::none)
+    // A version moved to a tier is read from there by a GET alone, as S3 refuses to copy an archived object.
+    if (is_tiered(src))
+    {
+        s3_error err = make_error("InvalidObjectState");
+        err.message = "The source object is in the storage class " + std::string(storage_class_of(src));
+        send_error(c, err);
+        return;
+    }
+    // Bytes sealed under one key, or to be sealed under another, are opened and sealed again on their way through, and
+    // compressed ones are opened.
+    if (is_encrypted(src) || is_compressed(src) || dst.mode != sse_mode::none)
     {
         copy_sealed(c, std::move(src_bucket), std::move(src_key), std::move(src_version), std::move(meta), src, dst,
                     std::move(src_customer), source_id, algo);
@@ -1847,6 +1692,9 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
     r.headers.emplace_back("Accept-Ranges", "bytes");
     r.headers.emplace_back("ETag", "\"" + m.etag() + "\"");
     r.headers.emplace_back("Last-Modified", http_date(m.mtime_ms));
+    // S3 names a class other than STANDARD, which a version moved to a tier has.
+    if (is_tiered(m))
+        r.headers.emplace_back("x-amz-storage-class", std::string(storage_class_of(m)));
 
     struct override_row { std::string_view query; std::string_view header; };
     static constexpr override_row overrides[] = {
@@ -2107,7 +1955,7 @@ std::string attributes_xml(const object_meta& m, const attr_query& a, const part
         x += rows + "</ObjectParts>";
     }
     if (a.storage_class)
-        x += "<StorageClass>STANDARD</StorageClass>";
+        x += "<StorageClass>" + std::string(storage_class_of(m)) + "</StorageClass>";
     if (a.size)
         x += "<ObjectSize>" + std::to_string(m.size) + "</ObjectSize>";
     x += "</GetObjectAttributesResponse>";
@@ -2262,9 +2110,21 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
 
         auto close_file = [&] { if (fd >= 0) m_loop.close_fd(fd); };
 
+        // A read the bucket left to the object's own grants is answered by them.
+        if (!acl_admits(cc, m))
+        {
+            close_file();
+            send_error(cc, make_error("AccessDenied"));
+            return;
+        }
+
         // An encrypted object is read only with the key its record names, and a clear one with none.
         sse_key key{};
         const bool sealed = is_encrypted(m);
+        // A compressed body is opened like a sealed one, with no key, unless it is in memory opened already, and a
+        // body moved to a tier is read from there.
+        const bool tiered   = !clear && is_tiered(m);
+        const bool squeezed = !sealed && !clear && !tiered && is_compressed(m);
         if (s3_error err; !sse_read_key(cc, m, sse_c_prefix, key, err, !head && !clear))
         {
             close_file();
@@ -2449,6 +2309,25 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
                 return;
             }
         }
+        else if (squeezed)
+        {
+            std::string plain;
+            if (len > 0 && prefetch.size() >= stored_size(m))
+            {
+                close_file();
+                if (!lz4_open_body(m, prefetch, plain))
+                {
+                    LOG_WARN(("storage: the compressed object \"" + rq.key + "\" does not open: a chunk is cut "
+                              "short or does not decompress").c_str());
+                    send_error(cc, make_error("InternalError"));
+                    return;
+                }
+                r.body = plain.substr(static_cast<size_t>(first), static_cast<size_t>(len));
+                ++m_c.copied_gets;
+                send_response(cc, std::move(r));
+                return;
+            }
+        }
         else if (!prefetch.empty() && first + len <= prefetch.size())
         {
             close_file();
@@ -2463,9 +2342,22 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
             send_response(cc, std::move(r));
             return;
         }
-        if (sealed)
+        if (tiered)
         {
-            send_sealed(cc, std::move(r), fd, data_off, m, key, first, len);
+            close_file();
+            auto reader = m_tier.reader(m, first, len);
+            if (!reader)
+            {
+                LOG_WARN(("storage: \"" + rq.key + "\" was moved to a tier that is not one of --tiers").c_str());
+                send_error(cc, make_error("InternalError"));
+                return;
+            }
+            send_reader(cc, std::move(r), std::move(reader), len);
+            return;
+        }
+        if (sealed || squeezed)
+        {
+            send_sealed(cc, std::move(r), fd, data_off, m, sealed ? &key : nullptr, first, len);
             return;
         }
         send_file(cc, std::move(r), fd, data_off + first, len);
@@ -2561,8 +2453,8 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
     {
         ++m_c.hot_gets;
         // A GET that asks for nothing but the object gets the headers kept with the copy, which do not follow the
-        // bucket's lifecycle rules.
-        if (q.query.empty() && q.header("range").empty() && q.header("x-amz-checksum-mode").empty() &&
+        // bucket's lifecycle rules, unless the object's own grants are still to admit it.
+        if (!c->acl_need && q.query.empty() && q.header("range").empty() && q.header("x-amz-checksum-mode").empty() &&
             !m_store.lifecycle(q.bucket) && (!q.website || (!c->website_status && website_target(*hot.meta).empty())) &&
             !q.has_header("x-amz-server-side-encryption-customer-algorithm") && evaluate(q, *hot.meta) == cond::proceed)
         {
@@ -2617,6 +2509,23 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
                               sse_mode_of(o.meta) != sse_mode::c && o.prefetch.size() >= stored_size(o.meta) &&
                               sse_read_key(cc, o.meta, sse_c_prefix, key, err) &&
                               sse_open_body(o.meta, key, o.prefetch, plain))
+            {
+                if (mine)
+                    m_store.hot_put(b, k, o.meta, plain);
+                else
+                    m_store.hot_put_foreign(b, k, drop_epoch, o.meta, plain);
+                answer(cc, o.meta, o.fd, o.data_off, plain, true);
+                return;
+            }
+            answer(cc, o.meta, o.fd, o.data_off, o.prefetch, false);
+            return;
+        }
+        // A compressed body read whole is held opened, as the bytes a client reads.
+        if (is_compressed(o.meta))
+        {
+            std::string plain;
+            if (o.meta.size <= object_store::hot_max_object && o.prefetch.size() >= stored_size(o.meta) &&
+                lz4_open_body(o.meta, o.prefetch, plain))
             {
                 if (mine)
                     m_store.hot_put(b, k, o.meta, plain);

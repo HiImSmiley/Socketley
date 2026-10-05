@@ -1020,7 +1020,13 @@ std::string replicator::signed_head(const lane& l, std::string_view method, cons
                                     const std::string& query, std::vector<std::pair<std::string, std::string>> headers,
                                     uint64_t length) const
 {
-    const replication_target& t = l.target;
+    return signed_s3_head(l.target, method, path, query, std::move(headers), length, "socketley-storage-replication");
+}
+
+std::string signed_s3_head(const replication_target& t, std::string_view method, const std::string& path,
+                           const std::string& query, std::vector<std::pair<std::string, std::string>> headers,
+                           uint64_t length, std::string_view agent)
+{
     const std::string date = amz_date_now();
     headers.emplace_back("host", t.http.authority());
     headers.emplace_back("x-amz-date", date);
@@ -1045,15 +1051,13 @@ std::string replicator::signed_head(const lane& l, std::string_view method, cons
     head += " " + path + (query.empty() ? "" : "?" + query) + " HTTP/1.1\r\n";
     for (const auto& [n, v] : headers)
         head += n + ": " + v + "\r\n";
-    head += "authorization: " + s3::sign(in) + "\r\nconnection: keep-alive\r\nuser-agent: socketley-storage-replication\r\n\r\n";
+    head += "authorization: " + s3::sign(in) + "\r\nconnection: keep-alive\r\nuser-agent: ";
+    head += agent;
+    head += "\r\n\r\n";
     return head;
 }
 
-namespace
-{
-
-// The path of `key` in `bucket` below a target's own path.
-std::string object_path(const http_target& t, std::string_view bucket, std::string_view key)
+std::string target_object_path(const http_target& t, std::string_view bucket, std::string_view key)
 {
     std::string p = t.path;
     while (!p.empty() && p.back() == '/')
@@ -1063,6 +1067,14 @@ std::string object_path(const http_target& t, std::string_view bucket, std::stri
     p += "/";
     url_encode_to(p, key, true);
     return p;
+}
+
+namespace
+{
+
+std::string object_path(const http_target& t, std::string_view bucket, std::string_view key)
+{
+    return target_object_path(t, bucket, key);
 }
 
 }   // namespace
@@ -1226,6 +1238,13 @@ void replicator::opened(lane& l, const std::shared_ptr<job>& j, open_result o)
     j->fd       = o.fd;
     j->meta     = std::move(o.meta);
     j->data_off = o.data_off;
+    // A version moved to a tier has no bytes here to send.
+    if (is_tiered(j->meta))
+    {
+        j->why = "its bytes were moved to the tier " + std::string(storage_class_of(j->meta));
+        ended(l, j, outcome::refused, 0);
+        return;
+    }
     if (is_encrypted(j->meta))
     {
         sse_key k{};
@@ -1356,11 +1375,11 @@ std::vector<std::pair<std::string, std::string>> node_headers(const object_meta&
     return h;
 }
 
-// Whether `len` bytes of `m` go to `target` straight from the file: plain bytes, on a connection without TLS, and
+// Whether `len` bytes of `m` go to `target` straight from the file: bytes stored as they are, on a connection without TLS, and
 // enough of them to be worth the pipe.
 bool spliceable(const http_target& target, const object_meta& m, uint64_t len)
 {
-    return !target.tls && !is_encrypted(m) && len >= 64 * 1024;
+    return !target.tls && !is_encrypted(m) && !is_compressed(m) && len >= 64 * 1024;
 }
 
 // The object's own checksum in `algo`, empty when it keeps none.

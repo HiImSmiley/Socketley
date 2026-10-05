@@ -3,7 +3,10 @@
 // header in front of its bytes, and the journal record that names it.
 //
 // Pure encoding with no I/O, so a unit test and a fuzz target reach it without a ring.
+#include <algorithm>
 #include <array>
+#include <cstring>
+#include <initializer_list>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -20,22 +23,70 @@ namespace socketley::storage
 // An object's own checksum as raw bytes, which is base64 only in an answer and on disk.
 struct object_checksum
 {
+    // Both are read here and written by set(), which keeps the value's storage fit for the algorithm.
     checksum_algo algo{checksum_algo::none};
     // The N of a COMPOSITE value's -N, and 0 for a checksum of the object's whole bytes.
     uint16_t composite{0};
-    std::array<uint8_t, 32> raw{};
+
+    object_checksum() : m_small{} {}
+    object_checksum(const object_checksum& o) : m_small{} { set(o.algo, o.raw_bytes(), o.composite); }
+    object_checksum(object_checksum&& o) noexcept : algo(o.algo), composite(o.composite), m_small{}
+    {
+        std::memcpy(m_small, o.m_small, sizeof m_small);
+        o.algo = checksum_algo::none;
+    }
+    object_checksum& operator=(const object_checksum& o)
+    {
+        if (this != &o)
+            set(o.algo, o.raw_bytes(), o.composite);
+        return *this;
+    }
+    object_checksum& operator=(object_checksum&& o) noexcept
+    {
+        if (this != &o)
+        {
+            release();
+            algo      = o.algo;
+            composite = o.composite;
+            std::memcpy(m_small, o.m_small, sizeof m_small);
+            o.algo = checksum_algo::none;
+        }
+        return *this;
+    }
+    ~object_checksum() { release(); }
+
+    // The algorithm, its raw value (zeros past what is given) and the count of a composite one.
+    void set(checksum_algo a, std::string_view raw = {}, uint16_t composite_count = 0);
 
     explicit operator bool() const { return algo != checksum_algo::none; }
     std::string_view raw_bytes() const
     {
-        return {reinterpret_cast<const char*>(raw.data()), checksum_raw_len(algo)};
+        return {reinterpret_cast<const char*>(big() ? m_big : m_small), checksum_raw_len(algo)};
     }
     // The value as S3 shows it: base64, with -N after a composite one.
     std::string b64() const;
     // FULL_OBJECT or COMPOSITE.
     std::string_view type() const { return composite ? "COMPOSITE" : "FULL_OBJECT"; }
 
-    bool operator==(const object_checksum&) const = default;
+    bool operator==(const object_checksum& o) const
+    {
+        return algo == o.algo && composite == o.composite && raw_bytes() == o.raw_bytes();
+    }
+
+private:
+    // A CRC's value inline, and a longer one's on the heap, so every object in memory spends 8 bytes on it.
+    bool big() const { return checksum_raw_len(algo) > sizeof m_small; }
+    void release()
+    {
+        if (big())
+            delete[] m_big;
+        algo = checksum_algo::none;
+    }
+    union
+    {
+        uint8_t  m_small[8];
+        uint8_t* m_big;
+    };
 };
 
 // A content type, which the objects of a store share one copy of for the first few hundred types it sees.
@@ -43,6 +94,28 @@ class content_type_ref
 {
 public:
     content_type_ref() = default;
+    content_type_ref(const content_type_ref& o) { copy_from(o); }
+    content_type_ref(content_type_ref&& o) noexcept : m_p(o.m_p) { o.m_p = 0; }
+    content_type_ref& operator=(const content_type_ref& o)
+    {
+        if (this != &o)
+        {
+            release();
+            copy_from(o);
+        }
+        return *this;
+    }
+    content_type_ref& operator=(content_type_ref&& o) noexcept
+    {
+        if (this != &o)
+        {
+            release();
+            m_p   = o.m_p;
+            o.m_p = 0;
+        }
+        return *this;
+    }
+    ~content_type_ref() { release(); }
     content_type_ref& operator=(std::string_view v);
 
     const std::string& str() const;
@@ -54,7 +127,120 @@ public:
     friend bool operator==(const content_type_ref& a, std::string_view b) { return a.str() == b; }
 
 private:
-    std::shared_ptr<const std::string> m_v;
+    // A string of the pool, which is never freed, or one of this value's own with the low bit set: a pointer wide,
+    // since every object in memory has one.
+    uintptr_t m_p{0};
+    const std::string* ptr() const { return reinterpret_cast<const std::string*>(m_p & ~uintptr_t{1}); }
+    bool owned() const { return (m_p & 1) != 0; }
+    void release()
+    {
+        if (owned())
+            delete ptr();
+        m_p = 0;
+    }
+    void copy_from(const content_type_ref& o)
+    {
+        m_p = o.owned() ? reinterpret_cast<uintptr_t>(new std::string(*o.ptr())) | 1 : o.m_p;
+    }
+};
+
+// An object's extra header entries, a pointer wide while there are none, which is most objects' case in memory.
+class meta_extras
+{
+public:
+    using value_type     = std::pair<std::string, std::string>;
+    using iterator       = value_type*;
+    using const_iterator = const value_type*;
+
+    meta_extras() = default;
+    meta_extras(std::initializer_list<value_type> l)
+    {
+        for (const value_type& v : l)
+            push_back(v);
+    }
+    meta_extras(const meta_extras& o) : m_v(o.empty() ? nullptr : std::make_unique<std::vector<value_type>>(*o.m_v)) {}
+    meta_extras(meta_extras&&) noexcept = default;
+    meta_extras& operator=(const meta_extras& o)
+    {
+        if (this != &o)
+            m_v = o.empty() ? nullptr : std::make_unique<std::vector<value_type>>(*o.m_v);
+        return *this;
+    }
+    meta_extras& operator=(meta_extras&&) noexcept = default;
+    meta_extras& operator=(std::initializer_list<value_type> l)
+    {
+        clear();
+        for (const value_type& v : l)
+            push_back(v);
+        return *this;
+    }
+
+    iterator       begin() { return m_v ? m_v->data() : nullptr; }
+    iterator       end() { return m_v ? m_v->data() + m_v->size() : nullptr; }
+    const_iterator begin() const { return m_v ? m_v->data() : nullptr; }
+    const_iterator end() const { return m_v ? m_v->data() + m_v->size() : nullptr; }
+    size_t size() const { return m_v ? m_v->size() : 0; }
+    bool   empty() const { return size() == 0; }
+    value_type&       operator[](size_t i) { return (*m_v)[i]; }
+    const value_type& operator[](size_t i) const { return (*m_v)[i]; }
+    value_type&       back() { return m_v->back(); }
+    const value_type& back() const { return m_v->back(); }
+
+    template <class... A>
+    value_type& emplace_back(A&&... a)
+    {
+        return vec().emplace_back(std::forward<A>(a)...);
+    }
+    void push_back(value_type v) { vec().push_back(std::move(v)); }
+    void pop_back()
+    {
+        m_v->pop_back();
+        if (m_v->empty())
+            m_v.reset();
+    }
+    iterator erase(const_iterator at)
+    {
+        const auto i = at - begin();
+        m_v->erase(m_v->begin() + i);
+        if (m_v->empty())
+        {
+            m_v.reset();
+            return nullptr;
+        }
+        return begin() + i;
+    }
+    iterator insert(const_iterator at, value_type v)
+    {
+        const auto i = at - begin();
+        vec().insert(vec().begin() + i, std::move(v));
+        return begin() + i;
+    }
+    void clear() { m_v.reset(); }
+
+    bool operator==(const meta_extras& o) const
+    {
+        return size() == o.size() && std::equal(begin(), end(), o.begin());
+    }
+
+    template <class P>
+    friend size_t erase_if(meta_extras& e, P pred)
+    {
+        if (!e.m_v)
+            return 0;
+        const size_t n = static_cast<size_t>(std::erase_if(*e.m_v, pred));
+        if (e.m_v->empty())
+            e.m_v.reset();
+        return n;
+    }
+
+private:
+    std::vector<value_type>& vec()
+    {
+        if (!m_v)
+            m_v = std::make_unique<std::vector<value_type>>();
+        return *m_v;
+    }
+    std::unique_ptr<std::vector<value_type>> m_v;
 };
 
 // Everything S3 tells a client about an object beyond its bytes.
@@ -71,7 +257,7 @@ struct object_meta
     content_type_ref content_type;
     // Lowercase header name and value: cache-control, content-disposition,
     // content-encoding, content-language, expires and every x-amz-meta-*.
-    std::vector<std::pair<std::string, std::string>> extra;
+    meta_extras extra;
 
     // The ETag as S3 spells it, without the quotes: 32 hex digits, and "-N"
     // after them for a multipart object.
@@ -96,6 +282,28 @@ inline constexpr std::string_view tags_extra = "x-amz-tagging";
 std::string_view tags_of(const object_meta& m);
 // Makes `tags` the object's tags, as the last extra entry, or removes them when it is empty.
 void set_tags_extra(object_meta& m, std::string_view tags);
+
+// The extra entry of a version whose bytes were moved to a tier: the tier's name, a ';', and the key they lie under
+// below the tier's own path.  Its file keeps the header alone.
+inline constexpr std::string_view tier_extra = "x-socketley-tier";
+
+struct tier_record
+{
+    std::string tier;
+    std::string remote_key;
+};
+bool tier_of(const object_meta& m, tier_record& out);
+inline bool is_tiered(const object_meta& m)
+{
+    for (const auto& e : m.extra)
+        if (e.first == tier_extra)
+            return true;
+    return false;
+}
+// Makes `m` say its bytes are where `r` says, or here when `r` is null.
+void set_tier_record(object_meta& m, const tier_record* r);
+// The storage class a listing and a read name: the tier the version moved to, or STANDARD.
+std::string_view storage_class_of(const object_meta& m);
 
 // The extra entry a multipart object's part sizes are kept in: one size when
 // every part but the last has it, else every size, comma-separated.
@@ -132,7 +340,7 @@ struct part_list
 // false when they are not recorded there or do not add up to the object.
 bool part_list_of(const object_meta& m, part_list& out);
 
-// Removes what `m` records of its parts, for a copy that is one part whatever its source was.
+// Removes what `m` records of its parts and of how its bytes lie, for a copy that is one part whatever its source was.
 void clear_part_layout(object_meta& m);
 
 // Gives `copy` the checksum `algo` of its whole bytes in place of any other: `src`'s own when that is one, else a

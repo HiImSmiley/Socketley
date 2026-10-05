@@ -67,6 +67,14 @@ bool parse_replication_targets(std::string_view text, std::vector<replication_ta
 // The same read from `path`.
 bool load_replication_targets(const std::string& path, std::vector<replication_target>& out, std::string& why);
 
+// The head of a request to `t`, signed with its credentials, for `path` and `query` with `headers` and a body of
+// `length` bytes left unsigned.
+std::string signed_s3_head(const replication_target& t, std::string_view method, const std::string& path,
+                           const std::string& query, std::vector<std::pair<std::string, std::string>> headers,
+                           uint64_t length, std::string_view agent);
+// The path of `key` in `bucket` below a target's own path.
+std::string target_object_path(const http_target& t, std::string_view bucket, std::string_view key);
+
 struct replication_counters
 {
     // Versions and delete markers a destination took, those it refused for good, and attempts that are tried again.

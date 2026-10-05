@@ -107,6 +107,7 @@ constexpr config_key config_keys[] = {
     // ── Storage ─────────────────────────────────────────────────────────────
     { "dir",                "--dir",                key_kind::text    },
     { "anonymous",          "--anonymous",          key_kind::boolean },
+    { "acls",               "--acls",               key_kind::boolean },
     { "max_bytes",          "--max-bytes",          key_kind::scalar  },
     { "access_key",         "--access-key",         key_kind::text    },
     { "secret_key",         "--secret-key",         key_kind::text    },
@@ -116,11 +117,15 @@ constexpr config_key config_keys[] = {
     { "website_domain",     "--website-domain",     key_kind::text    },
     { "notify_targets",     "--notify-targets",     key_kind::text    },
     { "replication_targets", "--replication-targets", key_kind::text   },
+    { "tiers",              "--tiers",              key_kind::text    },
+    { "federation",         "--federation",         key_kind::text    },
+    { "tls_offloaded",      "--tls-offloaded",      key_kind::text    },
     { "nodes",              "--nodes",              key_kind::text    },
     { "fsync",              "--fsync",              key_kind::text    },
     { "fsync_interval",     "--fsync-interval",     key_kind::scalar  },
     { "mpu_expire",         "--mpu-expire",         key_kind::scalar  },
     { "scrub",              "--scrub",              key_kind::scalar  },
+    { "compress",           "--compress",           key_kind::scalar  },
 };
 
 // Keys with no flag of their own, listed so an unknown key can still be

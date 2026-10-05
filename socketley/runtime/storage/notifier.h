@@ -21,22 +21,32 @@
 
 #include "outbound_http.h"
 #include "outbox.h"
+#include "../../shared/request_channel.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/file_io.h"
 #include "../../shared/hash_pool.h"
 
+class runtime_manager;
+
 namespace socketley::storage
 {
 
-// A webhook a bucket's events may be sent to, by the name its ARN gives it.
+// Where a bucket's events may be sent, by the name its ARN gives it: a webhook, or another runtime of the daemon -- a
+// cache's stream or pub/sub channel, or a server that hands them to every client it has.
 struct notify_target
 {
+    enum class kind : uint8_t { webhook, cache_stream, cache_channel, server };
     std::string name;
+    kind        k{kind::webhook};
     http_target http;
+    // The runtime a target of another kind names, and the stream or channel of a cache's.
+    std::string runtime;
+    std::string topic;
 };
 
-// The targets a file's text names, one `name url [ca=file]` per line with '#' starting a comment; false with `why`
-// for a line that is none of these or a name given twice.  Nothing is resolved.
+// The targets a file's text names, one `name url [ca=file]` per line with '#' starting a comment, the url a webhook's
+// http(s) one or cache://<runtime>/stream/<key>, cache://<runtime>/channel/<channel> or server://<runtime>; false with
+// `why` for a line that is none of these or a name given twice.  Nothing is resolved.
 bool parse_notify_targets(std::string_view text, std::vector<notify_target>& out, std::string& why);
 
 // The same read from `path`.
@@ -49,7 +59,7 @@ struct notify_counters
     uint64_t dropped{0};
 };
 
-class notifier
+class notifier : public request_origin
 {
 public:
     // The most events a shard holds undelivered, beyond which a new one is dropped and counted.
@@ -66,6 +76,10 @@ public:
     notifier& operator=(const notifier&) = delete;
 
     void set_targets(std::vector<notify_target> targets);
+    // The daemon's runtimes a target of another runtime is reached through, and this runtime's own name, which a
+    // server is told a broadcast comes from.
+    void set_runtimes(runtime_manager* mgr, std::string self);
+    void on_request_reply(uint64_t cookie, request_status st, std::string_view reply) override;
     bool has_target(std::string_view name) const;
     bool enabled() const { return !m_lanes.empty(); }
 
@@ -110,6 +124,8 @@ private:
     struct lane
     {
         std::string name;
+        notify_target target;
+        // A webhook's connection, none for a target of another runtime.
         std::unique_ptr<http_peer> peer;
         std::deque<pending> q;
         bool        busy{false};
@@ -119,8 +135,12 @@ private:
 
     lane* find_lane(std::string_view name);
     void start(lane& l);
+    // A delivery to another runtime of the daemon.
+    void start_runtime(lane& l, const pending& ev);
     // The delivery at the front of the queue ended, delivered or not.
-    void finish(lane& l, bool delivered);
+    void finish(lane& l, bool ok);
+    // The event at the front of the lane was taken.
+    void delivered(lane& l);
     // A delivery that did not happen is tried again after a pause that grows with each failure in a row.
     void back_off(lane& l);
     // A tick soon, which looks at every lane's deadline and pause.
@@ -138,6 +158,13 @@ private:
     bool        m_stopped{false};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
     outbox      m_box;
+
+    // The runtimes, the channel a cache is asked through, this runtime's name, and the lane each request out is for.
+    runtime_manager* m_mgr{nullptr};
+    request_channel* m_channel{nullptr};
+    std::string      m_self;
+    std::unordered_map<uint64_t, lane*> m_asked;
+    uint64_t         m_next_cookie{0};
 
     // One thread that resolves hosts, its answers handed back through an eventfd the ring reads, and the test aid's
     // hosts file (SOCKETLEY_STORAGE_NOTIFY_HOSTS).

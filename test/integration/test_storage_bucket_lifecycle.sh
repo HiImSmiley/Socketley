@@ -6,7 +6,8 @@
 #   config      PutBucketLifecycleConfiguration, Get and Delete, raw and through
 #               boto3; NoSuchLifecycleConfiguration; every refusal (MalformedXML,
 #               InvalidArgument, InvalidRequest for tag and size filters beside an
-#               abort of uploads, NotImplemented for transitions and noncurrent
+#               abort of uploads, InvalidStorageClass for a transition to no tier,
+#               NotImplemented for two transitions in a rule and for newer noncurrent
 #               versions, 1001 rules), each leaving the configuration that was there
 #   sweep       with a lifecycle day of two seconds (SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS):
 #               objects under an expiring prefix go and no earlier than a day

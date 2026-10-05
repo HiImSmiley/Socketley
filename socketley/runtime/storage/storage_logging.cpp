@@ -129,6 +129,20 @@ void storage_run::op_put_logging(const std::shared_ptr<conn>& c)
         send_error(c, e, false, "TargetBucket", cfg.target_bucket);
         return;
     }
+    // Grants are taken where the target bucket takes ACLs, as S3 refuses them for one whose ACLs are disabled.
+    if (!cfg.grants.empty())
+    {
+        if (bucket_ownership(cfg.target_bucket) == object_ownership::enforced)
+        {
+            send_error(c, make_error("AccessControlListNotSupported"));
+            return;
+        }
+        if (std::string acl; !logging_acl(cfg, acl, err))
+        {
+            send_error(c, err);
+            return;
+        }
+    }
     store_doc(c, bucket_doc::logging, q.bucket, cfg.target_bucket.empty() ? std::string{} : logging_config_xml(&cfg),
               200);
 }
@@ -225,7 +239,8 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
     plain(l, by_header ? "AuthHeader" : by_query ? "QueryString" : "");
     plain(l, r.host);
     plain(l, c->ssl ? std::string_view(SSL_get_version(c->ssl)) : std::string_view{});
-    l += "- -\n";
+    // No access point, and whether an ACL's grant was what admitted the request.
+    l += c->by_acl ? "- Yes\n" : "- -\n";
 
     // Lines for one destination are held together, the date partition's source bucket being part of where they go.
     std::string dest = cfg->target_bucket;
@@ -243,6 +258,8 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
         b.target      = cfg->target_bucket;
         b.prefix      = cfg->target_prefix;
         b.partitioned = cfg->partitioned;
+        if (s3_error ignored; !logging_acl(*cfg, b.acl, ignored))
+            b.acl.clear();
         if (b.partitioned)
             b.prefix += std::string(owner_of(r.bucket)) + "/us-east-1/" + r.bucket + "/";
         b.since = std::chrono::steady_clock::now();
@@ -254,7 +271,7 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
     {
         access_log_buffer b = std::move(it->second);
         m_access_logs.erase(it);
-        deliver_access_log(b.target, std::move(b.prefix), b.partitioned, std::move(b.data));
+        deliver_access_log(b.target, std::move(b.prefix), b.partitioned, b.acl, std::move(b.data));
     }
 }
 
@@ -272,11 +289,39 @@ void storage_run::flush_access_logs(bool all)
         }
         access_log_buffer b = std::move(it->second);
         it = m_access_logs.erase(it);
-        deliver_access_log(b.target, std::move(b.prefix), b.partitioned, std::move(b.data));
+        deliver_access_log(b.target, std::move(b.prefix), b.partitioned, b.acl, std::move(b.data));
     }
 }
 
-void storage_run::deliver_access_log(const std::string& target, std::string key, bool partitioned, std::string data)
+bool storage_run::logging_acl(const logging_config& cfg, std::string& out, s3_error& err) const
+{
+    out.clear();
+    if (cfg.grants.empty())
+        return true;
+    acl_request rq;
+    std::string lists[5];
+    for (const logging_config::grant& g : cfg.grants)
+    {
+        const size_t i = g.permission == "READ" ? 0 : g.permission == "WRITE" ? 1 : 4;
+        if (!lists[i].empty())
+            lists[i] += ", ";
+        lists[i] += g.kind + "=\"" + g.value + "\"";
+    }
+    for (size_t i = 0; i < 5; ++i)
+        rq.grant[i] = lists[i];
+    const std::string owner(owner_of(cfg.target_bucket));
+    acl_list a;
+    if (!acl_from_request(rq, false, owner, owner, acl_users(), a, err))
+        return false;
+    // The owner keeps full control of its log objects beside what the grants give others.
+    if (std::none_of(a.grants.begin(), a.grants.end(), [&](const acl_grant& g) { return g.id == owner; }))
+        a.grants.insert(a.grants.begin(), acl_grant{acl_grant::who::user, owner, acl_perm::full});
+    out = encode_acl(a);
+    return true;
+}
+
+void storage_run::deliver_access_log(const std::string& target, std::string key, bool partitioned,
+                                     const std::string& acl, std::string data)
 {
     // The object is named for when it is delivered, after its prefix and its date partition, and made unique.
     const int64_t now_ms = static_cast<int64_t>(m_store.now_ms());
@@ -300,6 +345,8 @@ void storage_run::deliver_access_log(const std::string& target, std::string key,
 
     object_meta meta;
     meta.content_type = "text/plain";
+    if (!acl.empty())
+        set_object_acl(meta, acl);
     s3_error err;
     const size_t lines = static_cast<size_t>(std::count(data.begin(), data.end(), '\n'));
     auto w = put_whole(target, key, std::move(meta), std::move(data),

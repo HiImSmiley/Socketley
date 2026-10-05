@@ -37,6 +37,10 @@ public:
     std::shared_ptr<const user_identity> user_of(std::string_view access_key) const;
     // The user of that id a section declared, null for none.
     const user_identity* find_user(std::string_view id) const;
+    // The first access key that signs for user `id`, empty for none.
+    std::string_view key_of(std::string_view id) const;
+    // The user whose email is `email`, empty for none.
+    std::string user_of_email(std::string_view email) const;
 
     size_t size() const { return m_map.size(); }
     // The ids of the users declared.
@@ -105,6 +109,10 @@ public:
     uint64_t max_bytes_of(std::string_view id) const override;
     bool issue_session(std::string_view access_key, int64_t expires, std::string_view policy, std::string_view role,
                        session_credentials& out) override;
+    bool issue_session_as(std::string_view user_id, int64_t expires, std::string_view policy, std::string_view role,
+                          session_credentials& out) override;
+    bool has_user(std::string_view id) const override { return m_creds.find_user(id) != nullptr; }
+    std::string user_of_email(std::string_view email) const override { return m_creds.user_of_email(email); }
     int role_check(std::string_view role, std::string_view user_id, int64_t& max_session) override;
     std::string iam_file() const override { return m_cfg.iam_file; }
     void refresh() override;

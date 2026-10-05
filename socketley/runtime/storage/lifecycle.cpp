@@ -39,6 +39,33 @@ bool positive_days(const xml_node& n, uint32_t& out)
     return true;
 }
 
+bool non_negative_days(const xml_node& n, uint32_t& out)
+{
+    std::string_view t = n.text;
+    while (!t.empty() && (t.front() == ' ' || t.front() == '\n' || t.front() == '\t' || t.front() == '\r'))
+        t.remove_prefix(1);
+    while (!t.empty() && (t.back() == ' ' || t.back() == '\n' || t.back() == '\t' || t.back() == '\r'))
+        t.remove_suffix(1);
+    int64_t v = 0;
+    const auto r = std::from_chars(t.data(), t.data() + t.size(), v);
+    if (t.empty() || r.ec != std::errc{} || r.ptr != t.data() + t.size() || v < 0 || v > INT32_MAX)
+        return false;
+    out = static_cast<uint32_t>(v);
+    return true;
+}
+
+// A storage class as a tier is named: what a targets file's names may be.
+bool class_name_ok(std::string_view s)
+{
+    if (s.empty() || s.size() > 64)
+        return false;
+    for (const char ch : s)
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' ||
+              ch == '_' || ch == '.'))
+            return false;
+    return true;
+}
+
 std::string new_rule_id()
 {
     static constexpr char digits[] = "abcdefghijklmnopqrstuvwxyz234567";
@@ -126,6 +153,8 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
     const xml_node* expiration = nullptr;
     const xml_node* noncurrent = nullptr;
     const xml_node* abort = nullptr;
+    const xml_node* transition = nullptr;
+    const xml_node* noncurrent_transition = nullptr;
     auto once = [&](const xml_node*& slot, const xml_node& k) -> bool
     {
         if (slot)
@@ -150,8 +179,14 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
             fresh = once(abort, k);
         else if (k.name == "Transition" || k.name == "NoncurrentVersionTransition")
         {
-            err = fail("NotImplemented", "Lifecycle transitions are not supported: this storage has one storage class");
-            return false;
+            // One transition of each kind a rule, since a tier is where a version stays.
+            const xml_node*& slot = k.name == "Transition" ? transition : noncurrent_transition;
+            if (slot)
+            {
+                err = fail("NotImplemented", "A rule moves objects to one storage class");
+                return false;
+            }
+            slot = &k;
         }
         else if (k.name == "NoncurrentVersionExpiration")
             fresh = once(noncurrent, k);
@@ -330,6 +365,89 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
         }
     }
 
+    if (transition)
+    {
+        const xml_node* days = nullptr;
+        const xml_node* date = nullptr;
+        const xml_node* cls  = nullptr;
+        for (const xml_node& k : transition->kids)
+        {
+            const bool fresh = k.name == "Days" ? once(days, k) : k.name == "Date" ? once(date, k)
+                             : k.name == "StorageClass" ? once(cls, k) : false;
+            if (!fresh || !k.kids.empty())
+            {
+                err = fail("MalformedXML");
+                return false;
+            }
+        }
+        if (!cls || (days != nullptr) == (date != nullptr))
+        {
+            err = fail("MalformedXML");
+            return false;
+        }
+        if (days && !non_negative_days(*days, r.transition_days))
+        {
+            err = fail("InvalidArgument", "'Days' for Transition action must be a non-negative integer");
+            return false;
+        }
+        if (date)
+        {
+            bool midnight = false;
+            if (!parse_iso8601(date->text, r.transition_date_ms, midnight) || !midnight)
+            {
+                err = fail("InvalidArgument", "'Date' must be an ISO 8601 date at midnight GMT");
+                return false;
+            }
+            r.has_transition_date = true;
+        }
+        if (!class_name_ok(cls->text))
+        {
+            err = fail("InvalidStorageClass");
+            return false;
+        }
+        r.transition_class = cls->text;
+        r.has_transition   = true;
+    }
+
+    if (noncurrent_transition)
+    {
+        const xml_node* days = nullptr;
+        const xml_node* cls  = nullptr;
+        for (const xml_node& k : noncurrent_transition->kids)
+        {
+            if (k.name == "NewerNoncurrentVersions")
+            {
+                err = fail("NotImplemented", "NewerNoncurrentVersions is not supported");
+                return false;
+            }
+            const bool fresh = k.name == "NoncurrentDays" ? once(days, k) : k.name == "StorageClass" ? once(cls, k)
+                             : false;
+            if (!fresh || !k.kids.empty())
+            {
+                err = fail("MalformedXML");
+                return false;
+            }
+        }
+        if (!days || !cls)
+        {
+            err = fail("MalformedXML");
+            return false;
+        }
+        if (!non_negative_days(*days, r.noncurrent_transition_days))
+        {
+            err = fail("InvalidArgument",
+                       "'NoncurrentDays' for NoncurrentVersionTransition action must be a non-negative integer");
+            return false;
+        }
+        if (!class_name_ok(cls->text))
+        {
+            err = fail("InvalidStorageClass");
+            return false;
+        }
+        r.noncurrent_transition_class = cls->text;
+        r.has_noncurrent_transition   = true;
+    }
+
     if (abort)
     {
         if (abort->kids.size() != 1 || abort->kids[0].name != "DaysAfterInitiation" || !abort->kids[0].kids.empty())
@@ -345,7 +463,7 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
         }
     }
 
-    if (!expiration && !abort && !noncurrent)
+    if (!expiration && !abort && !noncurrent && !transition && !noncurrent_transition)
     {
         err = fail("InvalidRequest", "At least one action needs to be specified in a rule");
         return false;
@@ -476,9 +594,19 @@ std::string lifecycle_xml(const lifecycle_config& c)
         else if (r.delete_marker >= 0)
             x += r.delete_marker ? "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>"
                                  : "<Expiration><ExpiredObjectDeleteMarker>false</ExpiredObjectDeleteMarker></Expiration>";
+        if (r.has_transition)
+        {
+            x += r.has_transition_date ? "<Transition><Date>" + iso8601(r.transition_date_ms) + "</Date>"
+                                       : "<Transition><Days>" + std::to_string(r.transition_days) + "</Days>";
+            x += "<StorageClass>" + r.transition_class + "</StorageClass></Transition>";
+        }
         if (r.noncurrent_days != 0)
             x += "<NoncurrentVersionExpiration><NoncurrentDays>" + std::to_string(r.noncurrent_days) +
                  "</NoncurrentDays></NoncurrentVersionExpiration>";
+        if (r.has_noncurrent_transition)
+            x += "<NoncurrentVersionTransition><NoncurrentDays>" + std::to_string(r.noncurrent_transition_days) +
+                 "</NoncurrentDays><StorageClass>" + r.noncurrent_transition_class +
+                 "</StorageClass></NoncurrentVersionTransition>";
         if (r.abort_days != 0)
             x += "<AbortIncompleteMultipartUpload><DaysAfterInitiation>" + std::to_string(r.abort_days) +
                  "</DaysAfterInitiation></AbortIncompleteMultipartUpload>";
@@ -547,6 +675,35 @@ bool lifecycle_noncurrent_due(const lifecycle_rule& r, std::string_view key, con
 {
     return r.enabled && r.noncurrent_days != 0 && filter_takes(r, key, m) &&
            now_ms >= lifecycle_due_ms(since_ms, r.noncurrent_days, day_ms);
+}
+
+bool lifecycle_transition_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t now_ms,
+                              int64_t day_ms)
+{
+    if (!r.transitions() || !filter_takes(r, key, m))
+        return false;
+    return now_ms >= (r.has_transition_date ? r.transition_date_ms
+                                            : lifecycle_due_ms(m.mtime_ms, r.transition_days, day_ms));
+}
+
+bool lifecycle_noncurrent_transition_due(const lifecycle_rule& r, std::string_view key, const object_meta& m,
+                                         int64_t since_ms, int64_t now_ms, int64_t day_ms)
+{
+    return r.enabled && r.has_noncurrent_transition && filter_takes(r, key, m) &&
+           now_ms >= lifecycle_due_ms(since_ms, r.noncurrent_transition_days, day_ms);
+}
+
+std::vector<std::string> lifecycle_classes(const lifecycle_config& c)
+{
+    std::vector<std::string> out;
+    for (const lifecycle_rule& r : c.rules)
+    {
+        if (r.has_transition)
+            out.push_back(r.transition_class);
+        if (r.has_noncurrent_transition)
+            out.push_back(r.noncurrent_transition_class);
+    }
+    return out;
 }
 
 bool lifecycle_upload_due(const lifecycle_rule& r, std::string_view key, int64_t initiated_ms, int64_t now_ms,

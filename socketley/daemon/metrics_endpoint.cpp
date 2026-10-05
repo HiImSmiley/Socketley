@@ -1,4 +1,6 @@
 #include "metrics_endpoint.h"
+
+#include <algorithm>
 #include "dashboard_html.h"
 #include "../shared/runtime_manager.h"
 #include "../shared/runtime_instance.h"
@@ -458,9 +460,12 @@ static void append_storage_series(std::string& out, const std::vector<storage_ro
     if (rows.empty())
         return;
 
+    // The figures a family of their own carries, which the catch-all at the end leaves out.
+    std::vector<std::string_view> named;
     const auto family = [&](std::string_view metric, std::string_view type, std::string_view help,
                             std::string_view key)
     {
+        named.push_back(key);
         out += "\n# HELP ";
         out += metric;
         out += ' ';
@@ -498,12 +503,84 @@ static void append_storage_series(std::string& out, const std::vector<storage_ro
     family("socketley_storage_tls_failures_total", "counter",
            "TLS handshakes that failed or never finished.", "tls_failures");
 
+    // The subsystems a runtime runs beside its requests: what waits, what went, what failed.
+    static constexpr struct
+    {
+        const char* metric;
+        const char* type;
+        const char* help;
+        const char* key;
+    } subsystems[] = {
+        {"socketley_storage_notify_sent_total", "counter", "Event notifications delivered.", "notify_sent"},
+        {"socketley_storage_notify_failed_total", "counter", "Event notification attempts that failed.", "notify_failed"},
+        {"socketley_storage_notify_queued", "gauge", "Event notifications waiting to be delivered.", "notify_queued"},
+        {"socketley_storage_notify_dropped_total", "counter", "Event notifications dropped past the queue's bound.",
+         "notify_dropped"},
+        {"socketley_storage_replication_pending", "gauge", "Versions and delete markers waiting to be replicated.",
+         "replication_pending"},
+        {"socketley_storage_replication_completed_total", "counter", "Versions and delete markers a replication target took.",
+         "replication_completed"},
+        {"socketley_storage_replication_failed_total", "counter", "Versions a replication target refused for good.",
+         "replication_failed"},
+        {"socketley_storage_replication_retries_total", "counter", "Replication attempts tried again.", "replication_retries"},
+        {"socketley_storage_replication_bytes_total", "counter", "Body bytes replication targets took.", "replication_bytes"},
+        {"socketley_storage_cluster_pending", "gauge", "Changes waiting for another node of the cluster.", "cluster_pending"},
+        {"socketley_storage_cluster_sent_total", "counter", "Changes the other nodes of the cluster took.", "cluster_sent"},
+        {"socketley_storage_cluster_failed_total", "counter", "Changes the other nodes refused for good.", "cluster_failed"},
+        {"socketley_storage_cluster_received_total", "counter", "Bucket, IAM and share records other nodes sent.", "cluster_in"},
+        {"socketley_storage_cluster_seeding", "gauge", "Nodes this runtime has not yet sent everything it holds.",
+         "cluster_seeding"},
+        {"socketley_storage_cluster_overflows_total", "counter", "Queues for a node let go for a full resend.",
+         "cluster_overflows"},
+        {"socketley_storage_cluster_synced_total", "counter", "Writes answered once the nodes sync names had them.",
+         "cluster_synced"},
+        {"socketley_storage_cluster_sync_timeouts_total", "counter", "Writes answered when their wait for the nodes was over.",
+         "cluster_sync_timeouts"},
+        {"socketley_storage_scrub_objects_total", "counter", "Versions the scrub read back.", "scrub_objects"},
+        {"socketley_storage_scrub_bytes_total", "counter", "Bytes the scrub read back.", "scrub_bytes"},
+        {"socketley_storage_scrub_corrupt_total", "counter", "Copies the scrub found whose bytes are not their MD5's.",
+         "scrub_corrupt"},
+        {"socketley_storage_scrub_passes_total", "counter", "Whole passes of the scrub.", "scrub_passes"},
+        {"socketley_storage_scrub_heals_total", "counter", "Corrupt copies another node was asked to send again.",
+         "scrub_heals"},
+        {"socketley_storage_scrub_unhealed_total", "counter", "Corrupt copies no other node held whole.", "scrub_unhealed"},
+        {"socketley_storage_compressed_objects_total", "counter", "Versions compressed where they lie.",
+         "compressed_objects"},
+        {"socketley_storage_compressed_bytes_in_total", "counter", "Bytes of the versions compressed.",
+         "compressed_bytes_in"},
+        {"socketley_storage_compressed_bytes_out_total", "counter", "What the versions compressed take on disk.",
+         "compressed_bytes_out"},
+        {"socketley_storage_tier_moved_total", "counter", "Versions a lifecycle moved to a tier.", "tier_moved"},
+        {"socketley_storage_tier_moved_bytes_total", "counter", "Bytes of the versions moved to a tier.",
+         "tier_moved_bytes"},
+        {"socketley_storage_tier_failed_total", "counter", "Moves to a tier that did not finish.", "tier_failed"},
+        {"socketley_storage_tier_reads_total", "counter", "Windows read back from a tier for a client.", "tier_reads"},
+        {"socketley_storage_tier_read_failures_total", "counter", "Windows a tier did not give back.",
+         "tier_read_failures"},
+        {"socketley_storage_lifecycle_expired_total", "counter", "Objects and versions lifecycle rules removed.",
+         "lifecycle_expired"},
+        {"socketley_storage_lifecycle_aborted_total", "counter", "Uploads lifecycle rules aborted.", "lifecycle_aborted"},
+        {"socketley_storage_multipart_completed_total", "counter", "Multipart uploads completed.", "multipart_completed"},
+        {"socketley_storage_media_made_total", "counter", "Thumbnails and stream segments made.", "media_made"},
+        {"socketley_storage_media_failed_total", "counter", "Media that could not be made.", "media_failed"},
+        {"socketley_storage_fsyncs_total", "counter", "Syncs the store made for durability.", "fsyncs"},
+    };
+    for (const auto& f : subsystems)
+    {
+        // A family no runtime reports, as one of a build without the subsystem, has no lines to print.
+        if (std::none_of(rows.begin(), rows.end(), [&f](const storage_row& r) { uint64_t v; return r.get(f.key, v); }))
+            continue;
+        family(f.metric, f.type, f.help, f.key);
+    }
+
     out += "\n# HELP socketley_storage_requests_total Requests a storage runtime served, by operation.\n"
            "# TYPE socketley_storage_requests_total counter\n";
     static constexpr std::pair<const char*, const char*> ops[] = {
         {"gets", "get"}, {"heads", "head"}, {"puts", "put"},
         {"deletes", "delete"}, {"lists", "list"}, {"copies", "copy"},
     };
+    for (const auto& [key, op] : ops)
+        named.push_back(key);
     for (const auto& r : rows)
         for (const auto& [key, op] : ops)
         {
@@ -532,6 +609,23 @@ static void append_storage_series(std::string& out, const std::vector<storage_ro
             label_escape_into(out, r.name);
             out += "\",code=\"";
             label_escape_into(out, std::string_view(key).substr(6));
+            out += "\"} ";
+            json_append_uint(out, v);
+            out += '\n';
+        }
+
+    // Every other figure of `stats`, by the name it has there, so nothing a runtime counts is missing from a scrape.
+    out += "\n# HELP socketley_storage_stat A storage runtime's other stats figures, by name.\n"
+           "# TYPE socketley_storage_stat untyped\n";
+    for (const auto& r : rows)
+        for (const auto& [key, v] : r.figures)
+        {
+            if (key.starts_with("error_") || std::find(named.begin(), named.end(), key) != named.end())
+                continue;
+            out += "socketley_storage_stat{name=\"";
+            label_escape_into(out, r.name);
+            out += "\",stat=\"";
+            label_escape_into(out, key);
             out += "\"} ";
             json_append_uint(out, v);
             out += '\n';

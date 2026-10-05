@@ -526,7 +526,7 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
         rv.host         = r.host;
         rv.payload_hash = r.payload_hash;
         rv.headers      = &r.headers;
-        rv.tls          = c->ssl != nullptr;
+        rv.tls          = secure(*c);
         const std::string body_hash = sha256_hex(c->body);
         rv.body_sha256_hex = body_hash;
         auth_verdict v = m_auth->authorize(rv);

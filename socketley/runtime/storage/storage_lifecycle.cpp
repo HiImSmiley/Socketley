@@ -40,6 +40,8 @@ public:
         ++m_p.scanned;
         if (lifecycle_object_due(m_rule, key, meta, m_now, m_day))
             m_p.due.push_back({m_bucket, key, m_p.cfg, m_p.rule, false});
+        else if (tierer::movable(meta) && lifecycle_transition_due(m_rule, key, meta, m_now, m_day))
+            m_p.due.push_back({m_bucket, key, m_p.cfg, m_p.rule, false, {}, m_rule.transition_class});
     }
     void prefix(std::string) override {}
     void truncated(const std::string& resume_at) override
@@ -83,6 +85,15 @@ void storage_run::op_put_lifecycle(const std::shared_ptr<conn>& c)
         send_error(c, err);
         return;
     }
+    // A class a rule moves objects to is a tier of --tiers, the only place this storage keeps another class.
+    for (const std::string& cls : lifecycle_classes(*cfg))
+        if (!m_tier.has_tier(cls))
+        {
+            err = make_error("InvalidStorageClass");
+            err.message = "The storage class " + cls + " is no tier of this storage";
+            send_error(c, err);
+            return;
+        }
     // Every shard parses the same canonical document, so an ID generated here is every shard's.
     store_doc(c, bucket_doc::lifecycle, q.bucket, lifecycle_xml(*cfg), 200);
 }
@@ -211,7 +222,7 @@ bool storage_run::lifecycle_walk(lifecycle_pass& p)
         };
         if (!p.versions_phase)
         {
-            if (!rule.expires())
+            if (!rule.expires() && !rule.transitions())
             {
                 next_phase();
                 continue;
@@ -248,6 +259,10 @@ bool storage_run::lifecycle_walk(lifecycle_pass& p)
                     if (newer && !is_delete_marker(v) && !lock_holds(v, now, false) &&
                         lifecycle_noncurrent_due(rule, key, v, newer->mtime_ms, now, m_lc_day_ms))
                         p.due.push_back({name, key, p.cfg, p.rule, false, version_of(v).id});
+                    else if (newer && tierer::movable(v) &&
+                             lifecycle_noncurrent_transition_due(rule, key, v, newer->mtime_ms, now, m_lc_day_ms))
+                        p.due.push_back({name, key, p.cfg, p.rule, false, version_of(v).id,
+                                         rule.noncurrent_transition_class});
                     newer = &v;
                 }
             });
@@ -288,6 +303,18 @@ void storage_run::lifecycle_issue(lifecycle_pass& p)
         return;
     }
 
+    // A move is the tier's to make, which checks the version again when it reads it and when it puts it back.
+    if (!d.tier.empty())
+    {
+        const object_meta* m = d.version_id.empty() ? m_store.find(d.bucket, d.key)
+                                                    : m_store.find_version(d.bucket, d.key, d.version_id);
+        if (m && m_tier.has_tier(d.tier))
+        {
+            m_tier.move(d.bucket, d.key, d.version_id, *m, d.tier);
+            ++p.moved;
+        }
+        return;
+    }
     ++p.inflight;
     const std::string bucket = d.bucket;
     const std::string key    = d.key;
@@ -383,9 +410,10 @@ void storage_run::lifecycle_pump()
     if (!finished)
         return;
 
-    if (p.expired || p.aborted)
-        LOG_INFO(("storage: lifecycle expired " + std::to_string(p.expired) + " object(s) and aborted " +
-                  std::to_string(p.aborted) + " incomplete upload(s)").c_str());
+    if (p.expired || p.aborted || p.moved)
+        LOG_INFO(("storage: lifecycle expired " + std::to_string(p.expired) + " object(s), aborted " +
+                  std::to_string(p.aborted) + " incomplete upload(s) and moved " + std::to_string(p.moved) +
+                  " version(s) to a tier").c_str());
     m_lc.reset();
     // A pass an hour at most, and more often only under a test's shortened day.
     const auto every = std::chrono::milliseconds(std::clamp<int64_t>(m_lc_day_ms / 24, 1000, 3600 * 1000));

@@ -1,12 +1,13 @@
 #pragma once
 // A bucket's lifecycle configuration, read, checked and written back, with no I/O.
 //
-// What it takes is the core of S3 lifecycle on a store with one storage class:
-// expiration by days or by date, the removal of noncurrent versions some days
-// after they became noncurrent and of delete markers left with no version behind
-// them, and the abort of incomplete multipart uploads, filtered by key prefix,
-// object tags and object size.  A rule asking for anything else is refused,
-// never accepted to do less than it says.
+// What it takes is the core of S3 lifecycle: expiration by days or by date, the
+// removal of noncurrent versions some days after they became noncurrent and of
+// delete markers left with no version behind them, the abort of incomplete
+// multipart uploads, and the transition of objects and noncurrent versions to a
+// tier named as their storage class, filtered by key prefix, object tags and
+// object size.  A rule asking for anything else is refused, never accepted to do
+// less than it says.
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -56,10 +57,24 @@ struct lifecycle_rule
     uint32_t    noncurrent_days{0};
     // Days after an incomplete multipart upload began it is aborted, zero for none.
     uint32_t    abort_days{0};
+    // <Transition>: days after an object's mtime, or the midnight from which, it moves to the tier its class names.
+    bool        has_transition{false};
+    uint32_t    transition_days{0};
+    bool        has_transition_date{false};
+    int64_t     transition_date_ms{0};
+    std::string transition_class;
+    // <NoncurrentVersionTransition>: days after a version became noncurrent it moves to the tier its class names.
+    bool        has_noncurrent_transition{false};
+    uint32_t    noncurrent_transition_days{0};
+    std::string noncurrent_transition_class;
 
     bool expires() const { return enabled && (expire_days != 0 || has_date); }
+    bool transitions() const { return enabled && has_transition; }
     // The rule acts on the versions behind a key's latest, or on a delete marker that is its latest.
-    bool versions() const { return enabled && (noncurrent_days != 0 || delete_marker == 1); }
+    bool versions() const
+    {
+        return enabled && (noncurrent_days != 0 || delete_marker == 1 || has_noncurrent_transition);
+    }
     bool aborts() const { return enabled && abort_days != 0; }
 };
 
@@ -90,6 +105,17 @@ bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, const o
 // Whether the version `m` of `key`, noncurrent since `since_ms` when the one after it was made, is to be removed.
 bool lifecycle_noncurrent_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t since_ms,
                               int64_t now_ms, int64_t day_ms);
+
+// Whether the object `key` with metadata `m` is to move to the tier of `r`'s transition at `now_ms`.
+bool lifecycle_transition_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t now_ms,
+                              int64_t day_ms);
+
+// Whether the version `m` of `key`, noncurrent since `since_ms`, is to move to the tier of `r`'s noncurrent transition.
+bool lifecycle_noncurrent_transition_due(const lifecycle_rule& r, std::string_view key, const object_meta& m,
+                                         int64_t since_ms, int64_t now_ms, int64_t day_ms);
+
+// The storage classes the rules of `c` move objects to, which must each name a tier.
+std::vector<std::string> lifecycle_classes(const lifecycle_config& c);
 
 // Whether an upload of `key` begun at `initiated_ms` is to be aborted under `r` at `now_ms`.
 bool lifecycle_upload_due(const lifecycle_rule& r, std::string_view key, int64_t initiated_ms, int64_t now_ms,

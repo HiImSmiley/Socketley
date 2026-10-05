@@ -114,6 +114,17 @@ using iam_fields = std::vector<std::pair<std::string, std::string>>;
 iam_result iam_apply(iam_state& s, std::string_view action, const iam_fields& fields, int64_t now_ms,
                      std::string_view request_id, bool (*taken)(void*, std::string_view), void* taken_ctx);
 
+// The resources an IAM request acts on, each after "arn:aws:iam::<account>:" as user/<path><name>, group/... or
+// role/..., and one empty string for an action on none, such as ListUsers.
+std::vector<std::string> iam_resources(const iam_state& s, std::string_view action, const iam_fields& fields);
+
+// Whether the request would let some identity call IAM: a policy put or attached whose Allow names an IAM action, or
+// a user added to a group that has one.
+bool iam_grants_iam(const iam_state& s, std::string_view action, const iam_fields& fields);
+
+// Whether a request that names no UserName acts on its caller's user, as IAM reads it.
+bool iam_defaults_to_caller(std::string_view action);
+
 std::string iam_error_xml(std::string_view code, std::string_view message, std::string_view request_id);
 
 }   // namespace socketley::storage

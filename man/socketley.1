@@ -6366,9 +6366,23 @@ and the rest of its line:
 # name   url
 audit    http://10.0.0.5:8080/s3\-events
 thumbs   https://thumbs.internal/hook ca=/etc/ssl/internal\-ca.pem
+feed     cache://events/stream/s3
+live     cache://events/channel/s3
+panel    server://dashboard
 .fi
 .RE
 .IP
+A url may also name another runtime of the daemon:
+.BI cache:// runtime /stream/ key
+appends each event to that cache's stream as an entry of one field
+.BR event ,
+.BI cache:// runtime /channel/ channel
+publishes it on that channel, and
+.BI server:// runtime
+broadcasts it to the server's clients; such a line takes no
+.BR ca= .
+An event a cache refuses or a runtime that is not running is retried like a
+webhook that does not answer.
 A configuration names one as
 .BI arn:socketley:webhook::: name\fR.
 The file is refused at
@@ -6410,6 +6424,49 @@ if a line does not parse and is read at every start;
 and the state file keep its path, and its secrets are never logged. Without it
 every replication configuration is refused. See
 .BR Replication .
+.TP
+.B \-\-acls
+Buckets given no ownership controls take ACLs, as S3 did before it disabled them
+by default and as RGW does; without it they are BucketOwnerEnforced. See the
+ACLs under
+.BR "Supported S3 operations" .
+.TP
+.BI \-\-tls\-offloaded " addresses"
+The proxies that terminate TLS in front of the runtime, as addresses or blocks
+.RB ( 10.0.0.5 ,
+.BR 10.0.0.0/24 ,
+IPv6 alike), comma\-separated: a connection from one of them counts as one made
+over TLS, so it may carry SSE\-C headers,
+.B aws:SecureTransport
+is true for it, and the URLs the runtime answers with are https. Refused at
+.B create
+when an entry is no address.
+.TP
+.BI \-\-federation " file"
+The OIDC provider and the LDAP directory whose identities STS gives temporary
+credentials to, and the users they sign as, read at every start. See
+.BR "Federated identities" .
+.TP
+.BI \-\-tiers " file"
+The S3 endpoints a bucket's lifecycle may move versions to, each a storage class
+named by its first field, in the format of
+.BR \-\-replication\-targets ;
+the URL's path is the bucket there and an optional prefix in it:
+.RS
+.PP
+.nf
+# name   url                                region     access key            secret
+COLD     https://s3.archive.internal/cold/a  eu\-west\-1  AKIATIER000000000001  wJal.../tier
+.fi
+.RE
+.IP
+The file is refused at
+.B create
+and
+.B start
+if a line does not parse and is read at every start. A tier's path is this
+runtime's own: what lies under it that no version here is is removed. See
+.BR Tiers .
 .TP
 .BI \-\-nodes " file"
 Makes the runtime a node of a cluster, whose nodes each keep every bucket and
@@ -6486,6 +6543,12 @@ check its bytes against the MD5 its header names, so a file the disk changed is
 found before a client reads it. See
 .BR Scrub .
 Without it nothing is read in the background.
+.TP
+.BI \-\-compress " duration"
+Compress each version once it has gone unwritten this long (\fB1h\fR, \fB7d\fR),
+where it lies, so it takes less of the disk and reads back as it was. See
+.BR Compression .
+Without it every body is stored as it was sent.
 .TP
 .BI \-\-max\-bytes " size"
 A quota on the bytes the runtime holds, with the
@@ -6672,6 +6735,10 @@ HeadObject	HEAD /bucket/key	T{
 .ad l
 The headers of a GET, from memory, or from the object's header when another shard owns the key; ?versionId= as for GET.
 T}
+SelectObjectContent	POST /bucket/key?select&select\-type=2	T{
+.ad l
+A SQL expression over a CSV or JSON object, answered as an event stream. See \fBS3 Select\fR below.
+T}
 GetObjectAttributes	GET /bucket/key?attributes	T{
 .ad l
 x\-amz\-object\-attributes of ETag, Checksum, ObjectParts, StorageClass and ObjectSize; the parts of a multipart object paged by x\-amz\-max\-parts and x\-amz\-part\-number\-marker, with their numbers, sizes and, when the upload had a checksum algorithm, each part's own checksum; ?versionId= and the SSE\-C headers as for HeadObject.
@@ -6836,29 +6903,64 @@ AssumeRole	POST / Action=AssumeRole	T{
 .ad l
 STS's: the same, DurationSeconds 900 to 43200 (3600), any RoleArn, and a Policy that bounds the session.
 T}
+AssumeRoleWithWebIdentity	POST / Action=AssumeRoleWithWebIdentity	T{
+.ad l
+STS's, unsigned: temporary credentials for an OIDC provider's token, as \fB\-\-federation\fR maps it. See \fBFederated identities\fR below.
+T}
+AssumeRoleWithLDAPIdentity	POST / Action=AssumeRoleWithLDAPIdentity	T{
+.ad l
+Unsigned: temporary credentials for a user the LDAP directory binds, as \fB\-\-federation\fR maps it.
+T}
 .TE
 .PP
-ACLs are those of a bucket whose ACLs are disabled, which S3 makes the default
-(ObjectOwnership BucketOwnerEnforced): every bucket and object has one grant,
-FULL_CONTROL to its owner, which GetBucketAcl and GetObjectAcl answer and
-GetBucketOwnershipControls names. A write may ask for that ACL
-(\fBbucket\-owner\-full\-control\fR, or \fBx\-amz\-acl: private\fR from the bucket's
-owner, as rclone and s3fs send by default, since from anybody else it would give
-the writer the control) and PutBucketAcl and PutObjectAcl may set it again; any other
-canned ACL or grant is
+A bucket's ownership controls (PutBucketOwnershipControls, GetBucketOwnershipControls,
+DeleteBucketOwnershipControls, or
+.B x\-amz\-object\-ownership
+on CreateBucket) decide whether it takes ACLs. BucketOwnerEnforced, every bucket's
+default as S3 makes it now, disables them: every bucket and object has one grant,
+FULL_CONTROL to the bucket's owner, which GetBucketAcl and GetObjectAcl answer, and a
+write may ask only for that ACL (\fBbucket\-owner\-full\-control\fR, or
+\fBx\-amz\-acl: private\fR from the bucket's owner, as rclone and s3fs send by
+default); any other canned ACL or grant is
 .B "400 AccessControlListNotSupported"
-(\fBInvalidBucketAclWithObjectOwnership\fR on CreateBucket) and stores nothing,
-rather than an object stored private that was asked to be public.
+(\fBInvalidBucketAclWithObjectOwnership\fR on CreateBucket) and stores nothing.
+ObjectWriter and BucketOwnerPreferred take them, and with
+.B \-\-acls
+so does every bucket given no ownership controls (GetBucketOwnershipControls is then
+.B "404 OwnershipControlsNotFoundError"
+for it, as for an RGW bucket). There the canned ACLs (private, public\-read,
+public\-read\-write, authenticated\-read, bucket\-owner\-read,
+bucket\-owner\-full\-control, log\-delivery\-write), the
+.B x\-amz\-grant\-*
+headers (id=, uri= of AllUsers, AuthenticatedUsers or LogDelivery, emailAddress= of a
+user's
+.B email
+setting) and an AccessControlPolicy document set a bucket's ACL, kept as its
+document beside its policy, and an object's, kept in its header with its owner: the
+writer under ObjectWriter, the bucket's owner under BucketOwnerPreferred when the
+write gave that owner full control. A bucket's grants admit listing (READ), writes
+and deletes (WRITE) and its ACL (READ_ACP, WRITE_ACP); an object's admit its reads
+(READ) and its ACL, and are read when the object is, after the bucket's said
+nothing. An explicit Deny of a policy still refuses, the bucket's owner and an admin
+are admitted whatever the grants say, a public grant is
+.B "403 AccessDenied"
+where the public access block blocks public ACLs and counts for nothing where it
+ignores them, a grantee that is no user is
+.B "400 InvalidArgument"
+.RB ( UnresolvableGrantByEmailAddress
+for an email), and BucketOwnerEnforced is refused on a bucket whose ACL grants
+anything more than its owner's full control.
 A bucket's own tags (PutBucketTagging, GetBucketTagging, DeleteBucketTagging)
 are at most 50 under the rules of an object's, NoSuchTagSet (404) when there are
 none, and are kept and carried between shards like its CORS rules, in
 .IB dir / bucket /tagging .
 Every storage class S3 has is taken and stored as STANDARD, the one this storage
-has, and one it does not have is
+keeps here (a version a lifecycle moved to a tier is listed and read with the
+tier's name as its class), and one it does not have is
 .BR "400 InvalidStorageClass" ;
 .B x\-amz\-website\-redirect\-location
 is kept and returned like the other stored headers.
-Anything else \(em other ownership controls, analytics, inventory \(em is answered
+Anything else \(em analytics, inventory \(em is answered
 .B "501 NotImplemented"
 and never mistaken for the plain operation. A single put is at most 5 GiB and a
 key at most 1024 bytes.
@@ -7182,8 +7284,87 @@ what the policy does not allow is refused even to an admin or a bucket's owner,
 the bucket policy's operations included. GetCallerIdentity names the user or the
 assumed role that signed. A browser's form upload is not signed with temporary
 credentials.
+.SS Federated identities
+With
+.BI \-\-federation " file"
+the endpoint gives temporary credentials, unsigned, to an identity an OIDC provider
+or an LDAP directory vouches for. The file holds one setting a line, comments and
+blank lines as in
+.BR \-\-notify\-targets ,
+relative paths under its own directory:
+.RS
+.PP
+.nf
+oidc issuer https://id.example.org/realms/main
+oidc client storage\-console
+oidc jwks   jwks.json
+oidc claim  policy
+role arn:aws:iam:::role/ci   builder
+ldap url    ldaps://ldap.example.org ca=/etc/ssl/ldap\-ca.pem
+ldap dn     uid=%s,ou=People,dc=example,dc=org
+ldap user   alice  =
+ldap user   *      reader
+.fi
+.RE
+.PP
+.B AssumeRoleWithWebIdentity
+takes a JWT signed RS256, RS384, RS512, PS256, ES256 or ES384 by a key of the JWK
+Set file (RSA of 2048 bits and up, EC P\-256 and P\-384), read again whenever it
+changes and kept while a new one does not parse; its
+.B iss
+must be the issuer, its
+.B aud
+name a client, and
+.BR exp ,
+.B nbf
+and
+.B iat
+hold within a minute, else
+.B "400 InvalidIdentityToken"
+.RB ( ExpiredTokenException
+once it ran out). A
+.B role
+line for the RoleArn names the user the session signs as; without one the token's
+claim (by default
+.BR policy )
+must name exactly one user.
+.B AssumeRoleWithLDAPIdentity
+binds
+.B LDAPUsername
+with
+.B LDAPPassword
+as the
+.B dn
+template makes it (the name escaped as a DN value), over ldap:// or ldaps://
+checked against
+.B ca=
+or the system's CAs, within five seconds on a thread of its own
+.RB ( "503 ServiceUnavailable"
+when the directory does not answer,
+.B "403 AccessDenied"
+when it refuses); the user's own
+.B ldap user
+line, else the
+.B *
+one, names the user the session signs as
+.RB ( =
+for the same name). An empty password is refused before anything is sent.
+.PP
+Either session is the mapped user's, signed under its first key, with its rights,
+narrowed by a
+.B Policy
+as AssumeRole's is; a RoleArn naming a role the IAM API made is assumed when its
+trust policy names the mapped user, as AssumeRole's would be. A mapping to a user
+that is not there, or has no key, is
+.BR "403 AccessDenied" .
+The file is refused at
+.B create
+and
+.B start
+when a line does not parse, and read at every start.
 .SS IAM
-The endpoint answers IAM's API too, to an admin and no session: CreateUser,
+The endpoint answers IAM's API too, to an admin, to a user whose own policies
+allow the action, and never to a session: CreateUser,
 GetUser, ListUsers, UpdateUser and DeleteUser; CreateAccessKey (at most two per
 user), ListAccessKeys, UpdateAccessKey and DeleteAccessKey; CreateGroup,
 GetGroup, ListGroups, DeleteGroup, AddUserToGroup, RemoveUserFromGroup and
@@ -7215,6 +7396,36 @@ statements with a condition let nobody in. ARNs name no account,
 .BR arn:aws:iam:::user/ name ,
 as RGW writes them. OIDC providers, customer managed policies, tags and permission
 boundaries are not served.
+.PP
+A user who is no admin may call an IAM action its identity policies allow, as
+.BI iam: Action
+with
+.B *
+and
+.B ?
+(\fBiam:List*\fR, \fBiam:*\fR; \fB"*"\fR names S3's actions alone, so a policy written
+before IAM could be delegated gives none of it, and AdministratorAccess names
+\fBiam:*\fR beside it), on resources
+.BI arn:aws:iam:: account :user/ "path name" ,
+.BR group/ ...
+or
+.BR role/ ...
+in any account, where
+.B ${aws:username}
+is the caller's user id; ListUsers, ListGroups and ListRoles act on no resource,
+so only
+.B "Resource": "*"
+covers them. A Deny wins and no Allow is
+.BR AccessDenied .
+A key named by its id alone is judged as its owner's, a rename or a move needs
+both ARNs, and GetUser, CreateAccessKey and ListAccessKeys without a UserName act
+on the caller. An admin keeps every right whatever its policies say. The admin
+flag is the credentials file's alone, and only an admin may give an identity IAM
+rights: a policy put or attached whose Allow names an
+.B iam:
+action, AdministratorAccess included, or a group that has one, is refused to
+anybody else. IAM actions this runtime does not answer are accepted in a policy
+and match nothing.
 .SS CORS
 A bucket's CORS rules let a page served from another origin use it from a
 browser: read objects, and upload with a presigned URL. They are set with
@@ -8157,6 +8368,150 @@ and
 (corrupt copies another node was asked to send again) and
 .B scrub_unhealed
 (those no other node held whole).
+.SS Compression
+With
+.BR \-\-compress ,
+every shard looks, a key at a time, at the versions written since its last pass
+that have now gone unwritten for the duration, and compresses each that is stored
+in the clear, is of one part and holds at least 4 KiB: its bytes are cut into
+chunks of 64 KiB, each compressed as an LZ4 block, or kept as it is when that is
+no shorter, and written beside the version with a table of where each chunk lies,
+then put in its place under its key's lane while it is still the version it was.
+A version whose first megabyte, or whole body, does not get an eighth shorter is
+left as it was. A pass begins once a quarter of the duration, and at least a
+second, has passed since the last one's window; what it took is noted in
+.IB dir /.compact. shard ,
+so each version is looked at once. The reads go at most 64 MiB a second.
+.PP
+Nothing a client sees changes: the ETag, the checksums, the size and the time are
+the version's, a range opens only the chunks it touches, a copy is made of the
+bytes and not of the chunks, and replication, the scrub, media and WebDAV read it
+as they read any other. A version under SSE, a multipart object and an object
+of under 4 KiB are never compressed.
+.PP
+.B stats
+shows, per shard,
+.B compressed_objects
+(versions compressed),
+.B compressed_skipped
+(read and left, as no shorter or changed meanwhile),
+.BR compressed_failed ,
+.B compressed_bytes_in
+and
+.B compressed_bytes_out
+(their bytes, and what they take on disk now),
+.B compressed_passes
+and
+.B compressed_gets
+(GETs whose chunks were opened from the file rather than from memory).
+.SS S3 Select
+SelectObjectContent runs one SQL expression over an object stored as CSV
+(FileHeaderInfo USE, IGNORE or NONE, any field and record delimiter, quotes,
+comments) or as JSON (DOCUMENT or LINES), with an optional ScanRange, and answers
+in AWS's event stream, sent as HTTP chunks while the object is read: Records
+events as they come, a Progress event when asked for, then Stats (the bytes
+scanned, processed and returned) and End, or an error event when the object
+cannot be read past the 200. The expression is
+.B SELECT
+.B *
+or a list of expressions with
+.BR AS ,
+.B FROM S3Object
+with an alias and a JSON path
+.RB ( S3Object[*].items[*] ),
+.BR WHERE ,
+.BR LIMIT ;
+columns by position
+.RB ( _1 ),
+by header name or by JSON path
+.RB ( s.a.b[0] );
+the comparisons,
+.BR AND ,
+.BR OR ,
+.BR NOT ,
+.BR LIKE ,
+.BR BETWEEN ,
+.BR IN ,
+.BR "IS NULL" ,
+arithmetic and
+.BR || ;
+.BR CAST ,
+.BR LOWER ,
+.BR UPPER ,
+.BR TRIM ,
+.BR CHAR_LENGTH ,
+.BR SUBSTRING ,
+.B COALESCE
+and
+.BR NULLIF ;
+and the aggregates
+.BR COUNT ,
+.BR SUM ,
+.BR AVG ,
+.B MIN
+and
+.BR MAX .
+A record over 1 MiB is
+.BR OverMaxRecordSize ,
+and GZIP, BZIP2 and Parquet input are
+.BR "501 NotImplemented" .
+The object is read as a GET reads it, sealed, compressed or at a tier, and the
+request needs what a GetObject of it needs, SSE\-C headers included.
+.B stats
+counts
+.B selects
+and
+.B select_scanned
+(the bytes their scans read).
+.SS Tiers
+A lifecycle rule's
+.B Transition
+or
+.B NoncurrentVersionTransition
+names a tier of
+.B \-\-tiers
+as its
+.BR StorageClass .
+When a version comes due, the shard that owns its key reads it and writes it to
+the tier with one signed PUT (its Content\-MD5 the version's own when it is of
+one part), under
+.IB prefix bucket / mtime \- md5 \- version / key
+in the tier's bucket, so the same version of every node of a cluster is one
+object there; once the tier has it, the version's file here becomes its header
+alone, put in place under its key's lane while it is still the version that was
+read. A version under SSE, one larger than 5 GiB and a multipart object whose part
+list follows its bytes stay here.
+.PP
+A moved version is listed, and answered on GET and HEAD, with the tier's name as
+its
+.BR x\-amz\-storage\-class ;
+a GET, a range or a part of it is read from the tier half a megabyte at a time,
+two windows ahead, with the size, ETag, time and checksums it always had.
+CopyObject and UploadPartCopy from it are
+.BR "403 InvalidObjectState" ,
+as S3 answers for an archived object; the scrub, replication and a cluster's
+seeding pass it over. A quarter day after the last, each shard walks every
+tier's listing and removes there what no version of a key it owns is any more,
+an hour after the tier took it at the earliest, so a version deleted, expired or
+written over here is gone from the tier within six hours.
+.PP
+.B stats
+shows
+.B tier_moved
+and
+.B tier_moved_bytes
+(versions moved and their bytes),
+.BR tier_failed ,
+.B tier_moving
+(waiting and in flight),
+.B tier_reads
+and
+.B tier_read_failures
+(windows read back),
+.B tier_swept
+(objects removed at a tier) and
+.B tier_gets
+(GETs read from a tier).
 .SS Server\-side encryption
 .B "x\-amz\-server\-side\-encryption: AES256"
 on PutObject, CreateMultipartUpload or CopyObject (SSE\-S3) stores the object
@@ -8209,8 +8564,10 @@ SSE\-C is the client's own key, sent with every request that touches the object 
 .B \-customer\-key
 (the 32 bytes in base64) and
 .BR \-customer\-key\-MD5 ,
-as boto3 and the AWS CLI send them. It is taken over TLS only: the headers over plain
-HTTP or a unix node are
+as boto3 and the AWS CLI send them. It is taken over TLS only, the runtime's own or
+a proxy's that
+.B \-\-tls\-offloaded
+names: the headers over plain HTTP from anywhere else or a unix node are
 .BR "400 InvalidRequest" ,
 and nothing is written. The key is never stored: the object's data key is wrapped
 under it, which only that key opens, so a GET or HEAD without the headers is
@@ -8334,11 +8691,25 @@ of its own), and
 .B NoncurrentVersionExpiration
 by
 .BR NoncurrentDays .
-.BR Transition ,
-.B NoncurrentVersionTransition
+.B Transition
+by
+.B Days
+(zero included) or by
+.BR Date ,
 and
+.B NoncurrentVersionTransition
+by
+.BR NoncurrentDays ,
+each to a
+.B StorageClass
+that names a tier of
+.B \-\-tiers
+(any other is
+.BR "400 InvalidStorageClass" ;
+see
+.BR Tiers ).
 .B NewerNoncurrentVersions
-are refused with
+and a second transition of either kind in one rule are refused with
 .B "501 NotImplemented"
 and the configuration that was there stays; a document that is not one is
 .BR MalformedXML ,
@@ -9543,7 +9914,26 @@ and
 .B socketley_storage_errors_total
 (label
 .B code
-= the S3 error code).
+= the S3 error code). The subsystems have families of their own when a runtime
+runs them: event notifications
+.RB ( socketley_storage_notify_ *),
+replication
+.RB ( socketley_storage_replication_ *),
+a cluster
+.RB ( socketley_storage_cluster_ *),
+the scrub
+.RB ( socketley_storage_scrub_ *),
+compression
+.RB ( socketley_storage_compressed_ *),
+tiers
+.RB ( socketley_storage_tier_ *),
+lifecycle, multipart, media and fsyncs. Every other figure of
+.B stats
+is
+.B socketley_storage_stat
+with its name as the label
+.BR stat ,
+so nothing a runtime counts is missing from a scrape.
 .SS Lua
 A script attached with
 .B \-\-lua

@@ -100,6 +100,8 @@ void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool
         stg.set_dir(cfg.storage_dir);
     if (asked("anonymous", cfg.storage_anonymous))
         stg.set_anonymous(cfg.storage_anonymous);
+    if (asked("acls", cfg.storage_acls))
+        stg.set_acls(cfg.storage_acls);
     if (asked("max_bytes", cfg.storage_max_bytes > 0))
         stg.set_max_bytes(cfg.storage_max_bytes);
     if (asked("access_key", !cfg.storage_access_key.empty()))
@@ -118,6 +120,12 @@ void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool
         stg.set_notify_targets(cfg.storage_notify_targets);
     if (asked("replication_targets", !cfg.storage_replication_targets.empty()))
         stg.set_replication_targets(cfg.storage_replication_targets);
+    if (asked("tiers", !cfg.storage_tiers.empty()))
+        stg.set_tiers_file(cfg.storage_tiers);
+    if (asked("federation", !cfg.storage_federation.empty()))
+        stg.set_federation_file(cfg.storage_federation);
+    if (asked("tls_offloaded", !cfg.storage_tls_offloaded.empty()))
+        stg.set_tls_offloaded(cfg.storage_tls_offloaded);
     if (asked("nodes", !cfg.storage_nodes.empty()))
         stg.set_nodes_file(cfg.storage_nodes);
     if (asked("fsync", !cfg.storage_fsync.empty()))
@@ -128,6 +136,8 @@ void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool
         stg.set_mpu_expire_secs(cfg.storage_mpu_expire_secs);
     if (asked("scrub", cfg.storage_scrub_secs > 0))
         stg.set_scrub_secs(cfg.storage_scrub_secs);
+    if (asked("compress", cfg.storage_compress_secs > 0))
+        stg.set_compress_secs(cfg.storage_compress_secs);
 }
 
 void apply_common_config(runtime_instance& rt, const runtime_config& cfg)

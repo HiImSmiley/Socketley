@@ -237,7 +237,7 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
         pr.action    = s3_action::list_all_my_buckets;
         pr.principal = v.principal;
         pr.user      = u->configured ? std::string_view(u->id) : std::string_view{};
-        pr.tls       = c->ssl != nullptr;
+        pr.tls       = secure(*c);
         pr.ip        = &c->ip;
         const auto denies = [&pr](const bucket_policy* p) { return p && p->evaluate(pr) == policy_effect::deny; };
         if (denies(u->session_policy.get()) || (u->has_policy && denies(&u->policy)) || denies(u->iam_policy.get()))
@@ -253,7 +253,9 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
     if (!copy_from && !restricted)
     {
         const bucket_policy* p = m_store.policy(r.bucket);
-        if (!p || (!v.anonymous && !p->has_deny()))
+        // Nor an anonymous one a bucket's grants may admit.
+        const bool grants = v.anonymous && bucket_ownership(r.bucket) != object_ownership::enforced;
+        if ((!p && !grants) || (p && !v.anonymous && !p->has_deny()))
             return;
     }
 
@@ -277,7 +279,7 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
     pr.anonymous = v.anonymous;
     pr.principal = v.principal;
     pr.user      = u && u->configured ? std::string_view(u->id) : std::string_view{};
-    pr.tls       = c->ssl != nullptr;
+    pr.tls       = secure(*c);
     pr.ip        = &c->ip;
     pr.every_key = action == s3_action::delete_object && r.key.empty();
     pr.sse_sent  = r.has_header("x-amz-server-side-encryption");
@@ -318,7 +320,15 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
 
     auto judge = [this, &c, u](std::string_view bucket, const policy_request& q) { return access_of(c, bucket, q, u); };
 
-    const policy_effect dest = judge(r.bucket, pr);
+    policy_effect dest = judge(r.bucket, pr);
+    // An object's own grants are read where the object is, so a request its bucket does not admit waits for them.
+    if (dest == policy_effect::none && !copy_from)
+        if (const uint8_t need = object_acl_need(action);
+            need && bucket_ownership(r.bucket) != object_ownership::enforced)
+        {
+            dest = policy_effect::allow;
+            c->acl_need = need;
+        }
     // A copy reads its source, which the source bucket's owner and policy have their say on as a GetObject.
     const bool copy = copy_from && action == s3_action::put_object;
     policy_effect src = policy_effect::none;
@@ -451,7 +461,65 @@ policy_effect storage_run::access_of(const std::shared_ptr<conn>& c, std::string
         return policy_effect::deny;
     if (full || own == policy_effect::allow || pol == policy_effect::allow)
         return policy_effect::allow;
+    // A bucket that takes ACLs admits what its ACL grants, a grant to everyone only while it does not ignore those.
+    if (const uint8_t need = bucket_acl_need(q.action); need && bucket_ownership(bucket) != object_ownership::enforced)
+    {
+        const auto kept = m_store.bucket_acl(bucket);
+        const acl_list a = kept ? *kept : default_acl(std::string(owner_of(bucket)));
+        const auto pab = m_store.bucket_public_access(bucket);
+        const std::string_view id = u ? std::string_view(u->id) : std::string_view{};
+        if ((acl_grants(a, id, u != nullptr, pab && pab->ignore_public_acls) & need) == need)
+        {
+            c->by_acl = true;
+            return policy_effect::allow;
+        }
+    }
     return policy_effect::none;
+}
+
+bool storage_run::secure(conn& c)
+{
+    if (c.ssl)
+        return true;
+    if (m_tls_offloaded.empty())
+        return false;
+    if (!c.ip_known)
+    {
+        c.ip       = client_ip_of(c.fd);
+        c.ip_known = true;
+    }
+    for (const bucket_policy::cidr& b : m_tls_offloaded)
+        if (cidr_holds(b, c.ip))
+            return true;
+    return false;
+}
+
+policy_effect storage_run::iam_access(const std::shared_ptr<conn>& c, const user_identity& u, std::string_view principal,
+                                      int action, std::string_view resource)
+{
+    if (!c->ip_known && ((u.has_policy && u.policy.needs_ip()) || (u.iam_policy && u.iam_policy->needs_ip())))
+    {
+        c->ip       = client_ip_of(c->fd);
+        c->ip_known = true;
+    }
+    const request_context ctx(*c, &u, false, static_cast<int64_t>(m_store.now_ms()));
+    policy_request q;
+    q.ctx          = &ctx;
+    q.iam_action   = action;
+    q.iam_resource = resource;
+    q.principal    = principal;
+    q.user         = u.configured ? std::string_view(u.id) : std::string_view{};
+    q.tls          = secure(*c);
+    q.ip           = &c->ip;
+    policy_effect own = u.has_policy ? u.policy.evaluate(q) : policy_effect::none;
+    // The IAM API's policies of a credentials-file user stand beside the file's, as they do for S3.
+    if (const bucket_policy* extra = u.iam_policy.get())
+    {
+        const policy_effect e = extra->evaluate(q);
+        if (e == policy_effect::deny || (e == policy_effect::allow && own == policy_effect::none))
+            own = e;
+    }
+    return own;
 }
 
 bool storage_run::policy_allows(const std::shared_ptr<conn>& c, s3_action action, std::string_view key)
@@ -468,7 +536,7 @@ bool storage_run::policy_allows(const std::shared_ptr<conn>& c, s3_action action
     q.anonymous = c->anonymous;
     q.principal = c->principal;
     q.user      = u && u->configured ? std::string_view(u->id) : std::string_view{};
-    q.tls       = c->ssl != nullptr;
+    q.tls       = secure(*c);
     q.ip        = &c->ip;
     const policy_effect e = access_of(c, c->req.bucket, q, u);
     if (u)

@@ -2029,6 +2029,14 @@ st apply_header_change(object_meta& m, const header_change& c, int64_t now_ms)
             if (replication_status_of(m) != "FAILED")
                 set_replication_status(m, c.value);
             break;
+        case header_change::kind::acl:
+        {
+            acl_list check;
+            if (!c.value.empty() && !decode_acl(c.value, check))
+                return st::io_error;
+            set_object_acl(m, c.value);
+            break;
+        }
     }
     set_tags_extra(m, tags_of(m));
     set_retention_extra(m, retention_of(m));
@@ -2137,7 +2145,8 @@ void object_store::change_header_local(std::string_view bucket_name, std::string
         }
         if (tags_of(tc->meta) == tags_of(*found) && retention_of(tc->meta) == retention_of(*found) &&
             legal_hold_of(tc->meta) == legal_hold_of(*found) &&
-            replication_status_of(tc->meta) == replication_status_of(*found))
+            replication_status_of(tc->meta) == replication_status_of(*found) &&
+            object_acl_value(tc->meta) == object_acl_value(*found))
         {
             tags_written(tc, st::ok, false);
             return;
@@ -2177,7 +2186,9 @@ void object_store::change_header_local(std::string_view bucket_name, std::string
                         return;
                     }
                     uint64_t at = 0;
-                    std::string slot = encode_tag_slot(d, tc->meta, at);
+                    // An ACL has no slot of its own, so its change writes the header again.
+                    std::string slot = tc->change.what == header_change::kind::acl ? std::string()
+                                                                                  : encode_tag_slot(d, tc->meta, at);
                     if (slot.empty())
                         tags_rewrite(tc, d.header_len);
                     else
@@ -2351,6 +2362,130 @@ void object_store::tags_written(std::shared_ptr<tag_change> tc, st s, bool chang
     hot_drop(b->name, tc->key);
     it->second = tc->meta;
     invalidate_siblings(tc->bname, tc->key, std::move(finish));
+}
+
+// ─── A version's bytes stored another way ───────────────────────────────────
+
+void object_store::open_tmp(std::string_view bucket_name, std::function<void(int, std::string)> cb)
+{
+    bucket* b = find_bucket(bucket_name);
+    if (!b || b->closing)
+    {
+        cb(-1, {});
+        return;
+    }
+    ++b->active_ops;
+    ++m_inflight;
+    std::string name = tmp_name();
+    auto alive = m_alive;
+    const bool q = m_io->openat(b->tmp_fd, name, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600,
+        [this, alive, bname = std::string(bucket_name), name, cb](int64_t r)
+        {
+            if (!*alive)
+                return;
+            if (r < 0)
+            {
+                drop_tmp(bname, {});
+                cb(-1, {});
+                return;
+            }
+            cb(static_cast<int>(r), name);
+        });
+    if (!q)
+    {
+        drop_tmp(bucket_name, {});
+        cb(-1, {});
+    }
+}
+
+void object_store::drop_tmp(std::string_view bucket_name, const std::string& name)
+{
+    --m_inflight;
+    bucket* b = find_bucket(bucket_name);
+    if (!b)
+        return;
+    --b->active_ops;
+    if (!name.empty() && !m_io->unlinkat(b->tmp_fd, name, 0, [](int64_t) {})) {}
+}
+
+void object_store::replace_body(std::string bucket_name, std::string key, std::string version_id, object_meta was,
+                                object_meta now, std::string tmp, std::function<void(st)> cb)
+{
+    bucket* b = find_bucket(bucket_name);
+    if (!b || b->closing || !owns(bucket_name, key) || !versioning_settled(*b))
+    {
+        drop_tmp(bucket_name, tmp);
+        cb(b ? st::unavailable : st::no_such_bucket);
+        return;
+    }
+    auto tc        = std::make_shared<tag_change>();
+    tc->alive      = m_alive;
+    tc->bname      = bucket_name;
+    tc->key        = std::move(key);
+    tc->version_id = std::move(version_id);
+    tc->meta       = std::move(now);
+    tc->cb         = [cb](st s, std::string) { cb(s); };
+    // The hold open_tmp took is the one tags_written lets go of.
+    lane_enter(*b, tc->key, [this, tc, was = std::move(was), tmp = std::move(tmp)]()
+    {
+        bucket* bp = find_bucket(tc->bname);
+        if (!bp)
+        {
+            tags_written(tc, st::no_such_bucket, false);
+            return;
+        }
+        const auto latest = bp->objects.find(tc->key);
+        const object_meta* found = latest == bp->objects.end() ? nullptr : &latest->second;
+        if (!tc->version_id.empty())
+        {
+            found = find_version(tc->bname, tc->key, tc->version_id);
+            tc->noncurrent = found && (latest == bp->objects.end() || &latest->second != found);
+        }
+        // Under the key's lane the index is the file, so a version it still has as it was is the one rewritten.
+        if (!found || !(*found == was))
+        {
+            if (!m_io->unlinkat(bp->tmp_fd, tmp, 0, [](int64_t) {})) {}
+            tags_written(tc, st::precondition_failed, false);
+            return;
+        }
+        if (has_version(*found) || bp->vstate != versioning::off)
+            tc->changed_id = version_of(*found).id;
+        tc->rel = tc->noncurrent ? version_rel_path(tc->key, tc->changed_id) : object_rel_path(tc->key);
+        const int data_dir = tc->noncurrent ? bp->dir_fd : bp->data_fd;
+        auto leaf    = std::make_shared<int>(-1);
+        auto renamed = std::make_shared<bool>(false);
+        auto ch      = std::make_shared<disk_chain>(m_alive);
+        ch->then([this, tmp_dir = bp->tmp_fd, tmp, data_dir, rel = tc->rel, renamed](file_io::done d)
+        {
+            return m_io->renameat(tmp_dir, tmp, data_dir, rel, [renamed, d](int64_t r)
+            {
+                *renamed = r >= 0;
+                d(r);
+            });
+        });
+        ch->then([this, data_dir, dir = tc->rel.substr(0, tc->rel.rfind('/')), leaf](file_io::done d)
+        {
+            return m_io->openat(data_dir, dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0, [leaf, d](int64_t r)
+            {
+                if (r >= 0)
+                    *leaf = static_cast<int>(r);
+                d(r);
+            });
+        });
+        ch->then([this, leaf](file_io::done d) { return m_io->sync(*leaf, false, std::move(d)); });
+        ch->run([this, tc, tmp, leaf, renamed](int64_t r)
+        {
+            if (*leaf >= 0)
+                m_loop->close_fd(*leaf);
+            if (!*renamed)
+                if (bucket* bq = find_bucket(tc->bname))
+                    if (!m_io->unlinkat(bq->tmp_fd, tmp, 0, [](int64_t) {})) {}
+            if (r >= 0)
+                ++m_totals.fsyncs;
+            // Renamed into place, the file holds the new layout whether or not its directory's sync then failed.
+            tags_written(tc, r < 0 ? errno_status(r) : st::ok, *renamed);
+        });
+    });
 }
 
 // ─── Reading an object ──────────────────────────────────────────────────────
@@ -2613,10 +2748,11 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
             // owns is not in this shard's memory.
             cs->src_fd  = o.fd;
             cs->src_off = o.data_off;
-            // Its bytes would be copied sealed under a header that no longer says how, which the caller re-encrypts instead.
-            if (is_encrypted(o.meta))
+            // Its bytes would be copied sealed or compressed under a header that no longer says how, which the caller
+            // opens instead.
+            if (is_encrypted(o.meta) || is_compressed(o.meta) || is_tiered(o.meta))
             {
-                LOG_WARN(("storage: a byte copy of the encrypted object \"" + cs->dst_key + "\" was refused").c_str());
+                LOG_WARN(("storage: a byte copy of the encrypted or compressed object \"" + cs->dst_key + "\" was refused").c_str());
                 (*finish)({st::io_error, cs->meta});
                 return;
             }
@@ -3184,6 +3320,8 @@ const char* object_store::doc_file(bucket_doc kind)
         case bucket_doc::website:    return "website";
         case bucket_doc::public_access: return "public-access-block";
         case bucket_doc::logging:    return "logging";
+        case bucket_doc::ownership:  return "ownership-controls";
+        case bucket_doc::acl:        return "acl";
     }
     return "?";
 }
@@ -3192,6 +3330,18 @@ std::shared_ptr<const website_config> object_store::bucket_website(std::string_v
 {
     const bucket* b = find_bucket(name);
     return b && !b->closing ? b->website : nullptr;
+}
+
+object_ownership object_store::bucket_ownership(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b && !b->closing ? b->ownership : object_ownership::unset;
+}
+
+std::shared_ptr<const acl_list> object_store::bucket_acl(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b && !b->closing ? b->acl : nullptr;
 }
 
 std::shared_ptr<const public_access_block> object_store::bucket_public_access(std::string_view name) const
@@ -3419,6 +3569,36 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml, st
         }
         m_logging_buckets += (l != nullptr) - (b.logging != nullptr);
         b.logging = std::move(l);
+        return true;
+    }
+    if (kind == bucket_doc::ownership)
+    {
+        object_ownership o = object_ownership::unset;
+        if (!xml.empty() && !parse_ownership_controls(xml, o, err))
+        {
+            if (why)
+                *why = err.message;
+            return false;
+        }
+        const auto takes = [](object_ownership x) { return x == object_ownership::preferred || x == object_ownership::writer; };
+        m_acl_buckets += takes(o) - takes(b.ownership);
+        b.ownership = o;
+        return true;
+    }
+    if (kind == bucket_doc::acl)
+    {
+        std::shared_ptr<acl_list> a;
+        if (!xml.empty())
+        {
+            a = std::make_shared<acl_list>();
+            if (!decode_acl(xml, *a))
+            {
+                if (why)
+                    *why = "the ACL does not decode";
+                return false;
+            }
+        }
+        b.acl = std::move(a);
         return true;
     }
     if (kind == bucket_doc::public_access)

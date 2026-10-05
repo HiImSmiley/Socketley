@@ -463,6 +463,8 @@ std::string doc_label(bucket_doc kind)
         case bucket_doc::website:     return "website configuration";
         case bucket_doc::public_access: return "public access block";
         case bucket_doc::logging:     return "logging configuration";
+        case bucket_doc::ownership:   return "ownership controls";
+        case bucket_doc::acl:         return "access control list";
     }
     return "configuration";
 }
@@ -1206,7 +1208,7 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             uint8_t what = 0;
             if (!wire::decode_set_tags(payload, bucket, key, version_id, change.value, &what, &change.bypass,
                                        &change.who) ||
-                what > static_cast<uint8_t>(header_change::kind::replication))
+                what > static_cast<uint8_t>(header_change::kind::acl))
             {
                 reply(false, {});
                 return;

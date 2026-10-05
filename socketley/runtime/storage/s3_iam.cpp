@@ -524,7 +524,8 @@ const char* iam_managed_policy(std::string_view a)
     if (a == "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess")
         return R"({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*","s3:List*"],"Resource":"*"}]})";
     if (a == "arn:aws:iam::aws:policy/AdministratorAccess")
-        return R"({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]})";
+        // "*" is S3's actions alone, so the policy names IAM's for itself.
+        return R"({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["*","iam:*"],"Resource":"*"}]})";
     return nullptr;
 }
 
@@ -612,18 +613,21 @@ std::string iam_error_xml(std::string_view code, std::string_view message, std::
 namespace
 {
 
-constexpr std::string_view actions[] = {
-    "CreateUser", "GetUser", "ListUsers", "UpdateUser", "DeleteUser",
-    "CreateAccessKey", "ListAccessKeys", "UpdateAccessKey", "DeleteAccessKey",
-    "PutUserPolicy", "GetUserPolicy", "ListUserPolicies", "DeleteUserPolicy",
-    "AttachUserPolicy", "DetachUserPolicy", "ListAttachedUserPolicies",
-    "CreateGroup", "GetGroup", "ListGroups", "DeleteGroup", "AddUserToGroup", "RemoveUserFromGroup",
-    "ListGroupsForUser", "PutGroupPolicy", "GetGroupPolicy", "ListGroupPolicies", "DeleteGroupPolicy",
-    "AttachGroupPolicy", "DetachGroupPolicy", "ListAttachedGroupPolicies",
-    "CreateRole", "GetRole", "ListRoles", "UpdateRole", "DeleteRole",
-    "PutRolePolicy", "GetRolePolicy", "ListRolePolicies", "DeleteRolePolicy",
-    "AttachRolePolicy", "DetachRolePolicy", "ListAttachedRolePolicies",
-};
+const std::string* field_of(const iam_fields& f, std::string_view n)
+{
+    for (const auto& [k, v] : f)
+        if (k == n)
+            return &v;
+    return nullptr;
+}
+
+// Whether a policy document compiles to one whose Allow names an IAM action.
+bool doc_grants_iam(std::string_view doc)
+{
+    bucket_policy p;
+    s3_error err;
+    return !doc.empty() && bucket_policy::compile_identity(doc, p, err) && p.allows_iam();
+}
 
 struct api
 {
@@ -638,10 +642,7 @@ struct api
 
     const std::string* field(std::string_view n) const
     {
-        for (const auto& [k, v] : f)
-            if (k == n)
-                return &v;
-        return nullptr;
+        return field_of(f, n);
     }
     std::string text(std::string_view n) const
     {
@@ -891,7 +892,9 @@ struct api
         if (a == "CreateAccessKey")
         {
             const std::string n = text("UserName");
-            if (!s.users.count(n))
+            // A user of the credentials file signs with that file's keys, so a key made here would never sign.
+            const auto user = s.users.find(n);
+            if (user == s.users.end() || user->second.external)
                 return no_entity("user", n);
             size_t have = 0;
             for (const auto& [k, key] : s.keys)
@@ -1132,10 +1135,81 @@ struct api
 
 bool iam_action(std::string_view action)
 {
-    for (std::string_view a : actions)
-        if (a == action)
+    return iam_action_index(action) >= 0;
+}
+
+std::vector<std::string> iam_resources(const iam_state& s, std::string_view action, const iam_fields& f)
+{
+    if (action == "ListUsers" || action == "ListGroups" || action == "ListRoles")
+        return {std::string{}};
+    auto text = [&f](std::string_view n)
+    {
+        const std::string* v = field_of(f, n);
+        return v ? *v : std::string{};
+    };
+    auto named = [](std::string_view kind, const std::string& path, const std::string& name)
+    { return std::string(kind) + (path.empty() ? std::string("/") : path) + name; };
+    // An entity that is not there has the default path, and the request that makes one gives its own.
+    auto path_in = [](const auto& entities, const std::string& name)
+    {
+        const auto it = entities.find(name);
+        return it == entities.end() ? std::string("/") : it->second.path;
+    };
+    const bool creates = action == "CreateUser" || action == "CreateGroup" || action == "CreateRole";
+    const std::string made_path = field_of(f, "Path") ? text("Path") : std::string("/");
+    if (action.find("Role") != std::string_view::npos)
+    {
+        const std::string n = text("RoleName");
+        return {named("role", creates ? made_path : path_in(s.roles, n), n)};
+    }
+    if (action.find("Group") != std::string_view::npos && action != "ListGroupsForUser")
+    {
+        const std::string n = text("GroupName");
+        return {named("group", creates ? made_path : path_in(s.groups, n), n)};
+    }
+    std::string n = text("UserName");
+    // A key named without its user is its own user's to change.
+    if ((action == "UpdateAccessKey" || action == "DeleteAccessKey") && !field_of(f, "UserName"))
+        if (const auto k = s.keys.find(text("AccessKeyId")); k != s.keys.end())
+            n = k->second.user;
+    std::vector<std::string> out{named("user", creates ? made_path : path_in(s.users, n), n)};
+    // A rename or a move is a right over the user it makes as well, as IAM asks for both.
+    if (action == "UpdateUser" && (field_of(f, "NewUserName") || field_of(f, "NewPath")))
+        out.push_back(named("user", field_of(f, "NewPath") ? text("NewPath") : path_in(s.users, n),
+                            field_of(f, "NewUserName") ? text("NewUserName") : n));
+    return out;
+}
+
+bool iam_grants_iam(const iam_state& s, std::string_view action, const iam_fields& f)
+{
+    if (action == "PutUserPolicy" || action == "PutGroupPolicy" || action == "PutRolePolicy")
+    {
+        const std::string* d = field_of(f, "PolicyDocument");
+        return d && doc_grants_iam(*d);
+    }
+    if (action == "AttachUserPolicy" || action == "AttachGroupPolicy" || action == "AttachRolePolicy")
+    {
+        const std::string* a = field_of(f, "PolicyArn");
+        const char* m = a ? iam_managed_policy(*a) : nullptr;
+        return m && doc_grants_iam(m);
+    }
+    if (action != "AddUserToGroup")
+        return false;
+    const std::string* g = field_of(f, "GroupName");
+    const auto it = g ? s.groups.find(*g) : s.groups.end();
+    if (it == s.groups.end())
+        return false;
+    std::vector<std::string_view> docs;
+    docs_of(it->second.policies, docs);
+    for (std::string_view d : docs)
+        if (doc_grants_iam(d))
             return true;
     return false;
+}
+
+bool iam_defaults_to_caller(std::string_view action)
+{
+    return action == "GetUser" || action == "CreateAccessKey" || action == "ListAccessKeys";
 }
 
 iam_result iam_apply(iam_state& s, std::string_view action, const iam_fields& fields, int64_t now_ms,
