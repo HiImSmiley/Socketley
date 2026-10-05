@@ -559,6 +559,7 @@ void storage_run::sweep()
         }
     }
     lifecycle_tick();
+    share_burn_tick();
     m_scrub.tick();
     m_compact.tick();
     m_tier.tick();
@@ -566,7 +567,7 @@ void storage_run::sweep()
     flush_access_logs(false);
     if (!m_conns.empty() || m_mpu_expire_secs != 0 || m_start_note != start_note::told || m_lc ||
         m_store.lifecycle_buckets() != 0 || m_store.any_doubt() || !m_access_logs.empty() || m_scrub.enabled() ||
-        m_compact.enabled() || m_tier.enabled())
+        m_compact.enabled() || m_tier.enabled() || m_burns != 0 || !m_burning.empty())
         arm_sweep();
 }
 

@@ -981,6 +981,9 @@ public:
     // storage_share.cpp.
     void share_sent(const std::string& id, std::string json, std::function<void()> then);
     st share_take(const std::string& id, const std::string& json);
+    // Links that burn what they name, ended at their expiry or after their last download: looked over by the sweep.
+    void share_burn_tick();
+    void share_burn(std::string id, std::string bucket, std::string key, bool folder);
     std::vector<std::string> share_records();
     // Who a request's change is told as: its user or "anonymous", and the client's address, left empty for a
     // bucket that sends no events.
@@ -1182,6 +1185,10 @@ private:
     anonymous_authenticator m_anon;
     uint32_t          m_mpu_expire_secs{0};
     std::chrono::steady_clock::time_point m_last_reap{};
+    // How many links that burn the last look found, the ones this shard is removing for, and the next look.
+    size_t            m_burns{0};
+    std::unordered_set<std::string> m_burning;
+    std::chrono::steady_clock::time_point m_burn_next{};
     // What a lifecycle day is, shorter only under SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS, a test aid.
     int64_t           m_lc_day_ms{0};
     std::unique_ptr<lifecycle_pass> m_lc;

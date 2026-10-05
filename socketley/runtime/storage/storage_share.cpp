@@ -13,6 +13,9 @@
 #include <openssl/rand.h>
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <charconv>
 
@@ -45,6 +48,10 @@ struct share_link
     bool        upload{false};
     // The maker's label for the link.
     std::string note;
+    // What the link names is removed when the link ends: at its expiry, or a while after its last download.
+    bool        burn{false};
+    // When the last download a limit allows was counted.
+    int64_t     drained_ms{0};
 };
 
 namespace
@@ -90,6 +97,8 @@ std::string share_json(const share_link& s)
     o += s.upload ? ",\"upload\":true" : ",\"upload\":false";
     o += ",\"note\":";
     jstr(o, s.note);
+    if (s.burn)
+        o += ",\"burn\":true,\"drained\":" + std::to_string(s.drained_ms);
     o += "}";
     return o;
 }
@@ -144,6 +153,8 @@ bool parse_share(std::string_view text, share_link& s)
             s.by_node[node] = num_of(*by, node);
     s.upload = flag_of(root, "upload");
     s.note = str_of(root, "note");
+    s.burn = flag_of(root, "burn");
+    s.drained_ms = static_cast<int64_t>(num_of(root, "drained"));
     return !s.id.empty() && !s.bucket.empty();
 }
 
@@ -240,8 +251,81 @@ std::string share_view_json(const share_link& s)
     jstr(o, s.note);
     o += ",\"owner\":";
     jstr(o, s.owner);
+    o += s.burn ? ",\"burn\":true" : ",\"burn\":false";
     o += "}";
     return o;
+}
+
+// How long a burning link's files outlive its last allowed download, so a browser resuming that download finds them;
+// SOCKETLEY_SHARE_BURN_GRACE_SECS shortens it, a test aid.
+int64_t burn_grace_ms()
+{
+    static const int64_t ms = []
+    {
+        const char* e = std::getenv("SOCKETLEY_SHARE_BURN_GRACE_SECS");
+        int64_t secs = 600;
+        if (e && *e)
+            std::from_chars(e, e + std::strlen(e), secs);
+        return std::max<int64_t>(0, secs) * 1000;
+    }();
+    return ms;
+}
+
+std::string human_size(uint64_t n)
+{
+    static const char* units[] = {"bytes", "KB", "MB", "GB", "TB"};
+    double v = static_cast<double>(n);
+    int u = 0;
+    while (v >= 1000 && u < 4)
+    {
+        v /= 1000;
+        ++u;
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof buf, u ? "%.1f %s" : "%.0f %s", v, units[u]);
+    return buf;
+}
+
+// The page a burning file's link opens on, which counts nothing: a chat's preview of the link reads this and not the
+// file, and the file is taken with ?download.
+std::string landing_page(const share_link& s, std::string_view name, const object_meta* m, int64_t now)
+{
+    std::string h = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" "
+                    "content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>";
+    xml_escape_to(h, name);
+    h += "</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;"
+         "justify-content:center;padding:16px;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#f1f0ff;"
+         "background:radial-gradient(700px 500px at 15% 10%,#6d28d9aa,transparent 60%),radial-gradient(700px 500px at "
+         "90% 90%,#db277799,transparent 60%),radial-gradient(600px 400px at 80% 10%,#0891b288,transparent 60%),#07060d}"
+         ".c{width:100%;max-width:440px;padding:34px 30px;border-radius:24px;background:rgba(16,12,30,.72);border:1px solid "
+         "rgba(255,255,255,.12);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);text-align:center;"
+         "box-shadow:0 30px 80px -30px #000}.i{width:76px;height:76px;margin:0 auto 18px;border-radius:22px;display:flex;"
+         "align-items:center;justify-content:center;background:linear-gradient(135deg,#a855f7,#ec4899 55%,#f97316);"
+         "box-shadow:0 14px 40px -12px #ec4899}h1{font-size:20px;margin:0 0 6px;word-break:break-all}p{margin:0;color:#b9b3d6}"
+         ".m{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin:18px 0 24px}.m span{padding:4px 11px;"
+         "border-radius:99px;background:rgba(255,255,255,.08);font-size:13px}a.b{display:block;padding:14px;border-radius:14px;"
+         "color:#fff;text-decoration:none;font-weight:700;background:linear-gradient(135deg,#a855f7,#ec4899 55%,#f97316);"
+         "box-shadow:0 12px 30px -10px #ec4899}a.b:hover{filter:brightness(1.1)}small{display:block;margin-top:16px;"
+         "color:#7d7799}</style><div class=\"c\"><div class=\"i\"><svg width=\"34\" height=\"34\" viewBox=\"0 0 24 24\" "
+         "fill=\"none\" stroke=\"#fff\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path "
+         "d=\"M12 4v11m-4.5-4.5L12 15l4.5-4.5M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15\"/></svg></div><h1>";
+    xml_escape_to(h, name);
+    h += "</h1><p>Someone sent you a file.</p><div class=\"m\">";
+    if (m)
+        h += "<span>" + human_size(m->size) + "</span>";
+    if (s.max_downloads)
+    {
+        const uint64_t left = s.max_downloads > s.downloads ? s.max_downloads - s.downloads : 0;
+        h += "<span>" + std::to_string(left) + (left == 1 ? " download left" : " downloads left") + "</span>";
+    }
+    if (s.expires_ms)
+    {
+        const int64_t mins = std::max<int64_t>(1, (s.expires_ms - now) / 60000);
+        h += "<span>gone in " + (mins >= 2880 ? std::to_string(mins / 1440) + " days" : mins >= 120 ?
+             std::to_string(mins / 60) + " hours" : std::to_string(mins) + " minutes") + "</span>";
+    }
+    h += "</div><a class=\"b\" href=\"?download\">Download</a><small>The file is deleted when the link ends.</small></div>";
+    return h;
 }
 
 }   // namespace
@@ -336,7 +420,20 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
             app_reply(c, 403, "Only its maker or an admin revokes a link.\n");
             return;
         }
-        ::unlink(path.c_str());
+        // A link that burns takes what it names with it, by the sweep, which finds it under its new name.
+        if (s.burn)
+        {
+            if (::rename(path.c_str(), (m_store.options().dir + "/.shares/" + id + ".burning").c_str()) < 0)
+            {
+                app_reply(c, 500, "The link could not be ended.\n");
+                return;
+            }
+            ++m_burns;
+            m_burn_next = {};
+            arm_sweep();
+        }
+        else
+            ::unlink(path.c_str());
         ::unlink((path + ".lock").c_str());
         share_sent(id, {}, [this, weak = std::weak_ptr<conn>(c)]()
         {
@@ -451,6 +548,13 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
         });
         return;
     }
+    // A burning file's link opens on a page, and the file itself is read with ?download.
+    if (s.burn && !s.folder && r.method == "GET" && !r.has_query("download"))
+    {
+        app_reply(c, 200, landing_page(s, last_name_of(key), m_store.find(s.bucket, key), now_ms()),
+                  "text/html; charset=utf-8");
+        return;
+    }
     // A download counts against the link's limit, once per reading from the start: a player's later ranges do not.
     const std::string_view range = r.header("range");
     if (r.method == "GET" && s.max_downloads && (range.empty() || range.starts_with("bytes=0-")))
@@ -472,6 +576,8 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
                     ++now.by_node[m_cluster_self];
                 }
                 ++now.downloads;
+                if (now.burn && now.downloads >= now.max_downloads)
+                    now.drained_ms = now_ms();
                 allowed = write_text(path, share_json(now));
                 if (allowed)
                     share_sent(id, share_json(now), {});
@@ -563,6 +669,9 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
                 // An expired link is gone for good, and is cleared away here rather than listed.
                 if (s.expires_ms && now_ms() > s.expires_ms)
                 {
+                    // One that burns is left to the sweep, which removes what it names first.
+                    if (s.burn)
+                        continue;
                     ::unlink((dir + "/" + std::string(n)).c_str());
                     ::unlink((dir + "/" + std::string(n) + ".lock").c_str());
                     continue;
@@ -599,9 +708,21 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
     const uint64_t expires_in = num_of(req, "expires_in");
     const std::string password = str_of(req, "password");
     s.note = str_of(req, "note").substr(0, 200);
+    s.burn = flag_of(req, "burn");
     if (!m_store.has_bucket(s.bucket))
     {
         app_reply(c, 404, "No such bucket.\n");
+        return;
+    }
+    if (s.burn && (s.upload || (!expires_in && !s.max_downloads)))
+    {
+        app_reply(c, 400, "A link that burns what it names ends: give it expires_in or max_downloads, and no upload.\n");
+        return;
+    }
+    // A cluster's nodes each own their keys, and the sweep removes on this node only.
+    if (s.burn && !m_cluster_self.empty())
+    {
+        app_reply(c, 400, "Links that burn are not made in a cluster.\n");
         return;
     }
     if (s.upload && !s.folder)
@@ -611,9 +732,10 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
     }
     // A link gives what its maker may do, and nothing more.
     if (!app_allowed(c, "GET", s.bucket, s.folder ? std::string_view{} : std::string_view(s.key)) ||
-        (s.upload && !app_allowed(c, "PUT", s.bucket, s.key)))
+        (s.upload && !app_allowed(c, "PUT", s.bucket, s.key)) ||
+        (s.burn && !app_allowed(c, "DELETE", s.bucket, s.key)))
     {
-        app_reply(c, 403, "You may not share what you may not read.\n");
+        app_reply(c, 403, s.burn ? "You may not burn what you may not delete.\n" : "You may not share what you may not read.\n");
         return;
     }
     s.owner = u ? u->id : std::string(default_owner);
@@ -640,6 +762,11 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
     {
         app_reply(c, 500, "The link could not be kept.\n");
         return;
+    }
+    if (s.burn)
+    {
+        ++m_burns;
+        arm_sweep();
     }
     share_sent(s.id, share_json(s), [this, weak = std::weak_ptr<conn>(c), view = share_view_json(s)]() mutable
     {
@@ -719,6 +846,102 @@ std::vector<std::string> storage_run::share_records()
         ::closedir(d);
     }
     return out;
+}
+
+// ─── Links that burn ────────────────────────────────────────────────────────
+// Every few seconds, while any are known, the links that burn are looked over: one past its expiry, or past the grace
+// after its last allowed download, is renamed to <id>.burning, which ends it for every reader at once, and what it
+// names is removed; the file goes when that is done. A .burning file found at a start is taken up again. Two shards
+// may both take up one left at a start, and the second's removals find nothing.
+
+void storage_run::share_burn_tick()
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (now < m_burn_next)
+        return;
+    m_burn_next = now + std::chrono::seconds(5);
+    const std::string dir = m_store.options().dir + "/.shares";
+    const int64_t t = now_ms();
+    size_t seen = 0;
+    DIR* d = ::opendir(dir.c_str());
+    if (!d)
+    {
+        m_burns = 0;
+        return;
+    }
+    while (dirent* e = ::readdir(d))
+    {
+        const std::string_view n = e->d_name;
+        const bool burning = n.ends_with(".burning");
+        if (!burning && !n.ends_with(".json"))
+            continue;
+        std::string text;
+        share_link s;
+        const std::string path = dir + "/" + std::string(n);
+        if (!read_text(path, text) || !parse_share(text, s) || !s.burn)
+            continue;
+        ++seen;
+        if (m_burning.count(s.id))
+            continue;
+        if (!burning)
+        {
+            const bool due = (s.expires_ms && t > s.expires_ms) || (s.drained_ms && t > s.drained_ms + burn_grace_ms());
+            if (!due || ::rename(path.c_str(), (dir + "/" + s.id + ".burning").c_str()) < 0)
+                continue;
+            ::unlink((path + ".lock").c_str());
+            share_sent(s.id, {}, nullptr);
+        }
+        share_burn(s.id, s.bucket, s.key, s.folder);
+    }
+    ::closedir(d);
+    m_burns = seen;
+}
+
+void storage_run::share_burn(std::string id, std::string bucket, std::string key, bool folder)
+{
+    m_burning.insert(id);
+    struct burn
+    {
+        std::string id, bucket;
+        size_t left{0};
+        size_t removed{0};
+    };
+    auto b = std::make_shared<burn>();
+    b->id = id;
+    b->bucket = bucket;
+    auto one_done = [this, b](st s, bool existed)
+    {
+        if (s == st::ok && existed)
+            ++b->removed;
+        else if (s != st::ok && s != st::no_such_key && s != st::no_such_bucket)
+            LOG_WARN(("storage: a burning link could not remove from " + b->bucket + ": " + status_name(s)).c_str());
+        if (--b->left)
+            return;
+        ::unlink((m_store.options().dir + "/.shares/" + b->id + ".burning").c_str());
+        m_burning.erase(b->id);
+        LOG_INFO(("storage: link " + b->id + " ended and removed " + std::to_string(b->removed) + " object(s) of " +
+                  b->bucket).c_str());
+    };
+    if (!folder)
+    {
+        b->left = 1;
+        m_store.remove(bucket, key, one_done);
+        return;
+    }
+    list_query q;
+    q.prefix = key;
+    app_list(bucket, std::move(q), [this, b, bucket, one_done](st s, list_page p)
+    {
+        if (s != st::ok || p.objects.empty())
+        {
+            b->left = 1;
+            one_done(st::ok, false);
+            return;
+        }
+        b->left = p.objects.size();
+        for (const list_entry& e : p.objects)
+            m_store.remove(bucket, e.key, one_done);
+    });
 }
 
 }   // namespace socketley::storage

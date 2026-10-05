@@ -14,6 +14,9 @@
 #     taking one
 #   * a link not seen or not revoked by its maker, seen by another user, or
 #     lost by a restart or on the other shard
+#   * a link that burns leaving its file behind at its expiry, after its last
+#     download or at its revocation, removing it before, counting its page or
+#     a link preview as a download, or being made by one who may not delete
 # suite: isolated
 set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -31,6 +34,8 @@ check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "got '$2', want '$3'"; fi; 
 
 daemon_isolate stgshare
 trap 'daemon_stop' EXIT
+# A burning link's files outlive its last download by two seconds here, not ten minutes.
+export SOCKETLEY_SHARE_BURN_GRACE_SECS=2
 daemon_start "$BIN"
 P1=$((SL_PORT_BASE + 1909))
 U="http://127.0.0.1:$P1"
@@ -134,6 +139,39 @@ check "a link outlives a restart" \
 check "its maker revokes it" "$(code -u "$A" -X DELETE "$U/~share/$f")" 204
 check "and it reads no more" "$(code "$U/~share/$f")" 404
 check "on either shard" "$(for _ in 1 2 3 4; do code "$U/~share/$f"; done)" 404404404404
+
+# Links that burn what they name, as a file sent once.
+gone() { for _ in $(seq 1 40); do [ "$(code -u "$A" "$U/~dav/ann/$1")" = 404 ] && { echo gone; return; }; sleep 0.5; done; echo there; }
+printf 'secret' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/ann/send/once.txt"
+check "a link that burns needs an end" "$(mk "$A" '{"bucket":"ann","key":"send/once.txt","burn":true}')" 400
+check "and is no upload link" "$(mk "$A" '{"bucket":"ann","key":"send/","burn":true,"upload":true,"max_downloads":1}')" 400
+check "nor made by one who may not delete there" "$(mk "$B" '{"bucket":"ann","key":"send/once.txt","burn":true,"max_downloads":1}')" 403
+o=$(mk "$A" '{"bucket":"ann","key":"send/once.txt","burn":true,"max_downloads":1}')
+check "opens on a page" "$(curl -s "$U/~share/$o" | grep -c 'href="?download"')" 1
+check "which a preview reads again and again without a download" "$(code "$U/~share/$o")$(code "$U/~share/$o")" 200200
+check "the file is read with ?download" "$(curl -s "$U/~share/$o?download")" secret
+check "once" "$(code "$U/~share/$o?download")" 410
+check "and is still there for the grace after it" "$(code -u "$A" "$U/~dav/ann/send/once.txt")" 200
+check "then gone" "$(gone send/once.txt)" gone
+check "with its link" "$(code "$U/~share/$o")" 404
+printf 'a' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/ann/send/box/a.txt"
+printf 'b' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/ann/send/box/b.txt"
+e=$(mk "$A" '{"bucket":"ann","key":"send/box/","burn":true,"expires_in":2}')
+check "a folder that burns reads until its expiry" "$(curl -s "$U/~share/$e/b.txt")" b
+check "it is not counted as a download, as no limit was set" "$(curl -s "$U/~share/$e/a.txt")" a
+check "and after its expiry every file under it is gone" "$(gone send/box/a.txt) $(gone send/box/b.txt)" "gone gone"
+check "the folder link with them" "$(code "$U/~share/$e/")" 404
+printf 'r' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/ann/send/revoked.txt"
+v=$(mk "$A" '{"bucket":"ann","key":"send/revoked.txt","burn":true,"expires_in":3600}')
+check "a link that burns is listed as one" "$(curl -s -u "$A" "$U/~share" | python3 -c 'import json,sys; print([x["burn"] for x in json.load(sys.stdin) if x["id"]==sys.argv[1]])' "$v")" "[True]"
+check "a revoked one takes its file with it" "$(code -u "$A" -X DELETE "$U/~share/$v") $(gone send/revoked.txt)" "204 gone"
+printf 'k' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/ann/send/kept.txt"
+k=$(mk "$A" '{"bucket":"ann","key":"send/kept.txt","max_downloads":1}')
+curl -s -o /dev/null "$U/~share/$k"; sleep 6
+check "a link that does not burn leaves its file after its last download" "$(code -u "$A" "$U/~dav/ann/send/kept.txt")" 200
+r=$(mk "$A" '{"bucket":"ann","key":"send/kept.txt","burn":true,"expires_in":4}')
+"$BIN" stop share >/dev/null 2>&1; sleep 5; "$BIN" start share >/dev/null 2>&1; up
+check "one that ended while the runtime was stopped burns at its start" "$(gone send/kept.txt)" gone
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || { echo "  FAILED"; exit 1; }

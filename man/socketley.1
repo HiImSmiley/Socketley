@@ -9612,7 +9612,26 @@ and is removed at the next listing.
 .B GET /~share
 lists the caller's links, every link for an admin, and
 .B DELETE /~share/\fIid\fR
-revokes one. Links are files in
+revokes one.
+.IP
+.B "\(dqburn\(dq: true"
+makes a link that removes what it names when it ends, as a file sent once:
+at its expiry, ten minutes after the last download its limit allows (so a
+browser resuming that download still finds it), or at its revocation. It needs
+.B expires_in
+or
+.BR max_downloads ,
+is no upload link, and is made only by one who may also delete there. A
+file's link that burns opens on a page saying what it is, which counts no
+download, so a chat's preview of the link costs nothing, and the file is read
+with
+.BR ?download .
+The runtime's sweep looks the links over every five seconds and renames one
+that has ended to
+.IR id .burning,
+which no reader opens, before it removes; one left so by a stop is finished at
+the next start. In a versioned bucket the removal is a delete marker and the
+versions stay. A cluster does not make them. Links are files in
 .IR dir /.shares/,
 read by every shard.
 .TP
@@ -14347,6 +14366,13 @@ A test aid: the number of seconds a bucket lifecycle rule counts as one day, 1 t
 86400, read by the lifecycle sweep alone, which then also runs as often as every
 second. Unset, a day is a day. It changes when objects expire, so it is never for a
 runtime holding data anyone wants (see Bucket lifecycle).
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_SHARE_BURN_GRACE_SECS
+A test aid: how many seconds the files of a share link that burns outlive its last
+allowed download, 600 when unset (see Drive, links, media and the web
+interface).
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
