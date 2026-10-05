@@ -9692,13 +9692,27 @@ and
 .TP
 .B /~ui/
 A web interface, one page served from the binary, that signs in with an access
-key and its secret and browses, uploads (folders too, by dropping them), renames,
-deletes, shares, restores from the trash, previews pictures and text and plays
-films and music, with their subtitles: the file itself where the browser plays
-it, which costs the server nothing, and otherwise the master playlist's streams
-through Media Source Extensions, the copied one where the browser takes its codec
-and the line carries it, renditions by measured bandwidth otherwise, or through
-the browser's own HLS where it has no Media Source at all.
+key and its secret and browses libraries (buckets) as a media library: films,
+pictures, music and documents in their own rows, with thumbnails, lengths and
+what was left half watched in this browser. It uploads several files at once,
+and a file of 48 MiB or more in parts of at least 16 MiB, four requests side by
+side, through the drive's multipart above, with each file's percentage, rate,
+time left and start; folders too, by dropping them or choosing one. It selects
+several items to download or delete, renames, shares, restores from the trash,
+shows pictures one after another, and opens text in an editor that highlights
+code, finds and replaces, previews Markdown and saves with Ctrl+S, and makes new
+text files. A download is the object byte for byte, through a link of half a
+day, so a browser resuming an interrupted one still finds it.
+.IP
+It plays films and music, with their subtitles: the file itself where the
+browser plays it, which costs the server nothing, and otherwise the master
+playlist's streams through Media Source Extensions, the copied one where the
+browser takes its codec and the line carries it, renditions by measured
+bandwidth otherwise, or through the browser's own HLS where it has no Media
+Source at all. Its quality menu, in the player, offers Original (the file, or the
+copied stream where the browser does not play the file), Auto and each
+rendition; a change is made on the same media source, keeping the next six
+seconds already buffered while the new stream's first segment is made.
 .
 .SS Durability
 .B \-\-fsync
