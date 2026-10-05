@@ -192,6 +192,8 @@ private:
     SSL*        m_ssl{nullptr};
     bool        m_handshaken{false};
     bool        m_head_given{false};
+    // The head of a request whose body comes from a source, held for the body's first piece.
+    std::string m_head_out;
     bool        m_source_done{false};
     bool        m_sent{false};
     // A write failed, so the answer the host may have sent before closing is all that is left to read.

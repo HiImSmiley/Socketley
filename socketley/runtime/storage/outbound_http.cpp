@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -383,6 +384,7 @@ void http_peer::exchange(http_request req, std::function<void(http_answer)> done
     m_handshaken   = false;
     m_head_given   = false;
     m_source_done  = false;
+    m_head_out.clear();
     m_sent         = false;
     m_write_failed = false;
     m_eof          = false;
@@ -429,6 +431,9 @@ void http_peer::connect()
         finish(false, "no socket could be made");
         return;
     }
+    // A request's last segment goes at once, not after the host's delayed acknowledgement of the one before.
+    const int one = 1;
+    if (::setsockopt(m_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0) {}
     ++m_connects;
     m_connected_at = std::chrono::steady_clock::now();
     const uint64_t gen = m_gen;
@@ -499,8 +504,14 @@ void http_peer::advance()
             plain        = std::move(m_req.head);
             plain += m_req.body;
             m_req.body.clear();
+            // Without TLS the head waits for the body's first piece, so the host gets both in one write.
+            if (m_req.source && !m_source_done && !m_ssl)
+            {
+                m_head_out = std::move(plain);
+                plain.clear();
+            }
         }
-        else if (m_req.source && !m_source_done)
+        if (plain.empty() && m_req.source && !m_source_done)
         {
             const uint64_t gen = m_gen;
             auto alive = m_alive;
@@ -514,10 +525,19 @@ void http_peer::advance()
                     return;
                 }
                 if (piece.empty())
+                {
                     m_source_done = true;
+                    if (!m_head_out.empty())
+                    {
+                        send(std::make_shared<std::string>(std::exchange(m_head_out, {})), 0);
+                        return;
+                    }
+                }
                 else if (!m_ssl)
                 {
-                    send(std::make_shared<std::string>(piece), 0);
+                    auto bytes = std::make_shared<std::string>(std::exchange(m_head_out, {}));
+                    bytes->append(piece);
+                    send(std::move(bytes), 0);
                     return;
                 }
                 else
@@ -538,7 +558,7 @@ void http_peer::advance()
             });
             return;
         }
-        else
+        if (plain.empty())
             m_sent = true;
         if (!plain.empty())
         {
