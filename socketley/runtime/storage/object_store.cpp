@@ -1288,6 +1288,17 @@ void object_store::ensure_dirs(const std::string& bucket_name, const std::string
 
 // ─── Commit ─────────────────────────────────────────────────────────────────
 
+st check_delete_condition(const delete_condition& c, const object_meta& current)
+{
+    if (!c.if_match.empty() && c.if_match != "*" && !etag_list_matches(c.if_match, current.etag()))
+        return st::precondition_failed;
+    if (c.mtime_s >= 0 && current.mtime_ms / 1000 != c.mtime_s)
+        return st::precondition_failed;
+    if (c.size >= 0 && current.size != static_cast<uint64_t>(c.size))
+        return st::precondition_failed;
+    return st::ok;
+}
+
 st check_put_condition(const put_condition& c, const object_meta* current)
 {
     if (!c.if_match.empty())
@@ -1709,13 +1720,14 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
 }
 
 void object_store::remove_version(std::string_view bucket_name, std::string_view key_sv, std::string version_id,
-                                  std::function<void(remove_result)> cb, bool bypass, change_origin who)
+                                  std::function<void(remove_result)> cb, bool bypass, change_origin who,
+                                  delete_condition cond)
 {
     const uint32_t owner = owner_of(bucket_name, key_sv);
     if (owner == m_opts.shard)
     {
         remove_version_local(bucket_name, key_sv, std::move(version_id), std::move(cb), {}, bypass,
-                             change_cause::remove, std::move(who));
+                             change_cause::remove, std::move(who), std::move(cond));
         return;
     }
 
@@ -1738,13 +1750,13 @@ void object_store::remove_version(std::string_view bucket_name, std::string_view
         if (bucket* bp = find_bucket(bname))
             --bp->active_ops;
         cb(std::move(r));
-    });
+    }, std::move(cond));
 }
 
 void object_store::remove_version_local(std::string_view bucket_name, std::string_view key_sv,
                                         std::string version_id, std::function<void(remove_result)> cb,
                                         std::function<bool(const object_meta&)> only_if, bool bypass,
-                                        change_cause cause, change_origin who)
+                                        change_cause cause, change_origin who, delete_condition cond)
 {
     bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
@@ -1776,6 +1788,7 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
         bool                          bypass{false};
         change_cause                  cause{change_cause::remove};
         change_origin                 who;
+        delete_condition              cond;
         // The events the removal staged, 0 for none.
         uint64_t                      ticket{0};
         std::function<void(remove_result)> cb;
@@ -1792,6 +1805,7 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
     rm->bypass  = bypass;
     rm->cause   = cause;
     rm->who     = std::move(who);
+    rm->cond    = std::move(cond);
 
     const auto done = [this](const removal_ptr& r, st s, bool existed)
     {
@@ -1838,7 +1852,7 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
                 lane_settle(bname, key, ticket, made);
             };
             remove_versioned(rm->bname, rm->key, rm->version_id, std::move(rm->only_if), rm->bypass, rm->cause,
-                             std::move(rm->who), std::move(release), std::move(rm->cb));
+                             std::move(rm->who), std::move(release), std::move(rm->cb), std::move(rm->cond));
             return;
         }
         const auto found = bp->objects.find(rm->key);
@@ -1846,6 +1860,12 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
         if (rm->only_if && (!rm->existed || !rm->only_if(found->second)))
         {
             done(rm, st::ok, false);
+            return;
+        }
+        // A conditional delete of a key that is not there removes nothing and is no error, as in S3.
+        if (rm->cond.any() && (!rm->existed || check_delete_condition(rm->cond, found->second) != st::ok))
+        {
+            done(rm, rm->existed ? st::precondition_failed : st::ok, rm->existed);
             return;
         }
         if (rm->existed && lock_holds(found->second, static_cast<int64_t>(now_ms()), rm->bypass))

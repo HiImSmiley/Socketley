@@ -124,7 +124,7 @@ bool decode_commit(std::string_view payload, commit_request& out)
 }
 
 std::string encode_remove(std::string_view bucket, std::string_view key, std::string_view version_id, bool bypass,
-                          const change_origin& who)
+                          const change_origin& who, const delete_condition& cond)
 {
     bytes::writer w = begin(op::remove);
     w.bytes(bucket);
@@ -132,19 +132,28 @@ std::string encode_remove(std::string_view bucket, std::string_view key, std::st
     w.bytes(version_id);
     w.u8(bypass ? 1 : 0);
     put_origin(w, who);
+    w.bytes(cond.if_match);
+    w.u64(static_cast<uint64_t>(cond.mtime_s));
+    w.u64(static_cast<uint64_t>(cond.size));
     return w.take();
 }
 
 bool decode_remove(std::string_view payload, std::string& bucket, std::string& key, std::string* version_id,
-                   bool* bypass, change_origin* who)
+                   bool* bypass, change_origin* who, delete_condition* cond)
 {
     bytes::reader r(payload);
     std::string id;
     bool by = false;
     change_origin o;
+    delete_condition c;
+    uint64_t mtime = 0, size = 0;
     if (!open_request(r, op::remove) || !r.bytes(bucket, name_cap) || !r.bytes(key, name_cap) || !r.bytes(id, 256) ||
-        !r.flag(by) || !get_origin(r, o))
+        !r.flag(by) || !get_origin(r, o) || !r.bytes(c.if_match, 4096) || !r.u64(mtime) || !r.u64(size))
         return false;
+    c.mtime_s = static_cast<int64_t>(mtime);
+    c.size    = static_cast<int64_t>(size);
+    if (cond)
+        *cond = std::move(c);
     if (version_id)
         *version_id = std::move(id);
     if (bypass)

@@ -6682,7 +6682,7 @@ Part N of a multipart object as a 206 with its Content\-Range and x\-amz\-mp\-pa
 T}
 DeleteObject	DELETE /bucket/key	T{
 .ad l
-204 whether or not the key existed; in a versioned bucket a delete marker, and with ?versionId= that version removed for good.
+204 whether or not the key existed; in a versioned bucket a delete marker, and with ?versionId= that version removed for good. If\-Match (an ETag list or *), x\-amz\-if\-match\-last\-modified\-time and x\-amz\-if\-match\-size are asked of that version, or of the latest the marker would cover (a delete marker included, which only * passes): PreconditionFailed (412) when it does not match, and 204 with nothing removed when there is none, decided by the shard that owns the key as the delete is.
 T}
 PostObject	POST /bucket (multipart/form-data)	T{
 .ad l
@@ -6690,7 +6690,7 @@ A browser's upload by HTML form; see \fBUploads by form\fR below.
 T}
 DeleteObjects	POST /bucket?delete	T{
 .ad l
-Up to 1000 keys, each with or without a VersionId, Quiet, Content\-MD5 checked.
+Up to 1000 keys, each with or without a VersionId and with the conditions DeleteObject takes as an ETag, a LastModifiedTime (an HTTP date or ISO 8601) and a Size, a key whose condition does not match answered PreconditionFailed among the errors; Quiet, Content\-MD5 checked.
 T}
 CopyObject	PUT /bucket/key + x\-amz\-copy\-source	T{
 .ad l

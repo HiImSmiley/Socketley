@@ -324,6 +324,20 @@ struct put_condition
     bool any() const { return !if_match.empty() || !if_none_match.empty(); }
 };
 
+// What a delete asks of the version it removes, or of the latest it would put a delete marker in front of: an ETag
+// list or *, its time in whole seconds, and its size; a version that is not there is removed by nobody, and no error.
+struct delete_condition
+{
+    std::string if_match;
+    int64_t     mtime_s{-1};
+    int64_t     size{-1};
+
+    bool any() const { return !if_match.empty() || mtime_s >= 0 || size >= 0; }
+};
+
+// ok, or precondition_failed when `current` is not what `c` asks for.
+st check_delete_condition(const delete_condition& c, const object_meta& current);
+
 // Whether a write under `c` may replace `current`, null for a key that is not there:
 // ok, precondition_failed, or no_such_key for an If-Match with nothing to match.
 st check_put_condition(const put_condition& c, const object_meta* current);
@@ -643,7 +657,7 @@ public:
     // `version_id` empty deletes the key as the bucket's versioning says, and otherwise that version of it.
     // `bypass` lets the removal of a version go past a GOVERNANCE retention.
     virtual void remove(uint32_t owner, std::string bucket, std::string key, std::string version_id, bool bypass,
-                        change_origin who, std::function<void(remove_result)> cb) = 0;
+                        change_origin who, std::function<void(remove_result)> cb, delete_condition cond = {}) = 0;
     virtual void change_header(uint32_t owner, std::string bucket, std::string key, std::string version_id,
                                header_change change, std::function<void(st, std::string version_id)> cb) = 0;
     // Tells every sibling that may hold the key to drop it, and `done` runs once each has answered or is gone.
@@ -877,12 +891,14 @@ public:
     // The same with the version: `version_id` empty deletes the key, and otherwise removes that version for good,
     // which a retention or legal hold refuses as st::locked unless `bypass` lifts a GOVERNANCE retention.
     void remove_version(std::string_view bucket, std::string_view key, std::string version_id,
-                        std::function<void(remove_result)> cb, bool bypass = false, change_origin who = {});
+                        std::function<void(remove_result)> cb, bool bypass = false, change_origin who = {},
+                        delete_condition cond = {});
     // `only_if` is asked of the version that would be removed, or of the latest before a marker covers it.
     void remove_version_local(std::string_view bucket, std::string_view key, std::string version_id,
                               std::function<void(remove_result)> cb,
                               std::function<bool(const object_meta&)> only_if = {}, bool bypass = false,
-                              change_cause cause = change_cause::remove, change_origin who = {});
+                              change_cause cause = change_cause::remove, change_origin who = {},
+                              delete_condition cond = {});
 
     // Makes `change` of an object or of its version `version_id`, keeping its bytes, ETag and time; `cb` is told
     // the version it changed.
@@ -1188,7 +1204,7 @@ private:
     void remove_versioned(std::string bucket, std::string key, std::string version_id,
                           std::function<bool(const object_meta&)> only_if, bool bypass, change_cause cause,
                           change_origin who, std::function<void(uint64_t ticket, bool made)> release,
-                          std::function<void(remove_result)> cb);
+                          std::function<void(remove_result)> cb, delete_condition cond = {});
     void vop_header(std::shared_ptr<vop> v);
     void vop_copy(std::shared_ptr<vop> v, int src, uint64_t data_off);
     void vop_install(std::shared_ptr<vop> v);

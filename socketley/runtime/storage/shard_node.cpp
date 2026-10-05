@@ -102,11 +102,11 @@ void shard_node::commit(uint32_t owner, commit_request req, std::function<void(p
 }
 
 void shard_node::remove(uint32_t owner, std::string bucket, std::string key, std::string version_id, bool bypass,
-                        change_origin who, std::function<void(remove_result)> cb)
+                        change_origin who, std::function<void(remove_result)> cb, delete_condition cond)
 {
     ++m_c.removes_out;
     auto alive = m_alive;
-    m_transport.call(owner, wire::encode_remove(bucket, key, version_id, bypass, who),
+    m_transport.call(owner, wire::encode_remove(bucket, key, version_id, bypass, who, cond),
                      [this, alive, cb](bool ok, std::string_view reply)
     {
         if (!*alive)
@@ -1187,7 +1187,8 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             std::string bucket, key, version_id;
             bool bypass = false;
             change_origin who;
-            if (!wire::decode_remove(payload, bucket, key, &version_id, &bypass, &who))
+            delete_condition cond;
+            if (!wire::decode_remove(payload, bucket, key, &version_id, &bypass, &who, &cond))
             {
                 reply(false, {});
                 return;
@@ -1195,7 +1196,7 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             ++m_c.removes_in;
             m_store.remove_version_local(bucket, key, std::move(version_id),
                 [reply](remove_result r) { reply(true, wire::encode_removed(r)); }, {}, bypass,
-                change_cause::remove, std::move(who));
+                change_cause::remove, std::move(who), std::move(cond));
             return;
         }
         case wire::op::set_tags:

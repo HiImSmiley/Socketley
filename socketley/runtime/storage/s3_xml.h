@@ -662,6 +662,10 @@ struct delete_request
     std::vector<std::string> keys;
     // Each key's <VersionId>, empty where it named none.
     std::vector<std::string> versions;
+    // Each key's conditions, <ETag>, <LastModifiedTime> and <Size>, as they were given, empty where none was.
+    std::vector<std::string> etags;
+    std::vector<std::string> mtimes;
+    std::vector<std::string> sizes;
     bool                     quiet{false};
 };
 
@@ -743,7 +747,7 @@ inline bool parse_delete_request(std::string_view x, delete_request& out)
         {
             pos = t.end;
             bool have_key = false;
-            std::string key, version;
+            std::string key, version, etag, mtime, size;
             for (;;)
             {
                 tag u;
@@ -773,10 +777,13 @@ inline bool parse_delete_request(std::string_view x, delete_request& out)
                     have_key = true;
                     pos = u.end;
                 }
-                else if (u.name == "VersionId" && !u.closing && !u.self_closing)
+                else if ((u.name == "VersionId" || u.name == "ETag" || u.name == "LastModifiedTime" ||
+                          u.name == "Size") && !u.closing && !u.self_closing)
                 {
+                    std::string& into = u.name == "VersionId" ? version : u.name == "ETag" ? etag
+                                      : u.name == "LastModifiedTime" ? mtime : size;
                     const size_t close = x.find('<', u.end);
-                    if (close == std::string_view::npos || !xml_unescape(x.substr(u.end, close - u.end), version))
+                    if (close == std::string_view::npos || !xml_unescape(x.substr(u.end, close - u.end), into))
                         return false;
                     const size_t gt = x.find('>', close);
                     if (gt == std::string_view::npos)
@@ -790,6 +797,9 @@ inline bool parse_delete_request(std::string_view x, delete_request& out)
                 return false;
             out.keys.push_back(std::move(key));
             out.versions.push_back(std::move(version));
+            out.etags.push_back(std::move(etag));
+            out.mtimes.push_back(std::move(mtime));
+            out.sizes.push_back(std::move(size));
             if (out.keys.size() > 1000)
                 return false;
         }

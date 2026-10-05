@@ -924,7 +924,7 @@ int64_t object_store::removed_at(const std::string& bucket, const std::string& k
 void object_store::remove_versioned(std::string bucket_name, std::string key, std::string version_id,
                                     std::function<bool(const object_meta&)> only_if, bool bypass, change_cause cause,
                                     change_origin who, std::function<void(uint64_t ticket, bool made)> release,
-                                    std::function<void(remove_result)> cb)
+                                    std::function<void(remove_result)> cb, delete_condition cond)
 {
     auto v        = std::make_shared<vop>();
     v->alive      = m_alive;
@@ -976,6 +976,21 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
         {
             answer({st::ok});
             return;
+        }
+        // A conditional delete asks it of the latest, a delete marker included, and of nothing removes nothing.
+        if (cond.any())
+        {
+            const object_meta* latest = o != b->objects.end() ? &o->second : latest_marker(v->bname, v->key);
+            if (!latest || (is_delete_marker(*latest) && cond.if_match == "*" && cond.mtime_s < 0 && cond.size < 0))
+            {
+                answer({st::ok});
+                return;
+            }
+            if (check_delete_condition(cond, *latest) != st::ok)
+            {
+                answer({st::precondition_failed, true});
+                return;
+            }
         }
         v->what = vop::kind::marker;
         v->meta = object_meta{};
@@ -1042,6 +1057,11 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
         if (!f && m_mirror && valid_version_id(v->version_id))
             note_removed(v->bname, v->key, v->version_id, static_cast<int64_t>(now_ms()));
         answer({st::ok, false, false, v->version_id});
+        return;
+    }
+    if (cond.any() && check_delete_condition(cond, *f) != st::ok)
+    {
+        answer({st::precondition_failed, true, false, v->version_id});
         return;
     }
     if (lock_holds(*f, static_cast<int64_t>(now_ms()), bypass))

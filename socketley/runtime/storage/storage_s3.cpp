@@ -872,7 +872,7 @@ void storage_run::op_put_acl(const std::shared_ptr<conn>& c)
     // every grant is FULL_CONTROL to the owner.
     s3_error err;
     const std::string_view owner = owner_of(r.bucket);
-    bool ok = acl_headers_ok(r, false, owner, err);
+    bool ok = acl_headers_ok(r, false, owner, c->user ? std::string_view(c->user->id) : owner, err);
     if (ok && !c->body.empty())
     {
         xml_node root;
@@ -1158,6 +1158,36 @@ void storage_run::op_list_objects(const std::shared_ptr<conn>& c, bool v2)
 
 // ─── DeleteObjects ──────────────────────────────────────────────────────────
 
+namespace
+{
+
+// A delete's conditions from an ETag list, a time as an HTTP date or in ISO 8601, which clients send in either, and a
+// size; false for one that is none.
+bool delete_condition_of(std::string_view etag, std::string_view mtime, std::string_view size, delete_condition& out)
+{
+    out = delete_condition{};
+    out.if_match = std::string(http_trim_ows(etag));
+    if (!mtime.empty())
+    {
+        int64_t ms = 0;
+        bool midnight = false;
+        out.mtime_s = parse_iso8601(mtime, ms, midnight) ? ms / 1000 : parse_http_date(mtime);
+        if (out.mtime_s < 0)
+            return false;
+    }
+    if (!size.empty())
+    {
+        uint64_t n = 0;
+        const auto r = std::from_chars(size.data(), size.data() + size.size(), n);
+        if (r.ec != std::errc{} || r.ptr != size.data() + size.size() || n > static_cast<uint64_t>(INT64_MAX))
+            return false;
+        out.size = static_cast<int64_t>(n);
+    }
+    return true;
+}
+
+}   // namespace
+
 void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
 {
     const s3_request& q = c->req;
@@ -1241,6 +1271,14 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
             done_one(b);
             continue;
         }
+        delete_condition cond;
+        if (!delete_condition_of(dr.etags[i], dr.mtimes[i], dr.sizes[i], cond))
+        {
+            res.ok    = false;
+            res.error = make_error("InvalidArgument");
+            done_one(b);
+            continue;
+        }
         ++m_c.deletes;
         const bool bypass = !res.version_id.empty() && bypass_allowed(c, res.key);
         m_store.remove_version(b->bucket, res.key, res.version_id, [this, b, i, done_one](remove_result rr)
@@ -1260,7 +1298,7 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
                     one.marker_version_id = rr.version_id;
             }
             done_one(b);
-        }, bypass, origin_of(*c));
+        }, bypass, origin_of(*c), std::move(cond));
     }
 }
 
@@ -1748,6 +1786,13 @@ void storage_run::op_delete_object(const std::shared_ptr<conn>& c)
     std::string version_id;
     if (!version_param(c, version_id))
         return;
+    delete_condition cond;
+    if (!delete_condition_of(c->req.header("if-match"), c->req.header("x-amz-if-match-last-modified-time"),
+                             c->req.header("x-amz-if-match-size"), cond))
+    {
+        send_error(c, make_error("InvalidArgument"));
+        return;
+    }
     ++m_c.deletes;
     const bool bypass = !version_id.empty() && bypass_allowed(c, c->req.key);
     std::weak_ptr<conn> weak = c;
@@ -1773,7 +1818,7 @@ void storage_run::op_delete_object(const std::shared_ptr<conn>& c)
         if (!rr.version_id.empty())
             r.headers.emplace_back("x-amz-version-id", rr.version_id);
         send_response(cc, std::move(r));
-    }, bypass, origin_of(*c));
+    }, bypass, origin_of(*c), std::move(cond));
 }
 
 // ─── GetObject, HeadObject ──────────────────────────────────────────────────

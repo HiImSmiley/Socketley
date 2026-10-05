@@ -73,9 +73,10 @@ bool        decode_committed(std::string_view reply, put_result& r);
 
 // A delete of the key, or of its version `version_id` when that is not empty, `bypass` going past a GOVERNANCE retention.
 std::string encode_remove(std::string_view bucket, std::string_view key, std::string_view version_id = {},
-                          bool bypass = false, const change_origin& who = {});
+                          bool bypass = false, const change_origin& who = {}, const delete_condition& cond = {});
 bool        decode_remove(std::string_view payload, std::string& bucket, std::string& key,
-                          std::string* version_id = nullptr, bool* bypass = nullptr, change_origin* who = nullptr);
+                          std::string* version_id = nullptr, bool* bypass = nullptr, change_origin* who = nullptr,
+                          delete_condition* cond = nullptr);
 
 // A header change: `value` is the tags, the retention or the legal hold as header_change::kind `what` says.
 std::string encode_set_tags(std::string_view bucket, std::string_view key, std::string_view version_id,
