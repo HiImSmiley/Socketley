@@ -242,10 +242,10 @@ fi
 
 # ── 6. A stop after a crash absorbs the tail ────────────────────────────────
 #
-# The daemon does not notice a kill -9 -- `ls` still says Up minutes later --
-# so `stop` is what tells it, and stopping a runtime whose worker is gone is
-# the ordinary way out of a crash.  What must not happen there is the journal
-# being cut without its records reaching the dump.
+# The supervisor puts a killed worker back, which replays the journal and
+# says Up in `ls`, so `stop` after a crash reaches that worker, and what must
+# not happen there is the journal being cut without its records reaching the
+# dump.
 redis-cli -p "$PORT" SET jsplit written >/dev/null 2>&1
 sleep 2                       # flushed, not snapshotted
 kill_workers || bad "kill 3" "no worker pid to kill"
@@ -259,6 +259,10 @@ if [ "$CRASH_J" -gt "$JOURNAL_HEAD" ]; then ok "the crash left records in the jo
     bad "the crash left records in the journal" \
         "journal is $CRASH_J bytes, header is $JOURNAL_HEAD: nothing was captured"
 fi
+
+# Served again, because a stop that lands before the new worker's setup takes it
+# down with nothing to dump, and leaves the journal whole for the next start.
+for _ in $(seq 1 200); do [ "$(redis-cli -p "$PORT" GET jsplit 2>/dev/null)" = written ] && break; sleep 0.05; done
 
 "$BIN" stop jc >/dev/null 2>&1
 sleep 1
