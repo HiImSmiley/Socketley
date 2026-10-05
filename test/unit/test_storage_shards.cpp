@@ -1439,8 +1439,9 @@ TEST_CASE("the wire forms round-trip and refuse what is not theirs")
     CHECK_FALSE(wire::request_op("*1\r\n$4\r\nPING\r\n", o));
     CHECK_FALSE(wire::request_op("", o));
     std::string flipped = enc;
-    // A byte of the record, which ends before the cause and the origin's two strings.
-    const size_t tail = 1 + 8 + req.who.principal.size() + req.who.source_ip.size();
+    // A byte of the record, which ends before the cause and the origin: four strings and two flags.
+    const size_t tail = 1 + 16 + 2 + req.who.principal.size() + req.who.source_ip.size() +
+                        req.who.source_version.size() + req.who.stamp.size();
     flipped[flipped.size() - tail - 5] ^= 0x10;
     commit_request junk;
     CHECK_FALSE(wire::decode_commit(flipped, junk));
