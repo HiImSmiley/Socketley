@@ -18,8 +18,10 @@ node_start() {
     echo $! >"$T/$n.pid"
     NODES+=("$n")
     local i
+    local now
     for i in $(seq 1 100); do
-        [ "$(grep -c "daemon started" "$T/$n.log" 2>/dev/null || true)" -gt "${before:-0}" ] && return 0
+        now=$(grep -c "daemon started" "$T/$n.log" 2>/dev/null || true)
+        [ "${now:-0}" -gt "${before:-0}" ] && return 0
         kill -0 "$(cat "$T/$n.pid")" 2>/dev/null || break
         sleep 0.1
     done

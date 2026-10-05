@@ -134,7 +134,9 @@ round() {   # round <condition> <round number>
         check '[ "$recent" = 0 ]' "$cond $i: $recent writes acknowledged more than 250 ms before the kill are missing after the promotion"
     fi
     start_member "$P"
-    check 'wait_for 60 "[ \"\$(count_of \"\$(leading 1 2 3)\")\" = 1 ] && settled_on \$(leading 1 2 3) \$(cstat \$(leading 1 2 3) cluster_epoch) 1 2 3"' \
+    # A node back after a stalled round takes the whole keyspace again, a million keys, which beside the rest of a
+    # parallel suite takes longer than a minute.
+    check 'wait_for 150 "[ \"\$(count_of \"\$(leading 1 2 3)\")\" = 1 ] && settled_on \$(leading 1 2 3) \$(cstat \$(leading 1 2 3) cluster_epoch) 1 2 3"' \
           "$cond $i: the cluster did not settle after node $P was restarted"
 }
 
