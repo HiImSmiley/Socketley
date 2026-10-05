@@ -6411,6 +6411,40 @@ and the state file keep its path, and its secrets are never logged. Without it
 every replication configuration is refused. See
 .BR Replication .
 .TP
+.BI \-\-cluster " file"
+Makes the runtime a node of a cluster, whose nodes each keep every bucket and
+take writes. The file names this node, every node by the S3 endpoint the others
+reach it at (this one included, with an optional
+.BI ca= file
+for an https endpoint), and the key the nodes sign for each other with, the same
+in every node's file; comments and blank lines are as in
+.BR \-\-notify\-targets :
+.RS
+.PP
+.nf
+self  a
+node  a  https://s3\-a.internal:9000
+node  b  https://s3\-b.internal:9000
+node  c  https://s3\-c.internal:9000  ca=/etc/socketley/cluster\-ca.pem
+key   AKIACLUSTERNODES0001  wJal.../nodes
+.fi
+.RE
+.IP
+The file is refused at
+.B create
+and
+.B start
+if a line does not parse, if
+.B self
+is none of its nodes, or if it names no key, and is read at every start, so a
+node added to the file is taken by each node once it starts again;
+.B show
+and the state file keep its path, and the key is never logged. The cluster's key
+is accepted beside the runtime's own credentials and is not one of them: a request
+signed with it writes what another node made, is judged by no bucket policy, and
+cannot be given to a user. See
+.BR Cluster .
+.TP
 .B \-\-anonymous
 Accept requests that carry no credentials at all. Required unless
 credentials are given: a runtime made with neither is refused, so an endpoint is
@@ -7935,8 +7969,9 @@ in
 synced beside the change itself and before it is answered, as its events are
 (see
 .BR "Event notifications" ),
-so a crash never copies a change that was not made. Each target is
-sent one copy at a time, in order. A refused connection, a stall of 10 seconds,
+so a crash never copies a change that was not made. Each target has up to 16
+copies in flight, each on a connection of its own, a key's copies one at a time
+and in the order they were made. A refused connection, a stall of 10 seconds,
 no answer within 120 seconds of the whole request, and an answer of 408, 409,
 429 or a 5xx other than 501 are tried again after 0.25 s, doubling to 8 s, and
 logged at the first of a run; any other answer, or a version whose bytes cannot be
@@ -7964,6 +7999,92 @@ and
 .B replication_reuses
 (requests that went on a connection kept from the request before, as a webhook's
 is), per shard.
+.SS Cluster
+The nodes of a cluster (\fB\-\-cluster\fR) each keep every bucket, and every
+node takes reads and writes, so a client or a load balancer may use any of them.
+Each change a node makes is sent to every other node, from its replication
+outbox in the way a bucket's replication sends a version (see
+.BR Replication ),
+and is in that outbox, synced, before the client hears it was made: a version or
+an object (as a PutObject, or as a multipart upload in the same parts, so its ETag
+is the same everywhere), a delete marker, a tag change, a removal, a version
+removed by its id, a version's retention or legal hold, a bucket made with its
+owner, removed, or given or relieved of a configuration document (versioning,
+object lock, policy, lifecycle, CORS, encryption, tags, website, logging, quota,
+public access block, notification, replication), the IAM API's users, groups and
+roles, and share links with their downloads. What a node was sent it does not
+send on. A lifecycle rule's expiries are each node's own, since every node runs
+the bucket's rules; so are a bucket's event notifications, which only the node a
+change was made on sends, and its replication to another endpoint, which only
+that node copies.
+.PP
+Every node ends with the same state whatever order the changes reach it in.
+A version keeps the id, the time and the lock its node gave it, and one older than
+a key's latest goes behind it rather than in front; a node that has not yet heard
+of its bucket's versioning answers it
+.B "503 SlowDown"
+until it has. An object of a bucket that keeps no versions is the write made
+last, by the time it was written on its node and then by the larger ETag; a removal
+is stamped with its time as well, and a node keeps a record of what it removed for
+24 hours, across a restart, in
+.IB dir /.removed. shard\fR,
+so that an older write that crosses the removal on its way is not made. A removal
+is sent even by a node that did not have the key yet. The IAM document is
+the one changed last on any node, so two admins who change IAM on two nodes in the
+same moment keep only the later change. A share link's downloads are counted by
+each node and added up, so its limit holds across the nodes once their counts have
+met. A node answers a write it already has, or one older than what it has,
+.B "412 PreconditionFailed"
+to the node that sent it, which takes that as delivered.
+.PP
+A node that was stopped is sent what it missed once it is back, as a replication
+target is; a change for a bucket another lane is still making or emptying waits for
+it up to 15 minutes, and is then given up and logged. A node more than 100000
+changes behind a shard has that shard's queue for it let go, which bounds the
+memory a long absence takes, and is sent everything instead, as below, once it
+answers again. A node whose data is new to
+another \(em one that joined the cluster, or began again with an empty
+.B \-\-dir
+\(em is sent everything that node holds: every node keeps a random id of its data in
+.IB dir /.cluster\-id\fR,
+asks every other node for its id at start and every 30 seconds, and when an id is
+new sends the IAM document, the share links, every bucket with its documents, and
+every version, delete marker and object it holds, 500 keys at a time and asking
+first whether the node already has each, and last what it removed in the last 24
+hours, noting how far it got in
+.IB dir /.replicate/seed. shard . node
+so a restart goes on from there.
+.PP
+The nodes need the same credentials and the same
+.B \-\-sse\-key\-file
+(an SSE\-S3 object is sent in the clear over the node's endpoint and encrypted
+again there; use https between nodes that are not on one host), and their clocks
+within a second of one another, since the time a write was made decides between
+two writes of one key. An SSE\-C object is not sent, as its key is its client's.
+.B stats
+shows, per shard,
+.B cluster_pending
+(changes waiting for another node),
+.B cluster_sent
+and
+.B cluster_failed
+(changes the other nodes took, and gave up),
+.B cluster_in
+(bucket, IAM and share records another node sent here),
+.B cluster_seeds
+(nodes this shard began to send everything to),
+.B cluster_seeded
+(versions and objects it queued for them) and
+.B cluster_seeding
+(nodes it has not yet queued everything for, or not yet asked) and
+.B cluster_overflows
+(queues let go).
+.PP
+Three nodes on one host, 4 KiB PutObject from 16 clients for 15 seconds: the two
+other nodes keep up as the writes come (4 changes waiting when the clients stop,
+none 0.4 seconds later). On a 4\-vCPU VPS with the two other nodes on tmpfs, a node
+takes 1800 PutObject a second against 2660 alone, its own work per write growing
+from 450 to 557 microseconds of CPU, which is the write read back and sent twice.
 .SS Server\-side encryption
 .B "x\-amz\-server\-side\-encryption: AES256"
 on PutObject, CreateMultipartUpload or CopyObject (SSE\-S3) stores the object
