@@ -13829,6 +13829,13 @@ Default: 10000. A test lowers it to reach the bound.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_STORAGE_CLUSTER_QUEUE
+The most changes a storage shard queues for another node of its cluster before it
+lets them go and sends that node everything instead once it answers (see Cluster).
+Default: 100000. A test lowers it to reach the bound with a few writes.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_STORAGE_REPLICATION_HOSTS
 A test aid: a file of
 .I name address
