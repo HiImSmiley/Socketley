@@ -863,9 +863,10 @@ public:
     void dav_trash(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix);
     void dav_restore(const std::shared_ptr<conn>& c, std::string bucket, std::string key);
     // Turns the request into the S3 operation `method` on `bucket`/`key` and sends it down the S3 path, after the
-    // policy has had its say; `extra` is a header to add, name and value.
+    // policy has had its say; `extra` is a header to add, name and value, and `query` the S3 query it carries.
     void app_forward(const std::shared_ptr<conn>& c, std::string_view method, std::string bucket, std::string key,
-                     std::string_view extra_name = {}, std::string extra_value = {});
+                     std::string_view extra_name = {}, std::string extra_value = {},
+                     std::vector<std::pair<std::string, std::string>> query = {});
     // Whether the request's user may do `method` to `bucket`/`key` as S3 would judge it.
     bool app_allowed(const std::shared_ptr<conn>& c, std::string_view method, std::string_view bucket,
                      std::string_view key, std::string_view query = {});

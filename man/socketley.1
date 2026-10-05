@@ -9556,6 +9556,18 @@ client's own key is not copied and the answer is
 .BR 500 .
 Locks are granted and not enforced, and properties are not kept.
 .IP
+A file may also be sent in parts, side by side, as S3's multipart upload under
+the drive's sign-in:
+.B POST ?uploads
+on the file begins one and answers its UploadId,
+.B PUT ?partNumber=\fIn\fB&uploadId=\fIid\fR
+streams a part and answers its ETag,
+.B POST ?uploadId=\fIid\fR
+with S3's CompleteMultipartUpload body makes the file of them, and
+.B DELETE ?uploadId=\fIid\fR
+abandons it; each is judged as the S3 operation it is. A file's other PUTs
+ignore their query.
+.IP
 .nf
 [drive]                      # rclone.conf, then: rclone copy ~/photos drive:holiday
 type = webdav

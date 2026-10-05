@@ -233,13 +233,14 @@ bool storage_run::app_allowed(const std::shared_ptr<conn>& c, std::string_view m
 }
 
 void storage_run::app_forward(const std::shared_ptr<conn>& c, std::string_view method, std::string bucket,
-                              std::string key, std::string_view extra_name, std::string extra_value)
+                              std::string key, std::string_view extra_name, std::string extra_value,
+                              std::vector<std::pair<std::string, std::string>> query)
 {
     s3_request& r = c->req;
     r.method = method;
     r.bucket = std::move(bucket);
     r.key    = std::move(key);
-    r.query.clear();
+    r.query  = std::move(query);
     r.app = app_none;
     if (!extra_name.empty())
     {
@@ -327,9 +328,23 @@ void storage_run::op_dav(const std::shared_ptr<conn>& c)
         return;
     std::string bucket, key;
     split_dav(r.key, bucket, key);
+    // A file's upload in parts, S3's multipart under the drive's sign-in, so a browser sends a large file's parts
+    // side by side: POST ?uploads begins it, PUT ?partNumber&uploadId streams a part, POST ?uploadId completes it
+    // and DELETE ?uploadId abandons it, each judged by the policies as the S3 operation it is.
+    const bool file = !bucket.empty() && !key.empty() && key.back() != '/';
+    if (file && ((r.method == "POST" && (r.has_query("uploads") || r.has_query("uploadId"))) ||
+                 ((r.method == "PUT" || r.method == "DELETE") && r.has_query("uploadId"))))
+    {
+        std::vector<std::pair<std::string, std::string>> mpu;
+        for (auto& q : r.query)
+            if (q.first == "uploads" || q.first == "uploadId" || q.first == "partNumber")
+                mpu.push_back(std::move(q));
+        app_forward(c, r.method, std::move(bucket), std::move(key), {}, {}, std::move(mpu));
+        return;
+    }
     // A file's PUT streams down the S3 path as it arrives; anything else is read whole first, which is nothing for
     // the methods that carry no body.
-    if (r.method == "PUT" && !bucket.empty() && !key.empty() && key.back() != '/')
+    if (r.method == "PUT" && file)
     {
         // WebDAV clients count an upload as 201 Created and read an S3 200 as neither that nor 204.
         c->on_answer = [this](const std::shared_ptr<conn>& cc, response& resp)

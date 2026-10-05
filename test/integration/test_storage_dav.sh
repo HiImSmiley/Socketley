@@ -131,6 +131,27 @@ check "DELETE of a folder is 204" "$(code -u "$A" -X DELETE "$U/~dav/docs/d/")" 
 check "and leaves nothing under it" "$(s3 "$U/docs?list-type=2&prefix=d/" | grep -c '<Key>')" 0
 check "COPY without a Destination is 400" "$(code -u "$A" -X COPY "$U/~dav/docs/a/one.txt")" 400
 
+# A file sent in parts side by side, as the web interface sends a large one.
+head -c 6000000 /dev/urandom > "$T/p1"; head -c 1234567 /dev/urandom > "$T/p2"; cat "$T/p1" "$T/p2" > "$T/parts"
+mpu=$(curl -s -u "$A" -X POST -H 'Content-Type: video/mp4' "$U/~dav/docs/film.mp4?uploads" | grep -o '<UploadId>[^<]*' | cut -d'>' -f2)
+check "POST ?uploads begins an upload in parts" "${#mpu}" 32
+etag() { curl -s -u "$A" -T "$1" -D - -o /dev/null "$U/~dav/docs/film.mp4?partNumber=$2&uploadId=$mpu" | grep -i '^etag:' | cut -d' ' -f2 | tr -d '\r'; }
+e2=$(etag "$T/p2" 2); e1=$(etag "$T/p1" 1)
+check "each part is taken, in any order" "${#e1}${#e2}" 3434
+check "nothing is there before the upload is completed" "$(code -u "$A" "$U/~dav/docs/film.mp4")" 404
+check "POST ?uploadId completes it" "$(code -u "$A" -X POST "$U/~dav/docs/film.mp4?uploadId=$mpu" \
+      -d "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>$e1</ETag></Part><Part><PartNumber>2</PartNumber><ETag>$e2</ETag></Part></CompleteMultipartUpload>")" 200
+check "into the file whole" "$(curl -s -u "$A" "$U/~dav/docs/film.mp4" | cmp -s - "$T/parts" && echo same)" same
+check "with the type it was begun with" "$(curl -s -u "$A" -I "$U/~dav/docs/film.mp4" | grep -i '^content-type:' | tr -d '\r')" "Content-Type: video/mp4"
+check "a folder's upload in parts is no upload" "$(code -u "$A" -X POST "$U/~dav/docs/a/?uploads")" 405
+mpu=$(curl -s -u "$A" -X POST "$U/~dav/docs/gone.bin?uploads" | grep -o '<UploadId>[^<]*' | cut -d'>' -f2)
+check "DELETE ?uploadId abandons one" "$(code -u "$A" -X DELETE "$U/~dav/docs/gone.bin?uploadId=$mpu")" 204
+check "which leaves no upload behind" "$(s3 "$U/docs?uploads" | grep -c '<UploadId>')" 0
+check "another user may not begin one in the bucket" "$(code -u "$B" -X POST "$U/~dav/docs/x.bin?uploads")" 403
+check "nor without credentials" "$(code -X POST "$U/~dav/docs/x.bin?uploads")" 401
+check "the drive's PUT of a file still ignores S3's own queries" "$(code -u "$A" -T "$T/one" "$U/~dav/docs/q.txt?tagging")" 201
+s3 -o /dev/null -X DELETE "$U/docs/film.mp4"; s3 -o /dev/null -X DELETE "$U/docs/q.txt"
+
 # Another user's bucket.
 check "another user's root does not list it" "$(names "$B" "")" ""
 check "nor may they read it" "$(code -u "$B" "$U/~dav/docs/a/one.txt")" 403
