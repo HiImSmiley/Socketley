@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <charconv>
 #include <sys/un.h>
+#include <arpa/inet.h>
 #include "../shared/runtime_manager.h"
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
@@ -52,6 +53,36 @@ static bool refuse_client_flag_elsewhere(const runtime_instance* instance,
 // Defined further down, beside validate_listen_value; declared here because
 // the common create and edit parsers dispatch to it.
 static int parse_listen_flag(runtime_instance* rt, const parsed_args& pa, size_t& i);
+
+// `--bind address`, the IPv4 address the port is bound on alone, 0.0.0.0 for every address again.
+static int apply_bind_address(runtime_instance* instance, std::string_view address)
+{
+    in_addr a{};
+    const std::string text(address);
+    if (::inet_pton(AF_INET, text.c_str(), &a) != 1)
+    {
+        std::cout << "invalid listen address \"" << text << "\": an IPv4 address such as 127.0.0.1\n";
+        return 1;
+    }
+    instance->set_bind_address(a.s_addr == htonl(INADDR_ANY) ? std::string() : text);
+    return 0;
+}
+
+// `-p port`, or `-p address:port` for --bind and -p at once.
+static int parse_port_flag(runtime_instance* instance, std::string_view value)
+{
+    const size_t colon = value.rfind(':');
+    uint16_t port;
+    if (!parse_uint16(colon == std::string_view::npos ? value : value.substr(colon + 1), port))
+    {
+        std::cout << "invalid port number\n";
+        return 1;
+    }
+    if (colon != std::string_view::npos && apply_bind_address(instance, value.substr(0, colon)) != 0)
+        return 1;
+    instance->set_port(port);
+    return 0;
+}
 
 // Every duration flag parses through here, so the next one cannot grow a
 // second grammar and no site can forget the range check.
@@ -206,14 +237,17 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "-p requires a port\n";
                 return 1;
             }
-            uint16_t port;
-            if (!parse_uint16(pa.args[++i], port))
+            return parse_port_flag(instance, pa.args[++i]);
+        }
+
+        case fnv1a("--bind"):
+        {
+            if (i + 1 >= pa.count)
             {
-                std::cout << "invalid port number\n";
+                std::cout << "--bind requires an address\n";
                 return 1;
             }
-            instance->set_port(port);
-            return 0;
+            return apply_bind_address(instance, pa.args[++i]);
         }
 
         case fnv1a("-s"):
@@ -1618,14 +1652,21 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "-p requires a port number\n";
                 return 1;
             }
-            uint16_t port;
-            if (!parse_uint16(pa.args[++i], port))
+            return parse_port_flag(instance, pa.args[++i]);
+        }
+        case fnv1a("--bind"):
+        {
+            if (is_running)
             {
-                std::cout << "invalid port number\n";
+                std::cout << "cannot change the bind address while running\n";
                 return 1;
             }
-            instance->set_port(port);
-            return 0;
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--bind requires an address\n";
+                return 1;
+            }
+            return apply_bind_address(instance, pa.args[++i]);
         }
         case fnv1a("-b"):
             instance->set_bash_output(true);

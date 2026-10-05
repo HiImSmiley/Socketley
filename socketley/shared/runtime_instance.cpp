@@ -23,6 +23,8 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 runtime_instance::runtime_instance(runtime_type type, std::string_view name)
     : m_name(name), m_id(generate_runtime_id()), m_type(type), m_state(runtime_created),
@@ -435,6 +437,25 @@ void runtime_instance::set_listen_path(std::string_view path)
 std::string_view runtime_instance::get_listen_path() const
 {
     return m_listen_path;
+}
+
+void runtime_instance::set_bind_address(std::string_view address)
+{
+    m_bind_address = address;
+}
+
+std::string_view runtime_instance::get_bind_address() const
+{
+    return m_bind_address;
+}
+
+uint32_t runtime_instance::bind_in_addr() const
+{
+    if (m_bind_address.empty())
+        return htonl(INADDR_ANY);
+    in_addr a{};
+    // One that does not parse, from a state file edited by hand, fails the bind rather than opening every address.
+    return ::inet_pton(AF_INET, m_bind_address.c_str(), &a) == 1 ? a.s_addr : htonl(INADDR_NONE);
 }
 
 void runtime_instance::set_companion_path(std::string_view path)

@@ -32,6 +32,8 @@ struct runtime_config
     // `--listen unix:/path`, an AF_UNIX listener instead of a port, mutually
     // exclusive with `port` and refused where the flag is read.
     std::string listen_path;
+    // `--bind`, the IPv4 address `port` is bound on alone, empty for every address.
+    std::string bind_address;
     bool was_running = false;
 
     // Common

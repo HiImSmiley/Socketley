@@ -2109,7 +2109,7 @@ bool server_instance::setup_tcp_listener(uint16_t port)
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = bind_in_addr();
     addr.sin_port = htons(port);
 
     if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
@@ -2350,7 +2350,7 @@ bool server_instance::setup(event_loop& loop)
 
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_addr.s_addr = bind_in_addr();
         addr.sin_port = htons(port);
 
         if (bind(m_udp_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)

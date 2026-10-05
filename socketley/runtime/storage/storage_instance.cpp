@@ -211,7 +211,7 @@ bool storage_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
 
     struct sockaddr_in addr{};
     addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = bind_in_addr();
     addr.sin_port        = htons(port);
     if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {

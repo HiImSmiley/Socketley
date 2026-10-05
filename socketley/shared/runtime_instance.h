@@ -87,6 +87,12 @@ public:
     void set_listen_path(std::string_view path);
     std::string_view get_listen_path() const;
 
+    // The IPv4 address a port listener binds, as `-p address:port` names it, empty for every address.
+    void set_bind_address(std::string_view address);
+    std::string_view get_bind_address() const;
+    // The address bind() is given in network order, INADDR_ANY for none.
+    uint32_t bind_in_addr() const;
+
     // The node this runtime also answers on, beside its port.  Set by the
     // daemon, empty for a runtime that has only one way in -- which is every
     // runtime with TLS, with no port, or already listening on a path.
@@ -875,6 +881,7 @@ private:
     std::string m_on_start_error;
     uint16_t m_port = 0;
     std::string m_listen_path;
+    std::string m_bind_address;
     std::string m_companion_path;
     std::vector<std::string> m_companion_paths;
     bool m_test_mode = false;

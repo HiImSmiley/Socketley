@@ -42,6 +42,7 @@ struct config_key
 constexpr config_key config_keys[] = {
     // ── Every type ──────────────────────────────────────────────────────────
     { "port",               "-p",                   key_kind::integer },
+    { "bind",               "--bind",               key_kind::text    },
     { "listen",             "--listen",             key_kind::text    },
     { "shards",             "--shards",             key_kind::integer },
     { "log",                "--log",                key_kind::text    },

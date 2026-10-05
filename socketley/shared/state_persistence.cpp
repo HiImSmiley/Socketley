@@ -703,6 +703,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.ca_path = instance->get_ca_path();
     cfg.target = instance->get_target();
     cfg.listen_path = instance->get_listen_path();
+    cfg.bind_address = instance->get_bind_address();
     cfg.cache_name = instance->get_cache_name();
     cfg.group = instance->get_group();
     cfg.owner = instance->get_owner();
@@ -883,6 +884,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     // this is the field an operator edits and re-imports.
     if (!cfg.listen_path.empty())
         append_str_field("listen", "unix:" + cfg.listen_path);
+    if (!cfg.bind_address.empty())
+        append_str_field("bind", cfg.bind_address);
     append_bool_field("was_running", cfg.was_running);
 
     // Common fields (only write non-default)
@@ -1160,6 +1163,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
         if (listen.rfind("unix:", 0) == 0)
             cfg.listen_path = listen.substr(5);
     }
+    cfg.bind_address = json_get_string(json, "bind");
     cfg.was_running = json_get_bool(json, "was_running");
 
     // Common

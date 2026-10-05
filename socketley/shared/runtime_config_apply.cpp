@@ -146,6 +146,7 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
     // an empty value would overwrite a default that means something.
     if (cfg.port > 0)                rt.set_port(cfg.port);
     if (!cfg.listen_path.empty())    rt.set_listen_path(cfg.listen_path);
+    if (!cfg.bind_address.empty())   rt.set_bind_address(cfg.bind_address);
     if (!cfg.companion_path.empty()) rt.set_companion_path(cfg.companion_path);
     if (!cfg.group.empty())          rt.set_group(cfg.group);
     if (!cfg.log_file.empty())       rt.set_log_file(cfg.log_file);

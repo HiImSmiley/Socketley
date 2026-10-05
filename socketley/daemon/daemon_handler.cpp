@@ -34,6 +34,7 @@
 #include "../shared/shard_target.h"
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include "../shared/lua_context.h"
 #include "proxy_supervisor.h"
 
@@ -2033,6 +2034,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
                 << ",\"listen\":\""
                 << (listen_path.empty() ? std::string()
                                         : "unix:" + sp_detail::json_escape(listen_path))
+                << "\",\"bind\":\"" << sp_detail::json_escape(instance->get_bind_address())
                 << "\",\"status\":\"" << state_str
                 << "\",\"restarts\":" << instance->restart_count()
                 << ",\"connections\":" << instance->reported_connection_count()
@@ -2251,6 +2253,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
                 << ",\"listen\":\""
                 << (listen_path.empty() ? std::string()
                                         : "unix:" + sp_detail::json_escape(listen_path))
+                << "\",\"bind\":\"" << sp_detail::json_escape(instance->get_bind_address())
                 << "\",\"status\":\"" << state_json(instance->get_state())
                 << "\",\"uptime\":\""
                 << (running ? format_uptime(instance->get_start_time()) : std::string())
@@ -3396,6 +3399,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
         std::string mesh_ca, mesh_cert, mesh_key;
         uint32_t    shards{1};
         std::string listen;
+        std::string bind;
         uint16_t    port{0};
         uint32_t    max_conns{0}, idle_timeout{0};
         size_t      write_buffer{0}, read_buffer{0};
@@ -3424,6 +3428,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
     }
     before.shards     = instance->get_shards();
     before.listen     = std::string(instance->get_listen_path());
+    before.bind       = std::string(instance->get_bind_address());
     before.port       = instance->get_port();
     before.max_conns  = instance->get_max_connections();
     before.idle_timeout      = instance->get_idle_timeout();
@@ -3464,6 +3469,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
         instance->set_ca_path(before.ca);
         instance->set_shards(before.shards);
         instance->set_listen_path(before.listen);
+        instance->set_bind_address(before.bind);
         instance->set_port(before.port);
         instance->set_max_connections(before.max_conns);
         instance->set_idle_timeout(before.idle_timeout);
@@ -3813,6 +3819,19 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
+    // The address judged as --bind judges it, since a document is the other way in.
+    if (cfg.has("bind") && !cfg.bind_address.empty())
+    {
+        in_addr a{};
+        if (::inet_pton(AF_INET, cfg.bind_address.c_str(), &a) != 1)
+        {
+            conn->write_buf = "bind: \"" + cfg.bind_address + "\" is not an IPv4 address such as 127.0.0.1\n";
+            return 1;
+        }
+        if (a.s_addr == htonl(INADDR_ANY))
+            cfg.bind_address.clear();
+    }
+
     bool is_running = instance->get_state() == runtime_running;
     runtime_type type = instance->get_type();
 
@@ -3955,6 +3974,11 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         if (cfg.has("listen") && cfg.listen_path != std::string(instance->get_listen_path()))
         {
             conn->write_buf = "cannot change the listen socket while running\n";
+            return 1;
+        }
+        if (cfg.has("bind") && cfg.bind_address != std::string(instance->get_bind_address()))
+        {
+            conn->write_buf = "cannot change the bind address while running\n";
             return 1;
         }
         // The same rule as the port above, because applying it to a running
@@ -4118,6 +4142,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
 
     if (has("port"))              instance->set_port(cfg.port);
     if (has("listen"))            instance->set_listen_path(cfg.listen_path);
+    if (has("bind"))              instance->set_bind_address(cfg.bind_address);
     // The same absolute-path rule the flag doors apply, because a document is
     // the other way in and a state file written before that rule existed is a
     // third.

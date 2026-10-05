@@ -1969,7 +1969,7 @@ bool proxy_instance::setup(event_loop& loop)
         // this instrument can tell from zero.
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_addr.s_addr = bind_in_addr();
         addr.sin_port = htons(port);
 
         if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)

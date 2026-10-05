@@ -1691,7 +1691,26 @@ to be set first.
 These flags work with all runtime types:
 .TP
 .BI "\-p " "port"
-Set listener port (server, proxy, cache) or target port (client).
+Set listener port (server, proxy, cache, storage) or target port (client).
+.BI "\-p " address : port
+sets
+.B \-\-bind
+as well.
+.TP
+.BI "\-\-bind " address
+The IPv4 address the listener port is bound on, alone, such as
+.B 127.0.0.1
+for a runtime only a reverse proxy on the same host reaches; without it, or with
+.BR 0.0.0.0 ,
+every address. Changed while stopped, by
+.BR edit ,
+or by
+.BR import 's
+.B bind
+field, and named in
+.BR "ls \-\-json" .
+An address that is not one is refused when it is given; one the host does not
+have fails the start.
 .TP
 .B \-s
 Start immediately after creation.
