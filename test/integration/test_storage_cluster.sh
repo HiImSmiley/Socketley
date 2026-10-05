@@ -15,6 +15,8 @@
 #     its queue is let go, removals included; a removal forgotten by a restart
 #   * a node that joins a cluster holding data, or that began again empty, not
 #     sent everything: buckets, documents, versions, markers, locks, objects
+#   * a write answered before the nodes sync names have it, or one waiting
+#     for a node that is down longer than the wait it is given
 #   * a cluster file that does not parse taken, or its key shown
 # suite: isolated
 set -uo pipefail
@@ -81,27 +83,27 @@ for n in cla clb clc; do cluster_file "$n" > "$T/$n.cluster"; done
 
 # ── the flag ────────────────────────────────────────────────────────────────
 printf 'self clx\nnode cla http://127.0.0.1:%s\nkey AKIACLUSTERNODES0001 %s\n' "$PA" "$NODE_SK" > "$T/bad.cluster"
-out=$("$BIN" create storage clx -p "$PX" --dir "$T/x" --credentials "$T/creds" --cluster "$T/bad.cluster" -s 2>&1)
+out=$("$BIN" create storage clx -p "$PX" --dir "$T/x" --credentials "$T/creds" --nodes "$T/bad.cluster" -s 2>&1)
 if [ $? -ne 0 ] && echo "$out" | grep -q "none of the file's nodes"; then
     ok "a cluster file whose self is none of its nodes is refused, saying why"
 else
     bad "a cluster file whose self is none of its nodes is refused, saying why" "$out"
 fi
 "$BIN" remove clx >/dev/null 2>&1
-out=$("$BIN" create storage clx -p "$PX" --dir "$T/x" --credentials "$T/creds" --cluster 2>&1)
-[ $? -eq 1 ] && ok "--cluster with no file is refused" || bad "--cluster with no file is refused" "$out"
+out=$("$BIN" create storage clx -p "$PX" --dir "$T/x" --credentials "$T/creds" --nodes 2>&1)
+[ $? -eq 1 ] && ok "--nodes with no file is refused" || bad "--nodes with no file is refused" "$out"
 
 # ── three nodes, the third with two shards ─────────────────────────────────
-"$BIN" create storage cla -p "$PA" --dir "$T/a" --credentials "$T/creds" --cluster "$T/cla.cluster" -s >/dev/null 2>&1 &&
-"$BIN" create storage clb -p "$PB" --dir "$T/b" --credentials "$T/creds" --cluster "$T/clb.cluster" -s >/dev/null 2>&1 &&
-"$BIN" create storage clc -p "$PC" --dir "$T/c" --credentials "$T/creds" --cluster "$T/clc.cluster" --shards 2 \
+"$BIN" create storage cla -p "$PA" --dir "$T/a" --credentials "$T/creds" --nodes "$T/cla.cluster" -s >/dev/null 2>&1 &&
+"$BIN" create storage clb -p "$PB" --dir "$T/b" --credentials "$T/creds" --nodes "$T/clb.cluster" -s >/dev/null 2>&1 &&
+"$BIN" create storage clc -p "$PC" --dir "$T/c" --credentials "$T/creds" --nodes "$T/clc.cluster" --shards 2 \
     -s >/dev/null 2>&1 || { echo "  FAIL [create]: the nodes were not created"; exit 1; }
 wait_up "$PA" && wait_up "$PB" && wait_up "$PC" || bad "the nodes come up" "no answer on $PA, $PB or $PC"
 shown=$("$BIN" show cla 2>&1)
-if echo "$shown" | grep -q "\"cluster\": \"$T/cla.cluster\"" && ! echo "$shown" | grep -q "$NODE_SK"; then
-    ok "show names the cluster file and not its key"
+if echo "$shown" | grep -q "\"nodes\": \"$T/cla.cluster\"" && ! echo "$shown" | grep -q "$NODE_SK"; then
+    ok "show names the nodes file and not its key"
 else
-    bad "show names the cluster file and not its key" "$shown"
+    bad "show names the nodes file and not its key" "$shown"
 fi
 
 run_lib() {   # label mode node...
@@ -117,7 +119,7 @@ run_lib "the cluster half ran" main "cla:$PA" "clb:$PB" "clc:$PC"
 # ── a fourth node joins, and a node begins again empty ─────────────────────
 run_lib "the data for the join was written" keep "cla:$PA" "clb:$PB" "clc:$PC"
 for n in cla clb clc cld; do cluster_file "$n" joined > "$T/$n.cluster"; done
-"$BIN" create storage cld -p "$PX" --dir "$T/d" --credentials "$T/creds" --cluster "$T/cld.cluster" -s >/dev/null 2>&1 ||
+"$BIN" create storage cld -p "$PX" --dir "$T/d" --credentials "$T/creds" --nodes "$T/cld.cluster" -s >/dev/null 2>&1 ||
     bad "the fourth node is made" "create failed"
 for n in cla clb clc; do "$BIN" stop "$n" >/dev/null 2>&1; "$BIN" start "$n" >/dev/null 2>&1; done
 wait_up "$PA" && wait_up "$PB" && wait_up "$PC" && wait_up "$PX" || bad "the four nodes come up" "no answer"
@@ -127,6 +129,21 @@ rm -rf "$T/b"
 "$BIN" start clb >/dev/null 2>&1
 wait_up "$PB" || bad "the emptied node comes up" "no answer on $PB"
 run_lib "the again half ran" same "cla:$PA" "clb:$PB"
+
+# ── a write answered once the other nodes have it ──────────────────────────
+for n in cla clb clc cld; do { cluster_file "$n" joined; echo "sync 3 2000"; } > "$T/$n.cluster"; done
+for n in cla clb clc cld; do "$BIN" stop "$n" >/dev/null 2>&1; "$BIN" start "$n" >/dev/null 2>&1; done
+wait_up "$PA" && wait_up "$PB" && wait_up "$PC" && wait_up "$PX" || bad "the four nodes come up with sync" "no answer"
+run_lib "the sync half ran" sync "cla:$PA" "clb:$PB" "clc:$PC" "cld:$PX"
+printf 'self clx\nnode clx http://127.0.0.1:%s\nnode cla http://127.0.0.1:%s\nkey AKIACLUSTERNODES0001 %s\nsync 2\n' \
+    "$PX" "$PA" "$NODE_SK" > "$T/toomany.cluster"
+out=$("$BIN" create storage clx -p "$PX" --dir "$T/x2" --credentials "$T/creds" --nodes "$T/toomany.cluster" -s 2>&1)
+if [ $? -ne 0 ] && echo "$out" | grep -q "there are 1 others"; then
+    ok "a sync of more nodes than there are is refused, saying why"
+else
+    bad "a sync of more nodes than there are is refused, saying why" "$out"
+fi
+"$BIN" remove clx >/dev/null 2>&1
 
 grep -q "$NODE_SK" "$SOCKETLEY_DLOG" && bad "no node key reaches the log" "$(grep -n "$NODE_SK" "$SOCKETLEY_DLOG")" \
     || ok "no node key reaches the log"

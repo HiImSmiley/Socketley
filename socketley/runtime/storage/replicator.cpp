@@ -555,12 +555,79 @@ uint64_t replicator::stage(std::string_view check, const replication_config* cfg
         nt.second.id = ids[i++];
     if (!l)
         tasks.clear();
+    // The answer of a write waits for as many other nodes as sync asks, each copy telling its ticket when it is taken.
+    if (m_sync && !node_tasks.empty())
+    {
+        m_sync_waits[ticket].need = std::min<uint32_t>(m_sync, static_cast<uint32_t>(node_tasks.size()));
+        for (const auto& nt : node_tasks)
+            m_sync_copies[nt.second.id] = ticket;
+    }
     m_staged.emplace(ticket, staged_copies{l, std::move(tasks), std::move(node_tasks)});
     return ticket;
 }
 
+void replicator::synced(uint64_t ticket, std::function<void()> then)
+{
+    const auto it = m_sync_waits.find(ticket);
+    if (it == m_sync_waits.end() || it->second.need == 0 || m_stopped)
+    {
+        if (it != m_sync_waits.end())
+        {
+            ++m_c.node_synced;
+            m_sync_waits.erase(it);
+        }
+        then();
+        return;
+    }
+    it->second.then  = std::move(then);
+    it->second.until = std::chrono::steady_clock::now() + std::chrono::milliseconds(m_sync_ms);
+    arm_timer();
+}
+
+void replicator::sync_taken(uint64_t task_id, bool taken)
+{
+    const auto c = m_sync_copies.find(task_id);
+    if (c == m_sync_copies.end())
+        return;
+    const uint64_t ticket = c->second;
+    m_sync_copies.erase(c);
+    const auto it = m_sync_waits.find(ticket);
+    if (it == m_sync_waits.end() || !taken)
+        return;
+    if (it->second.need > 0 && --it->second.need == 0)
+        sync_answer(ticket, false);
+}
+
+void replicator::sync_answer(uint64_t ticket, bool timed_out)
+{
+    const auto it = m_sync_waits.find(ticket);
+    if (it == m_sync_waits.end())
+        return;
+    // A change whose answer nobody waits for yet is answered at once when its wait begins.
+    if (!it->second.then)
+    {
+        it->second.need = 0;
+        return;
+    }
+    std::function<void()> then = std::move(it->second.then);
+    m_sync_waits.erase(it);
+    ++(timed_out ? m_c.node_sync_timeouts : m_c.node_synced);
+    then();
+}
+
 void replicator::settle(uint64_t ticket, bool made, std::function<void()> then)
 {
+    // A change that was not made waits for no node.
+    if (!made)
+        if (const auto w = m_sync_waits.find(ticket); w != m_sync_waits.end())
+        {
+            for (auto c = m_sync_copies.begin(); c != m_sync_copies.end();)
+                c = c->second == ticket ? m_sync_copies.erase(c) : std::next(c);
+            if (w->second.then)
+                sync_answer(ticket, false);
+            else
+                m_sync_waits.erase(w);
+        }
     const auto it = m_staged.find(ticket);
     if (it == m_staged.end())
     {
@@ -619,6 +686,14 @@ void replicator::on_timer()
         return;
     const auto now = std::chrono::steady_clock::now();
     bool waiting = false;
+    // A write whose nodes did not all take it in time is answered anyway, and its copies go on.
+    std::vector<uint64_t> late;
+    for (const auto& [ticket, w] : m_sync_waits)
+        if (w.then && now >= w.until)
+            late.push_back(ticket);
+    for (const uint64_t ticket : late)
+        sync_answer(ticket, true);
+    waiting = std::any_of(m_sync_waits.begin(), m_sync_waits.end(), [](const auto& w) { return bool(w.second.then); });
     for (auto& lp : m_lanes)
     {
         lane& l = *lp;
@@ -770,6 +845,7 @@ void replicator::ended(lane& l, const std::shared_ptr<job>& j, outcome o, uint64
         land(l, j);
         if (j->t.node_kind)
         {
+            sync_taken(j->t.id, o == outcome::done);
             ++(o == outcome::done ? m_c.node_sent : m_c.node_failed);
             --m_node_pending;
         }
@@ -1407,7 +1483,10 @@ void replicator::overflow(lane& l)
     LOG_WARN(("storage: the cluster node " + l.target.name + " is " + std::to_string(l.q.size()) +
               " changes behind, so they are let go and it is sent everything this shard holds once it answers").c_str());
     for (const task& t : l.q)
+    {
         m_box.done(t.id);
+        sync_taken(t.id, false);
+    }
     m_pending -= l.q.size();
     m_node_pending -= l.q.size();
     l.q.clear();
@@ -1627,6 +1706,8 @@ void replicator::stop()
     if (m_stopped)
         return;
     m_stopped = true;
+    m_sync_waits.clear();
+    m_sync_copies.clear();
     for (auto& l : m_lanes)
     {
         for (auto& p : l->peers)

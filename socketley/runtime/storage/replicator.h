@@ -83,6 +83,9 @@ struct replication_counters
     uint64_t node_seeds{0};
     // Times a node fell so far behind that its queue was let go, to be sent everything once it answers again.
     uint64_t node_overflows{0};
+    // Writes answered after as many other nodes as `sync` asks had them, and those answered when the wait was over.
+    uint64_t node_synced{0};
+    uint64_t node_sync_timeouts{0};
 };
 
 class replicator
@@ -111,6 +114,16 @@ public:
     void set_nodes(std::vector<replication_target> nodes);
     // The runtime's own records a node being sent everything gets before the buckets.
     void set_seed_first(std::function<std::vector<std::string>()> fn) { m_seed_first = std::move(fn); }
+    // A write is answered once `n` other nodes have it, or after `ms` whatever they say.
+    void set_sync(uint32_t n, uint32_t ms)
+    {
+        m_sync    = n;
+        m_sync_ms = ms;
+    }
+    // Runs `then` once the change `ticket` is with as many other nodes as set_sync() asks, or its wait is over.
+    void synced(uint64_t ticket, std::function<void()> then);
+    // Whether the answer of the change `ticket` waits for other nodes.
+    bool sync_waits(uint64_t ticket) const { return m_sync_waits.contains(ticket); }
     bool has_nodes() const { return m_nodes > 0; }
 
     // Opens the shard's outbox under `dir`, queues again what it holds, and queues every version of a replicated
@@ -331,6 +344,21 @@ private:
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
     outbox        m_box;
     std::function<std::vector<std::string>()> m_seed_first;
+    // The changes whose answer waits for other nodes, by ticket: how many must still take it, the answer, and until
+    // when it waits; and the ticket of each of their copies.
+    struct sync_wait
+    {
+        uint32_t need{0};
+        std::function<void()> then;
+        std::chrono::steady_clock::time_point until{};
+    };
+    std::unordered_map<uint64_t, sync_wait> m_sync_waits;
+    std::unordered_map<uint64_t, uint64_t>  m_sync_copies;
+    uint32_t      m_sync{0};
+    uint32_t      m_sync_ms{5000};
+    // A copy of a waiting change was taken, or will not be.
+    void sync_taken(uint64_t task_id, bool taken);
+    void sync_answer(uint64_t ticket, bool timed_out);
     // Where the outbox is, which a seeding's notes go beside.
     std::string   m_dir;
     uint32_t      m_shard{0};

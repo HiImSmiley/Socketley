@@ -6411,7 +6411,7 @@ and the state file keep its path, and its secrets are never logged. Without it
 every replication configuration is refused. See
 .BR Replication .
 .TP
-.BI \-\-cluster " file"
+.BI \-\-nodes " file"
 Makes the runtime a node of a cluster, whose nodes each keep every bucket and
 take writes. The file names this node, every node by the S3 endpoint the others
 reach it at (this one included, with an optional
@@ -6427,8 +6427,18 @@ node  a  https://s3\-a.internal:9000
 node  b  https://s3\-b.internal:9000
 node  c  https://s3\-c.internal:9000  ca=/etc/socketley/cluster\-ca.pem
 key   AKIACLUSTERNODES0001  wJal.../nodes
+sync  1  5000
 .fi
 .RE
+.IP
+.BI sync " n " "[ms]"
+is optional: a write is then answered only once
+.I n
+other nodes have it, or once
+.I ms
+milliseconds (5000) have passed whatever they say, after which its copies go on
+as they would without it; without it a write is answered once it is in this
+node's outbox. A file whose sync names more nodes than there are is refused.
 .IP
 The file is refused at
 .B create
@@ -7971,7 +7981,9 @@ synced beside the change itself and before it is answered, as its events are
 .BR "Event notifications" ),
 so a crash never copies a change that was not made. Each target has up to 16
 copies in flight, each on a connection of its own, a key's copies one at a time
-and in the order they were made. A refused connection, a stall of 10 seconds,
+and in the order they were made; a body of 64 KiB or more that is not encrypted
+goes to an http target straight from its file by splice, without passing through
+the runtime. A refused connection, a stall of 10 seconds,
 no answer within 120 seconds of the whole request, and an answer of 408, 409,
 429 or a 5xx other than 501 are tried again after 0.25 s, doubling to 8 s, and
 logged at the first of a run; any other answer, or a version whose bytes cannot be
@@ -8000,7 +8012,7 @@ and
 (requests that went on a connection kept from the request before, as a webhook's
 is), per shard.
 .SS Cluster
-The nodes of a cluster (\fB\-\-cluster\fR) each keep every bucket, and every
+The nodes of a cluster (\fB\-\-nodes\fR) each keep every bucket, and every
 node takes reads and writes, so a client or a load balancer may use any of them.
 Each change a node makes is sent to every other node, from its replication
 outbox in the way a bucket's replication sends a version (see
@@ -8078,13 +8090,20 @@ and
 .B cluster_seeding
 (nodes it has not yet queued everything for, or not yet asked) and
 .B cluster_overflows
-(queues let go).
+(queues let go),
+.B cluster_synced
+and
+.B cluster_sync_timeouts
+(writes answered once the nodes sync names had them, and once its wait was over).
 .PP
 Three nodes on one host, 4 KiB PutObject from 16 clients for 15 seconds: the two
 other nodes keep up as the writes come (4 changes waiting when the clients stop,
 none 0.4 seconds later). On a 4\-vCPU VPS with the two other nodes on tmpfs, a node
 takes 1800 PutObject a second against 2660 alone, its own work per write growing
-from 450 to 557 microseconds of CPU, which is the write read back and sent twice.
+from 450 to 557 microseconds of CPU, which is the write read back and sent twice;
+1 MiB PutObject from 8 clients, 200 a second against 415 alone, at 5.7 against 4.4
+milliseconds of CPU each, the two other nodes taking every megabyte on the same
+four CPUs.
 .SS Server\-side encryption
 .B "x\-amz\-server\-side\-encryption: AES256"
 on PutObject, CreateMultipartUpload or CopyObject (SSE\-S3) stores the object

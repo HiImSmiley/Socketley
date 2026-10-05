@@ -174,13 +174,22 @@ void storage_run::staged(uint64_t ticket, std::function<void()> then)
     const auto it = m_staged.find(ticket);
     if (it == m_staged.end())
     {
+        // A change settled before its answer, as a commit is, still waits for the nodes its sync asks.
+        if (const auto c = m_settled_copies.find(ticket); c != m_settled_copies.end())
+        {
+            const uint64_t copies = c->second;
+            m_settled_copies.erase(c);
+            m_repl.synced(copies, std::move(then));
+            return;
+        }
         then();
         return;
     }
+    it->second.answered = true;
     const uint64_t copies = it->second.copies;
     m_notify.staged(it->second.notify, [this, copies, then = std::move(then)]() mutable
     {
-        m_repl.staged(copies, std::move(then));
+        m_repl.staged(copies, [this, copies, then = std::move(then)]() mutable { m_repl.synced(copies, std::move(then)); });
     });
 }
 
@@ -194,6 +203,8 @@ void storage_run::settle(uint64_t ticket, bool made, std::function<void()> then)
     }
     staged_change s = std::move(it->second);
     m_staged.erase(it);
+    if (!s.answered && m_repl.sync_waits(s.copies))
+        m_settled_copies.emplace(ticket, s.copies);
     std::optional<change_note> uncopied = made ? std::move(s.uncopied) : std::nullopt;
     m_notify.settle(s.notify, made, [this, copies = s.copies, made, uncopied = std::move(uncopied),
                                      then = std::move(then)]() mutable

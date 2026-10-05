@@ -1050,7 +1050,11 @@ private:
         uint64_t notify{0};
         uint64_t copies{0};
         std::optional<change_note> uncopied;
+        // Its answer began to wait, which a commit begins after it settled.
+        bool     answered{false};
     };
+    // The copies of changes settled before their answer, by ticket, which that answer waits for when sync asks it to.
+    std::unordered_map<uint64_t, uint64_t> m_settled_copies;
     std::unordered_map<uint64_t, staged_change> m_staged;
     uint64_t          m_next_ticket{1};
     // The last sequencer an event was given, which only grows.

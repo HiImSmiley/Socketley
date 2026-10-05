@@ -6,6 +6,7 @@ usage: lib_storage_cluster.py MODE NODE...
   main A B C      everything made on one node is on the others, in every order of arrival; C has two shards
   join A B C D    D joined a cluster that holds data, and is sent all of it
   same A X        X, which began again empty, holds what A holds
+  sync A B C D    the nodes answer a write once the three others have it, or after 2 s
 
 A NODE is name:port.  Every node is signed for with ADMIN_AK/ADMIN_SK.  Prints one PASS or FAIL line per assertion
 and exits with the number of failures.
@@ -472,6 +473,35 @@ def keep():
     check("the nodes hold the same before one joins", same(lambda c: holdings(c), CLIENTS) == holdings(A))
 
 
-{"main": main, "join": join, "same": again, "keep": keep}[MODE]()
+def sync():
+    A, B, C, D = CLIENTS
+    A.create_bucket(Bucket="cl-sync")
+    wait_for(lambda: all(isinstance(call(c.head_bucket, Bucket="cl-sync"), dict) for c in CLIENTS[1:]))
+    had = []
+    for i in range(10):
+        t = time.time()
+        A.put_object(Bucket="cl-sync", Key="s%d" % i, Body=b"synced")
+        took = time.time() - t
+        had.append((all(isinstance(head(c, "cl-sync", "s%d" % i), dict) for c in (B, C, D)), round(took, 3),
+                    [head(c, "cl-sync", "s%d" % i) if not isinstance(head(c, "cl-sync", "s%d" % i), dict) else 1
+                     for c in (B, C, D)]))
+    check("with sync, every other node has a write by the time it is answered", all(h[0] for h in had),
+          (had, {k: v for k, v in stats(A).items() if k.startswith("cluster")}))
+    check("and the writes are counted as synced", wait_for(lambda: stats(A).get("cluster_synced", 0) >= 10),
+          {k: v for k, v in stats(A).items() if k.startswith("cluster")})
+    runtime(D, "stop")
+    t = time.time()
+    A.put_object(Bucket="cl-sync", Key="late", Body=b"one node is down")
+    took = time.time() - t
+    check("a write a node that is down cannot take is answered once its wait of 2 s is over", 1.8 <= took < 6, took)
+    check("and counted so", wait_for(lambda: stats(A).get("cluster_sync_timeouts", 0) >= 1),
+          {k: v for k, v in stats(A).items() if k.startswith("cluster")})
+    check("the nodes that are up have it", all(isinstance(head(c, "cl-sync", "late"), dict) for c in (B, C)))
+    runtime(D, "start")
+    check("and the one that was down has it once it is back",
+          wait_for(lambda: isinstance(head(D, "cl-sync", "late"), dict)))
+
+
+{"main": main, "join": join, "same": again, "keep": keep, "sync": sync}[MODE]()
 print("  cluster: PASS=%d FAIL=%d" % (passed, failed))
 sys.exit(failed)

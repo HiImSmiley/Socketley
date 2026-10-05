@@ -5,6 +5,7 @@
 //   self <name>                  the node this runtime is
 //   node <name> <url> [ca=file]  every node, this one included, by the S3 endpoint the others reach it at
 //   key <access_key> <secret>    the credentials the nodes sign for each other with, the same in every node's file
+//   sync <n> [ms]                a write is answered once n other nodes have it, or after ms (5000) whatever they say
 //
 // Every node takes writes; each sends every change it made to the others through its replication outbox, and a node
 // keeps another's write when it is newer than what it has: a version by its id, which all nodes share, and an object
@@ -27,6 +28,9 @@ struct cluster_config
     std::vector<replication_target> peers;
     std::string access_key;
     std::string secret;
+    // How many other nodes have a write before it is answered, 0 for none, and how long that is waited for at most.
+    uint32_t    sync{0};
+    uint32_t    sync_ms{5000};
 };
 
 // False with `why` for a file that names no `self` among its nodes, a node twice, or no key.

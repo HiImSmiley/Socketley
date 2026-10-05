@@ -61,6 +61,7 @@ bool storage_run::load_cluster_id(std::string& err)
 void storage_run::set_cluster(cluster_config cfg)
 {
     m_cluster_self = cfg.self;
+    m_repl.set_sync(cfg.sync, cfg.sync_ms);
     m_repl.set_nodes(std::move(cfg.peers));
     m_store.set_mirror(true);
     // A bucket's change is in the outbox before its client hears it was made.
