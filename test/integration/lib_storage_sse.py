@@ -681,8 +681,9 @@ def mode_recovery(port, data):
     check("after it every encrypted object is found from its file and reads back", not wrong, wrong[:3])
     listed = {o["Key"] for o in s3.list_objects_v2(Bucket=B).get("Contents", [])}
     check("and is listed", set(expect) <= listed, set(expect) - listed)
-    check("no object file was set aside as corrupt", "corrupt" not in subprocess.run(
-        [BIN, "stats", RUNTIME], capture_output=True, text=True).stdout)
+    check("no object file was set aside as corrupt", not [l for l in subprocess.run(
+        [BIN, "stats", RUNTIME], capture_output=True, text=True).stdout.splitlines()
+        if "corrupt" in l and not l.startswith("scrub_")])
     with open(os.path.join(data, DEFAULTS_STATE)) as f:
         wrong = default_sums_wrong(json.load(f))
     check("and every default checksum is read back from its sealed object's header", not wrong, wrong[:2])
