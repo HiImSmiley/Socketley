@@ -1305,8 +1305,9 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
     // Whoever holds the lock is making it, here or on another shard, and a request for it keeps it wanted.
     media_touch(w.dir);
     const bool stream = w.kind == k_copy;
+    // The GPU's test run is no client's job, so it holds no place a thumbnail or a probe waits for.
     const auto same_kind = std::ranges::count_if(m_media_jobs, [&](const media_job& j) {
-        return (j.want.kind == k_copy || j.want.kind == k_rendition) == stream;
+        return j.want.kind != k_hwtest && (j.want.kind == k_copy || j.want.kind == k_rendition) == stream;
     });
     if (same_kind >= (stream ? hls_jobs_max : thumb_jobs_max))
         return false;
@@ -1620,7 +1621,6 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
                 args.insert(args.end(), {"-rc_mode", "VBR", "-b:v", std::to_string(r->kbps * 3 / 5) + "k",
                                          "-maxrate", std::to_string(r->kbps) + "k", "-bufsize", std::to_string(r->kbps) + "k",
                                          "-profile:v", "high", "-level", avc_level(r->height), "-vf", hwvf,
-                                         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
                                          "-force_key_frames", "expr:gte(t,n_forced*" + std::to_string(seg_seconds) + ")"});
                 j.gpu = true;
             }
@@ -1632,8 +1632,11 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
                                          "-x264-params", "subme=0:me_range=16:rc_lookahead=10:me=hex:open_gop=0",
                                          "-sc_threshold", "0", "-threads", threads, "-level:v", avc_level(r->height),
                                          "-maxrate", std::to_string(r->kbps) + "k", "-bufsize", std::to_string(r->kbps) + "k",
-                                         "-vf", vf, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+                                         "-vf", vf,
                                          "-force_key_frames", "expr:gte(t,n_forced*" + std::to_string(seg_seconds) + ")"});
+            // BT.709 is said in the bitstream, since ffmpeg 8 and later take the colour options on the output for a
+            // conversion, which puts software frames behind scale_vaapi and leaves x264's transfer and matrix unsaid.
+            args.insert(args.end(), {"-bsf:v", "h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1"});
             args.insert(args.end(), audio.begin(), audio.end());
             // The film's time in every fragment and none in the init, so that any job's init fits every job's segments.
             args.insert(args.end(), {"-avoid_negative_ts", "disabled", "-output_ts_offset", offset,
