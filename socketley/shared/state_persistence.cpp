@@ -796,7 +796,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.storage_website_domain = std::string(stg->get_website_domain());
             cfg.storage_notify_targets = std::string(stg->get_notify_targets());
             cfg.storage_replication_targets = std::string(stg->get_replication_targets());
-            cfg.storage_cluster = std::string(stg->get_cluster_file());
+            cfg.storage_nodes = std::string(stg->get_nodes_file());
             cfg.storage_fsync = std::string(stg->get_fsync());
             cfg.storage_fsync_interval_secs = stg->get_fsync_interval_secs();
             cfg.storage_mpu_expire_secs = stg->get_mpu_expire_secs();
@@ -1079,8 +1079,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("notify_targets", cfg.storage_notify_targets);
             if (!cfg.storage_replication_targets.empty())
                 append_str_field("replication_targets", cfg.storage_replication_targets);
-            if (!cfg.storage_cluster.empty())
-                append_str_field("cluster", cfg.storage_cluster);
+            if (!cfg.storage_nodes.empty())
+                append_str_field("nodes", cfg.storage_nodes);
             if (!cfg.storage_fsync.empty())
                 append_str_field("fsync", cfg.storage_fsync);
             if (cfg.storage_fsync_interval_secs > 0)
@@ -1256,7 +1256,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.storage_website_domain = json_get_string(json, "website_domain");
             cfg.storage_notify_targets = json_get_string(json, "notify_targets");
             cfg.storage_replication_targets = json_get_string(json, "replication_targets");
-            cfg.storage_cluster = json_get_string(json, "cluster");
+            cfg.storage_nodes = json_get_string(json, "nodes");
             cfg.storage_fsync = json_get_string(json, "fsync");
             cfg.storage_fsync_interval_secs = static_cast<uint32_t>(json_get_size(json, "fsync_interval"));
             cfg.storage_mpu_expire_secs = static_cast<uint32_t>(json_get_size(json, "mpu_expire"));

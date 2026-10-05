@@ -164,7 +164,7 @@ struct runtime_config
     std::string storage_website_domain;
     std::string storage_notify_targets;
     std::string storage_replication_targets;
-    std::string storage_cluster;
+    std::string storage_nodes;
     std::string storage_fsync;
     uint32_t storage_fsync_interval_secs = 0;
     uint32_t storage_mpu_expire_secs = 0;

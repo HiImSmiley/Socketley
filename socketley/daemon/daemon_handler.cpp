@@ -3568,7 +3568,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                  pa.hashes[i] == fnv1a("--domain") || pa.hashes[i] == fnv1a("--notify-targets") ||
                  pa.hashes[i] == fnv1a("--website-domain") ||
                  pa.hashes[i] == fnv1a("--replication-targets") || pa.hashes[i] == fnv1a("--fsync") ||
-                 pa.hashes[i] == fnv1a("--cluster") ||
+                 pa.hashes[i] == fnv1a("--nodes") ||
                  pa.hashes[i] == fnv1a("--fsync-interval")))
             {
                 restore_edit();
@@ -4078,9 +4078,9 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                 conn->write_buf = "cannot change the replication targets file while running; stop, import, and start\n";
                 return 1;
             }
-            if (cfg.has("cluster") && cfg.storage_cluster != std::string(stg->get_cluster_file()))
+            if (cfg.has("nodes") && cfg.storage_nodes != std::string(stg->get_nodes_file()))
             {
-                conn->write_buf = "cannot change the cluster file while running; stop, import, and start\n";
+                conn->write_buf = "cannot change the nodes file while running; stop, import, and start\n";
                 return 1;
             }
         }

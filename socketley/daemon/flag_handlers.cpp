@@ -1446,15 +1446,15 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
             stg->set_replication_targets(pa.args[++i]);
             return 0;
         }
-        // The cluster this runtime is a node of, a file of `self`, `node` and `key` lines read at every start.
-        case fnv1a("--cluster"):
+        // The nodes that each keep every bucket, a file of `self`, `node` and `key` lines read at every start.
+        case fnv1a("--nodes"):
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--cluster requires a file path\n";
+                std::cout << "--nodes requires a file path\n";
                 return 1;
             }
-            stg->set_cluster_file(pa.args[++i]);
+            stg->set_nodes_file(pa.args[++i]);
             return 0;
         }
         // Open multipart uploads are aborted after this long, and never when it is absent.
