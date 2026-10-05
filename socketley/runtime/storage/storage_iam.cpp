@@ -6,7 +6,9 @@
 #include <sys/file.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 
 #include "s3_iam.h"
 #include "../../shared/logging.h"
@@ -74,7 +76,51 @@ bool replace_file(const std::string& path, const std::string& text)
     return true;
 }
 
+// The revision of the IAM document the file holds, the time it was changed, 0 for a file never changed in a cluster.
+int64_t read_rev(const std::string& file)
+{
+    std::string text;
+    return read_all(file + ".rev", text) ? std::atoll(text.c_str()) : 0;
+}
+
 }   // namespace
+
+std::string storage_run::iam_record()
+{
+    const std::string file = m_auth ? m_auth->iam_file() : std::string();
+    std::string text;
+    if (file.empty() || !read_all(file, text) || text.empty())
+        return {};
+    return encode_cluster_record({'i', std::to_string(read_rev(file)), 0, std::move(text), {}});
+}
+
+st storage_run::iam_take(int64_t rev, const std::string& json)
+{
+    const std::string file = m_auth ? m_auth->iam_file() : std::string();
+    iam_state st;
+    std::string err;
+    if (file.empty())
+        return st::ok;
+    if (!iam_parse(json, st, err))
+        return st::invalid_bucket_state;
+    const int lfd = ::open((file + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lfd < 0 || ::flock(lfd, LOCK_EX) < 0)
+    {
+        if (lfd >= 0)
+            ::close(lfd);
+        return st::io_error;
+    }
+    // The document changed last on any node is every node's.
+    bool ok = true;
+    const bool newer = rev > read_rev(file);
+    if (newer)
+        ok = replace_file(file, json) && replace_file(file + ".rev", std::to_string(rev));
+    ::flock(lfd, LOCK_UN);
+    ::close(lfd);
+    if (newer && ok)
+        m_auth->refresh();
+    return ok ? st::ok : st::io_error;
+}
 
 void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::pair<std::string, std::string>>& fields,
                          std::string_view action, const auth_verdict& v)
@@ -116,9 +162,10 @@ void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::
         fail(500, "ServiceFailure", "The IAM file could not be locked.");
         return;
     }
-    std::string text, err;
+    std::string text, err, doc;
     iam_state st;
     iam_result res;
+    int64_t rev = 0;
     if (!read_all(file, text) || !iam_parse(text, st, err))
     {
         LOG_WARN(("storage: the IAM file " + file + " is not read: " + err).c_str());
@@ -133,12 +180,18 @@ void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::
         res = iam_apply(st, action, fields, now_ms, c->req.request_id,
                         [](void* a, std::string_view id) { return static_cast<authenticator*>(a)->file_user(id); },
                         m_auth);
-        if (res.ok && res.changed && !replace_file(file, iam_json(st)))
+        // A node of a cluster notes when the document changed, so the one changed last is every node's.
+        if (res.ok && res.changed)
         {
-            res.ok = false;
-            res.status = 500;
-            res.code = "ServiceFailure";
-            res.message = "The IAM file could not be written.";
+            doc = iam_json(st);
+            rev = std::max(now_ms, read_rev(file) + 1);
+            if (!replace_file(file, doc) || (m_repl.has_nodes() && !replace_file(file + ".rev", std::to_string(rev))))
+            {
+                res.ok = false;
+                res.status = 500;
+                res.code = "ServiceFailure";
+                res.message = "The IAM file could not be written.";
+            }
         }
     }
     ::flock(lfd, LOCK_UN);
@@ -150,7 +203,24 @@ void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::
         fail(res.status, res.code, res.message);
         return;
     }
-    answer(200, std::move(res.xml));
+    if (!res.changed || !m_repl.enqueue_nodes({'i', {}, {}, {}, {}, encode_cluster_record({'i', std::to_string(rev), 0,
+                                                                                            std::move(doc), {}})}))
+    {
+        answer(200, std::move(res.xml));
+        return;
+    }
+    // The other nodes' copy is durable before the admin hears the change was made.
+    std::weak_ptr<conn> weak = c;
+    m_repl.sync([this, weak, xml = std::move(res.xml)]() mutable
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        response resp;
+        resp.headers.emplace_back("Content-Type", "text/xml");
+        resp.body = std::move(xml);
+        send_response(cc, std::move(resp));
+    });
 }
 
 }   // namespace socketley::storage

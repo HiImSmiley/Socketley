@@ -42,11 +42,13 @@ inline constexpr std::string_view cluster_legal_hold_header = "x-socketley-clust
 inline constexpr std::string_view cluster_query = "x-socketley-cluster";
 inline constexpr uint64_t         cluster_max_body = 2u << 20;
 
-// A change no S3 request makes as it was made: a bucket made with its owner, removed, or a document of it set, and a
-// version's retention or legal hold changed past what S3 allows a client.
+// A change no S3 request makes as it was made: a bucket made with its owner, removed, or a document of it set, a
+// version's retention or legal hold changed past what S3 allows a client, the IAM API's users, groups and roles, and
+// the share links.
 struct cluster_record
 {
-    // 'c' made, 'r' removed, 'd' a document set or removed, 'l' a version's lock.
+    // 'c' made, 'r' removed, 'd' a document set or removed, 'l' a version's lock, 'i' the IAM document, its revision
+    // in `owner`, and 'h' a share link, its id in `owner` and nothing for one revoked.
     char        kind{0};
     std::string owner;
     // A document's kind as bucket_doc numbers it, or a lock's as header_change::kind does.

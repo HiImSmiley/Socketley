@@ -161,6 +161,8 @@ bool storage_run::open(std::string& err)
     recovery_report rep;
     if (!m_store.open(err, &rep))
         return false;
+    if (m_store.mirror() && !m_store.open_removed(err))
+        return false;
     if (!m_mpu.open(err))
         return false;
     const auto made = [this](std::string_view check)
@@ -171,6 +173,8 @@ bool storage_run::open(std::string& err)
     if (!m_notify.open(m_store.options().dir, m_store.shard(), made, err))
         return false;
     if (!m_repl.open(m_store.options().dir, m_store.shard(), made, err))
+        return false;
+    if (!m_cluster_self.empty() && !load_cluster_id(err))
         return false;
     reap_uploads();
     LOG_INFO(("storage: " + std::to_string(rep.buckets) + " bucket(s), " +

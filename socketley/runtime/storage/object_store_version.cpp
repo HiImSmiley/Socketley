@@ -10,14 +10,17 @@
 // written by the key's owner under its lane, so the files alone say everything.
 #include "object_store.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 
 #include <fcntl.h>
+#include <unistd.h>
 
 #include "disk_chain.h"
+#include "../../shared/byte_codec.h"
 #include "s3_notify.h"
 #include "../../shared/logging.h"
 #include "../../shared/random_id.h"
@@ -741,6 +744,39 @@ st object_store::cluster_verdict(const bucket& b, const std::string& key, const 
     return removed_at(b.name, key, s.tag.id) > 0 ? st::precondition_failed : st::ok;
 }
 
+size_t object_store::keys_after(std::string_view name, std::string_view after, size_t limit,
+                                const std::function<void(const std::string& key,
+                                                         const std::vector<const object_meta*>& versions)>& fn) const
+{
+    const bucket* b = find_bucket(name);
+    if (!b || limit == 0)
+        return 0;
+    // The keys of `objects` and of `versions` merged in order, a key in both handed out once with all it has.
+    auto o = after.empty() ? b->objects.begin() : b->objects.upper_bound(after);
+    auto v = after.empty() ? b->versions.begin() : b->versions.upper_bound(after);
+    size_t n = 0;
+    std::vector<const object_meta*> all;
+    while (n < limit && (o != b->objects.end() || v != b->versions.end()))
+    {
+        const bool take_o = o != b->objects.end() && (v == b->versions.end() || o->first <= v->first);
+        const bool take_v = v != b->versions.end() && (o == b->objects.end() || v->first <= o->first);
+        const std::string& key = take_o ? o->first : v->first;
+        all.clear();
+        if (take_o)
+            all.push_back(&o->second);
+        if (take_v)
+            for (const object_meta& m : v->second)
+                all.push_back(&m);
+        fn(key, all);
+        ++n;
+        if (take_o)
+            ++o;
+        if (take_v)
+            ++v;
+    }
+    return n;
+}
+
 namespace
 {
 
@@ -776,7 +812,103 @@ void object_store::note_removed(const std::string& bucket, const std::string& ke
     auto& [at, noted] = m_removed[k];
     at    = std::max(at, when_ms);
     noted = now;
+    if (m_removed_fd >= 0)
+    {
+        // Unsynced: what a crash takes was sent the other nodes anyway, from the outbox, and is only a later write's
+        // judge here.
+        bytes::writer one;
+        one.bytes(k);
+        one.u64(static_cast<uint64_t>(at));
+        one.u64(static_cast<uint64_t>(noted));
+        bytes::writer w;
+        w.bytes(one.take());
+        const std::string rec = w.take();
+        if (::write(m_removed_fd, rec.data(), rec.size()) != static_cast<ssize_t>(rec.size())) {}
+        // Written whole again once it holds as many stale records as live ones.
+        if (++m_removed_appends > 2 * m_removed.size() + 10000)
+            write_removed();
+    }
     m_removed_order.emplace_back(now, std::move(k));
+}
+
+bool object_store::write_removed()
+{
+    const std::string path = m_opts.dir + "/.removed." + std::to_string(m_opts.shard);
+    bytes::writer w;
+    for (const auto& [k, v] : m_removed)
+    {
+        bytes::writer one;
+        one.bytes(k);
+        one.u64(static_cast<uint64_t>(v.first));
+        one.u64(static_cast<uint64_t>(v.second));
+        w.bytes(one.take());
+    }
+    const std::string text = w.take();
+    const std::string tmp = path + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return false;
+    const bool whole = ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
+    ::close(fd);
+    if (!whole || ::rename(tmp.c_str(), path.c_str()) < 0)
+        return false;
+    if (m_removed_fd >= 0)
+        ::close(m_removed_fd);
+    m_removed_fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
+    m_removed_appends = 0;
+    return m_removed_fd >= 0;
+}
+
+bool object_store::open_removed(std::string& err)
+{
+    const std::string path = m_opts.dir + "/.removed." + std::to_string(m_opts.shard);
+    std::string text;
+    if (const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0)
+    {
+        char buf[65536];
+        for (ssize_t n; (n = ::read(fd, buf, sizeof buf)) > 0;)
+            text.append(buf, static_cast<size_t>(n));
+        ::close(fd);
+    }
+    // Records torn by a crash end the file; those older than a day are let go.
+    const int64_t now = static_cast<int64_t>(now_ms());
+    std::vector<std::pair<int64_t, std::string>> order;
+    bytes::reader all(text);
+    for (std::string rec; all.bytes(rec, 16384);)
+    {
+        bytes::reader r(rec);
+        std::string k;
+        uint64_t when = 0, noted = 0;
+        if (!r.bytes(k, 8192) || !r.u64(when) || !r.u64(noted) ||
+            static_cast<int64_t>(noted) + removed_keep_ms < now)
+            continue;
+        auto& [w, n] = m_removed[k];
+        w = std::max(w, static_cast<int64_t>(when));
+        n = std::max(n, static_cast<int64_t>(noted));
+    }
+    for (const auto& [k, v] : m_removed)
+        order.emplace_back(v.second, k);
+    std::sort(order.begin(), order.end());
+    m_removed_order.assign(order.begin(), order.end());
+    if (!write_removed())
+    {
+        err = "the removals this node noted cannot be kept in " + path;
+        return false;
+    }
+    return true;
+}
+
+void object_store::each_removed(const std::function<void(const std::string& bucket, const std::string& key,
+                                                         const std::string& id, int64_t when_ms)>& fn) const
+{
+    for (const auto& [k, v] : m_removed)
+    {
+        const size_t a = k.find('\0');
+        const size_t b = k.find('\0', a + 1);
+        if (a == std::string::npos || b == std::string::npos)
+            continue;
+        fn(k.substr(0, a), k.substr(a + 1, b - a - 1), k.substr(b + 1), v.first);
+    }
 }
 
 int64_t object_store::removed_at(const std::string& bucket, const std::string& key, std::string_view id) const

@@ -3,8 +3,60 @@
 
 #include "cluster.h"
 
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#include "../../shared/random_id.h"
+
 namespace socketley::storage
 {
+
+bool storage_run::load_cluster_id(std::string& err)
+{
+    // Made once, by whichever shard comes first, and new whenever the data is: what tells the other nodes to send all.
+    const std::string path = m_store.options().dir + "/.cluster-id";
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        if (const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0)
+        {
+            char buf[64];
+            const ssize_t n = ::read(fd, buf, sizeof buf);
+            ::close(fd);
+            std::string id(buf, n > 0 ? static_cast<size_t>(n) : 0);
+            while (!id.empty() && (id.back() == '\n' || id.back() == '\r'))
+                id.pop_back();
+            if (id.size() == 32 && id.find_first_not_of("0123456789abcdef") == std::string::npos)
+            {
+                m_cluster_id = std::move(id);
+                return true;
+            }
+        }
+        char hex_id[40];
+        std::snprintf(hex_id, sizeof hex_id, "%016llx%016llx\n", static_cast<unsigned long long>(random_u64()),
+                      static_cast<unsigned long long>(random_u64()));
+        const std::string id = hex_id;
+        const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0)
+            break;
+        const bool whole = ::write(fd, id.data(), id.size()) == static_cast<ssize_t>(id.size()) && ::fsync(fd) == 0;
+        ::close(fd);
+        // The first shard's id stays, and a later one reads it.
+        if (!whole || ::link(tmp.c_str(), path.c_str()) < 0)
+            if (errno != EEXIST)
+            {
+                ::unlink(tmp.c_str());
+                break;
+            }
+        ::unlink(tmp.c_str());
+    }
+    err = "the cluster id of this node's data in " + path + " can be neither read nor made";
+    return false;
+}
 
 void storage_run::set_cluster(cluster_config cfg)
 {
@@ -12,6 +64,14 @@ void storage_run::set_cluster(cluster_config cfg)
     m_repl.set_nodes(std::move(cfg.peers));
     m_store.set_mirror(true);
     // A bucket's change is in the outbox before its client hears it was made.
+    // A node being sent everything gets the IAM document and the share links first.
+    m_repl.set_seed_first([this]()
+    {
+        std::vector<std::string> out = share_records();
+        if (std::string iam = iam_record(); !iam.empty())
+            out.insert(out.begin(), std::move(iam));
+        return out;
+    });
     m_node.set_bucket_listener([this](char kind, const std::string& bucket, const std::string& owner, uint8_t doc,
                                       const std::string& xml, std::function<void()> then)
     {
@@ -66,13 +126,19 @@ bool storage_run::cluster_mark(const std::shared_ptr<conn>& c, object_meta& m, s
 void storage_run::op_cluster(const std::shared_ptr<conn>& c)
 {
     const s3_request& q = c->req;
-    if (!c->cluster)
+    if (!c->cluster || m_cluster_id.empty())
     {
         send_error(c, make_error("AccessDenied"));
         return;
     }
+    if (q.method == "GET")
+    {
+        app_reply(c, 200, m_cluster_id + "\n", "text/plain");
+        return;
+    }
     cluster_record rec;
     if (!decode_cluster_record(c->body, rec) || (rec.kind == 'l') == q.key.empty() ||
+        (rec.kind == 'i' || rec.kind == 'h') != q.bucket.empty() ||
         (rec.kind == 'd' && rec.what >= std::size(all_bucket_docs)) ||
         (rec.kind == 'l' && rec.what != static_cast<uint8_t>(header_change::kind::retention) &&
          rec.what != static_cast<uint8_t>(header_change::kind::legal_hold)))
@@ -107,6 +173,12 @@ void storage_run::op_cluster(const std::shared_ptr<conn>& c)
             return;
         case 'd':
             m_node.set_doc(static_cast<bucket_doc>(rec.what), q.bucket, std::move(rec.value), answer, true);
+            return;
+        case 'i':
+            answer(iam_take(std::atoll(rec.owner.c_str()), rec.value));
+            return;
+        case 'h':
+            answer(share_take(rec.owner, rec.value));
             return;
         default:
         {

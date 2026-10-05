@@ -550,6 +550,8 @@ public:
     const replicator& replication() const { return m_repl; }
     // Makes this runtime a node of the cluster `cfg` names, before open().
     void set_cluster(cluster_config cfg);
+    // Reads the id of this node's data, or makes it; blocking, so it runs at open().
+    bool load_cluster_id(std::string& err);
     const std::string& cluster_self() const { return m_cluster_self; }
     // Uploads left open this many seconds are aborted; zero keeps them until they are.
     void set_mpu_expire_secs(uint32_t s)
@@ -872,6 +874,16 @@ public:
     bool cluster_mark(const std::shared_ptr<conn>& c, object_meta& m, s3_error& err);
     // Applies a record of a bucket's or a version's change another node sent.
     void op_cluster(const std::shared_ptr<conn>& c);
+    // The IAM document as a record for another node, empty for none, and one another node sent taken when it is the
+    // newer, in storage_iam.cpp; blocking, as an IAM change is.
+    std::string iam_record();
+    st iam_take(int64_t rev, const std::string& json);
+    // A share link made, counted or revoked (`json` empty) told to the other nodes, `then` once that is durable when
+    // given; one another node told taken, its downloads the larger count; and every link as records, in
+    // storage_share.cpp.
+    void share_sent(const std::string& id, std::string json, std::function<void()> then);
+    st share_take(const std::string& id, const std::string& json);
+    std::vector<std::string> share_records();
     // Who a request's change is told as: its user or "anonymous", and the client's address, left empty for a
     // bucket that sends no events.
     change_origin origin_of(const conn& c) const;
@@ -1028,8 +1040,9 @@ private:
     multipart_store   m_mpu;
     notifier          m_notify;
     replicator        m_repl;
-    // The name the cluster file gives this node, empty for a runtime that is no node of one.
+    // The name the cluster file gives this node, empty for a runtime that is no node of one, and the id of its data.
     std::string       m_cluster_self;
+    std::string       m_cluster_id;
     // Each change staged and not yet settled, by the ticket the store holds: its tickets in the two outboxes, and the
     // change itself when it was written PENDING and nothing was staged to copy it, which settle() then marks FAILED.
     struct staged_change

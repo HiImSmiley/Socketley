@@ -13,6 +13,7 @@
 #include <openssl/rand.h>
 
 #include <chrono>
+#include <map>
 #include <charconv>
 
 #include "digest.h"
@@ -39,6 +40,8 @@ struct share_link
     std::string pw_hash;
     uint64_t    max_downloads{0};
     uint64_t    downloads{0};
+    // In a cluster, each node's own count of the downloads, whose sum is `downloads`.
+    std::map<std::string, uint64_t> by_node;
     bool        upload{false};
     // The maker's label for the link.
     std::string note;
@@ -71,6 +74,19 @@ std::string share_json(const share_link& s)
     o += ",\"hash\":";
     jstr(o, s.pw_hash);
     o += ",\"max_downloads\":" + std::to_string(s.max_downloads) + ",\"downloads\":" + std::to_string(s.downloads);
+    if (!s.by_node.empty())
+    {
+        o += ",\"by_node\":{";
+        bool first = true;
+        for (const auto& [node, n] : s.by_node)
+        {
+            o += first ? "" : ",";
+            first = false;
+            jstr(o, node);
+            o += ":" + std::to_string(n);
+        }
+        o += "}";
+    }
     o += s.upload ? ",\"upload\":true" : ",\"upload\":false";
     o += ",\"note\":";
     jstr(o, s.note);
@@ -123,6 +139,9 @@ bool parse_share(std::string_view text, share_link& s)
     s.pw_hash = str_of(root, "hash");
     s.max_downloads = num_of(root, "max_downloads");
     s.downloads = num_of(root, "downloads");
+    if (const jvalue* by = member(root, "by_node"); by && by->k == jvalue::kind::object)
+        for (const auto& [node, v] : by->members)
+            s.by_node[node] = num_of(*by, node);
     s.upload = flag_of(root, "upload");
     s.note = str_of(root, "note");
     return !s.id.empty() && !s.bucket.empty();
@@ -319,7 +338,11 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
         }
         ::unlink(path.c_str());
         ::unlink((path + ".lock").c_str());
-        app_reply(c, 204);
+        share_sent(id, {}, [this, weak = std::weak_ptr<conn>(c)]()
+        {
+            if (auto cc = weak.lock(); cc && !cc->dead)
+                app_reply(cc, 204);
+        });
         return;
     }
     if (!share_open(c, id, s))
@@ -441,8 +464,17 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
             share_link now;
             if (read_text(path, text) && parse_share(text, now) && now.downloads < now.max_downloads)
             {
+                // A node of a cluster counts its own, which every node adds up with the others'.
+                if (!m_cluster_self.empty())
+                {
+                    if (now.by_node.empty() && now.downloads)
+                        now.by_node["-"] = now.downloads;
+                    ++now.by_node[m_cluster_self];
+                }
                 ++now.downloads;
                 allowed = write_text(path, share_json(now));
+                if (allowed)
+                    share_sent(id, share_json(now), {});
             }
             ::flock(fd, LOCK_UN);
         }
@@ -609,7 +641,84 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
         app_reply(c, 500, "The link could not be kept.\n");
         return;
     }
-    app_reply(c, 201, share_view_json(s), "application/json");
+    share_sent(s.id, share_json(s), [this, weak = std::weak_ptr<conn>(c), view = share_view_json(s)]() mutable
+    {
+        if (auto cc = weak.lock(); cc && !cc->dead)
+            app_reply(cc, 201, std::move(view), "application/json");
+    });
+}
+
+void storage_run::share_sent(const std::string& id, std::string json, std::function<void()> then)
+{
+    // A link made or revoked is on the other nodes' way before its maker hears so; a download's count is not waited for.
+    const bool queued = m_repl.enqueue_nodes({'i', {}, {}, {}, {}, encode_cluster_record({'h', id, 0, std::move(json), {}})});
+    if (!then)
+        return;
+    if (queued)
+        m_repl.sync(std::move(then));
+    else
+        then();
+}
+
+st storage_run::share_take(const std::string& id, const std::string& json)
+{
+    if (!valid_id(id))
+        return st::invalid_bucket_name;
+    const std::string dir  = m_store.options().dir + "/.shares";
+    const std::string path = dir + "/" + id + ".json";
+    if (json.empty())
+    {
+        ::unlink(path.c_str());
+        ::unlink((path + ".lock").c_str());
+        return st::ok;
+    }
+    share_link in;
+    if (!parse_share(json, in) || in.id != id)
+        return st::invalid_bucket_name;
+    if (::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST)
+        return st::io_error;
+    const int fd = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0 || ::flock(fd, LOCK_EX) < 0)
+    {
+        if (fd >= 0)
+            ::close(fd);
+        return st::io_error;
+    }
+    // Each node's count only grows, and the downloads are their sum.
+    std::string text;
+    share_link now;
+    if (read_text(path, text) && parse_share(text, now))
+        for (const auto& [node, n] : now.by_node)
+            in.by_node[node] = std::max(in.by_node[node], n);
+    if (!in.by_node.empty())
+    {
+        in.downloads = 0;
+        for (const auto& [node, n] : in.by_node)
+            in.downloads += n;
+    }
+    const bool ok = write_text(path, share_json(in));
+    ::flock(fd, LOCK_UN);
+    ::close(fd);
+    return ok ? st::ok : st::io_error;
+}
+
+std::vector<std::string> storage_run::share_records()
+{
+    std::vector<std::string> out;
+    const std::string dir = m_store.options().dir + "/.shares";
+    if (DIR* d = ::opendir(dir.c_str()))
+    {
+        while (dirent* e = ::readdir(d))
+        {
+            const std::string_view n = e->d_name;
+            std::string text;
+            share_link s;
+            if (n.ends_with(".json") && read_text(dir + "/" + std::string(n), text) && parse_share(text, s))
+                out.push_back(encode_cluster_record({'h', s.id, 0, std::move(text), {}}));
+        }
+        ::closedir(d);
+    }
+    return out;
 }
 
 }   // namespace socketley::storage

@@ -254,7 +254,7 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     if (app_request(c))
         return;
     // A request for temporary credentials is signed over its form, which is read before it is judged.
-    if (r.method == "POST" && r.bucket.empty())
+    if (r.method == "POST" && r.bucket.empty() && !r.has_query(cluster_query))
     {
         collect_body(c, sts_max_body);
         return;
@@ -388,7 +388,7 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
     const bool svc = q.bucket.empty();
     const bool bkt = !svc && q.key.empty();
     const std::string_view m = q.method;
-    if (m == "POST" && !svc && q.has_query(cluster_query))
+    if ((m == "POST" || (m == "GET" && svc)) && q.has_query(cluster_query))
     {
         op_cluster(c);
         return;

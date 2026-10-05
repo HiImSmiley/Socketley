@@ -751,6 +751,12 @@ public:
     // Every bucket's changes go to the sink, for a node of a cluster, which sends each to the other nodes.
     void set_mirror(bool on) { m_mirror = on; }
     bool mirror() const { return m_mirror; }
+    // Reads back the removals this shard noted in the last day, from <dir>/.removed.<shard>, and goes on noting them
+    // there; blocking, so it runs at open.
+    bool open_removed(std::string& err);
+    // Every removal noted and still kept: the bucket, the key, the version id (empty for a key's), and when.
+    void each_removed(const std::function<void(const std::string& bucket, const std::string& key, const std::string& id,
+                                               int64_t when_ms)>& fn) const;
     // Whether the change `n` describes is in the files, for a start deciding a staged event; blocking.
     bool change_on_disk(const change_note& n) const;
     // The bucket's replication configuration, null when it has none.
@@ -769,6 +775,13 @@ public:
     // Every version of `bucket` this shard indexes, the latest of each key and the others, delete markers included.
     void each_version(std::string_view bucket,
                       const std::function<void(const std::string& key, const object_meta& m)>& fn) const;
+    // Up to `limit` keys of `bucket` this shard indexes after `after`, in order, each with every version it has, delete
+    // markers included; the number handed to `fn`.
+    size_t keys_after(std::string_view bucket, std::string_view after, size_t limit,
+                      const std::function<void(const std::string& key, const std::vector<const object_meta*>& versions)>&
+                          fn) const;
+    // The text of every document bucket `name` has, as its files hold it; blocking, for a cluster's seeding of a node.
+    std::vector<std::pair<bucket_doc, std::string>> bucket_docs_text(std::string_view name) const;
 
     // ── Sharding ────────────────────────────────────────────────────────────
     uint32_t shard() const { return m_opts.shard; }
@@ -1225,9 +1238,14 @@ private:
     st quota_room(const bucket& b, uint64_t add, uint64_t held, bool grows) const;
     change_sink* m_sink{nullptr};
     bool         m_mirror{false};
-    // The removals note_removed() keeps, by bucket NUL key NUL id, each with when it was noted, and in that order.
+    // The removals note_removed() keeps, by bucket NUL key NUL id, each with when it was noted, and in that order; the
+    // file they are noted in, and how many were noted there since it was last written whole.
     std::unordered_map<std::string, std::pair<int64_t, int64_t>> m_removed;
     std::deque<std::pair<int64_t, std::string>> m_removed_order;
+    int          m_removed_fd{-1};
+    uint64_t     m_removed_appends{0};
+    // Writes the removals kept to the file whole, which then holds nothing else.
+    bool write_removed();
     // Stages the events and copies of a change of an object about to be made under its key's lane, 0 when the bucket
     // makes none.
     uint64_t stage_change(const bucket& b, const change_note& n);

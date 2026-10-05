@@ -1041,6 +1041,16 @@ uint64_t object_store::roll_forward_pooled(bucket& b, std::unordered_set<std::st
     return rolled;
 }
 
+std::vector<std::pair<bucket_doc, std::string>> object_store::bucket_docs_text(std::string_view name) const
+{
+    std::vector<std::pair<bucket_doc, std::string>> out;
+    const std::string base = m_opts.dir + "/" + std::string(name) + "/";
+    for (const bucket_doc kind : all_bucket_docs)
+        if (std::string xml = slurp(base + doc_file(kind), doc_max_bytes); !xml.empty())
+            out.emplace_back(kind, std::move(xml));
+    return out;
+}
+
 bool object_store::change_on_disk(const change_note& n) const
 {
     const std::string base = m_opts.dir + "/" + n.bucket;
@@ -1554,6 +1564,11 @@ void object_store::close(bool clean)
 {
     *m_alive = false;
     stop_syncer();
+    if (m_removed_fd >= 0)
+    {
+        ::close(m_removed_fd);
+        m_removed_fd = -1;
+    }
 
     // The marker only when nothing is half done, because a stop that left a
     // rename without its journal record is exactly what the next start must

@@ -529,6 +529,10 @@ std::string storage_instance::stats_lines() const
         << "cluster_sent:" << m_run->replication().counters().node_sent << "\n"
         << "cluster_failed:" << m_run->replication().counters().node_failed << "\n"
         << "cluster_in:" << m_run->counters().cluster_in << "\n"
+        << "cluster_seeds:" << m_run->replication().counters().node_seeds << "\n"
+        << "cluster_seeded:" << m_run->replication().counters().node_seeded << "\n"
+        << "cluster_seeding:" << m_run->replication().node_seeding() << "\n"
+        << "cluster_overflows:" << m_run->replication().counters().node_overflows << "\n"
         << "replication_bytes:" << m_run->replication().counters().bytes << "\n";
     // One line per code answered, so a client's mistakes and the runtime's own
     // are told apart without reading a log.

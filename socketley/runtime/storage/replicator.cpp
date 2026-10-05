@@ -4,12 +4,16 @@
 #include <cstdlib>
 #include <ctime>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "body_reader.h"
-#include "cluster.h"
 #include "checksum.h"
+#include "cluster.h"
 #include "s3_names.h"
 #include "s3_tagging.h"
 #include "../../shared/byte_codec.h"
+#include "../../shared/http_framing.h"
 #include "../../shared/logging.h"
 #include "../../shared/s3_sigv4.h"
 
@@ -72,6 +76,40 @@ std::string describe(const http_answer& a)
     return d;
 }
 
+// The bytes of `s` in hex, and back, empty for text that is not hex.
+std::string hex_of(std::string_view s)
+{
+    return hex(reinterpret_cast<const uint8_t*>(s.data()), s.size());
+}
+
+std::string unhex(std::string_view h)
+{
+    std::string out;
+    if (h.size() % 2)
+        return out;
+    const auto digit = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
+    for (size_t i = 0; i < h.size(); i += 2)
+    {
+        const int a = digit(h[i]), b = digit(h[i + 1]);
+        if (a < 0 || b < 0)
+            return {};
+        out.push_back(static_cast<char>(a << 4 | b));
+    }
+    return out;
+}
+
+// Writes `text` beside `path` and renames it over, unsynced, for a note a crash may take back to an older one.
+bool replace_note(const std::string& path, const std::string& text)
+{
+    const std::string tmp = path + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return false;
+    const bool whole = ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
+    ::close(fd);
+    return whole && ::rename(tmp.c_str(), path.c_str()) == 0;
+}
+
 // What a change sent to another node is, for the log.
 std::string node_change_name(char kind, bool has_version)
 {
@@ -83,6 +121,7 @@ std::string node_change_name(char kind, bool has_version)
         case 'd': return "its removal";
         case 'x': return "a version's removal";
         case 'l': return "a version's lock";
+        case 'i': return "a record of the runtime's own";
         default:  return "the bucket's change";
     }
 }
@@ -193,6 +232,8 @@ replicator::replicator(event_loop& loop, file_io& io, io_handler* owner, object_
 {
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_REPLICATION_HOSTS"))
         m_hosts_file = e;
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_CLUSTER_QUEUE"))
+        m_node_queue_max = std::max<size_t>(std::strtoul(e, nullptr, 10), 1);
 }
 
 replicator::~replicator()
@@ -292,6 +333,8 @@ bool replicator::open(const std::string& dir, uint32_t shard, const outbox::chan
 {
     if (m_lanes.empty())
         return true;
+    m_dir   = dir;
+    m_shard = shard;
     uint64_t dropped = 0, again = 0;
     const bool ok = m_box.open(dir, ".replicate", shard, made, [&](uint64_t id, std::string_view payload)
     {
@@ -305,7 +348,7 @@ bool replicator::open(const std::string& dir, uint32_t shard, const outbox::chan
             ++dropped;
             return false;
         }
-        const bool node = std::string_view("pmgdxlb").find(static_cast<char>(kind)) != std::string_view::npos;
+        const bool node = std::string_view("pmgdxlbsi").find(static_cast<char>(kind)) != std::string_view::npos;
         const bool read = node ? r.bytes(t.bucket, 4096) && r.bytes(t.key, 4096) && r.bytes(t.version_id, 4096) &&
                                      r.bytes(t.stamp, 4096) && r.bytes(t.tags, max_record_bytes)
                                : r.bytes(t.bucket, 4096) && r.bytes(t.key, 4096) && r.bytes(t.version_id, 4096) &&
@@ -361,7 +404,14 @@ bool replicator::open(const std::string& dir, uint32_t shard, const outbox::chan
         LOG_INFO(("storage: " + std::to_string(again) + " replication(s) from the outbox and " + std::to_string(swept) +
                   " pending version(s) are copied again").c_str());
     for (auto& l : m_lanes)
+    {
+        if (l->target.node)
+            load_seed(*l);
         start(*l);
+    }
+    // A node is asked for its data's id at the first tick, and every so often after.
+    if (m_nodes)
+        arm_timer();
     return true;
 }
 
@@ -541,6 +591,8 @@ void replicator::settle(uint64_t ticket, bool made, std::function<void()> then)
 
 void replicator::push(lane& l, task t, bool from_outbox)
 {
+    if (l.seed && l.q.size() >= m_node_queue_max)
+        overflow(l);
     if (!from_outbox)
         t.id = m_box.add(encode_task(l, t));
     m_node_pending += t.node_kind ? 1 : 0;
@@ -572,6 +624,16 @@ void replicator::on_timer()
         lane& l = *lp;
         for (auto& p : l.peers)
             p->tick(now);
+        if (l.seed)
+        {
+            seeding& sd = *l.seed;
+            sd.probe->tick(now);
+            if (!sd.asking && now >= sd.next_ask)
+                ask_id(l);
+            if (sd.confirmed && !sd.done && !sd.saving && l.q.size() < std::min(seed_low, m_node_queue_max / 2))
+                seed_more(l);
+            waiting = true;
+        }
         if (!l.q.empty() && now >= l.next_try)
             start(l);
         waiting = waiting || !l.active.empty() || !l.q.empty();
@@ -596,7 +658,7 @@ void replicator::start(lane& l)
     std::string name;
     for (auto it = l.q.begin(); it != l.q.end() && l.active.size() < lane_width && scanned < lane_scan; ++scanned)
     {
-        const bool barrier = it->node_kind == 'b';
+        const bool barrier = it->node_kind == 'b' || it->node_kind == 'i';
         if (l.barrier || (barrier && !l.active.empty()))
             break;
         name = version_key(it->bucket, it->key, {});
@@ -778,7 +840,8 @@ replicator::outcome replicator::judge_node(task& t, const http_answer& a)
 {
     const std::string code = element_text(a.body, "Code");
     // The node has the change or a newer one, or nothing a removal, a tag or a lock could change.
-    if (a.status == 412 || (a.status == 404 && code != "NoSuchBucket" && t.node_kind != 'p' && t.node_kind != 'b'))
+    if (a.status == 412 ||
+        (a.status == 404 && code != "NoSuchBucket" && t.node_kind != 'p' && t.node_kind != 's' && t.node_kind != 'b'))
         return outcome::done;
     // A bucket that is not made yet, or not emptied yet, waits for the change another lane carries, but not forever.
     if (a.status == 404 || a.status == 409)
@@ -929,6 +992,33 @@ void replicator::run_node(lane& l, const std::shared_ptr<job>& j)
         case 'p':
             run_put(l, j);
             return;
+        case 's':
+        {
+            // A node being sent everything is asked first whether it has the version, or the object's bytes.
+            rq.head = signed_head(l, "HEAD", path, t.version_id.empty() ? std::string()
+                                                                        : "versionId=" + url_encode(t.version_id, false),
+                                  {}, 0);
+            rq.head_only = true;
+            exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>& jj, http_answer a)
+            {
+                if (a.status == 200)
+                {
+                    const object_meta* m = jj->t.version_id.empty() ? m_store.find(jj->t.bucket, jj->t.key) : nullptr;
+                    if (!jj->t.version_id.empty() || (m && http_trim_ows(a.header("etag")) == "\"" + m->etag() + "\""))
+                    {
+                        ended(lp, jj, outcome::done, 0);
+                        return;
+                    }
+                }
+                if (a.status == 200 || a.status == 404)
+                {
+                    run_put(lp, jj);
+                    return;
+                }
+                ended(lp, jj, judge_node(jj->t, a), 0);
+            });
+            return;
+        }
         case 'm':
         case 'd':
             rq.head = signed_head(l, "DELETE", path, {}, {{std::string(cluster_stamp_header), t.stamp}}, 0);
@@ -1291,6 +1381,228 @@ void replicator::mpu_abort(lane& l, const std::shared_ptr<job>& j, outcome o)
     });
 }
 
+// ─── Sending a node everything ──────────────────────────────────────────────
+
+void replicator::overflow(lane& l)
+{
+    LOG_WARN(("storage: the cluster node " + l.target.name + " is " + std::to_string(l.q.size()) +
+              " changes behind, so they are let go and it is sent everything this shard holds once it answers").c_str());
+    for (const task& t : l.q)
+        m_box.done(t.id);
+    m_pending -= l.q.size();
+    m_node_pending -= l.q.size();
+    l.q.clear();
+    ++m_c.node_overflows;
+    seeding& sd = *l.seed;
+    sd.buckets   = false;
+    sd.done      = false;
+    sd.keys_done = false;
+    sd.confirmed = false;
+    sd.next_ask  = {};
+    sd.removals.clear();
+    sd.bucket.clear();
+    sd.key.clear();
+    save_seed(l);
+}
+
+std::string replicator::seed_path(const lane& l) const
+{
+    return m_dir + "/.replicate/seed." + std::to_string(m_shard) + "." + l.target.name;
+}
+
+void replicator::load_seed(lane& l)
+{
+    l.seed = std::make_unique<seeding>();
+    l.seed->probe = new_peer(l.target);
+    std::string text;
+    if (std::string why; !read_targets_file(seed_path(l), "seeding", text, why))
+        return;
+    // Lines of `name value`, the bucket and key in hex, since a key may hold any byte.
+    for (const target_line& line : split_target_lines(text))
+    {
+        if (line.fields.size() != 2)
+            continue;
+        const std::string_view name = line.fields[0], value = line.fields[1];
+        if (name == "id")
+            l.seed->id = value == "-" ? std::string() : std::string(value);
+        else if (name == "buckets")
+            l.seed->buckets = value == "1";
+        else if (name == "done")
+            l.seed->done = value == "1";
+        else if (name == "bucket")
+            l.seed->bucket = value == "-" ? std::string() : unhex(value);
+        else if (name == "key")
+            l.seed->key = value == "-" ? std::string() : unhex(value);
+    }
+}
+
+void replicator::save_seed(const lane& l)
+{
+    const seeding& sd = *l.seed;
+    const std::string text = "id " + (sd.id.empty() ? std::string("-") : sd.id) + "\nbuckets " + (sd.buckets ? "1" : "0") +
+                             "\ndone " + (sd.done ? "1" : "0") + "\nbucket " +
+                             (sd.bucket.empty() ? std::string("-") : hex_of(sd.bucket)) + "\nkey " +
+                             (sd.key.empty() ? std::string("-") : hex_of(sd.key)) + "\n";
+    // A note lost to a crash sends the node again what it already has, which it then refuses as had.
+    if (!replace_note(seed_path(l), text))
+        LOG_WARN(("storage: how far the cluster node " + l.target.name + " was sent everything could not be noted").c_str());
+}
+
+void replicator::ask_id(lane& l)
+{
+    seeding& sd = *l.seed;
+    sd.asking = true;
+    std::string path = l.target.http.path;
+    while (!path.empty() && path.back() == '/')
+        path.pop_back();
+    http_request rq;
+    rq.head = signed_head(l, "GET", path + "/", std::string(cluster_query) + "=", {}, 0);
+    rq.answer_secs = ask_every_secs;
+    auto alive = m_alive;
+    lane* lp   = &l;
+    sd.probe->exchange(std::move(rq), [this, alive, lp](http_answer a)
+    {
+        if (!*alive || m_stopped)
+            return;
+        seeding& s = *lp->seed;
+        s.asking   = false;
+        std::string id = a.body;
+        while (!id.empty() && (id.back() == '\n' || id.back() == '\r'))
+            id.pop_back();
+        const bool ok = a.status == 200 && id.size() == 32 &&
+                        id.find_first_not_of("0123456789abcdef") == std::string::npos;
+        s.next_ask = std::chrono::steady_clock::now() + std::chrono::seconds(ok ? ask_every_secs : ask_retry_secs);
+        if (!ok)
+            return;
+        // A node whose data this shard never sent everything to, a new one or one that began again empty, is sent it.
+        if (id != s.id)
+        {
+            LOG_INFO(("storage: the cluster node " + lp->target.name + " holds data this shard has not sent all it has "
+                      "to, so it is sent everything").c_str());
+            s.id        = id;
+            s.buckets   = false;
+            s.done      = false;
+            s.keys_done = false;
+            s.removals.clear();
+            s.bucket.clear();
+            s.key.clear();
+            ++m_c.node_seeds;
+            save_seed(*lp);
+        }
+        s.confirmed = true;
+    });
+}
+
+void replicator::seed_more(lane& l)
+{
+    seeding& sd = *l.seed;
+    // A bucket's change goes before its keys, from shard 0 alone, since every shard has the bucket's documents.
+    if (!sd.buckets)
+    {
+        if (m_shard == 0 && m_seed_first)
+            for (std::string& first : m_seed_first())
+                push(l, node_task({'i', {}, {}, {}, {}, std::move(first)}), false);
+        if (m_shard == 0)
+        {
+            auto all = m_store.buckets();
+            std::sort(all.begin(), all.end(), [](const bucket_info& a, const bucket_info& b) { return a.name < b.name; });
+            for (const bucket_info& b : all)
+            {
+                push(l, node_task({'b', b.name, {}, {}, {}, encode_cluster_record({'c', b.owner, 0, {}, {}})}), false);
+                for (auto& [kind, xml] : m_store.bucket_docs_text(b.name))
+                    push(l, node_task({'b', b.name, {}, {}, {},
+                                       encode_cluster_record({'d', {}, static_cast<uint8_t>(kind), std::move(xml), {}})}),
+                         false);
+            }
+        }
+        sd.buckets = true;
+    }
+    auto all = m_store.buckets();
+    std::sort(all.begin(), all.end(), [](const bucket_info& a, const bucket_info& b) { return a.name < b.name; });
+    // A batch stays well inside the queue's bound, so a seeding never lets go of itself.
+    const size_t batch = std::clamp<size_t>(m_node_queue_max / 4, 1, seed_batch);
+    size_t queued = 0;
+    for (const bucket_info& b : all)
+    {
+        if (sd.keys_done)
+            break;
+        if (b.name < sd.bucket)
+            continue;
+        const std::string after = b.name == sd.bucket ? sd.key : std::string();
+        queued += m_store.keys_after(b.name, after, batch - queued,
+                                     [&](const std::string& key, const std::vector<const object_meta*>& versions)
+        {
+            for (const object_meta* m : versions)
+            {
+                cluster_change c;
+                c.bucket = b.name;
+                c.key    = key;
+                if (is_delete_marker(*m))
+                {
+                    c.kind       = 'm';
+                    c.version_id = version_of(*m).id;
+                    c.stamp      = cluster_stamp_text({version_of(*m), m->mtime_ms});
+                }
+                else
+                {
+                    c.kind       = 's';
+                    c.version_id = has_version(*m) ? version_of(*m).id : std::string();
+                }
+                push(l, node_task(c), false);
+                ++m_c.node_seeded;
+            }
+            sd.bucket = b.name;
+            sd.key    = key;
+        });
+        if (queued >= batch)
+            break;
+    }
+    // Last, what this shard removed in the last day, which the node may still hold, a batch at a time.
+    if (!sd.keys_done && queued < batch)
+    {
+        sd.keys_done = true;
+        m_store.each_removed([&](const std::string& bucket, const std::string& key, const std::string& id, int64_t when)
+        {
+            // A removal in a bucket removed since is no node's to make.
+            if (!m_store.has_bucket(bucket))
+                return;
+            cluster_change c;
+            c.bucket = bucket;
+            c.key    = key;
+            if (id.empty())
+            {
+                c.kind  = 'd';
+                c.stamp = cluster_stamp_text({{static_cast<uint64_t>(when) * 1000, "null", false}, when});
+            }
+            else
+            {
+                c.kind       = 'x';
+                c.version_id = id;
+            }
+            sd.removals.push_back(std::move(c));
+        });
+    }
+    while (sd.keys_done && queued < batch && !sd.removals.empty())
+    {
+        push(l, node_task(sd.removals.back()), false);
+        sd.removals.pop_back();
+        ++queued;
+    }
+    sd.done   = sd.keys_done && sd.removals.empty();
+    sd.saving = true;
+    auto alive = m_alive;
+    lane* lp   = &l;
+    m_box.sync([this, alive, lp]()
+    {
+        if (!*alive)
+            return;
+        lp->seed->saving = false;
+        save_seed(*lp);
+        if (lp->seed->done)
+            LOG_INFO(("storage: everything this shard holds is queued for the cluster node " + lp->target.name).c_str());
+    });
+}
+
 void replicator::stop()
 {
     if (m_stopped)
@@ -1300,6 +1612,8 @@ void replicator::stop()
     {
         for (auto& p : l->peers)
             p->stop();
+        if (l->seed)
+            l->seed->probe->stop();
         for (auto& j : l->active)
         {
             if (j->fd >= 0)

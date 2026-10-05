@@ -48,7 +48,8 @@ struct replication_target
 struct cluster_change
 {
     // 'p' a version or object, 'm' a delete marker, 'g' its tags, 'd' an object of a bucket that keeps no versions
-    // removed, 'x' a version removed for good, 'l' a version's lock, 'b' a bucket made, removed or configured.
+    // removed, 'x' a version removed for good, 'l' a version's lock, 'b' a bucket made, removed or configured, and 'i' a
+    // record of the runtime's own, its IAM document or a share link.
     char        kind{0};
     std::string bucket;
     std::string key;
@@ -77,6 +78,11 @@ struct replication_counters
     // Changes another node of the cluster took, and those it refused for good, which the four above do not count.
     uint64_t node_sent{0};
     uint64_t node_failed{0};
+    // Versions and objects queued for a node whose data is new to this shard, and the nodes it began to send all to.
+    uint64_t node_seeded{0};
+    uint64_t node_seeds{0};
+    // Times a node fell so far behind that its queue was let go, to be sent everything once it answers again.
+    uint64_t node_overflows{0};
 };
 
 class replicator
@@ -103,6 +109,8 @@ public:
     bool has_target(std::string_view name) const;
     // The other nodes of the cluster, each a target every change is sent to.
     void set_nodes(std::vector<replication_target> nodes);
+    // The runtime's own records a node being sent everything gets before the buckets.
+    void set_seed_first(std::function<std::vector<std::string>()> fn) { m_seed_first = std::move(fn); }
     bool has_nodes() const { return m_nodes > 0; }
 
     // Opens the shard's outbox under `dir`, queues again what it holds, and queues every version of a replicated
@@ -143,6 +151,14 @@ public:
     // Versions and delete markers waiting to be copied, across every target, and changes waiting for another node.
     uint64_t pending() const { return m_pending - m_node_pending; }
     uint64_t node_pending() const { return m_node_pending; }
+    // The nodes this shard has not yet queued all it holds for, or not yet asked whether they need it.
+    uint64_t node_seeding() const
+    {
+        uint64_t n = 0;
+        for (const auto& l : m_lanes)
+            n += l->seed && !l->seed->done ? 1 : 0;
+        return n;
+    }
     // Connections made to every target, and requests that went on one kept from the request before.
     uint64_t connects() const;
     uint64_t reuses() const;
@@ -167,9 +183,30 @@ private:
         std::chrono::steady_clock::time_point waiting_since{};
     };
     struct job;
+    // What a shard has sent another node of everything it holds: the id of the node's data it was sent to, whether
+    // the buckets went and all did, and the last key queued, by bucket and key.
+    struct seeding
+    {
+        std::unique_ptr<http_peer> probe;
+        bool        asking{false};
+        // The node said this run that it holds the data `id` names.
+        bool        confirmed{false};
+        bool        saving{false};
+        std::chrono::steady_clock::time_point next_ask{};
+        std::string id;
+        bool        buckets{false};
+        bool        done{false};
+        std::string bucket;
+        std::string key;
+        // Past the last key, the removals still to queue, taken when the keys ran out and queued a batch at a time.
+        bool        keys_done{false};
+        std::vector<cluster_change> removals;
+    };
     // One target's queue, the copies it has in flight, each on a connection of its own, and its pause after a failure.
     struct lane
     {
+        // A node's: what this shard has sent it of everything it holds.
+        std::unique_ptr<seeding> seed;
         replication_target target;
         std::vector<std::unique_ptr<http_peer>> peers;
         std::deque<task> q;
@@ -211,6 +248,25 @@ private:
     void requeue(lane& l, const std::shared_ptr<job>& j);
     // Takes a copy out of its lane's flight.
     static void land(lane& l, const std::shared_ptr<job>& j);
+
+    // A node is asked for the id of its data this often, and sooner after it did not answer; the keys a seeding
+    // queues at a time, and how short a node's queue is before it queues more.
+    static constexpr int    ask_every_secs = 30;
+    static constexpr int    ask_retry_secs = 5;
+    static constexpr size_t seed_batch     = 500;
+    static constexpr size_t seed_low       = 1000;
+    // The most changes a node's queue holds in memory; past it they are let go and the node is sent everything.
+    // SOCKETLEY_STORAGE_CLUSTER_QUEUE, a test aid, makes it smaller.
+    size_t        m_node_queue_max{100000};
+    // Lets go of a node's queue, which a seeding of everything replaces.
+    void overflow(lane& l);
+    // Asks a node for the id of its data, and begins to send it everything when the id is new to this shard.
+    void ask_id(lane& l);
+    // Queues the next keys of everything this shard holds for a node, and notes how far it got once that is durable.
+    void seed_more(lane& l);
+    std::string seed_path(const lane& l) const;
+    void load_seed(lane& l);
+    void save_seed(const lane& l);
     void back_off(lane& l);
     void arm_timer();
     // Writes `status` into the version, and runs `then` with whether it was written or is moot.
@@ -274,6 +330,10 @@ private:
     bool          m_stopped{false};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
     outbox        m_box;
+    std::function<std::vector<std::string>()> m_seed_first;
+    // Where the outbox is, which a seeding's notes go beside.
+    std::string   m_dir;
+    uint32_t      m_shard{0};
 
     // One thread that resolves hosts, and the test aid's hosts file (SOCKETLEY_STORAGE_REPLICATION_HOSTS).
     hash_pool     m_resolver{1};
