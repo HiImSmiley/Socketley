@@ -11,7 +11,10 @@
 #     write, and a version that must go behind the latest
 #   * a version given another id on another node, so the lists differ
 #   * a node sending on what another node sent it, so changes go round
-#   * a change lost while a node is down
+#   * a change lost while a node is down, or while it is so far behind that
+#     its queue is let go, removals included; a removal forgotten by a restart
+#   * a node that joins a cluster holding data, or that began again empty, not
+#     sent everything: buckets, documents, versions, markers, locks, objects
 #   * a cluster file that does not parse taken, or its key shown
 # suite: isolated
 set -uo pipefail
@@ -24,6 +27,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_daemon.sh"
 
 daemon_isolate stgcluster
+# A node's queue lets go of what it holds past this, so the test reaches a node far behind with a few writes.
+export SOCKETLEY_STORAGE_CLUSTER_QUEUE=40
 
 PA=$((SL_PORT_BASE+1961))
 PB=$((SL_PORT_BASE+1963))
@@ -38,9 +43,9 @@ ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 
 cleanup() {
-    for r in cla clb clc clx; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
+    for r in cla clb clc cld clx; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
     sleep 0.3
-    for r in cla clb clc clx; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
+    for r in cla clb clc cld clx; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
     daemon_stop
 }
 trap cleanup EXIT
@@ -61,7 +66,7 @@ daemon_start "$BIN"
 
 T="$SOCKETLEY_TMPD"
 printf '[admin]\n%s:%s\nadmin = true\n' "$ADMIN_AK" "$ADMIN_SK" > "$T/creds"
-cluster_file() {   # self
+cluster_file() {   # self [joined]
     cat <<EOF
 # every node, this one included
 self $1
@@ -70,6 +75,7 @@ node clb http://127.0.0.1:$PB
 node clc http://127.0.0.1:$PC
 key AKIACLUSTERNODES0001 $NODE_SK
 EOF
+    [ -n "${2:-}" ] && echo "node cld http://127.0.0.1:$PX"
 }
 for n in cla clb clc; do cluster_file "$n" > "$T/$n.cluster"; done
 
@@ -98,11 +104,29 @@ else
     bad "show names the cluster file and not its key" "$shown"
 fi
 
-out=$(python3 "$HERE/lib_storage_cluster.py" "cla:$PA" "clb:$PB" "clc:$PC" 2>&1); rc=$?
-echo "$out" | grep -E '^  (PASS|FAIL)'
-p=$(echo "$out" | grep -c '^  PASS'); f=$(echo "$out" | grep -c '^  FAIL')
-PASS=$((PASS+p)); FAIL=$((FAIL+f)); TOTAL=$((TOTAL+p+f))
-[ "$rc" -ne 0 ] && [ "$f" -eq 0 ] && bad "the cluster half ran" "exit $rc: $out"
+run_lib() {   # label mode node...
+    local label=$1 out rc p f; shift
+    out=$(python3 "$HERE/lib_storage_cluster.py" "$@" 2>&1); rc=$?
+    echo "$out" | grep -E '^  (PASS|FAIL)'
+    p=$(echo "$out" | grep -c '^  PASS'); f=$(echo "$out" | grep -c '^  FAIL')
+    PASS=$((PASS+p)); FAIL=$((FAIL+f)); TOTAL=$((TOTAL+p+f))
+    [ "$rc" -ne 0 ] && [ "$f" -eq 0 ] && bad "$label" "exit $rc: $out"
+}
+run_lib "the cluster half ran" main "cla:$PA" "clb:$PB" "clc:$PC"
+
+# ── a fourth node joins, and a node begins again empty ─────────────────────
+run_lib "the data for the join was written" keep "cla:$PA" "clb:$PB" "clc:$PC"
+for n in cla clb clc cld; do cluster_file "$n" joined > "$T/$n.cluster"; done
+"$BIN" create storage cld -p "$PX" --dir "$T/d" --credentials "$T/creds" --cluster "$T/cld.cluster" -s >/dev/null 2>&1 ||
+    bad "the fourth node is made" "create failed"
+for n in cla clb clc; do "$BIN" stop "$n" >/dev/null 2>&1; "$BIN" start "$n" >/dev/null 2>&1; done
+wait_up "$PA" && wait_up "$PB" && wait_up "$PC" && wait_up "$PX" || bad "the four nodes come up" "no answer"
+run_lib "the join half ran" join "cla:$PA" "clb:$PB" "clc:$PC" "cld:$PX"
+"$BIN" stop clb >/dev/null 2>&1
+rm -rf "$T/b"
+"$BIN" start clb >/dev/null 2>&1
+wait_up "$PB" || bad "the emptied node comes up" "no answer on $PB"
+run_lib "the again half ran" same "cla:$PA" "clb:$PB"
 
 grep -q "$NODE_SK" "$SOCKETLEY_DLOG" && bad "no node key reaches the log" "$(grep -n "$NODE_SK" "$SOCKETLEY_DLOG")" \
     || ok "no node key reaches the log"
