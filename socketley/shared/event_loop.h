@@ -275,7 +275,7 @@ public:
     // io-wq worker, measured at 17 us against 1.2 us for a ready send -- so it
     // is right for server_instance's file serving and wrong for a proxy
     // relaying small messages.
-    bool submit_splice(int fd_in, int fd_out, uint32_t len, io_request* req);
+    bool submit_splice(int fd_in, int fd_out, uint32_t len, io_request* req, op_type type = op_splice);
 
     // Async file read using io_uring_prep_read, with req->fd set to the socket
     // for CQE dispatch routing.
@@ -297,7 +297,8 @@ public:
     bool submit_mkdirat(int dir, const char* path, mode_t mode, io_request* req, bool link = false);
     // A regular file at `offset` into a pipe, which is what a zero-copy send
     // starts with; the file's own position is not touched.
-    bool submit_splice_file(int file_fd, uint64_t offset, int pipe_wr, uint32_t len, io_request* req);
+    bool submit_splice_file(int file_fd, uint64_t offset, int pipe_wr, uint32_t len, io_request* req,
+                            op_type type = op_splice_file);
 
     // Room for `n` submissions without a submit in between, flushing what is
     // queued first when there is not, and false only when the ring is smaller.

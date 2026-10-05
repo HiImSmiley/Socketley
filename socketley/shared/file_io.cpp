@@ -92,6 +92,10 @@ bool file_io::submit(op* o)
             queued = m_loop->submit_connect(o->fd, reinterpret_cast<const struct sockaddr*>(&o->addr), o->addr_len,
                                             &o->req);
             break;
+        case op_io_splice:
+            queued = o->off == at_stream ? m_loop->submit_splice(o->fd, o->fd2, o->len, &o->req, op_io_splice)
+                                         : m_loop->submit_splice_file(o->fd, o->off, o->fd2, o->len, &o->req, op_io_splice);
+            break;
         default:
             break;
     }
@@ -246,6 +250,24 @@ bool file_io::pwrite(int fd, const char* buf, uint32_t len, uint64_t off, done c
     o->len = len;
     o->off = off;
     o->cb = std::move(cb);
+    if (!submit(o))
+    {
+        delete o;
+        return false;
+    }
+    m_live.insert(o);
+    return true;
+}
+
+bool file_io::splice(int fd_in, uint64_t off, int fd_out, uint32_t len, done cb)
+{
+    auto* o = new op;
+    o->kind = op_io_splice;
+    o->fd   = fd_in;
+    o->fd2  = fd_out;
+    o->off  = off;
+    o->len  = len;
+    o->cb   = std::move(cb);
     if (!submit(o))
     {
         delete o;

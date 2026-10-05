@@ -1954,7 +1954,7 @@ bool event_loop::submit_recv_multishot_bundle_fixed_file(int fixed_idx, uint16_t
     return true;
 }
 
-bool event_loop::submit_splice(int fd_in, int fd_out, uint32_t len, io_request* req)
+bool event_loop::submit_splice(int fd_in, int fd_out, uint32_t len, io_request* req, op_type type)
 {
     struct io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
@@ -1965,7 +1965,7 @@ bool event_loop::submit_splice(int fd_in, int fd_out, uint32_t len, io_request* 
     // against 0.72 us for a read from the same ready pipe.
     io_uring_prep_splice(sqe, fd_in, -1, fd_out, -1, len, SPLICE_F_MOVE);
     io_uring_sqe_set_data(sqe, req);
-    req->type = op_splice;
+    req->type = type;
     arm(req, raw_target(fd_in), raw_target(fd_out));
     return true;
 }
@@ -2080,14 +2080,15 @@ bool event_loop::submit_mkdirat(int dir, const char* path, mode_t mode, io_reque
     return true;
 }
 
-bool event_loop::submit_splice_file(int file_fd, uint64_t offset, int pipe_wr, uint32_t len, io_request* req)
+bool event_loop::submit_splice_file(int file_fd, uint64_t offset, int pipe_wr, uint32_t len, io_request* req,
+                                    op_type type)
 {
     struct io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
 
     io_uring_prep_splice(sqe, file_fd, static_cast<int64_t>(offset), pipe_wr, -1, len, SPLICE_F_MOVE);
     io_uring_sqe_set_data(sqe, req);
-    req->type = op_splice_file;
+    req->type = type;
     arm(req, raw_target(file_fd), raw_target(pipe_wr));
     return true;
 }

@@ -317,6 +317,9 @@ http_peer::~http_peer()
     *m_alive = false;
     if (m_ssl)
         tls_context::free_ssl(m_ssl);
+    for (const int fd : {m_pipe_rd, m_pipe_wr})
+        if (fd >= 0)
+            ::close(fd);
     // A kept connection a stop did not close, which nothing in the ring names any more.
     if (m_fd >= 0)
         ::close(m_fd);
@@ -385,6 +388,8 @@ void http_peer::exchange(http_request req, std::function<void(http_answer)> done
     m_head_given   = false;
     m_source_done  = false;
     m_head_out.clear();
+    m_file_sent    = 0;
+    m_in_pipe      = 0;
     m_sent         = false;
     m_write_failed = false;
     m_eof          = false;
@@ -505,12 +510,25 @@ void http_peer::advance()
             plain += m_req.body;
             m_req.body.clear();
             // Without TLS the head waits for the body's first piece, so the host gets both in one write.
-            if (m_req.source && !m_source_done && !m_ssl)
+            if (m_req.source && !m_source_done && !m_ssl && m_req.file_fd < 0)
             {
                 m_head_out = std::move(plain);
                 plain.clear();
             }
         }
+        if (plain.empty() && m_req.file_fd >= 0 && m_ssl)
+        {
+            finish(false, "a body from a file does not go over TLS");
+            return;
+        }
+        if (plain.empty() && m_req.file_fd >= 0 && (m_file_sent < m_req.file_len || m_in_pipe > 0))
+        {
+            splice_body();
+            return;
+        }
+        // A file body that is all sent leaves the pipe empty, for the next request's.
+        if (m_req.file_fd >= 0)
+            m_pipe_dirty = false;
         if (plain.empty() && m_req.source && !m_source_done)
         {
             const uint64_t gen = m_gen;
@@ -608,6 +626,76 @@ bool http_peer::flush_cipher()
         return false;
     send(std::make_shared<std::string>(std::move(cipher)), 0);
     return true;
+}
+
+void http_peer::drop_pipe()
+{
+    for (int* fd : {&m_pipe_rd, &m_pipe_wr})
+        if (*fd >= 0)
+        {
+            m_loop.close_fd(*fd);
+            *fd = -1;
+        }
+    m_pipe_dirty = false;
+}
+
+void http_peer::splice_body()
+{
+    if (m_pipe_rd < 0)
+    {
+        int p[2];
+        if (::pipe2(p, O_CLOEXEC) < 0)
+        {
+            finish(false, "no pipe could be made for the body");
+            return;
+        }
+        m_pipe_rd = p[0];
+        m_pipe_wr = p[1];
+        // A megabyte a step where the system allows it, which a larger body takes in fewer steps.
+        if (::fcntl(m_pipe_wr, F_SETPIPE_SZ, 1 << 20) < 0) {}
+        const int size = ::fcntl(m_pipe_wr, F_GETPIPE_SZ);
+        m_pipe_size = size > 0 ? static_cast<uint32_t>(size) : 65536;
+    }
+    m_pipe_dirty = true;
+    const uint64_t gen = m_gen;
+    auto alive = m_alive;
+    // What is in the pipe goes to the socket first, and the file fills it again once it is empty.
+    if (m_in_pipe > 0)
+    {
+        if (!m_io.splice(m_pipe_rd, file_io::at_stream, m_fd, m_in_pipe, [this, alive, gen](int64_t res)
+            {
+                if (!*alive || m_gen != gen)
+                    return;
+                if (res <= 0)
+                {
+                    // A host that answered before it had the whole body, and closed, may have left its answer.
+                    m_write_failed = true;
+                    drop_pipe();
+                    receive();
+                    return;
+                }
+                m_in_pipe -= static_cast<uint32_t>(std::min<int64_t>(res, m_in_pipe));
+                m_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(stall_secs);
+                advance();
+            }))
+            finish(false, "the ring is full");
+        return;
+    }
+    const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(m_pipe_size, m_req.file_len - m_file_sent));
+    if (!m_io.splice(m_req.file_fd, m_req.file_off + m_file_sent, m_pipe_wr, n, [this, alive, gen](int64_t res)
+        {
+            if (!*alive || m_gen != gen)
+                return;
+            if (res <= 0)
+            {
+                finish(false, "the body could not be read");
+                return;
+            }
+            m_file_sent += static_cast<uint64_t>(res);
+            m_in_pipe   += static_cast<uint32_t>(res);
+            splice_body();
+        }))
+        finish(false, "the ring is full");
 }
 
 void http_peer::send(std::shared_ptr<std::string> bytes, size_t off)
@@ -776,6 +864,8 @@ void http_peer::finish(bool answered, std::string why)
 {
     ++m_gen;
     m_busy = false;
+    if (m_pipe_dirty)
+        drop_pipe();
     if (answered && keepable())
         m_idle_since = std::chrono::steady_clock::now();
     else
@@ -852,6 +942,7 @@ void http_peer::stop()
     if (m_busy)
         finish(false, "the runtime stopped");
     close_socket();
+    drop_pipe();
 }
 
 }   // namespace socketley::storage

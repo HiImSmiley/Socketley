@@ -60,12 +60,16 @@ public:
     // A socket's connect, the address copied so the caller need not keep it.
     bool connect(int fd, const struct sockaddr* addr, socklen_t len, done cb);
 
+    // Moves up to `len` bytes from a file at `off` into a pipe, or from a pipe into a socket when `off` is at_stream,
+    // without their passing through this process.
+    bool splice(int fd_in, uint64_t off, int fd_out, uint32_t len, done cb);
+
     // Whether a completion of this kind is one of this object's.
     static bool owns_type(uint8_t type)
     {
         return type == op_file_read || type == op_file_write || type == op_fsync ||
                type == op_rename || type == op_unlink || type == op_openat ||
-               type == op_mkdir || type == op_link || type == op_connect;
+               type == op_mkdir || type == op_link || type == op_connect || type == op_io_splice;
     }
 
     // Runs the callback of the operation `cqe` completes.

@@ -253,10 +253,12 @@ enum op_type : uint8_t
     // op_splice because that one names a pipe and a socket and takes no offset.
     op_splice_file           = 29,
     // A second name for a file, which a rename may then move without the first.
-    op_link                  = 30
+    op_link                  = 30,
+    // A splice a file_io started, which reports to its callback and not to a connection's splice handler.
+    op_io_splice             = 31
 };
 
-inline constexpr uint8_t op_type_count = 31;
+inline constexpr uint8_t op_type_count = 32;
 
 // For diagnostics only, because a count says an owner cannot be released yet
 // and the kind says where to look.
@@ -293,6 +295,7 @@ inline const char* io_op_name(uint8_t t)
         case op_mkdir:                   return "mkdir";
         case op_splice_file:             return "splice-file";
         case op_link:                    return "link";
+        case op_io_splice:               return "io-splice";
         default:                         return "unknown";
     }
 }

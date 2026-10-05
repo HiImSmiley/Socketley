@@ -1218,6 +1218,13 @@ std::vector<std::pair<std::string, std::string>> node_headers(const object_meta&
     return h;
 }
 
+// Whether `len` bytes of `m` go to `target` straight from the file: plain bytes, on a connection without TLS, and
+// enough of them to be worth the pipe.
+bool spliceable(const http_target& target, const object_meta& m, uint64_t len)
+{
+    return !target.tls && !is_encrypted(m) && len >= 64 * 1024;
+}
+
 // The object's own checksum in `algo`, empty when it keeps none.
 std::string checksum_value(const object_meta& m, checksum_algo algo)
 {
@@ -1239,7 +1246,13 @@ void replicator::send_single(lane& l, const std::shared_ptr<job>& j)
         h.emplace_back(std::string(checksum_header(algo)), v);
     http_request rq;
     rq.head = signed_head(l, "PUT", object_path(l.target.http, j->t.dest_bucket, j->t.key), {}, std::move(h), m.size);
-    if (m.size)
+    if (spliceable(l.target.http, m, m.size))
+    {
+        rq.file_fd  = j->fd;
+        rq.file_off = j->data_off;
+        rq.file_len = m.size;
+    }
+    else if (m.size)
         rq.source = body_of(j, 0, m.size);
     exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>& jj, http_answer a)
     {
@@ -1305,7 +1318,13 @@ void replicator::mpu_part(lane& l, const std::shared_ptr<job>& j)
     const std::string query = "partNumber=" + std::to_string(number) + "&uploadId=" + url_encode(j->upload_id, false);
     http_request rq;
     rq.head = signed_head(l, "PUT", object_path(l.target.http, j->t.dest_bucket, j->t.key), query, std::move(h), len);
-    if (len)
+    if (spliceable(l.target.http, j->meta, len))
+    {
+        rq.file_fd  = j->fd;
+        rq.file_off = j->data_off + first;
+        rq.file_len = len;
+    }
+    else if (len)
         rq.source = body_of(j, first, len);
     exchange(l, j, std::move(rq), [this, number](lane& lp, const std::shared_ptr<job>& jj, http_answer a)
     {

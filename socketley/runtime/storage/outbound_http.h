@@ -94,6 +94,11 @@ struct http_request
     std::string body;
     // A body handed out a piece at a time after the head and `body`, none when empty.
     http_body_source source;
+    // Or a body moved straight from a file by splice, [file_off, file_off + file_len) of `file_fd`, which the caller
+    // keeps open; only on a connection without TLS, whose bytes never pass through this process.
+    int         file_fd{-1};
+    uint64_t    file_off{0};
+    uint64_t    file_len{0};
     // The exchange ends once the answer's head is in, for a host whose answer has nothing more to say.
     bool        head_only{false};
     // How long the answer may take once the whole request is written.
@@ -148,6 +153,10 @@ private:
     void advance();
     // Writes `bytes` whole, then advances.
     void send(std::shared_ptr<std::string> bytes, size_t off);
+    // Moves the next piece of a file body through the pipe into the socket, then advances once all is sent.
+    void splice_body();
+    // Closes the pipe, which a transfer cut short leaves holding bytes no later one may send.
+    void drop_pipe();
     // Hands what the record layer has to say to send(); false when it had nothing.
     bool flush_cipher();
     void receive();
@@ -194,6 +203,13 @@ private:
     bool        m_head_given{false};
     // The head of a request whose body comes from a source, held for the body's first piece.
     std::string m_head_out;
+    // A file body's pipe, its bytes sent so far and those in the pipe; dirty from a transfer's start to its end.
+    int         m_pipe_rd{-1};
+    int         m_pipe_wr{-1};
+    uint32_t    m_pipe_size{0};
+    uint64_t    m_file_sent{0};
+    uint32_t    m_in_pipe{0};
+    bool        m_pipe_dirty{false};
     bool        m_source_done{false};
     bool        m_sent{false};
     // A write failed, so the answer the host may have sent before closing is all that is left to read.
