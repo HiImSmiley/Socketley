@@ -253,16 +253,20 @@ bool storage_run::lifecycle_walk(lifecycle_pass& p)
                 if (marker_latest && versions.size() == 1 && rule.delete_marker == 1)
                     p.due.push_back({name, key, p.cfg, p.rule, false, version_of(versions.front()).id});
                 const object_meta* newer = latest;
+                // The noncurrent versions newest first, so this many are newer than the one at hand.
+                uint32_t ahead = 0;
                 for (const object_meta& v : versions)
                 {
                     // A version under a retention or a legal hold is not expired, whatever the rule says.
                     if (newer && !is_delete_marker(v) && !lock_holds(v, now, false) &&
-                        lifecycle_noncurrent_due(rule, key, v, newer->mtime_ms, now, m_lc_day_ms))
+                        lifecycle_noncurrent_due(rule, key, v, newer->mtime_ms, ahead, now, m_lc_day_ms))
                         p.due.push_back({name, key, p.cfg, p.rule, false, version_of(v).id});
                     else if (newer && tierer::movable(v) &&
-                             lifecycle_noncurrent_transition_due(rule, key, v, newer->mtime_ms, now, m_lc_day_ms))
+                             lifecycle_noncurrent_transition_due(rule, key, v, newer->mtime_ms, ahead, now, m_lc_day_ms))
                         p.due.push_back({name, key, p.cfg, p.rule, false, version_of(v).id,
                                          rule.noncurrent_transition_class});
+                    if (newer)
+                        ++ahead;
                     newer = &v;
                 }
             });

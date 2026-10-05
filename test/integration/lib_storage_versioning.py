@@ -564,29 +564,38 @@ def lifecycle():
     delete("m/z", bucket=lb)
     put("m/w", b"w1", bucket=lb)
     delete("m/w", bucket=lb)
+    n_versions = [put("n/k", b"k%d" % i, bucket=lb)[1] for i in range(1, 5)]
     rules = ("<LifecycleConfiguration>"
              "<Rule><ID>nc</ID><Filter><Prefix>a/</Prefix></Filter><Status>Enabled</Status>"
              "<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule>"
              "<Rule><ID>dm</ID><Filter><Prefix>m/</Prefix></Filter><Status>Enabled</Status>"
              "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule>"
+             "<Rule><ID>nn</ID><Filter><Prefix>n/</Prefix></Filter><Status>Enabled</Status>"
+             "<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays>"
+             "<NewerNoncurrentVersions>2</NewerNoncurrentVersions></NoncurrentVersionExpiration></Rule>"
              "</LifecycleConfiguration>")
     st, _, body = req("PUT", "/%s?lifecycle" % lb, rules.encode())
     check("a lifecycle with NoncurrentVersionExpiration and ExpiredObjectDeleteMarker is taken", st == 200,
           (st, body[:200]))
     st, _, body = req("GET", "/%s?lifecycle" % lb)
     check("and read back", st == 200 and b"<NoncurrentDays>1</NoncurrentDays>" in body and
-          b"<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>" in body, body[:400])
+          b"<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>" in body and
+          b"<NewerNoncurrentVersions>2</NewerNoncurrentVersions>" in body, body[:600])
 
     def keys_versions():
         got = {}
         for kind, key, vid, latest, etag in all_versions(bucket=lb) or []:
             got.setdefault(key, []).append(kind)
         return got
-    done = wait_for(lambda: (lambda g: g if g.get("a/x") == ["V"] and "m/z" not in g else None)(keys_versions()), 30)
+    done = wait_for(lambda: (lambda g: g if g.get("a/x") == ["V"] and "m/z" not in g and
+                                           len(g.get("n/k", [])) == 3 else None)(keys_versions()), 30)
     got = keys_versions()
     check("the version behind a latest in the rule's prefix is removed some days after it became noncurrent",
           got.get("a/x") == ["V"], got)
     check("a delete marker with no version behind it is removed", "m/z" not in got, got)
+    n_left = [vid for kind, key, vid, latest, etag in all_versions(bucket=lb) or [] if key == "n/k"]
+    check("NewerNoncurrentVersions keeps that many noncurrent versions behind the latest and removes the older one",
+          sorted(n_left) == sorted(n_versions[1:]), (n_left, n_versions))
     check("versions outside the rules stay", got.get("keep/y") == ["V", "V"] and got.get("m/w") == ["M", "V"], got)
     st, h, body = get("a/x", bucket=lb)
     check("the latest a noncurrent rule leaves is whole", (st, body, h.get("x-amz-version-id")) == (200, b"x2", x2),

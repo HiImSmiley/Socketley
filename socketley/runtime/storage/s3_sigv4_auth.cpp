@@ -670,6 +670,8 @@ void sigv4_authenticator::add_iam(credential_set& set)
         u->id           = name;
         u->display_name = name;
         u->configured   = true;
+        u->iam_id       = iu.id;
+        u->iam_path     = iu.path;
         const std::string doc = iam_user_policy(st, iu);
         if (!doc.empty())
             compiled(*u, doc);

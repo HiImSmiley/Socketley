@@ -55,6 +55,8 @@ struct lifecycle_rule
     int8_t      delete_marker{-1};
     // Days after a version became noncurrent it is removed for good, zero for none.
     uint32_t    noncurrent_days{0};
+    // <NewerNoncurrentVersions>: how many noncurrent versions newer than one it keeps before it may be removed.
+    uint32_t    noncurrent_newer{0};
     // Days after an incomplete multipart upload began it is aborted, zero for none.
     uint32_t    abort_days{0};
     // <Transition>: days after an object's mtime, or the midnight from which, it moves to the tier its class names.
@@ -66,6 +68,7 @@ struct lifecycle_rule
     // <NoncurrentVersionTransition>: days after a version became noncurrent it moves to the tier its class names.
     bool        has_noncurrent_transition{false};
     uint32_t    noncurrent_transition_days{0};
+    uint32_t    noncurrent_transition_newer{0};
     std::string noncurrent_transition_class;
 
     bool expires() const { return enabled && (expire_days != 0 || has_date); }
@@ -102,17 +105,19 @@ bool lifecycle_expiry(const lifecycle_config& c, std::string_view key, const obj
 bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t now_ms,
                           int64_t day_ms);
 
-// Whether the version `m` of `key`, noncurrent since `since_ms` when the one after it was made, is to be removed.
+// Whether the version `m` of `key`, noncurrent since `since_ms` when the one after it was made and with `newer`
+// noncurrent versions after it, is to be removed.
 bool lifecycle_noncurrent_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t since_ms,
-                              int64_t now_ms, int64_t day_ms);
+                              uint32_t newer, int64_t now_ms, int64_t day_ms);
 
 // Whether the object `key` with metadata `m` is to move to the tier of `r`'s transition at `now_ms`.
 bool lifecycle_transition_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t now_ms,
                               int64_t day_ms);
 
-// Whether the version `m` of `key`, noncurrent since `since_ms`, is to move to the tier of `r`'s noncurrent transition.
+// Whether the version `m` of `key`, noncurrent since `since_ms` and with `newer` noncurrent versions after it, is to
+// move to the tier of `r`'s noncurrent transition.
 bool lifecycle_noncurrent_transition_due(const lifecycle_rule& r, std::string_view key, const object_meta& m,
-                                         int64_t since_ms, int64_t now_ms, int64_t day_ms);
+                                         int64_t since_ms, uint32_t newer, int64_t now_ms, int64_t day_ms);
 
 // The storage classes the rules of `c` move objects to, which must each name a tier.
 std::vector<std::string> lifecycle_classes(const lifecycle_config& c);

@@ -1030,6 +1030,36 @@ TEST_CASE("the region is whatever the request says unless one is pinned")
     CHECK(std::string(r.run().code) == "AuthorizationQueryParametersError");
 }
 
+TEST_CASE("a request signed for no region is taken unless a region is pinned")
+{
+    // What boto3 sends when it is given region_name='', as the s3-tests suite's STS cases do.
+    const std::string date = "20261006T120000Z";
+    const std::string empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const std::vector<s3::header_field> signed_headers = {{"host", "127.0.0.1:9000"}, {"x-amz-content-sha256", empty},
+                                                          {"x-amz-date", date}};
+    s3::sign_input in;
+    in.method       = "GET";
+    in.raw_path     = "/bucket/key";
+    in.headers      = signed_headers;
+    in.payload_hash = empty;
+    in.access_key   = "AKIDEXAMPLE";
+    in.secret       = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+    in.region       = "";
+    in.amz_date     = date;
+    const std::string auth = s3::sign(in);
+    REQUIRE(auth.find("/20261006//s3/aws4_request") != std::string::npos);
+    std::vector<s3::header_field> sent = signed_headers;
+    sent.push_back({"authorization", auth});
+    const s3::request_view rv{"GET", "/bucket/key", "", sent, {}};
+    auto lookup = [&](sv k) -> sv { return k == in.access_key ? in.secret : sv(); };
+    s3::verify_options opts;
+    CHECK(s3::verify(rv, opts, lookup, 1791288000).status == s3::sigv4_status::ok);
+    opts.region = "us-east-1";
+    const s3::verify_result pinned = s3::verify(rv, opts, lookup, 1791288000);
+    CHECK(pinned.status == s3::sigv4_status::malformed);
+    CHECK(std::string(pinned.code) == "AuthorizationHeaderMalformed");
+}
+
 TEST_CASE("the service must be the one the server is")
 {
     const kase* c = find_case("boto3/get-special-key");

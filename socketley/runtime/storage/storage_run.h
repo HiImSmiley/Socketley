@@ -709,6 +709,8 @@ public:
     // and dropping the body when it is small enough, so the client hears the
     // answer and not a reset.
     void deny_request(const std::shared_ptr<conn>& c, const s3_error& e);
+    // Whether the buckets a request names belong to the owners its x-amz-expected-bucket-owner headers name.
+    bool expected_owner_ok(const s3_request& r) const;
 
     // ── Sending a file out ──────────────────────────────────────────────────
     void send_file(const std::shared_ptr<conn>& c, response head, int fd, uint64_t off, uint64_t len);

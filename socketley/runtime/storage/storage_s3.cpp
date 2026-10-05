@@ -41,7 +41,7 @@ bool unsupported_subresource(const s3_request& r, bool object)
         "accelerate",
         "requestPayment", "analytics", "metrics", "inventory", "ownershipControls",
         "intelligent-tiering", "attributes", "restore", "torrent",
-        "acl", "location-constraint",
+        "location-constraint",
     };
     // Every subresource is a query parameter, and most requests have none.
     if (r.query.empty())
@@ -80,7 +80,8 @@ bool unsupported_subresource(const s3_request& r, bool object)
         return true;
     if (r.has_query("versionId") &&
         (!object || r.has_query("uploadId") ||
-         (r.method != "GET" && r.method != "HEAD" && r.method != "DELETE" && !r.has_query("tagging") && !lock_attr)))
+         (r.method != "GET" && r.method != "HEAD" && r.method != "DELETE" && !r.has_query("tagging") &&
+          !r.has_query("acl") && !lock_attr)))
         return true;
     for (const auto& q : r.query)
         for (std::string_view n : names)
@@ -284,6 +285,14 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
         apply_policy(c, rv, v);
     if (!v.allowed)
     {
+        // An anonymous request to a bucket that does not exist is told so, as a signed one is, since a refusal would
+        // only hide what CreateBucket tells everyone anyway.
+        const bool create = r.method == "PUT" && r.key.empty() && r.raw_query.empty();
+        if (v.anonymous && !r.bucket.empty() && !create && !m_store.has_bucket(r.bucket))
+        {
+            deny_request(c, make_error("NoSuchBucket"));
+            return;
+        }
         deny_request(c, v.error.code.empty() ? make_error("AccessDenied") : v.error);
         return;
     }
@@ -292,6 +301,14 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     c->user      = std::move(v.user);
     c->anonymous = v.anonymous;
     c->cluster   = c->user && c->user->cluster;
+
+    // A bucket owned by someone other than the one the client names is refused before anything is done to it, so a
+    // name taken over by another owner receives nothing meant for the first.
+    if (!expected_owner_ok(r))
+    {
+        deny_request(c, make_error("AccessDenied"));
+        return;
+    }
 
     // A client that signs its payload in chunks, talking to a runtime with no
     // decoder for them, would have the framing stored as the object; an empty body has none.
@@ -314,6 +331,23 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
 
     // A script's say comes after authentication and before anything is done.
     hook_request(c);
+}
+
+bool storage_run::expected_owner_ok(const s3_request& r) const
+{
+    const auto names = [this](std::string_view bucket, std::string_view expected)
+    {
+        return expected.empty() || bucket.empty() || !m_store.has_bucket(bucket) || owner_of(bucket) == expected;
+    };
+    if (!names(r.bucket, r.header("x-amz-expected-bucket-owner")))
+        return false;
+    const std::string_view source = r.header("x-amz-source-expected-bucket-owner");
+    if (source.empty() || !r.has_header("x-amz-copy-source"))
+        return true;
+    std::string bucket, key;
+    s3_error err;
+    // A source that does not parse is refused by the copy itself.
+    return !parse_copy_source(r.header("x-amz-copy-source"), bucket, key, err) || names(bucket, source);
 }
 
 void storage_run::route(const std::shared_ptr<conn>& c)

@@ -13,6 +13,10 @@
 #   * a public grant taken where the bucket blocks them, or counted where it
 #     ignores them
 #   * the default --acls gives not what RGW and the old S3 gave
+#   * a group's grant listed after a user's, which a client sorting by
+#     DisplayName stops at; an ACL put on a version refused
+#   * a request whose x-amz-expected-bucket-owner names another owner done;
+#     an anonymous request to a bucket that is not there refused as 403
 # suite: isolated
 set -uo pipefail
 
@@ -164,6 +168,23 @@ check("and the bucket has no ownership controls",
 m2.put_object(Bucket="aclsr", Key="o", Body=b"o", ACL="public-read")
 check("its public object reads to everyone", a2.get_object(Bucket="aclsr", Key="o")["Body"].read(), b"o")
 check("and its listing", code(lambda: a2.list_objects(Bucket="aclsr")), "ok")
+check("a group's grants are listed before a user's",
+      [g["Grantee"]["Type"] for g in m2.get_bucket_acl(Bucket="aclsr")["Grants"]], ["Group", "CanonicalUser"])
+m2.put_bucket_versioning(Bucket="aclsr", VersioningConfiguration={"Status": "Enabled"})
+v1 = m2.put_object(Bucket="aclsr", Key="v", Body=b"1")["VersionId"]
+m2.put_object(Bucket="aclsr", Key="v", Body=b"2")
+check("an ACL is put on a version that is not the latest",
+      code(lambda: m2.put_object_acl(Bucket="aclsr", Key="v", VersionId=v1, ACL="public-read")), "ok")
+check("which reads to everyone by its version", code(lambda: a2.get_object(Bucket="aclsr", Key="v", VersionId=v1)), "ok")
+check("and leaves the latest its owner's", code(lambda: a2.get_object(Bucket="aclsr", Key="v")), "AccessDenied")
+check("a request expecting another bucket owner is AccessDenied",
+      code(lambda: a2.list_objects(Bucket="aclsr", ExpectedBucketOwner="alt")), "AccessDenied")
+check("and one expecting the owner is done", code(lambda: a2.list_objects(Bucket="aclsr", ExpectedBucketOwner="main")), "ok")
+check("a copy expecting another owner of its source is AccessDenied",
+      code(lambda: m2.copy_object(Bucket="aclsr", Key="c", CopySource={"Bucket": "aclsr", "Key": "o"},
+                                  ExpectedSourceBucketOwner="alt")), "AccessDenied")
+check("an anonymous request to a bucket that is not there is NoSuchBucket",
+      code(lambda: a2.delete_object(Bucket="aclsgone", Key="k")), "NoSuchBucket")
 print("  Results: %d/%d passed (%d failed)" % (passed, passed + failed, failed))
 sys.exit(failed)
 PY

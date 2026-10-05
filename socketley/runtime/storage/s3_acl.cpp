@@ -369,8 +369,13 @@ std::string acl_xml(const acl_list& a, const std::function<std::string(std::stri
     static constexpr std::pair<uint8_t, std::string_view> names[] = {
         {acl_perm::full, "FULL_CONTROL"}, {acl_perm::read, "READ"}, {acl_perm::write, "WRITE"},
         {acl_perm::read_acp, "READ_ACP"}, {acl_perm::write_acp, "WRITE_ACP"}};
+    // Groups before users, as RGW lists them, since S3 fixes no order and a client that sorts by DisplayName stops
+    // at a group's missing one when a user comes first.
+    for (const bool groups : {true, false})
     for (const acl_grant& g : a.grants)
     {
+        if ((g.w != acl_grant::who::user) != groups)
+            continue;
         uint8_t left = g.perm;
         for (const auto& [bits, name] : names)
         {

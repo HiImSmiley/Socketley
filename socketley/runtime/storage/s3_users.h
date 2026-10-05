@@ -20,6 +20,9 @@ struct user_identity
     std::string display_name;
     // The address an ACL's grant may name the user by, empty for none.
     std::string email;
+    // The UserId and path the IAM API gave a user it made, empty for one of the credentials file.
+    std::string iam_id;
+    std::string iam_path;
     // May do everything on every bucket that no Deny takes away, as every key could before there were users.
     bool        admin{false};
     // Declared by a section of the credentials file, so a bucket policy's principal may name it by its id.

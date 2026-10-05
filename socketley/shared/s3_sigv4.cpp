@@ -734,9 +734,9 @@ verify_result verify(const request_view& req, const verify_options& opts, const 
         return malformed(a.form, "The credential scope date does not match the request date.");
     if (a.service != opts.service)
         return malformed(a.form, "The credential scope names a different service than this one.");
-    // A global service's client signs for no region when it was given none, which RGW and boto3 both expect taken.
-    const bool global = opts.service == "iam" || opts.service == "sts";
-    if ((a.region.empty() && !global) || a.region.size() > 48 || a.service.size() > 24)
+    // A client given no region signs for none, which RGW and MinIO take where no region is pinned, as the check below
+    // refuses it where one is.
+    if (a.region.size() > 48 || a.service.size() > 24)
         return malformed(a.form, "The credential scope region is not valid.");
     if (!opts.region.empty() && a.region != opts.region)
         return malformed(a.form, "The authorization is for a region other than the one this server is in.");

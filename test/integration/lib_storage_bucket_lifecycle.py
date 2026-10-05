@@ -228,7 +228,8 @@ def mode_main(port):
         ("a filter by size beside an abort of uploads", doc("<Rule><ID>t</ID><Filter><ObjectSizeGreaterThan>5</ObjectSizeGreaterThan></Filter><Status>Enabled</Status>" + abort(1) + "</Rule>"), "InvalidRequest"),
         ("a transition to a class that is no tier of --tiers", doc(rule("<Transition><Days>1</Days><StorageClass>GLACIER</StorageClass></Transition>", "tr")), "InvalidStorageClass"),
         ("two transitions in one rule", doc(rule("<Transition><Days>1</Days><StorageClass>A</StorageClass></Transition><Transition><Days>2</Days><StorageClass>B</StorageClass></Transition>", "t2")), "NotImplemented"),
-        ("a noncurrent version expiration that keeps newer versions", doc(rule("<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays><NewerNoncurrentVersions>2</NewerNoncurrentVersions></NoncurrentVersionExpiration>", "nv")), "NotImplemented"),
+        ("NewerNoncurrentVersions of zero", doc(rule("<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays><NewerNoncurrentVersions>0</NewerNoncurrentVersions></NoncurrentVersionExpiration>", "nv")), "InvalidArgument"),
+        ("NewerNoncurrentVersions over 100", doc(rule("<NoncurrentVersionTransition><NoncurrentDays>1</NoncurrentDays><NewerNoncurrentVersions>101</NewerNoncurrentVersions><StorageClass>A</StorageClass></NoncurrentVersionTransition>", "nv")), "InvalidArgument"),
         ("NoncurrentDays of zero", doc(rule("<NoncurrentVersionExpiration><NoncurrentDays>0</NoncurrentDays></NoncurrentVersionExpiration>", "nz")), "InvalidArgument"),
         ("1001 rules", doc(*[rule(days(1), "r%d" % i, prefix="p%d/" % i) for i in range(1001)]), "InvalidArgument"),
     ]

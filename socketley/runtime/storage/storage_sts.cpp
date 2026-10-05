@@ -95,12 +95,16 @@ void storage_run::op_sts(const std::shared_ptr<conn>& c)
     if (action && *action == "GetCallerIdentity")
     {
         const std::string id = v.user ? v.user->id : std::string{};
+        // A user the IAM API made is named by the id and the path it was given, as IAM's own answers name it.
+        const bool made = v.user && !v.user->iam_id.empty() && !v.session;
         const std::string arn = id.starts_with("role/") ? "arn:aws:sts:::assumed-role/" + id.substr(5)
-                                                        : "arn:aws:iam:::user/" + id;
+                              : "arn:aws:iam::" + std::string(iam_account) + ":user" +
+                                    (made ? v.user->iam_path : std::string("/")) + id;
+        const std::string& user_id = made ? v.user->iam_id : v.principal;
         response resp;
         resp.headers.emplace_back("Content-Type", "text/xml");
         resp.body = "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">"
-                    "<GetCallerIdentityResult><Arn>" + xml_escape(arn) + "</Arn><UserId>" + xml_escape(v.principal) +
+                    "<GetCallerIdentityResult><Arn>" + xml_escape(arn) + "</Arn><UserId>" + xml_escape(user_id) +
                     "</UserId><Account></Account></GetCallerIdentityResult><ResponseMetadata><RequestId>" +
                     r.request_id + "</RequestId></ResponseMetadata></GetCallerIdentityResponse>";
         send_response(c, std::move(resp));

@@ -7085,8 +7085,8 @@ dots in its name fails verification virtual\-hosted and is reached path style.
 Requests are verified as AWS Signature Version 4, in both forms: the
 .B Authorization
 header and a presigned URL (\fBX\-Amz\-Algorithm\fR and the rest in the
-query, for GET, HEAD, PUT and DELETE). Whatever region the credential scope names
-is accepted. Every
+query, for GET, HEAD, PUT and DELETE). Whatever region the credential scope names, none
+included, is accepted. Every
 .B x\-amz\-content\-sha256
 mode a client sends is honoured: a hex hash is checked against the body as it
 streams (a body that is not the one signed is
@@ -7231,6 +7231,15 @@ lets it in.
 Anything else is
 .BR "403 AccessDenied" .
 .PP
+A request without credentials to a bucket that is not there is answered
+.BR "404 NoSuchBucket" ,
+as a signed one is. A request whose
+.B x\-amz\-expected\-bucket\-owner
+names another user than the bucket's owner, or whose
+.B x\-amz\-source\-expected\-bucket\-owner
+does so for a copy's source bucket, is
+.B "403 AccessDenied"
+before anything is done.
 A copy is also judged as a GetObject of its source in the source bucket.
 CreateBucket is anybody's whose identity policy does not deny
 .B s3:CreateBucket
@@ -7282,7 +7291,7 @@ caller's. Any other RoleArn makes the caller's own session, bounded by its
 (an identity policy's grammar, at most 2048 bytes), which only narrows it:
 what the policy does not allow is refused even to an admin or a bucket's owner,
 the bucket policy's operations included. GetCallerIdentity names the user or the
-assumed role that signed. A browser's form upload is not signed with temporary
+assumed role that signed, a user the IAM API made by the UserId and the path it was given. A browser's form upload is not signed with temporary
 credentials.
 .SS Federated identities
 With
@@ -8690,7 +8699,10 @@ in an
 of its own), and
 .B NoncurrentVersionExpiration
 by
-.BR NoncurrentDays .
+.BR NoncurrentDays ,
+and with
+.B NewerNoncurrentVersions
+(1 to 100) only a version that many noncurrent versions of its key are newer than.
 .B Transition
 by
 .B Days
@@ -8708,13 +8720,15 @@ that names a tier of
 .BR "400 InvalidStorageClass" ;
 see
 .BR Tiers ).
+.B NoncurrentVersionTransition
+takes
 .B NewerNoncurrentVersions
-and a second transition of either kind in one rule are refused with
+as well. A second transition of either kind in one rule is refused with
 .B "501 NotImplemented"
 and the configuration that was there stays; a document that is not one is
 .BR MalformedXML ,
 a value S3 would not take (Days of zero, a Date that is not midnight, a
-repeated ID, 1001 rules, an ObjectSizeLessThan of 0) is
+repeated ID, 1001 rules, an ObjectSizeLessThan of 0, a NewerNoncurrentVersions of 0 or over 100) is
 .BR InvalidArgument ,
 a tag key or value an object could not have is
 .BR InvalidTag ,

@@ -39,6 +39,12 @@ bool positive_days(const xml_node& n, uint32_t& out)
     return true;
 }
 
+// S3 keeps at most 100 newer noncurrent versions of a key.
+bool newer_versions(const xml_node& n, uint32_t& out)
+{
+    return positive_days(n, out) && out <= 100;
+}
+
 bool non_negative_days(const xml_node& n, uint32_t& out)
 {
     std::string_view t = n.text;
@@ -339,19 +345,23 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
 
     if (noncurrent)
     {
-        const xml_node* days = nullptr;
+        const xml_node* days  = nullptr;
+        const xml_node* newer = nullptr;
         for (const xml_node& k : noncurrent->kids)
         {
-            if (k.name == "NewerNoncurrentVersions")
-            {
-                err = fail("NotImplemented", "NewerNoncurrentVersions is not supported");
-                return false;
-            }
-            if (k.name != "NoncurrentDays" || !once(days, k) || !k.kids.empty())
+            const bool fresh = k.name == "NoncurrentDays" ? once(days, k)
+                             : k.name == "NewerNoncurrentVersions" ? once(newer, k) : false;
+            if (!fresh || !k.kids.empty())
             {
                 err = fail("MalformedXML");
                 return false;
             }
+        }
+        if (newer && !newer_versions(*newer, r.noncurrent_newer))
+        {
+            err = fail("InvalidArgument", "'NewerNoncurrentVersions' for NoncurrentVersionExpiration action must be a "
+                                          "positive integer no greater than 100");
+            return false;
         }
         if (!days)
         {
@@ -411,22 +421,24 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
 
     if (noncurrent_transition)
     {
-        const xml_node* days = nullptr;
-        const xml_node* cls  = nullptr;
+        const xml_node* days  = nullptr;
+        const xml_node* cls   = nullptr;
+        const xml_node* newer = nullptr;
         for (const xml_node& k : noncurrent_transition->kids)
         {
-            if (k.name == "NewerNoncurrentVersions")
-            {
-                err = fail("NotImplemented", "NewerNoncurrentVersions is not supported");
-                return false;
-            }
             const bool fresh = k.name == "NoncurrentDays" ? once(days, k) : k.name == "StorageClass" ? once(cls, k)
-                             : false;
+                             : k.name == "NewerNoncurrentVersions" ? once(newer, k) : false;
             if (!fresh || !k.kids.empty())
             {
                 err = fail("MalformedXML");
                 return false;
             }
+        }
+        if (newer && !newer_versions(*newer, r.noncurrent_transition_newer))
+        {
+            err = fail("InvalidArgument", "'NewerNoncurrentVersions' for NoncurrentVersionTransition action must be a "
+                                          "positive integer no greater than 100");
+            return false;
         }
         if (!days || !cls)
         {
@@ -600,13 +612,17 @@ std::string lifecycle_xml(const lifecycle_config& c)
                                        : "<Transition><Days>" + std::to_string(r.transition_days) + "</Days>";
             x += "<StorageClass>" + r.transition_class + "</StorageClass></Transition>";
         }
+        const auto newer_xml = [](uint32_t n)
+        {
+            return n == 0 ? std::string() : "<NewerNoncurrentVersions>" + std::to_string(n) + "</NewerNoncurrentVersions>";
+        };
         if (r.noncurrent_days != 0)
-            x += "<NoncurrentVersionExpiration><NoncurrentDays>" + std::to_string(r.noncurrent_days) +
-                 "</NoncurrentDays></NoncurrentVersionExpiration>";
+            x += "<NoncurrentVersionExpiration><NoncurrentDays>" + std::to_string(r.noncurrent_days) + "</NoncurrentDays>" +
+                 newer_xml(r.noncurrent_newer) + "</NoncurrentVersionExpiration>";
         if (r.has_noncurrent_transition)
             x += "<NoncurrentVersionTransition><NoncurrentDays>" + std::to_string(r.noncurrent_transition_days) +
-                 "</NoncurrentDays><StorageClass>" + r.noncurrent_transition_class +
-                 "</StorageClass></NoncurrentVersionTransition>";
+                 "</NoncurrentDays>" + newer_xml(r.noncurrent_transition_newer) + "<StorageClass>" +
+                 r.noncurrent_transition_class + "</StorageClass></NoncurrentVersionTransition>";
         if (r.abort_days != 0)
             x += "<AbortIncompleteMultipartUpload><DaysAfterInitiation>" + std::to_string(r.abort_days) +
                  "</DaysAfterInitiation></AbortIncompleteMultipartUpload>";
@@ -671,9 +687,9 @@ bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, const o
 }
 
 bool lifecycle_noncurrent_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t since_ms,
-                              int64_t now_ms, int64_t day_ms)
+                              uint32_t newer, int64_t now_ms, int64_t day_ms)
 {
-    return r.enabled && r.noncurrent_days != 0 && filter_takes(r, key, m) &&
+    return r.enabled && r.noncurrent_days != 0 && newer >= r.noncurrent_newer && filter_takes(r, key, m) &&
            now_ms >= lifecycle_due_ms(since_ms, r.noncurrent_days, day_ms);
 }
 
@@ -687,9 +703,9 @@ bool lifecycle_transition_due(const lifecycle_rule& r, std::string_view key, con
 }
 
 bool lifecycle_noncurrent_transition_due(const lifecycle_rule& r, std::string_view key, const object_meta& m,
-                                         int64_t since_ms, int64_t now_ms, int64_t day_ms)
+                                         int64_t since_ms, uint32_t newer, int64_t now_ms, int64_t day_ms)
 {
-    return r.enabled && r.has_noncurrent_transition && filter_takes(r, key, m) &&
+    return r.enabled && r.has_noncurrent_transition && newer >= r.noncurrent_transition_newer && filter_takes(r, key, m) &&
            now_ms >= lifecycle_due_ms(since_ms, r.noncurrent_transition_days, day_ms);
 }
 

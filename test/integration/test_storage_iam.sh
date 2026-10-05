@@ -11,6 +11,7 @@
 #   * a role assumed by a caller its trust policy does not name, or a role's
 #     session holding other rights than the role's policies
 #   * a credentials-file user's IAM policy not standing beside its own
+#   * GetCallerIdentity naming a user the API made by its key, or without its path
 #   * any of it lost by a restart, or not seen at once by the other shard
 # suite: isolated
 set -uo pipefail
@@ -135,6 +136,14 @@ if phase == "main":
     check("and not the caller's", code(lambda: r3.get_object(Bucket="data", Key="a")), "AccessDenied")
     ident = mk("sts", (cr["AccessKeyId"], cr["SecretAccessKey"]), cr["SessionToken"]).get_caller_identity()
     check("GetCallerIdentity names the assumed role", ident["Arn"], "arn:aws:sts:::assumed-role/cleaner")
+    d = iam.create_user(UserName="dave", Path="/team/")["User"]
+    dk = iam.create_access_key(UserName="dave")["AccessKey"]
+    settle()
+    ident = mk("sts", (dk["AccessKeyId"], dk["SecretAccessKey"])).get_caller_identity()
+    check("GetCallerIdentity names a user the API made by its UserId and its ARN with the path",
+          (ident["UserId"], ident["Arn"]), (d["UserId"], "arn:aws:iam:::user/team/dave"))
+    iam.delete_access_key(UserName="dave", AccessKeyId=dk["AccessKeyId"])
+    iam.delete_user(UserName="dave")
     check("a role session may not call IAM",
           code(lambda: mk("iam", (cr["AccessKeyId"], cr["SecretAccessKey"]), cr["SessionToken"], region="").list_users()), "AccessDenied")
     json.dump({"alice": list(alice), "carol": [ck["AccessKeyId"], ck["SecretAccessKey"]], "role": cr}, open(state, "w"), default=str)
