@@ -220,10 +220,33 @@ void storage_run::op_get_policy_status(const std::shared_ptr<conn>& c)
 void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_view& rv, auth_verdict& v)
 {
     const s3_request& r = c->req;
-    // Every user may ask for the list of its own buckets.
-    if (r.bucket.empty())
-        return;
     const user_identity* u = v.anonymous ? nullptr : v.user.get();
+    // Every user may ask for the list of its own buckets, unless one of its policies denies it.
+    if (r.bucket.empty())
+    {
+        if (!u || u->unrestricted() || r.method != "GET")
+            return;
+        if (!c->ip_known)
+        {
+            c->ip       = client_ip_of(c->fd);
+            c->ip_known = true;
+        }
+        const request_context ctx(*c, u, false, static_cast<int64_t>(m_store.now_ms()));
+        policy_request pr;
+        pr.ctx       = &ctx;
+        pr.action    = s3_action::list_all_my_buckets;
+        pr.principal = v.principal;
+        pr.user      = u->configured ? std::string_view(u->id) : std::string_view{};
+        pr.tls       = c->ssl != nullptr;
+        pr.ip        = &c->ip;
+        const auto denies = [&pr](const bucket_policy* p) { return p && p->evaluate(pr) == policy_effect::deny; };
+        if (denies(u->session_policy.get()) || (u->has_policy && denies(&u->policy)) || denies(u->iam_policy.get()))
+        {
+            v.allowed = false;
+            v.error   = make_error("AccessDenied");
+        }
+        return;
+    }
     const bool restricted = u && !u->unrestricted();
     // A request that only a Deny could refuse is let through without a look when its bucket has none.
     const bool copy_from = r.method == "PUT" && !r.key.empty() && r.has_header("x-amz-copy-source");

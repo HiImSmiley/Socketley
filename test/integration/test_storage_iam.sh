@@ -94,6 +94,13 @@ if phase == "main":
           code(lambda: iam.put_user_policy(UserName="alice", PolicyName="bad", PolicyDocument="{nope")), "MalformedPolicyDocument")
     check("GetUserPolicy reads it back", json.loads(json.dumps(iam.get_user_policy(UserName="alice", PolicyName="read")["PolicyDocument"]))["Statement"][0]["Action"], "s3:GetObject")
     check("a user who is no admin may not call IAM", code(lambda: mk("iam", alice, region="").list_users()), "AccessDenied")
+    iam.put_user_policy(UserName="alice", PolicyName="nolist", PolicyDocument=doc("Deny", "s3:ListAllMyBuckets", "*"))
+    settle()
+    check("a Deny of s3:ListAllMyBuckets refuses ListBuckets, on either shard",
+          [code(lambda: a3.list_buckets()) for _ in range(6)], ["AccessDenied"] * 6)
+    iam.delete_user_policy(UserName="alice", PolicyName="nolist")
+    settle()
+    check("and without it the user lists its buckets again", [code(lambda: a3.list_buckets()) for _ in range(6)], ["ok"] * 6)
     # Groups and managed policies.
     iam.create_group(GroupName="writers")
     iam.put_group_policy(GroupName="writers", PolicyName="w", PolicyDocument=doc("Allow", "s3:PutObject", "arn:aws:s3:::data/*"))

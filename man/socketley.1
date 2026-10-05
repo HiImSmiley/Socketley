@@ -7098,7 +7098,10 @@ A bucket is owned by the user that made it, recorded on the second line of its
 .IB dir / bucket /created
 (none for the default owner, as for every bucket made before users) and taken by
 every shard, at its making and at every start. ListBuckets shows a user the
-buckets it owns and an admin every bucket; every Owner element \(em ListBuckets,
+buckets it owns and an admin every bucket, unless one of the user's policies
+denies it
+.B s3:ListAllMyBuckets
+(on \fB*\fR or \fBarn:aws:s3:::*\fR), which makes it 403; every Owner element \(em ListBuckets,
 ListObjects, ListObjectVersions, the uploads and parts listings, GetBucketAcl and
 GetObjectAcl \(em is the bucket's owner with its display name, since an object of a
 bucket with ACLs disabled is its bucket owner's.

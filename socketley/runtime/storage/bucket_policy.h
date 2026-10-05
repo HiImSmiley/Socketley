@@ -90,6 +90,8 @@ enum class s3_action : uint8_t
     put_bucket_public_access_block,
     get_bucket_logging,
     put_bucket_logging,
+    // ListBuckets, whose resource is every bucket of the account.
+    list_all_my_buckets,
     count,
 };
 static_assert(static_cast<int>(s3_action::count) <= 64);

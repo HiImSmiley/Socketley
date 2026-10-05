@@ -186,7 +186,7 @@ constexpr action_name action_names[] = {
     {"DeleteBucketPolicy", res_kind::bucket, s3_action::delete_bucket_policy},
     {"GetBucketPolicyStatus", res_kind::bucket, s3_action::get_bucket_policy_status},
 
-    {"ListAllMyBuckets", res_kind::service, s3_action::none},
+    {"ListAllMyBuckets", res_kind::service, s3_action::list_all_my_buckets},
     {"GetObjectVersion", res_kind::object, s3_action::get_object_version},
     {"GetObjectAcl", res_kind::object, s3_action::get_object_acl},
     {"PutObjectAcl", res_kind::object, s3_action::put_object_acl},
