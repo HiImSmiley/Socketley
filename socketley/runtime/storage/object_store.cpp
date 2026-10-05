@@ -1870,9 +1870,10 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
                 return;
             }
         }
-        if (m_mirror)
+        const bool heal = rm->cause == change_cause::heal;
+        if (m_mirror && !heal)
             note_removed(rm->bname, rm->key, {}, when);
-        if (rm->existed || (m_mirror && !rm->who.cluster && rm->cause != change_cause::lifecycle))
+        if (!heal && (rm->existed || (m_mirror && !rm->who.cluster && rm->cause != change_cause::lifecycle)))
         {
             change_note n;
             n.bucket = rm->bname;

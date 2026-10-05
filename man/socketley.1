@@ -6480,6 +6480,13 @@ until it is completed or aborted, however old. Expiry is looked for while the
 runtime runs and once at every start, so an upload that outlived the setting
 while the runtime was stopped is gone when it comes back.
 .TP
+.BI \-\-scrub " duration"
+Read every object and version back once in this long (\fB30d\fR, \fB7d\fR) and
+check its bytes against the MD5 its header names, so a file the disk changed is
+found before a client reads it. See
+.BR Scrub .
+Without it nothing is read in the background.
+.TP
 .BI \-\-max\-bytes " size"
 A quota on the bytes the runtime holds, with the
 .BR K / M / G
@@ -8104,6 +8111,48 @@ from 450 to 557 microseconds of CPU, which is the write read back and sent twice
 1 MiB PutObject from 8 clients, 200 a second against 415 alone, at 5.7 against 4.4
 milliseconds of CPU each, the two other nodes taking every megabyte on the same
 four CPUs.
+.SS Scrub
+With
+.BR \-\-scrub ,
+every shard reads each version it holds back from its file, a key at a time in
+order, at a pace that makes one pass of the shard's bytes take the period, at
+least a megabyte a second; a pass begins a period after the last one began, and
+where a pass got to is noted in
+.IB dir /.scrub. shard
+every 30 seconds, so a restart goes on from there. The bytes are checked against
+the MD5 the object's header names: a whole object's against its MD5, a multipart
+object's part by part against the ETag its parts make, and an SSE\-S3 or SSE\-KMS
+object's in its plaintext, which a chunk whose tag fails makes corrupt as well.
+An SSE\-C object, whose key only its client has, and an object whose parts are not
+recorded, are passed over and counted as skipped.
+.PP
+A copy whose bytes differ is logged once as an error, however many passes find it.
+On a runtime that is no node of a cluster it stays as it is, to be restored from a
+copy. On a node of one (\fB\-\-nodes\fR), a version named by its id, or an object of a
+bucket that keeps no versions, is asked for of the other nodes in turn by a HEAD
+that must answer its ETag; the first that holds it whole is asked to send it again,
+and the corrupt copy is taken away first, with no event, no copy sent to the other
+nodes and no record of a removal, and only while it is still the copy the scrub
+read. The node's copy comes back under its own id, behind the latest when it was
+behind it. Until it is back, a read of it on this node finds nothing.
+.PP
+.B stats
+shows, per shard,
+.B scrub_objects
+and
+.B scrub_bytes
+(read),
+.B scrub_corrupt
+(found, each once),
+.BR scrub_skipped ,
+.B scrub_passes
+and
+.B scrub_last_pass_ms
+(how long the last whole pass took),
+.B scrub_heals
+(corrupt copies another node was asked to send again) and
+.B scrub_unhealed
+(those no other node held whole).
 .SS Server\-side encryption
 .B "x\-amz\-server\-side\-encryption: AES256"
 on PutObject, CreateMultipartUpload or CopyObject (SSE\-S3) stores the object

@@ -57,6 +57,9 @@ public:
     // are completed or aborted.
     void set_mpu_expire_secs(uint32_t s) { m_mpu_expire_secs = s; }
     uint32_t get_mpu_expire_secs() const { return m_mpu_expire_secs; }
+    // A whole scrub of every object in this long (--scrub), 0 for none.
+    void set_scrub_secs(uint32_t s) { m_scrub_secs = s; }
+    uint32_t get_scrub_secs() const { return m_scrub_secs; }
 
     // A quota on the bytes held, 0 for none.
     void set_max_bytes(uint64_t bytes) { m_max_bytes = bytes; }
@@ -152,6 +155,7 @@ private:
     std::string m_fsync;
     uint32_t    m_fsync_interval_secs{0};
     uint32_t    m_mpu_expire_secs{0};
+    uint32_t    m_scrub_secs{0};
     std::unique_ptr<socketley::storage::authenticator> m_auth;
     std::unique_ptr<socketley::storage::anonymous_authenticator> m_anon;
 

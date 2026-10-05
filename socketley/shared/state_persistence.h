@@ -168,6 +168,7 @@ struct runtime_config
     std::string storage_fsync;
     uint32_t storage_fsync_interval_secs = 0;
     uint32_t storage_mpu_expire_secs = 0;
+    uint32_t storage_scrub_secs = 0;
 
     // A registered type's own fields in declaration order, opaque here, held
     // as strings because the schema that gives them kinds lives in a manifest.

@@ -1471,6 +1471,20 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
             stg->set_mpu_expire_secs(static_cast<uint32_t>(std::min<uint64_t>(secs, UINT32_MAX)));
             return 0;
         }
+        // Every object read back and checked once in this long, at a pace that spreads the reads over it.
+        case fnv1a("--scrub"):
+        {
+            uint64_t secs = 0;
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            if (parse_duration_seconds(v, uint64_t{10} * 365 * 86400, secs) != duration_parse::ok || secs == 0)
+            {
+                std::cout << "--scrub requires a duration such as 7d or 30d\n";
+                return 1;
+            }
+            ++i;
+            stg->set_scrub_secs(static_cast<uint32_t>(std::min<uint64_t>(secs, UINT32_MAX)));
+            return 0;
+        }
         case fnv1a("--max-bytes"):
         {
             if (i + 1 >= pa.count)

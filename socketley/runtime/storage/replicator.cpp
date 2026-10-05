@@ -110,6 +110,9 @@ bool replace_note(const std::string& path, const std::string& text)
     return whole && ::rename(tmp.c_str(), path.c_str()) == 0;
 }
 
+// The path of `key` in `bucket` below a target's own path.
+std::string object_path(const http_target& t, std::string_view bucket, std::string_view key);
+
 // What a change sent to another node is, for the log.
 std::string node_change_name(char kind, bool has_version)
 {
@@ -122,6 +125,7 @@ std::string node_change_name(char kind, bool has_version)
         case 'x': return "a version's removal";
         case 'l': return "a version's lock";
         case 'i': return "a record of the runtime's own";
+        case 'q': return "a request for a copy";
         default:  return "the bucket's change";
     }
 }
@@ -348,7 +352,7 @@ bool replicator::open(const std::string& dir, uint32_t shard, const outbox::chan
             ++dropped;
             return false;
         }
-        const bool node = std::string_view("pmgdxlbsi").find(static_cast<char>(kind)) != std::string_view::npos;
+        const bool node = std::string_view("pmgdxlbsiq").find(static_cast<char>(kind)) != std::string_view::npos;
         const bool read = node ? r.bytes(t.bucket, 4096) && r.bytes(t.key, 4096) && r.bytes(t.version_id, 4096) &&
                                      r.bytes(t.stamp, 4096) && r.bytes(t.tags, max_record_bytes)
                                : r.bytes(t.bucket, 4096) && r.bytes(t.key, 4096) && r.bytes(t.version_id, 4096) &&
@@ -522,6 +526,64 @@ bool replicator::enqueue_nodes(const cluster_change& c)
         if (l->target.node)
             push(*l, node_task(c), false);
     return true;
+}
+
+bool replicator::enqueue_node(const std::string& name, const cluster_change& c)
+{
+    lane* l = m_stopped ? nullptr : find_lane(name, true);
+    if (!l)
+        return false;
+    push(*l, node_task(c), false);
+    return true;
+}
+
+void replicator::find_copy(std::string bucket, std::string key, std::string version_id, std::string etag,
+                           std::function<void(std::string node)> found)
+{
+    m_questions.push_back({std::move(bucket), std::move(key), std::move(version_id), std::move(etag), std::move(found), 0});
+    if (!m_asking)
+        ask_next();
+}
+
+void replicator::ask_next()
+{
+    std::vector<lane*> nodes;
+    for (auto& l : m_lanes)
+        if (l->seed)
+            nodes.push_back(l.get());
+    while (!m_questions.empty() && m_questions.front().next >= nodes.size())
+    {
+        auto q = std::move(m_questions.front());
+        m_questions.pop_front();
+        q.found({});
+    }
+    m_asking = !m_questions.empty() && !m_stopped;
+    if (!m_asking)
+        return;
+    copy_question& q = m_questions.front();
+    lane& l = *nodes[q.next++];
+    if (!l.seed->asker)
+        l.seed->asker = new_peer(l.target);
+    http_request rq;
+    rq.head = signed_head(l, "HEAD", object_path(l.target.http, q.bucket, q.key),
+                          q.version_id.empty() ? std::string() : "versionId=" + url_encode(q.version_id, false), {}, 0);
+    rq.head_only   = true;
+    rq.answer_secs = 10;
+    auto alive = m_alive;
+    const std::string name = l.target.name;
+    l.seed->asker->exchange(std::move(rq), [this, alive, name](http_answer a)
+    {
+        if (!*alive || m_questions.empty())
+            return;
+        copy_question& q = m_questions.front();
+        if (a.status == 200 && http_trim_ows(a.header("etag")) == "\"" + q.etag + "\"")
+        {
+            auto done = std::move(q);
+            m_questions.pop_front();
+            done.found(name);
+        }
+        ask_next();
+    });
 }
 
 uint64_t replicator::stage(std::string_view check, const replication_config* cfg, const std::string& bucket,
@@ -1046,7 +1108,7 @@ http_request replicator::node_record(const lane& l, const task& t) const
     while (!path.empty() && path.back() == '/')
         path.pop_back();
     path += "/" + t.bucket;
-    if (t.node_kind == 'l')
+    if (t.node_kind == 'l' || t.node_kind == 'q')
         path = object_path(l.target.http, t.bucket, t.key);
     rq.body = t.tags;
     rq.head = signed_head(l, "POST", path, std::string(cluster_query) + "=",
@@ -1713,7 +1775,11 @@ void replicator::stop()
         for (auto& p : l->peers)
             p->stop();
         if (l->seed)
+        {
             l->seed->probe->stop();
+            if (l->seed->asker)
+                l->seed->asker->stop();
+        }
         for (auto& j : l->active)
         {
             if (j->fd >= 0)

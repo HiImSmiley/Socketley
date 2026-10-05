@@ -364,6 +364,8 @@ enum class change_cause : uint8_t
     complete,
     remove,
     lifecycle,
+    // A copy the scrub found corrupt taken away for another node's to replace, which nobody is told of.
+    heal,
 };
 
 // A change to an object, told by the owner of its key to whoever sends its bucket's events and replicates it.

@@ -52,7 +52,8 @@ inline constexpr uint64_t         cluster_max_body = 2u << 20;
 struct cluster_record
 {
     // 'c' made, 'r' removed, 'd' a document set or removed, 'l' a version's lock, 'i' the IAM document, its revision
-    // in `owner`, and 'h' a share link, its id in `owner` and nothing for one revoked.
+    // in `owner`, 'h' a share link, its id in `owner` and nothing for one revoked, and 'q' a version the scrub of the
+    // node `owner` found corrupt, which it asks to be sent again.
     char        kind{0};
     std::string owner;
     // A document's kind as bucket_doc numbers it, or a lock's as header_change::kind does.

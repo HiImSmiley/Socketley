@@ -31,6 +31,7 @@
 #include "post_policy.h"
 #include "cluster.h"
 #include "replicator.h"
+#include "scrubber.h"
 #include "s3_auth.h"
 #include "s3_users.h"
 #include "../../shared/storage_rpc.h"
@@ -75,6 +76,9 @@ struct storage_counters
     uint64_t mpu_created{0};
     // Changes of buckets and locks another node of the cluster sent here.
     uint64_t cluster_in{0};
+    // Corrupt copies the scrub had another node send again, and those no node held a good copy of.
+    uint64_t scrub_heals{0};
+    uint64_t scrub_unhealed{0};
     uint64_t mpu_parts{0};
     uint64_t mpu_completed{0};
     uint64_t mpu_aborted{0};
@@ -550,6 +554,16 @@ public:
     const replicator& replication() const { return m_repl; }
     // Makes this runtime a node of the cluster `cfg` names, before open().
     void set_cluster(cluster_config cfg);
+    // A whole scrub in `secs`, 0 for none.
+    void set_scrub_secs(uint32_t secs)
+    {
+        m_scrub.set_period(secs);
+        if (secs)
+            arm_sweep();
+    }
+    const scrubber& scrub() const { return m_scrub; }
+    // A version the scrub found corrupt: logged, and in a cluster taken away and sent again by a node that holds it.
+    void scrub_found(scrubber::finding f);
     // Reads the id of this node's data, or makes it; blocking, so it runs at open().
     bool load_cluster_id(std::string& err);
     const std::string& cluster_self() const { return m_cluster_self; }
@@ -1040,6 +1054,7 @@ private:
     multipart_store   m_mpu;
     notifier          m_notify;
     replicator        m_repl;
+    scrubber          m_scrub;
     // The name the cluster file gives this node, empty for a runtime that is no node of one, and the id of its data.
     std::string       m_cluster_self;
     std::string       m_cluster_id;

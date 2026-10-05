@@ -149,7 +149,7 @@ bool decode_cluster_record(std::string_view in, cluster_record& out)
         !r.bytes(out.version_id, 64))
         return false;
     out.kind = static_cast<char>(kind);
-    return std::string_view("crdlih").find(out.kind) != std::string_view::npos;
+    return std::string_view("crdlihq").find(out.kind) != std::string_view::npos;
 }
 
 }   // namespace socketley::storage

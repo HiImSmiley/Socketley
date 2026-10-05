@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "../../shared/logging.h"
 #include "../../shared/random_id.h"
 
 namespace socketley::storage
@@ -89,6 +90,48 @@ void storage_run::set_cluster(cluster_config cfg)
     });
 }
 
+void storage_run::scrub_found(scrubber::finding f)
+{
+    const std::string what = f.bucket + "/" + f.key + (f.version_id.empty() ? "" : " (version " + f.version_id + ")");
+    const bool plain = m_store.bucket_versioning(f.bucket) == versioning::off;
+    // Only a version named by its id, or an object of a bucket that keeps no versions, is taken away to be replaced.
+    if (!m_repl.has_nodes() || (f.version_id.empty() && !plain))
+    {
+        LOG_ERROR(("storage: " + what + " does not hold the bytes its header names; restore it from a copy").c_str());
+        return;
+    }
+    LOG_ERROR(("storage: " + what + " does not hold the bytes its header names, so another node that holds it is "
+               "asked for it").c_str());
+    const md5_t md5 = f.meta.md5;
+    const int64_t mtime = f.meta.mtime_ms;
+    // Copied first, since the lambda below takes `f` and the order its arguments are made in is the compiler's.
+    std::string bucket = f.bucket, key = f.key, version_id = f.version_id, etag = f.meta.etag();
+    m_repl.find_copy(std::move(bucket), std::move(key), std::move(version_id), std::move(etag),
+                     [this, f = std::move(f), what, md5, mtime](std::string node)
+    {
+        if (node.empty())
+        {
+            ++m_c.scrub_unhealed;
+            LOG_ERROR(("storage: no other node holds " + what + " whole; restore it from a copy").c_str());
+            return;
+        }
+        // The corrupt copy goes quietly, and only while it is still the one the scrub read.
+        m_store.remove_version_local(f.bucket, f.key, f.version_id, [this, f, node, what](remove_result r)
+        {
+            if (r.status != st::ok || !r.existed)
+            {
+                LOG_ERROR(("storage: " + what + " could not be taken away to be replaced (" +
+                           std::string(status_name(r.status)) + ")").c_str());
+                return;
+            }
+            ++m_c.scrub_heals;
+            m_repl.enqueue_node(node, {'q', f.bucket, f.key, f.version_id, {},
+                                       encode_cluster_record({'q', m_cluster_self, 0, {}, f.version_id})});
+        }, [md5, mtime](const object_meta& m) { return m.md5 == md5 && m.mtime_ms == mtime; }, true,
+           change_cause::heal);
+    });
+}
+
 bool storage_run::cluster_mark(const std::shared_ptr<conn>& c, object_meta& m, s3_error& err)
 {
     const s3_request& r = c->req;
@@ -138,7 +181,7 @@ void storage_run::op_cluster(const std::shared_ptr<conn>& c)
         return;
     }
     cluster_record rec;
-    if (!decode_cluster_record(c->body, rec) || (rec.kind == 'l') == q.key.empty() ||
+    if (!decode_cluster_record(c->body, rec) || (rec.kind == 'l' || rec.kind == 'q') == q.key.empty() ||
         (rec.kind == 'i' || rec.kind == 'h') != q.bucket.empty() ||
         (rec.kind == 'd' && rec.what >= std::size(all_bucket_docs)) ||
         (rec.kind == 'l' && rec.what != static_cast<uint8_t>(header_change::kind::retention) &&
@@ -180,6 +223,11 @@ void storage_run::op_cluster(const std::shared_ptr<conn>& c)
             return;
         case 'h':
             answer(share_take(rec.owner, rec.value));
+            return;
+        case 'q':
+            // Another node lost its copy to a disk, and is sent this one again.
+            m_repl.enqueue_node(rec.owner, {'p', q.bucket, q.key, rec.version_id, {}, {}});
+            answer(st::ok);
             return;
         default:
         {

@@ -126,6 +126,8 @@ void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool
         stg.set_fsync_interval_secs(cfg.storage_fsync_interval_secs);
     if (asked("mpu_expire", cfg.storage_mpu_expire_secs > 0))
         stg.set_mpu_expire_secs(cfg.storage_mpu_expire_secs);
+    if (asked("scrub", cfg.storage_scrub_secs > 0))
+        stg.set_scrub_secs(cfg.storage_scrub_secs);
 }
 
 void apply_common_config(runtime_instance& rt, const runtime_config& cfg)

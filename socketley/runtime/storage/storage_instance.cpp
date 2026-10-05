@@ -153,6 +153,7 @@ void storage_instance::refresh_cached_limits()
     {
         m_run->store().set_max_bytes(m_max_bytes);
         m_run->set_mpu_expire_secs(m_mpu_expire_secs);
+        m_run->set_scrub_secs(m_scrub_secs);
     }
 }
 
@@ -270,6 +271,7 @@ bool storage_instance::setup(event_loop& loop)
     if (signed_auth)
         run->adopt_authenticator(std::move(signed_auth));
     run->set_mpu_expire_secs(m_mpu_expire_secs);
+    run->set_scrub_secs(m_scrub_secs);
     run->set_tls(std::move(tls));
     if (std::vector<std::string> d; !m_domain.empty())
     {
@@ -535,6 +537,14 @@ std::string storage_instance::stats_lines() const
         << "cluster_overflows:" << m_run->replication().counters().node_overflows << "\n"
         << "cluster_synced:" << m_run->replication().counters().node_synced << "\n"
         << "cluster_sync_timeouts:" << m_run->replication().counters().node_sync_timeouts << "\n"
+        << "scrub_objects:" << m_run->scrub().counters().objects << "\n"
+        << "scrub_bytes:" << m_run->scrub().counters().bytes << "\n"
+        << "scrub_corrupt:" << m_run->scrub().counters().corrupt << "\n"
+        << "scrub_skipped:" << m_run->scrub().counters().skipped << "\n"
+        << "scrub_passes:" << m_run->scrub().counters().passes << "\n"
+        << "scrub_last_pass_ms:" << m_run->scrub().counters().last_pass_ms << "\n"
+        << "scrub_heals:" << m_run->counters().scrub_heals << "\n"
+        << "scrub_unhealed:" << m_run->counters().scrub_unhealed << "\n"
         << "replication_bytes:" << m_run->replication().counters().bytes << "\n";
     // One line per code answered, so a client's mistakes and the runtime's own
     // are told apart without reading a log.

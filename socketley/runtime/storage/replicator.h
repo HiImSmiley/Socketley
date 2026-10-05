@@ -146,6 +146,12 @@ public:
                    const cluster_change* node = nullptr, bool* copied = nullptr);
     // Queues `c` for every other node of the cluster; true when there is one.
     bool enqueue_nodes(const cluster_change& c);
+    // Queues `c` for the node `name` alone, false when there is no such node.
+    bool enqueue_node(const std::string& name, const cluster_change& c);
+    // Asks the other nodes in turn whether one holds version `version_id` of `key` (the object, when empty) with
+    // `etag`, and tells `found` the first that does, or nothing when none does.
+    void find_copy(std::string bucket, std::string key, std::string version_id, std::string etag,
+                   std::function<void(std::string node)> found);
     // Runs `then` once the entries of the change `ticket` names are synced.
     void staged(uint64_t ticket, std::function<void()> then) { m_box.staged(ticket, std::move(then)); }
     // The change was made or not: its copies are queued or dropped, and `then` runs once that record is synced.
@@ -201,6 +207,8 @@ private:
     struct seeding
     {
         std::unique_ptr<http_peer> probe;
+        // Asks whether the node holds a copy the scrub needs, one question at a time.
+        std::unique_ptr<http_peer> asker;
         bool        asking{false};
         // The node said this run that it holds the data `id` names.
         bool        confirmed{false};
@@ -273,6 +281,16 @@ private:
     size_t        m_node_queue_max{100000};
     // Lets go of a node's queue, which a seeding of everything replaces.
     void overflow(lane& l);
+    // The questions of find_copy(), one at a time, each asking the nodes from `next` on.
+    struct copy_question
+    {
+        std::string bucket, key, version_id, etag;
+        std::function<void(std::string)> found;
+        size_t next{0};
+    };
+    std::deque<copy_question> m_questions;
+    bool          m_asking{false};
+    void ask_next();
     // Asks a node for the id of its data, and begins to send it everything when the id is new to this shard.
     void ask_id(lane& l);
     // Queues the next keys of everything this shard holds for a node, and notes how far it got once that is durable.

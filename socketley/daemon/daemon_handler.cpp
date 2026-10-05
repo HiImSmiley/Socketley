@@ -3568,7 +3568,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                  pa.hashes[i] == fnv1a("--domain") || pa.hashes[i] == fnv1a("--notify-targets") ||
                  pa.hashes[i] == fnv1a("--website-domain") ||
                  pa.hashes[i] == fnv1a("--replication-targets") || pa.hashes[i] == fnv1a("--fsync") ||
-                 pa.hashes[i] == fnv1a("--nodes") ||
+                 pa.hashes[i] == fnv1a("--nodes") || pa.hashes[i] == fnv1a("--scrub") ||
                  pa.hashes[i] == fnv1a("--fsync-interval")))
             {
                 restore_edit();

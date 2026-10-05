@@ -120,6 +120,7 @@ constexpr config_key config_keys[] = {
     { "fsync",              "--fsync",              key_kind::text    },
     { "fsync_interval",     "--fsync-interval",     key_kind::scalar  },
     { "mpu_expire",         "--mpu-expire",         key_kind::scalar  },
+    { "scrub",              "--scrub",              key_kind::scalar  },
 };
 
 // Keys with no flag of their own, listed so an unknown key can still be

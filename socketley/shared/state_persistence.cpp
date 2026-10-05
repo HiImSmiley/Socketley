@@ -800,6 +800,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.storage_fsync = std::string(stg->get_fsync());
             cfg.storage_fsync_interval_secs = stg->get_fsync_interval_secs();
             cfg.storage_mpu_expire_secs = stg->get_mpu_expire_secs();
+            cfg.storage_scrub_secs = stg->get_scrub_secs();
             break;
         }
     }
@@ -1087,6 +1088,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_int_field("fsync_interval", cfg.storage_fsync_interval_secs);
             if (cfg.storage_mpu_expire_secs > 0)
                 append_int_field("mpu_expire", cfg.storage_mpu_expire_secs);
+            if (cfg.storage_scrub_secs > 0)
+                append_int_field("scrub", cfg.storage_scrub_secs);
             break;
     }
 
@@ -1260,6 +1263,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.storage_fsync = json_get_string(json, "fsync");
             cfg.storage_fsync_interval_secs = static_cast<uint32_t>(json_get_size(json, "fsync_interval"));
             cfg.storage_mpu_expire_secs = static_cast<uint32_t>(json_get_size(json, "mpu_expire"));
+            cfg.storage_scrub_secs = static_cast<uint32_t>(json_get_size(json, "scrub"));
             break;
     }
 

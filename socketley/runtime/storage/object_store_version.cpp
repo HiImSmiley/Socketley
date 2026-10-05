@@ -942,11 +942,14 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
     };
     // The removal's events are staged once what it removes or makes is decided, and before the disk is touched.
     const bool lc = cause == change_cause::lifecycle;
+    const bool heal = cause == change_cause::heal;
     const std::string source_version = who.source_version;
     const bool cluster = who.cluster;
     const std::string cluster_text = who.stamp;
-    const auto stage = [this, v, b, lc, who = std::move(who)](bool marker)
+    const auto stage = [this, v, b, lc, heal, who = std::move(who)](bool marker)
     {
+        if (heal)
+            return false;
         change_note n;
         n.bucket     = v->bname;
         n.key        = v->key;
@@ -1047,7 +1050,7 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
         return;
     }
     v->rr = {st::ok, true, is_delete_marker(*f), v->version_id};
-    if (m_mirror)
+    if (m_mirror && !heal)
         note_removed(v->bname, v->key, v->version_id, static_cast<int64_t>(now_ms()));
     if (stage(false))
         return;

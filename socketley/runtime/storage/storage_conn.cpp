@@ -97,6 +97,13 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
                  s3_error ignored;
                  return sse_data_key(m, std::nullopt, out, ignored);
              }),
+      m_scrub(loop, m_io, m_store, m_hash,
+              [this](const object_meta& m, sse_key& out)
+              {
+                  s3_error ignored;
+                  return sse_data_key(m, std::nullopt, out, ignored);
+              },
+              [this](scrubber::finding f) { scrub_found(std::move(f)); }),
       m_transport(owner.get_runtime_manager() ? &owner.get_runtime_manager()->requests() : nullptr,
                   std::string(owner.get_name())),
       m_node(m_store, m_transport), m_auth(auth)
@@ -176,6 +183,7 @@ bool storage_run::open(std::string& err)
         return false;
     if (!m_cluster_self.empty() && !load_cluster_id(err))
         return false;
+    m_scrub.open(m_store.options().dir, m_store.shard());
     reap_uploads();
     LOG_INFO(("storage: " + std::to_string(rep.buckets) + " bucket(s), " +
               std::to_string(rep.objects) + " object(s) in " + m_store.options().dir +
@@ -547,10 +555,11 @@ void storage_run::sweep()
         }
     }
     lifecycle_tick();
+    m_scrub.tick();
     tell_started();
     flush_access_logs(false);
     if (!m_conns.empty() || m_mpu_expire_secs != 0 || m_start_note != start_note::told || m_lc ||
-        m_store.lifecycle_buckets() != 0 || m_store.any_doubt() || !m_access_logs.empty())
+        m_store.lifecycle_buckets() != 0 || m_store.any_doubt() || !m_access_logs.empty() || m_scrub.enabled())
         arm_sweep();
 }
 
@@ -600,6 +609,7 @@ void storage_run::stop()
     m_node.stop();
     m_notify.stop();
     m_repl.stop();
+    m_scrub.stop();
 
     // Nothing new can arrive, so the journal writes, syncs and compaction already begun are let finish, which is what lets close() mark the stop clean.
     const auto give_up = std::chrono::steady_clock::now() + stop_drain_bound;

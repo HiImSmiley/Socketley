@@ -1259,6 +1259,8 @@ lua_config() {
     echo "│ --max-bytes <size>     │ Quota on bytes held (100M, 1G);     │"
     echo "│                        │ a put past it is 507 StorageFull    │"
     echo "│ --mpu-expire <time>    │ Abort uploads open this long (24h)  │"
+    echo "│ --scrub <time>         │ Read every object back once in this │"
+    echo "│                        │ long, checking its MD5 (30d)        │"
     echo "│ --sse-key-file <file>  │ SSE-S3 master key: 32 bytes, mode   │"
     echo "│                        │ 0600; without it AES256 is refused  │"
     echo "│ --domain <name>[,...]  │ Host <bucket>.<name> addresses the  │"
