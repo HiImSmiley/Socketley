@@ -25,6 +25,8 @@ struct logging_config
         std::string permission;
     };
     std::vector<grant> grants;
+    // TargetGrants was given, empty or not, which a target whose ACLs are disabled refuses either way.
+    bool        grants_given{false};
 };
 
 // The document PutBucketLogging takes; false with `err` for anything S3 would refuse, and true with an empty

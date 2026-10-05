@@ -130,7 +130,7 @@ void storage_run::op_put_logging(const std::shared_ptr<conn>& c)
         return;
     }
     // Grants are taken where the target bucket takes ACLs, as S3 refuses them for one whose ACLs are disabled.
-    if (!cfg.grants.empty())
+    if (cfg.grants_given)
     {
         if (bucket_ownership(cfg.target_bucket) == object_ownership::enforced)
         {

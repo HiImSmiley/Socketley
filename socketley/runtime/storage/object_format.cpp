@@ -220,7 +220,8 @@ void object_checksum::set(checksum_algo a, std::string_view raw, uint16_t compos
 {
     // The bytes may be this checksum's own, so they are kept before its storage is let go.
     uint8_t keep[32]{};
-    std::memcpy(keep, raw.data(), std::min(raw.size(), sizeof keep));
+    if (!raw.empty())
+        std::memcpy(keep, raw.data(), std::min(raw.size(), sizeof keep));
     release();
     algo      = a;
     composite = composite_count;

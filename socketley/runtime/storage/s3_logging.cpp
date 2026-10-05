@@ -40,8 +40,9 @@ bool parse_logging_config(std::string_view xml, logging_config& out, s3_error& e
                 bucket = true;
             else if (k.name == "TargetPrefix" && !prefix && leaf(k, out.target_prefix))
                 prefix = true;
-            else if (k.name == "TargetGrants" && out.grants.empty())
+            else if (k.name == "TargetGrants" && !out.grants_given)
             {
+                out.grants_given = true;
                 for (const xml_node& g : k.kids)
                 {
                     logging_config::grant one;
