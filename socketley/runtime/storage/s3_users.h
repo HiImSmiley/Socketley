@@ -22,6 +22,8 @@ struct user_identity
     bool        admin{false};
     // Declared by a section of the credentials file, so a bucket policy's principal may name it by its id.
     bool        configured{false};
+    // The key the nodes of a cluster sign for each other with, whose requests write what another node made.
+    bool        cluster{false};
     bool        has_policy{false};
     bucket_policy policy;
     // The most bytes the buckets this user owns may hold together, 0 for no bound.

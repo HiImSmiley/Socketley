@@ -83,6 +83,10 @@ public:
     void set_replication_targets(std::string_view f) { m_replication_targets = std::string(f); }
     std::string_view get_replication_targets() const { return m_replication_targets; }
 
+    // The cluster file that names this runtime's node, the others, and the key they sign for each other with.
+    void set_cluster_file(std::string_view f) { m_cluster_file = std::string(f); }
+    std::string_view get_cluster_file() const { return m_cluster_file; }
+
     // When an answered write is synced: always before its answer (empty), within --fsync-interval after it, or never
     // before a stop.
     void set_fsync(std::string_view m) { m_fsync = std::string(m); }
@@ -144,6 +148,7 @@ private:
     std::string m_website_domain;
     std::string m_notify_targets;
     std::string m_replication_targets;
+    std::string m_cluster_file;
     std::string m_fsync;
     uint32_t    m_fsync_interval_secs{0};
     uint32_t    m_mpu_expire_secs{0};

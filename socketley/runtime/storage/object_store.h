@@ -35,6 +35,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <list>
 #include <map>
@@ -336,6 +337,9 @@ struct change_origin
     bool        replica{false};
     // The version id the replica's source gave it, which a delete marker it makes keeps when it can.
     std::string source_version{};
+    // Another node of the cluster made the change, which no node sends on, and the stamp it made it with.
+    bool        cluster{false};
+    std::string stamp{};
 };
 
 // A change of what a version keeps in its header's slots, made in place by the owner of its key.
@@ -380,6 +384,13 @@ struct change_note
     // A new version's tags, in the encoding of tags_of(), and the replication status it was written with.
     std::string tags;
     std::string replication;
+    // A version's retention (1) or legal hold (2) changed rather than an event, to the value of its extra entry.
+    uint8_t     lock_change{0};
+    std::string lock_value;
+    // A delete marker's or a removal's stamp, which the other nodes of a cluster make it with.
+    std::string stamp;
+    // A removal of a key this node did not have, which only the other nodes of a cluster are told, since they may.
+    bool        absent{false};
 };
 
 // Whoever sends a bucket's events and copies, told of each change by the owner of its key.
@@ -737,6 +748,9 @@ public:
     // Told by the owner of a key of each change to an object of a bucket with a notification or a replication
     // configuration.
     void set_change_sink(change_sink* sink) { m_sink = sink; }
+    // Every bucket's changes go to the sink, for a node of a cluster, which sends each to the other nodes.
+    void set_mirror(bool on) { m_mirror = on; }
+    bool mirror() const { return m_mirror; }
     // Whether the change `n` describes is in the files, for a start deciding a staged event; blocking.
     bool change_on_disk(const change_note& n) const;
     // The bucket's replication configuration, null when it has none.
@@ -1133,9 +1147,16 @@ private:
     // The order of the newest version `key` has, zero for none.
     static uint64_t newest_seq(const bucket& b, std::string_view key);
     // The version a new latest of `key` is given, newer than every one it has: `source_id`, a replica's id at its
-    // source, when that still is.
-    version_tag next_version(const bucket& b, const std::string& key, bool marker,
-                             std::string_view source_id = {}) const;
+    // source, when that still is, and `exact`, the version another node of the cluster gave the write, always.
+    version_tag next_version(const bucket& b, const std::string& key, bool marker, std::string_view source_id = {},
+                             const version_tag* exact = nullptr) const;
+    // What another node's write of `key` comes to here: ok, precondition_failed when what this node has is newer or
+    // removed it after, and unavailable for a version a bucket that has not yet heard of its versioning cannot keep.
+    st cluster_verdict(const bucket& b, const std::string& key, const object_meta& meta, const cluster_stamp& s) const;
+    // Notes that `key`, or its version `id`, was removed at `when_ms`, so an older write of it that crosses the removal
+    // on its way from another node is not made; kept a day, and only by a node of a cluster.
+    void note_removed(const std::string& bucket, const std::string& key, std::string_view id, int64_t when_ms);
+    int64_t removed_at(const std::string& bucket, const std::string& key, std::string_view id) const;
     // Whether the version a writer put in a body's header is one the owner can give it as it stands.
     bool stamp_holds(const bucket& b, const std::string& key, const object_meta& meta) const;
     // The index's other versions of a key, each change journaled: `m` in its place by order, or the version `id` gone.
@@ -1156,6 +1177,8 @@ private:
     void vop_header(std::shared_ptr<vop> v);
     void vop_copy(std::shared_ptr<vop> v, int src, uint64_t data_off);
     void vop_install(std::shared_ptr<vop> v);
+    // A version older than the key's newest, which only another node's write is, goes in behind the latest.
+    void vop_behind(std::shared_ptr<vop> v);
     // A pooled version renamed into place: the answer, then the syncs, then the lane.
     void vop_pooled(std::shared_ptr<vop> v, bool drop_null);
     void vop_end(std::shared_ptr<vop> v, st s);
@@ -1201,6 +1224,10 @@ private:
     // `grows`, fit the bucket's quota and its owner's.
     st quota_room(const bucket& b, uint64_t add, uint64_t held, bool grows) const;
     change_sink* m_sink{nullptr};
+    bool         m_mirror{false};
+    // The removals note_removed() keeps, by bucket NUL key NUL id, each with when it was noted, and in that order.
+    std::unordered_map<std::string, std::pair<int64_t, int64_t>> m_removed;
+    std::deque<std::pair<int64_t, std::string>> m_removed_order;
     // Stages the events and copies of a change of an object about to be made under its key's lane, 0 when the bucket
     // makes none.
     uint64_t stage_change(const bucket& b, const change_note& n);

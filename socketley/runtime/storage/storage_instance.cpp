@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "cluster.h"
 #include "s3_sigv4_auth.h"
 #include "s3_vhost.h"
 #include "sse.h"
@@ -75,9 +76,17 @@ std::string storage_instance::config_refusal() const
         return "storage: a runtime with no credentials serves nobody; pass --access-key and "
                "--secret-key or --credentials to require signed requests, or --anonymous to "
                "accept every request without authentication\n";
+    if (!m_cluster_file.empty())
+    {
+        socketley::storage::cluster_config cluster;
+        if (std::string why; !socketley::storage::load_cluster(m_cluster_file, cluster, why))
+            return "storage: " + why + "\n";
+        if (m_auth)
+            return "storage: a node of a cluster checks signatures itself, so it takes no authenticator of its own\n";
+    }
     if (has_credentials())
         if (const std::string why = socketley::storage::sigv4_config_error(
-                {m_access_key, m_secret_key, m_credentials_file, m_anonymous, {}}); !why.empty())
+                {m_access_key, m_secret_key, m_credentials_file, m_anonymous, {}, {}, {}}); !why.empty())
             return "storage: " + why + "\n";
     if (!m_sse_key_file.empty())
     {
@@ -212,14 +221,24 @@ bool storage_instance::setup(event_loop& loop)
         }
     }
 
+    // Read here, at every start, so an edited cluster file is the one a restart takes.
+    socketley::storage::cluster_config cluster;
+    if (!m_cluster_file.empty())
+        if (std::string why; !socketley::storage::load_cluster(m_cluster_file, cluster, why))
+        {
+            LOG_ERROR(("storage: " + why).c_str());
+            return false;
+        }
+
     socketley::storage::authenticator* auth = m_auth.get();
     std::unique_ptr<socketley::storage::authenticator> signed_auth;
-    if (!auth && has_credentials())
+    if (!auth && (has_credentials() || !m_cluster_file.empty()))
     {
         // Made at every start, so a reload picks up a changed file and key.
         // The IAM API's users, groups and roles are kept beside the buckets, where every shard reads them.
         auto a = std::make_unique<socketley::storage::sigv4_authenticator>(socketley::storage::sigv4_config{
-            m_access_key, m_secret_key, m_credentials_file, m_anonymous, m_dir + "/.iam.json"});
+            m_access_key, m_secret_key, m_credentials_file, m_anonymous, m_dir + "/.iam.json", cluster.access_key,
+            cluster.secret});
         std::string why;
         if (!a->load(why))
         {
@@ -317,6 +336,8 @@ bool storage_instance::setup(event_loop& loop)
         }
         run->replication().set_targets(std::move(targets));
     }
+    if (!m_cluster_file.empty())
+        run->set_cluster(std::move(cluster));
 
     // The one blocking step: reading the directory and reconciling the journals
     // happens here, before the listener exists, so no connection waits behind it.
@@ -504,6 +525,10 @@ std::string storage_instance::stats_lines() const
         << "replication_retries:" << m_run->replication().counters().retries << "\n"
         << "replication_connects:" << m_run->replication().connects() << "\n"
         << "replication_reuses:" << m_run->replication().reuses() << "\n"
+        << "cluster_pending:" << m_run->replication().node_pending() << "\n"
+        << "cluster_sent:" << m_run->replication().counters().node_sent << "\n"
+        << "cluster_failed:" << m_run->replication().counters().node_failed << "\n"
+        << "cluster_in:" << m_run->counters().cluster_in << "\n"
         << "replication_bytes:" << m_run->replication().counters().bytes << "\n";
     // One line per code answered, so a client's mistakes and the runtime's own
     // are told apart without reading a log.

@@ -5,6 +5,7 @@
 #include <ctime>
 
 #include "body_reader.h"
+#include "cluster.h"
 #include "checksum.h"
 #include "s3_names.h"
 #include "s3_tagging.h"
@@ -69,6 +70,21 @@ std::string describe(const http_answer& a)
     if (open != std::string::npos && close != std::string::npos && close > open)
         d += " " + a.body.substr(open + 6, close - open - 6);
     return d;
+}
+
+// What a change sent to another node is, for the log.
+std::string node_change_name(char kind, bool has_version)
+{
+    switch (kind)
+    {
+        case 'p': return has_version ? "a version" : "an object";
+        case 'm': return "a delete marker";
+        case 'g': return "its tags";
+        case 'd': return "its removal";
+        case 'x': return "a version's removal";
+        case 'l': return "a version's lock";
+        default:  return "the bucket's change";
+    }
 }
 
 // The headers of an object a client set, which its replica is written with.
@@ -165,6 +181,9 @@ struct replicator::job
     bool        source_failed{false};
     // What the last step that did not succeed came to, for the log.
     std::string why;
+    // The connection of its lane it goes on, and whether it is still in flight there.
+    size_t      slot{0};
+    bool        live{true};
 };
 
 replicator::replicator(event_loop& loop, file_io& io, io_handler* owner, object_store& store, hash_pool& hashes,
@@ -183,30 +202,62 @@ replicator::~replicator()
 
 void replicator::set_targets(std::vector<replication_target> targets)
 {
-    m_lanes.clear();
+    std::erase_if(m_lanes, [](const std::unique_ptr<lane>& l) { return !l->target.node; });
+    add_lanes(std::move(targets), false);
+}
+
+void replicator::set_nodes(std::vector<replication_target> nodes)
+{
+    std::erase_if(m_lanes, [](const std::unique_ptr<lane>& l) { return l->target.node; });
+    m_nodes = nodes.size();
+    add_lanes(std::move(nodes), true);
+}
+
+void replicator::add_lanes(std::vector<replication_target> targets, bool nodes)
+{
     bool names = false;
     for (const replication_target& t : targets)
     {
         http_endpoint e;
         names = names || !literal_endpoint(t.http.host, t.http.port, e);
     }
-    if (names && !m_resolver.attach(m_io))
-        LOG_ERROR("storage: the replication resolver cannot be waited for, so targets named by a host are not written to");
+    if (names && !m_resolver_attached)
+    {
+        m_resolver_attached = m_resolver.attach(m_io);
+        if (!m_resolver_attached)
+            LOG_ERROR("storage: the replication resolver cannot be waited for, so targets named by a host are not "
+                      "written to");
+    }
     for (replication_target& t : targets)
     {
-        auto l  = std::make_unique<lane>();
-        l->peer = std::make_unique<http_peer>(m_loop, m_io, m_resolver, t.http, m_hosts_file,
-                                              "the replication target " + t.name);
-        l->peer->prime();
+        t.node = nodes;
+        auto l = std::make_unique<lane>();
+        l->peers.push_back(new_peer(t));
+        l->peers.front()->prime();
         l->target = std::move(t);
         m_lanes.push_back(std::move(l));
     }
 }
 
+std::unique_ptr<http_peer> replicator::new_peer(const replication_target& t)
+{
+    return std::make_unique<http_peer>(m_loop, m_io, m_resolver, t.http, m_hosts_file,
+                                       (t.node ? "the cluster node " : "the replication target ") + t.name);
+}
+
+size_t replicator::free_slot(lane& l)
+{
+    for (size_t i = 0; i < l.peers.size(); ++i)
+        if (std::none_of(l.active.begin(), l.active.end(), [i](const auto& a) { return a->slot == i; }))
+            return i;
+    l.peers.push_back(new_peer(l.target));
+    return l.peers.size() - 1;
+}
+
 bool replicator::has_target(std::string_view name) const
 {
     for (const auto& l : m_lanes)
-        if (l->target.name == name)
+        if (!l->target.node && l->target.name == name)
             return true;
     return false;
 }
@@ -215,7 +266,8 @@ uint64_t replicator::connects() const
 {
     uint64_t n = 0;
     for (const auto& l : m_lanes)
-        n += l->peer->connects();
+        for (const auto& p : l->peers)
+            n += p->connects();
     return n;
 }
 
@@ -223,14 +275,15 @@ uint64_t replicator::reuses() const
 {
     uint64_t n = 0;
     for (const auto& l : m_lanes)
-        n += l->peer->reuses();
+        for (const auto& p : l->peers)
+            n += p->reuses();
     return n;
 }
 
-replicator::lane* replicator::find_lane(std::string_view name)
+replicator::lane* replicator::find_lane(std::string_view name, bool node)
 {
     for (auto& l : m_lanes)
-        if (l->target.name == name)
+        if (l->target.node == node && l->target.name == name)
             return l.get();
     return nullptr;
 }
@@ -247,23 +300,34 @@ bool replicator::open(const std::string& dir, uint32_t shard, const outbox::chan
         std::string target;
         task t;
         t.id = id;
-        if (!r.u8(kind) || !r.bytes(target, 4096) || !r.bytes(t.bucket, 4096) || !r.bytes(t.key, 4096) ||
-            !r.bytes(t.version_id, 4096) || !r.bytes(t.dest_bucket, 4096) || !r.bytes(t.storage_class, 4096) ||
-            (kind != 'P' && kind != 'M' && kind != 'G') || (kind == 'G' && !r.bytes(t.tags, 64 * 1024)))
+        if (!r.u8(kind) || !r.bytes(target, 4096))
         {
             ++dropped;
             return false;
         }
-        lane* l = find_lane(target);
+        const bool node = std::string_view("pmgdxlb").find(static_cast<char>(kind)) != std::string_view::npos;
+        const bool read = node ? r.bytes(t.bucket, 4096) && r.bytes(t.key, 4096) && r.bytes(t.version_id, 4096) &&
+                                     r.bytes(t.stamp, 4096) && r.bytes(t.tags, max_record_bytes)
+                               : r.bytes(t.bucket, 4096) && r.bytes(t.key, 4096) && r.bytes(t.version_id, 4096) &&
+                                     r.bytes(t.dest_bucket, 4096) && r.bytes(t.storage_class, 4096) &&
+                                     (kind == 'P' || kind == 'M' || kind == 'G') &&
+                                     (kind != 'G' || r.bytes(t.tags, 64 * 1024));
+        lane* l = read ? find_lane(target, node) : nullptr;
         if (!l)
         {
             ++dropped;
             return false;
         }
+        if (node)
+        {
+            t.node_kind   = static_cast<char>(kind);
+            t.dest_bucket = t.bucket;
+        }
         t.marker  = kind == 'M';
         t.tagging = kind == 'G';
         if (kind == 'P')
             ++m_open[version_key(t.bucket, t.key, t.version_id)];
+        m_node_pending += node ? 1 : 0;
         l->q.push_back(std::move(t));
         ++m_pending;
         ++again;
@@ -273,7 +337,7 @@ bool replicator::open(const std::string& dir, uint32_t shard, const outbox::chan
         return false;
     if (dropped)
         LOG_WARN(("storage: " + std::to_string(dropped) +
-                  " replication(s) in the outbox name a target that is gone, and are dropped").c_str());
+                  " replication(s) in the outbox name a target or a cluster node that is gone, and are dropped").c_str());
 
     // A version answered PENDING whose entry a crash or a failed write took is queued again from what the index says.
     uint64_t swept = 0;
@@ -309,7 +373,7 @@ replicator::lane* replicator::tasks_for(const replication_config& cfg, const std
     if (m_stopped || version_id.empty())
         return nullptr;
     const auto rules = replication_rules_for(cfg, key, tags, marker);
-    lane* l = find_lane(cfg.target);
+    lane* l = find_lane(cfg.target, false);
     if (rules.empty() || !l)
         return nullptr;
     for (const replication_rule* r : rules)
@@ -329,6 +393,17 @@ replicator::lane* replicator::tasks_for(const replication_config& cfg, const std
 std::string replicator::encode_task(const lane& l, const task& t)
 {
     bytes::writer w;
+    if (t.node_kind)
+    {
+        w.u8(static_cast<uint8_t>(t.node_kind));
+        w.bytes(l.target.name);
+        w.bytes(t.bucket);
+        w.bytes(t.key);
+        w.bytes(t.version_id);
+        w.bytes(t.stamp);
+        w.bytes(t.tags);
+        return w.take();
+    }
     w.u8(t.tagging ? 'G' : t.marker ? 'M' : 'P');
     w.bytes(l.target.name);
     w.bytes(t.bucket);
@@ -376,21 +451,61 @@ bool replicator::enqueue_tags(const replication_config& cfg, const std::string& 
     return true;
 }
 
-uint64_t replicator::stage(std::string_view check, const replication_config& cfg, const std::string& bucket,
-                           const std::string& key, const std::string& version_id, bool marker, std::string_view tags)
+replicator::task replicator::node_task(const cluster_change& c)
+{
+    task t;
+    t.node_kind   = c.kind;
+    t.bucket      = c.bucket;
+    t.key         = c.key;
+    t.version_id  = c.version_id;
+    t.dest_bucket = c.bucket;
+    t.stamp       = c.stamp;
+    t.tags        = c.payload;
+    return t;
+}
+
+bool replicator::enqueue_nodes(const cluster_change& c)
+{
+    if (m_stopped || m_nodes == 0)
+        return false;
+    for (auto& l : m_lanes)
+        if (l->target.node)
+            push(*l, node_task(c), false);
+    return true;
+}
+
+uint64_t replicator::stage(std::string_view check, const replication_config* cfg, const std::string& bucket,
+                           const std::string& key, const std::string& version_id, bool marker, std::string_view tags,
+                           const cluster_change* node, bool* copied)
 {
     std::vector<task> tasks;
-    lane* l = tasks_for(cfg, bucket, key, version_id, marker, tags, tasks);
-    if (!l)
+    lane* l = cfg ? tasks_for(*cfg, bucket, key, version_id, marker, tags, tasks) : nullptr;
+    if (copied)
+        *copied = l != nullptr;
+    std::vector<std::pair<lane*, task>> node_tasks;
+    if (node && !m_stopped)
+        for (auto& nl : m_lanes)
+            if (nl->target.node)
+                node_tasks.emplace_back(nl.get(), node_task(*node));
+    if (!l && node_tasks.empty())
         return 0;
     std::vector<std::string> payloads;
-    for (const task& t : tasks)
-        payloads.push_back(encode_task(*l, t));
+    if (l)
+        for (const task& t : tasks)
+            payloads.push_back(encode_task(*l, t));
+    for (const auto& [nl, t] : node_tasks)
+        payloads.push_back(encode_task(*nl, t));
     std::vector<uint64_t> ids;
     const uint64_t ticket = m_box.stage(check, payloads, ids);
-    for (size_t i = 0; i < tasks.size(); ++i)
-        tasks[i].id = ids[i];
-    m_staged.emplace(ticket, staged_copies{l, std::move(tasks)});
+    size_t i = 0;
+    if (l)
+        for (task& t : tasks)
+            t.id = ids[i++];
+    for (auto& nt : node_tasks)
+        nt.second.id = ids[i++];
+    if (!l)
+        tasks.clear();
+    m_staged.emplace(ticket, staged_copies{l, std::move(tasks), std::move(node_tasks)});
     return ticket;
 }
 
@@ -418,6 +533,8 @@ void replicator::settle(uint64_t ticket, bool made, std::function<void()> then)
         }
         for (task& t : sc.tasks)
             push(*sc.l, std::move(t), true);
+        for (auto& [nl, t] : sc.node_tasks)
+            push(*nl, std::move(t), true);
     }
     m_box.settle(ticket, made, std::move(then));
 }
@@ -426,6 +543,7 @@ void replicator::push(lane& l, task t, bool from_outbox)
 {
     if (!from_outbox)
         t.id = m_box.add(encode_task(l, t));
+    m_node_pending += t.node_kind ? 1 : 0;
     l.q.push_back(std::move(t));
     ++m_pending;
     start(l);
@@ -452,10 +570,11 @@ void replicator::on_timer()
     for (auto& lp : m_lanes)
     {
         lane& l = *lp;
-        l.peer->tick(now);
-        if (!l.active && !l.q.empty() && now >= l.next_try)
+        for (auto& p : l.peers)
+            p->tick(now);
+        if (!l.q.empty() && now >= l.next_try)
             start(l);
-        waiting = waiting || l.active || !l.q.empty();
+        waiting = waiting || !l.active.empty() || !l.q.empty();
     }
     if (waiting)
         arm_timer();
@@ -463,23 +582,69 @@ void replicator::on_timer()
 
 void replicator::start(lane& l)
 {
-    if (l.active || l.q.empty() || m_stopped)
+    if (l.q.empty() || m_stopped || l.active.size() >= lane_width)
         return;
     if (std::chrono::steady_clock::now() < l.next_try)
     {
         arm_timer();
         return;
     }
-    auto j = std::make_shared<job>();
-    j->t     = l.q.front();
-    l.active = j;
+    // A key's copies go one at a time and in order, and a bucket's change alone, after what is in flight and before
+    // what follows it.
+    std::vector<std::shared_ptr<job>> started;
+    size_t scanned = 0;
+    std::string name;
+    for (auto it = l.q.begin(); it != l.q.end() && l.active.size() < lane_width && scanned < lane_scan; ++scanned)
+    {
+        const bool barrier = it->node_kind == 'b';
+        if (l.barrier || (barrier && !l.active.empty()))
+            break;
+        name = version_key(it->bucket, it->key, {});
+        if (l.busy.contains(name))
+        {
+            ++it;
+            continue;
+        }
+        auto j  = std::make_shared<job>();
+        j->t    = std::move(*it);
+        it      = l.q.erase(it);
+        j->slot = free_slot(l);
+        l.active.push_back(j);
+        l.busy.insert(std::move(name));
+        l.barrier = barrier;
+        started.push_back(j);
+    }
     arm_timer();
-    if (j->t.tagging)
+    // Started once the queue is no longer walked, since a step that ends at once starts the next copies itself.
+    for (const auto& j : started)
+        if (j->live)
+            run(l, j);
+}
+
+void replicator::run(lane& l, const std::shared_ptr<job>& j)
+{
+    if (j->t.node_kind)
+        run_node(l, j);
+    else if (j->t.tagging)
         run_tags(l, j);
     else if (j->t.marker)
         run_marker(l, j);
     else
         run_put(l, j);
+}
+
+void replicator::land(lane& l, const std::shared_ptr<job>& j)
+{
+    j->live = false;
+    std::erase(l.active, j);
+    l.busy.erase(version_key(j->t.bucket, j->t.key, {}));
+    l.barrier = false;
+}
+
+void replicator::requeue(lane& l, const std::shared_ptr<job>& j)
+{
+    land(l, j);
+    l.q.push_front(std::move(j->t));
 }
 
 void replicator::back_off(lane& l)
@@ -508,10 +673,9 @@ void replicator::set_status(const std::string& bucket, const std::string& key, c
     });
 }
 
-void replicator::ended(lane& l, outcome o, uint64_t bytes)
+void replicator::ended(lane& l, const std::shared_ptr<job>& j, outcome o, uint64_t bytes)
 {
-    std::shared_ptr<job> j = l.active;
-    if (!j)
+    if (!j->live)
         return;
     if (j->fd >= 0)
     {
@@ -520,7 +684,12 @@ void replicator::ended(lane& l, outcome o, uint64_t bytes)
     }
     const task& t = j->t;
     // A streak of failures is said once, at its start, and a refusal every time.
-    if ((o == outcome::retry && l.failures == 0) || o == outcome::refused)
+    if (((o == outcome::retry && l.failures == 0) || o == outcome::refused) && t.node_kind)
+        LOG_WARN(("storage: sending " + t.bucket + (t.key.empty() ? "" : "/" + t.key) + " (" + node_change_name(t.node_kind, !t.version_id.empty()) +
+                  ") to the cluster node " + l.target.name + " failed (" + j->why + ")" +
+                  (o == outcome::retry ? "; it is sent again until it is taken" : "; it is given up"))
+                     .c_str());
+    else if ((o == outcome::retry && l.failures == 0) || o == outcome::refused)
         LOG_WARN(("storage: copying " + t.bucket + "/" + t.key +
                   (t.tagging ? " (its tags)" : t.marker ? " (a delete marker)" : "") + " to " + l.target.name + ":" +
                   t.dest_bucket + " failed (" + j->why + ")" +
@@ -530,13 +699,19 @@ void replicator::ended(lane& l, outcome o, uint64_t bytes)
                      .c_str());
     if (o == outcome::retry)
     {
-        l.active.reset();
+        requeue(l, j);
         back_off(l);
         return;
     }
     auto retire = [this, &l, j, o, bytes]()
     {
-        if (o == outcome::done)
+        land(l, j);
+        if (j->t.node_kind)
+        {
+            ++(o == outcome::done ? m_c.node_sent : m_c.node_failed);
+            --m_node_pending;
+        }
+        else if (o == outcome::done)
         {
             ++m_c.completed;
             m_c.bytes += bytes;
@@ -544,16 +719,13 @@ void replicator::ended(lane& l, outcome o, uint64_t bytes)
         else
             ++m_c.failed;
         m_box.done(j->t.id);
-        if (!l.q.empty() && l.q.front().id == j->t.id)
-            l.q.pop_front();
         --m_pending;
-        l.active.reset();
         l.failures = 0;
         l.next_try = {};
         start(l);
     };
-    // A delete marker and a tag change have no status of their own to write.
-    if (t.marker || t.tagging)
+    // A delete marker, a tag change and a change sent to another node have no status of their own to write.
+    if (t.marker || t.tagging || t.node_kind)
     {
         retire();
         return;
@@ -581,7 +753,7 @@ void replicator::ended(lane& l, outcome o, uint64_t bytes)
     lane* lp = &l;
     set_status(t.bucket, t.key, t.version_id, status, [this, alive, lp, j, vk, retire](bool written)
     {
-        if (!*alive || lp->active != j)
+        if (!*alive || !j->live)
             return;
         if (written)
         {
@@ -590,7 +762,7 @@ void replicator::ended(lane& l, outcome o, uint64_t bytes)
         }
         // The copy is made again, since its status is what a restart goes by.
         ++m_open[vk];
-        lp->active.reset();
+        requeue(*lp, j);
         back_off(*lp);
     });
 }
@@ -602,15 +774,40 @@ replicator::outcome replicator::judge(const http_answer& a)
     return outcome::refused;
 }
 
+replicator::outcome replicator::judge_node(task& t, const http_answer& a)
+{
+    const std::string code = element_text(a.body, "Code");
+    // The node has the change or a newer one, or nothing a removal, a tag or a lock could change.
+    if (a.status == 412 || (a.status == 404 && code != "NoSuchBucket" && t.node_kind != 'p' && t.node_kind != 'b'))
+        return outcome::done;
+    // A bucket that is not made yet, or not emptied yet, waits for the change another lane carries, but not forever.
+    if (a.status == 404 || a.status == 409)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (t.waiting_since == std::chrono::steady_clock::time_point{})
+            t.waiting_since = now;
+        return now - t.waiting_since > node_wait_limit ? outcome::refused : outcome::retry;
+    }
+    // A node that is down, busy, or not given this node's key yet, is sent the change until it takes it.
+    if (a.status == 0 || a.status >= 500 || a.status == 403 || a.status == 408 || a.status == 429)
+        return outcome::retry;
+    return outcome::refused;
+}
+
+replicator::outcome replicator::judge_of(task& t, const http_answer& a)
+{
+    return t.node_kind ? judge_node(t, a) : judge(a);
+}
+
 void replicator::exchange(lane& l, const std::shared_ptr<job>& j, http_request rq,
                           std::function<void(lane&, const std::shared_ptr<job>&, http_answer)> then)
 {
     auto alive = m_alive;
     lane* lp = &l;
     rq.answer_secs = answer_secs;
-    l.peer->exchange(std::move(rq), [alive, lp, j, then](http_answer a)
+    l.peers[j->slot]->exchange(std::move(rq), [alive, lp, j, then](http_answer a)
     {
-        if (!*alive || lp->active != j)
+        if (!*alive || !j->live)
             return;
         if (a.status / 100 != 2)
             j->why = describe(a);
@@ -675,9 +872,9 @@ void replicator::run_marker(lane& l, const std::shared_ptr<job>& j)
     rq.head = signed_head(l, "DELETE", object_path(l.target.http, j->t.dest_bucket, j->t.key), {},
                           {{"x-amz-replication-status", "REPLICA"},
                            {std::string(replica_version_header), j->t.version_id}}, 0);
-    exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>&, http_answer a)
+    exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>& jj, http_answer a)
     {
-        ended(lp, a.status / 100 == 2 ? outcome::done : judge(a), 0);
+        ended(lp, jj, a.status / 100 == 2 ? outcome::done : judge(a), 0);
     });
 }
 
@@ -697,26 +894,92 @@ void replicator::run_tags(lane& l, const std::shared_ptr<job>& j)
         h.emplace_back("content-type", "application/xml");
         rq.head = signed_head(l, "PUT", path, query, std::move(h), rq.body.size());
     }
-    exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>&, http_answer a)
+    exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>& jj, http_answer a)
     {
-        ended(lp, a.status / 100 == 2 ? outcome::done : judge(a), 0);
+        ended(lp, jj, a.status / 100 == 2 ? outcome::done : judge(a), 0);
     });
+}
+
+http_request replicator::node_record(const lane& l, const task& t) const
+{
+    http_request rq;
+    std::string path = l.target.http.path;
+    while (!path.empty() && path.back() == '/')
+        path.pop_back();
+    path += "/" + t.bucket;
+    if (t.node_kind == 'l')
+        path = object_path(l.target.http, t.bucket, t.key);
+    rq.body = t.tags;
+    rq.head = signed_head(l, "POST", path, std::string(cluster_query) + "=",
+                          {{"content-type", "application/octet-stream"}}, rq.body.size());
+    return rq;
+}
+
+void replicator::run_node(lane& l, const std::shared_ptr<job>& j)
+{
+    const task& t = j->t;
+    auto settle = [this](lane& lp, const std::shared_ptr<job>& jj, http_answer a)
+    {
+        ended(lp, jj, a.status / 100 == 2 ? outcome::done : judge_node(jj->t, a), 0);
+    };
+    http_request rq;
+    const std::string path = object_path(l.target.http, t.bucket, t.key);
+    switch (t.node_kind)
+    {
+        case 'p':
+            run_put(l, j);
+            return;
+        case 'm':
+        case 'd':
+            rq.head = signed_head(l, "DELETE", path, {}, {{std::string(cluster_stamp_header), t.stamp}}, 0);
+            break;
+        case 'x':
+            rq.head = signed_head(l, "DELETE", path, "versionId=" + url_encode(t.version_id, false), {}, 0);
+            break;
+        case 'g':
+        {
+            const std::string query =
+                t.version_id.empty() ? std::string("tagging=") : "tagging=&versionId=" + url_encode(t.version_id, false);
+            if (t.tags.empty())
+                rq.head = signed_head(l, "DELETE", path, query, {}, 0);
+            else
+            {
+                rq.body = tagging_xml(decode_tags(t.tags));
+                const auto md5 = md5_of(rq.body);
+                rq.head = signed_head(l, "PUT", path, query,
+                                      {{"content-md5", base64_encode(std::string_view(
+                                                           reinterpret_cast<const char*>(md5.data()), 16))},
+                                       {"content-type", "application/xml"}},
+                                      rq.body.size());
+            }
+            break;
+        }
+        default:
+            rq = node_record(l, t);
+            break;
+    }
+    exchange(l, j, std::move(rq), std::move(settle));
 }
 
 void replicator::run_put(lane& l, const std::shared_ptr<job>& j)
 {
     auto alive = m_alive;
     lane* lp = &l;
-    m_store.open_version(j->t.bucket, j->t.key, j->t.version_id, 0, [this, alive, lp, j](open_result o)
+    auto then = [this, alive, lp, j](open_result o)
     {
-        if (!*alive || lp->active != j)
+        if (!*alive || !j->live)
         {
             if (o.fd >= 0)
                 m_loop.close_fd(o.fd);
             return;
         }
         opened(*lp, j, std::move(o));
-    });
+    };
+    // An object of a bucket that keeps no versions is sent as it is now, which is its newest write.
+    if (j->t.version_id.empty())
+        m_store.open_object(j->t.bucket, j->t.key, 0, std::move(then));
+    else
+        m_store.open_version(j->t.bucket, j->t.key, j->t.version_id, 0, std::move(then));
 }
 
 void replicator::opened(lane& l, const std::shared_ptr<job>& j, open_result o)
@@ -729,7 +992,7 @@ void replicator::opened(lane& l, const std::shared_ptr<job>& j, open_result o)
         const bool gone = o.delete_marker || o.status == st::no_such_version || o.status == st::no_such_key ||
                           o.status == st::no_such_bucket;
         j->why = std::string("the version could not be opened: ") + status_name(o.status);
-        ended(l, gone ? outcome::done : outcome::retry, 0);
+        ended(l, j, gone ? outcome::done : outcome::retry, 0);
         return;
     }
     j->fd       = o.fd;
@@ -742,7 +1005,7 @@ void replicator::opened(lane& l, const std::shared_ptr<job>& j, open_result o)
         if (sse_mode_of(j->meta) == sse_mode::c || !m_keys || !m_keys(j->meta, k))
         {
             j->why = "its data key does not open here";
-            ended(l, outcome::refused, 0);
+            ended(l, j, outcome::refused, 0);
             return;
         }
         j->key = k;
@@ -770,7 +1033,7 @@ void replicator::opened(lane& l, const std::shared_ptr<job>& j, open_result o)
     if (!m_io.pread(j->fd, buf->data(), static_cast<uint32_t>(t.len), j->data_off + t.at,
                     [this, alive, lp, j, buf, t](int64_t r)
         {
-            if (!*alive || lp->active != j)
+            if (!*alive || !j->live)
                 return;
             j->parts = part_list{};
             if (r != static_cast<int64_t>(t.len) || !decode_part_trailer(*buf, j->meta, t, j->parts) ||
@@ -781,7 +1044,7 @@ void replicator::opened(lane& l, const std::shared_ptr<job>& j, open_result o)
             }
             mpu_create(*lp, j);
         }))
-        ended(l, outcome::retry, 0);
+        ended(l, j, outcome::retry, 0);
 }
 
 http_body_source replicator::body_of(const std::shared_ptr<job>& j, uint64_t first, uint64_t len)
@@ -848,6 +1111,23 @@ std::vector<std::pair<std::string, std::string>> replica_headers(const object_me
     return h;
 }
 
+// The headers another node of the cluster is sent an object with: a replica's, its lock, and its stamp in place of the
+// replication status, so the node keeps the version and the time this one gave it.
+std::vector<std::pair<std::string, std::string>> node_headers(const object_meta& m)
+{
+    auto h = replica_headers(m, {});
+    std::erase_if(h, [](const auto& e) { return e.first == "x-amz-replication-status" || e.first == replica_version_header; });
+    for (const auto& [n, v] : m.extra)
+    {
+        if (n == retention_extra)
+            h.emplace_back(std::string(cluster_retention_header), v);
+        else if (n == legal_hold_extra)
+            h.emplace_back(std::string(cluster_legal_hold_header), v);
+    }
+    h.emplace_back(std::string(cluster_stamp_header), cluster_stamp_text({version_of(m), m.mtime_ms}));
+    return h;
+}
+
 // The object's own checksum in `algo`, empty when it keeps none.
 std::string checksum_value(const object_meta& m, checksum_algo algo)
 {
@@ -861,7 +1141,7 @@ std::string checksum_value(const object_meta& m, checksum_algo algo)
 void replicator::send_single(lane& l, const std::shared_ptr<job>& j)
 {
     const object_meta& m = j->meta;
-    auto h = replica_headers(m, j->t.storage_class);
+    auto h = j->t.node_kind ? node_headers(m) : replica_headers(m, j->t.storage_class);
     // The bytes are checked by the destination against the source's own digests, so a copy torn on the way is refused.
     h.emplace_back("content-md5", base64_encode(std::string_view(reinterpret_cast<const char*>(m.md5.data()), 16)));
     const checksum_algo algo = checksum_algo_of(m);
@@ -874,16 +1154,16 @@ void replicator::send_single(lane& l, const std::shared_ptr<job>& j)
     exchange(l, j, std::move(rq), [this](lane& lp, const std::shared_ptr<job>& jj, http_answer a)
     {
         if (a.status / 100 == 2)
-            ended(lp, outcome::done, jj->meta.size);
+            ended(lp, jj, outcome::done, jj->meta.size);
         else
-            ended(lp, jj->source_failed ? outcome::refused : judge(a), 0);
+            ended(lp, jj, jj->source_failed ? outcome::refused : judge_of(jj->t, a), 0);
     });
 }
 
 void replicator::mpu_create(lane& l, const std::shared_ptr<job>& j)
 {
     const object_meta& m = j->meta;
-    auto h = replica_headers(m, j->t.storage_class);
+    auto h = j->t.node_kind ? node_headers(m) : replica_headers(m, j->t.storage_class);
     const checksum_algo algo = checksum_algo_of(m);
     if (const std::string v = checksum_value(m, algo); !v.empty())
     {
@@ -896,14 +1176,14 @@ void replicator::mpu_create(lane& l, const std::shared_ptr<job>& j)
     {
         if (a.status / 100 != 2)
         {
-            ended(lp, judge(a), 0);
+            ended(lp, jj, judge_of(jj->t, a), 0);
             return;
         }
         jj->upload_id = element_text(a.body, "UploadId");
         if (jj->upload_id.empty())
         {
             jj->why = "the upload's creation named no UploadId";
-            ended(lp, outcome::retry, 0);
+            ended(lp, jj, outcome::retry, 0);
             return;
         }
         jj->part = 0;
@@ -927,7 +1207,8 @@ void replicator::mpu_part(lane& l, const std::shared_ptr<job>& j)
     const uint32_t number = j->parts.numbers.size() == j->parts.sizes.size() ? j->parts.numbers[i]
                                                                             : static_cast<uint32_t>(i + 1);
     std::vector<std::pair<std::string, std::string>> h;
-    h.emplace_back("x-amz-replication-status", "REPLICA");
+    if (!j->t.node_kind)
+        h.emplace_back("x-amz-replication-status", "REPLICA");
     const checksum_algo algo = checksum_algo_of(j->meta);
     if (algo != checksum_algo::none && i < j->parts.checksums.size() && !j->parts.checksums[i].empty())
         h.emplace_back(std::string(checksum_header(algo)), base64_encode(j->parts.checksums[i]));
@@ -940,7 +1221,7 @@ void replicator::mpu_part(lane& l, const std::shared_ptr<job>& j)
     {
         if (a.status / 100 != 2)
         {
-            mpu_abort(lp, jj, jj->source_failed ? outcome::refused : judge(a));
+            mpu_abort(lp, jj, jj->source_failed ? outcome::refused : judge_of(jj->t, a));
             return;
         }
         const checksum_algo algo = checksum_algo_of(jj->meta);
@@ -973,7 +1254,8 @@ void replicator::mpu_complete(lane& l, const std::shared_ptr<job>& j)
     x += "</CompleteMultipartUpload>";
     std::vector<std::pair<std::string, std::string>> h;
     h.emplace_back("content-type", "application/xml");
-    h.emplace_back("x-amz-replication-status", "REPLICA");
+    if (!j->t.node_kind)
+        h.emplace_back("x-amz-replication-status", "REPLICA");
     const std::string query = "uploadId=" + url_encode(j->upload_id, false);
     http_request rq;
     rq.head = signed_head(l, "POST", object_path(l.target.http, j->t.dest_bucket, j->t.key), query, std::move(h),
@@ -984,12 +1266,12 @@ void replicator::mpu_complete(lane& l, const std::shared_ptr<job>& j)
         // A completion may be refused inside a 200, as S3 answers one it worked on for a while.
         if (a.status / 100 == 2 && a.body.find("<Error>") == std::string::npos)
         {
-            ended(lp, outcome::done, jj->meta.size);
+            ended(lp, jj, outcome::done, jj->meta.size);
             return;
         }
         if (a.status / 100 == 2)
             jj->why = "the completion was refused inside its 200";
-        mpu_abort(lp, jj, a.status / 100 == 2 ? outcome::retry : judge(a));
+        mpu_abort(lp, jj, a.status / 100 == 2 ? outcome::retry : judge_of(jj->t, a));
     });
 }
 
@@ -998,12 +1280,14 @@ void replicator::mpu_abort(lane& l, const std::shared_ptr<job>& j, outcome o)
     const std::string why = j->why;
     const std::string query = "uploadId=" + url_encode(j->upload_id, false);
     http_request rq;
-    rq.head = signed_head(l, "DELETE", object_path(l.target.http, j->t.dest_bucket, j->t.key), query,
-                          {{"x-amz-replication-status", "REPLICA"}}, 0);
+    std::vector<std::pair<std::string, std::string>> h;
+    if (!j->t.node_kind)
+        h.emplace_back("x-amz-replication-status", "REPLICA");
+    rq.head = signed_head(l, "DELETE", object_path(l.target.http, j->t.dest_bucket, j->t.key), query, std::move(h), 0);
     exchange(l, j, std::move(rq), [this, o, why](lane& lp, const std::shared_ptr<job>& jj, http_answer)
     {
         jj->why = why;
-        ended(lp, o, 0);
+        ended(lp, jj, o, 0);
     });
 }
 
@@ -1014,10 +1298,16 @@ void replicator::stop()
     m_stopped = true;
     for (auto& l : m_lanes)
     {
-        l->peer->stop();
-        if (l->active && l->active->fd >= 0)
-            m_loop.close_fd(l->active->fd);
-        l->active.reset();
+        for (auto& p : l->peers)
+            p->stop();
+        for (auto& j : l->active)
+        {
+            if (j->fd >= 0)
+                m_loop.close_fd(j->fd);
+            j->live = false;
+        }
+        l->active.clear();
+        l->busy.clear();
     }
     if (m_timer_armed)
         m_loop.submit_timeout_remove(&m_timer_req);

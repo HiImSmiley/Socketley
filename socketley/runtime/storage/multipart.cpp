@@ -1145,7 +1145,8 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
         plan.meta.size  = total;
         plan.meta.md5   = md5_of(md5s);
         plan.meta.parts = static_cast<uint32_t>(parts.size());
-        plan.meta.mtime_ms = static_cast<int64_t>(m_store->now_ms());
+        cluster_stamp stamp;
+        plan.meta.mtime_ms = cluster_stamp_of(plan.meta, stamp) ? stamp.mtime_ms : static_cast<int64_t>(m_store->now_ms());
         const auto type = std::find_if(plan.meta.extra.begin(), plan.meta.extra.end(),
                                        [](const auto& e) { return e.first == checksum_type_extra; });
         const bool full = type != plan.meta.extra.end();

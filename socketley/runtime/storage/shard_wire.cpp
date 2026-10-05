@@ -48,15 +48,18 @@ void put_origin(bytes::writer& w, const change_origin& who)
     w.bytes(who.source_ip);
     w.u8(who.replica ? 1 : 0);
     w.bytes(who.source_version);
+    w.u8(who.cluster ? 1 : 0);
+    w.bytes(who.stamp);
 }
 
 bool get_origin(bytes::reader& r, change_origin& who)
 {
-    uint8_t replica = 0;
+    uint8_t replica = 0, cluster = 0;
     if (!r.bytes(who.principal, 1024) || !r.bytes(who.source_ip, 64) || !r.u8(replica) ||
-        !r.bytes(who.source_version, 64))
+        !r.bytes(who.source_version, 64) || !r.u8(cluster) || !r.bytes(who.stamp, 128))
         return false;
     who.replica = replica != 0;
+    who.cluster = cluster != 0;
     return true;
 }
 

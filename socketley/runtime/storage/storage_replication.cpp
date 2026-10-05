@@ -2,6 +2,7 @@
 // is written with, and the copies the owner of a key queues for each change it makes.
 #include "storage_run.h"
 
+#include "cluster.h"
 #include "s3_notify.h"
 #include "s3_replication.h"
 #include "s3_xml.h"
@@ -106,8 +107,10 @@ void storage_run::replication_mark(std::string_view bucket, std::string_view key
                                    bool replica)
 {
     set_replication_status(m, {});
-    // A copy of a replica is no replica, so the source's version id it carried goes with the status.
+    // A copy of a replica is no replica, so the source's version id it carried goes with the status, as does the stamp
+    // of another node's write.
     std::erase_if(m.extra, [](const auto& e) { return e.first == replica_version_extra; });
+    clear_cluster_extra(m);
     // A replica is not copied on, which is what keeps two buckets that replicate to each other from doing so forever.
     if (replica)
     {
@@ -145,16 +148,61 @@ bool storage_run::replicate_change(const change_note& n)
     return n.event == ev_marker && m_repl.enqueue(*cfg, n.bucket, n.key, n.version_id, true, {});
 }
 
-uint64_t storage_run::stage_copies(const change_note& n, std::string_view check)
+uint64_t storage_run::stage_copies(const change_note& n, std::string_view check, bool& copied)
 {
-    const auto cfg = m_store.bucket_replication(n.bucket);
-    if (!cfg || n.who.replica)
+    copied = false;
+    const auto cfg = n.who.replica ? nullptr : m_store.bucket_replication(n.bucket);
+    const bool copies = cfg && (n.has_object ? n.replication == replication_pending : n.event == ev_marker);
+    cluster_change cc;
+    const bool to_nodes = node_change(n, cc);
+    if (!copies && !to_nodes)
         return 0;
+    return m_repl.stage(check, copies ? cfg.get() : nullptr, n.bucket, n.key, n.version_id, !n.has_object, n.tags,
+                        to_nodes ? &cc : nullptr, &copied);
+}
+
+bool storage_run::node_change(const change_note& n, cluster_change& out) const
+{
+    // A lifecycle rule's change is every node's own, since each runs the bucket's rules.
+    if (!m_repl.has_nodes() || n.who.cluster || n.event == ev_lc_delete || n.event == ev_lc_marker)
+        return false;
+    out = cluster_change{};
+    out.bucket = n.bucket;
+    out.key    = n.key;
+    // A bucket that keeps no versions names none, where another node's may.
+    out.version_id = m_store.bucket_versioning(n.bucket) == versioning::off && n.version_id == "null" ? std::string()
+                                                                                                    : n.version_id;
+    if (n.lock_change)
+    {
+        out.kind    = 'l';
+        out.payload = encode_cluster_record({'l', {}, static_cast<uint8_t>(n.lock_change == 1
+                                                                               ? header_change::kind::retention
+                                                                               : header_change::kind::legal_hold),
+                                             n.lock_value, out.version_id});
+        return true;
+    }
+    if (n.event == ev_tagging_put || n.event == ev_tagging_del)
+    {
+        out.kind    = 'g';
+        out.payload = n.tags;
+        return true;
+    }
     if (n.has_object)
-        return n.replication == replication_pending
-                   ? m_repl.stage(check, *cfg, n.bucket, n.key, n.version_id, false, n.tags)
-                   : 0;
-    return n.event == ev_marker ? m_repl.stage(check, *cfg, n.bucket, n.key, n.version_id, true, {}) : 0;
+    {
+        out.kind = 'p';
+        return true;
+    }
+    if (n.event == ev_marker)
+    {
+        out.kind  = 'm';
+        out.stamp = n.stamp;
+        return true;
+    }
+    if (n.event != ev_delete)
+        return false;
+    out.kind  = n.version_id.empty() ? 'd' : 'x';
+    out.stamp = n.stamp;
+    return true;
 }
 
 }   // namespace socketley::storage

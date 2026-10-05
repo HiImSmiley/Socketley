@@ -417,6 +417,59 @@ void clear_version_extra(object_meta& m)
     std::erase_if(m.extra, [](const auto& e) { return e.first == version_extra; });
 }
 
+std::string cluster_stamp_text(const cluster_stamp& s)
+{
+    char seq[version_seq_digits + 1];
+    std::snprintf(seq, sizeof seq, "%016llx", static_cast<unsigned long long>(s.tag.seq));
+    std::string value(seq, version_seq_digits);
+    value.push_back(s.tag.marker ? 'm' : 'v');
+    value += s.tag.id;
+    value.push_back(' ');
+    value += std::to_string(s.mtime_ms);
+    return value;
+}
+
+bool parse_cluster_stamp(std::string_view text, cluster_stamp& out)
+{
+    const size_t sp = text.find(' ');
+    if (sp == std::string_view::npos || sp <= version_seq_digits + 1 ||
+        (text[version_seq_digits] != 'm' && text[version_seq_digits] != 'v'))
+        return false;
+    uint64_t seq = 0;
+    const auto r = std::from_chars(text.data(), text.data() + version_seq_digits, seq, 16);
+    const std::string_view id = text.substr(version_seq_digits + 1, sp - version_seq_digits - 1);
+    int64_t mtime = 0;
+    const std::string_view ms = text.substr(sp + 1);
+    const auto m = std::from_chars(ms.data(), ms.data() + ms.size(), mtime);
+    if (r.ec != std::errc{} || r.ptr != text.data() + version_seq_digits || !valid_version_id(id) || seq == 0 ||
+        m.ec != std::errc{} || m.ptr != ms.data() + ms.size() || mtime <= 0)
+        return false;
+    out.tag.seq    = seq;
+    out.tag.id     = std::string(id);
+    out.tag.marker = text[version_seq_digits] == 'm';
+    out.mtime_ms   = mtime;
+    return true;
+}
+
+bool cluster_stamp_of(const object_meta& m, cluster_stamp& out)
+{
+    for (const auto& [n, v] : m.extra)
+        if (n == cluster_extra)
+            return parse_cluster_stamp(v, out);
+    return false;
+}
+
+void set_cluster_extra(object_meta& m, const cluster_stamp& s)
+{
+    clear_cluster_extra(m);
+    m.extra.emplace_back(std::string(cluster_extra), cluster_stamp_text(s));
+}
+
+void clear_cluster_extra(object_meta& m)
+{
+    std::erase_if(m.extra, [](const auto& e) { return e.first == cluster_extra; });
+}
+
 std::string retention_value(const retention& r)
 {
     if (r.mode == lock_mode::none)

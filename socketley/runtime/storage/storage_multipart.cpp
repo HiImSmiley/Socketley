@@ -101,7 +101,7 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
     s3_error    err;
     // The tags and the lock are kept with the upload and land on the object its completion makes.
     if (!object_meta_from_headers(c, meta, err) || !tagging_from_header(r, meta, err) ||
-        !lock_from_headers(c, meta, err))
+        (c->cluster ? !cluster_mark(c, meta, err) : !lock_from_headers(c, meta, err)))
     {
         send_error(c, err);
         return;
@@ -135,8 +135,11 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
     if (full)
         meta.extra.emplace_back(std::string(checksum_type_extra), "FULL_OBJECT");
     // The object the upload completes is replicated as its bucket's rules said when it began.
-    replication_mark(r.bucket, r.key, meta, ask.mode == sse_mode::c, replica_request(r));
-    replica_source(r, meta);
+    if (!c->cluster)
+    {
+        replication_mark(r.bucket, r.key, meta, ask.mode == sse_mode::c, replica_request(r));
+        replica_source(r, meta);
+    }
 
     ++m_c.mpu_created;
     std::weak_ptr<conn> weak = c;

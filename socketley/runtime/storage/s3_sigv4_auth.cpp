@@ -542,6 +542,23 @@ bool sigv4_authenticator::rebuild(std::string& err)
     credential_set set;
     if (!m_cfg.access_key.empty() && !set.add(m_cfg.access_key, m_cfg.secret_key, err))
         return false;
+    if (!m_cfg.cluster_key.empty())
+    {
+        static const auto node = []()
+        {
+            auto u = std::make_shared<user_identity>();
+            u->id           = "socketley-cluster";
+            u->display_name = "socketley-cluster";
+            u->admin        = true;
+            u->cluster      = true;
+            return u;
+        }();
+        if (!set.add(m_cfg.cluster_key, m_cfg.cluster_secret, err, node))
+        {
+            err = "the cluster's key: " + err;
+            return false;
+        }
+    }
     if (!m_cfg.credentials_file.empty())
     {
         std::string text;

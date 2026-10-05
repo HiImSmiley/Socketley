@@ -233,6 +233,24 @@ inline constexpr std::string_view replica_version_extra = "x-socketley-replica-v
 // That id, empty for anything but a replica.
 std::string_view replica_source_of(const object_meta& m);
 
+// The extra entry of a write another node of the cluster made: the version that node gave it and the time it was
+// written there, which every node keeps, so all of them hold the same versions of the same writes.
+inline constexpr std::string_view cluster_extra = "x-socketley-cluster";
+
+struct cluster_stamp
+{
+    version_tag tag;
+    int64_t     mtime_ms{0};
+};
+
+// "<seq><m|v><id> <mtime>", the entry's value and the header a node's write to another carries.
+std::string cluster_stamp_text(const cluster_stamp& s);
+bool        parse_cluster_stamp(std::string_view text, cluster_stamp& out);
+// The stamp `m` was written with, false for a write of this node's own.
+bool        cluster_stamp_of(const object_meta& m, cluster_stamp& out);
+void        set_cluster_extra(object_meta& m, const cluster_stamp& s);
+void        clear_cluster_extra(object_meta& m);
+
 // The extra entries of a version's object lock: its retention, 'G' or 'C' and the retain-until time in decimal
 // milliseconds, and its legal hold, ON or OFF once one was ever set.
 inline constexpr std::string_view retention_extra  = "x-socketley-retention";

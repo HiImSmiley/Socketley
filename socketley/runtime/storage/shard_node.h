@@ -90,11 +90,17 @@ public:
     uint64_t holders(uint32_t slot) const { return m_holders[slot]; }
 
     // ── Buckets are made and dropped by shard 0 and told to the rest ────────
-    // `owner` is the id of the user that makes it, empty for the default owner.
-    void create_bucket(std::string name, std::string owner, std::function<void(st)> cb);
-    void delete_bucket(std::string name, std::function<void(st)> cb);
+    // `owner` is the id of the user that makes it, empty for the default owner.  Each change but a `quiet` one, which
+    // another node of the cluster made, is told to the bucket listener before `cb` hears it was made.
+    void create_bucket(std::string name, std::string owner, std::function<void(st)> cb, bool quiet = false);
+    void delete_bucket(std::string name, std::function<void(st)> cb, bool quiet = false);
     // Sets a bucket's configuration document of `kind`, or removes it when `xml` is empty; every shard has it before `cb`.
-    void set_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb);
+    void set_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb, bool quiet = false);
+    // Told 'c' with the owner, 'r', or 'd' with the document's kind and text, of a bucket's change, and runs `then`
+    // once it has what it needs of it.
+    using bucket_listener = std::function<void(char kind, const std::string& bucket, const std::string& owner,
+                                               uint8_t doc, const std::string& xml, std::function<void()> then)>;
+    void set_bucket_listener(bucket_listener fn) { m_bucket_listener = std::move(fn); }
 
     // ── A listing is every shard's, merged ──────────────────────────────────
     void list(std::string_view bucket, const list_query& q, std::function<void(st, list_page)> cb);
@@ -152,6 +158,10 @@ private:
                    std::function<void()> done, uint64_t mask = ~uint64_t{0});
 
 
+    // `cb`, told the listener first when the change was made and is not `quiet`.
+    std::function<void(st)> told(bool quiet, char kind, const std::string& bucket, const std::string& owner, uint8_t doc,
+                                 const std::string& xml, std::function<void(st)> cb);
+
     void serve_mpu(wire::op o, std::string_view payload, std::function<void(bool ok, std::string reply)> reply);
     const mpu_upload* mpu_find(const std::string& bucket, const std::string& key, const std::string& id) const;
 
@@ -171,6 +181,7 @@ private:
     // The holds waiting for the end of the turn, by owner, and what each was asked with.
     std::vector<std::vector<wire::hold_entry>>          m_hold_q;
     std::vector<std::vector<std::function<void(bool)>>> m_hold_cb;
+    bucket_listener m_bucket_listener;
     std::shared_ptr<bool> m_alive;
 };
 

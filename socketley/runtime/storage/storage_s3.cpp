@@ -8,6 +8,7 @@
 
 #include <openssl/evp.h>
 
+#include "cluster.h"
 #include "lifecycle.h"
 #include "s3_cors.h"
 #include "s3_names.h"
@@ -289,6 +290,7 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     c->principal = std::move(v.principal);
     c->user      = std::move(v.user);
     c->anonymous = v.anonymous;
+    c->cluster   = c->user && c->user->cluster;
 
     // A client that signs its payload in chunks, talking to a runtime with no
     // decoder for them, would have the framing stored as the object; an empty body has none.
@@ -370,7 +372,9 @@ void storage_run::route(const std::shared_ptr<conn>& c)
         return;
     }
 
-    collect_body(c, bucket_level && r.has_query("cors") ? cors_max_bytes : small_body_limit);
+    collect_body(c, bucket_level && r.has_query("cors") ? cors_max_bytes
+                    : c->cluster && r.has_query(cluster_query) ? cluster_max_body
+                                                              : small_body_limit);
 }
 
 void storage_run::route_small(const std::shared_ptr<conn>& c)
@@ -384,6 +388,11 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
     const bool svc = q.bucket.empty();
     const bool bkt = !svc && q.key.empty();
     const std::string_view m = q.method;
+    if (m == "POST" && !svc && q.has_query(cluster_query))
+    {
+        op_cluster(c);
+        return;
+    }
     if (svc)
     {
         if (m == "GET")
@@ -1325,7 +1334,7 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
     // Refused before the body is read, and the body is read off after the
     // answer, so a client still sending it hears the refusal and not a reset.
     if (!object_meta_from_headers(c, meta, err) || !tagging_from_header(r, meta, err) ||
-        (m_store.has_bucket(r.bucket) && !lock_from_headers(c, meta, err)))
+        (c->cluster ? !cluster_mark(c, meta, err) : m_store.has_bucket(r.bucket) && !lock_from_headers(c, meta, err)))
     {
         deny_request(c, err);
         return;
@@ -1349,8 +1358,11 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
         deny_request(c, err);
         return;
     }
-    replication_mark(r.bucket, r.key, meta, ask.mode == sse_mode::c, replica_request(r));
-    replica_source(r, meta);
+    if (!c->cluster)
+    {
+        replication_mark(r.bucket, r.key, meta, ask.mode == sse_mode::c, replica_request(r));
+        replica_source(r, meta);
+    }
     start_put(c, r.key, std::move(meta), {}, checksum_algo::none, cond, {},
               ask.mode != sse_mode::none ? &seal : nullptr);
 }

@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include "cluster.h"
 #include "s3_names.h"
 #include "s3_notify.h"
 #include "s3_xml.h"
@@ -81,6 +82,13 @@ change_origin storage_run::origin_of(const conn& c) const
     o.replica = replica_request(c.req);
     if (o.replica)
         o.source_version = std::string(c.req.header(replica_version_header));
+    // Another node's change is one no node sends on, made with that node's stamp.
+    if (c.cluster)
+    {
+        o.replica = true;
+        o.cluster = true;
+        o.stamp   = std::string(http_trim_ows(c.req.header(cluster_stamp_header)));
+    }
     if (!m_store.bucket_notify(c.req.bucket))
         return o;
     o.principal = c.user ? c.user->id : "anonymous";
@@ -107,7 +115,8 @@ change_origin storage_run::origin_of(const conn& c) const
 std::vector<std::pair<std::string, std::string>> storage_run::change_events(const change_note& n)
 {
     std::vector<std::pair<std::string, std::string>> out;
-    const auto cfg = m_store.bucket_notify(n.bucket);
+    // The node that made a change sends its events, and a removal of nothing is no event.
+    const auto cfg = n.who.cluster || n.absent ? nullptr : m_store.bucket_notify(n.bucket);
     if (cfg)
     {
         // Sixteen hex digits that grow with every event of this shard, which owns the key, so a key's events sort by it.
@@ -148,9 +157,10 @@ uint64_t storage_run::stage(const change_note& n)
     staged_change s;
     if (auto events = change_events(n); !events.empty())
         s.notify = m_notify.stage(check, std::move(events));
-    s.copies = stage_copies(n, check);
+    bool copied = false;
+    s.copies = stage_copies(n, check, copied);
     // A version written PENDING that nothing copies is marked FAILED once it is made, as a change already made is.
-    if (s.copies == 0 && n.has_object && n.replication == replication_pending)
+    if (!copied && n.has_object && n.replication == replication_pending)
         s.uncopied = n;
     if (s.notify == 0 && s.copies == 0 && !s.uncopied)
         return 0;
@@ -200,7 +210,9 @@ void storage_run::settle(uint64_t ticket, bool made, std::function<void()> then)
 
 void storage_run::made(change_note n, std::function<void()> answer)
 {
-    const bool copied = replicate_change(n);
+    cluster_change cc;
+    const bool to_nodes = node_change(n, cc) && m_repl.enqueue_nodes(cc);
+    const bool copied = replicate_change(n) || to_nodes;
     bool queued = false;
     for (auto& [target, json] : change_events(n))
         queued = m_notify.add(target, std::move(json)) || queued;

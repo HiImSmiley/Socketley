@@ -29,6 +29,7 @@
 #include "notifier.h"
 #include "object_store.h"
 #include "post_policy.h"
+#include "cluster.h"
 #include "replicator.h"
 #include "s3_auth.h"
 #include "s3_users.h"
@@ -72,6 +73,8 @@ struct storage_counters
     uint64_t timeouts{0};
     // Multipart: uploads begun, parts taken, uploads completed and aborted.
     uint64_t mpu_created{0};
+    // Changes of buckets and locks another node of the cluster sent here.
+    uint64_t cluster_in{0};
     uint64_t mpu_parts{0};
     uint64_t mpu_completed{0};
     uint64_t mpu_aborted{0};
@@ -412,6 +415,8 @@ struct conn
     bool        ip_known{false};
     // The request carried no credentials, and was let in by a bucket policy rather than by the runtime.
     bool        anonymous{false};
+    // Another node of the cluster sent it, to write what that node made, which no policy judges.
+    bool        cluster{false};
     bool        policy_admitted{false};
     // A missing key is answered AccessDenied, for a requester a policy lets read and not list, as S3 does.
     bool        hide_missing{false};
@@ -543,6 +548,9 @@ public:
     const notifier& notifications() const { return m_notify; }
     replicator& replication() { return m_repl; }
     const replicator& replication() const { return m_repl; }
+    // Makes this runtime a node of the cluster `cfg` names, before open().
+    void set_cluster(cluster_config cfg);
+    const std::string& cluster_self() const { return m_cluster_self; }
     // Uploads left open this many seconds are aborted; zero keeps them until they are.
     void set_mpu_expire_secs(uint32_t s)
     {
@@ -695,6 +703,8 @@ public:
     // the user is not an admin free of an identity policy.
     bool needs_judging(const user_identity* user) const
     {
+        if (user && user->cluster)
+            return false;
         return m_store.any_policy() || (user && !user->unrestricted());
     }
     // Judges an authenticated or anonymous request by ownership and the policies of the buckets it touches,
@@ -852,8 +862,16 @@ public:
     void replica_source(const s3_request& r, object_meta& m);
     // Queues the copies a change already made makes, true when any was.
     bool replicate_change(const change_note& n);
-    // Stages the copies of a change about to be made, its ticket in the replication outbox or 0.
-    uint64_t stage_copies(const change_note& n, std::string_view check);
+    // Stages the copies of a change about to be made, its ticket in the replication outbox or 0, and says in
+    // `copied` whether the bucket's replication copies it.
+    uint64_t stage_copies(const change_note& n, std::string_view check, bool& copied);
+    // What the other nodes of the cluster are sent of a change this node made, false for nothing.
+    bool node_change(const change_note& n, cluster_change& out) const;
+    // Puts into `m` the stamp and the lock another node's write was made with, in storage_cluster.cpp; false with
+    // `err` for a write that names none, or a version this node cannot keep until it hears of the bucket's versioning.
+    bool cluster_mark(const std::shared_ptr<conn>& c, object_meta& m, s3_error& err);
+    // Applies a record of a bucket's or a version's change another node sent.
+    void op_cluster(const std::shared_ptr<conn>& c);
     // Who a request's change is told as: its user or "anonymous", and the client's address, left empty for a
     // bucket that sends no events.
     change_origin origin_of(const conn& c) const;
@@ -1010,6 +1028,8 @@ private:
     multipart_store   m_mpu;
     notifier          m_notify;
     replicator        m_repl;
+    // The name the cluster file gives this node, empty for a runtime that is no node of one.
+    std::string       m_cluster_self;
     // Each change staged and not yet settled, by the ticket the store holds: its tickets in the two outboxes, and the
     // change itself when it was written PENDING and nothing was staged to copy it, which settle() then marks FAILED.
     struct staged_change

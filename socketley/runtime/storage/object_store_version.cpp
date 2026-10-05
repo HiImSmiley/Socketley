@@ -103,6 +103,8 @@ struct object_store::vop
     std::function<bool(const object_meta&)> only_if;
     // The file changed on disk, so the index must follow whatever happens after.
     bool        changed{false};
+    // The version goes behind the latest rather than in front of it.
+    bool        behind{false};
     int         fd{-1};
     std::string head;
     remove_result rr;
@@ -159,9 +161,15 @@ uint64_t object_store::newest_seq(const bucket& b, std::string_view key)
 }
 
 version_tag object_store::next_version(const bucket& b, const std::string& key, bool marker,
-                                       std::string_view source_id) const
+                                       std::string_view source_id, const version_tag* exact) const
 {
     version_tag t;
+    if (exact)
+    {
+        t = *exact;
+        t.marker = marker;
+        return t;
+    }
     if (b.vstate == versioning::enabled && version_of_id(source_id, marker, t) && t.seq > newest_seq(b, key))
         return t;
     // Newer than every version the key has even when the clock stepped back.
@@ -493,6 +501,12 @@ void object_store::vop_install(std::shared_ptr<vop> v)
         vop_end(std::move(v), st::no_such_bucket);
         return;
     }
+    // Only another node's write is older than the key's newest version, since this node gives every one a newer.
+    if (version_seq_of(v->meta) <= newest_seq(*b, v->key))
+    {
+        vop_behind(std::move(v));
+        return;
+    }
     const std::string rel = object_rel_path(v->key);
     const bool null_new = version_id_of(v->meta) == "null";
 
@@ -572,6 +586,32 @@ void object_store::vop_install(std::shared_ptr<vop> v)
     ch->run([this, v](int64_t r) { vop_end(v, r < 0 ? errno_status(r) : st::ok); });
 }
 
+void object_store::vop_behind(std::shared_ptr<vop> v)
+{
+    bucket* b = find_bucket(v->bname);
+    if (!b)
+    {
+        vop_end(std::move(v), st::no_such_bucket);
+        return;
+    }
+    v->behind = true;
+    // Its file goes where a noncurrent version of its id is, over the older null version it takes the place of.
+    const std::string vrel = version_rel_path(v->key, version_of(v->meta).id);
+    const int dir_fd  = b->dir_fd;
+    const int src_dir = v->pooled ? b->pool_fd : b->tmp_fd;
+    auto ch = std::make_shared<disk_chain>(m_alive);
+    ch->then([this, v, src_dir, dir_fd, vrel](file_io::done d)
+    {
+        return m_io->renameat(src_dir, v->tmp, dir_fd, vrel, [v, d](int64_t r)
+        {
+            v->changed = r >= 0;
+            d(r);
+        });
+    });
+    sync_dir(*ch, m_io, m_loop, dir_fd, parent_of(vrel), m_alive, &m_totals.fsyncs);
+    ch->run([this, v](int64_t r) { vop_end(v, r < 0 ? errno_status(r) : st::ok); });
+}
+
 void object_store::vop_pooled(std::shared_ptr<vop> v, bool drop_null)
 {
     bucket* b = find_bucket(v->bname);
@@ -643,7 +683,9 @@ void object_store::vop_end(std::shared_ptr<vop> v, st s)
         return;
     }
     // Renamed into place, it is the latest whether or not a sync after the rename failed.
-    if (b)
+    if (b && v->behind)
+        version_add(*b, v->key, v->meta);
+    else if (b)
         version_install(*b, v->key, v->meta);
     if (s != st::ok)
         m_sync_lost = true;
@@ -660,6 +702,89 @@ void object_store::vop_end(std::shared_ptr<vop> v, st s)
             after_staged(v->ticket, [v]() { v->rm_cb(v->rr); });
         }
     });
+}
+
+// ─── Another node's writes ──────────────────────────────────────────────────
+
+st object_store::cluster_verdict(const bucket& b, const std::string& key, const object_meta& meta,
+                                 const cluster_stamp& s) const
+{
+    if (!versioned(b, key))
+    {
+        // A version its node kept is kept here once this node has heard of the bucket's versioning.
+        if (s.tag.id != "null" || s.tag.marker)
+            return st::unavailable;
+        // The write made last is the key's, a removal made after it included, and the larger ETag breaks a tie.
+        if (const auto o = b.objects.find(key); o != b.objects.end() &&
+            (o->second.mtime_ms > s.mtime_ms || (o->second.mtime_ms == s.mtime_ms && o->second.etag() >= meta.etag())))
+            return st::precondition_failed;
+        return removed_at(b.name, key, {}) >= s.mtime_ms ? st::precondition_failed : st::ok;
+    }
+    if (s.tag.id == "null")
+    {
+        // The key has one null version, the newest written.
+        if (const auto o = b.objects.find(key);
+            o != b.objects.end() && version_id_of(o->second) == "null" && version_seq_of(o->second) >= s.tag.seq)
+            return st::precondition_failed;
+        if (const auto v = b.versions.find(key); v != b.versions.end())
+            for (const object_meta& m : v->second)
+                if (version_id_of(m) == "null" && version_seq_of(m) >= s.tag.seq)
+                    return st::precondition_failed;
+        return removed_at(b.name, key, "null") >= s.mtime_ms ? st::precondition_failed : st::ok;
+    }
+    if (const auto o = b.objects.find(key); o != b.objects.end() && version_id_of(o->second) == s.tag.id)
+        return st::precondition_failed;
+    if (const auto v = b.versions.find(key); v != b.versions.end())
+        for (const object_meta& m : v->second)
+            if (version_id_of(m) == s.tag.id)
+                return st::precondition_failed;
+    return removed_at(b.name, key, s.tag.id) > 0 ? st::precondition_failed : st::ok;
+}
+
+namespace
+{
+
+constexpr int64_t removed_keep_ms = 24 * 3600 * 1000;
+constexpr size_t  removed_keep_max = 262144;
+
+std::string removed_key(std::string_view bucket, std::string_view key, std::string_view id)
+{
+    std::string k;
+    k.reserve(bucket.size() + key.size() + id.size() + 2);
+    k.append(bucket);
+    k.push_back('\0');
+    k.append(key);
+    k.push_back('\0');
+    k.append(id);
+    return k;
+}
+
+}   // namespace
+
+void object_store::note_removed(const std::string& bucket, const std::string& key, std::string_view id, int64_t when_ms)
+{
+    const int64_t now = static_cast<int64_t>(now_ms());
+    while (!m_removed_order.empty() &&
+           (m_removed_order.front().first + removed_keep_ms < now || m_removed_order.size() >= removed_keep_max))
+    {
+        const auto it = m_removed.find(m_removed_order.front().second);
+        if (it != m_removed.end() && it->second.second == m_removed_order.front().first)
+            m_removed.erase(it);
+        m_removed_order.pop_front();
+    }
+    std::string k = removed_key(bucket, key, id);
+    auto& [at, noted] = m_removed[k];
+    at    = std::max(at, when_ms);
+    noted = now;
+    m_removed_order.emplace_back(now, std::move(k));
+}
+
+int64_t object_store::removed_at(const std::string& bucket, const std::string& key, std::string_view id) const
+{
+    if (m_removed.empty())
+        return 0;
+    const auto it = m_removed.find(removed_key(bucket, key, id));
+    return it == m_removed.end() ? 0 : it->second.first;
 }
 
 // ─── Deletes ────────────────────────────────────────────────────────────────
@@ -686,6 +811,8 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
     // The removal's events are staged once what it removes or makes is decided, and before the disk is touched.
     const bool lc = cause == change_cause::lifecycle;
     const std::string source_version = who.source_version;
+    const bool cluster = who.cluster;
+    const std::string cluster_text = who.stamp;
     const auto stage = [this, v, b, lc, who = std::move(who)](bool marker)
     {
         change_note n;
@@ -695,6 +822,8 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
         n.event      = marker ? (lc ? ev_lc_marker : ev_marker) : (lc ? ev_lc_delete : ev_delete);
         n.version_id = v->rr.version_id;
         n.mtime_ms   = marker ? v->meta.mtime_ms : 0;
+        if (marker)
+            n.stamp = cluster_stamp_text({version_of(v->meta), v->meta.mtime_ms});
         v->ticket    = stage_change(*b, n);
         return killed_after_event(v->ticket, v->key);
     };
@@ -717,7 +846,19 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
         v->meta = object_meta{};
         v->meta.mtime_ms = static_cast<int64_t>(now_ms());
         v->meta.md5      = md5_of({});
-        const version_tag t = next_version(*b, v->key, true, source_version);
+        // Another node's marker is the one it made, which this node may have already or have removed since.
+        cluster_stamp cs;
+        const bool exact = cluster && parse_cluster_stamp(cluster_text, cs);
+        if (exact)
+        {
+            v->meta.mtime_ms = cs.mtime_ms;
+            if (cluster_verdict(*b, v->key, v->meta, cs) != st::ok)
+            {
+                answer({st::ok, false, true, cs.tag.id});
+                return;
+            }
+        }
+        const version_tag t = next_version(*b, v->key, true, source_version, exact ? &cs.tag : nullptr);
         set_version_extra(v->meta, t);
         v->rr = {st::ok, o != b->objects.end(), true, t.id};
         v->tmp = tmp_name();
@@ -762,6 +903,9 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
     const object_meta* f = valid_version_id(v->version_id) ? find_version(v->bname, v->key, v->version_id) : nullptr;
     if (!f || (v->only_if && !v->only_if(*f)))
     {
+        // A version another node removed before this one had it is not made when it comes.
+        if (!f && m_mirror && valid_version_id(v->version_id))
+            note_removed(v->bname, v->key, v->version_id, static_cast<int64_t>(now_ms()));
         answer({st::ok, false, false, v->version_id});
         return;
     }
@@ -771,6 +915,8 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
         return;
     }
     v->rr = {st::ok, true, is_delete_marker(*f), v->version_id};
+    if (m_mirror)
+        note_removed(v->bname, v->key, v->version_id, static_cast<int64_t>(now_ms()));
     if (stage(false))
         return;
     const auto o = b->objects.find(v->key);

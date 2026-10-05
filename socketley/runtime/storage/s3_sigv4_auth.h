@@ -79,6 +79,9 @@ struct sigv4_config
     bool        anonymous{false};
     // The IAM API's document, beside the buckets, empty for none.
     std::string iam_file;
+    // The key the nodes of a cluster sign for each other with, empty for a runtime that is no node of one.
+    std::string cluster_key;
+    std::string cluster_secret;
 };
 
 // The empty string when the configuration can be served, and what is wrong

@@ -1409,6 +1409,16 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
                 return;
             }
         }
+        // Another node's write is made when it is newer than what this node has of the key, and past the quotas,
+        // which that node judged it by.
+        cluster_stamp stamp;
+        const bool cluster = cluster_stamp_of(rq.meta, stamp);
+        if (cluster)
+            if (const st cv = cluster_verdict(*bp, rq.key, rq.meta, stamp); cv != st::ok)
+            {
+                commit_refuse(c, cv);
+                return;
+            }
         // The landing shard judged the quota from its own bytes, which is only a
         // sample of the owner's, so the owner judges it again for the key it holds.
         if (m_opts.nshards > 1 && m_opts.max_bytes)
@@ -1422,6 +1432,7 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
             }
         }
         // The bucket's quota and its owner's are judged here, where every write of the key is, one at a time.
+        if (!cluster)
         {
             const auto old = bp->objects.find(rq.key);
             const bool keeps_old = versioned(*bp, rq.key);
@@ -1466,7 +1477,11 @@ bool object_store::decide_version(const bucket& b, commit_request& rq) const
 {
     if (!versioned(b, rq.key) || stamp_holds(b, rq.key, rq.meta))
         return false;
-    set_version_extra(rq.meta, next_version(b, rq.key, false, replica_source_of(rq.meta)));
+    cluster_stamp cs;
+    const bool exact = cluster_stamp_of(rq.meta, cs);
+    if (exact && has_version(rq.meta) && version_of(rq.meta).id == cs.tag.id && version_seq_of(rq.meta) == cs.tag.seq)
+        return false;
+    set_version_extra(rq.meta, next_version(b, rq.key, false, replica_source_of(rq.meta), exact ? &cs.tag : nullptr));
     return true;
 }
 
@@ -1838,13 +1853,35 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
             done(rm, st::locked, true);
             return;
         }
-        if (rm->existed)
+        // Another node's removal takes only a write older than it, and its delete marker waits for the versioning.
+        int64_t when = static_cast<int64_t>(now_ms());
+        if (rm->who.cluster)
+        {
+            cluster_stamp cs;
+            if (!parse_cluster_stamp(rm->who.stamp, cs) || cs.tag.marker)
+            {
+                done(rm, st::unavailable, false);
+                return;
+            }
+            when = cs.mtime_ms;
+            if (rm->existed && found->second.mtime_ms > when)
+            {
+                done(rm, st::ok, false);
+                return;
+            }
+        }
+        if (m_mirror)
+            note_removed(rm->bname, rm->key, {}, when);
+        if (rm->existed || (m_mirror && !rm->who.cluster && rm->cause != change_cause::lifecycle))
         {
             change_note n;
             n.bucket = rm->bname;
             n.key    = rm->key;
             n.who    = rm->who;
             n.event  = rm->cause == change_cause::lifecycle ? ev_lc_delete : ev_delete;
+            n.mtime_ms = when;
+            n.stamp    = cluster_stamp_text({{static_cast<uint64_t>(when) * 1000, "null", false}, when});
+            n.absent   = !rm->existed;
             rm->ticket = stage_change(*bp, n);
             if (killed_after_event(rm->ticket, rm->key))
                 return;
@@ -3181,7 +3218,7 @@ void object_store::each_version(std::string_view name,
 
 uint64_t object_store::stage_change(const bucket& b, const change_note& n)
 {
-    return (b.notify || b.replication) && m_sink ? m_sink->stage(n) : 0;
+    return (b.notify || b.replication || m_mirror) && m_sink ? m_sink->stage(n) : 0;
 }
 
 void object_store::after_staged(uint64_t ticket, std::function<void()> answer)
@@ -3243,10 +3280,13 @@ std::function<void(st, std::string)> object_store::noted_header(const bucket& b,
                                                                 const header_change& c,
                                                                 std::function<void(st, std::string)> cb)
 {
-    if ((!b.notify && !b.replication) || !m_sink || c.what != header_change::kind::tags)
+    // A node of a cluster sends a version's lock on to the others too, which is no event.
+    const bool lock = m_mirror && (c.what == header_change::kind::retention || c.what == header_change::kind::legal_hold);
+    if ((!b.notify && !b.replication && !m_mirror) || !m_sink || (c.what != header_change::kind::tags && !lock))
         return cb;
-    const uint16_t bit = c.value.empty() ? ev_tagging_del : ev_tagging_put;
-    return [this, bucket = b.name, key = std::string(key), who = c.who, bit, tags = c.value,
+    const uint16_t bit = lock ? 0 : c.value.empty() ? ev_tagging_del : ev_tagging_put;
+    const uint8_t lock_change = !lock ? 0 : c.what == header_change::kind::retention ? 1 : 2;
+    return [this, bucket = b.name, key = std::string(key), who = c.who, bit, lock_change, value = c.value,
             cb = std::move(cb)](st s, std::string id)
     {
         if (s != st::ok)
@@ -3260,7 +3300,13 @@ std::function<void(st, std::string)> object_store::noted_header(const bucket& b,
         n.who        = who;
         n.event      = bit;
         n.version_id = id;
-        n.tags       = tags;
+        if (lock_change)
+        {
+            n.lock_change = lock_change;
+            n.lock_value  = value;
+        }
+        else
+            n.tags = value;
         m_sink->made(std::move(n), [cb, s, id = std::move(id)]() mutable { cb(s, std::move(id)); });
     };
 }

@@ -228,8 +228,25 @@ void shard_node::announce_start(std::function<void(bool)> done)
 
 // ─── Buckets ────────────────────────────────────────────────────────────────
 
-void shard_node::create_bucket(std::string name, std::string owner, std::function<void(st)> cb)
+std::function<void(st)> shard_node::told(bool quiet, char kind, const std::string& bucket, const std::string& owner,
+                                         uint8_t doc, const std::string& xml, std::function<void(st)> cb)
 {
+    if (quiet || !m_bucket_listener)
+        return cb;
+    return [this, alive = m_alive, kind, bucket, owner, doc, xml, cb = std::move(cb)](st s)
+    {
+        if (!*alive || s != st::ok)
+        {
+            cb(s);
+            return;
+        }
+        m_bucket_listener(kind, bucket, owner, doc, xml, [cb]() { cb(st::ok); });
+    };
+}
+
+void shard_node::create_bucket(std::string name, std::string owner, std::function<void(st)> cb, bool quiet)
+{
+    cb = told(quiet, 'c', name, owner, 0, {}, std::move(cb));
     if (m_store.shard() == 0)
     {
         run_create(std::move(name), std::move(owner), [cb](st s, int64_t) { cb(s); });
@@ -302,8 +319,9 @@ void shard_node::run_create(std::string name, std::string owner, std::function<v
     });
 }
 
-void shard_node::delete_bucket(std::string name, std::function<void(st)> cb)
+void shard_node::delete_bucket(std::string name, std::function<void(st)> cb, bool quiet)
 {
+    cb = told(quiet, 'r', name, {}, 0, {}, std::move(cb));
     if (m_store.shard() == 0)
     {
         run_drop(std::move(name), std::move(cb));
@@ -451,8 +469,9 @@ std::string doc_label(bucket_doc kind)
 
 }   // namespace
 
-void shard_node::set_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb)
+void shard_node::set_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb, bool quiet)
 {
+    cb = told(quiet, 'd', name, {}, static_cast<uint8_t>(kind), xml, std::move(cb));
     if (m_store.shard() == 0)
     {
         run_doc(kind, std::move(name), std::move(xml), std::move(cb));
