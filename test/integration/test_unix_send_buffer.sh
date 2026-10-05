@@ -62,11 +62,13 @@ P=$((SL_PORT_BASE + 1790))
 RTDIR="$SOCKETLEY_SOCKET.rt"
 
 # Connects to a unix path, has one exchange so the connection is surely
-# accepted, and holds it open until killed.
+# accepted, and holds it open until killed; a server with no handler answers
+# nothing, so the reply is waited for briefly and hold() waits well past that.
 cat > "$D/hold.py" <<'EOF'
 import socket, sys, time
 s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1])
 s.sendall(sys.argv[2].encode().decode("unicode_escape").encode("latin1"))
+s.settimeout(1)
 try: s.recv(4096)
 except OSError: pass
 print("held", flush=True)
@@ -93,7 +95,7 @@ hold() {   # hold <path> <payload>
     python3 "$D/hold.py" "$1" "$2" >"$out" 2>&1 &
     HOLDERS+=($!)
     local i
-    for i in $(seq 1 50); do grep -q held "$out" 2>/dev/null && return 0; sleep 0.1; done
+    for i in $(seq 1 150); do grep -q held "$out" 2>/dev/null && return 0; sleep 0.1; done
     return 1
 }
 
