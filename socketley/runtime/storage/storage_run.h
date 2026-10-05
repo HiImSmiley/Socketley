@@ -696,7 +696,8 @@ public:
     void op_delete_bucket(const std::shared_ptr<conn>& c);
     void op_head_bucket(const std::shared_ptr<conn>& c);
     // False with `err` S3's refusal when a write asks for an ACL other than full control for `owner`.
-    bool acl_headers_ok(const s3_request& r, bool bucket, std::string_view owner, s3_error& err) const;
+    bool acl_headers_ok(const s3_request& r, bool bucket, std::string_view owner, std::string_view requester,
+                        s3_error& err) const;
     // False with `err` when a write asks for a storage class S3 does not have.
     static bool storage_class_ok(const s3_request& r, s3_error& err);
     void op_get_acl(const std::shared_ptr<conn>& c);

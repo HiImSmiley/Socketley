@@ -329,7 +329,9 @@ void storage_run::route(const std::shared_ptr<conn>& c)
     {
         const std::string_view acl_owner = m_store.has_bucket(r.bucket) || !c->user ? owner_of(r.bucket)
                                                                                     : std::string_view(c->user->id);
-        if (s3_error e; !acl_headers_ok(r, bucket_level && !r.form, acl_owner, e))
+        // A request with no credentials is the owner's on a runtime that takes them, as every one there is.
+        const std::string_view requester = c->user ? std::string_view(c->user->id) : acl_owner;
+        if (s3_error e; !acl_headers_ok(r, bucket_level && !r.form, acl_owner, requester, e))
         {
             deny_request(c, e);
             return;
@@ -771,7 +773,8 @@ void storage_run::op_delete_bucket(const std::shared_ptr<conn>& c)
 
 // ─── ACLs and ownership controls ────────────────────────────────────────────
 
-bool storage_run::acl_headers_ok(const s3_request& r, bool bucket, std::string_view owner, s3_error& err) const
+bool storage_run::acl_headers_ok(const s3_request& r, bool bucket, std::string_view owner, std::string_view requester,
+                                 s3_error& err) const
 {
     if (r.method != "PUT" && r.method != "POST")
         return true;
@@ -779,9 +782,10 @@ bool storage_run::acl_headers_ok(const s3_request& r, bool bucket, std::string_v
     bool ok = true;
     for (const auto& h : r.headers)
     {
-        // The two canned ACLs that give the owner full control and nobody else anything, which every object has.
+        // The canned ACLs that give the owner full control and nobody else anything, which every object has: private
+        // only from the owner, since from anybody else it gives the writer the control.
         if (h.name == "x-amz-acl")
-            ok = ok && (h.value == "private" || h.value == "bucket-owner-full-control");
+            ok = ok && ((h.value == "private" && requester == owner) || h.value == "bucket-owner-full-control");
         else if (h.name == "x-amz-grant-full-control")
             ok = ok && http_trim_ows(h.value) == grant;
         else if (h.name.starts_with("x-amz-grant-"))

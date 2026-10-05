@@ -6842,8 +6842,9 @@ ACLs are those of a bucket whose ACLs are disabled, which S3 makes the default
 (ObjectOwnership BucketOwnerEnforced): every bucket and object has one grant,
 FULL_CONTROL to its owner, which GetBucketAcl and GetObjectAcl answer and
 GetBucketOwnershipControls names. A write may ask for that ACL
-(\fBx\-amz\-acl: private\fR or \fBbucket\-owner\-full\-control\fR, as rclone and
-s3fs do by default) and PutBucketAcl and PutObjectAcl may set it again; any other
+(\fBbucket\-owner\-full\-control\fR, or \fBx\-amz\-acl: private\fR from the bucket's
+owner, as rclone and s3fs send by default, since from anybody else it would give
+the writer the control) and PutBucketAcl and PutObjectAcl may set it again; any other
 canned ACL or grant is
 .B "400 AccessControlListNotSupported"
 (\fBInvalidBucketAclWithObjectOwnership\fR on CreateBucket) and stores nothing,
