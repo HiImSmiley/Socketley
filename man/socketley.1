@@ -9740,7 +9740,11 @@ music and documents in their own rows, with thumbnails, lengths and what the
 user left half watched on any device. It uploads several files at once,
 and a file of 48 MiB or more in parts of at least 16 MiB, four requests side by
 side, through the drive's multipart above, with each file's percentage, rate,
-time left and start; folders too, by dropping them or choosing one. It selects
+time left and start; folders too, by dropping them or choosing one. A file in
+parts whose line is lost is paused and goes on when the line is back, and one a
+closed or reloaded page left is shown again, with how far it came, and goes on
+from the parts the server lists once its file is chosen anew (the same name and
+size, and the same modification time or a confirmation). It selects
 several items to download or delete, renames, shares, restores from the trash,
 shows pictures one after another, and opens text in an editor that highlights
 code, finds and replaces, previews Markdown and saves with Ctrl+S, and makes new

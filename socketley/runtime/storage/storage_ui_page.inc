@@ -1958,21 +1958,71 @@ function sendDlg(preset) {
 
 // ─── uploads ────────────────────────────────────────────────────────────────
 // Several files at once, and a large file in parts side by side over /~dav/'s multipart, so a line with latency is
-// filled by more than one connection; each part is tried again a few times before the file is given up.
+// filled by more than one connection. A part is tried again a few times; a file whose connection is lost is paused,
+// not given up, and taken up again when the line is back or on a click, and one a closed or reloaded page left
+// behind is remembered in localStorage and taken up again once its file is chosen anew, from the parts the server
+// says arrived.
 const UP = { jobs: [], busy: 0, slots: 4, ui: null, rate: 0, lastBytes: 0, lastT: 0, ticking: 0 };
 const PART_FROM = 48 << 20;
 function partSize(n) { return Math.max(16 << 20, Math.ceil(n / 9000 / (1 << 20)) << 20); }
+const KEEP = 'skl-upload:';
+function makeParts(size, ps) { const out = []; for (let o = 0, n = 1; o < size; o += ps, n++) out.push({ n, from: o, to: Math.min(size, o + ps), state: 'todo', tries: 0 }); return out; }
 function enqueue(file, rel, base, onend) {
   const segs = [...(base || path), ...rel.split('/').filter(Boolean)];
   const j = { file, segs, name: segs[segs.length - 1], dir: segs.slice(0, -1).join('/'), size: file.size, state: 'queued', tries: 0, sent: 0, inflight: new Map(), xhrs: new Set(), rate: 0, hist: [], onend };
-  if (file.size >= PART_FROM) {
-    const ps = partSize(file.size); j.parts = [];
-    for (let o = 0, n = 1; o < file.size; o += ps, n++) j.parts.push({ n, from: o, to: Math.min(file.size, o + ps), state: 'todo', tries: 0 });
-  }
+  if (file.size >= PART_FROM) { j.ps = partSize(file.size); j.parts = makeParts(file.size, j.ps); }
   UP.jobs.push(j);
   paintUploads(); schedule();
   return j;
 }
+function keep(j) { store.set(KEEP + j.id, JSON.stringify({ segs: j.segs, size: j.size, mod: j.file ? j.file.lastModified : j.mod, ps: j.ps, at: Date.now() })); }
+function forget(j) { if (j.id) store.del(KEEP + j.id); }
+// The parts of upload `j` the server has, pages of them, marked done with their ETags; false when the upload is gone.
+async function arrived(j) {
+  let marker = '';
+  for (;;) {
+    const r = await api('GET', url(j) + '?uploadId=' + encodeURIComponent(j.id) + (marker ? '&part-number-marker=' + marker : ''));
+    if (!r.ok) return false;
+    const doc = new DOMParser().parseFromString(await r.text(), 'application/xml');
+    const t = (e, n) => { const x = e.getElementsByTagName(n)[0]; return x ? x.textContent : ''; };
+    for (const e of doc.getElementsByTagName('Part')) {
+      const p = j.parts[+t(e, 'PartNumber') - 1];
+      if (p && +t(e, 'Size') === p.to - p.from && p.state !== 'done') { p.state = 'done'; p.etag = t(e, 'ETag'); j.sent += p.to - p.from; }
+    }
+    if (t(doc, 'IsTruncated') !== 'true') return true;
+    marker = t(doc, 'NextPartNumberMarker');
+  }
+}
+// Uploads a closed page left: shown paused, with how far they had come, until their file is chosen again.
+async function leftBehind() {
+  const ids = [];
+  try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith(KEEP)) ids.push(k.slice(KEEP.length)); } } catch (e) { return; }
+  for (const id of ids) {
+    let v; try { v = JSON.parse(store.get(KEEP + id, 'null')); } catch (e) {}
+    if (!v || !v.segs || UP.jobs.some(j => j.id === id)) continue;
+    const j = { file: null, segs: v.segs, name: v.segs[v.segs.length - 1], dir: v.segs.slice(0, -1).join('/'), size: v.size, mod: v.mod, ps: v.ps, id,
+                state: 'stale', tries: 0, sent: 0, inflight: new Map(), xhrs: new Set(), rate: 0, hist: [], parts: makeParts(v.size, v.ps) };
+    if (!(await arrived(j))) { store.del(KEEP + id); continue; }
+    UP.jobs.push(j);
+  }
+  paintUploads();
+}
+function resume(j) {
+  if (j.state === 'paused') { for (const p of j.parts || []) if (p.state === 'sending') p.state = 'todo'; j.state = j.id ? 'running' : 'queued'; j.err = ''; j.hist = []; schedule(); paintUploads(); return; }
+  // A file left by a closed page: the same one is chosen again, known by its name, size and time.
+  const pick = el('input', { type: 'file' });
+  pick.onchange = async () => {
+    const f = pick.files[0]; if (!f) return;
+    if (f.size !== j.size || f.name !== j.name) { toast('That is not ' + j.name + ' (' + human(j.size) + ')', 'bad'); return; }
+    if (j.mod && f.lastModified !== j.mod && !(await ask({ title: 'A different version?', text: f.name + ' was changed since its upload began. Taking the upload up again mixes the two versions.', ok: 'Continue anyway' }))) return;
+    j.file = f;
+    if (!(await arrived(j))) { forget(j); UP.jobs.splice(UP.jobs.indexOf(j), 1); toast('The server no longer holds that upload: it starts again'); enqueue(f, j.segs.slice(1).join('/'), [j.segs[0]]); return; }
+    j.state = 'running'; j.started = Date.now(); j.hist = [];
+    schedule(); paintUploads();
+  };
+  pick.click();
+}
+window.addEventListener('online', () => { for (const j of UP.jobs) if (j.state === 'paused') resume(j); });
 function xhr(j, method, url, body, headers, onprog) {
   return new Promise(res => {
     const x = new XMLHttpRequest();
@@ -1988,7 +2038,7 @@ function xhr(j, method, url, body, headers, onprog) {
 function nextTask() {
   for (const j of UP.jobs) {
     if (j.state === 'queued' && !j.parts) { j.state = 'running'; return () => putWhole(j); }
-    if (!j.parts || j.state === 'done' || j.state === 'error' || j.state === 'canceled') continue;
+    if (!j.parts || ['done', 'error', 'canceled', 'paused', 'stale'].includes(j.state)) continue;
     if (j.state === 'queued') { j.state = 'starting'; return () => begin(j); }
     if (j.state !== 'running') continue;
     const p = j.parts.find(p => p.state === 'todo');
@@ -2027,16 +2077,21 @@ async function begin(j) {
   const m = /<UploadId>([^<]+)<\/UploadId>/.exec(r.text);
   if (r.status !== 200 || !m) return failed(j, r);
   j.id = m[1]; j.state = 'running';
+  keep(j);
 }
 async function sendPart(j, p) {
   for (;;) {
     const r = await xhr(j, 'PUT', url(j) + '?partNumber=' + p.n + '&uploadId=' + encodeURIComponent(j.id), j.file.slice(p.from, p.to), null, n => j.inflight.set(p.n, n));
     j.inflight.delete(p.n);
     if (j.state === 'canceled' || j.state === 'error') return;
-    if (r.status === 200 && r.etag) { p.etag = r.etag; p.state = 'done'; j.sent += p.to - p.from; return; }
+    if (r.status === 200 && r.etag) { if (p.state !== 'done') { p.etag = r.etag; p.state = 'done'; j.sent += p.to - p.from; } return; }
+    if (j.state === 'paused') { p.state = 'todo'; return; }
     if ((r.status === 0 || r.status >= 500) && ++p.tries < 5) { await sleep(800 * p.tries); continue; }
+    // A lost line pauses the file with what arrived kept; a refusal ends it.
+    if (r.status === 0 || r.status >= 500) { p.state = 'todo'; p.tries = 0; pause(j); return; }
     failed(j, r);
     xhr(j, 'DELETE', url(j) + '?uploadId=' + encodeURIComponent(j.id));
+    forget(j);
     return;
   }
 }
@@ -2047,7 +2102,14 @@ async function finish(j) {
   if (r.status === 200 && !/<Error>/.test(r.text)) return done(j);
   failed(j, r);
 }
-function done(j) { j.state = 'done'; j.ended = Date.now(); if (j.onend) j.onend(j); if (j.dir === path.join('/') || path.length && j.dir.startsWith(path.join('/') + '/')) reloadSoon(); }
+function pause(j) {
+  if (j.state === 'paused') return;
+  j.state = 'paused'; j.err = 'the connection was lost';
+  for (const x of [...j.xhrs]) x.abort();
+  for (const p of j.parts) if (p.state === 'sending') p.state = 'todo';
+  toast(j.name + ' is paused: it goes on when the line is back', 'bad', 6000);
+}
+function done(j) { forget(j); j.state = 'done'; j.ended = Date.now(); if (j.onend) j.onend(j); if (j.dir === path.join('/') || path.length && j.dir.startsWith(path.join('/') + '/')) reloadSoon(); }
 function failed(j, r) {
   if (j.state === 'error') return;
   j.state = 'error'; j.ended = Date.now();
@@ -2062,7 +2124,7 @@ function cancel(j) {
   j.state = 'canceled'; j.ended = Date.now();
   for (const x of [...j.xhrs]) x.abort();
   if (j.onend) j.onend(j);
-  if (j.id) xhr(j, 'DELETE', url(j) + '?uploadId=' + encodeURIComponent(j.id));
+  if (j.id) { xhr(j, 'DELETE', url(j) + '?uploadId=' + encodeURIComponent(j.id)); forget(j); }
   paintUploads(); schedule();
 }
 const sentOf = j => j.state === 'done' ? j.size : j.sent + [...j.inflight.values()].reduce((a, b) => a + b, 0);
@@ -2090,11 +2152,11 @@ function paintUploads() {
   const rate = live.reduce((a, j) => a + (j.rate || 0), 0);
   const left = live.reduce((a, j) => a + j.size - sentOf(j), 0);
   UP.head.textContent = '';
-  const errs = UP.jobs.filter(j => j.state === 'error').length;
+  const errs = UP.jobs.filter(j => j.state === 'error').length, held = UP.jobs.filter(j => j.state === 'paused' || j.state === 'stale').length;
   UP.head.append(el('div', { class: 't' },
-    el('b', { text: live.length ? 'Uploading ' + live.length + (live.length === 1 ? ' file' : ' files') + ' · ' + Math.floor(100 * sent / Math.max(1, total)) + '%' : errs ? errs + ' upload' + (errs > 1 ? 's' : '') + ' failed' : 'Uploads complete' }),
+    el('b', { text: live.length ? 'Uploading ' + live.length + (live.length === 1 ? ' file' : ' files') + ' · ' + Math.floor(100 * sent / Math.max(1, total)) + '%' : held ? held + ' upload' + (held > 1 ? 's' : '') + ' paused' : errs ? errs + ' upload' + (errs > 1 ? 's' : '') + ' failed' : 'Uploads complete' }),
     el('small', { text: live.length ? human(rate) + '/s · ' + (rate > 0 ? clock(left / rate) + ' left' : 'starting…') + ' · ' + human(sent) + ' of ' + human(total) : UP.jobs.filter(j => j.state === 'done').length + ' done · ' + human(total) })),
-    live.length ? '' : ibtn('close', 'Clear', () => { UP.jobs = UP.jobs.filter(j => !['done', 'error', 'canceled'].includes(j.state)); paintUploads(); }));
+    live.length || held ? '' : ibtn('close', 'Clear', () => { UP.jobs = UP.jobs.filter(j => !['done', 'error', 'canceled'].includes(j.state)); paintUploads(); }));
   UP.bar.firstChild.style.width = (100 * sent / Math.max(1, total)) + '%';
   for (const [j, row] of UP.rows) if (!UP.jobs.includes(j)) { row.remove(); UP.rows.delete(j); }
   for (const j of UP.jobs) {
@@ -2102,8 +2164,13 @@ function paintUploads() {
     if (!r) {
       r = el('div', { class: 'uj' }, el('div', { class: 'n', text: j.name, title: j.segs.join('/') }), el('div', { class: 's' }), el('div', { class: 'p' }, el('i')));
       r.append(ibtn('close', 'Cancel', () => cancel(j), 'x'));
+      r._go = btn('upload', 'Resume', () => resume(j), 'sm pri');
+      r._go.style.gridColumn = '1'; r._go.style.justifySelf = 'start'; r._go.style.marginTop = '6px';
+      r.append(r._go);
       UP.rows.set(j, r); UP.body.append(r);
     }
+    r._go.hidden = j.state !== 'paused' && j.state !== 'stale';
+    r._go.lastChild.textContent = j.state === 'stale' ? 'Choose the file to resume' : 'Resume';
     const s = sentOf(j), pct = 100 * s / Math.max(1, j.size);
     r.className = 'uj' + (j.state === 'done' ? ' done' : j.state === 'error' ? ' err' : '');
     const started = j.started ? new Date(j.started).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
@@ -2112,10 +2179,12 @@ function paintUploads() {
     else if (j.state === 'done') { const secs = Math.max(0.001, (j.ended - j.started) / 1000); text = '✓ ' + human(j.size) + ' in ' + clock(secs) + ' · ' + human(j.size / secs) + '/s · started ' + started; }
     else if (j.state === 'error') text = 'Failed: ' + j.err;
     else if (j.state === 'canceled') text = 'Canceled';
+    else if (j.state === 'paused') text = 'Paused at ' + pct.toFixed(0) + '% · ' + j.err;
+    else if (j.state === 'stale') text = 'Left at ' + pct.toFixed(0) + '% of ' + human(j.size) + ' when the page closed · in ' + j.dir;
     else text = pct.toFixed(pct < 10 ? 1 : 0) + '% · ' + human(s) + ' / ' + human(j.size) + ' · ' + (j.rate > 0 ? human(j.rate) + '/s · ' + clock((j.size - s) / j.rate) + ' left' : '…') + ' · started ' + started + (j.parts ? ' · ' + j.parts.length + ' parts' : '');
     r.children[1].textContent = text;
     r.children[2].firstChild.style.width = (j.state === 'canceled' ? 0 : pct) + '%';
-    r.lastChild.title = ['done', 'error', 'canceled'].includes(j.state) ? 'Remove' : 'Cancel';
+    r.children[3].title = ['done', 'error', 'canceled'].includes(j.state) ? 'Remove' : 'Cancel';
   }
 }
 window.addEventListener('beforeunload', e => { if (UP.jobs.some(j => ['queued', 'running', 'starting', 'finishing'].includes(j.state))) { e.preventDefault(); e.returnValue = ''; } });
@@ -2151,6 +2220,7 @@ async function start() {
   await migratePositions();
   await loadProgress();
   load();
+  leftBehind();
 }
 // A session the browser still holds signs in at once.
 (async () => {
