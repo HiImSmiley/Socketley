@@ -147,6 +147,12 @@ select.inp option{background:#151821}
   -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box exclude,linear-gradient(#000 0 0)}
 .cv .shine{position:absolute;inset:0;z-index:3;pointer-events:none;opacity:0;transition:opacity .25s;background:radial-gradient(420px circle at var(--mx,50%) var(--my,50%),rgba(255,255,255,.2),transparent 45%)}
 .card:hover .ring,.card:focus-visible .ring,.card:hover .shine{opacity:1}
+.cv img.cov{z-index:0}
+.lib .card .cv.covered .big{opacity:0}
+.lib .card .cv.covered::after{background:linear-gradient(180deg,rgba(0,0,0,.05) 20%,rgba(0,0,0,.75))}
+.fold .card .cv.covered img.cov{opacity:.38;filter:saturate(1.2)}
+.fold .card .cv.covered::after{display:block;background:linear-gradient(90deg,rgba(10,10,18,.85) 25%,rgba(10,10,18,.2))}
+.fold .card .cv .fi,.fold .card .cv .fn{position:relative;z-index:2}
 .dropin .cv,.dropin td,button.dropin{outline:2px dashed var(--a1);outline-offset:3px;background:rgba(var(--glow),.12)}
 .card.sel .cv{box-shadow:0 0 0 3px var(--a1),0 18px 50px -20px rgba(var(--glow),.6);border-color:transparent}
 .cv img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .4s}
@@ -924,8 +930,8 @@ function render() {
       const by = k => list.filter(it => it.kind === k);
       const vids = by('video'), pics = by('image'), auds = by('audio');
       const docs = list.filter(it => ['text', 'pdf'].includes(it.kind)), other = list.filter(it => ['archive', 'file'].includes(it.kind));
-      C.append(...[section('Folders', 'fold', by('dir'), folderCard), section('Videos', 'vid', vids, it => videoCard(it, vids)),
-        section('Pictures', 'pic', pics, it => fileCard(it)), section('Music', 'aud', auds, it => fileCard(it)),
+      C.append(...[section('Folders', 'fold', by('dir'), folderCard), ...videoSections(vids),
+        ...pictureSections(pics), section('Music', 'aud', auds, it => fileCard(it)),
         section('Documents', 'doc', docs, it => fileCard(it)), section('Other files', 'doc', other, it => fileCard(it))].filter(Boolean));
     }
   }
@@ -1035,13 +1041,74 @@ async function moveTo(list, dest) {
   if (errs.length) toast(errs[0], 'bad', 7000);
   load(true);
 }
+// Episodes named S01E02 or 1x02: a season each, in their order, the rest of the films after them.
+const EP = /(?:^|[^a-z0-9])s(\d{1,2})[ ._-]?e(\d{1,3})|(?:^|[^0-9])(\d{1,2})x(\d{2,3})(?:[^0-9]|$)/i;
+function episodeOf(name) {
+  const m = EP.exec(name);
+  if (!m) return null;
+  const season = +(m[1] || m[3]), ep = +(m[2] || m[4]);
+  let title = name.replace(/\.[^.]+$/, '').slice(m.index + m[0].length).replace(/^[\s._-]+/, '').replace(/[._]/g, ' ').trim();
+  title = title.replace(/\b(1080p|720p|2160p|480p|x264|x265|h264|h265|hevc|web[- ]?dl|webrip|bluray|hdr|10bit|aac|dts|ddp?5 1)\b.*$/i, '').trim();
+  return { season, ep, title };
+}
+function videoSections(vids) {
+  const eps = vids.map(it => [it, episodeOf(it.name)]).filter(([, e]) => e);
+  if (eps.length < 2) return [section('Videos', 'vid', vids, it => videoCard(it, vids))];
+  const seasons = new Map();
+  for (const [it, e] of eps) { if (!seasons.has(e.season)) seasons.set(e.season, []); seasons.get(e.season).push([it, e]); }
+  const order = [...seasons.keys()].sort((a, b) => a - b);
+  // A film plays on into the next episode, across seasons.
+  const all = order.flatMap(sn => seasons.get(sn).sort((a, b) => a[1].ep - b[1].ep).map(([it]) => it));
+  for (const it of all) it._list = all;
+  const out = order.map(sn => {
+    const list = seasons.get(sn).map(([it]) => it);
+    return section('Season ' + sn, 'vid', list, it => { const e = episodeOf(it.name); const c = videoCard(it, all); const t = c.querySelector('.ct'); t.textContent = 'E' + String(e.ep).padStart(2, '0') + (e.title ? ' · ' + e.title : ''); return c; });
+  });
+  const rest = vids.filter(it => !episodeOf(it.name));
+  if (rest.length) out.push(section('Videos', 'vid', rest, it => videoCard(it, rest)));
+  return out;
+}
+// Pictures in months of their dates, newest first, once there are many of them; a slideshow from the first.
+function pictureSections(pics) {
+  if (pics.length < 13 || sortBy !== 'date' && sortBy !== 'name') return [section('Pictures', 'pic', pics, it => fileCard(it))];
+  const months = new Map();
+  const ordered = pics.slice().sort((a, b) => (new Date(b.mod) - new Date(a.mod)) || a.name.localeCompare(b.name, undefined, { numeric: true }));
+  // The viewer steps through them as they are shown.
+  for (const it of ordered) it._list = ordered;
+  for (const it of ordered) {
+    const d = it.mod ? new Date(it.mod) : null, k = d ? d.getFullYear() * 12 + d.getMonth() : -1;
+    if (!months.has(k)) months.set(k, { label: d ? d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }) : 'Undated', list: [] });
+    months.get(k).list.push(it);
+  }
+  return [...months.values()].map(m => section(m.label, 'pic', m.list, it => fileCard(it)));
+}
+// A folder's or a library's cover: a picture called folder, cover or poster in it, else its first picture or film,
+// found by one listing when its card comes into view.
+const covers = new Map();
+const coverIo = 'IntersectionObserver' in window ? new IntersectionObserver(es => { for (const e of es) if (e.isIntersecting) { coverIo.unobserve(e.target); coverFor(e.target); } }, { rootMargin: '200px' }) : null;
+function lazyCover(cv, it) { cv._it = it; coverIo ? coverIo.observe(cv) : coverFor(cv); }
+async function coverFor(cv) {
+  const it = cv._it, k = keyOf(it);
+  if (!covers.has(k)) covers.set(k, propfind(it.segs).then(list => {
+    const files = list.filter(x => !x.dir);
+    const named = files.find(x => x.kind === 'image' && /^(folder|cover|poster)\.(jpe?g|png|webp)$/i.test(x.name));
+    return named || files.find(x => x.kind === 'video') || files.find(x => x.kind === 'image') || null;
+  }).catch(() => null));
+  const c = await covers.get(k);
+  if (!c || !cv.isConnected) return;
+  const img = el('img', { alt: '', src: '/~media/thumb-' + (it.kind === 'bucket' ? 960 : 480) + '/' + enc(c.segs), draggable: 'false', class: 'cov' });
+  img.onload = () => { img.classList.add('on'); cv.classList.add('covered'); };
+  cv.prepend(img);
+}
 function libCard(it) {
   const h = hue(it.name);
   const cv = el('div', { class: 'cv', style: 'background:linear-gradient(135deg,hsl(' + h + ' 70% 42%),hsl(' + (h + 45) + ' 75% 24%) 70%)' }, ico('bucket', 'big'), el('span', { class: 'ln', text: it.name }));
+  lazyCover(cv, it);
   return cardShell(it, cv);
 }
 function folderCard(it) {
   const cv = el('div', { class: 'cv' }, el('span', { class: 'fi' }, ico('folder')), el('span', { class: 'fn', text: it.name }));
+  lazyCover(cv, it);
   return cardShell(it, cv);
 }
 function videoCard(it, list) {
@@ -1388,11 +1455,17 @@ function viewImage(it, list) {
     for (const j of [i + 1, i - 1]) if (list[j]) new Image().src = '/~dav/' + enc(list[j].segs);
   };
   const step = d => { if (list.length < 2) return; i = (i + d + list.length) % list.length; show(); };
-  if (list.length > 1) stage.append(el('button', { class: 'nav2 l', title: 'Previous', onclick: () => step(-1) }, ico('left')), el('button', { class: 'nav2 r', title: 'Next', onclick: () => step(1) }, ico('chev')));
+  if (list.length > 1) stage.append(el('button', { class: 'nav2 l', title: 'Previous', onclick: () => { stopShow(); step(-1); } }, ico('left')), el('button', { class: 'nav2 r', title: 'Next', onclick: () => { stopShow(); step(1); } }, ico('chev')));
+  // A slideshow: the next picture every four seconds until it is stopped, by S, a click on it or a step by hand.
+  let showT = 0;
+  const ssB = list.length > 1 ? el('button', { class: 'btn sm', style: 'position:absolute;right:18px;bottom:16px;z-index:5', onclick: () => showT ? stopShow() : startShow() }, ico('play'), el('span', { text: 'Slideshow' })) : null;
+  function startShow() { showT = setInterval(() => step(1), 4000); if (ssB) { ssB.firstChild.innerHTML = P.pause; ssB.lastChild.textContent = 'Stop'; } }
+  function stopShow() { clearInterval(showT); showT = 0; if (ssB) { ssB.firstChild.innerHTML = P.play; ssB.lastChild.textContent = 'Slideshow'; } }
   L.o.append(stage, info);
-  const key = e => { if (layers[layers.length - 1] !== L) return; if (e.key === 'ArrowRight') step(1); else if (e.key === 'ArrowLeft') step(-1); };
+  if (ssB) L.o.append(ssB);
+  const key = e => { if (layers[layers.length - 1] !== L) return; if (e.key === 'ArrowRight') { stopShow(); step(1); } else if (e.key === 'ArrowLeft') { stopShow(); step(-1); } else if (e.key.toLowerCase() === 's') showT ? stopShow() : startShow(); };
   document.addEventListener('keydown', key);
-  L.onclose = () => document.removeEventListener('keydown', key);
+  L.onclose = () => { stopShow(); document.removeEventListener('keydown', key); };
   show();
 }
 async function viewPdf(it) {
