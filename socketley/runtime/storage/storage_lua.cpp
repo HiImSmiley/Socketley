@@ -43,7 +43,9 @@ namespace
     {
         const auto* a = reinterpret_cast<const struct sockaddr_in6*>(&ss);
         ::inet_ntop(AF_INET6, &a->sin6_addr, host, sizeof(host));
-        return "[" + std::string(host) + "]:" + std::to_string(ntohs(a->sin6_port));
+        std::string out(1, '[');
+        out.append(host).append("]:").append(std::to_string(ntohs(a->sin6_port)));
+        return out;
     }
     return "unix";
 }

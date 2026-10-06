@@ -265,7 +265,10 @@ struct object_meta
     {
         std::string e = hex(md5);
         if (parts)
-            e += "-" + std::to_string(parts);
+        {
+            e += '-';
+            e += std::to_string(parts);
+        }
         return e;
     }
 

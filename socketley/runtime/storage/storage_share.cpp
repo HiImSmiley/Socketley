@@ -93,7 +93,8 @@ std::string share_json(const share_link& s)
             o += first ? "" : ",";
             first = false;
             jstr(o, node);
-            o += ":" + std::to_string(n);
+            o += ':';
+            o += std::to_string(n);
         }
         o += "}";
     }

@@ -22,8 +22,9 @@ workspace "Socketley"
     platforms { "x64" }
     location "make"
 
-    -- Every project, since the SDK and the tests include event_loop.h too and a system without liburing has none.
+    -- Every project, since the SDK and the tests use event_loop.h too and a system without liburing has none.
     externalincludedirs { "thirdparty/liburing" }
+    libdirs { "thirdparty/liburing" }
 
     -- ccache when it is present.  The workflow this pays for is toggling
     -- CPPFLAGS (trace, invariants): make does not notice that change, so the
@@ -250,7 +251,8 @@ project "socketley"
     forceincludes { "socketley/shared/liburing_version.h" }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "luajit", "uring", "ssl", "crypto" }
+    -- liburing from its archive only, so no binary loads a liburing.so other than the version it was compiled against.
+    links { "luajit", "uring:static", "ssl", "crypto" }
 
     files {
         "socketley/**.h",
@@ -702,7 +704,7 @@ project "test_request_channel"
             "socketley/shared/request_channel.cpp",
             "socketley/shared/event_loop.cpp" }
 
-    links { "uring" }
+    links { "uring:static" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }
@@ -740,7 +742,7 @@ project "test_managed_runtime"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_managed_runtime.cpp" }
 
@@ -780,7 +782,7 @@ project "test_write_queue"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_write_queue.cpp" }
 
@@ -820,7 +822,7 @@ project "test_worker_map"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_worker_map.cpp" }
 
@@ -1096,7 +1098,7 @@ project "test_sdk_engine"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_sdk_engine.cpp" }
 
@@ -1138,7 +1140,7 @@ project "test_sdk_runtime"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_sdk_runtime.cpp" }
 
@@ -1373,7 +1375,7 @@ project "fuzz_storage_parsers"
 
     includedirs { ".", "socketley", "test/fuzz", "thirdparty/sol2", "thirdparty/luajit", "include/linux" }
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files {
         "test/fuzz/fuzz_storage_parsers.cpp",
@@ -1483,7 +1485,7 @@ project "fuzz_event_loop"
     cppdialect "C++latest"
 
     includedirs { "socketley", "test/fuzz" }
-    links { "uring" }
+    links { "uring:static" }
 
     files {
         "test/fuzz/fuzz_event_loop.cpp",
@@ -1522,7 +1524,7 @@ project "fuzz_http_request"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files {
         "test/fuzz/fuzz_http_request.cpp",
@@ -1570,7 +1572,7 @@ project "fuzz_server_ops"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files {
         "test/fuzz/fuzz_server_ops.cpp",
@@ -1596,7 +1598,7 @@ project "fuzz_client_ops"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files {
         "test/fuzz/fuzz_client_ops.cpp",
@@ -1642,7 +1644,7 @@ project "fuzz_proxy_ops"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files {
         "test/fuzz/fuzz_proxy_ops.cpp",
@@ -1702,7 +1704,7 @@ project "test_conn_transfer"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_conn_transfer.cpp" }
 
@@ -1742,7 +1744,7 @@ project "test_udp_recv_ladder"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_udp_recv_ladder.cpp" }
 
@@ -1982,7 +1984,7 @@ project "test_raft_storage"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_raft_storage.cpp" }
 
@@ -2022,7 +2024,7 @@ project "test_object_store"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_object_store.cpp" }
 
@@ -2060,7 +2062,7 @@ project "test_storage_multipart"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_storage_multipart.cpp" }
 
@@ -2098,7 +2100,7 @@ project "test_storage_select"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_storage_select.cpp" }
 
@@ -2136,7 +2138,7 @@ project "test_storage_federation"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_storage_federation.cpp" }
 
@@ -2174,7 +2176,7 @@ project "test_storage_compression"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto", "dl" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto", "dl" }
 
     files { "test/unit/test_storage_compression.cpp" }
 
@@ -2212,7 +2214,7 @@ project "test_storage_shards"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_storage_shards.cpp" }
 
@@ -2250,7 +2252,7 @@ project "test_storage_crash"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/unit/test_storage_crash.cpp" }
 
@@ -2289,7 +2291,7 @@ project "bench_conn_transfer"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
 
     files { "test/benchmark/bench_conn_transfer.cpp" }
 

@@ -65,8 +65,8 @@ CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/liburing"
 CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/sol2"
 CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/luajit"
 
-LIBS="-L$LIBDIR -L$ROOT/thirdparty/luajit"
-LIBS="$LIBS -lsocketley_sdk -lluajit -luring -lssl -lcrypto -pthread"
+LIBS="-L$LIBDIR -L$ROOT/thirdparty/luajit -L$ROOT/thirdparty/liburing"
+LIBS="$LIBS -lsocketley_sdk -lluajit -Wl,-Bstatic -luring -Wl,-Bdynamic -lssl -lcrypto -pthread"
 
 if [ "$want_pc" = 1 ]; then
     cat <<EOF

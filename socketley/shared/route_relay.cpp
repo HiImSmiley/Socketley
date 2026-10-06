@@ -48,7 +48,7 @@ bool open(runtime_manager* mgr, std::string_view to, std::string_view from,
     {
         if (srv->accept_routed(ref, from) >= 0)
             return true;
-        err = "\"" + std::string(to) + "\" refused the connection";
+        err.assign(1, '"').append(to).append("\" refused the connection");
         return false;
     }
 
@@ -57,8 +57,8 @@ bool open(runtime_manager* mgr, std::string_view to, std::string_view from,
     {
         // Says which of the two it is, because "there is no runtime called x"
         // would be a different and wrong diagnosis.
-        err = "\"" + std::string(to) + "\" is not in this process and there is "
-              "no channel to reach it";
+        err.assign(1, '"').append(to).append("\" is not in this process and there is "
+                                             "no channel to reach it");
         return false;
     }
     return sink->open(to, ref, from, err);
