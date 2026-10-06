@@ -1622,7 +1622,12 @@ class MsePlayer {
           if (fb >= 0 || any >= 0) { level = fb >= 0 ? fb : any; list = await this.list(level); }
         }
         const lvl = this.levels[level];
-        const seg = list.segs.find(s => s.start + s.dur > end + 0.05);
+        let si = list.segs.findIndex(s => s.start + s.dur > end + 0.05);
+        // A segment whose media ends a little short of its playlist length, as a copied stream's does at its last audio
+        // frame, leaves the buffer where it left it; the next one is asked for, not the same one again.
+        const last = this.last;
+        if (si >= 0 && last && last.level === level && si <= last.i && Math.abs(end - last.end) < 0.01) si = last.i + 1;
+        const seg = si >= 0 ? list.segs[si] : undefined;
         if (!seg) {
           if (list.ended || end >= list.total - 0.1) {
             // The end is marked once; a seek back after it is still fed, as appending opens the source again.
@@ -1651,6 +1656,7 @@ class MsePlayer {
           this.inited = level;
         }
         await this.append(data);
+        this.last = { level, i: si, end: this.bufferedEnd() };
         if (this.playing !== level) { this.playing = level; this.onlevel(); }
         // Up when the next stream fits the measured rate twice over and answers at once; down when this one does not
         // fit it, or the server takes more than half a segment to answer, as it does when it cannot keep up.
