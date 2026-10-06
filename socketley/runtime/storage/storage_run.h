@@ -872,8 +872,16 @@ public:
                      std::string_view key, std::string_view query = {});
     // Every page of a listing as one, up to the bound an application lists to.
     void app_list(std::string bucket, list_query q, std::function<void(st, list_page)> done);
-    // HTTP Basic credentials, or none on a runtime that takes none; false after answering 401.
+    // HTTP Basic credentials, the web interface's session cookie, or none on a runtime that takes none; false after
+    // answering 401.
     bool app_login(const std::shared_ptr<conn>& c, std::string_view realm);
+    // The web interface's session cookie judged into `v`; false when the request carries none.
+    bool ui_cookie(const std::shared_ptr<conn>& c, auth_verdict& v);
+    static bool has_ui_cookie(const conn& c);
+    // A Content-Disposition that saves `key` under its last name, as ?download asks.
+    static std::string attachment_of(std::string_view key);
+    // The interface's sign-in, /~ui/session.
+    void ui_session(const std::shared_ptr<conn>& c);
     void app_reply(const std::shared_ptr<conn>& c, int status, std::string body = {},
                    std::string_view type = "text/plain; charset=utf-8");
     void op_share(const std::shared_ptr<conn>& c);

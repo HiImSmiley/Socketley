@@ -9732,6 +9732,28 @@ above), deleted after a chosen time or number of downloads (for several files,
 that number of each), with an optional password. Five colour themes are chosen
 from the sidebar and kept in the browser.
 .IP
+It signs in with
+.B POST /~ui/session
+and Basic credentials, which sets the cookie
+.B skl_ui
+(HttpOnly, SameSite=Strict, Secure over TLS): the access key, an expiry and an
+HMAC-SHA256 of both under the key's own secret, so every shard and node checks
+it alike and a key whose secret changes or that is removed ends its sessions.
+It lasts twelve hours and the browser's session, or thirty days with
+.BR ?remember .
+.B GET /~ui/session
+says who is signed in and
+.B DELETE /~ui/session
+signs out. /~dav/, /~media/ and the management of /~share/ take the cookie as
+they take Basic credentials, so the page's script never holds the secret; a
+change made under the cookie alone (anything but GET, HEAD, OPTIONS and
+PROPFIND) must carry the header
+.BR "X-Socketley-UI" ,
+which no other site's page can add, and is 403 otherwise. A session never makes
+a new one. A file's
+.B GET /~dav/\fIbucket\fB/\fIkey\fB?download
+is saved under its name.
+.IP
 It plays films and music, with their subtitles: the file itself where the
 browser plays it, which costs the server nothing, and otherwise the master
 playlist's streams through Media Source Extensions, the copied one where the

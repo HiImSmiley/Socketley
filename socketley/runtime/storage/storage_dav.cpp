@@ -170,6 +170,18 @@ bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view rea
         else
             v.allowed = false;
     }
+    else if (ui_cookie(c, v))
+    {
+        // A browser's session sends its cookie with whatever it asks, another site's form too: a change made under
+        // the cookie alone must carry the interface's own header, which no page elsewhere can add without CORS.
+        const std::string_view m = c->req.method;
+        if (v.allowed && m != "GET" && m != "HEAD" && m != "OPTIONS" && m != "PROPFIND" &&
+            c->req.header("x-socketley-ui").empty())
+        {
+            app_reply(c, 403, "A change made with the web interface's session comes from the web interface.\n");
+            return false;
+        }
+    }
     else
     {
         // No credentials: let in on a runtime that takes none, and asked for them otherwise.
@@ -184,8 +196,9 @@ bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view rea
     {
         response r;
         r.status = 401;
-        // The web interface asks for credentials itself, and a browser's own prompt would come before its form.
-        if (c->req.header("x-socketley-ui").empty())
+        // The web interface asks for credentials itself, and a browser's own prompt would come before its form, as it
+        // would over a player whose session ran out.
+        if (c->req.header("x-socketley-ui").empty() && !has_ui_cookie(*c))
             r.headers.emplace_back("WWW-Authenticate", "Basic realm=\"" + std::string(realm) + "\", charset=\"UTF-8\"");
         r.headers.emplace_back("Content-Type", "text/plain; charset=utf-8");
         r.body = "Sign in with an access key as the user name and its secret as the password.\n";
@@ -340,6 +353,14 @@ void storage_run::op_dav(const std::shared_ptr<conn>& c)
             if (q.first == "uploads" || q.first == "uploadId" || q.first == "partNumber")
                 mpu.push_back(std::move(q));
         app_forward(c, r.method, std::move(bucket), std::move(key), {}, {}, std::move(mpu));
+        return;
+    }
+    // A file read with ?download is saved by a browser, under its own name.
+    if (r.method == "GET" && file && r.has_query("download"))
+    {
+        std::vector<std::pair<std::string, std::string>> q;
+        q.emplace_back("response-content-disposition", attachment_of(key));
+        app_forward(c, "GET", std::move(bucket), std::move(key), {}, {}, std::move(q));
         return;
     }
     // A file's PUT streams down the S3 path as it arrives; anything else is read whole first, which is nothing for

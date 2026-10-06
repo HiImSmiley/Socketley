@@ -1,4 +1,5 @@
 #include "s3_sigv4_auth.h"
+#include "small_file.h"
 
 #include <cerrno>
 #include <charconv>
@@ -998,6 +999,24 @@ auth_verdict sigv4_authenticator::authorize_basic(std::string_view access_key, s
     {
         v.allowed = false;
         v.error   = {"AccessDenied", "The access key or secret given is not one of this runtime's.", 401};
+        return v;
+    }
+    v.principal = std::string(access_key);
+    v.user      = m_creds.user_of(access_key);
+    return v;
+}
+
+auth_verdict sigv4_authenticator::authorize_ui_session(std::string_view access_key, int64_t expires_ms,
+                                                      std::string_view mac_hex)
+{
+    maybe_reload();
+    auth_verdict v;
+    const std::string_view secret = m_creds.secret(access_key);
+    const std::string want = secret.empty() ? std::string{} : hmac_sha256_hex(secret, ui_session_text(access_key, expires_ms));
+    if (want.empty() || want.size() != mac_hex.size() || CRYPTO_memcmp(want.data(), mac_hex.data(), want.size()) != 0)
+    {
+        v.allowed = false;
+        v.error   = {"AccessDenied", "The session is not one of this runtime's.", 401};
         return v;
     }
     v.principal = std::string(access_key);

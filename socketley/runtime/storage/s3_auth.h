@@ -145,6 +145,12 @@ struct post_signature
     std::string_view v2_signature;
 };
 
+// What a web interface's session cookie seals.
+inline std::string ui_session_text(std::string_view access_key, int64_t expires_ms)
+{
+    return "socketley-ui\n" + std::string(access_key) + "\n" + std::to_string(expires_ms);
+}
+
 class authenticator
 {
 public:
@@ -161,6 +167,17 @@ public:
     // A WebDAV client's or a browser's HTTP Basic credentials, the access key as the user name and its secret as the
     // password; an authenticator that holds no keys lets everyone in as with no credentials.
     virtual auth_verdict authorize_basic(std::string_view /*access_key*/, std::string_view /*secret*/)
+    {
+        auth_verdict v;
+        v.anonymous = true;
+        return v;
+    }
+    // The web interface's sign-in cookie for `access_key`, sealed with that key's own secret: `mac_hex` must be the
+    // HMAC-SHA256 under the secret of ui_session_text(access_key, expires_ms). The caller judges the expiry. A key that
+    // is gone or whose secret changed no longer verifies, so its sessions end with it; an authenticator that holds no
+    // keys lets everyone in as with no credentials.
+    virtual auth_verdict authorize_ui_session(std::string_view /*access_key*/, int64_t /*expires_ms*/,
+                                              std::string_view /*mac_hex*/)
     {
         auth_verdict v;
         v.anonymous = true;

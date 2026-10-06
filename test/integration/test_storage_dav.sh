@@ -12,6 +12,10 @@
 #   * a versioned bucket's deleted file missing from its trash, or not brought
 #     back by a restore
 #   * the interface not served, or served without its content policy
+#   * a sign-in cookie not let in, let in tampered with, expired or after its
+#     key's secret changed, readable by script, or taking a change that does
+#     not carry the interface's header; a session extending itself
+#   * a file read with ?download not saved under its name
 #   * an rclone mount's copy of a tree not coming back byte for byte
 # suite: isolated
 set -uo pipefail
@@ -181,6 +185,37 @@ check "as a page with its script" "$(curl -s "$U/~ui/" | grep -c '<script>')" 1
 check "under a content policy" "$(curl -s -o /dev/null -D - "$U/~ui/" | grep -ci "^content-security-policy: default-src 'self'")" 1
 check "and only read" "$(code -X POST "$U/~ui/")" 405
 check "a path of no application is refused" "$(code "$U/~nope/")" 400
+
+# The interface's sign-in: a cookie sealed with the key's secret.
+jar="$T/jar"
+check "a sign-in with a wrong secret is 401" "$(code -X POST -u "AKIADAVANN0000000000:nope" "$U/~ui/session")" 401
+check "and with none" "$(code -X POST "$U/~ui/session")" 401
+hdr=$(curl -s -u "$A" -X POST -c "$jar" -D - -o "$T/who" "$U/~ui/session")
+check "a sign-in sets a cookie script cannot read and no other site sends" \
+      "$(echo "$hdr" | grep -i '^set-cookie: skl_ui=' | grep -ci 'httponly; samesite=strict')" 1
+check "a session without ?remember ends with the browser" "$(echo "$hdr" | grep -i '^set-cookie: skl_ui=' | grep -ci 'max-age')" 0
+check "and says who signed in" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["user"])' "$T/who")" ann
+check "?remember keeps it a month" \
+      "$(curl -s -u "$A" -X POST -D - -o /dev/null "$U/~ui/session?remember" | grep -i '^set-cookie: skl_ui=' | grep -o 'Max-Age=[0-9]*')" Max-Age=2592000
+ck=$(grep skl_ui "$jar" | awk '{print $7}')
+check "the cookie lists a folder" "$(code -b "skl_ui=$ck" -X PROPFIND -H 'Depth: 1' "$U/~dav/docs/")" 207
+check "on either shard" "$(for _ in 1 2 3 4; do code -b "skl_ui=$ck" "$U/~dav/docs/a/one.txt"; done)" 200200200200
+check "and reads media" "$(code -b "skl_ui=$ck" "$U/~ui/session")" 200
+check "a change under it without the interface's header is refused" "$(code -b "skl_ui=$ck" -X DELETE "$U/~dav/docs/a/one.txt")" 403
+check "with it, taken" "$(printf 'cookie' | code -b "skl_ui=$ck" -H 'X-Socketley-UI: 1' -T - "$U/~dav/docs/cookie.txt")" 201
+check "a cookie whose seal was altered is 401" "$(code -b "skl_ui=${ck%?}$( [ "${ck: -1}" = 0 ] && echo 1 || echo 0)" "$U/~ui/session")" 401
+key64=${ck%%.*}; mac=${ck##*.}
+check "as is one whose expiry was moved on" "$(code -b "skl_ui=$key64.99999999999999.$mac" "$U/~ui/session")" 401
+past=$(python3 -c 'import hmac,hashlib,sys,time; e=int(time.time()*1000)-1000; print("%d.%s" % (e, hmac.new(sys.argv[1].encode(), ("socketley-ui\n%s\n%d" % (sys.argv[2], e)).encode(), hashlib.sha256).hexdigest()))' "${A#*:}" "${A%%:*}")
+check "and one past its expiry, though sealed right" "$(code -b "skl_ui=$key64.$past" "$U/~ui/session")" 401
+check "a session cannot make itself a new one" "$(code -b "skl_ui=$ck" -X POST "$U/~ui/session")" 401
+check "nor does a stale cookie make a browser ask for credentials" "$(curl -s -o /dev/null -D - -b 'skl_ui=x.1.y' "$U/~dav/" | grep -ci '^www-authenticate')" 0
+check "a file read with ?download is saved under its name" \
+      "$(curl -s -o /dev/null -D - -b "skl_ui=$ck" "$U/~dav/docs/a/one.txt?download" | grep -i '^content-disposition' | tr -d '\r')" \
+      "Content-Disposition: attachment; filename=\"one.txt\"; filename*=UTF-8''one.txt"
+check "signing out clears the cookie" "$(curl -s -X DELETE -D - -o /dev/null "$U/~ui/session" | grep -i '^set-cookie: skl_ui=;' | grep -c 'Max-Age=0')" 1
+
+s3 -o /dev/null -X DELETE "$U/docs/cookie.txt"
 
 # A client of the drive: rclone copies a tree in and out.
 if [ -n "$RCLONE" ] && [ -x "$RCLONE" ]; then
