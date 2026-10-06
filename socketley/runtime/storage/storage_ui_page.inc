@@ -147,6 +147,7 @@ select.inp option{background:#151821}
   -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box exclude,linear-gradient(#000 0 0)}
 .cv .shine{position:absolute;inset:0;z-index:3;pointer-events:none;opacity:0;transition:opacity .25s;background:radial-gradient(420px circle at var(--mx,50%) var(--my,50%),rgba(255,255,255,.2),transparent 45%)}
 .card:hover .ring,.card:focus-visible .ring,.card:hover .shine{opacity:1}
+.dropin .cv,.dropin td,button.dropin{outline:2px dashed var(--a1);outline-offset:3px;background:rgba(var(--glow),.12)}
 .card.sel .cv{box-shadow:0 0 0 3px var(--a1),0 18px 50px -20px rgba(var(--glow),.6);border-color:transparent}
 .cv img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .4s}
 .cv img.on{opacity:1}
@@ -457,7 +458,7 @@ body.audio #ups,body.audio #selbar{bottom:96px}
     <div id="top">
       <button class="ib" id="menuB"></button>
       <nav class="crumbs" id="crumbs"></nav>
-      <div class="search" id="srch"><input class="inp" id="q" placeholder="Filter this folder" spellcheck="false"></div>
+      <div class="search" id="srch"><input class="inp" id="q" placeholder="Search" spellcheck="false"></div>
       <select class="inp" id="sort" title="Sort"><option value="name">Name</option><option value="date">Newest</option><option value="size">Largest</option></select>
       <div class="seg" id="vsw"></div>
       <button class="btn" id="bNew"></button>
@@ -714,6 +715,8 @@ function crumbs() {
   const c = $('#crumbs'); c.textContent = '';
   c.append(el('button', { text: 'Home', onclick: () => go([]) }));
   path.forEach((s, i) => c.append(ico('chev'), el('button', { text: s, title: s, onclick: () => go(path.slice(0, i + 1)) })));
+  // A breadcrumb above the folder open takes what is dropped on it, as a folder does.
+  [...c.querySelectorAll('button')].forEach((b, i) => { if (i > 0 && i < path.length) dropTarget(b, path.slice(0, i)); });
   const nw = $('#bNew'); nw.textContent = ''; nw.append(ico('plus'), el('span', { text: 'New' }));
   const up = $('#bUp'); up.textContent = ''; up.append(ico('upload'), el('span', { text: 'Upload' }));
   up.hidden = !path.length;
@@ -723,7 +726,45 @@ function crumbs() {
 }
 function setView(v) { view = v; store.set('skl-view', v); crumbs(); render(); }
 $('#sort').onchange = () => { sortBy = $('#sort').value; store.set('skl-sort', sortBy); render(); };
-$('#q').oninput = () => { query = $('#q').value.trim().toLowerCase(); render(); };
+// The box filters the folder open at once, and from two characters on also asks every library, a moment after the
+// last key.
+let searchT = 0, found = null, foundFor = '';
+$('#q').oninput = () => {
+  query = $('#q').value.trim().toLowerCase();
+  clearTimeout(searchT);
+  if (query.length < 2) { found = null; render(); return; }
+  render();
+  const q = query;
+  searchT = setTimeout(async () => {
+    try {
+      const r = await api('GET', '/~ui/search?q=' + encodeURIComponent(q));
+      if (!r.ok || q !== query) return;
+      found = await r.json(); foundFor = q;
+      render();
+    } catch (e) {}
+  }, 300);
+};
+function searchSection() {
+  if (!found || foundFor !== query || !query) return null;
+  const here = path.join('/') + (path.length ? '/' : '');
+  const list = found.results.filter(x => !(x.bucket + '/' + x.key).startsWith(here) || (x.bucket + '/' + x.key).slice(here.length).includes('/'));
+  const T = el('table', { class: 'tbl' });
+  const B = el('tbody');
+  for (const x of list) {
+    const segs = [x.bucket, ...x.key.split('/').filter(Boolean)];
+    const it = { name: segs[segs.length - 1], segs, dir: !!x.dir, size: x.size || 0, type: x.type || '', mod: x.modified ? new Date(x.modified).toUTCString() : '' };
+    it.kind = it.dir ? 'dir' : kind(it.name, it.type);
+    const th = el('span', { class: 'th' }, ico(ICON[it.kind]));
+    lazyThumb(th, it, 64);
+    const tr = el('tr', { class: 'r' }, el('td', { class: 'nm' }, el('div', { class: 'nmw' }, th, el('span', { text: it.name + (it.dir ? '/' : '') }))),
+      el('td', { class: 'hide', text: segs.slice(0, -1).join(' / ') }), el('td', { text: it.dir ? '' : human(it.size) }));
+    tr.onclick = () => { if (it.dir) { go(it.segs); return; } const sibs = list.filter(y => !y.dir).map(y => { const sg = [y.bucket, ...y.key.split('/')]; return { name: sg[sg.length - 1], segs: sg, size: y.size, type: y.type, dir: false, kind: kind(sg[sg.length - 1], y.type) }; }); open(Object.assign(it, { _list: sibs })); };
+    B.append(tr);
+  }
+  if (!list.length) B.append(el('tr', {}, el('td', { class: 'mut', text: 'Nothing elsewhere is called like that.' })));
+  T.append(B);
+  return el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('search')), el('span', { text: 'In all libraries' }), el('span', { class: 'n', text: String(list.length) + (found.more ? '+' : '') })), T);
+}
 $('#menuB').append(ico('menu')); $('#menuB').onclick = () => $('#side').classList.toggle('open');
 $('#srch').prepend(ico('search'));
 
@@ -845,8 +886,9 @@ function render() {
     C.append(el('div', { class: 'empty' }, ico(path.length ? 'upload' : 'bucket', 'big'),
       el('h3', { text: path.length ? 'Nothing here yet' : 'No libraries yet' }),
       el('div', { text: path.length ? 'Drop files or folders anywhere on this page, or use Upload.' : 'A library is a bucket: make one with New.' })));
-  } else if (!list.length) C.append(el('div', { class: 'empty' }, ico('search', 'big'), el('h3', { text: 'No match' }), el('div', { text: 'Nothing in this folder is called like that.' })));
+  } else if (!list.length) C.append(el('div', { class: 'empty', style: 'padding:30px 20px' }, el('h3', { text: 'Nothing here is called like that' }), el('div', { text: query.length >= 2 ? 'Results from every library are below.' : 'Type another letter to search every library.' })));
   else if (view === 'list') C.append(table(list));
+  if (query.length >= 2) { const f = searchSection(); if (f) C.append(f); }
   else {
     if (!path.length) {
       const cw = watching();
@@ -928,7 +970,44 @@ function cardShell(it, cover, extra) {
   c.addEventListener('click', e => clickItem(it, e));
   c.addEventListener('keydown', e => { if (e.key === 'Enter') open(it); });
   c.addEventListener('contextmenu', e => ctxMenu(it, e));
+  movable(c, it);
   return c;
+}
+// Items dragged onto a folder, a breadcrumb or a library move there, the selection with them when they are part of it.
+const DRAG = 'application/x-socketley-items';
+function movable(node, it) {
+  if (it.kind === 'bucket') { dropTarget(node, it.segs); return; }
+  node.draggable = true;
+  node.addEventListener('dragstart', e => {
+    const list = sel.has(keyOf(it)) ? selected() : [it];
+    e.dataTransfer.setData(DRAG, JSON.stringify(list.map(x => ({ segs: x.segs, dir: x.dir, name: x.name }))));
+    e.dataTransfer.effectAllowed = 'move';
+  });
+  if (it.dir) dropTarget(node, it.segs);
+}
+function dropTarget(node, segs) {
+  node.addEventListener('dragover', e => { if (e.dataTransfer.types.includes(DRAG)) { e.preventDefault(); e.stopPropagation(); node.classList.add('dropin'); } });
+  node.addEventListener('dragleave', () => node.classList.remove('dropin'));
+  node.addEventListener('drop', e => {
+    if (!e.dataTransfer.types.includes(DRAG)) return;
+    e.preventDefault(); e.stopPropagation(); node.classList.remove('dropin');
+    moveTo(JSON.parse(e.dataTransfer.getData(DRAG)), segs);
+  });
+}
+async function moveTo(list, dest) {
+  const go2 = list.filter(x => x.segs.slice(0, -1).join('/') !== dest.join('/') && !(x.dir && (dest.join('/') + '/').startsWith(x.segs.join('/') + '/')));
+  if (!go2.length) return;
+  let moved = 0; const errs = [];
+  for (const x of go2) {
+    try {
+      await must(await api('MOVE', dav(x.segs, x.dir), { headers: { Destination: location.origin + dav([...dest, x.name], x.dir), Overwrite: 'F' } }));
+      moved++;
+    } catch (e) { errs.push(x.name + ': ' + e.message); }
+  }
+  sel.clear();
+  if (moved) toast('Moved ' + (moved === 1 ? go2[0].name : moved + ' items') + ' to ' + (dest[dest.length - 1] || 'Home'));
+  if (errs.length) toast(errs[0], 'bad', 7000);
+  load(true);
 }
 function libCard(it) {
   const h = hue(it.name);
@@ -972,6 +1051,7 @@ function table(list) {
     tr.addEventListener('click', e => clickItem(it, e));
     tr.addEventListener('dblclick', () => open(it));
     tr.addEventListener('contextmenu', e => ctxMenu(it, e));
+    movable(tr, it);
     B.append(tr);
   }
   T.append(B);
@@ -1030,9 +1110,10 @@ function selbar() {
 }
 function open(it) {
   if (it.dir) return go(it.segs);
-  if (it.kind === 'video') return playVideo(it, shown.filter(x => x.kind === 'video'));
-  if (it.kind === 'audio') return playAudio(it, shown.filter(x => x.kind === 'audio'));
-  if (it.kind === 'image') return viewImage(it, shown.filter(x => x.kind === 'image'));
+  const sibs = k => (it._list || shown).filter(x => x.kind === k);
+  if (it.kind === 'video') return playVideo(it, sibs('video'));
+  if (it.kind === 'audio') return playAudio(it, sibs('audio'));
+  if (it.kind === 'image') return viewImage(it, sibs('image'));
   if (it.kind === 'text') return editText(it);
   if (it.kind === 'pdf') return viewPdf(it);
   fileInfo(it);
