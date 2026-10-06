@@ -976,6 +976,8 @@ public:
         bool        head{false};
         // The segment asked for, -1 for a stream's init segment.
         int64_t     seg{-1};
+        // The sound track a stream carries, 0:a:<audio>, named by a variant's -a<n>.
+        int64_t     audio{0};
         int64_t     deadline_ms{0};
         int64_t     asked_ms{0};
         // The object as one string, bucket, key and ETag, which its open file is kept under; and the version the

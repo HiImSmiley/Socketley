@@ -9752,6 +9752,19 @@ mastering display metadata the GPU tone-maps from is made with x264), as
 .B SOCKETLEY_MEDIA_HWACCEL
 describes, and the interface plays a place the copied stream has not been
 remuxed to yet from a rendition until the copy catches up.
+A variant with
+.BI \-a n
+after it, as
+.BR hls\-a1 ,
+.B hls\-720\-a1
+and
+.BR hls\-copy\-a1 ,
+carries the film's sound track
+.I n
+(counted from 0 among its sound tracks, as info lists them) instead of the first,
+made or copied by that track's own codec and channels; its master names its
+streams with it, and each is made and kept as a stream of its own, so the other
+track's picture is made again.
 .B hls\-copy
 streams the source's own picture without transcoding, and its sound copied when
 it is AAC in two channels or fewer, and made AAC otherwise; renditions always make

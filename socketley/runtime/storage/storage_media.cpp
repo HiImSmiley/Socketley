@@ -132,8 +132,22 @@ bool thumb_width(std::string_view v, uint64_t& w)
     return v.starts_with("thumb-") && parse_uint(v.substr(6), w) && std::ranges::find(allowed, w) != std::end(allowed);
 }
 
+// A stream's variant without the -a<n> that picks its sound track, and that track.
+std::string_view without_track(std::string_view v, int64_t& track)
+{
+    track = 0;
+    const size_t at = v.rfind("-a");
+    uint64_t n = 0;
+    if (at == std::string_view::npos || !v.starts_with("hls") || !parse_uint(v.substr(at + 2), n) || n == 0 || n > 64)
+        return v;
+    track = static_cast<int64_t>(n);
+    return v.substr(0, at);
+}
+
 const rung* rendition_of(std::string_view v)
 {
+    int64_t track = 0;
+    v = without_track(v, track);
     uint64_t h = 0;
     if (!v.starts_with("hls-") || !parse_uint(v.substr(4), h))
         return nullptr;
@@ -526,8 +540,9 @@ std::string fps_attr(const media_probe& p)
     return buf;
 }
 
-std::string master_text(const media_probe& p, std::string_view source, std::string_view version)
+std::string master_text(const media_probe& p, std::string_view source, std::string_view version, int64_t track)
 {
+    const std::string a = track > 0 ? "-a" + std::to_string(track) : std::string{};
     std::string m = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n";
     const std::string v = "?v=" + std::string(version);
     // Subtitles as their own renditions, which every stream names.
@@ -553,7 +568,7 @@ std::string master_text(const media_probe& p, std::string_view source, std::stri
         std::string l = "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string((r->kbps * 5 / 4 + (p.audio ? audio_kbps : 0)) * 1000) +
                         ",RESOLUTION=" + std::to_string(w) + "x" + std::to_string(h) + ",CODECS=\"" + avc_codecs(r->height) +
                         audio + "\"" + fps_attr(p) + subs + "\n";
-        url_path(l, "hls-" + std::to_string(r->height), source);
+        url_path(l, "hls-" + std::to_string(r->height) + a, source);
         l += "/index.m3u8" + v + "\n";
         lines.push_back(std::move(l));
     }
@@ -566,7 +581,7 @@ std::string master_text(const media_probe& p, std::string_view source, std::stri
         m += "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string(std::max<int64_t>(p.bitrate, 1000000) * 3 / 2 + audio_kbps * 1000) +
              ",RESOLUTION=" + std::to_string(p.width) + "x" + std::to_string(p.height) + ",CODECS=\"" + codecs + audio + "\"" +
              fps_attr(p) + (p.hdr() ? (p.transfer == "smpte2084" ? ",VIDEO-RANGE=PQ" : ",VIDEO-RANGE=HLG") : "") + subs + "\n";
-        url_path(m, "hls-copy", source);
+        url_path(m, "hls-copy" + a, source);
         m += "/index.m3u8" + v + "\n";
     }
     return m;
@@ -868,6 +883,7 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
     uint64_t size = 0;
     int64_t index = 0;
     std::string_view source = rest;
+    const std::string_view stream = without_track(variant, w.audio);
     const size_t last = source.rfind('/');
     const std::string_view file = last == std::string_view::npos ? std::string_view{} : source.substr(last + 1);
     if (thumb_width(variant, size))
@@ -880,7 +896,7 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         w.kind = k_info;
         w.file = "info";
     }
-    else if (variant == "hls" && file == "master.m3u8")
+    else if (stream == "hls" && file == "master.m3u8")
     {
         w.kind = k_master;
         w.file.assign(file);
@@ -892,16 +908,17 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         w.file.assign(file);
         source = source.substr(0, last);
     }
-    else if ((variant == "hls-copy" || rendition_of(variant)) && (file == "index.m3u8" || stream_file(file, w.seg)))
+    else if ((stream == "hls-copy" || rendition_of(variant)) && (file == "index.m3u8" || stream_file(file, w.seg)))
     {
-        w.kind = variant == "hls-copy" ? k_copy : k_rendition;
+        w.kind = stream == "hls-copy" ? k_copy : k_rendition;
         w.file.assign(file);
         source = source.substr(0, last);
     }
     else
     {
         app_reply(c, 404, "No such medium: thumb-<width>/<object>, info/<object>, hls/<object>/master.m3u8, "
-                          "hls-<height>|hls-copy/<object>/index.m3u8 and its segments, or sub-<stream>/<object>/subs.vtt.\n");
+                          "hls-<height>|hls-copy/<object>/index.m3u8 and its segments, each with -a<track> for another sound track, "
+                          "or sub-<stream>/<object>/subs.vtt.\n");
         return;
     }
     w.source.assign(source);
@@ -1280,6 +1297,11 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
         }
     }
     const media_probe* p = pp.get();
+    if (p && w.audio > 0 && static_cast<size_t>(w.audio) >= p->tracks.size())
+    {
+        app_reply(c, 404, "No such sound track.\n");
+        return true;
+    }
     if (w.kind == k_info || w.kind == k_master || (w.kind == k_rendition && w.file == "index.m3u8") ||
         (w.kind == k_sub && w.file == "index.m3u8"))
     {
@@ -1301,7 +1323,7 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
             return true;
         }
         std::string text = w.kind == k_info       ? info_text(*p, w.version)
-                         : w.kind == k_master     ? master_text(*p, w.source, w.version)
+                         : w.kind == k_master     ? master_text(*p, w.source, w.version, w.audio)
                          : w.kind == k_rendition  ? rendition_text(*p, w.version)
                                                   : subtitle_text(*p, w.version);
         const std::string etag = media_etag(w.version, w.variant + "/" + w.file);
@@ -1591,6 +1613,14 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
         pp = media_probe_of(w.probe_dir);
         if (!pp)
             return false;
+        // Another sound track is made or copied as the first would be, by its own codec and channels.
+        if (w.audio > 0 && static_cast<size_t>(w.audio) < pp->tracks.size())
+        {
+            auto q = std::make_shared<media_probe>(*pp);
+            q->acodec = q->tracks[static_cast<size_t>(w.audio)].codec;
+            q->achannels = q->tracks[static_cast<size_t>(w.audio)].channels;
+            pp = std::move(q);
+        }
     }
     // Sound is copied only by the copied stream, which never begins mid-film: a copy begun at a seek keeps the
     // packets from the keyframe before it, and its segment starts there instead of at its own four seconds.
@@ -1722,6 +1752,8 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
         default:
             return false;
     }
+    if (w.audio > 0)
+        std::ranges::replace(args, std::string("0:a:0?"), "0:a:" + std::to_string(w.audio) + "?");
     std::vector<char*> argv;
     for (std::string& a : args)
         argv.push_back(a.data());

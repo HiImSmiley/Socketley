@@ -13,7 +13,8 @@
 #     link to it
 #   * ffmpeg's own address for an object opening without its signature
 #   * something that is no medium answered as one, or a cache past its size
-#   * a film's sound tracks or chapters, or a song's tags, missing from its info
+#   * a film's sound tracks or chapters, or a song's tags, missing from its info,
+#     or a stream asked for with another sound track carrying the first
 # suite: isolated
 set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -311,8 +312,8 @@ check "a stream that is no text subtitle is 404" "$(code -u "$A" "$U/~media/sub-
 
 # Sound tracks, chapters and a song's tags.
 printf ';FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=3000\ntitle=Intro\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=3000\nEND=7000\ntitle=Main part\n' > "$T/chap.txt"
-ff -f lavfi -i testsrc2=size=320x240:rate=25:duration=7 -f lavfi -i sine=frequency=440:duration=7 -f lavfi -i sine=frequency=880:duration=7 \
-   -i "$T/chap.txt" -map 0:v -map 1:a -map 2:a -map_chapters 3 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -ac:a:1 6 \
+ff -f lavfi -i testsrc2=size=320x240:rate=25:duration=7 -f lavfi -i sine=frequency=440:duration=7 -f lavfi -i anullsrc=channel_layout=5.1:sample_rate=48000 \
+   -i "$T/chap.txt" -map 0:v -map 1:a -map 2:a -map_chapters 3 -t 7 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \
    -metadata:s:a:0 language=eng -metadata:s:a:0 title=English -metadata:s:a:1 language=ger -metadata:s:a:1 title=Deutsch \
    -disposition:a:0 default -disposition:a:1 0 "$T/dual.mkv"
 code -u "$A" -T "$T/dual.mkv" "$U/~dav/films/dual.mkv" >/dev/null
@@ -323,6 +324,15 @@ check "info names every sound track" \
 check "and the chapters" "$(python3 -c 'import json,sys; print([(c["start"], c["end"], c["title"]) for c in json.loads(sys.argv[1])["chapters"]])' "$dinfo")" \
       "[(0.0, 3.0, 'Intro'), (3.0, 7.0, 'Main part')]"
 check "and no song's title from a film's sound track" "$(python3 -c 'import json,sys; print(repr(json.loads(sys.argv[1])["tags"]["title"]))' "$dinfo")" "''"
+loud() { "$FF" -hide_banner -i "$1" -map 0:a:0 -af volumedetect -f null - 2>&1 | grep -o 'mean_volume: [-0-9.]*' | awk '{ print ($2 > -60) ? "loud" : "silent" }'; }
+check "a master for another sound track names its streams with it" \
+      "$(curl -s -u "$A" "$U/~media/hls-a1/films/dual.mkv/master.m3u8" | grep -c '^/~media/hls-\(240\|copy\)-a1/films/dual.mkv/index.m3u8')" 2
+stream hls-240 dual.mkv "$T/d0"; stream hls-240-a1 dual.mkv "$T/d1"
+check "a stream carries the first sound track" "$(loud "$T/d0/all.mp4")" loud
+check "and with -a1 the second" "$(loud "$T/d1/all.mp4")" silent
+stream hls-copy-a1 dual.mkv "$T/dc1"
+check "a copied stream of it makes six channels two" "$(loud "$T/dc1/all.mp4") $("$FFPROBE" -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$T/dc1/all.mp4")" "silent 2"
+check "a track the film has not is 404" "$(code -u "$A" "$U/~media/hls-240-a2/films/dual.mkv/index.m3u8")" 404
 ff -f lavfi -i sine=frequency=500:duration=2 -c:a libmp3lame -metadata title="First Song" -metadata artist="The Band" \
    -metadata album="A Record" -metadata album_artist="The Band" -metadata track=3/12 -metadata date=2019 -metadata genre=Rock "$T/song.mp3"
 ff -f lavfi -i sine=frequency=500:duration=2 -c:a libopus -metadata TITLE="Second Song" -metadata ARTIST="Other" \
