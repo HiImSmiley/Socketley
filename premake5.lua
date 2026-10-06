@@ -289,10 +289,12 @@ project "socketley_sdk"
     targetdir ("bin/%{cfg.buildcfg}")
     location("%{wks.location}")
 
+    externalincludedirs {
+        "thirdparty/sol2",
+        "thirdparty/luajit"
+    }
     includedirs {
         ".",
-        "thirdparty/sol2",
-        "thirdparty/luajit",
         "socketley",
         "include/linux"
     }
@@ -325,6 +327,8 @@ project "socketley_sdk"
         defines { "NDEBUG", "RELEASE" }
         optimize "Full"
         staticruntime "Off"
+        -- An archive of GIMPLE links only with this gcc and compiles the whole library again at every link.
+        buildoptions { "-fno-lto" }
     filter {}
 
     filter "configurations:Sanitize"
@@ -345,10 +349,12 @@ project "socketley_sdk_nolua"
     targetdir ("bin/%{cfg.buildcfg}")
     location("%{wks.location}")
 
+    externalincludedirs {
+        "thirdparty/sol2",
+        "thirdparty/luajit"
+    }
     includedirs {
         ".",
-        "thirdparty/sol2",
-        "thirdparty/luajit",
         "socketley",
         "include/linux"
     }
@@ -376,6 +382,8 @@ project "socketley_sdk_nolua"
         defines { "NDEBUG", "RELEASE" }
         optimize "Full"
         staticruntime "Off"
+        -- An archive of GIMPLE links only with this gcc and compiles the whole library again at every link.
+        buildoptions { "-fno-lto" }
     filter {}
 
     filter "configurations:Sanitize"

@@ -129,7 +129,10 @@ static daemon_config load_daemon_config(const std::string& config_path)
     if (!table)
         return out;
 
-    sol::optional<std::string> ll = (*table)["log_level"].get<sol::optional<std::string>>();
+    // Pointer keys: gcc folds sol2's literal-key getters of two lengths into one and warns of a bound none crosses.
+    auto text = [&](const char* key) { return table->get<sol::optional<std::string>>(key); };
+
+    sol::optional<std::string> ll = text("log_level");
     if (ll)
     {
         log_level level;
@@ -137,19 +140,19 @@ static daemon_config load_daemon_config(const std::string& config_path)
             logger::g_level = level;
     }
 
-    sol::optional<int> mp = (*table)["metrics_port"].get<sol::optional<int>>();
+    sol::optional<int> mp = table->get<sol::optional<int>>(static_cast<const char*>("metrics_port"));
     if (mp && *mp > 0 && *mp <= 65535)
         out.metrics_port = static_cast<uint16_t>(*mp);
 
-    sol::optional<std::string> name = (*table)["name"].get<sol::optional<std::string>>();
+    sol::optional<std::string> name = text("name");
     if (name && !name->empty())
         out.name = *name;
 
-    sol::optional<std::string> cluster = (*table)["cluster"].get<sol::optional<std::string>>();
+    sol::optional<std::string> cluster = text("cluster");
     if (cluster && !cluster->empty())
         out.cluster = *cluster;
 
-    sol::optional<std::string> cpus = (*table)["cpus"].get<sol::optional<std::string>>();
+    sol::optional<std::string> cpus = text("cpus");
     if (cpus && !cpus->empty())
         out.cpus = *cpus;
 

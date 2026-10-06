@@ -24,6 +24,11 @@
 # test_sdk_daemon.sh and test_registered_type.sh; this file only holds the
 # floor.
 #
+# It also links one example without gcc's linker plugin.  The Release archive
+# was once LTO bytecode, which links only with the gcc that wrote it and made
+# every example compile the whole library again: four at once ran 64 lto1
+# processes and pushed a full gate past its two hours.
+#
 # The builds run in parallel because serially they cost 1m48s here, which is
 # too much to pay twice per suite for a check this shallow.  The cap is well
 # under nproc: each translation unit pulls in sol2, and the box this runs on
@@ -120,6 +125,17 @@ else
     FAIL=$((FAIL+1))
     echo "  FAIL [every example was actually attempted]: ${#SOURCES[@]} sources,"
     echo "        $LINES verdicts -- a build that produced neither is not a pass"
+fi
+
+# Another compiler links only machine code, so one example is linked without gcc's linker plugin, which alone reads
+# an archive of LTO bytecode.
+TOTAL=$((TOTAL+1))
+if g++ -std=c++23 $SANFLAGS -fno-use-linker-plugin "${SOURCES[0]}" $SDKFLAGS -o "$WORK/noplugin.bin" 2>"$WORK/noplugin.err"; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [the archive is machine code]: ${SOURCES[0]#"$ROOT"/} does not link without gcc's LTO plugin"
+    sed 's/^/        /' "$WORK/noplugin.err" | head -6
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

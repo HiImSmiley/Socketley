@@ -1076,7 +1076,8 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     result["body"]   = std::string{};
     result["error"]  = std::string{};
 
-    sol::optional<std::string> url_opt = opts["url"].get<sol::optional<std::string>>();
+    // A pointer key: gcc folds sol2's literal-key getters of two lengths into one and warns of a bound none crosses.
+    sol::optional<std::string> url_opt = opts.get<sol::optional<std::string>>(static_cast<const char*>("url"));
     if (!url_opt || url_opt->empty()) { result["error"] = "url required"; return result; }
 
     // ─── The three optional keys, checked ───────────────────────────────────

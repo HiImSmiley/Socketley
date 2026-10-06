@@ -5169,7 +5169,8 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
         response += filter_reason(status);
         response += "\r\n";
 
-        sol::optional<sol::table> rh = t["headers"].get<sol::optional<sol::table>>();
+        // A pointer key: gcc folds sol2's literal-key getters of two lengths into one and warns of a bound none crosses.
+        sol::optional<sol::table> rh = t.get<sol::optional<sol::table>>(static_cast<const char*>("headers"));
         if (rh)
         {
             rh->for_each([&](sol::object key, sol::object val) {

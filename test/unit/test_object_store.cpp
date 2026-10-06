@@ -570,7 +570,7 @@ TEST_CASE("a tag change keeps the object's bytes, ETag and time, and its file al
     // Ten tags of 128-byte keys and 256-byte values outgrow every slot, so the object is written again.
     std::string big;
     for (int i = 0; i < 10; ++i)
-        big += std::string(127, 'k') + char('0' + i) + '\0' + std::string(256, 'v') + '\0';
+        big.append(127, 'k').append(1, char('0' + i)).append(1, '\0').append(256, 'v').append(1, '\0');
     object_meta first;
     {
         rig r(d.path);
