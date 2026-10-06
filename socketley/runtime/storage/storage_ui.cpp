@@ -1,6 +1,7 @@
 // The web interface at /~ui/: one page, served from the binary, that browses, uploads to, shares from and plays
 // what the runtime holds, through /~dav/, /~share/ and /~media/; its sign-in, a cookie sealed with the access key's own
-// secret (/~ui/session); and the films each user has part watched (/~ui/progress).
+// secret (/~ui/session); the films each user has part watched (/~ui/progress); and who else a library is shared with
+// (/~ui/access).
 #include "storage_run.h"
 
 #include <sys/file.h>
@@ -139,6 +140,69 @@ std::string positions_json(const std::vector<position>& ps)
     return o;
 }
 
+// A JSON value written back as JSON, for a policy read, changed and stored again.
+void to_json(std::string& o, const jvalue& v)
+{
+    switch (v.k)
+    {
+        case jvalue::kind::null: o += "null"; return;
+        case jvalue::kind::boolean: o += v.b ? "true" : "false"; return;
+        case jvalue::kind::number: o += v.s; return;
+        case jvalue::kind::string: jstr(o, v.s); return;
+        case jvalue::kind::array:
+            o += '[';
+            for (size_t i = 0; i < v.items.size(); ++i)
+            {
+                o += i ? "," : "";
+                to_json(o, v.items[i]);
+            }
+            o += ']';
+            return;
+        case jvalue::kind::object:
+            o += '{';
+            for (size_t i = 0; i < v.members.size(); ++i)
+            {
+                o += i ? "," : "";
+                jstr(o, v.members[i].first);
+                o += ':';
+                to_json(o, v.members[i].second);
+            }
+            o += '}';
+            return;
+    }
+}
+
+// The statements the interface writes into a bucket's policy are named by their Sid, socketley-ui-<access>:<user>,
+// and it reads and changes only those; whatever else the policy says stays as it was.
+constexpr std::string_view ui_sid = "socketley-ui-";
+
+constexpr std::string_view read_actions[]  = {"s3:ListBucket", "s3:GetBucketLocation", "s3:GetObject"};
+constexpr std::string_view write_actions[] = {"s3:ListBucket", "s3:GetBucketLocation", "s3:GetObject", "s3:PutObject",
+                                     "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts",
+                                     "s3:ListBucketVersions", "s3:GetObjectVersion", "s3:DeleteObjectVersion"};
+
+std::string ui_statement(std::string_view bucket, std::string_view user, bool write)
+{
+    std::string o = "{\"Sid\":";
+    jstr(o, std::string(ui_sid) + (write ? "write:" : "read:") + std::string(user));
+    o += ",\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[";
+    jstr(o, "arn:aws:iam::000000000000:user/" + std::string(user));
+    o += "]},\"Action\":[";
+    const std::string_view* acts = write ? write_actions : read_actions;
+    const size_t n = write ? std::size(write_actions) : std::size(read_actions);
+    for (size_t i = 0; i < n; ++i)
+    {
+        o += i ? "," : "";
+        jstr(o, acts[i]);
+    }
+    o += "],\"Resource\":[";
+    jstr(o, "arn:aws:s3:::" + std::string(bucket));
+    o += ',';
+    jstr(o, "arn:aws:s3:::" + std::string(bucket) + "/*");
+    o += "]}";
+    return o;
+}
+
 }   // namespace
 
 bool storage_run::has_ui_cookie(const conn& c)
@@ -192,6 +256,11 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
     if (r.key == "progress")
     {
         ui_progress(c);
+        return;
+    }
+    if (r.key == "access")
+    {
+        ui_access(c);
         return;
     }
     if (r.method != "GET" && r.method != "HEAD")
@@ -386,6 +455,14 @@ void storage_run::ui_progress(const std::shared_ptr<conn>& c)
 
 void storage_run::ui_body(const std::shared_ptr<conn>& c)
 {
+    if (c->req.key == "access")
+        ui_access_body(c);
+    else
+        ui_progress_body(c);
+}
+
+void storage_run::ui_progress_body(const std::shared_ptr<conn>& c)
+{
     jvalue req;
     if (!json_reader(c->body).document(req))
     {
@@ -451,6 +528,161 @@ void storage_run::ui_body(const std::shared_ptr<conn>& c)
         ::close(fd);
         app_reply(cc, ok ? 204 : 500, ok ? std::string{} : "The position could not be kept.\n");
     });
+}
+
+// GET ?bucket= says who else may read or write a library, as the statements the interface wrote into its policy say;
+// POST {bucket, user, access: read | write | none} changes that for one user. Both are its owner's, or whoever may read
+// and write the bucket's policy; the statements are named by their Sid, and the rest of the policy is kept.
+void storage_run::ui_access(const std::shared_ptr<conn>& c)
+{
+    s3_request& r = c->req;
+    if (r.method != "GET" && r.method != "POST")
+    {
+        app_reply(c, 405, "Access is read with GET and changed with POST.\n");
+        return;
+    }
+    if (!app_login(c, "socketley"))
+        return;
+    if (r.method == "POST")
+    {
+        if (r.chunked || (r.has_content_length && r.content_length > 16 * 1024))
+        {
+            r.keep_alive = false;
+            app_reply(c, 413, "Request body too large.\n");
+            return;
+        }
+        collect_body(c, 16 * 1024);
+        return;
+    }
+    const std::string bucket(r.get_query("bucket"));
+    if (!m_store.has_bucket(bucket))
+    {
+        app_reply(c, 404, "No such bucket.\n");
+        return;
+    }
+    if (!app_allowed(c, "GET", bucket, {}, "policy"))
+    {
+        app_reply(c, 403, "Only who may read the library's policy sees who it is shared with.\n");
+        return;
+    }
+    std::string o = "{\"bucket\":";
+    jstr(o, bucket);
+    o += ",\"owner\":";
+    jstr(o, owner_of(bucket));
+    o += ",\"grants\":[";
+    bool first = true;
+    jvalue root;
+    if (const bucket_policy* p = m_store.policy(bucket); p && json_reader(p->text()).document(root))
+        if (const jvalue* st = member(root, "Statement"))
+        {
+            const auto one = [&](const jvalue& x)
+            {
+                const std::string sid = str_of(x, "Sid");
+                const size_t colon = sid.find(':');
+                if (!sid.starts_with(ui_sid) || colon == std::string::npos)
+                    return;
+                o += first ? "{\"user\":" : ",{\"user\":";
+                first = false;
+                jstr(o, sid.substr(colon + 1));
+                o += ",\"access\":";
+                jstr(o, sid.substr(ui_sid.size(), colon - ui_sid.size()));
+                o += "}";
+            };
+            if (st->k == jvalue::kind::array)
+                for (const jvalue& x : st->items)
+                    one(x);
+            else if (st->k == jvalue::kind::object)
+                one(*st);
+        }
+    o += "]}";
+    app_reply(c, 200, std::move(o), "application/json");
+}
+
+void storage_run::ui_access_body(const std::shared_ptr<conn>& c)
+{
+    jvalue req;
+    if (!json_reader(c->body).document(req))
+    {
+        app_reply(c, 400, "The body is a JSON object: bucket, user and access.\n");
+        return;
+    }
+    const std::string bucket = str_of(req, "bucket"), user = str_of(req, "user"), access = str_of(req, "access");
+    if (access != "read" && access != "write" && access != "none")
+    {
+        app_reply(c, 400, "Access is read, write or none.\n");
+        return;
+    }
+    if (!m_store.has_bucket(bucket))
+    {
+        app_reply(c, 404, "No such bucket.\n");
+        return;
+    }
+    if (!app_allowed(c, "PUT", bucket, {}, "policy"))
+    {
+        app_reply(c, 403, "Only who may change the library's policy shares it.\n");
+        return;
+    }
+    if (user.empty() || user.size() > 127 || user.find_first_of(" /:=,*?\"") != std::string::npos ||
+        !m_auth->has_user(user))
+    {
+        app_reply(c, 404, "No such user.\n");
+        return;
+    }
+    if (user == owner_of(bucket))
+    {
+        app_reply(c, 400, "The library is that user's own.\n");
+        return;
+    }
+    // The policy as it is, without this user's statements of ours, and with the one asked for.
+    jvalue root;
+    std::vector<std::string> statements;
+    std::string head;
+    if (const bucket_policy* p = m_store.policy(bucket); p && json_reader(p->text()).document(root))
+        for (const auto& [k, v] : root.members)
+        {
+            if (k != "Statement")
+            {
+                if (k == "Version")
+                    continue;
+                head += ",";
+                jstr(head, k);
+                head += ":";
+                to_json(head, v);
+                continue;
+            }
+            const auto keep = [&](const jvalue& x)
+            {
+                const std::string sid = str_of(x, "Sid");
+                if (sid.starts_with(ui_sid) && sid.ends_with(":" + user))
+                    return;
+                std::string t;
+                to_json(t, x);
+                statements.push_back(std::move(t));
+            };
+            if (v.k == jvalue::kind::array)
+                for (const jvalue& x : v.items)
+                    keep(x);
+            else if (v.k == jvalue::kind::object)
+                keep(v);
+        }
+    if (access != "none")
+        statements.push_back(ui_statement(bucket, user, access == "write"));
+    std::string text;
+    if (!statements.empty())
+    {
+        text = "{\"Version\":\"2012-10-17\"" + head + ",\"Statement\":[";
+        for (size_t i = 0; i < statements.size(); ++i)
+            text += (i ? "," : "") + statements[i];
+        text += "]}";
+        bucket_policy checked;
+        s3_error err;
+        if (!bucket_policy::compile(text, bucket, checked, err))
+        {
+            app_reply(c, 400, "The policy would not be one: " + err.message + "\n");
+            return;
+        }
+    }
+    store_doc(c, bucket_doc::policy, bucket, std::move(text), 204);
 }
 
 }   // namespace socketley::storage

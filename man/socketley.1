@@ -9545,7 +9545,8 @@ under the S3 runtime's users, policies and versioning:
 A WebDAV drive (classes 1 and 2) for Windows, macOS, Linux file managers, rclone
 and phones. It signs in with HTTP Basic, an access key as the user name and its
 secret as the password; a runtime without credentials takes none. Its root is
-every bucket the user owns, every bucket for an admin, and a bucket's keys are
+every bucket the user owns or a bucket policy lets it list, every bucket for an
+admin, and a bucket's keys are
 files whose slashes are folders. A file's GET, PUT, DELETE, COPY and MOVE are the
 S3 operations, judged by the same policies; MKCOL at the root makes a bucket and
 within one an empty
@@ -9767,6 +9768,24 @@ file of their own,
 .IR dir /.ui/progress/,
 changed entry by entry under a lock, so two devices watching different films
 keep both; the latest 200 are kept. Nodes of a cluster keep their own.
+.IP
+.B GET /~ui/access?bucket=\fIname\fR
+says who else a library is shared with, and
+.B POST /~ui/access
+with
+.B {"bucket", "user", "access"}
+shares it with a user of the credentials or the IAM API, by id:
+.B read
+(list and read),
+.B write
+(also write, delete, and restore from the trash) or
+.B none
+to take it back. Each is a statement of the bucket's policy, named by its Sid
+.BI socketley\-ui\- access : user\fR,
+and only those are read or changed: the rest of the policy is kept, and a Deny
+in it still holds. Both are for whoever may read or write the bucket's policy,
+its owner and an admin. The drive's root lists, besides the buckets a user owns,
+every bucket whose policy lets the user list it.
 .IP
 It plays films and music, with their subtitles: the file itself where the
 browser plays it, which costs the server nothing, and otherwise the master

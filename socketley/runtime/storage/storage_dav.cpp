@@ -673,7 +673,7 @@ void storage_run::dav_propfind(const std::shared_ptr<conn>& c, const std::string
 {
     const std::string_view depth = c->req.header("depth");
     const bool children = depth != "0";
-    // The root: every bucket its user owns, or every bucket for an admin.
+    // The root: every bucket its user owns, every bucket a policy lets the user list, or every bucket for an admin.
     if (bucket.empty())
     {
         std::string x(multistatus_head);
@@ -683,7 +683,8 @@ void storage_run::dav_propfind(const std::shared_ptr<conn>& c, const std::string
             const user_identity* u = c->user.get();
             const std::string_view me = u ? std::string_view(u->id) : default_owner;
             for (const bucket_info& b : m_store.buckets())
-                if (!u || u->admin || (b.owner.empty() ? default_owner : std::string_view(b.owner)) == me)
+                if (!u || u->admin || (b.owner.empty() ? default_owner : std::string_view(b.owner)) == me ||
+                    (m_store.policy(b.name) && app_allowed(c, "GET", b.name, {})))
                     dir_response(x, dav_href(b.name, {}), b.name, b.created_ms);
         }
         x += "</D:multistatus>";

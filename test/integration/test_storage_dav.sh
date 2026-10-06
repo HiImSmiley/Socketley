@@ -18,6 +18,9 @@
 #   * a file read with ?download not saved under its name
 #   * a user's watch positions seen by another user, kept for what the user
 #     may not read, or shown after the film was replaced
+#   * a library shared with a user not listed or not readable by them, giving
+#     more than it says, shared by one who may not, or its policy's other
+#     statements lost when it is shared or unshared
 #   * an rclone mount's copy of a tree not coming back byte for byte
 # suite: isolated
 set -uo pipefail
@@ -233,6 +236,25 @@ check "a film replaced since is no longer listed" \
       "$(curl -s -b "skl_ui=$ck" "$U/~ui/progress" | python3 -c 'import json,sys; print([x["key"] for x in json.load(sys.stdin)])')" "['huge.bin']"
 check "a position below 0 forgets one" "$(pos '{"bucket":"docs","key":"huge.bin","t":-1,"d":3600}') $(curl -s -b "skl_ui=$ck" "$U/~ui/progress")" "204 []"
 s3 -o /dev/null -X DELETE "$U/docs/cookie.txt"
+
+# A library shared with another user, as statements of its policy.
+acc() { curl -s -u "$1" -o /dev/null -w '%{http_code}' -X POST -d "{\"bucket\":\"docs\",\"user\":\"$2\",\"access\":\"$3\"}" "$U/~ui/access"; }
+s3 -o /dev/null -X PUT "$U/docs?policy" -d '{"Version":"2012-10-17","Statement":[{"Sid":"mine","Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::docs/secret/*"}]}'
+printf 'hid' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/docs/secret/x.txt"
+check "the other user does not see the library" "$(names "$B" "")" ""
+check "until it is shared with them to read" "$(acc "$A" AKIADAVBEN0000000000 read)$(acc "$A" ben read) $(names "$B" "")" "404204  docs"
+check "which its owner sees" "$(curl -s -u "$A" "$U/~ui/access?bucket=docs")" '{"bucket":"docs","owner":"ann","grants":[{"user":"ben","access":"read"}]}'
+check "and they do not" "$(code -u "$B" "$U/~ui/access?bucket=docs")" 403
+check "they read it" "$(curl -s -u "$B" "$U/~dav/docs/a/one.txt")" one
+check "and do not write" "$(printf 'b' | code -u "$B" -T - "$U/~dav/docs/b.txt")" 403
+check "nor share it on" "$(acc "$B" ben write)" 403
+check "the policy's own statements still hold" "$(code -u "$B" "$U/~dav/docs/secret/x.txt")" 403
+check "write access lets them write" "$(acc "$A" ben write) $(printf 'b' | code -u "$B" -T - "$U/~dav/docs/b.txt") $(code -u "$B" -X DELETE "$U/~dav/docs/b.txt")" "204 201 204"
+check "a user that is not one is 404" "$(acc "$A" nobody read)" 404
+check "nor is the owner shared its own" "$(acc "$A" ann read)" 400
+check "none takes it away" "$(acc "$A" ben none) $(code -u "$B" "$U/~dav/docs/a/one.txt") $(names "$B" "")" "204 403 "
+check "and leaves the rest of the policy as it was" "$(s3 "$U/docs?policy" | python3 -c 'import json,sys; print([x["Sid"] for x in json.load(sys.stdin)["Statement"]])')" "['mine']"
+s3 -o /dev/null -X DELETE "$U/docs?policy"; s3 -o /dev/null -X DELETE "$U/docs/secret/x.txt"
 
 # A client of the drive: rclone copies a tree in and out.
 if [ -n "$RCLONE" ] && [ -x "$RCLONE" ]; then

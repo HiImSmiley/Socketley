@@ -883,6 +883,10 @@ public:
     // The interface's sign-in (/~ui/session) and the films a user has part watched (/~ui/progress).
     void ui_session(const std::shared_ptr<conn>& c);
     void ui_progress(const std::shared_ptr<conn>& c);
+    void ui_progress_body(const std::shared_ptr<conn>& c);
+    // Who else a library is shared with, /~ui/access, as statements of the bucket's policy.
+    void ui_access(const std::shared_ptr<conn>& c);
+    void ui_access_body(const std::shared_ptr<conn>& c);
     void ui_body(const std::shared_ptr<conn>& c);
     void app_reply(const std::shared_ptr<conn>& c, int status, std::string body = {},
                    std::string_view type = "text/plain; charset=utf-8");
