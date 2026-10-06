@@ -16,6 +16,8 @@
 #   * a film's sound tracks or chapters, or a song's tags, missing from its info,
 #     or a stream asked for with another sound track carrying the first
 #   * a film's stills for a seek bar not a row of tiles, or offered for a song
+#   * an info or a playlist answered 304 to the tag of a binary that wrote less in
+#     it, so a browser keeps showing what the binary before said
 # suite: isolated
 set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -272,6 +274,12 @@ check "and revalidates to 304" "$(code -u "$A" -H "If-None-Match: $etag" "$U/~me
 check "a range of it is 206" "$(curl -s -u "$A" -r 0-99 -o "$T/r.bin" -w '%{http_code}' "$U/~media/hls-240/films/clip.mp4/$seg") $(wc -c < "$T/r.bin")" "206 100"
 check "the master is asked again, and has an ETag" \
       "$(curl -s -u "$A" -D - -o /dev/null "$U/~media/hls/films/clip.mp4/master.m3u8" | grep -ciE '^(cache-control: private, no-cache|etag:)')" 2
+# The info's tag names its text, so what a browser kept from a binary that wrote less is sent again, as it is not 304.
+itag=$(curl -s -u "$A" -D - -o /dev/null "$U/~media/info/films/clip.mp4" | grep -i '^etag' | cut -d' ' -f2 | tr -d '\r')
+check "the info revalidates to 304 on its own tag" "$(code -u "$A" -H "If-None-Match: $itag" "$U/~media/info/films/clip.mp4")" 304
+over=$(curl -s -u "$A" -I "$U/~dav/films/clip.mp4" | grep -i '^etag' | sed 's/[^"]*"\([0-9a-f]\{16\}\).*/\1/')
+check "and is sent again to the tag a binary gave it that named only the object's version" \
+      "$(code -u "$A" -H "If-None-Match: \"$over-info/info\"" "$U/~media/info/films/clip.mp4")" 200
 
 # The object's file is read directly, not over the listener.
 check "ffmpeg reads an unencrypted object's file" "$( [ "$(stat media_direct)" -gt 0 ] && echo yes)" yes

@@ -1353,7 +1353,9 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
                          : w.kind == k_master     ? master_text(*p, w.source, w.version, w.audio)
                          : w.kind == k_rendition  ? rendition_text(*p, w.version)
                                                   : subtitle_text(*p, w.version);
-        const std::string etag = media_etag(w.version, w.variant + "/" + w.file);
+        // These texts are written by this binary, so their tag names what they say: an upgrade that adds to them is not
+        // answered 304 with what the browser kept from the one before.
+        const std::string etag = media_etag(w.version, w.variant + "/" + sha256_hex(text).substr(0, 16));
         ++m_c.media_served;
         response r;
         r.headers.emplace_back("Content-Type", w.kind == k_info ? "application/json" : "application/vnd.apple.mpegurl");
