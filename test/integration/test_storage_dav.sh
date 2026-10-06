@@ -30,6 +30,8 @@
 #   * a library shared with a user not listed or not readable by them, giving
 #     more than it says, shared by one who may not, or its policy's other
 #     statements lost when it is shared or unshared
+#   * an address that keeps guessing secrets not refused for a while, or
+#     another address or a session refused with it
 #   * an rclone mount's copy of a tree not coming back byte for byte
 # suite: isolated
 set -uo pipefail
@@ -327,6 +329,14 @@ check "nor is the owner shared its own" "$(acc "$A" ann read)" 400
 check "none takes it away" "$(acc "$A" ben none) $(code -u "$B" "$U/~dav/docs/a/one.txt") $(names "$B" "")" "204 403 "
 check "and leaves the rest of the policy as it was" "$(s3 "$U/docs?policy" | python3 -c 'import json,sys; print([x["Sid"] for x in json.load(sys.stdin)["Statement"]])')" "['mine']"
 s3 -o /dev/null -X DELETE "$U/docs?policy"; s3 -o /dev/null -X DELETE "$U/docs/secret/x.txt"
+
+# Guessing at sign-ins: an address past ten failures, on each shard, is refused a while, the right secret too.
+jar="$T/guessjar"; curl -s -c "$jar" -o /dev/null -u "$A" -X POST "$U/~ui/session"
+for _ in $(seq 1 60); do curl -s -m 30 --interface 127.0.0.3 -o /dev/null -u "${A%%:*}:wrong" -X PROPFIND "$U/~dav/"; done
+check "an address that keeps guessing is refused even the right secret" "$(code --interface 127.0.0.3 -u "$A" -X PROPFIND "$U/~dav/")$(code --interface 127.0.0.3 -u "$A" -X PROPFIND "$U/~dav/")" 429429
+check "and told for how long" "$(curl -s --interface 127.0.0.3 -o /dev/null -D - -u "$A" -X PROPFIND "$U/~dav/" | tr -d '\r' | awk -F': ' 'tolower($1)=="retry-after" { print ($2 > 0 && $2 <= 900) }')" 1
+check "its session goes on" "$(code --interface 127.0.0.3 -b "$jar" -X PROPFIND "$U/~dav/")" 207
+check "and another address signs in" "$(code -u "$A" -X PROPFIND "$U/~dav/")" 207
 
 # A client of the drive: rclone copies a tree in and out.
 if [ -n "$RCLONE" ] && [ -x "$RCLONE" ]; then

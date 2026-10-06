@@ -9561,6 +9561,19 @@ client's own key is not copied and the answer is
 .BR 500 .
 Locks are granted and not enforced, and properties are not kept.
 .IP
+An address that fails ten sign-ins with Basic, here, at
+.B /~ui/
+and
+.BR /~media/ ,
+or ten passwords of share links within a quarter hour is answered
+.B 429
+with a
+.B Retry\-After
+until that quarter hour ends, the right secret too, while its signed-in sessions
+go on; an IPv6 address counts by its /64. Each shard counts on its own, so an
+address has ten tries a shard, and behind a proxy every client is the proxy's
+address, so one guessing there keeps the others from signing in as well.
+.IP
 A file may also be sent in parts, side by side, as S3's multipart upload under
 the drive's sign-in:
 .B POST ?uploads

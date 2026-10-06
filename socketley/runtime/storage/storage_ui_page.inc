@@ -669,6 +669,7 @@ $('#lf').addEventListener('submit', async ev => {
   try { r = await fetch('/~ui/session' + ($('#lr').checked ? '?remember' : ''), { method: 'POST', headers: { 'Authorization': basic, 'X-Socketley-UI': '1' } }); }
   catch (e) { $('#le').textContent = 'The server cannot be reached.'; return; }
   if (r.status === 401) { $('#le').textContent = 'Those credentials are not known.'; return; }
+  if (r.status === 429) { $('#le').textContent = 'Too many failed sign-ins from here; try again in ' + Math.ceil((+r.headers.get('Retry-After') || 900) / 60) + ' min.'; return; }
   if (!r.ok) { $('#le').textContent = 'Signing in failed: ' + r.status; return; }
   me = await r.json();
   $('#ls').value = '';

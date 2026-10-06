@@ -321,13 +321,19 @@ bool storage_run::share_open(const std::shared_ptr<conn>& c, std::string_view id
     // Any user name, and the link's password, as a browser asks for them.
     const std::string_view h = c->req.header("authorization");
     std::string pair;
-    if ((h.starts_with("Basic ") || h.starts_with("basic ")) && base64_decode(http_trim_ows(h.substr(6)), pair))
+    if (h.starts_with("Basic ") || h.starts_with("basic "))
     {
-        const size_t colon = pair.find(':');
-        const std::string got = pw_hash(s.pw_salt, colon == std::string::npos ? std::string_view{} :
-                                                                               std::string_view(pair).substr(colon + 1));
-        if (got.size() == s.pw_hash.size() && CRYPTO_memcmp(got.data(), s.pw_hash.data(), got.size()) == 0)
-            return true;
+        if (login_barred(c))
+            return false;
+        if (base64_decode(http_trim_ows(h.substr(6)), pair))
+        {
+            const size_t colon = pair.find(':');
+            const std::string got = pw_hash(s.pw_salt, colon == std::string::npos ? std::string_view{} :
+                                                                                   std::string_view(pair).substr(colon + 1));
+            if (got.size() == s.pw_hash.size() && CRYPTO_memcmp(got.data(), s.pw_hash.data(), got.size()) == 0)
+                return true;
+        }
+        login_missed(*c);
     }
     response resp;
     resp.status = 401;

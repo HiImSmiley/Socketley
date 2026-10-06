@@ -7,7 +7,7 @@
 #     more than its maker may
 #   * a link not reading its object or its folder for a visitor, or reading
 #     anything outside it
-#   * a password not asked for, or a wrong one taken
+#   * a password not asked for, or a wrong one taken, or guessed at without end
 #   * an expired link still read, or a download limit not kept, counting a
 #     player's later ranges against it
 #   * an upload link not taking a file into its folder, or a read-only link
@@ -110,6 +110,9 @@ check "in a way a browser shows" "$(curl -s -D - -o /dev/null "$U/~share/$p" | g
 check "refuses a wrong one" "$(code -u "x:wrong" "$U/~share/$p")" 401
 check "and takes the right one, with any name" "$(curl -s -u "anyone:open sesame" "$U/~share/$p")" report
 check "the password is not kept in the clear" "$(grep -rc 'open sesame' "$T/share/.shares/" | grep -vc ':0')" 0
+for _ in $(seq 1 60); do curl -s -m 30 --interface 127.0.0.3 -o /dev/null -u "x:guess" "$U/~share/$p"; done
+check "an address that keeps guessing is refused the right one too" "$(code --interface 127.0.0.3 -u "x:open sesame" "$U/~share/$p")$(code --interface 127.0.0.3 -u "x:open sesame" "$U/~share/$p")" 429429
+check "while another address is let in" "$(code -u "x:open sesame" "$U/~share/$p")" 200
 
 # Expiry and download limits.
 e=$(mk "$A" '{"bucket":"ann","key":"report.txt","expires_in":1}')

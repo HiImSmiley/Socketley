@@ -4,6 +4,8 @@
 // operation for, a folder's listing, making, removal, copy and move, is done here over the keys under it.
 #include "storage_run.h"
 
+#include <algorithm>
+
 #include <openssl/rand.h>
 
 #include "checksum.h"
@@ -33,6 +35,10 @@ constexpr uint64_t app_body_limit = 256 * 1024;
 // A folder's copy reads each of its objects whole, so one past this is refused rather than held.
 constexpr uint64_t tree_object_max = 256ull << 20;
 constexpr size_t   listing_max     = 100000;
+// Ten failed sign-ins a quarter hour from an address, and a bound on the addresses remembered.
+constexpr uint32_t login_tries  = 10;
+constexpr auto     login_window = std::chrono::minutes(15);
+constexpr size_t   misses_max   = 16384;
 
 std::string dav_href(std::string_view bucket, std::string_view key)
 {
@@ -158,18 +164,79 @@ void storage_run::app_reply(const std::shared_ptr<conn>& c, int status, std::str
     send_response(c, std::move(r));
 }
 
+std::string storage_run::miss_key(conn& c)
+{
+    if (!c.ip_known)
+    {
+        c.ip       = client_ip_of(c.fd);
+        c.ip_known = true;
+    }
+    // One holder of an IPv6 network has its whole /64, so that is what counts as one address.
+    return std::string(1, static_cast<char>(c.ip.family)) +
+           std::string(reinterpret_cast<const char*>(c.ip.addr), c.ip.family == 4 ? 4 : c.ip.family == 6 ? 8 : 0);
+}
+
+bool storage_run::login_barred(const std::shared_ptr<conn>& c)
+{
+    const auto it = m_misses.find(miss_key(*c));
+    if (it == m_misses.end())
+        return false;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - it->second.first >= login_window)
+    {
+        m_misses.erase(it);
+        return false;
+    }
+    if (it->second.count < login_tries)
+        return false;
+    const auto left = std::chrono::ceil<std::chrono::seconds>(it->second.first + login_window - now).count();
+    response r;
+    r.status = 429;
+    r.headers.emplace_back("Retry-After", std::to_string(std::max<int64_t>(left, 1)));
+    r.headers.emplace_back("Content-Type", "text/plain; charset=utf-8");
+    r.body = "Too many failed sign-ins from this address; try again later.\n";
+    count_error(*c, "SlowDown");
+    send_response(c, std::move(r));
+    return true;
+}
+
+void storage_run::login_missed(conn& c)
+{
+    const auto now = std::chrono::steady_clock::now();
+    std::string key = miss_key(c);
+    if (m_misses.size() >= misses_max && !m_misses.contains(key))
+    {
+        std::erase_if(m_misses, [&](const auto& m) { return now - m.second.first >= login_window; });
+        if (m_misses.size() >= misses_max)
+            m_misses.erase(std::min_element(m_misses.begin(), m_misses.end(), [](const auto& a, const auto& b)
+                                            { return a.second.first < b.second.first; }));
+    }
+    login_misses& m = m_misses[std::move(key)];
+    if (m.count == 0 || now - m.first >= login_window)
+    {
+        m.count = 0;
+        m.first = now;
+    }
+    ++m.count;
+}
+
 bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view realm)
 {
     const std::string_view h = c->req.header("authorization");
     auth_verdict v;
     if (h.starts_with("Basic ") || h.starts_with("basic "))
     {
+        // An address that keeps guessing is refused even the right secret, so the answer tells it nothing.
+        if (login_barred(c))
+            return false;
         std::string pair;
         const size_t colon = base64_decode(http_trim_ows(h.substr(6)), pair) ? pair.find(':') : std::string::npos;
         if (colon != std::string::npos)
             v = m_auth->authorize_basic(std::string_view(pair).substr(0, colon), std::string_view(pair).substr(colon + 1));
         else
             v.allowed = false;
+        if (!v.allowed)
+            login_missed(*c);
     }
     else if (ui_cookie(c, v))
     {

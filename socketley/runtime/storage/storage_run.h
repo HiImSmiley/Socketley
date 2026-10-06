@@ -880,6 +880,18 @@ public:
     // HTTP Basic credentials, the web interface's session cookie, or none on a runtime that takes none; false after
     // answering 401.
     bool app_login(const std::shared_ptr<conn>& c, std::string_view realm);
+    // Failed sign-ins counted by the client's address, an IPv6 one by its /64, in this shard's memory: past
+    // login_tries within login_window a sign-in from there is refused until the window ends.
+    struct login_misses
+    {
+        uint32_t count{0};
+        std::chrono::steady_clock::time_point first{};
+    };
+    std::unordered_map<std::string, login_misses> m_misses;
+    std::string miss_key(conn& c);
+    // Answers 429 and is true while the client's address may not sign in.
+    bool login_barred(const std::shared_ptr<conn>& c);
+    void login_missed(conn& c);
     // The web interface's session cookie judged into `v`; false when the request carries none.
     bool ui_cookie(const std::shared_ptr<conn>& c, auth_verdict& v);
     static bool has_ui_cookie(const conn& c);
