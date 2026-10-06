@@ -2197,6 +2197,39 @@ project "test_storage_compression"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+project "test_storage_inflate"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    links { "dl" }
+
+    files { "test/unit/test_storage_inflate.cpp", "socketley/runtime/storage/inflate.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 project "test_storage_shards"
     kind "ConsoleApp"
     language "C++"
