@@ -185,6 +185,35 @@ print("PIPELINED", buf.count(b"small over tls"))
 PYEOF
 contains "three pipelined requests in one TLS write are all answered" "$(cat "$T/pipe.out")" "PIPELINED 3"
 
+# A body that begins slowly is paced, one recv per 10 ms tick; over TLS such a recv brings one 16 KiB ring buffer,
+# under the 4 MB/s that would end the pace, so a client that then sends at full speed was held at 1.6 MB/s for the
+# rest of the body: 32 MiB took some 20 s. Once a paced recv leaves bytes behind the pace ends.
+python3 - "$P1" "$CERTS/srv.pem" <<'PYEOF' > "$T/ramp.out" 2>&1
+import socket, ssl, sys, time
+port, cert = int(sys.argv[1]), sys.argv[2]
+n = 32 << 20
+ctx = ssl.create_default_context(cafile=cert)
+s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", port)), server_hostname="localhost")
+s.sendall(b"PUT /tlsbkt/ramp HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % n)
+t0 = time.time()
+sent = 0
+for _ in range(10):   # 10 KiB every 20 ms: a slow start, taken for a trickle
+    s.sendall(b"r" * 10240); sent += 10240; time.sleep(0.02)
+s.sendall(b"r" * (n - sent))
+s.settimeout(60)
+buf = b""
+while b"\r\n\r\n" not in buf:
+    d = s.recv(4096)
+    if not d: break
+    buf += d
+print("STATUS", buf.split(b" ")[1].decode() if b" " in buf else "none", "SECS %.1f" % (time.time() - t0))
+PYEOF
+ramp=$(cat "$T/ramp.out")
+contains "a body that starts slowly over TLS is stored" "$ramp" "STATUS 200"
+secs=$(printf '%s\n' "$ramp" | sed -n 's/.*SECS \([0-9]*\).*/\1/p')
+if [ -n "$secs" ] && [ "$secs" -lt 8 ]; then ok "and the rest of it is not held at the trickle's pace (${secs} s for 32 MiB)"
+else bad "a TLS body that starts slowly is not held at the trickle's pace" "$ramp"; fi
+
 # ── mTLS ────────────────────────────────────────────────────────────────────
 "$BIN" create storage stgmtls -p "$P2" --dir "$T/objects2" --anonymous --tls --cert "$CERTS/srv.pem" --key "$CERTS/srv-key.pem" --ca "$CERTS/ca.pem" -s >/dev/null 2>&1 \
     || bad "create mtls" "the mTLS runtime was not created"

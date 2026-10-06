@@ -9427,7 +9427,9 @@ a 64 MiB put at 32 connections use the disk rather than one core.
 .PP
 A body of known length that arrives slower than 4 MB/s, judged over 10 ms, is
 left to gather in the socket and read once per 10 ms tick shared by every such
-connection, except for its last 64 KiB, so a slow upload is not paid for with a
+connection, except for its last 64 KiB; each tick takes all that gathered, even
+over TLS, where one receive brings 16 KiB, so a body that began slowly and
+speeds up is read at the speed it comes. A slow upload is so not paid for with a
 receive and a wakeup per TCP segment; its digests are handed to the hashing
 threads 64 KiB at a time. A 1 MiB put sent in 1448\-byte segments at 0.8 MB/s,
 eight at once, took about 35 to 60 ms of worker CPU per MiB before and about 6

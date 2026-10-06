@@ -952,6 +952,10 @@ void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe*
             c->rate_bytes += n;
             const auto ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(now - c->rate_since).count());
+            // What gathered during a tick is all taken before the next wait: a TLS recv brings one 16 KiB ring buffer,
+            // under the rate above, so taking one a tick held a body once judged trickling at 1.6 MB/s to its end.
+            if (c->trickle && !c->rd_drained)
+                c->pace_due = true;
             if (ns >= static_cast<uint64_t>(pace_ns))
             {
                 c->trickle    = c->rate_bytes * trickle_ns_per_byte < ns;
