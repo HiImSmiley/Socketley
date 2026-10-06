@@ -7112,7 +7112,23 @@ dots in its name fails verification virtual\-hosted and is reached path style.
 Requests are verified as AWS Signature Version 4, in both forms: the
 .B Authorization
 header and a presigned URL (\fBX\-Amz\-Algorithm\fR and the rest in the
-query, for GET, HEAD, PUT and DELETE). Whatever region the credential scope names, none
+query, for GET, HEAD, PUT and DELETE). Signature Version 2, which awscli 1.x presigns with and older tools
+sign with, is verified as well, in both forms:
+.B "Authorization: AWS"
+.IR key : signature ,
+dated by
+.B Date
+or
+.B x\-amz\-date
+within fifteen minutes, and a URL's
+.BR AWSAccessKeyId ,
+.B Expires
+and
+.BR Signature ,
+good until
+.BR Expires ;
+its resource is the bucket and key as sent with the subresources S3 signs, and
+nothing of the body is signed. Whatever region the credential scope names, none
 included, is accepted. Every
 .B x\-amz\-content\-sha256
 mode a client sends is honoured: a hex hash is checked against the body as it

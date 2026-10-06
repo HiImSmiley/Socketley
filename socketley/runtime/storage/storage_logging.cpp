@@ -232,9 +232,12 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
     quoted(l, r.header("user-agent"));
     plain(l, r.header("x-amz-version-id"));
     l += "- ";
-    const bool by_query = r.raw_query.find("X-Amz-Algorithm=") != std::string_view::npos;
-    const bool by_header = r.header("authorization").starts_with("AWS4-HMAC-SHA256");
-    plain(l, by_query || by_header ? "SigV4" : "");
+    const bool v2_query = r.has_query("AWSAccessKeyId") && r.has_query("Signature");
+    const bool by_query = r.raw_query.find("X-Amz-Algorithm=") != std::string_view::npos || v2_query;
+    const bool by_header = r.header("authorization").starts_with("AWS4-HMAC-SHA256") ||
+                           r.header("authorization").starts_with("AWS ");
+    const bool v2 = v2_query || r.header("authorization").starts_with("AWS ");
+    plain(l, by_query || by_header ? (v2 ? "SigV2" : "SigV4") : "");
     plain(l, c->ssl ? std::string_view(SSL_get_cipher_name(c->ssl)) : std::string_view{});
     plain(l, by_header ? "AuthHeader" : by_query ? "QueryString" : "");
     plain(l, r.host);

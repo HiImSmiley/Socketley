@@ -1089,6 +1089,58 @@ TEST_CASE("a presigned request's stated payload hash is the body's, and one that
     }
 }
 
+TEST_CASE("Signature Version 2: the S3 documentation's examples, a presigned URL, and the refusals")
+{
+    const sv key = "AKIAIOSFODNN7EXAMPLE";
+    const sv secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    auto lookup = [&](sv k) -> sv { return k == key ? secret : sv(); };
+    s3::verify_options opts;
+    opts.v2_bucket = "johnsmith";
+    {
+        // "Example Object GET", virtual-hosted, whose signature the S3 documentation publishes.
+        const std::vector<s3::header_field> h = {{"host", "johnsmith.s3.amazonaws.com"},
+                                                 {"date", "Tue, 27 Mar 2007 19:36:42 +0000"},
+                                                 {"authorization", "AWS AKIAIOSFODNN7EXAMPLE:bWq2s1WEIj+Ydj0vQ697zp+IXMU="}};
+        const s3::request_view rv{"GET", "/photos/puppy.jpg", "", h, {}};
+        const s3::verify_result r = s3::verify(rv, opts, lookup, 1175024202);
+        REQUIRE(r.status == s3::sigv4_status::ok);
+        CHECK(r.access_key() == key);
+        CHECK(r.form == s3::auth_form::header);
+        CHECK(r.payload == s3::payload_kind::unsigned_payload);
+        CHECK(s3::verify(rv, opts, lookup, 1175024202 + 3600).status == s3::sigv4_status::request_time_too_skewed);
+        s3::verify_options path_style;
+        CHECK(s3::verify(rv, path_style, lookup, 1175024202).status == s3::sigv4_status::signature_mismatch);
+    }
+    {
+        // "Example Object PUT", with its Content-Type on the third line.
+        const std::vector<s3::header_field> h = {{"host", "johnsmith.s3.amazonaws.com"},
+                                                 {"date", "Tue, 27 Mar 2007 21:15:45 +0000"},
+                                                 {"content-type", "image/jpeg"}, {"content-length", "94328"},
+                                                 {"authorization", "AWS AKIAIOSFODNN7EXAMPLE:MyyxeRY7whkBe+bq8fHCL/2kKUg="}};
+        const s3::request_view rv{"PUT", "/photos/puppy.jpg", "", h, {}};
+        CHECK(s3::verify(rv, opts, lookup, 1175030145).status == s3::sigv4_status::ok);
+        std::vector<s3::header_field> other = h;
+        other[2].value = "image/png";
+        const s3::request_view changed{"PUT", "/photos/puppy.jpg", "", other, {}};
+        CHECK(s3::verify(changed, opts, lookup, 1175030145).status == s3::sigv4_status::signature_mismatch);
+    }
+    {
+        // A presigned URL signs its Expires where a header signs its Date; the value is Python's hmac over that string.
+        const std::vector<s3::header_field> h = {{"host", "johnsmith.s3.amazonaws.com"}};
+        const s3::request_view rv{"GET", "/photos/puppy.jpg",
+                                  "AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE&Expires=1141889120&Signature=fScKGHCDI0NY5E7CYp9Vc8VKMbY%3D", h, {}};
+        const s3::verify_result r = s3::verify(rv, opts, lookup, 1141889000);
+        CHECK(r.status == s3::sigv4_status::ok);
+        CHECK(r.form == s3::auth_form::query);
+        const s3::verify_result late = s3::verify(rv, opts, lookup, 1141889121);
+        CHECK(late.status == s3::sigv4_status::expired);
+        CHECK(std::string(late.code) == "AccessDenied");
+        const s3::request_view unknown{"GET", "/photos/puppy.jpg",
+                                       "AWSAccessKeyId=AKIANOBODY&Expires=1141889120&Signature=fScKGHCDI0NY5E7CYp9Vc8VKMbY%3D", h, {}};
+        CHECK(std::string(s3::verify(unknown, opts, lookup, 1141889000).code) == "InvalidAccessKeyId");
+    }
+}
+
 TEST_CASE("the service must be the one the server is")
 {
     const kase* c = find_case("boto3/get-special-key");
@@ -1113,10 +1165,17 @@ TEST_CASE("no credentials at all is AccessDenied, and mixed or foreign schemes a
     }
     {
         req r(*c);
-        *r.find("authorization") = "AWS AKIAIOSFODNN7EXAMPLE:frJIUN8DYpKDtOLCwo//yllqDzg=";
+        *r.find("authorization") = "Bearer AKIAIOSFODNN7EXAMPLE";
         s3::verify_result res = r.run();
         CHECK(res.status == s3::sigv4_status::malformed);
         CHECK(std::string(res.code) == "InvalidRequest");
+    }
+    {
+        // Signature Version 2 is verified, not refused as foreign: this key is not the case's.
+        req r(*c);
+        *r.find("authorization") = "AWS AKIAIOSFODNN7EXAMPLE:frJIUN8DYpKDtOLCwo//yllqDzg=";
+        s3::verify_result res = r.run();
+        CHECK(std::string(res.code) == "InvalidAccessKeyId");
     }
     {
         req r(*c);

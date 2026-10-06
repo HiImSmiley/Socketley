@@ -1250,7 +1250,7 @@ lua_config() {
     echo "┌────────────────────────┬─────────────────────────────────────┐"
     echo "│ --dir <path>           │ Where the buckets live (required)   │"
     echo "│ --access-key <key>     │ The pair requests are signed with   │"
-    echo "│ --secret-key <secret>  │ (SigV4); both, or --credentials     │"
+    echo "│ --secret-key <secret>  │ (SigV4, V2); both or --credentials  │"
     echo "│ --credentials <file>   │ access:secret lines, re-read when   │"
     echo "│                        │ the file changes; [id] sections are │"
     echo "│                        │ users (name, admin, policy,         │"

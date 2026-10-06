@@ -883,7 +883,8 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
     maybe_reload();
 
     auth_verdict v;
-    const bool attempted = !req.header("authorization").empty() || query_names(req.raw_query, "X-Amz-Algorithm");
+    const bool attempted = !req.header("authorization").empty() || query_names(req.raw_query, "X-Amz-Algorithm") ||
+                           (query_names(req.raw_query, "AWSAccessKeyId") && query_names(req.raw_query, "Signature"));
     v.anonymous = !attempted;
     if (!attempted && m_cfg.anonymous)
     {
@@ -904,6 +905,8 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
     sv.body_sha256_hex = req.body_sha256_hex;
     s3::verify_options opts = m_opts;
     opts.service = req.service;
+    if (req.vhost)
+        opts.v2_bucket = req.bucket;
 
     // Temporary credentials name their session in a token, as a header or in a presigned URL's query.
     std::string token(req.header("x-amz-security-token"));

@@ -67,10 +67,13 @@ public:
         if (key == "s3:signatureversion" || key == "s3:authtype")
         {
             const bool by_header = !r.header("authorization").empty();
-            const bool by_query  = r.has_query("X-Amz-Algorithm");
+            const bool v2_query  = r.has_query("AWSAccessKeyId") && r.has_query("Signature");
+            const bool by_query  = r.has_query("X-Amz-Algorithm") || v2_query;
             if (m_anonymous || (!by_header && !by_query && !r.form))
                 return false;
-            out.emplace_back(key == "s3:signatureversion" ? "AWS4-HMAC-SHA256"
+            // S3 names Signature Version 2 "AWS".
+            const bool v2 = v2_query || r.header("authorization").starts_with("AWS ");
+            out.emplace_back(key == "s3:signatureversion" ? (v2 ? "AWS" : "AWS4-HMAC-SHA256")
                              : by_header ? "REST-HEADER" : by_query ? "REST-QUERY-STRING" : "POST");
             return true;
         }

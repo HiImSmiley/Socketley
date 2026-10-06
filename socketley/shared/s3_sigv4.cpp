@@ -2,6 +2,7 @@
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 #include <algorithm>
 #include <array>
@@ -641,11 +642,27 @@ stream_context stream_context::unsigned_trailer(uint64_t decoded_length)
     return c;
 }
 
+namespace
+{
+verify_result verify_v2(const request_view& req, const verify_options& opts, const secret_lookup& secrets,
+                        int64_t now_unix, std::string_view auth);
+} // namespace
+
 verify_result verify(const request_view& req, const verify_options& opts, const secret_lookup& secrets, int64_t now_unix)
 {
     const header_field* auth_hdr = find_header(req.headers, "authorization");
     std::string algo_q;
     bool has_query_auth = query_param(req.raw_query, "X-Amz-Algorithm", algo_q);
+
+    // Signature Version 2, as older clients and presigners still sign: "AWS key:signature", or a URL's AWSAccessKeyId.
+    if (auth_hdr && trim(auth_hdr->value).starts_with("AWS ") && !has_query_auth)
+        return verify_v2(req, opts, secrets, now_unix, trim(auth_hdr->value));
+    if (!auth_hdr && !has_query_auth)
+    {
+        std::string probe;
+        if (query_param(req.raw_query, "AWSAccessKeyId", probe) && query_param(req.raw_query, "Signature", probe))
+            return verify_v2(req, opts, secrets, now_unix, {});
+    }
 
     if (!auth_hdr && !has_query_auth)
         return fail(sigv4_status::missing_auth, 403, "AccessDenied", "Access Denied");
@@ -991,6 +1008,149 @@ namespace
 bool signed_kind(payload_kind k)
 {
     return k == payload_kind::streaming_signed || k == payload_kind::streaming_signed_trailer;
+}
+
+
+// ---- Signature Version 2 ----
+
+// The subresources a Signature Version 2 resource names, in byte order, as botocore and S3 sign them.
+constexpr std::string_view v2_subresources[] = {
+    "accelerate", "acl", "analytics", "cors", "defaultObjectAcl", "delete", "inventory", "lifecycle", "location",
+    "logging", "metrics", "notification", "object-lock", "partNumber", "policy", "replication", "requestPayment",
+    "response-cache-control", "response-content-disposition", "response-content-encoding", "response-content-language",
+    "response-content-type", "response-expires", "restore", "select", "select-type", "storageClass", "tagging", "torrent",
+    "uploadId", "uploads", "versionId", "versioning", "versions", "website",
+};
+
+std::string base64_of(const uint8_t* p, size_t n)
+{
+    std::string out(4 * ((n + 2) / 3), '\0');
+    const int len = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(out.data()), p, static_cast<int>(n));
+    out.resize(len > 0 ? static_cast<size_t>(len) : 0);
+    return out;
+}
+
+// The string a Signature Version 2 signs, with `date` on the line of the Date header.
+std::string v2_string_to_sign(const request_view& req, const verify_options& opts, std::string_view date)
+{
+    const auto value = [&](std::string_view name)
+    {
+        const header_field* h = find_header(req.headers, name);
+        return h ? trim(h->value) : std::string_view{};
+    };
+    std::string s;
+    append(s, {req.method, "\n", value("content-md5"), "\n", value("content-type"), "\n", date, "\n"});
+    // Every x-amz-* header by its lowercase name, the values of one name joined by commas.
+    std::vector<std::pair<std::string, std::string>> amz;
+    for (const header_field& h : req.headers)
+    {
+        if (h.name.size() < 6)
+            continue;
+        std::string name(h.name);
+        for (char& ch : name)
+            ch = lower(ch);
+        if (!name.starts_with("x-amz-"))
+            continue;
+        const auto it = std::ranges::find_if(amz, [&](const auto& e) { return e.first == name; });
+        if (it == amz.end())
+            amz.emplace_back(std::move(name), std::string(trim(h.value)));
+        else
+            append(it->second, {",", trim(h.value)});
+    }
+    std::ranges::sort(amz);
+    for (const auto& [n, v] : amz)
+        append(s, {n, ":", v, "\n"});
+    const size_t resource = s.size();
+    if (!opts.v2_bucket.empty())
+        append(s, {"/", opts.v2_bucket});
+    s += req.raw_path;
+    // A bucket named alone is "/bucket/", as S3 and the clients write it.
+    if (s.size() > resource + 1 && s.find('/', resource + 1) == std::string::npos)
+        s += '/';
+    std::vector<std::pair<std::string, std::string>> sub;
+    // A parameter written without '=' has no value at all, and is signed so.
+    for_each_param(req.raw_query, [&](std::string_view n, std::string_view v) {
+        if (std::ranges::find(v2_subresources, n) != std::end(v2_subresources))
+            sub.emplace_back(std::string(n), v.data() ? "=" + decode_component(v, false) : std::string());
+    });
+    std::ranges::stable_sort(sub, {}, [](const auto& e) { return e.first; });
+    for (size_t i = 0; i < sub.size(); ++i)
+        append(s, {i ? "&" : "?", sub[i].first, sub[i].second});
+    return s;
+}
+
+// A request signed with Signature Version 2, `auth` the Authorization header's value or empty for a presigned URL.
+verify_result verify_v2(const request_view& req, const verify_options& opts, const secret_lookup& secrets,
+                        int64_t now_unix, std::string_view auth)
+{
+    const auth_form form = auth.empty() ? auth_form::query : auth_form::header;
+    std::string access_key, claimed, expires;
+    std::vector<std::string> dates;
+    if (form == auth_form::header)
+    {
+        // "AWS AKID:signature", the key never holding a colon and the signature, base64, never either.
+        const std::string_view rest = trim(auth.substr(3));
+        const size_t colon = rest.rfind(':');
+        if (colon == std::string_view::npos || colon == 0 || colon + 1 == rest.size())
+            return malformed(form, "The authorization header is malformed; expecting \"AWS AccessKeyId:Signature\".");
+        access_key.assign(rest.substr(0, colon));
+        claimed.assign(rest.substr(colon + 1));
+        stamp when{};
+        const header_field* xd = find_header(req.headers, "x-amz-date");
+        const header_field* d  = find_header(req.headers, "date");
+        if ((xd && !parse_http_date(trim(xd->value), when) && !parse_amz_date(trim(xd->value), when)) ||
+            (!xd && (!d || !parse_http_date(trim(d->value), when))))
+            return fail(sigv4_status::missing_auth, 403, "AccessDenied", "AWS authentication requires a valid Date or x-amz-date header", form);
+        if (now_unix - when.unix > opts.skew_seconds || when.unix - now_unix > opts.skew_seconds)
+            return fail(sigv4_status::request_time_too_skewed, 403, "RequestTimeTooSkewed", "The difference between the request time and the current time is too large.", form);
+        // The Date line holds the Date header, and is empty beside an x-amz-date, which clients write either way.
+        dates.emplace_back(d ? std::string(trim(d->value)) : std::string());
+        if (xd && d)
+            dates.emplace_back();
+    }
+    else
+    {
+        if (!query_param(req.raw_query, "AWSAccessKeyId", access_key) || !query_param(req.raw_query, "Signature", claimed) ||
+            !query_param(req.raw_query, "Expires", expires))
+            return malformed(form, "Query-string authentication requires the Signature, Expires and AWSAccessKeyId parameters");
+        uint64_t until = 0;
+        if (!parse_u64(expires, until))
+            return malformed(form, "Expires is not a number of seconds since the epoch.");
+        if (static_cast<int64_t>(until) < now_unix)
+            return fail(sigv4_status::expired, 403, "AccessDenied", "Request has expired", form);
+        dates.push_back(expires);
+    }
+    if (access_key.size() > 127)
+        return malformed(form, "The access key is too long.");
+    const std::string_view secret = secrets(access_key);
+    if (secret.empty())
+        return fail(sigv4_status::unknown_access_key, 403, "InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", form);
+
+    bool matched = false;
+    for (const std::string& date : dates)
+    {
+        const std::string sts = v2_string_to_sign(req, opts, date);
+        unsigned char mac[EVP_MAX_MD_SIZE];
+        unsigned int len = 0;
+        if (!HMAC(EVP_sha1(), secret.data(), static_cast<int>(secret.size()), reinterpret_cast<const unsigned char*>(sts.data()),
+                  sts.size(), mac, &len))
+            break;
+        const std::string want = base64_of(mac, len);
+        matched = matched || (want.size() == claimed.size() && CRYPTO_memcmp(want.data(), claimed.data(), want.size()) == 0);
+    }
+    if (!matched)
+        return fail(sigv4_status::signature_mismatch, 403, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided. Check your key and signing method.", form);
+
+    verify_result r;
+    r.status      = sigv4_status::ok;
+    r.http_status = 200;
+    r.code        = "";
+    r.message     = "";
+    r.form        = form;
+    r.payload     = payload_kind::unsigned_payload;
+    std::memcpy(r.access_key_buf, access_key.data(), access_key.size());
+    r.access_key_len = static_cast<uint8_t>(access_key.size());
+    return r;
 }
 
 } // namespace

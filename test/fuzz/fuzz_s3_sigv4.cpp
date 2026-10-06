@@ -1,4 +1,4 @@
-// Fuzz target: AWS Signature V4 verification (socketley/shared/s3_sigv4.h) and the aws-chunked decoder.
+// Fuzz target: AWS Signature V4 and V2 verification (socketley/shared/s3_sigv4.h) and the aws-chunked decoder.
 //
 // Reachable by anything that can send an HTTP request to a storage runtime: every request is verified before any
 // other work, and the chunk decoder reads the body of any request that says it is aws-chunked.
@@ -90,7 +90,10 @@ void one_request(uint8_t flags, std::string_view text)
         s3::request_view up{rv.method, rv.raw_path, rv.raw_query, upper, rv.body_sha256_hex};
         FUZZ_CHECK(s3::verify(up, opts, lookup_real, now_unix).ok(), "header names in upper case stopped verifying");
         FUZZ_CHECK(!s3::verify(rv, opts, lookup_other, now_unix).ok(), "verified under two different secrets");
-        FUZZ_CHECK(!s3::verify(rv, opts, lookup_real, now_unix - 2 * 86400).ok(), "verified with the clock two days behind");
+        // A Signature Version 2 URL names when it expires and not when it was made, so an earlier clock still takes it.
+        const bool v2_url = r.form == s3::auth_form::query && rv.raw_query.find("AWSAccessKeyId=") != std::string_view::npos;
+        FUZZ_CHECK(v2_url || !s3::verify(rv, opts, lookup_real, now_unix - 2 * 86400).ok(),
+                   "verified with the clock two days behind");
         FUZZ_CHECK(!s3::verify(rv, opts, lookup_real, now_unix + 8 * 86400).ok(), "verified with the clock eight days ahead");
     }
     else

@@ -8,6 +8,7 @@ with the number of failures (at most 100).  Every request is signed, since a
 runtime with credentials is what each of these was found against.
 """
 import email.utils
+import json
 import sys
 import xml.etree.ElementTree as ET
 
@@ -512,10 +513,56 @@ def object_lock():
           s3.head_object(Bucket="cl-misc", Key="redir").get("WebsiteRedirectLocation") == "/elsewhere")
 
 
+def signature_v2():
+    print("=== Signature Version 2: a header and a presigned URL, as awscli 1.x and older tools sign ===")
+    import requests
+    import time
+    v2 = boto3.client("s3", endpoint_url="http://127.0.0.1:%d" % PORT, region_name="us-east-1",
+                      aws_access_key_id=ACCESS, aws_secret_access_key=SECRET,
+                      config=Config(signature_version="s3", s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
+    check("a bucket is made and listed by Signature V2",
+          code_of(lambda: v2.create_bucket(Bucket="cl-v2")) == (None, None) and
+          "cl-v2" in [b["Name"] for b in v2.list_buckets()["Buckets"]])
+    v2.put_object(Bucket="cl-v2", Key="a b/c+d.txt", Body=b"two", ContentType="text/plain", Metadata={"m": "1"})
+    got = v2.get_object(Bucket="cl-v2", Key="a b/c+d.txt", ResponseContentType="application/x-two")
+    check("an object with a space and a plus in its key is put and read, response-* signed as a subresource",
+          got["Body"].read() == b"two" and got["ContentType"] == "application/x-two" and got["Metadata"] == {"m": "1"})
+    up = v2.create_multipart_upload(Bucket="cl-v2", Key="mp")["UploadId"]
+    etag = v2.upload_part(Bucket="cl-v2", Key="mp", UploadId=up, PartNumber=1, Body=b"p")["ETag"]
+    check("an upload, signing ?uploads, ?uploadId and ?partNumber, completes",
+          code_of(lambda: v2.complete_multipart_upload(Bucket="cl-v2", Key="mp", UploadId=up,
+                                                       MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": etag}]}))
+          == (None, None))
+    url = v2.generate_presigned_url("get_object", Params={"Bucket": "cl-v2", "Key": "a b/c+d.txt"}, ExpiresIn=60)
+    r = requests.get(url, timeout=30)
+    check("a presigned V2 GET reads the object", "AWSAccessKeyId=" in url and (r.status_code, r.content) == (200, b"two"),
+          (r.status_code, url))
+    url = v2.generate_presigned_url("put_object", Params={"Bucket": "cl-v2", "Key": "pp"}, ExpiresIn=60)
+    r = requests.put(url, data=b"put by url", timeout=30)
+    check("and a presigned V2 PUT stores one", r.status_code == 200 and
+          s3.get_object(Bucket="cl-v2", Key="pp")["Body"].read() == b"put by url", r.status_code)
+    url = v2.generate_presigned_url("get_object", Params={"Bucket": "cl-v2", "Key": "pp"}, ExpiresIn=1)
+    time.sleep(2)
+    r = requests.get(url, timeout=30)
+    check("one past its Expires is AccessDenied", r.status_code == 403 and b"Request has expired" in r.content, r.status_code)
+    wrong = boto3.client("s3", endpoint_url="http://127.0.0.1:%d" % PORT, region_name="us-east-1",
+                         aws_access_key_id=ACCESS, aws_secret_access_key="not-the-secret",
+                         config=Config(signature_version="s3", s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
+    check("a V2 signature under another secret is SignatureDoesNotMatch",
+          code_of(lambda: wrong.list_objects(Bucket="cl-v2"))[0] == "SignatureDoesNotMatch")
+    s3.put_bucket_policy(Bucket="cl-v2", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": ["arn:aws:s3:::cl-v2", "arn:aws:s3:::cl-v2/*"],
+         "Condition": {"StringEquals": {"s3:signatureversion": "AWS"}}}]}))
+    check("a bucket policy refuses Signature V2 by s3:signatureversion AWS",
+          code_of(lambda: v2.list_objects(Bucket="cl-v2"))[0] == "AccessDenied" and
+          code_of(lambda: s3.list_objects(Bucket="cl-v2")) == (None, None))
+    s3.delete_bucket_policy(Bucket="cl-v2")
+
+
 # A section that raises fails as one assertion and the next still runs, so a runtime without the feature reads red, not dead.
 for section in (delete_bucket_with_uploads, date_header, empty_content_md5, aws_chunked_coding, list_buckets_paged,
                 object_attributes, conditional_writes, completion_sent_twice, full_object_checksums,
-                expiration_header, acls_disabled, bucket_tags, post_object, object_lock):
+                expiration_header, acls_disabled, bucket_tags, post_object, object_lock, signature_v2):
     try:
         section()
     except Exception as e:

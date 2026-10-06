@@ -165,6 +165,8 @@ struct verify_options
     // Empty accepts any region; otherwise the credential scope must name exactly this one.
     std::string_view region;
     std::string_view service = "s3";
+    // The bucket a virtual-hosted request names in its host, which a Signature Version 2 resource begins with.
+    std::string_view v2_bucket;
     int64_t skew_seconds     = 15 * 60;
     int64_t max_expires_seconds = 7 * 24 * 60 * 60;
 };

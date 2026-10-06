@@ -243,6 +243,7 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     rv.bucket       = r.bucket;
     rv.key          = r.key;
     rv.tls          = secure(*c);
+    rv.vhost        = r.vhost || r.website;
 
     // A bucket whose documents this shard may hold old copies of is served nothing, preflights included.
     if (m_store.any_doubt() && !docs_settled(c))

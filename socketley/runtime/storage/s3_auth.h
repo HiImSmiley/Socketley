@@ -56,6 +56,8 @@ struct request_view
     std::string_view key;
     // Whether the connection is TLS, which decides what a presigned URL says.
     bool tls{false};
+    // The bucket came from the host, virtual-hosted, which a Signature Version 2 resource names all the same.
+    bool vhost{false};
     // The service the signature's scope must name: s3, or sts for a request for temporary credentials.
     std::string_view service{"s3"};
     // The body's sha256 in hex, for a body read before its request is judged that names no x-amz-content-sha256.
