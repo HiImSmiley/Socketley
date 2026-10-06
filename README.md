@@ -123,20 +123,23 @@ cd make && make config=release_x64 -j$(nproc)
 sudo bash packaging/install.sh
 ```
 
-`./bin/build-thirdparty.sh` with no argument builds *both* archives, and
-`thirdparty/liburing/` is on the link path, so `-luring` then resolves to
-`liburing.a` and you get liburing statically linked. The Dockerfile, CI, the
-release job and `scripts/install-from-source.sh` all say `luajit` instead and
-take liburing from the system, which is what the `.deb`'s
-`Depends: liburing2 (>= 2.6)` describes. Both build; `ldd` on the result is
-what tells you which one you have.
+liburing is always linked from an archive: `thirdparty/liburing/liburing.a` once
+`./bin/build-thirdparty.sh` has built it, otherwise the `liburing.a` that
+`scripts/install-liburing.sh` installed. A binary therefore loads no liburing at
+run time, whatever version the machine it runs on packages; `ldd` on the result
+lists no `liburing.so`.
 
 ### Debian package
 
 ```bash
 bash packaging/build-deb.sh
-sudo dpkg -i socketley_*.deb
+sudo apt install ./socketley_*.deb
 ```
+
+Its `Depends` is read from the binary by `dpkg-shlibdeps`, so build it on the
+release it is for: a package built on Ubuntu 24.04 needs glibc 2.38 and does not
+install on Debian 12. Inside a `debian:bookworm` container the same two lines
+give a package for Debian 12, which this tree builds with its GCC 12.
 
 ## What's Included
 
@@ -904,8 +907,8 @@ still want it to themselves.
   which is what CI, the release job and the Dockerfile all use. 2.15 is the
   version everything is tested against; 2.7 is the oldest that compiles.
   Distributions carrying 2.7 or later (Debian 13, Fedora 40+, Arch) need no
-  extra step. A binary built this way needs liburing 2.6+ at *run* time, which
-  is why the `.deb` depends on `liburing2 (>= 2.6)`.
+  extra step. It is linked statically, so a built binary needs no liburing at
+  *run* time.
 - libssl-dev (TLS on every role that has a handshake, and WebSocket handshake hashing)
 - GCC 12+ (C++23)
 - x86\_64. `premake5.lua` declares one platform and Release compiles

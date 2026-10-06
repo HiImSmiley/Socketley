@@ -130,7 +130,7 @@ chmod 644 "$COPYRIGHT"
 SHLIBS_DIR=$(mktemp -d)
 mkdir "$SHLIBS_DIR/debian"
 printf 'Source: socketley\n\nPackage: socketley\nArchitecture: any\n' > "$SHLIBS_DIR/debian/control"
-if ! SHLIBS=$(cd "$SHLIBS_DIR" && dpkg-shlibdeps -O "$BINARY"); then
+if ! SHLIBS=$(cd "$SHLIBS_DIR" && dpkg-shlibdeps -O "$PKG_DIR/usr/bin/socketley"); then
     rm -rf "$SHLIBS_DIR" "$PKG_DIR"
     echo "error: a library the binary loads belongs to no package; run bin/build-thirdparty.sh and build again"
     exit 1
