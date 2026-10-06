@@ -421,7 +421,7 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
         return;
     }
     // A folder link without a file is a page of what is in it, and with ?format=json a list.
-    if (reading && s.folder && (rel.empty() || rel.back() == '/'))
+    if (reading && s.folder && (rel.empty() || rel.back() == '/') && !r.has_query("zip"))
     {
         list_query q;
         q.prefix    = key;
@@ -501,6 +501,8 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
                 h += "</a> (" + std::to_string(e.meta.size) + " bytes)</li>";
             }
             h += "</ul>";
+            if (!p.objects.empty() || !p.prefixes.empty())
+                h += "<p><a href=\"?zip\"><b>Download all as a ZIP</b></a></p>";
             if (upload)
                 h += "<p><input type=\"file\" id=\"f\" multiple> <button onclick=\"up()\">Upload</button> <span id=\"s\"></span>"
                      "<script>async function up(){const s=document.getElementById('s');for(const f of document.getElementById('f').files){"
@@ -561,6 +563,20 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
             app_reply(c, 410, "This link has been used as often as it may be.\n");
             return;
         }
+    }
+    // A folder's link read with ?zip is the folder, or the part of it under the path, as one archive; it counts as one
+    // download.
+    if (reading && s.folder && r.has_query("zip"))
+    {
+        if (!key.empty() && key.back() != '/')
+            key += '/';
+        std::string archive = key.size() > s.key.size() ? key.substr(0, key.size() - 1) : s.key.empty() ? s.bucket
+                              : s.key.substr(0, s.key.size() - 1);
+        archive = archive.substr(archive.rfind('/') + 1);
+        c->anonymous = true;
+        c->user.reset();
+        zip_start(c, s.bucket, std::move(key), {}, std::move(archive), true);
+        return;
     }
     // The object itself, as the S3 path serves it, judged by the link and not by any policy.
     if (r.method == "PUT")

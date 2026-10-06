@@ -270,6 +270,7 @@ class storage_run;
 
 struct response;
 struct select_job;
+struct zip_job;
 
 // What of a bucket's ACL, and of an object's own, a request of action `a` needs, none for one they say nothing to.
 uint8_t bucket_acl_need(s3_action a);
@@ -413,6 +414,8 @@ struct conn
     std::shared_ptr<body_reader> dec;
     // A SelectObjectContent streaming its answer, which the pump feeds instead of a file's bytes.
     std::shared_ptr<select_job> sel;
+    // A folder streamed as a ZIP, which the pump feeds entry by entry instead of a file's bytes.
+    std::shared_ptr<zip_job> zip;
     int         file_fd{-1};
     uint64_t    file_off{0};
     uint64_t    file_left{0};
@@ -880,6 +883,14 @@ public:
     static bool has_ui_cookie(const conn& c);
     // A Content-Disposition that saves `key` under its last name, as ?download asks.
     static std::string attachment_of(std::string_view key);
+    // A ZIP of what is under `prefix` in `bucket` (only the names in `only` and what is under them, when it names
+    // any), saved as `archive`.zip, with an exact Content-Length; storage_zip.cpp.
+    // `by_link` for a share link's folder, which its link and not the policies lets the visitor read.
+    void zip_start(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix, std::vector<std::string> only,
+                   std::string archive, bool by_link);
+    void zip_pump(const std::shared_ptr<conn>& c);
+    // Lets go of an archive's open object, at a close or the next request.
+    void zip_end(conn& c);
     // The interface's sign-in (/~ui/session) and the films a user has part watched (/~ui/progress).
     void ui_session(const std::shared_ptr<conn>& c);
     void ui_progress(const std::shared_ptr<conn>& c);

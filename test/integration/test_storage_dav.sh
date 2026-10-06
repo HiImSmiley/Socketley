@@ -16,6 +16,9 @@
 #     key's secret changed, readable by script, or taking a change that does
 #     not carry the interface's header; a session extending itself
 #   * a file read with ?download not saved under its name
+#   * a folder's ZIP not holding its files byte for byte, its Content-Length
+#     not its length, a selection taking more than it named, or the ZIP
+#     giving what its reader may not read
 #   * a user's watch positions seen by another user, kept for what the user
 #     may not read, or shown after the film was replaced
 #   * a library shared with a user not listed or not readable by them, giving
@@ -219,6 +222,20 @@ check "a file read with ?download is saved under its name" \
       "$(curl -s -o /dev/null -D - -b "skl_ui=$ck" "$U/~dav/docs/a/one.txt?download" | grep -i '^content-disposition' | tr -d '\r')" \
       "Content-Disposition: attachment; filename=\"one.txt\"; filename*=UTF-8''one.txt"
 check "signing out clears the cookie" "$(curl -s -X DELETE -D - -o /dev/null "$U/~ui/session" | grep -i '^set-cookie: skl_ui=;' | grep -c 'Max-Age=0')" 1
+
+# A folder as one ZIP.
+zipinfo() { python3 -c 'import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); print(z.testzip(), sorted((i.filename, i.file_size) for i in z.infolist()))' "$1"; }
+check "a folder's ZIP has its files under their paths, each whole" \
+      "$(curl -s -u "$A" -o "$T/a.zip" "$U/~dav/docs/a/?zip"; zipinfo "$T/a.zip")" "None [('one.txt', 3), ('sub/big.bin', 300000)]"
+check "its Content-Length is its length" \
+      "$(curl -s -u "$A" -o /dev/null -D - "$U/~dav/docs/a/?zip" | grep -i '^content-length' | tr -d '\r' | cut -d' ' -f2)" "$(stat -c %s "$T/a.zip")"
+check "and it is saved under the folder's name" \
+      "$(curl -s -u "$A" -o /dev/null -D - "$U/~dav/docs/a?zip" | grep -i '^content-disposition' | grep -c 'filename="a.zip"')" 1
+check "a big file in it is the file" "$(python3 -c 'import zipfile,sys; print(zipfile.ZipFile(sys.argv[1]).read("sub/big.bin") == open(sys.argv[2],"rb").read())' "$T/a.zip" "$T/big")" True
+check "?n= takes only what it names" "$(curl -s -u "$A" -o "$T/n.zip" "$U/~dav/docs/a/?zip&n=sub"; zipinfo "$T/n.zip")" "None [('sub/big.bin', 300000)]"
+check "a whole bucket is one too" "$(curl -s -u "$A" -o "$T/b.zip" "$U/~dav/docs?zip"; python3 -c 'import zipfile,sys; print(zipfile.ZipFile(sys.argv[1]).testzip())' "$T/b.zip")" None
+check "another user gets no ZIP of it" "$(code -u "$B" "$U/~dav/docs/a/?zip")" 403
+check "nor of an empty folder" "$(curl -s -u "$A" -X MKCOL -o /dev/null "$U/~dav/docs/hollow"; code -u "$A" "$U/~dav/docs/hollow/?zip")" 404
 
 # Watch positions, a user's own.
 pos() { curl -s -b "skl_ui=$ck" -H 'X-Socketley-UI: 1' -o /dev/null -w '%{http_code}' -X POST -d "$1" "$U/~ui/progress"; }

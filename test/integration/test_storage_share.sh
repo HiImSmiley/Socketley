@@ -14,6 +14,8 @@
 #     taking one
 #   * a link not seen or not revoked by its maker, seen by another user, or
 #     lost by a restart or on the other shard
+#   * a folder link's ZIP not holding the folder, or counted as more than one
+#     download
 #   * a link that burns leaving its file behind at its expiry, after its last
 #     download or at its revocation, removing it before, counting its page or
 #     a link preview as a download, or being made by one who may not delete
@@ -139,6 +141,12 @@ check "a link outlives a restart" \
 check "its maker revokes it" "$(code -u "$A" -X DELETE "$U/~share/$f")" 204
 check "and it reads no more" "$(code "$U/~share/$f")" 404
 check "on either shard" "$(for _ in 1 2 3 4; do code "$U/~share/$f"; done)" 404404404404
+
+# A folder's link as one ZIP.
+zl=$(mk "$A" '{"bucket":"ann","key":"album/","max_downloads":1}')
+check "a folder link's page offers its ZIP" "$(curl -s "$U/~share/$zl/" | grep -c 'href="?zip"')" 1
+check "which holds the folder" "$(curl -s -o "$T/l.zip" "$U/~share/$zl/?zip"; python3 -c 'import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); print(z.testzip(), [i.filename for i in z.infolist()])' "$T/l.zip")" "None ['one.jpg', 'sub/two.jpg']"
+check "and counts as one download" "$(code "$U/~share/$zl/?zip")" 410
 
 # Links that burn what they name, as a file sent once.
 gone() { for _ in $(seq 1 40); do [ "$(code -u "$A" "$U/~dav/ann/$1")" = 404 ] && { echo gone; return; }; sleep 0.5; done; echo there; }

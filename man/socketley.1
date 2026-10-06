@@ -9577,6 +9577,19 @@ user = AKIA...
 pass = <the secret, as rclone obscure prints it>
 .fi
 .IP
+.B GET /~dav/\fIbucket\fB/\fIfolder\fB/?zip
+is the folder as one ZIP, saved as
+.IR folder .zip,
+and
+.B ?zip&n=\fIname\fB&n=\fIname\fR
+only the files and folders of it named; a bucket's root takes it too. It is
+streamed as it is read, each file stored as it is, so its Content-Length is known
+before its first byte and a browser shows how far it has come; each entry's CRC-32
+is taken as its bytes pass and follows them in a data descriptor, and a file or
+an offset past 4 GiB takes ZIP64. Only what the user may read is in it, and what
+only its client's key opens is left out. An object that changes while the ZIP
+is being sent ends the connection, since its length was promised.
+.IP
 In a versioned bucket a deleted file is a delete marker, and its versions stay:
 .B GET /~dav/\fIbucket\fB/\fIfolder\fB/?trash
 lists the files under the folder whose latest version is a marker, as JSON with
@@ -9607,7 +9620,10 @@ any user name, and kept salted and hashed;
 .B max_downloads
 counts each read from the start of a file and not a player's later ranges, and
 .B ?download
-asks a browser to save. An expired link is
+asks a browser to save, and a folder's link read with
+.B ?zip
+is the folder, or the part of it the path names, as one ZIP as the drive gives
+it, counted as one download; its page offers it. An expired link is
 .BR 410 ,
 and is removed at the next listing.
 .B GET /~share

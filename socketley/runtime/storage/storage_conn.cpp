@@ -660,6 +660,7 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
         c->put->abort();
     c->dec.reset();
     c->sel.reset();
+    zip_end(*c);
     if (c->file_fd >= 0)
     {
         m_loop.close_fd(c->file_fd);
@@ -1636,6 +1637,7 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->sent_body = 0;
     c->dec.reset();
     c->sel.reset();
+    zip_end(*c);
     c->rd_direct = false;
     c->hfill = 0;
     c->trickle  = false;
@@ -2421,6 +2423,11 @@ void storage_run::file_pump(const std::shared_ptr<conn>& c)
     if (c->sel)
     {
         select_pump(c);
+        return;
+    }
+    if (c->zip)
+    {
+        zip_pump(c);
         return;
     }
     if (c->file_left == 0)
