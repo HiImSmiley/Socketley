@@ -321,7 +321,13 @@ select.inp option{background:#151821}
 .seek .pl{background:var(--grad)}
 .seek .kn{position:absolute;top:50%;width:14px;height:14px;margin:-7px 0 0 -7px;border-radius:50%;background:#fff;box-shadow:0 0 0 4px rgba(var(--glow),.35);transform:scale(0);transition:transform .15s}
 .seek:hover .kn,.seek.drag .kn{transform:scale(1)}
-.seek .tip{position:absolute;bottom:22px;transform:translateX(-50%);padding:3px 8px;border-radius:6px;background:rgba(0,0,0,.85);font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;opacity:0;pointer-events:none;white-space:nowrap}
+.seek .tip{position:absolute;bottom:22px;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;gap:5px;padding:3px 8px;border-radius:8px;background:rgba(0,0,0,.85);font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;opacity:0;pointer-events:none;white-space:nowrap}
+.seek .tip:has(.pv:not([hidden])){padding:5px 5px 6px}
+.seek .tip .pv{border-radius:5px;background-repeat:no-repeat;background-color:#000}
+.seek .tip small{font-weight:500;color:var(--mut);max-width:170px;overflow:hidden;text-overflow:ellipsis}
+.seek .cm{position:absolute;top:0;bottom:0;width:3px;margin-left:-1.5px;background:rgba(0,0,0,.7)}
+.skipb{position:absolute;right:28px;bottom:118px;z-index:6;padding:11px 20px;border-radius:12px;background:rgba(15,15,22,.82);border:1px solid var(--line2);color:#fff;font-weight:650;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);box-shadow:var(--sh);transition:background .15s}
+.skipb:hover{background:rgba(var(--glow),.3)}
 .seek:hover .tip,.seek.drag .tip{opacity:1}
 .row2{display:flex;align-items:center;gap:4px;margin-top:8px}
 .row2 .ib{color:#fff;width:42px;height:42px}
@@ -599,9 +605,12 @@ async function api(method, url, opt = {}) {
 async function must(r) { if (!r.ok) { let t = ''; try { t = (await r.text()).trim(); } catch (e) {} const m = /<Message>([^<]*)/.exec(t); throw new Error(m ? m[1] : t.slice(0, 200) || r.status + ' ' + r.statusText); } return r; }
 
 // ─── toasts, menus, dialogs ─────────────────────────────────────────────────
+// Where a dialog, a menu or a toast goes: into the element shown full screen, which hides everything outside it.
+const host = () => document.fullscreenElement || document.body;
+document.addEventListener('fullscreenchange', () => host().append($('#toasts')));
 function toast(msg, kind = 'ok', ms = 3200) {
   const t = el('div', { class: 'toast ' + kind }, ico(kind === 'bad' ? 'info' : kind === 'ok' ? 'check' : 'spark'), el('span', { text: msg }));
-  $('#toasts').append(t);
+  host().append($('#toasts')); $('#toasts').append(t);
   setTimeout(() => { t.style.transition = 'opacity .3s'; t.style.opacity = 0; setTimeout(() => t.remove(), 300); }, ms);
   return t;
 }
@@ -617,7 +626,7 @@ function popup(at, entries) {
     if (x.head) { m.append(el('div', { class: 'hd', text: x.head })); continue; }
     m.append(el('button', { class: x.bad ? 'bad' : '', onclick: () => { closePop(); x.fn(); } }, ico(x.icon), el('span', { text: x.label }), x.key ? el('span', { class: 'k', text: x.key }) : null));
   }
-  document.body.append(m);
+  host().append(m);
   let x, y;
   if (at instanceof Element) { const r = at.getBoundingClientRect(); x = r.right - m.offsetWidth; y = r.bottom + 6; if (x < 8) x = r.left; }
   else { x = at.x; y = at.y; }
@@ -637,7 +646,7 @@ function modal(title, body, foot, wide) {
   box.append(el('div', { class: 'dh' }, el('h3', { text: title }), ibtn('close', 'Close', close)), el('div', { class: 'db' }, body));
   if (foot) box.append(el('div', { class: 'df' }, foot));
   s.addEventListener('mousedown', e => { if (e.target === s) close(); });
-  document.body.append(s); layers.push(L);
+  host().append(s); layers.push(L);
   return L;
 }
 function ask({ title, text, input, value, ok = 'OK', danger }) {
@@ -1735,16 +1744,49 @@ class MsePlayer {
 }
 
 function seekBar(onseek) {
-  const tr = el('div', { class: 'tr' }), bf = el('div', { class: 'bf' }), pl = el('div', { class: 'pl' }), kn = el('div', { class: 'kn' }), tip = el('div', { class: 'tip' });
+  const tr = el('div', { class: 'tr' }), bf = el('div', { class: 'bf' }), pl = el('div', { class: 'pl' }), kn = el('div', { class: 'kn' });
+  const pv = el('div', { class: 'pv', hidden: '' }), tt = el('span'), ch = el('small', { hidden: '' });
+  const tip = el('div', { class: 'tip' }, pv, tt, ch);
   tr.append(bf, pl, kn);
   const s = el('div', { class: 'seek' }, tr, tip);
-  let dur = 0, drag = false;
+  let dur = 0, drag = false, trick = null, chapters = [];
   const frac = e => { const r = tr.getBoundingClientRect(); return Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)); };
-  s.addEventListener('pointermove', e => { const f = frac(e); tip.textContent = clock(f * dur); tip.style.left = (f * 100) + '%'; if (drag) set(f * dur, null); });
+  // The film's still nearest the time, from its sprite, once that is loaded; asked again a while after a failure.
+  function sprite() {
+    if (!trick || trick.ready || trick.loading || Date.now() - trick.failed < 15000) return;
+    trick.loading = true;
+    const img = new Image();
+    img.onload = () => { trick.loading = false; trick.ready = true; pv.style.backgroundImage = 'url("' + trick.url + '")'; pv.style.width = trick.width + 'px'; pv.style.height = trick.height + 'px'; };
+    img.onerror = () => { trick.loading = false; trick.failed = Date.now(); };
+    img.src = trick.url;
+  }
+  function marks() { tr.querySelectorAll('.cm').forEach(n => n.remove()); if (dur) for (const c of chapters) if (c.start > 0.5 && c.start < dur) tr.append(el('div', { class: 'cm', style: 'left:' + (c.start / dur * 100) + '%' })); }
+  s.addEventListener('pointerenter', sprite);
+  s.addEventListener('pointermove', e => {
+    const f = frac(e), t = f * dur;
+    tt.textContent = clock(t);
+    const c = chapters.find(x => t >= x.start && t < x.end);
+    ch.textContent = c ? c.title : ''; ch.hidden = !ch.textContent;
+    if (trick && trick.ready) {
+      const i = Math.min(trick.count - 1, Math.floor(t / trick.every));
+      pv.style.backgroundPosition = -(i % trick.columns) * trick.width + 'px ' + -Math.floor(i / trick.columns) * trick.height + 'px';
+      pv.hidden = false;
+    }
+    // Kept inside the bar, so a still near either end is seen whole.
+    const w = tr.getBoundingClientRect().width, half = tip.offsetWidth / 2;
+    tip.style.left = Math.max(half, Math.min(w - half, f * w)) + 'px';
+    if (drag) set(t, null);
+  });
   s.addEventListener('pointerdown', e => { drag = true; s.classList.add('drag'); s.setPointerCapture(e.pointerId); set(frac(e) * dur, null); });
   s.addEventListener('pointerup', e => { if (!drag) return; drag = false; s.classList.remove('drag'); onseek(frac(e) * dur); });
   function set(t, b) { const f = dur ? Math.min(1, t / dur) : 0; pl.style.width = f * 100 + '%'; kn.style.left = f * 100 + '%'; if (b != null) bf.style.width = (dur ? Math.min(1, b / dur) : 0) * 100 + '%'; }
-  return { el: s, update(t, d, b) { dur = d || 0; if (!drag) set(t, b); }, get dragging() { return drag; } };
+  return {
+    el: s,
+    update(t, d, b) { if ((d || 0) !== dur) { dur = d || 0; marks(); } if (!drag) set(t, b); },
+    preview(url, t) { trick = Object.assign({ url, failed: 0 }, t); },
+    chapters(list) { chapters = list || []; marks(); },
+    get dragging() { return drag; }
+  };
 }
 function bufferedAt(m) { const b = m.buffered, t = m.currentTime; for (let i = 0; i < b.length; i++) if (b.start(i) <= t + 0.5 && b.end(i) >= t) return b.end(i); return t; }
 
@@ -1756,7 +1798,7 @@ async function playVideo(it, list) {
   const spin = el('div', { class: 'spin' });
   const chips = el('div', { class: 'chips' });
   O.append(v, spin, topbar(L, it, chips));
-  let player = null, meta = null, base = '', master = '', choice = 'orig', direct = false, copyOK = false, streams = false, native = false;
+  let player = null, meta = null, base = '', master = '', choice = 'orig', direct = false, copyOK = false, streams = false, native = false, audio = 0;
   const MS = MsePlayer.source();
   const vol = +store.get('skl-vol', '1'); v.volume = isFinite(vol) ? vol : 1; v.muted = store.get('skl-muted', '0') === '1';
   // Controls
@@ -1769,14 +1811,19 @@ async function playVideo(it, list) {
   const idx = list.findIndex(x => keyOf(x) === keyOf(it));
   const nextIt = idx >= 0 && idx < list.length - 1 ? list[idx + 1] : null;
   const ccB = ibtn('cc', 'Subtitles (c)', e => menu('cc', e)); ccB.hidden = true;
+  const chB = ibtn('list', 'Chapters', e => menu('ch', e)); chB.hidden = true;
+  const skipB = el('button', { class: 'skipb', hidden: '', onclick: e => { e.stopPropagation(); const c = intro(); if (c) { v.currentTime = c.end; osd('Skipped ' + c.title); } } });
   const qlab = el('span', { class: 'qlab' }); qlab.hidden = true;
   const gearB = ibtn('gear', 'Quality and speed', e => menu('q', e));
   const fsB = ibtn('fs', 'Full screen (f)', () => fullscreen());
   const pipB = document.pictureInPictureEnabled ? ibtn('pip', 'Picture in picture', () => { (document.pictureInPictureElement ? document.exitPictureInPicture() : v.requestPictureInPicture()).catch(() => {}); }) : null;
   const ctl = el('div', { class: 'ctl' }, sk.el, el('div', { class: 'row2' }, ppB, ibtn('back10', 'Back 10 s (j)', () => { v.currentTime = Math.max(0, v.currentTime - 10); }),
     ibtn('fwd10', 'Forward 10 s (l)', () => { v.currentTime = Math.min(v.duration || 1e9, v.currentTime + 10); }), nextIt ? ibtn('next', 'Next: ' + nextIt.name, () => playNext()) : null,
-    el('div', { class: 'vol' }, volB, volR), tm, el('span', { class: 'sp' }), ccB, gearB, qlab, pipB, fsB));
-  O.append(ctl);
+    el('div', { class: 'vol' }, volB, volR), tm, el('span', { class: 'sp' }), chB, ccB, gearB, qlab, pipB, fsB));
+  O.append(ctl, skipB);
+  // A chapter named as an opening, a recap or the credits is offered to be skipped while it plays.
+  const skippable = /^(intro|opening|opener|vorspann|recap|previously|rückblick|credits|abspann|outro)\b/i;
+  function intro() { const t = v.currentTime; return ((meta && meta.chapters) || []).find(c => skippable.test(c.title.trim()) && t >= c.start && t < c.end - 1) || null; }
   let pm = null;
   const closeMenu = () => { if (pm) { pm.remove(); pm = null; } };
   function qualityName(c) {
@@ -1799,8 +1846,17 @@ async function playVideo(it, list) {
         for (const h of (meta.renditions || []).slice().sort((a, b) => b - a)) item(h + 'p', choice === String(h), () => setChoice(String(h)), h >= 2160 ? '4K' : h >= 1080 ? 'HD' : '');
       }
       if (!streams && !direct && !copyOK) pm.append(el('div', { class: 'hd', style: 'text-transform:none;letter-spacing:0', text: 'Only the file itself is offered.' }));
+      const tracks = (meta && meta.tracks) || [];
+      if (tracks.length > 1 && (streams || copyOK)) {
+        pm.append(el('hr'), el('div', { class: 'hd', text: 'Audio' }));
+        tracks.forEach((t, i) => item(trackName(t, i), audio === i, () => setAudio(i), [t.codec.toUpperCase(), t.channels > 2 ? (t.channels === 6 ? '5.1' : t.channels === 8 ? '7.1' : t.channels + ' ch') : t.channels === 1 ? 'mono' : 'stereo'].join(' · ')));
+      }
       pm.append(el('hr'), el('div', { class: 'hd', text: 'Speed' }));
       for (const r of [0.5, 0.75, 1, 1.25, 1.5, 2]) item(r === 1 ? 'Normal' : r + '×', v.playbackRate === r, () => { v.playbackRate = r; osd(r === 1 ? 'Normal speed' : r + '× speed'); });
+    } else if (which === 'ch') {
+      pm.append(el('div', { class: 'hd', text: 'Chapters' }));
+      const t = v.currentTime;
+      meta.chapters.forEach((c, i) => item(c.title || 'Chapter ' + (i + 1), t >= c.start && t < c.end, () => { v.currentTime = c.start; osd(c.title || 'Chapter ' + (i + 1)); }, clock(c.start)));
     } else {
       pm.append(el('div', { class: 'hd', text: 'Subtitles' }));
       const tracks = [...v.textTracks];
@@ -1828,6 +1884,7 @@ async function playVideo(it, list) {
     tm.textContent = clock(v.currentTime) + ' / ' + clock(v.duration);
   };
   v.addEventListener('timeupdate', paint); v.addEventListener('progress', paint); v.addEventListener('durationchange', paint);
+  v.addEventListener('timeupdate', () => { const c = intro(); skipB.hidden = !c; if (c) skipB.textContent = 'Skip ' + c.title.trim().toLowerCase(); });
   v.addEventListener('play', () => { ppB.firstChild.innerHTML = P.pause; wake(); });
   v.addEventListener('pause', () => { ppB.firstChild.innerHTML = P.play; O.classList.remove('idle'); savePosition(it, v.currentTime, v.duration, true); });
   v.addEventListener('waiting', () => spin.hidden = false);
@@ -1861,6 +1918,8 @@ async function playVideo(it, list) {
     else if (k === 'm') v.muted = !v.muted;
     else if (k === 'c' && !ccB.hidden) { const t = [...v.textTracks]; const on = t.findIndex(x => x.mode === 'showing'); t.forEach((x, j) => x.mode = j === (on + 1 === t.length ? -1 : on + 1) ? 'showing' : 'disabled'); const s = t.find(x => x.mode === 'showing'); osd(s ? 'Subtitles: ' + (s.label || s.language) : 'Subtitles off'); }
     else if (k === 'n' && nextIt) playNext();
+    // A frame on or back, paused, as editors step.
+    else if (k === ',' || k === '.') { e.preventDefault(); v.pause(); const f = 1 / (meta && meta.fps > 0 ? meta.fps : 25); v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + (k === '.' ? f : -f))); osd(k === '.' ? 'Next frame' : 'Previous frame'); }
     else if (/^[0-9]$/.test(k) && v.duration) v.currentTime = v.duration * (+k) / 10;
     wake();
   };
@@ -1875,12 +1934,13 @@ async function playVideo(it, list) {
     loadProgress().then(() => { if (auth && !layers.length) render(); });
   };
   // Where it plays from.
-  async function setChoice(c) {
-    const at = v.currentTime || start;
+  async function setChoice(c, from) {
+    const at = from != null ? from : v.currentTime || start;
     const paused = v.paused && v.currentTime > 0;
     choice = c;
     qlab.hidden = c === 'orig' && !player; qlab.textContent = c === 'orig' ? 'ORIG' : c === 'auto' ? 'AUTO' : c + 'p';
-    const viaStream = c !== 'orig' || !direct;
+    // The file itself plays only its default sound, so another track is always streamed.
+    const viaStream = c !== 'orig' || !direct || audio > 0;
     if (viaStream && MS) {
       const want = c === 'orig' ? 'copy' : c;
       if (player) { player.setChoice(want); osd('Quality: ' + qualityName(c)); return; }
@@ -1891,11 +1951,26 @@ async function playVideo(it, list) {
     } else {
       if (player) { player.stop(); player = null; }
       const obj = '/' + enc(it.segs);
-      v.src = viaStream ? '/~media/' + (c === 'auto' ? 'hls' + obj + '/master.m3u8' : (c === 'orig' ? 'hls-copy' : 'hls-' + c) + obj + '/index.m3u8') : base;
+      const a = audio ? '-a' + audio : '';
+      v.src = viaStream ? '/~media/' + (c === 'auto' ? 'hls' + a + obj + '/master.m3u8' : (c === 'orig' ? 'hls-copy' : 'hls-' + c) + a + obj + '/index.m3u8') : base;
       if (at) v.currentTime = at;
     }
     if (!paused) v.play().catch(() => {});
     if (c !== 'orig' || player) osd('Quality: ' + qualityName(c));
+  }
+  function trackName(t, i) { return t.title || (t.lang && t.lang !== 'und' ? t.lang.toUpperCase() : 'Track ' + (i + 1)); }
+  // Another sound track is another stream of the same film, begun again where the film is.
+  async function setAudio(i) {
+    if (i === audio) return;
+    audio = i;
+    master = '/~media/hls' + (i ? '-a' + i : '') + '/' + enc(it.segs) + '/master.m3u8';
+    const t = v.currentTime, paused = v.paused;
+    if (player) { player.stop(); player = null; }
+    let c = choice;
+    if (c === 'orig' && !copyOK) c = 'auto';
+    await setChoice(c, t);
+    if (paused) v.pause();
+    osd('Audio: ' + trackName(meta.tracks[i], i));
   }
   const pos = position(it);
   const start = pos ? pos.t : 0;
@@ -1916,6 +1991,9 @@ async function playVideo(it, list) {
       for (const s of meta.subtitles || [])
         v.append(el('track', { kind: 'subtitles', src: '/~media/sub-' + s.index + '/' + enc(it.segs) + '/subs.vtt?v=' + meta.version, srclang: (s.lang || 'und').slice(0, 3), label: s.title || s.lang || 'Track ' + s.index }));
       ccB.hidden = !(meta.subtitles || []).length;
+      if (meta.trick) sk.preview('/~media/trick/' + enc(it.segs) + '?v=' + meta.version, meta.trick);
+      if ((meta.chapters || []).length > 1) { sk.chapters(meta.chapters); chB.hidden = false; }
+      if ((meta.tracks || []).length > 1) c((meta.tracks.length) + ' audio tracks');
     }
     if (it.size) chips.append(el('span', { class: 'chip', text: human(it.size) }));
     // The file itself where the browser plays it, which costs the server nothing; a stream where it does not.
