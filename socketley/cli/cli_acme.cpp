@@ -18,6 +18,7 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -547,7 +548,9 @@ public:
             return false;
         if (!json_reader(r.body).document(doc))
         {
-            err = url + " answered something that is not JSON";
+            std::string head = r.body.substr(0, 120);
+            std::ranges::replace_if(head, [](unsigned char ch) { return ch < 0x20 || ch > 0x7e; }, '.');
+            err = url + " answered " + std::to_string(r.status) + " with something that is not JSON: '" + head + "'";
             return false;
         }
         return true;

@@ -2,12 +2,13 @@
 #include "doctest.h"
 
 #include "../../socketley/runtime/storage/bucket_policy.h"
+#include "../../socketley/runtime/storage/json_doc.h"
 
 #include <string>
 #include <string_view>
 
 // The JSON a bucket policy is read from, at its edges: escapes and raw UTF-8, nesting, numbers, names given twice,
-// and the size limit; and the refusing policy a stored document that stops compiling becomes.
+// a value read into twice, and the size limit; and the refusing policy a stored document that stops compiling becomes.
 
 using namespace socketley::storage;
 
@@ -106,6 +107,19 @@ TEST_CASE("nesting is bounded, and a document nested past it is refused rather t
     CHECK_FALSE(compiles("{\"Id\":" + nested(10200) + "}", &err));
     CHECK(err.message.find("valid JSON") != std::string::npos);
     CHECK_FALSE(compiles(std::string(20000, '{'), &err));
+}
+
+TEST_CASE("a document read into a value that holds one is the second document alone")
+{
+    // As an ACME client asks an authorization again: the second answer read into the first's value.
+    jvalue doc;
+    REQUIRE(json_reader(R"({"status":"pending","challenges":[{"type":"http-01"}]})").document(doc));
+    REQUIRE(json_reader(R"({"status":"valid"})").document(doc));
+    REQUIRE(doc.members.size() == 1);
+    CHECK(doc.members[0].first == "status");
+    CHECK(doc.members[0].second.s == "valid");
+    CHECK_FALSE(json_reader("[1]").document(doc));
+    CHECK(doc.members.empty());
 }
 
 TEST_CASE("a number is read whatever its size and never taken for anything a policy says")

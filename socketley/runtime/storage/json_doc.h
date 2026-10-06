@@ -32,6 +32,8 @@ public:
 
     bool document(jvalue& out)
     {
+        // A value read into before would otherwise keep its members, and each read again would be named twice.
+        out = jvalue{};
         ws();
         if (m_pos >= m_in.size() || m_in[m_pos] != '{')
             return false;

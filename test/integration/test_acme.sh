@@ -13,6 +13,8 @@
 #   * --acme flags taken for a runtime that cannot use them, or names a CA
 #     would refuse
 #   * `socketley acme issue` by hand not writing a certificate for its names
+#   * an authorization asked about again after "pending" taken for something
+#     that is not JSON, so nothing is issued by a CA that is not instant
 # suite: isolated
 set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -49,7 +51,8 @@ cat > "$T/pebble.json" <<EOF
  "certificate": "$PEBBLE_DIR/localhost-cert.pem", "privateKey": "$PEBBLE_DIR/localhost-key.pem",
  "httpPort": $P_HTTP, "tlsPort": $P_TLS, "ocspResponderURL": "", "externalAccountBindingRequired": false}}
 EOF
-PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=0 "$PEBBLE" -config "$T/pebble.json" -dnsserver "127.0.0.1:$P_DNS" > "$T/pebble.log" 2>&1 &
+# The CA validates after a pause, as a real one does, so an authorization is asked about while it is still pending.
+PEBBLE_WFE_NONCEREJECT=0 "$PEBBLE" -config "$T/pebble.json" -dnsserver "127.0.0.1:$P_DNS" > "$T/pebble.log" 2>&1 &
 PPID_PEBBLE=$!
 for _ in $(seq 1 100); do curl -s --cacert "$PEBBLE_DIR/pebble.minica.pem" -o /dev/null "https://127.0.0.1:$P_DIR/dir" && break; sleep 0.1; done
 check "the CA serves its directory" "$(curl -s --cacert "$PEBBLE_DIR/pebble.minica.pem" -o /dev/null -w '%{http_code}' "https://127.0.0.1:$P_DIR/dir")" 200
