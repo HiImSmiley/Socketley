@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include "../shared/fd_placement.h"
 
 #include <poll.h>
 
@@ -597,115 +598,20 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         if (lv[0] >= 0)
             ::close(lv[0]);
 
-        // dup2 destroys its destination, so a socketpair that came back
-        // holding 4 is moved out of the way before either fixed number is
-        // placed.
-        if ((m_shard_region_fd >= 0 && sv[1] == child_shard_fd)
-            || (m_shard_clients_fd >= 0 && sv[1] == child_clients_fd)
-            || (mv[1] >= 0 && sv[1] == child_map_fd)
-            || (lv[1] >= 0 && sv[1] == child_link_fd))
-        {
-            const int moved = ::fcntl(sv[1], F_DUPFD, 16);
-            if (moved < 0)
-                _exit(127);
-            ::close(sv[1]);
-            sv[1] = moved;
-        }
-
-        // The shared regions, whose MFD_CLOEXEC dup2 clears on the copy,
-        // placed by the same three lines and each moved out of the way first
-        // because a source sitting on the other's destination would be
-        // destroyed by a placement that has not happened yet.
-        int region_src  = m_shard_region_fd;
-        int clients_src = m_shard_clients_fd;
-        if (clients_src >= 0 && region_src == child_clients_fd)
-        {
-            region_src = ::fcntl(region_src, F_DUPFD, 16);
-            if (region_src < 0) _exit(127);
-        }
-        if (region_src >= 0 && clients_src == child_shard_fd)
-        {
-            clients_src = ::fcntl(clients_src, F_DUPFD, 16);
-            if (clients_src < 0) _exit(127);
-        }
-
-        const auto place = [](int src, int dst) {
-            if (src < 0) return;
-            if (src != dst)
-            {
-                if (::dup2(src, dst) < 0)
-                    _exit(127);
-            }
-            else
-            {
-                const int fl = ::fcntl(src, F_GETFD, 0);
-                if (fl >= 0)
-                    if (::fcntl(src, F_SETFD, fl & ~FD_CLOEXEC) < 0) {}
-            }
-        };
-        place(region_src,  child_shard_fd);
-        place(clients_src, child_clients_fd);
-
-        // The grant channel's source is moved with the mesh's rather than
-        // after it, because the mesh block is placed first and a source still
-        // sitting on one of its destinations would be destroyed by a
-        // placement that has not happened yet.
-        int link_src = lv[1];
-        if (link_src >= 0
-            && link_src <= child_mesh_base + static_cast<int>(m_mesh_fds.size()))
-        {
-            link_src = ::fcntl(link_src, F_DUPFD, 128);
-            if (link_src < 0)
-                _exit(127);
-        }
-
-        // The mesh is a block rather than two descriptors, so every source is
-        // moved above the whole destination block first -- one rule instead of
-        // a case analysis that grows as N**2.
+        // Every descriptor on its fixed number at once, so none is placed over another's source.
+        socketley::fd_move moves[5 + max_shards];
+        size_t n_moves = 0;
+        moves[n_moves++] = {m_shard_region_fd, child_shard_fd};
+        moves[n_moves++] = {m_shard_clients_fd, child_clients_fd};
+        moves[n_moves++] = {lv[1], child_link_fd};
+        moves[n_moves++] = {mv[1], child_map_fd};
+        moves[n_moves++] = {sv[1], child_control_fd};
+        if (m_mesh_fds.size() > max_shards)
+            _exit(127);
         for (size_t j = 0; j < m_mesh_fds.size(); ++j)
-        {
-            if (m_mesh_fds[j] < 0)
-                continue;
-            if (m_mesh_fds[j] >= child_mesh_base
-                && m_mesh_fds[j] < child_mesh_base + static_cast<int>(m_mesh_fds.size()))
-            {
-                const int moved = ::fcntl(m_mesh_fds[j], F_DUPFD, 128);
-                if (moved < 0)
-                    _exit(127);
-                m_mesh_fds[j] = moved;
-            }
-        }
-        for (size_t j = 0; j < m_mesh_fds.size(); ++j)
-            place(m_mesh_fds[j], child_mesh_base + static_cast<int>(j));
-
-        // Below the mesh block and above the map, so neither placement can
-        // reach it.
-        place(link_src, child_link_fd);
-
-        // The map socket is placed last but one, because a source already on 6
-        // belongs to a placement that has happened, and the control socket
-        // stays last as the descriptor whose loss cannot be recovered from.
-        int map_src = mv[1];
-        if (map_src >= 0 && map_src <= child_mesh_base + static_cast<int>(m_mesh_fds.size()))
-        {
-            map_src = ::fcntl(map_src, F_DUPFD, 128);
-            if (map_src < 0)
-                _exit(127);
-        }
-        place(map_src, child_map_fd);
-
-        if (sv[1] != child_control_fd)
-        {
-            if (::dup2(sv[1], child_control_fd) < 0)
-                _exit(127);
-            ::close(sv[1]);
-        }
-        else
-        {
-            const int fl = ::fcntl(sv[1], F_GETFD, 0);
-            if (fl >= 0)
-                if (::fcntl(sv[1], F_SETFD, fl & ~FD_CLOEXEC) < 0) {}
-        }
+            moves[n_moves++] = {m_mesh_fds[j], child_mesh_base + static_cast<int>(j)};
+        if (!socketley::place_descriptors(moves, n_moves))
+            _exit(127);
 
         // Its own session, so a Ctrl-C in the terminal that started the daemon
         // does not reach the worker before the daemon has stopped it properly.
