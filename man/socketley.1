@@ -6459,7 +6459,11 @@ over TLS, so it may carry SSE\-C headers,
 .B aws:SecureTransport
 is true for it, and the URLs the runtime answers with are https. Refused at
 .B create
-when an entry is no address.
+when an entry is no address. A proxy that speaks HTTP/2 to clients holds an upload to its flow\-control
+window per round trip, 64 KiB unless raised: behind Apache,
+.B "H2WindowSize 16777215"
+in the virtual host took a browser's upload from 1.2 to 4.3 MB/s over a line
+that carries 5.
 .TP
 .BI \-\-federation " file"
 The OIDC provider and the LDAP directory whose identities STS gives temporary
