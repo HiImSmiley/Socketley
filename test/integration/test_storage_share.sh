@@ -15,7 +15,7 @@
 #   * a link not seen or not revoked by its maker, seen by another user, or
 #     lost by a restart or on the other shard
 #   * a folder link's ZIP not holding the folder, or counted as more than one
-#     download
+#     download, or naming entries that unpack outside the visitor's folder
 #   * a link's webhook not told of a download or of its files' removal, or a
 #     webhook taken that the runtime may not reach for its users
 #   * a link that burns leaving its file behind at its expiry, after its last
@@ -152,6 +152,26 @@ zl=$(mk "$A" '{"bucket":"ann","key":"album/","max_downloads":1}')
 check "a folder link's page offers its ZIP" "$(curl -s "$U/~share/$zl/" | grep -c 'href="?zip"')" 1
 check "which holds the folder" "$(curl -s -o "$T/l.zip" "$U/~share/$zl/?zip"; python3 -c 'import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); print(z.testzip(), [i.filename for i in z.infolist()])' "$T/l.zip")" "None ['one.jpg', 'sub/two.jpg']"
 check "and counts as one download" "$(code "$U/~share/$zl/?zip")" 410
+
+# A folder link's ZIP of keys its owner chose to escape the folder the visitor unpacks into.
+zipsafe() { python3 - "$1" "$2" <<'ZEOF'
+import zipfile, sys, os
+z = zipfile.ZipFile(sys.argv[1])
+names = [i.filename for i in z.infolist()]
+bad = [n for n in names if n.startswith("/") or "\\" in n or any(s in ("", ".", "..") for s in n.split("/"))
+       or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in n)]
+contents = sorted(z.read(n).decode() for n in names)
+print("bad=%s unique=%s test=%s size=%s contents=%s" % (bad, len(set(names)) == len(names), z.testzip(),
+      os.path.getsize(sys.argv[1]) == int(sys.argv[2]), contents))
+ZEOF
+}
+for k in 'z/../../evil.txt' 'z/./dot.txt' 'z//double.txt' 'z/double.txt' 'z/back%5Cslash.txt' 'z/a/../a.txt' 'z/a.txt' 'z/ctrl%01name.txt'; do
+    printf '%s' "$k" | curl -s -m 30 --path-as-is --aws-sigv4 "aws:amz:us-east-1:s3" -u "$A" -T - -o /dev/null "$U/ann/$k"
+done
+zz=$(mk "$A" '{"bucket":"ann","key":"z/"}')
+len=$(curl -s -o "$T/z.zip" -D - "$U/~share/$zz/?zip" | grep -i '^content-length' | tr -d '\r' | cut -d' ' -f2)
+check "a link's ZIP names nothing outside the visitor's folder" "$(zipsafe "$T/z.zip" "$len")" \
+      "bad=[] unique=True test=None size=True contents=['z/../../evil.txt', 'z/./dot.txt', 'z//double.txt', 'z/a.txt', 'z/a/../a.txt', 'z/back%5Cslash.txt', 'z/ctrl%01name.txt', 'z/double.txt']"
 
 # A link's webhook, told of each download and of the removal of what burns.
 python3 - "$HOOK_PORT" "$T/hook" <<'PYEOF2' &

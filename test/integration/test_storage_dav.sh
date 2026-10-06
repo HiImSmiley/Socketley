@@ -19,6 +19,8 @@
 #   * a folder's ZIP not holding its files byte for byte, its Content-Length
 #     not its length, a selection taking more than it named, or the ZIP
 #     giving what its reader may not read
+#   * a ZIP entry named so it unpacks outside its folder ("..", a leading or
+#     doubled '/', '\\'), with a control character, or twice under one name
 #   * a user's watch positions seen by another user, kept for what the user
 #     may not read, or shown after the film was replaced
 #   * a search missing a file or folder by part of its name in any case,
@@ -247,6 +249,29 @@ check "?n= takes only what it names" "$(curl -s -u "$A" -o "$T/n.zip" "$U/~dav/d
 check "a whole bucket is one too" "$(curl -s -u "$A" -o "$T/b.zip" "$U/~dav/docs?zip"; python3 -c 'import zipfile,sys; print(zipfile.ZipFile(sys.argv[1]).testzip())' "$T/b.zip")" None
 check "another user gets no ZIP of it" "$(code -u "$B" "$U/~dav/docs/a/?zip")" 403
 check "nor of an empty folder" "$(curl -s -u "$A" -X MKCOL -o /dev/null "$U/~dav/docs/hollow"; code -u "$A" "$U/~dav/docs/hollow/?zip")" 404
+
+# Keys an unzipper would put outside the folder, or not as named: each key's object holds the key itself.
+zipsafe() { python3 - "$1" "$2" <<'ZEOF'
+import zipfile, sys, os
+z = zipfile.ZipFile(sys.argv[1])
+names = [i.filename for i in z.infolist()]
+bad = [n for n in names if n.startswith("/") or "\\" in n or any(s in ("", ".", "..") for s in n.split("/"))
+       or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in n)]
+contents = sorted(z.read(n).decode() for n in names)
+print("bad=%s unique=%s test=%s size=%s contents=%s" % (bad, len(set(names)) == len(names), z.testzip(),
+      os.path.getsize(sys.argv[1]) == int(sys.argv[2]), contents))
+ZEOF
+}
+for k in 'z/../../evil.txt' 'z/./dot.txt' 'z//double.txt' 'z/double.txt' 'z/back%5Cslash.txt' 'z/a/../a.txt' 'z/a.txt' 'z/ctrl%01name.txt'; do
+    printf '%s' "$k" | curl -s -m 30 --path-as-is --aws-sigv4 "aws:amz:us-east-1:s3" -u "$A" -T - -o /dev/null "$U/docs/$k"
+done
+len=$(curl -s -u "$A" -o "$T/z.zip" -D - "$U/~dav/docs/z/?zip" | grep -i '^content-length' | tr -d '\r' | cut -d' ' -f2)
+check "a ZIP's names stay inside the folder, plain, and each once, and each holds its key's object" "$(zipsafe "$T/z.zip" "$len")" \
+      "bad=[] unique=True test=None size=True contents=['z/../../evil.txt', 'z/./dot.txt', 'z//double.txt', 'z/a.txt', 'z/a/../a.txt', 'z/back%5Cslash.txt', 'z/ctrl%01name.txt', 'z/double.txt']"
+check "where two keys clean to one name, the second is numbered" \
+      "$(python3 -c 'import zipfile,sys; print(sorted(i.filename for i in zipfile.ZipFile(sys.argv[1]).infolist() if "double" in i.filename))' "$T/z.zip")" \
+      "['double (2).txt', 'double.txt']"
+for k in 'z/../../evil.txt' 'z/./dot.txt' 'z//double.txt' 'z/double.txt' 'z/back%5Cslash.txt' 'z/a/../a.txt' 'z/a.txt' 'z/ctrl%01name.txt'; do s3 -o /dev/null --path-as-is -X DELETE "$U/docs/$k"; done
 
 # Watch positions, a user's own.
 pos() { curl -s -b "skl_ui=$ck" -H 'X-Socketley-UI: 1' -o /dev/null -w '%{http_code}' -X POST -d "$1" "$U/~ui/progress"; }

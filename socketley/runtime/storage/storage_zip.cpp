@@ -6,6 +6,7 @@
 #include "storage_run.h"
 
 #include <ctime>
+#include <unordered_set>
 
 #include "body_reader.h"
 #include "checksum.h"
@@ -193,6 +194,46 @@ std::string end_records(uint64_t count, uint64_t cd_offset, uint64_t cd_size, bo
     return o;
 }
 
+// A key under the folder as a name an unzipper puts inside the folder it unpacks into: its segments without the empty
+// ones, "." and "..", with '\\' and control characters made '_'; empty when nothing is left.
+std::string entry_name(std::string_view rel)
+{
+    std::string out;
+    while (!rel.empty())
+    {
+        const size_t slash = rel.find('/');
+        const std::string_view seg = rel.substr(0, slash);
+        rel = slash == std::string_view::npos ? std::string_view{} : rel.substr(slash + 1);
+        if (seg.empty() || seg == "." || seg == "..")
+            continue;
+        if (!out.empty())
+            out += '/';
+        for (const char ch : seg)
+        {
+            const auto u = static_cast<unsigned char>(ch);
+            out += ch == '\\' || u < 0x20 || u == 0x7f ? '_' : ch;
+        }
+    }
+    return out;
+}
+
+// `name` made one no entry before it has, by " (2)", " (3)" and on before its last segment's extension, since an
+// unzipper writes a second entry of one name over the first.
+std::string unique_name(std::string name, std::unordered_set<std::string>& taken)
+{
+    if (taken.insert(name).second)
+        return name;
+    const size_t slash = name.rfind('/');
+    const size_t dot = name.rfind('.');
+    const size_t cut = dot != std::string::npos && (slash == std::string::npos || dot > slash + 1) ? dot : name.size();
+    for (int n = 2;; ++n)
+    {
+        std::string next = name.substr(0, cut) + " (" + std::to_string(n) + ")" + name.substr(cut);
+        if (taken.insert(next).second)
+            return next;
+    }
+}
+
 }   // namespace
 
 void storage_run::zip_start(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix,
@@ -220,6 +261,7 @@ void storage_run::zip_start(const std::shared_ptr<conn>& c, std::string bucket, 
         job->bucket = bucket;
         uint64_t at = 0;
         size_t skipped = 0;
+        std::unordered_set<std::string> taken;
         for (list_entry& e : p.objects)
         {
             std::string name = e.key.substr(prefix.size());
@@ -235,9 +277,14 @@ void storage_run::zip_start(const std::shared_ptr<conn>& c, std::string bucket, 
                 ++skipped;
                 continue;
             }
+            // A key holding "..", a leading or doubled '/', '\\' or a control character would unpack outside the folder
+            // or not as named: the visitor of a link unpacks names the folder's owner chose.
+            std::string safe = entry_name(name);
+            if (safe.empty())
+                continue;
             zip_job::entry z;
             z.key      = std::move(e.key);
-            z.name     = std::move(name);
+            z.name     = unique_name(std::move(safe), taken);
             z.size     = e.meta.size;
             z.mtime_ms = e.meta.mtime_ms;
             z.offset   = at;
