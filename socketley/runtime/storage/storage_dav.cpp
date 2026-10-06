@@ -213,6 +213,14 @@ bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view rea
     return true;
 }
 
+bool storage_run::lists_bucket(const std::shared_ptr<conn>& c, const bucket_info& b)
+{
+    const user_identity* u = c->user.get();
+    const std::string_view me = u ? std::string_view(u->id) : default_owner;
+    return !u || u->admin || (b.owner.empty() ? default_owner : std::string_view(b.owner)) == me ||
+           (m_store.policy(b.name) && app_allowed(c, "GET", b.name, {}));
+}
+
 bool storage_run::app_allowed(const std::shared_ptr<conn>& c, std::string_view method, std::string_view bucket,
                               std::string_view key, std::string_view query)
 {
@@ -701,11 +709,8 @@ void storage_run::dav_propfind(const std::shared_ptr<conn>& c, const std::string
         dir_response(x, "/~dav/", "", 0);
         if (children)
         {
-            const user_identity* u = c->user.get();
-            const std::string_view me = u ? std::string_view(u->id) : default_owner;
             for (const bucket_info& b : m_store.buckets())
-                if (!u || u->admin || (b.owner.empty() ? default_owner : std::string_view(b.owner)) == me ||
-                    (m_store.policy(b.name) && app_allowed(c, "GET", b.name, {})))
+                if (lists_bucket(c, b))
                     dir_response(x, dav_href(b.name, {}), b.name, b.created_ms);
         }
         x += "</D:multistatus>";

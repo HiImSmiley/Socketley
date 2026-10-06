@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <functional>
+#include <set>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -261,6 +263,11 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
     if (r.key == "access")
     {
         ui_access(c);
+        return;
+    }
+    if (r.key == "search")
+    {
+        ui_search(c);
         return;
     }
     if (r.method != "GET" && r.method != "HEAD")
@@ -683,6 +690,120 @@ void storage_run::ui_access_body(const std::shared_ptr<conn>& c)
         }
     }
     store_doc(c, bucket_doc::policy, bucket, std::move(text), 204);
+}
+
+// GET ?q=<text>[&bucket=<name>] lists the files and folders whose own name holds the text, ignoring the case of ASCII
+// letters, in every library the user lists or the one named: folders first, at most 200, each file only where the user
+// may read it. Each library is listed whole, up to the bound an application lists to, one after the other.
+void storage_run::ui_search(const std::shared_ptr<conn>& c)
+{
+    s3_request& r = c->req;
+    if (r.method != "GET")
+    {
+        app_reply(c, 405, "Search with GET.\n");
+        return;
+    }
+    if (!app_login(c, "socketley"))
+        return;
+    const auto fold = [](std::string_view s)
+    {
+        std::string o(s);
+        for (char& ch : o)
+            if (ch >= 'A' && ch <= 'Z')
+                ch = static_cast<char>(ch - 'A' + 'a');
+        return o;
+    };
+    const std::string q = fold(r.get_query("q"));
+    if (q.size() < 2 || q.size() > 200)
+    {
+        app_reply(c, 400, "Search for two characters or more.\n");
+        return;
+    }
+    struct hunt
+    {
+        std::vector<std::string> buckets;
+        size_t      at{0};
+        std::string q;
+        std::string folders, files;
+        size_t      found{0};
+        bool        more{false};
+        std::set<std::string> seen;
+        std::function<void()> step;
+    };
+    auto h = std::make_shared<hunt>();
+    h->q = q;
+    const std::string only(r.get_query("bucket"));
+    for (const bucket_info& b : m_store.buckets())
+        if ((only.empty() || b.name == only) && lists_bucket(c, b))
+            h->buckets.push_back(b.name);
+    constexpr size_t limit = 200;
+    std::weak_ptr<conn> weak = c;
+    // The step holds the hunt weakly, and each listing's answer strongly, so the hunt lives exactly as long as a listing
+    // is out for it.
+    h->step = [this, weak, wh = std::weak_ptr<hunt>(h), fold, limit]()
+    {
+        auto h = wh.lock();
+        auto cc = weak.lock();
+        if (!h || !cc || cc->dead)
+            return;
+        if (h->at == h->buckets.size() || h->found >= limit)
+        {
+            std::string o = "{\"results\":[" + h->folders;
+            if (!h->folders.empty() && !h->files.empty())
+                o += ",";
+            o += h->files + "],\"more\":";
+            o += h->more || h->found >= limit ? "true}" : "false}";
+            app_reply(cc, 200, std::move(o), "application/json");
+            return;
+        }
+        const std::string bucket = h->buckets[h->at++];
+        app_list(bucket, list_query{}, [this, weak, h, fold, limit, bucket](st s, list_page p)
+        {
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            if (s == st::ok)
+            {
+                h->more = h->more || p.truncated;
+                for (const list_entry& e : p.objects)
+                {
+                    if (h->found >= limit)
+                        break;
+                    // Each folder on the way to the key, once, where its own name holds the text.
+                    size_t from = 0;
+                    for (size_t slash = e.key.find('/'); slash != std::string::npos; slash = e.key.find('/', from))
+                    {
+                        const std::string_view name = std::string_view(e.key).substr(from, slash - from);
+                        const std::string folder = bucket + "/" + e.key.substr(0, slash + 1);
+                        if (fold(name).find(h->q) != std::string::npos && h->seen.insert(folder).second && h->found < limit)
+                        {
+                            h->folders += h->folders.empty() ? "{\"bucket\":" : ",{\"bucket\":";
+                            jstr(h->folders, bucket);
+                            h->folders += ",\"key\":";
+                            jstr(h->folders, e.key.substr(0, slash + 1));
+                            h->folders += ",\"dir\":true}";
+                            ++h->found;
+                        }
+                        from = slash + 1;
+                    }
+                    const std::string_view name = std::string_view(e.key).substr(from);
+                    if (name.empty() || fold(name).find(h->q) == std::string::npos || !app_allowed(cc, "GET", bucket, e.key))
+                        continue;
+                    h->files += h->files.empty() ? "{\"bucket\":" : ",{\"bucket\":";
+                    jstr(h->files, bucket);
+                    h->files += ",\"key\":";
+                    jstr(h->files, e.key);
+                    h->files += ",\"size\":" + std::to_string(e.meta.size) + ",\"modified\":" + std::to_string(e.meta.mtime_ms) +
+                                ",\"type\":";
+                    jstr(h->files, e.meta.content_type.str());
+                    h->files += "}";
+                    ++h->found;
+                }
+            }
+            h->step();
+        });
+    };
+    h->step();
 }
 
 }   // namespace socketley::storage

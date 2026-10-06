@@ -21,6 +21,8 @@
 #     giving what its reader may not read
 #   * a user's watch positions seen by another user, kept for what the user
 #     may not read, or shown after the film was replaced
+#   * a search missing a file or folder by part of its name in any case,
+#     or finding one the user may not list
 #   * a library shared with a user not listed or not readable by them, giving
 #     more than it says, shared by one who may not, or its policy's other
 #     statements lost when it is shared or unshared
@@ -256,6 +258,13 @@ check "a film replaced since is no longer listed" \
       "$(curl -s -b "skl_ui=$ck" "$U/~ui/progress" | python3 -c 'import json,sys; print([x["key"] for x in json.load(sys.stdin)])')" "['huge.bin']"
 check "a position below 0 forgets one" "$(pos '{"bucket":"docs","key":"huge.bin","t":-1,"d":3600}') $(curl -s -b "skl_ui=$ck" "$U/~ui/progress")" "204 []"
 s3 -o /dev/null -X DELETE "$U/docs/cookie.txt"
+
+# Searching every library.
+srch() { curl -s -u "$1" "$U/~ui/search?q=$2" | python3 -c 'import json,sys; print(sorted((x["bucket"], x["key"]) for x in json.load(sys.stdin)["results"]))'; }
+check "a search finds a file by part of its name, in any case" "$(srch "$A" ONE.T)" "[('docs', 'a/one.txt')]"
+check "and a folder by its own name" "$(srch "$A" sub)" "[('docs', 'a/sub/')]"
+check "a search of another user finds nothing of the first's" "$(srch "$B" one)" "[]"
+check "one character is not a search" "$(code -u "$A" "$U/~ui/search?q=o")" 400
 
 # A library shared with another user, as statements of its policy.
 acc() { curl -s -u "$1" -o /dev/null -w '%{http_code}' -X POST -d "{\"bucket\":\"docs\",\"user\":\"$2\",\"access\":\"$3\"}" "$U/~ui/access"; }

@@ -873,6 +873,8 @@ public:
     // Whether the request's user may do `method` to `bucket`/`key` as S3 would judge it.
     bool app_allowed(const std::shared_ptr<conn>& c, std::string_view method, std::string_view bucket,
                      std::string_view key, std::string_view query = {});
+    // Whether the user lists bucket `b` among its own: one it owns, one a policy lets it list, every one for an admin.
+    bool lists_bucket(const std::shared_ptr<conn>& c, const bucket_info& b);
     // Every page of a listing as one, up to the bound an application lists to.
     void app_list(std::string bucket, list_query q, std::function<void(st, list_page)> done);
     // HTTP Basic credentials, the web interface's session cookie, or none on a runtime that takes none; false after
@@ -897,6 +899,8 @@ public:
     void ui_progress_body(const std::shared_ptr<conn>& c);
     // Who else a library is shared with, /~ui/access, as statements of the bucket's policy.
     void ui_access(const std::shared_ptr<conn>& c);
+    // Files and folders whose name holds a text, in every library the user lists, /~ui/search.
+    void ui_search(const std::shared_ptr<conn>& c);
     void ui_access_body(const std::shared_ptr<conn>& c);
     void ui_body(const std::shared_ptr<conn>& c);
     void app_reply(const std::shared_ptr<conn>& c, int status, std::string body = {},
