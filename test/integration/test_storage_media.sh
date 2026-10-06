@@ -15,6 +15,7 @@
 #   * something that is no medium answered as one, or a cache past its size
 #   * a film's sound tracks or chapters, or a song's tags, missing from its info,
 #     or a stream asked for with another sound track carrying the first
+#   * a film's stills for a seek bar not a row of tiles, or offered for a song
 # suite: isolated
 set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -341,6 +342,13 @@ code -u "$A" -T "$T/song.mp3" "$U/~dav/films/song.mp3" >/dev/null; code -u "$A" 
 tags() { curl -s -u "$A" "$U/~media/info/films/$1" | python3 -c 'import json,sys; t=json.load(sys.stdin)["tags"]; print(t["title"], "|", t["artist"], "|", t["album"], "|", t["album_artist"], "|", t["track"], t["disc"], "|", t["date"], "|", t["genre"])'; }
 check "info gives a song's tags" "$(tags song.mp3)" "First Song | The Band | A Record | The Band | 3 0 | 2019 | Rock"
 check "Vorbis comments too, kept on the sound" "$(tags song.opus)" "Second Song | Other | B Sides |  | 7 2 |  | "
+
+# A film's stills for a seek bar, tiled in one JPEG.
+check "info says how its stills are laid out" \
+      "$(curl -s -u "$A" "$U/~media/info/films/clip.mp4" | python3 -c 'import json,sys; t=json.load(sys.stdin)["trick"]; print(t["every"], t["count"], t["columns"], t["width"], t["height"])')" "2 5 10 160 90"
+check "the stills are a JPEG" "$(get "$T/trick.jpg" -u "$A" "$U/~media/trick/films/clip.mp4") $(head -c 3 "$T/trick.jpg" | od -An -tx1 | tr -d ' ')" "200 ffd8ff"
+check "a row of ten tiles" "$(width "$T/trick.jpg")x$(height "$T/trick.jpg")" 1600x90
+check "and a song has none" "$(code -u "$A" "$U/~media/trick/films/song.mp3") $(curl -s -u "$A" "$U/~media/info/films/song.mp3" | grep -c '"trick"')" "415 0"
 
 # A copied HEVC stream is tagged hvc1, as Apple's players take it.
 get "$T/hvc.mp4" -u "$A" "$U/~media/hls-copy/films/hdr.mp4/index.m3u8" >/dev/null

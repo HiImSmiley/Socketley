@@ -62,6 +62,8 @@ enum media_kind : uint8_t
     k_sub,
     // A second of video through the GPU's encoder, to learn whether renditions can be made there.
     k_hwtest,
+    // Small stills through the film, tiled in one JPEG, that a seek bar shows where it would seek to.
+    k_trick,
 };
 
 // Thumbnails queue behind a few at a time; a stream is someone waiting to watch, and never waits for another's film.
@@ -74,6 +76,10 @@ constexpr int64_t media_tick_ms    = 100;
 constexpr int64_t media_wait_tick_ms = 20;
 constexpr int64_t media_wait_ms    = 60000;
 constexpr int64_t thumb_job_ms     = 60000;
+// A film's stills are read from its keyframes alone, which still reads the whole file.
+constexpr int64_t trick_job_ms     = 600000;
+// The stills: 160x90, ten a row, one every two seconds or more, two hundred at most.
+constexpr int64_t trick_w = 160, trick_h = 90, trick_cols = 10, trick_max = 200;
 // A stream nobody has asked for in this long is let go; what it made is kept.
 constexpr int64_t hls_idle_ms      = 600000;
 // A failure is answered as one for this long, and tried again after.
@@ -587,6 +593,17 @@ std::string master_text(const media_probe& p, std::string_view source, std::stri
     return m;
 }
 
+// The seconds between a film's stills, and how many there are.
+int64_t trick_every(const media_probe& p)
+{
+    return std::max<int64_t>(2, static_cast<int64_t>(std::ceil(p.duration / trick_max)));
+}
+
+int64_t trick_count(const media_probe& p)
+{
+    return std::max<int64_t>(1, static_cast<int64_t>(std::ceil(p.duration / static_cast<double>(trick_every(p)))));
+}
+
 void json_str(std::string& o, std::string_view v)
 {
     o += '"';
@@ -684,7 +701,12 @@ std::string info_text(const media_probe& p, std::string_view version)
         json_str(o, *value);
         o += ',';
     }
-    o += "\"track\":" + std::to_string(p.track) + ",\"disc\":" + std::to_string(p.disc) + "}}";
+    o += "\"track\":" + std::to_string(p.track) + ",\"disc\":" + std::to_string(p.disc) + "}";
+    if (!p.vcodec.empty() && p.duration > 0)
+        o += ",\"trick\":{\"every\":" + std::to_string(trick_every(p)) + ",\"count\":" + std::to_string(trick_count(p)) +
+             ",\"columns\":" + std::to_string(trick_cols) + ",\"width\":" + std::to_string(trick_w) +
+             ",\"height\":" + std::to_string(trick_h) + "}";
+    o += "}";
     return o;
 }
 
@@ -896,6 +918,11 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         w.kind = k_info;
         w.file = "info";
     }
+    else if (variant == "trick")
+    {
+        w.kind = k_trick;
+        w.file = "trick.jpg";
+    }
     else if (stream == "hls" && file == "master.m3u8")
     {
         w.kind = k_master;
@@ -918,7 +945,7 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
     {
         app_reply(c, 404, "No such medium: thumb-<width>/<object>, info/<object>, hls/<object>/master.m3u8, "
                           "hls-<height>|hls-copy/<object>/index.m3u8 and its segments, each with -a<track> for another sound track, "
-                          "or sub-<stream>/<object>/subs.vtt.\n");
+                          "sub-<stream>/<object>/subs.vtt, or trick/<object>.\n");
         return;
     }
     w.source.assign(source);
@@ -1246,7 +1273,7 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
 {
     struct stat sb{};
     // A file of a medium made whole is served as it is, without the probe it was made from.
-    if (w.kind == k_thumb || w.kind == k_copy || (w.kind == k_sub && w.file == "subs.vtt") ||
+    if (w.kind == k_thumb || w.kind == k_trick || w.kind == k_copy || (w.kind == k_sub && w.file == "subs.vtt") ||
         (w.kind == k_rendition && w.file != "index.m3u8"))
     {
         const bool done = m_media_done.contains(w.dir) || ::stat((w.dir + "/done").c_str(), &sb) == 0;
@@ -1364,6 +1391,11 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
             return true;
         }
     }
+    if (w.kind == k_trick && (p->vcodec.empty() || p->duration <= 0))
+    {
+        app_reply(c, 415, "This object has no film to take stills of.\n");
+        return true;
+    }
 
     // A thumbnail, a subtitle track and a copied stream: one job each, made whole, kept.
     const bool done = m_media_done.contains(w.dir) || ::stat((w.dir + "/done").c_str(), &sb) == 0;
@@ -1390,11 +1422,13 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
     // Whoever holds the lock is making it, here or on another shard, and a request for it keeps it wanted.
     media_touch(w.dir);
     const bool stream = w.kind == k_copy;
-    // The GPU's test run is no client's job, so it holds no place a thumbnail or a probe waits for.
+    // The GPU's test run is no client's job, so it holds no place a thumbnail or a probe waits for; a film's stills,
+    // which take minutes, have a place of their own, so thumbnails never wait behind them.
     const auto same_kind = std::ranges::count_if(m_media_jobs, [&](const media_job& j) {
-        return j.want.kind != k_hwtest && (j.want.kind == k_copy || j.want.kind == k_rendition) == stream;
+        return j.want.kind != k_hwtest && (j.want.kind == k_trick) == (w.kind == k_trick) &&
+               (j.want.kind == k_copy || j.want.kind == k_rendition) == stream;
     });
-    if (same_kind >= (stream ? streams_max() : thumb_jobs_max))
+    if (same_kind >= (stream ? streams_max() : w.kind == k_trick ? 1 : thumb_jobs_max))
         return false;
     if (::mkdir(w.dir.c_str(), 0700) < 0 && errno != EEXIST)
     {
@@ -1419,8 +1453,8 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
         ::close(lock_fd);
         return media_try(c, w);
     }
-    // A film's still is a few seconds in, past a black first frame.
-    if (!media_start(w, lock_fd, w.kind == k_thumb && !w.image ? 1 : 0))
+    // A film's still is a few seconds in, past a black first frame, and its seek bar's stills are from its keyframes.
+    if (!media_start(w, lock_fd, (w.kind == k_thumb && !w.image) || w.kind == k_trick ? 1 : 0))
     {
         ::close(lock_fd);
         app_reply(c, 500, "ffmpeg could not be started.\n");
@@ -1608,7 +1642,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
     std::string out_file;
     media_job j;
     std::shared_ptr<const media_probe> pp;
-    if (w.kind == k_copy || w.kind == k_rendition)
+    if (w.kind == k_copy || w.kind == k_rendition || w.kind == k_trick)
     {
         pp = media_probe_of(w.probe_dir);
         if (!pp)
@@ -1641,6 +1675,24 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             args.insert(args.end(), {"-frames:v", "1", "-vf", "scale='min(" + std::to_string(n) + ",iw)':-2", "-q:v", "4",
                                      w.dir + "/thumb.jpg"});
             j.seeked = from > 0;
+            break;
+        }
+        case k_trick:
+        {
+            const int64_t rows = (trick_count(*pp) + trick_cols) / trick_cols;
+            clear_dir(w.dir, true);
+            // Keyframes only are decoded first, and every frame when that gives no picture, as for a film of one keyframe;
+            // a still is taken every so many seconds, fitted into its tile and tiled.
+            if (from > 0)
+                args.insert(args.end(), {"-skip_frame", "nokey"});
+            j.seeked = from > 0;
+            args.insert(args.end(), input.begin(), input.end());
+            args.insert(args.end(), {"-map", "0:v:0", "-an", "-sn", "-vf",
+                                     "fps=1/" + std::to_string(trick_every(*pp)) + ",scale=" + std::to_string(trick_w) + ":" +
+                                     std::to_string(trick_h) + ":force_original_aspect_ratio=decrease,pad=" +
+                                     std::to_string(trick_w) + ":" + std::to_string(trick_h) + ":(ow-iw)/2:(oh-ih)/2,tile=" +
+                                     std::to_string(trick_cols) + "x" + std::to_string(rows),
+                                     "-frames:v", "1", "-q:v", "5", w.dir + "/trick.jpg"});
             break;
         }
         case k_probe:
@@ -1957,7 +2009,7 @@ void storage_run::media_tick()
         if (r == 0)
         {
             const bool idle = j.want.kind == k_copy && ::fstat(j.lock_fd, &sb) == 0 && now - mtime_ms(sb) > hls_idle_ms;
-            if (!idle && (j.want.kind == k_copy || now - j.started_ms <= thumb_job_ms))
+            if (!idle && (j.want.kind == k_copy || now - j.started_ms <= (j.want.kind == k_trick ? trick_job_ms : thumb_job_ms)))
             {
                 ++i;
                 continue;
@@ -1994,10 +2046,13 @@ void storage_run::media_tick()
             }
             else
             {
-                const std::string out = j.want.dir + (j.want.kind == k_copy ? "/index.m3u8" : "/thumb.jpg");
+                const std::string out = j.want.dir + (j.want.kind == k_copy    ? "/index.m3u8"
+                                                    : j.want.kind == k_trick ? "/trick.jpg"
+                                                                             : "/thumb.jpg");
                 ok = ok && ::stat(out.c_str(), &sb) == 0 && sb.st_size > 0;
             }
-            // A still a few seconds in that the film is too short for is taken from its start.
+            // A still a few seconds in that the film is too short for is taken from its start, and stills its keyframes
+            // did not give are taken from every frame.
             if (!ok && j.seeked)
             {
                 const media_want w = j.want;

@@ -9718,6 +9718,13 @@ subtitles, every sound track with its codec, channels, language, title and
 whether it is the default, its chapters with their start, end and title, and a
 song's tags (title, artist, album, album artist, track, disc, date, genre), the
 container's or, for a file without a picture, its sound's as Ogg keeps them.
+.B trick
+is a film's stills for a seek bar, one JPEG of 160x90 tiles, ten a row, one
+every two seconds or every 1/200 of the film if that is longer; info's
+.B trick
+says the seconds between them, their count and their layout. They are taken
+from the keyframes alone, and from every frame when the keyframes give none, in
+a place of their own beside the thumbnails, one at a time a shard.
 .BI sub\- stream /subs.vtt
 is a text subtitle stream (SubRip, ASS, mov_text, WebVTT) as WebVTT, on the film's
 clock, and
