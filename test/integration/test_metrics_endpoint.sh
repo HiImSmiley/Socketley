@@ -50,13 +50,14 @@ unset SOCKETLEY_CONFIG
 MPORT=$((SL_PORT_BASE+340))
 S1=$((SL_PORT_BASE+341))
 S2=$((SL_PORT_BASE+342))
+S3=$((SL_PORT_BASE+343))
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); }
 bad() { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); echo "  FAIL [$1]: $2"; }
 
 cleanup() {
-    for r in m_one m_two; do
+    for r in m_one m_two m_shards; do
         "$BIN" stop "$r" >/dev/null 2>&1 || true
         "$BIN" remove "$r" >/dev/null 2>&1 || true
     done
@@ -157,6 +158,58 @@ else bad "stopping a runtime does not change the total" \
 DASH=$(get /)
 if grep -q "200 OK" <<<"$DASH" && grep -qi "html" <<<"$DASH"; then ok
 else bad "GET / serves the dashboard" "got: $(head -1 <<<"$DASH")"; fi
+
+# ── CPU and memory, of the processes they name ─────────────────────────────
+# Each runtime's figures are its own shards' and the overview's are those plus the daemon, so a reading is held
+# against /proc for the same processes: a figure taken from the wrong process, or from none, is a different number.
+create_ok "a sharded runtime" "$BIN" create cache m_shards -p "$S3" --shards 2 -s
+sleep 1.2
+USAGE=$(python3 - "$MPORT" "$SOCKETLEY_DPID" <<'PYEOF'
+import json, os, socket, sys
+port, daemon = int(sys.argv[1]), int(sys.argv[2])
+def fetch(path):
+    s = socket.create_connection(("127.0.0.1", port), 8); s.settimeout(8)
+    s.sendall(("GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" % path).encode())
+    out = b""
+    while True:
+        d = s.recv(65536)
+        if not d: break
+        out += d
+    return out.split(b"\r\n\r\n", 1)[1].decode()
+def children(pid):
+    out = []
+    for t in os.listdir("/proc/%d/task" % pid):
+        out += [int(c) for c in open("/proc/%d/task/%s/children" % (pid, t)).read().split()]
+    return out
+def cpu(pid):
+    f = open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()
+    return (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
+rts = {r["name"]: r for r in json.loads(fetch("/api/runtimes"))}
+ov = json.loads(fetch("/api/overview"))
+kids = children(daemon)
+print("one_processes=%s" % rts["m_one"]["processes"])
+print("shards_processes=%s" % rts["m_shards"]["processes"])
+print("stopped_processes=%s" % rts["m_two"]["processes"])
+print("rss_positive=%s" % (rts["m_one"]["rss_bytes"] > 0 and rts["m_shards"]["rss_bytes"] > rts["m_one"]["rss_bytes"] / 2))
+print("overview_processes=%s children=%d" % (ov["processes"], len(kids)))
+total = cpu(daemon) + sum(cpu(k) for k in kids)
+print("overview_cpu_close=%s" % (abs(ov["cpu_seconds"] - total) <= 0.05 + 0.02 * len(kids)))
+print("cpus=%s" % (ov["cpus"] == os.cpu_count()))
+PYEOF
+)
+echo "  usage: $(echo "$USAGE" | tr '\n' ' ')"
+case "$USAGE" in *"one_processes=1"*) ok ;; *) bad "a runtime counts its one process" "$USAGE" ;; esac
+case "$USAGE" in *"shards_processes=2"*) ok ;; *) bad "a runtime of two shards counts two processes" "$USAGE" ;; esac
+case "$USAGE" in *"stopped_processes=0"*) ok ;; *) bad "a stopped runtime counts none" "$USAGE" ;; esac
+case "$USAGE" in *"rss_positive=True"*) ok ;; *) bad "a running runtime's resident memory is read" "$USAGE" ;; esac
+case "$USAGE" in *"overview_processes=4 children=3"*) ok ;; *) bad "the overview counts the daemon and every shard" "$USAGE" ;; esac
+case "$USAGE" in *"overview_cpu_close=True"*) ok ;; *) bad "the overview's CPU time is that of the daemon and its children" "$USAGE" ;; esac
+case "$USAGE" in *"cpus=True"*) ok ;; *) bad "the overview names the CPUs online" "$USAGE" ;; esac
+if [ -n "$(metric 'socketley_runtime_cpu_seconds_total{name="m_shards"}')" ] \
+   && [ "$(metric 'socketley_runtime_resident_memory_bytes{name="m_shards"}')" -gt 0 ] 2>/dev/null; then ok
+else bad "CPU time and resident memory are Prometheus series" "$(get /metrics | grep -E 'cpu_seconds|resident' | head -4)"; fi
+if grep -q 'id="cpu"' <<<"$DASH" && grep -q 'id="mem"' <<<"$DASH"; then ok
+else bad "the dashboard shows CPU and memory" "no cpu or mem card in the page"; fi
 
 # ── Three endpoints, one cache ─────────────────────────────────────────────
 # /metrics, /api/overview and /api/runtimes share m_cached_* and one

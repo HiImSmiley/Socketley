@@ -398,6 +398,61 @@ static void json_append_uint(std::string& out, uint64_t v)
     out.append(buf, end - buf);
 }
 
+// CPU time and resident memory of a set of processes, read from /proc, as the shards of a runtime or the whole daemon.
+struct process_usage
+{
+    double   cpu_seconds{0};
+    uint64_t rss_bytes{0};
+    uint32_t processes{0};
+};
+
+static void add_process_usage(pid_t pid, process_usage& u)
+{
+    char path[48];
+    std::snprintf(path, sizeof path, "/proc/%d/stat", static_cast<int>(pid));
+    FILE* f = std::fopen(path, "re");
+    if (!f)
+        return;
+    char buf[1024];
+    const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+    std::fclose(f);
+    buf[n] = '\0';
+    // The command name may hold spaces and parentheses, so the fields are counted from its last closing parenthesis.
+    const char* p = std::strrchr(buf, ')');
+    if (!p)
+        return;
+    unsigned long long utime = 0, stime = 0;
+    long long rss_pages = 0;
+    if (std::sscanf(p + 1, " %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %llu %llu %*s %*s %*s %*s %*s %*s %*s %*s %lld",
+                    &utime, &stime, &rss_pages) != 3)
+        return;
+    static const long tick = ::sysconf(_SC_CLK_TCK);
+    static const long page = ::sysconf(_SC_PAGESIZE);
+    u.cpu_seconds += static_cast<double>(utime + stime) / static_cast<double>(tick > 0 ? tick : 100);
+    u.rss_bytes += rss_pages > 0 ? static_cast<uint64_t>(rss_pages) * static_cast<uint64_t>(page > 0 ? page : 4096) : 0;
+    ++u.processes;
+}
+
+static process_usage usage_of(const std::vector<pid_t>& pids)
+{
+    process_usage u;
+    for (const pid_t pid : pids)
+        add_process_usage(pid, u);
+    return u;
+}
+
+static void append_usage_json(std::string& out, const process_usage& u)
+{
+    char buf[48];
+    std::snprintf(buf, sizeof buf, "%.2f", u.cpu_seconds);
+    out += ",\"cpu_seconds\":";
+    out += buf;
+    out += ",\"rss_bytes\":";
+    json_append_uint(out, u.rss_bytes);
+    out += ",\"processes\":";
+    json_append_uint(out, u.processes);
+}
+
 // One storage runtime's `stats` text as figures: the lines are `key:value`, and
 // the ones that are not numbers are left out.
 struct storage_row
@@ -644,6 +699,7 @@ std::string metrics_endpoint::build_metrics() const
         // What the worker last published, kept for the types whose own
         // counters are series of their own.
         std::string detail;
+        std::vector<pid_t> pids;
     };
     std::vector<runtime_snapshot> snapshots;
     {
@@ -663,7 +719,8 @@ std::string metrics_endpoint::build_metrics() const
                 f.bytes_in,
                 f.bytes_out,
                 static_cast<size_t>(f.active_connections),
-                rt->get_type() == runtime_storage ? rt->stat_detail_snapshot() : std::string{}});
+                rt->get_type() == runtime_storage ? rt->stat_detail_snapshot() : std::string{},
+                rt->shard_pids()});
         }
     }
 
@@ -819,6 +876,33 @@ std::string metrics_endpoint::build_metrics() const
         out += "\n";
     }
 
+    out += "\n# HELP socketley_runtime_cpu_seconds_total CPU time of a runtime's processes, user and system.\n"
+           "# TYPE socketley_runtime_cpu_seconds_total counter\n";
+    std::vector<process_usage> usages;
+    usages.reserve(snapshots.size());
+    for (const auto& s : snapshots)
+    {
+        usages.push_back(usage_of(s.pids));
+        char buf[48];
+        std::snprintf(buf, sizeof buf, "%.2f", usages.back().cpu_seconds);
+        out += "socketley_runtime_cpu_seconds_total{name=\"";
+        label_escape_into(out, s.name);
+        out += "\"} ";
+        out += buf;
+        out += "\n";
+    }
+    out += "\n# HELP socketley_runtime_resident_memory_bytes Resident memory of a runtime's processes.\n"
+           "# TYPE socketley_runtime_resident_memory_bytes gauge\n";
+    for (size_t i = 0; i < snapshots.size(); ++i)
+    {
+        out += "socketley_runtime_resident_memory_bytes{name=\"";
+        label_escape_into(out, snapshots[i].name);
+        out += "\"} ";
+        json_append_uint(out, usages[i].rss_bytes);
+        out += "\n";
+    }
+    out += "\n";
+
     std::vector<storage_row> storage_rows;
     for (const auto& s : snapshots)
         if (s.type == runtime_storage && s.state == runtime_running && !s.detail.empty())
@@ -848,12 +932,15 @@ std::string metrics_endpoint::build_json_overview() const
     uint64_t active_connections = 0;
     int running_count = 0;
     size_t runtimes_total = 0;
+    std::vector<pid_t> pids{::getpid()};
     {
         std::shared_lock lock(m_manager.mutex);
         const auto& runtimes = m_manager.list();
         runtimes_total = runtimes.size();
         for (const auto& [name, rt] : runtimes)
         {
+            for (const pid_t pid : rt->shard_pids())
+                pids.push_back(pid);
             // Published, not live, and for a runtime in a worker summed out of
             // its shared table at this instant.
             const shard_stats::figures f = rt->worker_figures();
@@ -887,6 +974,10 @@ std::string metrics_endpoint::build_json_overview() const
     json_append_uint(j, total_bytes_in);
     j += ",\"bytes_out\":";
     json_append_uint(j, total_bytes_out);
+    // The daemon and every runtime's processes, with the CPUs online so that a reader can say what share of the host it is.
+    append_usage_json(j, usage_of(pids));
+    j += ",\"cpus\":";
+    json_append_uint(j, static_cast<uint64_t>(std::max(1L, ::sysconf(_SC_NPROCESSORS_ONLN))));
     j += "}";
     return j;
 }
@@ -901,6 +992,7 @@ std::string metrics_endpoint::build_json_runtimes() const
         uint16_t port;
         uint64_t total_connections, total_messages, bytes_in, bytes_out;
         size_t active_connections;
+        std::vector<pid_t> pids;
     };
     std::vector<runtimes_snapshot> snapshots;
     {
@@ -920,7 +1012,8 @@ std::string metrics_endpoint::build_json_runtimes() const
                 f.total_messages,
                 f.bytes_in,
                 f.bytes_out,
-                static_cast<size_t>(f.active_connections)});
+                static_cast<size_t>(f.active_connections),
+                rt->shard_pids()});
         }
     }
 
@@ -952,6 +1045,7 @@ std::string metrics_endpoint::build_json_runtimes() const
         json_append_uint(j, s.bytes_in);
         j += ",\"bytes_out\":";
         json_append_uint(j, s.bytes_out);
+        append_usage_json(j, usage_of(s.pids));
         j += "}";
     }
 
@@ -992,6 +1086,7 @@ std::string metrics_endpoint::build_json_runtime(std::string_view name) const
     json_append_uint(j, f.bytes_in);
     j += ",\"bytes_out\":";
     json_append_uint(j, f.bytes_out);
+    append_usage_json(j, usage_of(rt->shard_pids()));
 
     // The published text, because get_stats() is overridden per type and every
     // override reads a container the event loop rewrites underneath this

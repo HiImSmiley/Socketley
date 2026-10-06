@@ -661,6 +661,7 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     if (m_placeholder)
     {
         m_placeholder->set_pid(child);
+        m_placeholder->set_shard_pid(m_shard_index, child);
 
         // Forked and not listening, lowered on every spawn and not only the
         // first, because a child being replaced re-enters exactly this window.
@@ -954,7 +955,10 @@ void proxy_supervisor::shutdown()
         // The placeholder stops naming a process the moment this supervisor
         // stops owning one, whether or not the reap succeeded.
         if (m_placeholder)
+        {
             m_placeholder->set_pid(0);
+            m_placeholder->set_shard_pid(m_shard_index, 0);
+        }
     }
     close_control();
 }
@@ -1564,7 +1568,10 @@ bool proxy_supervisor::check_liveness()
     // that has been reaped is worse than no pid at all — it is a number the
     // operator will go and look at, and by then it can belong to anything.
     if (m_placeholder)
+    {
         m_placeholder->set_pid(0);
+        m_placeholder->set_shard_pid(m_shard_index, 0);
+    }
     close_control();
     m_in.clear();
 

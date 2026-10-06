@@ -936,6 +936,19 @@ void runtime_instance::mark_external() { m_external = true; m_out_of_process = f
 bool runtime_instance::is_external() const { return m_external; }
 void runtime_instance::set_pid(pid_t pid) { m_pid = pid; }
 pid_t runtime_instance::get_pid() const { return m_pid; }
+void runtime_instance::set_shard_pid(uint32_t shard, pid_t pid)
+{
+    if (shard < m_shard_pids.size())
+        m_shard_pids[shard].store(pid, std::memory_order_relaxed);
+}
+std::vector<pid_t> runtime_instance::shard_pids() const
+{
+    std::vector<pid_t> out;
+    for (const auto& p : m_shard_pids)
+        if (const pid_t v = p.load(std::memory_order_relaxed); v > 0)
+            out.push_back(v);
+    return out;
+}
 void runtime_instance::mark_managed(std::string exec_path) { m_managed = true; mark_external(); m_exec_path = std::move(exec_path); }
 bool runtime_instance::is_managed() const { return m_managed; }
 std::string_view runtime_instance::get_exec_path() const { return m_exec_path; }

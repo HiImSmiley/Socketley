@@ -12,7 +12,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 header{background:#1e293b;padding:16px 24px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #334155}
 header h1{font-size:20px;font-weight:600;color:#38bdf8}
 header .meta{font-size:13px;color:#94a3b8}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;padding:24px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;padding:24px}
 .card{background:#1e293b;border-radius:8px;padding:20px;border:1px solid #334155}
 .card .label{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#94a3b8;margin-bottom:8px}
 .card .value{font-size:28px;font-weight:700;color:#f1f5f9}
@@ -41,16 +41,20 @@ h2{padding:0 24px;font-size:16px;font-weight:600;color:#cbd5e1;margin-bottom:12p
  <div class="card"><div class="label">Connections</div><div class="value" id="conn-active">-</div><div class="sub"><span id="conn-total">-</span> total</div></div>
  <div class="card"><div class="label">Messages</div><div class="value" id="msg-total">-</div><div class="sub" id="msg-rate">-</div></div>
  <div class="card"><div class="label">Throughput</div><div class="value" id="bytes-rate">-</div><div class="sub"><span id="bytes-in">-</span> in / <span id="bytes-out">-</span> out</div></div>
+ <div class="card"><div class="label">CPU</div><div class="value" id="cpu">-</div><div class="sub" id="cpu-sub">-</div></div>
+ <div class="card"><div class="label">Memory</div><div class="value" id="mem">-</div><div class="sub" id="mem-sub">-</div></div>
 </div>
 <h2>Runtimes</h2>
 <table>
- <thead><tr><th>Name</th><th>Type</th><th>State</th><th>Port</th><th>Connections</th><th>Messages</th><th>Bytes In</th><th>Bytes Out</th></tr></thead>
+ <thead><tr><th>Name</th><th>Type</th><th>State</th><th>Port</th><th>Connections</th><th>Messages</th><th>Bytes In</th><th>Bytes Out</th><th>CPU</th><th>Memory</th></tr></thead>
  <tbody id="rt-body"></tbody>
 </table>
 <script>
-let prevMsg=0,prevBytes=0,prevTime=0;
+let prevMsg=0,prevBytes=0,prevTime=0,prevCpu=0,prevRt={};
 function fmt(n){if(n>=1e9)return(n/1e9).toFixed(1)+'G';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return n.toString()}
 function fmtB(n){if(n>=1e9)return(n/1e9).toFixed(2)+' GB';if(n>=1e6)return(n/1e6).toFixed(2)+' MB';if(n>=1e3)return(n/1e3).toFixed(2)+' KB';return n+' B'}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>'&#'+c.charCodeAt(0)+';')}
+function pct(p){return p>=10?p.toFixed(0)+'%':p.toFixed(1)+'%'}
 function fmtUp(s){let d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return(d?d+'d ':'')+(h?h+'h ':'')+(m?m+'m ':'')+Math.floor(s%60)+'s'}
 
 async function refresh(){
@@ -71,19 +75,29 @@ async function refresh(){
    let br=((ov.bytes_in+ov.bytes_out)-(prevBytes))/dt;
    document.getElementById('msg-rate').textContent=fmt(Math.round(mr))+'/s';
    document.getElementById('bytes-rate').textContent=fmtB(Math.round(br))+'/s';
+   let core=(ov.cpu_seconds-prevCpu)/dt*100;
+   document.getElementById('cpu').textContent=pct(core/ov.cpus);
+   document.getElementById('cpu-sub').textContent=pct(core)+' of one core, '+ov.cpus+' CPUs';
   }
-  prevMsg=ov.messages_total;prevBytes=ov.bytes_in+ov.bytes_out;prevTime=now;
+  prevMsg=ov.messages_total;prevBytes=ov.bytes_in+ov.bytes_out;prevCpu=ov.cpu_seconds;
+  document.getElementById('mem').textContent=fmtB(ov.rss_bytes);
+  document.getElementById('mem-sub').textContent=ov.processes+' processes';
   document.getElementById('bytes-in').textContent=fmtB(ov.bytes_in);
   document.getElementById('bytes-out').textContent=fmtB(ov.bytes_out);
 
-  let html='';
+  let html='',rt={};
   for(let r of rts){
+   let cpu='-';
+   if(prevRt[r.name]!==undefined&&prevTime>0)cpu=pct((r.cpu_seconds-prevRt[r.name])/(now-prevTime)*100);
+   rt[r.name]=r.cpu_seconds;
    let sc=r.state==='running'?'running':r.state==='created'?'created':'stopped';
-   html+='<tr><td><strong>'+r.name+'</strong></td><td><span class="type-badge">'+r.type+'</span></td>'
+   html+='<tr><td><strong>'+esc(r.name)+'</strong></td><td><span class="type-badge">'+esc(r.type)+'</span></td>'
     +'<td><span class="state state-'+sc+'">'+r.state+'</span></td>'
     +'<td>'+(r.port||'-')+'</td><td>'+fmt(r.connections)+'</td>'
-    +'<td>'+fmt(r.messages_total)+'</td><td>'+fmtB(r.bytes_in)+'</td><td>'+fmtB(r.bytes_out)+'</td></tr>';
+    +'<td>'+fmt(r.messages_total)+'</td><td>'+fmtB(r.bytes_in)+'</td><td>'+fmtB(r.bytes_out)+'</td>'
+    +'<td>'+cpu+'</td><td>'+fmtB(r.rss_bytes)+'</td></tr>';
   }
+  prevRt=rt;prevTime=now;
   document.getElementById('rt-body').innerHTML=html;
  }catch(e){
   document.getElementById('error').style.display='block';

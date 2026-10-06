@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <string_view>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -479,6 +480,10 @@ public:
     bool is_external() const;
     void set_pid(pid_t pid);
     pid_t get_pid() const;
+
+    // The process each shard runs in, 0 where none does, kept for the metrics thread to read while the loop changes it.
+    void set_shard_pid(uint32_t shard, pid_t pid);
+    std::vector<pid_t> shard_pids() const;
 
     // Managed external — daemon owns fork+exec lifecycle
     void mark_managed(std::string exec_path);
@@ -1016,6 +1021,7 @@ private:
     bool m_endpoint_live{true};
     std::string m_exec_path;
     pid_t m_pid = 0;           // PID of external process (used by stop() to send SIGTERM)
+    std::array<std::atomic<pid_t>, max_shards> m_shard_pids{};
     child_policy m_child_policy = child_policy::stop;
 
     // Ring policy as requested, meaningful only when the matching _set flag is
