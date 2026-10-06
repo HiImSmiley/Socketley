@@ -94,7 +94,7 @@ change_origin storage_run::origin_of(const conn& c) const
     o.principal = c.user ? c.user->id : "anonymous";
     struct sockaddr_storage ss{};
     socklen_t len = sizeof(ss);
-    if (::getpeername(c.fd, reinterpret_cast<struct sockaddr*>(&ss), &len) < 0)
+    if (::getpeername(c.sock(), reinterpret_cast<struct sockaddr*>(&ss), &len) < 0)
         return o;
     char host[INET6_ADDRSTRLEN] = {};
     if (ss.ss_family == AF_INET)

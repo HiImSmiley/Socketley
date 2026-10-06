@@ -137,6 +137,8 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
         m_hash.stop();
     }
     m_max_conns = m_owner.get_max_connections();
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_HTTP2"))
+        m_h2 = std::string_view(e) != "0";
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_SPLICE_MIN"))
     {
         char* end;
@@ -266,7 +268,10 @@ void storage_run::new_request_id(std::string& id)
 std::shared_ptr<conn> storage_run::find(uint64_t id)
 {
     auto it = m_conns.find(id);
-    return it == m_conns.end() ? nullptr : it->second;
+    if (it != m_conns.end())
+        return it->second;
+    auto st = m_streams.find(id);
+    return st == m_streams.end() ? nullptr : st->second;
 }
 
 // ─── The ring ───────────────────────────────────────────────────────────────
@@ -498,7 +503,8 @@ void storage_run::sweep()
     const auto now = std::chrono::steady_clock::now();
     const uint32_t idle = m_owner.get_idle_timeout();
     std::vector<std::shared_ptr<conn>> victims;
-    for (auto& [id, c] : m_conns)
+    std::vector<std::shared_ptr<conn>> sessions;
+    auto judge = [&](const std::shared_ptr<conn>& c)
     {
         const auto quiet = std::chrono::duration_cast<std::chrono::seconds>(now - c->last_progress).count();
         bool kill = false;
@@ -511,10 +517,14 @@ void storage_run::sweep()
                 ++m_c.tls_failures;
                 victims.push_back(c);
             }
-            continue;
+            return;
         }
         switch (c->ph)
         {
+            case phase::h2:
+                // Its streams are judged one by one; the connection only for a preface or an idle session.
+                sessions.push_back(c);
+                break;
             case phase::head:
                 // A head that never finishes, and a keep-alive connection left idle.
                 if (!c->in.empty())
@@ -538,12 +548,19 @@ void storage_run::sweep()
         }
         if (kill)
             victims.push_back(c);
-    }
+    };
+    for (auto& [id, c] : m_conns)
+        judge(c);
+    for (auto& [id, c] : m_streams)
+        judge(c);
     for (auto& c : victims)
     {
         ++m_c.timeouts;
         close_conn(c);
     }
+    for (auto& c : sessions)
+        if (!c->dead)
+            h2_sweep(c, now);
     // An upload sealed for an assembler on another shard that never said how it
     // ended is opened again after six hours.
     m_mpu.unseal_stale(static_cast<int64_t>(m_store.now_ms()) - 6ll * 3600 * 1000);
@@ -611,6 +628,10 @@ void storage_run::stop()
     std::vector<std::shared_ptr<conn>> all;
     for (auto& [id, c] : m_conns)
         all.push_back(c);
+    // An HTTP/2 client is told the connection ends, and which of its streams were taken, before it does.
+    for (auto& c : all)
+        if (c->h2)
+            h2_goaway(c, 0, true);
     for (auto& c : all)
         close_conn(c);
 
@@ -656,6 +677,27 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
         return;
     c->dead    = true;
     c->closing = true;
+    // A stream has no socket: what it held is let go and the session told, which resets it unless it ended.
+    if (c->h2s)
+    {
+        if (c->put)
+            c->put->abort();
+        c->dec.reset();
+        c->sel.reset();
+        zip_end(*c);
+        if (c->file_fd >= 0)
+        {
+            m_loop.close_fd(c->file_fd);
+            c->file_fd = -1;
+        }
+        c->after_write = conn::after_kind::none;
+        c->on_body     = false;
+        h2_stream_gone(c);
+        m_streams.erase(c->id);
+        return;
+    }
+    if (c->h2)
+        h2_parent_gone(c);
 
     // Aborted but not dropped: a receive may still be landing in its buffer.
     if (c->put)
@@ -791,6 +833,13 @@ void storage_run::cancel_read(const std::shared_ptr<conn>& c)
 
 void storage_run::arm_read(const std::shared_ptr<conn>& c)
 {
+    // A stream reads what its DATA frames brought, and the window it gives back is what lets more come.
+    if (c->h2s)
+    {
+        if (!c->dead)
+            h2_pull(c);
+        return;
+    }
     if (c->dead || c->fd < 0 || c->paced)
         return;
     // A body that trickles in is left to gather in the socket until the next tick, so a recv and a wakeup are not paid per segment.
@@ -1121,7 +1170,13 @@ void storage_run::plain_in(const std::shared_ptr<conn>& c, const char* p, size_t
 {
     switch (c->ph)
     {
+        case phase::h2:
+            h2_in(c, p, n);
+            return;
         case phase::head:
+            // A cleartext connection whose first bytes are HTTP/2's preface speaks it from there on.
+            if (m_h2 && !c->ssl && !c->any_request && h2_preface_in(c, p, n))
+                return;
             if (c->in.empty())
             {
                 c->request_began = c->last_progress;
@@ -1226,6 +1281,8 @@ void storage_run::tls_in(const std::shared_ptr<conn>& c, const char* data, size_
         }
         c->tls_state = tls_conn_ready;
         ++m_c.tls_handshakes;
+        if (m_h2 && tls_context::negotiated_h2(c->ssl))
+            h2_start(c);
         // The tickets a finished handshake owes go out now, and the first
         // request may already be in the same packet.
         pump_write(c);
@@ -1321,6 +1378,11 @@ void storage_run::queue_write(const std::shared_ptr<conn>& c, std::string data)
 {
     if (c->dead || data.empty())
         return;
+    if (c->h2s)
+    {
+        h2_stream_out(c, std::move(data));
+        return;
+    }
     if (c->ssl)
         c->wq += data;
     else if (c->wbuf.empty() && c->wq.empty())
@@ -1332,7 +1394,7 @@ void storage_run::queue_write(const std::shared_ptr<conn>& c, std::string data)
 
 void storage_run::pump_write(const std::shared_ptr<conn>& c)
 {
-    if (c->dead || c->wr_pending)
+    if (c->dead || c->wr_pending || c->h2s)
         return;
     if (c->woff >= c->wbuf.size())
     {
@@ -1384,6 +1446,11 @@ void storage_run::write_done(const std::shared_ptr<conn>& c, struct io_uring_cqe
     c->last_progress = std::chrono::steady_clock::now();
     runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(cqe->res));
     m_c.bytes_out += static_cast<uint64_t>(cqe->res);
+    if (c->h2)
+    {
+        h2_written(c);
+        return;
+    }
 
     if (c->woff < c->wbuf.size() || c->wq_off < c->wq.size() ||
         (c->ssl && tls_context::has_pending_out(c->ssl)))
@@ -1675,6 +1742,12 @@ void storage_run::finish_request(const std::shared_ptr<conn>& c)
 {
     if (c->dead)
         return;
+    // A stream is not reused: its answer ends it.
+    if (c->h2s)
+    {
+        h2_stream_end(c);
+        return;
+    }
     if (c->close_after_write)
     {
         close_conn(c);
@@ -1728,6 +1801,7 @@ bool storage_run::parse_head(const std::shared_ptr<conn>& c, std::string_view he
 {
     s3_request& r = c->req;
     r.reset();
+    c->any_request = true;
     new_request_id(r.request_id);
     r.head.assign(head);
 
@@ -2411,7 +2485,7 @@ void storage_run::send_file(const std::shared_ptr<conn>& c, response head, int f
     // A body worth the pipe goes file to socket in the kernel, and the rest is
     // read here and written from memory.
     // Not on a session: a splice moves bytes the record layer never sees.
-    c->spliced = !c->ssl && len >= m_zero_copy_min && pipe_acquire(*c);
+    c->spliced = !c->ssl && !c->h2s && len >= m_zero_copy_min && pipe_acquire(*c);
     if (c->spliced)
         ++m_c.zero_copy_gets;
     else

@@ -2592,7 +2592,10 @@ const PLAYERS = new Map();
 const playCh = 'BroadcastChannel' in window ? new BroadcastChannel('skl-play') : null;
 const tabId = Math.random().toString(36).slice(2);
 const othersWatching = () => { const now = Date.now(); for (const [k, t] of PLAYERS) if (now - t > 12000) PLAYERS.delete(k); return PLAYERS.size > 0; };
-const upSlots = () => UP.watching || othersWatching() ? 1 : UP.slots;
+// Over HTTP/2 every request shares one connection and none waits for a free one, so a player and uploads go side by
+// side and uploads keep all their places; the limit above is HTTP/1.1's.
+const overH2 = (() => { try { return (performance.getEntriesByType('navigation')[0] || {}).nextHopProtocol === 'h2'; } catch (e) { return false; } })();
+const upSlots = () => !overH2 && (UP.watching || othersWatching()) ? 1 : UP.slots;
 let playBeat = 0;
 if (playCh) playCh.onmessage = e => {
   const m = e.data || {};
@@ -2602,6 +2605,7 @@ if (playCh) playCh.onmessage = e => {
 // The requests past that one give way at once: each is ended and its part, or its file sent whole, is queued again;
 // the one furthest along goes on.
 function giveWay() {
+  if (overH2) return;
   const data = UP.jobs.flatMap(j => [...j.xhrs].filter(x => x._data)).sort((a, b) => (b._sent || 0) - (a._sent || 0));
   for (const x of data.slice(1)) { x._yield = true; x.abort(); }
 }

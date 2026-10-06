@@ -46,7 +46,7 @@ public:
         if (key == "aws:useragent")
             return header("user-agent");
         if (key == "aws:securetransport")
-            return out.emplace_back(m_c.ssl ? "true" : "false"), true;
+            return out.emplace_back(m_c.tls() ? "true" : "false"), true;
         if (key == "aws:currenttime")
             return out.emplace_back(iso8601(m_now_ms)), true;
         if (key == "aws:epochtime")
@@ -79,9 +79,9 @@ public:
         }
         if (key == "s3:tlsversion")
         {
-            if (!m_c.ssl)
+            if (!m_c.tls())
                 return false;
-            const int v = SSL_version(m_c.ssl);
+            const int v = SSL_version(m_c.tls());
             out.emplace_back(v == TLS1_3_VERSION ? "1.3" : v == TLS1_2_VERSION ? "1.2" : "1.1");
             return true;
         }
@@ -231,7 +231,7 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
             return;
         if (!c->ip_known)
         {
-            c->ip       = client_ip_of(c->fd);
+            c->ip       = client_ip_of(c->sock());
             c->ip_known = true;
         }
         const request_context ctx(*c, u, false, static_cast<int64_t>(m_store.now_ms()));
@@ -426,7 +426,7 @@ policy_effect storage_run::access_of(const std::shared_ptr<conn>& c, std::string
     {
         if (bound->needs_ip() && !c->ip_known)
         {
-            c->ip       = client_ip_of(c->fd);
+            c->ip       = client_ip_of(c->sock());
             c->ip_known = true;
         }
         // A session's policy bounds everything else: what it does not allow nothing else can.
@@ -454,7 +454,7 @@ policy_effect storage_run::access_of(const std::shared_ptr<conn>& c, std::string
     {
         if (p->needs_ip() && !c->ip_known)
         {
-            c->ip       = client_ip_of(c->fd);
+            c->ip       = client_ip_of(c->sock());
             c->ip_known = true;
         }
         pol = p->evaluate(q);
@@ -485,13 +485,13 @@ policy_effect storage_run::access_of(const std::shared_ptr<conn>& c, std::string
 
 bool storage_run::secure(conn& c)
 {
-    if (c.ssl)
+    if (c.tls())
         return true;
     if (m_tls_offloaded.empty())
         return false;
     if (!c.ip_known)
     {
-        c.ip       = client_ip_of(c.fd);
+        c.ip       = client_ip_of(c.sock());
         c.ip_known = true;
     }
     for (const bucket_policy::cidr& b : m_tls_offloaded)
@@ -505,7 +505,7 @@ policy_effect storage_run::iam_access(const std::shared_ptr<conn>& c, const user
 {
     if (!c->ip_known && ((u.has_policy && u.policy.needs_ip()) || (u.iam_policy && u.iam_policy->needs_ip())))
     {
-        c->ip       = client_ip_of(c->fd);
+        c->ip       = client_ip_of(c->sock());
         c->ip_known = true;
     }
     const request_context ctx(*c, &u, false, static_cast<int64_t>(m_store.now_ms()));

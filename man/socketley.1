@@ -9435,6 +9435,41 @@ threads 64 KiB at a time. A 1 MiB put sent in 1448\-byte segments at 0.8 MB/s,
 eight at once, took about 35 to 60 ms of worker CPU per MiB before and about 6
 to 9 after, against about 3 to 5 for the same put sent at loopback speed.
 .
+.SS HTTP/2
+A storage runtime speaks HTTP/2 (RFC 9113) besides HTTP/1.1: over
+.B \-\-tls
+to a client that offers \fBh2\fR by ALPN, as every browser does, and in the clear
+to one that opens with HTTP/2's preface (prior knowledge, as
+.B curl \-\-http2\-prior\-knowledge
+and a proxy's h2c backend speak it). Every request is a stream of the one
+connection and runs exactly as over HTTP/1.1, S3, WebDAV, the web interface,
+share links and media alike, so a browser's uploads, its player's segments and
+its pictures no longer wait for one of the six connections it opens to a server
+over HTTP/1.1. A stream's window is given back only as its body is taken, so a
+disk that cannot keep up holds the client as a full socket does; going out, a
+frame of each stream is sent in turn as the client's windows allow, a stream
+told its bytes left when they reach the connection's queue, which is kept
+under 256 KiB. This side reads by a window of 4 MiB a stream and 32 MiB a
+connection, 128 streams open at once (the next is refused with REFUSED_STREAM),
+header lists of up to 64 KiB, and frames of 16 KiB; a peer that resets more
+than 400 streams, sends more than 200 PINGs or SETTINGS or 1000 empty DATA
+frames in ten seconds, or a header block past 80 KiB or 64 CONTINUATIONs, is
+sent GOAWAY with ENHANCE_YOUR_CALM, as RFC 9113 and the rapid\-reset advisory
+(CVE\-2023\-44487) ask. A stream's file is read through the process rather than
+spliced, as over TLS. A connection with no stream open is let go after the idle
+timeout with GOAWAY, as is every one at a stop.
+.B stats
+counts
+.BR h2_conns ,
+.BR h2_streams ,
+.BR h2_refused ,
+.BR h2_resets_in ,
+.B h2_resets_out
+and
+.BR h2_goaways .
+.B SOCKETLEY_STORAGE_HTTP2=0
+turns it off, so every client speaks HTTP/1.1.
+.
 .SS Quotas
 A bucket's quota bounds the bytes its objects and versions hold and how many there
 are; it is socketley's own document, which S3 has no counterpart of:
@@ -9842,11 +9877,12 @@ else the object's); and pictures play as a slideshow. A ZIP's menu unpacks it be
 (\fB?unzip\fR above). It uploads several files at once,
 and a file of 48 MiB or more in parts of at least 16 MiB, four requests side by
 side shared among up to three files, each going to the file with the fewest on
-the way, through the drive's multipart above; while a film or a song plays in
-any of the browser's tabs (they tell each other on a BroadcastChannel),
-uploads keep one request, since a browser opens six connections at most to a
-server that speaks HTTP/1.1 as this one does, and take four again once it is
-closed, with each file's percentage, rate,
+the way, through the drive's multipart above; over HTTP/1.1, while a film or a
+song plays in any of the browser's tabs (they tell each other on a
+BroadcastChannel), uploads keep one request, since a browser opens six
+connections at most to such a server, and take four again once it is closed,
+while over HTTP/2 (see above) they keep all four beside the player, with each
+file's percentage, rate,
 time left and start; folders too, by dropping them or choosing one. A file in
 parts whose line is lost is paused and goes on when the line is back, and one a
 closed or reloaded page left is shown again, with how far it came, and goes on

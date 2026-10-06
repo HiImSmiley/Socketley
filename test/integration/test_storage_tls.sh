@@ -123,8 +123,9 @@ expect "a small object round-trips" "$(https "https://localhost:$P1/tlsbkt/small
 etag=$(https -D - -o /dev/null "https://localhost:$P1/tlsbkt/small" | tr -d '\r' | sed -n 's/^[Ee][Tt]ag: //p')
 expect "and carries the MD5 ETag" "$etag" "\"$(printf 'small over tls' | md5sum | cut -d' ' -f1)\""
 
-# Chunked upload over the session, the framing curl uses for a stream of unknown size.
-printf 'chunked body over tls' | https -X PUT -H 'Transfer-Encoding: chunked' --data-binary @- "https://localhost:$P1/tlsbkt/chunked" -o /dev/null
+# Chunked upload over the session, the framing curl uses for a stream of unknown size. HTTP/1.1's, which curl would
+# otherwise not speak here: offered h2 by ALPN, curl 8.5 drops the header and still writes the framing into DATA.
+printf 'chunked body over tls' | https --http1.1 -X PUT -H 'Transfer-Encoding: chunked' --data-binary @- "https://localhost:$P1/tlsbkt/chunked" -o /dev/null
 expect "a chunked upload over TLS is stored" "$(https "https://localhost:$P1/tlsbkt/chunked")" "chunked body over tls"
 
 # The worker publishes its figures when they change, so they are read until they

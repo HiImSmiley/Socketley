@@ -261,7 +261,7 @@ void storage_run::hook_request(const std::shared_ptr<conn>& c)
     req["principal"]   = c->principal;
     req["tls"]         = secure(*c);
     if (c->peer.empty())
-        c->peer = peer_of(c->fd);
+        c->peer = peer_of(c->sock());
     req["client"]      = c->peer;
     if (r.has_content_length)
         req["content_length"] = static_cast<double>(r.content_length);

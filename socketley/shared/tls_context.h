@@ -116,6 +116,10 @@ public:
 
     // Check if SSL needs to write (has pending encrypted output)
     static bool has_pending_out(SSL* ssl);
+    // Offers HTTP/2 by ALPN to a client that asks for "h2", HTTP/1.1 being what one that does not speaks; off unless a
+    // runtime that serves HTTP/2 turns it on. Whether a finished handshake chose it.
+    void enable_h2(bool on);
+    static bool negotiated_h2(SSL* ssl);
 
     // Free an SSL connection
     static void free_ssl(SSL* ssl);

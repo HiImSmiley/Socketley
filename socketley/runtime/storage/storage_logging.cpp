@@ -183,7 +183,7 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
     log_time(l, now_ms);
     if (!c->ip_known)
     {
-        c->ip       = client_ip_of(c->fd);
+        c->ip       = client_ip_of(c->sock());
         c->ip_known = true;
     }
     char ip[INET6_ADDRSTRLEN] = "-";
@@ -238,10 +238,10 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
                            r.header("authorization").starts_with("AWS ");
     const bool v2 = v2_query || r.header("authorization").starts_with("AWS ");
     plain(l, by_query || by_header ? (v2 ? "SigV2" : "SigV4") : "");
-    plain(l, c->ssl ? std::string_view(SSL_get_cipher_name(c->ssl)) : std::string_view{});
+    plain(l, c->tls() ? std::string_view(SSL_get_cipher_name(c->tls())) : std::string_view{});
     plain(l, by_header ? "AuthHeader" : by_query ? "QueryString" : "");
     plain(l, r.host);
-    plain(l, c->ssl ? std::string_view(SSL_get_version(c->ssl)) : std::string_view{});
+    plain(l, c->tls() ? std::string_view(SSL_get_version(c->tls())) : std::string_view{});
     // No access point, and whether an ACL's grant was what admitted the request.
     l += c->by_acl ? "- Yes\n" : "- -\n";
 

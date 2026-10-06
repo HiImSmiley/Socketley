@@ -95,6 +95,14 @@ struct storage_counters
     // TLS handshakes that completed and that did not.
     uint64_t tls_handshakes{0};
     uint64_t tls_failures{0};
+    // HTTP/2 connections and streams opened, streams refused for the concurrency limit, reset by the peer and by
+    // this side, and connections ended with GOAWAY.
+    uint64_t h2_conns{0};
+    uint64_t h2_streams{0};
+    uint64_t h2_refused{0};
+    uint64_t h2_resets_in{0};
+    uint64_t h2_resets_out{0};
+    uint64_t h2_goaways{0};
     // Receives that found the buffer ring empty and were taken by the connection's own buffer instead.
     uint64_t recv_fallbacks{0};
     // Recvs withdrawn, because the phase wanted a buffer of its own or what they brought had piled up.
@@ -265,6 +273,8 @@ enum class phase : uint8_t
     hook_wait,
     // Reading a browser's form up to its file, whose fields say what the upload is.
     form_head,
+    // The connection speaks HTTP/2: what it reads is frames, and its requests are its streams, each a conn of its own.
+    h2,
 };
 
 class storage_run;
@@ -272,6 +282,10 @@ class storage_run;
 struct response;
 struct select_job;
 struct zip_job;
+struct h2_session;
+struct h2_stream;
+struct h2_session_free { void operator()(h2_session* s) const; };
+struct h2_stream_free { void operator()(h2_stream* s) const; };
 
 // What of a bucket's ACL, and of an object's own, a request of action `a` needs, none for one they say nothing to.
 uint8_t bucket_acl_need(s3_action a);
@@ -331,6 +345,18 @@ struct conn
     int          fd{-1};
     // An identity for callbacks that outlive a close.
     bool         dead{false};
+
+    // ── HTTP/2 ──────────────────────────────────────────────────────────────
+    // A connection that speaks it holds its session; each of its streams is a conn with no socket of its own, whose
+    // request is read from DATA frames and whose answer is framed onto `h2_parent`, which a parent's close clears.
+    std::unique_ptr<h2_session, h2_session_free> h2;
+    std::unique_ptr<h2_stream, h2_stream_free>   h2s;
+    conn*        h2_parent{nullptr};
+    // A request was read on the connection, so it is HTTP/1 and a preface is no longer looked for.
+    bool         any_request{false};
+    // The socket and the TLS session the request came in on, the parent's for a stream.
+    int  sock() const { return h2_parent ? h2_parent->fd : fd; }
+    SSL* tls() const { return h2_parent ? h2_parent->ssl : ssl; }
 
     // ── TLS ─────────────────────────────────────────────────────────────────
     // Null on a cleartext connection.  With a session, what a recv brings is
@@ -684,6 +710,23 @@ public:
     void tls_pull(const std::shared_ptr<conn>& c);
     // Moves what the record layer has to say and what waits in `wq` into `wbuf`.
     bool tls_encrypt(const std::shared_ptr<conn>& c);
+    // HTTP/2, in storage_h2.cpp: a connection turned over to frames, by ALPN or by the cleartext preface; the frames
+    // it reads; a stream's DATA handed to its phase as a recv's would be; what a stream writes, framed and sent as the
+    // windows let it; the parent's write done, which refills it and tells the streams whose bytes left; and a stream
+    // ended, by its answer or by a close.
+    void h2_start(const std::shared_ptr<conn>& c);
+    void h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n);
+    void h2_pull(const std::shared_ptr<conn>& c);
+    void h2_stream_out(const std::shared_ptr<conn>& c, std::string data);
+    void h2_written(const std::shared_ptr<conn>& c);
+    void h2_schedule(const std::shared_ptr<conn>& parent);
+    void h2_stream_end(const std::shared_ptr<conn>& c);
+    void h2_stream_gone(const std::shared_ptr<conn>& c);
+    void h2_parent_gone(const std::shared_ptr<conn>& c);
+    void h2_goaway(const std::shared_ptr<conn>& c, uint32_t code, bool now);
+    bool h2_preface_in(const std::shared_ptr<conn>& c, const char* p, size_t n);
+    bool h2_headers(const std::shared_ptr<conn>& c, uint32_t sid);
+    void h2_sweep(const std::shared_ptr<conn>& c, std::chrono::steady_clock::time_point now);
     void close_conn(const std::shared_ptr<conn>& c);
     void maybe_release(const std::shared_ptr<conn>& c);
     void queue_write(const std::shared_ptr<conn>& c, std::string data);
@@ -1317,6 +1360,10 @@ private:
     io_request  m_accept_req{};
     bool        m_accept_pending{false};
     std::unordered_map<uint64_t, std::shared_ptr<conn>> m_conns;
+    // The streams of HTTP/2 connections, conns with no socket, kept apart so a count of connections is of sockets.
+    std::unordered_map<uint64_t, std::shared_ptr<conn>> m_streams;
+    // HTTP/2 is offered unless SOCKETLEY_STORAGE_HTTP2=0.
+    bool        m_h2{true};
     uint64_t    m_next_id{1};
 
     // Connections whose kernel operations have not all reported, kept so the

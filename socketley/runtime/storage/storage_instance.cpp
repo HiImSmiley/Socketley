@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 
@@ -251,6 +252,9 @@ bool storage_instance::setup(event_loop& loop)
                       "client CA could not be loaded");
             return false;
         }
+        // A browser that asks for HTTP/2 by ALPN is given it, unless SOCKETLEY_STORAGE_HTTP2=0.
+        const char* h2 = std::getenv("SOCKETLEY_STORAGE_HTTP2");
+        tls->enable_h2(!h2 || std::string_view(h2) != "0");
     }
 
     // Read here, at every start, so an edited cluster file is the one a restart takes.
@@ -565,6 +569,12 @@ std::string storage_instance::stats_lines() const
         << "tls:" << (m_run->tls_enabled() ? 1 : 0) << "\n"
         << "tls_handshakes:" << c.tls_handshakes << "\n"
         << "tls_failures:" << c.tls_failures << "\n"
+        << "h2_conns:" << c.h2_conns << "\n"
+        << "h2_streams:" << c.h2_streams << "\n"
+        << "h2_refused:" << c.h2_refused << "\n"
+        << "h2_resets_in:" << c.h2_resets_in << "\n"
+        << "h2_resets_out:" << c.h2_resets_out << "\n"
+        << "h2_goaways:" << c.h2_goaways << "\n"
         << "recv_fallbacks:" << c.recv_fallbacks << "\n"
         << "recv_cancels:" << c.recv_cancels << "\n"
         << "recv_direct_bytes:" << c.recv_direct_bytes << "\n"

@@ -557,6 +557,18 @@ static void append_storage_series(std::string& out, const std::vector<storage_ro
            "TLS handshakes a storage runtime completed.", "tls_handshakes");
     family("socketley_storage_tls_failures_total", "counter",
            "TLS handshakes that failed or never finished.", "tls_failures");
+    family("socketley_storage_http2_connections_total", "counter",
+           "Connections a storage runtime served over HTTP/2.", "h2_conns");
+    family("socketley_storage_http2_streams_total", "counter",
+           "HTTP/2 streams a storage runtime opened, one per request.", "h2_streams");
+    family("socketley_storage_http2_refused_total", "counter",
+           "HTTP/2 streams refused for the limit on those open at once.", "h2_refused");
+    family("socketley_storage_http2_resets_received_total", "counter",
+           "HTTP/2 streams the client reset.", "h2_resets_in");
+    family("socketley_storage_http2_resets_sent_total", "counter",
+           "HTTP/2 streams a storage runtime reset.", "h2_resets_out");
+    family("socketley_storage_http2_goaways_total", "counter",
+           "HTTP/2 connections a storage runtime ended with GOAWAY.", "h2_goaways");
 
     // The subsystems a runtime runs beside its requests: what waits, what went, what failed.
     static constexpr struct

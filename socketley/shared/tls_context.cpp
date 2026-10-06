@@ -337,15 +337,34 @@ int acme_client_hello(SSL* ssl, int* /*alert*/, void* /*arg*/)
     return SSL_CLIENT_HELLO_SUCCESS;
 }
 
-// Only a handshake given the challenge certificate speaks acme-tls/1; every other one negotiates no protocol, as before.
-int acme_alpn_select(SSL* ssl, const unsigned char** out, unsigned char* outlen, const unsigned char* /*in*/,
-                     unsigned int /*inlen*/, void* /*arg*/)
+// A handshake given the challenge certificate speaks acme-tls/1. Every other one negotiates "h2" when the context
+// offers it and the client lists it, and no protocol otherwise, as before. The client's list is walked here rather
+// than by SSL_select_next_proto, whose overread (CVE-2024-5535) the OpenSSL in use may still have.
+int acme_alpn_select(SSL* ssl, const unsigned char** out, unsigned char* outlen, const unsigned char* in,
+                     unsigned int inlen, void* arg)
 {
-    if (!SSL_get_ex_data(ssl, acme_ex_index()))
+    if (SSL_get_ex_data(ssl, acme_ex_index()))
+    {
+        *out = acme_tls_alpn + 1;
+        *outlen = sizeof acme_tls_alpn - 1;
+        return SSL_TLSEXT_ERR_OK;
+    }
+    if (!arg)
         return SSL_TLSEXT_ERR_NOACK;
-    *out = acme_tls_alpn + 1;
-    *outlen = sizeof acme_tls_alpn - 1;
-    return SSL_TLSEXT_ERR_OK;
+    for (unsigned int p = 0; p < inlen;)
+    {
+        const unsigned int n = in[p];
+        if (n == 0 || p + 1 + n > inlen)
+            break;
+        if (n == 2 && in[p + 1] == 'h' && in[p + 2] == '2')
+        {
+            *out = in + p + 1;
+            *outlen = 2;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        p += 1 + n;
+    }
+    return SSL_TLSEXT_ERR_NOACK;
 }
 
 }   // namespace
@@ -826,6 +845,29 @@ int tls_context::bio_write_in(SSL* ssl, const char* buf, int len)
     return -1;
 #else
     return -1;
+#endif
+}
+
+void tls_context::enable_h2(bool on)
+{
+#if SOCKETLEY_HAS_TLS
+    if (m_ctx)
+        SSL_CTX_set_alpn_select_cb(m_ctx, acme_alpn_select, on ? reinterpret_cast<void*>(1) : nullptr);
+#else
+    (void)on;
+#endif
+}
+
+bool tls_context::negotiated_h2(SSL* ssl)
+{
+#if SOCKETLEY_HAS_TLS
+    const unsigned char* p = nullptr;
+    unsigned int n = 0;
+    SSL_get0_alpn_selected(ssl, &p, &n);
+    return n == 2 && p[0] == 'h' && p[1] == '2';
+#else
+    (void)ssl;
+    return false;
 #endif
 }
 

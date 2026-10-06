@@ -1,4 +1,4 @@
-// HPACK: RFC 7541's own examples decoded in sequence with the dynamic table they leave, the encoder's blocks read
+// HPACK and HTTP/2's frames. HPACK: RFC 7541's own examples decoded in sequence with the dynamic table they leave, the encoder's blocks read
 // back, and what is not HPACK -- a bad index, a size update past the settings, wrong padding, EOS -- refused.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "shared/h2_frame.h"
 #include "shared/hpack.h"
 
 using namespace socketley::hpack;
@@ -144,4 +145,83 @@ TEST_CASE("random blocks are refused or read, never read past")
         d.decode(b, got, 1 + rng() % 8192);
         CHECK(d.table_size() <= 4096);
     }
+}
+
+TEST_CASE("a frame's head is read as written, its reserved bit dropped")
+{
+    std::string o;
+    socketley::h2::put_head(o, 0x123456, socketley::h2::HEADERS, socketley::h2::END_HEADERS, 0x7fffffff);
+    REQUIRE(o.size() == socketley::h2::head_len);
+    o[5] = static_cast<char>(o[5] | 0x80);
+    const auto h = socketley::h2::parse_head(o.data());
+    CHECK(h.len == 0x123456);
+    CHECK(h.type == socketley::h2::HEADERS);
+    CHECK(h.flags == socketley::h2::END_HEADERS);
+    CHECK(h.sid == 0x7fffffff);
+}
+
+TEST_CASE("a header block larger than a frame is HEADERS and CONTINUATIONs, END_STREAM on the first, END_HEADERS on the last")
+{
+    namespace h2 = socketley::h2;
+    std::string block(40000, 'b'), o;
+    h2::put_header_block(o, 5, block, true, 16384);
+    std::string back;
+    size_t at = 0;
+    int frames = 0;
+    while (at < o.size())
+    {
+        const auto h = h2::parse_head(o.data() + at);
+        CHECK(h.sid == 5);
+        CHECK(h.type == (frames == 0 ? h2::HEADERS : h2::CONTINUATION));
+        CHECK(bool(h.flags & h2::END_STREAM) == (frames == 0));
+        back.append(o, at + h2::head_len, h.len);
+        at += h2::head_len + h.len;
+        ++frames;
+        CHECK(bool(h.flags & h2::END_HEADERS) == (at == o.size()));
+    }
+    CHECK(frames == 3);
+    CHECK(back == block);
+    o.clear();
+    h2::put_header_block(o, 1, "", false, 16384);
+    CHECK(o.size() == h2::head_len);
+}
+
+TEST_CASE("padding and priority fields are taken off, and padding past the frame refused")
+{
+    namespace h2 = socketley::h2;
+    h2::frame_head h;
+    h.type  = h2::HEADERS;
+    h.flags = h2::PADDED | h2::PRIORITY_F;
+    std::string p = std::string(1, '\x03') + "PPPPP" + "block" + "zzz";
+    std::string_view v = p;
+    REQUIRE(h2::unpad(h, v));
+    CHECK(v == "block");
+    p = std::string(1, '\x09') + "abc";
+    v = p;
+    h.flags = h2::PADDED;
+    CHECK_FALSE(h2::unpad(h, v));
+    v = {};
+    CHECK_FALSE(h2::unpad(h, v));
+}
+
+TEST_CASE("the frames a server writes")
+{
+    namespace h2 = socketley::h2;
+    std::string o;
+    h2::put_settings(o, {{h2::MAX_CONCURRENT_STREAMS, 128}, {h2::INITIAL_WINDOW_SIZE, 1 << 21}});
+    auto h = h2::parse_head(o.data());
+    CHECK(h.type == h2::SETTINGS);
+    CHECK(h.len == 12);
+    CHECK(h2::rd32(o.data() + 9 + 2) == 128);
+    o.clear();
+    h2::put_window_update(o, 3, 1000);
+    CHECK(h2::rd32(o.data() + 9) == 1000);
+    o.clear();
+    h2::put_goaway(o, 7, h2::ENHANCE_YOUR_CALM);
+    CHECK(h2::rd32(o.data() + 9) == 7);
+    CHECK(h2::rd32(o.data() + 13) == h2::ENHANCE_YOUR_CALM);
+    o.clear();
+    h2::put_ping_ack(o, "12345678");
+    h = h2::parse_head(o.data());
+    CHECK((h.type == h2::PING && h.flags == h2::ACK && o.substr(9) == "12345678"));
 }

@@ -321,14 +321,16 @@ decoder::result decoder::decode(std::string_view b, std::vector<header>& out, si
 {
     size_t at = 0, listed = 0;
     bool over = false, fields = false;
-    auto add = [&](header h)
+    // A list past its limit is still decoded to its end, so the table stays in step, but nothing more of it is kept:
+    // a block of one-byte references to a large entry costs a count, not a copy each.
+    auto add = [&](const header& h)
     {
         fields = true;
         listed += h.name.size() + h.value.size() + entry_overhead;
         if (listed > max_list)
             over = true;
         if (!over)
-            out.push_back(std::move(h));
+            out.push_back(h);
     };
     while (at < b.size())
     {
@@ -368,9 +370,9 @@ decoder::result decoder::decode(std::string_view b, std::vector<header>& out, si
                 return result::error;
             if (!read_string(b, at, h.value))
                 return result::error;
+            add(h);
             if (indexing)
-                insert(h);
-            add(std::move(h));
+                insert(std::move(h));
         }
     }
     return over ? result::too_large : result::ok;

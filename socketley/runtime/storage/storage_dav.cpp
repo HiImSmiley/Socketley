@@ -168,7 +168,7 @@ std::string storage_run::miss_key(conn& c)
 {
     if (!c.ip_known)
     {
-        c.ip       = client_ip_of(c.fd);
+        c.ip       = client_ip_of(c.sock());
         c.ip_known = true;
     }
     // One holder of an IPv6 network has its whole /64, so that is what counts as one address.
