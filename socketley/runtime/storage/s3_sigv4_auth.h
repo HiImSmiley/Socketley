@@ -103,7 +103,8 @@ public:
     auth_verdict authorize(const request_view& req) override;
     auth_verdict authorize_post(const post_signature& sig) override;
     auth_verdict authorize_basic(std::string_view access_key, std::string_view secret) override;
-    auth_verdict authorize_ui_session(std::string_view access_key, int64_t expires_ms, std::string_view mac_hex) override;
+    auth_verdict authorize_ui_session(std::string_view access_key, int64_t issued_ms, int64_t expires_ms,
+                                      std::string_view mac_hex) override;
 
     size_t credential_count() const { return m_creds.size(); }
     std::string display_name(std::string_view id) const override;

@@ -1005,13 +1005,13 @@ auth_verdict sigv4_authenticator::authorize_basic(std::string_view access_key, s
     return v;
 }
 
-auth_verdict sigv4_authenticator::authorize_ui_session(std::string_view access_key, int64_t expires_ms,
-                                                      std::string_view mac_hex)
+auth_verdict sigv4_authenticator::authorize_ui_session(std::string_view access_key, int64_t issued_ms,
+                                                      int64_t expires_ms, std::string_view mac_hex)
 {
     maybe_reload();
     auth_verdict v;
     const std::string_view secret = m_creds.secret(access_key);
-    const std::string want = secret.empty() ? std::string{} : hmac_sha256_hex(secret, ui_session_text(access_key, expires_ms));
+    const std::string want = secret.empty() ? std::string{} : hmac_sha256_hex(secret, ui_session_text(access_key, issued_ms, expires_ms));
     if (want.empty() || want.size() != mac_hex.size() || CRYPTO_memcmp(want.data(), mac_hex.data(), want.size()) != 0)
     {
         v.allowed = false;

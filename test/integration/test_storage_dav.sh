@@ -14,7 +14,8 @@
 #   * the interface not served, or served without its content policy
 #   * a sign-in cookie not let in, let in tampered with, expired or after its
 #     key's secret changed, readable by script, or taking a change that does
-#     not carry the interface's header; a session extending itself
+#     not carry the interface's header; a session extending itself, or
+#     outliving its user's signing out everywhere
 #   * a file read with ?download not saved under its name
 #   * a folder's ZIP not holding its files byte for byte, its Content-Length
 #     not its length, a selection taking more than it named, or the ZIP
@@ -227,9 +228,10 @@ check "and reads media" "$(code -b "skl_ui=$ck" "$U/~ui/session")" 200
 check "a change under it without the interface's header is refused" "$(code -b "skl_ui=$ck" -X DELETE "$U/~dav/docs/a/one.txt")" 403
 check "with it, taken" "$(printf 'cookie' | code -b "skl_ui=$ck" -H 'X-Socketley-UI: 1' -T - "$U/~dav/docs/cookie.txt")" 201
 check "a cookie whose seal was altered is 401" "$(code -b "skl_ui=${ck%?}$( [ "${ck: -1}" = 0 ] && echo 1 || echo 0)" "$U/~ui/session")" 401
-key64=${ck%%.*}; mac=${ck##*.}
-check "as is one whose expiry was moved on" "$(code -b "skl_ui=$key64.99999999999999.$mac" "$U/~ui/session")" 401
-past=$(python3 -c 'import hmac,hashlib,sys,time; e=int(time.time()*1000)-1000; print("%d.%s" % (e, hmac.new(sys.argv[1].encode(), ("socketley-ui\n%s\n%d" % (sys.argv[2], e)).encode(), hashlib.sha256).hexdigest()))' "${A#*:}" "${A%%:*}")
+key64=${ck%%.*}; mac=${ck##*.}; iat=$(echo "$ck" | cut -d. -f2); exp=$(echo "$ck" | cut -d. -f3)
+check "as is one whose expiry was moved on" "$(code -b "skl_ui=$key64.$iat.99999999999999.$mac" "$U/~ui/session")" 401
+check "or whose time of issue was" "$(code -b "skl_ui=$key64.$((iat + 1)).$exp.$mac" "$U/~ui/session")" 401
+past=$(python3 -c 'import hmac,hashlib,sys,time; e=int(time.time()*1000)-1000; print("%d.%d.%s" % (e-5000, e, hmac.new(sys.argv[1].encode(), ("socketley-ui\n%s\n%d\n%d" % (sys.argv[2], e-5000, e)).encode(), hashlib.sha256).hexdigest()))' "${A#*:}" "${A%%:*}")
 check "and one past its expiry, though sealed right" "$(code -b "skl_ui=$key64.$past" "$U/~ui/session")" 401
 check "a session cannot make itself a new one" "$(code -b "skl_ui=$ck" -X POST "$U/~ui/session")" 401
 check "nor does a stale cookie make a browser ask for credentials" "$(curl -s -o /dev/null -D - -b 'skl_ui=x.1.y' "$U/~dav/" | grep -ci '^www-authenticate')" 0
@@ -329,6 +331,18 @@ check "nor is the owner shared its own" "$(acc "$A" ann read)" 400
 check "none takes it away" "$(acc "$A" ben none) $(code -u "$B" "$U/~dav/docs/a/one.txt") $(names "$B" "")" "204 403 "
 check "and leaves the rest of the policy as it was" "$(s3 "$U/docs?policy" | python3 -c 'import json,sys; print([x["Sid"] for x in json.load(sys.stdin)["Statement"]])')" "['mine']"
 s3 -o /dev/null -X DELETE "$U/docs?policy"; s3 -o /dev/null -X DELETE "$U/docs/secret/x.txt"
+
+# Signing out everywhere ends each session the user had, on both shards within a second, and no one else's.
+curl -s -c "$T/j1" -o /dev/null -u "$A" -X POST "$U/~ui/session"; curl -s -c "$T/j2" -o /dev/null -u "$A" -X POST "$U/~ui/session?remember"
+curl -s -c "$T/j3" -o /dev/null -u "$B" -X POST "$U/~ui/session"
+check "two sessions of a user let in" "$(code -b "$T/j1" "$U/~ui/session")$(code -b "$T/j2" "$U/~ui/session")" 200200
+check "ending them all takes the interface's header" "$(code -b "$T/j1" -X POST "$U/~ui/session?everywhere")" 403
+check "with it, they end" "$(curl -s -b "$T/j1" -H 'X-Socketley-UI: 1' -X POST -D - -o /dev/null -w '%{http_code}' "$U/~ui/session?everywhere" | grep -c 'skl_ui=;')" 1
+sleep 1.2
+check "both, on either shard" "$(for _ in 1 2 3; do code -b "$T/j1" "$U/~ui/session"; code -b "$T/j2" "$U/~ui/session"; done)" 401401401401401401
+check "the other user's session goes on" "$(code -b "$T/j3" "$U/~ui/session")" 200
+check "and the user signs in anew" "$(curl -s -c "$T/j4" -o /dev/null -w '%{http_code}' -u "$A" -X POST "$U/~ui/session") $(for _ in 1 2 3; do code -b "$T/j4" "$U/~ui/session"; done)" "200 200200200"
+check "the end outlasts a restart" "$("$BIN" stop dav >/dev/null 2>&1; "$BIN" start dav >/dev/null 2>&1; up; code -b "$T/j2" "$U/~ui/session") $(code -b "$T/j4" "$U/~ui/session")" "401 200"
 
 # Guessing at sign-ins: an address past ten failures, on each shard, is refused a while, the right secret too.
 jar="$T/guessjar"; curl -s -c "$jar" -o /dev/null -u "$A" -X POST "$U/~ui/session"

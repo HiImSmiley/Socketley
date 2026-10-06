@@ -907,6 +907,15 @@ public:
     void zip_end(conn& c);
     // The interface's sign-in (/~ui/session) and the films a user has part watched (/~ui/progress).
     void ui_session(const std::shared_ptr<conn>& c);
+    // The time before which a user's sessions are no longer let in, set by signing out everywhere into
+    // <dir>/.ui/sessions/ and read from there again after a second, so the other shards follow.
+    struct session_floor
+    {
+        int64_t ms{0};
+        std::chrono::steady_clock::time_point at{};
+    };
+    std::unordered_map<std::string, session_floor> m_floors;
+    int64_t sessions_since(const std::string& who);
     void ui_progress(const std::shared_ptr<conn>& c);
     void ui_progress_body(const std::shared_ptr<conn>& c);
     // Who else a library is shared with, /~ui/access, as statements of the bucket's policy.

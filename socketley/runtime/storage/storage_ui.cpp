@@ -215,23 +215,46 @@ bool storage_run::has_ui_cookie(const conn& c)
 
 bool storage_run::ui_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
 {
-    // <access key, base64url>.<expiry in ms>.<HMAC-SHA256 under the key's secret, hex>
+    // <access key, base64url>.<issued in ms>.<expiry in ms>.<HMAC-SHA256 under the key's secret, hex>
     const std::string_view val = cookie_value(c->req.header("cookie"), cookie_name);
     if (val.empty())
         return false;
     v.allowed = false;
-    const size_t a = val.find('.'), b = a == std::string_view::npos ? a : val.find('.', a + 1);
+    const size_t a = val.find('.'), b = a == std::string_view::npos ? a : val.find('.', a + 1),
+                 d = b == std::string_view::npos ? b : val.find('.', b + 1);
     std::string key;
-    if (b == std::string_view::npos || !base64url_decode(val.substr(0, a), key) || key.empty())
+    if (d == std::string_view::npos || !base64url_decode(val.substr(0, a), key) || key.empty())
         return true;
-    const std::string_view exp_text = val.substr(a + 1, b - a - 1);
-    char* end = nullptr;
-    const std::string exp_s(exp_text);
-    const long long exp = std::strtoll(exp_s.c_str(), &end, 10);
-    if (exp_s.empty() || !end || *end || exp < wall_ms())
+    const auto number = [](std::string_view text, long long& out)
+    {
+        const std::string s(text);
+        char* end = nullptr;
+        out = std::strtoll(s.c_str(), &end, 10);
+        return !s.empty() && end && !*end;
+    };
+    long long iat = 0, exp = 0;
+    if (!number(val.substr(a + 1, b - a - 1), iat) || !number(val.substr(b + 1, d - b - 1), exp) || exp < wall_ms())
         return true;
-    v = m_auth->authorize_ui_session(key, exp, val.substr(b + 1));
+    v = m_auth->authorize_ui_session(key, iat, exp, val.substr(d + 1));
+    if (v.allowed && !v.anonymous && iat < sessions_since(v.user ? v.user->id : key))
+    {
+        v         = auth_verdict{};
+        v.allowed = false;
+    }
     return true;
+}
+
+int64_t storage_run::sessions_since(const std::string& who)
+{
+    const auto now = std::chrono::steady_clock::now();
+    session_floor& f = m_floors[who];
+    if (f.at != std::chrono::steady_clock::time_point{} && now - f.at < std::chrono::seconds(1))
+        return f.ms;
+    std::string text;
+    f.ms = read_whole_file(m_store.options().dir + "/.ui/sessions/" + sha256_hex(who).substr(0, 32), text) ?
+           std::strtoll(text.c_str(), nullptr, 10) : 0;
+    f.at = now;
+    return f.ms;
 }
 
 std::string storage_run::attachment_of(std::string_view key)
@@ -324,6 +347,33 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
         app_reply(c, 405, "Sign in with POST, ask with GET, sign out with DELETE.\n");
         return;
     }
+    // Ends every session of the user, on each browser, from now: one made earlier is no longer let in.
+    if (r.method == "POST" && r.has_query("everywhere"))
+    {
+        if (!app_login(c, "socketley"))
+            return;
+        if (c->anonymous)
+        {
+            app_reply(c, 400, "Only a user has sessions to end.\n");
+            return;
+        }
+        const std::string who = c->user ? c->user->id : c->principal;
+        const std::string dir = m_store.options().dir + "/.ui";
+        const int64_t now = wall_ms();
+        if ((::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST) ||
+            (::mkdir((dir + "/sessions").c_str(), 0700) < 0 && errno != EEXIST) ||
+            !replace_file(dir + "/sessions/" + sha256_hex(who).substr(0, 32), std::to_string(now), true))
+        {
+            app_reply(c, 500, "The sessions could not be ended.\n");
+            return;
+        }
+        m_floors[who] = {now, std::chrono::steady_clock::now()};
+        response out;
+        out.status = 204;
+        out.headers.emplace_back("Set-Cookie", std::string(cookie_name) + "=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict" + secure_attr);
+        send_response(c, std::move(out));
+        return;
+    }
     // A sign-in is made from the credentials themselves and never from a session, so a cookie cannot extend itself.
     const std::string_view h = r.header("authorization");
     if (r.method == "POST" && !h.starts_with("Basic ") && !h.starts_with("basic "))
@@ -352,9 +402,10 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
         const size_t colon = pair.find(':');
         const std::string_view key = std::string_view(pair).substr(0, colon), secret = std::string_view(pair).substr(colon + 1);
         const bool remember = r.has_query("remember");
-        expires = wall_ms() + (remember ? remember_ms : session_ms);
-        std::string cookie = std::string(cookie_name) + "=" + base64url_encode(key) + "." + std::to_string(expires) + "." +
-                             hmac_sha256_hex(secret, ui_session_text(key, expires)) +
+        const int64_t issued = wall_ms();
+        expires = issued + (remember ? remember_ms : session_ms);
+        std::string cookie = std::string(cookie_name) + "=" + base64url_encode(key) + "." + std::to_string(issued) + "." +
+                             std::to_string(expires) + "." + hmac_sha256_hex(secret, ui_session_text(key, issued, expires)) +
                              "; Path=/; HttpOnly; SameSite=Strict" + secure_attr;
         if (remember)
             cookie += "; Max-Age=" + std::to_string(remember_ms / 1000);

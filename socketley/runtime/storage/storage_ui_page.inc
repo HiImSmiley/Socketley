@@ -460,6 +460,7 @@ body.audio #ups,body.audio #selbar{bottom:96px}
     <button class="nav" id="nUse"></button>
     <div class="themes" id="themes"></div>
     <button class="nav" id="nOut"></button>
+    <button class="nav" id="nAll"></button>
   </aside>
   <div id="main">
     <div id="top">
@@ -661,6 +662,13 @@ async function signOut() {
   try { await fetch('/~ui/session', { method: 'DELETE', headers: { 'X-Socketley-UI': '1' } }); } catch (e) {}
   signedOut();
 }
+async function signOutAll() {
+  if (!await ask({ title: 'Sign out everywhere?', text: 'Every browser and device signed in as you, this one too, has to sign in again. Drives and apps with your key go on.', ok: 'Sign out everywhere', danger: true })) return;
+  let r;
+  try { r = await api('POST', '/~ui/session?everywhere'); } catch (e) { fail(e); return; }
+  if (r.status !== 204) { toast('Signing out everywhere failed: ' + r.status, 'bad'); return; }
+  signedOut();
+}
 $('#lf').addEventListener('submit', async ev => {
   ev.preventDefault();
   // The credentials go to the server once, which answers with the session cookie; the page keeps neither.
@@ -710,6 +718,8 @@ function side() {
   nav($('#nHome'), 'home', 'Home', !path.length, () => go([]));
   nav($('#nLinks'), 'link', 'Shared links', false, linksDlg);
   nav($('#nOut'), 'out', me && me.user ? 'Sign out · ' + (me.name || me.user) : 'Sign out', false, signOut);
+  nav($('#nAll'), 'out', 'Sign out everywhere', false, signOutAll);
+  $('#nAll').hidden = !(me && me.user);
   nav($('#nSend'), 'send', 'Send a file', false, () => sendDlg());
   nav($('#nUse'), 'bucket', 'Storage', false, usageDlg);
   paintThemes();

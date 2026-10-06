@@ -9820,15 +9820,22 @@ It signs in with
 .B POST /~ui/session
 and Basic credentials, which sets the cookie
 .B skl_ui
-(HttpOnly, SameSite=Strict, Secure over TLS): the access key, an expiry and an
-HMAC-SHA256 of both under the key's own secret, so every shard and node checks
-it alike and a key whose secret changes or that is removed ends its sessions.
+(HttpOnly, SameSite=Strict, Secure over TLS): the access key, the time it was
+made, an expiry and an HMAC-SHA256 of them under the key's own secret, so every
+shard and node checks it alike and a key whose secret changes or that is removed
+ends its sessions.
 It lasts twelve hours and the browser's session, or thirty days with
 .BR ?remember .
 .B GET /~ui/session
 says who is signed in and
 .B DELETE /~ui/session
-signs out. /~dav/, /~media/ and the management of /~share/ take the cookie as
+signs out.
+.B POST /~ui/session?everywhere
+ends every session of the user made before it, in each browser, by keeping its
+time in
+.IR dir /.ui/sessions/;
+the other shards follow within a second, and a sign-in with Basic credentials is
+not a session and goes on. /~dav/, /~media/ and the management of /~share/ take the cookie as
 they take Basic credentials, so the page's script never holds the secret; a
 change made under the cookie alone (anything but GET, HEAD, OPTIONS and
 PROPFIND) must carry the header
