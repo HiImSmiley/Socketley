@@ -18,9 +18,9 @@
 #include "json_doc.h"
 #include "s3_names.h"
 #include "s3_quota.h"
-#include "small_file.h"
 #include "../../shared/http_framing.h"
 #include "../../shared/state_persistence.h"
+#include "../../shared/replaced_file.h"
 
 namespace socketley::storage
 {
@@ -105,7 +105,7 @@ std::vector<position> read_positions(const std::string& path)
     std::vector<position> out;
     std::string text;
     jvalue root;
-    if (!read_small_file(path, text) || !json_reader(text).document(root))
+    if (!read_whole_file(path, text) || !json_reader(text).document(root))
         return out;
     const jvalue* items = member(root, "items");
     if (!items || items->k != jvalue::kind::array)
@@ -538,7 +538,7 @@ void storage_run::ui_progress_body(const std::shared_ptr<conn>& c)
         std::sort(ps.begin(), ps.end(), [](const position& a, const position& b) { return a.at > b.at; });
         if (ps.size() > progress_max)
             ps.resize(progress_max);
-        const bool ok = write_small_file(path, positions_json(ps), false);
+        const bool ok = replace_file(path, positions_json(ps), false);
         ::flock(fd, LOCK_UN);
         ::close(fd);
         app_reply(cc, ok ? 204 : 500, ok ? std::string{} : "The position could not be kept.\n");

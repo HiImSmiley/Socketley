@@ -1,5 +1,4 @@
 #include "s3_sigv4_auth.h"
-#include "small_file.h"
 
 #include <cerrno>
 #include <charconv>

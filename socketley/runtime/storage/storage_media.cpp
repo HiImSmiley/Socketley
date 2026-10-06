@@ -33,10 +33,10 @@
 #include <thread>
 
 #include "digest.h"
-#include "small_file.h"
 #include "json_doc.h"
 #include "s3_names.h"
 #include "sse.h"
+#include "../../shared/replaced_file.h"
 
 extern char** environ;
 
@@ -220,10 +220,10 @@ bool locked_fresh(int fd, const std::string& path)
 void kill_orphan(const std::string& pid_file, const std::string& dir)
 {
     std::string v, cmdline;
-    if (!read_small_file(pid_file, v) || v.empty())
+    if (!read_whole_file(pid_file, v) || v.empty())
         return;
     const long pid = std::strtol(v.c_str(), nullptr, 10);
-    if (pid <= 1 || !read_small_file("/proc/" + std::to_string(pid) + "/cmdline", cmdline) ||
+    if (pid <= 1 || !read_whole_file("/proc/" + std::to_string(pid) + "/cmdline", cmdline) ||
         cmdline.find(dir) == std::string::npos)
         return;
     ::kill(static_cast<pid_t>(pid), SIGKILL);
@@ -640,14 +640,14 @@ std::string job_file(const std::string& dir, int64_t from, std::string_view ext)
 int64_t read_int(const std::string& path, int64_t fallback)
 {
     std::string v;
-    if (!read_small_file(path, v) || v.empty())
+    if (!read_whole_file(path, v) || v.empty())
         return fallback;
     return std::strtoll(v.c_str(), nullptr, 10);
 }
 
 void write_int(const std::string& path, int64_t v)
 {
-    write_small_file(path, std::to_string(v), false);
+    replace_file(path, std::to_string(v), false);
 }
 
 // A player's ask, which moves the job's furthest point forward and says, by the file's time, that it is watched.
@@ -1008,7 +1008,7 @@ std::shared_ptr<const media_probe> storage_run::media_probe_of(const std::string
     }
     std::string text;
     auto p = std::make_shared<media_probe>();
-    if (!exists(probe_dir + "/done") || !read_small_file(probe_dir + "/probe.json", text) || !parse_probe(text, *p))
+    if (!exists(probe_dir + "/done") || !read_whole_file(probe_dir + "/probe.json", text) || !parse_probe(text, *p))
         return nullptr;
     if (m_media_probes.size() > 1024)
         m_media_probes.clear();
@@ -1423,7 +1423,7 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
         const auto pp = media_probe_of(w.probe_dir);
         // HDR is tone-mapped on the GPU from its mastering display metadata, and with x264 where it has none.
         const bool gpu = (m_hw == media_hw::vaapi || m_hw == media_hw::vaapi_lp) && pp && (!pp->hdr() || pp->mastering);
-        write_small_file(w.dir + "/encoder", gpu ? (m_hw == media_hw::vaapi_lp ? "vaapi-lp" : "vaapi") : "x264", false);
+        replace_file(w.dir + "/encoder", gpu ? (m_hw == media_hw::vaapi_lp ? "vaapi-lp" : "vaapi") : "x264", false);
     }
     write_int(job_file(w.dir, seg, ".pos"), seg);
     // A job begun for an init has been asked no segment yet, which is -1.
@@ -1582,7 +1582,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             vf += ",format=yuv420p";
             const std::string offset = std::to_string(from * seg_seconds);
             std::string encoder;
-            read_small_file(w.dir + "/encoder", encoder);
+            read_whole_file(w.dir + "/encoder", encoder);
             const bool gpu = encoder.starts_with("vaapi") && !m_hw_device.empty();
             // On the GPU the picture is decoded, scaled, tone-mapped and encoded there, and never copied back.
             if (gpu)
@@ -1764,7 +1764,7 @@ void storage_run::media_tick()
             {
                 j.playlist_mtime = mtime_ms(sb);
                 std::string text;
-                if (read_small_file(own, text))
+                if (read_whole_file(own, text))
                 {
                     int64_t made = 0;
                     for (size_t at = 0; (at = text.find("\nseg", at)) != std::string::npos; ++at)
@@ -1822,7 +1822,7 @@ void storage_run::media_tick()
                 // A GPU job that fails before the rendition has anything is the GPU's failure with this film: the
                 // rendition is made with x264 from then on. Any other that fails from its very start is the medium's.
                 if (j.gpu && j.next == j.from && !exists(j.want.dir + "/init.mp4"))
-                    write_small_file(j.want.dir + "/encoder", "x264", false);
+                    replace_file(j.want.dir + "/encoder", "x264", false);
                 else if (j.next == j.from)
                     mark(j.want.dir, "failed");
             }
@@ -1867,12 +1867,12 @@ void storage_run::media_tick()
             {
                 // The track's cues on the film's own clock, as an HLS player is told they are.
                 std::string vtt;
-                ok = ok && read_small_file(j.want.dir + "/subs.tmp.vtt", vtt) && vtt.starts_with("WEBVTT");
+                ok = ok && read_whole_file(j.want.dir + "/subs.tmp.vtt", vtt) && vtt.starts_with("WEBVTT");
                 if (ok)
                 {
                     const size_t eol = vtt.find('\n');
                     vtt.insert(eol == std::string::npos ? vtt.size() : eol + 1, "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n");
-                    write_small_file(j.want.dir + "/subs.vtt", vtt, false);
+                    replace_file(j.want.dir + "/subs.vtt", vtt, false);
                     ::unlink((j.want.dir + "/subs.tmp.vtt").c_str());
                 }
             }
