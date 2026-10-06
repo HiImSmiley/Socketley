@@ -223,6 +223,7 @@ select.inp option{background:#151821}
 
 /* list */
 .tbl{width:100%;border-collapse:separate;border-spacing:0;margin-top:18px}
+.more-mark{grid-column:1/-1;height:1px}
 .tbl th{font-size:11.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--dim);text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);position:sticky;top:0;background:linear-gradient(rgba(var(--glow),.07),rgba(var(--glow2),.04)),rgba(12,14,21,.6);backdrop-filter:blur(16px) saturate(1.4);-webkit-backdrop-filter:blur(16px) saturate(1.4);z-index:2}
 .tbl thead th:first-child{border-top-left-radius:10px}.tbl thead th:last-child{border-top-right-radius:10px}
 .tbl td{padding:8px 12px;border-bottom:1px solid var(--line);white-space:nowrap;color:var(--mut)}
@@ -845,6 +846,7 @@ async function load(keepScroll) {
   for (const k of [...sel]) if (!items.some(it => keyOf(it) === k)) sel.delete(k);
   liveAt = Date.now();
   side(); render();
+  if (keepScroll) fillTo(top);
   $('#scroll').scrollTop = keepScroll ? top : 0;
 }
 let reloadT = 0;
@@ -872,7 +874,7 @@ async function liveCheck() {
     if (!path.length) buckets = now.filter(b => b.dir);
     for (const k of [...sel]) if (!items.some(it => keyOf(it) === k)) sel.delete(k);
     const top = $('#scroll').scrollTop;
-    side(); render();
+    side(); render(); fillTo(top);
     $('#scroll').scrollTop = top;
   } catch (e) {}
 }
@@ -963,6 +965,7 @@ function watching() {
 // ─── rendering ──────────────────────────────────────────────────────────────
 function render() {
   const C = $('#content'); C.textContent = '';
+  MORE.clear();
   closePop();
   const list = sorted(items.filter(it => !query || it.name.toLowerCase().includes(query)));
   shown = list;
@@ -1037,10 +1040,35 @@ function hero(list) {
   return h;
 }
 const SECI = { vid: 'video', pic: 'image', aud: 'music', doc: 'text', fold: 'folder', lib: 'bucket' };
+// ─── large folders ──────────────────────────────────────────────────────────
+// A long list is drawn a few hundred at a time, the next part once the end of the last comes near the screen.
+const MORE = new Set();
+// Watched against the scrolling pane itself, so the margin reaches below what it shows.
+let moreIo = null;
+function moreWatch() { if (!moreIo && 'IntersectionObserver' in window) moreIo = new IntersectionObserver(es => { for (const e of es) if (e.isIntersecting && e.target._more) e.target._more(); }, { root: $('#scroll'), rootMargin: '0px 0px 1500px 0px' }); return moreIo; }
+function chunked(box, list, make, marker) {
+  let at = 0;
+  const mark = marker();
+  const step = () => {
+    const end = Math.min(list.length, at + (at ? 300 : 150));
+    const frag = document.createDocumentFragment();
+    for (; at < end; at++) frag.append(make(list[at]));
+    mark.before(frag);
+    if (at < list.length) return true;
+    MORE.delete(step); if (moreIo) moreIo.unobserve(mark); mark.remove();
+    return false;
+  };
+  box.append(mark);
+  mark._more = step; MORE.add(step);
+  if (step()) { if (moreWatch()) moreIo.observe(mark); else while (step()); }
+}
+// Enough drawn to scroll back to where the folder was, after it is drawn anew.
+function fillTo(top) { const S = $('#scroll'); for (const f of MORE) while (S.scrollHeight < top + S.clientHeight * 2 && f()); }
+
 function section(title, cls, list, make) {
   if (!list.length) return null;
   const g = el('div', { class: 'grid ' + cls });
-  for (const it of list) g.append(make(it));
+  chunked(g, list, make, () => el('div', { class: 'more-mark' }));
   return el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico(title === 'Continue watching' ? 'clock' : title === 'Other files' ? 'file' : SECI[cls])), el('span', { text: title }), el('span', { class: 'n', text: String(list.length) })), g);
 }
 function cardShell(it, cover, extra) {
@@ -1279,24 +1307,26 @@ function fileCard(it) {
 function table(list) {
   const T = el('table', { class: 'tbl' }, el('thead', {}, el('tr', {}, el('th', { text: 'Name' }), el('th', { class: 'hide', text: 'Kind' }), el('th', { text: 'Size' }), el('th', { class: 'hide', text: 'Modified' }), el('th'))));
   const B = el('tbody');
-  for (const it of list) {
-    const k = keyOf(it);
-    const th = el('span', { class: 'th' }, ico(ICON[it.kind]));
-    lazyThumb(th, it, 64);
-    const tr = el('tr', { class: 'r' + (sel.has(k) ? ' sel' : ''), 'data-k': k },
-      el('td', { class: 'nm' }, el('div', { class: 'nmw' }, th, el('span', { text: it.name + (it.dir ? '/' : ''), title: it.name }))),
-      el('td', { class: 'hide', text: it.kind === 'dir' ? 'Folder' : it.kind === 'bucket' ? 'Library' : (ext(it.name).toUpperCase() || it.kind) }),
-      el('td', { text: it.dir ? '' : human(it.size) }),
-      el('td', { class: 'hide', text: it.mod ? new Date(it.mod).toLocaleString() : '' }),
-      el('td', { class: 'ac' }, ibtn('more', 'More', e => { e.stopPropagation(); if (!sel.has(k)) { sel.clear(); sel.add(k); paintSel(); } popup(e.currentTarget, actions()); })));
-    tr.addEventListener('click', e => clickItem(it, e));
-    tr.addEventListener('dblclick', () => open(it));
-    tr.addEventListener('contextmenu', e => ctxMenu(it, e));
-    movable(tr, it);
-    B.append(tr);
-  }
+  chunked(B, list, listRow, () => el('tr', { class: 'more-mark' }));
   T.append(B);
   return T;
+}
+// A row of the list.
+function listRow(it) {
+  const k = keyOf(it);
+  const th = el('span', { class: 'th' }, ico(ICON[it.kind]));
+  lazyThumb(th, it, 64);
+  const tr = el('tr', { class: 'r' + (sel.has(k) ? ' sel' : ''), 'data-k': k },
+    el('td', { class: 'nm' }, el('div', { class: 'nmw' }, th, el('span', { text: it.name + (it.dir ? '/' : ''), title: it.name }))),
+    el('td', { class: 'hide', text: it.kind === 'dir' ? 'Folder' : it.kind === 'bucket' ? 'Library' : (ext(it.name).toUpperCase() || it.kind) }),
+    el('td', { text: it.dir ? '' : human(it.size) }),
+    el('td', { class: 'hide', text: it.mod ? new Date(it.mod).toLocaleString() : '' }),
+    el('td', { class: 'ac' }, ibtn('more', 'More', e => { e.stopPropagation(); if (!sel.has(k)) { sel.clear(); sel.add(k); paintSel(); } popup(e.currentTarget, actions()); })));
+  tr.addEventListener('click', e => clickItem(it, e));
+  tr.addEventListener('dblclick', () => open(it));
+  tr.addEventListener('contextmenu', e => ctxMenu(it, e));
+  movable(tr, it);
+  return tr;
 }
 
 // ─── selection and actions ──────────────────────────────────────────────────
