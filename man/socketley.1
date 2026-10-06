@@ -9652,8 +9652,28 @@ with
 The runtime's sweep looks the links over every five seconds and renames one
 that has ended to
 .IR id .burning,
-which no reader opens, before it removes; one left so by a stop is finished at
-the next start. In a versioned bucket the removal is a delete marker and the
+which no reader opens, stamped with the time, before it removes; the shard that
+renamed it removes, and one stamped more than a minute ago, left by a stop, is
+taken up by the first shard to see it.
+.IP
+.B "\(dqnotify\(dq: \(dqhttps://...\(dq"
+gives a link a webhook, POSTed a JSON object at each download it counts and when
+what a link that burns names is removed:
+.BR content " and " text
+(a sentence, as Discord and Slack show it),
+.BR event " (" downloaded " or " deleted ),
+.BR bucket ", " key ", " downloads ", " max_downloads " and " expires .
+Since the runtime makes the request for the link's maker, the URL must begin
+with one of the prefixes
+.B SOCKETLEY_SHARE_NOTIFY_ALLOW
+names, comma\-separated, by default the webhooks of Discord
+.RB ( https://discord.com/api/webhooks/ ,
+.BR https://discordapp.com/api/webhooks/ ),
+Slack
+.RB ( https://hooks.slack.com/ )
+and
+.BR https://ntfy.sh/ ;
+any other is 400. A webhook's requests go one at a time, at most 16 waiting. In a versioned bucket the removal is a delete marker and the
 versions stay. A cluster does not make them. Links are files in
 .IR dir /.shares/,
 read by every shard.
@@ -14486,6 +14506,13 @@ A test aid: the number of seconds a bucket lifecycle rule counts as one day, 1 t
 86400, read by the lifecycle sweep alone, which then also runs as often as every
 second. Unset, a day is a day. It changes when objects expire, so it is never for a
 runtime holding data anyone wants (see Bucket lifecycle).
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_SHARE_NOTIFY_ALLOW
+The URL prefixes a share link's webhook may begin with, comma\-separated; unset,
+the webhooks of Discord, Slack and ntfy.sh (see Drive, links, media and the web
+interface).
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

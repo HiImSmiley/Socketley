@@ -567,7 +567,7 @@ void storage_run::sweep()
     flush_access_logs(false);
     if (!m_conns.empty() || m_mpu_expire_secs != 0 || m_start_note != start_note::told || m_lc ||
         m_store.lifecycle_buckets() != 0 || m_store.any_doubt() || !m_access_logs.empty() || m_scrub.enabled() ||
-        m_compact.enabled() || m_tier.enabled() || m_burns != 0 || !m_burning.empty())
+        m_compact.enabled() || m_tier.enabled() || m_burns != 0 || !m_burning.empty() || !m_hooks.empty())
         arm_sweep();
 }
 
@@ -583,6 +583,8 @@ void storage_run::stop()
         return;
     m_stopped = true;
     stop_rpc();
+    for (auto& [url, h] : m_hooks)
+        h->peer->stop();
     // Access log lines not yet delivered are dropped with the deliveries in flight.
     for (auto& d : m_log_deliveries)
         d->abort();

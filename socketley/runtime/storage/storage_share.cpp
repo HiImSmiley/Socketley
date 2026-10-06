@@ -53,6 +53,8 @@ struct share_link
     bool        burn{false};
     // When the last download a limit allows was counted.
     int64_t     drained_ms{0};
+    // A webhook told of each download, and of the files' removal when the link burns.
+    std::string notify;
 };
 
 namespace
@@ -100,6 +102,11 @@ std::string share_json(const share_link& s)
     jstr(o, s.note);
     if (s.burn)
         o += ",\"burn\":true,\"drained\":" + std::to_string(s.drained_ms);
+    if (!s.notify.empty())
+    {
+        o += ",\"notify\":";
+        jstr(o, s.notify);
+    }
     o += "}";
     return o;
 }
@@ -156,6 +163,7 @@ bool parse_share(std::string_view text, share_link& s)
     s.note = str_of(root, "note");
     s.burn = flag_of(root, "burn");
     s.drained_ms = static_cast<int64_t>(num_of(root, "drained"));
+    s.notify = str_of(root, "notify");
     return !s.id.empty() && !s.bucket.empty();
 }
 
@@ -215,6 +223,7 @@ std::string share_view_json(const share_link& s)
     o += ",\"owner\":";
     jstr(o, s.owner);
     o += s.burn ? ",\"burn\":true" : ",\"burn\":false";
+    o += s.notify.empty() ? ",\"notify\":false" : ",\"notify\":true";
     o += "}";
     return o;
 }
@@ -386,14 +395,16 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
         // A link that burns takes what it names with it, by the sweep, which finds it under its new name.
         if (s.burn)
         {
-            if (::rename(path.c_str(), (m_store.options().dir + "/.shares/" + id + ".burning").c_str()) < 0)
+            const std::string to = m_store.options().dir + "/.shares/" + id + ".burning";
+            if (::rename(path.c_str(), to.c_str()) < 0)
             {
                 app_reply(c, 500, "The link could not be ended.\n");
                 return;
             }
-            ++m_burns;
-            m_burn_next = {};
-            arm_sweep();
+            ::utimensat(AT_FDCWD, to.c_str(), nullptr, 0);
+            share_burn(s.id, s.bucket, s.key, s.folder);
+            if (!s.notify.empty())
+                share_tell(s.notify, "deleted", s.bucket, s.key, s.downloads, s.max_downloads, s.expires_ms, true);
         }
         else
             ::unlink(path.c_str());
@@ -553,6 +564,9 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
                 allowed = write_small_file(path, share_json(now), true);
                 if (allowed)
                     share_sent(id, share_json(now), {});
+                if (allowed && !now.notify.empty())
+                    share_tell(now.notify, "downloaded", now.bucket, now.key, now.downloads, now.max_downloads, now.expires_ms,
+                               now.burn);
             }
             ::flock(fd, LOCK_UN);
         }
@@ -695,6 +709,13 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
     const std::string password = str_of(req, "password");
     s.note = str_of(req, "note").substr(0, 200);
     s.burn = flag_of(req, "burn");
+    s.notify = str_of(req, "notify");
+    if (!s.notify.empty() && !notify_allowed(s.notify))
+    {
+        app_reply(c, 400, "A link's notify is an https webhook of Discord, Slack or ntfy (or what "
+                          "SOCKETLEY_SHARE_NOTIFY_ALLOW names).\n");
+        return;
+    }
     if (!m_store.has_bucket(s.bucket))
     {
         app_reply(c, 404, "No such bucket.\n");
@@ -837,8 +858,8 @@ std::vector<std::string> storage_run::share_records()
 // ─── Links that burn ────────────────────────────────────────────────────────
 // Every few seconds, while any are known, the links that burn are looked over: one past its expiry, or past the grace
 // after its last allowed download, is renamed to <id>.burning, which ends it for every reader at once, and what it
-// names is removed; the file goes when that is done. A .burning file found at a start is taken up again. Two shards
-// may both take up one left at a start, and the second's removals find nothing.
+// names is removed; the file goes when that is done. The shard that renamed it stamps it and removes; a .burning file
+// stamped more than a minute ago was left by a stop and is taken up again, stamped anew, by the first shard to see it.
 
 void storage_run::share_burn_tick()
 {
@@ -872,14 +893,36 @@ void storage_run::share_burn_tick()
         if (!burning)
         {
             const bool due = (s.expires_ms && t > s.expires_ms) || (s.drained_ms && t > s.drained_ms + burn_grace_ms());
-            if (!due || ::rename(path.c_str(), (dir + "/" + s.id + ".burning").c_str()) < 0)
+            const std::string to = dir + "/" + s.id + ".burning";
+            if (!due || ::rename(path.c_str(), to.c_str()) < 0)
                 continue;
+            // Stamped now, so another shard's look leaves it to this one.
+            ::utimensat(AT_FDCWD, to.c_str(), nullptr, 0);
             ::unlink((path + ".lock").c_str());
             share_sent(s.id, {}, nullptr);
+            share_burn(s.id, s.bucket, s.key, s.folder);
+            if (!s.notify.empty())
+                share_tell(s.notify, "deleted", s.bucket, s.key, s.downloads, s.max_downloads, s.expires_ms, true);
+            continue;
         }
+        // A .burning file another shard is at was stamped within the minute; one older was left by a stop.
+        struct stat sb{};
+        if (::stat(path.c_str(), &sb) == 0 && t - (static_cast<int64_t>(sb.st_mtim.tv_sec) * 1000) < 60000)
+            continue;
+        ::utimensat(AT_FDCWD, path.c_str(), nullptr, 0);
         share_burn(s.id, s.bucket, s.key, s.folder);
     }
     ::closedir(d);
+    // The webhooks' exchanges that stalled end, and peers left with nothing to do go.
+    const auto tnow = std::chrono::steady_clock::now();
+    for (auto it = m_hooks.begin(); it != m_hooks.end();)
+    {
+        it->second->peer->tick(tnow);
+        if (!it->second->peer->busy() && it->second->queue.empty() && tnow - it->second->used > std::chrono::seconds(30))
+            it = m_hooks.erase(it);
+        else
+            ++it;
+    }
     m_burns = seen;
 }
 
@@ -927,6 +970,105 @@ void storage_run::share_burn(std::string id, std::string bucket, std::string key
         b->left = p.objects.size();
         for (const list_entry& e : p.objects)
             m_store.remove(bucket, e.key, one_done);
+    });
+}
+
+// ─── Telling a webhook of a link's downloads ────────────────────────────────
+// A link's notify is a URL its maker gives, which the runtime then POSTs to: so it is only one of the prefixes
+// SOCKETLEY_SHARE_NOTIFY_ALLOW names, comma-separated, by default the webhooks of Discord and Slack and ntfy.sh, and
+// never another address a user would have the runtime reach for them.
+bool storage_run::notify_allowed(std::string_view url)
+{
+    static const std::vector<std::string> allow = []
+    {
+        std::vector<std::string> out;
+        const char* e = std::getenv("SOCKETLEY_SHARE_NOTIFY_ALLOW");
+        std::string_view v = e && *e ? std::string_view(e)
+                                     : "https://discord.com/api/webhooks/,https://discordapp.com/api/webhooks/,"
+                                       "https://hooks.slack.com/,https://ntfy.sh/";
+        while (!v.empty())
+        {
+            const size_t comma = v.find(',');
+            std::string_view one = v.substr(0, comma);
+            while (!one.empty() && one.front() == ' ')
+                one.remove_prefix(1);
+            if (!one.empty())
+                out.emplace_back(one);
+            v = comma == std::string_view::npos ? std::string_view{} : v.substr(comma + 1);
+        }
+        return out;
+    }();
+    http_target t;
+    std::string why;
+    if (url.size() > 1000 || !parse_http_url(url, t, why))
+        return false;
+    for (const std::string& a : allow)
+        if (url.starts_with(a))
+            return true;
+    return false;
+}
+
+void storage_run::share_tell(const std::string& url, std::string_view what, const std::string& bucket,
+                             const std::string& key, uint64_t downloads, uint64_t max_downloads, int64_t expires_ms,
+                             bool burn)
+{
+    const std::string_view name = key.empty() ? std::string_view(bucket)
+                                  : key.back() == '/' ? std::string_view(key).substr(0, key.size() - 1) : std::string_view(key);
+    const std::string_view shown = name.substr(name.rfind('/') == std::string_view::npos ? 0 : name.rfind('/') + 1);
+    std::string text;
+    if (what == "deleted")
+        text = "\xF0\x9F\x94\xA5 " + std::string(shown) + " was deleted: its link ended.";
+    else
+    {
+        text = "\xF0\x9F\x93\xA5 " + std::string(shown) + " was downloaded";
+        text += max_downloads ? " (" + std::to_string(downloads) + " of " + std::to_string(max_downloads) + ")."
+                              : " (" + std::to_string(downloads) + (downloads == 1 ? " time)." : " times).");
+        if (burn && max_downloads && downloads >= max_downloads)
+            text += " That was the last: it is deleted in a few minutes.";
+    }
+    std::string body = "{\"content\":";
+    body += '"' + sp_detail::json_escape(text) + '"';
+    body += ",\"text\":\"" + sp_detail::json_escape(text) + "\",\"event\":\"" + std::string(what) + "\",\"bucket\":\"" +
+            sp_detail::json_escape(bucket) + "\",\"key\":\"" + sp_detail::json_escape(key) + "\",\"downloads\":" +
+            std::to_string(downloads) + ",\"max_downloads\":" + std::to_string(max_downloads) + ",\"expires\":" +
+            std::to_string(expires_ms) + "}";
+    auto& h = m_hooks[url];
+    if (!h)
+    {
+        http_target t;
+        std::string why;
+        if (!parse_http_url(url, t, why))
+            return;
+        h = std::make_unique<hook_peer>();
+        h->peer = std::make_unique<http_peer>(m_loop, m_io, m_hash, t, std::string{}, "a link's webhook");
+    }
+    // At most a few waiting, so a webhook that does not answer cannot hold memory without bound.
+    if (h->queue.size() < 16)
+        h->queue.push_back(std::move(body));
+    h->used = std::chrono::steady_clock::now();
+    share_tell_next(url);
+    arm_sweep();
+}
+
+void storage_run::share_tell_next(const std::string& url)
+{
+    auto it = m_hooks.find(url);
+    if (it == m_hooks.end() || it->second->peer->busy() || it->second->queue.empty())
+        return;
+    hook_peer& h = *it->second;
+    const http_target& t = h.peer->target();
+    http_request req;
+    req.body = std::move(h.queue.front());
+    h.queue.pop_front();
+    req.head = "POST " + (t.path.empty() ? std::string("/") : t.path) + " HTTP/1.1\r\nHost: " + t.authority() +
+               "\r\nUser-Agent: socketley\r\nContent-Type: application/json\r\nContent-Length: " +
+               std::to_string(req.body.size()) + "\r\n\r\n";
+    h.peer->exchange(std::move(req), [this, url](http_answer a)
+    {
+        if (a.status < 200 || a.status >= 300)
+            LOG_WARN(("storage: a link's webhook answered " + std::to_string(a.status) +
+                      (a.failure.empty() ? std::string{} : " (" + a.failure + ")")).c_str());
+        share_tell_next(url);
     });
 }
 

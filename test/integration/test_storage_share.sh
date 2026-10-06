@@ -16,6 +16,8 @@
 #     lost by a restart or on the other shard
 #   * a folder link's ZIP not holding the folder, or counted as more than one
 #     download
+#   * a link's webhook not told of a download or of its files' removal, or a
+#     webhook taken that the runtime may not reach for its users
 #   * a link that burns leaving its file behind at its expiry, after its last
 #     download or at its revocation, removing it before, counting its page or
 #     a link preview as a download, or being made by one who may not delete
@@ -38,6 +40,9 @@ daemon_isolate stgshare
 trap 'daemon_stop' EXIT
 # A burning link's files outlive its last download by two seconds here, not ten minutes.
 export SOCKETLEY_SHARE_BURN_GRACE_SECS=2
+# A link's webhook here is a listener on this machine, which the runtime may reach only when this names it.
+HOOK_PORT=$((SL_PORT_BASE + 1919))
+export SOCKETLEY_SHARE_NOTIFY_ALLOW="http://127.0.0.1:$HOOK_PORT/"
 daemon_start "$BIN"
 P1=$((SL_PORT_BASE + 1909))
 U="http://127.0.0.1:$P1"
@@ -147,6 +152,33 @@ zl=$(mk "$A" '{"bucket":"ann","key":"album/","max_downloads":1}')
 check "a folder link's page offers its ZIP" "$(curl -s "$U/~share/$zl/" | grep -c 'href="?zip"')" 1
 check "which holds the folder" "$(curl -s -o "$T/l.zip" "$U/~share/$zl/?zip"; python3 -c 'import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); print(z.testzip(), [i.filename for i in z.infolist()])' "$T/l.zip")" "None ['one.jpg', 'sub/two.jpg']"
 check "and counts as one download" "$(code "$U/~share/$zl/?zip")" 410
+
+# A link's webhook, told of each download and of the removal of what burns.
+python3 - "$HOOK_PORT" "$T/hook" <<'PYEOF2' &
+import http.server, sys
+out = open(sys.argv[2], "a")
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        out.write(self.path + " " + body.decode() + "\n"); out.flush()
+        self.send_response(204); self.end_headers()
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PYEOF2
+HOOK_PID=$!
+trap 'kill $HOOK_PID 2>/dev/null; daemon_stop' EXIT
+sleep 0.5
+printf 'tell' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/ann/send/told.txt"
+check "a webhook the runtime may not reach is refused" "$(mk "$A" '{"bucket":"ann","key":"send/told.txt","notify":"http://169.254.169.254/latest"}')" 400
+hk=$(mk "$A" '{"bucket":"ann","key":"send/told.txt","max_downloads":1,"burn":true,"notify":"http://127.0.0.1:'"$HOOK_PORT"'/hook/x"}')
+check "the link says it tells a webhook" "$(curl -s -u "$A" "$U/~share" | python3 -c 'import json,sys; print([x["notify"] for x in json.load(sys.stdin) if x["id"]==sys.argv[1]])' "$hk")" "[True]"
+curl -s -o /dev/null "$U/~share/$hk?download"
+waithook() { for _ in $(seq 1 80); do grep -q "$1" "$T/hook" 2>/dev/null && return 0; sleep 0.25; done; return 1; }
+check "a download is told to its webhook, at its path" \
+      "$(waithook '"event":"downloaded"' && grep downloaded "$T/hook" | python3 -c 'import json,sys; l=sys.stdin.readline(); p,b=l.split(" ",1); d=json.loads(b); print(p, d["event"], d["key"], d["downloads"], d["max_downloads"], "told.txt was downloaded (1 of 1)" in d["content"])')" \
+      "/hook/x downloaded send/told.txt 1 1 True"
+check "and so is the removal of what burned, once whatever shard sees it" \
+      "$(waithook '"event":"deleted"' && sleep 6 && grep -c '"event":"deleted"' "$T/hook")" 1
 
 # Links that burn what they name, as a file sent once.
 gone() { for _ in $(seq 1 40); do [ "$(code -u "$A" "$U/~dav/ann/$1")" = 404 ] && { echo gone; return; }; sleep 0.5; done; echo there; }

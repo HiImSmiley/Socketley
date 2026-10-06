@@ -1025,6 +1025,18 @@ public:
     // Links that burn what they name, ended at their expiry or after their last download: looked over by the sweep.
     void share_burn_tick();
     void share_burn(std::string id, std::string bucket, std::string key, bool folder);
+    // A link's webhook told of a download or of its files' removal, in order, one exchange at a time per URL.
+    static bool notify_allowed(std::string_view url);
+    void share_tell(const std::string& url, std::string_view what, const std::string& bucket, const std::string& key,
+                    uint64_t downloads, uint64_t max_downloads, int64_t expires_ms, bool burn);
+    void share_tell_next(const std::string& url);
+    struct hook_peer
+    {
+        std::unique_ptr<http_peer> peer;
+        std::deque<std::string> queue;
+        std::chrono::steady_clock::time_point used{};
+    };
+    std::unordered_map<std::string, std::unique_ptr<hook_peer>> m_hooks;
     std::vector<std::string> share_records();
     // Who a request's change is told as: its user or "anonymous", and the client's address, left empty for a
     // bucket that sends no events.
