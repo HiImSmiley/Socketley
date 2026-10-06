@@ -1,80 +1,230 @@
 #!/bin/sh
-set -e
+# Installs socketley from a release .deb: it reads what the package needs, asks before installing each missing
+# dependency, and where socketley is installed already offers to upgrade or uninstall it.
+#
+#   curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.sh | sudo sh
+#   sudo sh install.sh [--deb FILE] [--yes] [--uninstall]
+set -eu
 
 REPO="HiImSmiley/Socketley"
+DEB=""
+YES=0
+UNINSTALL=0
 
-# Said here rather than by dpkg halfway through.  The README documents
-# `curl ... | sudo sh`, so the usual way to arrive without privileges is to have
-# dropped the sudo -- and without this the script gets as far as apt-get before
-# failing, having already changed the package lists of a machine whose owner
-# thought nothing had happened yet.
-if [ "$(id -u)" -ne 0 ]; then
-  echo "error: this installer must run as root" >&2
-  echo "  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | sudo sh" >&2
-  exit 1
+usage() {
+  cat <<'USAGE'
+usage: install.sh [--deb FILE] [--yes] [--uninstall]
+  --deb FILE    install this package instead of downloading the newest release
+  --yes         take every question's default answer (the capital letter) without asking
+  --uninstall   remove an installed socketley
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --deb) [ $# -ge 2 ] || { usage; exit 1; }; DEB=$2; shift 2 ;;
+    -y|--yes) YES=1; shift ;;
+    --uninstall) UNINSTALL=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+done
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# Said here rather than by dpkg halfway through: without sudo the script would get as far as apt before failing.
+[ "$(id -u)" -eq 0 ] || die "this installer must run as root: curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | sudo sh"
+command -v dpkg >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1 \
+  || die "this installer is for Debian and Ubuntu (dpkg and apt); the README says how to build from source elsewhere"
+
+# Questions are read from the terminal, since under curl | sh the script itself is standard input; apt and dpkg get
+# /dev/null, so they never take an answer typed for the next question.
+if [ "$YES" = 0 ] && ! ( : </dev/tty ) 2>/dev/null; then
+  die "there is no terminal to ask on; run with --yes to take every default"
+fi
+
+# ask QUESTION y|n -- true for yes, the second argument being the answer an empty line or --yes gives.
+ask() {
+  if [ "$YES" = 1 ]; then [ "$2" = y ]; return; fi
+  while :; do
+    if [ "$2" = y ]; then printf '%s [Y/n] ' "$1" >/dev/tty; else printf '%s [y/N] ' "$1" >/dev/tty; fi
+    read -r answer </dev/tty || answer=""
+    case "$answer" in
+      "") [ "$2" = y ]; return ;;
+      [yYjJ]*) return 0 ;;
+      [nN]*) return 1 ;;
+    esac
+  done
+}
+
+installed_version() { dpkg-query -W -f='${Status} ${Version}\n' "$1" 2>/dev/null | sed -n 's/^install ok installed //p'; }
+
+uninstall() {
+  if [ -n "$(installed_version socketley)" ]; then
+    apt-get remove -y -qq socketley </dev/null >/dev/null
+    echo "socketley is uninstalled."
+  else
+    echo "/usr/bin/socketley belongs to no package; it was installed from source, and"
+    echo "  bash scripts/install-from-source.sh --uninstall"
+    echo "in the clone it was built from removes exactly what that install put there."
+    exit 1
+  fi
+  if [ -d /var/lib/socketley ] || [ -d /etc/socketley ]; then
+    size=$(du -sh /var/lib/socketley /etc/socketley 2>/dev/null | awk '{print $1}' | paste -sd+)
+    if ask "Delete its runtimes and data as well (/var/lib/socketley, /etc/socketley: $size)? This cannot be undone." n; then
+      rm -rf /var/lib/socketley /etc/socketley
+      userdel socketley 2>/dev/null || true
+      groupdel socketley 2>/dev/null || true
+      echo "Its data, configuration and the socketley account are deleted."
+    else
+      echo "Its data is kept in /var/lib/socketley and /etc/socketley."
+    fi
+  fi
+}
+
+# What is there already.
+OLD=$(installed_version socketley)
+if [ -n "$OLD" ]; then
+  echo "socketley $OLD is installed."
+elif [ -e /usr/bin/socketley ]; then
+  OLD=unpackaged
+  echo "socketley is installed in /usr/bin, not from a package."
+fi
+
+if [ "$UNINSTALL" = 1 ]; then
+  [ -n "$OLD" ] || die "socketley is not installed"
+  uninstall
+  exit 0
+fi
+
+if [ -n "$OLD" ] && [ "$YES" = 0 ]; then
+  while :; do
+    printf '[u]pgrade, [r]emove or [c]ancel? [U/r/c] ' >/dev/tty
+    read -r answer </dev/tty || answer=c
+    case "$answer" in
+      ""|[uU]*) break ;;
+      [rR]*) uninstall; exit 0 ;;
+      [cC]*) echo "Nothing was changed."; exit 0 ;;
+    esac
+  done
 fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-echo "Fetching latest release..."
-URL=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-  | grep -oP '"browser_download_url": "\K[^"]*\.deb')
+# The package: the one given, or the newest release's, the one built for this distribution where there is one.
+if [ -z "$DEB" ]; then
+  command -v curl >/dev/null 2>&1 || die "curl is needed to download the release; or pass --deb FILE"
+  echo "Looking for the newest release..."
+  curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" -o "$TMP/release.json" \
+    || die "the newest release could not be read from GitHub; download a .deb and pass --deb FILE"
+  . /etc/os-release
+  URLS=$(sed -n 's/.*"browser_download_url": *"\([^"]*\.deb\)".*/\1/p' "$TMP/release.json")
+  URL=$(printf '%s\n' "$URLS" | grep -F "${ID}${VERSION_ID}" | head -1 || true)
+  [ -n "$URL" ] || URL=$(printf '%s\n' "$URLS" | head -1)
+  [ -n "$URL" ] || die "the newest release has no .deb"
+  echo "Downloading $(basename "$URL")..."
+  curl -fsSL "$URL" -o "$TMP/socketley.deb"
+  DEB="$TMP/socketley.deb"
+fi
+[ -r "$DEB" ] || die "$DEB cannot be read"
+NEW=$(dpkg-deb -f "$DEB" Version) || die "$DEB is not a .deb"
 
-if [ -z "$URL" ]; then
-  echo "error: no .deb found in latest release" >&2
+if [ "$OLD" = "$NEW" ] && ! ask "socketley $NEW is what is installed already. Install it again?" n; then
+  echo "Nothing was changed."
+  exit 0
+fi
+
+# What the package needs, held against what is installed and what apt can install.
+echo "Reading the package lists..."
+apt-get update -qq </dev/null || echo "warning: apt-get update failed; checking against the lists there are"
+WANT=""
+MISSING=0
+echo "socketley $NEW needs:"
+printf '%s\n' "$(dpkg-deb -f "$DEB" Depends)" | tr ',' '\n' | sed 's/^ *//; s/ *|.*//' | while read -r dep; do
+  [ -n "$dep" ] || continue
+  name=${dep%% *}
+  op=$(printf '%s' "$dep" | sed -n 's/.*(\([<>=]*\) *\(.*\))/\1/p')
+  ver=$(printf '%s' "$dep" | sed -n 's/.*(\([<>=]*\) *\(.*\))/\2/p')
+  have=$(installed_version "$name")
+  cand=$(apt-cache policy "$name" 2>/dev/null | sed -n 's/^ *Candidate: //p')
+  [ "$cand" = "(none)" ] && cand=""
+  fits() { [ -n "$1" ] && { [ -z "$op" ] || dpkg --compare-versions "$1" "$op" "$ver"; }; }
+  if fits "$have"; then
+    echo "  ok       $dep  (installed: $have)"
+  elif fits "$cand"; then
+    echo "  missing  $dep  (apt has $cand)"
+    echo "$name" >> "$TMP/want"
+  else
+    echo "  MISSING  $dep  (installed: ${have:-none}, apt has: ${cand:-none})"
+    echo "$name" >> "$TMP/unmet"
+  fi
+done
+
+if [ -s "$TMP/unmet" ]; then
+  echo
+  echo "This package was built for a newer distribution than this one: apt has no version of"
+  echo "$(paste -sd' ' "$TMP/unmet") that it accepts. Nothing was changed."
+  echo "A package built on this distribution installs here, or socketley builds from source:"
+  echo "  git clone https://github.com/${REPO} && cd Socketley && bash scripts/install-from-source.sh"
   exit 1
 fi
 
-echo "Downloading $(basename "$URL")..."
-curl -fsSL "$URL" -o "$TMP/socketley.deb"
-
-UPGRADE=false
-if dpkg -s socketley >/dev/null 2>&1; then
-  UPGRADE=true
+if [ -s "$TMP/want" ]; then
+  for name in $(cat "$TMP/want"); do
+    if ask "socketley needs $name. Install it?" y; then
+      WANT="$WANT $name"
+    else
+      MISSING=1
+    fi
+  done
+  [ "$MISSING" = 0 ] || die "socketley does not run without what it needs; nothing was installed"
 fi
 
-# apt, not dpkg, so the package's Depends (libc6, libssl3, libstdc++6) are installed with it; liburing is linked in.
-echo "Installing..."
-apt-get update -qq
-apt-get install -y -qq "$TMP/socketley.deb"
+# ffmpeg is the one thing a runtime can do without: the storage runtime's thumbnails and video streams are made by it.
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  cand=$(apt-cache policy ffmpeg 2>/dev/null | sed -n 's/^ *Candidate: //p')
+  if [ -n "$cand" ] && [ "$cand" != "(none)" ] \
+     && ask "Optional: ffmpeg ($cand) makes the storage runtime's thumbnails and video streams. Install it?" n; then
+    WANT="$WANT ffmpeg"
+  fi
+fi
 
-if [ "$UPGRADE" = true ]; then
-  echo "Done. A running daemon was restarted onto the new version."
+if [ -n "$WANT" ]; then
+  echo "Installing$WANT..."
+  # shellcheck disable=SC2086
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $WANT </dev/null >/dev/null
+fi
+
+echo "Installing socketley $NEW..."
+dpkg -i "$DEB" </dev/null >"$TMP/dpkg.log" 2>&1 || { cat "$TMP/dpkg.log" >&2; die "dpkg could not install $DEB"; }
+
+if [ -d /run/systemd/system ]; then
+  if [ "$(systemctl is-active socketley 2>/dev/null)" = active ]; then
+    echo "Done: socketley $NEW is running (systemctl status socketley)."
+  else
+    echo "Done: socketley $NEW is installed; start it with: systemctl start socketley"
+  fi
 else
-  echo "Done. The daemon is running: systemctl status socketley"
+  echo "Done: socketley $NEW is installed; with no systemd here, start it with: socketley daemon"
 fi
 
-cat <<'PERMS'
+# The IPC socket is 0660 socketley:socketley, so whoever ran sudo is offered the group that reaches it.
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && ! id -nG "$SUDO_USER" | tr ' ' '\n' | grep -qx socketley; then
+  if ask "Let $SUDO_USER run socketley commands (the group socketley, whose members administer the daemon)?" y; then
+    usermod -aG socketley "$SUDO_USER"
+    echo "$SUDO_USER is in the group socketley from their next login."
+  fi
+fi
 
-The daemon's IPC socket is 0660 socketley:socketley. Every socketley command
-goes through it, and a runtime's --lua script runs with the daemon's
-privileges, so reaching it is an administrative right. To grant it:
-
-  sudo usermod -aG socketley "$USER"     # then log in again
-
-PERMS
-
-# This script creates no directories of its own — the state directory's mode
-# comes from the package payload and the postinst, which set it to 0750. What
-# it owns is telling whoever ran it, and on an UPGRADE that is not optional:
-# every version before this one wrote those files world-readable with the
-# passwords in them, and no amount of tightening now un-reads what was already
-# readable.
-if [ "$UPGRADE" = true ]; then
+# Versions before 1.1.0 wrote the runtime records, each with its --master-pw in plaintext, readable to every account.
+if [ -n "$OLD" ] && [ "$OLD" != unpackaged ] && dpkg --compare-versions "$OLD" lt 1.1.0~; then
   cat <<'STATE'
-UPGRADE NOTE — read this one.
 
-Versions before this wrote /var/lib/socketley/runtimes/*.json with the mode the
-daemon's umask happened to give them: 0644 under systemd, 0666 from a shell
-with "umask 0". Those files carry each runtime's --master-pw in plaintext and
-the paths of its TLS private keys, so on a multi-user machine they were
-readable — and in the 0666 case writable — by every local account.
-
-The daemon narrows them to 0600 on its first start and says so in the log. It
-cannot undo the exposure. If this machine has accounts other than yours:
-
-  rotate every --master-pw    socketley edit <name>, or recreate the runtime
-
+Upgraded from a version that wrote /var/lib/socketley/runtimes/*.json readable
+to every local account, with each runtime's --master-pw in plaintext. The daemon
+narrows them to 0600 on its first start, which cannot undo the exposure: if this
+machine has accounts other than yours, rotate every --master-pw
+(socketley edit <name>, or recreate the runtime).
 STATE
 fi

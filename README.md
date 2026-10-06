@@ -90,7 +90,16 @@ curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.s
 
 Downloads the newest release `.deb` and installs it. Nothing is compiled, so it
 is minutes faster and gives you whatever the last tag was rather than what is on
-`main`.
+`main`. It lists what the package needs against what is installed, asks before
+installing each missing dependency (and offers ffmpeg, which the storage
+runtime's thumbnails and video streams use), and stops with the reason, having
+changed nothing, when the package was built for a newer distribution than yours.
+Where socketley is installed already it offers to upgrade or remove it, and a
+removal asks before deleting `/var/lib/socketley` and `/etc/socketley`.
+
+- `--deb FILE` installs a package you have instead of downloading one.
+- `--yes` takes every default without asking, for scripts.
+- `--uninstall` removes socketley.
 
 ### From source, step by step
 
