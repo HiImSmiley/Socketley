@@ -10129,34 +10129,8 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
         size_t written = static_cast<size_t>(cqe->res);
         if (written < total_submitted)
         {
-            // Advance past fully-written iovecs
-            size_t remaining = written;
-            uint32_t first_iov = 0;
-            for (; first_iov < conn->write_batch_count; first_iov++)
-            {
-                if (remaining < conn->write_iovs[first_iov].iov_len)
-                {
-                    conn->write_iovs[first_iov].iov_base =
-                        static_cast<char*>(conn->write_iovs[first_iov].iov_base) + remaining;
-                    conn->write_iovs[first_iov].iov_len -= remaining;
-                    break;
-                }
-                remaining -= conn->write_iovs[first_iov].iov_len;
-            }
-
-            // Shift remaining iovecs and batch refs to front
-            uint32_t new_count = conn->write_batch_count - first_iov;
-            if (first_iov > 0)
-            {
-                for (uint32_t i = 0; i < new_count; i++)
-                {
-                    conn->write_iovs[i] = conn->write_iovs[first_iov + i];
-                    conn->write_batch[i] = std::move(conn->write_batch[first_iov + i]);
-                }
-                for (uint32_t i = new_count; i < conn->write_batch_count; i++)
-                    conn->write_batch[i].clear();
-            }
-            conn->write_batch_count = new_count;
+            conn->write_batch_count =
+                socketley::drop_written(conn->write_batch, conn->write_iovs, conn->write_batch_count, written);
 
             // The remainder of a short write cannot be handed over, because
             // leaving write_pending set strands the connection mid-message.
@@ -10254,34 +10228,8 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
         size_t written = static_cast<size_t>(cqe->res);
         if (written < total_submitted)
         {
-            // Advance past fully-written iovecs
-            size_t remaining = written;
-            uint32_t first_iov = 0;
-            for (; first_iov < conn->write_batch_count; first_iov++)
-            {
-                if (remaining < conn->write_iovs[first_iov].iov_len)
-                {
-                    conn->write_iovs[first_iov].iov_base =
-                        static_cast<char*>(conn->write_iovs[first_iov].iov_base) + remaining;
-                    conn->write_iovs[first_iov].iov_len -= remaining;
-                    break;
-                }
-                remaining -= conn->write_iovs[first_iov].iov_len;
-            }
-
-            // Shift remaining iovecs and batch refs to front
-            uint32_t new_count = conn->write_batch_count - first_iov;
-            if (first_iov > 0)
-            {
-                for (uint32_t i = 0; i < new_count; i++)
-                {
-                    conn->write_iovs[i] = conn->write_iovs[first_iov + i];
-                    conn->write_batch[i] = std::move(conn->write_batch[first_iov + i]);
-                }
-                for (uint32_t i = new_count; i < conn->write_batch_count; i++)
-                    conn->write_batch[i].clear();
-            }
-            conn->write_batch_count = new_count;
+            conn->write_batch_count =
+                socketley::drop_written(conn->write_batch, conn->write_iovs, conn->write_batch_count, written);
 
             // The remainder of a short write cannot be handed over, because
             // leaving write_pending set strands the connection mid-message.

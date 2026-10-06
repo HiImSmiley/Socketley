@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <sys/uio.h>
 
 namespace socketley
 {
@@ -443,5 +444,44 @@ private:
     std::queue<T> m_queue;
     size_t        m_bytes{0};
 };
+
+// After a short write of `written` bytes, less than the batch holds: drops the entries sent whole and the front of the
+// next, moves what is left to the front with `move_entry(to, from)`, and returns how many entries are left.  Each iovec is
+// re-pointed through `bytes_of(i)`, the address entry i's bytes start at or nullptr where they do not live in the entry,
+// because a string of up to 15 bytes keeps its bytes inside itself and takes them along when it moves.
+template <class Move, class Bytes>
+uint32_t drop_written(struct iovec* iovs, uint32_t count, size_t written, Move&& move_entry, Bytes&& bytes_of)
+{
+    uint32_t first = 0;
+    while (first < count && written >= iovs[first].iov_len)
+        written -= iovs[first++].iov_len;
+    const uint32_t left = count - first;
+    for (uint32_t i = 0; i < left; ++i)
+    {
+        const uint32_t from = first + i;
+        const size_t   skip = i == 0 ? written : 0;
+        char* const    at   = static_cast<char*>(iovs[from].iov_base) + skip;
+        const size_t   len  = iovs[from].iov_len - skip;
+        const char*    old  = bytes_of(from);
+        const size_t   off  = old ? static_cast<size_t>(at - old) : 0;
+        if (from != i)
+            move_entry(i, from);
+        const char* now = bytes_of(i);
+        iovs[i].iov_base = now ? const_cast<char*>(now) + off : at;
+        iovs[i].iov_len  = len;
+    }
+    return left;
+}
+
+// The same for a batch of write_chunks, whose slots past what is left are cleared so a borrowed one gives its buffer back.
+inline uint32_t drop_written(write_chunk* batch, struct iovec* iovs, uint32_t count, size_t written)
+{
+    const uint32_t left = drop_written(
+        iovs, count, written, [&](uint32_t to, uint32_t from) { batch[to] = std::move(batch[from]); },
+        [&](uint32_t i) { return batch[i].data(); });
+    for (uint32_t i = left; i < count; ++i)
+        batch[i].clear();
+    return left;
+}
 
 }  // namespace socketley

@@ -346,3 +346,59 @@ TEST_CASE("a slice survives being copied and moved, and keeps its segment alive"
     CHECK_FALSE(moved.owns());                       // never appended to: the bytes are shared
     CHECK(moved.continues_at(nullptr, 12) == false);
 }
+
+namespace {
+// What a writev of these iovecs would send, as the kernel reads them.
+std::string sent_by(const struct iovec* iovs, uint32_t n)
+{
+    std::string out;
+    for (uint32_t i = 0; i < n; ++i)
+        out.append(static_cast<const char*>(iovs[i].iov_base), iovs[i].iov_len);
+    return out;
+}
+}  // namespace
+
+TEST_CASE("after a short write the rest of the batch is sent from where its short strings moved to")
+{
+    // Strings of up to 15 bytes keep their bytes inside themselves, so moving one to the front of the batch moves its
+    // bytes, and an iovec still naming the old slot sent what the move and the clear left there: a proxy relayed
+    // "\0000007" and "\0\3\0\0\0\0\0\0" in place of a record's first bytes once a backend's socket filled.
+    socketley::write_chunk batch[4] = { std::string("0123456789"), std::string("00000076|<"),
+                                        std::string("short"), std::string(100, 'x') };
+    struct iovec iovs[4];
+    for (int i = 0; i < 4; ++i)
+        iovs[i] = { const_cast<char*>(batch[i].data()), batch[i].size() };
+
+    const uint32_t left = socketley::drop_written(batch, iovs, 4, 10);
+    REQUIRE(left == 3);
+    CHECK(sent_by(iovs, left) == "00000076|<short" + std::string(100, 'x'));
+    for (uint32_t i = 0; i < left; ++i)
+        CHECK(iovs[i].iov_base == batch[i].data());
+    CHECK(batch[3].size() == 0);                     // the vacated slot is cleared
+
+    // Part of the first entry left as well: the iovec starts inside the moved bytes.
+    const uint32_t again = socketley::drop_written(batch, iovs, left, 13);
+    REQUIRE(again == 2);
+    CHECK(sent_by(iovs, again) == "rt" + std::string(100, 'x'));
+    CHECK(iovs[0].iov_base == batch[0].data() + 3);
+}
+
+TEST_CASE("bytes that do not live in their entry are sent from where they were")
+{
+    // A ring buffer lent to the queue, or a shared segment, stays put however the entry holding it moves.
+    const std::string lent = "lent-bytes";
+    socketley::write_chunk batch[2] = { std::string("ab"), std::string() };
+    struct iovec iovs[2] = { { const_cast<char*>(batch[0].data()), 2 },
+                             { const_cast<char*>(lent.data()), lent.size() } };
+    bool owned[2] = { true, false };
+    const uint32_t left = socketley::drop_written(
+        iovs, 2, 4,
+        [&](uint32_t to, uint32_t from)
+        {
+            batch[to] = std::move(batch[from]);
+            owned[to] = owned[from];
+        },
+        [&](uint32_t i) -> const char* { return owned[i] ? batch[i].data() : nullptr; });
+    REQUIRE(left == 1);
+    CHECK(sent_by(iovs, left) == "nt-bytes");
+}

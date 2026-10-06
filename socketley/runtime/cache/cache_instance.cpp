@@ -2586,32 +2586,18 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         size_t written = static_cast<size_t>(cqe->res);
         if (written < total_submitted)
         {
-            size_t remaining = written;
-            uint32_t first_iov = 0;
-            for (; first_iov < conn->write_batch_count; first_iov++)
-            {
-                if (remaining < conn->write_iovs[first_iov].iov_len)
+            // A shared segment's bytes are on the heap and stay put, an owned string's move with it.
+            const uint32_t new_count = socketley::drop_written(
+                conn->write_iovs, conn->write_batch_count, written,
+                [&](uint32_t to, uint32_t from)
                 {
-                    conn->write_iovs[first_iov].iov_base =
-                        static_cast<char*>(conn->write_iovs[first_iov].iov_base) + remaining;
-                    conn->write_iovs[first_iov].iov_len -= remaining;
-                    break;
-                }
-                remaining -= conn->write_iovs[first_iov].iov_len;
-            }
-
-            uint32_t new_count = conn->write_batch_count - first_iov;
-            if (first_iov > 0)
-            {
-                for (uint32_t i = 0; i < new_count; i++)
-                {
-                    conn->write_iovs[i] = conn->write_iovs[first_iov + i];
-                    conn->write_batch[i] = std::move(conn->write_batch[first_iov + i]);
-                    conn->write_batch_seg[i] = std::move(conn->write_batch_seg[first_iov + i]);
-                }
-                for (uint32_t i = new_count; i < conn->write_batch_count; i++)
-                    { conn->write_batch[i].clear(); conn->write_batch_seg[i].reset(); }
-            }
+                    conn->write_batch[to]     = std::move(conn->write_batch[from]);
+                    conn->write_batch_seg[to] = std::move(conn->write_batch_seg[from]);
+                },
+                [&](uint32_t i) -> const char*
+                { return conn->write_batch_seg[i] ? nullptr : conn->write_batch[i].data(); });
+            for (uint32_t i = new_count; i < conn->write_batch_count; i++)
+                { conn->write_batch[i].clear(); conn->write_batch_seg[i].reset(); }
             conn->write_batch_count = new_count;
 
             conn->write_pending = true;
