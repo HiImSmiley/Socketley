@@ -1853,8 +1853,8 @@ class MsePlayer {
         }
         // The init of a stream just switched to is fetched beside its first segment, not before it.
         const t0 = performance.now();
-        const want = [fetch(seg.url, { signal: this.ctl.signal })];
-        if (this.inited !== level) want.push(fetch(list.init, { signal: this.ctl.signal }));
+        const want = [fetch(seg.url, { signal: this.ctl.signal, priority: 'high' })];
+        if (this.inited !== level) want.push(fetch(list.init, { signal: this.ctl.signal, priority: 'high' }));
         const [res, ires] = await Promise.all(want);
         if (!res.ok) throw new Error('segment ' + res.status);
         const t1 = performance.now();
@@ -1991,6 +1991,7 @@ async function playVideo(it, list) {
   closeAudio();
   const L = overlay('theater');
   const O = L.o;
+  watchingStart();
   const v = el('video', { playsinline: '', preload: 'auto' });
   const spin = el('div', { class: 'spin' });
   const chips = el('div', { class: 'chips' });
@@ -2125,6 +2126,7 @@ async function playVideo(it, list) {
   document.addEventListener('keydown', keys);
   L.esc = () => { if (pm) closeMenu(); else if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); else L.close(); };
   L.onclose = () => {
+    watchingEnd();
     savePosition(it, v.currentTime, v.duration, true);
     clearInterval(saveT); clearInterval(upT); clearTimeout(idleT);
     document.removeEventListener('keydown', keys); document.removeEventListener('fullscreenchange', onfs);
@@ -2208,7 +2210,7 @@ async function playVideo(it, list) {
 
 // ─── music ──────────────────────────────────────────────────────────────────
 let AU = null;
-function closeAudio() { if (AU) { AU.a.pause(); AU.a.removeAttribute('src'); AU.a.load(); AU.bar.remove(); AU = null; document.body.classList.remove('audio'); paintPlaying(); } }
+function closeAudio() { if (AU) { watchingEnd(); AU.a.pause(); AU.a.removeAttribute('src'); AU.a.load(); AU.bar.remove(); AU = null; document.body.classList.remove('audio'); paintPlaying(); } }
 async function playAudio(it, list) {
   if (!AU) {
     const a = el('audio', { preload: 'auto' });
@@ -2226,6 +2228,7 @@ async function playAudio(it, list) {
     a.addEventListener('ended', () => { if (AU.i < AU.list.length - 1) skip(1); });
     a.volume = +store.get('skl-vol', '1') || 1;
     document.body.append(bar); document.body.classList.add('audio');
+    watchingStart();
     if ('mediaSession' in navigator) { navigator.mediaSession.setActionHandler('previoustrack', () => skip(-1)); navigator.mediaSession.setActionHandler('nexttrack', () => skip(1)); }
   }
   AU.list = list; AU.i = Math.max(0, list.findIndex(x => keyOf(x) === keyOf(it)));
@@ -2533,7 +2536,18 @@ function sendDlg(preset) {
 // not given up, and taken up again when the line is back or on a click, and one a closed or reloaded page left
 // behind is remembered in localStorage and taken up again once its file is chosen anew, from the parts the server
 // says arrived.
-const UP = { jobs: [], busy: 0, slots: 4, ui: null, rate: 0, lastBytes: 0, lastT: 0, ticking: 0 };
+const UP = { jobs: [], busy: 0, slots: 4, ui: null, rate: 0, lastBytes: 0, lastT: 0, ticking: 0, watching: 0 };
+// A browser keeps six connections to a server that speaks HTTP/1.1, as this one does; while a film or a song plays,
+// uploads take one of them, so the player's segments never wait behind them, and four again once it is closed.
+const upSlots = () => UP.watching ? 1 : UP.slots;
+// The requests past that one give way at once: each is ended and its part, or its file sent whole, is queued again;
+// the one furthest along goes on.
+function watchingStart() {
+  UP.watching++;
+  const data = UP.jobs.flatMap(j => [...j.xhrs].filter(x => x._data)).sort((a, b) => (b._sent || 0) - (a._sent || 0));
+  for (const x of data.slice(1)) { x._yield = true; x.abort(); }
+}
+function watchingEnd() { UP.watching = Math.max(0, UP.watching - 1); if (UP.jobs.length) schedule(); }
 const PART_FROM = 48 << 20;
 function partSize(n) { return Math.max(16 << 20, Math.ceil(n / 9000 / (1 << 20)) << 20); }
 const KEEP = 'skl-upload:';
@@ -2600,8 +2614,10 @@ function xhr(j, method, url, body, headers, onprog) {
     x.open(method, url);
     x.setRequestHeader('X-Socketley-UI', '1');
     for (const [k, v] of Object.entries(headers || {})) x.setRequestHeader(k, v);
-    if (onprog) x.upload.onprogress = e => onprog(e.loaded);
-    x.onloadend = () => { j.xhrs.delete(x); res({ status: x.status, text: x.responseText || '', etag: x.getResponseHeader('ETag') }); };
+    // A request carrying a file's bytes, and how many it has sent, which the player's turn looks at.
+    x._data = method === 'PUT';
+    x.upload.onprogress = e => { x._sent = e.loaded; if (onprog) onprog(e.loaded); };
+    x.onloadend = () => { j.xhrs.delete(x); res({ status: x.status, text: x.responseText || '', etag: x.getResponseHeader('ETag'), yielded: !!x._yield }); };
     j.xhrs.add(x);
     x.send(body);
   });
@@ -2629,7 +2645,7 @@ function nextTask() {
 }
 function schedule() {
   if (!UP.ticking) UP.ticking = setInterval(tick, 500);
-  while (UP.busy < UP.slots) {
+  while (UP.busy < upSlots()) {
     const n = nextTask(); if (!n) break;
     const [j, t] = n;
     UP.busy++; j.active = (j.active || 0) + 1;
@@ -2670,6 +2686,7 @@ async function putWhole(j) {
     const r = await xhr(j, 'PUT', url(j), c.body, Object.assign(typeOf(j.file) ? { 'Content-Type': typeOf(j.file) } : {}, c.crc), n => { j.inflight.set(0, n); });
     j.inflight.clear();
     if (j.state === 'canceled') return;
+    if (r.yielded) { j.state = 'queued'; return; }
     if (r.status >= 200 && r.status < 300) { j.sent = j.size; return done(j); }
     if ((r.status === 0 || r.status >= 500 || badDigest(r)) && ++j.tries < 4) { await sleep(1000 * j.tries); continue; }
     return failed(j, r);
@@ -2693,6 +2710,7 @@ async function sendPart(j, p) {
     c = null;
     j.inflight.delete(p.n);
     if (j.state === 'canceled' || j.state === 'error') return;
+    if (r.yielded) { p.state = 'todo'; return; }
     if (r.status === 200 && r.etag) { if (p.state !== 'done') { p.etag = r.etag; p.state = 'done'; j.sent += p.to - p.from; } return; }
     if (j.state === 'paused') { p.state = 'todo'; return; }
     if ((r.status === 0 || r.status >= 500 || badDigest(r)) && ++p.tries < 5) { await sleep(800 * p.tries); continue; }

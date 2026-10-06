@@ -9816,7 +9816,10 @@ their date (the camera's, see
 else the object's); and pictures play as a slideshow. It uploads several files at once,
 and a file of 48 MiB or more in parts of at least 16 MiB, four requests side by
 side shared among up to three files, each going to the file with the fewest on
-the way, through the drive's multipart above, with each file's percentage, rate,
+the way, through the drive's multipart above; while a film or a song plays,
+uploads keep one request, since a browser opens six connections at most to a
+server that speaks HTTP/1.1 as this one does, and take four again once it is
+closed, with each file's percentage, rate,
 time left and start; folders too, by dropping them or choosing one. A file in
 parts whose line is lost is paused and goes on when the line is back, and one a
 closed or reloaded page left is shown again, with how far it came, and goes on
