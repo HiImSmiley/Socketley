@@ -57,7 +57,11 @@ ask() {
   done
 }
 
-installed_version() { dpkg-query -W -f='${Status} ${Version}\n' "$1" 2>/dev/null | sed -n 's/^install ok installed //p'; }
+# The version of this machine's architecture, as a host with i386 alongside lists a library once per architecture.
+installed_version() {
+  dpkg-query -W -f='${Status} ${Architecture} ${Version}\n' "$1" 2>/dev/null \
+    | awk -v arch="$(dpkg --print-architecture)" '$3 == "installed" && ($4 == arch || $4 == "all") { print $5; exit }'
+}
 
 uninstall() {
   if [ -n "$(installed_version socketley)" ]; then
