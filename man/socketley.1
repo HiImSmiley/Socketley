@@ -9810,6 +9810,21 @@ case, in every library the user lists (or the one named), folders first, at most
 true when there were more or a library was too large to list whole; a file is
 listed only where the user may read it. Each library is listed whole for it.
 .IP
+.B GET /~ui/usage
+lists every library the user lists with its owner, whether it is shared with
+the user, its bytes and objects, summed from its listing (which holds every
+shard's keys) and kept a minute, with
+.B partial
+when it was too large to list whole, and its quota; besides, the user's own quota
+over the libraries it owns, and whether the user is an admin.
+.B POST /~ui/usage
+with
+.B {"bucket", "max_bytes", "max_objects"}
+sets a library's quota as
+.B ?quota
+does, 0 for none, and like it is an admin's alone. The page's Storage shows them
+as bars.
+.IP
 .B GET /~ui/access?bucket=\fIname\fR
 says who else a library is shared with, and
 .B POST /~ui/access

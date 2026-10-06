@@ -17,6 +17,7 @@
 #include "digest.h"
 #include "json_doc.h"
 #include "s3_names.h"
+#include "s3_quota.h"
 #include "small_file.h"
 #include "../../shared/http_framing.h"
 #include "../../shared/state_persistence.h"
@@ -270,6 +271,11 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
         ui_search(c);
         return;
     }
+    if (r.key == "usage")
+    {
+        ui_usage(c);
+        return;
+    }
     if (r.method != "GET" && r.method != "HEAD")
     {
         app_reply(c, 405, "The interface is read only.\n");
@@ -462,7 +468,9 @@ void storage_run::ui_progress(const std::shared_ptr<conn>& c)
 
 void storage_run::ui_body(const std::shared_ptr<conn>& c)
 {
-    if (c->req.key == "access")
+    if (c->req.key == "usage")
+        ui_usage_body(c);
+    else if (c->req.key == "access")
         ui_access_body(c);
     else
         ui_progress_body(c);
@@ -804,6 +812,143 @@ void storage_run::ui_search(const std::shared_ptr<conn>& c)
         });
     };
     h->step();
+}
+
+// GET lists every library the user lists with its owner, its bytes and objects (summed from its listing, which
+// every shard's keys are in, and kept a minute), whether it is shared with the user, and its quota; the user's own
+// quota over the libraries it owns; and whether the user is an admin. POST {bucket, max_bytes, max_objects} sets a
+// library's quota, 0 for none, an admin's alone as ?quota is.
+void storage_run::ui_usage(const std::shared_ptr<conn>& c)
+{
+    s3_request& r = c->req;
+    if (r.method != "GET" && r.method != "POST")
+    {
+        app_reply(c, 405, "Usage is read with GET and a quota set with POST.\n");
+        return;
+    }
+    if (!app_login(c, "socketley"))
+        return;
+    if (r.method == "POST")
+    {
+        if (c->user && !c->user->admin)
+        {
+            app_reply(c, 403, "Only an admin sets a quota.\n");
+            return;
+        }
+        if (r.chunked || (r.has_content_length && r.content_length > 16 * 1024))
+        {
+            r.keep_alive = false;
+            app_reply(c, 413, "Request body too large.\n");
+            return;
+        }
+        collect_body(c, 16 * 1024);
+        return;
+    }
+    struct tally
+    {
+        std::vector<bucket_info> buckets;
+        size_t at{0};
+        std::function<void()> step;
+    };
+    auto t = std::make_shared<tally>();
+    for (const bucket_info& b : m_store.buckets())
+        if (lists_bucket(c, b))
+            t->buckets.push_back(b);
+    std::weak_ptr<conn> weak = c;
+    t->step = [this, weak, wt = std::weak_ptr<tally>(t)]()
+    {
+        auto t = wt.lock();
+        auto cc = weak.lock();
+        if (!t || !cc || cc->dead)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        // The next library not counted within the minute is listed; the answer is made once all are.
+        while (t->at < t->buckets.size())
+        {
+            const std::string& name = t->buckets[t->at].name;
+            auto it = m_usage.find(name);
+            if (it != m_usage.end() && now - it->second.at < std::chrono::seconds(60))
+            {
+                ++t->at;
+                continue;
+            }
+            app_list(name, list_query{}, [this, t, name](st s, list_page p)
+            {
+                usage_count u;
+                u.at = std::chrono::steady_clock::now();
+                u.partial = s != st::ok || p.truncated;
+                for (const list_entry& e : p.objects)
+                {
+                    u.bytes += e.meta.size;
+                    ++u.objects;
+                }
+                m_usage[name] = u;
+                ++t->at;
+                t->step();
+            });
+            return;
+        }
+        const user_identity* u = cc->user.get();
+        const std::string me = u ? u->id : std::string(default_owner);
+        std::string o = "{\"admin\":";
+        o += !u || u->admin ? "true" : "false";
+        o += ",\"user\":";
+        jstr(o, u ? u->id : std::string{});
+        o += ",\"user_max_bytes\":" + std::to_string(u ? m_auth->max_bytes_of(u->id) : 0) + ",\"libraries\":[";
+        bool first = true;
+        for (const bucket_info& b : t->buckets)
+        {
+            const usage_count& n = m_usage[b.name];
+            const std::string owner = b.owner.empty() ? std::string(default_owner) : b.owner;
+            o += first ? "{\"bucket\":" : ",{\"bucket\":";
+            first = false;
+            jstr(o, b.name);
+            o += ",\"owner\":";
+            jstr(o, owner);
+            o += owner == me ? ",\"shared\":false" : ",\"shared\":true";
+            o += ",\"bytes\":" + std::to_string(n.bytes) + ",\"objects\":" + std::to_string(n.objects);
+            o += n.partial ? ",\"partial\":true" : ",\"partial\":false";
+            if (const auto q = m_store.bucket_quota_of(b.name))
+                o += ",\"max_bytes\":" + std::to_string(q->max_bytes) + ",\"max_objects\":" + std::to_string(q->max_objects);
+            o += "}";
+        }
+        o += "]}";
+        app_reply(cc, 200, std::move(o), "application/json");
+    };
+    t->step();
+}
+
+void storage_run::ui_usage_body(const std::shared_ptr<conn>& c)
+{
+    jvalue req;
+    if (!json_reader(c->body).document(req))
+    {
+        app_reply(c, 400, "The body is a JSON object: bucket, max_bytes and max_objects.\n");
+        return;
+    }
+    const std::string bucket = str_of(req, "bucket");
+    const double mb = num_of(req, "max_bytes"), mo = num_of(req, "max_objects");
+    if (!m_store.has_bucket(bucket))
+    {
+        app_reply(c, 404, "No such bucket.\n");
+        return;
+    }
+    if (!(mb >= 0) || !(mo >= 0))
+    {
+        app_reply(c, 400, "A quota is 0 or more.\n");
+        return;
+    }
+    std::string xml;
+    if (mb > 0 || mo > 0)
+    {
+        xml = "<BucketQuota>";
+        if (mb > 0)
+            xml += "<MaxBytes>" + std::to_string(static_cast<uint64_t>(mb)) + "</MaxBytes>";
+        if (mo > 0)
+            xml += "<MaxObjects>" + std::to_string(static_cast<uint64_t>(mo)) + "</MaxObjects>";
+        xml += "</BucketQuota>";
+    }
+    store_doc(c, bucket_doc::quota, bucket, std::move(xml), 204);
 }
 
 }   // namespace socketley::storage

@@ -23,6 +23,8 @@
 #     may not read, or shown after the film was replaced
 #   * a search missing a file or folder by part of its name in any case,
 #     or finding one the user may not list
+#   * a library's size in the usage not its bytes, a user seeing another's
+#     library there, or a quota set by one who is not an admin
 #   * a library shared with a user not listed or not readable by them, giving
 #     more than it says, shared by one who may not, or its policy's other
 #     statements lost when it is shared or unshared
@@ -54,7 +56,11 @@ cat > "$T/creds" <<EOF
 AKIADAVANN0000000000:davannsecretdavannsecretdavannsecret0000
 [ben]
 AKIADAVBEN0000000000:davbensecretdavbensecretdavbensecret0000
+[boss]
+admin = true
+AKIADAVBOSS000000000:davbosssecretdavbosssecretdavbosssecret00
 EOF
+R="AKIADAVBOSS000000000:davbosssecretdavbosssecretdavbosssecret00"
 A="AKIADAVANN0000000000:davannsecretdavannsecretdavannsecret0000"
 B="AKIADAVBEN0000000000:davbensecretdavbensecretdavbensecret0000"
 "$BIN" create storage dav -p "$P1" --dir "$T/dav" --credentials "$T/creds" --shards 2 -s >/dev/null 2>&1
@@ -265,6 +271,18 @@ check "a search finds a file by part of its name, in any case" "$(srch "$A" ONE.
 check "and a folder by its own name" "$(srch "$A" sub)" "[('docs', 'a/sub/')]"
 check "a search of another user finds nothing of the first's" "$(srch "$B" one)" "[]"
 check "one character is not a search" "$(code -u "$A" "$U/~ui/search?q=o")" 400
+
+# How full each library is.
+use() { curl -s -u "$1" "$U/~ui/usage" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["admin"], [(l["bucket"], l["objects"], l["bytes"]) for l in d["libraries"]])'; }
+want=$(s3 "$U/docs?list-type=2" | python3 -c 'import sys,re; t=sys.stdin.read(); print(len(re.findall("<Key>",t)), sum(int(x) for x in re.findall("<Size>([0-9]+)",t)))')
+check "a library's usage is its objects and their bytes, summed on both shards" "$(use "$A")" "False [('docs', ${want% *}, ${want#* })]"
+check "another user sees none of it" "$(use "$B")" "False []"
+check "an admin sees every library" "$(use "$R" | cut -c1-14)" "True [('docs',"
+setq() { curl -s -u "$1" -o /dev/null -w '%{http_code}' -X POST -d '{"bucket":"docs","max_bytes":'"$2"',"max_objects":0}' "$U/~ui/usage"; }
+check "the owner sets no quota" "$(setq "$A" 1000)" 403
+check "an admin does, which ?quota then says" "$(setq "$R" 123456789) $(curl -s --aws-sigv4 "aws:amz:us-east-1:s3" -u "$R" "$U/docs?quota" | grep -o '<MaxBytes>[0-9]*' | cut -d'>' -f2)" "204 123456789"
+check "and the usage shows" "$(curl -s -u "$A" "$U/~ui/usage" | python3 -c 'import json,sys; print(json.load(sys.stdin)["libraries"][0]["max_bytes"])')" 123456789
+check "0 takes it away" "$(setq "$R" 0) $(curl -s --aws-sigv4 "aws:amz:us-east-1:s3" -u "$R" -o /dev/null -w '%{http_code}' "$U/docs?quota")" "204 404"
 
 # A library shared with another user, as statements of its policy.
 acc() { curl -s -u "$1" -o /dev/null -w '%{http_code}' -X POST -d "{\"bucket\":\"docs\",\"user\":\"$2\",\"access\":\"$3\"}" "$U/~ui/access"; }

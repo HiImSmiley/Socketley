@@ -901,6 +901,18 @@ public:
     void ui_access(const std::shared_ptr<conn>& c);
     // Files and folders whose name holds a text, in every library the user lists, /~ui/search.
     void ui_search(const std::shared_ptr<conn>& c);
+    // How full each library the user lists is, and an admin's quota on one, /~ui/usage.
+    void ui_usage(const std::shared_ptr<conn>& c);
+    void ui_usage_body(const std::shared_ptr<conn>& c);
+    // A library's size summed from its listing, kept a minute: the bytes, the objects, and whether it was too large
+    // to list whole.
+    struct usage_count
+    {
+        uint64_t bytes{0}, objects{0};
+        bool     partial{false};
+        std::chrono::steady_clock::time_point at{};
+    };
+    std::unordered_map<std::string, usage_count> m_usage;
     void ui_access_body(const std::shared_ptr<conn>& c);
     void ui_body(const std::shared_ptr<conn>& c);
     void app_reply(const std::shared_ptr<conn>& c, int status, std::string body = {},
