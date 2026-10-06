@@ -143,6 +143,7 @@ void storage_run::app_body(const std::shared_ptr<conn>& c)
     {
         case app_dav: dav_body(c); return;
         case app_share: share_body(c); return;
+        case app_ui: ui_body(c); return;
         default: send_error(c, make_error("InternalError")); return;
     }
 }

@@ -9754,6 +9754,20 @@ a new one. A file's
 .B GET /~dav/\fIbucket\fB/\fIkey\fB?download
 is saved under its name.
 .IP
+.B GET /~ui/progress
+lists the films the signed\-in user has part watched, the most recent first,
+with the position, the length, the size and the type; only those the user may
+still read, in the version watched, so one replaced or removed since, or whose
+access was taken away, is left out.
+.B POST /~ui/progress
+with
+.B {"bucket", "key", "t", "d"}
+keeps where one was left (t below 0 forgets it). Each user's positions are a
+file of their own,
+.IR dir /.ui/progress/,
+changed entry by entry under a lock, so two devices watching different films
+keep both; the latest 200 are kept. Nodes of a cluster keep their own.
+.IP
 It plays films and music, with their subtitles: the file itself where the
 browser plays it, which costs the server nothing, and otherwise the master
 playlist's streams through Media Source Extensions, the copied one where the

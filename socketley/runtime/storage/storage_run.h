@@ -880,8 +880,10 @@ public:
     static bool has_ui_cookie(const conn& c);
     // A Content-Disposition that saves `key` under its last name, as ?download asks.
     static std::string attachment_of(std::string_view key);
-    // The interface's sign-in, /~ui/session.
+    // The interface's sign-in (/~ui/session) and the films a user has part watched (/~ui/progress).
     void ui_session(const std::shared_ptr<conn>& c);
+    void ui_progress(const std::shared_ptr<conn>& c);
+    void ui_body(const std::shared_ptr<conn>& c);
     void app_reply(const std::shared_ptr<conn>& c, int status, std::string body = {},
                    std::string_view type = "text/plain; charset=utf-8");
     void op_share(const std::shared_ptr<conn>& c);

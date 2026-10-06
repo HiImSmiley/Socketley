@@ -16,6 +16,8 @@
 #     key's secret changed, readable by script, or taking a change that does
 #     not carry the interface's header; a session extending itself
 #   * a file read with ?download not saved under its name
+#   * a user's watch positions seen by another user, kept for what the user
+#     may not read, or shown after the film was replaced
 #   * an rclone mount's copy of a tree not coming back byte for byte
 # suite: isolated
 set -uo pipefail
@@ -215,6 +217,21 @@ check "a file read with ?download is saved under its name" \
       "Content-Disposition: attachment; filename=\"one.txt\"; filename*=UTF-8''one.txt"
 check "signing out clears the cookie" "$(curl -s -X DELETE -D - -o /dev/null "$U/~ui/session" | grep -i '^set-cookie: skl_ui=;' | grep -c 'Max-Age=0')" 1
 
+# Watch positions, a user's own.
+pos() { curl -s -b "skl_ui=$ck" -H 'X-Socketley-UI: 1' -o /dev/null -w '%{http_code}' -X POST -d "$1" "$U/~ui/progress"; }
+check "a position is kept" "$(pos '{"bucket":"docs","key":"huge.bin","t":61.5,"d":3600}')" 204
+check "beside another" "$(pos '{"bucket":"docs","key":"cookie.txt","t":3,"d":10}')" 204
+check "and both are listed, the latest first" \
+      "$(curl -s -b "skl_ui=$ck" "$U/~ui/progress" | python3 -c 'import json,sys; print([(x["key"], x["t"]) for x in json.load(sys.stdin)])')" \
+      "[('cookie.txt', 3.0), ('huge.bin', 61.5)]"
+check "one past the film's end is refused" "$(pos '{"bucket":"docs","key":"huge.bin","t":99,"d":10}')" 400
+check "and one in what does not exist" "$(pos '{"bucket":"docs","key":"nope","t":1,"d":10}')" 404
+check "another user keeps none in what it may not read" "$(curl -s -u "$B" -o /dev/null -w '%{http_code}' -X POST -d '{"bucket":"docs","key":"huge.bin","t":1,"d":10}' "$U/~ui/progress")" 403
+check "nor sees the first user's" "$(curl -s -u "$B" "$U/~ui/progress")" "[]"
+printf 'new' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/docs/cookie.txt"
+check "a film replaced since is no longer listed" \
+      "$(curl -s -b "skl_ui=$ck" "$U/~ui/progress" | python3 -c 'import json,sys; print([x["key"] for x in json.load(sys.stdin)])')" "['huge.bin']"
+check "a position below 0 forgets one" "$(pos '{"bucket":"docs","key":"huge.bin","t":-1,"d":3600}') $(curl -s -b "skl_ui=$ck" "$U/~ui/progress")" "204 []"
 s3 -o /dev/null -X DELETE "$U/docs/cookie.txt"
 
 # A client of the drive: rclone copies a tree in and out.
