@@ -408,6 +408,25 @@ select.inp option{background:#151821}
   backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);animation:rise .25s}
 #audio .art{width:52px;height:52px;border-radius:10px;background:var(--grad);display:flex;align-items:center;justify-content:center;flex:none;box-shadow:0 8px 20px -8px rgba(var(--glow),.8)}
 #audio .art .i{color:#fff;width:24px;height:24px}
+#audio .art{position:relative;overflow:hidden}#audio .art img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.album{display:grid;grid-template-columns:200px 1fr;gap:28px;margin:34px 0;align-items:start}
+.album .art{position:relative;aspect-ratio:1;border-radius:14px;overflow:hidden;background:linear-gradient(135deg,rgba(var(--glow),.28),rgba(var(--glow2),.12));display:flex;align-items:center;justify-content:center;box-shadow:var(--sh)}
+.album .art img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.album .art .i{width:56px;height:56px;color:rgba(255,255,255,.6)}
+.album .kick{font-size:11.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--a1)}
+.album h2{margin:4px 0 2px;font-size:28px;line-height:1.15;font-weight:800;letter-spacing:-.01em}
+.album .by{color:var(--mut);margin-bottom:14px}
+.album .acts{display:flex;gap:8px;margin-bottom:12px}
+.album .trk{display:flex;flex-direction:column}
+.album .trow{display:grid;grid-template-columns:30px 1fr auto;align-items:center;gap:12px;padding:8px 10px;border-radius:10px;text-align:left;color:var(--fg);transition:background .12s}
+.album .trow:hover{background:rgba(255,255,255,.05)}
+.album .trow.on{background:rgba(var(--glow),.14)}.album .trow.on .n{color:var(--a1)}
+.album .trow .n{color:var(--dim);font-variant-numeric:tabular-nums;text-align:right}
+.album .trow .ti{display:flex;flex-direction:column;min-width:0}
+.album .trow b{font-weight:550;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.album .trow small{color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.album .trow .du{color:var(--mut);font-variant-numeric:tabular-nums;font-size:13px}
+@media (max-width:700px){.album{grid-template-columns:1fr;gap:16px}.album .art{max-width:200px}}
 #audio .meta{width:220px;min-width:0}
 #audio .meta b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #audio .meta small{color:var(--mut);font-size:12px}
@@ -511,6 +530,7 @@ const P = {
   image: '<rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5-10 9"/>',
   video: '<rect x="2.5" y="5" width="15" height="14" rx="2.5"/><path d="m17.5 10 4-2.5v9l-4-2.5"/>',
   music: '<path d="M9 18V5.5l11-2V16"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/>',
+  shuffle: '<path d="M16 4h4v4M4 20 20 4M20 16v4h-4M15 15l5 5M4 4l5 5"/>',
   pdf: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M8.5 16.5h1.5a1.5 1.5 0 0 0 0-3H8.5v5M14 13.5v5"/>',
   archive: '<rect x="3" y="4" width="18" height="5" rx="1.5"/><path d="M5 9v9.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V9M10 13h4"/>',
   bucket: '<ellipse cx="12" cy="5.5" rx="8" ry="2.8"/><path d="M4 5.5v13c0 1.5 3.6 2.8 8 2.8s8-1.3 8-2.8v-13M4 12c0 1.5 3.6 2.8 8 2.8s8-1.3 8-2.8"/>',
@@ -968,7 +988,7 @@ function render() {
       const vids = by('video'), pics = by('image'), auds = by('audio');
       const docs = list.filter(it => ['text', 'pdf'].includes(it.kind)), other = list.filter(it => ['archive', 'file'].includes(it.kind));
       C.append(...[section('Folders', 'fold', by('dir'), folderCard), ...videoSections(vids),
-        ...pictureSections(pics), section('Music', 'aud', auds, it => fileCard(it)),
+        ...pictureSections(pics), auds.length ? musicSections(auds) : null,
         section('Documents', 'doc', docs, it => fileCard(it)), section('Other files', 'doc', other, it => fileCard(it))].filter(Boolean));
     }
   }
@@ -1106,6 +1126,75 @@ function videoSections(vids) {
   return out;
 }
 // Pictures in months of their dates, newest first, once there are many of them; a slideshow from the first.
+// ─── music by album ─────────────────────────────────────────────────────────
+// A song's tags come with its info, asked four at a time and kept for the page's life.
+const TAGS = new Map(), tagQ = [];
+let tagRun = 0;
+function infoOf(it) {
+  const k = keyOf(it) + '|' + it.mod;
+  if (!TAGS.has(k)) TAGS.set(k, new Promise(res => {
+    tagQ.push(async () => { try { const r = await api('GET', '/~media/info/' + enc(it.segs)); res(r.ok ? await r.json() : null); } catch (e) { res(null); } });
+    pumpTags();
+  }));
+  return TAGS.get(k);
+}
+function pumpTags() { while (tagRun < 4 && tagQ.length) { const f = tagQ.shift(); tagRun++; f().finally(() => { tagRun--; pumpTags(); }); } }
+// Songs as albums, an artist's in the order they came out, once their tags are read; those without an album after.
+function musicSections(auds) {
+  const wrap = el('div', { class: 'music' });
+  wrap.append(section('Music', 'aud', auds, it => fileCard(it)));
+  if (auds.length < 2) return wrap;
+  Promise.all(auds.map(infoOf)).then(infos => {
+    if (!wrap.isConnected) return;
+    const albums = new Map(), loose = [];
+    auds.forEach((it, i) => {
+      const inf = infos[i], t = inf && inf.tags;
+      it._tags = t || null; it._dur = inf ? inf.duration : 0;
+      if (!t || !t.album) { loose.push(it); return; }
+      const who = t.album_artist || t.artist || '', k = who.toLowerCase() + '\n' + t.album.toLowerCase();
+      if (!albums.has(k)) albums.set(k, { album: t.album, artist: who, year: (t.date || '').slice(0, 4), list: [] });
+      albums.get(k).list.push(it);
+    });
+    if (!albums.size) return;
+    wrap.textContent = '';
+    const cmp = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+    for (const a of [...albums.values()].sort((a, b) => cmp(a.artist, b.artist) || cmp(a.year, b.year) || cmp(a.album, b.album))) wrap.append(albumBlock(a));
+    if (loose.length) wrap.append(section(albums.size ? 'Other music' : 'Music', 'aud', loose, it => fileCard(it)));
+    paintPlaying();
+  });
+  return wrap;
+}
+function albumBlock(a) {
+  const num = (x, k) => (x._tags && x._tags[k]) || 0;
+  a.list.sort((x, y) => (num(x, 'disc') - num(y, 'disc')) || (num(x, 'track') - num(y, 'track')) || x.name.localeCompare(y.name, undefined, { numeric: true }));
+  for (const it of a.list) it._list = a.list;
+  const art = el('div', { class: 'art' }, ico('music'));
+  const img = el('img', { alt: '', src: '/~media/thumb-320/' + enc(a.list[0].segs), draggable: 'false' });
+  img.onerror = () => img.remove(); art.prepend(img);
+  const rows = el('div', { class: 'trk' });
+  a.list.forEach((it, i) => {
+    const t = it._tags;
+    const r = el('button', { class: 'trow', 'data-k': keyOf(it), onclick: () => playAudio(it, a.list) },
+      el('span', { class: 'n', text: String(t.track || i + 1) }),
+      el('span', { class: 'ti' }, el('b', { text: t.title || it.name.replace(/\.[^.]+$/, '') }), t.artist && t.artist !== a.artist ? el('small', { text: t.artist }) : null),
+      el('span', { class: 'du', text: it._dur ? clock(it._dur) : '' }));
+    r.addEventListener('contextmenu', e => ctxMenu(it, e));
+    rows.append(r);
+  });
+  const total = a.list.reduce((s, x) => s + (x._dur || 0), 0);
+  return el('section', { class: 'album' }, art, el('div', { class: 'ab' },
+    el('div', { class: 'kick', text: 'Album' + (a.year ? ' · ' + a.year : '') }), el('h2', { text: a.album }),
+    el('div', { class: 'by', text: [a.artist || 'Unknown artist', a.list.length + (a.list.length === 1 ? ' song' : ' songs'), total ? Math.round(total / 60) + ' min' : ''].filter(Boolean).join(' · ') }),
+    el('div', { class: 'acts' }, btn('play', 'Play', () => playAudio(a.list[0], a.list), 'pri sm'),
+      btn('shuffle', 'Shuffle', () => { const l = a.list.slice().sort(() => Math.random() - 0.5); playAudio(l[0], l); }, 'sm')),
+    rows));
+}
+// The song playing marked in its album.
+function paintPlaying() {
+  const k = AU && AU.list[AU.i] ? keyOf(AU.list[AU.i]) : '';
+  document.querySelectorAll('.album .trow').forEach(r => r.classList.toggle('on', r.dataset.k === k));
+}
+
 function pictureSections(pics) {
   if (pics.length < 13 || sortBy !== 'date' && sortBy !== 'name') return [section('Pictures', 'pic', pics, it => fileCard(it))];
   const months = new Map();
@@ -2008,7 +2097,7 @@ async function playVideo(it, list) {
 
 // ─── music ──────────────────────────────────────────────────────────────────
 let AU = null;
-function closeAudio() { if (AU) { AU.a.pause(); AU.a.removeAttribute('src'); AU.a.load(); AU.bar.remove(); AU = null; document.body.classList.remove('audio'); } }
+function closeAudio() { if (AU) { AU.a.pause(); AU.a.removeAttribute('src'); AU.a.load(); AU.bar.remove(); AU = null; document.body.classList.remove('audio'); paintPlaying(); } }
 async function playAudio(it, list) {
   if (!AU) {
     const a = el('audio', { preload: 'auto' });
@@ -2030,8 +2119,15 @@ async function playAudio(it, list) {
   }
   AU.list = list; AU.i = Math.max(0, list.findIndex(x => keyOf(x) === keyOf(it)));
   const cur = list[AU.i];
-  AU.title.textContent = cur.name.replace(/\.[^.]+$/, ''); AU.sub.textContent = (cur.segs.slice(0, -1).join(' / ')) + ' · ' + (AU.i + 1) + ' of ' + list.length;
-  if ('mediaSession' in navigator && window.MediaMetadata) navigator.mediaSession.metadata = new MediaMetadata({ title: AU.title.textContent, album: cur.segs.slice(0, -1).join(' / ') });
+  const t = cur._tags;
+  AU.title.textContent = (t && t.title) || cur.name.replace(/\.[^.]+$/, '');
+  AU.sub.textContent = (t && (t.artist || t.album) ? [t.artist, t.album].filter(Boolean).join(' — ') : cur.segs.slice(0, -1).join(' / ')) + ' · ' + (AU.i + 1) + ' of ' + list.length;
+  // The song's own cover where it has one, the note where not.
+  const art = AU.bar.querySelector('.art'); art.querySelectorAll('img').forEach(n => n.remove());
+  const cover = '/~media/thumb-320/' + enc(cur.segs), img = el('img', { alt: '', src: cover });
+  img.onerror = () => img.remove(); art.append(img);
+  if ('mediaSession' in navigator && window.MediaMetadata) navigator.mediaSession.metadata = new MediaMetadata({ title: AU.title.textContent, artist: (t && t.artist) || '', album: (t && t.album) || cur.segs.slice(0, -1).join(' / '), artwork: [{ src: cover, sizes: '320x320', type: 'image/jpeg' }] });
+  paintPlaying();
   AU.a.src = '/~dav/' + enc(cur.segs); AU.a.play().catch(() => {});
 }
 function skip(d) { if (!AU) return; const j = AU.i + d; if (j < 0 || j >= AU.list.length) return; playAudio(AU.list[j], AU.list); }
