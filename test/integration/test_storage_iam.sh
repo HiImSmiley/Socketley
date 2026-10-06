@@ -144,6 +144,15 @@ if phase == "main":
           (ident["UserId"], ident["Arn"]), (d["UserId"], "arn:aws:iam:::user/team/dave"))
     iam.delete_access_key(UserName="dave", AccessKeyId=dk["AccessKeyId"])
     iam.delete_user(UserName="dave")
+    check("a role session makes no bucket its policies do not allow", code(lambda: r3.create_bucket(Bucket="role-made")),
+          "AccessDenied")
+    check("nor does a user the API made with no policy that allows it", code(lambda: a3.create_bucket(Bucket="alice-made")),
+          "AccessDenied")
+    iam.put_user_policy(UserName="alice", PolicyName="mk", PolicyDocument=doc("Allow", "s3:CreateBucket", "*"))
+    settle()
+    check("which it makes once one does", code(lambda: a3.create_bucket(Bucket="alice-made")), "ok")
+    iam.delete_user_policy(UserName="alice", PolicyName="mk")
+    s3.delete_bucket(Bucket="alice-made")
     check("a role session may not call IAM",
           code(lambda: mk("iam", (cr["AccessKeyId"], cr["SecretAccessKey"]), cr["SessionToken"], region="").list_users()), "AccessDenied")
     json.dump({"alice": list(alice), "carol": [ck["AccessKeyId"], ck["SecretAccessKey"]], "role": cr}, open(state, "w"), default=str)

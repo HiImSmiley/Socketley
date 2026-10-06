@@ -294,13 +294,16 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
         v.error   = std::move(e);
         v.hook.reset();
     };
-    // A bucket is anybody's to make whose own policy does not deny it, and one that is there is answered by the
-    // operation.
+    // A bucket is a credentials-file user's to make where its own policy does not deny it, a role's and an IAM
+    // user's only where their policies allow it, as S3 judges them, and one that is there is answered by the operation.
     if (action == s3_action::create_bucket)
     {
-        if (u && ((u->has_policy && u->policy.evaluate(pr) == policy_effect::deny) ||
-                  (u->iam_policy && u->iam_policy->evaluate(pr) == policy_effect::deny) ||
-                  (u->session_policy && u->session_policy->evaluate(pr) != policy_effect::allow)))
+        const policy_effect own = u && u->has_policy ? u->policy.evaluate(pr) : policy_effect::none;
+        const policy_effect iam = u && u->iam_policy ? u->iam_policy->evaluate(pr) : policy_effect::none;
+        const bool granted_only = u && (u->id.starts_with("role/") || !u->iam_id.empty());
+        if (u && (own == policy_effect::deny || iam == policy_effect::deny ||
+                  (u->session_policy && u->session_policy->evaluate(pr) != policy_effect::allow) ||
+                  (granted_only && own != policy_effect::allow && iam != policy_effect::allow)))
             refuse(make_error("AccessDenied"));
         return;
     }

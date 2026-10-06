@@ -7271,9 +7271,10 @@ does so for a copy's source bucket, is
 .B "403 AccessDenied"
 before anything is done.
 A copy is also judged as a GetObject of its source in the source bucket.
-CreateBucket is anybody's whose identity policy does not deny
+CreateBucket is a credentials\-file user's whose identity policy does not deny
 .B s3:CreateBucket
-on the name. The bucket policy's own operations stay open to the owner and admins
+on the name, and a role's or a user's the IAM API made only where one of its
+policies allows it, as S3 judges them. The bucket policy's own operations stay open to the owner and admins
 whatever the policy says, and so do what no action names (ownership controls and the
 operations answered NotImplemented); another user needs an Allow for the former and
 is refused the latter.
