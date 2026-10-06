@@ -531,6 +531,7 @@ const P = {
   info: '<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/>', speed: '<path d="M12 13l4-4"/><path d="M4.5 18a9 9 0 1 1 15 0"/>',
   replace: '<path d="M4 7h11l-3-3M20 17H9l3 3"/>',
   send: '<path d="M21 3 10.5 13.5M21 3l-6.5 18-4-7.5L3 9.5z"/>',
+  users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6.5 6.5 0 0 1 3.5 6"/>',
   fire: '<path d="M12 21c-3.9 0-7-2.9-7-6.6 0-2.8 1.6-4.6 3.2-6.3.3 1.8 1.3 3 2.6 3.4C10.4 8 12 5.2 14.5 3c.3 3.2 4.5 5.6 4.5 11.1 0 3.9-3.1 6.9-7 6.9z"/><path d="M12 21c-1.7 0-3-1.3-3-3 0-1.9 1.6-2.9 3-4.5 1.4 1.6 3 2.6 3 4.5 0 1.7-1.3 3-3 3z"/>'
 };
 const THEMES = [['aurora', 'Aurora', '#c084fc', '#f472b6', '#fb923c'], ['ocean', 'Ocean', '#67e8f9', '#60a5fa', '#818cf8'], ['neon', 'Neon', '#bef264', '#22d3ee', '#f0abfc'], ['ember', 'Ember', '#fb7185', '#fb923c', '#fde047'], ['mono', 'Mono', '#fafafa', '#a1a1aa', '#52525b']];
@@ -570,16 +571,17 @@ const MIME = { txt: 'text/plain', md: 'text/markdown', json: 'application/json',
 const keyOf = it => it.segs.join('/') + (it.dir ? '/' : '');
 
 // ─── state ──────────────────────────────────────────────────────────────────
-let auth = '';
-try { auth = sessionStorage.getItem('skl-auth') || localStorage.getItem('skl-auth') || ''; } catch (e) {}
+// Who is signed in, as /~ui/session says; the session itself is an HttpOnly cookie the page never sees.
+let me = null;
+let auth = false;
 let path = [], items = [], buckets = [], shown = [];
 let view = store.get('skl-view', 'grid'), sortBy = store.get('skl-sort', 'name'), query = '';
 const sel = new Set(); let anchor = -1;
 
 async function api(method, url, opt = {}) {
-  const h = Object.assign({ 'Authorization': auth, 'X-Socketley-UI': '1' }, opt.headers || {});
-  const r = await fetch(url, { method, headers: h, body: opt.body, signal: opt.signal });
-  if (r.status === 401) { signOut(); throw new Error('Signed out'); }
+  const h = Object.assign({ 'X-Socketley-UI': '1' }, opt.headers || {});
+  const r = await fetch(url, { method, headers: h, body: opt.body, signal: opt.signal, credentials: 'same-origin' });
+  if (r.status === 401) { signedOut(); throw new Error('Your session ended: sign in again'); }
   return r;
 }
 async function must(r) { if (!r.ok) { let t = ''; try { t = (await r.text()).trim(); } catch (e) {} const m = /<Message>([^<]*)/.exec(t); throw new Error(m ? m[1] : t.slice(0, 200) || r.status + ' ' + r.statusText); } return r; }
@@ -641,20 +643,27 @@ function ask({ title, text, input, value, ok = 'OK', danger }) {
 }
 
 // ─── signing in ─────────────────────────────────────────────────────────────
-function signOut() {
-  auth = '';
-  try { sessionStorage.removeItem('skl-auth'); localStorage.removeItem('skl-auth'); } catch (e) {}
+function signedOut() {
+  auth = false; me = null;
   $('#app').hidden = true; $('#login').hidden = false;
   closeAudio();
+  while (layers.length) layers[layers.length - 1].close();
+}
+async function signOut() {
+  try { await fetch('/~ui/session', { method: 'DELETE', headers: { 'X-Socketley-UI': '1' } }); } catch (e) {}
+  signedOut();
 }
 $('#lf').addEventListener('submit', async ev => {
   ev.preventDefault();
-  auth = 'Basic ' + btoa(unescape(encodeURIComponent($('#lk').value.trim() + ':' + $('#ls').value)));
+  // The credentials go to the server once, which answers with the session cookie; the page keeps neither.
+  const basic = 'Basic ' + btoa(unescape(encodeURIComponent($('#lk').value.trim() + ':' + $('#ls').value)));
   let r;
-  try { r = await fetch('/~dav/', { method: 'PROPFIND', headers: { 'Authorization': auth, 'Depth': '0', 'X-Socketley-UI': '1' } }); }
+  try { r = await fetch('/~ui/session' + ($('#lr').checked ? '?remember' : ''), { method: 'POST', headers: { 'Authorization': basic, 'X-Socketley-UI': '1' } }); }
   catch (e) { $('#le').textContent = 'The server cannot be reached.'; return; }
   if (r.status === 401) { $('#le').textContent = 'Those credentials are not known.'; return; }
-  try { ($('#lr').checked ? localStorage : sessionStorage).setItem('skl-auth', auth); } catch (e) {}
+  if (!r.ok) { $('#le').textContent = 'Signing in failed: ' + r.status; return; }
+  me = await r.json();
+  $('#ls').value = '';
   $('#le').textContent = '';
   start();
 });
@@ -690,7 +699,7 @@ function side() {
   const nav = (b, icon, label, on, fn) => { b.textContent = ''; b.append(ico(icon), el('span', { text: label })); b.classList.toggle('on', on); b.onclick = fn; };
   nav($('#nHome'), 'home', 'Home', !path.length, () => go([]));
   nav($('#nLinks'), 'link', 'Shared links', false, linksDlg);
-  nav($('#nOut'), 'out', 'Sign out', false, signOut);
+  nav($('#nOut'), 'out', me && me.user ? 'Sign out · ' + (me.name || me.user) : 'Sign out', false, signOut);
   nav($('#nSend'), 'send', 'Send a file', false, () => sendDlg());
   paintThemes();
   const L = $('#libs'); L.textContent = '';
@@ -744,7 +753,6 @@ let reloadT = 0;
 function reloadSoon() { clearTimeout(reloadT); reloadT = setTimeout(() => load(true), 400); }
 
 // ─── thumbnails, media facts and watch progress ─────────────────────────────
-const blobs = new Map();
 const thumbQ = []; let thumbBusy = 0;
 const io = 'IntersectionObserver' in window ? new IntersectionObserver(es => { for (const e of es) if (e.isIntersecting) { io.unobserve(e.target); thumbQ.push(e.target); pump(); } }, { rootMargin: '300px' }) : null;
 function pump() {
@@ -752,11 +760,11 @@ function pump() {
     const w = thumbQ.shift();
     if (!w.isConnected) continue;
     thumbBusy++;
-    const src = w.dataset.src;
-    const have = blobs.get(src);
-    (have ? Promise.resolve(have) : api('GET', src).then(r => r.ok ? r.blob() : null).then(b => { if (!b) return null; const u = URL.createObjectURL(b); blobs.set(src, u); return u; }))
-      .then(u => { if (!u) return; const img = el('img', { alt: '', src: u, draggable: 'false' }); img.onload = () => img.classList.add('on'); w.append(img); if (w._onthumb) w._onthumb(u); })
-      .catch(() => {}).finally(() => { thumbBusy--; pump(); });
+    // Read with the session's cookie, and kept by the browser's cache under the ETag the server gives.
+    const img = el('img', { alt: '', src: w.dataset.src, draggable: 'false', decoding: 'async' });
+    const settle = ok => { if (ok) img.classList.add('on'); else img.remove(); thumbBusy--; pump(); };
+    img.onload = () => settle(true); img.onerror = () => settle(false);
+    w.append(img);
     if (w.dataset.info) facts(w);
   }
 }
@@ -781,17 +789,49 @@ async function facts(w) {
   if (q) w.append(el('span', { class: 'tagq', text: q }));
   if (m.hdr) w.append(el('span', { class: 'tagq hdr', text: 'HDR' }));
 }
-const POS = 'skl-pos:';
-function position(it) { try { return JSON.parse(store.get(POS + it.segs.join('/'), 'null')); } catch (e) { return null; } }
-function savePosition(it, t, d) {
+// Where each film was left, the signed-in user's own, kept by the server so every device picks up where another
+// stopped; read once at the start and after a film is closed, and kept as it plays.
+const PROG = new Map();
+async function loadProgress() {
+  try {
+    const r = await api('GET', '/~ui/progress');
+    if (!r.ok) return;
+    PROG.clear();
+    for (const p of await r.json()) PROG.set(p.bucket + '/' + p.key, p);
+  } catch (e) {}
+}
+// Positions an earlier version of the page kept in this browser go to the server once.
+async function migratePositions() {
+  const old = [];
+  try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('skl-pos:')) old.push(k); } } catch (e) { return; }
+  for (const k of old) {
+    try {
+      const v = JSON.parse(localStorage.getItem(k)), segs = k.slice(8).split('/');
+      await api('POST', '/~ui/progress', { body: JSON.stringify({ bucket: segs[0], key: segs.slice(1).join('/'), t: v.t, d: v.d }) });
+    } catch (e) {}
+    store.del(k);
+  }
+}
+function position(it) { return PROG.get(it.segs.join('/')) || null; }
+let lastSaved = '';
+function savePosition(it, t, d, force) {
   if (!d || !isFinite(d)) return;
-  if (t < 10 || t > d - 20) { store.del(POS + it.segs.join('/')); return; }
-  store.set(POS + it.segs.join('/'), JSON.stringify({ t, d, at: Date.now(), name: it.name, size: it.size, type: it.type || '' }));
+  const k = it.segs.join('/');
+  const gone = t < 10 || t > d - Math.min(20, d * 0.05);
+  const was = PROG.get(k);
+  if (gone) { if (!was) return; PROG.delete(k); }
+  else PROG.set(k, { bucket: it.segs[0], key: it.segs.slice(1).join('/'), t, d, at: Date.now(), size: it.size, type: it.type || '' });
+  // A position a few seconds from the last one kept is not sent again, unless the film is paused or closed.
+  const sig = k + ':' + (gone ? -1 : Math.round(t / 10));
+  if (!force && sig === lastSaved) return;
+  lastSaved = sig;
+  api('POST', '/~ui/progress', { body: JSON.stringify({ bucket: it.segs[0], key: it.segs.slice(1).join('/'), t: gone ? -1 : t, d }) }).catch(() => {});
 }
 function watching() {
-  const out = [];
-  try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith(POS)) { const v = JSON.parse(localStorage.getItem(k)); out.push({ segs: k.slice(POS.length).split('/'), ...v }); } } } catch (e) {}
-  return out.sort((a, b) => b.at - a.at).slice(0, 12).map(v => ({ name: v.name || v.segs[v.segs.length - 1], segs: v.segs, size: v.size || 0, type: v.type, dir: false, kind: 'video', mod: '' }));
+  return [...PROG.values()].sort((a, b) => b.at - a.at).slice(0, 12).map(p => {
+    const segs = [p.bucket, ...p.key.split('/')];
+    return { name: segs[segs.length - 1], segs, size: p.size || 0, type: p.type, dir: false, kind: 'video', mod: '' };
+  });
 }
 
 // ─── rendering ──────────────────────────────────────────────────────────────
@@ -847,13 +887,18 @@ function hero(list) {
     if (auds.length) acts.append(btn('music', 'Play music', () => playAudio(auds[0], auds), vids.length ? '' : 'pri'));
     acts.append(btn('upload', 'Upload', () => $('#fi').click(), vids.length || auds.length ? '' : 'pri'), btn('send', 'Send', () => sendDlg()), btn('newfile', 'New text file', newText));
     if (path.length) acts.append(btn('restore', 'Trash', trashDlg));
+    // Sharing the library with other users, for whoever may change its policy.
+    if (path.length === 1 && me && !me.anonymous) {
+      const lib = path[0];
+      api('GET', '/~ui/access?bucket=' + encodeURIComponent(lib)).then(r => { if (r.ok && acts.isConnected && path[0] === lib) acts.append(btn('users', 'Share library', () => accessDlg(lib))); }).catch(() => {});
+    }
     h.append(acts);
     const cover = items.find(it => it.kind === 'video') || items.find(it => it.kind === 'image');
     if (cover) {
       const src = '/~media/thumb-1280/' + enc(cover.segs);
-      const show = u => { bd.style.backgroundImage = 'url("' + u + '")'; bd.classList.add('on'); };
-      if (blobs.has(src)) show(blobs.get(src));
-      else api('GET', src).then(r => r.ok ? r.blob() : null).then(b => { if (b) { const u = URL.createObjectURL(b); blobs.set(src, u); if (bd.isConnected) show(u); } }).catch(() => {});
+      const pre = new Image();
+      pre.onload = () => { bd.style.backgroundImage = 'url("' + src + '")'; bd.classList.add('on'); };
+      pre.src = src;
     }
   }
   return h;
@@ -1048,20 +1093,13 @@ document.addEventListener('keydown', e => {
 $('#scroll').addEventListener('click', e => { if (sel.size && (e.target.id === 'content' || e.target.classList.contains('grid') || e.target.classList.contains('hero'))) { sel.clear(); paintSel(); } });
 
 // ─── links and downloads ────────────────────────────────────────────────────
-// A link the page makes for itself, to hand a player or a download what it cannot sign. A download's lasts half a day,
-// so a browser that resumes an interrupted one with a range still finds it.
-async function tempLink(it, seconds) {
-  const r = await must(await api('POST', '/~share', { body: JSON.stringify({ bucket: it.segs[0], key: it.segs.slice(1).join('/'), expires_in: seconds, note: 'player' }) }));
-  return (await r.json()).id;
-}
+// A download is the drive's GET with ?download, which the session's cookie signs and the server answers with the file
+// under its name; a browser resuming it later sends the cookie again.
 async function download(list) {
   for (const it of list) {
-    try {
-      const id = await tempLink(it, 12 * 3600);
-      const f = el('iframe', { src: '/~share/' + id + '?download', style: 'display:none' });
-      document.body.append(f); setTimeout(() => f.remove(), 120000);
-      await sleep(350);
-    } catch (e) { fail(e); }
+    const a = el('a', { href: '/~dav/' + enc(it.segs) + '?download', download: it.name, style: 'display:none' });
+    document.body.append(a); a.click(); a.remove();
+    await sleep(350);
   }
   if (list.length > 1) toast('Downloading ' + list.length + ' files');
 }
@@ -1115,6 +1153,34 @@ function linksDlg() {
   fill();
   return L;
 }
+// Who else may read or write a library, each a statement of its bucket's policy the server writes.
+function accessDlg(lib) {
+  const T = el('table', { class: 'mtbl' });
+  const who = el('input', { class: 'inp', placeholder: 'User id, as in the credentials', spellcheck: 'false', autocomplete: 'off' });
+  const lvl = el('select', { class: 'inp', style: 'flex:none;width:auto' }, el('option', { value: 'read', text: 'Can view' }), el('option', { value: 'write', text: 'Can edit' }));
+  const set = async (user, access) => {
+    try { await must(await api('POST', '/~ui/access', { body: JSON.stringify({ bucket: lib, user, access }) })); fill(); toast(access === 'none' ? user + ' no longer has access' : 'Shared with ' + user); }
+    catch (e) { fail(e); }
+  };
+  const add = () => { const u = who.value.trim(); if (u) { set(u, lvl.value); who.value = ''; } };
+  who.addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
+  const body = [el('p', { text: 'People who sign in to this runtime with their own key see “' + lib + '” among their libraries. Viewers can browse, play and download; editors can also upload, rename and delete.' }),
+    el('div', { class: 'lnk', style: 'margin:4px 0 14px' }, who, lvl, btn('plus', 'Add', add, 'pri')), T];
+  modal('Share “' + lib + '”', body, null, true);
+  async function fill() {
+    T.textContent = '';
+    let a;
+    try { a = await (await must(await api('GET', '/~ui/access?bucket=' + encodeURIComponent(lib)))).json(); } catch (e) { T.append(el('tr', {}, el('td', { text: e.message }))); return; }
+    T.append(el('tr', {}, el('td', { class: 'w' }, el('b', { text: a.owner || 'you' })), el('td', { class: 'mut', text: 'Owner' }), el('td')));
+    if (!a.grants.length) T.append(el('tr', {}, el('td', { class: 'mut', colspan: '3', text: 'Nobody else has access yet.' })));
+    for (const g of a.grants) {
+      const sel = el('select', { class: 'inp', style: 'height:32px' }, el('option', { value: 'read', text: 'Can view' }), el('option', { value: 'write', text: 'Can edit' }));
+      sel.value = g.access; sel.onchange = () => set(g.user, sel.value);
+      T.append(el('tr', {}, el('td', { class: 'w', text: g.user }), el('td', {}, sel), el('td', { class: 'r' }, btn(null, 'Remove', () => set(g.user, 'none'), 'sm bad'))));
+    }
+  }
+  fill();
+}
 function trashDlg() {
   const T = el('table', { class: 'mtbl' });
   modal('Trash · ' + path.join('/'), [el('p', { text: 'Files deleted from a library that keeps versions. Restoring brings back the last version before the deletion.' }), T], null, true);
@@ -1156,16 +1222,13 @@ function viewImage(it, list) {
     const sp = el('div', { class: 'spin' }); stage.append(sp);
     info.textContent = (i + 1) + ' / ' + list.length + ' · ' + human(cur.size) + (cur.mod ? ' · ' + new Date(cur.mod).toLocaleString() : '');
     zoom = 1;
-    try {
-      const key = '/~dav/' + enc(cur.segs);
-      let u = blobs.get(key);
-      if (!u) { const r = await must(await api('GET', key)); u = URL.createObjectURL(await r.blob()); blobs.set(key, u); }
-      if (list[i] !== cur) return;
-      const img = el('img', { src: u, alt: cur.name, draggable: 'false' });
-      img.ondblclick = () => { zoom = zoom > 1 ? 1 : 2.2; img.style.transform = 'scale(' + zoom + ')'; };
-      sp.remove(); stage.append(img);
-    } catch (e) { sp.remove(); stage.append(el('div', { class: 'mut', text: e.message })); }
-    for (const j of [i + 1, i - 1]) if (list[j] && !blobs.has('/~dav/' + enc(list[j].segs))) api('GET', '/~dav/' + enc(list[j].segs)).then(r => r.ok ? r.blob() : null).then(b => b && blobs.set('/~dav/' + enc(list[j].segs), URL.createObjectURL(b))).catch(() => {});
+    const img = el('img', { src: '/~dav/' + enc(cur.segs), alt: cur.name, draggable: 'false' });
+    img.onload = () => sp.remove();
+    img.onerror = () => { sp.remove(); img.remove(); stage.append(el('div', { class: 'mut', text: 'This picture cannot be shown.' })); };
+    img.ondblclick = () => { zoom = zoom > 1 ? 1 : 2.2; img.style.transform = 'scale(' + zoom + ')'; };
+    stage.append(img);
+    // The neighbours, so the next step shows at once.
+    for (const j of [i + 1, i - 1]) if (list[j]) new Image().src = '/~dav/' + enc(list[j].segs);
   };
   const step = d => { if (list.length < 2) return; i = (i + d + list.length) % list.length; show(); };
   if (list.length > 1) stage.append(el('button', { class: 'nav2 l', title: 'Previous', onclick: () => step(-1) }, ico('left')), el('button', { class: 'nav2 r', title: 'Next', onclick: () => step(1) }, ico('chev')));
@@ -1180,7 +1243,7 @@ async function viewPdf(it) {
   L.o.append(topbar(L, it));
   const stage = el('div', { class: 'stage', style: 'padding-top:64px' });
   L.o.append(stage);
-  try { const id = await tempLink(it, 3600); stage.append(el('iframe', { src: '/~share/' + id, title: it.name })); } catch (e) { stage.append(el('div', { class: 'mut', text: e.message })); }
+  stage.append(el('iframe', { src: '/~dav/' + enc(it.segs), title: it.name }));
 }
 function fileInfo(it) {
   const L = overlay('viewer');
@@ -1472,7 +1535,7 @@ async function playVideo(it, list) {
   };
   v.addEventListener('timeupdate', paint); v.addEventListener('progress', paint); v.addEventListener('durationchange', paint);
   v.addEventListener('play', () => { ppB.firstChild.innerHTML = P.pause; wake(); });
-  v.addEventListener('pause', () => { ppB.firstChild.innerHTML = P.play; O.classList.remove('idle'); savePosition(it, v.currentTime, v.duration); });
+  v.addEventListener('pause', () => { ppB.firstChild.innerHTML = P.play; O.classList.remove('idle'); savePosition(it, v.currentTime, v.duration, true); });
   v.addEventListener('waiting', () => spin.hidden = false);
   for (const ev of ['playing', 'canplay', 'seeked', 'pause']) v.addEventListener(ev, () => { if (ev !== 'pause' || v.readyState >= 3) spin.hidden = true; });
   v.addEventListener('volumechange', () => { volB.firstChild.innerHTML = v.muted || !v.volume ? P.mute : P.vol; volR.value = String(v.muted ? 0 : v.volume); store.set('skl-vol', String(v.volume)); store.set('skl-muted', v.muted ? '1' : '0'); });
@@ -1480,7 +1543,7 @@ async function playVideo(it, list) {
   document.addEventListener('fullscreenchange', onfs);
   function onfs() { fsB.firstChild.innerHTML = document.fullscreenElement ? P.fsx : P.fs; }
   let saveT = setInterval(() => { if (!v.paused) savePosition(it, v.currentTime, v.duration); }, 5000);
-  v.addEventListener('ended', () => { store.del(POS + it.segs.join('/')); if (nextIt) upNext(); });
+  v.addEventListener('ended', () => { savePosition(it, v.duration, v.duration, true); if (nextIt) upNext(); });
   v.addEventListener('error', () => { if (choice === 'orig' && direct && streams && !player) { toast('The browser cannot play this file itself: streaming it instead', 'info'); direct = false; setChoice('auto'); } });
   let upT = 0;
   function upNext() {
@@ -1510,12 +1573,12 @@ async function playVideo(it, list) {
   document.addEventListener('keydown', keys);
   L.esc = () => { if (pm) closeMenu(); else if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); else L.close(); };
   L.onclose = () => {
-    savePosition(it, v.currentTime, v.duration);
+    savePosition(it, v.currentTime, v.duration, true);
     clearInterval(saveT); clearInterval(upT); clearTimeout(idleT);
     document.removeEventListener('keydown', keys); document.removeEventListener('fullscreenchange', onfs);
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     if (player) player.stop(); else { v.pause(); v.removeAttribute('src'); v.load(); }
-    if (path.length) render();
+    loadProgress().then(() => { if (auth && !layers.length) render(); });
   };
   // Where it plays from.
   async function setChoice(c) {
@@ -1533,7 +1596,8 @@ async function playVideo(it, list) {
       if (!(await player.start(at))) { player.stop(); player = null; choice = 'orig'; v.src = base; v.currentTime = at; }
     } else {
       if (player) { player.stop(); player = null; }
-      v.src = viaStream ? '/~media/' + (c === 'auto' ? 'hls' + base + '/master.m3u8' : (c === 'orig' ? 'hls-copy' : 'hls-' + c) + base + '/index.m3u8') : base;
+      const obj = '/' + enc(it.segs);
+      v.src = viaStream ? '/~media/' + (c === 'auto' ? 'hls' + obj + '/master.m3u8' : (c === 'orig' ? 'hls-copy' : 'hls-' + c) + obj + '/index.m3u8') : base;
       if (at) v.currentTime = at;
     }
     if (!paused) v.play().catch(() => {});
@@ -1542,10 +1606,10 @@ async function playVideo(it, list) {
   const pos = position(it);
   const start = pos ? pos.t : 0;
   try {
-    const id = await tempLink(it, 6 * 3600);
-    if (!O.isConnected) return;
-    base = '/~share/' + id; master = '/~media/hls' + base + '/master.m3u8';
-    try { const r = await fetch('/~media/info' + base); if (r.ok) meta = await r.json(); } catch (e) {}
+    // Everything is read with the session's cookie: the file through the drive, and the media made of it.
+    const obj = '/' + enc(it.segs);
+    base = '/~dav' + obj; master = '/~media/hls' + obj + '/master.m3u8';
+    try { const r = await api('GET', '/~media/info' + obj); if (r.ok) meta = await r.json(); } catch (e) {}
     if (!O.isConnected) return;
     native = v.canPlayType('application/vnd.apple.mpegurl') !== '';
     streams = !!(meta && meta.video && (MS || native) && (meta.renditions || []).length);
@@ -1556,7 +1620,7 @@ async function playVideo(it, list) {
       if (meta.height) c(meta.height + 'p'); if (meta.video) c(meta.video.toUpperCase()); if (meta.hdr) c('HDR'); if (meta.audio) c(meta.audio.toUpperCase());
       if (meta.duration) c(clock(meta.duration));
       for (const s of meta.subtitles || [])
-        v.append(el('track', { kind: 'subtitles', src: '/~media/sub-' + s.index + base + '/subs.vtt?v=' + meta.version, srclang: (s.lang || 'und').slice(0, 3), label: s.title || s.lang || 'Track ' + s.index }));
+        v.append(el('track', { kind: 'subtitles', src: '/~media/sub-' + s.index + '/' + enc(it.segs) + '/subs.vtt?v=' + meta.version, srclang: (s.lang || 'und').slice(0, 3), label: s.title || s.lang || 'Track ' + s.index }));
       ccB.hidden = !(meta.subtitles || []).length;
     }
     if (it.size) chips.append(el('span', { class: 'chip', text: human(it.size) }));
@@ -1596,7 +1660,7 @@ async function playAudio(it, list) {
   const cur = list[AU.i];
   AU.title.textContent = cur.name.replace(/\.[^.]+$/, ''); AU.sub.textContent = (cur.segs.slice(0, -1).join(' / ')) + ' · ' + (AU.i + 1) + ' of ' + list.length;
   if ('mediaSession' in navigator && window.MediaMetadata) navigator.mediaSession.metadata = new MediaMetadata({ title: AU.title.textContent, album: cur.segs.slice(0, -1).join(' / ') });
-  try { const id = await tempLink(cur, 6 * 3600); AU.a.src = '/~share/' + id; AU.a.play().catch(() => {}); } catch (e) { fail(e); }
+  AU.a.src = '/~dav/' + enc(cur.segs); AU.a.play().catch(() => {});
 }
 function skip(d) { if (!AU) return; const j = AU.i + d; if (j < 0 || j >= AU.list.length) return; playAudio(AU.list[j], AU.list); }
 
@@ -1903,7 +1967,7 @@ function xhr(j, method, url, body, headers, onprog) {
   return new Promise(res => {
     const x = new XMLHttpRequest();
     x.open(method, url);
-    x.setRequestHeader('Authorization', auth); x.setRequestHeader('X-Socketley-UI', '1');
+    x.setRequestHeader('X-Socketley-UI', '1');
     for (const [k, v] of Object.entries(headers || {})) x.setRequestHeader(k, v);
     if (onprog) x.upload.onprogress = e => onprog(e.loaded);
     x.onloadend = () => { j.xhrs.delete(x); res({ status: x.status, text: x.responseText || '', etag: x.getResponseHeader('ETag') }); };
@@ -2071,8 +2135,21 @@ window.addEventListener('drop', async e => {
   if (ents.length) { for (const it of ents) await walkEntry(it, ''); } else for (const f of e.dataTransfer.files) enqueue(f, f.name);
 });
 
-function start() { $('#login').hidden = true; $('#app').hidden = false; fromHash(); buckets = []; load(); }
-if (auth) start(); else signOut();
+async function start() {
+  auth = true;
+  $('#login').hidden = true; $('#app').hidden = false; fromHash(); buckets = [];
+  await migratePositions();
+  await loadProgress();
+  load();
+}
+// A session the browser still holds signs in at once.
+(async () => {
+  try {
+    const r = await fetch('/~ui/session', { headers: { 'X-Socketley-UI': '1' } });
+    if (r.ok) { me = await r.json(); start(); return; }
+  } catch (e) {}
+  signedOut();
+})();
 </script>
 </body>
 </html>
