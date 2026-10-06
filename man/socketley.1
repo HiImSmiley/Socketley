@@ -9750,7 +9750,9 @@ four seconds. Its playlist is whole from the start, written from the film's leng
 so a player seeks anywhere at once, and its segments are made as they are asked
 for: a segment at or a little past where a job is making them is waited for, and
 one elsewhere starts a job there, on the film's own clock, so the segments of
-every job join up, and every job's init segment is the same bytes. An init
+every job join up, and every job's init segment is the same bytes. A length past
+99,999 segments (about 111 hours), or one that is no number, is taken for none: the
+info gives 0 and a rendition is answered 415, as for a film of no length. An init
 segment asked for with no job running begins one at the start at once, which a
 seek that follows lets go, and which is held after two seconds if no segment of
 it is asked for. Several jobs run over one film for viewers at different places;

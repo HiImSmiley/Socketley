@@ -16,6 +16,8 @@
 #   * a film's sound tracks or chapters, or a song's tags, missing from its info,
 #     or a stream asked for with another sound track carrying the first
 #   * a film's stills for a seek bar not a row of tiles, or offered for a song
+#   * a film whose container claims a trillion seconds cut into that many
+#     segments, holding its shard in the loop that writes the playlist
 #   * an info or a playlist answered 304 to the tag of a binary that wrote less in
 #     it, so a browser keeps showing what the binary before said
 # suite: isolated
@@ -357,6 +359,20 @@ check "info says how its stills are laid out" \
 check "the stills are a JPEG" "$(get "$T/trick.jpg" -u "$A" "$U/~media/trick/films/clip.mp4") $(head -c 3 "$T/trick.jpg" | od -An -tx1 | tr -d ' ')" "200 ffd8ff"
 check "a row of ten tiles" "$(width "$T/trick.jpg")x$(height "$T/trick.jpg")" 1600x90
 check "and a song has none" "$(code -u "$A" "$U/~media/trick/films/song.mp3") $(curl -s -u "$A" "$U/~media/info/films/song.mp3" | grep -c '"trick"')" "415 0"
+
+# A container's claimed length past what a segment's name can count is no length, so no playlist is written for it.
+ff -f lavfi -i testsrc=size=320x240:rate=25 -t 2 -c:v libx264 -pix_fmt yuv420p -f matroska "$T/liar.mkv"
+python3 - "$T/liar.mkv" <<'XEOF'
+import struct, sys
+b = bytearray(open(sys.argv[1], 'rb').read())
+i = b.find(b'\x44\x89\x88')
+b[i + 3:i + 11] = struct.pack('>d', 1e15)
+open(sys.argv[1], 'wb').write(b)
+XEOF
+code -u "$A" -T "$T/liar.mkv" "$U/~dav/films/liar.mkv" >/dev/null
+check "a container that claims a trillion seconds has no length" \
+      "$(curl -s -m 10 -u "$A" "$U/~media/info/films/liar.mkv" | python3 -c 'import json,sys; print(json.load(sys.stdin)["duration"])' 2>&1 | tail -1)" 0.0
+check "and its stream is not cut into that many segments" "$(code -m 10 -u "$A" "$U/~media/hls-240/films/liar.mkv/index.m3u8")" 415
 
 # A copied HEVC stream is tagged hvc1, as Apple's players take it.
 get "$T/hvc.mp4" -u "$A" "$U/~media/hls-copy/films/hdr.mp4/index.m3u8" >/dev/null

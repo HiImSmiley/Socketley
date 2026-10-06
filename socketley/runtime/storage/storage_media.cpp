@@ -88,6 +88,8 @@ constexpr int64_t failed_hold_ms   = 120000;
 constexpr int64_t source_ttl_s     = 6 * 3600;
 constexpr uint64_t cache_default_mb = 10240;
 constexpr int64_t seg_seconds      = 4;
+// A segment's name counts five digits, so a film is no longer than that many segments.
+constexpr double  max_seconds      = 99999.0 * seg_seconds;
 // A segment this close past where a job is gets waited for; one further is a seek, and the job starts again there.
 constexpr int64_t seek_beyond      = 5;
 // A job this far past every player is held still, and goes on once one is within resume_within of it; one nobody
@@ -191,7 +193,7 @@ bool stream_file(std::string_view f, int64_t& seg)
 
 std::string seg_name(int64_t n)
 {
-    char buf[16];
+    char buf[32];
     std::snprintf(buf, sizeof buf, "seg%05lld.m4s", static_cast<long long>(n));
     return buf;
 }
@@ -340,6 +342,13 @@ int64_t int_of(const jvalue& o, std::string_view n)
     return std::strtoll(str_of(o, n).c_str(), nullptr, 10);
 }
 
+// A length or a time from ffprobe, 0 for one no film has: not a number, below zero, or past max_seconds.
+double seconds_of(const jvalue& o, std::string_view n)
+{
+    const double s = std::strtod(str_of(o, n).c_str(), nullptr);
+    return std::isfinite(s) && s > 0 && s <= max_seconds ? s : 0;
+}
+
 double rate_of(const std::string& r)
 {
     const size_t slash = r.find('/');
@@ -385,15 +394,14 @@ bool parse_probe(const std::string& text, media_probe& p)
         return false;
     if (const jvalue* f = member(root, "format"))
     {
-        p.duration = std::strtod(str_of(*f, "duration").c_str(), nullptr);
+        p.duration = seconds_of(*f, "duration");
         p.bitrate = int_of(*f, "bit_rate");
         p.format = str_of(*f, "format_name");
         song_tags(member(*f, "tags"), p);
     }
     if (const jvalue* chapters = member(root, "chapters"))
         for (const jvalue& ch : chapters->items)
-            p.chapters.push_back({std::strtod(str_of(ch, "start_time").c_str(), nullptr),
-                                  std::strtod(str_of(ch, "end_time").c_str(), nullptr), tag_of(member(ch, "tags"), "title")});
+            p.chapters.push_back({seconds_of(ch, "start_time"), seconds_of(ch, "end_time"), tag_of(member(ch, "tags"), "title")});
     double vduration = 0;
     const jvalue* sound_tags = nullptr;
     if (const jvalue* streams = member(root, "streams"))
@@ -413,7 +421,7 @@ bool parse_probe(const std::string& text, media_probe& p)
                 p.fps = rate_of(str_of(s, "avg_frame_rate"));
                 if (p.fps <= 0 || p.fps > 240)
                     p.fps = rate_of(str_of(s, "r_frame_rate"));
-                vduration = std::strtod(str_of(s, "duration").c_str(), nullptr);
+                vduration = seconds_of(s, "duration");
             }
             else if (type == "audio")
             {
