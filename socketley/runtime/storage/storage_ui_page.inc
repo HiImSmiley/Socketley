@@ -2628,16 +2628,40 @@ function schedule() {
   }
   if (!UP.busy && !UP.jobs.some(j => ['queued', 'running', 'starting', 'finishing'].includes(j.state))) { clearInterval(UP.ticking); UP.ticking = 0; paintUploads(); }
 }
+// Each part's CRC-32, which the server checks against what arrived and refuses with BadDigest when they differ, so a
+// part changed on its way, or by the file changing under the upload, is sent again rather than stored.
+const CRC_T = (() => {
+  const t = new Uint32Array(1024);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  for (let n = 0; n < 256; n++) for (let k = 1; k < 4; k++) t[k * 256 + n] = (t[(k - 1) * 256 + n] >>> 8) ^ t[t[(k - 1) * 256 + n] & 255];
+  return t;
+})();
+function crc32(u8) {
+  const t = CRC_T; let c = 0xFFFFFFFF, i = 0;
+  // Four bytes a step, as slicing-by-4 does.
+  for (const n = u8.length & ~3; i < n; i += 4) {
+    c ^= u8[i] | u8[i + 1] << 8 | u8[i + 2] << 16 | u8[i + 3] << 24;
+    c = t[768 + (c & 255)] ^ t[512 + (c >>> 8 & 255)] ^ t[256 + (c >>> 16 & 255)] ^ t[c >>> 24];
+  }
+  for (; i < u8.length; i++) c = t[(c ^ u8[i]) & 255] ^ (c >>> 8);
+  c = (c ^ 0xFFFFFFFF) >>> 0;
+  return btoa(String.fromCharCode(c >>> 24, c >>> 16 & 255, c >>> 8 & 255, c & 255));
+}
+// The bytes of a part, read once, and their CRC-32 header.
+async function checked(blob) { const u8 = new Uint8Array(await blob.arrayBuffer()); return { body: u8, crc: { 'x-amz-checksum-crc32': crc32(u8) } }; }
+const badDigest = r => r.status === 400 && /BadDigest/.test(r.text);
 const url = j => '/~dav/' + enc(j.segs);
 const typeOf = f => f.type || MIME[ext(f.name)] || '';
 async function putWhole(j) {
   j.started = j.started || Date.now();
   for (;;) {
-    const r = await xhr(j, 'PUT', url(j), j.file, typeOf(j.file) ? { 'Content-Type': typeOf(j.file) } : null, n => { j.inflight.set(0, n); });
+    let c;
+    try { c = await checked(j.file); } catch (e) { failed(j, { status: 0, text: '' }); j.err = 'the file could not be read'; return; }
+    const r = await xhr(j, 'PUT', url(j), c.body, Object.assign(typeOf(j.file) ? { 'Content-Type': typeOf(j.file) } : {}, c.crc), n => { j.inflight.set(0, n); });
     j.inflight.clear();
     if (j.state === 'canceled') return;
     if (r.status >= 200 && r.status < 300) { j.sent = j.size; return done(j); }
-    if ((r.status === 0 || r.status >= 500) && ++j.tries < 4) { await sleep(1000 * j.tries); continue; }
+    if ((r.status === 0 || r.status >= 500 || badDigest(r)) && ++j.tries < 4) { await sleep(1000 * j.tries); continue; }
     return failed(j, r);
   }
 }
@@ -2652,12 +2676,16 @@ async function begin(j) {
 }
 async function sendPart(j, p) {
   for (;;) {
-    const r = await xhr(j, 'PUT', url(j) + '?partNumber=' + p.n + '&uploadId=' + encodeURIComponent(j.id), j.file.slice(p.from, p.to), null, n => j.inflight.set(p.n, n));
+    let c;
+    try { c = await checked(j.file.slice(p.from, p.to)); } catch (e) { failed(j, { status: 0, text: '' }); j.err = 'the file could not be read'; return; }
+    if (j.state === 'canceled' || j.state === 'error') return;
+    const r = await xhr(j, 'PUT', url(j) + '?partNumber=' + p.n + '&uploadId=' + encodeURIComponent(j.id), c.body, c.crc, n => j.inflight.set(p.n, n));
+    c = null;
     j.inflight.delete(p.n);
     if (j.state === 'canceled' || j.state === 'error') return;
     if (r.status === 200 && r.etag) { if (p.state !== 'done') { p.etag = r.etag; p.state = 'done'; j.sent += p.to - p.from; } return; }
     if (j.state === 'paused') { p.state = 'todo'; return; }
-    if ((r.status === 0 || r.status >= 500) && ++p.tries < 5) { await sleep(800 * p.tries); continue; }
+    if ((r.status === 0 || r.status >= 500 || badDigest(r)) && ++p.tries < 5) { await sleep(800 * p.tries); continue; }
     // A lost line pauses the file with what arrived kept; a refusal ends it.
     if (r.status === 0 || r.status >= 500) { p.state = 'todo'; p.tries = 0; pause(j); return; }
     failed(j, r);

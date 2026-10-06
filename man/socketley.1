@@ -9818,7 +9818,12 @@ time left and start; folders too, by dropping them or choosing one. A file in
 parts whose line is lost is paused and goes on when the line is back, and one a
 closed or reloaded page left is shown again, with how far it came, and goes on
 from the parts the server lists once its file is chosen anew (the same name and
-size, and the same modification time or a confirmation). It selects
+size, and the same modification time or a confirmation). Each part, and a
+file sent whole, carries its CRC-32 in
+.BR x\-amz\-checksum\-crc32 ,
+which the server checks against what arrived; one refused as
+.B BadDigest
+is read and sent again. It selects
 several items to download or delete, renames, shares, restores from the trash,
 shows pictures one after another, and opens text in an editor that highlights
 code, finds and replaces, previews Markdown and saves with Ctrl+S, and makes new
