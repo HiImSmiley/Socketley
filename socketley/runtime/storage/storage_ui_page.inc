@@ -451,6 +451,7 @@ body.audio #ups,body.audio #selbar{bottom:96px}
     <div class="sh">Libraries</div>
     <div id="libs"></div>
     <button class="nav" id="nSend"></button>
+    <button class="nav" id="nUse"></button>
     <div class="themes" id="themes"></div>
     <button class="nav" id="nOut"></button>
   </aside>
@@ -702,6 +703,7 @@ function side() {
   nav($('#nLinks'), 'link', 'Shared links', false, linksDlg);
   nav($('#nOut'), 'out', me && me.user ? 'Sign out · ' + (me.name || me.user) : 'Sign out', false, signOut);
   nav($('#nSend'), 'send', 'Send a file', false, () => sendDlg());
+  nav($('#nUse'), 'bucket', 'Storage', false, usageDlg);
   paintThemes();
   const L = $('#libs'); L.textContent = '';
   for (const b of buckets) {
@@ -1271,6 +1273,39 @@ function accessDlg(lib) {
     }
   }
   fill();
+}
+// How full each library is; an admin sets a library's quota here.
+function usageDlg() {
+  const box = el('div');
+  const L = modal('Storage', box, null, true);
+  const fill = async () => {
+    box.textContent = '';
+    let u;
+    try { u = await (await must(await api('GET', '/~ui/usage'))).json(); } catch (e) { box.append(el('p', { text: e.message })); return; }
+    const own = u.libraries.filter(l => !l.shared), mine = own.reduce((a, l) => a + l.bytes, 0);
+    box.append(el('div', { class: 'stats', style: 'display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 16px' },
+      el('span', { class: 'chip' }, el('span', { text: human(mine) + ' in ' + own.length + (own.length === 1 ? ' library' : ' libraries') })),
+      u.user_max_bytes ? el('span', { class: 'chip' }, el('span', { text: 'your quota ' + human(u.user_max_bytes) + ' · ' + Math.round(100 * mine / u.user_max_bytes) + '% used' })) : null,
+      u.admin ? el('span', { class: 'chip' }, el('span', { text: 'admin: every library' })) : null));
+    const top = Math.max(1, ...u.libraries.map(l => l.max_bytes || l.bytes));
+    for (const l of u.libraries.sort((a, b) => b.bytes - a.bytes)) {
+      const cap = l.max_bytes || 0, pct = cap ? Math.min(100, 100 * l.bytes / cap) : 100 * l.bytes / top;
+      const bar = el('div', { class: 'sbar' }, el('i', { style: 'width:' + pct.toFixed(1) + '%' + (cap && pct > 90 ? ';background:var(--bad)' : '') }));
+      const head = el('div', { style: 'display:flex;align-items:baseline;gap:10px;margin-top:14px' },
+        el('b', { text: l.bucket }), el('span', { class: 'mut', style: 'font-size:12.5px', text: u.admin ? 'owner ' + l.owner : l.shared ? 'shared with you by ' + l.owner : '' }),
+        el('span', { style: 'margin-left:auto;font-variant-numeric:tabular-nums', text: (l.partial ? 'at least ' : '') + human(l.bytes) + (cap ? ' of ' + human(cap) : '') + ' · ' + l.objects + (l.objects === 1 ? ' file' : ' files') }));
+      box.append(head, bar);
+      if (u.admin) {
+        const q = el('input', { class: 'inp', type: 'number', min: '0', step: '0.1', placeholder: 'No quota', value: cap ? String(+(cap / 1e9).toFixed(2)) : '', style: 'width:120px;height:32px' });
+        box.append(el('div', { style: 'display:flex;align-items:center;gap:8px;margin-top:6px' }, el('span', { class: 'mut', style: 'font-size:12.5px', text: 'Quota in GB' }), q,
+          btn(null, 'Set', async () => { try { await must(await api('POST', '/~ui/usage', { body: JSON.stringify({ bucket: l.bucket, max_bytes: Math.round((+q.value || 0) * 1e9), max_objects: l.max_objects || 0 }) })); toast(+q.value ? 'Quota of ' + l.bucket + ' set to ' + q.value + ' GB' : 'Quota of ' + l.bucket + ' removed'); fill(); } catch (e) { fail(e); } }, 'sm')));
+      }
+    }
+    if (!u.libraries.length) box.append(el('p', { class: 'mut', text: 'No libraries yet.' }));
+    box.append(el('p', { class: 'mut', style: 'font-size:12.5px;margin-top:18px', text: 'Sizes are summed from each library’s listing and kept for a minute.' }));
+  };
+  fill();
+  return L;
 }
 function trashDlg() {
   const T = el('table', { class: 'mtbl' });
