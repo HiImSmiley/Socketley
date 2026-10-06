@@ -9559,6 +9559,12 @@ marker object, as S3 browsers do. A folder's COPY, MOVE and DELETE go over every
 key under it, and a copy reads each object whole, so one past 256 MiB or under a
 client's own key is not copied and the answer is
 .BR 500 .
+A COPY or MOVE with
+.B Overwrite: F
+is
+.B 412
+when its Destination holds a file, or for a folder any object under it, and
+replaces it otherwise.
 Locks are granted and not enforced, and properties are not kept.
 .IP
 An address that fails ten sign-ins with Basic, here, at

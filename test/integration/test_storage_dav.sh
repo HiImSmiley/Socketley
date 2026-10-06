@@ -8,6 +8,7 @@
 #   * a folder, a file or a bucket a WebDAV client makes, lists, copies, moves
 #     or removes not being what S3 then sees, on either shard
 #   * a folder's copy or move losing an object, or its removal leaving one
+#   * a copy or move with Overwrite: F replacing what is at its Destination
 #   * a user seeing or writing another user's bucket through the drive
 #   * a versioned bucket's deleted file missing from its trash, or not brought
 #     back by a restore
@@ -147,6 +148,14 @@ check "COPY of a file is 201" "$(code -u "$A" -X COPY -H "$(dst docs/b/one-copy.
 check "and the copy reads the same" "$(curl -s -u "$A" "$U/~dav/docs/b/one-copy.txt")" one
 check "MOVE of a file is 201" "$(code -u "$A" -X MOVE -H "$(dst docs/b/moved.txt)" "$U/~dav/docs/b/one-copy.txt")" 201
 check "and leaves no source" "$(code -u "$A" "$U/~dav/docs/b/one-copy.txt")" 404
+printf 'two' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/docs/b/two.txt"
+check "a MOVE onto a file with Overwrite: F is 412, and changes nothing" \
+      "$(code -u "$A" -X MOVE -H "$(dst docs/b/moved.txt)" -H 'Overwrite: F' "$U/~dav/docs/b/two.txt") $(curl -s -u "$A" "$U/~dav/docs/b/moved.txt") $(code -u "$A" "$U/~dav/docs/b/two.txt")" "412 one 200"
+check "as is a COPY" "$(code -u "$A" -X COPY -H "$(dst docs/b/moved.txt)" -H 'Overwrite: F' "$U/~dav/docs/b/two.txt") $(curl -s -u "$A" "$U/~dav/docs/b/moved.txt")" "412 one"
+check "and a folder's onto one that holds files" "$(code -u "$A" -X COPY -H "$(dst docs/b/)" -H 'Overwrite: F' "$U/~dav/docs/a/") $(names "$A" docs/b/)" "412 b moved.txt two.txt"
+check "to a free name it is made" "$(code -u "$A" -X COPY -H "$(dst 'docs/b/two%20(1).txt')" -H 'Overwrite: F' "$U/~dav/docs/b/two.txt") $(curl -s -u "$A" "$U/~dav/docs/b/two%20(1).txt")" "201 two"
+check "without it, a file is replaced" "$(code -u "$A" -X COPY -H "$(dst 'docs/b/two%20(1).txt')" "$U/~dav/docs/b/moved.txt") $(curl -s -u "$A" "$U/~dav/docs/b/two%20(1).txt")" "201 one"
+curl -s -u "$A" -o /dev/null -X DELETE "$U/~dav/docs/b/two.txt"; curl -s -u "$A" -o /dev/null -X DELETE "$U/~dav/docs/b/two%20(1).txt"
 check "COPY of a folder is 201" "$(code -u "$A" -X COPY -H "$(dst docs/c/)" "$U/~dav/docs/a/")" 201
 check "with every object under it" "$(curl -s -u "$A" "$U/~dav/docs/c/sub/big.bin" | cmp -s - "$T/big" && echo same)" same
 check "MOVE of a folder is 201" "$(code -u "$A" -X MOVE -H "$(dst docs/d/)" "$U/~dav/docs/c/")" 201

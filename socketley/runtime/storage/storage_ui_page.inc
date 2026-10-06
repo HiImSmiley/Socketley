@@ -512,6 +512,7 @@ const P = {
   link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
   trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4.5h6V7"/>',
   edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="m13.5 6.5 4 4"/>',
+  copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
   more: '<circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/>',
   close: '<path d="M6 6l12 12M18 6 6 18"/>', plus: '<path d="M12 5v14M5 12h14"/>',
   grid: '<rect x="4" y="4" width="7" height="7" rx="1.8"/><rect x="13" y="4" width="7" height="7" rx="1.8"/><rect x="4" y="13" width="7" height="7" rx="1.8"/><rect x="13" y="13" width="7" height="7" rx="1.8"/>',
@@ -1204,6 +1205,7 @@ function actions() {
     !one || one.dir ? { icon: 'archive', label: one ? 'Download as ZIP' : 'Download ' + s.length + ' items as ZIP', fn: () => downloadZip(s) } : null,
     one ? { icon: 'share', label: 'Share link…', fn: () => shareDlg(one) } : null,
     one && one.kind !== 'bucket' ? { icon: 'edit', label: 'Rename…', key: 'F2', fn: () => rename(one) } : null,
+    s.every(x => x.kind !== 'bucket') ? { icon: 'copy', label: s.length > 1 ? 'Copy ' + s.length + ' items' : 'Copy', key: 'Ctrl+D', fn: () => duplicate(s) } : null,
     '-',
     { icon: 'trash', label: s.length > 1 ? 'Delete ' + s.length + ' items' : 'Delete', key: 'Del', bad: true, fn: () => remove(s) }
   ];
@@ -1272,6 +1274,34 @@ async function remove(list) {
   if (!path.length) buckets = [];
   load(true);
 }
+// A copy beside the original, named as a file manager names one: “photo (1).jpg”, then “photo (2).jpg”.
+function copyName(name, dir, n) {
+  const dot = dir ? -1 : name.lastIndexOf('.');
+  const stem = dot > 0 ? name.slice(0, dot) : name, tail = dot > 0 ? name.slice(dot) : '';
+  return stem.replace(/ \(\d+\)$/, '') + ' (' + n + ')' + tail;
+}
+async function duplicate(list) {
+  if (!list.length) return;
+  const t = list.length > 1 ? toast('Copying…', 'info', 600000) : null;
+  let done = 0, last = ''; const errs = [];
+  for (const it of list) {
+    try {
+      // The drive refuses to copy over a name that is taken, so the next number is tried until one is free.
+      for (let n = 1; ; n++) {
+        const name = copyName(it.name, it.dir, n);
+        const r = await api('COPY', dav(it.segs, it.dir), { headers: { Destination: location.origin + dav([...it.segs.slice(0, -1), name], it.dir), Overwrite: 'F', Depth: 'infinity' } });
+        if (r.status === 412 && n < 100) continue;
+        await must(r); last = name; done++;
+        break;
+      }
+      if (t) t.lastChild.textContent = 'Copying… ' + done + ' / ' + list.length;
+    } catch (e) { errs.push(it.name + ': ' + e.message); }
+  }
+  if (t) t.remove();
+  if (done) toast(done === 1 ? 'Copied as ' + last : 'Copied ' + done + ' items');
+  if (errs.length) toast(errs[0] + (errs.length > 1 ? ' (and ' + (errs.length - 1) + ' more)' : ''), 'bad', 7000);
+  sel.clear(); load(true);
+}
 async function rename(it) {
   const n = await ask({ title: 'Rename', input: 'New name', value: it.name, ok: 'Rename' });
   if (!n || n === it.name) return;
@@ -1283,6 +1313,7 @@ document.addEventListener('keydown', e => {
   if (layers.length || !auth || $('#app').hidden || /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return;
   if (e.key === 'Delete' && sel.size) { e.preventDefault(); remove(selected()); }
   else if (e.key === 'F2' && sel.size === 1) { e.preventDefault(); rename(selected()[0]); }
+  else if ((e.ctrlKey || e.metaKey) && e.key === 'd' && sel.size) { e.preventDefault(); const s = selected(); if (s.every(x => x.kind !== 'bucket')) duplicate(s); }
   else if ((e.ctrlKey || e.metaKey) && e.key === 'a') { e.preventDefault(); shown.forEach(it => sel.add(keyOf(it))); paintSel(); }
   else if (e.key === '/') { e.preventDefault(); $('#q').focus(); }
   else if (e.key === 'Backspace' && path.length) { e.preventDefault(); go(path.slice(0, -1)); }

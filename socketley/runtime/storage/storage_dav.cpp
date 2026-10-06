@@ -654,7 +654,18 @@ void storage_run::dav_body(const std::shared_ptr<conn>& c)
                     app_forward(cc, "DELETE", std::move(b), {});
                     return;
                 }
-                dav_tree(cc, std::move(b), std::move(prefix), std::move(dst_b), std::move(dst_k), method == "COPY");
+                if (method == "DELETE")
+                {
+                    dav_tree(cc, std::move(b), std::move(prefix), {}, {}, false);
+                    return;
+                }
+                const bool copy = method == "COPY";
+                std::weak_ptr<conn> weak = cc;
+                dav_unless_taken(cc, dst_b, dst_k, true, [this, weak, b, prefix, dst_b, dst_k, copy]()
+                {
+                    if (auto c2 = weak.lock(); c2 && !c2->dead)
+                        dav_tree(c2, b, prefix, dst_b, dst_k, copy);
+                });
             }
             else
                 app_reply(cc, 405, "Not a method of a folder.\n");
@@ -687,45 +698,51 @@ void storage_run::dav_body(const std::shared_ptr<conn>& c)
                 return;
             }
             const bool move = method == "MOVE";
+            if (move && !app_allowed(cc, "DELETE", b, k))
+            {
+                app_reply(cc, 403, "Access denied.\n");
+                return;
+            }
             std::string source = "/";
             url_encode_to(source, b, true);
             source += '/';
             url_encode_to(source, k, true);
-            // A move is the copy and then the source's removal, answered once both are done.
-            cc->on_answer = [this, move, b, k](const std::shared_ptr<conn>& c2, response& resp)
+            std::weak_ptr<conn> wc = cc;
+            dav_unless_taken(cc, dst_b, dst_k, false, [this, wc, move, b, k, dst_b, dst_k, source]() mutable
             {
-                if (resp.status != 200)
-                {
-                    send_response(c2, std::move(resp));
+                auto fc = wc.lock();
+                if (!fc || fc->dead)
                     return;
-                }
-                if (!move)
+                // A move is the copy and then the source's removal, answered once both are done.
+                fc->on_answer = [this, move, b, k](const std::shared_ptr<conn>& c2, response& resp)
                 {
-                    response out;
-                    out.status = 201;
-                    send_response(c2, std::move(out));
-                    return;
-                }
-                std::weak_ptr<conn> weak = c2;
-                m_store.remove_version(b, k, {}, [this, weak, b, k](remove_result rr)
-                {
-                    if (rr.status == st::ok && rr.existed)
-                        notify_delete(b, k);
-                    if (auto c3 = weak.lock(); c3 && !c3->dead)
+                    if (resp.status != 200)
+                    {
+                        send_response(c2, std::move(resp));
+                        return;
+                    }
+                    if (!move)
                     {
                         response out;
-                        out.status = rr.status == st::ok ? 201 : 500;
-                        send_response(c3, std::move(out));
+                        out.status = 201;
+                        send_response(c2, std::move(out));
+                        return;
                     }
-                });
-            };
-            if (move && !app_allowed(cc, "DELETE", b, k))
-            {
-                cc->on_answer = nullptr;
-                app_reply(cc, 403, "Access denied.\n");
-                return;
-            }
-            app_forward(cc, "PUT", std::move(dst_b), std::move(dst_k), "x-amz-copy-source", std::move(source));
+                    std::weak_ptr<conn> weak = c2;
+                    m_store.remove_version(b, k, {}, [this, weak, b, k](remove_result rr)
+                    {
+                        if (rr.status == st::ok && rr.existed)
+                            notify_delete(b, k);
+                        if (auto c3 = weak.lock(); c3 && !c3->dead)
+                        {
+                            response out;
+                            out.status = rr.status == st::ok ? 201 : 500;
+                            send_response(c3, std::move(out));
+                        }
+                    });
+                };
+                app_forward(fc, "PUT", std::move(dst_b), std::move(dst_k), "x-amz-copy-source", std::move(source));
+            });
             return;
         }
         app_reply(cc, 405, "Not a method of a file.\n");
@@ -1082,6 +1099,37 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
         });
     };
     raw->page();
+}
+
+void storage_run::dav_unless_taken(const std::shared_ptr<conn>& c, const std::string& bucket, const std::string& key,
+                                   bool folder, std::function<void()> then)
+{
+    const std::string_view o = c->req.header("overwrite");
+    if (o != "F" && o != "f")
+    {
+        then();
+        return;
+    }
+    std::weak_ptr<conn> weak = c;
+    auto answer = [this, weak, then = std::move(then)](bool taken)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        if (taken)
+            app_reply(cc, 412, "The Destination exists, and Overwrite is F.\n");
+        else
+            then();
+    };
+    if (!folder)
+    {
+        m_store.stat_object(bucket, key, [answer](st s, const object_meta&) { answer(s == st::ok); });
+        return;
+    }
+    list_query q;
+    q.prefix   = key;
+    q.max_keys = 1;
+    m_node.list(bucket, q, [answer](st s, list_page p) { answer(s == st::ok && !p.objects.empty()); });
 }
 
 void storage_run::dav_trash(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix)

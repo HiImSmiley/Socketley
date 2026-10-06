@@ -879,6 +879,10 @@ public:
     void dav_collection(const std::shared_ptr<conn>& c, const std::string& bucket, const std::string& key);
     void dav_tree(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix, std::string dst_bucket,
                   std::string dst_prefix, bool keep_source);
+    // Calls `then` once a COPY's or MOVE's Destination may be written: with Overwrite: F only when nothing is there,
+    // answering 412 otherwise.
+    void dav_unless_taken(const std::shared_ptr<conn>& c, const std::string& bucket, const std::string& key, bool folder,
+                          std::function<void()> then);
     // A versioned bucket's deleted files under a folder, and one of them brought back by removing its delete marker.
     void dav_trash(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix);
     void dav_restore(const std::shared_ptr<conn>& c, std::string bucket, std::string key);
