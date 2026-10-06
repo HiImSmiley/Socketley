@@ -2606,25 +2606,35 @@ function xhr(j, method, url, body, headers, onprog) {
     x.send(body);
   });
 }
+// The next step of one file, marked as taken: its whole PUT, its start, a part, or its completion.
+function stepOf(j) {
+  if (j.state === 'queued' && !j.parts) { j.state = 'running'; return () => putWhole(j); }
+  if (!j.parts || ['done', 'error', 'canceled', 'paused', 'stale'].includes(j.state)) return null;
+  if (j.state === 'queued') { j.state = 'starting'; return () => begin(j); }
+  if (j.state !== 'running') return null;
+  const p = j.parts.find(p => p.state === 'todo');
+  if (p) { p.state = 'sending'; return () => sendPart(j, p); }
+  if (j.parts.every(p => p.state === 'done')) { j.state = 'finishing'; return () => finish(j); }
+  return null;
+}
+// Up to three files go up side by side: a free place goes to the open file with the fewest requests on the way, and a
+// queued file opens while fewer than three are open, so a large file's parts never hold every place.
+const FILES_MAX = 3;
 function nextTask() {
-  for (const j of UP.jobs) {
-    if (j.state === 'queued' && !j.parts) { j.state = 'running'; return () => putWhole(j); }
-    if (!j.parts || ['done', 'error', 'canceled', 'paused', 'stale'].includes(j.state)) continue;
-    if (j.state === 'queued') { j.state = 'starting'; return () => begin(j); }
-    if (j.state !== 'running') continue;
-    const p = j.parts.find(p => p.state === 'todo');
-    if (p) { p.state = 'sending'; return () => sendPart(j, p); }
-    if (j.parts.every(p => p.state === 'done')) { j.state = 'finishing'; return () => finish(j); }
-  }
+  const open = UP.jobs.filter(j => (j.active || 0) > 0 || ['running', 'starting', 'finishing'].includes(j.state));
+  const order = open.slice().sort((a, b) => (a.active || 0) - (b.active || 0));
+  if (open.length < FILES_MAX) order.unshift(...UP.jobs.filter(j => j.state === 'queued').slice(0, FILES_MAX - open.length));
+  for (const j of order) { const t = stepOf(j); if (t) return [j, t]; }
   return null;
 }
 function schedule() {
   if (!UP.ticking) UP.ticking = setInterval(tick, 500);
   while (UP.busy < UP.slots) {
-    const t = nextTask(); if (!t) break;
-    UP.busy++;
+    const n = nextTask(); if (!n) break;
+    const [j, t] = n;
+    UP.busy++; j.active = (j.active || 0) + 1;
     if (!UP.jobs.some(j => j.started)) UP.started = Date.now();
-    t().finally(() => { UP.busy--; schedule(); paintUploads(); });
+    t().finally(() => { UP.busy--; j.active--; schedule(); paintUploads(); });
   }
   if (!UP.busy && !UP.jobs.some(j => ['queued', 'running', 'starting', 'finishing'].includes(j.state))) { clearInterval(UP.ticking); UP.ticking = 0; paintUploads(); }
 }
