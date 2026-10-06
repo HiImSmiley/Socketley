@@ -290,6 +290,69 @@ check "where two keys clean to one name, the second is numbered" \
       "['double (2).txt', 'double.txt']"
 for k in 'z/../../evil.txt' 'z/./dot.txt' 'z//double.txt' 'z/double.txt' 'z/back%5Cslash.txt' 'z/a/../a.txt' 'z/a.txt' 'z/ctrl%01name.txt'; do s3 -o /dev/null --path-as-is -X DELETE "$U/docs/$k"; done
 
+# A ZIP unpacked on the server, into a folder beside it, across both shards.
+python3 - "$T" <<'ZEOF'
+import zipfile, sys, os, random
+t = sys.argv[1]
+random.seed(5)
+text = b"".join(b"line %d of a file that packs well\n" % i for i in range(90000))
+noise = bytes(random.getrandbits(8) for _ in range(1 << 20))
+with zipfile.ZipFile(t + "/mixed.zip", "w") as z:
+    z.writestr("readme.txt", b"hello from the archive\n", zipfile.ZIP_STORED)
+    z.writestr("deep/er/packed.txt", text, zipfile.ZIP_DEFLATED, 9)
+    z.writestr("deep/noise.bin", noise, zipfile.ZIP_DEFLATED)
+    z.writestr("empty/", b"")
+    z.writestr("mXsik.txt", b"old code page\n", zipfile.ZIP_STORED)
+    z.writestr("win\\path\\file.txt", b"backslashes\n", zipfile.ZIP_DEFLATED)
+    z.writestr("../escape.txt", b"no\n", zipfile.ZIP_STORED)
+    z.writestr("__MACOSX/._readme.txt", b"fork\n", zipfile.ZIP_STORED)
+    z.writestr("bz.txt", b"bzip2 packed\n" * 100, zipfile.ZIP_BZIP2)
+    z.writestr("film.mp4", b"\x00\x00\x00\x18ftypmp42", zipfile.ZIP_STORED)
+    with z.open("big64.bin", "w", force_zip64=True) as f:
+        f.write(noise[:300000])
+# A name in code page 437, as an archiver from before UTF-8 writes it: "m\x81sik" is "müsik".
+b = open(t + "/mixed.zip", "rb").read().replace(b"mXsik.txt", b"m\x81sik.txt")
+open(t + "/mixed.zip", "wb").write(b)
+open(t + "/text.bin", "wb").write(text)
+open(t + "/noise.bin", "wb").write(noise)
+with zipfile.ZipFile(t + "/broken.zip", "w") as z:
+    z.writestr("good.txt", b"good\n", zipfile.ZIP_STORED)
+    z.writestr("bad.txt", b"x" * 5000, zipfile.ZIP_DEFLATED)
+b = bytearray(open(t + "/broken.zip", "rb").read())
+i = b.find(b"PK\x03\x04", 10)           # the second entry's local header, its deflated bytes after it
+b[i + 30 + 7 + 3] ^= 0xff
+open(t + "/broken.zip", "wb").write(bytes(b))
+ZEOF
+unzip_code() { curl -s -m 60 -o "$T/unzip.json" -w '%{http_code}' "$@"; }
+check "a ZIP is put" "$(code -u "$A" -T "$T/mixed.zip" "$U/~dav/docs/arch/mixed.zip")" 201
+check "and POST ?unzip unpacks it" "$(unzip_code -u "$A" -X POST "$U/~dav/docs/arch/mixed.zip?unzip")" 201
+check "telling into which folder and what it made and skipped" \
+      "$(python3 -c 'import json,sys; j=json.load(open(sys.argv[1])); print(j["folder"], j["files"], j["folders"], j["failed"], j["skipped"], sorted(j["skipped_names"]))' "$T/unzip.json")" \
+      "arch/mixed/ 7 1 0 2 ['../escape.txt', 'bz.txt']"
+check "a stored file is as it was" "$(curl -s -u "$A" "$U/~dav/docs/arch/mixed/readme.txt")" "hello from the archive"
+check "a deflated one of 3 MB too" "$(curl -s -u "$A" "$U/~dav/docs/arch/mixed/deep/er/packed.txt" | cmp -s - "$T/text.bin" && echo same)" same
+check "and one that did not pack" "$(curl -s -u "$A" "$U/~dav/docs/arch/mixed/deep/noise.bin" | cmp -s - "$T/noise.bin" && echo same)" same
+check "and one with ZIP64's fields" "$(curl -s -u "$A" "$U/~dav/docs/arch/mixed/big64.bin" | cmp -s - <(head -c 300000 "$T/noise.bin") && echo same)" same
+check "a name in the old code page is UTF-8" "$(curl -s -u "$A" "$U/~dav/docs/arch/mixed/m%C3%BCsik.txt")" "old code page"
+check "backslashes are folders" "$(curl -s -u "$A" "$U/~dav/docs/arch/mixed/win/path/file.txt")" "backslashes"
+check "an empty folder is kept" "$(s3 -o /dev/null -w '%{http_code}' -I "$U/docs/arch/mixed/empty/")" 200
+check "a file is typed by its name" "$(s3 -o /dev/null -D - -I "$U/docs/arch/mixed/film.mp4" | grep -i '^content-type' | tr -d '\r')" "Content-Type: video/mp4"
+check "nothing climbs out of the folder, nor is macOS's shadow kept" \
+      "$(s3 "$U/docs?list-type=2&prefix=arch/" | grep -o '<Key>[^<]*' | grep -c 'escape\|__MACOSX')" 0
+check "a second unpacking goes beside the first, numbered" \
+      "$(unzip_code -u "$A" -X POST "$U/~dav/docs/arch/mixed.zip?unzip"; python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["folder"])' "$T/unzip.json")" \
+      "201arch/mixed (2)/"
+check "another user may not unpack it" "$(unzip_code -u "$B" -X POST "$U/~dav/docs/arch/mixed.zip?unzip")" 403
+check "nor the interface's session without its header" "$(unzip_code -b "skl_ui=$ck" -X POST "$U/~dav/docs/arch/mixed.zip?unzip")" 403
+check "a file that is not a ZIP is 400" "$(unzip_code -u "$A" -X POST "$U/~dav/docs/a/one.txt?unzip")" 400
+check "and one not there 404" "$(unzip_code -u "$A" -X POST "$U/~dav/docs/arch/none.zip?unzip")" 404
+code -u "$A" -T "$T/broken.zip" "$U/~dav/docs/arch/broken.zip" >/dev/null
+check "a file whose bytes do not open to its CRC fails" \
+      "$(unzip_code -u "$A" -X POST "$U/~dav/docs/arch/broken.zip?unzip"; python3 -c 'import json,sys; j=json.load(open(sys.argv[1])); print(j["files"], j["failed"], j["failed_names"])' "$T/unzip.json")" \
+      "5001 1 ['bad.txt']"
+check "and is not written, while the rest are" \
+      "$(code -u "$A" "$U/~dav/docs/arch/broken/bad.txt") $(curl -s -u "$A" "$U/~dav/docs/arch/broken/good.txt")" "404 good"
+
 # Watch positions, a user's own.
 pos() { curl -s -b "skl_ui=$ck" -H 'X-Socketley-UI: 1' -o /dev/null -w '%{http_code}' -X POST -d "$1" "$U/~ui/progress"; }
 check "a position is kept" "$(pos '{"bucket":"docs","key":"huge.bin","t":61.5,"d":3600}')" 204

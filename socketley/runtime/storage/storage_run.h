@@ -927,6 +927,10 @@ public:
     void zip_pump(const std::shared_ptr<conn>& c);
     // Lets go of an archive's open object, at a close or the next request.
     void zip_end(conn& c);
+    // A ZIP object opened into the folder `dst_prefix` of its bucket, one object per file in it, answered once all are
+    // written with what was made and what was not; storage_unzip.cpp.
+    struct unzip_job;
+    void unzip_start(const std::shared_ptr<conn>& c, std::string bucket, std::string key, std::string dst_prefix);
     // The interface's sign-in (/~ui/session) and the films a user has part watched (/~ui/progress).
     void ui_session(const std::shared_ptr<conn>& c);
     // The time before which a user's sessions are no longer let in, set by signing out everywhere into
@@ -1411,6 +1415,10 @@ private:
         // Removes what was written, and tells nobody.
         void abort();
     };
+    // A put of `size` bytes the runtime makes itself, begun as a client's is: encrypted when the bucket encrypts,
+    // marked for replication and with S3's default checksum; null with `err` when it cannot start.
+    std::shared_ptr<put_op> begin_own_put(const std::string& bucket, const std::string& key, object_meta meta,
+                                          uint64_t size, s3_error& err);
     // Writes `data` as the object, encrypted when the bucket encrypts, marked for replication and with S3's default
     // checksum as a client's put is, telling `done` once; null with `err` when it cannot start.
     std::shared_ptr<whole_put> put_whole(const std::string& bucket, const std::string& key, object_meta meta,

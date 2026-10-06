@@ -9634,6 +9634,25 @@ the key, the time of the deletion and the size of the version behind it, and
 .B POST /~dav/\fIbucket\fB/\fIkey\fB?restore
 removes the marker and brings that version back. A lifecycle rule's
 NoncurrentVersionExpiration empties the trash.
+.B POST /~dav/\fIbucket\fB/\fIkey\fB?unzip
+unpacks a ZIP object on the server into a folder beside it named as it is
+without its extension, numbered (\fIname\fR (2)) when that name is taken, so
+nothing is written over and nothing of it crosses the client's line. Each file
+is read from the archive, opened when it is deflated, checked against its CRC-32
+and size, and written as an object of its own, four at a time, as the drive's
+other writes are (encrypted when the bucket encrypts, typed by its extension);
+an empty folder in it becomes the folder's marker. ZIP64 archives are read;
+names in UTF-8 are kept and older ones are read as code page 437. A file that is
+encrypted, packed other than stored or deflated, or named outside the folder
+(\fB..\fR, a control character) is skipped, as macOS's \fB__MACOSX\fR tree,
+\fB.DS_Store\fR and \fBThumbs.db\fR are without a word. It needs GET of the
+archive and PUT under the folder; the answer, once every file is written, is
+JSON naming the folder and counting the files, folders and bytes written and
+the files skipped and failed, with up to 20 names of each, 201 when none failed
+and 500 when any did. An archive whose directory is over 64 MiB or holds more
+than 100,000 entries is refused. The job goes on to its end when its request is
+abandoned. 549 MiB unpacked from a 312 MiB archive of 502 files in 2.1 s on four
+CPUs with two shards, other requests answered meanwhile in under 35 ms.
 .TP
 .B /~share/
 Links to an object or a folder that anyone holding one reads without credentials.
@@ -9819,7 +9838,8 @@ library's card shows a picture called folder, cover or poster in it, else its
 first picture or film; more than twelve pictures are grouped by the month of
 their date (the camera's, see
 .BR /~ui/taken ,
-else the object's); and pictures play as a slideshow. It uploads several files at once,
+else the object's); and pictures play as a slideshow. A ZIP's menu unpacks it beside itself on the server
+(\fB?unzip\fR above). It uploads several files at once,
 and a file of 48 MiB or more in parts of at least 16 MiB, four requests side by
 side shared among up to three files, each going to the file with the fewest on
 the way, through the drive's multipart above; while a film or a song plays in

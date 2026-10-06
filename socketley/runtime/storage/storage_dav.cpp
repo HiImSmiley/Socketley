@@ -510,6 +510,17 @@ void storage_run::dav_body(const std::shared_ptr<conn>& c)
         dav_restore(c, std::move(bucket), std::move(key));
         return;
     }
+    // A ZIP posted to with ?unzip is unpacked on the server into a folder beside it named as it is without its
+    // extension, numbered when that name is taken.
+    if (m == "POST" && r.has_query("unzip") && !bucket.empty() && !folder_path)
+    {
+        std::string dst = key;
+        const size_t slash = dst.rfind('/');
+        if (const size_t dot = dst.rfind('.'); dot != std::string::npos && (slash == std::string::npos || dot > slash + 1))
+            dst.resize(dot);
+        unzip_start(c, std::move(bucket), std::move(key), std::move(dst));
+        return;
+    }
     if (m == "PROPPATCH")
     {
         // Properties are not kept; each one asked for is answered as set, as clients that stamp times expect.

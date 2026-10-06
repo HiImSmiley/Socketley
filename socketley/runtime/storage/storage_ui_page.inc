@@ -1365,6 +1365,7 @@ function actions() {
     one && !one.dir && (one.kind === 'text' || one.kind === 'file') && one.size < 8e6 ? { icon: 'code', label: 'Edit as text', fn: () => editText(one) } : null,
     one && !one.dir ? { icon: 'download', label: 'Download', fn: () => download(files) } : null,
     !one || one.dir ? { icon: 'archive', label: one ? 'Download as ZIP' : 'Download ' + s.length + ' items as ZIP', fn: () => downloadZip(s) } : null,
+    one && !one.dir && ext(one.name) === 'zip' ? { icon: 'archive', label: 'Unzip here', fn: () => unzip(one) } : null,
     one ? { icon: 'share', label: 'Share link…', fn: () => shareDlg(one) } : null,
     one && one.kind !== 'bucket' ? { icon: 'edit', label: 'Rename…', key: 'F2', fn: () => rename(one) } : null,
     s.every(x => x.kind !== 'bucket') ? { icon: 'copy', label: s.length > 1 ? 'Copy ' + s.length + ' items' : 'Copy', key: 'Ctrl+D', fn: () => duplicate(s) } : null,
@@ -1462,6 +1463,22 @@ async function duplicate(list) {
   if (t) t.remove();
   if (done) toast(done === 1 ? 'Copied as ' + last : 'Copied ' + done + ' items');
   if (errs.length) toast(errs[0] + (errs.length > 1 ? ' (and ' + (errs.length - 1) + ' more)' : ''), 'bad', 7000);
+  sel.clear(); load(true);
+}
+// A ZIP is unpacked by the drive itself, into a folder beside it of its name, so none of it comes down and goes back up.
+async function unzip(it) {
+  const t = toast('Unzipping ' + it.name + '…', 'info', 3600000);
+  try {
+    const r = await api('POST', dav(it.segs) + '?unzip');
+    // The answer tells what was made, and what was not, whether or not all of it went well.
+    let j = null; try { j = await r.clone().json(); } catch (e) {}
+    if (!j) await must(r);
+    const folder = j.folder.replace(/\/$/, '').split('/').pop();
+    if (j.files || !j.failed) toast('Unzipped ' + j.files + (j.files === 1 ? ' file' : ' files') + ' into ' + folder);
+    const few = (n, names) => names.slice(0, 3).join(', ') + (n > 3 ? ', …' : '');
+    if (j.failed) toast(j.failed + ' of its files could not be unpacked (' + few(j.failed, j.failed_names) + ')', 'bad', 8000);
+    if (j.skipped) toast(j.skipped + ' not unpacked: encrypted, packed another way or named outside the folder (' + few(j.skipped, j.skipped_names) + ')', 'bad', 8000);
+  } catch (e) { fail(e); } finally { t.remove(); }
   sel.clear(); load(true);
 }
 async function rename(it) {

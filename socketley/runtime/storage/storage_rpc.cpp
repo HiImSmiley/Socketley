@@ -382,10 +382,8 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
     return false;
 }
 
-std::shared_ptr<storage_run::whole_put> storage_run::put_whole(const std::string& bucket, const std::string& key,
-                                                              object_meta meta, std::string data,
-                                                              std::function<void(st, const put_result*)> done,
-                                                              s3_error& err)
+std::shared_ptr<put_op> storage_run::begin_own_put(const std::string& bucket, const std::string& key, object_meta meta,
+                                                   uint64_t size, s3_error& err)
 {
     // A bucket that encrypts its new objects encrypts this one too.
     sse_seal_spec seal;
@@ -412,13 +410,24 @@ std::shared_ptr<storage_run::whole_put> storage_run::put_whole(const std::string
     // Given S3's default checksum like a client's object.
     reserve_checksum(meta, default_checksum_algo);
     st why = st::ok;
-    auto op_ptr = m_store.begin_put(bucket, key, std::move(meta), data.size(), true, why, true, sealed ? &seal : nullptr);
+    auto op_ptr = m_store.begin_put(bucket, key, std::move(meta), size, true, why, true, sealed ? &seal : nullptr);
     if (!op_ptr)
     {
         err = error_for(why);
         return nullptr;
     }
     op_ptr->track_checksum(default_checksum_algo, {});
+    return op_ptr;
+}
+
+std::shared_ptr<storage_run::whole_put> storage_run::put_whole(const std::string& bucket, const std::string& key,
+                                                              object_meta meta, std::string data,
+                                                              std::function<void(st, const put_result*)> done,
+                                                              s3_error& err)
+{
+    auto op_ptr = begin_own_put(bucket, key, std::move(meta), data.size(), err);
+    if (!op_ptr)
+        return nullptr;
     auto w  = std::make_shared<whole_put>();
     w->put  = std::move(op_ptr);
     w->data = std::move(data);
