@@ -555,7 +555,8 @@ run ./bin/premake5 gmake2
 
 step "building Release with -j$JOBS" \
      "if this was killed with no message it was the OOM reaper: re-run with --jobs 1"
-run make -C make config=release_x64 -j"$JOBS"
+# The daemon alone: the SDK archives, tests, fuzzers and benchmarks are no part of an install.
+run make -C make config=release_x64 -j"$JOBS" socketley
 
 step "checking the build produced a binary" \
      "make can exit 0 having linked nothing, so this is checked rather than assumed"
@@ -564,7 +565,7 @@ if [ "$DRY_RUN" = 1 ]; then
 else
     if [ ! -x "$ROOT/bin/Release/socketley" ]; then
         fail "the build reported success but there is no binary at bin/Release/socketley" \
-             "re-run the build alone and read its last lines:  make -C make config=release_x64 -j1"
+             "re-run the build alone and read its last lines:  make -C make config=release_x64 -j1 socketley"
     fi
     note "$(stat -c%s "$ROOT/bin/Release/socketley") bytes"
 fi
