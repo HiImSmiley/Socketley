@@ -886,6 +886,7 @@ function hero(list) {
     if (vids.length) acts.append(btn('play', 'Play', () => playVideo(vids[0], vids), 'pri'));
     if (auds.length) acts.append(btn('music', 'Play music', () => playAudio(auds[0], auds), vids.length ? '' : 'pri'));
     acts.append(btn('upload', 'Upload', () => $('#fi').click(), vids.length || auds.length ? '' : 'pri'), btn('send', 'Send', () => sendDlg()), btn('newfile', 'New text file', newText));
+    if (items.length) acts.append(btn('archive', 'Download all', () => downloadZip([])));
     if (path.length) acts.append(btn('restore', 'Trash', trashDlg));
     // Sharing the library with other users, for whoever may change its policy.
     if (path.length === 1 && me && !me.anonymous) {
@@ -1006,7 +1007,8 @@ function actions() {
   return [
     one ? { icon: one.dir ? 'folder' : one.kind === 'video' || one.kind === 'audio' ? 'play' : 'eye', label: one.dir ? 'Open' : one.kind === 'video' || one.kind === 'audio' ? 'Play' : 'Open', fn: () => open(one) } : null,
     one && !one.dir && (one.kind === 'text' || one.kind === 'file') && one.size < 8e6 ? { icon: 'code', label: 'Edit as text', fn: () => editText(one) } : null,
-    files.length ? { icon: 'download', label: files.length > 1 ? 'Download ' + files.length + ' files' : 'Download', fn: () => download(files) } : null,
+    one && !one.dir ? { icon: 'download', label: 'Download', fn: () => download(files) } : null,
+    !one || one.dir ? { icon: 'archive', label: one ? 'Download as ZIP' : 'Download ' + s.length + ' items as ZIP', fn: () => downloadZip(s) } : null,
     one ? { icon: 'share', label: 'Share link…', fn: () => shareDlg(one) } : null,
     one && one.kind !== 'bucket' ? { icon: 'edit', label: 'Rename…', key: 'F2', fn: () => rename(one) } : null,
     '-',
@@ -1021,7 +1023,8 @@ function selbar() {
   b.textContent = '';
   const files = s.filter(it => !it.dir);
   b.append(el('b', { text: s.length + ' selected' }));
-  if (files.length) b.append(btn('download', 'Download', () => download(files), 'sm'));
+  if (s.length === 1 && !s[0].dir) b.append(btn('download', 'Download', () => download(files), 'sm'));
+  else b.append(btn('archive', 'Download ZIP', () => downloadZip(s), 'sm'));
   if (s.length === 1) b.append(btn('share', 'Share', () => shareDlg(s[0]), 'sm'));
   b.append(btn('trash', 'Delete', () => remove(s), 'sm bad'), ibtn('close', 'Clear selection', () => { sel.clear(); paintSel(); }));
 }
@@ -1102,6 +1105,13 @@ async function download(list) {
     await sleep(350);
   }
   if (list.length > 1) toast('Downloading ' + list.length + ' files');
+}
+// Several items, or a folder, as one ZIP the server streams; an empty list is the whole folder open.
+function downloadZip(list) {
+  const url = dav(path, true) + '?zip' + list.map(it => '&n=' + encodeURIComponent(it.name)).join('');
+  const a = el('a', { href: list.length === 1 && list[0].dir ? dav(list[0].segs, true) + '?zip' : url, download: '', style: 'display:none' });
+  document.body.append(a); a.click(); a.remove();
+  toast('Preparing the ZIP: the download starts in a moment');
 }
 function shareDlg(it) {
   const exp = el('select', { class: 'inp' }, ...[['3600', '1 hour'], ['86400', '1 day'], ['604800', '7 days'], ['2592000', '30 days'], ['0', 'Never']].map(([v, t]) => el('option', { value: v, text: t })));
