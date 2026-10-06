@@ -789,11 +789,35 @@ async function load(keepScroll) {
     side(); return;
   }
   for (const k of [...sel]) if (!items.some(it => keyOf(it) === k)) sel.delete(k);
+  liveAt = Date.now();
   side(); render();
   $('#scroll').scrollTop = keepScroll ? top : 0;
 }
 let reloadT = 0;
 function reloadSoon() { clearTimeout(reloadT); reloadT = setTimeout(() => load(true), 400); }
+// What another device or client changes in the folder open shows here within seconds: the folder is asked again
+// every 5 s while the page is seen (30 s past 2000 entries, none while a viewer or dialog is open or items are
+// dragged), and drawn anew only when what it holds changed.
+const sig = list => list.map(it => it.name + '\u0001' + it.size + '\u0001' + it.mod + '\u0001' + it.dir).join('\u0002');
+let liveT = 0, liveAt = 0, dragging = false;
+document.addEventListener('dragstart', () => dragging = true); document.addEventListener('dragend', () => dragging = false);
+async function liveCheck() {
+  if (!auth || document.hidden || layers.length || dragging || openPop) return;
+  if (Date.now() - liveAt < (items.length > 2000 ? 30000 : 5000)) return;
+  liveAt = Date.now();
+  const at = path.join('/');
+  try {
+    const now = await propfind(path);
+    if (path.join('/') !== at || sig(now) === sig(items)) return;
+    items = now;
+    if (!path.length) buckets = now.filter(b => b.dir);
+    for (const k of [...sel]) if (!items.some(it => keyOf(it) === k)) sel.delete(k);
+    const top = $('#scroll').scrollTop;
+    side(); render();
+    $('#scroll').scrollTop = top;
+  } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { liveAt = 0; liveCheck(); } });
 
 // ─── thumbnails, media facts and watch progress ─────────────────────────────
 const thumbQ = []; let thumbBusy = 0;
@@ -2364,6 +2388,7 @@ async function start() {
   await loadProgress();
   load();
   leftBehind();
+  if (!liveT) liveT = setInterval(liveCheck, 1000);
 }
 // A session the browser still holds signs in at once.
 (async () => {
