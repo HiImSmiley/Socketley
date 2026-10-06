@@ -83,12 +83,13 @@ a{color:inherit}
 #side{width:248px;flex:none;display:flex;flex-direction:column;padding:18px 12px;background:rgba(9,8,16,.5);border-right:1px solid var(--line);
   backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);z-index:15}
 #side .logo{padding:2px 8px 18px}
+#side>*:not(#libs){flex-shrink:0}
 .nav{display:flex;align-items:center;gap:12px;width:100%;padding:9px 12px;border-radius:10px;color:var(--mut);font-weight:500;text-align:left;transition:background .15s,color .15s}
 .nav:hover{background:rgba(255,255,255,.05);color:var(--fg)}
 .nav.on{background:linear-gradient(90deg,rgba(var(--glow),.24),rgba(var(--glow2),.05));color:#fff;box-shadow:inset 3px 0 0 var(--a1),0 8px 24px -14px rgba(var(--glow),.8)}
 .nav.on .i{color:var(--a1)}
 .nav .dot{width:10px;height:10px;border-radius:3px;flex:none}
-.nav span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nav span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-bottom:.3em;margin-bottom:-.3em}
 .sh{font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);padding:18px 12px 6px}
 #libs{overflow:auto;flex:1;min-height:0}
 #main{flex:1;min-width:0;display:flex;flex-direction:column;position:relative}
@@ -222,7 +223,8 @@ select.inp option{background:#151821}
 
 /* list */
 .tbl{width:100%;border-collapse:separate;border-spacing:0;margin-top:18px}
-.tbl th{font-size:11.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--dim);text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);position:sticky;top:0;background:rgba(7,8,12,.92);z-index:2}
+.tbl th{font-size:11.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--dim);text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);position:sticky;top:0;background:linear-gradient(rgba(var(--glow),.07),rgba(var(--glow2),.04)),rgba(12,14,21,.6);backdrop-filter:blur(16px) saturate(1.4);-webkit-backdrop-filter:blur(16px) saturate(1.4);z-index:2}
+.tbl thead th:first-child{border-top-left-radius:10px}.tbl thead th:last-child{border-top-right-radius:10px}
 .tbl td{padding:8px 12px;border-bottom:1px solid var(--line);white-space:nowrap;color:var(--mut)}
 .tbl tr.r{cursor:pointer;transition:background .12s}
 .tbl tr.r:hover td{background:rgba(255,255,255,.035)}
@@ -942,6 +944,11 @@ function render() {
   } else if (!list.length) C.append(el('div', { class: 'empty', style: 'padding:30px 20px' }, el('h3', { text: 'Nothing here is called like that' }), el('div', { text: query.length >= 2 ? 'Results from every library are below.' : 'Type another letter to search every library.' })));
   else if (view === 'list') C.append(table(list));
   if (query.length >= 2) { const f = searchSection(); if (f) C.append(f); }
+  // The list holds the folder already; only what is not in it, the films being watched, is added below it.
+  else if (view === 'list') {
+    const cw = !path.length ? watching() : [];
+    if (cw.length) C.append(section('Continue watching', 'vid', cw, it => videoCard(it, cw)));
+  }
   else {
     if (!path.length) {
       const cw = watching();
