@@ -9449,7 +9449,7 @@ over HTTP/1.1. A stream's window is given back only as its body is taken, so a
 disk that cannot keep up holds the client as a full socket does; going out, a
 frame of each stream is sent in turn as the client's windows allow, a stream
 told its bytes left when they reach the connection's queue, which is kept
-under 256 KiB. This side reads by a window of 4 MiB a stream and 32 MiB a
+under 1 MiB, so the next piece of a file is read while the last is written. This side reads by a window of 4 MiB a stream and 32 MiB a
 connection, 128 streams open at once (the next is refused with REFUSED_STREAM),
 header lists of up to 64 KiB, and frames of 16 KiB; a peer that resets more
 than 400 streams, sends more than 200 PINGs or SETTINGS or 1000 empty DATA

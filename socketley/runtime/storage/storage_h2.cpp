@@ -37,7 +37,7 @@ constexpr size_t   header_list_max = 64 * 1024;
 constexpr size_t   block_max       = header_list_max + 16 * 1024;
 constexpr int      continuations_max = 64;
 // What waits in the connection's queue before more frames are put in it.
-constexpr size_t   out_high        = 256 * 1024;
+constexpr size_t   out_high        = 1024 * 1024;
 // What one turn hands a stream's phase.
 constexpr size_t   pull_slice      = 64 * 1024;
 // Seconds a TLS connection that chose HTTP/2 has to send its preface.
@@ -57,8 +57,11 @@ struct h2_stream
 {
     uint32_t sid{0};
     // DATA received and not yet handed to the phase, and how far it has been.
-    std::string rx;
-    size_t      rx_off{0};
+    // Held as the frames brought it, so taking the front never moves the rest; only what the phase could not take
+    // at once is held at all.
+    std::deque<std::string> rxq;
+    size_t      rx_head{0};
+    size_t      rx_bytes{0};
     // What this side may still receive on the stream, and what was taken and not yet given back.
     int64_t     recv_avail{stream_window};
     uint32_t    rx_unacked{0};
@@ -319,12 +322,20 @@ void storage_run::h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n)
     h2_session& s = *c->h2;
     if (s.dying)
         return;
-    c->in.append(p, n);
+    // Frames are read where the bytes arrived; only a frame cut off by the end of them is kept for the next.
+    std::string held;
+    std::string_view buf(p, n);
+    if (!c->in.empty())
+    {
+        c->in.append(p, n);
+        held.swap(c->in);
+        buf = held;
+    }
     size_t at = 0;
     auto conn_error = [&](uint32_t code)
     {
-        c->in.clear();
-        at = 0;
+        buf = {};
+        at  = 0;
         h2_goaway(c, code, false);
     };
     // A stream's own error ends it alone.
@@ -343,14 +354,15 @@ void storage_run::h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n)
     if (!s.preface_ok)
     {
         const std::string_view pre = h2::preface;
-        const size_t look = std::min(pre.size(), c->in.size());
-        if (c->in.compare(0, look, pre.substr(0, look)) != 0)
+        const size_t look = std::min(pre.size(), buf.size());
+        if (buf.substr(0, look) != pre.substr(0, look))
         {
             close_conn(c);
             return;
         }
-        if (c->in.size() < pre.size())
+        if (buf.size() < pre.size())
         {
+            c->in.assign(buf);
             arm_read(c);
             return;
         }
@@ -358,17 +370,17 @@ void storage_run::h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n)
         at = pre.size();
     }
 
-    while (!c->dead && !s.dying && c->in.size() - at >= h2::head_len)
+    while (!c->dead && !s.dying && buf.size() - at >= h2::head_len)
     {
-        const h2::frame_head h = h2::parse_head(c->in.data() + at);
+        const h2::frame_head h = h2::parse_head(buf.data() + at);
         if (h.len > h2::default_frame)
         {
             conn_error(h2::FRAME_SIZE_ERROR);
             break;
         }
-        if (c->in.size() - at < h2::head_len + h.len)
+        if (buf.size() - at < h2::head_len + h.len)
             break;
-        std::string_view pl(c->in.data() + at + h2::head_len, h.len);
+        std::string_view pl(buf.data() + at + h2::head_len, h.len);
         at += h2::head_len + h.len;
         tick_window(s);
 
@@ -444,23 +456,18 @@ void storage_run::h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n)
                     stream_error(h.sid, h2::PROTOCOL_ERROR);
                     break;
                 }
-                if (st.rx_off == st.rx.size())
-                {
-                    st.rx.clear();
-                    st.rx_off = 0;
-                }
-                st.rx.append(pl);
                 if (h.flags & h2::END_STREAM)
                 {
                     st.remote_closed = true;
                     if (st.has_cl && st.data_in != st.cl)
                     {
+                        s.recv_unacked += static_cast<uint32_t>(pl.size());
                         stream_error(h.sid, h2::PROTOCOL_ERROR);
                         break;
                     }
                 }
                 sc->last_progress = std::chrono::steady_clock::now();
-                h2_pull(sc);
+                h2_pull(sc, pl);
                 break;
             }
             case h2::HEADERS:
@@ -709,8 +716,8 @@ void storage_run::h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n)
     }
     if (c->dead)
         return;
-    if (at)
-        c->in.erase(0, std::min(at, c->in.size()));
+    if (!s.dying && at < buf.size())
+        c->in.assign(buf.substr(at));
     h2_schedule(c);
     if (!c->dead && !c->ssl)
         arm_read(c);
@@ -743,7 +750,7 @@ bool storage_run::h2_headers(const std::shared_ptr<conn>& c, uint32_t sid)
             close_conn(sc);
             return true;
         }
-        h2_pull(sc);
+        h2_pull(sc, {});
         return true;
     }
 
@@ -898,54 +905,83 @@ bool storage_run::h2_headers(const std::shared_ptr<conn>& c, uint32_t sid)
 
 // ─── A stream's body in ─────────────────────────────────────────────────────
 
-void storage_run::h2_pull(const std::shared_ptr<conn>& c)
+void storage_run::h2_pull(const std::shared_ptr<conn>& c, std::string_view fresh)
 {
-    if (c->pulling || c->dead || !c->h2_parent)
+    if (c->dead || !c->h2_parent)
         return;
     conn* parent = c->h2_parent;
     h2_session& s = *parent->h2;
     h2_stream& st = *c->h2s;
+    // Called again from inside the phase, by its arm_read(): what just came is held, and the outer call goes on.
+    if (c->pulling)
+    {
+        if (!fresh.empty())
+        {
+            st.rxq.emplace_back(fresh);
+            st.rx_bytes += fresh.size();
+        }
+        return;
+    }
     c->pulling = true;
     uint64_t given = 0;
     auto open = [&] { return !c->dead && c->ph != phase::respond && c->ph != phase::hook_wait && c->park_off >= c->park.size(); };
-    while (open() && st.rx_off < st.rx.size())
+    auto give = [&](const char* d, size_t n)
     {
-        const size_t n = std::min(pull_slice, st.rx.size() - st.rx_off);
-        const size_t from = st.rx_off;
-        st.rx_off += n;
         given += n;
-        if (st.synth_chunked)
+        if (!st.synth_chunked)
         {
-            char hex[20];
-            const auto r = std::to_chars(hex, hex + sizeof hex, n, 16);
-            std::string framed;
-            framed.reserve(n + 32);
-            framed.append(hex, r.ptr);
-            framed += "\r\n";
-            framed.append(st.rx, from, n);
-            framed += "\r\n";
-            plain_in(c, framed.data(), framed.size());
+            plain_in(c, d, n);
+            return;
         }
-        else
-            plain_in(c, st.rx.data() + from, n);
+        char hex[20];
+        const auto r = std::to_chars(hex, hex + sizeof hex, n, 16);
+        std::string framed;
+        framed.reserve(n + 32);
+        framed.append(hex, r.ptr);
+        framed += "\r\n";
+        framed.append(d, n);
+        framed += "\r\n";
+        plain_in(c, framed.data(), framed.size());
+    };
+    // What was held goes first, in order; then what just came, straight from the frame when nothing is held.
+    while (open() && !st.rxq.empty())
+    {
+        std::string front = std::move(st.rxq.front());
+        st.rxq.pop_front();
+        size_t at = std::exchange(st.rx_head, 0);
+        while (at < front.size() && open())
+        {
+            const size_t n = std::min(pull_slice, front.size() - at);
+            st.rx_bytes -= n;
+            at += n;
+            give(front.data() + at - n, n);
+        }
+        if (at < front.size())
+        {
+            st.rx_head = at;
+            st.rxq.push_front(std::move(front));
+        }
     }
-    if (st.synth_chunked && st.remote_closed && !st.chunk_end_given && st.rx_off >= st.rx.size() && open())
+    while (!fresh.empty())
+    {
+        if (!open() || !st.rxq.empty())
+        {
+            st.rxq.emplace_back(fresh);
+            st.rx_bytes += fresh.size();
+            break;
+        }
+        const size_t n = std::min(pull_slice, fresh.size());
+        const char* d = fresh.data();
+        fresh.remove_prefix(n);
+        give(d, n);
+    }
+    if (st.synth_chunked && st.remote_closed && !st.chunk_end_given && st.rxq.empty() && open())
     {
         st.chunk_end_given = true;
         static const char end[] = "0\r\n\r\n";
         plain_in(c, end, sizeof end - 1);
     }
     c->pulling = false;
-    if (st.rx_off == st.rx.size())
-    {
-        st.rx.clear();
-        st.rx_off = 0;
-    }
-    else if (st.rx_off > (1u << 20) && st.rx_off * 2 > st.rx.size())
-    {
-        st.rx.erase(0, st.rx_off);
-        st.rx_off = 0;
-    }
     if (!given || s.dying)
         return;
     // What the phase took is given back, in increments of half a window so the updates are few.
@@ -1040,12 +1076,17 @@ void storage_run::h2_stream_out(const std::shared_ptr<conn>& c, std::string data
         }
         if (st.os == h2_stream::out_state::body)
         {
+            // A piece of a file is taken as it was handed over, when nothing is waiting before it.
             if (st.tx_off == st.tx.size())
             {
-                st.tx.clear();
                 st.tx_off = 0;
+                if (rest.data() == data.data() && rest.size() == data.size())
+                    st.tx = std::move(data);
+                else
+                    st.tx.assign(rest);
             }
-            st.tx.append(rest);
+            else
+                st.tx.append(rest);
             rest = {};
             break;
         }
@@ -1113,7 +1154,7 @@ void storage_run::h2_stream_gone(const std::shared_ptr<conn>& c)
             st.reset = true;
         }
         // What it received and its phase never took is the connection's again.
-        s.recv_unacked += static_cast<uint32_t>(st.rx.size() - st.rx_off);
+        s.recv_unacked += static_cast<uint32_t>(st.rx_bytes);
         if (s.recv_unacked >= conn_window / 2)
         {
             h2::put_window_update(s.ctl, 0, s.recv_unacked);
@@ -1122,7 +1163,8 @@ void storage_run::h2_stream_gone(const std::shared_ptr<conn>& c)
         }
     }
     s.streams.erase(st.sid);
-    std::string().swap(st.rx);
+    st.rxq.clear();
+    st.rx_bytes = 0;
     std::string().swap(st.tx);
     if (!s.dying)
         if (auto p = find(parent->id))
@@ -1136,11 +1178,14 @@ void storage_run::h2_schedule(const std::shared_ptr<conn>& c)
     if (c->dead || !c->h2)
         return;
     h2_session& s = *c->h2;
-    std::string out = std::move(s.ctl);
-    s.ctl.clear();
+    // Frames go straight into the connection's queue, which the record layer or the kernel takes from.
+    std::string& out = c->wq;
     const size_t before = unsent(*c);
+    const size_t start = out.size();
+    out += s.ctl;
+    s.ctl.clear();
     std::vector<std::shared_ptr<conn>> ended;
-    while (!s.rr.empty() && before + out.size() < out_high)
+    while (!s.rr.empty() && before + (out.size() - start) < out_high)
     {
         const uint32_t sid = s.rr.front();
         s.rr.pop_front();
@@ -1185,14 +1230,41 @@ void storage_run::h2_schedule(const std::shared_ptr<conn>& c)
             ended.push_back(sc);
             continue;
         }
+        if (!st.tx_left() && st.hdr.empty() && sc->after_write != conn::after_kind::none &&
+            st.os != h2_stream::out_state::head)
+            m_h2_due.push_back(sc);
         // More of it goes in the next turn, unless a window holds it until an update comes.
         if (st.tx_left() && st.send_win > 0 && s.send_win > 0)
             enqueue(s, st);
     }
-    if (!out.empty())
-        queue_write(c, std::move(out));
+    if (out.size() > start)
+        pump_write(c);
     for (auto& sc : ended)
         close_conn(sc);
+}
+
+// A stream whose bytes have all left its own queue is told its write is done, as HTTP/1.1's write completion tells a
+// connection: the next piece of its file is read, or its answer ends.
+void storage_run::h2_go_on(const std::shared_ptr<conn>& sc)
+{
+    if (sc->dead || !sc->h2s || sc->after_write == conn::after_kind::none || !sc->h2s->hdr.empty() ||
+        sc->h2s->tx_left() || sc->h2s->os == h2_stream::out_state::head)
+        return;
+    const conn::after_kind next = sc->after_write;
+    sc->after_write = conn::after_kind::none;
+    if (next == conn::after_kind::finish)
+        finish_request(sc);
+    else if (next == conn::after_kind::pump)
+        file_pump(sc);
+}
+
+void storage_run::h2_turn()
+{
+    std::vector<std::weak_ptr<conn>> due;
+    due.swap(m_h2_due);
+    for (auto& w : due)
+        if (auto sc = w.lock())
+            h2_go_on(sc);
 }
 
 void storage_run::h2_written(const std::shared_ptr<conn>& c)
@@ -1212,20 +1284,10 @@ void storage_run::h2_written(const std::shared_ptr<conn>& c)
     // Each stream whose answer has left its own queue goes on: the next piece of its file, or its end.
     std::vector<std::shared_ptr<conn>> due;
     for (auto& [sid, sc] : s.streams)
-        if (!sc->dead && sc->after_write != conn::after_kind::none && sc->h2s->hdr.empty() && !sc->h2s->tx_left() &&
-            sc->h2s->os != h2_stream::out_state::head)
-            due.push_back(sc);
+        due.push_back(sc);
     for (auto& sc : due)
-    {
-        if (sc->dead || c->dead)
-            continue;
-        const conn::after_kind next = sc->after_write;
-        sc->after_write = conn::after_kind::none;
-        if (next == conn::after_kind::finish)
-            finish_request(sc);
-        else if (next == conn::after_kind::pump)
-            file_pump(sc);
-    }
+        if (!c->dead)
+            h2_go_on(sc);
     if (c->dead)
         return;
     h2_schedule(c);

@@ -716,7 +716,7 @@ public:
     // ended, by its answer or by a close.
     void h2_start(const std::shared_ptr<conn>& c);
     void h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n);
-    void h2_pull(const std::shared_ptr<conn>& c);
+    void h2_pull(const std::shared_ptr<conn>& c, std::string_view fresh = {});
     void h2_stream_out(const std::shared_ptr<conn>& c, std::string data);
     void h2_written(const std::shared_ptr<conn>& c);
     void h2_schedule(const std::shared_ptr<conn>& parent);
@@ -1364,6 +1364,11 @@ private:
     std::unordered_map<uint64_t, std::shared_ptr<conn>> m_streams;
     // HTTP/2 is offered unless SOCKETLEY_STORAGE_HTTP2=0.
     bool        m_h2{true};
+    // Streams whose bytes have all gone into their connection's queue, told so at the end of the turn so the next
+    // piece of a file is read while the connection is still writing the last.
+    std::vector<std::weak_ptr<conn>> m_h2_due;
+    void h2_turn();
+    void h2_go_on(const std::shared_ptr<conn>& sc);
     uint64_t    m_next_id{1};
 
     // Connections whose kernel operations have not all reported, kept so the

@@ -590,6 +590,8 @@ void storage_run::sweep()
 
 void storage_run::on_turn()
 {
+    if (!m_h2_due.empty())
+        h2_turn();
     m_max_conns = m_owner.get_max_connections();
     m_node.flush_holds();
 }
