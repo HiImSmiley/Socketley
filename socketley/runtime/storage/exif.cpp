@@ -143,9 +143,11 @@ void boxes(std::string_view s, F&& each)
             size = s.size() - at;
         if (size < head)
             return;
-        // A box that runs past the bytes there are is given what there is of it.
-        const uint64_t end = size > s.size() - at ? s.size() : at + size;
-        if (!each(type, s.substr(at + head, end - at - head)))
+        // A box that runs past the bytes there are is given what there is of it and is the last, so a size near 2**64
+        // cannot carry `at` around to the start.
+        const uint64_t left = s.size() - at;
+        const uint64_t end = size > left ? s.size() : at + size;
+        if (!each(type, s.substr(at + head, end - at - head)) || size >= left)
             return;
         at += size;
     }

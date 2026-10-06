@@ -33,7 +33,8 @@
 #     more than it says, shared by one who may not, or its policy's other
 #     statements lost when it is shared or unshared
 #   * a photo's time or place not read from a JPEG's EXIF or a HEIF's Exif
-#     item, or read for a user who may not list the folder
+#     item, or read for a user who may not list the folder; or a HEIF whose
+#     box says it is nearly 2**64 bytes long holding its shard in a loop
 #   * an address that keeps guessing secrets not refused for a while, or
 #     another address or a session refused with it
 #   * an rclone mount's copy of a tree not coming back byte for byte
@@ -388,7 +389,13 @@ check "and again from what was read" "$(taken "$A")" \
       "[('pics/far.heic', '2019-01-02T03:04:05', 0, 0), ('pics/photo.jpg', '2021-07-14T18:03:22+02:00', 52.52, -13.405)]"
 check "not to a user who may not list them" "$(code -u "$B" "$U/~ui/taken?bucket=docs&prefix=pics/")" 403
 check "a folder is named with its slash" "$(code -u "$A" "$U/~ui/taken?bucket=docs&prefix=pics")" 400
-for f in pics/photo.jpg pics/plain.jpg pics/far.heic pics/deeper/inner.jpg; do curl -s -u "$A" -o /dev/null -X DELETE "$U/~dav/docs/$f"; done
+# A HEIF whose second box says it is 2**64 - 16 bytes long, which carried the walk of its boxes back to the start forever.
+python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('>I', 16) + b'ftypheic' + b'\0' * 4 + struct.pack('>I', 1) + b'free' + struct.pack('>Q', 2**64 - 16) + b'\0' * 8)" > "$T/loop.heic"
+curl -s -u "$A" -T "$T/loop.heic" -o /dev/null "$U/~dav/docs/pics/loop.heic"
+check "a HEIF whose box size wraps is read to its end, and the folder's photos still answer" \
+      "$(curl -s -m 10 -u "$A" -o /dev/null -w '%{http_code}' "$U/~ui/taken?bucket=docs&prefix=pics/")" 200
+check "and so does the runtime after it" "$(curl -s -m 10 -u "$A" -X PROPFIND -H "Depth: 0" -o /dev/null -w '%{http_code}' "$U/~dav/docs/")" 207
+for f in pics/photo.jpg pics/plain.jpg pics/far.heic pics/deeper/inner.jpg pics/loop.heic; do curl -s -u "$A" -o /dev/null -X DELETE "$U/~dav/docs/$f"; done
 
 # Signing out everywhere ends each session the user had, on both shards within a second, and no one else's.
 curl -s -c "$T/j1" -o /dev/null -u "$A" -X POST "$U/~ui/session"; curl -s -c "$T/j2" -o /dev/null -u "$A" -X POST "$U/~ui/session?remember"

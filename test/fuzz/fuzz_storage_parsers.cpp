@@ -1,6 +1,6 @@
 // Fuzz target: the storage runtime's parsers of what a client or the disk hands it whole -- an LZ4 block and a
 // compressed body's table, a SelectObjectContent request and the records it reads, an ACL document and grant
-// headers, and a JWT and the JWK Set it is checked against.
+// headers, a JWT and the JWK Set it is checked against, and a photo's EXIF.
 //
 // The first input byte picks the parser, and the rest is its input:
 //   0  an LZ4 block opened into a buffer of the size the next two bytes say
@@ -8,14 +8,17 @@
 //   2  a select: a request document up to the first NUL, then the object's bytes
 //   3  an ACL: an AccessControlPolicy document up to the first NUL, then grant headers, one a line
 //   4  a token: a JWK Set up to the first NUL, then a JWT
+//   5  a photo's first bytes (JPEG, TIFF, HEIF), and the same read as a HEIF's Exif item
 //
 // Properties checked, beyond "did it crash":
 //   * any bytes compressed open back to themselves, and a block opens to no more than the room it is given;
 //   * a select fed its object whole gives the records it gives fed a byte at a time;
-//   * an ACL that parses encodes and decodes back to itself, and grants nothing a grantee it does not name.
+//   * an ACL that parses encodes and decodes back to itself, and grants nothing a grantee it does not name;
+//   * a photo's facts are a time or a place on the globe, and a HEIF's boxes end however large they say they are.
 
 #include "fuzz_common.h"
 #include "runtime/storage/compression.h"
+#include "runtime/storage/exif.h"
 #include "runtime/storage/lz4_block.h"
 #include "runtime/storage/s3_acl.h"
 #include "runtime/storage/s3_federation.h"
@@ -151,6 +154,19 @@ void token(std::string_view in)
     FUZZ_CHECK(!ok || !keys.keys.empty(), "a token verified with no key to verify it");
 }
 
+void photo(std::string_view in)
+{
+    photo_facts f;
+    exif_place elsewhere;
+    if (photo_facts_of(in, f, &elsewhere))
+    {
+        FUZZ_CHECK(!f.taken.empty() || f.located, "facts said with neither a time nor a place");
+        FUZZ_CHECK(!f.located || (f.lat >= -90 && f.lat <= 90 && f.lon >= -180 && f.lon <= 180), "a place off the globe");
+    }
+    photo_facts g;
+    if (exif_item_facts(in, g)) {}
+}
+
 }   // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
@@ -159,13 +175,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     if (size == 0)
         return 0;
     const std::string_view in(reinterpret_cast<const char*>(data) + 1, size - 1);
-    switch (data[0] % 5)
+    switch (data[0] % 6)
     {
         case 0: lz4(in); break;
         case 1: body(in); break;
         case 2: select(in); break;
         case 3: acl(in); break;
-        default: token(in); break;
+        case 4: token(in); break;
+        default: photo(in); break;
     }
     return 0;
 }
