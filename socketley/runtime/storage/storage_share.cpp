@@ -514,8 +514,15 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
     // A burning file's link opens on a page, and the file itself is read with ?download.
     if (s.burn && !s.folder && r.method == "GET" && !r.has_query("download"))
     {
-        app_reply(c, 200, landing_page(s, last_name_of(key), m_store.find(s.bucket, key), now_ms()),
-                  "text/html; charset=utf-8");
+        // Its size from whichever shard owns the key: this one's index holds only its own.
+        m_store.stat_object(s.bucket, key, [this, weak = std::weak_ptr<conn>(c), s, key](st found, const object_meta& m)
+        {
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            app_reply(cc, 200, landing_page(s, last_name_of(key), found == st::ok ? &m : nullptr, now_ms()),
+                      "text/html; charset=utf-8");
+        });
         return;
     }
     // A download counts against the link's limit, once per reading from the start: a player's later ranges do not.

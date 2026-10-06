@@ -148,6 +148,7 @@ check "and is no upload link" "$(mk "$A" '{"bucket":"ann","key":"send/","burn":t
 check "nor made by one who may not delete there" "$(mk "$B" '{"bucket":"ann","key":"send/once.txt","burn":true,"max_downloads":1}')" 403
 o=$(mk "$A" '{"bucket":"ann","key":"send/once.txt","burn":true,"max_downloads":1}')
 check "opens on a page" "$(curl -s "$U/~share/$o" | grep -c 'href="?download"')" 1
+check "which gives the file's size, whichever shard answers" "$(for _ in 1 2 3 4; do curl -s "$U/~share/$o" | grep -c '<span>6 bytes</span>'; done | tr -d '\n')" 1111
 check "which a preview reads again and again without a download" "$(code "$U/~share/$o")$(code "$U/~share/$o")" 200200
 check "the file is read with ?download" "$(curl -s "$U/~share/$o?download")" secret
 check "once" "$(code "$U/~share/$o?download")" 410
