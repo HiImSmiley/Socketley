@@ -65,6 +65,8 @@ enum media_kind : uint8_t
 // Thumbnails queue behind a few at a time; a stream is someone waiting to watch, and never waits for another's film.
 constexpr int     thumb_jobs_max   = 2;
 constexpr int     hls_jobs_max     = 8;
+// The streams a machine's GPU makes at once, shared out among its shards.
+constexpr int     gpu_streams_max  = 24;
 constexpr int64_t media_tick_ms    = 100;
 // The look again for a request waiting on a segment, which is the most a made segment waits to be sent.
 constexpr int64_t media_wait_tick_ms = 20;
@@ -415,6 +417,12 @@ bool parse_probe(const std::string& text, media_probe& p)
                 p.subtitles.push_back(std::move(sub));
             }
         }
+    if (const jvalue* frames = member(root, "frames"))
+        for (const jvalue& f : frames->items)
+            if (str_of(f, "media_type") == "video")
+                if (const jvalue* sides = member(f, "side_data_list"))
+                    for (const jvalue& sd : sides->items)
+                        p.mastering = p.mastering || str_of(sd, "side_data_type") == "Mastering display metadata";
     // The picture's own length where the container's runs on past it, so the last segment is one the picture has.
     if (vduration > 0 && vduration < p.duration)
         p.duration = vduration;
@@ -955,6 +963,13 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
     });
 }
 
+int storage_run::streams_max() const
+{
+    if (m_hw != media_hw::vaapi && m_hw != media_hw::vaapi_lp)
+        return hls_jobs_max;
+    return std::max<int>(hls_jobs_max, gpu_streams_max / static_cast<int>(std::max(1u, m_store.shards())));
+}
+
 void storage_run::media_hw_detect()
 {
     // SOCKETLEY_MEDIA_HWACCEL: off, a render node, or vaapi-unchecked:<node>, which skips the test run so that a
@@ -1309,7 +1324,7 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
     const auto same_kind = std::ranges::count_if(m_media_jobs, [&](const media_job& j) {
         return j.want.kind != k_hwtest && (j.want.kind == k_copy || j.want.kind == k_rendition) == stream;
     });
-    if (same_kind >= (stream ? hls_jobs_max : thumb_jobs_max))
+    if (same_kind >= (stream ? streams_max() : thumb_jobs_max))
         return false;
     if (::mkdir(w.dir.c_str(), 0700) < 0 && errno != EEXIST)
     {
@@ -1406,7 +1421,7 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
     auto streams = std::ranges::count_if(m_media_jobs, [](const media_job& j) {
         return j.want.kind == k_copy || j.want.kind == k_rendition;
     });
-    if (streams >= hls_jobs_max)
+    if (streams >= streams_max())
     {
         size_t oldest = m_media_jobs.size();
         for (size_t i = 0; i < m_media_jobs.size(); ++i)
@@ -1442,7 +1457,8 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
     if (!exists(w.dir + "/encoder"))
     {
         const auto pp = media_probe_of(w.probe_dir);
-        const bool gpu = (m_hw == media_hw::vaapi || m_hw == media_hw::vaapi_lp) && pp && pp->transfer != "arib-std-b67";
+        // HDR is tone-mapped on the GPU from its mastering display metadata, and with x264 where it has none.
+        const bool gpu = (m_hw == media_hw::vaapi || m_hw == media_hw::vaapi_lp) && pp && (!pp->hdr() || pp->mastering);
         write_small(w.dir + "/encoder", gpu ? (m_hw == media_hw::vaapi_lp ? "vaapi-lp" : "vaapi") : "x264");
     }
     write_int(job_file(w.dir, seg, ".pos"), seg);
@@ -1552,7 +1568,9 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
         case k_probe:
         {
             clear_dir(w.dir, true);
-            args = {ffprobe_path(m_ffmpeg), "-v", "error", "-print_format", "json", "-show_format", "-show_streams"};
+            // The first picture of each stream as well, whose side data says whether HDR comes with its mastering display.
+            args = {ffprobe_path(m_ffmpeg), "-v", "error", "-print_format", "json", "-show_format", "-show_streams",
+                    "-show_frames", "-read_intervals", "%+#1"};
             if (args.front().empty())
                 return false;
             if (src_fd < 0)

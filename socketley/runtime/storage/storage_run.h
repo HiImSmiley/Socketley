@@ -291,6 +291,8 @@ struct media_probe
     };
     // Text subtitles only, which WebVTT carries; pictures of text are not.
     std::vector<subtitle> subtitles;
+    // The first picture carries HDR10's mastering display metadata, which the GPU's tone mapping cannot do without.
+    bool    mastering{false};
     bool hdr() const { return transfer == "smpte2084" || transfer == "arib-std-b67"; }
 };
 
@@ -1269,6 +1271,8 @@ private:
     bool        m_hw_tried_lp{false};
     std::string m_hw_device;
     void media_hw_detect();
+    // The streams this shard makes at once, more where renditions are made on a GPU.
+    int streams_max() const;
     bool media_hw_test(bool low_power);
     // The key that signs ffmpeg's reads of an object, shared by every shard through the cache's directory.
     std::string m_media_key;

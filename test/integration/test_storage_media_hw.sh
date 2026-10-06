@@ -9,7 +9,8 @@
 #   * a rendition's encoder changing between its jobs, whose inits would differ
 #   * a rendition that does not say BT.709, whose colours a player would guess
 #   * with a GPU this process may use: a rendition made with x264 after all, or
-#     a GPU job that fails and is made again, so the GPU is never used
+#     a GPU job that fails and is made again, so the GPU is never used; or
+#     no more than eight streams made at once, a CPU's share, on the GPU
 # suite: isolated
 set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -85,6 +86,48 @@ if [ -r "$NODE" ] && [ -w "$NODE" ] && "$FF" -hide_banner -loglevel error -init_
     cat "$T"/data/.media/*/init.mp4 "$T"/data/.media/*/seg00001.m4s > "$T/joined.mp4" 2>/dev/null
     check "its segments decode against its init" "$("$FF" -v error -i "$T/joined.mp4" -f null - 2>&1 | grep -c .)" 0
     check "and say BT.709 all through" "$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=color_primaries,color_transfer,color_space -of csv=p=0 "$T/joined.mp4")" bt709,bt709,bt709
+    # Twelve streams asked for at once, four rungs of three films, run side by side on the GPU.
+    "$FF" -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=1280x720:rate=25:duration=90 -f lavfi \
+        -i sine=frequency=440:duration=90 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac "$T/long.mp4"
+    for f in a b c; do
+        code -u "$A" -T "$T/long.mp4" "$U/~dav/films/$f.mp4" >/dev/null
+        code -u "$A" "$U/~media/info/films/$f.mp4" >/dev/null
+    done
+    worker=$("$BIN" stats hw | awk -F: '/^pid:/ {print $2}' | tr ',' ' ' | awk '{print $1}')
+    asks=()
+    for f in a b c; do for h in 720 480 360 240; do
+        code -u "$A" "$U/~media/hls-$h/films/$f.mp4/seg00000.m4s" >/dev/null &
+        asks+=($!)
+    done; done
+    most=0
+    for _ in $(seq 1 200); do
+        n=$(ps --ppid "$worker" -o comm= 2>/dev/null | grep -c '^ffmpeg$')
+        [ "$n" -gt "$most" ] && most=$n
+        sleep 0.02
+    done
+    wait "${asks[@]}"
+    echo "  (at most $most ffmpeg at once)"
+    check "more than eight streams are made at once on the GPU" "$([ "$most" -gt 8 ] && echo yes || echo "no: $most")" yes
+    check "and none of them failed" "$(stat_of media_failed)" 0
+    # HDR10 with its mastering display metadata is tone-mapped on the GPU; PQ without it goes to x264 at once.
+    x265="log-level=none:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc"
+    md=":hdr10=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400"
+    encoders() { find "$T/data/.media" -name encoder | sort; }
+    declare -A made
+    for v in md:"$x265$md" bare:"$x265"; do
+        "$FF" -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=640x360:rate=25:duration=8 -c:v libx265 \
+            -preset ultrafast -pix_fmt yuv420p10le -x265-params "${v#*:}" -color_primaries bt2020 -color_trc smpte2084 \
+            -colorspace bt2020nc "$T/hdr-${v%%:*}.mp4"
+        code -u "$A" -T "$T/hdr-${v%%:*}.mp4" "$U/~dav/films/hdr-${v%%:*}.mp4" >/dev/null
+        code -u "$A" "$U/~media/info/films/hdr-${v%%:*}.mp4" >/dev/null
+        before=$(encoders) hw=$(stat_of media_hw)
+        code -u "$A" "$U/~media/hls-240/films/hdr-${v%%:*}.mp4/seg00000.m4s" >/dev/null
+        sleep 0.6
+        made[${v%%:*}]="$(comm -13 <(echo "$before") <(encoders) | xargs -r cat) $(( $(stat_of media_hw) - hw ))"
+    done
+    check "HDR10 with its mastering display is made on the GPU" "$(sed 's/^\(vaapi\)[^ ]*/\1/' <<<"${made[md]}")" "vaapi 1"
+    check "and PQ without it with x264, trying no GPU job first" "${made[bare]}" "x264 0"
+    check "with no job that failed" "$(sleep 0.6; stat_of media_failed)" 0
     daemon_stop; trap - EXIT
 else
     echo "  (no render node this process may use and ffmpeg encodes on: the GPU's own renditions are not made here)"

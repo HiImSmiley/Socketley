@@ -9611,10 +9611,12 @@ one that reaches segments made before ends, one fifteen segments ahead of every
 player that asks of it, or two ahead when nobody has asked of it for ten seconds,
 is held still until one comes within eight, and one nobody asks of for a minute
 while held, or for ten minutes running, ends; a job held still and unasked gives
-its place to a new one when a shard has eight. What they made
+its place to a new one when a shard has eight, or where renditions are made on a GPU
+24 shared among the shards and never fewer than eight. What they made
 is kept: a film watched once streams from the cache afterwards. HDR (PQ or HLG) is
 tone-mapped to SDR for these renditions. Where a GPU with VAAPI is there, a
-rendition is decoded, scaled, tone-mapped and encoded on it, as
+rendition is decoded, scaled, tone-mapped and encoded on it (an HDR film without the
+mastering display metadata the GPU tone-maps from is made with x264), as
 .B SOCKETLEY_MEDIA_HWACCEL
 describes, and the interface plays a place the copied stream has not been
 remuxed to yet from a rendition until the copy catches up.
