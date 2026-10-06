@@ -950,6 +950,10 @@ bool event_loop::init()
     // every submission afterwards may reach into it.
     m_ring_open = true;
 
+    // A loop waits with its accepts and receives armed, which the kernel counts as I/O wait unless told otherwise, so
+    // a host idle but for socketley read one blocked task per process in its load average and its iowait.
+    if (io_uring_set_iowait(&m_ring, false) < 0) {}
+
     // Register the ring fd itself, which removes an fget/fput per io_uring
     // syscall for about 1-3% throughput.
     io_uring_register_ring_fd(&m_ring);
