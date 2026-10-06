@@ -582,7 +582,7 @@ const keyOf = it => it.segs.join('/') + (it.dir ? '/' : '');
 // Who is signed in, as /~ui/session says; the session itself is an HttpOnly cookie the page never sees.
 let me = null;
 let auth = false;
-let path = [], items = [], buckets = [], shown = [];
+let path = [], items = [], buckets = [], shown = [], bucketsAt = 0;
 let view = store.get('skl-view', 'grid'), sortBy = store.get('skl-sort', 'name'), query = '';
 const sel = new Set(); let anchor = -1;
 
@@ -679,7 +679,8 @@ $('#lf').addEventListener('submit', async ev => {
 // ─── navigation ─────────────────────────────────────────────────────────────
 function go(p) { location.hash = '#/' + enc(p) + (p.length ? '/' : ''); }
 function fromHash() { path = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(s => { try { return decodeURIComponent(s); } catch (e) { return s; } }); }
-window.addEventListener('hashchange', () => { if (!auth) return; fromHash(); sel.clear(); query = ''; $('#q').value = ''; load(); $('#side').classList.remove('open'); });
+// A new place closes what was open over the old one, as the browser's back button is expected to.
+window.addEventListener('hashchange', () => { if (!auth) return; while (layers.length) layers[layers.length - 1].close(); fromHash(); sel.clear(); query = ''; $('#q').value = ''; load(); $('#side').classList.remove('open'); });
 
 async function propfind(p) {
   const r = await must(await api('PROPFIND', dav(p, true), { headers: { Depth: '1' } }));
@@ -783,7 +784,10 @@ async function load(keepScroll) {
   const C = $('#content');
   const top = $('#scroll').scrollTop;
   try {
-    const [list, roots] = await Promise.all([propfind(path), path.length && buckets.length ? null : propfind([])]);
+    // The libraries are read again inside one as well, at most every half minute, so one another device made shows up.
+    const stale = !buckets.length || Date.now() - bucketsAt > 30000;
+    const [list, roots] = await Promise.all([propfind(path), path.length && !stale ? null : propfind([])]);
+    if (path.length && stale) bucketsAt = Date.now();
     if (seq !== loadSeq) return;
     if (roots) buckets = roots.filter(b => b.dir);
     items = list;
@@ -813,6 +817,11 @@ async function liveCheck() {
   liveAt = Date.now();
   const at = path.join('/');
   try {
+    if (path.length && Date.now() - bucketsAt > 30000) {
+      bucketsAt = Date.now();
+      const roots = (await propfind([])).filter(b => b.dir);
+      if (sig(roots) !== sig(buckets)) { buckets = roots; side(); }
+    }
     const now = await propfind(path);
     if (path.join('/') !== at || sig(now) === sig(items)) return;
     items = now;
