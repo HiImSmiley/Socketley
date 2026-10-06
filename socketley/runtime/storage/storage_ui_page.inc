@@ -310,6 +310,7 @@ select.inp option{background:#151821}
 .ovbar .tt .chips{display:flex;gap:6px;margin-top:4px;flex-wrap:wrap}
 .ovbar .ib{color:#fff}
 .theater video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+.theater video::cue{color:#fff;background:rgba(0,0,0,.55);font-family:Inter,system-ui,sans-serif;line-height:1.35;text-shadow:0 1px 3px rgba(0,0,0,.8)}
 .theater.idle{cursor:none}
 .theater.idle .ovbar,.theater.idle .ctl{opacity:0;pointer-events:none}
 .ctl{position:absolute;left:0;right:0;bottom:0;z-index:5;padding:60px 22px 16px;background:linear-gradient(0deg,rgba(0,0,0,.85),rgba(0,0,0,.4) 60%,transparent);transition:opacity .3s}
@@ -1879,6 +1880,56 @@ function seekBar(onseek) {
 }
 function bufferedAt(m) { const b = m.buffered, t = m.currentTime; for (let i = 0; i < b.length; i++) if (b.start(i) <= t + 0.5 && b.end(i) >= t) return b.end(i); return t; }
 
+// ─── subtitle files beside a film ───────────────────────────────────────────
+// Film.srt, Film.de.srt, Film.forced.en.vtt or Film.ass beside Film.mkv, as WebVTT the video element shows.
+const subLangs = { de: 'Deutsch', ger: 'Deutsch', deu: 'Deutsch', en: 'English', eng: 'English', fr: 'Français', fre: 'Français', fra: 'Français', es: 'Español', spa: 'Español', it: 'Italiano', ita: 'Italiano', nl: 'Nederlands', pl: 'Polski', pt: 'Português', ru: 'Русский', tr: 'Türkçe', ja: '日本語', jpn: '日本語' };
+function sidecars(film, siblings) {
+  const stem = film.name.replace(/\.[^.]+$/, '').toLowerCase();
+  return siblings.filter(x => !x.dir && /\.(srt|vtt|ass|ssa)$/i.test(x.name) && x.name.toLowerCase().startsWith(stem + '.'))
+    .map(x => {
+      const tags = x.name.slice(stem.length).replace(/\.[^.]+$/, '').split('.').filter(Boolean).map(t => t.toLowerCase());
+      const lang = tags.find(t => /^[a-z]{2,3}$/.test(t) && t !== 'sdh') || '';
+      const label = [subLangs[lang] || (lang ? lang.toUpperCase() : 'Subtitles'), tags.includes('forced') ? 'forced' : '', tags.includes('sdh') || tags.includes('cc') ? 'SDH' : ''].filter(Boolean).join(' · ');
+      return { it: x, lang, label };
+    });
+}
+// Bytes as text: UTF-8 where they are, else Windows-1252, as older German and French files are.
+function subText(buf) { try { return new TextDecoder('utf-8', { fatal: true }).decode(buf).replace(/^\uFEFF/, ''); } catch (e) { return new TextDecoder('windows-1252').decode(buf); } }
+function toVtt(text, ext) {
+  text = text.replace(/\r\n?/g, '\n');
+  if (ext === 'vtt') return text;
+  if (ext === 'srt') return 'WEBVTT\n\n' + text.replace(/(\d\d:\d\d:\d\d),(\d{3})/g, '$1.$2').replace(/^\d+\n(?=\d\d:)/gm, '');
+  // ASS and SSA: each Dialogue line's start, end and text, its override tags left out.
+  let out = 'WEBVTT\n\n', fmt = null;
+  const ts = t => { const m = /(\d+):(\d\d):(\d\d)[.:](\d\d)/.exec(t); return m ? String(m[1]).padStart(2, '0') + ':' + m[2] + ':' + m[3] + '.' + m[4] + '0' : null; };
+  for (const line of text.split('\n')) {
+    if (/^Format:/i.test(line) && !fmt) { const f = line.slice(7).split(',').map(x => x.trim().toLowerCase()); if (f.includes('text')) fmt = f; continue; }
+    if (!/^Dialogue:/i.test(line) || !fmt) continue;
+    const parts = line.slice(9).split(','), text2 = parts.slice(fmt.length - 1).join(',');
+    const a = ts(parts[fmt.indexOf('start')] || ''), b = ts(parts[fmt.indexOf('end')] || '');
+    if (!a || !b) continue;
+    const body = text2.replace(/\{[^}]*\}/g, '').replace(/\\N/gi, '\n').replace(/\\h/g, ' ').trim();
+    if (body) out += a + ' --> ' + b + '\n' + body + '\n\n';
+  }
+  return out;
+}
+async function addSidecars(v, film) {
+  let sibs = [];
+  try { sibs = await propfind(film.segs.slice(0, -1)); } catch (e) { return 0; }
+  let n = 0;
+  for (const sc of sidecars(film, sibs)) {
+    try {
+      const r = await api('GET', '/~dav/' + enc(sc.it.segs));
+      if (!r.ok) continue;
+      const vtt = toVtt(subText(await r.arrayBuffer()), ext(sc.it.name));
+      const url = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }));
+      v.append(el('track', { kind: 'subtitles', src: url, srclang: sc.lang || 'und', label: sc.label }));
+      n++;
+    } catch (e) {}
+  }
+  return n;
+}
+
 async function playVideo(it, list) {
   closeAudio();
   const L = overlay('theater');
@@ -1973,6 +2024,8 @@ async function playVideo(it, list) {
     tm.textContent = clock(v.currentTime) + ' / ' + clock(v.duration);
   };
   v.addEventListener('timeupdate', paint); v.addEventListener('progress', paint); v.addEventListener('durationchange', paint);
+  // Cues end at 84% of the picture's height, clear of the controls, unless a file places them itself.
+  v.textTracks.addEventListener('addtrack', e => e.track.addEventListener('cuechange', () => { for (const c of e.track.activeCues || []) if (c.line === 'auto') { c.snapToLines = false; c.line = 84; c.lineAlign = 'end'; } }));
   v.addEventListener('timeupdate', () => { const c = intro(); skipB.hidden = !c; if (c) skipB.textContent = 'Skip ' + c.title.trim().toLowerCase(); });
   v.addEventListener('play', () => { ppB.firstChild.innerHTML = P.pause; wake(); });
   v.addEventListener('pause', () => { ppB.firstChild.innerHTML = P.play; O.classList.remove('idle'); savePosition(it, v.currentTime, v.duration, true); });
@@ -2085,6 +2138,7 @@ async function playVideo(it, list) {
       if ((meta.tracks || []).length > 1) c((meta.tracks.length) + ' audio tracks');
     }
     if (it.size) chips.append(el('span', { class: 'chip', text: human(it.size) }));
+    addSidecars(v, it).then(n => { if (n) ccB.hidden = false; });
     // The file itself where the browser plays it, which costs the server nothing; a stream where it does not.
     const first = direct || (!streams && !copyOK) ? 'orig' : copyOK ? 'orig' : 'auto';
     if (start) v.addEventListener('loadedmetadata', () => { if (!player && v.currentTime < 1) v.currentTime = start; }, { once: true });
