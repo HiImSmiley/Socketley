@@ -111,29 +111,32 @@ emit_notice "LuaJIT"   "statically linked into /usr/bin/socketley" \
     thirdparty/luajit/COPYRIGHT
 emit_notice "sol2"     "header-only, compiled into /usr/bin/socketley" \
     thirdparty/sol2/LICENSE.txt
-emit_notice "liburing" "dynamically linked (see Depends: liburing2)" \
+# The documented build links liburing's archive from bin/build-thirdparty.sh; one against a shared liburing names it in Depends.
+if objdump -p "$BINARY" | grep -q 'NEEDED *liburing\.so'; then
+    URING_HOW="dynamically linked (see Depends)"
+else
+    URING_HOW="statically linked into /usr/bin/socketley"
+fi
+emit_notice "liburing" "$URING_HOW" \
     thirdparty/liburing/LICENSE
 
 chmod 644 "$COPYRIGHT"
 
 # Control file
 #
-# `Depends: liburing2` — with no version — was a package that installed cleanly
-# and then would not start.  The binary calls io_uring_register_napi(), a real
-# exported symbol added in liburing 2.6, so it records a versioned dependency:
-#
-#   $ objdump -p bin/Release/socketley | grep -A3 'required from liburing'
-#     required from liburing.so.2:
-#       LIBURING_2.6
-#
-# Ubuntu 24.04's liburing2 is 2.5 and satisfies an unversioned `liburing2`, so
-# dpkg was happy, and the first exec then died on a version lookup for
-# LIBURING_2.6.  Stating the constraint makes apt refuse the install instead,
-# which is the same news delivered where it can be acted on.
-#
-# 2.6 and not the 2.7 the *source* needs: the two extra things 2.7 provides that
-# this tree uses are preprocessor constants compiled into the binary, not
-# symbols resolved from the shared object at load time.
+# Depends is what the binary loads, as dpkg-shlibdeps finds it in the packages that hold each library, so a
+# library from no package -- a liburing built from source into /usr/lib -- stops the build here instead of an
+# exec on the machine it was installed on.
+SHLIBS_DIR=$(mktemp -d)
+mkdir "$SHLIBS_DIR/debian"
+printf 'Source: socketley\n\nPackage: socketley\nArchitecture: any\n' > "$SHLIBS_DIR/debian/control"
+if ! SHLIBS=$(cd "$SHLIBS_DIR" && dpkg-shlibdeps -O "$BINARY"); then
+    rm -rf "$SHLIBS_DIR" "$PKG_DIR"
+    echo "error: a library the binary loads belongs to no package; run bin/build-thirdparty.sh and build again"
+    exit 1
+fi
+rm -rf "$SHLIBS_DIR"
+DEPENDS=$(printf '%s\n' "$SHLIBS" | sed -n 's/^shlibs:Depends=//p')
 cat > "$PKG_DIR/DEBIAN/control" << EOF
 Package: socketley
 Version: $VERSION
@@ -142,7 +145,7 @@ Maintainer: Socketley Developers
 Description: Network runtime daemon with Docker-style management
  Socketley is a Linux-only daemon that manages long-living network
  runtimes (server, client, proxy, cache) in a Docker-like style.
-Depends: liburing2 (>= 2.6)
+Depends: $DEPENDS
 Section: net
 Priority: optional
 EOF
@@ -176,13 +179,16 @@ chown -R socketley:socketley /var/lib/socketley
 install -dm750 -o socketley -g socketley /var/lib/socketley/runtimes
 install -dm755 -o socketley -g socketley /run/socketley
 
-# Kill any stale dev-mode daemon (user-space, socket at /tmp/socketley.sock)
-pkill -x socketley 2>/dev/null || true
-
-# Enable and restart system service
-systemctl daemon-reload
-systemctl enable socketley.service
-systemctl try-restart socketley.service 2>/dev/null || true
+# Enabled and started on a first install only, so an upgrade keeps an administrator's disable, and restarted onto
+# the new binary only if it was running; a system without systemd, a container's, is installed without either.
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    if [ "$1" = configure ] && [ -z "${2:-}" ]; then
+        systemctl enable --now socketley.service
+    else
+        systemctl try-restart socketley.service || true
+    fi
+fi
 
 # Said on install because an upgrade changes who can reach the daemon.  The
 # socket was 0666 and is now 0660 socketley:socketley, so anyone who has been
@@ -197,8 +203,11 @@ chmod 755 "$PKG_DIR/DEBIAN/postinst"
 cat > "$PKG_DIR/DEBIAN/prerm" << 'EOF'
 #!/bin/bash
 set -e
-systemctl stop socketley.service 2>/dev/null || true
-systemctl disable socketley.service 2>/dev/null || true
+# Stopped and disabled when the package goes, not on an upgrade, which the postinst restarts onto the new binary.
+if [ -d /run/systemd/system ] && { [ "$1" = remove ] || [ "$1" = deconfigure ]; }; then
+    systemctl stop socketley.service || true
+    systemctl disable socketley.service || true
+fi
 EOF
 chmod 755 "$PKG_DIR/DEBIAN/prerm"
 

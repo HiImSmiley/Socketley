@@ -8,6 +8,8 @@ Type=simple
 ExecStart=/usr/bin/socketley daemon
 Restart=on-failure
 RestartSec=5
+# Every connection is a descriptor, and systemd's default soft limit of 1024 would cap a runtime near a thousand.
+LimitNOFILE=1048576
 
 # Directories
 RuntimeDirectory=socketley
