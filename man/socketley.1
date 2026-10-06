@@ -9816,7 +9816,8 @@ their date (the camera's, see
 else the object's); and pictures play as a slideshow. It uploads several files at once,
 and a file of 48 MiB or more in parts of at least 16 MiB, four requests side by
 side shared among up to three files, each going to the file with the fewest on
-the way, through the drive's multipart above; while a film or a song plays,
+the way, through the drive's multipart above; while a film or a song plays in
+any of the browser's tabs (they tell each other on a BroadcastChannel),
 uploads keep one request, since a browser opens six connections at most to a
 server that speaks HTTP/1.1 as this one does, and take four again once it is
 closed, with each file's percentage, rate,
@@ -9844,10 +9845,11 @@ edit, through
 .B /~ui/access
 below.
 .IP
-Send a file sends files as wormhole does: they are uploaded into the chosen
-library's
-.I Sent/
-folder behind a link that burns (see
+Send a file sends files as wormhole does: they are uploaded into the user's
+library for temporary files,
+.BI tmp\- user
+(the user's id in lowercase, made when it is first needed and shown as
+Temporary files), each sending in a folder of its own, behind a link that burns (see
 .B /~share/
 above), deleted after a chosen time or number of downloads (for several files,
 that number of each), with an optional password and a webhook told of each

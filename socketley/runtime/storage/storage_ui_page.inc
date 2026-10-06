@@ -766,7 +766,7 @@ function side() {
   for (const b of buckets) {
     const h = hue(b.name);
     L.append(el('button', { class: 'nav' + (path[0] === b.name ? ' on' : ''), onclick: () => go([b.name]) },
-      el('span', { class: 'dot', style: 'background:linear-gradient(135deg,hsl(' + h + ' 75% 60%),hsl(' + (h + 50) + ' 75% 45%))' }), el('span', { text: b.name })));
+      el('span', { class: 'dot', style: 'background:linear-gradient(135deg,hsl(' + h + ' 75% 60%),hsl(' + (h + 50) + ' 75% 45%))' }), el('span', { text: b.name === tmpName() ? 'Temporary files' : b.name, title: b.name })));
   }
   if (!buckets.length) L.append(el('div', { class: 'dim', style: 'padding:6px 12px;font-size:13px', text: 'No libraries yet' }));
 }
@@ -1824,8 +1824,13 @@ class MsePlayer {
         if (this.sb.updating) { await sleep(100); continue; }
         if (this.flush) {
           this.flush = false;
-          const from = this.v.currentTime + 6;
-          if (this.bufferedEnd() > from) { this.sb.remove(from, Infinity); await this.updated(); }
+          // What was buffered in the old quality goes, behind the playhead as well as ahead of it, so a seek back
+          // shows the new one; only the segment playing stays, cut where segments begin with a keyframe.
+          const t = this.v.currentTime, lst = this.lists[this.playing >= 0 ? this.playing : this.level];
+          const cur = lst && lst.segs.find(x => x.start <= t && x.start + x.dur > t);
+          const keepFrom = cur ? cur.start : t, keepTo = cur ? cur.start + cur.dur : t + 1;
+          if (keepFrom > 0.1 && this.sb.buffered.length && this.sb.buffered.start(0) < keepFrom) { this.sb.remove(0, keepFrom); await this.updated(); }
+          if (this.bufferedEnd() > keepTo) { this.sb.remove(keepTo, Infinity); await this.updated(); }
           this.ended = false;
         }
         const end = this.bufferedEnd();
@@ -2489,11 +2494,21 @@ async function editText(it) {
 // ─── sending ────────────────────────────────────────────────────────────────
 // A file sent as wormhole sends one: uploaded into the library's Sent folder, behind a link that ends after a time or
 // a number of downloads, and that takes the file with it when it does.
+// Where what is only for a while is kept: a library of the user's own, tmp-<user>, made when it is first needed.
+function tmpName() {
+  const u = me && me.user ? me.user.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 59) : '';
+  return u ? 'tmp-' + u : 'tmp';
+}
+async function tmpLibrary() {
+  const name = tmpName();
+  const r = await api('PROPFIND', '/~dav/' + name + '/', { headers: { Depth: '0' } });
+  if (r.status === 404) { await must(await api('MKCOL', '/~dav/' + name + '/')); buckets = (await propfind([])).filter(b => b.dir); side(); }
+  else await must(r);
+  return name;
+}
 function sendDlg(preset) {
   const files = [...(preset || [])];
   let exp = 86400, lim = 1;
-  const libs = el('select', { class: 'inp' }, ...buckets.map(b => el('option', { value: b.name, text: b.name })));
-  if (path.length) libs.value = path[0];
   const fin = el('input', { type: 'file', multiple: true, hidden: true });
   const list = el('div', { class: 'sfl' });
   const dz = el('div', { class: 'dz', onclick: () => fin.click() }, el('span', { class: 'bub' }, ico('send')), el('b', { text: 'Drop files to send' }), el('span', { class: 'mut', text: 'or click to choose them' }));
@@ -2510,16 +2525,17 @@ function sendDlg(preset) {
     el('div', { class: 'fld' }, el('label', { text: 'Downloads' }), pills([[1, '1'], [3, '3'], [10, '10'], [100, '100'], [0, 'Unlimited']], () => lim, v => lim = v)),
     el('div', { class: 'fld' }, el('label', { text: 'Password' }), pw),
     (snf = notifyField()).el,
-    el('div', { class: 'fld' }, el('label', { text: 'Kept in' }), libs));
+    el('div', { class: 'fld' }, el('label', { text: 'Kept in' }), el('span', { class: 'mut', text: tmpName() + ', your library for temporary files, until the link ends' })));
   const go = btn('send', 'Send', () => send(), 'pri');
   go.disabled = true;
   const L = modal('Send files', body, [go]);
-  if (!buckets.length) { body.textContent = ''; body.append(el('p', { text: 'Sending keeps the files in a library until the link ends. Make a library first.' })); go.replaceWith(btn('plus', 'New library', () => { L.close(); newBucket(); }, 'pri')); return; }
   paintList();
   async function send() {
-    const lib = libs.value, n = files.length;
+    let lib;
+    try { lib = await tmpLibrary(); } catch (e) { toast('The library for temporary files could not be made: ' + e.message, 'bad', 7000); return; }
+    const n = files.length;
     const stamp = new Date().toISOString().slice(0, 10) + '-' + Math.random().toString(36).slice(2, 8);
-    const base = [lib, 'Sent', stamp];
+    const base = [lib, stamp];
     const total = files.reduce((a, f) => a + f.size, 0);
     const bar = el('div', { class: 'sbar' }, el('i')), note = el('div', { class: 'mut', style: 'text-align:center;font-size:13px' });
     body.textContent = ''; L.box.querySelector('.df').remove();
@@ -2551,18 +2567,38 @@ function sendDlg(preset) {
 // not given up, and taken up again when the line is back or on a click, and one a closed or reloaded page left
 // behind is remembered in localStorage and taken up again once its file is chosen anew, from the parts the server
 // says arrived.
-const UP = { jobs: [], busy: 0, slots: 4, ui: null, rate: 0, lastBytes: 0, lastT: 0, ticking: 0, watching: 0 };
-// A browser keeps six connections to a server that speaks HTTP/1.1, as this one does; while a film or a song plays,
-// uploads take one of them, so the player's segments never wait behind them, and four again once it is closed.
-const upSlots = () => UP.watching ? 1 : UP.slots;
+const UP = { jobs: [], busy: 0, slots: 4, ui: null, rate: 0, lastBytes: 0, lastT: 0, ticking: 0, watching: 0, sending: 0 };
+// A browser keeps six connections to a server that speaks HTTP/1.1, as this one does, for all its tabs together; while
+// a film or a song plays in any tab of it, uploads take one of them, so the player's segments never wait behind them,
+// and four again once it is closed. Tabs tell each other on a channel, a player every 5 s while it is open.
+const PLAYERS = new Map();
+const playCh = 'BroadcastChannel' in window ? new BroadcastChannel('skl-play') : null;
+const tabId = Math.random().toString(36).slice(2);
+const othersWatching = () => { const now = Date.now(); for (const [k, t] of PLAYERS) if (now - t > 12000) PLAYERS.delete(k); return PLAYERS.size > 0; };
+const upSlots = () => UP.watching || othersWatching() ? 1 : UP.slots;
+let playBeat = 0;
+if (playCh) playCh.onmessage = e => {
+  const m = e.data || {};
+  if (m.on) { const fresh = !PLAYERS.has(m.id); PLAYERS.set(m.id, Date.now()); if (fresh) giveWay(); }
+  else { PLAYERS.delete(m.id); if (UP.jobs.length) schedule(); }
+};
 // The requests past that one give way at once: each is ended and its part, or its file sent whole, is queued again;
 // the one furthest along goes on.
-function watchingStart() {
-  UP.watching++;
+function giveWay() {
   const data = UP.jobs.flatMap(j => [...j.xhrs].filter(x => x._data)).sort((a, b) => (b._sent || 0) - (a._sent || 0));
   for (const x of data.slice(1)) { x._yield = true; x.abort(); }
 }
-function watchingEnd() { UP.watching = Math.max(0, UP.watching - 1); if (UP.jobs.length) schedule(); }
+function watchingStart() {
+  UP.watching++;
+  giveWay();
+  if (playCh && UP.watching === 1) { playCh.postMessage({ id: tabId, on: true }); playBeat = setInterval(() => playCh.postMessage({ id: tabId, on: true }), 5000); }
+}
+function watchingEnd() {
+  UP.watching = Math.max(0, UP.watching - 1);
+  if (playCh && !UP.watching) { clearInterval(playBeat); playCh.postMessage({ id: tabId, on: false }); }
+  if (UP.jobs.length) schedule();
+}
+window.addEventListener('pagehide', () => { if (playCh && UP.watching) playCh.postMessage({ id: tabId, on: false }); });
 const PART_FROM = 48 << 20;
 function partSize(n) { return Math.max(16 << 20, Math.ceil(n / 9000 / (1 << 20)) << 20); }
 const KEEP = 'skl-upload:';
@@ -2631,8 +2667,9 @@ function xhr(j, method, url, body, headers, onprog) {
     for (const [k, v] of Object.entries(headers || {})) x.setRequestHeader(k, v);
     // A request carrying a file's bytes, and how many it has sent, which the player's turn looks at.
     x._data = method === 'PUT';
+    if (x._data) UP.sending++;
     x.upload.onprogress = e => { x._sent = e.loaded; if (onprog) onprog(e.loaded); };
-    x.onloadend = () => { j.xhrs.delete(x); res({ status: x.status, text: x.responseText || '', etag: x.getResponseHeader('ETag'), yielded: !!x._yield }); };
+    x.onloadend = () => { if (x._data) UP.sending--; j.xhrs.delete(x); res({ status: x.status, text: x.responseText || '', etag: x.getResponseHeader('ETag'), yielded: !!x._yield }); };
     j.xhrs.add(x);
     x.send(body);
   });
@@ -2698,6 +2735,8 @@ async function putWhole(j) {
   for (;;) {
     let c;
     try { c = await checked(j.file); } catch (e) { failed(j, { status: 0, text: '' }); j.err = 'the file could not be read'; return; }
+    // A player that began while the file was read takes the place it would have sent in.
+    if (UP.sending >= upSlots()) { j.state = 'queued'; return; }
     const r = await xhr(j, 'PUT', url(j), c.body, Object.assign(typeOf(j.file) ? { 'Content-Type': typeOf(j.file) } : {}, c.crc), n => { j.inflight.set(0, n); });
     j.inflight.clear();
     if (j.state === 'canceled') return;
@@ -2721,6 +2760,7 @@ async function sendPart(j, p) {
     let c;
     try { c = await checked(j.file.slice(p.from, p.to)); } catch (e) { failed(j, { status: 0, text: '' }); j.err = 'the file could not be read'; return; }
     if (j.state === 'canceled' || j.state === 'error') return;
+    if (UP.sending >= upSlots()) { p.state = 'todo'; return; }
     const r = await xhr(j, 'PUT', url(j) + '?partNumber=' + p.n + '&uploadId=' + encodeURIComponent(j.id), c.body, c.crc, n => j.inflight.set(p.n, n));
     c = null;
     j.inflight.delete(p.n);
@@ -2795,6 +2835,8 @@ function tick() {
     j.hist.push([now, sentOf(j)]); while (j.hist.length > 12) j.hist.shift();
     const [t0, b0] = j.hist[0]; j.rate = j.hist.length > 1 ? (sentOf(j) - b0) / ((now - t0) / 1000) : 0;
   }
+  // A player in another tab that stopped telling, closed without a word, gives its places back.
+  if (UP.busy < upSlots()) schedule();
   paintUploads();
 }
 function paintUploads() {
