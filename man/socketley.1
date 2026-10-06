@@ -9566,8 +9566,14 @@ streams a part and answers its ETag,
 .B POST ?uploadId=\fIid\fR
 with S3's CompleteMultipartUpload body makes the file of them, and
 .B DELETE ?uploadId=\fIid\fR
-abandons it; each is judged as the S3 operation it is. A file's other PUTs
-ignore their query.
+abandons it; each is judged as the S3 operation it is.
+.B GET ?uploadId=\fIid\fR
+lists the parts that arrived (with
+.B max\-parts
+and
+.B part\-number\-marker
+for the next page), so an upload broken off is taken up again where it stopped.
+A file's other PUTs ignore their query.
 .IP
 .nf
 [drive]                      # rclone.conf, then: rclone copy ~/photos drive:holiday

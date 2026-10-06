@@ -151,6 +151,9 @@ etag() { curl -s -u "$A" -T "$1" -D - -o /dev/null "$U/~dav/docs/film.mp4?partNu
 e2=$(etag "$T/p2" 2); e1=$(etag "$T/p1" 1)
 check "each part is taken, in any order" "${#e1}${#e2}" 3434
 check "nothing is there before the upload is completed" "$(code -u "$A" "$U/~dav/docs/film.mp4")" 404
+check "GET ?uploadId lists the parts that arrived, to take an upload up again" \
+      "$(curl -s -u "$A" "$U/~dav/docs/film.mp4?uploadId=$mpu" | grep -o '<PartNumber>[0-9]*' | cut -d'>' -f2 | tr '\n' ' ')" "1 2 "
+check "a page at a time" "$(curl -s -u "$A" "$U/~dav/docs/film.mp4?uploadId=$mpu&max-parts=1" | grep -o '<NextPartNumberMarker>[0-9]*' | cut -d'>' -f2)" 1
 check "POST ?uploadId completes it" "$(code -u "$A" -X POST "$U/~dav/docs/film.mp4?uploadId=$mpu" \
       -d "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>$e1</ETag></Part><Part><PartNumber>2</PartNumber><ETag>$e2</ETag></Part></CompleteMultipartUpload>")" 200
 check "into the file whole" "$(curl -s -u "$A" "$U/~dav/docs/film.mp4" | cmp -s - "$T/parts" && echo same)" same

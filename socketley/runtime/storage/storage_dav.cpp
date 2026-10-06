@@ -344,14 +344,16 @@ void storage_run::op_dav(const std::shared_ptr<conn>& c)
     split_dav(r.key, bucket, key);
     // A file's upload in parts, S3's multipart under the drive's sign-in, so a browser sends a large file's parts
     // side by side: POST ?uploads begins it, PUT ?partNumber&uploadId streams a part, POST ?uploadId completes it
-    // and DELETE ?uploadId abandons it, each judged by the policies as the S3 operation it is.
+    // and DELETE ?uploadId abandons it, each judged by the policies as the S3 operation it is; GET ?uploadId lists the
+    // parts that arrived, so an upload broken off is taken up again where it stopped.
     const bool file = !bucket.empty() && !key.empty() && key.back() != '/';
     if (file && ((r.method == "POST" && (r.has_query("uploads") || r.has_query("uploadId"))) ||
-                 ((r.method == "PUT" || r.method == "DELETE") && r.has_query("uploadId"))))
+                 ((r.method == "PUT" || r.method == "DELETE" || r.method == "GET") && r.has_query("uploadId"))))
     {
         std::vector<std::pair<std::string, std::string>> mpu;
         for (auto& q : r.query)
-            if (q.first == "uploads" || q.first == "uploadId" || q.first == "partNumber")
+            if (q.first == "uploads" || q.first == "uploadId" || q.first == "partNumber" || q.first == "max-parts" ||
+                q.first == "part-number-marker")
                 mpu.push_back(std::move(q));
         app_forward(c, r.method, std::move(bucket), std::move(key), {}, {}, std::move(mpu));
         return;
