@@ -25,6 +25,7 @@
 #include <openssl/rand.h>
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <climits>
@@ -327,6 +328,36 @@ double rate_of(const std::string& r)
     return den > 0 ? num / den : 0;
 }
 
+// A tag by its name in any case, as Vorbis comments write them in capitals and ID3 in lowercase.
+std::string tag_of(const jvalue* tags, std::string_view name)
+{
+    if (tags)
+        for (const auto& [k, v] : tags->members)
+            if (k.size() == name.size() && std::ranges::equal(k, name, [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == b; }))
+                return v.s;
+    return {};
+}
+
+// The tags of a song from `tags`, each one the probe does not have yet.
+void song_tags(const jvalue* tags, media_probe& p)
+{
+    for (auto [field, name] : {std::pair{&p.title, "title"}, {&p.artist, "artist"}, {&p.album, "album"},
+                               {&p.album_artist, "album_artist"}, {&p.genre, "genre"}, {&p.date, "date"}})
+        if (field->empty())
+            *field = tag_of(tags, name);
+    if (p.album_artist.empty())
+        p.album_artist = tag_of(tags, "albumartist");
+    // "3/12" is the third of twelve.
+    if (p.track == 0)
+        p.track = std::strtoll(tag_of(tags, "track").c_str(), nullptr, 10);
+    if (p.track == 0)
+        p.track = std::strtoll(tag_of(tags, "tracknumber").c_str(), nullptr, 10);
+    if (p.disc == 0)
+        p.disc = std::strtoll(tag_of(tags, "disc").c_str(), nullptr, 10);
+    if (p.disc == 0)
+        p.disc = std::strtoll(tag_of(tags, "discnumber").c_str(), nullptr, 10);
+}
+
 bool parse_probe(const std::string& text, media_probe& p)
 {
     jvalue root;
@@ -337,8 +368,14 @@ bool parse_probe(const std::string& text, media_probe& p)
         p.duration = std::strtod(str_of(*f, "duration").c_str(), nullptr);
         p.bitrate = int_of(*f, "bit_rate");
         p.format = str_of(*f, "format_name");
+        song_tags(member(*f, "tags"), p);
     }
+    if (const jvalue* chapters = member(root, "chapters"))
+        for (const jvalue& ch : chapters->items)
+            p.chapters.push_back({std::strtod(str_of(ch, "start_time").c_str(), nullptr),
+                                  std::strtod(str_of(ch, "end_time").c_str(), nullptr), tag_of(member(ch, "tags"), "title")});
     double vduration = 0;
+    const jvalue* sound_tags = nullptr;
     if (const jvalue* streams = member(root, "streams"))
         for (const jvalue& s : streams->items)
         {
@@ -358,11 +395,18 @@ bool parse_probe(const std::string& text, media_probe& p)
                     p.fps = rate_of(str_of(s, "r_frame_rate"));
                 vduration = std::strtod(str_of(s, "duration").c_str(), nullptr);
             }
-            else if (type == "audio" && !p.audio)
+            else if (type == "audio")
             {
-                p.audio = true;
-                p.acodec = str_of(s, "codec_name");
-                p.achannels = int_of(s, "channels");
+                const jvalue* tags = member(s, "tags");
+                p.tracks.push_back({int_of(s, "channels"), str_of(s, "codec_name"), tag_of(tags, "language"),
+                                    tag_of(tags, "title"), disp && int_of(*disp, "default")});
+                if (!p.audio)
+                {
+                    sound_tags = tags;
+                    p.audio = true;
+                    p.acodec = str_of(s, "codec_name");
+                    p.achannels = int_of(s, "channels");
+                }
             }
             else if (type == "subtitle")
             {
@@ -387,6 +431,9 @@ bool parse_probe(const std::string& text, media_probe& p)
                 if (const jvalue* sides = member(f, "side_data_list"))
                     for (const jvalue& sd : sides->items)
                         p.mastering = p.mastering || str_of(sd, "side_data_type") == "Mastering display metadata";
+    // An Ogg song keeps its tags on its sound; a film's sound track names only itself.
+    if (p.vcodec.empty())
+        song_tags(sound_tags, p);
     // The picture's own length where the container's runs on past it, so the last segment is one the picture has.
     if (vduration > 0 && vduration < p.duration)
         p.duration = vduration;
@@ -586,7 +633,43 @@ std::string info_text(const media_probe& p, std::string_view version)
         json_str(o, s.title);
         o += "}";
     }
-    o += "]}";
+    o += "],\"tracks\":[";
+    first = true;
+    for (const media_probe::audio_track& t : p.tracks)
+    {
+        o += first ? "{" : ",{";
+        first = false;
+        o += "\"codec\":";
+        json_str(o, t.codec);
+        o += ",\"channels\":" + std::to_string(t.channels) + ",\"lang\":";
+        json_str(o, t.lang);
+        o += ",\"title\":";
+        json_str(o, t.title);
+        o += t.main ? ",\"default\":true}" : ",\"default\":false}";
+    }
+    o += "],\"chapters\":[";
+    first = true;
+    char buf[64];
+    for (const media_probe::chapter& ch : p.chapters)
+    {
+        std::snprintf(buf, sizeof buf, "{\"start\":%.3f,\"end\":%.3f,\"title\":", ch.start, ch.end);
+        o += first ? "" : ",";
+        first = false;
+        o += buf;
+        json_str(o, ch.title);
+        o += "}";
+    }
+    o += "],\"tags\":{";
+    for (auto [name, value] : {std::pair{"title", &p.title}, {"artist", &p.artist}, {"album", &p.album},
+                               {"album_artist", &p.album_artist}, {"genre", &p.genre}, {"date", &p.date}})
+    {
+        o += '"';
+        o += name;
+        o += "\":";
+        json_str(o, *value);
+        o += ',';
+    }
+    o += "\"track\":" + std::to_string(p.track) + ",\"disc\":" + std::to_string(p.disc) + "}}";
     return o;
 }
 
@@ -896,7 +979,8 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         w.object = w.bucket + '\n' + w.key + '\n' + etag;
         w.version = etag.substr(0, 16);
         w.dir = media_dir + "/" + sha256_hex(w.variant + '\n' + w.object);
-        w.probe_dir = media_dir + "/" + sha256_hex("probe\n" + w.object);
+        // The second probe's, which also holds chapters; the first's are left for eviction.
+        w.probe_dir = media_dir + "/" + sha256_hex("probe2\n" + w.object);
         w.asked_ms = now_ms();
         w.deadline_ms = w.asked_ms + media_wait_ms;
         // An object's file whose bytes are stored as they are, opened once a minute a shard, is what ffmpeg reads; a
@@ -1534,7 +1618,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             clear_dir(w.dir, true);
             // The first picture of each stream as well, whose side data says whether HDR comes with its mastering display.
             args = {ffprobe_path(m_ffmpeg), "-v", "error", "-print_format", "json", "-show_format", "-show_streams",
-                    "-show_frames", "-read_intervals", "%+#1"};
+                    "-show_chapters", "-show_frames", "-read_intervals", "%+#1"};
             if (args.front().empty())
                 return false;
             if (src_fd < 0)

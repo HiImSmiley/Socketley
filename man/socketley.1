@@ -9707,8 +9707,11 @@ of a film a few seconds in.
 .B info
 is what the object is, as JSON: its length, picture size, frame rate, codecs,
 whether it is HDR, the MIME type with codecs a browser is asked whether it plays
-the file itself, the codecs of its copied stream, its renditions and its text
-subtitles.
+the file itself, the codecs of its copied stream, its renditions, its text
+subtitles, every sound track with its codec, channels, language, title and
+whether it is the default, its chapters with their start, end and title, and a
+song's tags (title, artist, album, album artist, track, disc, date, genre), the
+container's or, for a file without a picture, its sound's as Ogg keeps them.
 .BI sub\- stream /subs.vtt
 is a text subtitle stream (SubRip, ASS, mov_text, WebVTT) as WebVTT, on the film's
 clock, and

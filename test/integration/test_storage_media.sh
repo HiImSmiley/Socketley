@@ -13,6 +13,7 @@
 #     link to it
 #   * ffmpeg's own address for an object opening without its signature
 #   * something that is no medium answered as one, or a cache past its size
+#   * a film's sound tracks or chapters, or a song's tags, missing from its info
 # suite: isolated
 set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -307,6 +308,29 @@ vtt=$(curl -s -u "$A" "$U/~media/sub-1/films/subbed.mkv/subs.vtt")
 check "as WebVTT on the film's clock" "$(head -2 <<<"$vtt" | tr '\n' '|')" "WEBVTT|X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000|"
 check "with its cues" "$(grep -c 'Hello from the subtitles\|Second line' <<<"$vtt")" 2
 check "a stream that is no text subtitle is 404" "$(code -u "$A" "$U/~media/sub-0/films/subbed.mkv/subs.vtt")" 404
+
+# Sound tracks, chapters and a song's tags.
+printf ';FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=3000\ntitle=Intro\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=3000\nEND=7000\ntitle=Main part\n' > "$T/chap.txt"
+ff -f lavfi -i testsrc2=size=320x240:rate=25:duration=7 -f lavfi -i sine=frequency=440:duration=7 -f lavfi -i sine=frequency=880:duration=7 \
+   -i "$T/chap.txt" -map 0:v -map 1:a -map 2:a -map_chapters 3 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -ac:a:1 6 \
+   -metadata:s:a:0 language=eng -metadata:s:a:0 title=English -metadata:s:a:1 language=ger -metadata:s:a:1 title=Deutsch \
+   -disposition:a:0 default -disposition:a:1 0 "$T/dual.mkv"
+code -u "$A" -T "$T/dual.mkv" "$U/~dav/films/dual.mkv" >/dev/null
+dinfo=$(curl -s -u "$A" "$U/~media/info/films/dual.mkv")
+check "info names every sound track" \
+      "$(python3 -c 'import json,sys; print([(t["codec"], t["channels"], t["lang"], t["title"], t["default"]) for t in json.loads(sys.argv[1])["tracks"]])' "$dinfo")" \
+      "[('aac', 1, 'eng', 'English', True), ('aac', 6, 'ger', 'Deutsch', False)]"
+check "and the chapters" "$(python3 -c 'import json,sys; print([(c["start"], c["end"], c["title"]) for c in json.loads(sys.argv[1])["chapters"]])' "$dinfo")" \
+      "[(0.0, 3.0, 'Intro'), (3.0, 7.0, 'Main part')]"
+check "and no song's title from a film's sound track" "$(python3 -c 'import json,sys; print(repr(json.loads(sys.argv[1])["tags"]["title"]))' "$dinfo")" "''"
+ff -f lavfi -i sine=frequency=500:duration=2 -c:a libmp3lame -metadata title="First Song" -metadata artist="The Band" \
+   -metadata album="A Record" -metadata album_artist="The Band" -metadata track=3/12 -metadata date=2019 -metadata genre=Rock "$T/song.mp3"
+ff -f lavfi -i sine=frequency=500:duration=2 -c:a libopus -metadata TITLE="Second Song" -metadata ARTIST="Other" \
+   -metadata ALBUM="B Sides" -metadata TRACKNUMBER=7 -metadata DISCNUMBER=2 "$T/song.opus"
+code -u "$A" -T "$T/song.mp3" "$U/~dav/films/song.mp3" >/dev/null; code -u "$A" -T "$T/song.opus" "$U/~dav/films/song.opus" >/dev/null
+tags() { curl -s -u "$A" "$U/~media/info/films/$1" | python3 -c 'import json,sys; t=json.load(sys.stdin)["tags"]; print(t["title"], "|", t["artist"], "|", t["album"], "|", t["album_artist"], "|", t["track"], t["disc"], "|", t["date"], "|", t["genre"])'; }
+check "info gives a song's tags" "$(tags song.mp3)" "First Song | The Band | A Record | The Band | 3 0 | 2019 | Rock"
+check "Vorbis comments too, kept on the sound" "$(tags song.opus)" "Second Song | Other | B Sides |  | 7 2 |  | "
 
 # A copied HEVC stream is tagged hvc1, as Apple's players take it.
 get "$T/hvc.mp4" -u "$A" "$U/~media/hls-copy/films/hdr.mp4/index.m3u8" >/dev/null

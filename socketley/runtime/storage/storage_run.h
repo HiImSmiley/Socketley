@@ -294,6 +294,23 @@ struct media_probe
     std::vector<subtitle> subtitles;
     // The first picture carries HDR10's mastering display metadata, which the GPU's tone mapping cannot do without.
     bool    mastering{false};
+    // Every sound track, in the order 0:a:<n> names them; the first is the one above.
+    struct audio_track
+    {
+        int64_t     channels{0};
+        std::string codec, lang, title;
+        bool        main{false};
+    };
+    std::vector<audio_track> tracks;
+    struct chapter
+    {
+        double      start{0}, end{0};
+        std::string title;
+    };
+    std::vector<chapter> chapters;
+    // A song's tags, the container's or else its sound's.
+    std::string title, artist, album, album_artist, genre, date;
+    int64_t     track{0}, disc{0};
     bool hdr() const { return transfer == "smpte2084" || transfer == "arib-std-b67"; }
 };
 
