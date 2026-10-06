@@ -1196,6 +1196,12 @@ function downloadZip(list) {
   document.body.append(a); a.click(); a.remove();
   toast('Preparing the ZIP: the download starts in a moment');
 }
+// A webhook a link tells of its downloads: Discord, Slack or ntfy, remembered in this browser for the next link.
+function notifyField() {
+  const n = el('input', { class: 'inp', type: 'url', placeholder: 'Optional: Discord, Slack or ntfy webhook', spellcheck: 'false', value: store.get('skl-notify', '') });
+  const f = el('div', { class: 'fld' }, el('label', { text: 'Tell me on download' }), n);
+  return { el: f, value: () => { const v = n.value.trim(); store.set('skl-notify', v); return v; } };
+}
 function shareDlg(it) {
   const exp = el('select', { class: 'inp' }, ...[['3600', '1 hour'], ['86400', '1 day'], ['604800', '7 days'], ['2592000', '30 days'], ['0', 'Never']].map(([v, t]) => el('option', { value: v, text: t })));
   exp.value = '604800';
@@ -1203,13 +1209,14 @@ function shareDlg(it) {
   const max = el('input', { class: 'inp', type: 'number', min: '0', placeholder: 'Unlimited' });
   const up = el('input', { type: 'checkbox' });
   const out = el('div');
+  let nf;
   const body = [el('p', { text: 'Anyone with the link can ' + (it.dir ? 'browse this folder' : 'download this file') + ' without signing in.' }),
-    el('div', { class: 'fld' }, el('label', { text: 'Expires' }), exp), el('div', { class: 'fld' }, el('label', { text: 'Password' }), pw),
+    el('div', { class: 'fld' }, el('label', { text: 'Expires' }), exp), el('div', { class: 'fld' }, el('label', { text: 'Password' }), pw), (nf = notifyField()).el,
     it.dir ? el('div', { class: 'fld' }, el('label', { text: 'Others may upload' }), up) : el('div', { class: 'fld' }, el('label', { text: 'Download limit' }), max), out];
   const make = async () => {
     const key = it.segs.slice(1).join('/') + (it.dir && it.segs.length > 1 ? '/' : '');
     try {
-      const r = await must(await api('POST', '/~share', { body: JSON.stringify({ bucket: it.segs[0], key, expires_in: +exp.value, password: pw.value, max_downloads: +max.value || 0, upload: up.checked }) }));
+      const r = await must(await api('POST', '/~share', { body: JSON.stringify({ bucket: it.segs[0], key, expires_in: +exp.value, password: pw.value, max_downloads: +max.value || 0, upload: up.checked, notify: nf.value() || undefined }) }));
       const url = location.origin + (await r.json()).url;
       const inp = el('input', { class: 'inp', value: url, readonly: '' });
       out.textContent = '';
@@ -1237,7 +1244,7 @@ function linksDlg() {
     for (const s of ls) {
       const url = location.origin + s.url;
       T.append(el('tr', {},
-        el('td', { class: 'w' }, el('a', { href: url, target: '_blank', rel: 'noopener', text: s.bucket + '/' + s.key }), el('span', { class: 'mut', text: (s.password ? ' · password' : '') + (s.upload ? ' · upload' : '') }), s.burn ? el('span', { class: 'fire', text: ' · deleted when it ends' }) : null),
+        el('td', { class: 'w' }, el('a', { href: url, target: '_blank', rel: 'noopener', text: s.bucket + '/' + s.key }), el('span', { class: 'mut', text: (s.password ? ' · password' : '') + (s.upload ? ' · upload' : '') }), s.burn ? el('span', { class: 'fire', text: ' · deleted when it ends' }) : null, s.notify ? el('span', { class: 'mut', text: ' · tells a webhook' }) : null),
         el('td', { class: 'mut', text: s.expires ? new Date(s.expires).toLocaleString() : 'Never' }),
         el('td', { class: 'mut', text: s.downloads + (s.max_downloads ? ' / ' + s.max_downloads : '') }),
         el('td', { class: 'r' }, btn(null, 'Copy', () => copy(url), 'sm'), ' ', btn(null, 'Revoke', async () => { try { await must(await api('DELETE', '/~share/' + s.id)); fill(); } catch (e) { fail(e); } }, 'sm bad'))));
@@ -2033,10 +2040,12 @@ function sendDlg(preset) {
   dz.addEventListener('drop', e => { e.preventDefault(); e.stopPropagation(); dz.classList.remove('over'); files.push(...e.dataTransfer.files); paintList(); });
   const pills = (opts, get, set) => { const p = el('div', { class: 'pills' }); const paint = () => { p.textContent = ''; for (const [v, t] of opts) p.append(el('button', { class: get() === v ? 'on' : '', text: t, onclick: () => { set(v); paint(); } })); }; paint(); return p; };
   const pw = el('input', { class: 'inp', type: 'password', placeholder: 'None', autocomplete: 'new-password' });
+  let snf;
   const body = el('div', {}, dz, fin, list,
     el('div', { class: 'fld' }, el('label', { text: 'Deleted after' }), pills([[3600, '1 hour'], [86400, '1 day'], [604800, '7 days'], [2592000, '30 days']], () => exp, v => exp = v)),
     el('div', { class: 'fld' }, el('label', { text: 'Downloads' }), pills([[1, '1'], [3, '3'], [10, '10'], [100, '100'], [0, 'Unlimited']], () => lim, v => lim = v)),
     el('div', { class: 'fld' }, el('label', { text: 'Password' }), pw),
+    (snf = notifyField()).el,
     el('div', { class: 'fld' }, el('label', { text: 'Kept in' }), libs));
   const go = btn('send', 'Send', () => send(), 'pri');
   go.disabled = true;
@@ -2058,7 +2067,7 @@ function sendDlg(preset) {
     if (failed) { body.textContent = ''; body.append(el('div', { class: 'sres' }, el('h4', { text: 'The upload did not finish' }), el('p', { class: 'mut', text: 'Nothing was sent. What did arrive is in ' + base.join('/') + '.' }))); return; }
     try {
       const key = base.slice(1).join('/') + '/' + (n === 1 ? files[0].name : '');
-      const r = await must(await api('POST', '/~share', { body: JSON.stringify({ bucket: lib, key, expires_in: exp, max_downloads: lim * n, password: pw.value, burn: true, note: 'sent' }) }));
+      const r = await must(await api('POST', '/~share', { body: JSON.stringify({ bucket: lib, key, expires_in: exp, max_downloads: lim * n, password: pw.value, burn: true, note: 'sent', notify: snf.value() || undefined }) }));
       const url = location.origin + (await r.json()).url;
       const inp = el('input', { class: 'inp', value: url, readonly: '' });
       const ends = [exp >= 86400 ? exp / 86400 + (exp === 86400 ? ' day' : ' days') : '1 hour', lim ? lim + (lim === 1 ? ' download' : ' downloads') + (n > 1 ? ' of each file' : '') : ''].filter(Boolean).join(' or ');
@@ -2225,7 +2234,25 @@ function pause(j) {
   for (const p of j.parts) if (p.state === 'sending') p.state = 'todo';
   toast(j.name + ' is paused: it goes on when the line is back', 'bad', 6000);
 }
-function done(j) { forget(j); j.state = 'done'; j.ended = Date.now(); if (j.onend) j.onend(j); if (j.dir === path.join('/') || path.length && j.dir.startsWith(path.join('/') + '/')) reloadSoon(); }
+// A picture's or a film's media are asked for as soon as it is up, so the server makes them while nobody waits: its
+// thumbnails and facts, and where this browser would not play the file itself, the start of its stream.
+async function warm(j) {
+  const k = kind(j.name, j.file && j.file.type), obj = enc(j.segs);
+  const quiet = u => fetch(u, { headers: { 'X-Socketley-UI': '1' } }).then(r => r.ok ? r : null).catch(() => null);
+  if (k === 'image') { quiet('/~media/thumb-320/' + obj); return; }
+  if (k !== 'video') return;
+  quiet('/~media/thumb-480/' + obj); quiet('/~media/thumb-1280/' + obj);
+  const r = await quiet('/~media/info/' + obj);
+  const m = r && await r.json().catch(() => null);
+  if (!m || (m.mime && document.createElement('video').canPlayType(m.mime))) return;
+  const master = await quiet('/~media/hls/' + obj + '/master.m3u8');
+  const first = master && (await master.text()).split('\n').find(l => l && !l.startsWith('#'));
+  if (!first) return;
+  const url = new URL(first, location.origin + '/~media/hls/' + obj + '/master.m3u8').href;
+  const list = await quiet(url); const seg = list && (await list.text()).split('\n').find(l => l && !l.startsWith('#'));
+  if (seg) quiet(new URL(seg, url).href);
+}
+function done(j) { forget(j); warm(j); j.state = 'done'; j.ended = Date.now(); if (j.onend) j.onend(j); if (j.dir === path.join('/') || path.length && j.dir.startsWith(path.join('/') + '/')) reloadSoon(); }
 function failed(j, r) {
   if (j.state === 'error') return;
   j.state = 'error'; j.ended = Date.now();
