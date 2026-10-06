@@ -32,6 +32,8 @@
 #   * a library shared with a user not listed or not readable by them, giving
 #     more than it says, shared by one who may not, or its policy's other
 #     statements lost when it is shared or unshared
+#   * a photo's time or place not read from a JPEG's EXIF or a HEIF's Exif
+#     item, or read for a user who may not list the folder
 #   * an address that keeps guessing secrets not refused for a while, or
 #     another address or a session refused with it
 #   * an rclone mount's copy of a tree not coming back byte for byte
@@ -340,6 +342,53 @@ check "nor is the owner shared its own" "$(acc "$A" ann read)" 400
 check "none takes it away" "$(acc "$A" ben none) $(code -u "$B" "$U/~dav/docs/a/one.txt") $(names "$B" "")" "204 403 "
 check "and leaves the rest of the policy as it was" "$(s3 "$U/docs?policy" | python3 -c 'import json,sys; print([x["Sid"] for x in json.load(sys.stdin)["Statement"]])')" "['mine']"
 s3 -o /dev/null -X DELETE "$U/docs?policy"; s3 -o /dev/null -X DELETE "$U/docs/secret/x.txt"
+
+# When and where photos were taken, from their EXIF: a JPEG's APP1, and a HEIF's Exif item past the first 64 KiB.
+python3 - "$T" <<'XEOF'
+import struct, sys
+T = sys.argv[1]
+def ifd(entries, base):
+    n = len(entries); data = base + 2 + 12 * n + 4; body = b''; out = struct.pack('>H', n)
+    for tag, typ, cnt, val in sorted(entries):
+        if len(val) <= 4: out += struct.pack('>HHI', tag, typ, cnt) + val.ljust(4, b'\0')
+        else: out += struct.pack('>HHII', tag, typ, cnt, data + len(body)); body += val
+    return out + b'\0\0\0\0' + body
+asc = lambda s: (2, len(s) + 1, s.encode() + b'\0')
+def rat3(d):
+    deg = int(d); m = int((d - deg) * 60); sec = round(((d - deg) * 60 - m) * 60 * 100)
+    return (5, 3, struct.pack('>IIIIII', deg, 1, m, 1, sec, 100))
+def tiff(dt, zone=None, gps=None):
+    ex_e = [(0x9003,) + asc(dt)] + ([(0x9011,) + asc(zone)] if zone else [])
+    size0 = 2 + 12 * (2 if gps else 1) + 4
+    ex_at = 8 + size0; ex = ifd(ex_e, ex_at); gps_at = ex_at + len(ex)
+    gp = ifd([(1,) + asc(gps[0]), (2,) + rat3(gps[1]), (3,) + asc(gps[2]), (4,) + rat3(gps[3])], gps_at) if gps else b''
+    i0 = ifd([(0x8769, 4, 1, struct.pack('>I', ex_at))] + ([(0x8825, 4, 1, struct.pack('>I', gps_at))] if gps else []), 8)
+    return b'MM\0*' + struct.pack('>I', 8) + i0 + ex + gp
+t = tiff('2021:07:14 18:03:22', '+02:00', ('N', 52.52, 'W', 13.405))
+open(T + '/photo.jpg', 'wb').write(b'\xff\xd8\xff\xe1' + struct.pack('>H', 2 + 6 + len(t)) + b'Exif\0\0' + t + b'\xff\xd9')
+open(T + '/plain.jpg', 'wb').write(b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9')
+box = lambda k, b: struct.pack('>I', 8 + len(b)) + k + b
+full = lambda k, b, v=0: box(k, bytes([v, 0, 0, 0]) + b)
+item = struct.pack('>I', 6) + b'Exif\0\0' + tiff('2019:01:02 03:04:05')
+ftyp = box(b'ftyp', b'heic' + b'\0\0\0\0' + b'mif1heic')
+hdlr = full(b'hdlr', b'\0' * 4 + b'pict' + b'\0' * 12 + b'\0')
+iinf = full(b'iinf', struct.pack('>H', 1) + full(b'infe', struct.pack('>HH', 1, 0) + b'Exif' + b'\0', 2))
+iloc_len = len(full(b'iloc', bytes([0x44, 0]) + struct.pack('>HHHHII', 1, 1, 0, 1, 0, 0)))
+free = box(b'free', b'\0' * 70000)
+head = len(ftyp) + len(full(b'meta', hdlr + iinf + b'\0' * iloc_len)) + len(free) + 8
+iloc = full(b'iloc', bytes([0x44, 0]) + struct.pack('>HHHHII', 1, 1, 0, 1, head, len(item)))
+open(T + '/far.heic', 'wb').write(ftyp + full(b'meta', hdlr + iinf + iloc) + free + box(b'mdat', item))
+XEOF
+for f in photo.jpg plain.jpg far.heic; do curl -s -u "$A" -T "$T/$f" -o /dev/null "$U/~dav/docs/pics/$f"; done
+curl -s -u "$A" -T "$T/photo.jpg" -o /dev/null "$U/~dav/docs/pics/deeper/inner.jpg"
+taken() { curl -s -u "$1" "$U/~ui/taken?bucket=docs&prefix=pics/" | python3 -c 'import json,sys; print(sorted((p["key"], p.get("taken"), round(p.get("lat", 0), 3), round(p.get("lon", 0), 3)) for p in json.load(sys.stdin)["photos"]))'; }
+check "a folder's photos say when and where they were taken" "$(taken "$A")" \
+      "[('pics/far.heic', '2019-01-02T03:04:05', 0, 0), ('pics/photo.jpg', '2021-07-14T18:03:22+02:00', 52.52, -13.405)]"
+check "and again from what was read" "$(taken "$A")" \
+      "[('pics/far.heic', '2019-01-02T03:04:05', 0, 0), ('pics/photo.jpg', '2021-07-14T18:03:22+02:00', 52.52, -13.405)]"
+check "not to a user who may not list them" "$(code -u "$B" "$U/~ui/taken?bucket=docs&prefix=pics/")" 403
+check "a folder is named with its slash" "$(code -u "$A" "$U/~ui/taken?bucket=docs&prefix=pics")" 400
+for f in pics/photo.jpg pics/plain.jpg pics/far.heic pics/deeper/inner.jpg; do curl -s -u "$A" -o /dev/null -X DELETE "$U/~dav/docs/$f"; done
 
 # Signing out everywhere ends each session the user had, on both shards within a second, and no one else's.
 curl -s -c "$T/j1" -o /dev/null -u "$A" -X POST "$U/~ui/session"; curl -s -c "$T/j2" -o /dev/null -u "$A" -X POST "$U/~ui/session?remember"

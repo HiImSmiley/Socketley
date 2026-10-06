@@ -6,6 +6,7 @@
 
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <functional>
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "compression.h"
 #include "digest.h"
 #include "json_doc.h"
 #include "s3_names.h"
@@ -297,6 +299,11 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
     if (r.key == "usage")
     {
         ui_usage(c);
+        return;
+    }
+    if (r.key == "taken")
+    {
+        ui_taken(c);
         return;
     }
     if (r.method != "GET" && r.method != "HEAD")
@@ -1000,6 +1007,145 @@ void storage_run::ui_usage_body(const std::shared_ptr<conn>& c)
         xml += "</BucketQuota>";
     }
     store_doc(c, bucket_doc::quota, bucket, std::move(xml), 204);
+}
+
+// GET ?bucket=&prefix= says when and where the photos directly in a folder were taken: each JPEG, TIFF or HEIF the
+// user may read, its first 64 KiB read for its EXIF, and a HEIF's Exif item read where it lies further in. An object
+// stored encrypted, compressed or in a tier is left out, as is all past the folder's first thousand keys.
+void storage_run::ui_taken(const std::shared_ptr<conn>& c)
+{
+    s3_request& r = c->req;
+    if (r.method != "GET")
+    {
+        app_reply(c, 405, "Ask with GET.\n");
+        return;
+    }
+    if (!app_login(c, "socketley"))
+        return;
+    const std::string bucket(r.get_query("bucket")), prefix(r.get_query("prefix"));
+    if (bucket.empty() || (!prefix.empty() && prefix.back() != '/'))
+    {
+        app_reply(c, 400, "Name a bucket, and a folder ending in '/'.\n");
+        return;
+    }
+    if (!app_allowed(c, "GET", bucket, {}))
+    {
+        app_reply(c, 403, "Access denied.\n");
+        return;
+    }
+    list_query q;
+    q.prefix    = prefix;
+    q.delimiter = "/";
+    q.max_keys  = 1000;
+    std::weak_ptr<conn> weak = c;
+    app_list(bucket, std::move(q), [this, weak, bucket](st s, list_page p)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        if (s != st::ok)
+        {
+            app_reply(cc, s == st::no_such_bucket ? 404 : 500, "The folder could not be listed.\n");
+            return;
+        }
+        struct gather
+        {
+            std::vector<std::pair<std::string, std::string>> todo;
+            std::string out;
+            size_t      at{0}, left{0};
+            bool        more{false}, answered{false};
+        };
+        auto g = std::make_shared<gather>();
+        g->more = p.truncated;
+        auto add = [g](const std::string& key, const photo_facts& f)
+        {
+            if (f.taken.empty() && !f.located)
+                return;
+            g->out += g->out.empty() ? "{\"key\":" : ",{\"key\":";
+            jstr(g->out, key);
+            if (!f.taken.empty())
+            {
+                g->out += ",\"taken\":";
+                jstr(g->out, f.taken);
+            }
+            if (f.located)
+            {
+                char buf[64];
+                std::snprintf(buf, sizeof buf, ",\"lat\":%.6f,\"lon\":%.6f", f.lat, f.lon);
+                g->out += buf;
+            }
+            g->out += '}';
+        };
+        for (const list_entry& e : p.objects)
+        {
+            const size_t dot = e.key.rfind('.');
+            std::string ext = dot == std::string::npos ? std::string{} : e.key.substr(dot + 1);
+            for (char& ch : ext)
+                ch = static_cast<char>(ch >= 'A' && ch <= 'Z' ? ch - 'A' + 'a' : ch);
+            static const std::set<std::string> photos = {"jpg", "jpeg", "jpe", "tif", "tiff", "dng", "heic", "heif", "hif"};
+            if (!photos.contains(ext) || is_encrypted(e.meta) || is_compressed(e.meta) || is_tiered(e.meta) ||
+                !app_allowed(cc, "GET", bucket, e.key))
+                continue;
+            const auto it = m_taken.find(bucket + '\n' + e.key + '\n' + e.meta.etag());
+            if (it != m_taken.end())
+                add(e.key, it->second);
+            else
+                g->todo.emplace_back(e.key, e.meta.etag());
+        }
+        auto finish = [this, weak, g]()
+        {
+            if (g->answered)
+                return;
+            g->answered = true;
+            if (auto c2 = weak.lock(); c2 && !c2->dead)
+                app_reply(c2, 200, "{\"photos\":[" + g->out + "],\"more\":" + (g->more ? "true}" : "false}"), "application/json");
+        };
+        if (g->todo.empty())
+        {
+            finish();
+            return;
+        }
+        if (m_taken.size() + g->todo.size() > 20000)
+            m_taken.clear();
+        // Eight read at a time, each answer starting the next, the last answering.
+        auto next = std::make_shared<std::function<void()>>();
+        *next = [this, g, bucket, add, finish, wn = std::weak_ptr<std::function<void()>>(next)]()
+        {
+            if (g->at == g->todo.size())
+            {
+                if (g->left == 0)
+                    finish();
+                return;
+            }
+            const auto [key, etag] = g->todo[g->at++];
+            ++g->left;
+            m_store.open_object(bucket, key, 64 * 1024, [this, g, bucket, key, etag, add, hold = wn.lock()](open_result o)
+            {
+                photo_facts f;
+                if (o.status == st::ok && o.meta.etag() == etag && !is_encrypted(o.meta) && !is_compressed(o.meta) &&
+                    !is_tiered(o.meta))
+                {
+                    exif_place there;
+                    if (!photo_facts_of(o.prefetch, f, &there) && there.len > 0 && there.len <= (1u << 20) && o.fd >= 0 &&
+                        there.off + there.len <= o.meta.size)
+                    {
+                        std::string item(there.len, '\0');
+                        if (::pread(o.fd, item.data(), item.size(), static_cast<off_t>(o.data_off + there.off)) ==
+                            static_cast<ssize_t>(item.size()))
+                            exif_item_facts(item, f);
+                    }
+                }
+                if (o.fd >= 0)
+                    m_loop.close_fd(o.fd);
+                m_taken[bucket + '\n' + key + '\n' + etag] = f;
+                add(key, f);
+                --g->left;
+                (*hold)();
+            });
+        };
+        for (int i = 0; i < 8; ++i)
+            (*next)();
+    });
 }
 
 }   // namespace socketley::storage

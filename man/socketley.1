@@ -9896,6 +9896,24 @@ case, in every library the user lists (or the one named), folders first, at most
 true when there were more or a library was too large to list whole; a file is
 listed only where the user may read it. Each library is listed whole for it.
 .IP
+.B GET /~ui/taken?bucket=\fIname\fB&prefix=\fIfolder/\fR
+says when and where the photos directly in a folder were taken, as their EXIF
+says: for each JPEG, TIFF or HEIF (HEIC) the user may read, its key, its
+.B taken
+time as the camera's clock wrote it ("2021-07-14T18:03:22", with "+02:00" where
+the camera wrote its offset) and its
+.B lat
+and
+.BR lon .
+Its first 64 KiB are read, and a HEIF's Exif item where it lies further in; what
+was read is kept by the object's ETag in the shard's memory. An object stored
+encrypted, compressed or in a tier is left out, and so is all past the folder's
+first thousand keys
+.RB ( "more" ).
+The page groups a folder's pictures by the month they were taken, shows the time
+in the viewer and links to the place on openstreetmap.org, which the page never
+loads itself; it shows a HEIF as its thumbnail, which ffmpeg makes from 7.1 on.
+.IP
 .B GET /~ui/usage
 lists every library the user lists with its owner, whether it is shared with
 the user, its bytes and objects, summed from its listing (which holds every

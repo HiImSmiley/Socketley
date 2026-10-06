@@ -23,6 +23,7 @@
 #include <sys/types.h>
 
 #include "body_reader.h"
+#include "exif.h"
 #include "bucket_policy.h"
 #include "checksum.h"
 #include "multipart.h"
@@ -945,6 +946,10 @@ public:
     void ui_search(const std::shared_ptr<conn>& c);
     // How full each library the user lists is, and an admin's quota on one, /~ui/usage.
     void ui_usage(const std::shared_ptr<conn>& c);
+    // When and where the photos directly in a folder were taken, as their EXIF says, /~ui/taken; what was read is kept
+    // by bucket, key and ETag, a shard's own.
+    void ui_taken(const std::shared_ptr<conn>& c);
+    std::unordered_map<std::string, photo_facts> m_taken;
     void ui_usage_body(const std::shared_ptr<conn>& c);
     // A library's size summed from its listing, kept a minute: the bytes, the objects, and whether it was too large
     // to list whole.

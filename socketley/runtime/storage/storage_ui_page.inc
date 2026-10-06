@@ -1196,14 +1196,35 @@ function paintPlaying() {
   document.querySelectorAll('.album .trow').forEach(r => r.classList.toggle('on', r.dataset.k === k));
 }
 
+// When and where the photos of a folder were taken, from their EXIF, asked once a folder and its pictures.
+const TAKEN = new Map();
+function takenIn(segs, pics) {
+  const k = segs.join('/') + '|' + pics.length + '|' + pics.reduce((m, x) => x.mod > m ? x.mod : m, '');
+  if (!TAKEN.has(k)) TAKEN.set(k, api('GET', '/~ui/taken?bucket=' + encodeURIComponent(segs[0]) + '&prefix=' + encodeURIComponent(segs.slice(1).map(x => x + '/').join('')))
+    .then(r => r.ok ? r.json() : { photos: [] }).then(j => new Map(j.photos.map(p => [p.key, p]))).catch(() => new Map()));
+  return TAKEN.get(k);
+}
+// A picture's date: when it was taken, as the camera's clock said, else when it was stored.
+const shotAt = it => it._exif && it._exif.taken ? new Date(it._exif.taken.slice(0, 19)) : it.mod ? new Date(it.mod) : null;
 function pictureSections(pics) {
+  const wrap = el('div', { class: 'pics' });
+  const draw = () => { wrap.textContent = ''; wrap.append(...picturesByMonth(pics).filter(Boolean)); };
+  draw();
+  if (path.length && /\.(jpe?g|tiff?|dng|heic|heif|hif)$/im.test(pics.map(x => x.name).join('\n'))) takenIn(path, pics).then(m => {
+    let any = false;
+    for (const it of pics) { const e = m.get(it.segs.slice(1).join('/')) || null; any = any || !!e; it._exif = e; }
+    if (any && wrap.isConnected) draw();
+  });
+  return [wrap];
+}
+function picturesByMonth(pics) {
   if (pics.length < 13 || sortBy !== 'date' && sortBy !== 'name') return [section('Pictures', 'pic', pics, it => fileCard(it))];
   const months = new Map();
-  const ordered = pics.slice().sort((a, b) => (new Date(b.mod) - new Date(a.mod)) || a.name.localeCompare(b.name, undefined, { numeric: true }));
+  const ordered = pics.slice().sort((a, b) => ((shotAt(b) || 0) - (shotAt(a) || 0)) || a.name.localeCompare(b.name, undefined, { numeric: true }));
   // The viewer steps through them as they are shown.
   for (const it of ordered) it._list = ordered;
   for (const it of ordered) {
-    const d = it.mod ? new Date(it.mod) : null, k = d ? d.getFullYear() * 12 + d.getMonth() : -1;
+    const d = shotAt(it), k = d ? d.getFullYear() * 12 + d.getMonth() : -1;
     if (!months.has(k)) months.set(k, { label: d ? d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }) : 'Undated', list: [] });
     months.get(k).list.push(it);
   }
@@ -1601,15 +1622,21 @@ function viewImage(it, list) {
     bar = topbar(L, cur); L.o.prepend(bar);
     stage.querySelectorAll('img,.spin').forEach(n => n.remove());
     const sp = el('div', { class: 'spin' }); stage.append(sp);
-    info.textContent = (i + 1) + ' / ' + list.length + ' · ' + human(cur.size) + (cur.mod ? ' · ' + new Date(cur.mod).toLocaleString() : '');
+    const x = cur._exif;
+    info.textContent = '';
+    info.append(el('span', { text: (i + 1) + ' / ' + list.length + ' · ' + human(cur.size) + (x && x.taken ? ' · taken ' + shotAt(cur).toLocaleString() : cur.mod ? ' · ' + new Date(cur.mod).toLocaleString() : '') }));
+    // Where it was taken, as a link to the map, which the page itself never loads.
+    if (x && x.lat != null) info.append(' · ', el('a', { href: 'https://www.openstreetmap.org/?mlat=' + x.lat + '&mlon=' + x.lon + '#map=15/' + x.lat + '/' + x.lon, target: '_blank', rel: 'noopener noreferrer', style: 'color:var(--a1)', text: 'Show on map' }));
     zoom = 1;
-    const img = el('img', { src: '/~dav/' + enc(cur.segs), alt: cur.name, draggable: 'false' });
+    // A HEIF no browser but Safari shows is shown as the server's large still of it.
+    const heif = /\.(heic|heif|hif)$/i.test(cur.name);
+    const img = el('img', { src: heif ? '/~media/thumb-1920/' + enc(cur.segs) : '/~dav/' + enc(cur.segs), alt: cur.name, draggable: 'false' });
     img.onload = () => sp.remove();
     img.onerror = () => { sp.remove(); img.remove(); stage.append(el('div', { class: 'mut', text: 'This picture cannot be shown.' })); };
     img.ondblclick = () => { zoom = zoom > 1 ? 1 : 2.2; img.style.transform = 'scale(' + zoom + ')'; };
     stage.append(img);
     // The neighbours, so the next step shows at once.
-    for (const j of [i + 1, i - 1]) if (list[j]) new Image().src = '/~dav/' + enc(list[j].segs);
+    for (const j of [i + 1, i - 1]) if (list[j]) new Image().src = (/\.(heic|heif|hif)$/i.test(list[j].name) ? '/~media/thumb-1920/' : '/~dav/') + enc(list[j].segs);
   };
   const step = d => { if (list.length < 2) return; i = (i + d + list.length) % list.length; show(); };
   if (list.length > 1) stage.append(el('button', { class: 'nav2 l', title: 'Previous', onclick: () => { stopShow(); step(-1); } }, ico('left')), el('button', { class: 'nav2 r', title: 'Next', onclick: () => { stopShow(); step(1); } }, ico('chev')));
