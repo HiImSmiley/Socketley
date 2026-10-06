@@ -102,7 +102,7 @@ std::string iso_time(const std::string& exif)
 {
     int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
     if (std::sscanf(exif.c_str(), "%4d:%2d:%2d %2d:%2d:%2d", &y, &mo, &d, &h, &mi, &s) != 6 || y < 1800 || mo < 1 ||
-        mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || s > 60)
+        mo > 12 || d < 1 || d > 31 || h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 60)
         return {};
     char buf[32];
     std::snprintf(buf, sizeof buf, "%04d-%02d-%02dT%02d:%02d:%02d", y, mo, d, h, mi, s);

@@ -34,7 +34,8 @@
 #     statements lost when it is shared or unshared
 #   * a photo's time or place not read from a JPEG's EXIF or a HEIF's Exif
 #     item, or read for a user who may not list the folder; or a HEIF whose
-#     box says it is nearly 2**64 bytes long holding its shard in a loop
+#     box says it is nearly 2**64 bytes long holding its shard in a loop, or a
+#     time with a negative hour given as one
 #   * an address that keeps guessing secrets not refused for a while, or
 #     another address or a session refused with it
 #   * an rclone mount's copy of a tree not coming back byte for byte
@@ -367,6 +368,8 @@ def tiff(dt, zone=None, gps=None):
     return b'MM\0*' + struct.pack('>I', 8) + i0 + ex + gp
 t = tiff('2021:07:14 18:03:22', '+02:00', ('N', 52.52, 'W', 13.405))
 open(T + '/photo.jpg', 'wb').write(b'\xff\xd8\xff\xe1' + struct.pack('>H', 2 + 6 + len(t)) + b'Exif\0\0' + t + b'\xff\xd9')
+t = tiff('2021:07:14 -1:03:22')
+open(T + '/neg.jpg', 'wb').write(b'\xff\xd8\xff\xe1' + struct.pack('>H', 2 + 6 + len(t)) + b'Exif\0\0' + t + b'\xff\xd9')
 open(T + '/plain.jpg', 'wb').write(b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9')
 box = lambda k, b: struct.pack('>I', 8 + len(b)) + k + b
 full = lambda k, b, v=0: box(k, bytes([v, 0, 0, 0]) + b)
@@ -380,7 +383,7 @@ head = len(ftyp) + len(full(b'meta', hdlr + iinf + b'\0' * iloc_len)) + len(free
 iloc = full(b'iloc', bytes([0x44, 0]) + struct.pack('>HHHHII', 1, 1, 0, 1, head, len(item)))
 open(T + '/far.heic', 'wb').write(ftyp + full(b'meta', hdlr + iinf + iloc) + free + box(b'mdat', item))
 XEOF
-for f in photo.jpg plain.jpg far.heic; do curl -s -u "$A" -T "$T/$f" -o /dev/null "$U/~dav/docs/pics/$f"; done
+for f in photo.jpg plain.jpg neg.jpg far.heic; do curl -s -u "$A" -T "$T/$f" -o /dev/null "$U/~dav/docs/pics/$f"; done
 curl -s -u "$A" -T "$T/photo.jpg" -o /dev/null "$U/~dav/docs/pics/deeper/inner.jpg"
 taken() { curl -s -u "$1" "$U/~ui/taken?bucket=docs&prefix=pics/" | python3 -c 'import json,sys; print(sorted((p["key"], p.get("taken"), round(p.get("lat", 0), 3), round(p.get("lon", 0), 3)) for p in json.load(sys.stdin)["photos"]))'; }
 check "a folder's photos say when and where they were taken" "$(taken "$A")" \
@@ -395,7 +398,7 @@ curl -s -u "$A" -T "$T/loop.heic" -o /dev/null "$U/~dav/docs/pics/loop.heic"
 check "a HEIF whose box size wraps is read to its end, and the folder's photos still answer" \
       "$(curl -s -m 10 -u "$A" -o /dev/null -w '%{http_code}' "$U/~ui/taken?bucket=docs&prefix=pics/")" 200
 check "and so does the runtime after it" "$(curl -s -m 10 -u "$A" -X PROPFIND -H "Depth: 0" -o /dev/null -w '%{http_code}' "$U/~dav/docs/")" 207
-for f in pics/photo.jpg pics/plain.jpg pics/far.heic pics/deeper/inner.jpg pics/loop.heic; do curl -s -u "$A" -o /dev/null -X DELETE "$U/~dav/docs/$f"; done
+for f in pics/photo.jpg pics/plain.jpg pics/neg.jpg pics/far.heic pics/deeper/inner.jpg pics/loop.heic; do curl -s -u "$A" -o /dev/null -X DELETE "$U/~dav/docs/$f"; done
 
 # Signing out everywhere ends each session the user had, on both shards within a second, and no one else's.
 curl -s -c "$T/j1" -o /dev/null -u "$A" -X POST "$U/~ui/session"; curl -s -c "$T/j2" -o /dev/null -u "$A" -X POST "$U/~ui/session?remember"
