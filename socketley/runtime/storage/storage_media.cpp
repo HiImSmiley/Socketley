@@ -33,6 +33,7 @@
 #include <thread>
 
 #include "digest.h"
+#include "small_file.h"
 #include "json_doc.h"
 #include "s3_names.h"
 #include "sse.h"
@@ -180,16 +181,6 @@ bool exists(const std::string& path)
     return ::stat(path.c_str(), &sb) == 0;
 }
 
-std::string hmac_hex(std::string_view key, std::string_view msg)
-{
-    unsigned char out[EVP_MAX_MD_SIZE];
-    unsigned int  n = 0;
-    if (!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), reinterpret_cast<const unsigned char*>(msg.data()),
-              msg.size(), out, &n))
-        return {};
-    return hex(out, n);
-}
-
 void clear_dir(const std::string& dir, bool keep_lock)
 {
     DIR* d = ::opendir(dir.c_str());
@@ -218,33 +209,6 @@ void mark(const std::string& dir, const char* name)
         ::close(fd);
 }
 
-bool read_small(const std::string& path, std::string& out)
-{
-    out.clear();
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return false;
-    char buf[8192];
-    ssize_t n;
-    while ((n = ::read(fd, buf, sizeof buf)) > 0)
-        out.append(buf, static_cast<size_t>(n));
-    ::close(fd);
-    return n == 0;
-}
-
-// Written aside and renamed in, so that a reader on any shard sees the old value or the new one and never neither.
-void write_small(const std::string& path, std::string_view data)
-{
-    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0)
-        return;
-    const bool ok = ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size());
-    ::close(fd);
-    if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0)
-        ::unlink(tmp.c_str());
-}
-
 // A lock taken on a file another shard deleted since it was opened is a lock on nothing anyone else will look at.
 bool locked_fresh(int fd, const std::string& path)
 {
@@ -256,10 +220,10 @@ bool locked_fresh(int fd, const std::string& path)
 void kill_orphan(const std::string& pid_file, const std::string& dir)
 {
     std::string v, cmdline;
-    if (!read_small(pid_file, v) || v.empty())
+    if (!read_small_file(pid_file, v) || v.empty())
         return;
     const long pid = std::strtol(v.c_str(), nullptr, 10);
-    if (pid <= 1 || !read_small("/proc/" + std::to_string(pid) + "/cmdline", cmdline) ||
+    if (pid <= 1 || !read_small_file("/proc/" + std::to_string(pid) + "/cmdline", cmdline) ||
         cmdline.find(dir) == std::string::npos)
         return;
     ::kill(static_cast<pid_t>(pid), SIGKILL);
@@ -676,14 +640,14 @@ std::string job_file(const std::string& dir, int64_t from, std::string_view ext)
 int64_t read_int(const std::string& path, int64_t fallback)
 {
     std::string v;
-    if (!read_small(path, v) || v.empty())
+    if (!read_small_file(path, v) || v.empty())
         return fallback;
     return std::strtoll(v.c_str(), nullptr, 10);
 }
 
 void write_int(const std::string& path, int64_t v)
 {
-    write_small(path, std::to_string(v));
+    write_small_file(path, std::to_string(v), false);
 }
 
 // A player's ask, which moves the job's furthest point forward and says, by the file's time, that it is watched.
@@ -1044,7 +1008,7 @@ std::shared_ptr<const media_probe> storage_run::media_probe_of(const std::string
     }
     std::string text;
     auto p = std::make_shared<media_probe>();
-    if (!exists(probe_dir + "/done") || !read_small(probe_dir + "/probe.json", text) || !parse_probe(text, *p))
+    if (!exists(probe_dir + "/done") || !read_small_file(probe_dir + "/probe.json", text) || !parse_probe(text, *p))
         return nullptr;
     if (m_media_probes.size() > 1024)
         m_media_probes.clear();
@@ -1081,7 +1045,7 @@ void storage_run::media_source(const std::shared_ptr<conn>& c, std::string_view 
         m_media_key = media_key(m_store.options().dir + "/.media");
     std::string bucket(rest.substr(0, slash)), key(rest.substr(slash + 1));
     const std::string etag(r.get_query("e"));
-    const std::string want = hmac_hex(m_media_key, bucket + '\n' + key + '\n' + etag + '\n' + std::to_string(expires));
+    const std::string want = hmac_sha256_hex(m_media_key, bucket + '\n' + key + '\n' + etag + '\n' + std::to_string(expires));
     const std::string_view got = r.get_query("s");
     if (m_media_key.empty() || want.empty() || got.size() != want.size() ||
         CRYPTO_memcmp(got.data(), want.data(), want.size()) != 0)
@@ -1459,7 +1423,7 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
         const auto pp = media_probe_of(w.probe_dir);
         // HDR is tone-mapped on the GPU from its mastering display metadata, and with x264 where it has none.
         const bool gpu = (m_hw == media_hw::vaapi || m_hw == media_hw::vaapi_lp) && pp && (!pp->hdr() || pp->mastering);
-        write_small(w.dir + "/encoder", gpu ? (m_hw == media_hw::vaapi_lp ? "vaapi-lp" : "vaapi") : "x264");
+        write_small_file(w.dir + "/encoder", gpu ? (m_hw == media_hw::vaapi_lp ? "vaapi-lp" : "vaapi") : "x264", false);
     }
     write_int(job_file(w.dir, seg, ".pos"), seg);
     // A job begun for an init has been asked no segment yet, which is -1.
@@ -1524,7 +1488,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
         url += '/';
         url_encode_to(url, w.key, true);
         url += "?t=" + std::to_string(expires) + "&e=" + etag + "&s=" +
-               hmac_hex(m_media_key, w.bucket + '\n' + w.key + '\n' + etag + '\n' + std::to_string(expires));
+               hmac_sha256_hex(m_media_key, w.bucket + '\n' + w.key + '\n' + etag + '\n' + std::to_string(expires));
     }
 
     // Reads over the listener survive a pause long enough for it to let them go; a file's need nothing of the sort.
@@ -1618,7 +1582,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             vf += ",format=yuv420p";
             const std::string offset = std::to_string(from * seg_seconds);
             std::string encoder;
-            read_small(w.dir + "/encoder", encoder);
+            read_small_file(w.dir + "/encoder", encoder);
             const bool gpu = encoder.starts_with("vaapi") && !m_hw_device.empty();
             // On the GPU the picture is decoded, scaled, tone-mapped and encoded there, and never copied back.
             if (gpu)
@@ -1800,7 +1764,7 @@ void storage_run::media_tick()
             {
                 j.playlist_mtime = mtime_ms(sb);
                 std::string text;
-                if (read_small(own, text))
+                if (read_small_file(own, text))
                 {
                     int64_t made = 0;
                     for (size_t at = 0; (at = text.find("\nseg", at)) != std::string::npos; ++at)
@@ -1858,7 +1822,7 @@ void storage_run::media_tick()
                 // A GPU job that fails before the rendition has anything is the GPU's failure with this film: the
                 // rendition is made with x264 from then on. Any other that fails from its very start is the medium's.
                 if (j.gpu && j.next == j.from && !exists(j.want.dir + "/init.mp4"))
-                    write_small(j.want.dir + "/encoder", "x264");
+                    write_small_file(j.want.dir + "/encoder", "x264", false);
                 else if (j.next == j.from)
                     mark(j.want.dir, "failed");
             }
@@ -1903,12 +1867,12 @@ void storage_run::media_tick()
             {
                 // The track's cues on the film's own clock, as an HLS player is told they are.
                 std::string vtt;
-                ok = ok && read_small(j.want.dir + "/subs.tmp.vtt", vtt) && vtt.starts_with("WEBVTT");
+                ok = ok && read_small_file(j.want.dir + "/subs.tmp.vtt", vtt) && vtt.starts_with("WEBVTT");
                 if (ok)
                 {
                     const size_t eol = vtt.find('\n');
                     vtt.insert(eol == std::string::npos ? vtt.size() : eol + 1, "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n");
-                    write_small(j.want.dir + "/subs.vtt", vtt);
+                    write_small_file(j.want.dir + "/subs.vtt", vtt, false);
                     ::unlink((j.want.dir + "/subs.tmp.vtt").c_str());
                 }
             }

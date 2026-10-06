@@ -23,6 +23,7 @@
 #include "json_doc.h"
 #include "s3_names.h"
 #include "s3_xml.h"
+#include "small_file.h"
 #include "../../shared/logging.h"
 #include "../../shared/state_persistence.h"
 
@@ -168,44 +169,6 @@ bool valid_id(std::string_view id)
     return true;
 }
 
-bool read_text(const std::string& path, std::string& out)
-{
-    out.clear();
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return false;
-    char buf[8192];
-    for (;;)
-    {
-        const ssize_t n = ::read(fd, buf, sizeof buf);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-        {
-            ::close(fd);
-            return n == 0;
-        }
-        out.append(buf, static_cast<size_t>(n));
-    }
-}
-
-bool write_text(const std::string& path, const std::string& text)
-{
-    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0)
-        return false;
-    bool ok = ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
-    ok = ::fsync(fd) == 0 && ok;
-    ok = ::close(fd) == 0 && ok;
-    if (!ok || ::rename(tmp.c_str(), path.c_str()) < 0)
-    {
-        ::unlink(tmp.c_str());
-        return false;
-    }
-    return true;
-}
-
 std::string pw_hash(std::string_view salt, std::string_view password)
 {
     return sha256_hex(std::string(salt) + std::string(password));
@@ -333,7 +296,7 @@ std::string landing_page(const share_link& s, std::string_view name, const objec
 bool storage_run::share_open(const std::shared_ptr<conn>& c, std::string_view id, share_link& s)
 {
     std::string text;
-    if (!valid_id(id) || !read_text(m_store.options().dir + "/.shares/" + std::string(id) + ".json", text) ||
+    if (!valid_id(id) || !read_small_file(m_store.options().dir + "/.shares/" + std::string(id) + ".json", text) ||
         !parse_share(text, s))
     {
         app_reply(c, 404, "No such link.\n");
@@ -407,7 +370,7 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
     // A link's maker revokes it with credentials, which a link's visitor has none of.
     if (r.method == "DELETE" && rel.empty())
     {
-        if (!valid_id(id) || !read_text(path, text) || !parse_share(text, s))
+        if (!valid_id(id) || !read_small_file(path, text) || !parse_share(text, s))
         {
             app_reply(c, 404, "No such link.\n");
             return;
@@ -566,7 +529,7 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
         if (fd >= 0 && ::flock(fd, LOCK_EX) == 0)
         {
             share_link now;
-            if (read_text(path, text) && parse_share(text, now) && now.downloads < now.max_downloads)
+            if (read_small_file(path, text) && parse_share(text, now) && now.downloads < now.max_downloads)
             {
                 // A node of a cluster counts its own, which every node adds up with the others'.
                 if (!m_cluster_self.empty())
@@ -578,7 +541,7 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
                 ++now.downloads;
                 if (now.burn && now.downloads >= now.max_downloads)
                     now.drained_ms = now_ms();
-                allowed = write_text(path, share_json(now));
+                allowed = write_small_file(path, share_json(now), true);
                 if (allowed)
                     share_sent(id, share_json(now), {});
             }
@@ -664,7 +627,7 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
                     continue;
                 std::string text;
                 share_link s;
-                if (!read_text(dir + "/" + std::string(n), text) || !parse_share(text, s))
+                if (!read_small_file(dir + "/" + std::string(n), text) || !parse_share(text, s))
                     continue;
                 // An expired link is gone for good, and is cleared away here rather than listed.
                 if (s.expires_ms && now_ms() > s.expires_ms)
@@ -758,7 +721,7 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
         app_reply(c, 500, "The links' folder cannot be made.\n");
         return;
     }
-    if (!write_text(dir + "/" + s.id + ".json", share_json(s)))
+    if (!write_small_file(dir + "/" + s.id + ".json", share_json(s), true))
     {
         app_reply(c, 500, "The link could not be kept.\n");
         return;
@@ -814,7 +777,7 @@ st storage_run::share_take(const std::string& id, const std::string& json)
     // Each node's count only grows, and the downloads are their sum.
     std::string text;
     share_link now;
-    if (read_text(path, text) && parse_share(text, now))
+    if (read_small_file(path, text) && parse_share(text, now))
         for (const auto& [node, n] : now.by_node)
             in.by_node[node] = std::max(in.by_node[node], n);
     if (!in.by_node.empty())
@@ -823,7 +786,7 @@ st storage_run::share_take(const std::string& id, const std::string& json)
         for (const auto& [node, n] : in.by_node)
             in.downloads += n;
     }
-    const bool ok = write_text(path, share_json(in));
+    const bool ok = write_small_file(path, share_json(in), true);
     ::flock(fd, LOCK_UN);
     ::close(fd);
     return ok ? st::ok : st::io_error;
@@ -840,7 +803,7 @@ std::vector<std::string> storage_run::share_records()
             const std::string_view n = e->d_name;
             std::string text;
             share_link s;
-            if (n.ends_with(".json") && read_text(dir + "/" + std::string(n), text) && parse_share(text, s))
+            if (n.ends_with(".json") && read_small_file(dir + "/" + std::string(n), text) && parse_share(text, s))
                 out.push_back(encode_cluster_record({'h', s.id, 0, std::move(text), {}}));
         }
         ::closedir(d);
@@ -878,7 +841,7 @@ void storage_run::share_burn_tick()
         std::string text;
         share_link s;
         const std::string path = dir + "/" + std::string(n);
-        if (!read_text(path, text) || !parse_share(text, s) || !s.burn)
+        if (!read_small_file(path, text) || !parse_share(text, s) || !s.burn)
             continue;
         ++seen;
         if (m_burning.count(s.id))
