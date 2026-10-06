@@ -336,7 +336,7 @@ TEST_CASE("what a sum over eight shards costs")
     volatile uint64_t sink = 0;
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < reps; ++i)
-        sink += region.sum_active();
+        sink = sink + region.sum_active();
     const auto t1 = std::chrono::steady_clock::now();
     (void)sink;
 

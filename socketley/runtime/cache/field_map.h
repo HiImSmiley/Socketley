@@ -210,7 +210,8 @@ public:
         }
         friend bool operator==(const const_iterator& a, const const_iterator& b)
         {
-            return a.m_m->m_table ? a.m_it == b.m_it : a.m_at == b.m_at;
+            // A friend of the iterator is no member of field_map, so it asks through the public packed().
+            return a.m_m->packed() ? a.m_at == b.m_at : a.m_it == b.m_it;
         }
         friend bool operator!=(const const_iterator& a, const const_iterator& b) { return !(a == b); }
     };

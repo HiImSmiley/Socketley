@@ -658,7 +658,8 @@ std::string info_text(const media_probe& p, std::string_view version)
     bool first = true;
     for (const rung* r : rungs_of(p))
     {
-        o += (first ? "" : ",") + std::to_string(r->height);
+        if (!first) o += ',';
+        o += std::to_string(r->height);
         first = false;
     }
     o += "],\"subtitles\":[";

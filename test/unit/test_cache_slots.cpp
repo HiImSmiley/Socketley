@@ -233,7 +233,11 @@ TEST_CASE("the split is not so lopsided that a shard is starved")
     {
         std::vector<int> count(n, 0);
         for (int i = 0; i < 20000; ++i)
-            count[cache_shard_of("key:" + std::to_string(i), n)]++;
+        {
+            std::string key("key:");
+            key += std::to_string(i);
+            count[cache_shard_of(key, n)]++;
+        }
         const int fair = 20000 / static_cast<int>(n);
         for (uint32_t s = 0; s < n; ++s)
             CHECK(count[s] > fair / 2);

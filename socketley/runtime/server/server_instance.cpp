@@ -5086,7 +5086,7 @@ static bool constant_time_eq(std::string_view a, std::string_view b)
     {
         uint8_t ca = (i < a.size()) ? static_cast<uint8_t>(a[i]) : 0;
         uint8_t cb = (i < b.size()) ? static_cast<uint8_t>(b[i]) : 0;
-        diff |= ca ^ cb;
+        diff = static_cast<uint8_t>(diff | (ca ^ cb));
     }
     return diff == 0;
 }

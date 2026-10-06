@@ -2,6 +2,7 @@
 // Names a connection across processes, where a reissued descriptor cannot:
 // `owner` is the minting runtime, `serial` the connection, top six bits its
 // shard.
+#include <cstddef>
 #include <cstdint>
 #include <ctime>
 #include <string>
@@ -123,7 +124,7 @@ inline void put_conn_ref(std::string& out, const conn_ref& r)
 // `p`, so a truncated frame cannot half-consume a name.
 inline bool take_conn_ref(const char*& p, const char* end, conn_ref& r)
 {
-    if (end - p < static_cast<ptrdiff_t>(conn_ref_wire_size))
+    if (end - p < static_cast<std::ptrdiff_t>(conn_ref_wire_size))
         return false;
 
     uint64_t owner = 0, serial = 0;

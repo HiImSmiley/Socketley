@@ -22,6 +22,9 @@ workspace "Socketley"
     platforms { "x64" }
     location "make"
 
+    -- Every project, since the SDK and the tests include event_loop.h too and a system without liburing has none.
+    externalincludedirs { "thirdparty/liburing" }
+
     -- ccache when it is present.  The workflow this pays for is toggling
     -- CPPFLAGS (trace, invariants): make does not notice that change, so the
     -- objects have to be deleted and everything recompiled although no source

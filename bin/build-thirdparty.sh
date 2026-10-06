@@ -20,7 +20,8 @@ build_liburing() {
   mkdir -p "$ROOT/thirdparty/liburing/liburing"
   cp "$tmp/src/liburing.a"                  "$ROOT/thirdparty/liburing/"
   cp "$tmp/src/include/liburing.h"          "$ROOT/thirdparty/liburing/"
-  cp "$tmp/src/include/liburing"/*.h        "$ROOT/thirdparty/liburing/liburing/"
+  # Recursive, because liburing.h includes headers from liburing/io_uring/.
+  cp -r "$tmp/src/include/liburing"/.       "$ROOT/thirdparty/liburing/liburing/"
   # Checked in the artefact, not in the tag: a clone that silently landed on a
   # different commit would produce a working build of the wrong version.
   local v

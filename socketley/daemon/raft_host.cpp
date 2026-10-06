@@ -1454,7 +1454,10 @@ std::string raft_host::placement() const
             auto it = st.owners.find(name);
             if (it != st.owners.end())
                 for (raft::node_id n : it->second)
-                    l.nodes += (l.nodes.empty() ? "" : " ") + node_name(n);
+                {
+                    if (!l.nodes.empty()) l.nodes += ' ';
+                    l.nodes += node_name(n);
+                }
             if (l.nodes.empty())
                 l.nodes = "-";
             if (const size_t m = st.missing(name))
@@ -1628,9 +1631,15 @@ std::string raft_host::status(int& exit_code) const
 
     std::string v, l;
     for (raft::node_id id : n.voters())
-        v += (v.empty() ? "" : " ") + describe(id);
+    {
+        if (!v.empty()) v += ' ';
+        v += describe(id);
+    }
     for (raft::node_id id : n.learners())
-        l += (l.empty() ? "" : " ") + describe(id);
+    {
+        if (!l.empty()) l += ' ';
+        l += describe(id);
+    }
     line("voters", v.empty() ? "none" : v);
     line("learners", l.empty() ? "none" : l);
 
