@@ -358,6 +358,11 @@ select.inp option{background:#151821}
 .upnext{position:absolute;right:24px;bottom:110px;z-index:7;width:320px;padding:14px;border-radius:14px;background:rgba(18,20,28,.95);border:1px solid var(--line2);box-shadow:var(--sh);animation:rise .25s}
 .upnext small{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:700}
 .upnext b{display:block;margin:4px 0 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.apb{display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;border-radius:9px;color:var(--mut);font-size:12.5px;font-weight:600}
+.apb:hover{background:rgba(255,255,255,.08);color:#fff}
+.apb .sw{position:relative;width:28px;height:16px;border-radius:9px;background:rgba(255,255,255,.22);transition:background .15s}
+.apb .sw::after{content:'';position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#fff;transition:transform .15s}
+.apb.on{color:#fff}.apb.on .sw{background:var(--grad)}.apb.on .sw::after{transform:translateX(12px)}
 .theater ::cue{background:rgba(0,0,0,.6);font-size:1.15em}
 .viewer .stage{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative}
 .viewer .stage img{max-width:100%;max-height:100%;object-fit:contain;transition:transform .2s;user-select:none}
@@ -2008,6 +2013,10 @@ async function playVideo(it, list) {
   const tm = el('span', { class: 'tm', text: '0:00 / 0:00' });
   const idx = list.findIndex(x => keyOf(x) === keyOf(it));
   const nextIt = idx >= 0 && idx < list.length - 1 ? list[idx + 1] : null;
+  // Whether the next film starts by itself at the end, kept in the browser; on unless turned off.
+  let autoplay = store.get('skl-autoplay', '1') === '1';
+  const apB = nextIt ? el('button', { class: 'apb' + (autoplay ? ' on' : ''), title: 'Play the next one by itself (a)', onclick: e => { e.stopPropagation(); setAutoplay(!autoplay); } }, el('span', { text: 'Autoplay' }), el('span', { class: 'sw' })) : null;
+  function setAutoplay(on) { autoplay = on; store.set('skl-autoplay', on ? '1' : '0'); if (apB) apB.classList.toggle('on', on); if (!on) cancelNext(); osd('Autoplay ' + (on ? 'on' : 'off')); }
   const ccB = ibtn('cc', 'Subtitles (c)', e => menu('cc', e)); ccB.hidden = true;
   const chB = ibtn('list', 'Chapters', e => menu('ch', e)); chB.hidden = true;
   const skipB = el('button', { class: 'skipb', hidden: '', onclick: e => { e.stopPropagation(); const c = intro(); if (c) { v.currentTime = c.end; osd('Skipped ' + c.title); } } });
@@ -2017,7 +2026,7 @@ async function playVideo(it, list) {
   const pipB = document.pictureInPictureEnabled ? ibtn('pip', 'Picture in picture', () => { (document.pictureInPictureElement ? document.exitPictureInPicture() : v.requestPictureInPicture()).catch(() => {}); }) : null;
   const ctl = el('div', { class: 'ctl' }, sk.el, el('div', { class: 'row2' }, ppB, ibtn('back10', 'Back 10 s (j)', () => { v.currentTime = Math.max(0, v.currentTime - 10); }),
     ibtn('fwd10', 'Forward 10 s (l)', () => { v.currentTime = Math.min(v.duration || 1e9, v.currentTime + 10); }), nextIt ? ibtn('next', 'Next: ' + nextIt.name, () => playNext()) : null,
-    el('div', { class: 'vol' }, volB, volR), tm, el('span', { class: 'sp' }), chB, ccB, gearB, qlab, pipB, fsB));
+    el('div', { class: 'vol' }, volB, volR), tm, el('span', { class: 'sp' }), apB, chB, ccB, gearB, qlab, pipB, fsB));
   O.append(ctl, skipB);
   // A chapter named as an opening, a recap or the credits is offered to be skipped while it plays.
   const skippable = /^(intro|opening|opener|vorspann|recap|previously|rückblick|credits|abspann|outro)\b/i;
@@ -2094,14 +2103,19 @@ async function playVideo(it, list) {
   document.addEventListener('fullscreenchange', onfs);
   function onfs() { fsB.firstChild.innerHTML = document.fullscreenElement ? P.fsx : P.fs; }
   let saveT = setInterval(() => { if (!v.paused) savePosition(it, v.currentTime, v.duration); }, 5000);
-  v.addEventListener('ended', () => { savePosition(it, v.duration, v.duration, true); if (nextIt) upNext(); });
+  v.addEventListener('ended', () => { savePosition(it, v.duration, v.duration, true); if (nextIt && autoplay) upNext(); });
+  // Going back into the film, or playing it again, is staying with it: the next one is not started.
+  v.addEventListener('seeking', () => { if (v.currentTime < (v.duration || 0) - 0.5) cancelNext(); });
+  v.addEventListener('play', cancelNext);
   v.addEventListener('error', () => { if (choice === 'orig' && direct && streams && !player) { toast('The browser cannot play this file itself: streaming it instead', 'info'); direct = false; setChoice('auto'); } });
-  let upT = 0;
+  let upT = 0, upCard = null;
+  function cancelNext() { clearInterval(upT); upT = 0; if (upCard) { upCard.remove(); upCard = null; } }
   function upNext() {
-    const card = el('div', { class: 'upnext' }, el('small', { text: 'Up next' }), el('b', { text: nextIt.name }));
+    cancelNext();
+    const card = upCard = el('div', { class: 'upnext' }, el('small', { text: 'Up next' }), el('b', { text: nextIt.name }));
     let n = 8;
     const b = btn('play', 'Play now (' + n + ')', () => playNext(), 'pri sm');
-    card.append(el('div', { style: 'display:flex;gap:8px' }, b, btn(null, 'Cancel', () => { clearInterval(upT); card.remove(); }, 'sm')));
+    card.append(el('div', { style: 'display:flex;gap:8px' }, b, btn(null, 'Cancel', cancelNext, 'sm')));
     O.append(card);
     upT = setInterval(() => { n--; b.lastChild.textContent = 'Play now (' + n + ')'; if (n <= 0) playNext(); }, 1000);
   }
@@ -2118,6 +2132,7 @@ async function playVideo(it, list) {
     else if (k === 'm') v.muted = !v.muted;
     else if (k === 'c' && !ccB.hidden) { const t = [...v.textTracks]; const on = t.findIndex(x => x.mode === 'showing'); t.forEach((x, j) => x.mode = j === (on + 1 === t.length ? -1 : on + 1) ? 'showing' : 'disabled'); const s = t.find(x => x.mode === 'showing'); osd(s ? 'Subtitles: ' + (s.label || s.language) : 'Subtitles off'); }
     else if (k === 'n' && nextIt) playNext();
+    else if (k === 'a' && nextIt) setAutoplay(!autoplay);
     // A frame on or back, paused, as editors step.
     else if (k === ',' || k === '.') { e.preventDefault(); v.pause(); const f = 1 / (meta && meta.fps > 0 ? meta.fps : 25); v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + (k === '.' ? f : -f))); osd(k === '.' ? 'Next frame' : 'Previous frame'); }
     else if (/^[0-9]$/.test(k) && v.duration) v.currentTime = v.duration * (+k) / 10;
