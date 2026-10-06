@@ -27,10 +27,14 @@ s3_error missing_lock_config()
     return lock_error("InvalidRequest", "Bucket is missing Object Lock Configuration");
 }
 
-// Whether the request says what its body's digest is, in a header or in the trailer that follows it.
+// Whether the request says what its body's digest is, in a header or in the trailer that follows it; a signed
+// SHA-256 of the payload is checked against the body as an MD5 is, and older SDKs send nothing else.
 bool integrity_sent(const s3_request& r)
 {
     if (r.has_header("content-md5") || r.header("x-amz-trailer").starts_with("x-amz-checksum-"))
+        return true;
+    if (const std::string_view h = r.header("x-amz-content-sha256");
+        h.size() == 64 && std::ranges::all_of(h, [](char ch) { return std::isxdigit(static_cast<unsigned char>(ch)); }))
         return true;
     for (const auto& h : r.headers)
         if (h.name.starts_with("x-amz-checksum-") && checksum_from_header(h.name) != checksum_algo::none)

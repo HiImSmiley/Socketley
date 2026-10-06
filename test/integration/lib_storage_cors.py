@@ -278,6 +278,17 @@ def basic(node):
     check("a GET from an origin only allowed HEAD carries none", s == 200 and "access-control-allow-origin" not in h, str(h))
     s, h, _ = req(node, "HEAD", "/web/obj", headers={"Origin": "https://anyone.test"})
     check("and its HEAD carries *", s == 200 and h.get("access-control-allow-origin") == "*", str(h))
+    s, h, _ = req(node, "GET", "/web/obj", headers={"Origin": "https://anyone.test", "Access-Control-Request-Method": "HEAD"})
+    check("a GET that carries a preflight's headers is judged by the method they name, as S3 judges it",
+          s == 200 and h.get("access-control-allow-origin") == "*", str(h))
+    s, h, _ = req(node, "GET", "/web/obj", headers={"Origin": APP, "Access-Control-Request-Method": "PUT",
+                                                    "Access-Control-Request-Headers": "Content-Type"})
+    check("and answered as that preflight, with the headers asked for and the rule's age",
+          s == 200 and h.get("access-control-allow-origin") == APP and
+          h.get("access-control-allow-headers") == "content-type" and h.get("access-control-max-age") == "600", str(h))
+    s, h, _ = req(node, "GET", "/web/obj", headers={"Origin": APP, "Access-Control-Request-Method": "DELETE"})
+    check("a method no rule lists carries none, whatever the request's own", s == 200 and "access-control-allow-origin" not in h,
+          str(h))
     s, h, b = req(node, "GET", "/web/missing", headers={"Origin": APP})
     check("a NoSuchKey to an allowed origin carries the rule, so the page can read the error",
           s == 404 and code_of(b) == "NoSuchKey" and h.get("access-control-allow-origin") == APP, "%d %s" % (s, h))

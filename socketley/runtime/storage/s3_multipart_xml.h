@@ -213,6 +213,7 @@ struct list_parts_render
     uint32_t         max_parts{1000};
     bool             truncated{false};
     checksum_algo    algo{checksum_algo::none};
+    std::string      storage_class{"STANDARD"};
 };
 
 inline std::string list_parts_xml(const list_parts_render& r, const std::vector<part_row>& parts)
@@ -231,7 +232,8 @@ inline std::string list_parts_xml(const list_parts_render& r, const std::vector<
              "</Size>" + checksum_element(p.algo, p.checksum_b64) + "</Part>";
     x += "<Initiator><ID>" + xml_escape(r.owner_id) + "</ID><DisplayName>" + xml_escape(r.owner_name) +
          "</DisplayName></Initiator><Owner><ID>" + xml_escape(r.owner_id) + "</ID><DisplayName>" +
-         xml_escape(r.owner_name) + "</DisplayName></Owner><StorageClass>STANDARD</StorageClass>";
+         xml_escape(r.owner_name) + "</DisplayName></Owner><StorageClass>" + xml_escape(r.storage_class) +
+         "</StorageClass>";
     if (r.algo != checksum_algo::none)
         x += "<ChecksumAlgorithm>" + std::string(checksum_name(r.algo)) + "</ChecksumAlgorithm>";
     x += "</ListPartsResult>";
@@ -243,6 +245,7 @@ struct upload_row
     std::string key;
     std::string upload_id;
     int64_t     initiated_ms{0};
+    std::string storage_class{"STANDARD"};
 };
 
 struct list_uploads_render
@@ -286,7 +289,8 @@ inline std::string list_uploads_xml(const list_uploads_render& r, const std::vec
         x += "<Upload><Key>" + enc(u.key) + "</Key><UploadId>" + xml_escape(u.upload_id) +
              "</UploadId><Initiator><ID>" + xml_escape(r.owner_id) + "</ID><DisplayName>" + xml_escape(r.owner_name) +
              "</DisplayName></Initiator><Owner><ID>" + xml_escape(r.owner_id) + "</ID><DisplayName>" +
-             xml_escape(r.owner_name) + "</DisplayName></Owner><StorageClass>STANDARD</StorageClass><Initiated>" +
+             xml_escape(r.owner_name) + "</DisplayName></Owner><StorageClass>" + xml_escape(u.storage_class) +
+             "</StorageClass><Initiated>" +
              iso8601(u.initiated_ms) + "</Initiated></Upload>";
     for (const std::string& p : prefixes)
         x += "<CommonPrefixes><Prefix>" + enc(p) + "</Prefix></CommonPrefixes>";

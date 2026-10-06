@@ -860,6 +860,7 @@ std::string encode_parts_page(const parts_page& pg)
         w.bytes(p.checksum_b64);
     }
     w.bytes(pg.owner);
+    w.bytes(pg.storage_class);
     return w.take();
 }
 
@@ -885,7 +886,7 @@ bool decode_parts_page(std::string_view reply, parts_page& pg)
         p.algo     = pg.algo;
         pg.rows.push_back(std::move(p));
     }
-    return r.bytes(pg.owner, name_cap);
+    return r.bytes(pg.owner, name_cap) && r.bytes(pg.storage_class, 64);
 }
 
 std::string encode_upload_list(const std::vector<upload_stub>& uploads)
@@ -897,6 +898,7 @@ std::string encode_upload_list(const std::vector<upload_stub>& uploads)
         w.bytes(u.key);
         w.bytes(u.id);
         w.u64(static_cast<uint64_t>(u.initiated_ms));
+        w.bytes(u.storage_class);
     }
     return w.take();
 }
@@ -912,7 +914,7 @@ bool decode_upload_list(std::string_view reply, std::vector<upload_stub>& upload
     {
         upload_stub u;
         uint64_t ms = 0;
-        if (!r.bytes(u.key, name_cap) || !r.bytes(u.id, id_cap) || !r.u64(ms))
+        if (!r.bytes(u.key, name_cap) || !r.bytes(u.id, id_cap) || !r.u64(ms) || !r.bytes(u.storage_class, 64))
             return false;
         u.initiated_ms = static_cast<int64_t>(ms);
         uploads.push_back(std::move(u));

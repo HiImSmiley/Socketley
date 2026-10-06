@@ -103,8 +103,9 @@ class Resp:
         return "%d %s %s" % (self.status, self.code() or "", self.body[:300])
 
 
-def req(method, path, query="", body=b"", headers=None, cred="default", target=None):
-    """One request, signed with `cred` unless it is None, to a port or a unix socket."""
+def req(method, path, query="", body=b"", headers=None, cred="default", target=None, payload=None):
+    """One request, signed with `cred` unless it is None, to a port or a unix socket; `payload` is the hash it signs,
+    the body's SHA-256 unless it is given (UNSIGNED-PAYLOAD for one that says nothing of its body)."""
     target = target or TARGET
     key = KEY if cred == "default" else cred
     if isinstance(body, str):
@@ -115,7 +116,8 @@ def req(method, path, query="", body=b"", headers=None, cred="default", target=N
         c, host = http.client.HTTPConnection("127.0.0.1", target, timeout=60), "127.0.0.1:%d" % target
     hdrs = dict(headers or {})
     if key is not None:
-        hdrs = dict(sig.sign(method, path, query, host, key[0], key[1], sig.sha256hex(body), extra_headers=hdrs).headers)
+        hdrs = dict(sig.sign(method, path, query, host, key[0], key[1], payload or sig.sha256hex(body),
+                             extra_headers=hdrs).headers)
     hdrs["Host"] = host
     try:
         c.request(method, path + ("?" + query if query else ""), body=body if body or method in ("PUT", "POST") else None,
@@ -155,6 +157,8 @@ def lock_doc(mode=None, days=None, years=None, enabled="Enabled"):
 
 def put_lock_config(bucket, doc, integrity="md5", **kw):
     h = md5h(doc) if integrity == "md5" else {}
+    if integrity is None:
+        kw.setdefault("payload", "UNSIGNED-PAYLOAD")
     if integrity == "crc32":
         h = {"x-amz-checksum-crc32": sig.crc32_b64(doc)}
     return req("PUT", "/" + bucket, "object-lock", doc, h, **kw)
@@ -184,6 +188,8 @@ def put(bucket, key, body=b"x", mode=None, until=None, hold=None, extra=None, in
         h["x-amz-object-lock-legal-hold"] = hold
     if integrity:
         h.update(md5h(body))
+    elif integrity is False:
+        kw.setdefault("payload", "UNSIGNED-PAYLOAD")
     return req("PUT", "/%s/%s" % (bucket, key), "", body, h, **kw)
 
 
@@ -202,6 +208,8 @@ def retention_doc(mode=None, until=None):
 def put_retention(bucket, key, mode=None, until=None, vid=None, bypass=False, integrity=True, **kw):
     doc = retention_doc(mode, until)
     h = md5h(doc) if integrity else {}
+    if not integrity:
+        kw.setdefault("payload", "UNSIGNED-PAYLOAD")
     if bypass:
         h["x-amz-bypass-governance-retention"] = "true"
     return req("PUT", "/%s/%s" % (bucket, key), "retention" + ("&" + vq(vid) if vid else ""), doc, h, **kw)
@@ -397,6 +405,8 @@ def modes():
     r = put("lkb", "crc", b"crc", mode="GOVERNANCE", until=now + DAY, integrity=False,
             extra={"x-amz-checksum-crc32": sig.crc32_b64(b"crc")})
     check("an x-amz-checksum-crc32 is enough", r.status == 200, r)
+    r = put("lkb", "sha", b"sha", mode="GOVERNANCE", until=now + DAY, integrity=None)
+    check("and so is a signed SHA-256 of the body, all an older SDK sends", r.status == 200, r)
     check("nothing was stored by the refused writes", req("HEAD", "/lkb/bad").status == 404)
     r = put_retention("lkb", "crc", "GOVERNANCE", now - 60)
     check("PutObjectRetention of a date in the past is InvalidArgument", (r.status, r.code()) == (400, "InvalidArgument"), r)
@@ -474,7 +484,7 @@ def legal_hold():
     doc = b'<LegalHold><Status>abc</Status></LegalHold>'
     r = req("PUT", "/lkb/h", "legal-hold", doc, md5h(doc))
     check("a Status other than ON or OFF is MalformedXML", (r.status, r.code()) == (400, "MalformedXML"), r)
-    r = req("PUT", "/lkb/h", "legal-hold", b"<LegalHold><Status>OFF</Status></LegalHold>")
+    r = req("PUT", "/lkb/h", "legal-hold", b"<LegalHold><Status>OFF</Status></LegalHold>", payload="UNSIGNED-PAYLOAD")
     check("PutObjectLegalHold with neither Content-MD5 nor a checksum is InvalidRequest",
           (r.status, r.code()) == (400, "InvalidRequest"), r)
     r = put_hold("lkb", "h", "OFF", vid=v)

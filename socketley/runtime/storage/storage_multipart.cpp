@@ -583,6 +583,8 @@ void storage_run::op_list_parts(const std::shared_ptr<conn>& c)
             lr.algo      = pg.algo;
             lr.truncated = pg.truncated;
             lr.next_part_number_marker = pg.next_marker;
+            if (!pg.storage_class.empty())
+                lr.storage_class = pg.storage_class;
 
             response resp;
             resp.headers.emplace_back("Content-Type", "application/xml");
@@ -724,7 +726,7 @@ void storage_run::op_list_uploads(const std::shared_ptr<conn>& c)
             lr.truncated = true;
             break;
         }
-        rows.push_back({u->key, u->id, u->initiated_ms});
+        rows.push_back({u->key, u->id, u->initiated_ms, u->storage_class.empty() ? "STANDARD" : u->storage_class});
         ++taken;
         last_key = u->key;
         last_id  = u->id;

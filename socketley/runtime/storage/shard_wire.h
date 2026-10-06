@@ -136,6 +136,7 @@ struct upload_stub
     std::string key;
     std::string id;
     int64_t     initiated_ms{0};
+    std::string storage_class;
 };
 
 std::string encode_mpu_create(std::string_view bucket, std::string_view key, const object_meta& meta,

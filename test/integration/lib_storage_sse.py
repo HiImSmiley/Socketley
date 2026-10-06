@@ -534,6 +534,10 @@ def mode_main(port, data):
     got = s3.get_bucket_encryption(Bucket="dflt")["ServerSideEncryptionConfiguration"]["Rules"][0]
     check("a default of aws:kms under a key is taken and read back", got["ApplyServerSideEncryptionByDefault"] ==
           {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": "team-b"}, got)
+    check("with no BucketKeyEnabled, which minio-java refuses to parse, where none was set", "BucketKeyEnabled" not in got, got)
+    s3.put_bucket_encryption(Bucket="dflt", ServerSideEncryptionConfiguration={"Rules": [dict(kms["Rules"][0], BucketKeyEnabled=True)]})
+    got = s3.get_bucket_encryption(Bucket="dflt")["ServerSideEncryptionConfiguration"]["Rules"][0]
+    check("and with it where it was", got.get("BucketKeyEnabled") is True, got)
     r = s3.put_object(Bucket="dflt", Key="dk", Body=b"by default")
     check("a PUT that asks nothing of it is sealed under that key",
           r.get("ServerSideEncryption") == "aws:kms" and r.get("SSEKMSKeyId") == "team-b", r)

@@ -112,9 +112,10 @@ inline std::string encryption_xml(const encryption_config& c)
         xml_escape_to(x, c.kms_key);
         x += "</KMSMasterKeyID>";
     }
-    x += "</ApplyServerSideEncryptionByDefault><BucketKeyEnabled>";
-    x += c.bucket_key ? "true" : "false";
-    x += "</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>";
+    // Said only when set, since clients written against servers that never say it refuse the element.
+    x += c.bucket_key ? "</ApplyServerSideEncryptionByDefault><BucketKeyEnabled>true</BucketKeyEnabled>"
+                      : "</ApplyServerSideEncryptionByDefault>";
+    x += "</Rule></ServerSideEncryptionConfiguration>";
     return x;
 }
 

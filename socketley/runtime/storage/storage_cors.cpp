@@ -138,8 +138,14 @@ void storage_run::cors_actual(const std::shared_ptr<conn>& c)
     const cors_config* cfg = m_store.bucket_cors(q.bucket);
     if (!cfg)
         return;
-    if (const cors_rule* rule = cors_match(*cfg, origin, q.method))
-        cors_render(c->cors_head, *rule, origin, false);
+    // A request that carries a preflight's headers is judged as the preflight they describe and answered as one, as
+    // S3 answers it.
+    const std::string_view asked_method = q.header("access-control-request-method");
+    const std::string_view asked_headers = q.header("access-control-request-headers");
+    const bool as_preflight = !asked_method.empty();
+    if (const cors_rule* rule = cors_match(*cfg, origin, as_preflight ? asked_method : std::string_view(q.method),
+                                           as_preflight ? asked_headers : std::string_view{}))
+        cors_render(c->cors_head, *rule, origin, as_preflight, asked_headers);
 }
 
 }   // namespace socketley::storage

@@ -283,10 +283,33 @@ void set_tier_record(object_meta& m, const tier_record* r)
 
 std::string_view storage_class_of(const object_meta& m)
 {
+    std::string_view kept;
     for (const auto& [n, v] : m.extra)
+    {
         if (n == tier_extra)
             return std::string_view(v).substr(0, v.find(';'));
-    return "STANDARD";
+        if (n == class_extra)
+            kept = v;
+    }
+    return kept.empty() ? std::string_view("STANDARD") : kept;
+}
+
+std::string_view kept_class(std::string_view asked)
+{
+    static constexpr std::string_view kept[] = {
+        "REDUCED_REDUNDANCY", "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING", "GLACIER_IR", "EXPRESS_ONEZONE",
+    };
+    for (std::string_view k : kept)
+        if (asked == k)
+            return k;
+    return {};
+}
+
+void set_class_extra(object_meta& m, std::string_view cls)
+{
+    erase_if(m.extra, [](const auto& e) { return e.first == class_extra; });
+    if (!cls.empty())
+        m.extra.emplace_back(std::string(class_extra), std::string(cls));
 }
 
 void encode_meta(std::string& out, std::string_view key, const object_meta& m)

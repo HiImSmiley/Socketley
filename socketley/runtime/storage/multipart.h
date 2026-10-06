@@ -175,6 +175,7 @@ struct parts_page
     uint32_t      next_marker{0};
     // Who owns the upload, its writer where the bucket takes ACLs, empty for the bucket's owner.
     std::string   owner;
+    std::string   storage_class;
 };
 
 struct mpu_totals

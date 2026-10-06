@@ -793,6 +793,21 @@ verify_result verify(const request_view& req, const verify_options& opts, const 
         return fail(sigv4_status::malformed, 400, "InvalidArgument", "x-amz-content-sha256 must be UNSIGNED-PAYLOAD, STREAMING-UNSIGNED-PAYLOAD-TRAILER, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER or a valid sha256 value.", a.form);
     if (a.form == auth_form::query && r.payload != payload_kind::unsigned_payload && r.payload != payload_kind::hex)
         return malformed(a.form, "A presigned request cannot use a streaming payload.");
+    // A presigned URL signs no payload, but a hash its sender states in the header is the body's all the same, and
+    // one that is no hash is refused rather than stored past.
+    if (const header_field* h = find_header(req.headers, "x-amz-content-sha256");
+        h && a.form == auth_form::query && !a.has_payload_query)
+    {
+        payload_kind stated = payload_kind::unsigned_payload;
+        uint8_t hash[32] = {};
+        if (!classify_payload(trim(h->value), stated, hash) || (stated != payload_kind::hex && stated != payload_kind::unsigned_payload))
+            return fail(sigv4_status::malformed, 400, "InvalidArgument", "x-amz-content-sha256 must be UNSIGNED-PAYLOAD or a valid sha256 value on a presigned request.", a.form);
+        if (stated == payload_kind::hex)
+        {
+            r.payload = payload_kind::hex;
+            std::memcpy(r.payload_sha256, hash, sizeof hash);
+        }
+    }
 
     uint64_t decoded_length = UINT64_MAX;
     if (const header_field* h = find_header(req.headers, "x-amz-decoded-content-length"))

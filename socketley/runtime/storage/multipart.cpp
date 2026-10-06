@@ -1009,6 +1009,7 @@ parts_page multipart_store::list_parts(std::string_view bucket, std::string_view
     pg.algo = up->algo;
     if (acl_list a; decode_acl(object_acl_value(up->meta), a) && !object_acl_value(up->meta).empty())
         pg.owner = a.owner;
+    pg.storage_class = storage_class_of(up->meta);
     for (auto it = up->parts.upper_bound(marker); it != up->parts.end(); ++it)
     {
         if (pg.rows.size() == max_parts)

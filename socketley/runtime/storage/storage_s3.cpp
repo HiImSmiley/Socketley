@@ -278,6 +278,12 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
         begin_post_form(c);
         return;
     }
+    // A POST to a key names no operation without its subresource, which S3 answers before it asks who sent it.
+    if (r.method == "POST" && !r.bucket.empty() && !r.key.empty() && r.raw_query.empty())
+    {
+        deny_request(c, make_error("MethodNotAllowed"));
+        return;
+    }
 
     auth_verdict v = m_auth->authorize(rv);
     // A policy may let in a request with no credentials, and ownership or a policy may refuse one with them.
@@ -819,7 +825,7 @@ bool storage_run::storage_class_ok(const s3_request& r, s3_error& err)
         return true;
     for (const auto& h : r.headers)
     {
-        // Every class S3 has is stored as STANDARD, the one this storage has, which keeps at least what was asked.
+        // Every class S3 has is taken, its bytes kept as STANDARD's, which keeps at least what was asked.
         if (h.name == "x-amz-storage-class")
         {
             static constexpr std::string_view classes[] = {
@@ -1214,6 +1220,7 @@ bool storage_run::object_meta_from_headers(const std::shared_ptr<conn>& c, objec
         err = make_error("MetadataTooLarge");
         return false;
     }
+    set_class_extra(m, kept_class(q.header("x-amz-storage-class")));
     // The owner and grants a bucket that takes ACLs keeps for the object.
     if (!object_acl_stamp(c, m, err))
         return false;
@@ -1544,7 +1551,8 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
     }
     // A version copied over its own key is a new latest made of an old one, which S3 allows as it is, and so is a
     // copy that names the encryption or the checksum algorithm it changes to.
-    if (src_bucket == r.bucket && src_key == r.key && !replace && src_version.empty() && !dst.named && !names_checksum)
+    if (src_bucket == r.bucket && src_key == r.key && !replace && src_version.empty() && !dst.named && !names_checksum &&
+        !r.has_header("x-amz-storage-class"))
     {
         s3_error e = make_error("InvalidRequest");
         e.message = "This copy request is illegal because it is trying to copy an object to itself "
@@ -1585,6 +1593,8 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
     else
     {
         meta = *src_meta;
+        // A copy's class is the one it asks for, STANDARD when it names none, and never its source's.
+        set_class_extra(meta, kept_class(r.header("x-amz-storage-class")));
         // A copy is a new object, whose owner and grants are its writer's and never its source's.
         if (s3_error err; !object_acl_stamp(c, meta, err))
         {
@@ -1726,9 +1736,9 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
     r.headers.emplace_back("Accept-Ranges", "bytes");
     r.headers.emplace_back("ETag", "\"" + m.etag() + "\"");
     r.headers.emplace_back("Last-Modified", http_date(m.mtime_ms));
-    // S3 names a class other than STANDARD, which a version moved to a tier has.
-    if (is_tiered(m))
-        r.headers.emplace_back("x-amz-storage-class", std::string(storage_class_of(m)));
+    // S3 names a class other than STANDARD, which a version moved to a tier or written with one has.
+    if (const std::string_view cls = storage_class_of(m); cls != "STANDARD")
+        r.headers.emplace_back("x-amz-storage-class", std::string(cls));
 
     struct override_row { std::string_view query; std::string_view header; };
     static constexpr override_row overrides[] = {

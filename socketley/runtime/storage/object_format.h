@@ -286,6 +286,13 @@ void set_tags_extra(object_meta& m, std::string_view tags);
 // The extra entry of a version whose bytes were moved to a tier: the tier's name, a ';', and the key they lie under
 // below the tier's own path.  Its file keeps the header alone.
 inline constexpr std::string_view tier_extra = "x-socketley-tier";
+// The storage class a write asked for, kept for the classes whose objects are read at once like STANDARD's.
+inline constexpr std::string_view class_extra = "x-socketley-class";
+// The class to keep for `asked` (an x-amz-storage-class), empty for STANDARD and for an archive class, whose name
+// would tell a client to restore what it can read now.
+std::string_view kept_class(std::string_view asked);
+// Makes `cls` the version's kept class, or removes it when it is empty.
+void set_class_extra(object_meta& m, std::string_view cls);
 
 struct tier_record
 {

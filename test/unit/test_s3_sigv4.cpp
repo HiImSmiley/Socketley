@@ -1060,6 +1060,35 @@ TEST_CASE("a request signed for no region is taken unless a region is pinned")
     CHECK(std::string(pinned.code) == "AuthorizationHeaderMalformed");
 }
 
+TEST_CASE("a presigned request's stated payload hash is the body's, and one that is no hash is refused")
+{
+    const kase* p = find_case("docs/presigned-get");
+    REQUIRE(p);
+    {
+        req r(*p);
+        r.headers.emplace_back("x-amz-content-sha256", "invalid-sha256");
+        const s3::verify_result res = r.run();
+        CHECK(res.status == s3::sigv4_status::malformed);
+        CHECK(std::string(res.code) == "InvalidArgument");
+    }
+    {
+        req r(*p);
+        const std::string hash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        r.headers.emplace_back("x-amz-content-sha256", hash);
+        const s3::verify_result res = r.run();
+        REQUIRE(res.status == s3::sigv4_status::ok);
+        CHECK(res.payload == s3::payload_kind::hex);
+        CHECK(hex_of(res.payload_sha256, 32) == hash);
+    }
+    {
+        req r(*p);
+        r.headers.emplace_back("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        const s3::verify_result res = r.run();
+        CHECK(res.status == s3::sigv4_status::ok);
+        CHECK(res.payload == s3::payload_kind::unsigned_payload);
+    }
+}
+
 TEST_CASE("the service must be the one the server is")
 {
     const kase* c = find_case("boto3/get-special-key");

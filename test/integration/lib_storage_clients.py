@@ -415,6 +415,9 @@ def post_object():
     check("a V4 form with success_action_status 201 answers its PostResponse",
           st == 201 and b"<Key>four</Key>" in data and s3.get_object(Bucket="cl-post", Key="four")["Body"].read() == b"signed v4",
           (st, data[:200]))
+    st, _, data = form_upload("cl-post/four", four["fields"], b"to a key")
+    check("a form posted to a key and not its bucket is MethodNotAllowed, as mc share upload expects of it",
+          st == 405 and b"MethodNotAllowed" in data, (st, data[:200]))
     redirect = v4c.generate_presigned_post("cl-post", "redir", Fields={"success_action_redirect": "http://example.test/done"},
                                            Conditions=[{"success_action_redirect": "http://example.test/done"}])
     st, hd, _ = form_upload("cl-post", redirect["fields"], b"r")
@@ -479,6 +482,31 @@ def object_lock():
     check("one it does not is InvalidStorageClass", code_of(lambda: s3.put_object(Bucket="cl-misc", Key="bogus", Body=b"x",
                                                                                    StorageClass="BOGUS")) ==
           ("InvalidStorageClass", 400))
+    def eq(name, got, want):
+        check(name, got == want, got)
+    eq("an archive class is named STANDARD, which a client reads without a restore",
+       s3.head_object(Bucket="cl-misc", Key="glacier").get("StorageClass"), None)
+    s3.put_object(Bucket="cl-misc", Key="rr", Body=b"x", StorageClass="REDUCED_REDUNDANCY")
+    listed = {o["Key"]: o["StorageClass"] for o in s3.list_objects_v2(Bucket="cl-misc", Prefix="rr")["Contents"]}
+    eq("a class read at once is kept, and named by HEAD, GET, the listing and GetObjectAttributes",
+       (s3.head_object(Bucket="cl-misc", Key="rr").get("StorageClass"),
+        s3.get_object(Bucket="cl-misc", Key="rr").get("StorageClass"), listed.get("rr"),
+        s3.get_object_attributes(Bucket="cl-misc", Key="rr", ObjectAttributes=["StorageClass"]).get("StorageClass")),
+       ("REDUCED_REDUNDANCY",) * 4)
+    s3.copy_object(Bucket="cl-misc", Key="rr-copy", CopySource={"Bucket": "cl-misc", "Key": "rr"})
+    eq("a copy that names no class is STANDARD", s3.head_object(Bucket="cl-misc", Key="rr-copy").get("StorageClass"), None)
+    eq("a copy onto itself that names a class is taken",
+       code_of(lambda: s3.copy_object(Bucket="cl-misc", Key="rr", CopySource={"Bucket": "cl-misc", "Key": "rr"},
+                                      StorageClass="STANDARD_IA")), (None, None))
+    eq("and changes the class", s3.head_object(Bucket="cl-misc", Key="rr").get("StorageClass"), "STANDARD_IA")
+    up = s3.create_multipart_upload(Bucket="cl-misc", Key="mp-ia", StorageClass="ONEZONE_IA")["UploadId"]
+    etag = s3.upload_part(Bucket="cl-misc", Key="mp-ia", UploadId=up, PartNumber=1, Body=b"p")["ETag"]
+    eq("ListMultipartUploads and ListParts name an upload's class",
+       ([u.get("StorageClass") for u in s3.list_multipart_uploads(Bucket="cl-misc", Prefix="mp-ia")["Uploads"]],
+        s3.list_parts(Bucket="cl-misc", Key="mp-ia", UploadId=up).get("StorageClass")), (["ONEZONE_IA"], "ONEZONE_IA"))
+    s3.complete_multipart_upload(Bucket="cl-misc", Key="mp-ia", UploadId=up,
+                                 MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": etag}]})
+    eq("and the object it makes has it", s3.head_object(Bucket="cl-misc", Key="mp-ia").get("StorageClass"), "ONEZONE_IA")
     s3.put_object(Bucket="cl-misc", Key="redir", Body=b"x", WebsiteRedirectLocation="/elsewhere")
     check("x-amz-website-redirect-location is kept and returned",
           s3.head_object(Bucket="cl-misc", Key="redir").get("WebsiteRedirectLocation") == "/elsewhere")

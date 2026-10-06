@@ -6973,9 +6973,15 @@ A bucket's own tags (PutBucketTagging, GetBucketTagging, DeleteBucketTagging)
 are at most 50 under the rules of an object's, NoSuchTagSet (404) when there are
 none, and are kept and carried between shards like its CORS rules, in
 .IB dir / bucket /tagging .
-Every storage class S3 has is taken and stored as STANDARD, the one this storage
-keeps here (a version a lifecycle moved to a tier is listed and read with the
-tier's name as its class), and one it does not have is
+Every storage class S3 has is taken, and the bytes are kept here as STANDARD's
+are. A class whose objects S3 reads at once (REDUCED_REDUNDANCY, STANDARD_IA,
+ONEZONE_IA, INTELLIGENT_TIERING, GLACIER_IR, EXPRESS_ONEZONE) is kept and named by
+HEAD, GET, the listings, GetObjectAttributes and an upload's ListParts and
+ListMultipartUploads; an archive class is named STANDARD, since its name would
+tell a client to restore what it can read now; a copy takes the class it names,
+STANDARD when it names none, and may name one to change an object's class in
+place; a version a lifecycle moved to a tier is listed and read with the tier's
+name as its class. A class S3 does not have is
 .BR "400 InvalidStorageClass" ;
 .B x\-amz\-website\-redirect\-location
 is kept and returned like the other stored headers.
@@ -6986,8 +6992,10 @@ key at most 1024 bytes.
 .SS Uploads by form
 A POST to a bucket whose body is
 .B multipart/form\-data
-is S3's POST Object, the upload a web page makes with an HTML form and the
-fields
+is S3's POST Object, the upload a web page makes with an HTML form (posted to a
+key instead, as to any key without a subresource, it is
+.BR "405 MethodNotAllowed" )
+and the fields
 .B generate_presigned_post
 and the SDKs' presigned POST write. The fields in front of the file (at most
 20 KiB of them, else
@@ -7110,7 +7118,10 @@ included, is accepted. Every
 mode a client sends is honoured: a hex hash is checked against the body as it
 streams (a body that is not the one signed is
 .B XAmzContentSHA256Mismatch
-and is not stored),
+and is not stored, and a presigned URL, which signs no payload, has its body checked
+against a hash its sender states in the header all the same, one that is no hash
+being
+.BR "400 InvalidArgument" ),
 .B UNSIGNED\-PAYLOAD
 has nothing to check, and aws\-chunked bodies \(em
 .BR STREAMING\-AWS4\-HMAC\-SHA256\-PAYLOAD ,
@@ -7534,7 +7545,10 @@ Every other request that carries an
 .B Origin
 some rule allows for its method gets the same headers but
 .BR Access\-Control\-Allow\-Headers ,
-on every answer: errors and authentication refusals included, so a page can
+and one that also carries
+.B Access\-Control\-Request\-Method
+is judged by that method and the headers it asks for and answered as that preflight,
+as S3 answers it, on every answer: errors and authentication refusals included, so a page can
 read why it was refused. A request from an origin no rule allows is served as
 before, with no CORS headers. A runtime none of whose buckets has rules looks
 nothing up for a request.
@@ -7893,8 +7907,11 @@ that names a retention or a legal hold, need
 .B Content\-MD5
 or an
 .B x\-amz\-checksum\-*
-of the body (checked), as S3 requires; a PutObject that only receives the default
-does not.
+of the body (checked), as S3 requires, or a SigV4 signature over the body's SHA\-256
+(an
+.B x\-amz\-content\-sha256
+that is a hash, checked as well), which is all an SDK from before checksums sends; a
+PutObject that only receives the default does not.
 .PP
 A version under a legal hold that is ON, or under a retention whose date the
 server's clock (UTC) has not reached, cannot be removed: a DELETE or DeleteObjects

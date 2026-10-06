@@ -283,6 +283,13 @@ def mode_main(sp, dp):
     check("a version the tag rule names is copied", wait_for(lambda: status(src, SB, "img/x") == "COMPLETED", 20) and
           body(dst, DB, "img/x") == b"hot image", status(src, SB, "img/x"))
     check("one whose tag differs has no status", status(src, SB, "img/y") == "", status(src, SB, "img/y"))
+    hx = call(dst.head_object, Bucket=DB, Key="img/x")
+    check("a replica is of the class its rule names", isinstance(hx, dict) and hx.get("StorageClass") == "STANDARD_IA", hx)
+    src.put_object(Bucket=SB, Key="docs/rr", Body=b"rr", StorageClass="REDUCED_REDUNDANCY")
+    hr = call(dst.head_object, Bucket=DB, Key="docs/rr") if wait_for(
+        lambda: status(src, SB, "docs/rr") == "COMPLETED", 20) else None
+    check("and of its source's where the rule names none",
+          isinstance(hr, dict) and hr.get("StorageClass") == "REDUCED_REDUNDANCY", hr)
     check("nor one no rule's prefix names", status(src, SB, "misc/z") == "", status(src, SB, "misc/z"))
 
     # An overwrite is a version of its own, and a delete marker follows where the rule says.
@@ -352,11 +359,11 @@ def mode_main(sp, dp):
     check("and so does a destination bucket that is not there",
           wait_for(lambda: status(src, "rsrc-gone", "k") == "FAILED", 20), status(src, "rsrc-gone", "k"))
 
-    sizes = 100 * 1024 + 9 + 5000 + 11 * (1 << 20) + 70000 + 1
+    sizes = 100 * 1024 + 9 + 5000 + 11 * (1 << 20) + 70000 + 1 + 2
     # The counters `stats` shows are a moment old, so the wait is for them to catch up; the two tag changes count.
     check("stats count what was copied, its bytes, what failed, and that nothing waits",
           wait_for(lambda: stat("rsrc", "replication_pending") == 0 and
-                   stat("rsrc", "replication_completed") == 9 and stat("rsrc", "replication_bytes") == sizes and
+                   stat("rsrc", "replication_completed") == 10 and stat("rsrc", "replication_bytes") == sizes and
                    stat("rsrc", "replication_failed") == 2, 10), rstats("rsrc"))
 
     check("a configuration is deleted", isinstance(call(src.delete_bucket_replication, Bucket="rsrc-gone"), dict) and

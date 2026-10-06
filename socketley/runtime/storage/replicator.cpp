@@ -1353,8 +1353,9 @@ std::vector<std::pair<std::string, std::string>> replica_headers(const object_me
         h.emplace_back(std::string(replica_version_header), version_of(m).id);
     if (is_encrypted(m))
         h.emplace_back("x-amz-server-side-encryption", "AES256");
-    if (!storage_class.empty())
-        h.emplace_back("x-amz-storage-class", std::string(storage_class));
+    // The rule's class, or the one the source was written with.
+    if (const std::string_view cls = storage_class.empty() ? storage_class_of(m) : storage_class; cls != "STANDARD")
+        h.emplace_back("x-amz-storage-class", std::string(cls));
     return h;
 }
 
