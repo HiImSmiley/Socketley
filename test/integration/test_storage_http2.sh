@@ -95,7 +95,7 @@ if grep -q SKIP "$T/frames.out"; then echo "  (the frame-by-frame part was skipp
 
 # Each shard has a section of its own, published as its figures change; the counts are their sums.
 sum() { "$BIN" stats stgh2c 2>/dev/null | awk -F: -v k="$1" '$1==k {s+=$2} END {print s+0}'; }
-for _ in $(seq 1 50); do [ "$(sum h2_goaways)" -ge 1 ] && break; sleep 0.1; done
+for _ in $(seq 1 100); do [ "$(sum h2_streams)" -ge 100 ] && [ "$(sum h2_refused)" -ge 1 ] && [ "$(sum h2_goaways)" -ge 1 ] && break; sleep 0.1; done
 n=$(sum h2_streams); r=$(sum h2_refused); g=$(sum h2_goaways)
 if [ "$n" -ge 100 ] && [ "$r" -ge 1 ] && [ "$g" -ge 1 ]; then ok "stats counts the streams ($n), the refused and the GOAWAYs"
 else bad "stats counts streams" "streams=$n refused=$r goaways=$g"; fi

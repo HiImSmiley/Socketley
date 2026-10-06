@@ -229,6 +229,27 @@ check("a frame past the size this side reads is FRAME_SIZE_ERROR",
 check("a WINDOW_UPDATE of nothing to the connection is PROTOCOL_ERROR",
       goaway_code(raw(frame(4, 0, 0) + frame(8, 0, 0, b"\x00\x00\x00\x00"))) == 1)
 
+hblock = b"\x82\x86\x84\x41\x09127.0.0.1"
+
+
+def rst_code(data, sid):
+    at = 0
+    while at + 9 <= len(data):
+        n = int.from_bytes(data[at:at + 3], "big")
+        if data[at + 3] == 3 and int.from_bytes(data[at + 5:at + 9], "big") == sid and at + 13 <= len(data):
+            return int.from_bytes(data[at + 9:at + 13], "big")
+        at += 9 + n
+    return None
+
+
+# A GET ended by both sides, then DATA on it; and HEADERS and PRIORITY naming their own stream as their parent.
+done = frame(4, 0, 0) + frame(1, 0x5, 1, hblock)
+got = raw(done + frame(0, 0x1, 1, b"late"), 2)
+check("DATA on a stream that has ended is reset with STREAM_CLOSED", rst_code(got, 1) == 5, got[:80])
+check("HEADERS that depend on their own stream are reset with PROTOCOL_ERROR",
+      rst_code(raw(frame(4, 0, 0) + frame(1, 0x25, 3, (3).to_bytes(4, "big") + b"\x10" + hblock)), 3) == 1)
+check("and so is a PRIORITY that does", rst_code(raw(frame(4, 0, 0) + frame(2, 0, 5, (5).to_bytes(4, "big") + b"\x10")), 5) == 1)
+
 # ── limits ───────────────────────────────────────────────────────────────────
 c = Client()
 # Each waits for a body it was promised, so it stays open; the client has not yet read this side's limit.
@@ -238,7 +259,6 @@ check("the 129th stream open at once is refused", c.resets.get(first[-1]) == 7, 
 c.close()
 
 flood = frame(4, 0, 0)
-hblock = b"\x82\x86\x84\x41\x09127.0.0.1"
 for i in range(1, 1200, 2):
     flood += frame(1, 0x4, i, hblock) + frame(3, 0, i, b"\x00\x00\x00\x08")
 check("streams opened and reset by the hundred end the connection with ENHANCE_YOUR_CALM",

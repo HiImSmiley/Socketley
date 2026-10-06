@@ -109,6 +109,8 @@ struct h2_session
     std::string cont_buf;
     bool     cont_end_stream{false};
     bool     cont_trailers{false};
+    // The block's stream named itself as its dependency, and is reset once the block is read.
+    bool     cont_refuse{false};
     int      cont_frames{0};
 
     std::unordered_map<uint32_t, std::shared_ptr<conn>> streams;
@@ -119,7 +121,7 @@ struct h2_session
 
     std::chrono::steady_clock::time_point began{};
     std::chrono::steady_clock::time_point window_start{};
-    uint32_t pings{0}, settings{0}, resets{0}, empty_data{0};
+    uint32_t pings{0}, settings{0}, resets{0}, empty_data{0}, strays{0};
 };
 
 void h2_session_free::operator()(h2_session* s) const { delete s; }
@@ -148,7 +150,7 @@ void tick_window(h2_session& s)
     if (now - s.window_start > std::chrono::seconds(10))
     {
         s.window_start = now;
-        s.pings = s.settings = s.resets = s.empty_data = 0;
+        s.pings = s.settings = s.resets = s.empty_data = s.strays = 0;
     }
 }
 
@@ -199,7 +201,15 @@ bool storage_run::h2_preface_in(const std::shared_ptr<conn>& c, const char* p, s
     {
         const char ch = i < have ? c->in[i] : p[i - have];
         if (ch != pre[i])
+        {
+            // A client that began HTTP/2's request line and then got it wrong speaks neither; it is not answered.
+            if (i >= 14)
+            {
+                close_conn(c);
+                return true;
+            }
             return false;
+        }
     }
     if (have + n < pre.size())
     {
@@ -397,10 +407,10 @@ void storage_run::h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n)
                 auto it = s.streams.find(h.sid);
                 if (it == s.streams.end() || it->second->h2s->remote_closed)
                 {
-                    // The bytes are the connection's again. A stream this side ended may still have DATA on the way,
-                    // which is not an error; one whose END_STREAM came is (RFC 9113 5.1).
+                    // The bytes are the connection's again, and DATA on a closed stream is STREAM_CLOSED (RFC 9113
+                    // 5.1); the answers to a peer that keeps sending such are bounded like its resets.
                     s.recv_unacked += h.len;
-                    if (it != s.streams.end())
+                    if (++s.strays <= resets_max)
                         stream_error(h.sid, h2::STREAM_CLOSED);
                     break;
                 }
@@ -460,6 +470,14 @@ void storage_run::h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n)
                     conn_error(h2::PROTOCOL_ERROR);
                     break;
                 }
+                // A stream may not depend on itself (RFC 9113 5.3.1), which is its own error; the block is still
+                // decoded, so the table stays in step.
+                bool self_dependent = false;
+                if (h.flags & h2::PRIORITY_F)
+                {
+                    const size_t at_dep = (h.flags & h2::PADDED) ? 1 : 0;
+                    self_dependent = pl.size() >= at_dep + 4 && (h2::rd32(pl.data() + at_dep) & 0x7fffffffu) == h.sid;
+                }
                 if (!h2::unpad(h, pl))
                 {
                     conn_error(h2::PROTOCOL_ERROR);
@@ -487,6 +505,7 @@ void storage_run::h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n)
                 s.cont_end_stream = h.flags & h2::END_STREAM;
                 s.cont_trailers   = trailers;
                 s.cont_frames     = 0;
+                s.cont_refuse     = self_dependent;
                 if (h.flags & h2::END_HEADERS)
                 {
                     const uint32_t sid = s.cont_sid;
@@ -523,6 +542,8 @@ void storage_run::h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n)
                     conn_error(h2::PROTOCOL_ERROR);
                 else if (h.len != 5)
                     stream_error(h.sid, h2::FRAME_SIZE_ERROR);
+                else if ((h2::rd32(pl.data()) & 0x7fffffffu) == h.sid)
+                    stream_error(h.sid, h2::PROTOCOL_ERROR);
                 break;
             case h2::RST_STREAM:
             {
@@ -732,6 +753,11 @@ bool storage_run::h2_headers(const std::shared_ptr<conn>& c, uint32_t sid)
         h2::put_rst(s.ctl, sid, code);
         ++m_c.h2_resets_out;
     };
+    if (s.cont_refuse)
+    {
+        refuse(h2::PROTOCOL_ERROR);
+        return true;
+    }
     // A client told to go away, or one at its limit, has the stream refused, which it may try again elsewhere.
     if (s.goaway_sent || s.streams.size() >= max_streams)
     {
