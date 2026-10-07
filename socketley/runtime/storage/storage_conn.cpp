@@ -292,6 +292,11 @@ void storage_run::on_cqe(struct io_uring_cqe* cqe)
         accept_done(cqe);
         return;
     }
+    if (h3_owns(req))
+    {
+        h3_cqe(req, cqe->res);
+        return;
+    }
     if (req == &m_sweep_timer.req)
     {
         m_sweep_timer.armed = false;
@@ -594,6 +599,15 @@ void storage_run::on_turn()
 {
     if (!m_h2_due.empty())
         h2_turn();
+    // What the turn gave QUIC connections to send leaves in one write each; a stream whose bytes that write took
+    // goes on now, and what it writes in turn is sent before the loop sleeps.
+    for (int round = 0; m_h3 && round < 8; ++round)
+    {
+        h3_flush_dirty();
+        if (m_h2_due.empty())
+            break;
+        h2_turn();
+    }
     m_max_conns = m_owner.get_max_connections();
     m_node.flush_holds();
 }
@@ -611,6 +625,7 @@ void storage_run::stop()
         d->abort();
     m_log_deliveries.clear();
 
+    h3_stop();
     if (m_listen_fd >= 0)
     {
         ::shutdown(m_listen_fd, SHUT_RDWR);
@@ -682,7 +697,7 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
     c->dead    = true;
     c->closing = true;
     // A stream has no socket: what it held is let go and the session told, which resets it unless it ended.
-    if (c->h2s)
+    if (c->stream())
     {
         if (c->put)
             c->put->abort();
@@ -696,7 +711,10 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
         }
         c->after_write = conn::after_kind::none;
         c->on_body     = false;
-        h2_stream_gone(c);
+        if (c->h3s)
+            h3_stream_gone(c);
+        else
+            h2_stream_gone(c);
         m_streams.erase(c->id);
         return;
     }
@@ -842,6 +860,12 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
     {
         if (!c->dead)
             h2_pull(c);
+        return;
+    }
+    if (c->h3s)
+    {
+        if (!c->dead)
+            h3_pull(c);
         return;
     }
     if (c->dead || c->fd < 0 || c->paced)
@@ -1387,6 +1411,11 @@ void storage_run::queue_write(const std::shared_ptr<conn>& c, std::string data)
         h2_stream_out(c, std::move(data));
         return;
     }
+    if (c->h3s)
+    {
+        h3_stream_out(c, std::move(data));
+        return;
+    }
     if (c->ssl)
         c->wq += data;
     else if (c->wbuf.empty() && c->wq.empty())
@@ -1398,7 +1427,7 @@ void storage_run::queue_write(const std::shared_ptr<conn>& c, std::string data)
 
 void storage_run::pump_write(const std::shared_ptr<conn>& c)
 {
-    if (c->dead || c->wr_pending || c->h2s)
+    if (c->dead || c->wr_pending || c->stream())
         return;
     if (c->woff >= c->wbuf.size())
     {
@@ -1495,7 +1524,7 @@ std::string storage_run::response_head(const conn& c, const response& r, size_t 
     size_t need = 200 + reason.size() + cached_date.size() + 2 * c.req.request_id.size();
     for (const auto& [k, v] : r.headers)
         need += k.size() + v.size() + 4;
-    need += r.headers_raw.size() + c.cors_head.size();
+    need += r.headers_raw.size() + c.cors_head.size() + m_alt_svc.size();
     std::string h;
     h.reserve(need + room);
     auto number = [&h](uint64_t n)
@@ -1523,6 +1552,13 @@ std::string storage_run::response_head(const conn& c, const response& r, size_t 
     }
     h += r.headers_raw;
     h += c.cors_head;
+    // A client over TCP learns HTTP/3 is offered on the same port.
+    if (!m_alt_svc.empty() && !c.h3s)
+    {
+        h += "Alt-Svc: ";
+        h += m_alt_svc;
+        h += "\r\n";
+    }
     if (r.chunked)
         h += "Transfer-Encoding: chunked\r\n";
     else if (r.status != 204 && r.status != 304 && r.status != 100)
@@ -1750,6 +1786,11 @@ void storage_run::finish_request(const std::shared_ptr<conn>& c)
     if (c->h2s)
     {
         h2_stream_end(c);
+        return;
+    }
+    if (c->h3s)
+    {
+        h3_stream_end(c);
         return;
     }
     if (c->close_after_write)
@@ -2489,7 +2530,7 @@ void storage_run::send_file(const std::shared_ptr<conn>& c, response head, int f
     // A body worth the pipe goes file to socket in the kernel, and the rest is
     // read here and written from memory.
     // Not on a session: a splice moves bytes the record layer never sees.
-    c->spliced = !c->ssl && !c->h2s && len >= m_zero_copy_min && pipe_acquire(*c);
+    c->spliced = !c->ssl && !c->stream() && len >= m_zero_copy_min && pipe_acquire(*c);
     if (c->spliced)
         ++m_c.zero_copy_gets;
     else

@@ -569,6 +569,10 @@ static void append_storage_series(std::string& out, const std::vector<storage_ro
            "HTTP/2 streams a storage runtime reset.", "h2_resets_out");
     family("socketley_storage_http2_goaways_total", "counter",
            "HTTP/2 connections a storage runtime ended with GOAWAY.", "h2_goaways");
+    family("socketley_storage_http3_connections_total", "counter",
+           "QUIC connections a storage runtime served over HTTP/3.", "h3_conns");
+    family("socketley_storage_http3_streams_total", "counter",
+           "HTTP/3 streams a storage runtime opened, one per request.", "h3_streams");
 
     // The subsystems a runtime runs beside its requests: what waits, what went, what failed.
     static constexpr struct

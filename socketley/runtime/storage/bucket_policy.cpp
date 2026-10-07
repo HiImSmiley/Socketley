@@ -1070,11 +1070,20 @@ s3_action version_action(s3_action a)
 
 client_ip client_ip_of(int fd)
 {
-    client_ip ip;
     struct sockaddr_storage ss{};
     socklen_t len = sizeof(ss);
     if (fd < 0 || ::getpeername(fd, reinterpret_cast<struct sockaddr*>(&ss), &len) != 0)
+        return client_ip{};
+    return client_ip_from(reinterpret_cast<const struct sockaddr*>(&ss));
+}
+
+client_ip client_ip_from(const struct sockaddr* sa)
+{
+    client_ip ip;
+    struct sockaddr_storage ss{};
+    if (!sa)
         return ip;
+    std::memcpy(&ss, sa, sa->sa_family == AF_INET6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in));
     if (ss.ss_family == AF_INET)
     {
         ip.family = 4;

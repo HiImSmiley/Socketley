@@ -48,6 +48,9 @@
 #include "../../shared/http_framing.h"
 #include "../../shared/tls_context.h"
 
+// ngtcp2's packet header, named by an HTTP/3 member without its header.
+struct ngtcp2_pkt_hd;
+
 class storage_instance;
 
 namespace socketley::storage
@@ -103,6 +106,9 @@ struct storage_counters
     uint64_t h2_refused{0};
     uint64_t h2_resets_in{0};
     uint64_t h2_resets_out{0};
+    // HTTP/3 connections and streams opened.
+    uint64_t h3_conns{0};
+    uint64_t h3_streams{0};
     uint64_t h2_goaways{0};
     // Receives that found the buffer ring empty and were taken by the connection's own buffer instead.
     uint64_t recv_fallbacks{0};
@@ -287,6 +293,11 @@ struct h2_session;
 struct h2_stream;
 struct h2_session_free { void operator()(h2_session* s) const; };
 struct h2_stream_free { void operator()(h2_stream* s) const; };
+struct h3_endpoint;
+struct h3_conn;
+struct h3_stream;
+struct h3_endpoint_free { void operator()(h3_endpoint* e) const; };
+struct h3_stream_free { void operator()(h3_stream* s) const; };
 
 // What of a bucket's ACL, and of an object's own, a request of action `a` needs, none for one they say nothing to.
 uint8_t bucket_acl_need(s3_action a);
@@ -355,9 +366,15 @@ struct conn
     conn*        h2_parent{nullptr};
     // A request was read on the connection, so it is HTTP/1 and a preface is no longer looked for.
     bool         any_request{false};
+    // ── HTTP/3 ──────────────────────────────────────────────────────────────
+    // A stream of a QUIC connection, a conn with no socket like an HTTP/2 stream's; its connection's TLS session.
+    std::unique_ptr<h3_stream, h3_stream_free> h3s;
+    SSL*         quic_ssl{nullptr};
     // The socket and the TLS session the request came in on, the parent's for a stream.
     int  sock() const { return h2_parent ? h2_parent->fd : fd; }
-    SSL* tls() const { return h2_parent ? h2_parent->ssl : ssl; }
+    SSL* tls() const { return quic_ssl ? quic_ssl : (h2_parent ? h2_parent->ssl : ssl); }
+    // A stream of HTTP/2 or HTTP/3: no socket of its own.
+    bool stream() const { return h2s || h3s; }
 
     // ── TLS ─────────────────────────────────────────────────────────────────
     // Null on a cleartext connection.  With a session, what a recv brings is
@@ -595,6 +612,7 @@ public:
     // cleartext.
     void set_tls(std::unique_ptr<tls_context> ctx) { m_tls = std::move(ctx); }
     bool tls_enabled() const { return m_tls != nullptr; }
+    bool h3_enabled() const { return m_h3 != nullptr; }
     // The domains a Host of `<bucket>.<domain>` addresses a bucket under; none serves path style only.
     void set_website_domains(std::vector<std::string> d) { m_website_domains = std::move(d); }
     void set_domains(std::vector<std::string> d) { m_domains = std::move(d); }
@@ -728,6 +746,42 @@ public:
     bool h2_preface_in(const std::shared_ptr<conn>& c, const char* p, size_t n);
     bool h2_headers(const std::shared_ptr<conn>& c, uint32_t sid);
     void h2_sweep(const std::shared_ptr<conn>& c, std::chrono::steady_clock::time_point now);
+
+    // HTTP/3, in storage_h3.cpp: a UDP socket beside the TCP listener when --tls is on; datagrams in and out through
+    // the ring, each QUIC connection's streams conns as HTTP/2's are; a stream's DATA, its answer, its end.
+    bool h3_open(uint16_t port, uint16_t advertise, bool reuseport, const std::string& cert, const std::string& key);
+    bool h3_owns(io_request* req) const;
+    void h3_cqe(io_request* req, int res);
+    void h3_pull(const std::shared_ptr<conn>& c, std::string_view fresh = {});
+    void h3_stream_out(const std::shared_ptr<conn>& c, std::string data);
+    void h3_stream_end(const std::shared_ptr<conn>& c);
+    void h3_stream_gone(const std::shared_ptr<conn>& c);
+    bool h3_stream_drained(const conn& c) const;
+    void h3_flush_dirty();
+    void h3_stop();
+#if SOCKETLEY_HTTP3
+    void h3_arm_read();
+    void h3_packet(const sockaddr_storage& local, socklen_t local_len, const sockaddr_storage& remote,
+                   socklen_t remote_len, const uint8_t* data, size_t len);
+    std::shared_ptr<h3_conn> h3_new_conn(const ::ngtcp2_pkt_hd& hd, const sockaddr_storage& local,
+                                         socklen_t local_len, const sockaddr_storage& remote, socklen_t remote_len);
+    bool h3_app_ready(h3_conn& hc);
+    bool h3_begin(h3_conn& hc, int64_t sid);
+    void h3_request(conn& raw, bool fin);
+    void h3_data(conn& raw, std::string_view data);
+    void h3_data_end(conn& raw);
+    void h3_acked(conn& raw, uint64_t len);
+    void h3_stream_closed(h3_conn& hc, int64_t sid);
+    void h3_dirty(const std::shared_ptr<h3_conn>& hc);
+    void h3_dirty_raw(h3_conn& hc);
+    void h3_send(const sockaddr_storage& local, socklen_t local_len, const sockaddr_storage& remote,
+                 socklen_t remote_len, const uint8_t* data, size_t len, size_t gso);
+    void h3_write(const std::shared_ptr<h3_conn>& hc);
+    void h3_arm_timer();
+    void h3_expire();
+    void h3_close(const std::shared_ptr<h3_conn>& hc);
+    void h3_drop(const std::shared_ptr<h3_conn>& hc);
+#endif
     void close_conn(const std::shared_ptr<conn>& c);
     void maybe_release(const std::shared_ptr<conn>& c);
     void queue_write(const std::shared_ptr<conn>& c, std::string data);
@@ -1372,6 +1426,9 @@ private:
     std::vector<std::weak_ptr<conn>> m_h2_due;
     void h2_turn();
     void h2_go_on(const std::shared_ptr<conn>& sc);
+    // The HTTP/3 endpoint, when one is open, and the Alt-Svc line every answer over TCP then carries.
+    std::unique_ptr<h3_endpoint, h3_endpoint_free> m_h3;
+    std::string m_alt_svc;
     uint64_t    m_next_id{1};
 
     // Connections whose kernel operations have not all reported, kept so the

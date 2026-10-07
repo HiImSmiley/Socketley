@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -467,6 +468,29 @@ bool storage_instance::setup(event_loop& loop)
         m_graveyard.push_back(std::move(run));
         return false;
     }
+#if SOCKETLEY_HTTP3
+    // HTTP/3 on the same port over UDP, unless SOCKETLEY_STORAGE_HTTP3=0; a port it cannot have only leaves it out.
+    if (listen_path.empty() && get_tls())
+    {
+        // The port the Alt-Svc header names is this one unless SOCKETLEY_STORAGE_HTTP3_ADVERTISE says another --
+        // the one a proxy in front forwards UDP from -- or 0, for none.
+        const char* h3 = std::getenv("SOCKETLEY_STORAGE_HTTP3");
+        const char* adv = std::getenv("SOCKETLEY_STORAGE_HTTP3_ADVERTISE");
+        uint16_t advertise = effective_port();
+        if (adv && *adv)
+        {
+            unsigned v = 0;
+            const auto [end, ec] = std::from_chars(adv, adv + std::strlen(adv), v);
+            if (ec == std::errc{} && *end == '\0' && v <= 65535)
+                advertise = static_cast<uint16_t>(v);
+            else
+                LOG_WARN("storage: SOCKETLEY_STORAGE_HTTP3_ADVERTISE is not a port; the runtime's own is advertised");
+        }
+        if (!(h3 && std::string_view(h3) == "0"))
+            run->h3_open(effective_port(), advertise, get_shards() > 1, std::string(get_cert_path()),
+                         std::string(get_key_path()));
+    }
+#endif
     m_run = std::move(run);
 
     // And a node beside the port for callers already on this box.  Its failure
@@ -575,6 +599,9 @@ std::string storage_instance::stats_lines() const
         << "h2_resets_in:" << c.h2_resets_in << "\n"
         << "h2_resets_out:" << c.h2_resets_out << "\n"
         << "h2_goaways:" << c.h2_goaways << "\n"
+        << "h3:" << (m_run->h3_enabled() ? 1 : 0) << "\n"
+        << "h3_conns:" << c.h3_conns << "\n"
+        << "h3_streams:" << c.h3_streams << "\n"
         << "recv_fallbacks:" << c.recv_fallbacks << "\n"
         << "recv_cancels:" << c.recv_cancels << "\n"
         << "recv_direct_bytes:" << c.recv_direct_bytes << "\n"

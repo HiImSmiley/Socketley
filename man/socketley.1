@@ -9470,6 +9470,36 @@ and
 .B SOCKETLEY_STORAGE_HTTP2=0
 turns it off, so every client speaks HTTP/1.1.
 .
+.SS HTTP/3
+With
+.B \-\-tls
+a storage runtime also speaks HTTP/3 (RFC 9114) over QUIC (RFC 9000) on the
+same port number over UDP, when it was built with HTTP/3 (\fBstats\fR shows
+\fBh3:1\fR; \fBbin/build\-thirdparty.sh http3\fR builds the static OpenSSL 3.5,
+ngtcp2 and nghttp3 it needs, and the install script runs it). Every answer over
+TCP carries
+.B Alt\-Svc: h3=":PORT"
+so a browser tries QUIC on its next request and goes on over TCP if UDP does not
+reach; each request is a stream and runs exactly as over HTTP/1.1 and HTTP/2.
+A connection survives a client's change of network, and a lost packet holds up
+only its own stream, which is what HTTP/3 is for on mobile and lossy links; on a
+clean wire HTTP/2 costs less CPU per byte. A stream's window and a connection's
+start at 1 and 4 MiB and grow to 16 and 64 MiB, 128 streams are open at once,
+and a connection is let go after 30 seconds without a packet.
+Behind a reverse proxy, which forwards TCP only, the proxy passes the header
+on with the runtime's port: forward UDP from the port browsers reach (usually
+443, which the proxy does not take for UDP) to the runtime's, give it the
+certificate browsers expect, and set
+.B SOCKETLEY_STORAGE_HTTP3_ADVERTISE
+to that port, or to 0 to advertise none.
+.B stats
+counts
+.B h3_conns
+and
+.BR h3_streams .
+.B SOCKETLEY_STORAGE_HTTP3=0
+turns it off.
+.
 .SS Quotas
 A bucket's quota bounds the bytes its objects and versions hold and how many there
 are; it is socketley's own document, which S3 has no counterpart of:

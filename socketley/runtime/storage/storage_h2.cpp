@@ -20,6 +20,7 @@
 #include "../../shared/h2_frame.h"
 #include "../../shared/hpack.h"
 #include "../../shared/logging.h"
+#include "mux_head.h"
 
 namespace socketley::storage
 {
@@ -155,24 +156,6 @@ void tick_window(h2_session& s)
         s.window_start = now;
         s.pings = s.settings = s.resets = s.empty_data = s.strays = 0;
     }
-}
-
-bool lower_token(std::string_view n)
-{
-    if (n.empty())
-        return false;
-    for (const char ch : n)
-        if ((ch >= 'A' && ch <= 'Z') || static_cast<uint8_t>(ch) <= 0x20 || ch == ':' || ch == 0x7f)
-            return false;
-    return true;
-}
-
-bool clean_value(std::string_view v)
-{
-    for (const char ch : v)
-        if (ch == '\0' || ch == '\r' || ch == '\n')
-            return false;
-    return v.empty() || (v.front() != ' ' && v.front() != '\t' && v.back() != ' ' && v.back() != '\t');
 }
 
 }   // namespace
@@ -777,68 +760,20 @@ bool storage_run::h2_headers(const std::shared_ptr<conn>& c, uint32_t sid)
     if (res == hpack::decoder::result::too_large)
         answer_status = "431";
 
-    // The request as an HTTP/1.1 head, which parse_head() reads; RFC 9113 8.2 and 8.3 say what a request may hold.
-    std::string_view method, scheme, path, authority;
-    bool regular = false, bad = false;
-    std::string head, cookies;
-    bool has_cl = false, has_host = false;
-    uint64_t cl = 0;
-    for (const auto& f : fields)
-    {
-        if (!f.name.empty() && f.name[0] == ':')
-        {
-            std::string_view* slot = f.name == ":method" ? &method : f.name == ":scheme" ? &scheme
-                                   : f.name == ":path" ? &path : f.name == ":authority" ? &authority : nullptr;
-            if (!slot || regular || !slot->empty() || f.value.empty())
-            {
-                bad = true;
-                break;
-            }
-            *slot = f.value;
-            continue;
-        }
-        regular = true;
-        if (!lower_token(f.name) || !clean_value(f.value) || f.name == "connection" || f.name == "keep-alive" ||
-            f.name == "proxy-connection" || f.name == "transfer-encoding" || f.name == "upgrade" ||
-            (f.name == "te" && f.value != "trailers"))
-        {
-            bad = true;
-            break;
-        }
-        if (f.name == "cookie")
-        {
-            cookies += cookies.empty() ? "" : "; ";
-            cookies += f.value;
-            continue;
-        }
-        if (f.name == "content-length")
-        {
-            const auto r = std::from_chars(f.value.data(), f.value.data() + f.value.size(), cl);
-            if (r.ec != std::errc{} || r.ptr != f.value.data() + f.value.size() || has_cl)
-            {
-                bad = true;
-                break;
-            }
-            has_cl = true;
-        }
-        has_host = has_host || f.name == "host";
-        head += f.name;
-        head += ": ";
-        head += f.value;
-        head += "\r\n";
-    }
-    if (!bad && answer_status.empty() && (method.empty() || method == "CONNECT" || scheme.empty() || path.empty()))
-        bad = true;
-    if (bad)
+    // The request as the HTTP/1.1 head parse_head() reads.
+    std::vector<std::pair<std::string, std::string>> list;
+    list.reserve(fields.size());
+    for (auto& f : fields)
+        list.emplace_back(std::move(f.name), std::move(f.value));
+    mux_request mr;
+    const mux_verdict verdict = mux_request_head(list, s.cont_end_stream, max_head, mr);
+    if (verdict == mux_verdict::malformed && answer_status.empty())
     {
         refuse(h2::PROTOCOL_ERROR);
         return true;
     }
-    if (s.cont_end_stream && has_cl && cl != 0)
-    {
-        refuse(h2::PROTOCOL_ERROR);
-        return true;
-    }
+    if (verdict == mux_verdict::too_large)
+        answer_status = "431";
 
     auto sc = std::make_shared<conn>();
     sc->run       = this;
@@ -854,37 +789,13 @@ bool storage_run::h2_headers(const std::shared_ptr<conn>& c, uint32_t sid)
     st.sid           = sid;
     st.send_win      = s.peer_init_win;
     st.remote_closed = s.cont_end_stream;
-    st.has_cl        = has_cl;
-    st.cl            = cl;
-    st.synth_chunked = !s.cont_end_stream && !has_cl;
+    st.has_cl        = mr.has_cl;
+    st.cl            = mr.cl;
+    st.synth_chunked = mr.synth_chunked;
     m_streams[sc->id] = sc;
     s.streams[sid]    = sc;
     ++m_c.h2_streams;
-
-    std::string line;
-    line.reserve(head.size() + path.size() + authority.size() + cookies.size() + 64);
-    line += method;
-    line += ' ';
-    line += path;
-    line += " HTTP/1.1\r\n";
-    if (!has_host && !authority.empty())
-    {
-        line += "host: ";
-        line += authority;
-        line += "\r\n";
-    }
-    line += head;
-    if (!cookies.empty())
-    {
-        line += "cookie: ";
-        line += cookies;
-        line += "\r\n";
-    }
-    if (st.synth_chunked)
-        line += "transfer-encoding: chunked\r\n";
-    line += "\r\n";
-    if (line.size() > max_head)
-        answer_status = "431";
+    const std::string& line = mr.line;
     if (!answer_status.empty())
     {
         new_request_id(sc->req.request_id);
@@ -1034,35 +945,12 @@ void storage_run::h2_stream_out(const std::shared_ptr<conn>& c, std::string data
                 block += '\x20';
                 s.first_block = false;
             }
-            const size_t sp = head.find(' ');
-            const std::string_view status = sp == std::string_view::npos ? "500" : head.substr(sp + 1, 3);
-            hpack::encode(block, ":status", status);
-            bool chunked = false;
-            size_t at = head.find("\r\n") + 2;
-            while (at < head.size())
-            {
-                const size_t eol = head.find("\r\n", at);
-                const std::string_view l = head.substr(at, eol - at);
-                at = eol + 2;
-                const size_t colon = l.find(':');
-                if (colon == std::string_view::npos)
-                    continue;
-                std::string name(l.substr(0, colon));
-                for (char& ch : name)
-                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-                std::string_view value = l.substr(colon + 1);
-                while (!value.empty() && value.front() == ' ')
-                    value.remove_prefix(1);
-                if (name == "transfer-encoding")
-                {
-                    chunked = value.find("chunked") != std::string_view::npos;
-                    continue;
-                }
-                if (name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "upgrade")
-                    continue;
+            mux_response mr;
+            mux_response_head(head, mr);
+            hpack::encode(block, ":status", mr.status);
+            for (const auto& [name, value] : mr.fields)
                 hpack::encode(block, name, value);
-            }
-            const bool interim = status.size() == 3 && status[0] == '1';
+            const bool interim = mr.interim, chunked = mr.chunked;
             h2::put_header_block(st.hdr, st.sid, block, false, s.peer_max_frame);
             st.head_acc.clear();
             if (!interim)
@@ -1247,8 +1135,14 @@ void storage_run::h2_schedule(const std::shared_ptr<conn>& c)
 // connection: the next piece of its file is read, or its answer ends.
 void storage_run::h2_go_on(const std::shared_ptr<conn>& sc)
 {
-    if (sc->dead || !sc->h2s || sc->after_write == conn::after_kind::none || !sc->h2s->hdr.empty() ||
-        sc->h2s->tx_left() || sc->h2s->os == h2_stream::out_state::head)
+    if (sc->dead || sc->after_write == conn::after_kind::none)
+        return;
+    if (sc->h3s)
+    {
+        if (!h3_stream_drained(*sc))
+            return;
+    }
+    else if (!sc->h2s || !sc->h2s->hdr.empty() || sc->h2s->tx_left() || sc->h2s->os == h2_stream::out_state::head)
         return;
     const conn::after_kind next = sc->after_write;
     sc->after_write = conn::after_kind::none;

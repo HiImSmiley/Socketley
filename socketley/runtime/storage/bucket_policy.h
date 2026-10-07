@@ -10,6 +10,7 @@
 // on the keys a request here carries.  Anything else is refused as
 // MalformedPolicy, never accepted to do less than it says.
 #include <cstdint>
+#include <sys/socket.h>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -132,8 +133,9 @@ struct client_ip
     uint8_t addr[16]{};
 };
 
-// The address of the peer of a connected socket.
+// The address of the peer of a connected socket, and an address as a datagram's sender gives it.
 client_ip client_ip_of(int fd);
+client_ip client_ip_from(const struct sockaddr* sa);
 
 // What a request says to a condition key, which only the runtime that parsed it can tell.
 class policy_context
