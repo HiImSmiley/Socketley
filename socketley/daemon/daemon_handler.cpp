@@ -17,8 +17,19 @@
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
 #include "../shared/dns_feed.h"
+#include "../shared/runtime_names.h"
 
 static void publish_dns_names(runtime_manager& manager);
+
+// Why `rt`'s names may not stand beside every other runtime's (runtime_names.h), empty when they may.
+static std::string names_refusal(runtime_manager& manager, const runtime_instance& rt)
+{
+    std::shared_lock lock(manager.mutex);
+    std::vector<const runtime_instance*> others;
+    for (const auto& [name, inst] : manager.list())
+        others.push_back(inst.get());
+    return runtime_names::refusal(rt, others);
+}
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
@@ -833,40 +844,17 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
 static void publish_dns_names(runtime_manager& manager)
 {
     std::vector<std::string> names;
-    const auto add_list = [&](std::string_view csv, bool with_wildcard)
-    {
-        for (size_t p = 0; p <= csv.size();)
-        {
-            const size_t comma = std::min(csv.find(',', p), csv.size());
-            std::string n(csv.substr(p, comma - p));
-            while (!n.empty() && n.front() == ' ')
-                n.erase(0, 1);
-            while (!n.empty() && n.back() == ' ')
-                n.pop_back();
-            if (std::string why; !n.empty() && dns_feed::valid_name(n, why))
-            {
-                if (with_wildcard && !n.starts_with("*."))
-                    names.push_back("*." + n);
-                names.push_back(std::move(n));
-            }
-            p = comma + 1;
-        }
-    };
     {
         std::shared_lock lock(manager.mutex);
         for (const auto& [name, inst] : manager.list())
         {
             if (!inst)
                 continue;
-            if (inst->get_type() == runtime_storage)
-            {
-                const auto* stg = static_cast<const storage_instance*>(inst.get());
-                add_list(stg->get_domain(), true);
-                add_list(stg->get_website_domain(), true);
-            }
-            add_list(inst->get_domains(), false);
+            for (auto& n : runtime_names::of(*inst, /*with_buckets=*/true))
+                names.push_back(std::move(n));
             for (const auto& d : inst->get_acme_domains())
-                add_list(d, false);
+                if (std::string why; dns_feed::valid_name(d, why))
+                    names.push_back(runtime_names::normal(d));
         }
     }
     static bool warned = false;
@@ -1465,6 +1453,14 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     // which is the first point the question can be answered, and refusing here
     // keeps the runtime from being created at all.
     if (const std::string msg = instance_tls_refusal(instance); !msg.empty())
+    {
+        std::cout << msg;
+        m_manager.remove(name);
+        return 1;
+    }
+
+    // A name belongs to one runtime, checked once every flag is in.
+    if (const std::string msg = names_refusal(m_manager, *instance); !msg.empty())
     {
         std::cout << msg;
         m_manager.remove(name);
@@ -3679,6 +3675,13 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
+    if (const std::string msg = names_refusal(m_manager, *instance); !msg.empty())
+    {
+        restore_edit();
+        std::cout << msg;
+        return 1;
+    }
+
     // The shard set, checked here because --listen and --shards are both
     // editable and either can complete an incompatible pair, and rolled back
     // the same way.
@@ -4198,6 +4201,38 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     // '{"name":"c"}'` silently took a runtime's TLS away -- clearing is still
     // possible and now has to be written.
     const auto has = [&cfg](const char* key) { return cfg.has(key); };
+
+    // The names the document gives, judged before anything is applied: put in place for the question and taken
+    // back, so a refusal leaves the runtime as it was.
+    {
+        const std::string old_domains(instance->get_domains()), old_group(instance->get_group());
+        std::string old_stg_domain, old_stg_website;
+        auto* stg = type == runtime_storage ? static_cast<storage_instance*>(instance) : nullptr;
+        if (stg)
+        {
+            old_stg_domain = std::string(stg->get_domain());
+            old_stg_website = std::string(stg->get_website_domain());
+            if (has("domain"))         stg->set_domain(cfg.storage_domain);
+            if (has("website_domain")) stg->set_website_domain(cfg.storage_website_domain);
+        }
+        else if (has("domain"))
+            instance->set_domains(cfg.domains);
+        if (has("group"))
+            instance->set_group(cfg.group);
+        const std::string msg = names_refusal(m_manager, *instance);
+        instance->set_domains(old_domains);
+        instance->set_group(old_group);
+        if (stg)
+        {
+            stg->set_domain(old_stg_domain);
+            stg->set_website_domain(old_stg_website);
+        }
+        if (!msg.empty())
+        {
+            conn->write_buf = msg;
+            return 1;
+        }
+    }
 
     if (has("port"))              instance->set_port(cfg.port);
     if (has("listen"))            instance->set_listen_path(cfg.listen_path);
