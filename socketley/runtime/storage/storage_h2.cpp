@@ -996,6 +996,10 @@ void storage_run::h2_stream_out(const std::shared_ptr<conn>& c, std::string data
         st.dechunk_in.erase(0, st.dechunk_in.size() - view.size());
     }
     c->last_progress = std::chrono::steady_clock::now();
+    // An answer handed over whole -- send_response's -- ends the stream with its last DATA frame rather than an empty
+    // one sent a turn later; a chunked one ends with its last chunk, which cannot be seen coming.
+    if (c->after_write == conn::after_kind::finish && st.os == h2_stream::out_state::body)
+        st.end_pending = true;
     enqueue(s, st);
     if (auto p = find(parent->id))
         h2_schedule(p);

@@ -1300,6 +1300,11 @@ void storage_run::h3_stream_out(const std::shared_ptr<conn>& c, std::string data
         }
     }
     c->last_progress = std::chrono::steady_clock::now();
+    // An answer handed over whole -- send_response's, whose end is already decided -- carries the stream's end with
+    // its last bytes, in the same packet, instead of in one of its own a turn later; finish_request still follows
+    // for the rest. A chunked one ends with its last chunk, which the stream cannot see coming.
+    if (c->after_write == conn::after_kind::finish && st.submitted && st.os == h3_stream::out_state::body)
+        st.end_pending = true;
     if (st.submitted && st.blocked)
     {
         st.blocked = false;
