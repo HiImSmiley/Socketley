@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "../../shared/dns_feed.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/ip_block.h"
 #include "../../shared/logging.h"
@@ -128,7 +129,8 @@ std::vector<std::string> split_csv(std::string_view s)
 }
 
 // Every zone of `paths`, read and checked, one apex each; false with the reason.
-bool load_all(const std::vector<std::string>& paths, zone_set& out, std::string& why)
+bool load_all(const std::vector<std::string>& paths, zone_set& out, std::string& why,
+              const extra_records* extra = nullptr)
 {
     out.zones.clear();
     for (const auto& p : paths)
@@ -136,6 +138,8 @@ bool load_all(const std::vector<std::string>& paths, zone_set& out, std::string&
         auto z = std::make_shared<zone>();
         if (!load_zone(p, {}, *z, why))
             return false;
+        if (extra)
+            add_extra(*z, *extra);
         for (const auto& other : out.zones)
             if (other->origin == z->origin)
             {
@@ -143,6 +147,26 @@ bool load_all(const std::vector<std::string>& paths, zone_set& out, std::string&
                 return false;
             }
         out.zones.push_back(std::move(z));
+    }
+    return true;
+}
+
+// The addresses --publish names, each in wire form; false naming the one that is no address.
+bool parse_publish(std::string_view csv, std::vector<std::string>& v4, std::vector<std::string>& v6, std::string& bad)
+{
+    for (const auto& a : split_csv(csv))
+    {
+        in_addr a4{};
+        in6_addr a6{};
+        if (::inet_pton(AF_INET, a.c_str(), &a4) == 1)
+            v4.emplace_back(reinterpret_cast<const char*>(&a4), 4);
+        else if (::inet_pton(AF_INET6, a.c_str(), &a6) == 1)
+            v6.emplace_back(reinterpret_cast<const char*>(&a6), 16);
+        else
+        {
+            bad = a;
+            return false;
+        }
     }
     return true;
 }
@@ -282,6 +306,8 @@ private:
         j.fd = -1;
     }
     void count(const answer_meta& m);
+    // What the rest of socketley has asked to be published (dns_feed.h), as records for the zones.
+    extra_records feed_extra();
 
     dns_instance& m_owner;
     event_loop&   m_loop;
@@ -290,6 +316,9 @@ private:
 
     std::shared_ptr<const zone_set> m_zones;
     std::vector<std::string> m_paths;
+    // The addresses runtimes' names are given (--publish), and when the feed was last read.
+    std::vector<std::string> m_v4, m_v6;
+    int64_t m_feed_stamp{-1};
     std::vector<ip_block> m_transfer;
     std::vector<std::pair<sockaddr_storage, socklen_t>> m_notify_to;
     std::vector<notify_job> m_notify;
@@ -326,8 +355,14 @@ private:
 bool dns_run::start(std::string& why)
 {
     m_paths = m_owner.zone_paths();
+    if (std::string bad; !parse_publish(m_owner.get_publish(), m_v4, m_v6, bad))
+    {
+        why = "--publish: '" + bad + "' is not an address";
+        return false;
+    }
     auto zs = std::make_shared<zone_set>();
-    if (!load_all(m_paths, *zs, why))
+    const extra_records extra = feed_extra();
+    if (!load_all(m_paths, *zs, why, &extra))
         return false;
     m_zones = zs;
 
@@ -1040,9 +1075,28 @@ void dns_run::tick()
 
 // A zone file changed on disk is read again; the new zone is served once it has been read whole and checked, and the
 // old one kept, with the reason logged, when it is not a zone.
+extra_records dns_run::feed_extra()
+{
+    extra_records x;
+    dns_feed::snapshot s = dns_feed::read();
+    m_feed_stamp = s.stamp_ns;
+    // Names are published only where there are addresses to give them; DNS-01 answers always.
+    if (!m_v4.empty() || !m_v6.empty())
+        x.names = std::move(s.names);
+    x.v4 = m_v4;
+    x.v6 = m_v6;
+    x.challenges = std::move(s.challenges);
+    // Seconds since November 2023 that the feed last changed: it only grows, so the serial a secondary sees grows
+    // whenever the feed or the file changes, and is the same in every shard and after every restart.
+    constexpr int64_t base = 1700000000;
+    if (s.stamp_ns > 0)
+        x.serial_add = static_cast<uint32_t>(std::max<int64_t>(0, s.stamp_ns / 1000000000 - base));
+    return x;
+}
+
 void dns_run::check_zones()
 {
-    bool changed = false;
+    bool changed = dns_feed::stamp_ns() != m_feed_stamp;
     for (const auto& z : m_zones->zones)
     {
         struct stat st{};
@@ -1056,7 +1110,8 @@ void dns_run::check_zones()
         return;
     auto next = std::make_shared<zone_set>();
     std::string why;
-    if (!load_all(m_paths, *next, why))
+    const extra_records extra = feed_extra();
+    if (!load_all(m_paths, *next, why, &extra))
     {
         ++m_c.reload_failures;
         LOG_ERROR(("dns: zone not reloaded, still serving the one before: " + why).c_str());
@@ -1262,6 +1317,9 @@ std::string dns_instance::config_refusal() const
         if (!socketley::dns::parse_target(t, ss, len))
             return "dns: --notify takes addresses, with a port if not 53, not '" + t + "'\n";
     }
+    std::vector<std::string> v4, v6;
+    if (std::string bad; !socketley::dns::parse_publish(m_publish, v4, v6, bad))
+        return "dns: --publish takes IPv4 and IPv6 addresses, not '" + bad + "'\n";
     return {};
 }
 

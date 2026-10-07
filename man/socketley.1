@@ -825,13 +825,17 @@ socketley daemon stats
 .fi
 .RE
 .TP
-.B acme issue \-\-domains \fIname\fR[\fB,\fIname\fR...] \fR[\fB\-\-cert \fIfile\fR] [\fB\-\-key \fIfile\fR] [\fB\-\-email \fIaddress\fR] [\fB\-\-directory \fIurl\fR] [\fB\-\-challenge http\-01\fR|\fBtls\-alpn\-01\fR]
+.B acme issue \-\-domains \fIname\fR[\fB,\fIname\fR...] \fR[\fB\-\-cert \fIfile\fR] [\fB\-\-key \fIfile\fR] [\fB\-\-email \fIaddress\fR] [\fB\-\-directory \fIurl\fR] [\fB\-\-challenge http\-01\fR|\fBtls\-alpn\-01\fR|\fBdns\-01\fR]
 A certificate from an ACME CA by hand, as certbot gives one: the account is made
 once per CA and kept in
 .IR state\-dir /.acme/,
 the names are proven over HTTP-01 by the daemon's runtimes on port 80, or with
 .B "\-\-challenge tls\-alpn\-01"
-by its TLS runtime on port 443, as
+by its TLS runtime on port 443, or with
+.B "\-\-challenge dns\-01"
+\(em which a wildcard takes by itself \(em by a
+.B dns
+runtime of the daemon that serves the name's zone, as
 .B \-\-acme
 describes, and the chain and a new key are written to the files, the key first,
 by default those
@@ -2314,14 +2318,56 @@ of the daemon answers that path on any port, for a token the daemon is waiting
 on, before it routes, serves or runs a script, so a runtime on port 80 \(em the
 proxy that redirects to HTTPS, say \(em is all it takes. Any other token goes
 where the path would have gone, so a site's own files there, as certbot's
-webroot writes them, are served as before. A name is a DNS name with a dot: a wildcard, which needs
-DNS-01, and an address are refused.
+webroot writes them, are served as before. A name is a DNS name with a dot; an address is refused.
+.IP
+A wildcard,
+.BR *.example.com ,
+is proven over DNS-01, the one challenge that can: the answer goes to the
+daemon's
+.B dns
+runtimes as the TXT record of
+.BI _acme\-challenge. name
+(see
+.B Names runtimes are reached by
+under
+.BR "DNS FLAGS" ),
+the CA is told to look
+.B SOCKETLEY_ACME_DNS_WAIT
+seconds later, and the record is gone once it has. It needs a
+.B dns
+runtime of the same daemon that is authoritative for the zone, and, if the zone
+has secondaries, the time for them to take the new serial.
+.B SOCKETLEY_ACME_CHALLENGE=dns\-01
+proves every name that way, for a host whose port 80 is closed.
 .IP
 .nf
 socketley create proxy web \-p 443 \-\-acme example.com,www.example.com \\
     \-\-acme\-email ops@example.com \-\-backend 127.0.0.1:8080 \-s
 socketley create proxy plain \-p 80 \-\-backend 127.0.0.1:8080 \-s
 .fi
+.TP
+.BI "\-\-domain " "name" \fR[\fB,\fIname\fR...]
+The names the runtime is reached by, which a
+.B dns
+runtime with
+.B \-\-publish
+answers for with this machine's addresses: a name without a dot is taken under
+each zone it serves
+.RB ( chat
+is
+.B chat.example.com
+for
+.BR example.com ),
+one with a dot as written, and
+.BI *. name
+covers every name beneath. A runtime removed takes its names with it. On a
+.B storage
+runtime the flag is its own and also names the virtual hosts of its buckets
+(see
+.BR "STORAGE FLAGS" ),
+which are published with the wildcard beneath it. The names of
+.B \-\-acme
+are published too.
 .TP
 .BI "\-g " "name"
 .TQ
@@ -10643,6 +10689,17 @@ comma\-separated, when the runtime starts and whenever a zone's serial changes.
 A NOTIFY is sent again after 1, 3, 7, 15 and 31 seconds until the secondary
 answers it. Only the first shard sends them.
 .TP
+.BI \-\-publish " list"
+This machine's public addresses, IPv4 and IPv6, comma\-separated: every name a
+runtime of the daemon is reached by
+.RB ( \-\-domain ,
+.BR \-\-acme ,
+a storage runtime's
+.B \-\-domain
+and
+.BR \-\-website\-domain )
+that falls within a zone is answered with them. Without it no such name is.
+.TP
 .BI \-\-rrl " n"
 Response rate limiting: at most
 .I n
@@ -10652,6 +10709,35 @@ the query) and the others are dropped. A resolver behind that network retries
 over TCP, which is not limited, and is served; a victim whose address a
 flood forges receives nothing larger than what was sent. 100 by default, 0 for
 no limit.
+.SS Names runtimes are reached by
+The daemon writes the names its runtimes are reached by into
+.IR state\-dir /.dns/names
+whenever they change, and
+.B acme issue
+writes a DNS\-01 answer there as
+.BI acme\- token
+while a CA checks it. A
+.B dns
+runtime looks at that directory once a second, as it looks at its zone files,
+and adds to each zone the names within it, with the addresses of
+.BR \-\-publish ,
+TTL 300, and the answers, as TXT records of
+.BI _acme\-challenge. name ,
+TTL 10. What the zone file says of a name wins: a name with addresses of its
+own, or an alias, keeps them, and nothing is added beneath a delegation.
+.PP
+.nf
+socketley create dns ns \-\-zone /etc/zones/example.com.zone \\
+    \-\-publish 203.0.113.7,2001:db8::7 \-s
+socketley create storage files \-p 9301 \-\-domain files.example.com ...
+dig files.example.com            # 203.0.113.7
+dig photos.files.example.com     # 203.0.113.7
+.fi
+.PP
+So that a secondary notices, the serial a zone is served with is its file's plus
+the seconds from 2023\-11\-14 to when that directory last changed: it grows with
+every change of the file's serial and of the published records, and is the same
+in every shard and after every restart.
 .SS What it answers
 A name found is answered with its records, authoritatively. A CNAME is
 followed, up to eight steps, while its target is in the same zone. A wildcard
@@ -15061,6 +15147,29 @@ use. Default: Let's Encrypt,
 its staging CA is
 .BR https://acme\-staging\-v02.api.letsencrypt.org/directory .
 Each CA has an account of its own.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_ACME_CHALLENGE
+The challenge
+.B acme issue
+and
+.B \-\-acme
+prove a name with when none is asked for:
+.BR http\-01 ,
+the default,
+.B tls\-alpn\-01
+or
+.BR dns\-01 .
+A wildcard is proven over DNS\-01 whatever this says.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_ACME_DNS_WAIT
+Seconds between putting a DNS\-01 answer where the
+.B dns
+runtimes serve it and telling the CA to look: the time a secondary of the zone
+has to take the new serial. Default 10, at most 3600.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

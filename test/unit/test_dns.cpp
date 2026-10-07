@@ -542,3 +542,49 @@ TEST_CASE("transfer: SOA, every record, SOA, across messages")
     CHECK(r.aa());
     CHECK(r.qd == 1);
 }
+
+TEST_CASE("published names and DNS-01 answers join a zone; what the file says wins")
+{
+    zone z = load(example_zone);
+    const uint32_t before = z.serial;
+    extra_records x;
+    x.names = {"chat", "api.example.com", "*.files.example.com", "files.example.com", "www", "mail",
+               "other.example.org", "host.sub.example.com", "deep.new.example.com."};
+    x.v4 = {std::string("\xc6\x33\x64\x0a", 4)};
+    x.v6 = {std::string(16, '\x01')};
+    x.challenges = {{"example.com", "abc"}, {"example.com", "def"}, {"example.org", "nope"}};
+    x.serial_add = 1000;
+    add_extra(z, x);
+    const auto zs = one(z);
+
+    auto a = ask(zs, query("chat.example.com.", type::A));
+    REQUIRE(a.r.an == 1);
+    CHECK(a.r.rrs[0].rdata == std::string("\xc6\x33\x64\x0a", 4));
+    CHECK(a.r.rrs[0].ttl == published_ttl);
+    CHECK(ask(zs, query("chat.example.com.", type::AAAA)).r.an == 1);
+    CHECK(ask(zs, query("api.example.com.", type::A)).r.an == 1);
+    CHECK(ask(zs, query("bucket.files.example.com.", type::A)).r.an == 1);
+    CHECK(ask(zs, query("deep.new.example.com.", type::A)).r.an == 1);
+    // The names on the way to a new one exist, empty.
+    a = ask(zs, query("new.example.com.", type::A));
+    CHECK(a.r.rcode() == rcode::NOERROR);
+    CHECK(a.r.an == 0);
+    // An alias keeps being one, and a name with an address of its own keeps that address.
+    a = ask(zs, query("www.example.com.", type::A));
+    REQUIRE(a.r.an == 2);
+    CHECK(a.r.rrs[0].type == type::CNAME);
+    a = ask(zs, query("mail.example.com.", type::A));
+    REQUIRE(a.r.an == 1);
+    CHECK(a.r.rrs[0].rdata == std::string("\xc0\x00\x02\x19", 4));
+    // Outside the zone, or beneath a delegation, nothing is added.
+    CHECK(ask(zs, query("host.sub.example.com.", type::A)).meta.referral);
+    // Both DNS-01 answers of a name, as one set.
+    a = ask(zs, query("_acme-challenge.example.com.", type::TXT));
+    REQUIRE(a.r.an == 2);
+    CHECK(a.r.rrs[0].ttl == challenge_ttl);
+    // The serial grew, and the SOA record carries it -- what a secondary compares.
+    CHECK(z.serial == before + 1000);
+    a = ask(zs, query("example.com.", type::SOA));
+    REQUIRE(a.r.an == 1);
+    CHECK(rd32(reinterpret_cast<const uint8_t*>(a.r.rrs[0].rdata.data()) + a.r.rrs[0].rdata.size() - 20) == before + 1000);
+}

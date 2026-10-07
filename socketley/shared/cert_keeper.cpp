@@ -169,7 +169,9 @@ void spawn_issue(acme_state& a)
     std::vector<std::string> args = {"socketley", "acme", "issue", "--domains", names, "--cert", a.cert, "--key", a.key};
     if (!a.email.empty())
         args.insert(args.end(), {"--email", a.email});
-    if (a.tls_alpn)
+    // A wildcard goes over DNS-01, which `acme issue` picks by itself; anything else over the listener on 443.
+    const bool wildcard = std::any_of(a.domains.begin(), a.domains.end(), [](const std::string& d) { return d.starts_with("*."); });
+    if (a.tls_alpn && !wildcard)
         args.insert(args.end(), {"--challenge", "tls-alpn-01"});
     std::vector<char*> argv;
     for (std::string& s : args)

@@ -52,6 +52,11 @@ public:
     void set_notify(std::string_view csv) { m_notify = std::string(csv); }
     std::string_view get_notify() const { return m_notify; }
 
+    // The addresses the names runtimes are reached by are given (--publish): IPv4 and IPv6, comma-separated. Empty
+    // publishes none of them.
+    void set_publish(std::string_view csv) { m_publish = std::string(csv); }
+    std::string_view get_publish() const { return m_publish; }
+
     // Response rate limiting (--rrl), per second for one client's /24 or /56.
     void set_rrl(uint32_t per_sec) { m_rrl = per_sec; }
     uint32_t get_rrl() const { return m_rrl; }
@@ -71,6 +76,7 @@ private:
     std::string m_zones;
     std::string m_transfer;
     std::string m_notify;
+    std::string m_publish;
     uint32_t    m_rrl{dns_default_rrl};
 
     std::unique_ptr<socketley::dns::dns_run> m_run;

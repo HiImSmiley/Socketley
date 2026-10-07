@@ -132,6 +132,7 @@ constexpr config_key config_keys[] = {
     { "zone",               "--zone",               key_kind::list    },
     { "transfer",           "--transfer",           key_kind::list    },
     { "notify",             "--notify",             key_kind::list    },
+    { "publish",            "--publish",            key_kind::list    },
     { "rrl",                "--rrl",                key_kind::integer },
 };
 

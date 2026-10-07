@@ -103,6 +103,8 @@ void apply_dns_config(dns_instance& dns, const runtime_config& cfg, bool by_pres
         dns.set_transfer(cfg.dns_transfer);
     if (asked("notify", !cfg.dns_notify.empty()))
         dns.set_notify(cfg.dns_notify);
+    if (asked("publish", !cfg.dns_publish.empty()))
+        dns.set_publish(cfg.dns_publish);
     if (asked("rrl", true))
         dns.set_rrl(cfg.dns_rrl);
 }
@@ -182,6 +184,7 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
     if (!cfg.key_path.empty())       rt.set_key_path(cfg.key_path);
     if (!cfg.acme_domains.empty())   rt.set_acme_domains(cfg.acme_domains);
     if (!cfg.acme_email.empty())     rt.set_acme_email(cfg.acme_email);
+    if (!cfg.domains.empty())        rt.set_domains(cfg.domains);
     if (!cfg.ca_path.empty())        rt.set_ca_path(cfg.ca_path);
     if (!cfg.target.empty())         rt.set_target(cfg.target);
     if (!cfg.cache_name.empty())     rt.set_cache_name(cfg.cache_name);

@@ -1,5 +1,6 @@
 // `socketley acme issue`: a certificate from an ACME CA (RFC 8555), Let's Encrypt unless told otherwise, proven over
-// HTTP-01 by the challenge files every socketley HTTP runtime serves. A runtime with --acme runs it as a child of its
+// HTTP-01 by the challenge files every socketley HTTP runtime serves, over TLS-ALPN-01 by a TLS listener, or over
+// DNS-01 by the TXT records a dns runtime serves from the feed (dns_feed.h) -- the one way to a wildcard. A runtime with --acme runs it as a child of its
 // worker; an operator may run it by hand, as certbot is run. Blocking on purpose: it is its own process.
 #include <fcntl.h>
 #include <netdb.h>
@@ -30,6 +31,7 @@
 #include <vector>
 
 #include "../shared/cert_keeper.h"
+#include "../shared/dns_feed.h"
 #include "../shared/tls_context.h"
 #include "../runtime/storage/json_doc.h"
 
@@ -596,7 +598,7 @@ bool poll(client& c, const std::string& url, std::string_view want, jvalue& doc,
 int issue(int argc, char** argv)
 {
     std::vector<std::string> names;
-    std::string cert, key, email, challenge = "http-01";
+    std::string cert, key, email, challenge;
     std::string dir = std::getenv("SOCKETLEY_ACME_DIRECTORY") && *std::getenv("SOCKETLEY_ACME_DIRECTORY")
                           ? std::getenv("SOCKETLEY_ACME_DIRECTORY")
                           : std::string(lets_encrypt);
@@ -630,7 +632,7 @@ int issue(int argc, char** argv)
         else if (a == "--directory")
             ok = value(dir);
         else if (a == "--challenge")
-            ok = value(challenge) && (challenge == "http-01" || challenge == "tls-alpn-01");
+            ok = value(challenge) && (challenge == "http-01" || challenge == "tls-alpn-01" || challenge == "dns-01");
         else
             ok = false;
         if (!ok)
@@ -642,7 +644,25 @@ int issue(int argc, char** argv)
     if (names.empty())
     {
         std::cout << "usage: socketley acme issue --domains name[,name...] [--cert file] [--key file] [--email addr] "
-                     "[--directory url] [--challenge http-01|tls-alpn-01]\n";
+                     "[--directory url] [--challenge http-01|tls-alpn-01|dns-01]\n";
+        return 1;
+    }
+    // A wildcard is proven by DNS alone (RFC 8555 8.4); SOCKETLEY_ACME_CHALLENGE picks one for every name, for a
+    // host whose port 80 is closed.
+    const bool wildcard = std::any_of(names.begin(), names.end(), [](const std::string& n) { return n.starts_with("*."); });
+    if (challenge.empty())
+    {
+        const char* env = std::getenv("SOCKETLEY_ACME_CHALLENGE");
+        challenge = wildcard ? "dns-01" : env && *env ? env : "http-01";
+    }
+    if (challenge != "http-01" && challenge != "tls-alpn-01" && challenge != "dns-01")
+    {
+        std::cout << "acme issue: the challenge is http-01, tls-alpn-01 or dns-01, not " << challenge << "\n";
+        return 1;
+    }
+    if (wildcard && challenge != "dns-01")
+    {
+        std::cout << "acme issue: a wildcard is proven over dns-01 only\n";
         return 1;
     }
     if (cert.empty())
@@ -692,7 +712,10 @@ int issue(int argc, char** argv)
     const std::string order_url = r.header("location");
     const std::string thumb = c.thumbprint();
 
-    // Every authorization's HTTP-01 answer is put where the runtimes serve it, and then the CA is told to look.
+    // Every authorization's answer is put where the runtimes serve it, and then the CA is told to look -- for DNS-01
+    // after every answer is out and has had time to reach the secondaries, since a CA asks any of the zone's servers.
+    struct pending_check { std::string authz, url; };
+    std::vector<pending_check> dns_checks;
     if (const jvalue* authz = member(order, "authorizations"))
         for (const jvalue& au : authz->items)
         {
@@ -715,6 +738,19 @@ int issue(int argc, char** argv)
                 err = "the CA offered no " + challenge + " challenge for " + (ident.empty() ? au.s : ident);
                 return done(2);
             }
+            if (challenge == "dns-01")
+            {
+                // The TXT record of _acme-challenge.<name> (RFC 8555 8.4), the name without a wildcard's "*.".
+                std::string path;
+                if (!dns_feed::write_challenge(ident, b64url(sha256(token + "." + thumb)), token, path))
+                {
+                    err = "the DNS-01 answer for " + ident + " could not be written to " + dns_feed::dir();
+                    return done(2);
+                }
+                written.push_back(path);
+                dns_checks.push_back({au.s, url});
+                continue;
+            }
             // HTTP-01's answer is served as a file over HTTP, TLS-ALPN-01's as a certificate on the TLS listener.
             const bool alpn = challenge == "tls-alpn-01";
             const std::string file = alpn ? cert_keeper::tls_alpn_path(ident) : challenges + "/" + token;
@@ -729,6 +765,21 @@ int issue(int argc, char** argv)
             if (!c.post(url, "{}", r, err) || !poll(c, au.s, "valid", ignored, err))
                 return done(2);
         }
+
+    if (!dns_checks.empty())
+    {
+        // A dns runtime takes the feed up within a second; SOCKETLEY_ACME_DNS_WAIT gives secondaries their time.
+        int wait = 10;
+        if (const char* w = std::getenv("SOCKETLEY_ACME_DNS_WAIT"); w && *w)
+            wait = std::clamp(std::atoi(w), 1, 3600);
+        std::this_thread::sleep_for(std::chrono::seconds(wait));
+        for (const pending_check& pc : dns_checks)
+        {
+            jvalue ignored;
+            if (!c.post(pc.url, "{}", r, err) || !poll(c, pc.authz, "valid", ignored, err))
+                return done(2);
+        }
+    }
 
     EVP_PKEY* cert_key = EVP_EC_gen("P-256");
     const std::string csr = cert_key ? csr_der(cert_key, names) : std::string{};
@@ -772,6 +823,6 @@ int acme_main(int argc, char** argv)
     if (argc >= 3 && std::string_view(argv[2]) == "issue")
         return issue(argc, argv);
     std::cout << "usage: socketley acme issue --domains name[,name...] [--cert file] [--key file] [--email addr] "
-                 "[--directory url] [--challenge http-01|tls-alpn-01]\n";
+                 "[--directory url] [--challenge http-01|tls-alpn-01|dns-01]\n";
     return 1;
 }

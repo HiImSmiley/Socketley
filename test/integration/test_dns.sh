@@ -42,9 +42,9 @@ skip() { echo "  SKIP: $1"; echo "  Results: 0/0 passed (0 failed)"; exit 0; }
 
 cleanup() {
     [ -n "${SINK_PID:-}" ] && kill "$SINK_PID" 2>/dev/null
-    for r in ns ns2 bad; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
+    for r in ns ns2 bad pub chat files; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
     sleep 0.2
-    for r in ns ns2 bad; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
+    for r in ns ns2 bad pub chat files; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
     daemon_stop
 }
 trap cleanup EXIT
@@ -178,6 +178,56 @@ EOF
 read -r full tc dropped <<<"$burst"
 if [ "$full" -le 110 ] && [ "$tc" -ge 100 ] && [ "$dropped" -ge 100 ]; then ok "400 queries in a burst: $full answered, $tc truncated, $dropped dropped"
 else bad "rate limit of 100 a second" "answered $full, truncated $tc, dropped $dropped"; fi
+
+# ── names runtimes are reached by, published ────────────────────────────────
+P2=$((SL_PORT_BASE+1712))
+cp "$T/example.zone" "$T/pub.zone"
+sed -i '$d' "$T/pub.zone"   # without the broken line the reload above left
+"$BIN" create dns pub -p "$P2" --zone "$T/pub.zone" --publish 192.0.2.10,2001:db8::10 --rrl 0 -s >/dev/null 2>&1
+"$BIN" create server chat -p $((SL_PORT_BASE+1713)) --domain chat,api.example.com >/dev/null 2>&1
+"$BIN" create storage files -p $((SL_PORT_BASE+1714)) --dir "$T/files" --anonymous --domain files.example.com >/dev/null 2>&1
+qp() { dig @127.0.0.1 -p "$P2" +time=2 +tries=1 +short "$@" 2>&1; }
+got=""
+for _ in $(seq 1 40); do got=$(qp chat.example.com A); [ -n "$got" ] && break; sleep 0.2; done
+expect "a runtime's --domain without a dot is published under the zone" "$got" "192.0.2.10"
+expect "with every address --publish names" "$(qp chat.example.com AAAA)" "2001:db8::10"
+expect "and one with dots as it is written" "$(qp api.example.com A)" "192.0.2.10"
+expect "a storage runtime's --domain, with its buckets beneath it" "$(qp files.example.com A) $(qp photos.files.example.com A)" "192.0.2.10 192.0.2.10"
+expect "a name the zone file gives an address keeps that address" "$(qp mail.example.com A)" "192.0.2.25"
+has "a runtime's names are not published by a dns runtime without --publish" "$(q chat.example.com A)" "NXDOMAIN"
+s1=$(qp example.com SOA | awk '{print $3}')
+"$BIN" remove chat >/dev/null 2>&1
+for _ in $(seq 1 40); do [ -z "$(qp chat.example.com A)" ] && break; sleep 0.2; done
+expect "a runtime removed takes its names with it" "$(qp chat.example.com A)" ""
+s2=$(qp example.com SOA | awk '{print $3}')
+if [ "${s2:-0}" -gt "${s1:-0}" ] 2>/dev/null; then ok "and the serial grows, so a secondary sees it ($s1 -> $s2)"
+else bad "the serial after a published name went" "$s1 -> $s2"; fi
+
+# ── a wildcard certificate over DNS-01, from this runtime's own answers ─────
+PEBBLE_DIR="${PEBBLE_DIR:-$HOME/socketley-perf/acme}"
+PEBBLE="$PEBBLE_DIR/pebble-linux-amd64/linux/amd64/pebble"
+if [ -x "$PEBBLE" ] && [ -r "$PEBBLE_DIR/pebble.minica.pem" ] && command -v openssl >/dev/null 2>&1; then
+    P_DIR=$((SL_PORT_BASE+1715)) P_MGMT=$((SL_PORT_BASE+1716))
+    printf '{"pebble": {"listenAddress": "127.0.0.1:%s", "managementListenAddress": "127.0.0.1:%s", "certificate": "%s", "privateKey": "%s", "httpPort": %s, "tlsPort": %s, "ocspResponderURL": "", "externalAccountBindingRequired": false}}\n' \
+        "$P_DIR" "$P_MGMT" "$PEBBLE_DIR/localhost-cert.pem" "$PEBBLE_DIR/localhost-key.pem" \
+        $((SL_PORT_BASE+1717)) $((SL_PORT_BASE+1718)) > "$T/pebble.json"
+    # The CA asks this dns runtime, and nobody else, for the TXT record that proves the zone.
+    PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=0 "$PEBBLE" -config "$T/pebble.json" -dnsserver "127.0.0.1:$P2" \
+        > "$T/pebble.log" 2>&1 &
+    PEBBLE_PID=$!
+    for _ in $(seq 1 100); do curl -s --cacert "$PEBBLE_DIR/pebble.minica.pem" -o /dev/null "https://127.0.0.1:$P_DIR/dir" && break; sleep 0.1; done
+    SOCKETLEY_ACME_DIRECTORY="https://127.0.0.1:$P_DIR/dir" SOCKETLEY_ACME_CA="$PEBBLE_DIR/pebble.minica.pem" \
+        SOCKETLEY_ACME_DNS_WAIT=2 "$BIN" acme issue --domains '*.example.com,example.com' --cert "$T/w.pem" --key "$T/w.key" \
+        > "$T/w.out" 2>&1
+    kill "$PEBBLE_PID" 2>/dev/null
+    expect "a wildcard certificate is issued over DNS-01, answered by the dns runtime" \
+        "$(openssl x509 -noout -ext subjectAltName -in "$T/w.pem" 2>/dev/null | grep -o 'DNS:[*a-z.]*' | sort | tr '\n' ' ')" \
+        "DNS:*.example.com DNS:example.com "
+    sleep 1.5
+    expect "and its answers are gone after" "$(qp _acme-challenge.example.com TXT)" ""
+else
+    echo "  SKIP: DNS-01 needs Pebble (set PEBBLE_DIR)"
+fi
 
 # ── restart ─────────────────────────────────────────────────────────────────
 sed -i '$d' "$T/example.zone"   # the broken line out, so the restart reads a zone

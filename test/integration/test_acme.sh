@@ -11,7 +11,7 @@
 #   * a certificate replaced on disk not taken up by the listener, or a broken
 #     one taken up
 #   * --acme flags taken for a runtime that cannot use them, or names a CA
-#     would refuse
+#     would refuse; a wildcard, which DNS-01 proves, refused
 #   * `socketley acme issue` by hand not writing a certificate for its names
 #   * an authorization asked about again after "pending" taken for something
 #     that is not JSON, so nothing is issued by a CA that is not instant
@@ -65,7 +65,10 @@ daemon_start "$BIN"
 
 # The flags' refusals.
 check "--acme on a client is refused" "$("$BIN" create client c1 -t 127.0.0.1:1 --acme a.example 2>&1 | grep -c 'issued for a runtime that listens')" 1
-check "a wildcard is refused" "$("$BIN" create server s0 -p $P_TLS2 --acme '*.example.org' 2>&1 | grep -c 'not a name')" 1
+# A wildcard is taken, to be proven over DNS-01 by a dns runtime (test_dns.sh issues one); two levels of it are not.
+check "a wildcard is taken" "$("$BIN" create server s0 -p $P_TLS2 --acme '*.example.org' 2>&1 | grep -c 'not a name')" 0
+"$BIN" remove s0 >/dev/null 2>&1
+check "a wildcard below a wildcard is refused" "$("$BIN" create server s0 -p $P_TLS2 --acme '*.*.example.org' 2>&1 | grep -c 'not a name')" 1
 check "an address is refused" "$("$BIN" create server s1 -p $P_TLS2 --acme 127.0.0.1 2>&1 | grep -c 'not a name')" 1
 check "an email without an at is refused" "$("$BIN" create server s2 -p $P_TLS2 --acme a.example --acme-email nope 2>&1 | grep -c 'not an address')" 1
 
@@ -80,7 +83,7 @@ check "for every name it was given" \
       "$(echo | openssl s_client -connect 127.0.0.1:$P_TLS -servername www.socketley.test 2>/dev/null | openssl x509 -noout -ext subjectAltName 2>/dev/null | grep -o 'DNS:[a-z.]*' | sort | tr '\n' ' ')" \
       "DNS:static.socketley.test DNS:www.socketley.test "
 check "with its chain, so a client trusting the CA's root alone is served" \
-      "$(curl -s --cacert "$ROOT" --resolve www.socketley.test:$P_TLS:127.0.0.1 "https://www.socketley.test:$P_TLS/" | head -1)" hello
+      "$(curl -s --noproxy "*" --cacert "$ROOT" --resolve www.socketley.test:$P_TLS:127.0.0.1 "https://www.socketley.test:$P_TLS/" | head -1)" hello
 check "the challenge's answer was left behind by nobody" "$(ls "$HOME/.local/share/socketley" -R 2>/dev/null | grep -c '^[A-Za-z0-9_-]\{40,\}$')" 0
 
 # A certificate replaced on disk is taken up without a restart; a broken one is not.

@@ -20,6 +20,7 @@
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
 #include "../shared/ip_block.h"
+#include "../shared/dns_feed.h"
 #include "../runtime/storage/s3_vhost.h"
 #include "../runtime/storage/sync_mode.h"
 
@@ -122,10 +123,13 @@ static int parse_acme_flag(runtime_instance* instance, const parsed_args& pa, si
         std::cout << "--acme requires a name, or several separated by commas\n";
         return 1;
     }
-    for (const std::string& n : names)
+    for (const std::string& name : names)
     {
-        // A name whose last label is all digits is an address, which HTTP-01 does not prove.
-        const std::string_view tld = std::string_view(n).substr(n.rfind('.') + 1);
+        // A wildcard of one label, which is proven over DNS-01 by a dns runtime serving its zone.
+        const std::string_view n = std::string_view(name).starts_with("*.") ? std::string_view(name).substr(2)
+                                                                             : std::string_view(name);
+        // A name whose last label is all digits is an address, which no challenge proves.
+        const std::string_view tld = n.substr(n.rfind('.') + 1);
         const bool ok = n.size() <= 253 && n.find('.') != std::string::npos && n.front() != '.' && n.back() != '.' &&
                         !std::all_of(tld.begin(), tld.end(), [](char ch) { return ch >= '0' && ch <= '9'; }) &&
                         std::all_of(n.begin(), n.end(), [](char ch) {
@@ -134,14 +138,39 @@ static int parse_acme_flag(runtime_instance* instance, const parsed_args& pa, si
                         });
         if (!ok)
         {
-            std::cout << "--acme: '" << n << "' is not a name a certificate is issued for over HTTP-01 "
-                         "(no wildcards, no addresses, at least one dot)\n";
+            std::cout << "--acme: '" << name << "' is not a name a certificate is issued for "
+                         "(no addresses, at least one dot, a wildcard only as its first label)\n";
             return 1;
         }
     }
     instance->set_tls(true);
     instance->set_cert_path(cert_keeper::acme_cert_path(names.front()));
     instance->set_key_path(cert_keeper::acme_key_path(names.front()));
+    return 0;
+}
+
+// --domain on every runtime but storage, whose own flag of that name also names its buckets' virtual hosts.
+static int parse_domain_flag(runtime_instance* instance, const parsed_args& pa, size_t& i)
+{
+    if (instance->get_type() == runtime_storage)
+        return -1;
+    if (i + 1 >= pa.count || pa.args[i + 1].empty())
+    {
+        std::cout << "--domain requires a name, or several separated by commas\n";
+        return 1;
+    }
+    const std::string_view v = pa.args[++i];
+    for (size_t p = 0; p <= v.size();)
+    {
+        const size_t comma = std::min(v.find(',', p), v.size());
+        if (std::string why; !dns_feed::valid_name(v.substr(p, comma - p), why))
+        {
+            std::cout << "--domain: " << why << "\n";
+            return 1;
+        }
+        p = comma + 1;
+    }
+    instance->set_domains(v);
     return 0;
 }
 
@@ -547,6 +576,9 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("--acme"):
         case fnv1a("--acme-email"):
             return parse_acme_flag(instance, pa, i);
+
+        case fnv1a("--domain"):
+            return parse_domain_flag(instance, pa, i);
 
         case fnv1a("--cert"):
         case fnv1a("--key"):
@@ -1382,6 +1414,17 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
             dns->set_notify(pa.args[++i]);
             return 0;
         }
+        // The addresses the names runtimes are reached by are published with, checked whole at create.
+        case fnv1a("--publish"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << "--publish requires this machine's public addresses, IPv4 and IPv6, comma-separated\n";
+                return 1;
+            }
+            dns->set_publish(pa.args[++i]);
+            return 0;
+        }
         case fnv1a("--rrl"):
         {
             uint32_t n = 0;
@@ -1946,6 +1989,9 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("--acme"):
         case fnv1a("--acme-email"):
             return parse_acme_flag(instance, pa, i);
+
+        case fnv1a("--domain"):
+            return parse_domain_flag(instance, pa, i);
 
         case fnv1a("--cert"):
         case fnv1a("--key"):

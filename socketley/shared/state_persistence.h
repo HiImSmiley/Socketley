@@ -59,6 +59,8 @@ struct runtime_config
     // --acme's names, comma-joined, and its account contact.
     std::string acme_domains;
     std::string acme_email;
+    // --domain's names, comma-joined, for every runtime but storage, which keeps its own under the same key.
+    std::string domains;
     std::string ca_path;
     std::string target;
     std::string cache_name;
@@ -181,6 +183,7 @@ struct runtime_config
     std::string dns_zones;
     std::string dns_transfer;
     std::string dns_notify;
+    std::string dns_publish;
     // Written always, since 0 is a setting (no rate limit) and not "not given".
     uint32_t dns_rrl = 100;
 

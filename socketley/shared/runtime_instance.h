@@ -296,6 +296,10 @@ public:
     void set_acme_domains(std::string_view comma_list);
     const std::vector<std::string>& get_acme_domains() const { return m_acme_domains; }
     void set_acme_email(std::string_view email) { m_acme_email = email; }
+    // --domain: the names this runtime is reached by, comma-separated as given, which a dns runtime with --publish
+    // answers for. A storage runtime keeps its own, which also names its buckets' virtual hosts.
+    void set_domains(std::string_view comma_list) { m_domains = comma_list; }
+    std::string_view get_domains() const { return m_domains; }
     std::string_view get_acme_email() const { return m_acme_email; }
 
     // get_stats() and get_connection_count() read this instance's live
@@ -966,6 +970,7 @@ private:
     std::string m_ca_path;
     std::vector<std::string> m_acme_domains;
     std::string m_acme_email;
+    std::string m_domains;
 
     // Lua script path for hot-reload
     std::string m_lua_script_path;

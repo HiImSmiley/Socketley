@@ -701,6 +701,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     for (const std::string& d : instance->get_acme_domains())
         cfg.acme_domains += (cfg.acme_domains.empty() ? "" : ",") + d;
     cfg.acme_email = instance->get_acme_email();
+    cfg.domains = std::string(instance->get_domains());
     cfg.ca_path = instance->get_ca_path();
     cfg.target = instance->get_target();
     cfg.listen_path = instance->get_listen_path();
@@ -790,6 +791,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.dns_zones = std::string(d->get_zones());
             cfg.dns_transfer = std::string(d->get_transfer());
             cfg.dns_notify = std::string(d->get_notify());
+            cfg.dns_publish = std::string(d->get_publish());
             cfg.dns_rrl = d->get_rrl();
             break;
         }
@@ -939,6 +941,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         append_str_field("acme_domains", cfg.acme_domains);
     if (!cfg.acme_email.empty())
         append_str_field("acme_email", cfg.acme_email);
+    if (!cfg.domains.empty() && cfg.type != runtime_storage)
+        append_str_field("domain", cfg.domains);
     if (!cfg.ca_path.empty())
         append_str_field("ca_path", cfg.ca_path);
     if (!cfg.target.empty())
@@ -1125,6 +1129,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("transfer", cfg.dns_transfer);
             if (!cfg.dns_notify.empty())
                 append_str_field("notify", cfg.dns_notify);
+            if (!cfg.dns_publish.empty())
+                append_str_field("publish", cfg.dns_publish);
             append_int_field("rrl", cfg.dns_rrl);
             break;
     }
@@ -1204,6 +1210,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.key_path = json_get_string(json, "key_path");
     cfg.acme_domains = json_get_string(json, "acme_domains");
     cfg.acme_email = json_get_string(json, "acme_email");
+    if (cfg.type != runtime_storage)
+        cfg.domains = json_get_string(json, "domain");
     cfg.ca_path = json_get_string(json, "ca_path");
     cfg.target = json_get_string(json, "target");
     cfg.cache_name = json_get_string(json, "cache_name");
@@ -1311,6 +1319,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.dns_zones = json_get_string(json, "zones");
             cfg.dns_transfer = json_get_string(json, "transfer");
             cfg.dns_notify = json_get_string(json, "notify");
+            cfg.dns_publish = json_get_string(json, "publish");
             cfg.dns_rrl = json_get_uint32(json, "rrl", 100);
             break;
     }

@@ -851,6 +851,83 @@ bool load_zone(const std::string& path, std::string_view origin_hint, zone& out,
     return true;
 }
 
+size_t add_extra(zone& z, const extra_records& x)
+{
+    size_t added = 0;
+    // The names between a new name and the apex, which exist from now on, empty.
+    const auto make_path = [&](const std::string& name)
+    {
+        for (std::string_view p = parent(name); p.size() > z.origin.size(); p = parent(p))
+            z.names.try_emplace(std::string(p));
+    };
+    // Whether `name` lies beneath a cut, where this zone answers nothing but referrals.
+    const auto below_cut = [&](const std::string& name)
+    {
+        for (std::string_view p = name; z.has_cuts && p.size() > z.origin.size(); p = parent(p))
+            if (const node* n = z.find(p); n && n->cut)
+                return true;
+        return false;
+    };
+    const auto put = [&](const std::string& name, uint16_t t, uint32_t ttl, const std::vector<std::string>& rdata)
+    {
+        if (rdata.empty() || below_cut(name))
+            return;
+        node& nd = z.names[name];
+        if (nd.find(type::CNAME) || nd.find(t))
+            return;
+        nd.sets.push_back(rrset{t, ttl, rdata});
+        std::sort(nd.sets.back().rdata.begin(), nd.sets.back().rdata.end());
+        added += rdata.size();
+        make_path(name);
+    };
+    for (const auto& n : x.names)
+    {
+        std::string w;
+        const bool relative = n.find('.') == std::string::npos;
+        if (!name_from_text(relative ? n : (n.back() == '.' ? n : n + "."), z.origin, w) || !is_subdomain(w, z.origin))
+            continue;
+        put(w, type::A, published_ttl, x.v4);
+        put(w, type::AAAA, published_ttl, x.v6);
+    }
+    std::vector<std::pair<std::string, std::vector<std::string>>> txt;
+    for (const auto& [name, value] : x.challenges)
+    {
+        std::string w;
+        const std::string full = "_acme-challenge." + name + (name.back() == '.' ? "" : ".");
+        if (value.size() > 255 || !name_from_text(full, {}, w) || !is_subdomain(w, z.origin))
+            continue;
+        std::string rd(1, static_cast<char>(value.size()));
+        rd += value;
+        auto it = std::find_if(txt.begin(), txt.end(), [&](const auto& e) { return e.first == w; });
+        if (it == txt.end())
+            txt.push_back({w, {rd}});
+        else if (std::find(it->second.begin(), it->second.end(), rd) == it->second.end())
+            it->second.push_back(rd);
+    }
+    for (const auto& [name, values] : txt)
+        put(name, type::TXT, challenge_ttl, values);
+    z.records += added;
+    z.serial += x.serial_add;
+    // The serial the SOA record itself carries, which is what a secondary compares.
+    if (x.serial_add)
+        if (node* apex = z.names.count(z.origin) ? &z.names[z.origin] : nullptr)
+            for (auto& set : apex->sets)
+                if (set.type == type::SOA && !set.rdata.empty())
+                {
+                    std::string& rd = set.rdata[0];
+                    size_t off = 0;
+                    for (int k = 0; k < 2 && off < rd.size(); ++k)
+                    {
+                        while (off < rd.size() && rd[off])
+                            off += 1 + static_cast<uint8_t>(rd[off]);
+                        ++off;
+                    }
+                    if (off + 4 <= rd.size())
+                        wr32(reinterpret_cast<uint8_t*>(rd.data()) + off, z.serial);
+                }
+    return added;
+}
+
 const zone* zone_set::find(std::string_view name) const
 {
     const zone* best = nullptr;

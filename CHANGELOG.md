@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **DNS: the names runtimes are reached by, published; wildcard certificates over
+  DNS-01.** Every runtime takes `--domain name[,name]` (a storage runtime its own,
+  which also names its buckets' virtual hosts). The daemon writes those names and
+  the names of `--acme` into `state-dir/.dns/`, and a dns runtime given
+  `--publish <addresses>` answers each one under its zones with this machine's
+  IPv4 and IPv6 addresses: a name without a dot is taken under the zone, a
+  storage runtime's comes with the wildcard its buckets are addressed under, and
+  a runtime removed takes its names with it. What the zone file says of a name
+  wins. `acme issue --challenge dns-01`, which a wildcard takes by itself, puts
+  its answer in the same directory, served as the TXT record of
+  `_acme-challenge.<name>`; `--acme '*.example.com'` is now taken. The serial a
+  zone is served with grows with every change of these, so secondaries take them
+  up. `SOCKETLEY_ACME_CHALLENGE` proves every name over another challenge and
+  `SOCKETLEY_ACME_DNS_WAIT` (10 s) gives secondaries time before the CA looks.
+  A wildcard certificate from Pebble was issued in 2.6 s through a dns runtime
+  as the CA's only DNS.
+
 - **DNS: an authoritative name server runtime.** `socketley create dns <name>
   --zone <file>` serves the zones in RFC 1035 master files over UDP and TCP on one
   port (53 by default), IPv4 and IPv6, in one or `--shards` processes. Records,

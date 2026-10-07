@@ -84,6 +84,25 @@ bool parse_zone(std::string_view text, std::string_view origin_hint, zone& out, 
 // case wire form; false when it is not one.
 bool name_from_text(std::string_view text, std::string_view origin, std::string& out);
 
+// Records a zone is given beside its file: the names runtimes are reached by, with the addresses --publish names, and
+// ACME DNS-01 answers. What the file says of a name wins: a name with addresses of its own, or an alias, keeps them.
+struct extra_records
+{
+    // Presentation form; one without a dot is taken under the apex, one with a dot as it is written.
+    std::vector<std::string> names;
+    // The addresses each name is given, in wire form: 4 bytes each, and 16.
+    std::vector<std::string> v4, v6;
+    // The name asked about (absolute, without "_acme-challenge.") and its TXT value.
+    std::vector<std::pair<std::string, std::string>> challenges;
+    // What is added to the file's serial, so a secondary sees a change of these.
+    uint32_t serial_add{0};
+};
+inline constexpr uint32_t published_ttl = 300;
+inline constexpr uint32_t challenge_ttl = 10;
+
+// `x` added to `z`, where it falls within it; how many records that was.
+size_t add_extra(zone& z, const extra_records& x);
+
 // Every zone a runtime serves, found for a name by its longest suffix that is an apex.
 struct zone_set
 {

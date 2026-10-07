@@ -16,6 +16,9 @@
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
+#include "../shared/dns_feed.h"
+
+static void publish_dns_names(runtime_manager& manager);
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
@@ -805,6 +808,7 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
                     start_accept();
 
                 check_managed_health();
+                publish_dns_names(m_manager);
                 // The backstop for a start whose wait ended without an exit watch firing, the reconcile above having forked.
                 finish_deferred_starts(false);
                 // Release the retired runtimes the ring has finished with,
@@ -820,6 +824,56 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
             break;
         default:
             break;
+    }
+}
+
+// The names every runtime is reached by, for a dns runtime with --publish to answer for (dns_feed.h): --domain and
+// --acme, and a storage runtime's --domain and --website-domain with the wildcard its buckets are addressed under.
+// Rewritten only when they change, which is what moves the feed's time and with it the serial secondaries see.
+static void publish_dns_names(runtime_manager& manager)
+{
+    std::vector<std::string> names;
+    const auto add_list = [&](std::string_view csv, bool with_wildcard)
+    {
+        for (size_t p = 0; p <= csv.size();)
+        {
+            const size_t comma = std::min(csv.find(',', p), csv.size());
+            std::string n(csv.substr(p, comma - p));
+            while (!n.empty() && n.front() == ' ')
+                n.erase(0, 1);
+            while (!n.empty() && n.back() == ' ')
+                n.pop_back();
+            if (std::string why; !n.empty() && dns_feed::valid_name(n, why))
+            {
+                if (with_wildcard && !n.starts_with("*."))
+                    names.push_back("*." + n);
+                names.push_back(std::move(n));
+            }
+            p = comma + 1;
+        }
+    };
+    {
+        std::shared_lock lock(manager.mutex);
+        for (const auto& [name, inst] : manager.list())
+        {
+            if (!inst)
+                continue;
+            if (inst->get_type() == runtime_storage)
+            {
+                const auto* stg = static_cast<const storage_instance*>(inst.get());
+                add_list(stg->get_domain(), true);
+                add_list(stg->get_website_domain(), true);
+            }
+            add_list(inst->get_domains(), false);
+            for (const auto& d : inst->get_acme_domains())
+                add_list(d, false);
+        }
+    }
+    static bool warned = false;
+    if (!dns_feed::write_names(names) && !warned)
+    {
+        warned = true;
+        LOG_WARN(("the names for dns runtimes could not be written to " + dns_feed::dir()).c_str());
     }
 }
 
@@ -4148,6 +4202,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     if (has("port"))              instance->set_port(cfg.port);
     if (has("listen"))            instance->set_listen_path(cfg.listen_path);
     if (has("bind"))              instance->set_bind_address(cfg.bind_address);
+    if (has("domain") && type != runtime_storage) instance->set_domains(cfg.domains);
     // The same absolute-path rule the flag doors apply, because a document is
     // the other way in and a state file written before that rule existed is a
     // third.
