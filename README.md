@@ -124,6 +124,12 @@ bash scripts/install-liburing.sh
 # -lluajit, so the name never matches. This script settles both.
 ./bin/build-thirdparty.sh
 
+# HTTP/3 for the storage runtime: OpenSSL 3.5, ngtcp2 and nghttp3, built into
+# thirdparty/ and linked statically (needs perl and cmake; about a minute and a
+# half on four cores). Included in the line above; without them everything
+# else builds as before and storage speaks HTTP/1.1 and HTTP/2.
+./bin/build-thirdparty.sh http3
+
 # Build
 ./bin/premake5 gmake2
 cd make && make config=release_x64 -j$(nproc)

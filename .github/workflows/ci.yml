@@ -91,7 +91,7 @@ jobs:
           # tree has not compiled against 2.5 since 5593ee1 (2026-07-28); this
           # job installed it anyway and was red on every run from that day until
           # 2026-08-01.  scripts/install-liburing.sh below is the dependency.
-          sudo apt-get install -y build-essential libssl-dev \
+          sudo apt-get install -y build-essential libssl-dev cmake \
             netcat-openbsd bc libluajit-5.1-dev \
             clang-18 libclang-rt-18-dev groff-base
           # clang is for libFuzzer only — see the note at the top of this file.
@@ -99,7 +99,7 @@ jobs:
           # and a half-installed toolchain should fail here where the error is
           # legible rather than three steps later.
           clang++-18 --version
-          bash bin/build-thirdparty.sh luajit
+          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
 
       - name: Install liburing
         run: bash scripts/install-liburing.sh
@@ -295,7 +295,7 @@ jobs:
           # as six "not declared in this scope" and one incomplete type, with
           # nothing anywhere naming a package version — so it is the job that
           # most needed the dependency to be honest.
-          sudo apt-get install -y clang-18 build-essential libssl-dev libluajit-5.1-dev
+          sudo apt-get install -y clang-18 build-essential libssl-dev cmake libluajit-5.1-dev
           clang++-18 --version
 
       - name: Install liburing

@@ -26,6 +26,27 @@ workspace "Socketley"
     externalincludedirs { "thirdparty/liburing" }
     libdirs { "thirdparty/liburing" }
 
+    -- HTTP/3: OpenSSL 3.5, ngtcp2 and nghttp3 as bin/build-thirdparty.sh http3
+    -- leaves them in thirdparty/, put before the system's so every project
+    -- compiles and links against the one OpenSSL, statically.  Without them the
+    -- tree builds as before against the system's OpenSSL, and a storage runtime
+    -- speaks HTTP/1.1 and HTTP/2 only.
+    http3 = os.isfile("thirdparty/openssl/lib/libssl.a") and os.isfile("thirdparty/ngtcp2/lib/libngtcp2.a")
+        and os.isfile("thirdparty/ngtcp2/lib/libngtcp2_crypto_ossl.a") and os.isfile("thirdparty/nghttp3/lib/libnghttp3.a")
+    -- The TLS libraries a project links, the QUIC ones first when HTTP/3 is built in, since a static archive is
+    -- searched once, in order.
+    function tls_libs()
+        if http3 then
+            return { "ngtcp2_crypto_ossl", "ngtcp2", "nghttp3", "ssl", "crypto" }
+        end
+        return { "ssl", "crypto" }
+    end
+    if http3 then
+        includedirs { "thirdparty/openssl/include", "thirdparty/ngtcp2/include", "thirdparty/nghttp3/include" }
+        libdirs { "thirdparty/openssl/lib", "thirdparty/ngtcp2/lib", "thirdparty/nghttp3/lib" }
+        defines { "SOCKETLEY_HTTP3=1" }
+    end
+
     -- ccache when it is present.  The workflow this pays for is toggling
     -- CPPFLAGS (trace, invariants): make does not notice that change, so the
     -- objects have to be deleted and everything recompiled although no source
@@ -252,7 +273,7 @@ project "socketley"
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     -- liburing from its archive only, so no binary loads a liburing.so other than the version it was compiled against.
-    links { "luajit", "uring:static", "ssl", "crypto" }
+    links { "luajit", "uring:static" } links(tls_libs())
 
     files {
         "socketley/**.h",
@@ -742,7 +763,7 @@ project "test_managed_runtime"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_managed_runtime.cpp" }
 
@@ -782,7 +803,7 @@ project "test_write_queue"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_write_queue.cpp" }
 
@@ -822,7 +843,7 @@ project "test_worker_map"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_worker_map.cpp" }
 
@@ -857,7 +878,7 @@ project "test_ws_parser"
         "socketley"
     }
 
-    links { "ssl", "crypto" }
+    links(tls_libs())
 
     files { "test/unit/test_ws_parser.cpp" }
 
@@ -1059,7 +1080,7 @@ project "socketley_bench"
     -- ssl and crypto because the fanout category can drive TLS connections, and
     -- one client for both arms is the whole point: a separate TLS load
     -- generator would compare two clients as well as two runtimes.
-    links { "pthread", "m", "ssl", "crypto" }
+    links { "pthread", "m" } links(tls_libs())
 
     files { "test/benchmark/bench.c" }
 
@@ -1098,7 +1119,7 @@ project "test_sdk_engine"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_sdk_engine.cpp" }
 
@@ -1140,7 +1161,7 @@ project "test_sdk_runtime"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_sdk_runtime.cpp" }
 
@@ -1285,7 +1306,7 @@ project "fuzz_ws_frame"
     cppdialect "C++latest"
 
     includedirs { "socketley", "test/fuzz" }
-    links { "ssl", "crypto" }
+    links(tls_libs())
 
     files {
         "test/fuzz/fuzz_ws_frame.cpp",
@@ -1375,7 +1396,7 @@ project "fuzz_storage_parsers"
 
     includedirs { ".", "socketley", "test/fuzz", "thirdparty/sol2", "thirdparty/luajit", "include/linux" }
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files {
         "test/fuzz/fuzz_storage_parsers.cpp",
@@ -1524,7 +1545,7 @@ project "fuzz_http_request"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files {
         "test/fuzz/fuzz_http_request.cpp",
@@ -1572,7 +1593,7 @@ project "fuzz_server_ops"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files {
         "test/fuzz/fuzz_server_ops.cpp",
@@ -1598,7 +1619,7 @@ project "fuzz_client_ops"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files {
         "test/fuzz/fuzz_client_ops.cpp",
@@ -1644,7 +1665,7 @@ project "fuzz_proxy_ops"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files {
         "test/fuzz/fuzz_proxy_ops.cpp",
@@ -1704,7 +1725,7 @@ project "test_conn_transfer"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_conn_transfer.cpp" }
 
@@ -1744,7 +1765,7 @@ project "test_udp_recv_ladder"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_udp_recv_ladder.cpp" }
 
@@ -1984,7 +2005,7 @@ project "test_raft_storage"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_raft_storage.cpp" }
 
@@ -2024,7 +2045,7 @@ project "test_object_store"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_object_store.cpp" }
 
@@ -2062,7 +2083,7 @@ project "test_storage_multipart"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_storage_multipart.cpp" }
 
@@ -2100,7 +2121,7 @@ project "test_storage_select"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_storage_select.cpp" }
 
@@ -2138,7 +2159,7 @@ project "test_storage_federation"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_storage_federation.cpp" }
 
@@ -2176,7 +2197,7 @@ project "test_storage_compression"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto", "dl" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs()) links { "dl" }
 
     files { "test/unit/test_storage_compression.cpp" }
 
@@ -2278,7 +2299,7 @@ project "test_storage_shards"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_storage_shards.cpp" }
 
@@ -2316,7 +2337,7 @@ project "test_storage_crash"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/unit/test_storage_crash.cpp" }
 
@@ -2355,7 +2376,7 @@ project "bench_conn_transfer"
     }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
-    links { "socketley_sdk", "luajit", "uring:static", "ssl", "crypto" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
 
     files { "test/benchmark/bench_conn_transfer.cpp" }
 

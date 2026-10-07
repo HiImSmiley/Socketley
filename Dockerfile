@@ -60,7 +60,7 @@ ARG BUILD_JOBS
 ARG LIBURING_TAG
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential libssl-dev libluajit-5.1-dev git ca-certificates \
+        build-essential libssl-dev cmake libluajit-5.1-dev git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Copied on its own, before the tree, so that editing socketley source does not
@@ -79,7 +79,7 @@ COPY . .
 # "same trick as CI" and copy libluajit-5.1.a by hand -- one of nine hand-written
 # copies of the same three commands, and one of the two that had no error check.
 # scripts/install-liburing.sh already ended that argument for the other archive.
-RUN bash bin/build-thirdparty.sh luajit
+RUN bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
 
 RUN ./bin/premake5 gmake2 && cd make && make config=release_x64 -j"$BUILD_JOBS"
 

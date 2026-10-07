@@ -1,5 +1,7 @@
 #include "tls_context.h"
 
+#include <unistd.h>
+
 // Conditionally compile TLS support only if OpenSSL is available
 #if __has_include(<openssl/ssl.h>)
 #define SOCKETLEY_HAS_TLS 1
@@ -520,7 +522,7 @@ bool tls_context::init_client(std::string_view ca_path,
     }
     else
     {
-        SSL_CTX_set_default_verify_paths(m_ctx);
+        load_system_roots(m_ctx);
         SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
     }
 
@@ -845,6 +847,28 @@ int tls_context::bio_write_in(SSL* ssl, const char* buf, int len)
     return -1;
 #else
     return -1;
+#endif
+}
+
+int tls_context::load_system_roots(SSL_CTX* ctx)
+{
+#if SOCKETLEY_HAS_TLS
+    int ok = SSL_CTX_set_default_verify_paths(ctx) == 1 ? 1 : 0;
+    // Debian and Ubuntu, Fedora and RHEL, openSUSE, Alpine and Arch: SSL_CERT_FILE and SSL_CERT_DIR still win, since
+    // the default above reads them first.
+    static const char* const bundles[] = {"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+                                          "/etc/ssl/ca-bundle.pem", "/etc/ssl/cert.pem"};
+    for (const char* f : bundles)
+        if (::access(f, R_OK) == 0 && SSL_CTX_load_verify_locations(ctx, f, nullptr) == 1)
+        {
+            ok = 1;
+            break;
+        }
+    ERR_clear_error();
+    return ok;
+#else
+    (void)ctx;
+    return 0;
 #endif
 }
 

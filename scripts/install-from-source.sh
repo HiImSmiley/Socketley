@@ -13,7 +13,7 @@
 #
 # Nothing below is a guess.  Each item names the file that already encoded it:
 #
-#   build-essential libssl-dev libluajit-5.1-dev git ca-certificates
+#   build-essential libssl-dev libluajit-5.1-dev git ca-certificates cmake perl
 #                                 Dockerfile builder stage, ci.yml, release.yml
 #   liburing >= 2.7, from source  scripts/install-liburing.sh, which owns the pin
 #   thirdparty/luajit/libluajit.a bin/build-thirdparty.sh luajit, as CI runs it
@@ -457,7 +457,7 @@ printf '\n'
 printf 'This run needs root for the following, and for nothing else:\n\n'
 if [ "$SKIP_DEPS" = 0 ]; then
     printf '  apt-get update, then apt-get install -y --no-install-recommends\n'
-    printf '      build-essential libssl-dev libluajit-5.1-dev git ca-certificates\n'
+    printf '      build-essential libssl-dev libluajit-5.1-dev git ca-certificates cmake perl\n'
     printf '      the build dependencies, taken from the Dockerfile and ci.yml.\n\n'
 fi
 printf '  make install, inside scripts/install-liburing.sh, then ldconfig\n'
@@ -505,7 +505,7 @@ else
          "apt-get failed; check the network and the package lists, then re-run -- nothing after this point has happened"
     run_root apt-get update
     run_root apt-get install -y --no-install-recommends \
-        build-essential libssl-dev libluajit-5.1-dev git ca-certificates
+        build-essential libssl-dev libluajit-5.1-dev git ca-certificates cmake perl
 fi
 
 # ── The compiler, checked where the answer is still actionable ──────────────
@@ -548,6 +548,10 @@ run bash scripts/install-liburing.sh
 step "building the vendored LuaJIT archive" \
      "bin/build-thirdparty.sh luajit failed; the first run needs git and a network"
 run bash bin/build-thirdparty.sh luajit
+# HTTP/3's libraries, OpenSSL 3.5 with them; a few minutes once, a few stats after.
+step "building OpenSSL 3.5, ngtcp2 and nghttp3 for HTTP/3" \
+     "bin/build-thirdparty.sh http3 failed; it needs perl, cmake, git and a network"
+run bash bin/build-thirdparty.sh http3
 
 # ── Makefiles, then the Release build ───────────────────────────────────────
 step "generating makefiles" "./bin/premake5 gmake2 failed; check that bin/premake5 is executable"

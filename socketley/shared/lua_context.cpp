@@ -1,4 +1,5 @@
 #include "lua_context.h"
+#include "tls_context.h"
 #include <strings.h>
 #include "resolve_cache.h"
 #include "http_framing.h"
@@ -1404,7 +1405,7 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         // certificate for a domain the attacker owns is entirely valid.
         SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
-        if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+        if (tls_context::load_system_roots(ctx) != 1) {
             std::string why = ssl_error_text();
             SSL_CTX_free(ctx); ::close(sock);
             result["error"] = "no system CA store available" + (why.empty() ? "" : ": " + why);

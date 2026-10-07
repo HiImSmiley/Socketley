@@ -120,6 +120,11 @@ public:
     // runtime that serves HTTP/2 turns it on. Whether a finished handshake chose it.
     void enable_h2(bool on);
     static bool negotiated_h2(SSL* ssl);
+    // The system's trusted roots: OpenSSL's own default, which is where the
+    // build's OPENSSLDIR says, and the bundle each common distribution keeps,
+    // since a statically linked OpenSSL knows only the one it was built for.
+    // 1 when any was loaded, as SSL_CTX_set_default_verify_paths answers.
+    static int load_system_roots(SSL_CTX* ctx);
 
     // Free an SSL connection
     static void free_ssl(SSL* ssl);

@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "../shared/cert_keeper.h"
+#include "../shared/tls_context.h"
 #include "../runtime/storage/json_doc.h"
 
 namespace
@@ -132,7 +133,7 @@ public:
         // A test CA's root, as Pebble's is, or the system's roots for a public one.
         const char* ca = std::getenv("SOCKETLEY_ACME_CA");
         const bool ok = ca && *ca ? SSL_CTX_load_verify_locations(m_ctx, ca, nullptr) == 1
-                                  : SSL_CTX_set_default_verify_paths(m_ctx) == 1;
+                                  : tls_context::load_system_roots(m_ctx) == 1;
         return ok || fail(err, std::string("the CA's trust roots could not be loaded") + (ca && *ca ? std::string(": ") + ca : ""));
     }
     ~https()

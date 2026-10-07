@@ -132,3 +132,8 @@ test/benchmark/bench_client
 # wants to share has to be added with an explicit `git add -f`, which is the
 # deliberate decision the old comment asked for and did not enforce.
 .claude/
+
+# Built by bin/build-thirdparty.sh http3, headers and archives alike.
+/thirdparty/openssl/
+/thirdparty/ngtcp2/
+/thirdparty/nghttp3/

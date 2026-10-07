@@ -1,4 +1,5 @@
 #include "s3_federation.h"
+#include "../../shared/tls_context.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -601,7 +602,7 @@ private:
         }
         SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
         if (!cfg.ca_file.empty() ? SSL_CTX_load_verify_locations(m_ctx, cfg.ca_file.c_str(), nullptr) != 1
-                                 : SSL_CTX_set_default_verify_paths(m_ctx) != 1)
+                                 : tls_context::load_system_roots(m_ctx) != 1)
         {
             why = cfg.ca_file.empty() ? "cannot load the system's CA certificates"
                                       : "cannot load the LDAP CA file " + cfg.ca_file;

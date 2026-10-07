@@ -119,6 +119,12 @@ else
 fi
 emit_notice "liburing" "$URING_HOW" \
     thirdparty/liburing/LICENSE
+# HTTP/3's libraries, when bin/build-thirdparty.sh http3 built them in: OpenSSL is then linked statically too.
+if [ -f thirdparty/ngtcp2/COPYING ]; then
+    emit_notice "OpenSSL"  "statically linked into /usr/bin/socketley" thirdparty/openssl/LICENSE.txt
+    emit_notice "ngtcp2"   "statically linked into /usr/bin/socketley" thirdparty/ngtcp2/COPYING
+    emit_notice "nghttp3"  "statically linked into /usr/bin/socketley" thirdparty/nghttp3/COPYING
+fi
 
 chmod 644 "$COPYRIGHT"
 

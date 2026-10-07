@@ -25,6 +25,15 @@ Checked into this repository and therefore redistributed with the source.
 | **sol2** | 3.5.0 | MIT | `thirdparty/sol2/LICENSE.txt` | header-only | https://github.com/ThePhD/sol2 |
 | **doctest** | 2.4.12 | MIT | `thirdparty/doctest/LICENSE.txt` | header-only, tests only | https://github.com/doctest/doctest |
 
+Built by `bin/build-thirdparty.sh http3` from pinned upstream tags rather than checked in, and linked statically when
+present; without them the tree builds against the system's OpenSSL and a storage runtime speaks HTTP/1.1 and HTTP/2:
+
+| Component | Version | Licence | Licence text | Linked | Upstream |
+|---|---|---|---|---|---|
+| **OpenSSL** | 3.5.9 (LTS) | Apache-2.0 | `thirdparty/openssl/LICENSE.txt` | **static** | https://www.openssl.org/ |
+| **ngtcp2** | 1.25.0 | MIT | `thirdparty/ngtcp2/COPYING` | **static** | https://github.com/ngtcp2/ngtcp2 |
+| **nghttp3** | 1.18.0 | MIT | `thirdparty/nghttp3/COPYING` | **static** | https://github.com/ngtcp2/nghttp3 |
+
 **LuaJIT is the one component compiled into the shipped binary.**  It is linked
 from `thirdparty/luajit/libluajit.a`, and MIT requires its copyright notice and
 permission notice to accompany any distribution of the software or a

@@ -86,7 +86,7 @@ env:
   # until 2026-08-01.  Each job runs scripts/install-liburing.sh instead, which
   # is also what the Dockerfile, CI and the release job use.
   APT_PACKAGES: >-
-    build-essential libssl-dev netcat-openbsd bc libluajit-5.1-dev
+    build-essential libssl-dev cmake netcat-openbsd bc libluajit-5.1-dev
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
@@ -109,7 +109,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash bin/build-thirdparty.sh luajit
+          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
           bash scripts/install-liburing.sh
 
       - name: Build (Sanitize)
@@ -199,7 +199,7 @@ jobs:
           # where the error names the cause.
           sudo apt-get install -y $APT_PACKAGES clang-18 libclang-rt-18-dev
           clang++-18 --version
-          bash bin/build-thirdparty.sh luajit
+          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
           bash scripts/install-liburing.sh
 
       # Carry-over.  The key rotates per run so each night writes a new entry;
@@ -810,7 +810,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash bin/build-thirdparty.sh luajit
+          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
           bash scripts/install-liburing.sh
 
       - name: Build (Debug + invariants, warn-only)
@@ -919,7 +919,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash bin/build-thirdparty.sh luajit
+          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
           bash scripts/install-liburing.sh
 
       - name: Build (Release)
@@ -982,7 +982,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash bin/build-thirdparty.sh luajit
+          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
           bash scripts/install-liburing.sh
 
       - name: Build (TSan)
@@ -1034,7 +1034,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y $APT_PACKAGES
-          bash bin/build-thirdparty.sh luajit
+          bash bin/build-thirdparty.sh luajit && bash bin/build-thirdparty.sh http3
           bash scripts/install-liburing.sh
 
       - name: Build (Release) and fail on any warning
