@@ -154,18 +154,21 @@ static int parse_domain_flag(runtime_instance* instance, const parsed_args& pa, 
 {
     if (instance->get_type() == runtime_storage)
         return -1;
-    if (i + 1 >= pa.count || pa.args[i + 1].empty())
+    // Without a value -- nothing follows, or the next word is another flag -- the runtime's own name is its name.
+    const bool own = i + 1 >= pa.count || pa.args[i + 1].starts_with('-');
+    if (!own && pa.args[i + 1].empty())
     {
-        std::cout << "--domain requires a name, or several separated by commas\n";
+        std::cout << "--domain requires a name, or several separated by commas; alone it takes the runtime's\n";
         return 1;
     }
-    const std::string_view v = pa.args[++i];
+    const std::string_view v = own ? instance->get_name() : pa.args[++i];
     for (size_t p = 0; p <= v.size();)
     {
         const size_t comma = std::min(v.find(',', p), v.size());
         if (std::string why; !dns_feed::valid_name(v.substr(p, comma - p), why))
         {
-            std::cout << "--domain: " << why << "\n";
+            std::cout << "--domain: " << why << (own ? " (the runtime's name, taken since no name followed --domain)" : "")
+                      << "\n";
             return 1;
         }
         p = comma + 1;
@@ -1528,13 +1531,17 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         {
             std::vector<std::string> domains;
             std::string why;
-            if (i + 1 >= pa.count || !socketley::storage::parse_domains(pa.args[i + 1], domains, why))
+            // Without a value, the runtime's own name, as on every other runtime.
+            const bool own = i + 1 >= pa.count || pa.args[i + 1].starts_with('-');
+            const std::string_view v = own ? stg->get_name() : pa.args[i + 1];
+            if (!socketley::storage::parse_domains(v, domains, why))
             {
-                std::cout << (why.empty() ? "--domain requires a domain name, or several separated by commas" : why)
-                          << "\n";
+                std::cout << (own ? "--domain: the runtime's name is no domain name; give one: " : "") << why << "\n";
                 return 1;
             }
-            stg->set_domain(pa.args[++i]);
+            if (!own)
+                ++i;
+            stg->set_domain(v);
             return 0;
         }
         // When an answered write reaches the disk: before its answer, within --fsync-interval after it, or at a stop.

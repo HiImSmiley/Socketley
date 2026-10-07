@@ -8,6 +8,8 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <sstream>
 #include <unordered_map>
 
@@ -22,6 +24,7 @@
 #include <unistd.h>
 
 #include "../../shared/dns_feed.h"
+#include "../../shared/paths.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/ip_block.h"
 #include "../../shared/logging.h"
@@ -409,6 +412,9 @@ bool dns_run::start(std::string& why)
             LOG_WARN("dns: --proxy is set but this machine has no public address on its interfaces (behind NAT?); "
                      "no runtime's name is published until --publish names one");
     }
+    // A zone named rather than given as a file, or a file since removed, is written first.
+    if (!m_owner.ensure_zone_files(why))
+        return false;
     auto zs = std::make_shared<zone_set>();
     const extra_records extra = feed_extra();
     if (!load_all(m_paths, *zs, why, &extra))
@@ -1339,7 +1345,109 @@ dns_instance::~dns_instance() = default;
 
 std::vector<std::string> dns_instance::zone_paths() const
 {
-    return socketley::dns::split_csv(m_zones);
+    auto paths = socketley::dns::split_csv(m_zones);
+    for (auto& p : paths)
+        if (p.find('/') == std::string::npos)
+            p = managed_zone_path(p);
+    return paths;
+}
+
+std::string dns_instance::managed_zone_path(std::string_view zone)
+{
+    std::string n;
+    for (char c : zone)
+        n += (c >= 'A' && c <= 'Z') ? static_cast<char>(c | 0x20) : c;
+    while (!n.empty() && n.back() == '.')
+        n.pop_back();
+    return (socketley_paths::resolve().state_dir / "zones" / (n + ".zone")).string();
+}
+
+bool dns_instance::ensure_zone_files(std::string& why) const
+{
+    for (const auto& entry : socketley::dns::split_csv(m_zones))
+    {
+        const bool named = entry.find('/') == std::string::npos;
+        const std::string path = named ? managed_zone_path(entry) : entry;
+        struct stat st{};
+        if (::stat(path.c_str(), &st) == 0)
+            continue;
+        // The zone a missing file is for: the name given, or the file's own name less ".zone".
+        std::string origin = named ? entry : std::filesystem::path(path).filename().string();
+        if (!named && origin.ends_with(".zone"))
+            origin.resize(origin.size() - 5);
+        while (!origin.empty() && origin.back() == '.')
+            origin.pop_back();
+        if (std::string bad; (!named && !path.ends_with(".zone")) || origin.find('.') == std::string::npos ||
+                             !dns_feed::valid_name(origin, bad) || origin.starts_with("*."))
+        {
+            why = named ? "--zone: '" + entry + "' is neither a zone's name such as example.com nor a file's path"
+                        : "--zone: " + path + " does not exist, and its name says no zone to write it for (name it "
+                                              "<zone>.zone, or give the zone's name instead of a path)";
+            return false;
+        }
+        for (char& c : origin)
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c | 0x20);
+
+        // Its servers' addresses: --publish's, or this machine's public ones.
+        std::vector<std::string> v4, v6;
+        if (std::string bad; !socketley::dns::parse_publish(m_publish, v4, v6, bad))
+        {
+            why = "--publish takes IPv4 and IPv6 addresses, not '" + bad + "'";
+            return false;
+        }
+        if (v4.empty() && v6.empty())
+            socketley::dns::public_addresses(v4, v6);
+        if (v4.empty() && v6.empty())
+        {
+            why = "--zone: writing the zone " + origin + " needs the address its name servers answer on, and this "
+                  "machine has no public one on its interfaces (behind NAT?); give it with --publish";
+            return false;
+        }
+
+        const std::time_t now = std::time(nullptr);
+        std::tm tm{};
+        ::gmtime_r(&now, &tm);
+        char serial[16];
+        std::snprintf(serial, sizeof serial, "%04d%02d%02d01", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+        std::string text = "; The zone " + origin + ", written by socketley for dns runtime '" + std::string(get_name()) +
+                           "'. Yours to edit: it is read again within a second.\n"
+                           "; The names of runtimes (--domain) need no line here; the runtime adds them itself.\n"
+                           "; The registrar is told ns1." + origin + " and ns2." + origin +
+                           " as the name servers, with the addresses below as their glue.\n"
+                           "$ORIGIN " + origin + ".\n"
+                           "$TTL 3600\n"
+                           "@    SOA  ns1 hostmaster " + serial + " 1h 15m 1w 300\n"
+                           "     NS   ns1\n"
+                           "     NS   ns2\n";
+        for (const char* ns : {"ns1", "ns2"})
+        {
+            char buf[INET6_ADDRSTRLEN];
+            for (const auto& a : v4)
+                if (::inet_ntop(AF_INET, a.data(), buf, sizeof buf))
+                    text += std::string(ns) + "  A    " + buf + "\n";
+            for (const auto& a : v6)
+                if (::inet_ntop(AF_INET6, a.data(), buf, sizeof buf))
+                    text += std::string(ns) + "  AAAA " + buf + "\n";
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+        const std::string tmp = path + ".tmp";
+        FILE* f = std::fopen(tmp.c_str(), "we");
+        const bool written = f && std::fwrite(text.data(), 1, text.size(), f) == text.size();
+        if (f)
+            std::fclose(f);
+        // Linked rather than renamed, so two shards writing at once leave one whole file and neither is overwritten.
+        if (!written || (::link(tmp.c_str(), path.c_str()) < 0 && errno != EEXIST))
+        {
+            ::unlink(tmp.c_str());
+            why = "--zone: " + path + " could not be written: " + std::strerror(errno ? errno : EIO);
+            return false;
+        }
+        ::unlink(tmp.c_str());
+    }
+    return true;
 }
 
 uint16_t dns_instance::effective_port() const
@@ -1362,7 +1470,9 @@ std::string dns_instance::config_refusal() const
 {
     const auto paths = zone_paths();
     if (paths.empty())
-        return "dns: --zone <file> is required: a name server answers for the zones it is given\n";
+        return "dns: --zone is required: the zone's name, such as example.com, or a zone file\n";
+    if (std::string why; !ensure_zone_files(why))
+        return "dns: " + why + "\n";
     if (!get_listen_path().empty())
         return "dns: --listen unix: is not served; DNS is asked over UDP and TCP\n";
     if (get_tls())

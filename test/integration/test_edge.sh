@@ -7,6 +7,9 @@
 #                create, edit and import, whatever its case or trailing dot,
 #                and across types; the runtimes of one group share a name; the
 #                entrance, a proxy without --backend, has none of its own
+#   own names    --domain with no name after it is the runtime's own name
+#   zones        --zone with a zone's name writes the zone's file itself, once,
+#                with ns1 and ns2 and their addresses, and leaves it to be edited
 #   publishing   a dns runtime with --proxy answers every runtime's name with
 #                this machine's public address, or --publish's; a cache's name
 #                too, though only HTTP runtimes are routed
@@ -58,6 +61,15 @@ has "the entrance has no name of its own" "$("$BIN" create proxy e -p $((P+5)) -
 expect "and nothing refused was made" "$("$BIN" ls 2>/dev/null | awk 'NR>1 {print $2}' | sort | tr '\n' ' ')" "a g1 g2 "
 for r in a g1 g2; do "$BIN" remove "$r" >/dev/null 2>&1; done
 
+# --domain with no name after it is the runtime's own name.
+expect "--domain alone takes the runtime's name" "$("$BIN" create server own -p $((P+6)) --domain -s 2>&1)" ""
+has "and show says so" "$("$BIN" show own 2>&1)" '"domain": "own"'
+expect "a storage runtime's too" "$("$BIN" create storage ownstore -p $((P+7)) --dir "$T/os" --anonymous --domain 2>&1)" ""
+has "with its buckets beneath it" "$("$BIN" show ownstore 2>&1)" '"domain": "ownstore"'
+has "a runtime's name that is no DNS name is refused, and said to be the runtime's" \
+    "$("$BIN" create server my_x -p $((P+8)) --domain 2>&1)" "the runtime's name, taken since no name followed --domain"
+for r in own ownstore; do "$BIN" remove "$r" >/dev/null 2>&1; done
+
 # ── publishing, through the entrance ────────────────────────────────────────
 command -v dig >/dev/null 2>&1 || { echo "  SKIP: dig is not installed, so names are not asked for"; echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"; exit "$FAIL"; }
 cat > "$T/z.zone" <<'EOF'
@@ -90,6 +102,34 @@ expect "--publish names the address instead" "$got" "198.51.100.7"
 expect "a storage runtime's buckets under its short name" "$(qd photos.ui.example.com A)" "198.51.100.7"
 expect "a cache's name is published too" "$(qd mycache.example.com A)" "198.51.100.7"
 expect "a name the zone file gives an address keeps it" "$(qd mail.example.com A)" "192.0.2.25"
+
+# ── a zone given by its name ────────────────────────────────────────────────
+Z=$((P+20))
+cd "$T"
+expect "--zone with a zone's name and no file makes the runtime" \
+    "$("$BIN" create dns nsz -p "$Z" --zone Zed.Example. --publish 198.51.100.9 --rrl 0 -s 2>&1)" ""
+zf=$(find "$T" -path '*zones/zed.example.zone' | head -1)
+[ -n "$zf" ] && ok "and its file is written in the state directory" || bad "zone file" "none under $T"
+dz() { dig @127.0.0.1 -p "$Z" +time=2 +tries=1 +short "$@" 2>&1; }
+for _ in $(seq 1 40); do [ -n "$(dz zed.example SOA)" ] && break; sleep 0.2; done
+expect "it answers the zone's SOA" "$(dz zed.example SOA | cut -d' ' -f1-2)" "ns1.zed.example. hostmaster.zed.example."
+expect "and names ns1 and ns2 as its servers" "$(dz zed.example NS | sort | tr '\n' ' ')" "ns1.zed.example. ns2.zed.example. "
+expect "with --publish's address" "$(dz ns2.zed.example A)" "198.51.100.9"
+echo 'www  A  192.0.2.80' >> "$zf"
+for _ in $(seq 1 40); do got=$(dz www.zed.example A); [ -n "$got" ] && break; sleep 0.2; done
+expect "the file is the user's to edit, and read again" "$got" "192.0.2.80"
+"$BIN" stop nsz >/dev/null 2>&1; "$BIN" start nsz >/dev/null 2>&1
+for _ in $(seq 1 40); do got=$(dz www.zed.example A); [ -n "$got" ] && break; sleep 0.2; done
+expect "and kept, not written over, at a restart" "$got" "192.0.2.80"
+"$BIN" remove nsz >/dev/null 2>&1
+expect "a missing <zone>.zone path is written where it was given" \
+    "$("$BIN" create dns nsf -p "$Z" --zone "$T/zz/third.example.zone" --publish 198.51.100.9 2>&1; ls "$T/zz")" "third.example.zone"
+"$BIN" remove nsf >/dev/null 2>&1
+has "a missing file of another name is refused" \
+    "$("$BIN" create dns nsn -p "$Z" --zone "$T/zz/nope.txt" --publish 198.51.100.9 2>&1)" "does not exist"
+has "and so is a name that is no zone's" "$("$BIN" create dns nsn -p "$Z" --zone nozone --publish 198.51.100.9 2>&1)" \
+    "neither a zone's name"
+cd - >/dev/null
 
 # ── the table the entrance routes by ────────────────────────────────────────
 mkdir -p "$T/c1" "$T/c2" "$T/late"; echo one > "$T/c1/who.txt"; echo two > "$T/c2/who.txt"; echo late > "$T/late/who.txt"

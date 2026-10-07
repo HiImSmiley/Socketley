@@ -43,6 +43,11 @@ public:
     }
     std::string_view get_zones() const { return m_zones; }
     std::vector<std::string> zone_paths() const;
+    // Where the file of a zone given by name (--zone example.com) is kept: the state directory's zones/.
+    static std::string managed_zone_path(std::string_view zone);
+    // Each zone file that does not exist yet written, for a zone given by name or a missing <zone>.zone: its SOA,
+    // ns1 and ns2 as its servers, with --publish's addresses or this machine's public ones. False with the reason.
+    bool ensure_zone_files(std::string& why) const;
 
     // Who may copy a whole zone (--transfer): addresses and blocks, comma-separated; empty is nobody.
     void set_transfer(std::string_view csv) { m_transfer = std::string(csv); }

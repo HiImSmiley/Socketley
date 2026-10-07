@@ -91,7 +91,7 @@ SINK_PID=$!
 daemon_start "$BIN"
 
 # ── create ──────────────────────────────────────────────────────────────────
-has "a dns runtime without --zone is refused" "$("$BIN" create dns bad -p "$P" -s 2>&1)" "--zone <file> is required"
+has "a dns runtime without --zone is refused" "$("$BIN" create dns bad -p "$P" -s 2>&1)" "--zone is required"
 "$BIN" remove bad >/dev/null 2>&1
 printf '$ORIGIN x.\n$TTL 60\n@ SOA a b 1 1 1 1 1\n@ NS a\nwww A 300.1.1.1\n' > "$T/broken.zone"
 has "a zone that does not parse is refused with its line" "$("$BIN" create dns bad -p "$P" --zone "$T/broken.zone" -s 2>&1)" "line 5"

@@ -2346,8 +2346,12 @@ socketley create proxy web \-p 443 \-\-acme example.com,www.example.com \\
 socketley create proxy plain \-p 80 \-\-backend 127.0.0.1:8080 \-s
 .fi
 .TP
-.BI "\-\-domain " "name" \fR[\fB,\fIname\fR...]
-The names the runtime is reached by, which a
+.BR \-\-domain " [" \fIname\fR[\fB,\fIname\fR...]]
+The names the runtime is reached by; with no name after it, the runtime's own
+.RB ( "create server chat \-\-domain"
+is reached as
+.BR chat ).
+They are names a
 .B dns
 runtime with
 .B \-\-publish
@@ -10619,8 +10623,8 @@ runtime is an authoritative name server: it answers, over UDP and TCP on one
 port, for the zones in the files it is given, and for nothing else.
 .PP
 .nf
-socketley create dns ns \-\-zone /etc/socketley/example.com.zone \-s
-dig @127.0.0.1 www.example.com
+socketley create dns ns \-\-zone example.com \-s
+dig @127.0.0.1 example.com SOA
 .fi
 .PP
 It asks no other server and caches nothing: a name in none of its zones is
@@ -10646,10 +10650,23 @@ and
 .B \-\-tls
 are refused.
 .TP
-.BI \-\-zone " file"
-A zone file in the master file format of RFC 1035, given once for each zone or
-as several paths separated by commas, each made absolute against the caller's
-directory. Required. The zone's apex is the owner of its one SOA record; every
+.BI \-\-zone " name\fR|\fIfile"
+The zone to serve, by its name or as a zone file, given once for each zone or
+as several separated by commas. Required. A name, such as
+.BR example.com ,
+needs no file: the runtime writes one under
+.IR state\-dir /zones/ name .zone
+the first time, with its SOA, ns1 and ns2 as its name servers and the addresses
+of
+.B \-\-publish
+(or this machine's public ones) as theirs, and serves it from then on; the file
+is the user's to edit, and is never written again while it exists. Those two
+names and addresses are what the registrar is told as the domain's name servers
+and their glue. A path is made absolute against the caller's directory; a file
+called
+.IB zone .zone
+that does not exist is written there the same way. A zone file is in the
+master file format of RFC 1035. The zone's apex is the owner of its one SOA record; every
 record has to lie at or below it, the apex has to name its servers with NS
 records, a CNAME has to be the only record of its name, and below a delegation
 only the addresses of its servers may stand. A file that is not such a zone is

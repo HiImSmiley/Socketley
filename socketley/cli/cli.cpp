@@ -731,6 +731,14 @@ std::string cli_caller_path(std::string_view flag, std::string_view value)
             pos = comma + 1;
         }
     }
+    // A zone given by its name (example.com) rather than a file: one without a slash that is no file here and
+    // not called *.zone. The daemon keeps that zone's file itself.
+    if (flag == "--zone" && value.find('/') == std::string_view::npos && !value.ends_with(".zone"))
+    {
+        std::error_code ec;
+        if (!std::filesystem::exists(value, ec))
+            return std::string(value);
+    }
     std::string_view prefix;
     bool is_path = false;
     for (std::string_view f : path_flags)

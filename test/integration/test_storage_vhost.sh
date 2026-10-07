@@ -90,14 +90,15 @@ contains "<bucket>.localhost resolves to the loopback" \
 daemon_start "$BIN"
 
 echo "== the flag =="
-for d in "" "bad_name.test" "-lead.test" "a..b" "x,"; do
+for d in "bad_name.test" "-lead.test" "a..b" "x,"; do
     out=$("$BIN" create storage stgvhx -p "$PX" --dir "$WORK/x" --anonymous --domain "$d" 2>&1); rc=$?
     expect "--domain '$d' is refused" "$rc" 1
     "$BIN" remove stgvhx >/dev/null 2>&1
 done
 contains "and says what a domain is" "$out" "DNS names separated by commas"
 out=$("$BIN" create storage stgvhx -p "$PX" --dir "$WORK/x" --anonymous --domain 2>&1); rc=$?
-expect "--domain with no value is refused" "$rc" 1
+expect "--domain with no value takes the runtime's name" "$rc" 0
+contains "and show says so" "$("$BIN" show stgvhx 2>&1)" '"domain": "stgvhx"'
 "$BIN" remove stgvhx >/dev/null 2>&1
 
 "$BIN" create storage stgvh -p "$PORT" --dir "$DATA" --access-key "$AK" --secret-key "$SK" \
