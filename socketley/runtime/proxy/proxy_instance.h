@@ -166,6 +166,12 @@ struct alignas(64) proxy_client_connection
     std::string method;
     std::string path;
     std::string version;
+    // An entrance's: the name the request asked for (lower case, no port, no
+    // trailing dot), how many Host fields it carried, and whether its Via
+    // already names this entrance.
+    std::string host;
+    uint8_t host_fields{0};
+    bool via_loop{false};
 
     // How the request whose header block was just parsed frames its own body,
     // written by parse_http_request_line and read once by
@@ -703,6 +709,23 @@ private:
     const backend_info* select_and_resolve_backend(proxy_client_connection* conn,
                                                    const std::string* exclude_host = nullptr,
                                                    uint16_t exclude_port = 0);
+    struct entrance_route
+    {
+        std::vector<uint32_t> idx;
+        uint32_t next{0};
+    };
+    // The entrance's table read again when its file changed, no more often
+    // than `min_gap` asks.
+    void entrance_load(std::chrono::milliseconds min_gap);
+    // The route for a host name, exact before wildcard; nullptr for none.
+    entrance_route* entrance_find(std::string_view host);
+    // A runtime of conn->host's route, round robin over those available; on a
+    // retry, one other than the one that just failed.
+    const backend_info* entrance_select(proxy_client_connection* conn, bool retry);
+    // The entrance's checks on a parsed request -- a Host, the same name as
+    // the TLS handshake gave, not seen before in Via, a route -- answered here
+    // when one fails, and true then.
+    bool entrance_refuse(proxy_client_connection* conn);
     // A false return covers two different things, so *resource_failure says
     // when the backend said nothing at all -- blaming it for our own resource
     // limit trips the breaker on a healthy backend.
@@ -942,6 +965,25 @@ private:
     proxy_strategy m_strategy = strategy_round_robin;
     std::vector<backend_info> m_backends;
     std::string m_prefix;  // pre-built "/<name>/" to avoid repeated allocation
+
+    // ── the entrance ────────────────────────────────────────────────────────
+    // A proxy speaking HTTP with no --backend routes each request by the name
+    // it asked for, from the table the daemon writes (dns_feed::routes_path):
+    // the addresses a route names are appended to m_backends as they first
+    // appear, so the pool, the breakers and the health checks work on them as
+    // on any backend, and a route (entrance_route) is the indices of its
+    // runtimes.
+    bool m_entrance{false};
+    std::unordered_map<std::string, entrance_route> m_entrance_exact;
+    // "*.ui.example.com" kept as ".ui.example.com", longest first, so the most
+    // specific wildcard answers.
+    std::vector<std::pair<std::string, entrance_route>> m_entrance_wild;
+    std::unordered_map<std::string, uint32_t> m_entrance_addr;
+    int64_t m_entrance_stamp{-1};
+    std::chrono::steady_clock::time_point m_entrance_checked{};
+    // What this entrance writes into Via and looks for there, so a request
+    // that comes round to it again is refused instead of circling.
+    std::string m_via_token;
 
     // The last snapshot the manager published, immutable and shared and read
     // on the connection path with no lock, null until the first publish.

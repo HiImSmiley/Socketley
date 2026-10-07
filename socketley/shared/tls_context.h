@@ -128,6 +128,8 @@ public:
 
     // Free an SSL connection
     static void free_ssl(SSL* ssl);
+    // The name the client asked for in its handshake (SNI), or nullptr.
+    static const char* server_name(const SSL* ssl);
 
     // Whether the certificate the peer presented names `name` (a DNS name or an
     // IP address), for a server that learns whom to expect only from what the

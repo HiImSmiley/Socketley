@@ -11,6 +11,7 @@
 #include "../../shared/invariants.h"
 #include "../../shared/fast_lo.h"
 #include "../../shared/unix_listener.h"
+#include "../../shared/dns_feed.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -31,6 +32,7 @@
 #include <liburing.h>
 #ifdef SOCKETLEY_TRACE
 #include <dirent.h>
+#include <sys/stat.h>
 #include <cstdio>
 #endif
 
@@ -313,6 +315,9 @@ void proxy_client_connection::reset(int new_fd)
     method.clear();
     path.clear();
     version.clear();
+    host.clear();
+    host_fields = 0;
+    via_loop = false;
     filter_headers.clear();
     filter_removed_headers.clear();
     declared_body_len = 0;
@@ -1029,6 +1034,11 @@ void proxy_instance::on_loop_turn()
 {
     // Counted before anything returns, because take_parked_backend() reads it.
     ++m_turn;
+
+    // The entrance's table, looked at once a second: a stat, and a read only
+    // when the daemon wrote it again.
+    if (m_entrance && m_loop)
+        entrance_load(std::chrono::milliseconds(1000));
 
     if (!m_recv_multishot_supported)
     {
@@ -1770,7 +1780,23 @@ bool proxy_instance::setup(event_loop& loop)
     // checked against the ring, and m_loop is null exactly then.
     m_retired_loop = &loop;
 
-    if (m_backends.empty())
+    // A proxy speaking HTTP with no --backend is the entrance, and finds what
+    // it routes to in the table the daemon writes for it; what the previous
+    // run appended from that table is read afresh.
+    m_entrance = m_protocol == protocol_http && (m_entrance || m_backends.empty());
+    if (m_entrance)
+    {
+        m_backends.clear();
+        m_entrance_exact.clear();
+        m_entrance_wild.clear();
+        m_entrance_addr.clear();
+        m_entrance_stamp = -1;
+        char hn[256] = {};
+        if (::gethostname(hn, sizeof(hn) - 1) != 0 || !hn[0])
+            std::strcpy(hn, "localhost");
+        m_via_token = std::string(get_name()) + "." + hn;
+    }
+    else if (m_backends.empty())
         return false;
 
     // ─── --listen unix:/path/to.sock ────────────────────────────────────────
@@ -2067,6 +2093,9 @@ bool proxy_instance::setup(event_loop& loop)
     m_health_checks.clear();
     m_health_checks.resize(m_backends.size());
     m_health_checks_pending = false;
+
+    if (m_entrance)
+        entrance_load(std::chrono::milliseconds(0));
 
     // Start health check timer if configured
     if (m_mesh.health_check != mesh_config::health_none && m_mesh.health_interval > 0)
@@ -3693,18 +3722,30 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
             return;
         }
 
-        // Check path prefix (m_prefix = "/<name>/", strip trailing slash for bare match)
-        std::string_view bare = std::string_view(m_prefix).substr(0, m_prefix.size() - 1);
-        if (!conn->path.starts_with(m_prefix) && conn->path != bare)
+        // An entrance routes by name and passes the path on as it came; any
+        // other proxy is reached under its own prefix and strips it.
+        std::string_view new_path;
+        if (m_entrance)
         {
-            send_error(conn, "404 Not Found", "Not Found\n");
-            return;
+            if (entrance_refuse(conn))
+                return;
+            new_path = conn->path;
         }
+        else
+        {
+            // Check path prefix (m_prefix = "/<name>/", strip trailing slash for bare match)
+            std::string_view bare = std::string_view(m_prefix).substr(0, m_prefix.size() - 1);
+            if (!conn->path.starts_with(m_prefix) && conn->path != bare)
+            {
+                send_error(conn, "404 Not Found", "Not Found\n");
+                return;
+            }
 
-        // Strip prefix through backend_path(), because on_route needs the same
-        // answer and two copies of a string transformation is two chances to
-        // tell a script a path the backend never sees.
-        std::string_view new_path = backend_path(conn->path);
+            // Strip prefix through backend_path(), because on_route needs the same
+            // answer and two copies of a string transformation is two chances to
+            // tell a script a path the backend never sees.
+            new_path = backend_path(conn->path);
+        }
 
         // The route declaration, first of everything, because it is the
         // cheapest verdict available and the only one derived from what the
@@ -4352,12 +4393,89 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     conn->declared_body_len = scan.has_content_length ? scan.content_length : 0;
     conn->declared_body_chunked = scan.transfer_encoding;
 
+    // An entrance routes by the name asked for, so it reads it here, with the
+    // Via fields a request that came round again would carry.
+    if (m_entrance)
+    {
+        conn->host.clear();
+        conn->host_fields = 0;
+        conn->via_loop = false;
+        std::string_view authority;
+        for (size_t p = 0; p < headers.size();)
+        {
+            size_t nl = headers.find("\r\n", p);
+            if (nl == std::string_view::npos)
+                nl = headers.size();
+            const std::string_view hl = headers.substr(p, nl - p);
+            p = nl + 2;
+            const auto colon = hl.find(':');
+            if (colon == std::string_view::npos)
+                continue;
+            if (header_name_equals(hl, "host", 4))
+            {
+                if (conn->host_fields < 255)
+                    ++conn->host_fields;
+                authority = http_trim_ows(hl.substr(colon + 1));
+            }
+            else if (header_name_equals(hl, "via", 3))
+            {
+                // Each element is "<protocol> <received-by> [comment]"; ours
+                // is a whole received-by, not a piece of somebody else's.
+                const std::string_view v = hl.substr(colon + 1);
+                for (size_t at = v.find(m_via_token); at != std::string_view::npos;
+                     at = v.find(m_via_token, at + 1))
+                {
+                    const size_t end = at + m_via_token.size();
+                    if (at > 0 && v[at - 1] == ' ' && (end == v.size() || v[end] == ' ' || v[end] == ',' ||
+                                             v[end] == '\t'))
+                        conn->via_loop = true;
+                }
+            }
+        }
+        // The absolute form names the host itself and wins over the field
+        // (RFC 9112 3.2.2); the backend is given the origin form.
+        std::string_view target = conn->path;
+        for (std::string_view scheme : {std::string_view("http://"), std::string_view("https://")})
+            if (target.size() > scheme.size() &&
+                http_token_equals(target.substr(0, scheme.size()), scheme.data(), scheme.size()))
+            {
+                std::string_view rest = target.substr(scheme.size());
+                const size_t slash = rest.find_first_of("/?");
+                std::string origin = slash == std::string_view::npos ? "/" : std::string(rest.substr(slash));
+                if (!origin.starts_with('/'))
+                    origin.insert(0, 1, '/');
+                conn->host_fields = std::max<uint8_t>(conn->host_fields, 1);
+                conn->host.assign(rest.substr(0, slash));
+                conn->path = std::move(origin);
+                authority = {};
+                break;
+            }
+        if (!authority.empty())
+            conn->host.assign(authority);
+        // The port and a trailing dot are not part of the name; an IPv6
+        // literal keeps its brackets and loses only what follows them.
+        if (!conn->host.empty() && conn->host.front() == '[')
+            conn->host.erase(std::min(conn->host.size(), conn->host.find(']') + 1));
+        else if (const size_t c = conn->host.find(':'); c != std::string::npos)
+            conn->host.erase(c);
+        while (!conn->host.empty() && conn->host.back() == '.')
+            conn->host.pop_back();
+        for (char& c : conn->host)
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c | 0x20);
+    }
+
     return http_request_parse::complete;
 }
 
 bool proxy_instance::append_backend_host_header(std::string& out,
                                                 const proxy_client_connection* conn) const
 {
+    // An entrance's runtimes are told the name the client asked for, which is
+    // how a storage runtime finds the bucket and a site its own name.
+    if (m_entrance)
+        return false;
+
     std::string_view host;
     uint16_t port = 0;
 
@@ -4643,6 +4761,13 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     {
         result += "X-Forwarded-Host: ";
         result.append(client_host.data(), client_host.size());
+        result += "\r\n";
+    }
+    if (m_entrance)
+    {
+        result += "Via: ";
+        result += conn->version == "HTTP/1.0" ? "1.0 " : "1.1 ";
+        result += m_via_token;
         result += "\r\n";
     }
 
@@ -5245,6 +5370,193 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
 // Recorded on the connection the way a group member is -- endpoint beside
 // index -- because for a sharded runtime the index alone no longer names the
 // socket: the breaker, the pool key and the Host header all read the node.
+// ── the entrance ────────────────────────────────────────────────────────────
+
+void proxy_instance::entrance_load(std::chrono::milliseconds min_gap)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (m_entrance_stamp >= 0 && now - m_entrance_checked < min_gap)
+        return;
+    m_entrance_checked = now;
+
+    const std::string path = dns_feed::routes_path(get_name());
+    struct stat st{};
+    // No file is an empty table, the same as one with no routes.
+    const int64_t stamp = ::stat(path.c_str(), &st) < 0
+                              ? 0
+                              : static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec +
+                                    static_cast<int64_t>(st.st_size);
+    if (stamp == m_entrance_stamp)
+        return;
+    m_entrance_stamp = stamp;
+
+    std::string text;
+    if (stamp)
+        if (FILE* f = std::fopen(path.c_str(), "re"))
+        {
+            char buf[8192];
+            for (size_t n; (n = std::fread(buf, 1, sizeof(buf), f)) > 0;)
+                text.append(buf, n);
+            std::fclose(f);
+        }
+
+    std::unordered_map<std::string, entrance_route> exact;
+    std::vector<std::pair<std::string, entrance_route>> wild;
+    for (size_t p = 0; p < text.size();)
+    {
+        size_t nl = text.find('\n', p);
+        if (nl == std::string::npos)
+            nl = text.size();
+        const std::string_view line(text.data() + p, nl - p);
+        p = nl + 1;
+        if (!line.starts_with("route "))
+            continue;   // a zone line, or one this version does not know
+
+        std::vector<std::string_view> words;
+        for (size_t w = 6; w < line.size();)
+        {
+            const size_t sp = std::min(line.find(' ', w), line.size());
+            if (sp > w)
+                words.push_back(line.substr(w, sp - w));
+            w = sp + 1;
+        }
+        if (words.size() < 2)
+            continue;
+
+        entrance_route route;
+        for (size_t i = 1; i < words.size(); ++i)
+        {
+            const std::string addr(words[i]);
+            auto it = m_entrance_addr.find(addr);
+            if (it == m_entrance_addr.end())
+            {
+                // A new address joins m_backends for good: a removed route
+                // leaves an entry nothing selects, and the per-backend state
+                // grows beside it.
+                backend_info b;
+                b.address = addr;
+                if (!resolve_backend(b))
+                {
+                    LOG_WARN(("proxy " + std::string(get_name()) + ": route to \"" + addr +
+                              "\" left out; it is not an address").c_str());
+                    continue;
+                }
+                const uint32_t idx = static_cast<uint32_t>(m_backends.size());
+                m_backends.push_back(std::move(b));
+                m_backend_health.resize(m_backends.size());
+                m_circuit_breakers.resize(m_backends.size());
+                m_backend_pool.resize(m_backends.size());
+                m_health_checks.resize(m_backends.size());
+                it = m_entrance_addr.emplace(addr, idx).first;
+            }
+            route.idx.push_back(it->second);
+        }
+        if (route.idx.empty())
+            continue;
+
+        std::string name(words[0]);
+        if (name.starts_with("*."))
+            wild.emplace_back(name.substr(1), std::move(route));
+        else
+            exact[std::move(name)] = std::move(route);
+    }
+    std::sort(wild.begin(), wild.end(),
+              [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+    m_entrance_exact = std::move(exact);
+    m_entrance_wild = std::move(wild);
+}
+
+proxy_instance::entrance_route* proxy_instance::entrance_find(std::string_view host)
+{
+    if (host.empty())
+        return nullptr;
+    if (auto it = m_entrance_exact.find(std::string(host)); it != m_entrance_exact.end())
+        return &it->second;
+    // "*.ui.example.com" covers one label or more in front of ".ui.example.com",
+    // as a storage runtime's bucket names do, and never the name itself.
+    for (auto& [suffix, route] : m_entrance_wild)
+        if (host.size() > suffix.size() && host.ends_with(suffix))
+            return &route;
+    return nullptr;
+}
+
+const backend_info* proxy_instance::entrance_select(proxy_client_connection* conn, bool retry)
+{
+    entrance_route* route = entrance_find(conn->host);
+    if (!route)
+        return nullptr;
+
+    const size_t failed = retry ? conn->backend_idx : SIZE_MAX;
+    // The runtimes of a group are there to stand in for each other, so one
+    // that refuses a connection hands the request to the next even without
+    // --retry -- before anything of it was sent, which try_retry sees to.
+    if (!retry)
+        conn->retries_remaining = std::max<int>(m_mesh.retry_count, static_cast<int>(route->idx.size()) - 1);
+    // A shard of a sharded runtime failed: another shard of it first.
+    if (retry && conn->backend_from_group && failed < m_backends.size())
+    {
+        const std::string failed_node = conn->backend_host;
+        if (const backend_info* t = pick_node(conn, failed, &failed_node))
+            return t;
+    }
+    conn->backend_from_group = false;
+
+    const size_t n = route->idx.size();
+    for (size_t a = 0; a < n; ++a)
+    {
+        const size_t k = (route->next + a) % n;
+        const uint32_t idx = route->idx[k];
+        if (idx == failed || !is_backend_available(idx))
+            continue;
+        route->next = static_cast<uint32_t>((k + 1) % n);
+        if (const backend_info* t = pick_node(conn, idx))
+            return t;
+    }
+    return nullptr;
+}
+
+bool proxy_instance::entrance_refuse(proxy_client_connection* conn)
+{
+    if (conn->via_loop)
+    {
+        send_error(conn, "508 Loop Detected", "Loop Detected: this request has been through this entrance before\n");
+        return true;
+    }
+    if (conn->host_fields != 1 || conn->host.empty())
+    {
+        send_error(conn, "400 Bad Request", "Bad Request: one Host is needed, and it names where the request goes\n");
+        return true;
+    }
+    // A connection made for one name is not used for another's requests: its
+    // certificate was chosen for that name, and so was who may see them.
+    if (conn->ssl)
+        if (const char* sni = tls_context::server_name(conn->ssl); sni && *sni)
+        {
+            std::string_view s(sni);
+            while (s.ends_with('.'))
+                s.remove_suffix(1);
+            if (s.size() != conn->host.size() ||
+                !std::equal(s.begin(), s.end(), conn->host.begin(),
+                            [](char a, char b) { return (a >= 'A' && a <= 'Z' ? (a | 0x20) : a) == b; }))
+            {
+                send_error(conn, "421 Misdirected Request",
+                           "Misdirected Request: this connection was opened for another name\n");
+                return true;
+            }
+        }
+    if (!entrance_find(conn->host))
+    {
+        // Perhaps a runtime that is newer than the table read last.
+        entrance_load(std::chrono::milliseconds(100));
+        if (!entrance_find(conn->host))
+        {
+            send_error(conn, "404 Not Found", "Not Found: no runtime here has that name\n");
+            return true;
+        }
+    }
+    return false;
+}
+
 const backend_info* proxy_instance::pick_node(proxy_client_connection* conn, size_t idx,
                                               const std::string* exclude_path)
 {
@@ -5305,6 +5617,9 @@ const backend_info* proxy_instance::pick_node(proxy_client_connection* conn, siz
 const backend_info* proxy_instance::select_and_resolve_backend(
     proxy_client_connection* conn, const std::string* exclude_host, uint16_t exclude_port)
 {
+    if (m_entrance)
+        return entrance_select(conn, exclude_host != nullptr);
+
     if (SOCKETLEY_UNLIKELY(m_backends.empty()))
         return nullptr;
 
@@ -7344,7 +7659,7 @@ bool proxy_instance::park_backend(proxy_client_connection* cconn,
     // One plain cleartext backend, because only there is the next request's
     // endpoint this socket's by construction, and a TLS peer's session
     // tickets would read as bytes nobody asked for.
-    if (m_backends.size() != 1 || m_backends[0].is_group || !m_backends[0].nodes.empty() ||
+    if (m_entrance || m_backends.size() != 1 || m_backends[0].is_group || !m_backends[0].nodes.empty() ||
         cconn->backend_from_group || cconn->backend_idx != 0 || bconn->ssl != nullptr)
         return false;
     // A client that will not ask again leaves nothing to keep the socket for,
@@ -8984,7 +9299,9 @@ void proxy_instance::note_backend_success(proxy_client_connection* conn)
 
 bool proxy_instance::try_retry(proxy_client_connection* conn)
 {
-    if (conn->retries_remaining <= 0 || m_mesh.retry_count <= 0)
+    // An entrance tries the other runtimes of a group without being asked;
+    // see entrance_select.
+    if (conn->retries_remaining <= 0 || (m_mesh.retry_count <= 0 && !m_entrance))
         return false;
 
     // Never retry after response data has started flowing to the client
@@ -9037,6 +9354,24 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
         conn->pipe_to_backend[0] = -1;
         conn->pipe_to_backend[1] = -1;
         conn->splice_active = false;
+    }
+
+    // An entrance retries among the runtimes of the request's own route and
+    // nowhere else, because another route's runtime is another site.
+    if (m_entrance)
+    {
+        // Without --retry the request is kept only until it went out whole,
+        // and one that went out is not sent twice.
+        if (conn->saved_request.empty())
+            return false;
+        const backend_info* target = entrance_select(conn, /*retry=*/true);
+        if (!target || !connect_to_backend(conn, target))
+            return false;
+        if (conn->connect_pending)
+            return true;    // handle_connect forwards saved_request
+        if (!conn->saved_request.empty())
+            forward_to_backend(conn, conn->saved_request);
+        return true;
     }
 
     // A member of a group, or a node of a sharded backend, is not an index into

@@ -929,6 +929,11 @@ bool tls_context::peer_name_matches(SSL* ssl, std::string_view name)
 #endif
 }
 
+const char* tls_context::server_name(const SSL* ssl)
+{
+    return ssl ? SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name) : nullptr;
+}
+
 void tls_context::free_ssl(SSL* ssl)
 {
 #if SOCKETLEY_HAS_TLS

@@ -13,6 +13,12 @@
 #   the table    the entrance's routes: each HTTP runtime's names, a short name
 #                under each zone, a storage runtime's buckets beneath it, the
 #                runtimes of a group together, nothing for a cache
+#   the entrance a proxy without --backend routes each request by its Host to
+#                the runtime with that name, the path and the Host as they came:
+#                exact before wildcard, a group spread over and standing in for
+#                each other, 404 for a name no runtime has, 400 without a Host,
+#                508 for a request that came round again, new runtimes without
+#                a restart
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -86,8 +92,9 @@ expect "a cache's name is published too" "$(qd mycache.example.com A)" "198.51.1
 expect "a name the zone file gives an address keeps it" "$(qd mail.example.com A)" "192.0.2.25"
 
 # ── the table the entrance routes by ────────────────────────────────────────
-"$BIN" create server chat1 -p $((P+14)) -g chat --domain chat >/dev/null 2>&1
-"$BIN" create server chat2 -p $((P+15)) -g chat --domain chat >/dev/null 2>&1
+mkdir -p "$T/c1" "$T/c2" "$T/late"; echo one > "$T/c1/who.txt"; echo two > "$T/c2/who.txt"; echo late > "$T/late/who.txt"
+"$BIN" create server chat1 -p $((P+14)) -g chat --domain chat --http "$T/c1" -s >/dev/null 2>&1
+"$BIN" create server chat2 -p $((P+15)) -g chat --domain chat --http "$T/c2" -s >/dev/null 2>&1
 want="zone example.com
 route *.ui.example.com 127.0.0.1:$((P+12))
 route chat.example.com 127.0.0.1:$((P+14)) 127.0.0.1:$((P+15))
@@ -95,6 +102,87 @@ route ui.example.com 127.0.0.1:$((P+12))"
 table=""
 for _ in $(seq 1 40); do table=$(cat "$(find "$T" -name routes-web | head -1)" 2>/dev/null); [ "$table" = "$want" ] && break; sleep 0.2; done
 expect "the entrance's table: each HTTP runtime's names, a group together, no cache" "$table" "$want"
+
+# ── the entrance ────────────────────────────────────────────────────────────
+E=$((P+11))
+"$BIN" start ui >/dev/null 2>&1; "$BIN" start web >/dev/null 2>&1
+hc() { local h=$1 p=$2; shift 2; curl -s --noproxy '*' -m 3 -H "Host: $h" "$@" "http://127.0.0.1:$E$p"; }
+code() { local h=$1 p=$2; shift 2; hc "$h" "$p" -o /dev/null -w '%{http_code}' "$@"; }
+got=""
+for _ in $(seq 1 40); do got=$(hc chat.example.com /who.txt); [ -n "$got" ] && break; sleep 0.2; done
+case "$got" in one|two) ok "the entrance routes a name to its runtime, the path as it came" ;; *) bad "routed" "got '$got'" ;; esac
+seen=$(for _ in 1 2 3 4; do hc chat.example.com /who.txt; done | sort -u | tr '\n' ' ')
+expect "and spreads a group's name over its runtimes" "$seen" "one two "
+expect "a name in any case, with a trailing dot and a port" "$(hc CHAT.Example.com.:443 /who.txt | tr -d '\n' | sed 's/two/one/')" "one"
+expect "a name no runtime has is 404" "$(code nobody.example.com /who.txt)" 404
+expect "a name outside the zones is 404" "$(code chat.example.org /who.txt)" 404
+expect "a request without a Host is 400" "$(code '' /who.txt -H 'Host:')" 400
+expect "a request that came round again is 508" "$(code chat.example.com /who.txt -H "Via: 1.1 web.$(hostname)")" 508
+expect "and one that only passed another proxy is not" "$(code chat.example.com /who.txt -H "Via: 1.1 xweb.$(hostname), 1.1 other")" 200
+expect "the absolute form names the host itself" \
+    "$(curl -s --noproxy '*' -m 3 --request-target http://chat.example.com/who.txt "http://127.0.0.1:$E/x" | sed 's/two/one/')" "one"
+
+# A storage runtime is told the name asked for, which is how it finds the bucket.
+for _ in $(seq 1 40); do [ "$(code ui.example.com /)" = 200 ] && break; sleep 0.2; done
+hc ui.example.com /photos -X PUT >/dev/null
+echo hello > "$T/hello.txt"
+hc ui.example.com /photos/hello.txt -T "$T/hello.txt" >/dev/null
+expect "a bucket under a storage runtime's short name, through the entrance" "$(hc photos.ui.example.com /hello.txt)" "hello"
+expect "and the runtime itself, path style" "$(hc ui.example.com /photos/hello.txt)" "hello"
+
+"$BIN" create server late -p $((P+16)) --domain late --http "$T/late" -s >/dev/null 2>&1
+got=""
+for _ in $(seq 1 40); do got=$(hc late.example.com /who.txt); [ "$got" = late ] && break; sleep 0.2; done
+expect "a runtime made while the entrance runs is reached without a restart" "$got" "late"
+if command -v python3 >/dev/null 2>&1; then
+    two=$(python3 - "$E" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3)
+out = []
+for host in ("late.example.com", "photos.ui.example.com", "late.example.com"):
+    path = "/hello.txt" if host.startswith("photos") else "/who.txt"
+    s.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        buf += s.recv(65536)
+    head, body = buf.split(b"\r\n\r\n", 1)
+    n = int([l.split(b":")[1] for l in head.split(b"\r\n") if l.lower().startswith(b"content-length")][0])
+    while len(body) < n:
+        body += s.recv(65536)
+    out.append(body[:n].decode().strip())
+print(" ".join(out))
+PY
+)
+    expect "each request on one connection goes where its own name says" "$two" "late hello late"
+fi
+
+"$BIN" stop chat2 >/dev/null 2>&1
+seen=$(for _ in 1 2 3 4; do hc chat.example.com /who.txt; done | tr '\n' ' ')
+expect "one runtime of a group stopped, the others answer for it" "$seen" "one one one one "
+"$BIN" stop chat1 >/dev/null 2>&1
+expect "all of them stopped, 502" "$(code chat.example.com /who.txt)" 502
+"$BIN" start chat1 >/dev/null 2>&1
+
+# Over TLS a connection belongs to the name its handshake gave.
+if command -v openssl >/dev/null 2>&1; then
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=example.com \
+        -addext "subjectAltName=DNS:*.example.com,DNS:example.com" \
+        -keyout "$T/e.key" -out "$T/e.pem" >/dev/null 2>&1
+    S=$((P+17))
+    "$BIN" create dns ns2 -p $((P+18)) --zone "$T/z.zone" --proxy webs --publish 198.51.100.7 --rrl 0 -s >/dev/null 2>&1
+    "$BIN" create proxy webs -p "$S" --tls --cert "$T/e.pem" --key "$T/e.key" -s >/dev/null 2>&1
+    hs() { curl -sk --noproxy '*' -m 3 --resolve "$1:$S:127.0.0.1" "${@:3}" "https://$1:$S$2"; }
+    got=""
+    for _ in $(seq 1 40); do got=$(hs chat.example.com /who.txt); [ "$got" = one ] && break; sleep 0.2; done
+    expect "over TLS, the name of the handshake and of the request the same, the request is routed" "$got" "one"
+    expect "and a request for another name on that connection is 421" \
+        "$(hs chat.example.com /who.txt -H 'Host: late.example.com' -o /dev/null -w '%{http_code}')" 421
+    expect "while the same name in another case is the same name" \
+        "$(hs chat.example.com /who.txt -H 'Host: CHAT.Example.COM' -o /dev/null -w '%{http_code}')" 200
+    "$BIN" remove webs >/dev/null 2>&1; "$BIN" stop ns2 >/dev/null 2>&1; "$BIN" remove ns2 >/dev/null 2>&1
+else
+    echo "  SKIP: openssl is not installed, so the entrance is not asked over TLS"
+fi
 "$BIN" remove chat2 >/dev/null 2>&1
 for _ in $(seq 1 40); do grep -q "$((P+15))" "$(find "$T" -name routes-web | head -1)" || break; sleep 0.2; done
 has "a runtime removed leaves the table" "$(cat "$(find "$T" -name routes-web | head -1)")" "route chat.example.com 127.0.0.1:$((P+14))
