@@ -184,6 +184,7 @@ struct runtime_config
     std::string dns_transfer;
     std::string dns_notify;
     std::string dns_publish;
+    std::string dns_proxy;
     // Written always, since 0 is a setting (no rate limit) and not "not given".
     uint32_t dns_rrl = 100;
 

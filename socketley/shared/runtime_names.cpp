@@ -2,6 +2,7 @@
 #include "runtime_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/storage/storage_instance.h"
+#include "../runtime/dns/dns_instance.h"
 
 #include <algorithm>
 
@@ -99,6 +100,67 @@ std::string refusal(const runtime_instance& rt, const std::vector<const runtime_
                        "'; a name belongs to one runtime, or to the runtimes of one group (-g)\n";
     }
     return {};
+}
+
+std::string entrance_table(const runtime_instance& entrance, const std::vector<const runtime_instance*>& all,
+                           const std::function<std::vector<std::string>(const runtime_instance&)>& origins_of)
+{
+    std::vector<std::string> zones;
+    for (const runtime_instance* r : all)
+        if (r && r->get_type() == runtime_dns &&
+            static_cast<const dns_instance*>(r)->get_proxy() == entrance.get_name())
+            for (auto& z : origins_of(*r))
+                zones.push_back(normal(z));
+    std::sort(zones.begin(), zones.end());
+    zones.erase(std::unique(zones.begin(), zones.end()), zones.end());
+
+    // Name -> the addresses of the runtimes that have it, ordered so the text is the same every time it is built.
+    std::vector<std::pair<std::string, std::vector<std::string>>> routes;
+    const auto add = [&](const std::string& name, const std::string& addr)
+    {
+        auto it = std::find_if(routes.begin(), routes.end(), [&](const auto& r) { return r.first == name; });
+        if (it == routes.end())
+            routes.push_back({name, {addr}});
+        else if (std::find(it->second.begin(), it->second.end(), addr) == it->second.end())
+            it->second.push_back(addr);
+    };
+    for (const runtime_instance* r : all)
+    {
+        if (!r || r == &entrance || !speaks_http(*r) || r->get_tls())
+            continue;
+        std::string addr;
+        if (!r->get_listen_path().empty())
+            addr = "unix:" + std::string(r->get_listen_path());
+        else
+        {
+            const std::string_view bind = r->get_bind_address();
+            addr = (bind.empty() || bind == "0.0.0.0" ? std::string("127.0.0.1") : std::string(bind)) + ":" +
+                   std::to_string(r->effective_port());
+        }
+        for (const auto& n : of(*r, /*with_buckets=*/true))
+        {
+            const bool relative = n.find('.') == std::string::npos ||
+                                  (n.starts_with("*.") && n.find('.', 2) == std::string::npos);
+            if (!relative)
+                add(n, addr);
+            else
+                for (const auto& z : zones)
+                    add(n + "." + z, addr);
+        }
+    }
+    std::sort(routes.begin(), routes.end());
+    std::string out;
+    for (const auto& z : zones)
+        out += "zone " + z + "\n";
+    for (auto& [name, addrs] : routes)
+    {
+        std::sort(addrs.begin(), addrs.end());
+        out += "route " + name;
+        for (const auto& a : addrs)
+            out += " " + a;
+        out += "\n";
+    }
+    return out;
 }
 
 }   // namespace runtime_names

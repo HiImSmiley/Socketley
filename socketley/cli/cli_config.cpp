@@ -133,6 +133,7 @@ constexpr config_key config_keys[] = {
     { "transfer",           "--transfer",           key_kind::list    },
     { "notify",             "--notify",             key_kind::list    },
     { "publish",            "--publish",            key_kind::list    },
+    { "proxy",              "--proxy",              key_kind::text    },
     { "rrl",                "--rrl",                key_kind::integer },
 };
 

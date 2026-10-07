@@ -1414,6 +1414,17 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
             dns->set_notify(pa.args[++i]);
             return 0;
         }
+        // The entrance the names of runtimes are reached through.
+        case fnv1a("--proxy"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << "--proxy requires the name of a proxy runtime without --backend: the entrance\n";
+                return 1;
+            }
+            dns->set_proxy(pa.args[++i]);
+            return 0;
+        }
         // The addresses the names runtimes are reached by are published with, checked whole at create.
         case fnv1a("--publish"):
         {

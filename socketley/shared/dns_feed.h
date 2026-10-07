@@ -5,6 +5,9 @@
 //   names            the names runtimes are reached by (--domain, --acme, a storage's --domain and --website-domain),
 //                    one a line, written by the daemon whenever they change; a dns runtime with --publish gives each
 //                    one under its zones the addresses --publish names
+//   routes-<proxy>   the table an entrance (a proxy without --backend) routes by, written by the daemon: the zones of
+//                    the dns runtimes that name it with --proxy, and each name of a runtime that speaks HTTP with
+//                    the addresses it listens on
 //   acme-<token>     one line, "<name> <value>": an ACME DNS-01 answer, written by `socketley acme issue` while a CA
 //                    checks it and removed after; served as the TXT record of _acme-challenge.<name>
 //
@@ -28,6 +31,13 @@ bool write_names(const std::vector<std::string>& names);
 
 // An ACME DNS-01 answer for `name` (without "_acme-challenge."); its file, for removing it after.
 bool write_challenge(std::string_view name, std::string_view value, std::string_view token, std::string& path);
+
+// The table entrance `name` routes by (runtime_names::entrance_table), rewritten only when it changes; and those of
+// entrances that are gone, removed.
+bool write_routes(std::string_view entrance, std::string_view table);
+void remove_routes_except(const std::vector<std::string>& entrances);
+// The file entrance `name` reads.
+std::string routes_path(std::string_view entrance);
 
 struct snapshot
 {

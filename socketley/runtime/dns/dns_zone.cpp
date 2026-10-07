@@ -883,7 +883,8 @@ size_t add_extra(zone& z, const extra_records& x)
     for (const auto& n : x.names)
     {
         std::string w;
-        const bool relative = n.find('.') == std::string::npos;
+        // Relative: no dot past a leading "*." -- "chat", and "*.ui" for the buckets of a storage runtime named "ui".
+        const bool relative = n.find('.', n.starts_with("*.") ? 2 : 0) == std::string::npos;
         if (!name_from_text(relative ? n : (n.back() == '.' ? n : n + "."), z.origin, w) || !is_subdomain(w, z.origin))
             continue;
         put(w, type::A, published_ttl, x.v4);

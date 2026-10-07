@@ -18,6 +18,9 @@
 #include "../runtime/dns/dns_instance.h"
 #include "../shared/dns_feed.h"
 #include "../shared/runtime_names.h"
+#include "../runtime/dns/dns_zone.h"
+#include "../runtime/dns/dns_wire.h"
+#include <sys/stat.h>
 
 static void publish_dns_names(runtime_manager& manager);
 
@@ -841,22 +844,64 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
 // The names every runtime is reached by, for a dns runtime with --publish to answer for (dns_feed.h): --domain and
 // --acme, and a storage runtime's --domain and --website-domain with the wildcard its buckets are addressed under.
 // Rewritten only when they change, which is what moves the feed's time and with it the serial secondaries see.
+// The origins of a dns runtime's zones, read from its files once and again only when one changes.
+static std::vector<std::string> zone_origins(const runtime_instance& rt)
+{
+    struct cached { int64_t mtime{0}; int64_t size{-1}; std::string origin; };
+    static std::unordered_map<std::string, cached> cache;
+    std::vector<std::string> out;
+    for (const auto& path : static_cast<const dns_instance&>(rt).zone_paths())
+    {
+        struct stat st{};
+        if (::stat(path.c_str(), &st) < 0)
+            continue;
+        const int64_t mt = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
+        cached& c = cache[path];
+        if (c.mtime != mt || c.size != st.st_size)
+        {
+            socketley::dns::zone z;
+            std::string why;
+            c.mtime = mt;
+            c.size = st.st_size;
+            c.origin = socketley::dns::load_zone(path, {}, z, why) ? socketley::dns::to_text(z.origin) : std::string{};
+        }
+        if (!c.origin.empty())
+            out.push_back(c.origin);
+    }
+    return out;
+}
+
 static void publish_dns_names(runtime_manager& manager)
 {
     std::vector<std::string> names;
+    std::vector<std::pair<std::string, std::string>> tables;
     {
         std::shared_lock lock(manager.mutex);
+        std::vector<const runtime_instance*> all;
         for (const auto& [name, inst] : manager.list())
         {
             if (!inst)
                 continue;
+            all.push_back(inst.get());
             for (auto& n : runtime_names::of(*inst, /*with_buckets=*/true))
                 names.push_back(std::move(n));
             for (const auto& d : inst->get_acme_domains())
                 if (std::string why; dns_feed::valid_name(d, why))
                     names.push_back(runtime_names::normal(d));
         }
+        // Every entrance's table, built while the runtimes cannot change under it.
+        for (const runtime_instance* r : all)
+            if (runtime_names::is_entrance(*r))
+                tables.emplace_back(std::string(r->get_name()), runtime_names::entrance_table(*r, all, zone_origins));
     }
+    std::vector<std::string> entrances;
+    for (const auto& [entrance, table] : tables)
+    {
+        entrances.push_back(entrance);
+        if (!dns_feed::write_routes(entrance, table))
+            LOG_WARN(("the routes of entrance " + entrance + " could not be written").c_str());
+    }
+    dns_feed::remove_routes_except(entrances);
     static bool warned = false;
     if (!dns_feed::write_names(names) && !warned)
     {

@@ -13,6 +13,8 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -171,6 +173,40 @@ bool parse_publish(std::string_view csv, std::vector<std::string>& v4, std::vect
     return true;
 }
 
+// This machine's addresses the internet can reach, from its interfaces: IPv4 outside the private, shared, loopback
+// and link-local blocks, IPv6 in 2000::/3. A host behind NAT has none, and is given its address with --publish.
+void public_addresses(std::vector<std::string>& v4, std::vector<std::string>& v6)
+{
+    ifaddrs* list = nullptr;
+    if (::getifaddrs(&list) < 0)
+        return;
+    for (ifaddrs* i = list; i; i = i->ifa_next)
+    {
+        if (!i->ifa_addr || !(i->ifa_flags & IFF_UP) || (i->ifa_flags & IFF_LOOPBACK))
+            continue;
+        if (i->ifa_addr->sa_family == AF_INET)
+        {
+            const auto* a = reinterpret_cast<const uint8_t*>(&reinterpret_cast<const sockaddr_in*>(i->ifa_addr)->sin_addr);
+            const bool priv = a[0] == 10 || a[0] == 127 || a[0] == 0 || (a[0] == 172 && (a[1] & 0xF0) == 16) ||
+                              (a[0] == 192 && a[1] == 168) || (a[0] == 169 && a[1] == 254) ||
+                              (a[0] == 100 && (a[1] & 0xC0) == 64) || a[0] >= 224;
+            std::string w(reinterpret_cast<const char*>(a), 4);
+            if (!priv && std::find(v4.begin(), v4.end(), w) == v4.end())
+                v4.push_back(std::move(w));
+        }
+        else if (i->ifa_addr->sa_family == AF_INET6)
+        {
+            const auto* a = reinterpret_cast<const uint8_t*>(&reinterpret_cast<const sockaddr_in6*>(i->ifa_addr)->sin6_addr);
+            std::string w(reinterpret_cast<const char*>(a), 16);
+            if ((a[0] & 0xE0) == 0x20 && std::find(v6.begin(), v6.end(), w) == v6.end())
+                v6.push_back(std::move(w));
+        }
+    }
+    ::freeifaddrs(list);
+    std::sort(v4.begin(), v4.end());
+    std::sort(v6.begin(), v6.end());
+}
+
 std::string peer_text(const sockaddr_storage& ss)
 {
     char buf[INET6_ADDRSTRLEN] = "?";
@@ -319,6 +355,8 @@ private:
     // The addresses runtimes' names are given (--publish), and when the feed was last read.
     std::vector<std::string> m_v4, m_v6;
     int64_t m_feed_stamp{-1};
+    bool m_auto_addresses{false};
+    int64_t m_addresses_at{0};
     std::vector<ip_block> m_transfer;
     std::vector<std::pair<sockaddr_storage, socklen_t>> m_notify_to;
     std::vector<notify_job> m_notify;
@@ -359,6 +397,17 @@ bool dns_run::start(std::string& why)
     {
         why = "--publish: '" + bad + "' is not an address";
         return false;
+    }
+    // Through an entrance and without addresses given, this machine's own are published, and looked at again now
+    // and then, since a host's address can change.
+    m_auto_addresses = !m_owner.get_proxy().empty() && m_v4.empty() && m_v6.empty();
+    if (m_auto_addresses)
+    {
+        public_addresses(m_v4, m_v6);
+        m_addresses_at = now_sec();
+        if (m_v4.empty() && m_v6.empty())
+            LOG_WARN("dns: --proxy is set but this machine has no public address on its interfaces (behind NAT?); "
+                     "no runtime's name is published until --publish names one");
     }
     auto zs = std::make_shared<zone_set>();
     const extra_records extra = feed_extra();
@@ -1097,6 +1146,20 @@ extra_records dns_run::feed_extra()
 void dns_run::check_zones()
 {
     bool changed = dns_feed::stamp_ns() != m_feed_stamp;
+    // This machine's addresses, looked at once a minute when they are what is published.
+    if (m_auto_addresses && now_sec() - m_addresses_at >= 60)
+    {
+        m_addresses_at = now_sec();
+        std::vector<std::string> v4, v6;
+        public_addresses(v4, v6);
+        if (v4 != m_v4 || v6 != m_v6)
+        {
+            LOG_INFO("dns: this machine's public addresses changed; the names published are given the new ones");
+            m_v4 = std::move(v4);
+            m_v6 = std::move(v6);
+            changed = true;
+        }
+    }
     for (const auto& z : m_zones->zones)
     {
         struct stat st{};

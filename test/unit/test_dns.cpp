@@ -548,7 +548,7 @@ TEST_CASE("published names and DNS-01 answers join a zone; what the file says wi
     zone z = load(example_zone);
     const uint32_t before = z.serial;
     extra_records x;
-    x.names = {"chat", "api.example.com", "*.files.example.com", "files.example.com", "www", "mail",
+    x.names = {"chat", "api.example.com", "*.files.example.com", "files.example.com", "www", "mail", "*.rel",
                "other.example.org", "host.sub.example.com", "deep.new.example.com."};
     x.v4 = {std::string("\xc6\x33\x64\x0a", 4)};
     x.v6 = {std::string(16, '\x01')};
@@ -565,6 +565,8 @@ TEST_CASE("published names and DNS-01 answers join a zone; what the file says wi
     CHECK(ask(zs, query("api.example.com.", type::A)).r.an == 1);
     CHECK(ask(zs, query("bucket.files.example.com.", type::A)).r.an == 1);
     CHECK(ask(zs, query("deep.new.example.com.", type::A)).r.an == 1);
+    // "*.rel" is relative too: the buckets of a storage runtime named "rel".
+    CHECK(ask(zs, query("bucket.rel.example.com.", type::A)).r.an == 1);
     // The names on the way to a new one exist, empty.
     a = ask(zs, query("new.example.com.", type::A));
     CHECK(a.r.rcode() == rcode::NOERROR);

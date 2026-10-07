@@ -792,6 +792,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.dns_transfer = std::string(d->get_transfer());
             cfg.dns_notify = std::string(d->get_notify());
             cfg.dns_publish = std::string(d->get_publish());
+            cfg.dns_proxy = std::string(d->get_proxy());
             cfg.dns_rrl = d->get_rrl();
             break;
         }
@@ -1131,6 +1132,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("notify", cfg.dns_notify);
             if (!cfg.dns_publish.empty())
                 append_str_field("publish", cfg.dns_publish);
+            if (!cfg.dns_proxy.empty())
+                append_str_field("proxy", cfg.dns_proxy);
             append_int_field("rrl", cfg.dns_rrl);
             break;
     }
@@ -1320,6 +1323,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.dns_transfer = json_get_string(json, "transfer");
             cfg.dns_notify = json_get_string(json, "notify");
             cfg.dns_publish = json_get_string(json, "publish");
+            cfg.dns_proxy = json_get_string(json, "proxy");
             cfg.dns_rrl = json_get_uint32(json, "rrl", 100);
             break;
     }

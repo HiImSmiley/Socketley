@@ -98,6 +98,38 @@ bool write_challenge(std::string_view name, std::string_view value, std::string_
     return write_atomic(path, std::string(name) + " " + std::string(value) + "\n");
 }
 
+std::string routes_path(std::string_view entrance)
+{
+    return dir() + "/routes-" + std::string(entrance);
+}
+
+bool write_routes(std::string_view entrance, std::string_view table)
+{
+    const std::string path = routes_path(entrance);
+    struct stat st{};
+    if (::stat(path.c_str(), &st) == 0 && read_file(path) == table)
+        return true;
+    return write_atomic(path, table);
+}
+
+void remove_routes_except(const std::vector<std::string>& entrances)
+{
+    DIR* d = ::opendir(dir().c_str());
+    if (!d)
+        return;
+    std::vector<std::string> gone;
+    while (const dirent* e = ::readdir(d))
+    {
+        const std::string_view fn = e->d_name;
+        if (fn.starts_with("routes-") && !fn.ends_with(".tmp") &&
+            std::find(entrances.begin(), entrances.end(), fn.substr(7)) == entrances.end())
+            gone.emplace_back(fn);
+    }
+    ::closedir(d);
+    for (const auto& g : gone)
+        ::unlink((dir() + "/" + g).c_str());
+}
+
 int64_t stamp_ns()
 {
     struct stat st{};

@@ -57,6 +57,11 @@ public:
     void set_publish(std::string_view csv) { m_publish = std::string(csv); }
     std::string_view get_publish() const { return m_publish; }
 
+    // The entrance runtimes' names are reached through (--proxy): a proxy without --backend. With it, every runtime's
+    // name in a zone is answered, with --publish's addresses or, without them, this machine's public ones.
+    void set_proxy(std::string_view name) { m_proxy = std::string(name); }
+    std::string_view get_proxy() const { return m_proxy; }
+
     // Response rate limiting (--rrl), per second for one client's /24 or /56.
     void set_rrl(uint32_t per_sec) { m_rrl = per_sec; }
     uint32_t get_rrl() const { return m_rrl; }
@@ -77,6 +82,7 @@ private:
     std::string m_transfer;
     std::string m_notify;
     std::string m_publish;
+    std::string m_proxy;
     uint32_t    m_rrl{dns_default_rrl};
 
     std::unique_ptr<socketley::dns::dns_run> m_run;
