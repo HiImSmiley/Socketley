@@ -33,6 +33,9 @@
 #include <cstdlib>
 #include <thread>
 
+#include <poll.h>
+#include <sys/syscall.h>
+
 #include "digest.h"
 #include "json_doc.h"
 #include "s3_names.h"
@@ -66,8 +69,9 @@ enum media_kind : uint8_t
     k_trick,
 };
 
-// Thumbnails queue behind a few at a time; a stream is someone waiting to watch, and never waits for another's film.
-constexpr int     thumb_jobs_max   = 2;
+// Thumbnails and probes queue behind one a core of the shard's share, each run on one thread, since most of what one
+// costs is ffmpeg starting; a stream is someone waiting to watch, and never waits for another's film.
+constexpr int     thumb_jobs_min   = 2;
 constexpr int     hls_jobs_max     = 8;
 // The streams a machine's GPU makes at once, shared out among its shards.
 constexpr int     gpu_streams_max  = 24;
@@ -1124,6 +1128,7 @@ bool storage_run::media_hw_test(bool low_power)
     j.started_ms = now_ms();
     j.seeked = low_power;
     m_media_jobs.push_back(std::move(j));
+    media_watch_exit(pid);
     media_arm();
     return true;
 }
@@ -1439,6 +1444,8 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
         return j.want.kind != k_hwtest && (j.want.kind == k_trick) == (w.kind == k_trick) &&
                (j.want.kind == k_copy || j.want.kind == k_rendition) == stream;
     });
+    const int thumb_jobs_max = std::max<int>(thumb_jobs_min, static_cast<int>(std::thread::hardware_concurrency() /
+                                                                           std::max(1u, m_store.shards())));
     if (same_kind >= (stream ? streams_max() : w.kind == k_trick ? 1 : thumb_jobs_max))
         return false;
     if (::mkdir(w.dir.c_str(), 0700) < 0 && errno != EEXIST)
@@ -1680,11 +1687,14 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             uint64_t n = 0;
             thumb_width(w.variant, n);
             clear_dir(w.dir, true);
+            // One frame is decoded and one written: ffmpeg's pools of threads, one a core for the decoder, the filter
+            // and the encoder each, cost more to start than the picture, 166 ms against 72 for a 1600x1200 JPEG.
+            args.insert(args.end(), {"-threads", "1", "-filter_threads", "1"});
             if (from > 0)
                 args.insert(args.end(), {"-ss", "5"});
             args.insert(args.end(), input.begin(), input.end());
             args.insert(args.end(), {"-frames:v", "1", "-vf", "scale='min(" + std::to_string(n) + ",iw)':-2", "-q:v", "4",
-                                     w.dir + "/thumb.jpg"});
+                                     "-threads", "1", w.dir + "/thumb.jpg"});
             j.seeked = from > 0;
             break;
         }
@@ -1861,6 +1871,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
     j.want = w;
     j.started_ms = now_ms();
     m_media_jobs.push_back(std::move(j));
+    media_watch_exit(pid);
     media_arm();
     return true;
 }
@@ -2189,6 +2200,39 @@ void storage_run::media_evict(const std::string& keep)
     }
 }
 
+// The kernel says when a job's process ends, through a pidfd the ring polls, so what it made is served at once
+// rather than at the next look of the tick; without pidfds (Linux before 5.3) the tick alone finds it.
+void storage_run::media_watch_exit(pid_t pid)
+{
+    const int fd = static_cast<int>(::syscall(SYS_pidfd_open, pid, 0));
+    if (fd < 0)
+        return;
+    auto& e = m_media_exits.emplace_back();
+    e.fd = fd;
+    e.req = io_request{};
+    e.req.owner = this;
+    e.req.type  = op_poll;
+    if (!m_loop.submit_poll_add(fd, POLLIN, &e.req))
+    {
+        ::close(fd);
+        m_media_exits.pop_back();
+    }
+}
+
+bool storage_run::media_exit_done(io_request* req)
+{
+    for (auto it = m_media_exits.begin(); it != m_media_exits.end(); ++it)
+        if (&it->req == req)
+        {
+            ::close(it->fd);
+            m_media_exits.erase(it);
+            if (!m_stopped)
+                media_tick();
+            return true;
+        }
+    return false;
+}
+
 void storage_run::media_stop()
 {
     for (media_job& j : m_media_jobs)
@@ -2211,6 +2255,12 @@ void storage_run::media_stop()
     m_media_srcs.clear();
     if (m_media_timer.armed)
         m_loop.submit_timeout_remove(&m_media_timer.req);
+    // The processes are gone, so their polls complete; each is withdrawn and its fd closed, and the loop forgets them.
+    for (auto& e : m_media_exits)
+    {
+        if (!m_loop.submit_poll_remove(&e.req)) {}
+        ::close(e.fd);
+    }
 }
 
 }   // namespace socketley::storage

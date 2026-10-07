@@ -730,7 +730,22 @@ function fromHash() { path = location.hash.replace(/^#\/?/, '').split('/').filte
 // A new place closes what was open over the old one, as the browser's back button is expected to.
 window.addEventListener('hashchange', () => { if (!auth) return; while (layers.length) layers[layers.length - 1].close(); fromHash(); sel.clear(); query = ''; $('#q').value = ''; load(); $('#side').classList.remove('open'); });
 
+// A folder's listing as the drive's compact JSON (?list), asked again with its ETag so a look that finds nothing new
+// is a 304 and costs no body; the root of libraries is a PROPFIND.
+const LISTED = new Map();
 async function propfind(p) {
+  if (p.length) {
+    const url = dav(p, true) + '?list', was = LISTED.get(url);
+    const r = await api('GET', url, { headers: was ? { 'If-None-Match': was.tag } : {} });
+    if (r.status === 304 && was) return was.items;
+    const j = await (await must(r)).json();
+    const items = [];
+    for (const n of j.d) items.push({ name: n, segs: [...p, n], dir: true, size: 0, type: '', mod: 0, kind: 'dir' });
+    for (const [n, size, mod, type] of j.f) items.push({ name: n, segs: [...p, n], dir: false, size, type, mod, kind: kind(n, type) });
+    const tag = r.headers.get('ETag');
+    if (tag) { LISTED.set(url, { tag, items }); if (LISTED.size > 64) LISTED.delete(LISTED.keys().next().value); }
+    return items;
+  }
   const r = await must(await api('PROPFIND', dav(p, true), { headers: { Depth: '1' } }));
   const doc = new DOMParser().parseFromString(await r.text(), 'application/xml');
   const D = 'DAV:', out = [];

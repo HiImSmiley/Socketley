@@ -11,6 +11,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <list>
 #include <memory>
 #include <optional>
 #include <string>
@@ -930,6 +931,8 @@ public:
     // A versioned bucket's deleted files under a folder, and one of them brought back by removing its delete marker.
     void dav_trash(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix);
     void dav_restore(const std::shared_ptr<conn>& c, std::string bucket, std::string key);
+    // A folder's listing as compact JSON for the web interface, with an ETag of its own (?list).
+    void dav_list(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix);
     // Turns the request into the S3 operation `method` on `bucket`/`key` and sends it down the S3 path, after the
     // policy has had its say; `extra` is a header to add, name and value, and `query` the S3 query it carries.
     void app_forward(const std::shared_ptr<conn>& c, std::string_view method, std::string bucket, std::string key,
@@ -1413,6 +1416,16 @@ private:
     std::vector<media_job> m_media_jobs;
     std::vector<std::pair<std::weak_ptr<conn>, media_want>> m_media_waits;
     timer       m_media_timer;
+    // A poll of each running job's pidfd, which completes when its process ends; a list, so each stays where the
+    // ring was told it is.
+    struct media_exit
+    {
+        io_request req{};
+        int        fd{-1};
+    };
+    std::list<media_exit> m_media_exits;
+    void media_watch_exit(pid_t pid);
+    bool media_exit_done(io_request* req);
     // What this shard knows of the cache without asking the disk again: probes, renditions whole, uses written.
     std::unordered_map<std::string, std::shared_ptr<const media_probe>> m_media_probes;
     std::unordered_set<std::string> m_media_done;

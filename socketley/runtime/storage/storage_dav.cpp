@@ -433,6 +433,15 @@ void storage_run::op_dav(const std::shared_ptr<conn>& c)
         app_forward(c, r.method, std::move(bucket), std::move(key), {}, {}, std::move(mpu));
         return;
     }
+    // A folder read with ?list is its listing as the web interface reads it: compact JSON, with an ETag of its own so
+    // a look for changes that finds none is a 304 and no body.
+    if ((r.method == "GET" || r.method == "HEAD") && !bucket.empty() && r.has_query("list"))
+    {
+        if (!key.empty() && key.back() != '/')
+            key += '/';
+        dav_list(c, std::move(bucket), std::move(key));
+        return;
+    }
     // A folder read with ?zip is one archive of everything under it, or of the names ?n= gives, files or folders.
     if ((r.method == "GET" || r.method == "HEAD") && !bucket.empty() && r.has_query("zip"))
     {
@@ -790,6 +799,88 @@ void storage_run::dav_body(const std::shared_ptr<conn>& c)
             }
             proceed(c2, bucket, key, true);
         });
+    });
+}
+
+void storage_run::dav_list(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix)
+{
+    if (!m_store.has_bucket(bucket))
+    {
+        app_reply(c, 404, "No such bucket.\n");
+        return;
+    }
+    if (!app_allowed(c, "GET", bucket, {}))
+    {
+        app_reply(c, 403, "Access denied.\n");
+        return;
+    }
+    list_query q;
+    q.prefix    = prefix;
+    q.delimiter = "/";
+    q.max_keys  = 1000;
+    std::weak_ptr<conn> weak = c;
+    app_list(bucket, std::move(q), [this, weak, prefix](st s, list_page p)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        if (s != st::ok || (!prefix.empty() && p.objects.empty() && p.prefixes.empty()))
+        {
+            app_reply(cc, 404, "Not found.\n");
+            return;
+        }
+        // {"d":[name,...],"f":[[name,size,mtime_ms,type],...]}: a quarter of a PROPFIND's bytes for each entry.
+        std::string x;
+        x.reserve(64 + p.prefixes.size() * 24 + p.objects.size() * 72);
+        x += "{\"d\":[";
+        bool first = true;
+        for (const std::string& sub : p.prefixes)
+        {
+            x += first ? "\"" : ",\"";
+            x += sp_detail::json_escape(last_name(sub));
+            x += '"';
+            first = false;
+        }
+        x += "],\"f\":[";
+        first = true;
+        for (const list_entry& e : p.objects)
+        {
+            if (e.key == prefix)
+                continue;
+            x += first ? "[\"" : ",[\"";
+            x += sp_detail::json_escape(last_name(e.key));
+            x += "\",";
+            x += std::to_string(e.meta.size);
+            x += ',';
+            x += std::to_string(e.meta.mtime_ms);
+            x += ",\"";
+            x += sp_detail::json_escape(e.meta.content_type.empty() ? std::string_view("application/octet-stream")
+                                                         : std::string_view(e.meta.content_type.str()));
+            x += "\"]";
+            first = false;
+        }
+        x += "]}";
+        // FNV-1a over the listing: the same names, sizes, times and types are the same tag.
+        uint64_t h = 1469598103934665603ull;
+        for (const unsigned char ch : x)
+            h = (h ^ ch) * 1099511628211ull;
+        static constexpr char hexd[] = "0123456789abcdef";
+        std::string tag = "\"l";
+        for (int i = 60; i >= 0; i -= 4)
+            tag += hexd[(h >> i) & 15];
+        tag += '"';
+        response resp;
+        resp.headers.emplace_back("ETag", tag);
+        resp.headers.emplace_back("Cache-Control", "no-cache");
+        if (etag_list_matches(cc->req.header("if-none-match"), tag.substr(1, tag.size() - 2)))
+            resp.status = 304;
+        else
+        {
+            resp.status = 200;
+            resp.headers.emplace_back("Content-Type", "application/json");
+            resp.body = std::move(x);
+        }
+        send_response(cc, std::move(resp));
     });
 }
 

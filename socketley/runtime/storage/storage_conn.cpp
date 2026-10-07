@@ -316,6 +316,8 @@ void storage_run::on_cqe(struct io_uring_cqe* cqe)
             media_tick();
         return;
     }
+    if (req->type == op_poll && req->owner == this && media_exit_done(req))
+        return;
     if (req == &m_pace_timer.req)
     {
         m_pace_timer.armed = false;

@@ -9669,6 +9669,16 @@ the key, the time of the deletion and the size of the version behind it, and
 .B POST /~dav/\fIbucket\fB/\fIkey\fB?restore
 removes the marker and brings that version back. A lifecycle rule's
 NoncurrentVersionExpiration empties the trash.
+.B GET /~dav/\fIbucket\fB/\fIfolder\fB/?list
+is a folder's listing as the web interface reads it, JSON of its subfolders'
+names and its files' names, sizes, times in milliseconds and types
+(\fB{"d":[...],"f":[[name,size,mtime,type],...]}\fR), about a tenth of a
+PROPFIND's bytes, with an ETag of its own, so a look again with
+.B If\-None\-Match
+that finds nothing changed is
+.B 304
+and no body. A folder of 20,000 files was 9.9 MB and 44 ms as a PROPFIND and is
+1.0 MB and 9 ms, and a browser read it in 40 ms rather than 400.
 .B POST /~dav/\fIbucket\fB/\fIkey\fB?unzip
 unpacks a ZIP object on the server into a folder beside it named as it is
 without its extension, numbered (\fIname\fR (2)) when that name is taken, so
@@ -9853,7 +9863,11 @@ for that version of it, and what they made lies in
 .IR dir /.media/
 under the variant, the object's key and its ETag, so a new version is made anew
 and every shard serves what one made; one thumbnail is made once however many
-ask for it at once. A shard runs two thumbnails and eight streams at once, a
+ask for it at once. A shard runs as many thumbnails and probes at once as it has
+cores of the host's share, at least two, each on one thread of ffmpeg's (a
+1600x1200 JPEG's thumbnail took 166 ms with ffmpeg's threads and 72 without),
+and eight streams; a job's end is heard from a pidfd the ring polls, so what it
+made is served as soon as ffmpeg exits rather than at the next look. A
 request waits a minute for its medium, an object ffmpeg cannot read is
 .B 415
 for two minutes, and an ffmpeg a dying worker left behind is found by its pid and

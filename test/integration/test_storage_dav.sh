@@ -290,6 +290,19 @@ check "where two keys clean to one name, the second is numbered" \
       "['double (2).txt', 'double.txt']"
 for k in 'z/../../evil.txt' 'z/./dot.txt' 'z//double.txt' 'z/double.txt' 'z/back%5Cslash.txt' 'z/a/../a.txt' 'z/a.txt' 'z/ctrl%01name.txt'; do s3 -o /dev/null --path-as-is -X DELETE "$U/docs/$k"; done
 
+# A folder's listing as compact JSON, and a look again with its ETag that finds nothing new.
+check "?list gives a folder's subfolders and files with size, time and type" \
+      "$(curl -s -u "$A" "$U/~dav/docs/a/?list" | python3 -c 'import json,sys; j=json.load(sys.stdin); print(j["d"], [(f[0], f[1], f[2] > 0, f[3]) for f in j["f"]])')" \
+      "['sub'] [('one.txt', 3, True, 'binary/octet-stream')]"
+tag=$(curl -s -u "$A" -D - -o /dev/null "$U/~dav/docs/a?list" | tr -d '\r' | sed -n 's/^[Ee][Tt]ag: //p')
+check "with an ETag, and without the folder's slash too" "${tag:0:2}" '"l'
+check "asked again with it, 304" "$(code -u "$A" -H "If-None-Match: $tag" "$U/~dav/docs/a/?list")" 304
+printf 'two' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/docs/a/two.txt"
+check "and 200 once the folder changed" "$(code -u "$A" -H "If-None-Match: $tag" "$U/~dav/docs/a/?list")" 200
+curl -s -u "$A" -X DELETE -o /dev/null "$U/~dav/docs/a/two.txt"
+check "another user is refused it" "$(code -u "$B" "$U/~dav/docs/a/?list")" 403
+check "a folder that is not there is 404" "$(code -u "$A" "$U/~dav/docs/nope/?list")" 404
+
 # A ZIP unpacked on the server, into a folder beside it, across both shards.
 python3 - "$T" <<'ZEOF'
 import zipfile, sys, os, random
