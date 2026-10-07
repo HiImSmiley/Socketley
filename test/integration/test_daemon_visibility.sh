@@ -93,8 +93,7 @@ EOF
     if g++ -std=c++23 $SANFLAGS "$SOCKETLEY_TMPD/mine.cpp" \
          -I"$ROOT" -I"$ROOT/include/linux" \
          -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
-         -L"$BINDIR" -L"$ROOT/thirdparty/luajit" -L"$ROOT/thirdparty/liburing" \
-         -lsocketley_sdk -lluajit -luring -lssl -lcrypto -pthread \
+         -L"$ROOT/thirdparty/liburing" $("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflags --libs) \
          -o "$SOCKETLEY_TMPD/mine" 2>"$SOCKETLEY_TMPD/gxx.err"; then
         SDK_BIN="$SOCKETLEY_TMPD/mine"
         SOCKETLEY_SOCKET="$B_SOCK" "$SDK_BIN" daemon >"$SOCKETLEY_TMPD/b.log" 2>&1 &

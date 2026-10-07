@@ -77,8 +77,7 @@ if command -v g++ >/dev/null 2>&1 && [ -f "$BINDIR/libsocketley_sdk.a" ]; then
            "$ROOT/sdk/examples/custom-type/greeter_worker.cpp" \
            -I"$ROOT" -I"$ROOT/include/linux" \
            -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
-           -L"$BINDIR" -L"$ROOT/thirdparty/luajit" -L"$ROOT/thirdparty/liburing" \
-           -lsocketley_sdk -lluajit -luring -lssl -lcrypto -pthread \
+           -L"$ROOT/thirdparty/liburing" $("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflags --libs) \
            -o "$SOCKETLEY_TMPD/greeter-worker" 2>"$SOCKETLEY_TMPD/gxx.err"
     then
         WORKER="$SOCKETLEY_TMPD/greeter-worker"

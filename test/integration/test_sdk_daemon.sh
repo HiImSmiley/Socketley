@@ -91,8 +91,7 @@ build() {   # build <src> <out>
     g++ -std=c++23 $SANFLAGS "$1" \
         -I"$ROOT" -I"$ROOT/include/linux" \
         -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
-        -L"$BINDIR" -L"$ROOT/thirdparty/luajit" -L"$ROOT/thirdparty/liburing" \
-        -lsocketley_sdk -lluajit -luring -lssl -lcrypto -pthread \
+        -L"$ROOT/thirdparty/liburing" $("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflags --libs) \
         -o "$2" 2>"$SOCKETLEY_TMPD/gxx.err"
 }
 

@@ -9439,9 +9439,8 @@ to 9 after, against about 3 to 5 for the same put sent at loopback speed.
 A storage runtime speaks HTTP/2 (RFC 9113) besides HTTP/1.1: over
 .B \-\-tls
 to a client that offers \fBh2\fR by ALPN, as every browser does, and in the clear
-to one that opens with HTTP/2's preface (prior knowledge, as
-.B curl \-\-http2\-prior\-knowledge
-and a proxy's h2c backend speak it). Every request is a stream of the one
+to one that opens with HTTP/2's preface (prior knowledge, as curl speaks it when
+told to and a proxy's h2c backend does). Every request is a stream of the one
 connection and runs exactly as over HTTP/1.1, S3, WebDAV, the web interface,
 share links and media alike, so a browser's uploads, its player's segments and
 its pictures no longer wait for one of the six connections it opens to a server

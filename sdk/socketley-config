@@ -66,7 +66,17 @@ CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/sol2"
 CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/luajit"
 
 LIBS="-L$LIBDIR -L$ROOT/thirdparty/luajit -L$ROOT/thirdparty/liburing"
-LIBS="$LIBS -lsocketley_sdk -lluajit -Wl,-Bstatic -luring -Wl,-Bdynamic -lssl -lcrypto -pthread"
+TLSLIBS="-lssl -lcrypto"
+# A tree built with HTTP/3 (bin/build-thirdparty.sh http3) compiled the engine against the static OpenSSL 3.5 in
+# thirdparty/ and calls ngtcp2 and nghttp3: a program links those, and that OpenSSL rather than the system's, whose
+# version the engine's structures do not match.
+if [ -f "$ROOT/thirdparty/ngtcp2/lib/libngtcp2.a" ] && [ -f "$ROOT/thirdparty/openssl/lib/libssl.a" ] &&
+   { [ ! -f "$LIBDIR/libsocketley_sdk.a" ] || grep -aq ngtcp2_conn_server_new "$LIBDIR/libsocketley_sdk.a"; }; then
+    CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/openssl/include"
+    LIBS="$LIBS -L$ROOT/thirdparty/ngtcp2/lib -L$ROOT/thirdparty/nghttp3/lib -L$ROOT/thirdparty/openssl/lib"
+    TLSLIBS="-lngtcp2_crypto_ossl -lngtcp2 -lnghttp3 -lssl -lcrypto -ldl"
+fi
+LIBS="$LIBS -lsocketley_sdk -lluajit -Wl,-Bstatic -luring -Wl,-Bdynamic $TLSLIBS -pthread"
 
 if [ "$want_pc" = 1 ]; then
     cat <<EOF
