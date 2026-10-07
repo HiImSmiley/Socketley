@@ -3,7 +3,7 @@
 #
 # ─── WHAT THIS HOLDS DOWN ───────────────────────────────────────────────────
 #
-#   an entrance given --tls and no --cert is issued a certificate for the zones
+#   the entrance a dns runtime makes (--tls, no --cert) is issued a certificate for the zones
 #   its dns runtime serves, each with its wildcard, proven over DNS-01 by that
 #   runtime's own answers -- no port 80, no file to name; a name the wildcard
 #   does not cover (a storage runtime's buckets) is asked for again when it
@@ -54,9 +54,9 @@ export SOCKETLEY_ACME_DIRECTORY="https://127.0.0.1:$P_DIR/dir" SOCKETLEY_ACME_CA
 daemon_start "$BIN"
 
 mkdir -p "$T/site"; echo hello > "$T/site/who.txt"
-"$BIN" create dns ns -p "$DNS" --zone example.com --proxy web --publish 127.0.0.1 --rrl 0 -s >/dev/null 2>&1
+expect "a dns runtime is made, and with it its entrance" \
+    "$("$BIN" create dns ns -p "$DNS" --zone example.com --proxy web --proxy-port "$S" --publish 127.0.0.1 --rrl 0 -s 2>&1)" ""
 "$BIN" create server chat -p $((P+6)) --domain --http "$T/site" -s >/dev/null 2>&1
-expect "an entrance with --tls and no --cert is made" "$("$BIN" create proxy web -p "$S" --tls -s 2>&1)" ""
 
 san() { echo | openssl s_client -connect "127.0.0.1:$S" -servername "$1" 2>/dev/null |
         openssl x509 -noout -ext subjectAltName 2>/dev/null | grep -o 'DNS:[*a-z0-9.-]*' | sort | tr '\n' ' '; }

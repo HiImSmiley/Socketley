@@ -99,10 +99,10 @@ has "a zone that does not parse is refused with its line" "$("$BIN" create dns b
 has "--listen unix: is refused" "$("$BIN" create dns bad --listen "unix:$T/d.sock" --zone "$T/example.zone" -s 2>&1)" "not served"
 "$BIN" remove bad >/dev/null 2>&1
 
-out=$("$BIN" create dns ns -p "$P" --zone "$T/example.zone" --transfer 127.0.0.1 --notify "127.0.0.1:$SINK" -s 2>&1)
+out=$("$BIN" create dns ns -p "$P" --zone "$T/example.zone" --transfer 127.0.0.1 --notify "127.0.0.1:$SINK" --proxy none -s 2>&1)
 expect "the runtime is created and started" "$out" ""
 for _ in $(seq 1 50); do dig @127.0.0.1 -p "$P" +short +time=1 +tries=1 example.com SOA >/dev/null 2>&1 && break; sleep 0.1; done
-has "a second runtime on the same port is refused" "$("$BIN" create dns ns2 -p "$P" --zone "$T/example.zone" -s 2>&1)" "$P"
+has "a second runtime on the same port is refused" "$("$BIN" create dns ns2 -p "$P" --zone "$T/example.zone" --proxy none -s 2>&1)" "$P"
 "$BIN" remove ns2 >/dev/null 2>&1
 
 q() { dig @127.0.0.1 -p "$P" +time=2 +tries=1 "$@" 2>&1; }
@@ -183,7 +183,7 @@ else bad "rate limit of 100 a second" "answered $full, truncated $tc, dropped $d
 P2=$((SL_PORT_BASE+1712))
 cp "$T/example.zone" "$T/pub.zone"
 sed -i '$d' "$T/pub.zone"   # without the broken line the reload above left
-"$BIN" create dns pub -p "$P2" --zone "$T/pub.zone" --publish 192.0.2.10,2001:db8::10 --rrl 0 -s >/dev/null 2>&1
+"$BIN" create dns pub -p "$P2" --zone "$T/pub.zone" --publish 192.0.2.10,2001:db8::10 --rrl 0 --proxy none -s >/dev/null 2>&1
 "$BIN" create server chat -p $((SL_PORT_BASE+1713)) --domain chat,api.example.com >/dev/null 2>&1
 "$BIN" create storage files -p $((SL_PORT_BASE+1714)) --dir "$T/files" --anonymous --domain files.example.com >/dev/null 2>&1
 qp() { dig @127.0.0.1 -p "$P2" +time=2 +tries=1 +short "$@" 2>&1; }

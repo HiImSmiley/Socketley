@@ -10715,7 +10715,45 @@ a storage runtime's
 .B \-\-domain
 and
 .BR \-\-website\-domain )
-that falls within a zone is answered with them. Without it no such name is.
+that falls within a zone is answered with them. Without it, they are answered
+with this machine's public addresses when the runtime has an entrance (below),
+and not at all with
+.BR "\-\-proxy none" .
+.TP
+.BI \-\-proxy " name\fR|\fBnone"
+The entrance the names of runtimes are reached through: a proxy without
+.BR \-\-backend ,
+which routes each HTTP request by the name it asks for to the runtime that has
+it (see
+.BR "PROXY FLAGS" ).
+.B create
+makes it as this runtime's child, named
+.IB dns \-proxy
+when the flag is not given, listening on
+.B \-\-proxy\-port
+with
+.B \-\-tls
+and a certificate it asks the CA for itself: each zone with its wildcard, proven
+over DNS\-01 by this runtime's answers. It stops, starts and is removed with
+this runtime; removed while another dns runtime names it too, it becomes that
+one's instead. A proxy of that name that exists already is taken as it is,
+provided it is an entrance.
+.B none
+makes none. With an entrance and no
+.BR \-\-publish ,
+the names are answered with this machine's public addresses, read from its
+interfaces and looked at again every minute.
+.IP
+.nf
+socketley create dns ns \-\-zone example.com \-s     # and ns\-proxy on 443
+socketley create server chat \-\-domain \-\-http /srv/chat \-s
+curl https://chat.example.com/
+.fi
+.TP
+.BI \-\-proxy\-port " port"
+The port the entrance
+.B create
+makes listens on; 443 when not given.
 .TP
 .BI \-\-rrl " n"
 Response rate limiting: at most

@@ -1417,15 +1417,28 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
             dns->set_notify(pa.args[++i]);
             return 0;
         }
-        // The entrance the names of runtimes are reached through.
+        // The entrance the names of runtimes are reached through: made by `create` when it does not exist yet,
+        // named <dns>-proxy when not given, and none at all with `--proxy none`.
         case fnv1a("--proxy"):
         {
-            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].starts_with('-'))
             {
-                std::cout << "--proxy requires the name of a proxy runtime without --backend: the entrance\n";
+                std::cout << "--proxy requires the name of the entrance (a proxy without --backend), or none\n";
                 return 1;
             }
             dns->set_proxy(pa.args[++i]);
+            return 0;
+        }
+        case fnv1a("--proxy-port"):
+        {
+            uint32_t port = 0;
+            if (i + 1 >= pa.count || !parse_uint32(pa.args[i + 1], port) || port == 0 || port > 65535)
+            {
+                std::cout << "--proxy-port requires the port the entrance listens on, 1 to 65535\n";
+                return 1;
+            }
+            ++i;
+            dns->set_proxy_port(static_cast<uint16_t>(port));
             return 0;
         }
         // The addresses the names runtimes are reached by are published with, checked whole at create.

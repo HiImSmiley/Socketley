@@ -10,6 +10,10 @@
 #   own names    --domain with no name after it is the runtime's own name
 #   zones        --zone with a zone's name writes the zone's file itself, once,
 #                with ns1 and ns2 and their addresses, and leaves it to be edited
+#   its entrance a dns runtime makes the proxy its names are reached through,
+#                <dns>-proxy on 443 (--proxy-port) with TLS, as its child: it
+#                stops, starts and is removed with it, passes to another dns
+#                runtime naming it, and is none with --proxy none
 #   publishing   a dns runtime with --proxy answers every runtime's name with
 #                this machine's public address, or --publish's; a cache's name
 #                too, though only HTTP runtimes are routed
@@ -81,8 +85,9 @@ ns1  A   192.0.2.53
 mail A   192.0.2.25
 EOF
 DNS=$((P+10))
-"$BIN" create dns ns -p "$DNS" --zone "$T/z.zone" --proxy web --rrl 0 -s >/dev/null 2>&1
+# An entrance made by hand, in plain HTTP, which the dns runtime takes as it is.
 "$BIN" create proxy web -p $((P+11)) >/dev/null 2>&1
+"$BIN" create dns ns -p "$DNS" --zone "$T/z.zone" --proxy web --rrl 0 -s >/dev/null 2>&1
 "$BIN" create storage ui -p $((P+12)) --dir "$T/ui" --anonymous --domain ui >/dev/null 2>&1
 "$BIN" create cache mycache -p $((P+13)) --domain mycache >/dev/null 2>&1
 qd() { dig @127.0.0.1 -p "$DNS" +time=2 +tries=1 +short "$@" 2>&1; }
@@ -107,7 +112,7 @@ expect "a name the zone file gives an address keeps it" "$(qd mail.example.com A
 Z=$((P+20))
 cd "$T"
 expect "--zone with a zone's name and no file makes the runtime" \
-    "$("$BIN" create dns nsz -p "$Z" --zone Zed.Example. --publish 198.51.100.9 --rrl 0 -s 2>&1)" ""
+    "$("$BIN" create dns nsz -p "$Z" --zone Zed.Example. --publish 198.51.100.9 --rrl 0 --proxy none -s 2>&1)" ""
 zf=$(find "$T" -path '*zones/zed.example.zone' | head -1)
 [ -n "$zf" ] && ok "and its file is written in the state directory" || bad "zone file" "none under $T"
 dz() { dig @127.0.0.1 -p "$Z" +time=2 +tries=1 +short "$@" 2>&1; }
@@ -123,13 +128,38 @@ for _ in $(seq 1 40); do got=$(dz www.zed.example A); [ -n "$got" ] && break; sl
 expect "and kept, not written over, at a restart" "$got" "192.0.2.80"
 "$BIN" remove nsz >/dev/null 2>&1
 expect "a missing <zone>.zone path is written where it was given" \
-    "$("$BIN" create dns nsf -p "$Z" --zone "$T/zz/third.example.zone" --publish 198.51.100.9 2>&1; ls "$T/zz")" "third.example.zone"
+    "$("$BIN" create dns nsf -p "$Z" --zone "$T/zz/third.example.zone" --publish 198.51.100.9 --proxy none 2>&1; ls "$T/zz")" "third.example.zone"
 "$BIN" remove nsf >/dev/null 2>&1
 has "a missing file of another name is refused" \
     "$("$BIN" create dns nsn -p "$Z" --zone "$T/zz/nope.txt" --publish 198.51.100.9 2>&1)" "does not exist"
 has "and so is a name that is no zone's" "$("$BIN" create dns nsn -p "$Z" --zone nozone --publish 198.51.100.9 2>&1)" \
     "neither a zone's name"
 cd - >/dev/null
+
+# ── the entrance a dns runtime makes ────────────────────────────────────────
+X=$((P+21))
+expect "a dns runtime is made with its entrance" \
+    "$("$BIN" create dns nse -p "$X" --zone ent.example --publish 198.51.100.9 --proxy-port $((X+1)) --rrl 0 -s 2>&1)" ""
+row() { "$BIN" ls 2>/dev/null | awk -v n="$1" '$2 == n {print $3, $6, $7}'; }
+expect "named after it, owned by it, running, on --proxy-port" "$(row nse-proxy) $("$BIN" show nse-proxy 2>&1 | grep -c "\"port\": $((X+1))")" "proxy nse Up 1"
+has "and speaking TLS, its certificate its own to ask for" "$("$BIN" show nse-proxy 2>&1)" '"tls": true'
+has "the dns runtime names it" "$("$BIN" show nse 2>&1)" '"proxy": "nse-proxy"'
+"$BIN" stop nse >/dev/null 2>&1
+expect "it stops with the dns runtime" "$(row nse-proxy | cut -d' ' -f3)" "Stopped"
+"$BIN" start nse >/dev/null 2>&1
+expect "and starts with it" "$(row nse-proxy | cut -d' ' -f3)" "Up"
+has "a port already taken is refused, and nothing is left made" \
+    "$("$BIN" create dns nsb -p $((X+2)) --zone b.example --publish 198.51.100.9 --proxy-port $((X+1)) -s 2>&1; "$BIN" ls 2>/dev/null | grep -c ' nsb')" "could not be made
+0"
+expect "--proxy none makes none" \
+    "$("$BIN" create dns nsn -p $((X+3)) --zone n.example --publish 198.51.100.9 --proxy none 2>&1; row nsn-proxy)" ""
+"$BIN" remove nsn >/dev/null 2>&1
+"$BIN" create dns nss -p $((X+4)) --zone s.example --publish 198.51.100.9 --proxy nse-proxy -s >/dev/null 2>&1
+expect "a second dns runtime may name the same entrance, which stays the first one's" "$(row nse-proxy | cut -d' ' -f2)" "nse"
+"$BIN" remove nse >/dev/null 2>&1
+expect "removed with the first, it passes to the other instead" "$(row nse-proxy | cut -d' ' -f2)" "nss"
+"$BIN" remove nss >/dev/null 2>&1
+expect "and goes with the last" "$(row nse-proxy)" ""
 
 # ── the table the entrance routes by ────────────────────────────────────────
 mkdir -p "$T/c1" "$T/c2" "$T/late"; echo one > "$T/c1/who.txt"; echo two > "$T/c2/who.txt"; echo late > "$T/late/who.txt"
@@ -209,8 +239,8 @@ if command -v openssl >/dev/null 2>&1; then
         -addext "subjectAltName=DNS:*.example.com,DNS:example.com" \
         -keyout "$T/e.key" -out "$T/e.pem" >/dev/null 2>&1
     S=$((P+17))
-    "$BIN" create dns ns2 -p $((P+18)) --zone "$T/z.zone" --proxy webs --publish 198.51.100.7 --rrl 0 -s >/dev/null 2>&1
     "$BIN" create proxy webs -p "$S" --tls --cert "$T/e.pem" --key "$T/e.key" -s >/dev/null 2>&1
+    "$BIN" create dns ns2 -p $((P+18)) --zone "$T/z.zone" --proxy webs --publish 198.51.100.7 --rrl 0 -s >/dev/null 2>&1
     hs() { curl -sk --noproxy '*' -m 3 --resolve "$1:$S:127.0.0.1" "${@:3}" "https://$1:$S$2"; }
     got=""
     for _ in $(seq 1 40); do got=$(hs chat.example.com /who.txt); [ "$got" = one ] && break; sleep 0.2; done

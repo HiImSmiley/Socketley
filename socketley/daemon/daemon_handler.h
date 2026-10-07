@@ -94,6 +94,9 @@ public:
     // This is how the cluster's reconciliation reaches create, start, stop and remove, and it returns once a worker
     // is forked rather than once it is serving.
     int run_internal(const std::vector<std::string>& words, std::string& out, bool cluster_owned);
+    // The entrance `create dns` makes as the dns runtime's child (--proxy, --proxy-port), 0 or the exit code.
+    int make_dns_entrance(class dns_instance* dns, bool start);
+    std::vector<std::string> dns_entrance_children(std::string_view dns_name) const;
     // The stats text the worker of runtime `name` last published, empty until it has published; a cluster replica's report is read from it.
     std::string worker_detail(const std::string& name) const;
     // Sends the worker of runtime `name` a cluster replica's order; false when there is no worker to take it.

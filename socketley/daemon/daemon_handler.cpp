@@ -1592,6 +1592,15 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
+    // A dns runtime comes with its entrance: the proxy every name it publishes is reached through, made here as
+    // its child unless it exists already or --proxy none says there is to be none.
+    if (type == runtime_dns && !instance->get_test_mode() && !instance->is_lua_created())
+        if (const int rc = make_dns_entrance(static_cast<dns_instance*>(instance), autostart); rc != 0)
+        {
+            m_manager.remove(name);
+            return rc;
+        }
+
     std::string start_refusal;
 
     if (autostart && !instance->get_test_mode())
@@ -1756,6 +1765,70 @@ std::vector<std::string> daemon_handler::resolve_names(const parsed_args& pa, si
     return names;
 }
 
+int daemon_handler::make_dns_entrance(dns_instance* dns, bool start)
+{
+    std::string proxy(dns->get_proxy());
+    if (proxy == "none")
+    {
+        dns->set_proxy("");
+        return 0;
+    }
+    if (proxy.empty())
+        proxy = std::string(dns->get_name()) + "-proxy";
+    if (auto* there = m_manager.get(proxy))
+    {
+        // One made before, or by hand: taken as it is, provided it is an entrance.
+        if (!runtime_names::is_entrance(*there))
+        {
+            std::cout << "--proxy: '" << proxy << "' is a runtime but no entrance (a proxy speaking HTTP without "
+                      << "--backend); name another, or none\n";
+            return 1;
+        }
+        dns->set_proxy(proxy);
+        return 0;
+    }
+    std::vector<std::string> words = {"create", "proxy", proxy, "-p", std::to_string(dns->get_proxy_port()), "--tls"};
+    if (start)
+        words.emplace_back("-s");
+    std::string out;
+    const int rc = run_internal(words, out, false);
+    auto* made = m_manager.get(proxy);
+    if (rc != 0 || !made)
+    {
+        std::cout << out << "the entrance '" << proxy << "' could not be made"
+                  << (made ? "" : "; give --proxy another name, --proxy-port another port, or --proxy none") << "\n";
+        if (made)
+        {
+            m_manager.stop(proxy, m_loop);
+            reconcile_proxy_workers();
+            m_manager.remove(proxy);
+            if (m_persistence)
+                m_persistence->remove_runtime(proxy);
+        }
+        return 1;
+    }
+    // Its child: stopped with it, started with it, removed with it.
+    made->set_owner(dns->get_name());
+    made->set_child_policy(runtime_instance::child_policy::stop);
+    if (m_persistence)
+        m_persistence->save_runtime(made);
+    dns->set_proxy(proxy);
+    return 0;
+}
+
+// The entrances a dns runtime made for itself, which go where it goes.
+std::vector<std::string> daemon_handler::dns_entrance_children(std::string_view dns_name) const
+{
+    std::vector<std::string> out;
+    const auto* dns = m_manager.get(dns_name);
+    if (!dns || dns->get_type() != runtime_dns)
+        return out;
+    for (const auto& child : m_manager.get_children(dns_name))
+        if (const auto* c = m_manager.get(child); c && runtime_names::is_entrance(*c))
+            out.push_back(child);
+    return out;
+}
+
 int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 2)
@@ -1780,6 +1853,12 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
     const size_t withheld_start = withhold_cluster_names(names, "start", conn);
     if (names.empty())
         return withheld_start ? 1 : 0;
+    // A dns runtime's entrance starts with it.
+    for (size_t k = 0, n = names.size(); k < n; ++k)
+        for (auto& child : dns_entrance_children(names[k]))
+            if (std::find(names.begin(), names.end(), child) == names.end())
+                if (const auto* c = m_manager.get(child); c && c->get_state() != runtime_running)
+                    names.push_back(std::move(child));
 
     if (want_interactive && names.size() > 1)
     {
@@ -1987,6 +2066,33 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
     int rc = check_empty_names(names, pa, "runtime not found: ", conn);
     if (rc >= 0) return rc;
     const size_t withheld = withhold_cluster_names(names, "remove", conn);
+    // A dns runtime's entrance is removed with it -- unless another dns runtime that stays names it too, which
+    // then becomes its parent.
+    for (size_t k = 0, n = names.size(); k < n; ++k)
+        for (auto& child : dns_entrance_children(names[k]))
+        {
+            if (std::find(names.begin(), names.end(), child) != names.end())
+                continue;
+            std::string heir;
+            {
+                std::shared_lock lock(m_manager.mutex);
+                for (const auto& [other, rt] : m_manager.list())
+                    if (rt->get_type() == runtime_dns && static_cast<const dns_instance*>(rt.get())->get_proxy() == child &&
+                        std::find(names.begin(), names.end(), other) == names.end())
+                    {
+                        heir = other;
+                        break;
+                    }
+            }
+            if (heir.empty())
+                names.push_back(std::move(child));
+            else if (auto* c = m_manager.get(child))
+            {
+                c->set_owner(heir);
+                if (m_persistence)
+                    m_persistence->save_runtime(c);
+            }
+        }
 
     // A caller cannot mean "signal me".  Removing an external runtime SIGTERMs
     // the pid it attached with, which is right for an operator and fatal for
