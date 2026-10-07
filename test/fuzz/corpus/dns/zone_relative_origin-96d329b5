@@ -1,0 +1,5 @@
+$ORIGIN example.
+$ORIGIN sub
+$TTL 1h30m
+@ SOA a b 1 1 1 1 1
+@ NS a

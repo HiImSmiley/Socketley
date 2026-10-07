@@ -8,6 +8,7 @@
 class cache_instance;
 class proxy_instance;
 class storage_instance;
+class dns_instance;
 class runtime_instance;
 struct runtime_config;
 
@@ -33,6 +34,9 @@ void apply_cache_config(cache_instance& cache, const runtime_config& cfg,
 
 // A storage runtime's own fields, with `by_presence` meaning what it means for the
 // cache.
+// A DNS runtime's zones, transfer and notify lists and rate limit, the same way.
+void apply_dns_config(dns_instance& dns, const runtime_config& cfg, bool by_presence = false);
+
 void apply_storage_config(storage_instance& stg, const runtime_config& cfg,
                           bool by_presence = false);
 

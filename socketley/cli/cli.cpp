@@ -712,8 +712,25 @@ std::string cli_caller_path(std::string_view flag, std::string_view value)
 {
     static constexpr std::string_view path_flags[] = {
         "--lua", "--log", "-w", "--persistent", "--http", "--dir", "--credentials", "--sse-key-file",
-        "--cert", "--key", "--ca", "--client-ca", "--client-cert", "--client-key",
+        "--cert", "--key", "--ca", "--client-ca", "--client-cert", "--client-key", "--zone",
     };
+    // A list of zone files, each made absolute in its place.
+    if (flag == "--zone" && value.find(',') != std::string_view::npos)
+    {
+        std::string out;
+        size_t pos = 0;
+        for (;;)
+        {
+            const size_t comma = value.find(',', pos);
+            if (!out.empty() || pos > 0)
+                out += ',';
+            out += cli_caller_path(flag, value.substr(pos, comma == std::string_view::npos ? std::string_view::npos
+                                                                                          : comma - pos));
+            if (comma == std::string_view::npos)
+                return out;
+            pos = comma + 1;
+        }
+    }
     std::string_view prefix;
     bool is_path = false;
     for (std::string_view f : path_flags)

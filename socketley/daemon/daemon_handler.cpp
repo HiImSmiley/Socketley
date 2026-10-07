@@ -15,6 +15,7 @@
 #include "../cli/command_hashing.h"
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/storage/storage_instance.h"
+#include "../runtime/dns/dns_instance.h"
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
@@ -1381,6 +1382,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                 case runtime_storage:
                     result = parse_storage_flags(
                         static_cast<storage_instance*>(instance), pa, i, name);
+                    break;
+                case runtime_dns:
+                    result = parse_dns_flags(static_cast<dns_instance*>(instance), pa, i, name);
                     break;
                 default:
                     // A registered type's flags come from its manifest schema.
@@ -3536,8 +3540,9 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                     result = -1;
                     break;
                 case runtime_storage:
-                    // A storage runtime's own settings are applied by `import`,
-                    // as a cache's are.
+                case runtime_dns:
+                    // A storage or DNS runtime's own settings are applied by
+                    // `import`, as a cache's are.
                     result = -1;
                     break;
                 default:
@@ -4322,6 +4327,11 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         {
             apply_storage_config(*static_cast<storage_instance*>(instance), cfg,
                                  /*by_presence=*/true);
+            break;
+        }
+        case runtime_dns:
+        {
+            apply_dns_config(*static_cast<dns_instance*>(instance), cfg, /*by_presence=*/true);
             break;
         }
         default:

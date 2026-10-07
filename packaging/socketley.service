@@ -28,6 +28,10 @@ ReadWritePaths=/var/lib/socketley /run/socketley
 # User
 User=socketley
 Group=socketley
+# Ports below 1024 -- a dns runtime's 53, and 80 and 443 -- without root. Only this one capability, and NoNewPrivileges
+# above keeps any program a runtime starts from gaining more.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target

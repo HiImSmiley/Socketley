@@ -18,6 +18,7 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/storage/storage_instance.h"
+#include "../runtime/dns/dns_instance.h"
 #include "../cli/command_hashing.h"
 #include "../runtime/worker/worker_main.h"
 
@@ -489,6 +490,11 @@ static void restore_runtimes(state_persistence& persistence,
             case runtime_storage:
             {
                 apply_storage_config(*static_cast<storage_instance*>(instance), cfg);
+                break;
+            }
+            case runtime_dns:
+            {
+                apply_dns_config(*static_cast<dns_instance*>(instance), cfg);
                 break;
             }
         }

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **DNS: an authoritative name server runtime.** `socketley create dns <name>
+  --zone <file>` serves the zones in RFC 1035 master files over UDP and TCP on one
+  port (53 by default), IPv4 and IPv6, in one or `--shards` processes. Records,
+  CNAMEs followed within the zone, wildcards, delegations referred with their
+  glue, NXDOMAIN and NODATA with the SOA at its negative TTL (RFC 2308), the
+  addresses of NS, MX and SRV targets, EDNS with UDP answers kept to 1232 bytes
+  and truncated to TCP past it, RFC 7766 pipelining over TCP, ANY answered as RFC
+  8482 allows, CHAOS refused. It never recurses and caches nothing, so a name of
+  no zone it holds is REFUSED. A zone file is checked whole at `create` (the line
+  that is wrong is named) and read again within a second of being edited; a
+  broken edit leaves the zone before it. AXFR goes to the addresses `--transfer`
+  names, NOTIFY (retried until answered) to the secondaries `--notify` names, and
+  `--rrl` (100 a second per /24 or /56 by default) answers past it truncated or
+  not at all. On four cores against dnsperf it answered 360-379k queries a second
+  on one shard and 473k on two, where NSD 4.8 answered 319-334k and 465-479k on
+  the same machine. The packaged service is given `CAP_NET_BIND_SERVICE` so a
+  runtime may bind 53. The ids of registered runtime types now begin at 6.
+
 - **Storage: bucket CORS, lifecycle, object tagging and reads by part number.**
   PutBucketCors/GetBucketCors/DeleteBucketCors with S3's CORSConfiguration, an
   unauthenticated `OPTIONS` preflight, and the CORS headers on every answer to an

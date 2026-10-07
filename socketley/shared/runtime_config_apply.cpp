@@ -8,6 +8,7 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/storage/storage_instance.h"
+#include "../runtime/dns/dns_instance.h"
 
 void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
                         bool by_presence)
@@ -89,6 +90,21 @@ void apply_cache_config(cache_instance& cache, const runtime_config& cfg, bool b
         cache.set_eviction(static_cast<eviction_policy>(cfg.eviction));
     if (asked("public", cfg.cache_public))
         cache.set_public(cfg.cache_public);
+}
+
+void apply_dns_config(dns_instance& dns, const runtime_config& cfg, bool by_presence)
+{
+    auto asked = [&](std::string_view key, bool nondefault) {
+        return by_presence ? cfg.has(key) : nondefault;
+    };
+    if (asked("zones", !cfg.dns_zones.empty()))
+        dns.set_zones(cfg.dns_zones);
+    if (asked("transfer", !cfg.dns_transfer.empty()))
+        dns.set_transfer(cfg.dns_transfer);
+    if (asked("notify", !cfg.dns_notify.empty()))
+        dns.set_notify(cfg.dns_notify);
+    if (asked("rrl", true))
+        dns.set_rrl(cfg.dns_rrl);
 }
 
 void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool by_presence)
@@ -289,6 +305,10 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
 
         case runtime_storage:
             apply_storage_config(static_cast<storage_instance&>(rt), cfg);
+            break;
+
+        case runtime_dns:
+            apply_dns_config(static_cast<dns_instance&>(rt), cfg);
             break;
     }
 

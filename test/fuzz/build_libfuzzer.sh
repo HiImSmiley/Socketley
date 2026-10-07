@@ -17,7 +17,7 @@ REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 # because the SDK-linking targets drag in fifteen translation units -- and
 # narrowing is always the caller's explicit decision, never a target dropped
 # because building it failed.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy"
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -96,6 +96,8 @@ want fuzz_s3_sigv4 && build fuzz_s3_sigv4 "$ROOT/test/fuzz/fuzz_s3_sigv4.cpp" \
     "$ROOT/socketley/shared/s3_sigv4.cpp" -lcrypto
 want fuzz_bucket_policy && build fuzz_bucket_policy "$ROOT/test/fuzz/fuzz_bucket_policy.cpp" \
     "$ROOT/socketley/runtime/storage/bucket_policy.cpp"
+want fuzz_dns && build fuzz_dns "$ROOT/test/fuzz/fuzz_dns.cpp" "$ROOT/socketley/runtime/dns/dns_wire.cpp" \
+    "$ROOT/socketley/runtime/dns/dns_zone.cpp" "$ROOT/socketley/runtime/dns/dns_answer.cpp"
 
 # fuzz_cache_ops needs one .cpp out of the runtime rather than the whole SDK,
 # because cache_store.cpp includes nothing but libc headers.

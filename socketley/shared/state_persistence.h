@@ -177,6 +177,13 @@ struct runtime_config
     uint32_t storage_scrub_secs = 0;
     uint32_t storage_compress_secs = 0;
 
+    // DNS
+    std::string dns_zones;
+    std::string dns_transfer;
+    std::string dns_notify;
+    // Written always, since 0 is a setting (no rate limit) and not "not given".
+    uint32_t dns_rrl = 100;
+
     // A registered type's own fields in declaration order, opaque here, held
     // as strings because the schema that gives them kinds lives in a manifest.
     std::vector<std::pair<std::string, std::string>> extra;

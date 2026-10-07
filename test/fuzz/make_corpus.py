@@ -2659,6 +2659,47 @@ def write_set(root, name, seeds):
     return d, len(seeds), written, sorted(existing)
 
 
+# ─── fuzz_dns ───────────────────────────────────────────────────────────────
+# The first byte chooses: 0 a query against the target's fixed zone, 1 a zone file. Queries of every kind it answers
+# and refuses, with and without EDNS; zones with every directive, form and type the reader takes, and one it refuses.
+def _dns_name(n):
+    return b"".join(bytes([len(l)]) + l.encode() for l in n.split(".") if l) + b"\0"
+
+
+def _dns_query(n, t, edns=True, flags=0x0100, qclass=1):
+    m = struct.pack("!HHHHHH", 0x1234, flags, 1, 0, 0, 1 if edns else 0) + _dns_name(n) + struct.pack("!HH", t, qclass)
+    if edns:
+        m += b"\0" + struct.pack("!HHIH", 41, 1232, 0, 0)
+    return b"\0" + m
+
+
+def dns_seeds():
+    return {
+        "a": _dns_query("example.com", 1),
+        "alias": _dns_query("www.example.com", 1),
+        "wildcard": _dns_query("x.w.example.com", 1),
+        "nxdomain": _dns_query("nope.example.com", 1),
+        "mx_no_edns": _dns_query("example.com", 15, edns=False),
+        "referral": _dns_query("a.sub.example.com", 1),
+        "any": _dns_query("example.com", 255),
+        "axfr": _dns_query("example.com", 252),
+        "ixfr": _dns_query("example.com", 251),
+        "cname_loop": _dns_query("loop.example.com", 1),
+        "srv": _dns_query("_s._tcp.example.com", 33),
+        "txt_large_no_edns": _dns_query("t.example.com", 16, edns=False),
+        "chaos": _dns_query("version.bind", 16, qclass=3),
+        "update_opcode": _dns_query("example.com", 6, flags=5 << 11),
+        "pointer_into_header": b"\0" + bytes.fromhex("123401000001000000000000c00000010001"),
+        "zone_basic": b"\1" + b"$ORIGIN fuzz.test.\n$TTL 60\n@ SOA ns h 1 1 1 1 1\n@ NS ns\nns A 1.2.3.4\n"
+                               b"www CNAME @\n*.a TXT \"x\" \"y\"\nmx MX 10 ns\n",
+        "zone_parens_types": b"\1" + b"@ 60 IN SOA ns h (\n 1 ; serial\n 2h 1m 1w 30 )\n@ 60 NS ns.other.\n"
+                                      b"sub 60 NS ns.sub\nns.sub 60 AAAA ::1\nx 60 TYPE999 \\# 2 abcd\n"
+                                      b"c 60 CAA 0 issue \"ca.example\"\ns 60 SRV 1 2 3 ns\nh 60 HINFO a b\n",
+        "zone_relative_origin": b"\1" + b"$ORIGIN example.\n$ORIGIN sub\n$TTL 1h30m\n@ SOA a b 1 1 1 1 1\n@ NS a\n",
+        "zone_refused_include": b"\1" + b"$ORIGIN x.\n$INCLUDE /etc/passwd\n",
+    }
+
+
 def main(argv):
     root = argv[1] if len(argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus")
     total = 0
@@ -2671,7 +2712,8 @@ def main(argv):
                         ("eventloop", eventloop_seeds()),
                         ("raftmsg", raftmsg_seeds()),
                         ("s3sigv4", s3sigv4_seeds()),
-                        ("bucketpolicy", bucketpolicy_seeds())):
+                        ("bucketpolicy", bucketpolicy_seeds()),
+                        ("dns", dns_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

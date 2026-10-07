@@ -58,6 +58,7 @@ class client_instance;
 class proxy_instance;
 class cache_instance;
 class storage_instance;
+class dns_instance;
 
 enum server_mode : uint8_t;
 enum server_send_to : uint8_t;
@@ -83,6 +84,8 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
 
 int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
                         std::string_view name);
+
+int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::string_view name);
 
 // A `--listen` value, one function because the flag and an `import` document's
 // "listen" field must judge it the same way, returning an empty string on

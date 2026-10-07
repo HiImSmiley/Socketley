@@ -18,6 +18,8 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/storage/storage_instance.h"
+#include "../runtime/dns/dns_instance.h"
+#include "../shared/ip_block.h"
 #include "../runtime/storage/s3_vhost.h"
 #include "../runtime/storage/sync_mode.h"
 
@@ -1331,6 +1333,65 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
             }
             ++i;
             cache->set_cluster_replica(incarnation);
+            return 0;
+        }
+        default:
+            return -1;
+    }
+}
+
+int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::string_view /*name*/)
+{
+    switch (pa.hashes[i])
+    {
+        // A zone file, absolute as the CLI makes it; given again for each further zone.
+        case fnv1a("--zone"):
+        {
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            if (v.empty() || v.find('\0') != std::string_view::npos)
+            {
+                std::cout << "--zone requires the path of a zone file, or several separated by commas\n";
+                return 1;
+            }
+            ++i;
+            dns->add_zone(v);
+            return 0;
+        }
+        // The secondaries that may copy a zone whole: addresses and blocks.
+        case fnv1a("--transfer"):
+        {
+            std::vector<socketley::ip_block> blocks;
+            std::string bad;
+            if (i + 1 >= pa.count || !socketley::ip_block::parse_list(pa.args[i + 1], blocks, bad))
+            {
+                std::cout << "--transfer requires addresses or blocks such as 192.0.2.7 or 2001:db8::/32"
+                          << (bad.empty() ? std::string{} : ", not '" + bad + "'") << "\n";
+                return 1;
+            }
+            dns->set_transfer(pa.args[++i]);
+            return 0;
+        }
+        // The secondaries told of a new serial, checked whole when the runtime is created.
+        case fnv1a("--notify"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << "--notify requires addresses, with :port where it is not 53\n";
+                return 1;
+            }
+            dns->set_notify(pa.args[++i]);
+            return 0;
+        }
+        case fnv1a("--rrl"):
+        {
+            uint32_t n = 0;
+            if (i + 1 >= pa.count || !parse_uint32(pa.args[i + 1], n) || n > 1000000)
+            {
+                std::cout << "--rrl requires responses a second per client network, 0 for no limit\n";
+                return 1;
+            }
+            ++i;
+            dns->set_rrl(n);
             return 0;
         }
         default:

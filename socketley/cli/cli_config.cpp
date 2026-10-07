@@ -127,6 +127,12 @@ constexpr config_key config_keys[] = {
     { "mpu_expire",         "--mpu-expire",         key_kind::scalar  },
     { "scrub",              "--scrub",              key_kind::scalar  },
     { "compress",           "--compress",           key_kind::scalar  },
+
+    // ── DNS ─────────────────────────────────────────────────────────────────
+    { "zone",               "--zone",               key_kind::list    },
+    { "transfer",           "--transfer",           key_kind::list    },
+    { "notify",             "--notify",             key_kind::list    },
+    { "rrl",                "--rrl",                key_kind::integer },
 };
 
 // Keys with no flag of their own, listed so an unknown key can still be
@@ -571,7 +577,7 @@ int cli_config(int argc, char** argv)
         if (!type_opt || type_opt->empty())
         {
             std::cerr << "runtime \"" << *name_opt << "\" has no type "
-                         "(server, client, proxy, cache, storage, or a registered type)\n";
+                         "(server, client, proxy, cache, storage, dns, or a registered type)\n";
             ++failed;
             continue;
         }

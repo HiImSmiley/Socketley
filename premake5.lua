@@ -1383,6 +1383,26 @@ project "fuzz_bucket_policy"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: the dns runtime's query answerer and zone file reader ───
+
+project "fuzz_dns"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_dns.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/runtime/dns/dns_wire.cpp",
+        "socketley/runtime/dns/dns_zone.cpp",
+        "socketley/runtime/dns/dns_answer.cpp"
+    }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: the storage runtime's parsers of whole inputs ───
 --
 -- An LZ4 block and a compressed body's table, a SelectObjectContent request and its records, an ACL and grant headers,
@@ -2231,6 +2251,42 @@ project "test_hpack"
     }
 
     files { "test/unit/test_hpack.cpp", "socketley/shared/hpack.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+project "test_dns"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files {
+        "test/unit/test_dns.cpp",
+        "socketley/runtime/dns/dns_wire.cpp",
+        "socketley/runtime/dns/dns_zone.cpp",
+        "socketley/runtime/dns/dns_answer.cpp"
+    }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

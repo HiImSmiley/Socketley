@@ -237,7 +237,7 @@ cli_commands() {
     echo ""
 
     echo -e "${BOLD}create <type> <name> [flags]${NC}"
-    echo "  Create a new runtime: server, client, proxy, cache, storage, or a type"
+    echo "  Create a new runtime: server, client, proxy, cache, storage, dns, or a type"
     echo "  registered by a manifest in the daemon's types directory"
     echo "  (/etc/socketley/types/ or ~/.config/socketley/types/), whose"
     echo "  schema keys become --<key> flags. See REGISTERED TYPES in man."
@@ -683,6 +683,24 @@ runtime_types() {
     echo -e "${GREEN}│${NC} Hot: a small object read again is answered from memory by      ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC}   any shard, never after it was replaced (stats: hot_gets).    ${GREEN}│${NC}"
     echo -e "${GREEN}└─────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+
+    echo -e "${BLUE}┌─────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BLUE}│${NC} ${BOLD}DNS${NC}                                                           ${BLUE}│${NC}"
+    echo -e "${BLUE}├─────────────────────────────────────────────────────────────────┤${NC}"
+    echo -e "${BLUE}│${NC} Authoritative name server for the zones in its files           ${BLUE}│${NC}"
+    echo -e "${BLUE}│${NC} Default port: 53 (UDP and TCP)                                 ${BLUE}│${NC}"
+    echo -e "${BLUE}│${NC} Flags: --zone file (required; repeat or comma-separate),       ${BLUE}│${NC}"
+    echo -e "${BLUE}│${NC}        --transfer addr/block (who may AXFR a zone),            ${BLUE}│${NC}"
+    echo -e "${BLUE}│${NC}        --notify host[:port] (secondaries told of new serials), ${BLUE}│${NC}"
+    echo -e "${BLUE}│${NC}        --rrl n (answers/s per client network, default 100)    ${BLUE}│${NC}"
+    echo -e "${BLUE}│${NC} Example: socketley create dns ns --zone /etc/zones/x.zone -s   ${BLUE}│${NC}"
+    echo -e "${BLUE}│${NC}                                                                 ${BLUE}│${NC}"
+    echo -e "${BLUE}│${NC} Answers only for its own zones: no recursion, REFUSED for any  ${BLUE}│${NC}"
+    echo -e "${BLUE}│${NC}   other name, ANY answered as RFC 8482 asks. An edited zone    ${BLUE}│${NC}"
+    echo -e "${BLUE}│${NC}   file is served within a second once it parses; a broken one ${BLUE}│${NC}"
+    echo -e "${BLUE}│${NC}   leaves the old zone in place. dig @host -p 53 name           ${BLUE}│${NC}"
+    echo -e "${BLUE}└─────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
 
     read -p "Press Enter to continue..." || true
@@ -3106,7 +3124,7 @@ sdk_cross() {
 # stdout with a live stdin still cannot show a menu worth drawing.
 plain_help() {
     cat <<'EOF'
-socketley — a daemon for long-living network runtimes (server, client, proxy, cache, storage)
+socketley — a daemon for long-living network runtimes (server, client, proxy, cache, storage, dns)
 
 USAGE
   socketley <command> [options]
@@ -3115,7 +3133,7 @@ USAGE
   socketley --lua <file>
 
 RUNTIMES
-  create <type> <name> [flags]   create a server, client, proxy, cache, storage, or a
+  create <type> <name> [flags]   create a server, client, proxy, cache, storage, dns, or a
                                  manifest-registered type (man: REGISTERED TYPES)
   start|stop|restart <name>      lifecycle
   remove <name>                  remove a runtime

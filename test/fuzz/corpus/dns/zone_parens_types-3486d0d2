@@ -1,0 +1,10 @@
+@ 60 IN SOA ns h (
+ 1 ; serial
+ 2h 1m 1w 30 )
+@ 60 NS ns.other.
+sub 60 NS ns.sub
+ns.sub 60 AAAA ::1
+x 60 TYPE999 \# 2 abcd
+c 60 CAA 0 issue "ca.example"
+s 60 SRV 1 2 3 ns
+h 60 HINFO a b

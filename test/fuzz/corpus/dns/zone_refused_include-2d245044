@@ -1,0 +1,2 @@
+$ORIGIN x.
+$INCLUDE /etc/passwd

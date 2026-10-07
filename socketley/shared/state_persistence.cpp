@@ -8,6 +8,7 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/storage/storage_instance.h"
+#include "../runtime/dns/dns_instance.h"
 #include "../cli/command_hashing.h"
 #include "type_registry.h"
 
@@ -783,6 +784,15 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.cache_public = cache->get_public();
             break;
         }
+        case runtime_dns:
+        {
+            auto* d = static_cast<const dns_instance*>(instance);
+            cfg.dns_zones = std::string(d->get_zones());
+            cfg.dns_transfer = std::string(d->get_transfer());
+            cfg.dns_notify = std::string(d->get_notify());
+            cfg.dns_rrl = d->get_rrl();
+            break;
+        }
         case runtime_storage:
         {
             auto* stg = static_cast<const storage_instance*>(instance);
@@ -1109,6 +1119,14 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             if (cfg.storage_compress_secs > 0)
                 append_int_field("compress", cfg.storage_compress_secs);
             break;
+        case runtime_dns:
+            append_str_field("zones", cfg.dns_zones);
+            if (!cfg.dns_transfer.empty())
+                append_str_field("transfer", cfg.dns_transfer);
+            if (!cfg.dns_notify.empty())
+                append_str_field("notify", cfg.dns_notify);
+            append_int_field("rrl", cfg.dns_rrl);
+            break;
     }
 
     // A registered type's fields as one nested object, absent when there are
@@ -1288,6 +1306,12 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.storage_mpu_expire_secs = static_cast<uint32_t>(json_get_size(json, "mpu_expire"));
             cfg.storage_scrub_secs = static_cast<uint32_t>(json_get_size(json, "scrub"));
             cfg.storage_compress_secs = static_cast<uint32_t>(json_get_size(json, "compress"));
+            break;
+        case runtime_dns:
+            cfg.dns_zones = json_get_string(json, "zones");
+            cfg.dns_transfer = json_get_string(json, "transfer");
+            cfg.dns_notify = json_get_string(json, "notify");
+            cfg.dns_rrl = json_get_uint32(json, "rrl", 100);
             break;
     }
 

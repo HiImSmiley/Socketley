@@ -49,6 +49,7 @@ bool builtin_lookup(std::string_view name, runtime_type& out)
     if (name == "proxy")  { out = runtime_proxy;  return true; }
     if (name == "cache")  { out = runtime_cache;  return true; }
     if (name == "storage") { out = runtime_storage; return true; }
+    if (name == "dns")     { out = runtime_dns;     return true; }
     return false;
 }
 
@@ -174,6 +175,7 @@ const char* type_to_string(runtime_type t)
         case runtime_proxy:  return "proxy";
         case runtime_cache:  return "cache";
         case runtime_storage: return "storage";
+        case runtime_dns:     return "dns";
         default: break;
     }
 

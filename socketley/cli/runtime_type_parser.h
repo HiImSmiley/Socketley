@@ -25,6 +25,9 @@ inline bool parse_runtime_type(std::string_view str, runtime_type& out)
         case fnv1a("storage"):
             out = runtime_storage;
             return true;
+        case fnv1a("dns"):
+            out = runtime_dns;
+            return true;
         default:
             return type_registry::lookup(str, out);
     }

@@ -1,0 +1,8 @@
+$ORIGIN fuzz.test.
+$TTL 60
+@ SOA ns h 1 1 1 1 1
+@ NS ns
+ns A 1.2.3.4
+www CNAME @
+*.a TXT "x" "y"
+mx MX 10 ns

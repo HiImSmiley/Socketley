@@ -173,6 +173,7 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 - **Client**:TCP/UDP connector with auto-reconnect
 - **Proxy**:HTTP/TCP reverse proxy with round-robin, random, or Lua-based routing
 - **Cache**:In-memory key-value store with strings, lists, sets, hashes, sorted sets, streams with consumer groups and blocking reads, TTL, pub/sub, RESP2 (Redis wire protocol), LRU eviction, persistence, leader-follower replication, and DB-backend Lua hooks for read-through / write-behind caching. It has no password, so it serves only this machine unless created with `--public` or given mutual TLS
+- **DNS**:Authoritative name server for zone files (RFC 1035 master format): UDP and TCP on one port, wildcards, aliases followed within the zone, delegations with glue, EDNS kept to 1232 bytes, truncation to TCP, AXFR to the secondaries `--transfer` names and NOTIFY to those `--notify` names, an edited zone served within a second, and response rate limiting. It answers for its own zones only — no recursion, nothing cached — so it is no open resolver
 - **Lua scripting**:Per-runtime callbacks (`on_message`, `on_connect`, `on_auth`, `on_route`, etc.) with hot-reload, timers, HTTP client, cross-runtime pub/sub
 - **Cluster mode**:Multi-daemon discovery via shared directory, `@group` backend routing, Lua cluster API
 - **Sharding**:`--shards N` runs one runtime across N worker processes behind a single port via `SO_REUSEPORT`, on servers, proxies and caches — a sharded cache keeps one keyspace, so `mget`, `dbsize` and `publish` still answer for the whole runtime. On a **cache** add `--cluster` and point a cluster-aware client at it: behind one address the shard a connection lands on relays every key it does not own, which measured 1.75× for 3.95 cores at four shards against 2.80× slot-routed — see **Sharding a cache** under Performance
@@ -724,6 +725,10 @@ redis-cli -p 6379 GET mykey
 # Create a reverse proxy
 socketley create proxy gw -p 8080 --backend 127.0.0.1:9000 -s
 
+# Serve a DNS zone (port 53 by default)
+socketley create dns ns --zone /etc/socketley/example.com.zone -s
+dig @127.0.0.1 www.example.com
+
 # List all runtimes
 socketley ls
 
@@ -735,7 +740,7 @@ socketley stats myapp
 
 ```
 socketley daemon                          # start the daemon (systemd does this when installed)
-socketley create <type> <name> [flags]    # types: server, client, proxy, cache
+socketley create <type> <name> [flags]    # types: server, client, proxy, cache, storage, dns
 socketley add <path> [--name <n>] [-s]    # register and manage an external SDK binary
 socketley attach <type> <name> <port>     # register an external process as a runtime
 socketley start <name|pattern>... [-i]    # start runtime(s), -i for interactive

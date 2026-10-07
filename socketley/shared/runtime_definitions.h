@@ -17,7 +17,8 @@ enum runtime_type : uint8_t
     runtime_client = 1,
     runtime_proxy  = 2,
     runtime_cache  = 3,
-    runtime_storage = 4
+    runtime_storage = 4,
+    runtime_dns     = 5
 };
 
 // The five names, once.  Five places had this switch -- lua_context,

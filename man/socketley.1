@@ -4,7 +4,7 @@
 .\"
 .TH SOCKETLEY 1 "2026" "socketley" "User Commands"
 .SH NAME
-socketley \- manage network runtimes (servers, clients, proxies, Redis-compatible caches, S3 object storage) in Docker-like style
+socketley \- manage network runtimes (servers, clients, proxies, Redis-compatible caches, S3 object storage, DNS) in Docker-like style
 .SH SYNOPSIS
 .B socketley
 .I command
@@ -117,7 +117,7 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .SH DESCRIPTION
 .B socketley
 is a high-performance Linux daemon and CLI that manages network runtimes
-(servers, clients, proxies, Redis-compatible caches, S3 object storage) in a Docker-like style \(em
+(servers, clients, proxies, Redis-compatible caches, S3 object storage, authoritative DNS) in a Docker-like style \(em
 with clustering, WebSocket, Lua scripting, and io_uring async I/O.
 .PP
 .B "TLS terminates on a server or cache listener, on both of a proxy's legs, and on a client's dial."
@@ -502,7 +502,7 @@ socketley daemon --name new-name   # rename while cluster is active
 .BI "create " "type name " "[flags]"
 Create a new runtime instance.
 .I type
-can be: server, client, proxy, cache, or any registered type \(em see
+can be: server, client, proxy, cache, storage, dns, or any registered type \(em see
 .BR "REGISTERED TYPES" .
 .I name
 is a unique identifier for the runtime.
@@ -1198,7 +1198,7 @@ name	Runtime name \fB(requires restart)\fR
 id	6-char hex identifier (read-only, ignored on import)
 type	T{
 .ad l
-Runtime type: server, client, proxy, cache, storage (read-only, ignored on import)
+Runtime type: server, client, proxy, cache, storage, dns (read-only, ignored on import)
 T}
 was_running	Internal daemon state (ignored on import)
 .TE
@@ -1691,7 +1691,7 @@ to be set first.
 These flags work with all runtime types:
 .TP
 .BI "\-p " "port"
-Set listener port (server, proxy, cache, storage) or target port (client).
+Set listener port (server, proxy, cache, storage, dns) or target port (client).
 .BI "\-p " address : port
 sets
 .B \-\-bind
@@ -10566,6 +10566,149 @@ Buckets are made with the S3 API. An object moves whole in memory and the
 request crosses a process boundary in a frame that waits in a 4 MiB queue, so a
 script may put or get at most 1 MiB per call, and at most 1024 calls may be
 waiting on one runtime; larger objects are for the S3 port.
+.SH DNS FLAGS
+A
+.B dns
+runtime is an authoritative name server: it answers, over UDP and TCP on one
+port, for the zones in the files it is given, and for nothing else.
+.PP
+.nf
+socketley create dns ns \-\-zone /etc/socketley/example.com.zone \-s
+dig @127.0.0.1 www.example.com
+.fi
+.PP
+It asks no other server and caches nothing: a name in none of its zones is
+answered REFUSED, never looked up, so it cannot be used as an open resolver and
+no answer it gives came from anybody else. It runs in a worker process of its
+own like every other runtime, may run as
+.B \-\-shards
+processes that share the port, and binds IPv4 and, when no
+.B \-\-bind
+address is given and the host has it, IPv6 as well. Port 53 is the default;
+below 1024 a port needs root or
+.BR CAP_NET_BIND_SERVICE ,
+which the packaged service grants.
+.BR \-p ,
+.BR \-\-bind ,
+.BR \-\-cpus ,
+.B \-\-max\-connections
+(TCP connections, 256 when not given) and the common flags apply as documented
+under
+.BR "COMMON FLAGS" ;
+.B \-\-listen
+and
+.B \-\-tls
+are refused.
+.TP
+.BI \-\-zone " file"
+A zone file in the master file format of RFC 1035, given once for each zone or
+as several paths separated by commas, each made absolute against the caller's
+directory. Required. The zone's apex is the owner of its one SOA record; every
+record has to lie at or below it, the apex has to name its servers with NS
+records, a CNAME has to be the only record of its name, and below a delegation
+only the addresses of its servers may stand. A file that is not such a zone is
+refused at
+.B create
+and
+.B start
+with the line that is wrong.
+.B $ORIGIN
+and
+.B $TTL
+are read;
+.B $INCLUDE
+is refused, since it would let a zone file read any file the worker may.
+Types A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV, CAA and HINFO are written in
+their usual form, and any other type in RFC 3597's
+.B TYPE\fIn\fB \e# \fIlength hex\fR.
+A TXT string longer than 255 bytes is split into several, as a DKIM key needs.
+.IP
+The file is looked at once a second. Edited, it is read again; the new zone is
+served once it has been read whole and checked, and a file that no longer parses
+leaves the zone before it in place, with the reason in the log. A changed zone
+whose serial did not change is served, and the log says that its secondaries
+will not notice it until the serial is raised.
+.TP
+.BI \-\-transfer " list"
+The addresses and blocks, comma\-separated, that may copy a zone whole by AXFR
+over TCP (RFC 5936) \(em a secondary's, such as 192.0.2.53 or 2001:db8::/48.
+Everyone else is REFUSED, so the names a zone holds are not handed to whoever
+asks. An IXFR from them over UDP is answered with the SOA alone, which tells a
+secondary the serial and to come over TCP; over TCP it is answered as an AXFR.
+.TP
+.BI \-\-notify " list"
+The secondaries told by a NOTIFY (RFC 1996), as
+.IR host [: port ],
+comma\-separated, when the runtime starts and whenever a zone's serial changes.
+A NOTIFY is sent again after 1, 3, 7, 15 and 31 seconds until the secondary
+answers it. Only the first shard sends them.
+.TP
+.BI \-\-rrl " n"
+Response rate limiting: at most
+.I n
+answers a second to one client network (an IPv4 /24, an IPv6 /56); past it,
+every second answer is replaced by a truncated one (TC, no records, as large as
+the query) and the others are dropped. A resolver behind that network retries
+over TCP, which is not limited, and is served; a victim whose address a
+flood forges receives nothing larger than what was sent. 100 by default, 0 for
+no limit.
+.SS What it answers
+A name found is answered with its records, authoritatively. A CNAME is
+followed, up to eight steps, while its target is in the same zone. A wildcard
+.RB ( *.label )
+stands for every name beneath its parent that does not exist. A name below a
+delegation is referred: the NS records of the cut, and the addresses of those
+servers where the zone holds them, without the authoritative flag. An absent
+name is NXDOMAIN, and a name without the type asked for NODATA, both with the
+zone's SOA, whose TTL there is the lesser of its own and its MINIMUM (RFC 2308).
+The addresses of the hosts an NS, MX or SRV answer names follow in the
+additional section when the zone has them and they fit.
+.PP
+ANY is answered with one HINFO record, as RFC 8482 allows, rather than with
+everything, so that it amplifies nothing. Classes other than IN, such as
+CHAOS's version.bind, are REFUSED. A query with EDNS (RFC 6891) is answered with
+it; an answer over UDP is kept within the size the query offers and never past
+1232 bytes, the size that needs no fragments, and one without EDNS within 512.
+What does not fit is sent as the question alone with TC set, and the asker
+comes back over TCP, where it is answered whole. A response is never answered,
+a malformed query is FORMERR, and opcodes other than QUERY are NOTIMP.
+.SS TCP
+A connection may carry several queries one after another and is answered in
+order (RFC 7766). One left quiet for 10 seconds, with nothing left to write, is
+closed.
+.SS Stats
+.B stats
+adds, for each shard:
+.BR zones ,
+.BR records ,
+.BR udp_queries ,
+.BR tcp_queries ,
+the answers by rcode
+.RB ( noerror ,
+.BR nxdomain ,
+.BR refused ,
+.BR formerr ,
+.BR notimp ,
+.BR other_rcode ),
+.BR truncated ,
+.BR referrals ,
+.B dropped
+(packets that were no query),
+.B rrl_dropped
+and
+.BR rrl_slipped ,
+.B send_failed
+(answers the socket would not take),
+.BR tcp_conns ,
+.BR tcp_refused ,
+.BR transfers ,
+.BR transfers_refused ,
+.BR notify_sent ,
+.BR notify_acked ,
+.BR notify_given_up ,
+.B zone_reloads
+and
+.BR zone_reload_failures .
 .SH REGISTERED TYPES
 A runtime type beyond the built-in five is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never
