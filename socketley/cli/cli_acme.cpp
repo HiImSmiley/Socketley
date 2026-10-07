@@ -597,7 +597,7 @@ bool poll(client& c, const std::string& url, std::string_view want, jvalue& doc,
 
 int issue(int argc, char** argv)
 {
-    std::vector<std::string> names;
+    std::vector<std::string> names, dns_zones;
     std::string cert, key, email, challenge;
     std::string dir = std::getenv("SOCKETLEY_ACME_DIRECTORY") && *std::getenv("SOCKETLEY_ACME_DIRECTORY")
                           ? std::getenv("SOCKETLEY_ACME_DIRECTORY")
@@ -633,6 +633,18 @@ int issue(int argc, char** argv)
             ok = value(dir);
         else if (a == "--challenge")
             ok = value(challenge) && (challenge == "http-01" || challenge == "tls-alpn-01" || challenge == "dns-01");
+        // The zones a dns runtime of this daemon serves: a name in one is proven over DNS-01 whatever --challenge
+        // says, which needs no port open, and --challenge is left for the others.
+        else if (a == "--dns-zones" && (ok = value(v)))
+        {
+            for (size_t p = 0; p <= v.size();)
+            {
+                const size_t comma = std::min(v.find(',', p), v.size());
+                if (comma > p)
+                    dns_zones.push_back(v.substr(p, comma - p));
+                p = comma + 1;
+            }
+        }
         else
             ok = false;
         if (!ok)
@@ -644,7 +656,7 @@ int issue(int argc, char** argv)
     if (names.empty())
     {
         std::cout << "usage: socketley acme issue --domains name[,name...] [--cert file] [--key file] [--email addr] "
-                     "[--directory url] [--challenge http-01|tls-alpn-01|dns-01]\n";
+                     "[--directory url] [--challenge http-01|tls-alpn-01|dns-01] [--dns-zones zone[,zone...]]\n";
         return 1;
     }
     // A wildcard is proven by DNS alone (RFC 8555 8.4); SOCKETLEY_ACME_CHALLENGE picks one for every name, for a
@@ -653,18 +665,33 @@ int issue(int argc, char** argv)
     if (challenge.empty())
     {
         const char* env = std::getenv("SOCKETLEY_ACME_CHALLENGE");
-        challenge = wildcard ? "dns-01" : env && *env ? env : "http-01";
+        challenge = wildcard && dns_zones.empty() ? "dns-01" : env && *env ? env : "http-01";
     }
+    // Whether `n` (with or without "*.") is proven over DNS-01: every name when that is the challenge, and the
+    // names in the zones --dns-zones gives.
+    const auto by_dns = [&](std::string_view n)
+    {
+        if (n.starts_with("*."))
+            n.remove_prefix(2);
+        if (challenge == "dns-01")
+            return true;
+        for (const std::string& z : dns_zones)
+            if (n.size() >= z.size() && n.substr(n.size() - z.size()) == z &&
+                (n.size() == z.size() || n[n.size() - z.size() - 1] == '.'))
+                return true;
+        return false;
+    };
     if (challenge != "http-01" && challenge != "tls-alpn-01" && challenge != "dns-01")
     {
         std::cout << "acme issue: the challenge is http-01, tls-alpn-01 or dns-01, not " << challenge << "\n";
         return 1;
     }
-    if (wildcard && challenge != "dns-01")
-    {
-        std::cout << "acme issue: a wildcard is proven over dns-01 only\n";
-        return 1;
-    }
+    for (const std::string& n : names)
+        if (n.starts_with("*.") && !by_dns(n))
+        {
+            std::cout << "acme issue: a wildcard is proven over dns-01 only, and " << n << " is in none of --dns-zones\n";
+            return 1;
+        }
     if (cert.empty())
         cert = cert_keeper::acme_cert_path(names.front());
     if (key.empty())
@@ -725,20 +752,21 @@ int issue(int argc, char** argv)
             if (str(a, "status") == "valid")
                 continue;
             std::string token, url;
+            const std::string ident = member(a, "identifier") ? str(*member(a, "identifier"), "value") : std::string{};
+            const std::string challenge_here = by_dns(ident) ? "dns-01" : challenge;
             if (const jvalue* chs = member(a, "challenges"))
                 for (const jvalue& ch : chs->items)
-                    if (str(ch, "type") == challenge)
+                    if (str(ch, "type") == challenge_here)
                     {
                         token = str(ch, "token");
                         url = str(ch, "url");
                     }
-            const std::string ident = member(a, "identifier") ? str(*member(a, "identifier"), "value") : std::string{};
             if (token.empty() || token.find('/') != std::string::npos || ident.empty())
             {
-                err = "the CA offered no " + challenge + " challenge for " + (ident.empty() ? au.s : ident);
+                err = "the CA offered no " + challenge_here + " challenge for " + (ident.empty() ? au.s : ident);
                 return done(2);
             }
-            if (challenge == "dns-01")
+            if (challenge_here == "dns-01")
             {
                 // The TXT record of _acme-challenge.<name> (RFC 8555 8.4), the name without a wildcard's "*.".
                 std::string path;
@@ -752,7 +780,7 @@ int issue(int argc, char** argv)
                 continue;
             }
             // HTTP-01's answer is served as a file over HTTP, TLS-ALPN-01's as a certificate on the TLS listener.
-            const bool alpn = challenge == "tls-alpn-01";
+            const bool alpn = challenge_here == "tls-alpn-01";
             const std::string file = alpn ? cert_keeper::tls_alpn_path(ident) : challenges + "/" + token;
             const std::string answer = alpn ? alpn_cert(ident, token + "." + thumb) : token + "." + thumb;
             if (answer.empty() || !write_atomic(file, answer, alpn ? 0600 : 0644))
@@ -823,6 +851,6 @@ int acme_main(int argc, char** argv)
     if (argc >= 3 && std::string_view(argv[2]) == "issue")
         return issue(argc, argv);
     std::cout << "usage: socketley acme issue --domains name[,name...] [--cert file] [--key file] [--email addr] "
-                 "[--directory url] [--challenge http-01|tls-alpn-01|dns-01]\n";
+                 "[--directory url] [--challenge http-01|tls-alpn-01|dns-01] [--dns-zones zone[,zone...]]\n";
     return 1;
 }

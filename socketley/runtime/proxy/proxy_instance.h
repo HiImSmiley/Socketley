@@ -717,6 +717,9 @@ private:
     // The entrance's table read again when its file changed, no more often
     // than `min_gap` asks.
     void entrance_load(std::chrono::milliseconds min_gap);
+    // The names an automatic certificate is asked for, from the table just
+    // read, handed to cert_keeper when they changed.
+    void entrance_certify();
     // The route for a host name, exact before wildcard; nullptr for none.
     entrance_route* entrance_find(std::string_view host);
     // A runtime of conn->host's route, round robin over those available; on a
@@ -984,6 +987,12 @@ private:
     // What this entrance writes into Via and looks for there, so a request
     // that comes round to it again is refused instead of circling.
     std::string m_via_token;
+    // An entrance given --tls and no certificate of its own: it is issued one
+    // for the zones of its table (each with its wildcard) and the names no
+    // wildcard covers, and again when that set changes.
+    bool m_entrance_auto_cert{false};
+    std::vector<std::string> m_entrance_zones;
+    std::vector<std::string> m_entrance_cert_names;
 
     // The last snapshot the manager published, immutable and shared and read
     // on the connection path with no lock, null until the first publish.

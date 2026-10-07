@@ -78,8 +78,10 @@ struct watched
 
 struct acme_state
 {
-    std::vector<std::string> domains;
+    std::vector<std::string> domains, dns_zones;
     std::string email, cert, key, log;
+    // The names the child now running asks for, written beside the certificate when it succeeds.
+    std::string issuing;
     bool tls_alpn{false};
     pid_t pid{-1};
     clock::time_point next_try{};
@@ -161,6 +163,17 @@ std::string last_line(const std::string& path)
     return last;
 }
 
+// The names a certificate is for, sorted, a line each: what is written beside it once issued.
+std::string names_of(const acme_state& a)
+{
+    std::vector<std::string> d = a.domains;
+    std::sort(d.begin(), d.end());
+    std::string out;
+    for (const std::string& n : d)
+        out += n + "\n";
+    return out;
+}
+
 void spawn_issue(acme_state& a)
 {
     std::string names;
@@ -169,9 +182,15 @@ void spawn_issue(acme_state& a)
     std::vector<std::string> args = {"socketley", "acme", "issue", "--domains", names, "--cert", a.cert, "--key", a.key};
     if (!a.email.empty())
         args.insert(args.end(), {"--email", a.email});
-    // A wildcard goes over DNS-01, which `acme issue` picks by itself; anything else over the listener on 443.
+    // A name in a zone this daemon serves goes over DNS-01, which needs no port open, as does every wildcard, which
+    // `acme issue` picks by itself; anything else over the listener on 443.
+    std::string zones;
+    for (const std::string& z : a.dns_zones)
+        zones += (zones.empty() ? "" : ",") + z;
+    if (!zones.empty())
+        args.insert(args.end(), {"--dns-zones", zones});
     const bool wildcard = std::any_of(a.domains.begin(), a.domains.end(), [](const std::string& d) { return d.starts_with("*."); });
-    if (a.tls_alpn && !wildcard)
+    if (a.tls_alpn && (!wildcard || !zones.empty()))
         args.insert(args.end(), {"--challenge", "tls-alpn-01"});
     std::vector<char*> argv;
     for (std::string& s : args)
@@ -204,6 +223,7 @@ void spawn_issue(acme_state& a)
         return;
     }
     a.pid = pid;
+    a.issuing = names_of(a);
 }
 
 void look_after(acme_state& a, clock::time_point now)
@@ -225,6 +245,7 @@ void look_after(acme_state& a, clock::time_point now)
             return;
         }
         // Issued: the files are taken up at the next look, which is now.
+        write_file(a.cert + ".names", a.issuing, 0644);
         a.backoff = backoff_first;
         g_next_watch = now;
         return;
@@ -234,7 +255,14 @@ void look_after(acme_state& a, clock::time_point now)
     int64_t left = 0;
     bool self_signed = true;
     if (cert_left(a.cert, left, self_signed) && !self_signed && left > renew_before_s)
-        return;
+    {
+        // Issued for the names asked for now, or issued before the names were written beside it.
+        std::ifstream f(a.cert + ".names");
+        std::stringstream was;
+        was << f.rdbuf();
+        if (!f || was.str() == names_of(a))
+            return;
+    }
     spawn_issue(a);
 }
 
@@ -258,17 +286,25 @@ void unwatch(tls_context* ctx)
 }
 
 bool prepare_acme(const std::vector<std::string>& domains, std::string_view email, std::string_view cert_path,
-                  std::string_view key_path, bool on_443, std::string& err)
+                  std::string_view key_path, bool on_443, std::string& err, const std::vector<std::string>& dns_zones)
 {
     if (domains.empty())
         return true;
     acme_state a;
     a.tls_alpn = on_443;
     a.domains = domains;
+    a.dns_zones = dns_zones;
     a.email.assign(email);
     a.cert.assign(cert_path);
     a.key.assign(key_path);
     a.log = a.cert + ".log";
+    // A child still issuing for the names before is waited for, and the new names asked for after it.
+    for (const acme_state& o : g_acme)
+        if (o.cert == a.cert && o.pid > 0)
+        {
+            a.pid = o.pid;
+            a.issuing = o.issuing;
+        }
     std::erase_if(g_acme, [&](const acme_state& o) { return o.cert == a.cert; });
     int64_t left = 0;
     bool self_signed = false;
@@ -358,6 +394,16 @@ std::string tls_alpn_answer(std::string_view name)
     std::stringstream ss;
     ss << f.rdbuf();
     return ss.str();
+}
+
+std::string entrance_cert_path(std::string_view runtime)
+{
+    return domain_dir("entrance-" + std::string(runtime)) + "/fullchain.pem";
+}
+
+std::string entrance_key_path(std::string_view runtime)
+{
+    return domain_dir("entrance-" + std::string(runtime)) + "/key.pem";
 }
 
 std::string acme_cert_path(std::string_view domain)

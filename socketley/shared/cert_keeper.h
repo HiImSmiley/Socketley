@@ -18,8 +18,11 @@ void unwatch(tls_context* ctx);
 // This process's runtime's names; a short-lived self-signed certificate stands in until one is issued, so the
 // listener starts and can answer the CA's challenge. False, with the reason, when the files cannot be written.
 // A runtime on 443 proves its names over TLS-ALPN-01 on its own listener, and any other over HTTP-01.
+// A name in one of `dns_zones` (zones a dns runtime of this daemon serves) is proven over DNS-01 instead, as a
+// wildcard always is. Called again with other names, it issues again for them.
 bool prepare_acme(const std::vector<std::string>& domains, std::string_view email, std::string_view cert_path,
-                  std::string_view key_path, bool on_443, std::string& err);
+                  std::string_view key_path, bool on_443, std::string& err,
+                  const std::vector<std::string>& dns_zones = {});
 
 // Once per turn of the worker's loop; one clock read when nothing is due.
 void tick();
@@ -32,6 +35,11 @@ std::string challenge_answer(std::string_view token);
 std::string tls_alpn_answer(std::string_view name);
 std::string tls_alpn_path(std::string_view name);
 inline constexpr std::string_view challenge_prefix = "/.well-known/acme-challenge/";
+
+// Where an entrance (a proxy without --backend) given --tls and no --cert keeps the certificate it is issued for
+// the names it routes.
+std::string entrance_cert_path(std::string_view runtime);
+std::string entrance_key_path(std::string_view runtime);
 
 // Where --acme keeps the certificate and key of a runtime's first name.
 std::string acme_cert_path(std::string_view domain);

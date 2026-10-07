@@ -18,6 +18,7 @@
 #include "../runtime/dns/dns_instance.h"
 #include "../shared/dns_feed.h"
 #include "../shared/runtime_names.h"
+#include "../shared/cert_keeper.h"
 #include "../runtime/dns/dns_zone.h"
 #include "../runtime/dns/dns_wire.h"
 #include <sys/stat.h>
@@ -158,6 +159,20 @@ static std::string daemon_hint()
 // Why this runtime's TLS configuration cannot be honoured, repeated wherever a
 // runtime goes live because a state file written before the parse gate existed
 // would otherwise bring up a cleartext listener `inspect` calls encrypted.
+static std::string instance_tls_refusal(const runtime_instance* inst);
+
+// An entrance asked for --tls with no certificate of its own is issued one for the names it routes: its files are
+// the ones the entrance keeps, and the proxy, seeing them, asks the CA (see proxy_instance::entrance_certify).
+static void entrance_cert_default(runtime_instance* inst)
+{
+    if (inst && runtime_names::is_entrance(*inst) && inst->get_tls() && inst->get_cert_path().empty() &&
+        inst->get_key_path().empty() && inst->get_acme_domains().empty())
+    {
+        inst->set_cert_path(cert_keeper::entrance_cert_path(inst->get_name()));
+        inst->set_key_path(cert_keeper::entrance_key_path(inst->get_name()));
+    }
+}
+
 static std::string instance_tls_refusal(const runtime_instance* inst)
 {
     if (!inst)
@@ -1497,6 +1512,7 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     // The TLS options are checked as a set once every flag has been seen,
     // which is the first point the question can be answered, and refusing here
     // keeps the runtime from being created at all.
+    entrance_cert_default(instance);
     if (const std::string msg = instance_tls_refusal(instance); !msg.empty())
     {
         std::cout << msg;
@@ -3713,6 +3729,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
         }
     }
 
+    entrance_cert_default(instance);
     if (const std::string msg = instance_tls_refusal(instance); !msg.empty())
     {
         restore_edit();

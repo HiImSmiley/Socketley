@@ -1791,6 +1791,23 @@ bool proxy_instance::setup(event_loop& loop)
         m_entrance_wild.clear();
         m_entrance_addr.clear();
         m_entrance_stamp = -1;
+        m_entrance_zones.clear();
+        m_entrance_cert_names.clear();
+        // The certificate the daemon named for it, stood in for by one of its
+        // own until the CA has issued, so the listener starts.
+        m_entrance_auto_cert = get_tls() && get_cert_path() == cert_keeper::entrance_cert_path(get_name());
+        if (m_entrance_auto_cert)
+        {
+            struct stat cst{};
+            if (::stat(std::string(get_cert_path()).c_str(), &cst) != 0 &&
+                !cert_keeper::write_self_signed({std::string(get_name()) + ".invalid"}, 7, get_cert_path(),
+                                                get_key_path()))
+            {
+                LOG_ERROR(("proxy " + std::string(get_name()) + ": no certificate could be written to " +
+                           std::string(get_cert_path())).c_str());
+                return false;
+            }
+        }
         char hn[256] = {};
         if (::gethostname(hn, sizeof(hn) - 1) != 0 || !hn[0])
             std::strcpy(hn, "localhost");
@@ -5402,6 +5419,7 @@ void proxy_instance::entrance_load(std::chrono::milliseconds min_gap)
 
     std::unordered_map<std::string, entrance_route> exact;
     std::vector<std::pair<std::string, entrance_route>> wild;
+    std::vector<std::string> zones;
     for (size_t p = 0; p < text.size();)
     {
         size_t nl = text.find('\n', p);
@@ -5409,6 +5427,8 @@ void proxy_instance::entrance_load(std::chrono::milliseconds min_gap)
             nl = text.size();
         const std::string_view line(text.data() + p, nl - p);
         p = nl + 1;
+        if (line.starts_with("zone ") && line.size() > 5)
+            zones.emplace_back(line.substr(5));
         if (!line.starts_with("route "))
             continue;   // a zone line, or one this version does not know
 
@@ -5464,6 +5484,62 @@ void proxy_instance::entrance_load(std::chrono::milliseconds min_gap)
               [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
     m_entrance_exact = std::move(exact);
     m_entrance_wild = std::move(wild);
+    m_entrance_zones = std::move(zones);
+    if (m_entrance_auto_cert)
+        entrance_certify();
+}
+
+void proxy_instance::entrance_certify()
+{
+    // One shard asks; the others take the files up when they change.
+    if (get_shard_index() != 0)
+        return;
+    const auto under = [](std::string_view n, std::string_view z) {
+        return n.size() > z.size() && n.ends_with(z) && n[n.size() - z.size() - 1] == '.';
+    };
+    const bool on_443 = get_port() == 443;
+    std::vector<std::string> names;
+    for (const auto& z : m_entrance_zones)
+    {
+        names.push_back(z);
+        names.push_back("*." + z);
+    }
+    const auto add = [&](const std::string& n) {
+        // A name in one of the zones is covered by its wildcard when it is one
+        // label below the zone; anything deeper is asked for by itself.
+        for (const auto& z : m_entrance_zones)
+            if (n == z || (under(n, z) && !n.starts_with("*.") &&
+                           n.find('.') == n.size() - z.size() - 1))
+                return;
+        const bool in_zone = std::any_of(m_entrance_zones.begin(), m_entrance_zones.end(),
+                                         [&](const std::string& z) { return under(n, z); });
+        // Outside the zones a name is proven on this listener (TLS-ALPN-01),
+        // which only a CA reaching it on 443 can ask.
+        if (!in_zone && (!on_443 || n.starts_with("*.")))
+            return;
+        names.push_back(n);
+    };
+    for (const auto& [n, r] : m_entrance_exact)
+        add(n);
+    for (const auto& [suffix, r] : m_entrance_wild)
+        add("*" + suffix);
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    // A CA takes at most 100 names in one certificate.
+    if (names.size() > 100)
+        names.resize(100);
+    if (names == m_entrance_cert_names)
+        return;
+    m_entrance_cert_names = names;
+    if (names.empty())
+        return;
+    std::string err;
+    if (!cert_keeper::prepare_acme(names, get_acme_email(), get_cert_path(), get_key_path(), on_443, err,
+                                   m_entrance_zones))
+        LOG_ERROR(("proxy " + std::string(get_name()) + ": " + err).c_str());
+    else
+        LOG_INFO(("proxy " + std::string(get_name()) + ": a certificate is asked for " + std::to_string(names.size()) +
+                  " names, " + names.front() + " first").c_str());
 }
 
 proxy_instance::entrance_route* proxy_instance::entrance_find(std::string_view host)
