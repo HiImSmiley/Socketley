@@ -1066,7 +1066,14 @@ void storage_run::h2_schedule(const std::shared_ptr<conn>& c)
     if (c->dead || !c->h2)
         return;
     h2_session& s = *c->h2;
-    // Frames go straight into the connection's queue, which the record layer or the kernel takes from.
+    // Frames go straight into the connection's queue, which the record layer or the kernel takes from. What it has
+    // taken is let go of once it is half the queue, so the queue does not grow -- and get copied whole as it grows --
+    // by everything the connection ever sent while several streams keep it from ever running empty.
+    if (c->wq_off > 0 && c->wq_off * 2 >= c->wq.size())
+    {
+        c->wq.erase(0, c->wq_off);
+        c->wq_off = 0;
+    }
     std::string& out = c->wq;
     const size_t before = unsent(*c);
     const size_t start = out.size();

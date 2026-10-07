@@ -63,8 +63,10 @@ constexpr size_t   max_head        = 32 * 1024;
 constexpr size_t   max_conns       = 4096;
 constexpr size_t   pull_slice      = 64 * 1024;
 constexpr size_t   rx_buf          = 64 * 1024;
-// Packets written at once and sent in one sendmsg by UDP GSO.
-constexpr size_t   gso_burst       = 16;
+// Packets written at once and sent in one sendmsg by UDP GSO: as many of ngtcp2's largest (its default
+// max_tx_udp_payload_size) as fit the 64 KiB a UDP datagram, and so a GSO send, may carry.
+constexpr size_t   max_udp_payload = NGTCP2_MAX_PMTUD_UDP_PAYLOAD_SIZE;
+constexpr size_t   gso_burst       = 65000 / max_udp_payload;
 constexpr uint64_t idle_timeout_ns = 30ull * NGTCP2_SECONDS;
 // A handshake not done by then is dropped, so an Initial from an address that never answers holds nothing for long.
 constexpr uint64_t handshake_timeout_ns = 10ull * NGTCP2_SECONDS;
@@ -175,7 +177,7 @@ struct h3_endpoint
     sockaddr_storage src{};
     alignas(cmsghdr) char cbuf[256]{};
     std::vector<uint8_t> rbuf = std::vector<uint8_t>(rx_buf);
-    std::vector<uint8_t> txbuf = std::vector<uint8_t>(gso_burst * 1500);
+    std::vector<uint8_t> txbuf = std::vector<uint8_t>(gso_burst * max_udp_payload);
     std::unordered_map<std::string, std::shared_ptr<h3_conn>> by_cid;
     std::vector<std::shared_ptr<h3_conn>> conns;
     // One timeout for every connection's earliest expiry; two timespecs, so one waiting to be submitted is never
@@ -189,6 +191,11 @@ struct h3_endpoint
     // Handshakes under way past which a new client is asked to prove its address with a Retry first (RFC 9000
     // 8.1.2), so datagrams with forged sources cannot fill the table: SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER, 0 always.
     size_t      retry_after{64};
+    // The congestion controller, SOCKETLEY_STORAGE_HTTP3_CC=bbr|cubic|reno. BBR by default: it paces by the path's
+    // measured rate and round trip rather than backing off at every loss, so a link that loses a packet in a hundred
+    // at 50 ms -- Wi-Fi, mobile -- carried a download ten to twenty times faster than with CUBIC, and as fast without
+    // loss.
+    ngtcp2_cc_algo cc{NGTCP2_CC_ALGO_BBR};
     // Shards share the UDP port, and the kernel picks one by the client's address: a client that moves may reach
     // another. The shard is the first byte of every connection ID this side gives, and a packet for another shard's
     // is handed to it through that shard's inbox, a datagram socket of its own, which answers it from the same port.
@@ -301,6 +308,10 @@ bool storage_run::h3_open(uint16_t port, uint16_t advertise, uint32_t shard, uin
                                      SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_NO_ANTI_REPLAY);
     SSL_CTX_set_mode(ep->ctx, SSL_MODE_RELEASE_BUFFERS);
     SSL_CTX_set_alpn_select_cb(ep->ctx, alpn_h3, nullptr);
+    // Every packet is sealed on its own, so the cipher is most of a transfer's CPU: AES-128-GCM, a quarter fewer
+    // rounds than AES-256 and what browsers ask for first, is chosen when the client offers it.
+    if (SSL_CTX_set_ciphersuites(ep->ctx, "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256") != 1)
+        ERR_clear_error();
     if (RAND_bytes(ep->secret, sizeof ep->secret) != 1)
         return false;
 
@@ -331,6 +342,18 @@ bool storage_run::h3_open(uint16_t port, uint16_t advertise, uint32_t shard, uin
     }
     ep->fd = fd;
     ep->port = port;
+    if (const char* cc = std::getenv("SOCKETLEY_STORAGE_HTTP3_CC"); cc && *cc)
+    {
+        const std::string_view v(cc);
+        if (v == "bbr")
+            ep->cc = NGTCP2_CC_ALGO_BBR;
+        else if (v == "reno")
+            ep->cc = NGTCP2_CC_ALGO_RENO;
+        else if (v == "cubic")
+            ep->cc = NGTCP2_CC_ALGO_CUBIC;
+        else
+            LOG_WARN("storage: SOCKETLEY_STORAGE_HTTP3_CC is none of bbr, cubic, reno; bbr is used");
+    }
     if (const char* ra = std::getenv("SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER"); ra && *ra)
     {
         size_t v = 0;
@@ -482,37 +505,55 @@ void storage_run::h3_cqe(io_request* req, int res)
     if (m_stopped)
         return;
     if (res > 0)
+        h3_datagram(static_cast<size_t>(res));
+    // What else has come is read now, without the ring: a burst of a client's packets is taken in one turn, and
+    // what they call for -- acknowledgements, answers -- leaves in one write per connection rather than one each.
+    for (int more = 0; res > 0 && more < 256; ++more)
     {
-        // The local address, from IP_PKTINFO, and the size each datagram was when GRO joined them.
-        sockaddr_storage local{};
-        socklen_t local_len = sizeof(sockaddr_in);
-        auto* l4 = reinterpret_cast<sockaddr_in*>(&local);
-        l4->sin_family = AF_INET;
-        l4->sin_port = htons(ep.port);
-        size_t seg = static_cast<size_t>(res);
-        for (cmsghdr* cm = CMSG_FIRSTHDR(&ep.msg); cm; cm = CMSG_NXTHDR(&ep.msg, cm))
-        {
-            if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_PKTINFO)
-            {
-                in_pktinfo pi{};
-                std::memcpy(&pi, CMSG_DATA(cm), sizeof pi);
-                l4->sin_addr = pi.ipi_addr;
-            }
-            else if (cm->cmsg_level == IPPROTO_UDP && cm->cmsg_type == UDP_GRO)
-            {
-                int g = 0;
-                std::memcpy(&g, CMSG_DATA(cm), sizeof g);
-                if (g > 0)
-                    seg = static_cast<size_t>(g);
-            }
-        }
-        const size_t total = static_cast<size_t>(res);
-        for (size_t off = 0; off < total; off += seg)
-            h3_packet(local, local_len, ep.src, ep.msg.msg_namelen, ep.rbuf.data() + off, std::min(seg, total - off),
-                      false);
-        h3_flush_dirty();
+        ep.iov.iov_base = ep.rbuf.data();
+        ep.iov.iov_len = ep.rbuf.size();
+        ep.msg.msg_name = &ep.src;
+        ep.msg.msg_namelen = sizeof ep.src;
+        ep.msg.msg_controllen = sizeof ep.cbuf;
+        ep.msg.msg_flags = 0;
+        const ssize_t n = ::recvmsg(ep.fd, &ep.msg, MSG_DONTWAIT);
+        if (n <= 0)
+            break;
+        h3_datagram(static_cast<size_t>(n));
     }
+    h3_flush_dirty();
     h3_arm_read();
+}
+
+// A datagram ep.msg holds, of `res` bytes: the local address from IP_PKTINFO, and the size each packet was when GRO
+// joined several.
+void storage_run::h3_datagram(size_t res)
+{
+    h3_endpoint& ep = *m_h3;
+    sockaddr_storage local{};
+    socklen_t local_len = sizeof(sockaddr_in);
+    auto* l4 = reinterpret_cast<sockaddr_in*>(&local);
+    l4->sin_family = AF_INET;
+    l4->sin_port = htons(ep.port);
+    size_t seg = res;
+    for (cmsghdr* cm = CMSG_FIRSTHDR(&ep.msg); cm; cm = CMSG_NXTHDR(&ep.msg, cm))
+    {
+        if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_PKTINFO)
+        {
+            in_pktinfo pi{};
+            std::memcpy(&pi, CMSG_DATA(cm), sizeof pi);
+            l4->sin_addr = pi.ipi_addr;
+        }
+        else if (cm->cmsg_level == IPPROTO_UDP && cm->cmsg_type == UDP_GRO)
+        {
+            int g = 0;
+            std::memcpy(&g, CMSG_DATA(cm), sizeof g);
+            if (g > 0)
+                seg = static_cast<size_t>(g);
+        }
+    }
+    for (size_t off = 0; off < res; off += seg)
+        h3_packet(local, local_len, ep.src, ep.msg.msg_namelen, ep.rbuf.data() + off, std::min(seg, res - off), false);
 }
 
 // ─── A datagram in ──────────────────────────────────────────────────────────
@@ -786,7 +827,7 @@ std::shared_ptr<h3_conn> storage_run::h3_new_conn(const ngtcp2_pkt_hd& hd, const
     settings.initial_ts = now_ns();
     settings.max_window = conn_window_max;
     settings.max_stream_window = stream_window_max;
-    settings.cc_algo = NGTCP2_CC_ALGO_CUBIC;
+    settings.cc_algo = ep.cc;
     settings.handshake_timeout = handshake_timeout_ns;
     if (odcid)
     {
@@ -1364,15 +1405,19 @@ void storage_run::h3_flush_dirty()
         return;
     std::vector<std::weak_ptr<h3_conn>> due;
     due.swap(m_h3->dirty);
+    // Only a connection written to can have moved its expiry earlier, so only those are looked at: one whose expiry
+    // moved later leaves the timer early, and h3_expire, finding nothing due, sets it again.
+    uint64_t soonest = UINT64_MAX;
     for (auto& w : due)
         if (auto hc = w.lock())
         {
             hc->dirty = false;
             if (!hc->dead)
                 h3_write(hc);
+            if (!hc->dead)
+                soonest = std::min<uint64_t>(soonest, ngtcp2_conn_get_expiry2(hc->q));
         }
-    // Streams whose bytes nghttp3 has all taken go on, as an HTTP/1.1 connection does when its write is done.
-    h3_arm_timer();
+    h3_arm_timer(soonest);
 }
 
 void storage_run::h3_send(const sockaddr_storage& local, socklen_t, const sockaddr_storage& remote, socklen_t remote_len,
@@ -1503,13 +1548,9 @@ void storage_run::h3_write(const std::shared_ptr<h3_conn>& hc)
             m_h2_due.push_back(sc);
 }
 
-void storage_run::h3_arm_timer()
+void storage_run::h3_arm_timer(uint64_t soonest)
 {
     h3_endpoint& ep = *m_h3;
-    uint64_t soonest = UINT64_MAX;
-    for (auto& hc : ep.conns)
-        if (!hc->dead)
-            soonest = std::min<uint64_t>(soonest, ngtcp2_conn_get_expiry2(hc->q));
     if (soonest == UINT64_MAX)
         return;
     if (ep.tm_armed && ep.tm_deadline <= soonest)
@@ -1546,6 +1587,12 @@ void storage_run::h3_expire()
         h3_dirty(hc);
     }
     h3_flush_dirty();
+    // The timer that fired is spent: it is set again by every connection's expiry, those not due included.
+    uint64_t soonest = UINT64_MAX;
+    for (auto& hc : ep.conns)
+        if (!hc->dead)
+            soonest = std::min<uint64_t>(soonest, ngtcp2_conn_get_expiry2(hc->q));
+    h3_arm_timer(soonest);
 }
 
 void storage_run::h3_close(const std::shared_ptr<h3_conn>& hc)

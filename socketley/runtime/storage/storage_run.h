@@ -770,6 +770,7 @@ public:
 #if SOCKETLEY_HTTP3
     void h3_arm_read();
     void h3_arm_inbox();
+    void h3_datagram(size_t res);
     void h3_packet(const sockaddr_storage& local, socklen_t local_len, const sockaddr_storage& remote,
                    socklen_t remote_len, const uint8_t* data, size_t len, bool forwarded);
     void h3_forward(uint32_t owner, const sockaddr_storage& local, socklen_t local_len, const sockaddr_storage& remote,
@@ -791,7 +792,7 @@ public:
     void h3_send(const sockaddr_storage& local, socklen_t local_len, const sockaddr_storage& remote,
                  socklen_t remote_len, const uint8_t* data, size_t len, size_t gso);
     void h3_write(const std::shared_ptr<h3_conn>& hc);
-    void h3_arm_timer();
+    void h3_arm_timer(uint64_t soonest);
     void h3_expire();
     void h3_close(const std::shared_ptr<h3_conn>& hc);
     void h3_drop(const std::shared_ptr<h3_conn>& hc);

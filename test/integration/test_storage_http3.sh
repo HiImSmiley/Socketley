@@ -12,7 +12,7 @@
 #                (past the 128 open at once), and uploads and downloads
 #                abandoned midway, after which the runtime still serves
 #   shards       two shards share the UDP port; a client whose address
-#                changes every 0.1 s mid-transfer reaches the other shard, which
+#                changes every 300 packets mid-transfer reaches the other shard, which
 #                hands its packets to the one holding the connection
 #   handshakes   a hundred begun from forged-looking sources and never finished:
 #                past 64 under way new clients are sent a Retry, and every one

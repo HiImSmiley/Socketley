@@ -2,7 +2,7 @@
 """HTTP/3 at its edges, for test_storage_http3.sh, over aioquic.
 
 usage:
-  lib_storage_http3_edge.py migrate PORT CAFILE FILE   a client whose address changes every 0.1 s, through a relay in
+  lib_storage_http3_edge.py migrate PORT CAFILE FILE   a client whose address changes every 300 packets, through a relay in
                                                        this process, puts FILE and reads it back; prints "same" or
                                                        what differed, then the relay's rebind count
   lib_storage_http3_edge.py halfopen PORT N            N handshakes begun from N ports and never finished
@@ -85,7 +85,8 @@ async def open_client(port, cfg, via=None):
 
 
 class Relay:
-    """Carries one client's datagrams to the server from a source port that changes every `every` seconds."""
+    """Carries one client's datagrams to the server from a source port that changes every `every` of them, so how
+    often it moves does not depend on how fast the transfer goes."""
 
     def __init__(self, server_port, every):
         self.loop = asyncio.get_running_loop()
@@ -97,9 +98,10 @@ class Relay:
         self.client = None
         self.up = None
         self.rebinds = 0
+        self.every = every
+        self.sent = 0
         self.loop.add_reader(self.down, self.from_client)
         self.rebind()
-        self.task = asyncio.ensure_future(self.every(every))
 
     def rebind(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -111,11 +113,6 @@ class Relay:
             self.rebinds += 1
             self.loop.call_later(1, lambda: (self.loop.remove_reader(old), old.close()))
 
-    async def every(self, s):
-        while True:
-            await asyncio.sleep(s)
-            self.rebind()
-
     def from_client(self):
         while True:
             try:
@@ -124,6 +121,9 @@ class Relay:
                 return
             self.client = addr
             self.up.sendto(data, self.server)
+            self.sent += 1
+            if self.sent % self.every == 0:
+                self.rebind()
 
     def from_server(self, s):
         while True:
@@ -137,7 +137,7 @@ class Relay:
 
 async def migrate(port, ca, path):
     data = open(path, "rb").read()
-    relay = Relay(port, 0.1)
+    relay = Relay(port, 300)
     c = await open_client(port, config(ca), via=relay.port)
     put, _ = await c.request("PUT", "/hthree/moved", data)
     got, back = await c.request("GET", "/hthree/moved")

@@ -2582,7 +2582,8 @@ void storage_run::file_pump(const std::shared_ptr<conn>& c)
     }
 
     const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(c->file_left, stream_chunk));
-    c->sbuf.resize(n);
+    // Sized without being cleared: the read writes every byte the answer takes.
+    c->sbuf.resize_and_overwrite(n, [](char*, size_t len) { return len; });
     std::weak_ptr<conn> weak = c;
     if (!m_io.pread(c->file_fd, c->sbuf.data(), n, c->file_off,
             [this, weak](int64_t res)
@@ -2607,6 +2608,16 @@ void storage_run::stream_read_done(const std::shared_ptr<conn>& c, int64_t res)
     c->file_off  += static_cast<uint64_t>(res);
     c->file_left -= static_cast<uint64_t>(res);
     c->after_write = conn::after_kind::pump;
+    // A stream keeps what it is handed until it is sent (HTTP/2) or acknowledged (HTTP/3), so it is given the buffer
+    // itself, and the next read gets a new one, rather than a copy of it.
+    if (c->stream())
+    {
+        std::string piece;
+        piece.swap(c->sbuf);
+        piece.resize(static_cast<size_t>(res));
+        queue_write(c, std::move(piece));
+        return;
+    }
     queue_write(c, std::string(c->sbuf.data(), static_cast<size_t>(res)));
 }
 

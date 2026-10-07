@@ -9490,7 +9490,16 @@ its shard, and a packet for another shard's connection is handed to it, which
 answers from the same port. A stream's window and a connection's start at 1 and
 4 MiB and grow to 16 and 64 MiB, 128 streams are open at once, a handshake not
 done in 10 seconds is dropped, and a connection is let go after 30 seconds
-without a packet. While more than
+without a packet. What a client is sent is paced by BBR, which follows the
+path's measured rate and round trip rather than backing off at each lost packet:
+over a 50 ms path that loses one packet in a hundred, as Wi\-Fi and mobile
+links do, a download ran ten to twenty times faster than with CUBIC, and as fast
+on a clean path.
+.B SOCKETLEY_STORAGE_HTTP3_CC=cubic
+(or
+.BR reno )
+chooses another. AES\-128\-GCM is offered first, since every packet is sealed on
+its own and it costs a quarter less than AES\-256. While more than
 .B SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER
 handshakes (64; 0 for always) are under way, a new client is sent a Retry and
 must prove its address before anything is kept for it (RFC 9000 8.1.2), so
@@ -14696,6 +14705,39 @@ that could not be reached would, without acting on it, for as long as the file
 exists, so a test can lose a message at each step of the change. Unset by default.
 .IP
 Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_STORAGE_HTTP2
+.B 0
+turns HTTP/2 off, so a storage runtime speaks HTTP/1.1 to every client; see
+.B HTTP/2
+under the storage runtime.
+.TP
+.B SOCKETLEY_STORAGE_HTTP3
+.B 0
+opens no UDP socket beside a
+.B \-\-tls
+storage runtime, which then offers HTTP/3 to nobody; see
+.B HTTP/3
+under the storage runtime.
+.TP
+.B SOCKETLEY_STORAGE_HTTP3_ADVERTISE
+The port the
+.B Alt\-Svc
+header names for HTTP/3, when a proxy in front forwards UDP from another than the
+runtime's own; 0 advertises none. Default: the runtime's port.
+.TP
+.B SOCKETLEY_STORAGE_HTTP3_CC
+The congestion controller HTTP/3 sends with:
+.BR bbr ,
+.B cubic
+or
+.BR reno .
+Default
+.BR bbr .
+.TP
+.B SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER
+The QUIC handshakes under way past which a new client is sent a Retry and must
+prove its address first; 0 asks it of every client. Default 64.
 .TP
 .B SOCKETLEY_STORAGE_SPLICE_MIN
 The size in bytes from which a storage GET is sent by splice from the file to

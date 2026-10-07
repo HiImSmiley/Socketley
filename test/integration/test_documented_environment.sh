@@ -60,7 +60,8 @@ fi
 EXCLUDED="SOCKETLEY_INV_PROGRESS_REPORT"
 
 # ── what the code reads ─────────────────────────────────────────────────────
-IN_CODE=$(grep -rhoE 'getenv\("SOCKETLEY_[A-Z_]+"\)' "$ROOT/socketley/" 2>/dev/null |
+# Digits too: SOCKETLEY_STORAGE_HTTP2 and the HTTP3 ones were invisible to [A-Z_]+ and went undocumented.
+IN_CODE=$(grep -rhoE 'getenv\("SOCKETLEY_[A-Z0-9_]+"\)' "$ROOT/socketley/" 2>/dev/null |
           sed 's/.*getenv("//; s/").*//' | sort -u)
 if [ -z "$IN_CODE" ]; then
     bad "the source was read at all" "no getenv(\"SOCKETLEY_...\") found under socketley/" \
@@ -81,7 +82,7 @@ ok
 IN_MAN=$(awk '
     /^\.SH ENVIRONMENT/ { on = 1; next }
     /^\.SH /            { on = 0 }
-    on && prev == ".TP" && /^\.B[RI]? [A-Z_]+/ { print $2 }
+    on && prev == ".TP" && /^\.B[RI]? [A-Z0-9_]+/ { print $2 }
     { prev = $0 }
 ' "$MAN" | sed 's/=.*//' | sort)
 if [ -z "$IN_MAN" ]; then
