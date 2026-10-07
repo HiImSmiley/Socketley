@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <unordered_map>
@@ -23,6 +24,7 @@
 #include <netinet/in.h>
 #include <netinet/udp.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <ngtcp2/ngtcp2.h>
@@ -64,6 +66,10 @@ constexpr size_t   rx_buf          = 64 * 1024;
 // Packets written at once and sent in one sendmsg by UDP GSO.
 constexpr size_t   gso_burst       = 16;
 constexpr uint64_t idle_timeout_ns = 30ull * NGTCP2_SECONDS;
+// A handshake not done by then is dropped, so an Initial from an address that never answers holds nothing for long.
+constexpr uint64_t handshake_timeout_ns = 10ull * NGTCP2_SECONDS;
+// How long a Retry's token proves the address it was sent to.
+constexpr uint64_t retry_token_timeout_ns = 10ull * NGTCP2_SECONDS;
 
 uint64_t now_ns()
 {
@@ -157,6 +163,9 @@ struct h3_endpoint
 {
     int         fd{-1};
     uint16_t    port{0};
+    // The certificate's context, watched for a renewed one and asking for a client's when --ca says so, as TCP's;
+    // `ctx` is its OpenSSL context, set up for QUIC.
+    std::unique_ptr<tls_context> tls;
     SSL_CTX*    ctx{nullptr};
     uint8_t     secret[32]{};
     io_request  rd{};
@@ -177,12 +186,22 @@ struct h3_endpoint
     bool        tm_armed{false};
     uint64_t    tm_deadline{0};
     std::vector<std::weak_ptr<h3_conn>> dirty;
-
-    ~h3_endpoint()
-    {
-        if (ctx)
-            SSL_CTX_free(ctx);
-    }
+    // Handshakes under way past which a new client is asked to prove its address with a Retry first (RFC 9000
+    // 8.1.2), so datagrams with forged sources cannot fill the table: SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER, 0 always.
+    size_t      retry_after{64};
+    // Shards share the UDP port, and the kernel picks one by the client's address: a client that moves may reach
+    // another. The shard is the first byte of every connection ID this side gives, and a packet for another shard's
+    // is handed to it through that shard's inbox, a datagram socket of its own, which answers it from the same port.
+    uint32_t    shard{0}, shards{1};
+    int         inbox{-1};
+    io_request  in_rd{};
+    bool        in_pending{false};
+    std::vector<uint8_t> inbuf = std::vector<uint8_t>(rx_buf + 64);
+    // Read with the sender's credentials, which the kernel vouches for: only this user's processes -- the shards --
+    // are listened to, since an abstract name is anyone's to send to.
+    msghdr      in_msg{};
+    iovec       in_iov{};
+    alignas(cmsghdr) char in_cbuf[CMSG_SPACE(sizeof(ucred))]{};
 };
 
 void h3_endpoint_free::operator()(h3_endpoint* e) const { delete e; }
@@ -228,6 +247,31 @@ void h3_drop_rx(h3_stream& st)
     h3_give_back(st.conn, left);
 }
 
+// The inbox of shard `n` of the runtime on `port`: an abstract unix name, gone with the socket.
+socklen_t inbox_addr(uint16_t port, uint32_t n, sockaddr_un& out)
+{
+    out = sockaddr_un{};
+    out.sun_family = AF_UNIX;
+    const std::string name = "socketley-h3/" + std::to_string(port) + "/" + std::to_string(n);
+    std::memcpy(out.sun_path + 1, name.data(), name.size());
+    return static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + name.size());
+}
+
+// An address ngtcp2 names, as the sockaddr_storage this side keeps.
+void path_addr(const ngtcp2_addr& a, sockaddr_storage& out, socklen_t& len)
+{
+    len = static_cast<socklen_t>(std::min<size_t>(a.addrlen, sizeof out));
+    std::memcpy(&out, a.addr, len);
+}
+
+std::string peer_text(const sockaddr_storage& remote)
+{
+    const auto* a = reinterpret_cast<const sockaddr_in*>(&remote);
+    char host[INET_ADDRSTRLEN] = {};
+    ::inet_ntop(AF_INET, &a->sin_addr, host, sizeof host);
+    return std::string(host) + ":" + std::to_string(ntohs(a->sin_port));
+}
+
 ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* ref)
 {
     return static_cast<h3_conn*>(ref->user_data)->q;
@@ -237,29 +281,26 @@ ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* ref)
 
 // ─── The endpoint ───────────────────────────────────────────────────────────
 
-bool storage_run::h3_open(uint16_t port, uint16_t advertise, bool reuseport, const std::string& cert,
-                          const std::string& key)
+bool storage_run::h3_open(uint16_t port, uint16_t advertise, uint32_t shard, uint32_t shards, const std::string& cert,
+                          const std::string& key, const std::string& ca)
 {
+    const bool reuseport = shards > 1;
     auto ep = std::unique_ptr<h3_endpoint, h3_endpoint_free>(new h3_endpoint);
     if (ngtcp2_crypto_ossl_init() != 0)
         return false;
-    ep->ctx = SSL_CTX_new(TLS_server_method());
-    if (!ep->ctx)
+    ep->tls = std::make_unique<tls_context>();
+    if (!ep->tls->init_server(cert, key, ca))
+    {
+        LOG_WARN("storage: HTTP/3 not offered -- the certificate or key could not be loaded for QUIC");
         return false;
+    }
+    ep->ctx = ep->tls->native();
     SSL_CTX_set_min_proto_version(ep->ctx, TLS1_3_VERSION);
     SSL_CTX_set_max_proto_version(ep->ctx, TLS1_3_VERSION);
     SSL_CTX_set_options(ep->ctx, (SSL_OP_ALL & ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS) | SSL_OP_SINGLE_ECDH_USE |
                                      SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_NO_ANTI_REPLAY);
     SSL_CTX_set_mode(ep->ctx, SSL_MODE_RELEASE_BUFFERS);
     SSL_CTX_set_alpn_select_cb(ep->ctx, alpn_h3, nullptr);
-    if (SSL_CTX_use_certificate_chain_file(ep->ctx, cert.c_str()) != 1 ||
-        SSL_CTX_use_PrivateKey_file(ep->ctx, key.c_str(), SSL_FILETYPE_PEM) != 1 ||
-        SSL_CTX_check_private_key(ep->ctx) != 1)
-    {
-        ERR_clear_error();
-        LOG_WARN("storage: HTTP/3 not offered -- the certificate or key could not be loaded for QUIC");
-        return false;
-    }
     if (RAND_bytes(ep->secret, sizeof ep->secret) != 1)
         return false;
 
@@ -290,14 +331,82 @@ bool storage_run::h3_open(uint16_t port, uint16_t advertise, bool reuseport, con
     }
     ep->fd = fd;
     ep->port = port;
+    if (const char* ra = std::getenv("SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER"); ra && *ra)
+    {
+        size_t v = 0;
+        const auto [end, ec] = std::from_chars(ra, ra + std::strlen(ra), v);
+        if (ec == std::errc{} && *end == '\0')
+            ep->retry_after = v;
+    }
+    ep->shard = shard;
+    ep->shards = std::max<uint32_t>(shards, 1);
+    if (ep->shards > 1)
+    {
+        // Without its inbox a shard still serves; only a client that moved to it from another is lost.
+        sockaddr_un un{};
+        const socklen_t ul = inbox_addr(port, shard, un);
+        ep->inbox = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (ep->inbox >= 0 && ::bind(ep->inbox, reinterpret_cast<sockaddr*>(&un), ul) != 0)
+        {
+            LOG_WARN("storage: HTTP/3 shard inbox could not be bound; a client that changes address may be lost");
+            ::close(ep->inbox);
+            ep->inbox = -1;
+        }
+        else if (ep->inbox >= 0)
+        {
+            int sz = 4 << 20, on = 1;
+            setsockopt(ep->inbox, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
+            setsockopt(ep->inbox, SOL_SOCKET, SO_PASSCRED, &on, sizeof on);
+        }
+    }
     ep->rd.owner = this;
     ep->tm.owner = this;
+    ep->in_rd.owner = this;
     m_h3 = std::move(ep);
     // Behind a proxy the port a browser reaches may not be this one; 0 offers HTTP/3 to no one who was not told.
     if (advertise)
         m_alt_svc = "h3=\":" + std::to_string(advertise) + "\"; ma=86400";
     h3_arm_read();
+    h3_arm_inbox();
     return true;
+}
+
+void storage_run::h3_arm_inbox()
+{
+    h3_endpoint& ep = *m_h3;
+    if (ep.in_pending || ep.inbox < 0 || m_stopped)
+        return;
+    ep.in_rd = io_request{};
+    ep.in_rd.owner = this;
+    ep.in_iov.iov_base = ep.inbuf.data();
+    ep.in_iov.iov_len = ep.inbuf.size();
+    ep.in_msg = msghdr{};
+    ep.in_msg.msg_iov = &ep.in_iov;
+    ep.in_msg.msg_iovlen = 1;
+    ep.in_msg.msg_control = ep.in_cbuf;
+    ep.in_msg.msg_controllen = sizeof ep.in_cbuf;
+    ep.in_pending = m_loop.submit_recvmsg(ep.inbox, &ep.in_msg, &ep.in_rd);
+}
+
+// A packet for a connection another shard holds, with the addresses it came by, to that shard's inbox.
+void storage_run::h3_forward(uint32_t owner, const sockaddr_storage& local, socklen_t local_len,
+                             const sockaddr_storage& remote, socklen_t remote_len, const uint8_t* data, size_t len)
+{
+    h3_endpoint& ep = *m_h3;
+    if (ep.inbox < 0 || local_len > 255 || remote_len > 255)
+        return;
+    std::vector<uint8_t> msg;
+    msg.reserve(2 + local_len + remote_len + len);
+    msg.push_back(static_cast<uint8_t>(remote_len));
+    msg.insert(msg.end(), reinterpret_cast<const uint8_t*>(&remote), reinterpret_cast<const uint8_t*>(&remote) + remote_len);
+    msg.push_back(static_cast<uint8_t>(local_len));
+    msg.insert(msg.end(), reinterpret_cast<const uint8_t*>(&local), reinterpret_cast<const uint8_t*>(&local) + local_len);
+    msg.insert(msg.end(), data, data + len);
+    sockaddr_un un{};
+    const socklen_t ul = inbox_addr(ep.port, owner, un);
+    // A shard that is not there, or whose inbox is full, loses the packet as the path would; QUIC sends it again.
+    if (::sendto(ep.inbox, msg.data(), msg.size(), MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&un), ul) > 0)
+        ++m_c.h3_forwarded;
 }
 
 void storage_run::h3_arm_read()
@@ -321,12 +430,45 @@ void storage_run::h3_arm_read()
 
 bool storage_run::h3_owns(io_request* req) const
 {
-    return m_h3 && (req == &m_h3->rd || req == &m_h3->tm);
+    return m_h3 && (req == &m_h3->rd || req == &m_h3->tm || req == &m_h3->in_rd);
 }
 
 void storage_run::h3_cqe(io_request* req, int res)
 {
     h3_endpoint& ep = *m_h3;
+    if (req == &ep.in_rd)
+    {
+        ep.in_pending = false;
+        if (m_stopped)
+            return;
+        // Another shard's packet: the addresses it came by, then the datagram, taken as if it had come here --
+        // from a process of this user's only, and whole.
+        bool mine = false;
+        for (cmsghdr* cm = CMSG_FIRSTHDR(&ep.in_msg); cm; cm = CMSG_NXTHDR(&ep.in_msg, cm))
+            if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_CREDENTIALS)
+            {
+                ucred cr{};
+                std::memcpy(&cr, CMSG_DATA(cm), sizeof cr);
+                mine = cr.uid == ::geteuid();
+            }
+        const size_t n = res > 0 && mine && !(ep.in_msg.msg_flags & MSG_TRUNC) ? static_cast<size_t>(res) : 0;
+        const uint8_t* p = ep.inbuf.data();
+        if (n > 2 && p[0] <= sizeof(sockaddr_storage) && 1u + p[0] + 1u < n)
+        {
+            sockaddr_storage remote{}, local{};
+            const socklen_t rl = p[0];
+            std::memcpy(&remote, p + 1, rl);
+            const socklen_t ll = p[1 + rl];
+            if (ll <= sizeof(sockaddr_storage) && 2u + rl + ll <= n)
+            {
+                std::memcpy(&local, p + 2 + rl, ll);
+                h3_packet(local, ll, remote, rl, p + 2 + rl + ll, n - 2 - rl - ll, true);
+                h3_flush_dirty();
+            }
+        }
+        h3_arm_inbox();
+        return;
+    }
     if (req == &ep.tm)
     {
         if (res == -ECANCELED)
@@ -366,7 +508,8 @@ void storage_run::h3_cqe(io_request* req, int res)
         }
         const size_t total = static_cast<size_t>(res);
         for (size_t off = 0; off < total; off += seg)
-            h3_packet(local, local_len, ep.src, ep.msg.msg_namelen, ep.rbuf.data() + off, std::min(seg, total - off));
+            h3_packet(local, local_len, ep.src, ep.msg.msg_namelen, ep.rbuf.data() + off, std::min(seg, total - off),
+                      false);
         h3_flush_dirty();
     }
     h3_arm_read();
@@ -375,7 +518,7 @@ void storage_run::h3_cqe(io_request* req, int res)
 // ─── A datagram in ──────────────────────────────────────────────────────────
 
 void storage_run::h3_packet(const sockaddr_storage& local, socklen_t local_len, const sockaddr_storage& remote,
-                            socklen_t remote_len, const uint8_t* data, size_t len)
+                            socklen_t remote_len, const uint8_t* data, size_t len, bool forwarded)
 {
     h3_endpoint& ep = *m_h3;
     ngtcp2_version_cid vc{};
@@ -398,12 +541,54 @@ void storage_run::h3_packet(const sockaddr_storage& local, socklen_t local_len, 
     std::shared_ptr<h3_conn> hc;
     if (auto it = ep.by_cid.find(cid_key(vc.dcid, vc.dcidlen)); it != ep.by_cid.end())
         hc = it->second;
+    if (!hc && !forwarded && ep.shards > 1 && vc.dcidlen == scid_len)
+    {
+        // A connection ID of another shard's, on anything but a client's first packet: that shard's connection.
+        const bool initial = (data[0] & 0x80) && ((data[0] & 0x30) >> 4) == 0;
+        const uint32_t owner = vc.dcid[0];
+        if (!initial && owner < ep.shards && owner != ep.shard)
+        {
+            h3_forward(owner, local, local_len, remote, remote_len, data, len);
+            return;
+        }
+    }
     if (!hc)
     {
         ngtcp2_pkt_hd hd{};
         if (ngtcp2_accept(&hd, data, len) != 0 || ep.conns.size() >= max_conns)
             return;
-        hc = h3_new_conn(hd, local, local_len, remote, remote_len);
+        // A client that has not proven its address is sent a Retry while many handshakes are under way; one that
+        // comes back with the token is let in as the client the first Initial named.
+        ngtcp2_cid odcid{};
+        bool retried = false;
+        if (hd.type == NGTCP2_PKT_INITIAL && hd.tokenlen > 0 && hd.token[0] == NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY2)
+        {
+            if (ngtcp2_crypto_verify_retry_token2(&odcid, hd.token, hd.tokenlen, ep.secret, sizeof ep.secret,
+                                                  hd.version, reinterpret_cast<const sockaddr*>(&remote), remote_len,
+                                                  &hd.dcid, retry_token_timeout_ns, now_ns()) != 0)
+            {
+                // A token this side did not give, or one too old: the client is told so and starts again.
+                uint8_t out[256];
+                const ngtcp2_ssize n = ngtcp2_crypto_write_connection_close(out, sizeof out, hd.version, &hd.scid,
+                                                                            &hd.dcid, NGTCP2_INVALID_TOKEN, nullptr, 0);
+                if (n > 0)
+                    h3_send(local, local_len, remote, remote_len, out, static_cast<size_t>(n), 0);
+                return;
+            }
+            retried = true;
+        }
+        else if (hd.type == NGTCP2_PKT_INITIAL)
+        {
+            size_t shaking = 0;
+            for (const auto& other : ep.conns)
+                shaking += !other->dead && !ngtcp2_conn_get_handshake_completed(other->q);
+            if (shaking >= ep.retry_after)
+            {
+                h3_retry(hd, local, local_len, remote, remote_len);
+                return;
+            }
+        }
+        hc = h3_new_conn(hd, retried ? &odcid : nullptr, local, local_len, remote, remote_len);
         if (!hc)
             return;
     }
@@ -430,12 +615,46 @@ void storage_run::h3_packet(const sockaddr_storage& local, socklen_t local_len, 
         h3_close(hc);
         return;
     }
+    // The client moved -- a NAT that rebound it, or another network: once ngtcp2 takes the new path, what is sent goes
+    // there, and the requests that follow are judged by the address they now come from.
+    const ngtcp2_path* now = ngtcp2_conn_get_path(hc->q);
+    if (now->remote.addrlen != hc->remote_len || std::memcmp(now->remote.addr, &hc->remote, hc->remote_len) != 0 ||
+        now->local.addrlen != hc->local_len || std::memcmp(now->local.addr, &hc->local, hc->local_len) != 0)
+    {
+        path_addr(now->remote, hc->remote, hc->remote_len);
+        path_addr(now->local, hc->local, hc->local_len);
+        hc->ip = client_ip_from(reinterpret_cast<const sockaddr*>(&hc->remote));
+        hc->peer = peer_text(hc->remote);
+    }
     h3_dirty(hc);
 }
 
-std::shared_ptr<h3_conn> storage_run::h3_new_conn(const ngtcp2_pkt_hd& hd, const sockaddr_storage& local,
-                                                  socklen_t local_len, const sockaddr_storage& remote,
-                                                  socklen_t remote_len)
+void storage_run::h3_retry(const ngtcp2_pkt_hd& hd, const sockaddr_storage& local, socklen_t local_len,
+                          const sockaddr_storage& remote, socklen_t remote_len)
+{
+    h3_endpoint& ep = *m_h3;
+    ngtcp2_cid scid{};
+    scid.datalen = scid_len;
+    h3_rand(scid.data, scid.datalen);
+    uint8_t token[NGTCP2_CRYPTO_MAX_RETRY_TOKENLEN2];
+    const ngtcp2_ssize tl = ngtcp2_crypto_generate_retry_token2(token, ep.secret, sizeof ep.secret, hd.version,
+                                                                reinterpret_cast<const sockaddr*>(&remote), remote_len,
+                                                                &scid, &hd.dcid, now_ns());
+    if (tl < 0)
+        return;
+    uint8_t out[1200];
+    const ngtcp2_ssize n = ngtcp2_crypto_write_retry(out, sizeof out, hd.version, &hd.scid, &scid, &hd.dcid, token,
+                                                     static_cast<size_t>(tl));
+    if (n > 0)
+    {
+        h3_send(local, local_len, remote, remote_len, out, static_cast<size_t>(n), 0);
+        ++m_c.h3_retries;
+    }
+}
+
+std::shared_ptr<h3_conn> storage_run::h3_new_conn(const ngtcp2_pkt_hd& hd, const ngtcp2_cid* odcid,
+                                                  const sockaddr_storage& local, socklen_t local_len,
+                                                  const sockaddr_storage& remote, socklen_t remote_len)
 {
     h3_endpoint& ep = *m_h3;
     auto hc = std::make_shared<h3_conn>();
@@ -447,16 +666,12 @@ std::shared_ptr<h3_conn> storage_run::h3_new_conn(const ngtcp2_pkt_hd& hd, const
     hc->ref.get_conn = get_conn;
     hc->ref.user_data = hc.get();
     hc->ip = client_ip_from(reinterpret_cast<const sockaddr*>(&remote));
-    {
-        const auto* a = reinterpret_cast<const sockaddr_in*>(&remote);
-        char host[INET_ADDRSTRLEN] = {};
-        ::inet_ntop(AF_INET, &a->sin_addr, host, sizeof host);
-        hc->peer = std::string(host) + ":" + std::to_string(ntohs(a->sin_port));
-    }
+    hc->peer = peer_text(remote);
 
     ngtcp2_cid scid{};
     scid.datalen = scid_len;
     h3_rand(scid.data, scid.datalen);
+    scid.data[0] = static_cast<uint8_t>(ep.shard);
 
     static const ngtcp2_callbacks cb = []
     {
@@ -539,6 +754,8 @@ std::shared_ptr<h3_conn> storage_run::h3_new_conn(const ngtcp2_pkt_hd& hd, const
             h3_rand(cid->data, cidlen);
             cid->datalen = cidlen;
             h3_endpoint& ep = *hc->run->m_h3;
+            if (cidlen > 0)
+                cid->data[0] = static_cast<uint8_t>(ep.shard);
             if (ngtcp2_crypto_generate_stateless_reset_token(token->data, ep.secret, sizeof ep.secret, cid) != 0)
                 return NGTCP2_ERR_CALLBACK_FAILURE;
             const std::string k = cid_key(cid->data, cid->datalen);
@@ -570,6 +787,14 @@ std::shared_ptr<h3_conn> storage_run::h3_new_conn(const ngtcp2_pkt_hd& hd, const
     settings.max_window = conn_window_max;
     settings.max_stream_window = stream_window_max;
     settings.cc_algo = NGTCP2_CC_ALGO_CUBIC;
+    settings.handshake_timeout = handshake_timeout_ns;
+    if (odcid)
+    {
+        // The address is proven: the amplification limit no longer holds this connection back.
+        settings.token = hd.token;
+        settings.tokenlen = hd.tokenlen;
+        settings.token_type = NGTCP2_TOKEN_TYPE_RETRY;
+    }
     uint32_t pn = 0;
     h3_rand(reinterpret_cast<uint8_t*>(&pn), sizeof pn);
     settings.initial_pkt_num = pn & 0x7fffffff;
@@ -585,8 +810,13 @@ std::shared_ptr<h3_conn> storage_run::h3_new_conn(const ngtcp2_pkt_hd& hd, const
     params.max_idle_timeout = idle_timeout_ns;
     params.active_connection_id_limit = 7;
     params.stateless_reset_token_present = 1;
-    params.original_dcid = hd.dcid;
+    params.original_dcid = odcid ? *odcid : hd.dcid;
     params.original_dcid_present = 1;
+    if (odcid)
+    {
+        params.retry_scid = hd.dcid;
+        params.retry_scid_present = 1;
+    }
     if (ngtcp2_crypto_generate_stateless_reset_token(params.stateless_reset_token, ep.secret, sizeof ep.secret,
                                                      &scid) != 0)
         return nullptr;
@@ -1260,7 +1490,12 @@ void storage_run::h3_write(const std::shared_ptr<h3_conn>& hc)
         ngtcp2_conn_update_pkt_tx_time(hc->q, ts);
         if (n == 0)
             break;
-        h3_send(hc->local, hc->local_len, hc->remote, hc->remote_len, ep.txbuf.data(), static_cast<size_t>(n), gso);
+        // Each burst on the path ngtcp2 wrote it for: the current one, or a path being validated.
+        sockaddr_storage to{}, from{};
+        socklen_t to_len = 0, from_len = 0;
+        path_addr(ps.path.remote, to, to_len);
+        path_addr(ps.path.local, from, from_len);
+        h3_send(from, from_len, to, to_len, ep.txbuf.data(), static_cast<size_t>(n), gso);
     }
     // Streams whose bytes nghttp3 has all taken are told their write is done at the end of the turn.
     for (auto& [sid, sc] : hc->streams)
@@ -1326,7 +1561,13 @@ void storage_run::h3_close(const std::shared_ptr<h3_conn>& hc)
         const ngtcp2_ssize n = ngtcp2_conn_write_connection_close(hc->q, &ps.path, &pi, buf, sizeof buf, &hc->err,
                                                                   now_ns());
         if (n > 0)
-            h3_send(hc->local, hc->local_len, hc->remote, hc->remote_len, buf, static_cast<size_t>(n), 0);
+        {
+            sockaddr_storage to{}, from{};
+            socklen_t to_len = 0, from_len = 0;
+            path_addr(ps.path.remote, to, to_len);
+            path_addr(ps.path.local, from, from_len);
+            h3_send(from, from_len, to, to_len, buf, static_cast<size_t>(n), 0);
+        }
     }
     h3_drop(hc);
 }
@@ -1345,12 +1586,20 @@ void storage_run::h3_drop(const std::shared_ptr<h3_conn>& hc)
     {
         sc->h3s->gone = true;
         sc->h3s->conn = nullptr;
+        // The session goes with the connection; a conn kept a little longer by an operation in flight must not
+        // reach it.
+        sc->quic_ssl = nullptr;
         close_conn(sc);
     }
     for (const std::string& k : hc->cids)
         if (auto it = ep.by_cid.find(k); it != ep.by_cid.end() && it->second == hc)
             ep.by_cid.erase(it);
     std::erase(ep.conns, hc);
+}
+
+size_t storage_run::h3_open_conns() const
+{
+    return m_h3 ? m_h3->conns.size() : 0;
 }
 
 void storage_run::h3_stop()
@@ -1371,6 +1620,11 @@ void storage_run::h3_stop()
         m_loop.close_fd(ep.fd);
         ep.fd = -1;
     }
+    if (ep.inbox >= 0)
+    {
+        m_loop.close_fd(ep.inbox);
+        ep.inbox = -1;
+    }
 }
 
 }   // namespace socketley::storage
@@ -1384,7 +1638,11 @@ struct h3_stream {};
 void h3_endpoint_free::operator()(h3_endpoint* e) const { delete e; }
 void h3_stream_free::operator()(h3_stream* s) const { delete s; }
 // Built without HTTP/3: no endpoint is ever opened, so no stream or request of its own reaches these.
-bool storage_run::h3_open(uint16_t, uint16_t, bool, const std::string&, const std::string&) { return false; }
+bool storage_run::h3_open(uint16_t, uint16_t, uint32_t, uint32_t, const std::string&, const std::string&,
+                          const std::string&)
+{
+    return false;
+}
 bool storage_run::h3_owns(io_request*) const { return false; }
 void storage_run::h3_cqe(io_request*, int) {}
 void storage_run::h3_pull(const std::shared_ptr<conn>&, std::string_view) {}
@@ -1394,6 +1652,7 @@ void storage_run::h3_stream_gone(const std::shared_ptr<conn>&) {}
 bool storage_run::h3_stream_drained(const conn&) const { return true; }
 void storage_run::h3_flush_dirty() {}
 void storage_run::h3_stop() {}
+size_t storage_run::h3_open_conns() const { return 0; }
 }   // namespace socketley::storage
 
 #endif

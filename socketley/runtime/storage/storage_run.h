@@ -50,6 +50,7 @@
 
 // ngtcp2's packet header, named by an HTTP/3 member without its header.
 struct ngtcp2_pkt_hd;
+struct ngtcp2_cid;
 
 class storage_instance;
 
@@ -109,6 +110,10 @@ struct storage_counters
     // HTTP/3 connections and streams opened.
     uint64_t h3_conns{0};
     uint64_t h3_streams{0};
+    // Retries sent, asking a new client to prove its address.
+    uint64_t h3_retries{0};
+    // Packets of a connection another shard holds, handed to it.
+    uint64_t h3_forwarded{0};
     uint64_t h2_goaways{0};
     // Receives that found the buffer ring empty and were taken by the connection's own buffer instead.
     uint64_t recv_fallbacks{0};
@@ -613,6 +618,8 @@ public:
     void set_tls(std::unique_ptr<tls_context> ctx) { m_tls = std::move(ctx); }
     bool tls_enabled() const { return m_tls != nullptr; }
     bool h3_enabled() const { return m_h3 != nullptr; }
+    // QUIC connections open now, their handshakes done or not.
+    size_t h3_open_conns() const;
     // The domains a Host of `<bucket>.<domain>` addresses a bucket under; none serves path style only.
     void set_website_domains(std::vector<std::string> d) { m_website_domains = std::move(d); }
     void set_domains(std::vector<std::string> d) { m_domains = std::move(d); }
@@ -749,7 +756,8 @@ public:
 
     // HTTP/3, in storage_h3.cpp: a UDP socket beside the TCP listener when --tls is on; datagrams in and out through
     // the ring, each QUIC connection's streams conns as HTTP/2's are; a stream's DATA, its answer, its end.
-    bool h3_open(uint16_t port, uint16_t advertise, bool reuseport, const std::string& cert, const std::string& key);
+    bool h3_open(uint16_t port, uint16_t advertise, uint32_t shard, uint32_t shards, const std::string& cert,
+                 const std::string& key, const std::string& ca);
     bool h3_owns(io_request* req) const;
     void h3_cqe(io_request* req, int res);
     void h3_pull(const std::shared_ptr<conn>& c, std::string_view fresh = {});
@@ -761,10 +769,16 @@ public:
     void h3_stop();
 #if SOCKETLEY_HTTP3
     void h3_arm_read();
+    void h3_arm_inbox();
     void h3_packet(const sockaddr_storage& local, socklen_t local_len, const sockaddr_storage& remote,
-                   socklen_t remote_len, const uint8_t* data, size_t len);
-    std::shared_ptr<h3_conn> h3_new_conn(const ::ngtcp2_pkt_hd& hd, const sockaddr_storage& local,
-                                         socklen_t local_len, const sockaddr_storage& remote, socklen_t remote_len);
+                   socklen_t remote_len, const uint8_t* data, size_t len, bool forwarded);
+    void h3_forward(uint32_t owner, const sockaddr_storage& local, socklen_t local_len, const sockaddr_storage& remote,
+                    socklen_t remote_len, const uint8_t* data, size_t len);
+    void h3_retry(const ::ngtcp2_pkt_hd& hd, const sockaddr_storage& local, socklen_t local_len,
+                  const sockaddr_storage& remote, socklen_t remote_len);
+    std::shared_ptr<h3_conn> h3_new_conn(const ::ngtcp2_pkt_hd& hd, const ::ngtcp2_cid* odcid,
+                                         const sockaddr_storage& local, socklen_t local_len,
+                                         const sockaddr_storage& remote, socklen_t remote_len);
     bool h3_app_ready(h3_conn& hc);
     bool h3_begin(h3_conn& hc, int64_t sid);
     void h3_request(conn& raw, bool fin);

@@ -487,8 +487,8 @@ bool storage_instance::setup(event_loop& loop)
                 LOG_WARN("storage: SOCKETLEY_STORAGE_HTTP3_ADVERTISE is not a port; the runtime's own is advertised");
         }
         if (!(h3 && std::string_view(h3) == "0"))
-            run->h3_open(effective_port(), advertise, get_shards() > 1, std::string(get_cert_path()),
-                         std::string(get_key_path()));
+            run->h3_open(effective_port(), advertise, get_shard_index(), std::max<uint32_t>(get_shards(), 1),
+                         std::string(get_cert_path()), std::string(get_key_path()), std::string(get_ca_path()));
     }
 #endif
     m_run = std::move(run);
@@ -601,7 +601,10 @@ std::string storage_instance::stats_lines() const
         << "h2_goaways:" << c.h2_goaways << "\n"
         << "h3:" << (m_run->h3_enabled() ? 1 : 0) << "\n"
         << "h3_conns:" << c.h3_conns << "\n"
+        << "h3_open:" << m_run->h3_open_conns() << "\n"
         << "h3_streams:" << c.h3_streams << "\n"
+        << "h3_retries:" << c.h3_retries << "\n"
+        << "h3_forwarded:" << c.h3_forwarded << "\n"
         << "recv_fallbacks:" << c.recv_fallbacks << "\n"
         << "recv_cancels:" << c.recv_cancels << "\n"
         << "recv_direct_bytes:" << c.recv_direct_bytes << "\n"

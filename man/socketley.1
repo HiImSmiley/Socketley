@@ -9481,11 +9481,24 @@ TCP carries
 .B Alt\-Svc: h3=":PORT"
 so a browser tries QUIC on its next request and goes on over TCP if UDP does not
 reach; each request is a stream and runs exactly as over HTTP/1.1 and HTTP/2.
-A connection survives a client's change of network, and a lost packet holds up
-only its own stream, which is what HTTP/3 is for on mobile and lossy links; on a
-clean wire HTTP/2 costs less CPU per byte. A stream's window and a connection's
-start at 1 and 4 MiB and grow to 16 and 64 MiB, 128 streams are open at once,
-and a connection is let go after 30 seconds without a packet.
+A connection survives a client's change of address or network, and a lost
+packet holds up only its own stream, which is what HTTP/3 is for on mobile and
+lossy links; on a clean wire HTTP/2 costs less CPU per byte. With
+.B \-\-shards
+the shards share the UDP port and the kernel picks one by the client's
+address, so a client that moved may reach another: every connection ID names
+its shard, and a packet for another shard's connection is handed to it, which
+answers from the same port. A stream's window and a connection's start at 1 and
+4 MiB and grow to 16 and 64 MiB, 128 streams are open at once, a handshake not
+done in 10 seconds is dropped, and a connection is let go after 30 seconds
+without a packet. While more than
+.B SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER
+handshakes (64; 0 for always) are under way, a new client is sent a Retry and
+must prove its address before anything is kept for it (RFC 9000 8.1.2), so
+datagrams with forged sources cannot fill the table. QUIC's TLS is TCP's: a
+certificate renewed on disk is taken up the same way, and
+.B \-\-ca
+asks for a client certificate here too.
 Behind a reverse proxy, which forwards TCP only, the proxy passes the header
 on with the runtime's port: forward UDP from the port browsers reach (usually
 443, which the proxy does not take for UDP) to the runtime's, give it the
@@ -9494,9 +9507,13 @@ certificate browsers expect, and set
 to that port, or to 0 to advertise none.
 .B stats
 counts
-.B h3_conns
+.BR h3_conns ,
+.BR h3_streams ,
+.BR h3_retries
 and
-.BR h3_streams .
+.B h3_forwarded
+(packets handed to another shard), and shows the connections open now as
+.BR h3_open .
 .B SOCKETLEY_STORAGE_HTTP3=0
 turns it off.
 .

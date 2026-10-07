@@ -135,6 +135,9 @@ public:
     static bool peer_name_matches(SSL* ssl, std::string_view name);
 
     bool is_initialized() const { return m_ctx != nullptr; }
+    // The context itself, for a server whose transport is not this wrapper's -- QUIC, which takes OpenSSL's own
+    // and still wants the certificate kept current and the client CA asked for, as init_server sets them up.
+    SSL_CTX* native() const { return m_ctx; }
 
     // A server context's certificate chain and key taken again from their files, for handshakes from now on; false,
     // and the old ones kept, when they do not load or do not match.
