@@ -2842,6 +2842,9 @@ async function resumeAll() {
 }
 function pauseAll() { for (const j of UP.jobs) pause(j, 'user'); }
 window.addEventListener('online', () => { for (const j of UP.jobs) if (j.state === 'paused' && j.why === 'line') resume(j); });
+// A server restarting, or a line lost past the browser, never says it is back: such an upload is tried again every
+// 15 s, and pauses again if it is still gone.
+setInterval(() => { if (navigator.onLine !== false) for (const j of UP.jobs) if (j.state === 'paused' && j.why === 'line' && Date.now() - j.pausedAt > 15000) resume(j); }, 5000);
 function xhr(j, method, url, body, headers, onprog) {
   return new Promise(res => {
     const x = new XMLHttpRequest();
@@ -2985,11 +2988,11 @@ async function finish(j) {
 function pause(j, why) {
   if (j.state === 'paused' || j.state === 'stale') { if (why === 'user' && j.why !== 'user') { j.why = 'user'; remember(j); paintUploads(); } return; }
   if (!['queued', 'running', 'starting'].includes(j.state)) return;
-  j.state = 'paused'; j.why = why; j.gen = (j.gen || 0) + 1;
+  j.state = 'paused'; j.why = why; j.gen = (j.gen || 0) + 1; j.pausedAt = Date.now();
   for (const x of [...j.xhrs]) if (x._data) x.abort();
   for (const p of j.parts || []) if (p.state === 'sending') p.state = 'todo';
   j.inflight.clear(); j.rate = 0;
-  if (why === 'line') toast(j.name + ' is paused: it goes on when the line is back', 'bad', 6000);
+  if (why === 'line' && !j.told) { j.told = true; toast(j.name + ' is paused: it goes on when the server is reachable again', 'bad', 6000); }
   remember(j); paintUploads(); schedule();
 }
 // A picture's or a film's media are asked for as soon as it is up, so the server makes them while nobody waits: its
