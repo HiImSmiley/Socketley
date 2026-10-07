@@ -137,3 +137,6 @@ test/benchmark/bench_client
 /thirdparty/openssl/
 /thirdparty/ngtcp2/
 /thirdparty/nghttp3/
+
+# scripts/update.sh: which pins of bin/build-thirdparty.sh the archives here were built from
+thirdparty/.built-versions
