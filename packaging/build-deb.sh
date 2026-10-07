@@ -171,8 +171,19 @@ if ! getent group socketley >/dev/null 2>&1; then
     groupadd --system socketley
 fi
 
+# The highest system uid that no account has and no running process holds: a container's processes share the host's
+# uid numbers, and MariaDB's, PostgreSQL's and Redis's images all run as 999, which useradd would hand out first.
+free_system_uid() {
+    taken=" $(getent passwd | cut -d: -f3 | tr '\n' ' ') $(awk '/^Uid:/ { print $3 }' /proc/[0-9]*/status 2>/dev/null | tr '\n' ' ') "
+    u=999
+    while [ "$u" -ge 100 ]; do
+        case "$taken" in *" $u "*) u=$((u - 1)) ;; *) echo "$u"; return ;; esac
+    done
+}
+
 if ! id -u socketley >/dev/null 2>&1; then
-    useradd --system --no-create-home --shell /usr/sbin/nologin \
+    uid=$(free_system_uid)
+    useradd --system ${uid:+--uid "$uid"} --no-create-home --shell /usr/sbin/nologin \
             --gid socketley socketley
 fi
 

@@ -598,6 +598,16 @@ run_root mandb -q >/dev/null 2>&1 || true
 # This repository carries no shell completion under any name, so nothing is
 # installed for one and nothing is invented here.
 
+# The highest system uid that no account has and no running process holds: a container's processes share the host's
+# uid numbers, and MariaDB's, PostgreSQL's and Redis's images all run as 999, which useradd would hand out first.
+free_system_uid() {
+    taken=" $(getent passwd | cut -d: -f3 | tr '\n' ' ') $(awk '/^Uid:/ { print $3 }' /proc/[0-9]*/status 2>/dev/null | tr '\n' ' ') "
+    u=999
+    while [ "$u" -ge 100 ]; do
+        case "$taken" in *" $u "*) u=$((u - 1)) ;; *) echo "$u"; return ;; esac
+    done
+}
+
 if [ "$WANT_SERVICE" = 1 ]; then
     step "creating the socketley user and group" \
          "groupadd or useradd refused; check whether the name is already taken by something else"
@@ -615,7 +625,8 @@ if [ "$WANT_SERVICE" = 1 ]; then
     if id -u socketley >/dev/null 2>&1; then
         note "user socketley already exists"
     else
-        run_root useradd --system --no-create-home --shell "$NOLOGIN" --gid socketley socketley
+        uid=$(free_system_uid)
+        run_root useradd --system ${uid:+--uid "$uid"} --no-create-home --shell "$NOLOGIN" --gid socketley socketley
     fi
 
     step "creating the state, runtime and configuration directories" \
