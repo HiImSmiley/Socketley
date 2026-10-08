@@ -192,7 +192,9 @@ for _ in $(seq 1 40); do got=$(qp chat.example.com A); [ -n "$got" ] && break; s
 expect "a runtime's --domain without a dot is published under the zone" "$got" "192.0.2.10"
 expect "with every address --publish names" "$(qp chat.example.com AAAA)" "2001:db8::10"
 expect "and one with dots as it is written" "$(qp api.example.com A)" "192.0.2.10"
-expect "a storage runtime's --domain, with its buckets beneath it" "$(qp files.example.com A) $(qp photos.files.example.com A)" "192.0.2.10 192.0.2.10"
+# Published when the daemon has it, which is after the server's name in a slow build.
+for _ in $(seq 1 40); do got="$(qp files.example.com A) $(qp photos.files.example.com A)"; [ "$got" = "192.0.2.10 192.0.2.10" ] && break; sleep 0.2; done
+expect "a storage runtime's --domain, with its buckets beneath it" "$got" "192.0.2.10 192.0.2.10"
 expect "a name the zone file gives an address keeps that address" "$(qp mail.example.com A)" "192.0.2.25"
 has "a runtime's names are not published by a dns runtime without --publish" "$(q chat.example.com A)" "NXDOMAIN"
 s1=$(qp example.com SOA | awk '{print $3}')
@@ -239,7 +241,8 @@ rm -f "$SOCKETLEY_SOCKET"
 : > "$SOCKETLEY_DLOG"
 daemon_start "$BIN"
 got=""
-for _ in $(seq 1 50); do got=$(q +short new.example.com A); [ -n "$got" ] && break; sleep 0.2; done
+# Under the sanitizer the old daemon's workers take seconds to go, and the new one starts after them.
+for _ in $(seq 1 150); do got=$(q +short new.example.com A); [ "$got" = 198.51.100.7 ] && break; sleep 0.2; done
 expect "a daemon started again brings the runtime back, answering" "$got" "198.51.100.7"
 has "its configuration kept" "$("$BIN" show ns 2>&1)" "127.0.0.1:$SINK"
 
