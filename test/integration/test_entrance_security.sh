@@ -95,8 +95,8 @@ for _ in $(seq 1 40); do got=$(hs hub.example.com '/deep/path?x=1' | field path)
 expect "a proxy with --domain, reached through the entrance, passes the path on as it came" "$got" "/deep/path?x=1"
 expect "and the Host" "$(hs hub.example.com / | field host)" "hub.example.com:$WEB"
 expect "and its backend is told the scheme the entrance was reached over" "$(hs hub.example.com / | field proto)" "https"
-expect "and who asked, last" "$(hs hub.example.com / -H 'X-Forwarded-For: 203.0.113.9' | field xff)" \
-    "203.0.113.9, 127.0.0.1, 127.0.0.1"
+expect "and who asked, last, without the entrance as a hop of its own" \
+    "$(hs hub.example.com / -H 'X-Forwarded-For: 203.0.113.9' | field xff)" "203.0.113.9, 127.0.0.1"
 expect "the entrance over TLS tells the browser to stay on HTTPS" \
     "$(hs hub.example.com / -o /dev/null -D - | tr -d '\r' | grep -ci '^strict-transport-security: max-age=31536000')" 1
 expect "and a backend's own HSTS is left alone, not doubled" \

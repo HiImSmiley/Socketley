@@ -4884,11 +4884,15 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     if (!filter_set("x-forwarded-for", 15) &&
         (!prior_forwarded_for.empty() || !conn->peer_addr.empty()))
     {
+        // Behind the entrance the chain it wrote ends with the client; the
+        // entrance itself, a hop on this machine, is no address to add.
+        const bool add_peer = !conn->peer_addr.empty() && !(forwarded_trusted && !prior_forwarded_for.empty());
         result += "X-Forwarded-For: ";
         result += prior_forwarded_for;
-        if (!prior_forwarded_for.empty() && !conn->peer_addr.empty())
+        if (!prior_forwarded_for.empty() && add_peer)
             result += ", ";
-        result += conn->peer_addr;
+        if (add_peer)
+            result += conn->peer_addr;
         result += "\r\n";
     }
     if (!kept_proto && !filter_set("x-forwarded-proto", 17))
