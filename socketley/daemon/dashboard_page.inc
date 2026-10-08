@@ -157,7 +157,8 @@ const toSec = v => { const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w)?$/i.exec(Strin
 const fromSec = s => { s = +s; if (!s) return '0'; for (const [u, n] of [['w', 604800], ['d', 86400], ['h', 3600], ['m', 60]]) if (s % n === 0) return s / n + u; return s + 's'; };
 const toBytes = v => { const m = /^(\d+(?:\.\d+)?)\s*([kmgt])?b?$/i.exec(String(v).trim()); if (!m) return null; return Math.round(+m[1] * Math.pow(1024, ' kmgt'.indexOf((m[2] || ' ').toLowerCase()))); };
 const fromBytes = b => { b = +b; for (const [u, n] of [['T', 2 ** 40], ['G', 2 ** 30], ['M', 2 ** 20], ['K', 1024]]) if (b >= n && b % n === 0) return b / n + u; return String(b); };
-const rate = n => human(n).replace(' ', ' ') + '/s';
+// Whole bytes: a rate is two counters' difference over the time between two polls, and its fractions mean nothing.
+const rate = n => human(Math.round(+n || 0)) + '/s';
 const count = n => { n = +n || 0; return n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(0) + 'k' : String(Math.round(n)); };
 const ago = s => { s = Math.floor(s); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? d + 'd ' + h + 'h' : h ? h + 'h ' + m + 'm' : m + 'm ' + (s % 60) + 's'; };
 
