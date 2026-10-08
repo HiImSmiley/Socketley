@@ -115,6 +115,7 @@ public:
                           session_credentials& out) override;
     bool has_user(std::string_view id) const override { return m_creds.find_user(id) != nullptr; }
     std::string user_of_email(std::string_view email) const override { return m_creds.user_of_email(email); }
+    std::string seal_key(std::string_view user_id, std::string_view purpose) const override;
     int role_check(std::string_view role, std::string_view user_id, int64_t& max_session) override;
     std::string iam_file() const override { return m_cfg.iam_file; }
     void refresh() override;

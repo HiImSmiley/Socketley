@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Storage: git repositories kept in a library.** The page's new Git tab adds a
+  repository by URL (a branch, `main` by default, or `*` for every one); it is
+  fetched once a day at the hour asked for and whenever asked, and when anything
+  moved its branch's files are written under `<name>/` of the library -- what
+  changed, or the whole tree the first time -- and a git bundle of its history
+  under `_backups/<name>/`, which `git clone` makes the repository from. Every
+  bundle of the last day stays, then the newest of each of 14 days, 8 weeks and
+  12 months. Runs are `socketley git-sync`, started with temporary credentials of
+  the user who added the repository and writing through the runtime's own S3
+  API, so that user's rights, quotas and versioning apply. A private repository
+  is read with the user's GitHub token, sealed with a key only the user's secret
+  derives and passed to git through its environment.
+
 - **The entrance replaces a web server in front of everything.** A proxy with
   `--domain` is reached by its name through the entrance and serves under no
   `/<name>/` prefix: the path and the Host go to its backend as they came, and

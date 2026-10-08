@@ -22,6 +22,7 @@ int cli_config(int argc, char** argv);
 int cli_cluster(int argc, char** argv);
 // `socketley acme issue`, in cli_acme.cpp.
 int acme_main(int argc, char** argv);
+int git_sync_main(int argc, char** argv);
 
 // A path a flag names, made absolute against the caller's directory, because the daemon resolves it against its own.
 std::string cli_caller_path(std::string_view flag, std::string_view value);

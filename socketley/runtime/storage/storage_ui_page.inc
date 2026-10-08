@@ -491,6 +491,7 @@ body.audio #ups,body.audio #selbar{bottom:96px}
     <button class="nav" id="nLinks"></button>
     <div class="sh">Libraries</div>
     <div id="libs"></div>
+    <button class="nav" id="nGit"></button>
     <button class="nav" id="nSend"></button>
     <button class="nav" id="nUse"></button>
     <div class="themes" id="themes"></div>
@@ -577,6 +578,7 @@ const P = {
   info: '<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/>', speed: '<path d="M12 13l4-4"/><path d="M4.5 18a9 9 0 1 1 15 0"/>',
   replace: '<path d="M4 7h11l-3-3M20 17H9l3 3"/>',
   send: '<path d="M21 3 10.5 13.5M21 3l-6.5 18-4-7.5L3 9.5z"/>',
+  git: '<circle cx="6" cy="5.5" r="2.2"/><circle cx="6" cy="18.5" r="2.2"/><circle cx="18" cy="8.5" r="2.2"/><path d="M6 7.7v8.6M18 10.7c0 4-6 3.3-11 6.2"/>',
   users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6.5 6.5 0 0 1 3.5 6"/>',
   fire: '<path d="M12 21c-3.9 0-7-2.9-7-6.6 0-2.8 1.6-4.6 3.2-6.3.3 1.8 1.3 3 2.6 3.4C10.4 8 12 5.2 14.5 3c.3 3.2 4.5 5.6 4.5 11.1 0 3.9-3.1 6.9-7 6.9z"/><path d="M12 21c-1.7 0-3-1.3-3-3 0-1.9 1.6-2.9 3-4.5 1.4 1.6 3 2.6 3 4.5 0 1.7-1.3 3-3 3z"/>'
 };
@@ -777,6 +779,8 @@ function side() {
   $('#nAll').hidden = !(me && me.user);
   nav($('#nSend'), 'send', 'Send a file', false, () => sendDlg());
   nav($('#nUse'), 'bucket', 'Storage', false, usageDlg);
+  nav($('#nGit'), 'git', 'Git', false, gitDlg);
+  $('#nGit').hidden = !(me && me.user);
   paintThemes();
   const L = $('#libs'); L.textContent = '';
   for (const b of buckets) {
@@ -1587,6 +1591,79 @@ function linksDlg() {
         el('td', { class: 'r' }, btn(null, 'Copy', () => copy(url), 'sm'), ' ', btn(null, 'Revoke', async () => { try { await must(await api('DELETE', '/~share/' + s.id)); fill(); } catch (e) { fail(e); } }, 'sm bad'))));
     }
   };
+  fill();
+  return L;
+}
+// Git repositories kept in a library: fetched every day, their branch's files under <name>/ and a bundle of their
+// history under _backups/<name>/ whenever anything moved.
+function gitDlg() {
+  const box = el('div');
+  const L = modal('Git', box, null, true);
+  let timer = 0;
+  L.onclose = () => clearTimeout(timer);
+  const field = (label, input) => el('label', { style: 'display:flex;flex-direction:column;gap:4px;font-size:12.5px;flex:1;min-width:140px' }, el('span', { class: 'mut', text: label }), input);
+  const url = el('input', { class: 'inp', placeholder: 'https://github.com/you/repo', spellcheck: 'false', autocomplete: 'off' });
+  const branch = el('input', { class: 'inp', value: 'main', spellcheck: 'false', title: 'A branch, or * for every branch' });
+  const lib = el('input', { class: 'inp', value: 'git', spellcheck: 'false' });
+  const name = el('input', { class: 'inp', placeholder: 'from the URL', spellcheck: 'false' });
+  const hour = el('select', { class: 'inp' }, ...Array.from({ length: 24 }, (_, h) => el('option', { value: String(h), text: String(h).padStart(2, '0') + ':00' })));
+  hour.value = '3';
+  const priv = el('input', { type: 'checkbox' });
+  const add = async () => {
+    const u = url.value.trim();
+    if (!u) { url.focus(); return; }
+    try {
+      const r = await (await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'add', url: u, branch: branch.value.trim() || 'main', bucket: lib.value.trim() || 'git', name: name.value.trim(), private: priv.checked, hour: +hour.value }) }))).json();
+      url.value = ''; name.value = '';
+      toast(r.started ? 'Added; the first copy is being made' : 'Added, but not run: ' + r.why, r.started ? 'ok' : 'bad');
+      fill();
+    } catch (e) { fail(e); }
+  };
+  url.addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
+  const tok = el('input', { class: 'inp', type: 'password', placeholder: 'GitHub token (read access to contents)', autocomplete: 'off', style: 'flex:1' });
+  const tokState = el('span', { class: 'mut', style: 'font-size:12.5px' });
+  const setTok = async v => { try { await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'token', token: v }) })); tok.value = ''; toast(v ? 'Token kept' : 'Token removed'); fill(); } catch (e) { fail(e); } };
+  const T = el('table', { class: 'mtbl' });
+  const form = el('div', {},
+    el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end' }, field('Repository URL', url), field('Branch', branch), field('Library', lib), field('Folder', name), field('Daily at', hour)),
+    el('div', { style: 'display:flex;gap:10px;align-items:center;margin:10px 0 18px' }, el('label', { class: 'chk' }, priv, ' Private (uses your GitHub token)'), el('span', { style: 'flex:1' }), btn('plus', 'Add repository', add, 'pri')));
+  const acct = el('div', { style: 'margin-top:20px' }, el('h4', { text: 'Your GitHub token', style: 'margin:0 0 6px' }),
+    el('p', { class: 'mut', style: 'font-size:12.5px;margin:0 0 8px', text: 'Only needed for private repositories. A fine-grained token with read access to their contents is enough. It is kept sealed with your own key and never shown again.' }),
+    el('div', { style: 'display:flex;gap:8px;align-items:center' }, tok, btn(null, 'Save', () => tok.value.trim() && setTok(tok.value.trim()), 'sm'), btn(null, 'Remove', () => setTok(''), 'sm bad')), tokState);
+  async function fill() {
+    clearTimeout(timer);
+    let g;
+    try { g = await (await must(await api('GET', '/~ui/git'))).json(); } catch (e) { box.textContent = ''; box.append(el('p', { text: e.message })); return; }
+    box.textContent = '';
+    if (!g.available) { box.append(el('p', { text: 'Git is not available on this runtime: ' + g.why })); return; }
+    tokState.textContent = g.token ? 'A token is set.' : 'No token set.';
+    T.textContent = '';
+    T.append(el('tr', {}, el('th', { text: 'Repository' }), el('th', { text: 'Branch' }), el('th', { text: 'Last run' }), el('th')));
+    if (!g.repos.length) T.append(el('tr', {}, el('td', { class: 'mut', colspan: '4', text: 'No repositories yet. Add one above; it is copied now and then every day.' })));
+    let busy = false;
+    for (const r of g.repos) {
+      busy = busy || r.running;
+      const st = r.state;
+      const last = r.running ? el('span', { text: 'running…' })
+        : !st ? el('span', { class: 'mut', text: 'not yet' })
+        : st.ok ? el('span', { title: st.commit || '', text: new Date(st.at * 1000).toLocaleString() + (st.commit ? ' · ' + st.commit.slice(0, 7) : '') + (st.changed ? ' · ' + st.files + ' file' + (st.files === 1 ? '' : 's') + ' written' : ' · unchanged') })
+        : el('span', { class: 'fire', title: st.error || '', text: 'failed ' + new Date(st.at * 1000).toLocaleString() + ': ' + (st.error || 'see the log') });
+      T.append(el('tr', {},
+        el('td', { class: 'w' }, el('a', { href: '#', text: r.bucket + '/' + r.name, onclick: e => { e.preventDefault(); L.close(); go([r.bucket, r.name]); } }),
+          el('div', { class: 'mut', style: 'font-size:12px;word-break:break-all', text: r.url + (r.private ? ' · private' : '') + (g.repos.some(x => x.owner !== r.owner) ? ' · ' + r.owner : '') + ' · daily at ' + String(r.hour).padStart(2, '0') + ':00' })),
+        el('td', { class: 'mut', text: r.branch === '*' ? 'all' : r.branch }),
+        el('td', { style: 'font-size:12.5px' }, last),
+        el('td', { class: 'r', style: 'white-space:nowrap' },
+          btn(null, 'Sync now', async () => { try { await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'sync', id: r.id }) })); toast('Running'); setTimeout(fill, 600); } catch (e) { fail(e); } }, 'sm'), ' ',
+          btn(null, 'Backups', () => { L.close(); go([r.bucket, '_backups', r.name]); }, 'sm'), ' ',
+          btn(null, 'Remove', async () => {
+            if (!await ask({ title: 'Remove ' + r.name + '?', text: 'It is no longer fetched. Its files and backups stay in ' + r.bucket + ' until you delete them.', ok: 'Remove', danger: true })) return;
+            try { await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'remove', id: r.id }) })); fill(); } catch (e) { fail(e); }
+          }, 'sm bad'))));
+    }
+    box.append(form, T, acct);
+    if (busy) timer = setTimeout(fill, 3000);
+  }
   fill();
   return L;
 }

@@ -34,6 +34,7 @@
 #include "cluster.h"
 #include "replicator.h"
 #include "compactor.h"
+#include "git_mirrors.h"
 #include "scrubber.h"
 #include "tierer.h"
 #include "s3_federation.h"
@@ -1087,6 +1088,10 @@ public:
     };
     std::unordered_map<std::string, usage_count> m_usage;
     void ui_access_body(const std::shared_ptr<conn>& c);
+    // GET lists the git repositories the user keeps here (an admin: all), each with how its last run ended, whether
+    // the account has a GitHub token, and whether git is available; POST {action: add | remove | sync | token, ...}.
+    void ui_git(const std::shared_ptr<conn>& c);
+    void ui_git_body(const std::shared_ptr<conn>& c);
     void ui_body(const std::shared_ptr<conn>& c);
     void app_reply(const std::shared_ptr<conn>& c, int status, std::string body = {},
                    std::string_view type = "text/plain; charset=utf-8");
@@ -1376,6 +1381,7 @@ private:
     notifier          m_notify;
     replicator        m_repl;
     scrubber          m_scrub;
+    git_mirrors       m_git;
     compactor         m_compact;
     tierer            m_tier;
     std::vector<bucket_policy::cidr> m_tls_offloaded;

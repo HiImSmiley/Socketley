@@ -190,6 +190,19 @@ bool storage_run::open(std::string& err)
         return false;
     m_scrub.open(m_store.options().dir, m_store.shard());
     m_compact.open(m_store.options().dir, m_store.shard());
+    {
+        // Where `git-sync` reaches this runtime: its own address, loopback for a wildcard.
+        std::string endpoint, why;
+        const std::string bind(m_owner.get_bind_address());
+        if (!m_owner.get_listen_path().empty())
+            why = "git needs the runtime on a TCP port; it listens on a unix socket";
+        else
+            endpoint = (bind.empty() || bind == "0.0.0.0" ? std::string("127.0.0.1")
+                        : bind == "::" ? std::string("[::1]")
+                        : bind.find(':') != std::string::npos ? "[" + bind + "]" : bind) +
+                       ":" + std::to_string(m_owner.effective_port());
+        m_git.open(m_store.options().dir, m_store.shard(), endpoint, m_tls != nullptr, why);
+    }
     reap_uploads();
     LOG_INFO(("storage: " + std::to_string(rep.buckets) + " bucket(s), " +
               std::to_string(rep.objects) + " object(s) in " + m_store.options().dir +
@@ -587,11 +600,13 @@ void storage_run::sweep()
     m_scrub.tick();
     m_compact.tick();
     m_tier.tick();
+    if (m_auth)
+        m_git.tick(*m_auth);
     tell_started();
     flush_access_logs(false);
     if (!m_conns.empty() || m_mpu_expire_secs != 0 || m_start_note != start_note::told || m_lc ||
         m_store.lifecycle_buckets() != 0 || m_store.any_doubt() || !m_access_logs.empty() || m_scrub.enabled() ||
-        m_compact.enabled() || m_tier.enabled() || m_burns != 0 || !m_burning.empty() || !m_hooks.empty())
+        m_compact.enabled() || m_tier.enabled() || m_git.enabled() || m_burns != 0 || !m_burning.empty() || !m_hooks.empty())
         arm_sweep();
 }
 
@@ -618,6 +633,7 @@ void storage_run::stop()
         return;
     m_stopped = true;
     stop_rpc();
+    m_git.stop();
     for (auto& [url, h] : m_hooks)
         h->peer->stop();
     // Access log lines not yet delivered are dropped with the deliveries in flight.

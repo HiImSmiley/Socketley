@@ -204,6 +204,8 @@ public:
     // Whether user `id` is one the credentials or the IAM API declared.
     virtual bool has_user(std::string_view /*id*/) const { return false; }
     // The id of the user whose email is `email`, empty for none.
+    // 32 bytes only this user's secret derives, for `purpose`, to seal what is kept for the user; empty for none.
+    virtual std::string seal_key(std::string_view /*user_id*/, std::string_view /*purpose*/) const { return {}; }
     virtual std::string user_of_email(std::string_view /*email*/) const { return {}; }
     // Whether the IAM role `role` lets user `user_id` assume it: -1 for no such role, 0 for a refusal, 1 with
     // `max_session` set to the longest session it gives.

@@ -755,6 +755,20 @@ bool sigv4_authenticator::issue_session(std::string_view access_key, int64_t exp
     return true;
 }
 
+std::string sigv4_authenticator::seal_key(std::string_view user_id, std::string_view purpose) const
+{
+    const std::string_view key = m_creds.key_of(user_id);
+    const std::string_view secret = key.empty() ? std::string_view{} : m_creds.secret(key);
+    if (secret.empty())
+        return {};
+    unsigned char out[32];
+    unsigned int n = 0;
+    if (!HMAC(EVP_sha256(), secret.data(), static_cast<int>(secret.size()), reinterpret_cast<const unsigned char*>(purpose.data()),
+              purpose.size(), out, &n) || n != 32)
+        return {};
+    return std::string(reinterpret_cast<char*>(out), n);
+}
+
 bool sigv4_authenticator::issue_session_as(std::string_view user_id, int64_t expires, std::string_view policy,
                                            std::string_view role, session_credentials& out)
 {

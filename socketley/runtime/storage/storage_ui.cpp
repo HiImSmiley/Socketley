@@ -67,6 +67,13 @@ void jstr(std::string& o, std::string_view v)
     o += '"';
 }
 
+std::string json_quote(std::string_view v)
+{
+    std::string o;
+    jstr(o, v);
+    return o;
+}
+
 std::string num(double v)
 {
     char buf[32];
@@ -306,6 +313,11 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
         ui_taken(c);
         return;
     }
+    if (r.key == "git")
+    {
+        ui_git(c);
+        return;
+    }
     if (r.method != "GET" && r.method != "HEAD")
     {
         app_reply(c, 405, "The interface is read only.\n");
@@ -530,6 +542,8 @@ void storage_run::ui_body(const std::shared_ptr<conn>& c)
         ui_usage_body(c);
     else if (c->req.key == "access")
         ui_access_body(c);
+    else if (c->req.key == "git")
+        ui_git_body(c);
     else
         ui_progress_body(c);
 }
@@ -1146,6 +1160,158 @@ void storage_run::ui_taken(const std::shared_ptr<conn>& c)
         for (int i = 0; i < 8; ++i)
             (*next)();
     });
+}
+
+void storage_run::ui_git(const std::shared_ptr<conn>& c)
+{
+    s3_request& r = c->req;
+    if (r.method != "GET" && r.method != "POST")
+    {
+        app_reply(c, 405, "Repositories are listed with GET and changed with POST.\n");
+        return;
+    }
+    if (!app_login(c, "socketley"))
+        return;
+    if (c->anonymous || !c->user)
+    {
+        app_reply(c, 403, "Repositories are kept for a user; sign in with a key of your own.\n");
+        return;
+    }
+    if (r.method == "POST")
+    {
+        if (r.chunked || (r.has_content_length && r.content_length > 16 * 1024))
+        {
+            r.keep_alive = false;
+            app_reply(c, 413, "Request body too large.\n");
+            return;
+        }
+        collect_body(c, 16 * 1024);
+        return;
+    }
+    const std::string& who = c->user->id;
+    std::string o = "{\"available\":" + std::string(m_git.available() ? "true" : "false") +
+                    ",\"why\":" + json_quote(m_git.unavailable_reason()) +
+                    ",\"token\":" + (m_git.has_token(who) ? "true" : "false") + ",\"repos\":[";
+    bool first = true;
+    for (const git_mirrors::repo& g : m_git.repos())
+    {
+        if (g.owner != who && !c->user->admin)
+            continue;
+        o += std::string(first ? "" : ",") + "{\"id\":" + json_quote(g.id) + ",\"owner\":" + json_quote(g.owner) +
+             ",\"url\":" + json_quote(g.url) + ",\"branch\":" + json_quote(g.branch) +
+             ",\"bucket\":" + json_quote(g.bucket) + ",\"name\":" + json_quote(g.name) +
+             ",\"private\":" + (g.private_repo ? "true" : "false") + ",\"hour\":" + std::to_string(g.hour) +
+             ",\"running\":" + (m_git.running(g.id) ? "true" : "false") + ",\"state\":" + m_git.state_json(g.id) + "}";
+        first = false;
+    }
+    o += "]}";
+    app_reply(c, 200, std::move(o), "application/json");
+}
+
+void storage_run::ui_git_body(const std::shared_ptr<conn>& c)
+{
+    jvalue req;
+    if (!json_reader(c->body).document(req))
+    {
+        app_reply(c, 400, "The body is a JSON object with an action: add, remove, sync or token.\n");
+        return;
+    }
+    const std::string& who = c->user->id;
+    const std::string action = str_of(req, "action");
+    // A repository the user keeps, or any to an admin.
+    const auto mine = [&](const std::string& id) {
+        for (const git_mirrors::repo& g : m_git.repos())
+            if (g.id == id)
+                return g.owner == who || c->user->admin;
+        return false;
+    };
+    if (action == "token")
+    {
+        const std::string token = str_of(req, "token");
+        if (token.size() > 512 || token.find_first_of(" \r\n\t") != std::string::npos)
+        {
+            app_reply(c, 400, "That is no token.\n");
+            return;
+        }
+        if (!m_git.set_token(*m_auth, who, token))
+        {
+            app_reply(c, 500, "The token could not be kept.\n");
+            return;
+        }
+        app_reply(c, 204);
+        return;
+    }
+    if (action == "add")
+    {
+        git_mirrors::repo g;
+        g.owner = who;
+        g.url = str_of(req, "url");
+        const std::string branch = str_of(req, "branch");
+        if (!branch.empty())
+            g.branch = branch;
+        const std::string bucket = str_of(req, "bucket");
+        if (!bucket.empty())
+            g.bucket = bucket;
+        g.name = str_of(req, "name");
+        const jvalue* p = nullptr;
+        for (const auto& [k, v] : req.members)
+            if (k == "private")
+                p = &v;
+        g.private_repo = p && p->k == jvalue::kind::boolean && p->b;
+        if (member(req, "hour"))
+            g.hour = static_cast<int>(num_of(req, "hour"));
+        if (!valid_bucket_name(g.bucket))
+        {
+            app_reply(c, 400, "A library is a bucket name: lowercase letters, digits, dots and dashes, 3 to 63.\n");
+            return;
+        }
+        // A library that is there is one the user may write; one that is not, the first run makes as the user.
+        if (m_store.has_bucket(g.bucket) && !app_allowed(c, "PUT", g.bucket, "x", {}))
+        {
+            app_reply(c, 403, "You may not write to the library " + g.bucket + ".\n");
+            return;
+        }
+        if (const std::string why = m_git.add(g); !why.empty())
+        {
+            app_reply(c, 400, why + "\n");
+            return;
+        }
+        // The first run now rather than at the next hour it is due.
+        const std::string why = m_git.run_now(g.id, *m_auth);
+        arm_sweep();
+        app_reply(c, 200, "{\"id\":" + json_quote(g.id) + ",\"started\":" + (why.empty() ? "true" : "false") +
+                              ",\"why\":" + json_quote(why) + "}",
+                  "application/json");
+        return;
+    }
+    const std::string id = str_of(req, "id");
+    if (!mine(id))
+    {
+        app_reply(c, 404, "No such repository.\n");
+        return;
+    }
+    if (action == "remove")
+    {
+        if (!m_git.remove(id))
+        {
+            app_reply(c, 500, "The repository could not be removed.\n");
+            return;
+        }
+        app_reply(c, 204);
+        return;
+    }
+    if (action == "sync")
+    {
+        if (const std::string why = m_git.run_now(id, *m_auth); !why.empty())
+        {
+            app_reply(c, 409, why + "\n");
+            return;
+        }
+        arm_sweep();
+        app_reply(c, 204);
+        return;
+    }
+    app_reply(c, 400, "The action is add, remove, sync or token.\n");
 }
 
 }   // namespace socketley::storage

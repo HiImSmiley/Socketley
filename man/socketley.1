@@ -825,6 +825,27 @@ socketley daemon stats
 .fi
 .RE
 .TP
+.B git\-sync \-\-url \fIurl\fR \-\-branch \fIname\fR|\fB*\fR \-\-work \fIdir\fR \-\-endpoint \fIhost\fB:\fIport\fR \fR[\fB\-\-tls\fR] \fB\-\-bucket \fIlibrary\fR \fB\-\-name \fIfolder\fR [\fB\-\-keep \fIdays\fB,\fIweeks\fB,\fImonths\fR]
+One run of a repository a storage runtime keeps (see
+.B Git repositories
+under
+.BR "STORAGE FLAGS" ),
+which the runtime starts itself and which runs by hand the same: it fetches
+into the bare clone under
+.IR dir ,
+and when a ref moved writes the branch's files and a bundle into the library at
+.IR host : port
+with the credentials in
+.BR SOCKETLEY_GIT_ACCESS_KEY ,
+.B SOCKETLEY_GIT_SECRET
+and, for temporary ones,
+.BR SOCKETLEY_GIT_SESSION_TOKEN ;
+.B SOCKETLEY_GIT_TOKEN
+is a GitHub token for a private repository. Exit status 0 when it ended well, 2
+when it did not, 3 when a run of the same directory is under way;
+.IR dir /state.json
+says how.
+.TP
 .B acme issue \-\-domains \fIname\fR[\fB,\fIname\fR...] \fR[\fB\-\-cert \fIfile\fR] [\fB\-\-key \fIfile\fR] [\fB\-\-email \fIaddress\fR] [\fB\-\-directory \fIurl\fR] [\fB\-\-challenge http\-01\fR|\fBtls\-alpn\-01\fR|\fBdns\-01\fR]
 A certificate from an ACME CA by hand, as certbot gives one: the account is made
 once per CA and kept in
@@ -10254,6 +10275,62 @@ copied stream where the browser does not play the file), Auto and each
 rendition; a change is made on the same media source, keeping the next six
 seconds already buffered while the new stream's first segment is made.
 .
+.SS Git repositories
+The page's Git keeps repositories in a library: each is fetched once a day, at
+the local hour asked for (3:00 by default), and whenever its user asks, and when
+any ref moved since the last run, the branch's files are written under
+.IB name /
+of the library \(em what changed, or the whole tree the first time, with nothing
+else left beside it \(em and a git bundle of the branch and the tags, or of every
+branch with
+.BR * ,
+under
+.BI _backups/ name / date _ time _ commit .bundle .
+.B "git clone" " file" .bundle
+makes the repository from one, its branch checked out. A run with nothing new
+writes nothing. Every bundle of the last day is kept, and before it the newest
+of each of the last 14 days, 8 weeks and 12 months; the rest are deleted.
+Symbolic links and submodules are no files and are left out.
+.IP
+A run is
+.B socketley git\-sync
+started by the runtime with temporary credentials of the user who added the
+repository, through the runtime's own S3 API on its port: what the user may not
+write it cannot write, quotas and versioning apply, and a library that is not
+there is made as the user. A failed run is tried again an hour later; the first
+shard runs the schedule, one repository at a time, and a run asked for starts
+at once. Each repository's bare clone, the state of its last run and its log are
+under
+.IR dir /.ui/git/ id /,
+and the list is
+.IR dir /.ui/git.json .
+Git must be installed; a runtime on a unix socket has none of this.
+.IP
+A repository is fetched over https://, http:// or git://, never with
+credentials in its URL. A private one is read with the GitHub token the user
+keeps in the page, sent as git's http.extraHeader through its environment, so it
+is on no command line; it is sealed with AES-256-GCM under a key only the user's
+own secret derives, in
+.IR dir /.ui/git\-tokens/,
+and never shown again.
+.IP
+.B GET /~ui/git
+lists the repositories the user keeps (an admin's: all), each with the state its
+last run ended in, and whether the user has a token.
+.B POST /~ui/git
+takes
+.B {"action":"add", "url", "branch", "bucket", "name", "private", "hour"}
+(branch
+.B main
+and library
+.B git
+by default, the folder named after the URL), which also starts the first run,
+.BR {"action":"sync","id"} ,
+.B {"action":"remove","id"}
+(the files and bundles stay) and
+.B {"action":"token","token"}
+(empty removes it). A user adds into a library it may write.
+.
 .SS Durability
 .B \-\-fsync
 decides when a write a client was answered for is on the disk, as a cache's
@@ -15377,6 +15454,24 @@ A PEM file of the roots the ACME CA's own HTTPS is checked against, for a CA
 whose certificate no system store holds, as Pebble's. Default: the system's roots.
 .IP
 Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_GIT_ACCESS_KEY
+The access key
+.B git\-sync
+writes into a library with; a storage runtime that starts it gives it temporary
+credentials of the user the repository is kept for.
+.TP
+.B SOCKETLEY_GIT_SECRET
+That key's secret.
+.TP
+.B SOCKETLEY_GIT_SESSION_TOKEN
+The session token of temporary credentials, sent as x-amz-security-token.
+.TP
+.B SOCKETLEY_GIT_TOKEN
+A GitHub token
+.B git\-sync
+reads a private repository with, given to git as an http.extraHeader in its
+environment, never on a command line.
 .TP
 .B SOCKETLEY_FFMPEG
 The ffmpeg a storage runtime makes thumbnails and streams with, under
