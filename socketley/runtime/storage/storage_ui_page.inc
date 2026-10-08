@@ -112,6 +112,8 @@ select.inp{padding-right:34px;appearance:none;-webkit-appearance:none;cursor:poi
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239aa2b8' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7 10 5 5 5-5'/%3E%3C/svg%3E");
   background-position:right 10px center;background-size:16px 16px;background-repeat:no-repeat}
 select.inp option{background:#151821}
+.inp.sm{height:32px}
+select.inp.sm{line-height:30px}
 
 /* hero */
 .hero{position:relative;margin:0 -24px 8px;padding:56px 24px 30px;overflow:hidden;min-height:210px;display:flex;flex-direction:column;justify-content:flex-end}
@@ -1605,14 +1607,15 @@ function gitDlg() {
   const url = el('input', { class: 'inp', placeholder: 'https://github.com/you/repo', spellcheck: 'false', autocomplete: 'off' });
   const branch = el('input', { class: 'inp', value: 'main', spellcheck: 'false', title: 'A branch, or * for every branch' });
   const lib = el('input', { class: 'inp', value: 'git', spellcheck: 'false' });
-  const name = el('input', { class: 'inp', placeholder: 'from the URL', spellcheck: 'false' });
+  const name = el('input', { class: 'inp', placeholder: 'the repository’s', spellcheck: 'false', title: 'Left empty, the repository’s own name' });
   const EVERY = [['never', 'Never'], ['day', 'Day'], ['week', 'Week'], ['month', 'Month']];
   const everySel = v => { const e = el('select', { class: 'inp' }, ...EVERY.map(([k, t]) => el('option', { value: k, text: t }))); e.value = v; return e; };
   const every = everySel('never');
   // Where a repository's files and backups go, said as it is typed.
-  const repoName = () => name.value.trim() || ((url.value.trim().replace(/\/+$/, '').split('/').pop() || '').replace(/\.git$/, '').replace(/[^A-Za-z0-9._-]/g, '-').replace(/^[.-]+/, '')) || '…';
+  const fromUrl = () => (url.value.trim().replace(/\/+$/, '').split('/').pop() || '').replace(/\.git$/, '').replace(/[^A-Za-z0-9._-]/g, '-').replace(/^[.-]+/, '');
+  const repoName = () => name.value.trim() || fromUrl() || '…';
   const where = el('div', { class: 'mut', style: 'font-size:12.5px;margin-top:6px' });
-  const paintWhere = () => { const l = lib.value.trim() || 'git', n = repoName(); where.textContent = 'Files go to ' + l + '/' + n + '/ and backups to ' + l + '/_backups/' + n + '/'; };
+  const paintWhere = () => { name.placeholder = fromUrl() || 'the repository’s'; const l = lib.value.trim() || 'git', n = repoName(); where.textContent = 'Files go to ' + l + '/' + n + '/ and backups to ' + l + '/_backups/' + n + '/'; };
   [url, lib, name].forEach(i => i.addEventListener('input', paintWhere));
   paintWhere();
   const priv = el('input', { type: 'checkbox' });
@@ -1632,7 +1635,7 @@ function gitDlg() {
   const setTok = async v => { try { await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'token', token: v }) })); tok.value = ''; toast(v ? 'Token kept' : 'Token removed'); fill(); } catch (e) { fail(e); } };
   const T = el('table', { class: 'mtbl' });
   const form = el('div', {},
-    el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end' }, field('Repository URL', url), field('Branch', branch), field('Library', lib), field('Name', name), field('Pull every', every)),
+    el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end' }, field('Repository URL', url), field('Branch', branch), field('Library', lib), field('Name (optional)', name), field('Pull every', every)),
     where,
     el('div', { style: 'display:flex;gap:10px;align-items:center;margin:10px 0 18px' }, el('label', { class: 'chk' }, priv, ' Private (uses your GitHub token)'), el('span', { style: 'flex:1' }), btn('plus', 'Add repository', add, 'pri')));
   const acct = el('div', { style: 'margin-top:20px' }, el('h4', { text: 'Your GitHub token', style: 'margin:0 0 6px' }),
@@ -1661,7 +1664,7 @@ function gitDlg() {
           el('div', { class: 'mut', style: 'font-size:12px;word-break:break-all', text: r.url + (r.private ? ' · private' : '') + (g.repos.some(x => x.owner !== r.owner) ? ' · ' + r.owner : '') })),
         el('td', { class: 'mut', text: r.branch === '*' ? 'all' : r.branch }),
         el('td', {}, (() => {
-          const e = everySel(r.every); e.style.height = '32px';
+          const e = everySel(r.every); e.classList.add('sm');
           e.onchange = async () => { try { await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'every', id: r.id, every: e.value }) })); toast(e.value === 'never' ? r.name + ' is pulled only when you ask' : r.name + ' is pulled every ' + e.value); } catch (x) { fail(x); fill(); } };
           return e;
         })()),
@@ -1701,7 +1704,7 @@ function accessDlg(lib) {
     T.append(el('tr', {}, el('td', { class: 'w' }, el('b', { text: a.owner || 'you' })), el('td', { class: 'mut', text: 'Owner' }), el('td')));
     if (!a.grants.length) T.append(el('tr', {}, el('td', { class: 'mut', colspan: '3', text: 'Nobody else has access yet.' })));
     for (const g of a.grants) {
-      const sel = el('select', { class: 'inp', style: 'height:32px' }, el('option', { value: 'read', text: 'Can view' }), el('option', { value: 'write', text: 'Can edit' }));
+      const sel = el('select', { class: 'inp sm' }, el('option', { value: 'read', text: 'Can view' }), el('option', { value: 'write', text: 'Can edit' }));
       sel.value = g.access; sel.onchange = () => set(g.user, sel.value);
       T.append(el('tr', {}, el('td', { class: 'w', text: g.user }), el('td', {}, sel), el('td', { class: 'r' }, btn(null, 'Remove', () => set(g.user, 'none'), 'sm bad'))));
     }
