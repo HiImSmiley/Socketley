@@ -1958,8 +1958,10 @@ bool proxy_instance::setup(event_loop& loop)
     }
     m_splice_enabled = m_splice_supported && splice_opt_in();
 
-    // Pre-build prefix once to avoid per-request allocation
-    m_prefix = "/" + std::string(get_name()) + "/";
+    // Pre-build prefix once to avoid per-request allocation; a proxy with
+    // --domain is reached by its name instead, and passes the path on as it came.
+    m_prefix = get_domains().empty() ? "/" + std::string(get_name()) + "/" : std::string();
+    m_auth.configure(m_auth_spec, get_name());
 
     if (!listen_path.empty())
     {
@@ -3739,6 +3741,14 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
             return;
         }
 
+        if (SOCKETLEY_UNLIKELY(m_https_redirect != 0))
+        {
+            answer_https_redirect(conn);
+            return;
+        }
+        if (SOCKETLEY_UNLIKELY(m_auth.enabled()) && !auth_admits(conn))
+            return;
+
         // An entrance routes by name and passes the path on as it came; any
         // other proxy is reached under its own prefix and strips it.
         std::string_view new_path;
@@ -3748,6 +3758,8 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
                 return;
             new_path = conn->path;
         }
+        else if (m_prefix.empty())
+            new_path = conn->path;
         else
         {
             // Check path prefix (m_prefix = "/<name>/", strip trailing slash for bare match)
@@ -3866,6 +3878,11 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
             if (!chunked)
                 conn->body_remaining -= n;
             conn->partial.erase(0, n);
+            // The backend owes its first byte once the request is in, so while
+            // the body still arrives the wait runs from its latest bytes: from
+            // the connect, an upload longer than --backend-timeout was 504.
+            if (conn->awaiting_response && !conn->response_started)
+                arm_response_deadline(conn);
         }
         // Whatever is still buffered is the next request, which waits for this
         // one's response and is then parsed from the top.
@@ -4221,23 +4238,28 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     }
 
     // A client that asked to close is told close, where a pooled backend says
-    // keep-alive -- when the whole final head came in this first read, which it
-    // does for any head that fits one; a split one is forwarded as it came.
+    // keep-alive, and an entrance speaking TLS tells browsers to come back over
+    // it alone (HSTS) -- when the whole final head came in this first read,
+    // which it does for any head that fits one; a split one is forwarded as it
+    // came.
     std::string closing_head;
     if (m_protocol == protocol_http && first_bytes && conn->http_frame.headers_parsed &&
         conn->http_frame.interim_blocks == 0 && !conn->http_frame.switched_protocols &&
         conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
     {
         const auto& ce = m_conn_idx[conn->client_fd];
-        if (ce.side == conn_client && (ce.client->client_conn_close || ce.client->client_eof))
+        const bool closing = ce.side == conn_client && (ce.client->client_conn_close || ce.client->client_eof);
+        const bool hsts = m_entrance && get_tls();
+        const std::string_view chunk{data_ptr, forward_len};
+        const size_t end = closing || hsts ? chunk.find("\r\n\r\n") : std::string_view::npos;
+        if (end != std::string_view::npos)
         {
-            const std::string_view chunk{data_ptr, forward_len};
-            const size_t end = chunk.find("\r\n\r\n");
-            if (end != std::string_view::npos)
-            {
-                closing_head = http_head_saying_close(chunk.substr(0, end + 4));
-                closing_head.append(chunk.substr(end + 4));
-            }
+            closing_head = closing ? http_head_saying_close(chunk.substr(0, end + 4))
+                                   : std::string(chunk.substr(0, end + 4));
+            if (hsts)
+                closing_head = http_head_adding(closing_head, "strict-transport-security",
+                                                "Strict-Transport-Security: max-age=31536000");
+            closing_head.append(chunk.substr(end + 4));
         }
     }
 
@@ -4411,8 +4433,9 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     conn->declared_body_chunked = scan.transfer_encoding;
 
     // An entrance routes by the name asked for, so it reads it here, with the
-    // Via fields a request that came round again would carry.
-    if (m_entrance)
+    // Via fields a request that came round again would carry; so does
+    // --redirect-https, which sends the client to that name.
+    if (m_entrance || m_https_redirect)
     {
         conn->host.clear();
         conn->host_fields = 0;
@@ -4489,8 +4512,9 @@ bool proxy_instance::append_backend_host_header(std::string& out,
                                                 const proxy_client_connection* conn) const
 {
     // An entrance's runtimes are told the name the client asked for, which is
-    // how a storage runtime finds the bucket and a site its own name.
-    if (m_entrance)
+    // how a storage runtime finds the bucket and a site its own name; so is
+    // the backend of a proxy with --domain, whose name it is.
+    if (m_entrance || m_prefix.empty())
         return false;
 
     std::string_view host;
@@ -4520,6 +4544,85 @@ bool proxy_instance::append_backend_host_header(std::string& out,
     out.append(port_buf, static_cast<size_t>(pend - port_buf));
     out += "\r\n";
     return true;
+}
+
+// Whether a peer is on this machine: a loopback address, or none for a unix socket.
+static bool local_peer(std::string_view ip)
+{
+    return ip.empty() || ip.starts_with("127.") || ip == "::1" || ip.starts_with("::ffff:127.");
+}
+
+// The value of header `lower` in a request's head, with how many times it came.
+static std::string_view request_field(std::string_view head, std::string_view lower, int& count)
+{
+    count = 0;
+    std::string_view value;
+    for (size_t p = head.find("\r\n"); p != std::string_view::npos && p + 2 < head.size();)
+    {
+        const size_t start = p + 2;
+        size_t nl = head.find("\r\n", start);
+        if (nl == std::string_view::npos)
+            nl = head.size();
+        const std::string_view line = head.substr(start, nl - start);
+        if (line.empty())
+            break;
+        if (line.size() > lower.size() && line[lower.size()] == ':' &&
+            std::equal(lower.begin(), lower.end(), line.begin(), [](char a, char b) { return a == (b | 0x20); }))
+        {
+            ++count;
+            value = http_trim_ows(line.substr(lower.size() + 1));
+        }
+        p = nl;
+    }
+    return value;
+}
+
+bool proxy_instance::auth_admits(proxy_client_connection* conn)
+{
+    const size_t end = conn->partial.find("\r\n\r\n");
+    const std::string_view head(conn->partial.data(), end == std::string::npos ? conn->partial.size() : end + 2);
+    int fields = 0;
+    const std::string_view authorization = request_field(head, "authorization", fields);
+    // Behind the entrance, a hop on this machine, the client is who it says it heard from last.
+    if (conn->peer_addr.empty() && conn->fd >= 0)
+        conn->peer_addr = peer_ip(conn->fd);
+    std::string client = conn->peer_addr;
+    if (local_peer(client))
+    {
+        int xff_fields = 0;
+        std::string_view xff = request_field(head, "x-forwarded-for", xff_fields);
+        if (const size_t comma = xff.rfind(','); comma != std::string_view::npos)
+            xff.remove_prefix(comma + 1);
+        if (xff_fields == 1 && !http_trim_ows(xff).empty())
+            client.assign(http_trim_ows(xff));
+    }
+    if (client.empty())
+        client = "local";
+    int64_t retry_after = 0;
+    const auto v = m_auth.check(fields > 1 ? std::string_view("-") : authorization, client, retry_after);
+    if (v == proxy_auth::verdict::pass)
+        return true;
+    if (v == proxy_auth::verdict::barred)
+        send_error(conn, "429 Too Many Requests", "Too many failed authorizations from this address; try again later.\n",
+                   true, "Retry-After: " + std::to_string(retry_after) + "\r\n");
+    else
+        send_error(conn, "401 Unauthorized", "Unauthorized\n", true, m_auth.challenge());
+    return false;
+}
+
+void proxy_instance::answer_https_redirect(proxy_client_connection* conn)
+{
+    if (conn->host_fields != 1 || conn->host.empty())
+    {
+        send_error(conn, "400 Bad Request", "Bad Request: one Host is needed, and it names where the request goes\n");
+        return;
+    }
+    std::string location = "Location: https://" + conn->host;
+    if (m_https_redirect != 443)
+        location += ":" + std::to_string(m_https_redirect);
+    location += conn->path.starts_with('/') ? conn->path : "/";
+    location += "\r\n";
+    send_error(conn, "308 Permanent Redirect", "", true, location);
 }
 
 // The path the backend is given, written once for the forwarding site and
@@ -4617,6 +4720,10 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
 
     bool host_written = false;
     bool client_keep_alive = false;
+    if (conn->peer_addr.empty() && conn->fd >= 0)
+        conn->peer_addr = peer_ip(conn->fd);
+    const bool forwarded_trusted = m_prefix.empty() && !m_entrance && local_peer(conn->peer_addr);
+    bool kept_proto = false, kept_host = false;
     std::string prior_forwarded_for;
     std::string_view client_host;
     size_t h_pos = 0;
@@ -4654,6 +4761,9 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
                  header_name_equals(hdr_line, "proxy-authorization", 19) ||
                  header_name_equals(hdr_line, "te", 2) ||
                  header_name_equals(hdr_line, "trailer", 7))
+            skip = true;
+        // The credentials --auth took were this proxy's to see, not the backend's.
+        else if (m_auth.enabled() && header_name_equals(hdr_line, "authorization", 13))
             skip = true;
         // Transfer-Encoding is deliberately not on this list, because this
         // proxy forwards the body byte for byte and removing the header would
@@ -4720,6 +4830,17 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         if (header_name_equals(hdr_line, "x-forwarded-proto", 17) ||
             header_name_equals(hdr_line, "x-forwarded-host", 16))
         {
+            // Except from the entrance in front of a proxy with --domain, a
+            // hop on this machine, which knows the scheme and this one does not.
+            if (forwarded_trusted)
+            {
+                if (header_name_equals(hdr_line, "x-forwarded-proto", 17))
+                    kept_proto = true;
+                else
+                    kept_host = true;
+                result += hdr_line;
+                result += "\r\n";
+            }
             h_pos = nl + 2;
             continue;
         }
@@ -4760,8 +4881,6 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
             if (http_token_equals(n, lower, len)) return true;
         return false;
     };
-    if (conn->peer_addr.empty() && conn->fd >= 0)
-        conn->peer_addr = peer_ip(conn->fd);
     if (!filter_set("x-forwarded-for", 15) &&
         (!prior_forwarded_for.empty() || !conn->peer_addr.empty()))
     {
@@ -4772,9 +4891,9 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         result += conn->peer_addr;
         result += "\r\n";
     }
-    if (!filter_set("x-forwarded-proto", 17))
+    if (!kept_proto && !filter_set("x-forwarded-proto", 17))
         result += get_tls() ? "X-Forwarded-Proto: https\r\n" : "X-Forwarded-Proto: http\r\n";
-    if (!client_host.empty() && !filter_set("x-forwarded-host", 16))
+    if (!kept_host && !client_host.empty() && !filter_set("x-forwarded-host", 16))
     {
         result += "X-Forwarded-Host: ";
         result.append(client_host.data(), client_host.size());
@@ -5505,12 +5624,9 @@ void proxy_instance::entrance_certify()
         names.push_back("*." + z);
     }
     const auto add = [&](const std::string& n) {
-        // A name in one of the zones is covered by its wildcard when it is one
-        // label below the zone; anything deeper is asked for by itself.
-        for (const auto& z : m_entrance_zones)
-            if (n == z || (under(n, z) && !n.starts_with("*.") &&
-                           n.find('.') == n.size() - z.size() - 1))
-                return;
+        // Every name is asked for, those the zone's wildcard covers too, so a
+        // zone not yet delegated here still has them proven one by one;
+        // `acme issue` leaves out what a wildcard it is given holds.
         const bool in_zone = std::any_of(m_entrance_zones.begin(), m_entrance_zones.end(),
                                          [&](const std::string& z) { return under(n, z); });
         // Outside the zones a name is proven on this listener (TLS-ALPN-01),
@@ -10033,10 +10149,21 @@ bool proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
 }
 
 void proxy_instance::send_error(proxy_client_connection* conn, std::string_view status, std::string_view body,
-                                bool drain)
+                                bool drain, std::string_view extra)
 {
     if (!m_loop || conn->closing)
         return;
+
+    if (!extra.empty())
+    {
+        std::string response = "HTTP/1.1 " + std::string(status) + "\r\nContent-Length: " +
+                               std::to_string(body.size()) + "\r\n";
+        response += extra;
+        response += "Connection: close\r\n\r\n";
+        response += body;
+        queue_final_response(conn, std::move(response), drain);
+        return;
+    }
 
     // Build response in a stack buffer when possible
     // Layout: "HTTP/1.1 " (9) + status + "\r\nContent-Length: " (18) + digits (max 20) + trailer (23) = ~70 + status

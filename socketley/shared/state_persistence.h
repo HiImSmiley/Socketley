@@ -138,6 +138,9 @@ struct runtime_config
     std::string mesh_client_ca;
     std::string mesh_client_cert;
     std::string mesh_client_key;
+    // --auth and --redirect-https.
+    std::string proxy_auth;
+    uint16_t https_redirect = 0;
 
     // Cache
     std::string persistent_path;

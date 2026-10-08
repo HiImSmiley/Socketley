@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The entrance replaces a web server in front of everything.** A proxy with
+  `--domain` is reached by its name through the entrance and serves under no
+  `/<name>/` prefix: the path and the Host go to its backend as they came, and
+  `X-Forwarded-Proto`/`-Host` from the entrance, a hop on this machine, are
+  kept. `--auth bearer:<file>` and `--auth basic:<credentials file>` (the keys of
+  a storage runtime's admins) answer 401 without the right answer, never pass
+  the credentials on, and answer an address that failed five times in fifteen
+  minutes 429 with `Retry-After` -- behind the entrance, the address it heard
+  from. `--redirect-https [port]` answers 308 to the same URL over HTTPS, and a
+  dns runtime whose entrance is on 443 makes one on port 80 beside it. The
+  entrance over TLS adds `Strict-Transport-Security: max-age=31536000` where the
+  runtime answering set none. Its certificate no longer waits for the
+  delegation: `acme issue` asks the resolver for a TXT record only this
+  daemon's dns runtime serves (`SOCKETLEY_ACME_DNS_PROBE` names another, or
+  `off`), and a zone not delegated here yet has its names proven one by one
+  over TLS-ALPN-01, the wildcard asked for again every six hours; asked again
+  for what the certificate already holds, it does not trouble the CA. A zone
+  file `--zone <name>` writes gives the zone's own name the entrance's address.
+  The dashboard serves a request carrying `Via`, which no page can set, whatever
+  its Host, and its pages are never framed, sniffed, cached or named in a
+  Referer.
+
 - **DNS: the names runtimes are reached by, published; wildcard certificates over
   DNS-01.** Every runtime takes `--domain name[,name]` (a storage runtime its own,
   which also names its buckets' virtual hosts). The daemon writes those names and
@@ -492,6 +514,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `self.route()` reach a runtime in another process. Despite the name neither
   hands a descriptor over — the origin keeps the socket and relays.
 ### Fixed
+
+- **Storage behind a proxy counted every client as the proxy.** Failed sign-ins,
+  `aws:SourceIp` and the access log read the socket's peer, so behind Apache or
+  the entrance one guesser locked everybody out of the web interface and an IP
+  condition could not tell clients apart. A connection from a proxy
+  `--tls-offloaded` names now takes the client from the last address that proxy
+  put in `X-Forwarded-For`, per request.
+
+- **TLS listeners offered CBC and SHA-1 suites over TLS 1.2 and resumed from
+  tickets.** A listener now offers Mozilla's intermediate list (ECDHE with AEAD
+  only) and resumes from its session cache, so a ticket key that lives as long
+  as the process cannot open the sessions it sealed.
 
 - **`stop` then `start` of a server, cache or storage runtime could leave it with
   no node beside its port.** The stopped worker's destructor unlinked the node

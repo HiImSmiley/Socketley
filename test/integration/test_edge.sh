@@ -120,6 +120,7 @@ for _ in $(seq 1 40); do [ -n "$(dz zed.example SOA)" ] && break; sleep 0.2; don
 expect "it answers the zone's SOA" "$(dz zed.example SOA | cut -d' ' -f1-2)" "ns1.zed.example. hostmaster.zed.example."
 expect "and names ns1 and ns2 as its servers" "$(dz zed.example NS | sort | tr '\n' ' ')" "ns1.zed.example. ns2.zed.example. "
 expect "with --publish's address" "$(dz ns2.zed.example A)" "198.51.100.9"
+expect "and the zone's own name, which the entrance answers for" "$(dz zed.example A)" "198.51.100.9"
 echo 'www  A  192.0.2.80' >> "$zf"
 for _ in $(seq 1 40); do got=$(dz www.zed.example A); [ -n "$got" ] && break; sleep 0.2; done
 expect "the file is the user's to edit, and read again" "$got" "192.0.2.80"

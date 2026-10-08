@@ -48,6 +48,8 @@ constexpr auto renew_every  = std::chrono::seconds(60);
 // A certificate with less than this left is renewed, as Let's Encrypt advises for its 90 days.
 constexpr int64_t renew_before_s = 30 * 86400;
 constexpr auto backoff_first = std::chrono::seconds(60);
+// How long a certificate issued without a wildcard whose zone was not delegated yet waits to ask again.
+constexpr auto partial_again = std::chrono::hours(6);
 constexpr auto backoff_most  = std::chrono::hours(6);
 
 struct file_sig
@@ -235,7 +237,9 @@ void look_after(acme_state& a, clock::time_point now)
         if (r == 0)
             return;
         a.pid = -1;
-        if (r == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        // 3 is issued without the wildcards of a zone not yet delegated here, asked again after a while.
+        const bool partial = r != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 3;
+        if (!partial && (r == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0))
         {
             LOG_ERROR(("acme: issuing for " + a.domains.front() + " failed, tried again in " +
                        std::to_string(std::chrono::duration_cast<std::chrono::seconds>(a.backoff).count()) + "s: " +
@@ -247,6 +251,8 @@ void look_after(acme_state& a, clock::time_point now)
         // Issued: the files are taken up at the next look, which is now.
         write_file(a.cert + ".names", a.issuing, 0644);
         a.backoff = backoff_first;
+        if (partial)
+            a.next_try = now + partial_again;
         g_next_watch = now;
         return;
     }
@@ -260,7 +266,8 @@ void look_after(acme_state& a, clock::time_point now)
         std::ifstream f(a.cert + ".names");
         std::stringstream was;
         was << f.rdbuf();
-        if (!f || was.str() == names_of(a))
+        struct stat partial{};
+        if ((!f || was.str() == names_of(a)) && ::stat((a.cert + ".partial").c_str(), &partial) != 0)
             return;
     }
     spawn_issue(a);

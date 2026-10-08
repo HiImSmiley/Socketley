@@ -94,6 +94,8 @@ constexpr config_key config_keys[] = {
     { "client_cert",        "--client-cert",        key_kind::text    },
     { "client_key",         "--client-key",         key_kind::text    },
     { "sidecar",            "--sidecar",            key_kind::boolean },
+    { "auth",               "--auth",               key_kind::text    },
+    { "redirect_https",     "--redirect-https",     key_kind::integer },
 
     // ── Cache ───────────────────────────────────────────────────────────────
     { "persistent",         "--persistent",         key_kind::text    },

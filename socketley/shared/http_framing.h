@@ -969,6 +969,26 @@ inline std::string http_head_saying_close(std::string_view head)
     return out;
 }
 
+// A response head with `field` ("Name: value") added before its blank line,
+// unless a field named `lower_name` is there already; `head` ends with its
+// blank line.
+inline std::string http_head_adding(std::string_view head, std::string_view lower_name, std::string_view field)
+{
+    for (size_t pos = head.find("\r\n"); pos != std::string_view::npos && pos + 2 < head.size();
+         pos = head.find("\r\n", pos + 2))
+    {
+        const std::string_view line = head.substr(pos + 2, lower_name.size() + 1);
+        if (line.size() == lower_name.size() + 1 && line.back() == ':' &&
+            std::equal(lower_name.begin(), lower_name.end(), line.begin(),
+                       [](char a, char b) { return a == (b | 0x20); }))
+            return std::string(head);
+    }
+    std::string out(head.substr(0, head.size() - 2));
+    out.append(field);
+    out.append("\r\n\r\n");
+    return out;
+}
+
 // Has this backend delivered a response whose end this proxy can point at,
 // asked by both halves of the pooling decision so no teardown path reaches the
 // pool without asking.

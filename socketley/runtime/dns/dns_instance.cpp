@@ -1420,7 +1420,8 @@ bool dns_instance::ensure_zone_files(std::string& why) const
                            "@    SOA  ns1 hostmaster " + serial + " 1h 15m 1w 300\n"
                            "     NS   ns1\n"
                            "     NS   ns2\n";
-        for (const char* ns : {"ns1", "ns2"})
+        // The zone's own name too, which the entrance answers for as it does the names beneath it.
+        for (const char* ns : {"@  ", "ns1", "ns2"})
         {
             char buf[INET6_ADDRSTRLEN];
             for (const auto& a : v4)

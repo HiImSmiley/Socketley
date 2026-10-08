@@ -1775,6 +1775,37 @@ int daemon_handler::make_dns_entrance(dns_instance* dns, bool start)
     }
     if (proxy.empty())
         proxy = std::string(dns->get_name()) + "-proxy";
+    const auto drop = [&](const std::string& name)
+    {
+        m_manager.stop(name, m_loop);
+        reconcile_proxy_workers();
+        m_manager.remove(name);
+        if (m_persistence)
+            m_persistence->remove_runtime(name);
+    };
+    // Made by this create, as the dns runtime's child: stopped with it, started with it, removed with it.
+    const auto make = [&](const std::string& name, std::vector<std::string> words, const char* what) -> bool
+    {
+        if (start)
+            words.emplace_back("-s");
+        std::string out;
+        const int rc = run_internal(words, out, false);
+        auto* made = m_manager.get(name);
+        if (rc != 0 || !made)
+        {
+            std::cout << out << what << " '" << name << "' could not be made"
+                      << (made ? "" : "; give --proxy another name, --proxy-port another port, or --proxy none") << "\n";
+            if (made)
+                drop(name);
+            return false;
+        }
+        made->set_owner(dns->get_name());
+        made->set_child_policy(runtime_instance::child_policy::stop);
+        if (m_persistence)
+            m_persistence->save_runtime(made);
+        return true;
+    };
+    bool made_entrance = false;
     if (auto* there = m_manager.get(proxy))
     {
         // One made before, or by hand: taken as it is, provided it is an entrance.
@@ -1784,34 +1815,24 @@ int daemon_handler::make_dns_entrance(dns_instance* dns, bool start)
                       << "--backend); name another, or none\n";
             return 1;
         }
-        dns->set_proxy(proxy);
-        return 0;
     }
-    std::vector<std::string> words = {"create", "proxy", proxy, "-p", std::to_string(dns->get_proxy_port()), "--tls"};
-    if (start)
-        words.emplace_back("-s");
-    std::string out;
-    const int rc = run_internal(words, out, false);
-    auto* made = m_manager.get(proxy);
-    if (rc != 0 || !made)
+    // Five minutes for a runtime's first byte, as a web server in front of sites gives them; two seconds is a mesh's.
+    else if (!make(proxy, {"create", "proxy", proxy, "-p", std::to_string(dns->get_proxy_port()), "--tls",
+                           "--backend-timeout", "5m"},
+                   "the entrance"))
+        return 1;
+    else
+        made_entrance = true;
+    // An entrance made on 443 comes with port 80, where a browser typing the bare name arrives and is sent to
+    // HTTPS; one taken as it is comes as it is.
+    const std::string http = proxy + "-http";
+    if (made_entrance && dns->get_proxy_port() == 443 && !m_manager.get(http) &&
+        !make(http, {"create", "proxy", http, "-p", "80", "--redirect-https"}, "the redirect to HTTPS"))
     {
-        std::cout << out << "the entrance '" << proxy << "' could not be made"
-                  << (made ? "" : "; give --proxy another name, --proxy-port another port, or --proxy none") << "\n";
-        if (made)
-        {
-            m_manager.stop(proxy, m_loop);
-            reconcile_proxy_workers();
-            m_manager.remove(proxy);
-            if (m_persistence)
-                m_persistence->remove_runtime(proxy);
-        }
+        if (made_entrance)
+            drop(proxy);
         return 1;
     }
-    // Its child: stopped with it, started with it, removed with it.
-    made->set_owner(dns->get_name());
-    made->set_child_policy(runtime_instance::child_policy::stop);
-    if (m_persistence)
-        m_persistence->save_runtime(made);
     dns->set_proxy(proxy);
     return 0;
 }
@@ -2077,7 +2098,9 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
             {
                 std::shared_lock lock(m_manager.mutex);
                 for (const auto& [other, rt] : m_manager.list())
-                    if (rt->get_type() == runtime_dns && static_cast<const dns_instance*>(rt.get())->get_proxy() == child &&
+                    if (rt->get_type() == runtime_dns &&
+                        (static_cast<const dns_instance*>(rt.get())->get_proxy() == child ||
+                         std::string(static_cast<const dns_instance*>(rt.get())->get_proxy()) + "-http" == child) &&
                         std::find(names.begin(), names.end(), other) == names.end())
                     {
                         heir = other;
@@ -3748,7 +3771,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                     break;
                 case runtime_proxy:
                     result = parse_proxy_edit_flags(
-                        static_cast<proxy_instance*>(instance), pa, i);
+                        static_cast<proxy_instance*>(instance), pa, i, is_running);
                     break;
                 case runtime_cache:
                     // There is no parse_cache_edit_flags, so cache flags fall

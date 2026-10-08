@@ -61,6 +61,10 @@ void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
         prx.set_mesh_client_cert(cfg.mesh_client_cert);
     if (want("mesh_client_key", !cfg.mesh_client_key.empty()))
         prx.set_mesh_client_key(cfg.mesh_client_key);
+    if (want("auth", !cfg.proxy_auth.empty()))
+        prx.set_auth(cfg.proxy_auth);
+    if (want("redirect_https", cfg.https_redirect != 0))
+        prx.set_https_redirect(cfg.https_redirect);
 }
 
 void apply_cache_config(cache_instance& cache, const runtime_config& cfg, bool by_presence)

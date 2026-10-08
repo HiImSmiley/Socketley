@@ -768,6 +768,8 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.mesh_client_ca = mesh.client_ca;
             cfg.mesh_client_cert = mesh.client_cert;
             cfg.mesh_client_key = mesh.client_key;
+            cfg.proxy_auth = prx->get_auth();
+            cfg.https_redirect = prx->get_https_redirect();
             break;
         }
         case runtime_cache:
@@ -1042,6 +1044,10 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_int_field("health_interval", cfg.health_interval);
             if (!cfg.health_path.empty() && cfg.health_path != "/health")
                 append_str_field("health_path", cfg.health_path);
+            if (!cfg.proxy_auth.empty())
+                append_str_field("auth", cfg.proxy_auth);
+            if (cfg.https_redirect != 0)
+                append_int_field("redirect_https", cfg.https_redirect);
             if (cfg.health_threshold != 3)
                 append_int_field("health_threshold", cfg.health_threshold);
             if (cfg.circuit_threshold != 5)
@@ -1266,6 +1272,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.health_check = static_cast<uint8_t>(json_get_int(json, "health_check"));
             { auto v = json_get_int(json, "health_interval"); if (v > 0) cfg.health_interval = v; }
             { auto s = json_get_string(json, "health_path"); if (!s.empty()) cfg.health_path = s; }
+            cfg.proxy_auth = json_get_string(json, "auth");
+            { auto v = json_get_int(json, "redirect_https"); if (v > 0 && v <= 65535) cfg.https_redirect = static_cast<uint16_t>(v); }
             { auto v = json_get_int(json, "health_threshold"); if (v > 0) cfg.health_threshold = v; }
             { auto v = json_get_int(json, "circuit_threshold"); if (v > 0) cfg.circuit_threshold = v; }
             { auto v = json_get_int(json, "circuit_timeout"); if (v > 0) cfg.circuit_timeout = v; }

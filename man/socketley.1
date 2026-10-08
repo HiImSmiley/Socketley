@@ -1431,7 +1431,17 @@ Print the URL of the built-in web dashboard. Requires
 to be set in the daemon configuration file (see
 .BR "Daemon Configuration" ).
 The dashboard provides a live-updating view of all runtimes, connections,
-and throughput. Example output:
+and throughput. It listens on loopback and answers a Host other than this
+machine's 403, so a page whose name was rebound to 127.0.0.1 reads nothing; a
+request that carries
+.BR Via ,
+which no page can set, is a proxy's and is served whatever its Host, so a proxy
+with
+.B \-\-domain
+and
+.B \-\-auth
+can put it on the internet. Its pages are never framed, sniffed, cached or
+named in a Referer. Example output:
 .nf
 Dashboard: http://localhost:9100/
 .fi
@@ -2245,6 +2255,11 @@ one read back out of the certificate that arrived. TLS 1.2 is the minimum
 version. There is deliberately no skip-verify option: a TLS client that does
 not verify buys encryption against an eavesdropper and nothing at all against
 somebody in the path, while reporting itself as encrypted either way.
+.PP
+A listener speaks TLS 1.2 and 1.3. Over 1.2 it offers only ECDHE key exchange
+with AEAD ciphers, Mozilla's intermediate list, and it resumes a session from
+its own cache rather than from a ticket, whose key lives as long as the process
+and would open every session it ever sealed to whoever learned it.
 .PP
 Trust stores are read when the runtime starts, and a listener's certificate and
 key are looked at again every two seconds: replaced on disk \(em by
@@ -3882,6 +3897,78 @@ work through a proxy in http mode. See
 under
 .BR LIMITATIONS
 for what the proxy does and does not do with such a connection.
+.TP
+.BI \-\-domain " name" [, name ...]
+On a proxy, the names it is reached by through the entrance (see
+.B \-\-proxy
+under
+.BR "DNS FLAGS" ).
+Reached by name, it serves under no
+.BI / name /
+prefix: the path and the Host go to the backend as they came, as a site behind
+it expects them. From a hop on this machine \(em the entrance in front of it \(em
+.B X\-Forwarded\-Proto
+and
+.B X\-Forwarded\-Host
+are kept rather than written over, so the backend is told the scheme the client
+used, not the cleartext hop between them.
+.IP
+.nf
+socketley create proxy hub \-p 8089 \-\-bind 127.0.0.1 \\
+    \-\-backend 127.0.0.1:8088 \-\-domain hub \-\-backend\-timeout 5m \-s
+.fi
+.TP
+.BI \-\-auth " bearer:file\fR|\fBbasic:\fIfile\fR|\fBnone"
+Who may send a request through, asked before any of it reaches a backend.
+.B bearer:
+admits
+.BI "Authorization: Bearer " token
+with a token that is a line of
+.I file
+(blank lines and lines starting with # aside).
+.B basic:
+admits HTTP Basic with an access key and its secret key from
+.IR file ,
+a credentials file as a storage runtime's
+.B \-\-credentials
+reads it, of a user who is an admin there; a key outside any
+.B [user]
+is the default owner's, an admin. A request without them is answered
+.B 401
+with the
+.B WWW\-Authenticate
+to answer in, and the backend is never sent the
+.B Authorization
+field. The file is read again when it changes, at most once a second; one that
+is gone or does not parse refuses everybody, and says so in the log. An address
+that fails five times within fifteen minutes is refused even the right answer,
+.B 429
+with
+.BR Retry\-After ,
+until fifteen minutes after its first failure, an IPv6 address by its /64;
+behind the entrance, a hop on this machine, the address is the last in
+.BR X\-Forwarded\-For ,
+the one the entrance heard from. Each failure is logged with that address.
+Set at
+.BR create ;
+.B edit
+changes it on a stopped proxy.
+.IP
+.nf
+socketley create proxy metrics \-p 9191 \-\-bind 127.0.0.1 \\
+    \-\-backend 127.0.0.1:9190 \-\-domain metrics \\
+    \-\-auth basic:/etc/socketley/storage\-ui.creds \-s
+.fi
+.TP
+.BR \-\-redirect\-https " [\fIport\fR|" none ]
+Answer every request with
+.B 308
+to the name it asked for and its path, over HTTPS on
+.I port
+(443 when not given, and then not written into the URL). An ACME HTTP\-01
+challenge this daemon holds is still answered first. A
+.B dns
+runtime whose entrance is on 443 makes one on port 80 as its child.
 .SS Sharding
 .TP
 .BI "\-\-shards " "N"
@@ -6507,7 +6594,13 @@ The proxies that terminate TLS in front of the runtime, as addresses or blocks
 IPv6 alike), comma\-separated: a connection from one of them counts as one made
 over TLS, so it may carry SSE\-C headers,
 .B aws:SecureTransport
-is true for it, and the URLs the runtime answers with are https. Refused at
+is true for it, and the URLs the runtime answers with are https. Its request's
+client is the address it put last in
+.BR X\-Forwarded\-For ,
+for
+.BR aws:SourceIp ,
+the access log and the count of failed sign\-ins, which would otherwise hold
+every client behind the proxy as one. Refused at
 .B create
 when an entry is no address. A proxy that speaks HTTP/2 to clients holds an upload to its flow\-control
 window per round trip, 64 KiB unless raised: behind Apache,
@@ -10659,7 +10752,8 @@ needs no file: the runtime writes one under
 the first time, with its SOA, ns1 and ns2 as its name servers and the addresses
 of
 .B \-\-publish
-(or this machine's public ones) as theirs, and serves it from then on; the file
+(or this machine's public ones) as theirs and as the zone's own name's, the
+entrance's, and serves it from then on; the file
 is the user's to edit, and is never written again while it exists. Those two
 names and addresses are what the registrar is told as the domain's name servers
 and their glue. A path is made absolute against the caller's directory; a file
@@ -10732,9 +10826,24 @@ makes it as this runtime's child, named
 when the flag is not given, listening on
 .B \-\-proxy\-port
 with
-.B \-\-tls
-and a certificate it asks the CA for itself: each zone with its wildcard, proven
-over DNS\-01 by this runtime's answers. It stops, starts and is removed with
+.BR \-\-tls ,
+.B "\-\-backend\-timeout 5m"
+(a site may take a while to begin answering, as behind any web server) and a
+certificate it asks the CA for itself: each zone with its wildcard, proven
+over DNS\-01 by this runtime's answers. Before that,
+.B acme issue
+asks the resolver of
+.I /etc/resolv.conf
+for a TXT record that exists only in this runtime's answers: a zone the world's
+DNS does not delegate here yet has each of its names proven by itself instead,
+over TLS\-ALPN\-01 on 443, without the wildcard, which is asked for again every
+six hours until the zone is delegated. On 443 it comes with
+.IB dns \-proxy\-http
+on port 80, which sends every request to HTTPS
+.RB ( \-\-redirect\-https ).
+Behind it, every response over TLS carries
+.B "Strict\-Transport\-Security: max\-age=31536000"
+unless the runtime answering set its own. It stops, starts and is removed with
 this runtime; removed while another dns runtime names it too, it becomes that
 one's instead. A proxy of that name that exists already is taken as it is,
 provided it is an entrance.
@@ -15225,6 +15334,24 @@ Seconds between putting a DNS\-01 answer where the
 .B dns
 runtimes serve it and telling the CA to look: the time a secondary of the zone
 has to take the new serial. Default 10, at most 3600.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_ACME_DNS_PROBE
+The resolver
+.B acme issue
+asks, as
+.IR host [: port ],
+whether a zone of
+.B \-\-dns\-zones
+is delegated to this daemon's
+.B dns
+runtimes, before it proves anything there over DNS\-01;
+.B off
+asks nothing and takes every zone as delegated. Default: the first
+.B nameserver
+of
+.IR /etc/resolv.conf .
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

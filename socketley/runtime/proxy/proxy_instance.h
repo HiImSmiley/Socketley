@@ -20,6 +20,7 @@
 #include "../../shared/trace.h"
 #include "../../shared/invariants.h"
 #include "../../shared/http_framing.h"
+#include "proxy_auth.h"
 
 struct runtime_endpoint;
 
@@ -563,6 +564,14 @@ public:
     void set_mesh_client_cert(std::string_view path);
     void set_mesh_client_key(std::string_view path);
 
+    // --auth: who may send a request through, as proxy_auth.h reads it; empty for anybody.
+    void set_auth(std::string_view spec) { m_auth_spec = spec; }
+    std::string_view get_auth() const { return m_auth_spec; }
+    // --redirect-https: every request answered with a redirect to the same name and path over HTTPS on this port,
+    // 0 for none.
+    void set_https_redirect(uint16_t port) { m_https_redirect = port; }
+    uint16_t get_https_redirect() const { return m_https_redirect; }
+
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool setup(event_loop& loop) override;
     void teardown(event_loop& loop) override;
@@ -873,8 +882,14 @@ private:
     // the client has nothing of its own in flight.
     void refuse_response(proxy_backend_connection* bconn,
                          proxy_client_connection* cconn);
+    // `extra` is header lines, each ending in CRLF, the answer carries besides its own.
     void send_error(proxy_client_connection* conn, std::string_view status, std::string_view body,
-                    bool drain = true);
+                    bool drain = true, std::string_view extra = {});
+    // --auth asked of a parsed request, answered here (401, or 429 for an address that keeps failing) when it
+    // refuses, and false then.
+    bool auth_admits(proxy_client_connection* conn);
+    // --redirect-https's answer to a parsed request.
+    void answer_https_redirect(proxy_client_connection* conn);
     // The one answer for a request that will never reach a backend, where 502
     // is the backend's answer and 503 is this proxy running short locally --
     // and false is a decision rather than a failure, for TCP mode and for a
@@ -977,6 +992,9 @@ private:
     // on any backend, and a route (entrance_route) is the indices of its
     // runtimes.
     bool m_entrance{false};
+    std::string m_auth_spec;
+    proxy_auth m_auth;
+    uint16_t m_https_redirect{0};
     std::unordered_map<std::string, entrance_route> m_entrance_exact;
     // "*.ui.example.com" kept as ".ui.example.com", longest first, so the most
     // specific wildcard answers.

@@ -108,4 +108,4 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
 int parse_client_edit_flags(client_instance* cli, const parsed_args& pa, size_t& i,
                             bool is_running);
 
-int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i);
+int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i, bool is_running);

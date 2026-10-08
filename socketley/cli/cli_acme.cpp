@@ -4,6 +4,7 @@
 // worker; an operator may run it by hand, as certbot is run. Blocking on purpose: it is its own process.
 #include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -15,6 +16,7 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -24,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -439,6 +442,144 @@ std::string alpn_cert(const std::string& name, const std::string& key_auth)
     return pem;
 }
 
+// Whether the world's DNS asks this daemon's dns runtimes about `zone`: a TXT record that exists nowhere else is put
+// in the feed and asked for through the resolver SOCKETLEY_ACME_DNS_PROBE names ("off" for no question), or else
+// the first of /etc/resolv.conf. A CA asking about a name in a zone that is not delegated here would never see the
+// answer, and every failed validation counts against its limits.
+bool zone_delegated(const std::string& zone)
+{
+    const char* env = std::getenv("SOCKETLEY_ACME_DNS_PROBE");
+    if (env && std::string_view(env) == "off")
+        return true;
+    std::string host, port = "53";
+    if (env && *env)
+    {
+        host = env;
+        // "127.0.0.1:5353" and "[::1]:5353"; a bare IPv6 address has more than one colon.
+        if (host.front() == '[' && host.find("]:") != std::string::npos)
+        {
+            port = host.substr(host.find("]:") + 2);
+            host = host.substr(1, host.find(']') - 1);
+        }
+        else if (host.find(':') == host.rfind(':') && host.find(':') != std::string::npos)
+        {
+            port = host.substr(host.find(':') + 1);
+            host.resize(host.find(':'));
+        }
+    }
+    else
+    {
+        std::ifstream rc("/etc/resolv.conf");
+        for (std::string line; host.empty() && std::getline(rc, line);)
+            if (line.starts_with("nameserver"))
+            {
+                const size_t a = line.find_first_not_of(" \t", 10);
+                if (a != std::string::npos)
+                    host = line.substr(a, line.find_first_of(" \t%", a) - a);
+            }
+    }
+    if (host.empty())
+        return false;
+
+    unsigned char rnd[24];
+    if (RAND_bytes(rnd, sizeof rnd) != 1)
+        return false;
+    static constexpr char hexd[] = "0123456789abcdef";
+    std::string label = "probe-", value;
+    for (int i = 0; i < 8; ++i)
+        label += {hexd[rnd[i] >> 4], hexd[rnd[i] & 15]};
+    for (int i = 8; i < 24; ++i)
+        value += {hexd[rnd[i] >> 4], hexd[rnd[i] & 15]};
+    std::string path;
+    if (!dns_feed::write_challenge(label + "." + zone, value, label, path))
+        return false;
+    // A dns runtime looks at the feed once a second.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+    // One question, recursion desired: TXT _acme-challenge.<label>.<zone>.
+    std::string q = {static_cast<char>(rnd[0]), static_cast<char>(rnd[1]), 1, 0, 0, 1, 0, 0, 0, 0, 0, 0};
+    const std::string qname = "_acme-challenge." + label + "." + zone;
+    for (size_t p = 0; p <= qname.size();)
+    {
+        const size_t dot = std::min(qname.find('.', p), qname.size());
+        if (dot > p)
+        {
+            q += static_cast<char>(dot - p);
+            q.append(qname, p, dot - p);
+        }
+        p = dot + 1;
+    }
+    q += std::string("\0\0\x10\0\x01", 5);
+
+    bool found = false;
+    addrinfo hints{}, *ai = nullptr;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+    if (::getaddrinfo(host.c_str(), port.c_str(), &hints, &ai) == 0 && ai)
+    {
+        const int fd = ::socket(ai->ai_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        for (int attempt = 0; fd >= 0 && attempt < 3 && !found; ++attempt)
+        {
+            if (::sendto(fd, q.data(), q.size(), 0, ai->ai_addr, ai->ai_addrlen) < 0)
+                break;
+            pollfd pfd{fd, POLLIN, 0};
+            while (!found && ::poll(&pfd, 1, 3000) > 0)
+            {
+                char buf[1500];
+                const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
+                if (n < 12)
+                    break;
+                // Its id, and the value, which nothing but this question's answer can hold.
+                if (buf[0] == q[0] && buf[1] == q[1])
+                {
+                    found = std::string_view(buf, static_cast<size_t>(n)).find(value) != std::string_view::npos;
+                    break;
+                }
+            }
+        }
+        if (fd >= 0)
+            ::close(fd);
+    }
+    if (ai)
+        ::freeaddrinfo(ai);
+    ::unlink(path.c_str());
+    return found;
+}
+
+// Whether the certificate in `path` is a CA's, has more than thirty days left, and is good for every one of `names`,
+// a name one label below a wildcard it has included.
+bool cert_covers(const std::string& path, const std::vector<std::string>& names)
+{
+    BIO* b = BIO_new_file(path.c_str(), "r");
+    X509* x = b ? PEM_read_bio_X509(b, nullptr, nullptr, nullptr) : nullptr;
+    if (b)
+        BIO_free(b);
+    ERR_clear_error();
+    if (!x)
+        return false;
+    int days = 0, secs = 0;
+    bool ok = X509_check_issued(x, x) != X509_V_OK &&
+              ASN1_TIME_diff(&days, &secs, nullptr, X509_get0_notAfter(x)) == 1 && days > 30;
+    std::vector<std::string> sans;
+    if (auto* gens = static_cast<GENERAL_NAMES*>(X509_get_ext_d2i(x, NID_subject_alt_name, nullptr, nullptr)))
+    {
+        for (int i = 0; i < sk_GENERAL_NAME_num(gens); ++i)
+            if (const GENERAL_NAME* g = sk_GENERAL_NAME_value(gens, i); g->type == GEN_DNS)
+                sans.emplace_back(reinterpret_cast<const char*>(ASN1_STRING_get0_data(g->d.dNSName)),
+                                  static_cast<size_t>(ASN1_STRING_length(g->d.dNSName)));
+        GENERAL_NAMES_free(gens);
+    }
+    X509_free(x);
+    for (const std::string& n : names)
+    {
+        const size_t dot = n.find('.');
+        ok = ok && (std::find(sans.begin(), sans.end(), n) != sans.end() ||
+                    (!n.starts_with("*.") && dot != std::string::npos &&
+                     std::find(sans.begin(), sans.end(), "*" + n.substr(dot)) != sans.end()));
+    }
+    return ok;
+}
+
 bool write_atomic(const std::string& path, const std::string& data, mode_t mode)
 {
     std::error_code ec;
@@ -696,6 +837,49 @@ int issue(int argc, char** argv)
         cert = cert_keeper::acme_cert_path(names.front());
     if (key.empty())
         key = cert_keeper::acme_key_path(names.front());
+
+    // A zone the world's DNS does not ask this daemon about proves nothing over DNS-01: its wildcards wait, and its
+    // other names are proven like any outside the zones. Issued so is partial, said with exit status 3 and a file
+    // beside the certificate, and tried again later.
+    bool partial = false;
+    if (challenge != "dns-01")
+        std::erase_if(dns_zones, [&](const std::string& z) {
+            if (zone_delegated(z))
+                return false;
+            std::cout << "acme issue: " << z << " is not delegated to this daemon's dns runtimes yet; its names are "
+                      << "proven over " << challenge << " and its wildcard waits\n";
+            return true;
+        });
+    std::erase_if(names, [&](const std::string& n) {
+        const bool waits = n.starts_with("*.") && !by_dns(n);
+        partial = partial || waits;
+        return waits;
+    });
+    // A name one label below a wildcard asked for is in it already.
+    const std::vector<std::string> asked = names;
+    std::erase_if(names, [&](const std::string& n) {
+        const size_t dot = n.find('.');
+        return !n.starts_with("*.") && dot != std::string::npos &&
+               std::find(asked.begin(), asked.end(), "*" + n.substr(dot)) != asked.end();
+    });
+    const auto finish = [&](int rc) {
+        if (rc == 0 && partial)
+        {
+            write_atomic(cert + ".partial", "", 0644);
+            return 3;
+        }
+        if (rc == 0)
+            ::unlink((cert + ".partial").c_str());
+        return rc;
+    };
+    if (names.empty())
+    {
+        std::cout << "acme issue: no name can be proven now\n";
+        return 2;
+    }
+    // Asked again for what the certificate already holds, the CA is not troubled.
+    if (cert_covers(cert, names))
+        return finish(0);
     const std::string challenges = cert_keeper::challenge_dir();
     const std::string account_path = std::filesystem::path(challenges).parent_path().string() + "/account-" +
                                      b64url(sha256(dir)).substr(0, 12) + ".key";
@@ -841,7 +1025,7 @@ int issue(int argc, char** argv)
         err = "the certificate could not be written to " + cert + " and " + key;
         return done(2);
     }
-    return done(0);
+    return finish(done(0));
 }
 
 }   // namespace

@@ -970,9 +970,66 @@ int parse_client_flags(client_instance* cli, const parsed_args& pa, size_t& i,
     }
 }
 
+// --auth and --redirect-https, which create and edit read alike; -1 for any other flag.
+static int parse_proxy_gate_flag(proxy_instance* proxy, const parsed_args& pa, size_t& i)
+{
+    switch (pa.hashes[i])
+    {
+        case fnv1a("--auth"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].starts_with('-'))
+            {
+                std::cout << "--auth requires bearer:<file> or basic:<file>\n";
+                return 1;
+            }
+            const std::string_view spec = pa.args[++i];
+            if (spec == "none")
+            {
+                proxy->set_auth("");
+                return 0;
+            }
+            if (const std::string why = proxy_auth::spec_error(spec); !why.empty())
+            {
+                std::cout << why << "\n";
+                return 1;
+            }
+            proxy->set_auth(spec);
+            return 0;
+        }
+        // The port HTTPS is reached on, 443 when none is given.
+        case fnv1a("--redirect-https"):
+        {
+            uint16_t port = 443;
+            if (i + 1 < pa.count && !pa.args[i + 1].starts_with('-'))
+            {
+                const std::string_view v = pa.args[++i];
+                if (v == "none")
+                    port = 0;
+                else
+                {
+                    unsigned long n = 0;
+                    const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
+                    if (ec != std::errc{} || end != v.data() + v.size() || n == 0 || n > 65535)
+                    {
+                        std::cout << "--redirect-https takes the port HTTPS is reached on, or none\n";
+                        return 1;
+                    }
+                    port = static_cast<uint16_t>(n);
+                }
+            }
+            proxy->set_https_redirect(port);
+            return 0;
+        }
+        default:
+            return -1;
+    }
+}
+
 int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
                       std::string_view /*name*/)
 {
+    if (const int rc = parse_proxy_gate_flag(proxy, pa, i); rc >= 0)
+        return rc;
     switch (pa.hashes[i])
     {
         case fnv1a("--backend"):
@@ -2276,8 +2333,18 @@ int parse_client_edit_flags(client_instance* cli, const parsed_args& pa, size_t&
     }
 }
 
-int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i)
+int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i, bool is_running)
 {
+    // Both are taken up when the proxy starts, so a running one is not told it has them.
+    if (pa.hashes[i] == fnv1a("--auth") || pa.hashes[i] == fnv1a("--redirect-https"))
+    {
+        if (is_running)
+        {
+            std::cout << "cannot change " << pa.args[i] << " while running; stop it first\n";
+            return 1;
+        }
+        return parse_proxy_gate_flag(proxy, pa, i);
+    }
     switch (pa.hashes[i])
     {
         case fnv1a("--strategy"):

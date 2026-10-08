@@ -80,7 +80,7 @@ constexpr std::string_view reserved_keys[] = {
     "upstreams", "protocol", "strategy", "backends", "health_check",
     "health_interval", "health_path", "health_threshold", "circuit_threshold",
     "circuit_timeout", "backend_timeout", "retry_count", "retry_all",
-    "mesh_client_ca", "mesh_client_cert", "mesh_client_key", "persistent_path",
+    "mesh_client_ca", "mesh_client_cert", "mesh_client_key", "auth", "redirect_https", "persistent_path",
     "persistent_interval",
     "cache_mode", "resp_forced", "cluster", "replicate_target", "cluster_replica", "max_memory",
     "eviction", "extra",

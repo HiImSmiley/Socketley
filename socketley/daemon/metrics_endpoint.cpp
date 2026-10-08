@@ -145,7 +145,9 @@ static void send_http_response(int fd, std::string_view content_type, std::strin
     response.reserve(body.size() + 256);
     response += "HTTP/1.1 200 OK\r\nContent-Type: ";
     response += content_type;
-    response += "\r\nConnection: close\r\nContent-Length: ";
+    // Never framed, sniffed, cached or named in a Referer, wherever a proxy puts the page.
+    response += "\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer"
+                "\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: ";
     char len_buf[24];
     auto [end, ec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body.size());
     response.append(len_buf, end - len_buf);
@@ -246,7 +248,9 @@ void metrics_endpoint::serve_loop()
         {
             buf[n] = '\0';
 
-            if (std::strncmp(buf, "GET ", 4) == 0 && !host_is_loopback(buf))
+            // A proxy's request carries Via, which no page can set, so one put in front of this port by name is
+            // served.
+            if (std::strncmp(buf, "GET ", 4) == 0 && !host_is_loopback(buf) && !::strcasestr(buf, "\r\nvia:"))
             {
                 // A page whose name was rebound to 127.0.0.1 reaches this port
                 // as its own origin and reads runtime names, ports and paths,

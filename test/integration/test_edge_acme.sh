@@ -8,6 +8,11 @@
 #   runtime's own answers -- no port 80, no file to name; a name the wildcard
 #   does not cover (a storage runtime's buckets) is asked for again when it
 #   appears; and the certificate is the one served, its chain to the CA's root
+#
+#   a zone the world's DNS does not delegate here yet (the probe `acme issue`
+#   asks the resolver goes unanswered) has its names proven one by one over
+#   HTTP-01 instead, without the wildcard, and the wildcard is asked for when
+#   the probe is answered
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -31,7 +36,7 @@ expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2', want '$3'"
 daemon_isolate edgeacme
 T="$SOCKETLEY_TMPD"
 P=$((SL_PORT_BASE+1960))
-DNS=$P S=$((P+1)) P_DIR=$((P+2)) P_MGMT=$((P+3))
+DNS=$P S=$((P+1)) P_DIR=$((P+2)) P_MGMT=$((P+3)) HTTP01=$((P+4)) PROBE=$((P+8))
 PEBBLE_PID=""
 trap 'kill $PEBBLE_PID 2>/dev/null; daemon_stop' EXIT
 
@@ -48,9 +53,10 @@ PEBBLE_PID=$!
 for _ in $(seq 1 100); do curl -s --noproxy '*' --cacert "$PEBBLE_DIR/pebble.minica.pem" -o /dev/null "https://127.0.0.1:$P_DIR/dir" && break; sleep 0.1; done
 curl -s --noproxy '*' --cacert "$PEBBLE_DIR/pebble.minica.pem" "https://127.0.0.1:$P_MGMT/roots/0" > "$T/root.pem"
 
-# What the worker's `acme issue` child is told: this CA, trusted by its own root, and a short wait for DNS.
+# What the worker's `acme issue` child is told: this CA, trusted by its own root, a short wait for DNS, and the
+# resolver its delegation probe asks -- nothing listens there until the zone is "delegated" below.
 export SOCKETLEY_ACME_DIRECTORY="https://127.0.0.1:$P_DIR/dir" SOCKETLEY_ACME_CA="$PEBBLE_DIR/pebble.minica.pem" \
-       SOCKETLEY_ACME_DNS_WAIT=1
+       SOCKETLEY_ACME_DNS_WAIT=1 SOCKETLEY_ACME_DNS_PROBE="127.0.0.1:$PROBE"
 daemon_start "$BIN"
 
 mkdir -p "$T/site"; echo hello > "$T/site/who.txt"
@@ -60,12 +66,27 @@ expect "a dns runtime is made, and with it its entrance" \
 
 san() { echo | openssl s_client -connect "127.0.0.1:$S" -servername "$1" 2>/dev/null |
         openssl x509 -noout -ext subjectAltName 2>/dev/null | grep -o 'DNS:[*a-z0-9.-]*' | sort | tr '\n' ' '; }
+# The CA's HTTP-01 port, served by a redirect to HTTPS, which answers a challenge before it redirects.
+"$BIN" create proxy redir -p "$HTTP01" --redirect-https "$S" -s >/dev/null 2>&1
 got=""
-for _ in $(seq 1 150); do got=$(san chat.example.com); [ "$got" = "DNS:*.example.com DNS:example.com " ] && break; sleep 0.2; done
+for _ in $(seq 1 300); do got=$(san chat.example.com); [ "$got" = "DNS:chat.example.com DNS:example.com " ] && break; sleep 0.2; done
+expect "a zone not delegated here has its names proven one by one, without the wildcard" "$got" \
+    "DNS:chat.example.com DNS:example.com "
+expect "and the redirect sends a browser to HTTPS, path and all" \
+    "$(curl -s --noproxy '*' -m 5 -o /dev/null -w '%{http_code} %{redirect_url}' -H 'Host: chat.example.com' "http://127.0.0.1:$HTTP01/a/b?c=d")" \
+    "308 https://chat.example.com:$S/a/b?c=d"
+
+# Delegated: the probe's resolver answers from the same zone and feed, and the entrance, started again, asks anew.
+"$BIN" create dns probe -p "$PROBE" --zone "$(find "$T" -path '*zones/example.com.zone' | head -1)" --proxy none --rrl 0 -s \
+    >/dev/null 2>&1
+"$BIN" stop web >/dev/null 2>&1; "$BIN" start web >/dev/null 2>&1
+for _ in $(seq 1 300); do got=$(san chat.example.com); [ "$got" = "DNS:*.example.com DNS:example.com " ] && break; sleep 0.2; done
 expect "it is issued one for its zone and the zone's wildcard, over DNS-01" "$got" "DNS:*.example.com DNS:example.com "
 expect "which a client trusting the CA's root alone accepts, the request routed" \
     "$(curl -s --noproxy '*' -m 5 --cacert "$T/root.pem" --resolve "chat.example.com:$S:127.0.0.1" "https://chat.example.com:$S/who.txt")" "hello"
-expect "no answer is left in the zone after" "$(dig @127.0.0.1 -p "$DNS" +short _acme-challenge.example.com TXT)" ""
+# The answer goes when the certificate is written, and the zone takes that up within a second.
+for _ in $(seq 1 15); do got=$(dig @127.0.0.1 -p "$DNS" +short _acme-challenge.example.com TXT); [ -z "$got" ] && break; sleep 0.2; done
+expect "no answer is left in the zone after" "$got" ""
 
 # A storage runtime's buckets are a name the zone's wildcard does not cover, one label further down.
 "$BIN" create storage ui -p $((P+7)) --dir "$T/ui" --anonymous --domain -s >/dev/null 2>&1
