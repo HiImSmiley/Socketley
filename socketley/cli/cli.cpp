@@ -17,7 +17,7 @@
 
 #include "command_hashing.h"
 #include "../shared/command_usage.h"
-#include "ipc_client.h"
+#include "../daemon/ipc_client.h"
 #include "../daemon/daemon_handler.h"
 #include "../runtime/worker/worker_main.h"
 #include "../shared/daemon_client.h"

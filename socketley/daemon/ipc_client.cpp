@@ -1,5 +1,5 @@
 #include "ipc_client.h"
-#include "../daemon/daemon_handler.h"
+#include "daemon_handler.h"
 #include "../shared/ipc_framing.h"
 
 #include <sys/socket.h>

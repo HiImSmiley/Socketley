@@ -1,5 +1,5 @@
 #include "cli.h"
-#include "ipc_client.h"
+#include "../daemon/ipc_client.h"
 #include "command_hashing.h"
 #include "../shared/cluster_discovery.h"
 #include "../shared/cluster_state.h"

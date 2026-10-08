@@ -7,7 +7,7 @@
 #include <sol/sol.hpp>
 
 #include "runtime_type_parser.h"
-#include "ipc_client.h"
+#include "../daemon/ipc_client.h"
 #include "command_hashing.h"
 #include "../daemon/type_manifest.h"
 #include "../shared/paths.h"

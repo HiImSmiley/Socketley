@@ -14,7 +14,7 @@
 #include <set>
 
 #include "runtime_schema.h"
-#include "../cli/ipc_client.h"
+#include "ipc_client.h"
 #include "../runtime/proxy/proxy_auth.h"
 #include "../runtime/storage/json_doc.h"
 #include "../shared/blocking_write.h"
