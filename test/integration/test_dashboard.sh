@@ -1,76 +1,142 @@
 #!/usr/bin/env bash
-# Integration test: dashboard command and metrics API
-set -euo pipefail
+# Integration test: the daemon's dashboard.
+#
+# ─── WHAT THIS HOLDS DOWN ───────────────────────────────────────────────────
+#
+#   the schema   every flag a create parser in flag_handlers.cpp takes is in
+#                the dashboard's schema (or an alias of one), for its type
+#   the page     served with the storage interface's style and helpers in it,
+#                and a script that parses
+#   signing in   an admin's key and secret make a session; another user's, a
+#                wrong secret and none do not; five failures bar the address
+#   reading      figures and the schema need a session, a local scraper's
+#                /metrics does not, a proxy's does
+#   commands     need a session and the page's header, take only the
+#                dashboard's verbs and no word with a space, and create, show,
+#                import, stop, start and remove a runtime as the CLI would
+#   no creds     without dashboard_credentials it reads and changes nothing
+set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
-. "$(dirname "$0")/lib_daemon.sh"
-. "$(dirname "$0")/lib_create.sh"
-. "$(dirname "$0")/lib_ports.sh"
-daemon_isolate dashboard
+BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+HERE=$(cd "$(dirname "$0")" && pwd)
+SRC="$HERE/../../socketley/daemon/flag_handlers.cpp"
+. "$HERE/lib_ports.sh"
+. "$HERE/lib_daemon.sh"
+
+command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
+
 PASS=0; FAIL=0; TOTAL=0
+ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
+bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
+expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2', want '$3'"; fi; }
+has() { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1" "'$3' not in: ${2:0:300}" ;; esac; }
 
-cleanup() {
-    "$BIN" stop dash_svr 2>/dev/null || true
-    sleep 0.5
-    "$BIN" remove dash_svr 2>/dev/null || true
-    daemon_stop
-}
-trap cleanup EXIT
+daemon_isolate dash
+T="$SOCKETLEY_TMPD"
+P=$((SL_PORT_BASE+1950))
+M=$P
+trap 'daemon_stop' EXIT
 
-assert_contains() {
-    TOTAL=$((TOTAL+1))
-    if grep -q "$2" <<<"$1"; then
-        PASS=$((PASS+1))
-    else
-        FAIL=$((FAIL+1))
-        echo "  FAIL: expected '$2' in output"
-    fi
-}
+echo "=== Integration: the daemon's dashboard ==="
 
-assert_not_empty() {
-    TOTAL=$((TOTAL+1))
-    if [ -n "$1" ]; then
-        PASS=$((PASS+1))
-    else
-        FAIL=$((FAIL+1))
-        echo "  FAIL: $2 was empty"
-    fi
-}
-
-echo "=== Integration: dashboard ==="
-
-# Ensure daemon is running
+ADMIN="AKIADASHTESTADMIN000:dashtestadminsecretdashtestadminsecret00"
+BOB="AKIADASHTESTBOB00000:dashtestbobsecretdashtestbobsecretdashte"
+printf '[admin]\nadmin = true\n%s\n[bob]\n%s\n' "$ADMIN" "$BOB" > "$T/creds"
+cat > "$T/daemon.lua" <<EOF
+daemon = { metrics_port = $M, dashboard_credentials = "$T/creds" }
+EOF
+export SOCKETLEY_CONFIG="$T/daemon.lua"
 daemon_start "$BIN"
+U="http://127.0.0.1:$M"
+for _ in $(seq 1 50); do curl -s -o /dev/null "$U/" && break; sleep 0.1; done
+code() { curl -s -o /dev/null -w '%{http_code}' -m 10 "$@"; }
 
-# Test: dashboard command without metrics (should give info message)
-OUT=$("$BIN" dashboard 2>&1) || true
-TOTAL=$((TOTAL+1))
-# Either shows a URL or says not configured — both are valid
-if grep -qE "Dashboard:|not configured|not enabled|metrics" <<<"$OUT"; then
-    PASS=$((PASS+1))
-else
-    FAIL=$((FAIL+1))
-    echo "  FAIL: unexpected dashboard output: $OUT"
+# ─── the schema ─────────────────────────────────────────────────────────────
+curl -s -X POST -c "$T/jar" -u "$ADMIN" "$U/api/session" >/dev/null
+curl -s -b "$T/jar" "$U/api/schema" > "$T/schema.json"
+missing=$(python3 - "$SRC" "$T/schema.json" <<'PY'
+import json, re, sys
+src, schema = open(sys.argv[1]).read(), json.load(open(sys.argv[2]))
+known = {}
+for f in schema["flags"]:
+    names = [f["flag"]] + [a for a in f.get("aliases", "").split(",") if a]
+    for n in names:
+        known.setdefault(n, set()).update(f["types"])
+# The create parsers, each one's cases.
+parsers = {"parse_common_flags": None, "parse_server_flags": "server", "parse_client_flags": "client",
+           "parse_proxy_gate_flag": "proxy", "parse_proxy_flags": "proxy", "parse_cache_flags": "cache",
+           "parse_dns_flags": "dns", "parse_storage_flags": "storage"}
+out = []
+for fn, ty in parsers.items():
+    m = re.search(r"\n(?:static )?int " + fn + r"\(.*?\n\}\n", src, re.S)
+    if not m:
+        out.append("no " + fn); continue
+    for flag in set(re.findall(r'case fnv1a\("(-[^"]*)"\)', m.group(0))):
+        if flag not in known:
+            out.append(flag + " (" + fn + ")")
+        elif ty and ty not in known[flag]:
+            out.append(flag + " not offered for " + ty)
+print(" ".join(sorted(out)))
+PY
+)
+expect "every flag a create parser takes is in the dashboard's schema, for its type" "$missing" ""
+
+# ─── the page ───────────────────────────────────────────────────────────────
+curl -s "$U/" > "$T/page.html"
+has "the page is served with the storage interface's style" "$(cat "$T/page.html")" "#aurora"
+has "and its dialogs" "$(cat "$T/page.html")" "function modal("
+if command -v node >/dev/null 2>&1; then
+    python3 -c "import re,sys; open(sys.argv[2],'w').write(re.search(r'<script>(.*)</script>', open(sys.argv[1]).read(), re.S).group(1))" "$T/page.html" "$T/page.js"
+    node --check "$T/page.js" 2>"$T/node.err" && ok "its script parses" || bad "its script parses" "$(head -5 "$T/node.err")"
 fi
 
-# Create a runtime to test stats endpoints later
-create_ok "server created" "$BIN" create server dash_svr -p $((SL_PORT_BASE+390)) -s
-sleep 0.3
+# ─── signing in ─────────────────────────────────────────────────────────────
+expect "figures need a session" "$(code "$U/api/runtimes")" 401
+expect "so does the schema" "$(code "$U/api/schema")" 401
+expect "a local scraper's /metrics does not" "$(code "$U/metrics")" 200
+expect "a proxy's does" "$(code -H 'Via: 1.1 entrance' "$U/metrics")" 401
+expect "an admin signs in" "$(code -X POST -c "$T/jar" -u "$ADMIN" "$U/api/session")" 200
+has "as an HttpOnly, SameSite=Strict cookie" "$(grep -c skl_dash "$T/jar") $(curl -s -D - -o /dev/null -X POST -u "$ADMIN" "$U/api/session" | tr -d '\r' | grep -i '^set-cookie')" "HttpOnly; SameSite=Strict"
+expect "and reads the figures" "$(code -b "$T/jar" "$U/api/runtimes")" 200
+expect "another user does not sign in" "$(code -X POST -u "$BOB" "$U/api/session")" 401
+expect "nor a wrong secret" "$(code -X POST -u "${ADMIN%%:*}:wrong" "$U/api/session")" 401
+for _ in 1 2 3 4 5; do code -X POST -H 'X-Forwarded-For: 10.9.9.9' -H 'Via: 1.1 e' -u "${ADMIN%%:*}:guess" "$U/api/session" >/dev/null; done
+expect "an address that keeps failing is barred, the right secret too" \
+    "$(code -X POST -H 'X-Forwarded-For: 10.9.9.9' -H 'Via: 1.1 e' -u "$ADMIN" "$U/api/session")" 429
+expect "while another is not" "$(code -X POST -H 'X-Forwarded-For: 10.9.9.8' -H 'Via: 1.1 e' -u "$ADMIN" "$U/api/session")" 200
+expect "a forged cookie is no session" "$(code -b 'skl_dash=AKIADASHTESTADMIN000.9999999999.00' "$U/api/runtimes")" 401
 
-# Test: runtime is visible
-#
-# The `|| true` three tests up is right for that one — a dashboard that is not
-# configured legitimately exits non-zero and the assertion accepts both answers.
-# These two are different: they must not end the file either, but a failure here
-# is not expected, so it goes to daemon_required, which carries on when the
-# daemon is still serving and stops with counts when it is not.
-OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
-assert_contains "$OUT" "dash_svr"
+# ─── commands ───────────────────────────────────────────────────────────────
+run() { curl -s -m 30 -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -H 'Content-Type: application/json' -d "$1" "$U/api/run"; }
+j() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))' "$1" 2>/dev/null; }
+expect "a command needs the page's header" "$(code -b "$T/jar" -d '{"args":["ls"]}' "$U/api/run")" 403
+expect "and a session" "$(code -H 'X-Socketley-Dashboard: 1' -d '{"args":["ls"]}' "$U/api/run")" 401
+expect "a verb that is not the dashboard's is refused" "$(code -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -d '{"args":["daemon-stop"]}' "$U/api/run")" 403
+expect "and a word with a space" "$(code -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -d '{"args":["create","server","a b"]}' "$U/api/run")" 400
+expect "a runtime is made, started" "$(run "{\"args\":[\"create\",\"server\",\"web\",\"-p\",\"$((P+1))\",\"-s\"]}" | j "d['code']")" 0
+for _ in $(seq 1 30); do [ "$(curl -s -b "$T/jar" "$U/api/runtimes" | j "[r['state'] for r in d if r['name']=='web'][0]")" = running ] && break; sleep 0.2; done
+expect "and runs" "$(curl -s -b "$T/jar" "$U/api/runtimes" | j "[r['state'] for r in d if r['name']=='web'][0]")" running
+expect "a refusal comes back with the daemon's words" "$(run '{"args":["create","server","web"]}' | j "d['code'] != 0 and 'already' in d['out']")" True
+expect "show gives its configuration" "$(run '{"args":["show","web"]}' | j "json.loads(d['out'])['port']")" "$((P+1))"
+expect "import changes it" "$(run '{"args":["import","web","{\"max_connections\": 77}"]}' | j "d['code']") $(run '{"args":["show","web"]}' | j "json.loads(d['out'])['max_connections']")" "0 77"
+expect "stop stops it" "$(run '{"args":["stop","web"]}' | j "d['code']") $("$BIN" ls 2>/dev/null | grep -c ' web .*Stopped')" "0 1"
+expect "start starts it" "$(run '{"args":["start","web"]}' | j "d['code']")" 0
+expect "and remove removes it" "$(run '{"args":["remove","web"]}' | j "d['code']") $("$BIN" ls 2>/dev/null | grep -c ' web ')" "0 0"
+expect "signing out ends the session" "$(code -X DELETE -b "$T/jar" -c "$T/jar" "$U/api/session") $(code -b "$T/jar" "$U/api/runtimes")" "204 401"
 
-# Test: stats command works
-OUT=$("$BIN" stats dash_svr 2>&1) || daemon_required "stats dash_svr"
-assert_contains "$OUT" "connections:"
-assert_contains "$OUT" "total_connections:"
+# ─── without credentials ────────────────────────────────────────────────────
+daemon_stop
+daemon_isolate dash2
+cat > "$SOCKETLEY_TMPD/daemon.lua" <<EOF
+daemon = { metrics_port = $M }
+EOF
+export SOCKETLEY_CONFIG="$SOCKETLEY_TMPD/daemon.lua"
+daemon_start "$BIN"
+for _ in $(seq 1 50); do curl -s -o /dev/null "$U/" && break; sleep 0.1; done
+expect "without credentials the figures are read as before" "$(code "$U/api/runtimes")" 200
+expect "and nobody signs in" "$(code -X POST -u "$ADMIN" "$U/api/session")" 403
+expect "or changes anything" "$(code -H 'X-Socketley-Dashboard: 1' -d '{"args":["ls"]}' "$U/api/run")" 403
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

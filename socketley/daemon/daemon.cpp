@@ -51,6 +51,8 @@ static void signal_handler(int)
 struct daemon_config
 {
     uint16_t    metrics_port = 0;
+    // The credentials file the dashboard's admins sign in from.
+    std::string dashboard_credentials;
     std::string name;
     std::string cluster;
     std::string cpus;
@@ -144,6 +146,10 @@ static daemon_config load_daemon_config(const std::string& config_path)
     sol::optional<int> mp = table->get<sol::optional<int>>(static_cast<const char*>("metrics_port"));
     if (mp && *mp > 0 && *mp <= 65535)
         out.metrics_port = static_cast<uint16_t>(*mp);
+
+    sol::optional<std::string> dc = text("dashboard_credentials");
+    if (dc && !dc->empty())
+        out.dashboard_credentials = *dc;
 
     sol::optional<std::string> name = text("name");
     if (name && !name->empty())
@@ -850,7 +856,7 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     bool metrics_bound = false;
     if (metrics_port > 0)
     {
-        metrics_bound = metrics.start(metrics_port);
+        metrics_bound = metrics.start(metrics_port, config.dashboard_credentials);
         if (metrics_bound)
             LOG_INFO("metrics endpoint started");
         else

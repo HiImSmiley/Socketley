@@ -1,7 +1,7 @@
 #include "metrics_endpoint.h"
 
 #include <algorithm>
-#include "dashboard_html.h"
+#include "dashboard.h"
 #include "../shared/runtime_manager.h"
 #include "../shared/runtime_instance.h"
 #include "../shared/blocking_write.h"
@@ -39,8 +39,9 @@ metrics_endpoint::~metrics_endpoint()
     stop();
 }
 
-bool metrics_endpoint::start(uint16_t port)
+bool metrics_endpoint::start(uint16_t port, std::string dashboard_credentials)
 {
+    m_dash = std::make_unique<dashboard::server>(std::move(dashboard_credentials));
     // SOCK_CLOEXEC because the daemon forks proxy workers, and with
     // SO_REUSEADDR but not SO_REUSEPORT an inherited copy keeps the metrics
     // port bound after the daemon is gone.
@@ -139,25 +140,6 @@ void metrics_endpoint::stop()
     }
 }
 
-static void send_http_response(int fd, std::string_view content_type, std::string_view body)
-{
-    std::string response;
-    response.reserve(body.size() + 256);
-    response += "HTTP/1.1 200 OK\r\nContent-Type: ";
-    response += content_type;
-    // Never framed, sniffed, cached or named in a Referer, wherever a proxy puts the page.
-    response += "\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer"
-                "\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: ";
-    char len_buf[24];
-    auto [end, ec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body.size());
-    response.append(len_buf, end - len_buf);
-    response += "\r\n\r\n";
-    response += body;
-    // Content-Length promises the whole body, so a short write here leaves the
-    // scraper waiting for bytes that are never coming.
-    socketley::write_all(fd, response.data(), response.size());
-}
-
 // Whether the request's Host names this machine, which a loopback listener's
 // honest clients always do and a DNS-rebound page never can; no Host at all is
 // an HTTP/1.0 scraper and is served.
@@ -185,13 +167,6 @@ static bool host_is_loopback(const char* req)
     in_addr a{};
     return ::inet_pton(AF_INET, std::string(v).c_str(), &a) == 1 &&
            (ntohl(a.s_addr) >> 24) == 127;
-}
-
-static void send_http_404(int fd)
-{
-    static constexpr const char* resp =
-        "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-    socketley::write_all(fd, resp, std::strlen(resp));
 }
 
 void metrics_endpoint::serve_loop()
@@ -242,105 +217,20 @@ void metrics_endpoint::serve_loop()
             continue;
         }
 
-        char buf[2048];
-        ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
-        if (n > 0)
+        dashboard::request req;
+        if (dashboard::read_request(client_fd, req))
         {
-            buf[n] = '\0';
-
-            // A proxy's request carries Via, which no page can set, so one put in front of this port by name is
-            // served.
-            if (std::strncmp(buf, "GET ", 4) == 0 && !host_is_loopback(buf) && !::strcasestr(buf, "\r\nvia:"))
-            {
-                // A page whose name was rebound to 127.0.0.1 reaches this port
-                // as its own origin and reads runtime names, ports and paths,
-                // so only a request that asked for this machine by name is
-                // served.
-                static constexpr std::string_view refused =
-                    "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                socketley::write_all(client_fd, refused.data(), refused.size());
-            }
-            else if (std::strncmp(buf, "GET ", 4) == 0)
-            {
-                // Extract path
-                const char* path_start = buf + 4;
-                const char* path_end = std::strchr(path_start, ' ');
-                if (!path_end) path_end = path_start + std::strlen(path_start);
-                std::string_view path(path_start, path_end - path_start);
-
-                if (path == "/" || path == "/dashboard")
-                {
-                    send_http_response(client_fd, "text/html; charset=utf-8", DASHBOARD_HTML);
-                }
-                else if (path == "/metrics")
-                {
-                    auto now = std::chrono::steady_clock::now();
-                    if ((now - m_cache_time) >= METRICS_CACHE_TTL)
-                    {
-                        m_cached_metrics = build_metrics();
-                        m_cached_json_overview.clear();
-                        m_cached_json_runtimes.clear();
-                        m_cache_time = now;
-                    }
-                    // The branch both JSON endpoints have and this one did
-                    // not: the three share one cache and one clock, and each
-                    // refresh empties the other two.  A dashboard poll inside
-                    // the TTL therefore left this serving 200 OK with
-                    // Content-Length: 0 -- a scrape Prometheus records as
-                    // successful, with every socketley_ series missing from
-                    // that sample.
-                    else if (m_cached_metrics.empty())
-                    {
-                        m_cached_metrics = build_metrics();
-                    }
-                    send_http_response(client_fd, "text/plain; version=0.0.4; charset=utf-8", m_cached_metrics);
-                }
-                else if (path == "/api/overview")
-                {
-                    auto now = std::chrono::steady_clock::now();
-                    if ((now - m_cache_time) >= METRICS_CACHE_TTL)
-                    {
-                        m_cached_json_overview = build_json_overview();
-                        m_cached_metrics.clear();
-                        m_cached_json_runtimes.clear();
-                        m_cache_time = now;
-                    }
-                    else if (m_cached_json_overview.empty())
-                    {
-                        m_cached_json_overview = build_json_overview();
-                    }
-                    send_http_response(client_fd, "application/json", m_cached_json_overview);
-                }
-                else if (path == "/api/runtimes")
-                {
-                    auto now = std::chrono::steady_clock::now();
-                    if ((now - m_cache_time) >= METRICS_CACHE_TTL)
-                    {
-                        m_cached_json_runtimes = build_json_runtimes();
-                        m_cached_metrics.clear();
-                        m_cached_json_overview.clear();
-                        m_cache_time = now;
-                    }
-                    else if (m_cached_json_runtimes.empty())
-                    {
-                        m_cached_json_runtimes = build_json_runtimes();
-                    }
-                    send_http_response(client_fd, "application/json", m_cached_json_runtimes);
-                }
-                else if (path.starts_with("/api/runtime/"))
-                {
-                    std::string_view name = path.substr(13);
-                    std::string body = build_json_runtime(name);
-                    if (body.empty())
-                        send_http_404(client_fd);
-                    else
-                        send_http_response(client_fd, "application/json", body);
-                }
-                else
-                {
-                    send_http_404(client_fd);
-                }
-            }
+            char ip[INET_ADDRSTRLEN] = {};
+            ::inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof ip);
+            req.peer = ip;
+            const bool via = !req.header("via").empty();
+            const std::string host_line = "\r\nhost: " + std::string(req.header("host")) + "\r\n";
+            // A page whose name was rebound to 127.0.0.1 reaches this port as its own origin, so only a request that
+            // asked for this machine by name is served -- or a proxy's, which carries Via, which no page can set.
+            if (!via && !req.header("host").empty() && !host_is_loopback(host_line.c_str()))
+                dashboard::send(client_fd, 403, {}, {});
+            else
+                serve(client_fd, req, via);
         }
 
         // Raw close and the right one, because no SQE has ever named this
@@ -348,6 +238,55 @@ void metrics_endpoint::serve_loop()
         // event-loop thread's own tables.
         close(client_fd);
     }
+}
+
+void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)
+{
+    const std::string_view path = req.path;
+    const auto refresh = [&](std::string& cached, auto build) {
+        const auto now = std::chrono::steady_clock::now();
+        // The three share one cache and one clock, and each refresh empties the other two, so one asked inside the
+        // TTL after another was refreshed is built again rather than served empty.
+        if (now - m_cache_time >= METRICS_CACHE_TTL)
+        {
+            m_cached_metrics.clear();
+            m_cached_json_overview.clear();
+            m_cached_json_runtimes.clear();
+            m_cache_time = now;
+        }
+        if (cached.empty())
+            cached = build();
+        return std::string_view(cached);
+    };
+    if (path == "/metrics")
+    {
+        // A scraper on this machine, or the signed-in page; through a proxy, only the latter.
+        if (m_dash->configured() && (via || req.peer.rfind("127.", 0) != 0) && m_dash->session_of(req).empty())
+            dashboard::send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
+        else
+            dashboard::send(fd, 200, "text/plain; version=0.0.4; charset=utf-8",
+                            refresh(m_cached_metrics, [&] { return build_metrics(); }));
+        return;
+    }
+    if (path.starts_with("/api/overview") || path.starts_with("/api/runtimes") || path.starts_with("/api/runtime/"))
+    {
+        if (!m_dash->may_read(req))
+        {
+            dashboard::send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
+            return;
+        }
+        if (path == "/api/overview")
+            dashboard::send(fd, 200, "application/json", refresh(m_cached_json_overview, [&] { return build_json_overview(); }));
+        else if (path == "/api/runtimes")
+            dashboard::send(fd, 200, "application/json", refresh(m_cached_json_runtimes, [&] { return build_json_runtimes(); }));
+        else if (const std::string body = build_json_runtime(path.substr(13)); path.starts_with("/api/runtime/") && !body.empty())
+            dashboard::send(fd, 200, "application/json", body);
+        else
+            dashboard::send(fd, 404, "text/plain; charset=utf-8", "Not Found\n");
+        return;
+    }
+    if (!m_dash->handle(fd, req))
+        dashboard::send(fd, 404, "text/plain; charset=utf-8", "Not Found\n");
 }
 
 // A control character has no literal spelling in a JSON string, and this

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The daemon's dashboard runs the daemon.** The page on `metrics_port` is new,
+  in the storage interface's look, whose stylesheet and helpers it takes from the
+  same binary: an overview of runtimes, connections, messages, bytes, CPU and
+  memory with their last minutes as lines; every runtime with its state and
+  figures, filtered by type and name; and each runtime's configuration and
+  stats. Signed in with an admin key of `daemon.dashboard_credentials`, it
+  starts, stops, restarts, removes and reloads runtimes, edits one in a form of
+  its type filled from `show` (or as JSON for `import`), and makes one from a
+  form of every flag `create` takes for its type, the command shown as it is
+  filled in. Commands go over the daemon's control socket as the CLI's do, and
+  only the dashboard's verbs. The session is a sealed HttpOnly, SameSite=Strict
+  cookie; five failed sign-ins bar an address for fifteen minutes; without
+  credentials the page only shows, as before. `test_dashboard` holds the form's
+  schema level with the create parsers: its first run found `--mode` missing for
+  clients and caches.
+
 - **Storage: git repositories kept in a library.** The page's new Git tab adds a
   repository by URL (a branch, `main` by default, or `*` for every one); it is
   pulled when added, whenever asked, and by itself every day, week or month as

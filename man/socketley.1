@@ -13625,10 +13625,52 @@ is set in the daemon configuration file, the metrics endpoint serves
 multiple routes:
 .TP
 .B GET /
-Live web dashboard. Auto-refreshes every 2 seconds. Shows all runtimes,
-connection counts, throughput, uptime, and the CPU and resident memory of the
-daemon and of each runtime's processes, CPU as a share of the host and of one
-core. The endpoint listens on 127.0.0.1 only; on a server, reach it through an
+The dashboard, in the storage interface's look, whose stylesheet and helpers it
+takes from the same binary. Its overview shows the daemon's runtimes,
+connections, messages, bytes in and out, CPU and resident memory, each with its
+last three minutes as a line; its runtimes, each with its state and the same
+figures, filtered by type and name; and each runtime with its configuration and
+its
+.B stats .
+Signed in, it starts, stops, restarts and removes a runtime, reloads its Lua,
+edits it in a form of its type filled with what
+.B show
+says (or as the JSON
+.B import
+takes), and makes one: the type, then a form of every flag
+.B create
+takes for it, by section, with the command it sends shown as it is filled in.
+.IP
+Signing in takes the access key and secret of an admin of the credentials file
+.B daemon.dashboard_credentials
+names, a storage runtime's format, as a proxy's
+.B "\-\-auth basic:"
+checks them: an address that fails five times in fifteen minutes is refused
+even the right secret, 429, behind a proxy on this machine the address in its
+X\-Forwarded\-For. The session is a cookie sealed with a key the daemon draws at
+start, HttpOnly and SameSite=Strict (Secure behind HTTPS), good for twelve
+hours; a command also carries the page's own header, which no other site's
+request can, goes over the daemon's control socket as the CLI's does, and is
+logged with who sent it. The page sends only
+.BR create ,
+.BR edit ,
+.BR import ,
+.BR start ,
+.BR stop ,
+.BR remove ,
+.BR reload ,
+.BR reload\-lua ,
+.BR show ,
+.BR stats ,
+.B ls
+and
+.BR ps ,
+none with a word holding a space. With credentials named, every route but the
+page and the sign\-in needs the session, and
+.B /metrics
+needs it from anywhere but a scraper on this machine without a proxy between;
+without them the page shows the figures, as it always did, and changes
+nothing. The endpoint listens on 127.0.0.1 only; on a server, reach it through an
 SSH tunnel, \fBssh \-L 9100:127.0.0.1:9100\fR \fIhost\fR, and open
 \fBhttp://localhost:9100/\fR. On an installed system the port is set in
 \fB/etc/socketley/config.lua\fR, as \fBdaemon = { metrics_port = 9100 }\fR,
@@ -15967,6 +16009,8 @@ daemon = {
     cluster = "/shared/dir", -- cluster directory; needs name
     log_level = "info",      -- debug, info, warn, error
     metrics_port = 9100,     -- Prometheus metrics HTTP endpoint
+    dashboard_credentials = "/etc/socketley/admin.creds",
+                             -- the dashboard's admins sign in from here
     cpus = "0-3"             -- where this daemon's I/O runs
 }
 .fi

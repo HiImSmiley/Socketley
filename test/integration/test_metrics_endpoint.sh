@@ -208,7 +208,7 @@ case "$USAGE" in *"cpus=True"*) ok ;; *) bad "the overview names the CPUs online
 if [ -n "$(metric 'socketley_runtime_cpu_seconds_total{name="m_shards"}')" ] \
    && [ "$(metric 'socketley_runtime_resident_memory_bytes{name="m_shards"}')" -gt 0 ] 2>/dev/null; then ok
 else bad "CPU time and resident memory are Prometheus series" "$(get /metrics | grep -E 'cpu_seconds|resident' | head -4)"; fi
-if grep -q 'id="cpu"' <<<"$DASH" && grep -q 'id="mem"' <<<"$DASH"; then ok
+if grep -q "tile('cpu', 'CPU'" <<<"$DASH" && grep -q "tile('gauge', 'Memory'" <<<"$DASH"; then ok
 else bad "the dashboard shows CPU and memory" "no cpu or mem card in the page"; fi
 
 # ── Three endpoints, one cache ─────────────────────────────────────────────

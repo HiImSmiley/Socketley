@@ -1325,4 +1325,21 @@ void storage_run::ui_git_body(const std::shared_ptr<conn>& c)
     app_reply(c, 400, "The action is add, remove, sync, every or token.\n");
 }
 
+// The page's stylesheet, which the daemon's dashboard takes for its own look.
+std::string_view storage_ui_style()
+{
+    const size_t from = ui_page.find("<style>") + 7, to = ui_page.find("</style>");
+    return ui_page.substr(from, to - from);
+}
+
+// The page's helpers -- elements, icons, themes, toasts, menus and dialogs -- which the dashboard takes as its own.
+std::string storage_ui_kit()
+{
+    const auto part = [](std::string_view from, std::string_view to) {
+        const size_t a = ui_page.find(from), b = ui_page.find(to, a);
+        return std::string(ui_page.substr(a, b - a));
+    };
+    return part("// ─── helpers", "// ─── state") + part("// ─── toasts, menus, dialogs", "// ─── signing in");
+}
+
 }   // namespace socketley::storage
