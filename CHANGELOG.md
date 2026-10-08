@@ -23,7 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **The daemon's dashboard runs the daemon.** The page on `metrics_port` is new,
   in the storage interface's look, whose stylesheet and helpers it takes from the
   same binary: an overview of runtimes, connections, messages, bytes, CPU and
-  memory with their last minutes as lines; every runtime with its state and
+  memory over the last fifteen minutes, hour, six hours or day, kept by the
+  daemon a point every ten seconds and across its restarts in `.history` of the
+  state directory, `GET /api/history`; every runtime with its state and
   figures, filtered by type and name; and each runtime's configuration and
   stats. Signed in with an admin key of `daemon.dashboard_credentials`, it
   starts, stops, restarts, removes and reloads runtimes, edits one in a form of

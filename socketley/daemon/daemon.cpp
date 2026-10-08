@@ -860,7 +860,7 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     bool metrics_bound = false;
     if (metrics_port > 0)
     {
-        metrics_bound = metrics.start(metrics_port, config.dashboard_credentials);
+        metrics_bound = metrics.start(metrics_port, config.dashboard_credentials, (paths.state_dir / ".history").string());
         if (metrics_bound)
             LOG_INFO("metrics endpoint started");
         else

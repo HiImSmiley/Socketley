@@ -13672,6 +13672,28 @@ needs it from anywhere but a scraper on this machine without a proxy between;
 without them the page shows the figures, as it always did, and changes
 nothing.
 .IP
+Its figures are drawn over the last fifteen minutes, hour, six hours or day, as
+chosen, the value and time under the pointer shown: the endpoint's thread takes
+a point every ten seconds for each runtime and for the daemon as a whole
+\(em connections and memory as they are, messages, bytes and CPU per second
+\(em keeps a day of them, and writes them to
+.B .history
+in the state directory every five minutes and when the daemon stops, readable
+by its user alone, so a restart keeps them; a runtime that is gone keeps its
+points until they are a day old.
+.BR "GET /api/history?runtime=" name "&range=" seconds "&points=" n
+gives one runtime's, or without a name the daemon's, as the mean of each of
+.I n
+buckets, null for one without a point: an object of
+.B from
+(the first bucket's start, in seconds since 1970),
+.B step
+(a bucket's seconds) and the arrays
+.BR conn ", " msg ", " in ", " out ", " cpu
+(percent of one CPU) and
+.BR rss ;
+the range is held between a minute and a day, the buckets between 10 and 1440.
+.IP
 Its Logs follow the daemon's recent log live, filtered by runtime, by level and
 by text, and each runtime's page shows its own; a runtime that failed says the
 last warning or error it wrote, where it is listed and on its page, beside how

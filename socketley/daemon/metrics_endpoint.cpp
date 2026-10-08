@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstring>
 #include <charconv>
+#include <cstdlib>
 #include <cstdio>
 #include <shared_mutex>
 #include <thread>
@@ -39,9 +40,11 @@ metrics_endpoint::~metrics_endpoint()
     stop();
 }
 
-bool metrics_endpoint::start(uint16_t port, std::string dashboard_credentials)
+bool metrics_endpoint::start(uint16_t port, std::string dashboard_credentials, std::string history_path)
 {
     m_dash = std::make_unique<dashboard::server>(std::move(dashboard_credentials), m_manager);
+    m_history = std::make_unique<history::keeper>(std::move(history_path));
+    m_history->load(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
     // SOCK_CLOEXEC because the daemon forks proxy workers, and with
     // SO_REUSEADDR but not SO_REUSEPORT an inherited copy keeps the metrics
     // port bound after the daemon is gone.
@@ -104,6 +107,8 @@ bool metrics_endpoint::start(uint16_t port, std::string dashboard_credentials)
 
     m_running.store(true, std::memory_order_release);
     m_start_time = std::chrono::steady_clock::now();
+    m_next_sample = m_start_time;
+    m_next_save = m_start_time + std::chrono::minutes(5);
     m_thread = std::thread(&metrics_endpoint::serve_loop, this);
     return true;
 }
@@ -125,6 +130,8 @@ void metrics_endpoint::stop()
 
     if (was && m_thread.joinable())
         m_thread.join();
+    if (was && m_history)
+        m_history->save();
 
     // Raw close — see serve_loop() for why none of this file's descriptors is
     // the event loop's to hold.
@@ -179,7 +186,20 @@ void metrics_endpoint::serve_loop()
         fds[0] = { m_listen_fd, POLLIN, 0 };
         fds[1] = { m_wake_fd,   POLLIN, 0 };
 
-        int ready = poll(fds, 2, -1);
+        // Woken for the next point of the history too, which this thread takes between connections.
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= m_next_sample)
+        {
+            sample();
+            m_next_sample = std::max(m_next_sample + std::chrono::seconds(history::step), now + std::chrono::seconds(1));
+            if (now >= m_next_save)
+            {
+                m_history->save();
+                m_next_save = now + std::chrono::minutes(5);
+            }
+        }
+        const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(m_next_sample - std::chrono::steady_clock::now());
+        int ready = poll(fds, 2, static_cast<int>(std::clamp<int64_t>(wait.count(), 0, history::step * 1000)));
         if (ready < 0)
         {
             if (errno == EINTR)
@@ -192,7 +212,7 @@ void metrics_endpoint::serve_loop()
         if (fds[1].revents != 0)
             break;
 
-        if ((fds[0].revents & POLLIN) == 0)
+        if (ready == 0 || (fds[0].revents & POLLIN) == 0)
             continue;
 
         struct sockaddr_in client_addr{};
@@ -266,6 +286,20 @@ void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)
         else
             dashboard::send(fd, 200, "text/plain; version=0.0.4; charset=utf-8",
                             refresh(m_cached_metrics, [&] { return build_metrics(); }));
+        return;
+    }
+    if (path == "/api/history")
+    {
+        if (!m_dash->may_read(req))
+        {
+            dashboard::send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
+            return;
+        }
+        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        const std::string body = m_history->query(dashboard::query_field(req.query, "runtime"), now,
+            std::strtoll(dashboard::query_field(req.query, "range").c_str(), nullptr, 10),
+            std::strtoul(dashboard::query_field(req.query, "points").c_str(), nullptr, 10));
+        dashboard::send(fd, 200, "application/json", body.empty() ? std::string("{}") : body);
         return;
     }
     if (path.starts_with("/api/overview") || path.starts_with("/api/runtimes") || path.starts_with("/api/runtime/"))
@@ -945,6 +979,48 @@ std::string metrics_endpoint::build_json_overview() const
     json_append_uint(j, static_cast<uint64_t>(std::max(1L, ::sysconf(_SC_NPROCESSORS_ONLN))));
     j += "}";
     return j;
+}
+
+void metrics_endpoint::sample()
+{
+    std::vector<std::pair<std::string, history::reading>> readings;
+    std::vector<std::vector<pid_t>> pids;
+    {
+        std::shared_lock lock(m_manager.mutex);
+        const auto& runtimes = m_manager.list();
+        readings.reserve(runtimes.size() + 1);
+        for (const auto& [name, rt] : runtimes)
+        {
+            const shard_stats::figures f = rt->worker_figures();
+            history::reading r;
+            r.connections = f.active_connections;
+            r.messages = f.total_messages;
+            r.bytes_in = f.bytes_in;
+            r.bytes_out = f.bytes_out;
+            readings.emplace_back(name, r);
+            pids.push_back(rt->shard_pids());
+        }
+    }
+    // The daemon's own is the sum of its runtimes', its own process added to theirs.
+    history::reading all;
+    std::vector<pid_t> every{::getpid()};
+    for (size_t i = 0; i < readings.size(); ++i)
+    {
+        const process_usage u = usage_of(pids[i]);
+        history::reading& r = readings[i].second;
+        r.cpu_seconds = u.cpu_seconds;
+        r.rss_bytes = u.rss_bytes;
+        all.connections += r.connections;
+        all.messages += r.messages;
+        all.bytes_in += r.bytes_in;
+        all.bytes_out += r.bytes_out;
+        every.insert(every.end(), pids[i].begin(), pids[i].end());
+    }
+    const process_usage u = usage_of(every);
+    all.cpu_seconds = u.cpu_seconds;
+    all.rss_bytes = u.rss_bytes;
+    readings.emplace_back(std::string(), all);
+    m_history->record(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(), readings);
 }
 
 std::string metrics_endpoint::build_json_runtimes() const

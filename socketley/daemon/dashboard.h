@@ -31,6 +31,8 @@ struct request
 
 // One request read from `fd`, its head and a body of at most `max_body`; false for none or a malformed one.
 bool read_request(int fd, request& r, size_t max_body = 1 << 20);
+// One query field's value, undecoded but for %XX and '+'.
+std::string query_field(std::string_view query, std::string_view name);
 // One answer, closing the connection.
 void send(int fd, int status, std::string_view type, std::string_view body, std::string_view extra_headers = {});
 

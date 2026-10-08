@@ -20,6 +20,12 @@ constexpr std::string_view dashboard_page = R"HTML(<!doctype html>
 .tile svg.spark{display:block;width:100%;height:42px;margin-top:8px}
 .tile svg.spark path.l{fill:none;stroke:var(--a1);stroke-width:1.8}
 .tile svg.spark path.f{fill:url(#sg);stroke:none;opacity:.35}
+.tile svg.spark line.x{stroke:var(--fg);stroke-width:1;opacity:.45;vector-effect:non-scaling-stroke}
+.tile .tip{position:absolute;right:12px;top:12px;font-size:12px;background:rgba(0,0,0,.55);border:1px solid var(--line);border-radius:8px;padding:3px 9px;pointer-events:none;font-variant-numeric:tabular-nums;white-space:nowrap}
+.tile .tip i{font-style:normal;color:var(--mut)}
+.rng{display:inline-flex;margin-left:auto;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:rgba(255,255,255,.03)}
+.rng button{background:none;border:0;color:var(--mut);font:inherit;font-size:12.5px;font-weight:600;padding:6px 12px;cursor:pointer}
+.rng button.on{background:rgba(255,255,255,.1);color:var(--fg)}
 .dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:none}
 .dot.running{background:var(--ok);box-shadow:0 0 10px var(--ok)}.dot.stopped,.dot.created{background:var(--dim)}.dot.failed{background:var(--bad);box-shadow:0 0 10px var(--bad)}
 .rt{width:100%;border-collapse:separate;border-spacing:0 8px}
@@ -184,9 +190,12 @@ async function problems() {
   } catch (e) {}
 }
 let me = null, schema = null, view = { at: 'over' }, rts = [], meta = {}, over = null, timer = 0, filterType = '';
-const hist = { msg: [], conn: [], bin: [], bout: [], cpu: [], rss: [] };
-// The same, per runtime, while the page is open.
-const rtHist = {};
+// The daemon's rates now, from the last two polls.
+const cur = { msg: 0, bin: 0, bout: 0, cpu: 0 };
+// The daemon's history of the chosen range, by runtime and '' for the daemon, as /api/history gives it.
+const RANGES = [[900, '15m'], [3600, '1h'], [21600, '6h'], [86400, '24h']];
+let range = +localStorage.getItem('skl_range') || 900, hover = null;
+const series = {};
 const prev = { t: 0, msg: 0, bin: 0, bout: 0, cpu: 0, per: {} };
 
 async function api(method, url, body) {
@@ -238,7 +247,9 @@ function route() {
   while (layers.length) layers[layers.length - 1].close();
   $('#side').classList.remove('open');
   const sc = $('#scroll'); if (sc) sc.scrollTop = 0;
+  hover = null;
   render(true);
+  if (over && (view.at === 'over' || view.at === 'rt')) loadSeries(view.at === 'rt' ? view.name : '');
 }
 window.addEventListener('hashchange', () => { if (me) route(); });
 
@@ -273,19 +284,17 @@ async function poll() {
     const [o, r] = await Promise.all([api('GET', '/api/overview').then(must).then(x => x.json()), api('GET', '/api/runtimes').then(must).then(x => x.json())]);
     const now = Date.now() / 1000, dt = prev.t ? now - prev.t : 0;
     if (dt > 0) {
-      const push = (k, v) => { hist[k].push(Math.max(0, v)); if (hist[k].length > 90) hist[k].shift(); };
-      push('msg', (o.messages_total - prev.msg) / dt); push('bin', (o.bytes_in - prev.bin) / dt); push('bout', (o.bytes_out - prev.bout) / dt);
-      push('cpu', 100 * (o.cpu_seconds - prev.cpu) / dt / (o.cpus || 1)); push('conn', o.connections_active); push('rss', o.rss_bytes);
+      cur.msg = Math.max(0, (o.messages_total - prev.msg) / dt); cur.bin = Math.max(0, (o.bytes_in - prev.bin) / dt); cur.bout = Math.max(0, (o.bytes_out - prev.bout) / dt);
+      cur.cpu = Math.max(0, 100 * (o.cpu_seconds - prev.cpu) / dt / (o.cpus || 1));
       for (const x of r) {
         const p = prev.per[x.name]; x.msg_s = p ? Math.max(0, (x.messages_total - p.m) / dt) : 0; x.in_s = p ? Math.max(0, (x.bytes_in - p.i) / dt) : 0; x.out_s = p ? Math.max(0, (x.bytes_out - p.o) / dt) : 0; x.cpu_p = p ? Math.max(0, 100 * (x.cpu_seconds - p.c) / dt) : 0;
-        const h = rtHist[x.name] || (rtHist[x.name] = { msg: [], conn: [], bin: [], bout: [], cpu: [], rss: [] });
-        for (const [k, v] of [['msg', x.msg_s], ['conn', x.connections], ['bin', x.in_s], ['bout', x.out_s], ['cpu', x.cpu_p], ['rss', x.rss_bytes]]) { h[k].push(v); if (h[k].length > 90) h[k].shift(); }
       }
     }
     prev.t = now; prev.msg = o.messages_total; prev.bin = o.bytes_in; prev.bout = o.bytes_out; prev.cpu = o.cpu_seconds;
     prev.per = Object.fromEntries(r.map(x => [x.name, { m: x.messages_total, i: x.bytes_in, o: x.bytes_out, c: x.cpu_seconds }]));
     over = o; rts = r;
     if (now - problemsAt > 6) { problemsAt = now; problems(); }
+    if (view.at === 'over' || view.at === 'rt') loadSeries(view.at === 'rt' ? view.name : '');
     render(false);
   } catch (e) { if (me) toast(e.message, 'bad'); }
   if (me) timer = setTimeout(poll, 2000);
@@ -294,20 +303,73 @@ async function poll() {
 async function loadMeta() {
   try { const r = await run('ls', '--json'); if (!r.code) for (const x of JSON.parse(r.out)) meta[x.name] = x; } catch (e) {}
 }
-// A rate is drawn from zero, a gauge (`span`) between its least and greatest value.
-function spark(vals, span) {
+// One runtime's history, or the daemon's for '', asked again once the daemon has taken a new point.
+async function loadSeries(name) {
+  const had = series[name];
+  if (had && had.range === range && Date.now() - had.at < 10000) return;
+  if (had && had.loading) return;
+  series[name] = Object.assign(had || {}, { loading: true });
+  try {
+    const d = await (await must(await api('GET', '/api/history?runtime=' + encodeURIComponent(name) + '&range=' + range + '&points=' + Math.min(180, range / 10)))).json();
+    series[name] = { at: Date.now(), range, d: d.from ? d : null };
+    render(false);
+  } catch (e) { series[name] = { at: Date.now(), range, d: null }; }
+}
+function rangePick() {
+  return el('div', { class: 'rng' }, ...RANGES.map(([v, t]) => el('button', { class: v === range ? 'on' : '', text: t, title: 'The last ' + t,
+    onclick: () => { range = v; localStorage.setItem('skl_range', v); for (const k in series) delete series[k]; render(false); loadSeries(view.at === 'rt' ? view.name : ''); } })));
+}
+// A line of `name`'s history: `key`'s values, a rate drawn from zero and a gauge (`span`) between its least and
+// greatest value, `fmt` saying a value for the hover; null while there is none.
+function line(name, key, fmt, span, scale) {
+  const h = series[name];
+  if (!h || !h.d) return null;
+  const vals = h.d[key].map(v => v === null ? null : v * (scale || 1));
+  return { vals, from: h.d.from, step: h.d.step, fmt, span };
+}
+function spark(ln) {
   const s = document.createElementNS(SVGNS, 'svg'); s.setAttribute('class', 'spark'); s.setAttribute('viewBox', '0 0 100 30'); s.setAttribute('preserveAspectRatio', 'none');
-  if (vals.length < 2) return s;
-  const lo = span ? Math.min(...vals) : 0, top = Math.max(...vals) - lo, n = vals.length;
-  const pts = vals.map((v, i) => [(i / (n - 1)) * 100, top ? 28 - ((v - lo) / top) * 26 : span ? 15 : 28]);
-  const d = pts.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(2) + ' ' + p[1].toFixed(2)).join('');
-  s.innerHTML = '<path class="f" d="' + d + 'L100 30L0 30Z"/><path class="l" d="' + d + '"/>';
+  const vals = ln.vals, n = vals.length, some = vals.filter(v => v !== null);
+  if (some.length < 2) return s;
+  const lo = ln.span ? Math.min(...some) : 0, top = Math.max(...some) - lo;
+  const y = v => top ? 28 - ((v - lo) / top) * 26 : ln.span ? 15 : 28;
+  // A stretch without points is a gap in the line, not a fall to zero.
+  let d = '', f = '', run = [];
+  const flush = () => {
+    if (!run.length) return;
+    const seg = run.map(([i, v], j) => (j ? 'L' : 'M') + (i / (n - 1) * 100).toFixed(2) + ' ' + y(v).toFixed(2)).join('');
+    d += seg; f += seg + 'L' + (run[run.length - 1][0] / (n - 1) * 100).toFixed(2) + ' 30L' + (run[0][0] / (n - 1) * 100).toFixed(2) + ' 30Z';
+    run = [];
+  };
+  vals.forEach((v, i) => { if (v === null) flush(); else run.push([i, v]); });
+  flush();
+  s.innerHTML = '<path class="f" d="' + f + '"/><path class="l" d="' + d + '"/>';
   return s;
 }
-function tile(icon, k, v, s, vals, span) {
-  return el('div', { class: 'tile' }, el('div', { class: 'k' }, ico(icon), el('span', { text: k })), el('div', { class: 'v', text: v }), s ? el('div', { class: 's', text: s }) : null, vals ? spark(vals, span) : null);
+const hhmm = t => new Date(t * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+function tile(icon, k, v, s, ln) {
+  const T = el('div', { class: 'tile' }, el('div', { class: 'k' }, ico(icon), el('span', { text: k })), el('div', { class: 'v', text: v }), s ? el('div', { class: 's', text: s }) : null);
+  if (!ln) return T;
+  const S = spark(ln);
+  T.append(S);
+  // The value under the pointer, kept across the redraw every poll makes.
+  const show = x => {
+    T.querySelector('.tip')?.remove(); S.querySelector('line')?.remove();
+    const n = ln.vals.length;
+    // The point nearest the pointer, on either side.
+    const i = Math.round(x * (n - 1));
+    let at = -1;
+    for (let d = 0; d < n && at < 0; d++) at = ln.vals[i - d] != null ? i - d : ln.vals[i + d] != null ? i + d : -1;
+    if (at < 0) return;
+    const L = document.createElementNS(SVGNS, 'line'); const px = (at / (n - 1) * 100).toFixed(2);
+    L.setAttribute('class', 'x'); L.setAttribute('x1', px); L.setAttribute('x2', px); L.setAttribute('y1', 0); L.setAttribute('y2', 30); S.append(L);
+    T.append(el('div', { class: 'tip' }, ln.fmt(ln.vals[at]) + ' ', el('i', { text: hhmm(ln.from + (at + 0.5) * ln.step) })));
+  };
+  T.onmousemove = e => { const r = S.getBoundingClientRect(); hover = { k, x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)) }; show(hover.x); };
+  T.onmouseleave = () => { hover = null; T.querySelector('.tip')?.remove(); S.querySelector('line')?.remove(); };
+  if (hover && hover.k === k) show(hover.x);
+  return T;
 }
-const last = a => a.length ? a[a.length - 1] : 0;
 
 // ─── views ──────────────────────────────────────────────────────────────────
 function render(full) {
@@ -324,15 +386,16 @@ function overview() {
   const C = $('#content'); C.textContent = '';
   if (!over) { C.append(el('div', { class: 'spin' })); return; }
   const running = rts.filter(r => r.state === 'running').length, failed = rts.filter(r => r.state === 'failed').length;
-  C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('pulse')), el('span', { text: 'Daemon' }), el('span', { class: 'n', text: 'v' + over.version + ' · up ' + ago(over.uptime_seconds) }))),
+  const cpus = over.cpus || 1, pct = v => v.toFixed(1) + ' %';
+  C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('pulse')), el('span', { text: 'Daemon' }), el('span', { class: 'n', text: 'v' + over.version + ' · up ' + ago(over.uptime_seconds) }), rangePick())),
     el('div', { class: 'tiles' },
       tile('server', 'Runtimes', running + ' / ' + over.runtimes_total, failed ? failed + ' failed' : running === over.runtimes_total ? 'all running' : (over.runtimes_total - running) + ' stopped'),
-      tile('users', 'Connections', count(over.connections_active), count(over.connections_total) + ' since start', hist.conn),
-      tile('send', 'Messages', count(last(hist.msg)) + '/s', count(over.messages_total) + ' since start', hist.msg),
-      tile('download', 'In', rate(last(hist.bin)), human(over.bytes_in) + ' since start', hist.bin),
-      tile('upload', 'Out', rate(last(hist.bout)), human(over.bytes_out) + ' since start', hist.bout),
-      tile('cpu', 'CPU', last(hist.cpu).toFixed(1) + ' %', over.cpus + ' CPUs · ' + over.processes + ' processes', hist.cpu),
-      tile('gauge', 'Memory', human(over.rss_bytes), 'resident, daemon and workers', hist.rss, true)));
+      tile('users', 'Connections', count(over.connections_active), count(over.connections_total) + ' since start', line('', 'conn', count)),
+      tile('send', 'Messages', count(cur.msg) + '/s', count(over.messages_total) + ' since start', line('', 'msg', v => count(v) + '/s')),
+      tile('download', 'In', rate(cur.bin), human(over.bytes_in) + ' since start', line('', 'in', rate)),
+      tile('upload', 'Out', rate(cur.bout), human(over.bytes_out) + ' since start', line('', 'out', rate)),
+      tile('cpu', 'CPU', pct(cur.cpu), cpus + ' CPUs · ' + over.processes + ' processes', line('', 'cpu', pct, false, 1 / cpus)),
+      tile('gauge', 'Memory', human(over.rss_bytes), 'resident, daemon and workers', line('', 'rss', human, true))));
   C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('server')), el('span', { text: 'Runtimes' }), el('span', { class: 'n', text: String(rts.length) }))), table(rts));
 }
 function runtimes() {
@@ -404,15 +467,15 @@ async function detail(full) {
   const t = TYPES[r.type] || [r.type, r.type];
   const H = $('#dHead'); H.textContent = '';
   H.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico(t[0])), el('span', { text: r.name }), el('span', { class: 'n' }, el('span', { class: 'dot ' + r.state }), ' ' + r.state + ' · ' + t[1] + (r.port ? ' · port ' + r.port : '')))),
-    el('div', { class: 'acts', style: 'margin:-4px 0 18px' }, ...controls(r, false)));
+    el('div', { class: 'acts', style: 'margin:-4px 0 18px' }, ...controls(r, false), rangePick()));
   const D = $('#dTiles'); D.textContent = '';
-  const h = rtHist[r.name] || {};
-  D.append(tile('users', 'Connections', count(r.connections), count(r.connections_total) + ' since start', h.conn),
-    tile('send', 'Messages', count(r.msg_s || 0) + '/s', count(r.messages_total) + ' since start', h.msg),
-    tile('download', 'In', rate(r.in_s || 0), human(r.bytes_in) + ' since start', h.bin),
-    tile('upload', 'Out', rate(r.out_s || 0), human(r.bytes_out) + ' since start', h.bout),
-    tile('cpu', 'CPU', (r.cpu_p || 0).toFixed(1) + ' %', r.processes + ' process' + (r.processes === 1 ? '' : 'es'), h.cpu),
-    tile('gauge', 'Memory', human(r.rss_bytes), 'resident', h.rss, true));
+  const n = r.name, pct = v => v.toFixed(1) + ' %';
+  D.append(tile('users', 'Connections', count(r.connections), count(r.connections_total) + ' since start', line(n, 'conn', count)),
+    tile('send', 'Messages', count(r.msg_s || 0) + '/s', count(r.messages_total) + ' since start', line(n, 'msg', v => count(v) + '/s')),
+    tile('download', 'In', rate(r.in_s || 0), human(r.bytes_in) + ' since start', line(n, 'in', rate)),
+    tile('upload', 'Out', rate(r.out_s || 0), human(r.bytes_out) + ' since start', line(n, 'out', rate)),
+    tile('cpu', 'CPU', pct(r.cpu_p || 0), r.processes + ' process' + (r.processes === 1 ? '' : 'es'), line(n, 'cpu', pct)),
+    tile('gauge', 'Memory', human(r.rss_bytes), 'resident', line(n, 'rss', human, true)));
   if (!full && shown.stamp && Date.now() - shown.stamp > 5000) statsText(r.name);
   tailInto($('#dLog'), shown, r.name, 300);
   if (r.state === 'failed' && why[r.name] && !$('#dWhy')) H.append(el('div', { id: 'dWhy', class: 'panel', style: 'border-color:rgba(251,88,118,.4)' }, el('h3', {}, ico('info'), el('span', { text: 'Why it failed' })), el('div', { class: 'kv' }, el('div', { class: 'k', text: new Date(why[r.name].at).toLocaleString() }), el('div', { class: 'v', text: clean(why[r.name].text) }))));

@@ -377,8 +377,7 @@ void server::session(int fd, const request& r)
              "; HttpOnly; SameSite=Strict" + (https ? "; Secure" : "") + "\r\n");
 }
 
-// One query field's value, undecoded but for %XX and '+'.
-static std::string query_field(std::string_view q, std::string_view name)
+std::string query_field(std::string_view q, std::string_view name)
 {
     for (size_t p = 0; p < q.size();)
     {
