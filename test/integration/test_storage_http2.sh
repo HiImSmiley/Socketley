@@ -91,14 +91,17 @@ python3 "$HERE/lib_storage_http2.py" "$P2" "$BIN" stgh2c > "$T/frames.out" 2>&1
 cat "$T/frames.out"
 n_pass=$(grep -c '^  PASS' "$T/frames.out"); n_fail=$(grep -c '^  FAIL' "$T/frames.out")
 PASS=$((PASS + n_pass)); FAIL=$((FAIL + n_fail)); TOTAL=$((TOTAL + n_pass + n_fail))
-if grep -q SKIP "$T/frames.out"; then echo "  (the frame-by-frame part was skipped)"; fi
-
-# Each shard has a section of its own, published as its figures change; the counts are their sums.
+# Each shard has a section of its own, published as its figures change; the counts are their sums -- of the streams,
+# refusals and GOAWAYs the frame-by-frame part made, so without it there is nothing to count.
 sum() { "$BIN" stats stgh2c 2>/dev/null | awk -F: -v k="$1" '$1==k {s+=$2} END {print s+0}'; }
-for _ in $(seq 1 100); do [ "$(sum h2_streams)" -ge 100 ] && [ "$(sum h2_refused)" -ge 1 ] && [ "$(sum h2_goaways)" -ge 1 ] && break; sleep 0.1; done
-n=$(sum h2_streams); r=$(sum h2_refused); g=$(sum h2_goaways)
-if [ "$n" -ge 100 ] && [ "$r" -ge 1 ] && [ "$g" -ge 1 ]; then ok "stats counts the streams ($n), the refused and the GOAWAYs"
-else bad "stats counts streams" "streams=$n refused=$r goaways=$g"; fi
+if grep -q SKIP "$T/frames.out"; then
+    echo "  SKIP: stats counts streams (the frame-by-frame part was skipped)"
+else
+    for _ in $(seq 1 100); do [ "$(sum h2_streams)" -ge 100 ] && [ "$(sum h2_refused)" -ge 1 ] && [ "$(sum h2_goaways)" -ge 1 ] && break; sleep 0.1; done
+    n=$(sum h2_streams); r=$(sum h2_refused); g=$(sum h2_goaways)
+    if [ "$n" -ge 100 ] && [ "$r" -ge 1 ] && [ "$g" -ge 1 ]; then ok "stats counts the streams ($n), the refused and the GOAWAYs"
+    else bad "stats counts streams" "streams=$n refused=$r goaways=$g"; fi
+fi
 expect "the TLS runtime still serves HTTP/1.1 and HTTP/2 after all that" \
     "$(h2 --http1.1 -o /dev/null -w '%{http_code}' "$U/htwo/s.txt") $(h2 -o /dev/null -w '%{http_code}' "$U/htwo/s.txt")" "200 200"
 

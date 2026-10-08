@@ -15,6 +15,8 @@
 daemon_isolate() {
     local tag=${1:-test}
     SOCKETLEY_TMPD=$(mktemp -d "/tmp/socketley-$tag-XXXXXX")
+    # Python's packages installed with --user stay found, which the test's own HOME would hide.
+    [ -n "${PYTHONUSERBASE:-}" ] || export PYTHONUSERBASE="$HOME/.local"
     export HOME="$SOCKETLEY_TMPD/home"
     export SOCKETLEY_SOCKET="$SOCKETLEY_TMPD/daemon.sock"
     mkdir -p "$HOME"

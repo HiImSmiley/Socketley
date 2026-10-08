@@ -142,11 +142,14 @@ PY
 )
 for dt in $dates; do s3 -X PUT --data-binary x "http://127.0.0.1:$ST/code/_backups/demo/${dt}_0000000000.bundle" >/dev/null; done
 set -- $dates
+# A bundle is named by its second and commit, so one of this commit made in the run's second would be the run's.
+sleep 1
 SOCKETLEY_GIT_ACCESS_KEY=$ALICE_K SOCKETLEY_GIT_SECRET=$ALICE_S "$BIN" git-sync --url "git://127.0.0.1:$GP/demo.git" \
     --branch main --work "$T/byhand" --endpoint "127.0.0.1:$ST" --bucket code --name demo > "$T/byhand.out" 2>&1
 expect "git-sync by hand, with its own clone, ends well" "$?" 0
 left=$(bundles)
-expect "the last day's bundles all stay, its own among them" "$(echo "$left" | grep -c "$(date -u +%Y-%m-%d)")" 3
+# The runs' own, by their commit rather than their date, which is yesterday's for a run just before midnight.
+expect "the last day's bundles all stay, its own among them" "$(echo "$left" | grep '\.bundle$' | grep -vc '_0000000000\.bundle$')" 3
 expect "and the newest of each recent day" "$(echo "$left" | grep -cE "$1|$2")" 2
 expect "the newest of an older week stays and the other of it goes" "$(echo "$left" | grep -c "$4") $(echo "$left" | grep -c "$3")" "1 0"
 expect "and one more than a year old goes" "$(echo "$left" | grep -c "$5")" 0
