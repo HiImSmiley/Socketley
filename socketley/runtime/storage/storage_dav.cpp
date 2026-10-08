@@ -166,11 +166,7 @@ void storage_run::app_reply(const std::shared_ptr<conn>& c, int status, std::str
 
 std::string storage_run::miss_key(conn& c)
 {
-    if (!c.ip_known)
-    {
-        c.ip       = client_ip_of(c.sock());
-        c.ip_known = true;
-    }
+    client_address(c);
     // One holder of an IPv6 network has its whole /64, so that is what counts as one address.
     return std::string(1, static_cast<char>(c.ip.family)) +
            std::string(reinterpret_cast<const char*>(c.ip.addr), c.ip.family == 4 ? 4 : c.ip.family == 6 ? 8 : 0);

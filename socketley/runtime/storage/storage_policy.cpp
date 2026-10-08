@@ -3,6 +3,7 @@
 // authenticated and before a script's on_request sees it.
 #include "storage_run.h"
 
+#include <arpa/inet.h>
 #include <openssl/ssl.h>
 
 #include "bucket_policy.h"
@@ -229,11 +230,7 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
     {
         if (!u || u->unrestricted() || r.method != "GET")
             return;
-        if (!c->ip_known)
-        {
-            c->ip       = client_ip_of(c->sock());
-            c->ip_known = true;
-        }
+        client_address(*c);
         const request_context ctx(*c, u, false, static_cast<int64_t>(m_store.now_ms()));
         policy_request pr;
         pr.ctx       = &ctx;
@@ -424,11 +421,8 @@ policy_effect storage_run::access_of(const std::shared_ptr<conn>& c, std::string
 {
     if (const bucket_policy* bound = u ? u->session_policy.get() : nullptr)
     {
-        if (bound->needs_ip() && !c->ip_known)
-        {
-            c->ip       = client_ip_of(c->sock());
-            c->ip_known = true;
-        }
+        if (bound->needs_ip())
+            client_address(*c);
         // A session's policy bounds everything else: what it does not allow nothing else can.
         const policy_effect e = bound->evaluate(q);
         if (e != policy_effect::allow)
@@ -452,11 +446,8 @@ policy_effect storage_run::access_of(const std::shared_ptr<conn>& c, std::string
     // The bucket's policy is asked for its Deny always, and for its Allow only when nothing else lets the request in.
     if (p && (!u || p->has_deny() || (!full && own != policy_effect::allow)))
     {
-        if (p->needs_ip() && !c->ip_known)
-        {
-            c->ip       = client_ip_of(c->sock());
-            c->ip_known = true;
-        }
+        if (p->needs_ip())
+            client_address(*c);
         pol = p->evaluate(q);
         // A public policy lets in nobody without credentials while the bucket restricts it.
         if (!u && pol == policy_effect::allow && p->is_public())
@@ -483,31 +474,61 @@ policy_effect storage_run::access_of(const std::shared_ptr<conn>& c, std::string
     return policy_effect::none;
 }
 
+const client_ip& storage_run::client_address(conn& c)
+{
+    if (c.ip_known)
+        return c.ip;
+    c.ip       = client_ip_of(c.sock());
+    c.ip_known = true;
+    c.via_offloader = std::any_of(m_tls_offloaded.begin(), m_tls_offloaded.end(),
+                                  [&](const bucket_policy::cidr& b) { return cidr_holds(b, c.ip); });
+    if (!c.via_offloader)
+        return c.ip;
+    // The proxy put the address it was reached from last; anything before that is the client's own word.
+    std::string_view xff = c.req.header("x-forwarded-for");
+    if (const size_t comma = xff.rfind(','); comma != std::string_view::npos)
+        xff.remove_prefix(comma + 1);
+    xff = http_trim_ows(xff);
+    char text[INET6_ADDRSTRLEN]{};
+    if (xff.empty() || xff.size() >= sizeof text)
+        return c.ip;
+    std::memcpy(text, xff.data(), xff.size());
+    client_ip ip;
+    if (::inet_pton(AF_INET, text, ip.addr) == 1)
+        ip.family = 4;
+    else if (::inet_pton(AF_INET6, text, ip.addr) == 1)
+    {
+        ip.family = 6;
+        static constexpr uint8_t mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+        if (std::memcmp(ip.addr, mapped, 12) == 0)
+        {
+            std::memmove(ip.addr, ip.addr + 12, 4);
+            std::memset(ip.addr + 4, 0, 12);
+            ip.family = 4;
+        }
+    }
+    else
+        return c.ip;
+    c.ip = ip;
+    c.ip_forwarded = true;
+    return c.ip;
+}
+
 bool storage_run::secure(conn& c)
 {
     if (c.tls())
         return true;
     if (m_tls_offloaded.empty())
         return false;
-    if (!c.ip_known)
-    {
-        c.ip       = client_ip_of(c.sock());
-        c.ip_known = true;
-    }
-    for (const bucket_policy::cidr& b : m_tls_offloaded)
-        if (cidr_holds(b, c.ip))
-            return true;
-    return false;
+    client_address(c);
+    return c.via_offloader;
 }
 
 policy_effect storage_run::iam_access(const std::shared_ptr<conn>& c, const user_identity& u, std::string_view principal,
                                       int action, std::string_view resource)
 {
-    if (!c->ip_known && ((u.has_policy && u.policy.needs_ip()) || (u.iam_policy && u.iam_policy->needs_ip())))
-    {
-        c->ip       = client_ip_of(c->sock());
-        c->ip_known = true;
-    }
+    if ((u.has_policy && u.policy.needs_ip()) || (u.iam_policy && u.iam_policy->needs_ip()))
+        client_address(*c);
     const request_context ctx(*c, &u, false, static_cast<int64_t>(m_store.now_ms()));
     policy_request q;
     q.ctx          = &ctx;

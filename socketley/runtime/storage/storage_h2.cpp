@@ -783,7 +783,8 @@ bool storage_run::h2_headers(const std::shared_ptr<conn>& c, uint32_t sid)
     sc->accepted  = c->accepted;
     sc->last_progress = sc->request_began = std::chrono::steady_clock::now();
     sc->ip        = c->ip;
-    sc->ip_known  = c->ip_known;
+    sc->ip_known  = c->ip_known && !c->ip_forwarded;
+    sc->via_offloader = c->via_offloader;
     sc->any_request = true;
     h2_stream& st = *sc->h2s;
     st.sid           = sid;

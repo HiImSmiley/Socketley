@@ -1756,6 +1756,11 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->trickle  = false;
     c->pace_due = false;
     c->principal.clear();
+    if (c->ip_forwarded)
+    {
+        c->ip_known     = false;
+        c->ip_forwarded = false;
+    }
     c->user.reset();
     c->anonymous       = false;
     c->cluster         = false;

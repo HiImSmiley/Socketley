@@ -181,11 +181,7 @@ void storage_run::access_log(const std::shared_ptr<conn>& c, int status, uint64_
     plain(l, owner_of(r.bucket));
     plain(l, r.bucket);
     log_time(l, now_ms);
-    if (!c->ip_known)
-    {
-        c->ip       = client_ip_of(c->sock());
-        c->ip_known = true;
-    }
+    client_address(*c);
     char ip[INET6_ADDRSTRLEN] = "-";
     if (c->ip.family == 4)
         ::inet_ntop(AF_INET, c->ip.addr, ip, sizeof ip);

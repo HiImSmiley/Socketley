@@ -503,9 +503,13 @@ struct conn
     std::shared_ptr<const user_identity> user;
     // The CORS header lines every answer to this request carries, empty unless a rule allows its origin.
     std::string cors_head;
-    // The peer's address as a policy condition compares it, read the first time one does.
+    // The client's address as a policy condition compares it, read the first time one does (client_address).
     client_ip   ip;
     bool        ip_known{false};
+    // `ip` was a proxy's X-Forwarded-For, the request's own and read again for the next; the peer is a proxy
+    // --tls-offloaded names.
+    bool        ip_forwarded{false};
+    bool        via_offloader{false};
     // The request carried no credentials, and was let in by a bucket policy rather than by the runtime.
     bool        anonymous{false};
     // Another node of the cluster sent it, to write what that node made, which no policy judges.
@@ -681,6 +685,9 @@ public:
     const tierer& tiers() const { return m_tier; }
     // The addresses whose connections arrive from a proxy that terminated TLS for them (--tls-offloaded).
     void set_tls_offloaded(std::vector<bucket_policy::cidr> from) { m_tls_offloaded = std::move(from); }
+    // The client's address: the socket's peer, or behind a proxy --tls-offloaded names, the address that proxy put
+    // last in X-Forwarded-For.
+    const client_ip& client_address(conn& c);
     // Whether the client reached the runtime over TLS, here or at a proxy --tls-offloaded trusts.
     bool secure(conn& c);
     // The OIDC provider and LDAP directory STS takes identities from (--federation).
