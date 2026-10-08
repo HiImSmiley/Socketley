@@ -358,6 +358,7 @@ private:
     // The addresses runtimes' names are given (--publish), and when the feed was last read.
     std::vector<std::string> m_v4, m_v6;
     int64_t m_feed_stamp{-1};
+    std::chrono::steady_clock::time_point m_refusal_said{};
     bool m_auto_addresses{false};
     int64_t m_addresses_at{0};
     std::vector<ip_block> m_transfer;
@@ -965,7 +966,16 @@ void dns_run::tcp_serve(const std::shared_ptr<tcp_conn>& c)
             continue;
         }
         if (meta.qtype == type::AXFR || meta.qtype == type::IXFR)
+        {
             ++m_c.transfers_refused;
+            // Said, at most once a second, so a secondary asking from an address --transfer does not name is found.
+            if (const auto now = std::chrono::steady_clock::now(); now - m_refusal_said >= std::chrono::seconds(1))
+            {
+                m_refusal_said = now;
+                LOG_WARN(("dns: a zone transfer was refused to " + peer_text(c->peer) +
+                          ", which --transfer does not name").c_str());
+            }
+        }
         ++m_c.tcp_queries;
         count(meta);
         wr16(out, static_cast<uint16_t>(n));

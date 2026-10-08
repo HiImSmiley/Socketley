@@ -139,6 +139,8 @@ expect "dig, told of the truncation, comes back over TCP by itself" "$(q +short 
 # ── transfer ────────────────────────────────────────────────────────────────
 expect "AXFR to an address --transfer names: SOA, every record, SOA" "$(q example.com AXFR +noall +answer | grep -c IN)" 53
 has "AXFR from another address is refused" "$(q -b 127.0.0.2 example.com AXFR)" "Transfer failed"
+for _ in $(seq 1 20); do grep -q "transfer was refused to 127.0.0.2" "$SOCKETLEY_DLOG" && break; sleep 0.1; done
+has "and the refusal is logged with who asked" "$(grep -o 'transfer was refused to 127.0.0.2[^,]*' "$SOCKETLEY_DLOG" | head -1)" "127.0.0.2"
 
 # ── reload ──────────────────────────────────────────────────────────────────
 for _ in $(seq 1 30); do grep -q opcode=4 "$T/notified" 2>/dev/null && break; sleep 0.1; done
