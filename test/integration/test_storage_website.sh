@@ -138,7 +138,8 @@ check "and the bucket has none" "$(code "$U/site?website")" 404
 # ── a policy says who may read it ──
 CREDS="$SOCKETLEY_TMPD/creds"
 echo "AKIAWEBSITEADMIN0000:websiteadminsecretwebsiteadminsecret000" > "$CREDS"
-"$BIN" create storage webp -p "$P2" --dir "$SOCKETLEY_TMPD/webp" --credentials "$CREDS" --website-domain web.test -s >/dev/null 2>&1
+# A name belongs to one runtime, so this one has a domain of its own.
+"$BIN" create storage webp -p "$P2" --dir "$SOCKETLEY_TMPD/webp" --credentials "$CREDS" --website-domain webp.test -s >/dev/null 2>&1
 up "$P2" || bad "the runtime with credentials serves" "no answer on $P2"
 python3 - "$P2" "$HERE" <<'PY'
 import http.client, sys
@@ -160,7 +161,7 @@ req("PUT", "/pub/index.html", body=b"public")
 req("PUT", "/pub/error.html", body=b"public-oops")
 req("PUT", "/pub/private/error.html", body=b"x")
 PY
-PW() { local p=$1; shift; curl -s -H "Host: pub.web.test:$P2" "$@" "http://127.0.0.1:$P2$p"; }
+PW() { local p=$1; shift; curl -s -H "Host: pub.webp.test:$P2" "$@" "http://127.0.0.1:$P2$p"; }
 check "without a policy nobody may read the website" "$(PW / -o /dev/null -w '%{http_code}')" 403
 check "nor its error document" "$(PW / | grep -c '<li>Code: AccessDenied</li>')" 1
 check "nor with credentials of its own" \
