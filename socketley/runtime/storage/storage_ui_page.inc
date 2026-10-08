@@ -1594,8 +1594,8 @@ function linksDlg() {
   fill();
   return L;
 }
-// Git repositories kept in a library: fetched every day, their branch's files under <name>/ and a bundle of their
-// history under _backups/<name>/ whenever anything moved.
+// Git repositories kept in a library: pulled every day, week or month, or only when asked, their branch's files under
+// <name>/ and a bundle of their history under _backups/<name>/ whenever anything moved.
 function gitDlg() {
   const box = el('div');
   const L = modal('Git', box, null, true);
@@ -1606,15 +1606,22 @@ function gitDlg() {
   const branch = el('input', { class: 'inp', value: 'main', spellcheck: 'false', title: 'A branch, or * for every branch' });
   const lib = el('input', { class: 'inp', value: 'git', spellcheck: 'false' });
   const name = el('input', { class: 'inp', placeholder: 'from the URL', spellcheck: 'false' });
-  const hour = el('select', { class: 'inp' }, ...Array.from({ length: 24 }, (_, h) => el('option', { value: String(h), text: String(h).padStart(2, '0') + ':00' })));
-  hour.value = '3';
+  const EVERY = [['never', 'Never'], ['day', 'Day'], ['week', 'Week'], ['month', 'Month']];
+  const everySel = v => { const e = el('select', { class: 'inp' }, ...EVERY.map(([k, t]) => el('option', { value: k, text: t }))); e.value = v; return e; };
+  const every = everySel('never');
+  // Where a repository's files and backups go, said as it is typed.
+  const repoName = () => name.value.trim() || ((url.value.trim().replace(/\/+$/, '').split('/').pop() || '').replace(/\.git$/, '').replace(/[^A-Za-z0-9._-]/g, '-').replace(/^[.-]+/, '')) || '…';
+  const where = el('div', { class: 'mut', style: 'font-size:12.5px;margin-top:6px' });
+  const paintWhere = () => { const l = lib.value.trim() || 'git', n = repoName(); where.textContent = 'Files go to ' + l + '/' + n + '/ and backups to ' + l + '/_backups/' + n + '/'; };
+  [url, lib, name].forEach(i => i.addEventListener('input', paintWhere));
+  paintWhere();
   const priv = el('input', { type: 'checkbox' });
   const add = async () => {
     const u = url.value.trim();
     if (!u) { url.focus(); return; }
     try {
-      const r = await (await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'add', url: u, branch: branch.value.trim() || 'main', bucket: lib.value.trim() || 'git', name: name.value.trim(), private: priv.checked, hour: +hour.value }) }))).json();
-      url.value = ''; name.value = '';
+      const r = await (await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'add', url: u, branch: branch.value.trim() || 'main', bucket: lib.value.trim() || 'git', name: name.value.trim(), private: priv.checked, every: every.value }) }))).json();
+      url.value = ''; name.value = ''; paintWhere();
       toast(r.started ? 'Added; the first copy is being made' : 'Added, but not run: ' + r.why, r.started ? 'ok' : 'bad');
       fill();
     } catch (e) { fail(e); }
@@ -1625,7 +1632,8 @@ function gitDlg() {
   const setTok = async v => { try { await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'token', token: v }) })); tok.value = ''; toast(v ? 'Token kept' : 'Token removed'); fill(); } catch (e) { fail(e); } };
   const T = el('table', { class: 'mtbl' });
   const form = el('div', {},
-    el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end' }, field('Repository URL', url), field('Branch', branch), field('Library', lib), field('Folder', name), field('Daily at', hour)),
+    el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end' }, field('Repository URL', url), field('Branch', branch), field('Library', lib), field('Name', name), field('Pull every', every)),
+    where,
     el('div', { style: 'display:flex;gap:10px;align-items:center;margin:10px 0 18px' }, el('label', { class: 'chk' }, priv, ' Private (uses your GitHub token)'), el('span', { style: 'flex:1' }), btn('plus', 'Add repository', add, 'pri')));
   const acct = el('div', { style: 'margin-top:20px' }, el('h4', { text: 'Your GitHub token', style: 'margin:0 0 6px' }),
     el('p', { class: 'mut', style: 'font-size:12.5px;margin:0 0 8px', text: 'Only needed for private repositories. A fine-grained token with read access to their contents is enough. It is kept sealed with your own key and never shown again.' }),
@@ -1638,8 +1646,8 @@ function gitDlg() {
     if (!g.available) { box.append(el('p', { text: 'Git is not available on this runtime: ' + g.why })); return; }
     tokState.textContent = g.token ? 'A token is set.' : 'No token set.';
     T.textContent = '';
-    T.append(el('tr', {}, el('th', { text: 'Repository' }), el('th', { text: 'Branch' }), el('th', { text: 'Last run' }), el('th')));
-    if (!g.repos.length) T.append(el('tr', {}, el('td', { class: 'mut', colspan: '4', text: 'No repositories yet. Add one above; it is copied now and then every day.' })));
+    T.append(el('tr', {}, el('th', { text: 'Repository' }), el('th', { text: 'Branch' }), el('th', { text: 'Pull every' }), el('th', { text: 'Last pull' }), el('th')));
+    if (!g.repos.length) T.append(el('tr', {}, el('td', { class: 'mut', colspan: '5', text: 'No repositories yet. Add one above; it is copied now, and again as often as you choose.' })));
     let busy = false;
     for (const r of g.repos) {
       busy = busy || r.running;
@@ -1650,8 +1658,13 @@ function gitDlg() {
         : el('span', { class: 'fire', title: st.error || '', text: 'failed ' + new Date(st.at * 1000).toLocaleString() + ': ' + (st.error || 'see the log') });
       T.append(el('tr', {},
         el('td', { class: 'w' }, el('a', { href: '#', text: r.bucket + '/' + r.name, onclick: e => { e.preventDefault(); L.close(); go([r.bucket, r.name]); } }),
-          el('div', { class: 'mut', style: 'font-size:12px;word-break:break-all', text: r.url + (r.private ? ' · private' : '') + (g.repos.some(x => x.owner !== r.owner) ? ' · ' + r.owner : '') + ' · daily at ' + String(r.hour).padStart(2, '0') + ':00' })),
+          el('div', { class: 'mut', style: 'font-size:12px;word-break:break-all', text: r.url + (r.private ? ' · private' : '') + (g.repos.some(x => x.owner !== r.owner) ? ' · ' + r.owner : '') })),
         el('td', { class: 'mut', text: r.branch === '*' ? 'all' : r.branch }),
+        el('td', {}, (() => {
+          const e = everySel(r.every); e.style.height = '32px';
+          e.onchange = async () => { try { await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'every', id: r.id, every: e.value }) })); toast(e.value === 'never' ? r.name + ' is pulled only when you ask' : r.name + ' is pulled every ' + e.value); } catch (x) { fail(x); fill(); } };
+          return e;
+        })()),
         el('td', { style: 'font-size:12.5px' }, last),
         el('td', { class: 'r', style: 'white-space:nowrap' },
           btn(null, 'Sync now', async () => { try { await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'sync', id: r.id }) })); toast('Running'); setTimeout(fill, 600); } catch (e) { fail(e); } }, 'sm'), ' ',

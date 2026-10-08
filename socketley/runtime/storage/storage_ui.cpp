@@ -1200,7 +1200,7 @@ void storage_run::ui_git(const std::shared_ptr<conn>& c)
         o += std::string(first ? "" : ",") + "{\"id\":" + json_quote(g.id) + ",\"owner\":" + json_quote(g.owner) +
              ",\"url\":" + json_quote(g.url) + ",\"branch\":" + json_quote(g.branch) +
              ",\"bucket\":" + json_quote(g.bucket) + ",\"name\":" + json_quote(g.name) +
-             ",\"private\":" + (g.private_repo ? "true" : "false") + ",\"hour\":" + std::to_string(g.hour) +
+             ",\"private\":" + (g.private_repo ? "true" : "false") + ",\"every\":" + json_quote(g.every) +
              ",\"running\":" + (m_git.running(g.id) ? "true" : "false") + ",\"state\":" + m_git.state_json(g.id) + "}";
         first = false;
     }
@@ -1213,7 +1213,7 @@ void storage_run::ui_git_body(const std::shared_ptr<conn>& c)
     jvalue req;
     if (!json_reader(c->body).document(req))
     {
-        app_reply(c, 400, "The body is a JSON object with an action: add, remove, sync or token.\n");
+        app_reply(c, 400, "The body is a JSON object with an action: add, remove, sync, every or token.\n");
         return;
     }
     const std::string& who = c->user->id;
@@ -1258,8 +1258,8 @@ void storage_run::ui_git_body(const std::shared_ptr<conn>& c)
             if (k == "private")
                 p = &v;
         g.private_repo = p && p->k == jvalue::kind::boolean && p->b;
-        if (member(req, "hour"))
-            g.hour = static_cast<int>(num_of(req, "hour"));
+        if (const std::string every = str_of(req, "every"); !every.empty())
+            g.every = every;
         if (!valid_bucket_name(g.bucket))
         {
             app_reply(c, 400, "A library is a bucket name: lowercase letters, digits, dots and dashes, 3 to 63.\n");
@@ -1300,6 +1300,17 @@ void storage_run::ui_git_body(const std::shared_ptr<conn>& c)
         app_reply(c, 204);
         return;
     }
+    if (action == "every")
+    {
+        if (!m_git.set_every(id, str_of(req, "every")))
+        {
+            app_reply(c, 400, "A repository is pulled every day, week or month, or never.\n");
+            return;
+        }
+        arm_sweep();
+        app_reply(c, 204);
+        return;
+    }
     if (action == "sync")
     {
         if (const std::string why = m_git.run_now(id, *m_auth); !why.empty())
@@ -1311,7 +1322,7 @@ void storage_run::ui_git_body(const std::shared_ptr<conn>& c)
         app_reply(c, 204);
         return;
     }
-    app_reply(c, 400, "The action is add, remove, sync or token.\n");
+    app_reply(c, 400, "The action is add, remove, sync, every or token.\n");
 }
 
 }   // namespace socketley::storage

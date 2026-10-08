@@ -12,6 +12,8 @@
 #   thinning     `git-sync --keep 1,0,0` keeps one bundle of the day
 #   who          a user sees the repositories it keeps and an admin all; one
 #                that may not write a library cannot add one into it
+#   schedule     one told to pull every day is pulled by itself a day on;
+#                one pulled never is not
 #   private      a private repository without a token is not run, and says so;
 #                a token is kept and removed, never shown
 #   refused      a file:// URL, a bad branch and a bad folder name
@@ -93,6 +95,7 @@ expect "a repository is added, and its first run starts" "$code $(j "d['started'
 st=$(settle "$t0")
 expect "the run ends well" "$(echo "$st" | j "d['repos'][0]['state']['ok']")" True
 expect "its folder is named after the URL" "$(echo "$st" | j "d['repos'][0]['name']")" demo
+expect "and it is pulled only when asked, unless told otherwise" "$(echo "$st" | j "d['repos'][0]['every']")" never
 expect "the branch's files are in the library" "$(s3 "http://127.0.0.1:$ST/code/demo/README.md")" hello
 expect "in their folders" "$(s3 "http://127.0.0.1:$ST/code/demo/src/deep/a.c")" "int x;"
 expect "and four of them" "$(echo "$st" | j "d['repos'][0]['state']['files']")" 4
@@ -128,7 +131,7 @@ expect "and a second bundle is written" "$(bundles | grep -c '\.bundle$')" 2
 # weeks ago (in one month), and one of more than a year ago.
 dates=$(python3 - <<'PY'
 import datetime as d
-now = d.datetime.utcnow()
+now = d.datetime.now(d.timezone.utc)
 for back in range(35, 70):
     a = now - d.timedelta(days=back + 1); b = now - d.timedelta(days=back)
     if a.isocalendar()[1] == b.isocalendar()[1] and a.month == b.month:
@@ -148,6 +151,10 @@ expect "and the newest of each recent day" "$(echo "$left" | grep -cE "$1|$2")" 
 expect "the newest of an older week stays and the other of it goes" "$(echo "$left" | grep -c "$4") $(echo "$left" | grep -c "$3")" "1 0"
 expect "and one more than a year old goes" "$(echo "$left" | grep -c "$5")" 0
 
+# ─── how often ─────────────────────────────────────────────────────────────
+expect "it is told to pull every week" "$(post "$ALICE_K:$ALICE_S" "{\"action\":\"every\",\"id\":\"$id\",\"every\":\"week\"}") $(ui "$ALICE_K:$ALICE_S" | j "d['repos'][0]['every']")" "204 week"
+expect "and refuses a period that is none" "$(post "$ALICE_K:$ALICE_S" "{\"action\":\"every\",\"id\":\"$id\",\"every\":\"hourly\"}")" 400
+
 # ─── who ────────────────────────────────────────────────────────────────────
 expect "another user sees none of alice's repositories" "$(ui "$BOB_K:$BOB_S" | j "len(d['repos'])")" 0
 expect "and may not add one into her library" \
@@ -163,6 +170,26 @@ has "and never shown" "$(ui "$BOB_K:$BOB_S")" '"token":true'
 expect "it is sealed, not written as it is" "$(grep -rl ghp_test123 "$T/st/.ui" 2>/dev/null | wc -l)" 0
 expect "and removed" "$(post "$BOB_K:$BOB_S" '{"action":"token","token":""}') $(ui "$BOB_K:$BOB_S" | j "d['token']")" "204 False"
 expect "an admin sees every repository" "$(ui "$ALICE_K:$ALICE_S" | j "len(d['repos'])")" 2
+
+# ─── the schedule ───────────────────────────────────────────────────────────
+# Alice's last pull made two days old and her repository told to pull every day: the schedule, which looks once a
+# minute, pulls it again by itself; Bob's, pulled never, is left alone.
+if [ "$(date +%-H)" -ge 3 ]; then
+    expect "a repository is told to pull every day" "$(post "$ALICE_K:$ALICE_S" "{\"action\":\"every\",\"id\":\"$id\",\"every\":\"day\"}")" 204
+    old=$(( $(date +%s) - 2 * 86400 ))
+    python3 - "$T/st/.ui/git/$id/state.json" "$old" <<'PY'
+import json, sys
+p, at = sys.argv[1], int(sys.argv[2])
+d = json.load(open(p)); d["at"] = at; json.dump(d, open(p, "w"))
+PY
+    bobs=$(ui "$BOB_K:$BOB_S" | j "d['repos'][0]['id']")
+    got=""
+    for _ in $(seq 1 90); do got=$(ui "$ALICE_K:$ALICE_S" | j "[r['state']['at'] for r in d['repos'] if r['id']=='$id'][0] > $old"); [ "$got" = True ] && break; sleep 1; done
+    expect "and the schedule pulls it again by itself, a day after" "$got" True
+    expect "while one pulled never is not pulled" "$(ui "$BOB_K:$BOB_S" | j "d['repos'][0]['state'] is None or d['repos'][0]['state'].get('commit', '') == ''")" True
+else
+    echo "  SKIP: the schedule starts runs from 3:00 local time"
+fi
 
 # ─── refused ────────────────────────────────────────────────────────────────
 expect "a file:// URL is refused" "$(post "$ALICE_K:$ALICE_S" '{"action":"add","url":"file:///etc"}')" 400

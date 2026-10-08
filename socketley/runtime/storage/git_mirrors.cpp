@@ -149,7 +149,9 @@ std::vector<git_mirrors::repo> parse(const std::string& text)
         r.name = text_of(i, "name");
         const jvalue* p = field(i, "private");
         r.private_repo = p && p->k == jvalue::kind::boolean && p->b;
-        r.hour = static_cast<int>(int_of(i, "hour", 3));
+        r.every = text_of(i, "every");
+        if (!git_mirrors::valid_every(r.every))
+            r.every = "never";
         r.added = int_of(i, "added", 0);
         if (!r.id.empty() && !r.url.empty())
             out.push_back(std::move(r));
@@ -204,7 +206,7 @@ bool git_mirrors::save(const std::vector<repo>& rs)
         o += (i ? ",\n" : "\n") + std::string("{\"id\":") + json_str(r.id) + ",\"owner\":" + json_str(r.owner) +
              ",\"url\":" + json_str(r.url) + ",\"branch\":" + json_str(r.branch) + ",\"bucket\":" + json_str(r.bucket) +
              ",\"name\":" + json_str(r.name) + ",\"private\":" + (r.private_repo ? "true" : "false") +
-             ",\"hour\":" + std::to_string(r.hour) + ",\"added\":" + std::to_string(r.added) + "}";
+             ",\"every\":" + json_str(r.every) + ",\"added\":" + std::to_string(r.added) + "}";
     }
     o += "\n]}\n";
     const bool ok = write_file(m_dir + "/.ui/git.json", o, 0600);
@@ -221,8 +223,8 @@ std::string git_mirrors::add(repo& r)
         r.name = git_names::name_of(r.url);
     if (!git_names::valid_name(r.name, why))
         return why;
-    if (r.hour < 0 || r.hour > 23)
-        return "the hour is 0 to 23";
+    if (!valid_every(r.every))
+        return "a repository is pulled every day, week or month, or never";
     list_lock lock(m_dir);
     m_cache_stamp = -1;
     std::vector<repo> rs = repos();
@@ -254,6 +256,22 @@ bool git_mirrors::remove(std::string_view id)
     std::error_code ec;
     std::filesystem::remove_all(work_of(id), ec);
     return true;
+}
+
+bool git_mirrors::set_every(std::string_view id, std::string_view every)
+{
+    if (!valid_every(every))
+        return false;
+    list_lock lock(m_dir);
+    m_cache_stamp = -1;
+    std::vector<repo> rs = repos();
+    for (repo& r : rs)
+        if (r.id == id)
+        {
+            r.every = every;
+            return save(rs);
+        }
+    return false;
 }
 
 bool git_mirrors::running(std::string_view id) const
@@ -419,6 +437,8 @@ std::string git_mirrors::start(const repo& r, authenticator& auth)
 
 bool git_mirrors::due(const repo& r, int64_t now) const
 {
+    if (r.every == "never")
+        return false;
     std::string text;
     jvalue st;
     const bool ran = read_file(work_of(r.id) + "/state.json", text) && json_reader(text).document(st);
@@ -435,8 +455,13 @@ bool git_mirrors::due(const repo& r, int64_t now) const
     const std::time_t last = static_cast<std::time_t>(at);
     std::tm lt{};
     ::localtime_r(&last, &lt);
-    const bool today = lt.tm_year == tm.tm_year && lt.tm_yday == tm.tm_yday;
-    return !today && tm.tm_hour >= r.hour;
+    if (tm.tm_hour < due_hour)
+        return false;
+    if (r.every == "day")
+        return lt.tm_year != tm.tm_year || lt.tm_yday != tm.tm_yday;
+    // A week or a month on, counted in days, less the hours a run late in its day would push the next one back.
+    const int64_t days = (now - at + 6 * 3600) / 86400;
+    return days >= (r.every == "week" ? 7 : 30);
 }
 
 void git_mirrors::tick(authenticator& auth)

@@ -1,6 +1,6 @@
 #pragma once
-// Git repositories a storage runtime keeps in its libraries: each one fetched once a day at the hour asked for, and
-// whenever its user asks, by `socketley git-sync` (cli_git.cpp), which writes the branch's files under <name>/ of the
+// Git repositories a storage runtime keeps in its libraries: each one fetched every day, week or month, from 3:00
+// local time, or only when its user asks (never, the default), by `socketley git-sync` (cli_git.cpp), which writes the branch's files under <name>/ of the
 // library and a bundle under _backups/<name>/ when anything moved, as the user who added it.
 //
 // ─── THE FILES ──────────────────────────────────────────────────────────────
@@ -29,8 +29,8 @@ public:
     {
         std::string id, owner, url, branch{"main"}, bucket{"git"}, name;
         bool private_repo{false};
-        // The local hour the daily run is due from.
-        int hour{3};
+        // How often it is fetched by itself: never, day, week or month.
+        std::string every{"never"};
         int64_t added{0};
     };
 
@@ -49,6 +49,11 @@ public:
     // An error to show, empty when added; `r.id` is set.
     std::string add(repo& r);
     bool remove(std::string_view id);
+    // How often a repository is fetched by itself; false for no such repository or no such period.
+    bool set_every(std::string_view id, std::string_view every);
+    static bool valid_every(std::string_view e) { return e == "never" || e == "day" || e == "week" || e == "month"; }
+    // The local hour a run that is due starts from.
+    static constexpr int due_hour = 3;
     // An error to show, empty when the run started.
     std::string run_now(std::string_view id, authenticator& auth);
     bool running(std::string_view id) const;

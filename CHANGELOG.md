@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Storage: git repositories kept in a library.** The page's new Git tab adds a
   repository by URL (a branch, `main` by default, or `*` for every one); it is
-  fetched once a day at the hour asked for and whenever asked, and when anything
+  pulled when added, whenever asked, and by itself every day, week or month as
+  its Pull every says (never by default), and when anything
   moved its branch's files are written under `<name>/` of the library -- what
   changed, or the whole tree the first time -- and a git bundle of its history
   under `_backups/<name>/`, which `git clone` makes the repository from. Every
