@@ -533,7 +533,9 @@ bool dns_name(const std::string& m, size_t& off, std::string& out)
         }
         if (at + 1 + len > m.size())
             return false;
-        out += (out.empty() ? "" : ".") + m.substr(at + 1, len);
+        if (!out.empty())
+            out += '.';
+        out.append(m, at + 1, len);
         at += 1 + len;
     }
     return false;
