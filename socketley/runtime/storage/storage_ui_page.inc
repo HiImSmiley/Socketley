@@ -1655,10 +1655,12 @@ function gitDlg() {
     for (const r of g.repos) {
       busy = busy || r.running;
       const st = r.state;
+      // One line: when, short, and the commit; the rest in its tooltip.
+      const when = t => { const d = new Date(t * 1000), now = new Date(); return d.toDateString() === now.toDateString() ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString([], d.getFullYear() === now.getFullYear() ? { day: 'numeric', month: 'short' } : { day: 'numeric', month: 'short', year: 'numeric' }); };
       const last = r.running ? el('span', { text: 'running…' })
         : !st ? el('span', { class: 'mut', text: 'not yet' })
-        : st.ok ? el('span', { title: st.commit || '', text: new Date(st.at * 1000).toLocaleString() + (st.commit ? ' · ' + st.commit.slice(0, 7) : '') + (st.changed ? ' · ' + st.files + ' file' + (st.files === 1 ? '' : 's') + ' written' : ' · unchanged') })
-        : el('span', { class: 'fire', title: st.error || '', text: 'failed ' + new Date(st.at * 1000).toLocaleString() + ': ' + (st.error || 'see the log') });
+        : st.ok ? el('span', { title: new Date(st.at * 1000).toLocaleString() + (st.commit ? '\n' + st.commit : '') + '\n' + (st.changed ? st.files + ' file' + (st.files === 1 ? '' : 's') + ' written' : 'unchanged'), text: when(st.at) + (st.commit ? ' · ' + st.commit.slice(0, 7) : '') })
+        : el('span', { class: 'fire', title: new Date(st.at * 1000).toLocaleString() + '\n' + (st.error || 'see the log'), text: 'failed ' + when(st.at) });
       T.append(el('tr', {},
         el('td', { class: 'w' }, el('a', { href: '#', text: r.bucket + '/' + r.name, onclick: e => { e.preventDefault(); L.close(); go([r.bucket, r.name]); } }),
           el('div', { class: 'mut', style: 'font-size:12px;word-break:break-all', text: r.url + (r.private ? ' · private' : '') + (g.repos.some(x => x.owner !== r.owner) ? ' · ' + r.owner : '') })),
@@ -1668,7 +1670,7 @@ function gitDlg() {
           e.onchange = async () => { try { await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'every', id: r.id, every: e.value }) })); toast(e.value === 'never' ? r.name + ' is pulled only when you ask' : r.name + ' is pulled every ' + e.value); } catch (x) { fail(x); fill(); } };
           return e;
         })()),
-        el('td', { style: 'font-size:12.5px' }, last),
+        el('td', { style: 'font-size:12.5px;white-space:nowrap' }, last),
         el('td', { class: 'r', style: 'white-space:nowrap' },
           btn(null, 'Sync now', async () => { try { await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'sync', id: r.id }) })); toast('Running'); setTimeout(fill, 600); } catch (e) { fail(e); } }, 'sm'), ' ',
           btn(null, 'Backups', () => { L.close(); go([r.bucket, '_backups', r.name]); }, 'sm'), ' ',
