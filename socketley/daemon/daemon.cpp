@@ -2,6 +2,7 @@
 #include <unordered_set>
 #include "daemon_handler.h"
 #include "metrics_endpoint.h"
+#include "../shared/log_ring.h"
 #include "raft_host.h"
 #include "type_manifest.h"
 #include "../shared/event_loop.h"
@@ -833,6 +834,9 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     handler.set_state_persistence(&persistence);
     handler.set_raft(raft.get());
 
+    // Before any worker is started, so each one's stderr comes through the daemon's recent log.
+    log_ring::start();
+
     if (!handler.setup())
     {
         LOG_ERROR("failed to setup ipc socket");
@@ -928,6 +932,8 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     }
 
     LOG_INFO("daemon stopped");
+    // What the workers wrote last, on its way to stderr before the process ends.
+    log_ring::drain();
 
     return 0;
 }

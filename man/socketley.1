@@ -13670,7 +13670,30 @@ page and the sign\-in needs the session, and
 .B /metrics
 needs it from anywhere but a scraper on this machine without a proxy between;
 without them the page shows the figures, as it always did, and changes
-nothing. The endpoint listens on 127.0.0.1 only; on a server, reach it through an
+nothing.
+.IP
+Its Logs follow the daemon's recent log live, filtered by runtime, by level and
+by text, and each runtime's page shows its own; a runtime that failed says the
+last warning or error it wrote, where it is listed and on its page, beside how
+often it was started again. Each worker writes its stderr into a pipe of its
+own, which the daemon reads, passes on to its own stderr unchanged \(em the
+journal gets every line as before \(em and keeps, named by the runtime, with
+the daemon's own lines, the last 10,000 in memory:
+.BR "GET /api/logs?since=" seq "&max=" n "&runtime=" name "&level=" warn .
+.IP
+Its Domains show every certificate a runtime serves \(em its names, its issuer,
+how long it has, whether it is issued by itself and whether a wildcard waits
+for its zone's delegation, and the last line of a failed issuance \(em each
+entrance's routes, a name to the runtime it goes to, and the zones of the dns
+runtimes, whose records it edits: the text is checked as the runtime reads a
+zone file before it is written, and a serial left as it was is raised, so
+secondaries take the change.
+.BR "GET /api/edge" ,
+and
+.B GET
+and
+.B PUT /api/zone
+for a file a dns runtime serves and no other. The endpoint listens on 127.0.0.1 only; on a server, reach it through an
 SSH tunnel, \fBssh \-L 9100:127.0.0.1:9100\fR \fIhost\fR, and open
 \fBhttp://localhost:9100/\fR. On an installed system the port is set in
 \fB/etc/socketley/config.lua\fR, as \fBdaemon = { metrics_port = 9100 }\fR,

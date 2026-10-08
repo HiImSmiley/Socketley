@@ -15,6 +15,7 @@
 #include <unordered_map>
 
 class proxy_auth;
+class runtime_manager;
 
 namespace dashboard
 {
@@ -36,7 +37,7 @@ void send(int fd, int status, std::string_view type, std::string_view body, std:
 class server
 {
 public:
-    explicit server(std::string credentials);
+    server(std::string credentials, runtime_manager& manager);
     ~server();
 
     bool configured() const { return !m_credentials.empty(); }
@@ -45,17 +46,26 @@ public:
     // Whether a read of the figures is let through: a session, or, without credentials, anyone the endpoint serves.
     bool may_read(const request& r) const { return !configured() || !session_of(r).empty(); }
 
-    // The page and /api/session, /api/run and /api/schema; false for a path that is none of them.
+    // The page and /api/session, /api/run, /api/schema and /api/logs; false for a path that is none of them.
     bool handle(int fd, const request& r);
 
 private:
     void session(int fd, const request& r);
     void run(int fd, const request& r);
+    // GET /api/logs?since=&max=&runtime=&level=: the daemon's recent log, as log_ring.h keeps it.
+    void logs(int fd, const request& r);
+    // GET /api/edge: the entrances, their routes and zones, every certificate a runtime serves with what it is for and
+    // when it ends, and the zone files of the dns runtimes.
+    void edge(int fd, const request& r);
+    // GET /api/zone?runtime=&path=: a dns runtime's zone file; PUT the same with its new text, checked as the runtime
+    // would read it before it is written.
+    void zone(int fd, const request& r);
     std::string seal(std::string_view user, int64_t expires) const;
 
     std::string m_credentials;
     std::string m_key;
     std::unique_ptr<proxy_auth> m_auth;
+    runtime_manager& m_manager;
 };
 
 }   // namespace dashboard

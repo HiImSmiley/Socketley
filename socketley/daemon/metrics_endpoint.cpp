@@ -41,7 +41,7 @@ metrics_endpoint::~metrics_endpoint()
 
 bool metrics_endpoint::start(uint16_t port, std::string dashboard_credentials)
 {
-    m_dash = std::make_unique<dashboard::server>(std::move(dashboard_credentials));
+    m_dash = std::make_unique<dashboard::server>(std::move(dashboard_credentials), m_manager);
     // SOCK_CLOEXEC because the daemon forks proxy workers, and with
     // SO_REUSEADDR but not SO_REUSEPORT an inherited copy keeps the metrics
     // port bound after the daemon is gone.

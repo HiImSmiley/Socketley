@@ -19,6 +19,26 @@
 #include "../runtime/storage/json_doc.h"
 #include "../shared/blocking_write.h"
 #include "../shared/logging.h"
+#include "../shared/log_ring.h"
+#include "../shared/cert_keeper.h"
+#include "../shared/dns_feed.h"
+#include "../shared/runtime_instance.h"
+#include "../shared/runtime_manager.h"
+#include "../shared/runtime_definitions.h"
+#include "../runtime/dns/dns_instance.h"
+#include "../runtime/dns/dns_zone.h"
+#include "../runtime/dns/dns_wire.h"
+
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <sys/stat.h>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <shared_mutex>
+#include <sstream>
 
 namespace socketley::storage
 {
@@ -194,7 +214,8 @@ void send(int fd, int status, std::string_view type, std::string_view body, std:
     socketley::write_all(fd, out.data(), out.size());
 }
 
-server::server(std::string credentials) : m_credentials(std::move(credentials))
+server::server(std::string credentials, runtime_manager& manager)
+    : m_credentials(std::move(credentials)), m_manager(manager)
 {
     unsigned char k[32];
     if (RAND_bytes(k, sizeof k) == 1)
@@ -278,6 +299,21 @@ bool server::handle(int fd, const request& r)
         run(fd, r);
         return true;
     }
+    if (r.path == "/api/logs")
+    {
+        logs(fd, r);
+        return true;
+    }
+    if (r.path == "/api/edge")
+    {
+        edge(fd, r);
+        return true;
+    }
+    if (r.path == "/api/zone")
+    {
+        zone(fd, r);
+        return true;
+    }
     return false;
 }
 
@@ -339,6 +375,306 @@ void server::session(int fd, const request& r)
     send(fd, 200, "application/json", "{\"user\":" + json_quote(user) + "}",
          "Set-Cookie: skl_dash=" + seal(user, expires) + "; Path=/; Max-Age=" + std::to_string(session_seconds) +
              "; HttpOnly; SameSite=Strict" + (https ? "; Secure" : "") + "\r\n");
+}
+
+// One query field's value, undecoded but for %XX and '+'.
+static std::string query_field(std::string_view q, std::string_view name)
+{
+    for (size_t p = 0; p < q.size();)
+    {
+        size_t amp = q.find('&', p);
+        if (amp == std::string_view::npos)
+            amp = q.size();
+        const std::string_view kv = q.substr(p, amp - p);
+        p = amp + 1;
+        const size_t eq = kv.find('=');
+        if (kv.substr(0, eq) != name)
+            continue;
+        std::string out;
+        const std::string_view v = eq == std::string_view::npos ? std::string_view{} : kv.substr(eq + 1);
+        for (size_t i = 0; i < v.size(); ++i)
+        {
+            if (v[i] == '%' && i + 2 < v.size())
+            {
+                out += static_cast<char>(std::strtol(std::string(v.substr(i + 1, 2)).c_str(), nullptr, 16));
+                i += 2;
+            }
+            else
+                out += v[i] == '+' ? ' ' : v[i];
+        }
+        return out;
+    }
+    return {};
+}
+
+void server::logs(int fd, const request& r)
+{
+    // The log says what runtimes do and with what, so only a session reads it when there are credentials.
+    if (!may_read(r))
+    {
+        send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
+        return;
+    }
+    const uint64_t since = std::strtoull(query_field(r.query, "since").c_str(), nullptr, 10);
+    size_t max = std::strtoul(query_field(r.query, "max").c_str(), nullptr, 10);
+    if (max == 0 || max > 2000)
+        max = 500;
+    uint64_t next = 0;
+    const auto lines = log_ring::since(since, max, query_field(r.query, "runtime"), query_field(r.query, "level"), next);
+    std::string o = "{\"next\":" + std::to_string(next) + ",\"lines\":[";
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        const auto& e = lines[i];
+        o += (i ? ",{" : "{") + std::string("\"seq\":") + std::to_string(e.seq) + ",\"at\":" + std::to_string(e.at_ms) +
+             ",\"rt\":" + json_quote(e.runtime) + ",\"lv\":\"" + e.level + "\",\"text\":" + json_quote(e.text) + "}";
+    }
+    o += "]}";
+    send(fd, 200, "application/json", o);
+}
+
+namespace
+{
+
+std::string read_text(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return f ? ss.str() : std::string{};
+}
+
+std::string last_line_of(const std::string& path)
+{
+    std::ifstream f(path);
+    std::string line, last;
+    while (std::getline(f, line))
+        if (!line.empty())
+            last = line;
+    return last;
+}
+
+// What a certificate file says of itself, as JSON members after `{`; empty when it is no certificate.
+std::string cert_json(const std::string& path)
+{
+    BIO* b = BIO_new_file(path.c_str(), "r");
+    X509* x = b ? PEM_read_bio_X509(b, nullptr, nullptr, nullptr) : nullptr;
+    if (b)
+        BIO_free(b);
+    ERR_clear_error();
+    if (!x)
+        return {};
+    std::string names;
+    if (auto* gens = static_cast<GENERAL_NAMES*>(X509_get_ext_d2i(x, NID_subject_alt_name, nullptr, nullptr)))
+    {
+        for (int i = 0; i < sk_GENERAL_NAME_num(gens); ++i)
+            if (const GENERAL_NAME* g = sk_GENERAL_NAME_value(gens, i); g->type == GEN_DNS)
+                names += (names.empty() ? "" : ",") +
+                         json_quote(std::string_view(reinterpret_cast<const char*>(ASN1_STRING_get0_data(g->d.dNSName)),
+                                                     static_cast<size_t>(ASN1_STRING_length(g->d.dNSName))));
+        GENERAL_NAMES_free(gens);
+    }
+    int days = 0, secs = 0;
+    ASN1_TIME_diff(&days, &secs, nullptr, X509_get0_notAfter(x));
+    char issuer[256] = {};
+    X509_NAME_get_text_by_NID(X509_get_issuer_name(x), NID_organizationName, issuer, sizeof issuer);
+    if (!issuer[0])
+        X509_NAME_get_text_by_NID(X509_get_issuer_name(x), NID_commonName, issuer, sizeof issuer);
+    const bool self = X509_check_issued(x, x) == X509_V_OK;
+    X509_free(x);
+    const int64_t left = static_cast<int64_t>(days) * 86400 + secs;
+    return "\"names\":[" + names + "],\"expires_in\":" + std::to_string(left) + ",\"issuer\":" + json_quote(issuer) +
+           ",\"self_signed\":" + (self ? "true" : "false");
+}
+
+}   // namespace
+
+void server::edge(int fd, const request& r)
+{
+    if (!may_read(r))
+    {
+        send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
+        return;
+    }
+    struct rt_info
+    {
+        std::string name, type, cert, address, proxy;
+        bool tls{false}, entrance{false}, acme{false};
+        std::vector<std::string> zones;
+    };
+    std::vector<rt_info> all;
+    {
+        std::shared_lock lock(m_manager.mutex);
+        for (const auto& [name, rt] : m_manager.list())
+        {
+            rt_info i;
+            i.name = name;
+            i.type = type_to_string(rt->get_type());
+            i.tls = rt->get_tls();
+            i.cert.assign(rt->get_cert_path());
+            if (!rt->get_acme_domains().empty())
+            {
+                i.acme = true;
+                if (i.cert.empty())
+                    i.cert = cert_keeper::acme_cert_path(rt->get_acme_domains().front());
+            }
+            const std::string bind(rt->get_bind_address());
+            i.address = !rt->get_listen_path().empty() ? "unix:" + std::string(rt->get_listen_path())
+                        : (bind.empty() || bind == "0.0.0.0" ? std::string("127.0.0.1") : bind) + ":" +
+                              std::to_string(rt->effective_port());
+            i.entrance = i.cert == cert_keeper::entrance_cert_path(name);
+            if (rt->get_type() == runtime_dns)
+            {
+                const auto* d = static_cast<const dns_instance*>(rt.get());
+                i.zones = d->zone_paths();
+                i.proxy.assign(d->get_proxy());
+            }
+            all.push_back(std::move(i));
+        }
+    }
+    std::map<std::string, std::string> by_address;
+    for (const auto& i : all)
+        by_address[i.address] = i.name;
+
+    std::string o = "{\"entrances\":[";
+    bool first = true;
+    for (const auto& i : all)
+    {
+        const std::string table = read_text(dns_feed::routes_path(i.name));
+        if (table.empty() && !i.entrance)
+            continue;
+        o += std::string(first ? "" : ",") + "{\"name\":" + json_quote(i.name) + ",\"zones\":[";
+        first = false;
+        std::string zones, routes;
+        std::istringstream lines(table);
+        for (std::string line; std::getline(lines, line);)
+        {
+            if (line.starts_with("zone "))
+                zones += (zones.empty() ? "" : ",") + json_quote(line.substr(5));
+            else if (line.starts_with("route "))
+            {
+                std::istringstream w(line.substr(6));
+                std::string name, addr, to;
+                w >> name;
+                while (w >> addr)
+                    to += (to.empty() ? "" : ",") + std::string("{\"address\":") + json_quote(addr) + ",\"runtime\":" +
+                          json_quote(by_address.count(addr) ? by_address[addr] : std::string{}) + "}";
+                routes += (routes.empty() ? "" : ",") + std::string("{\"name\":") + json_quote(name) + ",\"to\":[" + to + "]}";
+            }
+        }
+        o += zones + "],\"routes\":[" + routes + "]}";
+    }
+    o += "],\"certs\":[";
+    first = true;
+    for (const auto& i : all)
+    {
+        if (i.cert.empty())
+            continue;
+        const std::string c = cert_json(i.cert);
+        struct stat st{};
+        const bool partial = ::stat((i.cert + ".partial").c_str(), &st) == 0;
+        const std::string log = i.acme || i.entrance ? last_line_of(i.cert + ".log") : std::string{};
+        o += std::string(first ? "" : ",") + "{\"runtime\":" + json_quote(i.name) + ",\"path\":" + json_quote(i.cert) +
+             ",\"auto\":" + (i.acme || i.entrance ? "true" : "false") + ",\"partial\":" + (partial ? "true" : "false") +
+             ",\"acme_log\":" + json_quote(log) + (c.empty() ? ",\"missing\":true" : "," + c) + "}";
+        first = false;
+    }
+    o += "],\"zones\":[";
+    first = true;
+    for (const auto& i : all)
+        for (const std::string& p : i.zones)
+        {
+            socketley::dns::zone z;
+            std::string why;
+            const bool ok = socketley::dns::load_zone(p, {}, z, why);
+            o += std::string(first ? "" : ",") + "{\"runtime\":" + json_quote(i.name) + ",\"path\":" + json_quote(p) +
+                 ",\"origin\":" + json_quote(ok ? socketley::dns::to_text(z.origin) : std::string{}) +
+                 ",\"serial\":" + std::to_string(ok ? z.serial : 0) + ",\"error\":" + json_quote(ok ? std::string{} : why) +
+                 ",\"proxy\":" + json_quote(i.proxy) + "}";
+            first = false;
+        }
+    o += "]}";
+    send(fd, 200, "application/json", o);
+}
+
+void server::zone(int fd, const request& r)
+{
+    if (r.method == "GET" ? !may_read(r) : session_of(r).empty())
+    {
+        send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
+        return;
+    }
+    std::string runtime, path, text;
+    if (r.method == "GET")
+    {
+        runtime = query_field(r.query, "runtime");
+        path = query_field(r.query, "path");
+    }
+    else if (r.method == "PUT")
+    {
+        if (r.header("x-socketley-dashboard") != "1")
+        {
+            send(fd, 403, "text/plain; charset=utf-8", "A change comes from the dashboard's own page.\n");
+            return;
+        }
+        socketley::storage::jvalue doc;
+        if (socketley::storage::json_reader(r.body).document(doc))
+            for (const auto& [k, v] : doc.members)
+            {
+                if (v.k != socketley::storage::jvalue::kind::string)
+                    continue;
+                if (k == "runtime")
+                    runtime = v.s;
+                else if (k == "path")
+                    path = v.s;
+                else if (k == "text")
+                    text = v.s;
+            }
+    }
+    else
+    {
+        send(fd, 405, "text/plain; charset=utf-8", "A zone is read with GET and written with PUT.\n");
+        return;
+    }
+    // Only a file a dns runtime serves, so the page writes nothing else on this machine.
+    bool served = false;
+    {
+        std::shared_lock lock(m_manager.mutex);
+        if (const auto* rt = m_manager.get(runtime); rt && rt->get_type() == runtime_dns)
+            for (const std::string& p : static_cast<const dns_instance*>(rt)->zone_paths())
+                served = served || p == path;
+    }
+    if (!served)
+    {
+        send(fd, 404, "text/plain; charset=utf-8", "No dns runtime " + runtime + " serves " + path + ".\n");
+        return;
+    }
+    if (r.method == "GET")
+    {
+        send(fd, 200, "text/plain; charset=utf-8", read_text(path));
+        return;
+    }
+    socketley::dns::zone z;
+    std::string why;
+    if (text.size() > (4u << 20) || !socketley::dns::parse_zone(text, {}, z, why))
+    {
+        send(fd, 400, "text/plain; charset=utf-8", why.empty() ? std::string("The zone is too large.\n") : why + "\n");
+        return;
+    }
+    const std::string tmp = path + ".dashboard." + std::to_string(::getpid());
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f << text;
+        f.close();
+        std::error_code ec;
+        if (!f || (std::filesystem::rename(tmp, path, ec), ec))
+        {
+            ::unlink(tmp.c_str());
+            send(fd, 500, "text/plain; charset=utf-8", "The zone could not be written.\n");
+            return;
+        }
+    }
+    LOG_INFO(("dashboard: " + session_of(r) + " wrote the zone " + path + ", serial " + std::to_string(z.serial)).c_str());
+    send(fd, 204, {}, {});
 }
 
 void server::run(int fd, const request& r)

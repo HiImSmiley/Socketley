@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Dashboard: logs and domains.** Its Logs follow the daemon's recent log live,
+  by runtime, level and text, and a runtime that failed says the last warning
+  or error it wrote, with how often it was started again. Each worker's stderr
+  goes through a pipe of its own that the daemon reads, passes on unchanged to
+  its own stderr and keeps the last 10,000 lines of, named by runtime. Its
+  Domains show every certificate a runtime serves (names, issuer, days left,
+  self-issued or not, a wildcard waiting for the delegation, the last failed
+  issuance), each entrance's routes to their runtimes, and the dns runtimes'
+  zones, whose records it edits: checked as the runtime reads them before they
+  are written, the serial raised when it was left alone.
+
 - **The daemon's dashboard runs the daemon.** The page on `metrics_port` is new,
   in the storage interface's look, whose stylesheet and helpers it takes from the
   same binary: an overview of runtimes, connections, messages, bytes, CPU and

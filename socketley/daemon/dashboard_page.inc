@@ -53,6 +53,20 @@ pre.out{font-family:var(--mono);font-size:12.5px;background:rgba(0,0,0,.35);bord
 .filters{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 6px}
 .filters button{border:1px solid var(--line);background:transparent;color:var(--mut);border-radius:20px;padding:5px 12px;font:inherit;font-size:12.5px;cursor:pointer}
 .filters button.on{background:var(--grad);color:var(--on);border-color:transparent}
+.log{font-family:var(--mono);font-size:12.3px;line-height:1.55;background:rgba(0,0,0,.35);border:1px solid var(--line);border-radius:12px;padding:10px 0;overflow:auto;max-height:calc(100vh - 240px);min-height:200px}
+.log div{padding:0 14px;white-space:pre-wrap;word-break:break-word}
+.log div:hover{background:rgba(255,255,255,.04)}
+.log .warn{color:var(--warn)}.log .error{color:var(--bad)}.log .debug{color:var(--dim)}
+.log .rt{color:var(--a1);margin-right:8px}
+.log.short{max-height:320px}
+.why{font-size:12px;color:var(--bad);margin-top:3px;max-width:520px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.certs{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;margin-bottom:26px}
+.cert .nm2{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.cert .nm2 span{font-family:var(--mono);font-size:12px;background:rgba(255,255,255,.06);border:1px solid var(--line);border-radius:8px;padding:2px 8px}
+.mtbl th{white-space:nowrap}
+.ok2{color:var(--ok)}.warn2{color:var(--warn)}.bad2{color:var(--bad)}
+.logbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0 0 12px}
+.logbar .inp{height:34px}
 textarea.inp{height:auto;min-height:260px;padding:12px;font-family:var(--mono);font-size:12.5px;line-height:1.5;width:100%;resize:vertical}
 </style>
 </head>
@@ -77,6 +91,8 @@ textarea.inp{height:auto;min-height:260px;padding:12px;font-family:var(--mono);f
     <button class="nav" id="nOver"></button>
     <button class="nav" id="nRts"></button>
     <button class="nav" id="nNew"></button>
+    <button class="nav" id="nLogs"></button>
+    <button class="nav" id="nDom"></button>
     <div class="sh">Runtimes</div>
     <div id="rlist"></div>
     <div class="themes" id="themes"></div>
@@ -99,6 +115,7 @@ textarea.inp{height:auto;min-height:260px;padding:12px;font-family:var(--mono);f
 // ─── the dashboard ──────────────────────────────────────────────────────────
 Object.assign(P, {
   pulse: '<path d="M3 12h4l2.5-6 4 12 2.5-6H21"/>',
+  lock: '<rect x="5" y="10.5" width="14" height="10" rx="2.2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/>',
   server: '<rect x="3.5" y="4" width="17" height="6.5" rx="1.8"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="1.8"/><path d="M7 7.2h.01M7 16.8h.01"/>',
   client: '<path d="M4 17V7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v10"/><path d="M2 19h20"/>',
   proxy: '<circle cx="5" cy="12" r="2.2"/><circle cx="19" cy="6" r="2.2"/><circle cx="19" cy="18" r="2.2"/><path d="M7.2 12h4M11.2 12l5.8-5.2M11.2 12l5.8 5.2"/>',
@@ -144,6 +161,18 @@ const rate = n => human(n).replace(' ', ' ') + '/s';
 const count = n => { n = +n || 0; return n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(0) + 'k' : String(Math.round(n)); };
 const ago = s => { s = Math.floor(s); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? d + 'd ' + h + 'h' : h ? h + 'h ' + m + 'm' : m + 'm ' + (s % 60) + 's'; };
 
+let problemsAt = 0;
+// Each runtime's latest warning or error, from the log: what a failed one says about why.
+const why = {};
+async function problems() {
+  try {
+    const d = await (await must(await api('GET', '/api/logs?level=warn&max=1000'))).json();
+    for (const l of d.lines) {
+      const m = l.rt || (/'([^']+)'/.exec(l.text) || [])[1];
+      if (m) why[m] = l;
+    }
+  } catch (e) {}
+}
 let me = null, schema = null, view = { at: 'over' }, rts = [], meta = {}, over = null, timer = 0, filterType = '';
 const hist = { msg: [], conn: [], bin: [], bout: [], cpu: [] };
 const prev = { t: 0, msg: 0, bin: 0, bout: 0, cpu: 0, per: {} };
@@ -190,6 +219,8 @@ function route() {
   const h = location.hash.replace(/^#\/?/, '');
   if (h.startsWith('runtime/')) view = { at: 'rt', name: decodeURIComponent(h.slice(8)) };
   else if (h === 'runtimes') view = { at: 'rts' };
+  else if (h.startsWith('logs')) view = { at: 'logs', runtime: decodeURIComponent(h.slice(5)) };
+  else if (h === 'domains') view = { at: 'dom' };
   else if (h.startsWith('new')) view = { at: 'new', type: decodeURIComponent(h.slice(4)) || '' };
   else view = { at: 'over' };
   while (layers.length) layers[layers.length - 1].close();
@@ -203,6 +234,8 @@ function side() {
   nav($('#nOver'), 'pulse', 'Overview', view.at === 'over', () => go('#/'));
   nav($('#nRts'), 'server', 'Runtimes', view.at === 'rts', () => go('#/runtimes'));
   nav($('#nNew'), 'plus', 'New runtime', view.at === 'new', () => go('#/new'));
+  nav($('#nLogs'), 'text', 'Logs', view.at === 'logs', () => go('#/logs'));
+  nav($('#nDom'), 'dns', 'Domains', view.at === 'dom', () => go('#/domains'));
   nav($('#nOut'), 'out', me && me.user ? 'Sign out · ' + me.user : 'Sign out', false, signOut);
   $('#nNew').hidden = !(me && me.user);
   paintThemes();
@@ -235,6 +268,7 @@ async function poll() {
     prev.t = now; prev.msg = o.messages_total; prev.bin = o.bytes_in; prev.bout = o.bytes_out; prev.cpu = o.cpu_seconds;
     prev.per = Object.fromEntries(r.map(x => [x.name, { m: x.messages_total, i: x.bytes_in, o: x.bytes_out, c: x.cpu_seconds }]));
     over = o; rts = r;
+    if (now - problemsAt > 6) { problemsAt = now; problems(); }
     render(false);
   } catch (e) { if (me) toast(e.message, 'bad'); }
   if (me) timer = setTimeout(poll, 2000);
@@ -264,6 +298,8 @@ function render(full) {
   if (view.at === 'rts') return runtimes();
   if (view.at === 'rt') return detail(full);
   if (view.at === 'new' && full) return create();
+  if (view.at === 'logs' && full) return logsView();
+  if (view.at === 'dom' && full) return domains();
 }
 function overview() {
   crumbs([]);
@@ -315,7 +351,8 @@ function table(list) {
     const m = meta[r.name] || {};
     T.append(el('tr', { onclick: () => go('#/runtime/' + encodeURIComponent(r.name)) },
       el('td', { style: 'width:28px' }, el('span', { class: 'dot ' + r.state, title: r.state })),
-      el('td', {}, el('div', { class: 'nm', text: r.name }), el('div', { class: 'ty', text: (TYPES[r.type] || [r.type, r.type])[1] + (m.group ? ' · @' + m.group : '') + (m.owner && m.owner !== '-' ? ' · of ' + m.owner : '') + (r.state !== 'running' ? ' · ' + r.state : '') })),
+      el('td', {}, el('div', { class: 'nm', text: r.name }), el('div', { class: 'ty', text: (TYPES[r.type] || [r.type, r.type])[1] + (m.group ? ' · @' + m.group : '') + (m.owner && m.owner !== '-' ? ' · of ' + m.owner : '') + (r.state !== 'running' ? ' · ' + r.state : '') + (m.restarts ? ' · ' + m.restarts + ' restart' + (m.restarts === 1 ? '' : 's') : '') }),
+        r.state === 'failed' && why[r.name] ? el('div', { class: 'why', title: why[r.name].text, text: clean(why[r.name].text) }) : null),
       el('td', { class: 'num', text: r.port ? String(r.port) : '—' }),
       el('td', { class: 'num', text: count(r.connections) }),
       el('td', { class: 'num', text: count(r.msg_s || 0) + '/s' }),
@@ -338,7 +375,9 @@ async function detail(full) {
     C.textContent = '';
     C.append(el('div', { id: 'dHead' }), el('div', { class: 'tiles', id: 'dTiles' }),
       el('div', { class: 'panel' }, el('h3', {}, ico('edit'), el('span', { text: 'Configuration' })), el('div', { id: 'dConf', class: 'kv' })),
+      el('div', { class: 'panel' }, el('h3', {}, ico('text'), el('span', { text: 'Log' }), el('span', { style: 'flex:1' }), btn(null, 'Open full log', () => go('#/logs/' + encodeURIComponent(r.name)), 'sm')), el('div', { class: 'log short', id: 'dLog' })),
       el('div', { class: 'panel' }, el('h3', {}, ico('info'), el('span', { text: 'Stats' })), el('div', { class: 'kv', id: 'dStats' })));
+    shown.logNext = 0;
     if (me && me.user) {
       run('show', r.name).then(x => { if (!x.code) { try { shown.conf = JSON.parse(x.out); } catch (e) {} paintConf(); } });
       statsText(r.name);
@@ -356,6 +395,127 @@ async function detail(full) {
     tile('cpu', 'CPU', (r.cpu_p || 0).toFixed(1) + ' %', r.processes + ' process' + (r.processes === 1 ? '' : 'es')),
     tile('gauge', 'Memory', human(r.rss_bytes), 'resident'));
   if (!full && shown.stamp && Date.now() - shown.stamp > 5000) statsText(r.name);
+  tailInto($('#dLog'), shown, r.name, 300);
+  if (r.state === 'failed' && why[r.name] && !$('#dWhy')) H.append(el('div', { id: 'dWhy', class: 'panel', style: 'border-color:rgba(251,88,118,.4)' }, el('h3', {}, ico('info'), el('span', { text: 'Why it failed' })), el('div', { class: 'kv' }, el('div', { class: 'k', text: new Date(why[r.name].at).toLocaleString() }), el('div', { class: 'v', text: clean(why[r.name].text) }))));
+}
+// A line without its clock and tag, which the view says by itself.
+const clean = t => t.replace(/^\[\d\d:\d\d:\d\d\] \[[A-Z]+\] /, '');
+function logLine(l, withRt) {
+  const t = new Date(l.at);
+  // A worker's line names its runtime, which the view says already.
+  const text = l.rt ? clean(l.text).replace(/^\w+ '[^']*'( shard \d+)?: /, '') : clean(l.text);
+  return el('div', { class: l.lv }, el('span', { class: 'dim', text: t.toLocaleTimeString() + ' ' }), withRt && l.rt ? el('span', { class: 'rt', text: l.rt }) : null, el('span', { text }));
+}
+// New lines into `box`, from where `st.logNext` says; kept to `keep`, following the bottom unless scrolled away.
+async function tailInto(box, st, runtime, keep, level, text) {
+  if (!box || st.logBusy) return;
+  st.logBusy = true;
+  try {
+    const d = await (await must(await api('GET', '/api/logs?since=' + (st.logNext || 0) + '&max=' + (st.logNext ? 500 : keep) + (runtime ? '&runtime=' + encodeURIComponent(runtime) : '') + (level ? '&level=' + level : '')))).json();
+    st.logNext = d.next;
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    const q = (text || '').toLowerCase();
+    for (const l of d.lines) if (!q || l.text.toLowerCase().includes(q)) box.append(logLine(l, !runtime));
+    while (box.childElementCount > keep) box.firstElementChild.remove();
+    if (!box.childElementCount) box.append(el('div', { class: 'dim', text: 'Nothing logged yet.' }));
+    else if (box.firstElementChild.classList.contains('dim') && box.firstElementChild.textContent === 'Nothing logged yet.' && box.childElementCount > 1) box.firstElementChild.remove();
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  } catch (e) {}
+  st.logBusy = false;
+}
+
+// ─── domains ────────────────────────────────────────────────────────────────
+const daysOf = s => Math.floor(s / 86400);
+async function domains() {
+  crumbs([['Domains', '#/domains']]);
+  const C = $('#content'); C.textContent = '';
+  let d;
+  try { d = await (await must(await api('GET', '/api/edge'))).json(); } catch (e) { C.append(el('p', { class: 'mut', text: e.message })); return; }
+  if (view.at !== 'dom') return;
+  const rtLink = n => el('a', { href: '#/runtime/' + encodeURIComponent(n), text: n, style: 'color:var(--a1)' });
+  // ── certificates
+  C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('lock')), el('span', { text: 'Certificates' }), el('span', { class: 'n', text: String(d.certs.length) }))));
+  const G = el('div', { class: 'certs' });
+  for (const c of d.certs.sort((a, b) => (a.expires_in || 0) - (b.expires_in || 0))) {
+    const days = daysOf(c.expires_in || 0);
+    const state = c.missing ? ['bad2', 'no certificate yet'] : c.self_signed ? ['warn2', c.auto ? 'a placeholder, until the CA has issued one' : 'self-signed: browsers warn about it'] : days < 7 ? ['bad2', 'ends in ' + days + ' days'] : days < 30 ? ['warn2', 'ends in ' + days + ' days, renewal due'] : ['ok2', 'valid for ' + days + ' more days'];
+    const failed = c.acme_log && /fail|error|refused|invalid/i.test(c.acme_log);
+    G.append(el('div', { class: 'panel cert', style: 'margin:0' },
+      el('h3', {}, ico('lock'), rtLink(c.runtime), el('span', { class: 'mut', style: 'font-weight:400;font-size:12.5px', text: c.issuer ? ' · ' + c.issuer : '' })),
+      el('div', { class: state[0], style: 'font-size:13px;font-weight:600', text: state[1] }),
+      el('div', { class: 'nm2' }, ...(c.names || []).map(n => el('span', { text: n }))),
+      el('div', { class: 'mut', style: 'font-size:12px', text: c.auto ? 'Issued and renewed by itself' + (c.partial ? '; the wildcard waits for the zone to be delegated here' : '') : 'From ' + c.path }),
+      failed ? el('div', { class: 'bad2', style: 'font-size:12px;margin-top:6px', text: 'Last attempt: ' + c.acme_log }) : null));
+  }
+  if (!d.certs.length) G.append(el('p', { class: 'mut', text: 'No runtime serves TLS.' }));
+  C.append(G);
+  // ── routes
+  for (const e of d.entrances) {
+    C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('proxy')), el('span', { text: 'Entrance ' }), rtLink(e.name), el('span', { class: 'n', text: e.zones.join(', ') || 'no zone' }))));
+    const T = el('table', { class: 'mtbl', style: 'margin-bottom:26px' });
+    T.append(el('tr', {}, el('th', { text: 'Name' }), el('th', { text: 'Goes to' })));
+    for (const r of e.routes) T.append(el('tr', {}, el('td', { class: 'w', style: 'font-family:var(--mono)' }, el('a', { href: 'https://' + r.name.replace(/^\*\./, 'x.') + '/', target: '_blank', rel: 'noopener', text: r.name, style: 'color:var(--fg)' })),
+      el('td', {}, ...r.to.flatMap((t, i) => [i ? ', ' : null, t.runtime ? rtLink(t.runtime) : el('span', { class: 'mut', text: t.address })]))));
+    if (!e.routes.length) T.append(el('tr', {}, el('td', { class: 'mut', colspan: '2', text: 'No runtime has a name here yet: give one --domain.' })));
+    C.append(T);
+  }
+  // ── zones
+  if (d.zones.length) {
+    C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('dns')), el('span', { text: 'Zones' }), el('span', { class: 'n', text: String(d.zones.length) }))));
+    const T = el('table', { class: 'mtbl' });
+    T.append(el('tr', {}, el('th', { text: 'Zone' }), el('th', { text: 'Served by' }), el('th', { text: 'Serial' }), el('th')));
+    for (const z of d.zones) T.append(el('tr', {}, el('td', { class: 'w' }, el('b', { text: z.origin || z.path }), z.error ? el('div', { class: 'bad2', style: 'font-size:12px', text: z.error }) : null),
+      el('td', {}, rtLink(z.runtime)), el('td', { class: 'mut num', text: String(z.serial || '—') }),
+      el('td', { class: 'r' }, me && me.user ? btn('edit', 'Edit records', () => zoneDlg(z), 'sm') : null)));
+    C.append(T);
+  }
+}
+// A zone file in an editor: checked by the daemon as its dns runtime reads it, the serial raised when it was not.
+async function zoneDlg(z) {
+  let text;
+  try { text = await (await must(await api('GET', '/api/zone?runtime=' + encodeURIComponent(z.runtime) + '&path=' + encodeURIComponent(z.path)))).text(); } catch (e) { fail(e); return; }
+  const ta = el('textarea', { class: 'inp', spellcheck: 'false', style: 'min-height:420px' }); ta.value = text;
+  const err = el('div', { class: 'bad2', style: 'font-size:12.5px;min-height:18px;margin-top:6px' });
+  const SOA = /(\bSOA\s+\S+\s+\S+\s+)(\d+)/;
+  const save = async () => {
+    let t = ta.value;
+    const before = SOA.exec(text), now = SOA.exec(t);
+    // An edit that left the serial alone gets the next one, or secondaries would never take it.
+    if (t !== text && before && now && before[2] === now[2]) {
+      const d = new Date(), stamp = +(d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0') + '00');
+      t = t.replace(SOA, (m, a, n) => a + String(Math.max(+n + 1, stamp + 1)));
+    }
+    const r = await api('PUT', '/api/zone', { runtime: z.runtime, path: z.path, text: t });
+    if (!r.ok) { err.textContent = (await r.text()).trim(); return; }
+    toast((z.origin || 'The zone') + ' saved; served within a second'); L.close(); domains();
+  };
+  const L = modal('Records of ' + (z.origin || z.path), [el('p', { class: 'mut', style: 'font-size:12.5px;margin-top:0', text: 'RFC 1035 master format, as the dns runtime reads it. The names of runtimes need no line here: they are published by themselves. The serial is raised on save when you leave it as it was.' }), ta, err],
+    [btn(null, 'Cancel', () => L.close()), btn(null, 'Save', save, 'pri')], true);
+}
+
+// ─── the log ────────────────────────────────────────────────────────────────
+let logState = null;
+function logsView() {
+  crumbs([['Logs', '#/logs']].concat(view.runtime ? [[view.runtime, null]] : []));
+  const C = $('#content'); C.textContent = '';
+  const st = logState = { logNext: 0, paused: false };
+  const rt = el('select', { class: 'inp' }, el('option', { value: '', text: 'All runtimes and the daemon' }), ...rts.map(r => r.name).sort().map(n => el('option', { value: n, text: n })));
+  rt.value = view.runtime || '';
+  const lv = el('select', { class: 'inp' }, el('option', { value: '', text: 'Every line' }), el('option', { value: 'warn', text: 'Warnings and errors' }), el('option', { value: 'error', text: 'Errors' }));
+  const q = el('input', { class: 'inp', placeholder: 'Find in the log', spellcheck: 'false' });
+  const box = el('div', { class: 'log' });
+  const restart = () => { box.textContent = ''; st.logNext = 0; tick(); };
+  rt.onchange = () => { view.runtime = rt.value; history.replaceState(null, '', '#/logs' + (rt.value ? '/' + encodeURIComponent(rt.value) : '')); restart(); };
+  lv.onchange = restart; q.oninput = () => { clearTimeout(st.qt); st.qt = setTimeout(restart, 250); };
+  const pause = btn('stop', 'Pause', () => { st.paused = !st.paused; pause.querySelector('span').textContent = st.paused ? 'Follow' : 'Pause'; if (!st.paused) tick(); }, 'sm');
+  C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('text')), el('span', { text: 'Log' }), el('span', { class: 'n', text: 'the daemon and every runtime, newest at the bottom' }))),
+    el('div', { class: 'logbar' }, rt, lv, q, pause), box);
+  const tick = async () => {
+    if (logState !== st || view.at !== 'logs') return;
+    if (!st.paused) await tailInto(box, st, rt.value, 2000, lv.value, q.value);
+    clearTimeout(st.t); st.t = setTimeout(tick, 2000);
+  };
+  tick();
 }
 async function statsText(name) {
   shown.stamp = Date.now();

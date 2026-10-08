@@ -14,6 +14,11 @@
 #   commands     need a session and the page's header, take only the
 #                dashboard's verbs and no word with a space, and create, show,
 #                import, stop, start and remove a runtime as the CLI would
+#   the log      a worker's lines come through the daemon named by runtime,
+#                its stderr still gets them, and a reader asks for what is new
+#   domains      the entrance's routes, a certificate's names and days, a zone
+#                read, edited (served at once), refused when it does not parse
+#                or is no dns runtime's, and only from the page
 #   no creds     without dashboard_credentials it reads and changes nothing
 set -uo pipefail
 
@@ -123,6 +128,48 @@ expect "import changes it" "$(run '{"args":["import","web","{\"max_connections\"
 expect "stop stops it" "$(run '{"args":["stop","web"]}' | j "d['code']") $("$BIN" ls 2>/dev/null | grep -c ' web .*Stopped')" "0 1"
 expect "start starts it" "$(run '{"args":["start","web"]}' | j "d['code']")" 0
 expect "and remove removes it" "$(run '{"args":["remove","web"]}' | j "d['code']") $("$BIN" ls 2>/dev/null | grep -c ' web ')" "0 0"
+# ─── the log ────────────────────────────────────────────────────────────────
+run "{\"args\":[\"create\",\"storage\",\"loud\",\"-p\",\"$((P+2))\",\"--dir\",\"$T/loud\",\"--anonymous\",\"-s\"]}" >/dev/null
+logs() { curl -s -b "$T/jar" "$U/api/logs?$1"; }
+got=""
+for _ in $(seq 1 30); do got=$(logs "runtime=loud" | j "any(l['rt']=='loud' for l in d['lines'])"); [ "$got" = True ] && break; sleep 0.2; done
+expect "a worker's lines reach the daemon's log, named by their runtime" "$got" True
+expect "and its stderr still gets them" "$(grep -q "storage 'loud'" "$SOCKETLEY_DLOG" && echo yes)" yes
+expect "the daemon's own lines are there too" "$(logs "max=2000" | j "any(l['rt']=='' and 'daemon started' in l['text'] for l in d['lines'])")" True
+n=$(logs "max=1" | j "d['next']")
+expect "a reader asks for what is new" "$(logs "since=$n" | j "all(l['seq'] > $n for l in d['lines'])")" True
+expect "and filters by level" "$(logs "level=error&max=2000" | j "all(l['lv']=='error' for l in d['lines'])")" True
+expect "the log needs a session" "$(code "$U/api/logs")" 401
+
+# ─── domains ────────────────────────────────────────────────────────────────
+command -v openssl >/dev/null 2>&1 && openssl req -x509 -newkey rsa:2048 -nodes -days 20 -subj /CN=example.com \
+    -addext "subjectAltName=DNS:*.example.com,DNS:example.com" -keyout "$T/e.key" -out "$T/e.pem" >/dev/null 2>&1
+run "{\"args\":[\"create\",\"proxy\",\"web\",\"-p\",\"$((P+3))\",\"--tls\",\"--cert\",\"$T/e.pem\",\"--key\",\"$T/e.key\",\"-s\"]}" >/dev/null
+run "{\"args\":[\"create\",\"dns\",\"ns\",\"-p\",\"$((P+4))\",\"--zone\",\"example.com\",\"--proxy\",\"web\",\"--publish\",\"192.0.2.7\",\"-s\"]}" >/dev/null
+run "{\"args\":[\"create\",\"server\",\"site\",\"-p\",\"$((P+5))\",\"--domain\",\"site\",\"--http\",\"$T\",\"-s\"]}" >/dev/null
+edge() { curl -s -b "$T/jar" "$U/api/edge"; }
+got=""
+for _ in $(seq 1 30); do got=$(edge | j "[r['to'][0]['runtime'] for e in d['entrances'] if e['name']=='web' for r in e['routes'] if r['name']=='site.example.com']"); [ "$got" = "['site']" ] && break; sleep 0.2; done
+expect "the entrance's routes name the runtime each goes to" "$got" "['site']"
+expect "a certificate says its names and how long it has" \
+    "$(edge | j "[(sorted(c['names']), 19 <= c['expires_in'] // 86400 <= 20) for c in d['certs'] if c['runtime']=='web']")" "[(['*.example.com', 'example.com'], True)]"
+zpath=$(edge | j "[z['path'] for z in d['zones'] if z['runtime']=='ns'][0]")
+expect "a zone is listed with its origin" "$(edge | j "[z['origin'] for z in d['zones'] if z['runtime']=='ns'][0]")" "example.com."
+zone_text=$(curl -s -b "$T/jar" -G --data-urlencode "runtime=ns" --data-urlencode "path=$zpath" "$U/api/zone")
+has "and read whole" "$zone_text" "SOA"
+put() { curl -s -o "$T/put.out" -w '%{http_code}' -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -X PUT --data-binary "$1" "$U/api/zone"; }
+body=$(python3 -c 'import json,sys; t=sys.argv[3].replace("hostmaster 2026","hostmaster 2027") + "\nhello TXT \"from the dashboard\"\n"; print(json.dumps({"runtime":sys.argv[1],"path":sys.argv[2],"text":t}))' ns "$zpath" "$zone_text")
+expect "an edit is written" "$(put "$body")" 204
+for _ in $(seq 1 30); do got=$(dig @127.0.0.1 -p $((P+4)) +short hello.example.com TXT 2>/dev/null); [ -n "$got" ] && break; sleep 0.2; done
+expect "and served" "$got" '"from the dashboard"'
+bad=$(python3 -c 'import json,sys; print(json.dumps({"runtime":"ns","path":sys.argv[1],"text":sys.argv[2]+"\nbroken A 999.1.1.1\n"}))' "$zpath" "$zone_text")
+expect "a zone that does not parse is refused" "$(put "$bad")" 400
+has "saying where" "$(cat "$T/put.out")" "999.1.1.1"
+expect "and the file is as it was" "$(grep -c '999.1.1.1' "$zpath")" 0
+expect "a file no dns runtime serves is none of the page's" \
+    "$(put "$(python3 -c 'import json; print(json.dumps({"runtime":"ns","path":"/etc/passwd","text":"x"}))')")" 404
+expect "and a change needs the page's header" "$(curl -s -o /dev/null -w '%{http_code}' -b "$T/jar" -X PUT --data-binary "$body" "$U/api/zone")" 403
+
 expect "signing out ends the session" "$(code -X DELETE -b "$T/jar" -c "$T/jar" "$U/api/session") $(code -b "$T/jar" "$U/api/runtimes")" "204 401"
 
 # ─── without credentials ────────────────────────────────────────────────────

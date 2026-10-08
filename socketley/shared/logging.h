@@ -59,6 +59,9 @@ struct logger
     // daemon's stderr and a line that names no runtime names nothing.
     static inline std::string g_prefix;
 
+    // Where the daemon keeps its own recent lines (log_ring.h), null in a worker.
+    static inline void (*g_tap)(const char* line, size_t n) = nullptr;
+
     static void log(log_level level, const char* msg)
     {
         if (level < g_level)
@@ -83,6 +86,13 @@ struct logger
         std::lock_guard<std::mutex> lock(mtx);
         std::fprintf(stderr, "[%02d:%02d:%02d] [%s] %s%s\n",
             tm.tm_hour, tm.tm_min, tm.tm_sec, tag, g_prefix.c_str(), msg);
+        if (g_tap)
+        {
+            char head[32];
+            const int n = std::snprintf(head, sizeof head, "[%02d:%02d:%02d] [%s] ", tm.tm_hour, tm.tm_min, tm.tm_sec, tag);
+            const std::string line = std::string(head, n > 0 ? static_cast<size_t>(n) : 0) + g_prefix + msg;
+            g_tap(line.data(), line.size());
+        }
     }
 };
 

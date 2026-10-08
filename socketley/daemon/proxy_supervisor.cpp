@@ -1,4 +1,5 @@
 #include "proxy_supervisor.h"
+#include "../shared/log_ring.h"
 #include "../shared/fast_lo.h"
 #include "../shared/worker_env.h"
 
@@ -570,10 +571,13 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     // Before the fork, because after it only async-signal-safe calls are
     // legal and this object allocates.
     const socketley::worker_env child_env(cfg.type == runtime_cache);
+    // Its stderr through a pipe of its own, so the daemon's recent log knows which runtime wrote each line.
+    const int log_fd = log_ring::worker_pipe(cfg.name);
 
     const pid_t child = ::fork();
     if (child < 0)
     {
+        if (log_fd >= 0) ::close(log_fd);
         ::close(sv[0]);
         ::close(sv[1]);
         if (mv[0] >= 0) ::close(mv[0]);
@@ -587,6 +591,8 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     if (child == 0)
     {
         // ── child ───────────────────────────────────────────────────────────
+        // First, while no descriptor has been placed on a number it could take.
+        if (log_fd >= 0 && ::dup2(log_fd, STDERR_FILENO) < 0) {}
         // Exactly four descriptors are meant to reach the worker -- /dev/null,
         // the daemon's stdout and stderr, and the control socket -- with the
         // fix at every creation site rather than here, because a descriptor
@@ -633,6 +639,8 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     }
 
     // ── parent ──────────────────────────────────────────────────────────────
+    if (log_fd >= 0)
+        ::close(log_fd);
     ::close(sv[1]);
     if (mv[1] >= 0)
         ::close(mv[1]);
