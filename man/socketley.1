@@ -1187,6 +1187,16 @@ Deleting them used to clear them, and that is what changed: a runtime
 configured for TLS could be handed
 .B {"name":"x"}
 and answer in cleartext afterwards, with the command reporting success.
+.PP
+A document that leaves out
+.B name
+and
+.B type
+is about the runtime the command names, with that runtime's type, so one field
+is changed with one key:
+.nf
+socketley import ui '{"domain":"storage"}'
+.fi
 .SS Edit: JSON Configuration Fields
 The interactive editor opens a JSON file with the following fields.
 Fields marked

@@ -233,6 +233,13 @@ OUT=$(reimport if_srv "{'port':$((P_SRV+3))}") || true
 if [ -z "$OUT" ]; then ok; else bad "a port in range is accepted" "got '$OUT'"; fi
 check "and it moved" "$((P_SRV+3))" "$(field if_srv port)"
 
+# A document without "name" is about the runtime the command names; one that is no object is still refused.
+OUT=$("$BIN" import if_prx '{"circuit_timeout": 17}' 2>&1)
+if [ -z "$OUT" ]; then ok; else bad "a document without a name is the named runtime's" "got '$OUT'"; fi
+check "and it is applied" "17" "$(field if_prx circuit_timeout)"
+check "text that is no object is refused" "invalid JSON" "$("$BIN" import if_prx 'circuit_timeout 17' 2>&1)"
+check "and so is an empty name" "invalid JSON" "$("$BIN" import if_prx '{"name": ""}' 2>&1)"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 [ "$FAIL" -eq 0 ]

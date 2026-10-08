@@ -65,6 +65,7 @@ static std::string names_refusal(runtime_manager& manager, const runtime_instanc
 #include <chrono>
 #include <optional>
 #include <algorithm>
+#include <cctype>
 #include <grp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -4018,11 +4019,18 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     // Extract JSON from everything after the name
     std::string json_str(pa.rest_from(2));
     runtime_config cfg;
-    if (!m_persistence->parse_json_string(json_str, cfg))
+    const bool named = m_persistence->parse_json_string(json_str, cfg, instance->get_type());
+    std::string_view doc = json_str;
+    while (!doc.empty() && std::isspace(static_cast<unsigned char>(doc.front()))) doc.remove_prefix(1);
+    while (!doc.empty() && std::isspace(static_cast<unsigned char>(doc.back()))) doc.remove_suffix(1);
+    // A document without "name" is about the runtime the command names, as edit's flags are.
+    if (!doc.starts_with('{') || !doc.ends_with('}') || (!named && cfg.has("name")))
     {
         conn->write_buf = "invalid JSON\n";
         return 1;
     }
+    if (!named)
+        cfg.name = std::string(name);
 
     // The listener field is re-read from the document rather than taken from
     // cfg, because parse_json_string cannot tell a missing `unix:` prefix from

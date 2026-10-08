@@ -515,6 +515,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   hands a descriptor over — the origin keeps the socket and relays.
 ### Fixed
 
+- **`import name '{"key": value}'` was "invalid JSON", or applied nothing.** A
+  document without `name` was refused, and one without `type` had every field of
+  the runtime's own type left unread, so `{"name":"px","circuit_timeout":18}`
+  reported success and changed nothing. A document that leaves them out is now
+  about the runtime the command names, with its type.
+
 - **Storage behind a proxy counted every client as the proxy.** Failed sign-ins,
   `aws:SourceIp` and the access log read the socket's peer, so behind Apache or
   the entrance one guesser locked everybody out of the web interface and an IP

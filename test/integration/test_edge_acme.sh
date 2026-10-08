@@ -68,10 +68,13 @@ san() { echo | openssl s_client -connect "127.0.0.1:$S" -servername "$1" 2>/dev/
         openssl x509 -noout -ext subjectAltName 2>/dev/null | grep -o 'DNS:[*a-z0-9.-]*' | sort | tr '\n' ' '; }
 # The CA's HTTP-01 port, served by a redirect to HTTPS, which answers a challenge before it redirects.
 "$BIN" create proxy redir -p "$HTTP01" --redirect-https "$S" -s >/dev/null 2>&1
+# A name that appears while that issuance runs (its probe alone takes seconds) is asked for right after it.
+sleep 3
+"$BIN" create server late -p $((P+9)) --domain --http "$T/site" -s >/dev/null 2>&1
+want="DNS:chat.example.com DNS:example.com DNS:late.example.com "
 got=""
-for _ in $(seq 1 300); do got=$(san chat.example.com); [ "$got" = "DNS:chat.example.com DNS:example.com " ] && break; sleep 0.2; done
-expect "a zone not delegated here has its names proven one by one, without the wildcard" "$got" \
-    "DNS:chat.example.com DNS:example.com "
+for _ in $(seq 1 400); do got=$(san chat.example.com); [ "$got" = "$want" ] && break; sleep 0.2; done
+expect "a zone not delegated here has its names proven one by one, without the wildcard" "$got" "$want"
 expect "and the redirect sends a browser to HTTPS, path and all" \
     "$(curl -s --noproxy '*' -m 5 -o /dev/null -w '%{http_code} %{redirect_url}' -H 'Host: chat.example.com' "http://127.0.0.1:$HTTP01/a/b?c=d")" \
     "308 https://chat.example.com:$S/a/b?c=d"

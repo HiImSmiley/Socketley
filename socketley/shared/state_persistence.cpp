@@ -1175,7 +1175,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     return j;
 }
 
-bool state_persistence::parse_json_string(const std::string& json, runtime_config& cfg) const
+bool state_persistence::parse_json_string(const std::string& json, runtime_config& cfg,
+                                          std::optional<runtime_type> assumed) const
 {
     using namespace sp_detail;
 
@@ -1187,7 +1188,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.name = json_get_string(json, "name");
     cfg.id = json_get_string(json, "id");
     cfg.type_name = json_get_string(json, "type");
-    cfg.type = str_to_type(cfg.type_name);
+    cfg.type = cfg.type_name.empty() && assumed ? *assumed : str_to_type(cfg.type_name);
     cfg.port = static_cast<uint16_t>(json_get_int(json, "port"));
     {
         // The prefix is stripped here and stored bare, so nothing downstream

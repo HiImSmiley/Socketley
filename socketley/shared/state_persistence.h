@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <string>
 #include <condition_variable>
 #include <deque>
@@ -218,7 +219,9 @@ public:
 
     runtime_config read_from_instance(const runtime_instance* instance) const;
     std::string format_json_pretty(const runtime_config& cfg) const;
-    bool parse_json_string(const std::string& json, runtime_config& cfg) const;
+    // `assumed` is the type of a document that names none, as an import for a runtime that exists may leave out.
+    bool parse_json_string(const std::string& json, runtime_config& cfg,
+                           std::optional<runtime_type> assumed = std::nullopt) const;
 
     // One field exactly as written, for a value that parsing normalises away --
     // `listen` loses its `unix:` prefix and cannot be judged afterwards.

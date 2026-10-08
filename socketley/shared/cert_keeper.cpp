@@ -251,10 +251,14 @@ void look_after(acme_state& a, clock::time_point now)
         // Issued: the files are taken up at the next look, which is now.
         write_file(a.cert + ".names", a.issuing, 0644);
         a.backoff = backoff_first;
-        if (partial)
-            a.next_try = now + partial_again;
         g_next_watch = now;
-        return;
+        // Names asked for while it ran are asked for now, not at the next renewal look or six hours later.
+        if (a.issuing == names_of(a))
+        {
+            if (partial)
+                a.next_try = now + partial_again;
+            return;
+        }
     }
     if (now < a.next_try)
         return;
