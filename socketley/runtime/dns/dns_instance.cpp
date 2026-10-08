@@ -1408,7 +1408,7 @@ bool dns_instance::ensure_zone_files(std::string& why) const
         const std::time_t now = std::time(nullptr);
         std::tm tm{};
         ::gmtime_r(&now, &tm);
-        char serial[16];
+        char serial[48];
         std::snprintf(serial, sizeof serial, "%04d%02d%02d01", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
         std::string text = "; The zone " + origin + ", written by socketley for dns runtime '" + std::string(get_name()) +
                            "'. Yours to edit: it is read again within a second.\n"
