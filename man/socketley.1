@@ -10844,8 +10844,12 @@ over DNS\-01 by this runtime's answers. Before that,
 .B acme issue
 asks the resolver of
 .I /etc/resolv.conf
-for a TXT record that exists only in this runtime's answers: a zone the world's
-DNS does not delegate here yet has each of its names proven by itself instead,
+for a TXT record that exists only in this runtime's answers, after
+.B SOCKETLEY_ACME_DNS_WAIT
+seconds, and then asks every name server the zone is delegated to for it
+directly, as a CA may ask any of them. A zone the world's DNS does not delegate
+here yet, or one a secondary of which has not taken the record up in that time,
+has each of its names proven by itself instead,
 over TLS\-ALPN\-01 on 443, without the wildcard, which is asked for again every
 six hours until the zone is delegated. On 443 it comes with
 .IB dns \-proxy\-http
@@ -15343,7 +15347,9 @@ Inherited by worker processes, which have no command line of their own.
 Seconds between putting a DNS\-01 answer where the
 .B dns
 runtimes serve it and telling the CA to look: the time a secondary of the zone
-has to take the new serial. Default 10, at most 3600.
+has to take the new serial, and the time the delegation probe gives it too.
+Default 10, at most 3600. A secondary that is told by NOTIFY and transfers on it
+takes seconds; give one that waits for its refresh the minutes it takes.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
@@ -15356,7 +15362,8 @@ whether a zone of
 .B \-\-dns\-zones
 is delegated to this daemon's
 .B dns
-runtimes, before it proves anything there over DNS\-01;
+runtimes, before it proves anything there over DNS\-01; it then asks each name
+server of the zone, by its IPv4 addresses, the way a CA would.
 .B off
 asks nothing and takes every zone as delegated. Default: the first
 .B nameserver

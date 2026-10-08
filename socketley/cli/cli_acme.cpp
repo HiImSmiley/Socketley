@@ -3,6 +3,7 @@
 // DNS-01 by the TXT records a dns runtime serves from the feed (dns_feed.h) -- the one way to a wildcard. A runtime with --acme runs it as a child of its
 // worker; an operator may run it by hand, as certbot is run. Blocking on purpose: it is its own process.
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
 #include <sys/file.h>
@@ -442,11 +443,137 @@ std::string alpn_cert(const std::string& name, const std::string& key_auth)
     return pem;
 }
 
-// Whether the world's DNS asks this daemon's dns runtimes about `zone`: a TXT record that exists nowhere else is put
-// in the feed and asked for through the resolver SOCKETLEY_ACME_DNS_PROBE names ("off" for no question), or else
-// the first of /etc/resolv.conf. A CA asking about a name in a zone that is not delegated here would never see the
-// answer, and every failed validation counts against its limits.
-bool zone_delegated(const std::string& zone)
+// Seconds a secondary of a zone is given to take a change up before it is asked: SOCKETLEY_ACME_DNS_WAIT, 10 by default.
+int dns_wait_seconds()
+{
+    int wait = 10;
+    if (const char* w = std::getenv("SOCKETLEY_ACME_DNS_WAIT"); w && *w)
+        wait = std::clamp(std::atoi(w), 1, 3600);
+    return wait;
+}
+
+// One question to `host`:`port` over UDP, its answer raw; empty when none came. `recurse` sets RD.
+std::string dns_ask(const std::string& host, const std::string& port, const std::string& qname, uint16_t qtype,
+                    bool recurse)
+{
+    unsigned char id[2];
+    if (RAND_bytes(id, sizeof id) != 1)
+        return {};
+    std::string q = {static_cast<char>(id[0]), static_cast<char>(id[1]), static_cast<char>(recurse ? 1 : 0), 0,
+                     0, 1, 0, 0, 0, 0, 0, 0};
+    for (size_t p = 0; p <= qname.size();)
+    {
+        const size_t dot = std::min(qname.find('.', p), qname.size());
+        if (dot > p)
+        {
+            q += static_cast<char>(dot - p);
+            q.append(qname, p, dot - p);
+        }
+        p = dot + 1;
+    }
+    q += {'\0', static_cast<char>(qtype >> 8), static_cast<char>(qtype & 0xff), '\0', '\1'};
+
+    std::string answer;
+    addrinfo hints{}, *ai = nullptr;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+    if (::getaddrinfo(host.c_str(), port.c_str(), &hints, &ai) != 0 || !ai)
+        return {};
+    const int fd = ::socket(ai->ai_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    for (int attempt = 0; fd >= 0 && attempt < 3 && answer.empty(); ++attempt)
+    {
+        if (::sendto(fd, q.data(), q.size(), 0, ai->ai_addr, ai->ai_addrlen) < 0)
+            break;
+        pollfd pfd{fd, POLLIN, 0};
+        while (::poll(&pfd, 1, 3000) > 0)
+        {
+            char buf[1500];
+            const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
+            if (n < 12)
+                break;
+            if (buf[0] == q[0] && buf[1] == q[1])
+            {
+                answer.assign(buf, static_cast<size_t>(n));
+                break;
+            }
+        }
+    }
+    if (fd >= 0)
+        ::close(fd);
+    ::freeaddrinfo(ai);
+    return answer;
+}
+
+// The name at `off` in a DNS message, compression followed; `off` moves past it. False for a malformed one.
+bool dns_name(const std::string& m, size_t& off, std::string& out)
+{
+    out.clear();
+    size_t at = off;
+    bool jumped = false;
+    for (int hops = 0; hops < 64; ++hops)
+    {
+        if (at >= m.size())
+            return false;
+        const auto len = static_cast<unsigned char>(m[at]);
+        if (len == 0)
+        {
+            if (!jumped)
+                off = at + 1;
+            return true;
+        }
+        if ((len & 0xc0) == 0xc0)
+        {
+            if (at + 1 >= m.size())
+                return false;
+            if (!jumped)
+                off = at + 2;
+            jumped = true;
+            at = (static_cast<size_t>(len & 0x3f) << 8) | static_cast<unsigned char>(m[at + 1]);
+            continue;
+        }
+        if (at + 1 + len > m.size())
+            return false;
+        out += (out.empty() ? "" : ".") + m.substr(at + 1, len);
+        at += 1 + len;
+    }
+    return false;
+}
+
+// The NS names an answer holds.
+std::vector<std::string> dns_ns_names(const std::string& m)
+{
+    std::vector<std::string> out;
+    if (m.size() < 12)
+        return out;
+    const unsigned qd = (static_cast<unsigned char>(m[4]) << 8) | static_cast<unsigned char>(m[5]);
+    const unsigned an = (static_cast<unsigned char>(m[6]) << 8) | static_cast<unsigned char>(m[7]);
+    size_t off = 12;
+    std::string name;
+    for (unsigned i = 0; i < qd; ++i)
+        if (!dns_name(m, off, name) || (off += 4) > m.size())
+            return out;
+    for (unsigned i = 0; i < an; ++i)
+    {
+        if (!dns_name(m, off, name) || off + 10 > m.size())
+            return out;
+        const unsigned type = (static_cast<unsigned char>(m[off]) << 8) | static_cast<unsigned char>(m[off + 1]);
+        const size_t rdlen = (static_cast<unsigned char>(m[off + 8]) << 8) | static_cast<unsigned char>(m[off + 9]);
+        off += 10;
+        size_t rd = off;
+        if (type == 2 && dns_name(m, rd, name))
+            out.push_back(name);
+        off += rdlen;
+    }
+    return out;
+}
+
+// Whether the world's DNS asks this daemon's dns runtimes about `zone`, and every server of the zone answers what
+// they serve: a TXT record that exists nowhere else is put in the feed, SOCKETLEY_ACME_DNS_WAIT seconds are given to
+// the zone's secondaries, and it is asked for through the resolver SOCKETLEY_ACME_DNS_PROBE names ("off" for no
+// question) or else the first of /etc/resolv.conf, and then of each name server of the zone, by its IPv4 addresses.
+// A CA asks any of them, so a secondary that has not caught up fails the validation as surely as no delegation, and
+// every failed validation counts against the CA's limits; `why` says which it was.
+bool zone_delegated(const std::string& zone, std::string& why)
 {
     const char* env = std::getenv("SOCKETLEY_ACME_DNS_PROBE");
     if (env && std::string_view(env) == "off")
@@ -479,7 +606,10 @@ bool zone_delegated(const std::string& zone)
             }
     }
     if (host.empty())
+    {
+        why = "there is no resolver to ask";
         return false;
+    }
 
     unsigned char rnd[24];
     if (RAND_bytes(rnd, sizeof rnd) != 1)
@@ -492,58 +622,41 @@ bool zone_delegated(const std::string& zone)
         value += {hexd[rnd[i] >> 4], hexd[rnd[i] & 15]};
     std::string path;
     if (!dns_feed::write_challenge(label + "." + zone, value, label, path))
+    {
+        why = "the probe could not be written to " + dns_feed::dir();
         return false;
-    // A dns runtime looks at the feed once a second.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-
-    // One question, recursion desired: TXT _acme-challenge.<label>.<zone>.
-    std::string q = {static_cast<char>(rnd[0]), static_cast<char>(rnd[1]), 1, 0, 0, 1, 0, 0, 0, 0, 0, 0};
-    const std::string qname = "_acme-challenge." + label + "." + zone;
-    for (size_t p = 0; p <= qname.size();)
-    {
-        const size_t dot = std::min(qname.find('.', p), qname.size());
-        if (dot > p)
-        {
-            q += static_cast<char>(dot - p);
-            q.append(qname, p, dot - p);
-        }
-        p = dot + 1;
     }
-    q += std::string("\0\0\x10\0\x01", 5);
+    // A dns runtime looks at the feed once a second; its secondaries are told and take the change up after.
+    std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1500, dns_wait_seconds() * 1000)));
 
-    bool found = false;
-    addrinfo hints{}, *ai = nullptr;
-    hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
-    if (::getaddrinfo(host.c_str(), port.c_str(), &hints, &ai) == 0 && ai)
+    const std::string qname = "_acme-challenge." + label + "." + zone;
+    bool ok = dns_ask(host, port, qname, 16, true).find(value) != std::string::npos;
+    if (!ok)
+        why = "the world's DNS does not ask this daemon about it yet";
+    for (const std::string& ns : ok ? dns_ns_names(dns_ask(host, port, zone, 2, true)) : std::vector<std::string>{})
     {
-        const int fd = ::socket(ai->ai_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-        for (int attempt = 0; fd >= 0 && attempt < 3 && !found; ++attempt)
+        addrinfo hints{}, *ai = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        // A server whose address cannot be found here is one the CA could not find either.
+        if (::getaddrinfo(ns.c_str(), "53", &hints, &ai) != 0)
+            continue;
+        for (addrinfo* a = ai; a && ok; a = a->ai_next)
         {
-            if (::sendto(fd, q.data(), q.size(), 0, ai->ai_addr, ai->ai_addrlen) < 0)
-                break;
-            pollfd pfd{fd, POLLIN, 0};
-            while (!found && ::poll(&pfd, 1, 3000) > 0)
+            char ip[INET_ADDRSTRLEN];
+            if (!::inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(a->ai_addr)->sin_addr, ip, sizeof ip))
+                continue;
+            if (dns_ask(ip, "53", qname, 16, false).find(value) == std::string::npos)
             {
-                char buf[1500];
-                const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
-                if (n < 12)
-                    break;
-                // Its id, and the value, which nothing but this question's answer can hold.
-                if (buf[0] == q[0] && buf[1] == q[1])
-                {
-                    found = std::string_view(buf, static_cast<size_t>(n)).find(value) != std::string_view::npos;
-                    break;
-                }
+                ok = false;
+                why = ns + " (" + ip + ") had not taken the change up after " + std::to_string(dns_wait_seconds()) +
+                      " s (SOCKETLEY_ACME_DNS_WAIT)";
             }
         }
-        if (fd >= 0)
-            ::close(fd);
-    }
-    if (ai)
         ::freeaddrinfo(ai);
+    }
     ::unlink(path.c_str());
-    return found;
+    return ok;
 }
 
 // Whether the certificate in `path` is a CA's, has more than thirty days left, and is good for every one of `names`,
@@ -844,10 +957,11 @@ int issue(int argc, char** argv)
     bool partial = false;
     if (challenge != "dns-01")
         std::erase_if(dns_zones, [&](const std::string& z) {
-            if (zone_delegated(z))
+            std::string why;
+            if (zone_delegated(z, why))
                 return false;
-            std::cout << "acme issue: " << z << " is not delegated to this daemon's dns runtimes yet; its names are "
-                      << "proven over " << challenge << " and its wildcard waits\n";
+            std::cout << "acme issue: " << z << ": " << why << "; its names are proven over " << challenge
+                      << " and its wildcard waits\n";
             return true;
         });
     std::erase_if(names, [&](const std::string& n) {
@@ -981,9 +1095,7 @@ int issue(int argc, char** argv)
     if (!dns_checks.empty())
     {
         // A dns runtime takes the feed up within a second; SOCKETLEY_ACME_DNS_WAIT gives secondaries their time.
-        int wait = 10;
-        if (const char* w = std::getenv("SOCKETLEY_ACME_DNS_WAIT"); w && *w)
-            wait = std::clamp(std::atoi(w), 1, 3600);
+        const int wait = dns_wait_seconds();
         std::this_thread::sleep_for(std::chrono::seconds(wait));
         for (const pending_check& pc : dns_checks)
         {

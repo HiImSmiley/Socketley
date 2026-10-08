@@ -23,7 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   runtime answering set none. Its certificate no longer waits for the
   delegation: `acme issue` asks the resolver for a TXT record only this
   daemon's dns runtime serves (`SOCKETLEY_ACME_DNS_PROBE` names another, or
-  `off`), and a zone not delegated here yet has its names proven one by one
+  `off`) and then every name server of the zone directly, after
+  `SOCKETLEY_ACME_DNS_WAIT`, as a CA asks any of them; a zone not delegated
+  here yet, or with a secondary that has not caught up, has its names proven one by one
   over TLS-ALPN-01, the wildcard asked for again every six hours; asked again
   for what the certificate already holds, it does not trouble the CA. A zone
   file `--zone <name>` writes gives the zone's own name the entrance's address.
