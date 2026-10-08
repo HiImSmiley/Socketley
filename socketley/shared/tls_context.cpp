@@ -251,7 +251,7 @@ static void log_ssl_errors(const char* what, int ssl_err = SSL_ERROR_NONE)
 static void apply_ctx_performance_options(SSL_CTX* ctx)
 {
     // Session tickets for stateless resumption, with SSL_OP_NO_TICKET cleared
-    // explicitly although it is off by default.
+    // explicitly although it is off by default; init_server sets it again.
     long opts = SSL_CTX_get_options(ctx);
     opts &= ~SSL_OP_NO_TICKET;
 
@@ -395,6 +395,13 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
 
     // Apply common performance options (tickets, modes, fragment size)
     apply_ctx_performance_options(m_ctx);
+    // TLS 1.2 is offered with Mozilla's intermediate suites alone, ECDHE and AEAD; TLS 1.3's are all of that already.
+    SSL_CTX_set_cipher_list(m_ctx, "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+                                   "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+                                   "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305");
+    // Resumption from the session cache rather than from tickets, whose key lives as long as the process and would
+    // open every TLS 1.2 session it ever sealed to whoever learns it.
+    SSL_CTX_set_options(m_ctx, SSL_OP_NO_TICKET);
     SSL_CTX_set_client_hello_cb(m_ctx, acme_client_hello, nullptr);
     SSL_CTX_set_alpn_select_cb(m_ctx, acme_alpn_select, nullptr);
 
