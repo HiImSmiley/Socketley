@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <unordered_set>
 
 #include <fcntl.h>
@@ -76,14 +77,17 @@ void keeper::record(int64_t now_ms, const std::vector<std::pair<std::string, rea
     // A runtime not read now keeps its points until they are a day old: the first reading after a restart comes
     // before the runtimes are restored.
     const int64_t oldest = now_ms / 1000 - span;
-    std::erase_if(m_series, [&](auto& kv) {
-        if (present.contains(kv.first))
-            return false;
-        kv.second.last_ms = 0;
-        while (!kv.second.points.empty() && kv.second.points.front().at < oldest)
-            kv.second.points.pop_front();
-        return kv.second.points.empty();
-    });
+    for (auto it = m_series.begin(); it != m_series.end();)
+    {
+        series& s = it->second;
+        if (!present.contains(it->first))
+        {
+            s.last_ms = 0;
+            while (!s.points.empty() && s.points.front().at < oldest)
+                s.points.pop_front();
+        }
+        it = s.points.empty() && !present.contains(it->first) ? m_series.erase(it) : std::next(it);
+    }
 }
 
 std::string keeper::query(std::string_view name, int64_t now_s, int64_t range, size_t points) const
