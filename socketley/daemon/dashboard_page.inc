@@ -16,6 +16,7 @@ constexpr std::string_view dashboard_page = R"HTML(<!doctype html>
 .tile .k{font-size:12px;color:var(--mut);letter-spacing:.04em;text-transform:uppercase;display:flex;align-items:center;gap:6px}
 .tile .v{font-size:26px;font-weight:700;margin-top:6px;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
 .tile .s{font-size:12.5px;color:var(--mut);margin-top:2px;font-variant-numeric:tabular-nums}
+@media(min-width:900px){.tiles.t3{grid-template-columns:repeat(3,1fr)}}
 .tile svg.spark{display:block;width:100%;height:42px;margin-top:8px}
 .tile svg.spark path.l{fill:none;stroke:var(--a1);stroke-width:1.8}
 .tile svg.spark path.f{fill:url(#sg);stroke:none;opacity:.35}
@@ -60,6 +61,14 @@ pre.out{font-family:var(--mono);font-size:12.5px;background:rgba(0,0,0,.35);bord
 .log .rt{color:var(--a1);margin-right:8px}
 .log.short{max-height:320px}
 .why{font-size:12px;color:var(--bad);margin-top:3px;max-width:520px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:8px}
+.st{background:rgba(255,255,255,.035);border:1px solid var(--line);border-radius:10px;padding:8px 11px;min-width:0}
+.st b{display:block;font-size:15px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.st span{display:block;font-size:11.5px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.st.zero b{color:var(--dim)}.st.bad b{color:var(--bad)}
+.sgh{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);margin:14px 0 7px}.sgh:first-child{margin-top:0}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.chips span{font-size:12px;border:1px solid var(--line);border-radius:20px;padding:3px 10px;color:var(--mut)}.chips b{color:var(--fg);font-weight:600}
 .certs{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;margin-bottom:26px}
 .cert .nm2{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
 .cert .nm2 span{font-family:var(--mono);font-size:12px;background:rgba(255,255,255,.06);border:1px solid var(--line);border-radius:8px;padding:2px 8px}
@@ -175,7 +184,9 @@ async function problems() {
   } catch (e) {}
 }
 let me = null, schema = null, view = { at: 'over' }, rts = [], meta = {}, over = null, timer = 0, filterType = '';
-const hist = { msg: [], conn: [], bin: [], bout: [], cpu: [] };
+const hist = { msg: [], conn: [], bin: [], bout: [], cpu: [], rss: [] };
+// The same, per runtime, while the page is open.
+const rtHist = {};
 const prev = { t: 0, msg: 0, bin: 0, bout: 0, cpu: 0, per: {} };
 
 async function api(method, url, body) {
@@ -226,6 +237,7 @@ function route() {
   else view = { at: 'over' };
   while (layers.length) layers[layers.length - 1].close();
   $('#side').classList.remove('open');
+  const sc = $('#scroll'); if (sc) sc.scrollTop = 0;
   render(true);
 }
 window.addEventListener('hashchange', () => { if (me) route(); });
@@ -263,8 +275,12 @@ async function poll() {
     if (dt > 0) {
       const push = (k, v) => { hist[k].push(Math.max(0, v)); if (hist[k].length > 90) hist[k].shift(); };
       push('msg', (o.messages_total - prev.msg) / dt); push('bin', (o.bytes_in - prev.bin) / dt); push('bout', (o.bytes_out - prev.bout) / dt);
-      push('cpu', 100 * (o.cpu_seconds - prev.cpu) / dt / (o.cpus || 1)); push('conn', o.connections_active);
-      for (const x of r) { const p = prev.per[x.name]; x.msg_s = p ? Math.max(0, (x.messages_total - p.m) / dt) : 0; x.in_s = p ? Math.max(0, (x.bytes_in - p.i) / dt) : 0; x.out_s = p ? Math.max(0, (x.bytes_out - p.o) / dt) : 0; x.cpu_p = p ? Math.max(0, 100 * (x.cpu_seconds - p.c) / dt) : 0; }
+      push('cpu', 100 * (o.cpu_seconds - prev.cpu) / dt / (o.cpus || 1)); push('conn', o.connections_active); push('rss', o.rss_bytes);
+      for (const x of r) {
+        const p = prev.per[x.name]; x.msg_s = p ? Math.max(0, (x.messages_total - p.m) / dt) : 0; x.in_s = p ? Math.max(0, (x.bytes_in - p.i) / dt) : 0; x.out_s = p ? Math.max(0, (x.bytes_out - p.o) / dt) : 0; x.cpu_p = p ? Math.max(0, 100 * (x.cpu_seconds - p.c) / dt) : 0;
+        const h = rtHist[x.name] || (rtHist[x.name] = { msg: [], conn: [], bin: [], bout: [], cpu: [], rss: [] });
+        for (const [k, v] of [['msg', x.msg_s], ['conn', x.connections], ['bin', x.in_s], ['bout', x.out_s], ['cpu', x.cpu_p], ['rss', x.rss_bytes]]) { h[k].push(v); if (h[k].length > 90) h[k].shift(); }
+      }
     }
     prev.t = now; prev.msg = o.messages_total; prev.bin = o.bytes_in; prev.bout = o.bytes_out; prev.cpu = o.cpu_seconds;
     prev.per = Object.fromEntries(r.map(x => [x.name, { m: x.messages_total, i: x.bytes_in, o: x.bytes_out, c: x.cpu_seconds }]));
@@ -278,17 +294,18 @@ async function poll() {
 async function loadMeta() {
   try { const r = await run('ls', '--json'); if (!r.code) for (const x of JSON.parse(r.out)) meta[x.name] = x; } catch (e) {}
 }
-function spark(vals) {
+// A rate is drawn from zero, a gauge (`span`) between its least and greatest value.
+function spark(vals, span) {
   const s = document.createElementNS(SVGNS, 'svg'); s.setAttribute('class', 'spark'); s.setAttribute('viewBox', '0 0 100 30'); s.setAttribute('preserveAspectRatio', 'none');
   if (vals.length < 2) return s;
-  const top = Math.max(...vals) || 1, n = vals.length;
-  const pts = vals.map((v, i) => [(i / (n - 1)) * 100, 28 - (v / top) * 26]);
+  const lo = span ? Math.min(...vals) : 0, top = Math.max(...vals) - lo, n = vals.length;
+  const pts = vals.map((v, i) => [(i / (n - 1)) * 100, top ? 28 - ((v - lo) / top) * 26 : span ? 15 : 28]);
   const d = pts.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(2) + ' ' + p[1].toFixed(2)).join('');
   s.innerHTML = '<path class="f" d="' + d + 'L100 30L0 30Z"/><path class="l" d="' + d + '"/>';
   return s;
 }
-function tile(icon, k, v, s, vals) {
-  return el('div', { class: 'tile' }, el('div', { class: 'k' }, ico(icon), el('span', { text: k })), el('div', { class: 'v', text: v }), s ? el('div', { class: 's', text: s }) : null, vals ? spark(vals) : null);
+function tile(icon, k, v, s, vals, span) {
+  return el('div', { class: 'tile' }, el('div', { class: 'k' }, ico(icon), el('span', { text: k })), el('div', { class: 'v', text: v }), s ? el('div', { class: 's', text: s }) : null, vals ? spark(vals, span) : null);
 }
 const last = a => a.length ? a[a.length - 1] : 0;
 
@@ -315,7 +332,7 @@ function overview() {
       tile('download', 'In', rate(last(hist.bin)), human(over.bytes_in) + ' since start', hist.bin),
       tile('upload', 'Out', rate(last(hist.bout)), human(over.bytes_out) + ' since start', hist.bout),
       tile('cpu', 'CPU', last(hist.cpu).toFixed(1) + ' %', over.cpus + ' CPUs · ' + over.processes + ' processes', hist.cpu),
-      tile('gauge', 'Memory', human(over.rss_bytes), 'resident, daemon and workers')));
+      tile('gauge', 'Memory', human(over.rss_bytes), 'resident, daemon and workers', hist.rss, true)));
   C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('server')), el('span', { text: 'Runtimes' }), el('span', { class: 'n', text: String(rts.length) }))), table(rts));
 }
 function runtimes() {
@@ -374,10 +391,10 @@ async function detail(full) {
   if (full || !shown || shown.name !== r.name) {
     shown = { name: r.name, conf: null, stats: '' };
     C.textContent = '';
-    C.append(el('div', { id: 'dHead' }), el('div', { class: 'tiles', id: 'dTiles' }),
+    C.append(el('div', { id: 'dHead' }), el('div', { class: 'tiles t3', id: 'dTiles' }),
       el('div', { class: 'panel' }, el('h3', {}, ico('edit'), el('span', { text: 'Configuration' })), el('div', { id: 'dConf', class: 'kv' })),
       el('div', { class: 'panel' }, el('h3', {}, ico('text'), el('span', { text: 'Log' }), el('span', { style: 'flex:1' }), btn(null, 'Open full log', () => go('#/logs/' + encodeURIComponent(r.name)), 'sm')), el('div', { class: 'log short', id: 'dLog' })),
-      el('div', { class: 'panel' }, el('h3', {}, ico('info'), el('span', { text: 'Stats' })), el('div', { class: 'kv', id: 'dStats' })));
+      el('div', { class: 'panel' }, el('h3', {}, ico('info'), el('span', { text: 'Stats' })), el('div', { id: 'dStats' })));
     shown.logNext = 0;
     if (me && me.user) {
       run('show', r.name).then(x => { if (!x.code) { try { shown.conf = JSON.parse(x.out); } catch (e) {} paintConf(); } });
@@ -389,12 +406,13 @@ async function detail(full) {
   H.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico(t[0])), el('span', { text: r.name }), el('span', { class: 'n' }, el('span', { class: 'dot ' + r.state }), ' ' + r.state + ' · ' + t[1] + (r.port ? ' · port ' + r.port : '')))),
     el('div', { class: 'acts', style: 'margin:-4px 0 18px' }, ...controls(r, false)));
   const D = $('#dTiles'); D.textContent = '';
-  D.append(tile('users', 'Connections', count(r.connections), count(r.connections_total) + ' since start'),
-    tile('send', 'Messages', count(r.msg_s || 0) + '/s', count(r.messages_total) + ' since start'),
-    tile('download', 'In', rate(r.in_s || 0), human(r.bytes_in) + ' since start'),
-    tile('upload', 'Out', rate(r.out_s || 0), human(r.bytes_out) + ' since start'),
-    tile('cpu', 'CPU', (r.cpu_p || 0).toFixed(1) + ' %', r.processes + ' process' + (r.processes === 1 ? '' : 'es')),
-    tile('gauge', 'Memory', human(r.rss_bytes), 'resident'));
+  const h = rtHist[r.name] || {};
+  D.append(tile('users', 'Connections', count(r.connections), count(r.connections_total) + ' since start', h.conn),
+    tile('send', 'Messages', count(r.msg_s || 0) + '/s', count(r.messages_total) + ' since start', h.msg),
+    tile('download', 'In', rate(r.in_s || 0), human(r.bytes_in) + ' since start', h.bin),
+    tile('upload', 'Out', rate(r.out_s || 0), human(r.bytes_out) + ' since start', h.bout),
+    tile('cpu', 'CPU', (r.cpu_p || 0).toFixed(1) + ' %', r.processes + ' process' + (r.processes === 1 ? '' : 'es'), h.cpu),
+    tile('gauge', 'Memory', human(r.rss_bytes), 'resident', h.rss, true));
   if (!full && shown.stamp && Date.now() - shown.stamp > 5000) statsText(r.name);
   tailInto($('#dLog'), shown, r.name, 300);
   if (r.state === 'failed' && why[r.name] && !$('#dWhy')) H.append(el('div', { id: 'dWhy', class: 'panel', style: 'border-color:rgba(251,88,118,.4)' }, el('h3', {}, ico('info'), el('span', { text: 'Why it failed' })), el('div', { class: 'kv' }, el('div', { class: 'k', text: new Date(why[r.name].at).toLocaleString() }), el('div', { class: 'v', text: clean(why[r.name].text) }))));
@@ -520,25 +538,93 @@ function logsView() {
 }
 async function statsText(name) {
   shown.stamp = Date.now();
-  try {
-    const x = await run('stats', name); const S = $('#dStats');
-    if (!S || !shown || shown.name !== name) return;
-    S.textContent = '';
-    // `key:value` lines, the name and type left out as the head says them.
-    for (const line of (x.out || '').split('\n')) {
-      const c = line.indexOf(':'); if (c < 1) continue;
-      const k = line.slice(0, c), v = line.slice(c + 1);
-      if (k === 'name' || k === 'type') continue;
-      S.append(el('div', { class: 'k', text: k.replace(/_/g, ' ') }), el('div', { class: 'v', text: /^\d{4,}$/.test(v) && /bytes/.test(k) ? human(+v) + ' (' + v + ')' : v }));
+  let x;
+  try { x = await run('stats', name); } catch (e) { return; }
+  const S = $('#dStats');
+  if (!S || !shown || shown.name !== name) return;
+  paintStats(S, x.out || '');
+}
+// `stats` read for the page: the text values, each counter once -- added over the shards as the metrics endpoint adds
+// them, but for those every shard holds a whole copy of or counts for itself alone -- under the part of the runtime
+// its prefix names, and each shard's own figures.
+const COPY = /^(buckets|max_bytes|max_memory|tls|shards|mesh_links|peer_links)$/;
+const PART = /^(shard|mesh|peer|journal|replication|tier|error|errors|tls|ws|lua|acme|git|hot|pool|zone|upstream|backend)$/;
+function readStats(text) {
+  const head = {}, shards = [];
+  let cur = head;
+  for (const line of text.split('\n')) {
+    if (/^\[shard \d+\]$/.test(line.trim())) { cur = {}; shards.push(cur); continue; }
+    const c = line.indexOf(':'); if (c < 1) continue;
+    cur[line.slice(0, c)] = line.slice(c + 1);
+  }
+  const nums = new Map(), texts = new Map();
+  const take = (k, v) => {
+    if (!/^-?\d+(\.\d+)?$/.test(v)) { texts.set(k, v); return; }
+    if (!nums.has(k)) nums.set(k, []);
+    nums.get(k).push(+v);
+  };
+  // What the tiles above show already, what names the runtime and a setting the Configuration panel names are left
+  // out, and a number that stands for a word is the word.
+  const SHOWN = /^(name|type|port|connections|total_connections|total_messages|bytes_in|bytes_out|mode|eviction|shard_index)$/;
+  const WORDS = { repl_role: ['', 'leader', 'follower'] };
+  const own = /^shard_(connections|total_connections|total_messages|bytes_in|bytes_out)$/;
+  for (const part of [head, ...shards])
+    for (const [k, v] of Object.entries(part)) {
+      if (SHOWN.test(k) || own.test(k) || (part !== head && head.hasOwnProperty(k))) continue;
+      if (WORDS[k]) { if (WORDS[k][+v]) texts.set(k.replace('repl_', 'replication '), WORDS[k][+v]); }
+      else if (k === 'pid' || k === 'shard_pids') texts.set(k === 'pid' ? k : 'pids', v);
+      else take(k, v);
     }
-  } catch (e) {}
+  const counters = [...nums].map(([k, a]) => ({ k, v: COPY.test(k) ? Math.max(...a) : a.reduce((x, y) => x + y, 0), a }));
+  // A counter goes under its prefix when two shown share it and the prefix names a part of the runtime, or three do.
+  const pre = k => k.includes('_') ? k.slice(0, k.indexOf('_')) : '';
+  const many = {};
+  for (const x of counters) if (x.v) many[pre(x.k)] = (many[pre(x.k)] || 0) + 1;
+  for (const x of counters) {
+    const p = pre(x.k);
+    x.group = p && many[p] >= 2 && (PART.test(p) || many[p] >= 3) ? p : '';
+    x.label = (x.group ? x.k.slice(x.group.length + 1) : x.k).replace(/_/g, ' ');
+    x.bad = !!x.v && (/^errors?$/.test(x.group) || /error|fail|drop|reject/.test(x.k));
+  }
+  return { texts: [...texts], counters, shards: shards.length > 1 ? shards : [] };
+}
+function paintStats(S, text) {
+  const st = readStats(text);
+  const fmt = (k, v) => /bytes|_size$|memory/.test(k) ? human(v) : v >= 1e5 ? count(v) : v.toLocaleString();
+  S.textContent = '';
+  if (st.texts.length) S.append(el('div', { class: 'chips' }, ...st.texts.map(([k, v]) => el('span', {}, k.replace(/_/g, ' ') + ' ', el('b', { text: v })))));
+  const groups = new Map([['', []]]);
+  const zeros = el('div', { class: 'sgrid', hidden: true, style: 'margin-top:8px' });
+  let nz = 0;
+  for (const x of st.counters) {
+    const t = el('div', { class: 'st' + (!x.v ? ' zero' : x.bad ? ' bad' : ''), title: x.k + ': ' + x.v + (x.a.length > 1 ? ' (' + x.a.join(', ') + ')' : '') },
+      el('b', { text: fmt(x.k, x.v) }), el('span', { text: x.label }));
+    if (!x.v) { zeros.append(t); nz++; continue; }
+    if (!groups.has(x.group)) groups.set(x.group, []);
+    groups.get(x.group).push(t);
+  }
+  for (const [g, ts] of groups) {
+    if (!ts.length) continue;
+    if (groups.size > 1) S.append(el('div', { class: 'sgh', text: g ? { shard: 'shards', error: 'errors', hot: 'hot tier' }[g] || g : 'general' }));
+    S.append(el('div', { class: 'sgrid' }, ...ts));
+  }
+  if (nz) S.append(el('div', { style: 'margin-top:10px' }, btn(null, 'Show ' + nz + ' at zero', e => { zeros.hidden = !zeros.hidden; e.currentTarget.querySelector('span').textContent = zeros.hidden ? 'Show ' + nz + ' at zero' : 'Hide those at zero'; }, 'sm')), zeros);
+  if (st.shards.length) {
+    const T = el('table', { class: 'mtbl', style: 'margin-top:16px' });
+    T.append(el('tr', {}, ...['Shard', 'Connections', 'Since start', 'Messages', 'In', 'Out'].map(t => el('th', { text: t }))));
+    st.shards.forEach((sh, i) => T.append(el('tr', {}, el('td', { text: String(sh.shard_index ?? i) }), el('td', { class: 'num', text: sh.shard_connections || '0' }), el('td', { class: 'num', text: count(+sh.shard_total_connections || 0) }),
+      el('td', { class: 'num', text: count(+sh.shard_total_messages || 0) }), el('td', { class: 'num', text: human(+sh.shard_bytes_in || 0) }), el('td', { class: 'num', text: human(+sh.shard_bytes_out || 0) }))));
+    S.append(T);
+  }
 }
 function paintConf() {
   const K = $('#dConf'); if (!K || !shown.conf) return; K.textContent = '';
   const skip = new Set(['name', 'id', 'type', 'was_running']);
   for (const [k, v] of Object.entries(shown.conf)) {
     if (skip.has(k)) continue;
-    K.append(el('div', { class: 'k', text: label(k) }), el('div', { class: 'v', text: Array.isArray(v) ? v.join(', ') : String(v) }));
+    // A size in bytes is shown as the size, the exact figure beside it.
+    const sz = typeof v === 'number' && v >= 1024 && /memory|bytes|size/.test(k);
+    K.append(el('div', { class: 'k', text: label(k) }), el('div', { class: 'v', text: Array.isArray(v) ? v.join(', ') : sz ? human(v) + ' (' + v + ')' : String(v) }));
   }
 }
 // A key's label: the flag's own where the schema has it.

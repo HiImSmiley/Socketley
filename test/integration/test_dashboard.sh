@@ -94,6 +94,21 @@ has "and its dialogs" "$(cat "$T/page.html")" "function modal("
 if command -v node >/dev/null 2>&1; then
     python3 -c "import re,sys; open(sys.argv[2],'w').write(re.search(r'<script>(.*)</script>', open(sys.argv[1]).read(), re.S).group(1))" "$T/page.html" "$T/page.js"
     node --check "$T/page.js" 2>"$T/node.err" && ok "its script parses" || bad "its script parses" "$(head -5 "$T/node.err")"
+    # The stats panel's reading of a sharded runtime's text, run as the page has it.
+    python3 -c "
+import re,sys; s=open(sys.argv[1]).read()
+print('\n'.join(re.search(r'^const %s = .*$' % n, s, re.M).group(0) for n in ('COPY', 'PART')))
+print(re.search(r'^function readStats\(.*?^}$', s, re.M | re.S).group(0))" "$T/page.js" > "$T/read.js"
+    cat >> "$T/read.js" <<'EOF'
+const st = readStats('name:s\ntype:storage\nport:1\nconnections:0\nbytes_in:9\ncpus:max\n'
+  + '[shard 0]\nshard_connections:0\nshard_bytes_in:4\nshard_index:0\nbuckets:3\nobjects:5\nmax_bytes:0\nerror_NoSuchKey:2\nshard_commits_sent:1\nshard_commits_served:1\nmesh_links:1\n'
+  + '[shard 1]\nshard_connections:0\nshard_bytes_in:5\nshard_index:1\nbuckets:3\nobjects:5\nmax_bytes:0\nerror_NoSuchKey:0\nshard_commits_sent:2\nshard_commits_served:0\nmesh_links:1\nshards:2\nshard_pids:7,8\n');
+const c = Object.fromEntries(st.counters.map(x => [x.k, x]));
+console.log([c.objects.v, c.buckets.v, c.mesh_links.v, c.max_bytes.v, c.shard_commits_sent.v, c.shard_commits_sent.group, c.shard_commits_sent.label,
+  c.error_NoSuchKey.bad, 'bytes_in' in c, 'shard_bytes_in' in c, 'shard_index' in c, st.shards.length, st.texts.map(t => t.join('=')).join(' ')].join('|'));
+EOF
+    expect "the stats panel adds a counter over the shards, takes a whole copy once, folds nothing the tiles show, and groups by part" \
+        "$(node "$T/read.js" 2>&1)" "10|3|1|0|3|shard|commits sent|true|false|false|false|2|cpus=max pids=7,8"
 fi
 
 # ─── signing in ─────────────────────────────────────────────────────────────
