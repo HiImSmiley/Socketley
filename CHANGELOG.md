@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`socketley git-sync` and `socketley ping` in the interactive help.** Both
+  were dispatched by the CLI and documented in the manual, and neither appeared
+  in `socketley-help.sh`, so a reader who ran it to see what the binary does was
+  told it does not do them. A test now reads the verb table out of `cli.cpp` and
+  asks the manual's COMMANDS and the help for each one.
+
 - **The host's name alone opens the storage interface.** A browser asked for a
   storage runtime's root, which S3 answers with an XML refusal no one can read,
   is sent to `/~ui/`; a client, which asks for no HTML and carries a signature

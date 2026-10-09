@@ -418,6 +418,22 @@ cli_commands() {
     echo -e "  ${CYAN}socketley owner chess-rapid${NC}"
     echo ""
 
+    echo -e "${BOLD}ping${NC}"
+    echo "  Ask the daemon to identify itself: version, pid, and the device,"
+    echo "  inode and path of the executable it runs -- which says (deleted)"
+    echo "  once the file it started from has been replaced."
+    echo -e "  ${CYAN}socketley ping${NC}"
+    echo ""
+
+    echo -e "${BOLD}git-sync --url <url> --branch <name|*> --work <dir> --endpoint <host:port> --bucket <library> --name <folder>${NC}"
+    echo "  Fetch one repository into a storage runtime's library: the branch's"
+    echo "  files under <folder>/ and a bundle of its history under _backups/."
+    echo "  A storage runtime runs this itself, once a day and when asked; by"
+    echo "  hand it needs SOCKETLEY_GIT_ACCESS_KEY and SOCKETLEY_GIT_SECRET."
+    echo -e "  ${CYAN}socketley git-sync --url https://github.com/u/r.git --branch main \\${NC}"
+    echo -e "  ${CYAN}    --work /var/lib/socketley/git/r --endpoint 127.0.0.1:9000 --bucket code --name r${NC}"
+    echo ""
+
     echo -e "${BOLD}version | --version | -v${NC}"
     echo "  Print version number and exit"
     echo -e "  ${CYAN}socketley --version${NC}"
