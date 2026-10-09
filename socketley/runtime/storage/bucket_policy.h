@@ -110,6 +110,8 @@ inline constexpr std::string_view iam_action_names[] = {
     "CreateRole", "GetRole", "ListRoles", "UpdateRole", "DeleteRole",
     "PutRolePolicy", "GetRolePolicy", "ListRolePolicies", "DeleteRolePolicy",
     "AttachRolePolicy", "DetachRolePolicy", "ListAttachedRolePolicies",
+    "CreateLoginProfile", "GetLoginProfile", "UpdateLoginProfile", "DeleteLoginProfile", "ChangePassword",
+    "TagUser", "UntagUser", "ListUserTags",
 };
 static_assert(std::size(iam_action_names) < 64);
 

@@ -410,8 +410,8 @@ policy_effect iam_does(const bucket_policy& p, std::string_view action, std::str
 TEST_CASE("the IAM actions are the ones the endpoint answers, each with a bit of its own")
 {
     CHECK(iam_action_index("CreateUser") == 0);
-    CHECK(iam_action_index("ListAttachedRolePolicies") == static_cast<int>(std::size(iam_action_names)) - 1);
-    CHECK(iam_action_index("ChangePassword") == -1);
+    CHECK(iam_action_index("ListUserTags") == static_cast<int>(std::size(iam_action_names)) - 1);
+    CHECK(iam_action_index("CreateVirtualMFADevice") == -1);
     CHECK(iam_action_index("createuser") == -1);
 }
 
@@ -466,7 +466,7 @@ TEST_CASE("an IAM action or resource this runtime cannot honour is refused, and 
     s3_error err;
     bucket_policy p;
     // An IAM action IAM has and this runtime does not answer matches nothing, so a policy written for AWS compiles.
-    const bucket_policy other = identity(R"({"Statement":{"Effect":"Allow","Action":"iam:ChangePassword","Resource":"*"}})");
+    const bucket_policy other = identity(R"({"Statement":{"Effect":"Allow","Action":"iam:CreateVirtualMFADevice","Resource":"*"}})");
     CHECK_FALSE(other.allows_iam());
     CHECK_FALSE(bucket_policy::compile_identity(
         R"({"Statement":{"Effect":"Allow","Action":"iam:Create-User","Resource":"*"}})", p, err));

@@ -227,8 +227,14 @@ bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view rea
             return false;
         std::string pair;
         const size_t colon = base64_decode(http_trim_ows(h.substr(6)), pair) ? pair.find(':') : std::string::npos;
+        // An access key and its secret, or a user's name and the password of its login profile.
         if (colon != std::string::npos)
-            v = m_auth->authorize_basic(std::string_view(pair).substr(0, colon), std::string_view(pair).substr(colon + 1));
+        {
+            const std::string_view name = std::string_view(pair).substr(0, colon), secret = std::string_view(pair).substr(colon + 1);
+            v = m_auth->authorize_basic(name, secret);
+            if (!v.allowed)
+                v = m_auth->authorize_password(name, secret);
+        }
         else
             v.allowed = false;
         if (!v.allowed)
@@ -265,7 +271,7 @@ bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view rea
         if (c->req.header("x-socketley-ui").empty() && !has_ui_cookie(*c))
             r.headers.emplace_back("WWW-Authenticate", "Basic realm=\"" + std::string(realm) + "\", charset=\"UTF-8\"");
         r.headers.emplace_back("Content-Type", "text/plain; charset=utf-8");
-        r.body = "Sign in with an access key as the user name and its secret as the password.\n";
+        r.body = "Sign in with a user's name and password, or an access key and its secret.\n";
         count_error(*c, "AccessDenied");
         send_response(c, std::move(r));
         return false;

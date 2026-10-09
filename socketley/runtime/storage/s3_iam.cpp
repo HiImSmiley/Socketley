@@ -6,7 +6,9 @@
 #include <charconv>
 
 #include "bucket_policy.h"
+#include "digest.h"
 #include "json_doc.h"
+#include "password_hash.h"
 #include "s3_names.h"
 
 namespace socketley::storage
@@ -19,6 +21,8 @@ constexpr std::string_view iam_xmlns = "https://iam.amazonaws.com/doc/2010-05-08
 // The most access keys a user has, as IAM allows.
 constexpr size_t keys_per_user = 2;
 constexpr size_t policy_doc_max = 10240;
+// What a login secret and an invitation's token are drawn from.
+constexpr std::string_view alnum = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 // ─── JSON out ───────────────────────────────────────────────────────────────
 
@@ -401,6 +405,15 @@ bool iam_parse(std::string_view json, iam_state& out, std::string& err)
             u.groups = strings_of(member(v, "groups"));
             const jvalue* ext = member(v, "external");
             u.external = ext && ext->k == jvalue::kind::boolean && ext->b;
+            u.password = text_of(v, "password");
+            const jvalue* reset = member(v, "password_reset");
+            u.password_reset = reset && reset->k == jvalue::kind::boolean && reset->b;
+            u.password_ms = number_of(v, "password_set");
+            u.login_secret = text_of(v, "login_secret");
+            if (const jvalue* t = member(v, "tags"); t && t->k == jvalue::kind::object)
+                for (const auto& [k, tv] : t->members)
+                    if (tv.k == jvalue::kind::string)
+                        u.tags[k] = tv.s;
             out.users[n] = std::move(u);
         }
     if (const jvalue* ks = member(root, "keys"); ks && ks->k == jvalue::kind::object)
@@ -439,6 +452,23 @@ bool iam_parse(std::string_view json, iam_state& out, std::string& err)
             policies_in(v, r.policies);
             out.roles[n] = std::move(r);
         }
+    if (const jvalue* is = member(root, "invites"); is && is->k == jvalue::kind::object)
+        for (const auto& [n, v] : is->members)
+        {
+            iam_invite i;
+            i.id = n;
+            i.hash = text_of(v, "hash");
+            i.created_ms = number_of(v, "created");
+            i.expires_ms = number_of(v, "expires");
+            i.by = text_of(v, "by");
+            const jvalue* adm = member(v, "admin");
+            i.admin = adm && adm->k == jvalue::kind::boolean && adm->b;
+            i.max_bytes = static_cast<uint64_t>(number_of(v, "max_bytes"));
+            const jvalue* lib = member(v, "libraries");
+            i.libraries = !lib || lib->k != jvalue::kind::boolean || lib->b;
+            if (!i.hash.empty())
+                out.invites[n] = std::move(i);
+        }
     return true;
 }
 
@@ -463,7 +493,32 @@ std::string iam_json(const iam_state& s)
             o += i ? "," : "";
             jstr(o, u.groups[i]);
         }
-        o += u.external ? "],\"external\":true}" : "]}";
+        o += ']';
+        if (u.external)
+            o += ",\"external\":true";
+        if (!u.password.empty())
+        {
+            o += ",\"password\":";
+            jstr(o, u.password);
+            o += u.password_reset ? ",\"password_reset\":true" : "";
+            o += ",\"password_set\":" + std::to_string(u.password_ms) + ",\"login_secret\":";
+            jstr(o, u.login_secret);
+        }
+        if (!u.tags.empty())
+        {
+            o += ",\"tags\":{";
+            bool tfirst = true;
+            for (const auto& [k, v] : u.tags)
+            {
+                o += tfirst ? "" : ",";
+                tfirst = false;
+                jstr(o, k);
+                o += ':';
+                jstr(o, v);
+            }
+            o += '}';
+        }
+        o += '}';
     }
     o += "},\"keys\":{";
     first = true;
@@ -512,6 +567,22 @@ std::string iam_json(const iam_state& s)
         o += ",\"max_session\":" + std::to_string(r.max_session) + ",";
         policies_out(o, r.policies);
         o += "}";
+    }
+    o += "},\"invites\":{";
+    first = true;
+    for (const auto& [n, i] : s.invites)
+    {
+        o += first ? "" : ",";
+        first = false;
+        jstr(o, n);
+        o += ":{\"hash\":";
+        jstr(o, i.hash);
+        o += ",\"created\":" + std::to_string(i.created_ms) + ",\"expires\":" + std::to_string(i.expires_ms);
+        o += ",\"by\":";
+        jstr(o, i.by);
+        o += i.admin ? ",\"admin\":true" : ",\"admin\":false";
+        o += ",\"max_bytes\":" + std::to_string(i.max_bytes);
+        o += i.libraries ? ",\"libraries\":true}" : ",\"libraries\":false}";
     }
     o += "}}\n";
     return o;
@@ -667,25 +738,32 @@ struct api
         return fail(404, "NoSuchEntity", "The " + std::string(kind) + " with name " + std::string(name) + " cannot be found.");
     }
 
+    // The action as its response's elements name it: the runtime's own without their prefix, which XML would read as
+    // an undeclared namespace.
+    std::string_view tag() const
+    {
+        return action.substr(action.find(':') == std::string_view::npos ? 0 : action.find(':') + 1);
+    }
+
     std::string begin()
     {
         std::string x = "<";
-        x += action;
+        x += tag();
         x += "Response xmlns=\"";
         x += iam_xmlns;
         x += "\"><";
-        x += action;
+        x += tag();
         x += "Result>";
         return x;
     }
     iam_result& finish(std::string x)
     {
         x += "</";
-        x += action;
+        x += tag();
         x += "Result><ResponseMetadata>";
         el(x, "RequestId", rid);
         x += "</ResponseMetadata></";
-        x += action;
+        x += tag();
         x += "Response>";
         r.xml = std::move(x);
         return r;
@@ -693,13 +771,13 @@ struct api
     iam_result& done()
     {
         std::string x = "<";
-        x += action;
+        x += tag();
         x += "Response xmlns=\"";
         x += iam_xmlns;
         x += "\"><ResponseMetadata>";
         el(x, "RequestId", rid);
         x += "</ResponseMetadata></";
-        x += action;
+        x += tag();
         x += "Response>";
         r.xml = std::move(x);
         r.changed = true;
@@ -807,27 +885,316 @@ struct api
         return done();
     }
 
+    // The user `n`, or a user of the credentials file kept beside the IAM API's as policies are; null for neither.
+    iam_user* user_or_file(const std::string& n)
+    {
+        auto it = s.users.find(n);
+        if (it == s.users.end() && taken && taken(ctx, n))
+        {
+            iam_user u;
+            u.name     = n;
+            u.external = true;
+            it = s.users.emplace(n, std::move(u)).first;
+        }
+        return it == s.users.end() ? nullptr : &it->second;
+    }
+
+    // What is wrong with a tag the runtime reads, empty when nothing is.
+    static std::string tag_problem(std::string_view k, std::string_view v)
+    {
+        if (k.empty() || k.size() > 128 || v.size() > 256)
+            return "A tag's key is 1 to 128 characters and its value at most 256.";
+        if (k == iam_tag_max_bytes &&
+            (v.empty() || v.find_first_not_of("0123456789") != std::string_view::npos || v.size() > 19))
+            return "socketley:max-bytes is a number of bytes.";
+        if (k == iam_tag_disabled && v != "true" && v != "false")
+            return "socketley:disabled is true or false.";
+        if (k == iam_tag_email && !v.empty() && v.find('@') == std::string_view::npos)
+            return "socketley:email is an address.";
+        if (k.starts_with("socketley:") && k != iam_tag_max_bytes && k != iam_tag_disabled && k != iam_tag_email &&
+            k != iam_tag_display_name)
+            return "socketley: is the runtime's own prefix, and " + std::string(k) + " is none of its tags.";
+        return {};
+    }
+
+    void login_xml(std::string& x, const iam_user& u)
+    {
+        x += "<LoginProfile>";
+        el(x, "UserName", u.name);
+        el(x, "CreateDate", iso8601(u.password_ms));
+        el(x, "PasswordResetRequired", u.password_reset ? "true" : "false");
+        x += "</LoginProfile>";
+    }
+
+    // A user made by an invitation or by CreateUser, its name checked and taken by none.
+    iam_result* make_user(const std::string& n, const std::string& path, iam_user*& out)
+    {
+        if (!valid_name(n, 64))
+            return &missing("UserName");
+        if (!valid_path(path))
+            return &missing("Path");
+        if (s.users.count(n) || (taken && taken(ctx, n)))
+            return &fail(409, "EntityAlreadyExists", "User with name " + n + " already exists.");
+        iam_user u;
+        u.name = n;
+        u.id = new_id("AIDA");
+        u.path = path;
+        u.created_ms = now;
+        if (u.id.empty())
+            return &fail(500, "ServiceFailure", "No random bytes for an id.");
+        out = &(s.users[n] = std::move(u));
+        return nullptr;
+    }
+
     iam_result& run()
     {
         const std::string_view a = action;
+        // An invitation that has ended is gone, whatever is asked.
+        if (std::erase_if(s.invites, [&](const auto& kv) { return kv.second.expires_ms <= now; }) > 0)
+            r.changed = true;
         // ── users ──
         if (a == "CreateUser")
         {
-            const std::string n = text("UserName"), path = field("Path") ? text("Path") : "/";
-            if (!valid_name(n, 64))
-                return missing("UserName");
-            if (!valid_path(path))
-                return missing("Path");
-            if (s.users.count(n) || (taken && taken(ctx, n)))
-                return fail(409, "EntityAlreadyExists", "User with name " + n + " already exists.");
-            iam_user u;
-            u.name = n;
-            u.id = new_id("AIDA");
-            u.path = path;
-            u.created_ms = now;
+            iam_user* u = nullptr;
+            if (iam_result* bad = make_user(text("UserName"), field("Path") ? text("Path") : "/", u))
+                return *bad;
             std::string x = begin();
-            user_xml(x, u);
-            s.users[n] = std::move(u);
+            user_xml(x, *u);
+            r.changed = true;
+            return finish(std::move(x));
+        }
+        // ── login profiles, a user's password for the web interface ──
+        if (a == "CreateLoginProfile" || a == "UpdateLoginProfile")
+        {
+            const std::string n = text("UserName");
+            iam_user* u = user_or_file(n);
+            if (!u)
+                return no_entity("user", n);
+            if (a == "CreateLoginProfile" && !u->password.empty())
+                return fail(409, "EntityAlreadyExists", "Login Profile for user " + n + " already exists.");
+            if (a == "UpdateLoginProfile" && u->password.empty())
+                return fail(404, "NoSuchEntity", "Login Profile for User " + n + " cannot be found.");
+            if (const std::string* pw = field("Password"); pw || a == "CreateLoginProfile")
+            {
+                const std::string why = password_problem(pw ? std::string_view(*pw) : std::string_view{}, n);
+                if (!why.empty())
+                    return fail(400, "PasswordPolicyViolation", why);
+                const std::string h = password_hash(*pw);
+                if (h.empty())
+                    return fail(500, "ServiceFailure", "No random bytes for a salt.");
+                u->password = h;
+                u->password_ms = now;
+                if (u->login_secret.empty())
+                    u->login_secret = random_text("", 40, alnum);
+                if (u->login_secret.empty())
+                    return fail(500, "ServiceFailure", "No random bytes for a secret.");
+            }
+            if (const std::string* reset = field("PasswordResetRequired"))
+                u->password_reset = *reset == "true";
+            else if (a == "CreateLoginProfile")
+                u->password_reset = false;
+            if (a == "UpdateLoginProfile")
+                return done();
+            std::string x = begin();
+            login_xml(x, *u);
+            r.changed = true;
+            return finish(std::move(x));
+        }
+        if (a == "GetLoginProfile" || a == "DeleteLoginProfile")
+        {
+            const std::string n = text("UserName");
+            auto it = s.users.find(n);
+            if (it == s.users.end() || it->second.password.empty())
+                return fail(404, "NoSuchEntity", "Login Profile for User " + n + " cannot be found.");
+            if (a == "DeleteLoginProfile")
+            {
+                it->second.password.clear();
+                it->second.login_secret.clear();
+                it->second.password_reset = false;
+                // A user of the credentials file with nothing left beside it is the file's alone again.
+                const iam_policies& p = it->second.policies;
+                if (it->second.external && p.inline_docs.empty() && p.attached.empty())
+                    s.users.erase(it);
+                return done();
+            }
+            std::string x = begin();
+            login_xml(x, it->second);
+            return finish(std::move(x));
+        }
+        if (a == "ChangePassword")
+        {
+            const std::string n = text("UserName");
+            auto it = s.users.find(n);
+            if (it == s.users.end() || it->second.password.empty())
+                return fail(404, "NoSuchEntity", "Login Profile for User " + n + " cannot be found.");
+            if (!password_matches(it->second.password, text("OldPassword")))
+                return fail(403, "InvalidUserType", "The old password given is not the user's.");
+            const std::string pw = text("NewPassword");
+            if (const std::string why = password_problem(pw, n); !why.empty())
+                return fail(400, "PasswordPolicyViolation", why);
+            const std::string h = password_hash(pw);
+            if (h.empty())
+                return fail(500, "ServiceFailure", "No random bytes for a salt.");
+            it->second.password = h;
+            it->second.password_ms = now;
+            it->second.password_reset = false;
+            return done();
+        }
+        // ── tags of users ──
+        if (a == "TagUser" || a == "UntagUser" || a == "ListUserTags")
+        {
+            const std::string n = text("UserName");
+            auto it = s.users.find(n);
+            // A user of the credentials file is described there.
+            if (it == s.users.end() || it->second.external)
+                return no_entity("user", n);
+            auto& tags = it->second.tags;
+            if (a == "ListUserTags")
+            {
+                std::string x = begin() + "<Tags>";
+                for (const auto& [k, v] : tags)
+                {
+                    x += "<member>";
+                    el(x, "Key", k);
+                    el(x, "Value", v);
+                    x += "</member>";
+                }
+                x += "</Tags><IsTruncated>false</IsTruncated>";
+                return finish(std::move(x));
+            }
+            std::map<std::string, std::string> next = tags;
+            for (int i = 1; i <= 50; ++i)
+            {
+                const std::string base = (a == "TagUser" ? "Tags.member." : "TagKeys.member.") + std::to_string(i);
+                if (a == "UntagUser")
+                {
+                    const std::string* k = field(base);
+                    if (!k)
+                        break;
+                    next.erase(*k);
+                    continue;
+                }
+                const std::string* k = field(base + ".Key");
+                if (!k)
+                    break;
+                const std::string v = text(base + ".Value");
+                if (const std::string why = tag_problem(*k, v); !why.empty())
+                    return fail(400, "InvalidInput", why);
+                next[*k] = v;
+            }
+            if (next.size() > 50)
+                return fail(409, "LimitExceeded", "Cannot exceed quota for TagsPerUser: 50");
+            tags = std::move(next);
+            return done();
+        }
+        // ── the runtime's own: invitations ──
+        if (a == "socketley:CreateInvitation")
+        {
+            const std::string token = random_text("", 32, alnum);
+            if (token.empty())
+                return fail(500, "ServiceFailure", "No random bytes for an invitation.");
+            int64_t days = 7;
+            if (const std::string* d = field("ExpiresInDays"))
+            {
+                const auto res = std::from_chars(d->data(), d->data() + d->size(), days);
+                if (res.ec != std::errc{} || days < 1 || days > 30)
+                    return missing("ExpiresInDays");
+            }
+            iam_invite i;
+            i.hash = sha256_hex(token);
+            i.id = i.hash.substr(0, 16);
+            i.created_ms = now;
+            i.expires_ms = now + days * 86400000;
+            i.by = text("UserName");
+            i.admin = text("Admin") == "true";
+            i.libraries = text("Libraries") != "false";
+            if (const std::string* m = field("MaxBytes"); m && !m->empty())
+            {
+                const auto res = std::from_chars(m->data(), m->data() + m->size(), i.max_bytes);
+                if (res.ec != std::errc{} || res.ptr != m->data() + m->size())
+                    return missing("MaxBytes");
+            }
+            if (s.invites.size() >= 100)
+                return fail(409, "LimitExceeded", "Cannot exceed 100 open invitations.");
+            std::string x = begin() + "<Invitation>";
+            el(x, "Id", i.id);
+            el(x, "Token", token);
+            el(x, "Expires", iso8601(i.expires_ms));
+            x += "</Invitation>";
+            s.invites[i.id] = std::move(i);
+            r.changed = true;
+            return finish(std::move(x));
+        }
+        if (a == "socketley:ListInvitations")
+        {
+            std::string x = begin() + "<Invitations>";
+            for (const auto& [id, i] : s.invites)
+            {
+                x += "<member>";
+                el(x, "Id", id);
+                el(x, "CreatedBy", i.by);
+                el(x, "CreateDate", iso8601(i.created_ms));
+                el(x, "Expires", iso8601(i.expires_ms));
+                el(x, "Admin", i.admin ? "true" : "false");
+                el(x, "MaxBytes", std::to_string(i.max_bytes));
+                el(x, "Libraries", i.libraries ? "true" : "false");
+                x += "</member>";
+            }
+            x += "</Invitations>";
+            return finish(std::move(x));
+        }
+        if (a == "socketley:DeleteInvitation")
+        {
+            if (!s.invites.erase(text("Id")))
+                return fail(404, "NoSuchEntity", "The invitation " + text("Id") + " cannot be found.");
+            return done();
+        }
+        if (a == "socketley:AcceptInvitation")
+        {
+            const std::string h = sha256_hex(text("Token"));
+            const auto inv = s.invites.find(h.substr(0, 16));
+            if (text("Token").empty() || inv == s.invites.end() || inv->second.hash != h)
+                return fail(404, "NoSuchEntity", "The invitation is not one of this runtime's, or it has ended.");
+            const std::string n = text("UserName"), pw = text("Password");
+            if (const std::string why = password_problem(pw, n); !why.empty())
+                return fail(400, "PasswordPolicyViolation", why);
+            const iam_invite i = inv->second;
+            iam_user* u = nullptr;
+            if (iam_result* bad = make_user(n, "/", u))
+                return *bad;
+            u->password = password_hash(pw);
+            u->password_ms = now;
+            u->login_secret = random_text("", 40, alnum);
+            if (u->password.empty() || u->login_secret.empty())
+                return fail(500, "ServiceFailure", "No random bytes for a salt.");
+            if (i.max_bytes)
+                u->tags[std::string(iam_tag_max_bytes)] = std::to_string(i.max_bytes);
+            if (i.libraries)
+                u->policies.inline_docs[std::string(iam_libraries_policy)] = std::string(iam_libraries_doc);
+            if (const std::string* dn = field("DisplayName"); dn && !dn->empty() && dn->size() <= 128)
+                u->tags[std::string(iam_tag_display_name)] = *dn;
+            if (const std::string* em = field("Email"); em && !em->empty())
+            {
+                if (!tag_problem(iam_tag_email, *em).empty())
+                    return missing("Email");
+                u->tags[std::string(iam_tag_email)] = *em;
+            }
+            if (i.admin)
+            {
+                const std::string g(iam_admins_group);
+                if (!s.groups.count(g))
+                {
+                    iam_group grp;
+                    grp.name = g;
+                    grp.id = new_id("AGPA");
+                    grp.created_ms = now;
+                    s.groups[g] = std::move(grp);
+                }
+                u->groups.push_back(g);
+            }
+            std::string x = begin();
+            user_xml(x, *u);
+            s.invites.erase(inv);
             r.changed = true;
             return finish(std::move(x));
         }
@@ -872,9 +1239,10 @@ struct api
             bool keys = false;
             for (const auto& [k, key] : s.keys)
                 keys = keys || key.user == n;
-            if (keys || !u.policies.inline_docs.empty() || !u.policies.attached.empty() || !u.groups.empty())
-                return fail(409, "DeleteConflict", "Cannot delete entity, must delete access keys, policies and group "
-                                                   "memberships first.");
+            if (keys || !u.policies.inline_docs.empty() || !u.policies.attached.empty() || !u.groups.empty() ||
+                !u.password.empty())
+                return fail(409, "DeleteConflict", "Cannot delete entity, must delete access keys, policies, login "
+                                                   "profile and group memberships first.");
             s.users.erase(it);
             return done();
         }
@@ -1138,6 +1506,40 @@ bool iam_action(std::string_view action)
     return iam_action_index(action) >= 0;
 }
 
+bool iam_own_action(std::string_view action)
+{
+    return action == "socketley:CreateInvitation" || action == "socketley:ListInvitations" ||
+           action == "socketley:DeleteInvitation" || action == "socketley:AcceptInvitation";
+}
+
+bool iam_self_service(std::string_view a)
+{
+    // A first password is a user's own to set, as signing in with its key already proves it; another is set with the
+    // one it replaces, by ChangePassword, or by an admin.
+    return a == "GetUser" || a == "ChangePassword" || a == "GetLoginProfile" || a == "CreateLoginProfile" ||
+           a == "ListAccessKeys" || a == "CreateAccessKey" || a == "UpdateAccessKey" || a == "DeleteAccessKey" ||
+           a == "ListUserTags" || a == "ListGroupsForUser";
+}
+
+std::vector<std::string> iam_users_of(const iam_state& s, std::string_view action, const iam_fields& f)
+{
+    if (action.find("Role") != std::string_view::npos || iam_own_action(action) ||
+        (action.find("Group") != std::string_view::npos && action != "ListGroupsForUser" &&
+         action != "AddUserToGroup" && action != "RemoveUserFromGroup") ||
+        action == "ListUsers")
+        return {};
+    const std::string* n = field_of(f, "UserName");
+    if ((action == "UpdateAccessKey" || action == "DeleteAccessKey") && !n)
+        if (const std::string* id = field_of(f, "AccessKeyId"))
+            if (const auto k = s.keys.find(*id); k != s.keys.end())
+                return {k->second.user};
+    std::vector<std::string> out{n ? *n : std::string()};
+    if (action == "UpdateUser")
+        if (const std::string* nn = field_of(f, "NewUserName"))
+            out.push_back(*nn);
+    return out;
+}
+
 std::vector<std::string> iam_resources(const iam_state& s, std::string_view action, const iam_fields& f)
 {
     if (action == "ListUsers" || action == "ListGroups" || action == "ListRoles")
@@ -1182,6 +1584,19 @@ std::vector<std::string> iam_resources(const iam_state& s, std::string_view acti
 
 bool iam_grants_iam(const iam_state& s, std::string_view action, const iam_fields& f)
 {
+    // Making an admin is an admin's alone, and so are the tags the runtime reads, which say what a user may hold.
+    if (action == "AddUserToGroup" || action == "RemoveUserFromGroup")
+        if (const std::string* g = field_of(f, "GroupName"); g && *g == iam_admins_group)
+            return true;
+    if (action == "CreateGroup" || action == "DeleteGroup" || action == "PutGroupPolicy" ||
+        action == "AttachGroupPolicy")
+        if (const std::string* g = field_of(f, "GroupName"); g && *g == iam_admins_group)
+            return true;
+    if (action == "TagUser" || action == "UntagUser")
+        for (const auto& [k, v] : f)
+            if ((k.starts_with("Tags.member.") && k.ends_with(".Key") && v.starts_with("socketley:")) ||
+                (k.starts_with("TagKeys.member.") && v.starts_with("socketley:")))
+                return true;
     if (action == "PutUserPolicy" || action == "PutGroupPolicy" || action == "PutRolePolicy")
     {
         const std::string* d = field_of(f, "PolicyDocument");
@@ -1209,7 +1624,9 @@ bool iam_grants_iam(const iam_state& s, std::string_view action, const iam_field
 
 bool iam_defaults_to_caller(std::string_view action)
 {
-    return action == "GetUser" || action == "CreateAccessKey" || action == "ListAccessKeys";
+    return action == "GetUser" || action == "CreateAccessKey" || action == "ListAccessKeys" ||
+           action == "GetLoginProfile" || action == "ListUserTags" || action == "ListGroupsForUser" ||
+           action == "socketley:CreateInvitation";
 }
 
 iam_result iam_apply(iam_state& s, std::string_view action, const iam_fields& fields, int64_t now_ms,

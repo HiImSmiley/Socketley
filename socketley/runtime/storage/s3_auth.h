@@ -183,6 +183,28 @@ public:
         v.anonymous = true;
         return v;
     }
+    // A user's name and the password of its login profile, as the web interface's sign-in gives them; the principal
+    // is the key "~<name>" its sessions are sealed under. An authenticator that holds no users lets nobody in this way.
+    virtual auth_verdict authorize_password(std::string_view /*user*/, std::string_view /*password*/)
+    {
+        auth_verdict v;
+        v.allowed = false;
+        v.error   = {"AccessDenied", "The user or password given is not one of this runtime's.", 401};
+        return v;
+    }
+    // The HMAC-SHA256, hex, of ui_session_text(access_key, issued_ms, expires_ms) under that key's secret, which a
+    // session cookie carries; empty for a key that is none.
+    virtual std::string ui_session_mac(std::string_view /*access_key*/, int64_t /*issued_ms*/, int64_t /*expires_ms*/) const
+    {
+        return {};
+    }
+    // 1 when user `id` has a login profile whose password must be set again before anything else, 0 when it has one,
+    // -1 for none.
+    virtual int login_state(std::string_view /*id*/) const { return -1; }
+    // Every user the credentials and the IAM API declare.
+    virtual std::vector<std::shared_ptr<const user_identity>> users() const { return {}; }
+    // Whether user `id` is an admin, by the credentials file or the IAM group of admins.
+    virtual bool admin_user(std::string_view /*id*/) const { return false; }
     // The display name of user `id` as an Owner element gives it, the id itself for one no longer known.
     virtual std::string display_name(std::string_view id) const { return std::string(id); }
     // The quota on the bytes of the buckets user `id` owns, 0 for none or for a user no longer known.

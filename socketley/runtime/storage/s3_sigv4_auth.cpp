@@ -1,5 +1,7 @@
 #include "s3_sigv4_auth.h"
 
+#include "password_hash.h"
+
 #include <cerrno>
 #include <charconv>
 #include <cstring>
@@ -354,6 +356,12 @@ const user_identity* credential_set::find_user(std::string_view id) const
     return it == m_users.end() ? nullptr : it->second.get();
 }
 
+std::shared_ptr<const user_identity> credential_set::shared_user(std::string_view id) const
+{
+    const auto it = m_users.find(id);
+    return it == m_users.end() ? nullptr : it->second;
+}
+
 std::string credential_set::user_of_email(std::string_view email) const
 {
     for (const auto& [id, u] : m_users)
@@ -627,6 +635,7 @@ bool sigv4_authenticator::rebuild(std::string& err)
 void sigv4_authenticator::add_iam(credential_set& set)
 {
     m_roles.clear();
+    m_logins.clear();
     if (m_cfg.iam_file.empty())
         return;
     std::string text, err;
@@ -649,26 +658,49 @@ void sigv4_authenticator::add_iam(credential_set& set)
         if (!doc.empty() && !bucket_policy::compile_identity(doc, u.policy, e))
             LOG_WARN(("storage: the IAM policies of " + u.id + " do not compile: " + e.message).c_str());
     };
+    // A login profile signs as the key "~<name>", which sorts after every other key a user has, so what a key seals
+    // for it stays sealed under the same secret once it has another.
+    const auto add_login = [&](const std::string& name, const iam_user& iu, std::shared_ptr<const user_identity> who)
+    {
+        if (iu.password.empty() || iu.login_secret.empty() || !who)
+            return;
+        if (!set.add("~" + name, iu.login_secret, err, std::move(who)))
+        {
+            LOG_WARN(("storage: the login profile of " + name + " is not taken: " + err).c_str());
+            return;
+        }
+        m_logins[name] = login_entry{iu.password, iu.password_reset, iu.password_ms};
+    };
     for (const auto& [name, iu] : st.users)
     {
-        // A user the credentials file declares is that file's, with the IAM API's policies beside its own.
+        // A user the credentials file declares is that file's, with the IAM API's policies and login profile beside.
         if (const user_identity* fu = set.find_user(name))
         {
             const std::string doc = iam_user_policy(st, iu);
             auto extra = std::make_shared<bucket_policy>();
             s3_error e;
-            if (doc.empty() || !bucket_policy::compile_identity(doc, *extra, e))
-                continue;
-            auto copy = std::make_shared<user_identity>(*fu);
-            copy->iam_policy = std::move(extra);
-            set.replace_user(std::move(copy));
+            if (!doc.empty() && bucket_policy::compile_identity(doc, *extra, e))
+            {
+                auto copy = std::make_shared<user_identity>(*fu);
+                copy->iam_policy = std::move(extra);
+                set.replace_user(std::move(copy));
+            }
+            add_login(name, iu, set.shared_user(name));
             continue;
         }
         if (iu.external)
             continue;
+        const auto tag = [&iu](std::string_view k)
+        {
+            const auto it = iu.tags.find(std::string(k));
+            return it == iu.tags.end() ? std::string() : it->second;
+        };
         auto u = std::make_shared<user_identity>();
         u->id           = name;
-        u->display_name = name;
+        u->display_name = tag(iam_tag_display_name).empty() ? name : tag(iam_tag_display_name);
+        u->email        = tag(iam_tag_email);
+        u->max_bytes    = std::strtoull(tag(iam_tag_max_bytes).c_str(), nullptr, 10);
+        u->admin        = std::find(iu.groups.begin(), iu.groups.end(), iam_admins_group) != iu.groups.end();
         u->configured   = true;
         u->iam_id       = iu.id;
         u->iam_path     = iu.path;
@@ -678,9 +710,13 @@ void sigv4_authenticator::add_iam(credential_set& set)
         std::shared_ptr<const user_identity> done = u;
         if (!set.add_user(done, err))
             continue;
+        // A user who may not sign in is still one, whose buckets keep their owner and whom a share can name.
+        if (tag(iam_tag_disabled) == "true")
+            continue;
         for (const auto& [id, k] : st.keys)
             if (k.user == name && k.active && !set.add(id, k.secret, err, done))
                 LOG_WARN(("storage: the IAM key " + id + " is not taken: " + err).c_str());
+        add_login(name, iu, done);
     }
     for (const auto& [name, r] : st.roles)
     {
@@ -1019,11 +1055,75 @@ auth_verdict sigv4_authenticator::authorize_basic(std::string_view access_key, s
     return v;
 }
 
+auth_verdict sigv4_authenticator::authorize_password(std::string_view user, std::string_view password)
+{
+    maybe_reload();
+    auth_verdict v;
+    auto it = m_logins.find(user);
+    if (it == m_logins.end() && iam_changed())
+    {
+        refresh();
+        it = m_logins.find(user);
+    }
+    // A name without a profile costs what a wrong password does, so a refusal does not say which names are users.
+    static const std::string none = password_hash("socketley: no such user");
+    const auto now = std::chrono::steady_clock::now();
+    const std::string given = sha256_hex(password);
+    bool ok = false;
+    if (it == m_logins.end())
+        ok = (password_matches(none, password), false);
+    else if (const auto seen = m_logins_seen.find(user); seen != m_logins_seen.end() && seen->second.until > now &&
+             seen->second.hash == it->second.hash && CRYPTO_memcmp(seen->second.given.data(), given.data(), given.size()) == 0)
+        ok = true;
+    else if ((ok = password_matches(it->second.hash, password)))
+    {
+        if (m_logins_seen.size() > 1024)
+            m_logins_seen.clear();
+        m_logins_seen[std::string(user)] = login_seen{given, it->second.hash, now + std::chrono::minutes(5)};
+    }
+    const std::string key = "~" + std::string(user);
+    v.user = ok ? m_creds.user_of(key) : nullptr;
+    if (!v.user)
+    {
+        v.allowed = false;
+        v.error   = {"AccessDenied", "The user or password given is not one of this runtime's.", 401};
+        return v;
+    }
+    v.principal = key;
+    return v;
+}
+
+std::string sigv4_authenticator::ui_session_mac(std::string_view access_key, int64_t issued_ms, int64_t expires_ms) const
+{
+    const std::string_view secret = m_creds.secret(access_key);
+    return secret.empty() ? std::string{} : hmac_sha256_hex(secret, ui_session_text(access_key, issued_ms, expires_ms));
+}
+
+int sigv4_authenticator::login_state(std::string_view id) const
+{
+    const auto it = m_logins.find(id);
+    return it == m_logins.end() ? -1 : it->second.reset ? 1 : 0;
+}
+
+bool sigv4_authenticator::admin_user(std::string_view id) const
+{
+    const user_identity* u = m_creds.find_user(id);
+    return u && u->admin;
+}
+
 auth_verdict sigv4_authenticator::authorize_ui_session(std::string_view access_key, int64_t issued_ms,
                                                       int64_t expires_ms, std::string_view mac_hex)
 {
     maybe_reload();
     auth_verdict v;
+    // A password's session is good only from the time the password was set.
+    if (access_key.starts_with('~'))
+        if (const auto it = m_logins.find(access_key.substr(1)); it == m_logins.end() || issued_ms < it->second.set_ms)
+        {
+            v.allowed = false;
+            v.error   = {"AccessDenied", "The session is not one of this runtime's.", 401};
+            return v;
+        }
     const std::string_view secret = m_creds.secret(access_key);
     const std::string want = secret.empty() ? std::string{} : hmac_sha256_hex(secret, ui_session_text(access_key, issued_ms, expires_ms));
     if (want.empty() || want.size() != mac_hex.size() || CRYPTO_memcmp(want.data(), mac_hex.data(), want.size()) != 0)

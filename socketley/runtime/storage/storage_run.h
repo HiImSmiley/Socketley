@@ -291,6 +291,7 @@ enum class phase : uint8_t
 };
 
 class storage_run;
+struct iam_state;
 
 struct response;
 struct select_job;
@@ -1093,6 +1094,15 @@ public:
     void ui_git(const std::shared_ptr<conn>& c);
     void ui_git_body(const std::shared_ptr<conn>& c);
     void ui_body(const std::shared_ptr<conn>& c);
+    // POST /~ui/iam: an IAM action as the signed-in user, {"Action": ..., its fields}, answered as IAM answers it.
+    void ui_iam(const std::shared_ptr<conn>& c);
+    void ui_iam_body(const std::shared_ptr<conn>& c);
+    // GET /~ui/users: the users, each one's name to anyone signed in, and to an admin all of it with the invitations.
+    void ui_users(const std::shared_ptr<conn>& c);
+    // GET /~ui/invite?token=: whether an invitation holds; POST {token, user, password, name, email} takes it, and makes
+    // the user it lets in, with no sign-in.
+    void ui_invite(const std::shared_ptr<conn>& c);
+    void ui_invite_body(const std::shared_ptr<conn>& c);
     void app_reply(const std::shared_ptr<conn>& c, int status, std::string body = {},
                    std::string_view type = "text/plain; charset=utf-8");
     void op_share(const std::shared_ptr<conn>& c);
@@ -1159,7 +1169,7 @@ public:
     // IAM's users, keys, groups, roles and their policies, in storage_iam.cpp, for an admin, or a user its policies
     // allow.
     void op_iam(const std::shared_ptr<conn>& c, const std::vector<std::pair<std::string, std::string>>& fields,
-                std::string_view action, const auth_verdict& v);
+                std::string_view action, const auth_verdict& v, bool system = false);
     // A request to a bucket's website: an object, its index document, a redirect, or an error page.
     void op_website(const std::shared_ptr<conn>& c);
     // A website request that failed with `e`: a redirect, the error document, or an HTML page.
@@ -1196,6 +1206,8 @@ public:
     // The IAM document as a record for another node, empty for none, and one another node sent taken when it is the
     // newer, in storage_iam.cpp; blocking, as an IAM change is.
     std::string iam_record();
+    // The IAM file as it is now; false when it is there and cannot be read.
+    bool iam_read(iam_state& out);
     st iam_take(int64_t rev, const std::string& json);
     // A share link made, counted or revoked (`json` empty) told to the other nodes, `then` once that is durable when
     // given; one another node told taken, its downloads the larger count; and every link as records, in

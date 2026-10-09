@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   zones, whose records it edits: checked as the runtime reads them before they
   are written, the serial raised when it was left alone.
 
+- **Storage: users of their own.** A user signs in to the web interface with a
+  name and password -- an IAM login profile (CreateLoginProfile,
+  UpdateLoginProfile, DeleteLoginProfile, ChangePassword), kept as scrypt -- as
+  well as with a key. The page's Account changes the password and manages the
+  user's own keys, which every user may do to itself without a policy; an
+  admin's Users makes, invites (a one-time link), disables, deletes and sets the
+  quota, name, email and admin-ness of users, as IAM tags (TagUser) the runtime
+  reads and the group `admins`. Sharing a library offers the users by name.
+  Only an admin changes an admin.
+
 - **The daemon says what is wrong.** A runtime that failed or keeps being started
   again, a certificate that ends within two weeks, a disk, the host's memory or
   a runtime's own limit nearly full, and a git repository whose last pull

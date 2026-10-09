@@ -7605,6 +7605,8 @@ GetUser, ListUsers, UpdateUser and DeleteUser; CreateAccessKey (at most two per
 user), ListAccessKeys, UpdateAccessKey and DeleteAccessKey; CreateGroup,
 GetGroup, ListGroups, DeleteGroup, AddUserToGroup, RemoveUserFromGroup and
 ListGroupsForUser; CreateRole, GetRole, ListRoles, UpdateRole and DeleteRole;
+CreateLoginProfile, GetLoginProfile, UpdateLoginProfile, DeleteLoginProfile and
+ChangePassword; TagUser, UntagUser and ListUserTags;
 and for users, groups and roles alike Put, Get, List and Delete of an inline
 policy and Attach, Detach and ListAttached of the AWS managed policies
 AmazonS3FullAccess, AmazonS3ReadOnlyAccess and AdministratorAccess. A request is a
@@ -7626,12 +7628,44 @@ with none owns and reaches the buckets it makes, as a credentials-file user with
 a policy does. A user of the credentials file cannot be made again, and policies
 put on one stand beside the file's own: either's Deny refuses and either's Allow
 admits; such a user is not listed. A user is deleted once it has no keys, policies or
-groups left, a group once it has no members or policies, and a role once it has no
+groups or login profile left, a group once it has no members or policies, and a role once it has no
 policies. Policies are checked as identity policies are; a trust policy's
 statements with a condition let nobody in. ARNs name no account,
 .BR arn:aws:iam:::user/ name ,
-as RGW writes them. OIDC providers, customer managed policies, tags and permission
+as RGW writes them. OIDC providers, customer managed policies and permission
 boundaries are not served.
+.PP
+A login profile is a user's password for the web interface (and a WebDAV
+client's Basic credentials): at least 8 characters, kept as scrypt (N=2^14, r=8,
+p=1) and never as itself, for a user of the API or of the credentials file
+alike. A password that matched is not hashed again for five minutes, so a drive
+sending it with every request costs one hash and not one each.
+.B PasswordResetRequired
+makes the page ask for a new one before anything else; ChangePassword takes the
+old one and changes the caller's own. A password's sessions are sealed under a
+secret drawn with the profile, and a session made before the password was last
+set is no longer let in.
+.PP
+Four tags of a user the runtime reads itself:
+.B socketley:display\-name
+(the name shown),
+.B socketley:email ,
+.B socketley:max\-bytes
+(the quota on the bytes of the buckets it owns, as the credentials file's
+.BR max_bytes )
+and
+.B socketley:disabled
+.RB ( true :
+neither its password nor its keys sign in, while its buckets keep their owner
+and a share can still name it); other keys of that prefix are refused. A member
+of the group
+.B admins
+is an admin, as the credentials file's
+.B admin = true
+makes one. An IAM user makes a bucket only where a policy allows it, as S3
+judges; the web interface gives the users it makes the inline policy
+.B socketley\-libraries
+(Bs3:CreateBucketR on B*R), and a user owns what it makes.
 .PP
 A user who is no admin may call an IAM action its identity policies allow, as
 .BI iam: Action
@@ -7654,13 +7688,19 @@ so only
 covers them. A Deny wins and no Allow is
 .BR AccessDenied .
 A key named by its id alone is judged as its owner's, a rename or a move needs
-both ARNs, and GetUser, CreateAccessKey and ListAccessKeys without a UserName act
-on the caller. An admin keeps every right whatever its policies say. The admin
-flag is the credentials file's alone, and only an admin may give an identity IAM
+both ARNs, and GetUser, CreateAccessKey, ListAccessKeys, GetLoginProfile,
+ListUserTags and ListGroupsForUser without a UserName act on the caller. Without
+any policy a user may do to itself what IAM's console lets every user: read
+itself, its keys, tags and groups, make, change and delete its own keys, set a
+first password, and change its password. An admin keeps every right whatever its
+policies say, and only an admin changes an admin or gives an identity IAM
 rights: a policy put or attached whose Allow names an
 .B iam:
-action, AdministratorAccess included, or a group that has one, is refused to
-anybody else. IAM actions this runtime does not answer are accepted in a policy
+action, AdministratorAccess included, a group that has one, the group
+.BR admins ,
+and the
+.B socketley:
+tags are refused to anybody else. IAM actions this runtime does not answer are accepted in a policy
 and match nothing.
 .SS CORS
 A bucket's CORS rules let a page served from another origin use it from a
@@ -10165,12 +10205,14 @@ from the sidebar and kept in the browser.
 .IP
 It signs in with
 .B POST /~ui/session
-and Basic credentials, which sets the cookie
+and Basic credentials \(em a user's name and the password of its login profile
+(see IAM above), or an access key and its secret \(em which sets the cookie
 .B skl_ui
-(HttpOnly, SameSite=Strict, Secure over TLS): the access key, the time it was
-made, an expiry and an HMAC-SHA256 of them under the key's own secret, so every
-shard and node checks it alike and a key whose secret changes or that is removed
-ends its sessions.
+(HttpOnly, SameSite=Strict, Secure over TLS): the access key, or
+.BI ~ user
+for a password, the time it was made, an expiry and an HMAC-SHA256 of them under
+the key's own secret, so every shard and node checks it alike and a key whose
+secret changes or that is removed ends its sessions.
 It lasts twelve hours and the browser's session, or thirty days with
 .BR ?remember .
 .B GET /~ui/session
@@ -10191,6 +10233,33 @@ which no other site's page can add, and is 403 otherwise. A session never makes
 a new one. A file's
 .B GET /~dav/\fIbucket\fB/\fIkey\fB?download
 is saved under its name.
+.IP
+The page's Account sets and changes the user's password and makes, deactivates and
+deletes its access keys, the secret shown once. An admin's Users lists every
+user with how it signs in, makes one with a password (to be changed at the first
+sign\-in, if chosen), sets a password, the name shown, the email, the quota,
+admin\-ness and whether it makes libraries of its own, disables, deletes, and
+invites: an invitation is a link,
+.BI /~ui/#invite= token ,
+that lets one person choose a user name and password of their own, once, for one
+to thirty days, as an admin and with a quota if it says so; only the SHA\-256 of
+its token is kept, in
+.IR dir /.iam.json
+beside the users. Sharing a library offers the users by name.
+.B POST /~ui/iam
+with
+.B {"Action":
+\fIaction\fB,\fR \fIits fields\fB}\fR
+is an IAM action as the signed\-in user, judged and answered as IAM's own;
+.B GET /~ui/users
+lists the users, each one's id and name to any user and all of it, with the open
+invitations, to an admin;
+.B GET /~ui/invite?token=
+says whether an invitation holds, and
+.B POST /~ui/invite
+with
+.B {"token", "user", "password", "name", "email"}
+takes it, without a session, a token that is none counted as a failed sign\-in.
 .IP
 .B GET /~ui/progress
 lists the films the signed\-in user has part watched, the most recent first,

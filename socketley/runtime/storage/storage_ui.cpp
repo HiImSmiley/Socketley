@@ -18,6 +18,7 @@
 #include "compression.h"
 #include "digest.h"
 #include "json_doc.h"
+#include "s3_iam.h"
 #include "s3_names.h"
 #include "s3_quota.h"
 #include "../../shared/http_framing.h"
@@ -318,6 +319,21 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
         ui_git(c);
         return;
     }
+    if (r.key == "iam")
+    {
+        ui_iam(c);
+        return;
+    }
+    if (r.key == "users")
+    {
+        ui_users(c);
+        return;
+    }
+    if (r.key == "invite")
+    {
+        ui_invite(c);
+        return;
+    }
     if (r.method != "GET" && r.method != "HEAD")
     {
         app_reply(c, 405, "The interface is read only.\n");
@@ -404,7 +420,7 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
         rv.headers  = &none;
         if (!m_auth->authorize(rv).allowed)
         {
-            app_reply(c, 401, "Sign in with an access key as the user name and its secret as the password.\n");
+            app_reply(c, 401, "Sign in with a user's name and password, or an access key and its secret.\n");
             return;
         }
     }
@@ -416,15 +432,14 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
     int64_t expires = 0;
     if (r.method == "POST" && !c->anonymous)
     {
-        std::string pair;
-        base64_decode(http_trim_ows(h.substr(6)), pair);
-        const size_t colon = pair.find(':');
-        const std::string_view key = std::string_view(pair).substr(0, colon), secret = std::string_view(pair).substr(colon + 1);
+        // Sealed under the secret of the key the sign-in was made with: the access key given, or the "~<name>" a
+        // password signs as.
+        const std::string& key = c->principal;
         const bool remember = r.has_query("remember");
         const int64_t issued = wall_ms();
         expires = issued + (remember ? remember_ms : session_ms);
         std::string cookie = std::string(cookie_name) + "=" + base64url_encode(key) + "." + std::to_string(issued) + "." +
-                             std::to_string(expires) + "." + hmac_sha256_hex(secret, ui_session_text(key, issued, expires)) +
+                             std::to_string(expires) + "." + m_auth->ui_session_mac(key, issued, expires) +
                              "; Path=/; HttpOnly; SameSite=Strict" + secure_attr;
         if (remember)
             cookie += "; Max-Age=" + std::to_string(remember_ms / 1000);
@@ -436,6 +451,10 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
     jstr(o, u ? m_auth->display_name(u->id) : std::string{});
     o += u && u->admin ? ",\"admin\":true" : ",\"admin\":false";
     o += c->anonymous ? ",\"anonymous\":true" : ",\"anonymous\":false";
+    // Whether the user has a password, and must set another before anything else, and whether this session is one.
+    const int login = u ? m_auth->login_state(u->id) : -1;
+    o += login < 0 ? ",\"password\":false" : login ? ",\"password\":true,\"password_reset\":true" : ",\"password\":true";
+    o += c->principal.starts_with('~') ? ",\"by_password\":true" : ",\"by_password\":false";
     o += ",\"expires\":" + std::to_string(expires) + "}";
     out.headers.emplace_back("Content-Type", "application/json");
     out.headers.emplace_back("Cache-Control", "no-store");
@@ -544,6 +563,10 @@ void storage_run::ui_body(const std::shared_ptr<conn>& c)
         ui_access_body(c);
     else if (c->req.key == "git")
         ui_git_body(c);
+    else if (c->req.key == "iam")
+        ui_iam_body(c);
+    else if (c->req.key == "invite")
+        ui_invite_body(c);
     else
         ui_progress_body(c);
 }
@@ -1206,6 +1229,229 @@ void storage_run::ui_git(const std::shared_ptr<conn>& c)
     }
     o += "]}";
     app_reply(c, 200, std::move(o), "application/json");
+}
+
+void storage_run::ui_iam(const std::shared_ptr<conn>& c)
+{
+    s3_request& r = c->req;
+    if (r.method != "POST")
+    {
+        app_reply(c, 405, "An IAM action is sent with POST.\n");
+        return;
+    }
+    if (!app_login(c, "socketley"))
+        return;
+    if (c->anonymous || !c->user)
+    {
+        app_reply(c, 403, "IAM is a user's; sign in first.\n");
+        return;
+    }
+    if (r.chunked || (r.has_content_length && r.content_length > 16 * 1024))
+    {
+        r.keep_alive = false;
+        app_reply(c, 413, "Request body too large.\n");
+        return;
+    }
+    collect_body(c, 16 * 1024);
+}
+
+void storage_run::ui_iam_body(const std::shared_ptr<conn>& c)
+{
+    jvalue req;
+    if (!json_reader(c->body).document(req))
+    {
+        app_reply(c, 400, "The body is a JSON object: Action, and the action's fields as strings.\n");
+        return;
+    }
+    const std::string action = str_of(req, "Action");
+    // An invitation is taken without a session, at /~ui/invite.
+    if ((!iam_action(action) && !iam_own_action(action)) || action == "socketley:AcceptInvitation")
+    {
+        app_reply(c, 400, "No IAM action " + action + ".\n");
+        return;
+    }
+    iam_fields f;
+    for (const auto& [k, v] : req.members)
+        if (k != "Action" && v.k == jvalue::kind::string)
+            f.emplace_back(k, v.s);
+    auth_verdict v;
+    v.principal = c->principal;
+    v.user = c->user;
+    op_iam(c, f, action, v);
+}
+
+void storage_run::ui_users(const std::shared_ptr<conn>& c)
+{
+    if (c->req.method != "GET" && c->req.method != "HEAD")
+    {
+        app_reply(c, 405, "Users are listed with GET.\n");
+        return;
+    }
+    if (!app_login(c, "socketley"))
+        return;
+    if (c->anonymous || !c->user)
+    {
+        app_reply(c, 403, "Users are listed to a user; sign in first.\n");
+        return;
+    }
+    iam_state st;
+    if (!iam_read(st))
+    {
+        app_reply(c, 500, "The IAM file could not be read.\n");
+        return;
+    }
+    const bool admin = c->user->admin;
+    const int64_t now = wall_ms();
+    std::string o = "{\"admin\":";
+    o += admin ? "true" : "false";
+    o += ",\"users\":[";
+    bool first = true;
+    for (const auto& u : m_auth->users())
+    {
+        if (u->cluster)
+            continue;
+        o += first ? "{\"id\":" : ",{\"id\":";
+        first = false;
+        o += json_quote(u->id);
+        o += ",\"name\":";
+        o += json_quote(u->display_name);
+        if (admin)
+        {
+            const auto it = st.users.find(u->id);
+            const iam_user* iu = it == st.users.end() ? nullptr : &it->second;
+            const bool file = m_auth->file_user(u->id);
+            size_t keys = 0;
+            for (const auto& [id, k] : st.keys)
+                keys += k.user == u->id;
+            const auto tag = [&](std::string_view k)
+            {
+                if (!iu)
+                    return std::string();
+                const auto t = iu->tags.find(std::string(k));
+                return t == iu->tags.end() ? std::string() : t->second;
+            };
+            o += ",\"admin\":";
+            o += u->admin ? "true" : "false";
+            o += ",\"email\":";
+            o += json_quote(u->email);
+            o += ",\"max_bytes\":" + std::to_string(u->max_bytes);
+            o += ",\"file\":";
+            o += file ? "true" : "false";
+            o += ",\"password\":";
+            o += iu && !iu->password.empty() ? "true" : "false";
+            o += ",\"password_reset\":";
+            o += iu && iu->password_reset ? "true" : "false";
+            o += ",\"disabled\":";
+            o += tag(iam_tag_disabled) == "true" ? "true" : "false";
+            o += ",\"keys\":" + std::to_string(keys);
+            o += ",\"libraries\":";
+            o += u->admin || file || (iu && iu->policies.inline_docs.count(std::string(iam_libraries_policy))) ? "true" : "false";
+            o += ",\"created\":" + std::to_string(iu ? iu->created_ms : 0);
+            o += ",\"groups\":[";
+            for (size_t i = 0; iu && i < iu->groups.size(); ++i)
+            {
+                if (i)
+                    o += ',';
+                o += json_quote(iu->groups[i]);
+            }
+            o += ']';
+        }
+        o += '}';
+    }
+    o += ']';
+    if (admin)
+    {
+        o += ",\"invites\":[";
+        first = true;
+        for (const auto& [id, i] : st.invites)
+        {
+            if (i.expires_ms <= now)
+                continue;
+            o += first ? "{\"id\":" : ",{\"id\":";
+            first = false;
+            o += json_quote(id);
+            o += ",\"by\":";
+            o += json_quote(i.by);
+            o += ",\"created\":" + std::to_string(i.created_ms) + ",\"expires\":" + std::to_string(i.expires_ms);
+            o += ",\"admin\":";
+            o += i.admin ? "true" : "false";
+            o += ",\"max_bytes\":" + std::to_string(i.max_bytes);
+            o += i.libraries ? ",\"libraries\":true}" : ",\"libraries\":false}";
+        }
+        o += ']';
+    }
+    o += '}';
+    response out;
+    out.status = 200;
+    out.headers.emplace_back("Content-Type", "application/json");
+    out.headers.emplace_back("Cache-Control", "no-store");
+    out.body = std::move(o);
+    send_response(c, std::move(out));
+}
+
+void storage_run::ui_invite(const std::shared_ptr<conn>& c)
+{
+    s3_request& r = c->req;
+    if (m_auth->iam_file().empty())
+    {
+        app_reply(c, 404, "This runtime takes no invitations: it was started without credentials.\n");
+        return;
+    }
+    if (r.method == "POST")
+    {
+        if (login_barred(c))
+            return;
+        if (r.chunked || (r.has_content_length && r.content_length > 4096))
+        {
+            r.keep_alive = false;
+            app_reply(c, 413, "Request body too large.\n");
+            return;
+        }
+        collect_body(c, 4096);
+        return;
+    }
+    if (r.method != "GET")
+    {
+        app_reply(c, 405, "An invitation is read with GET and taken with POST.\n");
+        return;
+    }
+    iam_state st;
+    iam_read(st);
+    const std::string token(r.get_query("token"));
+    const std::string h = sha256_hex(token);
+    const auto it = st.invites.find(h.substr(0, 16));
+    const bool valid = !token.empty() && it != st.invites.end() && it->second.hash == h && it->second.expires_ms > wall_ms();
+    std::string o = "{\"valid\":";
+    o += valid ? "true" : "false";
+    if (valid)
+        o += ",\"expires\":" + std::to_string(it->second.expires_ms) + ",\"admin\":" + (it->second.admin ? "true" : "false");
+    o += '}';
+    response out;
+    out.status = 200;
+    out.headers.emplace_back("Content-Type", "application/json");
+    out.headers.emplace_back("Cache-Control", "no-store");
+    out.body = std::move(o);
+    send_response(c, std::move(out));
+}
+
+void storage_run::ui_invite_body(const std::shared_ptr<conn>& c)
+{
+    jvalue req;
+    if (!json_reader(c->body).document(req))
+    {
+        app_reply(c, 400, "The body is a JSON object: token, user, password, and a name and an email if wanted.\n");
+        return;
+    }
+    // A token is 190 bits, but a guess is counted as a wrong password is.
+    iam_state st;
+    iam_read(st);
+    const std::string h = sha256_hex(str_of(req, "token"));
+    const auto it = st.invites.find(h.substr(0, 16));
+    if (it == st.invites.end() || it->second.hash != h)
+        login_missed(*c);
+    iam_fields f{{"Token", str_of(req, "token")}, {"UserName", str_of(req, "user")}, {"Password", str_of(req, "password")},
+                 {"DisplayName", str_of(req, "name")}, {"Email", str_of(req, "email")}};
+    op_iam(c, f, "socketley:AcceptInvitation", auth_verdict{}, true);
 }
 
 void storage_run::ui_git_body(const std::shared_ptr<conn>& c)

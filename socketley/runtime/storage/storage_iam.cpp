@@ -86,6 +86,14 @@ int64_t read_rev(const std::string& file)
 
 }   // namespace
 
+bool storage_run::iam_read(iam_state& out)
+{
+    const std::string file = m_auth ? m_auth->iam_file() : std::string();
+    std::string text, err;
+    out = iam_state{};
+    return file.empty() || (read_all(file, text) && iam_parse(text, out, err));
+}
+
 std::string storage_run::iam_record()
 {
     const std::string file = m_auth ? m_auth->iam_file() : std::string();
@@ -124,7 +132,7 @@ st storage_run::iam_take(int64_t rev, const std::string& json)
 }
 
 void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::pair<std::string, std::string>>& fields,
-                         std::string_view action, const auth_verdict& v)
+                         std::string_view action, const auth_verdict& v, bool system)
 {
     auto answer = [this, &c](int status, std::string body)
     {
@@ -145,23 +153,27 @@ void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::
         fail(400, "InvalidAction", "This runtime has no IAM: it was started without credentials.");
         return;
     }
-    // IAM is no session's: an admin may do all of it, and another user what its own policies allow.
+    // IAM is no session's: an admin may do all of it, another user what its own policies allow and what IAM's console
+    // lets every user do to itself, and the runtime's own actions are an admin's -- or, `system`, the runtime's.
     const user_identity* u = v.user.get();
     const auto may_call = [](const user_identity& who)
     { return (who.has_policy && who.policy.allows_iam()) || (who.iam_policy && who.iam_policy->allows_iam()); };
-    if (!u || v.session || (!u->admin && !may_call(*u)))
+    if (!system && (!u || v.session ||
+                    (!u->admin && (iam_own_action(action) || (!may_call(*u) && !iam_self_service(action))))))
     {
         fail(403, "AccessDenied", "User: " + (u ? u->id : std::string("anonymous")) +
                                       " is not authorized to perform: iam:" + std::string(action));
         return;
     }
-    // A request that names no user acts on its caller's, as IAM reads it.
+    // A request that names no user acts on its caller's, as IAM reads it, and a password is only ever changed by its
+    // own user.
     iam_fields own;
     const iam_fields* f = &fields;
-    if (iam_defaults_to_caller(action) &&
-        std::none_of(fields.begin(), fields.end(), [](const auto& kv) { return kv.first == "UserName"; }))
+    const bool names_user = std::any_of(fields.begin(), fields.end(), [](const auto& kv) { return kv.first == "UserName"; });
+    if (u && ((iam_defaults_to_caller(action) && !names_user) || action == "ChangePassword"))
     {
         own = fields;
+        std::erase_if(own, [](const auto& kv) { return kv.first == "UserName"; });
         own.emplace_back("UserName", u->id);
         f = &own;
     }
@@ -196,13 +208,20 @@ void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::
             res.ok      = false;
             res.status  = 403;
             res.code    = "AccessDenied";
-            res.message = "User: " + u->id + " is not authorized to perform: iam:" + std::string(action) + message;
+            res.message = "User: " + (u ? u->id : std::string("anonymous")) + " is not authorized to perform: iam:" +
+                          std::string(action) + message;
         };
-        // Any other user is judged by its own policies on every resource the request acts on.
-        if (!u->admin)
+        // Any other user is judged by its own policies on every resource the request acts on -- but for what it may do
+        // to itself without one -- and may change no admin.
+        const std::vector<std::string> targets = iam_users_of(st, action, *f);
+        const bool on_self = u && !targets.empty() &&
+                             std::all_of(targets.begin(), targets.end(), [&](const std::string& t) { return t == u->id; });
+        if (!system && !u->admin && !(on_self && iam_self_service(action)))
         {
+            if (!may_call(*u))
+                refuse({});
             const int index = iam_action_index(action);
-            for (const std::string& resource : iam_resources(st, action, *f))
+            for (const std::string& resource : res.ok ? iam_resources(st, action, *f) : std::vector<std::string>{})
             {
                 const policy_effect e = iam_access(c, *u, v.principal, index, resource);
                 if (e == policy_effect::allow)
@@ -214,7 +233,11 @@ void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::
             }
             // Only an admin gives an identity the right to call IAM, so no delegate widens its own.
             if (res.ok && iam_grants_iam(st, action, *f))
-                refuse(" with a policy or group that grants IAM actions, which only an admin may give");
+                refuse(" with a policy, group or tag that grants IAM actions or what a user may hold, which only an admin "
+                       "may give");
+            for (const std::string& t : targets)
+                if (res.ok && t != u->id && m_auth->admin_user(t))
+                    refuse(" on " + t + ", an admin, whom only an admin may change");
         }
         if (res.ok)
             res = iam_apply(st, action, *f, now_ms, c->req.request_id,

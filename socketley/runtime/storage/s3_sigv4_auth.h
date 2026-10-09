@@ -37,6 +37,7 @@ public:
     std::shared_ptr<const user_identity> user_of(std::string_view access_key) const;
     // The user of that id a section declared, null for none.
     const user_identity* find_user(std::string_view id) const;
+    std::shared_ptr<const user_identity> shared_user(std::string_view id) const;
     // The first access key that signs for user `id`, empty for none.
     std::string_view key_of(std::string_view id) const;
     // The user whose email is `email`, empty for none.
@@ -52,6 +53,13 @@ public:
         return out;
     }
     size_t user_count() const { return m_users.size(); }
+    std::vector<std::shared_ptr<const user_identity>> users() const
+    {
+        std::vector<std::shared_ptr<const user_identity>> out;
+        for (const auto& [id, u] : m_users)
+            out.push_back(u);
+        return out;
+    }
 
 private:
     struct entry
@@ -114,6 +122,11 @@ public:
     bool issue_session_as(std::string_view user_id, int64_t expires, std::string_view policy, std::string_view role,
                           session_credentials& out) override;
     bool has_user(std::string_view id) const override { return m_creds.find_user(id) != nullptr; }
+    auth_verdict authorize_password(std::string_view user, std::string_view password) override;
+    int login_state(std::string_view id) const override;
+    std::string ui_session_mac(std::string_view access_key, int64_t issued_ms, int64_t expires_ms) const override;
+    bool admin_user(std::string_view id) const override;
+    std::vector<std::shared_ptr<const user_identity>> users() const override { return m_creds.users(); }
     std::string user_of_email(std::string_view email) const override { return m_creds.user_of_email(email); }
     std::string seal_key(std::string_view user_id, std::string_view purpose) const override;
     int role_check(std::string_view role, std::string_view user_id, int64_t& max_session) override;
@@ -175,6 +188,23 @@ private:
     };
     std::map<std::string, role_entry, std::less<>> m_roles;
     std::set<std::string> m_file_users;
+    // The login profiles of the IAM file, by user: the password's hash, whether it must be set again, and when it
+    // was set, before which no session of it is good.
+    struct login_entry
+    {
+        std::string hash;
+        bool reset{false};
+        int64_t set_ms{0};
+    };
+    std::map<std::string, login_entry, std::less<>> m_logins;
+    // A password that matched lately, by user: the SHA-256 of what was given and of the hash it matched, and until
+    // when, so a WebDAV client that sends it with every request costs one scrypt in five minutes and not one each.
+    struct login_seen
+    {
+        std::string given, hash;
+        std::chrono::steady_clock::time_point until;
+    };
+    std::map<std::string, login_seen, std::less<>> m_logins_seen;
     std::chrono::steady_clock::time_point m_last_iam_probe{};
     // Reads the IAM file into `set`, its roles into m_roles.
     void add_iam(credential_set& set);

@@ -74,6 +74,9 @@ a{color:inherit}
 .lcard .btn.pri{width:100%;justify-content:center;height:46px;margin-top:22px;font-size:15px}
 .chk{display:flex!important;align-items:center;gap:.5rem;text-transform:none!important;letter-spacing:0!important;font-weight:400!important;cursor:pointer}
 .err{color:var(--bad);min-height:1.3em;margin-top:10px;font-size:13px}
+.fv{display:flex;flex-direction:column;gap:5px;margin:0 0 12px}.fv>span{font-size:12.5px;color:var(--mut)}.fv small{font-size:11.5px}
+.dlg h4{margin:6px 0 8px;font-size:14px;font-weight:700}
+.dlg .chk+.fv,.dlg .chk:last-of-type{margin-top:6px}.dlg .chk+.fv{margin-top:12px}
 .logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;letter-spacing:-.01em}
 .logo .mk{width:34px;height:34px;border-radius:10px;background:var(--grad);display:flex;align-items:center;justify-content:center;box-shadow:0 6px 20px -6px rgba(var(--glow),.9)}
 .logo .mk svg{width:20px;height:20px;stroke:var(--on);fill:none;stroke-width:2.2}
@@ -479,8 +482,8 @@ body.audio #ups,body.audio #selbar{bottom:96px}
     <div class="logo"><div class="mk"><svg viewBox="0 0 24 24"><path d="M7 5.5v13l11-6.5z"/></svg></div>socketley</div>
     <h1>Welcome back</h1>
     <p class="mut">Sign in to your library.</p>
-    <label for="lk">Access key</label><input class="inp" id="lk" autocomplete="username" required spellcheck="false">
-    <label for="ls">Secret</label><input class="inp" id="ls" type="password" autocomplete="current-password" required>
+    <label for="lk">User name or access key</label><input class="inp" id="lk" autocomplete="username" required spellcheck="false" autocapitalize="off">
+    <label for="ls">Password or secret</label><input class="inp" id="ls" type="password" autocomplete="current-password" required>
     <label class="chk"><input type="checkbox" id="lr"> Stay signed in on this device</label>
     <div class="err" id="le"></div>
     <button class="btn pri">Sign in</button>
@@ -496,6 +499,8 @@ body.audio #ups,body.audio #selbar{bottom:96px}
     <button class="nav" id="nGit"></button>
     <button class="nav" id="nSend"></button>
     <button class="nav" id="nUse"></button>
+    <button class="nav" id="nAcc"></button>
+    <button class="nav" id="nUsers"></button>
     <div class="themes" id="themes"></div>
     <button class="nav" id="nOut"></button>
     <button class="nav" id="nAll"></button>
@@ -581,6 +586,9 @@ const P = {
   replace: '<path d="M4 7h11l-3-3M20 17H9l3 3"/>',
   send: '<path d="M21 3 10.5 13.5M21 3l-6.5 18-4-7.5L3 9.5z"/>',
   git: '<circle cx="6" cy="5.5" r="2.2"/><circle cx="6" cy="18.5" r="2.2"/><circle cx="18" cy="8.5" r="2.2"/><path d="M6 7.7v8.6M18 10.7c0 4-6 3.3-11 6.2"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/>',
+  shield: '<path d="M12 3l7.5 3v5.5c0 4.6-3.2 8.3-7.5 9.5-4.3-1.2-7.5-4.9-7.5-9.5V6z"/>',
+  lock: '<rect x="5" y="10.5" width="14" height="10" rx="2.2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/>',
   users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6.5 6.5 0 0 1 3.5 6"/>',
   fire: '<path d="M12 21c-3.9 0-7-2.9-7-6.6 0-2.8 1.6-4.6 3.2-6.3.3 1.8 1.3 3 2.6 3.4C10.4 8 12 5.2 14.5 3c.3 3.2 4.5 5.6 4.5 11.1 0 3.9-3.1 6.9-7 6.9z"/><path d="M12 21c-1.7 0-3-1.3-3-3 0-1.9 1.6-2.9 3-4.5 1.4 1.6 3 2.6 3 4.5 0 1.7-1.3 3-3 3z"/>'
 };
@@ -783,6 +791,10 @@ function side() {
   nav($('#nUse'), 'bucket', 'Storage', false, usageDlg);
   nav($('#nGit'), 'git', 'Git', false, gitDlg);
   $('#nGit').hidden = !(me && me.user);
+  nav($('#nAcc'), 'user', 'Account', false, accountDlg);
+  $('#nAcc').hidden = !(me && me.user);
+  nav($('#nUsers'), 'users', 'Users', false, usersDlg);
+  $('#nUsers').hidden = !(me && me.admin && me.user);
   paintThemes();
   const L = $('#libs'); L.textContent = '';
   for (const b of buckets) {
@@ -1688,7 +1700,9 @@ function gitDlg() {
 // Who else may read or write a library, each a statement of its bucket's policy the server writes.
 function accessDlg(lib) {
   const T = el('table', { class: 'mtbl' });
-  const who = el('input', { class: 'inp', placeholder: 'User id, as in the credentials', spellcheck: 'false', autocomplete: 'off' });
+  const who = el('input', { class: 'inp', placeholder: 'User name', spellcheck: 'false', autocomplete: 'off', list: 'skl-users' });
+  const known = el('datalist', { id: 'skl-users' });
+  api('GET', '/~ui/users').then(r => r.ok ? r.json() : null).then(d => { if (d) for (const u of d.users) if (u.id !== (me && me.user)) known.append(el('option', { value: u.id, label: u.name !== u.id ? u.name : '' })); }).catch(() => {});
   const lvl = el('select', { class: 'inp', style: 'flex:none;width:auto' }, el('option', { value: 'read', text: 'Can view' }), el('option', { value: 'write', text: 'Can edit' }));
   const set = async (user, access) => {
     try { await must(await api('POST', '/~ui/access', { body: JSON.stringify({ bucket: lib, user, access }) })); fill(); toast(access === 'none' ? user + ' no longer has access' : 'Shared with ' + user); }
@@ -1696,8 +1710,8 @@ function accessDlg(lib) {
   };
   const add = () => { const u = who.value.trim(); if (u) { set(u, lvl.value); who.value = ''; } };
   who.addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
-  const body = [el('p', { text: 'People who sign in to this runtime with their own key see “' + lib + '” among their libraries. Viewers can browse, play and download; editors can also upload, rename and delete.' }),
-    el('div', { class: 'lnk', style: 'margin:4px 0 14px' }, who, lvl, btn('plus', 'Add', add, 'pri')), T];
+  const body = [el('p', { text: 'People who sign in to this runtime see “' + lib + '” among their libraries. Viewers can browse, play and download; editors can also upload, rename and delete.' }),
+    el('div', { class: 'lnk', style: 'margin:4px 0 14px' }, who, known, lvl, btn('plus', 'Add', add, 'pri')), T];
   modal('Share “' + lib + '”', body, null, true);
   async function fill() {
     T.textContent = '';
@@ -1746,6 +1760,253 @@ function usageDlg() {
   fill();
   return L;
 }
+// ─── users ──────────────────────────────────────────────────────────────────
+// An IAM action as the signed-in user, its answer as an XML document; a refusal throws with IAM's own message.
+async function iam(Action, fields = {}) {
+  const r = await api('POST', '/~ui/iam', { body: JSON.stringify(Object.assign({ Action }, fields)) });
+  const t = await r.text();
+  const d = new DOMParser().parseFromString(t, 'application/xml');
+  const one = n => { const x = d.getElementsByTagName(n)[0]; return x ? x.textContent : ''; };
+  if (!r.ok) { const e = new Error(one('Message') || t.slice(0, 200) || r.status + ' ' + r.statusText); e.code = one('Code'); throw e; }
+  d.one = one;
+  return d;
+}
+const allOf = (d, n) => [...d.getElementsByTagName(n)];
+const tagsOf = o => { const f = {}; Object.entries(o).forEach(([k, v], i) => { f['Tags.member.' + (i + 1) + '.Key'] = k; f['Tags.member.' + (i + 1) + '.Value'] = v; }); return f; };
+const gb = b => b ? String(+(b / 1e9).toFixed(2)) : '';
+function labelled(label, input, hint) { return el('label', { class: 'fv' }, el('span', { text: label }), input, hint ? el('small', { class: 'mut', text: hint }) : null); }
+// A password a person can type, from the browser's own random numbers.
+function newPassword() { const a = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; const r = crypto.getRandomValues(new Uint32Array(16)); return [...r].map(x => a[x % a.length]).join(''); }
+function secretBox(title, rows, note) {
+  const T = el('table', { class: 'mtbl' }, ...rows.map(([k, v]) => el('tr', {}, el('td', { class: 'mut', text: k }), el('td', { class: 'w' }, el('code', { text: v, style: 'user-select:all;word-break:break-all' })), el('td', { class: 'r' }, btn(null, 'Copy', () => copy(v), 'sm')))));
+  modal(title, [el('p', { text: note }), T], [btn(null, 'Done', () => layers[layers.length - 1].close(), 'pri')], true);
+}
+async function changePasswordDlg(forced) {
+  const old = el('input', { class: 'inp', type: 'password', autocomplete: 'current-password' });
+  const pw = el('input', { class: 'inp', type: 'password', autocomplete: 'new-password' });
+  const pw2 = el('input', { class: 'inp', type: 'password', autocomplete: 'new-password' });
+  const err = el('div', { class: 'err' });
+  const first = !me.password;
+  const save = async () => {
+    err.textContent = '';
+    if (pw.value !== pw2.value) { err.textContent = 'The two new passwords differ.'; return; }
+    try {
+      if (first) await iam('CreateLoginProfile', { UserName: me.user, Password: pw.value });
+      else await iam('ChangePassword', { OldPassword: old.value, NewPassword: pw.value });
+    } catch (e) { err.textContent = e.message; return; }
+    me.password = true; me.password_reset = false; done = true;
+    L.close();
+    // A new password ends every session made before it, this one too when it was made with the old password.
+    toast(first ? 'Your password is set: sign in with your name and it from now on' : 'Password changed');
+    if (!first && me.by_password) { toast('Sign in again with the new password'); signedOut(); }
+  };
+  let done = false;
+  const L = modal(first ? 'Set a password' : forced ? 'Choose a new password' : 'Change password',
+    [forced ? el('p', { text: 'Your password was set for you; choose your own before going on.' }) : first ? el('p', { text: 'With a password you sign in with your name, ' + me.user + ', as well as with your key.' }) : null,
+      first ? null : labelled('Current password', old), labelled('New password', pw, 'At least 8 characters.'), labelled('New password again', pw2), err],
+    [forced ? btn(null, 'Sign out', () => { L.close(); signOut(); }) : btn(null, 'Cancel', () => L.close()), btn(null, 'Save', save, 'pri')]);
+  if (forced) L.onclose = () => { if (!done) signOut(); };
+  L.box.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); save(); } });
+  (first ? pw : old).focus();
+}
+// The signed-in user's own: its password and its access keys.
+function accountDlg() {
+  const box = el('div');
+  modal('Account', box, null, true);
+  const fill = async () => {
+    box.textContent = '';
+    box.append(el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 16px' },
+      el('span', { class: 'chip' }, el('span', { text: (me.name || me.user) + (me.name && me.name !== me.user ? ' · ' + me.user : '') })),
+      me.admin ? el('span', { class: 'chip' }, el('span', { text: 'admin' })) : null,
+      el('span', { class: 'chip' }, el('span', { text: me.by_password ? 'signed in with your password' : 'signed in with a key' }))));
+    box.append(el('h4', { text: 'Password' }), el('div', { style: 'display:flex;align-items:center;gap:10px;margin-bottom:18px' },
+      el('span', { class: 'mut', text: me.password ? 'You sign in with your name and password.' : 'You have no password yet: you sign in with a key.' }),
+      btn('lock', me.password ? 'Change' : 'Set a password', () => changePasswordDlg(false), 'sm')));
+    box.append(el('h4', { text: 'Access keys' }), el('p', { class: 'mut', style: 'font-size:13px', text: 'For S3 tools, drives and apps: an access key and its secret sign in as you. The secret is shown once, when the key is made.' }));
+    const T = el('table', { class: 'mtbl' });
+    box.append(T);
+    let d;
+    try { d = await iam('ListAccessKeys'); }
+    catch (e) { T.append(el('tr', {}, el('td', { class: 'mut', text: e.code === 'NoSuchEntity' ? 'Your keys are kept in the runtime’s credentials file, where an admin changes them.' : e.message }))); return; }
+    const keys = allOf(d, 'member');
+    if (!keys.length) T.append(el('tr', {}, el('td', { class: 'mut', colspan: '4', text: 'No keys yet.' })));
+    for (const k of keys) {
+      const id = k.getElementsByTagName('AccessKeyId')[0].textContent, active = k.getElementsByTagName('Status')[0].textContent === 'Active';
+      const made = k.getElementsByTagName('CreateDate')[0].textContent;
+      T.append(el('tr', {}, el('td', { class: 'w' }, el('code', { text: id })), el('td', { class: 'mut', text: active ? 'Active' : 'Inactive' }), el('td', { class: 'mut', text: when(made) }),
+        el('td', { class: 'r' }, btn(null, active ? 'Deactivate' : 'Activate', async () => { try { await iam('UpdateAccessKey', { AccessKeyId: id, Status: active ? 'Inactive' : 'Active' }); fill(); } catch (e) { fail(e); } }, 'sm'), ' ',
+          btn(null, 'Delete', async () => { if (!await ask({ title: 'Delete ' + id + '?', text: 'What signs in with it can no longer.', ok: 'Delete', danger: true })) return; try { await iam('DeleteAccessKey', { AccessKeyId: id }); fill(); } catch (e) { fail(e); } }, 'sm bad'))));
+    }
+    if (keys.length < 2) box.append(el('div', { style: 'margin-top:10px' }, btn('plus', 'New key', async () => {
+      try { const n = await iam('CreateAccessKey'); fill(); secretBox('Your new key', [['Access key', n.one('AccessKeyId')], ['Secret', n.one('SecretAccessKey')]], 'Keep the secret now: it is not shown again.'); } catch (e) { fail(e); }
+    }, 'sm')));
+  };
+  fill();
+}
+// An admin's: every user, made, invited, changed and removed, and the invitations still open.
+function usersDlg() {
+  const box = el('div');
+  modal('Users', box, [btn('plus', 'Invite', inviteDlg), btn('plus', 'New user', () => newUserDlg(fill), 'pri')], true);
+  const fill = async () => {
+    box.textContent = '';
+    let d;
+    try { d = await (await must(await api('GET', '/~ui/users'))).json(); } catch (e) { box.append(el('p', { text: e.message })); return; }
+    const T = el('table', { class: 'mtbl' });
+    box.append(T);
+    for (const u of d.users.sort((a, b) => a.id.localeCompare(b.id))) {
+      const badges = [u.admin ? 'admin' : null, !u.admin && !u.file && !u.libraries ? 'no libraries of their own' : null, u.disabled ? 'disabled' : null, u.file ? 'credentials file' : null, u.password ? (u.password_reset ? 'password to change' : 'password') : null, u.keys ? u.keys + (u.keys === 1 ? ' key' : ' keys') : null].filter(Boolean);
+      const more = ibtn('more', 'More', ev => popup(ev.currentTarget, [
+        { icon: 'lock', label: u.password ? 'Set a new password' : 'Give a password', fn: () => passwordFor(u, fill) },
+        u.file ? null : { icon: 'shield', label: u.admin ? 'No longer admin' : 'Make admin', fn: () => setAdmin(u, !u.admin, fill) },
+        u.file ? null : { icon: 'bucket', label: 'Storage quota', fn: () => quotaFor(u, fill) },
+        u.file || u.admin ? null : { icon: 'folder', label: u.libraries ? 'May not make libraries' : 'May make libraries', fn: () => setLibraries(u, !u.libraries, fill) },
+        u.file ? null : { icon: 'edit', label: 'Name and email', fn: () => detailsFor(u, fill) },
+        u.file || u.id === me.user ? null : { icon: u.disabled ? 'check' : 'close', label: u.disabled ? 'Let sign in again' : 'Disable', fn: () => setDisabled(u, !u.disabled, fill) },
+        u.file || u.id === me.user ? null : '-',
+        u.file || u.id === me.user ? null : { icon: 'trash', label: 'Delete user', bad: true, fn: () => deleteUser(u, fill) },
+      ]));
+      T.append(el('tr', {}, el('td', { class: 'w' }, el('b', { text: u.name }), u.name !== u.id ? el('span', { class: 'mut', text: ' · ' + u.id }) : null, u.email ? el('div', { class: 'mut', style: 'font-size:12.5px', text: u.email }) : null),
+        el('td', { class: 'mut', style: 'font-size:12.5px;white-space:nowrap', text: badges.join(' · ') }), el('td', { class: 'mut', style: 'font-size:12.5px;white-space:nowrap', text: u.max_bytes ? 'quota ' + human(u.max_bytes) : '' }), el('td', { class: 'r' }, more)));
+    }
+    if (d.invites && d.invites.length) {
+      box.append(el('h4', { text: 'Open invitations', style: 'margin-top:20px' }));
+      const I = el('table', { class: 'mtbl' });
+      for (const i of d.invites) I.append(el('tr', {}, el('td', { class: 'w', text: 'by ' + i.by + (i.admin ? ' · as admin' : '') + (i.max_bytes ? ' · quota ' + human(i.max_bytes) : '') }), el('td', { class: 'mut', style: 'white-space:nowrap', text: 'ends ' + new Date(i.expires).toLocaleDateString() }),
+        el('td', { class: 'r' }, btn(null, 'Withdraw', async () => { try { await iam('socketley:DeleteInvitation', { Id: i.id }); fill(); } catch (e) { fail(e); } }, 'sm bad'))));
+      box.append(I);
+    }
+  };
+  usersDlg.fill = fill;
+  fill();
+}
+async function setAdmin(u, on, fill) {
+  try {
+    if (on) { try { await iam('CreateGroup', { GroupName: 'admins' }); } catch (e) { if (e.code !== 'EntityAlreadyExists') throw e; } await iam('AddUserToGroup', { UserName: u.id, GroupName: 'admins' }); }
+    else await iam('RemoveUserFromGroup', { UserName: u.id, GroupName: 'admins' });
+    toast(on ? u.id + ' is an admin' : u.id + ' is no longer an admin'); fill();
+  } catch (e) { fail(e); }
+}
+const LIBS = '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:CreateBucket","Resource":"*"}]}';
+async function setLibraries(u, on, fill) {
+  try { if (on) await iam('PutUserPolicy', { UserName: u.id, PolicyName: 'socketley-libraries', PolicyDocument: LIBS }); else await iam('DeleteUserPolicy', { UserName: u.id, PolicyName: 'socketley-libraries' }); fill(); }
+  catch (e) { fail(e); }
+}
+async function setDisabled(u, on, fill) {
+  if (on && !await ask({ title: 'Disable ' + u.id + '?', text: 'Neither a password nor a key of theirs signs in until they are let in again. Their libraries stay.', ok: 'Disable', danger: true })) return;
+  try { if (on) await iam('TagUser', Object.assign({ UserName: u.id }, tagsOf({ 'socketley:disabled': 'true' }))); else await iam('UntagUser', { UserName: u.id, 'TagKeys.member.1': 'socketley:disabled' }); toast(on ? u.id + ' is disabled' : u.id + ' may sign in again'); fill(); }
+  catch (e) { fail(e); }
+}
+async function quotaFor(u, fill) {
+  const v = await ask({ title: 'Storage quota of ' + u.id, text: 'The most their libraries may hold together, in GB; empty for none.', input: 'GB', value: gb(u.max_bytes) });
+  if (v === null) return;
+  try { if (+v > 0) await iam('TagUser', Object.assign({ UserName: u.id }, tagsOf({ 'socketley:max-bytes': String(Math.round(+v * 1e9)) }))); else await iam('UntagUser', { UserName: u.id, 'TagKeys.member.1': 'socketley:max-bytes' }); fill(); }
+  catch (e) { fail(e); }
+}
+function detailsFor(u, fill) {
+  const name = el('input', { class: 'inp', value: u.name !== u.id ? u.name : '' }), mail = el('input', { class: 'inp', type: 'email', value: u.email || '' });
+  const L = modal('Name and email of ' + u.id, [labelled('Shown as', name), labelled('Email', mail)], [btn(null, 'Cancel', () => L.close()), btn(null, 'Save', async () => {
+    try {
+      const set = {}, drop = [];
+      (name.value.trim() ? set['socketley:display-name'] = name.value.trim() : drop.push('socketley:display-name'));
+      (mail.value.trim() ? set['socketley:email'] = mail.value.trim() : drop.push('socketley:email'));
+      if (Object.keys(set).length) await iam('TagUser', Object.assign({ UserName: u.id }, tagsOf(set)));
+      if (drop.length) await iam('UntagUser', Object.assign({ UserName: u.id }, Object.fromEntries(drop.map((k, i) => ['TagKeys.member.' + (i + 1), k]))));
+      L.close(); fill();
+    } catch (e) { fail(e); }
+  }, 'pri')]);
+}
+function passwordFor(u, fill) {
+  const pw = el('input', { class: 'inp', value: newPassword(), spellcheck: 'false' });
+  const reset = el('input', { type: 'checkbox', checked: true });
+  const L = modal((u.password ? 'New password for ' : 'A password for ') + u.id, [labelled('Password', pw, 'Give it to ' + u.id + ' yourself; it is not shown again.'), el('label', { class: 'chk' }, reset, ' They choose their own at their next sign-in')],
+    [btn(null, 'Cancel', () => L.close()), btn(null, 'Set', async () => {
+      try { await iam(u.password ? 'UpdateLoginProfile' : 'CreateLoginProfile', { UserName: u.id, Password: pw.value, PasswordResetRequired: reset.checked ? 'true' : 'false' }); L.close(); toast('Password of ' + u.id + ' set'); fill(); }
+      catch (e) { fail(e); }
+    }, 'pri')]);
+  pw.select();
+}
+async function deleteUser(u, fill) {
+  if (!await ask({ title: 'Delete ' + u.id + '?', text: 'Their password, keys, groups and policies go with them. Their libraries stay, owned by the name ' + u.id + ', and an admin still reaches them.', ok: 'Delete', danger: true })) return;
+  try {
+    const n = { UserName: u.id };
+    for (const k of allOf(await iam('ListAccessKeys', n), 'AccessKeyId')) await iam('DeleteAccessKey', { UserName: u.id, AccessKeyId: k.textContent });
+    try { await iam('DeleteLoginProfile', n); } catch (e) { if (e.code !== 'NoSuchEntity') throw e; }
+    for (const g of allOf(await iam('ListGroupsForUser', n), 'GroupName')) await iam('RemoveUserFromGroup', { UserName: u.id, GroupName: g.textContent });
+    for (const p of allOf(await iam('ListUserPolicies', n), 'member')) await iam('DeleteUserPolicy', { UserName: u.id, PolicyName: p.textContent });
+    for (const p of allOf(await iam('ListAttachedUserPolicies', n), 'PolicyArn')) await iam('DetachUserPolicy', { UserName: u.id, PolicyArn: p.textContent });
+    await iam('DeleteUser', n);
+    toast(u.id + ' is deleted'); fill();
+  } catch (e) { fail(e); }
+}
+function newUserDlg(fill) {
+  const id = el('input', { class: 'inp', spellcheck: 'false', autocapitalize: 'off', placeholder: 'alice' }), name = el('input', { class: 'inp', placeholder: 'Alice' }), mail = el('input', { class: 'inp', type: 'email' });
+  const pw = el('input', { class: 'inp', value: newPassword(), spellcheck: 'false' }), reset = el('input', { type: 'checkbox', checked: true }), adm = el('input', { type: 'checkbox' }), libs = el('input', { type: 'checkbox', checked: true });
+  const quota = el('input', { class: 'inp', type: 'number', min: '0', step: '0.1', placeholder: 'No quota' });
+  const err = el('div', { class: 'err' });
+  const make = async () => {
+    err.textContent = '';
+    const u = id.value.trim();
+    try {
+      await iam('CreateUser', { UserName: u });
+      await iam('CreateLoginProfile', { UserName: u, Password: pw.value, PasswordResetRequired: reset.checked ? 'true' : 'false' });
+      const t = {};
+      if (name.value.trim()) t['socketley:display-name'] = name.value.trim();
+      if (mail.value.trim()) t['socketley:email'] = mail.value.trim();
+      if (+quota.value > 0) t['socketley:max-bytes'] = String(Math.round(+quota.value * 1e9));
+      if (Object.keys(t).length) await iam('TagUser', Object.assign({ UserName: u }, tagsOf(t)));
+      if (libs.checked && !adm.checked) await iam('PutUserPolicy', { UserName: u, PolicyName: 'socketley-libraries', PolicyDocument: LIBS });
+      if (adm.checked) await setAdmin({ id: u }, true, () => {});
+    } catch (e) { err.textContent = e.message; fill(); return; }
+    L.close(); fill();
+    secretBox('User ' + u + ' made', [['User name', u], ['Password', pw.value]], 'Give these to ' + u + ' yourself; the password is not shown again.');
+  };
+  const L = modal('New user', [labelled('User name', id, 'Letters, digits and _+=,.@- only; it is how they sign in.'), labelled('Shown as', name), labelled('Email', mail), labelled('Password', pw),
+    el('label', { class: 'chk' }, reset, ' They choose their own at their first sign-in'), el('label', { class: 'chk' }, libs, ' May make libraries of their own'), el('label', { class: 'chk' }, adm, ' Admin: sees every library and manages users'), labelled('Storage quota in GB', quota), err],
+    [btn(null, 'Cancel', () => L.close()), btn('plus', 'Make', make, 'pri')]);
+  id.focus();
+}
+function inviteDlg() {
+  const adm = el('input', { type: 'checkbox' }), libs = el('input', { type: 'checkbox', checked: true }), quota = el('input', { class: 'inp', type: 'number', min: '0', step: '0.1', placeholder: 'No quota' });
+  const days = el('select', { class: 'inp' }, ...[1, 3, 7, 14, 30].map(d => el('option', { value: String(d), text: d + (d === 1 ? ' day' : ' days') })));
+  days.value = '7';
+  const L = modal('Invite someone', [el('p', { text: 'A link that lets one person choose a user name and password of their own. Anyone with the link can use it, once, until it ends.' }),
+    el('label', { class: 'chk' }, libs, ' May make libraries of their own'), el('label', { class: 'chk' }, adm, ' As admin'), labelled('Storage quota in GB', quota), labelled('Ends after', days)],
+    [btn(null, 'Cancel', () => L.close()), btn('link', 'Make link', async () => {
+      try {
+        const d = await iam('socketley:CreateInvitation', { Admin: adm.checked ? 'true' : 'false', Libraries: libs.checked ? 'true' : 'false', MaxBytes: +quota.value > 0 ? String(Math.round(+quota.value * 1e9)) : '', ExpiresInDays: days.value });
+        L.close(); if (usersDlg.fill) usersDlg.fill();
+        secretBox('Invitation', [['Link', location.origin + '/~ui/#invite=' + d.one('Token')]], 'Send this link to the person you invite. It is not shown again.');
+      } catch (e) { fail(e); }
+    }, 'pri')]);
+}
+// The page an invitation's link opens: a user name and password of one's own, and then signed in with them.
+async function inviteShow(token) {
+  let d = null;
+  try { d = await (await fetch('/~ui/invite?token=' + encodeURIComponent(token))).json(); } catch (e) {}
+  const F = $('#lf'); F.hidden = true;
+  const card = el('form', { class: 'lcard' });
+  $('#login').append(card); $('#login').hidden = false; $('#app').hidden = true;
+  card.append(el('div', { class: 'logo' }, el('div', { class: 'mk' }, ico('play')), 'socketley'));
+  if (!d || !d.valid) { card.append(el('h1', { text: 'This invitation has ended' }), el('p', { class: 'mut', text: 'It was used, withdrawn, or is too old. Ask whoever sent it for another.' }), btn(null, 'Sign in instead', () => { location.hash = ''; card.remove(); F.hidden = false; }, 'pri')); return; }
+  const id = el('input', { class: 'inp', autocomplete: 'username', spellcheck: 'false', autocapitalize: 'off', required: true }), name = el('input', { class: 'inp' }), mail = el('input', { class: 'inp', type: 'email' });
+  const pw = el('input', { class: 'inp', type: 'password', autocomplete: 'new-password', required: true }), pw2 = el('input', { class: 'inp', type: 'password', autocomplete: 'new-password', required: true });
+  const err = el('div', { class: 'err' });
+  card.append(el('h1', { text: 'You are invited' }), el('p', { class: 'mut', text: 'Choose how you sign in' + (d.admin ? ', as an admin' : '') + '. The link holds until ' + new Date(d.expires).toLocaleDateString() + '.' }),
+    el('label', { text: 'User name' }), id, el('label', { text: 'Your name (optional)' }), name, el('label', { text: 'Email (optional)' }), mail,
+    el('label', { text: 'Password, at least 8 characters' }), pw, el('label', { text: 'Password again' }), pw2, err, el('button', { class: 'btn pri', text: 'Join' }));
+  card.addEventListener('submit', async ev => {
+    ev.preventDefault(); err.textContent = '';
+    if (pw.value !== pw2.value) { err.textContent = 'The two passwords differ.'; return; }
+    const r = await fetch('/~ui/invite', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, user: id.value.trim(), password: pw.value, name: name.value.trim(), email: mail.value.trim() }) });
+    if (!r.ok) { const t = await r.text(); const m = /<Message>([^<]*)/.exec(t); err.textContent = r.status === 429 ? 'Too many tries from here; wait a while.' : m ? m[1] : 'Joining failed: ' + r.status; return; }
+    const s = await fetch('/~ui/session', { method: 'POST', headers: { 'Authorization': 'Basic ' + btoa(unescape(encodeURIComponent(id.value.trim() + ':' + pw.value))), 'X-Socketley-UI': '1' } });
+    history.replaceState(null, '', location.pathname);
+    card.remove(); F.hidden = false;
+    if (s.ok) { me = await s.json(); start(); toast('Welcome, ' + (me.name || me.user)); } else signedOut();
+  });
+  id.focus();
+}
+
 function trashDlg() {
   const T = el('table', { class: 'mtbl' });
   modal('Trash · ' + path.join('/'), [el('p', { text: 'Files deleted from a library that keeps versions. Restoring brings back the last version before the deletion.' }), T], null, true);
@@ -3265,6 +3526,7 @@ window.addEventListener('drop', async e => {
 
 async function start() {
   auth = true;
+  if (me && me.password_reset) setTimeout(() => changePasswordDlg(true), 0);
   $('#login').hidden = true; $('#app').hidden = false; fromHash(); buckets = [];
   await migratePositions();
   await loadProgress();
@@ -3272,8 +3534,10 @@ async function start() {
   restore();
   if (!liveT) liveT = setInterval(liveCheck, 1000);
 }
-// A session the browser still holds signs in at once.
+// A session the browser still holds signs in at once; an invitation's link asks for a user of one's own first.
 (async () => {
+  const inv = /^#invite=([A-Za-z0-9]+)$/.exec(location.hash);
+  if (inv) { inviteShow(inv[1]); return; }
   try {
     const r = await fetch('/~ui/session', { headers: { 'X-Socketley-UI': '1' } });
     if (r.ok) { me = await r.json(); start(); return; }

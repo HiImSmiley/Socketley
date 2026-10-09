@@ -33,8 +33,47 @@ struct iam_user
     int64_t     created_ms{0};
     iam_policies policies;
     std::vector<std::string> groups;
-    // A user of the credentials file, which the IAM API keeps policies for and nothing else.
+    // A user of the credentials file, which the IAM API keeps policies and a login profile for and nothing else.
     bool        external{false};
+    // Its login profile: the password's hash as password_hash.h makes it, empty for none, whether the next sign-in
+    // must set another, and when it was set.
+    std::string password;
+    bool        password_reset{false};
+    int64_t     password_ms{0};
+    // The secret of the key "~<name>" a password's sessions are sealed under and git's runs sign with, drawn with the
+    // profile and kept while it is, so a new password ends the sessions by their time and not by a new secret.
+    std::string login_secret;
+    // Its tags, those under "socketley:" read by the runtime itself (the iam_tag_ names below).
+    std::map<std::string, std::string> tags;
+};
+
+// The tags of a user the runtime reads: the name it is shown by, its email, the bytes its buckets may hold, and
+// whether it may not sign in at all.
+inline constexpr std::string_view iam_tag_display_name = "socketley:display-name";
+inline constexpr std::string_view iam_tag_email = "socketley:email";
+inline constexpr std::string_view iam_tag_max_bytes = "socketley:max-bytes";
+inline constexpr std::string_view iam_tag_disabled = "socketley:disabled";
+// The group whose members are admins, as a credentials file's `admin = true` makes one.
+inline constexpr std::string_view iam_admins_group = "admins";
+// The inline policy that lets a user of the web interface make libraries of its own: an IAM user makes a bucket only
+// where a policy allows it, as S3 judges, and owns what it makes.
+inline constexpr std::string_view iam_libraries_policy = "socketley-libraries";
+inline constexpr std::string_view iam_libraries_doc =
+    R"({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:CreateBucket","Resource":"*"}]})";
+
+// An invitation to make oneself a user: listed and withdrawn by `id`, the first 16 hex digits of the SHA-256 of the
+// token it was given as, which is all of it that is kept besides `hash`, that whole SHA-256.
+struct iam_invite
+{
+    std::string id;
+    std::string hash;
+    int64_t     created_ms{0};
+    int64_t     expires_ms{0};
+    std::string by;
+    bool        admin{false};
+    uint64_t    max_bytes{0};
+    // Whether the user it makes may make libraries.
+    bool        libraries{true};
 };
 
 struct iam_key
@@ -73,6 +112,7 @@ struct iam_state
     std::map<std::string, iam_key>   keys;
     std::map<std::string, iam_group> groups;
     std::map<std::string, iam_role>  roles;
+    std::map<std::string, iam_invite> invites;
 };
 
 bool iam_parse(std::string_view json, iam_state& out, std::string& err);
@@ -95,6 +135,10 @@ std::string_view iam_role_name_of(std::string_view arn_or_name);
 
 // Whether `action` is one of IAM's this runtime answers.
 bool iam_action(std::string_view action);
+
+// The runtime's own actions on the document, which no S3 request reaches: the web interface's invitations,
+// socketley:CreateInvitation, ListInvitations, DeleteInvitation and AcceptInvitation. iam_apply runs them as any.
+bool iam_own_action(std::string_view action);
 
 // What an IAM request did: `xml` to answer with, or `err` with its status; `changed` when the state must be kept.
 struct iam_result
@@ -124,6 +168,13 @@ bool iam_grants_iam(const iam_state& s, std::string_view action, const iam_field
 
 // Whether a request that names no UserName acts on its caller's user, as IAM reads it.
 bool iam_defaults_to_caller(std::string_view action);
+
+// Whether a user may call `action` on itself without a policy that allows it: reading itself, its keys and tags, and
+// changing its password and keys, which IAM's console lets every user do.
+bool iam_self_service(std::string_view action);
+
+// The users a request acts on, by name: the one it names, or the user of the key it names.
+std::vector<std::string> iam_users_of(const iam_state& s, std::string_view action, const iam_fields& fields);
 
 std::string iam_error_xml(std::string_view code, std::string_view message, std::string_view request_id);
 
