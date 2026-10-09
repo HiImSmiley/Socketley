@@ -547,17 +547,35 @@ void server::edge(int fd, const request& r)
         std::istringstream lines(table);
         for (std::string line; std::getline(lines, line);)
         {
+            // Appended piece by piece: gcc 12 takes a chain of + here for a copy past the largest object.
             if (line.starts_with("zone "))
-                zones += (zones.empty() ? "" : ",") + json_quote(line.substr(5));
+            {
+                if (!zones.empty())
+                    zones += ',';
+                zones += json_quote(line.substr(5));
+            }
             else if (line.starts_with("route "))
             {
                 std::istringstream w(line.substr(6));
                 std::string name, addr, to;
                 w >> name;
                 while (w >> addr)
-                    to += (to.empty() ? "" : ",") + std::string("{\"address\":") + json_quote(addr) + ",\"runtime\":" +
-                          json_quote(by_address.count(addr) ? by_address[addr] : std::string{}) + "}";
-                routes += (routes.empty() ? "" : ",") + std::string("{\"name\":") + json_quote(name) + ",\"to\":[" + to + "]}";
+                {
+                    if (!to.empty())
+                        to += ',';
+                    to += "{\"address\":";
+                    to += json_quote(addr);
+                    to += ",\"runtime\":";
+                    to += json_quote(by_address.count(addr) ? by_address[addr] : std::string{});
+                    to += '}';
+                }
+                if (!routes.empty())
+                    routes += ',';
+                routes += "{\"name\":";
+                routes += json_quote(name);
+                routes += ",\"to\":[";
+                routes += to;
+                routes += "]}";
             }
         }
         o += zones + "],\"routes\":[" + routes + "]}";
