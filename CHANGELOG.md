@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The host's name alone opens the storage interface.** A browser asked for a
+  storage runtime's root, which S3 answers with an XML refusal no one can read,
+  is sent to `/~ui/`; a client, which asks for no HTML and carries a signature
+  or a query, is answered as before. The dashboard shows each runtime the names
+  an entrance sends it, as a link out to them, in its list and on its own page,
+  and the Domains view no longer offers a wildcard as a page to open.
+
 - **Dashboard: logs and domains.** Its Logs follow the daemon's recent log live,
   by runtime, level and text, and a runtime that failed says the last warning
   or error it wrote, with how often it was started again. Each worker's stderr

@@ -41,7 +41,7 @@ a{color:inherit}
 [hidden]{display:none!important}
 .i{width:20px;height:20px;flex:none;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .btn{display:inline-flex;align-items:center;gap:.5rem;height:38px;padding:0 14px;border-radius:10px;background:rgba(255,255,255,.06);
-  border:1px solid var(--line);font-weight:500;transition:background .15s,border-color .15s,transform .1s;white-space:nowrap}
+  border:1px solid var(--line);font-weight:500;transition:background .15s,border-color .15s,transform .1s;white-space:nowrap;text-decoration:none}
 .btn:hover{background:rgba(255,255,255,.11);border-color:var(--line2)}
 .btn:active{transform:scale(.97)}
 .btn.pri{background:var(--grad);background-size:160% 100%;background-position:0 0;border-color:transparent;color:var(--on);font-weight:650;box-shadow:0 10px 30px -10px rgba(var(--glow),.75);transition:background-position .4s,box-shadow .3s,transform .1s}

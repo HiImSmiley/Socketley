@@ -150,6 +150,7 @@ Object.assign(P, {
   dns: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.5 2.6 3.6 5.4 3.6 8.5s-1.1 5.9-3.6 8.5c-2.5-2.6-3.6-5.4-3.6-8.5S9.5 6.1 12 3.5z"/>',
   play: '<path d="M7 5.5v13l11-6.5z"/>', stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
   restart: '<path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/>', edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
+  open: '<path d="M14 3.5h6.5V10"/><path d="M20.5 3.5 11 13"/><path d="M17.5 14v5.2a1.3 1.3 0 0 1-1.3 1.3H4.8a1.3 1.3 0 0 1-1.3-1.3V7.8a1.3 1.3 0 0 1 1.3-1.3H10"/>',
   gauge: '<path d="M12 14l4-4"/><path d="M4.5 18a9 9 0 1 1 15 0"/>', cpu: '<rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/>'
 });
 const TYPES = {
@@ -311,10 +312,40 @@ async function poll() {
     prev.per = Object.fromEntries(r.map(x => [x.name, { m: x.messages_total, i: x.bytes_in, o: x.bytes_out, c: x.cpu_seconds }]));
     over = o; rts = r;
     if (now - problemsAt > 6) { problemsAt = now; problems(); }
+    loadHosts();
     if (view.at === 'over' || view.at === 'rt') loadSeries(view.at === 'rt' ? view.name : '');
     render(false);
   } catch (e) { if (me) toast(e.message, 'bad'); }
   if (me) timer = setTimeout(poll, 2000);
+}
+// The names an entrance sends to each runtime, read seldom: routes change with a configuration, not with the figures.
+let hosts = {}, hostsAt = 0;
+// A wildcard stands for every host under it and names no page of its own, so it opens nothing.
+function hostsOf(d) {
+  const m = {};
+  for (const e of d.entrances || []) for (const r of e.routes || []) {
+    if (r.name.startsWith('*.')) continue;
+    for (const t of r.to || []) if (t.runtime && !(m[t.runtime] || []).includes(r.name)) (m[t.runtime] = m[t.runtime] || []).push(r.name);
+  }
+  return m;
+}
+async function loadHosts() {
+  if (Date.now() - hostsAt < 30000) return;
+  hostsAt = Date.now();
+  try {
+    hosts = hostsOf(await (await must(await api('GET', '/api/edge'))).json());
+    render(false);
+  } catch (e) {}
+}
+// A link out of the dashboard to where `name` is served, or null when no entrance sends anything there.
+function openLink(name, small) {
+  const h = (hosts[name] || [])[0];
+  if (!h) return null;
+  const a = el('a', { class: 'btn' + (small ? ' sm' : ''), href: 'https://' + h + '/', target: '_blank', rel: 'noopener',
+    title: 'Open https://' + h + '/' + ((hosts[name] || []).length > 1 ? ', one of ' + hosts[name].length + ' names' : '') });
+  a.append(ico('open'), el('span', { text: small ? 'Open' : 'Open ' + h }));
+  a.onclick = e => e.stopPropagation();
+  return a;
 }
 // The owners, groups and ages `ls` knows, which the figures do not carry.
 async function loadMeta() {
@@ -459,7 +490,7 @@ function table(list) {
       el('td', { class: 'num', text: count(r.msg_s || 0) + '/s' }),
       el('td', { class: 'num', text: rate(r.in_s || 0) + ' · ' + rate(r.out_s || 0) }),
       el('td', { class: 'num', text: (r.cpu_p || 0).toFixed(1) + ' %' }),
-      el('td', {}, el('div', { class: 'acts', style: 'justify-content:flex-end' }, ...controls(r, true)))));
+      el('td', {}, el('div', { class: 'acts', style: 'justify-content:flex-end' }, openLink(r.name, true), ...controls(r, true)))));
   }
   return T;
 }
@@ -487,7 +518,7 @@ async function detail(full) {
   const t = TYPES[r.type] || [r.type, r.type];
   const H = $('#dHead'); H.textContent = '';
   H.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico(t[0])), el('span', { text: r.name }), el('span', { class: 'n' }, el('span', { class: 'dot ' + r.state }), ' ' + r.state + ' · ' + t[1] + (r.port ? ' · port ' + r.port : '')))),
-    el('div', { class: 'acts', style: 'margin:-4px 0 18px' }, ...controls(r, false), rangePick()));
+    el('div', { class: 'acts', style: 'margin:-4px 0 18px' }, openLink(r.name), ...controls(r, false), rangePick()));
   const D = $('#dTiles'); D.textContent = '';
   const n = r.name, pct = v => v.toFixed(1) + ' %';
   D.append(tile('users', 'Connections', count(r.connections), count(r.connections_total) + ' since start', line(n, 'conn', count)),
@@ -588,7 +619,9 @@ async function domains() {
     C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('proxy')), el('span', { text: 'Entrance ' }), rtLink(e.name), el('span', { class: 'n', text: e.zones.join(', ') || 'no zone' }))));
     const T = el('table', { class: 'mtbl', style: 'margin-bottom:26px' });
     T.append(el('tr', {}, el('th', { text: 'Name' }), el('th', { text: 'Goes to' })));
-    for (const r of e.routes) T.append(el('tr', {}, el('td', { class: 'w', style: 'font-family:var(--mono)' }, el('a', { href: 'https://' + r.name.replace(/^\*\./, 'x.') + '/', target: '_blank', rel: 'noopener', text: r.name, style: 'color:var(--fg)' })),
+    for (const r of e.routes) T.append(el('tr', {}, el('td', { class: 'w', style: 'font-family:var(--mono)' },
+      r.name.startsWith('*.') ? el('span', { text: r.name, title: 'A name for every host under it: there is no one page behind it.' })
+        : el('a', { href: 'https://' + r.name + '/', target: '_blank', rel: 'noopener', text: r.name, style: 'color:var(--fg)' })),
       el('td', {}, ...r.to.flatMap((t, i) => [i ? ', ' : null, t.runtime ? rtLink(t.runtime) : el('span', { class: 'mut', text: t.address })]))));
     if (!e.routes.length) T.append(el('tr', {}, el('td', { class: 'mut', colspan: '2', text: 'No runtime has a name here yet: give one --domain.' })));
     C.append(T);

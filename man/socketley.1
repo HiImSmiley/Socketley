@@ -10146,7 +10146,13 @@ and
 .BR SOCKETLEY_MEDIA_CACHE_MB .
 .TP
 .B /~ui/
-A web interface, one page served from the binary, that signs in with an access
+A web interface, one page served from the binary. A browser asked for the
+runtime's root instead, with no query, no signature and
+.B Accept: text/html
+among what it takes, is sent here, so the host's name alone reaches the
+interface; an S3 client, which asks for none of that, still reads
+.B GET /
+as ListBuckets. The interface signs in with an access
 key and its secret, which it sends once for the session cookie below and keeps
 nowhere, and browses libraries (buckets) as a media library: films, pictures,
 music and documents in their own rows, with thumbnails, lengths and what the

@@ -13,6 +13,8 @@
 #   * a versioned bucket's deleted file missing from its trash, or not brought
 #     back by a restore
 #   * the interface not served, or served without its content policy
+#   * a browser at the root reading S3's XML refusal rather than being
+#     sent to the interface, or an S3 request being sent there instead
 #   * a sign-in cookie not let in, let in tampered with, expired or after its
 #     key's secret changed, readable by script, or taking a change that does
 #     not carry the interface's header; a session extending itself, or
@@ -222,6 +224,15 @@ check "as a page with its script" "$(curl -s "$U/~ui/" | grep -c '<script>')" 1
 check "under a content policy" "$(curl -s -o /dev/null -D - "$U/~ui/" | grep -ci "^content-security-policy: default-src 'self'")" 1
 check "and only read" "$(code -X POST "$U/~ui/")" 405
 check "a path of no application is refused" "$(code "$U/~nope/")" 400
+# A browser typing the host alone would otherwise read an XML refusal, and find no way to the interface at all.
+# The code and the Location of a GET, as one line.
+sent() { curl -s -m 30 -o /dev/null -D - "$@" | tr -d '\r' | awk 'BEGIN{IGNORECASE=1} /^HTTP/{c=$2} /^location:/{l=$2} END{print l ? c " " l : c}'; }
+check "a browser at the root is sent to the interface" "$(sent -H 'Accept: text/html,application/xhtml+xml,*/*;q=0.8' "$U/")" "302 /~ui/"
+check "and so is its HEAD" "$(sent -I -H 'Accept: text/html' "$U/")" "302 /~ui/"
+check "a client asking for no HTML still gets S3" "$(sent "$U/")" 403
+check "a request that signs is judged, not sent away" "$(sent -H 'Accept: text/html' -H 'Authorization: AWS4-HMAC-SHA256 Credential=x/y' "$U/")" 400
+check "nor is one carrying a query" "$(sent -H 'Accept: text/html' "$U/?encoding-type=url")" 403
+check "nor one naming a bucket" "$(sent -H 'Accept: text/html' "$U/docs")" 403
 
 # The interface's sign-in: a cookie sealed with the key's secret.
 jar="$T/jar"

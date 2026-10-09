@@ -254,6 +254,18 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
         op_website(c);
         return;
     }
+    // A browser sent to the root is given the interface, where S3 would answer it an XML refusal; a client asks for
+    // no HTML, carries a signature or a query, and is answered as before.
+    if ((r.method == "GET" || r.method == "HEAD") && !r.vhost && r.bucket.empty() && r.key.empty() &&
+        r.raw_query.empty() && !r.has_header("authorization") && !r.has_header("x-amz-date") &&
+        !r.has_header("x-amz-content-sha256") && r.header("accept").find("text/html") != std::string_view::npos)
+    {
+        response moved;
+        moved.status = 302;
+        moved.headers.emplace_back("Location", "/~ui/");
+        send_response(c, std::move(moved));
+        return;
+    }
     if (app_request(c))
         return;
     // A request for temporary credentials is signed over its form, which is read before it is judged.

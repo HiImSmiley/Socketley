@@ -109,6 +109,19 @@ console.log([c.objects.v, c.buckets.v, c.mesh_links.v, c.max_bytes.v, c.shard_co
 EOF
     expect "the stats panel adds a counter over the shards, takes a whole copy once, folds nothing the tiles show, and groups by part" \
         "$(node "$T/read.js" 2>&1)" "10|3|1|0|3|shard|commits sent|true|false|false|false|2|cpus=max pids=7,8"
+    # The names each runtime is opened by, read from an entrance's routes as the page reads them.
+    python3 -c "
+import re,sys; print(re.search(r'^function hostsOf\(.*?^}$', open(sys.argv[1]).read(), re.M | re.S).group(0))" "$T/page.js" > "$T/hosts.js"
+    cat >> "$T/hosts.js" <<'EOF'
+const h = hostsOf({ entrances: [{ name: 'ns-proxy', routes: [
+  { name: '*.storage.example', to: [{ address: '127.0.0.1:1', runtime: 'ui' }] },
+  { name: 'storage.example', to: [{ address: '127.0.0.1:1', runtime: 'ui' }] },
+  { name: 'files.example', to: [{ address: '127.0.0.1:1', runtime: 'ui' }] },
+  { name: 'gone.example', to: [{ address: '10.0.0.9:80', runtime: '' }] }] }] });
+console.log(JSON.stringify(h));
+EOF
+    expect "a runtime is opened by the names an entrance sends it, never by a wildcard or an address of no runtime" \
+        "$(node "$T/hosts.js" 2>&1)" '{"ui":["storage.example","files.example"]}'
 fi
 
 # ─── signing in ─────────────────────────────────────────────────────────────
