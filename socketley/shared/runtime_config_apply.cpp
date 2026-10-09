@@ -9,6 +9,7 @@
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
+#include "../runtime/sync/sync_instance.h"
 
 void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
                         bool by_presence)
@@ -113,6 +114,27 @@ void apply_dns_config(dns_instance& dns, const runtime_config& cfg, bool by_pres
         dns.set_proxy(cfg.dns_proxy);
     if (asked("rrl", true))
         dns.set_rrl(cfg.dns_rrl);
+}
+
+void apply_sync_config(sync_instance& sy, const runtime_config& cfg, bool by_presence)
+{
+    auto asked = [&](std::string_view key, bool nondefault) {
+        return by_presence ? cfg.has(key) : nondefault;
+    };
+    if (asked("dir", !cfg.sync_dir.empty()))
+        sy.set_dir(cfg.sync_dir);
+    if (asked("storage", !cfg.sync_storage.empty()))
+        sy.set_storage(cfg.sync_storage);
+    if (asked("prefix", !cfg.sync_prefix.empty()))
+        sy.set_prefix(cfg.sync_prefix);
+    if (asked("credentials", !cfg.sync_credentials.empty()))
+        sy.set_credentials(cfg.sync_credentials);
+    if (asked("exclude", !cfg.sync_exclude.empty()))
+        sy.set_exclude(cfg.sync_exclude);
+    if (asked("mode", cfg.mode != 0))
+        sy.set_mode(static_cast<sync_mode>(cfg.mode));
+    if (asked("every", true))
+        sy.set_every(cfg.sync_every);
 }
 
 void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool by_presence)
@@ -318,6 +340,9 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
 
         case runtime_dns:
             apply_dns_config(static_cast<dns_instance&>(rt), cfg);
+            break;
+        case runtime_sync:
+            apply_sync_config(static_cast<sync_instance&>(rt), cfg);
             break;
     }
 

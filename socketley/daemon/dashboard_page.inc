@@ -150,6 +150,7 @@ Object.assign(P, {
   dns: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.5 2.6 3.6 5.4 3.6 8.5s-1.1 5.9-3.6 8.5c-2.5-2.6-3.6-5.4-3.6-8.5S9.5 6.1 12 3.5z"/>',
   play: '<path d="M7 5.5v13l11-6.5z"/>', stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
   restart: '<path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/>', edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
+  sync: '<path d="M4 11a8 8 0 0 1 13.7-5.6L20 7.5"/><path d="M20 13a8 8 0 0 1-13.7 5.6L4 16.5"/><path d="M20 3.5V7.5h-4M4 20.5v-4h4"/>',
   open: '<path d="M14 3.5h6.5V10"/><path d="M20.5 3.5 11 13"/><path d="M17.5 14v5.2a1.3 1.3 0 0 1-1.3 1.3H4.8a1.3 1.3 0 0 1-1.3-1.3V7.8a1.3 1.3 0 0 1 1.3-1.3H10"/>',
   gauge: '<path d="M12 14l4-4"/><path d="M4.5 18a9 9 0 1 1 15 0"/>', cpu: '<rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/>'
 });
@@ -159,7 +160,8 @@ const TYPES = {
   proxy: ['proxy', 'Proxy', 'HTTP or TCP to backends, the entrance, auth and redirects.'],
   cache: ['cache', 'Cache', 'A key-value store that speaks Redis, persistent and sharded.'],
   storage: ['storage', 'Storage', 'S3-compatible object storage with this interface.'],
-  dns: ['dns', 'DNS', 'An authoritative name server, with an entrance on 443.']
+  dns: ['dns', 'DNS', 'An authoritative name server, with an entrance on 443.'],
+  sync: ['sync', 'Sync', 'Carries a directory to a storage, and back, on a schedule.']
 };
 // The configuration key `show` and `import` name each flag by.
 const KEY = { '-p': 'port', '-g': 'group', '--lua': 'lua_script', '--bind': 'bind', '--listen': 'listen', '--shards': 'shards', '--domain': 'domain', '--cpus': 'cpus',

@@ -724,6 +724,26 @@ runtime_types() {
     echo -e "${BLUE}└─────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
 
+    echo -e "${CYAN}┌─────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC} ${BOLD}SYNC${NC}                                                          ${CYAN}│${NC}"
+    echo -e "${CYAN}├─────────────────────────────────────────────────────────────────┤${NC}"
+    echo -e "${CYAN}│${NC} Carries one directory to a storage, and back. One runtime is   ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   one job, so a job that fails is a runtime that failed.       ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Listens on nothing: no -p, and --shards is refused.            ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Flags: --dir path (required), --storage ui/bucket or a URL     ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}          (required, comma-separate for more with --mode out),  ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}        --credentials file (access_key, secret_key; required),  ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}        --mode out|in|inout, --prefix key, --exclude patterns,  ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}        --every 1h (or never: only when told of a change)       ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Example: socketley create sync photos --dir /srv/photos \\      ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   --storage ui/photos --credentials /etc/socketley/s.creds -s  ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}                                                                 ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} It keeps an index of what it last carried, so a file deleted   ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   here is taken off the far side and one never carried is      ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   sent. socketley stats <name> says what it has moved.         ${CYAN}│${NC}"
+    echo -e "${CYAN}└─────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+
     read -p "Press Enter to continue..." || true
     main_menu
 }

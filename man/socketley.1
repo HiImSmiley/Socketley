@@ -502,7 +502,7 @@ socketley daemon --name new-name   # rename while cluster is active
 .BI "create " "type name " "[flags]"
 Create a new runtime instance.
 .I type
-can be: server, client, proxy, cache, storage, dns, or any registered type \(em see
+can be: server, client, proxy, cache, storage, dns, sync, or any registered type \(em see
 .BR "REGISTERED TYPES" .
 .I name
 is a unique identifier for the runtime.
@@ -1233,7 +1233,7 @@ name	Runtime name \fB(requires restart)\fR
 id	6-char hex identifier (read-only, ignored on import)
 type	T{
 .ad l
-Runtime type: server, client, proxy, cache, storage, dns (read-only, ignored on import)
+Runtime type: server, client, proxy, cache, storage, dns, sync (read-only, ignored on import)
 T}
 was_running	Internal daemon state (ignored on import)
 .TE
@@ -11134,8 +11134,123 @@ and
 .B zone_reloads
 and
 .BR zone_reload_failures .
+.SH SYNC FLAGS
+A
+.B sync
+runtime is one job that carries files between a directory and a storage. One
+runtime is one job, so a job that fails is a runtime that failed, with its
+reason in the log, its own alert and its own line in
+.BR "socketley ls" .
+.PP
+.nf
+socketley create sync photos \-\-dir /srv/photos \-\-storage ui/photos \e
+    \-\-credentials /etc/socketley/sync.creds \-\-mode out \-s
+.fi
+.PP
+It listens on nothing and takes no
+.BR \-p ,
+and
+.B \-\-shards
+is refused: the shards would share no socket and would write one index from
+several processes.
+.TP
+.BI "\-\-dir " path
+The directory whose files are carried, absolute, and there when the runtime
+starts. Required.
+.TP
+.BI "\-\-storage " target\fR[\fB,\fItarget\fR...]
+Where they go: a runtime of this daemon and a bucket,
+.BR ui/photos ,
+or a URL and a bucket,
+.BR https://storage.example/photos .
+More than one target is taken only with
+.BR "\-\-mode out" ,
+since carrying two of them into one directory cannot say which a file came from
+when they differ. Required.
+.TP
+.BI "\-\-mode out" | in | inout
+Who carries, in the same three words a server and a client take:
+.B out
+sends the directory to the storage,
+.B in
+brings the storage to the directory, and
+.B inout
+does both. The default is
+.BR out .
+.B in
+and
+.B inout
+are refused for now: only
+.B out
+is carried, and a job that named another mode is told so when it is made rather
+than failing at its first start.
+.TP
+.BI "\-\-credentials " file
+The file the job signs with:
+.B access_key
+and
+.B secret_key
+as
+.I key = value
+lines, with
+.B session_token
+and
+.B region
+when they are wanted, and
+.B #
+beginning a comment. Required, since a sync signs every request it makes.
+.TP
+.BI "\-\-prefix " key
+The key everything is written under, below the bucket. Empty is the bucket's
+root.
+.TP
+.BI "\-\-every " duration
+How often the whole directory is walked, as
+.BR 30s ,
+.BR 10m ,
+.B 1h
+or
+.BR 1d ;
+.B never
+walks it once at a start and then only when something says a file changed. One
+hour by default.
+.TP
+.BI "\-\-exclude " pattern\fR[\fB,\fIpattern\fR...]
+Shell patterns matched against the path below
+.BR \-\-dir ;
+anything they match is not carried.
+.PP
+.B "What it remembers."
+A sync keeps an index of what it last carried, in
+.IR state\-dir /sync/ name .index,
+0600, written before the change it records is called done. Without it a
+deletion here cannot be told from a file never carried: the first is taken off
+the far side and the second is sent. A record cut short by a crash costs that
+record alone.
+.PP
+.B "What a failure means."
+A file that cannot be carried is counted and logged, and tried again at the
+next walk; only a configuration that cannot work \(em a directory that is gone,
+credentials that are refused \(em fails the runtime. A target that stops
+answering holds up its own queue and no other's.
+.PP
+.B "Its figures"
+(\fBsocketley stats\fR) are
+.BR mode ,
+.BR dir ,
+.B indexed
+(files the index holds),
+.BR carried ,
+.BR removed ,
+.BR bytes_carried ,
+.B waiting
+(what is queued),
+.BR failures ,
+.B last_run_secs
+and
+.BR last_error .
 .SH REGISTERED TYPES
-A runtime type beyond the built-in five is delivered as a manifest plus a
+A runtime type beyond the built-in seven is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never
 code \(em to learn the type's name, its worker executable, and the schema of
 its configuration keys; the behaviour lives in the binary, which the daemon

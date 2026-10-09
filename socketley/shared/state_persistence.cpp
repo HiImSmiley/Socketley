@@ -9,6 +9,7 @@
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
+#include "../runtime/sync/sync_instance.h"
 #include "../cli/command_hashing.h"
 #include "type_registry.h"
 
@@ -798,6 +799,18 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.dns_rrl = d->get_rrl();
             break;
         }
+        case runtime_sync:
+        {
+            auto* sy = static_cast<const sync_instance*>(instance);
+            cfg.sync_dir = std::string(sy->get_dir());
+            cfg.sync_storage = std::string(sy->get_storage());
+            cfg.sync_prefix = std::string(sy->get_prefix());
+            cfg.sync_credentials = std::string(sy->get_credentials());
+            cfg.sync_exclude = std::string(sy->get_exclude());
+            cfg.sync_every = sy->get_every();
+            cfg.mode = static_cast<uint8_t>(sy->get_mode());
+            break;
+        }
         case runtime_storage:
         {
             auto* stg = static_cast<const storage_instance*>(instance);
@@ -1142,6 +1155,18 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("proxy", cfg.dns_proxy);
             append_int_field("rrl", cfg.dns_rrl);
             break;
+        case runtime_sync:
+            append_str_field("mode", sync_mode_name(static_cast<sync_mode>(cfg.mode)));
+            append_str_field("dir", cfg.sync_dir);
+            append_str_field("storage", cfg.sync_storage);
+            if (!cfg.sync_prefix.empty())
+                append_str_field("prefix", cfg.sync_prefix);
+            if (!cfg.sync_credentials.empty())
+                append_str_field("credentials", cfg.sync_credentials);
+            if (!cfg.sync_exclude.empty())
+                append_str_field("exclude", cfg.sync_exclude);
+            append_int_field("every", cfg.sync_every);
+            break;
     }
 
     // A registered type's fields as one nested object, absent when there are
@@ -1335,6 +1360,19 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.dns_proxy = json_get_string(json, "proxy");
             cfg.dns_rrl = json_get_uint32(json, "rrl", 100);
             break;
+        case runtime_sync:
+        {
+            sync_mode m = sync_mode_out;
+            parse_sync_runtime_mode(json_get_string(json, "mode"), m);
+            cfg.mode = static_cast<uint8_t>(m);
+            cfg.sync_dir = json_get_string(json, "dir");
+            cfg.sync_storage = json_get_string(json, "storage");
+            cfg.sync_prefix = json_get_string(json, "prefix");
+            cfg.sync_credentials = json_get_string(json, "credentials");
+            cfg.sync_exclude = json_get_string(json, "exclude");
+            cfg.sync_every = json_get_uint32(json, "every", sync_default_every);
+            break;
+        }
     }
 
     json_get_extra(json, cfg.extra);

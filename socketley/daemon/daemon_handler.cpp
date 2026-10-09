@@ -16,6 +16,7 @@
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
+#include "../runtime/sync/sync_instance.h"
 #include "../shared/dns_feed.h"
 #include "../shared/runtime_names.h"
 #include "../shared/cert_keeper.h"
@@ -1488,6 +1489,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                     break;
                 case runtime_dns:
                     result = parse_dns_flags(static_cast<dns_instance*>(instance), pa, i, name);
+                    break;
+                case runtime_sync:
+                    result = parse_sync_flags(static_cast<sync_instance*>(instance), pa, i, name);
                     break;
                 default:
                     // A registered type's flags come from its manifest schema.
@@ -3782,8 +3786,9 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                     break;
                 case runtime_storage:
                 case runtime_dns:
-                    // A storage or DNS runtime's own settings are applied by
-                    // `import`, as a cache's are.
+                case runtime_sync:
+                    // A storage, DNS or sync runtime's own settings are applied
+                    // by `import`, as a cache's are.
                     result = -1;
                     break;
                 default:
@@ -4621,6 +4626,11 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         case runtime_dns:
         {
             apply_dns_config(*static_cast<dns_instance*>(instance), cfg, /*by_presence=*/true);
+            break;
+        }
+        case runtime_sync:
+        {
+            apply_sync_config(*static_cast<sync_instance*>(instance), cfg, /*by_presence=*/true);
             break;
         }
         default:

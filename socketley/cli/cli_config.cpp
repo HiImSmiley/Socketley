@@ -137,6 +137,13 @@ constexpr config_key config_keys[] = {
     { "publish",            "--publish",            key_kind::list    },
     { "proxy",              "--proxy",              key_kind::text    },
     { "rrl",                "--rrl",                key_kind::integer },
+
+    // ── sync ────────────────────────────────────────────────────────────────
+    // dir, credentials and mode are above, shared with the storage and the server's.
+    { "storage",            "--storage",            key_kind::list    },
+    { "prefix",             "--prefix",             key_kind::text    },
+    { "exclude",            "--exclude",            key_kind::list    },
+    { "every",              "--every",              key_kind::scalar  },
 };
 
 // Keys with no flag of their own, listed so an unknown key can still be

@@ -50,6 +50,7 @@ bool builtin_lookup(std::string_view name, runtime_type& out)
     if (name == "cache")  { out = runtime_cache;  return true; }
     if (name == "storage") { out = runtime_storage; return true; }
     if (name == "dns")     { out = runtime_dns;     return true; }
+    if (name == "sync")    { out = runtime_sync;    return true; }
     return false;
 }
 
@@ -176,6 +177,7 @@ const char* type_to_string(runtime_type t)
         case runtime_cache:  return "cache";
         case runtime_storage: return "storage";
         case runtime_dns:     return "dns";
+        case runtime_sync:    return "sync";
         default: break;
     }
 

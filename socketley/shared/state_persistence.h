@@ -192,6 +192,15 @@ struct runtime_config
     // Written always, since 0 is a setting (no rate limit) and not "not given".
     uint32_t dns_rrl = 100;
 
+    // Sync
+    std::string sync_dir;
+    std::string sync_storage;
+    std::string sync_prefix;
+    std::string sync_credentials;
+    std::string sync_exclude;
+    // Written always, since 0 is a setting (walk only when told) and not "not given".
+    uint32_t sync_every = 3600;
+
     // A registered type's own fields in declaration order, opaque here, held
     // as strings because the schema that gives them kinds lives in a manifest.
     std::vector<std::pair<std::string, std::string>> extra;

@@ -8,7 +8,7 @@ namespace runtime_schema
 namespace
 {
 
-// The types a flag is offered for, one letter each: Server, Client, Proxy, cache (K), sTorage, Dns.
+// The types a flag is offered for, one letter each: Server, Client, Proxy, cache (K), sTorage, Dns, sYnc.
 struct row
 {
     std::string_view flag, types, kind, label, help, section, choices = {}, placeholder = {}, aliases = {};
@@ -132,6 +132,15 @@ constexpr row rows[] = {
     {"--transfer", "D", "list", "Transfer to", "Addresses that may copy the zones (AXFR): secondaries.", "DNS", {}, "203.0.113.53"},
     {"--notify", "D", "list", "Notify", "Secondaries told of each change.", "DNS", {}, "203.0.113.53"},
     {"--rrl", "D", "int", "Rate limit", "Answers a second to one network; 0 for none.", "DNS", {}, "100"},
+
+    // ── sync ────────────────────────────────────────────────────────────────
+    {"--dir", "Y", "path", "Directory", "The directory whose files are carried. Required.", "Sync", {}, "/srv/photos"},
+    {"--storage", "Y", "list", "Storage", "Where they go: a runtime and a bucket, or a URL and one. Required.", "Sync", {}, "ui/photos"},
+    {"--mode", "Y", "choice", "Direction", "Who carries; only out is carried so far.", "Sync", "out"},
+    {"--credentials", "Y", "path", "Credentials", "A file holding access_key and secret_key. Required.", "Sync", {}, "/etc/socketley/sync.creds"},
+    {"--prefix", "Y", "text", "Prefix", "The key everything is written under, below the bucket.", "Sync", {}, "laptop/"},
+    {"--every", "Y", "text", "Walk every", "How often the whole directory is walked; never for only on a change.", "Sync", {}, "1h"},
+    {"--exclude", "Y", "list", "Exclude", "Patterns not carried, against the path below the directory.", "Sync", {}, "*.tmp, .git/*"},
 };
 
 void quote(std::string& o, std::string_view v)
@@ -164,7 +173,7 @@ const std::string& json()
             for (char t : r.types)
             {
                 const char* name = t == 'S' ? "server" : t == 'C' ? "client" : t == 'P' ? "proxy" : t == 'K' ? "cache"
-                                 : t == 'T' ? "storage" : "dns";
+                                 : t == 'T' ? "storage" : t == 'Y' ? "sync" : "dns";
                 o += f2 ? "" : ",";
                 f2 = false;
                 quote(o, name);

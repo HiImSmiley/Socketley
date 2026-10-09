@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A `sync` runtime, which carries a directory to a storage.** One runtime is
+  one job, so a job that fails is a runtime that failed, with its reason in the
+  log, its alert and its own line in `socketley ls`; `--shards` is refused,
+  since the shards would share no socket and would write one index from several
+  processes. `--storage` takes a runtime of this daemon and a bucket
+  (`ui/photos`, whose port comes out of the map the daemon sends every worker),
+  a host and a port, or a URL -- more than one only with `--mode out`, since
+  carrying two into one directory cannot say which a file came from. `--mode`
+  is the server's and the client's three words, `out`, `in` and `inout`, of
+  which only `out` is carried so far and the other two are refused when a job
+  is made rather than at its first start. With `--prefix`, `--exclude` and
+  `--every`. It keeps an index of what it last carried in the state directory,
+  written before the change it records is called done, so a file deleted here
+  is taken off the far side and one that never arrived is sent; a record cut
+  short by a crash costs that record alone.
+
 - **`socketley git-sync` and `socketley ping` in the interactive help.** Both
   were dispatched by the CLI and documented in the manual, and neither appeared
   in `socketley-help.sh`, so a reader who ran it to see what the binary does was

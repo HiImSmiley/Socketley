@@ -2989,6 +2989,7 @@ void lua_context::register_bindings(runtime_instance* owner)
             break;
         case runtime_storage:
         case runtime_dns:
+        case runtime_sync:
             // No verbs of their own yet.
             break;
     }

@@ -9,6 +9,7 @@ class cache_instance;
 class proxy_instance;
 class storage_instance;
 class dns_instance;
+class sync_instance;
 class runtime_instance;
 struct runtime_config;
 
@@ -39,6 +40,9 @@ void apply_dns_config(dns_instance& dns, const runtime_config& cfg, bool by_pres
 
 void apply_storage_config(storage_instance& stg, const runtime_config& cfg,
                           bool by_presence = false);
+
+// A sync runtime's directory, targets, mode and schedule, the same way.
+void apply_sync_config(sync_instance& sy, const runtime_config& cfg, bool by_presence = false);
 
 // The fields every type has; not the ring settings, and not --lua, whose
 // failure to load means different things to a daemon and to a worker.

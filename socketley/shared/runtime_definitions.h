@@ -18,10 +18,11 @@ enum runtime_type : uint8_t
     runtime_proxy  = 2,
     runtime_cache  = 3,
     runtime_storage = 4,
-    runtime_dns     = 5
+    runtime_dns     = 5,
+    runtime_sync    = 6
 };
 
-// The five names, once.  Five places had this switch -- lua_context,
+// The names, once.  Five places had this switch -- lua_context,
 // cluster_discovery, metrics_endpoint, daemon_handler's ps --json, and the
 // --log file that was about to be the fifth -- all returning the same four
 // strings, which is exactly the shape a state renamed in one of them would
@@ -66,6 +67,12 @@ inline std::string shards_config_refusal(runtime_type type,
                "has no listening socket to share, so N of them would be N "
                "connections to the peer -- a different feature wearing this "
                "flag's name\n";
+
+    // The same shape of refusal as the client's, with a worse ending: N shards share no socket here either, and the
+    // index of what was last carried is one file, so N of them would overwrite each other's record of the last run.
+    if (type == runtime_sync)
+        return "--shards is not available on a sync: it listens on nothing to share, and N of them would carry the "
+               "same files over each other and write one index from N processes\n";
 
     // --listen used to be refused here, on the grounds that N processes
     // binding one path unlink each other's node.  That is true of one path and

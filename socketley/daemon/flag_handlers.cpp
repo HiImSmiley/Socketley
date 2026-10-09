@@ -19,6 +19,7 @@
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
+#include "../runtime/sync/sync_instance.h"
 #include "../shared/ip_block.h"
 #include "../shared/dns_feed.h"
 #include "../runtime/storage/s3_vhost.h"
@@ -1519,6 +1520,101 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
             }
             ++i;
             dns->set_rrl(n);
+            return 0;
+        }
+        default:
+            return -1;
+    }
+}
+
+int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::string_view /*name*/)
+{
+    switch (pa.hashes[i])
+    {
+        // The directory whose files are carried, which must be there when the runtime starts.
+        case fnv1a("--dir"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].front() != '/')
+            {
+                std::cout << "--dir requires the absolute path of the directory whose files are carried\n";
+                return 1;
+            }
+            sy->set_dir(pa.args[++i]);
+            return 0;
+        }
+        // Where they go: a runtime of this daemon and a bucket, or a URL and a bucket; more than one, comma-separated.
+        case fnv1a("--storage"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].find('/') == std::string_view::npos)
+            {
+                std::cout << "--storage requires a runtime and a bucket (ui/photos), or a URL and one "
+                             "(https://storage.example/photos)\n";
+                return 1;
+            }
+            sy->set_storage(pa.args[++i]);
+            return 0;
+        }
+        // The key everything is written under, beneath the bucket.
+        case fnv1a("--prefix"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].front() == '/')
+            {
+                std::cout << "--prefix requires a key below the bucket, without a leading slash\n";
+                return 1;
+            }
+            sy->set_prefix(pa.args[++i]);
+            return 0;
+        }
+        // The file access_key and secret_key are read from; --token writes one of these and names it.
+        case fnv1a("--credentials"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << "--credentials requires the path of a file holding access_key and secret_key\n";
+                return 1;
+            }
+            sy->set_credentials(pa.args[++i]);
+            return 0;
+        }
+        case fnv1a("--mode"):
+        {
+            sync_mode m{};
+            if (i + 1 >= pa.count || !parse_sync_runtime_mode(pa.args[i + 1], m))
+            {
+                std::cout << "--mode requires out (the directory to the storage), in (the storage to the "
+                             "directory) or inout (both)\n";
+                return 1;
+            }
+            ++i;
+            sy->set_mode(m);
+            return 0;
+        }
+        // How often the whole directory is walked; `never` walks it once at a start and then only when told.
+        case fnv1a("--every"):
+        {
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            uint64_t secs = 0;
+            if (v == "never")
+                secs = 0;
+            else if (v.empty() || parse_duration_seconds(v, 365ull * 24 * 3600, secs) != duration_parse::ok)
+            {
+                std::cout << "--every requires how often the whole directory is walked, as 30s, 10m, 1h or 1d, "
+                             "or never\n";
+                return 1;
+            }
+            ++i;
+            sy->set_every(static_cast<uint32_t>(secs));
+            return 0;
+        }
+        // Shell patterns matched against the path below --dir.
+        case fnv1a("--exclude"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << "--exclude requires patterns such as '*.tmp,.git/*', comma-separated\n";
+                return 1;
+            }
+            sy->set_exclude(pa.args[++i]);
             return 0;
         }
         default:

@@ -2338,6 +2338,39 @@ project "test_storage_inflate"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+project "test_sync_index"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    links { "dl" }
+
+    files { "test/unit/test_sync_index.cpp", "socketley/runtime/sync/sync_index.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 project "test_storage_shards"
     kind "ConsoleApp"
     language "C++"
