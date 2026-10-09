@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "../shared/cert_keeper.h"
+#include "../shared/https_client.h"
 #include "../shared/dns_feed.h"
 #include "../shared/tls_context.h"
 #include "../runtime/storage/json_doc.h"
@@ -112,167 +113,17 @@ std::string str(const jvalue& o, std::string_view n)
 
 // ─── HTTPS, one request per connection ──────────────────────────────────────
 
-struct reply
-{
-    int status{0};
-    std::vector<std::pair<std::string, std::string>> headers;
-    std::string body;
-    std::string header(std::string_view name) const
-    {
-        for (const auto& [k, v] : headers)
-            if (k.size() == name.size() && strncasecmp(k.data(), name.data(), k.size()) == 0)
-                return v;
-        return {};
-    }
-};
-
-class https
+// The ACME server's, trusting a test CA's root when SOCKETLEY_ACME_CA names one, as Pebble's is.
+class https : public https_client::client
 {
 public:
     bool init(std::string& err)
     {
-        m_ctx = SSL_CTX_new(TLS_client_method());
-        if (!m_ctx)
-            return fail(err, "no TLS context");
-        SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION);
-        SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
-        // A test CA's root, as Pebble's is, or the system's roots for a public one.
         const char* ca = std::getenv("SOCKETLEY_ACME_CA");
-        const bool ok = ca && *ca ? SSL_CTX_load_verify_locations(m_ctx, ca, nullptr) == 1
-                                  : tls_context::load_system_roots(m_ctx) == 1;
-        return ok || fail(err, std::string("the CA's trust roots could not be loaded") + (ca && *ca ? std::string(": ") + ca : ""));
+        return client::init(err, ca && *ca ? ca : "", "socketley-acme");
     }
-    ~https()
-    {
-        if (m_ctx)
-            SSL_CTX_free(m_ctx);
-    }
-
-    bool request(std::string_view method, const std::string& url, std::string_view type, std::string_view body, reply& out,
-                 std::string& err)
-    {
-        std::string_view u = url;
-        if (!u.starts_with("https://"))
-            return fail(err, "not an https URL: " + url);
-        u.remove_prefix(8);
-        const size_t slash = u.find('/');
-        std::string hostport(u.substr(0, slash)), path(slash == std::string_view::npos ? "/" : u.substr(slash));
-        std::string host = hostport, port = "443";
-        if (const size_t colon = hostport.rfind(':'); colon != std::string::npos && hostport.find(']') == std::string::npos)
-        {
-            host = hostport.substr(0, colon);
-            port = hostport.substr(colon + 1);
-        }
-        addrinfo hints{}, *res = nullptr;
-        hints.ai_socktype = SOCK_STREAM;
-        if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res)
-            return fail(err, "cannot resolve " + host);
-        int fd = -1;
-        for (addrinfo* a = res; a && fd < 0; a = a->ai_next)
-        {
-            fd = ::socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
-            if (fd < 0)
-                continue;
-            timeval tv{30, 0};
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-            if (::connect(fd, a->ai_addr, a->ai_addrlen) != 0)
-            {
-                ::close(fd);
-                fd = -1;
-            }
-        }
-        freeaddrinfo(res);
-        if (fd < 0)
-            return fail(err, "cannot connect to " + hostport);
-        SSL* ssl = SSL_new(m_ctx);
-        SSL_set_fd(ssl, fd);
-        SSL_set_tlsext_host_name(ssl, host.c_str());
-        SSL_set1_host(ssl, host.c_str());
-        bool ok = SSL_connect(ssl) == 1;
-        if (!ok)
-        {
-            const unsigned long e = ERR_get_error();
-            const char* why = e ? ERR_reason_error_string(e) : nullptr;
-            err = "TLS to " + hostport + " failed: " + (why ? why : "the handshake did not complete");
-        }
-        std::string req;
-        if (ok)
-        {
-            req = std::string(method) + " " + path + " HTTP/1.1\r\nHost: " + hostport +
-                  "\r\nUser-Agent: socketley-acme\r\nAccept: */*\r\nConnection: close\r\n";
-            if (!type.empty())
-                req += "Content-Type: " + std::string(type) + "\r\n";
-            req += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
-            req += body;
-            ok = SSL_write(ssl, req.data(), static_cast<int>(req.size())) == static_cast<int>(req.size());
-            if (!ok)
-                err = "sending to " + hostport + " failed";
-        }
-        std::string raw;
-        while (ok)
-        {
-            char buf[16384];
-            const int n = SSL_read(ssl, buf, sizeof buf);
-            if (n <= 0)
-                break;
-            raw.append(buf, static_cast<size_t>(n));
-        }
-        SSL_free(ssl);
-        ::close(fd);
-        ERR_clear_error();
-        return ok && parse(raw, out, err);
-    }
-
-private:
-    static bool fail(std::string& err, std::string why)
-    {
-        err = std::move(why);
-        return false;
-    }
-    static bool parse(const std::string& raw, reply& out, std::string& err)
-    {
-        const size_t end = raw.find("\r\n\r\n");
-        if (end == std::string::npos || raw.size() < 12)
-            return fail(err, "no HTTP answer");
-        out.status = std::atoi(raw.c_str() + 9);
-        size_t pos = raw.find("\r\n") + 2;
-        while (pos < end)
-        {
-            const size_t eol = raw.find("\r\n", pos);
-            const std::string line = raw.substr(pos, eol - pos);
-            if (const size_t colon = line.find(':'); colon != std::string::npos)
-            {
-                size_t v = colon + 1;
-                while (v < line.size() && line[v] == ' ')
-                    ++v;
-                out.headers.emplace_back(line.substr(0, colon), line.substr(v));
-            }
-            pos = eol + 2;
-        }
-        std::string body = raw.substr(end + 4);
-        if (strncasecmp(out.header("transfer-encoding").c_str(), "chunked", 7) == 0)
-        {
-            std::string plain;
-            size_t p = 0;
-            while (p < body.size())
-            {
-                const size_t eol = body.find("\r\n", p);
-                if (eol == std::string::npos)
-                    break;
-                const size_t n = std::strtoul(body.c_str() + p, nullptr, 16);
-                if (n == 0)
-                    break;
-                plain.append(body, eol + 2, n);
-                p = eol + 2 + n + 2;
-            }
-            body = std::move(plain);
-        }
-        out.body = std::move(body);
-        return true;
-    }
-    SSL_CTX* m_ctx{nullptr};
 };
+using reply = https_client::reply;
 
 // ─── Keys and signatures ────────────────────────────────────────────────────
 

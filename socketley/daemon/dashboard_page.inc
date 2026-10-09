@@ -23,6 +23,15 @@ constexpr std::string_view dashboard_page = R"HTML(<!doctype html>
 .tile svg.spark line.x{stroke:var(--fg);stroke-width:1;opacity:.45;vector-effect:non-scaling-stroke}
 .tile .tip{position:absolute;right:12px;top:12px;font-size:12px;background:rgba(0,0,0,.55);border:1px solid var(--line);border-radius:8px;padding:3px 9px;pointer-events:none;font-variant-numeric:tabular-nums;white-space:nowrap}
 .tile .tip i{font-style:normal;color:var(--mut)}
+.nav .cnt{margin-left:auto;font-size:11px;font-weight:700;min-width:20px;text-align:center;padding:1px 7px;border-radius:999px;background:var(--warn);color:#1a1300}
+.nav .cnt.crit{background:var(--bad);color:#fff}
+.kv.prose .v{font-family:inherit;font-size:13.5px}
+.al{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;border:1px solid var(--line);border-left:3px solid var(--warn);border-radius:12px;background:rgba(251,191,36,.06);margin-bottom:8px}
+.al.critical{border-left-color:var(--bad);background:rgba(251,88,118,.07)}
+.al .i{flex:none;color:var(--warn);margin-top:1px}.al.critical .i{color:var(--bad)}
+.al b{display:block;font-size:14px}.al .d{font-size:12.5px;color:var(--mut);margin-top:3px;word-break:break-word}
+.al .w{margin-left:auto;font-size:12px;color:var(--dim);white-space:nowrap}
+.al.clear{border-left-color:var(--ok);background:rgba(52,211,153,.05)}.al.clear .i{color:var(--ok)}
 .rng{display:inline-flex;margin-left:auto;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:rgba(255,255,255,.03)}
 .rng button{background:none;border:0;color:var(--mut);font:inherit;font-size:12.5px;font-weight:600;padding:6px 12px;cursor:pointer}
 .rng button.on{background:rgba(255,255,255,.1);color:var(--fg)}
@@ -108,6 +117,7 @@ textarea.inp{height:auto;min-height:260px;padding:12px;font-family:var(--mono);f
     <button class="nav" id="nNew"></button>
     <button class="nav" id="nLogs"></button>
     <button class="nav" id="nDom"></button>
+    <button class="nav" id="nAl"></button>
     <div class="sh">Runtimes</div>
     <div id="rlist"></div>
     <div class="themes" id="themes"></div>
@@ -130,6 +140,7 @@ textarea.inp{height:auto;min-height:260px;padding:12px;font-family:var(--mono);f
 // ─── the dashboard ──────────────────────────────────────────────────────────
 Object.assign(P, {
   pulse: '<path d="M3 12h4l2.5-6 4 12 2.5-6H21"/>',
+  bell: '<path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2.2 2.2 0 0 0 4 0"/>',
   lock: '<rect x="5" y="10.5" width="14" height="10" rx="2.2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/>',
   server: '<rect x="3.5" y="4" width="17" height="6.5" rx="1.8"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="1.8"/><path d="M7 7.2h.01M7 16.8h.01"/>',
   client: '<path d="M4 17V7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v10"/><path d="M2 19h20"/>',
@@ -196,6 +207,7 @@ const cur = { msg: 0, bin: 0, bout: 0, cpu: 0 };
 const RANGES = [[900, '15m'], [3600, '1h'], [21600, '6h'], [86400, '24h']];
 let range = +localStorage.getItem('skl_range') || 900, hover = null;
 const series = {};
+let alerts = { active: [], recent: [], webhook: false };
 const prev = { t: 0, msg: 0, bin: 0, bout: 0, cpu: 0, per: {} };
 
 async function api(method, url, body) {
@@ -242,6 +254,7 @@ function route() {
   else if (h === 'runtimes') view = { at: 'rts' };
   else if (h.startsWith('logs')) view = { at: 'logs', runtime: decodeURIComponent(h.slice(5)) };
   else if (h === 'domains') view = { at: 'dom' };
+  else if (h === 'alerts') view = { at: 'al' };
   else if (h.startsWith('new')) view = { at: 'new', type: decodeURIComponent(h.slice(4)) || '' };
   else view = { at: 'over' };
   while (layers.length) layers[layers.length - 1].close();
@@ -260,6 +273,8 @@ function side() {
   nav($('#nNew'), 'plus', 'New runtime', view.at === 'new', () => go('#/new'));
   nav($('#nLogs'), 'text', 'Logs', view.at === 'logs', () => go('#/logs'));
   nav($('#nDom'), 'dns', 'Domains', view.at === 'dom', () => go('#/domains'));
+  nav($('#nAl'), 'bell', 'Alerts', view.at === 'al', () => go('#/alerts'));
+  if (alerts.active.length) $('#nAl').append(el('span', { class: 'cnt' + (alerts.active.some(a => a.level === 'critical') ? ' crit' : ''), text: String(alerts.active.length) }));
   nav($('#nOut'), 'out', me && me.user ? 'Sign out · ' + me.user : 'Sign out', false, signOut);
   $('#nNew').hidden = !(me && me.user);
   paintThemes();
@@ -281,7 +296,9 @@ function crumbs(parts) {
 async function poll() {
   clearTimeout(timer);
   try {
-    const [o, r] = await Promise.all([api('GET', '/api/overview').then(must).then(x => x.json()), api('GET', '/api/runtimes').then(must).then(x => x.json())]);
+    const [o, r, al] = await Promise.all([api('GET', '/api/overview').then(must).then(x => x.json()), api('GET', '/api/runtimes').then(must).then(x => x.json()),
+      api('GET', '/api/alerts').then(x => x.ok ? x.json() : alerts).catch(() => alerts)]);
+    alerts = al;
     const now = Date.now() / 1000, dt = prev.t ? now - prev.t : 0;
     if (dt > 0) {
       cur.msg = Math.max(0, (o.messages_total - prev.msg) / dt); cur.bin = Math.max(0, (o.bytes_in - prev.bin) / dt); cur.bout = Math.max(0, (o.bytes_out - prev.bout) / dt);
@@ -380,6 +397,7 @@ function render(full) {
   if (view.at === 'new' && full) return create();
   if (view.at === 'logs' && full) return logsView();
   if (view.at === 'dom' && full) return domains();
+  if (view.at === 'al') return alertsView();
 }
 function overview() {
   crumbs([]);
@@ -387,6 +405,8 @@ function overview() {
   if (!over) { C.append(el('div', { class: 'spin' })); return; }
   const running = rts.filter(r => r.state === 'running').length, failed = rts.filter(r => r.state === 'failed').length;
   const cpus = over.cpus || 1, pct = v => v.toFixed(1) + ' %';
+  if (alerts.active.length) C.append(el('section', { class: 'sec' }, ...alerts.active.slice(0, 4).map(a => alertRow(a)),
+    alerts.active.length > 4 ? el('button', { class: 'btn sm', onclick: () => go('#/alerts') }, el('span', { text: 'All ' + alerts.active.length + ' alerts' })) : null));
   C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('pulse')), el('span', { text: 'Daemon' }), el('span', { class: 'n', text: 'v' + over.version + ' · up ' + ago(over.uptime_seconds) }), rangePick())),
     el('div', { class: 'tiles' },
       tile('server', 'Runtimes', running + ' / ' + over.runtimes_total, failed ? failed + ' failed' : running === over.runtimes_total ? 'all running' : (over.runtimes_total - running) + ' stopped'),
@@ -508,6 +528,38 @@ async function tailInto(box, st, runtime, keep, level, text) {
 
 // ─── domains ────────────────────────────────────────────────────────────────
 const daysOf = s => Math.floor(s / 86400);
+// One alert: what, why, since when -- or, in the history, when it was raised or cleared -- and its runtime's page a
+// click away.
+function alertRow(a, ev) {
+  const R = el('div', { class: 'al ' + (ev && !ev.raised ? 'clear' : a.level) }, ico(ev && !ev.raised ? 'check' : 'bell'),
+    el('div', { style: 'min-width:0' }, el('b', { text: a.title + (ev ? ev.raised ? ' — raised' : ' — cleared' : '') }), a.detail && !(ev && !ev.raised) ? el('div', { class: 'd', text: clean(a.detail) }) : null),
+    el('span', { class: 'w', text: ev ? new Date(ev.at * 1000).toLocaleString() : 'since ' + ago(Date.now() / 1000 - a.since) }));
+  if (a.runtime && rts.some(r => r.name === a.runtime)) { R.style.cursor = 'pointer'; R.onclick = () => go('#/runtime/' + encodeURIComponent(a.runtime)); }
+  return R;
+}
+function alertsView() {
+  crumbs([['Alerts', null]]);
+  const C = $('#content'); C.textContent = '';
+  const test = async () => {
+    try {
+      const r = await api('POST', '/api/alerts/test', {});
+      if (r.ok) toast('Sent: look for it where the hook posts.', 'check'); else toast(await r.text(), 'bad');
+    } catch (e) { fail(e); }
+  };
+  C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('bell')), el('span', { text: 'Alerts' }), el('span', { class: 'n', text: String(alerts.active.length) })),
+    alerts.active.length ? el('div', {}, ...alerts.active.map(a => alertRow(a))) : el('p', { class: 'mut', text: 'Nothing is wrong.' })));
+  C.append(el('div', { class: 'panel' }, el('h3', {}, ico('info'), el('span', { text: 'What is watched' })),
+    el('div', { class: 'kv prose' },
+      el('div', { class: 'k', text: 'Runtimes' }), el('div', { class: 'v', text: 'one that failed, and one started again three times within the hour' }),
+      el('div', { class: 'k', text: 'Certificates' }), el('div', { class: 'v', text: 'one that ends within two weeks, critical within three days' }),
+      el('div', { class: 'k', text: 'Space' }), el('div', { class: 'v', text: 'a storage runtime’s disk, the state directory’s and the host’s memory at 90 %, critical at 95 %' }),
+      el('div', { class: 'k', text: 'Limits' }), el('div', { class: 'v', text: 'a storage runtime at 90 % of --max-bytes, a cache that refuses writes at 90 % of its --maxmemory' }),
+      el('div', { class: 'k', text: 'Git' }), el('div', { class: 'v', text: 'a repository whose last pull failed' }),
+      el('div', { class: 'k', text: 'Webhook' }), el('div', { class: 'v' }, alerts.webhook ? 'set: each alert raised and cleared is posted to it' : 'none: set daemon.alert_webhook to a Discord, Slack, Telegram or any JSON hook',
+        alerts.webhook && me && me.user ? el('div', { style: 'margin-top:8px' }, btn('send', 'Send a test', test, 'sm')) : null))));
+  if (alerts.recent.length) C.append(el('section', { class: 'sec', style: 'margin-top:22px' }, el('h2', {}, el('span', { class: 'hb' }, ico('text')), el('span', { text: 'Recently' })),
+    ...alerts.recent.slice(0, 30).map(e => alertRow(e.alert, e))));
+}
 async function domains() {
   crumbs([['Domains', '#/domains']]);
   const C = $('#content'); C.textContent = '';

@@ -13694,6 +13694,40 @@ buckets, null for one without a point: an object of
 .BR rss ;
 the range is held between a minute and a day, the buckets between 10 and 1440.
 .IP
+Its Alerts say what is wrong, looked at every ten seconds whether a page is
+open or not: a runtime that failed, with the last line it wrote that says why,
+or was started again three times within the hour; a certificate a runtime
+serves that ends within two weeks (critical within three days, or once it has
+ended); the disk under a storage runtime or the state directory, or the host's
+memory, at 90% (critical at 95%); a storage runtime at 90% of its
+.B \-\-max\-bytes
+or a cache that refuses writes at 90% of its
+.BR \-\-maxmemory ;
+a git repository whose last pull failed. A level that comes and goes is raised
+after three readings and every alert is cleared after three without it; both
+are logged, listed on the page with the last hundred, shown on the overview,
+and \(em with
+.B daemon.alert_webhook
+set to an http or https URL \(em posted to it as JSON whose
+.B content
+and
+.B text
+carry the message, which Discord, Slack and Telegram's sendMessage read, and
+whose
+.B state
+.RB ( firing ,
+.BR resolved )
+and
+.B alert
+carry the rest. The alerts told of are kept in
+.B .alerts
+in the state directory, readable by the daemon's user alone, so a daemon
+started again does not tell of them a second time.
+.BR "GET /api/alerts" ,
+and
+.B POST /api/alerts/test
+with the page's header posts a test through the hook.
+.IP
 Its Logs follow the daemon's recent log live, filtered by runtime, by level and
 by text, and each runtime's page shows its own; a runtime that failed says the
 last warning or error it wrote, where it is listed and on its page, beside how
@@ -16056,6 +16090,8 @@ daemon = {
     metrics_port = 9100,     -- Prometheus metrics HTTP endpoint
     dashboard_credentials = "/etc/socketley/admin.creds",
                              -- the dashboard's admins sign in from here
+    alert_webhook = "https://discord.com/api/webhooks/...",
+                             -- where alerts are posted
     cpus = "0-3"             -- where this daemon's I/O runs
 }
 .fi

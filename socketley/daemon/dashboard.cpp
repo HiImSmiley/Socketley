@@ -455,37 +455,60 @@ std::string last_line_of(const std::string& path)
 // What a certificate file says of itself, as JSON members after `{`; empty when it is no certificate.
 std::string cert_json(const std::string& path)
 {
+    cert_facts c;
+    if (!read_cert(path, c))
+        return {};
+    std::string names;
+    for (const std::string& n : c.names)
+    {
+        if (!names.empty())
+            names += ',';
+        names += json_quote(n);
+    }
+    return "\"names\":[" + names + "],\"expires_in\":" + std::to_string(c.expires_in) + ",\"issuer\":" +
+           json_quote(c.issuer) + ",\"self_signed\":" + (c.self_signed ? "true" : "false");
+}
+
+}   // namespace
+
+bool read_cert(const std::string& path, cert_facts& c)
+{
     BIO* b = BIO_new_file(path.c_str(), "r");
     X509* x = b ? PEM_read_bio_X509(b, nullptr, nullptr, nullptr) : nullptr;
     if (b)
         BIO_free(b);
     ERR_clear_error();
     if (!x)
-        return {};
-    std::string names;
+        return false;
+    c = cert_facts{};
     if (auto* gens = static_cast<GENERAL_NAMES*>(X509_get_ext_d2i(x, NID_subject_alt_name, nullptr, nullptr)))
     {
         for (int i = 0; i < sk_GENERAL_NAME_num(gens); ++i)
             if (const GENERAL_NAME* g = sk_GENERAL_NAME_value(gens, i); g->type == GEN_DNS)
-                names += (names.empty() ? "" : ",") +
-                         json_quote(std::string_view(reinterpret_cast<const char*>(ASN1_STRING_get0_data(g->d.dNSName)),
-                                                     static_cast<size_t>(ASN1_STRING_length(g->d.dNSName))));
+                c.names.emplace_back(reinterpret_cast<const char*>(ASN1_STRING_get0_data(g->d.dNSName)),
+                                     static_cast<size_t>(ASN1_STRING_length(g->d.dNSName)));
         GENERAL_NAMES_free(gens);
     }
     int days = 0, secs = 0;
     ASN1_TIME_diff(&days, &secs, nullptr, X509_get0_notAfter(x));
+    c.expires_in = static_cast<int64_t>(days) * 86400 + secs;
     char issuer[256] = {};
     X509_NAME_get_text_by_NID(X509_get_issuer_name(x), NID_organizationName, issuer, sizeof issuer);
     if (!issuer[0])
         X509_NAME_get_text_by_NID(X509_get_issuer_name(x), NID_commonName, issuer, sizeof issuer);
-    const bool self = X509_check_issued(x, x) == X509_V_OK;
+    c.issuer = issuer;
+    c.self_signed = X509_check_issued(x, x) == X509_V_OK;
     X509_free(x);
-    const int64_t left = static_cast<int64_t>(days) * 86400 + secs;
-    return "\"names\":[" + names + "],\"expires_in\":" + std::to_string(left) + ",\"issuer\":" + json_quote(issuer) +
-           ",\"self_signed\":" + (self ? "true" : "false");
+    return true;
 }
 
-}   // namespace
+std::string served_cert(const runtime_instance& rt)
+{
+    std::string cert(rt.get_cert_path());
+    if (cert.empty() && !rt.get_acme_domains().empty())
+        cert = cert_keeper::acme_cert_path(rt.get_acme_domains().front());
+    return cert;
+}
 
 void server::edge(int fd, const request& r)
 {
@@ -509,13 +532,8 @@ void server::edge(int fd, const request& r)
             i.name = name;
             i.type = type_to_string(rt->get_type());
             i.tls = rt->get_tls();
-            i.cert.assign(rt->get_cert_path());
-            if (!rt->get_acme_domains().empty())
-            {
-                i.acme = true;
-                if (i.cert.empty())
-                    i.cert = cert_keeper::acme_cert_path(rt->get_acme_domains().front());
-            }
+            i.cert = served_cert(*rt);
+            i.acme = !rt->get_acme_domains().empty();
             const std::string bind(rt->get_bind_address());
             i.address = !rt->get_listen_path().empty() ? "unix:" + std::string(rt->get_listen_path())
                         : (bind.empty() || bind == "0.0.0.0" ? std::string("127.0.0.1") : bind) + ":" +

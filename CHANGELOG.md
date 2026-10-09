@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   zones, whose records it edits: checked as the runtime reads them before they
   are written, the serial raised when it was left alone.
 
+- **The daemon says what is wrong.** A runtime that failed or keeps being started
+  again, a certificate that ends within two weeks, a disk, the host's memory or
+  a runtime's own limit nearly full, and a git repository whose last pull
+  failed are raised as alerts, every ten seconds whether a page is open or not,
+  shown on the dashboard with their history and posted to `daemon.alert_webhook`
+  (Discord, Slack, Telegram or any JSON hook) once each, also across a restart.
+
 - **The daemon's dashboard runs the daemon.** The page on `metrics_port` is new,
   in the storage interface's look, whose stylesheet and helpers it takes from the
   same binary: an overview of runtimes, connections, messages, bytes, CPU and

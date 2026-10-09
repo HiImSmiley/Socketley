@@ -7,6 +7,7 @@
 #include <memory>
 
 #include "dashboard.h"
+#include "alerts.h"
 #include "history.h"
 
 class runtime_manager;
@@ -17,9 +18,16 @@ public:
     metrics_endpoint(runtime_manager& mgr);
     ~metrics_endpoint();
 
-    // `dashboard_credentials` is the file the dashboard's admins sign in from, empty for a read-only page;
-    // `history_path` the file the figures of the last day are kept in, empty to keep them in memory only.
-    bool start(uint16_t port, std::string dashboard_credentials = {}, std::string history_path = {});
+    struct options
+    {
+        // The file the dashboard's admins sign in from, empty for a read-only page.
+        std::string dashboard_credentials;
+        // Where the history and the alerts told of are kept, empty to keep them in memory only.
+        std::string state_dir;
+        // The URL alerts are posted to, empty for none.
+        std::string alert_webhook;
+    };
+    bool start(uint16_t port, options o = {});
     void stop();
 
 private:
@@ -29,12 +37,14 @@ private:
     std::string build_json_overview() const;
     std::string build_json_runtimes() const;
     std::string build_json_runtime(std::string_view name) const;
-    // Every runtime's figures and the daemon's, into the history.
+    // Every runtime's figures and the daemon's, into the history, and a look for what is wrong.
     void sample();
 
     runtime_manager& m_manager;
     std::unique_ptr<dashboard::server> m_dash;
     std::unique_ptr<history::keeper> m_history;
+    std::unique_ptr<alerts::monitor> m_alerts;
+    std::string m_state_dir;
     std::chrono::steady_clock::time_point m_next_sample{}, m_next_save{};
     int m_listen_fd{-1};
 

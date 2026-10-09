@@ -11,6 +11,7 @@
 #include "../shared/daemon_client.h"
 #include "../shared/fast_lo.h"
 #include "daemon_handler.h"
+#include "../runtime/storage/storage_instance.h"
 
 #include <unistd.h>
 #include <cerrno>
@@ -40,10 +41,13 @@ metrics_endpoint::~metrics_endpoint()
     stop();
 }
 
-bool metrics_endpoint::start(uint16_t port, std::string dashboard_credentials, std::string history_path)
+bool metrics_endpoint::start(uint16_t port, options o)
 {
-    m_dash = std::make_unique<dashboard::server>(std::move(dashboard_credentials), m_manager);
-    m_history = std::make_unique<history::keeper>(std::move(history_path));
+    m_dash = std::make_unique<dashboard::server>(std::move(o.dashboard_credentials), m_manager);
+    m_state_dir = o.state_dir;
+    m_history = std::make_unique<history::keeper>(o.state_dir.empty() ? std::string() : o.state_dir + "/.history");
+    m_alerts = std::make_unique<alerts::monitor>(o.state_dir.empty() ? std::string() : o.state_dir + "/.alerts",
+                                                 std::move(o.alert_webhook));
     m_history->load(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
     // SOCK_CLOEXEC because the daemon forks proxy workers, and with
     // SO_REUSEADDR but not SO_REUSEPORT an inherited copy keeps the metrics
@@ -300,6 +304,20 @@ void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)
             std::strtoll(dashboard::query_field(req.query, "range").c_str(), nullptr, 10),
             std::strtoul(dashboard::query_field(req.query, "points").c_str(), nullptr, 10));
         dashboard::send(fd, 200, "application/json", body.empty() ? std::string("{}") : body);
+        return;
+    }
+    if (path == "/api/alerts" || path == "/api/alerts/test")
+    {
+        if (!m_dash->may_read(req) || (path != "/api/alerts" && m_dash->session_of(req).empty()))
+            dashboard::send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
+        else if (path == "/api/alerts")
+            dashboard::send(fd, 200, "application/json", m_alerts->json());
+        else if (req.method != "POST" || req.header("x-socketley-dashboard") != "1")
+            dashboard::send(fd, 403, "text/plain; charset=utf-8", "A test comes from the dashboard's own page.\n");
+        else if (const std::string why = m_alerts->test(); why.empty())
+            dashboard::send(fd, 204, {}, {});
+        else
+            dashboard::send(fd, 502, "text/plain; charset=utf-8", why + "\n");
         return;
     }
     if (path.starts_with("/api/overview") || path.starts_with("/api/runtimes") || path.starts_with("/api/runtime/"))
@@ -985,6 +1003,7 @@ void metrics_endpoint::sample()
 {
     std::vector<std::pair<std::string, history::reading>> readings;
     std::vector<std::vector<pid_t>> pids;
+    std::vector<alerts::facts> facts;
     {
         std::shared_lock lock(m_manager.mutex);
         const auto& runtimes = m_manager.list();
@@ -999,6 +1018,28 @@ void metrics_endpoint::sample()
             r.bytes_out = f.bytes_out;
             readings.emplace_back(name, r);
             pids.push_back(rt->shard_pids());
+
+            alerts::facts a;
+            a.name = name;
+            a.type = type_to_string(rt->get_type());
+            a.failed = rt->get_state() == runtime_failed;
+            a.restarts = rt->restart_count();
+            a.cert = dashboard::served_cert(*rt);
+            // What it holds against its limit, from the same text the figures come from; a cache that evicts is
+            // full by design, so only one that refuses is watched.
+            const storage_row row = parse_storage_row(name, rt->stat_detail_snapshot());
+            if (rt->get_type() == runtime_storage)
+            {
+                a.dir.assign(static_cast<const storage_instance*>(rt.get())->get_dir());
+                row.get("bytes", a.used);
+                row.get("max_bytes", a.limit);
+            }
+            else if (uint64_t ev = 1; rt->get_type() == runtime_cache && row.get("eviction", ev) && ev == 0)
+            {
+                row.get("memory_used", a.used);
+                row.get("max_memory", a.limit);
+            }
+            facts.push_back(std::move(a));
         }
     }
     // The daemon's own is the sum of its runtimes', its own process added to theirs.
@@ -1020,7 +1061,9 @@ void metrics_endpoint::sample()
     all.cpu_seconds = u.cpu_seconds;
     all.rss_bytes = u.rss_bytes;
     readings.emplace_back(std::string(), all);
-    m_history->record(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(), readings);
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    m_history->record(now_ms, readings);
+    m_alerts->check(now_ms / 1000, facts, m_state_dir.empty() ? std::vector<std::string>{} : std::vector<std::string>{m_state_dir});
 }
 
 std::string metrics_endpoint::build_json_runtimes() const

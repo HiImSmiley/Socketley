@@ -54,6 +54,8 @@ struct daemon_config
     uint16_t    metrics_port = 0;
     // The credentials file the dashboard's admins sign in from.
     std::string dashboard_credentials;
+    // Where alerts are posted, empty for nowhere.
+    std::string alert_webhook;
     std::string name;
     std::string cluster;
     std::string cpus;
@@ -151,6 +153,10 @@ static daemon_config load_daemon_config(const std::string& config_path)
     sol::optional<std::string> dc = text("dashboard_credentials");
     if (dc && !dc->empty())
         out.dashboard_credentials = *dc;
+
+    sol::optional<std::string> hook = text("alert_webhook");
+    if (hook && !hook->empty())
+        out.alert_webhook = *hook;
 
     sol::optional<std::string> name = text("name");
     if (name && !name->empty())
@@ -860,7 +866,7 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     bool metrics_bound = false;
     if (metrics_port > 0)
     {
-        metrics_bound = metrics.start(metrics_port, config.dashboard_credentials, (paths.state_dir / ".history").string());
+        metrics_bound = metrics.start(metrics_port, {config.dashboard_credentials, paths.state_dir.string(), config.alert_webhook});
         if (metrics_bound)
             LOG_INFO("metrics endpoint started");
         else
