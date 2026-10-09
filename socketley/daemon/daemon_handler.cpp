@@ -1273,10 +1273,11 @@ int daemon_handler::check_empty_names(const std::vector<std::string>& names,
     return 0;
 }
 
-int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
+int daemon_handler::process_command(ipc_connection* conn, std::string& line)
 {
     parsed_args pa;
     pa.parse(line);
+    ipc_frame::restore_spaces(line);
     return process_parsed(conn, pa);
 }
 

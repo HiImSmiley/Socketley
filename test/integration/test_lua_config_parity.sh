@@ -159,19 +159,30 @@ OUT=$("$BIN" --lua "$WORK/shape.lua" 2>&1) || RC=$?
 if [ "$RC" -ne 0 ] && grep -q "port" <<<"$OUT"; then pass
 else fail "a port given as a string is refused" "exit $RC, said: ${OUT:-<nothing>}"; fi
 
-# ─── A value the wire cannot carry ──────────────────────────────────────────
+# ─── A value with a space in it ─────────────────────────────────────────────
 #
-# The daemon's command line splits on whitespace and has no quoting, so this
-# would have arrived as two arguments and set the password to "a".
+# The daemon's command line splits on whitespace; a space inside a value travels
+# as NUL, so this is one argument and not a log path of "$WORK/with" followed by
+# a stray word.
+mkdir -p "$WORK/with space"
 cat > "$WORK/space.lua" <<EOF
 runtimes = {
-  { type = "server", name = "lp_space", port = $((P + 7)), master_pw = "a b" },
+  { type = "proxy", name = "lp_space", port = $((P + 7)),
+    backends = {"127.0.0.1:$((P + 42))"}, log = "$WORK/with space/gw.log" },
 }
 EOF
 RC=0
 OUT=$("$BIN" --lua "$WORK/space.lua" 2>&1) || RC=$?
-if [ "$RC" -ne 0 ] && grep -qi "whitespace" <<<"$OUT"; then pass
-else fail "a value with a space is refused" "exit $RC, said: ${OUT:-<nothing>}"; fi
+if [ "$RC" -eq 0 ] && [ -z "$OUT" ]; then pass
+else fail "a value with a space is accepted" "exit $RC, said: ${OUT:-<nothing>}"; fi
+shows "and arrives as one argument" lp_space "with space/gw.log"
+
+# A tab still splits it, so it is refused rather than carried as two words.
+printf 'runtimes = {\n  { type = "server", name = "lp_tab", port = %d, master_pw = "a\tb" },\n}\n' $((P + 8)) > "$WORK/tab.lua"
+RC=0
+OUT=$("$BIN" --lua "$WORK/tab.lua" 2>&1) || RC=$?
+if [ "$RC" -ne 0 ] && grep -qi "tab" <<<"$OUT"; then pass
+else fail "a value with a tab is refused" "exit $RC, said: ${OUT:-<nothing>}"; fi
 
 # ─── The daemon's own refusal still reaches the operator ────────────────────
 #

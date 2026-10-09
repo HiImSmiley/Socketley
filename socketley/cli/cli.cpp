@@ -18,6 +18,7 @@
 #include "command_hashing.h"
 #include "../shared/command_usage.h"
 #include "../daemon/ipc_client.h"
+#include "../shared/ipc_framing.h"
 #include "../daemon/daemon_handler.h"
 #include "../runtime/worker/worker_main.h"
 #include "../shared/daemon_client.h"
@@ -831,7 +832,9 @@ int cli_forward(int argc, char** argv)
     {
         if (i > 1) command += ' ';
         if (opens_files && i > 2)
-            command += cli_caller_path(argv[i - 1], argv[i]);
+            ipc_frame::append_arg(command, cli_caller_path(argv[i - 1], argv[i]));
+        else if (i > 1)
+            ipc_frame::append_arg(command, argv[i]);
         else
             command += argv[i];
     }

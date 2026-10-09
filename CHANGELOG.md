@@ -20,7 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is the server's and the client's three words, `out`, `in` and `inout`, of
   which only `out` is carried so far and the other two are refused when a job
   is made rather than at its first start. With `--prefix`, `--exclude` and
-  `--every`. It keeps an index of what it last carried in the state directory,
+  `--every`; `--exclude` reads `'*.tmp, *.md, node_modules'` as a .gitignore
+  would, a pattern with no slash naming an entry at any depth, and does not
+  walk a directory it names.
+- **An argument with a space in it arrives as one.** The daemon's command line
+  is split on whitespace and had no quoting, so `--dir "/home/me/My Photos"`
+  arrived as `/home/me/My` and a stray `Photos`, refused as an unknown flag, and
+  a configuration file refused any value with a space. The CLI now sends a space
+  inside an argument as NUL, a byte no argv can hold, and the daemon puts it
+  back after splitting; every command without one is sent byte for byte as
+  before. A tab is still refused in a configuration file. It keeps an index of what it last carried in the state directory,
   written before the change it records is called done, so a file deleted here
   is taken off the far side and one that never arrived is sent; a record cut
   short by a crash costs that record alone.

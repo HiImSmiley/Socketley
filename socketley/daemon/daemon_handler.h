@@ -144,7 +144,7 @@ private:
     int check_empty_names(const std::vector<std::string>& names,
         const parsed_args& pa, const char* verb, ipc_connection* conn) const;
 
-    int process_command(ipc_connection* conn, std::string_view line);
+    int process_command(ipc_connection* conn, std::string& line);
     int process_parsed(ipc_connection* conn, const parsed_args& pa);
 
     // The switch, split out so process_command can read the exit code of the

@@ -80,4 +80,22 @@ inline take take_frame(std::string& buf, std::string& payload)
     return take::ok;
 }
 
+// A space inside one argument travels as NUL, which no argv can hold, so the daemon splits only where the shell did.
+inline constexpr char space_in_arg = '\0';
+
+// Never the first word: a line that began with NUL would be read as a frame.
+inline void append_arg(std::string& command, std::string_view arg)
+{
+    for (const char c : arg)
+        command += c == ' ' ? space_in_arg : c;
+}
+
+// After the split, so each argument gets back the spaces it was sent with.
+inline void restore_spaces(std::string& line)
+{
+    for (char& c : line)
+        if (c == space_in_arg)
+            c = ' ';
+}
+
 }   // namespace ipc_frame

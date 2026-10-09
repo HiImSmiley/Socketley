@@ -201,9 +201,14 @@ bool sync_run::start(std::string& why)
     for (size_t p = 0; p <= ex.size();)
     {
         const size_t comma = std::min(ex.find(',', p), ex.size());
-        std::string one(ex.substr(p, comma - p));
+        std::string_view one = ex.substr(p, comma - p);
+        // `*.tmp, *.md` is how a list is written by hand, and a pattern starting with a space matches nothing.
+        while (!one.empty() && (one.front() == ' ' || one.front() == '\t'))
+            one.remove_prefix(1);
+        while (!one.empty() && (one.back() == ' ' || one.back() == '\t'))
+            one.remove_suffix(1);
         if (!one.empty())
-            m_exclude.push_back(std::move(one));
+            m_exclude.emplace_back(one);
         p = comma + 1;
     }
 
@@ -240,9 +245,15 @@ size_t sync_run::open_connections() const
 
 bool sync_run::excluded(const std::string& rel) const
 {
+    const size_t slash = rel.rfind('/');
+    const char* base = rel.c_str() + (slash == std::string::npos ? 0 : slash + 1);
     for (const auto& pat : m_exclude)
-        if (::fnmatch(pat.c_str(), rel.c_str(), 0) == 0)
+    {
+        // A pattern with no slash names an entry at any depth, as a .gitignore line does.
+        const char* against = pat.find('/') == std::string::npos ? base : rel.c_str();
+        if (::fnmatch(pat.c_str(), against, 0) == 0)
             return true;
+    }
     return false;
 }
 
@@ -291,13 +302,16 @@ bool sync_run::walk_slice()
             return true;
         std::error_code ec;
         const fs::directory_entry& de = **m_iter;
+        std::string rel = de.path().string();
+        // The path below --dir, which is what the index keys by and what the key is built from.
+        if (rel.size() > root.size() + 1 && rel.compare(0, root.size(), root) == 0)
+            rel = rel.substr(root.size() + 1);
         const bool is_file = de.is_regular_file(ec) && !ec;
+        // An excluded directory is not walked at all, so `node_modules` or `.git` keeps its whole tree out.
+        if (!is_file && de.is_directory(ec) && !ec && excluded(rel))
+            m_iter->disable_recursion_pending();
         if (is_file)
         {
-            std::string rel = de.path().string();
-            // The path below --dir, which is what the index keys by and what the key is built from.
-            if (rel.size() > root.size() + 1 && rel.compare(0, root.size(), root) == 0)
-                rel = rel.substr(root.size() + 1);
             if (!excluded(rel))
             {
                 struct stat st{};

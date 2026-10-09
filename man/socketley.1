@@ -11216,9 +11216,16 @@ walks it once at a start and then only when something says a file changed. One
 hour by default.
 .TP
 .BI "\-\-exclude " pattern\fR[\fB,\fIpattern\fR...]
-Shell patterns matched against the path below
-.BR \-\-dir ;
-anything they match is not carried.
+Shell patterns, separated by commas, with spaces around them ignored:
+.BR "\(aq*.tmp, *.md, node_modules\(aq" .
+A pattern with no slash names a file or directory at any depth, as a
+.I .gitignore
+line does; one with a slash is matched against the whole path below
+.BR \-\-dir ,
+and its
+.B *
+crosses slashes. Anything matched is not carried, and a matched directory is
+not walked.
 .PP
 .B "What it remembers."
 A sync keeps an index of what it last carried, in
@@ -11532,9 +11539,10 @@ A key this list does not name is refused, naming it, rather than dropped in
 silence: a misspelled
 .B http_cache
 used to configure nothing while the runtime came up looking correct. A value of
-the wrong shape is refused the same way, and so is a value containing
-whitespace \(em the daemon's command line has no quoting, so a password with a
-space in it would arrive as two arguments.
+the wrong shape is refused the same way, and so is a value containing a tab
+\(em the daemon's command line splits on it, so a password with one in it
+would arrive as two arguments. A space is carried inside its value, as it is
+inside a quoted argument on the command line.
 .PP
 A key the daemon then refuses on that type \(em
 .B \-\-client\-ca

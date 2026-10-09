@@ -9,7 +9,8 @@
 #     --dir, --storage or --credentials not refused at create
 #   * a file in the directory not reaching the bucket, reaching it under the
 #     wrong key, or arriving with other bytes than it has here
-#   * a file below a subdirectory flattened, or one --exclude names carried
+#   * a file below a subdirectory flattened, or one --exclude names carried --
+#     after a space in the list, or below a directory it names
 #   * a file carried again on the next walk although nothing about it changed,
 #     which would send a whole directory every hour for ever
 #   * a changed file NOT carried again -- the failure a size-only check makes
@@ -61,6 +62,12 @@ until_st() { local i; for i in $(seq 1 "$1"); do [ "$(st "$2")" = "$3" ] && retu
 printf 'one\n' > "$T/src/a.txt"
 printf 'two\n' > "$T/src/sub/b.txt"
 printf 'nope\n' > "$T/src/c.tmp"
+mkdir -p "$T/src/node_modules/dep"
+printf 'nope\n' > "$T/src/notes.md"
+printf 'nope\n' > "$T/src/sub/old.md.bak"
+printf 'nope\n' > "$T/src/node_modules/dep/index.js"
+mkdir -p "$T/src/sub/node_modules"
+printf 'nope\n' > "$T/src/sub/node_modules/deep.js"
 cat > "$T/creds" <<EOF
 # the key this job signs with
 access_key = $KEY
@@ -86,10 +93,10 @@ expect "none of the refused ones was made" "$("$BIN" ls 2>/dev/null | grep -c ' 
 
 # ─── carrying ───────────────────────────────────────────────────────────────
 "$BIN" create sync up --dir "$T/src" --storage "box/photos" --credentials "$T/creds" \
-    --mode out --exclude '*.tmp' --every 2s -s >/dev/null 2>&1
+    --mode out --exclude '*.tmp, **.md*,node_modules' --every 2s -s >/dev/null 2>&1
 until_st 30 carried 2
 expect "the runtime runs and listens on no port" "$("$BIN" ls 2>/dev/null | grep ' up ' | grep -c 'sync')" 1
-expect "both files are carried, the excluded one is not" "$(keys)" "a.txt sub/b.txt"
+expect "both files are carried, none an --exclude pattern names" "$(keys)" "a.txt sub/b.txt"
 expect "a file's bytes arrive as they are here" "$(S "http://127.0.0.1:$P/photos/sub/b.txt")" two
 expect "and the index holds what was carried" "$(st indexed)" 2
 expect "with nothing waiting and nothing failed" "$(st waiting) $(st failures)" "0 0"
@@ -146,7 +153,7 @@ expect "and nothing of that job reached the bucket" "$(keys)" "a.txt byaddr/f.tx
 # ─── the configuration survives ─────────────────────────────────────────────
 expect "show says what it was made with" \
     "$("$BIN" show up 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["mode"], d["exclude"], d["every"])')" \
-    "out *.tmp 2"
+    "out *.tmp, **.md*,node_modules 2"
 "$BIN" remove no >/dev/null 2>&1
 "$BIN" remove pre >/dev/null 2>&1
 expect "a removed sync is gone" "$("$BIN" ls 2>/dev/null | grep -cE ' (no|pre) ')" 0

@@ -8,6 +8,7 @@
 
 #include "runtime_type_parser.h"
 #include "../daemon/ipc_client.h"
+#include "../shared/ipc_framing.h"
 #include "command_hashing.h"
 #include "../daemon/type_manifest.h"
 #include "../shared/paths.h"
@@ -162,15 +163,14 @@ std::string number_to_text(double v)
     return buf;
 }
 
-// The daemon's parser splits on whitespace and has no quoting, so a value with
-// a space in it would arrive as two arguments and configure something else.
+// A space travels inside its argument, a tab does not, so a value with one would arrive as two arguments.
 std::string refuse_whitespace(std::string_view key, const std::string& value)
 {
-    if (value.find_first_of(" \t") == std::string::npos)
+    if (value.find('\t') == std::string::npos)
         return {};
 
-    return std::string(key) + ": a value cannot contain whitespace, because the "
-           "daemon's command line has no quoting (\"" + value + "\")\n";
+    return std::string(key) + ": a value cannot contain a tab, because the "
+           "daemon's command line splits on it (\"" + value + "\")\n";
 }
 
 // One key, appended to the command or refused with the reason, returning the
@@ -224,7 +224,8 @@ std::string emit_key(const config_key& key, const sol::table& entry, std::string
             if (std::string why = refuse_whitespace(key.name, value); !why.empty())
                 return why;
 
-            command += " " + std::string(key.flag) + " " + value;
+            command += " " + std::string(key.flag) + " ";
+            ipc_frame::append_arg(command, value);
             return {};
         }
 
@@ -256,7 +257,10 @@ std::string emit_key(const config_key& key, const sol::table& entry, std::string
             // An empty list is the operator asking for nothing rather than for
             // a flag with no value, which the daemon would refuse.
             if (!joined.empty())
-                command += " " + std::string(key.flag) + " " + joined;
+            {
+                command += " " + std::string(key.flag) + " ";
+                ipc_frame::append_arg(command, joined);
+            }
             return {};
         }
     }
@@ -297,7 +301,8 @@ std::string emit_special_keys(const sol::table& entry, std::string& command, boo
                 return "config: the value is empty\n";
             if (std::string why = refuse_whitespace("config", value); !why.empty())
                 return why;
-            command += " --lua " + value;
+            command += " --lua ";
+            ipc_frame::append_arg(command, value);
         }
     }
 
