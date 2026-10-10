@@ -1721,7 +1721,12 @@ Load Lua orchestration configuration. Optionally configures daemon name
 and cluster mode, then creates multiple runtimes from a single config file.
 .SH DAEMON FLAGS
 These flags configure the running daemon via IPC commands. The daemon is
-auto-started if not already running.
+auto-started if not already running. One daemon serves a socket: it holds a
+lock on the socket's path with
+.B .lock
+appended for as long as it runs, and a second one started meanwhile \(em by
+hand, or by a command's auto-start \(em waits until the first answers and exits
+0, or exits 1 after ten seconds of a holder that never does.
 .TP
 .BI "\-\-name " "name" " | \-n " "name"
 Set this daemon's identity. Required before enabling cluster mode.

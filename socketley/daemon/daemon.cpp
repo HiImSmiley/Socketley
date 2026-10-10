@@ -27,6 +27,8 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <iostream>
@@ -739,6 +741,34 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // setenv between the fork and the exec would allocate in a child that must
     // not.
     export_log_level(logger::g_level);
+
+    // One daemon per socket, held by a lock for its whole life, since two started at once both found the path free
+    // and the second unlinked the first one's socket.
+    const std::string lock_path = daemon_handler::socket_path + ".lock";
+    const int lock_fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock_fd < 0)
+    {
+        std::cout << "not starting: " << lock_path << " could not be opened: " << std::strerror(errno) << "\n";
+        return 1;
+    }
+    // Another daemon holds it: one answering here is nothing to do, and one still starting or on its way out is
+    // waited for.
+    for (int waited_ms = 0; ::flock(lock_fd, LOCK_EX | LOCK_NB) != 0; waited_ms += 50)
+    {
+        if (daemon_handler::probe_socket() == daemon_handler::socket_state::ours)
+        {
+            ::close(lock_fd);
+            return 0;
+        }
+        if (waited_ms >= 10000)
+        {
+            std::cout << "not starting: another daemon holds " << lock_path
+                      << " and has not answered on its socket for ten seconds\n";
+            ::close(lock_fd);
+            return 1;
+        }
+        ::usleep(50000);
+    }
 
     // A daemon of ours already on this socket is nothing to do and exits 0, in
     // silence, because success is silent.  A socket we may not even connect to

@@ -246,11 +246,8 @@ for i in $(seq 1 40); do
     env HOME="$STALE_HOME" SOCKETLEY_SOCKET="$STALE_SOCK" "$BIN" ping >/dev/null 2>&1 && break
     sleep 0.15
 done
-SD=$(for p in $(pgrep -x socketley 2>/dev/null); do
-        [[ "$(readlink /proc/$p/exe 2>/dev/null)" == "$BIN" ]] || continue
-        grep -qs "SOCKETLEY_SOCKET=$STALE_SOCK" "/proc/$p/environ" 2>/dev/null || continue
-        tr '\0' ' ' < "/proc/$p/cmdline" | grep -q ' daemon' && echo "$p"
-     done | head -1)
+# The daemon is the one holding the socket: the ping above may have started one of its own, and the other leaves.
+SD=$(ss -xlpn 2>/dev/null | grep -F "$STALE_SOCK " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
 
 env HOME="$STALE_HOME" SOCKETLEY_SOCKET="$STALE_SOCK" "$BIN" create proxy stp \
     -p $P_STALE --protocol tcp --backend 127.0.0.1:$P_STALEB --shards 2 -s >/dev/null 2>&1
@@ -282,7 +279,7 @@ else
     for p in "${SW[@]}"; do kill -CONT $p 2>/dev/null; kill -9 $p 2>/dev/null; done
 fi
 kill -9 $SBACK 2>/dev/null
-rm -rf "$STALE_HOME" "$STALE_SOCK"
+rm -rf "$STALE_HOME" "$STALE_SOCK" "$STALE_SOCK.lock"
 
 echo
 echo "$PASS passed, $FAIL failed"
