@@ -302,8 +302,10 @@ public:
         }
 
         auto* t = static_cast<table*>(p);
+        // A count past the slots there are, as adopt() refuses too, would have every sum read beyond them.
         if (t->h.magic.load(std::memory_order_acquire) != magic_value
-            || t->h.version.load(std::memory_order_relaxed) != format_version)
+            || t->h.version.load(std::memory_order_relaxed) != format_version
+            || t->h.shard_count.load(std::memory_order_acquire) > max_shards)
         {
             ::munmap(p, sizeof(table));
             ::close(dup_fd);

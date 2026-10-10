@@ -66,6 +66,36 @@ inline bool http_token_equals(std::string_view s, const char* lower, size_t len)
     return true;
 }
 
+// Whether a name may go out as a header's name: a token (RFC 9110 5.6.2), so it can neither end the line nor be
+// read as a value -- names a script supplied are often derived from a request.
+inline bool http_field_name_ok(std::string_view s)
+{
+    if (s.empty() || s.size() > 256)
+        return false;
+    for (char c : s)
+    {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u <= 0x20 || u >= 0x7F)
+            return false;
+        switch (c)
+        {
+            case '(': case ')': case ',': case '/': case ':': case ';':
+            case '<': case '=': case '>': case '?': case '@': case '[':
+            case '\\': case ']': case '{': case '}': case '"':
+                return false;
+            default: break;
+        }
+    }
+    return true;
+}
+
+// Whether a value may go out as one header line: a CR or LF in it would end the line and start another the
+// sender never meant, and NUL ends it early for some readers.
+inline bool http_field_value_ok(std::string_view v)
+{
+    return v.find_first_of(std::string_view("\r\n\0", 3)) == std::string_view::npos;
+}
+
 // The optional whitespace a field value may carry on either side, tabs
 // included, or "Transfer-Encoding:\tchunked" reads as carrying no transfer
 // coding at all.

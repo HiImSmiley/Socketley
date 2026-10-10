@@ -58,8 +58,12 @@ class mutation_journal
 public:
     static constexpr char   magic[8]      = { 'S','K','L','J','R','N','L','1' };
     static constexpr size_t record_head   = 8;             // u32 length + u32 crc
-    // No record is ever near this; a larger length is corruption, not data.
-    static constexpr size_t max_record    = 64u << 20;
+    // Any length the head can state is data: a command is as long as the runtime's --read-buffer allows, and the CRC
+    // and the file's end are what tell damage. A cap below that refused a long MSET on replay and cut every record
+    // after it away.
+    static constexpr size_t max_record    = UINT32_MAX;
+    // What is held for a disk that takes nothing before the journal stops.
+    static constexpr size_t max_pending   = size_t{256} << 20;
 
     // What a file at the journal's name turned out to be, judged before this
     // run writes a byte of its own.
@@ -154,6 +158,8 @@ public:
             h.append(owner.data(), owner.size());
             if (!socketley::write_all(fd, h.data(), h.size()))
             {
+                // Back to empty, or the next start finds a part of a header and refuses the journal for good.
+                if (::ftruncate(fd, 0) != 0) {}
                 ::close(fd);
                 return false;
             }
@@ -188,11 +194,22 @@ public:
         m_fd = fd;
         m_head = head;
         m_pending.clear();
+        m_given_up = false;
         return true;
     }
 
     void append(std::string_view record)
     {
+        // A length the head cannot carry would be written short and read as damage; such a record is not kept.
+        if (record.size() > max_record)
+            return;
+        // Bounded while the disk takes nothing: past it the journal stops, and the dump is the record from then on.
+        if (m_given_up || m_pending.size() > max_pending)
+        {
+            m_given_up = true;
+            m_pending.clear();
+            return;
+        }
         char head[record_head];
         put32(head,     static_cast<uint32_t>(record.size()));
         put32(head + 4, journal_detail::crc32(record));
@@ -206,6 +223,8 @@ public:
     // append the same bytes twice.
     bool flush()
     {
+        if (m_given_up)
+            return false;
         if (m_fd < 0 || m_pending.empty())
             return true;
         size_t written = 0;
@@ -311,7 +330,7 @@ private:
         {
             const uint32_t len = get32(data.data() + p);
             const uint32_t crc = get32(data.data() + p + 4);
-            if (len > max_record || data.size() - p - record_head < len)
+            if (data.size() - p - record_head < len)
                 break;
             const std::string_view rec(data.data() + p + record_head, len);
             if (journal_detail::crc32(rec) != crc)
@@ -328,4 +347,6 @@ private:
     int         m_fd{-1};
     size_t      m_head{0};
     std::string m_pending;
+    // Set when m_pending outgrew max_pending with nothing written; cleared by the next open.
+    bool m_given_up{false};
 };

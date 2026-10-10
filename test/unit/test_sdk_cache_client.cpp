@@ -156,8 +156,70 @@ static void verify_cache_client_api()
     }
 }
 
+// ── A connection that ends in the middle of an answer ──────────
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <thread>
+#include <unistd.h>
+#include <csignal>
+
+// A server that reads one command, answers `answer`, and closes, on a port of its own.
+static uint16_t serve_once(std::string answer, std::thread& t)
+{
+    const int ls = ::socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(ls >= 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(::bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0);
+    CHECK(::listen(ls, 1) == 0);
+    socklen_t len = sizeof a;
+    CHECK(::getsockname(ls, reinterpret_cast<sockaddr*>(&a), &len) == 0);
+    t = std::thread([ls, answer]() {
+        const int c = ::accept(ls, nullptr, nullptr);
+        char buf[256];
+        if (c >= 0 && ::read(c, buf, sizeof buf) > 0 && ::write(c, answer.data(), answer.size()) < 0) {}
+        if (c >= 0) ::close(c);
+        ::close(ls);
+    });
+    return ntohs(a.sin_port);
+}
+
+static void test_multi_line_answer_cut_short()
+{
+    // Before, the reply loop read the closed connection as an endless run of empty lines and grew without bound;
+    // the alarm turns that hang into a failure.
+    ::alarm(10);
+    std::thread t;
+    const uint16_t port = serve_once("a\nb\n", t);
+    socketley::cache_client c;
+    CHECK(c.connect("127.0.0.1", port));
+    const socketley::cache_result r = c.keys("*");
+    t.join();
+    CHECK(!r.ok);
+    CHECK(r.values.size() <= 2);
+    CHECK(!c.is_connected());
+    ::alarm(0);
+}
+
+static void test_single_answer_never_sent()
+{
+    // A connection that closes before its answer is a failure, not an empty value.
+    std::thread t;
+    const uint16_t port = serve_once("", t);
+    socketley::cache_client c;
+    CHECK(c.connect("127.0.0.1", port));
+    const socketley::cache_result r = c.get("k");
+    t.join();
+    CHECK(!r.ok);
+}
+
 int main()
 {
+    test_multi_line_answer_cut_short();
+    test_single_answer_never_sent();
     test_result_default();
     test_result_ok();
     test_result_nil();

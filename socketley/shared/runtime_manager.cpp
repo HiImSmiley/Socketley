@@ -61,6 +61,12 @@ std::string address_conflict(
         {
             if (std::find(mine.begin(), mine.end(), a) == mine.end())
                 continue;
+            // One port on two addresses of this machine is two sockets the kernel keeps apart, unless either side
+            // takes every address.
+            const auto every = [](std::string_view b) { return b.empty() || b == "0.0.0.0" || b == "::"; };
+            if (!a.starts_with("unix:") && !every(want.get_bind_address()) && !every(inst->get_bind_address()) &&
+                want.get_bind_address() != inst->get_bind_address())
+                continue;
 
             // Two different sentences because the two families fail
             // differently, and one that describes the wrong mechanism sends
@@ -668,6 +674,10 @@ bool runtime_manager::rename(std::string_view old_name, std::string_view new_nam
     runtimes.erase(it);
     instance->set_name(new_name);
     runtimes.emplace(std::string(new_name), std::move(instance));
+    // Its children are owned by the runtime and not by the word, so they follow it to its new name.
+    for (auto& [child_name, child] : runtimes)
+        if (child->get_owner() == old_name)
+            child->set_owner(new_name);
     lock.unlock();
 
     publish_endpoints();
@@ -713,6 +723,17 @@ void runtime_manager::stop_children_cascading(std::string_view parent_name,
         if (!seen.insert(child).second)
             continue;
 
+        // Each by its own policy, as at the first level: one that goes with its parent goes however the stop came.
+        auto* inst = get(child);
+        if (inst && inst->get_child_policy() == runtime_instance::child_policy::remove)
+        {
+            remove_children_cascading(child, loop, seen);
+            inst = get(child);
+            if (inst && inst->get_state() == runtime_running)
+                stop_cascading(child, loop, seen);
+            remove(child);
+            continue;
+        }
         // Recurse: stop grandchildren first
         stop_children_cascading(child, loop, seen);
         stop_cascading(child, loop, seen);
@@ -893,6 +914,9 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
                 auto it = runtimes.find(n);
                 if (it == runtimes.end()) break;
                 if (it->second->get_state() != runtime_running) break;
+                // The same instance and the same script, or one removed and made again under its name is reached
+                // through a pointer to what was freed.
+                if (it->second.get() != inst || inst->lua() != lua) break;
             }
 
             lua->dispatch_cluster_event(w);

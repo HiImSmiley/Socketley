@@ -26,6 +26,8 @@ bool prepare_acme(const std::vector<std::string>& domains, std::string_view emai
 
 // Once per turn of the worker's loop; one clock read when nothing is due.
 void tick();
+// Milliseconds until tick() has a look to take, -1 while nothing is watched, so an idle loop wakes for it.
+int due_in_ms();
 
 // Where the answers to HTTP-01 challenges are kept, for every HTTP runtime to serve.
 std::string challenge_dir();

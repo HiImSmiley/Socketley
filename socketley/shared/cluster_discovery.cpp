@@ -32,6 +32,8 @@ std::string json_escape(std::string_view s)
             case '"':  out += "\\\""; break;
             case '\\': out += "\\\\"; break;
             case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
             default:   out += c;      break;
         }
     }
@@ -51,11 +53,29 @@ std::string json_get_string(std::string_view json, std::string_view key)
         return {};
 
     pos += needle.size();
-    auto end = json.find('"', pos);
-    if (end == std::string_view::npos)
-        return {};
-
-    return std::string(json.substr(pos, end - pos));
+    // Read back as json_escape wrote it, so a name with a quote or a backslash in it is the same name on every daemon.
+    std::string out;
+    for (; pos < json.size(); ++pos)
+    {
+        const char c = json[pos];
+        if (c == '"')
+            return out;
+        if (c != '\\')
+        {
+            out += c;
+            continue;
+        }
+        if (++pos >= json.size())
+            return {};
+        switch (json[pos])
+        {
+            case 'n': out += '\n'; break;
+            case 'r': out += '\r'; break;
+            case 't': out += '\t'; break;
+            default:  out += json[pos]; break;
+        }
+    }
+    return {};
 }
 
 // Extract a numeric value for a given key
@@ -109,8 +129,27 @@ std::vector<std::string_view> json_get_array_objects(std::string_view json, std:
         if (json[pos] != '{')
             break;
 
-        // Find matching closing brace (no nesting in our format)
-        auto end = json.find('}', pos);
+        // The closing brace outside every string, since a name may hold one.
+        size_t end = std::string_view::npos;
+        bool in_string = false;
+        for (size_t i = pos + 1; i < json.size(); ++i)
+        {
+            const char c = json[i];
+            if (in_string)
+            {
+                if (c == '\\')
+                    ++i;
+                else if (c == '"')
+                    in_string = false;
+            }
+            else if (c == '"')
+                in_string = true;
+            else if (c == '}')
+            {
+                end = i;
+                break;
+            }
+        }
         if (end == std::string_view::npos)
             break;
 
@@ -414,6 +453,15 @@ void cluster_discovery::publish()
             return;
         }
         f << json;
+        f.flush();
+        // A file the disk cut short would be published as whole, so it is not put in place.
+        if (!f)
+        {
+            LOG_WARN("cluster: could not write state file");
+            f.close();
+            std::remove(tmp_path.c_str());
+            return;
+        }
     }
 
     if (std::rename(tmp_path.c_str(), path.c_str()) != 0)

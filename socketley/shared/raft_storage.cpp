@@ -209,6 +209,20 @@ bool next_record(std::string_view bytes, size_t off, uint8_t& type, std::string_
     return true;
 }
 
+// Whether a record that reads whole begins anywhere after `from`.
+bool whole_record_after(std::string_view bytes, size_t from)
+{
+    for (size_t off = from + 1; off + record_header <= bytes.size(); ++off)
+    {
+        uint8_t type = 0;
+        std::string_view payload;
+        size_t next = 0;
+        if (next_record(bytes, off, type, payload, next))
+            return true;
+    }
+    return false;
+}
+
 index_t last_of(const persisted& st)
 {
     return st.log.empty() ? st.snap.index : st.log.back().index;
@@ -612,6 +626,13 @@ bool recover(const std::string& dir, recovery& out, std::string& err)
         }
 
         const replay_result r = replay(bytes, out.state);
+        // A whole record past the stop is no torn tail but damage inside what was synced, and acknowledged with it.
+        if (!r.stopped.empty() && whole_record_after(bytes, r.valid))
+        {
+            err = path + " holds whole records after a damaged one (" + r.stopped + "), so what it acknowledged "
+                  "cannot be told; this node does not start on it. Move its Raft directory away and let it rejoin";
+            return false;
+        }
         if (!r.stopped.empty())
         {
             // Nothing past an unsynced record was acknowledged, so the tail after the last whole record is dropped.

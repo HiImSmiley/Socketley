@@ -298,10 +298,20 @@ inline bind_result bind_listener(const std::string& path,
                           "than taking the path away from it";
                 return r;
             }
-            // ECONNREFUSED means a leftover; unlink's own failure is left to
-            // bind() so the operator gets one message, not two.
-            if (err != ENOENT)
+            // ECONNREFUSED means a leftover socket, or a file that is no
+            // socket at all, which is the operator's and is never removed;
+            // unlink's own failure is left to bind() so the operator gets one
+            // message, not two.
+            struct stat st{};
+            if (err != ENOENT && lstat(path.c_str(), &st) == 0)
+            {
+                if (!S_ISSOCK(st.st_mode))
+                {
+                    r.error = tag + " is a file that is no socket -- refusing to remove it to put one there";
+                    return r;
+                }
                 if (unlink(path.c_str()) < 0) {}
+            }
         }
     }
 

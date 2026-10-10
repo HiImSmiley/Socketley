@@ -415,7 +415,7 @@ std::chrono::system_clock::time_point runtime_instance::get_start_time() const
 
 void runtime_instance::note_restart()
 {
-    ++m_restarts;
+    m_restarts.fetch_add(1, std::memory_order_relaxed);
     m_start_time = std::chrono::system_clock::now();
 }
 
@@ -1337,7 +1337,8 @@ enum class notify_result { sent, skipped, broken };
 notify_result notify_write(int fd, const char* data, size_t len)
 {
     size_t written = 0;
-    if (socketley::write_all(fd, data, len, &written))
+    // Never blocking: one operator's stopped terminal would otherwise stop this runtime for every client it has.
+    if (socketley::send_all_nowait(fd, data, len, &written))
         return notify_result::sent;
     return (written == 0) ? notify_result::skipped : notify_result::broken;
 }

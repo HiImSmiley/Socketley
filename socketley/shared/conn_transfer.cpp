@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -85,22 +86,39 @@ bool send_handover(int channel_fd, const handover& h, int payload_fd)
     cm->cmsg_len   = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(cm), &payload_fd, sizeof(int));
 
-    // A partial send is a failed handover and the caller keeps the connection:
+    // Nothing sent is a failed handover and the caller keeps the connection:
     // served by the wrong runtime is recoverable, served by neither is not.
-    for (;;)
+    ssize_t n;
+    do
+        n = ::sendmsg(channel_fd, &msg, MSG_NOSIGNAL);
+    while (n < 0 && errno == EINTR);
+    if (n < 0)
+        return false;
+    // The descriptor went with the first byte, so the rest of the frame is owed; a frame cut for good is one the
+    // other side closes the descriptor of, and the caller keeps the connection.
+    size_t sent = static_cast<size_t>(n);
+    while (sent < framed.size())
     {
-        const ssize_t n = ::sendmsg(channel_fd, &msg, MSG_NOSIGNAL);
-        if (n < 0 && errno == EINTR)
+        const ssize_t m = ::send(channel_fd, framed.data() + sent, framed.size() - sent, MSG_NOSIGNAL);
+        if (m > 0)
+            sent += static_cast<size_t>(m);
+        else if (m < 0 && errno == EINTR)
             continue;
-        if (n < 0)
-            return false;
-        if (static_cast<size_t>(n) != framed.size())
+        else if (m < 0 && errno == EAGAIN)
         {
-            LOG_WARN("conn transfer: handover was sent short, keeping the connection");
-            return false;
+            struct pollfd pfd{channel_fd, POLLOUT, 0};
+            if (::poll(&pfd, 1, 1000) <= 0)
+                break;
         }
-        return true;
+        else
+            break;
     }
+    if (sent != framed.size())
+    {
+        LOG_WARN("conn transfer: handover was sent short, keeping the connection");
+        return false;
+    }
+    return true;
 }
 
 bool recv_handover(int channel_fd, handover& h, int& out_fd)
@@ -166,18 +184,24 @@ bool recv_handover(int channel_fd, handover& h, int& out_fd)
         if (n < 0 && errno == EINTR) continue;
         break;
     }
-    if (n <= 0 || static_cast<size_t>(n) != frame_buf.size())
-        return false;
-
+    // The descriptor first, whatever the frame turns out to be: one that came with a short frame is this process's
+    // now, and returning before taking it out of the control data left it open with nothing that knew of it.
     int fd = -1;
-    for (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm))
-    {
-        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
-            cm->cmsg_len == CMSG_LEN(sizeof(int)))
+    if (n > 0)
+        for (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm))
         {
-            memcpy(&fd, CMSG_DATA(cm), sizeof(int));
-            break;
+            if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
+                cm->cmsg_len == CMSG_LEN(sizeof(int)))
+            {
+                memcpy(&fd, CMSG_DATA(cm), sizeof(int));
+                break;
+            }
         }
+    if (n <= 0 || static_cast<size_t>(n) != frame_buf.size() || (msg.msg_flags & MSG_CTRUNC))
+    {
+        if (fd >= 0)
+            ::close(fd);
+        return false;
     }
     if (fd < 0)
         return false;

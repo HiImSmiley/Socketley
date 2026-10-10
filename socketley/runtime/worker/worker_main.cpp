@@ -338,6 +338,9 @@ public:
                                                             // a truncated 0
                                                             // would spin
             }
+            // A certificate watched on disk or an --acme issue in progress is looked at on time, not at the next completion.
+            if (const int due = cert_keeper::due_in_ms(); due >= 0)
+                wait_ms = std::min(wait_ms, due);
 
             // Before the ring exists poll_completions() returns at once
             // whatever timeout it is handed, so the wait comes from a poll on
@@ -805,6 +808,7 @@ private:
         if (!m_loop.ring_open() && !m_loop.init())
         {
             LOG_ERROR("proxy worker: could not initialise io_uring");
+            m_exit_code = 2;
             m_done = true;
             return;
         }

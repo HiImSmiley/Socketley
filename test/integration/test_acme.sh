@@ -66,7 +66,7 @@ daemon_start "$BIN"
 # The flags' refusals.
 check "--acme on a client is refused" "$("$BIN" create client c1 -t 127.0.0.1:1 --acme a.example 2>&1 | grep -c 'issued for a runtime that listens')" 1
 # A wildcard is taken, to be proven over DNS-01 by a dns runtime (test_dns.sh issues one); two levels of it are not.
-check "a wildcard is taken" "$("$BIN" create server s0 -p $P_TLS2 --acme '*.example.org' 2>&1 | grep -c 'not a name')" 0
+check "a wildcard is taken" "$("$BIN" create server s0 -p $P_TLS2 --acme '*.example.org' 2>&1; echo "rc=$?")" "rc=0"
 "$BIN" remove s0 >/dev/null 2>&1
 check "a wildcard below a wildcard is refused" "$("$BIN" create server s0 -p $P_TLS2 --acme '*.*.example.org' 2>&1 | grep -c 'not a name')" 1
 check "an address is refused" "$("$BIN" create server s1 -p $P_TLS2 --acme 127.0.0.1 2>&1 | grep -c 'not a name')" 1
@@ -98,8 +98,12 @@ cp "$T/k2.pem" "$KEY.new"; mv "$KEY.new" "$KEY"; cp "$T/c2.pem" "$CERT.new"; mv 
 for _ in $(seq 1 60); do [ "$(serial)" != "$before" ] && break; sleep 0.1; done
 check "a replaced certificate is served without a restart" "$(serial)" "$(openssl x509 -noout -serial -in "$T/c2.pem")"
 now=$(serial)
+warned() { grep -ac 'www\.socketley\.test/fullchain\.pem and .* do not load as a pair' "$SOCKETLEY_DLOG" 2>/dev/null; }
+w0=$(warned)
 echo "not a certificate" > "$CERT"
-sleep 2.5
+# The watcher looks every 2 s, so 6 s is three looks.
+for _ in $(seq 1 60); do [ "$(warned)" -gt "$w0" ] 2>/dev/null && break; sleep 0.1; done
+check "a broken one is looked at" "$([ "$(warned)" -gt "$w0" ] 2>/dev/null && echo yes)" yes
 check "a broken one is not taken up" "$(serial)" "$now"
 
 # By hand, as certbot is run.
@@ -112,7 +116,8 @@ check "and says nothing" "$(cat "$T/hand.out")" ""
 "$BIN" acme issue --domains alpn.socketley.test --challenge tls-alpn-01 --cert "$T/alpn.pem" --key "$T/alpn.key" > "$T/alpn.out" 2>&1
 check "TLS-ALPN-01 is answered by a running TLS listener" \
       "$(openssl x509 -noout -ext subjectAltName -in "$T/alpn.pem" 2>/dev/null | grep -o 'DNS:[a-z.]*')" DNS:alpn.socketley.test
-check "and its challenge certificate is gone after" "$(ls "$(dirname "$(dirname "$CERT")")/challenges" | grep -c tls-alpn)" 0
+CHALLENGES="$(dirname "$(dirname "$CERT")")/challenges"
+check "and its challenge certificate is gone after" "$([ -d "$CHALLENGES" ] && ls "$CHALLENGES" | grep -c tls-alpn)" 0
 check "and acme-tls/1 is spoken no more once it is gone" \
       "$(echo | openssl s_client -connect 127.0.0.1:$P_TLS -servername alpn.socketley.test -alpn acme-tls/1 2>/dev/null | grep -c 'ALPN protocol: acme-tls/1')" 0
 

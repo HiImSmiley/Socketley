@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 // JSON for socketley.json_encode and json_decode, a header rather than
 // file-static so a parser pointed at network data can be reached by a test and
 // a fuzz target.
@@ -127,9 +128,10 @@ inline bool json_encode_value(std::string& out, const sol::object& val,
             }
             else
             {
+                // The shortest text that decodes to the same double, where %.14g dropped the digits past fourteen.
                 char buf[32];
-                int n = snprintf(buf, sizeof(buf), "%.14g", d);
-                out.append(buf, static_cast<size_t>(n));
+                const auto r = std::to_chars(buf, buf + sizeof(buf), d);
+                out.append(buf, static_cast<size_t>(r.ptr - buf));
             }
             break;
         }
@@ -482,12 +484,12 @@ inline sol::object json_decode_value(sol::state& lua, const char*& p, const char
             if (p < end && (*p == 'e' || *p == 'E'))
             { is_float = true; ++p; if (p < end && (*p == '+' || *p == '-')) ++p; while (p < end && *p >= '0' && *p <= '9') ++p; }
 
+            // strtod and not stod, whose throw on a number past double's range made 1e400 a zero: past the range is
+            // infinity, as the magnitude says, and below it is as near to zero as a double comes.
             if (is_float)
             {
-                std::string num_str(start, static_cast<size_t>(p - start));
-                double d = 0;
-                try { d = std::stod(num_str); } catch (...) {}
-                return sol::make_object(lua, d);
+                const std::string num_str(start, static_cast<size_t>(p - start));
+                return sol::make_object(lua, std::strtod(num_str.c_str(), nullptr));
             }
 
             int64_t n = 0;
@@ -496,10 +498,8 @@ inline sol::object json_decode_value(sol::state& lua, const char*& p, const char
             {
                 // Out of int64 range is a large number, not a bad document:
                 // fall back to the float parse, which keeps the magnitude.
-                std::string num_str(start, static_cast<size_t>(p - start));
-                double d = 0;
-                try { d = std::stod(num_str); } catch (...) {}
-                return sol::make_object(lua, d);
+                const std::string num_str(start, static_cast<size_t>(p - start));
+                return sol::make_object(lua, std::strtod(num_str.c_str(), nullptr));
             }
             return sol::make_object(lua, static_cast<double>(n));
         }

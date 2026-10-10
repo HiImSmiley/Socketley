@@ -74,6 +74,10 @@ std::string roundtrip(int fd, const std::string& msg)
 {
     std::string out = msg + "\n";
     REQUIRE(::write(fd, out.data(), out.size()) == static_cast<ssize_t>(out.size()));
+    // Bounded, so a runtime that accepts and never answers fails the check instead of hanging the binary.
+    struct timeval tv{};
+    tv.tv_sec = 5;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     std::string reply;
     char buf[512];
     for (;;)
@@ -125,6 +129,23 @@ bool wait_for_connects(const std::atomic<int>& seen, int want, int ms = 5000)
     return false;
 }
 
+// Stops the runtime and joins its thread on any exit, so a failed REQUIRE
+// unwinds into a red case instead of ~thread calling std::terminate.
+template <typename R>
+struct loop_guard
+{
+    R& rt;
+    std::thread& t;
+    ~loop_guard()
+    {
+        if (t.joinable())
+        {
+            rt.stop();
+            t.join();
+        }
+    }
+};
+
 std::string unix_path_for(const char* tag)
 {
     return "/tmp/sdk_runtime_" + std::string(tag) + "_" +
@@ -146,6 +167,7 @@ TEST_CASE("server wrapper serves a TCP echo end to end")
        });
 
     std::thread t([&] { srv.start(); });
+    loop_guard<socketley::server> guard{srv, t};
 
     int fd = dial_tcp(k_tcp_port);
     REQUIRE(fd >= 0);
@@ -176,6 +198,7 @@ TEST_CASE("server wrapper listens on an AF_UNIX socket")
     });
 
     std::thread t([&] { srv.start(); });
+    loop_guard<socketley::server> guard{srv, t};
 
     int fd = dial_unix(path);
     REQUIRE(fd >= 0);
@@ -196,6 +219,7 @@ TEST_CASE("client wrapper dials a unix listener with the -t spelling")
         srv.send(fd, "pong " + std::string(msg));
     });
     std::thread ts([&] { srv.start(); });
+    loop_guard<socketley::server> guard_s{srv, ts};
 
     // Wait for the node before starting the client: its reconnect budget is
     // not the thing under test.
@@ -214,6 +238,7 @@ TEST_CASE("client wrapper dials a unix listener with the -t spelling")
            cli.stop();
        });
     std::thread tc([&] { cli.start(); });
+    loop_guard<socketley::client> guard_c{cli, tc};
 
     for (int i = 0; i < 200 && !answered; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
@@ -282,6 +307,7 @@ TEST_CASE("the default mode relays each client's bytes to the others")
        });
 
     std::thread t([&] { srv.start(); });
+    loop_guard<socketley::server> guard{srv, t};
 
     int a = dial_tcp(25892);
     REQUIRE(a >= 0);
@@ -314,6 +340,7 @@ TEST_CASE("mode_in stops it, which is what the examples set")
        });
 
     std::thread t([&] { srv.start(); });
+    loop_guard<socketley::server> guard{srv, t};
 
     int a = dial_tcp(25893);
     REQUIRE(a >= 0);
@@ -346,6 +373,7 @@ TEST_CASE("proxy wrapper forwards, and its hooks mean what the header says")
         backend.send(fd, "backend: " + std::string(msg));
     });
     std::thread bt([&] { backend.start(); });
+    loop_guard<socketley::server> guard_b{backend, bt};
     REQUIRE(dial_tcp(back_port) >= 0);
 
     // ── An empty string is "unchanged", and a non-empty one replaces ───────
@@ -359,6 +387,7 @@ TEST_CASE("proxy wrapper forwards, and its hooks mean what the header says")
               return std::string{};          // pass through
           });
         std::thread pt([&] { px.start(); });
+        loop_guard<socketley::proxy> guard_p{px, pt};
 
         int c = dial_tcp(front_pass);
         REQUIRE(c >= 0);
@@ -383,6 +412,7 @@ TEST_CASE("proxy wrapper forwards, and its hooks mean what the header says")
               return std::nullopt;
           });
         std::thread pt([&] { px.start(); });
+        loop_guard<socketley::proxy> guard_p{px, pt};
 
         int c = dial_tcp(front_drop);
         REQUIRE(c >= 0);

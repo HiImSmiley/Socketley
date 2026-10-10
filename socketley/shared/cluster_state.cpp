@@ -454,7 +454,9 @@ bool decode(std::string_view data, state& out)
         // What is stored passes through the same rules a proposal does, in the order encode writes it, so one state has one encoding.
         if (!refusal(c).empty() || (!s.specs.empty() && c.name <= s.specs.rbegin()->first) || held.size() > max_replicas)
             return false;
-        if (!std::is_sorted(held.begin(), held.end(), std::less_equal<node_id>{}) || (!held.empty() && held.front() == 0))
+        // Strictly ascending, since a repeated owner is a list encode never writes.
+        if (std::adjacent_find(held.begin(), held.end(), std::greater_equal<node_id>{}) != held.end() ||
+            (!held.empty() && held.front() == 0))
             return false;
         std::set<node_id> owners(held.begin(), held.end());
         // Only a cache has a primary, which is one of its owners and a process that has a number, or nobody.

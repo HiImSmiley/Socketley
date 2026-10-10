@@ -10,10 +10,11 @@
 // ceiling in shared/worker_env.h.
 //
 // WHY ONLY ONE CALLER.  Every other resolver in this tree is already bounded
-// by something the caller owns: a client and a server re-resolve at most once
-// per second of reconnect backoff and clear their address deliberately, so a
-// container that moved is followed; a proxy resolves once per thirty-second
-// sweep; the rest run once at start.  socketley.http() was the exception --
+// by something the caller owns: a client re-resolves at most once per second
+// of reconnect backoff and clears its address deliberately, so a container
+// that moved is followed; a server's upstreams, a proxy's names and a cache's
+// master are looked up off the loop by async_resolver.h; the rest run once at
+// start.  socketley.http() was the exception --
 // it resolved on every call, with no bound at all, and the comment above it
 // says a resolver escapes both the call's deadline and the callback budget.
 // Handing this to the others would undo decisions they made on purpose.

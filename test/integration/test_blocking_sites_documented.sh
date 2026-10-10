@@ -50,7 +50,7 @@ named() {  # label, needle in the section
 }
 
 named "the Lua HTTP client"  "socketley.http()"
-named "the static file open" "open"
+named "the static file open" ".BR open (2)"
 named "the resolver"         "getaddrinfo"
 named "the journal flush"    "journal"
 named "the snapshot fsync"   "fsync"
@@ -72,8 +72,8 @@ still_there "socketley.http is synchronous" \
             'socketley_http_call' shared/lua_context.cpp
 still_there "the static file path opens on the loop" \
             '(^|[^_a-zA-Z0-9>.])open\(resolved' runtime/server/server_instance.cpp
-still_there "getaddrinfo on a client reconnect" \
-            '(^|[^_a-zA-Z0-9>.])getaddrinfo\(' runtime/client/client_instance.cpp
+still_there "the resolver on a client's first dial" \
+            'lookup_now\(' runtime/client/client_instance.cpp
 still_there "the journal writes from the loop" \
             'journal_flush_now|m_journal\.flush' runtime/cache/cache_instance.cpp
 still_there "the state file is fsynced from the loop" \

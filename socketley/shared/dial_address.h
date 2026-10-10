@@ -25,6 +25,34 @@ inline std::string refusal(std::string_view addr, std::string& host, uint16_t& p
     if (addr.empty())
         return "no address was given";
 
+    // An IPv6 address is bracketed, since its own colons cannot be told from the port's.
+    if (addr.front() == '[')
+    {
+        const auto close = addr.find(']');
+        if (close == std::string_view::npos || close == 1)
+            return "an IPv6 address is written in brackets, as [::1]:port";
+        const auto rest = addr.substr(close + 1);
+        if (rest.empty())
+        {
+            if (port_required)
+                return "the address needs a port, as [host]:port";
+            host = std::string(addr.substr(1, close - 1));
+            return {};
+        }
+        if (rest.front() != ':')
+            return "after an IPv6 address in brackets comes its port, as [::1]:port";
+        std::string h;
+        uint16_t p = port;
+        std::string why = refusal(std::string("x") + std::string(rest), h, p, true);
+        if (!why.empty())
+            return why;
+        host = std::string(addr.substr(1, close - 1));
+        port = p;
+        return {};
+    }
+    if (addr.find(':') != addr.rfind(':'))
+        return "an IPv6 address is written in brackets, as [" + std::string(addr) + "]:port";
+
     const auto colon = addr.rfind(':');
     if (colon == std::string_view::npos)
     {

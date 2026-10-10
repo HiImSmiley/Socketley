@@ -1343,6 +1343,23 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         }
     }
 
+    // A method, a path or a header the script made from what someone sent it would otherwise write lines of their
+    // choosing into the request; one that cannot go out as given is refused, not sent altered.
+    bool fields_ok = http_field_name_ok(method) && !path.empty() &&
+                     path.find_first_of(std::string_view(" \r\n\0", 4)) == std::string_view::npos;
+    if (hdrs)
+        (*hdrs).for_each([&](sol::object k, sol::object v) {
+            if (k.is<std::string>() && v.is<std::string>() &&
+                (!http_field_name_ok(k.as<std::string>()) || !http_field_value_ok(v.as<std::string>())))
+                fields_ok = false;
+        });
+    if (!fields_ok)
+    {
+        ::close(sock);
+        result["error"] = std::string("the method, the path or a header holds what cannot go out as one line");
+        return result;
+    }
+
     // Build HTTP/1.0 request
     std::string req;
     req.reserve(256 + body.size());
@@ -1398,30 +1415,37 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
 
 #ifndef SOCKETLEY_NO_HTTPS
     if (is_https) {
-        SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
-        if (!ctx) { ::close(sock); result["error"] = "SSL_CTX_new failed"; return result; }
-
-        // SSL_VERIFY_PEER and the host pin are both needed, because a
-        // certificate for a domain the attacker owns is entirely valid.
-        SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
-        if (tls_context::load_system_roots(ctx) != 1) {
-            std::string why = ssl_error_text();
-            SSL_CTX_free(ctx); ::close(sock);
-            result["error"] = "no system CA store available" + (why.empty() ? "" : ": " + why);
-            return result;
-        }
+        // Built once per process and kept: a fresh context per call read and parsed the whole system CA store
+        // every time, on the loop. What a call changes lives on its SSL, not here.
+        static SSL_CTX* shared_ctx = nullptr;
+        if (!shared_ctx)
+        {
+            SSL_CTX* made = SSL_CTX_new(TLS_client_method());
+            if (!made) { ::close(sock); result["error"] = "SSL_CTX_new failed"; return result; }
+            // SSL_VERIFY_PEER and the host pin are both needed, because a
+            // certificate for a domain the attacker owns is entirely valid.
+            SSL_CTX_set_min_proto_version(made, TLS1_2_VERSION);
+            SSL_CTX_set_verify(made, SSL_VERIFY_PEER, nullptr);
+            if (tls_context::load_system_roots(made) != 1) {
+                std::string why = ssl_error_text();
+                SSL_CTX_free(made); ::close(sock);
+                result["error"] = "no system CA store available" + (why.empty() ? "" : ": " + why);
+                return result;
+            }
 #if defined(SSL_OP_IGNORE_UNEXPECTED_EOF)
-        // HTTP/1.0 with Connection: close, tolerating the missing close_notify
-        // a great many servers omit, at the cost that TLS can no longer tell a
-        // truncated response from a complete one -- which is why the framing
-        // below counts the Content-Length down instead, and why a response
-        // that declared no length remains unjudgeable here.
-        SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
+            // HTTP/1.0 with Connection: close, tolerating the missing close_notify
+            // a great many servers omit, at the cost that TLS can no longer tell a
+            // truncated response from a complete one -- which is why the framing
+            // below counts the Content-Length down instead, and why a response
+            // that declared no length remains unjudgeable here.
+            SSL_CTX_set_options(made, SSL_OP_IGNORE_UNEXPECTED_EOF);
 #endif
+            shared_ctx = made;
+        }
+        SSL_CTX* ctx = shared_ctx;
 
         SSL* ssl = SSL_new(ctx);
-        if (!ssl) { SSL_CTX_free(ctx); ::close(sock); result["error"] = "SSL_new failed"; return result; }
+        if (!ssl) { ::close(sock); result["error"] = "SSL_new failed"; return result; }
         SSL_set_fd(ssl, sock);
 
         // An address literal is matched against the certificate's iPAddress SAN
@@ -1441,7 +1465,7 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
             // Refuse rather than continue unpinned: a connection that verifies
             // the chain and not the name looks identical to a good one.
             std::string why = ssl_error_text();
-            SSL_free(ssl); SSL_CTX_free(ctx); ::close(sock);
+            SSL_free(ssl); ::close(sock);
             result["error"] = "failed to pin expected certificate name for " + host
                             + (why.empty() ? "" : ": " + why);
             return result;
@@ -1476,7 +1500,7 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
             break;
         }
         if (!tls_err.empty()) {
-            SSL_free(ssl); SSL_CTX_free(ctx); ::close(sock);
+            SSL_free(ssl); ::close(sock);
             result["error"] = tls_err;
             return result;
         }
@@ -1539,7 +1563,7 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         // spend the deadline on a connection being closed either way.
         if (SSL_shutdown(ssl) < 0) {}
         ERR_clear_error();
-        SSL_free(ssl); SSL_CTX_free(ctx);
+        SSL_free(ssl);
         ::close(sock);
     } else
 #endif
@@ -1638,6 +1662,24 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
 
     auto body_start = response.find("\r\n\r\n");
     std::string body_out = (body_start != std::string::npos) ? response.substr(body_start + 4) : "";
+    // The body is what the head says it is: none for a 204 or a 304, and no byte past a Content-Length that came in
+    // the same read.
+    if (frame.no_body)
+        body_out.clear();
+    else if (!frame.chunked && body_start != std::string::npos)
+    {
+        const std::string_view head(response.data(), body_start);
+        for (size_t at = head.find("\r\n"); at != std::string_view::npos;)
+        {
+            const size_t end = head.find("\r\n", at + 2);
+            const std::string_view line = head.substr(at + 2, end == std::string_view::npos ? std::string_view::npos : end - at - 2);
+            at = end;
+            size_t len = 0;
+            if (header_name_equals(line, "content-length", 14) &&
+                http_whole_decimal(http_trim_ows(line.substr(line.find(':') + 1)), len) && len < body_out.size())
+                body_out.resize(len);
+        }
+    }
 
     // A chunked answer is handed over as its payload, because the chunk sizes
     // are framing and a script decoding JSON would otherwise read them as the
@@ -2586,6 +2628,12 @@ void lua_context::register_bindings(runtime_instance* owner)
     // channel.
     sk["subscribe"] = [this](std::string cache_name, std::string channel,
                              sol::protected_function fn) -> int {
+        // The key joins the two with a NUL, which a runtime's name never holds, so a name that does is no cache.
+        if (cache_name.find('\0') != std::string::npos)
+        {
+            std::cerr << lua_diag::tag(owner_name()) << " subscribe(): a cache's name holds no NUL" << std::endl;
+            return 0;
+        }
         // 0, which is never an id: the runtime is down and a registration made
         // now would outlive the stop that was supposed to end them all.
         if (m_severed)
@@ -3232,7 +3280,8 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
                 return api_why("multicast list entry " + std::to_string(i)
                                + " is not a client id");
             const double d = v.as<double>();
-            if (d != std::floor(d))
+            // A whole number an int holds, since a cast of one it does not is undefined.
+            if (d != std::floor(d) || !(d >= INT_MIN && d <= INT_MAX))
                 return api_why("multicast list entry " + std::to_string(i)
                                + " is not a whole number");
             fds.push_back(static_cast<int>(d));

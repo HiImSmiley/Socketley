@@ -79,6 +79,12 @@ inline result ipc_send(const std::string& socket_path, std::string_view command)
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
+    // A path cut to fit could name another daemon's socket.
+    if (socket_path.size() >= sizeof(addr.sun_path))
+    {
+        ::close(fd);
+        return {-1, "the socket path is longer than a unix socket address holds"};
+    }
     std::strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
 
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
@@ -409,6 +415,9 @@ inline result cluster_show(const std::string& name)
         return {1, "daemon is not in cluster mode (start it with "
                    "--name <n> --cluster <dir>)"};
 
+    // A daemon's name, never a path: "../x" would read a file outside the cluster directory.
+    if (name.empty() || name.find('/') != std::string::npos || name.front() == '.')
+        return {1, "not a daemon name: " + name};
     const std::string dir = detail::status_field(st.data, "dir");
     std::ifstream f(dir + "/" + name + ".json");
     if (!f.is_open())

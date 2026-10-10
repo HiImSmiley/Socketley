@@ -1,5 +1,6 @@
 #include "state_persistence.h"
 #include <cmath>
+#include <type_traits>
 #include <limits>
 #include <cstring>
 #include "runtime_instance.h"
@@ -301,129 +302,117 @@ uint8_t str_to_eviction(std::string_view s)
     }
 }
 
-// Is this key named anywhere in the document, which `import` needs to tell a
+// Where the value of the document's own `key` begins, npos when it has none: only the outermost object's keys count,
+// so a field of "extra" that a registered type names `domain` is never read as the runtime's domain.
+size_t top_value_of(const std::string& json, std::string_view key)
+{
+    int depth = 0;
+    for (size_t pos = 0; pos < json.size(); ++pos)
+    {
+        const char c = json[pos];
+        if (c == '{' || c == '[')
+            ++depth;
+        else if (c == '}' || c == ']')
+            --depth;
+        else if (c == '"')
+        {
+            size_t end = pos + 1;
+            while (end < json.size() && json[end] != '"')
+            {
+                if (json[end] == '\\' && end + 1 < json.size()) ++end;   // \" is not the end
+                ++end;
+            }
+            if (end >= json.size())
+                return std::string::npos;
+            // A key is followed by a colon, without which the scan also matches a value that reads like a key name.
+            const size_t colon = json.find_first_not_of(" \t\n\r", end + 1);
+            if (depth == 1 && colon != std::string::npos && json[colon] == ':' && end - pos - 1 == key.size() &&
+                json.compare(pos + 1, key.size(), key.data(), key.size()) == 0)
+            {
+                const size_t v = json.find_first_not_of(" \t\n\r", colon + 1);
+                return v == std::string::npos ? json.size() : v;
+            }
+            pos = end;
+        }
+    }
+    return std::string::npos;
+}
+
+// Is this key named in the document, which `import` needs to tell a
 // field set to its default from one left out, as a second walk rather than a
 // flag threaded through the getters.
 bool json_has_key(const std::string& json, std::string_view key)
 {
-    size_t pos = 0;
-    while (pos < json.size())
-    {
-        pos = json.find('"', pos);
-        if (pos == std::string::npos) break;
-
-        if (pos + 1 + key.size() + 1 <= json.size() &&
-            json.compare(pos + 1, key.size(), key.data(), key.size()) == 0 &&
-            json[pos + 1 + key.size()] == '"')
-        {
-            // A key is followed by a colon, without which the scan also
-            // matches a value that reads like a key name.
-            const size_t after = pos + 1 + key.size() + 1;
-            const size_t colon = json.find_first_not_of(" \t\n\r", after);
-            if (colon != std::string::npos && json[colon] == ':')
-                return true;
-        }
-        pos++;
-    }
-    return false;
+    return top_value_of(json, key) != std::string::npos;
 }
 
-// Every key the document names, enumerated in one walk rather than from a
-// hand-written list that goes stale the first time somebody adds a field.
+// Every key the document names at its top, enumerated in one walk rather than
+// from a hand-written list that goes stale the first time somebody adds a field.
 void json_collect_keys(const std::string& json, std::set<std::string, std::less<>>& out)
 {
-    size_t pos = 0;
-    while (pos < json.size())
+    int depth = 0;
+    for (size_t pos = 0; pos < json.size(); ++pos)
     {
-        pos = json.find('"', pos);
-        if (pos == std::string::npos) break;
-
-        size_t end = pos + 1;
-        while (end < json.size() && json[end] != '"')
+        const char c = json[pos];
+        if (c == '{' || c == '[')
+            ++depth;
+        else if (c == '}' || c == ']')
+            --depth;
+        else if (c == '"')
         {
-            if (json[end] == '\\' && end + 1 < json.size()) ++end;   // \" is not the end
-            ++end;
+            size_t end = pos + 1;
+            while (end < json.size() && json[end] != '"')
+            {
+                if (json[end] == '\\' && end + 1 < json.size()) ++end;   // \" is not the end
+                ++end;
+            }
+            if (end >= json.size())
+                return;
+            const size_t after = json.find_first_not_of(" \t\n\r", end + 1);
+            if (depth == 1 && after != std::string::npos && json[after] == ':')
+                out.insert(json.substr(pos + 1, end - pos - 1));
+            // Past this token whether it was a key or a value, so a value is never examined as if it were a key.
+            pos = end;
         }
-        if (end >= json.size()) break;
-
-        const size_t after = json.find_first_not_of(" \t\n\r", end + 1);
-        if (after != std::string::npos && json[after] == ':')
-            out.insert(json.substr(pos + 1, end - pos - 1));
-
-        // Past this token whether it was a key or a value, so a value is never
-        // examined as if it were a key of its own.
-        pos = end + 1;
     }
 }
 
 // Simple JSON value parser: extract string value for a key from JSON text
 std::string json_get_string(const std::string& json, std::string_view key)
 {
-    // Search for "key" pattern without allocating a needle string
-    size_t pos = 0;
-    while (pos < json.size())
+    size_t vpos = top_value_of(json, key);
+    if (vpos >= json.size())
+        return {};
+
+    if (json[vpos] == '"')
     {
-        pos = json.find('"', pos);
-        if (pos == std::string::npos) break;
-
-        // Check if this quoted string matches the key
-        if (pos + 1 + key.size() + 1 <= json.size() &&
-            json.compare(pos + 1, key.size(), key.data(), key.size()) == 0 &&
-            json[pos + 1 + key.size()] == '"')
+        ++vpos;
+        std::string result;
+        while (vpos < json.size() && json[vpos] != '"')
         {
-            // A key is followed by a colon -- the same sentence json_has_key
-            // and json_collect_keys carry, and the one place that did not ask.
-            // find(':', after_key) took the next colon ANYWHERE ahead, so a
-            // VALUE spelling the key matched and returned the following
-            // field's value: format_json_pretty writes "name" first, so a
-            // runtime named `target` read its own id as its target, one named
-            // `was_running` lost auto-restart, one named `port` restored with
-            // none.  valid_name allows every one of those.
-            const size_t after_key = pos + 1 + key.size() + 1;
-            const size_t colon = json.find_first_not_of(" \t\n\r", after_key);
-            if (colon == std::string::npos || json[colon] != ':')
+            if (json[vpos] == '\\' && vpos + 1 < json.size())
             {
-                pos++;          // a value that reads like a key; keep looking
-                continue;
+                result += json[vpos];
+                result += json[vpos + 1];
+                vpos += 2;
             }
-
-            // Skip whitespace
-            size_t vpos = json.find_first_not_of(" \t\n\r", colon + 1);
-            if (vpos == std::string::npos) break;
-
-            if (json[vpos] == '"')
+            else
             {
+                result += json[vpos];
                 ++vpos;
-                std::string result;
-                while (vpos < json.size() && json[vpos] != '"')
-                {
-                    if (json[vpos] == '\\' && vpos + 1 < json.size())
-                    {
-                        result += json[vpos];
-                        result += json[vpos + 1];
-                        vpos += 2;
-                    }
-                    else
-                    {
-                        result += json[vpos];
-                        ++vpos;
-                    }
-                }
-                return json_unescape(result);
             }
-
-            // Not a string — extract until comma, ], or }
-            size_t end = json.find_first_of(",]}", vpos);
-            if (end == std::string::npos) end = json.size();
-            std::string val = json.substr(vpos, end - vpos);
-            // Trim whitespace
-            while (!val.empty() && (val.back() == ' ' || val.back() == '\n' || val.back() == '\r' || val.back() == '\t'))
-                val.pop_back();
-            return val;
         }
-        pos++;
+        return json_unescape(result);
     }
-    return {};
+
+    // Not a string — extract until comma, ], or }
+    size_t end = json.find_first_of(",]}", vpos);
+    if (end == std::string::npos) end = json.size();
+    std::string val = json.substr(vpos, end - vpos);
+    // Trim whitespace
+    while (!val.empty() && (val.back() == ' ' || val.back() == '\n' || val.back() == '\r' || val.back() == '\t'))
+        val.pop_back();
+    return val;
 }
 
 bool json_get_bool(const std::string& json, std::string_view key, bool default_val = false)
@@ -442,6 +431,8 @@ T json_get_number(const std::string& json, std::string_view key, T default_val, 
 {
     std::string v = json_get_string(json, key);
     if (v.empty()) return default_val;
+    // stoul and stoull take a minus and wrap it, so -1 would come back as the largest value there is.
+    if (std::is_unsigned_v<T> && v.find('-') != std::string::npos) return default_val;
     try
     {
         size_t consumed = 0;
@@ -484,55 +475,33 @@ std::vector<std::string> json_get_array(const std::string& json, std::string_vie
 {
     std::vector<std::string> result;
 
-    // Search for "key" pattern without allocating a needle string
-    size_t pos = 0;
-    bool found = false;
-    while (pos < json.size())
-    {
-        pos = json.find('"', pos);
-        if (pos == std::string::npos) return result;
-        if (pos + 1 + key.size() + 1 <= json.size() &&
-            json.compare(pos + 1, key.size(), key.data(), key.size()) == 0 &&
-            json[pos + 1 + key.size()] == '"')
-        {
-            pos = pos + 1 + key.size() + 1;
-            found = true;
-            break;
-        }
-        pos++;
-    }
-    if (!found) return result;
-
-    pos = json.find('[', pos);
-    if (pos == std::string::npos) return result;
+    size_t pos = top_value_of(json, key);
+    if (pos >= json.size() || json[pos] != '[') return result;
     ++pos;
 
-    size_t end = json.find(']', pos);
-    if (end == std::string::npos) return result;
-
-    std::string arr = json.substr(pos, end - pos);
-    size_t i = 0;
-    while (i < arr.size())
+    // String by string to the bracket that closes the array, since a value may hold a ']' of its own.
+    while (pos < json.size())
     {
-        i = arr.find('"', i);
-        if (i == std::string::npos) break;
-        ++i;
+        pos = json.find_first_not_of(" \t\n\r,", pos);
+        if (pos == std::string::npos || json[pos] != '"')
+            break;
+        ++pos;
         std::string val;
-        while (i < arr.size() && arr[i] != '"')
+        while (pos < json.size() && json[pos] != '"')
         {
-            if (arr[i] == '\\' && i + 1 < arr.size())
+            if (json[pos] == '\\' && pos + 1 < json.size())
             {
-                val += arr[i];
-                val += arr[i + 1];
-                i += 2;
+                val += json[pos];
+                val += json[pos + 1];
+                pos += 2;
             }
             else
             {
-                val += arr[i];
-                ++i;
+                val += json[pos];
+                ++pos;
             }
         }
-        if (i < arr.size()) ++i; // skip closing quote
+        if (pos < json.size()) ++pos; // skip closing quote
         result.push_back(json_unescape(val));
     }
 
@@ -546,31 +515,8 @@ void json_get_extra(const std::string& json,
 {
     out.clear();
 
-    // Find the "extra" key itself, colon-checked like json_has_key so a value
-    // spelled extra is not mistaken for it.
-    size_t pos = 0;
-    bool found = false;
-    while (pos < json.size())
-    {
-        pos = json.find('"', pos);
-        if (pos == std::string::npos) return;
-        if (pos + 7 <= json.size() && json.compare(pos + 1, 5, "extra") == 0 &&
-            json[pos + 6] == '"')
-        {
-            const size_t after = json.find_first_not_of(" \t\n\r", pos + 7);
-            if (after != std::string::npos && json[after] == ':')
-            {
-                pos = after + 1;
-                found = true;
-                break;
-            }
-        }
-        pos++;
-    }
-    if (!found) return;
-
-    pos = json.find_first_not_of(" \t\n\r", pos);
-    if (pos == std::string::npos || json[pos] != '{')
+    size_t pos = top_value_of(json, "extra");
+    if (pos >= json.size() || json[pos] != '{')
         return;
     ++pos;
 
@@ -887,15 +833,15 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     };
 
     auto append_double_field = [&](const char* key, double val) {
-        // Use snprintf for doubles to match ostringstream default formatting
         char buf[64];
         // %g writes `inf`, which is not a JSON token and is what
         // `--rate-limit inf` put in this file: parse_double accepts an
         // infinity on purpose, so the value is kept as the largest number this
         // format can say rather than written as one nothing can read.
-        int n = snprintf(buf, sizeof(buf), "%g",
-                         std::isfinite(val) ? val
-                                            : std::numeric_limits<double>::max());
+        // The shortest text that reads back as the same double, where %g's six digits turned 1234567 into 1234570.
+        const auto [end, ec] = std::to_chars(buf, buf + sizeof(buf),
+                                             std::isfinite(val) ? val : std::numeric_limits<double>::max());
+        const int n = ec == std::errc{} ? static_cast<int>(end - buf) : snprintf(buf, sizeof(buf), "0");
         j += "    \"";
         j += key;
         j += "\": ";

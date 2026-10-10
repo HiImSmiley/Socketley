@@ -51,8 +51,4 @@ inline std::chrono::steady_clock::time_point coarse_now() noexcept
             std::chrono::seconds(ts.tv_sec) + std::chrono::nanoseconds(ts.tv_nsec)));
 }
 
-// What one tick of it is worth, for a caller deciding whether the resolution is
-// good enough for what it is about to compare.
-inline constexpr std::chrono::milliseconds coarse_resolution{1};
-
 }  // namespace socketley

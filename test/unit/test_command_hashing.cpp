@@ -10,11 +10,13 @@ TEST_CASE("FNV-1a basic correctness")
     CHECK(fnv1a("create") != fnv1a("remove"));
 }
 
-TEST_CASE("FNV-1a deterministic")
+TEST_CASE("FNV-1a known values")
 {
-    CHECK(fnv1a("hello") == fnv1a("hello"));
-    CHECK(fnv1a("set") == fnv1a("set"));
-    CHECK(fnv1a("lpush") == fnv1a("lpush"));
+    // The reference vectors, so a wrong offset basis or prime is caught.
+    CHECK(fnv1a("") == 0x811c9dc5u);
+    CHECK(fnv1a("a") == 0xe40c292cu);
+    CHECK(fnv1a("foobar") == 0xbf9cf968u);
+    CHECK(fnv1a_lower("FooBar") == 0xbf9cf968u);
 }
 
 TEST_CASE("FNV-1a case-insensitive variant")

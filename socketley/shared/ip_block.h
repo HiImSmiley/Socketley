@@ -51,6 +51,13 @@ struct ip_block
         {
             out.family = AF_INET6;
             out.bits = static_cast<uint8_t>(bits < 0 ? 128 : bits);
+            // An IPv4 address written as IPv6 is the IPv4 one, as a peer is matched, its prefix below the 96 bits.
+            if (IN6_IS_ADDR_V4MAPPED(reinterpret_cast<const in6_addr*>(out.addr)) && out.bits >= 96)
+            {
+                std::memmove(out.addr, out.addr + 12, 4);
+                out.family = AF_INET;
+                out.bits = static_cast<uint8_t>(out.bits - 96);
+            }
             return true;
         }
         return false;

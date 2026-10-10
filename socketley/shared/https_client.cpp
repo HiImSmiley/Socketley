@@ -9,6 +9,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 
@@ -26,7 +27,8 @@ bool fail(std::string& err, std::string why)
     return false;
 }
 
-bool parse(const std::string& raw, reply& out, std::string& err)
+// `whole` is the far end closing the stream itself, which alone ends a body that names no length.
+bool parse(const std::string& raw, bool whole, bool head, reply& out, std::string& err)
 {
     const size_t end = raw.find("\r\n\r\n");
     if (end == std::string::npos || raw.size() < 12)
@@ -47,10 +49,18 @@ bool parse(const std::string& raw, reply& out, std::string& err)
         pos = eol + 2;
     }
     std::string body = raw.substr(end + 4);
+    // An answer to HEAD, a 204 and a 304 carry no body whatever their headers say.
+    if (head || out.status == 204 || out.status == 304)
+    {
+        out.body.clear();
+        return true;
+    }
+    const std::string length = out.header("content-length");
     if (strncasecmp(out.header("transfer-encoding").c_str(), "chunked", 7) == 0)
     {
         std::string plain;
         size_t p = 0;
+        bool last = false;
         while (p < body.size())
         {
             const size_t eol = body.find("\r\n", p);
@@ -58,12 +68,29 @@ bool parse(const std::string& raw, reply& out, std::string& err)
                 break;
             const size_t n = std::strtoul(body.c_str() + p, nullptr, 16);
             if (n == 0)
+            {
+                last = true;
+                break;
+            }
+            // Compared without the sum, which a chunk size near 2^64 would wrap.
+            if (n > body.size() - (eol + 2))
                 break;
             plain.append(body, eol + 2, n);
             p = eol + 2 + n + 2;
         }
+        if (!last)
+            return fail(err, "the answer ended before its last chunk");
         body = std::move(plain);
     }
+    else if (!length.empty())
+    {
+        const size_t want = std::strtoull(length.c_str(), nullptr, 10);
+        if (body.size() < want)
+            return fail(err, "the answer ended " + std::to_string(want - body.size()) + " bytes short of its length");
+        body.resize(want);
+    }
+    else if (!whole)
+        return fail(err, "the connection broke before the answer ended");
     out.body = std::move(body);
     return true;
 }
@@ -108,7 +135,21 @@ bool client::request(std::string_view method, const std::string& url, std::strin
     const size_t slash = u.find('/');
     std::string hostport(u.substr(0, slash)), path(slash == std::string_view::npos ? "/" : u.substr(slash));
     std::string host = hostport, port = tls ? "443" : "80";
-    if (const size_t colon = hostport.rfind(':'); colon != std::string::npos && hostport.find(']') == std::string::npos)
+    // An IPv6 host is bracketed, and its brackets are no part of the address.
+    if (hostport.starts_with('['))
+    {
+        const size_t close = hostport.find(']');
+        if (close == std::string::npos)
+            return fail(err, "an IPv6 host is written in brackets: " + url);
+        host = hostport.substr(1, close - 1);
+        if (close + 1 < hostport.size())
+        {
+            if (hostport[close + 1] != ':')
+                return fail(err, "after an IPv6 host in brackets comes its port: " + url);
+            port = hostport.substr(close + 2);
+        }
+    }
+    else if (const size_t colon = hostport.rfind(':'); colon != std::string::npos)
     {
         host = hostport.substr(0, colon);
         port = hostport.substr(colon + 1);
@@ -177,19 +218,26 @@ bool client::request(std::string_view method, const std::string& url, std::strin
             err = "sending to " + hostport + " failed";
     }
     std::string raw;
+    bool whole = false;
     while (ok)
     {
         char buf[16384];
         const int n = ssl ? SSL_read(ssl, buf, sizeof buf) : static_cast<int>(::recv(fd, buf, sizeof buf, 0));
-        if (n <= 0)
-            break;
-        raw.append(buf, static_cast<size_t>(n));
+        if (n > 0)
+        {
+            raw.append(buf, static_cast<size_t>(n));
+            continue;
+        }
+        if (!ssl && n < 0 && errno == EINTR)
+            continue;
+        whole = ssl ? SSL_get_error(ssl, n) == SSL_ERROR_ZERO_RETURN : n == 0;
+        break;
     }
     if (ssl)
         SSL_free(ssl);
     ::close(fd);
     ERR_clear_error();
-    return ok && parse(raw, out, err);
+    return ok && parse(raw, whole, method == "HEAD", out, err);
 }
 
 }   // namespace https_client

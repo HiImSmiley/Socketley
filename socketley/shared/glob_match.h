@@ -114,4 +114,36 @@ inline bool glob_match(std::string_view pat, std::string_view str) noexcept
     return pi == pat.size();
 }
 
+
+// IAM's wildcard (StringLike, ARNs): '*' is any run of characters, '?' is one, nothing else is special, and `fold`
+// compares letters without case. A '*' in the pattern is a wildcard even where the text holds one too.
+inline bool iam_wild_match(std::string_view pat, std::string_view str, bool fold = false) noexcept
+{
+    constexpr size_t none = static_cast<size_t>(-1);
+    const auto low = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; };
+    size_t pi = 0, si = 0, star = none, star_si = 0;
+    while (si < str.size())
+    {
+        if (pi < pat.size() && pat[pi] == '*')
+        {
+            star    = pi++;
+            star_si = si;
+            continue;
+        }
+        if (pi < pat.size() && (pat[pi] == '?' || (fold ? low(pat[pi]) == low(str[si]) : pat[pi] == str[si])))
+        {
+            ++pi;
+            ++si;
+            continue;
+        }
+        if (star == none)
+            return false;
+        pi = star + 1;
+        si = ++star_si;
+    }
+    while (pi < pat.size() && pat[pi] == '*')
+        ++pi;
+    return pi == pat.size();
+}
+
 }  // namespace socketley

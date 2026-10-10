@@ -70,6 +70,12 @@ daemon_identity daemon_probe(const char*   socket_path,
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
+    // A path cut to fit could name another daemon's socket, which is no daemon of ours.
+    if (strlen(socket_path) >= sizeof(addr.sun_path))
+    {
+        close(fd);
+        return daemon_identity::foreign;
+    }
     strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
@@ -86,7 +92,8 @@ daemon_identity daemon_probe(const char*   socket_path,
     // Asked before a byte is written, because the probe itself is a command.
     struct ucred cr{};
     socklen_t    cr_len = sizeof(cr);
-    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cr_len) == 0 && !peer_trusted(cr.uid))
+    // A peer whose user cannot be learned is not taken on trust.
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cr_len) != 0 || !peer_trusted(cr.uid))
     {
         close(fd);
         return daemon_identity::stranger;
@@ -197,6 +204,11 @@ static int daemon_ipc(const char* cmd)
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
+    if (sock_path.size() >= sizeof(addr.sun_path))
+    {
+        close(fd);
+        return -1;
+    }
     strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
 
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
@@ -255,6 +267,16 @@ bool daemon_attach(std::string_view name, std::string_view type, uint16_t port)
 void daemon_detach()
 {
     if (g_attached_name.empty()) return;
+    // Asked of the daemon alone, as the attach was: whatever holds the path by now hears no name and no remove.
+    {
+        auto paths = socketley_paths::resolve();
+        const daemon_identity who = daemon_probe(paths.socket_path.string().c_str());
+        if (who != daemon_identity::daemon && who != daemon_identity::predates_ping)
+        {
+            g_attached_name.clear();
+            return;
+        }
+    }
     std::string cmd = "remove " + g_attached_name;
     daemon_ipc(cmd.c_str());
     g_attached_name.clear();

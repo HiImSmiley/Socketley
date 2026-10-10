@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -327,6 +328,20 @@ bool prepare_acme(const std::vector<std::string>& domains, std::string_view emai
     g_acme.push_back(std::move(a));
     g_next_renew = clock::now();
     return true;
+}
+
+int due_in_ms()
+{
+    if (g_watched.empty() && g_acme.empty())
+        return -1;
+    clock::time_point next = g_watched.empty() ? clock::time_point::max() : g_next_watch;
+    if (!g_acme.empty())
+        next = std::min(next, g_next_renew);
+    const clock::time_point now = clock::now();
+    if (next <= now)
+        return 0;
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(next - now).count() + 1;
+    return static_cast<int>(std::min<int64_t>(ms, std::numeric_limits<int>::max()));
 }
 
 void tick()

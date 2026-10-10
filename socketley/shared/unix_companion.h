@@ -36,7 +36,13 @@ public:
     unix_companion(std::string path, adopt_fn adopt)
         : m_path(std::move(path)), m_adopt(std::move(adopt)) {}
 
-    ~unix_companion() override { close_node(); }
+    // The owner slot goes with it, so a completion of the withdrawn accept is dropped and not handed to freed memory.
+    ~unix_companion() override
+    {
+        close_node();
+        if (m_loop)
+            m_loop->deregister_owner(this);
+    }
 
     unix_companion(const unix_companion&)            = delete;
     unix_companion& operator=(const unix_companion&) = delete;

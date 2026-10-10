@@ -33,6 +33,8 @@ uint64_t g_seq{0};
 // and by drain().
 std::mutex g_io_mtx;
 std::vector<source> g_sources;
+// Pipes handed over by worker_pipe(), under a lock of their own: a spawn waits for nothing a slow stderr holds up.
+std::mutex g_new_mtx;
 std::vector<source> g_new;
 int g_wake{-1};
 bool g_started{false};
@@ -91,12 +93,12 @@ bool take(source& s)
         // Passed on as it came, so the journal sees what it always saw.
         if (::write(STDERR_FILENO, buf, static_cast<size_t>(n)) < 0) {}
         s.partial.append(buf, static_cast<size_t>(n));
-        for (size_t nl; (nl = s.partial.find('\n')) != std::string::npos;)
-        {
-            if (nl > 0)
-                keep(s.runtime, std::string_view(s.partial).substr(0, nl));
-            s.partial.erase(0, nl + 1);
-        }
+        // Walked by offset with one erase at the end, since an erase per line made a read of many lines quadratic.
+        size_t from = 0;
+        for (size_t nl; (nl = s.partial.find('\n', from)) != std::string::npos; from = nl + 1)
+            if (nl > from)
+                keep(s.runtime, std::string_view(s.partial).substr(from, nl - from));
+        s.partial.erase(0, from);
         // A line that never ends is kept in pieces rather than held for ever.
         if (s.partial.size() > 16384)
         {
@@ -113,9 +115,12 @@ void reader()
     {
         {
             std::lock_guard lock(g_io_mtx);
-            for (source& s : g_new)
-                g_sources.push_back(std::move(s));
-            g_new.clear();
+            {
+                std::lock_guard taken(g_new_mtx);
+                for (source& s : g_new)
+                    g_sources.push_back(std::move(s));
+                g_new.clear();
+            }
             fds.clear();
             fds.push_back({g_wake, POLLIN, 0});
             for (const source& s : g_sources)
@@ -195,7 +200,7 @@ int worker_pipe(std::string_view runtime)
         return -1;
     }
     {
-        std::lock_guard lock(g_io_mtx);
+        std::lock_guard lock(g_new_mtx);
         source s;
         s.fd = p[0];
         s.runtime.assign(runtime);
@@ -216,18 +221,36 @@ std::vector<entry> since(uint64_t seq, size_t max, std::string_view runtime, std
     const auto rank = [](std::string_view l) { return l == "error" ? 3 : l == "warn" ? 2 : l == "info" ? 1 : 0; };
     const int floor = level.empty() ? 0 : rank(level);
     const std::string quoted = "'" + std::string(runtime) + "'";
+    const auto wanted = [&](const entry& e)
+    {
+        return rank(e.level) >= floor &&
+               (runtime.empty() || e.runtime == runtime || e.text.find(quoted) != std::string::npos);
+    };
     std::vector<entry> out;
     std::lock_guard lock(g_ring_mtx);
     next = g_seq;
-    for (auto it = g_ring.rbegin(); it != g_ring.rend() && it->seq > seq && out.size() < max; ++it)
+    // A first look is the newest lines; a cursor goes on from where it was, oldest first, and its next names the last
+    // line given, so lines past `max` come with the following ask and none is skipped.
+    if (seq == 0)
     {
-        if (rank(it->level) < floor)
+        for (auto it = g_ring.rbegin(); it != g_ring.rend() && out.size() < max; ++it)
+            if (wanted(*it))
+                out.push_back(*it);
+        std::reverse(out.begin(), out.end());
+        return out;
+    }
+    auto it = std::find_if(g_ring.begin(), g_ring.end(), [seq](const entry& e) { return e.seq > seq; });
+    for (; it != g_ring.end(); ++it)
+    {
+        if (!wanted(*it))
             continue;
-        if (!runtime.empty() && it->runtime != runtime && it->text.find(quoted) == std::string::npos)
-            continue;
+        if (out.size() == max)
+        {
+            next = out.back().seq;
+            break;
+        }
         out.push_back(*it);
     }
-    std::reverse(out.begin(), out.end());
     return out;
 }
 

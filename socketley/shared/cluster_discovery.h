@@ -16,6 +16,13 @@
 class event_loop;
 class runtime_manager;
 
+// The reading of a daemon's published file, which `socketley cluster` reads the same way.
+namespace cd_detail {
+std::string json_get_string(std::string_view json, std::string_view key);
+int64_t json_get_number(std::string_view json, std::string_view key);
+std::vector<std::string_view> json_get_array_objects(std::string_view json, std::string_view key);
+}
+
 struct cluster_event
 {
     enum type_t { daemon_join, daemon_leave, group_change } kind;

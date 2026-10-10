@@ -396,6 +396,27 @@ else fail "a large finite double still encodes and round-trips" \
           "1e300 is an ordinary number; refusing it means the guard is on" \
           "magnitude rather than on finiteness."; fi
 
+# A number past a double's range is as large as a double goes, not a zero the script cannot tell from one sent.
+cat > "$SCRIPTS/huge.lua" <<'LUA'
+function on_start()
+  local a = socketley.json_decode('{"x":1e400,"y":-1e400,"z":123456789012345678901234567890}')
+  socketley.log("HUGE " .. tostring(a.x == math.huge) .. " " .. tostring(a.y == -math.huge) .. " " .. tostring(a.z > 1e29))
+  local t = 1700000000.123456
+  local back = socketley.json_decode(socketley.json_encode({ t = t }))
+  socketley.log("EXACT " .. tostring(back and back.t == t))
+end
+LUA
+run_script jsonhuge $((P + 9)) "$SCRIPTS/huge.lua"
+if said "HUGE true true true"; then pass
+else fail "a number past a double's range keeps its magnitude" \
+          "$(grep -o 'HUGE.*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)" \
+          "1e400 decoded as 0, which a script reads as a number that was sent."; fi
+
+if said "EXACT true"; then pass
+else fail "a double goes through json_encode and json_decode unchanged" \
+          "$(grep -o 'EXACT.*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)" \
+          "fourteen digits were written, so 1700000000.123456 came back as 1700000000.1235."; fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi
 exit "$FAIL"

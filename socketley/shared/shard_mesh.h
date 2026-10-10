@@ -72,8 +72,14 @@ public:
         // goes now and the slot stays claimed until they have drained.
         if (m_loop)
             m_loop->deregister_owner(this);
-        if (m_fd >= 0 && !m_loop)
-            ::close(m_fd);
+        // A link never die()d still has its descriptor, which the loop closes once nothing in the ring names it.
+        if (m_fd >= 0)
+        {
+            if (m_loop)
+                m_loop->close_fd(m_fd);
+            else
+                ::close(m_fd);
+        }
     }
 
     shard_link(const shard_link&)            = delete;
@@ -335,7 +341,13 @@ private:
         {
             worker_proto::chan_request_wire q;
             if (!worker_proto::decode_chan_request(payload, q))
+            {
+                // Answered as dropped when its ticket can be read, or the sender holds the crossing for good.
+                worker_proto::reader r(payload.data(), payload.size());
+                if (const uint64_t ticket = r.u64(); r.ok)
+                    send_reply(ticket, request_status::dropped, {});
                 return;
+            }
 
             std::string reply;
             const mesh_verdict v = m_server

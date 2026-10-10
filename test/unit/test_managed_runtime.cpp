@@ -6,8 +6,27 @@
 #include "shared/event_loop.h"
 
 #include <filesystem>
+#include <string>
+#include <system_error>
+#include <vector>
 #include <sys/wait.h>
 #include <unistd.h>
+
+namespace {
+
+// Removes its paths on every exit from a test body, the throw of a failing REQUIRE included.
+struct removed_on_exit
+{
+    std::vector<std::string> paths;
+    ~removed_on_exit()
+    {
+        std::error_code ec;
+        for (const auto& p : paths)
+            std::filesystem::remove_all(p, ec);
+    }
+};
+
+} // namespace
 
 // ─── Flag behavior ───
 
@@ -92,6 +111,7 @@ TEST_CASE("managed runtime persistence")
 
     char tmpdir[] = "/tmp/socketley-test-XXXXXX";
     REQUIRE(mkdtemp(tmpdir) != nullptr);
+    const removed_on_exit cleanup{{tmpdir}};
     fs::path tmp_path(tmpdir);
 
     state_persistence sp(tmp_path);
@@ -231,8 +251,6 @@ TEST_CASE("managed runtime persistence")
         CHECK(sp.parse_json_string(json, parsed));
         CHECK(parsed.exec_path == "/opt/my app/bin/serv\"er");
     }
-
-    fs::remove_all(tmp_path);
 }
 
 // ─── Fork+exec lifecycle ───
@@ -369,6 +387,7 @@ TEST_CASE("managed runtime env vars in child")
 
     // Create a small shell script that dumps the env vars
     std::string script_path = std::string(tmpfile) + ".sh";
+    const removed_on_exit cleanup{{tmpfile, script_path}};
     {
         FILE* f = fopen(script_path.c_str(), "w");
         REQUIRE(f);
@@ -406,8 +425,4 @@ TEST_CASE("managed runtime env vars in child")
     CHECK(output == "1|env-test");
 
     inst->stop(loop);
-
-    // Cleanup
-    unlink(tmpfile);
-    unlink(script_path.c_str());
 }

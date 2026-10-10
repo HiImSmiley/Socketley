@@ -902,6 +902,14 @@ TEST_CASE("a marker that is a rolled-up prefix skips the keys behind it")
     q.delimiter.clear();
     REQUIRE(r.store->list("bkt", q, p) == st::ok);
     CHECK(keys_of(p) == std::vector<std::string>{"b/1", "b/2", "c", "d/1"});
+
+    // A marker that is a key below the prefix is a key: what follows it, b/2, rolls up into b/, which the caller
+    // has not been given.
+    q.delimiter   = "/";
+    q.start_after = "b/1";
+    REQUIRE(r.store->list("bkt", q, p) == st::ok);
+    CHECK(keys_of(p) == std::vector<std::string>{"c"});
+    CHECK(p.prefixes == std::vector<std::string>{"b/", "d/"});
 }
 
 TEST_CASE("a clean restart keeps every object and trusts the journal")

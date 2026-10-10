@@ -530,8 +530,9 @@ constexpr uint64_t cache_scan_cursor_make(uint32_t shard, uint64_t store_cursor)
          | (store_cursor & cache_scan_store_mask);
 }
 
-// The ownership function fingerprinted over sixteen fixed probes always, so a
-// changed hash takes the filter path instead of misplacing every key.
+// The ownership function fingerprinted as eight fixed probes placed among
+// sixteen shards always, so a changed hash takes the filter path instead of
+// misplacing every key.
 inline constexpr uint32_t cache_fingerprint_count = 16;
 
 inline constexpr std::string_view cache_fingerprint_probes[] = {

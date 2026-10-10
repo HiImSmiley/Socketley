@@ -57,6 +57,18 @@ inline bool replace_file(const std::string& path, std::string_view data, bool du
         ::unlink(tmp.c_str());
         return false;
     }
+    // And the rename itself, which lives in the directory: without its sync a crash could bring the old file back.
+    if (durable)
+    {
+        const size_t slash = path.rfind('/');
+        const std::string dir = slash == std::string::npos ? std::string(".") : path.substr(0, slash ? slash : 1);
+        const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd < 0)
+            return false;
+        const bool synced = ::fsync(dfd) == 0;
+        ::close(dfd);
+        return synced;
+    }
     return true;
 }
 

@@ -633,7 +633,12 @@ private:
             char tmp[4096];
             int n = detail::platform::sock_recv(m_fd, tmp, sizeof(tmp));
             if (n <= 0)
+            {
+                // The peer is gone or did not answer in time: either way the replies on this connection no longer
+                // line up with the commands, so it is closed, which is how every caller tells a failure from a reply.
+                close();
                 return {};
+            }
             m_buf.append(tmp, static_cast<size_t>(n));
         }
     }

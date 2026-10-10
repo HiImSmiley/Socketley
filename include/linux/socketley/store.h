@@ -1,9 +1,9 @@
 // socketley/store.h -- the keyed store, as a data structure
 //
 // cache_store is what the cache runtime keeps its keys in, and nothing about
-// it is tied to that runtime: the header includes ten standard headers and not
-// one of the engine's, so a program can hold one without an event loop, a
-// daemon, or io_uring.  It was reachable only by including the cache runtime's
+// it is tied to that runtime: the header brings the store's own containers and
+// standard headers and nothing of the engine's loop, so a program can hold one
+// without an event loop, a daemon, or io_uring.  It was reachable only by including the cache runtime's
 // own header, which is to say it was reachable by accident.
 //
 //   cache_store s;

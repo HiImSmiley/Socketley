@@ -72,7 +72,7 @@ public:
     // becomes the new child's or `ls` reports a life the process did not have,
     // and the count is the only sign left that a store was lost.
     void     note_restart();
-    unsigned restart_count() const { return m_restarts; }
+    unsigned restart_count() const { return m_restarts.load(std::memory_order_relaxed); }
 
     // A live worker that has stopped answering, decided by the supervisor and
     // held here because `ls` reads instances and not supervisors.
@@ -905,7 +905,8 @@ private:
 
     // Not persisted: a daemon that restarts did not witness these, and a count
     // restored from a file would claim it had.
-    unsigned m_restarts{0};
+    // Counted by the daemon's loop and read by the metrics thread.
+    std::atomic<unsigned> m_restarts{0};
     bool     m_unresponsive{false};
 
     // Bash output settings

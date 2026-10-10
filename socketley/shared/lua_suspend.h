@@ -307,6 +307,10 @@ public:
                 luaL_unref(L, LUA_REGISTRYINDEX, r.ref);
         }
         m_live.clear();
+        // A frame still running is let go once its resume has returned, not under it.
+        for (const frame& f : m_frames)
+            if (f.ref != LUA_NOREF)
+                m_orphaned.push_back(f.ref);
         m_frames.clear();
         for (const auto& p : m_pool)
             luaL_unref(L, LUA_REGISTRYINDEX, p.ref);
@@ -434,13 +438,24 @@ private:
                                       m_owner_name.c_str());
             // Three arguments and not two: sol's 5.1 compatibility layer
             // defines lua_resume with the 5.4 signature and drops the caller.
+            ++m_resuming;
             rc = lua_resume(started.th, nullptr, nargs);
+            --m_resuming;
         }
 
         // A script that stopped its own runtime ran forget_all() under this
         // resume, which let the frame go with everything else.
         if (SOCKETLEY_UNLIKELY(m_frames.empty()))
+        {
+            // Only the outermost resume releases, since a frame below this one may still be running.
+            if (m_resuming == 0)
+            {
+                for (const int ref : m_orphaned)
+                    luaL_unref(m_lua->lua_state(), LUA_REGISTRYINDEX, ref);
+                m_orphaned.clear();
+            }
             return outcome::failed;
+        }
 
         const frame done = m_frames.back();   // an await may have given it an id
         m_frames.pop_back();
@@ -518,6 +533,12 @@ private:
     std::string m_owner_name;
 
     std::vector<frame>               m_frames;
+
+    // The registry references of frames forget_all() let go while they ran, released after their resume.
+
+    std::vector<int> m_orphaned;
+    // Resumes under way, nested when a handler's script starts another.
+    uint32_t m_resuming{0};
     std::vector<pooled>              m_pool;
     std::unordered_map<id_t, record> m_live;
     std::vector<id_t>                m_expired;

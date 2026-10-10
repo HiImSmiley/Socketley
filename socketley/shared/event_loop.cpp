@@ -51,6 +51,9 @@ void event_loop::shutdown_ring()
     // Before the ring goes, because every one of these names the ring, and
     // running them in the destructor told a closed and possibly reissued
     // descriptor to release buffers.
+    // The buffers themselves go only after the ring has, since a receive the kernel already gave one to may still
+    // be writing into it until the ring's requests are cancelled.
+    std::vector<char*> bases;
     for (uint16_t gid = 0; gid < MAX_BUF_GROUPS; ++gid)
     {
         auto& pool = m_buf_rings[gid];
@@ -59,7 +62,8 @@ void event_loop::shutdown_ring()
             io_uring_free_buf_ring(&m_ring, pool.ring, pool.buf_count, gid);
             pool.ring = nullptr;
         }
-        free(pool.base);
+        if (pool.base)
+            bases.push_back(pool.base);
         pool.base = nullptr;
     }
 
@@ -79,6 +83,8 @@ void event_loop::shutdown_ring()
     m_files_registered     = false;
     m_registered_file_count = 0;
     io_uring_queue_exit(&m_ring);
+    for (char* b : bases)
+        free(b);
 
     // Descriptors close_fd() was holding because the ring named them, swept
     // here because this is the one point where nothing can resolve a number
@@ -1731,7 +1737,7 @@ bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t 
     // Register all buffers
     for (uint32_t i = 0; i < buf_count; i++)
     {
-        io_uring_buf_ring_add(br, base + (i * buf_size), buf_size, static_cast<uint16_t>(i),
+        io_uring_buf_ring_add(br, base + (static_cast<size_t>(i) * buf_size), buf_size, static_cast<uint16_t>(i),
             io_uring_buf_ring_mask(buf_count), static_cast<int>(i));
     }
     io_uring_buf_ring_advance(br, buf_count);
