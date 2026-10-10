@@ -227,7 +227,11 @@ stop_holder
 wait_for_shards 4 && ok "the dead shard was replaced" \
                   || bad "replacement: $(shard_count) workers, wanted 4"
 
-open_window
+# The live shards may still be closing the holder's connections, which settles; a dead shard's figure never does.
+for _ in $(seq 1 16); do
+    open_window
+    [ "$(w_min)-$(w_max)" = "0-0" ] && break
+done
 echo "  observed: shards reported between $(w_min) and $(w_max) with nothing connected"
 check "a dead shard's last figure is not summed forever" "$(w_min)-$(w_max)" "0-0"
 

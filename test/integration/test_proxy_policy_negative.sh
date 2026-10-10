@@ -150,18 +150,20 @@ PY
 
 # One request.  Prints the status line, or ABORTED/EOF/TIMEOUT.
 cat > "$TMPD/req.py" <<'PY'
-import socket, struct, sys
+import socket, struct, sys, time
 port = int(sys.argv[1]); path = sys.argv[2]
 method = sys.argv[3] if len(sys.argv) > 3 else "GET"
 body = sys.argv[4].encode() if len(sys.argv) > 4 and sys.argv[4] != "-" else b""
 abort = "--abort" in sys.argv
+# How long the request stands before the reset, so it is at the backend when the client goes.
+abort_after = next((float(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--abort-after=")), 0.0)
 req = ("%s %s HTTP/1.1\r\nHost: h\r\nContent-Length: %d\r\n\r\n"
        % (method, path, len(body))).encode() + body
 try:
     s = socket.create_connection(("127.0.0.1", port), 5); s.settimeout(10)
     if abort:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-        s.sendall(req); s.close(); print("ABORTED"); sys.exit(0)
+        s.sendall(req); time.sleep(abort_after); s.close(); print("ABORTED"); sys.exit(0)
     s.sendall(req)
     data = b""
     while b"\r\n\r\n" not in data:
@@ -298,10 +300,12 @@ stop_backends
 
 start_backend b2 "$BE1" slow 0.35
 make_proxy "127.0.0.1:$BE1"
-for _ in $(seq 1 10); do python3 "$TMPD/req.py" "$PX" /pn_px/b GET - --abort >/dev/null 2>&1 || true; done
+# Reset 0.2 s in, inside the backend's 0.35 s, so each one is gone mid-exchange: one sent and reset at once can lose
+# its bytes in the proxy's receive queue and reach nobody.
+for _ in $(seq 1 10); do python3 "$TMPD/req.py" "$PX" /pn_px/b GET - --abort --abort-after=0.2 >/dev/null 2>&1 || true; done
 sleep 0.5
 # The backend has to have been reached, or the closed circuit below says nothing about aborts mid-exchange.
-assert_range "$(count_of b2)" 1 10 "control: aborted requests reached the backend"
+assert_range "$(count_of b2)" 10 10 "control: aborted requests reached the backend"
 assert_eq "$(circuits)" "0" "clients aborting mid-exchange do not open the circuit"
 assert_eq "$(python3 "$TMPD/req.py" "$PX" /pn_px/b2)" "HTTP/1.1 200 OK" "and the proxy still serves"
 stop_backends

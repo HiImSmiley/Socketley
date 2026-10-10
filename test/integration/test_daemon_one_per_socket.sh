@@ -58,6 +58,8 @@ done
 # A daemon started while one is serving changes nothing and says nothing.
 "$BIN" daemon >/dev/null 2>&1 &
 for _ in $(seq 1 50); do "$BIN" ping >/dev/null 2>&1 && break; sleep 0.1; done
+# The ping may have started one of its own, which leaves once the other answers.
+for _ in $(seq 1 40); do [ "$(daemons | wc -l)" -eq 1 ] && break; sleep 0.1; done
 FIRST=$(daemons)
 OUT=$("$BIN" daemon 2>&1); RC=$?
 if [ "$RC" -eq 0 ] && [ -z "$OUT" ] && [ "$(daemons)" = "$FIRST" ]; then pass "a second start beside a serving daemon is a silent no-op"
