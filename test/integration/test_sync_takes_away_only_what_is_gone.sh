@@ -8,6 +8,9 @@
 #     bucket, which no later run can fill again
 #   * a file below a directory the walk may not enter taken off the far side
 #   * a file deleted here, or replaced by a link to nothing, left on it
+#   * a link to a file outside --dir carried, which sends whatever whoever may
+#     write in --dir points it at
+#   * a target named by a host never resolved, which only an address hides
 #   * a file above one request's 5 GiB never arriving, which needs parts --
 #     and a part out of place, which the marks at their edges would show
 #   * with --every never: a file written, changed or deleted after the first
@@ -73,6 +76,9 @@ printf 'b\n' > "$T/src/sub/b.txt"
 printf 'c\n' > "$T/src/locked/c.txt"
 printf 'l\n' > "$T/src/target.txt"
 ln -s target.txt "$T/src/link.txt"
+# A link out of --dir, which whoever may write there could point at anything the daemon may read.
+printf 'not yours\n' > "$T/outside.txt"
+ln -s "$T/outside.txt" "$T/src/escape.txt"
 
 # ─── what create refuses ────────────────────────────────────────────────────
 refused() { "$BIN" create sync bad --dir "$T/src" --storage "$1" --credentials "$T/creds" 2>&1 | grep -c -- "$2"; }
@@ -96,7 +102,7 @@ expect "none of them was made" "$("$BIN" ls 2>/dev/null | grep -c ' bad ')" 0
 # ─── watched rather than walked ─────────────────────────────────────────────
 "$BIN" create sync s --dir "$T/src" --storage box/photos --credentials "$T/creds" --every never -s >/dev/null 2>&1
 until_keys 30 photos "a.txt link.txt locked/c.txt sub/b.txt target.txt"
-expect "the first walk carries everything, a link as what it points at" "$(keys)" "a.txt link.txt locked/c.txt sub/b.txt target.txt"
+expect "the first walk carries everything, a link as what it points at, and no link out of --dir" "$(keys)" "a.txt link.txt locked/c.txt sub/b.txt target.txt"
 # The figures arrive once the worker has published them, which a sanitizer build does later.
 for _ in $(seq 1 20); do [ "$(st s watched)" = 3 ] && break; sleep 0.5; done
 expect "and inotify watches every directory" "$(st s watched)" 3
@@ -163,6 +169,14 @@ expect "a --dir ending in a slash keeps every name whole" "$(keys | tr ' ' '\n' 
     "sl/a.txt sl/later/deeper/d.txt sl/locked/c.txt sl/sub/b.txt"
 "$BIN" remove sl >/dev/null 2>&1
 
+# ─── a host given by name ───────────────────────────────────────────────────
+# Resolved on the resolver's own thread, whose answer has to wake the run's loop: an address alone never asks.
+S -o /dev/null -X PUT "http://127.0.0.1:$P/named"
+"$BIN" create sync named --dir "$T/src" --storage "http://localhost:$P/named" --credentials "$T/creds" -s >/dev/null 2>&1
+for _ in $(seq 1 30); do [ "$(keys named | wc -w)" = 4 ] && break; sleep 0.5; done
+expect "a target named by a host is resolved and carried to" "$(keys named | wc -w) $(st named failures)" "4 0"
+"$BIN" remove named >/dev/null 2>&1
+
 # ─── a file too large for one request ───────────────────────────────────────
 # 600 MiB, sparse, with a mark at the end of the first part, at the start of the second and at the end of the file:
 # one PUT carries at most 5 GiB, so a file above that never arrives unless it goes in parts.
@@ -187,6 +201,17 @@ S -o /dev/null -X DELETE "http://127.0.0.1:$P/big/v.img"; rm -rf "$T/big"
 for _ in $(seq 1 20); do [ -n "$(st nostore last_error)" ] && break; sleep 0.5; done
 expect "a runtime named that is no storage is said" "$(st nostore last_error | grep -c 'is a cache runtime, not a storage')" 1
 "$BIN" remove nostore >/dev/null 2>&1
+
+# A target with no runtime behind it yet holds up nothing of the others: its queue could not shrink, and while it
+# held anything no walk ran -- and a link whose target goes is seen by a walk alone.
+mkdir -p "$T/two"; printf 't\n' > "$T/two/t.txt"; ln -s t.txt "$T/two/l.txt"; printf 's\n' > "$T/two/stay.txt"
+S -o /dev/null -X PUT "http://127.0.0.1:$P/two"
+"$BIN" create sync pair --dir "$T/two" --storage "box/two,nobody/two" --credentials "$T/creds" --every 2s -s >/dev/null 2>&1
+for _ in $(seq 1 30); do [ "$(keys two)" = "l.txt stay.txt t.txt" ] && break; sleep 0.5; done
+rm "$T/two/t.txt"
+for _ in $(seq 1 30); do [ "$(keys two)" = "stay.txt" ] && break; sleep 0.5; done
+expect "a target that is not there yet holds up no walk of the others" "$(keys two) $(st pair waiting)" "stay.txt 0"
+"$BIN" remove pair >/dev/null 2>&1
 
 U="http://127.0.0.1:$M"
 curl -s -X POST -c "$T/jar" -u "$ADMIN" "$U/api/session" >/dev/null

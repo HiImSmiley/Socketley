@@ -5,6 +5,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <climits>
+#include <cstdlib>
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -100,8 +102,22 @@ bool read_sync_credentials(const std::string& path, sync_credentials& out, std::
     }
     std::string text;
     char buf[4096];
-    for (ssize_t n; (n = ::read(fd, buf, sizeof buf)) > 0;)
+    for (;;)
+    {
+        const ssize_t n = ::read(fd, buf, sizeof buf);
+        if (n < 0 && errno == EINTR)
+            continue;
+        // Half a credentials file is a wrong secret, so a read that breaks off is no read.
+        if (n < 0)
+        {
+            why = path + ": " + std::strerror(errno);
+            ::close(fd);
+            return false;
+        }
+        if (n == 0)
+            break;
         text.append(buf, static_cast<size_t>(n));
+    }
     ::close(fd);
 
     for (size_t p = 0; p < text.size();)
@@ -241,6 +257,8 @@ bool sync_run::start(std::string& why)
         why = index.parent_path().string() + ": " + ec.message();
         return false;
     }
+    char root[PATH_MAX];
+    m_root_real = ::realpath(std::string(m_rt.get_dir()).c_str(), root) ? root : std::string(m_rt.get_dir());
     // The directory and the prefix decide which object a path is, so an index kept for others is begun again.
     const std::string scope = std::string(m_rt.get_dir()) + "\n" + std::string(m_rt.get_prefix());
     if (!m_index.open(index.string(), scope, why))
@@ -269,6 +287,9 @@ bool sync_run::start(std::string& why)
     }
 
     m_stats.indexed = m_index.size();
+    // A host given by name is resolved on the pool's thread, whose answers wake this loop only once it is attached.
+    if (!m_resolver.attach(m_io))
+        say("the resolver cannot be waited for, so a target named by a host is not reached");
     for (auto& t : m_targets)
         ensure_address(t);
 
@@ -302,6 +323,10 @@ void sync_run::stop()
     m_watches.clear();
     if (m_tick_armed)
         m_loop.submit_timeout_remove(&m_tick_req);
+    // A resolve in progress is waited out here, which the system resolver's own timeout bounds.
+    m_resolver.stop();
+    if (const int fd = m_resolver.release_wake_fd(); fd >= 0)
+        m_loop.close_fd(fd);
 }
 
 bool sync_run::drained() const
@@ -510,6 +535,19 @@ bool sync_run::provably_gone(const std::string& rel) const
     return S_ISLNK(st.st_mode) && ::stat(full.c_str(), &st) != 0 && (errno == ENOENT || errno == ENOTDIR);
 }
 
+bool sync_run::inside(const std::string& full, std::string* real) const
+{
+    char buf[PATH_MAX];
+    if (!::realpath(full.c_str(), buf))
+        return false;
+    const std::string_view r(buf);
+    const bool in = r == m_root_real || (r.size() > m_root_real.size() && r.starts_with(m_root_real) &&
+                                         (m_root_real == "/" || r[m_root_real.size()] == '/'));
+    if (real)
+        real->assign(r);
+    return in;
+}
+
 void sync_run::check_path(const std::string& rel)
 {
     const std::string full = std::string(m_rt.get_dir()) + "/" + rel;
@@ -518,6 +556,14 @@ void sync_run::check_path(const std::string& rel)
     {
         if (!S_ISREG(st.st_mode))
             return;
+        // A link is carried as what it names only when that is below --dir: one pointing out would send a file the
+        // job was never given, which anyone who may write in --dir could choose.
+        struct stat lst{};
+        if (::lstat(full.c_str(), &lst) == 0 && S_ISLNK(lst.st_mode) && !inside(full, nullptr))
+        {
+            say(rel + " is a link to a file outside " + std::string(m_rt.get_dir()) + ", which is not carried");
+            return;
+        }
         const int64_t mtime = int64_t(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
         for (auto& t : m_targets)
         {
@@ -723,8 +769,15 @@ void sync_run::body_from(const target& t, http_request& rq, const std::shared_pt
 
 void sync_run::carry(target& t, lane& l, const job& j)
 {
-    const std::string path = std::string(m_rt.get_dir()) + "/" + j.path;
-    const int raw = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    // Opened by the path it resolves to, and only below --dir, so a link changed since it was looked at cannot
+    // point the upload anywhere else.
+    std::string real;
+    if (!inside(std::string(m_rt.get_dir()) + "/" + j.path, &real))
+    {
+        l.busy = false;
+        return;
+    }
+    const int raw = ::open(real.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
     struct stat st{};
     if (raw < 0 || ::fstat(raw, &st) != 0 || !S_ISREG(st.st_mode))
     {
@@ -1020,6 +1073,14 @@ void sync_run::turn()
     for (auto& t : m_targets)
     {
         pump(t);
+        // A target with no address yet keeps nothing queued: the walk owed once it has one finds it all again, and
+        // a queue that could not shrink held up every target's walks and grew by a whole walk each time.
+        if (t.lanes.empty())
+        {
+            if (!t.queue.empty())
+                owe_retry();
+            t.queue.clear();
+        }
         waiting += t.queue.size();
     }
     m_stats.waiting = waiting;

@@ -148,6 +148,8 @@ private:
     void check_path(const std::string& rel);
     // Whether a path the index holds is gone from this side for certain, rather than unreadable or excluded now.
     bool provably_gone(const std::string& rel) const;
+    // Whether `full` resolves to a place below --dir, with the place it resolves to in `real`.
+    bool inside(const std::string& full, std::string* real) const;
 
     // inotify: one watch per directory the walk passes, a read standing on the descriptor, and what it said.
     void watch_dir(const std::string& rel);
@@ -221,6 +223,9 @@ private:
     __kernel_timespec m_tick_ts{};
     io_request m_tick_req{};
     bool m_tick_armed{false};
+
+    // --dir as the filesystem names it, links resolved, which every link's target is held against.
+    std::string m_root_real;
 
     sync_stats m_stats;
     bool       m_stopped{false};
