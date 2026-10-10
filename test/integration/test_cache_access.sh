@@ -287,6 +287,10 @@ def ask(cmd):
 hi = 1
 while ask("cache get %d" % hi) != "nil":
     hi *= 2
+    # No run of this file writes anywhere near this many keys, so a cache that answers every key ends the search.
+    if hi > 1 << 30:
+        print("STORE BAD every key up to %d answers" % hi)
+        raise SystemExit(0)
 lo = hi // 2
 while lo + 1 < hi:
     mid = (lo + hi) // 2
@@ -310,8 +314,14 @@ BURST = 20000
 s.sendall(("".join("burst%d\n" % i for i in range(BURST))).encode())
 first = ask("cache get %d" % (base + 2))
 last = ask("cache get %d" % (base + 1 + BURST))
+# Every key between them as well, since a batch dropped in the middle leaves the ends intact.
+middle = []
+for at in range(0, BURST, 1000):
+    s.sendall("".join("cache get %d\n" % (base + 2 + i) for i in range(at, at + 1000)).encode())
+    middle += read_lines(s, 1000)
 s.close()
-burst_ok = (first == "burst0" and last == "burst%d" % (BURST - 1))
+burst_ok = (first == "burst0" and last == "burst%d" % (BURST - 1)
+            and middle == ["burst%d" % i for i in range(BURST)])
 
 print("STORE", "ok" if (same_write and split_write and burst_ok)
       else "BAD same=%s split=%s burst=%s" % (same_write, split_write, burst_ok))

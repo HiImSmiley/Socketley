@@ -922,6 +922,8 @@ void cache_instance::teardown(event_loop& /*loop*/)
     // Drain: flush pending write queues with blocking writes
     if (get_drain())
     {
+        // One end for every connection together, so a client that stopped reading cannot hold the stop.
+        const auto drain_end = std::chrono::steady_clock::now() + socketley::drain_budget;
         for (auto& [fd, conn] : m_clients)
         {
             // These blocking writes go through the session, because the
@@ -962,7 +964,7 @@ void cache_instance::teardown(event_loop& /*loop*/)
                         const int c = tls_context::bio_read_out(conn->ssl, cbuf, sizeof(cbuf));
                         if (c <= 0)
                             break;
-                        if (!socketley::write_all(fd, cbuf, static_cast<size_t>(c)))
+                        if (!socketley::write_all_until(fd, cbuf, static_cast<size_t>(c), drain_end))
                         {
                             broken = true;
                             break;
@@ -977,14 +979,14 @@ void cache_instance::teardown(event_loop& /*loop*/)
             // remaining client its pending replies.
             if (!conn->response_buf.empty())
             {
-                if (!socketley::write_all(fd, conn->response_buf.data(),
-                                          conn->response_buf.size()))
+                if (!socketley::write_all_until(fd, conn->response_buf.data(),
+                                                conn->response_buf.size(), drain_end))
                     continue;
             }
             while (!conn->write_queue.empty())
             {
                 const std::string_view msg = conn->write_queue.front().view();
-                if (!socketley::write_all(fd, msg.data(), msg.size()))
+                if (!socketley::write_all_until(fd, msg.data(), msg.size(), drain_end))
                     break;
                 conn->write_queue.pop();
             }
@@ -2674,7 +2676,7 @@ void cache_instance::after_write(client_connection* conn, int fd)
     {
         if (conn->closing && !conn->read_pending)
         {
-            close_client(conn, fd, "idle-sweep");
+            close_client(conn, fd, "closing-after-write");
         }
         else
         {
@@ -3061,6 +3063,9 @@ void cache_instance::serve_payload(std::string_view payload, std::string& out, b
 
         if (serve_shard_batch(payload, out))
             return;
+        // A marker this build does not know, from a sibling of another version, is refused and never run as text.
+        out.append("error: a frame this cache does not read\n");
+        return;
     }
 
     if (!m_request_conn)
@@ -3103,6 +3108,11 @@ void cache_instance::serve_one_command(std::string_view line, std::string& out)
 void cache_instance::apply_replicated(std::string_view line)
 {
     std::string discard;
+    // What only a record of this cache's own writes may carry -- a group's consumers and pending entries -- is
+    // taken here, from the primary and from the journal, and never from a client that typed the record's verb.
+    const bool was = m_applying_replicated;
+    m_applying_replicated = true;
+    struct restore { bool& f; bool v; ~restore() { f = v; } } back{ m_applying_replicated, was };
 
     if (SOCKETLEY_LIKELY(m_shard_n <= 1))
     {
@@ -4205,8 +4215,11 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
             // Only answerable for a slot this shard owns, because every other
             // answer would need a crossing to produce a number nothing depends
             // on.
-            const uint32_t slot = static_cast<uint32_t>(
-                std::strtoul(std::string(arg).c_str(), nullptr, 10));
+            // Read whole and wide: a number past 2^32 narrowed into the slot range answered for a slot nobody named.
+            uint64_t wide = 0;
+            const auto [end, ec] = std::from_chars(arg.data(), arg.data() + arg.size(), wide);
+            const uint32_t slot = (ec == std::errc{} && end == arg.data() + arg.size() && wide < cache_slot_count)
+                                      ? static_cast<uint32_t>(wide) : cache_slot_count;
             if (slot >= cache_slot_count)
             {
                 if (resp) resp::encode_error_into(rb, "invalid slot");
@@ -5014,8 +5027,17 @@ bool cache_instance::explode_text_multi(client_connection* conn, uint32_t h,
         }
     }
 
-    if (keys.empty() || keys.size() > MAX_PARTS_PER_COMMAND)
-        return false;       // a usage error, or past the ceiling
+    if (keys.empty())
+        return false;       // a usage error, which the interpreter answers
+    // Past the ceiling is refused and not run here, where every key would land in this shard's store.
+    if (keys.size() > MAX_PARTS_PER_COMMAND)
+    {
+        run_in_reply_order(conn, [&] {
+            emit_unrouted(conn, h == fnv1a("mget") ? "mget" : "mset", false,
+                          "names more keys than a sharded cache takes in one command (65536)");
+        });
+        return true;
+    }
 
     // The per-shard port does not explode and cross but tells the client where
     // to go, and false means every key is this shard's.
@@ -5061,10 +5083,18 @@ bool cache_instance::explode_resp_multi(client_connection* conn, uint32_t h,
     const size_t n = is_mset ? static_cast<size_t>((argc - 1) / 2)
                              : static_cast<size_t>(argc - 1);
 
-    if (n == 0 || n > MAX_PARTS_PER_COMMAND)
+    if (n == 0)
         return false;
     if (is_mset && ((argc - 1) % 2 != 0))
         return false;       // the interpreter's own arity refusal
+    if (n > MAX_PARTS_PER_COMMAND)
+    {
+        run_in_reply_order(conn, [&] {
+            emit_unrouted(conn, args[0], true,
+                          "names more keys than a sharded cache takes in one command (65536)");
+        });
+        return true;
+    }
 
     // Same verdict as the text spelling over the same keys read the RESP way,
     // with the vector built only on this port.
@@ -5237,6 +5267,44 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         const cache_cmd_class cc = cache_classify_text(h);
         if (cc == cache_cmd_class::keyspace || cc == cache_cmd_class::cursor_scan)
         {
+            run_in_reply_order(conn, [&] { process_command_local(conn, line); });
+            return;
+        }
+    }
+
+    // A transaction is queued and replayed by this shard alone, so inside one -- and in the WATCH that guards it -- a
+    // command naming another shard's key is refused and the transaction with it, as the RESP router refuses it:
+    // routed, it ran at once outside the transaction, and a WATCH on it never heard of the owner's writes.
+    {
+        const bool txn_verb = h == fnv1a("multi") || h == fnv1a("exec") || h == fnv1a("discard") ||
+                              h == fnv1a("unwatch") || h == fnv1a("reset") || h == fnv1a("quit");
+        if (SOCKETLEY_UNLIKELY((conn->in_multi && !txn_verb) || h == fnv1a("watch")))
+        {
+            std::vector<std::string_view> words{ parts.cmd };
+            for (std::string_view rest = parts.args; !rest.empty();)
+            {
+                const size_t sp = rest.find(' ');
+                if (sp != 0) words.push_back(rest.substr(0, sp));
+                if (sp == std::string_view::npos) break;
+                rest.remove_prefix(sp + 1);
+            }
+            const int argc = static_cast<int>(words.size());
+            const int away = h == fnv1a("watch") ? first_foreign_key(words.data(), 1, argc - 1, 1)
+                                                 : resp_first_foreign_key(h, words.data(), argc);
+            if (away != -1)
+            {
+                if (conn->in_multi)
+                    conn->multi_broken = true;
+                run_in_reply_order(conn, [&] {
+                    if (conn->cluster_port && away >= 0)
+                        emit_moved(conn, words[static_cast<size_t>(away)],
+                                   cache_shard_of(words[static_cast<size_t>(away)], m_shard_n), false);
+                    else
+                        conn->response_buf.append("error: CROSSSLOT a transaction on a sharded cache may only name "
+                                                  "keys of the shard it runs on\n");
+                });
+                return;
+            }
             run_in_reply_order(conn, [&] { process_command_local(conn, line); });
             return;
         }
@@ -5579,8 +5647,13 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         if (st == cache_store::incr_result::ok) { append_int_nl(rb, result); return true; }
         static constexpr std::string_view overflowed = "error: increment or decrement would overflow\n";
         static constexpr std::string_view not_int    = "error: not an integer\n";
+        static constexpr std::string_view conflict   = "error: type conflict\n";
+        static constexpr std::string_view no_room    = "error: out of memory\n";
         const std::string_view msg =
-            st == cache_store::incr_result::would_overflow ? overflowed : not_int;
+            st == cache_store::incr_result::would_overflow ? overflowed
+          : st == cache_store::incr_result::wrong_type     ? conflict
+          : st == cache_store::incr_result::out_of_memory  ? no_room
+                                                           : not_int;
         rb.append(msg.data(), msg.size());
         return false;
     };
@@ -5970,7 +6043,21 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         {
             if (m_mode == cache_mode_readonly) { rb.append("denied: readonly mode\n", 22); return; }
             // MSET key1 val1 key2 val2 ...
+            // A key without its value is refused whole, rather than the pairs before it set and it dropped.
+            {
+                size_t words = args.empty() ? 0 : 1;
+                for (const char c : args)
+                    words += c == ' ';
+                if (words == 0 || words % 2 != 0)
+                {
+                    rb.append("usage: mset key value [key value ...]\n");
+                    return;
+                }
+            }
+            // Pairs go in order up to the first the store refuses, and only those reach a follower.
             std::string_view rest = args;
+            std::string_view applied_end = args.substr(0, 0);
+            bool refused = false;
             while (!rest.empty())
             {
                 size_t sp1 = rest.find(' ');
@@ -5980,7 +6067,17 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 size_t sp2 = rest.find(' ');
                 std::string_view val = (sp2 == std::string_view::npos) ? rest : rest.substr(0, sp2);
                 if (m_has_ttl_keys) m_store.check_expiry(key);
-                m_store.set(key, val);
+                if (!m_store.set(key, val))
+                {
+                    auto t = m_store.type(key);
+                    if (t == "none" || t == "string")
+                        rb.append("error: out of memory\n", 21);
+                    else
+                        rb.append("error: type conflict\n", 21);
+                    refused = true;
+                    break;
+                }
+                applied_end = args.substr(0, static_cast<size_t>(val.data() + val.size() - args.data()));
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_write())
                 {
@@ -5997,13 +6094,13 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 if (sp2 == std::string_view::npos) break;
                 rest = rest.substr(sp2 + 1);
             }
-            rb.append("ok\n", 3);
+            if (!refused) rb.append("ok\n", 3);
             // One key per replicated command, because `mset a 1 b 2` names
             // keys belonging to different shards and a sharded follower
             // dropped it whole -- so the effect is replicated instead, as SET
             // already does.
             {
-                std::string_view r = args;
+                std::string_view r = applied_end;
                 while (!r.empty())
                 {
                     const size_t s1 = r.find(' ');
@@ -6060,15 +6157,17 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             }
             if (!m_store.lpush(key, val))
             {
-                m_store.check_expiry(key);
-                if (!m_store.lpush(key, val))
-                {
+                auto t = m_store.type(key);
+                if (t == "none" || t == "list")
+                    rb.append("error: out of memory\n", 21);
+                else
                     rb.append("error: type conflict\n", 21);
-                    break;
-                }
+                break;
             }
             rb.append("ok\n", 3);
             replicate_command(line);
+            // A client blocked on the key over RESP is waiting for exactly this element.
+            while (wake_one_waiter(key)) {}
             break;
         }
         case fnv1a("rpush"):
@@ -6086,15 +6185,17 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             }
             if (!m_store.rpush(key, val))
             {
-                m_store.check_expiry(key);
-                if (!m_store.rpush(key, val))
-                {
+                auto t = m_store.type(key);
+                if (t == "none" || t == "list")
+                    rb.append("error: out of memory\n", 21);
+                else
                     rb.append("error: type conflict\n", 21);
-                    break;
-                }
+                break;
             }
             rb.append("ok\n", 3);
             replicate_command(line);
+            // A client blocked on the key over RESP is waiting for exactly this element.
+            while (wake_one_waiter(key)) {}
             break;
         }
         case fnv1a("lpop"):
@@ -7249,6 +7350,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (wh != fnv1a("before") && wh != fnv1a("after"))
             { rb.append("usage: linsert key before|after pivot value\n", 44); return; }
             const int n = m_store.linsert(key, wh == fnv1a("before"), pivot, v);
+            if (n == cache_store::linsert_refused) { rb.append("error: out of memory\n", 21); break; }
             rb.append(std::to_string(n)); rb.push_back('\n');
             if (n > 0) replicate_command(line);
             break;
@@ -7356,6 +7458,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             { rb.append("nil\n", 4); return; }
             rb.append(moved); rb.push_back('\n');
             replicate_command(line);
+            while (wake_one_waiter(dst)) {}
             break;
         }
 
@@ -7467,17 +7570,37 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (key.empty() || rest.empty())
             { rb.append("usage: hmset key field value [field value ...]\n"); return; }
             if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(key);
+            // Fields go in order up to the first the store refuses, and only those reach a follower.
             std::string_view walk = rest;
+            bool refused = false;
             while (!walk.empty())
             {
                 auto [f, r1] = extract_key(walk);
                 auto [v, r2] = extract_key(r1);
                 if (f.empty()) break;
-                m_store.hset(key, f, v);
+                if (!m_store.hset(key, f, v))
+                {
+                    auto t = m_store.type(key);
+                    if (t == "none" || t == "hash")
+                        rb.append("error: out of memory\n", 21);
+                    else
+                        rb.append("error: type conflict\n", 21);
+                    refused = true;
+                    break;
+                }
+                std::string one;
+                one.reserve(8 + key.size() + f.size() + v.size());
+                one += "hmset ";
+                one.append(key);
+                one += ' ';
+                one.append(f);
+                one += ' ';
+                one.append(v);
+                replicate_command(one);
                 walk = r2;
             }
-            rb.append("ok\n", 3);
-            replicate_command(line);
+            if (!refused) rb.append("ok\n", 3);
             break;
         }
         // ─── One collection, scanned ───
@@ -9063,9 +9186,14 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     const auto answered_incr = [&rb](cache_store::incr_result st, int64_t result) {
         if (st == cache_store::incr_result::ok)
         { resp::encode_integer_into(rb, result); return true; }
-        resp::encode_error_into(rb, st == cache_store::incr_result::would_overflow
-            ? "increment or decrement would overflow"
-            : "value is not an integer or out of range");
+        if (st == cache_store::incr_result::wrong_type)
+            resp::encode_error_code_into(rb, wrongtype_msg);
+        else if (st == cache_store::incr_result::out_of_memory)
+            resp::encode_error_code_into(rb, oom_msg);
+        else
+            resp::encode_error_into(rb, st == cache_store::incr_result::would_overflow
+                ? "increment or decrement would overflow"
+                : "value is not an integer or out of range");
         return false;
     };
 
@@ -9626,12 +9754,19 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         {
             if (argc < 3 || (argc - 1) % 2 != 0) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            // Pairs go in order up to the first the store refuses, and only those reach a follower.
+            int applied = argc;
             for (int i = 1; i + 1 < argc; i += 2)
             {
                 if ((i - 1) / 2 % cache_store::PREFETCH_BATCH == 0)
                     m_store.prefetch_keys(args + i, static_cast<size_t>(argc - i), 2);
                 if (m_has_ttl_keys) m_store.check_expiry(args[i]);
-                m_store.set(args[i], args[i+1]);
+                if (!m_store.set(args[i], args[i+1]))
+                {
+                    encode_refusal(rb, m_store.type(args[i]), "string");
+                    applied = i;
+                    break;
+                }
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_write())
                 {
@@ -9646,10 +9781,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 }
 #endif
             }
-            resp::encode_ok_into(rb);
+            if (applied == argc) resp::encode_ok_into(rb);
             // One key per replicated command, for the reason the text spelling
             // gives above.
-            for (int i = 1; i + 1 < argc; i += 2)
+            for (int i = 1; i + 1 < applied; i += 2)
                 repl_set_effect(args[i], args[i + 1], 0, 0);
             break;
         }
@@ -9717,6 +9852,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                         // room, and what has been logged stands rather than
                         // being taken back.
                         encode_refusal(rb, m_store.type(args[1]), "list");
+                        // The elements that did go in are owed to whoever waits on the key.
+                        if (i > 2) while (wake_one_waiter(args[1])) {}
                         return;
                     }
                 }
@@ -9747,6 +9884,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                         // room, and what has been logged stands rather than
                         // being taken back.
                         encode_refusal(rb, m_store.type(args[1]), "list");
+                        // The elements that did go in are owed to whoever waits on the key.
+                        if (i > 2) while (wake_one_waiter(args[1])) {}
                         return;
                     }
                 }
@@ -10982,6 +11121,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (where != fnv1a("before") && where != fnv1a("after"))
             { resp::encode_error_code_into(rb, "ERR syntax error"); break; }
             const int n = m_store.linsert(args[1], where == fnv1a("before"), args[3], args[4]);
+            if (n == cache_store::linsert_refused) { resp::encode_error_code_into(rb, oom_msg); break; }
             resp::encode_integer_into(rb, n);
             if (n > 0) repl(args, argc);
             break;
@@ -11188,6 +11328,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             { resp::encode_integer_into(rb, out); repl(args, argc); }
             else if (hst == cache_store::incr_result::would_overflow)
                 resp::encode_error_into(rb, "increment or decrement would overflow");
+            else if (hst == cache_store::incr_result::wrong_type)
+                resp::encode_error_code_into(rb, wrongtype_msg);
+            else if (hst == cache_store::incr_result::out_of_memory)
+                resp::encode_error_code_into(rb, oom_msg);
             else resp::encode_error_code_into(rb, "ERR hash value is not an integer");
             break;
         }
@@ -11296,8 +11440,13 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             {
                 case fnv1a("load"):
                     if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-                    resp::encode_bulk_into(rb, m_scripts.load(args[2]));
+                {
+                    std::string why;
+                    const std::string sha = m_scripts.load(args[2], why);
+                    if (sha.empty()) resp::encode_error_code_into(rb, "ERR " + why);
+                    else resp::encode_bulk_into(rb, sha);
                     break;
+                }
                 case fnv1a("exists"):
                     resp::encode_array_header_into(rb, argc - 2);
                     for (int i = 2; i < argc; ++i)
@@ -11484,7 +11633,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         default:
         {
             rb.append("-ERR unknown command '", 22);
-            rb.append(args[0].data(), args[0].size());
+            resp::append_one_line(rb, args[0]);
             rb.append("'\r\n", 3);
             break;
         }
@@ -11864,7 +12013,8 @@ bool cache_instance::block_pop(client_connection* conn, std::string_view* args,
     w.resp      = conn->resp_mode;
     w.seq       = ++m_block_seq;
     for (int i = 1; i < argc - 1; ++i) w.keys.emplace_back(args[i]);
-    if (secs > 0)
+    // Past some thirty years the clock would overflow into the past, and a wait that long is a wait for good.
+    if (secs > 0 && secs < 1e9)
         w.deadline = std::chrono::steady_clock::now()
                    + std::chrono::milliseconds(static_cast<int64_t>(secs * 1000.0));
 
@@ -12703,30 +12853,26 @@ bool cache_instance::connect_to_master()
         // A name, which is what the manual offers -- "--replicate host:port",
         // "replicate_target: Leader host:port" -- and what inet_pton alone
         // refused, so `--replicate localhost:6379` could never connect.
-        // Resolved here and not on the loop, for the reason the client's own
-        // resolver gives about stalling it: this runs once, at start, beside a
-        // connect that already waits.
-        struct addrinfo hints{};
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        struct addrinfo* res = nullptr;
-        if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res)
+        // Resolved off the loop, since a replica re-dials every fifth of a second and a resolver that hangs held the
+        // whole cache each time; the dial is asked again shortly while the answer is out.
+        std::vector<socketley::async_resolver::address> found;
+        const auto st = m_resolver.lookup(host, AF_INET, found);
+        if (st != socketley::async_resolver::state::ready || found.empty() ||
+            found.front().len < sizeof(struct sockaddr_in))
         {
             close_tracked(fd);
+            if (st == socketley::async_resolver::state::pending && !m_master_retry)
+            {
+                auto t = std::make_unique<timer_op>();
+                t->ts.tv_sec = 0;
+                t->ts.tv_nsec = 100 * 1000000L;
+                t->req = { this, nullptr, -1, 0, op_timeout };
+                if (m_loop && m_loop->submit_timeout(&t->ts, &t->req))
+                    m_master_retry = std::move(t);
+            }
             return false;
         }
-        // The length is checked before the cast, as the client's own resolver
-        // checks it before its copy: AF_INET hints cannot return anything else,
-        // and reading four bytes out of a shorter answer would not say so.
-        const bool usable = (res->ai_addrlen >= sizeof(struct sockaddr_in));
-        if (usable)
-            addr.sin_addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
-        freeaddrinfo(res);
-        if (!usable)
-        {
-            close_tracked(fd);
-            return false;
-        }
+        addr.sin_addr = reinterpret_cast<const struct sockaddr_in*>(&found.front().addr)->sin_addr;
     }
 
     // Read-only from the moment this cache intends to follow, and not once the
@@ -12920,6 +13066,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 
         if (link.partial[scan_from] == ipc_frame::marker)
         {
+            link.searched = 0;
             size_t next = 0;
             const auto r = ipc_frame::peek_frame(link.partial, scan_from, line, next);
             if (r == ipc_frame::take::need_more)
@@ -12933,9 +13080,16 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
         }
         else
         {
-            const size_t pos = link.partial.find('\n', scan_from);
+            const size_t pos = link.partial.find('\n', scan_from + (scan_from == 0 ? link.searched : 0));
             if (pos == std::string::npos)
+            {
+                link.searched = link.partial.size() - scan_from;
+                // A line is bounded too, as a frame is, or a leader that never ends one fills this process.
+                if (link.searched > std::max<size_t>(read_buffer_bytes(), size_t{512} << 20))
+                    framing_broken = true;
                 break;
+            }
+            link.searched = 0;
             line = std::string_view(link.partial.data() + scan_from, pos - scan_from);
             if (!line.empty() && line.back() == '\r')
                 line.remove_suffix(1);
@@ -13010,7 +13164,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
     // being applied.
     if (framing_broken)
     {
-        LOG_ERROR("cache: replication frame longer than the protocol allows — "
+        LOG_ERROR("cache: replication frame or line longer than the protocol allows — "
                   "the link is dropped rather than resynchronised");
         if (link.fd >= 0)
             close_tracked(link.fd);

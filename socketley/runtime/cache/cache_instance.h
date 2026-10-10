@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/async_resolver.h"
 #include "../../shared/conn_reachability.h"
 #include <initializer_list>
 #include <string>
@@ -132,7 +133,7 @@ struct client_connection
     size_t crossing_bytes{0};
 
     // The read was withdrawn because crossing_bytes reached
-    // MAX_CROSSING_BYTES, and comes back as the crossings are answered.
+    // read_buffer_bytes(), and comes back as the crossings are answered.
     bool read_paused{false};
 
     // The peer sent its FIN while a crossing was still owed, so the close is
@@ -896,6 +897,8 @@ private:
     // Set while a replication record is applied, the only door to the two
     // verbs that restore a group exactly.
     bool m_stream_internal{false};
+    // Inside apply_replicated(): a line from the primary or the journal, not from a client.
+    bool m_applying_replicated{false};
     // A reply's body built before its count is known, kept so a range reuses its room.
     std::string m_stream_scratch;
 
@@ -1238,6 +1241,8 @@ private:
     // Replication
     std::string m_replicate_target;
     repl_role m_repl_role{repl_none};
+    // The leader's name, resolved off the loop.
+    socketley::async_resolver m_resolver;
 
     // A follower socket plus whatever has not reached it yet, because a
     // follower sharing this event loop would deadlock a synchronous write and
@@ -1294,6 +1299,9 @@ private:
         // What the deadline below compares against, so a dump that is slow is
         // told apart from a leader that has stopped sending.
         uint64_t bytes_seen{0};
+        // How much of the unfinished line at the front of `partial` is known to hold no newline, so a long one is
+        // searched once across its reads rather than from its start at every one.
+        size_t searched{0};
         uint64_t bytes_at_deadline{0};
     };
     std::unique_ptr<master_link> m_master;

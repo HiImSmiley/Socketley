@@ -78,5 +78,32 @@ R2=$(txt "rename $A $A2" $((P+1)))
 ok "$(echo "$R2" | grep -c 'ok')" "1"            "a rename within one shard still succeeds"
 ok "$(redis-cli -p $((P+1)) get "$A2")" "wert"   "and the value moved to the new name"
 
+# A transaction is this shard's alone: a command in it that names another shard's key is refused, and the
+# transaction with it, rather than run at once outside it -- which left EXEC to apply the rest.
+T=$(printf 'multi\nset %s x\nset %s y\nexec\n' "$A2" "$B" | timeout 10 nc -q 2 127.0.0.1 $((P+1)) 2>/dev/null | tr -d '\r' | tr '\n' '|')
+ok "$(echo "$T" | grep -c 'queued')" "1" "inside MULTI a key of this shard is queued"
+ok "$(redis-cli -p $((P+1)) get "$A2")" "wert" "and a transaction that named another shard's key ran none of it ($T)"
+ok "$(redis-cli -p $((P+2)) get "$B")" ""      "nor wrote that key on its shard"
+W=$(txt "watch $B" $((P+1)))
+ok "$(echo "$W" | grep -cE 'MOVED|error')" "1" "a WATCH of another shard's key is refused, since its writes are never heard here ($W)"
+
+# Past the most keys one command is split into, the command is refused rather than run on the shard it arrived at,
+# which wrote every key into a store their owners never read.
+"$BIN" create cache tmk2 -p $((P+10)) --shards 2 --cluster --read-buffer 8M -s >/dev/null
+for _ in $(seq 1 100); do
+    redis-cli -p $((P+11)) ping >/dev/null 2>&1 && redis-cli -p $((P+12)) ping >/dev/null 2>&1 && break
+    sleep 0.2
+done
+BIG=$(python3 - $((P+10)) <<'PYEOF'
+import socket, sys
+line = b"mset " + b" ".join(b"bk%d v" % i for i in range(65537)) + b"\n"
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), 10); s.sendall(line); s.settimeout(20)
+print(s.recv(200).decode(errors="replace").strip()[:120])
+PYEOF
+)
+ok "$(echo "$BIG" | grep -c 'more keys than')" "1" "an MSET of 65537 keys is refused ($BIG)"
+ok "$(( $(redis-cli -p $((P+11)) dbsize) + $(redis-cli -p $((P+12)) dbsize) ))" "0" "and wrote none of them"
+"$BIN" stop tmk2 >/dev/null 2>&1 || true; "$BIN" remove tmk2 >/dev/null 2>&1 || true
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]

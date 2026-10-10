@@ -45,7 +45,8 @@ fail() {
 echo "=== Integration: the cache command reference matches the line protocol ==="
 
 # ─── What the page says ─────────────────────────────────────────────────────
-S=$(grep -n "Connect via TCP and send commands" "$MAN" | head -1 | cut -d: -f1)
+S=$(grep -n "Connect via TCP and send commands" "$MAN" | head -1 | cut -d: -f1 || true)
+[ -n "$S" ] || { echo "  FAIL: the page has no cache command section to read"; exit 1; }
 E=$(awk -v s="$S" 'NR>s && /^\.SS /{print NR; exit}' "$MAN")
 [ -n "$E" ] || { echo "  FAIL: the command section has no end"; exit 1; }
 

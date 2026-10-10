@@ -361,28 +361,37 @@ for name, cmds in SCENARIOS:
 def blocking(port):
     c = Conn(port); c.cmd('FLUSHALL'); out = []
     def later(*args):
-        r = {}
-        def run(): r['v'] = Conn(port).cmd(*args)
-        t = threading.Thread(target=run); t.start(); return t, r
-    t, r = later('XREAD', 'BLOCK', '5000', 'STREAMS', 'k', '$'); time.sleep(0.3)
+        r = {}; sent = threading.Event()
+        def run():
+            k = Conn(port); k.send(args); sent.set(); r['v'] = k.reply()
+        t = threading.Thread(target=run); t.start(); sent.wait(10); return t, r
+    def blocked(n, pause, at_most=False):
+        # Redis says how many readers are blocked; a server whose INFO does not say gets the fixed pause.
+        for _ in range(200):
+            m = re.search(r'blocked_clients:(\d+)', str(c.cmd('INFO', 'clients')))
+            if not m: time.sleep(pause); return
+            if int(m.group(1)) == n or (at_most and int(m.group(1)) < n): return
+            time.sleep(0.01)
+        print('readers blocked never reached %d' % n); sys.exit(1)
+    t, r = later('XREAD', 'BLOCK', '5000', 'STREAMS', 'k', '$'); blocked(1, 0.3)
     c.cmd('XADD', 'k', '1-1', 'a', 'b'); t.join(); out.append(r['v'])
     out.append(Conn(port).cmd('XREAD', 'BLOCK', '200', 'STREAMS', 'k', '$'))
     c.cmd('XGROUP', 'CREATE', 'q', 'g', '$', 'MKSTREAM')
     ws = []
     for i in range(2):
         ws.append(later('XREADGROUP', 'GROUP', 'g', 'c%d' % i, 'COUNT', '5', 'BLOCK', '3000', 'STREAMS', 'q', '>'))
-        time.sleep(0.2)
-    c.cmd('XADD', 'q', '1-1', 'job', '1'); time.sleep(0.2); c.cmd('XADD', 'q', '2-1', 'job', '2')
+        blocked(i + 1, 0.2)
+    c.cmd('XADD', 'q', '1-1', 'job', '1'); blocked(1, 0.2, at_most=True); c.cmd('XADD', 'q', '2-1', 'job', '2')
     for t, r in ws: t.join(); out.append(r['v'])
     out.append(c.cmd('XPENDING', 'q', 'g'))
-    t, r = later('XREAD', 'COUNT', '1', 'BLOCK', '3000', 'STREAMS', 'm1', 'm2', '$', '$'); time.sleep(0.3)
+    t, r = later('XREAD', 'COUNT', '1', 'BLOCK', '3000', 'STREAMS', 'm1', 'm2', '$', '$'); blocked(1, 0.3)
     p = Conn(port); p.send(['XADD', 'm2', '5-1', 'a', 'b']); p.send(['XADD', 'm2', '6-1', 'a', 'b']); p.reply(); p.reply()
     t.join(); out.append(r['v'])
     c.cmd('XGROUP', 'CREATE', 'd', 'g', '$', 'MKSTREAM')
-    t, r = later('XREADGROUP', 'GROUP', 'g', 'c', 'BLOCK', '3000', 'STREAMS', 'd', '>'); time.sleep(0.3)
+    t, r = later('XREADGROUP', 'GROUP', 'g', 'c', 'BLOCK', '3000', 'STREAMS', 'd', '>'); blocked(1, 0.3)
     c.cmd('XGROUP', 'DESTROY', 'd', 'g'); t.join(); out.append(r['v'])
     c.cmd('XGROUP', 'CREATE', 'e', 'g', '$', 'MKSTREAM')
-    t, r = later('XREADGROUP', 'GROUP', 'g', 'c', 'BLOCK', '3000', 'STREAMS', 'e', '>'); time.sleep(0.3)
+    t, r = later('XREADGROUP', 'GROUP', 'g', 'c', 'BLOCK', '3000', 'STREAMS', 'e', '>'); blocked(1, 0.3)
     c.cmd('DEL', 'e'); t.join(); out.append(r['v'])
     return out
 

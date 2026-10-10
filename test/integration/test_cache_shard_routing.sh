@@ -1,23 +1,9 @@
 #!/usr/bin/env bash
 # Integration test: a cache split into N processes answers as one store.
 #
-# ─── THIS RAN AS pending_ WHILE THE REFUSAL STOOD ──────────────────────────
+# ─── WHAT THE ASSERTIONS WERE WRITTEN AGAINST ──────────────────────────────
 #
-# `--shards` on a cache was refused while the routing was being built, so this
-# file lived outside run_all.sh's glob and was run against a scratch build with
-# the one refusal line compiled out.  The refusal is gone and so is the flag.
-#
-# The numbers below were taken on that scratch build and are kept because they
-# are what the assertions were written against:
-#
-# refusal is the last step of this work and it must not be lifted until the
-# multi-key commands, the keyspace-wide commands and persistence with a changed
-# shard count are routed too.  Everything this file asserts about is step one:
-# the single-key class.
-#
-# It is committed rather than held back, because it has been run.  The numbers
-# below are what it produced on a scratch build — the one refusal line in
-# shards_config_refusal() compiled out, nothing else changed:
+# A build with the cache's --shards refusal compiled out, nothing else changed:
 #
 #     without routing   9 of 12 keys read back as (nil), and which 9 changed
 #                       run to run: 4 shards, one connection each, so a SET
@@ -29,10 +15,6 @@
 #                       still serving afterwards.
 #     one-shard control 12 of 12 on both builds, which is what says this test is
 #                       about sharding and not about SET and GET.
-#
-# Rename it to test_cache_shard_routing.sh in the change that removes the
-# refusal.  That change is where it starts running, and where it stops being a
-# claim about a build nobody else can make.
 #
 # ─── THE DEFECT IT HOLDS DOWN ──────────────────────────────────────────────
 #
@@ -69,7 +51,7 @@
 #
 #   5. The commands that are NOT routed are refused by name.  When this file was
 #      written that meant the multi-key and keyspace-wide classes; those are
-#      routed now and pending_cache_shard_multikey.sh holds them down, so what
+#      routed now and test_cache_shard_multikey.sh holds them down, so what
 #      is asserted here is the two that are refused on purpose — the dump-file
 #      commands and replication.  A silent wrong answer from one shard's slice
 #      is the exact failure this whole change exists to remove, so "not
@@ -222,14 +204,14 @@ if command -v redis-cli >/dev/null 2>&1; then
     # ── 5: what is NOT routed is refused by name ────────────────────────────
     #
     # The multi-key and keyspace-wide classes were refused here when this file
-    # was written and are routed now — pending_cache_shard_multikey.sh holds
+    # was written and are routed now — test_cache_shard_multikey.sh holds
     # them down.  What is left is the two classes that are refused on purpose
     # rather than pending: a command that reads or writes the dump file, and one
     # that attaches a stream to a single shard.  Both would appear to work.
     # `flush` was refused here when this file was written and is routed now —
     # step four gave each shard its own dump file, so the collision that made
     # fanning it out dangerous no longer exists.  What it answers is the
-    # interpreter's own reply, merged; pending_cache_shard_persist.sh holds the
+    # interpreter's own reply, merged; test_cache_shard_persist.sh holds the
     # dump behaviour down.  Nothing is asserted about it here.
 
     RP=$(printf 'replicate 127.0.0.1:1\n' | timeout 5 nc -q1 127.0.0.1 "$P_T4" 2>/dev/null | head -1)

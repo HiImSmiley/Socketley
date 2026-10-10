@@ -119,6 +119,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include "fuzz_common.h"
@@ -1089,7 +1090,15 @@ void check_save_load(world& w)
             any_elapsed = true;
 
     if (!src.save(w.tmp_path))
-        return;   // a full /dev/shm is the machine's problem, not the store's
+    {
+        // A full /dev/shm is the machine's problem, so only a refusal with room to spare is the store's.
+        // 64 MiB is orders of magnitude above what twelve keys of eight short elements serialize to.
+        struct statvfs vfs{};
+        const bool shm_full = ::statvfs("/dev/shm", &vfs) != 0
+                           || static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize < (uint64_t{64} << 20);
+        CACHE_CHECK(shm_full, "save() refused a store while /dev/shm had room for it");
+        return;
+    }
 
     cache_store dst;
     dst.set_max_memory(src.m_max_memory);
@@ -1224,6 +1233,16 @@ void model_expire(world& w, int i)
 {
     if (w.sh[i].type != T_NONE && w.sh[i].ttl == TTL_ELAPSED)
         w.sh[i].clear();
+}
+
+// What KEYS and SCAN answer: every resident key but those whose expiry has passed and is not yet swept.
+size_t unexpired_keys(const world& w)
+{
+    size_t elapsed = 0;
+    for (int i = 0; i < NKEYS; i++)
+        if (w.sh[i].type != T_NONE && w.sh[i].ttl == TTL_ELAPSED)
+            elapsed++;
+    return w.store.size() - elapsed;
 }
 
 // Called on the failure path of every entry point that goes through set().
@@ -1700,6 +1719,7 @@ bool run_step(world& w, const step& s)
         case OP_LPUSH:
         case OP_RPUSH:
         {
+            model_expire(w, ki);   // push() calls check_expiry() first
             if ((e.type == T_LIST && e.list.size() >= MAX_ELEMS) || avoid_collection_uaf(w))
                 return true;
             wrote_key       = ki;
@@ -1758,6 +1778,7 @@ bool run_step(world& w, const step& s)
 
         case OP_SADD:
         {
+            model_expire(w, ki);   // sadd() calls check_expiry() first
             if ((e.type == T_SET && e.members.size() >= MAX_ELEMS && e.members.count(mem) == 0)
                 || avoid_collection_uaf(w))
                 return true;
@@ -1812,6 +1833,7 @@ bool run_step(world& w, const step& s)
 
         case OP_HSET:
         {
+            model_expire(w, ki);   // hset() calls check_expiry() first
             if ((e.type == T_HASH && e.fields.size() >= MAX_ELEMS && e.fields.count(mem) == 0)
                 || avoid_collection_uaf(w))
                 return true;
@@ -2362,15 +2384,15 @@ bool run_step(world& w, const step& s)
             std::sort(seen.begin(), seen.end());
             CACHE_CHECK(std::adjacent_find(seen.begin(), seen.end()) == seen.end(),
                         "a full SCAN returned the same key twice");
-            CACHE_CHECK(seen.size() == w.store.size(),
-                        "a full SCAN did not return every key in the store");
+            CACHE_CHECK(seen.size() == unexpired_keys(w),
+                        "a full SCAN did not return every unexpired key in the store");
             break;
         }
         case OP_KEYS:
         {
             std::vector<std::string_view> out;
             w.store.keys("*", out);
-            CACHE_CHECK(out.size() == w.store.size(), "keys(\"*\") did not return every key");
+            CACHE_CHECK(out.size() == unexpired_keys(w), "keys(\"*\") did not return every unexpired key");
             break;
         }
 

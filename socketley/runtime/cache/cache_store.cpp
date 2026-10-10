@@ -490,6 +490,8 @@ bool cache_store::rpush(std::string_view key, std::string_view val)
 
 bool cache_store::push(std::string_view key, std::string_view val, bool front)
 {
+    // A key past its deadline but not yet swept would take the element and lose it with the sweep.
+    check_expiry(key);
     auto it = m_lists.find(key);
     if (it != m_lists.end())
     {
@@ -604,6 +606,7 @@ std::optional<std::string_view> cache_store::lindex(std::string_view key, int id
 
 int cache_store::sadd(std::string_view key, std::string_view member)
 {
+    check_expiry(key);
     auto it = m_sets.find(key);
     if (it != m_sets.end())
     {
@@ -698,11 +701,13 @@ int cache_store::sinter(const std::string_view* keys, size_t n,
                         std::vector<std::string>& out) const
 {
     if (n == 0) return 0;
+    // Every key's type first, as Redis does: an absent set ahead of a string still answers WRONGTYPE.
+    for (size_t i = 0; i < n; ++i)
+        if (holds_other_type(keys[i], 't')) return -1;
     std::vector<const set_inner*> sets;
     sets.reserve(n);
     for (size_t i = 0; i < n; ++i)
     {
-        if (holds_other_type(keys[i], 't')) return -1;
         const set_inner* sp = set_ptr(keys[i]);
         if (!sp || sp->empty()) return 0;      // one empty set empties the lot
         sets.push_back(sp);
@@ -990,6 +995,7 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
                        bool* created)
 {
     if (created) *created = false;
+    check_expiry(key);
     auto it = m_hashes.find(key);
     if (it != m_hashes.end())
     {
@@ -1518,9 +1524,17 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
     // when this map is exhausted.
     // Ends on keys RETURNED and across the five maps together: `out` is what the
     // whole page has so far, not what this one map contributed.
+    // A key past its deadline is gone to every reader, the sweep only not having reached it yet.
+    const bool any_ttl = !m_expiry.empty();
+    const auto now = any_ttl ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto live = [&](std::string_view k) -> bool {
+        if (!any_ttl) return true;
+        const auto e = m_expiry.find(k);
+        return e == m_expiry.end() || now < e->second;
+    };
     auto walk = [&](const auto& map, uint8_t idx, size_t first_bucket) -> uint64_t {
         return walk_buckets(map, idx, first_bucket,
-            [&](const auto& e) { if (match(e.first)) out.push_back(e.first); },
+            [&](const auto& e) { if (match(e.first) && live(e.first)) out.push_back(e.first); },
             [&](size_t) { return out.size() >= count; });
     };
 
@@ -1591,7 +1605,7 @@ cache_store::incr_result cache_store::incr(std::string_view key, int64_t delta, 
             return incr_result::not_an_integer;
     }
     else if (has_type_conflict_for_string(key))
-        return incr_result::not_an_integer;
+        return incr_result::wrong_type;
 
     // Checked before the sum and not after it, because signed overflow is
     // undefined and there is no "after" to inspect: two INCRBY INT64_MAX in a
@@ -1614,7 +1628,7 @@ cache_store::incr_result cache_store::incr(std::string_view key, int64_t delta, 
         const size_t held = stored_string(it->second);
         const size_t want = rewritten_string(it->second, sv.size());
         if (want > held && !check_memory(want - held, key))
-            return incr_result::not_an_integer;
+            return incr_result::out_of_memory;
         it = m_data.find(key);   // see set(): named to check_memory, but not trusted here
     }
 
@@ -1627,7 +1641,7 @@ cache_store::incr_result cache_store::incr(std::string_view key, int64_t delta, 
     else
     {
         if (!check_memory(stored_string(sv.size()) + new_key_cost(key.size()), key))
-            return incr_result::not_an_integer;
+            return incr_result::out_of_memory;
         auto nit = m_data.emplace(std::string(key), std::string(sv)).first;
         track_add(entry_cost(nit->first, nit->second));
     }
@@ -1888,8 +1902,10 @@ int cache_store::lrem(std::string_view key, int64_t count, std::string_view val)
     auto& dq = it->second;
 
     int removed = 0;
+    // Negated unsigned, since -INT64_MIN has no signed value.
     const size_t want = (count == 0) ? dq.size()
-                                     : static_cast<size_t>(count < 0 ? -count : count);
+                                     : static_cast<size_t>(count < 0 ? 0 - static_cast<uint64_t>(count)
+                                                                     : static_cast<uint64_t>(count));
     const size_t shape = shape_cost(dq);
     // By position, since an erase in a packed list moves the bytes behind it
     // and an iterator carrying their offset would name the wrong element.
@@ -1962,10 +1978,13 @@ int cache_store::linsert(std::string_view key, bool before, std::string_view piv
     auto it = m_lists.find(key);
     if (it == m_lists.end())
         return 0;
+    // The pivot first, so a list without it costs no other key its place, and room after.
+    if (std::find(it->second.begin(), it->second.end(), pivot) == it->second.end())
+        return -1;
 
     if (!check_memory(stored_string(val.size()) + list_elem_overhead
                       + push_growth(&it->second, val.size(), false), key))
-        return -1;
+        return linsert_refused;
     it = m_lists.find(key);
     if (it == m_lists.end())
         return 0;
@@ -2228,8 +2247,11 @@ cache_store::incr_result cache_store::hincrby(std::string_view key, std::string_
     char buf[24];
     auto [end, ec2] = std::to_chars(buf, buf + sizeof(buf), val);
     (void)ec2;
-    return hset(key, field, std::string_view(buf, static_cast<size_t>(end - buf)))
-         ? incr_result::ok : incr_result::not_an_integer;
+    if (hset(key, field, std::string_view(buf, static_cast<size_t>(end - buf))))
+        return incr_result::ok;
+    // hset() refuses for room or for a key of another kind, which the key itself tells apart.
+    const std::string_view held = type(key);
+    return held == "none" || held == "hash" ? incr_result::out_of_memory : incr_result::wrong_type;
 }
 
 int cache_store::hsetnx(std::string_view key, std::string_view field, std::string_view val)
@@ -2402,7 +2424,13 @@ std::string_view cache_store::type(std::string_view key) const
 void cache_store::keys(std::string_view pattern, std::vector<std::string_view>& out) const
 {
     bool match_all = (pattern == "*");
+    // As in scan(): a key past its deadline is listed by nobody.
+    const bool any_ttl = !m_expiry.empty();
+    const auto now = any_ttl ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto match = [&](std::string_view key) -> bool {
+        if (any_ttl)
+            if (const auto e = m_expiry.find(key); e != m_expiry.end() && now >= e->second)
+                return false;
         if (match_all) return true;
         return socketley::glob_match(pattern, key);
     };
@@ -2958,10 +2986,16 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
         emit_expiry(key);
     }
 
-    if (msync(map, total_size, MS_SYNC) < 0) {}
+    // A dump the disk could not take is no dump, and the one before it stays in place.
+    const bool synced = msync(map, total_size, MS_SYNC) == 0;
     munmap(map, total_size);
-    fsync(fd_raw);
+    const bool flushed = synced && fsync(fd_raw) == 0;
     close(fd_raw);
+    if (!flushed)
+    {
+        unlink(tmp_path.c_str());
+        return false;
+    }
 
     return rename(tmp_path.c_str(), std::string(path).c_str()) == 0;
 }
@@ -3119,10 +3153,11 @@ bool cache_store::load_v2(const char* data, size_t size)
     while (p < end)
     {
         uint8_t type = 0;
-        if (!read_u8(type)) break;
+        if (!read_u8(type)) return false;
 
+        // A dump cut inside a key's header is as short as one cut inside its value, and loads as nothing.
         std::string key;
-        if (!read_string(key)) break;
+        if (!read_string(key)) return false;
 
         bool expired = false;
 
@@ -3266,8 +3301,9 @@ bool cache_store::load_v2_stream(std::ifstream& file)
         file.read(reinterpret_cast<char*>(&type), 1);
         if (!file) break;
 
+        // Cut inside a key's header is a cut dump, as load_v2 says.
         std::string key;
-        if (!read_string(key)) break;
+        if (!read_string(key)) return false;
 
         bool expired = false;
 
@@ -3386,23 +3422,25 @@ bool cache_store::load_v1(std::ifstream& file, uint32_t first_key_len)
 
     while (true)
     {
+        // Short anywhere inside an entry is a cut dump; only the end of the file between entries is its end.
         std::string key(key_len, '\0');
         file.read(key.data(), key_len);
-        if (!file) break;
+        if (!file) return false;
 
         uint32_t val_len = 0;
         file.read(reinterpret_cast<char*>(&val_len), sizeof(val_len));
-        if (!file) break;
+        if (!file) return false;
 
         std::string value(val_len, '\0');
         file.read(value.data(), val_len);
-        if (!file) break;
+        if (!file) return false;
 
         adopt_loaded_string(std::move(key), std::move(value));
 
         // Try reading next key_len
         file.read(reinterpret_cast<char*>(&key_len), sizeof(key_len));
-        if (!file) break;
+        if (!file)
+            return file.gcount() == 0;
     }
 
     return true;

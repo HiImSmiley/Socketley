@@ -85,8 +85,9 @@ PY
 }
 ready "$P4" 4 || { echo "  FATAL: the four-shard cache never answered"; exit 2; }
 
-direct_crossings() {
-    "$BIN" stats filt4 2>/dev/null | awk -F: '/^mesh_direct:/ {s+=$2} END{print s+0}'
+# Direct and relayed together, so a publish that goes round through the daemon is still counted.
+crossings() {
+    "$BIN" stats filt4 2>/dev/null | awk -F: '/^mesh_(direct|relayed):/ {s+=$2} END{print s+0}'
 }
 
 # Prints one line per round: name count reached-of-expected strays
@@ -187,7 +188,14 @@ else
 fi
 
 # ── the crossings, which is the only thing a build with no filter fails ────
-BEFORE=$(direct_crossings)
+# Every shard reports both counters, so a missing line is a count of zero that measures nothing.
+MESH_LINES=$("$BIN" stats filt4 2>/dev/null | grep -cE '^mesh_(direct|relayed):')
+if [ "$MESH_LINES" -eq 8 ]; then
+    ok "every shard reports its crossings ($MESH_LINES counter lines)"
+else
+    bad "every shard reports its crossings" "$MESH_LINES mesh_direct/mesh_relayed lines over four shards"
+fi
+BEFORE=$(crossings)
 COUNTS=$(python3 - "$P4" <<'PY'
 import socket, sys
 port = int(sys.argv[1])
@@ -202,7 +210,7 @@ print(wrong)
 PY
 )
 sleep 0.3
-AFTER=$(direct_crossings)
+AFTER=$(crossings)
 DELTA=$((AFTER - BEFORE))
 if [ "$COUNTS" = "0" ] && [ "$DELTA" -le 300 ]; then
     ok "300 publishes to a one-subscriber channel crossed $DELTA times, not 900"

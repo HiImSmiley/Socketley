@@ -77,6 +77,19 @@ eq "a CLI zset write is on the port"   "$(port 'zscore Z q')" "5"
 OUT=$("$BIN" cw set quiet 1 2>&1)
 if [ -z "$OUT" ]; then ok; else bad "a successful CLI mutation prints nothing" "printed '$OUT'"; fi
 
+# A value may hold spaces, since the cache takes it as the rest of the line; a key cannot, and is refused rather
+# than cut at its first space.
+"$BIN" cw set spaced "two words" >/dev/null 2>&1
+eq "a value with a space in it arrives whole" "$(port 'get spaced')" "two words"
+RC=0; OUT=$("$BIN" cw set "my key" v 2>&1) || RC=$?
+if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q "has a space in it" && [ "$(port 'get my')" = nil ]; then ok; else
+    bad "a key with a space in it is refused, not cut" "exit $RC, said '$OUT', key 'my' holds '$(port 'get my')'"
+fi
+RC=0; OUT=$("$BIN" cw get "my key" 2>&1) || RC=$?
+if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q "has a space in it"; then ok; else
+    bad "and so is a read of one" "exit $RC, said '$OUT'"
+fi
+
 RC=0; OUT=$("$BIN" cw quatsch k 2>&1) || RC=$?
 if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q "unknown action: quatsch"; then ok; else
     bad "an unknown verb still names itself" "exit $RC, said '$OUT'"
@@ -109,9 +122,14 @@ fi
 # And read back, after a kill rather than a stop: a clean stop makes the worker
 # write its own dump, which would repair the file this case is about.
 PIDS=$("$BIN" stats cw 2>/dev/null | grep -oP 'pid[s]?:\s*\K[0-9 ,]+' | tr ',' ' ')
+KILLED=""
 for p in $PIDS; do
-    grep -qa 'socketley' "/proc/$p/cmdline" 2>/dev/null && kill -9 "$p" 2>/dev/null
+    grep -qa 'socketley' "/proc/$p/cmdline" 2>/dev/null && kill -9 "$p" 2>/dev/null && KILLED="$KILLED $p"
 done
+# With no worker killed the stop below writes a clean dump and the read-back proves nothing.
+if [ -n "$KILLED" ]; then ok; else
+    bad "the worker is killed before the read-back" "stats gave pids '${PIDS:-<none>}' and none was a live worker"
+fi
 sleep 1
 "$BIN" stop cw >/dev/null 2>&1; sleep 0.5
 "$BIN" start cw >/dev/null 2>&1

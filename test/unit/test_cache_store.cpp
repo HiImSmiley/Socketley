@@ -10,6 +10,8 @@
 #include <thread>
 #include <malloc.h>
 #include <unistd.h>
+#include <fstream>
+#include <iterator>
 
 TEST_CASE("cache_store string operations")
 {
@@ -159,6 +161,18 @@ TEST_CASE("cache_store list operations")
 TEST_CASE("cache_store set operations")
 {
     cache_store store;
+
+    SUBCASE("SINTER answers WRONGTYPE for a key of another type behind an absent one, as Redis does")
+    {
+        store.set("str", "v");
+        store.sadd("s", "a");
+        const std::string_view keys[] = {"absent", "str"};
+        std::vector<std::string> out;
+        CHECK(store.sinter(keys, 2, out) == -1);
+        const std::string_view sets[] = {"absent", "s"};
+        CHECK(store.sinter(sets, 2, out) == 0);
+        CHECK(out.empty());
+    }
 
     SUBCASE("sadd and sismember")
     {
@@ -2420,6 +2434,24 @@ TEST_CASE("seg_list taken from one end only, emptied and refilled")
     }
 }
 
+TEST_CASE("seg_list take into a string that holds a buffer keeps its spare count")
+{
+    seg_list l, ref;
+    l.push_back(std::string(40, 'a'));
+    l.push_back(std::string(40, 'b'));
+    ref.push_back(std::string(40, 'b'));
+    std::string out;
+    out.reserve(300);
+    l.take_front(out);
+    CHECK(out == std::string(40, 'a'));
+    CHECK(l.spare() == ref.spare());
+    l.push_front(std::string(40, 'c'));
+    out.reserve(300);
+    l.take_back(out);
+    CHECK(out == std::string(40, 'b'));
+    CHECK(l.spare() < 1024);
+}
+
 TEST_CASE("list_items agrees with a deque, packed and after it moves to the seg_list")
 {
     uint32_t r = 31337;
@@ -3363,8 +3395,12 @@ TEST_CASE("a renamed key can still be evicted, and a refused COPY copies nothing
         store.set_eviction(evict_none);
         for (int i = 0; i < 1400; ++i)
         {
-            REQUIRE(store.sadd("a", "member-a-" + std::string(200, 'x') + std::to_string(i)) == 1);
-            REQUIRE(store.sadd("b", "member-b-" + std::string(200, 'y') + std::to_string(i)) == 1);
+            // Appended in place, since GCC 13 misreads the temporaries of a chained + as an overflow.
+            std::string ma = "member-a-", mb = "member-b-";
+            ma.append(200, 'x').append(std::to_string(i));
+            mb.append(200, 'y').append(std::to_string(i));
+            REQUIRE(store.sadd("a", ma) == 1);
+            REQUIRE(store.sadd("b", mb) == 1);
         }
         REQUIRE(store.set("dst", "kept"));
         const std::string_view keys[] = { "a", "b" };
@@ -4187,4 +4223,47 @@ TEST_CASE("a stream write refused for room leaves the stream as it was")
         REQUIRE(store_xadd(lru, "s", { i, 0 }, { "f", std::string(300, 'y') }));
     CHECK(lru.stream_get("s")->size() == 3000);
     CHECK(lru.get_memory_used() <= lru.get_max_memory());
+}
+
+TEST_CASE("cache_store keys and scan leave out a key past its deadline before the sweep")
+{
+    cache_store store;
+    store.set("gone", "x");
+    store.set("kept", "y");
+    REQUIRE(store.set_expiry_ms("gone", 1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    std::vector<std::string_view> listed;
+    store.keys("*", listed);
+    CHECK(listed == std::vector<std::string_view>{"kept"});
+
+    std::vector<std::string_view> page;
+    store.scan(0, "*", 100, page);
+    CHECK(page == std::vector<std::string_view>{"kept"});
+}
+
+TEST_CASE("cache_store load refuses a dump cut inside a key's header")
+{
+    const std::string path = "/tmp/socketley-unit-cut-" + std::to_string(::getpid()) + ".bin";
+    {
+        cache_store src;
+        src.set("first", "1");
+        src.set("marker_key_of_the_cut", "2");
+        REQUIRE(src.save(path));
+    }
+    std::string bytes;
+    {
+        std::ifstream in(path, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const size_t at = bytes.find("marker_key_of_the_cut");
+    REQUIRE(at != std::string::npos);
+    // Two bytes into the four that give the key's length.
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(at - 2));
+    }
+    cache_store dst;
+    CHECK_FALSE(dst.load(path));
+    ::unlink(path.c_str());
 }

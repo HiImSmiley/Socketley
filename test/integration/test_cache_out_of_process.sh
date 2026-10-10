@@ -47,9 +47,10 @@ trap cleanup EXIT
 
 echo "=== Integration: a cache in a worker process of its own ==="
 
+# A failure and not a skip, as test_cache_command_table.sh already makes redis-cli a requirement of the suite.
 if ! command -v redis-cli >/dev/null 2>&1; then
-    echo "  SKIP: redis-cli is required to speak to the cache"
-    exit 0
+    echo "  FAIL: redis-cli is required to speak to the cache"
+    exit 1
 fi
 
 daemon_start "$BIN"
@@ -106,7 +107,8 @@ fi
 # missing.
 sleep 2.5
 ST=$("$BIN" stats oopc 2>&1 || true)
-if has "$ST" "keys:1"; then ok; else
+# A whole line, so keys:10 is not read as keys:1.
+if has $'\n'"$ST"$'\n' $'\nkeys:1\n'; then ok; else
     bad "stats report the worker's store, not the placeholder's empty one" \
         "expected keys:1 after one SET" "$(printf '%s' "$ST" | tr '\n' '|')"
 fi

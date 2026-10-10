@@ -280,6 +280,9 @@ check('XINFO GROUPS', [(g['name'], g['pending'], g['last-delivered-id']) for g i
       [('g', 1, '6-1'), ('late', 0, '5-1')])
 check('NOGROUP', c('XREADGROUP', 'GROUP', 'nope', 'w', 'STREAMS', 'q', '>'),
       Err("NOGROUP No such key 'q' or consumer group 'nope' in XREADGROUP with GROUP option"))
+# A key that spells a reply ends no error early: the next reply is the next command's.
+odd = c('XREADGROUP', 'GROUP', 'nope', 'w', 'STREAMS', 'q\r\n+OK', '>')
+check('an error naming a key with CR LF in it stays one reply', (isinstance(odd, Err), c('PING')), (True, 'PONG'))
 check('XGROUP DESTROY', c('XGROUP', 'DESTROY', 'q', 'late'), 1)
 PY
 
@@ -482,6 +485,37 @@ truth('a blocking read waits at home and is refused away from it',
       sorted(map(str, blocked)) == sorted(['None', 'ERR a blocking read waits on the shard that owns its streams -- '
                                             'connect to that shard\'s --cluster port to block on them']), blocked)
 PY
+
+# The verbs only a record of the cache's own writes carries -- a group's consumers and pending entries -- are not a
+# client's: one that typed the record's form made a consumer appear in a group it had never read from.
+INJ=$(python3 - "$P" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+def resp(*a):
+    s = socket.create_connection(("127.0.0.1", port), 5)
+    s.sendall(("*%d\r\n" % len(a) + "".join("$%d\r\n%s\r\n" % (len(x), x) for x in a)).encode())
+    s.settimeout(2); d = b""
+    try:
+        while True:
+            b = s.recv(65536)
+            if not b: break
+            d += b
+            if d.endswith(b"\r\n"): break
+    except Exception: pass
+    s.close(); return d
+resp("XGROUP", "CREATE", "inj", "g", "$", "MKSTREAM")
+t = socket.create_connection(("127.0.0.1", port), 5)
+t.sendall(b"xapply inj 9:XCONSUMER3:inj1:g4:evil1:01:0\n")
+t.settimeout(2)
+try: t.recv(4096)
+except Exception: pass
+t.close()
+print("evil" in resp("XINFO", "CONSUMERS", "inj", "g").decode(errors="replace"))
+PY
+)
+TOTAL=$((TOTAL+1))
+if [ "$INJ" = False ]; then PASS=$((PASS+1))
+else FAIL=$((FAIL+1)); echo "  FAIL [a client cannot write a group's consumers through a record's verb]: XINFO showed it (${INJ:-<nothing>})"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] || exit 1

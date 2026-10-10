@@ -105,6 +105,8 @@ if mode == 'setup':
         read_reply(f)
     print("ok")
 elif mode == 'cmd':
+    # One command, one reply, printed flat -- for the counting rows, which are
+    # not walks and must not be run through the cursor loop.
     send(f, s, rest)
     r = read_reply(f)
     print(r.decode('latin1') if isinstance(r, bytes) else r)
@@ -125,12 +127,6 @@ elif mode == 'pairs':
         if pages > 5000:
             print("ERR runaway cursor"); sys.exit(0)
     print("%d %s" % (pages, ' '.join('%s=%s' % kv for kv in sorted(prs.items()))))
-elif mode == 'cmd':
-    # One command, one reply, printed flat -- for the counting rows, which are
-    # not walks and must not be run through the cursor loop.
-    send(f, s, rest)
-    r = read_reply(f)
-    print(r.decode('latin1') if isinstance(r, bytes) else r)
 elif mode == 'resume':
     # A cursor from a plain scan that has moved past the string map: its top
     # bits name another map, and its bucket index is that map's, not m_data's.

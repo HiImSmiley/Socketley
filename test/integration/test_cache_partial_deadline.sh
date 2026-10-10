@@ -170,7 +170,8 @@ if [ "$FASTR" = ok ]; then pass
 else fail "a slow writer ABOVE the floor still completes" \
           "700 kB at 20 KB/s, past at least one sweep, got: $FASTR" \
           "this arm is what stops the deadline from breaking a real client"; fi
-if [ "$SLOWR" != ok ]; then pass
+# Only a closed connection counts as a drop, not a writer that has not reported yet.
+if [[ "$SLOWR" =~ ^(no-ok|ConnectionResetError|BrokenPipeError|ConnectionAbortedError)$ ]]; then pass
 else fail "a writer below the floor is dropped" \
           "300 kB at 5 KB/s should fall behind its own allowance, got: $SLOWR"; fi
 

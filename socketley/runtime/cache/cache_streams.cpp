@@ -37,14 +37,14 @@ void err_code(std::string& rb, sv m) { resp::encode_error_code_into(rb, m); }
 void err_arity(std::string& rb, sv name)
 {
     rb.append("-ERR wrong number of arguments for '");
-    rb.append(name);
+    resp::append_one_line(rb, name);
     rb.append("' command\r\n");
 }
 
 void err_subcommand(std::string& rb, sv sub, sv container)
 {
     rb.append("-ERR unknown subcommand '");
-    rb.append(sub.substr(0, 128));
+    resp::append_one_line(rb, sub.substr(0, 128));
     rb.append("'. Try ");
     rb.append(container);
     rb.append(" HELP.\r\n");
@@ -53,7 +53,7 @@ void err_subcommand(std::string& rb, sv sub, sv container)
 void err_subcommand_syntax(std::string& rb, sv sub, sv container)
 {
     rb.append("-ERR unknown subcommand or wrong number of arguments for '");
-    rb.append(sub.substr(0, 128));
+    resp::append_one_line(rb, sub.substr(0, 128));
     rb.append("'. Try ");
     rb.append(container);
     rb.append(" HELP.\r\n");
@@ -215,18 +215,18 @@ struct stream_commands
     void nogroup_key(sv key, sv grp)
     {
         rb.append("-NOGROUP No such key '");
-        rb.append(key);
+        resp::append_one_line(rb, key);
         rb.append("' or consumer group '");
-        rb.append(grp);
+        resp::append_one_line(rb, grp);
         rb.append("'\r\n");
     }
 
     void nogroup_for(sv grp, sv key)
     {
         rb.append("-NOGROUP No such consumer group '");
-        rb.append(grp);
+        resp::append_one_line(rb, grp);
         rb.append("' for key name '");
-        rb.append(key);
+        resp::append_one_line(rb, key);
         rb.append("'\r\n");
     }
 
@@ -481,7 +481,7 @@ struct stream_commands
                 if (ci.m_script_depth > 0)
                 {
                     rb.append("-ERR ");
-                    rb.append(a[0]);
+                    resp::append_one_line(rb, a[0]);
                     rb.append(" command is not allowed with BLOCK option from scripts\r\n");
                     return;
                 }
@@ -540,9 +540,9 @@ struct stream_commands
                 if (!g)
                 {
                     rb.append("-NOGROUP No such key '");
-                    rb.append(key);
+                    resp::append_one_line(rb, key);
                     rb.append("' or consumer group '");
-                    rb.append(gname);
+                    resp::append_one_line(rb, gname);
                     rb.append("' in XREADGROUP with GROUP option\r\n");
                     return;
                 }
@@ -607,7 +607,7 @@ struct stream_commands
         if (conn->fd < 0 || conn == ci.m_request_conn.get())
         {
             rb.append("-ERR ");
-            rb.append(a[0]);
+            resp::append_one_line(rb, a[0]);
             rb.append(" BLOCK needs a connection to wait on, and a cross-runtime request has none\r\n");
             return;
         }
@@ -1045,7 +1045,7 @@ struct stream_commands
             else
             {
                 rb.append("-ERR Unrecognized XCLAIM option '");
-                rb.append(o);
+                resp::append_one_line(rb, o);
                 rb.append("'\r\n");
                 return;
             }
@@ -1473,7 +1473,7 @@ void cache_instance::stream_command(client_connection* conn, uint32_t h, std::st
             [[fallthrough]];
         default:
             rb.append("-ERR unknown command '");
-            rb.append(args[0]);
+            resp::append_one_line(rb, args[0]);
             rb.append("'\r\n");
             break;
     }
@@ -1610,7 +1610,7 @@ void cache_instance::stream_text(client_connection* conn, std::string_view cmd, 
     }
     std::string reply;
     const bool was = m_stream_internal;
-    m_stream_internal = record;
+    m_stream_internal = record && m_applying_replicated;
     stream_command(conn, h, a.data(), static_cast<int>(a.size()), reply);
     m_stream_internal = was;
     if (conn->blocked) return;
@@ -1758,7 +1758,8 @@ bool cache_instance::block_stream(client_connection* conn, const std::string_vie
         w.keys.emplace_back(keys[i]);
         w.after.push_back(ids[i]);
     }
-    if (timeout_ms > 0)
+    // As BLPOP's: a wait past some thirty years would overflow the clock into the past.
+    if (timeout_ms > 0 && timeout_ms < 1'000'000'000'000LL)
         w.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
     const uint64_t seq = w.seq;

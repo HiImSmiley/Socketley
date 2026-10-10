@@ -49,6 +49,10 @@ R rpush shortlist a b >/dev/null
 R pexpire shortlist 2000 >/dev/null
 R set long v ex 300 >/dev/null
 R set forever v >/dev/null
+# What the two gone-checks below mean only if both keys were there to begin with: an empty answer after the restart
+# reads the same for a deadline honoured and for a write that never landed.
+[ "$(R get short) $(R llen shortlist)" = "v 2" ] || fail "the premise" \
+    "before the stop, GET short = '$(R get short)' and LLEN shortlist = '$(R llen shortlist)', wanted v and 2"
 
 "$BIN" stop dt >/dev/null 2>&1
 # The worker writes the dump on its way out, after `stop` has answered.

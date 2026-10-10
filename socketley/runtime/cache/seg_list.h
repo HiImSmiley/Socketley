@@ -94,9 +94,10 @@ public:
         assign_fitted(s, v);
         m_spare += units(s);
     }
-    // The end element moved into `out` and gone, its spare with it.
-    void take_front(std::string& out) { m_spare -= units(front()); out = std::move(front()); pop_front(); }
-    void take_back(std::string& out)  { m_spare -= units(back());  out = std::move(back());  pop_back(); }
+    // The end element moved into `out` and gone, its spare with it: moved out whole first, because a move-assign
+    // hands the element `out`'s old buffer, whose spare the pop would then take off a count that never had it.
+    void take_front(std::string& out) { take(front(), out); pop_front(); }
+    void take_back(std::string& out)  { take(back(), out);  pop_back(); }
 
     std::string&       operator[](size_t i)       { return slot_at(m_off + i); }
     const std::string& operator[](size_t i) const { return slot_at(m_off + i); }
@@ -274,6 +275,16 @@ private:
         return static_cast<uint32_t>((spare_bytes(cap, len) + 15) / 16);
     }
     static uint32_t units(const std::string& s) { return units(s.capacity(), s.size()); }
+
+    // The element's bytes into `out`, the slot left empty and counted as empty for the pop that follows.
+    void take(std::string& slot, std::string& out)
+    {
+        const uint32_t was = units(slot);
+        std::string v = std::move(slot);
+        m_spare += units(slot);
+        m_spare -= was;
+        out = std::move(v);
+    }
 
     std::string& slot_at(size_t p) const
     {

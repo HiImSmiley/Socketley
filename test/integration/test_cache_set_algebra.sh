@@ -122,6 +122,8 @@ if [ "$(redis-cli -p "$RP" ping 2>/dev/null)" = "PONG" ]; then
         eq "same as redis-server: $q" "$(r "$q" "$P")" "$(r "$q" "$RP")"
     done
     redis-cli -p "$RP" shutdown nosave >/dev/null 2>&1
+elif command -v redis-server >/dev/null 2>&1; then
+    bad "redis-server comes up for the comparison arm" "nothing answered PING on $RP"
 else
     echo "  (redis-server absent — the comparison arm did not run)"
 fi

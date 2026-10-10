@@ -33,7 +33,59 @@ std::string cache_script_engine::sha1_hex(std::string_view in)
     return out;
 }
 
-std::string cache_script_engine::load(std::string_view body)
+static std::string shape_lua_error(const char* what);
+
+bool cache_script_engine::compile(std::string_view body, std::string& err)
+{
+    if (m_compiled.find(body) != m_compiled.end())
+        return true;
+    ensure_state();
+    // Named so a compile error points at "user_script" the way Redis's
+    // does, rather than at the script's own first line quoted back.
+    // Text only, because LuaJIT runs bytecode unverified and a crafted
+    // chunk from any client that can reach the port is native code.
+    sol::load_result lr = m_lua.load(std::string(body), "@user_script", sol::load_mode::text);
+    if (!lr.valid())
+    {
+        sol::error e = lr;
+        err = shape_lua_error(e.what());
+        return false;
+    }
+    m_compiled.emplace(std::string(body), lr.get<sol::protected_function>());
+    return true;
+}
+
+std::string cache_script_engine::load(std::string_view body, std::string& err)
+{
+    if (!compile(body, err))
+        return {};
+    std::string sha = remember(body);
+    // Loaded by name, it is kept until SCRIPT FLUSH, whether or not EVAL had made it known first.
+    if (const auto at = m_eval_at.find(body); at != m_eval_at.end())
+    {
+        m_eval_lru.erase(at->second);
+        m_eval_at.erase(at);
+    }
+    return sha;
+}
+
+void cache_script_engine::trim_eval()
+{
+    while (m_depth == 0 && m_eval_lru.size() > eval_kept)
+    {
+        const std::string& body = m_eval_lru.back();
+        if (const auto s = m_sha_of.find(body); s != m_sha_of.end())
+        {
+            m_scripts.erase(s->second);
+            m_sha_of.erase(s);
+        }
+        m_compiled.erase(body);
+        m_eval_at.erase(body);
+        m_eval_lru.pop_back();
+    }
+}
+
+std::string cache_script_engine::remember(std::string_view body)
 {
     // A body that fails to compile is registered again by every EVAL of it,
     // and SCRIPT LOAD may be sent any number of times: each would be an
@@ -74,6 +126,8 @@ void cache_script_engine::flush()
     // And the compiled forms, or SCRIPT FLUSH would leave the memory it was
     // asked to release.
     m_compiled.clear();
+    m_eval_lru.clear();
+    m_eval_at.clear();
 }
 
 // ─── The reply, read back ───────────────────────────────────────────────────
@@ -165,8 +219,16 @@ void lua_to_resp(lua_State* L, int idx, std::string& out, int depth = 0)
             // Truncated towards zero, not rounded: a script returning 3.7 is
             // returning 3 on Redis, and a caller that wanted 3.7 has to return
             // a string.
-            resp::encode_integer_into(out, static_cast<int64_t>(lua_tonumber(L, idx)));
+        {
+            // Saturated past int64's range and zero for NaN, where the plain cast is undefined.
+            const double d = lua_tonumber(L, idx);
+            const int64_t v = !(d == d) ? 0
+                            : d >= 9223372036854775808.0  ? INT64_MAX
+                            : d < -9223372036854775808.0  ? INT64_MIN
+                                                          : static_cast<int64_t>(d);
+            resp::encode_integer_into(out, v);
             return;
+        }
         case LUA_TSTRING:
         {
             const char* s = lua_tolstring(L, idx, &len);
@@ -287,7 +349,8 @@ int cache_script_engine::run_call(lua_State* L, bool raising)
             const double d = lua_tonumber(L, i);
             char buf[40];
             int  n;
-            if (d == static_cast<double>(static_cast<long long>(d)))
+            if (d >= -9223372036854775808.0 && d < 9223372036854775808.0 &&
+                d == static_cast<double>(static_cast<long long>(d)))
                 n = std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(d));
             else
                 n = std::snprintf(buf, sizeof(buf), "%.17g", d);
@@ -506,28 +569,35 @@ bool cache_script_engine::eval(std::string_view body,
     // Looked up by the body itself.  The SHA it used to be keyed by cost an
     // OpenSSL context allocation and a forty-character string build on every
     // call, to arrive at a name for something we were already holding.
+    // Counted for this call, so trim_eval() never drops the chunk an outer script is still running.
+    struct depth_guard
+    {
+        int& d;
+        cache_script_engine* e;
+        ~depth_guard() { if (--d == 0) e->trim_eval(); }
+    } dg{ ++m_depth, this };
+    if (const auto at = m_eval_at.find(body); at != m_eval_at.end())
+        m_eval_lru.splice(m_eval_lru.begin(), m_eval_lru, at->second);
+
     auto cached = m_compiled.find(body);
     if (cached == m_compiled.end())
     {
+        // Compiled before it is made known, so a body that does not compile has no SHA, as on Redis.
+        if (!compile(body, err))
+            return false;
+        cached = m_compiled.find(body);
         // EVAL loads as well as runs, so the SHA it would have under SCRIPT
         // LOAD works afterwards -- which is what lets a client try EVALSHA
         // first and fall back once.  Here and not per call: SCRIPT FLUSH empties
         // both maps, so a body compiled is a body loaded.
-        load(body);
-        // Named so a compile error points at "user_script" the way Redis's
-        // does, rather than at the script's own first line quoted back.
-        // Text only, because LuaJIT runs bytecode unverified and a crafted
-        // chunk from any client that can reach the port is native code.
-        sol::load_result lr = m_lua.load(std::string(body), "@user_script",
-                                         sol::load_mode::text);
-        if (!lr.valid())
+        // Made known by EVAL alone it is one of the scripts kept only while they are run often enough.
+        const bool pinned = m_sha_of.find(body) != m_sha_of.end() && m_eval_at.find(body) == m_eval_at.end();
+        remember(body);
+        if (!pinned && m_eval_at.find(body) == m_eval_at.end())
         {
-            sol::error e = lr;
-            err = shape_lua_error(e.what());
-            return false;
+            m_eval_lru.emplace_front(body);
+            m_eval_at.emplace(std::string(body), m_eval_lru.begin());
         }
-        cached = m_compiled.emplace(std::string(body),
-                                    lr.get<sol::protected_function>()).first;
     }
 
     // Armed for this call, and NOT hoisted out of it: this is what stops a

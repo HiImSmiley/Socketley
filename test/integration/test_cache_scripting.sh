@@ -80,11 +80,12 @@ want() {
     case "$got" in *"$expect"*) ok "$label" ;;
                    *) bad "$label" "reply did not contain '$expect'" "got: $got" ;; esac
 }
-deny() {   # the reply must NOT contain this
-    local label=$1 forbidden=$2 cmds=$3 got
+deny() {   # the reply must NOT contain this, and must start as expected so no reply is not a pass
+    local label=$1 forbidden=$2 start=$3 cmds=$4 got
     got=$(resp "$cmds")
     case "$got" in *"$forbidden"*) bad "$label" "reply contained '$forbidden'" "got: $got" ;;
-                   *) ok "$label" ;; esac
+                   "$start"*) ok "$label" ;;
+                   *) bad "$label" "reply did not start with '$start'" "got: ${got:-<nothing>}" ;; esac
 }
 
 echo "--- 1. the sandbox, door by door ---"
@@ -97,7 +98,7 @@ done
 # the script says so rather than the test assuming it cannot.
 want "ffi cannot be reached" "nein" \
   '[["EVAL","local ok = pcall(function() return require(\"ffi\") end); if ok then return \"JA\" end return \"nein\"","0"]]'
-deny "and no script sees the operator's globals" "socketley" \
+deny "and no script sees the operator's globals" "socketley" '$3 | nil' \
   '[["EVAL","return type(socketley)","0"]]'
 
 echo "--- 2. the deadline, and what survives it ---"
@@ -116,7 +117,7 @@ echo "--- 3. an error is one line, and the next reply survives it ---"
 got=$(resp '[["SET","es","v"],["EVAL","return redis.call(\"incr\", KEYS[1])","1","es"],["PING"]]')
 case "$got" in *PONG*) ok "the reply after a script error is intact" ;;
                *) bad "framing" "PONG did not survive the error reply" "got: $got" ;; esac
-deny "and the traceback is not in it" "traceback" \
+deny "and the traceback is not in it" "traceback" "-" \
   '[["EVAL","return redis.call(\"incr\", \"es\")","0"]]'
 
 echo "--- 4. what a script returns, converted ---"
@@ -160,11 +161,27 @@ want "script exists says 1" ":1" \
   '[["SCRIPT","EXISTS","a5260dd66ce02462c5b5231c727b3f7772c0bcc5"]]'
 want "evalsha runs it" "wert" \
   '[["EVALSHA","a5260dd66ce02462c5b5231c727b3f7772c0bcc5","1","sk"]]'
+# A body that does not compile has no SHA, by SCRIPT LOAD or by EVAL, as on Redis.
+want "script load of a body that does not compile is an error" "-ERR" '[["SCRIPT","LOAD","return ("]]'
+want "and neither it nor an EVAL of it is kept" ":0" \
+  '[["EVAL","return (","0"],["SCRIPT","EXISTS","728acb63e2aaef0ee859ece5db586bff5d800d1e"]]'
 want "an unknown sha is NOSCRIPT" "NOSCRIPT" \
   '[["EVALSHA","0000000000000000000000000000000000000000","1","sk"]]'
 want "script flush empties it" "+OK" '[["SCRIPT","FLUSH"]]'
 want "and then it is gone" ":0" \
   '[["SCRIPT","EXISTS","a5260dd66ce02462c5b5231c727b3f7772c0bcc5"]]'
+
+# EVAL keeps what it ran, but not without end: a client that sends a new body each time grew the cache for ever. The
+# least recently run of EVAL's own goes past 500, as Redis 7.4 has it, and SCRIPT LOAD's stays until a flush.
+EVALS=$(python3 -c '
+import json, hashlib
+cmds = [["SCRIPT", "LOAD", "return 7 -- kept by name"]] + [["EVAL", "return 1 -- %d" % i, "0"] for i in range(600)]
+first = hashlib.sha1(b"return 1 -- 0").hexdigest(); last = hashlib.sha1(b"return 1 -- 599").hexdigest()
+kept = hashlib.sha1(b"return 7 -- kept by name").hexdigest()
+cmds.append(["SCRIPT", "EXISTS", first, last, kept])
+print(json.dumps(cmds))')
+want "EVAL keeps the scripts it ran recently, drops the oldest past 500, and keeps a loaded one" \
+    '*3 | :0 | :1 | :1' "$EVALS"
 # EVAL loads as it runs, which is what makes the NOSCRIPT fallback work.
 want "eval loads as well as runs" "wert" \
   '[["EVAL","return redis.call(\"get\", KEYS[1])","1","sk"]]'

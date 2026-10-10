@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <span>
 #include <string>
 #include <string_view>
@@ -58,7 +59,13 @@ public:
 
     // SCRIPT LOAD, which keeps the source under its own SHA1 so EVALSHA can
     // find it.  Lowercase hex, forty characters, as Redis spells it.
-    std::string load(std::string_view body);
+    std::string load(std::string_view body, std::string& err);
+
+    // The scripts only EVAL made known that are kept, as Redis 7.4 keeps them: a client that sends a new body each
+    // time would otherwise grow the cache for ever. The least recently run goes first, and EVALSHA of it answers
+    // NOSCRIPT, after which a client sends EVAL again; SCRIPT LOAD's are kept until SCRIPT FLUSH.
+    static constexpr size_t eval_kept = 500;
+    size_t eval_held() const { return m_eval_lru.size(); }
     bool               known(std::string_view sha) const;
     const std::string* body_of(std::string_view sha) const;
     void               flush();
@@ -106,6 +113,17 @@ private:
     // EVALSHA's lookup.
     std::unordered_map<std::string, sol::protected_function,
                        string_hash, string_equal> m_compiled;
+
+    // Names a body without pinning or tracking it: the part SCRIPT LOAD and EVAL share.
+    std::string remember(std::string_view body);
+    // The body compiled into m_compiled, false with the compiler's answer in `err`.
+    bool compile(std::string_view body, std::string& err);
+    // Drops the least recently run of EVAL's scripts past eval_kept, never while a script runs.
+    void trim_eval();
+    std::list<std::string> m_eval_lru;
+    std::unordered_map<std::string, std::list<std::string>::iterator,
+                       string_hash, string_equal> m_eval_at;
+    int m_depth{0};
 
     // Built once and refilled per call.  Two fresh Lua tables per EVAL is two
     // allocations and two global-table writes for something whose shape almost

@@ -64,7 +64,8 @@ for n in names:
     if b"unknown command" in r:
         bad.append(n)
     s.close()
-print(" ".join(bad) if bad else "none")
+# An empty or short list probes nothing, so it is not a clean result.
+print(" ".join(bad) if bad else ("none" if len(names) > 100 else "only %d names listed" % len(names)))
 PYEOF
 )
 ok "$UNKNOWN" "none" "every command COMMAND lists is one the cache serves"

@@ -410,7 +410,7 @@ public:
     // arithmetic, and Redis names the second one separately.  not_an_integer
     // carries the memory refusal too, as the `false` it replaces did -- folding
     // that one is an older imprecision and not this enum's.
-    enum class incr_result { ok, not_an_integer, would_overflow };
+    enum class incr_result { ok, not_an_integer, would_overflow, wrong_type, out_of_memory };
     incr_result incr(std::string_view key, int64_t delta, int64_t& result);
 
     // append() sentinels, where npos means the wrong type, because a memory
@@ -478,7 +478,8 @@ public:
     // or every one when zero, and answers how many went.
     int  lrem(std::string_view key, int64_t count, std::string_view val);
     bool ltrim(std::string_view key, int64_t start, int64_t stop);
-    // The new length, 0 when the key is absent and -1 when the pivot is not.
+    // The new length, 0 when the key is absent, -1 when the pivot is not and linsert_refused without room.
+    static constexpr int linsert_refused = -2;
     int  linsert(std::string_view key, bool before, std::string_view pivot,
                  std::string_view val);
 

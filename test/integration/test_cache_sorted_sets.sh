@@ -92,13 +92,15 @@ eq "and reads back fractional"    "$(pt 'zscore f m')"   "1.5|"
 # ── The keyspace notices it ─────────────────────────────────────────────────
 case "$(pt 'keys')" in *lb*) ok ;; *) bad "keys lists a zset" "got $(pt 'keys')" ;; esac
 # scan walks five maps now; the zset key has to come out of it.
-FOUND=0; CUR=0
-for i in $(seq 1 40); do
-    OUT=$(pt "scan $CUR")
-    case "$OUT" in *lb*) FOUND=1 ;; esac
-    CUR=$(printf '%s' "$OUT" | tr '|' '\n' | tail -2 | head -1)
-    [ "$CUR" = "0" ] || [ -z "$CUR" ] && break
+# A reply is "cursor|key|...|end|", and count 1 makes the walk follow the cursor over several pages.
+FOUND=0; CUR=0; DONE=0
+for i in $(seq 1 400); do
+    OUT=$(pt "scan $CUR count 1")
+    case "|$OUT" in *"|lb|"*) FOUND=1 ;; esac
+    CUR=$(printf '%s' "$OUT" | cut -d'|' -f1)
+    case "$CUR" in ''|*[!0-9]*) break ;; 0) DONE=1; break ;; esac
 done
+if [ "$DONE" = 1 ]; then ok; else bad "scan walks back to cursor 0" "stopped at '$CUR' after $i pages: $OUT"; fi
 if [ "$FOUND" = 1 ]; then ok; else bad "scan reaches the fifth map" "no zset key in any scan page"; fi
 
 # ── RESP ────────────────────────────────────────────────────────────────────
@@ -121,8 +123,12 @@ fi
 pt 'flush' >/dev/null
 sleep 0.4
 "$BIN" stop zc >/dev/null 2>&1; sleep 1
-"$BIN" start zc >/dev/null 2>&1
+if ! RST=$("$BIN" start zc 2>&1); then
+    bad "the cache restarts" "start zc failed: $RST"
+fi
 for i in $(seq 1 60); do [ -n "$(pt 'size')" ] && break; sleep 0.2; done
+# Named here, so a cache that never came back is not read as a lost zset below.
+[ -n "$(pt 'size')" ] || bad "the cache answers after the restart" "nothing on $PORT"
 eq "a zset survives a restart"        "$(pt 'zrange lb 0 -1 withscores')" "cyd 75|bob 250|end|"
 eq "and its type came back with it"   "$(pt 'type lb')"                   "zset|"
 eq "a fractional score survives too"  "$(pt 'zscore f m')"                "1.5|"

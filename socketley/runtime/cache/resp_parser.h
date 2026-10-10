@@ -78,10 +78,22 @@ inline void encode_null_into(std::string& buf)
     buf.append(RESP_NULL, 5);
 }
 
+// One line whatever the text holds, since an error or a status can carry a client's key, and a CR or LF in it would
+// end the reply there and make the rest read as replies of their own.
+inline void append_one_line(std::string& buf, std::string_view msg)
+{
+    const size_t at = buf.size();
+    buf.append(msg.data(), msg.size());
+    if (msg.find_first_of("\r\n") != std::string_view::npos)
+        for (size_t i = at; i < buf.size(); ++i)
+            if (buf[i] == '\r' || buf[i] == '\n')
+                buf[i] = ' ';
+}
+
 inline void encode_error_into(std::string& buf, std::string_view msg)
 {
     buf.append("-ERR ", 5);
-    buf.append(msg.data(), msg.size());
+    append_one_line(buf, msg);
     buf.append("\r\n", 2);
 }
 
@@ -91,14 +103,14 @@ inline void encode_error_into(std::string& buf, std::string_view msg)
 inline void encode_error_code_into(std::string& buf, std::string_view msg)
 {
     buf += '-';
-    buf.append(msg.data(), msg.size());
+    append_one_line(buf, msg);
     buf.append("\r\n", 2);
 }
 
 inline void encode_simple_into(std::string& buf, std::string_view msg)
 {
     buf += '+';
-    buf.append(msg.data(), msg.size());
+    append_one_line(buf, msg);
     buf.append("\r\n", 2);
 }
 

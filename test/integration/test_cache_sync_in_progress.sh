@@ -135,8 +135,15 @@ else fail "stats says it too, for a caller that is not speaking the dialect" \
 # assertion above.
 create_rc=0
 timeout 20 "$BIN" create cache sync_leader -p "$LEADER_PORT" -s >/dev/null 2>&1 || create_rc=$?
-sleep 0.6
-send_to "$LEADER_PORT" 'set synckey syncval' >/dev/null
+# Asked until the leader answers, since a write sent before it listens is lost and shows up only as an empty dump below.
+SET=""
+for _ in $(seq 1 20); do
+    SET=$(send_to "$LEADER_PORT" 'set synckey syncval' || true)
+    [ "$SET" = "ok" ] && break
+    sleep 0.2
+done
+if [ "$SET" = "ok" ]; then pass
+else fail "the leader takes the write" "got: '$SET'"; fi
 timeout 20 "$BIN" create cache sync_live -p $((P + 11)) \
     --replicate "127.0.0.1:$LEADER_PORT" -s >/dev/null 2>&1 || create_rc=$?
 if [ "$create_rc" -eq 0 ]; then pass
@@ -162,9 +169,10 @@ else fail "and calls its link standing" \
 # A leader is not a follower and must not grow either field: they would read as
 # "0" and be taken for an answer rather than for silence.
 INFO_LEADER=$(send_to "$LEADER_PORT" 'info')
-if ! grep -q "master_sync_in_progress" <<<"$INFO_LEADER"; then pass
+# The leader's own role line proves the reply arrived, so the absence below is not silence.
+if grep -q "^role:master" <<<"$INFO_LEADER" && ! grep -q "master_sync_in_progress" <<<"$INFO_LEADER"; then pass
 else fail "a leader does not answer a follower's question" \
-          "got: $(field "$INFO_LEADER" master_sync_in_progress)"; fi
+          "role: $(field "$INFO_LEADER" role)  got: $(field "$INFO_LEADER" master_sync_in_progress)"; fi
 
 # ─── And it does not wait forever ───────────────────────────────────────────
 #

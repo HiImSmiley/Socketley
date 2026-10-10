@@ -73,7 +73,8 @@ else fail "the reason names the missing port" "said: ${OUT:-<nothing>}"; fi
 "$BIN" remove rep_bad >/dev/null 2>&1 || true
 DEAD=$((P + 12))
 timeout 20 "$BIN" create cache rep_dead -p $((P + 13)) --replicate "127.0.0.1:$DEAD" -s >/dev/null 2>&1 || true
-sleep 0.6
+# The dial completes on the worker's loop after create returns, so the log is polled for ten seconds.
+for _ in $(seq 1 50); do grep -q "could not dial master" "$SOCKETLEY_DLOG" 2>/dev/null && break; sleep 0.2; done
 if grep -q "could not dial master" "$SOCKETLEY_DLOG" 2>/dev/null; then pass
 else fail "a dial that did not happen is said out loud" \
           "nothing in the daemon log mentions the master it could not reach" \

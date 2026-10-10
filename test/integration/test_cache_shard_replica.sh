@@ -92,11 +92,15 @@ case "$RP" in
 esac
 
 # And a follower pointed at one really does stay empty.
-"$BIN" create cache rfx -p "$FX" --replicate "127.0.0.1:$L4" -s >/dev/null 2>&1
+"$BIN" create cache rfx -p "$FX" --replicate "127.0.0.1:$L4" -s >/dev/null 2>&1 \
+    || bad "the follower of the sharded leader starts" "create rfx failed"
 for i in $(seq 1 40); do printf "set s$i sv$i\n" | timeout 2 nc -q1 127.0.0.1 "$L4" >/dev/null 2>&1; done
 sleep 4
 FXSZ=$(sz "$FX")
-if [ "${FXSZ:-0}" -le 1 ]; then
+if ! [[ "$FXSZ" =~ ^[0-9]+$ ]]; then
+    bad "a follower of a sharded leader receives nothing rather than a quarter" \
+        "it never answered size: got '$FXSZ'"
+elif [ "$FXSZ" -le 1 ]; then
     ok "a follower of a sharded leader receives nothing rather than a quarter"
 else
     bad "a follower of a sharded leader receives nothing rather than a quarter" \
@@ -109,8 +113,10 @@ fi
 # ── a sharded follower of an unsharded leader ──────────────────────────────
 "$BIN" create cache rl  -p "$L"  -s >/dev/null 2>&1
 ready "$L" || { echo "  FATAL: the leader never answered"; exit 2; }
-"$BIN" create cache rf1 -p "$F1" --replicate "127.0.0.1:$L" -s >/dev/null 2>&1
-"$BIN" create cache rf4 -p "$F4" --shards 4 --replicate "127.0.0.1:$L" -s >/dev/null 2>&1
+"$BIN" create cache rf1 -p "$F1" --replicate "127.0.0.1:$L" -s >/dev/null 2>&1 \
+    || { echo "  FATAL: the unsharded follower was not created"; exit 2; }
+"$BIN" create cache rf4 -p "$F4" --shards 4 --replicate "127.0.0.1:$L" -s >/dev/null 2>&1 \
+    || { echo "  FATAL: the sharded follower was not created"; exit 2; }
 sleep 4
 
 for i in $(seq 1 30); do printf "set t$i tv$i\n" | timeout 2 nc -q1 127.0.0.1 "$L" >/dev/null 2>&1; done
@@ -136,7 +142,7 @@ else
 fi
 
 LSZ=$(sz "$L"); F1SZ=$(sz "$F1"); F4SZ=$(sz "$F4")
-if [ "$F4SZ" = "$LSZ" ] && [ "$F1SZ" = "$LSZ" ]; then
+if [[ "$LSZ" =~ ^[1-9][0-9]*$ ]] && [ "$F4SZ" = "$LSZ" ] && [ "$F1SZ" = "$LSZ" ]; then
     ok "the sharded follower holds the leader's keys once, not N times (size $F4SZ)"
 else
     bad "the sharded follower holds the leader's keys once, not N times" \

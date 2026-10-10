@@ -259,7 +259,7 @@ daemon_stop
 # 8*7 = 56 descriptors held at once; at a soft limit of 512 the budget is half
 # of that less headroom, so the mesh is refused and the runtime relays.
 (
-    ulimit -n 512 2>/dev/null || exit 0
+    ulimit -n 512 2>/dev/null || { echo "  SKIP: cannot lower the open-file limit to 512 here"; exit 77; }
     daemon_isolate cacheshardcap
     daemon_start "$BIN"
     "$BIN" create cache capc -p $((PORT+1)) --shards 8 --resp -s >/dev/null 2>&1
@@ -276,6 +276,11 @@ daemon_stop
     printf '%s %s\n' "$m" "$said" > /tmp/skl-cap-result.$$
     daemon_stop
 )
+CAPRC=$?
+if [ ! -f /tmp/skl-cap-result.$$ ] && [ "$CAPRC" -ne 77 ]; then
+    bad "under a low descriptor limit the mesh is refused out loud" \
+        "the capped daemon run ended (rc=$CAPRC) before it reported anything"
+fi
 if [ -f /tmp/skl-cap-result.$$ ]; then
     read -r CAPMISS CAPSAID < /tmp/skl-cap-result.$$
     rm -f /tmp/skl-cap-result.$$

@@ -86,7 +86,9 @@ command -v nc >/dev/null 2>&1 || { echo "  SKIP: nc is required"; exit 0; }
 
 daemon_start "$BIN"
 
-if ! "$BIN" create cache mk4 -p "$P_T4" --shards 4 -s >/dev/null 2>&1; then
+# Admin mode and a dump path, so `flush` below can only answer ok by writing every shard's slice.
+if ! "$BIN" create cache mk4 -p "$P_T4" --shards 4 --mode admin \
+        --persistent "$SOCKETLEY_TMPD/mk4.dump" -s >/dev/null 2>&1; then
     echo "  FATAL: --shards on a cache was refused.  It is a supported"
     echo "         configuration now, so this is a defect and not a skip."
     exit 2
@@ -181,13 +183,11 @@ fi
 # interpreter's own reply merged across the shards — `all_ok`, so a partial
 # flush shows as the refusal it is rather than being averaged away.
 FOUT=$(printf 'flush\n' | timeout 5 nc -q1 127.0.0.1 "$P_T4" 2>/dev/null | head -1)
-case "$FOUT" in
-    *"not routed"*|"")
-        bad "flush is answered by the runtime rather than refused as unroutable" \
-            "got '$FOUT'" ;;
-    *)
-        ok "flush is answered by the runtime ('$FOUT')" ;;
-esac
+if [ "$FOUT" = "ok" ]; then
+    ok "flush is answered by every shard with ok"
+else
+    bad "flush is answered by every shard with ok" "got '$FOUT'"
+fi
 
 # ── RESP: the second dispatch, and SCAN ─────────────────────────────────────
 if command -v redis-cli >/dev/null 2>&1; then
@@ -251,8 +251,10 @@ PY
         *) bad "a cursor from another shard set is refused, in RESP" "got '$BADC'" ;;
     esac
 else
-    echo "  (redis-cli absent — the RESP and SCAN assertions did not run)"
+    # Counted in the Results line, so a run without redis-cli does not read as complete.
+    SKIPPED=5
+    echo "  SKIP: redis-cli absent — the $SKIPPED RESP and SCAN assertions did not run"
 fi
 
-echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+echo "  Results: $PASS/$TOTAL passed ($FAIL failed, ${SKIPPED:-0} skipped)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || exit 1

@@ -57,7 +57,7 @@ def enc(cmd):
     for a in cmd: p += ('$%d\r\n%s\r\n' % (len(a), a)).encode()
     return p
 
-def once(port, cmds, wait=3.0, until=None):
+def once(port, cmds, wait=3.0, until=None, lines=None):
     s = socket.create_connection(('127.0.0.1', port), timeout=wait + 2)
     for c in cmds: s.sendall(enc(c))
     s.settimeout(wait); out = b''
@@ -67,7 +67,9 @@ def once(port, cmds, wait=3.0, until=None):
             if not b: break
             out += b
             if until and until.encode() in out: break
-            if not until and out.endswith(b'\r\n'): break
+            # Replies can come in separate reads, so a count of lines is read to the end of the last.
+            if lines and out.count(b'\r\n') >= lines: break
+            if not until and not lines and out.endswith(b'\r\n'): break
     except socket.timeout: pass
     s.close(); return out.decode('latin1')
 
@@ -95,7 +97,7 @@ elif mode == 'disconnect':
     s = socket.create_connection(('127.0.0.1', port), timeout=5)
     s.sendall(enc(['BLPOP', 'dc', '0']))
     time.sleep(0.3); s.close(); time.sleep(0.3)
-    print(json.dumps(once(port, [['RPUSH', 'dc', 'x'], ['LLEN', 'dc']], wait=2.0)))
+    print(json.dumps(once(port, [['RPUSH', 'dc', 'x'], ['LLEN', 'dc']], wait=2.0, lines=2)))
 
 elif mode == 'woken':
     got = [None]
@@ -103,6 +105,18 @@ elif mode == 'woken':
     t = threading.Thread(target=w); t.start(); time.sleep(0.5)
     once(port, [['RPUSH', 'wk', 'hallo']])
     t.join(); print(json.dumps(got[0]))
+
+elif mode == 'far':
+    # A timeout too long to count in the clock's nanoseconds is a wait, not an instant deadline.
+    got = [None, None]
+    def w(i, cmd): got[i] = once(port, [cmd], wait=4.0)
+    ts = [threading.Thread(target=w, args=(0, ['BLPOP', 'far', '1e300'])),
+          threading.Thread(target=w, args=(1, ['XREAD', 'BLOCK', '9999999999999', 'STREAMS', 'farx', '$']))]
+    for t in ts: t.start()
+    time.sleep(1.5)
+    once(port, [['RPUSH', 'far', 'spaet']]); once(port, [['XADD', 'farx', '*', 'f', 'spaet']])
+    for t in ts: t.join()
+    print(json.dumps(got))
 
 elif mode == 'timing':
     t0 = time.time(); r = once(port, [['BLPOP', 'leer', '1']], wait=4.0)
@@ -127,14 +141,14 @@ try:
         b=s.recv(65536)
         if not b: break
         out+=b
-        if out.count(b'\r\n')>=10: break
+        if out.count(b'\r\n')>=12: break
 except socket.timeout: pass
 s.close(); print(out.decode('latin1').replace('\r\n',' | '))
 X
 )
-case "$got" in *"q | "*a*) ok "blpop took the head without blocking" ;;
+case "$got" in *':2 | *2 | $1 | q | $1 | a | '*) ok "blpop took the head without blocking" ;;
                *) bad "immediate" "no immediate reply" "got: $got" ;; esac
-case "$got" in *b*) ok "brpop took the tail" ;; *) bad "brpop" "got: $got" ;; esac
+case "$got" in *' | a | *2 | $1 | q | $1 | b | ') ok "brpop took the tail" ;; *) bad "brpop" "got: $got" ;; esac
 
 echo "--- 2. an empty list waits, and answers nil when the time is up ---"
 read -r ms rest <<<"$(py timing | python3 -c 'import json,sys; a=json.load(sys.stdin); print(a[0], json.dumps(a[1]))')"
@@ -148,6 +162,13 @@ echo "--- 3. a push wakes the waiter ---"
 got=$(py woken)
 case "$got" in *wk*hallo*) ok "the waiting client got the pushed element" ;;
                *) bad "woken" "got: $got" ;; esac
+
+echo "--- 3b. a timeout of centuries waits rather than expiring at once ---"
+got=$(py far)
+case "$got" in *far*spaet*) ok "BLPOP 1e300 waited for the push" ;;
+               *) bad "far" "BLPOP 1e300 did not wait" "got: $got" ;; esac
+case "$got" in *farx*spaet*) ok "XREAD BLOCK 9999999999999 waited for the entry" ;;
+               *) bad "far" "XREAD BLOCK 9999999999999 did not wait" "got: $got" ;; esac
 
 echo "--- 4. three waiters, three pushes, longest-waiting first ---"
 # The case that catches the lost waiter: one waiter and one push passes even

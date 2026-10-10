@@ -178,11 +178,12 @@ if [ -n "$PTTL" ] && [ "$PTTL" -gt 0 ] && [ "$PTTL" -le 300000 ]; then
 else
     bad "ttl survival" "PTTL jttl = $PTTL"
 fi
-DEAD=$(redis-cli -p "$PORT" GET jdead 2>/dev/null)
-if [ -z "$DEAD" ]; then
+# EXISTS rather than GET, because an unreachable cache also answers GET with nothing.
+DEAD=$(redis-cli -p "$PORT" EXISTS jdead 2>/dev/null)
+if [ "$DEAD" = "0" ]; then
     ok "a TTL that lapsed while the runtime was dead stays lapsed"
 else
-    bad "lapsed ttl" "GET jdead = $DEAD"
+    bad "lapsed ttl" "EXISTS jdead = '$DEAD', wanted 0"
 fi
 
 # ── 4. A torn tail ──────────────────────────────────────────────────────────
@@ -293,10 +294,14 @@ if "$BIN" edit jc --shards 2 >/dev/null 2>&1; then ok "the shard count changed f
 fi
 cp "$WORK/crash.dump" "$DUMP" 2>/dev/null
 cp "$WORK/crash.journal" "$DUMP.journal" 2>/dev/null
+split_refusals() { grep -c 'was not written by this shard split' "$SOCKETLEY_DLOG" 2>/dev/null || true; }
+REFUSED0=$(split_refusals)
 "$BIN" start jc >/dev/null 2>&1
-sleep 2
+for _ in $(seq 1 40); do [ "$(split_refusals)" -gt "$REFUSED0" ] && break; sleep 0.1; done
 if redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG; then
     bad "changed split" "a 2-shard start served over a one-shard journal's records"
+elif [ "$(split_refusals)" -le "$REFUSED0" ]; then
+    bad "changed split" "the start did not come up, but the log never names the journal's split as the reason"
 else
     ok "a journal with records refuses a start under a different shard count"
 fi
