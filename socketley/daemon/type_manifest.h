@@ -56,6 +56,11 @@ int parse_registered_flag(runtime_instance* instance, const parsed_args& pa,
 // required key, and fills declared defaults in on success.
 std::string registered_create_refusal(runtime_instance* instance);
 
+// A document's "extra" that replaces a registered runtime's fields whole and leaves out a required key with no
+// default, which create refuses and an import therefore must too.
+std::string missing_required_refusal(runtime_type t,
+                                     const std::vector<std::pair<std::string, std::string>>& extra);
+
 // The same schema check for a bag arriving as a document rather than as
 // flags, so `import` refuses a misspelled key by name too.
 std::string extra_refusal(runtime_type t,

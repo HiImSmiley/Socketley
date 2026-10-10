@@ -175,6 +175,10 @@ private:
     socketley::raft::index_t m_last_proposed = 0;
     std::function<void()>    m_on_tick;
     clock::time_point        m_epoch = clock::now();
+    // What is kept of nodes no membership lists, bounded since their ids are theirs to choose.
+    static constexpr size_t max_heard = 1024;
+    // Inbound links open at once, past which an accepted socket is closed.
+    static constexpr size_t max_inbound = 256;
     // What peers said about themselves in a hello, for a member whose record this node has not seen yet.
     book m_heard_book;
 

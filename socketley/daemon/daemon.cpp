@@ -27,6 +27,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <sys/un.h>
 #include <unistd.h>
 #include <iostream>
 #include <fstream>
@@ -700,6 +701,13 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     // Set socket path for daemon_handler and ipc_client
     daemon_handler::socket_path = paths.socket_path.string();
+    // A longer path than a unix address holds would be bound cut short, under a name nobody asked for.
+    if (daemon_handler::socket_path.size() >= sizeof(sockaddr_un{}.sun_path))
+    {
+        std::cout << "the daemon's socket path is longer than the " << sizeof(sockaddr_un{}.sun_path) - 1
+                  << " bytes a unix socket address holds: " << daemon_handler::socket_path << "\n";
+        return 1;
+    }
     daemon_handler::daemons_dir = paths.daemons_dir.string();
 
     // Whether this daemon is the packaged one, decided from system_mode and
@@ -852,6 +860,11 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     if (!handler.setup())
     {
         LOG_ERROR("failed to setup ipc socket");
+        // Taken down as the later failures take it down, the Raft node and its ring first.
+        if (raft)
+            raft->stop();
+        loop.shutdown_ring();
+        log_ring::drain();
         return 1;
     }
 

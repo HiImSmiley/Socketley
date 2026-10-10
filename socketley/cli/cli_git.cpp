@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -108,7 +109,16 @@ child git_start(const std::vector<std::string>& args, bool want_stdin)
     else
         posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
     posix_spawn_file_actions_adddup2(&fa, op[1], 1);
-    const int rc = ::posix_spawnp(&c.pid, "git", &fa, nullptr, argv.data(), envp.data());
+    // git gets the default SIGPIPE back, which this process ignores so a git that left reads as an error.
+    posix_spawnattr_t at;
+    posix_spawnattr_init(&at);
+    sigset_t pipe_only;
+    sigemptyset(&pipe_only);
+    sigaddset(&pipe_only, SIGPIPE);
+    posix_spawnattr_setsigdefault(&at, &pipe_only);
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGDEF);
+    const int rc = ::posix_spawnp(&c.pid, "git", &fa, &at, argv.data(), envp.data());
+    posix_spawnattr_destroy(&at);
     posix_spawn_file_actions_destroy(&fa);
     if (want_stdin)
         ::close(ip[0]);
@@ -194,7 +204,8 @@ struct reply
 class s3_client
 {
 public:
-    s3_client(std::string host, std::string port, bool tls) : m_host(std::move(host)), m_port(std::move(port)), m_tls(tls)
+    s3_client(std::string host, std::string port, bool tls, std::string ca = {})
+        : m_host(std::move(host)), m_port(std::move(port)), m_ca(std::move(ca)), m_tls(tls)
     {
         const char* k = std::getenv("SOCKETLEY_GIT_ACCESS_KEY");
         const char* s = std::getenv("SOCKETLEY_GIT_SECRET");
@@ -248,9 +259,23 @@ private:
         }
         if (m_tls)
         {
-            // Its own listener on this machine, so there is nobody between to verify against.
+            // Its own listener, trusted by the certificate the runtime named, so a process that took the port first
+            // is not handed the session's credentials.
             if (!m_ctx)
+            {
                 m_ctx = SSL_CTX_new(TLS_client_method());
+                if (m_ctx && !m_ca.empty())
+                {
+                    if (SSL_CTX_load_verify_locations(m_ctx, m_ca.c_str(), nullptr) != 1)
+                    {
+                        m_error = "the runtime's certificate " + m_ca + " cannot be read";
+                        drop();
+                        return false;
+                    }
+                    X509_STORE_set_flags(SSL_CTX_get_cert_store(m_ctx), X509_V_FLAG_PARTIAL_CHAIN);
+                    SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
+                }
+            }
             m_ssl = m_ctx ? SSL_new(m_ctx) : nullptr;
             if (!m_ssl || SSL_set_fd(m_ssl, m_fd) != 1 || SSL_connect(m_ssl) != 1)
             {
@@ -382,7 +407,7 @@ private:
         return true;
     }
 
-    std::string m_host, m_port, m_key, m_secret, m_token, m_in;
+    std::string m_host, m_port, m_ca, m_key, m_secret, m_token, m_in;
     bool m_tls{false};
     int m_fd{-1};
     SSL_CTX* m_ctx{nullptr};
@@ -416,7 +441,7 @@ std::vector<std::string> xml_values(std::string_view xml, std::string_view tag)
 
 struct options
 {
-    std::string url, branch = "main", work, host, port, bucket, name;
+    std::string url, branch = "main", work, host, port, bucket, name, ca;
     bool tls{false};
     int keep_days{14}, keep_weeks{8}, keep_months{12};
 };
@@ -443,7 +468,7 @@ std::string json_str(std::string_view v)
 class run
 {
 public:
-    explicit run(options o) : m_o(std::move(o)), m_s3(m_o.host, m_o.port, m_o.tls) {}
+    explicit run(options o) : m_o(std::move(o)), m_s3(m_o.host, m_o.port, m_o.tls, m_o.ca) {}
 
     int go()
     {
@@ -451,7 +476,12 @@ public:
         std::error_code ec;
         std::filesystem::create_directories(m_o.work, ec);
         const int lock = ::open((m_o.work + "/lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-        if (lock < 0 || ::flock(lock, LOCK_EX | LOCK_NB) != 0)
+        if (lock < 0)
+        {
+            std::cerr << "git-sync: " << m_o.work << "/lock cannot be opened: " << std::strerror(errno) << "\n";
+            return 2;
+        }
+        if (::flock(lock, LOCK_EX | LOCK_NB) != 0)
         {
             std::cerr << "git-sync: a run of this repository is under way already\n";
             return 3;
@@ -538,10 +568,11 @@ private:
         return m_s3.request("DELETE", object_path(key), "", r) && (r.status == 204 || r.status == 200 || r.status == 404);
     }
 
-    // Every key under `prefix`.
-    std::vector<std::string> list(const std::string& prefix)
+    // Every key under `prefix`, false when a page could not be had, since a part of the list read as the whole
+    // would leave behind what the rest held.
+    bool list(const std::string& prefix, std::vector<std::string>& keys)
     {
-        std::vector<std::string> keys;
+        keys.clear();
         std::string token;
         for (int pages = 0; pages < 10000; ++pages)
         {
@@ -551,15 +582,15 @@ private:
             q += "&prefix=" + uri_encode(prefix, false);
             reply r;
             if (!m_s3.request("GET", "/" + uri_encode(m_o.bucket, false), q, r) || r.status != 200)
-                break;
+                return false;
             for (auto& k : xml_values(r.body, "Key"))
                 keys.push_back(std::move(k));
             const auto next = xml_values(r.body, "NextContinuationToken");
             if (next.empty())
-                break;
+                return true;
             token = next.front();
         }
-        return keys;
+        return false;
     }
 
     // The branch's files under <name>/: what changed since the commit written last, or the whole tree and nothing
@@ -625,7 +656,10 @@ private:
                 keep.insert(root + path);
             }
             // What is under <name>/ and not in the tree went with an earlier run of another branch or repository.
-            for (const std::string& k : list(root))
+            std::vector<std::string> there;
+            if (!list(root, there))
+                return fail("listing " + root + " in the library failed");
+            for (const std::string& k : there)
                 if (!keep.count(k))
                     gone.push_back(k);
         }
@@ -755,7 +789,10 @@ private:
     void thin()
     {
         const std::string prefix = "_backups/" + m_o.name + "/";
-        std::vector<std::string> keys = list(prefix);
+        std::vector<std::string> keys;
+        // A list in part would thin by what it lacks, so none is thinned this time.
+        if (!list(prefix, keys))
+            return;
         std::sort(keys.rbegin(), keys.rend());
         const std::time_t now = std::time(nullptr);
         std::set<std::string> days, weeks, months, keep;
@@ -833,6 +870,8 @@ private:
 
 int git_sync_main(int argc, char** argv)
 {
+    // A git that exits while it is written to is a failed write, recorded, and not the end of this process.
+    ::signal(SIGPIPE, SIG_IGN);
     options o;
     for (int i = 2; i < argc; ++i)
     {
@@ -857,6 +896,8 @@ int git_sync_main(int argc, char** argv)
             ok = value(o.name);
         else if (a == "--tls")
             o.tls = true;
+        else if (a == "--ca")
+            ok = value(o.ca);
         else if (a == "--endpoint" && (ok = value(v)))
         {
             const size_t c = v.rfind(':');
@@ -883,9 +924,15 @@ int git_sync_main(int argc, char** argv)
     if (o.work.empty() || o.host.empty() || o.bucket.empty() || !git_names::valid_url(o.url, why) ||
         !git_names::valid_branch(o.branch, why) || !git_names::valid_name(o.name, why))
     {
-        std::cout << "usage: socketley git-sync --url URL --branch NAME|* --work DIR --endpoint HOST:PORT [--tls] "
+        std::cout << "usage: socketley git-sync --url URL --branch NAME|* --work DIR --endpoint HOST:PORT [--tls [--ca FILE]] "
                      "--bucket B --name N [--keep DAYS,WEEKS,MONTHS]"
                   << (why.empty() ? "" : "\n" + why) << "\n";
+        return 1;
+    }
+    // The token goes in a header with every request, so only over https, where nobody on the way reads it.
+    if (const char* t = std::getenv("SOCKETLEY_GIT_TOKEN"); t && *t && !o.url.starts_with("https://"))
+    {
+        std::cout << "a GitHub token is sent only over https://, and " << o.url << " is not\n";
         return 1;
     }
     return run(std::move(o)).go();

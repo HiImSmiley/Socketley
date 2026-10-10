@@ -337,8 +337,11 @@ kill "${DAEMON_PIDS[1]}" 2>/dev/null || true
 wait "${DAEMON_PIDS[1]}" 2>/dev/null || true
 DAEMON_PIDS[1]=0
 
-# Wait for stale detection (10s threshold + scan cycles)
-sleep 13
+# Polled for up to 30s, which covers the 10s stale threshold and its scan cycles with room should the unpublish be missed.
+for _ in $(seq 1 60); do
+    grep -q '^LEAVE=nodeB' "$LUA_OUT" 2>/dev/null && break
+    sleep 0.5
+done
 
 OUT=$(cat "$LUA_OUT" 2>/dev/null || echo "")
 assert_contains "$OUT" "LEAVE=nodeB"

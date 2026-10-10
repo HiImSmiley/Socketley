@@ -188,6 +188,13 @@ int cli_dispatch(int argc, char** argv)
     // Resolve socket path for IPC (system vs dev mode)
     auto paths = socketley_paths::resolve();
     daemon_handler::socket_path = paths.socket_path.string();
+    // A longer path than a unix address holds would be cut, and the cut one may be another daemon's socket.
+    if (daemon_handler::socket_path.size() >= sizeof(sockaddr_un{}.sun_path))
+    {
+        std::cout << "the daemon's socket path is longer than the " << sizeof(sockaddr_un{}.sun_path) - 1
+                  << " bytes a unix socket address holds: " << daemon_handler::socket_path << "\n";
+        return 1;
+    }
 
     std::string_view cmd = argv[1];
 
@@ -823,8 +830,22 @@ static int settle_startup(int rc, std::string& data)
     return worst;
 }
 
+// A tab inside an argument cannot travel as one, since only a space has a stand-in on the line to the daemon.
+static bool refused_tab(int argc, char** argv)
+{
+    for (int i = 1; i < argc; ++i)
+        if (std::strchr(argv[i], '\t'))
+        {
+            std::cout << "an argument cannot hold a tab: \"" << argv[i] << "\"\n";
+            return true;
+        }
+    return false;
+}
+
 int cli_forward(int argc, char** argv)
 {
+    if (refused_tab(argc, argv))
+        return 1;
     const std::string_view verb = argc > 1 ? argv[1] : "";
     const bool opens_files = verb == "create" || verb == "edit" || verb == "add";
     std::string command;
@@ -1223,12 +1244,18 @@ static void interactive_sigint(int)
 
 int cli_interactive(int argc, char** argv)
 {
+    if (refused_tab(argc, argv))
+        return 1;
     // Build command: "start <name> -i"
     std::string command;
     for (int i = 1; i < argc; ++i)
     {
         if (i > 1) command += ' ';
-        command += argv[i];
+        // Each argument whole, as cli_forward sends one, or "my dir/app.lua" arrived as two words.
+        if (i > 1)
+            ipc_frame::append_arg(command, argv[i]);
+        else
+            command += argv[i];
     }
     return cli_interactive_command(command);
 }
@@ -1273,10 +1300,13 @@ int cli_interactive_command(const std::string& command)
 
     // Find NUL terminator in response
     std::string data;
+    // What came in the same read after the reply's end is the runtime's first output, kept for the screen.
+    std::string after;
     auto* nul = static_cast<char*>(std::memchr(buf + 1, '\0', n - 1));
     if (nul)
     {
         data.append(buf + 1, nul - buf - 1);
+        after.assign(nul + 1, buf + n);
     }
     else
     {
@@ -1286,7 +1316,7 @@ int cli_interactive_command(const std::string& command)
             n = read(ipc_fd, buf, sizeof(buf));
             if (n <= 0) break;
             nul = static_cast<char*>(std::memchr(buf, '\0', n));
-            if (nul) { data.append(buf, nul - buf); break; }
+            if (nul) { data.append(buf, nul - buf); after.assign(nul + 1, buf + n); break; }
             data.append(buf, n);
         }
     }
@@ -1298,6 +1328,7 @@ int cli_interactive_command(const std::string& command)
         close(ipc_fd);
         return exit_code;
     }
+    if (!after.empty() && ::write(STDOUT_FILENO, after.data(), after.size()) < 0) {}
 
     // Enter interactive mode — install SIGINT handler
     g_interactive_quit = 0;
@@ -1366,13 +1397,15 @@ int cli_interactive_command(const std::string& command)
 
 int cli_runtime_action(int argc, char** argv)
 {
+    if (refused_tab(argc, argv))
+        return 1;
     // Format: socketley <name> <action> [args...]
     // Forward as: action <name> <action> [args...]
     std::string command = "action";
     for (int i = 1; i < argc; ++i)
     {
         command += ' ';
-        command += argv[i];
+        ipc_frame::append_arg(command, argv[i]);
     }
 
     std::string data;

@@ -107,7 +107,23 @@ exec = $WORKER
 manifest_version = 1
 EOF
 
+# A key the common flags or the state file already use: --domain was taken by the common parser, and the field was
+# read back from the state file as the runtime's own domain.
+cat > "$HOME/.config/socketley/types/dom.toml" <<EOF
+name = "domtype"
+exec = "$WORKER"
+manifest_version = 1
+
+[config.domain]
+kind = "string"
+EOF
+
 daemon_start "$BIN"
+
+OUT=$("$BIN" create domtype d1 -p $((PORT+9)) 2>&1)
+if [ $? -ne 0 ] && grep -q '"domain" is reserved' "$SOCKETLEY_DLOG"; then ok; else
+    bad "a manifest naming a key the common flags use is refused" "create said: $OUT; log: $(grep -i domtype "$SOCKETLEY_DLOG" | head -2)"
+fi
 
 # ── The schema is the flag set ──────────────────────────────────────────────
 OUT=$("$BIN" create greeter typo -p $((PORT+1)) --greting hello 2>&1)

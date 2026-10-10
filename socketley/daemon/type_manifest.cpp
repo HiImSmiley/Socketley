@@ -89,6 +89,8 @@ constexpr std::string_view reserved_keys[] = {
     "write", "http", "cache", "retry", "client_ca", "client_cert",
     "client_key", "sidecar", "persistent", "maxmemory", "resp", "replicate",
     "config", "bash", "start", "daemon_process",
+    "domain", "bind", "acme", "acme-email", "acme_email", "acme_domains", "upstream", "master-pw", "send-to",
+    "http-cache", "tls_offloaded", "mesh_wired", "companion_path",
 };
 
 bool is_reserved(std::string_view key)
@@ -546,6 +548,19 @@ std::string registered_create_refusal(runtime_instance* instance)
         if (sk.has_default)
             inst->set_field(sk.name, sk.default_value);
     }
+    return {};
+}
+
+std::string missing_required_refusal(runtime_type t,
+                                     const std::vector<std::pair<std::string, std::string>>& extra)
+{
+    const manifest* m = find(t);
+    if (!m)
+        return {};
+    for (const auto& sk : m->schema)
+        if (sk.required && !sk.has_default &&
+            std::none_of(extra.begin(), extra.end(), [&](const auto& kv) { return kv.first == sk.name; }))
+            return "\"extra\" leaves out " + sk.name + ", which a " + m->type_name + " requires\n";
     return {};
 }
 

@@ -248,6 +248,10 @@ std::string emit_key(const config_key& key, const sol::table& entry, std::string
                     return name + ": an entry is empty\n";
                 if (std::string why = refuse_whitespace(key.name, value); !why.empty())
                     return why;
+                // An entry holding the separator would arrive as two.
+                if (value.find(sep) != std::string::npos)
+                    return name + ": an entry cannot hold '" + std::string(1, sep) + "', which separates the list (\"" +
+                           value + "\")\n";
 
                 if (!joined.empty())
                     joined += sep;
@@ -452,7 +456,8 @@ std::string build_create_command(const std::string& type_str, const std::string&
     if (std::string why = refuse_unknown_keys(entry, man); !why.empty())
         return why;
 
-    command = "create " + type_str + " " + name;
+    command = "create " + type_str + " ";
+    ipc_frame::append_arg(command, name);
 
     for (const config_key& key : config_keys)
         if (std::string why = emit_key(key, entry, command); !why.empty())
@@ -547,7 +552,9 @@ int cli_config(int argc, char** argv)
         if (name && !name->empty())
         {
             std::string response;
-            int rc = ipc_send("daemon-name " + *name, response);
+            std::string line = "daemon-name ";
+            ipc_frame::append_arg(line, *name);
+            int rc = ipc_send(line, response);
             if (rc < 0) { return ipc_report_failure(rc); }
             if (rc != 0) { if (!response.empty()) std::cerr << response; return rc; }
         }
@@ -556,16 +563,25 @@ int cli_config(int argc, char** argv)
         if (cluster && !cluster->empty())
         {
             std::string response;
-            int rc = ipc_send("daemon-cluster " + *cluster, response);
+            std::string line = "daemon-cluster ";
+            ipc_frame::append_arg(line, *cluster);
+            int rc = ipc_send(line, response);
             if (rc < 0) { return ipc_report_failure(rc); }
             if (rc != 0) { if (!response.empty()) std::cerr << response; return rc; }
         }
     }
 
-    sol::table runtimes = lua["runtimes"];
-
-    if (!runtimes.valid())
+    // Its type asked first: a reference that is valid() may still be a number or a string, which Release reads as a
+    // table without a word.
+    const sol::object runtimes_obj = lua["runtimes"];
+    if (!runtimes_obj.valid() || runtimes_obj.get_type() == sol::type::lua_nil)
         return 0;
+    if (runtimes_obj.get_type() != sol::type::table)
+    {
+        std::cerr << "`runtimes` is a list of tables, one per runtime\n";
+        return 1;
+    }
+    sol::table runtimes = runtimes_obj.as<sol::table>();
 
     // The daemon's exit code and sentence are read rather than only whether
     // the socket answered, because a config file whose every runtime failed
@@ -575,6 +591,12 @@ int cli_config(int argc, char** argv)
 
     for (auto& pair : runtimes)
     {
+        if (pair.second.get_type() != sol::type::table)
+        {
+            std::cerr << "every entry in `runtimes` is a table with a name and a type\n";
+            ++failed;
+            continue;
+        }
         sol::table t = pair.second;
 
         // sol::optional like every other field below, because a plain

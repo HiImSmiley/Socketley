@@ -229,6 +229,30 @@ TEST_CASE("recovery truncates a torn segment on disk and keeps every whole recor
     CHECK((sb.st_mode & 0777) == 0600);
 }
 
+TEST_CASE("a damaged record with whole ones after it is refused, not cut away with what was synced")
+{
+    tmpdir d;
+    std::string err;
+    REQUIRE(st::initialize(d.path, fresh({1}), err));
+    st::recovery rec;
+    REQUIRE(st::recover(d.path, rec, err));
+
+    std::string tail;
+    st::append_hard(tail, raft::hard_state{7, 2});
+    const size_t hard_end = tail.size();
+    st::append_entry(tail, make_entry(1, 7));
+    st::append_entry(tail, make_entry(2, 7));
+    // A bit flipped inside the hard state, the vote of term 7 the node must not forget.
+    tail[hard_end / 2] ^= 0x10;
+    const std::string whole = slurp(rec.segment) + tail;
+    spill(rec.segment, whole);
+
+    st::recovery again;
+    CHECK_FALSE(st::recover(d.path, again, err));
+    CHECK(err.find("damaged") != std::string::npos);
+    CHECK(slurp(rec.segment) == whole);
+}
+
 TEST_CASE("an unfinished rotation is discarded and the segment before it decides")
 {
     tmpdir d;

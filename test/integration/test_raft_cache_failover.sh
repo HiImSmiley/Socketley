@@ -277,11 +277,14 @@ check 'wait_for 40 "settled_on $P \$(cstat $P cluster_epoch) 1 2 3"' "the restar
 check '[ "$(cmd "$(target "${others[0]}")" "get before-quorum-loss")" = kept ]' "a follower does not hold what the fenced primary kept"
 
 # ─── remove ─────────────────────────────────────────────────────────────────
+check 'saw "\[cluster\]" as 1 ls' "node 1 does not list its replicas as the cluster's before the remove"
 out=$(as 1 cluster remove px 2>&1) && rc=0 || rc=$?
 check '[ "$rc" = 0 ] && [ -z "$out" ]' "cluster remove px: exit $rc, output: $out"
 out=$(as 1 cluster remove c 2>&1) && rc=0 || rc=$?
 check '[ "$rc" = 0 ] && [ -z "$out" ]' "cluster remove c: exit $rc, output: $out"
-check 'wait_for 20 "[ -z \"\$(leading 1 2 3)\" ] && ! saw \"\\[cluster\\]\" as 1 ls"' "a replica is still listed or leading after cluster remove"
+# Node 1 answers ls and lists no cluster replica, since a failed ls lists none either.
+unlisted() { local o; o=$(as 1 ls 2>&1) || return 1; ! grep -q '\[cluster\]' <<<"$o"; }
+check 'wait_for 20 "[ -z \"\$(leading 1 2 3)\" ] && unlisted"' "a replica is still listed or leading after cluster remove"
 
 echo "  promotion times (ms, kill -9 to a survivor taking a write): ${FAILOVERS[*]}; to a write through a proxy: ${PROXY_MS[*]}"
 echo "  writes acknowledged and missing after the promotion: ${LOST[*]}"

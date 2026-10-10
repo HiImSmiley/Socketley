@@ -98,7 +98,9 @@ round() {   # round <condition> <round number>
         local f pid
         for f in "${followers[@]}"; do
             pid=$(cstat "$f" pid)
-            [ -n "$pid" ] && { kill -STOP "$pid"; STALLED+=("$pid"); }
+            # A follower with no pid is not stopped, and a round that stalls nothing proves nothing about a stall.
+            if [ -n "$pid" ] && kill -STOP "$pid" 2>/dev/null; then STALLED+=("$pid")
+            else bad "$cond $i: follower $f could not be stopped (pid '${pid:-<none>}'), so this round ran unstalled"; fi
         done
         sleep 4
     fi

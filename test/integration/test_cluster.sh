@@ -200,6 +200,25 @@ assert_contains "$OUT" "node2"
 assert_contains "$OUT" "$NODE1_PORT"
 assert_contains "$OUT" "$NODE2_PORT"
 
+# A group name is the operator's text: a brace in one cut the published list short there, and a backslash came back
+# doubled, so neither group, nor any runtime published after it, was seen from another daemon.
+echo "  Test 3b: group names with JSON's own characters"
+create_ok "a runtime in a group with a brace and a backslash created" node2 create server clst_odd -p "$((SL_PORT_BASE+304))" -g 'odd}x\y' -s
+create_ok "and one after it" node2 create server clst_zz -p "$((SL_PORT_BASE+305))" -g after -s
+OUT=""
+for _ in $(seq 1 30); do
+    OUT=$(node1 cluster group 'odd}x\y' 2>&1; node1 cluster group after 2>&1) || true
+    printf '%s' "$OUT" | grep -q "$((SL_PORT_BASE+304))" && printf '%s' "$OUT" | grep -q "$((SL_PORT_BASE+305))" && break
+    sleep 0.5
+done
+assert_contains "$OUT" "$((SL_PORT_BASE+304))"
+assert_contains "$OUT" "$((SL_PORT_BASE+305))"
+node2 remove clst_odd >/dev/null 2>&1; node2 remove clst_zz >/dev/null 2>&1
+for _ in $(seq 1 30); do
+    node1 cluster ps 2>/dev/null | grep -q clst_ || break
+    sleep 0.5
+done
+
 # ─── Test 4: Cluster stats ────────────────────────────────────────────────────
 
 echo "  Test 4: cluster stats"
@@ -277,6 +296,8 @@ echo "  Test 6: stale detection"
 node2 stop "$RT_API2" 2>/dev/null || true
 sleep 0.5
 node2 remove "$RT_API2" 2>/dev/null || true
+N2_FILE="$CLUSTER_DIR/node2.json"
+cp "$N2_FILE" "$TMPD/node2.json.last" 2>/dev/null || true
 kill "${DAEMON_PIDS[1]}" 2>/dev/null || true
 wait "${DAEMON_PIDS[1]}" 2>/dev/null || true
 DAEMON_PIDS[1]=0
@@ -284,23 +305,26 @@ DAEMON_PIDS[1]=0
 # Stale threshold is 10s; wait for it to expire
 sleep 12
 
+# A daemon that left on SIGTERM took its file along, so its last heartbeat is put back to be judged.
+N2_PLANTED=0
+if [ ! -f "$N2_FILE" ] && [ -s "$TMPD/node2.json.last" ]; then
+    cp "$TMPD/node2.json.last" "$N2_FILE"; N2_PLANTED=1
+fi
+
 # node1's daemon, deliberately, not node2's: node2's was killed on purpose a few
 # lines up, and this is the one that has to still be answering for the staleness
 # question to mean anything.
 OUT=$(node1 cluster ls 2>&1)      || daemon_required "cluster ls" "$SOCK_NODE1"
-# node2 should be stale or its heartbeat should be old
+[ "$N2_PLANTED" = 1 ] && rm -f "$N2_FILE"
+# A heartbeat 12 s old is past the 10 s threshold, so node2 has to be listed as stale.
 TOTAL=$((TOTAL+1))
 if grep -q "stale" < <(grep "node2" <<<"$OUT"); then
     PASS=$((PASS+1))
 else
-    # If node2 unpublished on shutdown, it might be gone entirely
-    if ! grep -q "node2" <<<"$OUT"; then
-        PASS=$((PASS+1))
-    else
-        FAIL=$((FAIL+1))
-        echo "  FAIL: node2 not stale/gone after 12s"
-        echo "  GOT: $OUT"
-    fi
+    FAIL=$((FAIL+1))
+    echo "  FAIL: node2 not listed as stale 12s after its last heartbeat"
+    echo "        ($([ "$N2_PLANTED" = 1 ] && echo "its file was put back after it left" || echo "its file was still there"))"
+    echo "  GOT: $OUT"
 fi
 
 # node1 should still be healthy

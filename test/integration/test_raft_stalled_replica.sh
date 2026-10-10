@@ -81,6 +81,8 @@ count_serving() {
 }
 # Whether the output of a command matches a pattern, read whole first because grep -q ends early and pipefail then blames the writer.
 saw() { local pat=$1 o; shift; o=$("$@" 2>&1) || true; grep -qE -- "$pat" <<<"$o"; }
+# Whether a command succeeded and its output lacks a pattern, so a CLI that failed is not read as an empty listing.
+unseen() { local pat=$1 o; shift; o=$("$@" 2>&1) || return 1; ! grep -qE -- "$pat" <<<"$o"; }
 terms() { local n s=""; for n in a b c; do s="$s $(field "$n" term)"; done; echo "${s# }"; }
 
 raft_port() { case $1 in a) echo $PB;; b) echo $((PB+1));; c) echo $((PB+2));; esac; }
@@ -121,7 +123,7 @@ check 'saw "hang.*\[cluster\]" as b ls' "the hung replica is not listed on b"
 
 out=$(as b cluster remove hang 2>&1) && rc=0 || rc=$?
 check '[ "$rc" = 0 ] && [ -z "$out" ]' "cluster remove hang: exit $rc, output: $out"
-check 'wait_for 20 "! saw hang as a ls && ! saw hang as b ls && ! saw hang as c ls"' "the hung replica was not removed after cluster remove"
+check 'wait_for 20 "unseen hang as a ls && unseen hang as b ls && unseen hang as c ls"' "the hung replica was not removed after cluster remove"
 check '[ "$(count_serving okay a b c)" = 3 ]' "the healthy runtime stopped serving after the hung one was removed"
 
 echo ""

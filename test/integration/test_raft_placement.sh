@@ -68,6 +68,12 @@ echo "=== Integration: cluster runtimes placed and healed through Raft ==="
 ok()   { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad()  { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL: $*"; }
 check() { if eval "$1"; then ok; else bad "$2"; fi; }
+# Whether a command succeeded and its output lacks a pattern, so a CLI that failed is not read as an empty listing.
+unseen() {
+    local pat=$1 o; shift
+    o=$("$@" 2>&1) || return 1
+    ! grep -qE -- "$pat" <<<"$o"
+}
 
 cleanup() {
     set +e
@@ -189,7 +195,7 @@ h1=${H%% *}
 check 'saw "api.*\[cluster\]" as "$h1" ls' "ls does not mark the replica as a cluster runtime"
 check 'saw "\"name\":\"api\".*\"cluster\":true" as "$h1" ls --json' "ls --json does not say the replica is a cluster runtime"
 check 'saw "^cluster:replica" as "$h1" stats api' "stats does not say the replica is a cluster runtime"
-check '! saw "^[^ ]* *api" as "$spare" ls' "the node holding no replica lists api"
+check 'unseen "^[^ ]* *api" as "$spare" ls' "the node holding no replica lists api"
 check 'saw "^api +server +2 +2 " as "$h1" cluster placement' "placement does not report two replicas placed"
 check 'saw "replicas on this node" as "$h1" cluster placement && saw "^  api +running" as "$h1" cluster placement' "placement does not say this node's replica is running"
 
@@ -213,7 +219,7 @@ out=$(as a cluster create server dup --listen "unix:$T/dup-{node}.sock" --http "
 check '[ "$rc" = 0 ]' "cluster create dup from a: exit $rc: $out"
 check 'wait_for 20 "saw \"^  dup +blocked\" as b cluster placement"' "b does not report that its local dup blocks the replica"
 check 'wait_for 20 "[ \$(count_of \"\$(holders dup a c)\") = 2 ]"' "dup did not run on the two nodes without a local dup: [$(holders dup a c)]"
-check '[[ "$(probe dup b)" == "HTTP/1.1 200"* ]] && ! saw "dup.*\[cluster\]" as b ls' "b's own dup was replaced or marked as a cluster runtime"
+check '[[ "$(probe dup b)" == "HTTP/1.1 200"* ]] && unseen "dup.*\[cluster\]" as b ls' "b's own dup was replaced or marked as a cluster runtime"
 out=$(as a cluster remove dup 2>&1) && rc=0 || rc=$?
 check '[ "$rc" = 0 ] && [ -z "$out" ]' "cluster remove dup: exit $rc, output: $out"
 check 'wait_for 20 "[ -z \"\$(holders dup a c)\" ]"' "dup still serves after the cluster runtime was removed"
@@ -366,7 +372,7 @@ check 'wait_for 30 "[ \$(count_of \"\$(holders api a b c)\") = 2 ]"' "api did no
 out=$(as c cluster remove api 2>&1) && rc=0 || rc=$?
 check '[ "$rc" = 0 ] && [ -z "$out" ]' "cluster remove api: exit $rc, output: $out"
 check 'wait_for 20 "[ -z \"\$(holders api a b c)\" ]"' "api still serves after cluster remove"
-check '! saw "\[cluster\]" as a ls && ! saw "\[cluster\]" as b ls && ! saw "\[cluster\]" as c ls' "a replica is still listed after cluster remove"
+check 'unseen "\[cluster\]" as a ls && unseen "\[cluster\]" as b ls && unseen "\[cluster\]" as c ls' "a replica is still listed after cluster remove"
 check 'saw "no cluster runtimes declared" as a cluster placement' "placement still lists a runtime after cluster remove"
 
 # ─── how long the failovers took ────────────────────────────────────────────

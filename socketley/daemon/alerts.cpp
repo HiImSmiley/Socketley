@@ -1,6 +1,7 @@
 #include "alerts.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -10,6 +11,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <set>
+#include <utility>
 #include <sstream>
 
 #include "dashboard.h"
@@ -199,11 +201,14 @@ void monitor::check(int64_t now, const std::vector<facts>& runtimes, const std::
     for (const facts& r : runtimes)
         if (!r.dir.empty())
             dirs.push_back(r.dir);
-    std::set<unsigned long> disks;
+    // Told apart by the device the directory is on, since filesystems that give no fsid all give 0.
+    std::set<dev_t> disks;
     for (const std::string& d : dirs)
     {
         struct statvfs v{};
-        if (::statvfs(d.c_str(), &v) != 0 || v.f_blocks == 0 || !disks.insert(v.f_fsid).second)
+        struct stat st{};
+        if (::statvfs(d.c_str(), &v) != 0 || v.f_blocks == 0 || ::stat(d.c_str(), &st) != 0 ||
+            !disks.insert(st.st_dev).second)
             continue;
         const double total = static_cast<double>(v.f_blocks) * v.f_frsize, free = static_cast<double>(v.f_bavail) * v.f_frsize;
         if (free / total < 0.10)
@@ -357,16 +362,30 @@ void monitor::post(const alert& a, bool raised, int64_t now)
     else if (!a.detail.empty())
         text.append("\n").append(a.detail);
     if (text.size() > 1800)
-        text.resize(1800);
+    {
+        // Cut on a character's first byte, so the body stays UTF-8 a strict hook takes.
+        size_t at = 1800;
+        while (at > 0 && (static_cast<unsigned char>(text[at]) & 0xC0) == 0x80)
+            --at;
+        text.resize(at);
+    }
     std::string body = "{\"content\":";
     body.append(quote(text)).append(",\"text\":").append(quote(text)).append(",\"state\":");
     body.append(quote(raised ? "firing" : "resolved")).append(",\"host\":").append(quote(m_host));
     body.append(",\"alert\":").append(alert_json(a)).append("}");
+    bool first_drop = false;
     {
         std::lock_guard lock(m_mtx);
-        if (m_queue.size() < 50)
-            m_queue.push_back(std::move(body));
+        // The oldest goes for the newest, since what a hook that comes back needs is how things stand now.
+        if (m_queue.size() >= 50)
+        {
+            m_queue.pop_front();
+            first_drop = m_dropped++ == 0;
+        }
+        m_queue.push_back(std::move(body));
     }
+    if (first_drop)
+        LOG_WARN("alert webhook: the hook is not keeping up, and the oldest messages for it are dropped");
     m_cv.notify_one();
 }
 
@@ -390,6 +409,17 @@ void monitor::sender()
             LOG_WARN(("alert webhook: " + err).c_str());
         else if (r.status < 200 || r.status >= 300)
             LOG_WARN(("alert webhook: answered " + std::to_string(r.status)).c_str());
+        else
+        {
+            uint64_t dropped = 0;
+            {
+                std::lock_guard lock(m_mtx);
+                dropped = std::exchange(m_dropped, 0);
+            }
+            if (dropped)
+                LOG_WARN(("alert webhook: answering again; " + std::to_string(dropped) +
+                          " message(s) were dropped while it was behind").c_str());
+        }
     }
 }
 

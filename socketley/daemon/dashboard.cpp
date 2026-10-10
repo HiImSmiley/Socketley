@@ -1,4 +1,5 @@
 #include "dashboard.h"
+#include "../shared/ipc_framing.h"
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -339,6 +340,12 @@ void server::session(int fd, const request& r)
         send(fd, 405, "text/plain; charset=utf-8", "Signed in with POST, asked with GET, out with DELETE.\n");
         return;
     }
+    // Without its key a sealed cookie could never be read back, so no sign-in is answered as though it took.
+    if (m_key.size() != 32)
+    {
+        send(fd, 503, "text/plain; charset=utf-8", "The dashboard has no session key; no random bytes were to be had.\n");
+        return;
+    }
     if (!configured())
     {
         send(fd, 403, "text/plain; charset=utf-8",
@@ -434,22 +441,32 @@ void server::logs(int fd, const request& r)
 namespace
 {
 
+// At most a megabyte, since the page asks every half minute and a file it reads may have grown without end.
 std::string read_text(const std::string& path)
 {
     std::ifstream f(path, std::ios::binary);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return f ? ss.str() : std::string{};
+    std::string out(1 << 20, '\0');
+    f.read(out.data(), static_cast<std::streamsize>(out.size()));
+    out.resize(static_cast<size_t>(f.gcount()));
+    return out;
 }
 
+// From the file's last 8 KiB, so a log that only grows is not read whole for its last line.
 std::string last_line_of(const std::string& path)
 {
-    std::ifstream f(path);
-    std::string line, last;
-    while (std::getline(f, line))
-        if (!line.empty())
-            last = line;
-    return last;
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f)
+        return {};
+    const std::streamoff size = f.tellg();
+    const std::streamoff from = size > 8192 ? size - 8192 : 0;
+    f.seekg(from);
+    std::string tail(static_cast<size_t>(size - from), '\0');
+    f.read(tail.data(), static_cast<std::streamsize>(tail.size()));
+    tail.resize(static_cast<size_t>(f.gcount()));
+    while (!tail.empty() && (tail.back() == '\n' || tail.back() == '\r'))
+        tail.pop_back();
+    const size_t nl = tail.rfind('\n');
+    return nl == std::string::npos ? tail : tail.substr(nl + 1);
 }
 
 // What a certificate file says of itself, as JSON members after `{`; empty when it is no certificate.
@@ -685,6 +702,13 @@ void server::zone(int fd, const request& r)
     }
     if (r.method == "GET")
     {
+        // Whole or not at all, since the editor saves back what it was given.
+        struct stat st{};
+        if (::stat(path.c_str(), &st) == 0 && st.st_size >= (1 << 20))
+        {
+            send(fd, 413, "text/plain; charset=utf-8", path + " is larger than the editor takes; edit it on the machine.\n");
+            return;
+        }
         send(fd, 200, "text/plain; charset=utf-8", read_text(path));
         return;
     }
@@ -763,20 +787,41 @@ void server::run(int fd, const request& r)
             send(fd, 403, "text/plain; charset=utf-8", "The dashboard does not send " + a.s + ".\n");
             return;
         }
-        // Words are split at spaces, but for an import's document, which is the rest of the line.
+        // A space travels inside its word as the CLI sends one; a tab has no stand-in, and an import's document is
+        // the rest of the line as it is.
         const bool document = args->items[0].s == "import" && i == 2;
-        if (!document && a.s.find_first_of(" \t") != std::string::npos)
+        if (!document && a.s.find('\t') != std::string::npos)
         {
-            send(fd, 400, "text/plain; charset=utf-8", "\"" + a.s + "\" holds a space, which no word may.\n");
+            send(fd, 400, "text/plain; charset=utf-8", "\"" + a.s + "\" holds a tab, which no word may.\n");
             return;
         }
-        command += (i ? " " : "") + a.s;
+        command += i ? " " : "";
+        if (i && !document)
+            ipc_frame::append_arg(command, a.s);
+        else
+            command += a.s;
     }
     std::string out;
     const int rc = ipc_send(command, out);
     if (args->items[0].s != "show" && args->items[0].s != "stats" && args->items[0].s != "ls" &&
         args->items[0].s != "ps")
-        LOG_INFO(("dashboard: " + who + " ran " + command.substr(0, 200) + " (" + std::to_string(rc) + ")").c_str());
+    {
+        // What was run, without what it was run with where that is a secret: the value after a flag that holds
+        // one, and an import's whole document, which may hold any of them.
+        std::string said;
+        bool hide_next = false;
+        for (size_t i = 0; i < args->items.size(); ++i)
+        {
+            const std::string& w = args->items[i].s;
+            said += i ? " " : "";
+            if (args->items[0].s == "import" && i == 2)
+                said += "<document>";
+            else
+                said += hide_next ? std::string("***") : w;
+            hide_next = w == "--master-pw" || w == "--secret-key" || w == "--password";
+        }
+        LOG_INFO(("dashboard: " + who + " ran " + said.substr(0, 200) + " (" + std::to_string(rc) + ")").c_str());
+    }
     if (rc == ipc_unreachable || rc == ipc_no_answer)
     {
         send(fd, 502, "text/plain; charset=utf-8",

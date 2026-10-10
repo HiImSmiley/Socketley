@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Integration test: the dashboard command and the metrics API it names
+# Integration test: the dashboard command, and ps and stats for a runtime
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -45,8 +45,8 @@ daemon_start "$BIN"
 # Test: dashboard command without metrics (should give info message)
 OUT=$("$BIN" dashboard 2>&1) || true
 TOTAL=$((TOTAL+1))
-# Either shows a URL or says not configured — both are valid
-if grep -qE "Dashboard:|not configured|not enabled|metrics" <<<"$OUT"; then
+# Either shows a URL or says not configured — both are valid, and a port it could not bind is neither
+if grep -qE "^Dashboard: http://127\.0\.0\.1:[0-9]+/$|^metrics endpoint not configured$" <<<"$OUT"; then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))

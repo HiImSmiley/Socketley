@@ -141,6 +141,38 @@ else fail "control: the cascade reached the child" \
 "$BIN" remove parent >/dev/null 2>&1 || true
 "$BIN" remove child  >/dev/null 2>&1 || true
 
+# ─── A grandchild's policy holds however the stop arrives ────────────────────
+# r's script makes c (gone with r as a stop), c's makes g (removed with its parent): stopping r reached g through a
+# walk that never read g's policy, so g was stopped and kept, where stopping c itself removed it.
+D="$SOCKETLEY_TMPD"
+cat > "$D/r.lua" <<LUA
+function on_start() socketley.create("server", "gc_c", { port = $((P + 41)), lua = "$D/c.lua", start = true }) end
+LUA
+cat > "$D/c.lua" <<LUA
+function on_start() socketley.create("server", "gc_g", { port = $((P + 42)), on_parent_stop = "remove", start = true }) end
+LUA
+"$BIN" create server gc_r -p $((P + 40)) --lua "$D/r.lua" -s >/dev/null 2>&1 || true
+for _ in $(seq 1 40); do [ -n "$(state_of gc_g)" ] && break; sleep 0.25; done
+if [ -n "$(state_of gc_g)" ]; then pass
+else fail "the three-level chain is built" "gc_c='$(state_of gc_c)' gc_g='$(state_of gc_g)'"; fi
+timeout 15 "$BIN" stop gc_r >/dev/null 2>&1 || true
+sleep 0.5
+if [ -z "$(state_of gc_g)" ] && [ "$(state_of gc_c)" = "Stopped" ]; then pass
+else fail "a grandchild that goes with its parent goes when the stop came from above" \
+          "gc_c='$(state_of gc_c)' gc_g='$(state_of gc_g)', want Stopped and gone"; fi
+"$BIN" remove gc_r >/dev/null 2>&1 || true; "$BIN" remove gc_c >/dev/null 2>&1 || true
+
+# ─── A renamed parent keeps its children ────────────────────────────────────
+"$BIN" attach server rn_p $((P + 50)) >/dev/null 2>&1 || true
+"$BIN" attach server rn_k $((P + 51)) --owner rn_p >/dev/null 2>&1 || true
+"$BIN" stop rn_p >/dev/null 2>&1 || true
+"$BIN" start rn_k >/dev/null 2>&1 || true
+"$BIN" import rn_p '{"name":"rn_q"}' >/dev/null 2>&1 || true
+if [ "$("$BIN" owner rn_k 2>/dev/null | awk -F: '$1=="owner"{print $2}')" = "rn_q" ]; then pass
+else fail "a child names its parent's new name after an import renamed it" \
+          "rn_k's owner is '$("$BIN" owner rn_k 2>/dev/null | awk -F: '$1=="owner"{print $2}')'"; fi
+"$BIN" remove rn_q >/dev/null 2>&1 || true; "$BIN" remove rn_k >/dev/null 2>&1 || true
+
 # ─── Cycle 1a: a runtime that owns itself, stopped ──────────────────────────
 daemon_recover
 "$BIN" attach server selfown $((P + 10)) --owner selfown >/dev/null 2>&1 || true

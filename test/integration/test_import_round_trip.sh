@@ -120,6 +120,7 @@ assert_same "cache unchanged after round trip" "$WORK/cache.json" "$WORK/cache-a
 
 sed 's/"eviction": "allkeys-lru"/"eviction": "allkeys-random"/' "$WORK/cache.json" \
     > "$WORK/cache-edited.json"
+if ! diff -q "$WORK/cache.json" "$WORK/cache-edited.json" >/dev/null; then ok; else bad "eviction edit produced no change to import"; fi
 RC=0; "$BIN" import rt_cache "$(cat "$WORK/cache-edited.json")" >/dev/null 2>&1 || RC=$?
 assert_rc "cache import (eviction changed)" 0 "$RC"
 "$BIN" show rt_cache > "$WORK/cache-after-edit.json"
@@ -170,6 +171,9 @@ else bad "a clean numeric value no longer imports (max_connections is not 42)"; 
     --max-conn 77 --idle-timeout 45 --log /tmp/rt_partial.log \
     --tls --cert /tmp/rt.pem --key /tmp/rt.key >/dev/null 2>&1
 "$BIN" show rt_partial > "$WORK/partial-before.json"
+# Without TLS on before the import, both checks below would hold for a runtime that never had it.
+if grep -q '"tls": true' "$WORK/partial-before.json"; then ok
+else bad "the partial-import runtime starts with TLS on"; fi
 "$BIN" import rt_partial '{"name":"rt_partial"}' >/dev/null 2>&1 || true
 "$BIN" show rt_partial > "$WORK/partial-after.json"
 assert_same "a document naming only the name changes nothing else" \
@@ -281,6 +285,14 @@ assert_rc "naming the port it already has is accepted" 0 "$RC"
 
 "$BIN" stop rt_run >/dev/null 2>&1 || true
 "$BIN" remove rt_run >/dev/null 2>&1 || true
+
+# A document refused for a field after its new name changes nothing, the name included.
+"$BIN" create server rn_a -p $((SL_PORT_BASE+827)) >/dev/null 2>&1 || true
+RC=0; OUT=$("$BIN" import rn_a '{"name":"rn_b","log_file":"relative.log"}' 2>&1) || RC=$?
+assert_rc "a document with a relative log file is refused" 1 "$RC"
+if "$BIN" ls --name 2>/dev/null | grep -qx rn_a && ! "$BIN" ls --name 2>/dev/null | grep -qx rn_b; then ok
+else bad "a refused import leaves the name it had (ls: $("$BIN" ls --name 2>/dev/null | tr '\n' ' '))"; fi
+"$BIN" remove rn_a >/dev/null 2>&1 || true; "$BIN" remove rn_b >/dev/null 2>&1 || true
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

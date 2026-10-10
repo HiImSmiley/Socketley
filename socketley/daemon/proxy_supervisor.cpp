@@ -774,7 +774,8 @@ bool proxy_supervisor::write_frame(const std::string& framed)
 
     m_out += framed;
     flush_control();
-    return true;
+    // A flush that found the child gone closed the socket, and the frame went with it.
+    return m_control_fd >= 0;
 }
 
 bool proxy_supervisor::send_deliver(std::string_view message)

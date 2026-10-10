@@ -142,13 +142,19 @@ EVP_PKEY* load_or_make_key(const std::string& path, std::string& err)
     EVP_PKEY* k = EVP_EC_gen("P-256");
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    // Written beside and linked into place whole, so a failure leaves no empty or cut key that would never load.
+    const std::string tmp = path + ".new." + std::to_string(::getpid());
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     FILE* f = fd >= 0 ? fdopen(fd, "w") : nullptr;
-    const bool ok = k && f && PEM_write_PrivateKey(f, k, nullptr, nullptr, 0, nullptr, nullptr) == 1;
+    bool ok = k && f && PEM_write_PrivateKey(f, k, nullptr, nullptr, 0, nullptr, nullptr) == 1 && fflush(f) == 0 &&
+              ::fsync(fd) == 0;
     if (f)
-        fclose(f);
+        ok = fclose(f) == 0 && ok;
     else if (fd >= 0)
         ::close(fd);
+    ok = ok && ::link(tmp.c_str(), path.c_str()) == 0;
+    if (fd >= 0)
+        ::unlink(tmp.c_str());
     if (!ok)
     {
         err = "the account key " + path + " could not be written";
@@ -546,18 +552,32 @@ bool cert_covers(const std::string& path, const std::vector<std::string>& names)
     return ok;
 }
 
-bool write_atomic(const std::string& path, const std::string& data, mode_t mode)
+// `data` whole in a file beside `path`, whose name it answers, empty when the disk would not take it.
+std::string stage(const std::string& path, const std::string& data, mode_t mode)
 {
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
     const std::string tmp = path + ".tmp." + std::to_string(::getpid());
     const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
     if (fd < 0)
-        return false;
+        return {};
     bool ok = ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size());
     ok = ::fsync(fd) == 0 && ok;
     ok = ::close(fd) == 0 && ok;
-    if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0)
+    if (!ok)
+    {
+        ::unlink(tmp.c_str());
+        return {};
+    }
+    return tmp;
+}
+
+bool write_atomic(const std::string& path, const std::string& data, mode_t mode)
+{
+    const std::string tmp = stage(path, data, mode);
+    if (tmp.empty())
+        return false;
+    if (::rename(tmp.c_str(), path.c_str()) != 0)
     {
         ::unlink(tmp.c_str());
         return false;
@@ -982,8 +1002,19 @@ int issue(int argc, char** argv)
         EVP_PKEY_free(cert_key);
         return done(2);
     }
-    // The key before the chain, so a runtime that sees the new certificate finds its key already there.
-    const bool ok = write_atomic(key, pem_of_key(cert_key), 0600) && write_atomic(cert, chain.body, 0644);
+    // Both written out before either is put in place, so a disk that takes one and not the other leaves the old pair;
+    // then the key before the chain, so a runtime that sees the new certificate finds its key already there.
+    const std::string key_tmp = stage(key, pem_of_key(cert_key), 0600);
+    const std::string cert_tmp = key_tmp.empty() ? std::string() : stage(cert, chain.body, 0644);
+    const bool ok = !cert_tmp.empty() && ::rename(key_tmp.c_str(), key.c_str()) == 0 &&
+                    ::rename(cert_tmp.c_str(), cert.c_str()) == 0;
+    if (!ok)
+    {
+        if (!key_tmp.empty())
+            ::unlink(key_tmp.c_str());
+        if (!cert_tmp.empty())
+            ::unlink(cert_tmp.c_str());
+    }
     EVP_PKEY_free(cert_key);
     if (!ok)
     {

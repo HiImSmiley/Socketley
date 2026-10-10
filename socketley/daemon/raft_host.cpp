@@ -609,6 +609,9 @@ void raft_host::on_cqe(struct io_uring_cqe* cqe)
         on_tick();
     else if (req == &m_pump_req)
         pump();
+    // A tick the ring once refused is asked for again by the next completion that comes, as the warning says.
+    if (!m_tick_armed)
+        arm_tick();
 }
 
 void raft_host::on_accept(int res)
@@ -620,7 +623,12 @@ void raft_host::on_accept(int res)
             ::close(res);
         return;
     }
-    if (res >= 0)
+    if (res >= 0 && m_in.size() >= max_inbound)
+    {
+        // Peers are a handful of nodes, so this many open at once is somebody else holding the port.
+        ::close(res);
+    }
+    else if (res >= 0)
     {
         int on = 1;
         if (::setsockopt(res, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on) < 0) {}
@@ -637,6 +645,8 @@ void raft_host::on_accept(int res)
     else if (res != -ECANCELED)
     {
         warn(std::string("accept failed: ") + std::strerror(-res));
+        // Asked again at the next tick, since an accept refused for want of descriptors is refused again at once.
+        return;
     }
     arm_accept();
 }
@@ -667,6 +677,7 @@ void raft_host::on_tick()
     drive_cluster();
     arm_pump();
     arm_tick();
+    arm_accept();
     // Last, because the daemon's reconciliation may block on a worker starting and the next tick is already armed.
     if (m_on_tick && !m_stopped)
         m_on_tick();
@@ -782,6 +793,8 @@ void raft_host::after_persist(bool ok)
         send(m);
     apply(m_pending);
     m_pending = raft::ready{};
+    if (m_stopped)
+        return;
 
     if (m_applied >= m_snap_index + m_cfg.compact_every && m_node->compact(m_applied, encode_snapshot(m_applied_book, m_brain->current())))
         m_snap_index = m_applied;
@@ -801,7 +814,9 @@ void raft_host::apply(const raft::ready& r)
         }
         else
         {
-            warn("a snapshot at " + std::to_string(r.restore->index) + " holds no readable membership book and cluster state");
+            // Entries applied over the book and state from before it would be a state no other node holds.
+            return fail_stop("a snapshot at " + std::to_string(r.restore->index) +
+                             " holds no readable membership book and cluster state");
         }
         m_applied = r.restore->index;
         info("installed a snapshot at " + std::to_string(r.restore->index) + " from the leader");
@@ -994,6 +1009,21 @@ bool raft_host::on_frame(link& l, std::string_view payload)
         if (!listed)
             m_heard_book[f.hi.id] = member{f.hi.name, f.hi.addr, true};
         m_heard[f.hi.id] = clock::now();
+        // The ids a peer gives are its own to choose, so what is kept of nodes nobody listed is bounded: past it the
+        // one heard from longest ago goes, which a node still talking soon replaces.
+        while (m_heard_book.size() > max_heard)
+        {
+            auto oldest = m_heard_book.end();
+            for (auto it = m_heard_book.begin(); it != m_heard_book.end(); ++it)
+            {
+                const auto h = m_heard.find(it->first);
+                if (oldest == m_heard_book.end() ||
+                    (h != m_heard.end() && m_heard.count(oldest->first) && h->second < m_heard[oldest->first]))
+                    oldest = it;
+            }
+            m_heard.erase(oldest->first);
+            m_heard_book.erase(oldest);
+        }
         return true;
     }
 

@@ -20,83 +20,11 @@
 
 namespace fs = std::filesystem;
 
-// ─── Minimal JSON helpers (same as cluster_discovery.cpp) ───
-
 namespace {
 
-std::string json_get_string(std::string_view json, std::string_view key)
-{
-    std::string needle = "\"";
-    needle += key;
-    needle += "\":\"";
-    auto pos = json.find(needle);
-    if (pos == std::string_view::npos)
-        return {};
-
-    pos += needle.size();
-    auto end = json.find('"', pos);
-    if (end == std::string_view::npos)
-        return {};
-
-    return std::string(json.substr(pos, end - pos));
-}
-
-int64_t json_get_number(std::string_view json, std::string_view key)
-{
-    std::string needle = "\"";
-    needle += key;
-    needle += "\":";
-    auto pos = json.find(needle);
-    if (pos == std::string_view::npos)
-        return 0;
-
-    pos += needle.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
-        ++pos;
-
-    int64_t val = 0;
-    auto [ptr, ec] = std::from_chars(json.data() + pos,
-        json.data() + json.size(), val);
-    if (ec != std::errc{})
-        return 0;
-    return val;
-}
-
-std::vector<std::string_view> json_get_array_objects(std::string_view json, std::string_view key)
-{
-    std::vector<std::string_view> result;
-
-    std::string needle = "\"";
-    needle += key;
-    needle += "\":[";
-    auto pos = json.find(needle);
-    if (pos == std::string_view::npos)
-        return result;
-
-    pos += needle.size();
-
-    while (pos < json.size())
-    {
-        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' ||
-               json[pos] == '\n' || json[pos] == '\r' || json[pos] == ','))
-            ++pos;
-
-        if (pos >= json.size() || json[pos] == ']')
-            break;
-
-        if (json[pos] != '{')
-            break;
-
-        auto end = json.find('}', pos);
-        if (end == std::string_view::npos)
-            break;
-
-        result.push_back(json.substr(pos, end - pos + 1));
-        pos = end + 1;
-    }
-
-    return result;
-}
+using cd_detail::json_get_array_objects;
+using cd_detail::json_get_number;
+using cd_detail::json_get_string;
 
 struct cluster_daemon
 {

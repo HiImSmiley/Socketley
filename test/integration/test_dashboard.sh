@@ -71,7 +71,7 @@ for f in schema["flags"]:
 # The create parsers, each one's cases.
 parsers = {"parse_common_flags": None, "parse_server_flags": "server", "parse_client_flags": "client",
            "parse_proxy_gate_flag": "proxy", "parse_proxy_flags": "proxy", "parse_cache_flags": "cache",
-           "parse_dns_flags": "dns", "parse_storage_flags": "storage"}
+           "parse_dns_flags": "dns", "parse_storage_flags": "storage", "parse_sync_flags": "sync"}
 out = []
 for fn, ty in parsers.items():
     m = re.search(r"\n(?:static )?int " + fn + r"\(.*?\n\}\n", src, re.S)
@@ -82,10 +82,11 @@ for fn, ty in parsers.items():
             out.append(flag + " (" + fn + ")")
         elif ty and ty not in known[flag]:
             out.append(flag + " not offered for " + ty)
-print(" ".join(sorted(out)))
+print(" ".join(sorted(out)) or "none")
 PY
 )
-expect "every flag a create parser takes is in the dashboard's schema, for its type" "$missing" ""
+# "none" is said, never left empty: a schema that did not load fails python, and an empty answer passed for parity.
+expect "every flag a create parser takes is in the dashboard's schema, for its type" "$missing" "none"
 
 # ─── the page ───────────────────────────────────────────────────────────────
 curl -s "$U/" > "$T/page.html"
@@ -146,7 +147,10 @@ j() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1
 expect "a command needs the page's header" "$(code -b "$T/jar" -d '{"args":["ls"]}' "$U/api/run")" 403
 expect "and a session" "$(code -H 'X-Socketley-Dashboard: 1' -d '{"args":["ls"]}' "$U/api/run")" 401
 expect "a verb that is not the dashboard's is refused" "$(code -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -d '{"args":["daemon-stop"]}' "$U/api/run")" 403
-expect "and a word with a space" "$(code -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -d '{"args":["create","server","a b"]}' "$U/api/run")" 400
+expect "a word with a tab is refused" "$(code -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -d '{"args":["create","server","a\tb"]}' "$U/api/run")" 400
+# A space travels inside its word, so the daemon judges the one name and makes neither half of it.
+expect "a word with a space arrives as one" \
+    "$(run '{"args":["create","server","a b"]}' | j "d['code'] != 0 and 'a b' in d['out']") $("$BIN" ls 2>/dev/null | grep -cE '^ *(a|b) ')" "True 0"
 expect "a runtime is made, started" "$(run "{\"args\":[\"create\",\"server\",\"web\",\"-p\",\"$((P+1))\",\"-s\"]}" | j "d['code']")" 0
 for _ in $(seq 1 30); do [ "$(curl -s -b "$T/jar" "$U/api/runtimes" | j "[r['state'] for r in d if r['name']=='web'][0]")" = running ] && break; sleep 0.2; done
 expect "and runs" "$(curl -s -b "$T/jar" "$U/api/runtimes" | j "[r['state'] for r in d if r['name']=='web'][0]")" running
@@ -156,6 +160,13 @@ expect "import changes it" "$(run '{"args":["import","web","{\"max_connections\"
 expect "stop stops it" "$(run '{"args":["stop","web"]}' | j "d['code']") $("$BIN" ls 2>/dev/null | grep -c ' web .*Stopped')" "0 1"
 expect "start starts it" "$(run '{"args":["start","web"]}' | j "d['code']")" 0
 expect "and remove removes it" "$(run '{"args":["remove","web"]}' | j "d['code']") $("$BIN" ls 2>/dev/null | grep -c ' web ')" "0 0"
+# A command is logged without its secrets: the value after a flag that holds one, and an import's document.
+run "{\"args\":[\"create\",\"server\",\"pw\",\"-p\",\"$((P+3))\",\"--mode\",\"master\",\"--master-pw\",\"dashtopsecretpw\"]}" >/dev/null
+run '{"args":["import","pw","{\"master_pw\": \"dashothersecret\"}"]}' >/dev/null
+sleep 0.5
+expect "the dashboard's log of a command keeps no password" \
+    "$(grep -c 'dashtopsecretpw\|dashothersecret' "$SOCKETLEY_DLOG") $(grep -c 'ran create server pw .*--master-pw \*\*\*' "$SOCKETLEY_DLOG")" "0 1"
+run '{"args":["remove","pw"]}' >/dev/null
 # ─── the log ────────────────────────────────────────────────────────────────
 run "{\"args\":[\"create\",\"storage\",\"loud\",\"-p\",\"$((P+2))\",\"--dir\",\"$T/loud\",\"--anonymous\",\"-s\"]}" >/dev/null
 logs() { curl -s -b "$T/jar" "$U/api/logs?$1"; }
@@ -165,8 +176,11 @@ expect "a worker's lines reach the daemon's log, named by their runtime" "$got" 
 expect "and its stderr still gets them" "$(grep -q "storage 'loud'" "$SOCKETLEY_DLOG" && echo yes)" yes
 expect "the daemon's own lines are there too" "$(logs "max=2000" | j "any(l['rt']=='' and 'daemon started' in l['text'] for l in d['lines'])")" True
 n=$(logs "max=1" | j "d['next']")
-expect "a reader asks for what is new" "$(logs "since=$n" | j "all(l['seq'] > $n for l in d['lines'])")" True
-expect "and filters by level" "$(logs "level=error&max=2000" | j "all(l['lv']=='error' for l in d['lines'])")" True
+# A command after the mark logs a line, so the filters below are judged on lines rather than on an empty list.
+run '{"args":["stop","loud"]}' >/dev/null
+expect "a reader asks for what is new" "$(logs "since=$n" | j "len(d['lines']) > 0 and all(l['seq'] > $n for l in d['lines'])")" True
+# The refused sign-ins above logged warnings, and the level is a floor.
+expect "and filters by level" "$(logs "level=warn&max=2000" | j "len(d['lines']) > 0 and all(l['lv'] in ('warn','error') for l in d['lines'])")" True
 expect "the log needs a session" "$(code "$U/api/logs")" 401
 
 # ─── domains ────────────────────────────────────────────────────────────────

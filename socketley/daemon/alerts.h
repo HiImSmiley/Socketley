@@ -91,6 +91,8 @@ private:
     std::mutex m_mtx;
     std::condition_variable m_cv;
     std::deque<std::string> m_queue;
+    // Messages pushed out of a full queue since the hook last answered.
+    uint64_t m_dropped = 0;
     bool m_stop{false};
     std::thread m_thread;
 };

@@ -145,8 +145,10 @@ void cluster_reconciler::reconcile_one(const cl::want::item& item, bool serving)
         {
             // Not budgeted: a lapsed lease must stop what it fences at once, and a stop returns as soon as the worker is signalled.
             std::string out;
-            act({"stop", item.name}, out, false);
-            LOG_INFO(("cluster: stopped replica " + item.name + ", no lease").c_str());
+            if (act({"stop", item.name}, out, false) == 0)
+                LOG_INFO(("cluster: stopped replica " + item.name + ", no lease").c_str());
+            else
+                LOG_ERROR(("cluster: replica " + item.name + " has no lease and could not be stopped: " + out).c_str());
         }
         return note(item.name, "waiting", "no lease: this node cannot confirm it still owns the replica");
     }
@@ -248,7 +250,12 @@ void cluster_reconciler::tick()
         if (!spend())
             continue;
         std::string out;
-        act({"remove", name}, out, false);
+        // Forgotten only when gone, or the next tick would not know to try again.
+        if (act({"remove", name}, out, false) != 0)
+        {
+            LOG_ERROR(("cluster: replica " + name + " is no longer this node's and could not be removed: " + out).c_str());
+            continue;
+        }
         m_made.erase(name);
         m_incarnation.erase(name);
         m_retry_at.erase(name);

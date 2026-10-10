@@ -45,11 +45,16 @@ echo "=== Integration: the daemon's alerts ==="
 
 # A hook that keeps every body it is sent, one a line.
 python3 - "$HP" "$T/hook.log" <<'PY' &
-import http.server, sys
+import http.server, os, sys
 port, log = int(sys.argv[1]), sys.argv[2]
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         b = self.rfile.read(int(self.headers.get('content-length', 0)))
+        # While told to, an answer that breaks off: fifty bytes promised, five sent.
+        if os.path.exists(log + '.short'):
+            self.wfile.write(b'HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nshort'); self.wfile.flush()
+            self.close_connection = True
+            return
         open(log, 'ab').write(b.replace(b'\n', b' ') + b'\n')
         self.send_response(204); self.end_headers()
     def log_message(self, *a): pass
@@ -95,8 +100,8 @@ curl -s -o /dev/null -X PUT "http://127.0.0.1:$S3/bkt"
 head -c 1010000 /dev/zero | curl -s -o /dev/null -X PUT --data-binary @- "http://127.0.0.1:$S3/bkt/big"
 
 until_al 30 "any(a['id'] == 'failed:broke' for a in d['active'])"
-# A reading after the one that raised it, by when the alert's own line names the runtime in the log too.
-sleep 11
+# The storage limit takes three readings, so by then a reading after the raise has seen the alert's own line in the log too.
+until_al 45 "any(a['id'] == 'limit:full' for a in d['active'])"
 a=$(al)
 expect "a runtime that failed is a critical alert" "$(echo "$a" | j "[(x['level'], x['title']) for x in d['active'] if x['id'] == 'failed:broke']")" "[('critical', 'broke failed')]"
 expect "saying why, in the runtime's own words and not the alert's" \
@@ -113,6 +118,10 @@ expect "a storage runtime at 96 % of its limit, after three readings" \
 expect "a test of the hook needs the page's header" "$(curl -s -o /dev/null -w '%{http_code}' -b "$T/jar" -X POST "$U/api/alerts/test")" 403
 expect "and with it reaches the hook" \
     "$(curl -s -o /dev/null -w '%{http_code}' -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -X POST "$U/api/alerts/test") $(hook "d['state']" | grep -c test)" "204 1"
+touch "$T/hook.log.short"
+expect "an answer that breaks off before its length is no delivery" \
+    "$(curl -s -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -X POST -w ' %{http_code}' "$U/api/alerts/test" | tr -d '\n' | grep -c 'short of its length 502')" 1
+rm -f "$T/hook.log.short"
 
 file=$(find "$HOME" -name .alerts -type f | head -1)
 expect "what was told of is kept in the state directory, private" "$(stat -c %a "$file" 2>/dev/null) $(grep -c failed:broke "$file")" "600 1"

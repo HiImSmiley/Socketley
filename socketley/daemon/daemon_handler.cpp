@@ -1116,6 +1116,16 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     conn->partial.append(conn->read_buf, cqe->res);
 
+    // A line is held whole until its end, as a frame is up to max_payload: one that never ends is not let grow
+    // past that bound either.
+    if (SOCKETLEY_UNLIKELY(conn->partial.size() > ipc_frame::max_payload + ipc_frame::header_size) &&
+        conn->partial[0] != ipc_frame::marker && conn->partial.find('\n') == std::string::npos)
+    {
+        LOG_ERROR("daemon: a CLI connection sent a line longer than the limit with no end to it; closing it");
+        close_client(it);
+        return;
+    }
+
     // Interactive mode: forward input lines to runtime
     if (conn->interactive)
     {
@@ -1130,9 +1140,13 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
             if (line.empty())
                 continue;
 
+            // What was typed while the runtime is down goes nowhere, rather than all at once when it next starts.
             auto* inst = m_manager.get(conn->interactive_name);
             if (!inst || inst->get_state() != runtime_running)
+            {
+                conn->partial.clear();
                 break;
+            }
 
             // ─── The typed line goes where the runtime is ────────────────
             // Every arm below used to call the instance directly, which was
@@ -1166,10 +1180,11 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
                     const size_t sp = line.find(' ');
                     run_cache_action(conn, conn->interactive_name,
                                      line.substr(0, sp), line);
+                    // Never blocking the daemon on a terminal that stopped reading: what does not fit is dropped.
                     if (!conn->write_buf.empty())
                     {
-                        socketley::write_all(conn->fd, conn->write_buf.data(),
-                                             conn->write_buf.size());
+                        if (!socketley::send_all_nowait(conn->fd, conn->write_buf.data(),
+                                                        conn->write_buf.size())) {}
                         conn->write_buf.clear();
                     }
                 }
@@ -1194,8 +1209,7 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 case runtime_cache:
                 {
                     std::string resp = static_cast<cache_instance*>(inst)->execute(line);
-                    if (!resp.empty())
-                        socketley::write_all(conn->fd, resp.data(), resp.size());
+                    if (!resp.empty() && !socketley::send_all_nowait(conn->fd, resp.data(), resp.size())) {}
                     break;
                 }
                 default:
@@ -1912,6 +1926,8 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
     const size_t withheld_start = withhold_cluster_names(names, "start", conn);
     if (names.empty())
         return withheld_start ? 1 : 0;
+    // Counted before the entrances join, which start with their dns runtime and are no second name the operator gave.
+    const size_t named = names.size();
     // A dns runtime's entrance starts with it.
     for (size_t k = 0, n = names.size(); k < n; ++k)
         for (auto& child : dns_entrance_children(names[k]))
@@ -1919,7 +1935,7 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
                 if (const auto* c = m_manager.get(child); c && c->get_state() != runtime_running)
                     names.push_back(std::move(child));
 
-    if (want_interactive && names.size() > 1)
+    if (want_interactive && named > 1)
     {
         conn->write_buf = "cannot use -i with multiple runtimes\n";
         return 1;
@@ -2900,7 +2916,17 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
     // configuration the daemon owns, so it is finished below rather than here.
     if (type == runtime_cache && instance->is_out_of_process()
         && action != "send" && action != "memory")
+    {
+        // The cache splits a text command at its spaces, and only a value, its last word, is taken as the rest.
+        for (size_t i = 3; i < pa.count; ++i)
+            if (pa.args[i].find(' ') != std::string_view::npos && (i == 3 || i + 1 < pa.count))
+            {
+                conn->write_buf = "'" + std::string(pa.args[i]) + "' has a space in it, which the cache's text "
+                                  "commands read as two words; only a value, the last argument, may hold one\n";
+                return 1;
+            }
         return run_cache_action(conn, name, action, pa.rest_from(2));
+    }
 
     if (type == runtime_cache && instance->is_out_of_process()
         && action == "memory")
@@ -4221,6 +4247,12 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         conn->write_buf = msg;
         return 1;
     }
+    if (const std::string msg = type_manifest::missing_required_refusal(type, cfg.extra);
+        cfg.has("extra") && !msg.empty())
+    {
+        conn->write_buf = msg;
+        return 1;
+    }
 
     // Handle rename
     std::string old_name(name);
@@ -4243,18 +4275,13 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                 "  and may be at most 128 characters.\n";
             return 1;
         }
-        if (!m_manager.rename(old_name, cfg.name))
+        if (m_manager.get(cfg.name))
         {
             conn->write_buf = "rename failed: name already taken\n";
             return 1;
         }
-        // Re-fetch instance under new name
-        instance = m_manager.get(cfg.name);
+        // Renamed last, once nothing below can refuse the document, or a refusal left it renamed in memory alone.
         renamed = true;
-        // What a sync carried goes with its name, or the renamed job would carry its whole directory again.
-        if (instance && instance->get_type() == runtime_sync &&
-            ::rename(sync_index_path(old_name).c_str(), sync_index_path(cfg.name).c_str()) != 0 && errno != ENOENT)
-            LOG_WARN(("sync " + cfg.name + ": its index stayed under " + old_name + ": " + std::strerror(errno)).c_str());
     }
 
     // ─── Changes that need a restart ────────────────────────────────────────
@@ -4684,7 +4711,23 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     }
 
     if (renamed)
+    {
+        if (!m_manager.rename(old_name, cfg.name))
+        {
+            conn->write_buf = "rename failed: name already taken\n";
+            return 1;
+        }
+        instance = m_manager.get(cfg.name);
+        // The children it took along name it on disk too.
+        for (const auto& child : m_manager.get_children(cfg.name))
+            if (auto* c = m_manager.get(child); c && !c->get_test_mode() && !c->is_lua_created())
+                m_persistence->save_runtime(c);
+        // What a sync carried goes with its name, or the renamed job would carry its whole directory again.
+        if (instance && instance->get_type() == runtime_sync &&
+            ::rename(sync_index_path(old_name).c_str(), sync_index_path(cfg.name).c_str()) != 0 && errno != ENOENT)
+            LOG_WARN(("sync " + cfg.name + ": its index stayed under " + old_name + ": " + std::strerror(errno)).c_str());
         m_persistence->remove_runtime(old_name);
+    }
     m_persistence->save_runtime(instance);
 
     // The same push `edit` does, because this is the same set of fields
@@ -4799,6 +4842,19 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
             ++refused;
             continue;
         }
+        // The rest of a start's questions, as `start` asks them.
+        if (const std::string msg = instance_cache_persist_refusal(inst); !msg.empty())
+        {
+            conn->write_buf += std::string(n) + ": " + msg;
+            ++refused;
+            continue;
+        }
+        if (const std::string msg = instance_server_mode_refusal(inst); !msg.empty())
+        {
+            conn->write_buf += std::string(n) + ": " + msg;
+            ++refused;
+            continue;
+        }
         m_manager.stop(n, m_loop);
 
         // The child comes down here, per name, or the reconcile after the loop
@@ -4817,9 +4873,9 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
         }
         // Said out loud, because a reload whose start was refused used to
         // leave the runtime stopped and answer as though it had reloaded.
-        else if (!refusal.empty())
+        else
         {
-            conn->write_buf += refusal;
+            conn->write_buf += refusal.empty() ? "failed to start: " + std::string(n) + "\n" : refusal;
             ++refused;
         }
 
@@ -6729,7 +6785,14 @@ void daemon_handler::reconcile_proxy_workers()
             m_proxy_workers.erase(name);
             // And the regions go with them, for the same reason: a table with
             // no process publishing into it is not a smaller table, it is one
-            // whose every reader has gone.
+            // whose every reader has gone.  The placeholder's reader first,
+            // under the lock the reap above takes, or it reads a region
+            // nobody publishes into and a later start attaches no new one.
+            if (auto* inst = m_manager.get(name))
+            {
+                std::unique_lock stats_lock(m_manager.mutex);
+                inst->shard_stats_table().close();
+            }
             m_shard_regions.erase(name);
             m_shard_client_regions.erase(name);
         }
@@ -7317,7 +7380,17 @@ void daemon_handler::check_managed_health()
         LOG_WARN("managed runtime died, restarting");
         lock.unlock();
         inst->stop(m_loop);   // set state to stopped (no SIGTERM needed, process is dead)
-        m_manager.start(name, m_loop);  // fork+exec again
+        // A restart refused, an address now taken, is said and the runtime marked failed, not left stopped silently.
+        if (std::string refusal; !m_manager.start(name, m_loop, &refusal))  // fork+exec again
+        {
+            LOG_ERROR(("managed runtime " + std::string(name) + " could not be started again" +
+                       (refusal.empty() ? std::string() : ": " + refusal)).c_str());
+            inst->mark_failed();
+            if (m_persistence)
+                m_persistence->save_runtime(inst.get());
+            m_managed_restarts.erase(std::string(name));
+            return;
+        }
         // The count `stats` prints, which this path never touched: a runtime
         // that had been restarting every two seconds reported 0 restarts.
         inst->note_restart();

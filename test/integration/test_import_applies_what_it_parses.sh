@@ -146,7 +146,8 @@ for k in ("mesh_client_cert", "mesh_client_key", "mesh_client_ca"):
     d.pop(k, None)
 open(sys.argv[1] + ".new", "w").write(json.dumps(d))
 PYEOF
-"$BIN" import if_prx "$(tr -d '\n' < "$SOCKETLEY_TMPD/doc.json.new")" >/dev/null 2>&1 || true
+OUT=$("$BIN" import if_prx "$(tr -d '\n' < "$SOCKETLEY_TMPD/doc.json.new")" 2>&1; echo "rc=$?")
+check "the import without the mesh paths is accepted" "rc=0" "$OUT"
 check "an omitted mesh path is left alone" "/a.pem" "$(field if_prx mesh_client_cert)"
 
 # And the spelling that does clear it, which is the documented recovery for a
