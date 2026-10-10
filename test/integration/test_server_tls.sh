@@ -451,7 +451,8 @@ sleep 0.5
 assert_eq "$(state_of tls_missing)" "failed" "missing certificate: runtime fails to start"
 
 TOTAL=$((TOTAL+1))
-if nc -z 127.0.0.1 "$BAD_PORT" 2>/dev/null; then
+# Bash's own /dev/tcp, because a missing nc also exits non-zero and read as a closed port.
+if timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$BAD_PORT" 2>/dev/null; then
     FAIL=$((FAIL+1)); echo "  FAIL [missing certificate: nothing listens on the port]"
 else
     PASS=$((PASS+1))

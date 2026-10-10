@@ -1027,9 +1027,14 @@ void server_instance::rebuild_http_cache()
     if (ec)
         return;
 
-    for (const auto& entry : fs::recursive_directory_iterator(m_http_base, ec))
+    // Without exceptions: an unreadable directory under the root is left out, not a start that throws.
+    std::error_code wec;
+    fs::recursive_directory_iterator walk(m_http_base, fs::directory_options::skip_permission_denied, wec);
+    for (; !wec && walk != fs::recursive_directory_iterator(); walk.increment(wec))
     {
-        if (!entry.is_regular_file())
+        const auto& entry = *walk;
+        std::error_code tec;
+        if (!entry.is_regular_file(tec))
             continue;
 
         // Lexically, because fs::relative() resolves links and filed every one
@@ -1391,8 +1396,10 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         // Verify the resolved path is within the base directory (symlink escape check)
         auto base_str = m_http_base.native();
         auto resolved_str = resolved.native();
+        // Inside means the base itself or below a slash after it: /srv/www-secret begins with /srv/www too.
         if (ec || resolved_str.size() < base_str.size() ||
-            resolved_str.compare(0, base_str.size(), base_str) != 0)
+            resolved_str.compare(0, base_str.size(), base_str) != 0 ||
+            (resolved_str.size() > base_str.size() && base_str.back() != '/' && resolved_str[base_str.size()] != '/'))
         {
             queue_http_response(conn, http_404_response(conn->http_keep_alive));
             if (!conn->http_keep_alive)
@@ -1576,6 +1583,14 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
         }
 
         // Fallback: malloc + async read (HTML files or splice busy)
+        // One read takes at most what 32 bits count, and a page held whole past that is no page to send.
+        if (SOCKETLEY_UNLIKELY(send_len >= UINT32_MAX))
+        {
+            close_tracked(ffd);
+            queue_http_response(conn, http_500_response());
+            conn->closing = true;
+            return;
+        }
         char* fbuf = static_cast<char*>(malloc(send_len));
         if (!fbuf)
         {
@@ -1664,6 +1679,9 @@ static std::string build_http_response_full(int status, std::string_view reason,
     std::string resp;
     resp.reserve(256 + body.size());
     resp.append("HTTP/1.1 ");
+    // Three digits or 500, since a script's number goes on the status line as it is.
+    if (status < 100 || status > 999)
+        status = 500;
     char status_buf[8];
     auto [s_end, s_ec] = std::to_chars(status_buf, status_buf + sizeof(status_buf), status);
     resp.append(status_buf, s_end - status_buf);
@@ -1676,6 +1694,10 @@ static std::string build_http_response_full(int status, std::string_view reason,
     bool has_conn = false;
     for (const auto& [k, v] : headers)
     {
+        // A script's header is often made of what the request said, so one that would end its line, or start
+        // another, is left out rather than allowed to write headers of the client's choosing.
+        if (!http_field_name_ok(k) || !http_field_value_ok(v))
+            continue;
         resp.append(k);
         resp.append(": ");
         resp.append(v);
@@ -2628,6 +2650,8 @@ void server_instance::teardown(event_loop& loop)
     // Drain: flush pending write queues with blocking writes before closing
     if (get_drain())
     {
+        // One end for every connection together, so a client that stopped reading cannot hold the stop.
+        const auto drain_end = std::chrono::steady_clock::now() + socketley::drain_budget;
         for (auto& [fd, conn] : m_clients)
         {
             if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
@@ -2653,7 +2677,7 @@ void server_instance::teardown(event_loop& loop)
                     const int n = tls_context::bio_read_out(conn->ssl, cbuf, sizeof(cbuf));
                     if (n <= 0)
                         break;
-                    ok = socketley::write_all(fd, cbuf, static_cast<size_t>(n));
+                    ok = socketley::write_all_until(fd, cbuf, static_cast<size_t>(n), drain_end);
                 }
                 continue;
             }
@@ -2663,7 +2687,7 @@ void server_instance::teardown(event_loop& loop)
                 const auto& msg = conn->write_queue.front();
                 // A short write leaves half a message on the wire; sending the
                 // next one after it would misframe everything that follows.
-                if (!socketley::write_all(fd, msg.data(), msg.size())) break;
+                if (!socketley::write_all_until(fd, msg.data(), msg.size(), drain_end)) break;
                 conn->write_queue.pop();
             }
         }
@@ -3068,7 +3092,8 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                     if (req == &uc->timeout_req)
                     {
                         uc->timeout_pending = false;
-                        uc->reconnect_attempt++;
+                        if (!uc->resolving)
+                            uc->reconnect_attempt++;
                         if (!upstream_try_connect(uc.get()))
                             upstream_schedule_reconnect(uc.get());
                         break;
@@ -3257,6 +3282,38 @@ inline void server_instance::release_fixed_slot(server_connection* conn)
     }
 }
 
+uint64_t server_instance::auth_peer_key(int fd)
+{
+    sockaddr_storage peer{};
+    socklen_t len = sizeof(peer);
+    if (getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &len) != 0)
+        return 0;
+    if (peer.ss_family == AF_INET)
+        return reinterpret_cast<const sockaddr_in*>(&peer)->sin_addr.s_addr;
+    if (peer.ss_family == AF_INET6)
+    {
+        const in6_addr& a = reinterpret_cast<const sockaddr_in6*>(&peer)->sin6_addr;
+        uint32_t v4 = 0;
+        if (IN6_IS_ADDR_V4MAPPED(&a))
+        {
+            std::memcpy(&v4, &a.s6_addr[12], 4);
+            return v4;
+        }
+        // One holder of an IPv6 network has its whole /64.
+        uint64_t net = 0;
+        std::memcpy(&net, a.s6_addr, 8);
+        return net | (uint64_t{1} << 63);
+    }
+    if (peer.ss_family == AF_UNIX)
+    {
+        ucred cred{};
+        socklen_t clen = sizeof(cred);
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) == 0)
+            return (uint64_t{1} << 32) | cred.uid;
+    }
+    return 0;
+}
+
 // Everything an accepted descriptor goes through before it is a connection,
 // lifted out of handle_accept because a second listener hands over a
 // descriptor and nothing else: it has no completion of this one to resubmit,
@@ -3376,12 +3433,7 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
     // getpeername per accept.
     if (SOCKETLEY_UNLIKELY(!m_auth_ip_failures.empty()))
     {
-        struct sockaddr_in peer{};
-        socklen_t peer_len = sizeof(peer);
-        uint32_t ip = 0;
-        if (getpeername(client_fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0)
-            ip = peer.sin_addr.s_addr;
-        auto it = m_auth_ip_failures.find(ip);
+        auto it = m_auth_ip_failures.find(auth_peer_key(client_fd));
         if (it != m_auth_ip_failures.end())
         {
             auto elapsed = std::chrono::steady_clock::now() - it->second.last_failure;
@@ -3946,6 +3998,8 @@ bool server_instance::begin_chunked_response(server_connection* conn, int status
     std::string head;
     head.reserve(160);
     head.append("HTTP/1.1 ");
+    if (status < 100 || status > 999)
+        status = 500;
     char sbuf[8];
     auto [s_end, s_ec] = std::to_chars(sbuf, sbuf + sizeof(sbuf), status);
     head.append(sbuf, s_end - sbuf);
@@ -3961,6 +4015,8 @@ bool server_instance::begin_chunked_response(server_connection* conn, int status
         if (fnv1a_lower(k) == fnv1a("content-length") ||
             fnv1a_lower(k) == fnv1a("transfer-encoding") ||
             fnv1a_lower(k) == fnv1a("connection"))
+            continue;
+        if (!http_field_name_ok(k) || !http_field_value_ok(v))
             continue;
         head.append(k);
         head.append(": ");
@@ -5442,13 +5498,18 @@ void server_instance::process_message(server_connection* sender, std::string_vie
     }
 
     stat_add(m_stat_total_messages, 1);
-    print_bash_message(msg);
-    write_received_message(msg);
-    notify_interactive(msg);
+    // A master login carries its password: it goes to the login below and to nothing that keeps or shows a message.
+    const bool login = m_mode == mode_master && msg.size() > 7 && msg.starts_with("master ");
+    if (!login)
+    {
+        print_bash_message(msg);
+        write_received_message(msg);
+        notify_interactive(msg);
 
-    // Fire on_client_message callback (sender-aware)
-    if (sender)
-        invoke_on_client_message(sender->fd, msg);
+        // Fire on_client_message callback (sender-aware)
+        if (sender)
+            invoke_on_client_message(sender->fd, msg);
+    }
 
     // Cache command interception, asked of the linked cache and answered a
     // turn later, rather than run on this stack through a pointer to the cache
@@ -5464,7 +5525,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
 
     // Store in cache if configured, appended to the batch rather than posted,
     // because the granularity matters.
-    if (SOCKETLEY_UNLIKELY(!get_cache_name().empty()))
+    if (SOCKETLEY_UNLIKELY(!get_cache_name().empty()) && !login)
     {
         char key_buf[24];
         auto [key_end, key_ec] = std::to_chars(key_buf, key_buf + sizeof(key_buf), ++m_message_counter);
@@ -5661,14 +5722,31 @@ void server_instance::process_message(server_connection* sender, std::string_vie
 
                     // Record per-IP failure
                     {
-                        struct sockaddr_in peer_addr{};
-                        socklen_t peer_len = sizeof(peer_addr);
-                        if (getpeername(sender->fd, reinterpret_cast<struct sockaddr*>(&peer_addr), &peer_len) == 0)
+                        const auto now = std::chrono::steady_clock::now();
+                        // Bounded: past the cap, what is older than the lockout's minute goes, and then the oldest
+                        // eighth, so a flood of new addresses pays a scan per thousands of them and not one each.
+                        if (m_auth_ip_failures.size() >= max_auth_records)
                         {
-                            auto& rec = m_auth_ip_failures[peer_addr.sin_addr.s_addr];
-                            rec.failures++;
-                            rec.last_failure = std::chrono::steady_clock::now();
+                            std::erase_if(m_auth_ip_failures, [now](const auto& kv)
+                                          { return now - kv.second.last_failure > std::chrono::seconds(60); });
+                            if (m_auth_ip_failures.size() >= max_auth_records)
+                            {
+                                std::vector<std::chrono::steady_clock::time_point> at;
+                                at.reserve(m_auth_ip_failures.size());
+                                for (const auto& [k, r] : m_auth_ip_failures)
+                                    at.push_back(r.last_failure);
+                                const size_t cut = at.size() / 8;
+                                std::nth_element(at.begin(), at.begin() + cut, at.end());
+                                const auto before = at[cut];
+                                std::erase_if(m_auth_ip_failures, [&](const auto& kv)
+                                              { return kv.second.last_failure < before; });
+                                if (m_auth_ip_failures.size() >= max_auth_records)
+                                    m_auth_ip_failures.erase(m_auth_ip_failures.begin());
+                            }
                         }
+                        auto& rec = m_auth_ip_failures[auth_peer_key(sender->fd)];
+                        rec.failures++;
+                        rec.last_failure = now;
                     }
 
                     auto deny_msg = std::make_shared<const std::string>("master: denied\n");
@@ -6057,11 +6135,10 @@ void server_instance::relay_hold_push(server_connection* conn,
     // The deadline runs from the first message held, or a listener on a busy
     // relay would have its clock reset by each broadcast and never reach it.
     if (conn->relay_hold.empty())
-    {
         conn->relay_hold_since = std::chrono::steady_clock::now();
-        if (relay_deadline_applies(conn))
-            relay_deadline_arm(RELAY_HOLD_DEADLINE_MS);
-    }
+    // Asked at every push and not only the first, so a timer the ring once refused is armed by the next one.
+    if (relay_deadline_applies(conn))
+        relay_deadline_arm(RELAY_HOLD_DEADLINE_MS);
 
     conn->relay_hold.push(held_relay{msg, kind});
 
@@ -7531,8 +7608,7 @@ bool server_instance::write_to_ref(const conn_ref& ref, std::string_view msg)
     // holds, so wrapping it in a control block bought a second allocation and
     // an entry the queue may not coalesce.  The same shape queue_send's own
     // comment describes.
-    queue_send(conn, std::move(buf));
-    return true;
+    return queue_send(conn, std::move(buf));
 }
 
 void server_instance::drop_route(const conn_ref& ref)
@@ -7724,11 +7800,18 @@ int server_instance::find_or_add_peer(const struct sockaddr_in& addr)
         // their own.  The oldest goes instead, because a sender heard from
         // longer ago than every other is the one a broadcast is least likely
         // to be for.
-        int oldest = 0;
-        for (size_t i = 1; i < m_udp_peers.size(); ++i)
+        // The oldest of sixteen taken in turn, not of all ten thousand, so a flood of new sources costs each
+        // datagram a constant and not a scan of the table.
+        const size_t n = m_udp_peers.size();
+        size_t oldest = m_udp_evict_hand % n;
+        for (size_t k = 1; k < 16; ++k)
+        {
+            const size_t i = (m_udp_evict_hand + k) % n;
             if (m_udp_peers[i].last_seen < m_udp_peers[oldest].last_seen)
-                oldest = static_cast<int>(i);
-        drop_udp_peer(oldest);
+                oldest = i;
+        }
+        m_udp_evict_hand = (m_udp_evict_hand + 16) % n;
+        drop_udp_peer(static_cast<int>(oldest));
     }
 
     int idx = static_cast<int>(m_udp_peers.size());
@@ -7775,6 +7858,9 @@ std::vector<int> server_instance::clients()
     // Handles for siblings' connections that have gone, pruned here or
     // m_forwarded grows for the life of the runtime -- and only the ones
     // minted here, because route() owns its own lifetime.
+    // Not on a short read, where a client missing from the list has not gone.
+    if (!complete)
+        return out;
     for (auto it = m_forwarded.begin(); it != m_forwarded.end();)
     {
         if (it->second.origin == get_name() && live.find(it->second.ref) == live.end())
@@ -7825,8 +7911,9 @@ size_t server_instance::multicast(const std::vector<int>& fds, std::string_view 
         if (fd < 0 || fd >= MAX_FDS) continue;
         auto* conn = m_conn_idx[fd];
         if (!conn || conn->closing) continue;
-        queue_send(conn, shared, false, &ws_msg);
-        ++sent;
+        // Counted only where it was queued: a recipient dropped for its backlog was not sent it.
+        if (queue_send(conn, shared, false, &ws_msg))
+            ++sent;
     }
     return sent;
 }
@@ -7940,13 +8027,9 @@ size_t server_instance::group_send(std::string_view group, std::string_view msg)
     {
         auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
         if (!conn || conn->closing) continue;
-        if (conn->write_queue.bytes() >= write_buffer_bytes())
-        {
-            conn->closing = true;
-            continue;
-        }
-        queue_send(conn, shared_msg, false, &ws_msg);
-        ++sent;
+        // The backlog bound is admit_send's, which records why a slow member was let go.
+        if (queue_send(conn, shared_msg, false, &ws_msg))
+            ++sent;
     }
     return sent;
 }
@@ -8009,22 +8092,16 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
         }
         else
         {
-            struct addrinfo hints{}, *addrs = nullptr;
-            hints.ai_family = AF_INET;
-            hints.ai_socktype = SOCK_STREAM;
-            char port_buf[8];
-            auto [pe, pec] = std::to_chars(port_buf, port_buf + sizeof(port_buf), port);
-            *pe = '\0';
-            if (getaddrinfo(host.c_str(), port_buf, &hints, &addrs) != 0 || !addrs)
+            // Resolved off the loop: while the answer is out this attempt fails and asks again shortly.
+            std::vector<socketley::async_resolver::address> found;
+            const auto st = m_resolver.lookup(host, AF_INET, found);
+            uc->resolving = st == socketley::async_resolver::state::pending;
+            if (st != socketley::async_resolver::state::ready ||
+                found.empty() || found.front().len != sizeof(struct sockaddr_in))
                 return false;
-            if (addrs->ai_addrlen == sizeof(struct sockaddr_in))
-            {
-                std::memcpy(&uc->cached_addr, addrs->ai_addr, sizeof(struct sockaddr_in));
-                uc->has_cached_addr = true;
-            }
-            freeaddrinfo(addrs);
-            if (!uc->has_cached_addr)
-                return false;
+            std::memcpy(&uc->cached_addr, &found.front().addr, sizeof(struct sockaddr_in));
+            uc->cached_addr.sin_port = htons(port);
+            uc->has_cached_addr = true;
         }
     }
 
@@ -8066,8 +8143,11 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
     // wedge this upstream connection for the life of the runtime.
     if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, uc->read_buf, sizeof(uc->read_buf), &uc->read_req)))
     {
+        // No completion will ever come to take this socket down, so it goes now and the backoff dials again.
         uc->read_pending = false;
-        uc->closing = true;
+        uc->connected = false;
+        upstream_disconnect(uc);
+        return true;
     }
 
     // The callback does NOT fire here, and neither does `established`.  A
@@ -8135,6 +8215,13 @@ void server_instance::upstream_schedule_reconnect(upstream_connection* uc)
     // at most once per second of backoff, and a literal address never reaches
     // the resolver.
     uc->has_cached_addr = false;
+    if (uc->resolving)
+    {
+        delay_sec = 0;
+        jitter_ms = 100;
+    }
+    else
+        m_resolver.forget(uc->target.resolved_host);
 
     uc->timeout_ts.tv_sec = delay_sec;
     uc->timeout_ts.tv_nsec = jitter_ms * 1000000LL;

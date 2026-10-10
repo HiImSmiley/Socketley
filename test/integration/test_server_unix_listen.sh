@@ -228,6 +228,17 @@ else fail "the server that owns the socket still has it" \
           "it answers '${STILL:-<nothing>}' after the refused start" \
           "a build that unlinks unconditionally takes the path away here"; fi
 
+# A file that is no socket is the operator's: the probe's ECONNREFUSED is the same for it as for a leftover node, and
+# reading it as one deleted whatever the path named.
+NOTES="$D/notes.txt"
+echo "keep me" > "$NOTES"
+"$BIN" create server ul_file --listen "unix:$NOTES" -s >/dev/null 2>&1 || true
+sleep 0.8
+if [ "$(cat "$NOTES" 2>/dev/null)" = "keep me" ]; then pass
+else fail "a regular file at the --listen path is left alone" \
+          "it now holds '$(cat "$NOTES" 2>/dev/null || echo '<gone>')'"; fi
+"$BIN" remove ul_file >/dev/null 2>&1 || true
+
 # ─── 6. The restore path applies the whole common list ──────────────────────
 #
 # Both of these ride on the same line of daemon.cpp: the restore used to carry

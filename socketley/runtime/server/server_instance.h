@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/async_resolver.h"
 #include "../../shared/conn_reachability.h"
 #include "../../shared/http_framing.h"
 #include <string>
@@ -588,6 +589,8 @@ struct upstream_connection
     // name once per attempt.
     struct sockaddr_in cached_addr{};
     bool has_cached_addr{false};
+    // The name is being looked up off the loop, so the next attempt comes in a tenth of a second and counts no backoff.
+    bool resolving{false};
 };
 
 #ifndef SOCKETLEY_NO_LUA
@@ -1424,6 +1427,8 @@ private:
     std::vector<std::unique_ptr<udp_recv_state>> m_udp_recv_spent;
     std::vector<udp_peer> m_udp_peers;
     std::unordered_map<uint64_t, int> m_udp_peer_idx;  // packed IP+port → index in m_udp_peers
+    // Where the next eviction's sample of the full table begins.
+    size_t m_udp_evict_hand{0};
     // Datagrams the socket refused, counted so the log can be throttled and
     // still say how many went unsaid.
     uint64_t m_udp_send_failures{0};
@@ -1433,7 +1438,10 @@ private:
         uint32_t failures{0};
         std::chrono::steady_clock::time_point last_failure{};
     };
-    std::unordered_map<uint32_t, auth_ip_record> m_auth_ip_failures;
+    std::unordered_map<uint64_t, auth_ip_record> m_auth_ip_failures;
+    static constexpr size_t max_auth_records = 65536;
+    // Who a failure is held against: the IPv4 address, or for a unix-socket peer its user id.
+    static uint64_t auth_peer_key(int fd);
 
     // HTTP static file serving
     std::filesystem::path m_http_dir;
@@ -1533,4 +1541,5 @@ private:
     std::unordered_map<int, std::unique_ptr<upstream_connection>> m_upstreams;     // conn_id → upstream
     std::unordered_map<int, upstream_connection*> m_upstream_by_fd;                // fd → upstream (CQE dispatch)
     int m_next_upstream_id{1};
+    socketley::async_resolver m_resolver;
 };
