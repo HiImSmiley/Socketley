@@ -98,6 +98,9 @@ public:
     // Returns: 1 = complete, 0 = want more data, -1 = error
     static int do_handshake(SSL* ssl);
 
+    // The inbound handshakes that failed since the last report, told once a minute is past; cheap when it is not.
+    static void report_inbound_failures();
+
     // Read decrypted data from SSL
     // Returns bytes read, 0 = want more data, -1 = error/closed
     static int ssl_read(SSL* ssl, char* buf, int len);

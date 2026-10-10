@@ -15,11 +15,18 @@
 #define SOCKETLEY_HAS_TLS 0
 #endif
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
+#include <mutex>
+#include <vector>
 
 #include "cert_keeper.h"
+#include "logging.h"
 
 // The TLS configuration gate, next to the OpenSSL wrapper because whoever
 // wires up the next role will be reading this file.
@@ -220,31 +227,91 @@ static const char* ssl_error_name(int err)
     }
 }
 
-// Drain OpenSSL's error queue to stderr, because the queue is per-thread and
-// persistent, so an entry left behind is reported as the cause of an unrelated
-// failure.
-static void log_ssl_errors(const char* what, int ssl_err = SSL_ERROR_NONE)
+// What OpenSSL queued, the queue emptied, because it is per-thread and persistent and an entry left behind is
+// reported as the cause of an unrelated failure: every error in full, and the first one's reason alone.
+struct ssl_failure
 {
+    std::string detail, brief;
+};
+static ssl_failure take_ssl_failure(int ssl_err = SSL_ERROR_NONE)
+{
+    ssl_failure f;
     char buf[256];
-    bool any = false;
     for (unsigned long e = ERR_get_error(); e != 0; e = ERR_get_error())
     {
+        if (f.brief.empty())
+        {
+            const char* r = ERR_reason_error_string(e);
+            f.brief = r ? r : "unknown";
+        }
         ERR_error_string_n(e, buf, sizeof(buf));
-        std::cerr << "[tls] " << what << ": " << buf << "\n";
-        any = true;
+        if (!f.detail.empty())
+            f.detail += "; ";
+        f.detail += buf;
     }
-    if (any)
-        return;
-
-    // An empty queue is itself information: SSL_ERROR_SYSCALL with nothing
-    // queued means the transport broke under OpenSSL rather than the protocol.
-    std::cerr << "[tls] " << what << ": no OpenSSL error queued";
+    if (!f.detail.empty())
+        return f;
+    // An empty queue is itself information: SSL_ERROR_SYSCALL with nothing queued means the transport broke under
+    // OpenSSL rather than the protocol.
+    f.detail = "no OpenSSL error queued";
     if (ssl_err != SSL_ERROR_NONE)
-        std::cerr << " (" << ssl_error_name(ssl_err) << ")";
+        f.detail += std::string(" (") + ssl_error_name(ssl_err) + ")";
     if (ssl_err == SSL_ERROR_SYSCALL)
-        std::cerr << " (transport: " << std::strerror(errno) << ")";
-    std::cerr << "\n";
+        f.detail += std::string(" (transport: ") + std::strerror(errno) + ")";
+    f.brief = ssl_err == SSL_ERROR_SYSCALL ? "closed before the handshake finished" : f.detail;
+    return f;
 }
+
+static void log_ssl_errors(const char* what, int ssl_err = SSL_ERROR_NONE)
+{
+    LOG_ERROR((std::string("tls: ") + what + ": " + take_ssl_failure(ssl_err).detail).c_str());
+}
+
+namespace
+{
+// Handshakes strangers failed, counted by reason and told once a minute, since anyone may open a port and most who
+// fail are scanners; each one in full only at debug.
+struct inbound_failures
+{
+    std::mutex mu;
+    std::map<std::string, uint64_t> by_reason;
+    uint64_t total{0};
+    std::chrono::steady_clock::time_point since{};
+};
+inbound_failures& inbound()
+{
+    static inbound_failures f;
+    return f;
+}
+// A minute, or SOCKETLEY_TLS_FAILURE_REPORT_SECS for a test that cannot wait one.
+std::chrono::seconds inbound_report_every()
+{
+    static const std::chrono::seconds every = []
+    {
+        const char* e = std::getenv("SOCKETLEY_TLS_FAILURE_REPORT_SECS");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0;
+        return std::chrono::seconds(v > 0 && v <= 3600 ? v : 60);
+    }();
+    return every;
+}
+constexpr size_t inbound_reasons_max = 16;
+
+void note_inbound_failure(const std::string& brief)
+{
+    {
+        auto& f = inbound();
+        std::lock_guard<std::mutex> lk(f.mu);
+        if (f.total == 0)
+            f.since = std::chrono::steady_clock::now();
+        ++f.total;
+        if (f.by_reason.size() < inbound_reasons_max || f.by_reason.count(brief))
+            ++f.by_reason[brief];
+        else
+            ++f.by_reason["other"];
+    }
+    tls_context::report_inbound_failures();
+}
+}   // namespace
 
 // Apply SSL_CTX options common to server and client, once, which every
 // per-connection SSL object inherits.
@@ -379,7 +446,7 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
     m_ctx = SSL_CTX_new(TLS_server_method());
     if (!m_ctx)
     {
-        std::cerr << "[tls] failed to create SSL context\n";
+        LOG_ERROR("tls: failed to create SSL context");
         log_ssl_errors("SSL_CTX_new");
         return false;
     }
@@ -408,7 +475,7 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
     // The chain, so a client is sent the intermediates a CA's certificate needs as well as the leaf.
     if (SSL_CTX_use_certificate_chain_file(m_ctx, std::string(cert_path).c_str()) <= 0)
     {
-        std::cerr << "[tls] failed to load certificate: " << cert_path << "\n";
+        LOG_ERROR((std::string("tls: failed to load certificate: ") + std::string(cert_path)).c_str());
         log_ssl_errors("certificate load");
         SSL_CTX_free(m_ctx);
         m_ctx = nullptr;
@@ -417,7 +484,7 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
 
     if (SSL_CTX_use_PrivateKey_file(m_ctx, std::string(key_path).c_str(), SSL_FILETYPE_PEM) <= 0)
     {
-        std::cerr << "[tls] failed to load private key: " << key_path << "\n";
+        LOG_ERROR((std::string("tls: failed to load private key: ") + std::string(key_path)).c_str());
         log_ssl_errors("private key load");
         SSL_CTX_free(m_ctx);
         m_ctx = nullptr;
@@ -426,7 +493,7 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
 
     if (!SSL_CTX_check_private_key(m_ctx))
     {
-        std::cerr << "[tls] private key does not match certificate\n";
+        LOG_ERROR("tls: private key does not match certificate");
         log_ssl_errors("private key check");
         SSL_CTX_free(m_ctx);
         m_ctx = nullptr;
@@ -438,7 +505,7 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
     {
         if (SSL_CTX_load_verify_locations(m_ctx, std::string(client_ca).c_str(), nullptr) <= 0)
         {
-            std::cerr << "[tls] failed to load client CA: " << client_ca << "\n";
+            LOG_ERROR((std::string("tls: failed to load client CA: ") + std::string(client_ca)).c_str());
             log_ssl_errors("client CA load");
             SSL_CTX_free(m_ctx);
             m_ctx = nullptr;
@@ -450,7 +517,7 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
     cert_keeper::watch(this, cert_path, key_path);
     return true;
 #else
-    std::cerr << "[tls] OpenSSL not available -- rebuild with OpenSSL development headers\n";
+    LOG_ERROR("tls: OpenSSL not available -- rebuild with OpenSSL development headers");
     return false;
 #endif
 }
@@ -499,7 +566,7 @@ bool tls_context::init_client(std::string_view ca_path,
     m_ctx = SSL_CTX_new(TLS_client_method());
     if (!m_ctx)
     {
-        std::cerr << "[tls] failed to create SSL context\n";
+        LOG_ERROR("tls: failed to create SSL context");
         log_ssl_errors("SSL_CTX_new");
         return false;
     }
@@ -519,7 +586,7 @@ bool tls_context::init_client(std::string_view ca_path,
     {
         if (SSL_CTX_load_verify_locations(m_ctx, std::string(ca_path).c_str(), nullptr) <= 0)
         {
-            std::cerr << "[tls] failed to load CA file: " << ca_path << "\n";
+            LOG_ERROR((std::string("tls: failed to load CA file: ") + std::string(ca_path)).c_str());
             log_ssl_errors("CA file load");
             SSL_CTX_free(m_ctx);
             m_ctx = nullptr;
@@ -538,7 +605,7 @@ bool tls_context::init_client(std::string_view ca_path,
     {
         if (SSL_CTX_use_certificate_file(m_ctx, std::string(client_cert).c_str(), SSL_FILETYPE_PEM) <= 0)
         {
-            std::cerr << "[tls] failed to load client certificate: " << client_cert << "\n";
+            LOG_ERROR((std::string("tls: failed to load client certificate: ") + std::string(client_cert)).c_str());
             log_ssl_errors("client certificate load");
             SSL_CTX_free(m_ctx);
             m_ctx = nullptr;
@@ -546,7 +613,7 @@ bool tls_context::init_client(std::string_view ca_path,
         }
         if (SSL_CTX_use_PrivateKey_file(m_ctx, std::string(client_key).c_str(), SSL_FILETYPE_PEM) <= 0)
         {
-            std::cerr << "[tls] failed to load client key: " << client_key << "\n";
+            LOG_ERROR((std::string("tls: failed to load client key: ") + std::string(client_key)).c_str());
             log_ssl_errors("client key load");
             SSL_CTX_free(m_ctx);
             m_ctx = nullptr;
@@ -556,7 +623,7 @@ bool tls_context::init_client(std::string_view ca_path,
 
     return true;
 #else
-    std::cerr << "[tls] OpenSSL not available -- rebuild with OpenSSL development headers\n";
+    LOG_ERROR("tls: OpenSSL not available -- rebuild with OpenSSL development headers");
     return false;
 #endif
 }
@@ -626,7 +693,7 @@ SSL* tls_context::create_ssl_client(std::string_view expected_hostname) const
     // argument rather than a skippable setter.
     if (expected_hostname.empty())
     {
-        std::cerr << "[tls] refusing client connection: no expected peer name given\n";
+        LOG_ERROR("tls: refusing client connection: no expected peer name given");
         return nullptr;
     }
 
@@ -664,7 +731,7 @@ SSL* tls_context::create_ssl_client(std::string_view expected_hostname) const
         // Fail rather than return a connection that would verify the chain and
         // not the name: a half-verified SSL here is the exact outcome this
         // function exists to prevent, and it would look identical to a good one.
-        std::cerr << "[tls] failed to pin expected peer name: " << name << "\n";
+        LOG_ERROR((std::string("tls: failed to pin expected peer name: ") + std::string(name)).c_str());
         log_ssl_errors("peer name setup");
         SSL_free(ssl);   // frees both memory BIOs with it
         return nullptr;
@@ -728,6 +795,31 @@ void tls_context::remember_session(std::string_view peer_name, SSL* ssl)
 #endif
 }
 
+void tls_context::report_inbound_failures()
+{
+#if SOCKETLEY_HAS_TLS
+    std::string line;
+    {
+        auto& f = inbound();
+        std::lock_guard<std::mutex> lk(f.mu);
+        const auto now = std::chrono::steady_clock::now();
+        if (f.total == 0 || now - f.since < inbound_report_every())
+            return;
+        std::vector<std::pair<std::string, uint64_t>> top(f.by_reason.begin(), f.by_reason.end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        const auto secs = std::chrono::duration_cast<std::chrono::seconds>(now - f.since).count();
+        line = "tls: " + std::to_string(f.total) + (f.total == 1 ? " inbound handshake" : " inbound handshakes") +
+               " failed in the last " + std::to_string(secs) + " s, a client that does not speak TLS here or a " +
+               "scanner most often:";
+        for (size_t i = 0; i < top.size() && i < 3; ++i)
+            line += (i ? ", " : " ") + top[i].first + " (" + std::to_string(top[i].second) + ")";
+        f.by_reason.clear();
+        f.total = 0;
+    }
+    LOG_INFO(line.c_str());
+#endif
+}
+
 int tls_context::do_handshake(SSL* ssl)
 {
 #if SOCKETLEY_HAS_TLS
@@ -742,11 +834,18 @@ int tls_context::do_handshake(SSL* ssl)
 
     // A rejected certificate reaches here as a generic protocol error, so the
     // verify result is reported too or an operator is left guessing.
-    long verify = SSL_get_verify_result(ssl);
-    if (verify != X509_V_OK)
-        std::cerr << "[tls] handshake failed: peer certificate rejected: "
-                  << X509_verify_cert_error_string(verify) << "\n";
-    log_ssl_errors("handshake failed", err);
+    const long verify = SSL_get_verify_result(ssl);
+    const std::string rejected = verify != X509_V_OK
+        ? std::string("peer certificate rejected: ") + X509_verify_cert_error_string(verify) + "; " : std::string();
+    const ssl_failure f = take_ssl_failure(err);
+    // One a stranger failed against a listener of ours is counted; one this side began is ours to fix and said now.
+    if (SSL_is_server(ssl))
+    {
+        LOG_DEBUG(("tls: inbound handshake failed: " + rejected + f.detail).c_str());
+        note_inbound_failure(verify != X509_V_OK ? std::string("client certificate rejected") : f.brief);
+        return -1;
+    }
+    LOG_WARN(("tls: handshake failed: " + rejected + f.detail).c_str());
     return -1;
 #else
     return -1;
@@ -774,7 +873,12 @@ int tls_context::ssl_read(SSL* ssl, char* buf, int len)
         return -1;
     }
 
-    log_ssl_errors("read failed", err);
+    // A peer that went away mid-record is the peer's business on a listener, and ours on a connection we made.
+    const ssl_failure f = take_ssl_failure(err);
+    if (SSL_is_server(ssl))
+        LOG_DEBUG(("tls: read failed: " + f.detail).c_str());
+    else
+        LOG_WARN(("tls: read failed: " + f.detail).c_str());
     return -1;
 #else
     return -1;
@@ -800,7 +904,11 @@ int tls_context::ssl_write(SSL* ssl, const char* buf, int len)
     if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
         return 0;
 
-    log_ssl_errors("write failed", err);
+    const ssl_failure f = take_ssl_failure(err);
+    if (SSL_is_server(ssl))
+        LOG_DEBUG(("tls: write failed: " + f.detail).c_str());
+    else
+        LOG_WARN(("tls: write failed: " + f.detail).c_str());
     return -1;
 #else
     return -1;
@@ -841,8 +949,8 @@ int tls_context::bio_write_in(SSL* ssl, const char* buf, int len)
     const long buffered = static_cast<long>(BIO_ctrl_pending(rbio));
     if (buffered + static_cast<long>(len) > max_bio_buffered)
     {
-        std::cerr << "[tls] inbound buffer limit exceeded (" << buffered << " + " << len
-                  << " > " << max_bio_buffered << " bytes unconsumed) -- dropping connection\n";
+        LOG_WARN(("tls: inbound buffer limit exceeded (" + std::to_string(buffered) + " + " + std::to_string(len) +
+                  " > " + std::to_string(max_bio_buffered) + " bytes unconsumed) -- dropping connection").c_str());
         return -1;
     }
 

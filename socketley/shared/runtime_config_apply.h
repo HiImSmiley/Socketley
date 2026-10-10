@@ -1,4 +1,5 @@
 #pragma once
+#include <string_view>
 // Applying a runtime_config to a live runtime in one place, because the daemon
 // restores from disk and a worker rebuilds from a config frame and the two
 // must agree field for field.
@@ -63,6 +64,13 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg);
 // how these fields say "not configured", so an unguarded assignment would let
 // an edit of one limit clear another.
 void apply_live_config(runtime_instance& rt, const runtime_config& cfg);
+
+// The configuration keys apply_live_config takes, as `show` and `import` name them, kept beside it so the dashboard
+// says which edits wait for a restart.
+inline constexpr std::string_view live_config_keys[] = {
+    "max_connections", "rate_limit", "global_rate_limit", "idle_timeout", "write_buffer", "read_buffer", "write_file",
+    "strategy", "health_interval", "health_path", "health_threshold", "circuit_threshold", "circuit_timeout",
+    "backend_timeout", "retry_count", "retry_all", "max_bytes"};
 
 // The fields belonging to one type, touching nothing that needs a
 // runtime_manager.

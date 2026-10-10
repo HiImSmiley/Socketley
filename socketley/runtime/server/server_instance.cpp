@@ -3008,7 +3008,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 // client, the symptom is connections failing at random and
                 // this line is what points at the cause.
                 if (hs_dropped > 0)
-                    LOG_WARN(("server \"" + std::string(get_name()) + "\": dropped " +
+                    LOG_INFO(("server \"" + std::string(get_name()) + "\": dropped " +
                               std::to_string(hs_dropped) + " connection(s) that did not "
                               "finish a TLS handshake within " +
                               std::to_string(tls_handshake_deadline_secs) + "s").c_str());

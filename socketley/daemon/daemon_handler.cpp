@@ -4370,7 +4370,8 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                 conn->write_buf = "cannot change cluster mode while running\n";
                 return 1;
             }
-            if (cfg.replicate_target != std::string(cache->get_replicate_target()))
+            // Asked only when the document names it, as every check above is: an edit of one limit leaves it out.
+            if (cfg.has("replicate_target") && cfg.replicate_target != std::string(cache->get_replicate_target()))
             {
                 conn->write_buf = "cannot change replication while running\n";
                 return 1;

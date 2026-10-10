@@ -60,6 +60,9 @@ code() { curl -s -o /dev/null -w '%{http_code}' -m 10 "$@"; }
 # ─── the schema ─────────────────────────────────────────────────────────────
 curl -s -X POST -c "$T/jar" -u "$ADMIN" "$U/api/session" >/dev/null
 curl -s -b "$T/jar" "$U/api/schema" > "$T/schema.json"
+# Which edits a running runtime takes at once, for the edit form to mark the rest.
+expect "the schema names what a running runtime takes at once" \
+    "$(python3 -c 'import json,sys; l=json.load(open(sys.argv[1])).get("live",[]); print("max_connections" in l, "port" in l)' "$T/schema.json")" "True False"
 missing=$(python3 - "$SRC" "$T/schema.json" <<'PY'
 import json, re, sys
 src, schema = open(sys.argv[1]).read(), json.load(open(sys.argv[2]))

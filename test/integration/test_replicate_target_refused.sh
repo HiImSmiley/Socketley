@@ -128,6 +128,14 @@ if [ "$(send_to "$FOLLOWER" 'get repllive')" = "afterattach" ]; then pass
 else fail "a live write still reaches the follower" \
           "got: '$(send_to "$FOLLOWER" 'get repllive')'"; fi
 
+# An edit of a limit names no leader, and is no change of replication.
+RC=0; OUT=$(timeout 10 "$BIN" import rep_follower '{"max_connections": 77}' 2>&1) || RC=$?
+if [ "$RC" -eq 0 ]; then pass
+else fail "a running follower takes an edit that names no leader" "exit $RC: $OUT"; fi
+RC=0; OUT=$(timeout 10 "$BIN" import rep_follower '{"replicate_target": "127.0.0.1:1"}' 2>&1) || RC=$?
+if [ "$RC" -ne 0 ] && grep -q "cannot change replication while running" <<<"$OUT"; then pass
+else fail "and still refuses one that changes its leader" "exit $RC: $OUT"; fi
+
 # ─── A leader named rather than spelled in dotted quads ─────────────────────
 #
 # The manual offers "--replicate host:port" and connect_to_master() asked

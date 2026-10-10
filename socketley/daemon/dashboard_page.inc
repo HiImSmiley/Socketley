@@ -542,7 +542,10 @@ function logLine(l, withRt) {
   return el('div', { class: l.lv }, el('span', { class: 'dim', text: t.toLocaleTimeString() + ' ' }), withRt && l.rt ? el('span', { class: 'rt', text: l.rt }) : null, el('span', { text }));
 }
 // New lines into `box`, from where `st.logNext` says; kept to `keep`, following the bottom unless scrolled away.
-async function tailInto(box, st, runtime, keep, level, text) {
+// What strangers on the internet cause on any open port: failed TLS handshakes, connections that never finished
+// one, and request heads that stopped arriving.
+const NOISE = /inbound handshakes? failed in the last|did not finish a TLS handshake within|answered 408 to \d+ connection/;
+async function tailInto(box, st, runtime, keep, level, text, quiet) {
   if (!box || st.logBusy) return;
   st.logBusy = true;
   try {
@@ -550,7 +553,7 @@ async function tailInto(box, st, runtime, keep, level, text) {
     st.logNext = d.next;
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
     const q = (text || '').toLowerCase();
-    for (const l of d.lines) if (!q || l.text.toLowerCase().includes(q)) box.append(logLine(l, !runtime));
+    for (const l of d.lines) if ((!q || l.text.toLowerCase().includes(q)) && !(quiet && NOISE.test(l.text))) box.append(logLine(l, !runtime));
     while (box.childElementCount > keep) box.firstElementChild.remove();
     if (!box.childElementCount) box.append(el('div', { class: 'dim', text: 'Nothing logged yet.' }));
     else if (box.firstElementChild.classList.contains('dim') && box.firstElementChild.textContent === 'Nothing logged yet.' && box.childElementCount > 1) box.firstElementChild.remove();
@@ -672,16 +675,20 @@ function logsView() {
   rt.value = view.runtime || '';
   const lv = el('select', { class: 'inp' }, el('option', { value: '', text: 'Every line' }), el('option', { value: 'warn', text: 'Warnings and errors' }), el('option', { value: 'error', text: 'Errors' }));
   const q = el('input', { class: 'inp', placeholder: 'Find in the log', spellcheck: 'false' });
+  const quiet = el('input', { type: 'checkbox' }); quiet.checked = localStorage.getItem('skl-dash-quiet') !== '0';
+  const quietRow = el('div', { class: 'swrow', title: 'Failed TLS handshakes, connections that never finished one and request heads that stopped arriving: what scanners cause on any open port' },
+    el('label', { class: 'sw' }, quiet, el('i')), el('span', { class: 'h', text: 'Hide scanner noise' }));
   const box = el('div', { class: 'log' });
   const restart = () => { box.textContent = ''; st.logNext = 0; tick(); };
   rt.onchange = () => { view.runtime = rt.value; history.replaceState(null, '', '#/logs' + (rt.value ? '/' + encodeURIComponent(rt.value) : '')); restart(); };
   lv.onchange = restart; q.oninput = () => { clearTimeout(st.qt); st.qt = setTimeout(restart, 250); };
+  quiet.onchange = () => { try { localStorage.setItem('skl-dash-quiet', quiet.checked ? '1' : '0'); } catch (e) {} restart(); };
   const pause = btn('stop', 'Pause', () => { st.paused = !st.paused; pause.querySelector('span').textContent = st.paused ? 'Follow' : 'Pause'; if (!st.paused) tick(); }, 'sm');
   C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('text')), el('span', { text: 'Log' }), el('span', { class: 'n', text: 'the daemon and every runtime, newest at the bottom' }))),
-    el('div', { class: 'logbar' }, rt, lv, q, pause), box);
+    el('div', { class: 'logbar' }, rt, lv, q, quietRow, pause), box);
   const tick = async () => {
     if (logState !== st || view.at !== 'logs') return;
-    if (!st.paused) await tailInto(box, st, rt.value, 2000, lv.value, q.value);
+    if (!st.paused) await tailInto(box, st, rt.value, 2000, lv.value, q.value, quiet.checked);
     clearTimeout(st.t); st.t = setTimeout(tick, 2000);
   };
   tick();
@@ -788,23 +795,61 @@ function label(k) {
 async function editDlg(r) {
   let conf;
   try { const x = await run('show', r.name); if (x.code) throw new Error(x.out); conf = JSON.parse(x.out); } catch (e) { fail(e); return; }
-  const fields = form(r.type, conf, true);
+  const running = r.state === 'running';
+  const fields = form(r.type, conf, true, running);
+  const LIVE = new Set((schema && schema.live) || []);
   const raw = el('textarea', { class: 'inp', spellcheck: 'false' }); raw.value = JSON.stringify(conf, null, 2);
   const rawBox = el('div', { hidden: true }, el('p', { class: 'mut', style: 'font-size:12.5px', text: 'The whole configuration as import takes it. What a running runtime cannot change while it runs is refused: stop it first.' }), raw);
   let rawOn = false;
   const toggle = btn(null, 'JSON', () => { rawOn = !rawOn; rawBox.hidden = !rawOn; fields.box.hidden = rawOn; toggle.querySelector('span').textContent = rawOn ? 'Form' : 'JSON'; }, '');
-  const save = async () => {
-    let doc;
-    if (rawOn) { try { doc = JSON.parse(raw.value); } catch (e) { toast('That is no JSON: ' + e.message, 'bad'); return; } }
-    else { doc = fields.changes(); if (!Object.keys(doc).length) { L.close(); return; } }
-    if (await act(['import', r.name, JSON.stringify(doc)], r.name + ' saved')) { L.close(); poll(); if (view.at === 'rt') detail(true); }
+  const done = msg => { toast(msg); L.close(); poll(); if (view.at === 'rt') detail(true); };
+  const doc = () => {
+    if (rawOn) { try { return JSON.parse(raw.value); } catch (e) { toast('That is no JSON: ' + e.message, 'bad'); return null; } }
+    return fields.changes();
   };
-  const L = modal('Edit ' + r.name, [el('p', { class: 'mut', style: 'font-size:12.5px;margin-top:0', text: 'Only what you change is sent. Some settings take effect at the next start.' }), fields.box, rawBox], [toggle, el('span', { style: 'flex:1' }), btn(null, 'Cancel', () => L.close()), btn(null, 'Save', save, 'pri')], true);
+  // Stopped, saved and started again, for what a running runtime refuses or takes only at a start.
+  const cycle = async d => {
+    const out = await run('stop', r.name);
+    if (out.code) { toast((out.out || 'Stop failed').trim(), 'bad', 7000); return; }
+    const imp = await run('import', r.name, JSON.stringify(d));
+    const st = await run('start', r.name);
+    if (imp.code) { toast('Not saved: ' + (imp.out || '').trim() + (st.code ? '' : ' (started again as it was)'), 'bad', 9000); poll(); return; }
+    if (st.code) { toast('Saved, and it did not start again: ' + (st.out || '').trim(), 'bad', 9000); poll(); return; }
+    done(r.name + ' saved and restarted');
+  };
+  const save = async restart => {
+    const d = doc(); if (!d) return;
+    if (!Object.keys(d).length) { L.close(); return; }
+    if (restart && running) return cycle(d);
+    const out = await run('import', r.name, JSON.stringify(d));
+    if (!out.code) {
+      const later = running ? Object.keys(d).filter(k => !LIVE.has(k)) : [];
+      if (!later.length) return done(r.name + ' saved');
+      // Saved, and some of it waits for a start: offered now rather than left to be found later.
+      if (await ask({ title: 'Restart ' + r.name + ' now?', text: 'Saved. ' + later.join(', ') + (later.length === 1 ? ' takes' : ' take') + ' effect at the next start; a restart drops its connections.', ok: 'Restart now' })) {
+        const a = await run('stop', r.name), b = a.code ? a : await run('start', r.name);
+        if (b.code) { toast((b.out || 'Restart failed').trim(), 'bad', 7000); poll(); return; }
+        return done(r.name + ' saved and restarted');
+      }
+      return done(r.name + ' saved; the rest at its next start');
+    }
+    const why = (out.out || 'Failed').trim();
+    // What a running runtime may not change is offered as a stop, a save and a start.
+    if (running && /while running|stop it first|stop, import, and start/.test(why)) {
+      if (await ask({ title: 'Stop ' + r.name + ' to change this?', text: why.split('\n')[0] + '. It can be stopped, saved and started again now; its connections drop.', ok: 'Stop, save and start' })) return cycle(d);
+      return;
+    }
+    toast(why.split('\n').slice(0, 3).join(' '), 'bad', 7000);
+  };
+  const L = modal('Edit ' + r.name, [el('p', { class: 'mut', style: 'font-size:12.5px;margin-top:0', text: running ? 'Only what you change is sent. Limits take effect at once; a field marked restart waits for the next start, which Save & restart does now.' : 'Only what you change is sent; it takes effect at the next start.' }), fields.box, rawBox],
+    [toggle, el('span', { style: 'flex:1' }), btn(null, 'Cancel', () => L.close()), running ? btn('restart', 'Save & restart', () => save(true), '') : null, btn(null, 'Save', () => save(false), 'pri')], true);
 }
 
 // The fields of `type`, sectioned as the schema says; `conf` fills them for an edit.
-function form(type, conf, editing) {
+function form(type, conf, editing, running) {
   const box = el('div');
+  // What a running runtime takes at once; the rest of an edit waits for its next start, and says so.
+  const LIVE = new Set((schema && schema.live) || []);
   const vals = new Map();
   const sections = new Map();
   for (const f of schema.flags) {
@@ -844,7 +889,9 @@ function form(type, conf, editing) {
       }
       const initial = get();
       vals.set(f, { get, initial, key });
-      grid.append(el('label', { class: 'fld2', title: f.flag }, el('span', {}, el('b', { text: f.label, style: 'font-weight:600;color:var(--fg)' }), el('code', { class: 'dim', style: 'font-size:11px', text: f.flag })), input, f.kind !== 'switch' ? el('div', { class: 'h', text: f.help }) : null));
+      const later = editing && running && key && !LIVE.has(key);
+      grid.append(el('label', { class: 'fld2', title: f.flag }, el('span', {}, el('b', { text: f.label, style: 'font-weight:600;color:var(--fg)' }), el('code', { class: 'dim', style: 'font-size:11px', text: f.flag }),
+        later ? el('span', { class: 'chip', style: 'font-size:10.5px;margin-left:6px;padding:1px 7px', title: 'A running runtime takes this at its next start', text: key === 'lua_script' ? 'reload' : 'restart' }) : null), input, f.kind !== 'switch' ? el('div', { class: 'h', text: f.help }) : null));
     }
     box.append(head, grid);
   }

@@ -1,4 +1,5 @@
 #include "runtime_schema.h"
+#include "../shared/runtime_config_apply.h"
 
 #include <string_view>
 
@@ -206,7 +207,15 @@ const std::string& json()
                 o += ",\"hidden\":true";
             o += "}";
         }
-        o += "\n]}";
+        o += "\n],\"live\":[";
+        bool f3 = true;
+        for (std::string_view k : live_config_keys)
+        {
+            o += f3 ? "" : ",";
+            f3 = false;
+            quote(o, k);
+        }
+        o += "]}";
         return o;
     }();
     return out;

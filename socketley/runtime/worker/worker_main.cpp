@@ -21,6 +21,7 @@
 #include "../server/server_instance.h"
 #include "../client/client_instance.h"
 #include "../../shared/cert_keeper.h"
+#include "../../shared/tls_context.h"
 #include "../../shared/request_channel.h"
 #include "../../shared/endpoint_table.h"
 #include "../../shared/event_loop.h"
@@ -439,6 +440,8 @@ public:
                 m_rt->on_loop_turn();
                 // Certificates replaced on disk, and the runtime's own --acme renewals, for every type alike.
                 cert_keeper::tick();
+                // Strangers' failed handshakes, as one line a minute rather than one each.
+                tls_context::report_inbound_failures();
             }
 
             // A state the runtime reached on its own, reported as soon as it

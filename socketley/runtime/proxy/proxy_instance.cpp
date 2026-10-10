@@ -2508,7 +2508,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                     // nothing is said to the peer itself because there is no
                     // protocol yet to say it in.
                     if (hs_dropped > 0)
-                        LOG_WARN(("proxy \"" + std::string(get_name()) + "\": dropped " +
+                        LOG_INFO(("proxy \"" + std::string(get_name()) + "\": dropped " +
                                   std::to_string(hs_dropped) + " connection(s) that did not "
                                   "finish a TLS handshake within " +
                                   std::to_string(tls_handshake_deadline_secs) + "s").c_str());

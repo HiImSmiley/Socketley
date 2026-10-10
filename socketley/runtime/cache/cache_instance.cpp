@@ -1402,7 +1402,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                 // protocol yet to say it in -- so the log is the only record
                 // that this and not something else closed it.
                 if (hs_dropped > 0)
-                    LOG_WARN(("cache \"" + std::string(get_name()) + "\": dropped " +
+                    LOG_INFO(("cache \"" + std::string(get_name()) + "\": dropped " +
                               std::to_string(hs_dropped) + " connection(s) that did not "
                               "finish a TLS handshake within " +
                               std::to_string(tls_handshake_deadline_secs) + "s").c_str());
