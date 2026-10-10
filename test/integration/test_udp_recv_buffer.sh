@@ -79,7 +79,9 @@ sleep 1.2
 blast "$PB"
 sleep 2
 LIVE=$(msgs_of urb_c)
-if [ "${LIVE:-0}" -ge 5000 ]; then
+# A floor that a sender who sent nothing cannot reach, and not a rate: a sanitizer build's server took 2,232 and
+# 3,291 of the burst alone on the box, where a release build takes over 10,000.
+if [ "${LIVE:-0}" -ge 1000 ]; then
     ok "a server that is reading takes thousands of the burst ($LIVE of $BURST)"
 else
     bad "the fixture can fill a socket at all" \
