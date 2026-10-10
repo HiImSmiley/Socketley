@@ -129,13 +129,18 @@ end
 LUAEOF
 
 daemon_start "$BIN"
-"$BIN" create client c_plain -t "127.0.0.1:$P_PLAIN" --lua "$SOCKETLEY_TMPD/send.lua" -s >/dev/null 2>&1
-"$BIN" create client c_tls   -t "127.0.0.1:$P_TLS" --tls --lua "$SOCKETLEY_TMPD/send.lua" -s >/dev/null 2>&1
-# Long enough for the grace read above to have closed both records.
-sleep 6
+"$BIN" create client c_plain -t "127.0.0.1:$P_PLAIN" --lua "$SOCKETLEY_TMPD/send.lua" -s >/dev/null 2>&1 \
+    || bad "the plain client starts" "create c_plain failed"
+"$BIN" create client c_tls   -t "127.0.0.1:$P_TLS" --tls --lua "$SOCKETLEY_TMPD/send.lua" -s >/dev/null 2>&1 \
+    || bad "the --tls client starts" "create c_tls failed"
+# The listener writes each record once its grace read has closed it.
+for _ in $(seq 1 200); do
+    [ -s "$SOCKETLEY_TMPD/plain.bin" ] && [ -s "$SOCKETLEY_TMPD/tls.bin" ] && break
+    sleep 0.1
+done
 
 hexfirst() { [ -s "$1" ] && od -An -tx1 -N1 "$1" | tr -d ' \n' || echo "--"; }
-haspay()   { [ -s "$1" ] && grep -qa "$SECRET" "$1" && echo yes || echo no; }
+haspay()   { [ -s "$1" ] || { echo "nothing recorded"; return; }; grep -qa "$SECRET" "$1" && echo yes || echo no; }
 
 PLAIN_FIRST=$(hexfirst "$SOCKETLEY_TMPD/plain.bin")
 PLAIN_PAY=$(haspay   "$SOCKETLEY_TMPD/plain.bin")

@@ -100,8 +100,9 @@ static void tune_client_socket(int fd, bool udp)
     socket_tuning::keepalive_dead_peer(fd);
 }
 
-bool client_instance::try_connect()
+bool client_instance::try_connect(bool at_start)
 {
+    m_resolving = false;
     std::string host = "127.0.0.1";
     uint16_t port = get_port();
     if (port == 0)
@@ -208,34 +209,26 @@ bool client_instance::try_connect()
     }
 
     // Resolve hostname (supports both IPs and DNS names like Docker hostnames)
-    char port_str[8];
-    auto [pend, pec] = std::to_chars(port_str, port_str + sizeof(port_str), port);
-    *pend = '\0';
-
-    struct addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = m_udp ? SOCK_DGRAM : SOCK_STREAM;
-
-    struct addrinfo* result = nullptr;
-    if (getaddrinfo(host.c_str(), port_str, &hints, &result) != 0 || !result)
+    std::vector<socketley::async_resolver::address> found;
+    // At start the dial is waited for anyway, and a name that cannot resolve is a start that fails.
+    const auto st = at_start ? m_resolver.lookup_now(host, AF_INET, found)
+                             : m_resolver.lookup(host, AF_INET, found);
+    m_resolving = st == socketley::async_resolver::state::pending;
+    if (st != socketley::async_resolver::state::ready || found.empty() ||
+        found.front().len != sizeof(struct sockaddr_in))
     {
         close_tracked(m_conn->fd);
         m_conn->fd = -1;
         return false;
     }
 
-    int connect_ret = connect(m_conn->fd, result->ai_addr, result->ai_addrlen);
+    std::memcpy(&m_cached_addr, &found.front().addr, sizeof(m_cached_addr));
+    m_cached_addr.sin_port = htons(port);
+    m_cached_host = host;
+    m_cached_port = port;
+    m_has_cached_addr = true;
 
-    // Cache the resolved address for future reconnects
-    if (result->ai_addrlen == sizeof(struct sockaddr_in))
-    {
-        std::memcpy(&m_cached_addr, result->ai_addr, sizeof(m_cached_addr));
-        m_cached_host = host;
-        m_cached_port = port;
-        m_has_cached_addr = true;
-    }
-
-    freeaddrinfo(result);
+    int connect_ret = connect(m_conn->fd, reinterpret_cast<struct sockaddr*>(&m_cached_addr), sizeof(m_cached_addr));
 
     if (connect_ret < 0 && errno != EINPROGRESS)
     {
@@ -500,6 +493,9 @@ void client_instance::settle_stale(struct io_uring_cqe* cqe, io_request* req)
     else if (req == &m_conn->hs_req)
     {
         m_conn->hs_armed = false;
+        // The deadline an earlier socket left standing kept this one from arming its own.
+        if (m_connected && m_conn->tls_state == tls_conn_handshake)
+            arm_handshake_deadline();
     }
 }
 
@@ -550,6 +546,20 @@ void client_instance::note_established()
 // refused submission means nothing will ever run again.
 bool client_instance::schedule_reconnect()
 {
+    // A name still being looked up is asked again shortly, whatever --reconnect says, since no dial has failed yet.
+    if (m_resolving && m_loop)
+    {
+        if (m_reconnect_pending)
+            return true;
+        m_conn->timeout_ts.tv_sec = 0;
+        m_conn->timeout_ts.tv_nsec = 100000000LL;
+        m_conn->timeout_req = { this, nullptr, -1, 0, op_timeout, m_conn_generation };
+        m_reconnect_pending = m_loop->submit_timeout(&m_conn->timeout_ts, &m_conn->timeout_req);
+        if (!m_reconnect_pending)
+            LOG_ERROR("client: the timer that waits for the target's name could not be submitted");
+        return m_reconnect_pending;
+    }
+
     int max = get_reconnect();
     if (max < 0 || !m_loop)
         return true; // Reconnect disabled: nothing to arm, nothing wrong
@@ -594,6 +604,8 @@ bool client_instance::schedule_reconnect()
     // affordable here and nowhere else: the backoff is at least a second, and
     // a literal address never reaches the resolver at all.
     m_has_cached_addr = false;
+    if (!m_cached_host.empty())
+        m_resolver.forget(m_cached_host);
     m_cached_host.clear();
     m_cached_port = 0;
 
@@ -688,7 +700,7 @@ bool client_instance::setup(event_loop& loop)
     // Needs the ring, because a multishot recv selects its buffer from one.
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_enabled();
 
-    if (!try_connect())
+    if (!try_connect(/*at_start=*/true))
     {
         // Checked, because "we'll connect later" is only true if the clock
         // that makes it later was actually armed.
@@ -860,8 +872,11 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
 
         if (is_provided)
         {
+            // Kept apart from m_loop, which a stop inside on_message nulls while the buffer is still owed to the
+            // group, as the stream path below keeps it.
+            event_loop* const ring = m_loop;
             uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-            buf_data = m_loop->get_buf_ptr(BUF_GROUP_ID, buf_id);
+            buf_data = ring->get_buf_ptr(BUF_GROUP_ID, buf_id);
             if (!buf_data)
                 goto resubmit;
 
@@ -875,7 +890,7 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
             if (!msg.empty())
                 process_message(msg);
 
-            m_loop->return_buf(BUF_GROUP_ID, buf_id);
+            ring->return_buf(BUF_GROUP_ID, buf_id);
         }
         else
         {
@@ -1151,7 +1166,9 @@ void client_instance::handle_timeout(struct io_uring_cqe* cqe, io_request* req)
     if (m_connected)
         return;
 
-    m_reconnect_attempt++;
+    // A poll for a name is no attempt, so it spends none of --reconnect.
+    if (!m_resolving)
+        m_reconnect_attempt++;
 
     if (try_connect())
         return; // Reconnected successfully
@@ -1341,8 +1358,16 @@ bool client_instance::start_tls()
 // spends half a minute on one.
 void client_instance::arm_handshake_deadline()
 {
-    if (!m_loop || !m_conn || m_conn->hs_armed)
+    if (!m_loop || !m_conn)
         return;
+    if (m_conn->hs_armed)
+    {
+        // An earlier socket's deadline is withdrawn, and its settling arms this one's.
+        if (m_conn->hs_req.generation != m_conn_generation && !m_loop->submit_timeout_remove(&m_conn->hs_req))
+            LOG_WARN("client: an earlier handshake deadline could not be withdrawn — this "
+                     "connection's own is armed when that one fires");
+        return;
+    }
 
     m_conn->hs_ts.tv_sec  = tls_handshake_deadline_secs;
     m_conn->hs_ts.tv_nsec = 0;

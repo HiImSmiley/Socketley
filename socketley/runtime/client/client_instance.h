@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/async_resolver.h"
 #include <atomic>
 #include <memory>
 #include <string>
@@ -135,7 +136,7 @@ private:
     // it.
     [[nodiscard]] bool schedule_reconnect();
 
-    bool try_connect();
+    bool try_connect(bool at_start = false);
     // The one place a read is armed, and only when one is not already armed;
     // poll_first says the read just completed left the socket empty.
     void arm_read(bool poll_first = false);
@@ -240,6 +241,9 @@ private:
     // DNS cache (avoids getaddrinfo on every reconnect)
     struct sockaddr_in m_cached_addr{};
     bool m_has_cached_addr{false};
+    // A reconnect looks the target's name up off the loop, and while the answer is out the dial is retried every tenth of a second.
+    socketley::async_resolver m_resolver;
+    bool m_resolving{false};
     std::string m_cached_host;
     uint16_t m_cached_port{0};
 

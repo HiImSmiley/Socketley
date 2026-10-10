@@ -159,12 +159,15 @@ else fail "and --reconnect's limit is reached rather than reset every dial" \
           "got: $(state_of hs_cli)"; fi
 
 # ─── The control, read last so it has had the whole run to be dropped ───────
-if ! grep -qE "failed" <<<"$(state_of hs_good)"; then pass
-else fail "a client on a real TLS listener is not dropped by the deadline" \
-          "got: $(state_of hs_good)" \
+# Up with one connection, because an absent row or a client that never connected also lacks "failed".
+GOOD=$(state_of hs_good)
+if grep -q " up " <<<"$GOOD" && [ "$(awk '{print $5}' <<<"$GOOD")" = "1" ]; then pass
+else fail "a client on a real TLS listener is connected and not dropped by the deadline" \
+          "got: ${GOOD:-<no row>}" \
           "a build that dropped every TLS client would pass everything above"; fi
-if ! grep -qE "failed" <<<"$(state_of hs_real)"; then pass
-else fail "and the listener it talks to is still up" "got: $(state_of hs_real)"; fi
+REALST=$(state_of hs_real)
+if grep -q " up " <<<"$REALST"; then pass
+else fail "and the listener it talks to is still up" "got: ${REALST:-<no row>}"; fi
 
 echo "  the silent target was dialled $A time(s); the client gave up $GAVE_UP"
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
