@@ -46,11 +46,16 @@ daemon_start "$BIN"
 serves(){ python3 -c "import socket,sys;socket.create_connection(('127.0.0.1',int(sys.argv[1])),timeout=2).close()" "$PORT" 2>/dev/null; }
 
 # Three attaches, each detached by the timeout, with the daemon idle in its wait.
+ATTACHED=0
 for _ in 1 2 3; do
     sleep 0.5
-    sudo -n timeout 1 strace -p "$SOCKETLEY_DPID" -e trace=none >/dev/null 2>&1 || true
+    rc=0; out=$(sudo -n timeout 1 strace -p "$SOCKETLEY_DPID" -e trace=none 2>&1 >/dev/null) || rc=$?
+    # The timeout ends a tracer that attached with 124; one that could not attach exits on its own.
+    if [ "$rc" = 124 ] && grep -q 'attached' <<<"$out"; then ATTACHED=$((ATTACHED+1)); fi
 done
 sleep 0.5
+if [ "$ATTACHED" = 3 ]; then pass
+else fail "tracer" "strace attached $ATTACHED of 3 times, so nothing below was traced" "$out"; fi
 if kill -0 "$SOCKETLEY_DPID" 2>/dev/null; then pass
 else fail "attach" "the daemon is gone after a tracer attached and detached" "$(tail -3 "$SOCKETLEY_DLOG")"; fi
 

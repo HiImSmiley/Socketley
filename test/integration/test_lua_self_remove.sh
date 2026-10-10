@@ -238,7 +238,9 @@ fi
 # until worker_startup_bound expired.  The two waits beside it already answer
 # on that condition: "waiting out the deadline for a corpse is the difference
 # between a refusal and a hang."
-if [ "$NEW_MS" -lt 1500 ]; then pass; else
+# The bound itself is the threshold, because a create that waits it out is
+# timed from before the deadline was set and cannot come in under 2000 ms.
+if [ "$NEW_MS" -lt 2000 ]; then pass; else
     fail "the create returns when the worker is gone, not at the startup bound" \
          "create -s took ${NEW_MS} ms" \
          "worker_startup_bound is 2000ms, and the answer was already decided"

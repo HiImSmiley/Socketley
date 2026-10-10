@@ -89,12 +89,20 @@ if [ "$GOT" = "2" ]; then ok; else
         "an empty answer is the old behaviour: the request never left the worker"
 fi
 
-DIRECT=$(redis-cli -p $((WA+0)) GET wd 2>/dev/null || true)
-if [ "$DIRECT" = "2" ] || [ -z "${DIRECT}" -a ! -x "$(command -v redis-cli || echo /nonexistent)" ]; then
+# Read on the cache's own port as an inline command, so the check needs no client that may not be installed; a --resp
+# cache answers a bulk string, whose value is the second line.
+DIRECT=$(python3 -c "
+import socket, sys
+s = socket.create_connection(('127.0.0.1', int(sys.argv[1])), 5)
+s.sendall(b'GET wd\r\n')
+f = s.makefile('rb')
+head = f.readline().strip()
+print(f.readline().strip().decode() if head.startswith(b'\$') and head != b'\$-1' else head.decode())" $((WA+0)) 2>/dev/null)
+if [ "$DIRECT" = "2" ]; then
     ok
 else
     bad "the write landed in the daemon's cache, not somewhere in the worker" \
-        "redis-cli read '$DIRECT'"
+        "the cache's own port read '$DIRECT'"
 fi
 
 # ── two workers, with the daemon only routing ───────────────────────────────

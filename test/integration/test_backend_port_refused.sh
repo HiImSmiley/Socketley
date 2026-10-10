@@ -41,6 +41,10 @@ fail() {
 
 echo "=== Integration: a backend port that cannot work is refused ==="
 
+if ! command -v curl >/dev/null 2>&1; then
+    echo "  SKIP: curl is required"; exit 0
+fi
+
 daemon_start "$BIN"
 P=$((SL_PORT_BASE + 850))
 
@@ -75,7 +79,13 @@ else fail "the log names the port as the problem" \
 BACKEND_PORT=$((P + 20))
 PROXY_PORT=$((P + 21))
 
-"$BIN" create server be_srv -p "$BACKEND_PORT" --mode inout -s >/dev/null 2>&1 || true
+WWW="$SOCKETLEY_TMPD/www"; mkdir -p "$WWW"
+printf 'BACKEND-%s\n' "$BACKEND_PORT" > "$WWW/index.html"
+RC=0
+OUT=$("$BIN" create server be_srv -p "$BACKEND_PORT" --http "$WWW" -s 2>&1) || RC=$?
+if [ "$RC" -eq 0 ]; then pass
+else fail "the control backend is created" \
+          "create server exited $RC" "said: ${OUT:-<nothing>}"; fi
 RC=0
 OUT=$("$BIN" create proxy good_px -p "$PROXY_PORT" \
         --backend "127.0.0.1:$BACKEND_PORT" -s 2>&1) || RC=$?
@@ -84,12 +94,17 @@ else fail "an ordinary backend is still accepted" \
           "create exited $RC for a perfectly good address" \
           "said: ${OUT:-<nothing>}"; fi
 
-# And it is actually listening, which "create exited 0" does not prove.
-sleep 0.5
-if timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$PROXY_PORT" 2>/dev/null; then pass
-else fail "the accepted proxy is listening" \
-          "nothing accepted a connection on $PROXY_PORT" \
-          "a create that returns 0 without a listener is the failure this" \
+# And it actually reaches the backend, which "create exited 0" and a listening port do not prove.
+BODY=""
+for _ in $(seq 1 30); do
+    BODY=$(curl -s --max-time 2 "http://127.0.0.1:$PROXY_PORT/good_px/" 2>/dev/null || true)
+    [[ "$BODY" == *"BACKEND-$BACKEND_PORT"* ]] && break
+    sleep 0.2
+done
+if [[ "$BODY" == *"BACKEND-$BACKEND_PORT"* ]]; then pass
+else fail "the accepted proxy serves through its backend" \
+          "GET /good_px/ on $PROXY_PORT answered '${BODY:-<nothing>}', not the backend's page" \
+          "a create that returns 0 without a working path is the failure this" \
           "whole file is about, in the other direction."; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

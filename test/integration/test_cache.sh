@@ -98,15 +98,8 @@ assert_eq "$(send_cmd 'ttl ttlkey')" "-1" "TTL after PERSIST"
 # Type conflict
 assert_eq "$(send_cmd 'set myset conflict')" "error: type conflict" "type conflict"
 
-# Size
-SIZE=$(send_cmd 'size')
-TOTAL=$((TOTAL+1))
-if [ "$SIZE" -gt 0 ] 2>/dev/null; then
-    PASS=$((PASS+1))
-else
-    FAIL=$((FAIL+1))
-    echo "  FAIL [SIZE]: got '$SIZE'"
-fi
+# Size: myset, user and ttlkey, since mykey was deleted and an emptied list is no key.
+assert_eq "$(send_cmd 'size')" "3" "SIZE"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

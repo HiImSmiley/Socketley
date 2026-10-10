@@ -99,7 +99,9 @@ EOF
         SOCKETLEY_SOCKET="$B_SOCK" "$SDK_BIN" daemon >"$SOCKETLEY_TMPD/b.log" 2>&1 &
         B_PID=$!
     else
-        echo "  (the SDK daemon did not build -- the second-daemon assertions are skipped)"
+        # g++ and the SDK archive are both here, so a failed compile is the SDK's regression and not the box's.
+        bad "the SDK daemon builds" "$(head -5 "$SOCKETLEY_TMPD/gxx.err")" \
+            "the second-daemon assertions did not run"
     fi
 else
     echo "  (no g++ or no libsocketley_sdk.a -- the second-daemon assertions are skipped)"
@@ -224,7 +226,8 @@ if [ -n "$SDK_BIN" ]; then
                 "kill(pid, 0) succeeds on a zombie; the state has to be read too"
         fi
     else
-        echo "  (the zombie daemon did not start -- that assertion is skipped)"
+        bad "the zombie daemon starts" "no pid in $SOCKETLEY_TMPD/cpid or it was already gone" \
+            "the zombie assertion did not run"
     fi
     kill -9 "$C_PARENT" 2>/dev/null
     wait "$C_PARENT" 2>/dev/null || true

@@ -222,6 +222,11 @@ publish m2
 # The cache is still up and still serving PUBLISH — that is the point of
 # publishing through it rather than through the daemon: the message was
 # delivered to the cache's own subscriber machinery whether or not any Lua ran.
+if said "NOSTART msg=m2" 6; then pass; else
+    fail "control: the publish after the stop is delivered" \
+         "stopsub_live, subscribed to the same channel, logged no 'NOSTART msg=m2' line" \
+         "so m2 never left the cache and the absence below says nothing"
+fi
 sleep 1
 AFTER=$(hits)
 if [ "$AFTER" = "$BEFORE" ]; then pass; else

@@ -193,7 +193,9 @@ workers() { pgrep -P "$SOCKETLEY_DPID" 2>/dev/null | wc -l | tr -d ' '; }
 # A cluster of one tells an unconfigured empty table apart from a runtime that
 # is not there, and needs no second daemon.
 mkdir -p "$SOCKETLEY_TMPD/cluster"
-"$BIN" daemon --name luaworker --cluster "$SOCKETLEY_TMPD/cluster" >/dev/null 2>&1 || true
+if ! CL_OUT=$("$BIN" daemon --name luaworker --cluster "$SOCKETLEY_TMPD/cluster" 2>&1); then
+    fail "setup: cluster discovery is on" "the daemon refused --name/--cluster" "$CL_OUT"
+fi
 
 create_ok "controller created in the daemon" "$BIN" create server ctl \
     -p "$CTL_PORT" --mode in --lua "$CTL_LUA" -s

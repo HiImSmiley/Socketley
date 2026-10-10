@@ -95,7 +95,12 @@ PY
 
 python3 "$TMPD/be.py" "$BE_PORT" >/dev/null 2>&1 &
 BEPID=$!
-ready_tcp 127.0.0.1 "$BE_PORT" 15 || { echo "  SKIP: backend did not start"; exit 0; }
+# A failure rather than a skip, because a backend that cannot bind its own port
+# is a broken setup and a skip would be counted as a pass.
+if ! ready_tcp 127.0.0.1 "$BE_PORT" 15; then
+    echo "  FAIL [setup]: the backend never listened on $BE_PORT; nothing was measured"
+    exit 1
+fi
 
 daemon_start "$BIN"
 DPID=$SOCKETLEY_DPID
@@ -110,20 +115,18 @@ create_ok "out-of-process proxy created" \
     "$BIN" create proxy "$PX_NAME" -p "$PX_PORT" --backend "127.0.0.1:$BE_PORT" \
     --protocol http -s
 
-# Found by executable identity rather than by name, because agents copy the
-# binary into their worktrees, and `proxy-worker` is the daemon's own argv for
-# the child rather than a user-typed string, so matching it cannot hit a shell.
+# Named by the daemon's own stats, because the unrelated server runs in a
+# proxy-worker of its own and a worker of another daemon on this binary matches
+# the argv as well.
 find_worker() {
-    local d p r=""
-    for d in /proc/[0-9]*; do
-        p=${d#/proc/}
-        [ "$p" = "$DPID" ] && continue
-        [ "/proc/$p/exe" -ef "$BIN" ] || continue
-        { tr '\0' '\n' < "/proc/$p/cmdline"; } 2>/dev/null \
-            | grep -x 'proxy-worker' >/dev/null || continue
-        r=$p
-    done
-    printf '%s' "$r"
+    local p
+    p=$("$BIN" stats "$PX_NAME" 2>/dev/null | sed -n 's/^pid:\(.*\)$/\1/p' | head -1)
+    [ -n "$p" ] || return 0
+    [ "/proc/$p/exe" -ef "$BIN" ] || return 0
+    [ "$(awk '{ print $4 }' "/proc/$p/stat" 2>/dev/null)" = "$DPID" ] || return 0
+    { tr '\0' '\n' < "/proc/$p/cmdline"; } 2>/dev/null \
+        | grep -x 'proxy-worker' >/dev/null || return 0
+    printf '%s' "$p"
 }
 for _ in $(seq 1 60); do WPID=$(find_worker); [ -n "$WPID" ] && break; sleep 0.25; done
 
@@ -151,6 +154,10 @@ hex_port() { printf '%04X' "$1"; }
 SRV_HEX=$(hex_port "$SRV_PORT")
 PX_HEX=$(hex_port "$PX_PORT")
 
+# Both TCP tables, because a leaked IPv6 listener appears only in tcp6.
+TCP_TABLES=(/proc/net/tcp)
+[ -r /proc/net/tcp6 ] && TCP_TABLES+=(/proc/net/tcp6)
+
 # What the worker holds, one line per descriptor, already classified.
 classify() {
     local f n t ino
@@ -162,8 +169,8 @@ classify() {
             socket:*)
                 ino=${t#socket:[}; ino=${ino%]}
                 # A TCP row first; a UNIX row if it is not TCP.
-                awk -v i="$ino" -v n="$n" 'NR>1 && $10==i {print n" tcp "$2" "$4; f=1}
-                                           END{if(!f) print ""}' /proc/net/tcp \
+                awk -v i="$ino" -v n="$n" 'FNR>1 && $10==i {print n" tcp "$2" "$4; f=1}
+                                           END{if(!f) print ""}' "${TCP_TABLES[@]}" \
                     | grep -v '^$' && continue
                 awk -v i="$ino" -v n="$n" '$7==i {print n" unix "$8" "$4}' /proc/net/unix
                 ;;

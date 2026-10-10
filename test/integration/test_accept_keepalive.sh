@@ -95,7 +95,7 @@ for i in $(seq 1 100); do [ -S "$SOCK_UNIX" ] && break; sleep 0.1; done
 if [ -S "$SOCK_UNIX" ]; then ok; else
     bad "a unix-listening server still starts" "no socket at $SOCK_UNIX"
 fi
-if "$BIN" ls | grep -q "ux"; then ok; else
+if "$BIN" ls 2>&1 | awk '$2 == "ux" && $3 == "server" && /Up / { f=1 } END { exit !f }'; then ok; else
     bad "the unix-listening server is up" "$("$BIN" ls)"
 fi
 

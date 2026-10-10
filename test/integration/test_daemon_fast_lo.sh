@@ -289,6 +289,10 @@ fi
 
 attached(){
     if grep -q 'fast-lo: unavailable' "$SOCKETLEY_DLOG"; then
+        # Only a refusal the environment explains is a skip; any other is the attach path failing.
+        if ! grep 'fast-lo: unavailable' "$SOCKETLEY_DLOG" | grep -qE 'no CAP_|needs cgroup v2|no SO_NETNS_COOKIE|Function not implemented|Operation not supported'; then
+            fail "attach" "with the capabilities set the shortcut attaches, or names an environment reason" "$(grep 'fast-lo' "$SOCKETLEY_DLOG")"
+        fi
         echo "  SKIP: the shortcut did not attach here: $(grep 'fast-lo' "$SOCKETLEY_DLOG")"
         echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
         [ "$FAIL" = 0 ] && exit 0 || exit 1
@@ -525,9 +529,9 @@ PY
     touch "$WORK/nsready"
     wait "$HCPID" 2>/dev/null || true; HCPID=""
     HOST=$(cat "$WORK/host.out" 2>/dev/null)
-    if [ "$HOST" = "host ok" ] && [ "${E1:-0}" = "${E2:-1}" ]; then pass
-    else fail "netns guard" "a pair in another netns with our tuple must not enter, and the host pair is intact" \
-        "host: $HOST  entered before ns: ${E1:-?}  after: ${E2:-?} (must be equal)"; fi
+    if [ "$HOST" = "host ok" ] && grep -q '^ready$' "$WORK/ns.out" && [ "${E1:-0}" = "${E2:-1}" ]; then pass
+    else fail "netns guard" "a pair in another netns with our tuple connects and must not enter, and the host pair is intact" \
+        "host: $HOST  ns: $(cat "$WORK/ns.out" 2>/dev/null)  entered before ns: ${E1:-?}  after: ${E2:-?} (must be equal)"; fi
 else
     not_asserted "netns guard" "no ss, or no sudo -n unshare -n"
 fi

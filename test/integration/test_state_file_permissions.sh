@@ -112,8 +112,11 @@ if [ "$SECOND_UID" = "1" ]; then
                  "uid nobody read the file and it contains the master password" \
                  "the record also carries key_path and lua_script; the daemon" \
                  "restores runtimes from these files at startup" ;;
-        *"ermission denied"*|*"No such file"*)
+        *"ermission denied"*)
             pass ;;
+        *"No such file"*)
+            fail "another uid cannot read the password out of the record" \
+                 "uid nobody found no $REC to read, so the probe saw nothing" ;;
         *)
             echo "  NOTE: the second-uid probe could not run (${OUT%%$'\n'*})."
             echo "        Skipped, not passed.  Assertion 1 holds on its own:"

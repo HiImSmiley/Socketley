@@ -138,9 +138,10 @@ else fail "a runtime that was running is auto-started" \
 
 # The control.  Without it, a build that started everything on boot would pass
 # the assertion above while getting the field exactly as wrong.
-if [ "$DEAD" != "Up" ]; then pass
+# Listed in a state that is not up, since a runtime missing from ls is not up either.
+if [ "$DEAD" = "Stopped" ] || [ "$DEAD" = "Created" ]; then pass
 else fail "a runtime that was stopped stays stopped" \
-          "ls reports Up for wr_dead, which was stopped before the restart"; fi
+          "ls reports '${DEAD:-<nothing>}' for wr_dead, which was stopped before the restart"; fi
 
 # ─── 3. A record an older build damaged is repaired ─────────────────────────
 #

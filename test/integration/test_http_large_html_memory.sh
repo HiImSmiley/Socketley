@@ -93,7 +93,9 @@ peak_rss_kb_during() {   # url -> added KiB, and the response size on fd 3
     kill "$sampler" 2>/dev/null
     wait "$sampler" 2>/dev/null
     peak=$(sort -n "$WWW/samples" | tail -1)
-    awk -v p="${peak:-0}" -v b="${base:-0}" 'BEGIN { d = p - b; print (d > 0 ? d : 0) }'
+    # No baseline or no sample prints nothing, so the caller cannot read an unmeasured request as no growth.
+    [ -n "$base" ] && [ -n "$peak" ] || return 0
+    awk -v p="$peak" -v b="$base" 'BEGIN { d = p - b; print (d > 0 ? d : 0) }'
 }
 
 exec 3>"$WWW/curl_bin"
@@ -115,6 +117,13 @@ else
     bad "the request has to succeed before its memory means anything" \
         ".bin: ${BIN_CODE:-<none>} ${BIN_SIZE:-0} bytes, .html: ${HTML_CODE:-<none>} ${HTML_SIZE:-0} bytes," \
         "against a file of $FILE_BYTES"
+fi
+
+if [ -n "$BIN_PEAK" ] && [ -n "$HTML_PEAK" ]; then
+    ok "the worker's memory was sampled during both requests"
+else
+    bad "the worker's memory was sampled during both requests" \
+        "added .bin '${BIN_PEAK:-<none>}' .html '${HTML_PEAK:-<none>}' KiB -- an unread VmRSS is not zero growth"
 fi
 
 BIN_X=$(awk -v p="${BIN_PEAK:-0}" -v f="$FILE_BYTES" 'BEGIN{printf "%.2f", p*1024/f}')

@@ -120,6 +120,19 @@ else fail "an entry with no name is refused" "exit 0 for a nameless entry"; fi
 if grep -qi "name" <<<"$OUT"; then pass
 else fail "the refusal says the name is missing" "said: ${OUT:-<nothing>}"; fi
 
+# ─── A name with a space in it ──────────────────────────────────────────────
+# Sent as words, the second half was read as a flag, and the refusal named a flag nobody wrote instead of the name.
+cat > "$WORK/spaced.lua" <<EOF
+runtimes = {
+  { type = "server", name = "lc my", port = $((P + 21)) },
+}
+EOF
+RC=0
+OUT=$("$BIN" --lua "$WORK/spaced.lua" 2>&1) || RC=$?
+if [ "$RC" -ne 0 ] && grep -q "invalid runtime name: lc my" <<<"$OUT"; then pass
+else fail "a name with a space in it is refused as the name it is" \
+          "exit $RC, said: ${OUT:-<nothing>}; ls: $("$BIN" ls --name 2>/dev/null | tr '\n' ' ')"; fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi
 exit "$FAIL"

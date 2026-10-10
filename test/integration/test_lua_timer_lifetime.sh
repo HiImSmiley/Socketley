@@ -170,6 +170,8 @@ assert_eq "the replaced script's interval stops firing" "$V1_A" "$V1_B" \
 # such a timer delivers to clients of a runtime the operator has taken down.
 # runtime_instance::stop() severs them now, after on_stop, the same way it
 # already severed m_tick.
+V2_P=$(hits 'TMR V2 tick=' "$SOCKETLEY_DLOG")
+sleep 0.3
 V2_A=$(hits 'TMR V2 tick=' "$SOCKETLEY_DLOG")
 "$BIN" stop tmr >/dev/null 2>&1 || true
 sleep 0.8
@@ -192,9 +194,10 @@ assert_eq "stop cancels the script's interval" "$S_A" "$S_B" \
 
 # ...and it was genuinely running right up to the stop, so the flatness above
 # is the stop doing something rather than a timer that had already finished.
-if [ "$(( S_A - V2_A ))" -ge 0 ] && [ "$V2_A" -ge 3 ]; then pass; else
+# Three tenths of a second of a 60 ms interval is about five ticks, so a count that moved in them is a timer still running.
+if [ "$V2_A" -gt "$V2_P" ]; then pass; else
     fail "control: the interval was running when the stop arrived" \
-         "only $V2_A ticks before it" \
+         "$V2_P ticks and still $V2_A ticks 0.3s later, just before it" \
          "a timer that had already stopped makes every reading above flat for" \
          "a reason that has nothing to do with the fix"
 fi

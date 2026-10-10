@@ -168,8 +168,25 @@ else fail "a client dials the unix server" \
 
 # And the dial really is that socket: stopping the server drops the client's
 # connection.  (Reconnect is not configured, so the count stays down.)
-"$BIN" stop ur_cli >/dev/null 2>&1 || true
+cli_conns() { "$BIN" ls 2>/dev/null | awk '$2 == "ur_cli" { print $5 }'; }
+# The client's own count is published apart from the server's, so it is waited for as well.
+CLI_BEFORE=""
+for _i in $(seq 1 20); do
+    CLI_BEFORE=$(cli_conns)
+    [ "$CLI_BEFORE" = "1" ] && break
+    sleep 0.3
+done
 "$BIN" stop ur_usrv >/dev/null 2>&1 || true
+CLI_AFTER=""
+for _i in $(seq 1 20); do
+    CLI_AFTER=$(cli_conns)
+    [ "$CLI_AFTER" = "0" ] && break
+    sleep 0.3
+done
+if [ "$CLI_BEFORE" = "1" ] && [ "$CLI_AFTER" = "0" ]; then pass
+else fail "stopping the unix server drops the client's connection" \
+          "the client reported '$CLI_BEFORE' before the stop and '$CLI_AFTER' after, wanted 1 then 0"; fi
+"$BIN" stop ur_cli >/dev/null 2>&1 || true
 sleep 0.5
 
 # ─── 4. Each runtime's own incompatibilities, with their stated reasons ─────

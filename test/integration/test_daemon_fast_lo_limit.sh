@@ -253,6 +253,9 @@ if ! sudo -n setcap cap_bpf,cap_net_admin+ep "$CAPBIN" 2>/dev/null; then
     [ "$FAIL" = 0 ] && exit 0 || exit 1
 fi
 attached(){ if grep -q 'fast-lo: unavailable' "$SOCKETLEY_DLOG"; then
+    # Only a refusal the environment explains is a skip; any other is the attach path failing.
+    grep 'fast-lo: unavailable' "$SOCKETLEY_DLOG" | grep -qE 'no CAP_|needs cgroup v2|no SO_NETNS_COOKIE|Function not implemented|Operation not supported' ||
+        fail "attach" "with the capabilities set the shortcut attaches, or names an environment reason" "$(grep fast-lo "$SOCKETLEY_DLOG")"
     echo "  SKIP: the shortcut did not attach: $(grep fast-lo "$SOCKETLEY_DLOG")"
     echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"; [ "$FAIL" = 0 ] && exit 0 || exit 1; fi; }
 

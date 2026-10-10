@@ -117,9 +117,11 @@ done
 
 # A real client, judged on the handshake and not on any reply: the question is
 # whether the accept path let it in at all.
+# The output is read whole first, since grep -q ends early and pipefail then blames openssl.
 client() {  # port -> ok | refused
-    if timeout 8 openssl s_client -connect "127.0.0.1:$1" -brief </dev/null 2>&1 \
-       | grep -qiE "CONNECTION ESTABLISHED|Verification"; then echo ok; else echo refused; fi
+    local o
+    o=$(timeout 8 openssl s_client -connect "127.0.0.1:$1" -brief </dev/null 2>&1) || true
+    if grep -qiE "CONNECTION ESTABLISHED|Verification" <<<"$o"; then echo ok; else echo refused; fi
 }
 
 # ─── Arm one: the control ───────────────────────────────────────────────────

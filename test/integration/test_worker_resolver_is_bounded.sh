@@ -92,6 +92,8 @@ worker_on_port() {
 res_options_of() {
     local p=$1 entry
     [ -n "$p" ] || { echo "no-worker"; return; }
+    # An environment that cannot be read says so, rather than reading as one with no RES_OPTIONS.
+    [ -n "$(head -c1 "/proc/$p/environ" 2>/dev/null | tr -d '\0')" ] || { echo "unreadable"; return; }
     while IFS= read -r entry; do
         case "$entry" in
             RES_OPTIONS=*) printf '%s\n' "${entry#RES_OPTIONS=}"; return ;;

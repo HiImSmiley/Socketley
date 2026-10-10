@@ -289,6 +289,10 @@ GROWTH=$(( AFTER - BASE ))
 if [ -n "$SANITIZED" ]; then
     not_asserted "memory does not follow the body" \
         "RSS ${BASE}kB -> ${AFTER}kB, growth ${GROWTH}kB"
+# Both readings from the worker itself, since an unreadable one is 0 and 0 shows no growth.
+elif [ "${BASE:-0}" -le 0 ] || [ "${AFTER:-0}" -le 0 ]; then
+    bad "memory does not follow the body" \
+        "no RSS read from worker pid '${WPID:-<none>}': ${BASE}kB -> ${AFTER}kB"
 elif [ "$GROWTH" -lt 20480 ]; then
     ok
 else

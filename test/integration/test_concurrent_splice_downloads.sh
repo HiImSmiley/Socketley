@@ -206,7 +206,10 @@ if [ "$AFTER" -le $((BASE + 4)) ]; then ok; else
 # ─── 5. And they come back one at a time as well ────────────────────────────
 # Sequentially is where a leak accumulates fastest per unit of time, and it is
 # also the shape a keep-alive client has.
-run_downloads 1 60 >/dev/null
+# The downloads are judged too: sixty that all failed would leave the descriptors low as well.
+SEQ_OUT=$(run_downloads 1 60)
+if [ "$SEQ_OUT" = ok ]; then ok; else
+    bad "sixty sequential downloads arrive whole" "$SEQ_OUT"; fi
 sleep 1.5
 SEQ=$(fds)
 if [ "$SEQ" -le $((BASE + 4)) ]; then ok; else
@@ -218,19 +221,25 @@ if [ "$SEQ" -le $((BASE + 4)) ]; then ok; else
 # The path this change touches that no ordinary request reaches: the connection
 # is retired with a splice still in the ring, so the pipe cannot be freed at
 # once and has to be freed by the reap instead.
-timeout 90 python3 - "$P" <<'PYEOF' >/dev/null 2>&1 || true
+ABORTS=$(timeout 90 python3 - "$P" <<'PYEOF' 2>&1
 import socket, sys, time
 port = int(sys.argv[1])
+started = 0
 for _ in range(30):
     s = socket.create_connection(("127.0.0.1", port), 5)
     s.sendall(b"GET /f0.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     # Just enough to have the transfer running, then gone.
-    try:    s.recv(4096)
+    try:    started += len(s.recv(4096)) > 0
     except Exception: pass
     s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
     s.close()
     time.sleep(0.02)
+print(started)
 PYEOF
+)
+# An abort counts only once the transfer was running, or the reap below is never reached.
+if [ "$ABORTS" = 30 ]; then ok; else
+    bad "thirty downloads are aborted mid-transfer" "driver: ${ABORTS:-no output}"; fi
 sleep 2.5
 ABORTED=$(fds)
 if [ "$ABORTED" -le $((BASE + 4)) ]; then ok; else

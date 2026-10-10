@@ -36,8 +36,11 @@ pass(){ TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 fail(){ TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; for l in "${@:3}"; do echo "        $l"; done; }
 
 echo "=== Integration: the server closes after a websocket close handshake ==="
+if ! command -v gcc >/dev/null 2>&1; then
+    echo "  SKIP: no C compiler"; echo "  Results: 0/0 passed (0 failed)"; exit 0
+fi
 if ! gcc -O2 -o "$WORK/client" "$HERE/lib_ws_close_race.c" 2>"$WORK/cc.log"; then
-    echo "  SKIP: no C compiler"; cat "$WORK/cc.log"; echo "  Results: 0/0 passed (0 failed)"; exit 0
+    echo "  FATAL: the test's own client does not compile"; sed 's/^/         /' "$WORK/cc.log"; exit 2
 fi
 
 daemon_start "$BIN"
@@ -55,7 +58,9 @@ for i in $(seq 1 "$C"); do
     "$WORK/client" "$P" "$N" >"$WORK/got.$i" 2>"$WORK/ports.$i" &
     PIDS+=($!)
 done
-wait "${PIDS[@]}"
+# Each client waited on by itself, so one that crashed is counted rather than ending the file under set -e.
+CRASHED=0
+for pid in "${PIDS[@]}"; do wait "$pid" || CRASHED=$((CRASHED+1)); done
 cat "$WORK"/ports.* > "$WORK/ports"
 GOT=$(cat "$WORK"/got.* | awk '{s += $1} END {print s + 0}')
 sleep 0.5
@@ -69,6 +74,8 @@ TOT=$((C * N))
 echo "  $TOT close handshakes from $C clients: TIME-WAIT on the server's port $srv, on the clients' $cli"
 
 # ── 1. every handshake completed ────────────────────────────────────────────
+if [ "$CRASHED" -eq 0 ]; then pass
+else fail "every client runs to its end" "$CRASHED of $C exited non-zero"; fi
 if [ "$GOT" = "$TOT" ]; then pass
 else fail "every client gets its Close frame back" "$GOT of $TOT"; fi
 

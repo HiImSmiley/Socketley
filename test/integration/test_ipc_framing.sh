@@ -152,6 +152,34 @@ if [ "$TAIL" = 'trailing\n' ]; then pass
 else fail "a trailing newline is not part of the value" \
           "the client received [$TAIL], wanted [trailing\\n]"; fi
 
+# A line with no end is held no longer than a frame may be: past 16 MiB the connection is closed, and the daemon
+# answers the next one.
+ENDLESS=$(python3 - "$SOCKETLEY_SOCKET" <<'PYEOF'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.settimeout(10)
+piece = b"x" * (1 << 20)
+closed = False
+try:
+    for _ in range(40):
+        s.sendall(piece)
+except (BrokenPipeError, ConnectionResetError):
+    closed = True
+if not closed:
+    try:
+        closed = s.recv(1) == b""
+    except socket.timeout:
+        closed = False
+    except OSError:
+        closed = True
+print("closed" if closed else "kept")
+PYEOF
+)
+if [ "$ENDLESS" = closed ] && "$BIN" ls >/dev/null 2>&1; then pass
+else fail "a line with no end is not held without bound" \
+          "after 40 MiB with no newline the connection was ${ENDLESS:-<nothing>}, or the daemon stopped answering"; fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi
 exit "$FAIL"

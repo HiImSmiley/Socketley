@@ -107,18 +107,18 @@ else fail "the refusal points at the command that does take flags" \
 #
 # Load-bearing.  A build that refused every restart would pass both assertions
 # above.
-sleep 1.1
-BEFORE_UP=$(state_of cd_r1)
+pid_of() { "$BIN" stats "$1" 2>/dev/null | awk -F: '/^pid:/ {gsub(/[^0-9]/,"",$2); print $2}' | head -1; }
+BEFORE_PID=$(pid_of cd_r1)
 RC=0
 "$BIN" restart cd_r1 >/dev/null 2>&1 || RC=$?
 if [ "$RC" -eq 0 ]; then pass
 else fail "a plain restart still works" "exit $RC"; fi
 
-# It really went down and up: the uptime has to have reset.
-AFTER_UP=$(state_of cd_r1)
-if [ "$AFTER_UP" != "$BEFORE_UP" ]; then pass
+# It really went down and up: the worker is a new process, which a second boundary in an uptime string cannot fake.
+AFTER_PID=$(pid_of cd_r1)
+if [ -n "$BEFORE_PID" ] && [ -n "$AFTER_PID" ] && [ "$AFTER_PID" != "$BEFORE_PID" ]; then pass
 else fail "the restart actually cycled the runtime" \
-          "uptime is unchanged at '$AFTER_UP' — the stop/start did nothing"; fi
+          "worker pid '${BEFORE_PID:-<none>}' -> '${AFTER_PID:-<none>}' — the stop/start did nothing"; fi
 
 # A runtime that is not there is reported once, by name.
 RC=0

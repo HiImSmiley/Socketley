@@ -227,7 +227,11 @@ LUA="$SOCKETLEY_TMPD/rt.lua"
 cat > "$LUA" <<'EOF'
 function on_start() end
 EOF
-"$BIN" create server idlert -p $((PORT + N + 1)) --lua "$LUA" -s >/dev/null 2>&1
+if "$BIN" create server idlert -p $((PORT + N + 1)) --lua "$LUA" -s >/dev/null 2>&1; then
+    ok "the reload runtime is created"
+else
+    bad "the reload runtime was not created, so the reload below would time a refusal"
+fi
 sleep 1
 
 # The bound is on what the reload adds to one CLI round trip, because under
@@ -240,12 +244,15 @@ done
 RT_MS=$(printf '%s\n' $RT | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
 
 # A median of three, each after a second's quiet so the worker is back in its idle wait.
-RL=""
+RL=""; RL_FAILED=0
 for _ in $(seq 1 3); do
     sleep 1
-    t0=$(date +%s%3N); "$BIN" reload-lua idlert >/dev/null 2>&1
+    t0=$(date +%s%3N); "$BIN" reload-lua idlert >/dev/null 2>&1 || RL_FAILED=$((RL_FAILED+1))
     RL="$RL $(( $(date +%s%3N) - t0 ))"
 done
+# A refused reload is fast and would pass the bound without the worker ever being woken.
+if [ "$RL_FAILED" -eq 0 ]; then ok "every reload-lua succeeded"
+else bad "$RL_FAILED of 3 reload-lua calls failed, so their timings measure a refusal"; fi
 RL_MS=$(printf '%s\n' $RL | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
 MS=$((RL_MS - RT_MS))
 echo "  reload-lua against an idle worker: median ${RL_MS} ms ($RL ), one stats round trip ${RT_MS} ms ($RT ), ${MS} ms added"

@@ -192,7 +192,11 @@ fi
 
 # A declined adoption must not leave the marker behind: it is not a decision,
 # and the next boot has to ask again.
-if [ -f "$(find "$HOME" -type d -name 'runtimes.*' 2>/dev/null | head -1)/.adopted" ]; then
+KEYED_DIR=$(find "$HOME" -type d -name 'runtimes.*' 2>/dev/null | head -1 || true)
+if [ -z "$KEYED_DIR" ]; then
+    bad "a declined adoption is provisional, not recorded as settled" \
+        "no keyed runtimes.* directory under $HOME, so there was no marker to look for"
+elif [ -f "$KEYED_DIR/.adopted" ]; then
     bad "a declined adoption is provisional, not recorded as settled" \
         "the .adopted marker was written for a decline" \
         "That makes the refusal permanent: once the daemon on $DEFAULT_SOCK is" \

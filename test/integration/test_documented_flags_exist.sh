@@ -42,12 +42,13 @@ while read -r flag; do
         --circuit|--health) continue ;;   # the stem of a \-\-x\-* glob
     esac
     TOTAL=$((TOTAL+1))
-    if grep -rqF -- "\"$flag\"" "$SRC" 2>/dev/null; then
+    # A parser's case label or comparison, not the name quoted in a comment, a message or a removed-flag table.
+    if grep -rqF -e "case fnv1a(\"$flag\")" -e "== \"$flag\"" -e "!= \"$flag\"" "$SRC" 2>/dev/null; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))
         echo "  FAIL: the manual names $flag and no parser answers to it"
-        echo "        (grep -rn -- '\"$flag\"' socketley/ is empty; either the"
+        echo "        (no 'case fnv1a(\"$flag\")' or '== \"$flag\"' in socketley/; either the"
         echo "         page means a different flag or the flag was removed)"
     fi
 done < <(grep -oE '\\-\\-[a-z0-9]+(\\-[a-z0-9]+)*' "$MAN" | sed 's/\\-/-/g' | sort -u)

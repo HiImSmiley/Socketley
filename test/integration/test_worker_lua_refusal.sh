@@ -233,7 +233,12 @@ fi
 # evidence that the supervisor listened and five would be the evidence that it
 # did not -- counted on the raise text, which the worker prints once per
 # attempt to load.
-REFUSALS=$(grep -c 'toplevel: a deliberate raise' "$SOCKETLEY_DLOG" 2>/dev/null) || REFUSALS=0
+# The health tick is every 2 s, so 4.5 s covers two chances to retry it.
+for _ in $(seq 1 45); do
+    REFUSALS=$(grep -c 'toplevel: a deliberate raise' "$SOCKETLEY_DLOG" 2>/dev/null) || REFUSALS=0
+    [ "$REFUSALS" -gt 1 ] && break
+    sleep 0.1
+done
 if [ "$REFUSALS" -eq 1 ]; then pass; else
     fail "a refused configuration is not retried" \
          "the worker refused $REFUSALS times, wanted exactly 1" \
@@ -282,10 +287,12 @@ except Exception: pass
 s.sendall(b'route\n');time.sleep(1.0);s.close()" "$1" 2>/dev/null || true; }
 
 poke "$RT_IN_PORT"      # the control: in the daemon, this must actually route
-poke "$RT_OOP_PORT"      # the worker: this must be refused by name
-sleep 0.8
-
-ROUTED=$(grep -c 'RT_TARGET_GOT_ONE' "$SOCKETLEY_DLOG" 2>/dev/null) || ROUTED=0
+poke "$RT_OOP_PORT"      # the worker: this must route as well
+for _ in $(seq 1 50); do
+    ROUTED=$(grep -c 'RT_TARGET_GOT_ONE' "$SOCKETLEY_DLOG" 2>/dev/null) || ROUTED=0
+    [ "$ROUTED" -ge 2 ] && break
+    sleep 0.1
+done
 if [ "$ROUTED" -ge 2 ]; then pass; else
     fail "self.route() in a worker reaches the target" \
          "the target reported $ROUTED routed connection(s), wanted 2" \

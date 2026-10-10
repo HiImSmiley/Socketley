@@ -40,6 +40,9 @@ bad() {
     for line in "${@:3}"; do echo "        $line"; done
 }
 
+# True as soon as the condition holds, false if it never did within 5 s.
+wait_for() { local _; for _ in $(seq 1 100); do eval "$1" && return 0; sleep 0.05; done; return 1; }
+
 PORT=$((SL_PORT_BASE+1340))
 daemon_isolate companionnode
 
@@ -57,7 +60,7 @@ WWW="$SOCKETLEY_TMPD/www"; mkdir -p "$WWW"
 printf '<h1>over-either</h1>\n' > "$WWW/index.html"
 
 "$BIN" create server cn_srv -p "$PORT" --http "$WWW" -s >/dev/null 2>&1
-sleep 1.5
+wait_for '[ -S "$NODE" ]'
 
 # ── 1. It exists, and it is as closed as the port it sits beside ───────────
 if [ -S "$NODE" ]; then ok "the node is there ($NODE)"
@@ -104,7 +107,7 @@ else bad "and so does the node" "got '$BYNODE'"; fi
 # ── 3. A proxy naming the runtime takes the node ───────────────────────────
 "$BIN" create proxy cn_name -p $((PORT+1)) --backend cn_srv           -s >/dev/null 2>&1
 "$BIN" create proxy cn_addr -p $((PORT+2)) --backend "127.0.0.1:$PORT" -s >/dev/null 2>&1
-sleep 1.5
+wait_for '[ "$(grep -c "is reached over $NODE" "$SOCKETLEY_DLOG" 2>/dev/null)" -ge 2 ]'
 
 proxied() {
     python3 -c "
@@ -135,8 +138,12 @@ else
 fi
 
 # ── 4. An address that is NOT a runtime stays TCP ──────────────────────────
-"$BIN" create proxy cn_else -p $((PORT+3)) --backend "127.0.0.1:$((PORT+9))" -s >/dev/null 2>&1
-sleep 0.8
+# The backend is resolved during startup, which -s waits for, so the log is complete once create returns.
+if "$BIN" create proxy cn_else -p $((PORT+3)) --backend "127.0.0.1:$((PORT+9))" -s >/dev/null 2>&1; then
+    ok "a proxy on an address no runtime publishes starts"
+else
+    bad "a proxy on an address no runtime publishes starts" "create failed, so the check below would read an empty log"
+fi
 ELSE_SAID=$(grep -c "127.0.0.1:$((PORT+9))\" is reached over" "$SOCKETLEY_DLOG" 2>/dev/null || true)
 if [ "${ELSE_SAID:-0}" -eq 0 ]; then
     ok "an address no runtime publishes stays an address"
@@ -152,7 +159,7 @@ fi
 
 # ── 5. Stopping takes the node with it ─────────────────────────────────────
 "$BIN" stop cn_srv >/dev/null 2>&1
-sleep 0.8
+wait_for '[ ! -e "$NODE" ]'
 if [ ! -e "$NODE" ]; then ok "stopping removes the node"
 else bad "stopping removes the node" "$NODE is still there; closing a descriptor does not unlink a path"; fi
 "$BIN" remove cn_srv >/dev/null 2>&1
@@ -160,12 +167,14 @@ else bad "stopping removes the node" "$NODE is still there; closing a descriptor
 # ── 6. The two runtimes that get none ──────────────────────────────────────
 OWNSOCK="$SOCKETLEY_TMPD/own.sock"
 "$BIN" create server cn_own --listen "unix:$OWNSOCK" --http "$WWW" -s >/dev/null 2>&1
-sleep 1
-if [ ! -e "$RTDIR/cn_own.sock" ]; then
+# Its own path bound is the runtime up, which is when a second one would have been.
+wait_for '[ -S "$OWNSOCK" ]'
+if [ -S "$OWNSOCK" ] && [ ! -e "$RTDIR/cn_own.sock" ]; then
     ok "a runtime already on a path gets no second one"
 else
     bad "a runtime already on a path gets no second one" \
-        "$RTDIR/cn_own.sock exists; there is no port for it to be beside"
+        "own path bound: $([ -S "$OWNSOCK" ] && echo yes || echo no), $RTDIR/cn_own.sock exists: $([ -e "$RTDIR/cn_own.sock" ] && echo yes || echo no);" \
+        "there is no port for it to be beside"
 fi
 
 # ── 6b. A cache gets a node too, and its proxy takes it ────────────────────
@@ -179,7 +188,7 @@ fi
 # without binding cannot pass.
 "$BIN" create cache  cn_kv -p $((PORT+7)) -s >/dev/null 2>&1
 "$BIN" create proxy  cn_kvpx -p $((PORT+8)) --backend cn_kv --protocol tcp -s >/dev/null 2>&1
-sleep 1.5
+wait_for '[ -S "$RTDIR/cn_kv.sock" ] && grep -q "cn_kv\" is reached over $RTDIR/cn_kv.sock" "$SOCKETLEY_DLOG" 2>/dev/null'
 KV_NODE=$([ -S "$RTDIR/cn_kv.sock" ] && echo yes || echo no)
 KV_SAID=$(grep -c "cn_kv\" is reached over $RTDIR/cn_kv.sock" "$SOCKETLEY_DLOG" 2>/dev/null || true)
 KV_ANSWERED=$(printf 'set nodek nodev\nget nodek\n' | timeout 5 nc -q1 127.0.0.1 $((PORT+8)) 2>/dev/null | tr -d '\r' | sed -n 2p)
@@ -196,7 +205,7 @@ if [ "$KV_MODE" = "600" ]; then ok "the cache's node is 0600 like the server's"
 else bad "the cache's node is 0600 like the server's" "node is $KV_MODE"; fi
 "$BIN" stop cn_kvpx >/dev/null 2>&1; "$BIN" remove cn_kvpx >/dev/null 2>&1
 "$BIN" stop cn_kv   >/dev/null 2>&1
-sleep 0.8
+wait_for '[ ! -e "$RTDIR/cn_kv.sock" ]'
 if [ ! -e "$RTDIR/cn_kv.sock" ]; then ok "stopping the cache removes its node"
 else bad "stopping the cache removes its node" "$RTDIR/cn_kv.sock is still there"; fi
 "$BIN" remove cn_kv   >/dev/null 2>&1
@@ -209,10 +218,14 @@ else bad "stopping the cache removes its node" "$RTDIR/cn_kv.sock is still there
 # 6b exists: a node published for a set that binds none is a backend down.
 "$BIN" create cache  cn_kvs -p $((PORT+10)) --shards 2 -s >/dev/null 2>&1
 "$BIN" create proxy  cn_kvspx -p $((PORT+11)) --backend cn_kvs --protocol tcp -s >/dev/null 2>&1
-sleep 1.5
+# The proxy answering is both shards up, and its backend was resolved and logged before -s returned.
+for _ in 1 2 3 4 5; do
+    KVS_ANSWERED=$(printf 'set shk shv\nget shk\n' | timeout 5 nc -q1 127.0.0.1 $((PORT+11)) 2>/dev/null | tr -d '\r' | sed -n 2p)
+    [ "$KVS_ANSWERED" = "shv" ] && break
+    sleep 0.3
+done
 KVS_NODE_GONE=$([ -e "$RTDIR/cn_kvs.sock" ] && echo no || echo yes)
 KVS_SAID=$(grep -c "cn_kvs\" is reached over" "$SOCKETLEY_DLOG" 2>/dev/null || true)
-KVS_ANSWERED=$(printf 'set shk shv\nget shk\n' | timeout 5 nc -q1 127.0.0.1 $((PORT+11)) 2>/dev/null | tr -d '\r' | sed -n 2p)
 if [ "$KVS_NODE_GONE" = "yes" ] && [ "${KVS_SAID:-0}" -eq 0 ] && [ "$KVS_ANSWERED" = "shv" ]; then
     ok "a sharded cache gets no node, and a proxy in front of it still answers"
 else
@@ -237,7 +250,7 @@ fi
 # them just as well and only the transport says which way they went.
 "$BIN" create server cn_srvs -p $((PORT+12)) --shards 4 --http "$WWW" -s >/dev/null 2>&1
 "$BIN" create proxy  cn_srvspx -p $((PORT+13)) --backend cn_srvs --protocol tcp -s >/dev/null 2>&1
-sleep 2
+wait_for '[ "$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)" -eq 4 ] && [ "$(grep -c "\"cn_srvs\" is reached over $RTDIR/cn_srvs#" "$SOCKETLEY_DLOG" 2>/dev/null)" -ge 4 ]'
 SRVS_NODES=$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)
 SRVS_ONE_GONE=$([ -e "$RTDIR/cn_srvs.sock" ] && echo no || echo yes)
 SRVS_REFUSED=$(grep -c "companion node $RTDIR/cn_srvs" "$SOCKETLEY_DLOG" 2>/dev/null || true)
@@ -314,7 +327,8 @@ fi
 "$BIN" stop cn_srvs >/dev/null 2>&1
 "$BIN" edit cn_srvs --shards 2 >/dev/null 2>&1
 "$BIN" start cn_srvs >/dev/null 2>&1
-sleep 2
+# The proxy saying it took #0 and #1 again is it having followed the restart.
+wait_for '[ "$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)" -eq 2 ] && [ "$(grep -c "\"cn_srvs\" is reached over $RTDIR/cn_srvs#[01].sock" "$SOCKETLEY_DLOG" 2>/dev/null)" -ge 4 ]'
 SRVS2_NODES=$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)
 SRVS2_STALE=$( { [ -e "$RTDIR/cn_srvs#2.sock" ] || [ -e "$RTDIR/cn_srvs#3.sock" ]; } && echo yes || echo no)
 SRVS2_ANSWERED=$(srvs_run $((PORT+13)) 16)
@@ -334,7 +348,7 @@ else
 fi
 "$BIN" stop cn_srvspx >/dev/null 2>&1; "$BIN" remove cn_srvspx >/dev/null 2>&1
 "$BIN" stop cn_srvs   >/dev/null 2>&1
-sleep 0.8
+wait_for '[ "$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)" -eq 0 ]'
 SRVS_LEFT=$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)
 if [ "$SRVS_LEFT" -eq 0 ]; then ok "stopping the sharded server removes every node"
 else bad "stopping the sharded server removes every node" "$SRVS_LEFT of them are still there; each shard unlinks its own"; fi
@@ -361,7 +375,7 @@ mkdir -p "$SOCKETLEY_SOCKET.rt"
 chmod 0777 "$SOCKETLEY_SOCKET.rt"
 daemon_start "$BIN"
 "$BIN" create server cn_open -p $((PORT+6)) --http "$WWW" -s >/dev/null 2>&1
-sleep 1.5
+wait_for 'grep -q "companion nodes are off" "$SOCKETLEY_DLOG" 2>/dev/null'
 OPEN_NODE="$SOCKETLEY_SOCKET.rt/cn_open.sock"
 OPEN_SAID=$(grep -c "companion nodes are off" "$SOCKETLEY_DLOG" 2>/dev/null || true)
 OPEN_PORT=$(get_tcp $((PORT+6)))

@@ -159,9 +159,13 @@ PYJSON
     refused "a planted pair refuses to START" "cannot be combined with --mode master" \
         "$BIN" start um_boot
 
-    # And it really did not come up.
-    if [ -z "$(worker_pid um_boot)" ]; then ok; else
-        bad "the planted runtime stayed down" "it has a pid"; fi
+    # And it really did not come up, read off a stats call that answered, since a failed one has no pid either.
+    ST=$("$BIN" stats um_boot 2>/dev/null) || ST=""
+    if ! grep -q '^name:um_boot' <<<"$ST"; then
+        bad "the planted runtime stayed down" "stats did not answer: '${ST:-<nothing>}'"
+    elif grep -q '^pid:' <<<"$ST"; then
+        bad "the planted runtime stayed down" "it has a pid"
+    else ok; fi
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

@@ -84,9 +84,10 @@ else fail "naming the table twice is refused, not merged" \
 
 # The refusal drops the whole table rather than half of it, because a file
 # read in part is the outcome this refusal exists to prevent.
+# The daemon has to answer that metrics are off, because a dashboard that failed outright also prints no port.
 OUT=$("$BIN" dashboard 2>&1 </dev/null || true)
-if ! grep -q "$((P + 3))" <<<"$OUT"; then pass
-else fail "a refused file sets nothing" "metrics still came up on $((P + 3))"; fi
+if grep -q "metrics endpoint not configured" <<<"$OUT" && ! grep -q "$((P + 3))" <<<"$OUT"; then pass
+else fail "a refused file sets nothing" "dashboard said: ${OUT:-<nothing>}"; fi
 
 daemon_stop
 unset SOCKETLEY_CONFIG

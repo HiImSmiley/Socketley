@@ -143,10 +143,8 @@ check "2 MB is refused with 1009, not dropped" "close-1009" "$(line over)"
 # And the refusal is in the log ONCE, with the limit in it: a read already in
 # flight when the first one tripped lands afterwards and used to say the same
 # thing twice.
-# grep -c prints 0 AND exits 1 when nothing matches, so `|| echo 0` appends a
-# second line and the comparison reads "0\n0" -- which fails for the right
-# reason and the wrong message.
-HITS=$(grep -c 'without a complete message' "$SOCKETLEY_DLOG" 2>/dev/null | head -1)
+# grep -c prints 0 and exits 1 when nothing matches, which set -e would end the file on, so its count is kept and its status is not.
+HITS=$(grep -c 'without a complete message' "$SOCKETLEY_DLOG" 2>/dev/null || true)
 HITS=${HITS:-0}
 check "and said once in the log"               "1"          "$HITS"
 if grep -q 'holds at most 1048576' "$SOCKETLEY_DLOG" 2>/dev/null; then

@@ -137,12 +137,19 @@ else fail "an ordinary two-name list still works" "stop exited $RC: ${OUT:-<noth
 
 # And exactly at the limit is not an overflow: the last slot then holds one
 # token and there is nothing merged into it.
-AT_LIMIT=$(python3 -c "print(' '.join('ov_a' for _ in range($LIMIT - 2)))")
+AT_LIMIT=$(python3 -c "print(' '.join('ov_a' for _ in range($LIMIT)))")
 RC=0
 OUT=$("$BIN" stop $AT_LIMIT 2>&1) || RC=$?
 if [ "$RC" -eq 0 ]; then pass
 else fail "a list that just fits is not treated as an overflow" \
           "stop exited $RC: ${OUT:-<nothing>}"; fi
+
+# One past it is, so the two cases above sit on either side of the same boundary.
+RC=0
+OUT=$("$BIN" stop $AT_LIMIT ov_a 2>&1) || RC=$?
+if [ "$RC" -ne 0 ] && grep -qi "too many arguments" <<<"$OUT"; then pass
+else fail "one argument past the limit is an overflow" \
+          "exit $RC, said: ${OUT:-<nothing>}"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi

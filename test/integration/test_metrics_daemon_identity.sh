@@ -91,7 +91,9 @@ kind = "string"
 default = "hello"
 EOF
     else
-        echo "  (the example worker did not build -- the registered-type assertions are skipped)"
+        # With the toolchain and the SDK both here, an example that does not build is the SDK broken.
+        bad "the example worker builds against this SDK" "g++ said: $(tail -3 "$SOCKETLEY_TMPD/gxx.err")" \
+            "the registered-type assertions below are skipped"
     fi
 else
     echo "  (no g++ or no libsocketley_sdk.a -- the registered-type assertions are skipped)"

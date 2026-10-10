@@ -93,16 +93,21 @@ esac
 # is the placeholder's short "worker_report:none" form, and measuring there
 # reads the report ARRIVING as growth -- 141 bytes then 251, on a tree with and
 # without the fix alike.
+# A report that names the runtime is required too, since an empty answer is no placeholder either.
 for _ in $(seq 1 60); do
-    "$BIN" stats sg_one 2>/dev/null | grep -q "worker_report:none" || break
+    R=$("$BIN" stats sg_one 2>/dev/null || true)
+    case "$R" in *worker_report:none*) ;; *"name:sg_one"*) break ;; esac
     sleep 0.25
 done
-if "$BIN" stats sg_one 2>/dev/null | grep -q "worker_report:none"; then
-    bad "the worker reported its stats" \
-        "still worker_report:none after 15s -- nothing below measures growth"
-else
-    ok
-fi
+R=$("$BIN" stats sg_one 2>/dev/null || true)
+case "$R" in
+    *worker_report:none*)
+        bad "the worker reported its stats" \
+            "still worker_report:none after 15s -- nothing below measures growth" ;;
+    *"name:sg_one"*) ok ;;
+    *)  bad "the worker reported its stats" \
+            "stats sg_one said '${R:-<nothing>}' -- nothing below measures growth" ;;
+esac
 
 RUN_A=$(size sg_one)
 sleep 12

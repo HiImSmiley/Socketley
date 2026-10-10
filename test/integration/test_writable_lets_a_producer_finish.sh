@@ -172,7 +172,9 @@ ready_tcp 127.0.0.1 "$P" >/dev/null 2>&1 || true
 
 # ─── 1. The runtime is serving and the field is there ───────────────────────
 PR=$(read_arm probe)
-if [ -n "$PR" ]; then ok; else bad "the server answers at all" "no reply from the probe arm"; fi
+# At least the eight bytes of PROBE-OK, since a listener that accepts and sends nothing also prints a line.
+PRB=$(printf '%s\n' "$PR" | sed -n 's/.*BYTES=\([0-9]*\).*/\1/p')
+if [ "${PRB:-0}" -ge 8 ]; then ok; else bad "the server answers at all" "the probe arm read '${PR:-nothing}'"; fi
 
 PL=$(grep -o 'WR probe .*' "$SOCKETLEY_DLOG" | tail -1) || true
 # 4 MiB, and asserted as a number rather than "not nil" -- a field that read

@@ -228,8 +228,10 @@ if [ -z "${FUZZ_CHILD:-}" ] && [ "$FUZZ_JOBS" -gt 1 ] && [ "${#TARGETS[@]}" -gt 
         # finish rather than the oldest, so a quick target does not hold a slot
         # behind a slow one.
         while [ "$(jobs -pr | wc -l)" -ge "$FUZZ_JOBS" ]; do wait -n 2>/dev/null || break; done
-        FUZZ_CHILD=1 FUZZ_TARGETS="$fz_t" bash "$0" "$SECS" "$CONFIG" \
-            >"$fz_dir/$fz_t.log" 2>&1 &
+        # Each child's exit status goes to a file, because the bare wait below discards it.
+        ( FUZZ_CHILD=1 FUZZ_TARGETS="$fz_t" bash "$0" "$SECS" "$CONFIG" \
+              >"$fz_dir/$fz_t.log" 2>&1
+          echo $? >"$fz_dir/$fz_t.rc" ) &
         echo "  started $fz_t"
     done
     wait
@@ -250,6 +252,13 @@ if [ -z "${FUZZ_CHILD:-}" ] && [ "$FUZZ_JOBS" -gt 1 ] && [ "${#TARGETS[@]}" -gt 
         else
             fz_clean=$(grep -oE '[0-9]+ fuzz runs, all clean' "$fz_dir/$fz_t.log" | tail -1)
             [ -n "$fz_clean" ] && fz_ran=$(( fz_ran + $(echo "$fz_clean" | awk '{print $1}') ))
+        fi
+        # A child that exited non-zero without counting a failure of its own still failed.
+        fz_rc=$(cat "$fz_dir/$fz_t.rc" 2>/dev/null || echo missing)
+        if [ "$fz_rc" != "0" ] && { [ -z "$fz_line" ] || [ "$(echo "$fz_line" | awk '{print $1}')" -eq 0 ]; }; then
+            echo "FAIL $fz_t: child exited with status $fz_rc"
+            fz_fail=$((fz_fail + 1))
+            fz_ran=$((fz_ran + 1))
         fi
     done
 

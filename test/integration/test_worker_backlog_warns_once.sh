@@ -13,8 +13,8 @@
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
-#   * the writer never filling, which would make the rest a test of nothing --
-#     reported as not asserted, never as a pass
+#   * the warning never said at all: the daemon is held still for part of the
+#     flood, so the writer fills on any box and silence is a failure
 #   * the warning said more than a handful of times for one flood
 #   * and every stall it opened being closed by a line naming what it refused
 set -euo pipefail
@@ -26,7 +26,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 exec 2>&1
 PASS=0; FAIL=0; TOTAL=0
 WORK=$(mktemp -d)
-cleanup(){ rm -rf "$WORK"; daemon_stop; }
+cleanup(){ kill -CONT "${SOCKETLEY_DPID:-0}" 2>/dev/null; rm -rf "$WORK"; daemon_stop; }
 trap cleanup EXIT
 pass(){ TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 fail(){ TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; for l in "${@:3}"; do echo "        $l"; done; }
@@ -50,6 +50,12 @@ fi
 # The daemon tells the worker whether to forward on its health tick.
 sleep 1.5
 
+# The daemon is held still for three seconds of the flood, so the worker's
+# control socket fills whatever the box's speed: a stall made rather than hoped
+# for, and a warning that never fires is then a failure and not "not asserted".
+( sleep 0.5; kill -STOP "$SOCKETLEY_DPID" 2>/dev/null; sleep 3; kill -CONT "$SOCKETLEY_DPID" 2>/dev/null ) &
+HOLD=$!
+
 # 400,000 publishes of 200 bytes in one pipelined stream, replies drained as
 # they come so the cache never stops reading.
 SENT=$(timeout 120 python3 - "$P" <<'PY'
@@ -69,6 +75,8 @@ t.join(60)
 print(got[0])
 PY
 ) || SENT=0
+wait "$HOLD" 2>/dev/null
+kill -CONT "$SOCKETLEY_DPID" 2>/dev/null
 sleep 1
 
 FULL=$(grep -c 'frame writer: backlog full' "$SOCKETLEY_DLOG" 2>/dev/null || true)
@@ -84,7 +92,8 @@ if [ "${FULL:-0}" -gt 0 ]; then
     if [ "$DRAINED" -ge $(( FULL - 1 )) ] && [ "$DRAINED" -le "$FULL" ]; then pass
     else fail "each stall ends with what it refused" "$FULL stalls, $DRAINED drained lines"; fi
 else
-    not_asserted "the control socket backed up" "no refusal in $SENT publishes, so nothing here was tested"
+    fail "a stall is reported" "the daemon was held still for three seconds of a flood and no 'backlog full' was said" \
+         "in $SENT publishes -- a warning that never fires reads exactly like a writer that never filled"
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

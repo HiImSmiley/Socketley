@@ -71,11 +71,14 @@ out=$("$BIN" create server ba_bad -p "999.1.1.1:$P_BAD" 2>&1); rc=$?
 check "an address that is no address is refused" "$rc:$(grep -c 'invalid listen address' <<<"$out")" "1:1"
 out=$("$BIN" create server ba_bad -p "$P_BAD" --bind localhost 2>&1); rc=$?
 check "and a name is no address" "$rc" 1
-check "and nothing was made" "$("$BIN" ls --json | grep -c '"name":"ba_bad"')" 0
+# A listing that names the server is one that could have named ba_bad.
+L=$("$BIN" ls --json)
+check "and nothing was made" "$(grep -q '"name":"ba_srv"' <<<"$L" && grep -c '"name":"ba_bad"' <<<"$L")" 0
 out=$("$BIN" edit ba_cache --bind 0.0.0.0 2>&1); rc=$?
 check "the address of a running runtime is not changed" "$rc:$(grep -c 'while running' <<<"$out")" "1:1"
 "$BIN" show ba_cache > "$T/cache.json"
 sed -i 's/"bind": "127.0.0.1"/"bind": "127.0.0.2"/' "$T/cache.json"
+check "the imported document asks for another address" "$(grep -c '"bind": "127.0.0.2"' "$T/cache.json")" 1
 out=$("$BIN" import ba_cache < "$T/cache.json" 2>&1); rc=$?
 check "nor by an import" "$rc:$(grep -c 'while running' <<<"$out")" "1:1"
 
@@ -111,7 +114,8 @@ check "an import moves it" "$(bound "$P_CACHE")" "127.0.0.2:$P_CACHE "
 "$BIN" edit ba_cache --bind 0.0.0.0 >/dev/null 2>&1
 "$BIN" start ba_cache >/dev/null 2>&1; wait_bound "$P_CACHE"
 check "--bind 0.0.0.0 binds every address" "$(bound "$P_CACHE")" "0.0.0.0:$P_CACHE "
-check "and is no address in the state" "$("$BIN" show ba_cache | grep -c '"bind"')" 0
+S=$("$BIN" show ba_cache)
+check "and is no address in the state" "$([ -n "$S" ] && grep -c '"bind"' <<<"$S")" 0
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || { echo "  FAILED"; exit 1; }

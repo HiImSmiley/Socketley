@@ -119,13 +119,13 @@ rss_mb(){ awk '/^VmRSS/{printf "%.1f", $2/1024}' "/proc/$1/status" 2>/dev/null |
 grew(){ awk -v a="$1" -v b="$2" 'BEGIN{printf "%.1f", b-a}'; }
 over(){ awk -v x="$1" -v t="$2" 'BEGIN{exit !(x+0 > t+0)}'; }
 # One curl for a whole arm, so the connection is reused and the map fills from
-# requests rather than from connection setup.
+# requests rather than from connection setup; it prints how many came back 200.
 walk(){   # $1=url prefix  $2=file prefix  $3=count  $4=extra curl args
     local pre=$1 fp=$2 n=$3; shift 3
     local args=()
     local i
     for i in $(seq 1 "$n"); do args+=(-o /dev/null "$pre/$fp$i.bin"); done
-    curl -s -m 120 "$@" "${args[@]}" >/dev/null 2>&1 || true
+    curl -s -m 120 -w '%{http_code}\n' "$@" "${args[@]}" 2>/dev/null | grep -c '^200$' || true
 }
 
 # ── 0. the bytes, first: nothing below means anything if these are wrong ─────
@@ -153,10 +153,14 @@ fi
 # ── 2. 300 KiB over plaintext must keep nothing ─────────────────────────────
 L0=$(full_lines)
 A=$(rss_mb "$W_BIG")
-walk "http://127.0.0.1:$((P+1))" b "$BIG_N"
+SERVED=$(walk "http://127.0.0.1:$((P+1))" b "$BIG_N")
 sleep 0.5
 G_BIG=$(grew "$A" "$(rss_mb "$W_BIG")")
-if ! over "$G_BIG" 16; then pass
+# Keeping nothing means something only if every file was served and the worker is still there to measure.
+if [ "$SERVED" != "$BIG_N" ] || ! kill -0 "$W_BIG" 2>/dev/null; then
+    fail "${BIG_KB} KiB over plaintext is served before it is judged" \
+         "$SERVED of $BIG_N files came back 200, worker $W_BIG $(kill -0 "$W_BIG" 2>/dev/null && echo alive || echo gone)"
+elif ! over "$G_BIG" 16; then pass
 else fail "${BIG_KB} KiB over plaintext is spliced, not kept" \
           "the worker retained ${G_BIG} MB after $BIG_N files of $BIG_KB KiB, and the map's" \
           "own limit is 64 MB -- so these were copied into memory and kept, on a" \
@@ -165,7 +169,7 @@ else fail "${BIG_KB} KiB over plaintext is spliced, not kept" \
 L1=$(full_lines)
 # ── 3. 200 KiB over plaintext must still be kept ───────────────────────────
 A=$(rss_mb "$W_SMALL")
-walk "http://127.0.0.1:$((P+2))" s "$SMALL_N"
+walk "http://127.0.0.1:$((P+2))" s "$SMALL_N" >/dev/null
 sleep 0.5
 G_SMALL=$(grew "$A" "$(rss_mb "$W_SMALL")")
 if over "$G_SMALL" 32; then pass
@@ -178,7 +182,7 @@ else fail "${SMALL_KB} KiB over plaintext is still kept" \
 L2=$(full_lines)
 # ── 4. 300 KiB over TLS must be kept: TLS has no splice arm ────────────────
 A=$(rss_mb "$W_TLS")
-walk "https://127.0.0.1:$((P+3))" b "$BIG_N" -k
+walk "https://127.0.0.1:$((P+3))" b "$BIG_N" -k >/dev/null
 sleep 0.5
 G_TLS=$(grew "$A" "$(rss_mb "$W_TLS")")
 if over "$G_TLS" 32; then pass

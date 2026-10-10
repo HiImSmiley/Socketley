@@ -30,6 +30,8 @@ fail() {
     local line
     for line in "${@:3}"; do echo "        $line"; done
 }
+# Wait up to five seconds for the file $2 to hold $1, since each event crosses two workers and the daemon.
+seen() { local _; for _ in $(seq 1 50); do grep -q "$1" "$2" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 
 cleanup() {
     "$BIN" stop   xr_origin xr_target 2>/dev/null || true
@@ -153,7 +155,8 @@ fi
 
 # ── Verb 1: open ────────────────────────────────────────────────────────────
 echo "route" >&9
-sleep 1.0
+seen 'XR_ROUTE ' "$SOCKETLEY_DLOG"
+seen 'XR_GOT ' "$SOCKETLEY_DLOG"
 
 if grep -q 'XR_ROUTE true' "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
     fail "self.route() across processes answers true" \
@@ -184,7 +187,8 @@ fi
 
 # ── Verb 2: data, origin -> target ──────────────────────────────────────────
 echo "hello-from-client" >&9
-sleep 1.0
+seen 'XR_MSG hello-from-client' "$SOCKETLEY_DLOG"
+seen 'answered-by-target' "$CLIENT_OUT"
 if grep -q 'XR_MSG hello-from-client' "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
     fail "a routed client's message reaches the target's script" \
          "no XR_MSG line for it" \

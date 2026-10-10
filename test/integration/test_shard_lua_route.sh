@@ -129,7 +129,9 @@ def drain(secs=1.2):
         out.append(buf)
     return out
 
-socks[0].sendall(b"COUNT\n")
+# From every socket, so each shard's own clients() answers and one that disagrees adds a second count.
+for s in socks:
+    s.sendall(b"COUNT\n")
 counts = set()
 for b in drain():
     for line in b.split(b"\n"):

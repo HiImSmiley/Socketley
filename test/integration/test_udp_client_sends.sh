@@ -152,7 +152,52 @@ else
         "0 and 0 with five echoes is the defect -- the datagrams moved and nothing counted them"
 fi
 
-for n in ucc_a ucs_a ucc_b ucs_b ucs_c; do
+# ── D. A client that stops itself from on_message ──────────────────────────
+# The datagram arrived in a buffer of the ring's group, owed back after the script ran -- and a stop inside the
+# script took away the loop it was to be given back through.
+PD=$((SL_PORT_BASE+1407))
+python3 - "$PD" <<'PY' &
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.settimeout(20)
+try:
+    while True:
+        d, a = s.recvfrom(2048)
+        s.sendto(b"STOP-NOW\n", a)
+except Exception:
+    pass
+PY
+PEER=$!
+SELF="$SOCKETLEY_TMPD/self.lua"
+cat > "$SELF" <<'LUAEOF'
+function on_connect()
+    self.send("hello")
+end
+function on_message(msg)
+    if msg == "STOP-NOW" then
+        socketley.stop(self.name)
+    end
+end
+LUAEOF
+sleep 0.5
+"$BIN" create client ucc_d --udp -t "127.0.0.1:$PD" --lua "$SELF" -s >/dev/null 2>&1
+STATE=""
+for _ in $(seq 1 30); do
+    STATE=$("$BIN" ls 2>/dev/null | awk '$2 == "ucc_d" {print $7}')
+    [ "$STATE" = "Stopped" ] || [ "$STATE" = "Failed" ] && break
+    sleep 0.2
+done
+if [ "$STATE" = "Stopped" ] && ! grep -qiE "signal|crash|SEGV|ERROR: AddressSanitizer" "$SOCKETLEY_DLOG" 2>/dev/null; then
+    ok "a UDP client that stops itself from on_message stops, and its worker does not crash"
+else
+    bad "a stop from on_message on a UDP client" \
+        "the client is '${STATE:-<none>}' after its script stopped it;" \
+        "$(grep -iE 'signal|crash|SEGV|AddressSanitizer' "$SOCKETLEY_DLOG" 2>/dev/null | head -2)"
+fi
+kill "$PEER" 2>/dev/null; wait "$PEER" 2>/dev/null
+
+for n in ucc_a ucs_a ucc_b ucs_b ucs_c ucc_d; do
     "$BIN" stop "$n" >/dev/null 2>&1; "$BIN" remove "$n" >/dev/null 2>&1
 done
 daemon_stop

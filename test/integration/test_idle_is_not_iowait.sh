@@ -41,9 +41,17 @@ blocked() {
 before=$(blocked)
 daemon_start "$BIN"
 P=$((SL_PORT_BASE + 1960))
-"$BIN" create storage idle -p "$P" --dir "$SOCKETLEY_TMPD/idle" --access-key AKIAIDLEIOWAIT000000 \
-    --secret-key idleiowaitsecretidleiowaitsecretidle0000 --shards 4 -s >/dev/null 2>&1
-for _ in $(seq 1 50); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$P/")" != 000 ] && break; sleep 0.1; done
+if ! "$BIN" create storage idle -p "$P" --dir "$SOCKETLEY_TMPD/idle" --access-key AKIAIDLEIOWAIT000000 \
+    --secret-key idleiowaitsecretidleiowaitsecretidle0000 --shards 4 -s >/dev/null 2>&1; then
+    echo "  FAIL [the measured runtime is created]: create storage idle was refused"
+    exit 1
+fi
+code=000
+for _ in $(seq 1 50); do code=$(curl -s --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$P/"); [ "$code" != 000 ] && break; sleep 0.1; done
+if [ "$code" = 000 ]; then
+    echo "  FAIL [the measured runtime answers]: nothing answered on $P, so an idle machine would be measured"
+    exit 1
+fi
 sleep 1
 after=$(blocked)
 

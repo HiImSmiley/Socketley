@@ -177,7 +177,11 @@ check "and the running script sees it without a restart" "262144" \
 
 # ─── 7. It survives show/import ─────────────────────────────────────────────
 "$BIN" show wb_small > "$SOCKETLEY_TMPD/cfg.json" 2>/dev/null
-"$BIN" import wb_small < "$SOCKETLEY_TMPD/cfg.json" >/dev/null 2>&1 || true
+# Moved off the shown value first, so only an import that carries the field brings it back.
+"$BIN" edit wb_small --write-buffer 1M >/dev/null 2>&1 || true
+check "the record moved away before the import" "1048576" "$(f wb_small)"
+RC=0; "$BIN" import wb_small < "$SOCKETLEY_TMPD/cfg.json" >/dev/null 2>&1 || RC=$?
+check "the import is accepted" "0" "$RC"
 check "a round trip through show/import keeps it" "524288" "$(f wb_small)"
 
 # ─── 8. And the runtime with the default is still the default ───────────────

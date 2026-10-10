@@ -132,9 +132,12 @@ echo "--- 5. the length rule is applied to the LONGEST node, before any bind ---
 # -- and the case a rule reading the path as typed cannot see.
 LONG="$D/$(printf 'x%.0s' $(seq 1 $((106 - ${#D} - 1))))"
 [ "${#LONG}" -eq 106 ] || { bad "length" "test built a ${#LONG}-byte path, wanted 106"; }
-out=$("$BIN" create cache us_long --listen "unix:$LONG" --shards 4 -s 2>&1)
+out=$("$BIN" create cache us_long --listen "unix:$LONG" --shards 4 -s 2>&1); rc=$?
 if [ -n "$(ls "$LONG"* 2>/dev/null)" ]; then
     bad "length" "a node was bound despite the set not fitting" "$(ls "$LONG"* | tr '\n' ' ')"
+# Refused for the length, since a create that failed for any other reason binds nothing too.
+elif [ "$rc" -eq 0 ] || ! grep -q 'is the longest of them' "$SOCKETLEY_DLOG" 2>/dev/null; then
+    bad "length" "the create was not refused for its longest node" "exit $rc: $out"
 else
     ok "a set whose longest node does not fit binds nothing"
 fi

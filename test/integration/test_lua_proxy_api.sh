@@ -336,27 +336,8 @@ assert_eq "control: the backend answered the one that was refused" \
           "1" "$(hits 'PBE got=\[RESP-BADTYPE\]' "$SOCKETLEY_DLOG")" \
     "without this, 'the client got nothing' is satisfied by a request that" \
     "never left the proxy — a different hook and a different bug"
-# ─── WHAT IS DELIBERATELY NOT ASSERTED HERE, AND WHY ────────────────────────
-#
-# The man page says this refusal closes the client connection — "here by
-# closing the client connection, since the response this hook was to redact
-# must not be delivered unredacted" — and it does not.  The refusal branch runs
-# (the log carries "on_proxy_response returned a number; expected a string or
-# nil — refusing the response") and sets cconn->closing, and nothing acts on the
-# flag: on this path the code returns before queuing anything, so there is no
-# write completion to notice it, and the client is idle so there is no read
-# completion either.  Measured on the same proxy, one connection per arm:
-#
-#     hook forwards (observer)         client sees  answered: BACKEND-SAID-HELLO
-#     on_proxy_request  -> wrong type  client sees  closed
-#     on_proxy_response -> wrong type  client sees  OPEN, still open at 6 s
-#
-# So the half of fail-closed that matters is kept — the reply is withheld, which
-# is asserted above — and the client is left waiting for a response that will
-# never come.  Reported as a defect rather than folded into a test commit, and
-# NOT asserted in either direction: asserting "open" would enshrine the bug as
-# the contract, and asserting "closed" would make this file red against the
-# build it is being committed with.
+# That the refusal also closes the client is asserted in
+# test_proxy_hooks_fail_closed.sh, against a backend that holds its connection.
 echo respdrop > "$MODE_FILE"
 assert_eq "on_proxy_response returning nil drops the reply" \
           "" "$(ask "$HOOK_PORT" "RESP-DROPPED" 1.5)"

@@ -73,18 +73,12 @@ else
     echo "  FAIL [setup]: cannot read the message counter — is the runtime up?"
 fi
 
-# `|| true` here for the same reason as the captures either side of it, in the
-# shape a bare command takes it — on the command line, because the heredoc body
-# follows the redirection.  Under `set -e` this python was the end of the file
-# whenever it could not connect, which is exactly what a refused create leaves
-# behind: the run stopped on a traceback with no `Results` line and neither of
-# the two assertions that follow.  Failing to deliver the frames is not a reason
-# to stop asking what the counter did — it is the reason the counter did
-# nothing, and the check below states that in one line instead of a stack trace.
-python3 - "$SRV_PORT" <<'PYEOF' || true
+# The driver, run once with a CLOSE in front of the TEXT frame and once, as the control, without it.
+cat >"$TMPDIR_T/ws.py" <<'PYEOF'
 import base64, os, socket, struct, sys, time
 
 port = int(sys.argv[1])
+mode = sys.argv[2]
 s = socket.create_connection(("127.0.0.1", port), timeout=5)
 key = base64.b64encode(os.urandom(16)).decode()
 s.sendall(f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
@@ -112,14 +106,21 @@ def frame(payload, opcode, fin=True):
     header += mask
     return bytes(header) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
 
-# CLOSE and TEXT in a single write, so both land in one read buffer.
-s.sendall(frame(b"", 0x8) + frame(b"must-not-be-processed", 0x1))
+if mode == "close-first":
+    # CLOSE and TEXT in a single write, so both land in one read buffer.
+    s.sendall(frame(b"", 0x8) + frame(b"must-not-be-processed", 0x1))
+else:
+    # The control: a TEXT frame alone, which the counter has to see.
+    s.sendall(frame(b"must-be-processed", 0x1))
 # Give the server time to read and act on both frames before the socket goes
 # away — closing immediately can mean the trailing frame is never read at all,
 # which would make this test pass for the wrong reason.
 time.sleep(0.6)
 s.close()
+print("delivered")
 PYEOF
+# `|| true` because a driver that cannot connect must still reach the check, which then names the undelivered frames.
+DELIVERED=$(python3 "$TMPDIR_T/ws.py" "$SRV_PORT" close-first 2>&1) || true
 
 sleep 1
 AFTER=$("$BIN" stats wsclose_srv 2>/dev/null | grep '^total_messages:' | cut -d: -f2) || true
@@ -128,12 +129,31 @@ AFTER=$("$BIN" stats wsclose_srv 2>/dev/null | grep '^total_messages:' | cut -d:
 # counters are both empty, and "" = "" would report "no work past close" as a
 # pass for a runtime that was never there.
 TOTAL=$((TOTAL+1))
-if [ -n "$BEFORE" ] && [ -n "$AFTER" ] && [ "$AFTER" = "$BEFORE" ]; then
+if [ "$DELIVERED" != delivered ]; then
+    FAIL=$((FAIL+1))
+    echo "  FAIL [no work past close]: the frames were never delivered: ${DELIVERED:-<nothing>}"
+elif [ -n "$BEFORE" ] && [ -n "$AFTER" ] && [ "$AFTER" = "$BEFORE" ]; then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))
     echo "  FAIL [no work past close]: message counter went $BEFORE -> $AFTER;"
     echo "        the frame behind the close was parsed and its answer discarded"
+fi
+
+# The control: a TEXT frame with no close in front of it moves the counter, or an unmoved one above proves nothing.
+CONTROL=$(python3 "$TMPDIR_T/ws.py" "$SRV_PORT" text 2>&1) || true
+MOVED=""
+for _ in $(seq 1 30); do
+    MOVED=$("$BIN" stats wsclose_srv 2>/dev/null | grep '^total_messages:' | cut -d: -f2) || true
+    [ -n "$MOVED" ] && [ -n "$AFTER" ] && [ "$MOVED" -gt "$AFTER" ] && break
+    sleep 0.1
+done
+TOTAL=$((TOTAL+1))
+if [ "$CONTROL" = delivered ] && [ -n "$MOVED" ] && [ -n "$AFTER" ] && [ "$MOVED" -gt "$AFTER" ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [a TEXT frame alone is counted]: counter went ${AFTER:-?} -> ${MOVED:-?} (${CONTROL:-<nothing>})"
 fi
 
 # The runtime has to survive it — stopping at closing must not skip the teardown.

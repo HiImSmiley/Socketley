@@ -227,6 +227,13 @@ if has "$PS" "upsrv"; then ok; else
         "measuring an empty listing rather than a filtered one:  ${PS:-<nothing>}"
 fi
 
+if [ "$(row_status "$PSJ" upsrv)" = "running" ]; then ok; else
+    bad "the running runtime is still in bare ps --json" \
+        "bare ps --json lost a running runtime, so the 'absent' assertion above is" \
+        "measuring an empty listing rather than a filtered one; got:" \
+        "  ${PSJ:-<no output at all>}"
+fi
+
 if has "$PSA" "upsrv"; then ok; else
     bad "the running runtime is still in ps -a" \
         "-a replaced the listing instead of widening it: ${PSA:-<nothing>}"

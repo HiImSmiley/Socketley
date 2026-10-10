@@ -61,7 +61,7 @@ cat > "$SOCKETLEY_TMPD/s.lua" <<EOF
 local f = io.open("$MARK", "a")
 f:write("ran\n")
 f:close()
-pcall(function() socketley.create("server", "ghost_from_toplevel", $((SL_PORT_BASE+1488))) end)
+pcall(function() socketley.create("server", "ghost_from_toplevel", { port = $((SL_PORT_BASE+1488)) }) end)
 EOF
 
 daemon_start "$BIN"
@@ -90,11 +90,10 @@ sleep 2
 OOP_RUNS=$(wc -l < "$MARK")
 assert_eq "$OOP_RUNS" "1" "out-of-process: the top level runs once, not twice"
 
-# The runtime the placeholder would have created if it had run the script.  The
-# worker cannot create it -- 42db9b0 refuses cross-runtime calls there -- so any
-# appearance of this name means the daemon ran the top level.
-GHOST=$("$BIN" ls 2>/dev/null | grep -c "ghost_from_toplevel" || true)
-assert_eq "$GHOST" "0" "no runtime is created from inside the daemon's placeholder"
+# Which process ran the top level is not told by the runtime it asks for: a worker asks the daemon to create one,
+# so a create from the script succeeds once whoever ran it -- and with the third argument a number rather than a
+# table it never succeeded at all, which made "no ghost" true on every build. How many times the top level ran is
+# what the count above says, and it is the whole of this file's question.
 
 # The proxy itself still works: this is a placeholder that stopped running a
 # script, not a proxy that stopped being configured.
