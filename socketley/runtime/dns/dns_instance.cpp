@@ -289,7 +289,13 @@ private:
         std::string in;
         std::string out;
         size_t out_off{0};
+        // Answers made while a write through the ring still reads `out`, which must not move under it.
+        std::string later;
         int64_t last{0};
+
+        // Where the next answer goes: `out` unless the ring is reading it.
+        std::string& tail() { return wr_pending ? later : out; }
+        size_t waiting() const { return out.size() - out_off + later.size(); }
         char rbuf[tcp_rbuf];
     };
     // A NOTIFY goes from a socket of its own, connected to the secondary, so its answer comes back to this shard:
@@ -950,10 +956,10 @@ void dns_run::tcp_serve(const std::shared_ptr<tcp_conn>& c)
                      {
                          uint8_t pre[2];
                          wr16(pre, static_cast<uint16_t>(n2));
-                         c->out.append(reinterpret_cast<const char*>(pre), 2);
-                         c->out.append(reinterpret_cast<const char*>(p), n2);
+                         c->tail().append(reinterpret_cast<const char*>(pre), 2);
+                         c->tail().append(reinterpret_cast<const char*>(p), n2);
                      });
-            if (c->out.size() - c->out_off > tcp_out_max)
+            if (c->waiting() > tcp_out_max)
             {
                 close_conn(c);
                 return;
@@ -979,8 +985,8 @@ void dns_run::tcp_serve(const std::shared_ptr<tcp_conn>& c)
         ++m_c.tcp_queries;
         count(meta);
         wr16(out, static_cast<uint16_t>(n));
-        c->out.append(reinterpret_cast<const char*>(out), n + 2);
-        if (c->out.size() - c->out_off > tcp_out_max)
+        c->tail().append(reinterpret_cast<const char*>(out), n + 2);
+        if (c->waiting() > tcp_out_max)
         {
             close_conn(c);
             return;
@@ -1052,6 +1058,12 @@ void dns_run::write_done(const std::shared_ptr<tcp_conn>& c, int res)
     c->out_off += static_cast<size_t>(res);
     c->last = now_sec();
     runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(res));
+    // Nothing reads `out` now, so what waited beside it joins it.
+    if (!c->later.empty())
+    {
+        c->out.append(c->later);
+        c->later.clear();
+    }
     tcp_flush(c);
 }
 
@@ -1098,7 +1110,7 @@ void dns_run::tick()
     // Connections quiet for too long, with nothing left to write.
     std::vector<std::shared_ptr<tcp_conn>> idle;
     for (auto& [id, c] : m_conns)
-        if (now - c->last > tcp_idle_secs && c->out_off >= c->out.size())
+        if (now - c->last > tcp_idle_secs && c->waiting() == 0)
             idle.push_back(c);
     for (auto& c : idle)
         close_conn(c);
@@ -1190,28 +1202,52 @@ void dns_run::check_zones()
     auto next = std::make_shared<zone_set>();
     std::string why;
     const extra_records extra = feed_extra();
+    std::vector<const zone*> kept;
     if (!load_all(m_paths, *next, why, &extra))
     {
         ++m_c.reload_failures;
         LOG_ERROR(("dns: zone not reloaded, still serving the one before: " + why).c_str());
-        // Remembered as seen, so the same broken file is not read again every second.
-        auto keep = std::make_shared<zone_set>(*m_zones);
-        for (auto& z : keep->zones)
+        // Each file on its own: a sound one is taken, and a broken one keeps what it served, remembered as seen so it
+        // is not read again every second.
+        next->zones.clear();
+        for (const auto& p : m_paths)
         {
-            struct stat st{};
-            if (::stat(z->path.c_str(), &st) < 0)
-                continue;
-            auto copy = std::make_shared<zone>(*z);
-            copy->mtime_ns = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
-            copy->size = static_cast<uint64_t>(st.st_size);
-            z = copy;
+            auto z = std::make_shared<zone>();
+            std::string ignored;
+            bool sound = load_zone(p, {}, *z, ignored);
+            if (sound)
+            {
+                add_extra(*z, extra);
+                for (const auto& other : next->zones)
+                    if (other->origin == z->origin)
+                        sound = false;
+            }
+            if (!sound)
+            {
+                const zone* old = nullptr;
+                for (const auto& o : m_zones->zones)
+                    if (o->path == p)
+                        old = o.get();
+                if (!old)
+                    continue;
+                z = std::make_shared<zone>(*old);
+                struct stat st{};
+                if (::stat(p.c_str(), &st) == 0)
+                {
+                    z->mtime_ns = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
+                    z->size = static_cast<uint64_t>(st.st_size);
+                }
+                kept.push_back(z.get());
+            }
+            next->zones.push_back(std::move(z));
         }
-        m_zones = keep;
-        return;
     }
-    ++m_c.reloads;
+    if (kept.size() < next->zones.size())
+        ++m_c.reloads;
     for (const auto& z : next->zones)
     {
+        if (std::find(kept.begin(), kept.end(), z.get()) != kept.end())
+            continue;
         const zone* before = m_zones->find(z->origin);
         const bool newer = !before || before->origin != z->origin || before->serial != z->serial;
         LOG_INFO(("dns: reloaded " + to_text(z->origin) + " serial " + std::to_string(z->serial) + ", " +

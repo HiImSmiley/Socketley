@@ -5,7 +5,8 @@
 #
 #   create       no --zone, a zone that does not parse (named by its line),
 #                --listen and a taken port are refused before anything runs
-#   answers      through dig, over UDP and TCP: a record, an alias followed, a
+#   answers      through dig, over UDP and TCP: a record, an alias followed (a chain
+#                of them, each longer than the last), a
 #                wildcard, NXDOMAIN and NODATA with the SOA's negative TTL, an MX
 #                with its host's address, a delegation referred with its glue
 #                and without AA, a name of no zone REFUSED, CHAOS refused, ANY
@@ -28,6 +29,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_ports.sh"
 . "$HERE/lib_daemon.sh"
 
+# Taken before daemon_isolate moves HOME, or the default never finds Pebble.
+PEBBLE_DIR="${PEBBLE_DIR:-$HOME/socketley-perf/acme}"
 daemon_isolate dns
 P=$((SL_PORT_BASE+1710))
 SINK=$((SL_PORT_BASE+1711))
@@ -65,6 +68,9 @@ ns1       IN A   192.0.2.53
 mail      IN A   192.0.2.25
 www       IN CNAME @
 alias     IN CNAME www
+hop       IN CNAME first-target-long-enough-for-the-heap
+first-target-long-enough-for-the-heap IN CNAME a-second-target-that-is-longer-again.deep
+a-second-target-that-is-longer-again.deep IN A 192.0.2.7
 *.apps    IN A   192.0.2.80
 sub       IN NS  ns.sub
 ns.sub    IN A   192.0.2.99
@@ -96,6 +102,9 @@ has "a dns runtime without --zone is refused" "$("$BIN" create dns bad -p "$P" -
 printf '$ORIGIN x.\n$TTL 60\n@ SOA a b 1 1 1 1 1\n@ NS a\nwww A 300.1.1.1\n' > "$T/broken.zone"
 has "a zone that does not parse is refused with its line" "$("$BIN" create dns bad -p "$P" --zone "$T/broken.zone" -s 2>&1)" "line 5"
 "$BIN" remove bad >/dev/null 2>&1
+printf '$ORIGIN x.\n$TTL 60\n@ SOA a b 1 1 1 1 1\n@ NS a\nm MX \\# 1 0a\n' > "$T/short.zone"
+has "a known type given as \\# data shorter than its fields is refused, not read past its end" \
+    "$("$BIN" create dns bad -p "$P" --zone "$T/short.zone" -s 2>&1)" "line 5"
 has "--listen unix: is refused" "$("$BIN" create dns bad --listen "unix:$T/d.sock" --zone "$T/example.zone" -s 2>&1)" "not served"
 "$BIN" remove bad >/dev/null 2>&1
 
@@ -114,6 +123,10 @@ has "authoritatively, and without recursion offered" "$r" "flags: qr aa;"
 has "with EDNS kept to 1232" "$r" "udp: 1232"
 expect "an IPv6 address" "$(q +short example.com AAAA)" "2001:db8::1"
 expect "an alias is followed within the zone" "$(q +short alias.example.com A | tr '\n' ' ')" "www.example.com. example.com. 192.0.2.1 "
+# Each target longer than the last: the writer compresses against the names it was handed, so one rewritten under
+# it while the chain went on wrote pointers to bytes that were no longer there.
+expect "a chain of aliases, each longer than the last, is answered name by name" \
+    "$(q +short hop.example.com A | tr '\n' ' ')" "first-target-long-enough-for-the-heap.example.com. a-second-target-that-is-longer-again.deep.example.com. 192.0.2.7 "
 expect "a wildcard stands for the names beneath it" "$(q +short anything.apps.example.com A)" "192.0.2.80"
 r=$(q nothing.example.com A)
 has "an absent name is NXDOMAIN" "$r" "status: NXDOMAIN"
@@ -137,7 +150,7 @@ expect "and whole over TCP" "$(q +tcp +short big.example.com TXT | wc -l)" 40
 expect "dig, told of the truncation, comes back over TCP by itself" "$(q +short big.example.com TXT | wc -l)" 40
 
 # ── transfer ────────────────────────────────────────────────────────────────
-expect "AXFR to an address --transfer names: SOA, every record, SOA" "$(q example.com AXFR +noall +answer | grep -c IN)" 53
+expect "AXFR to an address --transfer names: SOA, every record, SOA" "$(q example.com AXFR +noall +answer | grep -c IN)" 56
 has "AXFR from another address is refused" "$(q -b 127.0.0.2 example.com AXFR)" "Transfer failed"
 for _ in $(seq 1 20); do grep -q "transfer was refused to 127.0.0.2" "$SOCKETLEY_DLOG" && break; sleep 0.1; done
 has "and the refusal is logged with who asked" "$(grep -o 'transfer was refused to 127.0.0.2[^,]*' "$SOCKETLEY_DLOG" | head -1)" "127.0.0.2"
@@ -158,6 +171,21 @@ expect "the secondary was told once at start and once of the new serial" "$(grep
 stat_of() { "$BIN" stats ns 2>/dev/null | awk -F: -v k="$1" '$1==k {s+=$2} END {print s+0}'; }
 expect "and answered both, so neither was sent again" "$(stat_of notify_acked) $(stat_of notify_sent)" "2 2"
 expect "the failed reload is counted" "$(stat_of zone_reload_failures)" 1
+
+# Two files in one runtime: one broken does not keep a sound edit of the other from being served.
+P3=$((SL_PORT_BASE+1719))
+printf '$ORIGIN one.test.\n$TTL 60\n@ SOA a b 1 1 1 1 1\n@ NS a\nwww A 192.0.2.1\n' > "$T/one.zone"
+printf '$ORIGIN two.test.\n$TTL 60\n@ SOA a b 1 1 1 1 1\n@ NS a\nwww A 192.0.2.2\n' > "$T/two.zone"
+"$BIN" create dns pair -p "$P3" --zone "$T/one.zone,$T/two.zone" --rrl 0 --proxy none -s >/dev/null 2>&1
+for _ in $(seq 1 50); do dig @127.0.0.1 -p "$P3" +short +time=1 +tries=1 www.one.test A >/dev/null 2>&1 && break; sleep 0.1; done
+echo "broken IN A 999.1.1.1" >> "$T/two.zone"
+sleep 2.5
+sed -i 's/192.0.2.1$/192.0.2.11/; s/SOA a b 1 /SOA a b 2 /' "$T/one.zone"
+got=""
+for _ in $(seq 1 30); do got=$(dig @127.0.0.1 -p "$P3" +short +time=1 +tries=1 www.one.test A); [ "$got" = 192.0.2.11 ] && break; sleep 0.2; done
+expect "a sound edit is served while another file of the runtime is broken" "$got" "192.0.2.11"
+expect "and the broken one keeps what it served" "$(dig @127.0.0.1 -p "$P3" +short +time=1 +tries=1 www.two.test A)" "192.0.2.2"
+"$BIN" remove pair >/dev/null 2>&1
 
 # ── response rate limiting ──────────────────────────────────────────────────
 burst=$(python3 - "$P" <<'EOF'
@@ -208,7 +236,6 @@ if [ "${s2:-0}" -gt "${s1:-0}" ] 2>/dev/null; then ok "and the serial grows, so 
 else bad "the serial after a published name went" "$s1 -> $s2"; fi
 
 # ── a wildcard certificate over DNS-01, from this runtime's own answers ─────
-PEBBLE_DIR="${PEBBLE_DIR:-$HOME/socketley-perf/acme}"
 PEBBLE="$PEBBLE_DIR/pebble-linux-amd64/linux/amd64/pebble"
 if [ -x "$PEBBLE" ] && [ -r "$PEBBLE_DIR/pebble.minica.pem" ] && command -v openssl >/dev/null 2>&1; then
     P_DIR=$((SL_PORT_BASE+1715)) P_MGMT=$((SL_PORT_BASE+1716))

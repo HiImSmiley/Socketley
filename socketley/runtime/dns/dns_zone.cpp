@@ -307,6 +307,55 @@ void put_strings(std::string& o, std::string_view s)
 
 std::string text_of(const token& t) { return t.quoted ? t.text : unescape(t.text); }
 
+// Where the uncompressed name starting at `off` ends, or npos when it runs past `rd`, is longer than 255 bytes, or
+// holds a pointer, which a zone's data never may.
+size_t wire_name_end(std::string_view rd, size_t off)
+{
+    const size_t from = off;
+    while (off < rd.size())
+    {
+        const auto len = static_cast<uint8_t>(rd[off]);
+        if (len == 0)
+            return off + 1 - from > 255 ? std::string_view::npos : off + 1;
+        if (len >= 0x40 || off + 1 + len > rd.size())
+            return std::string_view::npos;
+        off += 1 + len;
+    }
+    return std::string_view::npos;
+}
+
+// Whether data given as \# has the shape its type is read with, since the answer reads a known type's fields
+// where they belong and a short one would be read past its end.
+bool rdata_fits(uint16_t t, std::string_view rd)
+{
+    switch (t)
+    {
+        case type::A:     return rd.size() == 4;
+        case type::AAAA:  return rd.size() == 16;
+        case type::NS:
+        case type::CNAME:
+        case type::PTR:   return wire_name_end(rd, 0) == rd.size();
+        case type::MX:    return rd.size() >= 3 && wire_name_end(rd, 2) == rd.size();
+        case type::SRV:   return rd.size() >= 7 && wire_name_end(rd, 6) == rd.size();
+        case type::SOA:
+        {
+            const size_t m = wire_name_end(rd, 0);
+            const size_t r = m == std::string_view::npos ? m : wire_name_end(rd, m);
+            return r != std::string_view::npos && r + 20 == rd.size();
+        }
+        case type::TXT:
+        {
+            if (rd.empty())
+                return false;
+            for (size_t off = 0; off < rd.size(); off += 1 + static_cast<uint8_t>(rd[off]))
+                if (off + 1 + static_cast<uint8_t>(rd[off]) > rd.size())
+                    return false;
+            return true;
+        }
+        default:          return true;
+    }
+}
+
 // A record's data in wire form from its tokens; false with the reason.
 bool parse_rdata(uint16_t t, const std::vector<token>& tk, size_t from, std::string_view origin, std::string& out,
                  std::string& why)
@@ -348,6 +397,7 @@ bool parse_rdata(uint16_t t, const std::vector<token>& tk, size_t from, std::str
     // RFC 3597's form, for any type: \# then the length, then the data in hex.
     if (n >= 2 && arg(0) == "\\#")
     {
+        const size_t start = out.size();
         uint16_t len = 0;
         if (!parse_uint(arg(1), len))
         {
@@ -372,6 +422,11 @@ bool parse_rdata(uint16_t t, const std::vector<token>& tk, size_t from, std::str
                 return false;
             }
             out += static_cast<char>(b);
+        }
+        if (!rdata_fits(t, std::string_view(out).substr(start)))
+        {
+            why = "\\# data is not shaped as this type's record is";
+            return false;
         }
         return true;
     }

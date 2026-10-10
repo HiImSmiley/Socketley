@@ -90,7 +90,14 @@ void transfer(const zone& z, const uint8_t* q, size_t question_end, Emit&& emit)
             w.restore(m);
             flush();
             begin();
+            const auto fresh = w.save();
             write_rr(w, owner, t, ttl, rd);
+            // A record no message can hold is left out rather than sent as a message cut inside it.
+            if (w.overflowed())
+            {
+                w.restore(fresh);
+                return;
+            }
         }
         ++count;
     };

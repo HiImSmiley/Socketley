@@ -362,8 +362,9 @@ size_t answer(const zone_set& zones, const uint8_t* q, size_t qlen, uint8_t* out
     }
 
     // ─── The lookup ─────────────────────────────────────────────────────────
+    // Every name the chain passes stays where it is for the whole answer -- the question, then each CNAME's target in
+    // the zone -- because the writer's compression keeps pointers into the names it was given.
     std::string_view name = qname;
-    std::string chased;   // a CNAME's target, kept while the chain is followed
     uint8_t rc = rcode::NOERROR;
     bool aa = true;
     for (int hops = 0; hops < 8; ++hops)
@@ -420,10 +421,10 @@ size_t answer(const zone_set& zones, const uint8_t* q, size_t qlen, uint8_t* out
         if (w.overflowed())
             break;
         // The alias is followed while its target is in this zone; outside it, the asker's resolver takes over.
-        chased.assign(cname->rdata[0]);
-        if (!is_subdomain(chased, z->origin))
+        const std::string_view target = cname->rdata[0];
+        if (!is_subdomain(target, z->origin))
             break;
-        name = chased;
+        name = target;
     }
 
     if (w.overflowed())
