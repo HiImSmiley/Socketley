@@ -740,16 +740,16 @@ socketley stats myapp
 
 ```
 socketley daemon                          # start the daemon (systemd does this when installed)
-socketley create <type> <name> [flags]    # types: server, client, proxy, cache, storage, dns
+socketley create <type> <name> [flags]    # types: server, client, proxy, cache, storage, dns, sync
 socketley add <path> [--name <n>] [-s]    # register and manage an external SDK binary
-socketley attach <type> <name> <port>     # register an external process as a runtime
+socketley attach <type> <name> <port> [--owner <n>] [--pid <pid>]  # register an external process
 socketley start <name|pattern>... [-i]    # start runtime(s), -i for interactive
 socketley stop <name|pattern>...          # stop runtime(s)
 socketley remove <name|pattern>...        # remove runtime(s)
 socketley send <name> [message]           # send/broadcast message
 socketley stats <name|pattern>...         # show runtime statistics
 socketley restart <name> [-i]             # stop and start, keeping the configuration
-socketley reload <name|pattern>...        # restart runtime
+socketley reload <name|pattern>...        # stop and start, taking up the stored configuration
 socketley reload-lua <name|pattern>...    # hot-reload Lua script
 socketley show <name|pattern>...          # print JSON config
 socketley edit <name> [flags]             # modify runtime config

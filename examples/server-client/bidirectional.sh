@@ -20,7 +20,7 @@ echo ""
 cat > /tmp/chat-server.lua << 'EOF'
 function on_message(msg)
     socketley.log("[MSG] " .. msg)
-    -- Broadcast to all other clients
+    -- Broadcast to every client, the sender included
     self.broadcast("[" .. os.date("%H:%M:%S") .. "] " .. msg)
 end
 

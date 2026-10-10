@@ -1,9 +1,10 @@
 // edge — the application server behind the gateway.
 //
 // It listens on an AF_UNIX socket, not a port: the only thing that should
-// reach it is the gateway in front of it, and a filesystem node with 0700 on
-// its directory enforces that better than a firewall rule.  This is the
-// `--listen unix:` feature through the SDK's unix-path constructor.
+// reach it is the gateway in front of it.  A filesystem node is off the
+// network, and one in a 0700 directory -- not /tmp, as this demo uses for
+// brevity -- keeps other users out too.  This is the `--listen unix:` feature
+// through the SDK's unix-path constructor.
 //
 // It serves static files over HTTP from ./public (http_dir mode with the
 // response cache on), so the gateway has something real to terminate TLS for.

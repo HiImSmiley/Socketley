@@ -49,6 +49,7 @@ int main()
     mgr.create(runtime_cache, "jobs");
     auto* jobs = static_cast<cache_instance*>(mgr.get("jobs"));
     jobs->set_port(6380);
+    jobs->set_bind_address("127.0.0.1");       // admin mode: never on every interface; bind a private address for workers elsewhere
     jobs->set_mode(cache_mode_admin);          // workers may flush/load
     jobs->set_persistent("/tmp/jobqueue.dat"); // survive a restart
     jobs->set_runtime_manager(&mgr);

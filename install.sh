@@ -124,7 +124,8 @@ if [ -z "$DEB" ]; then
     || die "the newest release could not be read from GitHub; download a .deb and pass --deb FILE"
   . /etc/os-release
   URLS=$(sed -n 's/.*"browser_download_url": *"\([^"]*\.deb\)".*/\1/p' "$TMP/release.json")
-  URL=$(printf '%s\n' "$URLS" | grep -F "${ID}${VERSION_ID}" | head -1 || true)
+  # A rolling distribution names no version, which set -u would otherwise stop at.
+  URL=$(printf '%s\n' "$URLS" | grep -F "${ID:-}${VERSION_ID:-}" | head -1 || true)
   [ -n "$URL" ] || URL=$(printf '%s\n' "$URLS" | head -1)
   [ -n "$URL" ] || die "the newest release has no .deb"
   echo "Downloading $(basename "$URL")..."

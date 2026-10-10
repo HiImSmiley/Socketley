@@ -178,7 +178,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   not at all. On four cores against dnsperf it answered 360-379k queries a second
   on one shard and 473k on two, where NSD 4.8 answered 319-334k and 465-479k on
   the same machine. The packaged service is given `CAP_NET_BIND_SERVICE` so a
-  runtime may bind 53. The ids of registered runtime types now begin at 6.
+  runtime may bind 53. The ids of registered runtime types now begin at 7, the
+  sync runtime having taken 6.
 
 - **Storage: bucket CORS, lifecycle, object tagging and reads by part number.**
   PutBucketCors/GetBucketCors/DeleteBucketCors with S3's CORSConfiguration, an
@@ -279,7 +280,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   them; a start moves any whole file left in `pool/` (length and MD5 as its
   header says) into place (4 KiB puts at 32 connections about 430 to 600 per
   second, boto3 p50 11.3 to 7.6 ms); the MD5 and the SHA-256 that verifies a signed body are taken on helper
-  threads (`SOCKETLEY_STORAGE_HASH_THREADS`, default 3, 0 for the loop), which
+  threads (`SOCKETLEY_STORAGE_HASH_THREADS`, by default the machine's cores over
+  the shards, at least 1 and at most 3; 0 for the loop), which
   took the loop from 0.86 to 0.37 of a core during 64 MiB puts at 32 connections
   and put a 64 MiB put at 32 connections from 100 to about 400 MiB/s on this
   disk; the signing key of a day is derived once per thread; and an object of up

@@ -59,14 +59,14 @@ echo "      Reply 2: $REPLY2"
 echo ""
 
 # Kill and watch auto-restart
-PID1=$(socketley ps 2>/dev/null | grep chat | awk '{print $NF}')
+PID1=$(socketley stats chat 2>/dev/null | sed -n 's/^pid://p')
 echo "[4/6] Killing process (PID $PID1)..."
 kill -9 "$PID1" 2>/dev/null || true
 
 echo "[5/6] Waiting for auto-restart (~3s)..."
 sleep 3
 
-PID2=$(socketley ps 2>/dev/null | grep chat | awk '{print $NF}')
+PID2=$(socketley stats chat 2>/dev/null | sed -n 's/^pid://p')
 echo ""
 echo "=== After Auto-Restart ==="
 socketley ps

@@ -35,7 +35,13 @@ if(SOCKETLEY_NO_LUA)
 endif()
 
 # ── Link libraries ────────────────────────────────────────────────────────────
-find_library(LIBURING uring REQUIRED)
+# liburing from thirdparty/ first, as socketley-config gives it, the one the engine is written against.
+target_include_directories(socketley_sdk SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/liburing")
+find_library(LIBURING NAMES liburing.a uring
+             HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/liburing" NO_DEFAULT_PATH)
+if(NOT LIBURING)
+    find_library(LIBURING uring REQUIRED)
+endif()
 find_library(LIBSSL   ssl   REQUIRED)
 find_library(LIBCRYPTO crypto REQUIRED)
 

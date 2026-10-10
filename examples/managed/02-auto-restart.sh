@@ -51,7 +51,7 @@ sleep 0.5
 echo ""
 echo "=== Before Kill ==="
 socketley ps
-PID1=$(socketley ps 2>/dev/null | grep crash-test | awk '{print $NF}')
+PID1=$(socketley stats crash-test 2>/dev/null | sed -n 's/^pid://p')
 echo ""
 echo "Current PID: $PID1"
 
@@ -68,7 +68,7 @@ sleep 3
 echo ""
 echo "=== After Auto-Restart ==="
 socketley ps
-PID2=$(socketley ps 2>/dev/null | grep crash-test | awk '{print $NF}')
+PID2=$(socketley stats crash-test 2>/dev/null | sed -n 's/^pid://p')
 echo ""
 echo "New PID: $PID2"
 

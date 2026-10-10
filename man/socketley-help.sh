@@ -237,7 +237,7 @@ cli_commands() {
     echo ""
 
     echo -e "${BOLD}create <type> <name> [flags]${NC}"
-    echo "  Create a new runtime: server, client, proxy, cache, storage, dns, or a type"
+    echo "  Create a new runtime: server, client, proxy, cache, storage, dns, sync, or a type"
     echo "  registered by a manifest in the daemon's types directory"
     echo "  (/etc/socketley/types/ or ~/.config/socketley/types/), whose"
     echo "  schema keys become --<key> flags. See REGISTERED TYPES in man."
@@ -425,7 +425,7 @@ cli_commands() {
     echo -e "  ${CYAN}socketley ping${NC}"
     echo ""
 
-    echo -e "${BOLD}git-sync --url <url> --branch <name|*> --work <dir> --endpoint <host:port> --bucket <library> --name <folder>${NC}"
+    echo -e "${BOLD}git-sync --url <url> --branch <name|*> --work <dir> --endpoint <host:port> [--tls [--ca <file>]] --bucket <library> --name <folder> [--keep <d,w,m>]${NC}"
     echo "  Fetch one repository into a storage runtime's library: the branch's"
     echo "  files under <folder>/ and a bundle of its history under _backups/."
     echo "  A storage runtime runs this itself, once a day and when asked; by"
@@ -678,7 +678,7 @@ runtime_types() {
     echo -e "${GREEN}│${NC}        --replication-targets file (S3 endpoints to copy to),   ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC}        --nodes file (nodes that each keep every bucket),       ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC}        --listen unix:path                                      ${GREEN}│${NC}"
-    echo -e "${GREEN}│${NC} Flags: --dir path (required), --anonymous (required for now),  ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC} Flags: --dir path (required), credentials or --anonymous,      ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC}        --max-bytes size, --listen unix:path,                   ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC}        --tls --cert --key [--ca], --idle-timeout, --cpus       ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC} Example: socketley create storage media -p 9000 \\              ${GREEN}│${NC}"
@@ -733,7 +733,7 @@ runtime_types() {
     echo -e "${CYAN}│${NC} Flags: --dir path (required), --storage ui/bucket or a URL     ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}          (required, comma-separate for more with --mode out),  ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}        --credentials file (access_key, secret_key; required),  ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC}        --mode out|in|inout, --prefix key, --exclude patterns,  ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}        --mode out (in: not yet), --prefix key, --exclude list, ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}        --every 1h (a full walk; inotify sees changes between)  ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Example: socketley create sync photos --dir /srv/photos \\      ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   --storage ui/photos --credentials /etc/socketley/s.creds -s  ${CYAN}│${NC}"
@@ -781,12 +781,11 @@ flags_options() {
     echo "│ --idle-timeout <s>│ Close idle connections after N seconds │"
     echo "│                  │ or a duration suffix: 5m / 2h / 1d / 1w │"
     echo "│ --drain          │ Graceful shutdown (flush pending writes)│"
-    echo "│                  │ --max-connections, --rate-limit and     │"
-    echo "│                  │ --idle-timeout are refused on a client: │"
-    echo "│                  │ it accepts no connections, so there is  │"
-    echo "│                  │ nothing to limit or to time out.        │"
-    echo "│                  │ --global-rate-limit and --drain ARE     │"
-    echo "│                  │ accepted on one.                        │"
+    echo "│                  │ --max-connections, --rate-limit,        │"
+    echo "│                  │ --global-rate-limit, --idle-timeout and │"
+    echo "│                  │ --drain are refused on a client: it     │"
+    echo "│                  │ accepts no connections, so there is     │"
+    echo "│                  │ nothing to limit, time out or drain.    │"
     echo "│ --cpus <set>     │ CPUs for this runtime's I/O:            │"
     echo "│                  │ max | 0-3 | 0,1,2,3   (default max)     │"
     echo "│ --tls            │ SERVER/PROXY/CACHE: encrypt listener.   │"
@@ -1318,11 +1317,11 @@ lua_config() {
     echo "│                        │ (one of these is required)          │"
     echo "│ --max-bytes <size>     │ Quota on bytes held (100M, 1G);     │"
     echo "│                        │ a put past it is 507 StorageFull    │"
-    echo "│ --mpu-expire <time>    │ Abort uploads open this long (24h)  │"
+    echo "│ --mpu-expire <time>    │ Abort uploads open this long; off   │"
     echo "│ --scrub <time>         │ Read every object back once in this │"
-    echo "│                        │ long, checking its MD5 (30d)        │"
+    echo "│                        │ long, checking its MD5; off if unset│"
     echo "│ --compress <time>      │ LZ4 each version unwritten this     │"
-    echo "│                        │ long, where it lies (1h)            │"
+    echo "│                        │ long, where it lies; off if unset   │"
     echo "│ --sse-key-file <file>  │ SSE-S3 master key: 32 bytes, mode   │"
     echo "│                        │ 0600; without it AES256 is refused  │"
     echo "│ --domain <name>[,...]  │ Host <bucket>.<name> addresses the  │"
@@ -2065,7 +2064,7 @@ example_replication() {
     echo "echo 'get user' | nc -q 1 localhost 9001   # => alice"
     echo ""
     echo "# Stats show replication info"
-    echo "socketley stats leader    # repl_role:leader, followers:1"
+    echo "socketley stats leader    # repl_role:1 (1 leader, 2 follower), followers:1"
     echo "socketley stats follower  # repl_role:follower"
     echo ""
     echo "# Cleanup"
@@ -2105,7 +2104,7 @@ example_stats_reload() {
     echo "socketley stats mycache"
     echo "#   memory_used:1048576"
     echo "#   max_memory:268435456"
-    echo -e "#   eviction:allkeys-lru${NC}"
+    echo -e "#   eviction:1   (0 noeviction, 1 allkeys-lru, 2 allkeys-random)${NC}"
     echo ""
     read -p "Press Enter to continue..." || true
     examples_menu
@@ -3174,8 +3173,8 @@ USAGE
   socketley --lua <file>
 
 RUNTIMES
-  create <type> <name> [flags]   create a server, client, proxy, cache, storage, dns, or a
-                                 manifest-registered type (man: REGISTERED TYPES)
+  create <type> <name> [flags]   create a server, client, proxy, cache, storage, dns, sync, or
+                                 a manifest-registered type (man: REGISTERED TYPES)
   start|stop|restart <name>      lifecycle
   remove <name>                  remove a runtime
   ls | ps [-a] [--json]          list runtimes
@@ -3183,13 +3182,13 @@ RUNTIMES
   edit <name> [flags]            change a runtime's configuration
   rename <old> <new>             rename a runtime
   send <name> <data>             send through a runtime
-  reload | reload-lua <name>     reload configuration, or the Lua script
+  reload | reload-lua <name>     stop and start on the stored configuration, or reload the Lua script
 
 OTHER
   add <path> [--name <name>]     adopt a runtime from a file
   import | show | owner          state and relationships
   cluster [ls|ps|group|show|stats|watch]
-  attach <name>                  attach to a runtime's stream
+  attach <type> <name> <port>    register a process the daemon did not start
   dashboard                      terminal dashboard
   ping                           is the daemon answering
   version | --version | -v       version

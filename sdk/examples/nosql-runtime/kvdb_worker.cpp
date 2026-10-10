@@ -110,8 +110,9 @@ public:
 private:
     std::string dispatch(std::string_view line)
     {
-        if (line.empty()) return "\n";
         const auto tok = split_ws(line, 4);
+        // A line of spaces holds no word at all, and is answered as an empty one is.
+        if (tok.empty()) return "\n";
         std::string cmd = tok[0];
         std::transform(cmd.begin(), cmd.end(), cmd.begin(),
                        [](unsigned char c) { return std::toupper(c); });
@@ -119,6 +120,10 @@ private:
         if (cmd == "PUT")
         {
             if (tok.size() < 4)  return "ERR usage: PUT <collection> <field> <value>\n";
+            // A tab or a line break would end a journal record's field or the record itself early.
+            if (tok[1].find_first_of("\t\n") != std::string::npos || tok[2].find_first_of("\t\n") != std::string::npos ||
+                tok[3].find('\n') != std::string::npos)
+                return "ERR a collection or a field holds no tab, and nothing holds a line break\n";
             if (m_readonly)      return "ERR store is readonly\n";
             if (!m_docs.count(tok[1]) && m_docs.size() >= m_maxdocs)
                 return "ERR maxdocs reached\n";

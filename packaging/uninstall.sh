@@ -14,6 +14,8 @@ systemctl disable socketley.service 2>/dev/null || true
 rm -f /usr/bin/socketley
 rm -f /usr/lib/systemd/system/socketley.service
 rm -f /usr/share/man/man1/socketley.1
+rm -f /usr/share/socketley/socketley-help.sh
+rmdir /usr/share/socketley 2>/dev/null || true
 
 systemctl daemon-reload
 

@@ -3,7 +3,7 @@
 // =============================================================================
 //
 // A multi-client chat server using the socketley::server wrapper.
-// Messages from any client are broadcast to all others.
+// Messages from any client are broadcast to every client, the sender included.
 //
 // Works both standalone and as a daemon-managed binary via `socketley add`.
 // When managed: auto-restarts on crash, re-launches on daemon boot.

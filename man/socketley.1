@@ -825,7 +825,7 @@ socketley daemon stats
 .fi
 .RE
 .TP
-.B git\-sync \-\-url \fIurl\fR \-\-branch \fIname\fR|\fB*\fR \-\-work \fIdir\fR \-\-endpoint \fIhost\fB:\fIport\fR \fR[\fB\-\-tls\fR] \fB\-\-bucket \fIlibrary\fR \fB\-\-name \fIfolder\fR [\fB\-\-keep \fIdays\fB,\fIweeks\fB,\fImonths\fR]
+.B git\-sync \-\-url \fIurl\fR \-\-branch \fIname\fR|\fB*\fR \-\-work \fIdir\fR \-\-endpoint \fIhost\fB:\fIport\fR \fR[\fB\-\-tls\fR [\fB\-\-ca \fIfile\fR]] \fB\-\-bucket \fIlibrary\fR \fB\-\-name \fIfolder\fR [\fB\-\-keep \fIdays\fB,\fIweeks\fB,\fImonths\fR]
 One run of a repository a storage runtime keeps (see
 .B Git repositories
 under
@@ -841,7 +841,13 @@ with the credentials in
 and, for temporary ones,
 .BR SOCKETLEY_GIT_SESSION_TOKEN ;
 .B SOCKETLEY_GIT_TOKEN
-is a GitHub token for a private repository. Exit status 0 when it ended well, 2
+is a GitHub token for a private repository, sent only to an https:// URL.
+.B \-\-ca
+names the certificate the runtime at
+.IR host : port
+must present over
+.BR \-\-tls ,
+which the runtime passes its own. Exit status 0 when it ended well, 2
 when it did not, 3 when a run of the same directory is under way;
 .IR dir /state.json
 says how.
@@ -1683,7 +1689,8 @@ under the source tree the binary was built in, and
 .I /usr/share/socketley/socketley\-help.sh
 otherwise \(em nearest first, so a binary built in a tree prints that tree's
 help rather than an installed copy from another version. If neither is
-readable the command says so and exits 1. This page is the reference and that
+readable the command says so and exits 2, the installation's fault and not
+bad input. This page is the reference and that
 browser is the tour \(em they cover the same ground and are kept in step with
 each other.
 .RE
@@ -2121,10 +2128,10 @@ is charged on and the same one
 counts; a client that pipelines four requests into one segment therefore pays
 one token.
 .IP
-.B Not enforced by the cache or the client runtime.
-Both accept the flag and report it back from
-.BR show ,
-and neither applies it.
+A
+.B client
+refuses the flag: it limits what arrives, and a client has nothing arriving
+from connections of its own.
 .TP
 .BI "\-\-global\-rate\-limit " "n"
 Limit total messages per second across all connections using a shared
@@ -2440,7 +2447,7 @@ against a member that is merely young.
 .TP
 .BI "\-\-listen unix:" "/path/to.sock"
 Listen on an AF_UNIX socket instead of a TCP port. Taken by every runtime that
-listens \(em server, proxy and cache; a client dials out and listens on
+listens \(em server, proxy, cache and storage; a client dials out and listens on
 nothing, so on one the flag is refused with a pointer at
 .BR "\-t unix:" ,
 the connect side of the same socket. The other half of
@@ -3784,7 +3791,7 @@ because SO_REUSEPORT is not a path.
 .BI "\-\-backend " "addr"
 .B A hostname is resolved off the request path.
 A backend named by hostname is looked up when the proxy starts and, if that
-fails, again on the proxy's periodic sweep \(em never while a request is being
+fails, again on the proxy's periodic sweep, on a thread of its own \(em never while a request is being
 served. A request that arrives before the name resolves is refused rather than
 waiting for it. That is deliberate: the daemon has one thread for every runtime
 it holds, so a resolver that hangs on the request path stops not only this
@@ -11218,8 +11225,8 @@ when they are wanted, and
 beginning a comment. Required, since a sync signs every request it makes.
 .TP
 .BI "\-\-prefix " key
-The key everything is written under, below the bucket. Empty is the bucket's
-root.
+The key everything is written under, below the bucket; without the flag it is
+the bucket's root.
 .TP
 .BI "\-\-every " duration
 How often the whole directory is walked, as
@@ -17052,13 +17059,12 @@ which is what glibc turns an
 into.
 .IP \(bu 2
 .BR getaddrinfo (3)
-on a client's reconnect, a server's upstream, a cache's
+on a client's first dial and a proxy's setup, both before the runtime serves
+anything, so a start against a resolver that is not answering takes as long as
+the resolver does. A client's reconnect, a server's upstream, a cache's
 .B \-\-replicate
-and a proxy's setup. Not on any request path \(em the proxy resolves at setup
-for exactly this reason \(em but a reconnect against a resolver that is not
-answering holds the loop for as long as the resolver takes. There is no
-asynchronous form of it in glibc, so this one is a design decision and not a
-repair.
+and a proxy's later lookups ask on a thread of their own and dial once the
+answer is in, a tenth of a second at a time.
 .IP \(bu 2
 The mutation journal's flush, once per
 .B \-\-persistent\-interval
@@ -17308,7 +17314,8 @@ that is not a summable counter \(em a cache's key count, a proxy's healthy
 backends, the ring's granted polling mode \(em is still computed inside the
 worker, because it is a walk of tables that exist only there. It crosses the
 control socket when it changes, and for a runtime with no traffic that is never:
-an idle worker sends nothing and wakes for nothing.
+an idle worker sends nothing and wakes for nothing but a TLS listener's look at
+its certificate files, once every two seconds.
 .PP
 Until the first such report has arrived,
 .B stats

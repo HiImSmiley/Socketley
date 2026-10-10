@@ -8,9 +8,12 @@ VERSION="${1:-1.1.0}"
 ARCH="amd64"
 PKG_DIR="$PROJECT_ROOT/socketley_${VERSION}_${ARCH}"
 
+# Built here from clean, since make keeps objects across a change of flags and a package must carry the -march it
+# names, not whatever the last build of this tree used.
+make -C "$PROJECT_ROOT/make" config=release_x64 clean >/dev/null
+make -C "$PROJECT_ROOT/make" config=release_x64 -j"$(nproc)" socketley
 if [ ! -f "$BINARY" ]; then
     echo "error: release binary not found at $BINARY"
-    echo "build first: cd make && make config=release_x64 -j\$(nproc)"
     exit 1
 fi
 
