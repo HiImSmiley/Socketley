@@ -1662,6 +1662,15 @@ function shareDlg(it) {
       const inp = el('input', { class: 'inp', value: url, readonly: '' });
       out.textContent = '';
       out.append(el('div', { class: 'lnk' }, inp, btn('link', 'Copy', () => copy(url, inp), 'pri')));
+      // A film's link plays in a chat: its web copy is asked for now, so it is there when the chat looks.
+      if (it.kind === 'video' && !pw.value) {
+        // Its size first, which the page tells the chat, and a web copy when it is not an MP4 already.
+        const sh = url.slice(location.origin.length + 1);
+        fetch('/~media/info/' + sh).then(r => r.ok ? r.json() : null).then(i => {
+          if (i && !(/video\/mp4/.test(i.mime || '') && i.video === 'h264' && !i.hdr && (!i.audio || i.audio === 'aac'))) fetch('/~media/web/' + sh + '?prepare').catch(() => {});
+        }).catch(() => {});
+        out.append(el('p', { class: 'mut', style: 'font-size:12.5px;margin:8px 0 0', text: 'Pasted into Discord or another chat, the link shows a player. A film that is not an MP4 browsers play is made into one first, which takes a while for a long one.' }));
+      }
       copy(url, inp);
     } catch (e) { fail(e); }
   };

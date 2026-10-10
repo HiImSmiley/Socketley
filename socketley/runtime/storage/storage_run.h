@@ -1137,6 +1137,8 @@ public:
         int64_t     audio{0};
         int64_t     deadline_ms{0};
         int64_t     asked_ms{0};
+        // Asked to have it made and not to wait for it, as a share link of a film asks for its web copy.
+        bool        prepare{false};
         // The object as one string, bucket, key and ETag, which its open file is kept under; and the version the
         // URLs of its playlists carry.
         std::string object, version;
@@ -1145,6 +1147,10 @@ public:
     // A media request once its object is known, and its file open where ffmpeg may read it directly.
     void media_continue(const std::shared_ptr<conn>& c, media_want w);
     std::shared_ptr<const media_probe> media_probe_of(const std::string& probe_dir);
+    // What is known of an object's film without making anything: its probe if one was made, and whether its web copy
+    // is whole.
+    void media_known(const std::string& bucket, const std::string& key, const std::string& etag,
+                     std::shared_ptr<const media_probe>& probe, bool& web_made);
     // A medium's use, written to its lock's time at most once a minute, which eviction orders by.
     void media_touch(const std::string& dir);
     // Ends the rendition job at `i`: killed when running, its files cleared, the rendition marked done when whole.

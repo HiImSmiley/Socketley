@@ -67,6 +67,8 @@ enum media_kind : uint8_t
     k_hwtest,
     // Small stills through the film, tiled in one JPEG, that a seek bar shows where it would seek to.
     k_trick,
+    // The film as one H.264 and AAC MP4 that starts playing before it is whole, which a chat embeds as a player.
+    k_web,
 };
 
 // Thumbnails and probes queue behind one a core of the shard's share, each run on one thread, since most of what one
@@ -82,6 +84,8 @@ constexpr int64_t media_wait_ms    = 60000;
 constexpr int64_t thumb_job_ms     = 60000;
 // A film's stills are read from its keyframes alone, which still reads the whole file.
 constexpr int64_t trick_job_ms     = 600000;
+// A whole film made over is hours on a small machine, and it is let take them.
+constexpr int64_t web_job_ms       = 4 * 3600 * 1000;
 // The stills: 160x90, ten a row, one every two seconds or more, two hundred at most.
 constexpr int64_t trick_w = 160, trick_h = 90, trick_cols = 10, trick_max = 200;
 // A stream nobody has asked for in this long is let go; what it made is kept.
@@ -949,6 +953,12 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         w.kind = k_trick;
         w.file = "trick.jpg";
     }
+    else if (variant == "web")
+    {
+        w.kind = k_web;
+        w.file = "web.mp4";
+        w.prepare = c->req.has_query("prepare");
+    }
     else if (stream == "hls" && file == "master.m3u8")
     {
         w.kind = k_master;
@@ -971,7 +981,7 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
     {
         app_reply(c, 404, "No such medium: thumb-<width>/<object>, info/<object>, hls/<object>/master.m3u8, "
                           "hls-<height>|hls-copy/<object>/index.m3u8 and its segments, each with -a<track> for another sound track, "
-                          "sub-<stream>/<object>/subs.vtt, or trick/<object>.\n");
+                          "sub-<stream>/<object>/subs.vtt, trick/<object>, or web/<object>.\n");
         return;
     }
     w.source.assign(source);
@@ -1296,11 +1306,23 @@ bool storage_run::media_serve(const std::shared_ptr<conn>& c, const media_want& 
     return true;
 }
 
+void storage_run::media_known(const std::string& bucket, const std::string& key, const std::string& etag,
+                              std::shared_ptr<const media_probe>& probe, bool& web_made)
+{
+    // The same directories op_media names them by.
+    const std::string media_dir = m_store.options().dir + "/.media";
+    const std::string object = bucket + '\n' + key + '\n' + etag;
+    probe = media_probe_of(media_dir + "/" + sha256_hex("probe2\n" + object));
+    const std::string web = media_dir + "/" + sha256_hex("web\n" + object);
+    struct stat sb{};
+    web_made = m_media_done.contains(web) || ::stat((web + "/done").c_str(), &sb) == 0;
+}
+
 bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
 {
     struct stat sb{};
     // A file of a medium made whole is served as it is, without the probe it was made from.
-    if (w.kind == k_thumb || w.kind == k_trick || w.kind == k_copy || (w.kind == k_sub && w.file == "subs.vtt") ||
+    if (w.kind == k_thumb || w.kind == k_trick || w.kind == k_web || w.kind == k_copy || (w.kind == k_sub && w.file == "subs.vtt") ||
         (w.kind == k_rendition && w.file != "index.m3u8"))
     {
         const bool done = m_media_done.contains(w.dir) || ::stat((w.dir + "/done").c_str(), &sb) == 0;
@@ -1425,6 +1447,11 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
         app_reply(c, 415, "This object has no film to take stills of.\n");
         return true;
     }
+    if (w.kind == k_web && p->vcodec.empty())
+    {
+        app_reply(c, 415, "This object has no film to make a web copy of.\n");
+        return true;
+    }
 
     // A thumbnail, a subtitle track and a copied stream: one job each, made whole, kept.
     const bool done = m_media_done.contains(w.dir) || ::stat((w.dir + "/done").c_str(), &sb) == 0;
@@ -1455,12 +1482,21 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
     // which take minutes, have a place of their own, so thumbnails never wait behind them.
     const auto same_kind = std::ranges::count_if(m_media_jobs, [&](const media_job& j) {
         return j.want.kind != k_hwtest && (j.want.kind == k_trick) == (w.kind == k_trick) &&
+               (j.want.kind == k_web) == (w.kind == k_web) &&
                (j.want.kind == k_copy || j.want.kind == k_rendition) == stream;
     });
     const int thumb_jobs_max = std::max<int>(thumb_jobs_min, static_cast<int>(std::thread::hardware_concurrency() /
                                                                            std::max(1u, m_store.shards())));
-    if (same_kind >= (stream ? streams_max() : w.kind == k_trick ? 1 : thumb_jobs_max))
+    // A web copy, which takes every core it is given for as long as the film is, is made one at a time a shard.
+    if (same_kind >= (stream ? streams_max() : w.kind == k_trick || w.kind == k_web ? 1 : thumb_jobs_max))
+    {
+        if (w.prepare)
+        {
+            app_reply(c, 202, "It is made once those before it are.\n");
+            return true;
+        }
         return false;
+    }
     if (::mkdir(w.dir.c_str(), 0700) < 0 && errno != EEXIST)
     {
         app_reply(c, 500, "The media cache cannot be written.\n");
@@ -1475,6 +1511,12 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
     if (::flock(lock_fd, LOCK_EX | LOCK_NB) != 0 || !locked_fresh(lock_fd, lock))
     {
         ::close(lock_fd);
+        // Being made already, here or on another shard, which is all a request to prepare it wants to know.
+        if (w.prepare)
+        {
+            app_reply(c, 202, "It is being made.\n");
+            return true;
+        }
         return false;
     }
     kill_orphan(w.dir + "/pid", w.dir);
@@ -1489,6 +1531,11 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
     {
         ::close(lock_fd);
         app_reply(c, 500, "ffmpeg could not be started.\n");
+        return true;
+    }
+    if (w.prepare)
+    {
+        app_reply(c, 202, "It is being made.\n");
         return true;
     }
     return false;
@@ -1673,7 +1720,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
     std::string out_file;
     media_job j;
     std::shared_ptr<const media_probe> pp;
-    if (w.kind == k_copy || w.kind == k_rendition || w.kind == k_trick)
+    if (w.kind == k_copy || w.kind == k_rendition || w.kind == k_trick || w.kind == k_web)
     {
         pp = media_probe_of(w.probe_dir);
         if (!pp)
@@ -1709,6 +1756,40 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             args.insert(args.end(), {"-frames:v", "1", "-vf", "scale='min(" + std::to_string(n) + ",iw)':-2", "-q:v", "4",
                                      "-threads", "1", w.dir + "/thumb.jpg"});
             j.seeked = from > 0;
+            break;
+        }
+        case k_web:
+        {
+            const media_probe& p = *pp;
+            clear_dir(w.dir, true);
+            args.insert(args.end(), input.begin(), input.end());
+            args.insert(args.end(), {"-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"});
+            // A picture every browser and chat plays is copied; anything else is made H.264 of at most 1080 lines.
+            const bool plays = p.vcodec == "h264" && !p.hdr() &&
+                               (p.vprofile.empty() || p.vprofile == "High" || p.vprofile == "Main" ||
+                                p.vprofile == "Constrained Baseline" || p.vprofile == "Baseline");
+            if (plays)
+                args.insert(args.end(), {"-c:v", "copy"});
+            else
+            {
+                int64_t width = 0, height = 0;
+                fitted(p, 1080, width, height);
+                std::string vf = "scale=" + std::to_string(width) + ":" + std::to_string(height);
+                if (p.hdr())
+                    vf += ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
+                          "zscale=t=bt709:m=bt709:r=tv";
+                vf += ",format=yuv420p";
+                args.insert(args.end(), {"-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                                         "-profile:v", "high", "-threads", threads});
+            }
+            if (!p.audio)
+                args.push_back("-an");
+            else if (audio_copies(p))
+                args.insert(args.end(), {"-c:a", "copy"});
+            else
+                args.insert(args.end(), aac.begin(), aac.end());
+            // The index in front, so a player starts at once and seeks by range before the whole has come.
+            args.insert(args.end(), {"-movflags", "+faststart", "-f", "mp4", w.dir + "/web.mp4"});
             break;
         }
         case k_trick:
@@ -2053,7 +2134,8 @@ void storage_run::media_tick()
         if (r == 0)
         {
             const bool idle = j.want.kind == k_copy && ::fstat(j.lock_fd, &sb) == 0 && now - mtime_ms(sb) > hls_idle_ms;
-            if (!idle && (j.want.kind == k_copy || now - j.started_ms <= (j.want.kind == k_trick ? trick_job_ms : thumb_job_ms)))
+            const int64_t allowed = j.want.kind == k_trick ? trick_job_ms : j.want.kind == k_web ? web_job_ms : thumb_job_ms;
+            if (!idle && (j.want.kind == k_copy || now - j.started_ms <= allowed))
             {
                 ++i;
                 continue;
@@ -2092,6 +2174,7 @@ void storage_run::media_tick()
             {
                 const std::string out = j.want.dir + (j.want.kind == k_copy    ? "/index.m3u8"
                                                     : j.want.kind == k_trick ? "/trick.jpg"
+                                                    : j.want.kind == k_web   ? "/web.mp4"
                                                                              : "/thumb.jpg");
                 ok = ok && ::stat(out.c_str(), &sb) == 0 && sb.st_size > 0;
             }
@@ -2114,7 +2197,7 @@ void storage_run::media_tick()
             mark(j.want.dir, ok ? "done" : "failed");
             if (ok)
                 m_media_done.insert(j.want.dir);
-            large = large || j.want.kind == k_copy;
+            large = large || j.want.kind == k_copy || j.want.kind == k_web;
             made = j.want.dir;
             if (j.want.kind != k_probe)
                 ++(ok ? m_c.media_made : m_c.media_failed);

@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <cctype>
 #include <charconv>
 
 #include "digest.h"
@@ -301,6 +302,99 @@ std::string landing_page(const share_link& s, std::string_view name, const objec
     return h;
 }
 
+// Whether a link's file is a film, by its name, which a page that plays it is decided by before the object is read.
+bool film_name(std::string_view name)
+{
+    const size_t dot = name.rfind('.');
+    if (dot == std::string_view::npos)
+        return false;
+    std::string ext(name.substr(dot + 1));
+    for (char& ch : ext)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    for (std::string_view e : {"mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "flv", "ts", "mts", "m2ts", "mpg",
+                               "mpeg", "3gp", "ogv"})
+        if (ext == e)
+            return true;
+    return false;
+}
+
+// A browser opening a link, or a chat reading it for its preview: they get a page; a player, curl or a script the
+// file.
+bool wants_page(const s3_request& r)
+{
+    if (r.header("accept").find("text/html") != std::string_view::npos)
+        return true;
+    const std::string_view ua = r.header("user-agent");
+    for (std::string_view bot : {"Discordbot", "Twitterbot", "facebookexternalhit", "Slackbot", "TelegramBot",
+                                 "WhatsApp", "Mastodon", "LinkedInBot", "SkypeUriPreview", "Iframely", "Embedly"})
+        if (ua.find(bot) != std::string_view::npos)
+            return true;
+    return false;
+}
+
+// A film's link as a page that plays it, with the Open Graph a chat embeds a player by.
+std::string film_page(std::string_view name, const object_meta* m, std::string_view page_url, std::string_view video_url,
+                      std::string_view poster_url, std::string_view prepare_url, int64_t width, int64_t height, bool https)
+{
+    auto meta = [](std::string& h, std::string_view attr, std::string_view k, std::string_view v)
+    {
+        h += "<meta ";
+        h += attr;
+        h += "=\"";
+        h += k;
+        h += "\" content=\"";
+        xml_escape_to(h, v);
+        h += "\">";
+    };
+    std::string h = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" "
+                    "content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>";
+    xml_escape_to(h, name);
+    h += "</title>";
+    meta(h, "property", "og:site_name", "socketley");
+    meta(h, "property", "og:type", "video.other");
+    meta(h, "property", "og:title", name);
+    meta(h, "property", "og:url", page_url);
+    meta(h, "property", "og:image", poster_url);
+    meta(h, "property", "og:video", video_url);
+    meta(h, "property", "og:video:url", video_url);
+    if (https)
+        meta(h, "property", "og:video:secure_url", video_url);
+    meta(h, "property", "og:video:type", "video/mp4");
+    meta(h, "property", "og:video:width", std::to_string(width));
+    meta(h, "property", "og:video:height", std::to_string(height));
+    meta(h, "name", "twitter:card", "player");
+    meta(h, "name", "twitter:image", poster_url);
+    meta(h, "name", "twitter:player:stream", video_url);
+    meta(h, "name", "twitter:player:stream:content_type", "video/mp4");
+    meta(h, "name", "theme-color", "#a855f7");
+    h += "<style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:"
+         "center;padding:16px;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#f1f0ff;background:"
+         "radial-gradient(700px 500px at 15% 10%,#6d28d9aa,transparent 60%),radial-gradient(700px 500px at 90% 90%,"
+         "#db277799,transparent 60%),#07060d}.c{width:100%;max-width:1100px}video{width:100%;max-height:80vh;"
+         "border-radius:18px;background:#000;box-shadow:0 30px 80px -30px #000}.r{display:flex;align-items:center;gap:12px;"
+         "margin-top:14px}h1{font-size:18px;margin:0;flex:1;word-break:break-all}.m{color:#b9b3d6;font-size:13px}"
+         "a.b{padding:10px 18px;border-radius:12px;color:#fff;text-decoration:none;font-weight:700;background:"
+         "linear-gradient(135deg,#a855f7,#ec4899 55%,#f97316)}</style><div class=\"c\"><video controls playsinline "
+         "preload=\"metadata\" poster=\"";
+    xml_escape_to(h, poster_url);
+    h += "\" src=\"";
+    xml_escape_to(h, video_url);
+    h += "\"></video><div class=\"r\"><h1>";
+    xml_escape_to(h, name);
+    h += "</h1>";
+    if (m)
+        h += "<span class=\"m\">" + human_size(m->size) + "</span>";
+    h += "<a class=\"b\" href=\"?download\">Download</a></div></div>";
+    // A film no browser plays as it is gets its web copy asked for, which the next look at the link plays.
+    if (!prepare_url.empty())
+    {
+        h += "<script>fetch(\"";
+        xml_escape_to(h, prepare_url);
+        h += "\").catch(function(){})</script>";
+    }
+    return h;
+}
+
 }   // namespace
 
 bool storage_run::share_open(const std::shared_ptr<conn>& c, std::string_view id, share_link& s)
@@ -541,6 +635,44 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
             if (!cc || cc->dead)
                 return;
             app_reply(cc, 200, landing_page(s, last_name_of(key), found == st::ok ? &m : nullptr, now_ms()),
+                      "text/html; charset=utf-8");
+        });
+        return;
+    }
+    // A film's link opens, for a browser or a chat's preview, on a page that plays it; ?raw is the file itself.
+    if (!s.folder && !s.burn && r.method == "GET" && !r.has_query("download") && !r.has_query("raw") &&
+        film_name(last_name_of(key)) && wants_page(r))
+    {
+        const std::string base = (secure(*c) ? "https://" : "http://") + std::string(r.header("host"));
+        m_store.stat_object(s.bucket, key, [this, weak = std::weak_ptr<conn>(c), s, key, id, base,
+                                            https = secure(*c)](st found, const object_meta& m)
+        {
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            if (found != st::ok)
+            {
+                app_reply(cc, 404, "No such file in this link.\n");
+                return;
+            }
+            std::shared_ptr<const media_probe> p;
+            bool web_made = false;
+            media_known(s.bucket, key, m.etag(), p, web_made);
+            const std::string page = base + "/~share/" + id;
+            // As it is when a browser and a chat play it as it is: H.264 in an MP4, its sound AAC or none.
+            const bool mp4 = p ? p->format.find("mp4") != std::string::npos
+                               : m.content_type.str() == "video/mp4" || m.content_type.str() == "video/quicktime";
+            const bool plays = mp4 && (!p || (p->vcodec == "h264" && !p->hdr() && (!p->audio || p->acodec == "aac")));
+            const std::string web = base + "/~media/web/~share/" + id;
+            const std::string video = plays || !web_made ? page + "?raw" : web;
+            int64_t width = p && p->width > 0 ? p->width : 1280, height = p && p->height > 0 ? p->height : 720;
+            if (height > 1080)
+            {
+                width = width * 1080 / height;
+                height = 1080;
+            }
+            app_reply(cc, 200, film_page(last_name_of(key), &m, page, video, base + "/~media/thumb-1280/~share/" + id,
+                                         plays || web_made ? std::string() : web + "?prepare", width, height, https),
                       "text/html; charset=utf-8");
         });
         return;
