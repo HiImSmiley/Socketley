@@ -506,6 +506,14 @@ void git_mirrors::tick(authenticator& auth)
         }
         if (w == it->second && !(WIFEXITED(status) && WEXITSTATUS(status) == 0))
             LOG_WARN(("storage: git: the run of " + it->first + " failed; see " + work_of(it->first) + "/log").c_str());
+        if (on_run)
+        {
+            std::string state;
+            if (read_file(work_of(it->first) + "/state.json", state))
+                for (const repo& r : repos())
+                    if (r.id == it->first)
+                        on_run(r, state);
+        }
         it = m_children.erase(it);
     }
     if (m_shard != 0 || !available())

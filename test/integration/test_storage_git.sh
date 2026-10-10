@@ -125,6 +125,16 @@ expect "the changed file is new" "$(s3 "http://127.0.0.1:$ST/code/demo/README.md
 expect "the added one is there" "$(s3 "http://127.0.0.1:$ST/code/demo/src/b.txt")" new
 expect "the removed one is gone" "$(s3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ST/code/demo/old.txt")" 404
 expect "and a second bundle is written" "$(bundles | grep -c '\.bundle$')" 2
+# What alice is told: the first run and the push each brought something; the run with nothing new brought nothing.
+# Told once the run's process is reaped, a moment after its state is written.
+for _ in $(seq 1 25); do
+    NOTES=$(curl -s -m 10 -u "$ALICE_K:$ALICE_S" -H 'X-Socketley-UI: 1' "http://127.0.0.1:$ST/~ui/notifications")
+    [ "$(echo "$NOTES" | j "len([i for i in d['items'] if i['kind']=='sync'])")" = 2 ] && break
+    sleep 0.2
+done
+expect "each run that brought something is news for whoever added the repository" \
+    "$(echo "$NOTES" | j "[i['title'] for i in d['items'] if i['kind']=='sync']")" "['demo was updated', 'demo was updated']"
+expect "and leads to its folder" "$(echo "$NOTES" | j "d['items'][0]['link']")" "#/code/demo/"
 
 # ─── thinning, by hand ──────────────────────────────────────────────────────
 # Bundles of other days, put in as a run would have named them: two and three days old, two of one week five or six

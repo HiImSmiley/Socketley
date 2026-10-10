@@ -1075,6 +1075,12 @@ public:
     int64_t sessions_since(const std::string& who);
     void ui_progress(const std::shared_ptr<conn>& c);
     void ui_progress_body(const std::shared_ptr<conn>& c);
+    // What a user is told: GET and POST /~ui/notifications, and news added for one by the runtime itself.
+    void ui_inbox(const std::shared_ptr<conn>& c);
+    void ui_inbox_body(const std::shared_ptr<conn>& c);
+    std::string inbox_path(std::string_view user) const;
+    void inbox_add(const std::string& user, std::string_view kind, std::string title, std::string text = {},
+                   std::string link = {});
     // Who else a library is shared with, /~ui/access, as statements of the bucket's policy.
     void ui_access(const std::shared_ptr<conn>& c);
     // Files and folders whose name holds a text, in every library the user lists, /~ui/search.

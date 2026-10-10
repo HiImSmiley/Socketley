@@ -87,6 +87,12 @@ a{color:inherit}
 #side{width:248px;flex:none;display:flex;flex-direction:column;padding:18px 12px;background:rgba(9,8,16,.5);border-right:1px solid var(--line);
   backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);z-index:15}
 #side .logo{padding:2px 8px 18px;cursor:pointer;border-radius:10px}
+#bBell{position:relative}
+#bBell .dotn{position:absolute;top:1px;right:1px;min-width:17px;height:17px;padding:0 4px;border-radius:99px;background:var(--grad);color:#fff;font-size:10.5px;font-weight:700;line-height:17px;text-align:center}
+.notes{display:flex;flex-direction:column;gap:4px;max-height:62vh;overflow:auto;margin:0 -6px}
+.note{display:flex;flex-direction:column;align-items:flex-start;gap:2px;padding:10px 12px;border-radius:12px;text-align:left;width:100%}
+.note:hover{background:rgba(255,255,255,.05)}.note.un{background:rgba(168,85,247,.12)}
+.note b{font-weight:600}.note span{color:var(--mut);font-size:13px}.note small{color:var(--dim);font-size:11.5px}
 #side .logo:focus-visible{outline:2px solid var(--a1)}
 .sh.row{display:flex;align-items:center;justify-content:space-between;padding-right:4px}
 .sh.row .ib{width:26px;height:26px}
@@ -517,6 +523,7 @@ body.audio #ups,body.audio #selbar{bottom:96px}
       <div class="search" id="srch"><input class="inp" id="q" placeholder="Search" spellcheck="false"></div>
       <select class="inp" id="sort" title="Sort"><option value="name">Name</option><option value="date">Newest</option><option value="size">Largest</option></select>
       <div class="seg" id="vsw"></div>
+      <button class="ib" id="bBell" title="Notifications" hidden></button>
       <button class="btn" id="bNew"></button>
       <button class="btn pri" id="bUp"></button>
     </div>
@@ -584,6 +591,7 @@ const P = {
   newfolder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v6M9 14h6"/>',
   newfile: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/>',
   eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  bell: '<path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
   eyeoff: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/><path d="M4 4l16 16"/>',
   wrap: '<path d="M4 6h16M4 12h13a3 3 0 0 1 0 6h-4m2-2-2 2 2 2M4 18h5"/>',
   menu: '<path d="M4 6h16M4 12h16M4 18h16"/>', clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
@@ -1509,6 +1517,48 @@ async function deleteLibrary(lib) {
   buckets = []; sel.clear();
   if (path[0] === lib) go([]); else load(true);
 }
+// ─── notifications ──────────────────────────────────────────────────────────
+// What the server says this user was told: news of their repositories, links and libraries, read every half minute
+// while the page is in view.
+let NOTE = { unread: 0, items: [], kinds: [] };
+async function notes() {
+  const b = $('#bBell');
+  b.hidden = !(me && me.user && !me.anonymous);
+  if (b.hidden) return;
+  try { NOTE = await (await must(await api('GET', '/~ui/notifications'))).json(); } catch (e) { return; }
+  const n = b.querySelector('.dotn');
+  n.textContent = NOTE.unread > 99 ? '99+' : String(NOTE.unread);
+  n.hidden = !NOTE.unread;
+  b.title = NOTE.unread ? NOTE.unread + ' new' : 'Notifications';
+}
+$('#bBell').append(ico('bell'), el('span', { class: 'dotn', hidden: true }));
+setInterval(() => { if (!document.hidden && auth) notes(); }, 30000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && auth) notes(); });
+$('#bBell').onclick = () => {
+  const list = el('div', { class: 'notes' });
+  if (!NOTE.items.length) list.append(el('div', { class: 'mut', style: 'padding:14px 12px', text: 'Nothing yet. Which news you get is chosen under Account.' }));
+  for (const it of NOTE.items)
+    list.append(el('button', { class: 'note' + (it.read ? '' : ' un'), onclick: () => { L.close(); if (it.link) location.hash = it.link; } },
+      el('b', { text: it.title }), it.text ? el('span', { text: it.text }) : null, el('small', { text: when(it.at) })));
+  const L = modal('Notifications', list, [btn('gear', 'Settings', () => { L.close(); accountDlg(); }, ''), el('span', { style: 'flex:1' }),
+    NOTE.items.length ? btn('trash', 'Clear', async () => { try { await must(await api('POST', '/~ui/notifications', { body: JSON.stringify({ action: 'clear' }) })); L.close(); notes(); } catch (e) { fail(e); } }, '') : null]);
+  // Opened is read: the count goes, the marks stay until the next look.
+  if (NOTE.unread) api('POST', '/~ui/notifications', { body: JSON.stringify({ action: 'read' }) }).then(() => notes()).catch(() => {});
+};
+async function noteSettings(box) {
+  box.append(el('h4', { text: 'Notifications' }), el('p', { class: 'mut', style: 'font-size:13px', text: 'What the bell at the top tells you about.' }));
+  const T = el('div', { style: 'display:flex;flex-direction:column;gap:8px;margin-bottom:18px' });
+  box.append(T);
+  let d;
+  try { d = await (await must(await api('GET', '/~ui/notifications'))).json(); } catch (e) { T.append(el('div', { class: 'mut', text: e.message })); return; }
+  const boxes = d.kinds.map(k => { const c = el('input', { type: 'checkbox' }); c.checked = k.on; c.dataset.k = k.id; return c; });
+  const save = async () => {
+    try { await must(await api('POST', '/~ui/notifications', { body: JSON.stringify({ action: 'prefs', off: boxes.filter(c => !c.checked).map(c => c.dataset.k) }) })); toast('Saved'); }
+    catch (e) { fail(e); }
+  };
+  d.kinds.forEach((k, i) => { boxes[i].onchange = save; T.append(el('label', { class: 'chk' }, boxes[i], el('span', { text: k.label }))); });
+}
+
 // The library a user's repositories go to unless another is named, one of their own.
 function gitLibrary() {
   const slug = ((me && me.user) || '').toLowerCase().replace(/[^a-z0-9.]+/g, '-').replace(/^[.-]+|[.-]+$/g, '').slice(0, 59).replace(/[.-]+$/, '');
@@ -1915,6 +1965,7 @@ function accountDlg() {
       el('span', { class: 'chip' }, el('span', { text: (me.name || me.user) + (me.name && me.name !== me.user ? ' · ' + me.user : '') })),
       me.admin ? el('span', { class: 'chip' }, el('span', { text: 'admin' })) : null,
       el('span', { class: 'chip' }, el('span', { text: me.by_password ? 'signed in with your password' : 'signed in with a key' }))));
+    await noteSettings(box);
     box.append(el('h4', { text: 'Password' }), el('div', { style: 'display:flex;align-items:center;gap:10px;margin-bottom:18px' },
       el('span', { class: 'mut', text: me.password ? 'You sign in with your name and password.' : 'You have no password yet: you sign in with a key.' }),
       btn('lock', me.password ? 'Change' : 'Set a password', () => changePasswordDlg(false), 'sm')));
@@ -3641,6 +3692,7 @@ async function start() {
   load();
   restore();
   if (!liveT) liveT = setInterval(liveCheck, 1000);
+  notes();
 }
 // A session the browser still holds signs in at once; an invitation's link asks for a user of one's own first.
 (async () => {

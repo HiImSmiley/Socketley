@@ -26,6 +26,7 @@
 #include "s3_names.h"
 #include "s3_quota.h"
 #include "../../shared/git_names.h"
+#include "../../shared/logging.h"
 #include "../../shared/http_framing.h"
 #include "../../shared/state_persistence.h"
 #include "../../shared/replaced_file.h"
@@ -221,6 +222,93 @@ std::string ui_statement(std::string_view bucket, std::string_view user, bool wr
     return o;
 }
 
+// ── what a user is told ──
+// The kinds of news a user may turn off, and what the interface calls them.
+constexpr std::pair<std::string_view, std::string_view> inbox_kinds[] = {
+    {"sync", "A repository or a synced folder brought changes"},
+    {"share", "Someone downloaded from or uploaded to one of your links"},
+    {"library", "Someone shared a library with you"},
+};
+constexpr size_t inbox_max = 200;
+
+bool inbox_kind(std::string_view k)
+{
+    for (const auto& [id, label] : inbox_kinds)
+        if (id == k)
+            return true;
+    return false;
+}
+
+struct inbox_item
+{
+    int64_t seq{0}, at{0};
+    std::string kind, title, text, link;
+    bool read{false};
+};
+struct inbox
+{
+    int64_t seq{0};
+    std::vector<std::string> off;
+    std::vector<inbox_item> items;
+};
+
+inbox read_inbox(const std::string& path)
+{
+    inbox b;
+    std::string text;
+    jvalue doc;
+    if (!read_whole_file(path, text) || !json_reader(text).document(doc))
+        return b;
+    b.seq = static_cast<int64_t>(num_of(doc, "seq"));
+    if (const jvalue* off = member(doc, "off"); off && off->k == jvalue::kind::array)
+        for (const jvalue& k : off->items)
+            if (k.k == jvalue::kind::string && inbox_kind(k.s))
+                b.off.push_back(k.s);
+    if (const jvalue* items = member(doc, "items"); items && items->k == jvalue::kind::array)
+        for (const jvalue& i : items->items)
+        {
+            inbox_item it;
+            it.seq   = static_cast<int64_t>(num_of(i, "seq"));
+            it.at    = static_cast<int64_t>(num_of(i, "at"));
+            it.kind  = str_of(i, "kind");
+            it.title = str_of(i, "title");
+            it.text  = str_of(i, "text");
+            it.link  = str_of(i, "link");
+            const jvalue* r = member(i, "read");
+            it.read = r && r->k == jvalue::kind::boolean && r->b;
+            b.items.push_back(std::move(it));
+        }
+    return b;
+}
+
+std::string inbox_item_json(const inbox_item& it)
+{
+    std::string o = "{\"seq\":" + std::to_string(it.seq) + ",\"at\":" + std::to_string(it.at) + ",\"kind\":";
+    jstr(o, it.kind);
+    o += ",\"title\":";
+    jstr(o, it.title);
+    o += ",\"text\":";
+    jstr(o, it.text);
+    o += ",\"link\":";
+    jstr(o, it.link);
+    o += it.read ? ",\"read\":true}" : ",\"read\":false}";
+    return o;
+}
+
+std::string inbox_json(const inbox& b)
+{
+    std::string o = "{\"seq\":" + std::to_string(b.seq) + ",\"off\":[";
+    for (size_t i = 0; i < b.off.size(); ++i)
+    {
+        o += i ? "," : "";
+        jstr(o, b.off[i]);
+    }
+    o += "],\"items\":[";
+    for (size_t i = 0; i < b.items.size(); ++i)
+        o += (i ? "," : "") + inbox_item_json(b.items[i]);
+    return o + "]}\n";
+}
+
 }   // namespace
 
 bool storage_run::has_ui_cookie(const conn& c)
@@ -300,6 +388,11 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
     if (r.key == "progress")
     {
         ui_progress(c);
+        return;
+    }
+    if (r.key == "notifications")
+    {
+        ui_inbox(c);
         return;
     }
     if (r.key == "access")
@@ -499,6 +592,176 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
     send_response(c, std::move(out));
 }
 
+std::string storage_run::inbox_path(std::string_view user) const
+{
+    return m_store.options().dir + "/.ui/notify/" + sha256_hex(user).substr(0, 32) + ".json";
+}
+
+// News for `user`, kept in a file of their own under a lock beside it, unless the user turned its kind off; the
+// newest 200 are kept.
+void storage_run::inbox_add(const std::string& user, std::string_view kind, std::string title, std::string text,
+                            std::string link)
+{
+    if (user.empty() || !inbox_kind(kind))
+        return;
+    const std::string dir = m_store.options().dir + "/.ui";
+    if ((::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST) ||
+        (::mkdir((dir + "/notify").c_str(), 0700) < 0 && errno != EEXIST))
+        return;
+    const std::string path = inbox_path(user);
+    const int fd = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0 || ::flock(fd, LOCK_EX) < 0)
+    {
+        if (fd >= 0)
+            ::close(fd);
+        return;
+    }
+    inbox b = read_inbox(path);
+    if (std::find(b.off.begin(), b.off.end(), kind) == b.off.end())
+    {
+        inbox_item it;
+        it.seq   = ++b.seq;
+        it.at    = wall_ms();
+        it.kind  = std::string(kind);
+        it.title = std::move(title);
+        it.text  = std::move(text);
+        it.link  = std::move(link);
+        b.items.insert(b.items.begin(), std::move(it));
+        if (b.items.size() > inbox_max)
+            b.items.resize(inbox_max);
+        if (!replace_file(path, inbox_json(b), false))
+            LOG_WARN(("storage: a notification for " + user + " could not be kept").c_str());
+    }
+    ::flock(fd, LOCK_UN);
+    ::close(fd);
+}
+
+// GET says what the signed-in user was told, the newest fifty, how many unread, and which kinds there are and which
+// are off; POST {action: read | clear | prefs, off: [kinds]} changes that, and {action: post, kind, title, text}
+// tells the user something of its own, as a sync runtime signed in as the user does.
+void storage_run::ui_inbox(const std::shared_ptr<conn>& c)
+{
+    s3_request& r = c->req;
+    if (r.method != "GET" && r.method != "POST")
+    {
+        app_reply(c, 405, "Notifications are read with GET and changed with POST.\n");
+        return;
+    }
+    if (!app_login(c, "socketley"))
+        return;
+    if (r.method == "POST")
+    {
+        if (r.chunked || (r.has_content_length && r.content_length > 16 * 1024))
+        {
+            r.keep_alive = false;
+            app_reply(c, 413, "Request body too large.\n");
+            return;
+        }
+        collect_body(c, 16 * 1024);
+        return;
+    }
+    inbox b;
+    if (!c->anonymous)
+        b = read_inbox(inbox_path(c->user ? c->user->id : c->principal));
+    size_t unread = 0;
+    for (const inbox_item& it : b.items)
+        unread += !it.read;
+    std::string o = "{\"unread\":" + std::to_string(unread) + ",\"kinds\":[";
+    bool first = true;
+    for (const auto& [id, label] : inbox_kinds)
+    {
+        o += first ? "{\"id\":" : ",{\"id\":";
+        first = false;
+        jstr(o, id);
+        o += ",\"label\":";
+        jstr(o, label);
+        o += std::find(b.off.begin(), b.off.end(), id) == b.off.end() ? ",\"on\":true}" : ",\"on\":false}";
+    }
+    o += "],\"items\":[";
+    for (size_t i = 0; i < b.items.size() && i < 50; ++i)
+        o += (i ? "," : "") + inbox_item_json(b.items[i]);
+    o += "]}";
+    response out;
+    out.status = 200;
+    out.headers.emplace_back("Content-Type", "application/json");
+    out.headers.emplace_back("Cache-Control", "no-store");
+    out.body = std::move(o);
+    send_response(c, std::move(out));
+}
+
+void storage_run::ui_inbox_body(const std::shared_ptr<conn>& c)
+{
+    if (c->anonymous)
+    {
+        app_reply(c, 403, "Nobody in particular is told nothing.\n");
+        return;
+    }
+    jvalue req;
+    if (!json_reader(c->body).document(req))
+    {
+        app_reply(c, 400, "The body is a JSON object with an action: read, clear, prefs or post.\n");
+        return;
+    }
+    const std::string who = c->user ? c->user->id : c->principal;
+    const std::string action = str_of(req, "action");
+    if (action == "post")
+    {
+        // What a user tells itself is news of its own syncing, the one kind made outside this runtime.
+        const std::string kind = str_of(req, "kind"), title = str_of(req, "title");
+        if (kind != "sync" || title.empty() || title.size() > 200)
+        {
+            app_reply(c, 400, "A post is of kind sync, with a title of 1 to 200 bytes.\n");
+            return;
+        }
+        std::string text = str_of(req, "text");
+        if (text.size() > 1000)
+            text.resize(1000);
+        inbox_add(who, kind, title, std::move(text), str_of(req, "link").substr(0, 1000));
+        app_reply(c, 204);
+        return;
+    }
+    if (action != "read" && action != "clear" && action != "prefs")
+    {
+        app_reply(c, 400, "The action is read, clear, prefs or post.\n");
+        return;
+    }
+    const std::string dir = m_store.options().dir + "/.ui";
+    if ((::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST) ||
+        (::mkdir((dir + "/notify").c_str(), 0700) < 0 && errno != EEXIST))
+    {
+        app_reply(c, 500, "The notifications' folder cannot be made.\n");
+        return;
+    }
+    const std::string path = inbox_path(who);
+    const int fd = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0 || ::flock(fd, LOCK_EX) < 0)
+    {
+        if (fd >= 0)
+            ::close(fd);
+        app_reply(c, 500, "The notifications could not be locked.\n");
+        return;
+    }
+    inbox b = read_inbox(path);
+    if (action == "read")
+        for (inbox_item& it : b.items)
+            it.read = true;
+    else if (action == "clear")
+        b.items.clear();
+    else
+    {
+        b.off.clear();
+        if (const jvalue* off = member(req, "off"); off && off->k == jvalue::kind::array)
+            for (const jvalue& k : off->items)
+                if (k.k == jvalue::kind::string && inbox_kind(k.s) &&
+                    std::find(b.off.begin(), b.off.end(), k.s) == b.off.end())
+                    b.off.push_back(k.s);
+    }
+    const bool ok = replace_file(path, inbox_json(b), false);
+    ::flock(fd, LOCK_UN);
+    ::close(fd);
+    app_reply(c, ok ? 204 : 500, ok ? std::string{} : "The notifications could not be kept.\n");
+}
+
 // GET lists the films the signed-in user has part watched, those it may still read in the version it watched, the
 // most recent first; POST {bucket, key, t, d} keeps where one was left, and t below 0 forgets it. Each user's are a
 // file of their own, <dir>/.ui/progress/<sha-256 of the user>.json, changed under a lock beside it, entry by entry,
@@ -615,6 +878,8 @@ void storage_run::ui_body(const std::shared_ptr<conn>& c)
         ui_iam_body(c);
     else if (c->req.key == "invite")
         ui_invite_body(c);
+    else if (c->req.key == "notifications")
+        ui_inbox_body(c);
     else
         ui_progress_body(c);
 }
@@ -844,6 +1109,13 @@ void storage_run::ui_access_body(const std::shared_ptr<conn>& c)
             app_reply(c, 400, "The policy would not be one: " + err.message + "\n");
             return;
         }
+    }
+    if (access != "none")
+    {
+        const std::string by = c->user ? c->user->id : c->principal;
+        inbox_add(user, "library", by + " shared " + bucket + " with you",
+                  access == "write" ? "You can view and change what is in it." : "You can view what is in it.",
+                  "#/" + bucket + "/");
     }
     store_doc(c, bucket_doc::policy, bucket, std::move(text), 204);
 }

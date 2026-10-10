@@ -706,6 +706,10 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
                 if (allowed && !now.notify.empty())
                     share_tell(now.notify, "downloaded", now.bucket, now.key, now.downloads, now.max_downloads, now.expires_ms,
                                now.burn);
+                if (allowed)
+                    inbox_add(now.owner, "share", "Downloaded: " + std::string(last_name_of(key)),
+                              std::to_string(now.downloads) + " of " + std::to_string(now.max_downloads) +
+                                  " downloads through your link");
             }
             ::flock(fd, LOCK_UN);
         }
@@ -734,8 +738,13 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
     // The object itself, as the S3 path serves it, judged by the link and not by any policy.
     if (r.method == "PUT")
     {
-        c->on_answer = [this](const std::shared_ptr<conn>& cc, response& resp)
+        // A file put into a folder through its link is news for whoever made the link.
+        c->on_answer = [this, owner = s.owner, bucket = s.bucket, put = key](const std::shared_ptr<conn>& cc, response& resp)
         {
+            if (resp.status == 200)
+                inbox_add(owner, "share", "Uploaded through your link: " + std::string(last_name_of(put)),
+                          "Into " + bucket + "/" + put.substr(0, put.rfind('/') + 1),
+                          "#/" + bucket + "/" + put.substr(0, put.rfind('/') + 1));
             response out;
             out.status = resp.status == 200 ? 201 : resp.status;
             send_response(cc, std::move(out));

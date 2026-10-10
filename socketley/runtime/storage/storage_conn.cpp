@@ -1,6 +1,8 @@
 // The wire side of a storage run: accepting, reading, writing, HTTP framing,
 // the streaming of a body into an object and of an object out to a socket.
 #include "storage_run.h"
+#include "json_doc.h"
+#include "../../shared/git_names.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -210,6 +212,38 @@ bool storage_run::open(std::string& err)
                        ":" + std::to_string(m_owner.effective_port());
         m_git.open(m_store.options().dir, m_store.shard(), endpoint, m_tls != nullptr, why,
                    std::string(m_owner.get_cert_path()));
+        // A run that brought something, or that failed, is news for whoever added the repository.
+        m_git.on_run = [this](const git_mirrors::repo& r, const std::string& state)
+        {
+            jvalue st;
+            if (!json_reader(state).document(st))
+                return;
+            const jvalue* ok = nullptr;
+            const jvalue* changed = nullptr;
+            std::string files, error, commit;
+            for (const auto& [k, v] : st.members)
+            {
+                if (k == "ok")
+                    ok = &v;
+                else if (k == "changed")
+                    changed = &v;
+                else if (k == "files")
+                    files = v.s;
+                else if (k == "error")
+                    error = v.s;
+                else if (k == "commit")
+                    commit = v.s;
+            }
+            const std::string name = r.name.empty() ? git_names::name_of(r.url) : r.name;
+            const std::string link = "#/" + r.bucket + "/" + name + "/";
+            if (ok && ok->k == jvalue::kind::boolean && !ok->b)
+                inbox_add(r.owner, "sync", name + " could not be pulled", error.empty() ? r.url : error, link);
+            else if (changed && changed->k == jvalue::kind::boolean && changed->b)
+                inbox_add(r.owner, "sync", name + " was updated",
+                          (files.empty() || files == "0" ? std::string("New commits") : files + " files written") +
+                              (commit.empty() ? "" : " at " + commit.substr(0, 10)) + ", in " + r.bucket + "/" + name,
+                          link);
+        };
     }
     reap_uploads();
     LOG_INFO(("storage: " + std::to_string(rep.buckets) + " bucket(s), " +

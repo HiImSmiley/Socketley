@@ -12,6 +12,7 @@
 // The first shard runs the schedule; a run asked for is started by whichever shard is asked, and the lock a run holds
 // in its directory keeps two from running at once.
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <sys/types.h>
@@ -45,6 +46,8 @@ public:
     bool enabled() const { return !m_children.empty() || (m_shard == 0 && available()); }
     // Once a second: runs that ended are reaped, and once a minute the first shard starts what is due.
     void tick(authenticator& auth);
+    // Told of a run that ended, with the repository and its state.json as the run wrote it.
+    std::function<void(const repo&, const std::string& state)> on_run;
     void stop();
 
     std::vector<repo> repos();
