@@ -187,9 +187,13 @@ elif mode == "wsclient":
     enc = lambda fs: b"".join(struct.pack("!I", len(f)) + f for f in fs)
     e = enc(want)
     g = enc(got) + ("|bad=%d|extra=%d" % (len(bad), extra)).encode() * (1 if bad or extra else 0)
-    print("expect=%s %d got=%s %d frames=%d bad=%d extra=%d%s" % (
+    # The first frame that differs, so a reorder reads apart from bytes changed inside a frame.
+    diff = next((k for k in range(min(len(want), len(got))) if want[k] != got[k]), None)
+    where = "" if diff is None else " differs at frame %d: want %r got %r" % (
+        diff, want[diff][:12] + b"..%d" % len(want[diff]), got[diff][:12] + b"..%d" % len(got[diff]))
+    print("expect=%s %d got=%s %d frames=%d bad=%d extra=%d%s%s" % (
         hashlib.sha256(e).hexdigest(), len(e), hashlib.sha256(g).hexdigest(), len(g),
-        len(got), len(bad), extra, (" first: " + bad[0]) if bad else ""), flush=True)
+        len(got), len(bad), extra, (" first: " + bad[0]) if bad else "", where), flush=True)
 elif mode == "sink":
     ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)

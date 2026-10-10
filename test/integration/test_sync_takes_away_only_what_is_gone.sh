@@ -173,7 +173,8 @@ expect "a --dir ending in a slash keeps every name whole" "$(keys | tr ' ' '\n' 
 # Resolved on the resolver's own thread, whose answer has to wake the run's loop: an address alone never asks.
 S -o /dev/null -X PUT "http://127.0.0.1:$P/named"
 "$BIN" create sync named --dir "$T/src" --storage "http://localhost:$P/named" --credentials "$T/creds" -s >/dev/null 2>&1
-for _ in $(seq 1 30); do [ "$(keys named | wc -w)" = 4 ] && break; sleep 0.5; done
+# The worker's figures follow its work, so the failure count is waited for beside the keys.
+for _ in $(seq 1 30); do [ "$(keys named | wc -w)" = 4 ] && [ -n "$(st named failures)" ] && break; sleep 0.5; done
 expect "a target named by a host is resolved and carried to" "$(keys named | wc -w) $(st named failures)" "4 0"
 "$BIN" remove named >/dev/null 2>&1
 

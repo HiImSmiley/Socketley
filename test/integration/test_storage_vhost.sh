@@ -27,7 +27,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 HERE=$(cd "$(dirname "$0")" && pwd)
 # Taken before daemon_isolate moves HOME.
-COMPAT="$HOME/socketley-perf/compat/bin"
+COMPAT="${SOCKETLEY_COMPAT_BIN:-$HOME/socketley-perf/compat/bin}"
 [ -d "$COMPAT" ] && PATH="$COMPAT:$PATH"
 . "$HERE/lib_ports.sh"
 . "$HERE/lib_daemon.sh"

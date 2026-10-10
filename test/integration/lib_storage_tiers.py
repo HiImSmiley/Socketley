@@ -159,9 +159,10 @@ s.put_bucket_lifecycle_configuration(Bucket="ver", LifecycleConfiguration={"Rule
     rule("nc", {"NoncurrentVersionTransitions": [{"NoncurrentDays": 1, "StorageClass": "COLD"}]})]})
 v1 = s.put_object(Bucket="ver", Key="k", Body=noise[:300000])["VersionId"]
 v2 = s.put_object(Bucket="ver", Key="k", Body=text)["VersionId"]
-moved = stats().get("tier_moved", 0)
-check("a noncurrent version moves", wait_for(lambda: stats().get("tier_moved", 0) > moved, 60), stats())
-vers = {v["VersionId"]: v["StorageClass"] for v in s.list_object_versions(Bucket="ver")["Versions"]}
+# Asked of the version itself: the counter also moves for anything else the hot bucket's rule is still taking.
+ver_classes = lambda: {v["VersionId"]: v["StorageClass"] for v in s.list_object_versions(Bucket="ver")["Versions"]}
+check("a noncurrent version moves", wait_for(lambda: ver_classes().get(v1) == "COLD", 60), ver_classes())
+vers = ver_classes()
 check("the versions are listed with their classes", vers == {v1: "COLD", v2: "STANDARD"}, vers)
 check("and the moved one reads back by its id", get("k", "ver", VersionId=v1) == noise[:300000])
 check("while the latest stays here", get("k", "ver") == text)
