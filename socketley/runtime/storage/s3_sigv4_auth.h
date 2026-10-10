@@ -117,6 +117,7 @@ public:
     size_t credential_count() const { return m_creds.size(); }
     std::string display_name(std::string_view id) const override;
     uint64_t max_bytes_of(std::string_view id) const override;
+    void keep_current() override { maybe_reload(); }
     bool issue_session(std::string_view access_key, int64_t expires, std::string_view policy, std::string_view role,
                        session_credentials& out) override;
     bool issue_session_as(std::string_view user_id, int64_t expires, std::string_view policy, std::string_view role,

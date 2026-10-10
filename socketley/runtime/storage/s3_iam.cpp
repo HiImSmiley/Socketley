@@ -1240,9 +1240,8 @@ struct api
         if (a == "CreateAccessKey")
         {
             const std::string n = text("UserName");
-            // A user of the credentials file signs with that file's keys, so a key made here would never sign.
-            const auto user = s.users.find(n);
-            if (user == s.users.end() || user->second.external)
+            // A user of the credentials file may hold keys of the IAM API beside the file's, which sign as that user.
+            if (!user_or_file(n))
                 return no_entity("user", n);
             size_t have = 0;
             for (const auto& [k, key] : s.keys)
@@ -1270,7 +1269,7 @@ struct api
         if (a == "ListAccessKeys")
         {
             const std::string n = text("UserName");
-            if (!s.users.count(n))
+            if (!s.users.count(n) && !(taken && taken(ctx, n)))
                 return no_entity("user", n);
             std::string x = begin() + "<AccessKeyMetadata>";
             for (const auto& [id, k] : s.keys)

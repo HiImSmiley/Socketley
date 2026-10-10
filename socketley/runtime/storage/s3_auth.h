@@ -209,6 +209,8 @@ public:
     virtual std::string display_name(std::string_view id) const { return std::string(id); }
     // The quota on the bytes of the buckets user `id` owns, 0 for none or for a user no longer known.
     virtual uint64_t max_bytes_of(std::string_view /*id*/) const { return 0; }
+    // Takes up a change another shard wrote to the users, as a request it authenticates would.
+    virtual void keep_current() {}
     // Temporary credentials signing for the user of long-term key `access_key` until `expires`, bounded by `policy`
     // when it is not empty; false for a key that is not one, which an authenticator without keys has none of.
     virtual bool issue_session(std::string_view /*access_key*/, int64_t /*expires*/, std::string_view /*policy*/,

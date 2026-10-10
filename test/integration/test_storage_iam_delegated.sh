@@ -184,8 +184,11 @@ check("and nothing it does not name", code(lambda: di.get_user(UserName="bob")),
 iam.put_user_policy(UserName="dana", PolicyName="get", PolicyDocument=doc(("Allow", "iam:GetUser", "arn:aws:iam:::user/*")))
 settle()
 check("and its IAM policy beside the file's delegates more", code(lambda: di.get_user(UserName="bob")), "ok")
-check("a credentials-file user is given no IAM key, which would never sign",
-      code(lambda: iam.create_access_key(UserName="dana")), "NoSuchEntity")
+# A key of the IAM API beside the file's, which signs as that user.
+dk = iam.create_access_key(UserName="dana")["AccessKey"]
+settle()
+check("a credentials-file user is given an IAM key, which signs as it",
+      code(lambda: iam_of((dk["AccessKeyId"], dk["SecretAccessKey"])).list_users()), "ok")
 
 # An admin keeps every right, whatever its own policies deny.
 iam.put_user_policy(UserName="root", PolicyName="noiam", PolicyDocument=doc(("Deny", "iam:*", "*")))

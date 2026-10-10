@@ -1010,6 +1010,8 @@ public:
                           std::function<void()> then);
     // A versioned bucket's deleted files under a folder, and one of them brought back by removing its delete marker.
     void dav_trash(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix);
+    // A library emptied of every version of every file and then removed, as its owner asks from the UI.
+    void dav_purge(const std::shared_ptr<conn>& c, std::string bucket);
     void dav_restore(const std::shared_ptr<conn>& c, std::string bucket, std::string key);
     // A folder's listing as compact JSON for the web interface, with an ETag of its own (?list).
     void dav_list(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix);

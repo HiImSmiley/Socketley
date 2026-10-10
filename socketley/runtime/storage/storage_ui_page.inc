@@ -86,7 +86,11 @@ a{color:inherit}
 #app{display:flex;height:100%}
 #side{width:248px;flex:none;display:flex;flex-direction:column;padding:18px 12px;background:rgba(9,8,16,.5);border-right:1px solid var(--line);
   backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);z-index:15}
-#side .logo{padding:2px 8px 18px}
+#side .logo{padding:2px 8px 18px;cursor:pointer;border-radius:10px}
+#side .logo:focus-visible{outline:2px solid var(--a1)}
+.sh.row{display:flex;align-items:center;justify-content:space-between;padding-right:4px}
+.sh.row .ib{width:26px;height:26px}
+.nav .own{margin-left:auto;font-size:11px;color:var(--dim);max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #side>*:not(#libs){flex-shrink:0}
 .nav{display:flex;align-items:center;gap:12px;width:100%;padding:9px 12px;border-radius:10px;color:var(--mut);font-weight:500;text-align:left;transition:background .15s,color .15s}
 .nav:hover{background:rgba(255,255,255,.05);color:var(--fg)}
@@ -492,7 +496,7 @@ body.audio #ups,body.audio #selbar{bottom:96px}
 </div>
 <div id="app" hidden>
   <aside id="side">
-    <div class="logo"><div class="mk"><svg viewBox="0 0 24 24"><path d="M7 5.5v13l11-6.5z"/></svg></div>socketley</div>
+    <div class="logo" id="homeLogo" role="link" tabindex="0" title="Home"><div class="mk"><svg viewBox="0 0 24 24"><path d="M7 5.5v13l11-6.5z"/></svg></div>socketley</div>
     <button class="nav" id="nHome"></button>
     <button class="nav" id="nLinks"></button>
     <div class="sh">Libraries</div>
@@ -580,6 +584,7 @@ const P = {
   newfolder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v6M9 14h6"/>',
   newfile: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/>',
   eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  eyeoff: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/><path d="M4 4l16 16"/>',
   wrap: '<path d="M4 6h16M4 12h13a3 3 0 0 1 0 6h-4m2-2-2 2 2 2M4 18h5"/>',
   menu: '<path d="M4 6h16M4 12h16M4 18h16"/>', clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
   spark: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6"/>',
@@ -634,6 +639,11 @@ const keyOf = it => it.segs.join('/') + (it.dir ? '/' : '');
 let me = null;
 let auth = false;
 let path = [], items = [], buckets = [], shown = [], bucketsAt = 0;
+// What is drawn beside the folder's own list, the films being watched, which a menu acts on as well.
+let extraShown = [];
+// Whether other people's libraries are shown, in a section of their own.
+let showOthers = store.get('skl-others', '1') === '1';
+const mineLib = b => !b.owner || !me || !me.user || b.owner === me.user;
 let view = store.get('skl-view', 'grid'), sortBy = store.get('skl-sort', 'name'), query = '';
 const sel = new Set(); let anchor = -1;
 
@@ -772,6 +782,8 @@ async function propfind(p) {
     const segs = href.replace(/^.*?\/~dav\//, '').split('/').filter(Boolean).map(s => { try { return decodeURIComponent(s); } catch (e) { return s; } });
     const it = { name: g('displayname') || segs[segs.length - 1], segs, dir, size: +g('getcontentlength') || 0, type: g('getcontenttype'), mod: g('getlastmodified') };
     it.kind = dir ? (segs.length === 1 ? 'bucket' : 'dir') : kind(it.name, it.type);
+    const ow = x.getElementsByTagNameNS('urn:socketley:storage', 'owner')[0];
+    if (ow) it.owner = ow.textContent;
     out.push(it);
   }
   return out;
@@ -798,12 +810,23 @@ function side() {
   $('#nUsers').hidden = !(me && me.admin && me.user);
   paintThemes();
   const L = $('#libs'); L.textContent = '';
-  for (const b of buckets) {
+  const entry = b => {
     const h = hue(b.name);
-    L.append(el('button', { class: 'nav' + (path[0] === b.name ? ' on' : ''), onclick: () => go([b.name]) },
-      el('span', { class: 'dot', style: 'background:linear-gradient(135deg,hsl(' + h + ' 75% 60%),hsl(' + (h + 50) + ' 75% 45%))' }), el('span', { text: b.name === tmpName() ? 'Temporary files' : b.name, title: b.name })));
+    const e = el('button', { class: 'nav' + (path[0] === b.name ? ' on' : ''), onclick: () => go([b.name]) },
+      el('span', { class: 'dot', style: 'background:linear-gradient(135deg,hsl(' + h + ' 75% 60%),hsl(' + (h + 50) + ' 75% 45%))' }), el('span', { text: b.name === tmpName() ? 'Temporary files' : b.name, title: b.name }),
+      mineLib(b) ? null : el('span', { class: 'own', text: b.owner, title: 'Belongs to ' + b.owner }));
+    e.addEventListener('contextmenu', ev => { ev.preventDefault(); popup({ x: ev.clientX, y: ev.clientY }, libActions(b)); });
+    return e;
+  };
+  const mine = buckets.filter(mineLib), others = buckets.filter(b => !mineLib(b));
+  for (const b of mine) L.append(entry(b));
+  if (!mine.length) L.append(el('div', { class: 'dim', style: 'padding:6px 12px;font-size:13px', text: 'No libraries yet' }));
+  if (others.length) {
+    L.append(el('div', { class: 'sh row' }, el('span', { text: 'Other people’s' }),
+      ibtn(showOthers ? 'eye' : 'eyeoff', showOthers ? 'Hide other people’s libraries' : 'Show other people’s libraries', () => { showOthers = !showOthers; store.set('skl-others', showOthers ? '1' : '0'); side(); if (!path.length) render(); })));
+    if (showOthers) for (const b of others) L.append(entry(b));
+    else L.append(el('div', { class: 'dim', style: 'padding:2px 12px 6px;font-size:12.5px', text: others.length + (others.length === 1 ? ' library, hidden' : ' libraries, hidden') }));
   }
-  if (!buckets.length) L.append(el('div', { class: 'dim', style: 'padding:6px 12px;font-size:13px', text: 'No libraries yet' }));
 }
 function crumbs() {
   const c = $('#crumbs'); c.textContent = '';
@@ -860,6 +883,9 @@ function searchSection() {
   return el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('search')), el('span', { text: 'In all libraries' }), el('span', { class: 'n', text: String(list.length) + (found.more ? '+' : '') })), T);
 }
 $('#menuB').append(ico('menu')); $('#menuB').onclick = () => $('#side').classList.toggle('open');
+// The mark and the name lead home, as the Home entry below them does.
+$('#homeLogo').onclick = () => { $('#side').classList.remove('open'); go([]); };
+$('#homeLogo').onkeydown = e => { if (e.key === 'Enter') $('#homeLogo').onclick(); };
 $('#srch').prepend(ico('search'));
 
 let loadSeq = 0;
@@ -1009,6 +1035,7 @@ function render() {
   closePop();
   const list = sorted(items.filter(it => !query || it.name.toLowerCase().includes(query)));
   shown = list;
+  extraShown = [];
   C.append(hero(list));
   if (!items.length) {
     C.append(el('div', { class: 'empty' }, ico(path.length ? 'upload' : 'bucket', 'big'),
@@ -1020,13 +1047,15 @@ function render() {
   // The list holds the folder already; only what is not in it, the films being watched, is added below it.
   else if (view === 'list') {
     const cw = !path.length ? watching() : [];
+    extraShown = cw;
     if (cw.length) C.append(section('Continue watching', 'vid', cw, it => videoCard(it, cw)));
   }
   else {
     if (!path.length) {
       const cw = watching();
-      if (cw.length && !query) C.append(section('Continue watching', 'vid', cw, it => videoCard(it, cw)));
-      C.append(section('Libraries', 'lib', list, libCard) || '');
+      if (cw.length && !query) { extraShown = cw; C.append(section('Continue watching', 'vid', cw, it => videoCard(it, cw))); }
+      C.append(section('Libraries', 'lib', list.filter(mineLib), libCard) || '');
+      if (showOthers) C.append(section('Other people’s libraries', 'lib', list.filter(b => !mineLib(b)), libCard) || '');
     } else {
       const by = k => list.filter(it => it.kind === k);
       const vids = by('video'), pics = by('image'), auds = by('audio');
@@ -1046,7 +1075,7 @@ function hero(list) {
   if (!path.length) {
     const hr = new Date().getHours();
     h.append(el('div', { class: 'kick', text: 'socketley' }), el('h1', {}, el('span', { text: (hr < 5 ? 'Good night' : hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening') + ', ' }), el('span', { class: 'grad-t', text: 'welcome back' })),
-      el('div', { class: 'stats' }, el('span', { class: 'chip' }, ico('bucket'), el('span', { text: buckets.length + (buckets.length === 1 ? ' library' : ' libraries') }))));
+      el('div', { class: 'stats' }, el('span', { class: 'chip' }, ico('bucket'), el('span', { text: buckets.filter(mineLib).length + (buckets.filter(mineLib).length === 1 ? ' library' : ' libraries') }))));
     h.append(el('div', { class: 'acts' }, btn('send', 'Send a file', () => sendDlg(), 'pri'), btn('plus', 'New library', newBucket), btn('link', 'Shared links', linksDlg)));
   } else {
     const total = items.reduce((s, it) => s + it.size, 0);
@@ -1062,7 +1091,7 @@ function hero(list) {
     if (auds.length) acts.append(btn('music', 'Play music', () => playAudio(auds[0], auds), vids.length ? '' : 'pri'));
     acts.append(btn('upload', 'Upload', upFiles, vids.length || auds.length ? '' : 'pri'), btn('send', 'Send', () => sendDlg()), btn('newfile', 'New text file', newText));
     if (items.length) acts.append(btn('archive', 'Download all', () => downloadZip([])));
-    if (path.length) acts.append(btn('restore', 'Trash', trashDlg));
+    if (path.length) acts.append(btn('restore', 'Trash', () => trashDlg()));
     // Sharing the library with other users, for whoever may change its policy.
     if (path.length === 1 && me && !me.anonymous) {
       const lib = path[0];
@@ -1109,7 +1138,7 @@ function section(title, cls, list, make) {
   if (!list.length) return null;
   const g = el('div', { class: 'grid ' + cls });
   chunked(g, list, make, () => el('div', { class: 'more-mark' }));
-  return el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico(title === 'Continue watching' ? 'clock' : title === 'Other files' ? 'file' : SECI[cls])), el('span', { text: title }), el('span', { class: 'n', text: String(list.length) })), g);
+  return el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico(title === 'Continue watching' ? 'clock' : title === 'Other files' ? 'file' : title === 'Other people’s libraries' ? 'users' : SECI[cls])), el('span', { text: title }), el('span', { class: 'n', text: String(list.length) })), g);
 }
 function cardShell(it, cover, extra) {
   const k = keyOf(it);
@@ -1393,10 +1422,11 @@ function ctxMenu(it, e) {
   if (!sel.has(keyOf(it))) { sel.clear(); sel.add(keyOf(it)); anchor = shown.indexOf(it); paintSel(); }
   popup({ x: e.clientX, y: e.clientY }, actions());
 }
-const selected = () => shown.filter(it => sel.has(keyOf(it)));
+const selected = () => [...shown, ...extraShown.filter(x => !shown.some(y => keyOf(y) === keyOf(x)))].filter(it => sel.has(keyOf(it)));
 function actions() {
   const s = selected(); if (!s.length) return [];
   const one = s.length === 1 ? s[0] : null, files = s.filter(it => !it.dir);
+  if (one && one.kind === 'bucket') return libActions(one);
   return [
     one ? { icon: one.dir ? 'folder' : one.kind === 'video' || one.kind === 'audio' ? 'play' : 'eye', label: one.dir ? 'Open' : one.kind === 'video' || one.kind === 'audio' ? 'Play' : 'Open', fn: () => open(one) } : null,
     one && !one.dir && (one.kind === 'text' || one.kind === 'file') && one.size < 8e6 ? { icon: 'code', label: 'Edit as text', fn: () => editText(one) } : null,
@@ -1433,6 +1463,57 @@ function open(it) {
   if (it.kind === 'pdf') return viewPdf(it);
   fileInfo(it);
 }
+// A library's own menu, from its card, its row in the side bar or its settings.
+function libActions(b) {
+  const lib = b.name, mayManage = mineLib(b) || (me && me.admin);
+  return [
+    { icon: 'folder', label: 'Open', fn: () => go([lib]) },
+    { icon: 'gear', label: 'Library settings…', fn: () => libDlg(b) },
+    mayManage ? { icon: 'users', label: 'Share library…', fn: () => accessDlg(lib) } : null,
+    { icon: 'restore', label: 'Trash', fn: () => trashDlg(lib) },
+    { icon: 'archive', label: 'Download as ZIP', fn: () => downloadZip([b]) },
+    mayManage ? '-' : null,
+    mayManage ? { icon: 'trash', label: 'Delete library…', bad: true, fn: () => deleteLibrary(lib) } : null
+  ];
+}
+function libDlg(b) {
+  const lib = b.name, mayManage = mineLib(b) || (me && me.admin);
+  const T = el('table', { class: 'mtbl' });
+  const row = (k, v) => { const td = el('td', { class: 'w', text: v }); T.append(el('tr', {}, el('td', { class: 'mut', style: 'white-space:nowrap', text: k }), td)); return td; };
+  row('Name', lib);
+  row('Belongs to', b.owner || (me && me.user) || 'this runtime');
+  if (b.mod) row('Made', new Date(b.mod).toLocaleString());
+  const size = row('Holds', '…');
+  api('GET', '/~ui/usage').then(r => r.ok ? r.json() : null).then(u => {
+    const e = u && u.libraries.find(x => x.bucket === lib);
+    size.textContent = e ? human(e.bytes) + ' in ' + e.objects + (e.objects === 1 ? ' file' : ' files') + (e.partial ? ', still counting' : '') + (e.max_bytes ? ' of ' + human(e.max_bytes) : '') : 'unknown';
+  }).catch(() => { size.textContent = 'unknown'; });
+  const acts = el('div', { style: 'display:flex;flex-wrap:wrap;gap:8px;margin-top:14px' },
+    btn('folder', 'Open', () => { L.close(); go([lib]); }, 'sm'),
+    mayManage ? btn('users', 'Share library', () => accessDlg(lib), 'sm') : null,
+    btn('restore', 'Trash', () => trashDlg(lib), 'sm'),
+    me && me.admin ? btn('bucket', 'Quotas', usageDlg, 'sm') : null);
+  const danger = mayManage ? el('div', { style: 'margin-top:20px;padding-top:14px;border-top:1px solid var(--line)' },
+    el('h4', { text: 'Delete' }), el('p', { class: 'mut', style: 'font-size:13px', text: 'Deletes the library with every file in it, its older versions and its Trash.' }),
+    btn('trash', 'Delete library…', () => { L.close(); deleteLibrary(lib); }, 'sm bad')) : null;
+  const L = modal('Library · ' + (lib === tmpName() ? 'Temporary files' : lib), [T, acts, danger]);
+}
+async function deleteLibrary(lib) {
+  const n = await ask({ title: 'Delete the library ' + lib + '?', text: 'Every file in it goes, with its older versions and its Trash, and nothing brings them back. Type the library’s name to delete it.', input: lib, ok: 'Delete library', danger: true });
+  if (n === null) return;
+  if (n !== lib) return toast('The name did not match, so nothing was deleted', 'bad');
+  const t = toast('Deleting ' + lib + '…', 'info', 600000);
+  try { await must(await api('DELETE', dav([lib], true) + '?contents')); toast('Deleted ' + lib); }
+  catch (e) { fail(e); }
+  finally { t.remove(); }
+  buckets = []; sel.clear();
+  if (path[0] === lib) go([]); else load(true);
+}
+// The library a user's repositories go to unless another is named, one of their own.
+function gitLibrary() {
+  const slug = ((me && me.user) || '').toLowerCase().replace(/[^a-z0-9.]+/g, '-').replace(/^[.-]+|[.-]+$/g, '').slice(0, 59).replace(/[.-]+$/, '');
+  return slug ? 'git-' + slug : 'git';
+}
 async function newBucket() {
   const n = await ask({ title: 'New library', text: 'A library is a bucket: lowercase letters, digits, dots and dashes, 3 to 63 of them.', input: 'my-films', ok: 'Create' });
   if (!n) return;
@@ -1457,6 +1538,8 @@ $('#bNew').onclick = e => popup(e.currentTarget, path.length ? [
 ] : [{ icon: 'bucket', label: 'Library', fn: newBucket }]);
 async function remove(list) {
   if (!list.length) return;
+  const libs = list.filter(it => it.kind === 'bucket');
+  if (libs.length) { if (libs.length === 1 && list.length === 1) return deleteLibrary(libs[0].name); return toast('Delete libraries one at a time, from their own menu', 'bad'); }
   const dirs = list.filter(it => it.dir).length;
   const what = list.length === 1 ? '“' + list[0].name + '”' + (list[0].dir ? ' and everything in it' : '') : list.length + ' items' + (dirs ? ', ' + dirs + ' of them folders with everything in them' : '');
   const ok = await ask({ title: 'Delete ' + (list.length === 1 ? list[0].name : list.length + ' items') + '?', text: 'This deletes ' + what + '. A library that keeps versions keeps deleted files in its Trash; any other deletion is final.', ok: 'Delete', danger: true });
@@ -1621,7 +1704,7 @@ function gitDlg() {
   const field = (label, input) => el('label', { style: 'display:flex;flex-direction:column;gap:4px;font-size:12.5px;flex:1;min-width:140px' }, el('span', { class: 'mut', text: label }), input);
   const url = el('input', { class: 'inp', placeholder: 'https://github.com/you/repo', spellcheck: 'false', autocomplete: 'off' });
   const branch = el('input', { class: 'inp', value: 'main', spellcheck: 'false', title: 'A branch, or * for every branch' });
-  const lib = el('input', { class: 'inp', value: 'git', spellcheck: 'false' });
+  const lib = el('input', { class: 'inp', value: gitLibrary(), spellcheck: 'false' });
   const name = el('input', { class: 'inp', placeholder: 'the repository’s', spellcheck: 'false', title: 'Left empty, the repository’s own name' });
   const EVERY = [['never', 'Never'], ['day', 'Day'], ['week', 'Week'], ['month', 'Month']];
   const everySel = v => { const e = el('select', { class: 'inp' }, ...EVERY.map(([k, t]) => el('option', { value: k, text: t }))); e.value = v; return e; };
@@ -1831,7 +1914,7 @@ function accountDlg() {
     box.append(T);
     let d;
     try { d = await iam('ListAccessKeys'); }
-    catch (e) { T.append(el('tr', {}, el('td', { class: 'mut', text: e.code === 'NoSuchEntity' ? 'Your keys are kept in the runtime’s credentials file, where an admin changes them.' : e.message }))); return; }
+    catch (e) { T.replaceWith(el('p', { class: 'mut', style: 'font-size:13px', text: e.code === 'InvalidAction' ? 'This runtime keeps no keys of its own: it signs in with the keys it was started with.' : e.message })); return; }
     const keys = allOf(d, 'member');
     if (!keys.length) T.append(el('tr', {}, el('td', { class: 'mut', colspan: '4', text: 'No keys yet.' })));
     for (const k of keys) {
@@ -2011,17 +2094,18 @@ async function inviteShow(token) {
   id.focus();
 }
 
-function trashDlg() {
+function trashDlg(lib) {
+  const at = typeof lib === 'string' ? [lib] : path;
   const T = el('table', { class: 'mtbl' });
-  modal('Trash · ' + path.join('/'), [el('p', { text: 'Files deleted from a library that keeps versions. Restoring brings back the last version before the deletion.' }), T], null, true);
+  modal('Trash · ' + at.join('/'), [el('p', { text: 'Files deleted from a library that keeps versions. Restoring brings back the last version before the deletion.' }), T], null, true);
   const fill = async () => {
     T.textContent = '';
     let ls;
-    try { ls = await (await must(await api('GET', dav(path, true) + '?trash'))).json(); } catch (e) { T.append(el('tr', {}, el('td', { text: e.message }))); return; }
+    try { ls = await (await must(await api('GET', dav(at, true) + '?trash'))).json(); } catch (e) { T.append(el('tr', {}, el('td', { text: e.message }))); return; }
     if (!ls.length) T.append(el('tr', {}, el('td', { class: 'mut', text: 'Nothing here. A library keeps deleted files only with versioning on.' })));
     for (const f of ls)
       T.append(el('tr', {}, el('td', { class: 'w', text: f.key }), el('td', { class: 'mut', text: human(f.size) }), el('td', { class: 'mut', text: new Date(f.deleted).toLocaleString() }),
-        el('td', { class: 'r' }, btn('restore', 'Restore', async () => { try { await must(await api('POST', dav([path[0], ...f.key.split('/')]) + '?restore')); fill(); load(true); toast('Restored ' + f.key); } catch (e) { fail(e); } }, 'sm'))));
+        el('td', { class: 'r' }, btn('restore', 'Restore', async () => { try { await must(await api('POST', dav([at[0], ...f.key.split('/')]) + '?restore')); fill(); load(true); toast('Restored ' + f.key); } catch (e) { fail(e); } }, 'sm'))));
   };
   fill();
 }

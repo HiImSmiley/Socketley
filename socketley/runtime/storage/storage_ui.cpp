@@ -1566,8 +1566,7 @@ void storage_run::ui_git_body(const std::shared_ptr<conn>& c)
         if (!branch.empty())
             g.branch = branch;
         const std::string bucket = str_of(req, "bucket");
-        if (!bucket.empty())
-            g.bucket = bucket;
+        g.bucket = bucket.empty() ? git_names::library_for(who) : bucket;
         g.name = str_of(req, "name");
         const jvalue* p = nullptr;
         for (const auto& [k, v] : req.members)

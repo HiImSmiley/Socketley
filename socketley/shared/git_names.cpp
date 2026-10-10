@@ -66,6 +66,30 @@ bool valid_name(std::string_view n, std::string& why)
     return ok;
 }
 
+std::string library_for(std::string_view user)
+{
+    // A bucket name: lowercase letters, digits, '.' and '-', every other run of characters one '-', at most 63.
+    std::string slug;
+    for (const char ch : user)
+    {
+        const char c = (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.')
+            slug += c;
+        else if (!slug.empty() && slug.back() != '-')
+            slug += '-';
+    }
+    while (!slug.empty() && (slug.back() == '-' || slug.back() == '.'))
+        slug.pop_back();
+    while (!slug.empty() && (slug.front() == '-' || slug.front() == '.'))
+        slug.erase(slug.begin());
+    if (slug.empty())
+        return "git";
+    std::string out = "git-" + slug.substr(0, 59);
+    while (out.back() == '-' || out.back() == '.')
+        out.pop_back();
+    return out;
+}
+
 std::string name_of(std::string_view url)
 {
     while (url.ends_with('/'))

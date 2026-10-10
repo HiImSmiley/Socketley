@@ -21,6 +21,9 @@ bool valid_name(std::string_view name, std::string& why);
 // The name a repository is given when none is: the last part of its URL without ".git".
 std::string name_of(std::string_view url);
 
+// The library a user's repositories go to when none is named, "git-<user>", so two users sharing never share one.
+std::string library_for(std::string_view user);
+
 // Whether a path from a tree may be written as a key below the folder: no "." or ".." part, no empty one, and at
 // most 900 bytes.
 bool safe_path(std::string_view path);

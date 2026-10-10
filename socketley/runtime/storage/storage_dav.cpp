@@ -71,7 +71,8 @@ void xml_text(std::string& x, std::string_view name, std::string_view v)
     x += '>';
 }
 
-void dir_response(std::string& x, std::string_view href, std::string_view name, int64_t mtime_ms)
+void dir_response(std::string& x, std::string_view href, std::string_view name, int64_t mtime_ms,
+                  std::string_view owner = {})
 {
     x += "<D:response><D:href>";
     xml_escape_to(x, href);
@@ -80,6 +81,13 @@ void dir_response(std::string& x, std::string_view href, std::string_view name, 
     x += "<D:resourcetype><D:collection/></D:resourcetype>";
     if (mtime_ms > 0)
         xml_text(x, "getlastmodified", http_date(mtime_ms));
+    // Whose library it is, in a namespace of its own, so the UI can set other people's apart from the user's.
+    if (!owner.empty())
+    {
+        x += "<S:owner xmlns:S=\"urn:socketley:storage\">";
+        xml_escape_to(x, owner);
+        x += "</S:owner>";
+    }
     x += "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>";
 }
 
@@ -674,11 +682,19 @@ void storage_run::dav_body(const std::shared_ptr<conn>& c)
                 }
                 if (prefix.empty() && method == "DELETE")
                 {
+                    if (cc->req.has_query("contents"))
+                    {
+                        dav_purge(cc, std::move(b));
+                        return;
+                    }
                     // A bucket removed through its folder is removed only empty, as DeleteBucket is.
                     cc->on_answer = [this](const std::shared_ptr<conn>& c2, response& resp)
                     {
                         response out;
-                        out.status = resp.status == 204 ? 204 : resp.status == 409 ? 409 : resp.status;
+                        out.status = resp.status;
+                        // Said in words, since the S3 body is XML a file manager would show as it is.
+                        if (resp.status == 409)
+                            out.body = "The library still holds files; delete it with its contents.\n";
                         send_response(c2, std::move(out));
                     };
                     app_forward(cc, "DELETE", std::move(b), {});
@@ -912,7 +928,8 @@ void storage_run::dav_propfind(const std::shared_ptr<conn>& c, const std::string
         {
             for (const bucket_info& b : m_store.buckets())
                 if (lists_bucket(c, b))
-                    dir_response(x, dav_href(b.name, {}), b.name, b.created_ms);
+                    dir_response(x, dav_href(b.name, {}), b.name, b.created_ms,
+                                 b.owner.empty() ? default_owner : std::string_view(b.owner));
         }
         x += "</D:multistatus>";
         app_reply(c, 207, std::move(x), "application/xml; charset=utf-8");
@@ -1264,6 +1281,121 @@ void storage_run::dav_unless_taken(const std::shared_ptr<conn>& c, const std::st
     q.prefix   = key;
     q.max_keys = 1;
     m_node.list(bucket, q, [answer](st s, list_page p) { answer(s == st::ok && !p.objects.empty()); });
+}
+
+void storage_run::dav_purge(const std::shared_ptr<conn>& c, std::string bucket)
+{
+    // Asked as the operations it stands for: removing the bucket, and every version in it.
+    if (!app_allowed(c, "DELETE", bucket, {}) || !app_allowed(c, "DELETE", bucket, "x", "versionId"))
+    {
+        app_reply(c, 403, "Access denied.\n");
+        return;
+    }
+    struct walk
+    {
+        std::weak_ptr<conn> who;
+        std::string bucket;
+        version_query q;
+        std::vector<std::pair<std::string, std::string>> items;
+        size_t at{0}, failed{0}, inflight{0};
+        bool more{false}, listing{false}, pumping{false}, again{false}, answered{false};
+        std::weak_ptr<walk> self;
+        std::function<void()> next, page;
+    };
+    auto w = std::make_shared<walk>();
+    w->who = c;
+    w->bucket = std::move(bucket);
+    w->q.max_keys = 1000;
+    w->self = w;
+    walk* raw = w.get();
+    // Every version and marker, 32 removals at a time, the next page asked for once this one is handed out.
+    w->next = [this, raw]()
+    {
+        if (raw->pumping)
+        {
+            raw->again = true;
+            return;
+        }
+        raw->pumping = true;
+        do
+        {
+            raw->again = false;
+            while (raw->inflight < 32 && raw->at < raw->items.size())
+            {
+                ++raw->inflight;
+                const auto& [key, version] = raw->items[raw->at++];
+                m_store.remove_version(raw->bucket, key, version,
+                                       [this, raw, key = key, hold = raw->self.lock()](remove_result rr)
+                {
+                    if (rr.status != st::ok)
+                        ++raw->failed;
+                    else if (rr.existed)
+                        notify_delete(raw->bucket, key);
+                    --raw->inflight;
+                    raw->next();
+                });
+            }
+        } while (raw->again);
+        raw->pumping = false;
+        if (raw->at < raw->items.size() || raw->inflight > 0 || raw->listing || raw->answered)
+            return;
+        if (raw->more && !raw->failed)
+        {
+            raw->items.clear();
+            raw->at = 0;
+            raw->listing = true;
+            raw->page();
+            return;
+        }
+        raw->answered = true;
+        auto cc = raw->who.lock();
+        if (!cc || cc->dead)
+            return;
+        if (raw->failed)
+        {
+            app_reply(cc, 409, std::to_string(raw->failed) + " of the library's files could not be removed; a file " +
+                                   "under retention or legal hold stays until it is released.\n");
+            return;
+        }
+        cc->on_answer = [this](const std::shared_ptr<conn>& c2, response& resp)
+        {
+            response out;
+            out.status = resp.status;
+            if (resp.status == 409)
+                out.body = "The library is emptied, and something still holds it: an upload in progress, or a file "
+                           "written meanwhile.\n";
+            send_response(c2, std::move(out));
+        };
+        app_forward(cc, "DELETE", raw->bucket, {});
+    };
+    w->page = [this, raw]()
+    {
+        m_node.list_versions(raw->bucket, raw->q, [this, raw, hold = raw->self.lock()](st s, version_page p)
+        {
+            raw->listing = false;
+            if (s != st::ok)
+            {
+                if (auto cc = raw->who.lock(); cc && !cc->dead && !raw->answered)
+                {
+                    raw->answered = true;
+                    app_reply(cc, s == st::no_such_bucket ? 404 : 500, "The library's files could not be listed.\n");
+                }
+                return;
+            }
+            for (const version_item& it : p.items)
+                if (!it.prefix)
+                    raw->items.emplace_back(it.key, std::string(version_id_of(it.meta)));
+            raw->more = p.truncated && !p.items.empty();
+            if (raw->more)
+            {
+                raw->q.key_marker = p.items.back().key;
+                raw->q.version_marker = std::string(version_id_of(p.items.back().meta));
+            }
+            raw->next();
+        });
+    };
+    raw->listing = true;
+    raw->page();
 }
 
 void storage_run::dav_trash(const std::shared_ptr<conn>& c, std::string bucket, std::string prefix)

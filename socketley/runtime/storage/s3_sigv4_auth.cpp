@@ -705,6 +705,9 @@ void sigv4_authenticator::add_iam(credential_set& set)
             if (const auto d = iu.tags.find(std::string(iam_tag_disabled)); d != iu.tags.end() && d->second == "true")
                 continue;
             add_login(name, iu, set.shared_user(name));
+            for (const auto& [id, k] : st.keys)
+                if (k.user == name && k.active && !set.add(id, k.secret, err, set.shared_user(name)))
+                    LOG_WARN(("storage: the IAM key " + id + " is not taken: " + err).c_str());
             continue;
         }
         if (iu.external)
