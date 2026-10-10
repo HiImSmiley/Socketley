@@ -123,12 +123,18 @@ if [ -n "$SANITIZED" ]; then
 else
     SOCKETLEY_RECV_MULTISHOT=0 run_proxy single
     SINGLE=$(held_mb 16 4194304)
+    # A worker that was never found, or is gone after the load, reads as 0 MB on both arms.
+    SW=$WORKER; [ -n "$SW" ] && kill -0 "$SW" 2>/dev/null && SUP=up || SUP=gone
     daemon_stop
     run_proxy rule
     RULE=$(held_mb 16 4194304)
+    RW=$WORKER; [ -n "$RW" ] && kill -0 "$RW" 2>/dev/null && RUP=up || RUP=gone
     daemon_stop
     echo "  16 uploads of 4 MiB into a backend that never reads: single-shot $SINGLE MB, this rule $RULE MB"
-    if [ "$RULE" -le $(( SINGLE * 3 / 2 + 4 )) ]; then pass
+    if [ "$SUP" != up ] || [ "$RUP" != up ]; then
+        fail "a stream keeps the single-shot hold" \
+             "the proxy worker was not there to measure: single-shot pid '${SW}' $SUP, rule pid '${RW}' $RUP"
+    elif [ "$RULE" -le $(( SINGLE * 3 / 2 + 4 )) ]; then pass
     else fail "a stream keeps the single-shot hold" \
               "the rule held $RULE MB against $SINGLE MB single-shot" \
               "-- a stream earned multishot, which drains the socket into the queue"; fi

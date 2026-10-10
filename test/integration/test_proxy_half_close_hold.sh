@@ -37,28 +37,15 @@
 # Against the broken build the bodies still arrive — the hold worked, it just
 # never ended — so the descriptor assertion is the one that discriminates.
 #
-# ─── AND IT DOES NOT, ON THIS BOX ───────────────────────────────────────────
+# ─── WHAT DISCRIMINATES ─────────────────────────────────────────────────────
 #
-# Measured while repairing the fixture above, because a fixture change has to be
-# shown not to have gutted the check it feeds.  The pre-fix source was built
-# with the hold's ending — the close_pair in handle_backend_read that
-# client_answer_owed guards — compiled out, which is exactly the build this file
-# names, and this test passed 8/8 against it with FD1 == FD0 == 7.  Both the old
-# fixture and the new one.
-#
-# The likely reason is that the client here does not stay alive: it gives its
-# read ten seconds, times out, and closes the socket outright.  A multishot recv
-# on the client leg is still armed from before the hold, so that full close
-# delivers a completion and the pair is torn down by the ordinary route — after
-# the exchange this test is about, but well before the descriptors are counted.
-# The leak 8ed0bb4 recorded was measured on test_proxy_group_keepalive_load,
-# whose clients do stay alive, and that is where it is still visible.
-#
-# Left as it stands rather than rewritten: making it discriminate needs a client
-# that holds its socket open past the count, which is a different test from this
-# one, and this file's body assertions do still cover the half-close hold
-# itself.  Written down so the next person does not read the descriptor line as
-# coverage it does not provide.
+# The descriptor count was taken of the daemon, where no pair lives -- every
+# proxy runs in a worker of its own -- and against the broken build it passed
+# 8/8. The client now says how its read ended: at EOF, which is the hold
+# letting the pair go, or at its ten-second timeout with the whole body in
+# hand, which is the hold that never ended. The descriptors are counted in the
+# proxy's own process.
+
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -180,29 +167,34 @@ cat > "$TMPD/client.py" <<'PY'
 import socket, sys
 
 port, path = int(sys.argv[1]), sys.argv[2]
+keep = len(sys.argv) > 3 and sys.argv[3] == "keep"
 s = socket.create_connection(("127.0.0.1", port), 10)
 s.settimeout(10)
 s.sendall((f"GET {path} HTTP/1.1\r\n"
-           f"Host: 127.0.0.1\r\n"
-           f"Connection: close\r\n\r\n").encode())
+           f"Host: 127.0.0.1\r\n" +
+           ("" if keep else "Connection: close\r\n") + "\r\n").encode())
 s.shutdown(socket.SHUT_WR)
 data = b""
+end = "eof"
 try:
     while True:
         chunk = s.recv(4096)
         if not chunk:
             break
         data += chunk
+except socket.timeout:
+    # The answer may all be here and the pair still held: the hold never ended.
+    end = "timeout"
 except Exception:
-    pass
+    end = "error"
 s.close()
 sys.stdout.write("BODY:" + (data.split(b"\r\n\r\n", 1)[1].decode()
-                            if b"\r\n\r\n" in data else "<none>"))
+                            if b"\r\n\r\n" in data else "<none>") + "|END:" + end)
 PY
 
 python3 "$TMPD/be.py" "$BE_PORT" >/dev/null 2>&1 &
 BEPID=$!
-ready_tcp 127.0.0.1 "$BE_PORT" 15 || { echo "  SKIP: backend did not start"; exit 0; }
+ready_tcp 127.0.0.1 "$BE_PORT" 15 || { echo "  FATAL: backend did not start"; exit 1; }
 
 daemon_start "$BIN"
 
@@ -213,11 +205,20 @@ ready_http 127.0.0.1 "$PX_PORT" "/$PX_NAME/ready" 20 || true
 # The baseline is read after the readiness probe, so the listener, the pool and
 # everything else the first request builds is already standing.  What this test
 # adds on top of it is NREQ half-closed exchanges and nothing else.
-FD0=$(ls -1 "/proc/$SOCKETLEY_DPID/fd" 2>/dev/null | wc -l || true)
+# The proxy's own process, which holds the pairs; the daemon's descriptors say nothing about them.
+PXPID=$("$BIN" stats "$PX_NAME" 2>/dev/null | sed -n 's/^pid://p')
+FD0=$(ls -1 "/proc/$PXPID/fd" 2>/dev/null | wc -l || true)
 
 for i in $(seq 1 "$NREQ"); do
     out=$(python3 "$TMPD/client.py" "$PX_PORT" "/$PX_NAME/m$i" 2>/dev/null || true)
-    assert_eq "$out" "BODY:marker=m$i" "half-closed request $i answered in full"
+    assert_eq "$out" "BODY:marker=m$i|END:eof" "half-closed request $i answered in full, and the pair let go"
+done
+
+# The same without the client's `Connection: close`, where nothing on the
+# client's side asks for the end and only the hold's own ending lets go.
+for i in $(seq 1 "$NREQ"); do
+    out=$(python3 "$TMPD/client.py" "$PX_PORT" "/$PX_NAME/k$i" keep 2>/dev/null || true)
+    assert_eq "$out" "BODY:marker=k$i|END:eof" "half-closed keep-alive request $i answered in full, and the pair let go"
 done
 
 # Give the teardowns a moment to land, and poll rather than sleep a fixed time:
@@ -225,7 +226,7 @@ done
 # amount of waiting brings it down, so the loop costs nothing it does not need.
 FD1=$FD0
 for _ in $(seq 1 40); do
-    FD1=$(ls -1 "/proc/$SOCKETLEY_DPID/fd" 2>/dev/null | wc -l || true)
+    FD1=$(ls -1 "/proc/$PXPID/fd" 2>/dev/null | wc -l || true)
     [ -n "$FD1" ] && [ "$FD1" -le $((FD0 + 4)) ] && break
     sleep 0.25
 done
@@ -237,7 +238,7 @@ done
 TOTAL=$((TOTAL+1))
 if [ -z "$FD1" ] || [ -z "$FD0" ] || [ "$FD0" -eq 0 ]; then
     FAIL=$((FAIL+1))
-    echo "  FAIL [descriptors released]: could not read /proc/$SOCKETLEY_DPID/fd" \
+    echo "  FAIL [descriptors released]: could not read /proc/$PXPID/fd" \
          "(baseline '${FD0:-}', now '${FD1:-}')"
 elif [ "$FD1" -le $((FD0 + 4)) ]; then
     PASS=$((PASS+1))

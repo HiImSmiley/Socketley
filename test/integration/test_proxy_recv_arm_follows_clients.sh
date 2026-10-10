@@ -257,6 +257,7 @@ run_arm() {   # tag [clients] [path] [hold] [samples]   (the pin is the caller's
     wait "$sp" 2>/dev/null || true
     ARM_OPENED=$(head -1 "$WORK/slow.$tag" 2>/dev/null || echo 0)
     HELD=$(( (peak - base) / 1024 ))
+    ARM_SAMPLES=$(wc -l <"$WORK/rss.$tag" 2>/dev/null || echo 0)
     ARM_STEADY=$(sort -g "$WORK/rss.$tag" 2>/dev/null |
         awk -v b="$base" '{a[NR]=$1}
              END{ if (NR > 0) print int((a[int((NR+1)/2)] - b) / 1024); else print 0 }')
@@ -343,7 +344,7 @@ for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sle
 # holding exactly 383 MB.
 unset SOCKETLEY_RECV_MULTISHOT
 run_arm bigrule "$MANY_CLIENTS" /pa/mid 10 400
-HELD_BR=$ARM_STEADY; OPENED_BR=$ARM_OPENED
+HELD_BR=$ARM_STEADY; OPENED_BR=$ARM_OPENED; SAMPLES_BR=$ARM_SAMPLES
 echo "  above the threshold, the rule: $OPENED_BR slow clients, held ${HELD_BR} MB (peak ${HELD} MB)"
 daemon_stop
 for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
@@ -363,6 +364,9 @@ elif [ "${OPENED_BR:-0}" -lt $((MANY_CLIENTS / 2)) ] || [ "${OPENED_BP:-0}" -lt 
     fail "above the threshold the rule still bounds the queue" \
          "opened $OPENED_BR and $OPENED_BP of $MANY_CLIENTS" \
          "-- neither storm arrived, so the megabytes are about nothing"
+elif [ "${SAMPLES_BR:-0}" -le 0 ]; then
+    fail "above the threshold the rule still bounds the queue" \
+         "the rule arm took no RSS sample while its storm was up, so its ${HELD_BR} MB is no measurement"
 elif [ "${HELD_BP:-0}" -le 0 ]; then
     fail "above the threshold the rule still bounds the queue" \
          "the pinned arm held ${HELD_BP} MB, so there is no ratio to take" \

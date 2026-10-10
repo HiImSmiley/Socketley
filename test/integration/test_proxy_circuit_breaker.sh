@@ -189,9 +189,9 @@ assert_breaker_opened() {
 
 daemon_start "$BIN"
 
-start_backend healthy   "$OK_BE"  || { echo "  SKIP: healthy backend did not start"; exit 0; }
-start_backend failing   "$BAD_BE" || { echo "  SKIP: failing backend did not start"; exit 0; }
-start_backend truncated "$CUT_BE" || { echo "  SKIP: truncating backend did not start"; exit 0; }
+start_backend healthy   "$OK_BE"  || { echo "  FAIL: healthy backend did not start"; exit 1; }
+start_backend failing   "$BAD_BE" || { echo "  FAIL: failing backend did not start"; exit 1; }
+start_backend truncated "$CUT_BE" || { echo "  FAIL: truncating backend did not start"; exit 1; }
 
 create_ok "proxy for the healthy backend created" \
     "$BIN" create proxy cb_ok  -p "$OK_PROXY"  --backend "127.0.0.1:$OK_BE"  -s

@@ -69,7 +69,10 @@ while True:
     except Exception:
         break" >/dev/null 2>&1 &
 BE_PID=$!
-sleep 0.7
+# Listening before the proxy is made, or its connect fails and the client is answered with a 502 at once -- which
+# passed below without the sweep ever having run. Asked of ss, since an accept of this backend's holds it 90 s.
+for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q "127.0.0.1:$BE " && break; sleep 0.1; done
+ss -ltn 2>/dev/null | grep -q "127.0.0.1:$BE " || { bad "the backend listens" "nothing on $BE after 5 s"; }
 
 "$BIN" create proxy is_p -p "$PX" --backend "127.0.0.1:$BE" \
     --idle-timeout 1 --backend-timeout 0 -s >/dev/null 2>&1
@@ -103,7 +106,13 @@ case "$VERDICT" in
     ENDED|ConnectionResetError)
         ok "the swept client's socket ended after ${ELAPSED}s, at the sweep" ;;
     ANSWERED)
-        ok "the client was answered after ${ELAPSED}s, which is also not a stranded pair" ;;
+        # Only at the sweep: an answer before the idle timeout is the proxy failing to reach its backend.
+        if awk -v e="$ELAPSED" 'BEGIN { exit !(e >= 0.9) }'; then
+            ok "the client was answered after ${ELAPSED}s, at the sweep, which is also not a stranded pair"
+        else
+            bad "the sweep is what ended the exchange" \
+                "the client was answered after ${ELAPSED}s, before the 1 s idle timeout: the backend was never reached"
+        fi ;;
     *)
         bad "an idle client whose read is not armed is torn down, not just marked" \
             "the client socket was '$VERDICT' after ${ELAPSED}s with the backend still holding" \

@@ -101,11 +101,15 @@ RC=0
 timeout 8 python3 -c "
 import socket, sys
 s = socket.create_connection(('127.0.0.1', $((P + 2))), timeout=5)
-s.sendall(b'GET / HTTP/1.1\r\nHost: x\r\n\r\n')
+s.sendall(b'GET /dns_prox/ HTTP/1.1\r\nHost: x\r\n\r\n')
 s.settimeout(5)
-try:    s.recv(4096)
-except Exception: pass
+# An answer is an error status or the connection closed; a read that times out is the hang this is about.
+try:
+    d = s.recv(4096)
+except socket.timeout:
+    sys.exit(3)
 s.close()
+sys.exit(0 if d == b'' or d.startswith(b'HTTP/1.1 5') else 4)
 " || RC=$?
 if [ "$RC" -eq 0 ]; then pass
 else fail "a request to an unresolvable backend is answered" \

@@ -19,7 +19,7 @@
 #
 # Measured on the tree that had it, with a proxy nobody was using:
 #
-#     idle connections   daemon CPU   io-wq threads   parked in the socket wait
+#     idle connections   worker CPU   io-wq threads   parked in the socket wait
 #                    0         0.0%               0                          0
 #                    4        95.7%               7                          4
 #                   16       143.0%              20                         16
@@ -151,7 +151,10 @@ sleep 0.6
 # ---- the measurement ------------------------------------------------------
 # One python process does the whole thing so the connections it opens stay open
 # across the idle window; a shell loop cannot hold sockets.
-OUT=$(python3 - "$PX" "$IDLE" "$DPID" <<'PYEOF'
+# The proxy's event loop, its splices and their io-wq threads are in its own worker; the daemon idles whatever
+# the proxy does, so it is the worker that is measured.
+PXPID=$("$BIN" stats spidle 2>/dev/null | sed -n 's/^pid://p')
+OUT=$(python3 - "$PX" "$IDLE" "${PXPID:-$DPID}" <<'PYEOF'
 import os, socket, sys, time
 
 px, idle_n, dpid = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])

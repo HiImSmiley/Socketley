@@ -300,6 +300,8 @@ start_backend b2 "$BE1" slow 0.35
 make_proxy "127.0.0.1:$BE1"
 for _ in $(seq 1 10); do python3 "$TMPD/req.py" "$PX" /pn_px/b GET - --abort >/dev/null 2>&1 || true; done
 sleep 0.5
+# The backend has to have been reached, or the closed circuit below says nothing about aborts mid-exchange.
+assert_range "$(count_of b2)" 1 10 "control: aborted requests reached the backend"
 assert_eq "$(circuits)" "0" "clients aborting mid-exchange do not open the circuit"
 assert_eq "$(python3 "$TMPD/req.py" "$PX" /pn_px/b2)" "HTTP/1.1 200 OK" "and the proxy still serves"
 stop_backends

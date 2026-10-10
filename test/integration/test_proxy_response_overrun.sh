@@ -142,7 +142,7 @@ PY
 
 python3 "$TMPD/be.py" "$BE_PORT" &
 BEPID=$!
-ready_tcp 127.0.0.1 "$BE_PORT" 15 || { echo "  SKIP: backend did not start"; exit 0; }
+ready_tcp 127.0.0.1 "$BE_PORT" 15 || { echo "  FATAL: backend did not start"; exit 1; }
 
 create_ok "proxy created" "$BIN" create proxy "$PX_NAME" -p "$PX_PORT" \
     --backend "127.0.0.1:$BE_PORT" --protocol http -s

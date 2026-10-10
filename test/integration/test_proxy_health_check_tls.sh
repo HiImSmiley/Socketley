@@ -151,7 +151,9 @@ python3 "$TMPD/be.py" SICK sick "$SICK_BE" "$TMPD/trusted.crt" "$TMPD/trusted.ke
 python3 "$TMPD/be.py" UNTR ok   "$UNTR_BE" "$TMPD/other.crt"   "$TMPD/other.key" \
         >"$TMPD/untr.log" 2>&1 & BE_PIDS+=($!)
 for p in "$GOOD_BE" "$SICK_BE" "$UNTR_BE"; do
-    ready_tcp 127.0.0.1 "$p" 8 || { echo "  SKIP: a TLS backend never listened"; exit 0; }
+    # The tools are all present by here, so a backend that never listens is a broken setup, not a skip.
+    ready_tcp 127.0.0.1 "$p" 8 || { echo "  FATAL: the TLS backend on $p never listened"
+        cat "$TMPD/good.log" "$TMPD/sick.log" "$TMPD/untr.log" 2>/dev/null | sed 's/^/        /'; exit 1; }
 done
 
 daemon_start "$BIN"

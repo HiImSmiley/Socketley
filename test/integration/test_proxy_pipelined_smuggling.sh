@@ -500,7 +500,6 @@ else
 fi
 
 TOTAL=$((TOTAL+1))
-TOTAL=$((TOTAL+1))
 if grep -qx 'PHASE2C RESP1 OK pipe-a' "$OUT" 2>/dev/null &&
    grep -qx 'PHASE2C RESP2 OK pipe-b' "$OUT" 2>/dev/null; then
     PASS=$((PASS+1))
@@ -512,6 +511,7 @@ else
     echo "        choose, and both of them still have to be readable"
 fi
 
+TOTAL=$((TOTAL+1))
 if grep -qx 'PHASE2 RESP2 OK pipe-b' "$OUT" 2>/dev/null; then
     PASS=$((PASS+1))
 else

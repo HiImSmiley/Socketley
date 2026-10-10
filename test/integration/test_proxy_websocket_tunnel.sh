@@ -649,8 +649,9 @@ try:
     hr = Reader(h)
     head = hr.head()
     body = hr.read(5) if b"Content-Length: 5" in head else b""
-    say("breaker", 1 if body == b"plain" else 0)
-    if body != b"plain":
+    # Six closes the backend actually made, or the request after them asks nothing of the breaker.
+    say("breaker", 1 if closed == 6 and body == b"plain" else 0)
+    if closed != 6 or body != b"plain":
         say("breaker_got", "%d tunnels closed, then %s"
             % (closed, repr(head.split(b"\r\n", 1)[0])))
     h.close()
@@ -727,7 +728,7 @@ claim not_pooled_http "a tunnel's socket is not handed to the next request" \
 claim not_pooled_tunnel "the tunnel survives bytes that look like an HTTP response" \
     "the tunnel stopped relaying after the backend sent a response-shaped payload"
 claim breaker "closing a tunnel is not charged to the backend" \
-    "an ordinary request after six WebSocket closes was not answered by the backend — the circuit breaker took it out of rotation"
+    "six WebSocket closes and then an ordinary request answered by the backend were expected, got $(printf '%s\n' "$DRIVE_OUT" | sed -n 's/^breaker_\(got\|error\)=//p' | head -1) — fewer than six closes is no question put, an unanswered request is the breaker taking the backend out of rotation"
 claim idle_sweep "--idle-timeout does not reap a tunnel the backend is feeding" \
     "a tunnel carrying a frame a second was reaped as idle: $(printf '%s\n' "$DRIVE_OUT" | sed -n 's/^idle_sweep_frames=//p' | head -1)"
 if [ "$TLS_PROXY" = 1 ]; then

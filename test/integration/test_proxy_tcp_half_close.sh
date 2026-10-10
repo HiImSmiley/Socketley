@@ -236,7 +236,8 @@ if ready_tcp 127.0.0.1 "$PX_SPLICE" 15; then
         assert_eq "$got" "set" "splice path: half-closed request $i reached the backend"
     done
 else
-    echo "  SKIP: splice-path proxy did not start ($(cat "$TMPD/splice-create.log" 2>/dev/null))"
+    TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
+    echo "  FAIL: splice-path proxy did not start ($(cat "$TMPD/splice-create.log" 2>/dev/null))"
 fi
 
 # ── 3. the descriptors come back ────────────────────────────────────────────
@@ -276,6 +277,18 @@ create_ok "tcp proxy to a closing backend created" \
     "$BIN" create proxy hc_breaker -p "$PX_BREAKER" --backend "127.0.0.1:$CLOSER_PORT" --protocol tcp -s
 ready_tcp 127.0.0.1 "$PX_BREAKER" 15 || { echo "  FAIL: breaker proxy did not start"; exit 1; }
 
+# A stats call that fails, or has no worker report yet, is not a count of zero.
+open_circuits() {
+    local st=""
+    for _ in $(seq 1 40); do
+        st=$("$BIN" stats hc_breaker 2>/dev/null) || st=""
+        grep -q "^backends:" <<<"$st" && break
+        sleep 0.25
+    done
+    grep -q "^backends:" <<<"$st" || { echo "no worker stats report: ${st:-stats failed}" | tr '\n' ' '; return; }
+    grep -c "circuit:open" <<<"$st" || true
+}
+
 # circuit_threshold is 5, so twelve exchanges is more than twice what it takes
 # to open a breaker that charges clean closes.  On the broken build the first
 # few are answered and every one after that is an instant empty reply.
@@ -286,7 +299,7 @@ for _ in $(seq 1 12); do
 done
 assert_eq "$BREAK_OK" "12" "12 exchanges against a backend that closes after answering"
 
-circ=$("$BIN" stats hc_breaker 2>/dev/null | grep -c "circuit:open" || true)
+circ=$(open_circuits)
 assert_eq "$circ" "0" "no circuit opened by a backend closing cleanly"
 
 # ── 5. and nor does a client that aborts ────────────────────────────────────
@@ -330,7 +343,7 @@ for _ in $(seq 1 5); do
 done
 assert_eq "$AFTER_OK" "5" "proxy still serves after 20 aborting clients"
 
-circ=$("$BIN" stats hc_breaker 2>/dev/null | grep -c "circuit:open" || true)
+circ=$(open_circuits)
 assert_eq "$circ" "0" "no circuit opened by clients aborting"
 
 echo "  $PASS/$TOTAL passed"

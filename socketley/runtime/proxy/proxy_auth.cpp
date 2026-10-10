@@ -40,10 +40,20 @@ std::string miss_key(std::string_view client)
     if (client.size() >= sizeof text)
         return std::string(client);
     std::memcpy(text, client.data(), client.size());
-    unsigned char a[16];
-    if (::inet_pton(AF_INET6, text, a) == 1)
-        return std::string(reinterpret_cast<const char*>(a), 8);
-    return std::string(client);
+    in6_addr a{};
+    if (::inet_pton(AF_INET6, text, &a) != 1)
+        return std::string(client);
+    // An IPv4 peer on a dual-stack socket is its own address, as it is on an IPv4 one, and not ::ffff:0:0/64.
+    if (IN6_IS_ADDR_V4MAPPED(&a))
+    {
+        char v4[INET_ADDRSTRLEN]{};
+        if (::inet_ntop(AF_INET, &a.s6_addr[12], v4, sizeof v4))
+            return v4;
+    }
+    static constexpr unsigned char zero[8]{};
+    if (std::memcmp(a.s6_addr, zero, 8) == 0)
+        return std::string(reinterpret_cast<const char*>(a.s6_addr), 16);
+    return std::string(reinterpret_cast<const char*>(a.s6_addr), 8);
 }
 
 }   // namespace
@@ -172,10 +182,22 @@ void proxy_auth::missed(const std::string& key, std::chrono::steady_clock::time_
 {
     if (m_misses.size() >= misses_max && !m_misses.contains(key))
     {
+        // An eighth goes at once, the expired and then the oldest, so a flood of new keys pays a scan per thousands
+        // of them and not one each.
         std::erase_if(m_misses, [&](const auto& m) { return now - m.second.first >= window; });
         if (m_misses.size() >= misses_max)
-            m_misses.erase(std::min_element(m_misses.begin(), m_misses.end(), [](const auto& a, const auto& b)
-                                            { return a.second.first < b.second.first; }));
+        {
+            std::vector<std::chrono::steady_clock::time_point> firsts;
+            firsts.reserve(m_misses.size());
+            for (const auto& [k, m] : m_misses)
+                firsts.push_back(m.first);
+            const size_t cut = firsts.size() / 8;
+            std::nth_element(firsts.begin(), firsts.begin() + cut, firsts.end());
+            const auto before = firsts[cut];
+            std::erase_if(m_misses, [&](const auto& m) { return m.second.first < before; });
+            if (m_misses.size() >= misses_max)
+                m_misses.erase(m_misses.begin());
+        }
     }
     misses& m = m_misses[key];
     if (m.count == 0 || now - m.first >= window)

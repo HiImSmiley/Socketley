@@ -44,6 +44,7 @@ PA=$((SL_PORT_BASE+1408))
 PB=$((SL_PORT_BASE+1409))
 PX=$((SL_PORT_BASE+1410))
 PY=$((SL_PORT_BASE+1411))
+PZ=$((SL_PORT_BASE+1417))
 
 daemon_isolate proxygroupretry
 trap 'daemon_stop 2>/dev/null || true' EXIT
@@ -98,6 +99,21 @@ fi
 
 # ── 2. One member unreachable, and --retry carries the request ─────────────
 rm -f "$RTDIR/gr_b.sock"
+
+# The same proxy without --retry has to lose requests, or the removed node left
+# the member reachable and 20 of 20 below would need no retry at all.
+"$BIN" create proxy gr_nr -p "$PZ" --backend @gr_g --strategy round-robin -s >/dev/null 2>&1
+sleep 1.5
+read -r NR_OK NR_BAD <<<"$(run_n "$PZ" gr_nr 20)"
+if [ "${NR_BAD:-0}" -ge 1 ]; then
+    ok "the control: without --retry, $NR_BAD of 20 failed on the unreachable member"
+else
+    bad "the removed node makes the member unreachable" \
+        "without --retry ${NR_OK:-0} of 20 answered and none failed;" \
+        "the dead member was never chosen or is still reachable, so the retry below is not measured"
+fi
+"$BIN" stop gr_nr >/dev/null 2>&1; "$BIN" remove gr_nr >/dev/null 2>&1
+
 "$BIN" create proxy gr_p -p "$PX" --backend @gr_g --retry 1 --strategy round-robin -s >/dev/null 2>&1
 sleep 1.5
 read -r GOT BADN <<<"$(run_n "$PX" gr_p 20)"

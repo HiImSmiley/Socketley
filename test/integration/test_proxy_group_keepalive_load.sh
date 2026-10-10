@@ -442,10 +442,11 @@ LOAD_END=$(win_now)
 # serves nothing" a claim about the gateway.
 T_LEAVE_CMD=$(win_now)
 "$BIN" stop kam3 >/dev/null 2>&1
-CTRL_LEAVE=$(win_wait_output "$ANCHOR_WAIT" '!"name":"kam3"[^}]*"status":"running"' "$BIN" ls --json)
+# Listed as stopped rather than not listed as running, which a failed ls would also be.
+CTRL_LEAVE=$(win_wait_output "$ANCHOR_WAIT" '"name":"kam3"[^}]*"status":"stopped"' "$BIN" ls --json)
 if [ -z "$CTRL_LEAVE" ]; then
     bad "the daemon takes a stopped member out of the group" \
-        "kam3 still listed as running ${ANCHOR_WAIT}s after stop returned"
+        "kam3 not listed as stopped ${ANCHOR_WAIT}s after stop returned"
     CTRL_LEAVE=$(win_now)
 fi
 LEAVE_START=$(win_wait_drained "$EVF" be3 "$CTRL_LEAVE" "$DRAIN_CLEAR" "$ANCHOR_WAIT")

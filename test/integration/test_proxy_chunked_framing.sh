@@ -316,7 +316,7 @@ else bad "pooled with a body owed" "client saw: $R" \
          "client's request as the first client's body and answers nothing"; fi
 
 # Control: every row above talked to the backend it was meant to.
-N=$(grep -cE '^(GET|POST) ' "$SOCKETLEY_TMPD/be.req" 2>/dev/null || echo 0)
+N=$(grep -cE '^(GET|POST) ' "$SOCKETLEY_TMPD/be.req" 2>/dev/null || true); N=${N:-0}
 if [ "$N" -ge 8 ]; then ok "the backend parsed $N proxied requests"
 else bad "the rows reached the backend" "it parsed $N request lines"; fi
 

@@ -69,6 +69,10 @@ else
     echo "  FAIL [setup]: proxy does not report $BACKENDS backends"
 fi
 
+# The proxy runs in a worker of its own, which is what a smashed stack kills -- and the daemon starts it again under
+# a new pid -- so the worker is the one watched, and it has to be the same process after the probes.
+PXPID=$("$BIN" stats manybe 2>/dev/null | sed -n 's/^pid://p')
+
 # Every connection runs backend selection, which is where the overflow happened.
 for i in 1 2 3 4 5; do
     printf 'probe\n' | timeout 2 nc -q 1 127.0.0.1 "$PROXY_PORT" >/dev/null 2>&1 || true
@@ -76,12 +80,13 @@ done
 sleep 0.5
 
 TOTAL=$((TOTAL+1))
-if kill -0 "$DPID" 2>/dev/null; then
+NOWPID=$("$BIN" stats manybe 2>/dev/null | sed -n 's/^pid://p')
+if [ -n "$PXPID" ] && kill -0 "$PXPID" 2>/dev/null && [ "$NOWPID" = "$PXPID" ]; then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))
-    echo "  FAIL [daemon survived backend selection]: it aborted"
-    grep -E "stack smashing|AddressSanitizer|Segmentation" "$TMPDIR_T/daemon.log" 2>/dev/null | head -3
+    echo "  FAIL [the proxy's worker survived backend selection]: pid ${PXPID:-<none>} before, ${NOWPID:-<none>} after"
+    grep -E "stack smashing|AddressSanitizer|Segmentation|signal" "$TMPDIR_T/daemon.log" 2>/dev/null | head -3
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

@@ -421,9 +421,10 @@ for F in $FAULTS; do
              "${H_N:-0} requests in ${PHASE_CAP}s, wanted >= $MIN_REQS"
     fi
 
-    R=$(ctl "$F" be2); FAULT_T=$(echo "$R" | awk '{print $2}')
+    # The time is the asker's and is printed whatever the answer, so the answer is what says the fault is in place.
+    R=$(ctl "$F" be2); FAULT_T=$(echo "$R" | awk '$1 == "ok" {print $2}')
     if [ -z "${FAULT_T:-}" ]; then
-        bad "$F: fault timestamp readable" "the backend did not report when the fault took effect"
+        bad "$F: the fault took effect" "the backend's control answered '${R%% *}' rather than ok"
         : >"$STOPF"; wait $LPID 2>/dev/null; LPID=""; continue
     fi
 

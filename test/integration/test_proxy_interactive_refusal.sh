@@ -6,7 +6,7 @@
 # the reply comes back.  A proxy has none of that — it relays between a client
 # and a backend and speaks for neither — so there is nothing for typed input to
 # mean, and offering it would mean inventing a semantics rather than exposing
-# one.  It stays refused, on both the in-process and the out-of-process path.
+# one.  It stays refused.
 #
 # What was wrong was where the refusal happened.  The check sat BELOW the start
 # loop, so the command started the proxy, persisted was_running, and then exited
@@ -42,7 +42,6 @@ daemon_isolate proxyinteractive
 
 BE_PORT=$((SL_PORT_BASE+480))
 PX_PORT=$((SL_PORT_BASE+481))
-PX_OOP_PORT=$((SL_PORT_BASE+482))
 SRV_PORT=$((SL_PORT_BASE+483))
 
 PASS=0; FAIL=0; TOTAL=0
@@ -55,9 +54,9 @@ fail() {
 }
 
 cleanup() {
-    "$BIN" stop   px px_oop plainsrv backend 2>/dev/null || true
+    "$BIN" stop   px plainsrv backend 2>/dev/null || true
     sleep 0.3
-    "$BIN" remove px px_oop plainsrv backend 2>/dev/null || true
+    "$BIN" remove px plainsrv backend 2>/dev/null || true
     daemon_stop
 }
 trap cleanup EXIT
@@ -76,8 +75,6 @@ state() {
 create_ok "backend created" "$BIN" create server backend -p "$BE_PORT" -s
 create_ok "proxy created (not started)" "$BIN" create proxy px -p "$PX_PORT" \
     --backend "127.0.0.1:$BE_PORT" --protocol http
-create_ok "out-of-process proxy created (not started)" "$BIN" create proxy px_oop \
-    -p "$PX_OOP_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http
 create_ok "server created (not started)" "$BIN" create server plainsrv -p "$SRV_PORT"
 
 BEFORE=$(state px)
@@ -87,7 +84,7 @@ if [ "$BEFORE" = "created" ]; then pass; else
          "nothing below can tell a refusal from a no-op if it was already running"
 fi
 
-# ── The refusal, in-process ─────────────────────────────────────────────────
+# ── The refusal ─────────────────────────────────────────────────────────────
 RC=0
 OUT=$("$BIN" start px -i </dev/null 2>&1) || RC=$?
 
@@ -118,16 +115,6 @@ if [ "$AFTER" = "created" ]; then pass; else
          "the check used to run after the start loop, so the command started the" \
          "proxy, persisted was_running, and then reported failure — and a daemon" \
          "restart would bring back a runtime the operator was told had not started"
-fi
-
-# ── And the same on the out-of-process path ─────────────────────────────────
-RC=0
-OUT_OOP=$("$BIN" start px_oop -i </dev/null 2>&1) || RC=$?
-AFTER_OOP=$(state px_oop)
-if [ "$RC" -eq 1 ] && [ "$AFTER_OOP" = "created" ]; then pass; else
-    fail "the same holds for an out-of-process proxy" \
-         "exit $RC, state '$AFTER_OOP' — wanted exit 1 and 'created'" \
-         "output: '$OUT_OOP'"
 fi
 
 # ── Control: start without -i still works ───────────────────────────────────

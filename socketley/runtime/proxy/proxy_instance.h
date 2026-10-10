@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/async_resolver.h"
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -829,6 +830,8 @@ private:
     bool probe_pooled_tls(pooled_backend& pb);
     // Start the periodic sweep if it is not already running; idempotent.
     void arm_idle_sweep();
+    void arm_resolve_poll();
+    bool resolve_backend_names();
     // Close what the pool holds to endpoints the published membership no
     // longer lists, which runs where membership arrives because that is the
     // only thing that unreaches a healthy socket.
@@ -836,7 +839,10 @@ private:
     // Resolve the group members whose advertised address is a name, where the
     // address arrives -- the membership snapshot -- rather than on the request
     // path the idle sweep never sees.
-    void resolve_group_hosts();
+    // `retry_failed` on the sweep tick only: a name that did not resolve is not asked again on every membership
+    // change, where each ask would hold the loop for the resolver's whole timeout.
+    void resolve_group_hosts(bool retry_failed = true);
+    std::unordered_set<std::string> m_group_failed;
     // The one place a member's nodes are chosen over its port, appended to
     // `out` because a sharded member is N dial targets.
     void member_dial(const runtime_endpoint& ep, std::vector<resolved_backend>& out) const;
@@ -1091,6 +1097,12 @@ private:
     std::unique_ptr<timer_op> m_response_sweep_timer;
     bool m_response_sweep_armed{false};
     bool m_response_sweep_warned{false};
+
+    // Names are looked up off the loop, and this short chain runs only while an answer is still out.
+    static constexpr long RESOLVE_POLL_NSEC = 100000000L;   // 100 ms
+    socketley::async_resolver m_resolver;
+    std::unique_ptr<timer_op> m_resolve_timer;
+    bool m_resolve_armed{false};
 
 #ifdef SOCKETLEY_TRACE
     // Every live proxy on this process, so one instance's sweep can report on

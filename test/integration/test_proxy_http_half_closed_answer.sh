@@ -200,6 +200,8 @@ stat_when() {   # key want
     echo "${v:-absent}"
 }
 closed_after() { awk -v t="/$1" '$1 == t { print $2; exit }' "$SOCKETLEY_TMPD/be.closed" 2>/dev/null; }
+# A close timed from the client's, as the backend writes -1 when the client never marked its own.
+measured() { [ -n "$1" ] && [ "$1" != "-1.00" ]; }
 
 # One client that closes during an answer whose backend then says nothing.
 held_case() {   # mode
@@ -225,16 +227,17 @@ else bad "(a) a client closed during an answer framed by close is let go of" \
          "connections=$A_CONNS backend_connections=$A_BACKENDS three seconds after its close," \
          "want 0 and 0 (--backend-timeout 1)"; fi
 
-if [ -n "$A_TOOK" ]; then ok
+if measured "$A_TOOK"; then ok
 else bad "(a2) the backend's socket is closed with it" \
-         "the backend still held an open socket three seconds after the client closed"; fi
+         "backend socket closed after '${A_TOOK:-never}' s: never, or before the client marked its close" \
+         "client said: ${A_OUT:-nothing}"; fi
 
 # ─── (b): a Content-Length the backend stops short of ───────────────────────
 IFS='|' read -r B_OUT B_CONNS B_BACKENDS B_TOOK <<<"$(held_case quiet-cl)"
 echo "  (b) client: ${B_OUT:-nothing}; three seconds on: connections=$B_CONNS" \
      "backend_connections=$B_BACKENDS; backend socket closed after ${B_TOOK:-never} s"
 
-if [ "$B_CONNS" = 0 ] && [ "$B_BACKENDS" = 0 ] && [ -n "$B_TOOK" ]; then ok
+if [ "$B_CONNS" = 0 ] && [ "$B_BACKENDS" = 0 ] && measured "$B_TOOK"; then ok
 else bad "(b) a client closed during an answer its backend stopped short of is let go of" \
          "connections=$B_CONNS backend_connections=$B_BACKENDS, backend socket closed after" \
          "${B_TOOK:-never} s, three seconds after the client's close"; fi

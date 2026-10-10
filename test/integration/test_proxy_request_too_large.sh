@@ -180,8 +180,9 @@ PY
 
 python3 "$TMPD/be.py" hold   "$HOLD_BE"   >"$TMPD/hold.log"   2>&1 & BE_PIDS+=($!)
 python3 "$TMPD/be.py" stream "$STREAM_BE" >"$TMPD/stream.log" 2>&1 & BE_PIDS+=($!)
-ready_tcp 127.0.0.1 "$HOLD_BE" 8   || { echo "  SKIP: the holding backend never listened"; exit 0; }
-ready_tcp 127.0.0.1 "$STREAM_BE" 8 || { echo "  SKIP: the streaming backend never listened"; exit 0; }
+# The backends are this test's own, so one that never listens is a failure rather than a skip.
+ready_tcp 127.0.0.1 "$HOLD_BE" 8   || { echo "  FAIL [the holding backend listens]: $(tail -2 "$TMPD/hold.log")"; exit 1; }
+ready_tcp 127.0.0.1 "$STREAM_BE" 8 || { echo "  FAIL [the streaming backend listens]: $(tail -2 "$TMPD/stream.log")"; exit 1; }
 
 daemon_start "$BIN"
 

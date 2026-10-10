@@ -204,7 +204,7 @@ daemon_start "$BIN"
 # 1. The saving, on one https:// backend.
 # ─────────────────────────────────────────────────────────────────────────────
 start_be "$BE_A" "$TMPD/ip.pem" "$TMPD/ip.key" "$TMPD/a.state" "$TMPD/a.log" \
-    || { echo "  SKIP: backend would not start"; exit 0; }
+    || { echo "  FATAL: the test's own backend would not start"; tail -3 "$TMPD/a.log" | sed 's/^/         /'; exit 2; }
 
 "$BIN" create proxy tpool1 -p "$PX_ONE" --backend "https://127.0.0.1:$BE_A" \
     --protocol http --ca "$TMPD/both.pem" -s >/dev/null 2>&1
@@ -247,7 +247,7 @@ else bad "phase1-sni" "an https://127.0.0.1 backend must be asked for by no name
 # 2. Identity: two endpoints that differ only in how the same machine is named.
 # ─────────────────────────────────────────────────────────────────────────────
 start_be "$BE_B" "$TMPD/host.pem" "$TMPD/host.key" "$TMPD/b.state" "$TMPD/b.log" \
-    || { echo "  SKIP: second backend would not start"; exit 0; }
+    || { echo "  FATAL: the test's own second backend would not start"; tail -3 "$TMPD/b.log" | sed 's/^/         /'; exit 2; }
 
 "$BIN" create proxy tpool2 -p "$PX_TWO" \
     --backend "https://127.0.0.1:$BE_A" --backend "https://localhost:$BE_B" \
@@ -336,7 +336,7 @@ else bad "phase3-restart" "the first request after a restart must handshake agai
 # directions.
 # ─────────────────────────────────────────────────────────────────────────────
 start_be "$BE_C" "$TMPD/ip.pem" "$TMPD/ip.key" "$TMPD/c.state" "$TMPD/c.log" \
-    unbidden || { echo "  SKIP: unbidden backend would not start"; exit 0; }
+    unbidden || { echo "  FATAL: the test's own unbidden backend would not start"; tail -3 "$TMPD/c.log" | sed 's/^/         /'; exit 2; }
 
 "$BIN" create proxy tpoolu -p "$PX_UNBID" --backend "https://127.0.0.1:$BE_C" \
     --protocol http --ca "$TMPD/both.pem" -s >/dev/null 2>&1

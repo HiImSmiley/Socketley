@@ -54,7 +54,8 @@ class H(http.server.BaseHTTPRequestHandler):
         body = json.dumps({"path": self.path, "host": self.headers.get("Host", ""),
                            "proto": self.headers.get("X-Forwarded-Proto", ""),
                            "xff": self.headers.get("X-Forwarded-For", ""),
-                           "auth": self.headers.get("Authorization", "")}).encode()
+                           "auth": self.headers.get("Authorization", ""),
+                           "secret": self.headers.get("X-Hop-Secret", "")}).encode()
         self.send_response(200)
         if self.path == "/hsts":
             self.send_header("Strict-Transport-Security", "max-age=60")
@@ -105,6 +106,10 @@ expect "and a backend's own HSTS is left alone, not doubled" \
 expect "a proxy without --domain still writes the scheme itself" \
     "$("$BIN" create proxy plain -p $((P+10)) --backend "127.0.0.1:$ECHO" -s >/dev/null 2>&1; sleep 0.5
        curl -s -m 5 -H 'X-Forwarded-Proto: https' "http://127.0.0.1:$((P+10))/plain/" | field proto)" "http"
+expect "a field the client's Connection header names stops at the proxy" \
+    "$(curl -s -m 5 -H 'Connection: keep-alive, X-Hop-Secret' -H 'X-Hop-Secret: s3cr3t' "http://127.0.0.1:$((P+10))/plain/" | field secret)" ""
+expect "and one it does not name gets there" \
+    "$(curl -s -m 5 -H 'X-Hop-Secret: s3cr3t' "http://127.0.0.1:$((P+10))/plain/" | field secret)" "s3cr3t"
 
 # ─── an upload longer than --backend-timeout ────────────────────────────────
 "$BIN" create proxy slow -p $((P+12)) --backend "127.0.0.1:$ECHO" --backend-timeout 1 -s >/dev/null 2>&1
@@ -152,6 +157,10 @@ has_retry=$(curl -s -m 5 -D - -o /dev/null -H 'X-Forwarded-For: 10.0.0.1' "http:
             awk -F': ' 'tolower($1)=="retry-after" { print ($2 > 0 && $2 <= 900) }')
 expect "and told for how long" "$has_retry" 1
 expect "another address is not" "$(tc -H 'X-Forwarded-For: 10.0.0.2' -H 'Authorization: Bearer secret-token-one')" 200
+# A dual-stack listener hears IPv4 peers as ::ffff:a.b.c.d, whose first 64 bits every one of them shares.
+for _ in 1 2 3 4 5; do tc -H 'X-Forwarded-For: ::ffff:10.0.0.7' -H 'Authorization: Bearer guess' >/dev/null; done
+expect "an IPv4 address heard over IPv6 is barred alone, not with every IPv4 client" \
+    "$(tc -H 'X-Forwarded-For: ::ffff:10.0.0.7' -H 'Authorization: Bearer secret-token-one')$(tc -H 'X-Forwarded-For: ::ffff:10.0.0.8' -H 'Authorization: Bearer secret-token-one')" 429200
 expect "behind the entrance the address is the one it heard from, not the client's word" \
     "$(hs tun.example.com / -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 10.0.0.1' -H 'Authorization: Bearer secret-token-one')" 200
 printf 'secret-token-three\n' > "$T/tokens"

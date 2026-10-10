@@ -635,7 +635,7 @@ void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
 
     // And the addresses for whatever the new snapshot added, after the
     // pruning, so a member that just left is not looked up on its way out.
-    resolve_group_hosts();
+    resolve_group_hosts(/*retry_failed=*/false);
     announce_group_nodes();
 }
 
@@ -818,7 +818,7 @@ void proxy_instance::rebuild_route_view()
 // sweep never sees it, so resolution belongs here, on the membership change --
 // otherwise an @group backend whose members advertise names stopped routing
 // entirely.
-void proxy_instance::resolve_group_hosts()
+void proxy_instance::resolve_group_hosts(bool retry_failed)
 {
     if (!m_endpoints || m_backends.empty())
     {
@@ -860,24 +860,31 @@ void proxy_instance::resolve_group_hosts()
                 continue;
             }
 
-            struct addrinfo hints{};
-            hints.ai_family   = AF_INET;
-            hints.ai_socktype = SOCK_STREAM;
-
-            struct addrinfo* res = nullptr;
-            if (getaddrinfo(ep.host.c_str(), nullptr, &hints, &res) == 0 && res)
+            if (!retry_failed && m_group_failed.count(ep.host))
             {
-                if (res->ai_family == AF_INET &&
-                    res->ai_addrlen == sizeof(struct sockaddr_in))
-                {
-                    const auto* sin = reinterpret_cast<const struct sockaddr_in*>(res->ai_addr);
-                    kept.emplace(ep.host, sin->sin_addr);
-                }
-                freeaddrinfo(res);
+                unresolved = true;
+                continue;
             }
 
-            if (kept.find(ep.host) == kept.end())
+            std::vector<socketley::async_resolver::address> found;
+            const auto st = m_resolver.lookup(ep.host, AF_INET, found);
+            if (st == socketley::async_resolver::state::pending)
+            {
                 unresolved = true;
+                arm_resolve_poll();
+                continue;
+            }
+            if (st == socketley::async_resolver::state::ready && !found.empty() &&
+                found.front().len == sizeof(struct sockaddr_in))
+                kept.emplace(ep.host, reinterpret_cast<const struct sockaddr_in*>(&found.front().addr)->sin_addr);
+
+            if (kept.find(ep.host) == kept.end())
+            {
+                unresolved = true;
+                m_group_failed.insert(ep.host);
+            }
+            else
+                m_group_failed.erase(ep.host);
         }
     }
 
@@ -2039,17 +2046,26 @@ bool proxy_instance::setup(event_loop& loop)
     // io_request.
     m_accept = std::make_unique<accept_op>();
     m_accept->req = { this, nullptr, -1, 0, op_accept };
+    bool accepting = false;
     if (event_loop::supports_multishot_accept())
     {
         m_accept->req.type = op_multishot_accept;
-        loop.submit_multishot_accept(m_listen_fd, &m_accept->req);
-        m_multishot_active = true;
+        accepting = loop.submit_multishot_accept(m_listen_fd, &m_accept->req);
+        m_multishot_active = accepting;
     }
     else
     {
         m_accept->req.type = op_accept;
-        loop.submit_accept(m_listen_fd, &m_accept->addr, &m_accept->addrlen, &m_accept->req);
+        accepting = loop.submit_accept(m_listen_fd, &m_accept->addr, &m_accept->addrlen, &m_accept->req);
         m_multishot_active = false;
+    }
+    // A listener whose accept never reached the ring would be bound and reported running and take nobody.
+    if (SOCKETLEY_UNLIKELY(!accepting))
+    {
+        LOG_ERROR("proxy: the accept could not be submitted; the runtime does not start");
+        close_tracked(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
     }
 
     refresh_cached_limits();
@@ -2075,6 +2091,12 @@ bool proxy_instance::setup(event_loop& loop)
     m_response_sweep_timer->req = { this, nullptr, -1, 0, op_timeout };
     m_response_sweep_armed = false;
     m_response_sweep_warned = false;
+
+    m_resolve_timer = std::make_unique<timer_op>();
+    m_resolve_timer->ts.tv_sec = 0;
+    m_resolve_timer->ts.tv_nsec = RESOLVE_POLL_NSEC;
+    m_resolve_timer->req = { this, nullptr, -1, 0, op_timeout };
+    m_resolve_armed = false;
 
     // Pre-allocate connection struct pools
     if (m_client_pool.empty())
@@ -2171,6 +2193,8 @@ void proxy_instance::teardown(event_loop& /*loop*/)
     // Drain: flush pending write queues before closing
     if (get_drain())
     {
+        // One end for every connection together, so a client that stopped reading cannot hold the stop.
+        const auto drain_end = std::chrono::steady_clock::now() + socketley::drain_budget;
         for (int i = 0; i < MAX_FDS; i++)
         {
             auto& conn = m_client_slots[i];
@@ -2180,7 +2204,7 @@ void proxy_instance::teardown(event_loop& /*loop*/)
                 const auto& msg = conn->write_queue.front();
                 // A short write leaves half a message on the wire; sending the
                 // next one after it would misframe everything that follows.
-                if (!socketley::write_all(i, msg.data(), msg.size())) break;
+                if (!socketley::write_all_until(i, msg.data(), msg.size(), drain_end)) break;
                 conn->write_queue.pop();
             }
         }
@@ -2242,6 +2266,8 @@ void proxy_instance::teardown(event_loop& /*loop*/)
             withdrawn &= m_loop->submit_timeout_remove(&m_idle_sweep_timer->req);
         if (m_response_sweep_armed && m_response_sweep_timer)
             withdrawn &= m_loop->submit_timeout_remove(&m_response_sweep_timer->req);
+        if (m_resolve_armed && m_resolve_timer)
+            withdrawn &= m_loop->submit_timeout_remove(&m_resolve_timer->req);
         if (m_accept_backoff_timer)
             withdrawn &= m_loop->submit_timeout_remove(&m_accept_backoff_timer->req);
         if (m_health_check_timer)
@@ -2284,6 +2310,12 @@ void proxy_instance::teardown(event_loop& /*loop*/)
             owed[0] = &m_response_sweep_timer->req;
             retire(std::shared_ptr<void>(std::move(m_response_sweep_timer)), owed, n);
         }
+        if (m_resolve_timer)
+        {
+            const size_t n = m_resolve_armed ? 1 : 0;
+            owed[0] = &m_resolve_timer->req;
+            retire(std::shared_ptr<void>(std::move(m_resolve_timer)), owed, n);
+        }
         if (m_accept_backoff_timer)
         {
             owed[0] = &m_accept_backoff_timer->req;
@@ -2303,6 +2335,7 @@ void proxy_instance::teardown(event_loop& /*loop*/)
 
     m_idle_sweep_armed = false;
     m_response_sweep_armed = false;
+    m_resolve_armed = false;
     m_loop = nullptr;
     m_multishot_active = false;
 }
@@ -2508,38 +2541,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                 // And the DNS the request path no longer does, once per sweep,
                 // where a resolver that hangs costs one tick instead of one
                 // request.
-                bool unresolved_left = false;
-                for (auto& b : m_backends)
-                {
-                    if (b.has_cached_addr || b.resolved_host.empty() ||
-                        b.resolved_port == 0)
-                        continue;
-
-                    char port_str[8];
-                    auto [pend, pec] = std::to_chars(port_str,
-                                                     port_str + sizeof(port_str),
-                                                     b.resolved_port);
-                    *pend = '\0';
-
-                    struct addrinfo hints{};
-                    hints.ai_family = AF_INET;
-                    hints.ai_socktype = SOCK_STREAM;
-
-                    struct addrinfo* res = nullptr;
-                    if (getaddrinfo(b.resolved_host.c_str(), port_str, &hints, &res) == 0 && res)
-                    {
-                        if (res->ai_family == AF_INET &&
-                            res->ai_addrlen == sizeof(struct sockaddr_in))
-                        {
-                            std::memcpy(&b.cached_addr, res->ai_addr, sizeof(struct sockaddr_in));
-                            b.has_cached_addr = true;
-                        }
-                        freeaddrinfo(res);
-                    }
-
-                    if (!b.has_cached_addr)
-                        unresolved_left = true;
-                }
+                bool unresolved_left = resolve_backend_names();
 
                 // The group members too, on the same tick, with
                 // resolve_group_hosts() carrying over what it has so only the
@@ -2563,6 +2565,14 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
             {
                 m_response_sweep_armed = false;
                 response_deadline_sweep();
+            }
+            // A lookup was still out: this link has spoken, and asking again arms the next one while one still is.
+            else if (m_resolve_timer && req == &m_resolve_timer->req)
+            {
+                m_resolve_armed = false;
+                resolve_backend_names();
+                if (m_group_unresolved)
+                    resolve_group_hosts();
             }
             // Accept backoff expired, so the timer owes nothing more and the
             // next shortage may arm a new one.
@@ -3543,10 +3553,12 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             m_loop->return_buf(BUF_GROUP_ID, buf_id);
     }
 
-    // If async connect is pending, just buffer data in partial
+    // If async connect is pending, just buffer data in partial -- up to the read buffer and no further: the reads
+    // are taken up again once the backend is there, and a client faster than a handshake that hangs held all it
+    // sent in this process meanwhile.
     if (SOCKETLEY_UNLIKELY(conn->connect_pending))
     {
-        if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending)
+        if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending && conn->partial.size() < read_buffer_bytes())
             if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
             {
                 // A submission that did not reach the ring is this proxy's
@@ -4691,6 +4703,9 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     // 6.7) -- and stripping them made a strict backend answer a plain response
     // to a handshake the client believed had succeeded.
     bool upgrade_offered = false;
+    // The fields the client's Connection header names are this hop's and go no further (RFC 9110 7.6.1), all but
+    // the ones that frame the message, which a client must not be able to take away from the backend's reading.
+    std::vector<std::string> connection_named;
     {
         bool conn_has_upgrade = false, has_upgrade_field = false;
         size_t u_pos = 0;
@@ -4708,6 +4723,19 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
             {
                 if (http_list_has_token(http_trim_ows(line.substr(colon + 1)), "upgrade", 7))
                     conn_has_upgrade = true;
+                std::string_view list = line.substr(colon + 1);
+                while (!list.empty())
+                {
+                    const size_t comma = list.find(',');
+                    std::string token(http_trim_ows(list.substr(0, comma)));
+                    list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+                    for (char& ch : token)
+                        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    if (!token.empty() && token != "close" && token != "keep-alive" && token != "upgrade" &&
+                        token != "content-length" && token != "transfer-encoding" && token != "host" &&
+                        connection_named.size() < 32)
+                        connection_named.push_back(std::move(token));
+                }
             }
             else if (header_name_equals(line, "upgrade", 7))
             {
@@ -4765,6 +4793,13 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         // The credentials --auth took were this proxy's to see, not the backend's.
         else if (m_auth.enabled() && header_name_equals(hdr_line, "authorization", 13))
             skip = true;
+        else
+            for (const std::string& named : connection_named)
+                if (header_name_equals(hdr_line, named.c_str(), named.size()))
+                {
+                    skip = true;
+                    break;
+                }
         // Transfer-Encoding is deliberately not on this list, because this
         // proxy forwards the body byte for byte and removing the header would
         // leave the backend reading chunk sizes as content.
@@ -5073,23 +5108,7 @@ bool proxy_instance::enforce_declared_route(proxy_client_connection* conn,
 // it" is not evidence that the peer did not.
 static bool filter_token_ok(std::string_view s)
 {
-    if (s.empty() || s.size() > 256)
-        return false;
-    for (char c : s)
-    {
-        const unsigned char u = static_cast<unsigned char>(c);
-        if (u <= 0x20 || u >= 0x7F)
-            return false;
-        switch (c)
-        {
-            case '(': case ')': case ',': case '/': case ':': case ';':
-            case '<': case '=': case '>': case '?': case '@': case '[':
-            case '\\': case ']': case '{': case '}': case '"':
-                return false;
-            default: break;
-        }
-    }
-    return true;
+    return http_field_name_ok(s);
 }
 
 // A field value a filter supplied, where the bytes that end a line and a
@@ -6393,6 +6412,41 @@ void proxy_instance::arm_idle_sweep()
     }
 }
 
+void proxy_instance::arm_resolve_poll()
+{
+    if (m_resolve_armed || !m_loop || !m_resolve_timer)
+        return;
+    // A refused timer leaves the answer to the next idle sweep, which asks the same question.
+    m_resolve_armed = m_loop->submit_timeout(&m_resolve_timer->ts, &m_resolve_timer->req);
+}
+
+// True while a configured backend name has no address yet.
+bool proxy_instance::resolve_backend_names()
+{
+    bool unresolved = false;
+    for (auto& b : m_backends)
+    {
+        if (b.has_cached_addr || b.resolved_host.empty() || b.resolved_port == 0)
+            continue;
+
+        std::vector<socketley::async_resolver::address> found;
+        const auto st = m_resolver.lookup(b.resolved_host, AF_INET, found);
+        if (st == socketley::async_resolver::state::pending)
+            arm_resolve_poll();
+        else if (st == socketley::async_resolver::state::ready && !found.empty() &&
+                 found.front().len == sizeof(struct sockaddr_in))
+        {
+            std::memcpy(&b.cached_addr, &found.front().addr, sizeof(struct sockaddr_in));
+            b.cached_addr.sin_port = htons(b.resolved_port);
+            b.has_cached_addr = true;
+        }
+
+        if (!b.has_cached_addr)
+            unresolved = true;
+    }
+    return unresolved;
+}
+
 // Once per instance, because a backend that does this does it on every socket
 // it has, and a client receiving somebody else's answer is what the silent
 // version cost.
@@ -6932,6 +6986,20 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
         if (entry.side == conn_client)
         {
             auto* conn = entry.client;
+            // The outbound leg's wait for room in the backend's socket.
+            if (req == &conn->splice_out_req)
+            {
+                conn->splice_out_req.type = op_splice;
+                if (SOCKETLEY_UNLIKELY(cqe->res < 0 || conn->closing || conn->backend_fd < 0 ||
+                                       conn->pipe_to_backend[0] < 0 ||
+                                       !m_loop->submit_splice(conn->pipe_to_backend[0], conn->backend_fd,
+                                                              PROXY_READ_BUF_SIZE, &conn->splice_out_req)))
+                {
+                    conn->splice_out_pending = false;
+                    close_pair(conn->fd, conn->backend_fd);
+                }
+                return;
+            }
             if (SOCKETLEY_UNLIKELY(req != &conn->splice_in_req))
                 return;
             conn->splice_in_req.type = op_splice;
@@ -6948,6 +7016,20 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
         else if (entry.side == conn_backend)
         {
             auto* conn = entry.backend;
+            // The outbound leg's wait for room in the client's socket.
+            if (req == &conn->splice_out_req)
+            {
+                conn->splice_out_req.type = op_splice;
+                if (SOCKETLEY_UNLIKELY(cqe->res < 0 || conn->closing || conn->client_fd < 0 ||
+                                       conn->pipe_to_client[0] < 0 ||
+                                       !m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
+                                                              PROXY_READ_BUF_SIZE, &conn->splice_out_req)))
+                {
+                    conn->splice_out_pending = false;
+                    close_pair(conn->client_fd, conn->fd);
+                }
+                return;
+            }
             if (SOCKETLEY_UNLIKELY(req != &conn->splice_in_req))
                 return;
             conn->splice_in_req.type = op_splice;
@@ -7034,12 +7116,14 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
 
             if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
             {
-                // EAGAIN: backend send buffer full — retry
+                // EAGAIN: backend send buffer full -- waited out through the readiness poll, as the inbound legs
+                // wait, because a splice resubmitted onto a full socket answers EAGAIN again at once, round and
+                // round through io-wq.
                 if (cqe->res == -EAGAIN && !conn->closing && conn->backend_fd >= 0)
                 {
                     conn->splice_out_pending = true;
-                    if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_backend[0], conn->backend_fd,
-                                          PROXY_READ_BUF_SIZE, &conn->splice_out_req)))
+                    conn->splice_out_req.type = op_splice_poll;
+                    if (SOCKETLEY_UNLIKELY(!m_loop->submit_poll_add(conn->backend_fd, POLLOUT, &conn->splice_out_req)))
                     {
                         conn->splice_out_pending = false;
                         close_pair(conn->fd, conn->backend_fd);
@@ -7186,12 +7270,12 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
 
             if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
             {
-                // EAGAIN: client send buffer full — retry
+                // EAGAIN: client send buffer full -- waited out through the readiness poll, as on the other leg.
                 if (cqe->res == -EAGAIN && !conn->closing && conn->client_fd >= 0)
                 {
                     conn->splice_out_pending = true;
-                    if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
-                                          PROXY_READ_BUF_SIZE, &conn->splice_out_req)))
+                    conn->splice_out_req.type = op_splice_poll;
+                    if (SOCKETLEY_UNLIKELY(!m_loop->submit_poll_add(conn->client_fd, POLLOUT, &conn->splice_out_req)))
                     {
                         conn->splice_out_pending = false;
                         close_pair(conn->client_fd, conn->fd);
@@ -8431,8 +8515,9 @@ bool proxy_instance::health_submit_read(async_health_check* hc)
         return false;
     // Ciphertext into the probe's own buffer and plaintext into the one the
     // verdict is read from, both memory this struct owns and retire() holds.
-    char* dst = hc->ssl ? hc->cipher_in.data() : hc->buf;
-    const size_t len = hc->ssl ? hc->cipher_in.size() : sizeof(hc->buf) - 1;
+    // Plaintext goes on after what came before, since a status line may arrive in pieces.
+    char* dst = hc->ssl ? hc->cipher_in.data() : hc->buf + hc->plain_len;
+    const size_t len = hc->ssl ? hc->cipher_in.size() : sizeof(hc->buf) - 1 - hc->plain_len;
     if (SOCKETLEY_UNLIKELY(len == 0))
         return false;
     hc->req.type = op_health_check;
@@ -8828,10 +8913,18 @@ void proxy_instance::handle_health_cqe(struct io_uring_cqe* cqe, io_request* req
             }
             got_2xx = health_is_2xx(hc->buf, hc->plain_len);
         }
-        else if (cqe->res > 12)
+        else if (cqe->res > 0)
         {
-            hc->buf[cqe->res] = '\0';
-            got_2xx = health_is_2xx(hc->buf, static_cast<size_t>(cqe->res));
+            hc->plain_len = static_cast<uint16_t>(hc->plain_len + cqe->res);
+            hc->buf[hc->plain_len] = '\0';
+            // Not enough of the status line yet: read on, as the TLS branch does, within the sweep's deadline.
+            if (hc->plain_len <= 12 && hc->plain_len < sizeof(hc->buf) - 1)
+            {
+                if (SOCKETLEY_UNLIKELY(!health_submit_read(hc)))
+                    drop_health_check(slot);
+                return;
+            }
+            got_2xx = health_is_2xx(hc->buf, hc->plain_len);
         }
 
         record(got_2xx);
