@@ -41,7 +41,10 @@ mux_verdict mux_request_head(const std::vector<std::pair<std::string, std::strin
         {
             std::string_view* slot = name == ":method" ? &method : name == ":scheme" ? &scheme
                                    : name == ":path" ? &path : name == ":authority" ? &authority : nullptr;
-            if (!slot || regular || !slot->empty() || value.empty())
+            // Checked as a field's value is, and without spaces, since each becomes a word of the request line or
+            // the Host line of the head built from them.
+            if (!slot || regular || !slot->empty() || value.empty() || !clean_value(value) ||
+                value.find_first_of(" \t") != std::string::npos)
                 return mux_verdict::malformed;
             *slot = value;
             continue;

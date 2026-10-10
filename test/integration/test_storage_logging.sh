@@ -104,6 +104,8 @@ keys=$(curl -s "$U/logs?list-type=2&prefix=p/" | grep -o '<Key>[^<]*</Key>' | se
 check "a partitioned log is under owner, region, bucket and date" \
     "$(printf '%s\n' "$keys" | grep -vcE '^p/socketley/us-east-1/src2/[0-9]{4}/[0-9]{2}/[0-9]{2}/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9A-F]{16}$')" 0
 check "and there is one" "$([ -n "$keys" ] && echo yes)" yes
+check "the date source asked for is the one read back" \
+    "$(curl -s "$U/src2?logging" | grep -o '<PartitionDateSource>[A-Za-z]*' | sed 's/.*>//')" EventTime
 
 # ── a restart keeps it, an empty status ends it ──
 "$BIN" stop lg >/dev/null 2>&1; "$BIN" start lg >/dev/null 2>&1; up

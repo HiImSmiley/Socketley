@@ -76,7 +76,8 @@ wait_node() {   # shard [pid it must not be]
     done
     return 1
 }
-dead() { for _ in $(seq 1 100); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.1; done; return 1; }
+# An empty pid is no process identified, which is not a process that died.
+dead() { [ -n "$1" ] || return 1; for _ in $(seq 1 100); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.1; done; return 1; }
 tmp_names() { ls "$DATA/$1/tmp" 2>/dev/null | tr '\n' ' '; }
 
 echo "=== Integration: a killed shard leaves a consistent runtime ==="
@@ -146,7 +147,8 @@ ls "$DATA/crash/tmp" | grep -q '^1\.' && ok "shard 1 has a temporary file of an 
 ls "$DATA/crash/tmp" | grep -q '^3\.' && ok "and so has shard 3" || bad "no temporary file of shard 3" "$(tmp_names crash)"
 
 P1=$(node_pid 1)
-kill -9 "$P1"
+[ -n "$P1" ] && ok "shard 1 is process $P1" || bad "shard 1 has no process" ""
+[ -n "$P1" ] && kill -9 "$P1"
 dead "$P1" && ok "shard 1 is killed" || bad "shard 1 is alive" "$P1"
 wait_node 1 "$P1" && ok "and restarted" || bad "shard 1 did not come back" ""
 ls "$DATA/crash/tmp" | grep -q '^1\.' && bad "the restarted shard removes its own temporary file" "$(tmp_names crash)" \

@@ -120,14 +120,15 @@ PYEOF
 CUT_BG=$!
 sleep 2
 wpid=$(worker_pid mp)
-[ -n "$wpid" ] && kill -9 "$wpid" 2>/dev/null
+if [ -n "$wpid" ]; then kill -9 "$wpid" 2>/dev/null
+else bad "the worker is killed mid-upload" "stats gave no worker pid, so nothing was killed"; fi
 kill "$CUT_BG" 2>/dev/null; wait "$CUT_BG" 2>/dev/null
 for _ in $(seq 1 100); do
     np=$(worker_pid mp)
     [ -n "$np" ] && [ "$np" != "$wpid" ] && wait_up "$P1" && break
     sleep 0.2
 done
-if [ -n "${np:-}" ] && [ "$np" != "$wpid" ]; then ok "the supervisor replaces the killed worker"; else bad "the supervisor replaces the killed worker" "old $wpid new ${np:-none}"; fi
+if [ -n "$wpid" ] && [ -n "${np:-}" ] && [ "$np" != "$wpid" ]; then ok "the supervisor replaces the killed worker"; else bad "the supervisor replaces the killed worker" "old $wpid new ${np:-none}"; fi
 run_half "the half after the kill passed" mp "$P1" "$DATA" killed
 
 # ── expiry ──────────────────────────────────────────────────────────────────
@@ -161,8 +162,11 @@ parts=${SOCKETLEY_STORAGE_MPU_PARTS:-6}
 part_mib=${SOCKETLEY_STORAGE_MPU_PART_MIB:-64}
 free_mib=$(df -Pm "$SOCKETLEY_TMPD" | awk 'NR==2 {print $4}')
 need_mib=$((parts * part_mib * 3))
-if [ "${free_mib:-0}" -lt "$need_mib" ]; then
-    echo "  SKIP: the big object needs $need_mib MiB free under $SOCKETLEY_TMPD and has ${free_mib:-0}"
+if [ "${free_mib:-0}" -lt "$need_mib" ] && [ -n "${SOCKETLEY_STORAGE_MPU_PARTS:-}${SOCKETLEY_STORAGE_MPU_PART_MIB:-}" ]; then
+    # A size asked for by name is a run that wants the big object, so not running it is a failure.
+    bad "the big object asked for runs" "it needs $need_mib MiB free under $SOCKETLEY_TMPD and has ${free_mib:-0}"
+elif [ "${free_mib:-0}" -lt "$need_mib" ]; then
+    echo "  SKIP: the big object needs $need_mib MiB free under $SOCKETLEY_TMPD and has ${free_mib:-0}; its half is not run"
 elif ! "$BIN" create storage mpl -p "$P4" --dir "$LDATA" --access-key "$AK" --secret-key "$SK" -s >/dev/null 2>&1; then
     bad "create for the big object" "the runtime was not created"
 else

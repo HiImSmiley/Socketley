@@ -620,9 +620,11 @@ void storage_run::h3_packet(const sockaddr_storage& local, socklen_t local_len, 
         }
         else if (hd.type == NGTCP2_PKT_INITIAL)
         {
+            // Counted only as far as the bound, so a flood of handshakes, the case the bound is for, stops the scan early.
             size_t shaking = 0;
             for (const auto& other : ep.conns)
-                shaking += !other->dead && !ngtcp2_conn_get_handshake_completed(other->q);
+                if ((shaking += !other->dead && !ngtcp2_conn_get_handshake_completed(other->q)) >= ep.retry_after)
+                    break;
             if (shaking >= ep.retry_after)
             {
                 h3_retry(hd, local, local_len, remote, remote_len);

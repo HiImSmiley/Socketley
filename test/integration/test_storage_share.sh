@@ -79,7 +79,13 @@ check "a link is made" "${#f}" 22
 check "and read without credentials" "$(curl -s "$U/~share/$f")" report
 check "on either shard" "$(for _ in 1 2 3 4 5 6; do curl -s "$U/~share/$f"; done)" "reportreportreportreportreportreport"
 check "?download names the file to save" "$(curl -s -D - -o /dev/null "$U/~share/$f?download" | grep -i '^content-disposition' | tr -d '\r')" \
-      'Content-Disposition: attachment; filename="report.txt"'
+      "Content-Disposition: attachment; filename=\"report.txt\"; filename*=UTF-8''report.txt"
+# A quote in the name ended the quoted filename and left the rest as junk; the name is given whole as RFC 6266 does.
+printf 'q' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/ann/say%20%22hi%22%20%C3%BC.txt"
+fq=$(mk "$A" '{"bucket":"ann","key":"say \"hi\" ü.txt"}')
+check "a name with a quote and a letter beyond ASCII is named safely, and whole" \
+      "$(curl -s -D - -o /dev/null "$U/~share/$fq?download" | grep -i '^content-disposition' | tr -d '\r')" \
+      "Content-Disposition: attachment; filename=\"say _hi_ __.txt\"; filename*=UTF-8''say%20%22hi%22%20%C3%BC.txt"
 check "a range of it is read" "$(curl -s -r 2-4 "$U/~share/$f")" por
 check "a path under a file's link is 404" "$(code "$U/~share/$f/other")" 404
 check "a link is read only" "$(code -T /dev/null "$U/~share/$f")" 405
@@ -109,6 +115,8 @@ check "a link with a password asks for it" "$(code "$U/~share/$p")" 401
 check "in a way a browser shows" "$(curl -s -D - -o /dev/null "$U/~share/$p" | grep -ci '^www-authenticate: basic')" 1
 check "refuses a wrong one" "$(code -u "x:wrong" "$U/~share/$p")" 401
 check "and takes the right one, with any name" "$(curl -s -u "anyone:open sesame" "$U/~share/$p")" report
+# A share document where the next check looks, or that check reads an empty directory and passes.
+check "the share is kept in .shares/" "$(compgen -G "$T/share/.shares/*.json" >/dev/null && echo yes || echo no)" yes
 check "the password is not kept in the clear" "$(grep -rc 'open sesame' "$T/share/.shares/" | grep -vc ':0')" 0
 for _ in $(seq 1 60); do curl -s -m 30 --interface 127.0.0.3 -o /dev/null -u "x:guess" "$U/~share/$p"; done
 check "an address that keeps guessing is refused the right one too" "$(code --interface 127.0.0.3 -u "x:open sesame" "$U/~share/$p")$(code --interface 127.0.0.3 -u "x:open sesame" "$U/~share/$p")" 429429
@@ -141,7 +149,7 @@ check "but not over a folder" "$(printf 'x' | code -T - "$U/~share/$w/")" 405
 
 # Listing and revoking.
 mine=$(curl -s -u "$A" "$U/~share" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
-check "the maker lists the links, the expired one gone" "$mine" 6
+check "the maker lists the links, the expired one gone" "$mine" 7
 check "another user lists none of them" "$(curl -s -u "$B" "$U/~share")" "[]"
 check "nor revokes one" "$(code -u "$B" -X DELETE "$U/~share/$f")" 403
 check "a link outlives a restart" \

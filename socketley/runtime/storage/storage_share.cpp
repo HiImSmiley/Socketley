@@ -617,9 +617,9 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
     q.key    = std::move(key);
     q.query.clear();
     q.app = 0;
+    // The interface's own header, which keeps a quote or a control character in the name from breaking it.
     if (download)
-        q.query.emplace_back("response-content-disposition",
-                             "attachment; filename=\"" + std::string(last_name_of(q.key)) + "\"");
+        q.query.emplace_back("response-content-disposition", attachment_of(q.key));
     c->anonymous = true;
     c->user.reset();
     c->hook = nullptr;
@@ -754,7 +754,9 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
     }
     s.owner = u ? u->id : std::string(default_owner);
     s.created_ms = now_ms();
-    s.expires_ms = expires_in ? s.created_ms + static_cast<int64_t>(expires_in) * 1000 : 0;
+    // A lifetime past a hundred years is one that does not end, and is not multiplied past int64 into the past.
+    constexpr uint64_t century_s = 100ull * 365 * 86400;
+    s.expires_ms = !expires_in || expires_in > century_s ? 0 : s.created_ms + static_cast<int64_t>(expires_in) * 1000;
     if (!password.empty())
     {
         s.pw_salt = random_hex(16);
@@ -1039,16 +1041,18 @@ void storage_run::share_tell(const std::string& url, std::string_view what, cons
             sp_detail::json_escape(bucket) + "\",\"key\":\"" + sp_detail::json_escape(key) + "\",\"downloads\":" +
             std::to_string(downloads) + ",\"max_downloads\":" + std::to_string(max_downloads) + ",\"expires\":" +
             std::to_string(expires_ms) + "}";
-    auto& h = m_hooks[url];
-    if (!h)
+    // Parsed before a slot is made for it, so a URL that is none leaves no empty hook behind for the sweep.
+    auto found = m_hooks.find(url);
+    if (found == m_hooks.end() || !found->second)
     {
         http_target t;
         std::string why;
         if (!parse_http_url(url, t, why))
             return;
-        h = std::make_unique<hook_peer>();
-        h->peer = std::make_unique<http_peer>(m_loop, m_io, m_hash, t, std::string{}, "a link's webhook");
+        found = m_hooks.insert_or_assign(url, std::make_unique<hook_peer>()).first;
+        found->second->peer = std::make_unique<http_peer>(m_loop, m_io, m_hash, t, std::string{}, "a link's webhook");
     }
+    auto& h = found->second;
     // At most a few waiting, so a webhook that does not answer cannot hold memory without bound.
     if (h->queue.size() < 16)
         h->queue.push_back(std::move(body));

@@ -117,16 +117,21 @@ public:
         std::error_code ec;
         std::filesystem::create_directories(dir + "/.ui", ec);
         m_fd = ::open((dir + "/.ui/git.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-        if (m_fd >= 0 && ::flock(m_fd, LOCK_EX) != 0) {}
+        int r = -1;
+        while (m_fd >= 0 && (r = ::flock(m_fd, LOCK_EX)) != 0 && errno == EINTR) {}
+        m_held = m_fd >= 0 && r == 0;
     }
     ~list_lock()
     {
         if (m_fd >= 0)
             ::close(m_fd);
     }
+    // A change made without the lock is one another shard's can overwrite, so none is made.
+    bool held() const { return m_held; }
 
 private:
     int m_fd{-1};
+    bool m_held{false};
 };
 
 std::vector<git_mirrors::repo> parse(const std::string& text)
@@ -173,8 +178,10 @@ std::string random_hex(size_t bytes)
 
 }   // namespace
 
-void git_mirrors::open(std::string dir, uint32_t shard, std::string endpoint, bool tls, std::string why_not)
+void git_mirrors::open(std::string dir, uint32_t shard, std::string endpoint, bool tls, std::string why_not,
+                       std::string cert)
 {
+    m_cert = std::move(cert);
     m_dir = std::move(dir);
     m_shard = shard;
     m_endpoint = std::move(endpoint);
@@ -226,6 +233,8 @@ std::string git_mirrors::add(repo& r)
     if (!valid_every(r.every))
         return "a repository is pulled every day, week or month, or never";
     list_lock lock(m_dir);
+    if (!lock.held())
+        return "the list of repositories could not be locked";
     m_cache_stamp = -1;
     std::vector<repo> rs = repos();
     if (rs.size() >= max_repos)
@@ -244,6 +253,8 @@ std::string git_mirrors::add(repo& r)
 bool git_mirrors::remove(std::string_view id)
 {
     list_lock lock(m_dir);
+    if (!lock.held())
+        return false;
     m_cache_stamp = -1;
     std::vector<repo> rs = repos();
     const size_t before = rs.size();
@@ -263,6 +274,8 @@ bool git_mirrors::set_every(std::string_view id, std::string_view every)
     if (!valid_every(every))
         return false;
     list_lock lock(m_dir);
+    if (!lock.held())
+        return false;
     m_cache_stamp = -1;
     std::vector<repo> rs = repos();
     for (repo& r : rs)
@@ -272,6 +285,17 @@ bool git_mirrors::set_every(std::string_view id, std::string_view every)
             return save(rs);
         }
     return false;
+}
+
+// A child this process started for `id` that has not ended, which holds the run before it has taken the run's lock.
+bool git_mirrors::spawned_live(std::string_view id) const
+{
+    const auto it = m_children.find(std::string(id));
+    if (it == m_children.end())
+        return false;
+    // Asked without reaping, so tick() still hears how it ended.
+    siginfo_t info{};
+    return ::waitid(P_PID, static_cast<id_t>(it->second), &info, WEXITED | WNOHANG | WNOWAIT) == 0 && info.si_pid == 0;
 }
 
 bool git_mirrors::running(std::string_view id) const
@@ -364,7 +388,7 @@ std::string git_mirrors::run_now(std::string_view id, authenticator& auth)
 {
     for (const repo& r : repos())
         if (r.id == id)
-            return running(id) ? std::string("it is running already") : start(r, auth);
+            return running(id) || spawned_live(id) ? std::string("it is running already") : start(r, auth);
     return "no such repository";
 }
 
@@ -390,6 +414,11 @@ std::string git_mirrors::start(const repo& r, authenticator& auth)
                                      "--endpoint", m_endpoint, "--bucket", r.bucket, "--name", r.name};
     if (m_tls)
         args.push_back("--tls");
+    if (m_tls && !m_cert.empty())
+    {
+        args.push_back("--ca");
+        args.push_back(m_cert);
+    }
     std::vector<char*> argv;
     for (std::string& s : args)
         argv.push_back(s.data());

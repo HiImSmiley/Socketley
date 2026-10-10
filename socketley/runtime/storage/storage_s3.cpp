@@ -1855,6 +1855,8 @@ void render_object_headers(const s3_request& q, const object_meta& m, std::strin
     object_headers(q, m, r, false, versioned);
     for (const auto& [k, v] : r.headers)
     {
+        if (!http_field_value_ok(k) || !http_field_value_ok(v))
+            continue;
         out += k;
         out += ": ";
         out += v;

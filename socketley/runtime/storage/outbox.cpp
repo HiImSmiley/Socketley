@@ -58,11 +58,23 @@ bool outbox::open(const std::string& dir, std::string_view sub, uint32_t shard, 
             const ssize_t n = ::read(fd, buf, sizeof(buf));
             if (n < 0 && errno == EINTR)
                 continue;
-            if (n <= 0)
+            if (n < 0)
+            {
+                // A prefix taken as the whole would be written back without the entries still owed after it.
+                err = "cannot read " + nd + "/" + m_name + ": " + std::strerror(errno);
+                ::close(fd);
+                return false;
+            }
+            if (n == 0)
                 break;
             text.append(buf, static_cast<size_t>(n));
         }
         ::close(fd);
+    }
+    else if (errno != ENOENT)
+    {
+        err = "cannot open " + nd + "/" + m_name + ": " + std::strerror(errno);
+        return false;
     }
 
     // Every entry with no delivery record, in the order they were made; a torn tail is a change never answered.
@@ -348,6 +360,14 @@ void outbox::maybe_rotate()
         {
             if (!*alive)
                 return;
+            // A stop that came in the middle closed the files this would go on with, so nothing more is done.
+            if (m_stopped)
+            {
+                if (fd >= 0)
+                    m_loop.close_fd(static_cast<int>(fd));
+                m_rotating = false;
+                return;
+            }
             if (fd < 0)
             {
                 fail(std::strerror(static_cast<int>(-fd)));
@@ -357,6 +377,12 @@ void outbox::maybe_rotate()
             {
                 if (!*alive)
                     return;
+                if (m_stopped)
+                {
+                    m_loop.close_fd(static_cast<int>(fd));
+                    m_rotating = false;
+                    return;
+                }
                 if (r < 0)
                 {
                     m_loop.close_fd(static_cast<int>(fd));
@@ -375,7 +401,8 @@ void outbox::maybe_rotate()
                         if (!*alive)
                             return;
                         m_rotating = false;
-                        kick();
+                        if (!m_stopped)
+                            kick();
                     }))
                 {
                     m_rotating = false;

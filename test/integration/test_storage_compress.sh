@@ -83,7 +83,8 @@ echo "$metrics" | grep -q '^socketley_storage_scrub_passes_total' && ok "/metric
     || bad "/metrics has the scrub's counters" "$(echo "$metrics" | grep scrub | head -3)"
 
 # A restart reads what was compressed, and the passes go on from where they were rather than over every version.
-before=$("$BIN" stats cz 2>&1 | awk -F: '$1=="compressed_objects"{s+=$2} END{print s+0}')
+# A stats that fails or names no counter reads "none", never a 0 that would pass below.
+before=$("$BIN" stats cz 2>&1 | awk -F: '$1=="compressed_objects"{s+=$2; n++} END{print n ? s+0 : "none"}')
 "$BIN" stop cz >/dev/null 2>&1; "$BIN" start cz >/dev/null 2>&1
 wait_up "$P" || bad "the runtime comes back" "no answer on $P"
 got=$(python3 - "$P" <<'PY'
@@ -98,8 +99,8 @@ PY
 [ "$got" = $((3 << 20)) ] && ok "a compressed object reads back whole after a restart" \
     || bad "a compressed object reads back whole after a restart" "$got bytes"
 sleep 3
-after=$("$BIN" stats cz 2>&1 | awk -F: '$1=="compressed_objects"{s+=$2} END{print s+0}')
-[ "$after" = 0 ] && ok "and the passes after it compress nothing again" \
+after=$("$BIN" stats cz 2>&1 | awk -F: '$1=="compressed_objects"{s+=$2; n++} END{print n ? s+0 : "none"}')
+[ "$after" = 0 ] && [ "$before" != none ] && [ "$before" -gt 0 ] && ok "and the passes after it compress nothing again" \
     || bad "and the passes after it compress nothing again" "$after compressed after a restart, $before before"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

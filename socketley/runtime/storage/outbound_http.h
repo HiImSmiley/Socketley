@@ -217,6 +217,8 @@ private:
     // The host closed the connection, which then carries no further exchange.
     bool        m_eof{false};
     std::string m_in;
+    // Where the answer's head ends in m_in once found, so each read does not search it from the start again.
+    mutable size_t m_head_end = std::string::npos;
     std::chrono::steady_clock::time_point m_deadline{};
     // When the connection was made, and since when, kept from the last exchange, it has had nothing on it.
     std::chrono::steady_clock::time_point m_connected_at{};

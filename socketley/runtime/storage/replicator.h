@@ -239,6 +239,9 @@ private:
         replication_target target;
         std::vector<std::unique_ptr<http_peer>> peers;
         std::deque<task> q;
+        // start() is under way on this lane, and was asked again from inside it.
+        bool starting{false};
+        bool again{false};
         std::vector<std::shared_ptr<job>> active;
         // The keys of the copies in flight, by bucket NUL key, and whether one of them is a bucket's change.
         std::unordered_set<std::string> busy;
@@ -266,6 +269,8 @@ private:
     // Queues `t` for `l`, written to the outbox unless it came from there.
     void push(lane& l, task t, bool from_outbox);
     void start(lane& l);
+    // One pass of start(): what the lane can begin now.
+    void start_round(lane& l);
     // Starts the steps of a copy.
     void run(lane& l, const std::shared_ptr<job>& j);
     // The connection a new copy of `l` goes on, one no copy in flight has.

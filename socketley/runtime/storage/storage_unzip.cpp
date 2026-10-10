@@ -162,16 +162,35 @@ std::string_view type_of(std::string_view name)
     return "application/octet-stream";
 }
 
+// A string as JSON, a byte that begins no whole UTF-8 sequence written as U+FFFD, since a ZIP names its entries in
+// whatever bytes its maker had.
 void json_str(std::string& o, std::string_view v)
 {
     o += '"';
-    for (const char ch : v)
+    for (size_t i = 0; i < v.size();)
     {
-        if (ch == '"' || ch == '\\')
-            o += '\\';
-        if (static_cast<uint8_t>(ch) < 0x20)
+        const auto c = static_cast<uint8_t>(v[i]);
+        const size_t len = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 && c >= 0xC2 ? 2 : (c & 0xF0) == 0xE0 ? 3
+                         : (c & 0xF8) == 0xF0 && c <= 0xF4 ? 4 : 0;
+        bool whole = len != 0 && i + len <= v.size();
+        for (size_t k = 1; whole && k < len; ++k)
+            whole = (static_cast<uint8_t>(v[i + k]) & 0xC0) == 0x80;
+        if (!whole)
+        {
+            o += "\xEF\xBF\xBD";
+            ++i;
             continue;
-        o += ch;
+        }
+        if (len == 1)
+        {
+            if (c == '"' || c == '\\')
+                o += '\\';
+            if (c >= 0x20)
+                o += static_cast<char>(c);
+        }
+        else
+            o.append(v.substr(i, len));
+        i += len;
     }
     o += '"';
 }
@@ -274,6 +293,8 @@ struct storage_run::unzip_job : std::enable_shared_from_this<unzip_job>
         fd = -1;
         keep.reset();
     }
+
+    ~unzip_job() { --run->m_unzips; }
 
     void answer()
     {
@@ -572,7 +593,13 @@ void storage_run::unzip_start(const std::shared_ptr<conn>& c, std::string bucket
         app_reply(c, 403, "Access denied.\n");
         return;
     }
+    if (m_unzips >= max_unzips)
+    {
+        app_reply(c, 503, std::to_string(max_unzips) + " ZIPs are being unpacked already; try again in a moment.\n");
+        return;
+    }
     auto j    = std::make_shared<unzip_job>();
+    ++m_unzips;
     j->run    = this;
     j->who    = c;
     j->bucket = std::move(bucket);

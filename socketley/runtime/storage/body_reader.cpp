@@ -372,7 +372,9 @@ bool sse_open_body(const object_meta& m, const sse_key& key, std::string_view st
     part_list  list;
     part_trailer t;
     const bool trailer = part_trailer_of(m, t);
-    if (trailer && (stored.size() < t.at + t.len || !decode_part_trailer(stored.substr(t.at, t.len), m, t, list)))
+    // Compared without the sum, which a tampered offset near 2^64 would wrap past the check.
+    if (trailer && (t.at > stored.size() || t.len > stored.size() - t.at ||
+                    !decode_part_trailer(stored.substr(t.at, t.len), m, t, list)))
         return false;
     if (!l.init(m, trailer ? &list : nullptr) || stored.size() < l.stored())
         return false;

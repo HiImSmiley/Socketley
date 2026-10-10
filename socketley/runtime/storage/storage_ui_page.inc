@@ -1,5 +1,6 @@
 // The page of the web interface, whole: markup, style and script, with nothing fetched from elsewhere.
-constexpr std::string_view ui_page = R"HTML(<!doctype html>
+// An array and its size rather than a view of a pointer, whose length a compile-time strlen would count past its limit.
+constexpr char ui_page_text[] = R"HTML(<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -1148,7 +1149,9 @@ function dropTarget(node, segs) {
   node.addEventListener('drop', e => {
     if (!e.dataTransfer.types.includes(DRAG)) return;
     e.preventDefault(); e.stopPropagation(); node.classList.remove('dropin');
-    moveTo(JSON.parse(e.dataTransfer.getData(DRAG)), segs);
+    // What another page put under this type is not trusted to be the list this page writes there.
+    let items = null; try { items = JSON.parse(e.dataTransfer.getData(DRAG)); } catch (err) {}
+    if (Array.isArray(items)) moveTo(items, segs);
   });
 }
 async function moveTo(list, dest) {
@@ -1506,7 +1509,7 @@ async function unzip(it) {
     const r = await api('POST', dav(it.segs) + '?unzip');
     // The answer tells what was made, and what was not, whether or not all of it went well.
     let j = null; try { j = await r.clone().json(); } catch (e) {}
-    if (!j) await must(r);
+    if (!j) { await must(r); throw new Error('The drive answered with something this page cannot read'); }
     const folder = j.folder.replace(/\/$/, '').split('/').pop();
     if (j.files || !j.failed) toast('Unzipped ' + j.files + (j.files === 1 ? ' file' : ' files') + ' into ' + folder);
     const few = (n, names) => names.slice(0, 3).join(', ') + (n > 3 ? ', …' : '');
@@ -1692,7 +1695,8 @@ function gitDlg() {
           }, 'sm bad'))));
     }
     box.append(form, T, acct);
-    if (busy) timer = setTimeout(fill, 3000);
+    // Asked again only while the dialog is still shown, so a closed one stops polling.
+    if (busy) timer = setTimeout(() => { if (L.isConnected) fill(); }, 3000);
   }
   fill();
   return L;
@@ -2106,6 +2110,7 @@ class MsePlayer {
   static source() { return window.ManagedMediaSource || window.MediaSource; }
   stop() {
     this.alive = false; if (this.ctl) this.ctl.abort(); clearInterval(this.tick);
+    if (this.unopened) this.unopened();
     this.v.removeEventListener('seeking', this.onseek);
     this.v.removeAttribute('src'); this.v.load();
     if (this.url) URL.revokeObjectURL(this.url);
@@ -2147,7 +2152,10 @@ class MsePlayer {
     if (window.ManagedMediaSource) this.v.disableRemotePlayback = true;
     this.url = URL.createObjectURL(this.ms);
     this.v.src = this.url;
-    await new Promise(r => this.ms.addEventListener('sourceopen', r, { once: true }));
+    // Given up when the player is stopped first, or a stop before the source opened left the caller waiting for good.
+    await new Promise(r => { this.ms.addEventListener('sourceopen', r, { once: true }); this.unopened = r; });
+    this.unopened = null;
+    if (!this.alive) return false;
     this.ms.duration = first.total;
     this.sb = this.ms.addSourceBuffer('video/mp4; codecs="' + this.levels[this.level].codecs + '"');
     this.onseek = () => { if (this.ctl) this.ctl.abort(); };
@@ -2557,7 +2565,10 @@ async function playVideo(it, list) {
       spin.hidden = false;
       player = new MsePlayer(v, master, want);
       player.onlevel = () => { const l = player.current(); if (l) qlab.textContent = choice === 'auto' ? 'AUTO ' + (l.copy ? 'ORIG' : l.rung + 'p') : qlab.textContent; };
-      if (!(await player.start(at))) { player.stop(); player = null; choice = 'orig'; v.src = base; v.currentTime = at; }
+      // A start that throws is a start that failed, and falls back to the file as one that answers false does.
+      let started = false;
+      try { started = await player.start(at); } catch (e) { started = false; }
+      if (!started) { if (player) player.stop(); player = null; choice = 'orig'; v.src = base; v.currentTime = at; }
     } else {
       if (player) { player.stop(); player = null; }
       const obj = '/' + enc(it.segs);
@@ -3068,6 +3079,7 @@ function enqueue(file, rel, base, onend, handle, root) {
 }
 // The parts of upload `j` the server has, pages of them, marked done with their ETags; false when the upload is gone.
 async function arrived(j) {
+  if (!j.parts) return false;
   let marker = '';
   for (;;) {
     const r = await api('GET', url(j) + '?uploadId=' + encodeURIComponent(j.id) + (marker ? '&part-number-marker=' + marker : ''));
@@ -3079,7 +3091,10 @@ async function arrived(j) {
       if (p && +t(e, 'Size') === p.to - p.from && p.state !== 'done') { p.state = 'done'; p.etag = t(e, 'ETag'); j.sent += p.to - p.from; }
     }
     if (t(doc, 'IsTruncated') !== 'true') return true;
-    marker = t(doc, 'NextPartNumberMarker');
+    // A truncated page with nowhere to go on from would be asked for again for ever.
+    const next = t(doc, 'NextPartNumberMarker');
+    if (!next || next === marker) return false;
+    marker = next;
   }
 }
 // A tab holds a lock as long as it is open, so the uploads another open tab is sending are not taken up here as well.
@@ -3548,3 +3563,4 @@ async function start() {
 </body>
 </html>
 )HTML";
+constexpr std::string_view ui_page(ui_page_text, sizeof(ui_page_text) - 1);

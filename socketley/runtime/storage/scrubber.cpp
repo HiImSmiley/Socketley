@@ -197,12 +197,13 @@ void scrubber::check(std::string version_id)
     j->version_id = std::move(version_id);
     m_busy        = true;
     auto alive    = m_alive;
-    auto then     = [this, alive, j](open_result o)
+    auto then     = [this, alive, j, loop = &m_loop](open_result o)
     {
+        // The loop and not this scrubber, which may be gone.
         if (!*alive)
         {
             if (o.fd >= 0)
-                m_loop.close_fd(o.fd);
+                loop->close_fd(o.fd);
             return;
         }
         opened(j, std::move(o));
@@ -258,10 +259,16 @@ void scrubber::opened(const std::shared_ptr<job>& j, open_result o)
 void scrubber::read(const std::shared_ptr<job>& j)
 {
     auto alive = m_alive;
-    j->reader->next([this, alive, j](bool ok, std::string_view plain)
+    j->reader->next([this, alive, j, loop = &m_loop](bool ok, std::string_view plain)
     {
+        // The job's file goes with a scrubber that is gone, as the open's does.
         if (!*alive)
+        {
+            if (j->fd >= 0)
+                loop->close_fd(j->fd);
+            j->fd = -1;
             return;
+        }
         // A body that cannot be read whole is as corrupt as one whose bytes differ.
         if (!ok)
         {

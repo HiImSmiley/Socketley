@@ -83,7 +83,7 @@ public:
             if (!m_c.tls())
                 return false;
             const int v = SSL_version(m_c.tls());
-            out.emplace_back(v == TLS1_3_VERSION ? "1.3" : v == TLS1_2_VERSION ? "1.2" : "1.1");
+            out.emplace_back(v == TLS1_3_VERSION ? "1.3" : v == TLS1_2_VERSION ? "1.2" : v == TLS1_1_VERSION ? "1.1" : "1.0");
             return true;
         }
         if (key == "s3:requestobjecttagkeys" || key.starts_with("s3:requestobjecttag/"))
@@ -428,6 +428,10 @@ policy_effect storage_run::access_of(const std::shared_ptr<conn>& c, std::string
         if (e != policy_effect::allow)
             return e == policy_effect::deny ? policy_effect::deny : policy_effect::none;
     }
+    // The user's own policies need the client's address as much as a bucket's do, or an IP condition in one is
+    // weighed against an address nobody looked up.
+    if (u && ((u->has_policy && u->policy.needs_ip()) || (u->iam_policy && u->iam_policy->needs_ip())))
+        client_address(*c);
     policy_effect own = u && u->has_policy ? u->policy.evaluate(q) : policy_effect::none;
     // The IAM API's policies of a credentials-file user stand beside the file's: either's Deny refuses, either's Allow
     // admits.

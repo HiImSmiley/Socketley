@@ -451,8 +451,9 @@ struct commit_request
 // A body being written, from the first byte to the commit.
 //
 // The staged bytes are written in large pieces while the next ones arrive, the
-// digest is taken as they go past, and nothing but the two staging buffers is
-// ever held: a 5 GiB object needs no more memory than a 5 MiB one.
+// digest is taken as they go past, and nothing but the two staging buffers --
+// and for a sealed body each one's sealed copy -- is ever held: a 5 GiB object
+// needs no more memory than a 5 MiB one.
 class put_op : public std::enable_shared_from_this<put_op>
 {
 public:

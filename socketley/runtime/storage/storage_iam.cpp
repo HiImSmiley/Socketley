@@ -248,7 +248,9 @@ void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::
         {
             doc = iam_json(st);
             rev = std::max(now_ms, read_rev(file) + 1);
-            if (!replace_file(file, doc) || (m_repl.has_nodes() && !replace_file(file + ".rev", std::to_string(rev))))
+            // The revision first: a document written beside a revision that failed was in force on this node alone,
+            // while the admin was told it was not made.
+            if ((m_repl.has_nodes() && !replace_file(file + ".rev", std::to_string(rev))) || !replace_file(file, doc))
             {
                 res.ok = false;
                 res.status = 500;

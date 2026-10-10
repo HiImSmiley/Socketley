@@ -419,9 +419,11 @@ inline int64_t parse_http_date(std::string_view s)
     struct tm tm{};
     const std::string z(s);
     const char* end = strptime(z.c_str(), "%a, %d %b %Y %H:%M:%S GMT", &tm);
-    if (!end)
+    // The whole of it, and no instant before 1970, which leaves -1 meaning only "not a date".
+    if (!end || *end != '\0')
         return -1;
-    return static_cast<int64_t>(timegm(&tm));
+    const int64_t t = static_cast<int64_t>(timegm(&tm));
+    return t < 0 ? -1 : t;
 }
 
 }   // namespace socketley::storage

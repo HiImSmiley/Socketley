@@ -191,15 +191,28 @@ bool read_targets_file(const std::string& path, std::string_view what, std::stri
         why = "cannot read the " + std::string(what) + " file " + path + ": " + std::strerror(errno);
         return false;
     }
+    // Whole or refused: a file read in part would configure only what came before the break.
     char buf[4096];
     for (;;)
     {
         const ssize_t n = ::read(fd, buf, sizeof(buf));
         if (n < 0 && errno == EINTR)
             continue;
-        if (n <= 0 || out.size() > (1u << 20))
+        if (n < 0)
+        {
+            why = "cannot read the " + std::string(what) + " file " + path + ": " + std::strerror(errno);
+            ::close(fd);
+            return false;
+        }
+        if (n == 0)
             break;
         out.append(buf, static_cast<size_t>(n));
+        if (out.size() > (1u << 20))
+        {
+            why = "the " + std::string(what) + " file " + path + " is larger than 1 MiB";
+            ::close(fd);
+            return false;
+        }
     }
     ::close(fd);
     return true;
@@ -394,6 +407,7 @@ void http_peer::exchange(http_request req, std::function<void(http_answer)> done
     m_write_failed = false;
     m_eof          = false;
     m_in.clear();
+    m_head_end = std::string::npos;
     m_deadline = now + std::chrono::seconds(stall_secs);
     if (m_stopped || (m_target.tls && !m_tls))
     {
@@ -571,6 +585,10 @@ void http_peer::advance()
                         }
                         off += static_cast<size_t>(n);
                     }
+                    // Sent before the next piece is asked for, so the body goes as it is read and never waits whole
+                    // in the record layer; the write's completion asks for the next.
+                    if (flush_cipher())
+                        return;
                 }
                 advance();
             });
@@ -774,9 +792,15 @@ void http_peer::got(const char* p, size_t n)
             m_in.append(buf, static_cast<size_t>(r));
         }
     }
-    if (answer_complete() || m_in.size() > answer_cap)
+    if (answer_complete())
     {
         finish(true);
+        return;
+    }
+    // Past the cap is no answer this client reads, and not a truncated one handed on as whole.
+    if (m_in.size() > answer_cap)
+    {
+        finish(false, "the answer is larger than 1 MiB");
         return;
     }
     if (m_ssl && !m_sent && !m_write_failed)
@@ -789,7 +813,9 @@ void http_peer::got(const char* p, size_t n)
 
 bool http_peer::answer_complete(bool framed) const
 {
-    const size_t end = m_in.find("\r\n\r\n");
+    if (m_head_end == std::string::npos)
+        m_head_end = m_in.find("\r\n\r\n");
+    const size_t end = m_head_end;
     if (end == std::string::npos)
         return false;
     if (m_req.head_only && !framed)
@@ -801,6 +827,9 @@ bool http_peer::answer_complete(bool framed) const
         return true;
     if (http_list_has_token(head_value(head, "transfer-encoding"), "chunked", 7))
     {
+        // A chunked body ends with an empty line, so a buffer that does not is not decoded again just to learn so.
+        if (!m_in.ends_with("\r\n\r\n"))
+            return false;
         http_chunked_decoder d;
         std::string_view in = body, out;
         for (;;)
@@ -877,7 +906,11 @@ void http_peer::finish(bool answered, std::string why)
         a.head   = m_in.substr(0, end + 2);
         std::string_view body = std::string_view(m_in).substr(end + 4);
         size_t length = 0;
-        if (http_list_has_token(a.header("transfer-encoding"), "chunked", 7))
+        // An answer to HEAD, a 204 and a 304 have no body whatever their head says of one (RFC 9112 6.3).
+        if (m_req.head_only || a.status == 204 || a.status == 304)
+        {
+        }
+        else if (http_list_has_token(a.header("transfer-encoding"), "chunked", 7))
         {
             http_chunked_decoder d;
             std::string_view out;
@@ -910,6 +943,7 @@ void http_peer::finish(bool answered, std::string why)
     m_done = nullptr;
     m_req  = http_request{};
     m_in.clear();
+    m_head_end = std::string::npos;
     if (done && !m_stopped)
         done(std::move(a));
 }

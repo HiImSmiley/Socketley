@@ -66,6 +66,9 @@ run_py() {   # a mode of the library, whose lines are the test's
     PASS=$((PASS+p)); FAIL=$((FAIL+f)); TOTAL=$((TOTAL+p+f))
     if [ "$rc" -ne 0 ] && [ "$f" -eq 0 ]; then
         bad "the library ran" "exit $rc: $out"
+    elif [ "$p" -eq 0 ] && [ "$f" -eq 0 ]; then
+        # A mode that skipped or printed nothing would otherwise add nothing and pass.
+        bad "the library's $1 mode asserted something" "no PASS or FAIL line: $out"
     fi
 }
 restart() {   # runtime

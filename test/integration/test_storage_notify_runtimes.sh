@@ -98,7 +98,9 @@ got = {"sub": b"", "cli": b""}
 end = time.time() + 10
 for s in (sub, cli):
     s.settimeout(0.2)
-while time.time() < end and not all(b"k1" in v for v in got.values()):
+# Until each holds all of its record, since one may arrive in more than one read.
+want = {"sub": (b"k1.live", b"ObjectCreated:Put"), "cli": (b"k1.panel", b"ObjectCreated:Put", b'"Records"')}
+while time.time() < end and not all(w in got[n] for n, ws in want.items() for w in ws):
     for name, s in (("sub", sub), ("cli", cli)):
         try:
             got[name] += s.recv(65536)

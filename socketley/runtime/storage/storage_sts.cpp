@@ -163,6 +163,9 @@ void storage_run::op_sts(const std::shared_ptr<conn>& c)
                 fail(400, "ValidationError", "DurationSeconds exceeds the MaxSessionDuration of the role.");
                 return;
             }
+            // The default hour is cut to a role that allows less, as STS does, rather than issued past its maximum.
+            if (!field("DurationSeconds") && longest_role > 0)
+                duration = std::min(duration, longest_role);
             role = std::string(rname);
         }
         if (const std::string* p = field("Policy"))

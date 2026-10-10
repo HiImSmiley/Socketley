@@ -1,4 +1,5 @@
 #include "bucket_policy.h"
+#include "../../shared/glob_match.h"
 #include "json_doc.h"
 #include "s3_names.h"
 
@@ -28,30 +29,7 @@ char lower(char c)
 // IAM's StringLike: * any run of characters, ? one.
 bool glob(std::string_view pat, std::string_view text)
 {
-    size_t p = 0, t = 0, star = std::string_view::npos, mark = 0;
-    while (t < text.size())
-    {
-        if (p < pat.size() && (pat[p] == '?' || pat[p] == text[t]))
-        {
-            ++p;
-            ++t;
-        }
-        else if (p < pat.size() && pat[p] == '*')
-        {
-            star = p++;
-            mark = t;
-        }
-        else if (star != std::string_view::npos)
-        {
-            p = star + 1;
-            t = ++mark;
-        }
-        else
-            return false;
-    }
-    while (p < pat.size() && pat[p] == '*')
-        ++p;
-    return p == pat.size();
+    return socketley::iam_wild_match(pat, text);
 }
 
 std::string lowered(std::string_view in)
@@ -66,30 +44,7 @@ std::string lowered(std::string_view in)
 // IAM's wildcard: '*' is any run of characters, '?' is one, and nothing else is special.
 bool wild_match(std::string_view pat, std::string_view str, bool fold)
 {
-    constexpr size_t none = static_cast<size_t>(-1);
-    size_t pi = 0, si = 0, star = none, star_si = 0;
-    while (si < str.size())
-    {
-        if (pi < pat.size() && pat[pi] == '*')
-        {
-            star    = pi++;
-            star_si = si;
-            continue;
-        }
-        if (pi < pat.size() && (pat[pi] == '?' || (fold ? lower(pat[pi]) == lower(str[si]) : pat[pi] == str[si])))
-        {
-            ++pi;
-            ++si;
-            continue;
-        }
-        if (star == none)
-            return false;
-        pi = star + 1;
-        si = ++star_si;
-    }
-    while (pi < pat.size() && pat[pi] == '*')
-        ++pi;
-    return pi == pat.size();
+    return socketley::iam_wild_match(pat, str, fold);
 }
 
 bool key_matches(const bucket_policy::key_pattern& p, std::string_view key)

@@ -136,6 +136,15 @@ if phase == "main":
     check("and not the caller's", code(lambda: r3.get_object(Bucket="data", Key="a")), "AccessDenied")
     ident = mk("sts", (cr["AccessKeyId"], cr["SecretAccessKey"]), cr["SessionToken"]).get_caller_identity()
     check("GetCallerIdentity names the assumed role", ident["Arn"], "arn:aws:sts:::assumed-role/cleaner")
+    # A Deny with a condition this runtime does not weigh is read as holding: skipped, it let in whom it kept out.
+    guarded = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam:::user/alice"}, "Action": "sts:AssumeRole"},
+        {"Effect": "Deny", "Principal": {"AWS": "arn:aws:iam:::user/alice"}, "Action": "sts:AssumeRole",
+         "Condition": {"Bool": {"aws:MultiFactorAuthPresent": "false"}}}]})
+    grole = iam.create_role(RoleName="guarded", AssumeRolePolicyDocument=guarded)["Role"]
+    settle()
+    check("a trust policy's Deny under a condition refuses as if it held",
+          code(lambda: mk("sts", alice).assume_role(RoleArn=grole["Arn"], RoleSessionName="g1")), "AccessDenied")
     d = iam.create_user(UserName="dave", Path="/team/")["User"]
     dk = iam.create_access_key(UserName="dave")["AccessKey"]
     settle()

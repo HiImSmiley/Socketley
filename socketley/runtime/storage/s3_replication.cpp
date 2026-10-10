@@ -320,8 +320,14 @@ bool parse_replication_config(std::string_view xml, replication_config& out, s3_
         if (r.v1 != v1)
             return refuse(err, "InvalidRequest", "Rules in a replication configuration all use Prefix or all use "
                                                  "Filter.");
+        // A name given to a rule that has none is one no rule of the document gives itself.
         if (r.id.empty())
-            r.id = "rule-" + std::to_string(i + 1);
+            for (size_t n = i + 1; r.id.empty(); ++n)
+            {
+                std::string id = "rule-" + std::to_string(n);
+                if (std::none_of(out.rules.begin(), out.rules.end(), [&](const replication_rule& o) { return o.id == id; }))
+                    r.id = std::move(id);
+            }
         for (size_t j = 0; j < i; ++j)
         {
             const replication_rule& o = out.rules[j];

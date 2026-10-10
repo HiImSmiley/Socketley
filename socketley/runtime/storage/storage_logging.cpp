@@ -334,7 +334,11 @@ void storage_run::deliver_access_log(const std::string& target, std::string key,
     key.append(stamp, static_cast<size_t>(n));
     unsigned char raw[8];
     if (RAND_bytes(raw, sizeof raw) != 1)
+    {
+        LOG_WARN(("storage: access log lines for " + target + " are dropped: no random bytes to name their object")
+                     .c_str());
         return;
+    }
     static constexpr char hexd[] = "0123456789ABCDEF";
     for (unsigned char b : raw)
     {

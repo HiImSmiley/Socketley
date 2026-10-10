@@ -237,7 +237,7 @@ bool heif_place(std::string_view file, exif_place& out)
 
 bool tiff_facts(std::string_view tiff, photo_facts& out)
 {
-    if (tiff.size() < 8 || !(tiff.starts_with("II*\0") || tiff.starts_with(std::string_view("MM\0*", 4))))
+    if (tiff.size() < 8 || !(tiff.starts_with(std::string_view("II*\0", 4)) || tiff.starts_with(std::string_view("MM\0*", 4))))
         return false;
     const tiff_reader t(tiff);
     const uint64_t ifd0 = t.u32(4);
@@ -290,7 +290,9 @@ bool photo_facts_of(std::string_view head, photo_facts& out, exif_place* elsewhe
             const uint64_t len = be_n(head, at + 2, 2);
             if (len < 2)
                 break;
-            if (marker == 0xE1 && at + 4 + 6 <= head.size() && head.substr(at + 4, 6) == std::string_view("Exif\0\0", 6))
+            // A segment too short to hold its own Exif header is none, and no offset is read past its end.
+            if (marker == 0xE1 && len >= 8 && at + 4 + 6 <= head.size() &&
+                head.substr(at + 4, 6) == std::string_view("Exif\0\0", 6))
             {
                 const uint64_t end = std::min<uint64_t>(head.size(), at + 2 + len);
                 if (tiff_facts(head.substr(at + 10, end - at - 10), out))
@@ -300,7 +302,7 @@ bool photo_facts_of(std::string_view head, photo_facts& out, exif_place* elsewhe
         }
         return false;
     }
-    if (head.starts_with("II*\0") || head.starts_with(std::string_view("MM\0*", 4)))
+    if (head.starts_with(std::string_view("II*\0", 4)) || head.starts_with(std::string_view("MM\0*", 4)))
         return tiff_facts(head, out);
     if (head.size() >= 12 && head.substr(4, 4) == "ftyp")
     {

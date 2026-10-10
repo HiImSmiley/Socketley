@@ -105,7 +105,8 @@ t1=$(date +%s%N)
 check "is the one kept" "$(cmp -s "$T/t1.jpg" "$T/t1b.jpg" && echo same)" same
 check "and nothing is made for it" "$(ls "$T/media/.media" | grep -c '^[0-9a-f]\{64\}$')" "$made"
 check "by ffmpeg" "$(stat media_made)" 3
-[ $(( (t1 - t0) / 1000000 )) -lt 500 ] && ok || bad "a kept thumbnail is served at once" "$(( (t1 - t0) / 1000000 )) ms"
+# Under the 2 s the ffmpeg above sleeps first, so a thumbnail made again cannot pass it, and a loaded box has 1.5 s.
+[ $(( (t1 - t0) / 1000000 )) -lt 1500 ] && ok || bad "a kept thumbnail is served at once" "$(( (t1 - t0) / 1000000 )) ms"
 # One new thumbnail asked for four times at once, on either shard, is made once.
 made_before=$(stat media_made)
 >"$T/pcodes"; pids=()
@@ -163,14 +164,16 @@ check "a file a stream has none of is 404" "$(code -u "$A" "$U/~media/hls-240/fi
 
 # Streams do not queue behind one another, as thumbnails do: five at once over two shards all start together,
 # where two per shard would hold one back until another's ffmpeg had run.
-t0=$(date +%s%N); pids=()
-for v in hls-240 hls-360 hls-480 hls-720; do
-    curl -s -m 60 -u "$A" -o /dev/null "$U/~media/$v/films/short.mp4/seg00000.m4s" & pids+=($!)
+# The spread between the first and the last answer, as one held back waits out a whole other ffmpeg and its 2 s sleep.
+pids=(); n=0
+for path in hls-240/films/short.mp4/seg00000.m4s hls-360/films/short.mp4/seg00000.m4s hls-480/films/short.mp4/seg00000.m4s \
+            hls-720/films/short.mp4/seg00000.m4s hls-copy/films/short.mp4/index.m3u8; do
+    n=$((n + 1))
+    { curl -s -m 60 -u "$A" -o /dev/null "$U/~media/$path"; date +%s%N > "$T/five$n"; } & pids+=($!)
 done
-curl -s -m 60 -u "$A" -o /dev/null "$U/~media/hls-copy/films/short.mp4/index.m3u8" & pids+=($!)
 wait "${pids[@]}"
-ms=$(( ($(date +%s%N) - t0) / 1000000 ))
-[ "$ms" -lt 3800 ] && ok || bad "five streams at once start together" "the last playlist after $ms ms"
+ms=$(( ($(sort -n "$T"/five? | tail -1) - $(sort -n "$T"/five? | head -1)) / 1000000 ))
+[ "$ms" -lt 2000 ] && ok || bad "five streams at once start together" "the last answer $ms ms after the first"
 
 # Adaptive streaming: what the object is, the ladder a player chooses from, and renditions written up front.
 info=$(curl -s -u "$A" "$U/~media/info/films/clip.mp4")
@@ -213,10 +216,16 @@ check "and is done, from two jobs" "$([ -e "$(mdir hls-240 long.mp4 "$T/long.mp4
 
 # Held still: a job far ahead of every player waits for one, and goes on when one comes near.
 R="$U/~media/hls-360/films/long.mp4"
-code -u "$A" "$R/seg00000.m4s" >/dev/null
-sleep 6
 dir=$(mdir hls-360 long.mp4 "$T/long.mp4")
-made=$(ls "$dir" | grep -c '^seg.*\.m4s$')
+# Until the count rests for 2 s, asking the first segment again so the job is never one nobody asks of.
+made=-1; still=0
+for _ in $(seq 1 120); do
+    code -u "$A" "$R/seg00000.m4s" >/dev/null
+    sleep 0.5
+    n=$(ls "$dir" 2>/dev/null | grep -c '^seg.*\.m4s$')
+    if [ "$n" = "$made" ]; then still=$((still + 1)); else still=0; made=$n; fi
+    [ "$made" -ge 14 ] && [ "$still" -ge 4 ] && break
+done
 [ "$made" -ge 14 ] && [ "$made" -le 20 ] && ok || bad "a job far ahead of its player is held still" "$made segments made"
 sleep 2
 check "and stays held" "$(ls "$dir" | grep -c '^seg.*\.m4s$')" "$made"
@@ -280,6 +289,7 @@ check "the master is asked again, and has an ETag" \
 itag=$(curl -s -u "$A" -D - -o /dev/null "$U/~media/info/films/clip.mp4" | grep -i '^etag' | cut -d' ' -f2 | tr -d '\r')
 check "the info revalidates to 304 on its own tag" "$(code -u "$A" -H "If-None-Match: $itag" "$U/~media/info/films/clip.mp4")" 304
 over=$(curl -s -u "$A" -I "$U/~dav/films/clip.mp4" | grep -i '^etag' | sed 's/[^"]*"\([0-9a-f]\{16\}\).*/\1/')
+[[ "$over" =~ ^[0-9a-f]{16}$ ]] && ok || bad "the object's tag begins with the version the info's tag names" "'$over'"
 check "and is sent again to the tag a binary gave it that named only the object's version" \
       "$(code -u "$A" -H "If-None-Match: \"$over-info/info\"" "$U/~media/info/films/clip.mp4")" 200
 
@@ -362,10 +372,12 @@ check "and a song has none" "$(code -u "$A" "$U/~media/trick/films/song.mp3") $(
 
 # A container's claimed length past what a segment's name can count is no length, so no playlist is written for it.
 ff -f lavfi -i testsrc=size=320x240:rate=25 -t 2 -c:v libx264 -pix_fmt yuv420p -f matroska "$T/liar.mkv"
-python3 - "$T/liar.mkv" <<'XEOF'
+python3 - "$T/liar.mkv" <<'XEOF' || bad "a container is made to claim a trillion seconds" "liar.mkv has no 8-byte Duration element"
 import struct, sys
 b = bytearray(open(sys.argv[1], 'rb').read())
 i = b.find(b'\x44\x89\x88')
+if i < 0:
+    sys.exit(1)
 b[i + 3:i + 11] = struct.pack('>d', 1e15)
 open(sys.argv[1], 'wb').write(b)
 XEOF

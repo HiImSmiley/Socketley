@@ -36,7 +36,7 @@ T="$SOCKETLEY_TMPD"
 DATA="$T/objects"
 CERTS="$T/certs"
 
-PASS=0; FAIL=0; TOTAL=0
+PASS=0; FAIL=0; TOTAL=0; SKIPPED=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() {
     TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
@@ -164,7 +164,7 @@ l = c.list_objects_v2(Bucket="bototls", Prefix="k/")
 assert [o["Key"] for o in l["Contents"]] == ["k/one"], l
 print("BOTO OK")
 PYEOF
-if grep -q "^SKIP" "$T/boto.out"; then ok "boto3 is not installed here, skipped"
+if grep -q "^SKIP" "$T/boto.out"; then SKIPPED=$((SKIPPED + 1)); echo "  SKIP: boto3 over https ($(head -1 "$T/boto.out"))"
 else contains "boto3 puts, gets and lists over https" "$(cat "$T/boto.out")" "BOTO OK"; fi
 
 # A client speaking TLS but pipelining two requests in one write: the second is
@@ -272,6 +272,6 @@ if has "$out" "CLOSED_AFTER"; then
 else bad "a silent peer is dropped at the handshake deadline" "$out"; fi
 expect "and the runtime still serves" "$(https -o /dev/null -w '%{http_code}' "https://localhost:$P1/")" 200
 
-echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $SKIPPED skipped)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

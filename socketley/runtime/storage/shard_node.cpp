@@ -152,7 +152,7 @@ void shard_node::invalidate(std::string bucket, std::string key, std::function<v
     }
     // Until every sibling has answered this shard's start, one may hold a copy it never asked about.
     const uint64_t held = m_holders_known ? m_holders[object_slot(bucket, key)] : ~uint64_t{0};
-    const uint64_t mask = held & ~(uint64_t{1} << m_store.shard()) &
+    const uint64_t mask = held & ~(m_store.shard() < 64 ? uint64_t{1} << m_store.shard() : uint64_t{0}) &
                           (m_store.shards() >= 64 ? ~uint64_t{0} : (uint64_t{1} << m_store.shards()) - 1);
     if (mask == 0)
     {
@@ -1265,7 +1265,8 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
                 const object_meta* cur = m_store.owns(e.bucket, e.key) ? m_store.find(e.bucket, e.key) : nullptr;
                 if (!cur || !(*cur == e.meta))
                     continue;
-                m_holders[object_slot(e.bucket, e.key)] |= uint64_t{1} << from;
+                // A sibling past the 64 a mask can name is counted as any of them, which tells all and misses none.
+                m_holders[object_slot(e.bucket, e.key)] |= from < 64 ? uint64_t{1} << from : ~uint64_t{0};
                 held[i] = 1;
             }
             reply(true, wire::encode_held(held));
@@ -1357,9 +1358,13 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
                 reply(false, {});
                 return;
             }
-            run_create(std::move(name), std::move(owner), [this, name, reply](st s, int64_t created)
-                       { reply(true, wire::encode_created(s, created, m_store.bucket_owner(name))); });
+        {
+            // The reply's copy is taken before the call, whose arguments C++ may build in either order.
+            auto answer = [this, name, reply](st s, int64_t created)
+            { reply(true, wire::encode_created(s, created, m_store.bucket_owner(name))); };
+            run_create(std::move(name), std::move(owner), std::move(answer));
             return;
+        }
         case wire::op::bucket_delete:
             if (m_store.shard() != 0)
             {

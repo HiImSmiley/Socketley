@@ -250,8 +250,14 @@ void kill_orphan(const std::string& pid_file, const std::string& dir)
     if (!read_whole_file(pid_file, v) || v.empty())
         return;
     const long pid = std::strtol(v.c_str(), nullptr, 10);
-    if (pid <= 1 || !read_whole_file("/proc/" + std::to_string(pid) + "/cmdline", cmdline) ||
-        cmdline.find(dir) == std::string::npos)
+    if (pid <= 1)
+        return;
+    const std::string proc = "/proc/" + std::to_string(pid);
+    // Its arguments name the job's directory, or a probe's, which has none there, writes its log into it.
+    char log[PATH_MAX];
+    const ssize_t n = ::readlink((proc + "/fd/2").c_str(), log, sizeof(log) - 1);
+    const bool logs_here = n > 0 && std::string_view(log, static_cast<size_t>(n)).starts_with(dir + "/");
+    if (!logs_here && (!read_whole_file(proc + "/cmdline", cmdline) || cmdline.find(dir) == std::string::npos))
         return;
     ::kill(static_cast<pid_t>(pid), SIGKILL);
 }
@@ -566,11 +572,18 @@ std::string master_text(const media_probe& p, std::string_view source, std::stri
     // Subtitles as their own renditions, which every stream names.
     for (const media_probe::subtitle& s : p.subtitles)
     {
-        std::string name = !s.title.empty() ? s.title : !s.lang.empty() ? s.lang : "Track " + std::to_string(s.index);
-        std::erase(name, '"');
+        // A file's own tags are the uploader's text, so neither a quote nor a line break can end the attribute or the line.
+        const auto quoted = [](std::string t)
+        {
+            std::erase_if(t, [](char c) { return c == '"' || c == '\r' || c == '\n'; });
+            return t;
+        };
+        const std::string name = quoted(!s.title.empty() ? s.title : !s.lang.empty() ? s.lang
+                                                                                       : "Track " + std::to_string(s.index));
+        const std::string lang = quoted(s.lang);
         m += "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"" + name + "\"";
-        if (!s.lang.empty())
-            m += ",LANGUAGE=\"" + s.lang + "\"";
+        if (!lang.empty())
+            m += ",LANGUAGE=\"" + lang + "\"";
         m += ",AUTOSELECT=YES,DEFAULT=NO,URI=\"";
         url_path(m, "sub-" + std::to_string(s.index), source);
         m += "/index.m3u8" + v + "\"\n";
@@ -1896,7 +1909,7 @@ void storage_run::media_end_rendition(size_t i, bool kill)
         if (j.paused)
             ::kill(j.pid, SIGCONT);
         ::kill(j.pid, SIGKILL);
-        ::waitpid(j.pid, nullptr, 0);
+        reap_later(j.pid);
     }
     if (all_made(j.want.dir, j.total) && !exists(j.want.dir + "/done"))
     {
@@ -1911,8 +1924,17 @@ void storage_run::media_end_rendition(size_t i, bool kill)
     m_media_jobs.erase(m_media_jobs.begin() + static_cast<ptrdiff_t>(i));
 }
 
+// A killed ffmpeg reaped now if it has ended, and at a later tick if not: one stuck in the kernel on a hung disk
+// would otherwise hold the loop in waitpid until the disk answered.
+void storage_run::reap_later(pid_t pid)
+{
+    if (::waitpid(pid, nullptr, WNOHANG) == 0)
+        m_media_unreaped.push_back(pid);
+}
+
 void storage_run::media_tick()
 {
+    std::erase_if(m_media_unreaped, [](pid_t pid) { return ::waitpid(pid, nullptr, WNOHANG) != 0; });
     bool finished = false;
     // A stream finished is a large medium in: eviction runs at once, where a thumbnail's waits its turn.
     bool large = false;
@@ -1934,7 +1956,7 @@ void storage_run::media_tick()
             if (r == 0)
             {
                 ::kill(j.pid, SIGKILL);
-                ::waitpid(j.pid, nullptr, 0);
+                reap_later(j.pid);
             }
             const bool ok = r == j.pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
             const bool lp = j.seeked;
@@ -2037,7 +2059,7 @@ void storage_run::media_tick()
                 continue;
             }
             ::kill(j.pid, SIGKILL);
-            ::waitpid(j.pid, nullptr, 0);
+            reap_later(j.pid);
             // A stream let go is begun again when asked for; anything else that took too long is a failure.
             if (idle)
                 clear_dir(j.want.dir, true);
@@ -2224,7 +2246,8 @@ bool storage_run::media_exit_done(io_request* req)
     for (auto it = m_media_exits.begin(); it != m_media_exits.end(); ++it)
         if (&it->req == req)
         {
-            ::close(it->fd);
+            if (it->fd >= 0)
+                ::close(it->fd);
             m_media_exits.erase(it);
             if (!m_stopped)
                 media_tick();
@@ -2259,7 +2282,9 @@ void storage_run::media_stop()
     for (auto& e : m_media_exits)
     {
         if (!m_loop.submit_poll_remove(&e.req)) {}
+        // Its cancelled poll still completes into media_exit_done(), which must not close the number again.
         ::close(e.fd);
+        e.fd = -1;
     }
 }
 

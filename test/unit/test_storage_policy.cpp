@@ -2,6 +2,7 @@
 #include "doctest.h"
 
 #include "../../socketley/runtime/storage/bucket_policy.h"
+#include "../../socketley/shared/glob_match.h"
 #include "../../socketley/runtime/storage/json_doc.h"
 
 #include <string>
@@ -278,6 +279,46 @@ TEST_CASE("s3:x-amz-server-side-encryption under StringEquals, StringNotEquals a
     // A part or a completion was judged when its upload was created, so neither a Deny nor an Allow on the header is about it.
     for (const bucket_policy* p : {&ne, &null_true, &null_false, &eq})
         CHECK(anonymous_put(*p, false, {}, true) == policy_effect::none);
+}
+
+TEST_CASE("StringLike's star is a wildcard where the value holds a star of its own")
+{
+    // Matched first as the same character, the star was never remembered as one, and a Referer the client chose,
+    // "https://evil.example/*x", escaped a Deny on "https://evil.example/*".
+    struct referer : policy_context
+    {
+        std::string v;
+        bool values(std::string_view key, std::vector<std::string>& out) const override
+        {
+            if (key != "aws:referer")
+                return false;
+            out.push_back(v);
+            return true;
+        }
+    };
+    const bucket_policy like = compiled(put_policy("Deny", R"({"StringLike":{"aws:Referer":"https://evil.example/*"}})"));
+    const auto put_from = [&](std::string v)
+    {
+        referer ctx;
+        ctx.v = std::move(v);
+        policy_request r;
+        r.action    = s3_action::put_object;
+        r.key       = "k";
+        r.anonymous = true;
+        r.ctx       = &ctx;
+        return like.evaluate(r);
+    };
+    CHECK(put_from("https://evil.example/page") == policy_effect::deny);
+    CHECK(put_from("https://evil.example/*x") == policy_effect::deny);
+    CHECK(put_from("https://evil.example/*") == policy_effect::deny);
+    CHECK(put_from("https://good.example/page") == policy_effect::none);
+
+    CHECK(socketley::iam_wild_match("https://evil.example/*", "https://evil.example/*x"));
+    CHECK(socketley::iam_wild_match("a*b", "a*xb"));
+    CHECK(socketley::iam_wild_match("a?c", "a?c"));
+    CHECK_FALSE(socketley::iam_wild_match("a*b", "a*x"));
+    CHECK(socketley::iam_wild_match("ARN:*", "arn:x", true));
+    CHECK_FALSE(socketley::iam_wild_match("ARN:*", "arn:x", false));
 }
 
 TEST_CASE("a condition is refused where it cannot be honoured exactly, and taken on any key a request carries")

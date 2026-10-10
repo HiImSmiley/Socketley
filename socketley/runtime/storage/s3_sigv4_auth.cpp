@@ -232,12 +232,19 @@ bool read_file(const std::string& path, std::string& out, std::string& err, stru
     while (got < out.size())
     {
         const ssize_t n = ::read(fd, out.data() + got, out.size() - got);
+        if (n < 0 && errno == EINTR)
+            continue;
         if (n <= 0)
             break;
         got += static_cast<size_t>(n);
     }
     ::close(fd);
-    out.resize(got);
+    // Short of the size it had is a file being rewritten, which is read again next time and not taken in part.
+    if (got != out.size())
+    {
+        err = path + " changed while it was read";
+        return false;
+    }
     if (st_out)
         *st_out = st;
     return true;
@@ -619,12 +626,21 @@ bool sigv4_authenticator::rebuild(std::string& err)
         m_stamp_ino      = static_cast<uint64_t>(st.st_ino);
         m_have_stamp     = true;
     }
+    // A refused rebuild leaves the authenticator as it was, the IAM parts add_iam() fills included.
+    auto file_users = std::move(m_file_users);
+    auto roles = m_roles;
+    auto logins = m_logins;
+    const auto iam_stamp = m_iam_stamp;
     m_file_users.clear();
     for (std::string& id : set.user_ids())
         m_file_users.insert(std::move(id));
     add_iam(set);
     if (set.size() == 0 && !m_cfg.anonymous)
     {
+        m_file_users = std::move(file_users);
+        m_roles = std::move(roles);
+        m_logins = std::move(logins);
+        m_iam_stamp = iam_stamp;
         err = "no credentials to serve with";
         return false;
     }
@@ -685,6 +701,9 @@ void sigv4_authenticator::add_iam(credential_set& set)
                 copy->iam_policy = std::move(extra);
                 set.replace_user(std::move(copy));
             }
+            // Disabled is no sign-in for a user of the file too; the keys the file holds stay the file's to revoke.
+            if (const auto d = iu.tags.find(std::string(iam_tag_disabled)); d != iu.tags.end() && d->second == "true")
+                continue;
             add_login(name, iu, set.shared_user(name));
             continue;
         }

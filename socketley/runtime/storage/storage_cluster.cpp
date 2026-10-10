@@ -124,9 +124,15 @@ void storage_run::scrub_found(scrubber::finding f)
                            std::string(status_name(r.status)) + ")").c_str());
                 return;
             }
+            if (!m_repl.enqueue_node(node, {'q', f.bucket, f.key, f.version_id, {},
+                                            encode_cluster_record({'q', m_cluster_self, 0, {}, f.version_id})}))
+            {
+                ++m_c.scrub_unhealed;
+                LOG_ERROR(("storage: " + what + " was taken away and its copy could not be asked of " + node +
+                           "; restore it from a copy").c_str());
+                return;
+            }
             ++m_c.scrub_heals;
-            m_repl.enqueue_node(node, {'q', f.bucket, f.key, f.version_id, {},
-                                       encode_cluster_record({'q', m_cluster_self, 0, {}, f.version_id})});
         }, [md5, mtime](const object_meta& m) { return m.md5 == md5 && m.mtime_ms == mtime; }, true,
            change_cause::heal);
     });
@@ -161,8 +167,16 @@ bool storage_run::cluster_mark(const std::shared_ptr<conn>& c, object_meta& m, s
         }
         set_retention_extra(m, ret);
     }
-    if (const std::string_view v = http_trim_ows(r.header(cluster_legal_hold_header)); v == "ON" || v == "OFF")
+    // Refused as a garbled retention is, rather than stored with no hold at all.
+    if (const std::string_view v = http_trim_ows(r.header(cluster_legal_hold_header)); !v.empty())
+    {
+        if (v != "ON" && v != "OFF")
+        {
+            err = make_error("InvalidRequest");
+            return false;
+        }
         set_legal_hold_extra(m, v);
+    }
     set_cluster_extra(m, s);
     return true;
 }
@@ -226,8 +240,9 @@ void storage_run::op_cluster(const std::shared_ptr<conn>& c)
             return;
         case 'q':
             // Another node lost its copy to a disk, and is sent this one again.
-            m_repl.enqueue_node(rec.owner, {'p', q.bucket, q.key, rec.version_id, {}, {}});
-            answer(st::ok);
+            // Not taken when this node is stopping or does not know the asker, which asks again rather than wait.
+            answer(m_repl.enqueue_node(rec.owner, {'p', q.bucket, q.key, rec.version_id, {}, {}}) ? st::ok
+                                                                                                   : st::unavailable);
             return;
         default:
         {

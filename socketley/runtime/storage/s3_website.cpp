@@ -1,5 +1,6 @@
 #include "s3_website.h"
 
+#include <cctype>
 #include <charconv>
 
 #include "s3_xml_tree.h"
@@ -36,6 +37,17 @@ bool number(const xml_node& n, int& out)
     return r.ec == std::errc{} && r.ptr == n.text.data() + n.text.size();
 }
 
+// A host a redirect may name, with its port: what goes into a Location header and nothing that would end or split it.
+bool host_ok(const std::string& h)
+{
+    if (h.empty() || h.size() > 255)
+        return false;
+    for (const char c : h)
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '-' && c != ':' && c != '[' && c != ']')
+            return false;
+    return true;
+}
+
 bool protocol_ok(const std::string& p)
 {
     return p.empty() || p == "http" || p == "https";
@@ -47,7 +59,7 @@ bool redirect_of(const xml_node& n, website_redirect& r, s3_error& err)
     for (const xml_node& k : n.kids)
     {
         any = true;
-        if (k.name == "HostName" && leaf(k, r.host))
+        if (k.name == "HostName" && leaf(k, r.host) && host_ok(r.host))
             continue;
         if (k.name == "Protocol" && leaf(k, r.protocol) && protocol_ok(r.protocol))
             continue;
@@ -148,7 +160,7 @@ bool parse_website_config(std::string_view xml, website_config& out, s3_error& e
         {
             redirect_all = true;
             for (const xml_node& k : c.kids)
-                if (!(k.name == "HostName" && leaf(k, out.redirect_all_host)) &&
+                if (!(k.name == "HostName" && leaf(k, out.redirect_all_host) && host_ok(out.redirect_all_host)) &&
                     !(k.name == "Protocol" && leaf(k, out.redirect_all_protocol) && protocol_ok(out.redirect_all_protocol)))
                     return false;
             if (out.redirect_all_host.empty())

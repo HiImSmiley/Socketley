@@ -273,9 +273,9 @@ bool named_right(walker& w, const decoded_header& d, std::string_view name)
     return name.size() > 65 && w.named_for(d.key, name.substr(0, 64)) && version_id_of(d.meta) == name.substr(65);
 }
 
-// The verdict on an open object file whose first `n` bytes are in `head`, which closes it.
+// The verdict on an open object file whose first `n` bytes are in `head`, or -errno, which closes it.
 file_verdict judge_object_file(walker& w, int fd, const struct stat& sb, const char* name, std::string& head,
-                               ssize_t n, decoded_header& d)
+                               ssize_t n, decoded_header& d, int& why)
 {
     if (n >= 0)
     {
@@ -285,6 +285,8 @@ file_verdict judge_object_file(walker& w, int fd, const struct stat& sb, const c
         {
             head.resize(d.need);
             n = ::pread(fd, head.data(), head.size(), 0);
+            if (n < 0)
+                n = -errno;
             if (n >= 0)
             {
                 head.resize(static_cast<size_t>(n));
@@ -294,6 +296,12 @@ file_verdict judge_object_file(walker& w, int fd, const struct stat& sb, const c
     }
     ::close(fd);
 
+    // A read the moment refused says nothing about the file, which is still there to be judged on the next walk.
+    if (n < 0 && transient(static_cast<int>(-n)))
+    {
+        why = static_cast<int>(-n);
+        return file_verdict::failed;
+    }
     if (n >= 0 && d.status == header_status::ok && w.ignores(d.key))
         return file_verdict::skip;
     const bool sound = n >= 0 && d.status == header_status::ok &&
@@ -346,8 +354,10 @@ void read_files_one_by_one(walker& w, int dfd, const std::vector<dir_entry>& es,
         }
         struct stat sb{};
         head.resize(object_header_align);
-        const ssize_t n = ::fstat(fd, &sb) == 0 ? ::pread(fd, head.data(), head.size(), 0) : -1;
-        verdict(name, judge_object_file(w, fd, sb, name, head, n, d), d);
+        ssize_t n = ::fstat(fd, &sb) == 0 ? ::pread(fd, head.data(), head.size(), 0) : -1;
+        if (n < 0)
+            n = -errno;
+        verdict(name, judge_object_file(w, fd, sb, name, head, n, d, why), d);
     }
 }
 
@@ -386,11 +396,32 @@ void read_files_ring(walker& w, io_uring* ring, int dfd, const std::vector<dir_e
         start_open(s);
     while (inflight)
     {
-        // A ring that refuses to go on fails the walk, since what it still holds will not be heard of.
+        // A ring that refuses to go on fails the walk -- but not before what it holds is back: an open still names
+        // a string of `names`, and a read still writes into a slot, both of which the caller reuses at once.
         const int rc = io_uring_submit_and_wait(ring, 1);
         if (rc < 0 && rc != -EINTR)
         {
             why = -rc;
+            while (inflight)
+            {
+                io_uring_cqe* c = nullptr;
+                const int wr = io_uring_wait_cqe(ring, &c);
+                if (wr == -EINTR)
+                    continue;
+                if (wr < 0 || !c)
+                    break;
+                const unsigned s = static_cast<unsigned>(c->user_data >> 1);
+                // An open that succeeded hands back a descriptor; a read's slot already holds its own.
+                if (!(c->user_data & 1) && c->res >= 0)
+                    ::close(c->res);
+                else if ((c->user_data & 1) && slots[s].fd >= 0)
+                {
+                    ::close(slots[s].fd);
+                    slots[s].fd = -1;
+                }
+                io_uring_cqe_seen(ring, c);
+                --inflight;
+            }
             return;
         }
         io_uring_cqe* cqe;
@@ -405,14 +436,14 @@ void read_files_ring(walker& w, io_uring* ring, int dfd, const std::vector<dir_e
             const char*    name = names.data() + es[sl.e].at;
             decoded_header d;
             if (cqe->user_data & 1)
-                verdict(name, judge_object_file(w, sl.fd, sl.sb, name, sl.head, cqe->res, d), d);
+                verdict(name, judge_object_file(w, sl.fd, sl.sb, name, sl.head, cqe->res, d, why), d);
             else if (cqe->res < 0)
                 verdict(name, open_failed(-cqe->res, why), d);
             else
             {
                 sl.fd = cqe->res;
                 if (::fstat(sl.fd, &sl.sb) < 0)
-                    verdict(name, judge_object_file(w, sl.fd, sl.sb, name, sl.head, -1, d), d);
+                    verdict(name, judge_object_file(w, sl.fd, sl.sb, name, sl.head, -errno, d, why), d);
                 else
                 {
                     // The header is read through the ring too, so a cold one waits on the disk beside the others.
@@ -1167,6 +1198,18 @@ bool object_store::load_journal(bucket& b, std::string& bad_why, bool& torn, boo
                     if (n <= 0)
                     {
                         buf.resize(old);
+                        if (n < 0 && errno == EINTR)
+                            continue;
+                        // A read that fails is not the journal's end: what follows it is unknown, and appending at
+                        // the last record read would write over it, so the index is built from the objects instead.
+                        if (n < 0)
+                        {
+                            LOG_ERROR(("storage: the journal of bucket " + b.name + " could not be read past byte " +
+                                       std::to_string(pos) + ": " + std::strerror(errno) +
+                                       "; its index is rebuilt from the objects").c_str());
+                            corrupt = true;
+                            break;
+                        }
                         eof = true;
                         break;
                     }

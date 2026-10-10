@@ -9,6 +9,8 @@
 #     or removes not being what S3 then sees, on either shard
 #   * a folder's copy or move losing an object, or its removal leaving one
 #   * a copy or move with Overwrite: F replacing what is at its Destination
+#   * a folder moved onto itself or into itself, which copied each object onto
+#     its own key and then removed it: every object in it gone
 #   * a user seeing or writing another user's bucket through the drive
 #   * a versioned bucket's deleted file missing from its trash, or not brought
 #     back by a restore
@@ -80,8 +82,12 @@ up() { for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$U
 up || bad "the runtime serves" "no answer on $P1"
 code() { curl -s -m 30 -o /dev/null -w '%{http_code}' "$@"; }
 s3() { curl -s -m 30 --aws-sigv4 "aws:amz:us-east-1:s3" -u "$A" "$@"; }
-# The names a PROPFIND of depth 1 lists, its own first.
-names() { curl -s -m 30 -u "$1" -X PROPFIND -H 'Depth: 1' "$U/~dav/$2" | grep -o '<D:displayname>[^<]*' | sed 's/<D:displayname>//' | tr '\n' ' ' | sed 's/ $//'; }
+# The names a PROPFIND of depth 1 lists, its own first, or its status when that is not 207.
+names() {
+    local r; r=$(curl -s -m 30 -u "$1" -X PROPFIND -H 'Depth: 1' -w '\n%{http_code}' "$U/~dav/$2")
+    [ "${r##*$'\n'}" = 207 ] || { echo "PROPFIND answered ${r##*$'\n'}"; return; }
+    printf '%s' "${r%$'\n'*}" | grep -o '<D:displayname>[^<]*' | sed 's/<D:displayname>//' | tr '\n' ' ' | sed 's/ $//'
+}
 
 # Signing in.
 check "OPTIONS names the DAV classes" "$(curl -s -o /dev/null -D - -X OPTIONS "$U/~dav/" | grep -i '^dav:' | tr -d '\r')" "DAV: 1, 2"
@@ -146,7 +152,9 @@ curl -s -u "$A" -T "$T/one" -o /dev/null "$U/~dav/docs/many/f[1-1100]"
 check "a folder of 1100 files lists them all" \
       "$(curl -s -u "$A" -X PROPFIND -H 'Depth: 1' "$U/~dav/docs/many/" | grep -o '<D:getcontentlength>' | wc -l)" 1100
 check "and so does its page" "$(curl -s -u "$A" "$U/~dav/docs/many/" | grep -o '<li>' | wc -l)" 1100
-check "and it is removed whole" "$(code -u "$A" -X DELETE "$U/~dav/docs/many/")" 204
+check "it is moved whole, a page of the listing at a time" \
+      "$(code -u "$A" -X MOVE -H "Destination: $U/~dav/docs/many2/" "$U/~dav/docs/many/") $(curl -s -u "$A" -X PROPFIND -H 'Depth: 1' "$U/~dav/docs/many2/" | grep -o '<D:getcontentlength>' | wc -l) $(code -u "$A" -X PROPFIND -H 'Depth: 0' "$U/~dav/docs/many")" "201 1100 404"
+check "and it is removed whole" "$(code -u "$A" -X DELETE "$U/~dav/docs/many2/")" 204
 
 # Copy and move, of a file and of a folder.
 dst() { echo "Destination: $U/~dav/$1"; }
@@ -162,11 +170,23 @@ check "and a folder's onto one that holds files" "$(code -u "$A" -X COPY -H "$(d
 check "to a free name it is made" "$(code -u "$A" -X COPY -H "$(dst 'docs/b/two%20(1).txt')" -H 'Overwrite: F' "$U/~dav/docs/b/two.txt") $(curl -s -u "$A" "$U/~dav/docs/b/two%20(1).txt")" "201 two"
 check "without it, a file is replaced" "$(code -u "$A" -X COPY -H "$(dst 'docs/b/two%20(1).txt')" "$U/~dav/docs/b/moved.txt") $(curl -s -u "$A" "$U/~dav/docs/b/two%20(1).txt")" "201 one"
 curl -s -u "$A" -o /dev/null -X DELETE "$U/~dav/docs/b/two.txt"; curl -s -u "$A" -o /dev/null -X DELETE "$U/~dav/docs/b/two%20(1).txt"
+printf 'kept' | s3 -T - -H 'x-amz-meta-owner: ada' -H 'Content-Language: de' -H 'x-amz-tagging: k=v' -o /dev/null "$U/docs/m/x.txt"
+code -u "$A" -X MOVE -H "$(dst docs/n/)" "$U/~dav/docs/m/" >/dev/null
+check "a folder's MOVE keeps each object's metadata, as a file's does" \
+      "$(s3 -I "$U/docs/n/x.txt" | tr -d '\r' | grep -iE '^(x-amz-meta-owner|content-language|x-amz-tagging-count):' | tr 'A-Z' 'a-z' | sort | tr '\n' ' ')" \
+      "content-language: de x-amz-meta-owner: ada x-amz-tagging-count: 1 "
+s3 -X DELETE -o /dev/null "$U/docs/n/x.txt"
 check "COPY of a folder is 201" "$(code -u "$A" -X COPY -H "$(dst docs/c/)" "$U/~dav/docs/a/")" 201
 check "with every object under it" "$(curl -s -u "$A" "$U/~dav/docs/c/sub/big.bin" | cmp -s - "$T/big" && echo same)" same
 check "MOVE of a folder is 201" "$(code -u "$A" -X MOVE -H "$(dst docs/d/)" "$U/~dav/docs/c/")" 201
 check "and the folder is gone" "$(code -u "$A" -X PROPFIND -H 'Depth: 0' "$U/~dav/docs/c")" 404
 check "its objects moved" "$(names "$A" docs/d/)" "d sub one.txt"
+check "a folder moved onto itself is refused, and keeps every object" \
+      "$(code -u "$A" -X MOVE -H "$(dst docs/d/)" "$U/~dav/docs/d/") $(names "$A" docs/d/)" "403 d sub one.txt"
+check "as is one moved into a folder of its own" \
+      "$(code -u "$A" -X MOVE -H "$(dst docs/d/sub/inner/)" "$U/~dav/docs/d/") $(names "$A" docs/d/)" "403 d sub one.txt"
+check "and a file moved onto itself" \
+      "$(code -u "$A" -X MOVE -H "$(dst docs/d/one.txt)" "$U/~dav/docs/d/one.txt") $(names "$A" docs/d/)" "403 d sub one.txt"
 check "DELETE of a folder is 204" "$(code -u "$A" -X DELETE "$U/~dav/docs/d/")" 204
 check "and leaves nothing under it" "$(s3 "$U/docs?list-type=2&prefix=d/" | grep -c '<Key>')" 0
 check "COPY without a Destination is 400" "$(code -u "$A" -X COPY "$U/~dav/docs/a/one.txt")" 400
@@ -255,8 +275,10 @@ check "a cookie whose seal was altered is 401" "$(code -b "skl_ui=${ck%?}$( [ "$
 key64=${ck%%.*}; mac=${ck##*.}; iat=$(echo "$ck" | cut -d. -f2); exp=$(echo "$ck" | cut -d. -f3)
 check "as is one whose expiry was moved on" "$(code -b "skl_ui=$key64.$iat.99999999999999.$mac" "$U/~ui/session")" 401
 check "or whose time of issue was" "$(code -b "skl_ui=$key64.$((iat + 1)).$exp.$mac" "$U/~ui/session")" 401
-past=$(python3 -c 'import hmac,hashlib,sys,time; e=int(time.time()*1000)-1000; print("%d.%d.%s" % (e-5000, e, hmac.new(sys.argv[1].encode(), ("socketley-ui\n%s\n%d\n%d" % (sys.argv[2], e-5000, e)).encode(), hashlib.sha256).hexdigest()))' "${A#*:}" "${A%%:*}")
-check "and one past its expiry, though sealed right" "$(code -b "skl_ui=$key64.$past" "$U/~ui/session")" 401
+# A cookie sealed here with the given expiry from now in ms, issued 5 s before it.
+seal() { python3 -c 'import hmac,hashlib,sys,time; e=int(time.time()*1000)+int(sys.argv[3]); print("%d.%d.%s" % (e-5000, e, hmac.new(sys.argv[1].encode(), ("socketley-ui\n%s\n%d\n%d" % (sys.argv[2], e-5000, e)).encode(), hashlib.sha256).hexdigest()))' "${A#*:}" "${A%%:*}" "$1"; }
+check "a cookie sealed here is let in" "$(code -b "skl_ui=$key64.$(seal 60000)" "$U/~ui/session")" 200
+check "and one past its expiry, though sealed right" "$(code -b "skl_ui=$key64.$(seal -1000)" "$U/~ui/session")" 401
 check "a session cannot make itself a new one" "$(code -b "skl_ui=$ck" -X POST "$U/~ui/session")" 401
 check "nor does a stale cookie make a browser ask for credentials" "$(curl -s -o /dev/null -D - -b 'skl_ui=x.1.y' "$U/~dav/" | grep -ci '^www-authenticate')" 0
 check "a file read with ?download is saved under its name" \

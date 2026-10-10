@@ -9,11 +9,15 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <set>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+
+#include <openssl/evp.h>
+#include <openssl/sha.h>
 
 #include "compression.h"
 #include "digest.h"
@@ -21,6 +25,7 @@
 #include "s3_iam.h"
 #include "s3_names.h"
 #include "s3_quota.h"
+#include "../../shared/git_names.h"
 #include "../../shared/http_framing.h"
 #include "../../shared/state_persistence.h"
 #include "../../shared/replaced_file.h"
@@ -246,7 +251,10 @@ bool storage_run::ui_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
     if (!number(val.substr(a + 1, b - a - 1), iat) || !number(val.substr(b + 1, d - b - 1), exp) || exp < wall_ms())
         return true;
     v = m_auth->authorize_ui_session(key, iat, exp, val.substr(d + 1));
-    if (v.allowed && !v.anonymous && iat < sessions_since(v.user ? v.user->id : key))
+    struct stat revoked{};
+    if (v.allowed && !v.anonymous &&
+        (iat < sessions_since(v.user ? v.user->id : key) ||
+         ::stat((m_store.options().dir + "/.ui/revoked/" + sha256_hex(val).substr(0, 32)).c_str(), &revoked) == 0))
     {
         v         = auth_verdict{};
         v.allowed = false;
@@ -353,9 +361,20 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
         return;
     }
     resp.headers.emplace_back("Content-Type", "text/html; charset=utf-8");
-    resp.headers.emplace_back("Content-Security-Policy",
-                              "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
-                              "media-src 'self' blob:; img-src 'self' blob: data:; frame-ancestors 'none'");
+    // The page's one script by its hash and nothing else inline, so text that ever reached the page unescaped could
+    // not run as a script.
+    static const std::string csp = []()
+    {
+        const size_t from = ui_page.find("<script>") + 8, to = ui_page.find("</script>");
+        unsigned char md[SHA256_DIGEST_LENGTH];
+        SHA256(reinterpret_cast<const unsigned char*>(ui_page.data() + from), to - from, md);
+        unsigned char b64[4 * ((SHA256_DIGEST_LENGTH + 2) / 3) + 1];
+        EVP_EncodeBlock(b64, md, SHA256_DIGEST_LENGTH);
+        return "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-" +
+               std::string(reinterpret_cast<const char*>(b64)) +
+               "'; media-src 'self' blob:; img-src 'self' blob: data:; frame-ancestors 'none'";
+    }();
+    resp.headers.emplace_back("Content-Security-Policy", csp);
     resp.headers.emplace_back("X-Content-Type-Options", "nosniff");
     resp.body_view = ui_page;
     resp.head_only = r.method == "HEAD";
@@ -365,12 +384,30 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
 // POST signs in with Basic credentials and sets the cookie (?remember for a month), GET says who is signed in, and
 // DELETE signs out. The cookie is HttpOnly, so the page's script never holds the secret or the session, and
 // SameSite=Strict, so no other site's request carries it.
+using fs_iter = std::filesystem::directory_iterator;
+
 void storage_run::ui_session(const std::shared_ptr<conn>& c)
 {
     s3_request& r = c->req;
     const std::string secure_attr = secure(*c) ? "; Secure" : "";
     if (r.method == "DELETE")
     {
+        // The cookie itself is ended too, on the server, so a copy of it taken before is let in no longer.
+        if (const std::string_view val = cookie_value(r.header("cookie"), cookie_name); !val.empty())
+        {
+            const std::string dir = m_store.options().dir + "/.ui";
+            if ((::mkdir(dir.c_str(), 0700) == 0 || errno == EEXIST) &&
+                (::mkdir((dir + "/revoked").c_str(), 0700) == 0 || errno == EEXIST))
+            {
+                if (!replace_file(dir + "/revoked/" + sha256_hex(val).substr(0, 32), "", true)) {}
+                // A cookie lives a month at most, so a mark older than that guards nothing and goes.
+                std::error_code ec;
+                const auto month = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24 * 31);
+                for (fs_iter it(dir + "/revoked", ec), end; !ec && it != end; it.increment(ec))
+                    if (std::error_code tec; it->last_write_time(tec) < month && !tec)
+                        std::filesystem::remove(it->path(), tec);
+            }
+        }
         response out;
         out.status = 204;
         out.headers.emplace_back("Set-Cookie", std::string(cookie_name) + "=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict" + secure_attr);
@@ -487,7 +524,18 @@ void storage_run::ui_progress(const std::shared_ptr<conn>& c)
         collect_body(c, 16 * 1024);
         return;
     }
-    const std::string who = c->user ? c->user->id : c->anonymous ? std::string("anonymous") : c->principal;
+    // Anonymous visitors are nobody in particular, so what one watched is kept for none of them.
+    if (c->anonymous)
+    {
+        response out;
+        out.status = 200;
+        out.headers.emplace_back("Content-Type", "application/json");
+        out.headers.emplace_back("Cache-Control", "no-store");
+        out.body = "[]";
+        send_response(c, std::move(out));
+        return;
+    }
+    const std::string who = c->user ? c->user->id : c->principal;
     const std::string path = m_store.options().dir + "/.ui/progress/" + sha256_hex(who).substr(0, 32) + ".json";
     std::vector<position> ps = read_positions(path);
     std::sort(ps.begin(), ps.end(), [](const position& a, const position& b) { return a.at > b.at; });
@@ -573,6 +621,11 @@ void storage_run::ui_body(const std::shared_ptr<conn>& c)
 
 void storage_run::ui_progress_body(const std::shared_ptr<conn>& c)
 {
+    if (c->anonymous)
+    {
+        app_reply(c, 204, {});
+        return;
+    }
     jvalue req;
     if (!json_reader(c->body).document(req))
     {
@@ -595,7 +648,7 @@ void storage_run::ui_progress_body(const std::shared_ptr<conn>& c)
         app_reply(c, 403, "You may not read that.\n");
         return;
     }
-    const std::string who = c->user ? c->user->id : c->anonymous ? std::string("anonymous") : c->principal;
+    const std::string who = c->user ? c->user->id : c->principal;
     std::weak_ptr<conn> weak = c;
     const std::string bucket = p.bucket, key = p.key;
     m_store.stat_object(bucket, key, [this, weak, who, p = std::move(p)](st s, const object_meta& m) mutable
@@ -1028,9 +1081,10 @@ void storage_run::ui_usage_body(const std::shared_ptr<conn>& c)
         app_reply(c, 404, "No such bucket.\n");
         return;
     }
-    if (!(mb >= 0) || !(mo >= 0))
+    // Below 2^63 as well, which a uint64 holds exactly; a double past it has no integer to become.
+    if (!(mb >= 0) || !(mo >= 0) || !(mb < 9.2e18) || !(mo < 9.2e18))
     {
-        app_reply(c, 400, "A quota is 0 or more.\n");
+        app_reply(c, 400, "A quota is 0 or more, and less than 2^63.\n");
         return;
     }
     std::string xml;
@@ -1158,26 +1212,38 @@ void storage_run::ui_taken(const std::shared_ptr<conn>& c)
             ++g->left;
             m_store.open_object(bucket, key, 64 * 1024, [this, g, bucket, key, etag, add, hold = wn.lock()](open_result o)
             {
-                photo_facts f;
+                auto f = std::make_shared<photo_facts>();
+                const int fd = o.fd;
+                auto done = [this, g, bucket, key, etag, add, hold, f, fd]()
+                {
+                    if (fd >= 0)
+                        m_loop.close_fd(fd);
+                    m_taken[bucket + '\n' + key + '\n' + etag] = *f;
+                    add(key, *f);
+                    --g->left;
+                    (*hold)();
+                };
                 if (o.status == st::ok && o.meta.etag() == etag && !is_encrypted(o.meta) && !is_compressed(o.meta) &&
                     !is_tiered(o.meta))
                 {
                     exif_place there;
-                    if (!photo_facts_of(o.prefetch, f, &there) && there.len > 0 && there.len <= (1u << 20) && o.fd >= 0 &&
-                        there.off + there.len <= o.meta.size)
+                    // Compared without the sum, which an offset near 2^64 in the file would wrap past the check.
+                    if (!photo_facts_of(o.prefetch, *f, &there) && there.len > 0 && there.len <= (1u << 20) && fd >= 0 &&
+                        there.off <= o.meta.size && there.len <= o.meta.size - there.off)
                     {
-                        std::string item(there.len, '\0');
-                        if (::pread(o.fd, item.data(), item.size(), static_cast<off_t>(o.data_off + there.off)) ==
-                            static_cast<ssize_t>(item.size()))
-                            exif_item_facts(item, f);
+                        // Read through the ring, since a megabyte read in place held the loop for every photo of a folder.
+                        auto item = std::make_shared<std::string>(there.len, '\0');
+                        if (m_io.pread(fd, item->data(), static_cast<uint32_t>(item->size()), o.data_off + there.off,
+                                       [item, f, done](int64_t r)
+                                       {
+                                           if (r == static_cast<int64_t>(item->size()))
+                                               exif_item_facts(*item, *f);
+                                           done();
+                                       }))
+                            return;
                     }
                 }
-                if (o.fd >= 0)
-                    m_loop.close_fd(o.fd);
-                m_taken[bucket + '\n' + key + '\n' + etag] = f;
-                add(key, f);
-                --g->left;
-                (*hold)();
+                done();
             });
         };
         for (int i = 0; i < 8; ++i)
@@ -1302,6 +1368,11 @@ void storage_run::ui_users(const std::shared_ptr<conn>& c)
     }
     const bool admin = c->user->admin;
     const int64_t now = wall_ms();
+    // Each user's key count from one pass over the keys, not one pass per user.
+    std::unordered_map<std::string, size_t> keys_of;
+    if (admin)
+        for (const auto& [id, k] : st.keys)
+            ++keys_of[k.user];
     std::string o = "{\"admin\":";
     o += admin ? "true" : "false";
     o += ",\"users\":[";
@@ -1320,9 +1391,8 @@ void storage_run::ui_users(const std::shared_ptr<conn>& c)
             const auto it = st.users.find(u->id);
             const iam_user* iu = it == st.users.end() ? nullptr : &it->second;
             const bool file = m_auth->file_user(u->id);
-            size_t keys = 0;
-            for (const auto& [id, k] : st.keys)
-                keys += k.user == u->id;
+            const auto counted = keys_of.find(u->id);
+            const size_t keys = counted == keys_of.end() ? 0 : counted->second;
             const auto tag = [&](std::string_view k)
             {
                 if (!iu)
@@ -1512,7 +1582,9 @@ void storage_run::ui_git_body(const std::shared_ptr<conn>& c)
             return;
         }
         // A library that is there is one the user may write; one that is not, the first run makes as the user.
-        if (m_store.has_bucket(g.bucket) && !app_allowed(c, "PUT", g.bucket, "x", {}))
+        // Judged where the repository's files go, its folder, which a policy may grant alone.
+        const std::string folder = (g.name.empty() ? git_names::name_of(g.url) : g.name) + "/x";
+        if (m_store.has_bucket(g.bucket) && !app_allowed(c, "PUT", g.bucket, folder, {}))
         {
             app_reply(c, 403, "You may not write to the library " + g.bucket + ".\n");
             return;

@@ -57,6 +57,8 @@ PASS=0
 FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL [$1]: ${2:-}"; }
+SKIPPED=0
+skip() { SKIPPED=$((SKIPPED + 1)); echo "  SKIP: $1"; }
 
 # step NAME CMD... -- one client command, its output kept in $WORK/log and shown when it fails.
 step() {
@@ -108,7 +110,7 @@ if command -v python3 >/dev/null 2>&1 && python3 -c 'import boto3' 2>/dev/null; 
         fail "create over two shards" "the sharded runtime was not created"
     fi
 else
-    echo "  SKIP: boto3 is not installed"
+    skip "boto3 is not installed"
 fi
 
 # ─── AWS CLI v2 ─────────────────────────────────────────────────────────────
@@ -120,7 +122,7 @@ if command -v aws >/dev/null 2>&1; then
     step "aws: cp of 100 MiB, multipart" $A s3 cp "$WORK/big.bin" s3://awsb/big.bin
     step "aws: and back, byte for byte" bash -c "$A s3 cp s3://awsb/big.bin '$WORK/big.back' && cmp '$WORK/big.bin' '$WORK/big.back'"
     step "aws: sync up" $A s3 sync "$WORK/src" s3://awsb/tree
-    step "aws: sync up again copies nothing" bash -c "[ -z \"\$($A s3 sync '$WORK/src' s3://awsb/tree)\" ]"
+    step "aws: sync up again copies nothing" bash -c "out=\$($A s3 sync '$WORK/src' s3://awsb/tree) && [ -z \"\$out\" ] || { printf '%s\n' \"\$out\"; exit 1; }"
     step "aws: sync down, identical" bash -c "$A s3 sync s3://awsb/tree '$WORK/aws-down' && diff -r '$WORK/src' '$WORK/aws-down'"
     step "aws: ls --recursive" bash -c "$A s3 ls --recursive s3://awsb/ | grep -q 'tree/sp ace/file with spaces.txt'"
     step "aws: s3api list-buckets --max-buckets 1" bash -c "$A s3 mb s3://awsc >/dev/null && [ \"\$($A s3api list-buckets --max-buckets 1 --no-paginate --query 'length(Buckets)')\" = 1 ]"
@@ -131,7 +133,7 @@ if command -v aws >/dev/null 2>&1; then
     step "aws: rb" $A s3 rb s3://awsc
     unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE
 else
-    echo "  SKIP: aws is not on PATH"
+    skip "aws is not on PATH"
 fi
 
 # ─── rclone ─────────────────────────────────────────────────────────────────
@@ -150,7 +152,7 @@ if command -v rclone >/dev/null 2>&1; then
     step "rclone: purge" $R purge sl:rcb
     unset RCLONE_CONFIG
 else
-    echo "  SKIP: rclone is not on PATH"
+    skip "rclone is not on PATH"
 fi
 
 # ─── restic ─────────────────────────────────────────────────────────────────
@@ -168,7 +170,7 @@ if command -v restic >/dev/null 2>&1; then
     rm -f "$WORK/src/a/new.bin"
     unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY RESTIC_PASSWORD RESTIC_REPOSITORY RESTIC_CACHE_DIR
 else
-    echo "  SKIP: restic is not on PATH"
+    skip "restic is not on PATH"
 fi
 
 # ─── MinIO mc ───────────────────────────────────────────────────────────────
@@ -190,11 +192,13 @@ if command -v mc >/dev/null 2>&1 && mc --version 2>/dev/null | grep -qi minio; t
     step "mc: rb --force" mc rb --force sl/mcb
     unset MC_CONFIG_DIR
 else
-    echo "  SKIP: mc is not on PATH"
+    skip "mc is not on PATH"
 fi
 
 echo ""
-echo "  Results: $PASS passed, $FAIL failed"
+echo "  Results: $PASS passed, $FAIL failed, $SKIPPED clients skipped"
 [ "$FAIL" -eq 0 ] || { echo "  FAILED"; exit 1; }
+# Every client missing is a box without them, and that is said rather than called a pass.
+[ "$PASS" -gt 0 ] || { echo "  SKIPPED: no S3 client ran, nothing was asserted"; exit 0; }
 echo "  PASSED"
 exit 0

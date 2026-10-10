@@ -100,8 +100,15 @@ if [ -z "${WORKER:-}" ] || [ -z "${WORKER2:-}" ]; then
     echo "  FATAL: ss reported no pid for a listener, so there is nothing to sample"
     echo "  Results: 0/0 passed (0 failed)"; exit 2
 fi
-SAMPLE_PID=$WORKER
 rss(){ awk '/^VmRSS/{print $2}' "/proc/$SAMPLE_PID/status" 2>/dev/null || echo 0; }
+# A pid whose memory reads as nothing makes every delta below 0, which the memory assertions pass.
+for SAMPLE_PID in "$WORKER" "$WORKER2"; do
+    if ! [ "$(rss)" -gt 0 ] 2>/dev/null; then
+        echo "  FATAL: no VmRSS for worker pid $SAMPLE_PID, so no memory figure below means anything"
+        echo "  Results: 0/0 passed (0 failed)"; exit 2
+    fi
+done
+SAMPLE_PID=$WORKER
 
 # The two memory assertions are Release-only, and that is a property of the
 # measurement rather than a convenience.  This path replaces one allocation the

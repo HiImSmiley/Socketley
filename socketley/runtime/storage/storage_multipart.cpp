@@ -710,9 +710,10 @@ void storage_run::op_list_uploads(const std::shared_ptr<conn>& c)
         {
             if (!prefixes.empty() && prefixes.back() == group)
                 continue;
+            // Zero asked for is an empty page and not a truncated one, whose markers would name nothing to go on from.
             if (taken == max_uploads)
             {
-                lr.truncated = true;
+                lr.truncated = max_uploads != 0;
                 break;
             }
             prefixes.push_back(group);
@@ -723,7 +724,7 @@ void storage_run::op_list_uploads(const std::shared_ptr<conn>& c)
         }
         if (taken == max_uploads)
         {
-            lr.truncated = true;
+            lr.truncated = max_uploads != 0;
             break;
         }
         rows.push_back({u->key, u->id, u->initiated_ms, u->storage_class.empty() ? "STANDARD" : u->storage_class});

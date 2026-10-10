@@ -527,7 +527,8 @@ void storage_run::dav_body(const std::shared_ptr<conn>& c)
     {
         std::string dst = key;
         const size_t slash = dst.rfind('/');
-        if (const size_t dot = dst.rfind('.'); dot != std::string::npos && (slash == std::string::npos || dot > slash + 1))
+        // A name that is all extension, as ".zip" is, keeps it, or its folder would be the bucket's root.
+        if (const size_t dot = dst.rfind('.'); dot != std::string::npos && dot > (slash == std::string::npos ? 0 : slash + 1))
             dst.resize(dot);
         unzip_start(c, std::move(bucket), std::move(key), std::move(dst));
         return;
@@ -664,6 +665,13 @@ void storage_run::dav_body(const std::shared_ptr<conn>& c)
                         dst_k += '/';
                 }
                 std::string prefix = k.empty() || k.back() == '/' ? k : k + "/";
+                // Onto itself every copy lands on its own source and the move then removes it; into itself the copies
+                // land where the listing is still walking (RFC 4918 9.8.5, 9.9.4).
+                if (method != "DELETE" && dst_b == b && dst_k.starts_with(prefix))
+                {
+                    app_reply(cc, 403, "A folder is not copied or moved onto itself or into itself.\n");
+                    return;
+                }
                 if (prefix.empty() && method == "DELETE")
                 {
                     // A bucket removed through its folder is removed only empty, as DeleteBucket is.
@@ -717,6 +725,11 @@ void storage_run::dav_body(const std::shared_ptr<conn>& c)
             if (dst_b.empty() || dst_k.empty() || dst_k.back() == '/')
             {
                 app_reply(cc, 409, "A file's Destination is a file.\n");
+                return;
+            }
+            if (dst_b == b && dst_k == k)
+            {
+                app_reply(cc, 403, "A file is not copied or moved onto itself.\n");
                 return;
             }
             const bool move = method == "MOVE";
@@ -1053,8 +1066,10 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
         std::weak_ptr<conn> who;
         std::string bucket, prefix, dst_bucket, dst_prefix;
         bool keep_source{false}, removing{false};
+        // One page of the folder at a time, the next asked for once this one is handed out.
         std::vector<list_entry> keys;
         size_t at{0}, failed{0}, inflight{0};
+        bool more{false}, listing{false};
         // A completion that comes back inside the loop that started it asks for one more turn instead of recursing.
         bool pumping{false}, again{false}, answered{false};
         list_query q;
@@ -1133,8 +1148,14 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
                 done();
                 return;
             }
+            // What a file's COPY keeps, its headers, user metadata and tags; nothing of how the source was stored.
             object_meta meta;
             meta.content_type = o.meta.content_type;
+            for (const auto& [k, v] : o.meta.extra)
+                if (k.starts_with("x-amz-meta-") || k == "cache-control" || k == "content-disposition" ||
+                    k == "content-encoding" || k == "content-language" || k == "expires")
+                    meta.extra.push_back({k, v});
+            set_tags_extra(meta, tags_of(o.meta));
             s3_error err;
             auto put = put_whole(raw->dst_bucket, dst_key, std::move(meta), std::move(body),
                                  [raw, done, remove_then_done, src_key, hold](st s, const put_result*)
@@ -1174,7 +1195,15 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
             }
         } while (raw->again);
         raw->pumping = false;
-        if (raw->at == raw->keys.size() && raw->inflight == 0 && !raw->answered)
+        if (raw->at == raw->keys.size() && raw->more && !raw->listing)
+        {
+            raw->keys.clear();
+            raw->at = 0;
+            raw->listing = true;
+            raw->page();
+            return;
+        }
+        if (raw->at == raw->keys.size() && raw->inflight == 0 && !raw->listing && !raw->answered)
         {
             raw->answered = true;
             if (auto cc = raw->who.lock(); cc && !cc->dead)
@@ -1188,20 +1217,21 @@ void storage_run::dav_tree(const std::shared_ptr<conn>& c, std::string bucket, s
     {
         m_node.list(raw->bucket, raw->q, [raw, hold = raw->self.lock()](st s, list_page p)
         {
+            raw->listing = false;
             if (s != st::ok)
                 ++raw->failed;
             for (list_entry& e : p.objects)
                 raw->keys.push_back(std::move(e));
-            if (s == st::ok && p.truncated && raw->keys.size() < listing_max)
+            raw->more = s == st::ok && p.truncated;
+            if (raw->more)
             {
                 raw->q.resume_at  = p.resume_at;
                 raw->q.has_resume = true;
-                raw->page();
-                return;
             }
             raw->next();
         });
     };
+    raw->listing = true;
     raw->page();
 }
 

@@ -639,6 +639,9 @@ inline bool xml_unescape(std::string_view in, std::string& out)
                 if (cp > 0x10FFFF)
                     return false;
             }
+            // XML 1.0 has no NUL and no surrogate, so a reference to one is malformed.
+            if (cp == 0 || (cp >= 0xD800 && cp <= 0xDFFF))
+                return false;
             // UTF-8.
             if (cp < 0x80) out.push_back(static_cast<char>(cp));
             else if (cp < 0x800)

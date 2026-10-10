@@ -1,4 +1,5 @@
 #include "s3_federation.h"
+#include "../../shared/logging.h"
 #include "../../shared/tls_context.h"
 
 #include <algorithm>
@@ -956,6 +957,11 @@ bool load_federation(const std::string& path, federation_config& out, std::strin
         why = path + ": " + why;
         return false;
     }
+    // A bind carries the user's password, which ldap:// sends in the clear to anything but this machine.
+    if (out.ldap.enabled() && !out.ldap.tls && out.ldap.host != "localhost" && out.ldap.host != "127.0.0.1" &&
+        out.ldap.host != "::1")
+        LOG_WARN(("storage: " + path + " binds to " + out.ldap.host +
+                  " over ldap://, which sends every password in the clear; ldaps:// does not").c_str());
     return true;
 }
 

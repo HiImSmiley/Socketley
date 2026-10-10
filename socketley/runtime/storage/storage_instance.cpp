@@ -461,11 +461,18 @@ bool storage_instance::setup(event_loop& loop)
         return false;
     }
 
+    // The run holds the descriptor from listen_on() on, and its stop() closes it: closed here too it was closed
+    // twice, the second time whatever had been given its number since.
     if (!run->listen_on(fd))
     {
-        loop.close_fd(fd);
         run->stop();
         m_graveyard.push_back(std::move(run));
+        // The socket node this start bound goes with it, so the next start does not meet a stale path.
+        if (!m_bound_listen_path.empty())
+        {
+            if (::unlink(m_bound_listen_path.c_str()) < 0) {}
+            m_bound_listen_path.clear();
+        }
         return false;
     }
 #if SOCKETLEY_HTTP3

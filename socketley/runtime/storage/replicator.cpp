@@ -781,6 +781,25 @@ void replicator::on_timer()
 
 void replicator::start(lane& l)
 {
+    // A copy that ends at once retires through start() again, which inside this start() would recurse once per
+    // such copy -- thousands of delete markers in a row are thousands of frames -- so the inner call only asks for
+    // another round, and this loop gives it.
+    if (l.starting)
+    {
+        l.again = true;
+        return;
+    }
+    l.starting = true;
+    do
+    {
+        l.again = false;
+        start_round(l);
+    } while (l.again);
+    l.starting = false;
+}
+
+void replicator::start_round(lane& l)
+{
     if (l.q.empty() || m_stopped || l.active.size() >= lane_width)
         return;
     if (std::chrono::steady_clock::now() < l.next_try)
@@ -1679,6 +1698,8 @@ void replicator::seed_more(lane& l)
     // A bucket's change goes before its keys, from shard 0 alone, since every shard has the bucket's documents.
     if (!sd.buckets)
     {
+        // A queue that overflowed while these were pushed let them go and began the seeding again, which stands.
+        const auto overflows = m_c.node_overflows;
         if (m_shard == 0 && m_seed_first)
             for (std::string& first : m_seed_first())
                 push(l, node_task({'i', {}, {}, {}, {}, std::move(first)}), false);
@@ -1695,6 +1716,8 @@ void replicator::seed_more(lane& l)
                          false);
             }
         }
+        if (m_c.node_overflows != overflows)
+            return;
         sd.buckets = true;
     }
     auto all = m_store.buckets();

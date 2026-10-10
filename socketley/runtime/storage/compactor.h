@@ -44,7 +44,8 @@ public:
     compactor& operator=(const compactor&) = delete;
 
     // Versions unwritten for `secs` are compressed, 0 for none.
-    void set_age(uint64_t secs) { m_age_ms = secs * 1000; }
+    // Saturated, since an age past what milliseconds can count is one that never comes.
+    void set_age(uint64_t secs) { m_age_ms = secs > UINT64_MAX / 1000 ? UINT64_MAX : secs * 1000; }
     bool enabled() const { return m_age_ms != 0; }
     // Reads where the last run got to; blocking, so it runs at open.
     void open(const std::string& dir, uint32_t shard);

@@ -6,7 +6,8 @@
 // ─── THE FILES ──────────────────────────────────────────────────────────────
 //   <dir>/.ui/git.json            the repositories, changed under <dir>/.ui/git.lock
 //   <dir>/.ui/git/<id>/           each one's bare clone, the state its last run ended in, and that run's log
-//   <dir>/.ui/git-tokens/<user>   a user's GitHub token, sealed with a key only that user's secret derives
+//   <dir>/.ui/git-tokens/<hash>   a user's GitHub token, under the first 32 hex of the SHA-256 of the user's name,
+//                                 sealed with a key only that user's secret derives
 //
 // The first shard runs the schedule; a run asked for is started by whichever shard is asked, and the lock a run holds
 // in its directory keeps two from running at once.
@@ -36,7 +37,8 @@ public:
 
     // `endpoint` is where `git-sync` reaches this runtime's S3 API, host:port; empty when it cannot, and `why` says
     // why, for the interface to show.
-    void open(std::string dir, uint32_t shard, std::string endpoint, bool tls, std::string why_not);
+    // `cert` is the runtime's own certificate, which a run trusts its connection back by; empty without one.
+    void open(std::string dir, uint32_t shard, std::string endpoint, bool tls, std::string why_not, std::string cert = {});
     bool available() const { return !m_endpoint.empty(); }
     const std::string& unavailable_reason() const { return m_why_not; }
     // Whether the schedule has anything to look after.
@@ -57,6 +59,7 @@ public:
     // An error to show, empty when the run started.
     std::string run_now(std::string_view id, authenticator& auth);
     bool running(std::string_view id) const;
+    bool spawned_live(std::string_view id) const;
     // How its last run ended, as git-sync wrote it, "null" for none.
     std::string state_json(std::string_view id) const;
 
@@ -77,6 +80,7 @@ private:
     std::string m_dir, m_endpoint, m_why_not;
     uint32_t m_shard{0};
     bool m_tls{false};
+    std::string m_cert;
     bool m_any{false};
     int64_t m_next_look{0};
     std::vector<repo> m_cache;

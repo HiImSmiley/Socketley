@@ -16,6 +16,9 @@ struct logging_config
     std::string target_prefix;
     // [prefix][owner]/[region]/[bucket]/[YYYY]/[MM]/[DD]/ in front of each object's name, rather than the prefix alone.
     bool        partitioned{false};
+    // The date source the configuration named, read back as it was given; a batch's delivery and its events fall on
+    // the same day here, so both partition alike.
+    bool        event_time{false};
     // What TargetGrants give each log object beside its owner's full control: a grantee as a grant header names one
     // (id, uri or emailaddress, and its value) and a permission.
     struct grant

@@ -399,6 +399,8 @@ struct conn
     bool       rd_pending{false};
     bool       wr_pending{false};
     bool       sp_in_pending{false};
+    // A read of the object's file into sbuf the ring has not answered, which the conn must outlive.
+    bool       file_rd_pending{false};
     bool       sp_out_pending{false};
     bool       closing{false};
 
@@ -1054,6 +1056,9 @@ public:
     // A ZIP object opened into the folder `dst_prefix` of its bucket, one object per file in it, answered once all are
     // written with what was made and what was not; storage_unzip.cpp.
     struct unzip_job;
+    // ZIPs being unpacked now, each holding up to its directory's 64 MiB, so only a few at once.
+    size_t m_unzips{0};
+    static constexpr size_t max_unzips = 4;
     void unzip_start(const std::shared_ptr<conn>& c, std::string bucket, std::string key, std::string dst_prefix);
     // The interface's sign-in (/~ui/session) and the films a user has part watched (/~ui/progress).
     void ui_session(const std::shared_ptr<conn>& c);
@@ -1511,6 +1516,9 @@ private:
         int64_t     playlist_mtime{0}, want_mtime{0};
     };
     std::vector<media_job> m_media_jobs;
+    // Killed jobs not yet reaped, asked again at each tick.
+    std::vector<pid_t> m_media_unreaped;
+    void reap_later(pid_t pid);
     std::vector<std::pair<std::weak_ptr<conn>, media_want>> m_media_waits;
     timer       m_media_timer;
     // A poll of each running job's pidfd, which completes when its process ends; a list, so each stays where the

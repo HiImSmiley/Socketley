@@ -1,4 +1,5 @@
 #include "s3_iam.h"
+#include "../../shared/glob_match.h"
 
 #include <openssl/rand.h>
 
@@ -263,30 +264,7 @@ bool trust_ok(std::string_view doc, std::string& why)
 
 bool glob(std::string_view pat, std::string_view text)
 {
-    size_t p = 0, t = 0, star = std::string_view::npos, mark = 0;
-    while (t < text.size())
-    {
-        if (p < pat.size() && (pat[p] == '?' || pat[p] == text[t]))
-        {
-            ++p;
-            ++t;
-        }
-        else if (p < pat.size() && pat[p] == '*')
-        {
-            star = p++;
-            mark = t;
-        }
-        else if (star != std::string_view::npos)
-        {
-            p = star + 1;
-            t = ++mark;
-        }
-        else
-            return false;
-    }
-    while (p < pat.size() && pat[p] == '*')
-        ++p;
-    return p == pat.size();
+    return socketley::iam_wild_match(pat, text);
 }
 
 std::vector<std::string> strings_of(const jvalue* v)
@@ -628,8 +606,10 @@ bool iam_trusts(std::string_view trust, std::string_view user_id)
     bool allowed = false;
     for (const jvalue& s : st)
     {
-        // A statement with a condition is one this runtime cannot judge, so it lets nobody in.
-        if (member(s, "Condition"))
+        // Conditions are not weighed here, so the statement that has one is read the way that cannot let anyone in
+        // it would keep out: an Allow under a condition admits nobody, and a Deny under one refuses as if it held.
+        const bool conditional = member(s, "Condition") != nullptr;
+        if (conditional && text_of(s, "Effect") != "Deny")
             continue;
         bool action = false;
         for (const std::string& a : strings_of(member(s, "Action")))
@@ -1013,7 +993,7 @@ struct api
                 it->second.password_reset = false;
                 // A user of the credentials file with nothing left beside it is the file's alone again.
                 const iam_policies& p = it->second.policies;
-                if (it->second.external && p.inline_docs.empty() && p.attached.empty())
+                if (it->second.external && p.inline_docs.empty() && p.attached.empty() && it->second.groups.empty())
                     s.users.erase(it);
                 return done();
             }
@@ -1159,14 +1139,18 @@ struct api
             if (const std::string why = password_problem(pw, n); !why.empty())
                 return fail(400, "PasswordPolicyViolation", why);
             const iam_invite i = inv->second;
+            // Everything that can refuse is asked before the user is made, so a refusal leaves no half-made one.
+            const std::string hash = password_hash(pw), secret = random_text("", 40, alnum);
+            if (hash.empty() || secret.empty())
+                return fail(500, "ServiceFailure", "No random bytes for a salt.");
+            if (const std::string* em = field("Email"); em && !em->empty() && !tag_problem(iam_tag_email, *em).empty())
+                return missing("Email");
             iam_user* u = nullptr;
             if (iam_result* bad = make_user(n, "/", u))
                 return *bad;
-            u->password = password_hash(pw);
+            u->password = hash;
             u->password_ms = now;
-            u->login_secret = random_text("", 40, alnum);
-            if (u->password.empty() || u->login_secret.empty())
-                return fail(500, "ServiceFailure", "No random bytes for a salt.");
+            u->login_secret = secret;
             if (i.max_bytes)
                 u->tags[std::string(iam_tag_max_bytes)] = std::to_string(i.max_bytes);
             if (i.libraries)
@@ -1174,11 +1158,7 @@ struct api
             if (const std::string* dn = field("DisplayName"); dn && !dn->empty() && dn->size() <= 128)
                 u->tags[std::string(iam_tag_display_name)] = *dn;
             if (const std::string* em = field("Email"); em && !em->empty())
-            {
-                if (!tag_problem(iam_tag_email, *em).empty())
-                    return missing("Email");
                 u->tags[std::string(iam_tag_email)] = *em;
-            }
             if (i.admin)
             {
                 const std::string g(iam_admins_group);
@@ -1588,8 +1568,10 @@ bool iam_grants_iam(const iam_state& s, std::string_view action, const iam_field
     if (action == "AddUserToGroup" || action == "RemoveUserFromGroup")
         if (const std::string* g = field_of(f, "GroupName"); g && *g == iam_admins_group)
             return true;
+    // Taking from the admins group is as much an admin's to do as giving to it.
     if (action == "CreateGroup" || action == "DeleteGroup" || action == "PutGroupPolicy" ||
-        action == "AttachGroupPolicy")
+        action == "AttachGroupPolicy" || action == "DetachGroupPolicy" || action == "DeleteGroupPolicy" ||
+        action == "UpdateGroup")
         if (const std::string* g = field_of(f, "GroupName"); g && *g == iam_admins_group)
             return true;
     if (action == "TagUser" || action == "UntagUser")

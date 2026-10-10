@@ -656,13 +656,22 @@ void multipart_store::create(std::string bucket, std::string key, object_meta me
         --m_inflight;
         if (r < 0)
         {
-            // Nothing was promised, so what was made is taken back where it can be.
-            if (*s->file_fd >= 0)
-                if (!m_io->unlinkat(AT_FDCWD, s->dir + "/meta", 0, [](int64_t) {})) {}
-            if (*s->data_fd >= 0)
-                if (!m_io->unlinkat(AT_FDCWD, s->dir + "/data", 0, [](int64_t) {})) {}
-            if (*s->dir_fd >= 0)
-                if (!m_io->unlinkat(AT_FDCWD, s->dir, AT_REMOVEDIR, [](int64_t) {})) {}
+            // Nothing was promised, so what was made is taken back where it can be: the files first, and the
+            // directory once both have gone, or its removal finds them still there.
+            auto left = std::make_shared<int>(1);
+            auto io = m_io;
+            const std::string dir = s->dir;
+            const bool had_dir = *s->dir_fd >= 0;
+            auto one_gone = [left, io, dir, had_dir](int64_t)
+            {
+                if (--*left == 0 && had_dir)
+                    if (!io->unlinkat(AT_FDCWD, dir, AT_REMOVEDIR, [](int64_t) {})) {}
+            };
+            if (*s->file_fd >= 0 && m_io->unlinkat(AT_FDCWD, dir + "/meta", 0, one_gone))
+                ++*left;
+            if (*s->data_fd >= 0 && m_io->unlinkat(AT_FDCWD, dir + "/data", 0, one_gone))
+                ++*left;
+            one_gone(0);
             s->cb(errno_st(r), {});
             return;
         }
@@ -861,7 +870,18 @@ void multipart_store::finish_part(const std::shared_ptr<part_commit>& pc, int64_
         {
             if (!m_io->unlinkat(AT_FDCWD, pc->tmp_path, 0, [](int64_t) {})) {}
         }
-        else if (!m_io->unlinkat(AT_FDCWD, pc->part_path, 0, [](int64_t) {})) {}
+        else
+        {
+            if (!m_io->unlinkat(AT_FDCWD, pc->part_path, 0, [](int64_t) {})) {}
+            // The file the earlier upload of this number left is gone with it, so its entry and its bytes go too.
+            if (up)
+                if (const auto old = up->parts.find(pc->number); old != up->parts.end() && !old->second.in_place)
+                {
+                    up->held -= std::min(up->held, old->second.size);
+                    m_store->release_bytes(old->second.size);
+                    up->parts.erase(old);
+                }
+        }
         out.status = up ? errno_st(res) : st::cancelled;
     }
     else if (up)

@@ -73,8 +73,11 @@ bool parse_logging_config(std::string_view xml, logging_config& out, s3_error& e
                 if (f.name == "PartitionedPrefix")
                 {
                     for (const xml_node& p : f.kids)
+                    {
                         if (p.name != "PartitionDateSource" || (p.text != "EventTime" && p.text != "DeliveryTime"))
                             return false;
+                        out.event_time = p.text == "EventTime";
+                    }
                     out.partitioned = true;
                 }
                 else if (f.name != "SimplePrefix" || !f.kids.empty())
@@ -124,9 +127,11 @@ std::string logging_config_xml(const logging_config* c)
             x += "</TargetGrants>";
         }
         // The key format is told whether it was given or left to its default.
-        x += c->partitioned ? "<TargetObjectKeyFormat><PartitionedPrefix><PartitionDateSource>DeliveryTime"
-                              "</PartitionDateSource></PartitionedPrefix></TargetObjectKeyFormat>"
-                            : "<TargetObjectKeyFormat><SimplePrefix/></TargetObjectKeyFormat>";
+        x += !c->partitioned ? "<TargetObjectKeyFormat><SimplePrefix/></TargetObjectKeyFormat>"
+           : c->event_time   ? "<TargetObjectKeyFormat><PartitionedPrefix><PartitionDateSource>EventTime"
+                               "</PartitionDateSource></PartitionedPrefix></TargetObjectKeyFormat>"
+                             : "<TargetObjectKeyFormat><PartitionedPrefix><PartitionDateSource>DeliveryTime"
+                               "</PartitionDateSource></PartitionedPrefix></TargetObjectKeyFormat>";
         x += "</LoggingEnabled>";
     }
     x += "</BucketLoggingStatus>";

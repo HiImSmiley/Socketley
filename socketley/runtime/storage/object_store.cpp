@@ -824,8 +824,9 @@ st object_store::list_walk(std::string_view bucket_name, const list_query& q, li
                 // past all of them instead of stepping over each.
                 const std::string next = prefix_successor(cp);
                 // A marker that is itself a rolled-up prefix means the caller
-                // has that prefix already, and not the keys behind it.
-                const bool seen = !q.has_resume && !q.start_after.empty() && cp <= q.start_after;
+                // has that prefix already, and not the keys behind it; a marker
+                // that is a key below it was a key, and the prefix is news.
+                const bool seen = !q.has_resume && !q.start_after.empty() && cp == q.start_after;
                 if (!seen)
                 {
                     v.prefix(std::move(cp));
@@ -1415,8 +1416,9 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
             if (const st cs = check_put_condition(rq.cond, cur == bp->objects.end() ? nullptr : &cur->second);
                 cs != st::ok)
             {
-                if (!m_io->unlinkat(bp->tmp_fd, rq.tmp_name, 0, [](int64_t) {})) {}
-                commit_done(c, cs);
+                // From the directory it was written to: a small body may be pooled, and a pooled file left whole
+                // would be rolled forward by the next start -- the write it refused, made after all.
+                commit_refuse(c, cs);
                 return;
             }
         }
@@ -2946,6 +2948,9 @@ struct create_state
     std::string name;
     int         stage{0};
     int         fd{-1};
+    // The bucket's directory and its data/ directory, held from their opening to the bucket or to a failure.
+    int         dir_fd{-1};
+    int         data_fd{-1};
     int64_t     created_ms{0};
     std::string owner;
     // The next of the 256 object directories to make; 256 when they are all there.
@@ -3031,8 +3036,12 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
         const std::string base = cs->name;
         auto fail = [this, cs](st why)
         {
-            if (cs->fd >= 0)
-                m_loop->close_fd(cs->fd);
+            for (int* fd : {&cs->fd, &cs->dir_fd, &cs->data_fd})
+                if (*fd >= 0)
+                {
+                    m_loop->close_fd(*fd);
+                    *fd = -1;
+                }
             m_creating.erase(cs->name);
             --m_inflight;
             cs->cb(why);
@@ -3095,8 +3104,8 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
                 break;
             case 10:
                 if (res < 0) { fail(errno_status(res)); return; }
-                cs->text = std::to_string(res);   // the bucket directory's descriptor
-                queued = m_io->fsync(static_cast<int>(res), false, next);
+                cs->dir_fd = static_cast<int>(res);
+                queued = m_io->fsync(cs->dir_fd, false, next);
                 break;
             case 11:
                 if (res < 0) { fail(errno_status(res)); return; }
@@ -3117,10 +3126,9 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
             case 13:
             {
                 if (res < 0) { fail(errno_status(res)); return; }
-                // Remembered on the state until the last descriptor is opened.
-                cs->text += " " + std::to_string(res);
+                cs->data_fd = static_cast<int>(res);
                 // The 256 names are durable once, here, and no put makes a directory.
-                queued = m_io->fsync(static_cast<int>(res), false, next);
+                queued = m_io->fsync(cs->data_fd, false, next);
                 break;
             }
             case 14:
@@ -3131,14 +3139,12 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
             default:
             {
                 if (res < 0) { fail(errno_status(res)); return; }
-                int dir_fd = -1, data_fd = -1;
-                std::sscanf(cs->text.c_str(), "%d %d", &dir_fd, &data_fd);
                 auto b = std::make_unique<bucket>();
                 b->name       = cs->name;
                 b->created_ms = cs->created_ms;
                 b->owner      = cs->owner;
-                b->dir_fd     = dir_fd;
-                b->data_fd    = data_fd;
+                b->dir_fd     = std::exchange(cs->dir_fd, -1);
+                b->data_fd    = std::exchange(cs->data_fd, -1);
                 b->tmp_fd     = static_cast<int>(res);
                 b->j.fd       = cs->fd;
                 b->j.off      = journal_header_len;
@@ -3282,6 +3288,9 @@ void object_store::drop_rename(std::string name, std::function<void(st)> cb)
                 });
             if (!q2)
             {
+                // The directory has moved already, so the bucket is gone from memory too; only its durability
+                // is in doubt, which is what the error says.
+                forget_bucket(name);
                 --m_inflight;
                 cb(st::io_error);
             }

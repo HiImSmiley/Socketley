@@ -68,6 +68,10 @@ check "one with no IndexDocument is refused" \
     "$(code -X PUT "$U/site?website" --data '<WebsiteConfiguration><ErrorDocument><Key>e.html</Key></ErrorDocument></WebsiteConfiguration>')" 400
 check "one that redirects everything and names an index is refused" \
     "$(code -X PUT "$U/site?website" --data '<WebsiteConfiguration><RedirectAllRequestsTo><HostName>x.test</HostName></RedirectAllRequestsTo><IndexDocument><Suffix>i.html</Suffix></IndexDocument></WebsiteConfiguration>')" 400
+check "a redirect to a host with a line break in it is refused, as it would split the Location header" \
+    "$(code -X PUT "$U/site?website" --data '<WebsiteConfiguration><RedirectAllRequestsTo><HostName>x.test&#13;&#10;Set-Cookie: a=b</HostName></RedirectAllRequestsTo></WebsiteConfiguration>')" 400
+check "and so is one in a routing rule" \
+    "$(code -X PUT "$U/site?website" --data '<WebsiteConfiguration><IndexDocument><Suffix>i.html</Suffix></IndexDocument><RoutingRules><RoutingRule><Redirect><HostName>a b.test</HostName></Redirect></RoutingRule></RoutingRules></WebsiteConfiguration>')" 400
 check "a bucket without one answers NoSuchWebsiteConfiguration" "$(code "$U/site?website")" 404
 check "and so does its website" "$(wcode site /)" 404
 check "in HTML" "$(whead site content-type /)" "text/html; charset=utf-8"

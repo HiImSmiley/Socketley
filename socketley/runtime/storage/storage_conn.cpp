@@ -201,7 +201,8 @@ bool storage_run::open(std::string& err)
                         : bind == "::" ? std::string("[::1]")
                         : bind.find(':') != std::string::npos ? "[" + bind + "]" : bind) +
                        ":" + std::to_string(m_owner.effective_port());
-        m_git.open(m_store.options().dir, m_store.shard(), endpoint, m_tls != nullptr, why);
+        m_git.open(m_store.options().dir, m_store.shard(), endpoint, m_tls != nullptr, why,
+                   std::string(m_owner.get_cert_path()));
     }
     reap_uploads();
     LOG_INFO(("storage: " + std::to_string(rep.buckets) + " bucket(s), " +
@@ -732,6 +733,9 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
         else
             h2_stream_gone(c);
         m_streams.erase(c->id);
+        // A read of its file may still be landing in sbuf.
+        if (c->file_rd_pending)
+            m_closing.push_back(c);
         return;
     }
     if (c->h2)
@@ -764,13 +768,13 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
     c->on_body     = false;
 
     m_conns.erase(c->id);
-    if (c->rd_pending || c->wr_pending || c->sp_in_pending || c->sp_out_pending)
+    if (c->rd_pending || c->wr_pending || c->sp_in_pending || c->sp_out_pending || c->file_rd_pending)
         m_closing.push_back(c);
 }
 
 void storage_run::maybe_release(const std::shared_ptr<conn>& c)
 {
-    if (!c->dead || c->rd_pending || c->wr_pending || c->sp_in_pending || c->sp_out_pending)
+    if (!c->dead || c->rd_pending || c->wr_pending || c->sp_in_pending || c->sp_out_pending || c->file_rd_pending)
         return;
     auto it = std::find(m_closing.begin(), m_closing.end(), c);
     if (it != m_closing.end())
@@ -1561,6 +1565,10 @@ std::string storage_run::response_head(const conn& c, const response& r, size_t 
     h += "\r\n";
     for (const auto& [k, v] : r.headers)
     {
+        // A value a client put in a query (response-content-disposition) is dropped rather than allowed to write
+        // headers of its own into the answer.
+        if (!http_field_value_ok(k) || !http_field_value_ok(v))
+            continue;
         h += k;
         h += ": ";
         h += v;
@@ -2610,11 +2618,21 @@ void storage_run::file_pump(const std::shared_ptr<conn>& c)
             [this, weak](int64_t res)
             {
                 auto cc = weak.lock();
-                if (!cc || cc->dead)
+                if (!cc)
                     return;
+                cc->file_rd_pending = false;
+                if (cc->dead)
+                {
+                    maybe_release(cc);
+                    return;
+                }
                 stream_read_done(cc, res);
             }))
+    {
         close_conn(c);
+        return;
+    }
+    c->file_rd_pending = true;
 }
 
 void storage_run::stream_read_done(const std::shared_ptr<conn>& c, int64_t res)
