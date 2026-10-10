@@ -305,7 +305,11 @@ std::string inbox_json(const inbox& b)
     }
     o += "],\"items\":[";
     for (size_t i = 0; i < b.items.size(); ++i)
-        o += (i ? "," : "") + inbox_item_json(b.items[i]);
+    {
+        if (i)
+            o += ',';
+        o += inbox_item_json(b.items[i]);
+    }
     return o + "]}\n";
 }
 
@@ -679,7 +683,11 @@ void storage_run::ui_inbox(const std::shared_ptr<conn>& c)
     }
     o += "],\"items\":[";
     for (size_t i = 0; i < b.items.size() && i < 50; ++i)
-        o += (i ? "," : "") + inbox_item_json(b.items[i]);
+    {
+        if (i)
+            o += ',';
+        o += inbox_item_json(b.items[i]);
+    }
     o += "]}";
     response out;
     out.status = 200;
