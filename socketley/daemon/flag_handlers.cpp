@@ -1565,7 +1565,7 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
             sy->set_prefix(pa.args[++i]);
             return 0;
         }
-        // The file access_key and secret_key are read from; --token writes one of these and names it.
+        // The file access_key and secret_key are read from.
         case fnv1a("--credentials"):
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
@@ -1611,7 +1611,7 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
         {
             if (i + 1 >= pa.count || pa.args[i + 1].empty())
             {
-                std::cout << "--exclude requires patterns such as '*.tmp,.git/*', comma-separated\n";
+                std::cout << "--exclude requires patterns such as '*.tmp, .git, node_modules', comma-separated\n";
                 return 1;
             }
             sy->set_exclude(pa.args[++i]);

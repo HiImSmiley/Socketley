@@ -7,8 +7,7 @@
 // side cannot be told from a creation on the other.
 //
 // --mode says who sends: `out` carries the directory to the storage, `in` carries the storage to the directory, and
-// `inout` both ways, as it does on a server and a client. The rights a token is minted with follow it, so a token
-// made for `out` cannot read back what is already there.
+// `inout` both ways, as it does on a server and a client.
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -32,6 +31,25 @@ const char* sync_mode_name(sync_mode m);
 // How often the whole of both sides is walked when nothing told the runtime of a change, in seconds; 0 is never.
 inline constexpr uint32_t sync_default_every = 3600;
 
+// One --storage entry taken apart: a runtime of this daemon and a bucket, or an address and a bucket.
+struct sync_target_spec
+{
+    // As it was written, which is what the index keys by.
+    std::string name;
+    std::string bucket;
+    // The runtime's name, empty when the entry is an address.
+    std::string runtime;
+    // `http://host:port` or `https://host[:port]`, empty when the entry names a runtime.
+    std::string url;
+};
+
+// Where a sync's index is kept, <state>/sync/<name>.index, which a removal deletes and a rename carries along.
+std::string sync_index_path(std::string_view runtime_name);
+
+// `runtime/bucket`, `host:port/bucket` (http) or `http[s]://host[:port]/bucket`; false with `why` for anything else,
+// so create refuses what the job could never reach.
+bool parse_sync_target(std::string_view entry, sync_target_spec& out, std::string& why);
+
 class sync_instance : public runtime_instance
 {
 public:
@@ -39,7 +57,7 @@ public:
     ~sync_instance() override;
 
     // The directory the job's files are in (--dir); it must exist when the runtime starts.
-    void set_dir(std::string_view path) { m_dir = std::string(path); }
+    void set_dir(std::string_view path);
     std::string_view get_dir() const { return m_dir; }
 
     // Where they go (--storage): `runtime/bucket` for a storage runtime of this daemon, or a URL with a bucket for
@@ -55,7 +73,7 @@ public:
     void set_mode(sync_mode m) { m_mode = m; }
     sync_mode get_mode() const { return m_mode; }
 
-    // The file the job's credentials are read from (--credentials, or where --token's string was written).
+    // The file the job's credentials are read from (--credentials).
     void set_credentials(std::string_view path) { m_credentials = std::string(path); }
     std::string_view get_credentials() const { return m_credentials; }
 
@@ -87,4 +105,6 @@ private:
     uint32_t    m_every{sync_default_every};
 
     std::unique_ptr<socketley::sync::sync_run> m_run;
+    // Runs that were stopped and that the ring still owes a completion.
+    std::vector<std::unique_ptr<socketley::sync::sync_run>> m_graveyard;
 };

@@ -10,19 +10,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **A `sync` runtime, which carries a directory to a storage.** One runtime is
-  one job, so a job that fails is a runtime that failed, with its reason in the
-  log, its alert and its own line in `socketley ls`; `--shards` is refused,
-  since the shards would share no socket and would write one index from several
-  processes. `--storage` takes a runtime of this daemon and a bucket
-  (`ui/photos`, whose port comes out of the map the daemon sends every worker),
-  a host and a port, or a URL -- more than one only with `--mode out`, since
-  carrying two into one directory cannot say which a file came from. `--mode`
-  is the server's and the client's three words, `out`, `in` and `inout`, of
-  which only `out` is carried so far and the other two are refused when a job
-  is made rather than at its first start. With `--prefix`, `--exclude` and
-  `--every`; `--exclude` reads `'*.tmp, *.md, node_modules'` as a .gitignore
-  would, a pattern with no slash naming an entry at any depth, and does not
-  walk a directory it names.
+  one job, with its own line in `socketley ls`, its own figures, log lines and
+  alert; `--shards` is refused, since the shards would share no socket and
+  would write one index from several processes. `--storage` takes a storage
+  runtime of this daemon and a bucket (`ui/photos`, whose port comes out of the
+  map the daemon sends every worker), a host and a port, or an http or https
+  URL -- more than one only with `--mode out`. A target that can never work is
+  refused when the job is made: no bucket, a path before it, a bucket name S3
+  would refuse, one named twice, a runtime that is no storage, and a `--dir`
+  that holds the storage's own data or lies in it, which would carry every
+  object back into itself. `--mode` is the server's and the client's three
+  words, of which only `out` is carried so far. Between the walks `--every`
+  asks for, inotify says which files changed: a file is carried once it is
+  written and closed, and removed once it is deleted. A file above 512 MiB goes
+  in parts of 64 MiB, so one above the 5 GiB a single request carries arrives
+  at all; without TLS a file's bytes go to the socket by splice. Eight
+  requests go to a target at once, which carried 20,000 small files to a local
+  storage in 24 s rather than the 149 s of one at a time. Nothing is
+  removed from the storage unless it is provably gone here: a walk that broke
+  off, a directory it may not enter, a file excluded since and a directory that
+  is suddenly empty -- a disk that is not mounted -- take nothing away. A
+  refused or unanswered request is logged once while its reason stays the
+  same, raised as an alert after three readings, and tried again thirty seconds
+  later whatever `--every` says; the credentials file is read again at every
+  walk. The index of what was carried checksums every record, so a crash costs
+  carrying something again and never a file believed carried that was not; it
+  belongs to one directory and prefix and begins again when either changes, is
+  deleted by `socketley remove` and moves with a rename.
 - **An argument with a space in it arrives as one.** The daemon's command line
   is split on whitespace and had no quoting, so `--dir "/home/me/My Photos"`
   arrived as `/home/me/My` and a stray `Photos`, refused as an unknown flag, and

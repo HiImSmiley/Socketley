@@ -11138,9 +11138,9 @@ and
 A
 .B sync
 runtime is one job that carries files between a directory and a storage. One
-runtime is one job, so a job that fails is a runtime that failed, with its
-reason in the log, its own alert and its own line in
-.BR "socketley ls" .
+runtime is one job, so what goes wrong with it has its own line in
+.BR "socketley ls" ,
+its own figures, its own lines in the log and its own alert.
 .PP
 .nf
 socketley create sync photos \-\-dir /srv/photos \-\-storage ui/photos \e
@@ -11159,10 +11159,27 @@ The directory whose files are carried, absolute, and there when the runtime
 starts. Required.
 .TP
 .BI "\-\-storage " target\fR[\fB,\fItarget\fR...]
-Where they go: a runtime of this daemon and a bucket,
-.BR ui/photos ,
-or a URL and a bucket,
-.BR https://storage.example/photos .
+Where they go, each one of three forms with the bucket last:
+.RS
+.TP
+.B ui/photos
+a storage runtime of this daemon, reached on its port at 127.0.0.1. A name
+with no scheme and no port is always a runtime's, dots and all;
+.TP
+.B 10.0.0.5:9000/photos
+a host and a port, over plain HTTP;
+.TP
+.B https://files.example/photos
+a URL, http or https, with nothing between the host and the bucket.
+.RE
+.IP
+A storage runtime that serves TLS itself is named by its URL, since its port
+does not speak plain HTTP; naming it is refused, with the URL to use. A bucket name follows the S3 rules: 3 to 63 of
+.BR a\-z ,
+.BR 0\-9 ,
+.B .
+and
+.BR \- .
 More than one target is taken only with
 .BR "\-\-mode out" ,
 since carrying two of them into one directory cannot say which a file came from
@@ -11212,8 +11229,13 @@ How often the whole directory is walked, as
 or
 .BR 1d ;
 .B never
-walks it once at a start and then only when something says a file changed. One
-hour by default.
+walks it once at a start. One hour by default. Between walks, inotify says
+which files changed, and a file is carried once it is written and closed,
+moved in or touched, and removed once it is deleted; a directory that comes or
+goes, or more events than the kernel keeps, asks for a walk. When inotify is
+not there or its watches run out
+.RB ( fs.inotify.max_user_watches ),
+it is said once in the log and the walk is what finds a change.
 .TP
 .BI "\-\-exclude " pattern\fR[\fB,\fIpattern\fR...]
 Shell patterns, separated by commas, with spaces around them ignored:
@@ -11230,16 +11252,51 @@ not walked.
 .B "What it remembers."
 A sync keeps an index of what it last carried, in
 .IR state\-dir /sync/ name .index,
-0600, written before the change it records is called done. Without it a
-deletion here cannot be told from a file never carried: the first is taken off
-the far side and the second is sent. A record cut short by a crash costs that
-record alone.
+0600. Without it a deletion here cannot be told from a file never carried: the
+first is taken off the far side and the second is sent. Every record carries a
+checksum, and the first that fails it ends the file, so a crash costs at most
+carrying again what the last moments carried \(em never a file believed
+carried that was not. The index belongs to one directory and one prefix: when
+either changes it is begun again, which carries everything once more and takes
+nothing away.
+.B "socketley remove"
+deletes it, and a rename carries it along.
+.PP
+.B "How it carries."
+Eight requests at a time per target, each on a connection kept between them,
+and never two about one file. A file
+above 512 MiB goes as a multipart upload in parts of 64 MiB, since one request
+carries at most 5 GiB; a file that changes while its parts go is given up and
+carried again once it is written. Without TLS a file's bytes go from the disk
+to the socket by splice. A link to a file is carried as the file it names, and
+taken away at the walk that finds it pointing at nothing, since no event names
+a link whose target goes; a link to a directory is not followed. A
+.B \-\-dir
+that holds the directory of a storage runtime it names, or lies in it, is
+refused, since every object carried would be carried again.
+.PP
+.B "What it takes away."
+A file is removed from the storage only when it is provably gone here: deleted,
+or a link to nothing. A file the walk could not read, one below a directory it
+may not enter, and one an
+.B \-\-exclude
+names since it was carried are left where they are. A directory that is empty
+when the index says files were carried from it removes nothing, and says why in
+.B last_error
+\(em a disk that is not mounted looks exactly like that, and a bucket emptied on
+the strength of it cannot be filled again.
 .PP
 .B "What a failure means."
-A file that cannot be carried is counted and logged, and tried again at the
-next walk; only a configuration that cannot work \(em a directory that is gone,
-credentials that are refused \(em fails the runtime. A target that stops
-answering holds up its own queue and no other's.
+A file the storage refuses, and a target that does not answer, are counted,
+logged once for as long as the reason stays the same, and tried again by a walk
+thirty seconds later, whatever
+.B \-\-every
+says. A target that stops answering holds up its own queue and no other's. The
+runtime keeps running: a sync that keeps failing for three readings in a row
+raises an alert, with
+.B last_error
+as its detail, which clears once something is carried again. A runtime it
+names that is not a storage, or not there, is a failure of the same kind.
 .PP
 .B "Its figures"
 (\fBsocketley stats\fR) are
@@ -11253,6 +11310,10 @@ answering holds up its own queue and no other's.
 .B waiting
 (what is queued),
 .BR failures ,
+.B failing
+(failures since the last thing carried),
+.B watched
+(directories inotify watches),
 .B last_run_secs
 and
 .BR last_error .

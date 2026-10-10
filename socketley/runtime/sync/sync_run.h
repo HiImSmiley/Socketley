@@ -1,18 +1,22 @@
 #pragma once
-// One sync job at work: it walks its directory, asks its index what it last carried, and sends the difference.
+// One sync job at work: it walks its directory, asks its index what it last carried, and sends the difference;
+// between walks inotify names the files that changed, and only those are looked at.
 //
 // The walk is sliced over loop turns rather than done at once, so a directory of a million files does not stop the
-// runtime from answering a `stop` while it is counted. One exchange is in flight per target, on the connection
-// outbound_http keeps between them; a target that is unreachable holds up only its own queue.
+// runtime from answering a `stop` while it is counted. Several exchanges are in flight per target, each on a
+// connection outbound_http keeps, never two about one file; a target that is unreachable holds up only its own queue.
 //
-// A failure to carry one file is not a failed runtime: it is counted, logged once, and tried again at the next walk.
-// Only a configuration that cannot work -- a directory that is gone, credentials that are refused -- stops the job.
+// A failure is not a failed runtime: it is counted, logged once while its reason stays the same, raised as an alert
+// while it lasts, and tried again by a walk soon after. Nothing is removed from a target unless it is provably gone
+// here, since a removal is the one thing a sync does that cannot be undone.
 #include <chrono>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "sync_index.h"
@@ -36,6 +40,10 @@ struct sync_stats
     uint64_t bytes_carried{0};
     uint64_t waiting{0};
     uint64_t failures{0};
+    // Failures since the last thing that went through, which is what an alert is raised on.
+    uint64_t failing{0};
+    // Directories inotify is watching, 0 when the walk on --every is all that sees a change.
+    uint64_t watched{0};
     // Seconds since the last walk of the directory ended, and what went wrong last.
     uint64_t    last_run_secs{0};
     std::string last_error;
@@ -69,6 +77,8 @@ public:
 
     size_t open_connections() const;
     const sync_stats& stats() const { return m_stats; }
+    // Whether the ring owes this run nothing, so a stopped one can be freed.
+    bool drained() const;
 
 private:
     // What one file still owes one target.
@@ -81,8 +91,34 @@ private:
         int64_t     mtime_ns{0};
     };
 
+    // A file carried in parts: which, from what descriptor, the upload's id and the parts the target has taken.
+    struct upload
+    {
+        job j;
+        std::shared_ptr<int> fd;
+        std::string id;
+        uint64_t part{0};
+        std::vector<std::string> etags;
+    };
+
+    // One exchange at a time, on a connection kept between them, and the path it is about.
+    struct lane
+    {
+        std::unique_ptr<socketley::storage::http_peer> peer;
+        bool busy{false};
+        std::string path;
+        std::unique_ptr<upload> mpu;
+    };
+
     struct target
     {
+        // Moved and never copied: the lanes are its own, and a vector that grows would otherwise try to copy them.
+        target() = default;
+        target(const target&) = delete;
+        target& operator=(const target&) = delete;
+        target(target&&) = default;
+        target& operator=(target&&) = default;
+
         // As it was written on the command line, which is what the index keys by.
         std::string name;
         std::string bucket;
@@ -90,11 +126,13 @@ private:
         std::string where;
         // A runtime is named rather than addressed, and the daemon's map says its port only once it has arrived.
         bool        addressed{false};
+        // The runtime of this daemon it names, empty for an address.
+        std::string runtime;
         socketley::storage::http_target http;
         sync_credentials cred;
-        std::unique_ptr<socketley::storage::http_peer> peer;
+        // The exchanges in flight to it, one per lane, each on a connection of its own; empty until it is addressed.
+        std::vector<std::unique_ptr<lane>> lanes;
         std::deque<job> queue;
-        bool in_flight{false};
         // Said once per walk, so a host that is down does not fill the log.
         bool told{false};
     };
@@ -106,15 +144,44 @@ private:
     // Takes the next slice of the walk; true once the walk has ended.
     bool walk_slice();
     void end_walk();
+    // Queues what one path owes each target, as the walk would for it alone.
+    void check_path(const std::string& rel);
+    // Whether a path the index holds is gone from this side for certain, rather than unreadable or excluded now.
+    bool provably_gone(const std::string& rel) const;
+
+    // inotify: one watch per directory the walk passes, a read standing on the descriptor, and what it said.
+    void watch_dir(const std::string& rel);
+    void arm_watch();
+    void on_watch(int64_t res);
     void pump(target& t);
-    void carry(target& t, const job& j);
-    void remove(target& t, const job& j);
-    void finished(target& t, const job& j, const socketley::storage::http_answer& a);
+    // A walk in retry_secs, whatever --every says, for what a target refused or did not answer.
+    void owe_retry();
+    // A request for `rel`'s key, signed, with `extra` among its headers and `body` held whole.
+    socketley::storage::http_request signed_request(const target& t, std::string_view method, const std::string& rel,
+                                                    std::string_view query,
+                                                    std::vector<std::pair<std::string, std::string>> extra,
+                                                    std::string body = {}) const;
+    // [off, off + len) of `fd` as the request's body.
+    void body_from(const target& t, socketley::storage::http_request& rq, const std::shared_ptr<int>& fd,
+                   uint64_t off, uint64_t len) const;
+    void carry(target& t, lane& l, const job& j);
+    void begin_upload(target& t, lane& l, const job& j, std::shared_ptr<int> fd);
+    void send_part(target& t, lane& l);
+    void complete_upload(target& t, lane& l);
+    // Gives up on the upload in progress and asks the target to drop its parts; with `why`, that is the failure.
+    void abort_upload(target& t, lane& l, const std::string& why);
+    void remove(target& t, lane& l, const job& j);
+    // What an exchange came to: a file the target now holds, or an answer that is not that.
+    void carried(target& t, lane& l, const job& j, std::string etag);
+    void refused(target& t, lane& l, const job& j, const socketley::storage::http_answer& a);
     // Whether `rel` is one of --exclude's patterns.
     bool excluded(const std::string& rel) const;
     // The key an object is written under: --prefix and the path below --dir.
     std::string key_of(const std::string& rel) const;
+    // A failure: counted, kept as the last error, and logged once per change of what it says.
     void note(const std::string& what);
+    // Something the operator should know that is no failure of the job: logged once, and not counted.
+    void say(const std::string& what);
 
     sync_instance& m_rt;
     event_loop&    m_loop;
@@ -131,6 +198,29 @@ private:
     std::chrono::steady_clock::time_point m_walk_started{};
     std::chrono::steady_clock::time_point m_last_walk{};
     std::chrono::steady_clock::time_point m_last_tick{};
+    // A walk owed after a target stopped answering, so a job with --every never still tries again.
+    std::chrono::steady_clock::time_point m_retry_at{};
+
+    int m_inotify{-1};
+    bool m_watch_armed{false};
+    // Said once: the watches ran out, so changes below the rest are seen at the next walk only.
+    bool m_watch_full{false};
+    std::unique_ptr<char[]> m_watch_buf;
+    std::unordered_map<int, std::string> m_watches;
+    // Paths inotify named, looked at once the walk in progress, if any, is over.
+    std::unordered_set<std::string> m_changed;
+    // A directory came or went, or the kernel dropped events: only a walk can say what changed.
+    bool m_rewalk{false};
+    // The last failure written to the log, so one that repeats each walk is said once.
+    std::string m_logged;
+
+    // The timeout that turns the loop when nothing else would.
+    void arm_tick(bool soon);
+    // One turn's work: the walk's next slice, what inotify named, the queues, and the walks owed.
+    void turn();
+    __kernel_timespec m_tick_ts{};
+    io_request m_tick_req{};
+    bool m_tick_armed{false};
 
     sync_stats m_stats;
     bool       m_stopped{false};

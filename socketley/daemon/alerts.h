@@ -33,6 +33,9 @@ struct facts
     std::string dir;
     // What it holds against the limit it was given, both 0 when it has none or none applies.
     uint64_t used{0}, limit{0};
+    // A sync's failures since the last thing it carried, and what it said last.
+    uint64_t failing{0};
+    std::string error;
 };
 
 struct alert

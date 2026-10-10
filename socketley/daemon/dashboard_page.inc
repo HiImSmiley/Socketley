@@ -161,7 +161,7 @@ const TYPES = {
   cache: ['cache', 'Cache', 'A key-value store that speaks Redis, persistent and sharded.'],
   storage: ['storage', 'Storage', 'S3-compatible object storage with this interface.'],
   dns: ['dns', 'DNS', 'An authoritative name server, with an entrance on 443.'],
-  sync: ['sync', 'Sync', 'Carries a directory to a storage, and back, on a schedule.']
+  sync: ['sync', 'Sync', 'Carries a directory to a storage as its files change.']
 };
 // The configuration key `show` and `import` name each flag by.
 const KEY = { '-p': 'port', '-g': 'group', '--lua': 'lua_script', '--bind': 'bind', '--listen': 'listen', '--shards': 'shards', '--domain': 'domain', '--cpus': 'cpus',

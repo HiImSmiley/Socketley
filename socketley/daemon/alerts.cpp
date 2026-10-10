@@ -149,6 +149,11 @@ void monitor::check(int64_t now, const std::vector<facts>& runtimes, const std::
             raise("failed:" + r.name, "critical", r.name, r.name + " failed", why, 1);
         }
 
+    // A sync that cannot carry what it owes, held for three readings so one refused file in passing is not news.
+    for (const facts& r : runtimes)
+        if (r.failing > 0 && !r.failed)
+            raise("sync:" + r.name, "warning", r.name, r.name + " cannot carry everything it owes", r.error, 3);
+
     // A runtime started again three times within the hour.
     for (const facts& r : runtimes)
     {

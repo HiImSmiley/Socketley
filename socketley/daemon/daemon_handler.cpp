@@ -224,7 +224,39 @@ static std::string instance_cache_persist_refusal(const runtime_instance* inst)
 // wrapper exists only so a command can refuse BEFORE storing anything.
 static std::string instance_server_mode_refusal(const runtime_instance* inst)
 {
-    return inst ? inst->config_refusal() : std::string{};
+    if (!inst)
+        return {};
+    if (std::string msg = inst->config_refusal(); !msg.empty())
+        return msg;
+    // A sync whose directory holds the storage it carries to, or lies in it, would carry each object it wrote back
+    // into the same storage, without end; the daemon is the one place that knows both directories.
+    runtime_manager* mgr = inst->get_runtime_manager();
+    if (inst->get_type() != runtime_sync || !mgr)
+        return {};
+    const auto* sy = static_cast<const sync_instance*>(inst);
+    for (const auto& entry : sy->storage_targets())
+    {
+        sync_target_spec spec;
+        std::string why;
+        if (!parse_sync_target(entry, spec, why) || spec.runtime.empty())
+            continue;
+        const runtime_instance* rt = mgr->get(spec.runtime);
+        if (!rt || rt->get_type() != runtime_storage)
+            continue;
+        // Reached by its name the storage is spoken to in plain HTTP at 127.0.0.1, which a TLS port does not answer.
+        if (rt->get_tls())
+            return "sync: " + spec.runtime + " serves TLS itself, so it is named by its URL, as in https://<its host>:" +
+                   std::to_string(rt->get_port()) + "/" + spec.bucket + "\n";
+        std::error_code ec;
+        const std::string data =
+            std::filesystem::weakly_canonical(std::string(static_cast<const storage_instance*>(rt)->get_dir()), ec)
+                .string() + "/";
+        const std::string mine = std::filesystem::weakly_canonical(std::string(sy->get_dir()), ec).string() + "/";
+        if (data.starts_with(mine) || mine.starts_with(data))
+            return "sync: --dir " + std::string(sy->get_dir()) + " and the directory of " + spec.runtime +
+                   " lie one in the other, so every object carried would be carried again\n";
+    }
+    return {};
 }
 
 // Who is on the other end of this connection, or 0 when the socket cannot say.
@@ -2151,10 +2183,15 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
         // Nothing is held on this side any more, because remove() hands the
         // runtime to the manager's graveyard -- and the list that used to hold
         // it here was emptied by a timeout whose answer nobody read.
+        // Its index describes objects nobody answers for any more, and a job made again under the name starts empty.
+        const auto* gone = m_manager.get(n);
+        const bool sync_job = gone && gone->get_type() == runtime_sync;
         if (m_manager.remove(n))
         {
             if (m_persistence)
                 m_persistence->remove_runtime(n);
+            if (sync_job && ::unlink(sync_index_path(n).c_str()) != 0 && errno != ENOENT)
+                LOG_WARN(("sync " + n + ": its index was not removed: " + std::strerror(errno)).c_str());
         }
     }
 
@@ -4214,6 +4251,10 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         // Re-fetch instance under new name
         instance = m_manager.get(cfg.name);
         renamed = true;
+        // What a sync carried goes with its name, or the renamed job would carry its whole directory again.
+        if (instance && instance->get_type() == runtime_sync &&
+            ::rename(sync_index_path(old_name).c_str(), sync_index_path(cfg.name).c_str()) != 0 && errno != ENOENT)
+            LOG_WARN(("sync " + cfg.name + ": its index stayed under " + old_name + ": " + std::strerror(errno)).c_str());
     }
 
     // ─── Changes that need a restart ────────────────────────────────────────

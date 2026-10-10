@@ -1,26 +1,66 @@
 #include "sync_instance.h"
 #include "sync_run.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <sstream>
 #include <sys/stat.h>
 
 #include "../../shared/logging.h"
+#include "../../shared/paths.h"
+#include "../../shared/runtime_name.h"
+#include "../storage/outbound_http.h"
+#include "../storage/s3_names.h"
 
-namespace
+std::string sync_index_path(std::string_view runtime_name)
 {
-
-// A target is `runtime/bucket` or `scheme://host[:port]/bucket`, with the bucket last in both.
-bool target_bucket(std::string_view t, std::string_view& bucket)
-{
-    const size_t slash = t.rfind('/');
-    if (slash == std::string_view::npos || slash + 1 >= t.size())
-        return false;
-    bucket = t.substr(slash + 1);
-    return !bucket.empty() && bucket.find("://") == std::string_view::npos;
+    return (socketley_paths::resolve().state_dir / "sync" / (std::string(runtime_name) + ".index")).string();
 }
 
-}   // namespace
+bool parse_sync_target(std::string_view entry, sync_target_spec& out, std::string& why)
+{
+    out = sync_target_spec{};
+    out.name.assign(entry);
+    const size_t slash = entry.rfind('/');
+    const std::string_view where = slash == std::string_view::npos ? std::string_view{} : entry.substr(0, slash);
+    const std::string_view bucket = slash == std::string_view::npos ? std::string_view{} : entry.substr(slash + 1);
+    const std::string example = " -- as in ui/photos, 10.0.0.5:9000/photos or https://files.example/photos";
+    if (where.empty() || bucket.empty() || where.ends_with(":/") || where.ends_with("://"))
+    {
+        why = "'" + out.name + "' names no bucket" + example;
+        return false;
+    }
+    if (!socketley::storage::valid_bucket_name(bucket))
+    {
+        why = "'" + std::string(bucket) + "' is not a bucket name: 3 to 63 of a-z, 0-9, '.' and '-'";
+        return false;
+    }
+    out.bucket.assign(bucket);
+    if (where.find("://") != std::string_view::npos || where.find(':') != std::string_view::npos)
+    {
+        out.url = where.find("://") == std::string_view::npos ? "http://" + std::string(where) : std::string(where);
+        socketley::storage::http_target t;
+        if (!socketley::storage::parse_http_url(out.url, t, why))
+        {
+            why = "'" + out.name + "': " + why;
+            return false;
+        }
+        // The bucket is the whole of the path: a host serving its buckets below a path of its own signs another one.
+        if (!t.path.empty() && t.path != "/")
+        {
+            why = "'" + out.name + "' has a path between the host and the bucket, which is not taken" + example;
+            return false;
+        }
+        return true;
+    }
+    if (!socketley::valid_runtime_name(where))
+    {
+        why = "'" + std::string(where) + "' is neither a runtime's name nor an address" + example;
+        return false;
+    }
+    out.runtime.assign(where);
+    return true;
+}
 
 bool parse_sync_runtime_mode(std::string_view s, sync_mode& out)
 {
@@ -49,6 +89,16 @@ const char* sync_mode_name(sync_mode m)
 sync_instance::sync_instance(std::string_view name) : runtime_instance(runtime_sync, name) {}
 
 sync_instance::~sync_instance() = default;
+
+void sync_instance::set_dir(std::string_view path)
+{
+    // One spelling per directory: a trailing slash or a `.` would shift every path cut from it and change the scope
+    // its index is kept for.
+    std::string d = std::filesystem::path(path).lexically_normal().string();
+    while (d.size() > 1 && d.back() == '/')
+        d.pop_back();
+    m_dir = std::move(d);
+}
 
 std::vector<std::string> sync_instance::storage_targets() const
 {
@@ -95,10 +145,12 @@ std::string sync_instance::config_refusal() const
         return "sync: --storage is required: a storage runtime's name and a bucket (ui/photos), or a URL with one\n";
     for (const auto& t : targets)
     {
-        std::string_view bucket;
-        if (!target_bucket(t, bucket))
-            return "sync: --storage takes a bucket after the runtime or the URL, as in ui/photos or "
-                   "https://storage.example/photos, not '" + t + "'\n";
+        sync_target_spec spec;
+        std::string why;
+        if (!parse_sync_target(t, spec, why))
+            return "sync: --storage " + why + "\n";
+        if (std::count(targets.begin(), targets.end(), t) > 1)
+            return "sync: --storage names " + t + " twice\n";
     }
     // Two sources writing one directory cannot say which of them a file came from, so only the carrying out of one
     // directory may name more than one target.
@@ -106,7 +158,7 @@ std::string sync_instance::config_refusal() const
         return "sync: --storage takes one target unless --mode is out: carrying two of them into one directory "
                "cannot say which a file came from when they differ\n";
     if (m_credentials.empty())
-        return "sync: --token or --credentials is required: a sync signs every request it makes\n";
+        return "sync: --credentials is required: a sync signs every request it makes\n";
     if (::access(m_credentials.c_str(), R_OK) != 0)
         return "sync: the credentials file " + m_credentials + " cannot be read\n";
     if (m_mode != sync_mode_out)
@@ -140,12 +192,17 @@ bool sync_instance::setup(event_loop& loop)
 void sync_instance::teardown(event_loop&)
 {
     if (m_run)
+    {
         m_run->stop();
-    m_run.reset();
+        // Kept until the ring owes it nothing, since a cancelled exchange still completes into it.
+        m_graveyard.push_back(std::move(m_run));
+    }
 }
 
 void sync_instance::on_loop_turn()
 {
+    if (!m_graveyard.empty())
+        std::erase_if(m_graveyard, [](const auto& r) { return r->drained(); });
     if (m_run)
         m_run->on_loop_turn();
 }
@@ -164,6 +221,8 @@ std::string sync_instance::stats_lines() const
         << "bytes_carried:" << s.bytes_carried << "\n"
         << "waiting:" << s.waiting << "\n"
         << "failures:" << s.failures << "\n"
+        << "failing:" << s.failing << "\n"
+        << "watched:" << s.watched << "\n"
         << "last_run_secs:" << s.last_run_secs << "\n"
         << "last_error:" << s.last_error << "\n";
     return out.str();

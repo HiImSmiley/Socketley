@@ -1034,6 +1034,17 @@ void metrics_endpoint::sample()
                 row.get("bytes", a.used);
                 row.get("max_bytes", a.limit);
             }
+            // Only a running sync owes anything: a stopped one keeps the figures it stopped with.
+            else if (rt->get_type() == runtime_sync && rt->get_state() == runtime_running)
+            {
+                row.get("failing", a.failing);
+                const std::string detail = rt->stat_detail_snapshot();
+                if (const size_t at = detail.find("\nlast_error:"); at != std::string::npos)
+                {
+                    const size_t from = at + 12;
+                    a.error = detail.substr(from, detail.find('\n', from) - from);
+                }
+            }
             else if (uint64_t ev = 1; rt->get_type() == runtime_cache && row.get("eviction", ev) && ev == 0)
             {
                 row.get("memory_used", a.used);

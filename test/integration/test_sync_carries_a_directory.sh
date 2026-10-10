@@ -80,7 +80,7 @@ expect "a sync with no --dir is refused" \
 expect "with no --storage" \
     "$("$BIN" create sync bad --dir "$T/src" --credentials "$T/creds" 2>&1 | grep -c -- '--storage')" 1
 expect "with no credentials" \
-    "$("$BIN" create sync bad --dir "$T/src" --storage "box/photos" 2>&1 | grep -c -- '--token or --credentials')" 1
+    "$("$BIN" create sync bad --dir "$T/src" --storage "box/photos" 2>&1 | grep -c -- '--credentials is required')" 1
 expect "a --storage with no bucket" \
     "$("$BIN" create sync bad --dir "$T/src" --storage "box" --credentials "$T/creds" 2>&1 | grep -c 'bucket')" 1
 expect "and a mode that is not carried yet, when it is made rather than at its first start" \
