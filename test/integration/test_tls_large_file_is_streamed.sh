@@ -155,11 +155,14 @@ SMALL_ADDED=$(peak_added_during curl -sk --max-time 120 "https://127.0.0.1:$((P+
 SAMPLE_PID=$WORKER
 # A difference and not a ratio: the smaller file can add nothing measurable at all
 # -- it did, 0 kB -- and a ratio against zero says nothing.  What the claim
-# actually is: the extra 28 MiB of file must not cost 28 MiB of memory.
+# actually is: the extra 28 MiB of file must not cost 28 MiB of memory.  Half of
+# it is the allowance: a streaming worker's peak varied from 3.1 to 9.7 MB over
+# twenty runs of two builds, and a quarter of it (7 MB) failed one run in ten of
+# each, where a build that holds the body spends 28 MB and more.
 EXTRA=$(awk -v a="${SMALL_ADDED:-0}" -v b="${ONE:-0}" 'BEGIN{d=b-a; print (d>0?d:0)}')
-ALLOW=$(awk -v s="$SIZE" -v m="$SMALL" 'BEGIN{printf "%d", (s-m)/1024*0.25}')
+ALLOW=$(awk -v s="$SIZE" -v m="$SMALL" 'BEGIN{printf "%d", (s-m)/1024*0.5}')
 if cmp -s "$WWW/small.bin" "$WORK/gots" && [ "$EXTRA" -lt "$ALLOW" ]; then
-    echo "  eight times the file cost ${EXTRA} kB more (a quarter of the extra file is ${ALLOW} kB)"
+    echo "  eight times the file cost ${EXTRA} kB more (half the extra file is ${ALLOW} kB)"
     pass
 else fail "eight times the file does not cost eight times the memory" \
           "4 MiB added ${SMALL_ADDED} kB, 32 MiB added $ONE kB: $EXTRA kB more for 28 MiB more file," \
