@@ -992,7 +992,11 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         source.remove_prefix(7);
         const size_t s2 = source.find('/');
         const std::string_view rel = s2 == std::string_view::npos ? std::string_view{} : source.substr(s2 + 1);
-        if (!share_target(c, source.substr(0, s2), rel, w.bucket, w.key))
+        std::string_view id = source.substr(0, s2);
+        // A link's web copy is also <id>.mp4, since a chat embeds a player only for a URL that ends so.
+        if (w.kind == k_web && rel.empty() && id.ends_with(".mp4"))
+            id.remove_suffix(4);
+        if (!share_target(c, id, rel, w.bucket, w.key))
             return;
     }
     else
@@ -1059,7 +1063,7 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         w.object = w.bucket + '\n' + w.key + '\n' + etag;
         w.version = etag.substr(0, 16);
         // The web copy's name changed with its bitrate cap, so one made before is made again.
-        w.dir = media_dir + "/" + sha256_hex((w.variant == "web" ? std::string("web2") : w.variant) + '\n' + w.object);
+        w.dir = media_dir + "/" + sha256_hex((w.variant == "web" ? std::string("web4") : w.variant) + '\n' + w.object);
         // The second probe's, which also holds chapters; the first's are left for eviction.
         w.probe_dir = media_dir + "/" + sha256_hex("probe2\n" + w.object);
         w.asked_ms = now_ms();
@@ -1314,7 +1318,7 @@ void storage_run::media_known(const std::string& bucket, const std::string& key,
     const std::string media_dir = m_store.options().dir + "/.media";
     const std::string object = bucket + '\n' + key + '\n' + etag;
     probe = media_probe_of(media_dir + "/" + sha256_hex("probe2\n" + object));
-    const std::string web = media_dir + "/" + sha256_hex("web2\n" + object);
+    const std::string web = media_dir + "/" + sha256_hex("web4\n" + object);
     struct stat sb{};
     web_made = m_media_done.contains(web) || ::stat((web + "/done").c_str(), &sb) == 0;
 }
@@ -1765,10 +1769,17 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             clear_dir(w.dir, true);
             args.insert(args.end(), input.begin(), input.end());
             args.insert(args.end(), {"-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"});
-            // A picture every browser and chat plays is copied, unless it is denser than a chat embeds; anything else
-            // is made H.264 of at most 1080 lines and 5 Mbit/s.
-            const bool plays = p.vcodec == "h264" && !p.hdr() && p.height <= 1080 &&
-                               (p.bitrate == 0 || p.bitrate <= 8000000) &&
+            // What a chat embeds is at most 50 MiB, so the copy is held to 46: the film is made as well as it looks
+            // at a bitrate that fits, at most 12 Mbit/s, of as many lines as that bitrate carries well.
+            constexpr double fits = 46.0 * 1024 * 1024 * 8;
+            int64_t rate = 12000000;
+            if (p.duration > 0)
+                rate = std::clamp<int64_t>(static_cast<int64_t>(fits / p.duration) - 192000, 600000, rate);
+            const int64_t lines = rate >= 8000000 ? 1440 : rate >= 2500000 ? 1080 : 720;
+            // A picture every browser and chat plays is copied when it fits as it is; anything else is made H.264.
+            const bool plays = p.vcodec == "h264" && !p.hdr() && p.height <= lines &&
+                               (p.bitrate == 0 || p.bitrate <= 12000000) &&
+                               (p.duration <= 0 || p.bitrate == 0 || static_cast<double>(p.bitrate) * p.duration <= fits) &&
                                (p.vprofile.empty() || p.vprofile == "High" || p.vprofile == "Main" ||
                                 p.vprofile == "Constrained Baseline" || p.vprofile == "Baseline");
             if (plays)
@@ -1776,15 +1787,16 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             else
             {
                 int64_t width = 0, height = 0;
-                fitted(p, 1080, width, height);
+                fitted(p, lines, width, height);
                 std::string vf = "scale=" + std::to_string(width) + ":" + std::to_string(height);
                 if (p.hdr())
                     vf += ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
                           "zscale=t=bt709:m=bt709:r=tv";
                 vf += ",format=yuv420p";
-                args.insert(args.end(), {"-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                                         "-maxrate", "5M", "-bufsize", "10M", "-profile:v", "high", "-threads",
-                                         threads});
+                // Close to the original where the picture is easy, and held under the bitrate where it is not.
+                args.insert(args.end(), {"-vf", vf, "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+                                         "-maxrate", std::to_string(rate), "-bufsize", std::to_string(rate * 2),
+                                         "-profile:v", "high", "-threads", threads});
             }
             if (!p.audio)
                 args.push_back("-an");

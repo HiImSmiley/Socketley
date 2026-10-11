@@ -327,7 +327,7 @@ bool wants_page(const s3_request& r)
 
 // A film's link as a page that plays it, with the Open Graph a chat embeds a player by.
 std::string film_page(std::string_view name, const object_meta* m, std::string_view page_url, std::string_view video_url,
-                      std::string_view poster_url, std::string_view prepare_url, int64_t width, int64_t height, bool https)
+                      std::string_view chat_url, std::string_view poster_url, std::string_view prepare_url, int64_t width, int64_t height)
 {
     auto meta = [](std::string& h, std::string_view attr, std::string_view k, std::string_view v)
     {
@@ -343,22 +343,21 @@ std::string film_page(std::string_view name, const object_meta* m, std::string_v
                     "content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>";
     xml_escape_to(h, name);
     h += "</title>";
-    meta(h, "property", "og:site_name", "socketley");
-    meta(h, "property", "og:type", "video.other");
+    // What Discord embeds a player by, and no more: the still it shows first, so it need not make one of a large
+    // film in the time it gives a link, and a URL ending in .mp4, which it takes for a video it may play.
     meta(h, "property", "og:title", name);
     meta(h, "property", "og:url", page_url);
     meta(h, "property", "og:image", poster_url);
-    meta(h, "property", "og:video", video_url);
-    meta(h, "property", "og:video:url", video_url);
-    if (https)
-        meta(h, "property", "og:video:secure_url", video_url);
-    meta(h, "property", "og:video:type", "video/mp4");
-    meta(h, "property", "og:video:width", std::to_string(width));
-    meta(h, "property", "og:video:height", std::to_string(height));
-    meta(h, "name", "twitter:card", "player");
-    meta(h, "name", "twitter:image", poster_url);
-    meta(h, "name", "twitter:player:stream", video_url);
-    meta(h, "name", "twitter:player:stream:content_type", "video/mp4");
+    if (!chat_url.empty())
+    {
+        meta(h, "property", "og:type", "video.other");
+        meta(h, "property", "og:video:url", chat_url);
+        meta(h, "property", "og:video:width", std::to_string(width));
+        meta(h, "property", "og:video:height", std::to_string(height));
+        meta(h, "name", "twitter:card", "player");
+    }
+    else
+        meta(h, "name", "twitter:card", "summary_large_image");
     meta(h, "name", "theme-color", "#a855f7");
     h += "<style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:"
          "center;padding:16px;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#f1f0ff;background:"
@@ -637,8 +636,8 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
         !r.has_query("raw") && film_name(last_name_of(key)) && wants_page(r))
     {
         const std::string base = (secure(*c) ? "https://" : "http://") + std::string(r.header("host"));
-        m_store.stat_object(s.bucket, key, [this, weak = std::weak_ptr<conn>(c), s, key, id, base,
-                                            https = secure(*c)](st found, const object_meta& m)
+        m_store.stat_object(s.bucket, key, [this, weak = std::weak_ptr<conn>(c), s, key, id, base](st found,
+                                                                                                const object_meta& m)
         {
             auto cc = weak.lock();
             if (!cc || cc->dead)
@@ -656,14 +655,16 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
             // then the file itself, which plays wherever it is H.264 in an MP4.
             const std::string web = base + "/~media/web/~share/" + id;
             const std::string video = web_made ? web : page + "?raw";
+            // A chat is given only the web copy, as <id>.mp4: until it is made a chat shows the still alone.
+            const std::string chat = web_made ? web + ".mp4" : std::string();
             int64_t width = p && p->width > 0 ? p->width : 1280, height = p && p->height > 0 ? p->height : 720;
-            if (height > 1080)
+            if (height > 1440)
             {
-                width = width * 1080 / height;
-                height = 1080;
+                width = width * 1440 / height;
+                height = 1440;
             }
-            app_reply(cc, 200, film_page(last_name_of(key), &m, page, video, base + "/~media/thumb-1280/~share/" + id,
-                                         web_made ? std::string() : web + "?prepare", width, height, https),
+            app_reply(cc, 200, film_page(last_name_of(key), &m, page, video, chat, base + "/~media/thumb-1280/~share/" + id,
+                                         web_made ? std::string() : web + "?prepare", width, height),
                       "text/html; charset=utf-8");
         });
         return;
