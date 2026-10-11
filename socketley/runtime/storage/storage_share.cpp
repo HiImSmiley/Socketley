@@ -318,18 +318,11 @@ bool film_name(std::string_view name)
     return false;
 }
 
-// A browser opening a link, or a chat reading it for its preview: they get a page; a player, curl or a script the
-// file.
+// Whether a film's link answers with its page, which is always but for a player reading by range, since a chat's
+// preview comes by HEAD or GET under names that change and embeds nothing when it is told the film itself.
 bool wants_page(const s3_request& r)
 {
-    if (r.header("accept").find("text/html") != std::string_view::npos)
-        return true;
-    const std::string_view ua = r.header("user-agent");
-    for (std::string_view bot : {"Discordbot", "Twitterbot", "facebookexternalhit", "Slackbot", "TelegramBot",
-                                 "WhatsApp", "Mastodon", "LinkedInBot", "SkypeUriPreview", "Iframely", "Embedly"})
-        if (ua.find(bot) != std::string_view::npos)
-            return true;
-    return false;
+    return r.header("range").empty();
 }
 
 // A film's link as a page that plays it, with the Open Graph a chat embeds a player by.
@@ -640,8 +633,8 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
         return;
     }
     // A film's link opens, for a browser or a chat's preview, on a page that plays it; ?raw is the file itself.
-    if (!s.folder && !s.burn && r.method == "GET" && !r.has_query("download") && !r.has_query("raw") &&
-        film_name(last_name_of(key)) && wants_page(r))
+    if (!s.folder && !s.burn && (r.method == "GET" || r.method == "HEAD") && !r.has_query("download") &&
+        !r.has_query("raw") && film_name(last_name_of(key)) && wants_page(r))
     {
         const std::string base = (secure(*c) ? "https://" : "http://") + std::string(r.header("host"));
         m_store.stat_object(s.bucket, key, [this, weak = std::weak_ptr<conn>(c), s, key, id, base,

@@ -1058,7 +1058,8 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
         w.image = m.content_type.str().starts_with("image/");
         w.object = w.bucket + '\n' + w.key + '\n' + etag;
         w.version = etag.substr(0, 16);
-        w.dir = media_dir + "/" + sha256_hex(w.variant + '\n' + w.object);
+        // The web copy's name changed with its bitrate cap, so one made before is made again.
+        w.dir = media_dir + "/" + sha256_hex((w.variant == "web" ? std::string("web2") : w.variant) + '\n' + w.object);
         // The second probe's, which also holds chapters; the first's are left for eviction.
         w.probe_dir = media_dir + "/" + sha256_hex("probe2\n" + w.object);
         w.asked_ms = now_ms();
@@ -1313,7 +1314,7 @@ void storage_run::media_known(const std::string& bucket, const std::string& key,
     const std::string media_dir = m_store.options().dir + "/.media";
     const std::string object = bucket + '\n' + key + '\n' + etag;
     probe = media_probe_of(media_dir + "/" + sha256_hex("probe2\n" + object));
-    const std::string web = media_dir + "/" + sha256_hex("web\n" + object);
+    const std::string web = media_dir + "/" + sha256_hex("web2\n" + object);
     struct stat sb{};
     web_made = m_media_done.contains(web) || ::stat((web + "/done").c_str(), &sb) == 0;
 }
@@ -1764,8 +1765,10 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             clear_dir(w.dir, true);
             args.insert(args.end(), input.begin(), input.end());
             args.insert(args.end(), {"-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"});
-            // A picture every browser and chat plays is copied; anything else is made H.264 of at most 1080 lines.
-            const bool plays = p.vcodec == "h264" && !p.hdr() &&
+            // A picture every browser and chat plays is copied, unless it is denser than a chat embeds; anything else
+            // is made H.264 of at most 1080 lines and 5 Mbit/s.
+            const bool plays = p.vcodec == "h264" && !p.hdr() && p.height <= 1080 &&
+                               (p.bitrate == 0 || p.bitrate <= 8000000) &&
                                (p.vprofile.empty() || p.vprofile == "High" || p.vprofile == "Main" ||
                                 p.vprofile == "Constrained Baseline" || p.vprofile == "Baseline");
             if (plays)
@@ -1780,7 +1783,8 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
                           "zscale=t=bt709:m=bt709:r=tv";
                 vf += ",format=yuv420p";
                 args.insert(args.end(), {"-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                                         "-profile:v", "high", "-threads", threads});
+                                         "-maxrate", "5M", "-bufsize", "10M", "-profile:v", "high", "-threads",
+                                         threads});
             }
             if (!p.audio)
                 args.push_back("-an");

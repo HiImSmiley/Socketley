@@ -3,8 +3,9 @@
 #
 # A chat embeds a player for a link whose page carries og:video, pointing at an
 # MP4 it can play.  The link of a film now answers a browser and a chat's preview
-# with that page, and anything else -- a player, curl, a script -- with the file
-# as before; a film no browser plays as it is gets a web copy, H.264 and AAC with
+# with that page, as it does anything else but a player reading by range: a chat
+# asks by HEAD and under names that change, and told the film it embeds nothing.
+# ?raw and ?download are the file; a film no browser plays as it is gets a web copy, H.264 and AAC with
 # its index in front, made once and then named by the page.
 set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -68,7 +69,11 @@ check "of the film's size" "$(og og:video:width <<<"$PAGE")x$(og og:video:height
 check "with its still as the picture" "$(og og:image <<<"$PAGE")" "$U/~media/thumb-1280/~share/${L1#/~share/}"
 check "a chat's preview gets the page too" \
       "$(curl -s -A 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)' "$U$L1" | grep -c 'og:video')" 1
-check "curl gets the file, as before" "$(curl -s "$U$L1" | cmp -s - "$T/clip.mp4" && echo same)" same
+# Discord asks by HEAD, and as an old Firefox accepting anything; told the film itself it embeds nothing.
+check "so does a HEAD, which a chat asks first" "$(curl -s -I -o /dev/null -w '%{content_type}' "$U$L1")" "text/html; charset=utf-8"
+check "and anything that is no player reading by range" \
+      "$(curl -s -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:38.0) Gecko/20100101 Firefox/38.0' -H 'Accept: */*' "$U$L1" | grep -c 'og:video\"')" 1
+check "?download is the file" "$(curl -s "$U$L1?download" | cmp -s - "$T/clip.mp4" && echo same)" same
 check "and ?raw is the file for a browser too" "$(curl -s -H 'Accept: text/html' "$U$L1?raw" | cmp -s - "$T/clip.mp4" && echo same)" same
 check "which a player reads by range" "$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -r 0-99 "$U$L1?raw")" "206 100"
 check "the still is there without a sign-in" "$(curl -s -o /dev/null -w '%{http_code}' "$U/~media/thumb-1280/~share/${L1#/~share/}")" 200
@@ -100,6 +105,7 @@ printf 'hello\n' > "$T/note.txt"
 curl -s -u "$A" -T "$T/note.txt" "$U/~dav/films/note.txt" >/dev/null
 L3=$(link note.txt)
 check "a link of anything else is the file for a browser too" "$(curl -s -H 'Accept: text/html' "$U$L3")" "hello"
+check "and for anything else" "$(curl -s "$U$L3")" "hello"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] || exit 1
