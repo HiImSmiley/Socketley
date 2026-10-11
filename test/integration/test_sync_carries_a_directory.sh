@@ -21,8 +21,6 @@
 #     counting and saying so
 #   * a --storage naming a runtime of this daemon not reaching it, which needs
 #     the port out of the map the daemon sends the worker and not a guess
-#   * a mode that is not carried yet accepted at create and failing at start,
-#     where the operator does not see the reason
 #   * the index world-readable, or kept somewhere other than the state dir
 set -uo pipefail
 
@@ -83,8 +81,6 @@ expect "with no credentials" \
     "$("$BIN" create sync bad --dir "$T/src" --storage "box/photos" 2>&1 | grep -c -- '--credentials is required')" 1
 expect "a --storage with no bucket" \
     "$("$BIN" create sync bad --dir "$T/src" --storage "box" --credentials "$T/creds" 2>&1 | grep -c 'bucket')" 1
-expect "and a mode that is not carried yet, when it is made rather than at its first start" \
-    "$("$BIN" create sync bad --dir "$T/src" --storage "box/photos" --credentials "$T/creds" --mode in 2>&1 | grep -c 'not carried yet')" 1
 expect "a port, since it listens on nothing" \
     "$("$BIN" create sync bad -p 1234 --dir "$T/src" --storage "box/photos" --credentials "$T/creds" 2>&1 | grep -c -- '-p')" 1
 expect "and --shards, which would write one index from several processes" \

@@ -161,9 +161,6 @@ std::string sync_instance::config_refusal() const
         return "sync: --credentials is required: a sync signs every request it makes\n";
     if (::access(m_credentials.c_str(), R_OK) != 0)
         return "sync: the credentials file " + m_credentials + " cannot be read\n";
-    if (m_mode != sync_mode_out)
-        return "sync: --mode " + std::string(sync_mode_name(m_mode)) +
-               " is not carried yet; only out is, which sends --dir to --storage\n";
     if (!get_listen_path().empty())
         return "sync: --listen unix: is not served; a sync listens on nothing\n";
     if (get_port() != 0)
@@ -223,6 +220,9 @@ std::string sync_instance::stats_lines() const
         << "failures:" << s.failures << "\n"
         << "failing:" << s.failing << "\n"
         << "watched:" << s.watched << "\n"
+        << "brought:" << s.brought << "\n"
+        << "removed_here:" << s.removed_here << "\n"
+        << "conflicts:" << s.conflicts << "\n"
         << "last_run_secs:" << s.last_run_secs << "\n"
         << "last_error:" << s.last_error << "\n";
     return out.str();

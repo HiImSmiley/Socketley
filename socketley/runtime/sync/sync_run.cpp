@@ -47,6 +47,12 @@ constexpr uint64_t part_size = 64ull << 20;
 constexpr int lanes_per_target = 8;
 // How long after a target stopped answering the directory is walked again for it.
 constexpr int retry_secs = 30;
+// A file is brought from the storage in ranges this large, so one that is cut off costs only its last range.
+constexpr uint64_t fetch_range_bytes = 8ull << 20;
+// How often the storage is listed when --every says nothing.
+constexpr int default_pull_secs = 60;
+// Where a file brought from the storage is written until it is whole, below --dir so the rename is atomic.
+constexpr const char* temp_dir = ".socketley-sync";
 // One read of inotify takes this much: some hundred events, more than a burst of saves makes.
 constexpr uint32_t watch_buf_size = 64 * 1024;
 // A file is looked at once it is written and closed, moved in, touched or removed; one merely created is still being
@@ -80,6 +86,64 @@ std::string xml_text(std::string_view xml, std::string_view name)
     for (size_t q; (q = out.find("&quot;")) != std::string::npos;)
         out.replace(q, 6, "\"");
     return out;
+}
+
+// Every <name> element of `xml` in order, its text as xml_text would give it.
+std::vector<std::string_view> xml_blocks(std::string_view xml, std::string_view name)
+{
+    const std::string open = "<" + std::string(name) + ">", close = "</" + std::string(name) + ">";
+    std::vector<std::string_view> out;
+    for (size_t at = 0;;)
+    {
+        const size_t a = xml.find(open, at);
+        if (a == std::string_view::npos)
+            return out;
+        const size_t b = xml.find(close, a + open.size());
+        if (b == std::string_view::npos)
+            return out;
+        out.push_back(xml.substr(a + open.size(), b - a - open.size()));
+        at = b + close.size();
+    }
+}
+
+// The five entities XML escapes text with, written back as the characters they stand for.
+std::string xml_unescape(std::string s)
+{
+    static constexpr std::pair<std::string_view, char> ents[] = {
+        {"&lt;", '<'}, {"&gt;", '>'}, {"&quot;", '"'}, {"&apos;", '\''}, {"&amp;", '&'}};
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();)
+    {
+        bool hit = false;
+        if (s[i] == '&')
+            for (const auto& [e, c] : ents)
+                if (std::string_view(s).substr(i, e.size()) == e)
+                {
+                    out += c;
+                    i += e.size();
+                    hit = true;
+                    break;
+                }
+        if (!hit)
+            out += s[i++];
+    }
+    return out;
+}
+
+// An ETag as its value, without the quotes one side writes and another may not.
+std::string_view bare_etag(std::string_view e)
+{
+    while (!e.empty() && e.front() == '"')
+        e.remove_prefix(1);
+    while (!e.empty() && e.back() == '"')
+        e.remove_suffix(1);
+    return e;
+}
+
+int64_t mtime_of(const struct stat& st)
+{
+    return int64_t(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
 }
 
 // Every segment of a key encoded as S3 signs it, the separators kept.
@@ -286,6 +350,10 @@ bool sync_run::start(std::string& why)
         p = comma + 1;
     }
 
+    // What is being brought from the storage is no file of this side's until it is whole.
+    if (pulls())
+        m_exclude.emplace_back(temp_dir);
+
     m_stats.indexed = m_index.size();
     // A host given by name is resolved on the pool's thread, whose answers wake this loop only once it is attached.
     if (!m_resolver.attach(m_io))
@@ -300,8 +368,14 @@ bool sync_run::start(std::string& why)
     else
         m_watch_buf = std::make_unique<char[]>(watch_buf_size);
 
-    begin_walk();
-    arm_watch();
+    // Both ways, the storage is listed first: a file here the index does not know is then told from the storage's
+    // copy of it before either is carried over the other.
+    if (pulls())
+        m_pull_due = true;
+    else
+        begin_walk();
+    if (pushes())
+        arm_watch();
     arm_tick(true);
     return true;
 }
@@ -311,7 +385,11 @@ void sync_run::stop()
     m_stopped = true;
     for (auto& t : m_targets)
         for (auto& l : t.lanes)
+        {
             l->peer->stop();
+            if (l->get)
+                fetch_end(t, *l, false);
+        }
     m_iter.reset();
     m_walking = false;
     m_index.flush();
@@ -413,7 +491,7 @@ void sync_run::note(const std::string& what)
 
 void sync_run::begin_walk()
 {
-    if (m_stopped || m_walking)
+    if (m_stopped || m_walking || !pushes())
         return;
     m_rewalk = false;
     std::error_code ec;
@@ -809,10 +887,13 @@ void sync_run::carry(target& t, lane& l, const job& j)
         begin_upload(t, l, now, fd);
         return;
     }
-    http_request rq = signed_request(t, "PUT", now.path, {},
-                                     {{"content-length", std::to_string(now.size)},
-                                      // The time the file had here, so a job carried back out later knows it.
-                                      {"x-amz-meta-mtime", std::to_string(now.mtime_ns)}});
+    std::vector<std::pair<std::string, std::string>> headers = {
+        {"content-length", std::to_string(now.size)},
+        // The time the file had here, so a job carried back out later knows it.
+        {"x-amz-meta-mtime", std::to_string(now.mtime_ns)}};
+    if (const auto c = condition(t, now.path); !c.first.empty())
+        headers.push_back(c);
+    http_request rq = signed_request(t, "PUT", now.path, {}, std::move(headers));
     body_from(t, rq, fd, 0, now.size);
     l.peer->exchange(std::move(rq), [this, &t, &l, now, fd](http_answer a) {
         if (a.status / 100 == 2)
@@ -895,8 +976,11 @@ void sync_run::complete_upload(target& t, lane& l)
     socketley::storage::url_encode_to(query, up.id, false);
     // The length taken before the body is moved into the call, whose arguments may be read in any order.
     const std::string length = std::to_string(xml.size());
-    http_request rq = signed_request(t, "POST", up.j.path, query,
-                                     {{"content-length", length}, {"content-type", "application/xml"}}, std::move(xml));
+    std::vector<std::pair<std::string, std::string>> headers = {{"content-length", length},
+                                                                {"content-type", "application/xml"}};
+    if (const auto c = condition(t, up.j.path); !c.first.empty())
+        headers.push_back(c);
+    http_request rq = signed_request(t, "POST", up.j.path, query, std::move(headers), std::move(xml));
     l.peer->exchange(std::move(rq), [this, &t, &l](http_answer a) {
         if (!l.mpu)
             return;
@@ -937,7 +1021,10 @@ void sync_run::abort_upload(target& t, lane& l, const std::string& why)
 
 void sync_run::remove(target& t, lane& l, const job& j)
 {
-    l.peer->exchange(signed_request(t, "DELETE", j.path, {}, {}), [this, &t, &l, j](http_answer a) {
+    std::vector<std::pair<std::string, std::string>> headers;
+    if (const auto c = condition(t, j.path); c.first == "if-match")
+        headers.push_back(c);
+    l.peer->exchange(signed_request(t, "DELETE", j.path, {}, std::move(headers)), [this, &t, &l, j](http_answer a) {
         l.busy = false;
         std::string why;
         // A key the storage no longer has is the state this job wanted anyway.
@@ -973,6 +1060,12 @@ void sync_run::carried(target& t, lane& l, const job& j, std::string etag)
 void sync_run::refused(target& t, lane& l, const job& j, const http_answer& a)
 {
     l.busy = false;
+    // Changed on the storage since this side last saw it: the listing owed now decides, and keeps both if need be.
+    if (pulls() && a.status == 412)
+    {
+        m_pull_due = true;
+        return;
+    }
     if (a.status == 0)
     {
         note(t.name + ": " + (a.failure.empty() ? "no answer" : a.failure));
@@ -1031,7 +1124,7 @@ void sync_run::on_loop_turn()
     if (m_stopped)
         return;
     turn();
-    uint64_t pending = m_walking || m_rewalk || !m_changed.empty() ? 1 : 0;
+    uint64_t pending = m_walking || m_rewalk || !m_changed.empty() || !m_fetches.empty() ? 1 : 0;
     for (const auto& t : m_targets)
         if (!t.queue.empty())
             for (const auto& l : t.lanes)
@@ -1053,8 +1146,9 @@ void sync_run::turn()
     if (m_walking && walk_slice())
         end_walk();
 
-    // What inotify named is looked at once no walk is under way, since a walk ahead of it may yet see it too.
-    if (!m_walking)
+    // What inotify named is looked at once no walk is under way, since a walk ahead of it may yet see it too, and
+    // no listing, which what it carried would race.
+    if (!m_walking && !m_pulling)
     {
         if (m_rewalk)
         {
@@ -1072,7 +1166,10 @@ void sync_run::turn()
     uint64_t waiting = 0;
     for (auto& t : m_targets)
     {
-        pump(t);
+        if (m_pulling)
+            pump_fetch(t);
+        else
+            pump(t);
         // A target with no address yet keeps nothing queued: the walk owed once it has one finds it all again, and
         // a queue that could not shrink held up every target's walks and grew by a whole walk each time.
         if (t.lanes.empty())
@@ -1089,19 +1186,493 @@ void sync_run::turn()
             ? uint64_t(std::chrono::duration_cast<std::chrono::seconds>(now - m_last_walk).count())
             : 0;
 
-    if (m_walking || waiting != 0)
+    if (m_walking || waiting != 0 || m_pulling)
         return;
-    // A target that stopped answering is tried again by a walk, which finds again what it was owed.
+    // A target that stopped answering is tried again by a walk, which finds again what it was owed, after a listing
+    // when the storage's side is carried too.
     if (m_retry_at.time_since_epoch().count() && now >= m_retry_at)
     {
         m_retry_at = {};
-        begin_walk();
+        if (pulls())
+            m_pull_due = true;
+        else
+        {
+            begin_walk();
+            return;
+        }
+    }
+    const uint32_t every = m_rt.get_every();
+    if (pulls())
+    {
+        // The storage is listed when --every says so, and once a minute without it, since nothing tells this side
+        // that it changed; the walk follows each listing.
+        const auto pull_every = std::chrono::seconds(every ? every : default_pull_secs);
+        if ((m_pull_due || now - m_last_pull >= pull_every) && !m_targets.empty() && idle(m_targets.front()))
+            begin_pull();
         return;
     }
     // The whole of the directory is walked again when --every says so.
-    const uint32_t every = m_rt.get_every();
     if (every && m_last_walk.time_since_epoch().count() && now - m_last_walk >= std::chrono::seconds(every))
         begin_walk();
+}
+
+// ─── the storage's side ─────────────────────────────────────────────────────
+
+bool sync_run::pushes() const
+{
+    return m_rt.get_mode() != sync_mode_in;
+}
+
+bool sync_run::pulls() const
+{
+    return m_rt.get_mode() != sync_mode_out;
+}
+
+std::pair<std::string, std::string> sync_run::condition(const target& t, const std::string& rel) const
+{
+    if (!pulls())
+        return {};
+    const index_entry* had = m_index.find(t.name, rel);
+    if (!had)
+        return {"if-none-match", "*"};
+    if (had->etag.empty())
+        return {};
+    return {"if-match", "\"" + std::string(bare_etag(had->etag)) + "\""};
+}
+
+bool sync_run::idle(const target& t) const
+{
+    return std::none_of(t.lanes.begin(), t.lanes.end(), [](const auto& l) { return l->busy || l->peer->busy(); });
+}
+
+http_request sync_run::signed_bucket_request(const target& t, std::string_view query) const
+{
+    const std::string path = "/" + t.bucket;
+    const std::string date = amz_date_now();
+    std::vector<std::pair<std::string, std::string>> headers = {
+        {"host", t.http.authority()}, {"x-amz-date", date}, {"x-amz-content-sha256", "UNSIGNED-PAYLOAD"}};
+    if (!t.cred.session_token.empty())
+        headers.emplace_back("x-amz-security-token", t.cred.session_token);
+    std::vector<socketley::s3::header_field> fields;
+    for (const auto& [n, v] : headers)
+        fields.push_back({n, v});
+    socketley::s3::sign_input in;
+    in.method       = "GET";
+    in.raw_path     = path;
+    in.raw_query    = query;
+    in.headers      = fields;
+    in.payload_hash = "UNSIGNED-PAYLOAD";
+    in.access_key   = t.cred.access_key;
+    in.secret       = t.cred.secret;
+    in.region       = t.cred.region;
+    in.amz_date     = date;
+    http_request rq;
+    rq.head = "GET " + path + "?" + std::string(query) + " HTTP/1.1\r\n";
+    for (const auto& [n, v] : headers)
+        rq.head += n + ": " + v + "\r\n";
+    rq.head += "authorization: " + socketley::s3::sign(in) + "\r\nconnection: keep-alive\r\n";
+    rq.head += "user-agent: socketley-sync\r\n\r\n";
+    rq.answer_secs = answer_secs;
+    return rq;
+}
+
+bool sync_run::rel_of_key(std::string_view key, std::string& rel) const
+{
+    const std::string prefix = key_of({});
+    if (!key.starts_with(prefix))
+        return false;
+    key.remove_prefix(prefix.size());
+    if (key.empty() || key.size() > sync_index::max_path || key.back() == '/' || key.front() == '/' ||
+        key.find('\0') != std::string_view::npos)
+        return false;
+    // A key is a name the storage's user chose, so no segment of it may climb out of --dir or name nothing.
+    for (size_t p = 0; p <= key.size();)
+    {
+        const size_t slash = std::min(key.find('/', p), key.size());
+        const std::string_view seg = key.substr(p, slash - p);
+        if (seg.empty() || seg == "." || seg == "..")
+            return false;
+        p = slash + 1;
+    }
+    rel.assign(key);
+    return true;
+}
+
+std::string sync_run::conflict_name(const std::string& rel) const
+{
+    const size_t slash = rel.rfind('/');
+    const size_t base = slash == std::string::npos ? 0 : slash + 1;
+    size_t dot = rel.rfind('.');
+    if (dot == std::string::npos || dot <= base)
+        dot = rel.size();
+    char when[32];
+    const std::time_t now = std::time(nullptr);
+    std::tm tm{};
+    localtime_r(&now, &tm);
+    std::strftime(when, sizeof when, "%Y-%m-%d %H%M%S", &tm);
+    const std::string dir(m_rt.get_dir());
+    for (int n = 1;; ++n)
+    {
+        const std::string tag = " (conflict " + std::string(when) + (n > 1 ? " " + std::to_string(n) : "") + ")";
+        std::string name = rel.substr(0, dot) + tag + rel.substr(dot);
+        struct stat st{};
+        if (::lstat((dir + "/" + name).c_str(), &st) != 0 || n > 99)
+            return name;
+    }
+}
+
+void sync_run::begin_pull()
+{
+    if (m_stopped || m_pulling || m_targets.empty())
+        return;
+    target& t = m_targets.front();
+    if (!ensure_address(t))
+    {
+        owe_retry();
+        return;
+    }
+    sync_credentials cred;
+    std::string why;
+    if (read_sync_credentials(std::string(m_rt.get_credentials()), cred, why))
+        t.cred = cred;
+    else
+        note(why);
+    m_pull_due = false;
+    m_pulling = true;
+    m_listing = true;
+    m_remote.clear();
+    m_list_token.clear();
+    lane& l = *t.lanes.front();
+    l.busy = true;
+    l.path.clear();
+    list_page(t, l);
+}
+
+void sync_run::list_page(target& t, lane& l)
+{
+    std::string query;
+    if (!m_list_token.empty())
+    {
+        query = "continuation-token=";
+        socketley::storage::url_encode_to(query, m_list_token, false);
+        query += "&";
+    }
+    query += "list-type=2&prefix=";
+    socketley::storage::url_encode_to(query, key_of({}), false);
+    l.peer->exchange(signed_bucket_request(t, query), [this, &t, &l](http_answer a) {
+        if (m_stopped)
+            return;
+        if (a.status != 200)
+        {
+            l.busy = false;
+            m_pulling = false;
+            m_listing = false;
+            m_last_pull = std::chrono::steady_clock::now();
+            m_remote.clear();
+            const std::string code = xml_text(a.body, "Code");
+            note(t.name + ": listing the storage " +
+                 (a.status ? "was answered " + std::to_string(a.status) + (code.empty() ? "" : " " + code)
+                           : std::string("failed: ") + (a.failure.empty() ? "no answer" : a.failure)));
+            owe_retry();
+            return;
+        }
+        for (const std::string_view c : xml_blocks(a.body, "Contents"))
+        {
+            std::string rel;
+            if (!rel_of_key(xml_unescape(xml_text(c, "Key")), rel) || excluded(rel))
+                continue;
+            remote_obj o;
+            o.etag = std::string(bare_etag(xml_text(c, "ETag")));
+            o.size = std::strtoull(xml_text(c, "Size").c_str(), nullptr, 10);
+            m_remote[rel] = std::move(o);
+        }
+        m_list_token = xml_unescape(xml_text(a.body, "NextContinuationToken"));
+        if (xml_text(a.body, "IsTruncated") == "true" && !m_list_token.empty())
+        {
+            list_page(t, l);
+            return;
+        }
+        l.busy = false;
+        m_listing = false;
+        decide_pull(t);
+    });
+}
+
+void sync_run::decide_pull(target& t)
+{
+    const std::string dir(m_rt.get_dir());
+    const bool both = pushes();
+    std::string why;
+    for (const auto& [rel, r] : m_remote)
+    {
+        const index_entry* had = m_index.find(t.name, rel);
+        struct stat st{};
+        const bool here = ::lstat((dir + "/" + rel).c_str(), &st) == 0;
+        if (here && !S_ISREG(st.st_mode))
+        {
+            say(rel + " is no file here, so the storage's is not brought over it");
+            continue;
+        }
+        const bool storage_changed = !had || bare_etag(had->etag) != r.etag;
+        const bool here_changed = here && (!had || had->size != uint64_t(st.st_size) || had->mtime_ns != mtime_of(st));
+        fetch f;
+        f.rel = rel;
+        f.key_rel = rel;
+        f.etag = r.etag;
+        f.size = r.size;
+        f.here = here;
+        f.here_size = here ? uint64_t(st.st_size) : 0;
+        f.here_mtime = here ? mtime_of(st) : 0;
+        if (!here)
+        {
+            // Deleted here since it was last the same: the walk takes it off the storage, unless the storage changed
+            // it since, which is the newer word.
+            if (had && !storage_changed && both)
+                continue;
+        }
+        else if (!had)
+        {
+            // Met for the first time on both sides: the same length is taken as the same file, recorded and left;
+            // a different one is both kept.
+            if (uint64_t(st.st_size) == r.size)
+            {
+                if (!m_index.carried(t.name, rel, index_entry{uint64_t(st.st_size), mtime_of(st), r.etag}, why))
+                    note(why);
+                continue;
+            }
+            f.conflict = true;
+        }
+        else if (!storage_changed && !here_changed)
+            continue;
+        else if (!storage_changed)
+        {
+            // Changed here only: the walk carries it out; one way in, the storage's copy is put back.
+            if (both)
+                continue;
+        }
+        else if (here_changed)
+            f.conflict = true;
+        if (f.conflict)
+            ++m_stats.conflicts;
+        m_fetches.push_back(std::move(f));
+    }
+
+    // What the index holds and the storage no longer does was removed there, and goes here too unless it changed
+    // here since; a listing with nothing in it is taken for a storage that lost its bucket, not for one emptied.
+    std::vector<std::string> gone;
+    for (const auto& [k, e] : m_index.all())
+        if (k.target == t.name && !m_remote.contains(k.path))
+            gone.push_back(k.path);
+    if (m_remote.empty() && !gone.empty())
+    {
+        note(t.name + " lists nothing, and " + std::to_string(gone.size()) +
+             " files were carried with it: nothing is removed here. If the files were deleted on purpose, delete them "
+             "here by hand");
+        gone.clear();
+    }
+    for (const std::string& rel : gone)
+    {
+        const index_entry* had = m_index.find(t.name, rel);
+        // Carried out since the listing was asked for would be in it; a removal still queued for it is not news.
+        if (!had)
+            continue;
+        const std::string full = dir + "/" + rel;
+        struct stat st{};
+        if (::lstat(full.c_str(), &st) == 0 && S_ISREG(st.st_mode) && uint64_t(st.st_size) == had->size &&
+            mtime_of(st) == had->mtime_ns && inside(full, nullptr))
+        {
+            if (::unlink(full.c_str()) == 0)
+                ++m_stats.removed_here;
+            else
+                note(rel + ": " + std::strerror(errno));
+        }
+        // One changed here since is this side's now, and the walk carries it out again as a new file.
+        if (!m_index.gone(t.name, rel, why))
+            note(why);
+    }
+    m_stats.indexed = m_index.size();
+    m_remote.clear();
+    if (m_fetches.empty())
+        finish_pull(t);
+}
+
+void sync_run::pump_fetch(target& t)
+{
+    if (m_stopped || !m_pulling || m_listing)
+        return;
+    for (auto& lp : t.lanes)
+    {
+        lane& l = *lp;
+        if (m_fetches.empty())
+            break;
+        if (l.busy || l.peer->busy())
+            continue;
+        l.get = std::make_unique<fetch>(std::move(m_fetches.front()));
+        m_fetches.pop_front();
+        l.busy = true;
+        l.path = l.get->rel;
+        const std::string dir = std::string(m_rt.get_dir()) + "/" + temp_dir;
+        if (::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST)
+        {
+            note(dir + ": " + std::strerror(errno));
+            fetch_end(t, l, false);
+            continue;
+        }
+        char name[] = "/fetch-XXXXXX";
+        std::string temp = dir + name;
+        l.get->fd = ::mkostemp(temp.data(), O_CLOEXEC);
+        if (l.get->fd < 0)
+        {
+            note(temp + ": " + std::strerror(errno));
+            fetch_end(t, l, false);
+            continue;
+        }
+        l.get->temp = std::move(temp);
+        if (l.get->size == 0)
+            fetch_end(t, l, true);
+        else
+            fetch_range(t, l);
+    }
+    // Every fetch is over once no lane holds one and none waits.
+    if (m_fetches.empty() && std::none_of(t.lanes.begin(), t.lanes.end(), [](const auto& l) { return l->get != nullptr; }))
+        finish_pull(t);
+}
+
+void sync_run::fetch_range(target& t, lane& l)
+{
+    fetch& f = *l.get;
+    const uint64_t last = std::min(f.size, f.got + fetch_range_bytes) - 1;
+    http_request rq = signed_request(t, "GET", f.key_rel, {},
+                                     {{"range", "bytes=" + std::to_string(f.got) + "-" + std::to_string(last)},
+                                      // A file the storage changed during the fetch is not put together from two.
+                                      {"if-match", "\"" + f.etag + "\""}});
+    l.peer->exchange(std::move(rq), [this, &t, &l](http_answer a) {
+        if (m_stopped || !l.get)
+            return;
+        fetch& f = *l.get;
+        if (a.status == 412 || a.status == 404)
+        {
+            // Changed or removed on the storage since it was listed: the next listing sees what it is now.
+            fetch_end(t, l, false);
+            return;
+        }
+        if ((a.status != 206 && a.status != 200) || a.body.empty() || f.got + a.body.size() > f.size)
+        {
+            const std::string code = xml_text(a.body, "Code");
+            note(t.name + "/" + f.key_rel + ": bringing it " +
+                 (a.status ? "was answered " + std::to_string(a.status) + (code.empty() ? "" : " " + code)
+                           : std::string("failed: ") + (a.failure.empty() ? "no answer" : a.failure)));
+            fetch_end(t, l, false);
+            owe_retry();
+            return;
+        }
+        // A whole object for a range is the storage ignoring it, which is the same bytes from the start.
+        if (a.status == 200 && f.got != 0)
+        {
+            fetch_end(t, l, false);
+            return;
+        }
+        for (size_t off = 0; off < a.body.size();)
+        {
+            const ssize_t n = ::pwrite(f.fd, a.body.data() + off, a.body.size() - off, off_t(f.got + off));
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n <= 0)
+            {
+                note(f.rel + ": writing it here failed: " + std::strerror(n < 0 ? errno : ENOSPC));
+                fetch_end(t, l, false);
+                return;
+            }
+            off += size_t(n);
+        }
+        f.got += a.body.size();
+        if (f.got < f.size)
+            fetch_range(t, l);
+        else
+            fetch_end(t, l, true);
+    });
+}
+
+void sync_run::fetch_end(target& t, lane& l, bool whole)
+{
+    std::unique_ptr<fetch> f = std::move(l.get);
+    l.busy = false;
+    if (!f)
+        return;
+    const std::string dir(m_rt.get_dir());
+    bool placed = false;
+    if (whole && f->fd >= 0 && ::fsync(f->fd) == 0)
+    {
+        const std::string full = dir + "/" + f->rel;
+        struct stat st{};
+        const bool here = ::lstat(full.c_str(), &st) == 0;
+        // This side's file as the decision saw it, or the storage's copy is kept beside whatever it became.
+        if (!f->conflict && (here != f->here || (here && (uint64_t(st.st_size) != f->here_size || mtime_of(st) != f->here_mtime))))
+        {
+            f->conflict = true;
+            ++m_stats.conflicts;
+        }
+        // Both ways, the storage's copy goes beside this side's, which the walk then carries out; one way in, the
+        // storage's goes at the name and this side's beside it, so the next listing does not find the conflict again.
+        std::string name = f->rel;
+        bool ok = true;
+        if (f->conflict && pushes())
+            name = conflict_name(f->rel);
+        else if (f->conflict && here && ::rename(full.c_str(), (dir + "/" + conflict_name(f->rel)).c_str()) != 0)
+            ok = false;
+        const std::string target_path = dir + "/" + name;
+        const std::string parent = target_path.substr(0, target_path.rfind('/'));
+        // The folders on the way are made here, below the deepest one there is, and only when that is no link out
+        // of --dir.
+        std::string have = parent;
+        struct stat pst{};
+        while (have.size() > dir.size() && ::lstat(have.c_str(), &pst) != 0)
+            have.resize(have.rfind('/'));
+        std::error_code ec;
+        if (ok && inside(have, nullptr))
+            fs::create_directories(parent, ec);
+        else
+            ok = false;
+        if (ok && !ec && inside(parent, nullptr) && ::rename(f->temp.c_str(), target_path.c_str()) == 0)
+        {
+            placed = true;
+            ++m_stats.brought;
+            m_stats.bytes_carried += f->size;
+            std::string why;
+            // The name as the storage has it is now the same on both sides; a conflict copy is new to both, and the
+            // walk carries it out, as it does this side's file over the storage's, which it now knows the etag of.
+            if (name == f->rel && ::lstat(target_path.c_str(), &st) == 0 &&
+                !m_index.carried(t.name, f->rel, index_entry{uint64_t(st.st_size), mtime_of(st), f->etag}, why))
+                note(why);
+            if (name != f->rel && !m_index.carried(t.name, f->rel, index_entry{0, -1, f->etag}, why))
+                note(why);
+            m_stats.failing = 0;
+        }
+        else
+            note(name + ": it could not be put in place: " + (ec ? ec.message() : std::string(std::strerror(errno))));
+    }
+    if (f->fd >= 0)
+        ::close(f->fd);
+    if (!placed && !f->temp.empty())
+        ::unlink(f->temp.c_str());
+}
+
+void sync_run::finish_pull(target&)
+{
+    if (!m_pulling)
+        return;
+    m_pulling = false;
+    m_last_pull = std::chrono::steady_clock::now();
+    m_stats.indexed = m_index.size();
+    std::string why;
+    if (!m_index.compact(why))
+        note(why);
+    m_index.flush();
+    ::rmdir((std::string(m_rt.get_dir()) + "/" + temp_dir).c_str());
+    if (pushes())
+        begin_walk();
+    else
+        m_last_walk = m_last_pull;
 }
 
 }   // namespace socketley::sync

@@ -825,7 +825,7 @@ socketley daemon stats
 .fi
 .RE
 .TP
-.B git\-sync \-\-url \fIurl\fR \-\-branch \fIname\fR|\fB*\fR \-\-work \fIdir\fR \-\-endpoint \fIhost\fB:\fIport\fR \fR[\fB\-\-tls\fR [\fB\-\-ca \fIfile\fR]] \fB\-\-bucket \fIlibrary\fR \fB\-\-name \fIfolder\fR [\fB\-\-keep \fIdays\fB,\fIweeks\fB,\fImonths\fR]
+.B git\-sync \-\-url \fIurl\fR \-\-branch \fIname\fR|\fB*\fR \-\-work \fIdir\fR \-\-endpoint \fIhost\fB:\fIport\fR \fR[\fB\-\-tls\fR [\fB\-\-ca \fIfile\fR]] \fB\-\-bucket \fIlibrary\fR \fB\-\-name \fIfolder\fR [\fB\-\-keep \fIdays\fB,\fIweeks\fB,\fImonths\fR] [\fB\-\-move\-from \fIlibrary\fR]
 One run of a repository a storage runtime keeps (see
 .B Git repositories
 under
@@ -847,7 +847,12 @@ names the certificate the runtime at
 .IR host : port
 must present over
 .BR \-\-tls ,
-which the runtime passes its own. Exit status 0 when it ended well, 2
+which the runtime passes its own.
+.B \-\-move\-from
+names a library the folder was written to before: once the tree is whole in
+the new one, the backups there are copied over, its files there removed, and
+the library itself once nothing else is in it; one this user may not read is
+left as it is. Exit status 0 when it ended well, 2
 when it did not, 3 when a run of the same directory is under way;
 .IR dir /state.json
 says how.
@@ -10363,7 +10368,7 @@ rendition; a change is made on the same media source, keeping the next six
 seconds already buffered while the new stream's first segment is made.
 .
 .SS Git repositories
-The page's Git keeps repositories in a library: each is pulled when it is added,
+The page's Sync keeps repositories in a library: each is pulled when it is added,
 whenever its user asks, and by itself every day, week or month from 3:00 local
 time, or never (the default), as its Pull every says; when any ref moved since
 the last run, the branch's files are written under
@@ -10411,8 +10416,8 @@ takes
 (branch
 .BR main ,
 library
-.B git
-and every
+.BI git\- user ,
+the user's own, and every
 .B never
 by default, the name the URL's last part), which also starts the first run,
 .B {"action":"every","id","every"}
@@ -10426,6 +10431,16 @@ or
 (the files and bundles stay) and
 .B {"action":"token","token"}
 (empty removes it). A user adds into a library it may write.
+.IP
+A repository in the library
+.B git
+that every user once shared goes to its owner's own at the next start, and is
+run there until its tree is whole and
+.B "git\-sync \-\-move\-from git"
+has taken its backups over and its files away; the old library goes once it is
+empty.
+.IR dir /.ui/git/ id /moved\-from
+holds the move across restarts.
 .
 .SS Durability
 .B \-\-fsync
@@ -11206,13 +11221,6 @@ brings the storage to the directory, and
 .B inout
 does both. The default is
 .BR out .
-.B in
-and
-.B inout
-are refused for now: only
-.B out
-is carried, and a job that named another mode is told so when it is made rather
-than failing at its first start.
 .TP
 .BI "\-\-credentials " file
 The file the job signs with:
@@ -11234,14 +11242,21 @@ The key everything is written under, below the bucket; without the flag it is
 the bucket's root.
 .TP
 .BI "\-\-every " duration
-How often the whole directory is walked, as
+How often the whole directory is walked, and with
+.B in
+or
+.B inout
+the storage listed, as
 .BR 30s ,
 .BR 10m ,
 .B 1h
 or
 .BR 1d ;
 .B never
-walks it once at a start. One hour by default. Between walks, inotify says
+walks it once at a start. One hour by default; a job that brings the storage
+here lists it once a minute when
+.B \-\-every
+is never. Between walks, inotify says
 which files changed, and a file is carried once it is written and closed,
 moved in or touched, and removed once it is deleted; a directory that comes or
 goes, or more events than the kernel keeps, asks for a walk. When inotify is
@@ -11298,6 +11313,41 @@ when the index says files were carried from it removes nothing, and says why in
 \(em a disk that is not mounted looks exactly like that, and a bucket emptied on
 the strength of it cannot be filled again.
 .PP
+.B "Both ways."
+With
+.B in
+or
+.BR inout ,
+the storage is listed first, at a start and then at every
+.BR \-\-every ,
+and each object is set against the index and the file here; with
+.B inout
+the walk follows each listing. A file the storage has and this side does not
+is brought, in ranges of 8 MiB written below
+.I .socketley\-sync
+in
+.B \-\-dir
+and given its name once whole; one the storage changed since is brought again;
+one the storage removed is removed here, unless it changed here since. A file
+both sides have at the start with the same length is taken as the same.
+A file both sides changed is kept twice: this side's at its name, carried out
+over the storage's, and the storage's beside it as
+.IR "name (conflict date time).ext" ,
+on both sides. With
+.B inout
+every write and removal sent carries the etag this side last saw, so one the
+storage made meanwhile refuses it and the next listing keeps both, rather than
+the later write winning. With
+.B in
+nothing is carried out: a file changed here is put back as the storage has it,
+and this side's version kept beside it. A key with an empty,
+.B .
+or
+.B ..
+segment is not brought, and a folder that is a link out of
+.B \-\-dir
+is not written through. A listing with nothing in it removes nothing here.
+.PP
 .B "What a failure means."
 A file the storage refuses, and a target that does not answer, are counted,
 logged once for as long as the reason stays the same, and tried again by a walk
@@ -11326,6 +11376,12 @@ names that is not a storage, or not there, is a failure of the same kind.
 (failures since the last thing carried),
 .B watched
 (directories inotify watches),
+.B brought
+(files brought from the storage),
+.B removed_here
+(files removed here because the storage removed them),
+.B conflicts
+(files both sides changed),
 .B last_run_secs
 and
 .BR last_error .

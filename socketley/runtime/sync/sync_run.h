@@ -208,18 +208,34 @@ private:
         std::string etag;
         uint64_t size{0};
     };
-    bool two_way() const;
+    // Whether this side's changes go to the storage, and the storage's come here.
+    bool pushes() const;
+    bool pulls() const;
+    // Whether every lane of `t` is free, which a listing waits for so it sees what they carried.
+    bool idle(const target& t) const;
+    // The header a change to `rel` carries when both sides change, so one the storage made meanwhile is not
+    // written over: the etag last seen there, or none at all for a file it never had; empty one way.
+    std::pair<std::string, std::string> condition(const target& t, const std::string& rel) const;
     void begin_pull();
     void list_page(target& t, lane& l);
+    // What the listing asks of this side: files to bring, files to take away, conflicts to keep both of.
     void decide_pull(target& t);
     void pump_fetch(target& t);
     void fetch_range(target& t, lane& l);
-    void fetch_done(target& t, lane& l, bool ok);
-    void finish_pull();
+    // The fetch on `l` is over: placed when it is whole, its temporary file removed when it is not.
+    void fetch_end(target& t, lane& l, bool whole);
+    void finish_pull(target& t);
+    // The path below --dir a key names, false for one outside --prefix or one no file may be named.
+    bool rel_of_key(std::string_view key, std::string& rel) const;
+    // Where a copy of `rel` is kept when both sides changed it: beside it, named for the moment.
+    std::string conflict_name(const std::string& rel) const;
     // A request of the bucket itself rather than of a key in it, as a listing is.
     socketley::storage::http_request signed_bucket_request(const target& t, std::string_view query) const;
     bool m_pull_due{false};
     bool m_pulling{false};
+    // The listing is still being read, so no fetch is decided yet.
+    bool m_listing{false};
+    std::chrono::steady_clock::time_point m_last_pull{};
     std::string m_list_token;
     std::unordered_map<std::string, remote_obj> m_remote;
     std::deque<fetch> m_fetches;
