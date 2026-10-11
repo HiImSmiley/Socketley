@@ -140,6 +140,14 @@ void proxy_auth::reload(std::chrono::steady_clock::time_point now)
     m_loaded = true;
 }
 
+std::string proxy_auth::user_of(std::string_view access_key) const
+{
+    if (!m_loaded || !m_keys)
+        return {};
+    const auto u = m_keys->user_of(access_key);
+    return u ? u->id : std::string();
+}
+
 bool proxy_auth::admit(std::string_view authorization) const
 {
     if (!m_loaded)

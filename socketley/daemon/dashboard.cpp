@@ -376,7 +376,10 @@ void server::session(int fd, const request& r)
         if (n > 0)
             pair.assign(out.data(), static_cast<size_t>(n));
     }
-    const std::string user = pair.substr(0, pair.find(':'));
+    // Named as the credentials file names its section, and by the key for a key outside any.
+    const std::string key = pair.substr(0, pair.find(':'));
+    const std::string named = m_auth->user_of(key);
+    const std::string user = named.empty() ? key : named;
     const int64_t expires = static_cast<int64_t>(std::time(nullptr)) + session_seconds;
     LOG_INFO(("dashboard: " + user + " signed in from " + r.client()).c_str());
     send(fd, 200, "application/json", "{\"user\":" + json_quote(user) + "}",

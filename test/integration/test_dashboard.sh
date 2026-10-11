@@ -136,6 +136,8 @@ expect "a proxy's does" "$(code -H 'Via: 1.1 entrance' "$U/metrics")" 401
 expect "an admin signs in" "$(code -X POST -c "$T/jar" -u "$ADMIN" "$U/api/session")" 200
 has "as an HttpOnly, SameSite=Strict cookie" "$(grep -c skl_dash "$T/jar") $(curl -s -D - -o /dev/null -X POST -u "$ADMIN" "$U/api/session" | tr -d '\r' | grep -i '^set-cookie')" "HttpOnly; SameSite=Strict"
 expect "and reads the figures" "$(code -b "$T/jar" "$U/api/runtimes")" 200
+expect "and is named as the credentials file names it, not by the key" \
+    "$(curl -s -X POST -u "$ADMIN" "$U/api/session")" '{"user":"admin"}'
 expect "another user does not sign in" "$(code -X POST -u "$BOB" "$U/api/session")" 401
 expect "nor a wrong secret" "$(code -X POST -u "${ADMIN%%:*}:wrong" "$U/api/session")" 401
 for _ in 1 2 3 4 5; do code -X POST -H 'X-Forwarded-For: 10.9.9.9' -H 'Via: 1.1 e' -u "${ADMIN%%:*}:guess" "$U/api/session" >/dev/null; done

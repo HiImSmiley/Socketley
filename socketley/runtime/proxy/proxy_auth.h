@@ -35,6 +35,9 @@ public:
     // The request's Authorization field (empty for none) from `client`; `retry_after` is set when barred.
     verdict check(std::string_view authorization, std::string_view client, int64_t& retry_after);
 
+    // The id of the user an access key of the basic file signs for, empty for the default owner or no such key.
+    std::string user_of(std::string_view access_key) const;
+
     // The WWW-Authenticate field a refusal carries, with its line end.
     const std::string& challenge() const { return m_challenge; }
 
