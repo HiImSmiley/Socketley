@@ -355,6 +355,12 @@ std::string film_page(std::string_view name, const object_meta* m, std::string_v
         meta(h, "property", "og:video:width", std::to_string(width));
         meta(h, "property", "og:video:height", std::to_string(height));
         meta(h, "name", "twitter:card", "player");
+        // The same file as the player's stream, by which Discord plays a film it gave up making a still of in time.
+        meta(h, "name", "twitter:player", chat_url);
+        meta(h, "name", "twitter:player:stream", chat_url);
+        meta(h, "name", "twitter:player:width", std::to_string(width));
+        meta(h, "name", "twitter:player:height", std::to_string(height));
+        meta(h, "name", "twitter:image", poster_url);
     }
     else
         meta(h, "name", "twitter:card", "summary_large_image");

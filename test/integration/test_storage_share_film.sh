@@ -54,6 +54,7 @@ curl -s -u "$A" -T "$T/old.mkv" -H "Content-Type: video/x-matroska" "$U/~dav/fil
 link() { curl -s -u "$A" -H 'X-Socketley-UI: 1' -H 'Content-Type: application/json' \
          -d "{\"bucket\":\"films\",\"key\":\"$1\",\"expires_in\":3600}" "$U/~share" |
          python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])'; }
+tw() { python3 -c 'import re,sys; m=re.search(r"<meta name=\"%s\" content=\"([^\"]*)\"" % sys.argv[1], sys.stdin.read()); print(m.group(1) if m else "")' "$1"; }
 og() { python3 -c 'import re,sys; m=re.search(r"<meta property=\"%s\" content=\"([^\"]*)\"" % sys.argv[1], sys.stdin.read()); print(m.group(1) if m else "")' "$1"; }
 L1=$(link clip.mp4)
 L2=$(link old.mkv)
@@ -77,6 +78,9 @@ check "which is the web copy" "$(curl -s -o /dev/null -w '%{http_code} %{content
 check "as a player" "$(grep -o 'twitter:card" content="[^"]*' <<<"$PAGE")" 'twitter:card" content="player'
 check "of the film's size" "$(og og:video:width <<<"$PAGE")x$(og og:video:height <<<"$PAGE")" "640x360"
 check "with its still as the picture" "$(og og:image <<<"$PAGE")" "$U/~media/thumb-1280/~share/${L1#/~share/}"
+check "and the film as the player's stream, which Discord plays without making a still" \
+      "$(tw twitter:player:stream <<<"$PAGE")|$(tw twitter:image <<<"$PAGE")" \
+      "$U/~media/web/~share/${L1#/~share/}.mp4|$U/~media/thumb-1280/~share/${L1#/~share/}"
 check "a chat's preview gets the page too" \
       "$(curl -s -A 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)' "$U$L1" | grep -c 'og:video:url')" 1
 # Discord asks by HEAD, and as an old Firefox accepting anything; told the film itself it embeds nothing.
@@ -129,6 +133,20 @@ check "the film is denser than a chat embeds" \
 # The cap, and the one buffer of two seconds' worth an encoder may spend at once, over the film's three seconds.
 check "and its web copy is not" \
       "$("$FFPROBE" -v error -show_entries format=bit_rate -of csv=p=0 "$T/dense-web.mp4" | awk '{print ($1 > 0 && $1 <= 20500000)}')" 1
+
+# ── a long film of 60 frames a second ──
+# Long enough that its copy is below the bitrate of 1440 lines, so it is made at 30 frames.
+ff -f lavfi -i "testsrc2=size=320x180:rate=60" -t 50 -c:v mpeg4 -q:v 8 "$T/long60.mkv"
+curl -s -u "$A" -T "$T/long60.mkv" "$U/~dav/films/long60.mkv" >/dev/null
+L5=$(link long60.mkv)
+curl -s -o /dev/null "$U/~media/info/~share/${L5#/~share/}"
+for _ in $(seq 1 240); do
+    [ "$(curl -s -I -o /dev/null -w '%{http_code}' "$U/~media/web/~share/${L5#/~share/}?prepare")" = 200 ] && break
+    sleep 0.5
+done
+curl -s -o "$T/long60-web.mp4" "$U/~media/web/~share/${L5#/~share/}"
+check "a long film of 60 frames a second gets a web copy of 30" \
+      "$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$T/long60-web.mp4")" "30/1"
 
 # ── what is not a film ──
 printf 'hello\n' > "$T/note.txt"

@@ -1789,6 +1789,9 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
                 int64_t width = 0, height = 0;
                 fitted(p, lines, width, height);
                 std::string vf = "scale=" + std::to_string(width) + ":" + std::to_string(height);
+                // Below the bitrate 1440 lines are made at, the bits a second frame of 60 would take go to the picture.
+                if (lines < 1440 && p.fps > 31)
+                    vf += ",fps=30";
                 if (p.hdr())
                     vf += ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
                           "zscale=t=bt709:m=bt709:r=tv";
