@@ -1586,7 +1586,8 @@ void storage_run::ui_git(const std::shared_ptr<conn>& c)
     const std::string& who = c->user->id;
     std::string o = "{\"available\":" + std::string(m_git.available() ? "true" : "false") +
                     ",\"why\":" + json_quote(m_git.unavailable_reason()) +
-                    ",\"token\":" + (m_git.has_token(who) ? "true" : "false") + ",\"repos\":[";
+                    ",\"token\":" + (m_git.has_token(who) ? "true" : "false") +
+                    ",\"runtime\":" + json_quote(sync_runner_name(who)) + ",\"repos\":[";
     bool first = true;
     for (const git_mirrors::repo& g : m_git.repos())
     {
@@ -1901,7 +1902,7 @@ void storage_run::ui_git_body(const std::shared_ptr<conn>& c)
             return;
         }
         // The first run now rather than at the next hour it is due.
-        const std::string why = m_git.run_now(g.id, *m_auth);
+        const std::string why = m_git.run_now(g.id);
         arm_sweep();
         app_reply(c, 200, "{\"id\":" + json_quote(g.id) + ",\"started\":" + (why.empty() ? "true" : "false") +
                               ",\"why\":" + json_quote(why) + "}",
@@ -1937,7 +1938,7 @@ void storage_run::ui_git_body(const std::shared_ptr<conn>& c)
     }
     if (action == "sync")
     {
-        if (const std::string why = m_git.run_now(id, *m_auth); !why.empty())
+        if (const std::string why = m_git.run_now(id); !why.empty())
         {
             app_reply(c, 409, why + "\n");
             return;

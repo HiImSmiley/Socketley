@@ -753,6 +753,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.sync_prefix = std::string(sy->get_prefix());
             cfg.sync_credentials = std::string(sy->get_credentials());
             cfg.sync_exclude = std::string(sy->get_exclude());
+            cfg.sync_repositories = std::string(sy->get_repositories());
             cfg.sync_every = sy->get_every();
             cfg.mode = static_cast<uint8_t>(sy->get_mode());
             break;
@@ -1111,6 +1112,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("credentials", cfg.sync_credentials);
             if (!cfg.sync_exclude.empty())
                 append_str_field("exclude", cfg.sync_exclude);
+            if (!cfg.sync_repositories.empty())
+                append_str_field("repositories", cfg.sync_repositories);
             append_int_field("every", cfg.sync_every);
             break;
     }
@@ -1316,6 +1319,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.sync_prefix = json_get_string(json, "prefix");
             cfg.sync_credentials = json_get_string(json, "credentials");
             cfg.sync_exclude = json_get_string(json, "exclude");
+            cfg.sync_repositories = json_get_string(json, "repositories");
             cfg.sync_every = json_get_uint32(json, "every", sync_default_every);
             break;
         }

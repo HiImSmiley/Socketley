@@ -131,6 +131,8 @@ void apply_sync_config(sync_instance& sy, const runtime_config& cfg, bool by_pre
         sy.set_credentials(cfg.sync_credentials);
     if (asked("exclude", !cfg.sync_exclude.empty()))
         sy.set_exclude(cfg.sync_exclude);
+    if (asked("repositories", !cfg.sync_repositories.empty()))
+        sy.set_repositories(cfg.sync_repositories);
     if (asked("mode", cfg.mode != 0))
         sy.set_mode(static_cast<sync_mode>(cfg.mode));
     if (asked("every", true))

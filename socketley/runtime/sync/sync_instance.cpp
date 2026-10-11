@@ -1,4 +1,5 @@
 #include "sync_instance.h"
+#include "sync_repos.h"
 #include "sync_run.h"
 
 #include <algorithm>
@@ -131,6 +132,17 @@ size_t sync_instance::get_connection_count() const
 
 std::string sync_instance::config_refusal() const
 {
+    // A user's sync runtime a storage made: its file says everything else.
+    if (!m_repositories.empty())
+    {
+        if (m_repositories.front() != '/')
+            return "sync: --repositories takes an absolute path, not '" + m_repositories + "'\n";
+        if (!m_dir.empty() || !m_storage.empty())
+            return "sync: --repositories is a job of its own, with no --dir or --storage\n";
+        if (!get_listen_path().empty() || get_port() != 0)
+            return "sync: a sync listens on nothing\n";
+        return {};
+    }
     if (m_dir.empty())
         return "sync: --dir is required: the directory whose files are carried\n";
     if (m_dir.front() != '/')
@@ -175,6 +187,18 @@ void sync_instance::on_cqe(struct io_uring_cqe*)
 
 bool sync_instance::setup(event_loop& loop)
 {
+    if (!m_repositories.empty())
+    {
+        auto repos = std::make_unique<socketley::sync::repo_runner>(*this, loop);
+        std::string why;
+        if (!repos->start(why))
+        {
+            LOG_ERROR(("sync: " + why).c_str());
+            return false;
+        }
+        m_repos = std::move(repos);
+        return true;
+    }
     auto run = std::make_unique<socketley::sync::sync_run>(*this, loop);
     std::string why;
     if (!run->start(why))
@@ -188,6 +212,12 @@ bool sync_instance::setup(event_loop& loop)
 
 void sync_instance::teardown(event_loop&)
 {
+    if (m_repos)
+    {
+        m_repos->stop();
+        // Kept until its cancelled timeout has completed into it.
+        m_repo_graveyard.push_back(std::move(m_repos));
+    }
     if (m_run)
     {
         m_run->stop();
@@ -200,13 +230,19 @@ void sync_instance::on_loop_turn()
 {
     if (!m_graveyard.empty())
         std::erase_if(m_graveyard, [](const auto& r) { return r->drained(); });
+    if (!m_repo_graveyard.empty())
+        std::erase_if(m_repo_graveyard, [](const auto& r) { return r->drained(); });
     if (m_run)
         m_run->on_loop_turn();
+    if (m_repos)
+        m_repos->on_loop_turn();
 }
 
 std::string sync_instance::stats_lines() const
 {
     std::ostringstream out;
+    if (m_repos)
+        return m_repos->stats_lines();
     out << "mode:" << sync_mode_name(m_mode) << "\n";
     out << "dir:" << m_dir << "\n";
     if (!m_run)

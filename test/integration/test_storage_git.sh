@@ -19,6 +19,8 @@
 #   refused      a file:// URL, a bad branch and a bad folder name
 #   moved        one in the shared library git goes to git-<owner> at the next
 #                start, backups and all, and the emptied library goes
+#   runtimes     every user has a sync runtime the storage made, which runs
+#                their repositories and goes when the storage stops
 #   remove       a removed repository is no longer listed; its files stay
 set -uo pipefail
 
@@ -176,6 +178,15 @@ expect "and may not add one into her library" \
     "$(post "$BOB_K:$BOB_S" "{\"action\":\"add\",\"url\":\"git://127.0.0.1:$GP/demo.git\",\"bucket\":\"code\",\"name\":\"bobs\"}")" 403
 expect "nor run hers" "$(post "$BOB_K:$BOB_S" "{\"action\":\"sync\",\"id\":\"$id\"}")" 404
 
+# ─── whose runtime runs it ──────────────────────────────────────────────────
+# Every user has a sync runtime of their own, made and owned by the storage, which does the runs.
+LS=$("$BIN" ls 2>/dev/null)
+expect "every user has a sync runtime of their own, owned by the storage" \
+    "$(echo "$LS" | awk '$3 == "sync" && $6 == "st" {print $2}' | sort | tr '\n' ' ')" "st-sync-alice st-sync-bob "
+expect "the interface names it" "$(ui "$ALICE_K:$ALICE_S" | j "d['runtime']")" st-sync-alice
+expect "and it is what ran alice's repository" "$("$BIN" stats st-sync-alice 2>/dev/null | sed -n 's/^runs://p')" 3
+expect "and no other user's" "$("$BIN" stats st-sync-bob 2>/dev/null | sed -n 's/^runs://p')" 0
+
 # ─── private ────────────────────────────────────────────────────────────────
 code=$(post "$BOB_K:$BOB_S" "{\"action\":\"add\",\"url\":\"git://127.0.0.1:$GP/demo.git\",\"bucket\":\"bobcode\",\"private\":true}")
 expect "a private repository without a token is added, and not run" "$code $(j "d['started']" < "$T/post.out")" "200 False"
@@ -227,12 +238,14 @@ waitrun() {
     echo "$s" | python3 -c 'import json,sys; print(json.dumps([r for r in json.load(sys.stdin)["repos"] if r["id"]==sys.argv[1]][0]))' "$1"
 }
 t3=$(date +%s)
-expect "a repository written to the shared library git" "$(waitrun "$mig" "$t3" | j "d['state']['ok'], d['bucket']")" "(True, 'git')"
+first=$(waitrun "$mig" "$t3")
+expect "a repository written to the shared library git" "$(echo "$first" | j "d['state']['ok'], d['bucket']")" "(True, 'git')"
+at1=$(echo "$first" | j "d['state']['at']")
 OLDB=$(s3 "http://127.0.0.1:$ST/git?list-type=2&prefix=_backups/mig/" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g')
 "$BIN" stop st >/dev/null 2>&1; "$BIN" start st >/dev/null 2>&1
 for _ in $(seq 1 100); do curl -s -o /dev/null "http://127.0.0.1:$ST/" && break; sleep 0.1; done
-sleep 1
-st=$(waitrun "$mig" "$(($(date +%s) - 1))")
+# The run after the start, not the one before it, which may have ended within the same second.
+st=$(waitrun "$mig" "$((at1 + 1))")
 expect "goes to its owner's own library at the next start" "$(echo "$st" | j "d['state']['ok'], d['bucket']")" "(True, 'git-alice')"
 expect "with its files" "$(s3 "http://127.0.0.1:$ST/git-alice/mig/README.md")" "hello again"
 expect "and the backup it had" "$(s3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ST/git-alice/$OLDB")" 200
@@ -240,6 +253,10 @@ expect "and the old library, which held nothing else, is gone" "$(s3 -o /dev/nul
 # Known once the run's process is reaped, a moment after its state is written.
 for _ in $(seq 1 25); do [ -e "$T/st/.ui/git/$mig/moved-from" ] || break; sleep 0.2; done
 expect "and once there it is moved no more" "$(ls "$T/st/.ui/git/$mig/moved-from" 2>/dev/null | wc -l)" 0
+"$BIN" stop st >/dev/null 2>&1
+expect "the users' sync runtimes go with the storage that made them" "$("$BIN" ls 2>/dev/null | grep -c 'st-sync-')" 0
+"$BIN" start st >/dev/null 2>&1
+for _ in $(seq 1 100); do curl -s -o /dev/null "http://127.0.0.1:$ST/" && break; sleep 0.1; done
 
 # ─── remove ─────────────────────────────────────────────────────────────────
 expect "a repository is removed" "$(post "$ALICE_K:$ALICE_S" "{\"action\":\"remove\",\"id\":\"$id\"}")" 204

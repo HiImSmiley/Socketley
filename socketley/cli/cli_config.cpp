@@ -144,6 +144,7 @@ constexpr config_key config_keys[] = {
     { "storage",            "--storage",            key_kind::list    },
     { "prefix",             "--prefix",             key_kind::text    },
     { "exclude",            "--exclude",            key_kind::list    },
+    { "repositories",       "--repositories",       key_kind::text    },
     { "every",              "--every",              key_kind::scalar  },
 };
 

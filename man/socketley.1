@@ -10385,14 +10385,30 @@ writes nothing. Every bundle of the last day is kept, and before it the newest
 of each of the last 14 days, 8 weeks and 12 months; the rest are deleted.
 Symbolic links and submodules are no files and are left out.
 .IP
-A run is
+The runs are each user's own: the runtime's first shard makes every one of its
+users a
+.B sync
+runtime,
+.IB storage \-sync\- user ,
+owned by it, which goes when it stops and comes back when it starts, and which
+.B "socketley ls"
+and the dashboard list with its
+.BR runs ,
+.BR failures ,
+.B running
+and
+.BR last_error .
+It runs
 .B socketley git\-sync
-started by the runtime with temporary credentials of the user who added the
-repository, through the runtime's own S3 API on its port: what the user may not
-write it cannot write, quotas and versioning apply, and a library that is not
-there is made as the user. A failed run of one pulled by itself is tried again an hour later; the first
-shard runs the schedule, one repository at a time, and a run asked for starts
-at once. Each repository's bare clone, the state of its last run and its log are
+for that user's repositories alone, one at a time, with temporary credentials
+of the user the storage hands it in
+.IR dir /.ui/sync/,
+0600, made again with three of their twelve hours left, through the runtime's
+own S3 API on its port: what the user may not write it cannot write, quotas and
+versioning apply, and a library that is not there is made as the user. A failed
+run of one pulled by itself is tried again an hour later; a run asked for is
+.IR dir /.ui/git/ id /asked,
+which the user's sync runtime starts within a second. Each repository's bare clone, the state of its last run and its log are
 under
 .IR dir /.ui/git/ id /,
 and the list is
@@ -11263,6 +11279,20 @@ goes, or more events than the kernel keeps, asks for a walk. When inotify is
 not there or its watches run out
 .RB ( fs.inotify.max_user_watches ),
 it is said once in the log and the walk is what finds a change.
+.TP
+.BI "\-\-repositories " file
+Makes the job a user's own: it pulls the git repositories that user keeps in a
+storage runtime (see
+.B "Git repositories"
+under
+.BR "STORAGE FLAGS" )
+rather than carrying a directory, and takes no
+.BR \-\-dir ,
+.B \-\-storage
+or
+.BR \-\-credentials .
+The storage runtime makes such a job for each of its users and writes the
+file; it is not one to make by hand.
 .TP
 .BI "\-\-exclude " pattern\fR[\fB,\fIpattern\fR...]
 Shell patterns, separated by commas, with spaces around them ignored:
@@ -15848,6 +15878,12 @@ in
 This changes the memory a worker holds and never what it returns.
 .IP
 Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_TLS_FAILURE_REPORT_SECS
+How often a runtime serving TLS reports the inbound handshakes that failed
+since its last report, in one line: every 60 seconds by default, 1 to 3600. A
+handshake that fails is a port scanner far more often than a client, so each
+one is counted rather than logged.
 .TP
 .B SOCKETLEY_ACME_DIRECTORY
 The directory URL of the ACME CA that

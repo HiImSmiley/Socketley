@@ -9,6 +9,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
+#include <shared_mutex>
 #include <thread>
 
 #include <fcntl.h>
@@ -23,6 +24,8 @@
 #include "../../shared/logging.h"
 #include "../../shared/random_id.h"
 #include "../../shared/runtime_manager.h"
+#include "../../shared/replaced_file.h"
+#include "../../shared/state_persistence.h"
 #include "../../shared/unix_listener.h"
 
 namespace socketley::storage
@@ -210,6 +213,7 @@ bool storage_run::open(std::string& err)
                         : bind == "::" ? std::string("[::1]")
                         : bind.find(':') != std::string::npos ? "[" + bind + "]" : bind) +
                        ":" + std::to_string(m_owner.effective_port());
+        m_git_endpoint = endpoint;
         m_git.open(m_store.options().dir, m_store.shard(), endpoint, m_tls != nullptr, why,
                    std::string(m_owner.get_cert_path()));
         // A run that brought something, or that failed, is news for whoever added the repository.
@@ -642,8 +646,8 @@ void storage_run::sweep()
     m_scrub.tick();
     m_compact.tick();
     m_tier.tick();
-    if (m_auth)
-        m_git.tick(*m_auth);
+    m_git.tick();
+    tend_sync_runners();
     tell_started();
     flush_access_logs(false);
     if (!m_conns.empty() || m_mpu_expire_secs != 0 || m_start_note != start_note::told || m_lc ||
@@ -2768,6 +2772,134 @@ void storage_run::splice_out_done(const std::shared_ptr<conn>& c, struct io_urin
 void storage_run::file_done(const std::shared_ptr<conn>& c)
 {
     finish_request(c);
+}
+
+}   // namespace socketley::storage
+
+namespace socketley::storage
+{
+
+namespace
+{
+
+std::string json_quote(std::string_view v)
+{
+    return "\"" + sp_detail::json_escape(v) + "\"";
+}
+
+}   // namespace
+
+std::string storage_run::sync_runner_name(std::string_view user) const
+{
+    const std::string lib = git_names::library_for(user);
+    std::string name = std::string(m_owner.get_name()) + "-sync-" + (lib == "git" ? sha256_hex(user).substr(0, 12) : lib.substr(4));
+    return runtime_manager::valid_name(name) ? name : std::string(m_owner.get_name()) + "-sync-" + sha256_hex(user).substr(0, 12);
+}
+
+std::string storage_run::sync_runner_file(std::string_view user) const
+{
+    return m_store.options().dir + "/.ui/sync/" + sha256_hex(user).substr(0, 32) + ".json";
+}
+
+void storage_run::tend_sync_runners()
+{
+    if (m_store.shard() != 0 || !m_auth || !m_git.available() || m_stopped)
+        return;
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    if (now < m_runners_at)
+        return;
+    m_runners_at = now + 10;
+    auto* mgr = m_owner.get_runtime_manager();
+    if (!mgr || !mgr->has_map_sink())
+    {
+        m_git.set_unavailable("repositories are pulled by sync runtimes, which a runtime outside the daemon cannot make");
+        return;
+    }
+    std::unordered_map<std::string, std::string> want;
+    for (const auto& u : m_auth->users())
+        if (!u->cluster)
+            want.emplace(sync_runner_name(u->id), u->id);
+    const std::string dir = m_store.options().dir + "/.ui/sync";
+    if (::mkdir((m_store.options().dir + "/.ui").c_str(), 0700) < 0 && errno != EEXIST) {}
+    if (::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST)
+        return;
+    std::string why;
+    for (const auto& [name, user] : want)
+    {
+        // What the runner reads: where the storage is, and the user's temporary credentials, made again with three
+        // of their twelve hours left.
+        const std::string file = sync_runner_file(user);
+        std::string text;
+        jvalue was;
+        int64_t expires = 0;
+        if (read_whole_file(file, text) && json_reader(text).document(was))
+            for (const auto& [k, v] : was.members)
+                if (k == "expires")
+                    expires = std::strtoll(v.s.c_str(), nullptr, 10);
+        if (expires - now < 3 * 3600)
+        {
+            session_credentials creds;
+            const bool have = m_auth->issue_session_as(user, now + 12 * 3600, "", "", creds);
+            std::string o = "{\"dir\":" + json_quote(m_store.options().dir) + ",\"user\":" + json_quote(user) +
+                            ",\"endpoint\":" + json_quote(m_git_endpoint) + ",\"tls\":" + (m_tls ? "true" : "false") +
+                            ",\"ca\":" + json_quote(std::string(m_owner.get_cert_path()));
+            if (have)
+                o += ",\"access_key\":" + json_quote(creds.access_key) + ",\"secret\":" + json_quote(creds.secret) +
+                     ",\"session_token\":" + json_quote(creds.token) + ",\"expires\":" + std::to_string(creds.expires) +
+                     ",\"github_token\":" + json_quote(m_git.token_of(*m_auth, user));
+            o += "}\n";
+            if (!replace_file(file, o, false))
+                LOG_WARN(("storage: the sync runtime of " + user + " could not be handed its credentials").c_str());
+        }
+        bool there = false;
+        {
+            std::shared_lock lock(mgr->mutex);
+            if (const runtime_instance* rt = mgr->get(name))
+            {
+                there = true;
+                if (rt->get_owner() != m_owner.get_name())
+                {
+                    LOG_WARN(("storage: " + name + " is another runtime, so " + user + " has no sync runtime").c_str());
+                    continue;
+                }
+            }
+        }
+        m_runners[name] = user;
+        if (there)
+            continue;
+        runtime_config c;
+        c.name = name;
+        c.type = runtime_sync;
+        c.owner = std::string(m_owner.get_name());
+        c.child_policy = 1;
+        c.was_running = true;
+        c.sync_repositories = file;
+        state_persistence codec{std::filesystem::path{}};
+        if (!mgr->map_mutate("create", name, codec.format_json_pretty(c), why))
+        {
+            LOG_WARN(("storage: the sync runtime of " + user + " could not be made: " + why).c_str());
+            continue;
+        }
+        runtime_manager::replica_entry re;
+        re.name = name;
+        re.type = runtime_sync;
+        re.state = runtime_running;
+        re.owner = c.owner;
+        mgr->replica_note("create", name, re);
+        LOG_INFO(("storage: " + user + " has the sync runtime " + name).c_str());
+    }
+    for (auto it = m_runners.begin(); it != m_runners.end();)
+    {
+        if (want.contains(it->first))
+        {
+            ++it;
+            continue;
+        }
+        if (!mgr->map_mutate("remove", it->first, {}, why))
+            LOG_WARN(("storage: " + it->first + " could not be removed: " + why).c_str());
+        ::unlink(sync_runner_file(it->second).c_str());
+        it = m_runners.erase(it);
+    }
 }
 
 }   // namespace socketley::storage

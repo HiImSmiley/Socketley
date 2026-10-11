@@ -138,11 +138,12 @@ constexpr row rows[] = {
     // ── sync ────────────────────────────────────────────────────────────────
     {"--dir", "Y", "path", "Directory", "The directory whose files are carried. Required.", "Sync", {}, "/srv/photos"},
     {"--storage", "Y", "list", "Storage", "Where they go: a runtime and a bucket, or a URL and one. Required.", "Sync", {}, "ui/photos"},
-    {"--mode", "Y", "choice", "Direction", "Who carries; only out is carried so far.", "Sync", "out"},
+    {"--mode", "Y", "choice", "Direction", "Who carries: out to the storage, in from it, or inout both ways.", "Sync", "out,in,inout"},
     {"--credentials", "Y", "path", "Credentials", "A file holding access_key and secret_key. Required.", "Sync", {}, "/etc/socketley/sync.creds"},
     {"--prefix", "Y", "text", "Prefix", "The key everything is written under, below the bucket.", "Sync", {}, "laptop/"},
     {"--every", "Y", "text", "Walk every", "How often the whole directory is walked; never for only on a change.", "Sync", {}, "1h"},
     {"--exclude", "Y", "list", "Exclude", "Patterns not carried, against the path below the directory.", "Sync", {}, "*.tmp, .git/*"},
+    {"--repositories", "Y", "path", "Repositories", "The file a storage writes for a user's own sync runtime, which pulls their git repositories.", "Sync", {}, "/var/lib/socketley/storage/ui/.ui/sync/user.json"},
 };
 
 void quote(std::string& o, std::string_view v)

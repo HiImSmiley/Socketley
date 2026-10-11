@@ -198,6 +198,8 @@ struct runtime_config
     std::string sync_prefix;
     std::string sync_credentials;
     std::string sync_exclude;
+    // The file a storage hands its users' sync runtimes, which makes the job that user's repositories.
+    std::string sync_repositories;
     // Written always, since 0 is a setting (walk only when told) and not "not given".
     uint32_t sync_every = 3600;
 

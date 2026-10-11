@@ -6035,7 +6035,10 @@ bool daemon_handler::serve_map_request(const std::string& op,
         // The runtime this builds runs in the daemon as it always has,
         // deliberately, because making the same three lines of Lua build a
         // different thing depending on which process ran them is the property
-        // this work exists to remove.
+        // this work exists to remove. A sync is the exception: its work is
+        // done in on_loop_turn, which only a worker's loop turns.
+        if (cfg.type == runtime_sync)
+            inst->mark_out_of_process();
         inst->set_lua_created(true);
         inst->set_child_policy(
             cfg.child_policy == 1 ? runtime_instance::child_policy::remove

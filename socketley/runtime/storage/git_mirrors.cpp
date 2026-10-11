@@ -210,10 +210,25 @@ void git_mirrors::open(std::string dir, uint32_t shard, std::string endpoint, bo
             }
         if (changed && !save(rs))
             LOG_WARN("storage: git: the list of repositories could not be written, so none moved");
-        for (const repo& r : repos())
-            if (::access((work_of(r.id) + "/moved-from").c_str(), F_OK) == 0)
-                m_moved.push_back(r.id);
     }
+}
+
+void git_mirrors::open_runner(std::string dir, std::string user, std::string endpoint, bool tls, std::string cert)
+{
+    m_dir = std::move(dir);
+    m_user = std::move(user);
+    m_endpoint = std::move(endpoint);
+    m_tls = tls;
+    m_cert = std::move(cert);
+    m_shard = 1;
+}
+
+size_t git_mirrors::mine()
+{
+    size_t n = 0;
+    for (const repo& r : repos())
+        n += r.owner == m_user;
+    return n;
 }
 
 std::vector<git_mirrors::repo> git_mirrors::repos()
@@ -410,29 +425,32 @@ std::string git_mirrors::token_of(authenticator& auth, std::string_view user) co
     return ok ? token : std::string{};
 }
 
-std::string git_mirrors::run_now(std::string_view id, authenticator& auth)
+std::string git_mirrors::run_now(std::string_view id)
 {
     for (const repo& r : repos())
         if (r.id == id)
-            return running(id) || spawned_live(id) ? std::string("it is running already") : start(r, auth);
+        {
+            if (running(id))
+                return "it is running already";
+            if (r.private_repo && !has_token(r.owner))
+                return "the repository is private and " + r.owner + " has no GitHub token set";
+            std::error_code ec;
+            std::filesystem::create_directories(work_of(id), ec);
+            return write_file(work_of(id) + "/asked", std::to_string(std::time(nullptr)), 0600)
+                       ? std::string()
+                       : "the run could not be asked for";
+        }
     return "no such repository";
 }
 
-std::string git_mirrors::start(const repo& r, authenticator& auth)
+std::string git_mirrors::start(const repo& r, const identity& id)
 {
     if (!available())
         return m_why_not;
-    // Temporary credentials of the user it is kept for, so the run may do what that user may and no more.
-    session_credentials creds;
-    if (!auth.issue_session_as(r.owner, static_cast<int64_t>(std::time(nullptr)) + 6 * 3600, "", "", creds))
-        return "the user " + r.owner + " has no access key here any more";
-    std::string token;
-    if (r.private_repo)
-    {
-        token = token_of(auth, r.owner);
-        if (token.empty())
-            return "the repository is private and " + r.owner + " has no GitHub token set";
-    }
+    if (id.access_key.empty())
+        return "the storage has handed this sync runtime no credentials of " + r.owner + " yet";
+    if (r.private_repo && id.github_token.empty())
+        return "the repository is private and " + r.owner + " has no GitHub token set";
     const std::string work = work_of(r.id);
     std::error_code ec;
     std::filesystem::create_directories(work, ec);
@@ -458,11 +476,12 @@ std::string git_mirrors::start(const repo& r, authenticator& auth)
     for (char** e = environ; *e; ++e)
         if (!std::string_view(*e).starts_with("SOCKETLEY_GIT_"))
             env.emplace_back(*e);
-    env.push_back("SOCKETLEY_GIT_ACCESS_KEY=" + creds.access_key);
-    env.push_back("SOCKETLEY_GIT_SECRET=" + creds.secret);
-    env.push_back("SOCKETLEY_GIT_SESSION_TOKEN=" + creds.token);
-    if (!token.empty())
-        env.push_back("SOCKETLEY_GIT_TOKEN=" + token);
+    // Temporary credentials of the user it is kept for, so the run may do what that user may and no more.
+    env.push_back("SOCKETLEY_GIT_ACCESS_KEY=" + id.access_key);
+    env.push_back("SOCKETLEY_GIT_SECRET=" + id.secret);
+    env.push_back("SOCKETLEY_GIT_SESSION_TOKEN=" + id.session_token);
+    if (r.private_repo)
+        env.push_back("SOCKETLEY_GIT_TOKEN=" + id.github_token);
     std::vector<char*> envp;
     for (std::string& s : env)
         envp.push_back(s.data());
@@ -490,8 +509,9 @@ std::string git_mirrors::start(const repo& r, authenticator& auth)
     if (rc != 0)
         return "git-sync could not be started: " + std::string(std::strerror(rc));
     m_children[r.id] = pid;
-    LOG_INFO(("storage: git: " + r.url + " (" + r.branch + ") into " + r.bucket + "/" + r.name + "/, for " + r.owner)
-                 .c_str());
+    m_done.running = r.name;
+    ::unlink((work + "/asked").c_str());
+    LOG_INFO(("git: " + r.url + " (" + r.branch + ") into " + r.bucket + "/" + r.name + "/, for " + r.owner).c_str());
     return {};
 }
 
@@ -524,7 +544,32 @@ bool git_mirrors::due(const repo& r, int64_t now) const
     return days >= (r.every == "week" ? 7 : 30);
 }
 
-void git_mirrors::tick(authenticator& auth)
+void git_mirrors::tick()
+{
+    if (m_shard != 0 || !m_any)
+        return;
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    if (now < m_next_look)
+        return;
+    m_next_look = now + 1;
+    // A run is told of once its state is written and its lock let go; what the first look finds is no news.
+    for (const repo& r : repos())
+    {
+        const int64_t stamp = mtime_of(work_of(r.id) + "/state.json");
+        auto [it, fresh] = m_seen.try_emplace(r.id, stamp);
+        if (stamp == it->second && !(fresh && m_seen_once))
+            continue;
+        if (running(r.id))
+            continue;
+        it->second = stamp;
+        std::string state;
+        if (stamp && on_run && read_file(work_of(r.id) + "/state.json", state))
+            on_run(r, state);
+    }
+    m_seen_once = true;
+}
+
+void git_mirrors::serve(const identity& id)
 {
     for (auto it = m_children.begin(); it != m_children.end();)
     {
@@ -535,55 +580,61 @@ void git_mirrors::tick(authenticator& auth)
             ++it;
             continue;
         }
-        if (w == it->second && !(WIFEXITED(status) && WEXITSTATUS(status) == 0))
-            LOG_WARN(("storage: git: the run of " + it->first + " failed; see " + work_of(it->first) + "/log").c_str());
-        else if (w == it->second)
+        ++m_done.runs;
+        if (w == it->second && WIFEXITED(status) && WEXITSTATUS(status) == 0)
             ::unlink((work_of(it->first) + "/moved-from").c_str());
-        if (on_run)
+        else
         {
+            ++m_done.failures;
             std::string state;
-            if (read_file(work_of(it->first) + "/state.json", state))
-                for (const repo& r : repos())
-                    if (r.id == it->first)
-                        on_run(r, state);
+            jvalue st;
+            m_done.last_error = read_file(work_of(it->first) + "/state.json", state) && json_reader(state).document(st)
+                                    ? text_of(st, "error")
+                                    : "the run of " + it->first + " failed";
+            LOG_WARN(("git: the run of " + it->first + " failed; see " + work_of(it->first) + "/log").c_str());
         }
+        m_done.running.clear();
         it = m_children.erase(it);
     }
-    if (m_shard != 0 || !available())
+    // One run at a time, so a morning of many repositories is not a burst on the uplink.
+    if (!m_children.empty() || !available())
         return;
-    // A moved repository's first run in its new library, one at a time like the rest.
-    if (!m_moved.empty() && m_children.empty())
-    {
-        const std::string id = m_moved.back();
-        m_moved.pop_back();
-        for (const repo& r : repos())
-            if (r.id == id)
-                if (const std::string why = start(r, auth); !why.empty())
-                    LOG_WARN(("storage: git: " + r.url + " is not run in its new library: " + why).c_str());
-        return;
-    }
     const int64_t now = static_cast<int64_t>(std::time(nullptr));
-    if (now < m_next_look)
-        return;
-    m_next_look = now + 60;
-    // One run at a time from the schedule, so a morning of many repositories is not a burst on the uplink.
-    if (!m_children.empty())
-        return;
+    std::vector<repo> mine;
     for (const repo& r : repos())
-        if (!running(r.id) && due(r, now))
-        {
-            if (const std::string why = start(r, auth); !why.empty())
-            {
-                // Said where the interface shows it, and asked again an hour later rather than every minute.
-                LOG_WARN(("storage: git: " + r.url + " is not run: " + why).c_str());
-                std::error_code ec;
-                std::filesystem::create_directories(work_of(r.id), ec);
-                write_file(work_of(r.id) + "/state.json",
-                           "{\"ok\":false,\"at\":" + std::to_string(now) + ",\"error\":" + json_str(why) + "}\n", 0600);
-                continue;
-            }
-            return;
-        }
+        if (r.owner == m_user && !running(r.id))
+            mine.push_back(r);
+    const auto has = [&](const repo& r, const char* f) { return ::access((work_of(r.id) + "/" + f).c_str(), F_OK) == 0; };
+    const repo* next = nullptr;
+    // A moved one first, so its old library is emptied soon; then one asked for, at once; then, once a minute, one
+    // that is due.
+    for (const repo& r : mine)
+        if (!next && has(r, "moved-from"))
+            next = &r;
+    for (const repo& r : mine)
+        if (!next && has(r, "asked"))
+            next = &r;
+    if (!next && now >= m_next_look)
+    {
+        m_next_look = now + 60;
+        for (const repo& r : mine)
+            if (!next && due(r, now))
+                next = &r;
+    }
+    if (!next)
+        return;
+    if (const std::string why = start(*next, id); !why.empty())
+    {
+        // Said where the interface shows it, and asked again an hour later rather than every minute.
+        LOG_WARN(("git: " + next->url + " is not run: " + why).c_str());
+        ++m_done.failures;
+        m_done.last_error = why;
+        ::unlink((work_of(next->id) + "/asked").c_str());
+        std::error_code ec;
+        std::filesystem::create_directories(work_of(next->id), ec);
+        write_file(work_of(next->id) + "/state.json",
+                   "{\"ok\":false,\"at\":" + std::to_string(now) + ",\"error\":" + json_str(why) + "}\n", 0600);
+    }
 }
 
 void git_mirrors::stop()

@@ -19,6 +19,7 @@
 namespace socketley::sync
 {
 class sync_run;
+class repo_runner;
 }
 
 // Who carries what, the same three words a server and a client take.
@@ -85,6 +86,11 @@ public:
     void set_exclude(std::string_view csv) { m_exclude = std::string(csv); }
     std::string_view get_exclude() const { return m_exclude; }
 
+    // The file a storage writes for a user's own sync runtime (--repositories), which makes the job pulling that
+    // user's git repositories into their libraries rather than carrying a directory.
+    void set_repositories(std::string_view path) { m_repositories = std::string(path); }
+    std::string_view get_repositories() const { return m_repositories; }
+
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool setup(event_loop& loop) override;
     void teardown(event_loop& loop) override;
@@ -101,10 +107,13 @@ private:
     std::string m_prefix;
     std::string m_credentials;
     std::string m_exclude;
+    std::string m_repositories;
     sync_mode   m_mode{sync_mode_out};
     uint32_t    m_every{sync_default_every};
 
     std::unique_ptr<socketley::sync::sync_run> m_run;
     // Runs that were stopped and that the ring still owes a completion.
     std::vector<std::unique_ptr<socketley::sync::sync_run>> m_graveyard;
+    std::unique_ptr<socketley::sync::repo_runner> m_repos;
+    std::vector<std::unique_ptr<socketley::sync::repo_runner>> m_repo_graveyard;
 };

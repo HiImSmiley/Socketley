@@ -1364,6 +1364,14 @@ public:
     void op_delete_lifecycle(const std::shared_ptr<conn>& c);
     // Starts a pass when one is due, from the sweep's tick.
     void lifecycle_tick();
+    // Every user a sync runtime of their own, which runs their repositories: made by the first shard, owned by this
+    // runtime, and handed fresh temporary credentials before the last run out.
+    void tend_sync_runners();
+    std::string sync_runner_name(std::string_view user) const;
+    std::string sync_runner_file(std::string_view user) const;
+    int64_t m_runners_at{0};
+    std::string m_git_endpoint;
+    std::unordered_map<std::string, std::string> m_runners;
     // Moves the pass on by a bounded step: deletes up to the in-flight cap, and a bounded walk to find more.
     void lifecycle_pump();
     // A bucket's rules changed, so a pass runs soon.

@@ -1617,6 +1617,16 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
             sy->set_exclude(pa.args[++i]);
             return 0;
         }
+        case fnv1a("--repositories"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << "--repositories requires the file a storage runtime writes for a user's sync runtime\n";
+                return 1;
+            }
+            sy->set_repositories(pa.args[++i]);
+            return 0;
+        }
         default:
             return -1;
     }

@@ -128,6 +128,12 @@ select.inp{padding-right:34px;appearance:none;-webkit-appearance:none;cursor:poi
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239aa2b8' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7 10 5 5 5-5'/%3E%3C/svg%3E");
   background-position:right 10px center;background-size:16px 16px;background-repeat:no-repeat}
 select.inp option{background:#151821}
+.optlist{position:fixed;z-index:95;max-height:min(340px,60vh);overflow:auto;padding:6px;border-radius:12px;background:rgba(22,25,36,.97);
+  border:1px solid var(--line2);box-shadow:var(--sh);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+.optlist button{display:flex;align-items:center;gap:10px;width:100%;padding:8px 12px;border-radius:8px;text-align:left;color:#dfe3ee;font:inherit;font-size:14px;white-space:nowrap}
+.optlist button:hover,.optlist button:focus-visible{background:rgba(255,255,255,.08);outline:0}
+.optlist button.on{color:var(--fg);font-weight:600;background:rgba(var(--glow),.14)}
+.optlist button.on::after{content:'';margin-left:auto;width:7px;height:7px;border-radius:50%;background:var(--grad)}
 .inp.sm{height:32px}
 select.inp.sm{line-height:30px}
 
@@ -705,6 +711,50 @@ function popup(at, entries) {
 }
 document.addEventListener('mousedown', e => { if (openPop && !openPop.contains(e.target)) closePop(); });
 window.addEventListener('blur', closePop);
+// A select's list is drawn by the page, in its theme, since the one the system draws ignores it.
+(() => {
+  let list = null;
+  const close = () => { if (list) { list.remove(); list = null; } };
+  const show = s => {
+    close();
+    const m = el('div', { class: 'optlist', role: 'listbox' });
+    for (const o of s.options)
+      m.append(el('button', { type: 'button', role: 'option', class: o.value === s.value ? 'on' : '', disabled: o.disabled, onclick: () => {
+        close(); s.focus();
+        if (s.value !== o.value) { s.value = o.value; s.dispatchEvent(new Event('input', { bubbles: true })); s.dispatchEvent(new Event('change', { bubbles: true })); }
+      } }, el('span', { text: o.text })));
+    host().append(m);
+    const r = s.getBoundingClientRect();
+    m.style.minWidth = r.width + 'px';
+    let y = r.bottom + 6;
+    if (y + m.offsetHeight > innerHeight - 8) y = Math.max(8, r.top - 6 - m.offsetHeight);
+    m.style.left = Math.max(8, Math.min(r.left, innerWidth - m.offsetWidth - 8)) + 'px';
+    m.style.top = y + 'px';
+    m._sel = s; list = m;
+    (m.querySelector('.on') || m.firstChild)?.focus({ preventScroll: true });
+    m.querySelector('.on')?.scrollIntoView({ block: 'nearest' });
+  };
+  document.addEventListener('mousedown', e => {
+    if (list && list.contains(e.target)) return;
+    const s = e.target.closest ? e.target.closest('select.inp') : null;
+    if (!s || s.disabled || e.button !== 0) { close(); return; }
+    e.preventDefault();
+    if (list && list._sel === s) { close(); s.focus(); } else show(s);
+  }, true);
+  document.addEventListener('keydown', e => {
+    if (list) {
+      const bs = [...list.querySelectorAll('button:not([disabled])')], i = bs.indexOf(document.activeElement);
+      if (e.key === 'Escape' || e.key === 'Tab') { const s = list._sel; close(); s.focus(); if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); } return; }
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); (bs[Math.max(0, Math.min(bs.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))] || bs[0])?.focus(); return; }
+      return;
+    }
+    const s = e.target.closest ? e.target.closest('select.inp') : null;
+    if (s && (e.key === ' ' || e.key === 'Enter' || (e.altKey && e.key === 'ArrowDown'))) { e.preventDefault(); show(s); }
+  }, true);
+  addEventListener('blur', close);
+  addEventListener('resize', close);
+  document.addEventListener('scroll', e => { if (list && !list.contains(e.target)) close(); }, true);
+})();
 const layers = [];
 function modal(title, body, foot, wide) {
   const box = el('div', { class: 'dlg' + (wide ? ' wide' : ''), role: 'dialog' });
@@ -1453,8 +1503,8 @@ function actions() {
     one && !one.dir ? { icon: 'download', label: 'Download', fn: () => download(files) } : null,
     !one || one.dir ? { icon: 'archive', label: one ? 'Download as ZIP' : 'Download ' + s.length + ' items as ZIP', fn: () => downloadZip(s) } : null,
     one && !one.dir && ext(one.name) === 'zip' ? { icon: 'archive', label: 'Unzip here', fn: () => unzip(one) } : null,
-    one && one.kind === 'video' ? { icon: 'link', label: 'Copy link for Discord', fn: () => discordLink(one) } : null,
     one ? { icon: 'share', label: 'Share link…', fn: () => shareDlg(one) } : null,
+    one && !one.dir ? { icon: 'link', label: 'Create public link', fn: () => publicLink(one) } : null,
     one && one.kind !== 'bucket' ? { icon: 'edit', label: 'Rename…', key: 'F2', fn: () => rename(one) } : null,
     s.every(x => x.kind !== 'bucket') ? { icon: 'copy', label: s.length > 1 ? 'Copy ' + s.length + ' items' : 'Copy', key: 'Ctrl+D', fn: () => duplicate(s) } : null,
     '-',
@@ -1730,22 +1780,23 @@ function shareDlg(it) {
         // Its size first, which the page tells the chat, and a web copy when it is not an MP4 already.
         const sh = url.slice(location.origin.length + 1);
         fetch('/~media/info/' + sh).then(() => fetch('/~media/web/' + sh + '?prepare')).catch(() => {});
-        out.append(el('p', { class: 'mut', style: 'font-size:12.5px;margin:8px 0 0', text: 'Pasted into Discord or another chat, the link shows a player. A film that is not an MP4 browsers play is made into one first, which takes a while for a long one.' }));
+        out.append(el('p', { class: 'mut', style: 'font-size:12.5px;margin:8px 0 0', text: 'Pasted into a chat, the link shows a player. A film that is not an MP4 browsers play is made into one first, which takes a while for a long one.' }));
       }
       copy(url, inp);
     } catch (e) { fail(e); }
   };
   modal('Share ' + it.name, body, [btn('link', 'Create link', make, 'pri')]);
 }
-// A film's link for a chat, in one step: a link that does not end, its web copy asked for, the link copied.
-async function discordLink(it) {
+// A link that does not end, made and copied in one step, a film's web copy asked for so a chat embeds a player.
+async function publicLink(it) {
   try {
     const r = await must(await api('POST', '/~share', { body: JSON.stringify({ bucket: it.segs[0], key: it.segs.slice(1).join('/'), expires_in: 0 }) }));
     const url = location.origin + (await r.json()).url;
     const sh = url.slice(location.origin.length + 1);
-    fetch('/~media/info/' + sh).then(() => fetch('/~media/web/' + sh + '?prepare')).catch(() => {});
-    try { await navigator.clipboard.writeText(url); toast('Link copied: paste it into Discord and it shows a player', 'ok', 6000); }
-    catch (e) { secretBox('Link for Discord', [['Link', url]], 'Paste it into Discord; it shows a player there.'); }
+    if (it.kind === 'video') fetch('/~media/info/' + sh).then(() => fetch('/~media/web/' + sh + '?prepare')).catch(() => {});
+    const what = 'It works until you remove it under Shared links.' + (it.kind === 'video' ? ' In a chat it shows a player.' : '');
+    try { await navigator.clipboard.writeText(url); toast('Public link copied. ' + what, 'ok', 6000); }
+    catch (e) { secretBox('Public link', [['Link', url]], what); }
   } catch (e) { fail(e); }
 }
 function copy(text, inp) {
@@ -1858,7 +1909,7 @@ function reposPane(box, L) {
             try { await must(await api('POST', '/~ui/git', { body: JSON.stringify({ action: 'remove', id: r.id }) })); fill(); } catch (e) { fail(e); }
           }, 'sm bad'))));
     }
-    box.append(form, T, acct);
+    box.append(form, T, el('p', { class: 'mut', style: 'font-size:12.5px;margin:12px 0 0' }, 'Pulled by your own sync runtime, ', el('code', { text: g.runtime }), ', which the daemon’s dashboard lists with its runs and failures.'), acct);
     // Asked again only while the dialog is still shown, so a closed one stops polling.
     if (busy) timer = setTimeout(() => { if (box.isConnected) fill(); }, 3000);
   }
@@ -1896,19 +1947,20 @@ function computersPane(box) {
     const k = key || '<access key>', s = secret || '<secret>';
     const prefix = folder.value.trim().replace(/^\/+/, '');
     const target = lib.value + (prefix ? '/' + prefix.replace(/\/?$/, '/') : '/');
+    const home = (navigator.platform.startsWith('Win') ? 'C:\\Users\\you\\' : '~/') + name.value;
     out.append(
-      el('h4', { text: 'As a drive, on Windows, macOS or Linux' }),
-      el('p', { class: 'mut', style: 'font-size:13px', text: 'Add a network location with this address and sign in with your name and password. Windows: This PC › Map network drive; macOS: Finder › Go › Connect to Server.' }),
-      code(origin + '/~dav/' + target),
-      el('h4', { text: 'A folder kept in sync, with rclone' }),
-      el('p', { class: 'mut', style: 'font-size:13px', text: 'rclone runs on Windows, macOS and Linux. Put this into its configuration (rclone config file shows where it is), then run the first command once and the second as often as you like, by hand or on a schedule.' }),
-      code('[socketley]\ntype = s3\nprovider = Other\naccess_key_id = ' + k + '\nsecret_access_key = ' + s + '\nendpoint = ' + origin + '\nforce_path_style = true'),
-      code('rclone bisync "' + (navigator.platform.startsWith('Win') ? 'C:\\Users\\you\\' : '~/') + name.value + '" socketley:' + target + ' --resync --create-empty-src-dirs'),
-      code('rclone bisync "' + (navigator.platform.startsWith('Win') ? 'C:\\Users\\you\\' : '~/') + name.value + '" socketley:' + target + ' --create-empty-src-dirs'),
-      el('h4', { text: 'On Linux, with socketley' }),
+      el('h4', { text: 'With socketley, on Linux' }),
       el('p', { class: 'mut', style: 'font-size:13px', text: 'A sync runtime on the computer keeps the folder and the library in step both ways, watching the folder for changes. Save the credentials as a file, then create it.' }),
       code('access_key = ' + k + '\nsecret_key = ' + s),
-      code('socketley create sync ' + name.value + ' --dir ~/' + name.value + ' --storage ' + origin + '/' + lib.value + (prefix ? ' --prefix ' + prefix.replace(/\/$/, '') : '') + ' --credentials ~/.config/socketley/' + name.value + '.creds --mode inout --every 5m -s'));
+      code('socketley create sync ' + name.value + ' --dir ~/' + name.value + ' --storage ' + origin + '/' + lib.value + (prefix ? ' --prefix ' + prefix.replace(/\/$/, '') : '') + ' --credentials ~/.config/socketley/' + name.value + '.creds --mode inout --every 5m -s'),
+      el('h4', { text: 'With rclone, on Windows, macOS or Linux' }),
+      el('p', { class: 'mut', style: 'font-size:13px', text: 'Put this into rclone’s configuration (rclone config file shows where it is), then run the first command once and the second as often as you like, by hand or on a schedule.' }),
+      code('[socketley]\ntype = s3\nprovider = Other\naccess_key_id = ' + k + '\nsecret_access_key = ' + s + '\nendpoint = ' + origin + '\nforce_path_style = true'),
+      code('rclone bisync "' + home + '" socketley:' + target + ' --resync --create-empty-src-dirs'),
+      code('rclone bisync "' + home + '" socketley:' + target + ' --create-empty-src-dirs'),
+      el('h4', { text: 'As a drive' }),
+      el('p', { class: 'mut', style: 'font-size:13px', text: 'Not a copy but the library itself, opened over the network: add a network location with this address and sign in with your name and password. Windows: This PC › Map network drive; macOS: Finder › Go › Connect to Server.' }),
+      code(origin + '/~dav/' + target));
     if (!key) out.prepend(el('p', { class: 'mut', style: 'font-size:13px', text: 'Make a key for this computer first: it goes in where <access key> and <secret> stand, and the secret is shown only now.' }));
   };
   const make = async () => {
