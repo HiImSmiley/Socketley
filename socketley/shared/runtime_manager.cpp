@@ -601,6 +601,17 @@ bool runtime_manager::remove(std::string_view name)
         return false;
     }
 
+    // A stopped runtime in a worker of its own has its supervisor retired first, while the instance it reads is
+    // still here: a child removed with its parent is freed before the daemon reconciles after the stop.
+    bool out_of_process = false;
+    {
+        std::shared_lock lock(mutex);
+        auto it = runtimes.find(name);
+        out_of_process = it != runtimes.end() && it->second->is_out_of_process();
+    }
+    if (out_of_process)
+        release_workers();
+
     std::unique_ptr<runtime_instance> inst;
     {
         std::unique_lock lock(mutex);
