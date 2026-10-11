@@ -17,6 +17,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -158,7 +159,8 @@ static int map_create(uint32_t type, uint32_t key, uint32_t value, uint32_t entr
     a.value_size = value;
     a.max_entries = entries;
     a.map_flags = flags;
-    std::strncpy(a.map_name, name, sizeof(a.map_name) - 1);
+    // The kernel keeps 15 characters of a map's name and a NUL, so a longer name is cut there.
+    std::memcpy(a.map_name, name, std::min(std::strlen(name), sizeof(a.map_name) - 1));
     return static_cast<int>(sys_bpf(BPF_MAP_CREATE, &a));
 }
 
