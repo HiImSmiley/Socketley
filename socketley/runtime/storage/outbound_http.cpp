@@ -632,15 +632,7 @@ void http_peer::advance()
 bool http_peer::flush_cipher()
 {
     std::string cipher;
-    char buf[16384];
-    for (;;)
-    {
-        const int n = tls_context::bio_read_out(m_ssl, buf, sizeof(buf));
-        if (n <= 0)
-            break;
-        cipher.append(buf, static_cast<size_t>(n));
-    }
-    if (cipher.empty())
+    if (tls_context::take_out(m_ssl, cipher) == 0)
         return false;
     send(std::make_shared<std::string>(std::move(cipher)), 0);
     return true;

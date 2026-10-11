@@ -112,6 +112,11 @@ public:
     // Read encrypted data from SSL's output BIO (to send via io_uring)
     // Returns bytes read, 0 = nothing pending, -1 = error
     static int bio_read_out(SSL* ssl, char* buf, int len);
+    // Moves up to `max` bytes of the records waiting to be sent onto the end of `out`, and says how many: all of them
+    // into an empty `out` without a copy.
+    static size_t take_out(SSL* ssl, std::string& out, size_t max = SIZE_MAX);
+    // Room for `n` more bytes of records, so a large write grows the buffer once rather than by doubling.
+    static void reserve_out(SSL* ssl, size_t n);
 
     // Returns bytes written, 0 nothing to do, -1 fatal -- including the peer
     // exceeding max_bio_buffered, where the caller must close rather than retry.

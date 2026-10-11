@@ -286,14 +286,7 @@ struct raft_host::link : io_handler
                     break;
                 queue.erase(0, static_cast<size_t>(n));
             }
-            char buf[16384];
-            for (;;)
-            {
-                const int k = tls_context::bio_read_out(ssl, buf, sizeof buf);
-                if (k <= 0)
-                    break;
-                wire_out.append(buf, static_cast<size_t>(k));
-            }
+            tls_context::take_out(ssl, wire_out);
         }
         else if (state == phase::ready)
         {

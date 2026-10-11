@@ -23,10 +23,111 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <new>
 #include <vector>
 
 #include "cert_keeper.h"
 #include "logging.h"
+
+#if SOCKETLEY_HAS_TLS
+namespace
+{
+
+// Every connection's write side: the records SSL writes, kept in one string that take_out hands over whole, where a
+// memory BIO copied them in, zeroed its growth and copied them out again in pieces.
+struct out_bio
+{
+    std::string buf;
+    size_t      off = 0;
+};
+
+int out_write(BIO* b, const char* data, size_t len, size_t* written)
+{
+    BIO_clear_retry_flags(b);
+    static_cast<out_bio*>(BIO_get_data(b))->buf.append(data, len);
+    *written = len;
+    return 1;
+}
+
+int out_read(BIO* b, char* data, size_t len, size_t* read)
+{
+    BIO_clear_retry_flags(b);
+    auto* o = static_cast<out_bio*>(BIO_get_data(b));
+    const size_t n = std::min(len, o->buf.size() - o->off);
+    *read = n;
+    if (n == 0)
+    {
+        // Empty is "ask again", as a memory BIO with an EOF return of -1 says it.
+        BIO_set_retry_read(b);
+        return 0;
+    }
+    std::memcpy(data, o->buf.data() + o->off, n);
+    o->off += n;
+    if (o->off == o->buf.size())
+    {
+        o->buf.clear();
+        o->off = 0;
+    }
+    return 1;
+}
+
+long out_ctrl(BIO* b, int cmd, long, void*)
+{
+    const auto* o = static_cast<const out_bio*>(BIO_get_data(b));
+    switch (cmd)
+    {
+        case BIO_CTRL_PENDING: return static_cast<long>(o->buf.size() - o->off);
+        case BIO_CTRL_FLUSH:   return 1;
+        default:               return 0;
+    }
+}
+
+int out_create(BIO* b)
+{
+    auto* o = new (std::nothrow) out_bio;
+    BIO_set_data(b, o);
+    BIO_set_init(b, o != nullptr);
+    return o != nullptr;
+}
+
+int out_destroy(BIO* b)
+{
+    delete static_cast<out_bio*>(BIO_get_data(b));
+    BIO_set_data(b, nullptr);
+    return 1;
+}
+
+int out_type()
+{
+    static const int type = BIO_get_new_index() | BIO_TYPE_SOURCE_SINK;
+    return type;
+}
+
+const BIO_METHOD* out_method()
+{
+    static BIO_METHOD* const m = []
+    {
+        BIO_METHOD* x = BIO_meth_new(out_type(), "socketley records");
+        if (x && (!BIO_meth_set_write_ex(x, out_write) || !BIO_meth_set_read_ex(x, out_read) ||
+                  !BIO_meth_set_ctrl(x, out_ctrl) || !BIO_meth_set_create(x, out_create) ||
+                  !BIO_meth_set_destroy(x, out_destroy)))
+        {
+            BIO_meth_free(x);
+            x = nullptr;
+        }
+        return x;
+    }();
+    return m;
+}
+
+out_bio* out_of(const SSL* ssl)
+{
+    BIO* wbio = ssl ? SSL_get_wbio(ssl) : nullptr;
+    return wbio && BIO_method_type(wbio) == out_type() ? static_cast<out_bio*>(BIO_get_data(wbio)) : nullptr;
+}
+
+}   // namespace
+#endif
 
 // The TLS configuration gate, next to the OpenSSL wrapper because whoever
 // wires up the next role will be reading this file.
@@ -317,6 +418,7 @@ void note_inbound_failure(const std::string& brief)
 // per-connection SSL object inherits.
 static void apply_ctx_performance_options(SSL_CTX* ctx)
 {
+
     // Session tickets for stateless resumption, with SSL_OP_NO_TICKET cleared
     // explicitly although it is off by default; init_server sets it again.
     long opts = SSL_CTX_get_options(ctx);
@@ -643,8 +745,9 @@ SSL* tls_context::create_ssl() const
 
     // Memory BIO pair and not a socket BIO, so OpenSSL only encodes and
     // decodes and every byte on the wire is carried by an io_uring submission.
+    const BIO_METHOD* records = out_method();
     BIO* rbio = BIO_new(BIO_s_mem());
-    BIO* wbio = BIO_new(BIO_s_mem());
+    BIO* wbio = records ? BIO_new(records) : nullptr;
     if (!rbio || !wbio)
     {
         // Never hand SSL_set_bio a half-allocated pair, because which side it
@@ -658,7 +761,6 @@ SSL* tls_context::create_ssl() const
     }
 
     BIO_set_nbio(rbio, 1);
-    BIO_set_nbio(wbio, 1);
 
     // SSL_free() frees both BIOs from here on; do not free them separately.
     SSL_set_bio(ssl, rbio, wbio);
@@ -666,7 +768,6 @@ SSL* tls_context::create_ssl() const
     // What BIO_read returns from an empty memory BIO: -1 with the retry flag
     // means ask again, where 0 would be read as a closed connection.
     BIO_set_mem_eof_return(rbio, -1);
-    BIO_set_mem_eof_return(wbio, -1);
 
     return ssl;
 #else
@@ -1007,6 +1108,49 @@ bool tls_context::negotiated_h2(SSL* ssl)
 #else
     (void)ssl;
     return false;
+#endif
+}
+
+size_t tls_context::take_out(SSL* ssl, std::string& out, size_t max)
+{
+#if SOCKETLEY_HAS_TLS
+    out_bio* o = out_of(ssl);
+    if (!o)
+        return 0;
+    const size_t n = std::min(max, o->buf.size() - o->off);
+    if (n == 0)
+        return 0;
+    if (out.empty() && o->off == 0 && n == o->buf.size())
+    {
+        // The whole of it, by the string itself; the BIO keeps the empty one it was given.
+        out.swap(o->buf);
+        o->buf.clear();
+        return n;
+    }
+    out.append(o->buf, o->off, n);
+    o->off += n;
+    if (o->off == o->buf.size())
+    {
+        o->buf.clear();
+        o->off = 0;
+    }
+    return n;
+#else
+    (void)ssl;
+    (void)out;
+    (void)max;
+    return 0;
+#endif
+}
+
+void tls_context::reserve_out(SSL* ssl, size_t n)
+{
+#if SOCKETLEY_HAS_TLS
+    if (out_bio* o = out_of(ssl))
+        o->buf.reserve(o->buf.size() + n);
+#else
+    (void)ssl;
+    (void)n;
 #endif
 }
 

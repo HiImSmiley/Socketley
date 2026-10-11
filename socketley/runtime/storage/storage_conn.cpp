@@ -1449,19 +1449,8 @@ bool storage_run::tls_encrypt(const std::shared_ptr<conn>& c)
             c->wq_off = 0;
         }
     }
-    char out[16384];
-    while (c->wbuf.size() - c->woff < tls_write_cap)
-    {
-        const int k = tls_context::bio_read_out(c->ssl, out, sizeof(out));
-        if (k < 0)
-        {
-            close_conn(c);
-            return false;
-        }
-        if (k == 0)
-            break;
-        c->wbuf.append(out, static_cast<size_t>(k));
-    }
+    if (c->wbuf.size() - c->woff < tls_write_cap)
+        tls_context::take_out(c->ssl, c->wbuf, tls_write_cap - (c->wbuf.size() - c->woff));
     return true;
 }
 

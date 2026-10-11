@@ -2083,15 +2083,7 @@ bool cache_instance::tls_flush(client_connection* conn)
     // owns, because the BIO's storage moves under an SQE -- and it rides in
     // write_batch[0] so the short-write retry needs no TLS case.
     std::string cipher;
-    char buf[16384];
-    for (;;)
-    {
-        const int n = tls_context::bio_read_out(conn->ssl, buf, sizeof(buf));
-        if (n <= 0)
-            break;
-        cipher.append(buf, static_cast<size_t>(n));
-    }
-    if (SOCKETLEY_UNLIKELY(cipher.empty()))
+    if (SOCKETLEY_UNLIKELY(tls_context::take_out(conn->ssl, cipher) == 0))
         return true;
 
     // Nothing is in flight (checked above), so any buffers still held are from

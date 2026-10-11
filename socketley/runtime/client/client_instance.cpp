@@ -1502,20 +1502,12 @@ void client_instance::tls_flush()
     if (!tls_context::has_pending_out(m_conn->ssl))
         return;
 
-    // Ciphertext copied out of the write BIO into write_buf rather than
+    // Ciphertext taken out of the write BIO into write_buf rather than
     // pointed at, because the BIO's storage moves as OpenSSL writes the next
-    // record -- and the copy is what keeps the SSL free of anything the ring
+    // record -- and taking it is what keeps the SSL free of anything the ring
     // can name.
     std::string cipher;
-    char buf[16384];
-    for (;;)
-    {
-        const int n = tls_context::bio_read_out(m_conn->ssl, buf, sizeof(buf));
-        if (n <= 0)
-            break;
-        cipher.append(buf, static_cast<size_t>(n));
-    }
-    if (SOCKETLEY_UNLIKELY(cipher.empty()))
+    if (SOCKETLEY_UNLIKELY(tls_context::take_out(m_conn->ssl, cipher) == 0))
         return;
 
     // Nothing is in flight (checked above), so write_buf is this function's to

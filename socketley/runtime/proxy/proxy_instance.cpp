@@ -10497,6 +10497,14 @@ bool proxy_instance::tls_flush(Conn* conn)
     // WANT_READ.
     if (conn->tls_state == tls_conn_ready)
     {
+        // Room for the records of what is queued, as much as ssl_write takes before it refuses, each record of 16 KiB
+        // 22 bytes longer.
+        if (!conn->write_queue.empty())
+        {
+            const size_t plain = std::min<size_t>(conn->write_queue.bytes(),
+                                                  tls_context::max_bio_buffered + conn->write_queue.front().size());
+            tls_context::reserve_out(conn->ssl, plain + plain / 16384 * 22 + 64);
+        }
         while (!conn->write_queue.empty())
         {
             const auto& msg = conn->write_queue.front();
@@ -10526,19 +10534,11 @@ bool proxy_instance::tls_flush(Conn* conn)
     if (!tls_context::has_pending_out(conn->ssl))
         return true;
 
-    // Ciphertext copied out of the write BIO into a buffer this connection
+    // Ciphertext taken out of the write BIO into a buffer this connection
     // owns, because the BIO's storage moves under an SQE -- and it rides in
     // write_batch[0] so the retry paths need no TLS case.
     std::string cipher;
-    char buf[16384];
-    for (;;)
-    {
-        const int n = tls_context::bio_read_out(conn->ssl, buf, sizeof(buf));
-        if (n <= 0)
-            break;
-        cipher.append(buf, static_cast<size_t>(n));
-    }
-    if (SOCKETLEY_UNLIKELY(cipher.empty()))
+    if (SOCKETLEY_UNLIKELY(tls_context::take_out(conn->ssl, cipher) == 0))
         return true;
 
     // Nothing is in flight (checked above), so any batch entries still held are

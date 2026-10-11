@@ -6346,15 +6346,7 @@ void server_instance::tls_flush(server_connection* conn)
     // owns, because the BIO's storage moves under an SQE -- and it rides in
     // write_batch[0] so the short-write retry needs no TLS case.
     auto cipher = std::make_shared<std::string>();
-    char buf[16384];
-    for (;;)
-    {
-        const int n = tls_context::bio_read_out(conn->ssl, buf, sizeof(buf));
-        if (n <= 0)
-            break;
-        cipher->append(buf, static_cast<size_t>(n));
-    }
-    if (SOCKETLEY_UNLIKELY(cipher->empty()))
+    if (SOCKETLEY_UNLIKELY(tls_context::take_out(conn->ssl, *cipher) == 0))
         return;
 
     // Nothing is in flight (checked above), so any refs still held are from a
