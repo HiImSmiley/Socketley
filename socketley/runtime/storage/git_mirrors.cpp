@@ -188,6 +188,23 @@ void git_mirrors::open(std::string dir, uint32_t shard, std::string endpoint, bo
     m_tls = tls;
     m_why_not = std::move(why_not);
     m_any = !repos().empty();
+    // Repositories that went to the one library every user shared go to their owner's own, git-<user>, and each
+    // is run once there to write its whole tree; what the old library holds is left for its owner to delete.
+    if (m_shard == 0 && m_any)
+    {
+        list_lock lock(m_dir);
+        std::vector<repo> rs = repos();
+        for (repo& r : rs)
+            if (r.bucket == "git" && !r.owner.empty() && git_names::library_for(r.owner) != "git")
+            {
+                r.bucket = git_names::library_for(r.owner);
+                ::unlink((work_of(r.id) + "/written").c_str());
+                m_moved.push_back(r.id);
+                LOG_INFO(("storage: git: " + r.url + " goes to the library " + r.bucket + ", its owner's own").c_str());
+            }
+        if (!m_moved.empty() && !save(rs))
+            m_moved.clear();
+    }
 }
 
 std::vector<git_mirrors::repo> git_mirrors::repos()
@@ -518,6 +535,17 @@ void git_mirrors::tick(authenticator& auth)
     }
     if (m_shard != 0 || !available())
         return;
+    // A moved repository's first run in its new library, one at a time like the rest.
+    if (!m_moved.empty() && m_children.empty())
+    {
+        const std::string id = m_moved.back();
+        m_moved.pop_back();
+        for (const repo& r : repos())
+            if (r.id == id)
+                if (const std::string why = start(r, auth); !why.empty())
+                    LOG_WARN(("storage: git: " + r.url + " is not run in its new library: " + why).c_str());
+        return;
+    }
     const int64_t now = static_cast<int64_t>(std::time(nullptr));
     if (now < m_next_look)
         return;

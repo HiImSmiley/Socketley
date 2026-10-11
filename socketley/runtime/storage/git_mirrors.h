@@ -85,6 +85,8 @@ private:
     bool m_tls{false};
     std::string m_cert;
     bool m_any{false};
+    // Repositories moved out of the shared library "git" into their owner's, each to run once to fill it.
+    std::vector<std::string> m_moved;
     int64_t m_next_look{0};
     std::vector<repo> m_cache;
     int64_t m_cache_stamp{-1};

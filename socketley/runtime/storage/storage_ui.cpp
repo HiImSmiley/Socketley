@@ -250,6 +250,8 @@ struct inbox
     int64_t seq{0};
     std::vector<std::string> off;
     std::vector<inbox_item> items;
+    // The user's own choices kept beside what they were told: whether other people's libraries are shown at all.
+    bool show_others{false};
 };
 
 inbox read_inbox(const std::string& path)
@@ -260,6 +262,8 @@ inbox read_inbox(const std::string& path)
     if (!read_whole_file(path, text) || !json_reader(text).document(doc))
         return b;
     b.seq = static_cast<int64_t>(num_of(doc, "seq"));
+    if (const jvalue* so = member(doc, "show_others"); so && so->k == jvalue::kind::boolean)
+        b.show_others = so->b;
     if (const jvalue* off = member(doc, "off"); off && off->k == jvalue::kind::array)
         for (const jvalue& k : off->items)
             if (k.k == jvalue::kind::string && inbox_kind(k.s))
@@ -297,7 +301,7 @@ std::string inbox_item_json(const inbox_item& it)
 
 std::string inbox_json(const inbox& b)
 {
-    std::string o = "{\"seq\":" + std::to_string(b.seq) + ",\"off\":[";
+    std::string o = "{\"seq\":" + std::to_string(b.seq) + (b.show_others ? ",\"show_others\":true" : "") + ",\"off\":[";
     for (size_t i = 0; i < b.off.size(); ++i)
     {
         o += i ? "," : "";
@@ -589,6 +593,7 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
     const int login = u ? m_auth->login_state(u->id) : -1;
     o += login < 0 ? ",\"password\":false" : login ? ",\"password\":true,\"password_reset\":true" : ",\"password\":true";
     o += c->principal.starts_with('~') ? ",\"by_password\":true" : ",\"by_password\":false";
+    o += u && read_inbox(inbox_path(u->id)).show_others ? ",\"show_others\":true" : ",\"show_others\":false";
     o += ",\"expires\":" + std::to_string(expires) + "}";
     out.headers.emplace_back("Content-Type", "application/json");
     out.headers.emplace_back("Cache-Control", "no-store");
@@ -728,9 +733,9 @@ void storage_run::ui_inbox_body(const std::shared_ptr<conn>& c)
         app_reply(c, 204);
         return;
     }
-    if (action != "read" && action != "clear" && action != "prefs")
+    if (action != "read" && action != "clear" && action != "prefs" && action != "settings")
     {
-        app_reply(c, 400, "The action is read, clear, prefs or post.\n");
+        app_reply(c, 400, "The action is read, clear, prefs, settings or post.\n");
         return;
     }
     const std::string dir = m_store.options().dir + "/.ui";
@@ -755,6 +760,11 @@ void storage_run::ui_inbox_body(const std::shared_ptr<conn>& c)
             it.read = true;
     else if (action == "clear")
         b.items.clear();
+    else if (action == "settings")
+    {
+        if (const jvalue* so = member(req, "show_others"); so && so->k == jvalue::kind::boolean)
+            b.show_others = so->b;
+    }
     else
     {
         b.off.clear();

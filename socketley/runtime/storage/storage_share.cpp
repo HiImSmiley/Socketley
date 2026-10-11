@@ -659,12 +659,10 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
             bool web_made = false;
             media_known(s.bucket, key, m.etag(), p, web_made);
             const std::string page = base + "/~share/" + id;
-            // As it is when a browser and a chat play it as it is: H.264 in an MP4, its sound AAC or none.
-            const bool mp4 = p ? p->format.find("mp4") != std::string::npos
-                               : m.content_type.str() == "video/mp4" || m.content_type.str() == "video/quicktime";
-            const bool plays = mp4 && (!p || (p->vcodec == "h264" && !p->hdr() && (!p->audio || p->acodec == "aac")));
+            // The web copy once it is made, whose index is in front so a chat plays it before it has all of it; until
+            // then the file itself, which plays wherever it is H.264 in an MP4.
             const std::string web = base + "/~media/web/~share/" + id;
-            const std::string video = plays || !web_made ? page + "?raw" : web;
+            const std::string video = web_made ? web : page + "?raw";
             int64_t width = p && p->width > 0 ? p->width : 1280, height = p && p->height > 0 ? p->height : 720;
             if (height > 1080)
             {
@@ -672,7 +670,7 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
                 height = 1080;
             }
             app_reply(cc, 200, film_page(last_name_of(key), &m, page, video, base + "/~media/thumb-1280/~share/" + id,
-                                         plays || web_made ? std::string() : web + "?prepare", width, height, https),
+                                         web_made ? std::string() : web + "?prepare", width, height, https),
                       "text/html; charset=utf-8");
         });
         return;

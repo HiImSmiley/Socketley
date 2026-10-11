@@ -3,6 +3,8 @@
 // authenticated and before a script's on_request sees it.
 #include "storage_run.h"
 
+#include <sys/socket.h>
+
 #include <arpa/inet.h>
 #include <openssl/ssl.h>
 
@@ -486,6 +488,24 @@ const client_ip& storage_run::client_address(conn& c)
     c.ip_known = true;
     c.via_offloader = std::any_of(m_tls_offloaded.begin(), m_tls_offloaded.end(),
                                   [&](const bucket_policy::cidr& b) { return cidr_holds(b, c.ip); });
+    // A unix socket's peer is on this machine, as trusted as the loopback it would otherwise have come over: an
+    // entrance reaches a runtime of its daemon that way.
+    if (!c.via_offloader && c.ip.family == 0 && c.sock() >= 0)
+    {
+        sockaddr_storage local{};
+        socklen_t len = sizeof local;
+        if (::getsockname(c.sock(), reinterpret_cast<sockaddr*>(&local), &len) == 0 && local.ss_family == AF_UNIX)
+        {
+            client_ip lo4, lo6;
+            lo4.family = 4;
+            lo4.addr[0] = 127;
+            lo4.addr[3] = 1;
+            lo6.family = 6;
+            lo6.addr[15] = 1;
+            c.via_offloader = std::any_of(m_tls_offloaded.begin(), m_tls_offloaded.end(),
+                                          [&](const bucket_policy::cidr& b) { return cidr_holds(b, lo4) || cidr_holds(b, lo6); });
+        }
+    }
     if (!c.via_offloader)
         return c.ip;
     // The proxy put the address it was reached from last; anything before that is the client's own word.
@@ -525,7 +545,11 @@ bool storage_run::secure(conn& c)
     if (m_tls_offloaded.empty())
         return false;
     client_address(c);
-    return c.via_offloader;
+    if (!c.via_offloader)
+        return false;
+    // The offloader says which side of it the client was on, as one listening on 80 and 443 both must.
+    const std::string_view proto = c.req.header("x-forwarded-proto");
+    return proto.empty() || proto == "https";
 }
 
 policy_effect storage_run::iam_access(const std::shared_ptr<conn>& c, const user_identity& u, std::string_view principal,

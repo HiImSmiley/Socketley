@@ -122,6 +122,8 @@ a{color:inherit}
 #content{padding:0 24px 120px}
 .seg{display:flex;background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:10px;padding:2px}
 .seg .ib{width:34px;height:32px;border-radius:8px}
+.seg>button:not(.ib){padding:6px 14px;border-radius:8px;color:var(--mut);font-weight:600;font-size:13px}
+.seg>button.on{background:rgba(255,255,255,.1);color:var(--fg)}
 select.inp{padding-right:34px;appearance:none;-webkit-appearance:none;cursor:pointer;line-height:36px;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239aa2b8' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7 10 5 5 5-5'/%3E%3C/svg%3E");
   background-position:right 10px center;background-size:16px 16px;background-repeat:no-repeat}
@@ -592,6 +594,7 @@ const P = {
   newfile: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/>',
   eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   bell: '<path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
+  sync: '<path d="M20 11a8 8 0 0 0-14.3-4.9L4 8"/><path d="M4 4v4h4"/><path d="M4 13a8 8 0 0 0 14.3 4.9L20 16"/><path d="M20 20v-4h-4"/>',
   eyeoff: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/><path d="M4 4l16 16"/>',
   wrap: '<path d="M4 6h16M4 12h13a3 3 0 0 1 0 6h-4m2-2-2 2 2 2M4 18h5"/>',
   menu: '<path d="M4 6h16M4 12h16M4 18h16"/>', clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
@@ -650,7 +653,13 @@ let path = [], items = [], buckets = [], shown = [], bucketsAt = 0;
 // What is drawn beside the folder's own list, the films being watched, which a menu acts on as well.
 let extraShown = [];
 // Whether other people's libraries are shown, in a section of their own.
-let showOthers = store.get('skl-others', '1') === '1';
+// Off unless the user turned it on in Account, kept on the server so every device of theirs shows the same.
+let showOthers = false;
+async function setShowOthers(on) {
+  try { await must(await api('POST', '/~ui/notifications', { body: JSON.stringify({ action: 'settings', show_others: on }) })); }
+  catch (e) { fail(e); return; }
+  showOthers = on; if (me) me.show_others = on; buckets = []; side(); load(true);
+}
 const mineLib = b => !b.owner || !me || !me.user || b.owner === me.user;
 let view = store.get('skl-view', 'grid'), sortBy = store.get('skl-sort', 'name'), query = '';
 const sel = new Set(); let anchor = -1;
@@ -810,7 +819,7 @@ function side() {
   $('#nAll').hidden = !(me && me.user);
   nav($('#nSend'), 'send', 'Send a file', false, () => sendDlg());
   nav($('#nUse'), 'bucket', 'Storage', false, usageDlg);
-  nav($('#nGit'), 'git', 'Git', false, gitDlg);
+  nav($('#nGit'), 'sync', 'Sync', false, () => syncDlg());
   $('#nGit').hidden = !(me && me.user);
   nav($('#nAcc'), 'user', 'Account', false, accountDlg);
   $('#nAcc').hidden = !(me && me.user);
@@ -829,11 +838,11 @@ function side() {
   const mine = buckets.filter(mineLib), others = buckets.filter(b => !mineLib(b));
   for (const b of mine) L.append(entry(b));
   if (!mine.length) L.append(el('div', { class: 'dim', style: 'padding:6px 12px;font-size:13px', text: 'No libraries yet' }));
-  if (others.length) {
+  // Other people's, in a column of their own, only for a user who turned them on in Account.
+  if (others.length && showOthers) {
     L.append(el('div', { class: 'sh row' }, el('span', { text: 'Other people’s' }),
-      ibtn(showOthers ? 'eye' : 'eyeoff', showOthers ? 'Hide other people’s libraries' : 'Show other people’s libraries', () => { showOthers = !showOthers; store.set('skl-others', showOthers ? '1' : '0'); side(); if (!path.length) render(); })));
-    if (showOthers) for (const b of others) L.append(entry(b));
-    else L.append(el('div', { class: 'dim', style: 'padding:2px 12px 6px;font-size:12.5px', text: others.length + (others.length === 1 ? ' library, hidden' : ' libraries, hidden') }));
+      ibtn('eyeoff', 'Hide other people’s libraries', () => setShowOthers(false))));
+    for (const b of others) L.append(entry(b));
   }
 }
 function crumbs() {
@@ -872,7 +881,8 @@ $('#q').oninput = () => {
 function searchSection() {
   if (!found || foundFor !== query || !query) return null;
   const here = path.join('/') + (path.length ? '/' : '');
-  const list = found.results.filter(x => !(x.bucket + '/' + x.key).startsWith(here) || (x.bucket + '/' + x.key).slice(here.length).includes('/'));
+  const theirs = new Set(buckets.filter(b => !mineLib(b)).map(b => b.name));
+  const list = found.results.filter(x => (showOthers || !theirs.has(x.bucket)) && (!(x.bucket + '/' + x.key).startsWith(here) || (x.bucket + '/' + x.key).slice(here.length).includes('/')));
   const T = el('table', { class: 'tbl' });
   const B = el('tbody');
   for (const x of list) {
@@ -1041,7 +1051,9 @@ function render() {
   const C = $('#content'); C.textContent = '';
   MORE.clear();
   closePop();
-  const list = sorted(items.filter(it => !query || it.name.toLowerCase().includes(query)));
+  const all = sorted(items.filter(it => !query || it.name.toLowerCase().includes(query)));
+  // At home other people's libraries are left out unless the user turned them on.
+  const list = path.length || showOthers ? all : all.filter(mineLib);
   shown = list;
   extraShown = [];
   C.append(hero(list));
@@ -1441,6 +1453,7 @@ function actions() {
     one && !one.dir ? { icon: 'download', label: 'Download', fn: () => download(files) } : null,
     !one || one.dir ? { icon: 'archive', label: one ? 'Download as ZIP' : 'Download ' + s.length + ' items as ZIP', fn: () => downloadZip(s) } : null,
     one && !one.dir && ext(one.name) === 'zip' ? { icon: 'archive', label: 'Unzip here', fn: () => unzip(one) } : null,
+    one && one.kind === 'video' ? { icon: 'link', label: 'Copy link for Discord', fn: () => discordLink(one) } : null,
     one ? { icon: 'share', label: 'Share link…', fn: () => shareDlg(one) } : null,
     one && one.kind !== 'bucket' ? { icon: 'edit', label: 'Rename…', key: 'F2', fn: () => rename(one) } : null,
     s.every(x => x.kind !== 'bucket') ? { icon: 'copy', label: s.length > 1 ? 'Copy ' + s.length + ' items' : 'Copy', key: 'Ctrl+D', fn: () => duplicate(s) } : null,
@@ -1716,15 +1729,24 @@ function shareDlg(it) {
       if (it.kind === 'video' && !pw.value) {
         // Its size first, which the page tells the chat, and a web copy when it is not an MP4 already.
         const sh = url.slice(location.origin.length + 1);
-        fetch('/~media/info/' + sh).then(r => r.ok ? r.json() : null).then(i => {
-          if (i && !(/video\/mp4/.test(i.mime || '') && i.video === 'h264' && !i.hdr && (!i.audio || i.audio === 'aac'))) fetch('/~media/web/' + sh + '?prepare').catch(() => {});
-        }).catch(() => {});
+        fetch('/~media/info/' + sh).then(() => fetch('/~media/web/' + sh + '?prepare')).catch(() => {});
         out.append(el('p', { class: 'mut', style: 'font-size:12.5px;margin:8px 0 0', text: 'Pasted into Discord or another chat, the link shows a player. A film that is not an MP4 browsers play is made into one first, which takes a while for a long one.' }));
       }
       copy(url, inp);
     } catch (e) { fail(e); }
   };
   modal('Share ' + it.name, body, [btn('link', 'Create link', make, 'pri')]);
+}
+// A film's link for a chat, in one step: a link that does not end, its web copy asked for, the link copied.
+async function discordLink(it) {
+  try {
+    const r = await must(await api('POST', '/~share', { body: JSON.stringify({ bucket: it.segs[0], key: it.segs.slice(1).join('/'), expires_in: 0 }) }));
+    const url = location.origin + (await r.json()).url;
+    const sh = url.slice(location.origin.length + 1);
+    fetch('/~media/info/' + sh).then(() => fetch('/~media/web/' + sh + '?prepare')).catch(() => {});
+    try { await navigator.clipboard.writeText(url); toast('Link copied: paste it into Discord and it shows a player', 'ok', 6000); }
+    catch (e) { secretBox('Link for Discord', [['Link', url]], 'Paste it into Discord; it shows a player there.'); }
+  } catch (e) { fail(e); }
 }
 function copy(text, inp) {
   const ok = () => toast('Link copied');
@@ -1755,11 +1777,11 @@ function linksDlg() {
 }
 // Git repositories kept in a library: pulled every day, week or month, or only when asked, their branch's files under
 // <name>/ and a bundle of their history under _backups/<name>/ whenever anything moved.
-function gitDlg() {
-  const box = el('div');
-  const L = modal('Git', box, null, true);
+// What comes into the user's space from elsewhere: repositories pulled on a schedule, into `box` of the Sync dialog.
+function reposPane(box, L) {
   let timer = 0;
-  L.onclose = () => clearTimeout(timer);
+  const was = L.onclose;
+  L.onclose = () => { clearTimeout(timer); if (was) was(); };
   const field = (label, input) => el('label', { style: 'display:flex;flex-direction:column;gap:4px;font-size:12.5px;flex:1;min-width:140px' }, el('span', { class: 'mut', text: label }), input);
   const url = el('input', { class: 'inp', placeholder: 'https://github.com/you/repo', spellcheck: 'false', autocomplete: 'off' });
   const branch = el('input', { class: 'inp', value: 'main', spellcheck: 'false', title: 'A branch, or * for every branch' });
@@ -1838,10 +1860,65 @@ function gitDlg() {
     }
     box.append(form, T, acct);
     // Asked again only while the dialog is still shown, so a closed one stops polling.
-    if (busy) timer = setTimeout(() => { if (L.isConnected) fill(); }, 3000);
+    if (busy) timer = setTimeout(() => { if (box.isConnected) fill(); }, 3000);
   }
   fill();
+}
+
+// Sync: what comes into the space by itself, and the user's own computers kept in step with it.
+function syncDlg(tab) {
+  const head = el('div', { class: 'seg', style: 'margin:0 0 16px;display:inline-flex' });
+  const box = el('div');
+  const L = modal('Sync', [head, box], null, true);
+  const tabs = [['repos', 'Repositories'], ['computers', 'Your computers']];
+  const show = t => {
+    head.textContent = '';
+    for (const [id, label] of tabs) head.append(el('button', { class: t === id ? 'on' : '', text: label, onclick: () => show(id) }));
+    box.textContent = '';
+    if (t === 'repos') {
+      box.append(el('p', { class: 'mut', style: 'font-size:13px;margin:0 0 14px', text: 'Repositories are pulled into your library ' + gitLibrary() + ' when you ask, or every day, week or month; you are told in the bell when one brought something.' }));
+      const inner = el('div'); box.append(inner); reposPane(inner, L);
+    } else computersPane(box);
+  };
+  show(tab || 'repos');
   return L;
+}
+function computersPane(box) {
+  const host = location.host, origin = location.origin;
+  const lib = el('select', { class: 'inp' }, ...buckets.filter(mineLib).map(b => el('option', { value: b.name, text: b.name === tmpName() ? 'Temporary files' : b.name })));
+  const folder = el('input', { class: 'inp', placeholder: 'optional, as Documents/', spellcheck: 'false' });
+  const name = el('input', { class: 'inp', value: 'laptop', spellcheck: 'false' });
+  const out = el('div');
+  const field = (label, input) => el('label', { style: 'display:flex;flex-direction:column;gap:4px;font-size:12.5px;flex:1;min-width:150px' }, el('span', { class: 'mut', text: label }), input);
+  const code = text => { const c = el('pre', { class: 'code', style: 'white-space:pre-wrap;word-break:break-all;background:rgba(0,0,0,.35);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:6px 0 4px;font-size:12.5px' , text }); return el('div', {}, c, btn('copy', 'Copy', () => copy(text), 'sm')); };
+  const paint = (key, secret) => {
+    out.textContent = '';
+    const k = key || '<access key>', s = secret || '<secret>';
+    const prefix = folder.value.trim().replace(/^\/+/, '');
+    const target = lib.value + (prefix ? '/' + prefix.replace(/\/?$/, '/') : '/');
+    out.append(
+      el('h4', { text: 'As a drive, on Windows, macOS or Linux' }),
+      el('p', { class: 'mut', style: 'font-size:13px', text: 'Add a network location with this address and sign in with your name and password. Windows: This PC › Map network drive; macOS: Finder › Go › Connect to Server.' }),
+      code(origin + '/~dav/' + target),
+      el('h4', { text: 'A folder kept in sync, with rclone' }),
+      el('p', { class: 'mut', style: 'font-size:13px', text: 'rclone runs on Windows, macOS and Linux. Put this into its configuration (rclone config file shows where it is), then run the first command once and the second as often as you like, by hand or on a schedule.' }),
+      code('[socketley]\ntype = s3\nprovider = Other\naccess_key_id = ' + k + '\nsecret_access_key = ' + s + '\nendpoint = ' + origin + '\nforce_path_style = true'),
+      code('rclone bisync "' + (navigator.platform.startsWith('Win') ? 'C:\\Users\\you\\' : '~/') + name.value + '" socketley:' + target + ' --resync --create-empty-src-dirs'),
+      code('rclone bisync "' + (navigator.platform.startsWith('Win') ? 'C:\\Users\\you\\' : '~/') + name.value + '" socketley:' + target + ' --create-empty-src-dirs'),
+      el('h4', { text: 'On Linux, with socketley' }),
+      el('p', { class: 'mut', style: 'font-size:13px', text: 'A sync runtime on the computer keeps the folder and the library in step both ways, watching the folder for changes. Save the credentials as a file, then create it.' }),
+      code('access_key = ' + k + '\nsecret_key = ' + s),
+      code('socketley create sync ' + name.value + ' --dir ~/' + name.value + ' --storage ' + origin + '/' + lib.value + (prefix ? ' --prefix ' + prefix.replace(/\/$/, '') : '') + ' --credentials ~/.config/socketley/' + name.value + '.creds --mode inout --every 5m -s'));
+    if (!key) out.prepend(el('p', { class: 'mut', style: 'font-size:13px', text: 'Make a key for this computer first: it goes in where <access key> and <secret> stand, and the secret is shown only now.' }));
+  };
+  const make = async () => {
+    try { const n = await iam('CreateAccessKey'); paint(n.one('AccessKeyId'), n.one('SecretAccessKey')); toast('Key made: copy what you need now, the secret is not shown again'); }
+    catch (e) { fail(e); }
+  };
+  [lib, folder, name].forEach(i => i.addEventListener('input', () => paint()));
+  box.append(el('p', { class: 'mut', style: 'font-size:13px;margin:0 0 12px', text: 'Keep a folder on your computer and a library here the same, both ways, through ' + host + '.' }),
+    el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px' }, field('Library', lib), field('Folder in it', folder), field('Name of this computer', name), btn('lock', 'Make a key for this computer', make, 'pri')), out);
+  paint();
 }
 // Who else may read or write a library, each a statement of its bucket's policy the server writes.
 function accessDlg(lib) {
@@ -1965,6 +2042,10 @@ function accountDlg() {
       el('span', { class: 'chip' }, el('span', { text: (me.name || me.user) + (me.name && me.name !== me.user ? ' · ' + me.user : '') })),
       me.admin ? el('span', { class: 'chip' }, el('span', { text: 'admin' })) : null,
       el('span', { class: 'chip' }, el('span', { text: me.by_password ? 'signed in with your password' : 'signed in with a key' }))));
+    const so = el('input', { type: 'checkbox' }); so.checked = showOthers;
+    so.onchange = () => setShowOthers(so.checked);
+    box.append(el('h4', { text: 'Libraries' }), el('label', { class: 'chk', style: 'margin-bottom:18px' }, so,
+      el('span', { text: 'Show other people’s libraries, in a column of their own' })));
     await noteSettings(box);
     box.append(el('h4', { text: 'Password' }), el('div', { style: 'display:flex;align-items:center;gap:10px;margin-bottom:18px' },
       el('span', { class: 'mut', text: me.password ? 'You sign in with your name and password.' : 'You have no password yet: you sign in with a key.' }),
@@ -3685,6 +3766,7 @@ window.addEventListener('drop', async e => {
 
 async function start() {
   auth = true;
+  showOthers = !!(me && me.show_others);
   if (me && me.password_reset) setTimeout(() => changePasswordDlg(true), 0);
   $('#login').hidden = true; $('#app').hidden = false; fromHash(); buckets = [];
   await migratePositions();
