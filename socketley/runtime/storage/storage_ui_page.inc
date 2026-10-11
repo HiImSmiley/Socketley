@@ -667,6 +667,9 @@ async function setShowOthers(on) {
   showOthers = on; if (me) me.show_others = on; buckets = []; side(); load(true);
 }
 const mineLib = b => !b.owner || !me || !me.user || b.owner === me.user;
+// Whether libraries that are not the user's own are shown: always to a user who is no admin, who is listed only those
+// shared with them, and to an admin, who is listed every one, once they turned it on.
+const seesOthers = () => showOthers || !(me && me.admin);
 let view = store.get('skl-view', 'grid'), sortBy = store.get('skl-sort', 'name'), query = '';
 const sel = new Set(); let anchor = -1;
 
@@ -753,6 +756,7 @@ window.addEventListener('blur', closePop);
   }, true);
   addEventListener('blur', close);
   addEventListener('resize', close);
+  addEventListener('hashchange', close);
   document.addEventListener('scroll', e => { if (list && !list.contains(e.target)) close(); }, true);
 })();
 const layers = [];
@@ -888,10 +892,10 @@ function side() {
   const mine = buckets.filter(mineLib), others = buckets.filter(b => !mineLib(b));
   for (const b of mine) L.append(entry(b));
   if (!mine.length) L.append(el('div', { class: 'dim', style: 'padding:6px 12px;font-size:13px', text: 'No libraries yet' }));
-  // Other people's, in a column of their own, only for a user who turned them on in Account.
-  if (others.length && showOthers) {
-    L.append(el('div', { class: 'sh row' }, el('span', { text: 'Other people’s' }),
-      ibtn('eyeoff', 'Hide other people’s libraries', () => setShowOthers(false))));
+  // Other people's, in a column of their own: those shared with the user, or every one for an admin who asked.
+  if (others.length && seesOthers()) {
+    L.append(el('div', { class: 'sh row' }, el('span', { text: me && me.admin ? 'Other people’s' : 'Shared with you' }),
+      me && me.admin ? ibtn('eyeoff', 'Hide other people’s libraries', () => setShowOthers(false)) : null));
     for (const b of others) L.append(entry(b));
   }
 }
@@ -932,7 +936,7 @@ function searchSection() {
   if (!found || foundFor !== query || !query) return null;
   const here = path.join('/') + (path.length ? '/' : '');
   const theirs = new Set(buckets.filter(b => !mineLib(b)).map(b => b.name));
-  const list = found.results.filter(x => (showOthers || !theirs.has(x.bucket)) && (!(x.bucket + '/' + x.key).startsWith(here) || (x.bucket + '/' + x.key).slice(here.length).includes('/')));
+  const list = found.results.filter(x => (seesOthers() || !theirs.has(x.bucket)) && (!(x.bucket + '/' + x.key).startsWith(here) || (x.bucket + '/' + x.key).slice(here.length).includes('/')));
   const T = el('table', { class: 'tbl' });
   const B = el('tbody');
   for (const x of list) {
@@ -1103,7 +1107,7 @@ function render() {
   closePop();
   const all = sorted(items.filter(it => !query || it.name.toLowerCase().includes(query)));
   // At home other people's libraries are left out unless the user turned them on.
-  const list = path.length || showOthers ? all : all.filter(mineLib);
+  const list = path.length || seesOthers() ? all : all.filter(mineLib);
   shown = list;
   extraShown = [];
   C.append(hero(list));
@@ -1125,7 +1129,7 @@ function render() {
       const cw = watching();
       if (cw.length && !query) { extraShown = cw; C.append(section('Continue watching', 'vid', cw, it => videoCard(it, cw))); }
       C.append(section('Libraries', 'lib', list.filter(mineLib), libCard) || '');
-      if (showOthers) C.append(section('Other people’s libraries', 'lib', list.filter(b => !mineLib(b)), libCard) || '');
+      if (seesOthers()) C.append(section(me && me.admin ? 'Other people’s libraries' : 'Shared with you', 'lib', list.filter(b => !mineLib(b)), libCard) || '');
     } else {
       const by = k => list.filter(it => it.kind === k);
       const vids = by('video'), pics = by('image'), auds = by('audio');
@@ -1789,7 +1793,8 @@ function shareDlg(it) {
 // A film's web copy asked for and waited on, since a chat that reads the link before it is made embeds no player
 // and keeps that answer for a while.
 async function chatReady(sh, name) {
-  try { await fetch('/~media/info/' + sh); } catch (e) {}
+  // The still too, which the chat shows first and fetches in the few seconds it gives a link.
+  try { await fetch('/~media/info/' + sh); await fetch('/~media/thumb-1280/' + sh); } catch (e) {}
   let told = null;
   for (let i = 0; i < 400; i++) {
     let r = null;
@@ -2110,7 +2115,8 @@ function accountDlg() {
       el('span', { class: 'chip' }, el('span', { text: me.by_password ? 'signed in with your password' : 'signed in with a key' }))));
     const so = el('input', { type: 'checkbox' }); so.checked = showOthers;
     so.onchange = () => setShowOthers(so.checked);
-    box.append(el('h4', { text: 'Libraries' }), el('label', { class: 'chk', style: 'margin-bottom:18px' }, so,
+    // Only an admin is listed libraries nobody shared with them; everyone sees what was shared with them.
+    if (me.admin) box.append(el('h4', { text: 'Libraries' }), el('label', { class: 'chk', style: 'margin-bottom:18px' }, so,
       el('span', { text: 'Show other people’s libraries, in a column of their own' })));
     await noteSettings(box);
     box.append(el('h4', { text: 'Password' }), el('div', { style: 'display:flex;align-items:center;gap:10px;margin-bottom:18px' },
@@ -2162,7 +2168,8 @@ function usersDlg() {
       const others = el('input', { type: 'checkbox', onchange: () => othersFor(u, others) }); others.checked = !!u.show_others;
       T.append(el('tr', {}, el('td', { class: 'w' }, el('b', { text: u.name }), u.name !== u.id ? el('span', { class: 'mut', text: ' · ' + u.id }) : null, u.email ? el('div', { class: 'mut', style: 'font-size:12.5px', text: u.email }) : null),
         el('td', { class: 'mut', style: 'font-size:12.5px;white-space:nowrap', text: badges.join(' · ') }), el('td', { class: 'mut', style: 'font-size:12.5px;white-space:nowrap', text: u.max_bytes ? 'quota ' + human(u.max_bytes) : '' }),
-        el('td', { style: 'white-space:nowrap' }, el('label', { class: 'chk', title: 'Whether ' + u.id + ' sees the libraries of other people, in a column of their own' }, others, el('span', { style: 'font-size:12.5px', text: 'Sees others’ libraries' }))),
+        // Only an admin is listed every library; anyone else sees their own and those shared with them.
+        el('td', { style: 'white-space:nowrap' }, u.admin ? el('label', { class: 'chk', title: 'Whether ' + u.id + ' sees the libraries of other people, in a column of their own' }, others, el('span', { style: 'font-size:12.5px', text: 'Sees others’ libraries' })) : null),
         el('td', { class: 'r' }, more)));
     }
     if (d.invites && d.invites.length) {

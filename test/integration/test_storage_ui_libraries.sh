@@ -149,6 +149,12 @@ check("and the user turns it off again", (st, sees(jc)), (204, False))
 st, _, _ = http("POST", "/~ui/notifications", cookie=rc, ui=True, body={"action": "settings", "user": "nobody", "show_others": True})
 check("a user that is none is refused", st, 404)
 
+# ── a library shared with a user ──
+st, body, _ = http("POST", "/~ui/access", cookie=rc, ui=True, body={"bucket": "rootlib", "user": "jonas", "access": "read"})
+check("a library is shared with a user to view", st, 204)
+st, x, _ = http("PROPFIND", "/~dav/", key=JONAS)
+check("and the user is listed it, as the owner's", owners_of(x).get("rootlib"), "root")
+
 # ── the page ──
 st, page, _ = http("GET", "/~ui/", key=ROOT)
 check("the logo leads home", ('id="homeLogo"' in page, "$('#homeLogo').onclick" in page), (True, True))
