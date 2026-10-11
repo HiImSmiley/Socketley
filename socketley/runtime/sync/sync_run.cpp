@@ -1446,9 +1446,11 @@ void sync_run::decide_pull(target& t)
             continue;
         else if (!storage_changed)
         {
-            // Changed here only: the walk carries it out; one way in, the storage's copy is put back.
+            // Changed here only: the walk carries it out; one way in, the storage's copy is put back and this side's
+            // kept beside it.
             if (both)
                 continue;
+            f.conflict = true;
         }
         else if (here_changed)
             f.conflict = true;

@@ -16,6 +16,7 @@
 #     conditional write exists to prevent
 #   * a key that climbs out of the directory written outside it
 #   * one way in, a file changed here not put back, or its change lost
+#     rather than kept beside it
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -131,6 +132,7 @@ printf 'edited here' > "$T/in/a.txt"
 put media/sub/b.txt "b2"
 until_ok 15 test "$(cat "$T/in/a.txt")" = a
 expect "a file changed here is put back as the storage has it" "$(cat "$T/in/a.txt") $(cat "$T/in/sub/b.txt")" "a b2"
+expect "and the change made here is kept beside it" "$(cat "$T/in"/a\ \(conflict*.txt 2>/dev/null)" "edited here"
 expect "with nothing written over on the storage" "$(S "http://127.0.0.1:$P/media/a.txt")" a
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
