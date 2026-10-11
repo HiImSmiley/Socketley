@@ -715,8 +715,24 @@ void storage_run::ui_inbox_body(const std::shared_ptr<conn>& c)
         app_reply(c, 400, "The body is a JSON object with an action: read, clear, prefs or post.\n");
         return;
     }
-    const std::string who = c->user ? c->user->id : c->principal;
+    std::string who = c->user ? c->user->id : c->principal;
     const std::string action = str_of(req, "action");
+    // An admin sets what another user sees; nobody else is anybody but themselves here.
+    if (const std::string other = str_of(req, "user"); action == "settings" && !other.empty() && other != who)
+    {
+        if (!c->user || !c->user->admin)
+        {
+            app_reply(c, 403, "Only an admin changes what another user sees.\n");
+            return;
+        }
+        const auto users = m_auth->users();
+        if (std::none_of(users.begin(), users.end(), [&](const auto& u) { return u->id == other && !u->cluster; }))
+        {
+            app_reply(c, 404, "There is no such user.\n");
+            return;
+        }
+        who = other;
+    }
     if (action == "post")
     {
         // What a user tells itself is news of its own syncing, the one kind made outside this runtime.
@@ -1704,6 +1720,7 @@ void storage_run::ui_users(const std::shared_ptr<conn>& c)
             o += ",\"disabled\":";
             o += tag(iam_tag_disabled) == "true" ? "true" : "false";
             o += ",\"keys\":" + std::to_string(keys);
+            o += read_inbox(inbox_path(u->id)).show_others ? ",\"show_others\":true" : ",\"show_others\":false";
             o += ",\"libraries\":";
             o += u->admin || file || (iu && iu->policies.inline_docs.count(std::string(iam_libraries_policy))) ? "true" : "false";
             o += ",\"created\":" + std::to_string(iu ? iu->created_ms : 0);

@@ -44,6 +44,11 @@ struct sync_stats
     uint64_t failing{0};
     // Directories inotify is watching, 0 when the walk on --every is all that sees a change.
     uint64_t watched{0};
+    // What `inout` brought here from the storage, and took away here because the storage no longer had it.
+    uint64_t brought{0};
+    uint64_t removed_here{0};
+    // Files both sides changed since they were last the same, the storage's copy kept beside this side's.
+    uint64_t conflicts{0};
     // Seconds since the last walk of the directory ended, and what went wrong last.
     uint64_t    last_run_secs{0};
     std::string last_error;
@@ -101,6 +106,23 @@ private:
         std::vector<std::string> etags;
     };
 
+    // A file the storage has that this side is to have, brought in pieces into a file of its own below --dir and
+    // given its name once it is whole.
+    struct fetch
+    {
+        // Where it goes below --dir, and which object it is, as the index names it: the same but for a conflict.
+        std::string rel, key_rel;
+        std::string etag;
+        uint64_t size{0}, got{0};
+        std::string temp;
+        int fd{-1};
+        bool conflict{false};
+        // This side's file as it was when the fetch was decided, so one changed meanwhile is not written over.
+        bool here{false};
+        uint64_t here_size{0};
+        int64_t here_mtime{0};
+    };
+
     // One exchange at a time, on a connection kept between them, and the path it is about.
     struct lane
     {
@@ -108,6 +130,7 @@ private:
         bool busy{false};
         std::string path;
         std::unique_ptr<upload> mpu;
+        std::unique_ptr<fetch> get;
     };
 
     struct target
@@ -178,6 +201,28 @@ private:
     void refused(target& t, lane& l, const job& j, const socketley::storage::http_answer& a);
     // Whether `rel` is one of --exclude's patterns.
     bool excluded(const std::string& rel) const;
+
+    // ── the storage's side, for --mode inout: listed, set against the index and this side, and brought here ──
+    struct remote_obj
+    {
+        std::string etag;
+        uint64_t size{0};
+    };
+    bool two_way() const;
+    void begin_pull();
+    void list_page(target& t, lane& l);
+    void decide_pull(target& t);
+    void pump_fetch(target& t);
+    void fetch_range(target& t, lane& l);
+    void fetch_done(target& t, lane& l, bool ok);
+    void finish_pull();
+    // A request of the bucket itself rather than of a key in it, as a listing is.
+    socketley::storage::http_request signed_bucket_request(const target& t, std::string_view query) const;
+    bool m_pull_due{false};
+    bool m_pulling{false};
+    std::string m_list_token;
+    std::unordered_map<std::string, remote_obj> m_remote;
+    std::deque<fetch> m_fetches;
     // The key an object is written under: --prefix and the path below --dir.
     std::string key_of(const std::string& rel) const;
     // A failure: counted, kept as the last error, and logged once per change of what it says.

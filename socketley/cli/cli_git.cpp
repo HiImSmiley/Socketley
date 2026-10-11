@@ -217,14 +217,16 @@ public:
     ~s3_client() { drop(); }
 
     // One request; the body, when there is one, comes from `body` in pieces, `length` bytes in all.
+    // `copy` names an object the new one is copied from, as x-amz-copy-source does.
     bool request(std::string_view method, const std::string& path, const std::string& query, reply& r,
-                 uint64_t length = 0, const std::function<bool(const std::function<bool(const char*, size_t)>&)>& body = {})
+                 uint64_t length = 0, const std::function<bool(const std::function<bool(const char*, size_t)>&)>& body = {},
+                 const std::string& copy = {})
     {
         for (int attempt = 0; attempt < 2; ++attempt)
         {
             if (!connected() && !connect())
                 continue;
-            if (send_head(method, path, query, length) && (!body || body([&](const char* p, size_t n) { return send(p, n); })) &&
+            if (send_head(method, path, query, length, copy) && (!body || body([&](const char* p, size_t n) { return send(p, n); })) &&
                 read_reply(r, method == "HEAD"))
                 return true;
             drop();
@@ -321,7 +323,8 @@ private:
         m_in.append(buf, static_cast<size_t>(n));
         return true;
     }
-    bool send_head(std::string_view method, const std::string& path, const std::string& query, uint64_t length)
+    bool send_head(std::string_view method, const std::string& path, const std::string& query, uint64_t length,
+                   const std::string& copy)
     {
         char date[17];
         const std::time_t now = std::time(nullptr);
@@ -333,6 +336,8 @@ private:
             {"host", host}, {"x-amz-content-sha256", "UNSIGNED-PAYLOAD"}, {"x-amz-date", date}};
         if (!m_token.empty())
             h.emplace_back("x-amz-security-token", m_token);
+        if (!copy.empty())
+            h.emplace_back("x-amz-copy-source", copy);
         std::vector<socketley::s3::header_field> fields;
         for (const auto& [n, v] : h)
             fields.push_back({n, v});
@@ -442,6 +447,8 @@ std::vector<std::string> xml_values(std::string_view xml, std::string_view tag)
 struct options
 {
     std::string url, branch = "main", work, host, port, bucket, name, ca;
+    // A library the repository was written to before, which what it still holds of it is taken from.
+    std::string move_from;
     bool tls{false};
     int keep_days{14}, keep_weeks{8}, keep_months{12};
 };
@@ -528,7 +535,7 @@ private:
         m_changed = refs != m_refs || m_last_commit.empty();
         m_refs = refs;
         if (!m_changed)
-            return 0;
+            return move_old();
 
         if (!ensure_bucket())
             return 2;
@@ -541,6 +548,47 @@ private:
         if (const int rc = backup(repo, commit); rc != 0)
             return rc;
         thin();
+        return move_old();
+    }
+
+    // What the library the repository was written to before still holds of it, once its tree is whole in the new
+    // one: its backups are copied over, its files go, and so does the library once nothing else is left in it.
+    int move_old()
+    {
+        if (m_o.move_from.empty() || m_o.move_from == m_o.bucket)
+            return 0;
+        // Gone already, or not this user's to clear: nothing is left to take, and the run is not failed for it.
+        reply head;
+        if (!m_s3.request("HEAD", "/" + uri_encode(m_o.move_from, false), "", head))
+            return fail(m_s3.m_error);
+        if (head.status != 200)
+        {
+            std::cerr << "git-sync: the library " << m_o.move_from << " is left as it is (" << head.status << ")\n";
+            return 0;
+        }
+        std::vector<std::string> keys;
+        if (!list(m_o.move_from, "_backups/" + m_o.name + "/", keys))
+            return fail("the library " + m_o.move_from + " cannot be listed");
+        for (const std::string& k : keys)
+        {
+            reply r;
+            if (!m_s3.request("PUT", object_path(k), "", r, 0, {}, object_path(m_o.move_from, k)) || r.status != 200)
+                return fail("the backup " + k + " could not be taken from " + m_o.move_from +
+                            (r.status ? " (" + std::to_string(r.status) + ")" : std::string()));
+            if (!del(m_o.move_from, k))
+                return fail("the backup " + k + " could not be removed from " + m_o.move_from);
+        }
+        if (!list(m_o.move_from, m_o.name + "/", keys))
+            return fail("the library " + m_o.move_from + " cannot be listed");
+        for (const std::string& k : keys)
+            if (!del(m_o.move_from, k))
+                return fail(k + " could not be removed from " + m_o.move_from);
+        std::cerr << "git-sync: " << keys.size() << " file(s) of " << m_o.name << " removed from " << m_o.move_from << "\n";
+        // A library that holds what other repositories wrote is refused, and kept.
+        reply r;
+        if (list(m_o.move_from, "", keys) && keys.empty() &&
+            m_s3.request("DELETE", "/" + uri_encode(m_o.move_from, false), "", r) && r.status == 204)
+            std::cerr << "git-sync: the library " << m_o.move_from << " was empty and is gone\n";
         return 0;
     }
 
@@ -557,20 +605,24 @@ private:
         return false;
     }
 
-    std::string object_path(std::string_view key) const
+    std::string object_path(std::string_view key) const { return object_path(m_o.bucket, key); }
+    static std::string object_path(std::string_view bucket, std::string_view key)
     {
-        return "/" + uri_encode(m_o.bucket, false) + "/" + uri_encode(key, true);
+        return "/" + uri_encode(bucket, false) + "/" + uri_encode(key, true);
     }
 
-    bool del(const std::string& key)
+    bool del(const std::string& key) { return del(m_o.bucket, key); }
+    bool del(const std::string& bucket, const std::string& key)
     {
         reply r;
-        return m_s3.request("DELETE", object_path(key), "", r) && (r.status == 204 || r.status == 200 || r.status == 404);
+        return m_s3.request("DELETE", object_path(bucket, key), "", r) &&
+               (r.status == 204 || r.status == 200 || r.status == 404);
     }
 
     // Every key under `prefix`, false when a page could not be had, since a part of the list read as the whole
     // would leave behind what the rest held.
-    bool list(const std::string& prefix, std::vector<std::string>& keys)
+    bool list(const std::string& prefix, std::vector<std::string>& keys) { return list(m_o.bucket, prefix, keys); }
+    bool list(const std::string& bucket, const std::string& prefix, std::vector<std::string>& keys)
     {
         keys.clear();
         std::string token;
@@ -581,7 +633,7 @@ private:
                 q += "&continuation-token=" + uri_encode(token, false);
             q += "&prefix=" + uri_encode(prefix, false);
             reply r;
-            if (!m_s3.request("GET", "/" + uri_encode(m_o.bucket, false), q, r) || r.status != 200)
+            if (!m_s3.request("GET", "/" + uri_encode(bucket, false), q, r) || r.status != 200)
                 return false;
             for (auto& k : xml_values(r.body, "Key"))
                 keys.push_back(std::move(k));
@@ -898,6 +950,8 @@ int git_sync_main(int argc, char** argv)
             o.tls = true;
         else if (a == "--ca")
             ok = value(o.ca);
+        else if (a == "--move-from")
+            ok = value(o.move_from);
         else if (a == "--endpoint" && (ok = value(v)))
         {
             const size_t c = v.rfind(':');
@@ -925,7 +979,7 @@ int git_sync_main(int argc, char** argv)
         !git_names::valid_branch(o.branch, why) || !git_names::valid_name(o.name, why))
     {
         std::cout << "usage: socketley git-sync --url URL --branch NAME|* --work DIR --endpoint HOST:PORT [--tls [--ca FILE]] "
-                     "--bucket B --name N [--keep DAYS,WEEKS,MONTHS]"
+                     "--bucket B --name N [--keep DAYS,WEEKS,MONTHS] [--move-from LIBRARY]"
                   << (why.empty() ? "" : "\n" + why) << "\n";
         return 1;
     }

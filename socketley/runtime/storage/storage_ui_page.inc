@@ -2093,8 +2093,11 @@ function usersDlg() {
         u.file || u.id === me.user ? null : '-',
         u.file || u.id === me.user ? null : { icon: 'trash', label: 'Delete user', bad: true, fn: () => deleteUser(u, fill) },
       ]));
+      const others = el('input', { type: 'checkbox', onchange: () => othersFor(u, others) }); others.checked = !!u.show_others;
       T.append(el('tr', {}, el('td', { class: 'w' }, el('b', { text: u.name }), u.name !== u.id ? el('span', { class: 'mut', text: ' · ' + u.id }) : null, u.email ? el('div', { class: 'mut', style: 'font-size:12.5px', text: u.email }) : null),
-        el('td', { class: 'mut', style: 'font-size:12.5px;white-space:nowrap', text: badges.join(' · ') }), el('td', { class: 'mut', style: 'font-size:12.5px;white-space:nowrap', text: u.max_bytes ? 'quota ' + human(u.max_bytes) : '' }), el('td', { class: 'r' }, more)));
+        el('td', { class: 'mut', style: 'font-size:12.5px;white-space:nowrap', text: badges.join(' · ') }), el('td', { class: 'mut', style: 'font-size:12.5px;white-space:nowrap', text: u.max_bytes ? 'quota ' + human(u.max_bytes) : '' }),
+        el('td', { style: 'white-space:nowrap' }, el('label', { class: 'chk', title: 'Whether ' + u.id + ' sees the libraries of other people, in a column of their own' }, others, el('span', { style: 'font-size:12.5px', text: 'Sees others’ libraries' }))),
+        el('td', { class: 'r' }, more)));
     }
     if (d.invites && d.invites.length) {
       box.append(el('h4', { text: 'Open invitations', style: 'margin-top:20px' }));
@@ -2106,6 +2109,12 @@ function usersDlg() {
   };
   usersDlg.fill = fill;
   fill();
+}
+// Whether a user sees other people's libraries, which they also turn on and off themselves under Account.
+async function othersFor(u, box) {
+  if (me && u.id === me.user) return setShowOthers(box.checked);
+  try { await must(await api('POST', '/~ui/notifications', { body: JSON.stringify({ action: 'settings', user: u.id, show_others: box.checked }) })); u.show_others = box.checked; toast(box.checked ? u.id + ' sees other people’s libraries' : u.id + ' sees only their own libraries'); }
+  catch (e) { box.checked = !box.checked; fail(e); }
 }
 async function setAdmin(u, on, fill) {
   try {

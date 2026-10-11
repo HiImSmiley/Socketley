@@ -131,6 +131,24 @@ st, body, _ = http("GET", "/~ui/git", cookie=jc, ui=True)
 buckets = re.findall(r'"bucket":"([^"]*)"', body)
 check("and goes to a library of the user's own", buckets, ["git-jonas"])
 
+# ── who sees other people's libraries ──
+def sees(cookie):
+    st, body, _ = http("GET", "/~ui/session", cookie=cookie, ui=True)
+    return json.loads(body).get("show_others") if st == 200 else st
+st, _, sc = http("POST", "/~ui/session", key=ROOT, ui=True)
+rc = sc.split(";")[0] if sc else None
+check("nobody sees other people's libraries until it is turned on", (sees(jc), sees(rc)), (False, False))
+st, _, _ = http("POST", "/~ui/notifications", cookie=jc, ui=True, body={"action": "settings", "user": "root", "show_others": True})
+check("a user who is no admin does not turn it on for another", (st, sees(rc)), (403, False))
+st, _, _ = http("POST", "/~ui/notifications", cookie=rc, ui=True, body={"action": "settings", "user": "jonas", "show_others": True})
+check("an admin turns it on for a user", (st, sees(jc)), (204, True))
+st, body, _ = http("GET", "/~ui/users", cookie=rc, ui=True)
+check("and sees it in the list of users", [u.get("show_others") for u in json.loads(body)["users"] if u["id"] == "jonas"], [True])
+st, _, _ = http("POST", "/~ui/notifications", cookie=jc, ui=True, body={"action": "settings", "show_others": False})
+check("and the user turns it off again", (st, sees(jc)), (204, False))
+st, _, _ = http("POST", "/~ui/notifications", cookie=rc, ui=True, body={"action": "settings", "user": "nobody", "show_others": True})
+check("a user that is none is refused", st, 404)
+
 # ── the page ──
 st, page, _ = http("GET", "/~ui/", key=ROOT)
 check("the logo leads home", ('id="homeLogo"' in page, "$('#homeLogo').onclick" in page), (True, True))

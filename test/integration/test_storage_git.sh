@@ -17,6 +17,8 @@
 #   private      a private repository without a token is not run, and says so;
 #                a token is kept and removed, never shown
 #   refused      a file:// URL, a bad branch and a bad folder name
+#   moved        one in the shared library git goes to git-<owner> at the next
+#                start, backups and all, and the emptied library goes
 #   remove       a removed repository is no longer listed; its files stay
 set -uo pipefail
 
@@ -209,6 +211,35 @@ expect "a file:// URL is refused" "$(post "$ALICE_K:$ALICE_S" '{"action":"add","
 expect "and a URL with credentials in it" "$(post "$ALICE_K:$ALICE_S" '{"action":"add","url":"https://u:p@example.com/r.git"}')" 400
 expect "and a branch that is none" "$(post "$ALICE_K:$ALICE_S" "{\"action\":\"add\",\"url\":\"git://127.0.0.1:$GP/demo.git\",\"branch\":\"a..b\"}")" 400
 expect "and a folder named _backups" "$(post "$ALICE_K:$ALICE_S" "{\"action\":\"add\",\"url\":\"git://127.0.0.1:$GP/demo.git\",\"name\":\"_backups\"}")" 400
+
+# ─── moved ──────────────────────────────────────────────────────────────────
+# A repository in the one library every user once shared goes to its owner's own at the next start: its tree is
+# written there, its backups are taken along, and the old library, empty then, is gone.
+post "$ALICE_K:$ALICE_S" "{\"action\":\"add\",\"url\":\"git://127.0.0.1:$GP/demo.git\",\"bucket\":\"git\",\"name\":\"mig\"}" >/dev/null
+mig=$(j "d['id']" < "$T/post.out")
+waitrun() {
+    local s
+    for _ in $(seq 1 150); do
+        s=$(ui "$ALICE_K:$ALICE_S")
+        [ "$(echo "$s" | j "[r for r in d['repos'] if r['id']=='$1'][0]['running'] is False and ([r for r in d['repos'] if r['id']=='$1'][0]['state'] or {}).get('at', 0) >= $2")" = True ] && break
+        sleep 0.2
+    done
+    echo "$s" | python3 -c 'import json,sys; print(json.dumps([r for r in json.load(sys.stdin)["repos"] if r["id"]==sys.argv[1]][0]))' "$1"
+}
+t3=$(date +%s)
+expect "a repository written to the shared library git" "$(waitrun "$mig" "$t3" | j "d['state']['ok'], d['bucket']")" "(True, 'git')"
+OLDB=$(s3 "http://127.0.0.1:$ST/git?list-type=2&prefix=_backups/mig/" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g')
+"$BIN" stop st >/dev/null 2>&1; "$BIN" start st >/dev/null 2>&1
+for _ in $(seq 1 100); do curl -s -o /dev/null "http://127.0.0.1:$ST/" && break; sleep 0.1; done
+sleep 1
+st=$(waitrun "$mig" "$(($(date +%s) - 1))")
+expect "goes to its owner's own library at the next start" "$(echo "$st" | j "d['state']['ok'], d['bucket']")" "(True, 'git-alice')"
+expect "with its files" "$(s3 "http://127.0.0.1:$ST/git-alice/mig/README.md")" "hello again"
+expect "and the backup it had" "$(s3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ST/git-alice/$OLDB")" 200
+expect "and the old library, which held nothing else, is gone" "$(s3 -o /dev/null -w '%{http_code}' -I "http://127.0.0.1:$ST/git")" 404
+# Known once the run's process is reaped, a moment after its state is written.
+for _ in $(seq 1 25); do [ -e "$T/st/.ui/git/$mig/moved-from" ] || break; sleep 0.2; done
+expect "and once there it is moved no more" "$(ls "$T/st/.ui/git/$mig/moved-from" 2>/dev/null | wc -l)" 0
 
 # ─── remove ─────────────────────────────────────────────────────────────────
 expect "a repository is removed" "$(post "$ALICE_K:$ALICE_S" "{\"action\":\"remove\",\"id\":\"$id\"}")" 204

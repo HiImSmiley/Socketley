@@ -189,21 +189,30 @@ void git_mirrors::open(std::string dir, uint32_t shard, std::string endpoint, bo
     m_why_not = std::move(why_not);
     m_any = !repos().empty();
     // Repositories that went to the one library every user shared go to their owner's own, git-<user>, and each
-    // is run once there to write its whole tree; what the old library holds is left for its owner to delete.
+    // is run there until its whole tree is written and what the old library held of it is taken over; moved-from
+    // in its directory says so, so a restart in between does not forget it.
     if (m_shard == 0 && m_any)
     {
         list_lock lock(m_dir);
         std::vector<repo> rs = repos();
+        bool changed = false;
         for (repo& r : rs)
             if (r.bucket == "git" && !r.owner.empty() && git_names::library_for(r.owner) != "git")
             {
+                std::error_code ec;
+                std::filesystem::create_directories(work_of(r.id), ec);
+                if (!write_file(work_of(r.id) + "/moved-from", r.bucket, 0600))
+                    continue;
                 r.bucket = git_names::library_for(r.owner);
                 ::unlink((work_of(r.id) + "/written").c_str());
-                m_moved.push_back(r.id);
+                changed = true;
                 LOG_INFO(("storage: git: " + r.url + " goes to the library " + r.bucket + ", its owner's own").c_str());
             }
-        if (!m_moved.empty() && !save(rs))
-            m_moved.clear();
+        if (changed && !save(rs))
+            LOG_WARN("storage: git: the list of repositories could not be written, so none moved");
+        for (const repo& r : repos())
+            if (::access((work_of(r.id) + "/moved-from").c_str(), F_OK) == 0)
+                m_moved.push_back(r.id);
     }
 }
 
@@ -436,6 +445,11 @@ std::string git_mirrors::start(const repo& r, authenticator& auth)
         args.push_back("--ca");
         args.push_back(m_cert);
     }
+    if (std::string old; read_file(work + "/moved-from", old) && !old.empty())
+    {
+        args.push_back("--move-from");
+        args.push_back(old);
+    }
     std::vector<char*> argv;
     for (std::string& s : args)
         argv.push_back(s.data());
@@ -523,6 +537,8 @@ void git_mirrors::tick(authenticator& auth)
         }
         if (w == it->second && !(WIFEXITED(status) && WEXITSTATUS(status) == 0))
             LOG_WARN(("storage: git: the run of " + it->first + " failed; see " + work_of(it->first) + "/log").c_str());
+        else if (w == it->second)
+            ::unlink((work_of(it->first) + "/moved-from").c_str());
         if (on_run)
         {
             std::string state;
