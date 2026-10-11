@@ -343,21 +343,26 @@ std::string film_page(std::string_view name, const object_meta* m, std::string_v
                     "content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><title>";
     xml_escape_to(h, name);
     h += "</title>";
-    // What Discord embeds a player by, and no more: the still it shows first, so it need not make one of a large
-    // film in the time it gives a link, and a URL ending in .mp4, which it takes for a video it may play.
+    // The tags Vice's clip links give Discord, which plays files of any size by them: the still it shows first, so
+    // it need not make one, and the film as a URL ending in .mp4, named as the player's stream as well.
+    meta(h, "property", "og:site_name", "socketley");
     meta(h, "property", "og:title", name);
     meta(h, "property", "og:url", page_url);
     meta(h, "property", "og:image", poster_url);
     if (!chat_url.empty())
     {
         meta(h, "property", "og:type", "video.other");
+        meta(h, "property", "og:video", chat_url);
         meta(h, "property", "og:video:url", chat_url);
+        if (chat_url.starts_with("https:"))
+            meta(h, "property", "og:video:secure_url", chat_url);
+        meta(h, "property", "og:video:type", "video/mp4");
         meta(h, "property", "og:video:width", std::to_string(width));
         meta(h, "property", "og:video:height", std::to_string(height));
         meta(h, "name", "twitter:card", "player");
-        // The same file as the player's stream, by which Discord plays a film it gave up making a still of in time.
         meta(h, "name", "twitter:player", chat_url);
         meta(h, "name", "twitter:player:stream", chat_url);
+        meta(h, "name", "twitter:player:stream:content_type", "video/mp4");
         meta(h, "name", "twitter:player:width", std::to_string(width));
         meta(h, "name", "twitter:player:height", std::to_string(height));
         meta(h, "name", "twitter:image", poster_url);

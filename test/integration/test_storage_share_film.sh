@@ -78,6 +78,8 @@ check "which is the web copy" "$(curl -s -o /dev/null -w '%{http_code} %{content
 check "as a player" "$(grep -o 'twitter:card" content="[^"]*' <<<"$PAGE")" 'twitter:card" content="player'
 check "of the film's size" "$(og og:video:width <<<"$PAGE")x$(og og:video:height <<<"$PAGE")" "640x360"
 check "with its still as the picture" "$(og og:image <<<"$PAGE")" "$U/~media/thumb-1280/~share/${L1#/~share/}"
+check "named an MP4, to Open Graph and as the player's stream" \
+      "$(og og:video:type <<<"$PAGE")|$(tw twitter:player:stream:content_type <<<"$PAGE")" "video/mp4|video/mp4"
 check "and the film as the player's stream, which Discord plays without making a still" \
       "$(tw twitter:player:stream <<<"$PAGE")|$(tw twitter:image <<<"$PAGE")" \
       "$U/~media/web/~share/${L1#/~share/}.mp4|$U/~media/thumb-1280/~share/${L1#/~share/}"
