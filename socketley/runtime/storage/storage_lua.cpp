@@ -302,6 +302,7 @@ void storage_run::hook_done(uint64_t id, const s3_error* deny)
 
 void storage_run::notify_put(std::string_view bucket, std::string_view key, const object_meta& m)
 {
+    media_put(bucket, key, m);
     lua_context* lua = m_owner.lua();
     if (!lua || !lua->has_on_put() || m_stopped)
         return;
@@ -327,7 +328,7 @@ void storage_run::notify_delete(std::string_view bucket, std::string_view key)
 
 void storage_run::hook_request(const std::shared_ptr<conn>& c) { route(c); }
 void storage_run::hook_done(uint64_t, const s3_error*) {}
-void storage_run::notify_put(std::string_view, std::string_view, const object_meta&) {}
+void storage_run::notify_put(std::string_view bucket, std::string_view key, const object_meta& m) { media_put(bucket, key, m); }
 void storage_run::notify_delete(std::string_view, std::string_view) {}
 
 #endif

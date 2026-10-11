@@ -1563,6 +1563,21 @@ function libDlg(b) {
     const e = u && u.libraries.find(x => x.bucket === lib);
     size.textContent = e ? human(e.bytes) + ' in ' + e.objects + (e.objects === 1 ? ' file' : ' files') + (e.partial ? ', still counting' : '') + (e.max_bytes ? ' of ' + human(e.max_bytes) : '') : 'unknown';
   }).catch(() => { size.textContent = 'unknown'; });
+  // Whether every film put into it gets its web copy at once, so a link to it plays in a chat as soon as it is made.
+  const films = el('div', { style: 'margin-top:12px' });
+  api('GET', '/~ui/library?bucket=' + encodeURIComponent(lib)).then(r => r.ok ? r.json() : null).then(st => {
+    if (!st) return;
+    const box = el('input', { type: 'checkbox' });
+    box.checked = !!st.web_copies; box.disabled = !st.may_change;
+    box.onchange = async () => {
+      try {
+        await must(await api('POST', '/~ui/library', { body: JSON.stringify({ bucket: lib, web_copies: box.checked }) }));
+        toast(box.checked ? 'Films put into ' + lib + ' are made ready for chats as they arrive' : 'Films in ' + lib + ' are made ready when a link to them is made');
+      } catch (e) { box.checked = !box.checked; fail(e); }
+    };
+    films.append(el('label', { class: 'chk', title: 'Makes the web copy of every film as it is uploaded, so a public link to it plays in Discord at once' },
+      box, el('span', { style: 'font-size:13.5px', text: 'Prepare uploaded films for chats' })));
+  }).catch(() => {});
   const acts = el('div', { style: 'display:flex;flex-wrap:wrap;gap:8px;margin-top:14px' },
     btn('folder', 'Open', () => { L.close(); go([lib]); }, 'sm'),
     mayManage ? btn('users', 'Share library', () => accessDlg(lib), 'sm') : null,
@@ -1571,7 +1586,7 @@ function libDlg(b) {
   const danger = mayManage ? el('div', { style: 'margin-top:20px;padding-top:14px;border-top:1px solid var(--line)' },
     el('h4', { text: 'Delete' }), el('p', { class: 'mut', style: 'font-size:13px', text: 'Deletes the library with every file in it, its older versions and its Trash.' }),
     btn('trash', 'Delete library…', () => { L.close(); deleteLibrary(lib); }, 'sm bad')) : null;
-  const L = modal('Library · ' + (lib === tmpName() ? 'Temporary files' : lib), [T, acts, danger]);
+  const L = modal('Library · ' + (lib === tmpName() ? 'Temporary files' : lib), [T, films, acts, danger]);
 }
 async function deleteLibrary(lib) {
   const n = await ask({ title: 'Delete the library ' + lib + '?', text: 'Every file in it goes, with its older versions and its Trash, and nothing brings them back. Type the library’s name to delete it.', input: lib, ok: 'Delete library', danger: true });

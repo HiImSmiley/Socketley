@@ -150,6 +150,38 @@ curl -s -o "$T/long60-web.mp4" "$U/~media/web/~share/${L5#/~share/}"
 check "a long film of 60 frames a second gets a web copy of 30" \
       "$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$T/long60-web.mp4")" "30/1"
 
+# ── a library that prepares its films as they arrive ──
+UI=(-u "$A" -H 'X-Socketley-UI: 1' -H 'Content-Type: application/json')
+check "a library makes no web copies of what is put into it unless told to" \
+      "$(curl -s "${UI[@]}" "$U/~ui/library?bucket=films")" '{"bucket":"films","web_copies":false,"may_change":true}'
+check "and is told to by whoever may change its tags" \
+      "$(curl -s -o /dev/null -w '%{http_code}' "${UI[@]}" -d '{"bucket":"films","web_copies":true}' "$U/~ui/library")" 204
+check "which it then says" "$(curl -s "${UI[@]}" "$U/~ui/library?bucket=films")" '{"bucket":"films","web_copies":true,"may_change":true}'
+check "as a tag of the library" "$(curl -s --aws-sigv4 aws:amz:us-east-1:s3 -u "$A" "$U/films?tagging" | grep -o '<Key>socketley:web-copies</Key><Value>on</Value>')" \
+      '<Key>socketley:web-copies</Key><Value>on</Value>'
+# Long enough that its copy is 720 lines, from a picture of 1080 at a frame a second, which is quick to make.
+ff -f lavfi -i "testsrc2=size=1920x1080:rate=1" -t 150 -c:v libx264 -preset ultrafast -pix_fmt yuv420p "$T/wide.mp4"
+curl -s -u "$A" -T "$T/wide.mp4" "$U/~dav/films/wide.mp4" >/dev/null
+L6=$(link wide.mp4)
+# The page asks for nothing, so a copy it names was made because the film was put.
+PAGE=""
+for _ in $(seq 1 240); do
+    PAGE=$(curl -s -H 'Accept: text/html' "$U$L6")
+    [ -n "$(og og:video:url <<<"$PAGE")" ] && break
+    sleep 0.5
+done
+check "a film put into it has its web copy made with no one asking" "$(og og:video:url <<<"$PAGE")" "$U/~media/web/~share/${L6#/~share/}.mp4"
+curl -s -o "$T/wide-web.mp4" "$U/~media/web/~share/${L6#/~share/}"
+check "and its page gives a chat the copy's size, not the film's" \
+      "$(og og:video:width <<<"$PAGE")x$(og og:video:height <<<"$PAGE")|$(tw twitter:player:width <<<"$PAGE")x$(tw twitter:player:height <<<"$PAGE")" \
+      "$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$T/wide-web.mp4")|1280x720"
+check "which is smaller" "$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$T/wide-web.mp4")" "1280x720"
+check "and turned off again" \
+      "$(curl -s -o /dev/null -w '%{http_code}' "${UI[@]}" -d '{"bucket":"films","web_copies":false}' "$U/~ui/library")|$(curl -s "${UI[@]}" "$U/~ui/library?bucket=films")" \
+      '204|{"bucket":"films","web_copies":false,"may_change":true}'
+check "a setting that is not true or false is refused" \
+      "$(curl -s -o /dev/null -w '%{http_code}' "${UI[@]}" -d '{"bucket":"films","web_copies":"yes"}' "$U/~ui/library")" 400
+
 # ── what is not a film ──
 printf 'hello\n' > "$T/note.txt"
 curl -s -u "$A" -T "$T/note.txt" "$U/~dav/films/note.txt" >/dev/null

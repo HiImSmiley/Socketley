@@ -39,6 +39,7 @@
 #include "digest.h"
 #include "json_doc.h"
 #include "s3_names.h"
+#include "s3_tagging.h"
 #include "sse.h"
 #include "../../shared/replaced_file.h"
 
@@ -491,6 +492,28 @@ void fitted(const media_probe& p, int64_t box_h, int64_t& w, int64_t& h)
     h = static_cast<int64_t>(std::lround(static_cast<double>(p.height) * scale)) / 2 * 2;
 }
 
+// Whether an object is a film, by its type or else by its name, which a client that sends no type leaves.
+bool is_film(std::string_view type, std::string_view key)
+{
+    if (type.starts_with("video/"))
+        return true;
+    const size_t dot = key.rfind('.');
+    if (dot == std::string_view::npos || key.size() - dot > 6)
+        return false;
+    std::string ext(key.substr(dot + 1));
+    for (char& ch : ext)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    static constexpr std::string_view films[] = {"mp4", "m4v", "mkv", "mov", "webm", "avi", "wmv", "flv", "ts", "mts", "m2ts"};
+    return std::ranges::find(films, ext) != std::end(films);
+}
+
+// Where a medium of an object is made, by the object's bucket, key and ETag; the web copy's name changed with its
+// bitrate cap, so one made before is made again.
+std::string medium_dir(const std::string& media_dir, std::string_view variant, const std::string& object)
+{
+    return media_dir + "/" + sha256_hex((variant == "web" ? std::string("web4") : std::string(variant)) + '\n' + object);
+}
+
 // The rungs worth making of a source: those its picture fills in at least one side, and the one that keeps its size.
 std::vector<const rung*> rungs_of(const media_probe& p)
 {
@@ -912,6 +935,31 @@ bool one_range(std::string_view h, uint64_t len, uint64_t& off, uint64_t& n)
 
 }   // namespace
 
+web_plan web_plan_of(const media_probe& p)
+{
+    // What a chat embeds is at most 50 MiB, so the copy is held to 46: the film is made as well as it looks at a
+    // bitrate that fits, at most 12 Mbit/s, of as many lines as that bitrate carries well.
+    constexpr double fits = 46.0 * 1024 * 1024 * 8;
+    web_plan w;
+    w.rate = 12000000;
+    if (p.duration > 0)
+        w.rate = std::clamp<int64_t>(static_cast<int64_t>(fits / p.duration) - 192000, 600000, w.rate);
+    w.lines = w.rate >= 8000000 ? 1440 : w.rate >= 2500000 ? 1080 : 720;
+    // A picture every browser and chat plays is copied when it fits as it is; anything else is made H.264.
+    w.copies = p.vcodec == "h264" && !p.hdr() && p.height <= w.lines && (p.bitrate == 0 || p.bitrate <= 12000000) &&
+               (p.duration <= 0 || p.bitrate == 0 || static_cast<double>(p.bitrate) * p.duration <= fits) &&
+               (p.vprofile.empty() || p.vprofile == "High" || p.vprofile == "Main" ||
+                p.vprofile == "Constrained Baseline" || p.vprofile == "Baseline");
+    if (w.copies)
+    {
+        w.width = p.width;
+        w.height = p.height;
+    }
+    else
+        fitted(p, w.lines, w.width, w.height);
+    return w;
+}
+
 void storage_run::op_media(const std::shared_ptr<conn>& c)
 {
     s3_request& r = c->req;
@@ -1047,27 +1095,13 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
             app_reply(cc, 415, "An object only its client's key opens is not made into media.\n");
             return;
         }
-        // A medium is the object's as it is now, so a new version of it is made anew.
-        const std::string media_dir = m_store.options().dir + "/.media";
-        if (!m_media_dir_ready)
+        if (!media_dir_made())
         {
-            if (::mkdir(media_dir.c_str(), 0700) < 0 && errno != EEXIST)
-            {
-                app_reply(cc, 500, "The media cache cannot be made.\n");
-                return;
-            }
-            m_media_dir_ready = true;
+            app_reply(cc, 500, "The media cache cannot be made.\n");
+            return;
         }
         const std::string etag = m.etag();
-        w.image = m.content_type.str().starts_with("image/");
-        w.object = w.bucket + '\n' + w.key + '\n' + etag;
-        w.version = etag.substr(0, 16);
-        // The web copy's name changed with its bitrate cap, so one made before is made again.
-        w.dir = media_dir + "/" + sha256_hex((w.variant == "web" ? std::string("web4") : w.variant) + '\n' + w.object);
-        // The second probe's, which also holds chapters; the first's are left for eviction.
-        w.probe_dir = media_dir + "/" + sha256_hex("probe2\n" + w.object);
-        w.asked_ms = now_ms();
-        w.deadline_ms = w.asked_ms + media_wait_ms;
+        media_name(w, m);
         // An object's file whose bytes are stored as they are, opened once a minute a shard, is what ffmpeg reads; a
         // medium made needs none.
         const bool made = m_media_done.contains(w.dir);
@@ -1311,14 +1345,126 @@ bool storage_run::media_serve(const std::shared_ptr<conn>& c, const media_want& 
     return true;
 }
 
+bool storage_run::makes_web_copies(std::string_view bucket) const
+{
+    const auto xml = m_store.bucket_tagging(bucket);
+    tag_set tags;
+    s3_error err;
+    return xml && parse_tagging_xml(*xml, tags, err, max_bucket_tags) &&
+           std::ranges::any_of(tags, [](const auto& t) { return t.first == "socketley:web-copies" && t.second == "on"; });
+}
+
+void storage_run::media_put(std::string_view bucket, std::string_view key, const object_meta& m)
+{
+    if (m_stopped || sse_mode_of(m) == sse_mode::c || !is_film(m.content_type.str(), key) || !makes_web_copies(bucket))
+        return;
+    if (!m_ffmpeg_known)
+    {
+        m_ffmpeg = ffmpeg_path();
+        m_ffmpeg_known = true;
+    }
+    if (m_ffmpeg.empty() || !media_dir_made())
+        return;
+    media_want w;
+    w.kind = k_web;
+    w.variant = "web";
+    w.file = "web.mp4";
+    w.bucket.assign(bucket);
+    w.key.assign(key);
+    media_name(w, m);
+    if (std::ranges::any_of(m_media_unasked, [&w](const media_want& x) { return x.dir == w.dir; }))
+        return;
+    m_media_unasked.push_back(std::move(w));
+    media_arm();
+}
+
+bool storage_run::media_unasked(const media_want& w)
+{
+    struct stat sb{};
+    const int64_t now = now_ms();
+    // One that waited longer than a copy may take is let go: a look at its link asks for it again.
+    if (now - w.asked_ms > web_job_ms || m_media_done.contains(w.dir) || exists(w.dir + "/done"))
+        return true;
+    const auto pp = media_probe_of(w.probe_dir);
+    if (!pp)
+    {
+        if (::stat((w.probe_dir + "/failed").c_str(), &sb) == 0 && now - mtime_ms(sb) < failed_hold_ms)
+            return true;
+        return !media_probe_begin(w);
+    }
+    if (pp->vcodec.empty() || (::stat((w.dir + "/failed").c_str(), &sb) == 0 && now - mtime_ms(sb) < failed_hold_ms))
+        return true;
+    // The shard's one web copy at a time, which one a client waits for is as much as one made for nobody.
+    if (std::ranges::any_of(m_media_jobs, [](const media_job& j) { return j.want.kind == k_web; }))
+        return false;
+    if (::mkdir(w.dir.c_str(), 0700) < 0 && errno != EEXIST)
+        return true;
+    const std::string lock = w.dir + "/lock";
+    const int lock_fd = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock_fd < 0)
+        return true;
+    // Held, it is being made already, here or on another shard.
+    if (::flock(lock_fd, LOCK_EX | LOCK_NB) != 0 || !locked_fresh(lock_fd, lock))
+    {
+        ::close(lock_fd);
+        return true;
+    }
+    kill_orphan(w.dir + "/pid", w.dir);
+    if (exists(w.dir + "/done") || !media_start(w, lock_fd, 0))
+        ::close(lock_fd);
+    return true;
+}
+
+bool storage_run::media_dir_made()
+{
+    if (!m_media_dir_ready)
+        m_media_dir_ready = ::mkdir((m_store.options().dir + "/.media").c_str(), 0700) == 0 || errno == EEXIST;
+    return m_media_dir_ready;
+}
+
+void storage_run::media_name(media_want& w, const object_meta& m)
+{
+    // A medium is the object's as it is now, so a new version of it is made anew.
+    const std::string media_dir = m_store.options().dir + "/.media";
+    const std::string etag = m.etag();
+    w.image = m.content_type.str().starts_with("image/");
+    w.object = w.bucket + '\n' + w.key + '\n' + etag;
+    w.version = etag.substr(0, 16);
+    w.dir = medium_dir(media_dir, w.variant, w.object);
+    // The second probe's, which also holds chapters; the first's are left for eviction.
+    w.probe_dir = medium_dir(media_dir, "probe2", w.object);
+    w.asked_ms = now_ms();
+    w.deadline_ms = w.asked_ms + media_wait_ms;
+}
+
+bool storage_run::media_probe_begin(const media_want& w)
+{
+    media_want pw = w;
+    pw.kind = k_probe;
+    pw.variant = "probe";
+    pw.dir = w.probe_dir;
+    if (::mkdir(w.probe_dir.c_str(), 0700) < 0 && errno != EEXIST)
+        return false;
+    const std::string lock = w.probe_dir + "/lock";
+    const int lock_fd = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock_fd >= 0 && ::flock(lock_fd, LOCK_EX | LOCK_NB) == 0 && locked_fresh(lock_fd, lock))
+    {
+        kill_orphan(w.probe_dir + "/pid", w.probe_dir);
+        if (exists(w.probe_dir + "/done") || !media_start(pw, lock_fd, 0))
+            ::close(lock_fd);
+    }
+    else if (lock_fd >= 0)
+        ::close(lock_fd);
+    return true;
+}
+
 void storage_run::media_known(const std::string& bucket, const std::string& key, const std::string& etag,
                               std::shared_ptr<const media_probe>& probe, bool& web_made)
 {
-    // The same directories op_media names them by.
     const std::string media_dir = m_store.options().dir + "/.media";
     const std::string object = bucket + '\n' + key + '\n' + etag;
-    probe = media_probe_of(media_dir + "/" + sha256_hex("probe2\n" + object));
-    const std::string web = media_dir + "/" + sha256_hex("web4\n" + object);
+    probe = media_probe_of(medium_dir(media_dir, "probe2", object));
+    const std::string web = medium_dir(media_dir, "web", object);
     struct stat sb{};
     web_made = m_media_done.contains(web) || ::stat((web + "/done").c_str(), &sb) == 0;
 }
@@ -1355,25 +1501,11 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
                 app_reply(c, 504, "The medium is still being looked at; ask again.\n");
                 return true;
             }
-            media_want pw = w;
-            pw.kind = k_probe;
-            pw.variant = "probe";
-            pw.dir = w.probe_dir;
-            if (::mkdir(w.probe_dir.c_str(), 0700) < 0 && errno != EEXIST)
+            if (!media_probe_begin(w))
             {
                 app_reply(c, 500, "The media cache cannot be written.\n");
                 return true;
             }
-            const std::string lock = w.probe_dir + "/lock";
-            const int lock_fd = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-            if (lock_fd >= 0 && ::flock(lock_fd, LOCK_EX | LOCK_NB) == 0 && locked_fresh(lock_fd, lock))
-            {
-                kill_orphan(w.probe_dir + "/pid", w.probe_dir);
-                if (exists(w.probe_dir + "/done") || !media_start(pw, lock_fd, 0))
-                    ::close(lock_fd);
-            }
-            else if (lock_fd >= 0)
-                ::close(lock_fd);
             return false;
         }
     }
@@ -1769,28 +1901,15 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             clear_dir(w.dir, true);
             args.insert(args.end(), input.begin(), input.end());
             args.insert(args.end(), {"-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"});
-            // What a chat embeds is at most 50 MiB, so the copy is held to 46: the film is made as well as it looks
-            // at a bitrate that fits, at most 12 Mbit/s, of as many lines as that bitrate carries well.
-            constexpr double fits = 46.0 * 1024 * 1024 * 8;
-            int64_t rate = 12000000;
-            if (p.duration > 0)
-                rate = std::clamp<int64_t>(static_cast<int64_t>(fits / p.duration) - 192000, 600000, rate);
-            const int64_t lines = rate >= 8000000 ? 1440 : rate >= 2500000 ? 1080 : 720;
-            // A picture every browser and chat plays is copied when it fits as it is; anything else is made H.264.
-            const bool plays = p.vcodec == "h264" && !p.hdr() && p.height <= lines &&
-                               (p.bitrate == 0 || p.bitrate <= 12000000) &&
-                               (p.duration <= 0 || p.bitrate == 0 || static_cast<double>(p.bitrate) * p.duration <= fits) &&
-                               (p.vprofile.empty() || p.vprofile == "High" || p.vprofile == "Main" ||
-                                p.vprofile == "Constrained Baseline" || p.vprofile == "Baseline");
-            if (plays)
+            const web_plan plan = web_plan_of(p);
+            const int64_t rate = plan.rate;
+            if (plan.copies)
                 args.insert(args.end(), {"-c:v", "copy"});
             else
             {
-                int64_t width = 0, height = 0;
-                fitted(p, lines, width, height);
-                std::string vf = "scale=" + std::to_string(width) + ":" + std::to_string(height);
+                std::string vf = "scale=" + std::to_string(plan.width) + ":" + std::to_string(plan.height);
                 // Below the bitrate 1440 lines are made at, the bits a second frame of 60 would take go to the picture.
-                if (lines < 1440 && p.fps > 31)
+                if (plan.lines < 1440 && p.fps > 31)
                     vf += ",fps=30";
                 if (p.hdr())
                     vf += ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
@@ -2239,6 +2358,7 @@ void storage_run::media_tick()
         c->last_progress = now_steady;
         m_media_waits.emplace_back(std::move(weak), std::move(w));
     }
+    std::erase_if(m_media_unasked, [this](const media_want& w) { return media_unasked(w); });
     // An object's file no job has started from for a minute is let go.
     const int64_t now = now_ms();
     for (auto it = m_media_srcs.begin(); it != m_media_srcs.end();)
@@ -2256,7 +2376,7 @@ void storage_run::media_tick()
         m_media_evicted_ms = now;
         media_evict(made);
     }
-    if (!m_media_jobs.empty() || !m_media_waits.empty() || !m_media_srcs.empty())
+    if (!m_media_jobs.empty() || !m_media_waits.empty() || !m_media_srcs.empty() || !m_media_unasked.empty())
         media_arm();
 }
 
@@ -2375,6 +2495,7 @@ void storage_run::media_stop()
     }
     m_media_jobs.clear();
     m_media_waits.clear();
+    m_media_unasked.clear();
     for (auto& [object, src] : m_media_srcs)
         m_loop.close_fd(src.fd);
     m_media_srcs.clear();

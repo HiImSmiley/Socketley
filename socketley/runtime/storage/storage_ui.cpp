@@ -25,6 +25,7 @@
 #include "s3_iam.h"
 #include "s3_names.h"
 #include "s3_quota.h"
+#include "s3_tagging.h"
 #include "../../shared/git_names.h"
 #include "../../shared/logging.h"
 #include "../../shared/http_framing.h"
@@ -406,6 +407,11 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
     if (r.key == "access")
     {
         ui_access(c);
+        return;
+    }
+    if (r.key == "library")
+    {
+        ui_library(c);
         return;
     }
     if (r.key == "search")
@@ -906,6 +912,8 @@ void storage_run::ui_body(const std::shared_ptr<conn>& c)
         ui_usage_body(c);
     else if (c->req.key == "access")
         ui_access_body(c);
+    else if (c->req.key == "library")
+        ui_library_body(c);
     else if (c->req.key == "git")
         ui_git_body(c);
     else if (c->req.key == "iam")
@@ -990,6 +998,78 @@ void storage_run::ui_progress_body(const std::shared_ptr<conn>& c)
         ::close(fd);
         app_reply(cc, ok ? 204 : 500, ok ? std::string{} : "The position could not be kept.\n");
     });
+}
+
+// GET ?bucket= says whether a library makes a web copy of every film put into it, and whether the user may change that;
+// POST {bucket, web_copies} changes it, as the library's tag socketley:web-copies, for whoever may change its tags.
+void storage_run::ui_library(const std::shared_ptr<conn>& c)
+{
+    s3_request& r = c->req;
+    if (r.method != "GET" && r.method != "POST")
+    {
+        app_reply(c, 405, "A library's settings are read with GET and changed with POST.\n");
+        return;
+    }
+    if (!app_login(c, "socketley"))
+        return;
+    if (r.method == "POST")
+    {
+        if (r.chunked || (r.has_content_length && r.content_length > 16 * 1024))
+        {
+            r.keep_alive = false;
+            app_reply(c, 413, "Request body too large.\n");
+            return;
+        }
+        collect_body(c, 16 * 1024);
+        return;
+    }
+    const std::string bucket(r.get_query("bucket"));
+    if (!m_store.has_bucket(bucket))
+    {
+        app_reply(c, 404, "No such bucket.\n");
+        return;
+    }
+    if (!app_allowed(c, "GET", bucket, {}, "tagging"))
+    {
+        app_reply(c, 403, "Only who may read the library's tags sees its settings.\n");
+        return;
+    }
+    std::string o = "{\"bucket\":";
+    jstr(o, bucket);
+    o += makes_web_copies(bucket) ? ",\"web_copies\":true" : ",\"web_copies\":false";
+    o += app_allowed(c, "PUT", bucket, {}, "tagging") ? ",\"may_change\":true}" : ",\"may_change\":false}";
+    app_reply(c, 200, std::move(o), "application/json");
+}
+
+void storage_run::ui_library_body(const std::shared_ptr<conn>& c)
+{
+    jvalue req;
+    const jvalue* on = nullptr;
+    if (!json_reader(c->body).document(req) || !(on = member(req, "web_copies")) || on->k != jvalue::kind::boolean)
+    {
+        app_reply(c, 400, "The body is a JSON object: bucket and web_copies, true or false.\n");
+        return;
+    }
+    const std::string bucket = str_of(req, "bucket");
+    if (!m_store.has_bucket(bucket))
+    {
+        app_reply(c, 404, "No such bucket.\n");
+        return;
+    }
+    if (!app_allowed(c, "PUT", bucket, {}, "tagging"))
+    {
+        app_reply(c, 403, "Only who may change the library's tags changes its settings.\n");
+        return;
+    }
+    // The library's other tags as they are, and this one set or taken away.
+    tag_set tags;
+    s3_error err;
+    if (const auto xml = m_store.bucket_tagging(bucket); xml && !parse_tagging_xml(*xml, tags, err, max_bucket_tags))
+        tags.clear();
+    std::erase_if(tags, [](const auto& t) { return t.first == "socketley:web-copies"; });
+    if (on->b)
+        tags.emplace_back("socketley:web-copies", "on");
+    store_doc(c, bucket_doc::tagging, bucket, tags.empty() ? std::string() : tagging_xml(tags), 204);
 }
 
 // GET ?bucket= says who else may read or write a library, as the statements the interface wrote into its policy say;

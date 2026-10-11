@@ -348,6 +348,15 @@ struct media_probe
     bool hdr() const { return transfer == "smpte2084" || transfer == "arib-std-b67"; }
 };
 
+// How a film's web copy is made: its picture copied as it is, or made H.264 of `width` by `height`, of at most `rate`
+// bits a second, so that it fits what a chat embeds.
+struct web_plan
+{
+    int64_t rate{0}, lines{0}, width{0}, height{0};
+    bool    copies{false};
+};
+web_plan web_plan_of(const media_probe& p);
+
 struct conn
 {
     conn() = default;
@@ -872,7 +881,7 @@ public:
     void hook_request(const std::shared_ptr<conn>& c);
     // The hook has answered: `deny` refuses the request with that error, and null lets it go on.
     void hook_done(uint64_t id, const s3_error* deny);
-    // Told after the commit, and only if the script has the hook.
+    // Told after the commit: the media cache, and the script if it has the hook.
     void notify_put(std::string_view bucket, std::string_view key, const object_meta& m);
     void notify_delete(std::string_view bucket, std::string_view key);
     // What another runtime's script asked of this one, answered on a later turn
@@ -1083,6 +1092,7 @@ public:
                    std::string link = {});
     // Who else a library is shared with, /~ui/access, as statements of the bucket's policy.
     void ui_access(const std::shared_ptr<conn>& c);
+    void ui_library(const std::shared_ptr<conn>& c);
     // Files and folders whose name holds a text, in every library the user lists, /~ui/search.
     void ui_search(const std::shared_ptr<conn>& c);
     // How full each library the user lists is, and an admin's quota on one, /~ui/usage.
@@ -1102,6 +1112,7 @@ public:
     };
     std::unordered_map<std::string, usage_count> m_usage;
     void ui_access_body(const std::shared_ptr<conn>& c);
+    void ui_library_body(const std::shared_ptr<conn>& c);
     // GET lists the git repositories the user keeps here (an admin: all), each with how its last run ended, whether
     // the account has a GitHub token, and whether git is available; POST {action: add | remove | sync | token, ...}.
     void ui_git(const std::shared_ptr<conn>& c);
@@ -1157,6 +1168,19 @@ public:
     // is whole.
     void media_known(const std::string& bucket, const std::string& key, const std::string& etag,
                      std::shared_ptr<const media_probe>& probe, bool& web_made);
+    // Whether the media cache's folder is there, made at the first medium.
+    bool media_dir_made();
+    // Names the medium `w` asks of the object as it is now: its folder, its probe's, and the versions URLs carry.
+    void media_name(media_want& w, const object_meta& m);
+    // Starts the object's probe unless it is made or being made, here or on another shard; false when its folder
+    // cannot be made.
+    bool media_probe_begin(const media_want& w);
+    // A film put into a library that makes web copies of its films has its copy made, in its turn, for no request.
+    void media_put(std::string_view bucket, std::string_view key, const object_meta& m);
+    // One film's copy made for no request a step further; true once nothing more is left to do for it.
+    bool media_unasked(const media_want& w);
+    // Whether a library makes a web copy of every film put into it, which its tag socketley:web-copies says.
+    bool makes_web_copies(std::string_view bucket) const;
     // A medium's use, written to its lock's time at most once a minute, which eviction orders by.
     void media_touch(const std::string& dir);
     // Ends the rendition job at `i`: killed when running, its files cleared, the rendition marked done when whole.
@@ -1542,6 +1566,8 @@ private:
     std::vector<pid_t> m_media_unreaped;
     void reap_later(pid_t pid);
     std::vector<std::pair<std::weak_ptr<conn>, media_want>> m_media_waits;
+    // Web copies of films just put, waiting for their probe or for the shard's one web copy at a time.
+    std::vector<media_want> m_media_unasked;
     timer       m_media_timer;
     // A poll of each running job's pidfd, which completes when its process ends; a list, so each stays where the
     // ring was told it is.

@@ -10357,6 +10357,19 @@ in it still holds. Both are for whoever may read or write the bucket's policy,
 its owner and an admin. The drive's root lists, besides the buckets a user owns,
 every bucket whose policy lets the user list it.
 .IP
+A film's link is a page that plays it, which a chat embeds as a player once the
+film's web copy,
+.BI /~media/web/ bucket / key\fR,
+is made: H.264 in an MP4 of at most 46 MiB and 1440 lines. It is made when a
+link asks for it, or as the film is put into a library tagged
+.BR socketley:web\-copies=on .
+.B GET /~ui/library?bucket=\fIname\fR
+says whether a library is, and
+.B POST /~ui/library
+with
+.B "{\(dqbucket\(dq, \(dqweb_copies\(dq}"
+tags it or takes the tag away, for whoever may change the bucket's tags.
+.IP
 It plays films and music, with their subtitles: the file itself where the
 browser plays it, which costs the server nothing, and otherwise the master
 playlist's streams through Media Source Extensions, the copied one where the

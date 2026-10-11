@@ -668,11 +668,13 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
             const std::string video = web_made ? web : page + "?raw";
             // A chat is given only the web copy, as <id>.mp4: until it is made a chat shows the still alone.
             const std::string chat = web_made ? web + ".mp4" : std::string();
-            int64_t width = p && p->width > 0 ? p->width : 1280, height = p && p->height > 0 ? p->height : 720;
-            if (height > 1440)
+            // The web copy's own size, which a chat sizes its player by.
+            int64_t width = 1280, height = 720;
+            if (p && p->width > 0 && p->height > 0)
             {
-                width = width * 1440 / height;
-                height = 1440;
+                const web_plan plan = web_plan_of(*p);
+                width = plan.width;
+                height = plan.height;
             }
             app_reply(cc, 200, film_page(last_name_of(key), &m, page, video, chat, base + "/~media/thumb-1280/~share/" + id,
                                          web_made ? std::string() : web + "?prepare", width, height),
