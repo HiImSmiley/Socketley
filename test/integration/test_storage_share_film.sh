@@ -100,6 +100,25 @@ PAGE=$(curl -s -H 'Accept: text/html' "$U$L2")
 check "the page names the web copy once it is made" "$(og og:video <<<"$PAGE")" "$U/~media/web/~share/${L2#/~share/}"
 check "and asks for nothing more" "$(grep -c '?prepare' <<<"$PAGE")" 0
 
+check "and a HEAD asking for it says it is there" "$(curl -s -I -o /dev/null -w '%{http_code}' "$U/~media/web/~share/${L2#/~share/}?prepare")" 200
+
+# ── a film denser than a chat embeds ──
+# An H.264 MP4 a browser plays as it is, at a bitrate no chat proxies: its web copy is made again, at most 5 Mbit/s.
+ff -f lavfi -i "testsrc2=size=640x360:rate=25,noise=alls=60:allf=t" -t 3 -c:v libx264 -crf 0 -preset ultrafast \
+   -pix_fmt yuv420p "$T/dense.mp4"
+curl -s -u "$A" -T "$T/dense.mp4" -H "Content-Type: video/mp4" "$U/~dav/films/dense.mp4" >/dev/null
+L4=$(link dense.mp4)
+curl -s -o /dev/null "$U/~media/info/~share/${L4#/~share/}"
+for _ in $(seq 1 120); do
+    [ "$(curl -s -I -o /dev/null -w '%{http_code}' "$U/~media/web/~share/${L4#/~share/}?prepare")" = 200 ] && break
+    sleep 0.5
+done
+curl -s -o "$T/dense-web.mp4" "$U/~media/web/~share/${L4#/~share/}"
+check "the film is denser than a chat embeds" \
+      "$("$FFPROBE" -v error -show_entries format=bit_rate -of csv=p=0 "$T/dense.mp4" | awk '{print ($1 > 8000000)}')" 1
+check "and its web copy is not" \
+      "$("$FFPROBE" -v error -show_entries format=bit_rate -of csv=p=0 "$T/dense-web.mp4" | awk '{print ($1 > 0 && $1 <= 6500000)}')" 1
+
 # ── what is not a film ──
 printf 'hello\n' > "$T/note.txt"
 curl -s -u "$A" -T "$T/note.txt" "$U/~dav/films/note.txt" >/dev/null

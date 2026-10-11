@@ -1778,14 +1778,28 @@ function shareDlg(it) {
       // A film's link plays in a chat: its web copy is asked for now, so it is there when the chat looks.
       if (it.kind === 'video' && !pw.value) {
         // Its size first, which the page tells the chat, and a web copy when it is not an MP4 already.
-        const sh = url.slice(location.origin.length + 1);
-        fetch('/~media/info/' + sh).then(() => fetch('/~media/web/' + sh + '?prepare')).catch(() => {});
-        out.append(el('p', { class: 'mut', style: 'font-size:12.5px;margin:8px 0 0', text: 'Pasted into a chat, the link shows a player. A film that is not an MP4 browsers play is made into one first, which takes a while for a long one.' }));
+        chatReady(url.slice(location.origin.length + 1), it.name);
+        out.append(el('p', { class: 'mut', style: 'font-size:12.5px;margin:8px 0 0', text: 'Pasted into a chat, the link shows a player once the film is made playable there, which takes a while for a long one; you are told when.' }));
       }
       copy(url, inp);
     } catch (e) { fail(e); }
   };
   modal('Share ' + it.name, body, [btn('link', 'Create link', make, 'pri')]);
+}
+// A film's web copy asked for and waited on, since a chat that reads the link before it is made embeds no player
+// and keeps that answer for a while.
+async function chatReady(sh, name) {
+  try { await fetch('/~media/info/' + sh); } catch (e) {}
+  let told = null;
+  for (let i = 0; i < 400; i++) {
+    let r = null;
+    try { r = await fetch('/~media/web/' + sh + '?prepare', { method: 'HEAD' }); } catch (e) {}
+    if (r && r.status === 200) { if (told) told.remove(); if (i) toast('The player for ' + name + ' is ready: paste the link into a chat now', 'ok', 12000); return; }
+    if (!r || r.status !== 202) { if (told) told.remove(); return; }
+    if (!told) told = toast('Making ' + name + ' playable in chats: paste the link once this says it is ready', 'info', 3600000);
+    await new Promise(f => setTimeout(f, 3000));
+  }
+  if (told) told.remove();
 }
 // A link that does not end, made and copied in one step, a film's web copy asked for so a chat embeds a player.
 async function publicLink(it) {
@@ -1793,10 +1807,10 @@ async function publicLink(it) {
     const r = await must(await api('POST', '/~share', { body: JSON.stringify({ bucket: it.segs[0], key: it.segs.slice(1).join('/'), expires_in: 0 }) }));
     const url = location.origin + (await r.json()).url;
     const sh = url.slice(location.origin.length + 1);
-    if (it.kind === 'video') fetch('/~media/info/' + sh).then(() => fetch('/~media/web/' + sh + '?prepare')).catch(() => {});
-    const what = 'It works until you remove it under Shared links.' + (it.kind === 'video' ? ' In a chat it shows a player.' : '');
+    const what = 'It works until you remove it under Shared links.';
     try { await navigator.clipboard.writeText(url); toast('Public link copied. ' + what, 'ok', 6000); }
     catch (e) { secretBox('Public link', [['Link', url]], what); }
+    if (it.kind === 'video') chatReady(sh, it.name);
   } catch (e) { fail(e); }
 }
 function copy(text, inp) {
