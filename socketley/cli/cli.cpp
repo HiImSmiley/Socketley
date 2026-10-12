@@ -621,16 +621,14 @@ int cli_dispatch(int argc, char** argv)
             for (int i = 3; i < argc; ++i)
             {
                 if (std::string_view(argv[i]) == "-i")
-                {
                     want_interactive = true;
-                    continue;
-                }
                 edits += ' ';
                 edits += argv[i];
             }
 
             // One verb either way, so a stopped runtime is started whether or not there was something to change:
-            // sending the flags as `edit ... --restart` instead made restart mean two things.
+            // sending the flags as `edit ... --restart` instead made restart mean two things.  -i travels with them,
+            // because the daemon honours it on the connection the command arrives on and so has to be told.
             const std::string cmd = "restart " + std::string(argv[2]) + edits;
             if (want_interactive)
                 return cli_interactive_command(cmd);

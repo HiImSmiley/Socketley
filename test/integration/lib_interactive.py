@@ -6,8 +6,9 @@
 import os, select, subprocess, time
 
 
-def session(binp, sock, name):
-    return subprocess.Popen([binp, "start", name, "-i"],
+def session(binp, sock, name, verb="start", *flags):
+    """`start NAME -i` by default; any verb that takes -i, with its own flags before it."""
+    return subprocess.Popen([binp, verb, name, *flags, "-i"],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                             env=dict(os.environ, SOCKETLEY_SOCKET=sock))

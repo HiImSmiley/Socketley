@@ -4084,7 +4084,7 @@ int daemon_handler::cmd_dump(ipc_connection* conn, const parsed_args& pa)
 // behind it with it.  `apply` is called rather than inlined because cmd_import has forty ways out, and every one of
 // them returns here, to the start below.
 int daemon_handler::across_restart(ipc_connection* conn, const char* verb, std::string_view name,
-                                   const std::function<int()>& apply, bool always_start)
+                                   const std::function<int()>& apply, bool always_start, bool interactive)
 {
     const std::string was(name);
     std::string id;
@@ -4133,7 +4133,9 @@ int daemon_handler::across_restart(ipc_connection* conn, const char* verb, std::
                 break;
             }
     }
-    const std::string line = "start " + now;
+    // -i is honoured by cmd_start on the connection it arrives on, so it has to be on the line that gets there:
+    // without it the daemon never registered the session and the CLI pumped a terminal nobody was listening to.
+    const std::string line = "start " + now + (interactive ? " -i" : "");
     parsed_args sp;
     sp.parse(line);
     std::string said = std::move(conn->write_buf);
@@ -4161,16 +4163,28 @@ int daemon_handler::cmd_restart(ipc_connection* conn, const parsed_args& pa)
         conn->write_buf = command_usage::line("restart");
         return 1;
     }
-    if (pa.count == 2)
-        return across_restart(conn, "restart", pa.args[1], nullptr, true);
+    // -i is restart's own and belongs to the start at the end; everything else is edit's, so the two are separated
+    // here and `edit` never sees a flag it would refuse by name.
+    bool interactive = false;
+    std::string flags;
+    for (size_t i = 2; i < pa.count; ++i)
+    {
+        if (pa.args[i] == "-i")
+        {
+            interactive = true;
+            continue;
+        }
+        flags += ' ';
+        flags += pa.args[i];
+    }
+    if (flags.empty())
+        return across_restart(conn, "restart", pa.args[1], nullptr, true, interactive);
     // The flags are edit's, read by edit's own parser: `restart x --shards 1` is `edit x --shards 1` with the stop
     // and the start around it, and a flag this daemon does not know is refused here by the one parser that knows.
-    // Flags left out of it entirely rather than refused by name, because a silently ignored flag is the defect that
-    // had a flag's value started as a runtime.
-    const std::string line = "edit " + std::string(pa.args[1]) + " " + std::string(pa.rest_from(2));
+    const std::string line = "edit " + std::string(pa.args[1]) + flags;
     parsed_args ep;
     ep.parse(line);
-    return across_restart(conn, "restart", pa.args[1], [&] { return cmd_edit(conn, ep, false); }, true);
+    return across_restart(conn, "restart", pa.args[1], [&] { return cmd_edit(conn, ep, false); }, true, interactive);
 }
 
 // Everything after the name is the document -- minus --restart, which is the caller's own and not part of what is

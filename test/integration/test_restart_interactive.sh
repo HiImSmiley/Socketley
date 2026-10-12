@@ -101,7 +101,57 @@ else
     bad "restart -i still restarts" "ls reads '${STATE:-<none>}' after it"
 fi
 
+# ─── attached, and not merely holding a socket ──────────────────────────────
+#
+# "stayed" above is the CLI's own pump loop, which runs whether or not the
+# daemon ever registered the session: it reads stdin and a socket until one of
+# them ends, and a fifo makes sure neither does.  So it cannot tell an attached
+# session from a detached one -- and when `restart` became one daemon command,
+# the -i stopped reaching the `start` inside it and this file stayed green.
+#
+# What only an attached session can do is be heard: what is typed at a server's
+# terminal is broadcast to its clients, from the worker that holds them.  A
+# real client on the port is the observable.
 kill "$HOLDER" 2>/dev/null; HOLDER=""
+"$BIN" start ri >/dev/null 2>&1
+sleep 1.2
+REP=$(timeout 90 python3 - "$BIN" "$SOCKETLEY_SOCKET" "$P" "$HERE" <<'PYEOF' 2>&1
+import socket, sys, time
+sys.path.insert(0, sys.argv[4])
+from lib_interactive import session, drain, say
+binp, sock, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+def heard(*flags):
+    s = session(binp, sock, "ri", "restart", *flags)
+    time.sleep(3); drain(s, 0.5)
+    c = socket.create_connection(("127.0.0.1", port), 5); c.settimeout(3)
+    time.sleep(0.8)
+    say(s, "typed-at-the-restart")
+    try:    got = c.recv(256).decode().strip()
+    except Exception: got = ""
+    c.close(); s.kill(); s.wait()
+    return got
+
+print("PLAIN=%s" % heard())
+print("WITHFLAG=%s" % heard("--max-connections", "77"))
+PYEOF
+)
+for case in PLAIN WITHFLAG; do
+    GOT=$(sed -n "s/^$case=//p" <<<"$REP")
+    if [ "$GOT" = "typed-at-the-restart" ]; then
+        ok "a client heard what was typed at the session ($case)"
+    else
+        bad "restart -i really attaches ($case)" \
+            "the client heard '${GOT:-<nothing>}';" \
+            "the session held its socket open without the daemon registering it" \
+            "$(tr '\n' ' ' <<<"$REP")"
+    fi
+done
+# And the flag went with it, so the -i did not cost the change.
+MC=$("$BIN" show ri 2>/dev/null | sed -n 's/.*"max_connections": \([0-9]*\).*/\1/p')
+[ "$MC" = "77" ] && ok "and the flag beside -i was applied" \
+                 || bad "restart -i applies its flags" "max_connections reads '${MC:-<none>}', want 77"
+
 "$BIN" stop ri >/dev/null 2>&1; "$BIN" remove ri >/dev/null 2>&1
 daemon_stop
 trap - EXIT

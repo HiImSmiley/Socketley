@@ -184,7 +184,7 @@ private:
     // asked to change a setting, not to bring something up that somebody had taken down.
     // `verb` is the command the caller gave, so a refusal names it.
     int across_restart(ipc_connection* conn, const char* verb, std::string_view name,
-                       const std::function<int()>& apply, bool always_start);
+                       const std::function<int()>& apply, bool always_start, bool interactive = false);
     // restart <name>: the same with nothing to apply.
     int cmd_restart(ipc_connection* conn, const parsed_args& pa);
     int cmd_action(ipc_connection* conn, const parsed_args& pa);
