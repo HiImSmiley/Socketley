@@ -3668,7 +3668,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                              const parsed_args& pa, bool may_restart)
 {
     if (may_restart && pa.count >= 3 && asks_restart(pa))
-        return across_restart(conn, pa.args[1], [&] { return cmd_edit(conn, pa, false); }, false);
+        return across_restart(conn, "edit", pa.args[1], [&] { return cmd_edit(conn, pa, false); }, false);
     if (pa.count < 3)
     {
         std::cout << command_usage::line("edit");
@@ -4083,8 +4083,8 @@ int daemon_handler::cmd_dump(ipc_connection* conn, const parsed_args& pa)
 // after it never arrived.  Measured on a live box: the entrance down, its configuration unchanged, and every site
 // behind it with it.  `apply` is called rather than inlined because cmd_import has forty ways out, and every one of
 // them returns here, to the start below.
-int daemon_handler::across_restart(ipc_connection* conn, std::string_view name, const std::function<int()>& apply,
-                                   bool always_start)
+int daemon_handler::across_restart(ipc_connection* conn, const char* verb, std::string_view name,
+                                   const std::function<int()>& apply, bool always_start)
 {
     const std::string was(name);
     std::string id;
@@ -4093,6 +4093,18 @@ int daemon_handler::across_restart(ipc_connection* conn, std::string_view name, 
     {
         id.assign(inst->get_id());
         running = inst->get_state() == runtime_running;
+        // The guard `stop`, `start` and `edit` each carry, here as well: the cluster placed this runtime, so going
+        // around three refusals by doing all three at once is not what one command was for -- and the start below is
+        // cmd_start, which refuses a cluster runtime, so this would stop it and leave it down.
+        if (inst->is_cluster_owned() && !m_cluster_internal)
+        {
+            std::vector<std::string> only{was};
+            withhold_cluster_names(only, verb, conn);
+            // With nothing to apply it is a bounce in place, and there is a verb for that which the cluster allows.
+            if (!apply)
+                conn->write_buf += "  `socketley reload " + was + "` bounces it where it stands.\n";
+            return 1;
+        }
     }
     else
     {
@@ -4141,7 +4153,7 @@ int daemon_handler::cmd_restart(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
     if (pa.count == 2)
-        return across_restart(conn, pa.args[1], nullptr, true);
+        return across_restart(conn, "restart", pa.args[1], nullptr, true);
     // The flags are edit's, read by edit's own parser: `restart x --shards 1` is `edit x --shards 1` with the stop
     // and the start around it, and a flag this daemon does not know is refused here by the one parser that knows.
     // Flags left out of it entirely rather than refused by name, because a silently ignored flag is the defect that
@@ -4149,7 +4161,7 @@ int daemon_handler::cmd_restart(ipc_connection* conn, const parsed_args& pa)
     const std::string line = "edit " + std::string(pa.args[1]) + " " + std::string(pa.rest_from(2));
     parsed_args ep;
     ep.parse(line);
-    return across_restart(conn, pa.args[1], [&] { return cmd_edit(conn, ep, false); }, true);
+    return across_restart(conn, "restart", pa.args[1], [&] { return cmd_edit(conn, ep, false); }, true);
 }
 
 // Everything after the name is the document -- minus --restart, which is the caller's own and not part of what is
@@ -4171,7 +4183,7 @@ static std::string_view import_document(const parsed_args& pa)
 int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool may_restart)
 {
     if (may_restart && pa.count >= 3 && asks_restart(pa))
-        return across_restart(conn, pa.args[1], [&] { return cmd_import(conn, pa, false); }, false);
+        return across_restart(conn, "import", pa.args[1], [&] { return cmd_import(conn, pa, false); }, false);
 
     if (pa.count < 3)
     {
@@ -4184,6 +4196,15 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
     if (!instance)
     {
         conn->write_buf = "runtime not found: " + std::string(name) + "\n";
+        return 1;
+    }
+
+    // The same refusal `edit` gives, because this is the other door to the same configuration: the cluster placed
+    // this runtime and declares what it is, so a document written here is undone at the next tick.
+    if (instance->is_cluster_owned() && !m_cluster_internal)
+    {
+        std::vector<std::string> only{std::string(name)};
+        withhold_cluster_names(only, "import", conn);
         return 1;
     }
 

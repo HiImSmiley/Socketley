@@ -200,11 +200,21 @@ check 'saw "^api +server +2 +2 " as "$h1" cluster placement' "placement does not
 check 'saw "replicas on this node" as "$h1" cluster placement && saw "^  api +running" as "$h1" cluster placement' "placement does not say this node's replica is running"
 
 # ─── hands off ──────────────────────────────────────────────────────────────
-for verb in "stop api" "remove api" "start api" "edit api --max-connections 5"; do
+# restart and import are the same hands: restart is a stop and a start in one command, and import is the other door
+# to what edit refuses here -- neither may go around the refusal by being one request instead of three.
+for verb in "stop api" "remove api" "start api" "edit api --max-connections 5" \
+            "restart api" "restart api --max-connections 5" "edit api --max-connections 5 --restart" \
+            "import api {\"max_connections\":5}" "import api --restart {\"max_connections\":5}"; do
     out=$(as "$h1" $verb 2>&1) && rc=0 || rc=$?
     check '[ "$rc" = 1 ] && grep -q "is a cluster runtime" <<<"$out"' "$verb on a replica: exit $rc, said: $out"
 done
 check 'serves api "$h1"' "the replica stopped serving after the refused verbs"
+# The refused bare restart names the verb that does bounce a replica, and that verb works where restart may not.
+out=$(as "$h1" restart api 2>&1) || true
+check 'grep -q "reload api" <<<"$out"' "the refused restart does not point at reload: $out"
+out=$(as "$h1" reload api 2>&1) && rc=0 || rc=$?
+check '[ "$rc" = 0 ]' "reload on a replica: exit $rc, said: $out"
+check 'wait_for 20 "serves api \"$h1\""' "the replica does not serve again after a reload"
 
 # ─── refused as a duplicate, and a no-op ────────────────────────────────────
 refuse "already exists" create server api --listen "unix:$T/x-{node}.sock"
