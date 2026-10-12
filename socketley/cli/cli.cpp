@@ -595,9 +595,16 @@ int cli_dispatch(int argc, char** argv)
                     return cli_interactive(argc, argv);
             return cli_forward(argc, argv);
         }
-        // restart is stop then start and takes only the name and -i, because
-        // forwarding every argument had `start` read a flag's value as a
-        // runtime name and start whatever it happened to name.
+        // restart is one command to the daemon, not a stop and a start sent one
+        // after the other: the runtime being restarted may be the one the
+        // connection travels through -- an entrance proxy, which a dashboard is
+        // reached through -- and the stop then arrives while the start never
+        // does. Measured: an entrance left stopped and every site behind it
+        // with it.
+        //
+        // Flags are taken again, and go to `edit` rather than to `start`: what
+        // they used to do was have start read a flag's VALUE as a runtime name
+        // and start whatever that named, which is why they were refused at all.
         case fnv1a("restart"):
         {
             if (argc < 3)
@@ -610,65 +617,34 @@ int cli_dispatch(int argc, char** argv)
             }
 
             bool want_interactive = false;
+            std::string edits;
             for (int i = 3; i < argc; ++i)
             {
-                std::string_view arg = argv[i];
-                if (arg == "-i")
+                if (std::string_view(argv[i]) == "-i")
                 {
                     want_interactive = true;
                     continue;
                 }
-                std::cerr << "restart does not take " << arg << "\n"
-                          << "  It stops the runtime and starts it again with the "
-                             "configuration it already has.\n"
-                          << "  To change that configuration: socketley edit "
-                          << argv[2] << " " << arg << " ...\n";
-                return 1;
+                edits += ' ';
+                edits += argv[i];
             }
 
-            // The stop's answer is read now, because discarding it ran a start
-            // against a name the stop had already reported as missing.
-            std::string stop_cmd = std::string("stop ") + argv[2];
-            std::string stop_data;
-            int rc = ipc_send(stop_cmd, stop_data);
-            if (rc < 0)
-            {
-                return ipc_report_failure(rc);
-            }
-            if (rc != 0)
-            {
-                // The stream cli_forward uses and the start half below uses:
-                // `stop nosuch` named the runtime and `restart nosuch` said
-                // nothing at all, on the same refusal from the same daemon.
-                if (!stop_data.empty()) std::cout << stop_data;
-                return rc;
-            }
-
-            std::string start_cmd = "start";
-            for (int i = 2; i < argc; ++i)
-            {
-                start_cmd += ' ';
-                start_cmd += argv[i];
-            }
-
-            // The half that -i belongs to, and the reason this is not a plain
-            // send: the daemon honours -i on whatever connection it arrives on,
-            // so ipc_send registered the session and closed it in the same
-            // breath.
+            // One verb either way, so a stopped runtime is started whether or not there was something to change:
+            // sending the flags as `edit ... --restart` instead made restart mean two things.
+            const std::string cmd = "restart " + std::string(argv[2]) + edits;
             if (want_interactive)
-                return cli_interactive_command(start_cmd);
+                return cli_interactive_command(cmd);
 
-            std::string start_data;
-            rc = ipc_send(start_cmd, start_data);
+            std::string data;
+            int rc = ipc_send(cmd, data);
             if (rc < 0)
-            {
                 return ipc_report_failure(rc);
-            }
-            rc = settle_startup(rc, start_data);
-            if (!start_data.empty())
-                std::cout << start_data;
+            rc = settle_startup(rc, data);
+            if (!data.empty())
+                std::cout << data;
             return rc;
         }
+
         case fnv1a("ls"):
         case fnv1a("ps"):
         case fnv1a("create"):
@@ -1019,14 +995,29 @@ int cli_import(int argc, char** argv)
     std::string name = argv[2];
     std::string json;
 
-    if (argc >= 4)
+    // The caller's flag and not part of the document, so it is taken out before the rest is read -- and taken out
+    // rather than left in, because `show x | import x --restart` otherwise looks like a document of one word and
+    // never reads the pipe.
+    std::string restart;
+    int first = 3;
+    for (int i = 3; i < argc; ++i)
+        if (std::string_view(argv[i]) == "--restart")
+        {
+            restart = " --restart";
+            if (i == first)
+                ++first;
+        }
+
+    if (argc > first)
     {
-        // Quoted, the document is argv[3] entire; unquoted, joining with a
+        // Quoted, the document is argv[first] entire; unquoted, joining with a
         // space puts it back together well enough for the compaction about to
         // drop that whitespace.
-        for (int i = 3; i < argc; ++i)
+        for (int i = first; i < argc; ++i)
         {
-            if (i > 3) json += ' ';
+            if (std::string_view(argv[i]) == "--restart")
+                continue;
+            if (i > first) json += ' ';
             json += argv[i];
         }
     }
@@ -1050,7 +1041,7 @@ int cli_import(int argc, char** argv)
         return 1;
     }
 
-    std::string command = "import " + name + " " + compact;
+    std::string command = "import " + name + restart + " " + compact;
 
     std::string data;
     int exit_code = ipc_send(command, data);

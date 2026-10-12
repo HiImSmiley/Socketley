@@ -1404,6 +1404,7 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("show"):
         case fnv1a("dump"):      return cmd_dump(conn, pa);
         case fnv1a("import"):    return cmd_import(conn, pa);
+        case fnv1a("restart"):   return cmd_restart(conn, pa);
         case fnv1a("action"):    return cmd_action(conn, pa);
         case fnv1a("stats"):     return cmd_stats(conn, pa);
         case fnv1a("reload"):    return cmd_reload(conn, pa);
@@ -3653,9 +3654,21 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
 }
 
 // Same as cmd_create: guarded by process_command, along with every other command.
-int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
-                             const parsed_args& pa)
+// Whether the command carries --restart, which every configuration command takes to mean "stop it if that is what
+// this needs, apply, and start it again".
+static bool asks_restart(const parsed_args& pa)
 {
+    for (size_t i = 2; i < pa.count; ++i)
+        if (pa.args[i] == "--restart")
+            return true;
+    return false;
+}
+
+int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
+                             const parsed_args& pa, bool may_restart)
+{
+    if (may_restart && pa.count >= 3 && asks_restart(pa))
+        return across_restart(conn, pa.args[1], [&] { return cmd_edit(conn, pa, false); }, false);
     if (pa.count < 3)
     {
         std::cout << command_usage::line("edit");
@@ -4063,8 +4076,103 @@ int daemon_handler::cmd_dump(ipc_connection* conn, const parsed_args& pa)
     return 0;
 }
 
-int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
+// Stop, apply, start -- in the daemon, as one command.
+//
+// Three commands are three round trips, and the runtime they travel through is stopped by the first: a dashboard is
+// reached through an entrance proxy, so changing that proxy's shard count stopped it and the import and the start
+// after it never arrived.  Measured on a live box: the entrance down, its configuration unchanged, and every site
+// behind it with it.  `apply` is called rather than inlined because cmd_import has forty ways out, and every one of
+// them returns here, to the start below.
+int daemon_handler::across_restart(ipc_connection* conn, std::string_view name, const std::function<int()>& apply,
+                                   bool always_start)
 {
+    const std::string was(name);
+    std::string id;
+    bool running = false;
+    if (auto* inst = m_manager.get(was))
+    {
+        id.assign(inst->get_id());
+        running = inst->get_state() == runtime_running;
+    }
+    else
+    {
+        conn->write_buf = "runtime not found: " + was + "\n";
+        return 1;
+    }
+    // What the state file says is left alone: a daemon that dies between the stop and the start brings the runtime up
+    // again at its next start, where writing "was not running" would leave it down for good.
+    if (running)
+    {
+        m_manager.stop(was, m_loop);
+        reconcile_proxy_workers();
+    }
+    const int rc = apply ? apply() : 0;
+    if (!running && !always_start)
+        return rc;
+    // The name it answers to now, which a document or a flag that renamed it changed; the id does not move.
+    std::string now = was;
+    if (!m_manager.get(now))
+    {
+        std::shared_lock lock(m_manager.mutex);
+        for (const auto& [n, inst] : m_manager.list())
+            if (inst && inst->get_id() == id)
+            {
+                now = n;
+                break;
+            }
+    }
+    const std::string line = "start " + now;
+    parsed_args sp;
+    sp.parse(line);
+    std::string said = std::move(conn->write_buf);
+    conn->write_buf.clear();
+    const int src = cmd_start(conn, sp);
+    // What the change said comes first, since that is the answer to the command; the start's after it, which it has
+    // only when the runtime is not running any more.
+    conn->write_buf = said + conn->write_buf;
+    return rc != 0 ? rc : src;
+}
+
+int daemon_handler::cmd_restart(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count < 2)
+    {
+        conn->write_buf = command_usage::line("restart");
+        return 1;
+    }
+    if (pa.count == 2)
+        return across_restart(conn, pa.args[1], nullptr, true);
+    // The flags are edit's, read by edit's own parser: `restart x --shards 1` is `edit x --shards 1` with the stop
+    // and the start around it, and a flag this daemon does not know is refused here by the one parser that knows.
+    // Flags left out of it entirely rather than refused by name, because a silently ignored flag is the defect that
+    // had a flag's value started as a runtime.
+    const std::string line = "edit " + std::string(pa.args[1]) + " " + std::string(pa.rest_from(2));
+    parsed_args ep;
+    ep.parse(line);
+    return across_restart(conn, pa.args[1], [&] { return cmd_edit(conn, ep, false); }, true);
+}
+
+// Everything after the name is the document -- minus --restart, which is the caller's own and not part of what is
+// being imported, and which a caller may write on either side of it.
+static std::string_view import_document(const parsed_args& pa)
+{
+    size_t first = 2, last = pa.count - 1;
+    if (first <= last && pa.args[first] == "--restart")
+        ++first;
+    if (first <= last && pa.args[last] == "--restart")
+        --last;
+    if (first > last)
+        return {};
+    const char* b = pa.args[first].data();
+    const char* e = pa.args[last].data() + pa.args[last].size();
+    return std::string_view(b, static_cast<size_t>(e - b));
+}
+
+int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool may_restart)
+{
+    if (may_restart && pa.count >= 3 && asks_restart(pa))
+        return across_restart(conn, pa.args[1], [&] { return cmd_import(conn, pa, false); }, false);
+
     if (pa.count < 3)
     {
         conn->write_buf = command_usage::line("import");
@@ -4085,8 +4193,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         return 2;
     }
 
-    // Extract JSON from everything after the name
-    std::string json_str(pa.rest_from(2));
+    std::string json_str(import_document(pa));
     runtime_config cfg;
     const bool named = m_persistence->parse_json_string(json_str, cfg, instance->get_type());
     std::string_view doc = json_str;

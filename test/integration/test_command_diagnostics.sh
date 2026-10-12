@@ -99,8 +99,9 @@ else fail "the flag's value was not started as a runtime" \
           "cd_victim went from '$BEFORE' to '$(state_of cd_victim)'" \
           "resolve_names() treated the value as a name."; fi
 
-if grep -q "edit" <<<"$OUT"; then pass
-else fail "the refusal points at the command that does take flags" \
+# restart now takes edit's own flags, so the refusal names the flag rather than another command to go to.
+if grep -q -- "--some-flag" <<<"$OUT"; then pass
+else fail "the refusal names the flag it cannot honour" \
           "said: ${OUT:-<nothing>}"; fi
 
 # ─── And restart itself still restarts ──────────────────────────────────────

@@ -2171,6 +2171,11 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
         // Same rule as the create path, and the path that matters most,
         // because a generic "unknown flag" reads as a typo and sends the
         // operator to try a different spelling.
+        // Not a setting of the runtime: it says the caller wants the change carried across a stop and a start, and
+        // the command has already acted on it by the time the flags are read.
+        case fnv1a("--restart"):
+            return 0;
+
         case fnv1a("--tls"):
             if (!tls_role_has_handshake(instance->get_type()))
             {

@@ -467,7 +467,9 @@ function controls(r, small) {
   const b = [];
   if (!me || !me.user) return b;
   if (on) b.push(btn('stop', 'Stop', async e => { e && e.stopPropagation(); if (await act(['stop', n], n + ' stopped')) poll(); }, cls),
-    btn('restart', 'Restart', async e => { e && e.stopPropagation(); if (await act(['stop', n]) && await act(['start', n], n + ' restarted')) poll(); }, cls));
+    // One command and not a stop and a start: the runtime being restarted may be the entrance this page is
+    // reached through, and then the stop arrives and the start never does.
+    btn('restart', 'Restart', async e => { e && e.stopPropagation(); if (await act(['restart', n], n + ' restarted')) poll(); }, cls));
   else b.push(btn('play', 'Start', async e => { e && e.stopPropagation(); if (await act(['start', n], n + ' started')) poll(); }, cls + ' pri'));
   if (!small) b.push(btn('restart', 'Reload Lua', async () => { await act(['reload-lua', n], 'Lua of ' + n + ' reloaded'); }, cls),
     btn('edit', 'Edit', () => editDlg(r), cls),
@@ -812,12 +814,10 @@ async function editDlg(r) {
   };
   // Stopped, saved and started again, for what a running runtime refuses or takes only at a start.
   const cycle = async d => {
-    const out = await run('stop', r.name);
-    if (out.code) { toast((out.out || 'Stop failed').trim(), 'bad', 7000); return; }
-    const imp = await run('import', r.name, JSON.stringify(d));
-    const st = await run('start', r.name);
-    if (imp.code) { toast('Not saved: ' + (imp.out || '').trim() + (st.code ? '' : ' (started again as it was)'), 'bad', 9000); poll(); return; }
-    if (st.code) { toast('Saved, and it did not start again: ' + (st.out || '').trim(), 'bad', 9000); poll(); return; }
+    // The daemon stops it, saves and starts it again, so a page reached through the very runtime being restarted
+    // cannot be cut off between the three -- which left an entrance proxy stopped and unchanged.
+    const out = await run('import', r.name, '--restart', JSON.stringify(d));
+    if (out.code) { toast('Not saved: ' + (out.out || '').trim(), 'bad', 9000); poll(); return; }
     done(r.name + ' saved and restarted');
   };
   const save = async restart => {
@@ -830,7 +830,7 @@ async function editDlg(r) {
       if (!later.length) return done(r.name + ' saved');
       // Saved, and some of it waits for a start: offered now rather than left to be found later.
       if (await ask({ title: 'Restart ' + r.name + ' now?', text: 'Saved. ' + later.join(', ') + (later.length === 1 ? ' takes' : ' take') + ' effect at the next start; a restart drops its connections.', ok: 'Restart now' })) {
-        const a = await run('stop', r.name), b = a.code ? a : await run('start', r.name);
+        const b = await run('restart', r.name);
         if (b.code) { toast((b.out || 'Restart failed').trim(), 'bad', 7000); poll(); return; }
         return done(r.name + ' saved and restarted');
       }

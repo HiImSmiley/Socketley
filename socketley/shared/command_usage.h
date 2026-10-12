@@ -23,7 +23,7 @@ inline constexpr std::string_view for_verb(std::string_view verb)
     if (verb == "add")    return "add <path> [--name <name>] [-s]";
     if (verb == "start")  return "start <name|pattern>... [-i]";
     if (verb == "stop")   return "stop <name|pattern>...";
-    if (verb == "restart") return "restart <name> [-i]";
+    if (verb == "restart") return "restart <name> [edit flags] [-i]";
     if (verb == "remove") return "remove <name|pattern>...";
     if (verb == "owner")  return "owner <name>";
     if (verb == "send")   return "send <name> <message>";

@@ -891,24 +891,43 @@ trusted, so a daemon that was killed outright is reported
 .B dead
 rather than listed as running, and its file is removed once its pid is gone too.
 .TP
-.BI "restart " "name " "[\-i]"
-Stop and start a runtime in one step. The runtime keeps the
-configuration it already has. Equivalent to
-.B stop
-followed by
-.BR start ,
-and it takes the name and
-.B \-i
-and nothing else: every other flag is refused by name, because handing them to
-.B start
-had a flag's VALUE read as a runtime name and that runtime started. To restart
-with a changed setting,
+.BI "restart " "name " "[edit flags] [\-i]"
+Stop and start a runtime in one step, with any
 .B edit
-first:
+flag given applied in between \(em which is how a setting that cannot change
+while a runtime runs is changed at all:
 .nf
-socketley edit api \-p 9001
-socketley restart api
+socketley restart api \-p 9001
+socketley restart ns\-proxy \-\-shards 1
 .fi
+.IP
+One command and not a
+.B stop
+followed by a
+.BR start ,
+because the runtime being restarted may be the one the command travels
+through: an entrance proxy carries the dashboard it was asked from, so the
+stop arrived and the start never did, and the entrance stayed down with its
+configuration unchanged. The daemon does all of it, so whatever becomes of the
+caller's connection the runtime ends up running. A flag the
+.B edit
+refuses leaves the runtime running and unchanged.
+.IP
+The flags are
+.BR edit 's,
+read by
+.B edit
+and never handed to
+.BR start :
+handing them there had a flag's VALUE read as a runtime name and that runtime
+started, which is why they were refused for a while.
+.B \-i
+is restart's own and attaches to the runtime once it is up. A runtime that was
+stopped is started, as it was before, flags or no flags: it is the lifecycle
+verb, and it means one thing. For a change that is to be stored WITHOUT
+starting anything, see
+.B edit \-\-restart
+below.
 .IP
 A runtime's new worker is forked only once its previous worker has exited, since
 that process holds the ports, unix paths and files until then; the
@@ -1012,9 +1031,26 @@ glob patterns, or a mix. With
 .BR * ,
 prints all runtimes.
 .TP
-.BI "edit " "name " "[flags]"
+.BI "edit " "name " "[flags] [\-\-restart]"
 Edit a runtime's configuration. When called with flags (e.g. \-p 9001),
-applies the changes directly. The flags accepted here are a subset of the
+applies the changes directly.
+.B \-\-restart
+stops the runtime first and starts it again afterwards, which is what a
+setting refused "while running" needs \(em and
+.B import
+takes it the same way, before the document:
+.nf
+socketley edit ns\-proxy \-\-shards 1 \-\-restart
+socketley show ns\-proxy | socketley import ns\-proxy \-\-restart
+.fi
+.IP
+The daemon does the stop, the change and the start as one command, so a caller
+whose connection the runtime carries cannot be cut off between them; see
+.BR restart .
+A change the runtime refuses leaves it running and unchanged \(em it was stopped
+and started around the refusal, since whether a setting needs that is only
+answered by applying it, and an edit that is refused rolls back whole.
+A runtime that was already stopped stays stopped. The flags accepted here are a subset of the
 ones
 .B create
 takes: the common settings
@@ -1144,7 +1180,7 @@ Interactive editor mode with auto-reload. After saving changes, the
 runtime's Lua script is automatically hot-reloaded. Alias:
 .BR \-\-reload .
 .TP
-.BI "import " "name " "json"
+.BI "import " "name " "[\-\-restart] " "json"
 Update a runtime's configuration from a JSON string. With no
 .I json
 argument the document is read from standard input instead, so

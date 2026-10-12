@@ -165,7 +165,7 @@ private:
     bool deliver_to_runtime(std::string_view name, std::string_view message,
                             std::string& why,
                             const proxy_supervisor* exclude = nullptr);
-    int cmd_edit(ipc_connection* conn, const parsed_args& pa);
+    int cmd_edit(ipc_connection* conn, const parsed_args& pa, bool may_restart = true);
     int cmd_dump(ipc_connection* conn, const parsed_args& pa);
     // The whole configuration to every worker serving this runtime, so a change
     // reaches the process holding the port; see the definition.
@@ -176,7 +176,16 @@ private:
     // forked under a session that is already open.
     void grant_interactive_to_workers(std::string_view name, int fd);
 
-    int cmd_import(ipc_connection* conn, const parsed_args& pa);
+    int cmd_import(ipc_connection* conn, const parsed_args& pa, bool may_restart = true);
+    // Stop the runtime, do `apply`, start it again -- one command, so a caller whose connection the runtime carries
+    // cannot be cut off between the three. `name` is the runtime before `apply` runs; a rename inside it is followed.
+    // `always_start` is restart's own meaning -- it ends with the runtime running, a stopped one included, as it did
+    // when it was a stop and a start. A configuration command's --restart leaves a stopped runtime stopped: it was
+    // asked to change a setting, not to bring something up that somebody had taken down.
+    int across_restart(ipc_connection* conn, std::string_view name, const std::function<int()>& apply,
+                       bool always_start);
+    // restart <name>: the same with nothing to apply.
+    int cmd_restart(ipc_connection* conn, const parsed_args& pa);
     int cmd_action(ipc_connection* conn, const parsed_args& pa);
     int cmd_stats(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload(ipc_connection* conn, const parsed_args& pa);
