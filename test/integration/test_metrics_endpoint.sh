@@ -191,6 +191,11 @@ print("one_processes=%s" % rts["m_one"]["processes"])
 print("shards_processes=%s" % rts["m_shards"]["processes"])
 print("stopped_processes=%s" % rts["m_two"]["processes"])
 print("rss_positive=%s" % (rts["m_one"]["rss_bytes"] > 0 and rts["m_shards"]["rss_bytes"] > rts["m_one"]["rss_bytes"] / 2))
+# What a runtime costs the machine is never more than its processes' resident memory added up, and for one in four
+# shards it is less: the binary's pages are one copy the four of them share, counted once here and four times there.
+print("memory_held=%s" % (0 < rts["m_one"]["memory_bytes"] <= rts["m_one"]["rss_bytes"]
+                          and rts["m_shards"]["memory_bytes"] < rts["m_shards"]["rss_bytes"]
+                          and 0 < ov["memory_bytes"] <= ov["rss_bytes"]))
 print("overview_processes=%s children=%d" % (ov["processes"], len(kids)))
 total = cpu(daemon) + sum(cpu(k) for k in kids)
 print("overview_cpu_close=%s" % (abs(ov["cpu_seconds"] - total) <= 0.05 + 0.02 * len(kids)))
@@ -202,6 +207,7 @@ case "$USAGE" in *"one_processes=1"*) ok ;; *) bad "a runtime counts its one pro
 case "$USAGE" in *"shards_processes=2"*) ok ;; *) bad "a runtime of two shards counts two processes" "$USAGE" ;; esac
 case "$USAGE" in *"stopped_processes=0"*) ok ;; *) bad "a stopped runtime counts none" "$USAGE" ;; esac
 case "$USAGE" in *"rss_positive=True"*) ok ;; *) bad "a running runtime's resident memory is read" "$USAGE" ;; esac
+case "$USAGE" in *"memory_held=True"*) ok ;; *) bad "what a runtime costs the machine counts a shared page once, not once per shard" "$USAGE" ;; esac
 case "$USAGE" in *"overview_processes=4 children=3"*) ok ;; *) bad "the overview counts the daemon and every shard" "$USAGE" ;; esac
 case "$USAGE" in *"overview_cpu_close=True"*) ok ;; *) bad "the overview's CPU time is that of the daemon and its children" "$USAGE" ;; esac
 case "$USAGE" in *"cpus=True"*) ok ;; *) bad "the overview names the CPUs online" "$USAGE" ;; esac

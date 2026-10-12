@@ -14144,6 +14144,7 @@ JSON object with high-level daemon statistics:
     "bytes_out": 9876543,
     "cpu_seconds": 812.40,
     "rss_bytes": 163577856,
+    "memory_bytes": 94371840,
     "processes": 5,
     "cpus": 4
 }
@@ -14155,16 +14156,19 @@ run in, read from
 .BR /proc ;
 the change between two readings over the time between them is the CPU used.
 .B rss_bytes
-is their resident memory,
+is their resident memory added up, which counts a page shared between shards once per shard, and
+.B memory_bytes
+what they cost the machine, each shared page counted by the share the process holds of it, so that the figures of the
+runtimes add up to the memory they hold between them (the kernel's Pss).
 .B processes
-how many there are, and
+is how many there are, and
 .B cpus
 the CPUs online.
 .TP
 .B GET /api/runtimes
 JSON array of all runtimes with name, type, port, state, connections,
 message/byte counters, and
-.BR cpu_seconds ", " rss_bytes " and " processes
+.BR cpu_seconds ", " rss_bytes ", " memory_bytes " and " processes
 for the runtime's own processes, one per shard (none while it is stopped).
 .TP
 .BI "GET /api/runtime/" name
@@ -16500,9 +16504,11 @@ and JSON API endpoints at
 .BR DASHBOARD ).
 Metrics include: runtimes total/running, connections total/active,
 messages total, bytes in/out, and per-runtime breakdowns, among them
-.B socketley_runtime_cpu_seconds_total
-and
-.BR socketley_runtime_resident_memory_bytes .
+.BR socketley_runtime_cpu_seconds_total ,
+.B socketley_runtime_resident_memory_bytes
+(resident, a shared page counted once per shard) and
+.B socketley_runtime_memory_bytes
+(what the runtime costs the machine, a shared page counted by the share it holds).
 .SH C++ SDK
 Socketley ships a three-tier modular C++ SDK in
 .BR include/linux/socketley/ .

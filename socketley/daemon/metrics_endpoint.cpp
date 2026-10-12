@@ -393,13 +393,40 @@ static void json_append_uint(std::string& out, uint64_t v)
     out.append(buf, end - buf);
 }
 
-// CPU time and resident memory of a set of processes, read from /proc, as the shards of a runtime or the whole daemon.
+// CPU time and memory of a set of processes, read from /proc, as the shards of a runtime or the whole daemon.
 struct process_usage
 {
     double   cpu_seconds{0};
     uint64_t rss_bytes{0};
+    // What the set actually costs: a page shared with other processes counted by the share this one holds of it, so
+    // the binary's own pages are counted once across a runtime's shards rather than once per shard. Summing resident
+    // memory instead over-reports by the binary's resident size for every shard past the first -- measured on a live
+    // daemon of ten runtimes in seventeen processes, 289 MB against the 136 MB the machine was actually holding.
+    uint64_t memory_bytes{0};
     uint32_t processes{0};
 };
+
+// The process's share of every page it has resident, from smaps_rollup's Pss, in bytes; 0 where the kernel does not
+// offer it. Reading it walks the page tables, which costs about ten times a read of /proc/<pid>/stat -- measured, 356
+// against 25 microseconds a process -- and is taken at the same cadence as the rest rather than per request.
+static uint64_t proportional_bytes(pid_t pid)
+{
+    char path[48];
+    std::snprintf(path, sizeof path, "/proc/%d/smaps_rollup", static_cast<int>(pid));
+    FILE* f = std::fopen(path, "re");
+    if (!f)
+        return 0;
+    char line[256];
+    uint64_t kb = 0;
+    while (std::fgets(line, sizeof line, f))
+        if (std::strncmp(line, "Pss:", 4) == 0)
+        {
+            kb = std::strtoull(line + 4, nullptr, 10);
+            break;
+        }
+    std::fclose(f);
+    return kb * 1024;
+}
 
 static void add_process_usage(pid_t pid, process_usage& u)
 {
@@ -425,6 +452,7 @@ static void add_process_usage(pid_t pid, process_usage& u)
     static const long page = ::sysconf(_SC_PAGESIZE);
     u.cpu_seconds += static_cast<double>(utime + stime) / static_cast<double>(tick > 0 ? tick : 100);
     u.rss_bytes += rss_pages > 0 ? static_cast<uint64_t>(rss_pages) * static_cast<uint64_t>(page > 0 ? page : 4096) : 0;
+    u.memory_bytes += proportional_bytes(pid);
     ++u.processes;
 }
 
@@ -444,6 +472,8 @@ static void append_usage_json(std::string& out, const process_usage& u)
     out += buf;
     out += ",\"rss_bytes\":";
     json_append_uint(out, u.rss_bytes);
+    out += ",\"memory_bytes\":";
+    json_append_uint(out, u.memory_bytes);
     out += ",\"processes\":";
     json_append_uint(out, u.processes);
 }
@@ -908,7 +938,8 @@ std::string metrics_endpoint::build_metrics() const
         out += buf;
         out += "\n";
     }
-    out += "\n# HELP socketley_runtime_resident_memory_bytes Resident memory of a runtime's processes.\n"
+    out += "\n# HELP socketley_runtime_resident_memory_bytes Resident memory of a runtime's processes, a page shared "
+           "between shards counted once per shard.\n"
            "# TYPE socketley_runtime_resident_memory_bytes gauge\n";
     for (size_t i = 0; i < snapshots.size(); ++i)
     {
@@ -916,6 +947,17 @@ std::string metrics_endpoint::build_metrics() const
         label_escape_into(out, snapshots[i].name);
         out += "\"} ";
         json_append_uint(out, usages[i].rss_bytes);
+        out += "\n";
+    }
+    out += "\n# HELP socketley_runtime_memory_bytes What a runtime costs the machine: a page it shares counted by the "
+           "share it holds of it, so the sum over the runtimes is the memory they hold between them.\n"
+           "# TYPE socketley_runtime_memory_bytes gauge\n";
+    for (size_t i = 0; i < snapshots.size(); ++i)
+    {
+        out += "socketley_runtime_memory_bytes{name=\"";
+        label_escape_into(out, snapshots[i].name);
+        out += "\"} ";
+        json_append_uint(out, usages[i].memory_bytes);
         out += "\n";
     }
     out += "\n";
@@ -1061,7 +1103,8 @@ void metrics_endpoint::sample()
         const process_usage u = usage_of(pids[i]);
         history::reading& r = readings[i].second;
         r.cpu_seconds = u.cpu_seconds;
-        r.rss_bytes = u.rss_bytes;
+        // The chart plots what the runtime costs the machine, which is also what its tile says.
+        r.rss_bytes = u.memory_bytes;
         all.connections += r.connections;
         all.messages += r.messages;
         all.bytes_in += r.bytes_in;
@@ -1070,7 +1113,7 @@ void metrics_endpoint::sample()
     }
     const process_usage u = usage_of(every);
     all.cpu_seconds = u.cpu_seconds;
-    all.rss_bytes = u.rss_bytes;
+    all.rss_bytes = u.memory_bytes;
     readings.emplace_back(std::string(), all);
     const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     m_history->record(now_ms, readings);

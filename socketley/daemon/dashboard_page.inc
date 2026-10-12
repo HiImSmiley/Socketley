@@ -448,7 +448,7 @@ function overview() {
       tile('download', 'In', rate(cur.bin), human(over.bytes_in) + ' since start', line('', 'in', rate)),
       tile('upload', 'Out', rate(cur.bout), human(over.bytes_out) + ' since start', line('', 'out', rate)),
       tile('cpu', 'CPU', pct(cur.cpu), cpus + ' CPUs · ' + over.processes + ' processes', line('', 'cpu', pct, false, 1 / cpus)),
-      tile('gauge', 'Memory', human(over.rss_bytes), 'resident, daemon and workers', line('', 'rss', human, true))));
+      tile('gauge', 'Memory', human(over.memory_bytes), 'held, daemon and workers', line('', 'rss', human, true))));
   C.append(el('section', { class: 'sec' }, el('h2', {}, el('span', { class: 'hb' }, ico('server')), el('span', { text: 'Runtimes' }), el('span', { class: 'n', text: String(rts.length) }))), table(rts));
 }
 function runtimes() {
@@ -528,7 +528,7 @@ async function detail(full) {
     tile('download', 'In', rate(r.in_s || 0), human(r.bytes_in) + ' since start', line(n, 'in', rate)),
     tile('upload', 'Out', rate(r.out_s || 0), human(r.bytes_out) + ' since start', line(n, 'out', rate)),
     tile('cpu', 'CPU', pct(r.cpu_p || 0), r.processes + ' process' + (r.processes === 1 ? '' : 'es'), line(n, 'cpu', pct)),
-    tile('gauge', 'Memory', human(r.rss_bytes), 'resident', line(n, 'rss', human, true)));
+    tile('gauge', 'Memory', human(r.memory_bytes), 'held, every shard', line(n, 'rss', human, true)));
   if (!full && shown.stamp && Date.now() - shown.stamp > 5000) statsText(r.name);
   tailInto($('#dLog'), shown, r.name, 300);
   if (r.state === 'failed' && why[r.name] && !$('#dWhy')) H.append(el('div', { id: 'dWhy', class: 'panel', style: 'border-color:rgba(251,88,118,.4)' }, el('h3', {}, ico('info'), el('span', { text: 'Why it failed' })), el('div', { class: 'kv' }, el('div', { class: 'k', text: new Date(why[r.name].at).toLocaleString() }), el('div', { class: 'v', text: clean(why[r.name].text) }))));
