@@ -95,6 +95,9 @@ expect "every flag a create parser takes is in the dashboard's schema, for its t
 curl -s "$U/" > "$T/page.html"
 has "the page is served with the storage interface's style" "$(cat "$T/page.html")" "#aurora"
 has "and its dialogs" "$(cat "$T/page.html")" "function modal("
+# The runtimes table says what each one costs the machine, beside its CPU.
+has "the runtimes table has a memory column" "$(cat "$T/page.html")" "'CPU', 'Memory'"
+has "filled from what the runtime costs, not its shards' resident memory added up" "$(cat "$T/page.html")" "human(r.memory_bytes"
 if command -v node >/dev/null 2>&1; then
     python3 -c "import re,sys; open(sys.argv[2],'w').write(re.search(r'<script>(.*)</script>', open(sys.argv[1]).read(), re.S).group(1))" "$T/page.html" "$T/page.js"
     node --check "$T/page.js" 2>"$T/node.err" && ok "its script parses" || bad "its script parses" "$(head -5 "$T/node.err")"

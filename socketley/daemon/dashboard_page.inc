@@ -480,7 +480,7 @@ function controls(r, small) {
 function table(list) {
   if (!list.length) return el('div', { class: 'empty' }, el('div', { class: 'big' }, ico('server')), el('h3', { text: 'No runtimes here' }), el('div', { text: 'Make one with New runtime.' }));
   const T = el('table', { class: 'rt' });
-  T.append(el('tr', {}, ...['', 'Runtime', 'Port', 'Connections', 'Messages', 'In / out', 'CPU', ''].map(t => el('th', { text: t }))));
+  T.append(el('tr', {}, ...['', 'Runtime', 'Port', 'Connections', 'Messages', 'In / out', 'CPU', 'Memory', ''].map(t => el('th', { text: t }))));
   for (const r of list.slice().sort((a, b) => (a.state !== 'running') - (b.state !== 'running') || a.name.localeCompare(b.name))) {
     const m = meta[r.name] || {};
     T.append(el('tr', { onclick: () => go('#/runtime/' + encodeURIComponent(r.name)) },
@@ -492,6 +492,9 @@ function table(list) {
       el('td', { class: 'num', text: count(r.msg_s || 0) + '/s' }),
       el('td', { class: 'num', text: rate(r.in_s || 0) + ' · ' + rate(r.out_s || 0) }),
       el('td', { class: 'num', text: (r.cpu_p || 0).toFixed(1) + ' %' }),
+      // What the runtime costs the machine, every shard of it: a page it shares counted by the share it holds.
+      el('td', { class: 'num', title: r.processes > 1 ? human(r.rss_bytes || 0) + ' resident over ' + r.processes + ' shards' : '',
+                 text: r.state === 'running' ? human(r.memory_bytes || 0) : '—' }),
       el('td', {}, el('div', { class: 'acts', style: 'justify-content:flex-end' }, openLink(r.name, true), ...controls(r, true)))));
   }
   return T;
