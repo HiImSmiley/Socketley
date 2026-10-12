@@ -18,6 +18,7 @@
 #include <unordered_map>
 
 #include "../../shared/h2_frame.h"
+#include "../../shared/h2_session.h"
 #include "../../shared/hpack.h"
 #include "../../shared/logging.h"
 #include "../../shared/mux_head.h"
@@ -28,105 +29,35 @@ namespace socketley::storage
 namespace
 {
 
-// What a stream may send before its window is given back, which is what a browser's upload has in flight on it.
-constexpr uint32_t stream_window   = 4u << 20;
-// The connection's, across its streams: several uploads at once each keep their window full.
-constexpr uint32_t conn_window     = 32u << 20;
-constexpr uint32_t max_streams     = 128;
-constexpr size_t   header_list_max = 64 * 1024;
-// A header block gathered over CONTINUATIONs: past this, or past this many frames, it is a flood.
-constexpr size_t   block_max       = header_list_max + 16 * 1024;
-constexpr int      continuations_max = 64;
+// The protocol's own limits and flood bounds are shared with every runtime that speaks HTTP/2; named here so the
+// body below reads as it did, rather than carrying a qualifier on each of eleven constants.
+using h2::block_max;
+using h2::conn_window;
+using h2::continuations_max;
+using h2::empty_data_max;
+using h2::header_list_max;
+using h2::max_head;
+using h2::max_streams;
+using h2::pings_max;
+using h2::resets_max;
+using h2::settings_max;
+using h2::stream_window;
+
 // What waits in the connection's queue before more frames are put in it.
 constexpr size_t   out_high        = 1024 * 1024;
 // What one turn hands a stream's phase.
 constexpr size_t   pull_slice      = 64 * 1024;
 // Seconds a TLS connection that chose HTTP/2 has to send its preface.
 constexpr long     preface_secs    = 10;
-// Control frames the peer may make this side answer, and streams it may reset, in each ten seconds.
-constexpr uint32_t pings_max       = 200;
-constexpr uint32_t settings_max    = 200;
-constexpr uint32_t resets_max      = 400;
-constexpr uint32_t empty_data_max  = 1000;
-constexpr size_t   max_head        = 32 * 1024;
 // A session left with frames it cannot send, as an HTTP/1.1 answer that cannot be written is.
 constexpr long     write_stall_secs = 120;
 
 }   // namespace
 
-struct h2_stream
-{
-    uint32_t sid{0};
-    // DATA received and not yet handed to the phase, and how far it has been.
-    // Held as the frames brought it, so taking the front never moves the rest; only what the phase could not take
-    // at once is held at all.
-    std::deque<std::string> rxq;
-    size_t      rx_head{0};
-    size_t      rx_bytes{0};
-    // What this side may still receive on the stream, and what was taken and not yet given back.
-    int64_t     recv_avail{stream_window};
-    uint32_t    rx_unacked{0};
-    bool        remote_closed{false};
-    // A body with no content-length is handed over as chunked framing, which the phases read.
-    bool        synth_chunked{false};
-    bool        chunk_end_given{false};
-    bool        has_cl{false};
-    uint64_t    cl{0};
-    uint64_t    data_in{0};
-
-    // Going out: HEADERS already framed, which no window holds, then the body's bytes waiting for windows.
-    std::string hdr;
-    std::string tx;
-    size_t      tx_off{0};
-    int64_t     send_win{h2::default_window};
-    enum class out_state : uint8_t { head, body, dechunk } os{out_state::head};
-    std::string head_acc;
-    http_chunked_decoder dechunk;
-    std::string dechunk_in;
-    bool        end_pending{false};
-    bool        local_closed{false};
-    // RST_STREAM was sent or received, so none is sent again.
-    bool        reset{false};
-    bool        queued{false};
-
-    size_t tx_left() const { return tx.size() - tx_off; }
-};
-
-struct h2_session
-{
-    bool     preface_ok{false};
-    bool     got_settings{false};
-    uint32_t peer_init_win{h2::default_window};
-    uint32_t peer_max_frame{h2::default_frame};
-    hpack::decoder dec{4096};
-    int64_t  send_win{h2::default_window};
-    int64_t  recv_avail{conn_window};
-    uint32_t recv_unacked{0};
-    uint32_t last_sid{0};
-    bool     goaway_sent{false};
-    bool     peer_goaway{false};
-    bool     close_when_flushed{false};
-    bool     dying{false};
-    bool     first_block{true};
-    // A header block being gathered over CONTINUATIONs.
-    uint32_t cont_sid{0};
-    std::string cont_buf;
-    bool     cont_end_stream{false};
-    bool     cont_trailers{false};
-    // The block's stream named itself as its dependency, and is reset once the block is read.
-    bool     cont_refuse{false};
-    int      cont_frames{0};
-
-    std::unordered_map<uint32_t, std::shared_ptr<conn>> streams;
-    // Streams with something to send, in turn.
-    std::deque<uint32_t> rr;
-    // Frames of the connection's own, sent before any stream's.
-    std::string ctl;
-
-    std::chrono::steady_clock::time_point began{};
-    std::chrono::steady_clock::time_point window_start{};
-    uint32_t pings{0}, settings{0}, resets{0}, empty_data{0}, strays{0};
-};
+// The state is h2::stream's and h2::session's; these names stay because storage_run.h holds them as opaque types
+// with deleters of their own, and a conn is what this runtime hangs off a stream id.
+struct h2_stream : h2::stream {};
+struct h2_session : h2::session<std::shared_ptr<conn>> {};
 
 void h2_session_free::operator()(h2_session* s) const { delete s; }
 void h2_stream_free::operator()(h2_stream* s) const { delete s; }
@@ -134,28 +65,12 @@ void h2_stream_free::operator()(h2_stream* s) const { delete s; }
 namespace
 {
 
+using h2::enqueue;
+using h2::tick_window;
+
 size_t unsent(const conn& c)
 {
     return (c.wbuf.size() - c.woff) + (c.wq.size() - c.wq_off);
-}
-
-void enqueue(h2_session& s, h2_stream& st)
-{
-    if (st.queued)
-        return;
-    st.queued = true;
-    s.rr.push_back(st.sid);
-}
-
-// The flood counters start again every ten seconds.
-void tick_window(h2_session& s)
-{
-    const auto now = std::chrono::steady_clock::now();
-    if (now - s.window_start > std::chrono::seconds(10))
-    {
-        s.window_start = now;
-        s.pings = s.settings = s.resets = s.empty_data = s.strays = 0;
-    }
 }
 
 }   // namespace
