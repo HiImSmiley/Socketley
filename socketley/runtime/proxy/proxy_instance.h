@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/fd_table.h"
 #include "../../shared/async_resolver.h"
 #include <string>
 #include <string_view>
@@ -391,9 +392,11 @@ struct alignas(64) proxy_backend_connection
     void reset(int new_fd);
 };
 
+// No initialiser on `side`: the table these live in is handed over by the kernel as zeroes, which conn_none is, and a
+// type with a constructor to run could not be.
 struct proxy_conn_entry
 {
-    conn_side side = conn_none;
+    conn_side side;
     union {
         proxy_client_connection* client;
         proxy_backend_connection* backend;
@@ -1114,8 +1117,10 @@ private:
 #endif
 
     static constexpr int MAX_FDS = 65536;
-    std::unique_ptr<proxy_client_connection> m_client_slots[MAX_FDS];
-    std::unique_ptr<proxy_backend_connection> m_backend_slots[MAX_FDS];
+    // Raw rather than unique_ptr, so the table comes from the kernel as zeroes: what owns a connection is the slot,
+    // and every handing over is written out -- release() in, a unique_ptr built around what exchange() took out.
+    socketley::fd_table<proxy_client_connection*>  m_client_slots{MAX_FDS};
+    socketley::fd_table<proxy_backend_connection*> m_backend_slots{MAX_FDS};
     size_t m_client_count{0};
     size_t m_backend_count{0};
     // Backends parked on a client, a subset of m_backend_count, capped at
@@ -1125,7 +1130,7 @@ private:
     // Loop turns seen, so a socket parked this turn can be told apart.
     uint64_t m_turn{0};
 
-    proxy_conn_entry m_conn_idx[MAX_FDS]{};
+    socketley::fd_table<proxy_conn_entry> m_conn_idx{MAX_FDS};
     backend_info m_scratch_backend{};
 
     size_t m_rr_index = 0;

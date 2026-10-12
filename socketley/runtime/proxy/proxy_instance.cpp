@@ -1207,7 +1207,7 @@ void proxy_instance::withdraw_armed_backend_reads()
     size_t rem = m_backend_count;
     for (int fd = 0; fd < MAX_FDS && rem > 0; ++fd)
     {
-        auto* b = m_backend_slots[fd].get();
+        auto* b = m_backend_slots[fd];
         if (!b) continue;
         rem--;
         // A single-shot read declines itself at the bottom of
@@ -1242,7 +1242,7 @@ void proxy_instance::withdraw_armed_client_reads()
     size_t rem = m_client_count;
     for (int fd = 0; fd < MAX_FDS && rem > 0; ++fd)
     {
-        auto* c = m_client_slots[fd].get();
+        auto* c = m_client_slots[fd];
         if (!c) continue;
         rem--;
         if (!c->read_pending || c->recv_withdrawing)
@@ -1342,7 +1342,7 @@ size_t proxy_instance::total_queued_bytes() const
     size_t rem = m_client_count;
     for (int fd = 0; fd < MAX_FDS && rem > 0; ++fd)
     {
-        auto* c = m_client_slots[fd].get();
+        auto* c = m_client_slots[fd];
         if (!c) continue;
         rem--;
         total += c->write_queue.bytes();
@@ -1350,7 +1350,7 @@ size_t proxy_instance::total_queued_bytes() const
     rem = m_backend_count;
     for (int fd = 0; fd < MAX_FDS && rem > 0; ++fd)
     {
-        auto* b = m_backend_slots[fd].get();
+        auto* b = m_backend_slots[fd];
         if (!b) continue;
         rem--;
         total += b->write_queue.bytes();
@@ -1638,7 +1638,7 @@ void proxy_instance::trace_splice_sweep()
         size_t rem = inst->m_backend_count;
         for (int fd = 0; fd < MAX_FDS && rem > 0; ++fd)
         {
-            auto* b = inst->m_backend_slots[fd].get();
+            auto* b = inst->m_backend_slots[fd];
             if (!b) continue;
             rem--;
             armed += (int)b->splice_in_pending + (int)b->splice_out_pending;
@@ -1646,7 +1646,7 @@ void proxy_instance::trace_splice_sweep()
         size_t remc = inst->m_client_count;
         for (int fd = 0; fd < MAX_FDS && remc > 0; ++fd)
         {
-            auto* c = inst->m_client_slots[fd].get();
+            auto* c = inst->m_client_slots[fd];
             if (!c) continue;
             remc--;
             armed += (int)c->splice_in_pending + (int)c->splice_out_pending;
@@ -1685,7 +1685,7 @@ void proxy_instance::trace_splice_sweep()
         size_t remaining = inst->m_backend_count;
         for (int fd = 0; fd < MAX_FDS && remaining > 0; ++fd)
         {
-            auto* b = inst->m_backend_slots[fd].get();
+            auto* b = inst->m_backend_slots[fd];
             if (!b) continue;
             remaining--;
             if (!b->splice_active) continue;
@@ -2166,9 +2166,7 @@ void proxy_instance::teardown(event_loop& /*loop*/)
         drop_health_check(i);
     m_health_checks_pending = false;
 
-    // proxy_conn_entry has a default member initializer, so memset over it is
-    // not defined behaviour even though conn_none happens to be 0.
-    for (auto& e : m_conn_idx) e = {};
+    m_conn_idx.clear();
 
     // Shutdown before closing, because a multishot accept holds its own
     // reference and close() leaves the loop owing this owner forever -- with
@@ -2197,7 +2195,7 @@ void proxy_instance::teardown(event_loop& /*loop*/)
         const auto drain_end = std::chrono::steady_clock::now() + socketley::drain_budget;
         for (int i = 0; i < MAX_FDS; i++)
         {
-            auto& conn = m_client_slots[i];
+            auto* conn = m_client_slots[i];
             if (!conn) continue;
             while (!conn->write_queue.empty())
             {
@@ -2215,16 +2213,16 @@ void proxy_instance::teardown(event_loop& /*loop*/)
     // round to it.
     for (int i = 0; i < MAX_FDS; i++)
     {
-        auto& conn = m_backend_slots[i];
+        auto* conn = m_backend_slots[i];
         if (!conn) continue;
         shutdown(i, SHUT_RDWR);
         close_tracked(i);
-        backend_pool_release(std::move(conn));
+        backend_pool_release(std::unique_ptr<proxy_backend_connection>(std::exchange(m_backend_slots[i], nullptr)));
     }
 
     for (int i = 0; i < MAX_FDS; i++)
     {
-        auto& conn = m_client_slots[i];
+        auto* conn = m_client_slots[i];
         if (!conn) continue;
         // A connect that has not finished is waiting on POLLOUT, which closing
         // the socket does not take back, so close_fd submits the cancel and
@@ -2238,7 +2236,7 @@ void proxy_instance::teardown(event_loop& /*loop*/)
             m_loop->submit_poll_remove(&conn->abort_req);
         shutdown(i, SHUT_RDWR);
         close_tracked(i);
-        client_pool_release(std::move(conn));
+        client_pool_release(std::unique_ptr<proxy_client_connection>(std::exchange(m_client_slots[i], nullptr)));
     }
     m_client_count = 0;
     m_backend_count = 0;
@@ -2445,7 +2443,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                     size_t found = 0;
                     for (int cfd = 0; cfd < MAX_FDS && found < m_client_count; cfd++)
                     {
-                        auto& cconn = m_client_slots[cfd];
+                        auto* cconn = m_client_slots[cfd];
                         if (!cconn) continue;
                         found++;
                         if (cconn->closing) continue;
@@ -2467,7 +2465,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                     // side itself.
                     for (int cfd : expired)
                     {
-                        auto& cconn = m_client_slots[cfd];
+                        auto* cconn = m_client_slots[cfd];
                         if (!cconn || cconn->closing) continue;
                         close_pair(cfd, cconn->backend_fd, close_reason::force);
                     }
@@ -2487,7 +2485,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                     size_t seen = 0;
                     for (int cfd = 0; cfd < MAX_FDS && seen < m_client_count; cfd++)
                     {
-                        auto& cconn = m_client_slots[cfd];
+                        auto* cconn = m_client_slots[cfd];
                         if (!cconn) continue;
                         seen++;
                         if (cconn->closing) continue;
@@ -2498,7 +2496,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                     uint32_t hs_dropped = 0;
                     for (int cfd : stalled)
                     {
-                        auto& cconn = m_client_slots[cfd];
+                        auto* cconn = m_client_slots[cfd];
                         if (!cconn || cconn->closing) continue;
                         close_pair(cfd, cconn->backend_fd, close_reason::force);
                         ++hs_dropped;
@@ -2936,7 +2934,7 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         conn->splice_out_req = { this, nullptr, client_fd, 0, op_splice };
 
         auto* ptr = conn.get();
-        m_client_slots[client_fd] = std::move(conn);
+        m_client_slots[client_fd] = conn.release();
         m_client_count++;
         m_conn_idx[client_fd].side = conn_client;
         m_conn_idx[client_fd].client = ptr;
@@ -6665,7 +6663,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         bconn->splice_out_req = { this, nullptr, bfd, 0, op_splice };
 
         auto* ptr = bconn.get();
-        m_backend_slots[bfd] = std::move(bconn);
+        m_backend_slots[bfd] = bconn.release();
         m_backend_count++;
         m_conn_idx[bfd].side = conn_backend;
         m_conn_idx[bfd].backend = ptr;
@@ -6770,7 +6768,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         bconn->splice_out_req = { this, nullptr, bfd, 0, op_splice };
 
         auto* ptr = bconn.get();
-        m_backend_slots[bfd] = std::move(bconn);
+        m_backend_slots[bfd] = bconn.release();
         m_backend_count++;
         m_conn_idx[bfd].side = conn_backend;
         m_conn_idx[bfd].backend = ptr;
@@ -7430,7 +7428,7 @@ inline void proxy_instance::close_pair_close_backend(int backend_fd,
         // The owners are backend_pool_release()'s business, and clearing them
         // from out here took away the only way a late completion could be
         // recognised.
-        backend_pool_release(std::move(m_backend_slots[backend_fd]));
+        backend_pool_release(std::unique_ptr<proxy_backend_connection>(std::exchange(m_backend_slots[backend_fd], nullptr)));
         m_backend_count--;
     }
 }
@@ -7743,7 +7741,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                     // The owners belong to the release path, which this used
                     // to pre-empt by nulling three of the five and leaving
                     // both splice requests pointing at a pooled struct.
-                    client_pool_release(std::move(m_client_slots[client_fd]));
+                    client_pool_release(std::unique_ptr<proxy_client_connection>(std::exchange(m_client_slots[client_fd], nullptr)));
                     m_client_count--;
                 }
             }
@@ -7864,7 +7862,7 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
     // struct back in circulation.
     if (m_backend_slots[backend_fd])
     {
-        backend_pool_release(std::move(m_backend_slots[backend_fd]));
+        backend_pool_release(std::unique_ptr<proxy_backend_connection>(std::exchange(m_backend_slots[backend_fd], nullptr)));
         m_backend_count--;
     }
 
@@ -7922,7 +7920,7 @@ void proxy_instance::finish_pool_drain(proxy_backend_connection* conn,
     {
         // backend_pool_release() decides whether this can be reused at all; the
         // owners are its business, not the caller's.
-        backend_pool_release(std::move(m_backend_slots[fd]));
+        backend_pool_release(std::unique_ptr<proxy_backend_connection>(std::exchange(m_backend_slots[fd], nullptr)));
         m_backend_count--;
     }
 }
@@ -8099,7 +8097,7 @@ void proxy_instance::release_parked_backend(proxy_client_connection* cconn)
         }
         if (m_backend_slots[bfd])
         {
-            backend_pool_release(std::move(m_backend_slots[bfd]));
+            backend_pool_release(std::unique_ptr<proxy_backend_connection>(std::exchange(m_backend_slots[bfd], nullptr)));
             m_backend_count--;
         }
         return;
@@ -9056,7 +9054,7 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     bconn->splice_out_req = { this, nullptr, bfd, 0, op_splice };
 
     auto* ptr = bconn.get();
-    m_backend_slots[bfd] = std::move(bconn);
+    m_backend_slots[bfd] = bconn.release();
     m_backend_count++;
     m_conn_idx[bfd].side = conn_backend;
     m_conn_idx[bfd].backend = ptr;
@@ -9280,7 +9278,7 @@ void proxy_instance::response_deadline_sweep()
 
     for (int cfd = 0; cfd < MAX_FDS && remaining > 0; cfd++)
     {
-        auto* conn = m_client_slots[cfd].get();
+        auto* conn = m_client_slots[cfd];
         if (!conn)
             continue;
         remaining--;
@@ -9631,7 +9629,7 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
                 // A retry abandons the backend mid-request, so
                 // backend_pool_release() keeps the struct out of the pool
                 // until its completions land.
-                backend_pool_release(std::move(m_backend_slots[conn->backend_fd]));
+                backend_pool_release(std::unique_ptr<proxy_backend_connection>(std::exchange(m_backend_slots[conn->backend_fd], nullptr)));
                 m_backend_count--;
             }
         }

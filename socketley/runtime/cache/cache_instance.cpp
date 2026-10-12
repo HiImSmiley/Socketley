@@ -993,7 +993,7 @@ void cache_instance::teardown(event_loop& /*loop*/)
         }
     }
 
-    std::memset(m_conn_idx, 0, sizeof(m_conn_idx));
+    m_conn_idx.clear();
 
     // The listener first and then everything hanging off it, each closed and
     // handed to pool_release()/retire(), so the next setup() starts from

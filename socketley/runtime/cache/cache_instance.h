@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/fd_table.h"
 #include "../../shared/async_resolver.h"
 #include "../../shared/conn_reachability.h"
 #include <initializer_list>
@@ -1181,7 +1182,7 @@ private:
 
     // O(1) fd→connection lookup (avoids hash map on every CQE)
     static constexpr int MAX_FDS = 8192;
-    client_connection* m_conn_idx[MAX_FDS]{};
+    socketley::fd_table<client_connection*> m_conn_idx{MAX_FDS};
 
     event_loop* m_loop;
 

@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/fd_table.h"
 #include "../../shared/async_resolver.h"
 #include "../../shared/conn_reachability.h"
 #include "../../shared/http_framing.h"
@@ -1293,7 +1294,7 @@ private:
     std::unordered_map<int, std::unique_ptr<server_connection>> m_clients;
     // O(1) fd→conn lookup for CQE dispatch (non-owning, m_clients owns)
     static constexpr int MAX_FDS = 8192;
-    server_connection* m_conn_idx[MAX_FDS]{};
+    socketley::fd_table<server_connection*> m_conn_idx{MAX_FDS};
 
     // Active fd tracking for O(1) broadcast iteration (no map overhead)
     std::vector<int> m_active_fds;

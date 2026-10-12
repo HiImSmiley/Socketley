@@ -1749,7 +1749,7 @@ void client_send(world& w, int idx, int shape)
     bool proxy_ending = false;
     if (w.rt && c.proxy_fd >= 0 && c.proxy_fd < proxy_instance::MAX_FDS)
     {
-        const auto* cc = w.rt->m_client_slots[c.proxy_fd].get();
+        const auto* cc = w.rt->m_client_slots[c.proxy_fd];
         // client_conn_close as well as closing, because `closing` is the
         // teardown and the undertaking comes before it.
         //
@@ -2792,7 +2792,7 @@ void check_instance(world& w, bool deep)
         if (!rt->m_client_slots[fd])
             continue;
         RT_CHECK(rt->m_conn_idx[fd].side == conn_client &&
-                 rt->m_conn_idx[fd].client == rt->m_client_slots[fd].get(),
+                 rt->m_conn_idx[fd].client == rt->m_client_slots[fd],
                  "the dispatch index does not point at the connection the slot holds for "
                  "that descriptor");
         RT_CHECK(rt->m_client_slots[fd]->fd == fd,
@@ -2810,12 +2810,12 @@ void check_instance(world& w, bool deep)
         const auto& e = rt->m_conn_idx[fd];
         if (rt->m_client_slots[fd])
         {
-            RT_CHECK(e.side == conn_client && e.client == rt->m_client_slots[fd].get(),
+            RT_CHECK(e.side == conn_client && e.client == rt->m_client_slots[fd],
                      "a client slot is not the one the dispatch index names for its fd");
         }
         if (rt->m_backend_slots[fd])
         {
-            RT_CHECK(e.side == conn_backend && e.backend == rt->m_backend_slots[fd].get(),
+            RT_CHECK(e.side == conn_backend && e.backend == rt->m_backend_slots[fd],
                      "a backend slot is not the one the dispatch index names for its fd");
         }
         if (e.side == conn_client)
@@ -2939,7 +2939,7 @@ void expire_deadlines(world& w)
         const int fd = w.cli[i].proxy_fd;
         if (fd < 0 || fd >= proxy_instance::MAX_FDS || !rt->m_client_slots[fd])
             continue;
-        auto* c = rt->m_client_slots[fd].get();
+        auto* c = rt->m_client_slots[fd];
         if (c->awaiting_response) c->response_deadline = past;
         if (c->awaiting_headers)  c->header_deadline = past;
     }
