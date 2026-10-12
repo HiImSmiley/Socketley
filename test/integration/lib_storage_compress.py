@@ -134,8 +134,15 @@ check("and what does not get shorter is read and left",
 s = stats()
 check("what they take on disk is a fraction of their bytes",
       0 < s.get("compressed_bytes_out", 0) < s.get("compressed_bytes_in", 1) // 4, s)
+# Waited on the files and not on the counters: compressed_objects and
+# compressed_bytes_* count every bucket, and they rise when a version has been
+# compressed, not when the file in THIS bucket has been replaced.  So the two
+# facts drift apart under load -- measured on a loaded box, before and after
+# equal to the byte with five versions already counted, and green on its own.
+target = before - (len(big) + len(mid)) // 2
+shrank = wait_for(lambda: disk_bytes("logs") < target)
 after = disk_bytes("logs")
-check("and the bucket's files shrank by it", after < before - (len(big) + len(mid)) // 2, (before, after, logical))
+check("and the bucket's files shrank by it", shrank, (before, after, logical, target))
 
 check("a compressed object reads back whole", get("logs", "big") == big)
 check("so does one read whole with its header, and again from memory",
