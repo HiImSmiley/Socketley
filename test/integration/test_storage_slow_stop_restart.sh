@@ -101,6 +101,28 @@ for verb in restart reload; do
                          || bad "$verb: answered" "$MISSING of 20 answered puts are gone"
 done
 
+# ─── a refused change, while the start's answer is parked ───────────────────
+#
+# The old worker is slow to stop, so the start after the change waits for its fork and answers later.  A refusal from
+# the change travels as that one answer's exit code: returned as itself it was replied to at once, and the parked
+# start replied a second time -- two frames for one command, and the refusal's own text left for nobody.
+for i in $(seq 1 20); do
+    curl -s -o /dev/null -X PUT --data-binary "v3-$i" "http://127.0.0.1:$PORT/bkt/k3-$i"
+done
+T0=$(ms)
+"$BIN" edit stgsl --shards 999 --restart > "$SOCKETLEY_TMPD/refused.out" 2>&1
+RC=$?
+T=$(( $(ms) - T0 ))
+OUT=$(tr '\n' ' ' < "$SOCKETLEY_TMPD/refused.out")
+if [ "$RC" -eq 1 ] && [ "$T" -ge 2500 ]; then
+    ok "a refused change answered 1 after ${T} ms, with the start it waited for"
+else
+    bad "refused change" "answered $RC after ${T} ms: $OUT"
+fi
+grep -q "between 1 and" <<<"$OUT" && ok "and the refusal's own words came with it" \
+                                 || bad "refused change: why" "said: $OUT"
+up && ok "and the runtime is serving again" || bad "refused change: up" "it did not answer after the refused change"
+
 if [ "$FAILS" -ne 0 ]; then
     echo "  FAILED ($FAILS)"
     exit 1

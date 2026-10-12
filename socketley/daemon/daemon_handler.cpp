@@ -4142,6 +4142,15 @@ int daemon_handler::across_restart(ipc_connection* conn, const char* verb, std::
     // What the change said comes first, since that is the answer to the command; the start's after it, which it has
     // only when the runtime is not running any more.
     conn->write_buf = said + conn->write_buf;
+    // The start waits for a worker whose predecessor has not exited yet, so its answer goes out later -- and a
+    // refusal from the change above travels as the floor of that one answer.  Returned as itself, it would be
+    // replied to now and the parked verdict would reply again, which is two frames for one command.
+    if (src == reply_parked)
+    {
+        if (rc != 0)
+            conn->parked_floor = std::max(conn->parked_floor, rc);
+        return src;
+    }
     return rc != 0 ? rc : src;
 }
 
