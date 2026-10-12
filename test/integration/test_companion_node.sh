@@ -250,11 +250,15 @@ fi
 # them just as well and only the transport says which way they went.
 "$BIN" create server cn_srvs -p $((PORT+12)) --shards 4 --http "$WWW" -s >/dev/null 2>&1
 "$BIN" create proxy  cn_srvspx -p $((PORT+13)) --backend cn_srvs --protocol tcp -s >/dev/null 2>&1
-wait_for '[ "$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)" -eq 4 ] && [ "$(grep -c "\"cn_srvs\" is reached over $RTDIR/cn_srvs#" "$SOCKETLEY_DLOG" 2>/dev/null)" -ge 4 ]'
+wait_for '[ "$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)" -eq 4 ] && [ "$(grep -c "\"cn_srvs\" is reached over 4 nodes:" "$SOCKETLEY_DLOG" 2>/dev/null)" -ge 1 ]'
 SRVS_NODES=$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)
 SRVS_ONE_GONE=$([ -e "$RTDIR/cn_srvs.sock" ] && echo no || echo yes)
 SRVS_REFUSED=$(grep -c "companion node $RTDIR/cn_srvs" "$SOCKETLEY_DLOG" 2>/dev/null || true)
-SRVS_SAID=$(grep -c "\"cn_srvs\" is reached over $RTDIR/cn_srvs#" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+# How many of the four nodes the announcement names, not how many lines it
+# took to name them: a sharded backend is said once with its whole set, so a
+# count of lines would be asserting the format and not what the proxy took.
+SRVS_SAID=$(grep "\"cn_srvs\" is reached over 4 nodes:" "$SOCKETLEY_DLOG" 2>/dev/null \
+            | tail -1 | grep -o "cn_srvs#[0-9]*\.sock" | sort -u | wc -l)
 # N connections through PORT, each held open HOLD seconds after its answer so
 # the backend leg is there for ss to see; prints how many answered.  HTTP/1.1,
 # because a 1.0 answer closes the leg before ss looks.
@@ -303,7 +307,7 @@ if [ "$SRVS_NODES" -eq 4 ] && [ "$SRVS_ONE_GONE" = "yes" ] && [ "${SRVS_REFUSED:
 else
     bad "a sharded server binds one node per shard, and its proxy spreads over every shard" \
         "nodes cn_srvs#*.sock: $SRVS_NODES of 4, the unsharded cn_srvs.sock absent: $SRVS_ONE_GONE," \
-        "shards refused a node $SRVS_REFUSED time(s), the proxy named a node $SRVS_SAID time(s) (expected 4)," \
+        "shards refused a node $SRVS_REFUSED time(s), the proxy's announcement names $SRVS_SAID node(s) (expected 4)," \
         "answered $SRVS_ANSWERED of 64, per-shard connections: ${SRVS_PER_SHARD:-<none>} -- $SRVS_BUSY shard(s) saw any;" \
         "one node is one shard, and a proxy on it collapses --shards to 1/N"
 fi
@@ -328,22 +332,25 @@ fi
 "$BIN" edit cn_srvs --shards 2 >/dev/null 2>&1
 "$BIN" start cn_srvs >/dev/null 2>&1
 # The proxy saying it took #0 and #1 again is it having followed the restart.
-wait_for '[ "$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)" -eq 2 ] && [ "$(grep -c "\"cn_srvs\" is reached over $RTDIR/cn_srvs#[01].sock" "$SOCKETLEY_DLOG" 2>/dev/null)" -ge 4 ]'
+wait_for '[ "$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)" -eq 2 ] && [ "$(grep -c "\"cn_srvs\" is reached over 2 nodes:" "$SOCKETLEY_DLOG" 2>/dev/null)" -ge 1 ]'
 SRVS2_NODES=$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)
 SRVS2_STALE=$( { [ -e "$RTDIR/cn_srvs#2.sock" ] || [ -e "$RTDIR/cn_srvs#3.sock" ]; } && echo yes || echo no)
 SRVS2_ANSWERED=$(srvs_run $((PORT+13)) 16)
 sleep 0.5
 SRVS2_PER_SHARD=$("$BIN" stats cn_srvs 2>/dev/null | sed -n 's/^shard_total_connections:\([0-9][0-9]*\)$/\1/p' | tr '\n' ' ')
 SRVS2_BUSY=$(printf '%s\n' $SRVS2_PER_SHARD | awk '$1 > 0 { n++ } END { print n+0 }')
-SRVS2_SAID=$(grep -c "\"cn_srvs\" is reached over $RTDIR/cn_srvs#[01].sock" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+# "2 nodes:" can only have been said after the edit, which is what makes this
+# the proxy having followed the restart rather than its first announcement.
+SRVS2_SAID=$(grep "\"cn_srvs\" is reached over 2 nodes:" "$SOCKETLEY_DLOG" 2>/dev/null \
+             | tail -1 | grep -o "cn_srvs#[01]\.sock" | sort -u | wc -l)
 if [ "$SRVS2_NODES" -eq 2 ] && [ "$SRVS2_STALE" = "no" ] && [ "$SRVS2_ANSWERED" = "16" ] \
-   && [ "$SRVS2_BUSY" -eq 2 ] && [ "${SRVS2_SAID:-0}" -ge 4 ]; then
+   && [ "$SRVS2_BUSY" -eq 2 ] && [ "${SRVS2_SAID:-0}" -eq 2 ]; then
     ok "after edit --shards 2 and a restart the proxy follows: 2 nodes, 16 of 16 answered over 2 of 2 shards ($SRVS2_PER_SHARD)"
 else
     bad "the proxy follows a changed shard count" \
         "nodes after the restart: $SRVS2_NODES (expected 2), a stale #2/#3 left: $SRVS2_STALE," \
         "answered $SRVS2_ANSWERED of 16, per-shard: ${SRVS2_PER_SHARD:-<none>} -- $SRVS2_BUSY shard(s) saw any," \
-        "log named #0/#1 $SRVS2_SAID time(s) (expected 2 at first, 2 more after);" \
+        "the \"2 nodes\" announcement names $SRVS2_SAID of #0/#1 (expected 2);" \
         "a path nobody binds is the refused connect unix_listener.h describes"
 fi
 "$BIN" stop cn_srvspx >/dev/null 2>&1; "$BIN" remove cn_srvspx >/dev/null 2>&1

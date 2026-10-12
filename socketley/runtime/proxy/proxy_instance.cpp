@@ -1377,7 +1377,7 @@ inline void proxy_instance::tune_socket(int fd)
 // same backend -- and every refusal fails the start, because a backend that
 // provably cannot work is known at configuration time.
 static bool configure_unix_backend(backend_info& b, std::string_view path,
-                                   std::string_view where)
+                                   std::string_view where, bool announce = true)
 {
     // The path rules are shared/unix_listener.h's, with absoluteness mattering
     // here because a relative path resolves against the daemon's working
@@ -1407,9 +1407,11 @@ static bool configure_unix_backend(backend_info& b, std::string_view path,
 
     // Said out loud, because a backend written as a port and reached over a
     // node is a transport nobody can see -- tcpdump on loopback shows nothing
-    // and the configuration still reads like TCP.
-    LOG_INFO(("proxy backend " + std::string(where) + " is reached over "
-              + std::string(path)).c_str());
+    // and the configuration still reads like TCP.  A backend with several
+    // nodes is said once by its caller instead, naming them all.
+    if (announce)
+        LOG_INFO(("proxy backend " + std::string(where) + " is reached over "
+                  + std::string(path)).c_str());
     // The path is the endpoint with resolved_port at 0, and has_cached_addr is
     // true because there is no lookup to fail and nothing for the sweep to
     // retry.
@@ -1436,11 +1438,24 @@ bool proxy_instance::configure_node_backends(backend_info& b,
     {
         backend_info node;
         node.address = b.address;
-        if (!configure_unix_backend(node, p, where))
+        if (!configure_unix_backend(node, p, where, /*announce=*/false))
             return false;
         b.nodes.push_back(std::move(node));
     }
     b.node_next = 0;
+
+    // One line for the whole set rather than one per node: a sharded backend
+    // behind a sharded proxy said the same N facts N times, which was a
+    // quarter of everything a live daemon's log had to say.
+    std::string nodes;
+    for (const auto& p : paths)
+    {
+        if (!nodes.empty())
+            nodes += ' ';
+        nodes += p;
+    }
+    LOG_INFO(("proxy backend " + std::string(where) + " is reached over "
+              + std::to_string(paths.size()) + " nodes: " + nodes).c_str());
     return true;
 }
 
