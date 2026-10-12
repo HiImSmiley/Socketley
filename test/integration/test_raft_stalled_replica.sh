@@ -119,7 +119,11 @@ check '[ "$misses" = 0 ]' "the healthy runtime stopped serving on $misses polls 
 check '[ "$slow" = 0 ]' "cluster placement took more than 1.5 s on $slow polls"
 check '[ "$saw_placement" -ge 1 ]' "the hung runtime is not in the placement"
 check 'wait_for 5 formed' "the nodes no longer agree on one leader"
-check 'saw "hang.*\[cluster\]" as b ls' "the hung replica is not listed on b"
+# Waited for, like every other fact about a node's view in this file: the line above only waits for the leader to be
+# agreed again, and b learns what is placed on the tick after that -- so asserting it in the same breath is asserting
+# that a cluster is instantaneous.  Red beside seven other files and green alone, which is how that reads from here.
+listed_on_b() { saw "hang.*\[cluster\]" as b ls; }
+check 'wait_for 10 listed_on_b' "the hung replica is not listed on b"
 
 out=$(as b cluster remove hang 2>&1) && rc=0 || rc=$?
 check '[ "$rc" = 0 ] && [ -z "$out" ]' "cluster remove hang: exit $rc, output: $out"
