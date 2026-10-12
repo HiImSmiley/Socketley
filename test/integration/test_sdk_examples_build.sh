@@ -136,6 +136,28 @@ else
     FAIL=$((FAIL+1))
     echo "  FAIL [the archive is machine code]: ${SOURCES[0]#"$ROOT"/} does not link without gcc's LTO plugin"
     sed 's/^/        /' "$WORK/noplugin.err" | head -6
+
+    # Which members, and when they were compiled -- because the usual cause is
+    # not the flags but make: -fno-lto arrived in premake5.lua and make rebuilds
+    # on times, not flags, so objects older than that change keep their GIMPLE
+    # and the archive stays mixed.  Naming them turns an ld dump into one rm.
+    OBJDIR="$ROOT/make/obj/x64/$(basename "$BINDIR")/socketley_sdk"
+    STALE=""
+    for o in "$OBJDIR"/*.o; do
+        [ -e "$o" ] || continue
+        [ "$(readelf -S "$o" 2>/dev/null | grep -c gnu.lto)" -gt 0 ] || continue
+        STALE="$STALE $(basename "$o")($(stat -c %y "$o" 2>/dev/null | cut -c1-10))"
+    done
+    if [ -n "$STALE" ]; then
+        echo "        LTO objects still in $OBJDIR:$STALE"
+        echo "        make rebuilds on times and not on flags, so these predate -fno-lto"
+        echo "        and survive every later make; delete them and build again"
+    elif ! command -v readelf >/dev/null 2>&1; then
+        echo "        no readelf here, so which members are GIMPLE was not asked"
+    else
+        echo "        no LTO object in $OBJDIR, so this is the flags and not a stale"
+        echo "        object: check -fno-lto is on the sdk projects in premake5.lua"
+    fi
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
