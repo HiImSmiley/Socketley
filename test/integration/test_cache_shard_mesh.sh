@@ -118,7 +118,28 @@ else
         "quietly gives up still reports direct > 0"
 fi
 
-"$BIN" stop meshc >/dev/null 2>&1; sleep 0.3; "$BIN" remove meshc >/dev/null 2>&1
+# ── A clean stop says nothing about the mesh ──────────────────────────────
+#
+# Four shards leaving together means each one watches three siblings' ends
+# close, and every one of those used to be a WARN naming a link that was down
+# and crossings that would relay through the daemon.  On the live box that was
+# 73 of 73 warnings in a day, all of them a stop: a mesh that really broke was
+# indistinguishable from a deploy.
+#
+# The link going down is not what is asserted -- it is expected and it happens.
+# What is asserted is that a shard on its own way out does not call a sibling's
+# departure a fault, which is the only reading of this level anybody can use.
+"$BIN" stop meshc >/dev/null 2>&1; sleep 0.6
+STOPWARN=$(grep -cE '\[WARN\].*the link to shard' "$SOCKETLEY_DLOG" 2>/dev/null || true)
+if [ "${STOPWARN:-0}" -eq 0 ]; then
+    ok "a clean stop of four shards reports no mesh failure (0 warnings for 12 ends)"
+else
+    bad "a clean stop of four shards reports no mesh failure" \
+        "$STOPWARN warning(s) about a link going down, from shards that were" \
+        "themselves on the way out; a warning every stop produces is one" \
+        "nobody can read a real mesh failure out of"
+fi
+"$BIN" remove meshc >/dev/null 2>&1
 
 # ── eight shards: 56 links, and the assertion four shards cannot make ────
 #

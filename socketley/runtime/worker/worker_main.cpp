@@ -492,6 +492,11 @@ public:
         // has to remember is one a new path will not.
         if (::prctl(PR_SET_PDEATHSIG, 0) < 0) {}
 
+        // And the one place to say that a sibling going is no longer news,
+        // before the drain below -- which is where a sibling's end of input
+        // used to arrive and be logged as a mesh failure on every clean stop.
+        for_each_link([](shard_link& link) { link.expect_peer_exit(); });
+
         // Same order the daemon uses: stop the runtime while there is still a
         // ring for teardown() to cancel into, and only then end the ring.
         if (m_rt && m_rt->get_state() == runtime_running)
@@ -756,7 +761,13 @@ private:
                 if (m_rt)
                     m_rt->on_replica_order(payload);
                 break;
-            case worker_proto::frame_type::shutdown:  m_done = true;         break;
+            // Said here as well as at the way out of the loop, because the
+            // daemon tells every shard in one turn: a sibling can be gone
+            // before this one has finished the turn it was told in.
+            case worker_proto::frame_type::shutdown:
+                m_done = true;
+                for_each_link([](shard_link& link) { link.expect_peer_exit(); });
+                break;
 
             // Anything else is a frame this build predates or one that only
             // travels the other way, skipped and not fatal, which is the point

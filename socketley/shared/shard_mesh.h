@@ -217,7 +217,7 @@ public:
         // graceful half-close.
         if (res == 0)
         {
-            die("a sibling closed its end");
+            die("a sibling closed its end", m_peer_exit_expected);
             return;
         }
 
@@ -227,8 +227,14 @@ public:
             res == -ECANCELED)
             return;
 
-        die("reading from a sibling failed");
+        die("reading from a sibling failed", m_peer_exit_expected);
     }
+
+    // This process is leaving, so a sibling that goes first is the order of an
+    // ordinary stop and not a mesh that broke -- which is the difference
+    // between a log where a real mesh failure is visible and one where every
+    // stop says the same thing.
+    void expect_peer_exit() { m_peer_exit_expected = true; }
 
     // ── Once per turn of the owner's loop ───────────────────────────────────
     // The two things a completion cannot do for itself -- put this turn's
@@ -291,7 +297,12 @@ public:
             "shard mesh: the link to " + m_label
             + " is down (" + std::string(why) + "); " + std::to_string(swept)
             + " crossing(s) answered, the rest relay through the daemon";
-        if (expected)
+        // An expected end that dropped work is still worth a line, because a
+        // stop that answered crossings `no_target` is a thing a caller saw;
+        // an expected end with nothing in flight is only bookkeeping.
+        if (expected && swept > 0)
+            LOG_INFO(note.c_str());
+        else if (expected)
             LOG_DEBUG(note.c_str());
         else
             LOG_WARN(note.c_str());
@@ -412,6 +423,9 @@ private:
     io_request  m_req{};
     bool        m_armed{false};
     bool        m_dead{false};
+
+    // Set by expect_peer_exit(); false means a sibling going is news.
+    bool        m_peer_exit_expected{false};
 
     // What a standing recv writes into, one at a time and named by m_req.
     // 64 KiB was measured against this and is the same: a cache sharded two
