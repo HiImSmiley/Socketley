@@ -25,17 +25,32 @@ struct source
     std::string runtime, partial;
 };
 
-std::mutex g_ring_mtx;
-std::deque<entry> g_ring;
-uint64_t g_seq{0};
+// What the reader thread touches, made once and never destroyed.
+//
+// The thread is detached and runs as long as the process does, so it is still in its walk over the sources when the
+// static destructors run -- and a vector destroyed under it is storage it then reads.  Measured: AddressSanitizer's
+// heap-use-after-free at that walk, one run in four of test_storage_slow_start, at the daemon's exit.  Kept reachable
+// by the pointer, so nothing reads it as a leak.
+struct state
+{
+    std::mutex ring_mtx;
+    std::deque<entry> ring;
+    uint64_t seq{0};
+    // The pipes, and the one thread that reads them; io_mtx is held while lines are taken from them, by the thread
+    // and by drain().
+    std::mutex io_mtx;
+    std::vector<source> sources;
+    // Pipes handed over by worker_pipe(), under a lock of their own: a spawn waits for nothing a slow stderr holds up.
+    std::mutex new_mtx;
+    std::vector<source> fresh;
+};
 
-// The pipes, and the one thread that reads them; g_io_mtx is held while lines are taken from them, by the thread
-// and by drain().
-std::mutex g_io_mtx;
-std::vector<source> g_sources;
-// Pipes handed over by worker_pipe(), under a lock of their own: a spawn waits for nothing a slow stderr holds up.
-std::mutex g_new_mtx;
-std::vector<source> g_new;
+state& st()
+{
+    static state* s = new state;
+    return *s;
+}
+
 int g_wake{-1};
 bool g_started{false};
 
@@ -59,16 +74,16 @@ int64_t now_ms()
 
 void keep(std::string_view runtime, std::string_view line)
 {
-    std::lock_guard lock(g_ring_mtx);
+    std::lock_guard lock(st().ring_mtx);
     entry e;
-    e.seq = ++g_seq;
+    e.seq = ++st().seq;
     e.at_ms = now_ms();
     e.runtime.assign(runtime);
     e.level = level_of(line);
     e.text.assign(line.substr(0, 4096));
-    g_ring.push_back(std::move(e));
-    while (g_ring.size() > capacity)
-        g_ring.pop_front();
+    st().ring.push_back(std::move(e));
+    while (st().ring.size() > capacity)
+        st().ring.pop_front();
 }
 
 // What is in `s`'s pipe now, passed on to the daemon's stderr and kept line by line; false at its end.
@@ -114,16 +129,16 @@ void reader()
     for (;;)
     {
         {
-            std::lock_guard lock(g_io_mtx);
+            std::lock_guard lock(st().io_mtx);
             {
-                std::lock_guard taken(g_new_mtx);
-                for (source& s : g_new)
-                    g_sources.push_back(std::move(s));
-                g_new.clear();
+                std::lock_guard taken(st().new_mtx);
+                for (source& s : st().fresh)
+                    st().sources.push_back(std::move(s));
+                st().fresh.clear();
             }
             fds.clear();
             fds.push_back({g_wake, POLLIN, 0});
-            for (const source& s : g_sources)
+            for (const source& s : st().sources)
                 fds.push_back({s.fd, POLLIN, 0});
         }
         if (::poll(fds.data(), fds.size(), -1) < 0)
@@ -133,18 +148,18 @@ void reader()
             uint64_t v;
             if (::read(g_wake, &v, sizeof v) < 0) {}
         }
-        std::lock_guard lock(g_io_mtx);
+        std::lock_guard lock(st().io_mtx);
         for (size_t i = 1; i < fds.size(); ++i)
         {
             if (!fds[i].revents)
                 continue;
-            for (auto it = g_sources.begin(); it != g_sources.end(); ++it)
+            for (auto it = st().sources.begin(); it != st().sources.end(); ++it)
                 if (it->fd == fds[i].fd)
                 {
                     if (!take(*it))
                     {
                         ::close(it->fd);
-                        g_sources.erase(it);
+                        st().sources.erase(it);
                     }
                     break;
                 }
@@ -178,8 +193,8 @@ void drain()
 {
     if (!g_started)
         return;
-    std::lock_guard lock(g_io_mtx);
-    for (source& s : g_sources)
+    std::lock_guard lock(st().io_mtx);
+    for (source& s : st().sources)
         take(s);
 }
 
@@ -200,11 +215,11 @@ int worker_pipe(std::string_view runtime)
         return -1;
     }
     {
-        std::lock_guard lock(g_new_mtx);
+        std::lock_guard lock(st().new_mtx);
         source s;
         s.fd = p[0];
         s.runtime.assign(runtime);
-        g_new.push_back(std::move(s));
+        st().fresh.push_back(std::move(s));
     }
     const uint64_t one = 1;
     if (::write(g_wake, &one, sizeof one) < 0) {}
@@ -227,20 +242,20 @@ std::vector<entry> since(uint64_t seq, size_t max, std::string_view runtime, std
                (runtime.empty() || e.runtime == runtime || e.text.find(quoted) != std::string::npos);
     };
     std::vector<entry> out;
-    std::lock_guard lock(g_ring_mtx);
-    next = g_seq;
+    std::lock_guard lock(st().ring_mtx);
+    next = st().seq;
     // A first look is the newest lines; a cursor goes on from where it was, oldest first, and its next names the last
     // line given, so lines past `max` come with the following ask and none is skipped.
     if (seq == 0)
     {
-        for (auto it = g_ring.rbegin(); it != g_ring.rend() && out.size() < max; ++it)
+        for (auto it = st().ring.rbegin(); it != st().ring.rend() && out.size() < max; ++it)
             if (wanted(*it))
                 out.push_back(*it);
         std::reverse(out.begin(), out.end());
         return out;
     }
-    auto it = std::find_if(g_ring.begin(), g_ring.end(), [seq](const entry& e) { return e.seq > seq; });
-    for (; it != g_ring.end(); ++it)
+    auto it = std::find_if(st().ring.begin(), st().ring.end(), [seq](const entry& e) { return e.seq > seq; });
+    for (; it != st().ring.end(); ++it)
     {
         if (!wanted(*it))
             continue;

@@ -46,6 +46,15 @@ if [ -z "${D:-}" ] || ! [ "$(anon)" -gt 0 ] 2>/dev/null; then
     echo "  Results: 0/0 passed (0 failed)"; exit 2
 fi
 
+# A sanitizer build's allocator writes over what it hands out, so the kernel's
+# untouched pages are not what a proxy gets there and no figure below is of this
+# change.  Read with a redirect and not grep -q: under `set -o pipefail` a -q
+# that matches early reports 141.
+if nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then
+    echo "  (memory not asserted: a sanitizer build writes over every allocation it hands out)"
+    echo "  Results: 0/0 passed (0 failed)"; exit 0
+fi
+
 # A table of 65,536 descriptors, as the proxy sizes it; what one costs written out in full.
 TABLE=$((65536 * 16 / 1024))
 N=4
