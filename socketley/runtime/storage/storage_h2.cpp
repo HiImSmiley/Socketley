@@ -20,7 +20,7 @@
 #include "../../shared/h2_frame.h"
 #include "../../shared/hpack.h"
 #include "../../shared/logging.h"
-#include "mux_head.h"
+#include "../../shared/mux_head.h"
 
 namespace socketley::storage
 {
@@ -765,14 +765,14 @@ bool storage_run::h2_headers(const std::shared_ptr<conn>& c, uint32_t sid)
     list.reserve(fields.size());
     for (auto& f : fields)
         list.emplace_back(std::move(f.name), std::move(f.value));
-    mux_request mr;
-    const mux_verdict verdict = mux_request_head(list, s.cont_end_stream, max_head, mr);
-    if (verdict == mux_verdict::malformed && answer_status.empty())
+    mux::request mr;
+    const mux::verdict v = mux::request_head(list, s.cont_end_stream, max_head, mr);
+    if (v == mux::verdict::malformed && answer_status.empty())
     {
         refuse(h2::PROTOCOL_ERROR);
         return true;
     }
-    if (verdict == mux_verdict::too_large)
+    if (v == mux::verdict::too_large)
         answer_status = "431";
 
     auto sc = std::make_shared<conn>();
@@ -946,8 +946,8 @@ void storage_run::h2_stream_out(const std::shared_ptr<conn>& c, std::string data
                 block += '\x20';
                 s.first_block = false;
             }
-            mux_response mr;
-            mux_response_head(head, mr);
+            mux::response mr;
+            mux::response_head(head, mr);
             hpack::encode(block, ":status", mr.status);
             for (const auto& [name, value] : mr.fields)
                 hpack::encode(block, name, value);

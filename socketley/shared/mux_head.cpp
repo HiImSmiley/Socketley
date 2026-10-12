@@ -2,7 +2,7 @@
 
 #include <charconv>
 
-namespace socketley::storage
+namespace socketley::mux
 {
 
 namespace
@@ -28,8 +28,8 @@ bool clean_value(std::string_view v)
 
 }   // namespace
 
-mux_verdict mux_request_head(const std::vector<std::pair<std::string, std::string>>& fields, bool end_stream,
-                             size_t max_head, mux_request& out)
+verdict request_head(const std::vector<std::pair<std::string, std::string>>& fields, bool end_stream,
+                             size_t max_head, request& out)
 {
     // RFC 9113 8.2-8.3 and RFC 9114 4.2-4.3 say alike what a request may hold.
     std::string_view method, scheme, path, authority;
@@ -45,7 +45,7 @@ mux_verdict mux_request_head(const std::vector<std::pair<std::string, std::strin
             // the Host line of the head built from them.
             if (!slot || regular || !slot->empty() || value.empty() || !clean_value(value) ||
                 value.find_first_of(" \t") != std::string::npos)
-                return mux_verdict::malformed;
+                return verdict::malformed;
             *slot = value;
             continue;
         }
@@ -53,7 +53,7 @@ mux_verdict mux_request_head(const std::vector<std::pair<std::string, std::strin
         if (!lower_token(name) || !clean_value(value) || name == "connection" || name == "keep-alive" ||
             name == "proxy-connection" || name == "transfer-encoding" || name == "upgrade" ||
             (name == "te" && value != "trailers"))
-            return mux_verdict::malformed;
+            return verdict::malformed;
         if (name == "cookie")
         {
             cookies += cookies.empty() ? "" : "; ";
@@ -64,7 +64,7 @@ mux_verdict mux_request_head(const std::vector<std::pair<std::string, std::strin
         {
             const auto r = std::from_chars(value.data(), value.data() + value.size(), out.cl);
             if (r.ec != std::errc{} || r.ptr != value.data() + value.size() || out.has_cl)
-                return mux_verdict::malformed;
+                return verdict::malformed;
             out.has_cl = true;
         }
         has_host = has_host || name == "host";
@@ -74,9 +74,9 @@ mux_verdict mux_request_head(const std::vector<std::pair<std::string, std::strin
         head += "\r\n";
     }
     if (method.empty() || method == "CONNECT" || scheme.empty() || path.empty())
-        return mux_verdict::malformed;
+        return verdict::malformed;
     if (end_stream && out.has_cl && out.cl != 0)
-        return mux_verdict::malformed;
+        return verdict::malformed;
     out.synth_chunked = !end_stream && !out.has_cl;
 
     std::string& line = out.line;
@@ -101,10 +101,10 @@ mux_verdict mux_request_head(const std::vector<std::pair<std::string, std::strin
     if (out.synth_chunked)
         line += "transfer-encoding: chunked\r\n";
     line += "\r\n";
-    return line.size() > max_head ? mux_verdict::too_large : mux_verdict::ok;
+    return line.size() > max_head ? verdict::too_large : verdict::ok;
 }
 
-void mux_response_head(std::string_view head, mux_response& out)
+void response_head(std::string_view head, response& out)
 {
     const size_t sp = head.find(' ');
     out.status = sp == std::string_view::npos ? "500" : std::string(head.substr(sp + 1, 3));
@@ -138,4 +138,4 @@ void mux_response_head(std::string_view head, mux_response& out)
     }
 }
 
-}   // namespace socketley::storage
+}   // namespace socketley::mux

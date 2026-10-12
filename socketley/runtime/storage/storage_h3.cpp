@@ -35,7 +35,7 @@
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 
-#include "mux_head.h"
+#include "../../shared/mux_head.h"
 #include "../../shared/logging.h"
 
 #ifndef UDP_SEGMENT
@@ -1026,17 +1026,17 @@ void storage_run::h3_request(conn& raw, bool fin)
         return;   // trailers: read, and dropped
     st.opened = true;
     st.remote_closed = fin;
-    mux_request mr;
-    const mux_verdict v = mux_request_head(st.fields, fin, max_head, mr);
+    mux::request mr;
+    const mux::verdict v = mux::request_head(st.fields, fin, max_head, mr);
     std::vector<std::pair<std::string, std::string>>().swap(st.fields);
-    if (v == mux_verdict::malformed)
+    if (v == mux::verdict::malformed)
     {
         ngtcp2_conn_shutdown_stream(st.conn->q, 0, st.sid, NGHTTP3_H3_MESSAGE_ERROR);
         close_conn(sc);
         return;
     }
     st.synth_chunked = mr.synth_chunked;
-    if (v == mux_verdict::too_large)
+    if (v == mux::verdict::too_large)
     {
         new_request_id(sc->req.request_id);
         response r;
@@ -1241,8 +1241,8 @@ void storage_run::h3_stream_out(const std::shared_ptr<conn>& c, std::string data
             const size_t end = st.head_acc.find("\r\n\r\n");
             if (end == std::string::npos)
                 break;
-            mux_response mr;
-            mux_response_head(std::string_view(st.head_acc.data(), end + 2), mr);
+            mux::response mr;
+            mux::response_head(std::string_view(st.head_acc.data(), end + 2), mr);
             const std::string after = st.head_acc.substr(end + 4);
             st.head_acc.clear();
             std::vector<nghttp3_nv> nva;
