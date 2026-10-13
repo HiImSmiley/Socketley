@@ -19,7 +19,7 @@
 #   refused      a file:// URL, a bad branch and a bad folder name
 #   moved        one in the shared library git goes to git-<owner> at the next
 #                start, backups and all, and the emptied library goes
-#   runtimes     every user has a sync runtime the storage made, which runs
+#   runtimes     a user with a repository has a sync runtime the storage made, which runs
 #                their repositories and goes when the storage stops
 #   remove       a removed repository is no longer listed; its files stay
 set -uo pipefail
@@ -179,13 +179,14 @@ expect "and may not add one into her library" \
 expect "nor run hers" "$(post "$BOB_K:$BOB_S" "{\"action\":\"sync\",\"id\":\"$id\"}")" 404
 
 # ─── whose runtime runs it ──────────────────────────────────────────────────
-# Every user has a sync runtime of their own, made and owned by the storage, which does the runs.
+# A user with a repository has a sync runtime of their own, made and owned by the storage, which does the runs --
+# and a user with none has none, because a runtime is a process and one that syncs nothing is one nobody asked for.
 LS=$("$BIN" ls 2>/dev/null)
-expect "every user has a sync runtime of their own, owned by the storage" \
-    "$(echo "$LS" | awk '$3 == "sync" && $6 == "st" {print $2}' | sort | tr '\n' ' ')" "st-sync-alice st-sync-bob "
+expect "a user with a repository has a sync runtime of their own, owned by the storage" \
+    "$(echo "$LS" | awk '$3 == "sync" && $6 == "st" {print $2}' | sort | tr '\n' ' ')" "st-sync-alice "
+expect "and a user with none has none" "$(echo "$LS" | grep -c 'st-sync-bob')" 0
 expect "the interface names it" "$(ui "$ALICE_K:$ALICE_S" | j "d['runtime']")" st-sync-alice
 expect "and it is what ran alice's repository" "$("$BIN" stats st-sync-alice 2>/dev/null | sed -n 's/^runs://p')" 3
-expect "and no other user's" "$("$BIN" stats st-sync-bob 2>/dev/null | sed -n 's/^runs://p')" 0
 
 # ─── private ────────────────────────────────────────────────────────────────
 code=$(post "$BOB_K:$BOB_S" "{\"action\":\"add\",\"url\":\"git://127.0.0.1:$GP/demo.git\",\"bucket\":\"bobcode\",\"private\":true}")
@@ -262,6 +263,12 @@ for _ in $(seq 1 100); do curl -s -o /dev/null "http://127.0.0.1:$ST/" && break;
 expect "a repository is removed" "$(post "$ALICE_K:$ALICE_S" "{\"action\":\"remove\",\"id\":\"$id\"}")" 204
 expect "and no longer listed" "$(ui "$ALICE_K:$ALICE_S" | j "[r['id'] for r in d['repos']].count('$id')")" 0
 expect "while its files stay" "$(s3 "http://127.0.0.1:$ST/code/demo/README.md")" "hello again"
+
+# And her last repository gone takes her runtime with it, which is the other half of making it only when there is
+# something to sync.  Waited for, because the storage looks at its runners on a turn of its own.
+for _ in $(seq 1 60); do "$BIN" ls 2>/dev/null | grep -q 'st-sync-alice' || break; sleep 0.5; done
+expect "and her last repository gone takes her sync runtime with it" \
+    "$("$BIN" ls 2>/dev/null | grep -c 'st-sync-alice')" 0
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

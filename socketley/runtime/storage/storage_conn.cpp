@@ -2804,9 +2804,18 @@ void storage_run::tend_sync_runners()
         m_git.set_unavailable("repositories are pulled by sync runtimes, which a runtime outside the daemon cannot make");
         return;
     }
+    // A user's sync runtime is made when they have a repository and not before.  It is a process of its own, so a
+    // storage with users who sync nothing made one for each of them that did nothing but exist: measured on a live
+    // runtime, seven repositories all belonging to one user and a runtime each for the other two.  The list is the
+    // one the runtime already keeps, cached against the file's mtime, so asking it every turn costs nothing; a
+    // user's first repository brings their runtime up within the ten seconds below, and their last one taking it
+    // away is the removal at the end of this function.
+    std::unordered_set<std::string> syncing;
+    for (const auto& r : m_git.repos())
+        syncing.insert(r.owner);
     std::unordered_map<std::string, std::string> want;
     for (const auto& u : m_auth->users())
-        if (!u->cluster)
+        if (!u->cluster && syncing.contains(u->id))
             want.emplace(sync_runner_name(u->id), u->id);
     const std::string dir = m_store.options().dir + "/.ui/sync";
     if (::mkdir((m_store.options().dir + "/.ui").c_str(), 0700) < 0 && errno != EEXIST) {}
