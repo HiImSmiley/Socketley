@@ -40,6 +40,7 @@
 #include "s3_federation.h"
 #include "s3_auth.h"
 #include "s3_users.h"
+#include "../../shared/h3_endpoint.h"
 #include "../../shared/storage_rpc.h"
 #include "shard_node.h"
 #include "storage_transport.h"
@@ -304,11 +305,7 @@ struct h2_session;
 struct h2_stream;
 struct h2_session_free { void operator()(h2_session* s) const; };
 struct h2_stream_free { void operator()(h2_stream* s) const; };
-struct h3_endpoint;
-struct h3_conn;
-struct h3_stream;
-struct h3_endpoint_free { void operator()(h3_endpoint* e) const; };
-struct h3_stream_free { void operator()(h3_stream* s) const; };
+
 
 // What of a bucket's ACL, and of an object's own, a request of action `a` needs, none for one they say nothing to.
 uint8_t bucket_acl_need(s3_action a);
@@ -388,7 +385,9 @@ struct conn
     bool         any_request{false};
     // ── HTTP/3 ──────────────────────────────────────────────────────────────
     // A stream of a QUIC connection, a conn with no socket like an HTTP/2 stream's; its connection's TLS session.
-    std::unique_ptr<h3_stream, h3_stream_free> h3s;
+    // Non-null only on a stream of an HTTP/3 connection, and not owned: the endpoint holds the stream's own
+    // state and tells this runtime when it has let go of it.
+    h3::stream* h3s{nullptr};
     SSL*         quic_ssl{nullptr};
     // The socket and the TLS session the request came in on, the parent's for a stream.
     int  sock() const { return h2_parent ? h2_parent->fd : fd; }
@@ -776,7 +775,7 @@ public:
     void h2_goaway(const std::shared_ptr<conn>& c, uint32_t code, bool now);
     bool h2_preface_in(const std::shared_ptr<conn>& c, const char* p, size_t n);
     std::shared_ptr<conn> h2_make_stream(const std::shared_ptr<conn>& c);
-    void h2_start_stream(const std::shared_ptr<conn>& sc, socketley::mux::request& mr, int answer_status);
+    void h2_start_stream(const std::shared_ptr<conn>& sc, mux::request& mr, int answer_status);
     void h2_sweep(const std::shared_ptr<conn>& c, std::chrono::steady_clock::time_point now);
 
     // HTTP/3, in storage_h3.cpp: a UDP socket beside the TCP listener when --tls is on; datagrams in and out through
@@ -793,34 +792,19 @@ public:
     void h3_flush_dirty();
     void h3_stop();
 #if SOCKETLEY_HTTP3
-    void h3_arm_read();
-    void h3_arm_inbox();
-    void h3_datagram(size_t res);
-    void h3_packet(const sockaddr_storage& local, socklen_t local_len, const sockaddr_storage& remote,
-                   socklen_t remote_len, const uint8_t* data, size_t len, bool forwarded);
-    void h3_forward(uint32_t owner, const sockaddr_storage& local, socklen_t local_len, const sockaddr_storage& remote,
-                    socklen_t remote_len, const uint8_t* data, size_t len);
-    void h3_retry(const ::ngtcp2_pkt_hd& hd, const sockaddr_storage& local, socklen_t local_len,
-                  const sockaddr_storage& remote, socklen_t remote_len);
-    std::shared_ptr<h3_conn> h3_new_conn(const ::ngtcp2_pkt_hd& hd, const ::ngtcp2_cid* odcid,
-                                         const sockaddr_storage& local, socklen_t local_len,
-                                         const sockaddr_storage& remote, socklen_t remote_len);
-    bool h3_app_ready(h3_conn& hc);
-    bool h3_begin(h3_conn& hc, int64_t sid);
-    void h3_request(conn& raw, bool fin);
-    void h3_data(conn& raw, std::string_view data);
-    void h3_data_end(conn& raw);
-    void h3_acked(conn& raw, uint64_t len);
-    void h3_stream_closed(h3_conn& hc, int64_t sid);
-    void h3_dirty(const std::shared_ptr<h3_conn>& hc);
-    void h3_dirty_raw(h3_conn& hc);
-    void h3_send(const sockaddr_storage& local, socklen_t local_len, const sockaddr_storage& remote,
-                 socklen_t remote_len, const uint8_t* data, size_t len, size_t gso);
-    void h3_write(const std::shared_ptr<h3_conn>& hc);
-    void h3_arm_timer(uint64_t soonest);
-    void h3_expire();
-    void h3_close(const std::shared_ptr<h3_conn>& hc);
-    void h3_drop(const std::shared_ptr<h3_conn>& hc);
+    // What the shared endpoint asks of this runtime, in storage_h3.cpp.
+    uint64_t h3_make_stream(h3::stream& st);
+    void h3_start_stream(h3::stream& st, mux::request& mr, int answer_status);
+    bool h3_can_take(h3::stream& st);
+    void h3_take(h3::stream& st, const char* d, size_t n);
+    void h3_write_done(h3::stream& st);
+    void h3_host_stream_gone(h3::stream& st);
+    void h3_count(h3::event e);
+    void h3_sent(size_t n);
+    uint32_t h3_shards() const;
+    // The machinery between a datagram and a stream's bytes -- the socket, the packets, the handshakes, the
+    // timers and the congestion control -- is shared/h3_endpoint.cpp's; what stays here is what only this
+    // runtime can say about a stream, declared above.
 #endif
     void close_conn(const std::shared_ptr<conn>& c);
     void maybe_release(const std::shared_ptr<conn>& c);
@@ -1523,7 +1507,10 @@ private:
     void h2_turn();
     void h2_go_on(const std::shared_ptr<conn>& sc);
     // The HTTP/3 endpoint, when one is open, and the Alt-Svc line every answer over TCP then carries.
-    std::unique_ptr<h3_endpoint, h3_endpoint_free> m_h3;
+    // The endpoint, and the object it is told about this runtime's streams through; both live for as long as
+    // HTTP/3 is open on this runtime.
+    std::unique_ptr<h3::endpoint, h3::endpoint_free> m_h3;
+    std::unique_ptr<h3::host> m_h3_host;
     std::string m_alt_svc;
     uint64_t    m_next_id{1};
 

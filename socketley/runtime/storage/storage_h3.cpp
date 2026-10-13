@@ -1,49 +1,24 @@
-// HTTP/3, RFC 9114 over QUIC (RFC 9000), for a storage runtime with --tls: a UDP socket on the TCP listener's port,
-// read and written through the ring; QUIC is ngtcp2's, its TLS 1.3 OpenSSL 3.5's through ngtcp2's helper, and HTTP/3
-// and QPACK are nghttp3's. Each request is a stream, and each stream a conn with no socket, exactly as for HTTP/2:
-// its head is written back as the HTTP/1.1 head parse_head() reads, its body handed to its phase as a recv's bytes
-// would be, and its answer read back into HTTP/3's fields and DATA. Every operation runs as it does over HTTP/1.1.
+// HTTP/3 for a storage runtime with --tls: a UDP socket on the TCP listener's port, whose QUIC, TLS and HTTP/3 are
+// shared/h3_endpoint.cpp's. What is left here is what only this runtime can say about a stream: each request is a
+// stream, and each stream a conn with no socket, exactly as for HTTP/2 -- its head is written back as the HTTP/1.1
+// head parse_head() reads, its body handed to its phase as a recv's bytes would be, and its answer read back into
+// HTTP/3's fields and DATA. Every operation runs as it does over HTTP/1.1.
 //
-// A body in is given back to the window only as its phase takes it, as for HTTP/2. A body out is held until the peer
-// acknowledges it, since QUIC may send it again; a stream is told its write is done -- and asked for the next piece
-// of a file -- once nghttp3 has taken all it was handed. A browser learns of HTTP/3 from the Alt-Svc header every
-// answer over TCP carries, and goes on over TCP when UDP does not reach.
+// A body in is given back to the window only as its phase takes it, which is can_take() below. A body out is held
+// until the peer acknowledges it, since QUIC may send it again; a stream is told its write is done -- and asked for
+// the next piece of a file -- once nghttp3 has taken all it was handed. A browser learns of HTTP/3 from the Alt-Svc
+// header every answer over TCP carries, and goes on over TCP when UDP does not reach.
 #include "storage_run.h"
 #include "storage_instance.h"
 
 #if SOCKETLEY_HTTP3
 
-#include <algorithm>
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
-#include <unordered_map>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/udp.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-
-#include <ngtcp2/ngtcp2.h>
-#include <ngtcp2/ngtcp2_crypto.h>
-#include <ngtcp2/ngtcp2_crypto_ossl.h>
-#include <nghttp3/nghttp3.h>
-#include <openssl/err.h>
-#include <openssl/rand.h>
-#include <openssl/ssl.h>
-
-#include "../../shared/mux_head.h"
+#include "../../shared/h3_endpoint.h"
 #include "../../shared/logging.h"
-
-#ifndef UDP_SEGMENT
-#define UDP_SEGMENT 103
-#endif
-#ifndef UDP_GRO
-#define UDP_GRO 104
-#endif
 
 namespace socketley::storage
 {
@@ -51,996 +26,129 @@ namespace socketley::storage
 namespace
 {
 
-constexpr size_t   scid_len        = 18;
-// What a stream and the connection may be sent before this side gives the window back; ngtcp2 grows them toward the
-// maxima as the round trip asks.
-constexpr uint64_t stream_window   = 1u << 20;
-constexpr uint64_t conn_window     = 4u << 20;
-constexpr uint64_t stream_window_max = 16u << 20;
-constexpr uint64_t conn_window_max = 64u << 20;
-constexpr uint64_t max_streams     = 128;
-constexpr size_t   max_head        = 32 * 1024;
-constexpr size_t   max_conns       = 4096;
-constexpr size_t   pull_slice      = 64 * 1024;
-constexpr size_t   rx_buf          = 64 * 1024;
-// Packets written at once and sent in one sendmsg by UDP GSO: as many of ngtcp2's largest (its default
-// max_tx_udp_payload_size) as fit the 64 KiB a UDP datagram, and so a GSO send, may carry.
-constexpr size_t   max_udp_payload = NGTCP2_MAX_PMTUD_UDP_PAYLOAD_SIZE;
-constexpr size_t   gso_burst       = 65000 / max_udp_payload;
-constexpr uint64_t idle_timeout_ns = 30ull * NGTCP2_SECONDS;
-// A handshake not done by then is dropped, so an Initial from an address that never answers holds nothing for long.
-constexpr uint64_t handshake_timeout_ns = 10ull * NGTCP2_SECONDS;
-// How long a Retry's token proves the address it was sent to.
-constexpr uint64_t retry_token_timeout_ns = 10ull * NGTCP2_SECONDS;
-
-uint64_t now_ns()
-{
-    timespec ts{};
-    ::clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
-}
-
-std::string cid_key(const uint8_t* p, size_t n)
-{
-    return std::string(reinterpret_cast<const char*>(p), n);
-}
-
-void rand_cb(uint8_t* dest, size_t len, const ngtcp2_rand_ctx*)
-{
-    if (RAND_bytes(dest, static_cast<int>(len)) != 1) {}
-}
-
-void h3_rand(uint8_t* dest, size_t len)
-{
-    if (RAND_bytes(dest, static_cast<int>(len)) != 1) {}
-}
+constexpr size_t max_head = 32 * 1024;
 
 }   // namespace
 
-struct h3_conn;
-
-// What a stream's answer has given nghttp3 and what the peer has acknowledged, held as it was handed over: QUIC sends
-// a lost packet's bytes again, so they live until acknowledged.
-struct h3_stream
+// What the shared endpoint asks of this runtime. A stream's conn is found by the id the stream carries, not by a
+// pointer: a stream the endpoint still holds can outlive its conn by an operation in flight, and a miss there is a
+// miss rather than a read of something freed.
+class storage_h3_host final : public h3::host
 {
-    int64_t  sid{0};
-    h3_conn* conn{nullptr};
-    // The request's fields as they came, until its head is complete.
-    std::vector<std::pair<std::string, std::string>> fields;
-    bool     opened{false};
-    // DATA received and not yet handed to the phase.
-    std::deque<std::string> rxq;
-    size_t   rx_head{0};
-    bool     remote_closed{false};
-    bool     synth_chunked{false};
-    bool     chunk_end_given{false};
+public:
+    explicit storage_h3_host(storage_run& run) : m_run(run) {}
 
-    enum class out_state : uint8_t { head, body, dechunk } os{out_state::head};
-    std::string head_acc;
-    http_chunked_decoder dechunk;
-    std::string dechunk_in;
-    std::deque<std::string> tx;
-    size_t   tx_given_front{0};   // what of tx.front() nghttp3 already has
-    size_t   tx_given_chunks{0};  // chunks nghttp3 has whole, at the front
-    uint64_t tx_total{0}, tx_given{0}, tx_acked_front{0};
-    bool     submitted{false};
-    bool     blocked{false};      // read_data said it would block; resumed when more comes
-    bool     end_pending{false};
-    bool     ended{false};        // EOF given
-    bool     gone{false};
-};
-
-struct h3_conn : std::enable_shared_from_this<h3_conn>
-{
-    storage_run*   run{nullptr};
-    ngtcp2_conn*   q{nullptr};
-    nghttp3_conn*  h{nullptr};
-    ngtcp2_crypto_ossl_ctx* octx{nullptr};
-    SSL*           ssl{nullptr};
-    ngtcp2_crypto_conn_ref ref{};
-    sockaddr_storage local{}, remote{};
-    socklen_t      local_len{0}, remote_len{0};
-    std::vector<std::string> cids;
-    std::unordered_map<int64_t, std::shared_ptr<conn>> streams;
-    ngtcp2_ccerr   err{};
-    bool           dead{false};
-    bool           dirty{false};
-    std::string    peer;
-    client_ip      ip{};
-
-    ~h3_conn()
+    uint64_t make_stream(h3::stream& st) override { return m_run.h3_make_stream(st); }
+    void start_stream(h3::stream& st, mux::request& r, int answer_status) override
     {
-        if (h)
-            nghttp3_conn_del(h);
-        if (q)
-            ngtcp2_conn_del(q);
-        if (octx)
-            ngtcp2_crypto_ossl_ctx_del(octx);
-        if (ssl)
-            SSL_free(ssl);
+        m_run.h3_start_stream(st, r, answer_status);
     }
+    bool can_take(h3::stream& st) override { return m_run.h3_can_take(st); }
+    void take(h3::stream& st, const char* d, size_t n) override { m_run.h3_take(st, d, n); }
+    void write_done(h3::stream& st) override { m_run.h3_write_done(st); }
+    void stream_gone(h3::stream& st) override { m_run.h3_host_stream_gone(st); }
+    void count(h3::event e) override { m_run.h3_count(e); }
+    void sent(size_t n) override { m_run.h3_sent(n); }
+    uint32_t shards() const override { return m_run.h3_shards(); }
+
+private:
+    storage_run& m_run;
 };
-
-struct h3_endpoint
-{
-    int         fd{-1};
-    uint16_t    port{0};
-    // The certificate's context, watched for a renewed one and asking for a client's when --ca says so, as TCP's;
-    // `ctx` is its OpenSSL context, set up for QUIC.
-    std::unique_ptr<tls_context> tls;
-    SSL_CTX*    ctx{nullptr};
-    uint8_t     secret[32]{};
-    io_request  rd{};
-    bool        rd_pending{false};
-    msghdr      msg{};
-    iovec       iov{};
-    sockaddr_storage src{};
-    alignas(cmsghdr) char cbuf[256]{};
-    std::vector<uint8_t> rbuf = std::vector<uint8_t>(rx_buf);
-    std::vector<uint8_t> txbuf = std::vector<uint8_t>(gso_burst * max_udp_payload);
-    std::unordered_map<std::string, std::shared_ptr<h3_conn>> by_cid;
-    std::vector<std::shared_ptr<h3_conn>> conns;
-    // One timeout for every connection's earliest expiry; two timespecs, so one waiting to be submitted is never
-    // written over by the next.
-    io_request  tm{};
-    __kernel_timespec ts[2]{};
-    int         ts_at{0};
-    bool        tm_armed{false};
-    uint64_t    tm_deadline{0};
-    std::vector<std::weak_ptr<h3_conn>> dirty;
-    // Handshakes under way past which a new client is asked to prove its address with a Retry first (RFC 9000
-    // 8.1.2), so datagrams with forged sources cannot fill the table: SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER, 0 always.
-    size_t      retry_after{64};
-    // The congestion controller, SOCKETLEY_STORAGE_HTTP3_CC=bbr|cubic|reno. BBR by default: it paces by the path's
-    // measured rate and round trip rather than backing off at every loss, so a link that loses a packet in a hundred
-    // at 50 ms -- Wi-Fi, mobile -- carried a download ten to twenty times faster than with CUBIC, and as fast without
-    // loss.
-    ngtcp2_cc_algo cc{NGTCP2_CC_ALGO_BBR};
-    // Shards share the UDP port, and the kernel picks one by the client's address: a client that moves may reach
-    // another. The shard is the first byte of every connection ID this side gives, and a packet for another shard's
-    // is handed to it through that shard's inbox, a datagram socket of its own, which answers it from the same port.
-    uint32_t    shard{0}, shards{1};
-    int         inbox{-1};
-    io_request  in_rd{};
-    bool        in_pending{false};
-    std::vector<uint8_t> inbuf = std::vector<uint8_t>(rx_buf + 64);
-    // Read with the sender's credentials, which the kernel vouches for: only this user's processes -- the shards --
-    // are listened to, since an abstract name is anyone's to send to.
-    msghdr      in_msg{};
-    iovec       in_iov{};
-    alignas(cmsghdr) char in_cbuf[CMSG_SPACE(sizeof(ucred))]{};
-};
-
-void h3_endpoint_free::operator()(h3_endpoint* e) const { delete e; }
-void h3_stream_free::operator()(h3_stream* s) const { delete s; }
-
-namespace
-{
-
-int alpn_h3(SSL*, const unsigned char** out, unsigned char* outlen, const unsigned char* in, unsigned int inlen, void*)
-{
-    for (unsigned int p = 0; p < inlen;)
-    {
-        const unsigned int n = in[p];
-        if (n == 0 || p + 1 + n > inlen)
-            break;
-        if (n == 2 && in[p + 1] == 'h' && in[p + 2] == '3')
-        {
-            *out = in + p + 1;
-            *outlen = 2;
-            return SSL_TLSEXT_ERR_OK;
-        }
-        p += 1 + n;
-    }
-    return SSL_TLSEXT_ERR_ALERT_FATAL;
-}
-
-// Bytes QUIC handed over that no phase will take: the connection's window gets them back, as it does by itself only
-// for what it never handed over.
-void h3_give_back(h3_conn* hc, uint64_t n)
-{
-    if (n && hc && hc->q && !hc->dead)
-        ngtcp2_conn_extend_max_offset(hc->q, n);
-}
-
-void h3_drop_rx(h3_stream& st)
-{
-    uint64_t left = 0;
-    for (const auto& piece : st.rxq)
-        left += piece.size();
-    left -= std::min<uint64_t>(left, st.rx_head);
-    st.rxq.clear();
-    st.rx_head = 0;
-    h3_give_back(st.conn, left);
-}
-
-// The inbox of shard `n` of the runtime on `port`: an abstract unix name, gone with the socket.
-socklen_t inbox_addr(uint16_t port, uint32_t n, sockaddr_un& out)
-{
-    out = sockaddr_un{};
-    out.sun_family = AF_UNIX;
-    const std::string name = "socketley-h3/" + std::to_string(port) + "/" + std::to_string(n);
-    std::memcpy(out.sun_path + 1, name.data(), name.size());
-    return static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + name.size());
-}
-
-// An address ngtcp2 names, as the sockaddr_storage this side keeps.
-void path_addr(const ngtcp2_addr& a, sockaddr_storage& out, socklen_t& len)
-{
-    len = static_cast<socklen_t>(std::min<size_t>(a.addrlen, sizeof out));
-    std::memcpy(&out, a.addr, len);
-}
-
-std::string peer_text(const sockaddr_storage& remote)
-{
-    const auto* a = reinterpret_cast<const sockaddr_in*>(&remote);
-    char host[INET_ADDRSTRLEN] = {};
-    ::inet_ntop(AF_INET, &a->sin_addr, host, sizeof host);
-    return std::string(host) + ":" + std::to_string(ntohs(a->sin_port));
-}
-
-ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* ref)
-{
-    return static_cast<h3_conn*>(ref->user_data)->q;
-}
-
-}   // namespace
 
 // ─── The endpoint ───────────────────────────────────────────────────────────
 
 bool storage_run::h3_open(uint16_t port, uint16_t advertise, uint32_t shard, uint32_t shards, const std::string& cert,
                           const std::string& key, const std::string& ca)
 {
-    const bool reuseport = shards > 1;
-    auto ep = std::unique_ptr<h3_endpoint, h3_endpoint_free>(new h3_endpoint);
-    if (ngtcp2_crypto_ossl_init() != 0)
-        return false;
-    ep->tls = std::make_unique<tls_context>();
-    if (!ep->tls->init_server(cert, key, ca))
-    {
-        LOG_WARN("storage: HTTP/3 not offered -- the certificate or key could not be loaded for QUIC");
-        return false;
-    }
-    ep->ctx = ep->tls->native();
-    SSL_CTX_set_min_proto_version(ep->ctx, TLS1_3_VERSION);
-    SSL_CTX_set_max_proto_version(ep->ctx, TLS1_3_VERSION);
-    SSL_CTX_set_options(ep->ctx, (SSL_OP_ALL & ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS) | SSL_OP_SINGLE_ECDH_USE |
-                                     SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_NO_ANTI_REPLAY);
-    SSL_CTX_set_mode(ep->ctx, SSL_MODE_RELEASE_BUFFERS);
-    SSL_CTX_set_alpn_select_cb(ep->ctx, alpn_h3, nullptr);
-    // Every packet is sealed on its own, so the cipher is most of a transfer's CPU: AES-128-GCM, a quarter fewer
-    // rounds than AES-256 and what browsers ask for first, is chosen when the client offers it.
-    if (SSL_CTX_set_ciphersuites(ep->ctx, "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256") != 1)
-        ERR_clear_error();
-    if (RAND_bytes(ep->secret, sizeof ep->secret) != 1)
-        return false;
-
-    const int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0)
-        return false;
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    if (reuseport)
-        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
-    // The address a datagram came to, so the answer leaves from it; several datagrams a read, and the buffers a
-    // stream of them needs.
-    setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof one);
-    setsockopt(fd, IPPROTO_UDP, UDP_GRO, &one, sizeof one);
-    int buf = 4 << 20;
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf);
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = INADDR_ANY;
-    a.sin_port = htons(port);
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0)
-    {
-        LOG_WARN(("storage: HTTP/3 not offered -- UDP port " + std::to_string(port) + " could not be bound: " +
-                  std::strerror(errno)).c_str());
-        ::close(fd);
-        return false;
-    }
-    ep->fd = fd;
-    ep->port = port;
+    h3::options o;
+    o.owner     = this;
+    o.port      = port;
+    o.advertise = advertise;
+    o.shard     = shard;
+    o.shards    = std::max<uint32_t>(shards, 1);
+    o.cert      = cert;
+    o.key       = key;
+    o.ca        = ca;
+    o.max_head  = max_head;
+    // This runtime's own dials, which the endpoint's defaults otherwise answer for.
     if (const char* cc = std::getenv("SOCKETLEY_STORAGE_HTTP3_CC"); cc && *cc)
-    {
-        const std::string_view v(cc);
-        if (v == "bbr")
-            ep->cc = NGTCP2_CC_ALGO_BBR;
-        else if (v == "reno")
-            ep->cc = NGTCP2_CC_ALGO_RENO;
-        else if (v == "cubic")
-            ep->cc = NGTCP2_CC_ALGO_CUBIC;
-        else
-            LOG_WARN("storage: SOCKETLEY_STORAGE_HTTP3_CC is none of bbr, cubic, reno; bbr is used");
-    }
+        o.cc = cc;
     if (const char* ra = std::getenv("SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER"); ra && *ra)
     {
         size_t v = 0;
         const auto [end, ec] = std::from_chars(ra, ra + std::strlen(ra), v);
         if (ec == std::errc{} && *end == '\0')
-            ep->retry_after = v;
+            o.retry_after = v;
     }
-    ep->shard = shard;
-    ep->shards = std::max<uint32_t>(shards, 1);
-    if (ep->shards > 1)
+    m_h3_host = std::make_unique<storage_h3_host>(*this);
+    std::string err;
+    m_h3 = h3::open(o, *m_h3_host, m_loop, err);
+    if (!m_h3)
     {
-        // Without its inbox a shard still serves; only a client that moved to it from another is lost.
-        sockaddr_un un{};
-        const socklen_t ul = inbox_addr(port, shard, un);
-        ep->inbox = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        if (ep->inbox >= 0 && ::bind(ep->inbox, reinterpret_cast<sockaddr*>(&un), ul) != 0)
-        {
-            LOG_WARN("storage: HTTP/3 shard inbox could not be bound; a client that changes address may be lost");
-            ::close(ep->inbox);
-            ep->inbox = -1;
-        }
-        else if (ep->inbox >= 0)
-        {
-            int sz = 4 << 20, on = 1;
-            setsockopt(ep->inbox, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
-            setsockopt(ep->inbox, SOL_SOCKET, SO_PASSCRED, &on, sizeof on);
-        }
+        LOG_WARN(("storage: HTTP/3 not offered -- " + err).c_str());
+        m_h3_host.reset();
+        return false;
     }
-    ep->rd.owner = this;
-    ep->tm.owner = this;
-    ep->in_rd.owner = this;
-    m_h3 = std::move(ep);
-    // Behind a proxy the port a browser reaches may not be this one; 0 offers HTTP/3 to no one who was not told.
-    if (advertise)
-        m_alt_svc = "h3=\":" + std::to_string(advertise) + "\"; ma=86400";
-    h3_arm_read();
-    h3_arm_inbox();
+    m_alt_svc = h3::alt_svc(*m_h3);
     return true;
 }
 
-void storage_run::h3_arm_inbox()
-{
-    h3_endpoint& ep = *m_h3;
-    if (ep.in_pending || ep.inbox < 0 || m_stopped)
-        return;
-    ep.in_rd = io_request{};
-    ep.in_rd.owner = this;
-    ep.in_iov.iov_base = ep.inbuf.data();
-    ep.in_iov.iov_len = ep.inbuf.size();
-    ep.in_msg = msghdr{};
-    ep.in_msg.msg_iov = &ep.in_iov;
-    ep.in_msg.msg_iovlen = 1;
-    ep.in_msg.msg_control = ep.in_cbuf;
-    ep.in_msg.msg_controllen = sizeof ep.in_cbuf;
-    ep.in_pending = m_loop.submit_recvmsg(ep.inbox, &ep.in_msg, &ep.in_rd);
-}
+bool storage_run::h3_owns(io_request* req) const { return m_h3 && h3::owns(*m_h3, req); }
+void storage_run::h3_cqe(io_request* req, int res) { h3::completion(*m_h3, req, res); }
+void storage_run::h3_flush_dirty() { if (m_h3) h3::flush(*m_h3); }
+size_t storage_run::h3_open_conns() const { return m_h3 ? h3::open_conns(*m_h3) : 0; }
+void storage_run::h3_stop() { if (m_h3) h3::stop(*m_h3); }
+uint32_t storage_run::h3_shards() const { return std::max<uint32_t>(m_owner.get_shards(), 1); }
 
-// A packet for a connection another shard holds, with the addresses it came by, to that shard's inbox.
-void storage_run::h3_forward(uint32_t owner, const sockaddr_storage& local, socklen_t local_len,
-                             const sockaddr_storage& remote, socklen_t remote_len, const uint8_t* data, size_t len)
+void storage_run::h3_count(h3::event e)
 {
-    h3_endpoint& ep = *m_h3;
-    if (ep.inbox < 0 || local_len > 255 || remote_len > 255)
-        return;
-    std::vector<uint8_t> msg;
-    msg.reserve(2 + local_len + remote_len + len);
-    msg.push_back(static_cast<uint8_t>(remote_len));
-    msg.insert(msg.end(), reinterpret_cast<const uint8_t*>(&remote), reinterpret_cast<const uint8_t*>(&remote) + remote_len);
-    msg.push_back(static_cast<uint8_t>(local_len));
-    msg.insert(msg.end(), reinterpret_cast<const uint8_t*>(&local), reinterpret_cast<const uint8_t*>(&local) + local_len);
-    msg.insert(msg.end(), data, data + len);
-    sockaddr_un un{};
-    const socklen_t ul = inbox_addr(ep.port, owner, un);
-    // A shard that is not there, or whose inbox is full, loses the packet as the path would; QUIC sends it again.
-    if (::sendto(ep.inbox, msg.data(), msg.size(), MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&un), ul) > 0)
-        ++m_c.h3_forwarded;
-}
-
-void storage_run::h3_arm_read()
-{
-    h3_endpoint& ep = *m_h3;
-    if (ep.rd_pending || ep.fd < 0 || m_stopped)
-        return;
-    ep.iov.iov_base = ep.rbuf.data();
-    ep.iov.iov_len = ep.rbuf.size();
-    ep.msg = msghdr{};
-    ep.msg.msg_name = &ep.src;
-    ep.msg.msg_namelen = sizeof ep.src;
-    ep.msg.msg_iov = &ep.iov;
-    ep.msg.msg_iovlen = 1;
-    ep.msg.msg_control = ep.cbuf;
-    ep.msg.msg_controllen = sizeof ep.cbuf;
-    ep.rd = io_request{};
-    ep.rd.owner = this;
-    ep.rd_pending = m_loop.submit_recvmsg(ep.fd, &ep.msg, &ep.rd);
-}
-
-bool storage_run::h3_owns(io_request* req) const
-{
-    return m_h3 && (req == &m_h3->rd || req == &m_h3->tm || req == &m_h3->in_rd);
-}
-
-void storage_run::h3_cqe(io_request* req, int res)
-{
-    h3_endpoint& ep = *m_h3;
-    if (req == &ep.in_rd)
+    switch (e)
     {
-        ep.in_pending = false;
-        if (m_stopped)
-            return;
-        // Another shard's packet: the addresses it came by, then the datagram, taken as if it had come here --
-        // from a process of this user's only, and whole.
-        bool mine = false;
-        for (cmsghdr* cm = CMSG_FIRSTHDR(&ep.in_msg); cm; cm = CMSG_NXTHDR(&ep.in_msg, cm))
-            if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_CREDENTIALS)
-            {
-                ucred cr{};
-                std::memcpy(&cr, CMSG_DATA(cm), sizeof cr);
-                mine = cr.uid == ::geteuid();
-            }
-        const size_t n = res > 0 && mine && !(ep.in_msg.msg_flags & MSG_TRUNC) ? static_cast<size_t>(res) : 0;
-        const uint8_t* p = ep.inbuf.data();
-        if (n > 2 && p[0] <= sizeof(sockaddr_storage) && 1u + p[0] + 1u < n)
-        {
-            sockaddr_storage remote{}, local{};
-            const socklen_t rl = p[0];
-            std::memcpy(&remote, p + 1, rl);
-            const socklen_t ll = p[1 + rl];
-            if (ll <= sizeof(sockaddr_storage) && 2u + rl + ll <= n)
-            {
-                std::memcpy(&local, p + 2 + rl, ll);
-                h3_packet(local, ll, remote, rl, p + 2 + rl + ll, n - 2 - rl - ll, true);
-                h3_flush_dirty();
-            }
-        }
-        h3_arm_inbox();
-        return;
-    }
-    if (req == &ep.tm)
-    {
-        if (res == -ECANCELED)
-            return;
-        ep.tm_armed = false;
-        if (!m_stopped)
-            h3_expire();
-        return;
-    }
-    ep.rd_pending = false;
-    if (m_stopped)
-        return;
-    if (res > 0)
-        h3_datagram(static_cast<size_t>(res));
-    // What else has come is read now, without the ring: a burst of a client's packets is taken in one turn, and
-    // what they call for -- acknowledgements, answers -- leaves in one write per connection rather than one each.
-    for (int more = 0; res > 0 && more < 256; ++more)
-    {
-        ep.iov.iov_base = ep.rbuf.data();
-        ep.iov.iov_len = ep.rbuf.size();
-        ep.msg.msg_name = &ep.src;
-        ep.msg.msg_namelen = sizeof ep.src;
-        ep.msg.msg_controllen = sizeof ep.cbuf;
-        ep.msg.msg_flags = 0;
-        const ssize_t n = ::recvmsg(ep.fd, &ep.msg, MSG_DONTWAIT);
-        if (n <= 0)
-            break;
-        h3_datagram(static_cast<size_t>(n));
-    }
-    h3_flush_dirty();
-    h3_arm_read();
-}
-
-// A datagram ep.msg holds, of `res` bytes: the local address from IP_PKTINFO, and the size each packet was when GRO
-// joined several.
-void storage_run::h3_datagram(size_t res)
-{
-    h3_endpoint& ep = *m_h3;
-    sockaddr_storage local{};
-    socklen_t local_len = sizeof(sockaddr_in);
-    auto* l4 = reinterpret_cast<sockaddr_in*>(&local);
-    l4->sin_family = AF_INET;
-    l4->sin_port = htons(ep.port);
-    size_t seg = res;
-    for (cmsghdr* cm = CMSG_FIRSTHDR(&ep.msg); cm; cm = CMSG_NXTHDR(&ep.msg, cm))
-    {
-        if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_PKTINFO)
-        {
-            in_pktinfo pi{};
-            std::memcpy(&pi, CMSG_DATA(cm), sizeof pi);
-            l4->sin_addr = pi.ipi_addr;
-        }
-        else if (cm->cmsg_level == IPPROTO_UDP && cm->cmsg_type == UDP_GRO)
-        {
-            int g = 0;
-            std::memcpy(&g, CMSG_DATA(cm), sizeof g);
-            if (g > 0)
-                seg = static_cast<size_t>(g);
-        }
-    }
-    for (size_t off = 0; off < res; off += seg)
-        h3_packet(local, local_len, ep.src, ep.msg.msg_namelen, ep.rbuf.data() + off, std::min(seg, res - off), false);
-}
-
-// ─── A datagram in ──────────────────────────────────────────────────────────
-
-void storage_run::h3_packet(const sockaddr_storage& local, socklen_t local_len, const sockaddr_storage& remote,
-                            socklen_t remote_len, const uint8_t* data, size_t len, bool forwarded)
-{
-    h3_endpoint& ep = *m_h3;
-    ngtcp2_version_cid vc{};
-    const int rv = ngtcp2_pkt_decode_version_cid(&vc, data, len, scid_len);
-    if (rv == NGTCP2_ERR_VERSION_NEGOTIATION)
-    {
-        // A version this side does not speak: the ones it does, so the client can choose again.
-        uint8_t out[256];
-        uint32_t versions[] = {NGTCP2_PROTO_VER_V1};
-        uint8_t unused = 0;
-        h3_rand(&unused, 1);
-        const ngtcp2_ssize n = ngtcp2_pkt_write_version_negotiation(out, sizeof out, unused, vc.scid, vc.scidlen,
-                                                                     vc.dcid, vc.dcidlen, versions, 1);
-        if (n > 0)
-            h3_send(local, local_len, remote, remote_len, out, static_cast<size_t>(n), 0);
-        return;
-    }
-    if (rv != 0)
-        return;
-    std::shared_ptr<h3_conn> hc;
-    if (auto it = ep.by_cid.find(cid_key(vc.dcid, vc.dcidlen)); it != ep.by_cid.end())
-        hc = it->second;
-    if (!hc && !forwarded && ep.shards > 1 && vc.dcidlen == scid_len)
-    {
-        // A connection ID of another shard's, on anything but a client's first packet: that shard's connection.
-        const bool initial = (data[0] & 0x80) && ((data[0] & 0x30) >> 4) == 0;
-        const uint32_t owner = vc.dcid[0];
-        if (!initial && owner < ep.shards && owner != ep.shard)
-        {
-            h3_forward(owner, local, local_len, remote, remote_len, data, len);
-            return;
-        }
-    }
-    if (!hc)
-    {
-        ngtcp2_pkt_hd hd{};
-        if (ngtcp2_accept(&hd, data, len) != 0 || ep.conns.size() >= max_conns)
-            return;
-        // A client that has not proven its address is sent a Retry while many handshakes are under way; one that
-        // comes back with the token is let in as the client the first Initial named.
-        ngtcp2_cid odcid{};
-        bool retried = false;
-        if (hd.type == NGTCP2_PKT_INITIAL && hd.tokenlen > 0 && hd.token[0] == NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY2)
-        {
-            if (ngtcp2_crypto_verify_retry_token2(&odcid, hd.token, hd.tokenlen, ep.secret, sizeof ep.secret,
-                                                  hd.version, reinterpret_cast<const sockaddr*>(&remote), remote_len,
-                                                  &hd.dcid, retry_token_timeout_ns, now_ns()) != 0)
-            {
-                // A token this side did not give, or one too old: the client is told so and starts again.
-                uint8_t out[256];
-                const ngtcp2_ssize n = ngtcp2_crypto_write_connection_close(out, sizeof out, hd.version, &hd.scid,
-                                                                            &hd.dcid, NGTCP2_INVALID_TOKEN, nullptr, 0);
-                if (n > 0)
-                    h3_send(local, local_len, remote, remote_len, out, static_cast<size_t>(n), 0);
-                return;
-            }
-            retried = true;
-        }
-        else if (hd.type == NGTCP2_PKT_INITIAL)
-        {
-            // Counted only as far as the bound, so a flood of handshakes, the case the bound is for, stops the scan early.
-            size_t shaking = 0;
-            for (const auto& other : ep.conns)
-                if ((shaking += !other->dead && !ngtcp2_conn_get_handshake_completed(other->q)) >= ep.retry_after)
-                    break;
-            if (shaking >= ep.retry_after)
-            {
-                h3_retry(hd, local, local_len, remote, remote_len);
-                return;
-            }
-        }
-        hc = h3_new_conn(hd, retried ? &odcid : nullptr, local, local_len, remote, remote_len);
-        if (!hc)
-            return;
-    }
-    if (hc->dead)
-        return;
-    ngtcp2_path path{};
-    path.local.addr = reinterpret_cast<sockaddr*>(const_cast<sockaddr_storage*>(&local));
-    path.local.addrlen = local_len;
-    path.remote.addr = reinterpret_cast<sockaddr*>(const_cast<sockaddr_storage*>(&remote));
-    path.remote.addrlen = remote_len;
-    ngtcp2_pkt_info pi{};
-    const int r = ngtcp2_conn_read_pkt(hc->q, &path, &pi, data, len, now_ns());
-    if (r != 0)
-    {
-        if (r == NGTCP2_ERR_DRAINING || r == NGTCP2_ERR_DROP_CONN)
-        {
-            h3_drop(hc);
-            return;
-        }
-        if (r == NGTCP2_ERR_CRYPTO)
-            ngtcp2_ccerr_set_tls_alert(&hc->err, ngtcp2_conn_get_tls_alert(hc->q), nullptr, 0);
-        else if (hc->err.error_code == 0)
-            ngtcp2_ccerr_set_liberr(&hc->err, r, nullptr, 0);
-        h3_close(hc);
-        return;
-    }
-    // The client moved -- a NAT that rebound it, or another network: once ngtcp2 takes the new path, what is sent goes
-    // there, and the requests that follow are judged by the address they now come from.
-    const ngtcp2_path* now = ngtcp2_conn_get_path(hc->q);
-    if (now->remote.addrlen != hc->remote_len || std::memcmp(now->remote.addr, &hc->remote, hc->remote_len) != 0 ||
-        now->local.addrlen != hc->local_len || std::memcmp(now->local.addr, &hc->local, hc->local_len) != 0)
-    {
-        path_addr(now->remote, hc->remote, hc->remote_len);
-        path_addr(now->local, hc->local, hc->local_len);
-        hc->ip = client_ip_from(reinterpret_cast<const sockaddr*>(&hc->remote));
-        hc->peer = peer_text(hc->remote);
-    }
-    h3_dirty(hc);
-}
-
-void storage_run::h3_retry(const ngtcp2_pkt_hd& hd, const sockaddr_storage& local, socklen_t local_len,
-                          const sockaddr_storage& remote, socklen_t remote_len)
-{
-    h3_endpoint& ep = *m_h3;
-    ngtcp2_cid scid{};
-    scid.datalen = scid_len;
-    h3_rand(scid.data, scid.datalen);
-    uint8_t token[NGTCP2_CRYPTO_MAX_RETRY_TOKENLEN2];
-    const ngtcp2_ssize tl = ngtcp2_crypto_generate_retry_token2(token, ep.secret, sizeof ep.secret, hd.version,
-                                                                reinterpret_cast<const sockaddr*>(&remote), remote_len,
-                                                                &scid, &hd.dcid, now_ns());
-    if (tl < 0)
-        return;
-    uint8_t out[1200];
-    const ngtcp2_ssize n = ngtcp2_crypto_write_retry(out, sizeof out, hd.version, &hd.scid, &scid, &hd.dcid, token,
-                                                     static_cast<size_t>(tl));
-    if (n > 0)
-    {
-        h3_send(local, local_len, remote, remote_len, out, static_cast<size_t>(n), 0);
-        ++m_c.h3_retries;
+        case h3::event::conn_opened:   ++m_c.h3_conns;     break;
+        case h3::event::stream_opened: ++m_c.h3_streams;   break;
+        case h3::event::retry_sent:    ++m_c.h3_retries;   break;
+        case h3::event::forwarded:     ++m_c.h3_forwarded; break;
     }
 }
 
-std::shared_ptr<h3_conn> storage_run::h3_new_conn(const ngtcp2_pkt_hd& hd, const ngtcp2_cid* odcid,
-                                                  const sockaddr_storage& local, socklen_t local_len,
-                                                  const sockaddr_storage& remote, socklen_t remote_len)
+void storage_run::h3_sent(size_t n)
 {
-    h3_endpoint& ep = *m_h3;
-    auto hc = std::make_shared<h3_conn>();
-    hc->run = this;
-    hc->local = local;
-    hc->local_len = local_len;
-    hc->remote = remote;
-    hc->remote_len = remote_len;
-    hc->ref.get_conn = get_conn;
-    hc->ref.user_data = hc.get();
-    hc->ip = client_ip_from(reinterpret_cast<const sockaddr*>(&remote));
-    hc->peer = peer_text(remote);
-
-    ngtcp2_cid scid{};
-    scid.datalen = scid_len;
-    h3_rand(scid.data, scid.datalen);
-    scid.data[0] = static_cast<uint8_t>(ep.shard);
-
-    static const ngtcp2_callbacks cb = []
-    {
-        ngtcp2_callbacks c{};
-        c.recv_client_initial = ngtcp2_crypto_recv_client_initial_cb;
-        c.recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
-        c.encrypt = ngtcp2_crypto_encrypt_cb;
-        c.decrypt = ngtcp2_crypto_decrypt_cb;
-        c.hp_mask = ngtcp2_crypto_hp_mask_cb;
-        c.update_key = ngtcp2_crypto_update_key_cb;
-        c.delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
-        c.delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
-        c.get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb;
-        c.version_negotiation = ngtcp2_crypto_version_negotiation_cb;
-        c.rand = rand_cb;
-        c.recv_stream_data = [](ngtcp2_conn*, uint32_t flags, int64_t sid, uint64_t, const uint8_t* data, size_t len,
-                                void* ud, void*) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            if (!hc->h)
-                return 0;
-            const nghttp3_ssize n = nghttp3_conn_read_stream2(hc->h, sid, data, len, flags & NGTCP2_STREAM_DATA_FLAG_FIN,
-                                                              now_ns());
-            if (n < 0)
-            {
-                ngtcp2_ccerr_set_application_error(&hc->err, nghttp3_err_infer_quic_app_error_code(static_cast<int>(n)),
-                                                   nullptr, 0);
-                return NGTCP2_ERR_CALLBACK_FAILURE;
-            }
-            ngtcp2_conn_extend_max_stream_offset(hc->q, sid, static_cast<uint64_t>(n));
-            ngtcp2_conn_extend_max_offset(hc->q, static_cast<uint64_t>(n));
-            return 0;
-        };
-        c.acked_stream_data_offset = [](ngtcp2_conn*, int64_t sid, uint64_t, uint64_t len, void* ud, void*) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            if (hc->h && nghttp3_conn_add_ack_offset(hc->h, sid, len) != 0)
-                return NGTCP2_ERR_CALLBACK_FAILURE;
-            return 0;
-        };
-        c.stream_close2 = [](ngtcp2_conn*, uint32_t flags, int64_t sid, uint64_t rx, uint64_t tx, void* ud, void*) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            if (!hc->h)
-                return 0;
-            uint32_t f = NGHTTP3_STREAM_CLOSE_FLAG_NONE;
-            if (flags & NGTCP2_STREAM_CLOSE2_FLAG_RX_APP_ERROR_CODE_SET)
-                f |= NGHTTP3_STREAM_CLOSE_FLAG_RX_APP_ERROR_CODE_SET;
-            if (flags & NGTCP2_STREAM_CLOSE2_FLAG_TX_APP_ERROR_CODE_SET)
-                f |= NGHTTP3_STREAM_CLOSE_FLAG_TX_APP_ERROR_CODE_SET;
-            const int rv = nghttp3_conn_close_stream2(hc->h, f, sid, rx, tx);
-            return rv == 0 || rv == NGHTTP3_ERR_STREAM_NOT_FOUND ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
-        };
-        c.stream_reset = [](ngtcp2_conn*, int64_t sid, uint64_t, uint64_t, void* ud, void*) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            return !hc->h || nghttp3_conn_shutdown_stream_read(hc->h, sid) == 0 ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
-        };
-        c.stream_stop_sending = [](ngtcp2_conn*, int64_t sid, uint64_t, void* ud, void*) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            return !hc->h || nghttp3_conn_shutdown_stream_read(hc->h, sid) == 0 ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
-        };
-        c.extend_max_remote_streams_bidi = [](ngtcp2_conn*, uint64_t max, void* ud) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            if (hc->h)
-                nghttp3_conn_set_max_client_streams_bidi(hc->h, max);
-            return 0;
-        };
-        c.extend_max_stream_data = [](ngtcp2_conn*, int64_t sid, uint64_t, void* ud, void*) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            return !hc->h || nghttp3_conn_unblock_stream(hc->h, sid) == 0 ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
-        };
-        c.get_new_connection_id2 = [](ngtcp2_conn*, ngtcp2_cid* cid, ngtcp2_stateless_reset_token* token, size_t cidlen,
-                                      void* ud) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            h3_rand(cid->data, cidlen);
-            cid->datalen = cidlen;
-            h3_endpoint& ep = *hc->run->m_h3;
-            if (cidlen > 0)
-                cid->data[0] = static_cast<uint8_t>(ep.shard);
-            if (ngtcp2_crypto_generate_stateless_reset_token(token->data, ep.secret, sizeof ep.secret, cid) != 0)
-                return NGTCP2_ERR_CALLBACK_FAILURE;
-            const std::string k = cid_key(cid->data, cid->datalen);
-            hc->cids.push_back(k);
-            ep.by_cid[k] = hc->shared_from_this();
-            return 0;
-        };
-        c.remove_connection_id = [](ngtcp2_conn*, const ngtcp2_cid* cid, void* ud) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            const std::string k = cid_key(cid->data, cid->datalen);
-            hc->run->m_h3->by_cid.erase(k);
-            std::erase(hc->cids, k);
-            return 0;
-        };
-        c.recv_tx_key = [](ngtcp2_conn*, ngtcp2_encryption_level level, void* ud) -> int
-        {
-            if (level != NGTCP2_ENCRYPTION_LEVEL_1RTT)
-                return 0;
-            auto* hc = static_cast<h3_conn*>(ud);
-            return hc->run->h3_app_ready(*hc) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
-        };
-        return c;
-    }();
-
-    ngtcp2_settings settings;
-    ngtcp2_settings_default(&settings);
-    settings.initial_ts = now_ns();
-    settings.max_window = conn_window_max;
-    settings.max_stream_window = stream_window_max;
-    settings.cc_algo = ep.cc;
-    settings.handshake_timeout = handshake_timeout_ns;
-    if (odcid)
-    {
-        // The address is proven: the amplification limit no longer holds this connection back.
-        settings.token = hd.token;
-        settings.tokenlen = hd.tokenlen;
-        settings.token_type = NGTCP2_TOKEN_TYPE_RETRY;
-    }
-    uint32_t pn = 0;
-    h3_rand(reinterpret_cast<uint8_t*>(&pn), sizeof pn);
-    settings.initial_pkt_num = pn & 0x7fffffff;
-
-    ngtcp2_transport_params params;
-    ngtcp2_transport_params_default(&params);
-    params.initial_max_stream_data_bidi_local = stream_window;
-    params.initial_max_stream_data_bidi_remote = stream_window;
-    params.initial_max_stream_data_uni = stream_window;
-    params.initial_max_data = conn_window;
-    params.initial_max_streams_bidi = max_streams;
-    params.initial_max_streams_uni = 3;
-    params.max_idle_timeout = idle_timeout_ns;
-    params.active_connection_id_limit = 7;
-    params.stateless_reset_token_present = 1;
-    params.original_dcid = odcid ? *odcid : hd.dcid;
-    params.original_dcid_present = 1;
-    if (odcid)
-    {
-        params.retry_scid = hd.dcid;
-        params.retry_scid_present = 1;
-    }
-    if (ngtcp2_crypto_generate_stateless_reset_token(params.stateless_reset_token, ep.secret, sizeof ep.secret,
-                                                     &scid) != 0)
-        return nullptr;
-
-    ngtcp2_path path{};
-    path.local.addr = reinterpret_cast<sockaddr*>(&hc->local);
-    path.local.addrlen = hc->local_len;
-    path.remote.addr = reinterpret_cast<sockaddr*>(&hc->remote);
-    path.remote.addrlen = hc->remote_len;
-    if (ngtcp2_conn_server_new(&hc->q, &hd.scid, &scid, &path, hd.version, &cb, &settings, &params, nullptr, hc.get()) != 0)
-        return nullptr;
-
-    hc->ssl = SSL_new(ep.ctx);
-    if (!hc->ssl || ngtcp2_crypto_ossl_ctx_new(&hc->octx, nullptr) != 0)
-        return nullptr;
-    ngtcp2_crypto_ossl_ctx_set_ssl(hc->octx, hc->ssl);
-    if (ngtcp2_crypto_ossl_configure_server_session(hc->ssl) != 0)
-        return nullptr;
-    SSL_set_app_data(hc->ssl, &hc->ref);
-    SSL_set_accept_state(hc->ssl);
-    ngtcp2_conn_set_tls_native_handle(hc->q, hc->octx);
-
-    for (const ngtcp2_cid* id : std::initializer_list<const ngtcp2_cid*>{&hd.dcid, &scid})
-    {
-        const std::string k = cid_key(id->data, id->datalen);
-        hc->cids.push_back(k);
-        ep.by_cid[k] = hc;
-    }
-    ep.conns.push_back(hc);
-    ++m_c.h3_conns;
-    return hc;
-}
-
-// The handshake's keys for application data are in: HTTP/3's control and QPACK streams are opened.
-bool storage_run::h3_app_ready(h3_conn& hc)
-{
-    if (hc.h)
-        return true;
-    if (ngtcp2_conn_get_streams_uni_left2(hc.q) < 3)
-        return false;
-    static const nghttp3_callbacks cb = []
-    {
-        nghttp3_callbacks c{};
-        c.rand = h3_rand;
-        c.acked_stream_data = [](nghttp3_conn*, int64_t, uint64_t len, void*, void* sud) -> int
-        {
-            if (auto* sc = static_cast<conn*>(sud))
-                sc->run->h3_acked(*sc, len);
-            return 0;
-        };
-        c.stream_close = [](nghttp3_conn*, int64_t sid, uint64_t, void* ud, void*) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            // A request stream done is one more the client may open: ngtcp2 does not give it back by itself.
-            if (ngtcp2_is_bidi_stream(sid) && !ngtcp2_conn_is_local_stream(hc->q, sid))
-                ngtcp2_conn_extend_max_streams_bidi(hc->q, 1);
-            hc->run->h3_stream_closed(*hc, sid);
-            return 0;
-        };
-        c.recv_data = [](nghttp3_conn*, int64_t, const uint8_t* data, size_t len, void* ud, void* sud) -> int
-        {
-            if (auto* sc = static_cast<conn*>(sud))
-                sc->run->h3_data(*sc, std::string_view(reinterpret_cast<const char*>(data), len));
-            else
-                h3_give_back(static_cast<h3_conn*>(ud), len);
-            return 0;
-        };
-        c.deferred_consume = [](nghttp3_conn*, int64_t sid, size_t n, void* ud, void*) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            ngtcp2_conn_extend_max_stream_offset(hc->q, sid, n);
-            ngtcp2_conn_extend_max_offset(hc->q, n);
-            return 0;
-        };
-        c.begin_headers = [](nghttp3_conn*, int64_t sid, void* ud, void*) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            return hc->run->h3_begin(*hc, sid) ? 0 : NGHTTP3_ERR_CALLBACK_FAILURE;
-        };
-        c.recv_header = [](nghttp3_conn*, int64_t, int32_t, nghttp3_rcbuf* name, nghttp3_rcbuf* value, uint8_t, void*,
-                           void* sud) -> int
-        {
-            auto* sc = static_cast<conn*>(sud);
-            if (!sc || !sc->h3s)
-                return 0;
-            const nghttp3_vec n = nghttp3_rcbuf_get_buf(name), v = nghttp3_rcbuf_get_buf(value);
-            auto& f = sc->h3s->fields;
-            f.emplace_back(std::string(reinterpret_cast<const char*>(n.base), n.len),
-                           std::string(reinterpret_cast<const char*>(v.base), v.len));
-            return 0;
-        };
-        c.end_headers = [](nghttp3_conn*, int64_t, int fin, void*, void* sud) -> int
-        {
-            if (auto* sc = static_cast<conn*>(sud))
-                sc->run->h3_request(*sc, fin != 0);
-            return 0;
-        };
-        c.end_stream = [](nghttp3_conn*, int64_t, void*, void* sud) -> int
-        {
-            if (auto* sc = static_cast<conn*>(sud))
-                sc->run->h3_data_end(*sc);
-            return 0;
-        };
-        c.stop_sending = [](nghttp3_conn*, int64_t sid, uint64_t code, void* ud, void*) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            ngtcp2_conn_shutdown_stream_read(hc->q, 0, sid, code);
-            return 0;
-        };
-        c.reset_stream = [](nghttp3_conn*, int64_t sid, uint64_t code, void* ud, void*) -> int
-        {
-            auto* hc = static_cast<h3_conn*>(ud);
-            ngtcp2_conn_shutdown_stream_write(hc->q, 0, sid, code);
-            return 0;
-        };
-        return c;
-    }();
-    nghttp3_settings settings;
-    nghttp3_settings_default(&settings);
-    settings.qpack_max_dtable_capacity = 4096;
-    settings.qpack_blocked_streams = 100;
-    settings.max_field_section_size = 64 * 1024;
-    if (nghttp3_conn_server_new(&hc.h, &cb, &settings, nghttp3_mem_default(), &hc) != 0)
-        return false;
-    nghttp3_conn_set_max_client_streams_bidi(hc.h, ngtcp2_conn_get_local_transport_params2(hc.q)->initial_max_streams_bidi);
-    int64_t ctrl = 0, enc = 0, dec = 0;
-    if (ngtcp2_conn_open_uni_stream(hc.q, &ctrl, nullptr) != 0 || nghttp3_conn_bind_control_stream(hc.h, ctrl) != 0 ||
-        ngtcp2_conn_open_uni_stream(hc.q, &enc, nullptr) != 0 || ngtcp2_conn_open_uni_stream(hc.q, &dec, nullptr) != 0 ||
-        nghttp3_conn_bind_qpack_streams(hc.h, enc, dec) != 0)
-        return false;
-    return true;
+    runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(n));
+    m_c.bytes_out += static_cast<uint64_t>(n);
 }
 
 // ─── A stream's request in ──────────────────────────────────────────────────
 
-bool storage_run::h3_begin(h3_conn& hc, int64_t sid)
+// A stream of this connection, before it knows its head: its conn is this runtime's, and the id is what the
+// endpoint carries so that it can be found again.
+uint64_t storage_run::h3_make_stream(h3::stream& st)
 {
     auto sc = std::make_shared<conn>();
-    sc->run = this;
-    sc->id = m_next_id++;
-    sc->h3s.reset(new h3_stream);
-    sc->h3s->sid = sid;
-    sc->h3s->conn = &hc;
-    sc->quic_ssl = hc.ssl;
-    sc->accepted = sc->last_progress = sc->request_began = std::chrono::steady_clock::now();
-    sc->ip = hc.ip;
-    sc->ip_known = true;
-    sc->peer = hc.peer;
+    sc->run       = this;
+    sc->id        = m_next_id++;
+    sc->h3s       = &st;
+    sc->quic_ssl  = h3::tls_of(st);
+    sc->accepted  = sc->last_progress = sc->request_began = std::chrono::steady_clock::now();
+    if (const sockaddr_storage* a = h3::peer_of(st))
+        sc->ip = client_ip_from(reinterpret_cast<const sockaddr*>(a));
+    sc->ip_known  = true;
+    sc->peer      = h3::peer_text_of(st);
     sc->any_request = true;
-    hc.streams[sid] = sc;
     m_streams[sc->id] = sc;
-    ++m_c.h3_streams;
-    nghttp3_conn_set_stream_user_data(hc.h, sid, sc.get());
-    return true;
+    return sc->id;
 }
 
-void storage_run::h3_request(conn& raw, bool fin)
+// The request as the HTTP/1.1 head parse_head() reads, or the status its head earned instead.
+void storage_run::h3_start_stream(h3::stream& st, mux::request& mr, int answer_status)
 {
-    auto sc = find(raw.id);
-    if (!sc || sc->dead || !sc->h3s)
+    auto sc = find(st.user);
+    if (!sc || sc->dead)
         return;
-    h3_stream& st = *sc->h3s;
-    if (st.opened)
-        return;   // trailers: read, and dropped
-    st.opened = true;
-    st.remote_closed = fin;
-    mux::request mr;
-    const mux::verdict v = mux::request_head(st.fields, fin, max_head, mr);
-    std::vector<std::pair<std::string, std::string>>().swap(st.fields);
-    if (v == mux::verdict::malformed)
-    {
-        ngtcp2_conn_shutdown_stream(st.conn->q, 0, st.sid, NGHTTP3_H3_MESSAGE_ERROR);
-        close_conn(sc);
-        return;
-    }
-    st.synth_chunked = mr.synth_chunked;
-    if (v == mux::verdict::too_large)
+    if (answer_status != 0)
     {
         new_request_id(sc->req.request_id);
         response r;
-        r.status = 431;
+        r.status = answer_status;
         sc->ph = phase::respond;
         send_response(sc, std::move(r));
         return;
@@ -1053,266 +161,42 @@ void storage_run::h3_request(conn& raw, bool fin)
     dispatch(sc);
 }
 
-void storage_run::h3_data(conn& raw, std::string_view data)
+// ─── A stream's body in ─────────────────────────────────────────────────────
+
+bool storage_run::h3_can_take(h3::stream& st)
 {
-    auto sc = find(raw.id);
+    auto sc = find(st.user);
     if (!sc || sc->dead)
-    {
-        if (raw.h3s)
-            h3_give_back(raw.h3s->conn, data.size());
-        return;
-    }
-    sc->last_progress = std::chrono::steady_clock::now();
-    h3_pull(sc, data);
+        return false;
+    return sc->ph != phase::respond && sc->ph != phase::hook_wait && sc->park_off >= sc->park.size();
 }
 
-void storage_run::h3_data_end(conn& raw)
+void storage_run::h3_take(h3::stream& st, const char* d, size_t n)
 {
-    auto sc = find(raw.id);
-    if (!sc || sc->dead || !sc->h3s)
-        return;
-    sc->h3s->remote_closed = true;
-    h3_pull(sc, {});
+    if (auto sc = find(st.user); sc && !sc->dead)
+    {
+        sc->last_progress = std::chrono::steady_clock::now();
+        plain_in(sc, d, n);
+    }
 }
 
-// What came is handed to the phase while it takes it, held when it does not, and given back to QUIC's windows as it
-// is taken -- so a put that cannot keep up stops the client.
 void storage_run::h3_pull(const std::shared_ptr<conn>& c, std::string_view fresh)
 {
-    if (c->dead || !c->h3s)
-        return;
-    h3_stream& st = *c->h3s;
-    // The answer is done and the rest of the body is not read.
-    if (st.end_pending || st.gone)
-    {
-        h3_give_back(st.conn, fresh.size());
-        return;
-    }
-    if (c->pulling)
-    {
-        if (!fresh.empty())
-            st.rxq.emplace_back(fresh);
-        return;
-    }
-    c->pulling = true;
-    uint64_t given = 0;
-    auto open = [&] { return !c->dead && c->ph != phase::respond && c->ph != phase::hook_wait && c->park_off >= c->park.size(); };
-    auto give = [&](const char* d, size_t n)
-    {
-        given += n;
-        if (!st.synth_chunked)
-        {
-            plain_in(c, d, n);
-            return;
-        }
-        char hex[20];
-        const auto r = std::to_chars(hex, hex + sizeof hex, n, 16);
-        std::string framed;
-        framed.reserve(n + 32);
-        framed.append(hex, r.ptr);
-        framed += "\r\n";
-        framed.append(d, n);
-        framed += "\r\n";
-        plain_in(c, framed.data(), framed.size());
-    };
-    while (open() && !st.rxq.empty())
-    {
-        std::string front = std::move(st.rxq.front());
-        st.rxq.pop_front();
-        size_t at = std::exchange(st.rx_head, 0);
-        while (at < front.size() && open())
-        {
-            const size_t n = std::min(pull_slice, front.size() - at);
-            at += n;
-            give(front.data() + at - n, n);
-        }
-        if (at < front.size())
-        {
-            st.rx_head = at;
-            st.rxq.push_front(std::move(front));
-        }
-    }
-    while (!fresh.empty())
-    {
-        if (!open() || !st.rxq.empty())
-        {
-            st.rxq.emplace_back(fresh);
-            break;
-        }
-        const size_t n = std::min(pull_slice, fresh.size());
-        const char* d = fresh.data();
-        fresh.remove_prefix(n);
-        give(d, n);
-    }
-    if (st.synth_chunked && st.remote_closed && !st.chunk_end_given && st.rxq.empty() && open())
-    {
-        st.chunk_end_given = true;
-        static const char end[] = "0\r\n\r\n";
-        plain_in(c, end, sizeof end - 1);
-    }
-    c->pulling = false;
-    if (given && !st.gone && st.conn && st.conn->q)
-    {
-        ngtcp2_conn_extend_max_stream_offset(st.conn->q, st.sid, given);
-        ngtcp2_conn_extend_max_offset(st.conn->q, given);
-        h3_dirty_raw(*st.conn);
-    }
+    if (c->h3s)
+        h3::pull(*c->h3s, fresh);
 }
 
 // ─── A stream's answer out ──────────────────────────────────────────────────
 
-namespace
-{
-
-nghttp3_ssize read_data(nghttp3_conn*, int64_t, nghttp3_vec* vec, size_t veccnt, uint32_t* pflags, void*, void* sud)
-{
-    auto* sc = static_cast<conn*>(sud);
-    if (!sc || !sc->h3s)
-    {
-        *pflags |= NGHTTP3_DATA_FLAG_EOF;
-        return 0;
-    }
-    h3_stream& st = *sc->h3s;
-    size_t n = 0;
-    // The chunks not yet given, from where the last call left off.
-    size_t i = st.tx_given_chunks;
-    size_t off = st.tx_given_front;
-    while (n < veccnt && i < st.tx.size())
-    {
-        const std::string& ch = st.tx[i];
-        if (off < ch.size())
-        {
-            vec[n].base = reinterpret_cast<uint8_t*>(const_cast<char*>(ch.data())) + off;
-            vec[n].len = ch.size() - off;
-            st.tx_given += vec[n].len;
-            ++n;
-        }
-        ++i;
-        off = 0;
-    }
-    st.tx_given_chunks = i;
-    st.tx_given_front = 0;
-    if (st.tx_given == st.tx_total)
-    {
-        if (st.end_pending)
-        {
-            *pflags |= NGHTTP3_DATA_FLAG_EOF;
-            st.ended = true;
-        }
-        else if (n == 0)
-        {
-            st.blocked = true;
-            return NGHTTP3_ERR_WOULDBLOCK;
-        }
-    }
-    return static_cast<nghttp3_ssize>(n);
-}
-
-}   // namespace
-
-void storage_run::h3_acked(conn& raw, uint64_t len)
-{
-    if (!raw.h3s)
-        return;
-    h3_stream& st = *raw.h3s;
-    // Acknowledged bytes are let go from the front; a chunk goes when the whole of it is.
-    st.tx_acked_front += len;
-    while (!st.tx.empty() && st.tx_given_chunks > 0 && st.tx_acked_front >= st.tx.front().size())
-    {
-        st.tx_acked_front -= st.tx.front().size();
-        st.tx.pop_front();
-        --st.tx_given_chunks;
-    }
-}
-
 void storage_run::h3_stream_out(const std::shared_ptr<conn>& c, std::string data)
 {
-    h3_stream& st = *c->h3s;
-    if (st.gone || !st.conn || !st.conn->h)
+    if (!c->h3s)
         return;
-    h3_conn& hc = *st.conn;
-    std::string_view rest = data;
-    while (!rest.empty())
-    {
-        if (st.os == h3_stream::out_state::head)
-        {
-            st.head_acc.append(rest);
-            rest = {};
-            const size_t end = st.head_acc.find("\r\n\r\n");
-            if (end == std::string::npos)
-                break;
-            mux::response mr;
-            mux::response_head(std::string_view(st.head_acc.data(), end + 2), mr);
-            const std::string after = st.head_acc.substr(end + 4);
-            st.head_acc.clear();
-            std::vector<nghttp3_nv> nva;
-            nva.reserve(mr.fields.size() + 1);
-            auto nv = [](std::string_view n, std::string_view v)
-            {
-                return nghttp3_nv{reinterpret_cast<uint8_t*>(const_cast<char*>(n.data())),
-                                  reinterpret_cast<uint8_t*>(const_cast<char*>(v.data())), n.size(), v.size(),
-                                  NGHTTP3_NV_FLAG_NONE};
-            };
-            nva.push_back(nv(":status", mr.status));
-            for (const auto& [n, v] : mr.fields)
-                nva.push_back(nv(n, v));
-            if (mr.interim)
-                nghttp3_conn_submit_info(hc.h, st.sid, nva.data(), nva.size());
-            else
-            {
-                st.os = mr.chunked ? h3_stream::out_state::dechunk : h3_stream::out_state::body;
-                static const nghttp3_data_reader dr{read_data};
-                nghttp3_conn_submit_response(hc.h, st.sid, nva.data(), nva.size(), &dr);
-                st.submitted = true;
-            }
-            if (!after.empty())
-            {
-                data = after;
-                rest = data;
-            }
-            continue;
-        }
-        if (st.os == h3_stream::out_state::body)
-        {
-            const size_t n = rest.size();
-            if (rest.data() == data.data() && n == data.size())
-                st.tx.push_back(std::move(data));
-            else
-                st.tx.emplace_back(rest);
-            st.tx_total += n;
-            rest = {};
-            break;
-        }
-        st.dechunk_in.append(rest);
-        rest = {};
-        std::string_view view = st.dechunk_in;
-        std::string out;
-        for (;;)
-        {
-            std::string_view piece;
-            if (http_chunked_next(st.dechunk, view, piece) != chunk_step::payload)
-                break;
-            out.append(piece);
-        }
-        st.dechunk_in.erase(0, st.dechunk_in.size() - view.size());
-        if (!out.empty())
-        {
-            st.tx_total += out.size();
-            st.tx.push_back(std::move(out));
-        }
-    }
     c->last_progress = std::chrono::steady_clock::now();
     // An answer handed over whole -- send_response's, whose end is already decided -- carries the stream's end with
     // its last bytes, in the same packet, instead of in one of its own a turn later; finish_request still follows
     // for the rest. A chunked one ends with its last chunk, which the stream cannot see coming.
-    if (c->after_write == conn::after_kind::finish && st.submitted && st.os == h3_stream::out_state::body)
-        st.end_pending = true;
-    if (st.submitted && st.blocked)
-    {
-        st.blocked = false;
-        nghttp3_conn_resume_stream(hc.h, st.sid);
-    }
-    h3_dirty_raw(hc);
+    h3::answer(*c->h3s, std::move(data), c->after_write == conn::after_kind::finish);
 }
 
 void storage_run::h3_stream_end(const std::shared_ptr<conn>& c)
@@ -1326,372 +210,53 @@ void storage_run::h3_stream_end(const std::shared_ptr<conn>& c)
     c->sel.reset();
     zip_end(*c);
     c->ph = phase::respond;
-    h3_stream& st = *c->h3s;
-    if (st.gone || !st.conn || !st.conn->h)
-    {
+    if (!c->h3s || !h3::answer_end(*c->h3s))
         close_conn(c);
-        return;
-    }
-    h3_conn& hc = *st.conn;
-    st.end_pending = true;
-    if (!st.submitted)
-    {
-        // An answer with no head would be a broken stream; this one simply ends.
-        ngtcp2_conn_shutdown_stream(hc.q, 0, st.sid, NGHTTP3_H3_INTERNAL_ERROR);
-        close_conn(c);
-        return;
-    }
-    // A body still coming that the answer did not need is not read.
-    if (!st.remote_closed)
-        ngtcp2_conn_shutdown_stream_read(hc.q, 0, st.sid, NGHTTP3_H3_NO_ERROR);
-    h3_drop_rx(st);
-    if (st.blocked)
-    {
-        st.blocked = false;
-        nghttp3_conn_resume_stream(hc.h, st.sid);
-    }
-    h3_dirty_raw(hc);
 }
 
-// QUIC and HTTP/3 are done with the stream: its conn goes, if its answer has not already let it go.
-void storage_run::h3_stream_closed(h3_conn& hc, int64_t sid)
+// A stream whose bytes nghttp3 has all taken is told its write is done, which asks it for the next piece of its
+// file or ends its answer; the turn it is told in is the one the endpoint is finishing.
+void storage_run::h3_write_done(h3::stream& st)
 {
-    auto it = hc.streams.find(sid);
-    if (it == hc.streams.end())
+    auto sc = find(st.user);
+    if (sc && !sc->dead && sc->after_write != conn::after_kind::none)
+        m_h2_due.push_back(sc);
+}
+
+// QUIC and HTTP/3 are done with the stream: its conn goes, and the stream's own state is the endpoint's to let go.
+void storage_run::h3_host_stream_gone(h3::stream& st)
+{
+    auto sc = find(st.user);
+    if (!sc)
         return;
-    auto sc = it->second;
-    h3_drop_rx(*sc->h3s);
-    sc->h3s->gone = true;
-    hc.streams.erase(it);
+    // The session goes with the connection; a conn kept a little longer by an operation in flight must not reach it.
+    sc->quic_ssl = nullptr;
+    sc->h3s = nullptr;
     close_conn(sc);
 }
 
 void storage_run::h3_stream_gone(const std::shared_ptr<conn>& c)
 {
-    h3_stream& st = *c->h3s;
-    if (st.gone || !st.conn)
-        return;
-    h3_drop_rx(st);
-    st.gone = true;
-    h3_conn& hc = *st.conn;
-    // Ended before its answer did: the client is told the request was cancelled.
-    if (!st.ended && hc.q && !hc.dead)
-        ngtcp2_conn_shutdown_stream(hc.q, 0, st.sid, NGHTTP3_H3_REQUEST_CANCELLED);
-    // The reset, or the window its unread body gave back, goes out.
-    h3_dirty_raw(hc);
-    if (hc.h)
-        nghttp3_conn_set_stream_user_data(hc.h, st.sid, nullptr);
-    hc.streams.erase(st.sid);
+    if (h3::stream* st = c->h3s)
+    {
+        c->h3s = nullptr;
+        c->quic_ssl = nullptr;
+        h3::gone(*st);
+    }
 }
 
 bool storage_run::h3_stream_drained(const conn& c) const
 {
-    const h3_stream& st = *c.h3s;
-    return st.os != h3_stream::out_state::head && st.tx_given == st.tx_total;
-}
-
-// ─── Packets out, timers, ends ──────────────────────────────────────────────
-
-void storage_run::h3_dirty(const std::shared_ptr<h3_conn>& hc)
-{
-    if (hc->dirty)
-        return;
-    hc->dirty = true;
-    m_h3->dirty.push_back(hc);
-}
-
-void storage_run::h3_dirty_raw(h3_conn& hc)
-{
-    if (!hc.dirty && !hc.dead)
-        h3_dirty(hc.shared_from_this());
-}
-
-void storage_run::h3_flush_dirty()
-{
-    if (!m_h3)
-        return;
-    std::vector<std::weak_ptr<h3_conn>> due;
-    due.swap(m_h3->dirty);
-    // Only a connection written to can have moved its expiry earlier, so only those are looked at: one whose expiry
-    // moved later leaves the timer early, and h3_expire, finding nothing due, sets it again.
-    uint64_t soonest = UINT64_MAX;
-    for (auto& w : due)
-        if (auto hc = w.lock())
-        {
-            hc->dirty = false;
-            if (!hc->dead)
-                h3_write(hc);
-            if (!hc->dead)
-                soonest = std::min<uint64_t>(soonest, ngtcp2_conn_get_expiry2(hc->q));
-        }
-    h3_arm_timer(soonest);
-}
-
-void storage_run::h3_send(const sockaddr_storage& local, socklen_t, const sockaddr_storage& remote, socklen_t remote_len,
-                          const uint8_t* data, size_t len, size_t gso)
-{
-    h3_endpoint& ep = *m_h3;
-    iovec iov{const_cast<uint8_t*>(data), len};
-    msghdr msg{};
-    msg.msg_name = const_cast<sockaddr_storage*>(&remote);
-    msg.msg_namelen = remote_len;
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    alignas(cmsghdr) char cbuf[CMSG_SPACE(sizeof(in_pktinfo)) + CMSG_SPACE(sizeof(uint16_t))]{};
-    msg.msg_control = cbuf;
-    msg.msg_controllen = sizeof cbuf;
-    cmsghdr* cm = CMSG_FIRSTHDR(&msg);
-    cm->cmsg_level = IPPROTO_IP;
-    cm->cmsg_type = IP_PKTINFO;
-    cm->cmsg_len = CMSG_LEN(sizeof(in_pktinfo));
-    in_pktinfo pi{};
-    pi.ipi_spec_dst = reinterpret_cast<const sockaddr_in*>(&local)->sin_addr;
-    std::memcpy(CMSG_DATA(cm), &pi, sizeof pi);
-    size_t used = CMSG_SPACE(sizeof(in_pktinfo));
-    if (gso && len > gso)
-    {
-        cm = CMSG_NXTHDR(&msg, cm);
-        cm->cmsg_level = IPPROTO_UDP;
-        cm->cmsg_type = UDP_SEGMENT;
-        cm->cmsg_len = CMSG_LEN(sizeof(uint16_t));
-        const uint16_t g = static_cast<uint16_t>(gso);
-        std::memcpy(CMSG_DATA(cm), &g, sizeof g);
-        used += CMSG_SPACE(sizeof(uint16_t));
-    }
-    msg.msg_controllen = used;
-    // A datagram that does not fit the socket's buffer is lost, as one is on the way; QUIC sends it again.
-    const ssize_t n = ::sendmsg(ep.fd, &msg, MSG_DONTWAIT);
-    if (n < 0) {}
-    else
-    {
-        runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(n));
-        m_c.bytes_out += static_cast<uint64_t>(n);
-    }
-}
-
-void storage_run::h3_write(const std::shared_ptr<h3_conn>& hc)
-{
-    h3_endpoint& ep = *m_h3;
-    static const ngtcp2_write_pkt write_pkt = [](ngtcp2_conn* q, ngtcp2_path* path, ngtcp2_pkt_info* pi, uint8_t* dest,
-                                                 size_t destlen, ngtcp2_tstamp ts, void* ud) -> ngtcp2_ssize
-    {
-        auto* hc = static_cast<h3_conn*>(ud);
-        for (;;)
-        {
-            int64_t sid = -1;
-            int fin = 0;
-            nghttp3_vec vec[16];
-            nghttp3_ssize cnt = 0;
-            if (hc->h && ngtcp2_conn_get_max_data_left2(q))
-            {
-                cnt = nghttp3_conn_writev_stream(hc->h, &sid, &fin, vec, 16);
-                if (cnt < 0)
-                {
-                    ngtcp2_ccerr_set_application_error(&hc->err, nghttp3_err_infer_quic_app_error_code(static_cast<int>(cnt)),
-                                                       nullptr, 0);
-                    return NGTCP2_ERR_CALLBACK_FAILURE;
-                }
-            }
-            ngtcp2_ssize ndatalen = 0;
-            uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE | NGTCP2_WRITE_STREAM_FLAG_PADDING;
-            if (fin)
-                flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
-            const ngtcp2_ssize nwrite = ngtcp2_conn_writev_stream(q, path, pi, dest, destlen, &ndatalen, flags, sid,
-                                                                  reinterpret_cast<const ngtcp2_vec*>(vec),
-                                                                  static_cast<size_t>(cnt), ts);
-            if (nwrite < 0)
-            {
-                switch (nwrite)
-                {
-                    case NGTCP2_ERR_STREAM_DATA_BLOCKED:
-                        nghttp3_conn_block_stream(hc->h, sid);
-                        continue;
-                    case NGTCP2_ERR_STREAM_SHUT_WR:
-                        nghttp3_conn_shutdown_stream_write(hc->h, sid);
-                        continue;
-                    case NGTCP2_ERR_WRITE_MORE:
-                        if (nghttp3_conn_add_write_offset(hc->h, sid, static_cast<uint64_t>(ndatalen)) != 0)
-                            return NGTCP2_ERR_CALLBACK_FAILURE;
-                        continue;
-                    default:
-                        ngtcp2_ccerr_set_liberr(&hc->err, static_cast<int>(nwrite), nullptr, 0);
-                        return NGTCP2_ERR_CALLBACK_FAILURE;
-                }
-            }
-            if (ndatalen >= 0 && sid >= 0 &&
-                nghttp3_conn_add_write_offset(hc->h, sid, static_cast<uint64_t>(ndatalen)) != 0)
-                return NGTCP2_ERR_CALLBACK_FAILURE;
-            return nwrite;
-        }
-    };
-    // Bursts while ngtcp2 has packets to give and its pacing lets them go; it says when the next may.
-    for (int round = 0; round < 64 && !hc->dead; ++round)
-    {
-        ngtcp2_path_storage ps;
-        ngtcp2_path_storage_zero(&ps);
-        ngtcp2_pkt_info pi{};
-        size_t gso = 0;
-        const uint64_t ts = now_ns();
-        const ngtcp2_ssize n = ngtcp2_conn_write_aggregate_pkt2(hc->q, &ps.path, &pi, ep.txbuf.data(), ep.txbuf.size(),
-                                                                &gso, write_pkt, gso_burst, ts);
-        if (n < 0)
-        {
-            h3_close(hc);
-            return;
-        }
-        ngtcp2_conn_update_pkt_tx_time(hc->q, ts);
-        if (n == 0)
-            break;
-        // Each burst on the path ngtcp2 wrote it for: the current one, or a path being validated.
-        sockaddr_storage to{}, from{};
-        socklen_t to_len = 0, from_len = 0;
-        path_addr(ps.path.remote, to, to_len);
-        path_addr(ps.path.local, from, from_len);
-        h3_send(from, from_len, to, to_len, ep.txbuf.data(), static_cast<size_t>(n), gso);
-    }
-    // Streams whose bytes nghttp3 has all taken are told their write is done at the end of the turn.
-    for (auto& [sid, sc] : hc->streams)
-        if (!sc->dead && sc->after_write != conn::after_kind::none && h3_stream_drained(*sc))
-            m_h2_due.push_back(sc);
-}
-
-void storage_run::h3_arm_timer(uint64_t soonest)
-{
-    h3_endpoint& ep = *m_h3;
-    if (soonest == UINT64_MAX)
-        return;
-    if (ep.tm_armed && ep.tm_deadline <= soonest)
-        return;
-    if (ep.tm_armed && !m_loop.submit_timeout_remove(&ep.tm)) {}
-    const uint64_t now = now_ns();
-    const uint64_t wait = soonest > now ? soonest - now : 0;
-    __kernel_timespec& ts = ep.ts[ep.ts_at ^= 1];
-    ts.tv_sec = static_cast<long long>(wait / 1000000000ull);
-    ts.tv_nsec = static_cast<long long>(wait % 1000000000ull);
-    ep.tm = io_request{};
-    ep.tm.owner = this;
-    ep.tm_armed = m_loop.submit_timeout(&ts, &ep.tm);
-    ep.tm_deadline = soonest;
-}
-
-void storage_run::h3_expire()
-{
-    h3_endpoint& ep = *m_h3;
-    const uint64_t now = now_ns();
-    std::vector<std::shared_ptr<h3_conn>> due;
-    for (auto& hc : ep.conns)
-        if (!hc->dead && ngtcp2_conn_get_expiry2(hc->q) <= now)
-            due.push_back(hc);
-    for (auto& hc : due)
-    {
-        const int r = ngtcp2_conn_handle_expiry(hc->q, now);
-        if (r != 0)
-        {
-            // Idle past its timeout, or its handshake never finished: it is gone without a word.
-            h3_drop(hc);
-            continue;
-        }
-        h3_dirty(hc);
-    }
-    h3_flush_dirty();
-    // The timer that fired is spent: it is set again by every connection's expiry, those not due included.
-    uint64_t soonest = UINT64_MAX;
-    for (auto& hc : ep.conns)
-        if (!hc->dead)
-            soonest = std::min<uint64_t>(soonest, ngtcp2_conn_get_expiry2(hc->q));
-    h3_arm_timer(soonest);
-}
-
-void storage_run::h3_close(const std::shared_ptr<h3_conn>& hc)
-{
-    if (hc->dead)
-        return;
-    if (!ngtcp2_conn_in_closing_period2(hc->q) && !ngtcp2_conn_in_draining_period2(hc->q))
-    {
-        ngtcp2_path_storage ps;
-        ngtcp2_path_storage_zero(&ps);
-        ngtcp2_pkt_info pi{};
-        uint8_t buf[1500];
-        const ngtcp2_ssize n = ngtcp2_conn_write_connection_close(hc->q, &ps.path, &pi, buf, sizeof buf, &hc->err,
-                                                                  now_ns());
-        if (n > 0)
-        {
-            sockaddr_storage to{}, from{};
-            socklen_t to_len = 0, from_len = 0;
-            path_addr(ps.path.remote, to, to_len);
-            path_addr(ps.path.local, from, from_len);
-            h3_send(from, from_len, to, to_len, buf, static_cast<size_t>(n), 0);
-        }
-    }
-    h3_drop(hc);
-}
-
-void storage_run::h3_drop(const std::shared_ptr<h3_conn>& hc)
-{
-    if (hc->dead)
-        return;
-    hc->dead = true;
-    h3_endpoint& ep = *m_h3;
-    std::vector<std::shared_ptr<conn>> all;
-    for (auto& [sid, sc] : hc->streams)
-        all.push_back(sc);
-    hc->streams.clear();
-    for (auto& sc : all)
-    {
-        sc->h3s->gone = true;
-        sc->h3s->conn = nullptr;
-        // The session goes with the connection; a conn kept a little longer by an operation in flight must not
-        // reach it.
-        sc->quic_ssl = nullptr;
-        close_conn(sc);
-    }
-    for (const std::string& k : hc->cids)
-        if (auto it = ep.by_cid.find(k); it != ep.by_cid.end() && it->second == hc)
-            ep.by_cid.erase(it);
-    std::erase(ep.conns, hc);
-}
-
-size_t storage_run::h3_open_conns() const
-{
-    return m_h3 ? m_h3->conns.size() : 0;
-}
-
-void storage_run::h3_stop()
-{
-    if (!m_h3)
-        return;
-    h3_endpoint& ep = *m_h3;
-    // Every client is told the connection ends, as HTTP/2's GOAWAY tells it.
-    auto all = ep.conns;
-    for (auto& hc : all)
-    {
-        ngtcp2_ccerr_set_application_error(&hc->err, NGHTTP3_H3_NO_ERROR, nullptr, 0);
-        h3_close(hc);
-    }
-    if (ep.tm_armed && !m_loop.submit_timeout_remove(&ep.tm)) {}
-    if (ep.fd >= 0)
-    {
-        m_loop.close_fd(ep.fd);
-        ep.fd = -1;
-    }
-    if (ep.inbox >= 0)
-    {
-        m_loop.close_fd(ep.inbox);
-        ep.inbox = -1;
-    }
+    return c.h3s && c.h3s->drained();
 }
 
 }   // namespace socketley::storage
 
-#else   // !SOCKETLEY_HTTP3
+#else
 
 namespace socketley::storage
 {
-struct h3_endpoint {};
-struct h3_stream {};
-void h3_endpoint_free::operator()(h3_endpoint* e) const { delete e; }
-void h3_stream_free::operator()(h3_stream* s) const { delete s; }
-// Built without HTTP/3: no endpoint is ever opened, so no stream or request of its own reaches these.
+
 bool storage_run::h3_open(uint16_t, uint16_t, uint32_t, uint32_t, const std::string&, const std::string&,
                           const std::string&)
 {
@@ -1707,6 +272,7 @@ bool storage_run::h3_stream_drained(const conn&) const { return true; }
 void storage_run::h3_flush_dirty() {}
 void storage_run::h3_stop() {}
 size_t storage_run::h3_open_conns() const { return 0; }
+
 }   // namespace socketley::storage
 
 #endif
