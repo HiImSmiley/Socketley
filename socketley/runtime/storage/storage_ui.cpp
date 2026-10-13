@@ -1664,10 +1664,17 @@ void storage_run::ui_git(const std::shared_ptr<conn>& c)
         return;
     }
     const std::string& who = c->user->id;
-    std::string o = "{\"available\":" + std::string(m_git.available() ? "true" : "false") +
-                    ",\"why\":" + json_quote(m_git.unavailable_reason()) +
+    // With --sync never no runtime pulls a repository, which the page is told rather than left to find out by a
+    // repository that never runs.
+    const bool pulled = m_git.available() && m_sync_runners != sync_runners::never;
+    const std::string why = !m_git.available() ? m_git.unavailable_reason()
+                            : pulled             ? std::string()
+                                                 : std::string("repositories are pulled by sync runtimes, and this "
+                                                               "storage makes none: --sync is never");
+    std::string o = "{\"available\":" + std::string(pulled ? "true" : "false") +
+                    ",\"why\":" + json_quote(why) +
                     ",\"token\":" + (m_git.has_token(who) ? "true" : "false") +
-                    ",\"runtime\":" + json_quote(sync_runner_name(who)) + ",\"repos\":[";
+                    ",\"runtime\":" + json_quote(sync_runtime_for(who)) + ",\"repos\":[";
     bool first = true;
     for (const git_mirrors::repo& g : m_git.repos())
     {

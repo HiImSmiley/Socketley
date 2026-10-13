@@ -3905,7 +3905,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                  pa.hashes[i] == fnv1a("--nodes") || pa.hashes[i] == fnv1a("--scrub") ||
                  pa.hashes[i] == fnv1a("--compress") || pa.hashes[i] == fnv1a("--tiers") ||
                  pa.hashes[i] == fnv1a("--federation") || pa.hashes[i] == fnv1a("--tls-offloaded") ||
-                 pa.hashes[i] == fnv1a("--fsync-interval")))
+                 pa.hashes[i] == fnv1a("--fsync-interval") || pa.hashes[i] == fnv1a("--sync")))
             {
                 restore_edit();
                 std::cout << pa.args[i] << " cannot be changed with `edit`\n"

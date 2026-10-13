@@ -178,6 +178,8 @@ struct runtime_config
     std::string storage_tls_offloaded;
     std::string storage_nodes;
     std::string storage_fsync;
+    // --sync: never, active or per-user; empty is never.
+    std::string storage_sync;
     uint32_t storage_fsync_interval_secs = 0;
     uint32_t storage_mpu_expire_secs = 0;
     uint32_t storage_scrub_secs = 0;

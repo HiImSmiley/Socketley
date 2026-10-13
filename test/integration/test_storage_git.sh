@@ -19,7 +19,10 @@
 #   refused      a file:// URL, a bad branch and a bad folder name
 #   moved        one in the shared library git goes to git-<owner> at the next
 #                start, backups and all, and the emptied library goes
-#   runtimes     a user with a repository has a sync runtime the storage made, which runs
+#   --sync       never makes no sync runtime and tells the page so; active makes
+#                one for the whole storage, which pulls every user's; per-user
+#                one each
+#   runtimes     with per-user every user has a sync runtime the storage made, which runs
 #                their repositories and goes when the storage stops
 #   remove       a removed repository is no longer listed; its files stay
 set -uo pipefail
@@ -71,7 +74,8 @@ GITD=$!
 for _ in $(seq 1 50); do git ls-remote "git://127.0.0.1:$GP/demo.git" >/dev/null 2>&1 && break; sleep 0.1; done
 
 daemon_start "$BIN"
-"$BIN" create storage st -p "$ST" --dir "$T/st" --credentials "$T/creds" -s >/dev/null 2>&1
+# --sync per-user: a runtime of its own for each user, which is what everything below asks of who runs what.
+"$BIN" create storage st -p "$ST" --dir "$T/st" --credentials "$T/creds" --sync per-user -s >/dev/null 2>&1
 for _ in $(seq 1 100); do curl -s -o /dev/null "http://127.0.0.1:$ST/" && break; sleep 0.1; done
 
 ui() { local who=$1; shift; curl -s -m 10 -u "$who" "$@" "http://127.0.0.1:$ST/~ui/git"; }
@@ -179,14 +183,13 @@ expect "and may not add one into her library" \
 expect "nor run hers" "$(post "$BOB_K:$BOB_S" "{\"action\":\"sync\",\"id\":\"$id\"}")" 404
 
 # ─── whose runtime runs it ──────────────────────────────────────────────────
-# A user with a repository has a sync runtime of their own, made and owned by the storage, which does the runs --
-# and a user with none has none, because a runtime is a process and one that syncs nothing is one nobody asked for.
+# Every user has a sync runtime of their own, made and owned by the storage, which does the runs.
 LS=$("$BIN" ls 2>/dev/null)
-expect "a user with a repository has a sync runtime of their own, owned by the storage" \
-    "$(echo "$LS" | awk '$3 == "sync" && $6 == "st" {print $2}' | sort | tr '\n' ' ')" "st-sync-alice "
-expect "and a user with none has none" "$(echo "$LS" | grep -c 'st-sync-bob')" 0
+expect "every user has a sync runtime of their own, owned by the storage" \
+    "$(echo "$LS" | awk '$3 == "sync" && $6 == "st" {print $2}' | sort | tr '\n' ' ')" "st-sync-alice st-sync-bob "
 expect "the interface names it" "$(ui "$ALICE_K:$ALICE_S" | j "d['runtime']")" st-sync-alice
 expect "and it is what ran alice's repository" "$("$BIN" stats st-sync-alice 2>/dev/null | sed -n 's/^runs://p')" 3
+expect "and no other user's" "$("$BIN" stats st-sync-bob 2>/dev/null | sed -n 's/^runs://p')" 0
 
 # ─── private ────────────────────────────────────────────────────────────────
 code=$(post "$BOB_K:$BOB_S" "{\"action\":\"add\",\"url\":\"git://127.0.0.1:$GP/demo.git\",\"bucket\":\"bobcode\",\"private\":true}")
@@ -259,16 +262,31 @@ expect "the users' sync runtimes go with the storage that made them" "$("$BIN" l
 "$BIN" start st >/dev/null 2>&1
 for _ in $(seq 1 100); do curl -s -o /dev/null "http://127.0.0.1:$ST/" && break; sleep 0.1; done
 
+
+# ─── --sync never and --sync active ─────────────────────────────────────────
+# never is the default: a storage nobody asked for git runtimes from makes none, and its page says why a repository
+# would not run.  active makes exactly one, named after the storage, which pulls every user's repositories.
+NV=$((ST + 7)); AC=$((ST + 8))
+"$BIN" create storage nv -p "$NV" --dir "$T/nv" --credentials "$T/creds" -s >/dev/null 2>&1
+"$BIN" create storage ac -p "$AC" --dir "$T/ac" --credentials "$T/creds" --sync active -s >/dev/null 2>&1
+for _ in $(seq 1 60); do "$BIN" ls 2>/dev/null | awk '$2 == "ac-sync"' | grep -q . && break; sleep 0.5; done
+LS=$("$BIN" ls 2>/dev/null)
+expect "never, the default, makes no sync runtime" "$(echo "$LS" | awk '$3 == "sync" && $6 == "nv"' | wc -l)" 0
+nvpage=$(curl -s -u "$ALICE_K:$ALICE_S" "http://127.0.0.1:$NV/~ui/git" 2>/dev/null)
+expect "and says on the page that no repository would run" \
+    "$(echo "$nvpage" | j "d['available'], 'never' in d['why']" 2>/dev/null)" "(False, True)"
+expect "active makes one sync runtime for the whole storage" \
+    "$(echo "$LS" | awk '$3 == "sync" && $6 == "ac" {print $2}' | tr '\n' ' ')" "ac-sync "
+# Waited for: a worker's figures reach the daemon in its own report, which lands on a turn of its own.
+acusers() { "$BIN" stats ac-sync 2>/dev/null | sed -n 's/^user://p'; }
+for _ in $(seq 1 60); do [ "$(acusers)" = "alice,bob" ] && break; sleep 0.5; done
+expect "which pulls for every user, not for one" "$(acusers)" "alice,bob"
+"$BIN" remove nv >/dev/null 2>&1; "$BIN" remove ac >/dev/null 2>&1
+
 # ─── remove ─────────────────────────────────────────────────────────────────
 expect "a repository is removed" "$(post "$ALICE_K:$ALICE_S" "{\"action\":\"remove\",\"id\":\"$id\"}")" 204
 expect "and no longer listed" "$(ui "$ALICE_K:$ALICE_S" | j "[r['id'] for r in d['repos']].count('$id')")" 0
 expect "while its files stay" "$(s3 "http://127.0.0.1:$ST/code/demo/README.md")" "hello again"
-
-# And her last repository gone takes her runtime with it, which is the other half of making it only when there is
-# something to sync.  Waited for, because the storage looks at its runners on a turn of its own.
-for _ in $(seq 1 60); do "$BIN" ls 2>/dev/null | grep -q 'st-sync-alice' || break; sleep 0.5; done
-expect "and her last repository gone takes her sync runtime with it" \
-    "$("$BIN" ls 2>/dev/null | grep -c 'st-sync-alice')" 0
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

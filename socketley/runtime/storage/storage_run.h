@@ -23,6 +23,7 @@
 
 #include <sys/types.h>
 
+#include "sync_runners.h"
 #include "body_reader.h"
 #include "exif.h"
 #include "bucket_policy.h"
@@ -1377,11 +1378,20 @@ public:
     void op_delete_lifecycle(const std::shared_ptr<conn>& c);
     // Starts a pass when one is due, from the sweep's tick.
     void lifecycle_tick();
-    // Every user a sync runtime of their own, which runs their repositories: made by the first shard, owned by this
-    // runtime, and handed fresh temporary credentials before the last run out.
+    // --sync: which runtimes pull the users' git repositories.  Not changed under a running storage: `edit` refuses
+    // it, as it refuses the storage's other settings, so a new value arrives with a restart.
+    void set_sync_runners(sync_runners r) { m_sync_runners = r; }
+    // The sync runtimes --sync asks for: none, one for the whole storage that pulls every user's repositories, or
+    // one per user that pulls theirs.  Made by the first shard, owned by this runtime, handed fresh temporary
+    // credentials before the last run out, and taken away again when the setting no longer wants them.
     void tend_sync_runners();
     std::string sync_runner_name(std::string_view user) const;
     std::string sync_runner_file(std::string_view user) const;
+    // The one file --sync active hands its runtime, with every user's credentials in it.
+    std::string sync_runner_file_all() const;
+    // The runtime that pulls `user`'s repositories under the current --sync, empty under never.
+    std::string sync_runtime_for(std::string_view user) const;
+    sync_runners m_sync_runners{sync_runners::never};
     int64_t m_runners_at{0};
     std::string m_git_endpoint;
     std::unordered_map<std::string, std::string> m_runners;

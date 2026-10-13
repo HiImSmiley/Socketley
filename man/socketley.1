@@ -1465,6 +1465,9 @@ fsync	string	T{
 .ad l
 "always", "interval" or "never", as \fB\-\-fsync\fR \fB(requires restart)\fR
 T}
+sync	string	T{
+"never", "active" or "per\-user", as \fB\-\-sync\fR; absent is never \fB(requires restart)\fR
+T}
 fsync_interval	number	T{
 .ad l
 Seconds between the filesystem syncs of \fB\-\-fsync interval\fR, as \fB\-\-fsync\-interval\fR \fB(requires restart)\fR
@@ -6585,6 +6588,23 @@ leaves it to the kernel's own writeback. Either way a crash of the process loses
 nothing, and a stop syncs everything before it says it was clean. See
 .BR Durability .
 .TP
+.BI \-\-sync " never" | active | per\-user
+Which
+.B sync
+runtimes the storage makes to pull its users' git repositories:
+.B never
+makes none (the default),
+.B active
+one for the whole storage,
+.B per\-user
+one for each user. Each sync runtime is a process of its own, which is why none
+is made unless asked for. Applied by
+.BR import ;
+a change takes the runtimes a previous setting made away at the storage's next
+start. See
+.B Git repositories
+under the storage runtime.
+.TP
 .BI \-\-fsync\-interval " duration"
 How often
 .B \-\-fsync interval
@@ -10434,12 +10454,25 @@ writes nothing. Every bundle of the last day is kept, and before it the newest
 of each of the last 14 days, 8 weeks and 12 months; the rest are deleted.
 Symbolic links and submodules are no files and are left out.
 .IP
-The runs are each user's own: the runtime's first shard makes every one of its
-users a
+Which runtimes do the runs is
+.BR \-\-sync .
+With
+.B never
+\(em the default \(em the storage makes none, and the page says that a repository
+added would not run. With
+.B active
+the runtime's first shard makes one
 .B sync
-runtime,
-.IB storage \-sync\- user ,
-owned by it, which goes when it stops and comes back when it starts, and which
+runtime for the whole storage,
+.IB storage \-sync ,
+which pulls every user's repositories, each with that user's own credentials.
+With
+.B per\-user
+it makes every one of its users a
+.B sync
+runtime of their own,
+.IB storage \-sync\- user .
+Either is owned by the storage, goes when it stops and comes back when it starts, and is one
 .B "socketley ls"
 and the dashboard list with its
 .BR runs ,

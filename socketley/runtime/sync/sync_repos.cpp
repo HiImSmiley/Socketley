@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 
 #include <sstream>
+#include <vector>
 
 #include "../../shared/logging.h"
 #include "../../shared/replaced_file.h"
@@ -54,21 +55,49 @@ bool repo_runner::reload(std::string& why)
         why = path + " cannot be read";
         return false;
     }
-    m_stamp = stamp;
-    const std::string dir = text_of(doc, "dir"), user = text_of(doc, "user"), endpoint = text_of(doc, "endpoint");
-    if (dir.empty() || user.empty())
+    const std::string dir = text_of(doc, "dir"), endpoint = text_of(doc, "endpoint"), ca = text_of(doc, "ca");
+    const bool tls = flag_of(doc, "tls");
+    // One user's file names them at the top; active's lists every user under "users".
+    std::vector<const socketley::storage::jvalue*> users;
+    for (const auto& [k, v] : doc.members)
+        if (k == "users")
+            for (const auto& u : v.items)
+                users.push_back(&u);
+    if (users.empty() && !text_of(doc, "user").empty())
+        users.push_back(&doc);
+    if (dir.empty() || users.empty())
     {
         why = path + " names no storage directory and no user";
         return false;
     }
-    if (!m_opened || user != m_user)
-        m_git.open_runner(dir, user, endpoint, flag_of(doc, "tls"), text_of(doc, "ca"));
+    m_stamp = stamp;
+    std::map<std::string, pull> next;
+    for (const auto* u : users)
+    {
+        const std::string user = text_of(*u, "user");
+        if (user.empty())
+            continue;
+        // A user already pulled for keeps their mirror, and with it a run already under way.
+        pull p;
+        if (auto it = m_pulls.find(user); it != m_pulls.end())
+            p.git = std::move(it->second.git);
+        else
+        {
+            p.git = std::make_unique<socketley::storage::git_mirrors>();
+            p.git->open_runner(dir, user, endpoint, tls, ca);
+        }
+        p.id.access_key    = text_of(*u, "access_key");
+        p.id.secret        = text_of(*u, "secret");
+        p.id.session_token = text_of(*u, "session_token");
+        p.id.github_token  = text_of(*u, "github_token");
+        next.emplace(user, std::move(p));
+    }
+    // A user no longer in the file is no longer pulled for: their mirror stops, and a run of theirs with it.
+    for (auto& [user, p] : m_pulls)
+        if (!next.contains(user) && p.git)
+            p.git->stop();
+    m_pulls = std::move(next);
     m_opened = true;
-    m_user = user;
-    m_id.access_key = text_of(doc, "access_key");
-    m_id.secret = text_of(doc, "secret");
-    m_id.session_token = text_of(doc, "session_token");
-    m_id.github_token = text_of(doc, "github_token");
     return true;
 }
 
@@ -76,7 +105,10 @@ bool repo_runner::start(std::string& why)
 {
     if (!reload(why))
         return false;
-    LOG_INFO(("sync: pulls the repositories of " + m_user).c_str());
+    std::string who;
+    for (const auto& [user, p] : m_pulls)
+        who += (who.empty() ? "" : ", ") + user;
+    LOG_INFO(("sync: pulls the repositories of " + who).c_str());
     arm_tick();
     return true;
 }
@@ -84,7 +116,9 @@ bool repo_runner::start(std::string& why)
 void repo_runner::stop()
 {
     m_stopped = true;
-    m_git.stop();
+    for (auto& [user, p] : m_pulls)
+        if (p.git)
+            p.git->stop();
     if (m_tick_armed)
         m_loop.submit_timeout_remove(&m_tick_req);
 }
@@ -126,20 +160,39 @@ void repo_runner::on_loop_turn()
     else
         m_problem.clear();
     if (m_opened)
-        m_git.serve(m_id);
+        for (auto& [user, p] : m_pulls)
+            if (p.git)
+                p.git->serve(p.id);
     arm_tick();
 }
 
 std::string repo_runner::stats_lines() const
 {
-    const auto& d = m_git.done();
+    // Summed over the users it pulls for; `user` names them all, so one runtime for a whole storage still says
+    // whose repositories it carries.
+    std::string users, running, last_error;
+    uint64_t repos = 0, runs = 0, failures = 0;
+    for (const auto& [user, p] : m_pulls)
+    {
+        if (!p.git)
+            continue;
+        const auto& d = p.git->done();
+        users += (users.empty() ? "" : ",") + user;
+        repos += p.git->mine();
+        runs += d.runs;
+        failures += d.failures;
+        if (!d.running.empty())
+            running = d.running;
+        if (!d.last_error.empty())
+            last_error = d.last_error;
+    }
     std::ostringstream out;
-    out << "user:" << m_user << "\n"
-        << "repositories:" << const_cast<socketley::storage::git_mirrors&>(m_git).mine() << "\n"
-        << "runs:" << d.runs << "\n"
-        << "failures:" << d.failures << "\n"
-        << "running:" << d.running << "\n"
-        << "last_error:" << (m_problem.empty() ? d.last_error : m_problem) << "\n";
+    out << "user:" << users << "\n"
+        << "repositories:" << repos << "\n"
+        << "runs:" << runs << "\n"
+        << "failures:" << failures << "\n"
+        << "running:" << running << "\n"
+        << "last_error:" << (m_problem.empty() ? last_error : m_problem) << "\n";
     return out.str();
 }
 

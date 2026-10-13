@@ -5,6 +5,8 @@
 #include "../../shared/git_names.h"
 
 #include <algorithm>
+#include <unordered_set>
+#include <dirent.h>
 #include <cerrno>
 #include <charconv>
 #include <cstdlib>
@@ -2790,6 +2792,22 @@ std::string storage_run::sync_runner_file(std::string_view user) const
     return m_store.options().dir + "/.ui/sync/" + sha256_hex(user).substr(0, 32) + ".json";
 }
 
+std::string storage_run::sync_runtime_for(std::string_view user) const
+{
+    switch (m_sync_runners)
+    {
+        case sync_runners::per_user: return sync_runner_name(user);
+        case sync_runners::active:   return std::string(m_owner.get_name()) + "-sync";
+        case sync_runners::never:    break;
+    }
+    return {};
+}
+
+std::string storage_run::sync_runner_file_all() const
+{
+    return m_store.options().dir + "/.ui/sync/all.json";
+}
+
 void storage_run::tend_sync_runners()
 {
     if (m_store.shard() != 0 || !m_auth || !m_git.available() || m_stopped)
@@ -2804,50 +2822,113 @@ void storage_run::tend_sync_runners()
         m_git.set_unavailable("repositories are pulled by sync runtimes, which a runtime outside the daemon cannot make");
         return;
     }
-    // A user's sync runtime is made when they have a repository and not before.  It is a process of its own, so a
-    // storage with users who sync nothing made one for each of them that did nothing but exist: measured on a live
-    // runtime, seven repositories all belonging to one user and a runtime each for the other two.  The list is the
-    // one the runtime already keeps, cached against the file's mtime, so asking it every turn costs nothing; a
-    // user's first repository brings their runtime up within the ten seconds below, and their last one taking it
-    // away is the removal at the end of this function.
-    std::unordered_set<std::string> syncing;
-    for (const auto& r : m_git.repos())
-        syncing.insert(r.owner);
-    std::unordered_map<std::string, std::string> want;
+    // The users a runtime pulls for: every user who is a person and not another node of a cluster.
+    std::vector<std::string> people;
     for (const auto& u : m_auth->users())
-        if (!u->cluster && syncing.contains(u->id))
-            want.emplace(sync_runner_name(u->id), u->id);
+        if (!u->cluster)
+            people.push_back(u->id);
+    std::sort(people.begin(), people.end());
+
+    // Which runtimes --sync wants, by name, each with the user its file is for -- or empty for active's one runtime,
+    // whose file carries every user.  never wants none, and the removal at the end takes away whatever an earlier
+    // setting made, so changing the setting needs nothing beyond a restart.
+    std::unordered_map<std::string, std::string> want;
+    if (m_sync_runners == sync_runners::per_user)
+        for (const auto& id : people)
+            want.emplace(sync_runner_name(id), id);
+    else if (m_sync_runners == sync_runners::active && !people.empty())
+        want.emplace(sync_runtime_for({}), std::string());
+
+    // The sync runtimes this storage made before a restart are runtimes of the daemon, owned by it, which this
+    // runtime's own table forgot -- so they are found again here, and a setting that no longer wants them takes
+    // them away below rather than leaving them running for ever.
+    {
+        std::shared_lock lock(mgr->mutex);
+        for (const auto& [rname, rt] : mgr->list())
+            if (rt && rt->get_type() == runtime_sync && rt->get_owner() == m_owner.get_name() &&
+                !m_runners.contains(rname))
+                m_runners.emplace(rname, std::string(1, '\0'));
+    }
+
     const std::string dir = m_store.options().dir + "/.ui/sync";
-    if (::mkdir((m_store.options().dir + "/.ui").c_str(), 0700) < 0 && errno != EEXIST) {}
-    if (::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST)
-        return;
+    if (!want.empty())
+    {
+        if (::mkdir((m_store.options().dir + "/.ui").c_str(), 0700) < 0 && errno != EEXIST) {}
+        if (::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST)
+            return;
+    }
+    // A user's part of a runner's file: who they are and the credentials and GitHub token a run signs with, issued
+    // for twelve hours.
+    auto credentials_of = [&](const std::string& user, int64_t& expires) -> std::string
+    {
+        session_credentials creds;
+        std::string o = "\"user\":" + json_quote(user);
+        if (m_auth->issue_session_as(user, now + 12 * 3600, "", "", creds))
+        {
+            o += ",\"access_key\":" + json_quote(creds.access_key) + ",\"secret\":" + json_quote(creds.secret) +
+                 ",\"session_token\":" + json_quote(creds.token) + ",\"expires\":" + std::to_string(creds.expires) +
+                 ",\"github_token\":" + json_quote(m_git.token_of(*m_auth, user));
+            expires = creds.expires;
+        }
+        return o;
+    };
+    const std::string where = "\"dir\":" + json_quote(m_store.options().dir) + ",\"endpoint\":" +
+                              json_quote(m_git_endpoint) + ",\"tls\":" + (m_tls ? "true" : "false") +
+                              ",\"ca\":" + json_quote(std::string(m_owner.get_cert_path()));
+    // What a file last said: when its first credentials run out, and -- for active's -- whose they are.
+    auto read_back = [](const std::string& file, int64_t& expires, std::string& users)
+    {
+        std::string text;
+        jvalue was;
+        if (!read_whole_file(file, text) || !json_reader(text).document(was))
+            return;
+        for (const auto& [k, v] : was.members)
+        {
+            if (k == "expires")
+                expires = std::strtoll(v.s.c_str(), nullptr, 10);
+            else if (k == "people")
+                users = v.s;
+        }
+    };
+
     std::string why;
     for (const auto& [name, user] : want)
     {
-        // What the runner reads: where the storage is, and the user's temporary credentials, made again with three
-        // of their twelve hours left.
-        const std::string file = sync_runner_file(user);
-        std::string text;
-        jvalue was;
+        // Made again with three of the twelve hours left, and for active's also when the users are not the ones it
+        // was made for -- a user added must be pulled for, and a user removed must not be.
+        const bool all = user.empty();
+        const std::string file = all ? sync_runner_file_all() : sync_runner_file(user);
+        std::string people_key;
+        for (const auto& id : people)
+            people_key += id + '\n';
+        people_key = sha256_hex(people_key);
         int64_t expires = 0;
-        if (read_whole_file(file, text) && json_reader(text).document(was))
-            for (const auto& [k, v] : was.members)
-                if (k == "expires")
-                    expires = std::strtoll(v.s.c_str(), nullptr, 10);
-        if (expires - now < 3 * 3600)
+        std::string had;
+        read_back(file, expires, had);
+        if (expires - now < 3 * 3600 || (all && had != people_key))
         {
-            session_credentials creds;
-            const bool have = m_auth->issue_session_as(user, now + 12 * 3600, "", "", creds);
-            std::string o = "{\"dir\":" + json_quote(m_store.options().dir) + ",\"user\":" + json_quote(user) +
-                            ",\"endpoint\":" + json_quote(m_git_endpoint) + ",\"tls\":" + (m_tls ? "true" : "false") +
-                            ",\"ca\":" + json_quote(std::string(m_owner.get_cert_path()));
-            if (have)
-                o += ",\"access_key\":" + json_quote(creds.access_key) + ",\"secret\":" + json_quote(creds.secret) +
-                     ",\"session_token\":" + json_quote(creds.token) + ",\"expires\":" + std::to_string(creds.expires) +
-                     ",\"github_token\":" + json_quote(m_git.token_of(*m_auth, user));
-            o += "}\n";
+            std::string o;
+            if (all)
+            {
+                int64_t earliest = INT64_MAX;
+                std::string list;
+                for (const auto& id : people)
+                {
+                    int64_t e = 0;
+                    list += (list.empty() ? "{" : ",{") + credentials_of(id, e) + "}";
+                    if (e)
+                        earliest = std::min(earliest, e);
+                }
+                o = "{" + where + ",\"users\":[" + list + "],\"people\":" + json_quote(people_key) +
+                    ",\"expires\":" + std::to_string(earliest == INT64_MAX ? 0 : earliest) + "}\n";
+            }
+            else
+            {
+                int64_t e = 0;
+                o = "{" + where + "," + credentials_of(user, e) + "}\n";
+            }
             if (!replace_file(file, o, false))
-                LOG_WARN(("storage: the sync runtime of " + user + " could not be handed its credentials").c_str());
+                LOG_WARN(("storage: the sync runtime " + name + " could not be handed its credentials").c_str());
         }
         bool there = false;
         {
@@ -2857,7 +2938,7 @@ void storage_run::tend_sync_runners()
                 there = true;
                 if (rt->get_owner() != m_owner.get_name())
                 {
-                    LOG_WARN(("storage: " + name + " is another runtime, so " + user + " has no sync runtime").c_str());
+                    LOG_WARN(("storage: " + name + " is another runtime, so it is not this storage's sync runtime").c_str());
                     continue;
                 }
             }
@@ -2875,7 +2956,7 @@ void storage_run::tend_sync_runners()
         state_persistence codec{std::filesystem::path{}};
         if (!mgr->map_mutate("create", name, codec.format_json_pretty(c), why))
         {
-            LOG_WARN(("storage: the sync runtime of " + user + " could not be made: " + why).c_str());
+            LOG_WARN(("storage: the sync runtime " + name + " could not be made: " + why).c_str());
             continue;
         }
         runtime_manager::replica_entry re;
@@ -2884,7 +2965,7 @@ void storage_run::tend_sync_runners()
         re.state = runtime_running;
         re.owner = c.owner;
         mgr->replica_note("create", name, re);
-        LOG_INFO(("storage: " + user + " has the sync runtime " + name).c_str());
+        LOG_INFO(("storage: " + (all ? std::string("every user's repositories are pulled by ") : user + " has the sync runtime ") + name).c_str());
     }
     for (auto it = m_runners.begin(); it != m_runners.end();)
     {
@@ -2895,8 +2976,22 @@ void storage_run::tend_sync_runners()
         }
         if (!mgr->map_mutate("remove", it->first, {}, why))
             LOG_WARN(("storage: " + it->first + " could not be removed: " + why).c_str());
-        ::unlink(sync_runner_file(it->second).c_str());
         it = m_runners.erase(it);
+    }
+    // And every credentials file no wanted runtime reads goes too: they hold live session tokens, and a runtime
+    // found again after a restart does not say whose file it had.
+    std::unordered_set<std::string> keep;
+    for (const auto& [name, user] : want)
+        keep.insert(user.empty() ? sync_runner_file_all() : sync_runner_file(user));
+    if (DIR* d = ::opendir(dir.c_str()))
+    {
+        while (const dirent* e = ::readdir(d))
+        {
+            const std::string_view n(e->d_name);
+            if (n.size() > 5 && n.substr(n.size() - 5) == ".json" && !keep.contains(dir + "/" + std::string(n)))
+                ::unlink((dir + "/" + std::string(n)).c_str());
+        }
+        ::closedir(d);
     }
 }
 

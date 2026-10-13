@@ -178,6 +178,8 @@ void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool
         stg.set_nodes_file(cfg.storage_nodes);
     if (asked("fsync", !cfg.storage_fsync.empty()))
         stg.set_fsync(cfg.storage_fsync);
+    if (asked("sync", !cfg.storage_sync.empty()))
+        stg.set_sync(cfg.storage_sync);
     if (asked("fsync_interval", cfg.storage_fsync_interval_secs > 0))
         stg.set_fsync_interval_secs(cfg.storage_fsync_interval_secs);
     if (asked("mpu_expire", cfg.storage_mpu_expire_secs > 0))

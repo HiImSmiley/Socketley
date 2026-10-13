@@ -112,6 +112,9 @@ public:
     // before a stop.
     void set_fsync(std::string_view m) { m_fsync = std::string(m); }
     std::string_view get_fsync() const { return m_fsync; }
+    // Which sync runtimes it makes for its users' git repositories: never, active or per-user.
+    void set_sync(std::string_view m) { m_sync = std::string(m); }
+    std::string_view get_sync() const { return m_sync; }
     // The interval of --fsync interval, 0 for its default of a second.
     void set_fsync_interval_secs(uint32_t s) { m_fsync_interval_secs = s; }
     uint32_t get_fsync_interval_secs() const { return m_fsync_interval_secs; }
@@ -175,6 +178,7 @@ private:
     std::string m_tls_offloaded;
     std::string m_cluster_file;
     std::string m_fsync;
+    std::string m_sync{"never"};
     uint32_t    m_fsync_interval_secs{0};
     uint32_t    m_mpu_expire_secs{0};
     uint32_t    m_scrub_secs{0};

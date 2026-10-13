@@ -126,6 +126,7 @@ constexpr config_key config_keys[] = {
     { "tls_offloaded",      "--tls-offloaded",      key_kind::text    },
     { "nodes",              "--nodes",              key_kind::text    },
     { "fsync",              "--fsync",              key_kind::text    },
+    { "sync",               "--sync",               key_kind::text    },
     { "fsync_interval",     "--fsync-interval",     key_kind::scalar  },
     { "mpu_expire",         "--mpu-expire",         key_kind::scalar  },
     { "scrub",              "--scrub",              key_kind::scalar  },

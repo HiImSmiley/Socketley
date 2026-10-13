@@ -1,11 +1,15 @@
 #pragma once
-// A user's own sync runtime, made by a storage runtime for each of its users: it pulls that user's git repositories
-// into their libraries, one at a time, when they are due or asked for, as `socketley git-sync` children.
+// A sync runtime a storage runtime makes to pull git repositories into its users' libraries, one at a time, when
+// they are due or asked for, as `socketley git-sync` children.  With --sync per-user it is one user's; with --sync
+// active it is the one runtime of the whole storage and pulls every user's, each with that user's own credentials,
+// so one user's repositories are never fetched or written with another's rights.
 //
 // What it needs it reads from the file --repositories names, which the storage writes and makes again before the
 // temporary credentials in it run out: the storage's directory, where the list and each repository's state are, the
-// address it is reached on, the user, and the credentials and GitHub token a run signs and fetches with.
+// address it is reached on, and for each user the credentials and GitHub token a run signs and fetches with.
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <string>
 
 #include "../../shared/event_loop.h"
@@ -38,9 +42,13 @@ private:
 
     sync_instance& m_rt;
     event_loop&    m_loop;
-    socketley::storage::git_mirrors m_git;
-    socketley::storage::git_mirrors::identity m_id;
-    std::string m_user;
+    // One per user this runtime pulls for: their repositories, and the identity their runs sign with.
+    struct pull
+    {
+        std::unique_ptr<socketley::storage::git_mirrors> git;
+        socketley::storage::git_mirrors::identity id;
+    };
+    std::map<std::string, pull> m_pulls;
     int64_t     m_stamp{-1};
     bool        m_opened{false};
     std::string m_problem;

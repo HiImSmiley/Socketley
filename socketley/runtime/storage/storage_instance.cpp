@@ -1,4 +1,5 @@
 #include "storage_instance.h"
+#include "sync_runners.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -178,6 +179,20 @@ bool storage_instance::serve_deferred(uint64_t ticket, std::string_view, std::st
     return true;
 }
 
+namespace
+{
+
+// The setting a stored name gives; one that is not a setting at all -- a hand-edited state file -- is never, which
+// makes nothing rather than guessing.
+socketley::storage::sync_runners sync_runners_of(std::string_view name)
+{
+    socketley::storage::sync_runners r{socketley::storage::sync_runners::never};
+    socketley::storage::parse_sync_runners(name, r);
+    return r;
+}
+
+}   // namespace
+
 void storage_instance::refresh_cached_limits()
 {
     m_max_conns_cached = get_max_connections();
@@ -187,6 +202,7 @@ void storage_instance::refresh_cached_limits()
         m_run->set_mpu_expire_secs(m_mpu_expire_secs);
         m_run->set_scrub_secs(m_scrub_secs);
         m_run->set_compress_secs(m_compress_secs);
+        m_run->set_sync_runners(sync_runners_of(m_sync));
     }
 }
 
@@ -309,6 +325,7 @@ bool storage_instance::setup(event_loop& loop)
     run->set_mpu_expire_secs(m_mpu_expire_secs);
     run->set_scrub_secs(m_scrub_secs);
     run->set_compress_secs(m_compress_secs);
+    run->set_sync_runners(sync_runners_of(m_sync));
     run->set_acls_default(m_acls);
     run->set_tls(std::move(tls));
     if (std::vector<std::string> d; !m_domain.empty())

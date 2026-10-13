@@ -24,6 +24,7 @@
 #include "../shared/dns_feed.h"
 #include "../runtime/storage/s3_vhost.h"
 #include "../runtime/storage/sync_mode.h"
+#include "../runtime/storage/sync_runners.h"
 
 // Five flags that describe inbound traffic are refused on a client, which
 // accepts none, because they were stored and reported by `show` while no code
@@ -1730,6 +1731,18 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
                 return 1;
             }
             stg->set_fsync(pa.args[++i]);
+            return 0;
+        }
+        // Which sync runtimes pull the users' git repositories: none, one for the storage, or one per user.
+        case fnv1a("--sync"):
+        {
+            socketley::storage::sync_runners r;
+            if (i + 1 >= pa.count || !socketley::storage::parse_sync_runners(pa.args[i + 1], r))
+            {
+                std::cout << "--sync requires never, active or per-user\n";
+                return 1;
+            }
+            stg->set_sync(pa.args[++i]);
             return 0;
         }
         case fnv1a("--fsync-interval"):

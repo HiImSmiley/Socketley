@@ -119,6 +119,7 @@ constexpr row rows[] = {
     {"--compress", "T", "duration", "Compress after", "Compress a version unwritten this long; never unless given.", "Durability", {}, "7d"},
     {"--mpu-expire", "T", "duration", "Abort uploads after", "Abort a multipart upload open this long; never unless given.", "Durability", {}, "7d"},
     {"--sse-key-file", "T", "path", "Encryption key", "The 32-byte master key of server-side encryption.", "Storage extras", {}, "/etc/socketley/sse.key"},
+    {"--sync", "T", "choice", "Sync runtimes", "Runtimes that pull users' git repositories: none, one for all, or one each.", "Storage extras", "never,active,per-user"},
     {"--acls", "T", "switch", "ACLs", "Buckets without ownership controls take ACLs.", "Storage extras"},
     {"--notify-targets", "T", "path", "Webhooks", "The webhooks event notifications may go to.", "Storage extras"},
     {"--replication-targets", "T", "path", "Replication targets", "The S3 endpoints buckets may replicate to.", "Storage extras"},
