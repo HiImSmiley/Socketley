@@ -307,8 +307,13 @@ void reset_stream(session<S>& s, uint32_t sid, uint32_t code, Host& host)
     host.count(event::reset_out);
     if (auto it = s.streams.find(sid); it != s.streams.end())
     {
-        state_of(it->second).reset = true;
-        host.stream_gone(it->second);
+        // The handle is copied out of the map first: stream_gone() is what ends the stream, and ending it erases
+        // this entry -- so a reference into the map would name a handle already destroyed.  The code this was
+        // lifted from took the copy for the same reason, and taking a reference instead is a use-after-free the
+        // sanitizer found on the first streamed GET that was abandoned mid-read.
+        S h = it->second;
+        state_of(h).reset = true;
+        host.stream_gone(h);
     }
 }
 
@@ -636,8 +641,10 @@ bool feed(session<S>& s, std::string& frag, const char* p, size_t n, size_t max_
                 }
                 if (auto it = s.streams.find(h.sid); it != s.streams.end())
                 {
-                    state_of(it->second).reset = true;
-                    host.stream_gone(it->second);
+                    // Copied out of the map first, for the reason given in reset_stream().
+                    S hnd = it->second;
+                    state_of(hnd).reset = true;
+                    host.stream_gone(hnd);
                 }
                 break;
             }
