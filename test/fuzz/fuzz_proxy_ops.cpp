@@ -1777,7 +1777,7 @@ void client_send(world& w, int idx, int shape)
         // so it has no rewriter with which to add the "close" connection option
         // Section 9.6 says a server SHOULD send back.  The undertaking is real
         // and only the connection state records it.
-        proxy_ending = (cc == nullptr) || cc->closing || cc->client_conn_close;
+        proxy_ending = (cc == nullptr) || cc->closing || cc->ex.client_conn_close;
     }
 
     if (static_cast<size_t>(n) == buf.size() && whole > 0 &&
@@ -2940,8 +2940,8 @@ void expire_deadlines(world& w)
         if (fd < 0 || fd >= proxy_instance::MAX_FDS || !rt->m_client_slots[fd])
             continue;
         auto* c = rt->m_client_slots[fd];
-        if (c->awaiting_response) c->response_deadline = past;
-        if (c->awaiting_headers)  c->header_deadline = past;
+        if (c->ex.awaiting_response) c->ex.response_deadline = past;
+        if (c->ex.awaiting_headers)  c->ex.header_deadline = past;
     }
     rt->response_deadline_sweep();
 }

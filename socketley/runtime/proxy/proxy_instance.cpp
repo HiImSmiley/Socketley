@@ -64,16 +64,16 @@ static inline bool backend_endpoint_of(const proxy_client_connection* cconn,
 {
     if (!cconn)
         return false;
-    if (cconn->backend_from_group)
+    if (cconn->ex.backend_from_group)
     {
-        host = cconn->backend_host;
-        port = cconn->backend_port;
+        host = cconn->ex.backend_host;
+        port = cconn->ex.backend_port;
     }
     else
     {
-        if (cconn->backend_idx >= backends.size())
+        if (cconn->ex.backend_idx >= backends.size())
             return false;
-        const auto& b = backends[cconn->backend_idx];
+        const auto& b = backends[cconn->ex.backend_idx];
         if (b.is_group)
             return false;  // routed to a group without the per-request endpoint
         host = b.resolved_host;
@@ -291,13 +291,8 @@ void proxy_client_connection::reset(int new_fd)
     splice_active = false;
     splice_in_pending = false;
     splice_out_pending = false;
-    header_parsed = false;
-    response_started = false;
-    client_conn_close = false;
     wr_shutdown = false;
-    drain_on_close = false;
     drained_reads = 0;
-    backend_fd = -1;
     write_batch_count = 0;
     drained_bytes = 0;
     read_req = {};
@@ -312,34 +307,16 @@ void proxy_client_connection::reset(int new_fd)
     // are a guard against a path that does not exist.
     if (pipe_to_backend[0] >= 0) { close(pipe_to_backend[0]); pipe_to_backend[0] = -1; }
     if (pipe_to_backend[1] >= 0) { close(pipe_to_backend[1]); pipe_to_backend[1] = -1; }
-    method.clear();
-    path.clear();
-    version.clear();
-    host.clear();
-    host_fields = 0;
-    via_loop = false;
-    filter_headers.clear();
-    filter_removed_headers.clear();
-    declared_body_len = 0;
-    declared_body_chunked = false;
-    body_remaining = 0;
-    body_unbounded = false;
-    req_chunk = {};
+    // The whole of the last exchange in one assignment, which is what this object is for: a field added to
+    // proxy_exchange cannot be left behind here for the next connection out of the pool to find.
+    ex = {};
     peer_addr.clear();
     last_activity = {};
-    retries_remaining = 0;
-    backend_idx = 0;
-    saved_request.clear();
     parked_backend_fd = -1;
     kept_alive = false;
-    reissue_ok = false;
     SKL_TRACE_RESET(*this);
     SKL_INV_RESET(*this);
     client_eof = false;
-    backend_half_closed = false;
-    backend_from_group = false;
-    backend_host.clear();
-    backend_port = 0;
     // A struct out of the pool must not carry the previous connection's
     // allowance, nor a limit this proxy is not configured with.
     rl_tokens = 0.0;
@@ -350,10 +327,6 @@ void proxy_client_connection::reset(int new_fd)
     connect_req = {};
     abort_watch_pending = false;
     abort_req = {};
-    awaiting_response = false;
-    response_deadline = {};
-    awaiting_headers = false;
-    header_deadline = {};
 }
 
 void proxy_backend_connection::reset(int new_fd)
@@ -495,10 +468,10 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
     conn->write_queue.clear();
     for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
     conn->write_batch_count = 0;
-    conn->method.clear();
-    conn->path.clear();
-    conn->version.clear();
-    conn->saved_request.clear();
+    conn->ex.method.clear();
+    conn->ex.path.clear();
+    conn->ex.version.clear();
+    conn->ex.saved_request.clear();
 
     SKL_INV_POOLABLE("proxy::client_pool_release", conn->fd,
         conn->read_pending || conn->write_pending ||
@@ -542,7 +515,7 @@ std::unique_ptr<proxy_backend_connection> proxy_instance::backend_pool_acquire(
     conn->client_fd = cconn ? cconn->fd : -1;
     // Only ever set, never cleared, so a HEAD answered 204 agrees with itself
     // when the header scan reaches the same conclusion by its own road.
-    if (cconn && cconn->method == "HEAD")
+    if (cconn && cconn->ex.method == "HEAD")
         conn->http_frame.no_body = true;
     return conn;
 }
@@ -1116,9 +1089,9 @@ bool proxy_instance::backend_read_armable(const proxy_backend_connection* conn) 
 
 bool proxy_instance::backend_backpressured(const proxy_client_connection* conn) const
 {
-    if (conn->backend_fd < 0 || conn->backend_fd >= MAX_FDS)
+    if (conn->ex.backend_fd < 0 || conn->ex.backend_fd >= MAX_FDS)
         return false;
-    const auto& be = m_conn_idx[conn->backend_fd];
+    const auto& be = m_conn_idx[conn->ex.backend_fd];
     return be.side == conn_backend &&
            be.backend->write_queue.bytes() >= write_watermark_bytes();
 }
@@ -1280,7 +1253,7 @@ void proxy_instance::finish_client_recv_withdraw(proxy_client_connection* conn,
     if (SOCKETLEY_UNLIKELY(conn->closing))
     {
         if (!conn->write_pending)
-            close_pair(fd, conn->backend_fd);
+            close_pair(fd, conn->ex.backend_fd);
         return;
     }
 
@@ -1291,7 +1264,7 @@ void proxy_instance::finish_client_recv_withdraw(proxy_client_connection* conn,
     if (!client_read_armable(conn) || backend_backpressured(conn))
         return;
     if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
-        close_pair(fd, conn->backend_fd);
+        close_pair(fd, conn->ex.backend_fd);
 }
 
 // The withdrawal landing.
@@ -2482,7 +2455,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                     {
                         auto* cconn = m_client_slots[cfd];
                         if (!cconn || cconn->closing) continue;
-                        close_pair(cfd, cconn->backend_fd, close_reason::force);
+                        close_pair(cfd, cconn->ex.backend_fd, close_reason::force);
                     }
                 }
 
@@ -2513,7 +2486,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                     {
                         auto* cconn = m_client_slots[cfd];
                         if (!cconn || cconn->closing) continue;
-                        close_pair(cfd, cconn->backend_fd, close_reason::force);
+                        close_pair(cfd, cconn->ex.backend_fd, close_reason::force);
                         ++hs_dropped;
                     }
                     // Once for the tick, not once per connection: the attack
@@ -2676,7 +2649,7 @@ void proxy_instance::inv_check_pair(int fd, const char* where)
     if (entry.side == conn_client)
     {
         cconn = entry.client;
-        const int bfd = cconn->backend_fd;
+        const int bfd = cconn->ex.backend_fd;
         if (bfd >= 0 && bfd < MAX_FDS && m_conn_idx[bfd].side == conn_backend)
             bconn = m_conn_idx[bfd].backend;
     }
@@ -2752,17 +2725,17 @@ uint64_t proxy_instance::inv_digest(const proxy_client_connection* c)
     h = inv_mix(h, c->write_queue.bytes());
     h = inv_mix(h, c->write_queue.size());
     h = inv_mix(h, c->write_batch_count);
-    h = inv_mix(h, c->declared_body_len);
-    h = inv_mix(h, c->body_remaining);
-    h = inv_mix(h, static_cast<uint64_t>(c->backend_fd));
+    h = inv_mix(h, c->ex.declared_body_len);
+    h = inv_mix(h, c->ex.body_remaining);
+    h = inv_mix(h, static_cast<uint64_t>(c->ex.backend_fd));
     h = inv_mix(h, static_cast<uint64_t>(c->parked_backend_fd));
-    h = inv_mix(h, c->backend_idx);
-    h = inv_mix(h, c->backend_port);
-    h = inv_mix(h, static_cast<uint64_t>(c->retries_remaining));
+    h = inv_mix(h, c->ex.backend_idx);
+    h = inv_mix(h, c->ex.backend_port);
+    h = inv_mix(h, static_cast<uint64_t>(c->ex.retries_remaining));
     h = inv_mix(h, static_cast<uint64_t>(c->connect_fd));
     h = inv_mix(h, static_cast<uint64_t>(c->tls_state));
-    h = inv_mix(h, c->saved_request.size());
-    h = inv_mix(h, c->method.size() + c->path.size() + c->version.size());
+    h = inv_mix(h, c->ex.saved_request.size());
+    h = inv_mix(h, c->ex.method.size() + c->ex.path.size() + c->ex.version.size());
 
     // One word of flags, where a flag that flips and flips back between two
     // completions is invisible, because the digest compares against the
@@ -2774,21 +2747,21 @@ uint64_t proxy_instance::inv_digest(const proxy_client_connection* c)
     f |= uint64_t(c->splice_active)         << 4;
     f |= uint64_t(c->splice_in_pending)     << 5;
     f |= uint64_t(c->splice_out_pending)    << 6;
-    f |= uint64_t(c->header_parsed)         << 7;
-    f |= uint64_t(c->response_started)      << 8;
-    f |= uint64_t(c->client_conn_close)     << 9;
+    f |= uint64_t(c->ex.header_parsed)         << 7;
+    f |= uint64_t(c->ex.response_started)      << 8;
+    f |= uint64_t(c->ex.client_conn_close)     << 9;
     f |= uint64_t(c->tls_peer_closed)       << 10;
-    f |= uint64_t(c->declared_body_chunked) << 11;
-    f |= uint64_t(c->body_unbounded)        << 12;
+    f |= uint64_t(c->ex.declared_body_chunked) << 11;
+    f |= uint64_t(c->ex.body_unbounded)        << 12;
     f |= uint64_t(c->connect_reattempted)   << 13;
     f |= uint64_t(c->client_eof)            << 14;
-    f |= uint64_t(c->backend_from_group)    << 15;
+    f |= uint64_t(c->ex.backend_from_group)    << 15;
     f |= uint64_t(c->connect_pending)       << 16;
     f |= uint64_t(c->abort_watch_pending)   << 17;
-    f |= uint64_t(c->awaiting_response)     << 18;
-    f |= uint64_t(c->awaiting_headers)      << 19;
+    f |= uint64_t(c->ex.awaiting_response)     << 18;
+    f |= uint64_t(c->ex.awaiting_headers)      << 19;
     f |= uint64_t(c->ssl != nullptr)        << 20;
-    f |= uint64_t(c->backend_half_closed)   << 21;
+    f |= uint64_t(c->ex.backend_half_closed)   << 21;
     f |= uint64_t(c->kept_alive)            << 22;
     return inv_mix(h, f);
 }
@@ -3030,7 +3003,7 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         }
 
         if (SOCKETLEY_UNLIKELY(!arm_read(client_fd, ptr)))
-            close_pair(client_fd, ptr->backend_fd);
+            close_pair(client_fd, ptr->ex.backend_fd);
     }
 
     // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
@@ -3186,7 +3159,7 @@ static inline bool client_answer_owed(const proxy_client_connection* cconn,
                                       const proxy_backend_connection* bconn)
 {
     return cconn->connect_pending ||   // the request has not reached a backend yet
-           (bconn && !(cconn->response_started && backend_response_complete(bconn)));
+           (bconn && !(cconn->ex.response_started && backend_response_complete(bconn)));
 }
 
 void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* req)
@@ -3248,7 +3221,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                                                         sizeof(conn->read_buf), &conn->read_req)))
             {
                 conn->read_pending = false;
-                close_pair(fd, conn->backend_fd);
+                close_pair(fd, conn->ex.backend_fd);
             }
             return;
         }
@@ -3270,9 +3243,9 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         if (cqe->res == 0 && !conn->closing && m_protocol == protocol_http)
         {
             const proxy_backend_connection* b = nullptr;
-            if (conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS &&
-                m_conn_idx[conn->backend_fd].side == conn_backend)
-                b = m_conn_idx[conn->backend_fd].backend;
+            if (conn->ex.backend_fd >= 0 && conn->ex.backend_fd < MAX_FDS &&
+                m_conn_idx[conn->ex.backend_fd].side == conn_backend)
+                b = m_conn_idx[conn->ex.backend_fd].backend;
 
             // Stated out of the exchange and deliberately not out of
             // awaiting_response, which arm_response_deadline leaves unset when
@@ -3285,7 +3258,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                 conn->client_eof = true;
                 // Only the backend can end an answer already under way, so its
                 // silence is bounded the way its first byte was.
-                if (conn->response_started)
+                if (conn->ex.response_started)
                     arm_response_deadline(conn);
                 return;
             }
@@ -3295,7 +3268,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         // left is a read that failed -- and a socket the kernel has reset
         // cannot carry an answer however much is owed on it, stated with force
         // because the gate cannot see the difference.
-        close_pair(fd, conn->backend_fd,
+        close_pair(fd, conn->ex.backend_fd,
                    cqe->res < 0 ? close_reason::force : close_reason::normal);
         return;
     }
@@ -3330,7 +3303,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                 uint16_t buf_id_rl = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
                 m_loop->return_buf(BUF_GROUP_ID, buf_id_rl);
             }
-            close_pair(fd, conn->backend_fd);
+            close_pair(fd, conn->ex.backend_fd);
             return;
         }
         conn->rl_tokens -= 1.0;
@@ -3347,7 +3320,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         // The end-of-stream tests could not fire here, because every path out
         // of the block above returns and res is positive by construction; they
         // are stated once where a zero-length completion is seen.
-        close_pair(fd, conn->backend_fd);
+        close_pair(fd, conn->ex.backend_fd);
         return;
     }
 
@@ -3360,7 +3333,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         read_data = m_loop->get_buf_ptr(BUF_GROUP_ID, buf_id);
         if (SOCKETLEY_UNLIKELY(!read_data))
         {
-            close_pair(fd, conn->backend_fd);
+            close_pair(fd, conn->ex.backend_fd);
             return;
         }
     }
@@ -3394,7 +3367,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         {
             if (!conn->write_pending && !conn->read_pending &&
                 !conn->splice_in_pending && !conn->splice_out_pending)
-                close_pair(fd, conn->backend_fd);
+                close_pair(fd, conn->ex.backend_fd);
             return;
         }
 
@@ -3404,7 +3377,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         {
             if (!conn->read_pending &&
                 SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
-                close_pair(fd, conn->backend_fd);
+                close_pair(fd, conn->ex.backend_fd);
             return;
         }
 
@@ -3429,7 +3402,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             if (is_provided)
                 m_loop->return_buf(BUF_GROUP_ID, buf_id);
             if (!conn->write_pending)
-                close_pair(fd, conn->backend_fd);
+                close_pair(fd, conn->ex.backend_fd);
             return;
         }
 
@@ -3440,23 +3413,23 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         // If async connect is pending, buffer incoming data (with limit)
         if (SOCKETLEY_UNLIKELY(conn->connect_pending))
         {
-            if (conn->saved_request.size() < read_buffer_bytes())
-                conn->saved_request.append(read_data, data_len);
+            if (conn->ex.saved_request.size() < read_buffer_bytes())
+                conn->ex.saved_request.append(read_data, data_len);
             if (is_provided)
                 m_loop->return_buf(BUF_GROUP_ID, buf_id);
             // Pause reads if too much data buffered, resume in handle_connect
             if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending &&
-                conn->saved_request.size() < read_buffer_bytes())
+                conn->ex.saved_request.size() < read_buffer_bytes())
                 if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
                 {
-                    close_pair(fd, conn->backend_fd);
+                    close_pair(fd, conn->ex.backend_fd);
                     return;
                 }
             return;
         }
 
         // TCP mode: connect on first read, then forward raw bytes
-        if (SOCKETLEY_UNLIKELY(conn->backend_fd < 0))
+        if (SOCKETLEY_UNLIKELY(conn->ex.backend_fd < 0))
         {
             auto* target = select_and_resolve_backend(conn);
             if (SOCKETLEY_UNLIKELY(!target))
@@ -3468,7 +3441,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             }
 
             // Save initial data for forwarding after connect
-            conn->saved_request.assign(read_data, data_len);
+            conn->ex.saved_request.assign(read_data, data_len);
             if (is_provided)
                 m_loop->return_buf(BUF_GROUP_ID, buf_id);
 
@@ -3486,28 +3459,28 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                 if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending)
                     if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
                     {
-                        close_pair(fd, conn->backend_fd);
+                        close_pair(fd, conn->ex.backend_fd);
                         return;
                     }
                 return;
             }
 
             // Pooled connection acquired synchronously — forward saved data
-            forward_to_backend(conn, conn->saved_request);
-            conn->saved_request.clear();
+            forward_to_backend(conn, conn->ex.saved_request);
+            conn->ex.saved_request.clear();
 
             if (SOCKETLEY_LIKELY(!conn->closing))
             {
                 if (!conn->splice_active && !conn->read_pending)
                     if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
                     {
-                        close_pair(fd, conn->backend_fd);
+                        close_pair(fd, conn->ex.backend_fd);
                         return;
                     }
             }
             else if (!conn->write_pending)
             {
-                close_pair(fd, conn->backend_fd);
+                close_pair(fd, conn->ex.backend_fd);
             }
             return;
         }
@@ -3520,11 +3493,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             m_loop->return_buf(BUF_GROUP_ID, buf_id);
 
         if (SOCKETLEY_LIKELY(!conn->closing) && conn->splice_active &&
-            conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS)
+            conn->ex.backend_fd >= 0 && conn->ex.backend_fd < MAX_FDS)
         {
             // The read that raced the splice start has now been handed to the
             // write queue; once that has drained the pipeline can take over.
-            auto& be2 = m_conn_idx[conn->backend_fd];
+            auto& be2 = m_conn_idx[conn->ex.backend_fd];
             if (be2.side == conn_backend && !be2.backend->write_pending &&
                 be2.backend->write_queue.empty())
                 start_splice_forwarding(conn, be2.backend);
@@ -3542,7 +3515,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                 if (!backend_backpressured(conn))
                     if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
                     {
-                        close_pair(fd, conn->backend_fd);
+                        close_pair(fd, conn->ex.backend_fd);
                         return;
                     }
             }
@@ -3552,7 +3525,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         else if (!conn->write_pending)
         {
             // Closing and no more pending ops — clean up now.
-            close_pair(fd, conn->backend_fd);
+            close_pair(fd, conn->ex.backend_fd);
         }
         return;
     }
@@ -3578,7 +3551,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                 // shortage while a whole request waits on a handshake, so 503
                 // rather than silence.
                 answer_gateway_failure(conn, true);
-                close_pair(fd, conn->backend_fd);
+                close_pair(fd, conn->ex.backend_fd);
                 return;
             }
         return;
@@ -3592,17 +3565,17 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     {
         // Answered, the connection drains: what arrives now is thrown away
         // rather than held, so the ceiling still bounds memory.
-        if (answer_request_too_large(conn) && conn->drain_on_close)
+        if (answer_request_too_large(conn) && conn->ex.drain_on_close)
         {
             conn->partial.clear();
             if (!conn->read_pending && !continue_drain(conn, fd, 0) && !conn->write_pending)
-                close_pair(fd, conn->backend_fd, close_reason::force);
+                close_pair(fd, conn->ex.backend_fd, close_reason::force);
             return;
         }
         // force: the refusal is the answer, and holding would leave the
         // multishot recv armed and go on accepting the very bytes the ceiling
         // exists to stop.
-        close_pair(fd, conn->backend_fd, close_reason::force);
+        close_pair(fd, conn->ex.backend_fd, close_reason::force);
         return;
     }
 
@@ -3613,10 +3586,10 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     if (SOCKETLEY_UNLIKELY(conn->closing))
     {
         conn->partial.clear();
-        if (conn->drain_on_close && continue_drain(conn, fd, static_cast<size_t>(cqe->res)))
+        if (conn->ex.drain_on_close && continue_drain(conn, fd, static_cast<size_t>(cqe->res)))
             return;
         if (!conn->write_pending)
-            close_pair(fd, conn->backend_fd);
+            close_pair(fd, conn->ex.backend_fd);
         return;
     }
 
@@ -3626,9 +3599,9 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
 // See the declaration for why the answer lives on the backend.
 bool proxy_instance::conn_tunnelled(const proxy_client_connection* conn) const
 {
-    if (conn->backend_fd < 0 || conn->backend_fd >= MAX_FDS)
+    if (conn->ex.backend_fd < 0 || conn->ex.backend_fd >= MAX_FDS)
         return false;
-    const auto& be = m_conn_idx[conn->backend_fd];
+    const auto& be = m_conn_idx[conn->ex.backend_fd];
     if (be.side != conn_backend)
         return false;
     // Mutual, like every cross-half read here, because a descriptor number
@@ -3644,9 +3617,9 @@ bool proxy_instance::conn_tunnelled(const proxy_client_connection* conn) const
 // flushed, since nothing else will collect them.
 void proxy_instance::begin_tunnel(proxy_client_connection* cconn)
 {
-    cconn->awaiting_headers = false;
+    cconn->ex.awaiting_headers = false;
 
-    if (!cconn->partial.empty() && !cconn->closing && cconn->backend_fd >= 0)
+    if (!cconn->partial.empty() && !cconn->closing && cconn->ex.backend_fd >= 0)
     {
         std::string pending;
         pending.swap(cconn->partial);
@@ -3663,12 +3636,12 @@ static bool take_chunked_body(proxy_client_connection* conn, std::string_view in
     for (;;)
     {
         std::string_view piece;
-        switch (http_chunked_next(conn->req_chunk, rest, piece))
+        switch (http_chunked_next(conn->ex.req_chunk, rest, piece))
         {
         case chunk_step::payload:
             continue;
         case chunk_step::done:
-            conn->body_unbounded = false;
+            conn->ex.body_unbounded = false;
             [[fallthrough]];
         case chunk_step::need_more:
             take = in.size() - rest.size();
@@ -3689,7 +3662,7 @@ void proxy_instance::bound_pipelined_hold(proxy_client_connection* conn)
     if (conn->closing || conn->partial.empty())
         return;
     // What is buffered is body, not a request; the body path forwards it.
-    if (conn->body_unbounded || conn->body_remaining > 0)
+    if (conn->ex.body_unbounded || conn->ex.body_remaining > 0)
         return;
     arm_header_deadline(conn);
 }
@@ -3712,7 +3685,7 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
             forward_to_backend(conn, relay);
         }
     }
-    else if (!conn->header_parsed)
+    else if (!conn->ex.header_parsed)
     {
         // Slowloris / oversized header protection, asked of the head alone,
         // because a body arriving in the same read is not header bytes.
@@ -3746,21 +3719,21 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
             if (!conn->read_pending)
                 if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, poll_first)))
                 {
-                    close_pair(fd, conn->backend_fd);
+                    close_pair(fd, conn->ex.backend_fd);
                     return;
                 }
             return;
         }
 
-        conn->header_parsed = true;
+        conn->ex.header_parsed = true;
         // The block arrived; what happens next is the request's own business
         // and is timed by --backend-timeout, not by this.
-        conn->awaiting_headers = false;
+        conn->ex.awaiting_headers = false;
 
         // A CA's HTTP-01 challenge for a token this daemon holds is answered whatever the prefix and the backends
         // say; any other token is a backend's own, and is proxied as before.
-        if (std::string answer; SOCKETLEY_UNLIKELY(conn->path.starts_with(cert_keeper::challenge_prefix)) &&
-            !(answer = cert_keeper::challenge_answer(conn->path.substr(cert_keeper::challenge_prefix.size()))).empty())
+        if (std::string answer; SOCKETLEY_UNLIKELY(conn->ex.path.starts_with(cert_keeper::challenge_prefix)) &&
+            !(answer = cert_keeper::challenge_answer(conn->ex.path.substr(cert_keeper::challenge_prefix.size()))).empty())
         {
             send_error(conn, "200 OK", answer);
             return;
@@ -3781,15 +3754,15 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
         {
             if (entrance_refuse(conn))
                 return;
-            new_path = conn->path;
+            new_path = conn->ex.path;
         }
         else if (m_prefix.empty())
-            new_path = conn->path;
+            new_path = conn->ex.path;
         else
         {
             // Check path prefix (m_prefix = "/<name>/", strip trailing slash for bare match)
             std::string_view bare = std::string_view(m_prefix).substr(0, m_prefix.size() - 1);
-            if (!conn->path.starts_with(m_prefix) && conn->path != bare)
+            if (!conn->ex.path.starts_with(m_prefix) && conn->ex.path != bare)
             {
                 send_error(conn, "404 Not Found", "Not Found\n");
                 return;
@@ -3798,7 +3771,7 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
             // Strip prefix through backend_path(), because on_route needs the same
             // answer and two copies of a string transformation is two chances to
             // tell a script a path the backend never sees.
-            new_path = backend_path(conn->path);
+            new_path = backend_path(conn->ex.path);
         }
 
         // The route declaration, first of everything, because it is the
@@ -3826,12 +3799,12 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
         // Rewritten straight into saved_request, whose capacity survives the
         // clear() between requests, so a keep-alive connection stops
         // allocating a request buffer per request.
-        rewrite_http_request(conn, new_path, conn->saved_request);
-        if (SOCKETLEY_UNLIKELY(conn->req_chunk.st == http_chunked_decoder::phase::broken))
+        rewrite_http_request(conn, new_path, conn->ex.saved_request);
+        if (SOCKETLEY_UNLIKELY(conn->ex.req_chunk.st == http_chunked_decoder::phase::broken))
         {
             // Nothing has reached a backend yet, so the refusal is whole.
             conn->partial.clear();
-            conn->saved_request.clear();
+            conn->ex.saved_request.clear();
             send_error(conn, "400 Bad Request", "Bad Request\n");
             return;
         }
@@ -3861,24 +3834,24 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
                 if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, poll_first)))
                 {
                     answer_gateway_failure(conn, true);
-                    close_pair(fd, conn->backend_fd);
+                    close_pair(fd, conn->ex.backend_fd);
                     return;
                 }
             return;
         }
 
         // Pooled connection acquired synchronously — forward now
-        forward_to_backend(conn, conn->saved_request);
-        if (m_mesh.retry_count <= 0 && !conn->reissue_ok)
-            conn->saved_request.clear();
+        forward_to_backend(conn, conn->ex.saved_request);
+        if (m_mesh.retry_count <= 0 && !conn->ex.reissue_ok)
+            conn->ex.saved_request.clear();
     }
-    else if (conn->backend_fd >= 0 && !conn->partial.empty())
+    else if (conn->ex.backend_fd >= 0 && !conn->partial.empty())
     {
         // Only the body may go out here, because forwarding the whole buffer
         // is the same hole rewrite_http_request had: bytes nothing has parsed
         // reaching a backend that parses them.
-        size_t n = std::min(conn->body_remaining, conn->partial.size());
-        const bool chunked = conn->body_unbounded;
+        size_t n = std::min(conn->ex.body_remaining, conn->partial.size());
+        const bool chunked = conn->ex.body_unbounded;
         if (chunked && !take_chunked_body(conn, conn->partial, n))
         {
             // The backend holds part of a body whose framing just broke, so
@@ -3887,7 +3860,7 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
             if (client_answerable(conn))
                 send_error(conn, "400 Bad Request", "Bad Request\n");
             else
-                close_pair(fd, conn->backend_fd, close_reason::force);
+                close_pair(fd, conn->ex.backend_fd, close_reason::force);
             return;
         }
         if (n > 0)
@@ -3895,18 +3868,18 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
             forward_to_backend(conn, std::string_view(conn->partial.data(), n));
             // A retry resends saved_request, so a small body goes onto it as it
             // is forwarded and only a larger one gives the retry up.
-            if (conn->retries_remaining > 0 && !conn->saved_request.empty() &&
-                conn->saved_request.size() + n <= RETRY_KEEP_BYTES)
-                conn->saved_request.append(conn->partial.data(), n);
+            if (conn->ex.retries_remaining > 0 && !conn->ex.saved_request.empty() &&
+                conn->ex.saved_request.size() + n <= RETRY_KEEP_BYTES)
+                conn->ex.saved_request.append(conn->partial.data(), n);
             else
-                conn->retries_remaining = 0;
+                conn->ex.retries_remaining = 0;
             if (!chunked)
-                conn->body_remaining -= n;
+                conn->ex.body_remaining -= n;
             conn->partial.erase(0, n);
             // The backend owes its first byte once the request is in, so while
             // the body still arrives the wait runs from its latest bytes: from
             // the connect, an upload longer than --backend-timeout was 504.
-            if (conn->awaiting_response && !conn->response_started)
+            if (conn->ex.awaiting_response && !conn->ex.response_started)
                 arm_response_deadline(conn);
         }
         // Whatever is still buffered is the next request, which waits for this
@@ -3930,7 +3903,7 @@ proxy_http_resubmit:
                     // backend's, so 503 -- declined on its own if any of the
                     // answer has reached the client.
                     answer_gateway_failure(conn, true);
-                    close_pair(fd, conn->backend_fd);
+                    close_pair(fd, conn->ex.backend_fd);
                     return;
                 }
         }
@@ -3938,7 +3911,7 @@ proxy_http_resubmit:
     else if (!conn->write_pending)
     {
         // Closing and no more pending ops — clean up now.
-        close_pair(fd, conn->backend_fd);
+        close_pair(fd, conn->ex.backend_fd);
     }
 }
 
@@ -4057,7 +4030,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                 // request, which HAProxy retries on a fresh connection and
                 // does not hold against the backend.
                 if (m_protocol == protocol_http && conn->reused && !teardown_is_ours &&
-                    !ce.client->response_started && !ce.client->closing &&
+                    !ce.client->ex.response_started && !ce.client->closing &&
                     reissue_unanswered(ce.client, conn))
                     return;
 
@@ -4076,7 +4049,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                 // the HTTP path, so on a TCP proxy this term was a constant
                 // true and five ordinary exchanges opened the breaker.
                 const bool backend_answered = (m_protocol == protocol_http)
-                                                  ? ce.client->response_started
+                                                  ? ce.client->ex.response_started
                                                   : conn->sent_to_client;
                 const bool backend_failed =
                     (cqe->res < 0) || !backend_answered || never_framed;
@@ -4088,14 +4061,14 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                 // socket the backend had already closed, so a retry where one
                 // is configured and 502 where it is not.
                 if (m_protocol == protocol_http && backend_failed &&
-                    !ce.client->closing && !ce.client->response_started)
+                    !ce.client->closing && !ce.client->ex.response_started)
                 {
                     auto* cconn = ce.client;
                     // Detach the pair before either branch runs, because a
                     // retry opens a backend of its own and leaving the two
                     // pointing at each other lets this teardown take the
                     // client with it.
-                    cconn->backend_fd = -1;
+                    cconn->ex.backend_fd = -1;
                     conn->client_fd = -1;
                     if (!try_retry(cconn))
                         answer_gateway_failure(cconn, false);
@@ -4167,7 +4140,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             {
                 auto& ce = m_conn_idx[conn->client_fd];
                 if (ce.side == conn_client && !ce.client->closing &&
-                    !ce.client->response_started)
+                    !ce.client->ex.response_started)
                 {
                     auto* cconn = ce.client;
                     // A backend this proxy cannot complete a handshake with is
@@ -4176,7 +4149,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                     note_backend_failure(cconn);
                     // Detached before either branch runs: a retry opens a
                     // backend of its own and this one is torn down next line.
-                    cconn->backend_fd = -1;
+                    cconn->ex.backend_fd = -1;
                     conn->client_fd = -1;
                     // 502 and not 503, because this is a handshake the backend
                     // answered and rejected: the record layer has been on the
@@ -4232,10 +4205,10 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     if (m_protocol == protocol_http && conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
     {
         auto& ce = m_conn_idx[conn->client_fd];
-        if (ce.side == conn_client && !ce.client->response_started)
+        if (ce.side == conn_client && !ce.client->ex.response_started)
         {
             // Mark that we've started receiving response data — no retry after this
-            ce.client->response_started = true;
+            ce.client->ex.response_started = true;
             // The backend has answered, so the first-byte deadline is over:
             // cutting a slow or streaming body short would be a new defect
             // rather than a fix.
@@ -4273,7 +4246,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
     {
         const auto& ce = m_conn_idx[conn->client_fd];
-        const bool closing = ce.side == conn_client && (ce.client->client_conn_close || ce.client->client_eof);
+        const bool closing = ce.side == conn_client && (ce.client->ex.client_conn_close || ce.client->client_eof);
         const bool hsts = m_entrance && get_tls();
         const std::string_view chunk{data_ptr, forward_len};
         const size_t end = closing || hsts ? chunk.find("\r\n\r\n") : std::string_view::npos;
@@ -4326,7 +4299,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
     {
         auto& ce = m_conn_idx[conn->client_fd];
-        if (ce.side == conn_client && ce.client->backend_fd == fd)
+        if (ce.side == conn_client && ce.client->ex.backend_fd == fd)
             begin_tunnel(ce.client);
     }
 
@@ -4408,7 +4381,7 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     const size_t scan_len = block_complete ? hdr_end : conn->partial.size();
 
     // Scanned before anything is parsed out of these bytes, request line
-    // included, because a bare LF put a whole header line inside conn->version
+    // included, because a bare LF put a whole header line inside conn->ex.version
     // and sent it on the request line.
     if (SOCKETLEY_UNLIKELY(!http_eol_framing_ok(
             std::string_view(conn->partial.data(), scan_len), block_complete)))
@@ -4434,9 +4407,9 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     if (SOCKETLEY_UNLIKELY(sp2 == std::string_view::npos))
         return http_request_parse::invalid;
 
-    conn->method.assign(line.data(), sp1);
-    conn->path.assign(line.data() + sp1 + 1, sp2 - sp1 - 1);
-    conn->version.assign(line.data() + sp2 + 1, line.size() - sp2 - 1);
+    conn->ex.method.assign(line.data(), sp1);
+    conn->ex.path.assign(line.data() + sp1 + 1, sp2 - sp1 - 1);
+    conn->ex.version.assign(line.data() + sp2 + 1, line.size() - sp2 - 1);
 
     // pos and hdr_end are equal for a request that carries no headers, and the
     // subtraction then wrapped to SIZE_MAX-1 and sent the scan across the
@@ -4454,17 +4427,17 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     // How long this request's body is, from a header block just proved to give
     // exactly one answer, with everything past it held back by
     // rewrite_http_request.
-    conn->declared_body_len = scan.has_content_length ? scan.content_length : 0;
-    conn->declared_body_chunked = scan.transfer_encoding;
+    conn->ex.declared_body_len = scan.has_content_length ? scan.content_length : 0;
+    conn->ex.declared_body_chunked = scan.transfer_encoding;
 
     // An entrance routes by the name asked for, so it reads it here, with the
     // Via fields a request that came round again would carry; so does
     // --redirect-https, which sends the client to that name.
     if (m_entrance || m_https_redirect)
     {
-        conn->host.clear();
-        conn->host_fields = 0;
-        conn->via_loop = false;
+        conn->ex.host.clear();
+        conn->ex.host_fields = 0;
+        conn->ex.via_loop = false;
         std::string_view authority;
         for (size_t p = 0; p < headers.size();)
         {
@@ -4478,8 +4451,8 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
                 continue;
             if (header_name_equals(hl, "host", 4))
             {
-                if (conn->host_fields < 255)
-                    ++conn->host_fields;
+                if (conn->ex.host_fields < 255)
+                    ++conn->ex.host_fields;
                 authority = http_trim_ows(hl.substr(colon + 1));
             }
             else if (header_name_equals(hl, "via", 3))
@@ -4493,13 +4466,13 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
                     const size_t end = at + m_via_token.size();
                     if (at > 0 && v[at - 1] == ' ' && (end == v.size() || v[end] == ' ' || v[end] == ',' ||
                                              v[end] == '\t'))
-                        conn->via_loop = true;
+                        conn->ex.via_loop = true;
                 }
             }
         }
         // The absolute form names the host itself and wins over the field
         // (RFC 9112 3.2.2); the backend is given the origin form.
-        std::string_view target = conn->path;
+        std::string_view target = conn->ex.path;
         for (std::string_view scheme : {std::string_view("http://"), std::string_view("https://")})
             if (target.size() > scheme.size() &&
                 http_token_equals(target.substr(0, scheme.size()), scheme.data(), scheme.size()))
@@ -4509,23 +4482,23 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
                 std::string origin = slash == std::string_view::npos ? "/" : std::string(rest.substr(slash));
                 if (!origin.starts_with('/'))
                     origin.insert(0, 1, '/');
-                conn->host_fields = std::max<uint8_t>(conn->host_fields, 1);
-                conn->host.assign(rest.substr(0, slash));
-                conn->path = std::move(origin);
+                conn->ex.host_fields = std::max<uint8_t>(conn->ex.host_fields, 1);
+                conn->ex.host.assign(rest.substr(0, slash));
+                conn->ex.path = std::move(origin);
                 authority = {};
                 break;
             }
         if (!authority.empty())
-            conn->host.assign(authority);
+            conn->ex.host.assign(authority);
         // The port and a trailing dot are not part of the name; an IPv6
         // literal keeps its brackets and loses only what follows them.
-        if (!conn->host.empty() && conn->host.front() == '[')
-            conn->host.erase(std::min(conn->host.size(), conn->host.find(']') + 1));
-        else if (const size_t c = conn->host.find(':'); c != std::string::npos)
-            conn->host.erase(c);
-        while (!conn->host.empty() && conn->host.back() == '.')
-            conn->host.pop_back();
-        for (char& c : conn->host)
+        if (!conn->ex.host.empty() && conn->ex.host.front() == '[')
+            conn->ex.host.erase(std::min(conn->ex.host.size(), conn->ex.host.find(']') + 1));
+        else if (const size_t c = conn->ex.host.find(':'); c != std::string::npos)
+            conn->ex.host.erase(c);
+        while (!conn->ex.host.empty() && conn->ex.host.back() == '.')
+            conn->ex.host.pop_back();
+        for (char& c : conn->ex.host)
             if (c >= 'A' && c <= 'Z')
                 c = static_cast<char>(c | 0x20);
     }
@@ -4545,15 +4518,15 @@ bool proxy_instance::append_backend_host_header(std::string& out,
     std::string_view host;
     uint16_t port = 0;
 
-    if (conn->backend_from_group)
+    if (conn->ex.backend_from_group)
     {
-        host = conn->backend_host;
-        port = conn->backend_port;
+        host = conn->ex.backend_host;
+        port = conn->ex.backend_port;
     }
-    else if (conn->backend_idx < m_backends.size())
+    else if (conn->ex.backend_idx < m_backends.size())
     {
-        host = m_backends[conn->backend_idx].resolved_host;
-        port = m_backends[conn->backend_idx].resolved_port;
+        host = m_backends[conn->ex.backend_idx].resolved_host;
+        port = m_backends[conn->ex.backend_idx].resolved_port;
     }
 
     // A group entry keeps resolved_host empty and resolved_port zero; emitting
@@ -4637,15 +4610,15 @@ bool proxy_instance::auth_admits(proxy_client_connection* conn)
 
 void proxy_instance::answer_https_redirect(proxy_client_connection* conn)
 {
-    if (conn->host_fields != 1 || conn->host.empty())
+    if (conn->ex.host_fields != 1 || conn->ex.host.empty())
     {
         send_error(conn, "400 Bad Request", "Bad Request: one Host is needed, and it names where the request goes\n");
         return;
     }
-    std::string location = "Location: https://" + conn->host;
+    std::string location = "Location: https://" + conn->ex.host;
     if (m_https_redirect != 443)
         location += ":" + std::to_string(m_https_redirect);
-    location += conn->path.starts_with('/') ? conn->path : "/";
+    location += conn->ex.path.starts_with('/') ? conn->ex.path : "/";
     location += "\r\n";
     send_error(conn, "308 Permanent Redirect", "", true, location);
 }
@@ -4675,13 +4648,13 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     // Find end of request line
     auto pos = conn->partial.find("\r\n");
     result.clear();
-    result.reserve(conn->method.size() + 1 + new_path.size() + 1
-                   + conn->version.size() + conn->partial.size() - pos + 64);
-    result += conn->method;
+    result.reserve(conn->ex.method.size() + 1 + new_path.size() + 1
+                   + conn->ex.version.size() + conn->partial.size() - pos + 64);
+    result += conn->ex.method;
     result += ' ';
     result += new_path;
     result += ' ';
-    result += conn->version;
+    result += conn->ex.version;
     result += "\r\n";
 
     // The block is measured from the same terminator parse_http_request_line
@@ -4785,7 +4758,7 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
             {
                 const std::string_view v = http_trim_ows(hdr_line.substr(colon + 1));
                 if (http_list_has_token(v, "close", 5))
-                    conn->client_conn_close = true;
+                    conn->ex.client_conn_close = true;
                 if (http_list_has_token(v, "keep-alive", 10))
                     client_keep_alive = true;
             }
@@ -4820,10 +4793,10 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         // A header a filter set replaces the client's rather than joining it,
         // with the names lowercased and checked when they were collected, so
         // this loop cannot be made to skip a line it is responsible for.
-        if (SOCKETLEY_UNLIKELY(!conn->filter_headers.empty()))
+        if (SOCKETLEY_UNLIKELY(!conn->ex.filter_headers.empty()))
         {
             bool overridden = false;
-            for (const auto& [n, v] : conn->filter_headers)
+            for (const auto& [n, v] : conn->ex.filter_headers)
             {
                 if (header_name_equals(hdr_line, n.c_str(), n.size()))
                 {
@@ -4841,10 +4814,10 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         // A header a filter removed is dropped here in every occurrence,
         // because taking away half of a field sent twice leaves the backend
         // reading a value the filter meant to delete.
-        if (SOCKETLEY_UNLIKELY(!conn->filter_removed_headers.empty()))
+        if (SOCKETLEY_UNLIKELY(!conn->ex.filter_removed_headers.empty()))
         {
             bool removed = false;
-            for (const auto& n : conn->filter_removed_headers)
+            for (const auto& n : conn->ex.filter_removed_headers)
             {
                 if (header_name_equals(hdr_line, n.c_str(), n.size()))
                 {
@@ -4925,7 +4898,7 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     // what travel in the headers nginx and every framework read them from --
     // unless a filter set one of them, which is the script's to decide.
     auto filter_set = [&](const char* lower, size_t len) {
-        for (const auto& [n, v] : conn->filter_headers)
+        for (const auto& [n, v] : conn->ex.filter_headers)
             if (http_token_equals(n, lower, len)) return true;
         return false;
     };
@@ -4954,19 +4927,19 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     if (m_entrance)
     {
         result += "Via: ";
-        result += conn->version == "HTTP/1.0" ? "1.0 " : "1.1 ";
+        result += conn->ex.version == "HTTP/1.0" ? "1.0 " : "1.1 ";
         result += m_via_token;
         result += "\r\n";
     }
 
     // HTTP/1.0 closes after every answer unless it asked otherwise, and the
     // backend is always asked for keep-alive, so the proxy has to remember.
-    if (conn->version == "HTTP/1.0" && !client_keep_alive)
-        conn->client_conn_close = true;
+    if (conn->ex.version == "HTTP/1.0" && !client_keep_alive)
+        conn->ex.client_conn_close = true;
 
     // What the chain asked for, once each and after the client's own block,
     // with name and value validated where they were taken from Lua.
-    for (const auto& [n, v] : conn->filter_headers)
+    for (const auto& [n, v] : conn->ex.filter_headers)
     {
         result += n;
         result += ": ";
@@ -4988,21 +4961,21 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     // everything behind the header terminator handed a pipelined second
     // request to the backend without a single check running on it.
     size_t body_len;
-    if (conn->declared_body_chunked)
+    if (conn->ex.declared_body_chunked)
     {
         // Chunked has no length up front, so its end is found by walking the
         // chunk sizes; a broken walk is left in req_chunk for the caller.
-        conn->req_chunk = {};
-        conn->body_unbounded = true;
-        conn->body_remaining = 0;
+        conn->ex.req_chunk = {};
+        conn->ex.body_unbounded = true;
+        conn->ex.body_remaining = 0;
         if (!take_chunked_body(conn, body_section, body_len))
             body_len = 0;
     }
     else
     {
-        body_len = std::min(conn->declared_body_len, body_section.size());
-        conn->body_unbounded = false;
-        conn->body_remaining = conn->declared_body_len - body_len;
+        body_len = std::min(conn->ex.declared_body_len, body_section.size());
+        conn->ex.body_unbounded = false;
+        conn->ex.body_remaining = conn->ex.declared_body_len - body_len;
     }
 
     if (body_len > 0)
@@ -5049,7 +5022,7 @@ bool proxy_instance::enforce_declared_route(proxy_client_connection* conn,
     // OPTIONS is never refused here — route_table::method_allowed says why —
     // but there are three different right answers to it and the declaration
     // picks between them.
-    if (conn->method == "OPTIONS")
+    if (conn->ex.method == "OPTIONS")
     {
         // The handler asked for OPTIONS itself, so forward rather than
         // second-guess it: that is how a CORS layer written in Lua keeps
@@ -5081,7 +5054,7 @@ bool proxy_instance::enforce_declared_route(proxy_client_connection* conn,
         return true;
     }
 
-    if (route_table::method_allowed(*route, conn->method))
+    if (route_table::method_allowed(*route, conn->ex.method))
         return false;
 
     // Refused with the Allow header RFC 9110 Section 15.5.6 requires, which
@@ -5100,7 +5073,7 @@ bool proxy_instance::enforce_declared_route(proxy_client_connection* conn,
     response += "\r\nConnection: close\r\n\r\n";
     // A response to HEAD carries the length its GET would have had and none of
     // the bytes, which is rare here and still has to be framed right.
-    if (conn->method != "HEAD")
+    if (conn->ex.method != "HEAD")
         response += body;
 
     // Same reason as every other self-answered path here: what is still
@@ -5242,9 +5215,9 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
     // prefix, because a filter judges what arrived rather than what will be
     // forwarded.
     sol::table req = L.create_table(0, 5);
-    req["method"]    = conn->method;
-    req["path"]      = conn->path;
-    req["version"]   = conn->version;
+    req["method"]    = conn->ex.method;
+    req["path"]      = conn->ex.path;
+    req["version"]   = conn->ex.version;
     req["client_id"] = conn->fd;
 
     // The header block measured from the same terminator, with guards for the
@@ -5271,8 +5244,8 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
     // Headers a filter asked to set or remove, cleared here rather than only
     // between requests, because a request that reaches the chain twice must
     // not accumulate.
-    conn->filter_headers.clear();
-    conn->filter_removed_headers.clear();
+    conn->ex.filter_headers.clear();
+    conn->ex.filter_removed_headers.clear();
 
     // One budget for the whole chain rather than per filter, because a request
     // costs what its chain costs and measuring them one at a time would call
@@ -5376,16 +5349,16 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
                     // A name cannot be both set and removed, so the last
                     // statement wins, or the removal takes the client's line
                     // out and the set puts the proxy's back.
-                    for (auto it = conn->filter_headers.begin();
-                         it != conn->filter_headers.end(); ++it)
+                    for (auto it = conn->ex.filter_headers.begin();
+                         it != conn->ex.filter_headers.end(); ++it)
                     {
-                        if (it->first == name) { conn->filter_headers.erase(it); break; }
+                        if (it->first == name) { conn->ex.filter_headers.erase(it); break; }
                     }
                     bool already = false;
-                    for (const auto& have : conn->filter_removed_headers)
+                    for (const auto& have : conn->ex.filter_removed_headers)
                         if (have == name) { already = true; break; }
                     if (!already)
-                        conn->filter_removed_headers.push_back(std::move(name));
+                        conn->ex.filter_removed_headers.push_back(std::move(name));
                 }
             }
 
@@ -5418,18 +5391,18 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
                 }
                 // The other half of the rule above: setting a name a filter
                 // removed puts it back, because that is the later statement.
-                for (auto it = conn->filter_removed_headers.begin();
-                     it != conn->filter_removed_headers.end(); ++it)
+                for (auto it = conn->ex.filter_removed_headers.begin();
+                     it != conn->ex.filter_removed_headers.end(); ++it)
                 {
-                    if (*it == name) { conn->filter_removed_headers.erase(it); break; }
+                    if (*it == name) { conn->ex.filter_removed_headers.erase(it); break; }
                 }
                 // Last writer wins, so a later filter can correct an earlier one
                 // instead of appending a second copy the backend has to combine.
-                for (auto& [n, v] : conn->filter_headers)
+                for (auto& [n, v] : conn->ex.filter_headers)
                 {
                     if (n == name) { v = std::move(value); return; }
                 }
-                conn->filter_headers.emplace_back(std::move(name), std::move(value));
+                conn->ex.filter_headers.emplace_back(std::move(name), std::move(value));
             });
             continue;
         }
@@ -5507,7 +5480,7 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
         // header saying how much, while a HEAD response carries its GET's
         // length and no bytes.
         const bool no_content = (status == 204 || status == 304);
-        const bool head = (conn->method == "HEAD");
+        const bool head = (conn->ex.method == "HEAD");
         if (no_content)
             body.clear();
         else
@@ -5710,24 +5683,24 @@ proxy_instance::entrance_route* proxy_instance::entrance_find(std::string_view h
 
 const backend_info* proxy_instance::entrance_select(proxy_client_connection* conn, bool retry)
 {
-    entrance_route* route = entrance_find(conn->host);
+    entrance_route* route = entrance_find(conn->ex.host);
     if (!route)
         return nullptr;
 
-    const size_t failed = retry ? conn->backend_idx : SIZE_MAX;
+    const size_t failed = retry ? conn->ex.backend_idx : SIZE_MAX;
     // The runtimes of a group are there to stand in for each other, so one
     // that refuses a connection hands the request to the next even without
     // --retry -- before anything of it was sent, which try_retry sees to.
     if (!retry)
-        conn->retries_remaining = std::max<int>(m_mesh.retry_count, static_cast<int>(route->idx.size()) - 1);
+        conn->ex.retries_remaining = std::max<int>(m_mesh.retry_count, static_cast<int>(route->idx.size()) - 1);
     // A shard of a sharded runtime failed: another shard of it first.
-    if (retry && conn->backend_from_group && failed < m_backends.size())
+    if (retry && conn->ex.backend_from_group && failed < m_backends.size())
     {
-        const std::string failed_node = conn->backend_host;
+        const std::string failed_node = conn->ex.backend_host;
         if (const backend_info* t = pick_node(conn, failed, &failed_node))
             return t;
     }
-    conn->backend_from_group = false;
+    conn->ex.backend_from_group = false;
 
     const size_t n = route->idx.size();
     for (size_t a = 0; a < n; ++a)
@@ -5745,12 +5718,12 @@ const backend_info* proxy_instance::entrance_select(proxy_client_connection* con
 
 bool proxy_instance::entrance_refuse(proxy_client_connection* conn)
 {
-    if (conn->via_loop)
+    if (conn->ex.via_loop)
     {
         send_error(conn, "508 Loop Detected", "Loop Detected: this request has been through this entrance before\n");
         return true;
     }
-    if (conn->host_fields != 1 || conn->host.empty())
+    if (conn->ex.host_fields != 1 || conn->ex.host.empty())
     {
         send_error(conn, "400 Bad Request", "Bad Request: one Host is needed, and it names where the request goes\n");
         return true;
@@ -5763,8 +5736,8 @@ bool proxy_instance::entrance_refuse(proxy_client_connection* conn)
             std::string_view s(sni);
             while (s.ends_with('.'))
                 s.remove_suffix(1);
-            if (s.size() != conn->host.size() ||
-                !std::equal(s.begin(), s.end(), conn->host.begin(),
+            if (s.size() != conn->ex.host.size() ||
+                !std::equal(s.begin(), s.end(), conn->ex.host.begin(),
                             [](char a, char b) { return (a >= 'A' && a <= 'Z' ? (a | 0x20) : a) == b; }))
             {
                 send_error(conn, "421 Misdirected Request",
@@ -5772,11 +5745,11 @@ bool proxy_instance::entrance_refuse(proxy_client_connection* conn)
                 return true;
             }
         }
-    if (!entrance_find(conn->host))
+    if (!entrance_find(conn->ex.host))
     {
         // Perhaps a runtime that is newer than the table read last.
         entrance_load(std::chrono::milliseconds(100));
-        if (!entrance_find(conn->host))
+        if (!entrance_find(conn->ex.host))
         {
             send_error(conn, "404 Not Found", "Not Found: no runtime here has that name\n");
             return true;
@@ -5789,8 +5762,8 @@ const backend_info* proxy_instance::pick_node(proxy_client_connection* conn, siz
                                               const std::string* exclude_path)
 {
     backend_info& b = m_backends[idx];
-    conn->backend_idx = idx;
-    conn->backend_from_group = false;
+    conn->ex.backend_idx = idx;
+    conn->ex.backend_from_group = false;
     note_backend_selected(idx);
     if (b.nodes.empty())
         return exclude_path ? nullptr : &b;   // one address, and it just failed
@@ -5804,9 +5777,9 @@ const backend_info* proxy_instance::pick_node(proxy_client_connection* conn, siz
     };
     const auto take = [&](size_t k) -> const backend_info* {
         const backend_info& node = b.nodes[k];
-        conn->backend_from_group = true;
-        conn->backend_host = node.unix_path;
-        conn->backend_port = 0;
+        conn->ex.backend_from_group = true;
+        conn->ex.backend_host = node.unix_path;
+        conn->ex.backend_port = 0;
         note_group_selected(node.unix_path, 0);
         return &node;
     };
@@ -5853,7 +5826,7 @@ const backend_info* proxy_instance::select_and_resolve_backend(
 
     // Cleared up front so every non-group return path leaves it false, including
     // a keep-alive connection that was group-routed on an earlier request.
-    conn->backend_from_group = false;
+    conn->ex.backend_from_group = false;
 
     // Fast path: check if any backend is a group
     bool has_group = false;
@@ -5894,7 +5867,7 @@ const backend_info* proxy_instance::select_and_resolve_backend(
                              std::chrono::seconds(m_mesh.circuit_timeout))
                     return nullptr;
             }
-            conn->retries_remaining = m_mesh.retry_count;
+            conn->ex.retries_remaining = m_mesh.retry_count;
             return pick_node(conn, 0, exclude_host);
         }
 
@@ -5908,8 +5881,8 @@ const backend_info* proxy_instance::select_and_resolve_backend(
             // Lua panic handler.
             sol::protected_function_result r =
                 m_protocol == protocol_http
-                    ? lua()->on_route()(conn->method, conn->path,
-                                        backend_path(conn->path))
+                    ? lua()->on_route()(conn->ex.method, conn->ex.path,
+                                        backend_path(conn->ex.path))
                     : lua()->on_route()();
 
             // A raising on_route is routed round-robin rather than refused,
@@ -5930,7 +5903,7 @@ const backend_info* proxy_instance::select_and_resolve_backend(
                     int idx = result.as<int>();
                     if (idx >= 0 && static_cast<size_t>(idx) < pool_size)
                     {
-                        conn->retries_remaining = m_mesh.retry_count;
+                        conn->ex.retries_remaining = m_mesh.retry_count;
                         return pick_node(conn, static_cast<size_t>(idx), exclude_host);
                     }
                 }
@@ -6015,7 +5988,7 @@ const backend_info* proxy_instance::select_and_resolve_backend(
         if (SOCKETLEY_UNLIKELY(!found))
             return nullptr;
 
-        conn->retries_remaining = m_mesh.retry_count;
+        conn->ex.retries_remaining = m_mesh.retry_count;
         return pick_node(conn, selected_idx, exclude_host);
     }
 
@@ -6072,7 +6045,7 @@ const backend_info* proxy_instance::select_and_resolve_backend(
     // `--backend @grp` never set this, so try_retry() answered false on its
     // first line for every group -- while the manual promises the retry with
     // no exception for them.
-    conn->retries_remaining = m_mesh.retry_count;
+    conn->ex.retries_remaining = m_mesh.retry_count;
 
     // Members the breaker has taken out come off the list before anything is
     // selected, because choosing first means either using a broken member or
@@ -6102,8 +6075,8 @@ const backend_info* proxy_instance::select_and_resolve_backend(
             // either path.
             sol::protected_function_result r =
                 m_protocol == protocol_http
-                    ? lua()->on_route()(conn->method, conn->path,
-                                        backend_path(conn->path))
+                    ? lua()->on_route()(conn->ex.method, conn->ex.path,
+                                        backend_path(conn->ex.path))
                     : lua()->on_route()();
 
             // Report and leave `selected` at pool[0], which is what an
@@ -6148,12 +6121,12 @@ const backend_info* proxy_instance::select_and_resolve_backend(
     m_scratch_backend.has_cached_addr = false;
     m_scratch_backend.is_unix = false;
     m_scratch_backend.unix_path.clear();
-    conn->backend_from_group = true;
-    conn->backend_host = m_scratch_backend.resolved_host;
-    conn->backend_port = m_scratch_backend.resolved_port;
+    conn->ex.backend_from_group = true;
+    conn->ex.backend_host = m_scratch_backend.resolved_host;
+    conn->ex.backend_port = m_scratch_backend.resolved_port;
     // Claim the single half-open probe if this selection is the one that gets
     // it — the group counterpart of note_backend_selected().
-    note_group_selected(conn->backend_host, conn->backend_port);
+    note_group_selected(conn->ex.backend_host, conn->ex.backend_port);
     // A member member_dial() spelled as its path is the whole address, with
     // nothing to look up and nothing for the sweep to retry.
     if (m_scratch_backend.resolved_port == 0)
@@ -6546,8 +6519,8 @@ bool proxy_instance::conn_backend_tls(const proxy_client_connection* conn) const
         return false;
     if (m_backend_tls_all)
         return true;
-    return !conn->backend_from_group && conn->backend_idx < m_backends.size() &&
-           m_backends[conn->backend_idx].tls;
+    return !conn->ex.backend_from_group && conn->ex.backend_idx < m_backends.size() &&
+           m_backends[conn->ex.backend_idx].tls;
 }
 
 // Give a backend connection its session and put the ClientHello on the wire,
@@ -6634,9 +6607,9 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         std::string_view host;
         uint16_t port = 0;
         if (backend_endpoint_of(conn, m_backends, host, port) &&
-            conn->backend_idx < m_backend_pool.size())
+            conn->ex.backend_idx < m_backend_pool.size())
         {
-            bfd = acquire_pooled_backend(conn->backend_idx, host, port, backend_tls,
+            bfd = acquire_pooled_backend(conn->ex.backend_idx, host, port, backend_tls,
                                          &pooled_ssl);
         }
     }
@@ -6656,7 +6629,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             return false;
         }
 
-        conn->backend_fd = bfd;
+        conn->ex.backend_fd = bfd;
 
         auto bconn = backend_pool_acquire(bfd, conn);
         bconn->reused = true;
@@ -6721,7 +6694,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             conn->pipe_to_backend[0] = -1;
             conn->pipe_to_backend[1] = -1;
             conn->splice_active = false;
-            conn->backend_fd = -1;
+            conn->ex.backend_fd = -1;
             close_pair_close_backend(bfd, ptr, conn);
             ours();
             return false;
@@ -6773,7 +6746,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
     if (cr == 0)
     {
         // Instant connect success — set up backend inline (same as handle_connect)
-        conn->backend_fd = bfd;
+        conn->ex.backend_fd = bfd;
 
         auto bconn = backend_pool_acquire(bfd, conn);
         bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
@@ -6804,10 +6777,10 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
                 if (conn->splice_active)
                 {
                     // Forward saved data before splice takes over
-                    if (!conn->saved_request.empty())
+                    if (!conn->ex.saved_request.empty())
                     {
-                        forward_to_backend(conn, conn->saved_request);
-                        conn->saved_request.clear();
+                        forward_to_backend(conn, conn->ex.saved_request);
+                        conn->ex.saved_request.clear();
                     }
                     // Only queued, not written yet — see handle_connect.
                     if (!ptr->write_pending && ptr->write_queue.empty())
@@ -6835,7 +6808,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             conn->pipe_to_backend[0] = -1;
             conn->pipe_to_backend[1] = -1;
             conn->splice_active = false;
-            conn->backend_fd = -1;
+            conn->ex.backend_fd = -1;
             close_pair_close_backend(bfd, ptr, conn);
             ours();
             return false;
@@ -6846,7 +6819,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         // backend's answer.
         if (SOCKETLEY_UNLIKELY(backend_tls && !start_backend_tls(conn, ptr)))
         {
-            conn->backend_fd = -1;
+            conn->ex.backend_fd = -1;
             close_pair_close_backend(bfd, ptr, conn);
             ours();
             return false;
@@ -6962,7 +6935,7 @@ void proxy_instance::start_splice_forwarding(proxy_client_connection* conn, prox
         if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(conn->fd, &conn->splice_in_req)))
         {
             conn->splice_in_pending = false;
-            close_pair(conn->fd, conn->backend_fd);
+            close_pair(conn->fd, conn->ex.backend_fd);
             return;
         }
     }
@@ -7003,13 +6976,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             if (req == &conn->splice_out_req)
             {
                 conn->splice_out_req.type = op_splice;
-                if (SOCKETLEY_UNLIKELY(cqe->res < 0 || conn->closing || conn->backend_fd < 0 ||
+                if (SOCKETLEY_UNLIKELY(cqe->res < 0 || conn->closing || conn->ex.backend_fd < 0 ||
                                        conn->pipe_to_backend[0] < 0 ||
-                                       !m_loop->submit_splice(conn->pipe_to_backend[0], conn->backend_fd,
+                                       !m_loop->submit_splice(conn->pipe_to_backend[0], conn->ex.backend_fd,
                                                               PROXY_READ_BUF_SIZE, &conn->splice_out_req)))
                 {
                     conn->splice_out_pending = false;
-                    close_pair(conn->fd, conn->backend_fd);
+                    close_pair(conn->fd, conn->ex.backend_fd);
                 }
                 return;
             }
@@ -7023,7 +6996,7 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                                                           &conn->splice_in_req)))
             {
                 conn->splice_in_pending = false;
-                close_pair(conn->fd, conn->backend_fd);
+                close_pair(conn->fd, conn->ex.backend_fd);
             }
         }
         else if (entry.side == conn_backend)
@@ -7083,7 +7056,7 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                     if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(conn->fd, &conn->splice_in_req)))
                     {
                         conn->splice_in_pending = false;
-                        close_pair(conn->fd, conn->backend_fd);
+                        close_pair(conn->fd, conn->ex.backend_fd);
                         return;
                     }
                     return;
@@ -7095,19 +7068,19 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 if (cqe->res == 0 && !conn->closing && hold_tcp_half_close(conn))
                     return;
 
-                close_pair(conn->fd, conn->backend_fd);
+                close_pair(conn->fd, conn->ex.backend_fd);
                 return;
             }
 
             // Data is now in pipe_to_backend — splice it out to the backend fd
-            if (conn->backend_fd >= 0)
+            if (conn->ex.backend_fd >= 0)
             {
                 conn->splice_out_pending = true;
-                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_backend[0], conn->backend_fd,
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_backend[0], conn->ex.backend_fd,
                                       static_cast<uint32_t>(cqe->res), &conn->splice_out_req)))
                 {
                     conn->splice_out_pending = false;
-                    close_pair(conn->fd, conn->backend_fd);
+                    close_pair(conn->fd, conn->ex.backend_fd);
                     return;
                 }
             }
@@ -7132,19 +7105,19 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 // EAGAIN: backend send buffer full -- waited out through the readiness poll, as the inbound legs
                 // wait, because a splice resubmitted onto a full socket answers EAGAIN again at once, round and
                 // round through io-wq.
-                if (cqe->res == -EAGAIN && !conn->closing && conn->backend_fd >= 0)
+                if (cqe->res == -EAGAIN && !conn->closing && conn->ex.backend_fd >= 0)
                 {
                     conn->splice_out_pending = true;
                     conn->splice_out_req.type = op_splice_poll;
-                    if (SOCKETLEY_UNLIKELY(!m_loop->submit_poll_add(conn->backend_fd, POLLOUT, &conn->splice_out_req)))
+                    if (SOCKETLEY_UNLIKELY(!m_loop->submit_poll_add(conn->ex.backend_fd, POLLOUT, &conn->splice_out_req)))
                     {
                         conn->splice_out_pending = false;
-                        close_pair(conn->fd, conn->backend_fd);
+                        close_pair(conn->fd, conn->ex.backend_fd);
                         return;
                     }
                     return;
                 }
-                close_pair(conn->fd, conn->backend_fd);
+                close_pair(conn->fd, conn->ex.backend_fd);
                 return;
             }
 
@@ -7153,14 +7126,14 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             int pipe_left = 0;
             if (conn->pipe_to_backend[0] >= 0)
                 ioctl(conn->pipe_to_backend[0], FIONREAD, &pipe_left);
-            if (pipe_left > 0 && conn->backend_fd >= 0)
+            if (pipe_left > 0 && conn->ex.backend_fd >= 0)
             {
                 conn->splice_out_pending = true;
-                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_backend[0], conn->backend_fd,
+                if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_backend[0], conn->ex.backend_fd,
                                       static_cast<uint32_t>(pipe_left), &conn->splice_out_req)))
                 {
                     conn->splice_out_pending = false;
-                    close_pair(conn->fd, conn->backend_fd);
+                    close_pair(conn->fd, conn->ex.backend_fd);
                     return;
                 }
                 return;
@@ -7176,7 +7149,7 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 // Deliberately not re-armed, because a splice on a socket at
                 // end of stream answers res=0 for ever, so the pair now rests
                 // entirely on the peer and that is asked again here.
-                const int hbfd = conn->backend_fd;
+                const int hbfd = conn->ex.backend_fd;
                 bool reachable = client_op_in_flight(conn);
                 if (!conn->closing && !reachable && hbfd >= 0 && hbfd < MAX_FDS &&
                     m_conn_idx[hbfd].side == conn_backend)
@@ -7186,7 +7159,7 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 }
                 if (reachable)
                     return;
-                close_pair(conn->fd, conn->backend_fd);
+                close_pair(conn->fd, conn->ex.backend_fd);
                 return;
             }
 
@@ -7199,13 +7172,13 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                 if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(conn->fd, &conn->splice_in_req)))
                 {
                     conn->splice_in_pending = false;
-                    close_pair(conn->fd, conn->backend_fd);
+                    close_pair(conn->fd, conn->ex.backend_fd);
                     return;
                 }
             }
             else
             {
-                close_pair(conn->fd, conn->backend_fd);
+                close_pair(conn->fd, conn->ex.backend_fd);
             }
         }
     }
@@ -7254,7 +7227,7 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
             // identity once numbers are reused.
             if (conn->client_fd >= 0 && conn->client_fd < MAX_FDS &&
                 m_conn_idx[conn->client_fd].side == conn_client &&
-                m_conn_idx[conn->client_fd].client->backend_fd == conn->fd)
+                m_conn_idx[conn->client_fd].client->ex.backend_fd == conn->fd)
             {
                 conn->splice_out_pending = true;
                 if (SOCKETLEY_UNLIKELY(!m_loop->submit_splice(conn->pipe_to_client[0], conn->client_fd,
@@ -7394,7 +7367,7 @@ static inline bool backend_pool_eligible(const proxy_backend_connection* bconn,
         return false;
     // The backend is still owed the rest of a request body, so the next
     // borrower's request would be read as that body.
-    if (cconn->body_unbounded || cconn->body_remaining > 0)
+    if (cconn->ex.body_unbounded || cconn->ex.body_remaining > 0)
         return false;
     // The key is read off the client, so the client has to be this socket's
     // own -- cheap, and it makes the key's provenance a checked fact rather
@@ -7430,7 +7403,7 @@ inline void proxy_instance::close_pair_close_backend(int backend_fd,
     {
         // Release fd to pool — pool takes ownership of the descriptor and, on
         // a TLS leg, of the session with it; don't close either.
-        release_to_pool(backend_fd, cconn->backend_idx, host, port, bconn);
+        release_to_pool(backend_fd, cconn->ex.backend_idx, host, port, bconn);
     }
     else
     {
@@ -7507,7 +7480,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
     bool peer_splicing_into_client = false;
     if (client_for_pool)
     {
-        for (int cand : { backend_fd, client_for_pool->backend_fd })
+        for (int cand : { backend_fd, client_for_pool->ex.backend_fd })
         {
             if (cand < 0 || cand >= MAX_FDS) continue;
             const auto& bslot = m_conn_idx[cand];
@@ -7538,7 +7511,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                          // outstanding hands the number away with the write
                          // still to come.
                          (client_for_pool && client_for_pool->splice_out_pending &&
-                          client_for_pool->backend_fd == backend_fd);
+                          client_for_pool->ex.backend_fd == backend_fd);
             if (defer)
             {
                 // A queue that still holds data is as good a reason to defer
@@ -7570,7 +7543,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                 {
                     auto& ce = m_conn_idx[bconn->client_fd];
                     if (ce.side == conn_client)
-                        ce.client->backend_fd = -1;
+                        ce.client->ex.backend_fd = -1;
                 }
 
                 // Close splice pipes
@@ -7597,9 +7570,9 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                 release_parked_backend(conn);
 
             // Also close the other side of the pair
-            if (conn->backend_fd >= 0 && conn->backend_fd != backend_fd && conn->backend_fd < MAX_FDS)
+            if (conn->ex.backend_fd >= 0 && conn->ex.backend_fd != backend_fd && conn->ex.backend_fd < MAX_FDS)
             {
-                auto& be2 = m_conn_idx[conn->backend_fd];
+                auto& be2 = m_conn_idx[conn->ex.backend_fd];
                 if (be2.side == conn_backend)
                 {
                     auto* bconn2 = be2.backend;
@@ -7618,7 +7591,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                             !flush_backend_write_queue(bconn2))
                             defer2 = false;
                         else
-                            shutdown(conn->backend_fd, SHUT_RD);
+                            shutdown(conn->ex.backend_fd, SHUT_RD);
 
                         // Same rule as the block above: a deferral is only
                         // honest while a completion is actually owed.
@@ -7633,10 +7606,10 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                         bconn2->pipe_to_client[0] = -1;
                         bconn2->pipe_to_client[1] = -1;
 
-                        close_pair_close_backend(conn->backend_fd, bconn2, conn);
+                        close_pair_close_backend(conn->ex.backend_fd, bconn2, conn);
                     }
                 }
-                conn->backend_fd = -1;
+                conn->ex.backend_fd = -1;
             }
 
             // Close the pending connect fd through close_fd, which cancels the
@@ -7671,7 +7644,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                     defer_c = false;
                 else
                 {
-                    if (!conn->drain_on_close || reason == close_reason::force)
+                    if (!conn->ex.drain_on_close || reason == close_reason::force)
                         shutdown(client_fd, SHUT_RD);
                     if (!peer_splicing_into_client)
                         shutdown_client_write(conn);
@@ -7703,10 +7676,10 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                     ioctl(client_fd, FIONREAD, &unread);
                     [[maybe_unused]] unsigned long long be_spliced = 0;
                     [[maybe_unused]] long long be_owed = 0;
-                    if (conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS &&
-                        m_conn_idx[conn->backend_fd].side == conn_backend)
+                    if (conn->ex.backend_fd >= 0 && conn->ex.backend_fd < MAX_FDS &&
+                        m_conn_idx[conn->ex.backend_fd].side == conn_backend)
                     {
-                        [[maybe_unused]] auto* tb = m_conn_idx[conn->backend_fd].backend;
+                        [[maybe_unused]] auto* tb = m_conn_idx[conn->ex.backend_fd].backend;
                         be_owed = (long long)(tb->tr.bytes_queued - tb->tr.bytes_written);
                     }
                     [[maybe_unused]] unsigned long long be_in = 0, be_out = 0;
@@ -7715,13 +7688,13 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                     // because that takes the same mutex a splice holds while
                     // it waits -- and they are implied by the counters anyway.
                     pipe_c = (int)(long long)(conn->tr.sp_in - conn->tr.sp_out);
-                    if (conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS &&
-                        m_conn_idx[conn->backend_fd].side == conn_backend)
+                    if (conn->ex.backend_fd >= 0 && conn->ex.backend_fd < MAX_FDS &&
+                        m_conn_idx[conn->ex.backend_fd].side == conn_backend)
                     {
-                        [[maybe_unused]] auto* tb2 = m_conn_idx[conn->backend_fd].backend;
+                        [[maybe_unused]] auto* tb2 = m_conn_idx[conn->ex.backend_fd].backend;
                         be_in = tb2->tr.sp_in; be_out = tb2->tr.sp_out;
                         pipe_b = (int)(long long)(tb2->tr.sp_in - tb2->tr.sp_out);
-                        ioctl(conn->backend_fd, FIONREAD, &unread_b);
+                        ioctl(conn->ex.backend_fd, FIONREAD, &unread_b);
                     }
                     // Conservation, where whichever of the two equations fails
                     // names the hop the bytes vanished on.
@@ -7740,7 +7713,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                 // Drop every back-reference to this descriptor before it goes
                 // back, because a client that dies first left a deferred
                 // backend splicing into a stranger's socket.
-                for (int cand : { backend_fd, conn->backend_fd })
+                for (int cand : { backend_fd, conn->ex.backend_fd })
                 {
                     if (cand < 0 || cand >= MAX_FDS) continue;
                     auto& bslot = m_conn_idx[cand];
@@ -7802,7 +7775,7 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
         // completion still points at the struct.
         bconn->pool_draining = true;
         bconn->pool_abandoned = false;
-        bconn->pool_backend_idx = cconn->backend_idx;
+        bconn->pool_backend_idx = cconn->ex.backend_idx;
         // Read now while the pair is still a pair, because the client may be
         // routed to a different member before the cancellation lands.
         {
@@ -7824,7 +7797,7 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
         // for the backend's paperwork, which is why the backend carries its
         // own pool index from here.
         bconn->client_fd = -1;
-        cconn->backend_fd = -1;
+        cconn->ex.backend_fd = -1;
         reset_client_for_next_request(cconn);
         return;
     }
@@ -7837,7 +7810,7 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
         // A backend that cannot be pooled is no reason to take the client with
         // it, which ended every keep-alive connection after one response -- so
         // the two are detached and the backend goes on its own.
-        cconn->backend_fd = -1;
+        cconn->ex.backend_fd = -1;
         bconn->client_fd = -1;
         bconn->closing = true;
         shutdown(backend_fd, SHUT_RDWR);
@@ -7852,7 +7825,7 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
     uint16_t port = 0;
     const bool can_pool = backend_pool_eligible(bconn, cconn, m_backends, m_protocol) &&
                           backend_endpoint_of(cconn, m_backends, host, port);
-    const size_t b_idx = cconn->backend_idx;
+    const size_t b_idx = cconn->ex.backend_idx;
     // The view points into the client (group route) or into m_backends (plain
     // one); neither is touched between here and the release, but the copy
     // costs nothing and outlives the argument about which.
@@ -7860,7 +7833,7 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
 
     // Clear tracking
     m_conn_idx[backend_fd] = {};
-    cconn->backend_fd = -1;
+    cconn->ex.backend_fd = -1;
 
     if (can_pool)
     {
@@ -7953,12 +7926,12 @@ bool proxy_instance::park_backend(proxy_client_connection* cconn,
     // endpoint this socket's by construction, and a TLS peer's session
     // tickets would read as bytes nobody asked for.
     if (m_entrance || m_backends.size() != 1 || m_backends[0].is_group || !m_backends[0].nodes.empty() ||
-        cconn->backend_from_group || cconn->backend_idx != 0 || bconn->ssl != nullptr)
+        cconn->ex.backend_from_group || cconn->ex.backend_idx != 0 || bconn->ssl != nullptr)
         return false;
     // A client that will not ask again leaves nothing to keep the socket for,
     // and one that has not yet asked twice would mostly cost a cancel at its
     // close instead of saving a trip through the pool.
-    if (!cconn->kept_alive || cconn->client_eof || cconn->client_conn_close ||
+    if (!cconn->kept_alive || cconn->client_eof || cconn->ex.client_conn_close ||
         cconn->parked_backend_fd >= 0)
         return false;
     if (m_parked_count >= MAX_POOL_PER_BACKEND)
@@ -7983,7 +7956,7 @@ bool proxy_instance::park_backend(proxy_client_connection* cconn,
     if (bconn->pool_host != host)
         bconn->pool_host.assign(host);
     bconn->pool_port = port;
-    bconn->pool_backend_idx = cconn->backend_idx;
+    bconn->pool_backend_idx = cconn->ex.backend_idx;
 
     bconn->parked = true;
     bconn->parked_for = cconn->fd;
@@ -7991,7 +7964,7 @@ bool proxy_instance::park_backend(proxy_client_connection* cconn,
     bconn->idle_since = std::chrono::steady_clock::now();
     bconn->client_fd = -1;
     cconn->parked_backend_fd = bconn->fd;
-    cconn->backend_fd = -1;
+    cconn->ex.backend_fd = -1;
     ++m_parked_count;
 
     reset_client_for_next_request(cconn);
@@ -8010,7 +7983,7 @@ bool proxy_instance::take_parked_backend(proxy_client_connection* conn)
     uint16_t port = 0;
     const bool same = !conn_backend_tls(conn) &&
                       backend_endpoint_of(conn, m_backends, host, port) &&
-                      conn->backend_idx == b->pool_backend_idx &&
+                      conn->ex.backend_idx == b->pool_backend_idx &&
                       port == b->pool_port && host == b->pool_host;
     if (!same || !b->read_pending)
     {
@@ -8046,20 +8019,20 @@ bool proxy_instance::take_parked_backend(proxy_client_connection* conn)
     b->parked_for = -1;
     conn->parked_backend_fd = -1;
     b->client_fd = conn->fd;
-    conn->backend_fd = b->fd;
+    conn->ex.backend_fd = b->fd;
     b->reused = true;
     b->idle_since = {};
 
     // Kept whole in saved_request only when nothing of it is still to arrive,
     // which is what lets reissue_unanswered() send it again.
-    conn->reissue_ok = retry_safe_method(conn->method, m_mesh.retry_all) &&
-                       !conn->body_unbounded && conn->body_remaining == 0;
+    conn->ex.reissue_ok = retry_safe_method(conn->ex.method, m_mesh.retry_all) &&
+                       !conn->ex.body_unbounded && conn->ex.body_remaining == 0;
 
     // A new exchange framed from its first byte, with a HEAD's missing body
     // told as backend_pool_acquire tells it, and without a new generation
     // because the armed read carries this one.
     b->http_frame = {};
-    if (conn->method == "HEAD")
+    if (conn->ex.method == "HEAD")
         b->http_frame.no_body = true;
     b->sent_to_client = false;
     return true;
@@ -8146,14 +8119,14 @@ void proxy_instance::drop_parked_backend(proxy_backend_connection* bconn)
 bool proxy_instance::reissue_unanswered(proxy_client_connection* cconn,
                                         proxy_backend_connection* bconn)
 {
-    if (!cconn->reissue_ok || cconn->saved_request.empty())
+    if (!cconn->ex.reissue_ok || cconn->ex.saved_request.empty())
         return false;
     // Once, so a fresh connection that fails the same way takes the ordinary
     // road and is charged for it.
-    cconn->reissue_ok = false;
+    cconn->ex.reissue_ok = false;
 
     const int bfd = bconn->fd;
-    cconn->backend_fd = -1;
+    cconn->ex.backend_fd = -1;
     bconn->client_fd = -1;
     close_pair(-1, bfd, close_reason::force);
 
@@ -8173,7 +8146,7 @@ bool proxy_instance::reissue_unanswered(proxy_client_connection* cconn,
     }
     // An asynchronous connect is forwarded by handle_connect.
     if (!cconn->connect_pending)
-        forward_to_backend(cconn, cconn->saved_request);
+        forward_to_backend(cconn, cconn->ex.saved_request);
     return true;
 }
 
@@ -8183,7 +8156,7 @@ bool proxy_instance::refuse_desynced_answer(proxy_backend_connection* bconn, int
         m_conn_idx[bconn->client_fd].side != conn_client)
         return false;
     auto* cconn = m_conn_idx[bconn->client_fd].client;
-    if (cconn->backend_fd != bfd || cconn->response_started)
+    if (cconn->ex.backend_fd != bfd || cconn->ex.response_started)
         return false;
 
     warn_pool_unbidden();
@@ -8192,7 +8165,7 @@ bool proxy_instance::refuse_desynced_answer(proxy_backend_connection* bconn, int
     if (!cconn->closing && reissue_unanswered(cconn, bconn))
         return true;
 
-    cconn->backend_fd = -1;
+    cconn->ex.backend_fd = -1;
     bconn->client_fd = -1;
     answer_gateway_failure(cconn, false);
     close_pair(-1, bfd, close_reason::force);
@@ -8238,40 +8211,40 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
     // request.
     // A body still owed has no end this proxy can find once the answer is
     // out, and reading what follows it as a request is a guess.
-    const bool body_owing = cconn->body_unbounded || cconn->body_remaining > 0;
-    if (SOCKETLEY_UNLIKELY(cconn->client_eof || cconn->client_conn_close || body_owing) &&
+    const bool body_owing = cconn->ex.body_unbounded || cconn->ex.body_remaining > 0;
+    if (SOCKETLEY_UNLIKELY(cconn->client_eof || cconn->ex.client_conn_close || body_owing) &&
         cconn->fd >= 0)
     {
         cconn->closing = true;
-        close_pair(cconn->fd, cconn->backend_fd);
+        close_pair(cconn->fd, cconn->ex.backend_fd);
         return;
     }
 
-    cconn->header_parsed = false;
-    cconn->response_started = false;
+    cconn->ex.header_parsed = false;
+    cconn->ex.response_started = false;
     cconn->kept_alive = true;
-    cconn->reissue_ok = false;
+    cconn->ex.reissue_ok = false;
     // The exchange this connection was timed for is over, and the next request
     // arms deadlines of its own; until then it is merely idle, which is
     // --idle-timeout's business.
-    cconn->awaiting_response = false;
-    cconn->awaiting_headers = false;
-    cconn->client_conn_close = false;
-    cconn->method.clear();
-    cconn->path.clear();
-    cconn->version.clear();
+    cconn->ex.awaiting_response = false;
+    cconn->ex.awaiting_headers = false;
+    cconn->ex.client_conn_close = false;
+    cconn->ex.method.clear();
+    cconn->ex.path.clear();
+    cconn->ex.version.clear();
     // Per request and not per connection, because a keep-alive connection
     // whose second request is answered before it reaches the chain would
     // otherwise carry the first request's headers.
-    cconn->filter_headers.clear();
-    cconn->filter_removed_headers.clear();
+    cconn->ex.filter_headers.clear();
+    cconn->ex.filter_removed_headers.clear();
 
-    cconn->declared_body_len = 0;
-    cconn->declared_body_chunked = false;
-    cconn->body_remaining = 0;
-    cconn->body_unbounded = false;
-    cconn->req_chunk = {};
-    cconn->saved_request.clear();
+    cconn->ex.declared_body_len = 0;
+    cconn->ex.declared_body_chunked = false;
+    cconn->ex.body_remaining = 0;
+    cconn->ex.body_unbounded = false;
+    cconn->ex.req_chunk = {};
+    cconn->ex.saved_request.clear();
 
     // conn->partial is deliberately not cleared, because the pipelined request
     // in it has to go through the framing checks -- and nothing else will wake
@@ -8298,7 +8271,7 @@ bool proxy_instance::hold_tcp_half_close(proxy_client_connection* conn)
     // then.
     const bool connecting = conn->connect_pending;
 
-    const int bfd = conn->backend_fd;
+    const int bfd = conn->ex.backend_fd;
     proxy_backend_connection* bconn = nullptr;
     if (bfd >= 0 && bfd < MAX_FDS && m_conn_idx[bfd].side == conn_backend)
         bconn = m_conn_idx[bfd].backend;
@@ -8337,10 +8310,10 @@ bool proxy_instance::hold_tcp_half_close(proxy_client_connection* conn)
 // client's outbound bytes can finish.
 void proxy_instance::forward_client_half_close(proxy_client_connection* conn)
 {
-    if (m_protocol != protocol_tcp || !conn->client_eof || conn->backend_half_closed)
+    if (m_protocol != protocol_tcp || !conn->client_eof || conn->ex.backend_half_closed)
         return;
 
-    const int bfd = conn->backend_fd;
+    const int bfd = conn->ex.backend_fd;
     if (bfd < 0 || bfd >= MAX_FDS || m_conn_idx[bfd].side != conn_backend)
         return;
     auto* bconn = m_conn_idx[bfd].backend;
@@ -8359,7 +8332,7 @@ void proxy_instance::forward_client_half_close(proxy_client_connection* conn)
     // transport's rather than the session's -- a close_notify would be, and
     // TCP mode never sends one.
     if (shutdown(bfd, SHUT_WR) < 0) {}
-    conn->backend_half_closed = true;
+    conn->ex.backend_half_closed = true;
 }
 
 // A TCP backend's half-close is the mirror of the client's: its answer is over
@@ -8377,12 +8350,12 @@ bool proxy_instance::hold_backend_half_close(proxy_backend_connection* bconn)
         return false;
     auto* cconn = m_conn_idx[cfd].client;
     // A TLS client is owed a close_notify, which TCP mode never sends.
-    if (cconn->closing || cconn->backend_fd != bconn->fd || cconn->ssl != nullptr)
+    if (cconn->closing || cconn->ex.backend_fd != bconn->fd || cconn->ssl != nullptr)
         return false;
 
     // The client's direction is over and passed on, so there is nothing to
     // hold for.
-    if (cconn->client_eof && cconn->backend_half_closed)
+    if (cconn->client_eof && cconn->ex.backend_half_closed)
         return false;
 
     if (!client_op_in_flight(cconn) && cconn->write_queue.empty() &&
@@ -8402,7 +8375,7 @@ void proxy_instance::forward_backend_half_close(proxy_client_connection* cconn)
     if (m_protocol != protocol_tcp || cconn->wr_shutdown || cconn->closing || cconn->fd < 0)
         return;
 
-    const int bfd = cconn->backend_fd;
+    const int bfd = cconn->ex.backend_fd;
     if (bfd < 0 || bfd >= MAX_FDS || m_conn_idx[bfd].side != conn_backend)
         return;
     const auto* bconn = m_conn_idx[bfd].backend;
@@ -8421,7 +8394,7 @@ void proxy_instance::forward_backend_half_close(proxy_client_connection* cconn)
 bool proxy_instance::tcp_pair_done(const proxy_client_connection* c,
                                    const proxy_backend_connection* b) const
 {
-    return m_protocol == protocol_tcp && c->client_eof && c->backend_half_closed &&
+    return m_protocol == protocol_tcp && c->client_eof && c->ex.backend_half_closed &&
            c->wr_shutdown && b->backend_eof;
 }
 
@@ -9010,7 +8983,7 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     {
         SKL_TRACE_LOG("connect-result-failed cfd=%d bfd=%d res=%d (%s) saved=%zu",
                       client_fd, bfd, res, strerror(res < 0 ? -res : 0),
-                      conn->saved_request.size());
+                      conn->ex.saved_request.size());
         // Connect failed
         if (fd_ours && bfd >= 0) close_tracked(bfd);
 
@@ -9059,7 +9032,7 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
-    conn->backend_fd = bfd;
+    conn->ex.backend_fd = bfd;
 
     auto bconn = backend_pool_acquire(bfd, conn);
     bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
@@ -9090,10 +9063,10 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
             if (conn->splice_active)
             {
                 // Forward saved data via write, then start splice.
-                if (!conn->saved_request.empty())
+                if (!conn->ex.saved_request.empty())
                 {
-                    forward_to_backend(conn, conn->saved_request);
-                    conn->saved_request.clear();
+                    forward_to_backend(conn, conn->ex.saved_request);
+                    conn->ex.saved_request.clear();
                 }
 
                 // forward_to_backend only queues, and nothing orders a splice
@@ -9123,9 +9096,9 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     // because nothing has reached the backend yet.
     if (SOCKETLEY_UNLIKELY(conn_backend_tls(conn) && !start_backend_tls(conn, ptr)))
     {
-        if (m_protocol == protocol_http && !conn->closing && !conn->response_started)
+        if (m_protocol == protocol_http && !conn->closing && !conn->ex.response_started)
         {
-            conn->backend_fd = -1;
+            conn->ex.backend_fd = -1;
             ptr->client_fd = -1;
             answer_gateway_failure(conn, true);
             close_pair(-1, bfd);
@@ -9136,11 +9109,11 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     }
 
     // Forward any saved data
-    if (!conn->saved_request.empty())
+    if (!conn->ex.saved_request.empty())
     {
-        forward_to_backend(conn, conn->saved_request);
+        forward_to_backend(conn, conn->ex.saved_request);
         if (m_mesh.retry_count <= 0)
-            conn->saved_request.clear();
+            conn->ex.saved_request.clear();
     }
 
     // The client read was left unarmed until a backend existed, and is not
@@ -9194,7 +9167,7 @@ void proxy_instance::handle_client_abort(struct io_uring_cqe* cqe, io_request* r
     if (cqe->res < 0)
     {
         if (conn->closing && !client_op_in_flight(conn))
-            close_pair(client_fd, conn->backend_fd, close_reason::force);
+            close_pair(client_fd, conn->ex.backend_fd, close_reason::force);
         return;
     }
 
@@ -9220,7 +9193,7 @@ void proxy_instance::handle_client_abort(struct io_uring_cqe* cqe, io_request* r
                   client_fd, revents, (int)conn->connect_pending, (unsigned)m_client_count);
     // force: POLLERR/POLLHUP means the peer is gone, so holding would keep the
     // pair for a reply nobody will read.
-    close_pair(client_fd, conn->backend_fd, close_reason::force);
+    close_pair(client_fd, conn->ex.backend_fd, close_reason::force);
 }
 
 void proxy_instance::arm_response_deadline(proxy_client_connection* conn)
@@ -9228,26 +9201,26 @@ void proxy_instance::arm_response_deadline(proxy_client_connection* conn)
     if (m_mesh.backend_timeout <= 0)
         return;
 
-    conn->awaiting_response = true;
-    conn->response_deadline = std::chrono::steady_clock::now() +
+    conn->ex.awaiting_response = true;
+    conn->ex.response_deadline = std::chrono::steady_clock::now() +
                               std::chrono::seconds(m_mesh.backend_timeout);
     arm_response_deadline_sweep();
 }
 
 void proxy_instance::clear_response_deadline(proxy_client_connection* conn)
 {
-    conn->awaiting_response = false;
+    conn->ex.awaiting_response = false;
 }
 
 void proxy_instance::arm_header_deadline(proxy_client_connection* conn)
 {
     // Already running, because the deadline dates from the first incomplete
     // read and renewing it would hand the bound back to the client.
-    if (conn->awaiting_headers)
+    if (conn->ex.awaiting_headers)
         return;
 
-    conn->awaiting_headers = true;
-    conn->header_deadline = std::chrono::steady_clock::now() +
+    conn->ex.awaiting_headers = true;
+    conn->ex.header_deadline = std::chrono::steady_clock::now() +
                             std::chrono::seconds(PROXY_HEADER_TIMEOUT_SEC);
     arm_response_deadline_sweep();
 }
@@ -9300,11 +9273,11 @@ void proxy_instance::response_deadline_sweep()
 
         // A drain past its time ends with the read side, which completes the
         // armed read and lets the teardown run.
-        if (conn->closing && conn->drain_on_close)
+        if (conn->closing && conn->ex.drain_on_close)
         {
-            if (now >= conn->header_deadline)
+            if (now >= conn->ex.header_deadline)
             {
-                conn->drain_on_close = false;
+                conn->ex.drain_on_close = false;
                 shutdown(cfd, SHUT_RD);
             }
             else
@@ -9326,11 +9299,11 @@ void proxy_instance::response_deadline_sweep()
         // then say nothing, and at ten seconds the client got 408 Request
         // Timeout for a request it had sent in full, with nothing charged to
         // the backend that did not answer.
-        if (conn->awaiting_headers)
+        if (conn->ex.awaiting_headers)
         {
-            if (now >= conn->header_deadline)
+            if (now >= conn->ex.header_deadline)
             {
-                conn->awaiting_headers = false;
+                conn->ex.awaiting_headers = false;
                 // Dropped for the same reason the malformed-request path drops
                 // them: the error carries Connection: close, and bytes still
                 // sitting in `partial` must not be picked up as a fresh request
@@ -9355,7 +9328,7 @@ void proxy_instance::response_deadline_sweep()
                 // would leave the pair up until the backend happened to say
                 // something -- and a backend that has stopped saying anything
                 // is the case this deadline is here for.
-                close_pair(cfd, conn->backend_fd, close_reason::force);
+                close_pair(cfd, conn->ex.backend_fd, close_reason::force);
                 continue;
             }
             still_waiting = true;
@@ -9364,10 +9337,10 @@ void proxy_instance::response_deadline_sweep()
             // this one by default.
         }
 
-        if (!conn->awaiting_response)
+        if (!conn->ex.awaiting_response)
             continue;
 
-        if (now < conn->response_deadline)
+        if (now < conn->ex.response_deadline)
         {
             still_waiting = true;
             continue;
@@ -9375,7 +9348,7 @@ void proxy_instance::response_deadline_sweep()
 
         // A half-closed client's answer under way is closed rather than retried,
         // answered 504 or charged, unless the client is still being written to.
-        if (conn->client_eof && conn->response_started)
+        if (conn->client_eof && conn->ex.response_started)
         {
             if (conn->write_pending || !conn->write_queue.empty())
             {
@@ -9383,12 +9356,12 @@ void proxy_instance::response_deadline_sweep()
                 still_waiting = true;
                 continue;
             }
-            conn->awaiting_response = false;
-            close_pair(cfd, conn->backend_fd, close_reason::force);
+            conn->ex.awaiting_response = false;
+            close_pair(cfd, conn->ex.backend_fd, close_reason::force);
             continue;
         }
 
-        conn->awaiting_response = false;
+        conn->ex.awaiting_response = false;
 
         // Charged to the backend so the breaker opens, and to the member a
         // group-routed connection reached rather than to the index that names
@@ -9585,29 +9558,29 @@ void proxy_instance::note_group_selected(std::string_view host, uint16_t port)
 
 void proxy_instance::note_backend_failure(proxy_client_connection* conn)
 {
-    if (conn->backend_from_group)
-        record_group_error(conn->backend_host, conn->backend_port);
+    if (conn->ex.backend_from_group)
+        record_group_error(conn->ex.backend_host, conn->ex.backend_port);
     else
-        record_backend_error(conn->backend_idx);
+        record_backend_error(conn->ex.backend_idx);
 }
 
 void proxy_instance::note_backend_success(proxy_client_connection* conn)
 {
-    if (conn->backend_from_group)
-        record_group_success(conn->backend_host, conn->backend_port);
+    if (conn->ex.backend_from_group)
+        record_group_success(conn->ex.backend_host, conn->ex.backend_port);
     else
-        record_backend_success(conn->backend_idx);
+        record_backend_success(conn->ex.backend_idx);
 }
 
 bool proxy_instance::try_retry(proxy_client_connection* conn)
 {
     // An entrance tries the other runtimes of a group without being asked;
     // see entrance_select.
-    if (conn->retries_remaining <= 0 || (m_mesh.retry_count <= 0 && !m_entrance))
+    if (conn->ex.retries_remaining <= 0 || (m_mesh.retry_count <= 0 && !m_entrance))
         return false;
 
     // Never retry after response data has started flowing to the client
-    if (conn->response_started)
+    if (conn->ex.response_started)
         return false;
 
     // Nor after the client has been answered, because handle_connect would
@@ -9616,15 +9589,15 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
     if (conn->closing)
         return false;
 
-    if (!retry_safe_method(conn->method, m_mesh.retry_all))
+    if (!retry_safe_method(conn->ex.method, m_mesh.retry_all))
         return false;
 
-    conn->retries_remaining--;
+    conn->ex.retries_remaining--;
 
     // Disconnect from current backend safely
-    if (conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS)
+    if (conn->ex.backend_fd >= 0 && conn->ex.backend_fd < MAX_FDS)
     {
-        auto& be = m_conn_idx[conn->backend_fd];
+        auto& be = m_conn_idx[conn->ex.backend_fd];
         if (be.side == conn_backend)
         {
             auto* old_bconn = be.backend;
@@ -9636,19 +9609,19 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
             old_bconn->pipe_to_client[0] = -1;
             old_bconn->pipe_to_client[1] = -1;
 
-            shutdown(conn->backend_fd, SHUT_RDWR);
-            close_tracked(conn->backend_fd);
-            m_conn_idx[conn->backend_fd] = {};
-            if (m_backend_slots[conn->backend_fd])
+            shutdown(conn->ex.backend_fd, SHUT_RDWR);
+            close_tracked(conn->ex.backend_fd);
+            m_conn_idx[conn->ex.backend_fd] = {};
+            if (m_backend_slots[conn->ex.backend_fd])
             {
                 // A retry abandons the backend mid-request, so
                 // backend_pool_release() keeps the struct out of the pool
                 // until its completions land.
-                backend_pool_release(std::unique_ptr<proxy_backend_connection>(std::exchange(m_backend_slots[conn->backend_fd], nullptr)));
+                backend_pool_release(std::unique_ptr<proxy_backend_connection>(std::exchange(m_backend_slots[conn->ex.backend_fd], nullptr)));
                 m_backend_count--;
             }
         }
-        conn->backend_fd = -1;
+        conn->ex.backend_fd = -1;
 
         // Close client's splice pipes too
         if (conn->pipe_to_backend[0] >= 0) close_tracked(conn->pipe_to_backend[0]);
@@ -9664,15 +9637,15 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
     {
         // Without --retry the request is kept only until it went out whole,
         // and one that went out is not sent twice.
-        if (conn->saved_request.empty())
+        if (conn->ex.saved_request.empty())
             return false;
         const backend_info* target = entrance_select(conn, /*retry=*/true);
         if (!target || !connect_to_backend(conn, target))
             return false;
         if (conn->connect_pending)
             return true;    // handle_connect forwards saved_request
-        if (!conn->saved_request.empty())
-            forward_to_backend(conn, conn->saved_request);
+        if (!conn->ex.saved_request.empty())
+            forward_to_backend(conn, conn->ex.saved_request);
         return true;
     }
 
@@ -9681,23 +9654,23 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
     // nowhere to move to and every group request failed on its first refusal.
     // The alternative is another ENDPOINT, which is the same selection asked
     // again with the one that failed taken out.
-    if (conn->backend_from_group)
+    if (conn->ex.backend_from_group)
     {
-        const std::string failed_host = conn->backend_host;
-        const uint16_t    failed_port = conn->backend_port;
+        const std::string failed_host = conn->ex.backend_host;
+        const uint16_t    failed_port = conn->ex.backend_port;
         const backend_info* target =
             select_and_resolve_backend(conn, &failed_host, failed_port);
         if (!target || !connect_to_backend(conn, target))
             return false;
         if (conn->connect_pending)
             return true;    // handle_connect forwards saved_request
-        if (!conn->saved_request.empty())
-            forward_to_backend(conn, conn->saved_request);
+        if (!conn->ex.saved_request.empty())
+            forward_to_backend(conn, conn->ex.saved_request);
         return true;
     }
 
     // Select next healthy backend (skip the one that just failed)
-    const size_t failed = conn->backend_idx;
+    const size_t failed = conn->ex.backend_idx;
     size_t start_idx = (failed + 1) % m_backends.size();
     for (size_t attempts = 0; attempts < m_backends.size(); attempts++)
     {
@@ -9718,8 +9691,8 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
             return true;
 
         // Re-forward saved request
-        if (!conn->saved_request.empty())
-            forward_to_backend(conn, conn->saved_request);
+        if (!conn->ex.saved_request.empty())
+            forward_to_backend(conn, conn->ex.saved_request);
 
         return true;
     }
@@ -9873,7 +9846,7 @@ bool proxy_instance::close_client(int client_fd)
     if (conn->closing) return false;
     // force: the script asked for this connection to be closed, and
     // self.close_client() promising to close is the whole of its contract.
-    close_pair(client_fd, conn->backend_fd, close_reason::force);
+    close_pair(client_fd, conn->ex.backend_fd, close_reason::force);
     return true;
 }
 
@@ -9966,19 +9939,19 @@ bool proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     // Every path out that does not deliver takes the client down with it,
     // because a connection that silently swallows data is worse than one that
     // drops.
-    if (SOCKETLEY_UNLIKELY(conn->backend_fd < 0 || !m_loop))
+    if (SOCKETLEY_UNLIKELY(conn->ex.backend_fd < 0 || !m_loop))
     {
         conn->closing = true;
         return false;
     }
 
-    if (SOCKETLEY_UNLIKELY(conn->backend_fd >= MAX_FDS))
+    if (SOCKETLEY_UNLIKELY(conn->ex.backend_fd >= MAX_FDS))
     {
         conn->closing = true;
         return false;
     }
 
-    auto& be = m_conn_idx[conn->backend_fd];
+    auto& be = m_conn_idx[conn->ex.backend_fd];
     if (SOCKETLEY_UNLIKELY(be.side != conn_backend))
     {
         conn->closing = true;
@@ -10121,7 +10094,7 @@ bool proxy_instance::send_final_and_fin(proxy_client_connection* cconn, std::str
 {
     if (cconn->write_pending || !cconn->write_queue.empty() || cconn->ssl != nullptr ||
         cconn->splice_in_pending || cconn->splice_out_pending || cconn->fd < 0 ||
-        cconn->wr_shutdown || !(cconn->client_conn_close || cconn->client_eof))
+        cconn->wr_shutdown || !(cconn->ex.client_conn_close || cconn->client_eof))
         return false;
 
     size_t off = 0;
@@ -10162,7 +10135,7 @@ bool proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
         return false;
 
     auto* cconn = ce.client;
-    if (SOCKETLEY_UNLIKELY(cconn->backend_fd != conn->fd))
+    if (SOCKETLEY_UNLIKELY(cconn->ex.backend_fd != conn->fd))
         return false;   // not our client any more; see forward_to_backend
 
     if (SOCKETLEY_UNLIKELY(cconn->closing))
@@ -10322,7 +10295,7 @@ bool proxy_instance::client_answerable(const proxy_client_connection* conn) cons
     // Bytes of a backend's response are already on this client's wire, so a
     // status line behind them is the middle of somebody else's message and the
     // close is the honest answer.
-    if (conn->response_started)
+    if (conn->ex.response_started)
         return false;
     return true;
 }
@@ -10367,8 +10340,8 @@ void proxy_instance::queue_final_response(proxy_client_connection* conn,
     // behind our FIN instead, within bounds the deadline sweep enforces.
     if (drain && conn->ssl == nullptr && m_protocol == protocol_http)
     {
-        conn->drain_on_close = true;
-        conn->header_deadline = std::chrono::steady_clock::now() +
+        conn->ex.drain_on_close = true;
+        conn->ex.header_deadline = std::chrono::steady_clock::now() +
                                 std::chrono::seconds(PROXY_DRAIN_LIMIT_SEC);
         arm_response_deadline_sweep();
         return;
@@ -10391,7 +10364,7 @@ bool proxy_instance::continue_drain(proxy_client_connection* conn, int fd, size_
     if (conn->drained_bytes > PROXY_DRAIN_LIMIT_BYTES ||
         (!conn->read_pending && !arm_read(fd, conn)))
     {
-        conn->drain_on_close = false;
+        conn->ex.drain_on_close = false;
         shutdown(fd, SHUT_RD);
         return false;
     }
@@ -10763,7 +10736,7 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
             conn->write_batch[i].clear();
         conn->write_batch_count = 0;
-        close_pair(fd, conn->backend_fd);
+        close_pair(fd, conn->ex.backend_fd);
         return;
     }
 
@@ -10783,7 +10756,7 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
             // The remainder of a short write cannot be handed over, because
             // leaving write_pending set strands the connection mid-message.
             if (SOCKETLEY_UNLIKELY(!submit_write_batch(conn)))
-                close_pair(conn->fd, conn->backend_fd);
+                close_pair(conn->fd, conn->ex.backend_fd);
             return;
         }
     }
@@ -10799,15 +10772,15 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
     {
         if (SOCKETLEY_UNLIKELY(!flush_client_write_queue(conn)))
         {
-            close_pair(conn->fd, conn->backend_fd);
+            close_pair(conn->fd, conn->ex.backend_fd);
             return;
         }
     }
     else if (conn->closing && !conn->read_pending &&
              !conn->splice_in_pending && !conn->splice_out_pending &&
-             !(conn->drain_on_close && continue_drain(conn, fd, 0)))
+             !(conn->ex.drain_on_close && continue_drain(conn, fd, 0)))
     {
-        close_pair(fd, conn->backend_fd);
+        close_pair(fd, conn->ex.backend_fd);
         return;
     }
     else
@@ -10817,26 +10790,26 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
         // The last of a half-closed backend's answer is out, so its FIN may
         // follow, and with the client's own passed on that is the pair done.
         forward_backend_half_close(conn);
-        if (conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS &&
-            m_conn_idx[conn->backend_fd].side == conn_backend &&
-            tcp_pair_done(conn, m_conn_idx[conn->backend_fd].backend))
+        if (conn->ex.backend_fd >= 0 && conn->ex.backend_fd < MAX_FDS &&
+            m_conn_idx[conn->ex.backend_fd].side == conn_backend &&
+            tcp_pair_done(conn, m_conn_idx[conn->ex.backend_fd].backend))
         {
-            close_pair(fd, conn->backend_fd);
+            close_pair(fd, conn->ex.backend_fd);
             return;
         }
     }
 
     // Backpressure resume: if client write queue drained below threshold, restart backend reads
     if (conn->write_queue.bytes() < write_watermark_bytes() &&
-        conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS)
+        conn->ex.backend_fd >= 0 && conn->ex.backend_fd < MAX_FDS)
     {
-        auto& be = m_conn_idx[conn->backend_fd];
+        auto& be = m_conn_idx[conn->ex.backend_fd];
         if (be.side == conn_backend && !be.backend->read_pending &&
             backend_read_armable(be.backend))
         {
-            if (SOCKETLEY_UNLIKELY(!arm_read(conn->backend_fd, be.backend)))
+            if (SOCKETLEY_UNLIKELY(!arm_read(conn->ex.backend_fd, be.backend)))
             {
-                close_pair(conn->fd, conn->backend_fd);
+                close_pair(conn->fd, conn->ex.backend_fd);
                 return;
             }
         }
@@ -10930,7 +10903,7 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
     if (conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
     {
         auto& he = m_conn_idx[conn->client_fd];
-        if (he.side == conn_client && he.client->backend_fd == conn->fd)
+        if (he.side == conn_client && he.client->ex.backend_fd == conn->fd)
         {
             forward_client_half_close(he.client);
             // And with the backend's own FIN already passed on, the pair is done.

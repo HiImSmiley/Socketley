@@ -455,28 +455,28 @@ std::string feed(std::string_view chunk1, std::string_view chunk2)
     // The request line held together: method, path and version must all be
     // slices of the line that was parsed, and none of them may contain the
     // terminator that separates them from the headers.
-    FUZZ_CHECK(conn->method.find('\r') == std::string::npos &&
-               conn->method.find('\n') == std::string::npos,
+    FUZZ_CHECK(conn->ex.method.find('\r') == std::string::npos &&
+               conn->ex.method.find('\n') == std::string::npos,
                "the parsed method contains a line terminator");
-    FUZZ_CHECK(conn->path.find('\r') == std::string::npos &&
-               conn->path.find('\n') == std::string::npos,
+    FUZZ_CHECK(conn->ex.path.find('\r') == std::string::npos &&
+               conn->ex.path.find('\n') == std::string::npos,
                "the parsed path contains a line terminator — it is spliced into the "
                "rewritten request line verbatim");
-    FUZZ_CHECK(conn->version.find('\r') == std::string::npos &&
-               conn->version.find('\n') == std::string::npos,
+    FUZZ_CHECK(conn->ex.version.find('\r') == std::string::npos &&
+               conn->ex.version.find('\n') == std::string::npos,
                "the parsed version contains a line terminator");
 
     // handle_client_read strips the runtime's own "/<name>" prefix and passes
     // what is left.  Feed it the parsed path unchanged: that is the shape the
     // rewrite sees for a bare-prefix request, and it keeps the path attacker-
     // controlled, which is the point.
-    std::string new_path = conn->path.empty() ? std::string("/") : conn->path;
+    std::string new_path = conn->ex.path.empty() ? std::string("/") : conn->ex.path;
     (px.*rewrite)(conn.get(), new_path, forwarded);
 
     FUZZ_CHECK(!forwarded.empty(), "rewrite_http_request produced nothing from a request it accepted");
     FUZZ_CHECK(forwarded.find("\r\n") != std::string::npos,
                "the rewritten request has no request-line terminator");
-    FUZZ_CHECK(forwarded.compare(0, conn->method.size(), conn->method) == 0,
+    FUZZ_CHECK(forwarded.compare(0, conn->ex.method.size(), conn->ex.method) == 0,
                "the rewritten request does not begin with the method that was parsed");
 
     // Whatever had not arrived yet reaches the backend through
@@ -490,9 +490,9 @@ std::string feed(std::string_view chunk1, std::string_view chunk2)
     // request that was in fact checked.
     if (!chunk2_buffered && !chunk2.empty())
     {
-        const size_t n = conn->body_unbounded
+        const size_t n = conn->ex.body_unbounded
             ? chunk2.size()
-            : std::min(conn->body_remaining, chunk2.size());
+            : std::min(conn->ex.body_remaining, chunk2.size());
         forwarded.append(chunk2.data(), n);
     }
 

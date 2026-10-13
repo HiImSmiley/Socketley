@@ -100,6 +100,90 @@ static constexpr int PROXY_HEADER_TIMEOUT_SEC = http_header_deadline_secs;
 static constexpr int      PROXY_DRAIN_LIMIT_SEC   = 10;
 static constexpr uint32_t PROXY_DRAIN_LIMIT_BYTES = 64u << 20;
 
+// One request and its answer on a connection: what the request said, how its body is framed, which backend was
+// chosen for it, and the deadlines that bound it.  One object rather than thirty fields on the connection so that a
+// struct taken from the pool carries nothing of the last exchange in a single assignment, and a field added here
+// cannot be forgotten in that reset -- which is why proxy_backend_connection keeps its answer's framing as one
+// http_response_framing.
+//
+// A connection holds one because HTTP/1.1 has one exchange at a time.  An HTTP/2 stream is this same exchange
+// without a connection of its own, which is why it is a type and not a stretch of the struct below.
+struct proxy_exchange
+{
+    // Read on CQE dispatch, so first in the object.  Measured: the connection's two hot cache lines end at `ssl`,
+    // which this move brought from byte 128 to byte 120 -- so the lines every completion reads got tighter, not
+    // wider, and these five went to byte 2032, where the request's own fields already lay.
+    int backend_fd{-1};
+    bool header_parsed{false};
+    bool response_started{false};
+    bool client_conn_close{false};  // client sent Connection: close
+    // Answered on our own account with the request possibly still arriving,
+    // so it is read away after our FIN until EOF, the byte bound, or
+    // header_deadline, which the answer no longer needs.
+    bool drain_on_close{false};
+
+    // The client's half-close has been passed on with shutdown(SHUT_WR), a
+    // flag because the call has to happen exactly once and every path asks
+    // forward_client_half_close() rather than deciding for itself.
+    bool backend_half_closed{false};
+
+    std::string method;
+    std::string path;
+    std::string version;
+    // An entrance's: the name the request asked for (lower case, no port, no
+    // trailing dot), how many Host fields it carried, and whether its Via
+    // already names this entrance.
+    std::string host;
+    uint8_t host_fields{0};
+    bool via_loop{false};
+
+    // How the request whose header block was just parsed frames its own body,
+    // written by parse_http_request_line and read once by
+    // rewrite_http_request.
+    size_t declared_body_len{0};
+    bool declared_body_chunked{false};
+
+    // How much of the current request's body is still to be forwarded, because
+    // forwarding everything past the header terminator sent a pipelined second
+    // request to the backend without passing a single framing check -- with
+    // body_unbounded the chunked case, walked by req_chunk to its last chunk.
+    size_t body_remaining{0};
+    bool body_unbounded{false};
+    http_chunked_decoder req_chunk{};
+
+    // Request headers a filter set on the request now being parsed, per
+    // request rather than per connection, or the second request on a
+    // keep-alive socket would carry the first one's identity.
+    std::vector<std::pair<std::string, std::string>> filter_headers;
+
+    // Names a filter asked to remove, under the same lifetime rules and the
+    // same ban list, because a filter that could remove Content-Length would
+    // change how the message is framed.
+    std::vector<std::string> filter_removed_headers;
+
+    int retries_remaining{0};
+    size_t backend_idx{0};
+    std::string saved_request;
+    // The request in saved_request went whole onto a socket taken from
+    // parking, so an answer that never starts may be asked for again.
+    bool reissue_ok{false};
+    bool backend_from_group{false};
+    std::string backend_host;
+    uint16_t backend_port{0};
+
+    // A request handed to the backend with no answer yet, which nothing else
+    // bounded: a backend that accepts and stops answering fails no check, and
+    // under load throughput fell 99.7% while the survivors looked perfect.
+    bool awaiting_response{false};
+    std::chrono::steady_clock::time_point response_deadline{};
+
+    // Bytes of a request have arrived and its header block is unfinished,
+    // which the 16 KiB limit does not bound because a client that stops sends
+    // no further bytes to count.
+    bool awaiting_headers{false};
+    std::chrono::steady_clock::time_point header_deadline{};
+};
+
 struct alignas(64) proxy_client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
@@ -121,16 +205,8 @@ struct alignas(64) proxy_client_connection
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
-    bool header_parsed{false};
-    bool response_started{false};
-    bool client_conn_close{false};  // client sent Connection: close
     // Our FIN is out, sent before the armed read comes back so the client is not the one to close.
     bool wr_shutdown{false};
-    // Answered on our own account with the request possibly still arriving,
-    // so it is read away after our FIN until EOF, the byte bound, or
-    // header_deadline, which the answer no longer needs.
-    bool drain_on_close{false};
-    int backend_fd{-1};
     uint32_t write_batch_count{0};
     uint32_t drained_bytes{0};
     io_request read_req;
@@ -166,57 +242,18 @@ struct alignas(64) proxy_client_connection
 
     // === COLD fields ===
     int pipe_to_backend[2]{-1, -1};
-    std::string method;
-    std::string path;
-    std::string version;
-    // An entrance's: the name the request asked for (lower case, no port, no
-    // trailing dot), how many Host fields it carried, and whether its Via
-    // already names this entrance.
-    std::string host;
-    uint8_t host_fields{0};
-    bool via_loop{false};
-
-    // How the request whose header block was just parsed frames its own body,
-    // written by parse_http_request_line and read once by
-    // rewrite_http_request.
-    size_t declared_body_len{0};
-    bool declared_body_chunked{false};
-
-    // How much of the current request's body is still to be forwarded, because
-    // forwarding everything past the header terminator sent a pipelined second
-    // request to the backend without passing a single framing check -- with
-    // body_unbounded the chunked case, walked by req_chunk to its last chunk.
-    size_t body_remaining{0};
-    bool body_unbounded{false};
-    http_chunked_decoder req_chunk{};
-
+    proxy_exchange ex;
     // The client's address as X-Forwarded-For names it, looked up on the
     // connection's first request and kept for the rest.
     std::string peer_addr;
 
-    // Request headers a filter set on the request now being parsed, per
-    // request rather than per connection, or the second request on a
-    // keep-alive socket would carry the first one's identity.
-    std::vector<std::pair<std::string, std::string>> filter_headers;
-
-    // Names a filter asked to remove, under the same lifetime rules and the
-    // same ban list, because a filter that could remove Content-Length would
-    // change how the message is framed.
-    std::vector<std::string> filter_removed_headers;
-
     std::chrono::steady_clock::time_point last_activity{};
-    int retries_remaining{0};
-    size_t backend_idx{0};
-    std::string saved_request;
     // The backend kept idle for this connection's next request, or -1; see
     // proxy_instance::park_backend.
     int parked_backend_fd{-1};
     // An exchange on this connection has finished and it stayed open, which
     // is the evidence park_backend waits for.
     bool kept_alive{false};
-    // The request in saved_request went whole onto a socket taken from
-    // parking, so an answer that never starts may be asked for again.
-    bool reissue_ok{false};
 
     // Bumped on every reuse from the pool and stamped into io_requests, so
     // late completions from the previous occupant can be recognised and
@@ -229,13 +266,6 @@ struct alignas(64) proxy_client_connection
     // The client has shut its write side and is still reading, set on the EOF
     // completion and nowhere else, on both the copy and the splice path.
     bool client_eof{false};
-    // And that half-close has been passed on with shutdown(SHUT_WR), a flag
-    // because the call has to happen exactly once and every path asks
-    // forward_client_half_close() rather than deciding for itself.
-    bool backend_half_closed{false};
-    bool backend_from_group{false};
-    std::string backend_host;
-    uint16_t backend_port{0};
 
     // Rate limiting per connection, with the same three fields and names the
     // server and the cache carry, and rl_max of 0 the common case the check
@@ -257,18 +287,6 @@ struct alignas(64) proxy_client_connection
     // flow control still applies.
     bool abort_watch_pending{false};
     io_request abort_req;
-
-    // A request handed to the backend with no answer yet, which nothing else
-    // bounded: a backend that accepts and stops answering fails no check, and
-    // under load throughput fell 99.7% while the survivors looked perfect.
-    bool awaiting_response{false};
-    std::chrono::steady_clock::time_point response_deadline{};
-
-    // Bytes of a request have arrived and its header block is unfinished,
-    // which the 16 KiB limit does not bound because a client that stops sends
-    // no further bytes to count.
-    bool awaiting_headers{false};
-    std::chrono::steady_clock::time_point header_deadline{};
 
     SKL_TRACE_FIELD(tr)
     SKL_INV_FIELD(pr)
@@ -735,7 +753,7 @@ private:
     void entrance_certify();
     // The route for a host name, exact before wildcard; nullptr for none.
     entrance_route* entrance_find(std::string_view host);
-    // A runtime of conn->host's route, round robin over those available; on a
+    // A runtime of conn->ex.host's route, round robin over those available; on a
     // retry, one other than the one that just failed.
     const backend_info* entrance_select(proxy_client_connection* conn, bool retry);
     // The entrance's checks on a parsed request -- a Host, the same name as
