@@ -17,6 +17,7 @@
 #include <deque>
 #include <unordered_map>
 
+#include "../../shared/h2_driver.h"
 #include "../../shared/h2_frame.h"
 #include "../../shared/h2_session.h"
 #include "../../shared/hpack.h"
@@ -500,49 +501,8 @@ void storage_run::h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n)
                     conn_error(h2::ENHANCE_YOUR_CALM);
                     break;
                 }
-                bool bad = false;
-                for (size_t i = 0; i + 6 <= pl.size() && !bad; i += 6)
-                {
-                    const uint16_t id = static_cast<uint16_t>(static_cast<uint8_t>(pl[i]) << 8 | static_cast<uint8_t>(pl[i + 1]));
-                    const uint32_t v = h2::rd32(pl.data() + i + 2);
-                    if (id == h2::ENABLE_PUSH && v > 1)
-                        bad = true, conn_error(h2::PROTOCOL_ERROR);
-                    else if (id == h2::INITIAL_WINDOW_SIZE)
-                    {
-                        if (v > h2::max_window)
-                        {
-                            bad = true;
-                            conn_error(h2::FLOW_CONTROL_ERROR);
-                            break;
-                        }
-                        // Every open stream's window moves by the difference, and may go below zero.
-                        const int64_t delta = static_cast<int64_t>(v) - s.peer_init_win;
-                        s.peer_init_win = v;
-                        for (auto& [sid, sc] : s.streams)
-                        {
-                            sc->h2s->send_win += delta;
-                            if (sc->h2s->send_win > h2::max_window)
-                            {
-                                bad = true;
-                                conn_error(h2::FLOW_CONTROL_ERROR);
-                                break;
-                            }
-                            if (delta > 0 && sc->h2s->tx_left())
-                                enqueue(s, *sc->h2s);
-                        }
-                    }
-                    else if (id == h2::MAX_FRAME_SIZE)
-                    {
-                        if (v < h2::default_frame || v > 16777215)
-                            bad = true, conn_error(h2::PROTOCOL_ERROR);
-                        else
-                            s.peer_max_frame = std::min<uint32_t>(v, 64 * 1024);
-                    }
-                }
-                if (bad)
-                    break;
-                s.got_settings = true;
-                h2::put_settings_ack(s.ctl);
+                if (const auto r = h2::settings_in(s, pl); r.kind == h2::outcome::what::conn_error)
+                    conn_error(r.code);
                 break;
             }
             case h2::PING:
@@ -571,37 +531,11 @@ void storage_run::h2_in(const std::shared_ptr<conn>& c, const char* p, size_t n)
                     conn_error(h2::FRAME_SIZE_ERROR);
                     break;
                 }
-                const uint32_t inc = h2::rd32(pl.data()) & 0x7fffffffu;
-                if (h.sid == 0)
-                {
-                    if (inc == 0 || s.send_win + inc > h2::max_window)
-                    {
-                        conn_error(inc == 0 ? h2::PROTOCOL_ERROR : h2::FLOW_CONTROL_ERROR);
-                        break;
-                    }
-                    s.send_win += inc;
-                    for (auto& [sid, sc] : s.streams)
-                        if (sc->h2s->tx_left() && sc->h2s->send_win > 0)
-                            enqueue(s, *sc->h2s);
-                    break;
-                }
-                if (h.sid > s.last_sid)
-                {
-                    conn_error(h2::PROTOCOL_ERROR);
-                    break;
-                }
-                auto it = s.streams.find(h.sid);
-                if (it == s.streams.end())
-                    break;
-                h2_stream& st = *it->second->h2s;
-                if (inc == 0 || st.send_win + inc > h2::max_window)
-                {
-                    stream_error(h.sid, inc == 0 ? h2::PROTOCOL_ERROR : h2::FLOW_CONTROL_ERROR);
-                    break;
-                }
-                st.send_win += inc;
-                if (st.tx_left())
-                    enqueue(s, st);
+                const auto r = h2::window_update_in(s, h, pl);
+                if (r.kind == h2::outcome::what::conn_error)
+                    conn_error(r.code);
+                else if (r.kind == h2::outcome::what::stream_error)
+                    stream_error(r.sid, r.code);
                 break;
             }
             case h2::PUSH_PROMISE:
@@ -841,76 +775,7 @@ void storage_run::h2_stream_out(const std::shared_ptr<conn>& c, std::string data
     h2_stream& st = *c->h2s;
     if (st.reset || st.local_closed)
         return;
-    std::string_view rest = data;
-    while (!rest.empty())
-    {
-        if (st.os == h2_stream::out_state::head)
-        {
-            // The answer's head, which this runtime wrote, so its form is known: a status line and its fields.
-            st.head_acc.append(rest);
-            rest = {};
-            const size_t end = st.head_acc.find("\r\n\r\n");
-            if (end == std::string::npos)
-                break;
-            const std::string_view head(st.head_acc.data(), end + 2);
-            const std::string after = st.head_acc.substr(end + 4);
-            std::string block;
-            if (s.first_block)
-            {
-                // The table this side's blocks could use is set to nothing, so the peer's needs no tracking.
-                block += '\x20';
-                s.first_block = false;
-            }
-            mux::response mr;
-            mux::response_head(head, mr);
-            hpack::encode(block, ":status", mr.status);
-            for (const auto& [name, value] : mr.fields)
-                hpack::encode(block, name, value);
-            const bool interim = mr.interim, chunked = mr.chunked;
-            h2::put_header_block(st.hdr, st.sid, block, false, s.peer_max_frame);
-            st.head_acc.clear();
-            if (!interim)
-                st.os = chunked ? h2_stream::out_state::dechunk : h2_stream::out_state::body;
-            if (!after.empty())
-            {
-                data = after;
-                rest = data;
-            }
-            continue;
-        }
-        if (st.os == h2_stream::out_state::body)
-        {
-            // A piece of a file is taken as it was handed over, when nothing is waiting before it.
-            if (st.tx_off == st.tx.size())
-            {
-                st.tx_off = 0;
-                if (rest.data() == data.data() && rest.size() == data.size())
-                    st.tx = std::move(data);
-                else
-                    st.tx.assign(rest);
-            }
-            else
-                st.tx.append(rest);
-            rest = {};
-            break;
-        }
-        // A chunked answer's framing is HTTP/1.1's, and DATA frames carry what is inside it.
-        st.dechunk_in.append(rest);
-        rest = {};
-        std::string_view view = st.dechunk_in;
-        for (;;)
-        {
-            std::string_view out;
-            const chunk_step k = http_chunked_next(st.dechunk, view, out);
-            if (k == chunk_step::payload)
-            {
-                st.tx.append(out);
-                continue;
-            }
-            break;
-        }
-        st.dechunk_in.erase(0, st.dechunk_in.size() - view.size());
-    }
+    h2::frame_answer(s, st, std::move(data));
     c->last_progress = std::chrono::steady_clock::now();
     // An answer handed over whole -- send_response's -- ends the stream with its last DATA frame rather than an empty
     // one sent a turn later; a chunked one ends with its last chunk, which cannot be seen coming.
@@ -962,13 +827,7 @@ void storage_run::h2_stream_gone(const std::shared_ptr<conn>& c)
             st.reset = true;
         }
         // What it received and its phase never took is the connection's again.
-        s.recv_unacked += static_cast<uint32_t>(st.rx_bytes);
-        if (s.recv_unacked >= conn_window / 2)
-        {
-            h2::put_window_update(s.ctl, 0, s.recv_unacked);
-            s.recv_avail += s.recv_unacked;
-            s.recv_unacked = 0;
-        }
+        h2::give_back(s, static_cast<uint32_t>(st.rx_bytes));
     }
     s.streams.erase(st.sid);
     st.rxq.clear();
@@ -995,63 +854,17 @@ void storage_run::h2_schedule(const std::shared_ptr<conn>& c)
         c->wq_off = 0;
     }
     std::string& out = c->wq;
-    const size_t before = unsent(*c);
     const size_t start = out.size();
-    out += s.ctl;
-    s.ctl.clear();
     std::vector<std::shared_ptr<conn>> ended;
-    while (!s.rr.empty() && before + (out.size() - start) < out_high)
-    {
-        const uint32_t sid = s.rr.front();
-        s.rr.pop_front();
-        auto it = s.streams.find(sid);
-        if (it == s.streams.end())
-            continue;
-        auto sc = it->second;
-        h2_stream& st = *sc->h2s;
-        st.queued = false;
-        if (st.reset || st.local_closed)
-            continue;
-        if (!st.hdr.empty())
-        {
-            out += st.hdr;
-            st.hdr.clear();
-        }
-        const int64_t win = std::min(st.send_win, s.send_win);
-        if (st.tx_left() && win > 0)
-        {
-            const size_t n = std::min<size_t>({st.tx_left(), static_cast<size_t>(win), s.peer_max_frame});
-            const bool last = st.end_pending && n == st.tx_left();
-            h2::put_data(out, sid, std::string_view(st.tx).substr(st.tx_off, n), last);
-            st.tx_off  += n;
-            st.send_win -= static_cast<int64_t>(n);
-            s.send_win  -= static_cast<int64_t>(n);
-            sc->last_progress = std::chrono::steady_clock::now();
-            if (last)
-                st.local_closed = true;
-        }
-        if (!st.tx_left())
-        {
-            st.tx.clear();
-            st.tx_off = 0;
-            if (st.end_pending && !st.local_closed)
-            {
-                h2::put_data(out, sid, {}, true);
-                st.local_closed = true;
-            }
-        }
-        if (st.local_closed)
-        {
-            ended.push_back(sc);
-            continue;
-        }
-        if (!st.tx_left() && st.hdr.empty() && sc->after_write != conn::after_kind::none &&
-            st.os != h2_stream::out_state::head)
-            m_h2_due.push_back(sc);
-        // More of it goes in the next turn, unless a window holds it until an update comes.
-        if (st.tx_left() && st.send_win > 0 && s.send_win > 0)
-            enqueue(s, st);
-    }
+    h2::drain(s, out, unsent(*c), out_high,
+              [](const std::shared_ptr<conn>& sc) { sc->last_progress = std::chrono::steady_clock::now(); },
+              [&](const std::shared_ptr<conn>& sc) { ended.push_back(sc); },
+              // A stream with nothing left to send is asked for its next piece only if it is waiting to be asked.
+              [&](const std::shared_ptr<conn>& sc)
+              {
+                  if (sc->after_write != conn::after_kind::none)
+                      m_h2_due.push_back(sc);
+              });
     if (out.size() > start)
         pump_write(c);
     for (auto& sc : ended)
