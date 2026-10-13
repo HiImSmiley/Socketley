@@ -55,6 +55,10 @@ struct ngtcp2_cid;
 
 class storage_instance;
 
+// The request a multiplexed stream's head was read into, named here because h2_start_stream takes one; the
+// definition is mux_head.h's, which only the files that frame a stream include.
+namespace socketley::mux { struct request; }
+
 namespace socketley::storage
 {
 
@@ -771,7 +775,8 @@ public:
     void h2_parent_gone(const std::shared_ptr<conn>& c);
     void h2_goaway(const std::shared_ptr<conn>& c, uint32_t code, bool now);
     bool h2_preface_in(const std::shared_ptr<conn>& c, const char* p, size_t n);
-    bool h2_headers(const std::shared_ptr<conn>& c, uint32_t sid);
+    std::shared_ptr<conn> h2_make_stream(const std::shared_ptr<conn>& c);
+    void h2_start_stream(const std::shared_ptr<conn>& sc, socketley::mux::request& mr, int answer_status);
     void h2_sweep(const std::shared_ptr<conn>& c, std::chrono::steady_clock::time_point now);
 
     // HTTP/3, in storage_h3.cpp: a UDP socket beside the TCP listener when --tls is on; datagrams in and out through

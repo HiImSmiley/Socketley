@@ -277,4 +277,443 @@ void drain(session<S>& s, std::string& out, size_t unsent_now, size_t out_high, 
     }
 }
 
+// What a runtime answers while its frames are being read.  A host is a type with these members, taken by reference
+// and called directly, so nothing here is a virtual call:
+//
+//   bool gone()                       the connection is going; stop reading
+//   void close_now()                  a peer that is not speaking HTTP/2 at all, so it is not answered
+//   void want_more()                  ask the transport for the rest of a frame
+//   void conn_error(uint32_t code)     GOAWAY with that code; feed() discards the rest of the bytes
+//   void stream_gone(const S& h)      let go of what was kept for a stream the protocol has ended
+//   S    make(uint32_t sid)            the handle for a new stream, falsy when it cannot be made
+//   void start(const S& h, mux::request& r, int answer_status)   route that stream, or answer it that status
+//   void body(const S& h, std::string_view d)        DATA's payload to whatever reads the stream
+//   void body_end(const S& h)                        END_STREAM with nothing left to add
+//   void count(event e)                              the runtime's own counters
+//
+// Making a stream and starting it are two calls because the stream's own state has to be set between them: an
+// answer a host produces inside start() is framed at once, and a stream that did not know its number yet would
+// frame it onto stream 0.  `start` is given a status instead of a route when the head cannot be served as it
+// stands -- a list too long for this side is answered 431, as HTTP/1.1's would be -- and the stream is made either
+// way, because the answer has to go somewhere.
+enum class event : uint8_t { stream_opened, stream_refused, reset_in, reset_out };
+
+// A stream's own error ends it alone: the peer is told with an RST_STREAM, the stream is marked so none is sent
+// again, and the host lets go of whatever it kept for it.
+template <class S, class Host>
+void reset_stream(session<S>& s, uint32_t sid, uint32_t code, Host& host)
+{
+    put_rst(s.ctl, sid, code);
+    host.count(event::reset_out);
+    if (auto it = s.streams.find(sid); it != s.streams.end())
+    {
+        state_of(it->second).reset = true;
+        host.stream_gone(it->second);
+    }
+}
+
+// A complete header block: a new stream's request, or trailers, which are read only so the table stays in step.
+// False for a block HPACK cannot read, after which the connection cannot go on.
+template <class S, class Host>
+bool headers_in(session<S>& s, uint32_t sid, size_t max_head_bytes, Host& host)
+{
+    std::vector<hpack::header> fields;
+    const auto res = s.dec.decode(s.cont_buf, fields, header_list_max);
+    std::string().swap(s.cont_buf);
+    if (res == hpack::decoder::result::error)
+        return false;
+
+    if (s.cont_trailers)
+    {
+        auto it = s.streams.find(sid);
+        if (it == s.streams.end())
+            return true;
+        S h = it->second;
+        stream& st = state_of(h);
+        st.remote_closed = true;
+        if (st.has_cl && st.data_in != st.cl)
+        {
+            reset_stream(s, sid, PROTOCOL_ERROR, host);
+            return true;
+        }
+        host.body_end(h);
+        return true;
+    }
+
+    s.last_sid = sid;
+    auto refuse = [&](uint32_t code)
+    {
+        put_rst(s.ctl, sid, code);
+        host.count(event::reset_out);
+    };
+    if (s.cont_refuse)
+    {
+        refuse(PROTOCOL_ERROR);
+        return true;
+    }
+    // A client told to go away, or one at its limit, has the stream refused, which it may try again elsewhere.
+    if (s.goaway_sent || s.streams.size() >= max_streams)
+    {
+        host.count(event::stream_refused);
+        refuse(REFUSED_STREAM);
+        return true;
+    }
+    // A list too long for this side is answered, as HTTP/1.1's would be.
+    int answer_status = res == hpack::decoder::result::too_large ? 431 : 0;
+
+    std::vector<std::pair<std::string, std::string>> list;
+    list.reserve(fields.size());
+    for (auto& f : fields)
+        list.emplace_back(std::move(f.name), std::move(f.value));
+    mux::request mr;
+    const mux::verdict v = mux::request_head(list, s.cont_end_stream, max_head_bytes, mr);
+    if (v == mux::verdict::malformed && answer_status == 0)
+    {
+        refuse(PROTOCOL_ERROR);
+        return true;
+    }
+    if (v == mux::verdict::too_large)
+        answer_status = 431;
+
+    S h = host.make(sid);
+    if (!h)
+        return true;
+    stream& st = state_of(h);
+    st.sid           = sid;
+    st.send_win      = s.peer_init_win;
+    st.remote_closed = s.cont_end_stream;
+    st.has_cl        = mr.has_cl;
+    st.cl            = mr.cl;
+    st.synth_chunked = mr.synth_chunked;
+    s.streams[sid]   = h;
+    host.count(event::stream_opened);
+    host.start(h, mr, answer_status);
+    return true;
+}
+
+// Frames out of `p`/`n`, with `frag` holding the one frame cut off by the end of them for the next call.  Reading
+// stops the moment the host says the connection is going, and the bytes after a connection error are discarded
+// rather than read, which is what GOAWAY means.
+//
+// False when it stopped before reading any frame -- a session already going, a peer that is not speaking HTTP/2, or
+// a preface still arriving -- in which case the caller must not finish the turn: close_now() and want_more() have
+// already said what happens next, and arming a second read over the first is not idempotent.
+template <class S, class Host>
+bool feed(session<S>& s, std::string& frag, const char* p, size_t n, size_t max_head_bytes, Host& host)
+{
+    if (s.dying)
+        return false;
+    // Frames are read where the bytes arrived; only a frame cut off by the end of them is kept for the next.
+    std::string held;
+    std::string_view buf(p, n);
+    if (!frag.empty())
+    {
+        frag.append(p, n);
+        held.swap(frag);
+        buf = held;
+    }
+    size_t at = 0;
+    auto conn_error = [&](uint32_t code)
+    {
+        buf = {};
+        at  = 0;
+        host.conn_error(code);
+    };
+
+    if (!s.preface_ok)
+    {
+        const std::string_view pre = preface;
+        const size_t look = std::min(pre.size(), buf.size());
+        if (buf.substr(0, look) != pre.substr(0, look))
+        {
+            host.close_now();
+            return false;
+        }
+        if (buf.size() < pre.size())
+        {
+            frag.assign(buf);
+            host.want_more();
+            return false;
+        }
+        s.preface_ok = true;
+        at = pre.size();
+    }
+
+    while (!host.gone() && !s.dying && buf.size() - at >= head_len)
+    {
+        const frame_head h = parse_head(buf.data() + at);
+        if (h.len > default_frame)
+        {
+            conn_error(FRAME_SIZE_ERROR);
+            break;
+        }
+        if (buf.size() - at < head_len + h.len)
+            break;
+        std::string_view pl(buf.data() + at + head_len, h.len);
+        at += head_len + h.len;
+        tick_window(s);
+
+        // The first frame is the client's SETTINGS; between HEADERS and its END_HEADERS only CONTINUATION.
+        if (!s.got_settings && (h.type != SETTINGS || (h.flags & ACK)))
+        {
+            conn_error(PROTOCOL_ERROR);
+            break;
+        }
+        if (s.cont_sid && (h.type != CONTINUATION || h.sid != s.cont_sid))
+        {
+            conn_error(PROTOCOL_ERROR);
+            break;
+        }
+
+        switch (h.type)
+        {
+            case DATA:
+            {
+                if (h.sid == 0 || h.sid > s.last_sid)
+                {
+                    conn_error(PROTOCOL_ERROR);
+                    break;
+                }
+                if (static_cast<int64_t>(h.len) > s.recv_avail)
+                {
+                    conn_error(FLOW_CONTROL_ERROR);
+                    break;
+                }
+                s.recv_avail -= h.len;
+                auto it = s.streams.find(h.sid);
+                if (it == s.streams.end() || state_of(it->second).remote_closed)
+                {
+                    // The bytes are the connection's again, and DATA on a closed stream is STREAM_CLOSED (RFC 9113
+                    // 5.1); the answers to a peer that keeps sending such are bounded like its resets.
+                    s.recv_unacked += h.len;
+                    if (++s.strays <= resets_max)
+                        reset_stream(s, h.sid, STREAM_CLOSED, host);
+                    break;
+                }
+                S hnd = it->second;
+                stream& st = state_of(hnd);
+                if (static_cast<int64_t>(h.len) > st.recv_avail)
+                {
+                    s.recv_unacked += h.len;
+                    reset_stream(s, h.sid, FLOW_CONTROL_ERROR, host);
+                    break;
+                }
+                st.recv_avail -= h.len;
+                if (!unpad(h, pl))
+                {
+                    conn_error(PROTOCOL_ERROR);
+                    break;
+                }
+                // Padding is given back at once; the payload when the reader takes it.
+                const uint32_t pad = h.len - static_cast<uint32_t>(pl.size());
+                s.recv_unacked += pad;
+                st.rx_unacked  += pad;
+                if (pl.empty() && !(h.flags & END_STREAM) && ++s.empty_data > empty_data_max)
+                {
+                    conn_error(ENHANCE_YOUR_CALM);
+                    break;
+                }
+                st.data_in += pl.size();
+                if (st.has_cl && st.data_in > st.cl)
+                {
+                    s.recv_unacked += static_cast<uint32_t>(pl.size());
+                    reset_stream(s, h.sid, PROTOCOL_ERROR, host);
+                    break;
+                }
+                if (h.flags & END_STREAM)
+                {
+                    st.remote_closed = true;
+                    if (st.has_cl && st.data_in != st.cl)
+                    {
+                        s.recv_unacked += static_cast<uint32_t>(pl.size());
+                        reset_stream(s, h.sid, PROTOCOL_ERROR, host);
+                        break;
+                    }
+                }
+                host.body(hnd, pl);
+                break;
+            }
+            case HEADERS:
+            {
+                if (h.sid == 0 || !(h.sid & 1))
+                {
+                    conn_error(PROTOCOL_ERROR);
+                    break;
+                }
+                // A stream may not depend on itself (RFC 9113 5.3.1), which is its own error; the block is still
+                // decoded, so the table stays in step.
+                bool self_dependent = false;
+                if (h.flags & PRIORITY_F)
+                {
+                    const size_t at_dep = (h.flags & PADDED) ? 1 : 0;
+                    self_dependent = pl.size() >= at_dep + 4 && (rd32(pl.data() + at_dep) & 0x7fffffffu) == h.sid;
+                }
+                if (!unpad(h, pl))
+                {
+                    conn_error(PROTOCOL_ERROR);
+                    break;
+                }
+                bool trailers = false;
+                if (h.sid <= s.last_sid)
+                {
+                    auto it = s.streams.find(h.sid);
+                    // Trailers end the stream they follow; HEADERS on a stream that is closed is an error.
+                    if (it == s.streams.end() || state_of(it->second).remote_closed)
+                    {
+                        conn_error(STREAM_CLOSED);
+                        break;
+                    }
+                    if (!(h.flags & END_STREAM))
+                    {
+                        conn_error(PROTOCOL_ERROR);
+                        break;
+                    }
+                    trailers = true;
+                }
+                s.cont_sid        = h.sid;
+                s.cont_buf.assign(pl);
+                s.cont_end_stream = h.flags & END_STREAM;
+                s.cont_trailers   = trailers;
+                s.cont_frames     = 0;
+                s.cont_refuse     = self_dependent;
+                if (h.flags & END_HEADERS)
+                {
+                    const uint32_t sid = s.cont_sid;
+                    s.cont_sid = 0;
+                    if (!headers_in(s, sid, max_head_bytes, host))
+                        conn_error(COMPRESSION_ERROR);
+                }
+                break;
+            }
+            case CONTINUATION:
+            {
+                if (!s.cont_sid)
+                {
+                    conn_error(PROTOCOL_ERROR);
+                    break;
+                }
+                s.cont_buf.append(pl);
+                if (s.cont_buf.size() > block_max || ++s.cont_frames > continuations_max)
+                {
+                    conn_error(ENHANCE_YOUR_CALM);
+                    break;
+                }
+                if (h.flags & END_HEADERS)
+                {
+                    const uint32_t sid = s.cont_sid;
+                    s.cont_sid = 0;
+                    if (!headers_in(s, sid, max_head_bytes, host))
+                        conn_error(COMPRESSION_ERROR);
+                }
+                break;
+            }
+            case PRIORITY:
+                if (h.sid == 0)
+                    conn_error(PROTOCOL_ERROR);
+                else if (h.len != 5)
+                    reset_stream(s, h.sid, FRAME_SIZE_ERROR, host);
+                else if ((rd32(pl.data()) & 0x7fffffffu) == h.sid)
+                    reset_stream(s, h.sid, PROTOCOL_ERROR, host);
+                break;
+            case RST_STREAM:
+            {
+                if (h.sid == 0 || h.sid > s.last_sid)
+                {
+                    conn_error(PROTOCOL_ERROR);
+                    break;
+                }
+                if (h.len != 4)
+                {
+                    conn_error(FRAME_SIZE_ERROR);
+                    break;
+                }
+                host.count(event::reset_in);
+                // Streams opened and reset at once cost this side their work and the client nothing.
+                if (++s.resets > resets_max)
+                {
+                    conn_error(ENHANCE_YOUR_CALM);
+                    break;
+                }
+                if (auto it = s.streams.find(h.sid); it != s.streams.end())
+                {
+                    state_of(it->second).reset = true;
+                    host.stream_gone(it->second);
+                }
+                break;
+            }
+            case SETTINGS:
+            {
+                if (h.sid != 0)
+                {
+                    conn_error(PROTOCOL_ERROR);
+                    break;
+                }
+                if (h.flags & ACK)
+                {
+                    if (h.len != 0)
+                        conn_error(FRAME_SIZE_ERROR);
+                    break;
+                }
+                if (h.len % 6)
+                {
+                    conn_error(FRAME_SIZE_ERROR);
+                    break;
+                }
+                if (++s.settings > settings_max)
+                {
+                    conn_error(ENHANCE_YOUR_CALM);
+                    break;
+                }
+                if (const auto r = settings_in(s, pl); r.kind == outcome::what::conn_error)
+                    conn_error(r.code);
+                break;
+            }
+            case PING:
+                if (h.sid != 0)
+                    conn_error(PROTOCOL_ERROR);
+                else if (h.len != 8)
+                    conn_error(FRAME_SIZE_ERROR);
+                else if (!(h.flags & ACK))
+                {
+                    if (++s.pings > pings_max)
+                        conn_error(ENHANCE_YOUR_CALM);
+                    else
+                        put_ping_ack(s.ctl, pl);
+                }
+                break;
+            case GOAWAY:
+                if (h.sid != 0)
+                    conn_error(PROTOCOL_ERROR);
+                else
+                    s.peer_goaway = true;
+                break;
+            case WINDOW_UPDATE:
+            {
+                if (h.len != 4)
+                {
+                    conn_error(FRAME_SIZE_ERROR);
+                    break;
+                }
+                const auto r = window_update_in(s, h, pl);
+                if (r.kind == outcome::what::conn_error)
+                    conn_error(r.code);
+                else if (r.kind == outcome::what::stream_error)
+                    reset_stream(s, r.sid, r.code, host);
+                break;
+            }
+            case PUSH_PROMISE:
+                conn_error(PROTOCOL_ERROR);
+                break;
+            default:
+                // Frames of a kind not known are ignored, as RFC 9113 asks.
+                break;
+        }
+    }
+    if (host.gone())
+        return true;
+    if (!s.dying && at < buf.size())
+        frag.assign(buf.substr(at));
+    return true;
+}
+
 }   // namespace socketley::h2
