@@ -357,7 +357,7 @@ bool headers_in(session<S>& s, uint32_t sid, size_t max_head_bytes, Host& host)
         return true;
     }
     // A client told to go away, or one at its limit, has the stream refused, which it may try again elsewhere.
-    if (s.goaway_sent || s.streams.size() >= max_streams)
+    if (s.goaway_sent || s.streams.size() >= s.max_live)
     {
         host.count(event::stream_refused);
         refuse(REFUSED_STREAM);

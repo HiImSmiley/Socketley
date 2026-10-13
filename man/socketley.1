@@ -11110,7 +11110,13 @@ on port 80, which sends every request to HTTPS
 .RB ( \-\-redirect\-https ).
 Behind it, every response over TLS carries
 .B "Strict\-Transport\-Security: max\-age=31536000"
-unless the runtime answering set its own. It stops, starts and is removed with
+unless the runtime answering set its own. Over TLS it speaks HTTP/2 to a client
+that offers it by ALPN and HTTP/1.1 to one that does not: each stream is routed by
+the name it asks for, as a request over HTTP/1.1 is, and one asking for a name
+other than the one its connection's handshake gave is answered 421. A client may
+have eight streams open at once;
+.B SOCKETLEY_PROXY_HTTP2=0
+turns HTTP/2 off. It stops, starts and is removed with
 this runtime; removed while another dns runtime names it too, it becomes that
 one's instead. A proxy of that name that exists already is taken as it is,
 provided it is an entrance.
@@ -15727,6 +15733,15 @@ A test hook: a directory in which a file named
 runtime answer the message of that phase of a bucket document change as a sibling
 that could not be reached would, without acting on it, for as long as the file
 exists, so a test can lose a message at each step of the change. Unset by default.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_PROXY_HTTP2
+.B 0
+turns HTTP/2 off at an entrance, which then speaks HTTP/1.1 to every client over
+.BR \-\-tls ;
+see the entrance under the dns runtime's
+.BR \-\-proxy .
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

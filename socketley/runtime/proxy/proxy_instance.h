@@ -184,6 +184,15 @@ struct proxy_exchange
     std::chrono::steady_clock::time_point header_deadline{};
 };
 
+// An HTTP/2 session and one stream's protocol state, opaque here for the same reason the storage keeps them so:
+// only the file that frames a stream includes the codec, HPACK and the session's own header.
+namespace socketley::mux { struct request; }
+
+struct proxy_h2_conn;
+struct proxy_h2_stream;
+struct proxy_h2_conn_free { void operator()(proxy_h2_conn* s) const; };
+struct proxy_h2_stream_free { void operator()(proxy_h2_stream* s) const; };
+
 struct alignas(64) proxy_client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
@@ -243,6 +252,20 @@ struct alignas(64) proxy_client_connection
     // === COLD fields ===
     int pipe_to_backend[2]{-1, -1};
     proxy_exchange ex;
+
+    // Non-null only on a client that chose h2 by ALPN: its session, its streams and the frames waiting for the wire.
+    std::unique_ptr<proxy_h2_conn, proxy_h2_conn_free> h2;
+    // Non-null only on a stream's own connection: the stream's protocol state, and the client whose session it is.
+    // A stream is a client like any other here -- a descriptor, a slot, an exchange, a lifetime -- so the request it
+    // carries is routed and served by every path this proxy already has.  Only two things differ: its reads come
+    // from its stream's DATA rather than from a socket, and its answer is framed onto its parent rather than written.
+    std::unique_ptr<proxy_h2_stream, proxy_h2_stream_free> h2s;
+    proxy_client_connection* h2_parent{nullptr};
+
+    // The handshake this connection's requests belong to: a stream has none of its own, so it is its parent's.
+    // Named as the storage's conn::tls() is, and for the same reason -- the checks that ask "which name was this
+    // connection opened for" must get an answer on a stream too.
+    SSL* tls() const { return h2_parent ? h2_parent->ssl : ssl; }
     // The client's address as X-Forwarded-For names it, looked up on the
     // connection's first request and kept for the rest.
     std::string peer_addr;
@@ -782,6 +805,29 @@ private:
                                           proxy_backend_connection* bconn,
                                           proxy_client_connection* cconn);
     void reset_client_for_next_request(proxy_client_connection* cconn);
+
+    // ── HTTP/2 at the entrance, in proxy_h2.cpp ─────────────────────────────
+    // A client that chose h2 by ALPN carries frames from then on, and each stream it opens becomes a connection of
+    // its own so that the request on it is routed by its `:authority` and served by everything above.
+    void h2_begin(proxy_client_connection* conn);
+    void h2_in(proxy_client_connection* conn, const char* p, size_t n);
+    // Frames into the connection's queue: its own first, then one of each stream with something to send, in turn.
+    void h2_schedule(proxy_client_connection* conn);
+    void h2_goaway(proxy_client_connection* conn, uint32_t code);
+    // Every stream of a session that is going, before the session's own state is let go of.
+    void h2_parent_gone(proxy_client_connection* conn);
+    // A stream's connection: its reads come from the stream's DATA, its writes are framed onto its parent, and its
+    // answer ends with END_STREAM rather than a half-closed socket.
+    bool h2_child_pull(proxy_client_connection* child);
+    bool h2_child_flush(proxy_client_connection* child);
+    void h2_child_end(proxy_client_connection* child);
+    void h2_stream_gone(proxy_client_connection* child);
+    proxy_client_connection* h2_make_stream(proxy_client_connection* parent);
+    void h2_start_stream(proxy_client_connection* child, socketley::mux::request& mr, int answer_status);
+    // Whether this listener offers h2 at all: an entrance in HTTP mode with TLS, unless the environment says no.
+    bool h2_offered() const;
+    // Whether a session has no stream open, which is what the head deadline bounds.
+    bool h2_idle(const proxy_client_connection* conn) const;
     // TCP mode: take the hold on a client that has shut its write side and
     // pass that half-close on to the backend.
     bool hold_tcp_half_close(proxy_client_connection* conn);
@@ -1019,6 +1065,9 @@ private:
     // on any backend, and a route (entrance_route) is the indices of its
     // runtimes.
     bool m_entrance{false};
+    // The entrance's HTTP/2 tally, reported with the rest of its stats; all zero on a listener nobody spoke h2 to.
+    struct h2_tally { uint64_t conns{0}, streams{0}, refused{0}, resets_in{0}, resets_out{0}, goaways{0}; };
+    h2_tally m_h2{};
     std::string m_auth_spec;
     proxy_auth m_auth;
     uint16_t m_https_redirect{0};

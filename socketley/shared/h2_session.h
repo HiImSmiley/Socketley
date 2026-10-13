@@ -101,6 +101,11 @@ struct session
     bool     cont_refuse{false};
     int      cont_frames{0};
 
+    // Streams the peer may have open at once, announced in SETTINGS and held to in headers_in.  A session's own,
+    // because what a stream costs its host differs: the storage keeps a socket-less conn per stream, an entrance a
+    // client connection with a descriptor.
+    uint32_t max_live{max_streams};
+
     std::unordered_map<uint32_t, S> streams;
     // Streams with something to send, in turn.
     std::deque<uint32_t> rr;

@@ -100,9 +100,12 @@ expect "and who asked, last, without the entrance as a hop of its own" \
     "$(hs hub.example.com / -H 'X-Forwarded-For: 203.0.113.9' | field xff)" "203.0.113.9, 127.0.0.1"
 expect "the entrance over TLS tells the browser to stay on HTTPS" \
     "$(hs hub.example.com / -o /dev/null -D - | tr -d '\r' | grep -ci '^strict-transport-security: max-age=31536000')" 1
+# Lower-cased before comparing: over HTTP/2 a field name is lower case by RFC 9113 8.2.1, so its case is the
+# protocol's business and not this assertion's -- what is held down here is one HSTS header and its value.
 expect "and a backend's own HSTS is left alone, not doubled" \
-    "$(hs hub.example.com /hsts -o /dev/null -D - | tr -d '\r' | grep -i '^strict-transport-security' | tr '\n' ' ')" \
-    "Strict-Transport-Security: max-age=60 "
+    "$(hs hub.example.com /hsts -o /dev/null -D - | tr -d '\r' | grep -i '^strict-transport-security' \
+       | tr 'A-Z' 'a-z' | tr '\n' ' ')" \
+    "strict-transport-security: max-age=60 "
 expect "a proxy without --domain still writes the scheme itself" \
     "$("$BIN" create proxy plain -p $((P+10)) --backend "127.0.0.1:$ECHO" -s >/dev/null 2>&1; sleep 0.5
        curl -s -m 5 -H 'X-Forwarded-Proto: https' "http://127.0.0.1:$((P+10))/plain/" | field proto)" "http"
