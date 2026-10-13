@@ -165,8 +165,12 @@ void answer(stream& st, std::string data, bool finish);
 bool answer_end(stream& st);
 // A stream's acknowledged bytes, let go of: QUIC may have to send them again until then.
 void acked(stream& st, uint64_t len);
-// The host has let go: the stream is closed and forgotten.
+// The host has let go of a stream that nothing answered: it is reset toward the client and forgotten.
 void gone(stream& st);
+// And the same for one whose answer is finished: the host's object goes now, the stream stays until its last frame
+// has been sent, and this side forgets it alone.  The host's key is cleared, so the stream_gone() that follows
+// resolves to nothing rather than to an object already let go.
+void release(stream& st);
 
 // What a stream's connection is: the address its packets come from, and that address as text. A runtime parses the
 // address into whatever type it keeps, which is why neither is parsed here.

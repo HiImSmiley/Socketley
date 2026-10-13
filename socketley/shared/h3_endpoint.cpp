@@ -1620,8 +1620,9 @@ void gone(stream& st)
     conn& hc = *st.owner;
     drop_rx(st);
     st.gone = true;
-    // Ended before its answer did: the client is told the request was cancelled.
-    if (!st.ended && hc.q && !hc.dead)
+    // Ended before its answer did: the client is told the request was cancelled.  An end already asked for is not
+    // a cancel, and resetting then would take the answer with it.
+    if (!st.ended && !st.end_pending && hc.q && !hc.dead)
         ngtcp2_conn_shutdown_stream(hc.q, 0, st.sid, NGHTTP3_H3_REQUEST_CANCELLED);
     // The reset, or the window its unread body gave back, goes out.
     if (hc.ep)
@@ -1665,6 +1666,8 @@ void completion(endpoint& e, io_request* req, int res) { e.cqe(req, res); }
 void flush(endpoint& e) { e.flush_dirty(); }
 size_t open_conns(const endpoint& e) { return e.open_conns(); }
 std::string alt_svc(const endpoint& e) { return e.alt; }
+void release(stream& st) { st.user = 0; }
+
 void stop(endpoint& e) { e.stop(); }
 
 const sockaddr_storage* peer_of(const stream& st) { return st.owner ? &st.owner->remote : nullptr; }

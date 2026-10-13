@@ -186,6 +186,8 @@ struct proxy_exchange
 
 // An HTTP/2 session and one stream's protocol state, opaque here for the same reason the storage keeps them so:
 // only the file that frames a stream includes the codec, HPACK and the session's own header.
+#include "../../shared/h3_endpoint.h"
+
 namespace socketley::mux { struct request; }
 
 struct proxy_h2_conn;
@@ -261,11 +263,25 @@ struct alignas(64) proxy_client_connection
     // from its stream's DATA rather than from a socket, and its answer is framed onto its parent rather than written.
     std::unique_ptr<proxy_h2_stream, proxy_h2_stream_free> h2s;
     proxy_client_connection* h2_parent{nullptr};
+    // Non-null only on a stream of an HTTP/3 connection, and not owned: the endpoint holds the stream's own state
+    // and tells this runtime when it has let go of it.  A stream of either protocol is a client like any other, and
+    // what differs -- where its reads come from, where its writes go -- is the same two chokepoints.
+    socketley::h3::stream* h3s{nullptr};
 
     // The handshake this connection's requests belong to: a stream has none of its own, so it is its parent's.
     // Named as the storage's conn::tls() is, and for the same reason -- the checks that ask "which name was this
     // connection opened for" must get an answer on a stream too.
-    SSL* tls() const { return h2_parent ? h2_parent->ssl : ssl; }
+    // A stream of either protocol has no handshake of its own: HTTP/2's is its parent connection's, HTTP/3's is
+    // the QUIC connection's.  Without this the entrance's own check -- that a request's name is the name the
+    // handshake gave -- is skipped on a stream, and a connection opened for one name serves another.
+    SSL* tls() const
+    {
+        if (h2_parent)
+            return h2_parent->ssl;
+        if (h3s)
+            return socketley::h3::tls_of(*h3s);
+        return ssl;
+    }
     // The client's address as X-Forwarded-For names it, looked up on the
     // connection's first request and kept for the rest.
     std::string peer_addr;
@@ -566,8 +582,14 @@ struct pooled_backend
     const tls_context* tls_owner{nullptr};
 };
 
+// The object the shared HTTP/3 endpoint is told about this runtime's streams through; it is this class's
+// other half, in proxy_h3.cpp, and reaches what a member function reaches.
+class proxy_h3_host;
+
 class proxy_instance : public runtime_instance
 {
+    friend class proxy_h3_host;
+
 public:
     using proxy_hook = std::function<std::optional<std::string>(int client_fd, std::string_view data)>;
 
@@ -826,6 +848,27 @@ private:
     void h2_start_stream(proxy_client_connection* child, socketley::mux::request& mr, int answer_status);
     // Whether this listener offers h2 at all: an entrance in HTTP mode with TLS, unless the environment says no.
     bool h2_offered() const;
+
+    // ── HTTP/3 at the entrance, in proxy_h3.cpp ─────────────────────────────
+    // A UDP socket on the listener's port; every stream on it becomes a connection of its own, exactly as h2's do.
+    bool h3_offered() const;
+    bool h3_open(uint16_t port);
+    bool h3_owns(const io_request* req) const;
+    void h3_cqe(io_request* req, int res);
+    void h3_flush();
+    void h3_stop();
+    void h3_count(socketley::h3::event e);
+    uint64_t h3_make_stream(socketley::h3::stream& st);
+    void h3_start_stream(socketley::h3::stream& st, socketley::mux::request& mr, int answer_status);
+    bool h3_can_take(socketley::h3::stream& st);
+    void h3_take(socketley::h3::stream& st, const char* d, size_t n);
+    void h3_write_done(socketley::h3::stream& st);
+    void h3_host_stream_gone(socketley::h3::stream& st);
+    proxy_client_connection* h3_child(const socketley::h3::stream& st) const;
+    bool h3_child_pull(proxy_client_connection* child);
+    bool h3_child_flush(proxy_client_connection* child);
+    void h3_child_end(proxy_client_connection* child);
+    void h3_child_gone(proxy_client_connection* child);
     // Whether a session has no stream open, which is what the head deadline bounds.
     bool h2_idle(const proxy_client_connection* conn) const;
     // TCP mode: take the hold on a client that has shut its write side and
@@ -1068,6 +1111,13 @@ private:
     // The entrance's HTTP/2 tally, reported with the rest of its stats; all zero on a listener nobody spoke h2 to.
     struct h2_tally { uint64_t conns{0}, streams{0}, refused{0}, resets_in{0}, resets_out{0}, goaways{0}; };
     h2_tally m_h2{};
+    // The entrance's HTTP/3 tally, the endpoint, and the object it is told about streams through.
+    struct h3_tally { uint64_t conns{0}, streams{0}, retries{0}, forwarded{0}; };
+    h3_tally m_h3t{};
+    std::unique_ptr<socketley::h3::endpoint, socketley::h3::endpoint_free> m_h3;
+    std::unique_ptr<socketley::h3::host> m_h3_host;
+    // The Alt-Svc value every answer over TCP carries, empty when no UDP socket is open.
+    std::string m_alt_svc;
     std::string m_auth_spec;
     proxy_auth m_auth;
     uint16_t m_https_redirect{0};

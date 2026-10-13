@@ -11116,7 +11116,13 @@ the name it asks for, as a request over HTTP/1.1 is, and one asking for a name
 other than the one its connection's handshake gave is answered 421. A client may
 have eight streams open at once;
 .B SOCKETLEY_PROXY_HTTP2=0
-turns HTTP/2 off. It stops, starts and is removed with
+turns HTTP/2 off. Over UDP on the same port it speaks HTTP/3 (RFC 9114), which every answer over TCP names in
+.BR "Alt\-Svc: h3" ;
+a stream of it is routed by its own
+.B :authority
+exactly as HTTP/2's is, and a browser that cannot reach the UDP port goes on over TCP.
+.B SOCKETLEY_PROXY_HTTP3=0
+opens no UDP socket. It stops, starts and is removed with
 this runtime; removed while another dns runtime names it too, it becomes that
 one's instead. A proxy of that name that exists already is taken as it is,
 provided it is an entrance.
@@ -15733,6 +15739,16 @@ A test hook: a directory in which a file named
 runtime answer the message of that phase of a bucket document change as a sibling
 that could not be reached would, without acting on it, for as long as the file
 exists, so a test can lose a message at each step of the change. Unset by default.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_PROXY_HTTP3
+.B 0
+opens no UDP socket beside a
+.B \-\-tls
+entrance, which then offers HTTP/3 to nobody and names none in
+.BR Alt\-Svc ;
+HTTP/2 over TCP is unaffected.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

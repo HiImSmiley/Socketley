@@ -40,7 +40,7 @@ has() { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1" "'$3' not in: $2" ;; esac; }
 cleanup() { daemon_stop; }
 trap cleanup EXIT
 
-echo "=== Integration: the entrance speaks HTTP/2 ==="
+echo "=== Integration: the entrance speaks HTTP/2 and HTTP/3 ==="
 
 if ! command -v openssl >/dev/null 2>&1; then
     echo "  SKIP: openssl is not installed, so the entrance has no certificate to offer"
@@ -70,6 +70,7 @@ head -c 200000 /dev/urandom | base64 | head -c 120000 >"$T/big.txt"
 E=$((P+1))
 "$BIN" create server one -p $((P+2)) --http "$T/one" --domain one.example.com -s >/dev/null 2>&1
 "$BIN" create server two -p $((P+3)) --http "$T/two" --domain two.example.com -s >/dev/null 2>&1
+"$BIN" create server three -p $((P+5)) --http "$T/two" --domain three.example.com -s >/dev/null 2>&1
 "$BIN" create proxy ent -p "$E" --tls --cert "$T/e.pem" --key "$T/e.key" -s >/dev/null 2>&1
 
 # Over the entrance, with the name resolved to it; -k because the certificate is its own.
@@ -106,7 +107,10 @@ two_on_one=$(curl -sk --noproxy '*' -m 10 \
     --resolve "one.example.com:$E:127.0.0.1" --resolve "two.example.com:$E:127.0.0.1" \
     -w '|%{http_version}' \
     "https://one.example.com:$E/who.txt" "https://two.example.com:$E/who.txt" 2>&1 | tr -d '\n')
-has "two names on one connection reach their own runtimes" "$two_on_one" "from-one"
+# Two names, each over its own connection because curl opens one per host: what this holds down is that each
+# reaches its own runtime.  The coalesced case -- both names on ONE connection -- is in lib_proxy_http3.py, where
+# the client can be made to do it, and there the second is refused 421.
+has "two names, each routed to its own runtime" "$two_on_one" "from-one"
 has "and the second name is not answered by the first's runtime" "$two_on_one" "from-two"
 # The bodies and the versions interleave in curl's own output, so what is asked is that two answers came and both
 # said 2 -- not where in the line they sit.
@@ -194,6 +198,20 @@ if [ "${h2s:-0}" -ge 20 ]; then ok "and the streams on them ($h2s)"; else bad "t
 sleep 0.6
 expect "a proxy with a backend of its own offers no h2, having no authority to route by" \
     "$(curl -sk --noproxy '*' -m 5 "https://127.0.0.1:$((P+4))/who.txt" -o /dev/null -w '%{http_version}')" "1.1"
+
+# ── HTTP/3 on the same port ────────────────────────────────────────────────
+# A browser learns of it from Alt-Svc on a TCP answer and tries UDP next time; the streams on it are routed the same
+# way, which is what lib_proxy_http3.py holds down.
+alt=$(hc one.example.com /who.txt -o /dev/null -D - | tr -d '\r' | grep -i '^alt-svc:' | head -1)
+case "$alt" in *h3=*) ok "an answer over TCP names the HTTP/3 port in Alt-Svc ($alt)" ;;
+                  *) bad "Alt-Svc" "got '$alt'" ;; esac
+
+cp "$T/big.txt" "$T/one/big.txt"
+h3out=$(python3 "$HERE/lib_proxy_http3.py" "$E" "$T/e.pem" "$T/big.txt" 2>&1)
+echo "$h3out" | sed -n 's/^  \(PASS\|FAIL\|SKIP\)/  \1/p'
+h3p=$(echo "$h3out" | sed -n 's/^Results: \([0-9]*\) passed.*/\1/p')
+h3f=$(echo "$h3out" | sed -n 's/^Results: [0-9]* passed, \([0-9]*\) failed/\1/p')
+TOTAL=$((TOTAL + h3p + h3f)); PASS=$((PASS + h3p)); FAIL=$((FAIL + h3f))
 
 echo ""
 echo "=== Results: $PASS/$TOTAL passed, $FAIL failed ==="

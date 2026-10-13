@@ -417,6 +417,8 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
     // And a stream leaving tells its session, so no pointer to a struct on its way to the pool is kept.
     if (SOCKETLEY_UNLIKELY(conn->h2_parent != nullptr))
         h2_stream_gone(conn.get());
+    if (SOCKETLEY_UNLIKELY(conn->h3s != nullptr))
+        h3_child_gone(conn.get());
     conn->h2.reset();
     // The splice pipes go back to the kernel here even when the struct does
     // not, and close_tracked() is what makes that safe: a pipe number is
@@ -1029,6 +1031,10 @@ void proxy_instance::on_loop_turn()
     // Counted before anything returns, because take_parked_backend() reads it.
     ++m_turn;
 
+    // Every HTTP/3 connection whose state moved this turn writes its packets now, in one write each rather than
+    // one per thing that moved it.
+    h3_flush();
+
     // The entrance's table, looked at once a second: a stat, and a read only
     // when the daemon wrote it again.
     if (m_entrance && m_loop)
@@ -1118,6 +1124,8 @@ bool proxy_instance::arm_read(int fd, proxy_client_connection* conn, bool poll_f
     // asking for a read is asking its stream for them.
     if (SOCKETLEY_UNLIKELY(conn->h2_parent != nullptr))
         return h2_child_pull(conn);
+    if (SOCKETLEY_UNLIKELY(conn->h3s != nullptr))
+        return h3_child_pull(conn);
     return submit_read_op(m_loop, fd, conn, m_recv_multishot || earned_multishot(conn->drained_reads),
                           m_use_provided_bufs, BUF_GROUP_ID, poll_first);
 }
@@ -1875,6 +1883,10 @@ bool proxy_instance::setup(event_loop& loop)
         // by their own `:authority`.
         ctx->enable_h2(h2_offered());
         m_tls = std::move(ctx);
+        // And HTTP/3 beside it, on the same port over UDP; its own certificate context is the endpoint's, because
+        // QUIC's TLS is not this one's record layer.
+        if (h3_offered())
+            h3_open(static_cast<uint16_t>(get_port()));
     }
 
     // The backend-TLS options apply to every backend at once, and none of them
@@ -2361,6 +2373,14 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
 
     if (SOCKETLEY_UNLIKELY(!m_loop))
         return;
+
+    // The HTTP/3 endpoint's reads and timers carry no connection of their own, so they are asked for before the
+    // dispatch below, which resolves everything by descriptor.
+    if (SOCKETLEY_UNLIKELY(h3_owns(req)))
+    {
+        h3_cqe(req, cqe->res);
+        return;
+    }
 
 #ifdef SOCKETLEY_INVARIANTS
     // Remembered before the dispatch because the handler may release the
@@ -4296,8 +4316,12 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         const auto& ce = m_conn_idx[conn->client_fd];
         const bool closing = ce.side == conn_client && (ce.client->ex.client_conn_close || ce.client->client_eof);
         const bool hsts = m_entrance && get_tls();
+        // Alt-Svc is how a browser learns there is an HTTP/3 endpoint at all: it comes over TCP, is remembered, and
+        // the next visit is tried over UDP.  Only on an answer this connection is not already a stream of -- a
+        // stream's answer never passes here, and telling HTTP/3 about HTTP/3 says nothing.
+        const bool alt = !m_alt_svc.empty() && ce.side == conn_client && ce.client->h3s == nullptr;
         const std::string_view chunk{data_ptr, forward_len};
-        const size_t end = closing || hsts ? chunk.find("\r\n\r\n") : std::string_view::npos;
+        const size_t end = closing || hsts || alt ? chunk.find("\r\n\r\n") : std::string_view::npos;
         if (end != std::string_view::npos)
         {
             closing_head = closing ? http_head_saying_close(chunk.substr(0, end + 4))
@@ -4305,6 +4329,8 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             if (hsts)
                 closing_head = http_head_adding(closing_head, "strict-transport-security",
                                                 "Strict-Transport-Security: max-age=31536000");
+            if (alt)
+                closing_head = http_head_adding(closing_head, "alt-svc", "Alt-Svc: " + m_alt_svc);
             closing_head.append(chunk.substr(end + 4));
         }
     }
@@ -6913,7 +6939,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
     // the pair down before the backend had answered.  The premise does not
     // hold there either -- the session's own read is armed on the socket the
     // client is really on, and its end takes every stream with it.
-    if (!conn->abort_watch_pending && conn->h2_parent == nullptr)
+    if (!conn->abort_watch_pending && conn->h2_parent == nullptr && conn->h3s == nullptr)
     {
         conn->abort_req = { this, nullptr, conn->fd, 0, op_poll_abort, conn->generation };
         if (SOCKETLEY_LIKELY(m_loop->submit_poll_add(conn->fd, POLLERR | POLLHUP,
@@ -6933,7 +6959,7 @@ void proxy_instance::setup_splice_pipes(proxy_client_connection* conn, proxy_bac
         return;
     // Nor on a stream's connection, whose bytes are framed onto its parent rather than written to a descriptor --
     // guarded here for the same reason as the line above, since leaving splice_active false is all it takes.
-    if (SOCKETLEY_UNLIKELY(conn->h2_parent != nullptr))
+    if (SOCKETLEY_UNLIKELY(conn->h2_parent != nullptr || conn->h3s != nullptr))
         return;
     if (on_fast_lo(conn->fd, bconn->fd))
         return;
@@ -7491,6 +7517,11 @@ void proxy_instance::shutdown_client_write(proxy_client_connection* conn)
     if (SOCKETLEY_UNLIKELY(conn->h2_parent != nullptr))
     {
         h2_child_end(conn);
+        return;
+    }
+    if (SOCKETLEY_UNLIKELY(conn->h3s != nullptr))
+    {
+        h3_child_end(conn);
         return;
     }
     if (!conn->closing || conn->wr_shutdown || conn->fd < 0 || !conn->read_pending)
@@ -8276,6 +8307,11 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
         h2_child_end(cconn);
         return;
     }
+    if (SOCKETLEY_UNLIKELY(cconn->h3s != nullptr))
+    {
+        h3_child_end(cconn);
+        return;
+    }
     // There is no next request, said by client_eof or by client_conn_close, so
     // the connection ends here -- asked once of the client connection, because
     // answering it at the detach instead cost a backend connection per
@@ -8364,7 +8400,7 @@ bool proxy_instance::hold_tcp_half_close(proxy_client_connection* conn)
     // A failure to arm costs this connection the early notice of a reset and
     // nothing else, so nothing is unwound on refusal.  Never on a stream, for
     // the reason given where the other watch is armed.
-    if (!conn->abort_watch_pending && conn->h2_parent == nullptr)
+    if (!conn->abort_watch_pending && conn->h2_parent == nullptr && conn->h3s == nullptr)
     {
         conn->abort_req = { this, nullptr, conn->fd, 0, op_poll_abort, conn->generation };
         if (SOCKETLEY_LIKELY(m_loop && m_loop->submit_poll_add(conn->fd, POLLERR | POLLHUP,
@@ -10184,7 +10220,7 @@ bool proxy_instance::send_final_and_fin(proxy_client_connection* cconn, std::str
     if (cconn->write_pending || !cconn->write_queue.empty() || cconn->ssl != nullptr ||
         cconn->splice_in_pending || cconn->splice_out_pending || cconn->fd < 0 ||
         // A stream's descriptor has no peer, so a send on it would fail and be queued anyway.
-        cconn->h2_parent != nullptr ||
+        cconn->h2_parent != nullptr || cconn->h3s != nullptr ||
         cconn->wr_shutdown || !(cconn->ex.client_conn_close || cconn->client_eof))
         return false;
 
@@ -10421,12 +10457,15 @@ void proxy_instance::queue_final_response(proxy_client_connection* conn,
     // A stream's answer is framed onto its session and ended with END_STREAM: a stream let go of without that
     // sends an RST_STREAM instead, and a client may throw away an answer it was reset out of.  Nor is there
     // anything to drain -- the rest of the request is DATA on the session, which the frame reader bounds.
-    if (SOCKETLEY_UNLIKELY(conn->h2_parent != nullptr))
+    if (SOCKETLEY_UNLIKELY(conn->h2_parent != nullptr || conn->h3s != nullptr))
     {
         conn->write_queue.push(std::move(response));
-        if (!h2_child_flush(conn))
+        if (!flush_client_write_queue(conn))
             conn->write_queue.clear();
-        h2_child_end(conn);
+        if (conn->h2_parent)
+            h2_child_end(conn);
+        else
+            h3_child_end(conn);
         return;
     }
 
@@ -10671,6 +10710,8 @@ bool proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
     // one that has a socket; the same reasoning as the record layer below, one layer further in.
     if (SOCKETLEY_UNLIKELY(conn->h2_parent != nullptr))
         return h2_child_flush(conn);
+    if (SOCKETLEY_UNLIKELY(conn->h3s != nullptr))
+        return h3_child_flush(conn);
 
     // A TLS connection's bytes go through the record layer, which keeps every
     // caller above from having to know which kind of connection it holds.
