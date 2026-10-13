@@ -9857,6 +9857,21 @@ std::string proxy_instance::stats_lines() const
         }
     }
 
+    // And the HTTP/3 endpoint's, on the same rule: only where something spoke it.
+    if (m_h3t.conns > 0)
+    {
+        const std::pair<const char*, uint64_t> rows[] = {
+            {"h3_conns:", m_h3t.conns}, {"h3_streams:", m_h3t.streams},
+            {"h3_retries:", m_h3t.retries}, {"h3_forwarded:", m_h3t.forwarded}};
+        for (const auto& [name, value] : rows)
+        {
+            out += name;
+            auto [p3, e3] = std::to_chars(num_buf, num_buf + sizeof(num_buf), value);
+            out.append(num_buf, static_cast<size_t>(p3 - num_buf));
+            out += '\n';
+        }
+    }
+
     // Pool stats
     size_t pool_total = 0;
     for (const auto& pool : m_backend_pool)

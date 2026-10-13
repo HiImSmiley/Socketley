@@ -187,6 +187,7 @@ expect "a session that sends half a preface is closed, not held" "$half" "closed
 # Waited for, not asked once: an out-of-process runtime's counters reach the daemon in the worker's report, which
 # lands on its own turn -- asking in the same breath as the last request read the report before it.
 tally() { "$BIN" stats ent 2>/dev/null | sed -n 's/^h2_streams:\([0-9]*\)$/\1/p'; }
+tally_of() { "$BIN" stats ent 2>/dev/null | sed -n "s/^$1:\\([0-9]*\\)$/\\1/p"; }
 for _ in $(seq 1 60); do [ "$(tally || echo 0)" -ge 20 ] 2>/dev/null && break; sleep 0.2; done
 has "the entrance counts the HTTP/2 connections it had" "$("$BIN" stats ent 2>&1)" "h2_conns:"
 h2s=$(tally)
@@ -198,6 +199,15 @@ if [ "${h2s:-0}" -ge 20 ]; then ok "and the streams on them ($h2s)"; else bad "t
 sleep 0.6
 expect "a proxy with a backend of its own offers no h2, having no authority to route by" \
     "$(curl -sk --noproxy '*' -m 5 "https://127.0.0.1:$((P+4))/who.txt" -o /dev/null -w '%{http_version}')" "1.1"
+
+# An answer that was framed whole ends with END_STREAM, not a reset: measured on the live entrance, every completed
+# request left one h2_resets_out, which is a client being told its answer was cancelled after it was delivered.
+# Waited on the stream count, which is the proof the request was counted at all, and only then are the resets
+# read: waiting on the resets themselves would be waiting for the defect.
+r0=$(tally_of h2_resets_out); s0=$(tally_of h2_streams)
+hc one.example.com /who.txt >/dev/null
+for _ in $(seq 1 60); do [ "$(tally_of h2_streams)" != "$s0" ] && break; sleep 0.2; done
+expect "a completed answer leaves no reset behind" "$(tally_of h2_resets_out)" "$r0"
 
 # ── HTTP/3 on the same port ────────────────────────────────────────────────
 # A browser learns of it from Alt-Svc on a TCP answer and tries UDP next time; the streams on it are routed the same

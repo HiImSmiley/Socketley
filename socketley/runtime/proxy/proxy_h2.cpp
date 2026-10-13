@@ -378,8 +378,18 @@ void proxy_instance::h2_stream_gone(proxy_client_connection* child)
     proxy_h2_stream& st = *child->h2s;
     if (!s.dying)
     {
+        // An answer that was framed whole ends with END_STREAM and not a reset.  A proxy closing a connection is
+        // how HTTP/1.1 says an answer ended (RFC 9112 6.3), and a client may throw away an answer it was reset out
+        // of.  Measured on the live entrance before this: every completed request left one h2_resets_out, nine
+        // streams and six resets, which is this line and not the clients.
+        const bool answered = st.os != h2::stream::out_state::head && st.hdr.empty() && !st.tx_left();
+        if (!st.reset && !st.local_closed && answered)
+        {
+            h2::put_data(s.ctl, st.sid, {}, true);
+            st.local_closed = true;
+        }
         // Ended before its answer did, or with its request's body still coming: the client is told.
-        if (!st.reset && (!st.local_closed || !st.remote_closed))
+        else if (!st.reset && (!st.local_closed || !st.remote_closed))
         {
             h2::put_rst(s.ctl, st.sid, st.local_closed ? h2::NO_ERROR : h2::CANCEL);
             ++m_h2.resets_out;
