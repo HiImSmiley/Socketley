@@ -1764,6 +1764,8 @@ bool cache_instance::block_stream(client_connection* conn, const std::string_vie
 
     const uint64_t seq = w.seq;
     blocked_pop& parked = m_blocked.emplace(seq, std::move(w)).first->second;
+    if (parked.needs_tick())
+        ++m_ticking_waiters;
     parked.slots.reserve(parked.keys.size());
     for (const auto& k : parked.keys)
     {

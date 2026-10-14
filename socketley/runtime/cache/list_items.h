@@ -168,6 +168,46 @@ public:
         --p.n;
     }
 
+    // LREM in one walk: up to `limit` elements equal to `v`, from the front or the back, answering how many went.
+    size_t remove_matching(std::string_view v, size_t limit, bool from_back)
+    {
+        size_t removed = 0;
+        if (!is_packed())
+        {
+            auto& s = seg_ref();
+            if (!from_back)
+            {
+                for (size_t i = 0; i < s.size() && removed < limit; )
+                    if (s[i] == v) { s.erase(s.begin() + static_cast<std::ptrdiff_t>(i)); ++removed; }
+                    else ++i;
+            }
+            else
+            {
+                for (size_t i = s.size(); i > 0 && removed < limit; )
+                    if (s[--i] == v) { s.erase(s.begin() + static_cast<std::ptrdiff_t>(i)); ++removed; }
+            }
+            return removed;
+        }
+        // By offset: an erase moves only the bytes behind it, which a forward walk has not reached and a backward one has passed.
+        auto& p = packed_ref();
+        if (!from_back)
+        {
+            for (size_t off = 0; off < p.buf.size() && removed < limit; )
+                if (item(off) == v) { p.buf.erase(off, next(off) - off); --p.n; ++removed; }
+                else off = next(off);
+        }
+        else
+        {
+            for (size_t end = p.buf.size(); end > 0 && removed < limit; )
+            {
+                const size_t off = prev(end);
+                if (item(off) == v) { p.buf.erase(off, end - off); --p.n; ++removed; }
+                end = off;
+            }
+        }
+        return removed;
+    }
+
     void insert(size_t i, std::string_view v)
     {
         if (fits(v)) { place(offset_of(i), v); return; }

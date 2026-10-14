@@ -869,6 +869,12 @@ private:
         std::string              consumer;
         uint64_t                 count{0};
         bool                     noack{false};
+
+        // What sweep_blocked() can end: a deadline, or a group its stream may lose.
+        bool needs_tick() const
+        {
+            return deadline.time_since_epoch().count() != 0 || (stream && !group.empty());
+        }
     };
 
     // It stopped being true.  The linear walk that used to live here compared
@@ -882,6 +888,8 @@ private:
     // arrival order -- the front of that queue is the longest-waiting client,
     // which is the order Redis serves and the reason the seq exists at all.
     std::unordered_map<uint64_t, blocked_pop>             m_blocked;
+    // Waiters the tick serves, one with a deadline or a group reader; zero-deadline pops leave the timer unarmed.
+    size_t                                                 m_ticking_waiters{0};
     std::unordered_map<std::string, std::list<uint64_t>,
                        string_hash, string_equal>          m_wait_key;
     std::unordered_map<int, uint64_t>                     m_wait_fd;
@@ -1282,6 +1290,8 @@ private:
     // unique_ptr because the kernel holds a pointer to each write_req for the
     // lifetime of its operation; vector growth would move the elements.
     std::vector<std::unique_ptr<follower_conn>> m_followers;
+    // The line replicate_command sends, kept so a leader's write allocates nothing for it.
+    std::string m_repl_line;
 
     // The link to the leader allocated per connect, because the read armed on
     // it is not cancelled by closing the socket and reconnecting usually lands

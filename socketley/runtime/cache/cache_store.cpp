@@ -1907,24 +1907,10 @@ int cache_store::lrem(std::string_view key, int64_t count, std::string_view val)
                                      : static_cast<size_t>(count < 0 ? 0 - static_cast<uint64_t>(count)
                                                                      : static_cast<uint64_t>(count));
     const size_t shape = shape_cost(dq);
-    // By position, since an erase in a packed list moves the bytes behind it
-    // and an iterator carrying their offset would name the wrong element.
-    if (count >= 0)
-    {
-        for (size_t i = 0; i < dq.size() && static_cast<size_t>(removed) < want; )
-        {
-            if (dq.at(i) == val) { track_sub(stored_string(val.size())); dq.erase(i); ++removed; --m_list_elems; }
-            else ++i;
-        }
-    }
-    else
-    {
-        for (size_t i = dq.size(); i > 0 && static_cast<size_t>(removed) < want; )
-        {
-            --i;
-            if (dq.at(i) == val) { track_sub(stored_string(val.size())); dq.erase(i); ++removed; --m_list_elems; }
-        }
-    }
+    const size_t gone = dq.remove_matching(val, want, count < 0);
+    removed = static_cast<int>(gone);
+    m_list_elems -= gone;
+    track_sub(stored_string(val.size()) * gone);
     reshape(shape, shape_cost(dq));
 
     // An empty list is not a key, the way an empty sorted set is not one here.
@@ -3586,21 +3572,43 @@ bool cache_store::try_evict(size_t needed, const std::string_view* protect)
         // Both branches go through drop_lru(), which is the one place that
         // knows what leaving the LRU costs, so an eviction path that skipped
         // it would leak those bytes into the reported figure.
+        auto is_held = [&](std::string_view k) {
+            return (protect_resident && k == *protect) || (pinned_resident && k == *m_pinned);
+        };
+
         size_t skip = 0;
+        auto node = m_lru_order.end();
         if (m_eviction != evict_allkeys_lru)   // evict_allkeys_random
         {
             static thread_local std::mt19937 rng(std::random_device{}());
-            skip = std::uniform_int_distribution<size_t>(0, candidates - 1)(rng);
+
+            // A random bucket, then a random key in its chain, as Redis samples, since walking the order to a random index costs half the keyspace per victim.
+            const size_t buckets = m_lru_map.bucket_count();
+            for (int tries = 0; tries < 64 && node == m_lru_order.end(); ++tries)
+            {
+                const size_t b   = std::uniform_int_distribution<size_t>(0, buckets - 1)(rng);
+                const size_t len = m_lru_map.bucket_size(b);
+                if (len == 0)
+                    continue;
+                auto it = m_lru_map.begin(b);
+                std::advance(it, static_cast<std::ptrdiff_t>(
+                                     std::uniform_int_distribution<size_t>(0, len - 1)(rng)));
+                if (!is_held(it->first))
+                    node = it->second;
+            }
+
+            // A table emptied far below its bucket count rarely lands a sample, and the walk below is short there.
+            if (node == m_lru_order.end())
+                skip = std::uniform_int_distribution<size_t>(0, candidates - 1)(rng);
         }
 
         // The LRU policy takes the front of the order and the random one the
         // skip'th candidate, both stepping over the protected keys if they are
         // in their path.
-        auto node = m_lru_order.end();
-        for (auto n = m_lru_order.begin(); n != m_lru_order.end(); ++n)
+        for (auto n = node == m_lru_order.end() ? m_lru_order.begin() : m_lru_order.end();
+             n != m_lru_order.end(); ++n)
         {
-            if ((protect_resident && std::string_view(*n) == *protect)
-             || (pinned_resident && std::string_view(*n) == *m_pinned))
+            if (is_held(*n))
                 continue;
             if (skip == 0)
             {

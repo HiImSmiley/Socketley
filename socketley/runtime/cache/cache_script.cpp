@@ -576,8 +576,10 @@ bool cache_script_engine::eval(std::string_view body,
         cache_script_engine* e;
         ~depth_guard() { if (--d == 0) e->trim_eval(); }
     } dg{ ++m_depth, this };
-    if (const auto at = m_eval_at.find(body); at != m_eval_at.end())
-        m_eval_lru.splice(m_eval_lru.begin(), m_eval_lru, at->second);
+    // A script already at the front, the one a client runs over and over, skips the hash a move to the front would cost.
+    if (m_eval_lru.empty() || m_eval_lru.front() != body)
+        if (const auto at = m_eval_at.find(body); at != m_eval_at.end())
+            m_eval_lru.splice(m_eval_lru.begin(), m_eval_lru, at->second);
 
     auto cached = m_compiled.find(body);
     if (cached == m_compiled.end())

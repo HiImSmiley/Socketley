@@ -4267,3 +4267,102 @@ TEST_CASE("cache_store load refuses a dump cut inside a key's header")
     CHECK_FALSE(dst.load(path));
     ::unlink(path.c_str());
 }
+
+TEST_CASE("LREM removes what a list of the same elements would lose, packed or not, from either end")
+{
+    // A model walked element by element, against the store's one walk over the bytes.
+    auto model_lrem = [](std::deque<std::string>& d, int64_t count, const std::string& v) {
+        int removed = 0;
+        const size_t want = count == 0 ? d.size() : static_cast<size_t>(count < 0 ? -count : count);
+        if (count >= 0)
+        {
+            for (size_t i = 0; i < d.size() && static_cast<size_t>(removed) < want;)
+                if (d[i] == v) { d.erase(d.begin() + static_cast<std::ptrdiff_t>(i)); ++removed; }
+                else ++i;
+        }
+        else
+        {
+            for (size_t i = d.size(); i > 0 && static_cast<size_t>(removed) < want;)
+                if (d[--i] == v) { d.erase(d.begin() + static_cast<std::ptrdiff_t>(i)); ++removed; }
+        }
+        return removed;
+    };
+    uint32_t x = 2026;
+    auto rnd = [&] { x = x * 1103515245u + 12345u; return x >> 8; };
+    for (int round = 0; round < 400; ++round)
+    {
+        cache_store store;
+        std::deque<std::string> model;
+        // Short elements stay packed below 128 of them; a long one moves the list to its other form.
+        const bool long_form = round % 4 == 3;
+        const int n = 1 + static_cast<int>(rnd() % (long_form ? 300 : 120));
+        for (int i = 0; i < n; ++i)
+        {
+            std::string v = std::string(1, static_cast<char>('a' + rnd() % 3));
+            if (long_form && i == 0)
+                v = std::string(300, 'L');
+            REQUIRE(store.rpush("l", v));
+            model.push_back(v);
+        }
+        for (int op = 0; op < 4 && !model.empty(); ++op)
+        {
+            const std::string v(1, static_cast<char>('a' + rnd() % 3));
+            const int64_t count = static_cast<int64_t>(rnd() % 7) - 3;
+            const int want = model_lrem(model, count, v);
+            CHECK(store.lrem("l", count, v) == want);
+        }
+        REQUIRE(store.llen("l") == static_cast<int>(model.size()));
+        for (size_t i = 0; i < model.size(); ++i)
+        {
+            const auto got = store.lindex("l", static_cast<int>(i));
+            REQUIRE(got);
+            CHECK(*got == model[i]);
+        }
+    }
+}
+
+TEST_CASE("allkeys-random evicts a key drawn from the whole keyspace, never the one being written")
+{
+    // Under the LRU order's own walk a victim was the k'th node for a random k; a sample of the table must
+    // still land anywhere, not on the oldest key every time.
+    std::map<std::string, int> victims;
+    for (int trial = 0; trial < 200; ++trial)
+    {
+        cache_store store;
+        store.set_max_memory(64 * 1024);
+        store.set_eviction(evict_allkeys_random);
+        std::vector<std::string> keys;
+        for (int i = 0; store.get_memory_used() < 60 * 1024; ++i)
+        {
+            keys.push_back("k" + std::to_string(i));
+            REQUIRE(store.set(keys.back(), std::string(200, 'v')));
+        }
+        // Past the limit by one more key, which costs exactly the keys it pushes out.
+        while (store.get_memory_used() + 600 < 64 * 1024)
+        {
+            keys.push_back("k" + std::to_string(keys.size()));
+            REQUIRE(store.set(keys.back(), std::string(200, 'v')));
+        }
+        REQUIRE(store.set("new", std::string(200, 'n')));
+        CHECK(store.exists("new"));
+        CHECK(store.get_memory_used() <= 64 * 1024);
+        for (const auto& k : keys)
+            if (!store.exists(k))
+                ++victims[k];
+    }
+    CHECK(victims.size() > 20);
+    CHECK(victims["k0"] < 100);
+
+    // The key a write grows is protected, under random as under LRU.
+    cache_store store;
+    store.set_max_memory(16 * 1024);
+    store.set_eviction(evict_allkeys_random);
+    for (int i = 0; i < 40; ++i)
+        REQUIRE(store.set("k" + std::to_string(i), std::string(200, 'v')));
+    for (int round = 0; round < 50; ++round)
+    {
+        REQUIRE(store.set("grow", std::string(static_cast<size_t>(100 + round * 40), 'g')));
+        CHECK(store.exists("grow"));
+        CHECK(store.get_memory_used() <= 16 * 1024);
+    }
+}

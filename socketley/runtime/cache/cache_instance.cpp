@@ -2050,6 +2050,13 @@ bool cache_instance::tls_flush(client_connection* conn)
     // that answers WANT_READ.
     if (conn->tls_state == tls_conn_ready)
     {
+        // Room for the records of what is queued, as the proxy reserves it, so the write BIO does not regrow from empty.
+        if (!conn->write_queue.empty())
+        {
+            const size_t plain = std::min<size_t>(conn->write_queue.bytes(),
+                                                  tls_context::max_bio_buffered + conn->write_queue.front().view().size());
+            tls_context::reserve_out(conn->ssl, plain + plain / 16384 * 22 + 64);
+        }
         while (!conn->write_queue.empty())
         {
             const std::string_view msg = conn->write_queue.front().view();
@@ -8399,7 +8406,14 @@ bool cache_instance::process_resp(client_connection* conn)
         size_t           consumed;
         uint64_t         h;
     };
-    ahead_cmd q[AHEAD];
+    // Built empty, like resp::arg_slots, so a read that never looks ahead zeroes no 1 KiB of views.
+    union ahead_queue
+    {
+        ahead_cmd v[AHEAD];
+        ahead_queue()  noexcept {}
+        ~ahead_queue() noexcept {}
+    } q_slots;
+    ahead_cmd* const q = q_slots.v;
     int    qh = 0, qn = 0;
     size_t scan = 0;
     // Stalled until the first command has run the ordinary way, so a read
@@ -11395,7 +11409,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             const std::span<const std::string_view> keys(args + 3, static_cast<size_t>(nkeys));
             const std::span<const std::string_view> argv(args + 3 + nkeys, static_cast<size_t>(argc - 3 - nkeys));
 
-            std::string out, err;
+            // Straight into rb, since eval appends its reply only once the script has succeeded.
+            std::string err;
             const bool was_exec = conn->in_exec;
             conn->in_exec = true;
             ++m_script_depth;
@@ -11403,7 +11418,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 body, keys, argv,
                 [this, conn](std::span<std::string_view> a, std::string& reply)
                 { script_command(conn, a, reply); },
-                out, err);
+                rb, err);
             --m_script_depth;
             conn->in_exec = was_exec;
             if (!okrun)
@@ -11422,7 +11437,6 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 resp::encode_error_code_into(rb, coded ? err : "ERR " + err);
                 break;
             }
-            rb.append(out);
             break;
         }
         case fnv1a("script"):
@@ -11786,7 +11800,7 @@ void cache_instance::note_write_for_watch(uint32_t h, std::string_view* args, in
 
 void cache_instance::arm_block_timer()
 {
-    if (m_block_timer_armed || m_blocked.empty() || !m_loop)
+    if (m_block_timer_armed || m_ticking_waiters == 0 || !m_loop)
         return;
     if (!m_block_timer)
         m_block_timer = std::make_unique<timer_op>();
@@ -11845,6 +11859,8 @@ void cache_instance::forget_waiter(uint64_t seq)
     }
     auto fi = m_wait_fd.find(w.fd);
     if (fi != m_wait_fd.end() && fi->second == seq) m_wait_fd.erase(fi);
+    if (w.needs_tick())
+        --m_ticking_waiters;
     m_blocked.erase(it);
 }
 
@@ -12014,6 +12030,8 @@ bool cache_instance::block_pop(client_connection* conn, std::string_view* args,
     auto [it, fresh] = m_blocked.emplace(seq, std::move(w));
     (void)fresh;
     blocked_pop& parked = it->second;
+    if (parked.needs_tick())
+        ++m_ticking_waiters;
     parked.slots.reserve(parked.keys.size());
     for (const auto& k : parked.keys)
     {
@@ -12206,6 +12224,10 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
             // cost two strlen calls on lengths both sides already knew.
             if (!socketley::glob_match(pat, channel))
                 continue;
+            // Built once a pattern for each protocol and placed once, as the channel path does, not once a psubscriber.
+            std::string p_resp, p_text;
+            std::shared_ptr<const std::string> p_resp_seg, p_text_seg;
+            uint32_t p_resp_off = 0, p_text_off = 0;
             for (int fd : fds)
             {
                 if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) continue;
@@ -12228,24 +12250,34 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
                 // pmessage and not message: the pattern is part of the reply,
                 // because a client subscribed to two patterns cannot otherwise
                 // tell which one matched.
-                std::string out;
-                if (pc->resp_mode)
+                std::string& out = pc->resp_mode ? p_resp : p_text;
+                if (out.empty())
                 {
-                    resp::encode_array_header_into(out, 4);
-                    resp::encode_bulk_into(out, "pmessage");
-                    resp::encode_bulk_into(out, pat);
-                    resp::encode_bulk_into(out, channel);
-                    resp::encode_bulk_into(out, message);
+                    if (pc->resp_mode)
+                    {
+                        resp::encode_array_header_into(out, 4);
+                        resp::encode_bulk_into(out, "pmessage");
+                        resp::encode_bulk_into(out, pat);
+                        resp::encode_bulk_into(out, channel);
+                        resp::encode_bulk_into(out, message);
+                    }
+                    else
+                    {
+                        out.append("pmessage ");
+                        out.append(pat); out.push_back(' ');
+                        out.append(channel.data(), channel.size()); out.push_back(' ');
+                        out.append(message.data(), message.size()); out.push_back('\n');
+                    }
                 }
-                else
+                std::shared_ptr<const std::string>& seg = pc->resp_mode ? p_resp_seg : p_text_seg;
+                uint32_t& off = pc->resp_mode ? p_resp_off : p_text_off;
+                if (!seg)
                 {
-                    out.append("pmessage ");
-                    out.append(pat); out.push_back(' ');
-                    out.append(channel.data(), channel.size()); out.push_back(' ');
-                    out.append(message.data(), message.size()); out.push_back('\n');
+                    auto& place = pc->resp_mode ? m_pub_seg_resp : m_pub_seg_text;
+                    off = socketley::place_in_segment(place, out);
+                    seg = place;
                 }
-                pc->write_queue.push_coalesced(
-                    out, client_connection::WRITE_COALESCE_LIMIT);
+                pc->write_queue.push_slice(seg, off, static_cast<uint32_t>(out.size()));
                 if (!pc->write_pending && SOCKETLEY_UNLIKELY(!flush_write_queue(pc)))
                 { pc->closing = true; continue; }
                 count++;
@@ -12681,15 +12713,14 @@ void cache_instance::replicate_command(std::string_view cmd)
     // carry the command, so every value without a newline is byte-identical on
     // the wire and an old follower stores nothing rather than a truncated
     // value plus a command nobody sent.
-    std::string line;
+    std::string& line = m_repl_line;
     if (ipc_frame::needs_frame(cmd))
     {
         line = ipc_frame::encode(cmd);
     }
     else
     {
-        line.reserve(cmd.size() + 1);
-        line.append(cmd.data(), cmd.size());
+        line.assign(cmd.data(), cmd.size());
         line.push_back('\n');
     }
 
@@ -12698,6 +12729,9 @@ void cache_instance::replicate_command(std::string_view cmd)
         if (!follower_write(*f, line))
             f->dead = true;
     }
+    // One large value does not keep its size here for the life of the leader.
+    if (line.capacity() > 64 * 1024)
+        std::string().swap(line);
     reap_followers();
 }
 

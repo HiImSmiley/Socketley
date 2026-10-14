@@ -481,7 +481,9 @@ public:
             }
             return;
         }
+        // Sized for a full block once, rather than regrown through eight sizes on every call.
         std::vector<const char*> offs;
+        offs.reserve(node_max_entries);
         for (size_t b = locate(hi) + 1; b-- > m_head;)
         {
             const block& bk = m_blocks[b];

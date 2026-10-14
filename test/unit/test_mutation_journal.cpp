@@ -70,3 +70,30 @@ TEST_CASE("a record whose bytes do not match its checksum still ends the replay"
     CHECK(got[0] == "set a 1");
     ::unlink(p.c_str());
 }
+
+TEST_CASE("the record checksum is CRC-32 at every length and alignment")
+{
+    // The bitwise definition the table form must agree with, so a slip in the eight-byte fold shows here and not as a journal the next build cannot replay.
+    auto bitwise = [](std::string_view s) {
+        uint32_t c = 0xFFFFFFFFu;
+        for (const unsigned char b : s)
+        {
+            c ^= b;
+            for (int k = 0; k < 8; ++k)
+                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        }
+        return c ^ 0xFFFFFFFFu;
+    };
+    CHECK(journal_detail::crc32("123456789") == 0xCBF43926u);
+    std::string buf;
+    uint32_t    x = 0x12345678u;
+    for (int i = 0; i < 300; ++i)
+    {
+        x = x * 1664525u + 1013904223u;
+        buf.push_back(static_cast<char>(x >> 24));
+    }
+    for (size_t off = 0; off < 8; ++off)
+        for (size_t len = 0; len + off <= 140; ++len)
+            CHECK(journal_detail::crc32(std::string_view(buf).substr(off, len))
+                  == bitwise(std::string_view(buf).substr(off, len)));
+}
