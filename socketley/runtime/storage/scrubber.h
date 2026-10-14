@@ -99,6 +99,8 @@ private:
     // Bytes this second may still read, and whether a version is being read.
     int64_t       m_budget{0};
     bool          m_busy{false};
+    // The version being read, whose reader and job hold each other while a read is out.
+    std::weak_ptr<job> m_job;
     bool          m_stopped{false};
     int64_t       m_saved_ms{0};
     // The corrupt copies already told, by bucket, key, version and time, so a pass after tells only new ones.

@@ -64,6 +64,9 @@ scrubber::scrubber(event_loop& loop, file_io& io, object_store& store, hash_pool
 scrubber::~scrubber()
 {
     *m_alive = false;
+    // A read the ring never answers keeps the job and its reader holding each other, so the reader is let go here.
+    if (auto j = m_job.lock())
+        j->reader.reset();
 }
 
 void scrubber::open(const std::string& dir, uint32_t shard)
@@ -192,6 +195,7 @@ void scrubber::next()
 void scrubber::check(std::string version_id)
 {
     auto j        = std::make_shared<job>();
+    m_job         = j;
     j->bucket     = m_current_bucket;
     j->key        = m_current_key;
     j->version_id = std::move(version_id);

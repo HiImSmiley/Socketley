@@ -59,6 +59,8 @@ private:
         uint64_t   chunk_count{0};
     };
 
+    // Whether the store has gone, dropping the waiting consumer if so.
+    bool gone();
     void fetch();
     void load_list();
     void load_table();

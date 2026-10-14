@@ -78,6 +78,15 @@ std::shared_ptr<body_reader> body_reader::make_remote(std::shared_ptr<bool> aliv
     return r;
 }
 
+bool body_reader::gone()
+{
+    if (*m_alive)
+        return false;
+    // The waiting consumer is let go, since it may hold this reader and nothing will call it now.
+    m_waiter = nullptr;
+    return true;
+}
+
 void body_reader::next(deliver cb)
 {
     if (m_held >= 0)
@@ -125,7 +134,7 @@ void body_reader::load_table()
     const bool q = m_io->pread(m_fd, buf->data(), static_cast<uint32_t>(buf->size()),
                                m_data_off + m_squeezed->table_at, [self, buf, failed](int64_t res)
         {
-            if (!*self->m_alive)
+            if (self->gone())
                 return;
             auto t = std::make_shared<lz4_table>();
             if (res != static_cast<int64_t>(buf->size()) ||
@@ -162,7 +171,7 @@ void body_reader::load_list()
     const bool q = m_io->pread(m_fd, buf->data(), static_cast<uint32_t>(buf->size()), m_data_off + m_trailer.at,
         [self, buf, failed](int64_t res)
         {
-            if (!*self->m_alive)
+            if (self->gone())
                 return;
             part_list list;
             if (res != static_cast<int64_t>(buf->size()) ||
@@ -240,7 +249,7 @@ void body_reader::fetch()
             m_pos += want;
             m_remote(at, want, [self = shared_from_this(), i, want](bool ok, std::string bytes)
             {
-                if (!*self->m_alive)
+                if (self->gone())
                     return;
                 slot& sl = self->m_slots[i];
                 if (ok && bytes.size() == want)
@@ -316,7 +325,7 @@ void body_reader::fetch()
         const bool q = m_io->pread(m_fd, into, static_cast<uint32_t>(want), off,
             [self, i, want, chunks](int64_t res)
             {
-                if (!*self->m_alive)
+                if (self->gone())
                     return;
                 self->read_done(i, res, want, chunks);
             });
@@ -360,7 +369,7 @@ void body_reader::read_done(int index, int64_t res, uint64_t want, std::shared_p
     {
         m_pool->submit(m_lane, std::move(work), [self = shared_from_this(), index, ok]
         {
-            if (!*self->m_alive)
+            if (self->gone())
                 return;
             self->m_slots[index].state = *ok ? slot_state::ready : slot_state::failed;
             self->hand_out();
