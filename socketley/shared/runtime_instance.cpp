@@ -586,16 +586,17 @@ void runtime_instance::print_bash_message(std::string_view msg) const
     if (m_bash_prefix)
         std::cout << "[" << m_name << "] ";
 
-    // Sanitize control characters (terminal escape injection prevention)
-    for (char c : msg)
+    // Sanitize control characters (terminal escape injection prevention), into one write rather than one insert a byte.
+    std::string line(msg);
+    for (char& c : line)
     {
-        unsigned char uc = static_cast<unsigned char>(c);
+        const unsigned char uc = static_cast<unsigned char>(c);
         if ((uc < 0x20 && uc != '\t') || uc == 0x7F)
-            std::cout << '?';
-        else
-            std::cout << c;
+            c = '?';
     }
-    std::cout << std::endl;
+    line.push_back('\n');
+    std::cout.write(line.data(), static_cast<std::streamsize>(line.size()));
+    std::cout.flush();
 }
 
 // ─── -w file ────────────────────────────────────────────────────────────────

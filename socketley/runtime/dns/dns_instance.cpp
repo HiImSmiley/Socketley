@@ -11,6 +11,7 @@
 #include <ctime>
 #include <filesystem>
 #include <sstream>
+#include <memory>
 #include <unordered_map>
 
 #include <arpa/inet.h>
@@ -242,8 +243,9 @@ public:
 
     dns_run(dns_instance& owner, event_loop& loop) : m_owner(owner), m_loop(loop)
     {
-        m_rx_bufs.resize(static_cast<size_t>(udp_batch) * udp_rx_buf);
-        m_tx_bufs.resize(static_cast<size_t>(udp_batch) * reply_buf);
+        // Not zeroed, so the pages a quiet server never fills are never resident.
+        m_rx_bufs = std::make_unique_for_overwrite<uint8_t[]>(static_cast<size_t>(udp_batch) * udp_rx_buf);
+        m_tx_bufs = std::make_unique_for_overwrite<uint8_t[]>(static_cast<size_t>(udp_batch) * reply_buf);
     }
     ~dns_run() override
     {
@@ -383,12 +385,12 @@ private:
     iovec   m_rx_iov[udp_batch]{};
     sockaddr_storage m_rx_src[udp_batch]{};
     alignas(cmsghdr) char m_rx_cbuf[udp_batch][128]{};
-    std::vector<uint8_t> m_rx_bufs;
+    std::unique_ptr<uint8_t[]> m_rx_bufs;
     mmsghdr m_tx[udp_batch]{};
     iovec   m_tx_iov[udp_batch]{};
     sockaddr_storage m_tx_dst[udp_batch]{};
     alignas(cmsghdr) char m_tx_cbuf[udp_batch][64]{};
-    std::vector<uint8_t> m_tx_bufs;
+    std::unique_ptr<uint8_t[]> m_tx_bufs;
     unsigned m_tx_n{0};
 
     std::unordered_map<uint64_t, rrl_bucket> m_rrl;
@@ -639,7 +641,7 @@ void dns_run::udp_done(udp_ep& ep, int res)
     {
         for (unsigned i = 0; i < udp_batch; ++i)
         {
-            m_rx_iov[i].iov_base = m_rx_bufs.data() + i * udp_rx_buf;
+            m_rx_iov[i].iov_base = m_rx_bufs.get() + i * udp_rx_buf;
             m_rx_iov[i].iov_len = udp_rx_buf;
             msghdr& h = m_rx[i].msg_hdr;
             h = msghdr{};
@@ -655,7 +657,7 @@ void dns_run::udp_done(udp_ep& ep, int res)
             break;
         for (int i = 0; i < n; ++i)
             if (!(m_rx[i].msg_hdr.msg_flags & MSG_TRUNC))
-                udp_query(ep, m_rx_bufs.data() + static_cast<size_t>(i) * udp_rx_buf, m_rx[i].msg_len, m_rx_src[i],
+                udp_query(ep, m_rx_bufs.get() + static_cast<size_t>(i) * udp_rx_buf, m_rx[i].msg_len, m_rx_src[i],
                           m_rx[i].msg_hdr.msg_namelen, m_rx[i].msg_hdr);
         // Answered at once rather than after the next read, which may wait: a batch that came short says the queue
         // is drained for now, and its replies leave before anything else is read.
@@ -710,7 +712,7 @@ void dns_run::udp_query(udp_ep& ep, const uint8_t* q, size_t len, const sockaddr
     if (m_tx_n == udp_batch)
         udp_flush(ep);
     const unsigned slot = m_tx_n;
-    uint8_t* out = m_tx_bufs.data() + static_cast<size_t>(slot) * reply_buf;
+    uint8_t* out = m_tx_bufs.get() + static_cast<size_t>(slot) * reply_buf;
     answer_meta meta;
     const bool xfr = !m_transfer.empty() && ip_block::any_contains(m_transfer, reinterpret_cast<const sockaddr*>(&src));
     size_t n = answer(*m_zones, q, len, out, reply_buf, /*tcp=*/false, xfr, meta);
@@ -862,7 +864,8 @@ void dns_run::accept_done(tcp_listener& l, struct io_uring_cqe* cqe)
         }
         else
         {
-            auto c = std::make_shared<tcp_conn>();
+            // Default-initialised, so the read buffer is not zeroed before the first read fills it.
+            auto c = std::make_shared_for_overwrite<tcp_conn>();
             c->id = m_next_id++;
             c->fd = fd;
             socklen_t len = sizeof c->peer;

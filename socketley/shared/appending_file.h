@@ -115,10 +115,13 @@ public:
         // One write for the whole line, because N shards of one runtime are N
         // processes with the same path: an append this size is atomic on a
         // regular file, so the lines interleave without tearing.
-        std::string buf(line);
-        buf.push_back('\n');
-        if (!write_all(m_fd, buf.data(), buf.size()))
+        m_line.assign(line);
+        m_line.push_back('\n');
+        if (!write_all(m_fd, m_line.data(), m_line.size()))
             complain("could not be written");
+        // A long line once does not keep its size here.
+        if (m_line.capacity() > 64 * 1024)
+            std::string().swap(m_line);
     }
 
     void close()
@@ -145,6 +148,8 @@ private:
     std::string m_path;
     int         m_fd{-1};
     bool        m_failed{false};
+    // The line and its newline, built here so a message costs no allocation.
+    std::string m_line;
 };
 
 }  // namespace socketley

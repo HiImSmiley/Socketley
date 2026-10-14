@@ -656,6 +656,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Cache: `allkeys-random` at its limit takes a victim by sampling the table**,
+  as Redis does, instead of walking the LRU list to a random index. A write
+  over the limit cost half the keyspace in pointer chasing: 200-byte SETs into
+  a 16 MiB cache went from 4,375 to 566,000 a second and from 228 to 1.75 us of
+  CPU each (three alternating passes). The policy is unchanged; the walk is
+  kept for a table emptied far below its bucket count.
+
+- **Cache: a client blocked with no timeout no longer wakes its worker.** The
+  blocked-pop tick ran ten times a second while anyone was parked; it now runs
+  only while a waiter has a deadline or reads a group whose stream can go. One
+  `BLPOP key 0` parked: 139 wakeups in ten seconds before, 0 after.
+
+- **Shard crossings are framed once and read without copies.** A request or an
+  answer between two shards was built three times on the way out, its frames
+  were erased one at a time from the front of the read buffer, and each was
+  decoded into owned strings; the send queue was copied into the wire buffer
+  every batch and is swapped now. GETs on a four-shard cache: 2.3% less CPU
+  each (median of eight paired passes).
+
+- **Storage: a file body over HTTPS/1.1 reaches the record layer without two
+  copies of every 256 KiB piece.** 4 MiB GETs over TLS: 14% less CPU each and
+  16% more a second (median of five paired passes). A sealed or compressed
+  window is no longer zeroed before it is read into, and a sharded listing
+  merges the shards' sorted pages instead of sorting all of them.
+
+- **HTTP/2: HPACK Huffman strings decode eight bits a step instead of one,**
+  1.8-5x faster per byte, checked against the bit-at-a-time definition on
+  random input.
+
+- Smaller ones: EVAL writes its reply where it is sent and finds a script at
+  the front of its cache without hashing it (3% less CPU); the journal's
+  CRC-32 folds eight bytes a step; LREM walks a packed list once; a pattern
+  message is built once per pattern rather than once per subscriber; a
+  websocket broadcast frame is built inside the segment it is sent from; a
+  `socketley.pipe` line, `-b` output and `-w` lines allocate nothing per
+  message; the proxy asks a unix peer's address once per connection; TLS
+  flushes in the server, cache and client reserve their records as the proxy
+  does; an outbound storage peer resumes its TLS session; the dashboard reads
+  proportional memory once per sample, not once per poll; a DNS runtime's
+  512 KiB of datagram buffers are no longer zeroed, so an idle one keeps them
+  off its resident set.
+
 - **Storage: a copy of a multipart object is a single-part object**, as S3
   makes it: its ETag is the MD5 of its bytes without `-N`, taken during the copy,
   and `partNumber=1` reads all of it. Copies used to keep the source's multipart

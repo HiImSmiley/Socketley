@@ -258,6 +258,16 @@ inline std::string json_decode_string(const char*& p, const char* end, bool& ok)
     std::string result;
     while (p < end && *p != '"')
     {
+        // The run up to the next quote or backslash goes in one append, not a byte at a time.
+        if (*p != '\\')
+        {
+            const char* q = p;
+            while (q < end && *q != '"' && *q != '\\')
+                ++q;
+            result.append(p, static_cast<size_t>(q - p));
+            p = q;
+            continue;
+        }
         if (*p == '\\' && p + 1 < end)
         {
             ++p;

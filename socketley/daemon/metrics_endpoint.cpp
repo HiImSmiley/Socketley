@@ -19,6 +19,8 @@
 #include <charconv>
 #include <cstdlib>
 #include <cstdio>
+#include <mutex>
+#include <unordered_map>
 #include <shared_mutex>
 #include <thread>
 #include <chrono>
@@ -428,6 +430,44 @@ static uint64_t proportional_bytes(pid_t pid)
     return kb * 1024;
 }
 
+// Pss by process, read for every process at the history's cadence by sample() and only looked up by a request,
+// since a dashboard polling every two seconds otherwise walked every runtime's page tables on each poll.
+struct pss_cache
+{
+    std::mutex                          mu;
+    std::unordered_map<pid_t, uint64_t> by_pid;
+};
+
+static pss_cache& pss()
+{
+    static pss_cache c;
+    return c;
+}
+
+// A process the last sample did not see, a runtime started since, is read now and kept until the next.
+static uint64_t cached_pss(pid_t pid)
+{
+    auto& c = pss();
+    std::lock_guard<std::mutex> lk(c.mu);
+    if (const auto it = c.by_pid.find(pid); it != c.by_pid.end())
+        return it->second;
+    const uint64_t b = proportional_bytes(pid);
+    c.by_pid.emplace(pid, b);
+    return b;
+}
+
+static void refresh_pss(const std::vector<pid_t>& every)
+{
+    std::unordered_map<pid_t, uint64_t> fresh;
+    fresh.reserve(every.size());
+    for (const pid_t pid : every)
+        if (!fresh.contains(pid))
+            fresh.emplace(pid, proportional_bytes(pid));
+    auto& c = pss();
+    std::lock_guard<std::mutex> lk(c.mu);
+    c.by_pid.swap(fresh);
+}
+
 static void add_process_usage(pid_t pid, process_usage& u)
 {
     char path[48];
@@ -452,7 +492,7 @@ static void add_process_usage(pid_t pid, process_usage& u)
     static const long page = ::sysconf(_SC_PAGESIZE);
     u.cpu_seconds += static_cast<double>(utime + stime) / static_cast<double>(tick > 0 ? tick : 100);
     u.rss_bytes += rss_pages > 0 ? static_cast<uint64_t>(rss_pages) * static_cast<uint64_t>(page > 0 ? page : 4096) : 0;
-    u.memory_bytes += proportional_bytes(pid);
+    u.memory_bytes += cached_pss(pid);
     ++u.processes;
 }
 
@@ -1098,6 +1138,9 @@ void metrics_endpoint::sample()
     // The daemon's own is the sum of its runtimes', its own process added to theirs.
     history::reading all;
     std::vector<pid_t> every{::getpid()};
+    for (const auto& p : pids)
+        every.insert(every.end(), p.begin(), p.end());
+    refresh_pss(every);
     for (size_t i = 0; i < readings.size(); ++i)
     {
         const process_usage u = usage_of(pids[i]);
@@ -1109,7 +1152,6 @@ void metrics_endpoint::sample()
         all.messages += r.messages;
         all.bytes_in += r.bytes_in;
         all.bytes_out += r.bytes_out;
-        every.insert(every.end(), pids[i].begin(), pids[i].end());
     }
     const process_usage u = usage_of(every);
     all.cpu_seconds = u.cpu_seconds;
