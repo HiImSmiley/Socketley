@@ -5474,9 +5474,25 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             // reader can split again -- while broadcast(), send() and
             // group_send() all put the newline back.  queue_send() strips it
             // again for a websocket peer, so nothing changes there.
-            auto shared_msg = std::make_shared<const std::string>(
-                std::string(msg) + "\n");
-            queue_send(peer, shared_msg, false, nullptr, kind);
+            // One recipient, so the echo path's shape: no shared copy, and a raw peer's line goes straight into its queue.
+            if (SOCKETLEY_LIKELY(peer->proto != proto_ws))
+            {
+                if (admit_send(peer, msg.size() + 1, false))
+                {
+                    peer->write_queue.push_coalesced_line(
+                        msg, server_connection::WRITE_COALESCE_LIMIT);
+                    if (SOCKETLEY_LIKELY(!peer->write_pending))
+                        flush_write_queue(peer);
+                }
+            }
+            else
+            {
+                std::string buf;
+                buf.reserve(msg.size() + 1);
+                buf.append(msg);
+                buf.push_back('\n');
+                queue_send(peer, std::move(buf), false, kind);
+            }
         }
         return;
     }
@@ -5875,7 +5891,7 @@ server_instance::fanout_count server_instance::queue_broadcast(
     if (SOCKETLEY_UNLIKELY(!m_loop))
         return counted;
 
-    std::shared_ptr<const std::string> ws_msg; // Lazy WS frame creation
+    uint32_t ws_len = 0;   // the websocket frame, built at the first websocket in the set
     // Placed at the first recipient that takes each form, once for all of them.
     std::shared_ptr<const std::string> seg, ws_seg;
     uint32_t off = 0, ws_off = 0;
@@ -5932,20 +5948,24 @@ server_instance::fanout_count server_instance::queue_broadcast(
 
         if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
         {
-            if (!ws_msg)
+            if (ws_len == 0)
             {
                 // Strip trailing newline for WS frame (WS messages are not newline-delimited)
                 std::string_view payload(*msg);
                 if (!payload.empty() && payload.back() == '\n')
                     payload.remove_suffix(1);
                 // Built once for every websocket in the set, because the
-                // opcode is a fact about the message and not the recipient.
-                ws_msg = ws_frame_data_shared(
-                    static_cast<uint8_t>(0x80 | ws_data_opcode(kind, payload)), payload);
-                ws_off = socketley::place_in_segment(m_bcast_ws_seg, *ws_msg);
+                // opcode is a fact about the message and not the recipient,
+                // and straight into the segment it is sent from.
+                const auto op = static_cast<uint8_t>(0x80 | ws_data_opcode(kind, payload));
+                const size_t n = ws_header_size(payload.size()) + payload.size();
+                ws_off = socketley::place_in_segment_with(m_bcast_ws_seg, n, [&](std::string& out) {
+                    ws_frame_data_into(out, op, payload);
+                });
                 ws_seg = m_bcast_ws_seg;
+                ws_len = static_cast<uint32_t>(n);
             }
-            conn->write_queue.push_slice(ws_seg, ws_off, static_cast<uint32_t>(ws_msg->size()));
+            conn->write_queue.push_slice(ws_seg, ws_off, ws_len);
             if (!conn->write_pending)
                 flush_write_queue(conn);
         }
@@ -6313,6 +6333,13 @@ void server_instance::tls_flush(server_connection* conn)
     // WANT_READ.
     if (conn->tls_state == tls_conn_ready)
     {
+        // Room for the records of what is queued, as the proxy reserves it, so the write BIO does not regrow from empty.
+        if (!conn->write_queue.empty())
+        {
+            const size_t plain = std::min<size_t>(conn->write_queue.bytes(),
+                                                  tls_context::max_bio_buffered + conn->write_queue.front().size());
+            tls_context::reserve_out(conn->ssl, plain + plain / 16384 * 22 + 64);
+        }
         while (!conn->write_queue.empty())
         {
             const auto& msg = conn->write_queue.front();

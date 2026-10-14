@@ -669,10 +669,11 @@ inline std::shared_ptr<const std::string> ws_frame_data_shared(uint8_t opcode_wi
     char hdr[14];
     int hdr_len = ws_write_header(hdr, opcode_with_fin, payload.size());
 
+    // Reserved and appended, so the payload is written once and never zeroed first.
     auto frame = std::make_shared<std::string>();
-    frame->resize(static_cast<size_t>(hdr_len) + payload.size());
-    std::memcpy(frame->data(), hdr, static_cast<size_t>(hdr_len));
-    std::memcpy(frame->data() + hdr_len, payload.data(), payload.size());
+    frame->reserve(static_cast<size_t>(hdr_len) + payload.size());
+    frame->append(hdr, static_cast<size_t>(hdr_len));
+    frame->append(payload);
     return frame;
 }
 

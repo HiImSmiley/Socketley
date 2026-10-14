@@ -1465,6 +1465,13 @@ void client_instance::tls_flush()
     // WANT_READ.
     if (m_conn->tls_state == tls_conn_ready)
     {
+        // Room for the records of what is queued, as the proxy reserves it, so the write BIO does not regrow from empty.
+        if (!m_write_queue.empty())
+        {
+            const size_t plain = std::min<size_t>(m_write_queue.bytes(),
+                                                  tls_context::max_bio_buffered + m_write_queue.front().size());
+            tls_context::reserve_out(m_conn->ssl, plain + plain / 16384 * 22 + 64);
+        }
         while (!m_write_queue.empty())
         {
             const std::string& msg = m_write_queue.front();

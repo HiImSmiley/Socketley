@@ -211,6 +211,20 @@ inline uint32_t place_in_segment(std::shared_ptr<std::string>& seg, std::string_
     return off;
 }
 
+// place_in_segment for bytes `fill` appends, exactly `n` of them, so a frame is built where it is sent from.
+template <class Fill>
+inline uint32_t place_in_segment_with(std::shared_ptr<std::string>& seg, size_t n, Fill&& fill)
+{
+    if (!seg || seg->capacity() - seg->size() < n)
+    {
+        seg = std::make_shared<std::string>();
+        seg->reserve(n > write_segment_bytes ? n : write_segment_bytes);
+    }
+    const auto off = static_cast<uint32_t>(seg->size());
+    fill(*seg);
+    return off;
+}
+
 inline size_t write_queue_size_of(const write_chunk& c)
 {
     return c.size() + write_queue_entry_overhead;

@@ -22,6 +22,7 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <atomic>
 #include <mutex>
 #include <new>
 #include <vector>
@@ -378,6 +379,8 @@ struct inbound_failures
     std::map<std::string, uint64_t> by_reason;
     uint64_t total{0};
     std::chrono::steady_clock::time_point since{};
+    // Whether total is above zero, read without the lock by the report every loop turn runs.
+    std::atomic<bool> any{false};
 };
 inbound_failures& inbound()
 {
@@ -405,6 +408,7 @@ void note_inbound_failure(const std::string& brief)
         if (f.total == 0)
             f.since = std::chrono::steady_clock::now();
         ++f.total;
+        f.any.store(true, std::memory_order_relaxed);
         if (f.by_reason.size() < inbound_reasons_max || f.by_reason.count(brief))
             ++f.by_reason[brief];
         else
@@ -859,7 +863,8 @@ SSL* tls_context::create_ssl_client(std::string_view expected_hostname) const
 void tls_context::remember_session(std::string_view peer_name, SSL* ssl)
 {
 #if SOCKETLEY_HAS_TLS
-    if (!ssl || peer_name.empty())
+    // A handshake that never finished verified nobody, so its session is not offered again.
+    if (!ssl || peer_name.empty() || !SSL_is_init_finished(ssl))
         return;
 
     // A COPY and not a reference to the live one: freeing an SSL whose peer
@@ -902,6 +907,8 @@ void tls_context::report_inbound_failures()
     std::string line;
     {
         auto& f = inbound();
+        if (!f.any.load(std::memory_order_relaxed))
+            return;
         std::lock_guard<std::mutex> lk(f.mu);
         const auto now = std::chrono::steady_clock::now();
         if (f.total == 0 || now - f.since < inbound_report_every())
@@ -916,6 +923,7 @@ void tls_context::report_inbound_failures()
             line += (i ? ", " : " ") + top[i].first + " (" + std::to_string(top[i].second) + ")";
         f.by_reason.clear();
         f.total = 0;
+        f.any.store(false, std::memory_order_relaxed);
     }
     LOG_INFO(line.c_str());
 #endif

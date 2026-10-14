@@ -137,9 +137,19 @@ struct huffman_index
     uint32_t first[31]{};
     uint16_t offset[31]{};
     uint16_t symbol[257]{};
+    // By the next eight bits, the symbol whose code is that long or shorter and its length; 0 for a longer code.
+    uint8_t  fast_sym[256]{};
+    uint8_t  fast_len[256]{};
 
     huffman_index()
     {
+        for (unsigned s = 0; s < 256; ++s)
+            if (const unsigned len = huff_len[s]; len <= 8)
+                for (uint32_t t = huff_code[s] << (8 - len), e = t + (1u << (8 - len)); t < e; ++t)
+                {
+                    fast_sym[t] = static_cast<uint8_t>(s);
+                    fast_len[t] = static_cast<uint8_t>(len);
+                }
         for (unsigned s = 0; s < 257; ++s)
             ++count[huff_len[s]];
         uint16_t at = 0;
@@ -240,33 +250,69 @@ constexpr size_t entry_overhead = 32;
 
 }   // namespace
 
+uint32_t huffman_code(unsigned sym, unsigned& len)
+{
+    len = huff_len[sym];
+    return huff_code[sym];
+}
+
 bool huffman_decode(std::string_view in, std::string& out)
 {
     const huffman_index& h = index();
-    uint32_t code = 0;
-    unsigned len = 0;
-    for (const char ch : in)
+    // The unread bits, highest first; whatever lies below `nb` is zero.
+    uint64_t acc = 0;
+    unsigned nb  = 0;
+    size_t   i   = 0;
+    out.reserve(out.size() + in.size() * 8 / 5);
+    for (;;)
     {
-        const auto byte = static_cast<uint8_t>(ch);
-        for (int bit = 7; bit >= 0; --bit)
+        while (nb <= 56 && i < in.size())
         {
-            code = (code << 1) | ((byte >> bit) & 1u);
-            ++len;
-            if (len > 30)
-                return false;
-            if (h.count[len] && code >= h.first[len] && code - h.first[len] < h.count[len])
-            {
-                const uint16_t sym = h.symbol[h.offset[len] + (code - h.first[len])];
-                if (sym == 256)
-                    return false;   // EOS inside a string is an error
-                out += static_cast<char>(sym);
-                code = 0;
-                len  = 0;
-            }
+            acc |= static_cast<uint64_t>(static_cast<uint8_t>(in[i++])) << (56 - nb);
+            nb += 8;
         }
+        if (nb == 0)
+            return true;
+
+        // Eight bits at a time for the codes that short, which are most of what a header holds.
+        if (const unsigned top = static_cast<unsigned>(acc >> 56); h.fast_len[top] && h.fast_len[top] <= nb)
+        {
+            out += static_cast<char>(h.fast_sym[top]);
+            acc <<= h.fast_len[top];
+            nb  -= h.fast_len[top];
+            continue;
+        }
+
+        // A longer code, bit by bit from nine, as the canonical table counts them.
+        uint32_t code = static_cast<uint32_t>(acc >> 56);
+        unsigned len  = 8;
+        bool     hit  = false;
+        if (nb > 8)
+            while (len < 30 && len < nb)
+            {
+                code = (code << 1) | static_cast<uint32_t>((acc >> (63 - len)) & 1u);
+                ++len;
+                if (h.count[len] && code >= h.first[len] && code - h.first[len] < h.count[len])
+                {
+                    const uint16_t sym = h.symbol[h.offset[len] + (code - h.first[len])];
+                    if (sym == 256)
+                        return false;   // EOS inside a string is an error
+                    out += static_cast<char>(sym);
+                    acc <<= len;
+                    nb  -= len;
+                    hit  = true;
+                    break;
+                }
+            }
+        if (hit)
+            continue;
+
+        // No code ends in what is left, which is padding only if every byte is read, it is under eight bits, and
+        // those are the high bits of EOS, all ones.
+        if (i < in.size() || nb >= 8)
+            return false;
+        return (acc >> (64 - nb)) == (1u << nb) - 1;
     }
-    // What is left is padding: the high bits of EOS, which are all ones, and fewer than eight.
-    return len < 8 && code == (1u << len) - 1;
 }
 
 bool decoder::entry(uint64_t index, const header*& h) const

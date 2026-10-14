@@ -22,6 +22,7 @@
 #include "../../shared/trace.h"
 #include "../../shared/invariants.h"
 #include "../../shared/http_framing.h"
+#include "../../shared/transparent_string.h"
 #include "proxy_auth.h"
 
 struct runtime_endpoint;
@@ -285,6 +286,8 @@ struct alignas(64) proxy_client_connection
     // The client's address as X-Forwarded-For names it, looked up on the
     // connection's first request and kept for the rest.
     std::string peer_addr;
+    // Asked once, since a unix peer's address is empty and the empty string cannot say it was asked.
+    bool peer_probed{false};
 
     std::chrono::steady_clock::time_point last_activity{};
     // The backend kept idle for this connection's next request, or -1; see
@@ -1121,7 +1124,7 @@ private:
     std::string m_auth_spec;
     proxy_auth m_auth;
     uint16_t m_https_redirect{0};
-    std::unordered_map<std::string, entrance_route> m_entrance_exact;
+    std::unordered_map<std::string, entrance_route, string_hash, string_equal> m_entrance_exact;
     // "*.ui.example.com" kept as ".ui.example.com", longest first, so the most
     // specific wildcard answers.
     std::vector<std::pair<std::string, entrance_route>> m_entrance_wild;

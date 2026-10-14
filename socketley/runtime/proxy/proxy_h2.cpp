@@ -223,9 +223,13 @@ proxy_client_connection* proxy_instance::h2_make_stream(proxy_client_connection*
     // reaches the place that fills this in.  Without it the entrance appended no hop to X-Forwarded-For, the chain
     // ended at the client's own word, and a proxy behind the entrance -- which trusts a local peer -- keyed its
     // decisions on that word.
-    if (parent->peer_addr.empty() && parent->fd >= 0)
-        parent->peer_addr = peer_ip(parent->fd);
-    child->peer_addr = parent->peer_addr;
+    if (parent->peer_addr.empty() && !parent->peer_probed && parent->fd >= 0)
+    {
+        parent->peer_addr   = peer_ip(parent->fd);
+        parent->peer_probed = true;
+    }
+    child->peer_addr   = parent->peer_addr;
+    child->peer_probed = true;
     m_client_slots[fd] = owned.release();
     m_client_count++;
     m_conn_idx[fd].side = conn_client;

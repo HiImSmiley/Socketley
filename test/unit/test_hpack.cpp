@@ -225,3 +225,75 @@ TEST_CASE("the frames a server writes")
     h = h2::parse_head(o.data());
     CHECK((h.type == h2::PING && h.flags == h2::ACK && o.substr(9) == "12345678"));
 }
+
+TEST_CASE("Huffman strings: the table decoder says what the bit-by-bit definition says, for any bytes")
+{
+    // The definition: a bit at a time, a symbol wherever a code ends, padding of under eight ones at the end.
+    auto reference = [](std::string_view in, std::string& out) {
+        uint32_t code = 0;
+        unsigned len  = 0;
+        for (const char ch : in)
+            for (int bit = 7; bit >= 0; --bit)
+            {
+                code = (code << 1) | ((static_cast<uint8_t>(ch) >> bit) & 1u);
+                if (++len > 30)
+                    return false;
+                for (unsigned s = 0; s < 257; ++s)
+                {
+                    unsigned l = 0;
+                    if (huffman_code(s, l) == code && l == len)
+                    {
+                        if (s == 256)
+                            return false;
+                        out += static_cast<char>(s);
+                        code = 0;
+                        len  = 0;
+                        break;
+                    }
+                }
+            }
+        return len < 8 && code == (1u << len) - 1;
+    };
+    auto encode = [](std::string_view s) {
+        std::string out;
+        uint64_t acc = 0;
+        unsigned nb  = 0;
+        for (const char ch : s)
+        {
+            unsigned l = 0;
+            const uint32_t c = huffman_code(static_cast<uint8_t>(ch), l);
+            acc = (acc << l) | c;
+            nb += l;
+            while (nb >= 8) { out += static_cast<char>(acc >> (nb - 8)); nb -= 8; }
+        }
+        if (nb)
+            out += static_cast<char>((acc << (8 - nb)) | ((1u << (8 - nb)) - 1));
+        return out;
+    };
+
+    std::mt19937 rng(7541);
+    for (int round = 0; round < 3000; ++round)
+    {
+        // Every byte value, through codes of every length from five to thirty.
+        std::string plain;
+        const int n = static_cast<int>(rng() % 64);
+        for (int i = 0; i < n; ++i)
+            plain += static_cast<char>(round % 3 == 0 ? rng() % 256 : 32 + rng() % 95);
+        const std::string coded = encode(plain);
+        std::string got;
+        REQUIRE(huffman_decode(coded, got));
+        CHECK(got == plain);
+
+        // And bytes that are not a string at all, which both must refuse or read alike.
+        std::string noise;
+        const int m = static_cast<int>(rng() % 12);
+        for (int i = 0; i < m; ++i)
+            noise += static_cast<char>(rng() % 4 == 0 ? 0xff : rng() % 256);
+        std::string a, b;
+        const bool ra = huffman_decode(noise, a);
+        const bool rb = reference(noise, b);
+        CHECK(ra == rb);
+        if (ra && rb)
+            CHECK(a == b);
+    }
+}

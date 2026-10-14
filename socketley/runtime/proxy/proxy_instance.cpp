@@ -316,6 +316,7 @@ void proxy_client_connection::reset(int new_fd)
     h2s.reset();
     h2_parent = nullptr;
     peer_addr.clear();
+    peer_probed = false;
     last_activity = {};
     parked_backend_fd = -1;
     kept_alive = false;
@@ -4656,8 +4657,11 @@ bool proxy_instance::auth_admits(proxy_client_connection* conn)
     int fields = 0;
     const std::string_view authorization = request_field(head, "authorization", fields);
     // Behind the entrance, a hop on this machine, the client is who it says it heard from last.
-    if (conn->peer_addr.empty() && conn->fd >= 0)
-        conn->peer_addr = peer_ip(conn->fd);
+    if (conn->peer_addr.empty() && !conn->peer_probed && conn->fd >= 0)
+    {
+        conn->peer_addr   = peer_ip(conn->fd);
+        conn->peer_probed = true;
+    }
     std::string client = conn->peer_addr;
     if (local_peer(client))
     {
@@ -4808,8 +4812,11 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
 
     bool host_written = false;
     bool client_keep_alive = false;
-    if (conn->peer_addr.empty() && conn->fd >= 0)
-        conn->peer_addr = peer_ip(conn->fd);
+    if (conn->peer_addr.empty() && !conn->peer_probed && conn->fd >= 0)
+    {
+        conn->peer_addr   = peer_ip(conn->fd);
+        conn->peer_probed = true;
+    }
     const bool forwarded_trusted = m_prefix.empty() && !m_entrance && local_peer(conn->peer_addr);
     bool kept_proto = false, kept_host = false;
     std::string prior_forwarded_for;
@@ -5297,12 +5304,22 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
     // The header block measured from the same terminator, with guards for the
     // day the caller's precondition stops holding, because a chain that
     // silently sees no headers is an auth filter that admits everyone.
-    sol::table hdrs = L.create_table();
     const auto line_end = conn->partial.find("\r\n");
     const auto hdr_end  = conn->partial.find("\r\n\r\n");
-    if (line_end != std::string::npos && hdr_end != std::string::npos && hdr_end > line_end)
+    const bool framed   = line_end != std::string::npos && hdr_end != std::string::npos && hdr_end > line_end;
+    std::string_view block;
+    int fields = 0;
+    if (framed)
     {
-        std::string_view block(conn->partial.data() + line_end + 2, hdr_end - line_end - 2);
+        block = std::string_view(conn->partial.data() + line_end + 2, hdr_end - line_end - 2);
+        fields = 1;
+        for (size_t at = block.find("\r\n"); at != std::string_view::npos; at = block.find("\r\n", at + 2))
+            ++fields;
+    }
+    // Sized for every field up front, so the table is not rehashed as the headers go in.
+    sol::table hdrs = L.create_table(0, fields);
+    if (framed)
+    {
         size_t p = 0;
         while (p < block.size())
         {
@@ -5619,7 +5636,7 @@ void proxy_instance::entrance_load(std::chrono::milliseconds min_gap)
             std::fclose(f);
         }
 
-    std::unordered_map<std::string, entrance_route> exact;
+    std::unordered_map<std::string, entrance_route, string_hash, string_equal> exact;
     std::vector<std::pair<std::string, entrance_route>> wild;
     std::vector<std::string> zones;
     for (size_t p = 0; p < text.size();)
@@ -5745,7 +5762,7 @@ proxy_instance::entrance_route* proxy_instance::entrance_find(std::string_view h
 {
     if (host.empty())
         return nullptr;
-    if (auto it = m_entrance_exact.find(std::string(host)); it != m_entrance_exact.end())
+    if (auto it = m_entrance_exact.find(host); it != m_entrance_exact.end())
         return &it->second;
     // "*.ui.example.com" covers one label or more in front of ".ui.example.com",
     // as a storage runtime's bucket names do, and never the name itself.

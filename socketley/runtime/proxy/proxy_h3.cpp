@@ -137,6 +137,7 @@ uint64_t proxy_instance::h3_make_stream(socketley::h3::stream& st)
     child->peer_addr = socketley::h3::peer_text_of(st);
     if (const size_t colon = child->peer_addr.rfind(':'); colon != std::string::npos)
         child->peer_addr.erase(colon);
+    child->peer_probed = true;
     m_client_slots[fd] = owned.release();
     m_client_count++;
     m_conn_idx[fd].side = conn_client;

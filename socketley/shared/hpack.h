@@ -21,6 +21,9 @@ struct header
 // Opens a Huffman-coded string into `out`; false for padding longer than 7 bits or not all ones, or for EOS.
 bool huffman_decode(std::string_view in, std::string& out);
 
+// Symbol `sym`'s code from RFC 7541 Appendix B, right-aligned, and its length in bits; 256 is EOS.
+uint32_t huffman_code(unsigned sym, unsigned& len);
+
 class decoder
 {
 public:
