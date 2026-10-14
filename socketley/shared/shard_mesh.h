@@ -114,11 +114,11 @@ public:
     {
         if (!alive())
             return false;
-        if (!m_writer.write(worker_proto::frame(
-                worker_proto::frame_type::chan_rep,
-                worker_proto::encode_chan_reply(ticket,
-                                                static_cast<uint8_t>(st),
-                                                reply))))
+        if (!m_writer.write_with(
+                worker_proto::chan_reply_frame_size(reply), [&](std::string& out) {
+                    worker_proto::append_chan_reply_frame(
+                        out, ticket, static_cast<uint8_t>(st), reply);
+                }))
         {
             die("could not answer a sibling: the backlog is full");
             return false;
@@ -134,9 +134,11 @@ public:
         if (!alive())
             return false;
 
-        if (!m_writer.write(worker_proto::frame(
-                worker_proto::frame_type::chan_req,
-                worker_proto::encode_chan_request(ticket, target, payload))))
+        if (!m_writer.write_with(
+                worker_proto::chan_request_frame_size(target, payload),
+                [&](std::string& out) {
+                    worker_proto::append_chan_request_frame(out, ticket, target, payload);
+                }))
         {
             // The backlog is full or the socket is gone, and either way this
             // link is not carrying anything more.
@@ -327,17 +329,31 @@ private:
     // Act on every whole frame the recv completions have delivered so far.
     void take_frames()
     {
+        // A turn of the loop inside handle() lands here again, and the outer walk already reaches what it appended.
+        if (m_taking)
+            return;
+        m_taking = true;
+
         worker_proto::frame_type type{};
         uint16_t                 ver = 0;
+        std::string_view         view;
         std::string              payload;
         bool                     fatal = false;
+        size_t                   off   = 0;
 
-        while (worker_proto::take_frame(m_in, type, ver, payload, fatal))
+        while (worker_proto::peek_frame(m_in, off, type, ver, view, fatal))
         {
+            // Copied, since handle() may append to m_in and move what view points at.
+            payload.assign(view.data(), view.size());
             handle(type, payload);
             if (m_dead)
+            {
+                m_taking = false;
                 return;    // handle() gave up on the link; m_in goes with it
+            }
         }
+        m_in.erase(0, off);
+        m_taking = false;
 
         if (fatal)
             die("a sibling sent a frame this build cannot read");
@@ -350,7 +366,7 @@ private:
         // never meet.
         if (type == worker_proto::frame_type::chan_req)
         {
-            worker_proto::chan_request_wire q;
+            worker_proto::chan_request_view q;
             if (!worker_proto::decode_chan_request(payload, q))
             {
                 // Answered as dropped when its ticket can be read, or the sender holds the crossing for good.
@@ -379,7 +395,7 @@ private:
 
         if (type == worker_proto::frame_type::chan_rep)
         {
-            worker_proto::chan_reply_wire p;
+            worker_proto::chan_reply_view p;
             if (!worker_proto::decode_chan_reply(payload, p))
                 return;
 
@@ -423,6 +439,7 @@ private:
     io_request  m_req{};
     bool        m_armed{false};
     bool        m_dead{false};
+    bool        m_taking{false};
 
     // Set by expect_peer_exit(); false means a sibling going is news.
     bool        m_peer_exit_expected{false};

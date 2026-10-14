@@ -160,9 +160,10 @@ private:
                 m_off = 0;
                 return;                       // nothing owed
             }
-            m_wire.assign(m_out, m_off, std::string::npos);
-            m_out.clear();
-            m_off = 0;
+            // Swapped, not copied: the drained m_wire hands its capacity to the next batch.
+            m_wire.swap(m_out);
+            m_wire_off = m_off;
+            m_off      = 0;
         }
 
         const size_t   left = m_wire.size() - m_wire_off;

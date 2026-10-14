@@ -169,9 +169,10 @@ public:
         // resolve it, and false means the backlog is full, so the channel
         // answers the origin rather than parking a ticket nothing will
         // complete.
-        return m_w->write(
-            worker_proto::frame(worker_proto::frame_type::chan_req,
-                worker_proto::encode_chan_request(ticket, target, payload)));
+        return m_w->write_with(
+            worker_proto::chan_request_frame_size(target, payload), [&](std::string& out) {
+                worker_proto::append_chan_request_frame(out, ticket, target, payload);
+            });
     }
 
 private:
@@ -720,11 +721,18 @@ private:
 
         worker_proto::frame_type type{};
         uint16_t                 ver = 0;
+        std::string_view         view;
         std::string              payload;
         bool                     fatal = false;
+        size_t                   off   = 0;
 
-        while (worker_proto::take_frame(m_in, type, ver, payload, fatal))
+        // Copied, since a handler that turns the loop appends to m_in and moves what view points at.
+        while (worker_proto::peek_frame(m_in, off, type, ver, view, fatal))
+        {
+            payload.assign(view.data(), view.size());
             handle(type, payload);
+        }
+        m_in.erase(0, off);
 
         if (fatal)
         {
@@ -1277,10 +1285,11 @@ private:
 
         if (to.link_serial == 0)
         {
-            if (!m_writer.write(worker_proto::frame(
-                    worker_proto::frame_type::chan_rep,
-                    worker_proto::encode_chan_reply(
-                        to.wire_ticket, static_cast<uint8_t>(st), reply)))) {}
+            if (!m_writer.write_with(
+                    worker_proto::chan_reply_frame_size(reply), [&](std::string& out) {
+                        worker_proto::append_chan_reply_frame(
+                            out, to.wire_ticket, static_cast<uint8_t>(st), reply);
+                    })) {}
             return;
         }
 
@@ -1612,7 +1621,7 @@ private:
 
     void on_chan_req(const std::string& payload)
     {
-        worker_proto::chan_request_wire q;
+        worker_proto::chan_request_view q;
         if (!worker_proto::decode_chan_request(payload, q))
             return;   // a frame this build cannot read is skipped, not fatal
 
@@ -1642,8 +1651,10 @@ private:
             }
         }
 
-        if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::chan_rep,
-                          worker_proto::encode_chan_reply(q.ticket, st, reply)))) {}
+        if (!m_writer.write_with(
+                worker_proto::chan_reply_frame_size(reply), [&](std::string& out) {
+                    worker_proto::append_chan_reply_frame(out, q.ticket, st, reply);
+                })) {}
     }
 
     // The answer to something this worker's runtime asked, whose ticket this
@@ -1651,7 +1662,7 @@ private:
     // tag.
     void on_chan_rep(const std::string& payload)
     {
-        worker_proto::chan_reply_wire p;
+        worker_proto::chan_reply_view p;
         if (!worker_proto::decode_chan_reply(payload, p))
             return;
 

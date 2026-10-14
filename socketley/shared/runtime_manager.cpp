@@ -809,8 +809,8 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
     // Created.
     std::vector<std::string> names;
     {
+        // No reserve: a worker's table is mostly replicas without a VM, and the common publish collects nothing.
         std::shared_lock lock(mutex);
-        names.reserve(runtimes.size());
         for (auto& [n, inst] : runtimes)
         {
             if (inst->get_state() != runtime_running)

@@ -211,17 +211,18 @@ struct reader
     }
 };
 
-// Pulls one whole frame off the front of `buf`, leaving it untouched when
-// there is not a complete one, and reporting `frame_version` rather than
-// enforcing it.
-inline bool take_frame(std::string& buf, frame_type& type, uint16_t& frame_version,
-                       std::string& payload, bool& fatal)
+// One whole frame at `off` without consuming it, because erasing per frame
+// makes a read of many frames quadratic; `payload` points into `buf`, `off`
+// moves past the frame on true, and `frame_version` is reported, not enforced.
+inline bool peek_frame(std::string_view buf, size_t& off, frame_type& type,
+                       uint16_t& frame_version, std::string_view& payload,
+                       bool& fatal)
 {
     fatal = false;
-    if (buf.size() < header_size)
+    if (buf.size() - off < header_size)
         return false;
 
-    reader r(buf.data(), buf.size());
+    reader r(buf.data() + off, buf.size() - off);
     const uint32_t len = r.u32();
     frame_version      = r.u16();
     type               = static_cast<frame_type>(r.u16());
@@ -234,11 +235,26 @@ inline bool take_frame(std::string& buf, frame_type& type, uint16_t& frame_versi
         return false;
     }
 
-    if (buf.size() < header_size + len)
+    if (buf.size() - off < header_size + len)
         return false;
 
-    payload.assign(buf, header_size, len);
-    buf.erase(0, header_size + len);
+    payload = buf.substr(off + header_size, len);
+    off += header_size + len;
+    return true;
+}
+
+// Pulls one whole frame off the front of `buf`, leaving it untouched when
+// there is not a complete one.
+inline bool take_frame(std::string& buf, frame_type& type, uint16_t& frame_version,
+                       std::string& payload, bool& fatal)
+{
+    size_t           off = 0;
+    std::string_view view;
+    if (!peek_frame(buf, off, type, frame_version, view, fatal))
+        return false;
+
+    payload.assign(view.data(), view.size());
+    buf.erase(0, off);
     return true;
 }
 
@@ -1023,6 +1039,73 @@ inline bool decode_chan_reply(std::string_view payload, chan_reply_wire& p)
     p.ticket  = r.u64();
     p.status  = static_cast<uint8_t>(r.u8());
     p.payload = std::string(r.str());
+    return r.ok;
+}
+
+// The chan frames built straight into a writer's queue, header included, so a
+// crossing is copied once on the way out instead of three times.
+inline size_t chan_request_frame_size(std::string_view target, std::string_view payload)
+{
+    return header_size + 16 + target.size() + payload.size();
+}
+
+inline void append_chan_request_frame(std::string& out, uint64_t ticket,
+                                      std::string_view target, std::string_view payload)
+{
+    put_u32(out, static_cast<uint32_t>(16 + target.size() + payload.size()));
+    put_u16(out, version);
+    put_u16(out, static_cast<uint16_t>(frame_type::chan_req));
+    put_u64(out, ticket);
+    put_str(out, target);
+    put_str(out, payload);
+}
+
+inline size_t chan_reply_frame_size(std::string_view payload)
+{
+    return header_size + 13 + payload.size();
+}
+
+inline void append_chan_reply_frame(std::string& out, uint64_t ticket, uint8_t status,
+                                    std::string_view payload)
+{
+    put_u32(out, static_cast<uint32_t>(13 + payload.size()));
+    put_u16(out, version);
+    put_u16(out, static_cast<uint16_t>(frame_type::chan_rep));
+    put_u64(out, ticket);
+    out.push_back(static_cast<char>(status));
+    put_str(out, payload);
+}
+
+// The same two decodes as views into the frame, valid as long as its payload.
+struct chan_request_view
+{
+    uint64_t         ticket{0};
+    std::string_view target;
+    std::string_view payload;
+};
+
+struct chan_reply_view
+{
+    uint64_t         ticket{0};
+    uint8_t          status{0};
+    std::string_view payload;
+};
+
+inline bool decode_chan_request(std::string_view payload, chan_request_view& q)
+{
+    reader r(payload.data(), payload.size());
+    q.ticket  = r.u64();
+    q.target  = r.str();
+    q.payload = r.str();
+    return r.ok;
+}
+
+inline bool decode_chan_reply(std::string_view payload, chan_reply_view& p)
+{
+    reader r(payload.data(), payload.size());
+    p.ticket  = r.u64();
+    p.status  = static_cast<uint8_t>(r.u8());
+    p.payload = r.str();
     return r.ok;
 }
 
