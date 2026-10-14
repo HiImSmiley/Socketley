@@ -36,6 +36,7 @@
 
 #include "../shared/cert_keeper.h"
 #include "../shared/https_client.h"
+#include "../shared/jws.h"
 #include "../shared/dns_feed.h"
 #include "../shared/tls_context.h"
 #include "../runtime/storage/json_doc.h"
@@ -45,45 +46,13 @@ namespace
 
 using socketley::storage::jvalue;
 using socketley::storage::json_reader;
+using socketley::jws::b64url;
+using socketley::jws::es256;
+using socketley::jws::jwk_of;
+using socketley::jws::sha256;
 
 constexpr std::string_view lets_encrypt = "https://acme-v02.api.letsencrypt.org/directory";
 constexpr int poll_seconds = 90;
-
-std::string b64url(std::string_view in)
-{
-    static constexpr char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    std::string out;
-    size_t i = 0;
-    for (; i + 2 < in.size(); i += 3)
-    {
-        const uint32_t v = (uint8_t(in[i]) << 16) | (uint8_t(in[i + 1]) << 8) | uint8_t(in[i + 2]);
-        out += tbl[v >> 18];
-        out += tbl[(v >> 12) & 63];
-        out += tbl[(v >> 6) & 63];
-        out += tbl[v & 63];
-    }
-    if (i + 1 == in.size())
-    {
-        const uint32_t v = uint8_t(in[i]) << 16;
-        out += tbl[v >> 18];
-        out += tbl[(v >> 12) & 63];
-    }
-    else if (i + 2 == in.size())
-    {
-        const uint32_t v = (uint8_t(in[i]) << 16) | (uint8_t(in[i + 1]) << 8);
-        out += tbl[v >> 18];
-        out += tbl[(v >> 12) & 63];
-        out += tbl[(v >> 6) & 63];
-    }
-    return out;
-}
-
-std::string sha256(std::string_view in)
-{
-    unsigned char d[SHA256_DIGEST_LENGTH];
-    SHA256(reinterpret_cast<const unsigned char*>(in.data()), in.size(), d);
-    return std::string(reinterpret_cast<const char*>(d), sizeof d);
-}
 
 std::string jstr(std::string_view v)
 {
@@ -127,44 +96,6 @@ using reply = https_client::reply;
 
 // ─── Keys and signatures ────────────────────────────────────────────────────
 
-EVP_PKEY* load_or_make_key(const std::string& path, std::string& err)
-{
-    if (BIO* b = BIO_new_file(path.c_str(), "r"))
-    {
-        EVP_PKEY* k = PEM_read_bio_PrivateKey(b, nullptr, nullptr, nullptr);
-        BIO_free(b);
-        if (k)
-            return k;
-        err = "the account key " + path + " does not load";
-        return nullptr;
-    }
-    ERR_clear_error();
-    EVP_PKEY* k = EVP_EC_gen("P-256");
-    std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-    // Written beside and linked into place whole, so a failure leaves no empty or cut key that would never load.
-    const std::string tmp = path + ".new." + std::to_string(::getpid());
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    FILE* f = fd >= 0 ? fdopen(fd, "w") : nullptr;
-    bool ok = k && f && PEM_write_PrivateKey(f, k, nullptr, nullptr, 0, nullptr, nullptr) == 1 && fflush(f) == 0 &&
-              ::fsync(fd) == 0;
-    if (f)
-        ok = fclose(f) == 0 && ok;
-    else if (fd >= 0)
-        ::close(fd);
-    ok = ok && ::link(tmp.c_str(), path.c_str()) == 0;
-    if (fd >= 0)
-        ::unlink(tmp.c_str());
-    if (!ok)
-    {
-        err = "the account key " + path + " could not be written";
-        if (k)
-            EVP_PKEY_free(k);
-        return nullptr;
-    }
-    return k;
-}
-
 std::string pem_of_key(EVP_PKEY* k)
 {
     BIO* b = BIO_new(BIO_s_mem());
@@ -174,51 +105,6 @@ std::string pem_of_key(EVP_PKEY* k)
     std::string s(p, static_cast<size_t>(n));
     BIO_free(b);
     return s;
-}
-
-// The account key's public half as RFC 7638 orders it, which is also the input to its thumbprint.
-std::string jwk_of(EVP_PKEY* k)
-{
-    BIGNUM *x = nullptr, *y = nullptr;
-    EVP_PKEY_get_bn_param(k, "qx", &x);
-    EVP_PKEY_get_bn_param(k, "qy", &y);
-    std::string xs(32, '\0'), ys(32, '\0');
-    if (x)
-        BN_bn2binpad(x, reinterpret_cast<unsigned char*>(xs.data()), 32);
-    if (y)
-        BN_bn2binpad(y, reinterpret_cast<unsigned char*>(ys.data()), 32);
-    BN_free(x);
-    BN_free(y);
-    return "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"" + b64url(xs) + "\",\"y\":\"" + b64url(ys) + "\"}";
-}
-
-// ES256 over `input`, as JWS has it: r and s, 32 bytes each, and not DER.
-std::string es256(EVP_PKEY* k, std::string_view input)
-{
-    EVP_MD_CTX* md = EVP_MD_CTX_new();
-    size_t n = 0;
-    std::string der;
-    if (EVP_DigestSignInit(md, nullptr, EVP_sha256(), nullptr, k) == 1 &&
-        EVP_DigestSign(md, nullptr, &n, reinterpret_cast<const unsigned char*>(input.data()), input.size()) == 1)
-    {
-        der.resize(n);
-        if (EVP_DigestSign(md, reinterpret_cast<unsigned char*>(der.data()), &n,
-                           reinterpret_cast<const unsigned char*>(input.data()), input.size()) == 1)
-            der.resize(n);
-        else
-            der.clear();
-    }
-    EVP_MD_CTX_free(md);
-    const unsigned char* p = reinterpret_cast<const unsigned char*>(der.data());
-    ECDSA_SIG* sig = der.empty() ? nullptr : d2i_ECDSA_SIG(nullptr, &p, static_cast<long>(der.size()));
-    std::string raw(64, '\0');
-    if (sig)
-    {
-        BN_bn2binpad(ECDSA_SIG_get0_r(sig), reinterpret_cast<unsigned char*>(raw.data()), 32);
-        BN_bn2binpad(ECDSA_SIG_get0_s(sig), reinterpret_cast<unsigned char*>(raw.data()) + 32, 32);
-        ECDSA_SIG_free(sig);
-    }
-    return raw;
 }
 
 std::string csr_der(EVP_PKEY* k, const std::vector<std::string>& names)
@@ -879,7 +765,7 @@ int issue(int argc, char** argv)
 
     std::string err;
     https h;
-    EVP_PKEY* account = h.init(err) ? load_or_make_key(account_path, err) : nullptr;
+    EVP_PKEY* account = h.init(err) ? socketley::jws::load_or_make_key(account_path, "the account key", err) : nullptr;
     if (!account)
     {
         std::cout << "acme: " << err << "\n";
