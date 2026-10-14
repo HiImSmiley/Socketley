@@ -17,6 +17,9 @@
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
+#include "../runtime/idp/idp_instance.h"
+#include "../runtime/idp/idp_run.h"
+#include "../shared/storage_rpc.h"
 #include "../shared/dns_feed.h"
 #include "../shared/runtime_names.h"
 #include "../shared/cert_keeper.h"
@@ -1426,6 +1429,7 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("daemon-cluster"): return cmd_daemon_cluster(conn, pa);
         case fnv1a("dashboard"):     return cmd_dashboard(conn);
         case fnv1a("ping"):          return cmd_ping(conn);
+        case fnv1a("idp-user"):      return cmd_idp_user(conn, pa);
         case fnv1a("startup"):       return cmd_startup(conn, pa);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
@@ -1540,6 +1544,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                     break;
                 case runtime_sync:
                     result = parse_sync_flags(static_cast<sync_instance*>(instance), pa, i, name);
+                    break;
+                case runtime_idp:
+                    result = parse_idp_flags(static_cast<idp_instance*>(instance), pa, i, name);
                     break;
                 default:
                     // A registered type's flags come from its manifest schema.
@@ -2873,6 +2880,119 @@ void daemon_handler::on_worker_deliver(proxy_supervisor* from,
         LOG_WARN(("a worker's send could not be delivered: " + why).c_str());
 }
 
+// An account of an idp runtime, changed or read in the worker that keeps them, which answers in text.
+int daemon_handler::cmd_idp_user(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count < 3)
+    {
+        conn->write_buf = "usage: idp-user <idp> add|passwd|set|disable|enable|logout|remove|show|list|import ...\n";
+        return 1;
+    }
+    const std::string_view name = pa.args[1];
+    auto* instance = m_manager.get(name);
+    if (!instance || instance->get_type() != runtime_idp)
+    {
+        conn->write_buf = "no idp runtime named " + std::string(name) + "\n";
+        return 1;
+    }
+    if (instance->get_state() != runtime_running)
+    {
+        conn->write_buf = "runtime is not running: " + std::string(name) + "\n";
+        return 1;
+    }
+    // One request to a runtime's worker and its answer, waited for here; false with the reason in write_buf.
+    const auto ask = [&](std::string_view runtime, std::string_view payload, std::string& reply)
+    {
+        auto it = m_proxy_workers.find(std::string(runtime));
+        if (it == m_proxy_workers.end() || it->second.empty() || !it->second[0])
+        {
+            conn->write_buf = "could not reach the worker holding " + std::string(runtime) + "\n";
+            return false;
+        }
+        const uint64_t ticket = proxy_supervisor::direct_ticket_bit | ++m_direct_ticket_seq;
+        uint8_t st = 0;
+        const worker_wait_scope waiting{m_worker_wait_depth};
+        auto* sup = it->second[0].get();
+        if (!sup->send_direct(ticket, payload) || !sup->await_direct(ticket, std::chrono::milliseconds(4000), st, reply))
+        {
+            conn->write_buf = "no answer from the worker holding " + std::string(runtime) + "\n";
+            return false;
+        }
+        if (st != static_cast<uint8_t>(request_status::ok))
+        {
+            conn->write_buf = "the worker holding " + std::string(runtime) + " refused the command\n";
+            return false;
+        }
+        return true;
+    };
+    std::string reply;
+    if (pa.args[2] == "import")
+    {
+        // The storage is asked by the daemon and its pages handed to the provider, one wait after the other: the
+        // provider asking the storage itself would go through this daemon while it waits on the provider.
+        if (pa.count != 4)
+        {
+            conn->write_buf = "usage: idp-user <idp> import <storage>\n";
+            return 1;
+        }
+        const std::string_view storage = pa.args[3];
+        auto* st = m_manager.get(storage);
+        if (!st || st->get_type() != runtime_storage || st->get_state() != runtime_running)
+        {
+            conn->write_buf = "no running storage runtime named " + std::string(storage) + "\n";
+            return 1;
+        }
+        size_t added = 0, kept = 0;
+        std::string errors, after;
+        for (;;)
+        {
+            socketley::storage_rpc::request q;
+            q.kind = socketley::storage_rpc::op::users;
+            q.start_after = after;
+            std::string page;
+            if (!ask(storage, socketley::storage_rpc::encode(q), page))
+                return 2;
+            socketley::storage_rpc::reply r;
+            if (!socketley::storage_rpc::decode(page, socketley::storage_rpc::op::users, r) || !r.ok)
+            {
+                conn->write_buf = "the storage " + std::string(storage) + " gave no list of users: " + r.message + "\n";
+                return 1;
+            }
+            if (!ask(name, std::string(socketley::idp::command_marker) + "import-data\n" + page, reply))
+                return 2;
+            if (reply.starts_with("error: "))
+            {
+                conn->write_buf = reply;
+                return 1;
+            }
+            const size_t nl = reply.find('\n');
+            const std::string counts = reply.substr(0, nl);
+            added += std::strtoull(counts.c_str(), nullptr, 10);
+            kept += std::strtoull(counts.c_str() + std::min(counts.size(), counts.find(' ') + 1), nullptr, 10);
+            if (nl != std::string::npos)
+                errors += reply.substr(nl + 1);
+            if (!r.truncated || r.objects.empty())
+                break;
+            after = r.objects.back().key;
+        }
+        conn->write_buf = std::to_string(added) + " imported, " + std::to_string(kept) + " already here\n" + errors;
+        return 0;
+    }
+    std::string payload(socketley::idp::command_marker);
+    for (size_t i = 2; i < pa.count; ++i)
+    {
+        payload.append(pa.args[i]);
+        if (i + 1 < pa.count)
+            payload += '\n';
+    }
+    if (!ask(name, payload, reply))
+        return 2;
+    conn->write_buf = reply;
+    if (!conn->write_buf.empty() && conn->write_buf.back() != '\n')
+        conn->write_buf += '\n';
+    return reply.starts_with("error: ") ? 1 : 0;
+}
+
 int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 3)
@@ -3864,8 +3984,9 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                 case runtime_storage:
                 case runtime_dns:
                 case runtime_sync:
-                    // A storage, DNS or sync runtime's own settings are applied
-                    // by `import`, as a cache's are.
+                case runtime_idp:
+                    // A storage, DNS, sync or idp runtime's own settings are
+                    // applied by `import`, as a cache's are.
                     result = -1;
                     break;
                 default:
@@ -4852,6 +4973,11 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
         case runtime_sync:
         {
             apply_sync_config(*static_cast<sync_instance*>(instance), cfg, /*by_presence=*/true);
+            break;
+        }
+        case runtime_idp:
+        {
+            apply_idp_config(*static_cast<idp_instance*>(instance), cfg, /*by_presence=*/true);
             break;
         }
         default:
@@ -6186,9 +6312,9 @@ bool daemon_handler::serve_map_request(const std::string& op,
         // The runtime this builds runs in the daemon as it always has,
         // deliberately, because making the same three lines of Lua build a
         // different thing depending on which process ran them is the property
-        // this work exists to remove. A sync is the exception: its work is
-        // done in on_loop_turn, which only a worker's loop turns.
-        if (cfg.type == runtime_sync)
+        // this work exists to remove. A sync and an idp are the exceptions:
+        // their work is done on a worker's own loop, which only a worker turns.
+        if (cfg.type == runtime_sync || cfg.type == runtime_idp)
             inst->mark_out_of_process();
         inst->set_lua_created(true);
         inst->set_child_policy(

@@ -502,7 +502,7 @@ socketley daemon --name new-name   # rename while cluster is active
 .BI "create " "type name " "[flags]"
 Create a new runtime instance.
 .I type
-can be: server, client, proxy, cache, storage, dns, sync, or any registered type \(em see
+can be: server, client, proxy, cache, storage, dns, sync, idp, or any registered type \(em see
 .BR "REGISTERED TYPES" .
 .I name
 is a unique identifier for the runtime.
@@ -822,6 +822,47 @@ The counting is one atomic add per entered socket and per taint, never per send.
 .PP
 .nf
 socketley daemon stats
+.fi
+.RE
+.TP
+.B idp\-user \fIidp\fR add \fIuser\fR [\fB\-\-password \fIpw\fR|\fB\-\fR] [\fB\-\-name \fIname\fR] [\fB\-\-email \fIaddr\fR] [\fB\-\-groups \fIa,b\fR] [\fB\-\-set \fIfield\fB=\fIvalue\fR]... [\fB\-\-reset\fR]
+.TQ
+.B idp\-user \fIidp\fR passwd \fIuser\fR \fB\-\-password \fIpw\fR|\fB\-\fR [\fB\-\-reset\fR]
+.TQ
+.B idp\-user \fIidp\fR set \fIuser field\fB=\fIvalue\fR...
+.TQ
+.B idp\-user \fIidp\fR disable\fR|\fBenable\fR|\fBlogout\fR|\fBremove\fR|\fBshow \fIuser\fR
+.TQ
+.B idp\-user \fIidp\fR list\fR|\fBimport \fIstorage\fR
+The accounts an
+.B idp
+runtime keeps, changed in the process that keeps them.
+.B add
+makes one under a new fixed id, which it prints and which every token names it
+by, so a username changed later is still the same account;
+.B \-\-password \-
+reads the password from the first line of stdin, off the command line others
+can read, and
+.B \-\-reset
+makes it set again at the next sign-in.
+.B set
+gives any field a value, an empty one removing it: a field the provider does
+not know is kept and carried as it is, for the applications that use it.
+.B logout
+ends every session and refresh token the account holds;
+.B passwd
+does too.
+.B show
+prints the fields, the password as set and never its hash.
+.B import
+takes a storage runtime's users over, with the password each has there, an
+account of the same name already here kept as it is. A refusal is exit 1.
+.RS
+.PP
+.nf
+socketley idp\-user auth add smiley \-\-password \- \-\-groups admins
+socketley idp\-user auth set smiley picture=https://storage.example.com/me.png
+socketley idp\-user auth import ui
 .fi
 .RE
 .TP
@@ -1280,7 +1321,7 @@ name	Runtime name \fB(requires restart)\fR
 id	6-char hex identifier (read-only, ignored on import)
 type	T{
 .ad l
-Runtime type: server, client, proxy, cache, storage, dns, sync (read-only, ignored on import)
+Runtime type: server, client, proxy, cache, storage, dns, sync, idp (read-only, ignored on import)
 T}
 was_running	Internal daemon state (ignored on import)
 .TE
@@ -1437,6 +1478,7 @@ dir	string	T{
 Directory holding the buckets, as \fB\-\-dir\fR \fB(requires restart)\fR
 T}
 anonymous	bool	Accept requests without credentials, as \fB\-\-anonymous\fR \fB(requires restart)\fR
+idp	string	The idp runtime whose sign-in the web interface takes, as \fB\-\-idp\fR \fB(requires restart)\fR
 max_bytes	number	T{
 .ad l
 Quota on the bytes held, as \fB\-\-max\-bytes\fR (0 = none); takes effect on a serving runtime
@@ -4005,7 +4047,7 @@ socketley create proxy hub \-p 8089 \-\-bind 127.0.0.1 \\
     \-\-backend 127.0.0.1:8088 \-\-domain hub \-\-backend\-timeout 5m \-s
 .fi
 .TP
-.BI \-\-auth " bearer:file\fR|\fBbasic:\fIfile\fR|\fBnone"
+.BI \-\-auth " bearer:file\fR|\fBbasic:\fIfile\fR|\fBidp:\fIruntime\fR|\fBnone"
 Who may send a request through, asked before any of it reaches a backend.
 .B bearer:
 admits
@@ -4045,6 +4087,31 @@ changes it on a stopped proxy.
 socketley create proxy metrics \-p 9191 \-\-bind 127.0.0.1 \\
     \-\-backend 127.0.0.1:9190 \-\-domain metrics \\
     \-\-auth basic:/etc/socketley/storage\-ui.creds \-s
+.fi
+.IP
+.BI idp: runtime
+puts a sign-in in front of every route: the sign-in cookie of the
+.B idp
+runtime of that name in this daemon, verified here against the key it
+publishes beside its state, each session once and then remembered until it
+expires. A browser without one, a GET or HEAD that accepts HTML, is sent with
+.B 302
+to sign in and back to the address it asked for; anything else is answered
+.BR 401 .
+The backend is told the account's fixed id in
+.BR X\-Forwarded\-User ,
+its username in
+.B X\-Forwarded\-Preferred\-Username
+and its address in
+.BR X\-Forwarded\-Email ,
+which a client's own of those names never reaches. The cookie reaches a proxy
+on another name only when the provider's
+.B \-\-cookie\-domain
+covers both.
+.IP
+.nf
+socketley create proxy wiki \-p 8100 \-\-backend 127.0.0.1:3000 \\
+    \-\-domain wiki.example.com \-\-auth idp:auth \-s
 .fi
 .TP
 .BR \-\-redirect\-https " [\fIport\fR|" none ]
@@ -6801,6 +6868,21 @@ a request with no credentials is
 .B "403 AccessDenied"
 unless its bucket's policy allows it, as described under
 .BR "Bucket policy" .
+.TP
+.BI \-\-idp " runtime"
+The web interface and WebDAV in a browser take the sign-in of the
+.B idp
+runtime of that name in this daemon: an account signed in there is the user
+of the same name here, with the rights that user has here and no others, and
+an account that is no user here is answered
+.BR 403 .
+The page offers the provider's sign-in beside its own form, and signing out
+there signs out at the provider. The cookie reaches the storage only when the
+provider's
+.B \-\-cookie\-domain
+covers its name. Accounts of the storage's own users can be taken over by the
+provider with
+.BR "socketley idp\-user \fIidp\fP import \fIstorage\fP" .
 .TP
 .BI \-\-mpu\-expire " duration"
 Abort a multipart upload that has been open this long (\fB24h\fR, \fB7d\fR; a bare
@@ -11509,6 +11591,104 @@ names that is not a storage, or not there, is a failure of the same kind.
 .B last_run_secs
 and
 .BR last_error .
+.SH IDP FLAGS
+An
+.B idp
+runtime is an OpenID Connect provider that keeps its own accounts: a user
+signs in once, and every application that asks the provider, every route a
+proxy puts behind it, a storage's web interface and the dashboard know who
+they are.
+.PP
+.nf
+socketley create idp auth \-p 9400 \-\-domain auth.example.com \e
+    \-\-clients /etc/socketley/idp.clients \-\-cookie\-domain example.com \-s
+socketley idp\-user auth add smiley \-\-password \- \-\-groups admins
+.fi
+.PP
+An account is a fixed random id and fields with no schema. The provider
+reads
+.BR username ,
+.B password
+(a scrypt hash),
+.BR disabled ,
+.B groups
+(a comma list; members of
+.B admins
+are admins),
+.BR name ,
+.BR email ,
+.B picture
+and
+.BR reset ;
+every other field is kept for the applications as it is, so one they add needs
+no change here and an older build keeps what it does not know. What one
+application alone uses \(em a game's characters, a shop's orders \(em belongs
+in that application, under the account's id. Every change is synced to a
+journal under the state directory before it is answered, and folded into a
+snapshot that names its format, which a build older than it refuses rather
+than rewrites. See
+.B idp\-user
+under
+.BR COMMANDS .
+.PP
+It serves the authorization code flow with PKCE, refresh tokens, discovery at
+.BR /.well\-known/openid\-configuration ,
+its key at
+.BR /jwks ,
+.BR /userinfo ,
+which answers from the account as it is now, and
+.BR /logout ;
+at
+.B /account
+a user changes their name, address and password and signs out everywhere.
+Tokens are signed ES256 with a P\-256 key made at the first start and kept in
+the state directory, so a restart signs nobody out. A password is hashed and
+checked off the event loop. It serves plain HTTP and is reached through the
+entrance, which terminates TLS for its names as for every other runtime's;
+.B \-\-tls
+is refused, and so is
+.BR \-\-shards ,
+since a code one shard gives would be redeemed at another.
+.PP
+A sign-in is a cookie of the provider's, which a proxy with
+.BR "\-\-auth idp:" ,
+a storage with
+.B \-\-idp
+and the dashboard with
+.B daemon.dashboard_idp
+verify themselves against the key it publishes beside its state, each session
+once until it expires. A session ended at the provider \(em signed out
+everywhere, the account disabled \(em therefore ends there at once and at
+those at the session's expiry, at most twelve hours, a month for one kept
+signed in.
+.TP
+.BI "\-\-clients " file
+The applications that sign in through it, one a line:
+.IR "id secret redirect" " [" redirect ...],
+with
+.B \-
+as the secret of a public client, which must then send a PKCE challenge. A
+redirect is an https address compared whole, http only on localhost. The file
+is read again when it changes; one broken while running keeps the clients read
+before it.
+.TP
+.BI "\-\-issuer " url
+The https address the provider is reached at, which every token names; when
+not given,
+.BI https:// name
+for the first
+.BR \-\-domain .
+.TP
+.BI "\-\-cookie\-domain " domain
+The domain whose names share the sign-in cookie, so a user signed in here is
+signed in for a proxy, a storage or the dashboard on any name below it;
+without it the cookie is the provider's host alone.
+.PP
+An address that failed to sign in five times in fifteen minutes is refused
+until the oldest of those failures is fifteen minutes old, counted by the last
+address
+.B X\-Forwarded\-For
+names when the request came through a proxy on this machine.
 .SH REGISTERED TYPES
 A runtime type beyond the built-in seven is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never
@@ -14092,7 +14272,15 @@ takes), and makes one: the type, then a form of every flag
 .B create
 takes for it, by section, with the command it sends shown as it is filled in.
 .IP
-Signing in takes the access key and secret of an admin of the credentials file
+An account the
+.B idp
+runtime that
+.B daemon.dashboard_idp
+names signed in, of the group
+.BR admins ,
+is signed in here too, and the page offers that sign-in; signing out signs out
+at the provider. Otherwise signing in takes the access key and secret of an
+admin of the credentials file
 .B daemon.dashboard_credentials
 names, a storage runtime's format, as a proxy's
 .B "\-\-auth basic:"
@@ -16570,6 +16758,7 @@ daemon = {
     metrics_port = 9100,     -- Prometheus metrics HTTP endpoint
     dashboard_credentials = "/etc/socketley/admin.creds",
                              -- the dashboard's admins sign in from here
+    dashboard_idp = "auth",  -- or as admins of this idp runtime
     alert_webhook = "https://discord.com/api/webhooks/...",
                              -- where alerts are posted
     cpus = "0-3"             -- where this daemon's I/O runs

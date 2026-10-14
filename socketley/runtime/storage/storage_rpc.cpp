@@ -107,6 +107,39 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
 
     switch (rq.kind)
     {
+        case op::users:
+        {
+            // An identity provider taking this storage's users over: a page of them, each with its password's hash.
+            if (!m_auth)
+            {
+                answer(rq.kind, refusal("AccessDenied", "this storage has no users"));
+                return true;
+            }
+            std::vector<std::shared_ptr<const user_identity>> all = m_auth->users();
+            std::sort(all.begin(), all.end(), [](const auto& x, const auto& y) { return x->id < y->id; });
+            storage_rpc::reply r;
+            for (const auto& u : all)
+            {
+                if (!u || u->cluster || u->id <= rq.start_after)
+                    continue;
+                if (r.objects.size() >= storage_rpc::max_list)
+                {
+                    r.truncated = true;
+                    break;
+                }
+                storage_rpc::object_info i;
+                i.key = u->id;
+                i.metadata = {{"name", u->display_name == u->id ? std::string() : u->display_name},
+                              {"email", u->email},
+                              {"admin", u->admin ? "1" : "0"},
+                              {"reset", m_auth->login_state(u->id) == 1 ? "1" : ""},
+                              {"password", m_auth->login_hash(u->id)}};
+                r.objects.push_back(std::move(i));
+            }
+            answer(rq.kind, r);
+            return true;
+        }
+
         case op::head:
         {
             ++m_c.heads;

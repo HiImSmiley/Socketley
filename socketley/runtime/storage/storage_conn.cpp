@@ -117,6 +117,7 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
                   std::string(owner.get_name())),
       m_node(m_store, m_transport), m_auth(auth)
 {
+    m_idp.configure(owner.get_idp());
     // Uploads are each on the shard that owns their key; a bucket is dropped only
     // when no shard is at work on one, and the idle ones are aborted with it, as in S3.
     m_node.set_multipart(&m_mpu);
@@ -1835,6 +1836,8 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->hide_missing = false;
     c->acl_need = 0;
     c->by_acl   = false;
+    c->by_idp   = false;
+    c->by_idp_refused = false;
     c->website_key.clear();
     c->website_error = {};
     c->website_status = 0;

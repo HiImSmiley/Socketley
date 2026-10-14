@@ -24,7 +24,9 @@ inline constexpr size_t max_field = 1u << 16;
 inline constexpr uint32_t max_list = 1000;
 inline constexpr uint8_t version = 1;
 
-enum class op : uint8_t { put = 1, get = 2, head = 3, del = 4, list = 5 };
+// users answers for the storage's users rather than its objects, a page of them after start_after, each an
+// object_info whose key is the user and whose metadata holds name, email, admin, reset and the password's hash.
+enum class op : uint8_t { put = 1, get = 2, head = 3, del = 4, list = 5, users = 6 };
 
 inline const char* op_name(op o)
 {
@@ -35,6 +37,7 @@ inline const char* op_name(op o)
         case op::head: return "head";
         case op::del:  return "delete";
         case op::list: return "list";
+        case op::users: return "users";
     }
     return "?";
 }
@@ -82,7 +85,7 @@ inline bool decode(std::string_view in, request& r)
 {
     socketley::bytes::reader rd(in);
     uint8_t v = 0, k = 0;
-    if (!rd.u8(v) || v != version || !rd.u8(k) || k < 1 || k > 5)
+    if (!rd.u8(v) || v != version || !rd.u8(k) || k < 1 || k > 6)
         return false;
     r.kind = static_cast<op>(k);
     uint32_t n = 0;
@@ -190,6 +193,12 @@ inline std::string encode(const reply& r, op kind)
             break;
         case op::del:
             break;
+        case op::users:
+            w.u32(static_cast<uint32_t>(r.objects.size()));
+            for (const auto& o : r.objects)
+                encode_info(w, o, true);
+            w.u8(r.truncated ? 1 : 0);
+            break;
         case op::list:
             w.u32(static_cast<uint32_t>(r.objects.size()));
             for (const auto& o : r.objects)
@@ -222,6 +231,21 @@ inline bool decode(std::string_view in, op kind, reply& r)
             return decode_info(rd, r.info) && rd.bytes(r.data, max_value);
         case op::del:
             return true;
+        case op::users:
+        {
+            uint32_t n = 0;
+            if (!rd.u32(n) || n > max_list)
+                return false;
+            r.objects.resize(n);
+            for (auto& o : r.objects)
+                if (!decode_info(rd, o))
+                    return false;
+            uint8_t t = 0;
+            if (!rd.u8(t) || t > 1)
+                return false;
+            r.truncated = t == 1;
+            return true;
+        }
         case op::list:
         {
             uint32_t n = 0;

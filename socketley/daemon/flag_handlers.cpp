@@ -20,6 +20,8 @@
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
+#include "../runtime/idp/idp_instance.h"
+#include "../runtime/idp/idp_logic.h"
 #include "../shared/ip_block.h"
 #include "../shared/dns_feed.h"
 #include "../runtime/storage/s3_vhost.h"
@@ -1633,6 +1635,52 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
     }
 }
 
+int parse_idp_flags(idp_instance* ip, const parsed_args& pa, size_t& i, std::string_view /*name*/)
+{
+    switch (pa.hashes[i])
+    {
+        // The relying parties: `id secret redirect...` a line, `-` as the secret of a public client.
+        case fnv1a("--clients"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].front() != '/')
+            {
+                std::cout << "--clients requires the absolute path of a file with one client a line: "
+                             "id secret redirect...\n";
+                return 1;
+            }
+            ip->set_clients(pa.args[++i]);
+            return 0;
+        }
+        // The https address the provider is reached at, which every token names as its issuer.
+        case fnv1a("--issuer"):
+        {
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            if (v.empty() || socketley::idp::url_host(v).empty() || v.find_first_of("?#") != std::string_view::npos)
+            {
+                std::cout << "--issuer requires the https address the provider is reached at, "
+                             "such as https://auth.example.com\n";
+                return 1;
+            }
+            ip->set_issuer(pa.args[++i]);
+            return 0;
+        }
+        // The domain the sign-in cookie is set for, so a proxy on any name below it shares the sign-in.
+        case fnv1a("--cookie-domain"):
+        {
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            if (v.empty() || v.find_first_of("/:; ,") != std::string_view::npos || v.find('.') == std::string_view::npos)
+            {
+                std::cout << "--cookie-domain requires a domain such as example.com, whose names share the sign-in\n";
+                return 1;
+            }
+            ip->set_cookie_domain(pa.args[++i]);
+            return 0;
+        }
+        default:
+            return -1;
+    }
+}
+
 int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
                         std::string_view /*name*/)
 {
@@ -1660,6 +1708,17 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         case fnv1a("--anonymous"):
             stg->set_anonymous(true);
             return 0;
+        // The idp runtime whose sign-in the web interface takes.
+        case fnv1a("--idp"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty() || pa.args[i + 1].find_first_of("/ ") != std::string_view::npos)
+            {
+                std::cout << "--idp requires the name of an idp runtime of this daemon\n";
+                return 1;
+            }
+            stg->set_idp(pa.args[++i]);
+            return 0;
+        }
         // Off by default, as S3 has ACLs: a bucket given no ownership controls takes them.
         case fnv1a("--acls"):
             stg->set_acls(true);

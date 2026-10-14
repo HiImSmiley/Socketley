@@ -26,6 +26,8 @@ public:
         std::string state_dir;
         // The URL alerts are posted to, empty for none.
         std::string alert_webhook;
+        // The idp runtime whose admins sign in to the dashboard, empty for none.
+        std::string dashboard_idp;
     };
     bool start(uint16_t port, options o = {});
     void stop();

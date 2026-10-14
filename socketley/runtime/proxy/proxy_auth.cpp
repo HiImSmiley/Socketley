@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -13,6 +14,7 @@
 #include "../../shared/logging.h"
 #include "../storage/checksum.h"
 #include "../storage/s3_sigv4_auth.h"
+#include "../idp/idp_session.h"
 
 namespace
 {
@@ -63,9 +65,17 @@ proxy_auth::~proxy_auth() = default;
 
 std::string proxy_auth::spec_error(std::string_view spec)
 {
+    if (spec.starts_with("idp:"))
+    {
+        const std::string_view name = spec.substr(4);
+        if (name.empty() || name.find_first_of("/ ") != std::string_view::npos)
+            return "--auth: idp: takes the name of an idp runtime of this daemon, not '" + std::string(name) + "'";
+        return {};
+    }
     const bool bearer = spec.starts_with("bearer:"), basic = spec.starts_with("basic:");
     if (!bearer && !basic)
-        return "--auth takes bearer:<file of tokens> or basic:<credentials file of a storage runtime>, not '" +
+        return "--auth takes bearer:<file of tokens>, basic:<credentials file of a storage runtime> or "
+               "idp:<idp runtime>, not '" +
                std::string(spec) + "'";
     const std::string file(spec.substr(bearer ? 7 : 6));
     if (file.empty() || file.front() != '/')
@@ -75,8 +85,18 @@ std::string proxy_auth::spec_error(std::string_view spec)
 
 void proxy_auth::configure(std::string_view spec, std::string_view runtime)
 {
-    m_kind = spec.starts_with("bearer:") ? kind::bearer : spec.starts_with("basic:") ? kind::basic : kind::none;
-    m_file.assign(m_kind == kind::none ? std::string_view{} : spec.substr(m_kind == kind::bearer ? 7 : 6));
+    m_kind = spec.starts_with("bearer:")  ? kind::bearer
+           : spec.starts_with("basic:") ? kind::basic
+           : spec.starts_with("idp:")   ? kind::idp
+                                        : kind::none;
+    m_file.assign(m_kind == kind::none || m_kind == kind::idp ? std::string_view{}
+                                                              : spec.substr(m_kind == kind::bearer ? 7 : 6));
+    m_sessions.reset();
+    if (m_kind == kind::idp)
+    {
+        m_sessions = std::make_unique<socketley::idp::session_verifier>();
+        m_sessions->configure(spec.substr(4));
+    }
     m_runtime.assign(runtime);
     m_challenge = m_kind == kind::basic ? "WWW-Authenticate: Basic realm=\"" + m_runtime + "\", charset=\"UTF-8\"\r\n"
                                         : "WWW-Authenticate: Bearer realm=\"" + m_runtime + "\"\r\n";
@@ -150,7 +170,8 @@ std::string proxy_auth::user_of(std::string_view access_key) const
 
 bool proxy_auth::admit(std::string_view authorization) const
 {
-    if (!m_loaded)
+    // An idp's sessions are cookies, which check_session answers.
+    if (!m_loaded || m_kind == kind::idp)
         return false;
     const size_t sp = authorization.find(' ');
     if (sp == std::string_view::npos)
@@ -184,6 +205,23 @@ bool proxy_auth::admit(std::string_view authorization) const
     // A key outside any [user] signs for the default owner, who is an admin.
     const auto user = m_keys->user_of(key);
     return !user || user->admin;
+}
+
+proxy_auth::verdict proxy_auth::check_session(std::string_view cookies, std::string& sub, std::string& username,
+                                              std::string& email)
+{
+    socketley::idp::session_verifier::who w;
+    if (!m_sessions || !m_sessions->check(cookies, w))
+        return verdict::refuse;
+    sub = std::move(w.sub);
+    username = std::move(w.username);
+    email = std::move(w.email);
+    return verdict::pass;
+}
+
+std::string proxy_auth::login_url(std::string_view return_to)
+{
+    return m_sessions ? m_sessions->login_url(return_to) : std::string();
 }
 
 void proxy_auth::missed(const std::string& key, std::chrono::steady_clock::time_point now)

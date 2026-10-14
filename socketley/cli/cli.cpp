@@ -668,6 +668,9 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("send"):
             return cli_send(argc, argv);
 
+        case fnv1a("idp-user"):
+            return cli_idp_user(argc, argv);
+
         case fnv1a("edit"):
             return cli_edit(argc, argv);
 
@@ -846,6 +849,29 @@ int cli_forward(int argc, char** argv)
         std::cout << data;
 
     return exit_code;
+}
+
+// `--password -` takes the password from the first line of stdin, so it need not be on a command line others can read.
+int cli_idp_user(int argc, char** argv)
+{
+    std::vector<std::string> args(argv, argv + argc);
+    for (size_t i = 0; i + 1 < args.size(); ++i)
+        if (args[i] == "--password" && args[i + 1] == "-")
+        {
+            std::string line;
+            if (!std::getline(std::cin, line))
+            {
+                std::cout << "--password - reads the password from stdin, which gave none\n";
+                return 1;
+            }
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            args[i + 1] = line;
+        }
+    std::vector<char*> ptrs;
+    for (auto& a : args)
+        ptrs.push_back(a.data());
+    return cli_forward(static_cast<int>(ptrs.size()), ptrs.data());
 }
 
 int cli_send(int argc, char** argv)

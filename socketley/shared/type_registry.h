@@ -16,7 +16,7 @@ namespace type_registry
 using factory = std::function<std::unique_ptr<runtime_instance>(std::string_view name)>;
 
 // Everything below this id is a built-in whose value is fixed for ever.
-inline constexpr uint8_t first_registered = 7;
+inline constexpr uint8_t first_registered = 8;
 
 // Claims a local id for `name`, refusing a built-in name, a name already
 // holding a factory, and a name the id space cannot fit.

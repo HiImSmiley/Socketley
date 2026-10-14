@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **An `idp` runtime: one sign-in, for applications, proxies, storages and
+  the dashboard.** An OpenID Connect provider with its own accounts: each a
+  fixed random id that every token names it by, and fields with no schema --
+  a few the provider reads (username, password, groups, name, email,
+  picture, disabled), every other one kept for the applications as it is, so
+  a field they add needs no change and an older build keeps what it does not
+  know. Changes are synced to a journal before they are answered and folded
+  into a versioned snapshot. `socketley idp-user` adds, changes, disables,
+  signs out and lists accounts and imports a storage's users with the
+  passwords they have there; `/account` lets a user change their profile and
+  password and sign out everywhere. It serves the code flow with PKCE,
+  refresh tokens, discovery, its key as a JWKS, `/userinfo` and `/logout`,
+  signed ES256 with a key kept in the state directory, and hashes passwords
+  off the event loop. Its sign-in is a cookie that a proxy's `--auth
+  idp:<runtime>`, a storage's `--idp <runtime>` and `daemon.dashboard_idp`
+  verify themselves against the published key: a browser without one is sent
+  to sign in and back, a proxy's backend is told the account in
+  `X-Forwarded-User` and `X-Forwarded-Preferred-Username`, which a client
+  cannot send itself, a storage takes the account as its user of that name,
+  and the dashboard its admins. It serves plain HTTP behind the entrance;
+  `--tls` and `--shards` are refused.
+
 - **A `sync` runtime, which carries a directory to a storage.** One runtime is
   one job, with its own line in `socketley ls`, its own figures, log lines and
   alert; `--shards` is refused, since the shards would share no socket and

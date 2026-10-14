@@ -215,13 +215,14 @@ void send(int fd, int status, std::string_view type, std::string_view body, std:
     socketley::write_all(fd, out.data(), out.size());
 }
 
-server::server(std::string credentials, runtime_manager& manager)
+server::server(std::string credentials, std::string idp, runtime_manager& manager)
     : m_credentials(std::move(credentials)), m_manager(manager)
 {
+    m_idp.configure(idp);
     unsigned char k[32];
     if (RAND_bytes(k, sizeof k) == 1)
         m_key.assign(reinterpret_cast<char*>(k), sizeof k);
-    if (configured())
+    if (!m_credentials.empty())
     {
         m_auth = std::make_unique<proxy_auth>();
         m_auth->configure("basic:" + m_credentials, "dashboard");
@@ -246,9 +247,14 @@ std::string server::seal(std::string_view user, int64_t expires) const
 
 std::string server::session_of(const request& r) const
 {
-    if (!configured() || m_key.size() != 32)
+    if (!configured())
         return {};
     std::string_view cookies = r.header("cookie");
+    // An admin the idp runtime signed in, by the account's username.
+    if (socketley::idp::session_verifier::who w; m_idp.check(cookies, w) && w.admin)
+        return w.username;
+    if (m_key.size() != 32)
+        return {};
     std::string_view v;
     for (size_t p = 0; p < cookies.size();)
     {
@@ -323,9 +329,20 @@ void server::session(int fd, const request& r)
     if (r.method == "GET")
     {
         const std::string who = session_of(r);
+        // Where the idp signs an admin in and back here, and out again, built from the address this page was asked at.
+        std::string idp;
+        if (m_idp.enabled())
+            if (const std::string_view host = r.header("host"); !host.empty() &&
+                host.find_first_of("\r\n\"\\ /") == std::string_view::npos)
+            {
+                const std::string back =
+                    std::string(r.header("x-forwarded-proto") == "https" ? "https://" : "http://") + std::string(host) + "/";
+                idp = ",\"idp_login\":" + json_quote(m_idp.login_url(back)) + ",\"idp_logout\":" +
+                      json_quote(m_idp.logout_url(back));
+            }
         send(fd, 200, "application/json",
              "{\"configured\":" + std::string(configured() ? "true" : "false") + ",\"user\":" +
-                 (who.empty() ? std::string("null") : json_quote(who)) + "}");
+                 (who.empty() ? std::string("null") : json_quote(who)) + idp + "}");
         return;
     }
     const bool https = r.header("x-forwarded-proto") == "https";
@@ -350,6 +367,11 @@ void server::session(int fd, const request& r)
     {
         send(fd, 403, "text/plain; charset=utf-8",
              "Signing in needs daemon.dashboard_credentials in the daemon's configuration.\n");
+        return;
+    }
+    if (!m_auth)
+    {
+        send(fd, 403, "text/plain; charset=utf-8", "This dashboard is signed in to through its identity provider.\n");
         return;
     }
     int64_t retry = 0;

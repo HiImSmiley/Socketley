@@ -288,6 +288,10 @@ struct alignas(64) proxy_client_connection
     std::string peer_addr;
     // Asked once, since a unix peer's address is empty and the empty string cannot say it was asked.
     bool peer_probed{false};
+    // Who --auth idp: found signed in for this request, named to the backend: the account's id, username, email.
+    std::string auth_user;
+    std::string auth_name;
+    std::string auth_email;
 
     std::chrono::steady_clock::time_point last_activity{};
     // The backend kept idle for this connection's next request, or -1; see
@@ -1007,6 +1011,7 @@ private:
     // --auth asked of a parsed request, answered here (401, or 429 for an address that keeps failing) when it
     // refuses, and false then.
     bool auth_admits(proxy_client_connection* conn);
+    bool session_admits(proxy_client_connection* conn, std::string_view head, std::string_view client);
     // --redirect-https's answer to a parsed request.
     void answer_https_redirect(proxy_client_connection* conn);
     // The one answer for a request that will never reach a backend, where 502

@@ -40,6 +40,11 @@ public:
     // authenticate.
     void set_anonymous(bool on) { m_anonymous = on; }
     bool get_anonymous() const { return m_anonymous; }
+
+    // The idp runtime of this daemon whose sign-in the web interface takes (--idp), a user signed in there being the
+    // user of the same name here.
+    void set_idp(std::string_view name) { m_idp = std::string(name); }
+    std::string_view get_idp() const { return m_idp; }
     // Buckets given no ownership controls take ACLs (--acls), as S3 did before it disabled them by default.
     void set_acls(bool on) { m_acls = on; }
     bool get_acls() const { return m_acls; }
@@ -163,6 +168,7 @@ private:
 
     std::string m_dir;
     bool        m_anonymous{false};
+    std::string m_idp;
     bool        m_acls{false};
     uint64_t    m_max_bytes{0};
     std::string m_access_key;

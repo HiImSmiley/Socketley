@@ -251,6 +251,12 @@ public:
         return ok;
     }
 
+    // flush() and then the disk's own promise, for a record that must outlive a dead machine.
+    bool sync()
+    {
+        return flush() && m_fd >= 0 && ::fdatasync(m_fd) == 0;
+    }
+
     // Cut the records off behind a snapshot that now contains their effects,
     // buffer included, because both describe state the dump has absorbed.
     bool reset()

@@ -9,7 +9,7 @@ namespace runtime_schema
 namespace
 {
 
-// The types a flag is offered for, one letter each: Server, Client, Proxy, cache (K), sTorage, Dns, sYnc.
+// The types a flag is offered for, one letter each: Server, Client, Proxy, cache (K), sTorage, Dns, sYnc, Idp.
 struct row
 {
     std::string_view flag, types, kind, label, help, section, choices = {}, placeholder = {}, aliases = {};
@@ -18,18 +18,18 @@ struct row
 
 constexpr row rows[] = {
     // ── basics ──────────────────────────────────────────────────────────────
-    {"-p", "SCPKTD", "int", "Port", "The port it listens on (a client: the port of its target).", "Basics", {}, "8080"},
-    {"-s", "SCPKTD", "switch", "Start now", "Start it as soon as it is made.", "Basics"},
+    {"-p", "SCPKTDI", "int", "Port", "The port it listens on (a client: the port of its target).", "Basics", {}, "8080"},
+    {"-s", "SCPKTDI", "switch", "Start now", "Start it as soon as it is made.", "Basics"},
     {"-g", "SCPKTD", "text", "Group", "A group its proxies reach all members of with --backend @group.", "Basics", {}, "web", "--group"},
     {"--lua", "SCPKT", "path", "Lua script", "A script with the runtime's callbacks, run at start.", "Basics", {}, "/etc/socketley/app.lua"},
-    {"--test", "SCPKTD", "switch", "Dry run", "Check the type, the name and every flag, and keep nothing.", "Basics", {}, {}, {}, true},
+    {"--test", "SCPKTDI", "switch", "Dry run", "Check the type, the name and every flag, and keep nothing.", "Basics", {}, {}, {}, true},
 
     // ── network ─────────────────────────────────────────────────────────────
-    {"--bind", "SPKTD", "text", "Bind address", "The address the port is bound on alone, such as 127.0.0.1 for one only a proxy here reaches.", "Network", {}, "127.0.0.1"},
+    {"--bind", "SPKTDI", "text", "Bind address", "The address the port is bound on alone, such as 127.0.0.1 for one only a proxy here reaches.", "Network", {}, "127.0.0.1"},
     {"--listen", "SPKT", "text", "Unix socket", "Listen on a unix socket instead of a port.", "Network", {}, "unix:/run/socketley/app.sock"},
     {"--shards", "SPKTD", "int", "Shards", "Worker processes sharing the port: the way one runtime uses more than one core.", "Network", {}, "4"},
-    {"--domain", "SPKT", "list", "Names", "The names it is reached by through the entrance; empty for its own name.", "Network", {}, "chat, api.example.com"},
-    {"--cpus", "SCPKTD", "text", "CPUs", "The CPUs its I/O may run on, as 0-3,6.", "Network", {}, "0-3"},
+    {"--domain", "SPKTI", "list", "Names", "The names it is reached by through the entrance; empty for its own name.", "Network", {}, "chat, api.example.com"},
+    {"--cpus", "SCPKTDI", "text", "CPUs", "The CPUs its I/O may run on, as 0-3,6.", "Network", {}, "0-3"},
 
     // ── TLS ─────────────────────────────────────────────────────────────────
     {"--tls", "SCPKT", "switch", "TLS", "Encrypt its transport: terminate TLS on its port, or dial over it.", "TLS"},
@@ -40,7 +40,7 @@ constexpr row rows[] = {
     {"--acme-email", "SPKT", "text", "ACME e-mail", "The address the CA writes to about the certificate.", "TLS", {}, "ops@example.com"},
 
     // ── limits ──────────────────────────────────────────────────────────────
-    {"--max-connections", "SPKT", "int", "Max connections", "The most clients at once.", "Limits", {}, "10000", "--max-conn"},
+    {"--max-connections", "SPKTI", "int", "Max connections", "The most clients at once.", "Limits", {}, "10000", "--max-conn"},
     {"--rate-limit", "SPK", "int", "Rate limit", "Messages a second per connection.", "Limits", {}, "100"},
     {"--global-rate-limit", "SPK", "int", "Global rate limit", "Messages a second over all connections.", "Limits", {}, "10000"},
     {"--idle-timeout", "SPKT", "duration", "Idle timeout", "Close a connection quiet this long; none is closed for it unless this is given.", "Limits", {}, "5m"},
@@ -144,6 +144,10 @@ constexpr row rows[] = {
     {"--prefix", "Y", "text", "Prefix", "The key everything is written under, below the bucket.", "Sync", {}, "laptop/"},
     {"--every", "Y", "text", "Walk every", "How often the whole directory is walked; never for only on a change.", "Sync", {}, "1h"},
     {"--exclude", "Y", "list", "Exclude", "Patterns not carried, against the path below the directory.", "Sync", {}, "*.tmp, .git/*"},
+    {"--clients", "I", "path", "Clients", "The applications that sign in through it: id, secret or -, and redirect addresses a line.", "Identity", {}, "/etc/socketley/idp.clients"},
+    {"--issuer", "I", "text", "Issuer", "The https address it is reached at; https://<first name> when not given.", "Identity", {}, "https://auth.example.com"},
+    {"--idp", "T", "text", "Identity provider", "The idp runtime whose sign-in the web interface takes, its users being the users of the same name here.", "Storage", {}, "auth"},
+    {"--cookie-domain", "I", "text", "Cookie domain", "The domain whose names share one sign-in, for a proxy's --auth idp:.", "Identity", {}, "example.com"},
     {"--repositories", "Y", "path", "Repositories", "The file a storage writes for a user's own sync runtime, which pulls their git repositories.", "Sync", {}, "/var/lib/socketley/storage/ui/.ui/sync/user.json"},
 };
 
@@ -177,7 +181,7 @@ const std::string& json()
             for (char t : r.types)
             {
                 const char* name = t == 'S' ? "server" : t == 'C' ? "client" : t == 'P' ? "proxy" : t == 'K' ? "cache"
-                                 : t == 'T' ? "storage" : t == 'Y' ? "sync" : "dns";
+                                 : t == 'T' ? "storage" : t == 'Y' ? "sync" : t == 'I' ? "idp" : "dns";
                 o += f2 ? "" : ",";
                 f2 = false;
                 quote(o, name);

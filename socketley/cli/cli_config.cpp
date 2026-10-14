@@ -147,6 +147,12 @@ constexpr config_key config_keys[] = {
     { "exclude",            "--exclude",            key_kind::list    },
     { "repositories",       "--repositories",       key_kind::text    },
     { "every",              "--every",              key_kind::scalar  },
+
+    // ── idp ─────────────────────────────────────────────────────────────────
+    { "clients",            "--clients",            key_kind::text    },
+    { "issuer",             "--issuer",             key_kind::text    },
+    { "cookie_domain",      "--cookie-domain",      key_kind::text    },
+    { "idp",                "--idp",                key_kind::text    },
 };
 
 // Keys with no flag of their own, listed so an unknown key can still be

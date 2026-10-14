@@ -192,6 +192,15 @@ public:
         v.error   = {"AccessDenied", "The user or password given is not one of this runtime's.", 401};
         return v;
     }
+    // User `id` as a sign-in an identity provider vouched for names it, with the rights the user has here; refused
+    // for a name that is no user here.
+    virtual auth_verdict authorize_identity(std::string_view /*id*/)
+    {
+        auth_verdict v;
+        v.allowed = false;
+        v.error   = {"AccessDenied", "The account signed in is no user of this runtime.", 403};
+        return v;
+    }
     // The HMAC-SHA256, hex, of ui_session_text(access_key, issued_ms, expires_ms) under that key's secret, which a
     // session cookie carries; empty for a key that is none.
     virtual std::string ui_session_mac(std::string_view /*access_key*/, int64_t /*issued_ms*/, int64_t /*expires_ms*/) const
@@ -201,6 +210,8 @@ public:
     // 1 when user `id` has a login profile whose password must be set again before anything else, 0 when it has one,
     // -1 for none.
     virtual int login_state(std::string_view /*id*/) const { return -1; }
+    // The scrypt hash of user `id`'s password, empty for none, for an identity provider taking the user over.
+    virtual std::string login_hash(std::string_view /*id*/) const { return {}; }
     // Every user the credentials and the IAM API declare.
     virtual std::vector<std::shared_ptr<const user_identity>> users() const { return {}; }
     // Whether user `id` is an admin, by the credentials file or the IAM group of admins.

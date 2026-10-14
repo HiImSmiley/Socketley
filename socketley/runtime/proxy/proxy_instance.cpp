@@ -317,6 +317,9 @@ void proxy_client_connection::reset(int new_fd)
     h2_parent = nullptr;
     peer_addr.clear();
     peer_probed = false;
+    auth_user.clear();
+    auth_name.clear();
+    auth_email.clear();
     last_activity = {};
     parked_backend_fd = -1;
     kept_alive = false;
@@ -4506,9 +4509,9 @@ http_request_parse proxy_instance::parse_http_request_line(proxy_client_connecti
     conn->ex.declared_body_chunked = scan.transfer_encoding;
 
     // An entrance routes by the name asked for, so it reads it here, with the
-    // Via fields a request that came round again would carry; so does
-    // --redirect-https, which sends the client to that name.
-    if (m_entrance || m_https_redirect)
+    // Via fields a request that came round again would carry; so do
+    // --redirect-https and --auth idp:, which send the client to that name.
+    if (m_entrance || m_https_redirect || m_auth.idp())
     {
         conn->ex.host.clear();
         conn->ex.host_fields = 0;
@@ -4674,6 +4677,8 @@ bool proxy_instance::auth_admits(proxy_client_connection* conn)
     }
     if (client.empty())
         client = "local";
+    if (m_auth.idp())
+        return session_admits(conn, head, client);
     int64_t retry_after = 0;
     const auto v = m_auth.check(fields > 1 ? std::string_view("-") : authorization, client, retry_after);
     if (v == proxy_auth::verdict::pass)
@@ -4683,6 +4688,62 @@ bool proxy_instance::auth_admits(proxy_client_connection* conn)
                    true, "Retry-After: " + std::to_string(retry_after) + "\r\n");
     else
         send_error(conn, "401 Unauthorized", "Unauthorized\n", true, m_auth.challenge());
+    return false;
+}
+
+// A sign-in an idp keeps: the cookie verified here, a browser without one sent to sign in and back, and anything
+// else told 401.
+bool proxy_instance::session_admits(proxy_client_connection* conn, std::string_view head, std::string_view client)
+{
+    std::string cookies;
+    for (size_t pos = head.find("\r\n"); pos != std::string_view::npos && pos + 2 < head.size();)
+    {
+        const size_t nl = head.find("\r\n", pos + 2);
+        const std::string_view line = head.substr(pos + 2, (nl == std::string_view::npos ? head.size() : nl) - pos - 2);
+        pos = nl;
+        if (header_name_equals(line, "cookie", 6))
+        {
+            if (!cookies.empty())
+                cookies += "; ";
+            cookies.append(http_trim_ows(line.substr(7)));
+        }
+    }
+    conn->auth_user.clear();
+    conn->auth_name.clear();
+    conn->auth_email.clear();
+    if (m_auth.check_session(cookies, conn->auth_user, conn->auth_name, conn->auth_email) == proxy_auth::verdict::pass)
+        return true;
+    int accept_fields = 0, proto_fields = 0;
+    const std::string_view accept = request_field(head, "accept", accept_fields);
+    const bool browser = (conn->ex.method == "GET" || conn->ex.method == "HEAD") &&
+                         accept.find("text/html") != std::string_view::npos && conn->ex.host_fields == 1 &&
+                         !conn->ex.host.empty();
+    if (browser)
+    {
+        // The scheme the browser used: this proxy's own, or what the entrance in front of it says it was.
+        std::string_view scheme = conn->tls() ? "https" : "http";
+        if (local_peer(std::string(client)) || local_peer(conn->peer_addr))
+            if (const std::string_view p = http_trim_ows(request_field(head, "x-forwarded-proto", proto_fields));
+                proto_fields == 1 && (p == "https" || p == "http"))
+                scheme = p;
+        // The Host field whole, its port too, which the name ex.host keeps for routing has lost.
+        int host_fields = 0;
+        const std::string_view host = http_trim_ows(request_field(head, "host", host_fields));
+        const bool host_ok = host_fields == 1 && !host.empty() &&
+                             std::all_of(host.begin(), host.end(), [](char ch) {
+                                 return std::isalnum(static_cast<unsigned char>(ch)) || ch == '.' || ch == '-' ||
+                                        ch == ':' || ch == '[' || ch == ']';
+                             });
+        const std::string back = std::string(scheme) + "://" + std::string(host_ok ? host : conn->ex.host) +
+                                 conn->ex.path;
+        if (const std::string to = m_auth.login_url(back); !to.empty())
+        {
+            send_error(conn, "302 Found", "", true, "Location: " + to + "\r\nCache-Control: no-store\r\n");
+            return false;
+        }
+    }
+    send_error(conn, "401 Unauthorized", "Sign in first.\n", true,
+               "WWW-Authenticate: Bearer realm=\"" + std::string(get_name()) + "\"\r\n");
     return false;
 }
 
@@ -4860,6 +4921,11 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         // The credentials --auth took were this proxy's to see, not the backend's.
         else if (m_auth.enabled() && header_name_equals(hdr_line, "authorization", 13))
             skip = true;
+        // Who is signed in is said by this proxy alone, never by the client.
+        else if (m_auth.idp() && (header_name_equals(hdr_line, "x-forwarded-user", 16) ||
+                                  header_name_equals(hdr_line, "x-forwarded-preferred-username", 30) ||
+                                  header_name_equals(hdr_line, "x-forwarded-email", 17)))
+            skip = true;
         else
             for (const std::string& named : connection_named)
                 if (header_name_equals(hdr_line, named.c_str(), named.size()))
@@ -5004,6 +5070,28 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         result += "X-Forwarded-Host: ";
         result.append(client_host.data(), client_host.size());
         result += "\r\n";
+    }
+    // Named only when it is one field's worth of text, so no claim can write a header of its own.
+    const auto field_safe = [](std::string_view v) {
+        return std::none_of(v.begin(), v.end(), [](char ch) { return static_cast<unsigned char>(ch) < 0x20 || ch == 0x7f; });
+    };
+    if (m_auth.idp() && !conn->auth_user.empty() && field_safe(conn->auth_user))
+    {
+        result += "X-Forwarded-User: ";
+        result += conn->auth_user;
+        result += "\r\n";
+        if (!conn->auth_name.empty() && field_safe(conn->auth_name))
+        {
+            result += "X-Forwarded-Preferred-Username: ";
+            result += conn->auth_name;
+            result += "\r\n";
+        }
+        if (!conn->auth_email.empty() && field_safe(conn->auth_email))
+        {
+            result += "X-Forwarded-Email: ";
+            result += conn->auth_email;
+            result += "\r\n";
+        }
     }
     if (m_entrance)
     {

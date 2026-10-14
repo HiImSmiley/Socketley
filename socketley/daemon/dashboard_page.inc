@@ -107,6 +107,7 @@ textarea.inp{height:auto;min-height:260px;padding:12px;font-family:var(--mono);f
     <label for="ls">Secret</label><input class="inp" id="ls" type="password" autocomplete="current-password" required>
     <div class="err" id="le"></div>
     <button class="btn pri">Sign in</button>
+    <a class="btn" id="lidp" hidden>Sign in with your account</a>
   </form>
 </div>
 <div id="app" hidden>
@@ -150,6 +151,7 @@ Object.assign(P, {
   dns: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.5 2.6 3.6 5.4 3.6 8.5s-1.1 5.9-3.6 8.5c-2.5-2.6-3.6-5.4-3.6-8.5S9.5 6.1 12 3.5z"/>',
   play: '<path d="M7 5.5v13l11-6.5z"/>', stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
   restart: '<path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/>', edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
+  idp: '<rect x="5" y="10.5" width="14" height="9.5" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/><path d="M12 14.5v2"/>',
   sync: '<path d="M4 11a8 8 0 0 1 13.7-5.6L20 7.5"/><path d="M20 13a8 8 0 0 1-13.7 5.6L4 16.5"/><path d="M20 3.5V7.5h-4M4 20.5v-4h4"/>',
   open: '<path d="M14 3.5h6.5V10"/><path d="M20.5 3.5 11 13"/><path d="M17.5 14v5.2a1.3 1.3 0 0 1-1.3 1.3H4.8a1.3 1.3 0 0 1-1.3-1.3V7.8a1.3 1.3 0 0 1 1.3-1.3H10"/>',
   gauge: '<path d="M12 14l4-4"/><path d="M4.5 18a9 9 0 1 1 15 0"/>', cpu: '<rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/>'
@@ -161,7 +163,8 @@ const TYPES = {
   cache: ['cache', 'Cache', 'A key-value store that speaks Redis, persistent and sharded.'],
   storage: ['storage', 'Storage', 'S3-compatible object storage with this interface.'],
   dns: ['dns', 'DNS', 'An authoritative name server, with an entrance on 443.'],
-  sync: ['sync', 'Sync', 'Carries a directory to a storage as its files change.']
+  sync: ['sync', 'Sync', 'Carries a directory to a storage as its files change.'],
+  idp: ['idp', 'Sign-in', 'One sign-in, with a storage\'s users, for apps and for routes behind a proxy.']
 };
 // The configuration key `show` and `import` name each flag by.
 const KEY = { '-p': 'port', '-g': 'group', '--lua': 'lua_script', '--bind': 'bind', '--listen': 'listen', '--shards': 'shards', '--domain': 'domain', '--cpus': 'cpus',
@@ -177,7 +180,8 @@ const KEY = { '-p': 'port', '-g': 'group', '--lua': 'lua_script', '--bind': 'bin
   '--access-key': 'access_key', '--secret-key': 'secret_key', '--anonymous': 'anonymous', '--website-domain': 'website_domain', '--tls-offloaded': 'tls_offloaded',
   '--max-bytes': 'max_bytes', '--fsync': 'fsync', '--fsync-interval': 'fsync_interval', '--scrub': 'scrub', '--compress': 'compress', '--mpu-expire': 'mpu_expire',
   '--sse-key-file': 'sse_key_file', '--acls': 'acls', '--notify-targets': 'notify_targets', '--replication-targets': 'replication_targets', '--tiers': 'tiers',
-  '--federation': 'federation', '--nodes': 'nodes', '--zone': 'zones', '--publish': 'publish', '--proxy': 'proxy', '--transfer': 'transfer', '--notify': 'notify', '--rrl': 'rrl' };
+  '--federation': 'federation', '--nodes': 'nodes', '--zone': 'zones', '--publish': 'publish', '--proxy': 'proxy', '--transfer': 'transfer', '--notify': 'notify', '--rrl': 'rrl',
+  '--clients': 'clients', '--issuer': 'issuer', '--cookie-domain': 'cookie_domain', '--idp': 'idp' };
 const confKey = (f, type) => f.flag === '--mode' ? (type === 'cache' ? 'cache_mode' : 'mode') : KEY[f.flag];
 const ARRAYS = new Set(['backends', 'upstreams']);
 const HEALTH = ['', 'tcp', 'http'];
@@ -235,7 +239,12 @@ async function act(args, ok) {
 
 // ─── signing in ─────────────────────────────────────────────────────────────
 function signedOut() { me = null; clearTimeout(timer); $('#app').hidden = true; $('#login').hidden = false; while (layers.length) layers[layers.length - 1].close(); }
-async function signOut() { try { await fetch('/api/session', { method: 'DELETE' }); } catch (e) {} signedOut(); }
+async function signOut() {
+  try { await fetch('/api/session', { method: 'DELETE' }); } catch (e) {}
+  // An admin the identity provider signed in is signed out there, for every application it signed in.
+  if (me && me.idp_logout) { location.href = me.idp_logout; return; }
+  signedOut();
+}
 $('#lf').addEventListener('submit', async ev => {
   ev.preventDefault();
   const basic = 'Basic ' + btoa(unescape(encodeURIComponent($('#lk').value.trim() + ':' + $('#ls').value)));
@@ -861,7 +870,7 @@ function form(type, conf, editing, running) {
     if (!sections.has(f.section)) sections.set(f.section, []);
     sections.get(f.section).push(f);
   }
-  const OPEN = new Set(['Basics', 'Network', TYPES[type] ? TYPES[type][1] : '', 'Server', 'Client', 'Proxy', 'Cache', 'Storage', 'DNS']);
+  const OPEN = new Set(['Basics', 'Network', TYPES[type] ? TYPES[type][1] : '', 'Server', 'Client', 'Proxy', 'Cache', 'Storage', 'DNS', 'Sync', 'Identity']);
   // Basics first, then what only this type has, then what every type has.
   const COMMON = ['Basics', 'Network', 'TLS', 'Limits', 'Output'];
   const order = [...sections.keys()].sort((a, b) => (a === 'Basics' ? -1 : b === 'Basics' ? 1 : COMMON.includes(a) - COMMON.includes(b)));
@@ -980,7 +989,8 @@ async function start() {
   try { s = await (await fetch('/api/session')).json(); } catch (e) { $('#login').hidden = false; return; }
   // Without credentials configured the page only shows, and says how to change that.
   if (!s.configured) { me = { user: null }; start(); toast('Read only: set daemon.dashboard_credentials to sign in and change runtimes.', 'spark', 9000); return; }
-  if (s.user) { me = { user: s.user }; start(); return; }
+  if (s.user) { me = { user: s.user, idp_logout: s.idp_logout }; start(); return; }
+  if (s.idp_login) { $('#lidp').href = s.idp_login; $('#lidp').hidden = false; }
   $('#login').hidden = false; $('#lk').focus();
 })();
 </script>

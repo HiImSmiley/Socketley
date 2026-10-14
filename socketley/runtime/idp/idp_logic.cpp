@@ -1,0 +1,391 @@
+#include "idp_logic.h"
+
+#include <cctype>
+#include <charconv>
+
+#include "../../shared/jws.h"
+#include "../storage/json_doc.h"
+
+namespace socketley::idp
+{
+
+namespace
+{
+
+bool unreserved(char c)
+{
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '.' || c == '_' || c == '~';
+}
+
+int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+bool form_decode(std::string_view in, std::string& out)
+{
+    out.clear();
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i)
+    {
+        const char c = in[i];
+        if (c == '+')
+            out += ' ';
+        else if (c == '%')
+        {
+            if (i + 2 >= in.size())
+                return false;
+            const int hi = hex_value(in[i + 1]), lo = hex_value(in[i + 2]);
+            if (hi < 0 || lo < 0)
+                return false;
+            out += static_cast<char>(hi * 16 + lo);
+            i += 2;
+        }
+        else
+            out += c;
+    }
+    return true;
+}
+
+std::vector<std::string_view> words(std::string_view line)
+{
+    std::vector<std::string_view> out;
+    size_t i = 0;
+    while (i < line.size())
+    {
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t'))
+            ++i;
+        const size_t start = i;
+        while (i < line.size() && line[i] != ' ' && line[i] != '\t')
+            ++i;
+        if (i > start)
+            out.push_back(line.substr(start, i - start));
+    }
+    return out;
+}
+
+}   // namespace
+
+bool client::allows(std::string_view redirect) const
+{
+    for (const auto& r : redirects)
+        if (r == redirect)
+            return true;
+    return false;
+}
+
+bool parse_clients(std::string_view text, std::vector<client>& out, std::string& why)
+{
+    out.clear();
+    size_t line_no = 0;
+    while (!text.empty())
+    {
+        ++line_no;
+        const size_t nl = text.find('\n');
+        std::string_view line = text.substr(0, nl);
+        text = nl == std::string_view::npos ? std::string_view{} : text.substr(nl + 1);
+        // A comment begins at a # that starts a word, so one inside an address is the address's.
+        for (size_t h = line.find('#'); h != std::string_view::npos; h = line.find('#', h + 1))
+            if (h == 0 || line[h - 1] == ' ' || line[h - 1] == '\t')
+            {
+                line = line.substr(0, h);
+                break;
+            }
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        const auto w = words(line);
+        if (w.empty())
+            continue;
+        const std::string where = "line " + std::to_string(line_no) + ": ";
+        if (w.size() < 3)
+        {
+            why = where + "a client is its id, its secret or -, and at least one redirect address";
+            return false;
+        }
+        client c;
+        c.id.assign(w[0]);
+        for (const char ch : c.id)
+            if (!unreserved(ch))
+            {
+                why = where + "the client id \"" + c.id + "\" may hold only letters, digits and -._~";
+                return false;
+            }
+        if (w[1] != "-")
+            c.secret.assign(w[1]);
+        for (size_t i = 2; i < w.size(); ++i)
+        {
+            const std::string_view r = w[i];
+            // An http address only on this machine, where nobody can stand between the browser and the client.
+            const std::string host = url_host(r);
+            const bool local = r.starts_with("http://") && (host == "localhost" || host == "127.0.0.1" || host == "[::1]");
+            if (host.empty() || (!r.starts_with("https://") && !local) || r.find('#') != std::string_view::npos)
+            {
+                why = where + "the redirect \"" + std::string(r) +
+                      "\" is no https address (http only for localhost) without a fragment";
+                return false;
+            }
+            c.redirects.emplace_back(r);
+        }
+        for (const auto& o : out)
+            if (o.id == c.id)
+            {
+                why = where + "the client id \"" + c.id + "\" is named twice";
+                return false;
+            }
+        out.push_back(std::move(c));
+    }
+    return true;
+}
+
+params parse_form(std::string_view in)
+{
+    params out;
+    while (!in.empty())
+    {
+        const size_t amp = in.find('&');
+        const std::string_view pair = in.substr(0, amp);
+        in = amp == std::string_view::npos ? std::string_view{} : in.substr(amp + 1);
+        if (pair.empty())
+            continue;
+        const size_t eq = pair.find('=');
+        std::string k, v;
+        if (!form_decode(pair.substr(0, eq), k) ||
+            !form_decode(eq == std::string_view::npos ? std::string_view{} : pair.substr(eq + 1), v))
+            continue;
+        out.emplace_back(std::move(k), std::move(v));
+    }
+    return out;
+}
+
+std::string_view param(const params& p, std::string_view name)
+{
+    for (const auto& [k, v] : p)
+        if (k == name)
+            return v;
+    return {};
+}
+
+std::string url_encode(std::string_view in)
+{
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(in.size() * 3);
+    for (const char c : in)
+    {
+        if (unreserved(c))
+            out += c;
+        else
+        {
+            out += '%';
+            out += hex[static_cast<unsigned char>(c) >> 4];
+            out += hex[static_cast<unsigned char>(c) & 15];
+        }
+    }
+    return out;
+}
+
+std::string html_escape(std::string_view in)
+{
+    std::string out;
+    out.reserve(in.size());
+    for (const char c : in)
+        switch (c)
+        {
+            case '&':  out += "&amp;"; break;
+            case '<':  out += "&lt;"; break;
+            case '>':  out += "&gt;"; break;
+            case '"':  out += "&quot;"; break;
+            case '\'': out += "&#39;"; break;
+            default:   out += c;
+        }
+    return out;
+}
+
+std::string json_string(std::string_view in)
+{
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out = "\"";
+    for (const char c : in)
+    {
+        const auto u = static_cast<unsigned char>(c);
+        if (c == '"' || c == '\\')
+        {
+            out += '\\';
+            out += c;
+        }
+        else if (u < 0x20)
+        {
+            out += "\\u00";
+            out += hex[u >> 4];
+            out += hex[u & 15];
+        }
+        else
+            out += c;
+    }
+    return out + "\"";
+}
+
+bool pkce_matches(std::string_view verifier, std::string_view challenge)
+{
+    if (verifier.size() < 43 || verifier.size() > 128 || challenge.empty())
+        return false;
+    for (const char c : verifier)
+        if (!unreserved(c))
+            return false;
+    return socketley::jws::b64url(socketley::jws::sha256(verifier)) == challenge;
+}
+
+bool has_scope(std::string_view scope, std::string_view want)
+{
+    for (const auto w : words(scope))
+        if (w == want)
+            return true;
+    return false;
+}
+
+std::string url_host(std::string_view url)
+{
+    size_t at = 0;
+    if (url.starts_with("https://"))
+        at = 8;
+    else if (url.starts_with("http://"))
+        at = 7;
+    else
+        return {};
+    const std::string_view rest = url.substr(at);
+    const size_t end = rest.find_first_of("/?#");
+    std::string_view authority = rest.substr(0, end);
+    // Credentials in an address are a way to make it read as another host.
+    if (authority.find('@') != std::string_view::npos || authority.empty())
+        return {};
+    std::string_view host = authority;
+    if (host.front() == '[')
+    {
+        const size_t close = host.find(']');
+        if (close == std::string_view::npos)
+            return {};
+        host = host.substr(0, close + 1);
+    }
+    else if (const size_t colon = host.rfind(':'); colon != std::string_view::npos)
+        host = host.substr(0, colon);
+    std::string out;
+    for (const char c : host)
+        out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+
+bool return_allowed(std::string_view url, std::string_view issuer, std::string_view cookie_domain)
+{
+    // A path on this provider itself.
+    if (url.starts_with("/") && !url.starts_with("//") && url.find('\\') == std::string_view::npos)
+        return true;
+    if (!url.starts_with("https://") && !(issuer.starts_with("http://") && url.starts_with("http://")))
+        return false;
+    const std::string host = url_host(url);
+    if (host.empty())
+        return false;
+    if (host == url_host(issuer))
+        return true;
+    if (cookie_domain.empty())
+        return false;
+    std::string domain;
+    for (const char c : cookie_domain)
+        domain += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (domain.starts_with("."))
+        domain.erase(0, 1);
+    return host == domain || (host.size() > domain.size() && host.ends_with(domain) &&
+                              host[host.size() - domain.size() - 1] == '.');
+}
+
+std::string sign_token(EVP_PKEY* key, std::string_view kid, std::string_view typ, std::string_view body)
+{
+    const std::string header = "{\"alg\":\"ES256\",\"kid\":" + json_string(kid) + ",\"typ\":" + json_string(typ) + "}";
+    return socketley::jws::compact(key, header, "{" + std::string(body) + "}");
+}
+
+bool verify_token(EVP_PKEY* key, std::string_view kid, std::string_view typ, std::string_view issuer,
+                  std::string_view token, int64_t now, claims& out, std::string& why)
+{
+    using socketley::storage::json_reader;
+    using socketley::storage::jvalue;
+    out.clear();
+    const size_t d1 = token.find('.');
+    const size_t d2 = d1 == std::string_view::npos ? d1 : token.find('.', d1 + 1);
+    if (d2 == std::string_view::npos || token.find('.', d2 + 1) != std::string_view::npos)
+    {
+        why = "not a signed token";
+        return false;
+    }
+    std::string header, payload, sig;
+    if (!socketley::jws::b64url_decode(token.substr(0, d1), header) ||
+        !socketley::jws::b64url_decode(token.substr(d1 + 1, d2 - d1 - 1), payload) ||
+        !socketley::jws::b64url_decode(token.substr(d2 + 1), sig))
+    {
+        why = "not base64url";
+        return false;
+    }
+    jvalue h;
+    if (!json_reader(header).document(h))
+    {
+        why = "the header is not JSON";
+        return false;
+    }
+    std::string alg, hkid, htyp;
+    for (const auto& [k, v] : h.members)
+    {
+        if (v.k != jvalue::kind::string)
+            continue;
+        if (k == "alg") alg = v.s;
+        else if (k == "kid") hkid = v.s;
+        else if (k == "typ") htyp = v.s;
+    }
+    // The algorithm is this provider's and never the token's choice.
+    if (alg != "ES256" || hkid != kid || htyp != typ)
+    {
+        why = "not one of this provider's " + std::string(typ) + " tokens";
+        return false;
+    }
+    if (!socketley::jws::es256_verify(key, token.substr(0, d2), sig))
+    {
+        why = "the signature does not hold";
+        return false;
+    }
+    jvalue p;
+    if (!json_reader(payload).document(p))
+    {
+        why = "the claims are not JSON";
+        return false;
+    }
+    for (const auto& [k, v] : p.members)
+        switch (v.k)
+        {
+            case jvalue::kind::string:
+            case jvalue::kind::number:  out[k] = v.s; break;
+            case jvalue::kind::boolean: out[k] = v.b ? "true" : "false"; break;
+            default: break;
+        }
+    const auto iss = out.find("iss");
+    if (iss == out.end() || iss->second != issuer)
+    {
+        why = "issued by someone else";
+        return false;
+    }
+    int64_t exp = 0;
+    const auto e = out.find("exp");
+    if (e == out.end() || std::from_chars(e->second.data(), e->second.data() + e->second.size(), exp).ec != std::errc{})
+    {
+        why = "it has no expiry";
+        return false;
+    }
+    if (exp <= now)
+    {
+        why = "it has expired";
+        return false;
+    }
+    return true;
+}
+
+}   // namespace socketley::idp

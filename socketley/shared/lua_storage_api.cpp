@@ -29,6 +29,8 @@ const char* usage(op kind)
             return "socketley.storage.delete(runtime, bucket, key [, callback])";
         case op::list:
             return "socketley.storage.list(runtime, bucket [, prefix] [, {delimiter=, max_keys=, start_after=}] [, callback])";
+        case op::users:
+            break;   // the identity provider's, which no script is given
     }
     return "";
 }
@@ -374,6 +376,8 @@ lua_storage_client::mode lua_storage_client::begin(lua_State* L, op kind)
             }
             break;
         }
+        case op::users:
+            return shape();   // the identity provider's, which no script is given
     }
 
     auto* mgr = m_owner.get_runtime_manager();
@@ -452,6 +456,9 @@ int lua_storage_client::push_values(lua_State* L, op kind, request_status st,
             return 2;
         case op::del:
             lua_pushboolean(L, 1);
+            return 1;
+        case op::users:
+            lua_pushnil(L);   // the identity provider's, which no script is given
             return 1;
         case op::list:
         {

@@ -506,6 +506,7 @@ body.audio #ups,body.audio #selbar{bottom:96px}
     <label class="chk"><input type="checkbox" id="lr"> Stay signed in on this device</label>
     <div class="err" id="le"></div>
     <button class="btn pri">Sign in</button>
+    <a class="btn" id="lidp" hidden>Sign in with your account</a>
   </form>
 </div>
 <div id="app" hidden>
@@ -794,6 +795,8 @@ function signedOut() {
 }
 async function signOut() {
   try { await fetch('/~ui/session', { method: 'DELETE', headers: { 'X-Socketley-UI': '1' } }); } catch (e) {}
+  // A sign-in the identity provider made ends there, for every application it signed in.
+  if (me && me.idp_logout) { location.href = me.idp_logout; return; }
   signedOut();
 }
 async function signOutAll() {
@@ -3880,6 +3883,9 @@ async function start() {
   try {
     const r = await fetch('/~ui/session', { headers: { 'X-Socketley-UI': '1' } });
     if (r.ok) { me = await r.json(); start(); return; }
+    // A storage that takes an identity provider's sign-in offers it beside its own form.
+    const idp = r.headers.get('X-Socketley-Idp-Login');
+    if (idp) { $('#lidp').href = idp; $('#lidp').hidden = false; }
   } catch (e) {}
   signedOut();
 })();

@@ -1,0 +1,1750 @@
+#include "idp_run.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <charconv>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+
+#include "idp_instance.h"
+#include "../../shared/http_framing.h"
+#include "../../shared/jws.h"
+#include "../../shared/logging.h"
+#include "../../shared/runtime_manager.h"
+#include "../../shared/storage_rpc.h"
+#include "../storage/checksum.h"
+#include "../storage/password_hash.h"
+
+namespace socketley::idp
+{
+
+namespace
+{
+
+constexpr int64_t code_secs     = 60;
+constexpr int64_t token_secs    = 3600;
+constexpr int64_t refresh_secs  = 30 * 86400;
+constexpr int64_t session_secs  = 12 * 3600;
+constexpr int64_t remember_secs = 30 * 86400;
+constexpr int64_t idle_secs     = 60;
+constexpr size_t  max_head      = 16 * 1024;
+constexpr size_t  max_body      = 16 * 1024;
+constexpr size_t  max_conns     = 4096;
+constexpr int     miss_limit    = 5;
+constexpr int64_t miss_window   = 15 * 60;
+constexpr std::string_view cookie_name = "skl_idp";
+
+int64_t now_sec()
+{
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// Milliseconds, which tell a session given before a sign-out everywhere from one given in the same second after it.
+int64_t now_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+std::string random_token()
+{
+    unsigned char b[32];
+    if (RAND_bytes(b, sizeof b) != 1)
+        return {};
+    return socketley::jws::b64url(std::string_view(reinterpret_cast<const char*>(b), sizeof b));
+}
+
+std::string peer_text(const sockaddr_storage& a)
+{
+    char buf[INET6_ADDRSTRLEN] = {};
+    if (a.ss_family == AF_INET)
+        ::inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in&>(a).sin_addr, buf, sizeof buf);
+    else if (a.ss_family == AF_INET6)
+        ::inet_ntop(AF_INET6, &reinterpret_cast<const sockaddr_in6&>(a).sin6_addr, buf, sizeof buf);
+    return buf;
+}
+
+bool loopback(const sockaddr_storage& a)
+{
+    if (a.ss_family == AF_INET)
+        return (ntohl(reinterpret_cast<const sockaddr_in&>(a).sin_addr.s_addr) >> 24) == 127;
+    if (a.ss_family == AF_INET6)
+    {
+        const auto& v6 = reinterpret_cast<const sockaddr_in6&>(a).sin6_addr;
+        return IN6_IS_ADDR_LOOPBACK(&v6) ||
+               (IN6_IS_ADDR_V4MAPPED(&v6) && v6.s6_addr[12] == 127);
+    }
+    return false;
+}
+
+const char* reason(int status)
+{
+    switch (status)
+    {
+        case 200: return "OK";
+        case 302: return "Found";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 411: return "Length Required";
+        case 413: return "Content Too Large";
+        case 429: return "Too Many Requests";
+        case 431: return "Request Header Fields Too Large";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        default:  return "Error";
+    }
+}
+
+std::string claim(const claims& c, std::string_view k)
+{
+    const auto it = c.find(k);
+    return it == c.end() ? std::string() : it->second;
+}
+
+int64_t claim_int(const claims& c, std::string_view k)
+{
+    const std::string v = claim(c, k);
+    int64_t out = 0;
+    std::from_chars(v.data(), v.data() + v.size(), out);
+    return out;
+}
+
+// When a token of this provider was given, to the millisecond its own claim says, or its iat's second.
+int64_t issued_ms(const claims& c)
+{
+    const int64_t ms = claim_int(c, "iat_ms");
+    return ms ? ms : claim_int(c, "iat") * 1000;
+}
+
+std::string page(std::string_view title, std::string_view body)
+{
+    return "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" "
+           "content=\"width=device-width,initial-scale=1\"><title>" +
+           html_escape(title) +
+           "</title><style>body{font-family:system-ui,sans-serif;background:#f4f5f7;margin:0;display:flex;"
+           "min-height:100vh;align-items:center;justify-content:center}main{background:#fff;padding:2rem 2.2rem;"
+           "border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.08);width:min(22rem,90vw)}h1{font-size:1.25rem;"
+           "margin:0 0 1.2rem}label{display:block;font-size:.85rem;margin:.8rem 0 .3rem;color:#444}"
+           "input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:.6rem;border:1px solid "
+           "#ccd;border-radius:6px;font-size:1rem}button{margin-top:1.2rem;width:100%;padding:.65rem;border:0;"
+           "border-radius:6px;background:#2d6cdf;color:#fff;font-size:1rem;cursor:pointer}.err{color:#b3261e;"
+           "font-size:.9rem;margin:.4rem 0 0}.small{font-size:.85rem;color:#555}.row{display:flex;gap:.4rem;"
+           "align-items:center;margin-top:.8rem;font-size:.85rem}a{color:#2d6cdf}</style></head><body><main>" +
+           std::string(body) + "</main></body></html>";
+}
+
+// The parameters an authorize request carries through the sign-in form, and nothing else.
+constexpr std::string_view carried[] = {"client_id", "redirect_uri", "response_type", "scope", "state", "nonce",
+                                        "code_challenge", "code_challenge_method", "rd"};
+
+}   // namespace
+
+idp_run::idp_run(idp_instance& owner, event_loop& loop)
+    : m_owner(owner), m_loop(loop), m_io(loop, this), m_hash(1)
+{
+}
+
+idp_run::~idp_run()
+{
+    *m_alive = false;
+    m_hash.stop();
+    m_loop.deregister_owner(this);
+    if (m_key)
+        EVP_PKEY_free(m_key);
+}
+
+bool idp_run::start(std::string& why)
+{
+    m_issuer = m_owner.issuer();
+    m_cookie_domain = std::string(m_owner.get_cookie_domain());
+    m_secure_cookie = m_issuer.starts_with("https://");
+
+    std::string err;
+    m_key = socketley::jws::load_or_make_key(idp_key_path(m_owner.get_name()), "the signing key", err);
+    if (!m_key)
+    {
+        why = err;
+        return false;
+    }
+    m_kid = socketley::jws::thumbprint(m_key);
+    const std::string pub = socketley::jws::jwk_of(m_key);
+    m_jwk = pub.substr(0, pub.size() - 1) + ",\"kid\":" + json_string(m_kid) + ",\"use\":\"sig\",\"alg\":\"ES256\"}";
+    // The public half where a proxy of this daemon reads it, written whole so a reader never sees half of it.
+    {
+        const std::string path = idp_jwks_path(m_owner.get_name());
+        const std::string tmp = path + ".new";
+        std::ofstream f(tmp, std::ios::trunc);
+        f << "{\"issuer\":" << json_string(m_issuer) << ",\"keys\":[" << m_jwk << "]}\n";
+        f.close();
+        if (!f || ::rename(tmp.c_str(), path.c_str()) != 0)
+        {
+            why = "the public key could not be written to " + path;
+            return false;
+        }
+    }
+    load_clients();
+    if (!m_clients_error.empty())
+    {
+        why = m_clients_error;
+        return false;
+    }
+    if (!m_accounts.open(idp_accounts_dir(m_owner.get_name()), why))
+        return false;
+    // Password hashes are made and checked off the loop, which an scrypt would hold for tens of milliseconds.
+    m_loop.register_owner(this);
+    if (!m_hash.attach(m_io))
+        m_hash.stop();
+    m_hash_lane = m_hash.next_lane();
+
+    const uint16_t port = m_owner.effective_port();
+    m_listen_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (m_listen_fd < 0)
+    {
+        why = std::string("no socket: ") + std::strerror(errno);
+        return false;
+    }
+    int one = 1;
+    ::setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = m_owner.bind_in_addr();
+    a.sin_port = htons(port);
+    if (::bind(m_listen_fd, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0 || ::listen(m_listen_fd, 1024) < 0)
+    {
+        why = "port " + std::to_string(port) + " could not be bound: " + std::strerror(errno);
+        ::close(m_listen_fd);
+        m_listen_fd = -1;
+        return false;
+    }
+    m_loop.register_owner(this);
+    arm_accept();
+    LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": issuer " + m_issuer + ", " +
+              std::to_string(m_accounts.size()) + " account(s), " + std::to_string(m_clients.size()) + " client(s)").c_str());
+    return true;
+}
+
+void idp_run::stop()
+{
+    if (m_stopped)
+        return;
+    m_stopped = true;
+    if (m_listen_fd >= 0)
+    {
+        ::shutdown(m_listen_fd, SHUT_RDWR);
+        m_loop.close_fd(m_listen_fd);
+        m_listen_fd = -1;
+    }
+    std::vector<std::shared_ptr<conn>> all;
+    for (auto& [id, c] : m_conns)
+        all.push_back(c);
+    for (auto& c : all)
+        close_conn(c);
+    // The hashing thread ends before the descriptor it wakes the loop through is closed.
+    m_hash.stop();
+    if (const int fd = m_hash.release_wake_fd(); fd >= 0)
+        m_loop.close_fd(fd);
+    m_accounts.close();
+}
+
+bool idp_run::drained() const
+{
+    return m_loop.owner_inflight(this) == 0 && !m_loop.owner_table_full();
+}
+
+void idp_run::on_loop_turn()
+{
+    // A listener whose accept the ring had no room for is asked again here, or it would be deaf for good.
+    if (!m_accept_pending && !m_stopped)
+        arm_accept();
+}
+
+std::string idp_run::stats() const
+{
+    return "issuer:" + m_issuer + "\naccounts:" + std::to_string(m_accounts.size()) +
+           "\nclients:" + std::to_string(m_clients.size()) + "\nsign_ins:" + std::to_string(m_c.sign_ins) +
+           "\nsign_ins_refused:" + std::to_string(m_c.refused) + "\nsign_ins_barred:" + std::to_string(m_c.barred) +
+           "\ncodes:" + std::to_string(m_c.codes) + "\ntokens:" + std::to_string(m_c.tokens) +
+           "\nrefreshes:" + std::to_string(m_c.refreshes) + "\nuserinfo:" + std::to_string(m_c.userinfo) +
+           (m_clients_error.empty() ? std::string() : "\nclients_error:" + m_clients_error) + "\n";
+}
+
+// ─── Connections ────────────────────────────────────────────────────────────
+
+void idp_run::arm_accept()
+{
+    if (m_stopped || m_listen_fd < 0 || m_accept_pending)
+        return;
+    m_accept_req = io_request{};
+    m_accept_req.owner = this;
+    m_accept_req.fd = m_listen_fd;
+    m_accept_req.type = event_loop::supports_multishot_accept() ? op_multishot_accept : op_accept;
+    m_accept_pending = m_accept_req.type == op_multishot_accept
+                           ? m_loop.submit_multishot_accept(m_listen_fd, &m_accept_req)
+                           : m_loop.submit_accept(m_listen_fd, nullptr, nullptr, &m_accept_req);
+}
+
+void idp_run::accept_done(struct io_uring_cqe* cqe)
+{
+    if (!(cqe->flags & IORING_CQE_F_MORE))
+        m_accept_pending = false;
+    const int fd = cqe->res;
+    if (fd >= 0)
+    {
+        const size_t limit = m_owner.get_max_connections() ? m_owner.get_max_connections() : max_conns;
+        if (m_stopped || m_conns.size() >= limit)
+            m_loop.close_fd(fd);
+        else
+        {
+            auto c = std::make_shared_for_overwrite<conn>();
+            c->id = m_next_id++;
+            c->fd = fd;
+            socklen_t len = sizeof c->peer;
+            if (::getpeername(fd, reinterpret_cast<sockaddr*>(&c->peer), &len) < 0) {}
+            int one = 1;
+            ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+            c->last = now_sec();
+            m_conns.emplace(c->id, c);
+            runtime_instance::stat_add(m_owner.m_stat_total_connections, 1);
+            m_owner.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
+            arm_read(c);
+            arm_tick();
+        }
+    }
+    if (!m_accept_pending && !m_stopped && fd != -ECANCELED)
+        arm_accept();
+}
+
+std::shared_ptr<idp_run::conn> idp_run::conn_of(io_request* req)
+{
+    auto* raw = reinterpret_cast<conn*>(req->buffer);
+    if (auto it = m_conns.find(raw->id); it != m_conns.end() && it->second.get() == raw)
+        return it->second;
+    for (const auto& c : m_closing)
+        if (c.get() == raw)
+            return c;
+    return nullptr;
+}
+
+void idp_run::on_cqe(struct io_uring_cqe* cqe)
+{
+    auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
+    if (!req)
+        return;
+    if (file_io::owns_type(req->type))
+    {
+        m_io.on_cqe(cqe);
+        return;
+    }
+    if (req == &m_accept_req)
+    {
+        accept_done(cqe);
+        return;
+    }
+    if (req == &m_tick_req)
+    {
+        m_tick_armed = false;
+        tick();
+        return;
+    }
+    auto c = conn_of(req);
+    if (!c)
+        return;
+    if (req == &c->rd)
+        read_done(c, cqe->res);
+    else if (req == &c->wr)
+        write_done(c, cqe->res);
+}
+
+void idp_run::arm_read(const std::shared_ptr<conn>& c)
+{
+    if (c->dead || c->rd_pending || c->fd < 0)
+        return;
+    c->rd = io_request{};
+    c->rd.owner = this;
+    c->rd.buffer = reinterpret_cast<char*>(c.get());
+    c->rd.fd = c->fd;
+    c->rd.type = op_read;
+    c->rd_pending = m_loop.submit_read(c->fd, c->rbuf, sizeof c->rbuf, &c->rd);
+    if (!c->rd_pending)
+        close_conn(c);
+}
+
+void idp_run::read_done(const std::shared_ptr<conn>& c, int res)
+{
+    c->rd_pending = false;
+    if (c->dead)
+    {
+        if (!c->wr_pending)
+            std::erase(m_closing, c);
+        return;
+    }
+    if (res <= 0)
+    {
+        close_conn(c);
+        return;
+    }
+    c->last = now_sec();
+    c->in.append(c->rbuf, static_cast<size_t>(res));
+    runtime_instance::stat_add(m_owner.m_stat_bytes_in, static_cast<uint64_t>(res));
+    serve(c);
+    if (!c->dead && !c->waiting)
+        arm_read(c);
+}
+
+// Requests in order, one at a time: one whose answer waits on the storage holds those behind it.
+void idp_run::serve(const std::shared_ptr<conn>& c)
+{
+    while (!c->dead && !c->waiting && !c->in.empty())
+    {
+        request rq;
+        std::string refusal;
+        const int r = take_request(*c, rq, refusal);
+        if (r == 0)
+            break;
+        if (r < 0)
+        {
+            c->keep_alive = false;
+            respond(c, refusal == "413" ? 413 : refusal == "431" ? 431 : refusal == "411" ? 411 : 400, "text/plain",
+                    "the request could not be read\n");
+            return;
+        }
+        runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
+        handle(c, rq);
+    }
+    flush(c);
+}
+
+void idp_run::flush(const std::shared_ptr<conn>& c)
+{
+    if (c->dead || c->wr_pending)
+        return;
+    if (c->out_off >= c->out.size())
+    {
+        c->out.clear();
+        c->out_off = 0;
+        if (!c->keep_alive && !c->waiting)
+            close_conn(c);
+        return;
+    }
+    c->wr = io_request{};
+    c->wr.owner = this;
+    c->wr.buffer = reinterpret_cast<char*>(c.get());
+    c->wr.fd = c->fd;
+    c->wr.type = op_write;
+    const size_t chunk = std::min<size_t>(c->out.size() - c->out_off, 1u << 20);
+    c->wr_pending = m_loop.submit_write(c->fd, c->out.data() + c->out_off, static_cast<uint32_t>(chunk), &c->wr);
+    if (!c->wr_pending)
+        close_conn(c);
+}
+
+void idp_run::write_done(const std::shared_ptr<conn>& c, int res)
+{
+    c->wr_pending = false;
+    if (c->dead)
+    {
+        if (!c->rd_pending)
+            std::erase(m_closing, c);
+        return;
+    }
+    if (res <= 0)
+    {
+        close_conn(c);
+        return;
+    }
+    c->out_off += static_cast<size_t>(res);
+    c->last = now_sec();
+    runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(res));
+    flush(c);
+}
+
+void idp_run::close_conn(const std::shared_ptr<conn>& c)
+{
+    if (c->dead)
+        return;
+    c->dead = true;
+    if (c->fd >= 0)
+    {
+        ::shutdown(c->fd, SHUT_RDWR);
+        m_loop.close_fd(c->fd);
+        c->fd = -1;
+    }
+    m_conns.erase(c->id);
+    m_owner.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
+    if (c->rd_pending || c->wr_pending)
+        m_closing.push_back(c);
+}
+
+// Once a second while there is anything to look after: idle connections, codes to forget, failures to age; an
+// idle provider is woken by nothing.
+void idp_run::arm_tick()
+{
+    if (m_tick_armed || m_stopped)
+        return;
+    m_tick_req = io_request{};
+    m_tick_req.owner = this;
+    m_tick_req.type = op_timeout;
+    m_tick_ts = {1, 0};
+    m_tick_armed = m_loop.submit_timeout(&m_tick_ts, &m_tick_req);
+}
+
+void idp_run::tick()
+{
+    if (m_stopped)
+        return;
+    const int64_t now = now_sec();
+    std::vector<std::shared_ptr<conn>> idle;
+    for (auto& [id, c] : m_conns)
+        if (now - c->last > idle_secs && !c->waiting && c->out_off >= c->out.size())
+            idle.push_back(c);
+    for (auto& c : idle)
+        close_conn(c);
+    std::erase_if(m_codes, [now](const auto& kv) { return kv.second.expires <= now; });
+    std::erase_if(m_misses, [now](auto& kv)
+    {
+        std::erase_if(kv.second.at, [now](int64_t t) { return now - t > miss_window; });
+        return kv.second.at.empty();
+    });
+    if (!m_conns.empty() || !m_codes.empty() || !m_misses.empty())
+        arm_tick();
+}
+
+// ─── HTTP ───────────────────────────────────────────────────────────────────
+
+int idp_run::take_request(conn& c, request& rq, std::string& refusal)
+{
+    const size_t end = c.in.find("\r\n\r\n");
+    if (end == std::string::npos)
+    {
+        if (c.in.size() > max_head)
+        {
+            refusal = "431";
+            return -1;
+        }
+        return 0;
+    }
+    const std::string_view head(c.in.data(), end + 2);
+    if (!http_eol_framing_ok(head, true))
+        return -1;
+    const size_t line_end = head.find("\r\n");
+    const std::string_view line = head.substr(0, line_end);
+    const size_t sp1 = line.find(' ');
+    const size_t sp2 = sp1 == std::string_view::npos ? sp1 : line.find(' ', sp1 + 1);
+    if (sp2 == std::string_view::npos)
+        return -1;
+    rq.method.assign(line.substr(0, sp1));
+    const std::string_view target = line.substr(sp1 + 1, sp2 - sp1 - 1);
+    const std::string_view version = line.substr(sp2 + 1);
+    if (version != "HTTP/1.1" && version != "HTTP/1.0")
+        return -1;
+    const size_t q = target.find('?');
+    rq.path.assign(target.substr(0, q));
+    if (q != std::string_view::npos)
+        rq.query.assign(target.substr(q + 1));
+
+    const std::string_view fields = head.substr(line_end + 2);
+    const http_request_framing_scan scan = http_scan_request_headers(fields);
+    if (!scan.ok || scan.transfer_encoding)
+    {
+        refusal = scan.ok ? "411" : "";
+        return -1;
+    }
+    bool close = version == "HTTP/1.0";
+    size_t pos = 0;
+    while (pos < fields.size())
+    {
+        size_t nl = fields.find("\r\n", pos);
+        if (nl == std::string_view::npos)
+            nl = fields.size();
+        const std::string_view f = fields.substr(pos, nl - pos);
+        pos = nl + 2;
+        const size_t colon = f.find(':');
+        if (colon == std::string_view::npos)
+            continue;
+        const std::string_view value = http_trim_ows(f.substr(colon + 1));
+        if (header_name_equals(f, "cookie", 6))
+        {
+            if (!rq.cookie.empty())
+                rq.cookie += "; ";
+            rq.cookie.append(value);
+        }
+        else if (header_name_equals(f, "authorization", 13))
+            rq.authorization.assign(value);
+        else if (header_name_equals(f, "content-type", 12))
+            rq.content_type.assign(value);
+        else if (header_name_equals(f, "x-forwarded-for", 15))
+            rq.forwarded_for.assign(value);
+        else if (header_name_equals(f, "host", 4))
+            rq.host.assign(value);
+        else if (header_name_equals(f, "connection", 10))
+        {
+            if (http_list_has_token(value, "close", 5))
+                close = true;
+            else if (http_list_has_token(value, "keep-alive", 10))
+                close = false;
+        }
+    }
+    const size_t body_len = scan.has_content_length ? scan.content_length : 0;
+    if (body_len > max_body)
+    {
+        refusal = "413";
+        return -1;
+    }
+    if (c.in.size() < end + 4 + body_len)
+        return 0;
+    rq.body.assign(c.in, end + 4, body_len);
+    c.in.erase(0, end + 4 + body_len);
+    c.keep_alive = !close;
+    return 1;
+}
+
+void idp_run::respond(const std::shared_ptr<conn>& c, int status, std::string_view type, std::string_view body,
+                      std::string_view extra_headers)
+{
+    std::string& o = c->out;
+    o += "HTTP/1.1 ";
+    o += std::to_string(status);
+    o += ' ';
+    o += reason(status);
+    o += "\r\nContent-Type: ";
+    o += type;
+    o += "\r\nContent-Length: ";
+    o += std::to_string(body.size());
+    o += "\r\nCache-Control: no-store\r\nPragma: no-cache\r\nX-Content-Type-Options: nosniff\r\n"
+         "Referrer-Policy: no-referrer\r\n";
+    if (type.starts_with("text/html"))
+        o += "X-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; "
+             "frame-ancestors 'none'\r\n";
+    o += extra_headers;
+    if (!c->keep_alive)
+        o += "Connection: close\r\n";
+    o += "\r\n";
+    o += body;
+}
+
+void idp_run::redirect(const std::shared_ptr<conn>& c, std::string_view location, std::string_view extra_headers)
+{
+    std::string h = "Location: " + std::string(location) + "\r\n" + std::string(extra_headers);
+    respond(c, 302, "text/plain", "", h);
+}
+
+void idp_run::json_error(const std::shared_ptr<conn>& c, int status, std::string_view error,
+                         std::string_view description, std::string_view extra_headers)
+{
+    respond(c, status, "application/json",
+            "{\"error\":" + json_string(error) + ",\"error_description\":" + json_string(description) + "}",
+            "Access-Control-Allow-Origin: *\r\n" + std::string(extra_headers));
+}
+
+void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
+{
+    // The clients file, looked at again at most once a second.
+    if (const int64_t now = now_sec(); now != m_clients_checked)
+    {
+        m_clients_checked = now;
+        load_clients();
+    }
+    const std::string_view p = rq.path;
+    const bool get = rq.method == "GET" || rq.method == "HEAD";
+    const bool post = rq.method == "POST";
+    if (rq.method == "OPTIONS")
+    {
+        // A browser's preflight for the endpoints a single-page client calls.
+        respond(c, 200, "text/plain", "",
+                "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST\r\n"
+                "Access-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Max-Age: 600\r\n");
+        return;
+    }
+    if (p == "/.well-known/openid-configuration" && get)
+        discovery(c);
+    else if (p == "/jwks" && get)
+        jwks(c);
+    else if ((p == "/authorize" || p == "/login") && get)
+        authorize(c, rq);
+    else if ((p == "/authorize" || p == "/login") && post)
+        sign_in(c, rq);
+    else if (p == "/token" && post)
+        token(c, rq);
+    else if (p == "/userinfo" && (get || post))
+        userinfo(c, rq);
+    else if (p == "/logout" && (get || post))
+        logout(c, rq);
+    else if (p == "/" && get)
+        home(c, rq);
+    else if (p == "/account" && get)
+        account_page(c, rq, {}, {}, 200);
+    else if ((p == "/account" || p == "/account/everywhere") && post)
+        account_post(c, rq);
+    else if (p == "/account/password" && post)
+        password_post(c, rq);
+    else if (p == "/.well-known/openid-configuration" || p == "/jwks" || p == "/authorize" || p == "/login" ||
+             p == "/token" || p == "/userinfo" || p == "/logout" || p == "/" || p.starts_with("/account"))
+        respond(c, 405, "text/plain", "method not allowed\n");
+    else
+        respond(c, 404, "text/plain", "not found\n");
+}
+
+// ─── Discovery and keys ─────────────────────────────────────────────────────
+
+void idp_run::discovery(const std::shared_ptr<conn>& c)
+{
+    const std::string& i = m_issuer;
+    respond(c, 200, "application/json",
+            "{\"issuer\":" + json_string(i) + ",\"authorization_endpoint\":" + json_string(i + "/authorize") +
+                ",\"token_endpoint\":" + json_string(i + "/token") + ",\"userinfo_endpoint\":" +
+                json_string(i + "/userinfo") + ",\"jwks_uri\":" + json_string(i + "/jwks") +
+                ",\"end_session_endpoint\":" + json_string(i + "/logout") +
+                ",\"response_types_supported\":[\"code\"],\"grant_types_supported\":[\"authorization_code\","
+                "\"refresh_token\"],\"subject_types_supported\":[\"public\"],\"id_token_signing_alg_values_supported\":"
+                "[\"ES256\"],\"scopes_supported\":[\"openid\",\"profile\",\"email\",\"offline_access\"],"
+                "\"token_endpoint_auth_methods_supported\":[\"client_secret_basic\",\"client_secret_post\",\"none\"],"
+                "\"code_challenge_methods_supported\":[\"S256\"],\"claims_supported\":[\"sub\",\"name\","
+                "\"preferred_username\",\"email\",\"groups\"]}",
+            "Access-Control-Allow-Origin: *\r\n");
+}
+
+void idp_run::jwks(const std::shared_ptr<conn>& c)
+{
+    respond(c, 200, "application/json", "{\"keys\":[" + m_jwk + "]}", "Access-Control-Allow-Origin: *\r\n");
+}
+
+// ─── Clients ────────────────────────────────────────────────────────────────
+
+void idp_run::load_clients()
+{
+    const std::string path(m_owner.get_clients());
+    if (path.empty())
+        return;
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0)
+    {
+        m_clients_error = "the clients file " + path + " cannot be read";
+        if (m_clients_mtime >= 0)
+            LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": " + m_clients_error +
+                      "; the clients read before stay").c_str());
+        return;
+    }
+    const int64_t mtime = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
+    if (mtime == m_clients_mtime)
+        return;
+    std::ifstream f(path);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::vector<client> fresh;
+    std::string why;
+    if (!f || !parse_clients(ss.str(), fresh, why))
+    {
+        m_clients_error = "the clients file " + path + ": " + (why.empty() ? "cannot be read" : why);
+        // A file broken while running keeps the clients read before it, and says so once.
+        if (m_clients_mtime >= 0)
+            LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": " + m_clients_error +
+                      "; the clients read before stay").c_str());
+        m_clients_mtime = mtime;
+        return;
+    }
+    m_clients = std::move(fresh);
+    m_clients_error.clear();
+    m_clients_mtime = mtime;
+}
+
+const client* idp_run::find_client(std::string_view id)
+{
+    for (const auto& c : m_clients)
+        if (c.id == id)
+            return &c;
+    return nullptr;
+}
+
+// ─── Sessions ───────────────────────────────────────────────────────────────
+
+const account* idp_run::session_of(const request& rq) const
+{
+    // Every skl_idp cookie the request carries, since a browser sends one per domain it was set for.
+    std::string_view header = rq.cookie;
+    const int64_t now = now_sec();
+    while (!header.empty())
+    {
+        const size_t semi = header.find(';');
+        std::string_view part = header.substr(0, semi);
+        header = semi == std::string_view::npos ? std::string_view{} : header.substr(semi + 1);
+        while (!part.empty() && part.front() == ' ')
+            part.remove_prefix(1);
+        if (!part.starts_with(cookie_name) || part.size() <= cookie_name.size() || part[cookie_name.size()] != '=')
+            continue;
+        claims c;
+        std::string why;
+        if (!verify_token(m_key, m_kid, "session+jwt", m_issuer, part.substr(cookie_name.size() + 1), now, c, why) ||
+            claim(c, "aud") != "session")
+            continue;
+        const account* a = m_accounts.by_id(claim(c, "sub"));
+        if (a && !a->disabled() && still_signed_in(*a, issued_ms(c)))
+            return a;
+    }
+    return nullptr;
+}
+
+std::string idp_run::session_cookie(const account& who, bool remember) const
+{
+    const int64_t now = now_sec();
+    const int64_t life = remember ? remember_secs : session_secs;
+    // What a proxy or a storage verifying the cookie on its own needs: the id, the username and the admin bit.
+    const std::string body = "\"iss\":" + json_string(m_issuer) + ",\"aud\":\"session\",\"sub\":" +
+                             json_string(who.id) + ",\"preferred_username\":" + json_string(who.username()) +
+                             ",\"email\":" + json_string(who.field("email")) + ",\"admin\":" +
+                             (who.in_group("admins") ? "true" : "false") + ",\"iat\":" + std::to_string(now) +
+                             ",\"iat_ms\":" + std::to_string(now_ms()) +
+                             ",\"auth_time\":" + std::to_string(now) + ",\"exp\":" + std::to_string(now + life);
+    std::string h = "Set-Cookie: " + std::string(cookie_name) + "=" + sign_token(m_key, m_kid, "session+jwt", body) +
+                    "; Path=/; HttpOnly; SameSite=Lax";
+    if (remember)
+        h += "; Max-Age=" + std::to_string(life);
+    if (m_secure_cookie)
+        h += "; Secure";
+    if (!m_cookie_domain.empty())
+        h += "; Domain=" + m_cookie_domain;
+    return h + "\r\n";
+}
+
+bool idp_run::still_signed_in(const account& who, int64_t issued)
+{
+    const std::string_view before = who.field("revoked_before");
+    if (before.empty())
+        return true;
+    int64_t floor = 0;
+    std::from_chars(before.data(), before.data() + before.size(), floor);
+    return issued >= floor;
+}
+
+std::string idp_run::profile_claims(const account& who) const
+{
+    const std::string_view name = who.field("name").empty() ? who.username() : who.field("name");
+    std::string out = ",\"name\":" + json_string(name) + ",\"preferred_username\":" + json_string(who.username());
+    if (const std::string_view e = who.field("email"); !e.empty())
+        out += ",\"email\":" + json_string(e);
+    if (const std::string_view p = who.field("picture"); !p.empty())
+        out += ",\"picture\":" + json_string(p);
+    std::string groups;
+    std::string_view g = who.field("groups");
+    while (!g.empty())
+    {
+        const size_t comma = g.find(',');
+        std::string_view one = http_trim_ows(g.substr(0, comma));
+        g = comma == std::string_view::npos ? std::string_view{} : g.substr(comma + 1);
+        if (!one.empty())
+            groups += (groups.empty() ? "" : ",") + json_string(one);
+    }
+    if (!groups.empty())
+        out += ",\"groups\":[" + groups + "]";
+    return out;
+}
+
+std::string idp_run::clear_cookie() const
+{
+    std::string h = "Set-Cookie: " + std::string(cookie_name) + "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+    if (m_secure_cookie)
+        h += "; Secure";
+    if (!m_cookie_domain.empty())
+        h += "; Domain=" + m_cookie_domain;
+    return h + "\r\n";
+}
+
+std::string idp_run::client_ip(const conn& c, const request& rq) const
+{
+    // Behind the entrance, a hop on this machine, the client is the last one it names.
+    if (loopback(c.peer) && !rq.forwarded_for.empty())
+    {
+        std::string_view f = rq.forwarded_for;
+        if (const size_t comma = f.rfind(','); comma != std::string_view::npos)
+            f.remove_prefix(comma + 1);
+        f = http_trim_ows(f);
+        if (!f.empty())
+            return std::string(f);
+    }
+    return peer_text(c.peer);
+}
+
+bool idp_run::barred(const std::string& ip, int64_t now)
+{
+    const auto it = m_misses.find(ip);
+    if (it == m_misses.end())
+        return false;
+    std::erase_if(it->second.at, [now](int64_t t) { return now - t > miss_window; });
+    return static_cast<int>(it->second.at.size()) >= miss_limit;
+}
+
+void idp_run::missed(const std::string& ip, int64_t now)
+{
+    m_misses[ip].at.push_back(now);
+    arm_tick();
+}
+
+// ─── Authorize and sign in ──────────────────────────────────────────────────
+
+const client* idp_run::checked_client(const std::shared_ptr<conn>& c, const params& p, bool& answered)
+{
+    answered = false;
+    const client* cl = find_client(param(p, "client_id"));
+    const std::string_view back = param(p, "redirect_uri");
+    // Without a known client and one of its own addresses there is nowhere safe to send an error, so it is shown.
+    if (!cl || !cl->allows(back))
+    {
+        answered = true;
+        respond(c, 400, "text/html; charset=utf-8",
+                page("Sign-in refused", "<h1>This sign-in cannot go on</h1><p class=\"small\">The application asked "
+                                        "with a client or a return address this provider does not know.</p>"));
+        return nullptr;
+    }
+    const std::string sep = back.find('?') == std::string_view::npos ? "?" : "&";
+    const std::string state = std::string(param(p, "state"));
+    auto fail = [&](std::string_view error, std::string_view desc)
+    {
+        answered = true;
+        redirect(c, std::string(back) + sep + "error=" + url_encode(error) + "&error_description=" +
+                        url_encode(desc) + (state.empty() ? "" : "&state=" + url_encode(state)));
+    };
+    if (param(p, "response_type") != "code")
+    {
+        fail("unsupported_response_type", "only the authorization code flow is served");
+        return nullptr;
+    }
+    if (!has_scope(param(p, "scope"), "openid"))
+    {
+        fail("invalid_scope", "the scope must hold openid");
+        return nullptr;
+    }
+    const std::string_view challenge = param(p, "code_challenge");
+    if (!challenge.empty() && param(p, "code_challenge_method") != "S256")
+    {
+        fail("invalid_request", "only the S256 code challenge method is served");
+        return nullptr;
+    }
+    if (cl->is_public() && challenge.empty())
+    {
+        fail("invalid_request", "a public client must send a PKCE code challenge");
+        return nullptr;
+    }
+    return cl;
+}
+
+void idp_run::login_page(const std::shared_ptr<conn>& c, const params& p, std::string_view error, int status)
+{
+    std::string hidden;
+    for (const auto name : carried)
+        if (const std::string_view v = param(p, name); !v.empty())
+            hidden += "<input type=\"hidden\" name=\"" + std::string(name) + "\" value=\"" + html_escape(v) + "\">";
+    const std::string host = url_host(m_issuer);
+    const std::string body =
+        "<h1>Sign in</h1><form method=\"post\">" + hidden +
+        "<label for=\"u\">User</label><input id=\"u\" type=\"text\" name=\"username\" autocomplete=\"username\" "
+        "autofocus required value=\"" + html_escape(param(p, "username")) +
+        "\"><label for=\"p\">Password</label><input id=\"p\" type=\"password\" name=\"password\" "
+        "autocomplete=\"current-password\" required><div class=\"row\"><input id=\"r\" type=\"checkbox\" "
+        "name=\"remember\" value=\"1\"><label for=\"r\" style=\"margin:0\">Stay signed in</label></div>" +
+        (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
+        "<button type=\"submit\">Sign in</button></form><p class=\"small\">" + html_escape(host) + "</p>";
+    respond(c, status, "text/html; charset=utf-8", page("Sign in", body));
+}
+
+void idp_run::authorize(const std::shared_ptr<conn>& c, const request& rq)
+{
+    const params p = parse_form(rq.query);
+    const bool oauth = rq.path == "/authorize";
+    if (oauth)
+    {
+        bool answered = false;
+        if (!checked_client(c, p, answered))
+            return;
+    }
+    else if (const std::string_view rd = param(p, "rd"); !rd.empty() && !return_allowed(rd, m_issuer, m_cookie_domain))
+    {
+        respond(c, 400, "text/html; charset=utf-8",
+                page("Sign-in refused", "<h1>This sign-in cannot go on</h1><p class=\"small\">The page asked to "
+                                        "return to an address outside this provider's domain.</p>"));
+        return;
+    }
+    if (const account* who = param(p, "prompt") != "login" ? session_of(rq) : nullptr)
+    {
+        grant(c, p, *who, {});
+        return;
+    }
+    login_page(c, p, {}, 200);
+}
+
+void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
+{
+    params p = parse_form(rq.body);
+    // The authorize parameters travel in the form; a POST to /authorize may also carry them in its query.
+    for (auto& kv : parse_form(rq.query))
+        if (param(p, kv.first).empty())
+            p.push_back(std::move(kv));
+    if (rq.path == "/authorize")
+    {
+        bool answered = false;
+        if (!checked_client(c, p, answered))
+            return;
+    }
+    else if (const std::string_view rd = param(p, "rd"); !rd.empty() && !return_allowed(rd, m_issuer, m_cookie_domain))
+    {
+        respond(c, 400, "text/plain", "the return address is outside this provider's domain\n");
+        return;
+    }
+    const std::string user(param(p, "username"));
+    const std::string password(param(p, "password"));
+    if (user.empty() || password.empty())
+    {
+        login_page(c, p, "Give your user and password.", 400);
+        return;
+    }
+    const std::string ip = client_ip(*c, rq);
+    if (barred(ip, now_sec()))
+    {
+        ++m_c.barred;
+        login_page(c, p, "Too many failed sign-ins from here; try again in a quarter of an hour.", 429);
+        return;
+    }
+    const account* who = m_accounts.by_name(user);
+    std::weak_ptr<conn> weak = c;
+    const bool remember = param(p, "remember") == "1";
+    c->waiting = true;
+    check_password(who, password, [this, weak, p = std::move(p), ip, user, remember](bool ok)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        cc->waiting = false;
+        const account* a = m_accounts.by_name(user);
+        if (!ok || !a || a->disabled())
+        {
+            ++m_c.refused;
+            missed(ip, now_sec());
+            LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": a sign-in as \"" + user + "\" from " + ip +
+                      " was refused").c_str());
+            login_page(cc, p, "The user or password is not right.", 401);
+        }
+        else if (a->field("reset") == "1")
+            reset_page(cc, p, {}, 200);
+        else
+        {
+            ++m_c.sign_ins;
+            grant(cc, p, *a, session_cookie(*a, remember));
+        }
+        resume(cc);
+    });
+}
+
+void idp_run::check_password(const account* who, std::string_view password, std::function<void(bool)> then)
+{
+    // An unknown user or one without a password costs a hash all the same, so the time says nothing about who exists.
+    static const std::string dummy = socketley::storage::password_hash("socketley-no-such-user");
+    const std::string hash(who && !who->field("password").empty() ? who->field("password") : std::string_view(dummy));
+    const bool real = who && !who->field("password").empty();
+    auto result = std::make_shared<bool>(false);
+    auto work = [hash, pw = std::string(password), result] {
+        *result = socketley::storage::password_matches(hash, pw);
+    };
+    if (!m_hash.enabled())
+    {
+        work();
+        then(real && *result);
+        return;
+    }
+    m_hash.submit(m_hash_lane, std::move(work), [alive = m_alive, result, real, then = std::move(then)] {
+        if (*alive)
+            then(real && *result);
+    });
+}
+
+void idp_run::hash_password(std::string_view password, std::function<void(std::string)> then)
+{
+    auto result = std::make_shared<std::string>();
+    auto work = [pw = std::string(password), result] { *result = socketley::storage::password_hash(pw); };
+    if (!m_hash.enabled())
+    {
+        work();
+        then(std::move(*result));
+        return;
+    }
+    m_hash.submit(m_hash_lane, std::move(work), [alive = m_alive, result, then = std::move(then)] {
+        if (*alive)
+            then(std::move(*result));
+    });
+}
+
+void idp_run::resume(const std::shared_ptr<conn>& c)
+{
+    // What the connection brought while it waited, then more of it.
+    serve(c);
+    if (!c->dead && !c->waiting)
+        arm_read(c);
+}
+
+void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const account& who, std::string_view set_cookie)
+{
+    const client* cl = find_client(param(p, "client_id"));
+    // A sign-in for a page behind a proxy, or for this provider itself, rather than for a client.
+    if (!cl)
+    {
+        const std::string_view rd = param(p, "rd");
+        redirect(c, rd.empty() ? std::string_view("/") : rd, set_cookie);
+        return;
+    }
+    code_entry e;
+    e.client_id = cl->id;
+    e.redirect.assign(param(p, "redirect_uri"));
+    e.sub = who.id;
+    e.nonce.assign(param(p, "nonce"));
+    e.scope.assign(param(p, "scope"));
+    e.challenge.assign(param(p, "code_challenge"));
+    const int64_t now = now_sec();
+    e.auth_time = now;
+    e.expires = now + code_secs;
+    const std::string code = random_token();
+    if (code.empty())
+    {
+        respond(c, 503, "text/plain", "no randomness for a code\n");
+        return;
+    }
+    m_codes.emplace(code, std::move(e));
+    ++m_c.codes;
+    arm_tick();
+    const std::string_view redirect_uri = param(p, "redirect_uri");
+    const std::string_view state = param(p, "state");
+    std::string to(redirect_uri);
+    to += redirect_uri.find('?') == std::string_view::npos ? '?' : '&';
+    to += "code=" + url_encode(code);
+    if (!state.empty())
+        to += "&state=" + url_encode(state);
+    to += "&iss=" + url_encode(m_issuer);
+    redirect(c, to, set_cookie);
+}
+
+// ─── Tokens ─────────────────────────────────────────────────────────────────
+
+void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, const code_entry& e, const account& who)
+{
+    const int64_t now = now_sec();
+    const std::string jti = random_token();
+    const std::string profile = profile_claims(who);
+    const std::string common = "\"iss\":" + json_string(m_issuer) + ",\"sub\":" + json_string(who.id) +
+                               ",\"iat\":" + std::to_string(now) + ",\"iat_ms\":" + std::to_string(now_ms()) +
+                               ",\"auth_time\":" + std::to_string(e.auth_time);
+    const std::string id_token = sign_token(m_key, m_kid, "JWT",
+                                            common + ",\"aud\":" + json_string(cl.id) + ",\"exp\":" +
+                                                std::to_string(now + token_secs) +
+                                                (e.nonce.empty() ? "" : ",\"nonce\":" + json_string(e.nonce)) +
+                                                profile);
+    const std::string access = sign_token(m_key, m_kid, "at+jwt",
+                                          common + ",\"aud\":" + json_string(cl.id) + ",\"client_id\":" +
+                                              json_string(cl.id) + ",\"scope\":" + json_string(e.scope) +
+                                              ",\"jti\":" + json_string(jti) + ",\"exp\":" +
+                                              std::to_string(now + token_secs) + profile);
+    std::string body = "{\"access_token\":" + json_string(access) + ",\"token_type\":\"Bearer\",\"expires_in\":" +
+                       std::to_string(token_secs) + ",\"id_token\":" + json_string(id_token) +
+                       ",\"scope\":" + json_string(e.scope);
+    if (has_scope(e.scope, "offline_access") || !cl.is_public())
+    {
+        const std::string refresh = sign_token(m_key, m_kid, "refresh+jwt",
+                                               common + ",\"aud\":\"refresh\",\"client_id\":" + json_string(cl.id) +
+                                                   ",\"scope\":" + json_string(e.scope) + ",\"exp\":" +
+                                                   std::to_string(now + refresh_secs));
+        body += ",\"refresh_token\":" + json_string(refresh);
+    }
+    body += "}";
+    ++m_c.tokens;
+    respond(c, 200, "application/json", body, "Access-Control-Allow-Origin: *\r\n");
+}
+
+void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
+{
+    const params p = parse_form(rq.body);
+    // The client, by HTTP Basic or by the form, and a public one by its id alone.
+    std::string id(param(p, "client_id")), secret(param(p, "client_secret"));
+    bool basic = false;
+    if (rq.authorization.size() > 6 && (rq.authorization.starts_with("Basic ") || rq.authorization.starts_with("basic ")))
+    {
+        std::string decoded;
+        if (socketley::storage::base64_decode(http_trim_ows(std::string_view(rq.authorization).substr(6)), decoded))
+            if (const size_t colon = decoded.find(':'); colon != std::string::npos)
+            {
+                // RFC 6749 2.3.1 form-encodes both halves before they are joined.
+                const params half = parse_form("i=" + decoded.substr(0, colon) + "&s=" + decoded.substr(colon + 1));
+                id.assign(param(half, "i"));
+                secret.assign(param(half, "s"));
+                basic = true;
+            }
+    }
+    const client* cl = find_client(id);
+    const bool authenticated =
+        cl && (cl->is_public() ? secret.empty()
+                               : secret.size() == cl->secret.size() &&
+                                     CRYPTO_memcmp(secret.data(), cl->secret.data(), secret.size()) == 0);
+    if (!authenticated)
+    {
+        json_error(c, 401, "invalid_client", "the client is not known or its secret is not right",
+                   basic ? "WWW-Authenticate: Basic realm=\"" + m_issuer + "\"\r\n" : std::string());
+        return;
+    }
+    const std::string_view grant = param(p, "grant_type");
+    if (grant == "authorization_code")
+    {
+        const auto it = m_codes.find(std::string(param(p, "code")));
+        if (it == m_codes.end())
+        {
+            json_error(c, 400, "invalid_grant", "the code is not known, was used, or has expired");
+            return;
+        }
+        // Good once, whatever this exchange comes to.
+        const code_entry e = std::move(it->second);
+        m_codes.erase(it);
+        if (e.expires <= now_sec() || e.client_id != cl->id || e.redirect != param(p, "redirect_uri"))
+        {
+            json_error(c, 400, "invalid_grant", "the code was not given to this client for this redirect");
+            return;
+        }
+        if (!e.challenge.empty() && !pkce_matches(param(p, "code_verifier"), e.challenge))
+        {
+            json_error(c, 400, "invalid_grant", "the code verifier does not match the challenge");
+            return;
+        }
+        const account* who = m_accounts.by_id(e.sub);
+        if (!who || who->disabled())
+        {
+            json_error(c, 400, "invalid_grant", "the account is no longer one that may sign in");
+            return;
+        }
+        issue_tokens(c, *cl, e, *who);
+        return;
+    }
+    if (grant == "refresh_token")
+    {
+        claims r;
+        std::string why;
+        if (!verify_token(m_key, m_kid, "refresh+jwt", m_issuer, param(p, "refresh_token"), now_sec(), r, why) ||
+            claim(r, "aud") != "refresh" || claim(r, "client_id") != cl->id)
+        {
+            json_error(c, 400, "invalid_grant", "the refresh token is not one this client may use");
+            return;
+        }
+        // The account is looked at again, so one removed, disabled, made to reset its password or signed out
+        // everywhere since gets nothing.
+        const account* who = m_accounts.by_id(claim(r, "sub"));
+        if (!who || who->disabled() || who->field("reset") == "1" || !still_signed_in(*who, issued_ms(r)))
+        {
+            json_error(c, 400, "invalid_grant", "the account is no longer one that may sign in");
+            return;
+        }
+        code_entry e;
+        e.sub = who->id;
+        e.scope = claim(r, "scope");
+        e.auth_time = claim_int(r, "auth_time");
+        ++m_c.refreshes;
+        issue_tokens(c, *cl, e, *who);
+        return;
+    }
+    json_error(c, 400, "unsupported_grant_type", "only authorization_code and refresh_token are served");
+}
+
+void idp_run::userinfo(const std::shared_ptr<conn>& c, const request& rq)
+{
+    std::string_view auth = rq.authorization;
+    if (!auth.starts_with("Bearer ") && !auth.starts_with("bearer "))
+    {
+        json_error(c, 401, "invalid_token", "a bearer access token is required",
+                   "WWW-Authenticate: Bearer error=\"invalid_token\"\r\n");
+        return;
+    }
+    claims a;
+    std::string why;
+    if (!verify_token(m_key, m_kid, "at+jwt", m_issuer, http_trim_ows(auth.substr(7)), now_sec(), a, why) ||
+        !has_scope(claim(a, "scope"), "openid"))
+    {
+        json_error(c, 401, "invalid_token", "the access token is not valid: " + why,
+                   "WWW-Authenticate: Bearer error=\"invalid_token\"\r\n");
+        return;
+    }
+    // Answered from the account as it is now, which is what userinfo is for beside the token's copy.
+    const account* who = m_accounts.by_id(claim(a, "sub"));
+    if (!who || who->disabled() || !still_signed_in(*who, issued_ms(a)))
+    {
+        json_error(c, 401, "invalid_token", "the account is no longer one that may sign in",
+                   "WWW-Authenticate: Bearer error=\"invalid_token\"\r\n");
+        return;
+    }
+    ++m_c.userinfo;
+    respond(c, 200, "application/json", "{\"sub\":" + json_string(who->id) + profile_claims(*who) + "}",
+            "Access-Control-Allow-Origin: *\r\n");
+}
+
+void idp_run::logout(const std::shared_ptr<conn>& c, const request& rq)
+{
+    params p = parse_form(rq.query);
+    for (auto& kv : parse_form(rq.body))
+        p.push_back(std::move(kv));
+    const std::string_view to = param(p, "post_logout_redirect_uri");
+    bool known = false;
+    for (const auto& cl : m_clients)
+        if (cl.allows(to))
+            known = true;
+    if (!to.empty() && (known || return_allowed(to, m_issuer, m_cookie_domain)))
+    {
+        const std::string_view state = param(p, "state");
+        std::string loc(to);
+        if (!state.empty())
+            loc += std::string(to.find('?') == std::string_view::npos ? "?" : "&") + "state=" + url_encode(state);
+        redirect(c, loc, clear_cookie());
+        return;
+    }
+    respond(c, 200, "text/html; charset=utf-8",
+            page("Signed out", "<h1>Signed out</h1><p class=\"small\">You can close this page.</p>"), clear_cookie());
+}
+
+void idp_run::home(const std::shared_ptr<conn>& c, const request& rq)
+{
+    const account* who = session_of(rq);
+    if (!who)
+    {
+        login_page(c, {}, {}, 200);
+        return;
+    }
+    const std::string_view name = who->field("name").empty() ? who->username() : who->field("name");
+    respond(c, 200, "text/html; charset=utf-8",
+            page("Signed in", "<h1>Signed in</h1><p>as <b>" + html_escape(name) + "</b></p><p><a href=\"/account\">"
+                              "Your account</a></p><form method=\"post\" action=\"/logout\"><button "
+                              "type=\"submit\">Sign out</button></form>"));
+}
+
+void idp_run::reset_page(const std::shared_ptr<conn>& c, const params& p, std::string_view error, int status)
+{
+    std::string hidden;
+    for (const auto name : carried)
+        if (const std::string_view v = param(p, name); !v.empty())
+            hidden += "<input type=\"hidden\" name=\"" + std::string(name) + "\" value=\"" + html_escape(v) + "\">";
+    const std::string body =
+        "<h1>Set a new password</h1><p class=\"small\">Your password must be set again before you go on.</p>"
+        "<form method=\"post\" action=\"/account/password\">" + hidden +
+        "<input type=\"hidden\" name=\"username\" value=\"" + html_escape(param(p, "username")) +
+        "\"><label for=\"o\">Current password</label><input id=\"o\" type=\"password\" name=\"current\" "
+        "autocomplete=\"current-password\" required><label for=\"n\">New password</label><input id=\"n\" "
+        "type=\"password\" name=\"new\" autocomplete=\"new-password\" required>" +
+        (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
+        "<button type=\"submit\">Set password</button></form>";
+    respond(c, status, "text/html; charset=utf-8", page("Set a new password", body));
+}
+
+void idp_run::account_page(const std::shared_ptr<conn>& c, const request& rq, std::string_view note,
+                           std::string_view error, int status)
+{
+    const account* who = session_of(rq);
+    if (!who)
+    {
+        redirect(c, "/login?rd=" + url_encode("/account"));
+        return;
+    }
+    const std::string body =
+        "<h1>Your account</h1><p class=\"small\">Signed in as <b>" + html_escape(who->username()) + "</b></p>" +
+        (note.empty() ? std::string() : "<p class=\"small\">" + html_escape(note) + "</p>") +
+        (error.empty() ? std::string() : "<p class=\"err\">" + html_escape(error) + "</p>") +
+        "<form method=\"post\" action=\"/account\"><label for=\"dn\">Name</label><input id=\"dn\" type=\"text\" "
+        "name=\"name\" value=\"" + html_escape(who->field("name")) + "\"><label for=\"em\">E-mail</label><input "
+        "id=\"em\" type=\"text\" name=\"email\" value=\"" + html_escape(who->field("email")) +
+        "\"><button type=\"submit\">Save</button></form><form method=\"post\" action=\"/account/password\"><label "
+        "for=\"o\">Current password</label><input id=\"o\" type=\"password\" name=\"current\" autocomplete=\""
+        "current-password\" required><label for=\"n\">New password</label><input id=\"n\" type=\"password\" "
+        "name=\"new\" autocomplete=\"new-password\" required><button type=\"submit\">Change password</button></form>"
+        "<form method=\"post\" action=\"/account/everywhere\"><button type=\"submit\">Sign out everywhere</button>"
+        "</form>";
+    respond(c, status, "text/html; charset=utf-8", page("Your account", body));
+}
+
+void idp_run::account_post(const std::shared_ptr<conn>& c, const request& rq)
+{
+    const account* who = session_of(rq);
+    if (!who)
+    {
+        redirect(c, "/login?rd=" + url_encode("/account"));
+        return;
+    }
+    if (rq.path == "/account/everywhere")
+    {
+        // Every session and refresh token given before now stops holding, this browser's too.
+        std::string why;
+        if (!m_accounts.update(who->id, {{"revoked_before", std::to_string(now_ms())}}, why))
+        {
+            account_page(c, rq, {}, why, 500);
+            return;
+        }
+        respond(c, 200, "text/html; charset=utf-8",
+                page("Signed out", "<h1>Signed out everywhere</h1><p class=\"small\">Every session of this "
+                                   "account has ended.</p>"),
+                clear_cookie());
+        return;
+    }
+    const params p = parse_form(rq.body);
+    std::string why;
+    if (!m_accounts.update(who->id, {{"name", std::string(param(p, "name"))}, {"email", std::string(param(p, "email"))}},
+                           why))
+    {
+        account_page(c, rq, {}, why, 400);
+        return;
+    }
+    account_page(c, rq, "Saved.", {}, 200);
+}
+
+void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
+{
+    params p = parse_form(rq.body);
+    // Signed in, the account is the session's; at a forced reset it is the one named, proven by its old password.
+    const account* who = session_of(rq);
+    const bool from_reset = !who;
+    if (!who)
+        who = m_accounts.by_name(param(p, "username"));
+    const std::string ip = client_ip(*c, rq);
+    if (barred(ip, now_sec()))
+    {
+        ++m_c.barred;
+        respond(c, 429, "text/plain", "Too many failed sign-ins from here; try again in a quarter of an hour.\n");
+        return;
+    }
+    const std::string current(param(p, "current"));
+    const std::string fresh(param(p, "new"));
+    const std::string id = who ? who->id : std::string();
+    const std::string problem = socketley::storage::password_problem(fresh, who ? who->username() : "");
+    std::weak_ptr<conn> weak = c;
+    c->waiting = true;
+    check_password(who, current, [this, weak, rq, p, ip, id, fresh, problem, from_reset](bool ok)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        const account* a = m_accounts.by_id(id);
+        auto fail = [&](std::string_view msg, int status)
+        {
+            cc->waiting = false;
+            if (from_reset)
+                reset_page(cc, p, msg, status);
+            else
+                account_page(cc, rq, {}, msg, status);
+            resume(cc);
+        };
+        if (!ok || !a || a->disabled())
+        {
+            missed(ip, now_sec());
+            fail("The current password is not right.", 401);
+            return;
+        }
+        if (!problem.empty())
+        {
+            fail(problem, 400);
+            return;
+        }
+        hash_password(fresh, [this, weak, rq, p, id, from_reset](std::string hash)
+        {
+            auto c2 = weak.lock();
+            if (!c2 || c2->dead)
+                return;
+            c2->waiting = false;
+            std::string why;
+            const account* a2 = m_accounts.by_id(id);
+            // A new password ends the sessions given before it, as a stolen one would want.
+            if (hash.empty() || !a2 ||
+                !m_accounts.update(id, {{"password", hash}, {"reset", ""}, {"password_set", std::to_string(now_sec())},
+                                        {"revoked_before", std::to_string(now_ms())}},
+                                   why))
+            {
+                respond(c2, 500, "text/plain", "the password could not be kept\n");
+                resume(c2);
+                return;
+            }
+            ++m_c.sign_ins;
+            if (from_reset)
+                grant(c2, p, *a2, session_cookie(*a2, false));
+            else
+                respond(c2, 200, "text/html; charset=utf-8",
+                        page("Password changed", "<h1>Password changed</h1><p class=\"small\">Every other session "
+                                                 "has ended.</p><p><a href=\"/account\">Your account</a></p>"),
+                        session_cookie(*a2, false));
+            resume(c2);
+        });
+    });
+}
+
+}   // namespace socketley::idp
+
+// ─── socketley idp-user ─────────────────────────────────────────────────────
+
+namespace socketley::idp
+{
+
+void idp_run::answer_command(uint64_t ticket, std::string_view text)
+{
+    if (auto* mgr = m_owner.get_runtime_manager())
+        mgr->requests().complete_deferred(ticket, request_status::ok, text);
+}
+
+void idp_run::command(uint64_t ticket, std::string_view payload)
+{
+    std::vector<std::string> args;
+    payload.remove_prefix(command_marker.size());
+    // A page of a storage's users the daemon fetched for `import`, raw after its first line.
+    if (constexpr std::string_view page = "import-data\n"; payload.starts_with(page))
+    {
+        import_page(ticket, payload.substr(page.size()));
+        return;
+    }
+    while (!payload.empty())
+    {
+        const size_t nl = payload.find('\n');
+        args.emplace_back(payload.substr(0, nl));
+        payload = nl == std::string_view::npos ? std::string_view{} : payload.substr(nl + 1);
+    }
+    if (args.empty())
+    {
+        answer_command(ticket, "error: idp-user needs an action");
+        return;
+    }
+    const std::string action = args[0];
+    if (action == "list")
+    {
+        std::string out;
+        for (const account* a : m_accounts.all())
+            out += std::string(a->username()) + "\t" + a->id + "\t" +
+                   (a->field("groups").empty() ? "-" : std::string(a->field("groups"))) +
+                   (a->disabled() ? "\tdisabled" : "") + (a->field("password").empty() ? "\tno-password" : "") + "\n";
+        answer_command(ticket, out);
+        return;
+    }
+    if (args.size() < 2)
+    {
+        answer_command(ticket, "error: idp-user " + action + " needs a username");
+        return;
+    }
+    const std::string user = args[1];
+    if (action == "add")
+    {
+        field_list fields{{"username", user}, {"created", std::to_string(now_sec())}};
+        std::string password;
+        for (size_t i = 2; i < args.size(); ++i)
+        {
+            const std::string& a = args[i];
+            const bool more = i + 1 < args.size();
+            if (a == "--password" && more)
+                password = args[++i];
+            else if (a == "--name" && more)
+                fields.emplace_back("name", args[++i]);
+            else if (a == "--email" && more)
+                fields.emplace_back("email", args[++i]);
+            else if (a == "--groups" && more)
+                fields.emplace_back("groups", args[++i]);
+            else if (a == "--reset")
+                fields.emplace_back("reset", "1");
+            else if (a == "--set" && more)
+            {
+                const std::string& kv = args[++i];
+                const size_t eq = kv.find('=');
+                if (eq == std::string::npos || eq == 0)
+                {
+                    answer_command(ticket, "error: --set takes name=value");
+                    return;
+                }
+                fields.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
+            }
+            else
+            {
+                answer_command(ticket, "error: idp-user add takes --password, --name, --email, --groups, --set "
+                                       "name=value and --reset, not '" + a + "'");
+                return;
+            }
+        }
+        for (const auto& [k, v] : fields)
+            if (k == "password" || k == "revoked_before")
+            {
+                answer_command(ticket, "error: the field " + k + " is set by the provider, not by --set");
+                return;
+            }
+        if (m_accounts.by_name(user))
+        {
+            answer_command(ticket, "error: the username \"" + user + "\" is taken");
+            return;
+        }
+        if (!password.empty())
+            if (const std::string problem = socketley::storage::password_problem(password, user); !problem.empty())
+            {
+                answer_command(ticket, "error: " + problem);
+                return;
+            }
+        auto create = [this, ticket](field_list f)
+        {
+            std::string id, why;
+            if (!m_accounts.create(f, id, why))
+                answer_command(ticket, "error: " + why);
+            else
+                answer_command(ticket, id + "\n");
+        };
+        if (password.empty())
+            create(std::move(fields));
+        else
+            hash_password(password, [create, fields = std::move(fields)](std::string hash) mutable {
+                fields.emplace_back("password", std::move(hash));
+                fields.emplace_back("password_set", std::to_string(now_sec()));
+                create(std::move(fields));
+            });
+        return;
+    }
+    const account* who = m_accounts.by_name(user);
+    if (!who)
+    {
+        answer_command(ticket, "error: no account \"" + user + "\"");
+        return;
+    }
+    const std::string id = who->id;
+    auto apply = [this, ticket, id](const field_list& f, std::string_view done)
+    {
+        std::string why;
+        if (!m_accounts.update(id, f, why))
+            answer_command(ticket, "error: " + why);
+        else
+            answer_command(ticket, done);
+    };
+    if (action == "passwd")
+    {
+        std::string password;
+        bool reset = false;
+        for (size_t i = 2; i < args.size(); ++i)
+            if (args[i] == "--password" && i + 1 < args.size())
+                password = args[++i];
+            else if (args[i] == "--reset")
+                reset = true;
+            else
+            {
+                answer_command(ticket, "error: idp-user passwd takes --password and --reset, not '" + args[i] + "'");
+                return;
+            }
+        if (const std::string problem = socketley::storage::password_problem(password, user); !problem.empty())
+        {
+            answer_command(ticket, "error: " + problem);
+            return;
+        }
+        hash_password(password, [apply, reset](std::string hash) {
+            const std::string now = std::to_string(now_sec());
+            apply({{"password", std::move(hash)}, {"password_set", now}, {"revoked_before", std::to_string(now_ms())},
+                   {"reset", reset ? "1" : ""}},
+                  "");
+        });
+        return;
+    }
+    if (action == "set")
+    {
+        field_list f;
+        for (size_t i = 2; i < args.size(); ++i)
+        {
+            const size_t eq = args[i].find('=');
+            if (eq == std::string::npos || eq == 0)
+            {
+                answer_command(ticket, "error: set takes name=value, an empty value to remove the field");
+                return;
+            }
+            std::string k = args[i].substr(0, eq);
+            if (k == "password" || k == "revoked_before")
+            {
+                answer_command(ticket, "error: the field " + k + " is set by the provider; use passwd or logout");
+                return;
+            }
+            f.emplace_back(std::move(k), args[i].substr(eq + 1));
+        }
+        if (f.empty())
+        {
+            answer_command(ticket, "error: set needs name=value");
+            return;
+        }
+        apply(f, "");
+        return;
+    }
+    if (action == "disable" || action == "enable")
+    {
+        apply({{"disabled", action == "disable" ? "1" : ""}}, "");
+        return;
+    }
+    if (action == "logout")
+    {
+        apply({{"revoked_before", std::to_string(now_ms())}}, "");
+        return;
+    }
+    if (action == "remove")
+    {
+        std::string why;
+        if (!m_accounts.remove(id, why))
+            answer_command(ticket, "error: " + why);
+        else
+            answer_command(ticket, "");
+        return;
+    }
+    if (action == "show")
+    {
+        std::string out = "id: " + id + "\n";
+        for (const auto& [k, v] : who->fields)
+            out += k + ": " + (k == "password" ? std::string("(set)") : v) + "\n";
+        answer_command(ticket, out);
+        return;
+    }
+    answer_command(ticket, "error: unknown action '" + action +
+                               "'; idp-user takes add, passwd, set, disable, enable, logout, remove, show, list "
+                               "and import");
+}
+
+void idp_run::import_page(uint64_t ticket, std::string_view reply)
+{
+    storage_rpc::reply r;
+    if (!storage_rpc::decode(reply, storage_rpc::op::users, r))
+    {
+        answer_command(ticket, "error: the answer is not a storage's list of users");
+        return;
+    }
+    if (!r.ok)
+    {
+        answer_command(ticket, "error: " + r.message);
+        return;
+    }
+    // A user is taken with the password hash it has there, which is the same scrypt this provider checks; one whose
+    // name is an account here already is left as the account is.
+    size_t kept = 0;
+    std::vector<field_list> fresh;
+    for (const auto& u : r.objects)
+    {
+        if (m_accounts.by_name(u.key))
+        {
+            ++kept;
+            continue;
+        }
+        field_list f{{"username", u.key}, {"created", std::to_string(now_sec())}};
+        for (const auto& [k, v] : u.metadata)
+        {
+            if (v.empty())
+                continue;
+            if (k == "admin")
+            {
+                if (v == "1")
+                    f.emplace_back("groups", "admins");
+            }
+            else if (k == "name" || k == "email" || k == "password" || k == "reset")
+                f.emplace_back(k, v);
+        }
+        fresh.push_back(std::move(f));
+    }
+    std::string errors;
+    const size_t added = m_accounts.create_many(fresh, errors);
+    answer_command(ticket, std::to_string(added) + " " + std::to_string(kept) + "\n" + errors);
+}
+
+}   // namespace socketley::idp

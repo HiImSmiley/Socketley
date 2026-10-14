@@ -322,7 +322,20 @@ std::string inbox_json(const inbox& b)
 
 bool storage_run::has_ui_cookie(const conn& c)
 {
-    return !cookie_value(c.req.header("cookie"), cookie_name).empty();
+    return !cookie_value(c.req.header("cookie"), cookie_name).empty() ||
+           !cookie_value(c.req.header("cookie"), "skl_idp").empty();
+}
+
+bool storage_run::idp_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
+{
+    socketley::idp::session_verifier::who w;
+    if (!m_idp.enabled() || !m_idp.check(c->req.header("cookie"), w))
+        return false;
+    // The account's username is this storage's user of that name, with the rights it has here and no others.
+    v = m_auth->authorize_identity(w.username);
+    c->by_idp = v.allowed;
+    c->by_idp_refused = !v.allowed;
+    return true;
 }
 
 bool storage_run::ui_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
@@ -595,6 +608,13 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
     jstr(o, u ? m_auth->display_name(u->id) : std::string{});
     o += u && u->admin ? ",\"admin\":true" : ",\"admin\":false";
     o += c->anonymous ? ",\"anonymous\":true" : ",\"anonymous\":false";
+    // Signed in by the identity provider, which is where signing out happens, back to this interface.
+    if (c->by_idp)
+        if (const std::string_view host = r.header("host"); !host.empty() && host.find_first_of("\r\n\"\\") == std::string_view::npos)
+        {
+            o += ",\"idp_logout\":";
+            jstr(o, m_idp.logout_url(std::string(secure(*c) ? "https://" : "http://") + std::string(host) + "/~ui/"));
+        }
     // Whether the user has a password, and must set another before anything else, and whether this session is one.
     const int login = u ? m_auth->login_state(u->id) : -1;
     o += login < 0 ? ",\"password\":false" : login ? ",\"password\":true,\"password_reset\":true" : ",\"password\":true";

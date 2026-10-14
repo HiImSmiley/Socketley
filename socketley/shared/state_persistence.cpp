@@ -11,6 +11,7 @@
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
+#include "../runtime/idp/idp_instance.h"
 #include "../cli/command_hashing.h"
 #include "type_registry.h"
 
@@ -758,11 +759,20 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.mode = static_cast<uint8_t>(sy->get_mode());
             break;
         }
+        case runtime_idp:
+        {
+            auto* ip = static_cast<const idp_instance*>(instance);
+            cfg.idp_clients = std::string(ip->get_clients());
+            cfg.idp_issuer = std::string(ip->get_issuer_flag());
+            cfg.idp_cookie_domain = std::string(ip->get_cookie_domain());
+            break;
+        }
         case runtime_storage:
         {
             auto* stg = static_cast<const storage_instance*>(instance);
             cfg.storage_dir = std::string(stg->get_dir());
             cfg.storage_anonymous = stg->get_anonymous();
+            cfg.storage_idp = std::string(stg->get_idp());
             cfg.storage_acls = stg->get_acls();
             cfg.storage_max_bytes = stg->get_max_bytes();
             cfg.storage_access_key = std::string(stg->get_access_key());
@@ -1050,6 +1060,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             break;
         case runtime_storage:
             append_str_field("dir", cfg.storage_dir);
+            if (!cfg.storage_idp.empty())
+                append_str_field("idp", cfg.storage_idp);
             if (cfg.storage_anonymous)
                 append_bool_field("anonymous", true);
             if (cfg.storage_acls)
@@ -1118,6 +1130,14 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             if (!cfg.sync_repositories.empty())
                 append_str_field("repositories", cfg.sync_repositories);
             append_int_field("every", cfg.sync_every);
+            break;
+        case runtime_idp:
+            if (!cfg.idp_clients.empty())
+                append_str_field("clients", cfg.idp_clients);
+            if (!cfg.idp_issuer.empty())
+                append_str_field("issuer", cfg.idp_issuer);
+            if (!cfg.idp_cookie_domain.empty())
+                append_str_field("cookie_domain", cfg.idp_cookie_domain);
             break;
     }
 
@@ -1284,6 +1304,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
         case runtime_storage:
             cfg.storage_dir = json_get_string(json, "dir");
             cfg.storage_anonymous = json_get_bool(json, "anonymous");
+            cfg.storage_idp = json_get_string(json, "idp");
             cfg.storage_acls = json_get_bool(json, "acls");
             cfg.storage_max_bytes = json_get_size(json, "max_bytes");
             cfg.storage_access_key = json_get_string(json, "access_key");
@@ -1327,6 +1348,11 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.sync_every = json_get_uint32(json, "every", sync_default_every);
             break;
         }
+        case runtime_idp:
+            cfg.idp_clients = json_get_string(json, "clients");
+            cfg.idp_issuer = json_get_string(json, "issuer");
+            cfg.idp_cookie_domain = json_get_string(json, "cookie_domain");
+            break;
     }
 
     json_get_extra(json, cfg.extra);

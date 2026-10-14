@@ -4,6 +4,8 @@
 //   bearer:<file>   `Authorization: Bearer <token>`, with a token one line of the file
 //   basic:<file>    HTTP Basic with an access key and its secret key, from a storage runtime's credentials file, of
 //                   a user who is an admin there (a key outside any [user] is the default owner's, an admin)
+//   idp:<runtime>   the sign-in cookie of an idp runtime of this daemon, verified here against the key it publishes
+//                   beside its state; a browser without one is sent to sign in and back
 //
 // Either file is read again when it changes, at most once a second; one that has gone or no longer parses refuses
 // everybody until it is whole again. An address that keeps failing is refused even the right answer for a while,
@@ -17,6 +19,7 @@
 #include <vector>
 
 namespace socketley::storage { class credential_set; }
+namespace socketley::idp { class session_verifier; }
 
 class proxy_auth
 {
@@ -38,6 +41,13 @@ public:
     // The id of the user an access key of the basic file signs for, empty for the default owner or no such key.
     std::string user_of(std::string_view access_key) const;
 
+    // Whether this is an idp:<runtime> --auth, which a request's cookies answer rather than its Authorization.
+    bool idp() const { return m_kind == kind::idp; }
+    // The signed-in account the request's Cookie fields name: pass with its id, username and email set, or refuse.
+    verdict check_session(std::string_view cookies, std::string& sub, std::string& username, std::string& email);
+    // Where a browser signs in and is sent back to `return_to` from, empty while the provider's key is not known.
+    std::string login_url(std::string_view return_to);
+
     // The WWW-Authenticate field a refusal carries, with its line end.
     const std::string& challenge() const { return m_challenge; }
 
@@ -46,7 +56,7 @@ public:
     static constexpr std::chrono::minutes window{15};
 
 private:
-    enum class kind { none, bearer, basic };
+    enum class kind { none, bearer, basic, idp };
     void reload(std::chrono::steady_clock::time_point now);
     bool admit(std::string_view authorization) const;
     void missed(const std::string& key, std::chrono::steady_clock::time_point now);
@@ -58,6 +68,7 @@ private:
     bool m_loaded{false};
     std::vector<std::string> m_tokens;
     std::unique_ptr<socketley::storage::credential_set> m_keys;
+    std::unique_ptr<socketley::idp::session_verifier> m_sessions;
 
     struct misses
     {

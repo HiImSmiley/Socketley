@@ -21,6 +21,7 @@
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
+#include "../runtime/idp/idp_instance.h"
 #include "../cli/command_hashing.h"
 #include "../runtime/worker/worker_main.h"
 
@@ -58,6 +59,8 @@ struct daemon_config
     uint16_t    metrics_port = 0;
     // The credentials file the dashboard's admins sign in from.
     std::string dashboard_credentials;
+    // The idp runtime whose admins sign in to the dashboard, beside or instead of the credentials.
+    std::string dashboard_idp;
     // Where alerts are posted, empty for nowhere.
     std::string alert_webhook;
     std::string name;
@@ -157,6 +160,10 @@ static daemon_config load_daemon_config(const std::string& config_path)
     sol::optional<std::string> dc = text("dashboard_credentials");
     if (dc && !dc->empty())
         out.dashboard_credentials = *dc;
+
+    sol::optional<std::string> di = text("dashboard_idp");
+    if (di && !di->empty())
+        out.dashboard_idp = *di;
 
     sol::optional<std::string> hook = text("alert_webhook");
     if (hook && !hook->empty())
@@ -517,6 +524,11 @@ static void restore_runtimes(state_persistence& persistence,
             case runtime_sync:
             {
                 apply_sync_config(*static_cast<sync_instance*>(instance), cfg);
+                break;
+            }
+            case runtime_idp:
+            {
+                apply_idp_config(*static_cast<idp_instance*>(instance), cfg);
                 break;
             }
         }
@@ -915,7 +927,8 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     bool metrics_bound = false;
     if (metrics_port > 0)
     {
-        metrics_bound = metrics.start(metrics_port, {config.dashboard_credentials, paths.state_dir.string(), config.alert_webhook});
+        metrics_bound = metrics.start(metrics_port, {config.dashboard_credentials, paths.state_dir.string(), config.alert_webhook,
+                                                     config.dashboard_idp});
         if (metrics_bound)
             LOG_INFO("metrics endpoint started");
         else

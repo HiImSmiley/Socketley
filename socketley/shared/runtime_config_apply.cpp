@@ -10,6 +10,7 @@
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
+#include "../runtime/idp/idp_instance.h"
 
 void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
                         bool by_presence)
@@ -139,6 +140,19 @@ void apply_sync_config(sync_instance& sy, const runtime_config& cfg, bool by_pre
         sy.set_every(cfg.sync_every);
 }
 
+void apply_idp_config(idp_instance& ip, const runtime_config& cfg, bool by_presence)
+{
+    auto asked = [&](std::string_view key, bool nondefault) {
+        return by_presence ? cfg.has(key) : nondefault;
+    };
+    if (asked("clients", !cfg.idp_clients.empty()))
+        ip.set_clients(cfg.idp_clients);
+    if (asked("issuer", !cfg.idp_issuer.empty()))
+        ip.set_issuer(cfg.idp_issuer);
+    if (asked("cookie_domain", !cfg.idp_cookie_domain.empty()))
+        ip.set_cookie_domain(cfg.idp_cookie_domain);
+}
+
 void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool by_presence)
 {
     auto asked = [&](std::string_view key, bool nondefault) {
@@ -148,6 +162,8 @@ void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool
         stg.set_dir(cfg.storage_dir);
     if (asked("anonymous", cfg.storage_anonymous))
         stg.set_anonymous(cfg.storage_anonymous);
+    if (asked("idp", !cfg.storage_idp.empty()))
+        stg.set_idp(cfg.storage_idp);
     if (asked("acls", cfg.storage_acls))
         stg.set_acls(cfg.storage_acls);
     if (asked("max_bytes", cfg.storage_max_bytes > 0))
@@ -347,6 +363,9 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
             break;
         case runtime_sync:
             apply_sync_config(static_cast<sync_instance&>(rt), cfg);
+            break;
+        case runtime_idp:
+            apply_idp_config(static_cast<idp_instance&>(rt), cfg);
             break;
     }
 

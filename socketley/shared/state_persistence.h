@@ -163,6 +163,7 @@ struct runtime_config
     // Storage
     std::string storage_dir;
     bool storage_anonymous = false;
+    std::string storage_idp;
     bool storage_acls = false;
     uint64_t storage_max_bytes = 0;
     std::string storage_access_key;
@@ -204,6 +205,11 @@ struct runtime_config
     std::string sync_repositories;
     // Written always, since 0 is a setting (walk only when told) and not "not given".
     uint32_t sync_every = 3600;
+
+    // Idp
+    std::string idp_clients;
+    std::string idp_issuer;
+    std::string idp_cookie_domain;
 
     // A registered type's own fields in declaration order, opaque here, held
     // as strings because the schema that gives them kinds lives in a manifest.

@@ -8,6 +8,7 @@
 #include "../runtime/storage/storage_instance.h"
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
+#include "../runtime/idp/idp_instance.h"
 
 std::unique_ptr<runtime_instance> create_runtime(runtime_type type, std::string_view name)
 {
@@ -27,6 +28,8 @@ std::unique_ptr<runtime_instance> create_runtime(runtime_type type, std::string_
             return std::make_unique<dns_instance>(name);
         case runtime_sync:
             return std::make_unique<sync_instance>(name);
+        case runtime_idp:
+            return std::make_unique<idp_instance>(name);
         default:
             return type_registry::make(type, name);
     }

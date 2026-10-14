@@ -45,7 +45,8 @@ metrics_endpoint::~metrics_endpoint()
 
 bool metrics_endpoint::start(uint16_t port, options o)
 {
-    m_dash = std::make_unique<dashboard::server>(std::move(o.dashboard_credentials), m_manager);
+    m_dash = std::make_unique<dashboard::server>(std::move(o.dashboard_credentials), std::move(o.dashboard_idp),
+                                                 m_manager);
     m_state_dir = o.state_dir;
     m_history = std::make_unique<history::keeper>(o.state_dir.empty() ? std::string() : o.state_dir + "/.history");
     m_alerts = std::make_unique<alerts::monitor>(o.state_dir.empty() ? std::string() : o.state_dir + "/.alerts",

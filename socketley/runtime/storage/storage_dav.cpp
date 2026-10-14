@@ -248,7 +248,7 @@ bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view rea
         if (!v.allowed)
             login_missed(*c);
     }
-    else if (ui_cookie(c, v))
+    else if (ui_cookie(c, v) || idp_cookie(c, v))
     {
         // A browser's session sends its cookie with whatever it asks, another site's form too: a change made under
         // the cookie alone must carry the interface's own header, which no page elsewhere can add without CORS.
@@ -273,11 +273,25 @@ bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view rea
     if (!v.allowed)
     {
         response r;
+        // Signed in at the identity provider as an account that is no user here: known, and let in to nothing.
+        if (c->by_idp_refused)
+        {
+            app_reply(c, 403, "The account signed in is no user of this storage.\n");
+            return false;
+        }
         r.status = 401;
         // The web interface asks for credentials itself, and a browser's own prompt would come before its form, as it
         // would over a player whose session ran out.
         if (c->req.header("x-socketley-ui").empty() && !has_ui_cookie(*c))
             r.headers.emplace_back("WWW-Authenticate", "Basic realm=\"" + std::string(realm) + "\", charset=\"UTF-8\"");
+        // Where the --idp runtime signs a browser in and back to this interface, which the page offers.
+        if (m_idp.enabled())
+            if (const std::string_view host = c->req.header("host"); !host.empty() &&
+                host.find_first_of("\r\n /") == std::string_view::npos)
+                if (std::string to = m_idp.login_url(std::string(secure(*c) ? "https://" : "http://") +
+                                                     std::string(host) + "/~ui/");
+                    !to.empty())
+                    r.headers.emplace_back("X-Socketley-Idp-Login", std::move(to));
         r.headers.emplace_back("Content-Type", "text/plain; charset=utf-8");
         r.body = "Sign in with a user's name and password, or an access key and its secret.\n";
         count_error(*c, "AccessDenied");

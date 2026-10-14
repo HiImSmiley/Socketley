@@ -41,6 +41,7 @@
 #include "s3_federation.h"
 #include "s3_auth.h"
 #include "s3_users.h"
+#include "../idp/idp_session.h"
 #include "../../shared/h3_endpoint.h"
 #include "../../shared/storage_rpc.h"
 #include "shard_node.h"
@@ -538,6 +539,9 @@ struct conn
     uint8_t     acl_need{0};
     // An ACL's grant admitted the request, which its access log line says.
     bool        by_acl{false};
+    // Signed in by the --idp runtime's cookie rather than this storage's own.
+    bool        by_idp{false};
+    bool        by_idp_refused{false};
     // The S3 error code the answer carries, for the access log.
     std::string error_code;
     // Given the answer before it is sent, by an application that turns an S3 answer into its own; it sends it on.
@@ -1043,6 +1047,8 @@ public:
     void login_missed(conn& c);
     // The web interface's session cookie judged into `v`; false when the request carries none.
     bool ui_cookie(const std::shared_ptr<conn>& c, auth_verdict& v);
+    // A sign-in of the --idp runtime, the user of the account's name here; false when the request carries none.
+    bool idp_cookie(const std::shared_ptr<conn>& c, auth_verdict& v);
     static bool has_ui_cookie(const conn& c);
     // A Content-Disposition that saves `key` under its last name, as ?download asks.
     static std::string attachment_of(std::string_view key);
@@ -1477,6 +1483,8 @@ private:
     channel_transport m_transport;
     shard_node        m_node;
     authenticator*    m_auth;
+    // The --idp runtime's sessions, verified here against the key it publishes.
+    socketley::idp::session_verifier m_idp;
     std::unique_ptr<authenticator> m_auth_owned;
     anonymous_authenticator m_anon;
     uint32_t          m_mpu_expire_secs{0};

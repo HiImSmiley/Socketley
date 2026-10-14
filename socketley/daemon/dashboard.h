@@ -8,6 +8,7 @@
 // failures from one address barring it for fifteen minutes. A session is a cookie sealed with a key this process
 // draws at start, HttpOnly and SameSite=Strict, good for twelve hours; a change also carries the page's own header,
 // which no other site's request can. Without the credentials the page shows and changes nothing.
+#include "../runtime/idp/idp_session.h"
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -53,10 +54,10 @@ void send(int fd, int status, std::string_view type, std::string_view body, std:
 class server
 {
 public:
-    server(std::string credentials, runtime_manager& manager);
+    server(std::string credentials, std::string idp, runtime_manager& manager);
     ~server();
 
-    bool configured() const { return !m_credentials.empty(); }
+    bool configured() const { return !m_credentials.empty() || m_idp.enabled(); }
     // The access key of the request's session, empty for none.
     std::string session_of(const request& r) const;
     // Whether a read of the figures is let through: a session, or, without credentials, anyone the endpoint serves.
@@ -79,6 +80,10 @@ private:
     std::string seal(std::string_view user, int64_t expires) const;
 
     std::string m_credentials;
+
+    // The idp runtime's sessions, of whose accounts an admin signs in; verifying keeps a cache, so it is mutable.
+
+    mutable socketley::idp::session_verifier m_idp;
     std::string m_key;
     std::unique_ptr<proxy_auth> m_auth;
     runtime_manager& m_manager;

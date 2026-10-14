@@ -124,7 +124,9 @@ public:
                           session_credentials& out) override;
     bool has_user(std::string_view id) const override { return m_creds.find_user(id) != nullptr; }
     auth_verdict authorize_password(std::string_view user, std::string_view password) override;
+    auth_verdict authorize_identity(std::string_view id) override;
     int login_state(std::string_view id) const override;
+    std::string login_hash(std::string_view id) const override;
     std::string ui_session_mac(std::string_view access_key, int64_t issued_ms, int64_t expires_ms) const override;
     bool admin_user(std::string_view id) const override;
     std::vector<std::shared_ptr<const user_identity>> users() const override { return m_creds.users(); }

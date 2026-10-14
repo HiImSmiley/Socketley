@@ -1115,10 +1115,37 @@ auth_verdict sigv4_authenticator::authorize_password(std::string_view user, std:
     return v;
 }
 
+auth_verdict sigv4_authenticator::authorize_identity(std::string_view id)
+{
+    maybe_reload();
+    auto user = m_creds.shared_user(id);
+    if (!user && iam_changed())
+    {
+        refresh();
+        user = m_creds.shared_user(id);
+    }
+    auth_verdict v;
+    if (!user || user->cluster)
+    {
+        v.allowed = false;
+        v.error   = {"AccessDenied", "The account signed in is no user of this runtime.", 403};
+        return v;
+    }
+    v.user      = std::move(user);
+    v.principal = "~" + std::string(id);
+    return v;
+}
+
 std::string sigv4_authenticator::ui_session_mac(std::string_view access_key, int64_t issued_ms, int64_t expires_ms) const
 {
     const std::string_view secret = m_creds.secret(access_key);
     return secret.empty() ? std::string{} : hmac_sha256_hex(secret, ui_session_text(access_key, issued_ms, expires_ms));
+}
+
+std::string sigv4_authenticator::login_hash(std::string_view id) const
+{
+    const auto it = m_logins.find(id);
+    return it == m_logins.end() ? std::string() : it->second.hash;
 }
 
 int sigv4_authenticator::login_state(std::string_view id) const
