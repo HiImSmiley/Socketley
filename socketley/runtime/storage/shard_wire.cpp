@@ -523,11 +523,14 @@ list_page merge_pages(std::vector<list_page> pages, size_t max_keys)
     bool        bounded       = false;
     std::string horizon;
     std::vector<item> items;
+    // Where each sorted run begins in items: a page's objects, then its prefixes.
+    std::vector<size_t> runs;
     size_t            objects = 0;
     for (list_page& p : pages)
     {
         const std::string* last = nullptr;
         objects += p.objects.size();
+        runs.push_back(items.size());
         for (list_entry& e : p.objects)
         {
             items.push_back({&e.key, &e});
@@ -536,6 +539,7 @@ list_page merge_pages(std::vector<list_page> pages, size_t max_keys)
         // Each list is sorted alone, and the last name is the larger of the two ends.
         if (!p.objects.empty())
             last = &p.objects.back().key;
+        runs.push_back(items.size());
         for (const std::string& pr : p.prefixes)
             items.push_back({&pr, nullptr});
         if (!p.prefixes.empty() && (!last || p.prefixes.back() > *last))
@@ -550,8 +554,44 @@ list_page merge_pages(std::vector<list_page> pages, size_t max_keys)
         bounded = true;
     }
 
-    std::stable_sort(items.begin(), items.end(),
-                     [](const item& a, const item& b) { return *a.name < *b.name; });
+    runs.push_back(items.size());
+
+    // The runs merged as far as the page goes, since max_keys of shards times max_keys are taken; the stable sort it
+    // replaces is what a run out of order still gets, and a tie goes to the earlier run, as that sort kept it.
+    const auto by_name = [](const item& a, const item& b) { return *a.name < *b.name; };
+    bool sorted = true;
+    for (size_t r = 0; r + 1 < runs.size() && sorted; ++r)
+        sorted = std::is_sorted(items.begin() + static_cast<std::ptrdiff_t>(runs[r]),
+                                items.begin() + static_cast<std::ptrdiff_t>(runs[r + 1]), by_name);
+    if (!sorted)
+    {
+        std::stable_sort(items.begin(), items.end(), by_name);
+        runs = {0, items.size()};
+    }
+    // A heap of the runs not yet drained, smallest head name on top, the earlier run first on a tie.
+    std::vector<size_t> head(runs.begin(), runs.end() - 1);
+    std::vector<size_t> heap;
+    const auto after = [&](size_t a, size_t b) {
+        const std::string& x = *items[head[a]].name;
+        const std::string& y = *items[head[b]].name;
+        return y < x || (x == y && b < a);
+    };
+    for (size_t r = 0; r < head.size(); ++r)
+        if (head[r] < runs[r + 1])
+            heap.push_back(r);
+    std::make_heap(heap.begin(), heap.end(), after);
+    const auto next_item = [&]() -> const item* {
+        if (heap.empty())
+            return nullptr;
+        std::pop_heap(heap.begin(), heap.end(), after);
+        const size_t r = heap.back();
+        const item* got = &items[head[r]++];
+        if (head[r] < runs[r + 1])
+            std::push_heap(heap.begin(), heap.end(), after);
+        else
+            heap.pop_back();
+        return got;
+    };
 
     list_page out;
     // Reserved whole, so the name of the last object taken stays where it was moved to.
@@ -561,9 +601,9 @@ list_page merge_pages(std::vector<list_page> pages, size_t max_keys)
     size_t             count = 0;
     bool               more  = false;
 
-    for (size_t i = 0; i < items.size(); ++i)
+    for (const item* next = next_item(); next; next = next_item())
     {
-        const item& it = items[i];
+        const item& it = *next;
         // The same prefix from more than one shard is one entry.
         if (!it.object && taken_last && taken_prefix && *taken_last == *it.name)
             continue;

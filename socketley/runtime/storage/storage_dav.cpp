@@ -301,6 +301,9 @@ bool storage_run::lists_bucket(const std::shared_ptr<conn>& c, const bucket_info
 bool storage_run::app_allowed(const std::shared_ptr<conn>& c, std::string_view method, std::string_view bucket,
                               std::string_view key, std::string_view query)
 {
+    // Nothing to judge leaves the verdict at its allowed default, decided before any copy.
+    if (!needs_judging(c->anonymous ? nullptr : c->user.get()))
+        return true;
     s3_request& r = c->req;
     // The request is judged as the S3 operation it stands for, and put back as it was.
     const std::string_view old_method = r.method;

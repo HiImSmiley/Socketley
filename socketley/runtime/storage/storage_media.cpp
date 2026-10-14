@@ -1622,8 +1622,9 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
                (j.want.kind == k_web) == (w.kind == k_web) &&
                (j.want.kind == k_copy || j.want.kind == k_rendition) == stream;
     });
-    const int thumb_jobs_max = std::max<int>(thumb_jobs_min, static_cast<int>(std::thread::hardware_concurrency() /
-                                                                           std::max(1u, m_store.shards())));
+    // The core count read once, since asking it opens a sysfs file and every waiting thumbnail asks fifty times a second.
+    static const unsigned cores = std::thread::hardware_concurrency();
+    const int thumb_jobs_max = std::max<int>(thumb_jobs_min, static_cast<int>(cores / std::max(1u, m_store.shards())));
     // A web copy, which takes every core it is given for as long as the film is, is made one at a time a shard.
     if (same_kind >= (stream ? streams_max() : w.kind == k_trick || w.kind == k_web ? 1 : thumb_jobs_max))
     {

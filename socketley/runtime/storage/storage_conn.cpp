@@ -1472,7 +1472,13 @@ void storage_run::queue_write(const std::shared_ptr<conn>& c, std::string data)
         h3_stream_out(c, std::move(data));
         return;
     }
-    if (c->ssl)
+    // A drained queue takes the piece itself, so a file body reaches SSL_write without a copy.
+    if (c->ssl && c->wq_off >= c->wq.size())
+    {
+        c->wq     = std::move(data);
+        c->wq_off = 0;
+    }
+    else if (c->ssl)
         c->wq += data;
     else if (c->wbuf.empty() && c->wq.empty())
         c->wbuf = std::move(data);
@@ -2683,17 +2689,11 @@ void storage_run::stream_read_done(const std::shared_ptr<conn>& c, int64_t res)
     c->file_off  += static_cast<uint64_t>(res);
     c->file_left -= static_cast<uint64_t>(res);
     c->after_write = conn::after_kind::pump;
-    // A stream keeps what it is handed until it is sent (HTTP/2) or acknowledged (HTTP/3), so it is given the buffer
-    // itself, and the next read gets a new one, rather than a copy of it.
-    if (c->stream())
-    {
-        std::string piece;
-        piece.swap(c->sbuf);
-        piece.resize(static_cast<size_t>(res));
-        queue_write(c, std::move(piece));
-        return;
-    }
-    queue_write(c, std::string(c->sbuf.data(), static_cast<size_t>(res)));
+    // The buffer itself goes, and the next read sizes a new one, which costs the allocation a copy did and not the copy.
+    std::string piece;
+    piece.swap(c->sbuf);
+    piece.resize(static_cast<size_t>(res));
+    queue_write(c, std::move(piece));
 }
 
 void storage_run::splice_in_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe)

@@ -16,6 +16,12 @@ constexpr uint64_t remote_window_bytes = 512u << 10;
 // A window this small is opened where it lands, since the hop to a thread costs more.
 constexpr size_t open_inline_max = 64 * 1024;
 
+// Sized without zeroing, since the read, or the open of every chunk it read, writes each byte a window hands out.
+void sized_for_overwrite(std::string& b, size_t n)
+{
+    b.resize_and_overwrite(n, [](char*, size_t len) { return len; });
+}
+
 // Whether a window that has reached plaintext `end` takes chunk `c` too: one holding bytes before it, or an
 // empty last chunk right at it, which is what proves a stream read to its end was not cut short.
 bool takes(const sse_layout::chunk& c, uint64_t end, uint64_t plain, uint64_t budget)
@@ -266,8 +272,8 @@ void body_reader::fetch()
             s.chunk_count = last - first;
             if (!s.cipher)
                 s.cipher = std::make_shared<std::string>();
-            s.cipher->resize(static_cast<size_t>(want));
-            s.plain->resize(static_cast<size_t>(plain));
+            sized_for_overwrite(*s.cipher, static_cast<size_t>(want));
+            sized_for_overwrite(*s.plain, static_cast<size_t>(plain));
             m_pos = std::min(first * lz4_chunk + plain, m_end);
         }
         else if (!m_key)
@@ -276,7 +282,7 @@ void body_reader::fetch()
             off  = m_data_off + m_pos;
             s.skip = 0;
             s.len  = static_cast<size_t>(want);
-            s.plain->resize(s.len);
+            sized_for_overwrite(*s.plain, s.len);
             m_pos += want;
         }
         else
@@ -299,8 +305,8 @@ void body_reader::fetch()
             s.len  = static_cast<size_t>(std::min(at, m_end) - m_pos);
             if (!s.cipher)
                 s.cipher = std::make_shared<std::string>();
-            s.cipher->resize(static_cast<size_t>(stored));
-            s.plain->resize(static_cast<size_t>(plain));
+            sized_for_overwrite(*s.cipher, static_cast<size_t>(stored));
+            sized_for_overwrite(*s.plain, static_cast<size_t>(plain));
             m_pos = std::min(at, m_end);
         }
         s.state = slot_state::busy;

@@ -2512,10 +2512,11 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
     {
         ++m_c.hot_gets;
         // A GET that asks for nothing but the object gets the headers kept with the copy, which do not follow the
-        // bucket's lifecycle rules, unless the object's own grants are still to admit it.
-        if (!c->acl_need && q.query.empty() && q.header("range").empty() && q.header("x-amz-checksum-mode").empty() &&
+        // bucket's lifecycle rules, once the object's own grants, if they decide, admit it; a refusal is answer()'s.
+        if (q.query.empty() && q.header("range").empty() && q.header("x-amz-checksum-mode").empty() &&
             !m_store.lifecycle(q.bucket) && (!q.website || (!c->website_status && website_target(*hot.meta).empty())) &&
-            !q.has_header("x-amz-server-side-encryption-customer-algorithm") && evaluate(q, *hot.meta) == cond::proceed)
+            !q.has_header("x-amz-server-side-encryption-customer-algorithm") &&
+            (!c->acl_need || acl_admits(c, *hot.meta)) && evaluate(q, *hot.meta) == cond::proceed)
         {
             if (hot.head->empty())
             {

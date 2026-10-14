@@ -944,6 +944,9 @@ void http_peer::close_socket()
 {
     if (m_ssl)
     {
+        // Kept, from a finished handshake only, so the next dial past keep_idle_secs resumes rather than starting over.
+        if (m_tls)
+            m_tls->remember_session(m_target.host, m_ssl);
         tls_context::free_ssl(m_ssl);
         m_ssl = nullptr;
     }
