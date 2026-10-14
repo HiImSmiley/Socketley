@@ -139,10 +139,13 @@ check("what they take on disk is a fraction of their bytes",
 # compressed, not when the file in THIS bucket has been replaced.  So the two
 # facts drift apart under load -- measured on a loaded box, before and after
 # equal to the byte with five versions already counted, and green on its own.
-target = before - (len(big) + len(mid)) // 2
+# From the bytes put and not from a reading after them, which a compaction already done reads as the start:
+# measured, before and after equal to the byte when it ran ahead of the reading.
+raw = len(big) + len(mid) + len(warm) + len(noise) + len(small) + 2 * len(part)
+target = raw - (len(big) + len(mid)) // 2 + (64 << 10)
 shrank = wait_for(lambda: disk_bytes("logs") < target)
 after = disk_bytes("logs")
-check("and the bucket's files shrank by it", shrank, (before, after, logical, target))
+check("and the bucket's files shrank by it", shrank, (before, after, raw, target))
 
 check("a compressed object reads back whole", get("logs", "big") == big)
 check("so does one read whole with its header, and again from memory",
