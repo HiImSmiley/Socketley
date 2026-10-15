@@ -7,6 +7,8 @@
 #include <string_view>
 #include <unordered_map>
 
+#include "../../shared/transparent_string.h"
+
 namespace socketley::storage
 {
 struct jwks_keys;
@@ -58,7 +60,7 @@ private:
         int64_t expires{0};
     };
     // Sessions already verified, so a signature is checked once a session and not once a request.
-    std::unordered_map<std::string, cached> m_seen;
+    std::unordered_map<std::string, cached, string_hash, string_equal> m_seen;
 };
 
 }   // namespace socketley::idp

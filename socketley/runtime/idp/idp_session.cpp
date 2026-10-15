@@ -95,7 +95,7 @@ bool session_verifier::check(std::string_view cookies, who& out)
             part.remove_prefix(1);
         if (!part.starts_with("skl_idp="))
             continue;
-        const std::string token(part.substr(8));
+        const std::string_view token = part.substr(8);
         if (const auto it = m_seen.find(token); it != m_seen.end())
         {
             if (it->second.expires > now)
@@ -119,7 +119,7 @@ bool session_verifier::check(std::string_view cookies, who& out)
             who w{c["sub"], c["preferred_username"], c["email"], c["admin"] == "true"};
             if (m_seen.size() >= 4096)
                 m_seen.clear();
-            m_seen[token] = {w, exp};
+            m_seen.insert_or_assign(std::string(token), cached{w, exp});
             out = std::move(w);
             return true;
         }
