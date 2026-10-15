@@ -75,11 +75,14 @@ daemon_watch() {
 daemon_start() {
     local bin=$1; shift
     SOCKETLEY_DBIN=$bin
+    # A second start in one test appends to the log, whose first "daemon started" is not this one's.
+    local from
+    from=$(( $( { wc -l < "$SOCKETLEY_DLOG"; } 2>/dev/null || echo 0) + 1 ))
     "$bin" daemon "$@" >>"$SOCKETLEY_DLOG" 2>&1 &
     SOCKETLEY_DPID=$!
     local i
     for i in $(seq 1 100); do
-        grep -q "daemon started" "$SOCKETLEY_DLOG" 2>/dev/null && break
+        tail -n +"$from" "$SOCKETLEY_DLOG" 2>/dev/null | grep -q "daemon started" && break
         sleep 0.1
     done
     if [ ! -S "$SOCKETLEY_SOCKET" ] || ! kill -0 "$SOCKETLEY_DPID" 2>/dev/null; then
