@@ -512,11 +512,12 @@ void idp_run::tick()
     for (auto& c : idle)
         close_conn(c);
     std::erase_if(m_codes, [now](const auto& kv) { return kv.second.expires <= now; });
-    std::erase_if(m_misses, [now](auto& kv)
+    // A loop rather than erase_if, whose predicate GCC 12's library hands each entry as const.
+    for (auto it = m_misses.begin(); it != m_misses.end();)
     {
-        std::erase_if(kv.second.at, [now](int64_t t) { return now - t > miss_window; });
-        return kv.second.at.empty();
-    });
+        std::erase_if(it->second.at, [now](int64_t t) { return now - t > miss_window; });
+        it = it->second.at.empty() ? m_misses.erase(it) : std::next(it);
+    }
     if (!m_conns.empty() || !m_codes.empty() || !m_misses.empty())
         arm_tick();
 }
@@ -842,8 +843,11 @@ std::string idp_run::profile_claims(const account& who) const
         const size_t comma = g.find(',');
         std::string_view one = http_trim_ows(g.substr(0, comma));
         g = comma == std::string_view::npos ? std::string_view{} : g.substr(comma + 1);
-        if (!one.empty())
-            groups += (groups.empty() ? "" : ",") + json_string(one);
+        if (one.empty())
+            continue;
+        if (!groups.empty())
+            groups += ',';
+        groups += json_string(one);
     }
     if (!groups.empty())
         out += ",\"groups\":[" + groups + "]";
