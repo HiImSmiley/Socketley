@@ -7,6 +7,7 @@
 #include "coarse_clock.h"
 #include "lua_suspend.h"
 #include "lua_storage_api.h"
+#include "lua_db_api.h"
 
 // Outside the SOCKETLEY_NO_LUA guard: the no-Lua SDK compiles this file too,
 // and the callers that read a load failure back are not conditional on Lua.
@@ -968,6 +969,8 @@ void lua_context::cancel_timers()
     // And the storage calls it was owed answers to, for the same reason.
     if (m_storage_client)
         m_storage_client->cancel();
+    if (m_db_client)
+        m_db_client->cancel();
 }
 
 void lua_context::update_self_state(const char* state_str)
@@ -3003,6 +3006,9 @@ void lua_context::register_bindings(runtime_instance* owner)
     if (!m_storage_client)
         m_storage_client = std::make_unique<lua_storage_client>(*this, *owner);
     m_storage_client->install(m_lua, sk);
+    if (!m_db_client)
+        m_db_client = std::make_unique<lua_db_client>(*this, *owner);
+    m_db_client->install(m_lua, sk);
 
     // Last and over the top of the bindings above, so the two builds differ in
     // one place and the list of what is refused is readable in one place.
@@ -3039,6 +3045,7 @@ void lua_context::register_bindings(runtime_instance* owner)
         case runtime_dns:
         case runtime_sync:
         case runtime_idp:
+        case runtime_db:
             // No verbs of their own yet.
             break;
     }

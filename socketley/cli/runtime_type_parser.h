@@ -34,6 +34,9 @@ inline bool parse_runtime_type(std::string_view str, runtime_type& out)
         case fnv1a("idp"):
             out = runtime_idp;
             return true;
+        case fnv1a("db"):
+            out = runtime_db;
+            return true;
         default:
             return type_registry::lookup(str, out);
     }

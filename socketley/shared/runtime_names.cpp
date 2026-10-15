@@ -71,6 +71,7 @@ bool speaks_http(const runtime_instance& rt)
         case runtime_server:
         case runtime_storage:
         case runtime_idp:
+        case runtime_db:
             return true;
         case runtime_proxy:
             return static_cast<const proxy_instance&>(rt).get_protocol() == protocol_http && !is_entrance(rt);

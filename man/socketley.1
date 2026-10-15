@@ -502,7 +502,7 @@ socketley daemon --name new-name   # rename while cluster is active
 .BI "create " "type name " "[flags]"
 Create a new runtime instance.
 .I type
-can be: server, client, proxy, cache, storage, dns, sync, idp, or any registered type \(em see
+can be: server, client, proxy, cache, storage, dns, sync, idp, db, or any registered type \(em see
 .BR "REGISTERED TYPES" .
 .I name
 is a unique identifier for the runtime.
@@ -1321,7 +1321,7 @@ name	Runtime name \fB(requires restart)\fR
 id	6-char hex identifier (read-only, ignored on import)
 type	T{
 .ad l
-Runtime type: server, client, proxy, cache, storage, dns, sync, idp (read-only, ignored on import)
+Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db (read-only, ignored on import)
 T}
 was_running	Internal daemon state (ignored on import)
 .TE
@@ -1514,6 +1514,18 @@ fsync_interval	number	T{
 .ad l
 Seconds between the filesystem syncs of \fB\-\-fsync interval\fR, as \fB\-\-fsync\-interval\fR \fB(requires restart)\fR
 T}
+.TE
+.PP
+.B Db fields:
+.TS
+l l lw(42).
+Field	Type	Description
+_
+schema	string	The collections file, as \fB\-\-schema\fR; read again when it changes
+keys	string	The service keys file, as \fB\-\-keys\fR; read again when it changes
+idp	string	The idp runtime whose accounts own documents, as \fB\-\-idp\fR \fB(requires restart)\fR
+origins	string	The web origins it answers, as \fB\-\-origins\fR \fB(requires restart)\fR
+max_bytes	number	The most bytes the documents hold, as \fB\-\-max\-bytes\fR (0 = none) \fB(requires restart)\fR
 .TE
 .PP
 .B Cache fields:
@@ -11689,6 +11701,157 @@ until the oldest of those failures is fifteen minutes old, counted by the last
 address
 .B X\-Forwarded\-For
 names when the request came through a proxy on this machine.
+.SH DB FLAGS
+A
+.B db
+runtime keeps JSON documents for applications \(em a game's characters, a
+shop's orders and addresses, a user's settings \(em each owned by an account
+of an
+.B idp
+runtime, which reaches its own and no other's. Large things, a picture or a
+model, belong in a storage and their address here.
+.PP
+.nf
+socketley create db data \-p 9500 \-\-domain data \-\-idp auth \e
+    \-\-schema /etc/socketley/db.schema \-\-keys /etc/socketley/db.keys \-s
+.fi
+.PP
+A document lives at
+.BI /c/ collection / id
+and is read with
+.BR GET ,
+replaced with
+.BR PUT ,
+changed in place with
+.B PATCH
+and removed with
+.BR DELETE ;
+a
+.B POST
+to
+.BI /c/ collection
+makes one under a new id. It is answered with its fields and
+.BR _id ,
+.B _v
+(its version, 1 when made and one more with each change, also its
+.BR ETag )
+and
+.B _owner
+(the account's id).
+.B "If-Match: \(dq3\(dq"
+writes only at that version and
+.B "If-None-Match: *"
+only where there is none: 412 otherwise. A patch is
+.B {"set":{"a.b":1},"unset":["c"],"inc":{"n":1},"push":{"tags":"x"},"pull":{"tags":"y"}}
+on dotted paths.
+.BI POST " /c/" collection /_query
+takes
+.B {"where":{"level":{"gte":5},"name":"x"},"sort":"\-level","limit":50,"skip":0}
+with the conditions eq, ne, gt, gte, lt, lte, in, prefix and exists, or
+.B "count":true
+for the number alone; it answers
+.B {"docs":[...]}
+and
+.B next
+when there are more. A range compares a field's values of one kind only, as an
+index orders them: null, false, true, numbers, strings.
+.B POST /tx
+takes
+.B {"ops":[{"op":"put","c":..,"id":..,"doc":{..}},{"op":"patch",..,"changes":{..},"if":3},{"op":"insert",..},{"op":"delete",..}]}
+and makes every change or none.
+.B GET /me
+names who is asking.
+.PP
+Who asks is a key, sent as
+.BI "Authorization: Bearer " secret\fR,
+which reaches everything; an account of the
+.B \-\-idp
+runtime, by its sign-in cookie or by an access token the provider gave one of
+its clients, sent as
+.BR "Authorization: Bearer" ;
+or nobody. A write by the cookie must be
+.B application/json
+from the database's own host or an origin of
+.BR \-\-origins ,
+which a form another site posts cannot be. A document over 1 MiB, or nested
+deeper than 16, is refused.
+.PP
+A write is answered once its journal record is synced to the disk. One sync
+runs at a time, off the event loop, and takes every write made while the one
+before it ran, so a burst of writes costs a few syncs rather than one each and
+reads go on being answered meanwhile \(em a read on another connection may see
+a change a moment before it is on the disk. A read behind a write on one
+connection is answered after it. The journal is folded into a snapshot under the state
+directory that names its format, which a build older than it refuses rather
+than rewrites. The documents are held in memory; a script of this daemon
+reaches them as
+.BR socketley.db .
+It serves plain HTTP behind the entrance;
+.B \-\-shards
+is refused, since the documents are one journal in one process.
+.TP
+.BI "\-\-schema " file
+The collections, a line each: a name, who reaches it, and the fields indexed,
+.B unique:
+before one whose values no two documents share.
+.RS
+.nf
+# collection  access   indexes
+characters    owner    level unique:name
+posts         shared   created
+scores        public   score
+products      catalog  unique:sku price
+.fi
+.RE
+.IP
+.B private
+(and any collection the file does not name): a key only.
+.B owner
+: an account reads and writes its own documents; another's is answered as not
+there.
+.B shared
+: an account reads every document and writes its own.
+.B public
+: anybody reads; an account writes its own.
+.B catalog
+: anybody reads; a key writes. The file is read again when it changes; one that
+does not read, or a unique index the documents already break, keeps the schema
+before it and says why in
+.BR stats .
+.TP
+.BI "\-\-keys " file
+Service keys for backends, a line each:
+.IR "name secret" ,
+the secret at least 16 characters. Read again when it changes. A key may set a
+document's
+.BR _owner .
+.TP
+.BI "\-\-idp " runtime
+The idp runtime whose accounts own documents.
+.TP
+.BI "\-\-origins " list
+The web origins a browser may call it from, comma-separated, answered with
+CORS and the browser's sign-in;
+.B *
+for any page, without it.
+.TP
+.BI "\-\-max\-bytes " size
+The most the documents hold; a write past it is refused with 507.
+.PP
+In a script:
+.nf
+local c, err = socketley.db.get("data", "characters", id)
+socketley.db.put("data", "characters", id, { name = "Merlin", level = 3 }, { ["if"] = c._v })
+socketley.db.patch("data", "characters", id, { inc = { level = 1 } })
+local r = socketley.db.query("data", "scores", { sort = "\-score", limit = 10 })
+socketley.db.insert("data", "orders", { item = "sword" })
+socketley.db.delete("data", "orders", id)
+socketley.db.tx("data", { { op = "put", c = "a", id = "x", doc = {} }, { op = "delete", c = "b", id = "y" } })
+.fi
+.PP
+Each answers the document (or the transaction's results), or nil, an error
+code and a sentence. Inside a callback that can wait it waits; anywhere else
+the last argument is a function called with the answer.
 .SH REGISTERED TYPES
 A runtime type beyond the built-in seven is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never

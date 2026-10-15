@@ -52,6 +52,7 @@ bool builtin_lookup(std::string_view name, runtime_type& out)
     if (name == "dns")     { out = runtime_dns;     return true; }
     if (name == "sync")    { out = runtime_sync;    return true; }
     if (name == "idp")     { out = runtime_idp;     return true; }
+    if (name == "db")      { out = runtime_db;      return true; }
     return false;
 }
 
@@ -180,6 +181,7 @@ const char* type_to_string(runtime_type t)
         case runtime_dns:     return "dns";
         case runtime_sync:    return "sync";
         case runtime_idp:     return "idp";
+        case runtime_db:      return "db";
         default: break;
     }
 

@@ -21,6 +21,7 @@
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
 #include "../runtime/idp/idp_instance.h"
+#include "../runtime/db/db_instance.h"
 #include "../runtime/idp/idp_logic.h"
 #include "../shared/ip_block.h"
 #include "../shared/dns_feed.h"
@@ -1674,6 +1675,64 @@ int parse_idp_flags(idp_instance* ip, const parsed_args& pa, size_t& i, std::str
                 return 1;
             }
             ip->set_cookie_domain(pa.args[++i]);
+            return 0;
+        }
+        default:
+            return -1;
+    }
+}
+
+int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::string_view /*name*/)
+{
+    const std::string_view next = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+    switch (pa.hashes[i])
+    {
+        // The collections, their access and their indexes, a line each.
+        case fnv1a("--schema"):
+            if (next.empty() || next.front() != '/')
+            {
+                std::cout << "--schema requires the absolute path of a file with one collection a line: "
+                             "name access index...\n";
+                return 1;
+            }
+            db->set_schema_path(pa.args[++i]);
+            return 0;
+        // The service keys, `name secret` a line.
+        case fnv1a("--keys"):
+            if (next.empty() || next.front() != '/')
+            {
+                std::cout << "--keys requires the absolute path of a file with one key a line: name secret\n";
+                return 1;
+            }
+            db->set_keys_path(pa.args[++i]);
+            return 0;
+        // The idp runtime whose accounts own documents.
+        case fnv1a("--idp"):
+            if (next.empty() || next.find_first_of("/ ") != std::string_view::npos)
+            {
+                std::cout << "--idp requires the name of an idp runtime of this daemon\n";
+                return 1;
+            }
+            db->set_idp(pa.args[++i]);
+            return 0;
+        // The web origins a browser may call it from.
+        case fnv1a("--origins"):
+            if (next.empty() || next.find_first_of(" ;") != std::string_view::npos)
+            {
+                std::cout << "--origins requires origins such as https://app.example.com, comma-separated, or *\n";
+                return 1;
+            }
+            db->set_origins(pa.args[++i]);
+            return 0;
+        case fnv1a("--max-bytes"):
+        {
+            size_t bytes = 0;
+            if (next.empty() || !parse_size_suffix(pa.args[++i], bytes))
+            {
+                std::cout << "--max-bytes requires a size such as 2G\n";
+                return 1;
+            }
+            db->set_max_bytes(bytes);
             return 0;
         }
         default:

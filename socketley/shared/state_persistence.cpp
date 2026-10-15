@@ -12,6 +12,7 @@
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
 #include "../runtime/idp/idp_instance.h"
+#include "../runtime/db/db_instance.h"
 #include "../cli/command_hashing.h"
 #include "type_registry.h"
 
@@ -767,6 +768,16 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.idp_cookie_domain = std::string(ip->get_cookie_domain());
             break;
         }
+        case runtime_db:
+        {
+            auto* db = static_cast<const db_instance*>(instance);
+            cfg.db_schema = std::string(db->get_schema_path());
+            cfg.db_keys = std::string(db->get_keys_path());
+            cfg.db_idp = std::string(db->get_idp());
+            cfg.db_origins = std::string(db->get_origins());
+            cfg.db_max_bytes = db->get_max_bytes();
+            break;
+        }
         case runtime_storage:
         {
             auto* stg = static_cast<const storage_instance*>(instance);
@@ -1139,6 +1150,18 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             if (!cfg.idp_cookie_domain.empty())
                 append_str_field("cookie_domain", cfg.idp_cookie_domain);
             break;
+        case runtime_db:
+            if (!cfg.db_schema.empty())
+                append_str_field("schema", cfg.db_schema);
+            if (!cfg.db_keys.empty())
+                append_str_field("keys", cfg.db_keys);
+            if (!cfg.db_idp.empty())
+                append_str_field("idp", cfg.db_idp);
+            if (!cfg.db_origins.empty())
+                append_str_field("origins", cfg.db_origins);
+            if (cfg.db_max_bytes > 0)
+                append_int_field("max_bytes", cfg.db_max_bytes);
+            break;
     }
 
     // A registered type's fields as one nested object, absent when there are
@@ -1352,6 +1375,13 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.idp_clients = json_get_string(json, "clients");
             cfg.idp_issuer = json_get_string(json, "issuer");
             cfg.idp_cookie_domain = json_get_string(json, "cookie_domain");
+            break;
+        case runtime_db:
+            cfg.db_schema = json_get_string(json, "schema");
+            cfg.db_keys = json_get_string(json, "keys");
+            cfg.db_idp = json_get_string(json, "idp");
+            cfg.db_origins = json_get_string(json, "origins");
+            cfg.db_max_bytes = json_get_size(json, "max_bytes");
             break;
     }
 

@@ -18,6 +18,7 @@
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
 #include "../runtime/idp/idp_instance.h"
+#include "../runtime/db/db_instance.h"
 #include "../runtime/idp/idp_run.h"
 #include "../shared/storage_rpc.h"
 #include "../shared/dns_feed.h"
@@ -1547,6 +1548,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                     break;
                 case runtime_idp:
                     result = parse_idp_flags(static_cast<idp_instance*>(instance), pa, i, name);
+                    break;
+                case runtime_db:
+                    result = parse_db_flags(static_cast<db_instance*>(instance), pa, i, name);
                     break;
                 default:
                     // A registered type's flags come from its manifest schema.
@@ -3985,8 +3989,9 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                 case runtime_dns:
                 case runtime_sync:
                 case runtime_idp:
-                    // A storage, DNS, sync or idp runtime's own settings are
-                    // applied by `import`, as a cache's are.
+                case runtime_db:
+                    // A storage, DNS, sync, idp or db runtime's own settings
+                    // are applied by `import`, as a cache's are.
                     result = -1;
                     break;
                 default:
@@ -4035,6 +4040,21 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                              "    socketley show " << name
                           << " > cfg.json   # edit the field, then\n"
                              "    socketley import " << name << " < cfg.json\n";
+                return 1;
+            }
+
+            const uint32_t h = pa.hashes[i];
+            if ((type == runtime_idp &&
+                 (h == fnv1a("--clients") || h == fnv1a("--issuer") || h == fnv1a("--cookie-domain"))) ||
+                (type == runtime_db && (h == fnv1a("--schema") || h == fnv1a("--keys") || h == fnv1a("--idp") ||
+                                        h == fnv1a("--origins") || h == fnv1a("--max-bytes"))))
+            {
+                restore_edit();
+                std::cout << pa.args[i] << " cannot be changed with `edit`\n"
+                          << (type == runtime_idp ? "  An idp" : "  A db") << " runtime's own settings are applied by `import`:\n"
+                             "    socketley show " << name
+                          << " > cfg.json   # edit the field, then\n"
+                             "    socketley import " << name << " --restart < cfg.json\n";
                 return 1;
             }
 
@@ -4979,6 +4999,11 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
         case runtime_idp:
         {
             apply_idp_config(*static_cast<idp_instance*>(instance), cfg, /*by_presence=*/true);
+            break;
+        }
+        case runtime_db:
+        {
+            apply_db_config(*static_cast<db_instance*>(instance), cfg, /*by_presence=*/true);
             break;
         }
         default:
@@ -6313,9 +6338,10 @@ bool daemon_handler::serve_map_request(const std::string& op,
         // The runtime this builds runs in the daemon as it always has,
         // deliberately, because making the same three lines of Lua build a
         // different thing depending on which process ran them is the property
-        // this work exists to remove. A sync and an idp are the exceptions:
-        // their work is done on a worker's own loop, which only a worker turns.
-        if (cfg.type == runtime_sync || cfg.type == runtime_idp)
+        // this work exists to remove. A sync, an idp and a db are the
+        // exceptions: their work is done on a worker's own loop, which only a
+        // worker turns.
+        if (cfg.type == runtime_sync || cfg.type == runtime_idp || cfg.type == runtime_db)
             inst->mark_out_of_process();
         inst->set_lua_created(true);
         inst->set_child_policy(

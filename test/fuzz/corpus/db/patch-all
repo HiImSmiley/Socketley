@@ -1,0 +1,1 @@
+{"set":{"o.p.r":[1,{"a":2}]},"inc":{"n":2,"f":0.5},"push":{"list":"b"},"pull":{"list":1},"unset":["o.p.q"]}

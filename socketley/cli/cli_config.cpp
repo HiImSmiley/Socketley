@@ -153,6 +153,10 @@ constexpr config_key config_keys[] = {
     { "issuer",             "--issuer",             key_kind::text    },
     { "cookie_domain",      "--cookie-domain",      key_kind::text    },
     { "idp",                "--idp",                key_kind::text    },
+    // ── db ──────────────────────────────────────────────────────────────────
+    { "schema",             "--schema",             key_kind::text    },
+    { "keys",               "--keys",               key_kind::text    },
+    { "origins",            "--origins",            key_kind::text    },
 };
 
 // Keys with no flag of their own, listed so an unknown key can still be

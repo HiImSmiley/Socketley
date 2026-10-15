@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A `db` runtime: JSON documents for applications, owned by the accounts
+  of an `idp` runtime.** Collections of documents at `/c/<collection>/<id>`,
+  read with GET, replaced with PUT, changed in place with PATCH (`set`,
+  `unset`, `inc`, `push`, `pull` on dotted paths) and removed with DELETE;
+  each carries its version (`_v`, its ETag), which `If-Match` and
+  `If-None-Match: *` hold a write to. Queries (`POST .../_query`) take
+  conditions, a sort, a limit and a skip, and use the indexes the `--schema`
+  file declares, `unique:` ones refusing a second document of a value; `POST
+  /tx` makes many changes or none. The schema says per collection who
+  reaches it: `private` (a key), `owner` (an account its own documents),
+  `shared`, `public` and `catalog`. Who asks is a key from `--keys`, or an
+  account of `--idp` by its sign-in cookie or an access token the provider
+  gave one of its clients; a cookie write from another site's page is
+  refused, and `--origins` names the pages a browser may call it from with
+  CORS. Every write of a turn is answered after one sync of its journal, a
+  versioned snapshot folds it, and a script reaches the documents as
+  `socketley.db`. The idp's session verifier takes access tokens as
+  `Authorization: Bearer` for it.
 - **An `idp` runtime: one sign-in, for applications, proxies, storages and
   the dashboard.** An OpenID Connect provider with its own accounts: each a
   fixed random id that every token names it by, and fields with no schema --

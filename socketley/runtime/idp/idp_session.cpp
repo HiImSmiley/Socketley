@@ -78,6 +78,40 @@ void session_verifier::reload()
     m_keys = std::move(keys);
 }
 
+bool session_verifier::verified(std::string_view token, bool bearer, int64_t now, who& out)
+{
+    if (const auto it = m_seen.find(token); it != m_seen.end())
+    {
+        if (it->second.bearer != bearer)
+            return false;
+        if (it->second.expires > now)
+        {
+            out = it->second.w;
+            return true;
+        }
+        m_seen.erase(it);
+        return false;
+    }
+    for (const auto& k : m_keys->keys)
+    {
+        claims c;
+        std::string why;
+        if (!verify_token(k.key.get(), k.kid, bearer ? "at+jwt" : "session+jwt", m_issuer, token, now, c, why) ||
+            (!bearer && c["aud"] != "session") || c["sub"].empty())
+            continue;
+        int64_t exp = 0;
+        const std::string& e = c["exp"];
+        std::from_chars(e.data(), e.data() + e.size(), exp);
+        who w{c["sub"], c["preferred_username"], c["email"], c["admin"] == "true"};
+        if (m_seen.size() >= 4096)
+            m_seen.clear();
+        m_seen.insert_or_assign(std::string(token), cached{w, exp, bearer});
+        out = std::move(w);
+        return true;
+    }
+    return false;
+}
+
 bool session_verifier::check(std::string_view cookies, who& out)
 {
     if (!enabled())
@@ -93,38 +127,18 @@ bool session_verifier::check(std::string_view cookies, who& out)
         cookies = semi == std::string_view::npos ? std::string_view{} : cookies.substr(semi + 1);
         while (!part.empty() && part.front() == ' ')
             part.remove_prefix(1);
-        if (!part.starts_with("skl_idp="))
-            continue;
-        const std::string_view token = part.substr(8);
-        if (const auto it = m_seen.find(token); it != m_seen.end())
-        {
-            if (it->second.expires > now)
-            {
-                out = it->second.w;
-                return true;
-            }
-            m_seen.erase(it);
-            continue;
-        }
-        for (const auto& k : m_keys->keys)
-        {
-            claims c;
-            std::string why;
-            if (!verify_token(k.key.get(), k.kid, "session+jwt", m_issuer, token, now, c, why) ||
-                c["aud"] != "session" || c["sub"].empty())
-                continue;
-            int64_t exp = 0;
-            const std::string& e = c["exp"];
-            std::from_chars(e.data(), e.data() + e.size(), exp);
-            who w{c["sub"], c["preferred_username"], c["email"], c["admin"] == "true"};
-            if (m_seen.size() >= 4096)
-                m_seen.clear();
-            m_seen.insert_or_assign(std::string(token), cached{w, exp});
-            out = std::move(w);
+        if (part.starts_with("skl_idp=") && verified(part.substr(8), false, now, out))
             return true;
-        }
     }
     return false;
+}
+
+bool session_verifier::check_bearer(std::string_view token, who& out)
+{
+    if (!enabled())
+        return false;
+    reload();
+    return m_keys && !token.empty() && verified(token, true, now_sec(), out);
 }
 
 std::string session_verifier::login_url(std::string_view return_to)

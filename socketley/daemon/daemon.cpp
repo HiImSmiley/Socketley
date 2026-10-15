@@ -22,6 +22,7 @@
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
 #include "../runtime/idp/idp_instance.h"
+#include "../runtime/db/db_instance.h"
 #include "../cli/command_hashing.h"
 #include "../runtime/worker/worker_main.h"
 
@@ -529,6 +530,11 @@ static void restore_runtimes(state_persistence& persistence,
             case runtime_idp:
             {
                 apply_idp_config(*static_cast<idp_instance*>(instance), cfg);
+                break;
+            }
+            case runtime_db:
+            {
+                apply_db_config(*static_cast<db_instance*>(instance), cfg);
                 break;
             }
         }

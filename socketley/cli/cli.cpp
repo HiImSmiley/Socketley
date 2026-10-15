@@ -701,7 +701,7 @@ std::string cli_caller_path(std::string_view flag, std::string_view value)
 {
     static constexpr std::string_view path_flags[] = {
         "--lua", "--log", "-w", "--persistent", "--http", "--dir", "--credentials", "--sse-key-file",
-        "--cert", "--key", "--ca", "--client-ca", "--client-cert", "--client-key", "--zone",
+        "--cert", "--key", "--ca", "--client-ca", "--client-cert", "--client-key", "--zone", "--schema", "--keys",
     };
     // A list of zone files, each made absolute in its place.
     if (flag == "--zone" && value.find(',') != std::string_view::npos)

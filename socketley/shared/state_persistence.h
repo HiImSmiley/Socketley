@@ -211,6 +211,13 @@ struct runtime_config
     std::string idp_issuer;
     std::string idp_cookie_domain;
 
+    // Db
+    std::string db_schema;
+    std::string db_keys;
+    std::string db_idp;
+    std::string db_origins;
+    uint64_t db_max_bytes = 0;
+
     // A registered type's own fields in declaration order, opaque here, held
     // as strings because the schema that gives them kinds lives in a manifest.
     std::vector<std::pair<std::string, std::string>> extra;

@@ -63,6 +63,7 @@ class runtime_instance;
 // that starts a callback includes shared/lua_suspend.h itself.
 class lua_suspender;
 class lua_storage_client;
+class lua_db_client;
 
 // How long one Lua callback may hold the event-loop thread, enforced by a
 // count hook that fires every N VM instructions and tests wall-clock time --
@@ -444,6 +445,8 @@ private:
     // What socketley.storage waits on, made when the bindings are and freed with
     // this context, which is after cancel_timers() has let go of its requests.
     std::unique_ptr<lua_storage_client> m_storage_client;
+    // And what socketley.db waits on, alike.
+    std::unique_ptr<lua_db_client> m_db_client;
 
     // The `filters` chain as a vector because order is the whole point,
     // collected once at load time, and protected because a filter is where

@@ -792,6 +792,23 @@ runtime_types() {
     echo -e "${CYAN}└─────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
 
+    echo -e "${CYAN}┌─────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC} ${BOLD}DB${NC}                                                            ${CYAN}│${NC}"
+    echo -e "${CYAN}├─────────────────────────────────────────────────────────────────┤${NC}"
+    echo -e "${CYAN}│${NC} JSON documents for apps: characters, orders, settings, each    ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   owned by an idp account, which reaches its own alone.        ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} /c/<collection>/<id>: GET, PUT, PATCH (set/inc/push...),        ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   DELETE; POST .../_query; POST /tx for all-or-nothing.        ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Flags: --schema file (name access indexes... a line),          ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}        --keys file (name secret), --idp auth,                  ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}        --origins https://app.example.com, --max-bytes 2G       ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Access: private, owner, shared, public, catalog.               ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Scripts: socketley.db.get/put/patch/query(\"data\", ...)         ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Example: socketley create db data -p 9500 --idp auth \\         ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   --schema /etc/socketley/db.schema --keys /etc/socketley/k -s ${CYAN}│${NC}"
+    echo -e "${CYAN}└─────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+
     read -p "Press Enter to continue..." || true
     main_menu
 }

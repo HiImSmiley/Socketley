@@ -40,6 +40,8 @@ public:
 
     // The signed-in account a request's Cookie fields name, false when none does.
     bool check(std::string_view cookies, who& out);
+    // The account an access token the provider gave any of its clients names, for an `Authorization: Bearer`.
+    bool check_bearer(std::string_view token, who& out);
 
     // Where a browser signs in and is sent back to `return_to` from, empty while the provider's key is not known.
     std::string login_url(std::string_view return_to);
@@ -58,7 +60,10 @@ private:
     {
         who w;
         int64_t expires{0};
+        // An access token's, which is never taken as a session, nor a session's as one.
+        bool bearer{false};
     };
+    bool verified(std::string_view token, bool bearer, int64_t now, who& out);
     // Sessions already verified, so a signature is checked once a session and not once a request.
     std::unordered_map<std::string, cached, string_hash, string_equal> m_seen;
 };

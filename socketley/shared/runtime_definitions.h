@@ -20,7 +20,8 @@ enum runtime_type : uint8_t
     runtime_storage = 4,
     runtime_dns     = 5,
     runtime_sync    = 6,
-    runtime_idp     = 7
+    runtime_idp     = 7,
+    runtime_db      = 8
 };
 
 // The names, once.  Five places had this switch -- lua_context,
@@ -79,6 +80,11 @@ inline std::string shards_config_refusal(runtime_type type,
     if (type == runtime_idp)
         return "--shards is not available on an idp: an authorization code one shard gives is redeemed at whichever "
                "shard the client's next connection reaches, which never saw it\n";
+
+    // One process keeps one journal; a second would write the same documents into another.
+    if (type == runtime_db)
+        return "--shards is not available on a db: its documents are one journal in one process, and N of them would "
+               "each keep a different copy\n";
 
     // --listen used to be refused here, on the grounds that N processes
     // binding one path unlink each other's node.  That is true of one path and

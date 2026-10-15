@@ -276,6 +276,8 @@ public:
     }
 
     bool   is_open() const       { return m_fd >= 0; }
+    // The descriptor, for a caller that syncs it off its loop after flush().
+    int    fd() const            { return m_fd; }
     size_t pending_bytes() const { return m_pending.size(); }
 
     ~mutation_journal() { close(); }

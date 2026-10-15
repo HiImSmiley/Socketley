@@ -11,6 +11,7 @@
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/sync/sync_instance.h"
 #include "../runtime/idp/idp_instance.h"
+#include "../runtime/db/db_instance.h"
 
 void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
                         bool by_presence)
@@ -151,6 +152,23 @@ void apply_idp_config(idp_instance& ip, const runtime_config& cfg, bool by_prese
         ip.set_issuer(cfg.idp_issuer);
     if (asked("cookie_domain", !cfg.idp_cookie_domain.empty()))
         ip.set_cookie_domain(cfg.idp_cookie_domain);
+}
+
+void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presence)
+{
+    auto asked = [&](std::string_view key, bool nondefault) {
+        return by_presence ? cfg.has(key) : nondefault;
+    };
+    if (asked("schema", !cfg.db_schema.empty()))
+        db.set_schema_path(cfg.db_schema);
+    if (asked("keys", !cfg.db_keys.empty()))
+        db.set_keys_path(cfg.db_keys);
+    if (asked("idp", !cfg.db_idp.empty()))
+        db.set_idp(cfg.db_idp);
+    if (asked("origins", !cfg.db_origins.empty()))
+        db.set_origins(cfg.db_origins);
+    if (asked("max_bytes", cfg.db_max_bytes > 0))
+        db.set_max_bytes(cfg.db_max_bytes);
 }
 
 void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool by_presence)
@@ -366,6 +384,9 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
             break;
         case runtime_idp:
             apply_idp_config(static_cast<idp_instance&>(rt), cfg);
+            break;
+        case runtime_db:
+            apply_db_config(static_cast<db_instance&>(rt), cfg);
             break;
     }
 
