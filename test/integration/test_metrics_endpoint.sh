@@ -211,6 +211,41 @@ case "$USAGE" in *"memory_held=True"*) ok ;; *) bad "what a runtime costs the ma
 case "$USAGE" in *"overview_processes=4 children=3"*) ok ;; *) bad "the overview counts the daemon and every shard" "$USAGE" ;; esac
 case "$USAGE" in *"overview_cpu_close=True"*) ok ;; *) bad "the overview's CPU time is that of the daemon and its children" "$USAGE" ;; esac
 case "$USAGE" in *"cpus=True"*) ok ;; *) bad "the overview names the CPUs online" "$USAGE" ;; esac
+# A runtime that grows is read again at the next sample, though a process whose memory stood still is not.
+GROWN=$(python3 - "$MPORT" "$S3" <<'PYEOF'
+import json, socket, sys, time
+port, cport = int(sys.argv[1]), int(sys.argv[2])
+def fetch(path):
+    s = socket.create_connection(("127.0.0.1", port), 8); s.settimeout(8)
+    s.sendall(("GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" % path).encode())
+    out = b""
+    while True:
+        d = s.recv(65536)
+        if not d: break
+        out += d
+    return out.split(b"\r\n\r\n", 1)[1].decode()
+def memory():
+    return {r["name"]: r for r in json.loads(fetch("/api/runtimes"))}["m_shards"]["memory_bytes"]
+before = memory()
+c = socket.create_connection(("127.0.0.1", cport), 8); c.settimeout(8)
+value = b"v" * 65536
+for i in range(512):
+    key = b"grow:%d" % i
+    c.sendall(b"*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n" % (len(key), key, len(value), value))
+    got = b""
+    while not got.endswith(b"\r\n"):
+        got += c.recv(64)
+after = before
+for _ in range(15):
+    time.sleep(1)
+    after = memory()
+    if after - before > 16 << 20:
+        break
+print("grew=%s before=%d after=%d" % (after - before > 16 << 20, before, after))
+PYEOF
+)
+echo "  grown: $GROWN"
+case "$GROWN" in "grew=True"*) ok ;; *) bad "a runtime that took 32 MB is read again at the next sample" "$GROWN" ;; esac
 if [ -n "$(metric 'socketley_runtime_cpu_seconds_total{name="m_shards"}')" ] \
    && [ "$(metric 'socketley_runtime_resident_memory_bytes{name="m_shards"}')" -gt 0 ] 2>/dev/null; then ok
 else bad "CPU time and resident memory are Prometheus series" "$(get /metrics | grep -E 'cpu_seconds|resident' | head -4)"; fi

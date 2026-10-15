@@ -431,12 +431,32 @@ static uint64_t proportional_bytes(pid_t pid)
     return kb * 1024;
 }
 
+// Resident pages from /proc/<pid>/statm, a read a tenth the cost of smaps_rollup's walk; 0 when it cannot be read.
+static uint64_t resident_pages(pid_t pid)
+{
+    char path[48];
+    std::snprintf(path, sizeof path, "/proc/%d/statm", static_cast<int>(pid));
+    FILE* f = std::fopen(path, "re");
+    if (!f)
+        return 0;
+    unsigned long long size = 0, resident = 0;
+    const int got = std::fscanf(f, "%llu %llu", &size, &resident);
+    std::fclose(f);
+    return got == 2 ? resident : 0;
+}
+
 // Pss by process, read for every process at the history's cadence by sample() and only looked up by a request,
 // since a dashboard polling every two seconds otherwise walked every runtime's page tables on each poll.
 struct pss_cache
 {
-    std::mutex                          mu;
-    std::unordered_map<pid_t, uint64_t> by_pid;
+    struct entry
+    {
+        uint64_t pss{0};
+        uint64_t resident{0};
+        std::chrono::steady_clock::time_point read_at;
+    };
+    std::mutex                       mu;
+    std::unordered_map<pid_t, entry> by_pid;
 };
 
 static pss_cache& pss()
@@ -451,19 +471,37 @@ static uint64_t cached_pss(pid_t pid)
     auto& c = pss();
     std::lock_guard<std::mutex> lk(c.mu);
     if (const auto it = c.by_pid.find(pid); it != c.by_pid.end())
-        return it->second;
+        return it->second.pss;
     const uint64_t b = proportional_bytes(pid);
-    c.by_pid.emplace(pid, b);
+    c.by_pid.emplace(pid, pss_cache::entry{b, resident_pages(pid), std::chrono::steady_clock::now()});
     return b;
 }
 
 static void refresh_pss(const std::vector<pid_t>& every)
 {
-    std::unordered_map<pid_t, uint64_t> fresh;
+    // A process whose resident pages did not change keeps its Pss for up to a minute, so an idle machine walks no
+    // page tables between; a sibling mapping or dropping a shared page moves it no further than that.
+    constexpr auto max_age = std::chrono::seconds(60);
+    const auto now = std::chrono::steady_clock::now();
+    std::unordered_map<pid_t, pss_cache::entry> old;
+    {
+        auto& c = pss();
+        std::lock_guard<std::mutex> lk(c.mu);
+        old = c.by_pid;
+    }
+    std::unordered_map<pid_t, pss_cache::entry> fresh;
     fresh.reserve(every.size());
     for (const pid_t pid : every)
-        if (!fresh.contains(pid))
-            fresh.emplace(pid, proportional_bytes(pid));
+    {
+        if (fresh.contains(pid))
+            continue;
+        const uint64_t resident = resident_pages(pid);
+        if (const auto it = old.find(pid);
+            it != old.end() && resident != 0 && it->second.resident == resident && now - it->second.read_at < max_age)
+            fresh.emplace(pid, it->second);
+        else
+            fresh.emplace(pid, pss_cache::entry{proportional_bytes(pid), resident, now});
+    }
     auto& c = pss();
     std::lock_guard<std::mutex> lk(c.mu);
     c.by_pid.swap(fresh);
@@ -1142,6 +1180,9 @@ void metrics_endpoint::sample()
     for (const auto& p : pids)
         every.insert(every.end(), p.begin(), p.end());
     refresh_pss(every);
+    const process_usage own = usage_of({::getpid()});
+    all.cpu_seconds = own.cpu_seconds;
+    all.rss_bytes = own.memory_bytes;
     for (size_t i = 0; i < readings.size(); ++i)
     {
         const process_usage u = usage_of(pids[i]);
@@ -1153,10 +1194,9 @@ void metrics_endpoint::sample()
         all.messages += r.messages;
         all.bytes_in += r.bytes_in;
         all.bytes_out += r.bytes_out;
+        all.cpu_seconds += u.cpu_seconds;
+        all.rss_bytes += u.memory_bytes;
     }
-    const process_usage u = usage_of(every);
-    all.cpu_seconds = u.cpu_seconds;
-    all.rss_bytes = u.memory_bytes;
     readings.emplace_back(std::string(), all);
     const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     m_history->record(now_ms, readings);
