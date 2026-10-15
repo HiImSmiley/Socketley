@@ -62,12 +62,54 @@ struct zone
         const auto it = names.find(wire);
         return it == names.end() ? nullptr : &it->second;
     }
+    // Looked up once and kept: a zone is not changed once it is served, and every negative answer carries the SOA.
     const rrset* soa() const
     {
-        const node* n = find(origin);
-        return n ? n->find(type_soa) : nullptr;
+        if (!m_cache.soa_known)
+        {
+            const node* n = find(origin);
+            m_cache.soa = n ? n->find(type_soa) : nullptr;
+            m_cache.soa_known = true;
+        }
+        return m_cache.soa;
+    }
+    // Whether any name is a wildcard, decided once, so a zone without one looks for no closest encloser per miss.
+    bool has_wildcards() const
+    {
+        if (m_cache.wild < 0)
+        {
+            m_cache.wild = 0;
+            for (const auto& [n, nd] : names)
+                if (n.size() >= 2 && n[0] == '\1' && n[1] == '*')
+                {
+                    m_cache.wild = 1;
+                    break;
+                }
+        }
+        return m_cache.wild == 1;
     }
     static constexpr uint16_t type_soa = 6;
+
+private:
+    // Pointers into this zone's own names, so a copy starts without them rather than pointing into another's.
+    struct lookup_cache
+    {
+        const rrset* soa{nullptr};
+        bool soa_known{false};
+        int8_t wild{-1};
+        lookup_cache() = default;
+        lookup_cache(const lookup_cache&) {}
+        lookup_cache& operator=(const lookup_cache&)
+        {
+            soa = nullptr;
+            soa_known = false;
+            wild = -1;
+            return *this;
+        }
+    };
+    mutable lookup_cache m_cache;
+
+public:
 };
 
 // Bounds on a file, so a mistake -- or a file somebody else can write -- cannot take the worker's memory.

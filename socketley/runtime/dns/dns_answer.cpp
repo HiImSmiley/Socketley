@@ -1,5 +1,7 @@
 #include "dns_answer.h"
 
+#include <cstring>
+
 #include <algorithm>
 
 namespace socketley::dns
@@ -110,17 +112,19 @@ lookup find_name(const zone& z, std::string_view name, uint16_t qtype)
         r.k = n->sets.empty() ? lookup::nodata : lookup::found;
         return r;
     }
-    // The closest encloser is the first ancestor that exists, and the wildcard is directly beneath it.
-    for (std::string_view p = parent(name); p.size() >= z.origin.size(); p = parent(p))
+    // The closest encloser is the first ancestor that exists, and the wildcard is directly beneath it; a zone with
+    // no wildcard has nothing to find there.
+    for (std::string_view p = parent(name); z.has_wildcards() && p.size() >= z.origin.size(); p = parent(p))
     {
         if (!z.find(p))
             continue;
-        std::string wild;
-        wild.reserve(2 + p.size());
-        wild += '\1';
-        wild += '*';
-        wild += p;
-        if (const node* w = z.find(wild))
+        char buf[2 + max_name + 1];
+        if (p.size() > max_name)
+            break;
+        buf[0] = '\1';
+        buf[1] = '*';
+        std::memcpy(buf + 2, p.data(), p.size());
+        if (const node* w = z.find(std::string_view(buf, 2 + p.size())))
         {
             r.nd = w;
             r.wildcard = true;
@@ -200,7 +204,7 @@ void targets_of(const rrset& s, F&& f)
 size_t answer(const zone_set& zones, const uint8_t* q, size_t qlen, uint8_t* out, size_t cap, bool tcp,
               bool xfr_allowed, answer_meta& meta)
 {
-    meta = answer_meta{};
+    meta.reset();
     if (qlen < header_len)
     {
         meta.dropped = true;

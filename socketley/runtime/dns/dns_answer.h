@@ -31,6 +31,19 @@ struct answer_meta
     size_t   question_end{0};
     uint8_t  qname[max_name + 1];
     size_t   qname_len{0};
+
+    // Every field back to its start but the name, which answer() writes before anything reads it: a whole
+    // value-initialised copy zeroed and copied 270 bytes a query.
+    void reset()
+    {
+        rcode = 0;
+        qtype = 0;
+        dropped = truncated = referral = edns = notify_ack = false;
+        xfr = nullptr;
+        id = 0;
+        question_end = 0;
+        qname_len = 0;
+    }
 };
 
 // The reply to the query in `q` written to `out` (`cap` bytes, at least 512), its length returned; 0 when nothing
