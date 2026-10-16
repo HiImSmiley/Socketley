@@ -38,6 +38,7 @@ set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/lib_sdk.sh"
 ROOT=$(cd "$HERE/../.." && pwd)
 BINDIR=$(dirname "$BIN")
 
@@ -79,7 +80,7 @@ build_one() {
     # was free to reach into the source tree and no test could tell.  An
     # example that needs a path this script does not pass is an example nobody
     # outside the checkout can build.
-    if g++ -std=c++23 $SANFLAGS "$src" $SDKFLAGS \
+    if sdk_cxx "$src" $SDKFLAGS \
          -o "$WORK/$tag.bin" 2>"$WORK/$tag.err"
     then
         printf 'ok %s\n' "$tag" >> "$WORK/results"
@@ -87,7 +88,7 @@ build_one() {
         printf 'bad %s\n' "$tag" >> "$WORK/results"
     fi
 }
-export -f build_one
+export -f build_one sdk_cxx
 
 : > "$WORK/results"
 
@@ -130,7 +131,7 @@ fi
 # Another compiler links only machine code, so one example is linked without gcc's linker plugin, which alone reads
 # an archive of LTO bytecode.
 TOTAL=$((TOTAL+1))
-if g++ -std=c++23 $SANFLAGS -fno-use-linker-plugin "${SOURCES[0]}" $SDKFLAGS -o "$WORK/noplugin.bin" 2>"$WORK/noplugin.err"; then
+if sdk_cxx -fno-use-linker-plugin "${SOURCES[0]}" $SDKFLAGS -o "$WORK/noplugin.bin" 2>"$WORK/noplugin.err"; then
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))

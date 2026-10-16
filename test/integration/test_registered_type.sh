@@ -17,6 +17,7 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_ports.sh"
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_daemon.sh"
+. "$HERE/lib_sdk.sh"
 ROOT=$(cd "$HERE/../.." && pwd)
 BINDIR=$(dirname "$BIN")
 
@@ -67,7 +68,7 @@ SDKFLAGS=$("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflag
     echo "  Results: 0/1 passed (1 failed)"
     exit 1
 }
-if g++ -std=c++23 $SANFLAGS \
+if sdk_cxx \
        "$ROOT/sdk/examples/custom-type/greeter_worker.cpp" $SDKFLAGS \
        -o "$WORKER" 2>"$SOCKETLEY_TMPD/gxx.err"; then
     ok

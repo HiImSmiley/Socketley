@@ -35,6 +35,7 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_ports.sh"
 . "$HERE/lib_daemon.sh"
+. "$HERE/lib_sdk.sh"
 ROOT=$(cd "$HERE/../.." && pwd)
 BINDIR=$(dirname "$BIN")
 
@@ -183,7 +184,7 @@ PROBE_EOF
 SANFLAGS=""
 case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
 
-if g++ -std=c++23 $SANFLAGS "$SOCKETLEY_TMPD/probe.cpp" \
+if sdk_cxx "$SOCKETLEY_TMPD/probe.cpp" \
      -I"$ROOT" -I"$ROOT/include/linux" \
      -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
      -o "$SOCKETLEY_TMPD/probe" 2>"$SOCKETLEY_TMPD/gxx.err"

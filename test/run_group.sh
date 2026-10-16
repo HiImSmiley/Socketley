@@ -84,6 +84,11 @@ BIN_DIR="${SOCKETLEY_BIN_DIR:-$ROOT/bin/$SOCKETLEY_CONFIG}"
 BIN="${BIN:-$BIN_DIR/socketley}"
 . "$SCRIPT_DIR/lib_suite.sh"
 PAR="${SUITE_PAR:-$(suite_free_windows)}"
+# A sanitizer build's file takes about 1.5 GiB.
+if [ "$SOCKETLEY_CONFIG" = Sanitize ] && [ -z "${SUITE_PAR:-}" ]; then
+    MEM_PAR=$(suite_mem_slots 1610612736)
+    [ "$PAR" -gt "$MEM_PAR" ] && PAR=$MEM_PAR
+fi
 LIST_ONLY=""
 
 while getopts ":P:lh" opt; do

@@ -37,6 +37,7 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_ports.sh"
 . "$HERE/lib_daemon.sh"
+. "$HERE/lib_sdk.sh"
 ROOT=$(cd "$HERE/../.." && pwd)
 BINDIR=$(dirname "$BIN")
 
@@ -90,7 +91,7 @@ int main(int argc, char** argv)
     return socketley::daemon_start(manager, loop, argc, argv);
 }
 EOF
-    if g++ -std=c++23 $SANFLAGS "$SOCKETLEY_TMPD/mine.cpp" \
+    if sdk_cxx "$SOCKETLEY_TMPD/mine.cpp" \
          -I"$ROOT" -I"$ROOT/include/linux" \
          -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
          -L"$ROOT/thirdparty/liburing" $("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflags --libs) \

@@ -34,6 +34,7 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_ports.sh"
 . "$HERE/lib_daemon.sh"
+. "$HERE/lib_sdk.sh"
 ROOT=$(cd "$HERE/../.." && pwd)
 BINDIR=$(dirname "$BIN")
 
@@ -112,7 +113,7 @@ EOF
 
 BUILT=1
 for f in detach hold; do
-    g++ -std=c++23 $SANFLAGS "$SOCKETLEY_TMPD/$f.cpp" \
+    sdk_cxx "$SOCKETLEY_TMPD/$f.cpp" \
         -I"$ROOT" -I"$ROOT/include/linux" \
         -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
         -o "$SOCKETLEY_TMPD/$f" 2>>"$SOCKETLEY_TMPD/gxx.err" || BUILT=0

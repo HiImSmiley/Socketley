@@ -37,6 +37,7 @@ ROOT=$(cd "$HERE/../.." && pwd)
 BINDIR=$(dirname "$BIN")
 . "$HERE/lib_ports.sh"
 . "$HERE/lib_daemon.sh"
+. "$HERE/lib_sdk.sh"
 
 daemon_isolate mdid
 
@@ -73,7 +74,7 @@ WORKER=""
 if command -v g++ >/dev/null 2>&1 && [ -f "$BINDIR/libsocketley_sdk.a" ]; then
     SANFLAGS=""
     case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
-    if g++ -std=c++23 $SANFLAGS \
+    if sdk_cxx \
            "$ROOT/sdk/examples/custom-type/greeter_worker.cpp" \
            -I"$ROOT" -I"$ROOT/include/linux" \
            -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \

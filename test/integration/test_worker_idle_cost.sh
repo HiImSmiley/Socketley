@@ -42,6 +42,14 @@ daemon_start "$BIN"
 # gave a one-tick difference reported as a measurement, while thirty-two over
 # thirty gives six ticks of separation.
 N=32
+# A sanitizer worker holds about 200 MiB, and past the memory a run has they measure reclaim, not an idle loop.
+case "$BIN" in *Sanitize*)
+    . "$(dirname "$0")/../lib_suite.sh"
+    if [ "$(suite_mem_slots 209715200)" -le "$N" ]; then
+        echo "  SKIP: $((N + 1)) sanitizer processes of ~200 MiB do not fit in the memory this run may use"
+        exit 0
+    fi ;;
+esac
 for i in $(seq 1 $N); do
     "$BIN" create server "idle$i" -p $((PORT + i)) -s >/dev/null 2>&1 || true
 done

@@ -32,6 +32,26 @@ suite_free_windows() {
     echo "$n"
 }
 
+# How many jobs of the given bytes fit beside what is already held, at least
+# one: past it the box thrashes rather than fails.  A cgroup's memory.high
+# throttles below what the machine has free, so its headroom counts too,
+# against what its processes hold, since its page cache is given back first.
+suite_mem_slots() {   # bytes per job -> how many fit
+    local free cg lim l u n
+    free=$(awk '/^MemAvailable:/ { print $2 * 1024 }' /proc/meminfo)
+    cg="/sys/fs/cgroup$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)"
+    while [ -d "$cg" ] && [ "$cg" != /sys/fs/cgroup ]; do
+        for lim in memory.high memory.max; do
+            l=$(cat "$cg/$lim" 2>/dev/null); u=$(awk '$1 == "anon" { print $2 }' "$cg/memory.stat" 2>/dev/null)
+            case "$l$u" in ''|*[!0-9]*) continue ;; esac
+            [ $((l - u)) -lt "$free" ] && free=$((l - u))
+        done
+        cg=$(dirname "$cg")
+    done
+    n=$((free / $1)); [ "$n" -lt 1 ] && n=1
+    echo "$n"
+}
+
 # Where the last run's per-file seconds are kept, so the longest files start
 # first and the run does not end on one 85-second file started last.
 SUITE_DURATIONS="${SUITE_DURATIONS:-/tmp/socketley-test-durations-$(id -u)}"

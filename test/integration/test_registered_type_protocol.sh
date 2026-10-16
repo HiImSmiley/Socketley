@@ -23,6 +23,7 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 . "$(dirname "$0")/lib_ports.sh"
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_daemon.sh"
+. "$HERE/lib_sdk.sh"
 ROOT=$(cd "$HERE/../.." && pwd)
 BINDIR=$(dirname "$BIN")
 
@@ -90,7 +91,7 @@ if grep -q 'set_wire_protocol(proto_unknown)' "$CTL" && grep -q '"kvsniff"' "$CT
 fi
 
 build() {
-    g++ -std=c++23 $SANFLAGS "$1" $SDKFLAGS -o "$2" 2>"$SOCKETLEY_TMPD/gxx.err"
+    sdk_cxx "$1" $SDKFLAGS -o "$2" 2>"$SOCKETLEY_TMPD/gxx.err"
 }
 if build "$SRC" "$SOCKETLEY_TMPD/w-quiet"; then ok; else
     bad "the example worker builds" "$(tail -4 "$SOCKETLEY_TMPD/gxx.err")"
