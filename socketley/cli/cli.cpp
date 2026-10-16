@@ -3,6 +3,7 @@
 #include <fstream>
 #include <string_view>
 #include <string>
+#include <thread>
 #include <sstream>
 #include <vector>
 #include <unistd.h>
@@ -670,6 +671,16 @@ int cli_dispatch(int argc, char** argv)
 
         case fnv1a("idp-user"):
             return cli_idp_user(argc, argv);
+        case fnv1a("db-backup"):
+            return cli_db_backup(argc, argv);
+        case fnv1a("db-restore"):
+        {
+            // The backup is read by the daemon, against whose directory a relative path means something else.
+            std::string file = argc == 4 ? cli_caller_path("--keys", argv[3]) : std::string();
+            if (argc == 4)
+                argv[3] = file.data();
+            return cli_forward(argc, argv);
+        }
 
         case fnv1a("edit"):
             return cli_edit(argc, argv);
@@ -702,6 +713,7 @@ std::string cli_caller_path(std::string_view flag, std::string_view value)
     static constexpr std::string_view path_flags[] = {
         "--lua", "--log", "-w", "--persistent", "--http", "--dir", "--credentials", "--sse-key-file",
         "--cert", "--key", "--ca", "--client-ca", "--client-cert", "--client-key", "--zone", "--schema", "--keys",
+        "--replicate-key", "--backup-dir",
     };
     // A list of zone files, each made absolute in its place.
     if (flag == "--zone" && value.find(',') != std::string_view::npos)
@@ -872,6 +884,47 @@ int cli_idp_user(int argc, char** argv)
     for (auto& a : args)
         ptrs.push_back(a.data());
     return cli_forward(static_cast<int>(ptrs.size()), ptrs.data());
+}
+
+// A backup started, and waited for here by asking after it, so the daemon is never the one waiting.
+int cli_db_backup(int argc, char** argv)
+{
+    if (argc != 4)
+        return cli_forward(argc, argv);
+    const std::string db = argv[2];
+    const std::string file = cli_caller_path("--keys", argv[3]);
+    std::string data;
+    std::string cmd = "db-backup";
+    ipc_frame::append_arg(cmd += ' ', db);
+    ipc_frame::append_arg(cmd += ' ', file);
+    int rc = ipc_send(cmd, data);
+    if (rc < 0)
+        return ipc_report_failure(rc);
+    if (rc != 0 || !data.starts_with("job "))
+    {
+        std::cout << data;
+        return rc ? rc : 2;
+    }
+    const std::string job = data.substr(4, data.find('\n') - 4);
+    for (;;)
+    {
+        std::string status = "db-backup";
+        ipc_frame::append_arg(status += ' ', db);
+        status += " --status ";
+        status += job;
+        data.clear();
+        rc = ipc_send(status, data);
+        if (rc < 0)
+            return ipc_report_failure(rc);
+        if (rc != 0)
+        {
+            std::cout << data;
+            return rc;
+        }
+        if (data.starts_with("done "))
+            return 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
 }
 
 int cli_send(int argc, char** argv)

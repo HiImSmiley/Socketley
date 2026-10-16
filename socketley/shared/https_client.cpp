@@ -124,28 +124,39 @@ bool client::init(std::string& err, const std::string& ca_file, std::string user
     return ok || fail(err, "the trust roots could not be loaded" + (ca_file.empty() ? std::string() : ": " + ca_file));
 }
 
-bool client::request(std::string_view method, const std::string& url, std::string_view type, std::string_view body,
-                     reply& out, std::string& err, int timeout_s)
+int client::dial(const std::string& url, std::string& path, std::string& hostport, SSL*& ssl, std::string& err,
+                 int timeout_s)
 {
+    ssl = nullptr;
     std::string_view u = url;
     const bool tls = u.starts_with("https://");
     if (!tls && !u.starts_with("http://"))
-        return fail(err, "not an http or https URL: " + url);
+    {
+        err = "not an http or https URL: " + url;
+        return -1;
+    }
     u.remove_prefix(tls ? 8 : 7);
     const size_t slash = u.find('/');
-    std::string hostport(u.substr(0, slash)), path(slash == std::string_view::npos ? "/" : u.substr(slash));
+    hostport.assign(u.substr(0, slash));
+    path = slash == std::string_view::npos ? std::string("/") : std::string(u.substr(slash));
     std::string host = hostport, port = tls ? "443" : "80";
     // An IPv6 host is bracketed, and its brackets are no part of the address.
     if (hostport.starts_with('['))
     {
         const size_t close = hostport.find(']');
         if (close == std::string::npos)
-            return fail(err, "an IPv6 host is written in brackets: " + url);
+        {
+            err = "an IPv6 host is written in brackets: " + url;
+            return -1;
+        }
         host = hostport.substr(1, close - 1);
         if (close + 1 < hostport.size())
         {
             if (hostport[close + 1] != ':')
-                return fail(err, "after an IPv6 host in brackets comes its port: " + url);
+            {
+                err = "after an IPv6 host in brackets comes its port: " + url;
+                return -1;
+            }
             port = hostport.substr(close + 2);
         }
     }
@@ -157,7 +168,10 @@ bool client::request(std::string_view method, const std::string& url, std::strin
     addrinfo hints{}, *res = nullptr;
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res)
-        return fail(err, "cannot resolve " + host);
+    {
+        err = "cannot resolve " + host;
+        return -1;
+    }
     int fd = -1;
     for (addrinfo* a = res; a && fd < 0; a = a->ai_next)
     {
@@ -175,48 +189,67 @@ bool client::request(std::string_view method, const std::string& url, std::strin
     }
     freeaddrinfo(res);
     if (fd < 0)
-        return fail(err, "cannot connect to " + hostport);
-    SSL* ssl = nullptr;
-    bool ok = true;
+    {
+        err = "cannot connect to " + hostport;
+        return -1;
+    }
     if (tls)
     {
         ssl = SSL_new(m_ctx);
         SSL_set_fd(ssl, fd);
         SSL_set_tlsext_host_name(ssl, host.c_str());
         SSL_set1_host(ssl, host.c_str());
-        ok = SSL_connect(ssl) == 1;
-        if (!ok)
+        if (SSL_connect(ssl) != 1)
         {
             const unsigned long e = ERR_get_error();
             const char* why = e ? ERR_reason_error_string(e) : nullptr;
             err = "TLS to " + hostport + " failed: " + (why ? why : "the handshake did not complete");
+            SSL_free(ssl);
+            ssl = nullptr;
+            ::close(fd);
+            return -1;
         }
     }
-    const auto put = [&](const std::string& s) {
-        if (ssl)
-            return SSL_write(ssl, s.data(), static_cast<int>(s.size())) == static_cast<int>(s.size());
-        size_t at = 0;
-        while (at < s.size())
-        {
-            const ssize_t n = ::send(fd, s.data() + at, s.size() - at, MSG_NOSIGNAL);
-            if (n <= 0)
-                return false;
-            at += static_cast<size_t>(n);
-        }
-        return true;
-    };
-    if (ok)
+    return fd;
+}
+
+namespace
+{
+
+bool put_all(int fd, SSL* ssl, const std::string& s)
+{
+    if (ssl)
+        return SSL_write(ssl, s.data(), static_cast<int>(s.size())) == static_cast<int>(s.size());
+    size_t at = 0;
+    while (at < s.size())
     {
-        std::string req = std::string(method) + " " + path + " HTTP/1.1\r\nHost: " + hostport + "\r\nUser-Agent: " +
-                          m_agent + "\r\nAccept: */*\r\nConnection: close\r\n";
-        if (!type.empty())
-            req += "Content-Type: " + std::string(type) + "\r\n";
-        req += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
-        req += body;
-        ok = put(req);
-        if (!ok)
-            err = "sending to " + hostport + " failed";
+        const ssize_t n = ::send(fd, s.data() + at, s.size() - at, MSG_NOSIGNAL);
+        if (n <= 0)
+            return false;
+        at += static_cast<size_t>(n);
     }
+    return true;
+}
+
+}   // namespace
+
+bool client::request(std::string_view method, const std::string& url, std::string_view type, std::string_view body,
+                     reply& out, std::string& err, int timeout_s)
+{
+    std::string path, hostport;
+    SSL* ssl = nullptr;
+    const int fd = dial(url, path, hostport, ssl, err, timeout_s);
+    if (fd < 0)
+        return false;
+    std::string req = std::string(method) + " " + path + " HTTP/1.1\r\nHost: " + hostport + "\r\nUser-Agent: " +
+                      m_agent + "\r\nAccept: */*\r\nConnection: close\r\n";
+    if (!type.empty())
+        req += "Content-Type: " + std::string(type) + "\r\n";
+    req += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+    req += body;
+    bool ok = put_all(fd, ssl, req);
+    if (!ok)
+        err = "sending to " + hostport + " failed";
     std::string raw;
     bool whole = false;
     while (ok)
@@ -238,6 +271,110 @@ bool client::request(std::string_view method, const std::string& url, std::strin
     ::close(fd);
     ERR_clear_error();
     return ok && parse(raw, whole, method == "HEAD", out, err);
+}
+
+bool client::stream(const std::string& url, const std::vector<std::pair<std::string, std::string>>& headers,
+                    const std::function<bool(int status)>& on_status, const std::function<bool(std::string_view)>& on_data,
+                    std::string& err, int idle_s)
+{
+    std::string path, hostport;
+    SSL* ssl = nullptr;
+    const int fd = dial(url, path, hostport, ssl, err, idle_s);
+    if (fd < 0)
+        return false;
+    std::string req = "GET " + path + " HTTP/1.1\r\nHost: " + hostport + "\r\nUser-Agent: " + m_agent +
+                      "\r\nAccept: text/event-stream\r\nConnection: close\r\n";
+    for (const auto& [k, v] : headers)
+        req += k + ": " + v + "\r\n";
+    req += "\r\n";
+    bool ok = put_all(fd, ssl, req);
+    if (!ok)
+        err = "sending to " + hostport + " failed";
+    std::string raw;
+    bool head_done = false, chunked = false, closed = false;
+    // A chunked body's state: what of the current chunk is left, and the bytes not yet framed.
+    size_t chunk_left = 0;
+    while (ok)
+    {
+        char buf[16384];
+        const int n = ssl ? SSL_read(ssl, buf, sizeof buf) : static_cast<int>(::recv(fd, buf, sizeof buf, 0));
+        if (n <= 0)
+        {
+            const bool timed_out = ssl ? (SSL_get_error(ssl, n) == SSL_ERROR_WANT_READ ||
+                                          (SSL_get_error(ssl, n) == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EWOULDBLOCK)))
+                                       : n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
+            if (timed_out)
+            {
+                ERR_clear_error();
+                if (!on_data({}))
+                    break;
+                continue;
+            }
+            closed = ssl ? SSL_get_error(ssl, n) == SSL_ERROR_ZERO_RETURN || n == 0 : n == 0;
+            if (!closed)
+                err = "the stream from " + hostport + " broke";
+            break;
+        }
+        raw.append(buf, static_cast<size_t>(n));
+        if (!head_done)
+        {
+            const size_t end = raw.find("\r\n\r\n");
+            if (end == std::string::npos)
+            {
+                if (raw.size() > 65536)
+                {
+                    err = "no HTTP answer from " + hostport;
+                    break;
+                }
+                continue;
+            }
+            reply h;
+            parse(raw.substr(0, end + 4), true, true, h, err);
+            head_done = true;
+            chunked = strncasecmp(h.header("transfer-encoding").c_str(), "chunked", 7) == 0;
+            raw.erase(0, end + 4);
+            if (!on_status(h.status))
+                break;
+        }
+        std::string plain;
+        if (!chunked)
+            plain.swap(raw);
+        else
+            while (!raw.empty())
+            {
+                if (chunk_left == 0)
+                {
+                    const size_t eol = raw.find("\r\n");
+                    if (eol == std::string::npos)
+                        break;
+                    // The CRLF that ends the chunk before is the empty line here.
+                    if (eol == 0)
+                    {
+                        raw.erase(0, 2);
+                        continue;
+                    }
+                    chunk_left = std::strtoul(raw.c_str(), nullptr, 16);
+                    raw.erase(0, eol + 2);
+                    if (chunk_left == 0)
+                    {
+                        closed = true;
+                        ok = false;
+                        break;
+                    }
+                }
+                const size_t take = std::min(chunk_left, raw.size());
+                plain.append(raw, 0, take);
+                raw.erase(0, take);
+                chunk_left -= take;
+            }
+        if (!plain.empty() && !on_data(plain))
+            break;
+    }
+    if (ssl)
+        SSL_free(ssl);
+    ::close(fd);
+    ERR_clear_error();
+    return closed;
 }
 
 }   // namespace https_client

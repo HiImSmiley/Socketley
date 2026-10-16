@@ -776,6 +776,12 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.db_idp = std::string(db->get_idp());
             cfg.db_origins = std::string(db->get_origins());
             cfg.db_max_bytes = db->get_max_bytes();
+            cfg.db_cache = db->get_cache_bytes();
+            cfg.db_replicate = std::string(db->get_replicate());
+            cfg.db_replicate_key = std::string(db->get_replicate_key());
+            cfg.db_backup_dir = std::string(db->get_backup_dir());
+            cfg.db_backup_every = db->get_backup_every();
+            cfg.db_backup_keep = db->get_backup_keep();
             break;
         }
         case runtime_storage:
@@ -1161,6 +1167,15 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("origins", cfg.db_origins);
             if (cfg.db_max_bytes > 0)
                 append_int_field("max_bytes", cfg.db_max_bytes);
+            append_int_field("cache", cfg.db_cache);
+            if (!cfg.db_replicate.empty())
+                append_str_field("replicate", cfg.db_replicate);
+            if (!cfg.db_replicate_key.empty())
+                append_str_field("replicate_key", cfg.db_replicate_key);
+            if (!cfg.db_backup_dir.empty())
+                append_str_field("backup_dir", cfg.db_backup_dir);
+            append_int_field("backup_every", cfg.db_backup_every);
+            append_int_field("backup_keep", cfg.db_backup_keep);
             break;
     }
 
@@ -1382,6 +1397,12 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.db_idp = json_get_string(json, "idp");
             cfg.db_origins = json_get_string(json, "origins");
             cfg.db_max_bytes = json_get_size(json, "max_bytes");
+            cfg.db_cache = json_get_size(json, "cache", 64ull << 20);
+            cfg.db_replicate = json_get_string(json, "replicate");
+            cfg.db_replicate_key = json_get_string(json, "replicate_key");
+            cfg.db_backup_dir = json_get_string(json, "backup_dir");
+            cfg.db_backup_every = json_get_uint32(json, "backup_every", 86400);
+            cfg.db_backup_keep = json_get_uint32(json, "backup_keep", 7);
             break;
     }
 

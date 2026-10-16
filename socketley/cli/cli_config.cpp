@@ -157,6 +157,12 @@ constexpr config_key config_keys[] = {
     { "schema",             "--schema",             key_kind::text    },
     { "keys",               "--keys",               key_kind::text    },
     { "origins",            "--origins",            key_kind::text    },
+    { "cache",              "--cache",              key_kind::scalar  },
+    { "replicate",          "--replicate",          key_kind::text    },
+    { "replicate_key",      "--replicate-key",      key_kind::text    },
+    { "backup_dir",         "--backup-dir",         key_kind::text    },
+    { "backup_every",       "--backup-every",       key_kind::scalar  },
+    { "backup_keep",        "--backup-keep",        key_kind::integer },
 };
 
 // Keys with no flag of their own, listed so an unknown key can still be

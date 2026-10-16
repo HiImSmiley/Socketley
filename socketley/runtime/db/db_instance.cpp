@@ -19,8 +19,14 @@ std::string db_instance::config_refusal() const
         return "db: -p is required: the port the entrance or a client reaches the database on\n";
     if (!get_listen_path().empty())
         return "db: --listen unix: is not served; the database listens on its port\n";
-    if (m_keys.empty() && m_idp.empty())
+    if (m_keys.empty() && m_idp.empty() && m_replicate.empty())
         return "db: a database nobody can write is no use: give --keys, --idp or both\n";
+    if (!m_replicate.empty() && m_replicate_key.empty())
+        return "db: --replicate needs --replicate-key, the file holding a key of the database it copies\n";
+    if (!m_replicate.empty() && !m_replicate.starts_with("http://") && !m_replicate.starts_with("https://"))
+        return "db: --replicate is the http or https address of the database to copy: " + m_replicate + "\n";
+    if (!m_backup_dir.empty() && m_backup_every < 1)
+        return "db: --backup-every is at least a second\n";
     return {};
 }
 

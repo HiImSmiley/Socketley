@@ -23,10 +23,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   account of `--idp` by its sign-in cookie or an access token the provider
   gave one of its clients; a cookie write from another site's page is
   refused, and `--origins` names the pages a browser may call it from with
-  CORS. Every write of a turn is answered after one sync of its journal, a
-  versioned snapshot folds it, and a script reaches the documents as
-  `socketley.db`. The idp's session verifier takes access tokens as
+  CORS. A write is answered once it is on the disk, and a script reaches the
+  documents as `socketley.db`. The idp's session verifier takes access tokens as
   `Authorization: Bearer` for it.
+- **The `db` runtime holds more than memory, streams its changes, keeps
+  copies and backups.** Documents live in segments on the disk, appended to
+  and sealed at 64 MiB; memory holds where each lies, its figures and its
+  index values, and a cache of those last read (`--cache`), and sealed
+  segments mostly dead are merged off the event loop. No answer is given
+  before what it rests on is on the disk, a read's included. `GET
+  /c/<collection>/_feed` streams every change as a Server-Sent Event,
+  numbered, to a reader who may see it, resumed with `Last-Event-ID`; `GET
+  /_feed` streams them all to a key. A schema line's `ttl:<field>` gives
+  documents a time to go. `--replicate <url> --replicate-key <file>` makes a
+  runtime a copy of another database over http or https: a whole copy once,
+  then every change with its own number, resumed across restarts of either,
+  read-only until `--replicate` is taken away. `socketley db-backup` and
+  `db-restore` write and take back one file of every document;
+  `--backup-dir`, `--backup-every` and `--backup-keep` schedule them.
 - **An `idp` runtime: one sign-in, for applications, proxies, storages and
   the dashboard.** An OpenID Connect provider with its own accounts: each a
   fixed random id that every token names it by, and fields with no schema --

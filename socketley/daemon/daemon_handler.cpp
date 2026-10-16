@@ -19,6 +19,9 @@
 #include "../runtime/sync/sync_instance.h"
 #include "../runtime/idp/idp_instance.h"
 #include "../runtime/db/db_instance.h"
+#include "../runtime/db/db_log.h"
+#include "../runtime/db/db_store.h"
+#include "../shared/db_call.h"
 #include "../runtime/idp/idp_run.h"
 #include "../shared/storage_rpc.h"
 #include "../shared/dns_feed.h"
@@ -1431,6 +1434,8 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("dashboard"):     return cmd_dashboard(conn);
         case fnv1a("ping"):          return cmd_ping(conn);
         case fnv1a("idp-user"):      return cmd_idp_user(conn, pa);
+        case fnv1a("db-backup"):     return cmd_db_backup(conn, pa);
+        case fnv1a("db-restore"):    return cmd_db_restore(conn, pa);
         case fnv1a("startup"):       return cmd_startup(conn, pa);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
@@ -2884,6 +2889,163 @@ void daemon_handler::on_worker_deliver(proxy_supervisor* from,
         LOG_WARN(("a worker's send could not be delivered: " + why).c_str());
 }
 
+bool daemon_handler::ask_worker(ipc_connection* conn, std::string_view runtime, std::string_view payload,
+                                std::string& reply, std::chrono::milliseconds bound)
+{
+    auto it = m_proxy_workers.find(std::string(runtime));
+    if (it == m_proxy_workers.end() || it->second.empty() || !it->second[0])
+    {
+        conn->write_buf = "could not reach the worker holding " + std::string(runtime) + "\n";
+        return false;
+    }
+    const uint64_t ticket = proxy_supervisor::direct_ticket_bit | ++m_direct_ticket_seq;
+    uint8_t st = 0;
+    const worker_wait_scope waiting{m_worker_wait_depth};
+    auto* sup = it->second[0].get();
+    if (!sup->send_direct(ticket, payload) || !sup->await_direct(ticket, bound, st, reply))
+    {
+        conn->write_buf = "no answer from the worker holding " + std::string(runtime) + "\n";
+        return false;
+    }
+    if (st != static_cast<uint8_t>(request_status::ok))
+    {
+        conn->write_buf = "the worker holding " + std::string(runtime) + " refused the command\n";
+        return false;
+    }
+    return true;
+}
+
+// A backup of a db runtime into a file: started by the worker, which answers its number at once, and asked after by
+// that number, so a database of any size never holds the daemon up waiting for it.
+int daemon_handler::cmd_db_backup(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count != 3 && !(pa.count == 4 && pa.args[2] == "--status"))
+    {
+        conn->write_buf = command_usage::line("db-backup");
+        return 1;
+    }
+    const std::string_view name = pa.args[1];
+    auto* instance = m_manager.get(name);
+    if (!instance || instance->get_type() != runtime_db)
+    {
+        conn->write_buf = "no db runtime named " + std::string(name) + "\n";
+        return 1;
+    }
+    if (instance->get_state() != runtime_running)
+    {
+        conn->write_buf = "runtime is not running: " + std::string(name) + "\n";
+        return 1;
+    }
+    std::string payload(socketley::db::call_marker);
+    if (pa.count == 4)
+        payload += "{\"backup_status\":" + std::string(pa.args[3]) + "}";
+    else
+    {
+        if (pa.args[2].empty() || pa.args[2].front() != '/')
+        {
+            conn->write_buf = "the backup is written to an absolute path\n";
+            return 1;
+        }
+        std::string quoted;
+        socketley::db::write_string(pa.args[2], quoted);
+        payload += "{\"backup\":" + quoted + "}";
+    }
+    std::string reply;
+    if (!ask_worker(conn, name, payload, reply))
+        return 2;
+    socketley::db::jvalue v;
+    if (!socketley::db::json_reader(reply).document(v))
+    {
+        conn->write_buf = "the database's answer could not be read\n";
+        return 2;
+    }
+    const socketley::db::jvalue* status = socketley::db::member(v, "status");
+    const socketley::db::jvalue* body = socketley::db::member(v, "body");
+    const auto field = [&](std::string_view k) -> std::string {
+        const socketley::db::jvalue* f = body ? socketley::db::member(*body, k) : nullptr;
+        return !f ? std::string() : f->k == socketley::db::jvalue::kind::boolean ? (f->b ? "true" : "false") : f->s;
+    };
+    if (!status || (status->s != "200" && status->s != "202"))
+    {
+        conn->write_buf = field("message") + "\n";
+        return 1;
+    }
+    // Lines the CLI reads: the job's number, then whether it is done and how it ended.
+    if (pa.count == 3)
+        conn->write_buf = "job " + field("job") + "\n";
+    else if (field("done") != "true")
+        conn->write_buf = "running\n";
+    else if (field("ok") == "true")
+        conn->write_buf = "done " + field("documents") + " " + field("file") + "\n";
+    else
+    {
+        conn->write_buf = "failed: " + field("message") + "\n";
+        return 2;
+    }
+    return 0;
+}
+
+// A db runtime's documents replaced by a backup's: the runtime stopped, its directory kept aside, the backup put in
+// its place, and the runtime started again as it was.
+int daemon_handler::cmd_db_restore(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count != 3)
+    {
+        conn->write_buf = command_usage::line("db-restore");
+        return 1;
+    }
+    const std::string name(pa.args[1]);
+    const std::string file(pa.args[2]);
+    auto* instance = m_manager.get(name);
+    if (!instance || instance->get_type() != runtime_db)
+    {
+        conn->write_buf = "no db runtime named " + name + "\n";
+        return 1;
+    }
+    // Read whole before anything is touched: a file that is not a backup of a database changes nothing.
+    std::string why;
+    uint64_t records = 0;
+    if (file.empty() || file.front() != '/' ||
+        !socketley::db::seglog::scan_file(
+            file,
+            [&](uint32_t, uint64_t, std::string_view p) {
+                std::vector<socketley::db::event> evs;
+                ++records;
+                return socketley::db::decode_record(p, evs);
+            },
+            false, why))
+    {
+        conn->write_buf = (why.empty() ? "the backup is read from an absolute path" : why) + "\n";
+        return 1;
+    }
+    const std::string dir = db_data_dir(name);
+    return across_restart(
+        conn, "db-restore", name,
+        [&]() -> int {
+            std::error_code ec;
+            const std::string aside = dir + ".before-restore";
+            std::filesystem::remove_all(aside, ec);
+            if (std::filesystem::exists(dir, ec))
+                std::filesystem::rename(dir, aside, ec);
+            if (ec)
+            {
+                conn->write_buf = "the documents could not be moved aside: " + ec.message() + "\n";
+                return 2;
+            }
+            std::filesystem::create_directories(dir, ec);
+            std::filesystem::copy_file(file, dir + "/seg-00000001.log", ec);
+            if (ec)
+            {
+                conn->write_buf = "the backup could not be put in place: " + ec.message() + "; the documents before "
+                                  "are in " + aside + "\n";
+                return 2;
+            }
+            ::chmod(dir.c_str(), 0700);
+            return 0;
+        },
+        false);
+}
+
 // An account of an idp runtime, changed or read in the worker that keeps them, which answers in text.
 int daemon_handler::cmd_idp_user(ipc_connection* conn, const parsed_args& pa)
 {
@@ -2904,30 +3066,8 @@ int daemon_handler::cmd_idp_user(ipc_connection* conn, const parsed_args& pa)
         conn->write_buf = "runtime is not running: " + std::string(name) + "\n";
         return 1;
     }
-    // One request to a runtime's worker and its answer, waited for here; false with the reason in write_buf.
-    const auto ask = [&](std::string_view runtime, std::string_view payload, std::string& reply)
-    {
-        auto it = m_proxy_workers.find(std::string(runtime));
-        if (it == m_proxy_workers.end() || it->second.empty() || !it->second[0])
-        {
-            conn->write_buf = "could not reach the worker holding " + std::string(runtime) + "\n";
-            return false;
-        }
-        const uint64_t ticket = proxy_supervisor::direct_ticket_bit | ++m_direct_ticket_seq;
-        uint8_t st = 0;
-        const worker_wait_scope waiting{m_worker_wait_depth};
-        auto* sup = it->second[0].get();
-        if (!sup->send_direct(ticket, payload) || !sup->await_direct(ticket, std::chrono::milliseconds(4000), st, reply))
-        {
-            conn->write_buf = "no answer from the worker holding " + std::string(runtime) + "\n";
-            return false;
-        }
-        if (st != static_cast<uint8_t>(request_status::ok))
-        {
-            conn->write_buf = "the worker holding " + std::string(runtime) + " refused the command\n";
-            return false;
-        }
-        return true;
+    const auto ask = [&](std::string_view runtime, std::string_view payload, std::string& reply) {
+        return ask_worker(conn, runtime, payload, reply);
     };
     std::string reply;
     if (pa.args[2] == "import")
@@ -4046,8 +4186,11 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
             const uint32_t h = pa.hashes[i];
             if ((type == runtime_idp &&
                  (h == fnv1a("--clients") || h == fnv1a("--issuer") || h == fnv1a("--cookie-domain"))) ||
-                (type == runtime_db && (h == fnv1a("--schema") || h == fnv1a("--keys") || h == fnv1a("--idp") ||
-                                        h == fnv1a("--origins") || h == fnv1a("--max-bytes"))))
+                (type == runtime_db &&
+                 (h == fnv1a("--schema") || h == fnv1a("--keys") || h == fnv1a("--idp") || h == fnv1a("--origins") ||
+                  h == fnv1a("--max-bytes") || h == fnv1a("--cache") || h == fnv1a("--replicate") ||
+                  h == fnv1a("--replicate-key") || h == fnv1a("--backup-dir") || h == fnv1a("--backup-every") ||
+                  h == fnv1a("--backup-keep"))))
             {
                 restore_edit();
                 std::cout << pa.args[i] << " cannot be changed with `edit`\n"

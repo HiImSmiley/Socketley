@@ -9,6 +9,7 @@ int cli_dispatch(int argc, char** argv);
 int cli_forward(int argc, char** argv);
 int cli_send(int argc, char** argv);
 int cli_idp_user(int argc, char** argv);
+int cli_db_backup(int argc, char** argv);
 int cli_stdin_send(int argc, char** argv);
 int cli_edit(int argc, char** argv);
 int cli_import(int argc, char** argv);

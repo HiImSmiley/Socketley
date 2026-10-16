@@ -3,14 +3,18 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
+#include <map>
 
-#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <openssl/rand.h>
 
 #include "../../shared/byte_codec.h"
 #include "../../shared/jws.h"
+#include "../../shared/mutation_journal.h"
 #include "../../shared/replaced_file.h"
 
 namespace socketley::db
@@ -22,11 +26,10 @@ namespace
 constexpr uint8_t rec_write = 1;
 constexpr uint8_t ent_put   = 1;
 constexpr uint8_t ent_del   = 2;
-constexpr std::string_view journal_owner = "socketley-db";
+// A document's share of memory beside its JSON, for --max-bytes: its place, figures and the maps it sits in.
 constexpr size_t doc_overhead = 96;
-// Past either the journal is folded into a snapshot, so a start replays a bounded tail.
-constexpr uint64_t compact_records = 100000;
-constexpr uint64_t compact_bytes   = 64ull << 20;
+// A merge waits until the sealed segments hold this much that is dead, and more dead than alive.
+constexpr uint64_t merge_floor = 32ull << 20;
 
 error fail(int status, std::string_view code, std::string message)
 {
@@ -62,8 +65,26 @@ bool system_field(std::string_view f)
     return f == "_id" || f == "_v" || f == "_owner";
 }
 
-// A field of a document as a query sees it: _id, _owner and _v beside the document's own.
-const jvalue* field_of(const doc& d, const std::string& id, std::string_view path, jvalue& scratch)
+std::string staged_key(std::string_view coll, std::string_view id)
+{
+    std::string k(coll);
+    k += '\0';
+    k += id;
+    return k;
+}
+
+uint64_t cache_key(const location& at)
+{
+    return (static_cast<uint64_t>(at.seg) << 40) | at.off;
+}
+
+int64_t now_sec()
+{
+    return static_cast<int64_t>(::time(nullptr));
+}
+
+// A system field of a document as a query sees it, null for one of the document's own.
+const jvalue* system_of(const doc& d, const std::string& id, std::string_view path, jvalue& scratch)
 {
     if (path == "_id")
     {
@@ -79,13 +100,9 @@ const jvalue* field_of(const doc& d, const std::string& id, std::string_view pat
         scratch.s = d.owner;
         return &scratch;
     }
-    if (path == "_v")
-    {
-        scratch.k = jvalue::kind::number;
-        scratch.s = std::to_string(d.v);
-        return &scratch;
-    }
-    return at_path(d.body, path);
+    scratch.k = jvalue::kind::number;
+    scratch.s = std::to_string(d.v);
+    return &scratch;
 }
 
 bool key_meets(const query::cond& c, const ikey& k)
@@ -117,7 +134,39 @@ bool meets(const query::cond& c, const jvalue* v)
         case query::cond::exists:
             return (v != nullptr) == c.value.b;
         default:
-            return v && key_meets(c, key_of(v));
+            // An absent field is ordered as null, as an index orders it.
+            return key_meets(c, key_of(v));
+    }
+}
+
+bool scalar(const jvalue& v)
+{
+    return v.k != jvalue::kind::object && v.k != jvalue::kind::array;
+}
+
+// Whether a condition is answered from an index's key alone: not exists, which a key cannot tell from null, and no
+// value an object or an array, which a key orders by its text.
+bool by_key(const query::cond& c)
+{
+    if (c.op == query::cond::exists)
+        return false;
+    if (c.op == query::cond::in)
+        return std::all_of(c.value.items.begin(), c.value.items.end(), scalar);
+    return scalar(c.value);
+}
+
+bool meets_key(const query::cond& c, const ikey& k)
+{
+    switch (c.op)
+    {
+        case query::cond::eq: return k == c.key;
+        case query::cond::ne: return !(k == c.key);
+        case query::cond::in:
+            for (const auto& i : c.value.items)
+                if (k == key_of(&i))
+                    return true;
+            return false;
+        default: return key_meets(c, k);
     }
 }
 
@@ -146,23 +195,97 @@ bool add_numbers(const jvalue& a, const jvalue& b, jvalue& out)
     return true;
 }
 
-void put_entry(socketley::bytes::writer& w, std::string_view coll, std::string_view id, const doc* d,
-               const std::string* json)
-{
-    w.u8(d ? ent_put : ent_del);
-    w.bytes(coll);
-    w.bytes(id);
-    if (d)
-    {
-        w.u64(d->v);
-        w.bytes(d->owner);
-        w.bytes(*json);
-    }
-}
-
 }   // namespace
 
-void write_doc(const std::string& id, const doc& d, std::string& out)
+// ─── Records ────────────────────────────────────────────────────────────────
+
+std::string encode_record(uint64_t seq, const std::vector<event>& evs, std::vector<uint64_t>* json_offs)
+{
+    socketley::bytes::writer w;
+    w.u8(rec_write);
+    w.u64(seq);
+    w.u32(static_cast<uint32_t>(evs.size()));
+    std::string out;
+    for (const auto& e : evs)
+    {
+        w.u8(e.del ? ent_del : ent_put);
+        w.bytes(e.coll);
+        w.bytes(e.id);
+        if (e.del)
+            continue;
+        w.u64(e.v);
+        w.bytes(e.owner);
+        w.bytes(e.json);
+    }
+    out = w.take();
+    if (json_offs)
+    {
+        json_offs->clear();
+        // Each put's JSON is the last field of its entry, so its offset is the sum of what came before it.
+        size_t pos = 1 + 8 + 4;
+        for (const auto& e : evs)
+        {
+            pos += 1 + 4 + e.coll.size() + 4 + e.id.size();
+            if (e.del)
+            {
+                json_offs->push_back(0);
+                continue;
+            }
+            pos += 8 + 4 + e.owner.size() + 4;
+            json_offs->push_back(pos);
+            pos += e.json.size();
+        }
+    }
+    return out;
+}
+
+bool decode_record(std::string_view payload, std::vector<event>& out, std::vector<uint64_t>* json_offs,
+                   uint64_t* seq_out)
+{
+    socketley::bytes::reader r(payload);
+    uint8_t kind = 0;
+    uint64_t seq = 0;
+    uint32_t n = 0;
+    if (!r.u8(kind) || kind != rec_write || !r.u64(seq) || !r.u32(n) || n > store::max_ops)
+        return false;
+    if (seq_out)
+        *seq_out = seq;
+    out.clear();
+    if (json_offs)
+        json_offs->clear();
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        event e;
+        e.seq = seq;
+        uint8_t t = 0;
+        if (!r.u8(t) || !r.bytes(e.coll, 64) || !r.bytes(e.id, 128) || !valid_collection(e.coll))
+            return false;
+        if (t == ent_del)
+        {
+            e.del = true;
+            if (json_offs)
+                json_offs->push_back(0);
+        }
+        else if (t == ent_put)
+        {
+            std::string_view json;
+            if (!r.u64(e.v) || !r.bytes(e.owner, 256))
+                return false;
+            const size_t before = payload.size() - r.left();
+            if (!r.view(json, store::max_doc))
+                return false;
+            if (json_offs)
+                json_offs->push_back(before + 4);
+            e.json.assign(json);
+        }
+        else
+            return false;
+        out.push_back(std::move(e));
+    }
+    return r.left() == 0;
+}
+
+void write_doc(const std::string& id, const doc& d, std::string_view body_json, std::string& out)
 {
     out += "{\"_id\":";
     write_string(id, out);
@@ -173,14 +296,75 @@ void write_doc(const std::string& id, const doc& d, std::string& out)
         out += ",\"_owner\":";
         write_string(d.owner, out);
     }
-    for (const auto& [k, m] : d.body.members)
+    // The body's members follow, its own braces taken off.
+    if (body_json.size() > 2)
     {
         out += ',';
-        write_string(k, out);
-        out += ':';
-        write_json(m, out);
+        out.append(body_json.substr(1, body_json.size() - 2));
     }
     out += '}';
+}
+
+void copy_job::run()
+{
+    std::vector<std::string> payloads;
+    payloads.reserve(items.size());
+    std::unordered_map<uint32_t, int> fds;
+    ok = true;
+    for (auto& it : items)
+    {
+        int& fd = fds[it.from.seg];
+        if (fd == 0)
+        {
+            char name[32];
+            std::snprintf(name, sizeof name, "/seg-%08u.log", it.from.seg);
+            fd = ::open((dir + name).c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0)
+                fd = -1;
+        }
+        event e;
+        e.seq = it.seq;
+        e.coll = it.coll;
+        e.id = it.id;
+        e.owner = it.owner;
+        e.v = it.v;
+        e.json.resize(it.from.len);
+        size_t got = 0;
+        while (fd >= 0 && got < e.json.size())
+        {
+            const ssize_t n = ::pread(fd, e.json.data() + got, e.json.size() - got,
+                                      static_cast<off_t>(it.from.off + got));
+            if (n <= 0)
+                break;
+            got += static_cast<size_t>(n);
+        }
+        if (got != e.json.size())
+        {
+            ok = false;
+            why = "a document could not be read back from its segment";
+            break;
+        }
+        std::vector<uint64_t> offs;
+        payloads.push_back(encode_record(it.seq, {e}, &offs));
+        it.to.len = it.from.len;
+        it.to.off = offs[0];
+    }
+    for (auto& [seg, fd] : fds)
+        if (fd > 0)
+            ::close(fd);
+    if (!ok)
+        return;
+    std::vector<uint64_t> where;
+    if (!seglog::write_file(dest, payloads, where, why))
+    {
+        ok = false;
+        return;
+    }
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        items[i].to.seg = dest_seg;
+        items[i].to.off += where[i];
+    }
 }
 
 bool apply_patch(jvalue& body, const jvalue& changes, error& err)
@@ -284,7 +468,70 @@ bool apply_patch(jvalue& body, const jvalue& changes, error& err)
     return true;
 }
 
-// ─── Opening and closing ────────────────────────────────────────────────────
+
+// ─── The cache of documents read ────────────────────────────────────────────
+
+void store::set_cache_bytes(uint64_t b)
+{
+    m_cache_limit = b;
+    while (m_cache_bytes > m_cache_limit && !m_lru.empty())
+    {
+        const auto& e = m_lru.back();
+        m_cache_bytes -= e.json.size();
+        m_cache.erase(cache_key(location{e.seg, e.off, 0}));
+        m_lru.pop_back();
+    }
+}
+
+void store::cache_put(const location& at, std::string json)
+{
+    if (json.size() > m_cache_limit / 4 || m_cache_limit == 0)
+        return;
+    cache_drop(at);
+    m_cache_bytes += json.size();
+    m_lru.push_front(cache_entry{at.seg, at.off, std::move(json)});
+    m_cache[cache_key(at)] = m_lru.begin();
+    set_cache_bytes(m_cache_limit);
+}
+
+void store::cache_drop(const location& at)
+{
+    const auto it = m_cache.find(cache_key(at));
+    if (it == m_cache.end())
+        return;
+    m_cache_bytes -= it->second->json.size();
+    m_lru.erase(it->second);
+    m_cache.erase(it);
+}
+
+bool store::json_of(const doc& d, std::string& out)
+{
+    if (d.at.seg == 0)
+    {
+        out.clear();
+        return false;
+    }
+    if (const auto it = m_cache.find(cache_key(d.at)); it != m_cache.end())
+    {
+        ++m_hits;
+        m_lru.splice(m_lru.begin(), m_lru, it->second);
+        out = it->second->json;
+        return true;
+    }
+    ++m_misses;
+    if (!m_log.read(d.at, out))
+        return false;
+    cache_put(d.at, out);
+    return true;
+}
+
+bool store::body_of(const doc& d, jvalue& out)
+{
+    std::string json;
+    return json_of(d, json) && json_reader(json).document(out);
+}
+
+// ─── Collections and documents ──────────────────────────────────────────────
 
 store::coll_state* store::coll_of(std::string_view name)
 {
@@ -298,21 +545,44 @@ const store::coll_state* store::coll_of(std::string_view name) const
     return it == m_colls.end() ? nullptr : &it->second;
 }
 
+store::coll_state& store::make_coll(const std::string& name)
+{
+    coll_state& c = m_colls[name];
+    if (const collection_def* def = m_schema.find(name))
+    {
+        for (const auto& ix : def->indexes)
+            c.indexes.push_back(index_state{ix, {}});
+        c.ttl = def->ttl;
+    }
+    return c;
+}
+
 access store::access_of(std::string_view coll) const
 {
     const collection_def* d = m_schema.find(coll);
     return d ? d->acc : access::priv;
 }
 
+void store::derive(const coll_state& c, const jvalue& body, doc& d) const
+{
+    d.keys.clear();
+    for (const auto& ix : c.indexes)
+        d.keys.push_back(key_of(at_path(body, ix.def.field)));
+    d.expires = 0;
+    double t = 0;
+    if (const jvalue* v = c.ttl.empty() ? nullptr : at_path(body, c.ttl); v && number_of(*v, t) && t > 0)
+        d.expires = t > 9.2e18 ? INT64_MAX : static_cast<int64_t>(std::ceil(t));
+}
+
 void store::index_doc(coll_state& c, const std::string& id, const doc& d, bool add)
 {
-    for (auto& ix : c.indexes)
+    for (size_t i = 0; i < c.indexes.size() && i < d.keys.size(); ++i)
     {
-        std::pair<ikey, std::string> e{key_of(at_path(d.body, ix.def.field)), id};
+        std::pair<ikey, std::string> e{d.keys[i], id};
         if (add)
-            ix.entries.insert(std::move(e));
+            c.indexes[i].entries.insert(std::move(e));
         else
-            ix.entries.erase(e);
+            c.indexes[i].entries.erase(e);
     }
     if (!d.owner.empty())
     {
@@ -323,48 +593,133 @@ void store::index_doc(coll_state& c, const std::string& id, const doc& d, bool a
     }
 }
 
-void store::set_doc(coll_state& c, const std::string& id, const doc* d)
+void store::live_add(const doc& d, int64_t sign)
 {
-    if (const auto it = c.docs.find(id); it != c.docs.end())
-    {
-        index_doc(c, id, it->second, false);
-        m_bytes -= it->second.bytes;
-        --m_docs;
-        c.docs.erase(it);
-    }
-    if (d)
-    {
-        const auto [it, made] = c.docs.emplace(id, *d);
-        index_doc(c, id, it->second, true);
-        m_bytes += d->bytes;
-        ++m_docs;
-    }
+    if (d.at.seg == 0)
+        return;
+    uint64_t& l = m_live[d.at.seg];
+    const uint64_t n = d.at.len + seglog::record_head + 64;
+    l = sign > 0 ? l + n : (l > n ? l - n : 0);
 }
 
-void store::rebuild(coll_state& c, const collection_def* def)
+void store::set_doc(coll_state& c, const std::string& coll, const std::string& id, const doc* d)
 {
-    c.indexes.clear();
-    if (def)
-        for (const auto& d : def->indexes)
-            c.indexes.push_back(index_state{d, {}});
-    for (auto& ix : c.indexes)
-        for (const auto& [id, d] : c.docs)
-            ix.entries.emplace(key_of(at_path(d.body, ix.def.field)), id);
+    const auto it = c.docs.find(id);
+    if (it != c.docs.end())
+    {
+        doc& old = it->second;
+        index_doc(c, id, old, false);
+        if (old.expires)
+            m_expiry.erase({old.expires, coll, id});
+        m_bytes -= std::min<uint64_t>(m_bytes, old.at.len + id.size() + old.owner.size() + doc_overhead);
+        live_add(old, -1);
+        if (!d || old.at.seg != d->at.seg || old.at.off != d->at.off)
+            cache_drop(old.at);
+        if (d)
+        {
+            old = *d;
+        }
+        else
+        {
+            c.docs.erase(it);
+            --m_docs;
+        }
+    }
+    else if (d)
+    {
+        c.docs.emplace(id, *d);
+        ++m_docs;
+    }
+    if (!d)
+        return;
+    const doc& now = c.docs.find(id)->second;
+    index_doc(c, id, now, true);
+    if (now.expires)
+        m_expiry.emplace(now.expires, coll, id);
+    m_bytes += now.at.len + id.size() + now.owner.size() + doc_overhead;
+    live_add(now, +1);
+}
+
+bool store::rebuild(coll_state& c, const std::string& name, const collection_def* def, std::string& why)
+{
+    std::vector<index_def> want = def ? def->indexes : std::vector<index_def>{};
+    const std::string ttl = def ? def->ttl : std::string();
+    bool same_set = want.size() == c.indexes.size() && ttl == c.ttl;
+    for (size_t i = 0; same_set && i < want.size(); ++i)
+        same_set = want[i].field == c.indexes[i].def.field;
+    if (same_set)
+    {
+        for (size_t i = 0; i < want.size(); ++i)
+            c.indexes[i].def.unique = want[i].unique;
+        return true;
+    }
+    // Each document's values read again from its body, since the fields indexed changed.
+    std::vector<std::pair<std::string, doc>> docs;
+    docs.reserve(c.docs.size());
+    coll_state probe;
+    for (const auto& ix : want)
+        probe.indexes.push_back(index_state{ix, {}});
+    probe.ttl = ttl;
+    for (const auto& [id, d] : c.docs)
+    {
+        jvalue body;
+        if (!body_of(d, body))
+        {
+            why = "a document could not be read back to index it";
+            return false;
+        }
+        doc nd = d;
+        derive(probe, body, nd);
+        docs.emplace_back(id, std::move(nd));
+    }
+    for (auto& [id, d] : c.docs)
+        index_doc(c, id, d, false);
+    c.indexes = std::move(probe.indexes);
+    c.ttl = ttl;
+    for (auto& [id, nd] : docs)
+    {
+        doc& d = c.docs.find(id)->second;
+        if (d.expires)
+            m_expiry.erase({d.expires, name, id});
+        d.keys = std::move(nd.keys);
+        d.expires = nd.expires;
+        index_doc(c, id, d, true);
+        if (d.expires)
+            m_expiry.emplace(d.expires, name, id);
+    }
+    return true;
 }
 
 bool store::set_schema(const schema& s, std::string& why)
 {
     // Every unique index the schema has checked against the documents before anything changes.
-    for (const auto& [name, c] : m_colls)
+    for (auto& [name, c] : m_colls)
         if (const collection_def* def = s.find(name))
             for (const auto& ix : def->indexes)
             {
                 if (!ix.unique)
                     continue;
+                // The values already indexed answer when the field is; otherwise every body is read.
+                int known = -1;
+                for (size_t i = 0; i < c.indexes.size(); ++i)
+                    if (c.indexes[i].def.field == ix.field)
+                        known = static_cast<int>(i);
                 std::set<ikey> seen;
                 for (const auto& [id, d] : c.docs)
                 {
-                    ikey k = key_of(at_path(d.body, ix.field));
+                    ikey k;
+                    if (known >= 0)
+                        k = d.keys[static_cast<size_t>(known)];
+                    else
+                    {
+                        jvalue body;
+                        if (!body_of(d, body))
+                        {
+                            why = "a document could not be read back to check " + ix.field;
+                            return false;
+                        }
+                        k = key_of(at_path(body, ix.field));
+                    }
                     if (k.rank != ikey::null && !seen.insert(std::move(k)).second)
                     {
                         why = name + "." + ix.field + " cannot be unique: two documents hold one value";
@@ -374,212 +729,225 @@ bool store::set_schema(const schema& s, std::string& why)
             }
     m_schema = s;
     for (auto& [name, c] : m_colls)
-        rebuild(c, m_schema.find(name));
+        if (!rebuild(c, name, m_schema.find(name), why))
+            return false;
     return true;
 }
 
-bool store::apply(std::string_view record)
+// ─── Opening ────────────────────────────────────────────────────────────────
+
+bool store::scan(uint32_t seg, uint64_t payload_off, std::string_view payload)
 {
-    socketley::bytes::reader r(record);
-    uint8_t kind = 0;
-    uint32_t n = 0;
-    if (!r.u8(kind) || kind != rec_write || !r.u32(n) || n > max_ops)
+    std::vector<event> evs;
+    std::vector<uint64_t> offs;
+    uint64_t seq = 0;
+    if (!decode_record(payload, evs, &offs, &seq))
         return false;
-    for (uint32_t i = 0; i < n; ++i)
+    m_seq = std::max(m_seq, seq);
+    for (size_t i = 0; i < evs.size(); ++i)
     {
-        uint8_t e = 0;
-        std::string coll, id;
-        if (!r.u8(e) || !r.bytes(coll, 64) || !r.bytes(id, 128) || !valid_collection(coll))
-            return false;
-        coll_state* c = coll_of(coll);
+        const event& e = evs[i];
+        m_seq = std::max(m_seq, e.seq);
+        coll_state* c = coll_of(e.coll);
         if (!c)
+            c = &make_coll(e.coll);
+        // The latest record of a document wins, wherever a merge put the older ones.
+        const auto it = c->docs.find(e.id);
+        if (it != c->docs.end() && it->second.seq > e.seq)
+            continue;
+        c->last_seq = std::max(c->last_seq, e.seq);
+        // A deletion is remembered, so an older record a later segment holds does not bring the document back.
+        const std::string key = staged_key(e.coll, e.id);
+        if (e.del)
         {
-            c = &m_colls[coll];
-            rebuild(*c, m_schema.find(coll));
-        }
-        if (e == ent_del)
-        {
-            set_doc(*c, id, nullptr);
+            set_doc(*c, e.coll, e.id, nullptr);
+            m_tombs[key] = std::max(m_tombs[key], e.seq);
             continue;
         }
-        if (e != ent_put)
-            return false;
+        if (const auto t = m_tombs.find(key); t != m_tombs.end() && t->second > e.seq)
+            continue;
         doc d;
-        std::string json;
-        if (!r.u64(d.v) || !r.bytes(d.owner, 256) || !r.bytes(json, max_doc) || !json_reader(json).document(d.body))
-            return false;
-        d.bytes = json.size() + id.size() + d.owner.size() + doc_overhead;
-        set_doc(*c, id, &d);
+        d.owner = e.owner;
+        d.v = e.v;
+        d.seq = e.seq;
+        d.at = location{seg, payload_off + offs[i], static_cast<uint32_t>(e.json.size())};
+        if (!c->indexes.empty() || !c->ttl.empty())
+        {
+            jvalue body;
+            if (!json_reader(e.json).document(body))
+                return false;
+            derive(*c, body, d);
+        }
+        set_doc(*c, e.coll, e.id, &d);
     }
     return true;
 }
 
-bool store::read_snapshot(const std::string& path, std::string& why)
+namespace
+{
+
+// The documents of the first format, a snapshot of JSON lines and a journal of records, as they stood last.
+bool read_v1(const std::string& dir, std::map<std::pair<std::string, std::string>, event>& out, std::string& why)
 {
     std::string text;
-    if (!read_whole_file(path, text))
-        return true;   // no snapshot yet: everything is in the journal
-    m_snapshot_bytes = text.size();
-    std::string_view rest = text;
-    size_t line_no = 0;
-    bool header = false;
-    while (!rest.empty())
+    if (read_whole_file(dir + "/data.snapshot", text))
     {
-        const size_t nl = rest.find('\n');
-        const std::string_view line = rest.substr(0, nl);
-        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
-        ++line_no;
-        if (line.empty())
-            continue;
-        const std::string at = path + " line " + std::to_string(line_no);
-        // A document's line is its place, a tab, and its fields, so a document as deep as a write allows still reads.
-        const size_t tab = line.find('\t');
-        jvalue meta;
-        if (!json_reader(line.substr(0, tab)).document(meta))
+        bool header = false;
+        for (std::string_view rest = text; !rest.empty();)
         {
-            why = at + " is not JSON";
-            return false;
-        }
-        if (!header)
-        {
-            const jvalue* f = member(meta, "format");
-            const jvalue* v = member(meta, "version");
-            if (!f || f->k != jvalue::kind::string || f->s != journal_owner)
+            const size_t nl = rest.find('\n');
+            const std::string_view line = rest.substr(0, nl);
+            rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+            if (line.empty())
+                continue;
+            const size_t tab = line.find('\t');
+            jvalue meta;
+            if (!json_reader(line.substr(0, tab)).document(meta))
             {
-                why = path + " is not a db snapshot";
+                why = dir + "/data.snapshot is not a snapshot of this database";
                 return false;
             }
-            // A newer build's snapshot is left alone rather than read in part and written back without the rest.
-            if (const uint64_t ver = v ? std::strtoull(v->s.c_str(), nullptr, 10) : 0; ver > format_version)
+            if (!header)
             {
-                why = path + " is version " + std::to_string(ver) + ", newer than this build reads (" +
-                      std::to_string(format_version) + "); start the build that wrote it";
-                return false;
+                header = true;
+                continue;
             }
-            header = true;
-            continue;
+            const jvalue* c = member(meta, "c");
+            const jvalue* id = member(meta, "id");
+            const jvalue* v = member(meta, "v");
+            const jvalue* o = member(meta, "o");
+            if (tab == std::string_view::npos || !c || !id || !v)
+                continue;
+            event e;
+            e.coll = c->s;
+            e.id = id->s;
+            e.v = std::strtoull(v->s.c_str(), nullptr, 10);
+            e.owner = o ? o->s : std::string();
+            e.json.assign(line.substr(tab + 1));
+            out[{e.coll, e.id}] = std::move(e);
         }
-        const jvalue* c = member(meta, "c");
-        const jvalue* id = member(meta, "id");
-        const jvalue* v = member(meta, "v");
-        const jvalue* o = member(meta, "o");
-        doc d;
-        if (tab == std::string_view::npos || !c || c->k != jvalue::kind::string || !valid_collection(c->s) || !id ||
-            id->k != jvalue::kind::string || !v || v->k != jvalue::kind::number ||
-            !json_reader(line.substr(tab + 1)).document(d.body))
-        {
-            why = at + " is not a document";
-            return false;
-        }
-        d.v = std::strtoull(v->s.c_str(), nullptr, 10);
-        if (o && o->k == jvalue::kind::string)
-            d.owner = o->s;
-        d.bytes = line.size() - tab + id->s.size() + d.owner.size() + doc_overhead;
-        coll_state& cs = m_colls[c->s];
-        set_doc(cs, id->s, &d);
     }
-    return true;
-}
-
-bool store::open(const std::string& dir, std::string& why)
-{
-    close();
-    m_dir = dir;
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (!std::filesystem::is_directory(dir, ec))
-    {
-        why = "the data directory " + dir + " cannot be made";
-        return false;
-    }
-    if (::chmod(dir.c_str(), 0700) != 0) {}
-    if (!read_snapshot(dir + "/data.snapshot", why))
-        return false;
     const std::string jpath = dir + "/data.journal";
     std::string owner;
-    const auto probe = mutation_journal::probe(jpath, owner);
-    if (probe == mutation_journal::probe_result::not_a_journal || probe == mutation_journal::probe_result::unreadable ||
-        (probe == mutation_journal::probe_result::has_records && owner != journal_owner))
-    {
-        why = jpath + " is not this database's journal";
-        return false;
-    }
-    if (probe == mutation_journal::probe_result::has_records)
-    {
-        mutation_journal::replay_stats st;
-        bool bad = false;
-        mutation_journal::replay(jpath, [&](std::string_view rec) {
-            if (!apply(rec))
-                bad = true;
-            ++m_journal_records;
-            m_journal_bytes += rec.size();
-        }, st);
-        if (bad)
+    if (mutation_journal::probe(jpath, owner) != mutation_journal::probe_result::has_records)
+        return true;
+    mutation_journal::replay_stats st;
+    bool bad = false;
+    mutation_journal::replay(jpath, [&](std::string_view rec) {
+        socketley::bytes::reader r(rec);
+        uint8_t kind = 0;
+        uint32_t n = 0;
+        if (!r.u8(kind) || kind != rec_write || !r.u32(n))
         {
-            why = jpath + " holds a record this build cannot read";
+            bad = true;
+            return;
+        }
+        for (uint32_t i = 0; i < n && !bad; ++i)
+        {
+            uint8_t t = 0;
+            event e;
+            if (!r.u8(t) || !r.bytes(e.coll, 64) || !r.bytes(e.id, 128))
+            {
+                bad = true;
+                break;
+            }
+            if (t == ent_del)
+            {
+                out.erase({e.coll, e.id});
+                continue;
+            }
+            if (!r.u64(e.v) || !r.bytes(e.owner, 256) || !r.bytes(e.json, store::max_doc))
+            {
+                bad = true;
+                break;
+            }
+            out[{e.coll, e.id}] = std::move(e);
+        }
+    }, st);
+    if (bad)
+        why = jpath + " holds a record this build cannot read";
+    return !bad;
+}
+
+}   // namespace
+
+bool store::open(const std::string& dir, const schema& s, std::string& why)
+{
+    close();
+    m_schema = s;
+    // A database of the first format, a snapshot and a journal, is taken into segments once and its files kept aside.
+    std::error_code ec;
+    const bool v1 = std::filesystem::exists(dir + "/data.snapshot", ec) || std::filesystem::exists(dir + "/data.journal", ec);
+    std::map<std::pair<std::string, std::string>, event> old;
+    if (v1 && !read_v1(dir, old, why))
+        return false;
+    if (!m_log.open(dir, [this](uint32_t seg, uint64_t off, std::string_view p) { return scan(seg, off, p); }, why))
+        return false;
+    if (v1)
+    {
+        for (auto& [key, e] : old)
+        {
+            e.seq = ++m_seq;
+            std::vector<uint64_t> offs;
+            const location at = m_log.append(encode_record(e.seq, {e}, &offs));
+            coll_state* c = coll_of(e.coll);
+            if (!c)
+                c = &make_coll(e.coll);
+            c->last_seq = e.seq;
+            doc d;
+            d.owner = e.owner;
+            d.v = e.v;
+            d.seq = e.seq;
+            d.at = location{at.seg, at.off + offs[0], static_cast<uint32_t>(e.json.size())};
+            jvalue body;
+            if (!json_reader(e.json).document(body))
+            {
+                why = "a document of the first format is no JSON object";
+                return false;
+            }
+            derive(*c, body, d);
+            set_doc(*c, e.coll, e.id, &d);
+            std::string ignored;
+            m_log.roll_if_full(ignored);
+        }
+        if (!m_log.sync())
+        {
+            why = "the documents of the first format could not be written into segments";
             return false;
         }
+        for (const char* f : {"/data.snapshot", "/data.journal"})
+            std::filesystem::rename(dir + f, dir + f + ".v1", ec);
     }
+    // The deletions scan() remembered were for itself.
+    m_tombs.clear();
+    // The unique indexes hold as the documents read are, or the schema is refused.
+    schema none;
+    const schema wanted = m_schema;
+    m_schema = none;
     for (auto& [name, c] : m_colls)
-        rebuild(c, m_schema.find(name));
-    if (!m_journal.open_append(jpath, journal_owner))
-    {
-        why = jpath + " cannot be opened for writing";
-        return false;
-    }
-    if ((m_journal_records >= compact_records || m_journal_bytes >= compact_bytes) && !compact(why))
+        for (auto& ix : c.indexes)
+            ix.def.unique = false;
+    if (!set_schema(wanted, why))
         return false;
     return true;
 }
 
 void store::close()
 {
-    m_journal.close();
+    m_log.close();
     m_colls.clear();
+    m_expiry.clear();
+    m_live.clear();
+    m_staged.clear();
+    m_lru.clear();
+    m_cache.clear();
+    m_cache_bytes = 0;
     m_docs = 0;
     m_bytes = 0;
-    m_journal_records = 0;
-    m_journal_bytes = 0;
-    m_snapshot_bytes = 0;
-}
-
-bool store::compact(std::string& why)
-{
-    std::string out = "{\"format\":\"" + std::string(journal_owner) + "\",\"version\":" + std::to_string(format_version) +
-                      "}\n";
-    for (const auto& [name, c] : m_colls)
-        for (const auto& [id, d] : c.docs)
-        {
-            out += "{\"c\":";
-            write_string(name, out);
-            out += ",\"id\":";
-            write_string(id, out);
-            out += ",\"v\":" + std::to_string(d.v);
-            if (!d.owner.empty())
-            {
-                out += ",\"o\":";
-                write_string(d.owner, out);
-            }
-            out += "}\t";
-            write_json(d.body, out);
-            out += '\n';
-        }
-    if (!replace_file(m_dir + "/data.snapshot", out, true))
-    {
-        why = "the snapshot could not be written";
-        return false;
-    }
-    // Behind the snapshot that now holds their effects; a crash before this replays records already in it, which
-    // changes nothing, since a record sets documents rather than changing them.
-    if (!m_journal.reset())
-    {
-        why = "the journal could not be cut behind the snapshot";
-        return false;
-    }
-    m_snapshot_bytes = out.size();
-    m_journal_records = 0;
-    m_journal_bytes = 0;
-    return true;
+    m_seq = 0;
+    m_doomed.clear();
+    m_pins = 0;
+    m_job_running = false;
 }
 
 std::vector<std::string> store::collection_names() const
@@ -587,15 +955,23 @@ std::vector<std::string> store::collection_names() const
     std::vector<std::string> out;
     out.reserve(m_colls.size());
     for (const auto& [name, c] : m_colls)
-        out.push_back(name);
+        if (!c.docs.empty())
+            out.push_back(name);
     std::sort(out.begin(), out.end());
     return out;
 }
 
 // ─── Reading ────────────────────────────────────────────────────────────────
 
+bool store::expired(const doc& d) const
+{
+    return d.expires && d.expires <= now_sec();
+}
+
 bool store::may_read(const principal& who, access a, const doc& d) const
 {
+    if (expired(d))
+        return false;
     if (who.kind == principal::key)
         return true;
     switch (a)
@@ -638,15 +1014,20 @@ const doc* store::get(std::string_view coll, std::string_view id) const
     if (!c)
         return nullptr;
     const auto it = c->docs.find(id);
-    return it == c->docs.end() ? nullptr : &it->second;
+    return it == c->docs.end() || expired(it->second) ? nullptr : &it->second;
 }
 
-bool store::read(const principal& who, std::string_view coll, std::string_view id, std::string& out, error& err) const
+bool store::read(const principal& who, std::string_view coll, std::string_view id, std::string& out, error& err,
+                 uint64_t& depends)
 {
+    depends = 0;
     const access a = access_of(coll);
     if (!reach(who, a, err))
         return false;
     const coll_state* c = coll_of(coll);
+    // An absence rests on the collection's last change, which may be the deletion not yet on the disk.
+    if (c)
+        depends = c->last_seq;
     const auto it = c ? c->docs.find(id) : decltype(c->docs)::const_iterator{};
     // Another's document in an owner collection is answered as absent, so its id says nothing.
     if (!c || it == c->docs.end() || !may_read(who, a, it->second))
@@ -654,7 +1035,14 @@ bool store::read(const principal& who, std::string_view coll, std::string_view i
         err = fail(404, "not_found", "no such document");
         return false;
     }
-    write_doc(it->first, it->second, out);
+    depends = it->second.seq;
+    std::string json;
+    if (!json_of(it->second, json))
+    {
+        err = fail(503, "unreadable", "the document could not be read from the disk");
+        return false;
+    }
+    write_doc(it->first, it->second, json, out);
     return true;
 }
 
@@ -777,22 +1165,40 @@ bool store::parse_query(const jvalue& in, query& q, error& err)
     return true;
 }
 
-bool store::find(const principal& who, std::string_view coll, const query& q, std::string& out, error& err) const
+
+bool store::find(const principal& who, std::string_view coll, const query& q, std::string& out, error& err,
+                 uint64_t& depends)
 {
+    depends = 0;
     const access a = access_of(coll);
     if (!reach(who, a, err))
         return false;
-    const coll_state* c = coll_of(coll);
+    coll_state* c = coll_of(coll);
     if (!c)
     {
         out += q.count ? "{\"count\":0}" : "{\"docs\":[]}";
         return true;
     }
+    depends = c->last_seq;
     const bool own_only = who.kind == principal::user && a == access::owner;
-    const index_state* sort_ix = nullptr;
-    for (const auto& ix : c->indexes)
-        if (!q.sort.empty() && ix.def.field == q.sort)
-            sort_ix = &ix;
+    // Where each condition's field is indexed, so its value is read from the document's keys and not its body.
+    const auto index_of = [&](std::string_view field) -> int {
+        for (size_t i = 0; i < c->indexes.size(); ++i)
+            if (c->indexes[i].def.field == field)
+                return static_cast<int>(i);
+        return -1;
+    };
+    std::vector<int> cond_ix;
+    bool needs_body = false;
+    for (const auto& cond : q.where)
+    {
+        const int ix = system_field(cond.field) ? -2 : index_of(cond.field);
+        cond_ix.push_back(ix == -1 || (ix >= 0 && !by_key(cond)) ? -1 : ix);
+        needs_body = needs_body || cond_ix.back() == -1;
+    }
+    const int sort_ix = q.sort.empty() || system_field(q.sort) ? -2 : index_of(q.sort);
+    needs_body = needs_body || (!q.sort.empty() && sort_ix == -1);
+    const index_state* walk = sort_ix >= 0 ? &c->indexes[static_cast<size_t>(sort_ix)] : nullptr;
 
     // Where the documents come from: the account's own, one index's values, one index's range, the sort's index in
     // its order, or every document.
@@ -810,12 +1216,10 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
     {
         if (planned)
             break;
-        const index_state* ix = nullptr;
-        for (const auto& i : c->indexes)
-            if (i.def.field == cond.field)
-                ix = &i;
-        if (!ix)
+        const int pos = system_field(cond.field) ? -1 : index_of(cond.field);
+        if (pos < 0)
             continue;
+        const index_state* ix = &c->indexes[static_cast<size_t>(pos)];
         if (cond.op == query::cond::eq || cond.op == query::cond::in)
         {
             const auto take = [&](const ikey& k) {
@@ -850,14 +1254,14 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
             planned = true;
         }
     }
-    if (!planned && sort_ix)
+    if (!planned && walk)
     {
         in_order = true;
         if (q.desc)
-            for (auto it = sort_ix->entries.rbegin(); it != sort_ix->entries.rend(); ++it)
+            for (auto it = walk->entries.rbegin(); it != walk->entries.rend(); ++it)
                 ids.push_back(&it->second);
         else
-            for (const auto& e : sort_ix->entries)
+            for (const auto& e : walk->entries)
                 ids.push_back(&e.second);
     }
     else if (!planned)
@@ -873,24 +1277,53 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
                   ids.end());
     }
 
-    std::vector<std::pair<const std::string*, const doc*>> hits;
+    struct hit
+    {
+        const std::string* id;
+        const doc* d;
+        std::string json;
+        ikey sort;
+    };
+    std::vector<hit> hits;
     const size_t enough = q.skip + q.limit + 1;
-    jvalue scratch;
+    jvalue scratch, body;
+    std::string json;
     for (const std::string* id : ids)
     {
         const doc& d = c->docs.find(*id)->second;
         if (!may_read(who, a, d))
             continue;
-        bool ok = true;
-        for (const auto& cond : q.where)
-            if (!meets(cond, field_of(d, *id, cond.field, scratch)))
+        bool have_body = false;
+        if (needs_body)
+        {
+            if (!json_of(d, json) || !json_reader(json).document(body))
             {
-                ok = false;
-                break;
+                err = fail(503, "unreadable", "a document could not be read from the disk");
+                return false;
             }
+            have_body = true;
+        }
+        bool ok = true;
+        for (size_t i = 0; ok && i < q.where.size(); ++i)
+        {
+            const auto& cond = q.where[i];
+            if (cond_ix[i] >= 0)
+                ok = meets_key(cond, d.keys[static_cast<size_t>(cond_ix[i])]);
+            else if (cond_ix[i] == -2)
+                ok = meets(cond, system_of(d, *id, cond.field, scratch));
+            else
+                ok = meets(cond, at_path(body, cond.field));
+        }
         if (!ok)
             continue;
-        hits.emplace_back(id, &d);
+        hit h{id, &d, {}, {}};
+        if (!q.sort.empty() && !in_order)
+            h.sort = sort_ix >= 0      ? d.keys[static_cast<size_t>(sort_ix)]
+                     : sort_ix == -2   ? key_of(system_of(d, *id, q.sort, scratch))
+                                       : key_of(have_body ? at_path(body, q.sort) : nullptr);
+        if (have_body)
+            h.json = std::move(json);
+        hits.push_back(std::move(h));
         if (in_order && !q.count && hits.size() >= enough)
             break;
     }
@@ -900,23 +1333,11 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
         return true;
     }
     if (!in_order && !q.sort.empty())
-    {
-        std::vector<std::pair<ikey, size_t>> keys;
-        keys.reserve(hits.size());
-        for (size_t i = 0; i < hits.size(); ++i)
-            keys.emplace_back(key_of(field_of(*hits[i].second, *hits[i].first, q.sort, scratch)), i);
-        std::stable_sort(keys.begin(), keys.end(), [&](const auto& x, const auto& y) {
-            if (x.first == y.first)
-                return q.desc ? *hits[y.second].first < *hits[x.second].first
-                              : *hits[x.second].first < *hits[y.second].first;
-            return q.desc ? y.first < x.first : x.first < y.first;
+        std::stable_sort(hits.begin(), hits.end(), [&](const hit& x, const hit& y) {
+            if (x.sort == y.sort)
+                return q.desc ? *y.id < *x.id : *x.id < *y.id;
+            return q.desc ? y.sort < x.sort : x.sort < y.sort;
         });
-        std::vector<std::pair<const std::string*, const doc*>> sorted;
-        sorted.reserve(hits.size());
-        for (const auto& [k, i] : keys)
-            sorted.push_back(hits[i]);
-        hits.swap(sorted);
-    }
     else if (!in_order && q.desc)
         std::reverse(hits.begin(), hits.end());
     out += "{\"docs\":[";
@@ -925,7 +1346,12 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
     {
         if (i > q.skip)
             out += ',';
-        write_doc(*hits[i].first, *hits[i].second, out);
+        if (hits[i].json.empty() && !json_of(*hits[i].d, hits[i].json))
+        {
+            err = fail(503, "unreadable", "a document could not be read from the disk");
+            return false;
+        }
+        write_doc(*hits[i].id, *hits[i].d, hits[i].json, out);
     }
     out += ']';
     if (hits.size() > q.skip + q.limit)
@@ -938,16 +1364,21 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
 
 bool store::unique_ok(const coll_state& c, const std::string& id, const doc& d, error& err) const
 {
-    for (const auto& ix : c.indexes)
+    for (size_t i = 0; i < c.indexes.size(); ++i)
     {
+        const auto& ix = c.indexes[i];
         if (!ix.def.unique)
             continue;
-        const ikey k = key_of(at_path(d.body, ix.def.field));
+        const ikey& k = d.keys[i];
         if (k.rank == ikey::null)
             continue;
         for (auto it = ix.entries.lower_bound({k, std::string()}); it != ix.entries.end() && it->first == k; ++it)
             if (it->second != id)
             {
+                const auto other = c.docs.find(it->second);
+                // A document whose time came holds its value no longer.
+                if (other != c.docs.end() && expired(other->second))
+                    continue;
                 err = fail(409, "taken", ix.def.field + " holds a value another document has: it is unique");
                 return false;
             }
@@ -955,7 +1386,8 @@ bool store::unique_ok(const coll_state& c, const std::string& id, const doc& d, 
     return true;
 }
 
-bool store::write(const principal& who, std::vector<write_op>& ops, std::string& out, error& err)
+bool store::write(const principal& who, std::vector<write_op>& ops, std::string& out, error& err,
+                  std::vector<event>* events)
 {
     if (ops.empty() || ops.size() > max_ops)
     {
@@ -982,15 +1414,18 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
     std::string results = "[";
     const auto rollback = [&] {
         for (auto it = undos.rbegin(); it != undos.rend(); ++it)
-            set_doc(*it->c, it->id, it->had ? &it->before : nullptr);
+            set_doc(*it->c, it->coll, it->id, it->had ? &it->before : nullptr);
         for (const auto& name : made_colls)
             m_colls.erase(name);
+        m_staged.clear();
     };
     const auto refuse = [&](error e) {
         rollback();
         err = std::move(e);
         return false;
     };
+    const uint64_t seq = m_seq + 1;
+    size_t total = 0;
 
     for (auto& op : ops)
     {
@@ -1005,8 +1440,7 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
             if (m_colls.size() >= max_collections)
                 return refuse(fail(507, "full", "a database holds at most " + std::to_string(max_collections) +
                                                     " collections"));
-            c = &m_colls[op.coll];
-            rebuild(*c, m_schema.find(op.coll));
+            c = &make_coll(op.coll);
             made_colls.push_back(op.coll);
         }
         if (op.kind == write_op::insert)
@@ -1021,8 +1455,9 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
         else if (!valid_id(op.id))
             return refuse(fail(400, "bad_id", "an id is 1 to 128 of A-Z a-z 0-9 . _ : @ + -, not _ first"));
 
-        const auto it = c->docs.find(op.id);
-        const doc* old = it == c->docs.end() ? nullptr : &it->second;
+        auto it = c->docs.find(op.id);
+        // A document whose time came is gone, whatever the deletion that says so has not yet done.
+        const doc* old = it == c->docs.end() || expired(it->second) ? nullptr : &it->second;
         if (op.if_absent && old)
             return refuse(fail(412, "exists", "the document exists"));
         if (op.if_v && (!old || old->v != op.if_v))
@@ -1034,12 +1469,14 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
         if (who.kind == principal::user && old && old->owner != who.sub)
             return refuse(a == access::owner ? fail(404, "not_found", "no such document")
                                              : fail(403, "not_yours", "the document is another account's"));
+        const std::string key = staged_key(op.coll, op.id);
         if (std::none_of(undos.begin(), undos.end(), [&](const undo& u) { return u.c == c && u.id == op.id; }))
-            undos.push_back({c, op.coll, op.id, old != nullptr, old ? *old : doc{}});
+            undos.push_back({c, op.coll, op.id, it != c->docs.end(), it != c->docs.end() ? it->second : doc{}});
 
         if (op.kind == write_op::del)
         {
-            set_doc(*c, op.id, nullptr);
+            set_doc(*c, op.coll, op.id, nullptr);
+            m_staged.erase(key);
             results += results.size() > 1 ? "," : "";
             results += "{\"_id\":";
             write_string(op.id, results);
@@ -1050,20 +1487,24 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
         if (op.kind == write_op::patch)
         {
             nd = *old;
-            if (!apply_patch(nd.body, op.body, err))
+            jvalue body;
+            const auto s = m_staged.find(key);
+            if (s != m_staged.end() ? !json_reader(s->second).document(body) : !body_of(*old, body))
+                return refuse(fail(503, "unreadable", "the document could not be read from the disk"));
+            if (!apply_patch(body, op.body, err))
             {
                 error e = std::move(err);
                 return refuse(std::move(e));
             }
+            op.body = std::move(body);
         }
         else
         {
             if (op.body.k != jvalue::kind::object)
                 return refuse(fail(400, "bad_document", "a document is a JSON object"));
-            nd.body = std::move(op.body);
             nd.owner = old ? old->owner : std::string();
             // What a document read back carries is taken off, and _owner set by a key alone.
-            for (auto m = nd.body.members.begin(); m != nd.body.members.end();)
+            for (auto m = op.body.members.begin(); m != op.body.members.end();)
             {
                 if (!m->first.starts_with('_'))
                 {
@@ -1081,62 +1522,327 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
                 else if (!system_field(m->first))
                     return refuse(fail(400, "bad_document", "a field's name starting with _ is the database's: " +
                                                                 m->first));
-                m = nd.body.members.erase(m);
+                m = op.body.members.erase(m);
             }
-            for (const auto& [k, v] : nd.body.members)
+            for (const auto& [k, v] : op.body.members)
                 if (!valid_path(k) || k.find('.') != std::string::npos)
                     return refuse(fail(400, "bad_document", "a field's name is 1 to 64 of A-Z a-z 0-9 _ -: " + k));
         }
         if (who.kind == principal::user)
             nd.owner = who.sub;
         nd.v = old ? old->v + 1 : 1;
-        if (depth_of(nd.body) > socketley::storage::json_max_depth)
+        nd.seq = seq;
+        if (depth_of(op.body) > socketley::storage::json_max_depth)
             return refuse(fail(400, "too_deep", "a document nests at most " +
                                                     std::to_string(socketley::storage::json_max_depth) + " deep"));
-        const std::string json = to_json(nd.body);
+        std::string json = to_json(op.body);
         if (json.size() > max_doc)
             return refuse(fail(413, "too_large", "a document is at most 1 MiB; keep large things in a storage and "
                                                  "their address here"));
-        nd.bytes = json.size() + op.id.size() + nd.owner.size() + doc_overhead;
+        total += json.size();
+        if (total > max_write)
+            return refuse(fail(413, "too_large", "a write is at most 32 MiB"));
+        derive(*c, op.body, nd);
+        // No place on the disk yet: the length counts for the bounds, the place comes with the record.
+        nd.at = location{0, 0, static_cast<uint32_t>(json.size())};
         if (!unique_ok(*c, op.id, nd, err))
         {
             error e = std::move(err);
             return refuse(std::move(e));
         }
-        set_doc(*c, op.id, &nd);
+        set_doc(*c, op.coll, op.id, &nd);
         results += results.size() > 1 ? "," : "";
-        write_doc(op.id, c->docs.find(op.id)->second, results);
+        write_doc(op.id, nd, json, results);
+        m_staged[key] = std::move(json);
     }
     if (m_max_bytes && m_bytes > m_max_bytes && m_bytes > bytes_before)
         return refuse(fail(507, "full", "the database holds its --max-bytes"));
 
-    socketley::bytes::writer w;
-    w.u8(rec_write);
-    w.u32(static_cast<uint32_t>(undos.size()));
+    // One record of every touched document as it now is, and each one's place in it.
+    std::vector<event> evs;
+    evs.reserve(undos.size());
     for (const auto& u : undos)
     {
+        event e;
+        e.seq = seq;
+        e.coll = u.coll;
+        e.id = u.id;
         const auto it = u.c->docs.find(u.id);
         if (it == u.c->docs.end())
-            put_entry(w, u.coll, u.id, nullptr, nullptr);
+        {
+            e.del = true;
+            e.owner = u.had ? u.before.owner : std::string();
+        }
         else
         {
-            const std::string json = to_json(it->second.body);
-            put_entry(w, u.coll, u.id, &it->second, &json);
+            e.owner = it->second.owner;
+            e.v = it->second.v;
+            e.json = m_staged[staged_key(u.coll, u.id)];
         }
+        evs.push_back(std::move(e));
     }
-    const std::string rec = w.take();
-    m_journal.append(rec);
-    ++m_journal_records;
-    m_journal_bytes += rec.size();
-    if (m_journal_records >= compact_records ||
-        m_journal_bytes >= std::max<uint64_t>(compact_bytes, 2 * m_snapshot_bytes))
+    std::vector<uint64_t> offs;
+    const location at = m_log.append(encode_record(seq, evs, &offs));
+    m_seq = seq;
+    for (size_t i = 0; i < evs.size(); ++i)
     {
-        std::string ignored;
-        compact(ignored);
+        auto& u = undos[i];
+        u.c->last_seq = seq;
+        if (evs[i].del)
+            continue;
+        doc& d = u.c->docs.find(u.id)->second;
+        live_add(d, -1);
+        d.at = location{at.seg, at.off + offs[i], static_cast<uint32_t>(evs[i].json.size())};
+        live_add(d, +1);
+        cache_put(d.at, evs[i].json);
     }
+    m_staged.clear();
+    if (events)
+        for (auto& e : evs)
+            events->push_back(std::move(e));
+    std::string ignored;
+    m_log.roll_if_full(ignored);
     out += results;
     out += ']';
     return true;
+}
+
+size_t store::expire(int64_t now, std::vector<event>* events)
+{
+    std::vector<write_op> ops;
+    for (auto it = m_expiry.begin(); it != m_expiry.end() && std::get<0>(*it) <= now && ops.size() < max_ops; ++it)
+    {
+        write_op op;
+        op.kind = write_op::del;
+        op.coll = std::get<1>(*it);
+        op.id = std::get<2>(*it);
+        ops.push_back(std::move(op));
+    }
+    if (ops.empty())
+        return 0;
+    // Through write(), as a key, after the time came: expired() makes it absent, so the deletion is written directly.
+    std::vector<event> evs;
+    const uint64_t seq = m_seq + 1;
+    for (const auto& op : ops)
+    {
+        coll_state* c = coll_of(op.coll);
+        const auto it = c ? c->docs.find(op.id) : decltype(c->docs)::iterator{};
+        if (!c || it == c->docs.end())
+            continue;
+        event e;
+        e.seq = seq;
+        e.coll = op.coll;
+        e.id = op.id;
+        e.owner = it->second.owner;
+        e.del = true;
+        set_doc(*c, op.coll, op.id, nullptr);
+        c->last_seq = seq;
+        evs.push_back(std::move(e));
+    }
+    if (evs.empty())
+        return 0;
+    m_log.append(encode_record(seq, evs));
+    m_seq = seq;
+    const size_t n = evs.size();
+    if (events)
+        for (auto& e : evs)
+            events->push_back(std::move(e));
+    std::string ignored;
+    m_log.roll_if_full(ignored);
+    return n;
+}
+
+int64_t store::next_expiry() const
+{
+    return m_expiry.empty() ? 0 : std::get<0>(*m_expiry.begin());
+}
+
+bool store::apply(const std::vector<event>& evs, std::string& why)
+{
+    // Events of one sequence number are one record, as the write that made them was.
+    size_t from = 0;
+    while (from < evs.size())
+    {
+        size_t to = from + 1;
+        while (to < evs.size() && evs[to].seq == evs[from].seq)
+            ++to;
+        const std::vector<event> group(evs.begin() + static_cast<std::ptrdiff_t>(from),
+                                       evs.begin() + static_cast<std::ptrdiff_t>(to));
+        const uint64_t seq = group.front().seq;
+        if (seq <= m_seq)
+        {
+            from = to;
+            continue;
+        }
+        std::vector<uint64_t> offs;
+        const location at = m_log.append(encode_record(seq, group, &offs));
+        for (size_t i = 0; i < group.size(); ++i)
+        {
+            const event& e = group[i];
+            if (!valid_collection(e.coll) || !valid_id(e.id))
+            {
+                why = "a change names no collection or id this database takes";
+                return false;
+            }
+            coll_state* c = coll_of(e.coll);
+            if (!c)
+                c = &make_coll(e.coll);
+            c->last_seq = seq;
+            if (e.del)
+            {
+                set_doc(*c, e.coll, e.id, nullptr);
+                continue;
+            }
+            doc d;
+            d.owner = e.owner;
+            d.v = e.v;
+            d.seq = seq;
+            d.at = location{at.seg, at.off + offs[i], static_cast<uint32_t>(e.json.size())};
+            jvalue body;
+            if (!json_reader(e.json).document(body))
+            {
+                why = "a change carries a document that is no JSON object";
+                return false;
+            }
+            derive(*c, body, d);
+            set_doc(*c, e.coll, e.id, &d);
+            cache_put(d.at, e.json);
+        }
+        m_seq = seq;
+        std::string ignored;
+        m_log.roll_if_full(ignored);
+        from = to;
+    }
+    return true;
+}
+
+void store::mark(uint64_t seq)
+{
+    if (seq <= m_seq)
+        return;
+    m_log.append(encode_record(seq, {}));
+    m_seq = seq;
+}
+
+bool store::reset(std::string& why)
+{
+    if (!m_log.clear(why))
+        return false;
+    m_colls.clear();
+    m_expiry.clear();
+    m_live.clear();
+    m_lru.clear();
+    m_cache.clear();
+    m_cache_bytes = 0;
+    m_docs = 0;
+    m_bytes = 0;
+    m_seq = 0;
+    m_doomed.clear();
+    return true;
+}
+
+// ─── Merges, backups and whole copies ───────────────────────────────────────
+
+std::vector<copy_job::item> store::everything()
+{
+    std::vector<copy_job::item> out;
+    out.reserve(m_docs);
+    for (const auto& [name, c] : m_colls)
+        for (const auto& [id, d] : c.docs)
+            if (!expired(d))
+                out.push_back(copy_job::item{name, id, d.owner, d.v, d.seq, d.at, {}});
+    // In the order they were written, so a copy taken in applies older changes first.
+    std::sort(out.begin(), out.end(), [](const auto& x, const auto& y) { return x.seq < y.seq; });
+    return out;
+}
+
+std::unique_ptr<copy_job> store::plan_merge()
+{
+    if (m_job_running)
+        return nullptr;
+    const std::vector<uint32_t> sealed = m_log.sealed();
+    if (sealed.empty())
+        return nullptr;
+    uint64_t size = 0, live = 0;
+    for (const uint32_t s : sealed)
+    {
+        size += m_log.size_of(s);
+        const auto it = m_live.find(s);
+        live += it == m_live.end() ? 0 : it->second;
+    }
+    const uint64_t dead = size > live ? size - live : 0;
+    if (dead < merge_floor || dead < live)
+        return nullptr;
+    auto job = std::make_unique<copy_job>();
+    job->merge = true;
+    job->sources = sealed;
+    job->dir = m_log.dir();
+    for (const auto& [name, c] : m_colls)
+        for (const auto& [id, d] : c.docs)
+            if (std::find(sealed.begin(), sealed.end(), d.at.seg) != sealed.end())
+                job->items.push_back(copy_job::item{name, id, d.owner, d.v, d.seq, d.at, {}});
+    job->dest_seg = m_log.reserve();
+    job->dest = m_log.path_of(job->dest_seg);
+    m_job_running = true;
+    return job;
+}
+
+std::unique_ptr<copy_job> store::plan_backup(const std::string& dest)
+{
+    if (m_job_running || !m_log.flush())
+        return nullptr;
+    auto job = std::make_unique<copy_job>();
+    job->dir = m_log.dir();
+    job->dest = dest;
+    job->items = everything();
+    m_job_running = true;
+    return job;
+}
+
+void store::finish(copy_job& job)
+{
+    m_job_running = false;
+    if (!job.ok || !job.merge)
+        return;
+    std::string why;
+    if (!m_log.adopt(job.dest_seg, why))
+        return;
+    // A document still where the merge read it now lies where it was copied; one changed since stays where it went.
+    for (const auto& it : job.items)
+    {
+        coll_state* c = coll_of(it.coll);
+        if (!c)
+            continue;
+        const auto d = c->docs.find(it.id);
+        if (d == c->docs.end() || d->second.seq != it.seq || d->second.at.seg != it.from.seg ||
+            d->second.at.off != it.from.off)
+            continue;
+        cache_drop(d->second.at);
+        live_add(d->second, -1);
+        d->second.at = it.to;
+        live_add(d->second, +1);
+    }
+    ++m_merges;
+    for (const uint32_t s : job.sources)
+        m_doomed.push_back(s);
+    if (m_pins == 0)
+        drop_doomed();
+}
+
+void store::unpin()
+{
+    if (m_pins > 0 && --m_pins == 0)
+        drop_doomed();
+}
+
+void store::drop_doomed()
+{
+    for (const uint32_t s : m_doomed)
+    {
+        m_log.remove(s);
+        m_live.erase(s);
+    }
+    m_doomed.clear();
 }
 
 }   // namespace socketley::db

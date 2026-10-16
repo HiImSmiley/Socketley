@@ -1735,6 +1735,69 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
             db->set_max_bytes(bytes);
             return 0;
         }
+        // The memory the documents last read are kept in; the rest come from the disk.
+        case fnv1a("--cache"):
+        {
+            size_t bytes = 0;
+            if (next.empty() || !parse_size_suffix(pa.args[++i], bytes))
+            {
+                std::cout << "--cache requires a size such as 256M\n";
+                return 1;
+            }
+            db->set_cache_bytes(bytes);
+            return 0;
+        }
+        // The database this one copies, and the file holding the key it asks with.
+        case fnv1a("--replicate"):
+            if (!next.starts_with("http://") && !next.starts_with("https://"))
+            {
+                std::cout << "--replicate requires the http or https address of the database to copy\n";
+                return 1;
+            }
+            db->set_replicate(pa.args[++i]);
+            return 0;
+        case fnv1a("--replicate-key"):
+            if (next.empty() || next.front() != '/')
+            {
+                std::cout << "--replicate-key requires the absolute path of a file holding a key's secret\n";
+                return 1;
+            }
+            db->set_replicate_key(pa.args[++i]);
+            return 0;
+        // Backups into a directory, how often, and how many are kept.
+        case fnv1a("--backup-dir"):
+            if (next.empty() || next.front() != '/')
+            {
+                std::cout << "--backup-dir requires the absolute path of a directory\n";
+                return 1;
+            }
+            db->set_backup_dir(pa.args[++i]);
+            return 0;
+        case fnv1a("--backup-every"):
+        {
+            uint64_t secs = 0;
+            if (next.empty() || parse_duration_seconds(next, 365ull * 24 * 3600, secs) != duration_parse::ok || secs < 1)
+            {
+                std::cout << "--backup-every requires how often, as 6h or 1d\n";
+                return 1;
+            }
+            ++i;
+            db->set_backup_every(static_cast<uint32_t>(secs));
+            return 0;
+        }
+        case fnv1a("--backup-keep"):
+        {
+            uint32_t n = 0;
+            const auto r = std::from_chars(next.data(), next.data() + next.size(), n);
+            if (next.empty() || r.ec != std::errc() || r.ptr != next.data() + next.size() || n < 1 || n > 10000)
+            {
+                std::cout << "--backup-keep requires how many backups are kept, from 1\n";
+                return 1;
+            }
+            ++i;
+            db->set_backup_keep(n);
+            return 0;
+        }
         default:
             return -1;
     }

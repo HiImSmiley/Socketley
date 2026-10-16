@@ -46,6 +46,26 @@ public:
     void set_max_bytes(uint64_t b) { m_max_bytes = b; }
     uint64_t get_max_bytes() const { return m_max_bytes; }
 
+    // The most memory the documents last read are kept in (--cache); the rest are read from the disk.
+    void set_cache_bytes(uint64_t b) { m_cache_bytes = b; }
+    uint64_t get_cache_bytes() const { return m_cache_bytes; }
+
+    // The database this one is a copy of (--replicate), an http or https address, and the file holding the key it
+    // asks with (--replicate-key); a replica answers reads and refuses writes.
+    void set_replicate(std::string_view url) { m_replicate = std::string(url); }
+    std::string_view get_replicate() const { return m_replicate; }
+    void set_replicate_key(std::string_view path) { m_replicate_key = std::string(path); }
+    std::string_view get_replicate_key() const { return m_replicate_key; }
+
+    // Backups written into a directory (--backup-dir) every so many seconds (--backup-every), the newest kept
+    // (--backup-keep).
+    void set_backup_dir(std::string_view d) { m_backup_dir = std::string(d); }
+    std::string_view get_backup_dir() const { return m_backup_dir; }
+    void set_backup_every(uint32_t s) { m_backup_every = s; }
+    uint32_t get_backup_every() const { return m_backup_every; }
+    void set_backup_keep(uint32_t n) { m_backup_keep = n; }
+    uint32_t get_backup_keep() const { return m_backup_keep; }
+
     std::string config_refusal() const override;
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool setup(event_loop& loop) override;
@@ -73,6 +93,12 @@ private:
     std::string m_idp;
     std::string m_origins;
     uint64_t m_max_bytes{0};
+    uint64_t m_cache_bytes{64ull << 20};
+    std::string m_replicate;
+    std::string m_replicate_key;
+    std::string m_backup_dir;
+    uint32_t m_backup_every{86400};
+    uint32_t m_backup_keep{7};
 
     std::unique_ptr<socketley::db::db_run> m_run;
     // Runs stopped but still owed completions by the ring.

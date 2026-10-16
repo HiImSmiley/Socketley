@@ -2,13 +2,15 @@
 // file an operator gives it (socketley/runtime/db/).
 //
 // The first byte chooses: 0 a query, asked of a store with indexes and of one without; 1 a patch, made to a fixed
-// document; 2 a document, written and read back; 3 a schema, parsed and set.
+// document; 2 a document, written and read back; 3 a schema, parsed and set; 4 a record as a segment or a replica's
+// stream hands one over.
 //
 // Properties checked, beyond "did it crash":
 //   * a query answers JSON, the same with the schema's indexes as without them;
 //   * a patch that is made leaves a document that writes as JSON which reads back the same;
 //   * a document that is written reads back as the fields it was given, with its version;
-//   * a schema that parses names only valid collections and fields, and a store takes it or keeps the one before.
+//   * a schema that parses names only valid collections and fields, and a store takes it or keeps the one before;
+//   * a record that decodes encodes back to the same bytes, each document's JSON where its offset says.
 #include "fuzz_common.h"
 #include "runtime/db/db_doc.h"
 #include "runtime/db/db_schema.h"
@@ -31,13 +33,12 @@ struct stores
     {
         char a[] = "/tmp/fuzz_db.XXXXXX", b[] = "/tmp/fuzz_db.XXXXXX";
         std::string why;
-        if (!::mkdtemp(a) || !::mkdtemp(b) || !indexed.open(a, why) || !plain.open(b, why))
+        db::schema s;
+        if (!db::parse_schema("items private level name stats.hp unique:sku\n", s, why) || !::mkdtemp(a) ||
+            !::mkdtemp(b) || !indexed.open(a, s, why) || !plain.open(b, db::schema{}, why))
             abort();
         dirs[0] = a;
         dirs[1] = b;
-        db::schema s;
-        if (!db::parse_schema("items private level name stats.hp unique:sku\n", s, why) || !indexed.set_schema(s, why))
-            abort();
         const char* docs[] = {R"({"level":1,"name":"a","stats":{"hp":3},"sku":"x1"})",
                               R"({"level":5,"name":"b","tags":["q","r"]})",
                               R"({"level":"5","name":null,"stats":{"hp":-2.5}})",
@@ -91,8 +92,9 @@ void query(std::string_view text)
     }
     std::string a, b;
     db::error ea, eb;
-    const bool ra = fixed().indexed.find(key, "items", q, a, ea);
-    const bool rb = fixed().plain.find(key, "items", q, b, eb);
+    uint64_t da_seq = 0, db_seq = 0;
+    const bool ra = fixed().indexed.find(key, "items", q, a, ea, da_seq);
+    const bool rb = fixed().plain.find(key, "items", q, b, eb, db_seq);
     FUZZ_CHECK(ra && rb, "both stores answer the query");
     // The two stores hold the same documents under ids numbered apart, so the answers are compared by shape.
     db::jvalue pa, pb;
@@ -142,7 +144,8 @@ void document(std::string_view text)
         return;
     }
     std::string read;
-    FUZZ_CHECK(fixed().plain.read(key, "fuzzed", "doc", read, err), "a document written reads back");
+    uint64_t depends = 0;
+    FUZZ_CHECK(fixed().plain.read(key, "fuzzed", "doc", read, err, depends), "a document written reads back");
     db::jvalue v;
     FUZZ_CHECK(db::json_reader(read).document(v), "its answer is JSON");
     FUZZ_CHECK(db::member(v, "_id") && db::member(v, "_v"), "with _id and _v");
@@ -165,8 +168,24 @@ void schema(std::string_view text)
     fixed().plain.set_schema(s, why);
     std::string out;
     db::error err;
-    FUZZ_CHECK(fixed().plain.find(key, "items", db::query{}, out, err), "the store still answers under any schema");
+    uint64_t depends = 0;
+    FUZZ_CHECK(fixed().plain.find(key, "items", db::query{}, out, err, depends), "the store still answers under any schema");
     fixed().plain.set_schema(before, why);
+}
+
+void record(std::string_view bytes)
+{
+    std::vector<db::event> evs;
+    std::vector<uint64_t> offs;
+    uint64_t seq = 0;
+    if (!db::decode_record(bytes, evs, &offs, &seq))
+        return;
+    std::vector<uint64_t> again;
+    FUZZ_CHECK(db::encode_record(seq, evs, &again) == bytes, "a record decoded encodes back to its bytes");
+    FUZZ_CHECK(again == offs, "with each document where its offset says");
+    for (size_t i = 0; i < evs.size(); ++i)
+        if (!evs[i].del)
+            FUZZ_CHECK(bytes.substr(offs[i], evs[i].json.size()) == evs[i].json, "the offset names the JSON");
 }
 
 }   // namespace
@@ -177,12 +196,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     if (size < 1)
         return 0;
     const std::string_view rest(reinterpret_cast<const char*>(data) + 1, size - 1);
-    switch (data[0] % 4)
+    switch (data[0] % 5)
     {
         case 0: query(rest); break;
         case 1: patch(rest); break;
         case 2: document(rest); break;
-        default: schema(rest); break;
+        case 3: schema(rest); break;
+        default: record(rest); break;
     }
     return 0;
 }

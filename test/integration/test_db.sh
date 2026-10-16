@@ -296,12 +296,13 @@ if phase == "main":
 
     # ── An answer is a promise: the change is in the journal on the disk before it ──
     import glob
-    journal = glob.glob(tmpd + "/home/.local/share/socketley/*/db/data/data.journal")
+    def on_disk():
+        return b"".join(open(f, "rb").read() for f in glob.glob(tmpd + "/home/.local/share/socketley/*/db/data/seg-*.log"))
     seen = []
     for i in range(20):
         mark = "durable-%d-%s" % (i, os.urandom(6).hex())
         db("PUT", "/c/notes/d%d" % i, {"m": mark}, KEY)
-        seen.append(bool(journal) and mark.encode() in open(journal[0], "rb").read())
+        seen.append(mark.encode() in on_disk())
     check("every write answered is already in the journal file", seen, [True] * 20)
 
     # ── A script ──────────────────────────────────────────────────────────────

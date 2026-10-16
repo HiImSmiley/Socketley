@@ -169,6 +169,18 @@ void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presenc
         db.set_origins(cfg.db_origins);
     if (asked("max_bytes", cfg.db_max_bytes > 0))
         db.set_max_bytes(cfg.db_max_bytes);
+    if (asked("cache", true))
+        db.set_cache_bytes(cfg.db_cache);
+    if (asked("replicate", !cfg.db_replicate.empty()))
+        db.set_replicate(cfg.db_replicate);
+    if (asked("replicate_key", !cfg.db_replicate_key.empty()))
+        db.set_replicate_key(cfg.db_replicate_key);
+    if (asked("backup_dir", !cfg.db_backup_dir.empty()))
+        db.set_backup_dir(cfg.db_backup_dir);
+    if (asked("backup_every", true))
+        db.set_backup_every(cfg.db_backup_every);
+    if (asked("backup_keep", true))
+        db.set_backup_keep(cfg.db_backup_keep);
 }
 
 void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool by_presence)

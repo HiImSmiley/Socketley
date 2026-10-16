@@ -189,6 +189,11 @@ private:
     int cmd_restart(ipc_connection* conn, const parsed_args& pa);
     int cmd_action(ipc_connection* conn, const parsed_args& pa);
     int cmd_idp_user(ipc_connection* conn, const parsed_args& pa);
+    int cmd_db_backup(ipc_connection* conn, const parsed_args& pa);
+    int cmd_db_restore(ipc_connection* conn, const parsed_args& pa);
+    // One request to a runtime's worker and its answer, waited for here; false with the reason in conn's write_buf.
+    bool ask_worker(ipc_connection* conn, std::string_view runtime, std::string_view payload, std::string& reply,
+                    std::chrono::milliseconds bound = std::chrono::milliseconds(4000));
     int cmd_stats(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload_lua(ipc_connection* conn, const parsed_args& pa);

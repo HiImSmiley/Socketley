@@ -41,6 +41,8 @@ inline constexpr std::string_view for_verb(std::string_view verb)
         return "idp-user <idp> add <user> [--password <pw>|-] [--name ..] [--email ..] [--groups a,b] [--set k=v] "
                "[--reset] | passwd <user> --password <pw>|- [--reset] | set <user> k=v... | disable|enable|logout|"
                "remove|show <user> | list | import <storage>";
+    if (verb == "db-backup")  return "db-backup <db> <file>";
+    if (verb == "db-restore") return "db-restore <db> <file>";
     if (verb == "cluster")
         return "cluster [ls|ps|group <name>|stats|watch|show <daemon>|raft-status|placement|"
                "create <type> <name> [flags] [--replicas <n>]|scale <name> <n>|remove <name>]";

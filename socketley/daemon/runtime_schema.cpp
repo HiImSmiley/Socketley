@@ -153,6 +153,12 @@ constexpr row rows[] = {
     {"--idp", "B", "text", "Identity provider", "The idp runtime whose accounts own documents and sign in by its cookie or access tokens.", "Database", {}, "auth"},
     {"--origins", "B", "list", "Web origins", "The pages a browser may call it from, with its sign-in; * for any, without it.", "Database", {}, "https://app.example.com"},
     {"--max-bytes", "B", "size", "Quota", "The most bytes the documents hold.", "Database", {}, "2G"},
+    {"--cache", "B", "size", "Cache", "The memory the documents last read are kept in; the rest come from the disk.", "Database", {}, "256M"},
+    {"--replicate", "B", "text", "Copy of", "The http or https address of the database this one follows; a copy answers reads.", "Replication", {}, "https://data.example.com"},
+    {"--replicate-key", "B", "path", "Its key", "A file holding a key of that database.", "Replication", {}, "/etc/socketley/db.replica-key"},
+    {"--backup-dir", "B", "path", "Backups", "The directory backups are written into.", "Backups", {}, "/var/backups/socketley"},
+    {"--backup-every", "B", "duration", "Back up every", "How often a backup is taken.", "Backups", {}, "1d"},
+    {"--backup-keep", "B", "int", "Keep", "How many backups are kept.", "Backups", {}, "7"},
     {"--repositories", "Y", "path", "Repositories", "The file a storage writes for a user's own sync runtime, which pulls their git repositories.", "Sync", {}, "/var/lib/socketley/storage/ui/.ui/sync/user.json"},
 };
 

@@ -123,6 +123,17 @@ bool parse_schema(std::string_view text, schema& out, std::string& why)
         {
             index_def d;
             std::string_view f = w[i];
+            if (f.starts_with("ttl:"))
+            {
+                f.remove_prefix(4);
+                if (!c.ttl.empty() || !valid_path(f) || f.front() == '_')
+                {
+                    why = at + "ttl: names one field, a path of A-Z a-z 0-9 _ - joined by dots: " + std::string(w[i]);
+                    return false;
+                }
+                c.ttl = std::string(f);
+                continue;
+            }
             if (f.starts_with("unique:"))
             {
                 d.unique = true;

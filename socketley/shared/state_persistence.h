@@ -217,6 +217,12 @@ struct runtime_config
     std::string db_idp;
     std::string db_origins;
     uint64_t db_max_bytes = 0;
+    uint64_t db_cache = 64ull << 20;
+    std::string db_replicate;
+    std::string db_replicate_key;
+    std::string db_backup_dir;
+    uint32_t db_backup_every = 86400;
+    uint32_t db_backup_keep = 7;
 
     // A registered type's own fields in declaration order, opaque here, held
     // as strings because the schema that gives them kinds lives in a manifest.

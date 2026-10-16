@@ -5,10 +5,13 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -16,6 +19,7 @@
 
 #include "db_instance.h"
 #include "../../shared/http_framing.h"
+#include "../../shared/https_client.h"
 #include "../../shared/logging.h"
 #include "../../shared/replaced_file.h"
 #include "../../shared/runtime_manager.h"
@@ -72,7 +76,7 @@ std::string error_body(std::string_view code, std::string_view message)
 
 db_run::answer refused(int status, std::string_view code, std::string_view message)
 {
-    return db_run::answer{status, error_body(code, message), 0, false};
+    return db_run::answer{status, error_body(code, message), 0, 0};
 }
 
 db_run::answer refused(const error& e)
@@ -126,19 +130,46 @@ const jvalue* string_member(const jvalue& obj, std::string_view name)
 
 }   // namespace
 
+
 db_run::db_run(db_instance& owner, event_loop& loop) : m_owner(owner), m_loop(loop), m_io(loop, this) {}
 
 db_run::~db_run()
 {
+    m_replica_stop = true;
+    if (m_replica.joinable())
+        m_replica.join();
+    for (auto& j : m_jobs)
+        if (j->th.joinable())
+            j->th.join();
     m_loop.deregister_owner(this);
 }
 
 bool db_run::start(std::string& why)
 {
-    if (!m_store.open(db_data_dir(m_owner.get_name()), why))
+    schema s;
+    if (const std::string path(m_owner.get_schema_path()); !path.empty())
+    {
+        std::string text;
+        if (!read_whole_file(path, text))
+        {
+            why = path + " cannot be read";
+            return false;
+        }
+        if (!parse_schema(text, s, why))
+        {
+            why = path + " " + why;
+            return false;
+        }
+        m_schema_mtime = mtime_of(path);
+    }
+    m_store.set_cache_bytes(m_owner.get_cache_bytes());
+    if (!m_store.open(db_data_dir(m_owner.get_name()), s, why))
         return false;
     m_store.set_max_bytes(m_owner.get_max_bytes());
-    reload_files(true, why);
+    m_durable = m_store.seq();
+    m_history_from = m_durable + 1;
+    m_files_checked = 0;
+    reload_files(why);
     if (!why.empty())
         return false;
     m_idp.configure(m_owner.get_idp());
@@ -171,12 +202,29 @@ bool db_run::start(std::string& why)
         m_listen_fd = -1;
         return false;
     }
+    m_wake_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (m_wake_fd < 0)
+    {
+        why = "no eventfd for work off the loop";
+        return false;
+    }
     m_loop.register_owner(this);
     arm_accept();
+    arm_wake();
+    if (!m_owner.get_backup_dir().empty())
+        m_next_backup = now_sec() + m_owner.get_backup_every();
+    if (!m_owner.get_replicate().empty())
+    {
+        m_replica_seq = m_store.seq();
+        m_replica_state = "connecting";
+        m_replica = std::thread(&db_run::replica_main, this);
+    }
+    arm_tick();
     LOG_INFO(("db " + std::string(m_owner.get_name()) + ": " + std::to_string(m_store.documents()) +
-              " document(s) in " + std::to_string(m_store.collections()) + " collection(s), " +
-              std::to_string(m_keys.size()) + " key(s)" +
-              (m_owner.get_idp().empty() ? "" : ", accounts of " + std::string(m_owner.get_idp())))
+              " document(s) in " + std::to_string(m_store.collections()) + " collection(s) at change " +
+              std::to_string(m_store.seq()) + ", " + std::to_string(m_keys.size()) + " key(s)" +
+              (m_owner.get_idp().empty() ? "" : ", accounts of " + std::string(m_owner.get_idp())) +
+              (m_owner.get_replicate().empty() ? "" : ", a replica of " + std::string(m_owner.get_replicate())))
                  .c_str());
     return true;
 }
@@ -185,14 +233,20 @@ void db_run::stop()
 {
     if (m_stopped)
         return;
-    // What was written is on the disk before anything goes, and nothing more is read to write; a sync in flight is
-    // made again here, and its answers given, since its completion comes after this run is done answering.
     m_stopped = true;
-    m_held.insert(m_held.begin(), m_syncing.begin(), m_syncing.end());
-    m_held_calls.insert(m_held_calls.begin(), m_syncing_calls.begin(), m_syncing_calls.end());
-    m_syncing.clear();
-    m_syncing_calls.clear();
-    finish_turn();
+    m_replica_stop = true;
+    if (m_replica.joinable())
+        m_replica.join();
+    // Work off the loop ends before the files it reads go.
+    for (auto& j : m_jobs)
+        if (j->th.joinable())
+            j->th.join();
+    // What was written is on the disk before anything goes, and every answer waiting on it given.
+    if (!m_waiting.empty() || !m_unpublished.empty())
+    {
+        const uint64_t covered = m_store.seq();
+        synced(!m_broken && m_store.sync(), covered);
+    }
     if (m_listen_fd >= 0)
     {
         ::shutdown(m_listen_fd, SHUT_RDWR);
@@ -204,7 +258,15 @@ void db_run::stop()
         all.push_back(c);
     for (auto& c : all)
         close_conn(c);
+    for (auto& j : m_jobs)
+        m_store.finish(*j->job);
+    m_jobs.clear();
     m_store.close();
+    if (m_wake_fd >= 0)
+    {
+        m_loop.close_fd(m_wake_fd);
+        m_wake_fd = -1;
+    }
 }
 
 bool db_run::drained() const
@@ -214,116 +276,643 @@ bool db_run::drained() const
 
 void db_run::on_loop_turn()
 {
+    if (m_stopped)
+        return;
     finish_turn();
+    maybe_merge();
     // A listener whose accept the ring had no room for is asked again here, or it would be deaf for good.
-    if (!m_accept_pending && !m_stopped)
+    if (!m_accept_pending)
         arm_accept();
+    if (!m_wake_armed)
+        arm_wake();
+}
+
+// ─── The disk ───────────────────────────────────────────────────────────────
+
+void db_run::hold(waiter w)
+{
+    if (w.c)
+        w.c->waiting = true;
+    m_waiting.push_back(std::move(w));
 }
 
 void db_run::finish_turn()
 {
-    if (m_held.empty() && m_held_calls.empty())
+    if (m_broken)
+    {
+        if (!m_waiting.empty())
+            synced(false, 0);
         return;
-    // One sync on the disk at a time; what was written meanwhile waits for the next, which starts when it ends.
-    if (m_sync_inflight && !m_stopped)
+    }
+    bool need = !m_unpublished.empty();
+    for (const auto& w : m_waiting)
+        need = need || w.needs > m_durable;
+    if (!need || m_sync_inflight)
         return;
-    std::vector<std::shared_ptr<conn>> held;
-    held.swap(m_held);
-    std::vector<std::pair<uint64_t, std::string>> calls;
-    calls.swap(m_held_calls);
+    if (!m_store.flush())
+    {
+        synced(false, 0);
+        return;
+    }
+    const uint64_t covered = m_store.seq();
     ++m_c.syncs;
-    if (m_broken || !m_store.flush())
-    {
-        answer_synced(held, calls, false);
-        return;
-    }
-    // Stopping, the last records are synced here and now, since no completion will be waited for.
-    if (m_stopped || m_store.journal_fd() < 0)
-    {
-        answer_synced(held, calls, m_store.sync());
-        return;
-    }
-    m_syncing = std::move(held);
-    m_syncing_calls = std::move(calls);
     m_sync_inflight = true;
-    const bool queued = m_io.fsync(m_store.journal_fd(), true, [this](int64_t res) {
+    const bool queued = m_io.fsync(m_store.journal_fd(), true, [this, covered](int64_t res) {
         m_sync_inflight = false;
-        // A stop answered these itself, with a sync of its own.
+        // A stop gave every answer itself, after a sync of its own.
         if (m_stopped)
             return;
-        std::vector<std::shared_ptr<conn>> done;
-        done.swap(m_syncing);
-        std::vector<std::pair<uint64_t, std::string>> done_calls;
-        done_calls.swap(m_syncing_calls);
-        answer_synced(done, done_calls, res == 0);
+        synced(res == 0, covered);
         finish_turn();
     });
     if (!queued)
     {
         // The ring had no room: the sync is made here instead, which only blocks the loop for it.
         m_sync_inflight = false;
-        std::vector<std::shared_ptr<conn>> done;
-        done.swap(m_syncing);
-        std::vector<std::pair<uint64_t, std::string>> done_calls;
-        done_calls.swap(m_syncing_calls);
-        answer_synced(done, done_calls, m_store.sync());
+        synced(m_store.sync(), covered);
     }
 }
 
-void db_run::answer_synced(std::vector<std::shared_ptr<conn>>& held,
-                           std::vector<std::pair<uint64_t, std::string>>& calls, bool ok)
+void db_run::synced(bool ok, uint64_t covered)
 {
-    if (!ok && !m_broken)
+    if (!ok)
     {
+        if (!m_broken)
+            LOG_ERROR(("db " + std::string(m_owner.get_name()) +
+                       ": the journal could not be written to the disk; nothing more is answered until a restart "
+                       "reads back what is there")
+                          .c_str());
         m_broken = true;
-        LOG_ERROR(("db " + std::string(m_owner.get_name()) +
-                   ": the journal could not be written to the disk; nothing more is answered until a restart reads "
-                   "back what is there")
-                      .c_str());
-    }
-    for (auto& c : held)
-    {
-        if (c->dead)
-            continue;
-        if (ok)
-            c->out += c->held;
-        else
+        m_unpublished.clear();
+        std::vector<waiter> all;
+        all.swap(m_waiting);
+        const std::string body = error_body("not_durable", "the change could not be written to the disk");
+        for (auto& w : all)
         {
-            c->keep_alive = false;
-            const std::string body = error_body("not_durable", "the change could not be written to the disk");
-            c->out += head(*c, 503, "application/json", body.size(), {});
-            c->out += body;
+            if (w.call)
+            {
+                if (auto* mgr = m_owner.get_runtime_manager())
+                    mgr->requests().complete_deferred(w.ticket, request_status::ok,
+                                                      "{\"status\":503,\"body\":" + body + "}");
+                continue;
+            }
+            if (w.c->dead)
+                continue;
+            w.c->keep_alive = false;
+            w.c->out += head(*w.c, 503, "application/json", body.size(), {});
+            w.c->out += body;
+            w.c->waiting = false;
+            flush(w.c);
         }
-        c->held.clear();
-        if (!m_stopped)
-            resume(c);
+        return;
     }
-    auto* mgr = m_owner.get_runtime_manager();
-    for (auto& [ticket, reply] : calls)
-        if (mgr)
-            mgr->requests().complete_deferred(
-                ticket, request_status::ok,
-                ok ? reply
-                   : "{\"status\":503,\"body\":" +
-                         error_body("not_durable", "the change could not be written to the disk") + "}");
+    m_durable = std::max(m_durable, covered);
+    m_replica_seq = m_durable;
+    std::vector<waiter> ready;
+    std::vector<waiter> rest;
+    for (auto& w : m_waiting)
+        (w.needs <= m_durable ? ready : rest).push_back(std::move(w));
+    m_waiting.swap(rest);
+    for (auto& w : ready)
+    {
+        if (w.call)
+        {
+            if (auto* mgr = m_owner.get_runtime_manager())
+                mgr->requests().complete_deferred(w.ticket, request_status::ok, w.held);
+            continue;
+        }
+        if (w.c->dead)
+            continue;
+        w.c->out += w.held;
+        if (m_stopped)
+            w.c->waiting = false;
+        else
+            resume(w.c);
+    }
+    publish();
 }
+
+// ─── Streams of changes ─────────────────────────────────────────────────────
+
+bool db_run::sees(const conn& c, const event& e) const
+{
+    if (c.replica || c.all)
+        return true;
+    if (e.coll != c.coll)
+        return false;
+    if (c.who.kind == principal::key)
+        return true;
+    const collection_def* def = m_store.get_schema().find(e.coll);
+    switch (def ? def->acc : access::priv)
+    {
+        case access::priv:    return false;
+        case access::owner:   return c.who.kind == principal::user && e.owner == c.who.sub;
+        case access::shared:  return c.who.kind == principal::user;
+        case access::open:
+        case access::catalog: return true;
+    }
+    return false;
+}
+
+void db_run::send_event(conn& c, const event& e)
+{
+    std::string& o = c.out;
+    o += "id: " + std::to_string(e.seq) + (e.del ? "\nevent: delete\ndata: " : "\nevent: put\ndata: ");
+    o += "{\"collection\":";
+    write_string(e.coll, o);
+    o += ",\"id\":";
+    write_string(e.id, o);
+    if (!e.owner.empty())
+    {
+        o += ",\"owner\":";
+        write_string(e.owner, o);
+    }
+    if (e.del)
+        o += ",\"deleted\":true}\n\n";
+    else
+    {
+        o += ",\"version\":" + std::to_string(e.v) + ",\"doc\":";
+        o += e.json;
+        o += "}\n\n";
+    }
+    ++m_c.events;
+}
+
+void db_run::publish()
+{
+    constexpr size_t history_bytes = 32u << 20;
+    while (!m_unpublished.empty() && m_unpublished.front().seq <= m_durable)
+    {
+        event e = std::move(m_unpublished.front());
+        m_unpublished.pop_front();
+        for (auto& [id, c] : m_conns)
+        {
+            if (!c->feed || c->dead || !c->dump.empty() || !sees(*c, e))
+                continue;
+            send_event(*c, e);
+            // A stream that reads slower than changes come is let go; it resumes from the last one it read.
+            if (c->out.size() - c->out_off > (16u << 20))
+                close_conn(c);
+            else
+                flush(c);
+        }
+        m_history_bytes += e.json.size() + e.coll.size() + e.id.size() + 64;
+        m_history.push_back(std::move(e));
+        while (m_history_bytes > history_bytes && !m_history.empty())
+        {
+            const event& f = m_history.front();
+            m_history_bytes -= f.json.size() + f.coll.size() + f.id.size() + 64;
+            m_history_from = f.seq + 1;
+            m_history.pop_front();
+        }
+    }
+    // Erased during the walk above leaves the map unchanged: close_conn() keeps a closed stream until its reads end.
+}
+
+void db_run::open_feed(const std::shared_ptr<conn>& c, const request& rq, std::string coll, bool all, bool replica)
+{
+    // Where the stream starts: after the change it names, or now.
+    uint64_t since = m_durable;
+    bool named = false;
+    std::string_view s = rq.last_event_id;
+    for (std::string_view q = rq.query; s.empty() && !q.empty();)
+    {
+        const size_t amp = q.find('&');
+        const std::string_view kv = q.substr(0, amp);
+        q = amp == std::string_view::npos ? std::string_view{} : q.substr(amp + 1);
+        if (kv.starts_with("since="))
+            s = kv.substr(6);
+    }
+    if (!s.empty())
+    {
+        uint64_t v = 0;
+        const auto r = std::from_chars(s.data(), s.data() + s.size(), v);
+        if (r.ec == std::errc() && r.ptr == s.data() + s.size())
+        {
+            since = v;
+            named = true;
+        }
+    }
+    c->feed = true;
+    c->all = all;
+    c->replica = replica;
+    c->coll = std::move(coll);
+    c->keep_alive = false;
+    ++m_c.feeds;
+    c->out += "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n"
+              "X-Accel-Buffering: no\r\nX-Content-Type-Options: nosniff\r\n" +
+              cors(rq) + "Connection: close\r\n\r\n";
+    // A count the database never reached is a copy of another past: it is told everything again.
+    const bool kept = named && since <= m_durable && since + 1 >= m_history_from;
+    if (!named || since == m_durable || kept)
+    {
+        for (const auto& e : m_history)
+            if (e.seq > since && sees(*c, e))
+                send_event(*c, e);
+        flush(c);
+        arm_tick();
+        return;
+    }
+    c->out += "id: " + std::to_string(m_durable) + "\nevent: reset\ndata: {}\n\n";
+    if (!replica)
+    {
+        // A page told to read again what it shows, and then the changes after it.
+        flush(c);
+        arm_tick();
+        return;
+    }
+    c->dump = m_store.everything();
+    c->dump_at = 0;
+    c->dump_seq = m_store.seq();
+    m_store.pin();
+    pump_dump(c);
+    arm_tick();
+}
+
+void db_run::pump_dump(const std::shared_ptr<conn>& c)
+{
+    std::string json;
+    while (!c->dump.empty() && c->out.size() - c->out_off < (1u << 20))
+    {
+        if (c->dump_at == c->dump.size())
+        {
+            c->out += "id: " + std::to_string(c->dump_seq) + "\nevent: synced\ndata: {}\n\n";
+            c->dump.clear();
+            m_store.unpin();
+            // The changes made while the copy went, from the history; a gap there starts the copy again.
+            if (c->dump_seq + 1 < m_history_from && c->dump_seq < m_durable)
+            {
+                c->out += "id: " + std::to_string(m_durable) + "\nevent: reset\ndata: {}\n\n";
+                c->dump = m_store.everything();
+                c->dump_at = 0;
+                c->dump_seq = m_store.seq();
+                m_store.pin();
+                continue;
+            }
+            for (const auto& e : m_history)
+                if (e.seq > c->dump_seq)
+                    send_event(*c, e);
+            break;
+        }
+        const auto& it = c->dump[c->dump_at++];
+        if (!m_store.body_at(it.from, json))
+        {
+            close_conn(c);
+            return;
+        }
+        send_event(*c, event{it.seq, it.coll, it.id, it.owner, it.v, false, json});
+    }
+    flush(c);
+}
+
+// ─── Work off the loop ──────────────────────────────────────────────────────
+
+void db_run::arm_wake()
+{
+    if (m_wake_armed || m_wake_fd < 0 || m_stopped)
+        return;
+    // Polled and then read here: the ring's read is a socket's recv, which an eventfd answers at once with ENOTSOCK.
+    m_wake_req = io_request{};
+    m_wake_req.owner = this;
+    m_wake_req.fd = m_wake_fd;
+    m_wake_req.type = op_poll;
+    m_wake_armed = m_loop.submit_poll_add(m_wake_fd, POLLIN, &m_wake_req);
+}
+
+void db_run::start_job(std::unique_ptr<copy_job> job, uint64_t ticket)
+{
+    auto slot = std::make_unique<job_slot>();
+    slot->job = std::move(job);
+    slot->ticket = ticket;
+    job_slot* raw = slot.get();
+    const int wake = m_wake_fd;
+    raw->th = std::thread([raw, wake] {
+        raw->job->run();
+        raw->done = true;
+        const uint64_t one = 1;
+        if (::write(wake, &one, sizeof one) < 0) {}
+    });
+    m_jobs.push_back(std::move(slot));
+}
+
+void db_run::jobs_done()
+{
+    for (auto it = m_jobs.begin(); it != m_jobs.end();)
+    {
+        job_slot& j = **it;
+        if (!j.done)
+        {
+            ++it;
+            continue;
+        }
+        j.th.join();
+        copy_job& job = *j.job;
+        m_store.finish(job);
+        if (!job.merge)
+        {
+            if (job.ok)
+                ++m_c.backups;
+            else
+                ++m_c.backup_failures;
+            if (j.ticket)
+            {
+                backup_result& r = m_backups[j.ticket];
+                r.done = true;
+                r.ok = job.ok;
+                r.why = job.why;
+                r.documents = job.items.size();
+            }
+            else if (!job.ok)
+                LOG_ERROR(("db " + std::string(m_owner.get_name()) + ": the backup failed: " + job.why).c_str());
+            else
+            {
+                // The newest --backup-keep of this database's backups stay.
+                std::vector<std::filesystem::path> ours;
+                std::error_code ec;
+                const std::string prefix = std::string(m_owner.get_name()) + "-";
+                for (const auto& e : std::filesystem::directory_iterator(std::string(m_owner.get_backup_dir()), ec))
+                {
+                    const std::string n = e.path().filename().string();
+                    if (n.starts_with(prefix) && n.ends_with(".dbbackup"))
+                        ours.push_back(e.path());
+                }
+                std::sort(ours.begin(), ours.end());
+                const size_t keep = std::max<uint32_t>(1, m_owner.get_backup_keep());
+                for (size_t i = 0; i + keep < ours.size(); ++i)
+                    std::filesystem::remove(ours[i], ec);
+            }
+        }
+        else if (!job.ok)
+            LOG_ERROR(("db " + std::string(m_owner.get_name()) + ": a merge of segments failed: " + job.why).c_str());
+        it = m_jobs.erase(it);
+    }
+}
+
+void db_run::maybe_merge()
+{
+    if (!m_jobs.empty())
+        return;
+    if (auto job = m_store.plan_merge())
+        start_job(std::move(job), 0);
+}
+
+void db_run::scheduled_backup()
+{
+    if (m_owner.get_backup_dir().empty() || now_sec() < m_next_backup)
+        return;
+    std::error_code ec;
+    std::filesystem::create_directories(std::string(m_owner.get_backup_dir()), ec);
+    char stamp[32];
+    const time_t t = ::time(nullptr);
+    struct tm tmv{};
+    gmtime_r(&t, &tmv);
+    std::strftime(stamp, sizeof stamp, "%Y%m%dT%H%M%SZ", &tmv);
+    const std::string dest =
+        std::string(m_owner.get_backup_dir()) + "/" + std::string(m_owner.get_name()) + "-" + stamp + ".dbbackup";
+    auto job = m_store.plan_backup(dest);
+    if (!job)
+        return;   // a merge is running; the next tick tries again
+    m_next_backup = now_sec() + m_owner.get_backup_every();
+    start_job(std::move(job), 0);
+}
+
+// ─── A replica ──────────────────────────────────────────────────────────────
+
+void db_run::replica_main()
+{
+    std::string secret;
+    if (std::string text; read_whole_file(std::string(m_owner.get_replicate_key()), text))
+    {
+        secret = std::string(http_trim_ows(text.substr(0, text.find('\n'))));
+    }
+    https_client::client cl;
+    std::string err;
+    if (secret.empty() || !cl.init(err))
+    {
+        std::lock_guard lk(m_replica_mu);
+        m_replica_state = secret.empty() ? "the key file " + std::string(m_owner.get_replicate_key()) + " holds no key"
+                                         : err;
+        return;
+    }
+    std::string base(m_owner.get_replicate());
+    while (!base.empty() && base.back() == '/')
+        base.pop_back();
+    const auto wake = [this] {
+        const uint64_t one = 1;
+        if (::write(m_wake_fd, &one, sizeof one) < 0) {}
+    };
+    while (!m_replica_stop)
+    {
+        const std::string url = base + "/_replicate?since=" + std::to_string(m_replica_seq.load());
+        std::string buf;
+        auto last = std::chrono::steady_clock::now();
+        int status = 0;
+        err.clear();
+        cl.stream(
+            url, {{"Authorization", "Bearer " + secret}},
+            [&](int st) {
+                status = st;
+                if (st == 200)
+                {
+                    m_replica_connected = true;
+                    std::lock_guard lk(m_replica_mu);
+                    m_replica_state = "following";
+                }
+                return st == 200;
+            },
+            [&](std::string_view data) {
+                if (m_replica_stop)
+                    return false;
+                const auto now = std::chrono::steady_clock::now();
+                if (data.empty())
+                    // The database sends a comment every fifteen seconds; a minute of nothing is a dead stream.
+                    return now - last < std::chrono::seconds(60);
+                last = now;
+                buf.append(data);
+                std::vector<event> got;
+                bool reset = false;
+                uint64_t mark = 0;
+                size_t end;
+                while ((end = buf.find("\n\n")) != std::string::npos)
+                {
+                    const std::string block = buf.substr(0, end);
+                    buf.erase(0, end + 2);
+                    std::string name, payload;
+                    uint64_t id = 0;
+                    for (std::string_view rest = block; !rest.empty();)
+                    {
+                        const size_t nl = rest.find('\n');
+                        const std::string_view line = rest.substr(0, nl);
+                        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+                        if (line.starts_with("id: "))
+                            std::from_chars(line.data() + 4, line.data() + line.size(), id);
+                        else if (line.starts_with("event: "))
+                            name = std::string(line.substr(7));
+                        else if (line.starts_with("data: "))
+                            payload = std::string(line.substr(6));
+                    }
+                    if (name == "reset")
+                    {
+                        reset = true;
+                        got.clear();
+                        continue;
+                    }
+                    if (name == "synced")
+                    {
+                        mark = id;
+                        continue;
+                    }
+                    if (name != "put" && name != "delete")
+                        continue;
+                    jvalue v;
+                    if (!json_reader(payload).document(v))
+                        continue;
+                    event e;
+                    e.seq = id;
+                    e.del = name == "delete";
+                    const jvalue* c = string_member(v, "collection");
+                    const jvalue* i = string_member(v, "id");
+                    const jvalue* o = string_member(v, "owner");
+                    const jvalue* ver = member(v, "version");
+                    const jvalue* d = member(v, "doc");
+                    if (!c || !i || (!e.del && (!d || !ver)))
+                        continue;
+                    e.coll = c->s;
+                    e.id = i->s;
+                    e.owner = o ? o->s : std::string();
+                    if (!e.del)
+                    {
+                        std::from_chars(ver->s.data(), ver->s.data() + ver->s.size(), e.v);
+                        write_json(*d, e.json);
+                    }
+                    got.push_back(std::move(e));
+                }
+                if (!got.empty() || reset || mark)
+                {
+                    std::lock_guard lk(m_replica_mu);
+                    if (reset)
+                    {
+                        m_replica_in.clear();
+                        m_replica_reset = true;
+                    }
+                    for (auto& e : got)
+                        m_replica_in.push_back(std::move(e));
+                    if (mark)
+                        m_replica_mark = std::max(m_replica_mark, mark);
+                    wake();
+                }
+                return true;
+            },
+            err, 1);
+        m_replica_connected = false;
+        {
+            std::lock_guard lk(m_replica_mu);
+            m_replica_state = status && status != 200 ? "refused with " + std::to_string(status)
+                              : err.empty()           ? "the stream ended; connecting again"
+                                                      : err;
+        }
+        // A moment between tries, broken off by a stop.
+        for (int i = 0; i < 20 && !m_replica_stop; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+void db_run::take_replicated()
+{
+    std::vector<event> evs;
+    bool reset = false;
+    uint64_t mark = 0;
+    {
+        std::lock_guard lk(m_replica_mu);
+        evs.swap(m_replica_in);
+        reset = m_replica_reset;
+        mark = m_replica_mark;
+        m_replica_reset = false;
+        m_replica_mark = 0;
+    }
+    if (!reset && evs.empty() && !mark)
+        return;
+    std::string why;
+    if (reset)
+    {
+        ++m_c.resets;
+        // Answers waiting on what is about to go are given first, as they were.
+        if (!m_waiting.empty() || !m_unpublished.empty())
+            synced(m_store.sync(), m_store.seq());
+        if (!m_store.reset(why))
+        {
+            LOG_ERROR(("db " + std::string(m_owner.get_name()) + ": the copy could not be emptied: " + why).c_str());
+            m_broken = true;
+            return;
+        }
+        m_durable = 0;
+        m_history.clear();
+        m_history_bytes = 0;
+        m_history_from = 1;
+        m_unpublished.clear();
+        // Streams of this database, past what it now holds, start over.
+        std::vector<std::shared_ptr<conn>> feeds;
+        for (auto& [id, c] : m_conns)
+            if (c->feed)
+                feeds.push_back(c);
+        for (auto& c : feeds)
+            close_conn(c);
+    }
+    if (!evs.empty())
+    {
+        if (!m_store.apply(evs, why))
+        {
+            LOG_ERROR(("db " + std::string(m_owner.get_name()) + ": a change from " +
+                       std::string(m_owner.get_replicate()) + " could not be applied: " + why)
+                          .c_str());
+            return;
+        }
+        m_c.replicated += evs.size();
+        for (auto& e : evs)
+            m_unpublished.push_back(std::move(e));
+    }
+    if (mark)
+        m_store.mark(mark);
+    // A change carried here waits for the disk as a write does; finish_turn() syncs it.
+    if (m_store.seq() > m_durable)
+        hold(waiter{m_store.seq(), nullptr, {}, 0, true});
+}
+
+// ─── Stats and files ────────────────────────────────────────────────────────
 
 std::string db_run::stats() const
 {
+    std::string replica;
+    if (!m_owner.get_replicate().empty())
+    {
+        std::lock_guard lk(const_cast<std::mutex&>(m_replica_mu));
+        replica = "\nreplica_of:" + std::string(m_owner.get_replicate()) + "\nreplica_state:" + m_replica_state +
+                  "\nreplica_connected:" + (m_replica_connected ? "1" : "0") +
+                  "\nreplicated:" + std::to_string(m_c.replicated) + "\nresets:" + std::to_string(m_c.resets);
+    }
+    size_t feeds = 0;
+    for (const auto& [id, c] : m_conns)
+        feeds += c->feed ? 1 : 0;
     return "documents:" + std::to_string(m_store.documents()) + "\ncollections:" + std::to_string(m_store.collections()) +
            "\nbytes:" + std::to_string(m_store.bytes()) + "\nmax_bytes:" + std::to_string(m_owner.get_max_bytes()) +
-           "\nkeys:" + std::to_string(m_keys.size()) + "\nreads:" + std::to_string(m_c.reads) +
-           "\nwrites:" + std::to_string(m_c.writes) + "\nqueries:" + std::to_string(m_c.queries) +
-           "\nsyncs:" + std::to_string(m_c.syncs) + "\nrefused:" + std::to_string(m_c.refused) +
-           "\nconflicts:" + std::to_string(m_c.conflicts) + "\nscript_calls:" + std::to_string(m_c.calls) +
-           "\njournal_records:" + std::to_string(m_store.journal_records()) +
-           (m_broken ? "\nbroken:the journal could not be synced; restart" : "") +
+           "\ndisk_bytes:" + std::to_string(m_store.disk_bytes()) + "\nsegments:" + std::to_string(m_store.segments()) +
+           "\nmerges:" + std::to_string(m_store.merges()) + "\ncache_hits:" + std::to_string(m_store.cache_hits()) +
+           "\ncache_misses:" + std::to_string(m_store.cache_misses()) + "\nseq:" + std::to_string(m_store.seq()) +
+           "\ndurable:" + std::to_string(m_durable) + "\nkeys:" + std::to_string(m_keys.size()) +
+           "\nreads:" + std::to_string(m_c.reads) + "\nwrites:" + std::to_string(m_c.writes) +
+           "\nqueries:" + std::to_string(m_c.queries) + "\nsyncs:" + std::to_string(m_c.syncs) +
+           "\nrefused:" + std::to_string(m_c.refused) + "\nconflicts:" + std::to_string(m_c.conflicts) +
+           "\nexpired:" + std::to_string(m_c.expired) + "\nfeeds:" + std::to_string(feeds) +
+           "\nevents_sent:" + std::to_string(m_c.events) + "\nbackups:" + std::to_string(m_c.backups) +
+           "\nbackup_failures:" + std::to_string(m_c.backup_failures) + "\nscript_calls:" + std::to_string(m_c.calls) +
+           replica + (m_broken ? "\nbroken:the journal could not be synced; restart" : "") +
            (m_schema_error.empty() ? std::string() : "\nschema_error:" + m_schema_error) +
            (m_keys_error.empty() ? std::string() : "\nkeys_error:" + m_keys_error) + "\n";
 }
 
-void db_run::reload_files(bool first, std::string& why)
+void db_run::reload_files(std::string& why)
 {
+    const bool first = m_files_checked == 0;
     const int64_t now = now_sec();
     if (!first && now == m_files_checked)
         return;
@@ -341,9 +930,7 @@ void db_run::reload_files(bool first, std::string& why)
                 err = path + " " + err;
             else if (!m_store.set_schema(s, err))
                 err = path + ": " + err;
-            if (!err.empty() && first)
-                why = err;
-            else if (!err.empty())
+            if (!err.empty())
                 LOG_ERROR(("db " + std::string(m_owner.get_name()) + ": " + err + "; the schema before is kept").c_str());
             m_schema_error = err;
         }
@@ -361,7 +948,7 @@ void db_run::reload_files(bool first, std::string& why)
                 err = path + " " + err;
             else
                 m_keys = std::move(keys);
-            if (!err.empty() && first && why.empty())
+            if (!err.empty() && first)
                 why = err;
             else if (!err.empty())
                 LOG_ERROR(("db " + std::string(m_owner.get_name()) + ": " + err + "; the keys before are kept").c_str());
@@ -423,36 +1010,6 @@ std::shared_ptr<db_run::conn> db_run::conn_of(io_request* req)
         if (c.get() == raw)
             return c;
     return nullptr;
-}
-
-void db_run::on_cqe(struct io_uring_cqe* cqe)
-{
-    auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
-    if (!req)
-        return;
-    if (file_io::owns_type(req->type))
-    {
-        m_io.on_cqe(cqe);
-        return;
-    }
-    if (req == &m_accept_req)
-    {
-        accept_done(cqe);
-        return;
-    }
-    if (req == &m_tick_req)
-    {
-        m_tick_armed = false;
-        tick();
-        return;
-    }
-    auto c = conn_of(req);
-    if (!c)
-        return;
-    if (req == &c->rd)
-        read_done(c, cqe->res);
-    else if (req == &c->wr)
-        write_done(c, cqe->res);
 }
 
 void db_run::arm_read(const std::shared_ptr<conn>& c)
@@ -529,7 +1086,7 @@ void db_run::flush(const std::shared_ptr<conn>& c)
     {
         c->out.clear();
         c->out_off = 0;
-        if (!c->keep_alive && !c->waiting)
+        if (!c->keep_alive && !c->waiting && !c->feed)
             close_conn(c);
         return;
     }
@@ -561,6 +1118,17 @@ void db_run::write_done(const std::shared_ptr<conn>& c, int res)
     c->out_off += static_cast<size_t>(res);
     c->last = now_sec();
     runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(res));
+    // A stream's buffer is cut behind what went, and a whole copy being sent goes on as it drains.
+    if (c->feed && c->out_off == c->out.size())
+    {
+        c->out.clear();
+        c->out_off = 0;
+        if (!c->dump.empty())
+        {
+            pump_dump(c);
+            return;
+        }
+    }
     flush(c);
 }
 
@@ -569,6 +1137,11 @@ void db_run::close_conn(const std::shared_ptr<conn>& c)
     if (c->dead)
         return;
     c->dead = true;
+    if (!c->dump.empty())
+    {
+        c->dump.clear();
+        m_store.unpin();
+    }
     if (c->fd >= 0)
     {
         ::shutdown(c->fd, SHUT_RDWR);
@@ -581,15 +1154,74 @@ void db_run::close_conn(const std::shared_ptr<conn>& c)
         m_closing.push_back(c);
 }
 
-// Once a second while connections are open, for the idle ones; an idle database is woken by nothing.
+
+void db_run::on_cqe(struct io_uring_cqe* cqe)
+{
+    auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
+    if (!req)
+        return;
+    if (file_io::owns_type(req->type))
+    {
+        m_io.on_cqe(cqe);
+        return;
+    }
+    if (req == &m_accept_req)
+    {
+        accept_done(cqe);
+        return;
+    }
+    if (req == &m_tick_req)
+    {
+        m_tick_armed = false;
+        tick();
+        return;
+    }
+    if (req == &m_wake_req)
+    {
+        m_wake_armed = false;
+        if (m_stopped)
+            return;
+        if (::read(m_wake_fd, &m_wake_buf, sizeof m_wake_buf) < 0) {}
+        jobs_done();
+        take_replicated();
+        arm_wake();
+        return;
+    }
+    auto c = conn_of(req);
+    if (!c)
+        return;
+    if (req == &c->rd)
+        read_done(c, cqe->res);
+    else if (req == &c->wr)
+        write_done(c, cqe->res);
+}
+
+// Woken for what is due: every second while connections are open, else at the next document to go or backup to
+// take, at most a minute ahead; an idle database with neither is woken by nothing.
 void db_run::arm_tick()
 {
     if (m_tick_armed || m_stopped)
         return;
+    int64_t delay = 0;
+    const int64_t now = now_sec();
+    const auto due = [&](int64_t at) {
+        if (at <= 0)
+            return;
+        const int64_t d = std::clamp<int64_t>(at - now, 1, 60);
+        delay = delay ? std::min(delay, d) : d;
+    };
+    if (!m_conns.empty() || !m_owner.get_replicate().empty())
+        delay = 1;
+    if (m_owner.get_replicate().empty())
+        due(m_store.next_expiry());
+    if (!m_owner.get_backup_dir().empty())
+        due(m_next_backup);
+    if (!delay)
+        return;
     m_tick_req = io_request{};
     m_tick_req.owner = this;
     m_tick_req.type = op_timeout;
-    m_tick_ts = {1, 0};
+    m_tick_ts = {delay, 0};
     m_tick_armed = m_loop.submit_timeout(&m_tick_ts, &m_tick_req);
 }
 
@@ -600,12 +1232,37 @@ void db_run::tick()
     const int64_t now = now_sec();
     std::vector<std::shared_ptr<conn>> idle;
     for (auto& [id, c] : m_conns)
+    {
+        if (c->feed)
+        {
+            // A comment now and then, so a stream nothing changes on is not taken for a dead one.
+            if (now - c->last >= 15)
+            {
+                c->last = now;
+                c->out += ": ping\n\n";
+                flush(c);
+            }
+            continue;
+        }
         if (now - c->last > idle_secs && !c->waiting && c->out_off >= c->out.size())
             idle.push_back(c);
+    }
     for (auto& c : idle)
         close_conn(c);
-    if (!m_conns.empty())
-        arm_tick();
+    // A replica is told of the documents that go by the database it copies, which sends their deletions.
+    if (m_owner.get_replicate().empty() && !m_broken)
+    {
+        std::vector<event> evs;
+        if (const size_t n = m_store.expire(now, &evs))
+        {
+            m_c.expired += n;
+            for (auto& e : evs)
+                m_unpublished.push_back(std::move(e));
+            finish_turn();
+        }
+    }
+    scheduled_backup();
+    arm_tick();
 }
 
 // ─── HTTP ───────────────────────────────────────────────────────────────────
@@ -636,7 +1293,10 @@ int db_run::take_request(conn& c, request& rq, int& refusal)
     const std::string_view version = line.substr(sp2 + 1);
     if (version != "HTTP/1.1" && version != "HTTP/1.0")
         return -1;
-    rq.path.assign(target.substr(0, target.find('?')));
+    const size_t q = target.find('?');
+    rq.path.assign(target.substr(0, q));
+    if (q != std::string_view::npos)
+        rq.query.assign(target.substr(q + 1));
 
     const std::string_view fields = head.substr(line_end + 2);
     const http_request_framing_scan scan = http_scan_request_headers(fields);
@@ -672,6 +1332,8 @@ int db_run::take_request(conn& c, request& rq, int& refusal)
             rq.if_match.assign(value);
         else if (header_name_equals(f, "if-none-match", 13))
             rq.if_none_match.assign(value);
+        else if (header_name_equals(f, "last-event-id", 13))
+            rq.last_event_id.assign(value);
         else if (header_name_equals(f, "origin", 6))
             rq.origin.assign(value);
         else if (header_name_equals(f, "host", 4))
@@ -777,7 +1439,7 @@ bool db_run::who_of(const request& rq, principal& who, bool& by_cookie, std::str
 void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
 {
     std::string ignored;
-    reload_files(false, ignored);
+    reload_files(ignored);
     const std::string allow = cors(rq);
     if (rq.method == "OPTIONS")
     {
@@ -785,7 +1447,7 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
         respond(c, 204, "",
                 allow + (allow.starts_with("Access-Control-Allow-Origin")
                              ? "Access-Control-Allow-Methods: GET, PUT, PATCH, DELETE, POST\r\n"
-                               "Access-Control-Allow-Headers: Authorization, Content-Type, If-Match, If-None-Match\r\n"
+                               "Access-Control-Allow-Headers: Authorization, Content-Type, If-Match, If-None-Match, Last-Event-ID\r\n"
                                "Access-Control-Max-Age: 600\r\n"
                              : ""));
         return;
@@ -854,20 +1516,57 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
         respond(c, 400, error_body("bad_path", "the path holds a % that spells no byte"), allow);
         return;
     }
+    // Streams of changes: a collection's as its reader may see them, every one's for a key, and a replica's.
+    const bool feed = path.ends_with("/_feed") && path.starts_with("/c/");
+    if ((path == "/_feed" || path == "/_replicate" || feed) && reads)
+    {
+        std::string coll;
+        if (feed)
+        {
+            coll = path.substr(3, path.size() - 3 - 6);
+            if (!valid_collection(coll))
+            {
+                respond(c, 400, error_body("bad_collection", "a collection's name is 1 to 64 of a-z 0-9 _ -"), allow);
+                return;
+            }
+            const collection_def* def = m_store.get_schema().find(coll);
+            const access acc = def ? def->acc : access::priv;
+            if (who.kind == principal::anyone && (acc == access::priv || acc == access::owner || acc == access::shared))
+            {
+                respond(c, 401, error_body("sign_in", "this collection is read by a signed-in account or a key"), allow);
+                return;
+            }
+            if (who.kind == principal::user && acc == access::priv)
+            {
+                respond(c, 403, error_body("forbidden", "this collection is reached by a key only"), allow);
+                return;
+            }
+        }
+        else if (who.kind != principal::key)
+        {
+            respond(c, who.kind == principal::anyone ? 401 : 403,
+                    error_body("key_only", "every collection's changes are streamed to a key only"), allow);
+            return;
+        }
+        c->who = who;
+        open_feed(c, rq, coll, !feed, path == "/_replicate");
+        return;
+    }
     answer a = execute(who, rq.method, path, rq.body, rq.if_match, rq.if_none_match);
     std::string extra = allow;
     if (a.version)
         extra += "ETag: \"" + std::to_string(a.version) + "\"\r\n";
     if (rq.method == "HEAD")
         a.body.clear();
-    if (!a.durable)
+    if (a.needs <= m_durable)
     {
         respond(c, a.status, a.body, extra);
         return;
     }
-    c->held = head(*c, a.status, "application/json", a.body.size(), extra) + a.body;
-    c->waiting = true;
-    m_held.push_back(c);
+    // Rests on a change not yet on the disk: answered once it is, and nothing behind it read meanwhile.
+    if (a.status >= 400)
+        ++m_c.refused;
+    hold(waiter{a.needs, c, head(*c, a.status, "application/json", a.body.size(), extra) + a.body, 0, false});
 }
 
 db_run::answer db_run::execute(const principal& who, std::string_view method, std::string_view path,
@@ -875,6 +1574,11 @@ db_run::answer db_run::execute(const principal& who, std::string_view method, st
 {
     if (m_broken)
         return refused(503, "not_durable", "the journal could not be written to the disk; restart the database");
+    // A copy answers reads, a query among them, and leaves every write to the database it copies.
+    const bool reading = method == "GET" || method == "HEAD" || (method == "POST" && path.ends_with("/_query"));
+    if (!m_owner.get_replicate().empty() && !reading)
+        return refused(403, "read_only", "this database is a copy of " + std::string(m_owner.get_replicate()) +
+                                             "; write there");
     const auto parse_body = [&](jvalue& out) {
         return json_reader(body).document(out);
     };
@@ -949,7 +1653,7 @@ db_run::answer db_run::execute(const principal& who, std::string_view method, st
             if (!body.empty() && !store::parse_query(q, parsed, err))
                 return refused(err);
             answer a;
-            if (!m_store.find(who, coll, parsed, a.body, err))
+            if (!m_store.find(who, coll, parsed, a.body, err, a.needs))
                 return refused(err);
             ++m_c.queries;
             return a;
@@ -968,8 +1672,13 @@ db_run::answer db_run::execute(const principal& who, std::string_view method, st
         else if (method == "GET" || method == "HEAD")
         {
             answer a;
-            if (!m_store.read(who, coll, id, a.body, err))
-                return refused(err);
+            if (!m_store.read(who, coll, id, a.body, err, a.needs))
+            {
+                // An absence rests on the last change too: one not yet on the disk may be its deletion.
+                answer r = refused(err);
+                r.needs = a.needs;
+                return r;
+            }
             if (const doc* d = m_store.get(coll, id))
                 a.version = d->v;
             ++m_c.reads;
@@ -1007,14 +1716,17 @@ db_run::answer db_run::execute(const principal& who, std::string_view method, st
     const bool existed = !is_tx && ops[0].kind == write_op::put && m_store.get(coll, ops[0].id);
     answer a;
     std::string out;
-    if (!m_store.write(who, ops, out, err))
+    std::vector<event> evs;
+    if (!m_store.write(who, ops, out, err, &evs))
     {
         if (err.status == 409 || err.status == 412)
             ++m_c.conflicts;
         return refused(err);
     }
     ++m_c.writes;
-    a.durable = true;
+    a.needs = m_store.seq();
+    for (auto& e : evs)
+        m_unpublished.push_back(std::move(e));
     if (is_tx)
     {
         a.body = "{\"results\":" + out + "}";
@@ -1042,8 +1754,53 @@ void db_run::call(uint64_t ticket, std::string_view json)
     answer a;
     const jvalue* method = nullptr;
     const jvalue* path = nullptr;
-    if (!json_reader(json).document(req) || !(method = string_member(req, "method")) ||
-        !(path = string_member(req, "path")))
+    const bool parsed = json_reader(json).document(req);
+    // A backup the daemon asks for, into the file it names: started and numbered at once, since it may take long,
+    // and asked after by its number.
+    if (const jvalue* file = parsed ? string_member(req, "backup") : nullptr)
+    {
+        auto job = file->s.starts_with('/') ? m_store.plan_backup(file->s) : nullptr;
+        if (!job)
+        {
+            mgr->requests().complete_deferred(
+                ticket, request_status::ok,
+                "{\"status\":409,\"body\":" +
+                    error_body("busy", file->s.starts_with('/') ? "a merge or another backup is running; try again"
+                                                                : "the backup's file is an absolute path") +
+                    "}");
+            return;
+        }
+        const uint64_t id = m_next_backup_id++;
+        m_backups[id].file = file->s;
+        start_job(std::move(job), id);
+        mgr->requests().complete_deferred(ticket, request_status::ok,
+                                          "{\"status\":202,\"body\":{\"job\":" + std::to_string(id) + "}}");
+        return;
+    }
+    if (const jvalue* id = parsed ? member(req, "backup_status") : nullptr)
+    {
+        uint64_t n = 0;
+        std::from_chars(id->s.data(), id->s.data() + id->s.size(), n);
+        const auto it = m_backups.find(n);
+        std::string body;
+        if (it == m_backups.end())
+            body = "{\"status\":404,\"body\":" + error_body("not_found", "no backup of that number") + "}";
+        else
+        {
+            body = "{\"status\":200,\"body\":{\"done\":" + std::string(it->second.done ? "true" : "false") +
+                   ",\"ok\":" + (it->second.ok ? "true" : "false") + ",\"documents\":" +
+                   std::to_string(it->second.documents) + ",\"file\":";
+            write_string(it->second.file, body);
+            body += ",\"message\":";
+            write_string(it->second.why, body);
+            body += "}}";
+            if (it->second.done)
+                m_backups.erase(it);
+        }
+        mgr->requests().complete_deferred(ticket, request_status::ok, body);
+        return;
+    }
+    if (!parsed || !(method = string_member(req, "method")) || !(path = string_member(req, "path")))
         a = refused(400, "bad_call", "a call is {\"method\":..,\"path\":..[,\"body\":..]}");
     else
     {
@@ -1057,8 +1814,8 @@ void db_run::call(uint64_t ticket, std::string_view json)
                     inm ? inm->s : std::string_view{});
     }
     std::string reply = "{\"status\":" + std::to_string(a.status) + ",\"body\":" + (a.body.empty() ? "null" : a.body) + "}";
-    if (a.durable)
-        m_held_calls.emplace_back(ticket, std::move(reply));
+    if (a.needs > m_durable)
+        hold(waiter{a.needs, nullptr, std::move(reply), ticket, true});
     else
         mgr->requests().complete_deferred(ticket, request_status::ok, reply);
 }

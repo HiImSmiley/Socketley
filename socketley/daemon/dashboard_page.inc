@@ -184,7 +184,9 @@ const KEY = { '-p': 'port', '-g': 'group', '--lua': 'lua_script', '--bind': 'bin
   '--sse-key-file': 'sse_key_file', '--acls': 'acls', '--notify-targets': 'notify_targets', '--replication-targets': 'replication_targets', '--tiers': 'tiers',
   '--federation': 'federation', '--nodes': 'nodes', '--zone': 'zones', '--publish': 'publish', '--proxy': 'proxy', '--transfer': 'transfer', '--notify': 'notify', '--rrl': 'rrl',
   '--clients': 'clients', '--issuer': 'issuer', '--cookie-domain': 'cookie_domain', '--idp': 'idp', '--schema': 'schema', '--keys': 'keys',
-  '--origins': 'origins' };
+  '--origins': 'origins', '--cache': 'cache',
+  '--replicate': 'replicate', '--replicate-key': 'replicate_key', '--backup-dir': 'backup_dir', '--backup-every': 'backup_every',
+  '--backup-keep': 'backup_keep' };
 const confKey = (f, type) => f.flag === '--mode' ? (type === 'cache' ? 'cache_mode' : 'mode') : KEY[f.flag];
 const ARRAYS = new Set(['backends', 'upstreams']);
 const HEALTH = ['', 'tcp', 'http'];

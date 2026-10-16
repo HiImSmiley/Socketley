@@ -2,9 +2,10 @@
 // What the --schema file declares of each collection -- who may read and write it, and which fields are indexed --
 // and the service keys the --keys file holds. Both are a line each, `#` starting a comment.
 //
-//   # collection  access   index...          (an index: a field, or unique:field)
+//   # collection  access   index...          (an index: a field, or unique:field; ttl:field for when one goes)
 //   characters    owner    level unique:name
 //   scores        public   score
+//   sessions      owner    ttl:expires_at
 //
 // A collection the file does not name is private: only a key reaches it.
 #include <cstdint>
@@ -38,6 +39,8 @@ struct collection_def
     std::string name;
     access acc{access::priv};
     std::vector<index_def> indexes;
+    // The field whose number, in seconds since 1970, is when a document of the collection goes; empty for never.
+    std::string ttl;
 };
 
 struct schema
