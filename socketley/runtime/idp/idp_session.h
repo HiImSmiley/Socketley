@@ -5,9 +5,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
-#include "../../shared/transparent_string.h"
+#include "idp_logic.h"
 
 namespace socketley::storage
 {
@@ -56,16 +55,9 @@ private:
     std::unique_ptr<socketley::storage::jwks_keys> m_keys;
     int64_t m_stamp{-1};
     int64_t m_checked{0};
-    struct cached
-    {
-        who w;
-        int64_t expires{0};
-        // An access token's, which is never taken as a session, nor a session's as one.
-        bool bearer{false};
-    };
     bool verified(std::string_view token, bool bearer, int64_t now, who& out);
     // Sessions already verified, so a signature is checked once a session and not once a request.
-    std::unordered_map<std::string, cached, string_hash, string_equal> m_seen;
+    verified_tokens m_seen;
 };
 
 }   // namespace socketley::idp

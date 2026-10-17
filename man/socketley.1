@@ -11674,8 +11674,10 @@ at
 .B /account
 a user changes their name, address and password and signs out everywhere.
 Tokens are signed ES256 with a P\-256 key made at the first start and kept in
-the state directory, so a restart signs nobody out. A password is hashed and
-checked off the event loop. It serves plain HTTP and is reached through the
+the state directory, so a restart signs nobody out; a refresh token, which only
+the provider reads back, is signed HS256 under a secret made from that key. A
+password is hashed and checked off the event loop, on a thread for each core
+the runtime may use, up to eight. It serves plain HTTP and is reached through the
 entrance, which terminates TLS for its names as for every other runtime's;
 .B \-\-tls
 is refused, and so is

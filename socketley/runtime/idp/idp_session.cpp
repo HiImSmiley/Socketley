@@ -80,33 +80,15 @@ void session_verifier::reload()
 
 bool session_verifier::verified(std::string_view token, bool bearer, int64_t now, who& out)
 {
-    if (const auto it = m_seen.find(token); it != m_seen.end())
-    {
-        if (it->second.bearer != bearer)
-            return false;
-        if (it->second.expires > now)
-        {
-            out = it->second.w;
-            return true;
-        }
-        m_seen.erase(it);
-        return false;
-    }
     for (const auto& k : m_keys->keys)
     {
         claims c;
         std::string why;
-        if (!verify_token(k.key.get(), k.kid, bearer ? "at+jwt" : "session+jwt", m_issuer, token, now, c, why) ||
+        // An access token is never taken as a session, nor a session as one: each is verified for its typ.
+        if (!m_seen.verify(k.key.get(), k.kid, bearer ? "at+jwt" : "session+jwt", m_issuer, token, now, c, why) ||
             (!bearer && c["aud"] != "session") || c["sub"].empty())
             continue;
-        int64_t exp = 0;
-        const std::string& e = c["exp"];
-        std::from_chars(e.data(), e.data() + e.size(), exp);
-        who w{c["sub"], c["preferred_username"], c["email"], c["admin"] == "true"};
-        if (m_seen.size() >= 4096)
-            m_seen.clear();
-        m_seen.insert_or_assign(std::string(token), cached{w, exp, bearer});
-        out = std::move(w);
+        out = who{c["sub"], c["preferred_username"], c["email"], c["admin"] == "true"};
         return true;
     }
     return false;

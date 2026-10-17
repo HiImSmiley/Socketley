@@ -56,8 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   passwords they have there; `/account` lets a user change their profile and
   password and sign out everywhere. It serves the code flow with PKCE,
   refresh tokens, discovery, its key as a JWKS, `/userinfo` and `/logout`,
-  signed ES256 with a key kept in the state directory, and hashes passwords
-  off the event loop. Its sign-in is a cookie that a proxy's `--auth
+  signed ES256 with a key kept in the state directory (refresh tokens, which
+  only it reads back, HS256 under a secret made from that key), remembers a
+  session or an access token it verified until it expires, and hashes
+  passwords off the event loop, on as many threads as it has cores, up to
+  eight. Its sign-in is a cookie that a proxy's `--auth
   idp:<runtime>`, a storage's `--idp <runtime>` and `daemon.dashboard_idp`
   verify themselves against the published key: a browser without one is sent
   to sign in and back, a proxy's backend is told the account in

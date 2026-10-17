@@ -136,6 +136,63 @@ TEST_CASE("a token verifies with its own key and fails every way it was not made
     EVP_PKEY_free(k);
 }
 
+TEST_CASE("a token only the provider reads is HS256 under a secret of its key, and nothing else passes for one")
+{
+    EVP_PKEY* k = fresh_key();
+    EVP_PKEY* other = fresh_key();
+    REQUIRE(k);
+    REQUIRE(other);
+    const std::string secret = token_secret(k);
+    CHECK(secret.size() == 32);
+    CHECK(token_secret(k) == secret);
+    CHECK(token_secret(other) != secret);
+    const std::string iss = "https://auth.example.com";
+    const std::string body = "\"iss\":\"" + iss + "\",\"sub\":\"alice\",\"exp\":2000";
+    const std::string t = sign_secret_token(secret, "refresh+jwt", body);
+    claims c;
+    std::string why;
+    REQUIRE(verify_secret_token(secret, "refresh+jwt", iss, t, 1000, c, why));
+    CHECK(c["sub"] == "alice");
+    CHECK_FALSE(verify_secret_token(secret, "refresh+jwt", iss, t, 2000, c, why));
+    CHECK_FALSE(verify_secret_token(secret, "at+jwt", iss, t, 1000, c, why));
+    CHECK_FALSE(verify_secret_token(token_secret(other), "refresh+jwt", iss, t, 1000, c, why));
+    CHECK(why == "the signature does not hold");
+    // Neither kind is taken for the other, whatever the header says.
+    const std::string kid = socketley::jws::thumbprint(k);
+    CHECK_FALSE(verify_token(k, kid, "refresh+jwt", iss, t, 1000, c, why));
+    CHECK_FALSE(verify_secret_token(secret, "refresh+jwt", iss, sign_token(k, kid, "refresh+jwt", body), 1000, c, why));
+    const size_t d1 = t.find('.'), d2 = t.find('.', d1 + 1);
+    const std::string forged = t.substr(0, d1 + 1) +
+                               socketley::jws::b64url("{\"iss\":\"" + iss + "\",\"sub\":\"root\",\"exp\":2000}") +
+                               t.substr(d2);
+    CHECK_FALSE(verify_secret_token(secret, "refresh+jwt", iss, forged, 1000, c, why));
+    EVP_PKEY_free(other);
+    EVP_PKEY_free(k);
+}
+
+TEST_CASE("a token verified once is remembered for its typ until it expires, and a forgery is never remembered")
+{
+    EVP_PKEY* k = fresh_key();
+    REQUIRE(k);
+    const std::string kid = socketley::jws::thumbprint(k);
+    const std::string iss = "https://auth.example.com";
+    const std::string t = sign_token(k, kid, "at+jwt", "\"iss\":\"" + iss + "\",\"sub\":\"alice\",\"exp\":2000");
+    verified_tokens seen;
+    claims c;
+    std::string why;
+    REQUIRE(seen.verify(k, kid, "at+jwt", iss, t, 1000, c, why));
+    c.clear();
+    REQUIRE(seen.verify(k, kid, "at+jwt", iss, t, 1500, c, why));
+    CHECK(c["sub"] == "alice");
+    CHECK_FALSE(seen.verify(k, kid, "session+jwt", iss, t, 1500, c, why));
+    CHECK_FALSE(seen.verify(k, kid, "at+jwt", "https://other.example", t, 1500, c, why));
+    CHECK_FALSE(seen.verify(k, kid, "at+jwt", iss, t, 2000, c, why));
+    const std::string forged = t.substr(0, t.rfind('.') + 1) + "AAAA";
+    CHECK_FALSE(seen.verify(k, kid, "at+jwt", iss, forged, 1000, c, why));
+    CHECK_FALSE(seen.verify(k, kid, "at+jwt", iss, forged, 1000, c, why));
+    EVP_PKEY_free(k);
+}
+
 TEST_CASE("base64url decodes what it encodes and refuses a second spelling")
 {
     for (int n = 0; n < 40; ++n)

@@ -3,6 +3,11 @@
 #include <cctype>
 #include <charconv>
 
+#include <openssl/bn.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+
 #include "../../shared/jws.h"
 #include "../storage/json_doc.h"
 
@@ -306,8 +311,14 @@ std::string sign_token(EVP_PKEY* key, std::string_view kid, std::string_view typ
     return socketley::jws::compact(key, header, "{" + std::string(body) + "}");
 }
 
-bool verify_token(EVP_PKEY* key, std::string_view kid, std::string_view typ, std::string_view issuer,
-                  std::string_view token, int64_t now, claims& out, std::string& why)
+namespace
+{
+
+// A token's claims when its header names `want_alg`, `kid` and `typ`, `holds` takes its signature over the part
+// before it, it was issued by `issuer` and has not expired at `now`.
+template <class Holds>
+bool read_token(std::string_view want_alg, std::string_view kid, std::string_view typ, std::string_view issuer,
+                std::string_view token, int64_t now, Holds&& holds, claims& out, std::string& why)
 {
     using socketley::storage::json_reader;
     using socketley::storage::jvalue;
@@ -343,12 +354,12 @@ bool verify_token(EVP_PKEY* key, std::string_view kid, std::string_view typ, std
         else if (k == "typ") htyp = v.s;
     }
     // The algorithm is this provider's and never the token's choice.
-    if (alg != "ES256" || hkid != kid || htyp != typ)
+    if (alg != want_alg || hkid != kid || htyp != typ)
     {
         why = "not one of this provider's " + std::string(typ) + " tokens";
         return false;
     }
-    if (!socketley::jws::es256_verify(key, token.substr(0, d2), sig))
+    if (!holds(token.substr(0, d2), sig))
     {
         why = "the signature does not hold";
         return false;
@@ -386,6 +397,89 @@ bool verify_token(EVP_PKEY* key, std::string_view kid, std::string_view typ, std
         return false;
     }
     return true;
+}
+
+std::string hs256(std::string_view secret, std::string_view input)
+{
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int n = 0;
+    if (!HMAC(EVP_sha256(), secret.data(), static_cast<int>(secret.size()),
+              reinterpret_cast<const unsigned char*>(input.data()), input.size(), md, &n))
+        return {};
+    return std::string(reinterpret_cast<const char*>(md), n);
+}
+
+}   // namespace
+
+bool verify_token(EVP_PKEY* key, std::string_view kid, std::string_view typ, std::string_view issuer,
+                  std::string_view token, int64_t now, claims& out, std::string& why)
+{
+    return read_token("ES256", kid, typ, issuer, token, now,
+                      [key](std::string_view input, std::string_view sig) {
+                          return socketley::jws::es256_verify(key, input, sig);
+                      },
+                      out, why);
+}
+
+bool verified_tokens::verify(EVP_PKEY* key, std::string_view kid, std::string_view typ, std::string_view issuer,
+                             std::string_view token, int64_t now, claims& out, std::string& why)
+{
+    std::string context = std::string(kid) + "\n" + std::string(typ) + "\n" + std::string(issuer);
+    if (const auto it = m_seen.find(token); it != m_seen.end() && it->second.context == context)
+    {
+        if (it->second.expires > now)
+        {
+            out = it->second.c;
+            return true;
+        }
+        m_seen.erase(it);
+    }
+    if (!verify_token(key, kid, typ, issuer, token, now, out, why))
+        return false;
+    if (m_seen.size() >= 4096)
+    {
+        std::erase_if(m_seen, [now](const auto& kv) { return kv.second.expires <= now; });
+        if (m_seen.size() >= 4096)
+            m_seen.clear();
+    }
+    int64_t exp = 0;
+    const std::string& e = out.find("exp")->second;
+    std::from_chars(e.data(), e.data() + e.size(), exp);
+    m_seen.insert_or_assign(std::string(token), entry{std::move(context), out, exp});
+    return true;
+}
+
+std::string token_secret(EVP_PKEY* key)
+{
+    BIGNUM* priv = nullptr;
+    if (EVP_PKEY_get_bn_param(key, "priv", &priv) != 1)
+        return {};
+    std::string scalar(32, '\0');
+    const bool ok = BN_bn2binpad(priv, reinterpret_cast<unsigned char*>(scalar.data()), 32) == 32;
+    BN_clear_free(priv);
+    const std::string secret = ok ? hs256(scalar, "socketley idp: tokens only this provider reads") : std::string();
+    OPENSSL_cleanse(scalar.data(), scalar.size());
+    return secret;
+}
+
+std::string sign_secret_token(std::string_view secret, std::string_view typ, std::string_view body)
+{
+    const std::string header = "{\"alg\":\"HS256\",\"kid\":\"self\",\"typ\":" + json_string(typ) + "}";
+    const std::string input =
+        socketley::jws::b64url(header) + "." + socketley::jws::b64url("{" + std::string(body) + "}");
+    return input + "." + socketley::jws::b64url(hs256(secret, input));
+}
+
+bool verify_secret_token(std::string_view secret, std::string_view typ, std::string_view issuer, std::string_view token,
+                         int64_t now, claims& out, std::string& why)
+{
+    return read_token("HS256", "self", typ, issuer, token, now,
+                      [secret](std::string_view input, std::string_view sig) {
+                          const std::string want = hs256(secret, input);
+                          return !want.empty() && sig.size() == want.size() &&
+                                 CRYPTO_memcmp(sig.data(), want.data(), want.size()) == 0;
+                      },
+                      out, why);
 }
 
 }   // namespace socketley::idp

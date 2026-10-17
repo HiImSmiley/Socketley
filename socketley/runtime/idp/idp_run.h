@@ -168,8 +168,8 @@ private:
     idp_instance& m_owner;
     event_loop& m_loop;
     file_io m_io;
+    // A thread a core the process may run on, as each sign-in's scrypt is one core's tens of milliseconds.
     hash_pool m_hash;
-    uint32_t m_hash_lane{0};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
     std::string m_issuer;
     std::string m_cookie_domain;
@@ -189,6 +189,10 @@ private:
     EVP_PKEY* m_key{nullptr};
     std::string m_kid;
     std::string m_jwk;
+    // What signs the refresh tokens, which only this provider reads back.
+    std::string m_secret;
+    // Session cookies and access tokens already verified, so one sent again is not verified again.
+    mutable verified_tokens m_verified;
 
     account_store m_accounts;
     std::vector<client> m_clients;

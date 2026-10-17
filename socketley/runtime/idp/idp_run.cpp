@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -150,10 +151,19 @@ std::string page(std::string_view title, std::string_view body)
 constexpr std::string_view carried[] = {"client_id", "redirect_uri", "response_type", "scope", "state", "nonce",
                                         "code_challenge", "code_challenge_method", "rd"};
 
+// One scrypt holds 16 MiB, so eight at once is where the cores stop being what bounds the sign-ins.
+unsigned hash_threads()
+{
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    const int n = ::sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : 1;
+    return static_cast<unsigned>(std::clamp(n, 1, 8));
+}
+
 }   // namespace
 
 idp_run::idp_run(idp_instance& owner, event_loop& loop)
-    : m_owner(owner), m_loop(loop), m_io(loop, this), m_hash(1)
+    : m_owner(owner), m_loop(loop), m_io(loop, this), m_hash(hash_threads())
 {
 }
 
@@ -180,6 +190,12 @@ bool idp_run::start(std::string& why)
         return false;
     }
     m_kid = socketley::jws::thumbprint(m_key);
+    m_secret = token_secret(m_key);
+    if (m_secret.empty())
+    {
+        why = "the signing key's private half cannot be read";
+        return false;
+    }
     const std::string pub = socketley::jws::jwk_of(m_key);
     m_jwk = pub.substr(0, pub.size() - 1) + ",\"kid\":" + json_string(m_kid) + ",\"use\":\"sig\",\"alg\":\"ES256\"}";
     // The public half where a proxy of this daemon reads it, written whole so a reader never sees half of it.
@@ -207,7 +223,6 @@ bool idp_run::start(std::string& why)
     m_loop.register_owner(this);
     if (!m_hash.attach(m_io))
         m_hash.stop();
-    m_hash_lane = m_hash.next_lane();
 
     const uint16_t port = m_owner.effective_port();
     m_listen_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -786,7 +801,7 @@ const account* idp_run::session_of(const request& rq) const
             continue;
         claims c;
         std::string why;
-        if (!verify_token(m_key, m_kid, "session+jwt", m_issuer, part.substr(cookie_name.size() + 1), now, c, why) ||
+        if (!m_verified.verify(m_key, m_kid, "session+jwt", m_issuer, part.substr(cookie_name.size() + 1), now, c, why) ||
             claim(c, "aud") != "session")
             continue;
         const account* a = m_accounts.by_id(claim(c, "sub"));
@@ -1064,7 +1079,7 @@ void idp_run::check_password(const account* who, std::string_view password, std:
         then(real && *result);
         return;
     }
-    m_hash.submit(m_hash_lane, std::move(work), [alive = m_alive, result, real, then = std::move(then)] {
+    m_hash.submit(m_hash.next_lane(), std::move(work), [alive = m_alive, result, real, then = std::move(then)] {
         if (*alive)
             then(real && *result);
     });
@@ -1080,7 +1095,7 @@ void idp_run::hash_password(std::string_view password, std::function<void(std::s
         then(std::move(*result));
         return;
     }
-    m_hash.submit(m_hash_lane, std::move(work), [alive = m_alive, result, then = std::move(then)] {
+    m_hash.submit(m_hash.next_lane(), std::move(work), [alive = m_alive, result, then = std::move(then)] {
         if (*alive)
             then(std::move(*result));
     });
@@ -1159,7 +1174,7 @@ void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, con
                        ",\"scope\":" + json_string(e.scope);
     if (has_scope(e.scope, "offline_access") || !cl.is_public())
     {
-        const std::string refresh = sign_token(m_key, m_kid, "refresh+jwt",
+        const std::string refresh = sign_secret_token(m_secret, "refresh+jwt",
                                                common + ",\"aud\":\"refresh\",\"client_id\":" + json_string(cl.id) +
                                                    ",\"scope\":" + json_string(e.scope) + ",\"exp\":" +
                                                    std::to_string(now + refresh_secs));
@@ -1235,7 +1250,7 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
     {
         claims r;
         std::string why;
-        if (!verify_token(m_key, m_kid, "refresh+jwt", m_issuer, param(p, "refresh_token"), now_sec(), r, why) ||
+        if (!verify_secret_token(m_secret, "refresh+jwt", m_issuer, param(p, "refresh_token"), now_sec(), r, why) ||
             claim(r, "aud") != "refresh" || claim(r, "client_id") != cl->id)
         {
             json_error(c, 400, "invalid_grant", "the refresh token is not one this client may use");
@@ -1271,7 +1286,7 @@ void idp_run::userinfo(const std::shared_ptr<conn>& c, const request& rq)
     }
     claims a;
     std::string why;
-    if (!verify_token(m_key, m_kid, "at+jwt", m_issuer, http_trim_ows(auth.substr(7)), now_sec(), a, why) ||
+    if (!m_verified.verify(m_key, m_kid, "at+jwt", m_issuer, http_trim_ows(auth.substr(7)), now_sec(), a, why) ||
         !has_scope(claim(a, "scope"), "openid"))
     {
         json_error(c, 401, "invalid_token", "the access token is not valid: " + why,

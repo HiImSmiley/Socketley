@@ -5,8 +5,11 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "../../shared/transparent_string.h"
 
 typedef struct evp_pkey_st EVP_PKEY;
 
@@ -70,5 +73,35 @@ std::string sign_token(EVP_PKEY* key, std::string_view kid, std::string_view typ
 // issued by `issuer` and has not expired at `now`; false with `why` otherwise.
 bool verify_token(EVP_PKEY* key, std::string_view kid, std::string_view typ, std::string_view issuer,
                   std::string_view token, int64_t now, claims& out, std::string& why);
+
+// verify_token with the tokens it took remembered until they expire, so one sent again costs a lookup rather than a
+// signature check: a token's bytes decide its verification whole.
+class verified_tokens
+{
+public:
+    bool verify(EVP_PKEY* key, std::string_view kid, std::string_view typ, std::string_view issuer,
+                std::string_view token, int64_t now, claims& out, std::string& why);
+    void clear() { m_seen.clear(); }
+
+private:
+    struct entry
+    {
+        // The key's id, the typ and the issuer it was verified for, each a line.
+        std::string context;
+        claims c;
+        int64_t expires{0};
+    };
+    std::unordered_map<std::string, entry, string_hash, string_equal> m_seen;
+};
+
+// The secret of the tokens only this provider reads back, made from `key`'s private half, so it lives and changes
+// with the key; empty when that half cannot be read.
+std::string token_secret(EVP_PKEY* key);
+
+// A JWT signed HS256 with `secret`, for what this provider alone reads back, as a refresh token: an HMAC costs a
+// microsecond where an ECDSA signature costs tens.
+std::string sign_secret_token(std::string_view secret, std::string_view typ, std::string_view body);
+bool verify_secret_token(std::string_view secret, std::string_view typ, std::string_view issuer, std::string_view token,
+                         int64_t now, claims& out, std::string& why);
 
 }   // namespace socketley::idp
