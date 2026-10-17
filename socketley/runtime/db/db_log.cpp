@@ -254,6 +254,7 @@ bool seglog::begin(uint32_t seg, std::string& why)
     m_active = seg;
     m_highest = std::max(m_highest, seg);
     m_segs[seg].size = header_bytes;
+    ++m_layout;
     m_written = m_alloc = header_bytes;
     m_room_failed = false;
     m_pending.clear();
@@ -276,7 +277,7 @@ void seglog::close()
     m_pending.clear();
     m_active = m_highest = 0;
     m_written = m_alloc = 0;
-    m_failed = m_room_failed = false;
+    m_failed = m_room_failed = m_follow = false;
 }
 
 location seglog::append(std::string_view payload)
@@ -369,7 +370,17 @@ int seglog::fd_of(uint32_t seg)
         return m_fd;
     const auto it = m_segs.find(seg);
     if (it == m_segs.end())
-        return -1;
+    {
+        // A reader of another's log takes a segment it had not seen the first time it is asked for, and keeps it.
+        if (!m_follow)
+            return -1;
+        const int fd = ::open(path_of(seg).c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            return -1;
+        m_segs[seg].fd = fd;
+        m_highest = std::max(m_highest, seg);
+        return fd;
+    }
     if (it->second.fd < 0)
         it->second.fd = ::open(path_of(seg).c_str(), O_RDONLY | O_CLOEXEC);
     return it->second.fd;
@@ -449,6 +460,7 @@ bool seglog::adopt(uint32_t seg, std::string& why)
     }
     m_segs[seg].size = static_cast<uint64_t>(st.st_size);
     m_highest = std::max(m_highest, seg);
+    ++m_layout;
     return true;
 }
 
@@ -461,6 +473,7 @@ void seglog::remove(uint32_t seg)
         ::close(it->second.fd);
     ::unlink(path_of(seg).c_str());
     m_segs.erase(it);
+    ++m_layout;
 }
 
 bool seglog::clear(std::string& why)
@@ -478,6 +491,102 @@ bool seglog::clear(std::string& why)
         remove(n);
     sync_dir(m_dir);
     return true;
+}
+
+bool seglog::follow_open(const std::string& dir, std::string& why)
+{
+    close();
+    m_dir = dir;
+    m_follow = true;
+    for (const uint32_t n : listed())
+    {
+        const int fd = ::open(path_of(n).c_str(), O_RDONLY | O_CLOEXEC);
+        char head[header_bytes];
+        if (fd < 0 || !pread_all(fd, head, header_bytes, 0) || std::memcmp(head, magic, sizeof magic) != 0)
+        {
+            if (fd >= 0)
+                ::close(fd);
+            why = path_of(n) + " is not a segment of a db runtime";
+            return false;
+        }
+        m_segs[n].fd = fd;
+        m_highest = std::max(m_highest, n);
+    }
+    return true;
+}
+
+std::vector<uint32_t> seglog::listed() const
+{
+    std::vector<uint32_t> out;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(m_dir, ec))
+    {
+        const std::string name = e.path().filename().string();
+        unsigned n = 0;
+        if (name.size() == 16 && std::sscanf(name.c_str(), "seg-%08u.log", &n) == 1)
+            out.push_back(n);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+uint64_t seglog::read_records(uint32_t seg, uint64_t off,
+                              const std::function<bool(uint64_t payload_off, std::string_view payload)>& each)
+{
+    const int fd = fd_of(seg);
+    struct stat st{};
+    if (fd < 0 || ::fstat(fd, &st) != 0)
+        return off;
+    const uint64_t size = static_cast<uint64_t>(st.st_size);
+    // A window at a time, as a scan reads, so a long tail is not one read a record.
+    std::string buf;
+    uint64_t base = off;
+    while (off + record_head <= size)
+    {
+        if (off + record_head > base + buf.size())
+        {
+            buf.erase(0, static_cast<size_t>(std::min<uint64_t>(off - base, buf.size())));
+            base = off;
+            const size_t want = static_cast<size_t>(std::min<uint64_t>(size - base, 1u << 20));
+            const size_t had = buf.size();
+            if (want > had)
+            {
+                buf.resize(want);
+                if (!pread_all(fd, buf.data() + had, want - had, base + had))
+                    break;
+            }
+        }
+        const char* h = buf.data() + (off - base);
+        const uint32_t len = get32(h);
+        const uint32_t crc = get32(h + 4);
+        if (len == 0 || len > max_record || off + record_head + len > size)
+            break;
+        if (off + record_head + len > base + buf.size())
+        {
+            buf.erase(0, static_cast<size_t>(off - base));
+            base = off;
+            const size_t had = buf.size();
+            buf.resize(record_head + len);
+            if (!pread_all(fd, buf.data() + had, buf.size() - had, base + had))
+                break;
+        }
+        const std::string_view payload(buf.data() + (off - base) + record_head, len);
+        if (journal_detail::crc32(payload) != crc || !each(off + record_head, payload))
+            break;
+        off += record_head + len;
+    }
+    m_segs[seg].size = std::max(m_segs[seg].size, off);
+    return off;
+}
+
+void seglog::forget(uint32_t seg)
+{
+    const auto it = m_segs.find(seg);
+    if (it == m_segs.end())
+        return;
+    if (it->second.fd >= 0)
+        ::close(it->second.fd);
+    m_segs.erase(it);
 }
 
 bool seglog::write_file(const std::string& path, const std::vector<std::string>& payloads, std::vector<uint64_t>& offs,

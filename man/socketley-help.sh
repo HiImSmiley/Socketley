@@ -814,6 +814,7 @@ runtime_types() {
     echo -e "${CYAN}│${NC}        --origins https://app.example.com, --max-bytes 2G       ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Access: private, owner, shared, public, catalog; ttl:field.    ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} On the disk, a cache in memory (--cache): more than RAM holds. ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Cores: --shards N, shard 0 writes and every shard reads.       ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Changes: GET /c/<collection>/_feed, Server-Sent Events.         ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Copy: --replicate https://data... --replicate-key file         ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Backups: socketley db-backup|db-restore <db> <file>,           ${CYAN}│${NC}"

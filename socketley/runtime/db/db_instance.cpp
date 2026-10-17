@@ -3,6 +3,7 @@
 #include "db_run.h"
 #include "../../shared/logging.h"
 #include "../../shared/paths.h"
+#include "../../shared/runtime_manager.h"
 
 std::string db_data_dir(std::string_view runtime_name)
 {
@@ -70,6 +71,19 @@ void db_instance::on_loop_turn()
 
 bool db_instance::serve_deferred(uint64_t ticket, std::string_view, std::string_view payload)
 {
+    // A reading shard's write for shard 0, and shard 0's word that more of its log is on the disk.
+    if (m_run && payload.starts_with(socketley::db::cross_marker))
+    {
+        m_run->cross_call(ticket, payload);
+        return true;
+    }
+    if (m_run && payload.starts_with(socketley::db::nudge_marker))
+    {
+        if (auto* mgr = get_runtime_manager())
+            mgr->requests().complete_deferred(ticket, request_status::ok, {});
+        m_run->nudged();
+        return true;
+    }
     // Only what socketley.db sends; any other runtime's request is no call this database takes.
     if (!m_run || !payload.starts_with(socketley::db::call_marker))
         return false;

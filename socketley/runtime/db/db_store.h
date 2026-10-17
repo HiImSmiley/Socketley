@@ -151,6 +151,18 @@ public:
     // The documents kept under `dir`, judged and indexed by `s`; false with `why` when they do not read or a unique
     // index the schema has is broken by two of them.
     bool open(const std::string& dir, const schema& s, std::string& why);
+
+    // ── A shard reading shard 0's log ───────────────────────────────────────
+    // The documents of `dir` as its writer has made them durable, up to change `until`, read and never written.
+    bool follow_open(const std::string& dir, const schema& s, uint64_t until, std::string& why);
+    // The changes past those read, up to `until`, each told to `events`; false when the log no longer goes on from
+    // where the reading stands -- cleared, restored, or merged past it -- which a follow_open answers.
+    bool follow(uint64_t until, std::vector<event>* events);
+    // Documents a merge moved, found where it put them, and the segments it removed let go.
+    void follow_layout();
+    bool following() const { return m_following; }
+    // How often the writer's set of segments changed, which a reader of its log follows.
+    uint64_t layout() const { return m_log.layout(); }
     void close();
 
     // The schema the next calls are judged and indexed by; false, and the one before kept, when a unique index it
@@ -260,7 +272,10 @@ private:
     void derive(const coll_state& c, const jvalue& body, doc& d) const;
     bool rebuild(coll_state& c, const std::string& name, const collection_def* def, std::string& why);
     void drop_doomed();
-    bool scan(uint32_t seg, uint64_t payload_off, std::string_view payload);
+    // One record read into the documents, its changes told to `events` when it is given.
+    bool scan(uint32_t seg, uint64_t payload_off, std::string_view payload, std::vector<event>* events = nullptr);
+    // A document a merge wrote again, taken at its new place when it is still the version there.
+    void relocate(const event& e, uint32_t seg, uint64_t off);
     bool may_read(const principal& who, access a, const doc& d) const;
     bool unique_ok(const coll_state& c, const std::string& id, const doc& d, error& err) const;
     bool expired(const doc& d) const;
@@ -303,6 +318,11 @@ private:
     bool m_job_running{false};
     int m_pins{0};
     std::vector<uint32_t> m_doomed;
+    bool m_following{false};
+    // Where the reading of the writer's log stands, and every segment whose records it has taken in.
+    uint32_t m_follow_seg{0};
+    uint64_t m_follow_off{0};
+    std::set<uint32_t> m_seen_segs;
     uint64_t m_merges{0};
 };
 

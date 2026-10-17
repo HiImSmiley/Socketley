@@ -50,8 +50,6 @@ chmod 600 "$T/keys"
 
 out=$("$BIN" create db x1 -p "$PD" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ok || bad "a database no key nor account can write is refused" "rc $rc: $out"
-out=$("$BIN" create db x2 -p "$PD" --keys "$T/keys" --shards 2 2>&1); rc=$?
-[ "$rc" -ne 0 ] && ok || bad "--shards is refused" "rc $rc: $out"
 out=$("$BIN" create db x3 -p "$PD" --keys relative.keys 2>&1); rc=$?
 case "$out" in *"$PWD/relative.keys"*|"") ok ;; *) [ "$rc" -eq 0 ] && ok || bad "a relative --keys is made absolute by the CLI" "rc $rc: $out" ;; esac
 "$BIN" remove x3 >/dev/null 2>&1

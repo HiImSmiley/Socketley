@@ -889,13 +889,25 @@ bool store::set_schema(const schema& s, std::string& why)
 
 // ─── Opening ────────────────────────────────────────────────────────────────
 
-bool store::scan(uint32_t seg, uint64_t payload_off, std::string_view payload)
+bool store::scan(uint32_t seg, uint64_t payload_off, std::string_view payload, std::vector<event>* events)
 {
     std::vector<event> evs;
     std::vector<uint64_t> offs;
     uint64_t seq = 0;
     if (!decode_record(payload, evs, &offs, &seq))
         return false;
+    // Told after the documents are as the record leaves them, as a write tells its own.
+    struct tell
+    {
+        std::vector<event>& evs;
+        std::vector<event>* to;
+        ~tell()
+        {
+            if (to)
+                for (auto& e : evs)
+                    to->push_back(std::move(e));
+        }
+    } told{evs, events};
     m_seq = std::max(m_seq, seq);
     for (size_t i = 0; i < evs.size(); ++i)
     {
@@ -934,6 +946,185 @@ bool store::scan(uint32_t seg, uint64_t payload_off, std::string_view payload)
         set_doc(*c, e.coll, e.id, &d);
     }
     return true;
+}
+
+namespace
+{
+
+// A record's sequence number, its bytes after the kind, as encode_record() writes it; 0 for one too short.
+uint64_t record_seq(std::string_view payload)
+{
+    uint64_t q = 0;
+    if (payload.size() < 9)
+        return 0;
+    for (int b = 0; b < 8; ++b)
+        q |= static_cast<uint64_t>(static_cast<unsigned char>(payload[1 + b])) << (8 * b);
+    return q;
+}
+
+}   // namespace
+
+void store::relocate(const event& e, uint32_t seg, uint64_t off)
+{
+    if (e.del)
+        return;
+    coll_state* c = coll_of(e.coll);
+    const auto it = c ? c->docs.find(e.id) : decltype(c->docs)::iterator{};
+    if (!c || it == c->docs.end() || it->second.seq != e.seq)
+        return;
+    doc& d = it->second;
+    if (d.at.seg == seg && d.at.off == off)
+        return;
+    live_add(d, -1);
+    cache_drop(d);
+    d.at = location{seg, off, static_cast<uint32_t>(e.json.size())};
+    live_add(d, +1);
+}
+
+bool store::follow_open(const std::string& dir, const schema& s, uint64_t until, std::string& why)
+{
+    close();
+    m_schema = s;
+    if (!m_log.follow_open(dir, why))
+        return false;
+    m_following = true;
+    uint64_t best = 0;
+    for (const uint32_t n : m_log.listed())
+    {
+        bool bad = false;
+        uint64_t top = 0;
+        const uint64_t end = m_log.read_records(n, seglog::header_bytes, [&](uint64_t off, std::string_view p) {
+            const uint64_t q = record_seq(p);
+            // What is past `until` may be written and not yet on the disk.
+            if (q > until)
+                return false;
+            if (!scan(n, off, p))
+            {
+                bad = true;
+                return false;
+            }
+            top = std::max(top, q);
+            return true;
+        });
+        if (bad)
+        {
+            why = m_log.path_of(n) + " holds a record this build cannot read";
+            return false;
+        }
+        m_seen_segs.insert(n);
+        // The reading goes on where the latest change was found.
+        if (top >= best)
+        {
+            best = top;
+            m_follow_seg = n;
+            m_follow_off = end;
+        }
+    }
+    m_tombs.clear();
+    schema none;
+    const schema wanted = m_schema;
+    m_schema = none;
+    for (auto& [name, c] : m_colls)
+        for (auto& ix : c.indexes)
+            ix.def.unique = false;
+    return set_schema(wanted, why);
+}
+
+bool store::follow(uint64_t until, std::vector<event>* events)
+{
+    if (!m_following || until < m_seq)
+        return false;
+    while (m_seq < until)
+    {
+        bool bad = false;
+        const uint64_t before = m_seq;
+        m_follow_off = m_log.read_records(m_follow_seg, m_follow_off, [&](uint64_t off, std::string_view p) {
+            if (record_seq(p) > until)
+                return false;
+            if (!scan(m_follow_seg, off, p, events))
+            {
+                bad = true;
+                return false;
+            }
+            return true;
+        });
+        if (bad)
+            return false;
+        if (m_seq >= until)
+            break;
+        if (m_seq != before)
+            continue;
+        // The segment read ended short of `until`: the log goes on in the one whose first record is the next change,
+        // which only one may be.
+        uint32_t next = 0;
+        int found = 0;
+        for (const uint32_t n : m_log.listed())
+        {
+            if (n <= m_follow_seg)
+                continue;
+            uint64_t first = 0;
+            m_log.read_records(n, seglog::header_bytes, [&](uint64_t, std::string_view p) {
+                first = record_seq(p);
+                return false;
+            });
+            if (first == m_seq + 1)
+            {
+                next = n;
+                ++found;
+            }
+        }
+        if (found != 1)
+            return false;
+        m_follow_seg = next;
+        m_follow_off = seglog::header_bytes;
+        m_seen_segs.insert(next);
+    }
+    return true;
+}
+
+void store::follow_layout()
+{
+    if (!m_following)
+        return;
+    const std::vector<uint32_t> now = m_log.listed();
+    for (const uint32_t n : now)
+    {
+        if (m_seen_segs.contains(n) || n == m_follow_seg)
+            continue;
+        // A segment a merge wrote, unless its records are past what was read: a log the reading has not reached.
+        bool ahead = false;
+        m_log.read_records(n, seglog::header_bytes, [&](uint64_t off, std::string_view p) {
+            std::vector<event> evs;
+            std::vector<uint64_t> offs;
+            uint64_t q = 0;
+            if (!decode_record(p, evs, &offs, &q))
+                return false;
+            if (q > m_seq)
+            {
+                ahead = true;
+                return false;
+            }
+            for (size_t i = 0; i < evs.size(); ++i)
+                relocate(evs[i], n, off + offs[i]);
+            return true;
+        });
+        if (!ahead)
+            m_seen_segs.insert(n);
+    }
+    // A segment the writer removed is let go once no document lies in it.
+    for (auto it = m_seen_segs.begin(); it != m_seen_segs.end();)
+    {
+        const uint32_t n = *it;
+        const auto live = m_live.find(n);
+        if (n != m_follow_seg && !std::binary_search(now.begin(), now.end(), n) && (live == m_live.end() || !live->second))
+        {
+            m_log.forget(n);
+            m_live.erase(n);
+            it = m_seen_segs.erase(it);
+        }
+        else
+            ++it;
+    }
 }
 
 namespace
@@ -1098,6 +1289,10 @@ void store::close()
     m_seq = 0;
     m_doomed.clear();
     m_pins = 0;
+    m_following = false;
+    m_follow_seg = 0;
+    m_follow_off = 0;
+    m_seen_segs.clear();
     m_job_running = false;
 }
 
@@ -1577,6 +1772,12 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
     if (ops.empty() || ops.size() > max_ops)
     {
         err = fail(400, "bad_write", "a write is 1 to " + std::to_string(max_ops) + " changes");
+        return false;
+    }
+    // A shard reading another's log writes nothing of its own.
+    if (m_following)
+    {
+        err = fail(503, "not_the_writer", "this shard reads the log shard 0 writes");
         return false;
     }
     if (who.kind == principal::anyone)

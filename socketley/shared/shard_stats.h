@@ -352,6 +352,24 @@ public:
         s.active_connections.store(f.active_connections, std::memory_order_release);
     }
 
+    // Two numbers of this shard's own for its siblings, which the runtime gives their meaning: a sharded db's
+    // writer puts the change its log is on the disk up to, and how often its segments were rearranged.  The second
+    // is stored first, so a reader that sees the first sees the second it was taken with.
+    void publish_words(uint64_t first, uint64_t second)
+    {
+        if (!writable())
+            return;
+        slot& s = m_table->slots[m_index];
+        s.reserved[1].store(second, std::memory_order_release);
+        s.reserved[0].store(first, std::memory_order_release);
+    }
+    uint64_t word_at(uint32_t i, uint32_t k) const
+    {
+        if (!m_table || i >= m_count || i >= max_shards || k > 1)
+            return 0;
+        return m_table->slots[i].reserved[k].load(std::memory_order_acquire);
+    }
+
     // This shard's own filter, one bit at a time.
     void channel_set(uint32_t bit)
     {

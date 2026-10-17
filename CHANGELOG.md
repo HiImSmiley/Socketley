@@ -44,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   read-only until `--replicate` is taken away. `socketley db-backup` and
   `db-restore` write and take back one file of every document;
   `--backup-dir`, `--backup-every` and `--backup-keep` schedule them.
+- **The `db` runtime on several cores.** `--shards N` serves a database from
+  N worker processes on its one port: shard 0 writes the one log and every
+  shard reads it from the same files as it reaches the disk, answering reads,
+  queries and streams itself and sending shard 0 the writes. A shard takes in
+  what shard 0 has made durable before it answers, so a read on any shard sees
+  every write answered before it began; transactions, unique indexes, streams,
+  replicas and backups hold as on one shard, and the number of shards changes
+  across a restart with the documents as they are. On four cores GET answers
+  2.5-3.5x and queries 2.3x what one shard does; writes, bound by one disk,
+  stay as many.
 - **An `idp` runtime: one sign-in, for applications, proxies, storages and
   the dashboard.** An OpenID Connect provider with its own accounts: each a
   fixed random id that every token names it by, and fields with no schema --

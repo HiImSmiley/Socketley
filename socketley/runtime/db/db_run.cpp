@@ -24,6 +24,7 @@
 #include "../../shared/logging.h"
 #include "../../shared/replaced_file.h"
 #include "../../shared/runtime_manager.h"
+#include "../../shared/shard_target.h"
 
 namespace socketley::db
 {
@@ -166,8 +167,18 @@ bool db_run::start(std::string& why)
         }
         m_schema_mtime = mtime_of(path);
     }
+    m_shards = std::max<uint32_t>(1, m_owner.get_shards());
+    m_shard = m_owner.get_shard_index();
+    m_reader = m_shards > 1 && m_shard > 0;
     m_store.set_cache_bytes(m_owner.get_cache_bytes());
-    if (!m_store.open(db_data_dir(m_owner.get_name()), s, why))
+    // A shard reading shard 0's log opens it once shard 0 has, and sends shard 0 everything until then.
+    if (m_reader)
+    {
+        // Kept by the store until it opens the log, so a schema read again meanwhile is the one it opens with.
+        if (!m_store.set_schema(s, why))
+            return false;
+    }
+    else if (!m_store.open(db_data_dir(m_owner.get_name()), s, why))
         return false;
     m_store.set_max_bytes(m_owner.get_max_bytes());
     m_durable = m_store.seq();
@@ -195,6 +206,9 @@ bool db_run::start(std::string& why)
     }
     int one = 1;
     ::setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    // Every shard binds the port, and the kernel spreads the connections over them.
+    if (m_shards > 1)
+        ::setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = m_owner.bind_in_addr();
@@ -217,7 +231,12 @@ bool db_run::start(std::string& why)
     arm_wake();
     if (!m_owner.get_backup_dir().empty())
         m_next_backup = now_sec() + m_owner.get_backup_every();
-    if (!m_owner.get_replicate().empty())
+    if (m_reader)
+        try_follow();
+    else
+        publish_log();
+    // Shard 0 alone follows the database it copies; the others read what it writes.
+    if (!m_owner.get_replicate().empty() && !m_reader)
     {
         m_replica_seq = m_store.seq();
         m_replica_state = "connecting";
@@ -238,6 +257,10 @@ void db_run::stop()
     if (m_stopped)
         return;
     m_stopped = true;
+    // Answers to what this shard took to another are not wanted once it stops.
+    if (auto* mgr = m_owner.get_runtime_manager())
+        mgr->requests().drop_origin(this);
+    m_crossed.clear();
     m_replica_stop = true;
     if (m_replica.joinable())
         m_replica.join();
@@ -285,6 +308,8 @@ void db_run::on_loop_turn()
         return;
     finish_turn();
     maybe_merge();
+    // A merge finished or a segment removed, said to the reading shards.
+    publish_log();
     // A listener whose accept the ring had no room for is asked again here, or it would be deaf for good.
     if (!m_accept_pending)
         arm_accept();
@@ -373,6 +398,8 @@ void db_run::synced(bool ok, uint64_t covered)
     }
     m_durable = std::max(m_durable, covered);
     m_replica_seq = m_durable;
+    // Said to the reading shards before anything resting on it is answered.
+    publish_log();
     std::vector<waiter> ready;
     std::vector<waiter> rest;
     for (auto& w : m_waiting)
@@ -657,7 +684,7 @@ void db_run::jobs_done()
 
 void db_run::maybe_merge()
 {
-    if (!m_jobs.empty())
+    if (!m_jobs.empty() || m_reader)
         return;
     if (auto job = m_store.plan_merge())
         start_job(std::move(job), 0);
@@ -665,7 +692,7 @@ void db_run::maybe_merge()
 
 void db_run::scheduled_backup()
 {
-    if (m_owner.get_backup_dir().empty() || now_sec() < m_next_backup)
+    if (m_reader || m_owner.get_backup_dir().empty() || now_sec() < m_next_backup)
         return;
     std::error_code ec;
     std::filesystem::create_directories(std::string(m_owner.get_backup_dir()), ec);
@@ -912,6 +939,14 @@ std::string db_run::stats() const
            "\nexpired:" + std::to_string(m_c.expired) + "\nfeeds:" + std::to_string(feeds) +
            "\nevents_sent:" + std::to_string(m_c.events) + "\nbackups:" + std::to_string(m_c.backups) +
            "\nbackup_failures:" + std::to_string(m_c.backup_failures) + "\nscript_calls:" + std::to_string(m_c.calls) +
+           (m_shards > 1 ? "\nshard:" + std::to_string(m_shard) + "/" + std::to_string(m_shards) +
+                               (m_reader ? std::string("\nrole:reader") + (m_ready ? "" : " (starting)") +
+                                               "\ncaught_up:" + std::to_string(m_c.caught_up) +
+                                               "\nreopened:" + std::to_string(m_c.reopened)
+                                         : std::string("\nrole:writer")) +
+                               "\nsent_to_writer:" + std::to_string(m_c.crossed) +
+                               "\ntaken_from_readers:" + std::to_string(m_c.crossings_served)
+                         : std::string()) +
            replica + (m_broken ? "\nbroken:the journal could not be synced; restart" : "") +
            (m_schema_error.empty() ? std::string() : "\nschema_error:" + m_schema_error) +
            (m_keys_error.empty() ? std::string() : "\nkeys_error:" + m_keys_error) + "\n";
@@ -1255,8 +1290,10 @@ void db_run::tick()
             idle.push_back(c);
     for (auto& c : idle)
         close_conn(c);
-    // A replica is told of the documents that go by the database it copies, which sends their deletions.
-    if (m_owner.get_replicate().empty() && !m_broken)
+    catch_up();
+    // A replica is told of the documents that go by the database it copies, which sends their deletions; a shard
+    // reading shard 0's log is told them by it.
+    if (m_owner.get_replicate().empty() && !m_broken && !m_reader)
     {
         std::vector<event> evs;
         if (const size_t n = m_store.expire(now, &evs))
@@ -1468,6 +1505,8 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
 {
     std::string ignored;
     reload_files(ignored);
+    // What shard 0 has made durable is taken in first, so this answer sees every write answered before it.
+    catch_up();
     const std::string allow = cors(rq);
     if (rq.method == "OPTIONS")
     {
@@ -1578,11 +1617,28 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
                     error_body("key_only", "every collection's changes are streamed to a key only"), allow);
             return;
         }
+        if (m_reader && !m_ready)
+        {
+            respond(c, 503, error_body("starting", "this shard is still reading the log; try again"), allow);
+            return;
+        }
         c->who = who;
         open_feed(c, rq, coll, !feed, path == "/_replicate");
         return;
     }
     answer a = execute(who, rq.method, path, rq.body, rq.if_match, rq.if_none_match);
+    if (a.forward)
+    {
+        // Answered when shard 0 has, and nothing behind it on this connection meanwhile.
+        c->waiting = true;
+        if (!cross(a.forward - 1, crossing{who, rq.method, path, rq.body, rq.if_match, rq.if_none_match},
+                   crossed{c, 0, rq.method == "HEAD", allow}))
+        {
+            c->waiting = false;
+            respond(c, 503, error_body("shard_unreachable", "shard 0, which writes, could not be asked"), allow);
+        }
+        return;
+    }
     if (rq.method == "HEAD")
         a.body.clear();
     if (a.needs <= m_durable)
@@ -1612,7 +1668,8 @@ db_run::answer db_run::spare_answer()
 }
 
 db_run::answer db_run::execute(const principal& who, std::string_view method, std::string_view path,
-                               std::string_view body, std::string_view if_match, std::string_view if_none_match)
+                               std::string_view body, std::string_view if_match, std::string_view if_none_match,
+                               bool sibling)
 {
     if (m_broken)
         return refused(503, "not_durable", "the journal could not be written to the disk; restart the database");
@@ -1621,6 +1678,13 @@ db_run::answer db_run::execute(const principal& who, std::string_view method, st
     if (!m_owner.get_replicate().empty() && !reading)
         return refused(403, "read_only", "this database is a copy of " + std::string(m_owner.get_replicate()) +
                                              "; write there");
+    // A shard reading shard 0's log sends it the writes, and every request until the log is open.
+    if (m_reader && !sibling && (!reading || !m_ready))
+    {
+        answer a;
+        a.forward = 1;
+        return a;
+    }
     const auto parse_body = [&](jvalue& out) {
         return json_reader(body).document(out);
     };
@@ -1854,6 +1918,181 @@ void db_run::call(uint64_t ticket, std::string_view json)
                     inm ? inm->s : std::string_view{});
     }
     std::string reply = "{\"status\":" + std::to_string(a.status) + ",\"body\":" + (a.body.empty() ? "null" : a.body) + "}";
+    if (a.needs > m_durable)
+        hold(waiter{a.needs, nullptr, std::move(reply), ticket, true});
+    else
+        mgr->requests().complete_deferred(ticket, request_status::ok, reply);
+}
+
+// ─── Shards ─────────────────────────────────────────────────────────────────
+
+uint64_t db_run::log_word(uint32_t k) const
+{
+    return m_owner.shard_stats_table().word_at(0, k);
+}
+
+void db_run::publish_log()
+{
+    if (m_shards <= 1 || m_reader)
+        return;
+    const uint64_t layout = m_store.layout() + 1;
+    if (m_durable == m_told_durable && layout == m_told_layout)
+        return;
+    m_told_durable = m_durable;
+    m_told_layout = layout;
+    m_owner.shard_stats_table().publish_words(m_durable, layout);
+    // A word to each reading shard, so its streams hear of the change without waiting for a read or a tick.
+    if (auto* mgr = m_owner.get_runtime_manager())
+        for (uint32_t j = 1; j < m_shards; ++j)
+            mgr->requests().post(this, 0, shard_target(m_owner.get_name(), j), nudge_marker,
+                                 request_class::background);
+}
+
+void db_run::try_follow()
+{
+    if (!m_reader || m_ready || m_stopped)
+        return;
+    // Shard 0 says its log is open by saying how often its segments changed, one at least.
+    const uint64_t layout = log_word(1);
+    if (!layout)
+        return;
+    std::string why;
+    const schema wanted = m_store.get_schema();
+    if (!m_store.follow_open(db_data_dir(m_owner.get_name()), wanted, log_word(0), why))
+    {
+        // Said once a reason, since it is tried again every second.
+        if (why != m_follow_error)
+            LOG_WARN(("db " + std::string(m_owner.get_name()) + " shard " + std::to_string(m_shard) +
+                      ": shard 0's log could not be read yet: " + why)
+                         .c_str());
+        m_follow_error = why;
+        return;
+    }
+    m_follow_error.clear();
+    m_ready = true;
+    m_seen_layout = layout;
+    m_durable = m_store.seq();
+    m_history.clear();
+    m_history_bytes = 0;
+    m_history_from = m_durable + 1;
+}
+
+void db_run::catch_up()
+{
+    if (!m_reader)
+        return;
+    if (!m_ready)
+    {
+        try_follow();
+        return;
+    }
+    const uint64_t layout = log_word(1);
+    const uint64_t durable = log_word(0);
+    if (layout == m_seen_layout && durable <= m_store.seq())
+        return;
+    std::vector<event> evs;
+    if (!m_store.follow(durable, &evs))
+    {
+        // The log no longer goes on from where this shard stood -- cleared, restored, merged past -- so it is read
+        // again whole, and its streams start over as a replica's do after a reset.
+        ++m_c.reopened;
+        m_ready = false;
+        std::vector<std::shared_ptr<conn>> streams = m_feeds;
+        for (auto& c : streams)
+            close_conn(c);
+        try_follow();
+        return;
+    }
+    if (layout != m_seen_layout)
+    {
+        m_store.follow_layout();
+        m_seen_layout = layout;
+    }
+    ++m_c.caught_up;
+    for (auto& e : evs)
+        m_unpublished.push_back(std::move(e));
+    m_durable = m_store.seq();
+    publish();
+}
+
+void db_run::nudged()
+{
+    catch_up();
+}
+
+bool db_run::cross(uint32_t shard, const crossing& what, crossed then)
+{
+    auto* mgr = m_owner.get_runtime_manager();
+    if (!mgr)
+        return false;
+    const uint64_t cookie = m_next_cookie++;
+    m_crossed.emplace(cookie, std::move(then));
+    if (!mgr->requests().post(this, cookie, shard_target(m_owner.get_name(), shard), encode_crossing(what)))
+    {
+        m_crossed.erase(cookie);
+        return false;
+    }
+    ++m_c.crossed;
+    return true;
+}
+
+void db_run::on_request_reply(uint64_t cookie, request_status st, std::string_view reply)
+{
+    // A nudge's answer, cookie 0, says nothing.
+    const auto it = m_crossed.find(cookie);
+    if (it == m_crossed.end())
+        return;
+    crossed then = std::move(it->second);
+    m_crossed.erase(it);
+    int status = 503;
+    uint64_t version = 0;
+    std::string_view body;
+    std::string refusal;
+    if (st != request_status::ok || !decode_crossing_reply(reply, status, version, body))
+    {
+        status = 503;
+        refusal = error_body("shard_unreachable", "shard 0, which writes, did not answer");
+        body = refusal;
+    }
+    deliver(then, status, body, version);
+}
+
+void db_run::deliver(const crossed& to, int status, std::string_view body, uint64_t version)
+{
+    if (to.ticket)
+    {
+        std::string out = "{\"status\":" + std::to_string(status) + ",\"body\":";
+        out += body.empty() ? std::string_view("null") : body;
+        out += '}';
+        if (auto* mgr = m_owner.get_runtime_manager())
+            mgr->requests().complete_deferred(to.ticket, request_status::ok, out);
+        return;
+    }
+    const std::shared_ptr<conn> c = to.c.lock();
+    if (!c || c->dead)
+        return;
+    // Shard 0 answered once the write was on its disk and had said so first, so a read behind it here sees it.
+    catch_up();
+    respond(c, status, to.head ? std::string_view{} : body, to.allow, version);
+    resume(c);
+}
+
+void db_run::cross_call(uint64_t ticket, std::string_view payload)
+{
+    auto* mgr = m_owner.get_runtime_manager();
+    if (!mgr)
+        return;
+    crossing what;
+    if (m_reader || !decode_crossing(payload, what))
+    {
+        mgr->requests().complete_deferred(
+            ticket, request_status::ok,
+            encode_crossing_reply(421, 0, error_body("misdirected", "a shard's write is shard 0's to take")));
+        return;
+    }
+    ++m_c.crossings_served;
+    const answer a = execute(what.who, what.method, what.path, what.body, what.if_match, what.if_none_match, true);
+    std::string reply = encode_crossing_reply(a.status, a.version, a.body);
     if (a.needs > m_durable)
         hold(waiter{a.needs, nullptr, std::move(reply), ticket, true});
     else

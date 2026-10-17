@@ -11819,9 +11819,24 @@ rather than one each and reads go on being answered meanwhile. A read behind a
 write on one connection is answered after it. A script of this daemon reaches
 the documents as
 .BR socketley.db .
-It serves plain HTTP behind the entrance;
-.B \-\-shards
-is refused, since the documents are one log in one process.
+It serves plain HTTP behind the entrance.
+.PP
+.B On several cores.
+With
+.BI "\-\-shards " N
+the database is served by
+.I N
+worker processes on its one port
+.RB ( SO_REUSEPORT ).
+Shard 0 writes the one log, as a database of one shard does, and every other
+shard reads it from the same files as shard 0 puts it on the disk: it answers
+reads, queries and streams itself and sends shard 0 the writes, which are
+answered once they are on its disk. A shard takes in what shard 0 has made
+durable before it answers, so a read on any shard sees every write answered
+before it began. Transactions, unique indexes, streams, replicas and backups
+hold as they do on one shard, and the number may change across a restart, the
+documents being one log whichever it is. Reads and queries are answered by every
+shard; writes, which wait for one disk, are as many as one shard takes.
 .PP
 .B Changes, as they happen.
 .BI GET " /c/" collection /_feed
@@ -11954,6 +11969,12 @@ How often, 1d unless given.
 .TP
 .BI "\-\-backup\-keep " n
 How many are kept, 7 unless given.
+.TP
+.BI "\-\-shards " N
+The worker processes the database is served by, 1 to 64: shard 0 writes and
+every one reads (see
+.B On several cores
+above). It changes with the runtime stopped.
 .PP
 In a script:
 .nf

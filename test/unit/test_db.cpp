@@ -15,8 +15,10 @@
 #include "runtime/db/db_doc.h"
 #include "runtime/db/db_docmap.h"
 #include "runtime/db/db_schema.h"
+#include "runtime/db/db_shard.h"
 #include "runtime/db/db_store.h"
 #include "shared/byte_codec.h"
+#include "shared/db_call.h"
 #include "shared/mutation_journal.h"
 
 using namespace socketley::db;
@@ -695,6 +697,122 @@ TEST_CASE("persistence: segments, and what a restart reads")
         CHECK_FALSE(st.open(t.path, schema{}, why));
         CHECK(why.find("not a segment") != std::string::npos);
     }
+}
+
+TEST_CASE("a write sent to shard 0 reads back as it was sent, and nothing else passes for one")
+{
+    const crossing c{principal{principal::user, "acct-7"}, "PATCH", "/c/chars/x", R"({"inc":{"n":1}})", "\"3\"", ""};
+    const std::string wire = encode_crossing(c);
+    crossing back;
+    REQUIRE(decode_crossing(wire, back));
+    CHECK(back.who.kind == principal::user);
+    CHECK(back.who.sub == "acct-7");
+    CHECK(back.method == "PATCH");
+    CHECK(back.path == "/c/chars/x");
+    CHECK(back.body == c.body);
+    CHECK(back.if_match == "\"3\"");
+    CHECK(back.if_none_match.empty());
+    CHECK_FALSE(decode_crossing(wire.substr(0, wire.size() - 1), back));
+    CHECK_FALSE(decode_crossing(wire + "x", back));
+    CHECK_FALSE(decode_crossing(std::string(socketley::db::call_marker) + "{}", back));
+    std::string forged = wire;
+    forged[cross_marker.size()] = 9;
+    CHECK_FALSE(decode_crossing(forged, back));
+
+    const std::string reply = encode_crossing_reply(201, 4, R"({"_id":"x"})");
+    int status = 0;
+    uint64_t version = 0;
+    std::string_view body;
+    REQUIRE(decode_crossing_reply(reply, status, version, body));
+    CHECK(status == 201);
+    CHECK(version == 4);
+    CHECK(body == R"({"_id":"x"})");
+    CHECK_FALSE(decode_crossing_reply(reply.substr(1), status, version, body));
+}
+
+TEST_CASE("a shard reading another's log sees what is on the disk, across rolls and merges, and nothing before")
+{
+    tmpdir t;
+    std::string why;
+    store w;
+    REQUIRE(w.open(t.path, make_schema("big private n\n"), why));
+    w.set_cache_bytes(256 << 10);
+    const std::string pad(4000, 'p');
+    std::map<std::string, std::string> want;
+    const auto write = [&](int i) {
+        const std::string id = "d" + std::to_string(i % 1000);
+        if (i % 97 == 0 && want.contains(id))
+        {
+            REQUIRE(del(w, key, "big", id.c_str()) == 0);
+            want.erase(id);
+            return;
+        }
+        REQUIRE(put(w, key, "big", id.c_str(), "{\"n\":" + std::to_string(i) + ",\"pad\":\"" + pad + "\"}") == 0);
+        want[id] = std::to_string(i);
+    };
+    for (int i = 0; i < 2000; ++i)
+        write(i);
+    REQUIRE(w.sync());
+
+    store r;
+    REQUIRE_MESSAGE(r.follow_open(t.path, make_schema("big private n\n"), w.seq(), why), why);
+    r.set_cache_bytes(256 << 10);
+    const auto same = [&] {
+        CHECK(r.documents() == want.size());
+        for (const auto& [id, n] : want)
+            REQUIRE_MESSAGE(get(r, key, "big", id.c_str()).find("\"n\":" + n + ",") != std::string::npos, id);
+        CHECK(ids_of(find(r, key, "big", R"({"where":{"n":{"gte":0}},"sort":"-n","limit":5})")) ==
+              ids_of(find(w, key, "big", R"({"where":{"n":{"gte":0}},"sort":"-n","limit":5})")));
+    };
+    same();
+    CHECK(put(r, key, "big", "x", "{}") == 503);
+
+    // Written and not yet on the disk: not read, though the bytes are in the file.
+    const uint64_t durable = w.seq();
+    REQUIRE(put(w, key, "big", "early", R"({"n":-1,"pad":"x"})") == 0);
+    REQUIRE(w.flush());
+    std::vector<event> evs;
+    REQUIRE(r.follow(durable, &evs));
+    CHECK(evs.empty());
+    CHECK(get(r, key, "big", "early") == "404");
+    want["early"] = "-1";
+    REQUIRE(w.sync());
+
+    // Past several rolls, every change read in order and told.
+    for (int i = 2000; i < 40000; ++i)
+    {
+        write(i);
+        if (i % 64 == 0)
+            REQUIRE(w.sync());
+    }
+    REQUIRE(w.sync());
+    CHECK(w.segments() > 2);
+    evs.clear();
+    REQUIRE(r.follow(w.seq(), &evs));
+    CHECK(evs.size() == 38001);
+    same();
+
+    // A merge moves the living documents and removes the old segments; the reader takes them where they went, and
+    // reads one it had not been told of yet from the descriptor it kept.
+    const uint64_t layout = w.layout();
+    auto job = w.plan_merge();
+    REQUIRE(job);
+    job->run();
+    REQUIRE_MESSAGE(job->ok, job->why);
+    w.finish(*job);
+    CHECK(w.layout() != layout);
+    same();
+    r.follow_layout();
+    same();
+    for (int i = 40000; i < 41000; ++i)
+        write(i);
+    REQUIRE(w.sync());
+    REQUIRE(r.follow(w.seq(), nullptr));
+    r.follow_layout();
+    same();
+
+    // A log that went back -- cleared, or another put in its place -- is no log this reading goes on with.
+    CHECK_FALSE(r.follow(1, nullptr));
 }
 
 TEST_CASE("segments: rolled, merged off the loop, and read back across a restart, with more than the cache holds")

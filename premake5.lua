@@ -2584,7 +2584,8 @@ project "test_db"
     links { "crypto", "dl" }
 
     files { "test/unit/test_db.cpp", "socketley/runtime/db/db_doc.cpp", "socketley/runtime/db/db_schema.cpp",
-            "socketley/runtime/db/db_store.cpp", "socketley/runtime/db/db_log.cpp", "socketley/shared/jws.cpp" }
+            "socketley/runtime/db/db_store.cpp", "socketley/runtime/db/db_log.cpp", "socketley/runtime/db/db_shard.cpp",
+            "socketley/shared/jws.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

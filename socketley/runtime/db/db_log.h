@@ -78,6 +78,22 @@ public:
     bool clear(std::string& why);
     const std::string& dir() const { return m_dir; }
 
+    // How many times the set of segments changed: one begun, adopted, removed, or all of them cleared.
+    uint64_t layout() const { return m_layout; }
+
+    // ── Reading another process's log ───────────────────────────────────────
+    // The segments under `dir` opened to read and kept open, so a document in one the writer removes is still read
+    // where it was found; nothing is ever written, cut or removed.
+    bool follow_open(const std::string& dir, std::string& why);
+    // The segment numbers in the directory now.
+    std::vector<uint32_t> listed() const;
+    // The whole records of `seg` from `off` on, each told to `each` until it says stop: the offset after the last one
+    // taken. A record cut short, a room of zeros or the end of the file ends the reading.
+    uint64_t read_records(uint32_t seg, uint64_t off,
+                          const std::function<bool(uint64_t payload_off, std::string_view payload)>& each);
+    // A segment let go, once no document lies in it and the writer removed it.
+    void forget(uint32_t seg);
+
     // Records into a new segment file at `path`, written beside it and renamed into place once on the disk: the
     // payload offsets of each are in `offs`. Run off the loop, by a merge or a backup.
     static bool write_file(const std::string& path, const std::vector<std::string>& payloads, std::vector<uint64_t>& offs,
@@ -93,6 +109,8 @@ private:
     void end_room();
 
     std::string m_dir;
+    uint64_t m_layout{0};
+    bool m_follow{false};
     // Every segment by number, with its size and a descriptor opened when first read.
     struct seg_info
     {

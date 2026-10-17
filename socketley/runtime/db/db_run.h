@@ -20,19 +20,21 @@
 #include <time.h>
 
 #include "db_schema.h"
+#include "db_shard.h"
 #include "db_store.h"
 #include "../idp/idp_session.h"
 #include "../../shared/db_call.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/event_loop_definitions.h"
 #include "../../shared/file_io.h"
+#include "../../shared/request_channel.h"
 
 class db_instance;
 
 namespace socketley::db
 {
 
-class db_run : public io_handler
+class db_run : public io_handler, public request_origin
 {
 public:
     db_run(db_instance& owner, event_loop& loop);
@@ -49,6 +51,11 @@ public:
     // A call through the request channel, `{"method":...}` from socketley.db or `{"backup":...}` from the daemon,
     // answered under `ticket` as {"status":..,"body":..}.
     void call(uint64_t ticket, std::string_view json);
+    // Another shard's write, taken by shard 0 and answered under `ticket` once it is on the disk.
+    void cross_call(uint64_t ticket, std::string_view payload);
+    // Shard 0's word that more of its log is on the disk, which a reading shard takes in.
+    void nudged();
+    void on_request_reply(uint64_t cookie, request_status st, std::string_view reply) override;
 
     // One request as the HTTP side and a script both put it: a method, a path below the database, and a body.
     struct answer
@@ -58,11 +65,14 @@ public:
         // An ETag for a document's version, and the change the answer may not be given before it is on the disk.
         uint64_t version{0};
         uint64_t needs{0};
+        // The shard, plus one, the request is taken to: shard 0 for a write sent to a shard that reads its log.
+        uint32_t forward{0};
     };
     // An answer whose body grows in the buffer the last one left, so a body is not built in a new one each time.
     answer spare_answer();
+    // `sibling` when another shard sent it, which is never sent on.
     answer execute(const principal& who, std::string_view method, std::string_view path, std::string_view body,
-                   std::string_view if_match, std::string_view if_none_match);
+                   std::string_view if_match, std::string_view if_none_match, bool sibling = false);
 
 private:
     struct conn
@@ -161,6 +171,23 @@ private:
     void scheduled_backup();
     void arm_wake();
 
+    // A request taken to shard 0: a connection waits for the answer as it waits for a sync, a call for its ticket.
+    struct crossed
+    {
+        std::weak_ptr<conn> c;
+        uint64_t ticket{0};
+        bool head{false};
+        std::string allow;
+    };
+    bool cross(uint32_t shard, const crossing& what, crossed then);
+    void deliver(const crossed& to, int status, std::string_view body, uint64_t version);
+    // Shard 0's log on the disk up to its latest change: said to the shards that read it, which take it in before
+    // they answer, so a read sees every write answered before it began.
+    void publish_log();
+    void catch_up();
+    void try_follow();
+    uint64_t log_word(uint32_t k) const;
+
     // A replica's thread, following the stream of the database it copies, and the changes it hands the loop.
     void replica_main();
     void take_replicated();
@@ -186,6 +213,16 @@ private:
     // The connections streaming changes, so a change is offered to them and not to every connection; one closed stays
     // until the walk after it, since close_conn() may run inside a walk.
     std::vector<std::shared_ptr<conn>> m_feeds;
+    // This shard's place among the runtime's: shard 0 writes, any other reads its log once it is open.
+    uint32_t m_shard{0};
+    uint32_t m_shards{1};
+    bool m_reader{false};
+    bool m_ready{false};
+    uint64_t m_seen_layout{0};
+    std::string m_follow_error;
+    uint64_t m_told_durable{0}, m_told_layout{0};
+    std::unordered_map<uint64_t, crossed> m_crossed;
+    uint64_t m_next_cookie{1};
     // The buffer the last answer's body was built in, kept for the next.
     std::string m_spare;
     std::vector<std::shared_ptr<conn>> m_closing;
@@ -246,7 +283,8 @@ private:
     struct counters
     {
         uint64_t reads{0}, writes{0}, queries{0}, syncs{0}, refused{0}, conflicts{0}, calls{0}, expired{0}, events{0},
-            feeds{0}, backups{0}, backup_failures{0}, replicated{0}, resets{0};
+            feeds{0}, backups{0}, backup_failures{0}, replicated{0}, resets{0}, crossed{0}, crossings_served{0},
+            caught_up{0}, reopened{0};
     } m_c;
 };
 
