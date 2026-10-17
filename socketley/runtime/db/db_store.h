@@ -8,8 +8,8 @@
 // write is one record carrying a sequence number; a write is made whole in memory or not at all, then recorded, and the
 // caller syncs before answering. Sealed segments whose documents have mostly moved on are merged off the loop.
 #include <cstdint>
-#include <list>
 #include <memory>
+#include <map>
 #include <set>
 #include <string>
 #include <string_view>
@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "db_doc.h"
+#include "db_docmap.h"
 #include "db_log.h"
 #include "db_schema.h"
 #include "../../shared/transparent_string.h"
@@ -34,6 +35,9 @@ struct principal
     std::string sub;
 };
 
+// A document's JSON held in memory, its bytes right after it, so a read reaches both in one place.
+struct cached_json;
+
 struct doc
 {
     std::string owner;
@@ -45,6 +49,9 @@ struct doc
     location at;
     // Its values for its collection's indexes, in the schema's order.
     std::vector<ikey> keys;
+    // Its JSON in the store's cache, set and cleared by the store alone and only on the document in its map; a copy's
+    // is never read.
+    mutable cached_json* cache{nullptr};
 };
 
 // One change of a write.
@@ -137,6 +144,7 @@ public:
     static constexpr size_t   max_collections = 1024;
 
     store() = default;
+    ~store();
     store(const store&) = delete;
     store& operator=(const store&) = delete;
 
@@ -157,13 +165,20 @@ public:
     // A document's place and figures, null when there is none, it went, or whoever asks may not see it.
     const doc* get(std::string_view coll, std::string_view id) const;
     // A document as JSON, with _id, _v and _owner; false with `err` when it is absent or not the principal's to read.
-    // `depends` is the sequence number the answer rests on, which the caller waits to be on the disk.
+    // `depends` is the sequence number the answer rests on, which the caller waits to be on the disk, and `version`
+    // the document's.
     bool read(const principal& who, std::string_view coll, std::string_view id, std::string& out, error& err,
-              uint64_t& depends);
+              uint64_t& depends, uint64_t* version = nullptr);
     // The changes made, each document as it now is written to `out` as a JSON array, recorded, and told to `events`;
     // none of them made when one cannot be.
+    // What a write's first change found and left: whether its document was there, and the version it made.
+    struct first_change
+    {
+        bool existed{false};
+        uint64_t version{0};
+    };
     bool write(const principal& who, std::vector<write_op>& ops, std::string& out, error& err,
-               std::vector<event>* events = nullptr);
+               std::vector<event>* events = nullptr, first_change* first = nullptr);
     // The documents of a collection a query picks, as {"docs":[...]} and "next" when there are more.
     bool find(const principal& who, std::string_view coll, const query& q, std::string& out, error& err,
               uint64_t& depends);
@@ -217,33 +232,30 @@ private:
     struct index_state
     {
         index_def def;
-        std::set<std::pair<ikey, std::string>> entries;
+        // Each document by its value and id, to its node in the collection, which keeps its place while it lives.
+        std::map<std::pair<ikey, std::string>, const doc*> entries;
     };
     struct coll_state
     {
-        std::unordered_map<std::string, doc, string_hash, string_equal> docs;
+        doc_map<doc> docs;
         std::vector<index_state> indexes;
         // Every document by its owner, so an account's own are found without a scan.
-        std::set<std::pair<std::string, std::string>> by_owner;
+        std::map<std::pair<std::string, std::string>, const doc*> by_owner;
         std::string ttl;
         // The last write that changed the collection, which a query's answer rests on.
         uint64_t last_seq{0};
     };
-    // A document read lately, by where it lies, so a change never answers an old copy.
-    struct cache_entry
-    {
-        uint32_t seg;
-        uint64_t off;
-        std::string json;
-    };
-
     coll_state* coll_of(std::string_view name);
     const coll_state* coll_of(std::string_view name) const;
     coll_state& make_coll(const std::string& name);
     access access_of(std::string_view coll) const;
     void index_doc(coll_state& c, const std::string& id, const doc& d, bool add);
+    // The index entries and the owner's of `id` moved from what `before` holds to what `after` does, either null, the
+    // entries made naming `node`.
+    void reindex(coll_state& c, const std::string& id, const doc* before, const doc* after, const doc* node);
     // The document `id` replaced by `d`, or removed when `d` is null, with its indexes, expiry, bytes and cache.
-    void set_doc(coll_state& c, const std::string& coll, const std::string& id, const doc* d);
+    // `id` made `*d`, which is moved from, or removed when `d` is null.
+    void set_doc(coll_state& c, const std::string& coll, const std::string& id, doc* d);
     // The keys and expiry a body gives a document of `c`.
     void derive(const coll_state& c, const jvalue& body, doc& d) const;
     bool rebuild(coll_state& c, const std::string& name, const collection_def* def, std::string& why);
@@ -255,8 +267,15 @@ private:
     // A document's JSON: a write's own, the cache's, or the disk's.
     bool json_of(const doc& d, std::string& out);
     bool body_of(const doc& d, jvalue& out);
-    void cache_put(const location& at, std::string json);
-    void cache_drop(const location& at);
+    // The cached JSON of `d`, marked used; valid until the cache next changes.
+    bool cached(const doc& d, std::string_view& out);
+    void cache_put(const doc& d, std::string_view json);
+    void cache_drop(const doc& d);
+    void free_block(cached_json* b);
+    // Blocks evicted until the cache holds `limit`: a hand clears the bit a read sets and takes the first block found
+    // clear, so a hit moves nothing.
+    void evict_to(uint64_t limit);
+    void clear_cache();
     void live_add(const doc& d, int64_t sign);
 
     seglog m_log;
@@ -275,8 +294,8 @@ private:
     // The deletions a start has read, so an older record read after one does not bring its document back.
     std::unordered_map<std::string, uint64_t> m_tombs;
 
-    std::list<cache_entry> m_lru;
-    std::unordered_map<uint64_t, std::list<cache_entry>::iterator> m_cache;
+    std::vector<cached_json*> m_blocks;
+    size_t m_hand{0};
     uint64_t m_cache_bytes{0};
     uint64_t m_cache_limit{64ull << 20};
     uint64_t m_hits{0}, m_misses{0};

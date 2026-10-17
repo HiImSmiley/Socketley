@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <map>
+#include <new>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -73,11 +75,6 @@ std::string staged_key(std::string_view coll, std::string_view id)
     return k;
 }
 
-uint64_t cache_key(const location& at)
-{
-    return (static_cast<uint64_t>(at.seg) << 40) | at.off;
-}
-
 int64_t now_sec()
 {
     return static_cast<int64_t>(::time(nullptr));
@@ -128,34 +125,52 @@ ikey after(ikey k)
     return k;
 }
 
-using index_entries = std::set<std::pair<ikey, std::string>>;
+using index_entries = std::map<std::pair<ikey, std::string>, const doc*>;
 
-// The entries an eq or a range on the index picks, which are one run of it, since it orders them by their values.
-std::pair<index_entries::const_iterator, index_entries::const_iterator> run_of(const index_entries& s,
-                                                                              const query::cond& c)
+// Whether an index's key is in the run an eq or a range picks, which is one run of the index, since it orders its
+// entries by their values.
+bool in_run(const query::cond& c, const ikey& k)
+{
+    return c.op == query::cond::eq ? k == c.key : key_meets(c, k);
+}
+
+// Where a walk of that run starts going up: at its first entry, or past it when the run is empty.
+index_entries::const_iterator run_start(const index_entries& s, const query::cond& c)
 {
     const auto at = [&](const ikey& k) { return s.lower_bound({k, std::string()}); };
     const ikey& k = c.key;
-    const ikey first{k.rank, -INFINITY, {}};
+    switch (c.op)
+    {
+        case query::cond::gt:     return at(after(k));
+        case query::cond::lt:
+        case query::cond::lte:    return at(ikey{k.rank, -INFINITY, {}});
+        case query::cond::prefix: return at(ikey{ikey::string, 0, c.value.s});
+        default:                  return at(k);
+    }
+}
+
+// Where a walk of that run starts going down: past its last entry.
+index_entries::const_iterator run_end(const index_entries& s, const query::cond& c)
+{
+    const auto at = [&](const ikey& k) { return s.lower_bound({k, std::string()}); };
+    const ikey& k = c.key;
     const ikey past{static_cast<uint8_t>(k.rank + 1), -INFINITY, {}};
     switch (c.op)
     {
-        case query::cond::gt:  return {at(after(k)), at(past)};
-        case query::cond::gte: return {at(k), at(past)};
-        case query::cond::lt:  return {at(first), at(k)};
-        case query::cond::lte: return {at(first), at(after(k))};
+        case query::cond::gt:
+        case query::cond::gte: return at(past);
+        case query::cond::lt:  return at(k);
         case query::cond::prefix:
         {
-            const ikey from{ikey::string, 0, c.value.s};
-            ikey to = from;
+            ikey to{ikey::string, 0, c.value.s};
             while (!to.str.empty() && static_cast<unsigned char>(to.str.back()) == 0xff)
                 to.str.pop_back();
             if (to.str.empty())
-                return {at(from), at(past)};
+                return at(past);
             to.str.back() = static_cast<char>(static_cast<unsigned char>(to.str.back()) + 1);
-            return {at(from), at(to)};
+            return at(to);
         }
-        default: return {at(k), at(after(k))};
+        default: return at(after(k));
     }
 }
 
@@ -243,6 +258,10 @@ bool add_numbers(const jvalue& a, const jvalue& b, jvalue& out)
 std::string encode_record(uint64_t seq, const std::vector<event>& evs, std::vector<uint64_t>* json_offs)
 {
     socketley::bytes::writer w;
+    size_t size = 1 + 8 + 4;
+    for (const auto& e : evs)
+        size += 1 + 4 + e.coll.size() + 4 + e.id.size() + (e.del ? 0 : 8 + 4 + e.owner.size() + 4 + e.json.size());
+    w.reserve(size);
     w.u8(rec_write);
     w.u64(seq);
     w.u32(static_cast<uint32_t>(evs.size()));
@@ -512,37 +531,100 @@ bool apply_patch(jvalue& body, const jvalue& changes, error& err)
 
 // ─── The cache of documents read ────────────────────────────────────────────
 
+struct cached_json
+{
+    const doc* d;
+    location at;
+    uint32_t len;
+    // Its place among the store's blocks, which the hand walks.
+    uint32_t index;
+    bool used;
+
+    char* bytes() { return reinterpret_cast<char*>(this + 1); }
+    std::string_view json() const { return {reinterpret_cast<const char*>(this + 1), len}; }
+};
+
+store::~store()
+{
+    clear_cache();
+}
+
 void store::set_cache_bytes(uint64_t b)
 {
     m_cache_limit = b;
-    while (m_cache_bytes > m_cache_limit && !m_lru.empty())
-    {
-        const auto& e = m_lru.back();
-        m_cache_bytes -= e.json.size();
-        m_cache.erase(cache_key(location{e.seg, e.off, 0}));
-        m_lru.pop_back();
-    }
+    evict_to(b);
 }
 
-void store::cache_put(const location& at, std::string json)
+bool store::cached(const doc& d, std::string_view& out)
+{
+    cached_json* b = d.cache;
+    if (!b || b->at.seg != d.at.seg || b->at.off != d.at.off)
+        return false;
+    b->used = true;
+    ++m_hits;
+    out = b->json();
+    return true;
+}
+
+void store::cache_put(const doc& d, std::string_view json)
 {
     if (json.size() > m_cache_limit / 4 || m_cache_limit == 0)
         return;
-    cache_drop(at);
+    cache_drop(d);
+    auto* b = new (::operator new(sizeof(cached_json) + json.size()))
+        cached_json{&d, d.at, static_cast<uint32_t>(json.size()), static_cast<uint32_t>(m_blocks.size()), true};
+    std::memcpy(b->bytes(), json.data(), json.size());
+    m_blocks.push_back(b);
     m_cache_bytes += json.size();
-    m_lru.push_front(cache_entry{at.seg, at.off, std::move(json)});
-    m_cache[cache_key(at)] = m_lru.begin();
-    set_cache_bytes(m_cache_limit);
+    d.cache = b;
+    evict_to(m_cache_limit);
 }
 
-void store::cache_drop(const location& at)
+void store::cache_drop(const doc& d)
 {
-    const auto it = m_cache.find(cache_key(at));
-    if (it == m_cache.end())
-        return;
-    m_cache_bytes -= it->second->json.size();
-    m_lru.erase(it->second);
-    m_cache.erase(it);
+    if (d.cache && d.cache->d == &d)
+        free_block(d.cache);
+    d.cache = nullptr;
+}
+
+void store::free_block(cached_json* b)
+{
+    if (b->d->cache == b)
+        b->d->cache = nullptr;
+    m_cache_bytes -= b->len;
+    cached_json* last = m_blocks.back();
+    m_blocks[b->index] = last;
+    last->index = b->index;
+    m_blocks.pop_back();
+    ::operator delete(b);
+}
+
+void store::evict_to(uint64_t limit)
+{
+    while (m_cache_bytes > limit && !m_blocks.empty())
+    {
+        if (m_hand >= m_blocks.size())
+            m_hand = 0;
+        cached_json* b = m_blocks[m_hand];
+        if (b->used)
+        {
+            b->used = false;
+            ++m_hand;
+        }
+        else
+            // The last block takes its place, and is looked at next.
+            free_block(b);
+    }
+}
+
+void store::clear_cache()
+{
+    // The documents may be gone already: a block is let go without being looked through.
+    for (cached_json* b : m_blocks)
+        ::operator delete(b);
+    m_blocks.clear();
+    m_hand = 0;
+    m_cache_bytes = 0;
 }
 
 bool store::json_of(const doc& d, std::string& out)
@@ -552,17 +634,15 @@ bool store::json_of(const doc& d, std::string& out)
         out.clear();
         return false;
     }
-    if (const auto it = m_cache.find(cache_key(d.at)); it != m_cache.end())
+    if (std::string_view j; cached(d, j))
     {
-        ++m_hits;
-        m_lru.splice(m_lru.begin(), m_lru, it->second);
-        out = it->second->json;
+        out.assign(j);
         return true;
     }
     ++m_misses;
     if (!m_log.read(d.at, out))
         return false;
-    cache_put(d.at, out);
+    cache_put(d, out);
     return true;
 }
 
@@ -621,17 +701,41 @@ void store::index_doc(coll_state& c, const std::string& id, const doc& d, bool a
     {
         std::pair<ikey, std::string> e{d.keys[i], id};
         if (add)
-            c.indexes[i].entries.insert(std::move(e));
+            c.indexes[i].entries.emplace(std::move(e), &d);
         else
             c.indexes[i].entries.erase(e);
     }
     if (!d.owner.empty())
     {
         if (add)
-            c.by_owner.emplace(d.owner, id);
+            c.by_owner.emplace(std::pair{d.owner, id}, &d);
         else
             c.by_owner.erase({d.owner, id});
     }
+}
+
+void store::reindex(coll_state& c, const std::string& id, const doc* before, const doc* after, const doc* node)
+{
+    for (size_t i = 0; i < c.indexes.size(); ++i)
+    {
+        const ikey* was = before && i < before->keys.size() ? &before->keys[i] : nullptr;
+        const ikey* is = after && i < after->keys.size() ? &after->keys[i] : nullptr;
+        if (was && is && *was == *is)
+            continue;
+        if (was)
+            c.indexes[i].entries.erase({*was, id});
+        if (is)
+            c.indexes[i].entries.emplace(std::pair{*is, id}, node);
+    }
+    const std::string none;
+    const std::string& was = before ? before->owner : none;
+    const std::string& is = after ? after->owner : none;
+    if (was == is)
+        return;
+    if (!was.empty())
+        c.by_owner.erase({was, id});
+    if (!is.empty())
+        c.by_owner.emplace(std::pair{is, id}, node);
 }
 
 void store::live_add(const doc& d, int64_t sign)
@@ -643,22 +747,30 @@ void store::live_add(const doc& d, int64_t sign)
     l = sign > 0 ? l + n : (l > n ? l - n : 0);
 }
 
-void store::set_doc(coll_state& c, const std::string& coll, const std::string& id, const doc* d)
+void store::set_doc(coll_state& c, const std::string& coll, const std::string& id, doc* d)
 {
     const auto it = c.docs.find(id);
+    doc* now = nullptr;
+    int64_t expired_before = 0;
     if (it != c.docs.end())
     {
         doc& old = it->second;
-        index_doc(c, id, old, false);
-        if (old.expires)
+        // Only the index entries, the owner's and the expiry that change are touched.
+        reindex(c, id, &old, d, &old);
+        expired_before = old.expires;
+        if (old.expires && (!d || d->expires != old.expires))
             m_expiry.erase({old.expires, coll, id});
         m_bytes -= std::min<uint64_t>(m_bytes, old.at.len + id.size() + old.owner.size() + doc_overhead);
         live_add(old, -1);
-        if (!d || old.at.seg != d->at.seg || old.at.off != d->at.off)
-            cache_drop(old.at);
+        const bool moved = !d || old.at.seg != d->at.seg || old.at.off != d->at.off;
+        if (moved)
+            cache_drop(old);
         if (d)
         {
-            old = *d;
+            cached_json* const kept = old.cache;
+            old = std::move(*d);
+            old.cache = moved ? nullptr : kept;
+            now = &old;
         }
         else
         {
@@ -668,17 +780,17 @@ void store::set_doc(coll_state& c, const std::string& coll, const std::string& i
     }
     else if (d)
     {
-        c.docs.emplace(id, *d);
+        now = &c.docs.emplace(id, std::move(*d)).first->second;
+        now->cache = nullptr;
         ++m_docs;
+        reindex(c, id, nullptr, now, now);
     }
-    if (!d)
+    if (!now)
         return;
-    const doc& now = c.docs.find(id)->second;
-    index_doc(c, id, now, true);
-    if (now.expires)
-        m_expiry.emplace(now.expires, coll, id);
-    m_bytes += now.at.len + id.size() + now.owner.size() + doc_overhead;
-    live_add(now, +1);
+    if (now->expires && now->expires != expired_before)
+        m_expiry.emplace(now->expires, coll, id);
+    m_bytes += now->at.len + id.size() + now->owner.size() + doc_overhead;
+    live_add(*now, +1);
 }
 
 bool store::rebuild(coll_state& c, const std::string& name, const collection_def* def, std::string& why)
@@ -980,9 +1092,7 @@ void store::close()
     m_expiry.clear();
     m_live.clear();
     m_staged.clear();
-    m_lru.clear();
-    m_cache.clear();
-    m_cache_bytes = 0;
+    clear_cache();
     m_docs = 0;
     m_bytes = 0;
     m_seq = 0;
@@ -1059,7 +1169,7 @@ const doc* store::get(std::string_view coll, std::string_view id) const
 }
 
 bool store::read(const principal& who, std::string_view coll, std::string_view id, std::string& out, error& err,
-                 uint64_t& depends)
+                 uint64_t& depends, uint64_t* version)
 {
     depends = 0;
     const access a = access_of(coll);
@@ -1077,6 +1187,13 @@ bool store::read(const principal& who, std::string_view coll, std::string_view i
         return false;
     }
     depends = it->second.seq;
+    if (version)
+        *version = it->second.v;
+    if (std::string_view j; cached(it->second, j))
+    {
+        write_doc(it->first, it->second, j, out);
+        return true;
+    }
     std::string json;
     if (!json_of(it->second, json))
     {
@@ -1255,14 +1372,19 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
     bool in_order = false;
     bool unreadable = false;
     // A candidate judged; false once the answer has what it needs.
-    const auto consider = [&](const std::string* id) {
-        const doc& d = c->docs.find(*id)->second;
+    const auto consider = [&](const std::string* id, const doc* node) {
+        const doc& d = *node;
         if (!may_read(who, a, d))
             return true;
         bool have_body = false;
         if (needs_body)
         {
-            if (!json_of(d, json) || !json_reader(json).document(body))
+            // Read in the cache where it lies, so only a document read from the disk is copied for its hit.
+            std::string_view in;
+            json.clear();
+            if (!cached(d, in) && json_of(d, json))
+                in = json;
+            if (in.empty() || !json_reader(in).document(body))
             {
                 unreadable = true;
                 return false;
@@ -1292,24 +1414,55 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
     const auto walk_run = [&](auto lo, auto hi) {
         in_order = true;
         if (q.desc)
-            while (hi != lo && consider(&(--hi)->second)) {}
+        {
+            while (hi != lo)
+            {
+                --hi;
+                if (!consider(&hi->first.second, hi->second))
+                    break;
+            }
+        }
         else
-            for (; lo != hi && consider(&lo->second); ++lo) {}
+            for (; lo != hi && consider(&lo->first.second, lo->second); ++lo) {}
+    };
+    // One index's run of a condition, found with one descent: up from its start, or down from its end.
+    const auto walk_cond = [&](const index_entries& s, const query::cond& cond) {
+        in_order = true;
+        if (q.desc)
+        {
+            for (auto it = run_end(s, cond); it != s.begin();)
+            {
+                --it;
+                if (!in_run(cond, it->first.first) || !consider(&it->first.second, it->second))
+                    break;
+            }
+        }
+        else
+            for (auto it = run_start(s, cond); it != s.end() && in_run(cond, it->first.first); ++it)
+                if (!consider(&it->first.second, it->second))
+                    break;
     };
 
     // Where the documents come from: the account's own or one index's run of values, read in place when their entries
     // are already in the answer's order, the sort's index, or every document.
-    std::vector<const std::string*> ids;
+    std::vector<std::pair<const std::string*, const doc*>> ids;
+    const auto take_run = [&](const index_entries& s, const query::cond& cond) {
+        for (auto it = run_start(s, cond); it != s.end() && in_run(cond, it->first.first); ++it)
+            ids.emplace_back(&it->first.second, it->second);
+    };
     bool planned = false;
     if (own_only)
     {
-        const auto lo = c->by_owner.lower_bound({who.sub, std::string()});
-        const auto hi = c->by_owner.lower_bound({who.sub + '\0', std::string()});
-        if (q.sort.empty())
-            walk_run(lo, hi);
-        else
-            for (auto it = lo; it != hi; ++it)
-                ids.push_back(&it->second);
+        // An account's own are in the order of their ids, which is an answer's when it names no sort.
+        in_order = q.sort.empty();
+        for (auto it = c->by_owner.lower_bound({who.sub, std::string()});
+             it != c->by_owner.end() && it->first.first == who.sub; ++it)
+        {
+            if (!in_order)
+                ids.emplace_back(&it->first.second, it->second);
+            else if (!consider(&it->first.second, it->second))
+                break;
+        }
         planned = true;
     }
     for (const auto& cond : q.where)
@@ -1327,18 +1480,14 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
             {
                 query::cond one;
                 one.key = key_of(&v);
-                const auto [lo, hi] = run_of(ix.entries, one);
-                for (auto it = lo; it != hi; ++it)
-                    ids.push_back(&it->second);
+                take_run(ix.entries, one);
             }
             continue;
         }
-        const auto [lo, hi] = run_of(ix.entries, cond);
         if (sort_ix == pos || (q.sort.empty() && cond.op == query::cond::eq))
-            walk_run(lo, hi);
+            walk_cond(ix.entries, cond);
         else
-            for (auto it = lo; it != hi; ++it)
-                ids.push_back(&it->second);
+            take_run(ix.entries, cond);
     }
     if (!planned && walk)
         walk_run(walk->entries.begin(), walk->entries.end());
@@ -1346,15 +1495,15 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
     {
         ids.reserve(c->docs.size());
         for (const auto& [id, d] : c->docs)
-            ids.push_back(&id);
+            ids.emplace_back(&id, &d);
     }
     if (!in_order)
     {
-        std::sort(ids.begin(), ids.end(), [](const std::string* x, const std::string* y) { return *x < *y; });
-        ids.erase(std::unique(ids.begin(), ids.end(), [](const std::string* x, const std::string* y) { return *x == *y; }),
+        std::sort(ids.begin(), ids.end(), [](const auto& x, const auto& y) { return *x.first < *y.first; });
+        ids.erase(std::unique(ids.begin(), ids.end(), [](const auto& x, const auto& y) { return *x.first == *y.first; }),
                   ids.end());
-        for (const std::string* id : ids)
-            if (!consider(id))
+        for (const auto& [id, node] : ids)
+            if (!consider(id, node))
                 break;
     }
     if (unreadable)
@@ -1381,12 +1530,14 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
     {
         if (i > q.skip)
             out += ',';
-        if (hits[i].json.empty() && !json_of(*hits[i].d, hits[i].json))
+        std::string_view j;
+        const bool hit = hits[i].json.empty() && cached(*hits[i].d, j);
+        if (!hit && hits[i].json.empty() && !json_of(*hits[i].d, hits[i].json))
         {
             err = fail(503, "unreadable", "a document could not be read from the disk");
             return false;
         }
-        write_doc(*hits[i].id, *hits[i].d, hits[i].json, out);
+        write_doc(*hits[i].id, *hits[i].d, hit ? j : std::string_view(hits[i].json), out);
     }
     out += ']';
     if (hits.size() > q.skip + q.limit)
@@ -1407,12 +1558,11 @@ bool store::unique_ok(const coll_state& c, const std::string& id, const doc& d, 
         const ikey& k = d.keys[i];
         if (k.rank == ikey::null)
             continue;
-        for (auto it = ix.entries.lower_bound({k, std::string()}); it != ix.entries.end() && it->first == k; ++it)
-            if (it->second != id)
+        for (auto it = ix.entries.lower_bound({k, std::string()}); it != ix.entries.end() && it->first.first == k; ++it)
+            if (it->first.second != id)
             {
-                const auto other = c.docs.find(it->second);
                 // A document whose time came holds its value no longer.
-                if (other != c.docs.end() && expired(other->second))
+                if (expired(*it->second))
                     continue;
                 err = fail(409, "taken", ix.def.field + " holds a value another document has: it is unique");
                 return false;
@@ -1422,7 +1572,7 @@ bool store::unique_ok(const coll_state& c, const std::string& id, const doc& d, 
 }
 
 bool store::write(const principal& who, std::vector<write_op>& ops, std::string& out, error& err,
-                  std::vector<event>* events)
+                  std::vector<event>* events, first_change* first)
 {
     if (ops.empty() || ops.size() > max_ops)
     {
@@ -1501,6 +1651,8 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
                                                    : "no such document"));
         if ((op.kind == write_op::patch || op.kind == write_op::del) && !old)
             return refuse(fail(404, "not_found", "no such document"));
+        if (first && &op == &ops.front())
+            *first = first_change{old != nullptr, old ? old->v + 1 : 1};
         if (who.kind == principal::user && old && old->owner != who.sub)
             return refuse(a == access::owner ? fail(404, "not_found", "no such document")
                                              : fail(403, "not_yours", "the document is another account's"));
@@ -1585,9 +1737,9 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
             error e = std::move(err);
             return refuse(std::move(e));
         }
-        set_doc(*c, op.coll, op.id, &nd);
         results += results.size() > 1 ? "," : "";
         write_doc(op.id, nd, json, results);
+        set_doc(*c, op.coll, op.id, &nd);
         m_staged[key] = std::move(json);
     }
     if (m_max_bytes && m_bytes > m_max_bytes && m_bytes > bytes_before)
@@ -1612,7 +1764,8 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
         {
             e.owner = it->second.owner;
             e.v = it->second.v;
-            e.json = m_staged[staged_key(u.coll, u.id)];
+            // Taken rather than copied: the staging is cleared once the record is made.
+            e.json = std::move(m_staged[staged_key(u.coll, u.id)]);
         }
         evs.push_back(std::move(e));
     }
@@ -1629,7 +1782,7 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
         live_add(d, -1);
         d.at = location{at.seg, at.off + offs[i], static_cast<uint32_t>(evs[i].json.size())};
         live_add(d, +1);
-        cache_put(d.at, evs[i].json);
+        cache_put(d, evs[i].json);
     }
     m_staged.clear();
     if (events)
@@ -1741,7 +1894,7 @@ bool store::apply(const std::vector<event>& evs, std::string& why)
             }
             derive(*c, body, d);
             set_doc(*c, e.coll, e.id, &d);
-            cache_put(d.at, e.json);
+            cache_put(c->docs.find(e.id)->second, e.json);
         }
         m_seq = seq;
         std::string ignored;
@@ -1766,9 +1919,7 @@ bool store::reset(std::string& why)
     m_colls.clear();
     m_expiry.clear();
     m_live.clear();
-    m_lru.clear();
-    m_cache.clear();
-    m_cache_bytes = 0;
+    clear_cache();
     m_docs = 0;
     m_bytes = 0;
     m_seq = 0;
@@ -1852,7 +2003,7 @@ void store::finish(copy_job& job)
         if (d == c->docs.end() || d->second.seq != it.seq || d->second.at.seg != it.from.seg ||
             d->second.at.off != it.from.off)
             continue;
-        cache_drop(d->second.at);
+        cache_drop(d->second);
         live_add(d->second, -1);
         d->second.at = it.to;
         live_add(d->second, +1);

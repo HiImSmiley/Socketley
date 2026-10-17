@@ -9,10 +9,18 @@ namespace socketley::db
 void write_string(std::string_view s, std::string& out)
 {
     static constexpr char hex[] = "0123456789abcdef";
+    out.reserve(out.size() + s.size() + 2);
     out += '"';
-    for (const char c : s)
+    size_t from = 0;
+    for (size_t i = 0; i < s.size(); ++i)
     {
+        const char c = s[i];
         const auto u = static_cast<unsigned char>(c);
+        if (u >= 0x20 && c != '"' && c != '\\')
+            continue;
+        // The run before it as it is, then the character escaped.
+        out.append(s.data() + from, i - from);
+        from = i + 1;
         if (c == '"' || c == '\\')
         {
             out += '\\';
@@ -24,15 +32,14 @@ void write_string(std::string_view s, std::string& out)
             out += "\\t";
         else if (c == '\r')
             out += "\\r";
-        else if (u < 0x20)
+        else
         {
             out += "\\u00";
             out += hex[u >> 4];
             out += hex[u & 15];
         }
-        else
-            out += c;
     }
+    out.append(s.data() + from, s.size() - from);
     out += '"';
 }
 

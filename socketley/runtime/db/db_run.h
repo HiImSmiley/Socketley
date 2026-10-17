@@ -59,6 +59,8 @@ public:
         uint64_t version{0};
         uint64_t needs{0};
     };
+    // An answer whose body grows in the buffer the last one left, so a body is not built in a new one each time.
+    answer spare_answer();
     answer execute(const principal& who, std::string_view method, std::string_view path, std::string_view body,
                    std::string_view if_match, std::string_view if_none_match);
 
@@ -130,8 +132,12 @@ private:
 
     int take_request(conn& c, request& rq, int& refusal);
     void handle(const std::shared_ptr<conn>& c, request& rq);
+    // A response's head appended to `o`, with an ETag for `version` when it is one.
+    void put_head(std::string& o, const conn& c, int status, std::string_view type, size_t length,
+                  std::string_view extra, uint64_t version = 0) const;
     std::string head(const conn& c, int status, std::string_view type, size_t length, std::string_view extra) const;
-    void respond(const std::shared_ptr<conn>& c, int status, std::string_view body, std::string_view extra = {});
+    void respond(const std::shared_ptr<conn>& c, int status, std::string_view body, std::string_view extra = {},
+                 uint64_t version = 0);
     std::string cors(const request& rq) const;
     bool who_of(const request& rq, principal& who, bool& by_cookie, std::string& refusal);
     void reload_files(std::string& why);
@@ -180,6 +186,8 @@ private:
     // The connections streaming changes, so a change is offered to them and not to every connection; one closed stays
     // until the walk after it, since close_conn() may run inside a walk.
     std::vector<std::shared_ptr<conn>> m_feeds;
+    // The buffer the last answer's body was built in, kept for the next.
+    std::string m_spare;
     std::vector<std::shared_ptr<conn>> m_closing;
     uint64_t m_next_id{1};
 

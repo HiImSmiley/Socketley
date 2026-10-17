@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <ctime>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -35,9 +36,12 @@ constexpr size_t  max_head  = 16 * 1024;
 constexpr size_t  max_body  = 4u << 20;
 constexpr size_t  max_conns = 4096;
 
+// The coarse clock, a read of what the kernel last ticked: every use counts whole seconds, three times a request.
 int64_t now_sec()
 {
-    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    timespec ts{};
+    ::clock_gettime(CLOCK_REALTIME_COARSE, &ts);
+    return static_cast<int64_t>(ts.tv_sec);
 }
 
 const char* reason(int status)
@@ -1362,25 +1366,47 @@ int db_run::take_request(conn& c, request& rq, int& refusal)
     return 1;
 }
 
-std::string db_run::head(const conn& c, int status, std::string_view type, size_t length, std::string_view extra) const
+void db_run::put_head(std::string& o, const conn& c, int status, std::string_view type, size_t length,
+                      std::string_view extra, uint64_t version) const
 {
-    std::string o = "HTTP/1.1 " + std::to_string(status) + " " + reason(status) + "\r\nContent-Type: ";
+    char num[24];
+    const auto number = [&](uint64_t v) {
+        o.append(num, static_cast<size_t>(std::to_chars(num, num + sizeof num, v).ptr - num));
+    };
+    o += "HTTP/1.1 ";
+    number(static_cast<uint64_t>(status));
+    o += ' ';
+    o += reason(status);
+    o += "\r\nContent-Type: ";
     o += type;
     o += "\r\nContent-Length: ";
-    o += std::to_string(length);
+    number(length);
     o += "\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n";
     o += extra;
+    if (version)
+    {
+        o += "ETag: \"";
+        number(version);
+        o += "\"\r\n";
+    }
     if (!c.keep_alive)
         o += "Connection: close\r\n";
     o += "\r\n";
+}
+
+std::string db_run::head(const conn& c, int status, std::string_view type, size_t length, std::string_view extra) const
+{
+    std::string o;
+    put_head(o, c, status, type, length, extra);
     return o;
 }
 
-void db_run::respond(const std::shared_ptr<conn>& c, int status, std::string_view body, std::string_view extra)
+void db_run::respond(const std::shared_ptr<conn>& c, int status, std::string_view body, std::string_view extra,
+                     uint64_t version)
 {
     if (status >= 400)
         ++m_c.refused;
-    c->out += head(*c, status, "application/json", body.size(), extra);
+    put_head(c->out, *c, status, "application/json", body.size(), extra, version);
     c->out += body;
 }
 
@@ -1512,12 +1538,14 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
         respond(c, 200, body, allow);
         return;
     }
-    std::string path;
-    if (!unescape(rq.path, path))
+    // A path with no % is its own spelling, read where it lies.
+    std::string unescaped;
+    if (rq.path.find('%') != std::string::npos && !unescape(rq.path, unescaped))
     {
         respond(c, 400, error_body("bad_path", "the path holds a % that spells no byte"), allow);
         return;
     }
+    const std::string_view path = unescaped.empty() ? std::string_view(rq.path) : std::string_view(unescaped);
     // Streams of changes: a collection's as its reader may see them, every one's for a key, and a replica's.
     const bool feed = path.ends_with("/_feed") && path.starts_with("/c/");
     if ((path == "/_feed" || path == "/_replicate" || feed) && reads)
@@ -1555,20 +1583,32 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
         return;
     }
     answer a = execute(who, rq.method, path, rq.body, rq.if_match, rq.if_none_match);
-    std::string extra = allow;
-    if (a.version)
-        extra += "ETag: \"" + std::to_string(a.version) + "\"\r\n";
     if (rq.method == "HEAD")
         a.body.clear();
     if (a.needs <= m_durable)
+        respond(c, a.status, a.body, allow, a.version);
+    else
     {
-        respond(c, a.status, a.body, extra);
-        return;
+        // Rests on a change not yet on the disk: answered once it is, and nothing behind it read meanwhile.
+        if (a.status >= 400)
+            ++m_c.refused;
+        std::string reply;
+        put_head(reply, *c, a.status, "application/json", a.body.size(), allow, a.version);
+        reply += a.body;
+        hold(waiter{a.needs, c, std::move(reply), 0, false});
     }
-    // Rests on a change not yet on the disk: answered once it is, and nothing behind it read meanwhile.
-    if (a.status >= 400)
-        ++m_c.refused;
-    hold(waiter{a.needs, c, head(*c, a.status, "application/json", a.body.size(), extra) + a.body, 0, false});
+    m_spare.swap(a.body);
+    // A buffer one large answer grew is not held for the small ones after it.
+    if (m_spare.capacity() > (1u << 20))
+        std::string().swap(m_spare);
+}
+
+db_run::answer db_run::spare_answer()
+{
+    answer a;
+    a.body.swap(m_spare);
+    a.body.clear();
+    return a;
 }
 
 db_run::answer db_run::execute(const principal& who, std::string_view method, std::string_view path,
@@ -1654,7 +1694,7 @@ db_run::answer db_run::execute(const principal& who, std::string_view method, st
                 return refused(400, "bad_query", "a query is a JSON object");
             if (!body.empty() && !store::parse_query(q, parsed, err))
                 return refused(err);
-            answer a;
+            answer a = spare_answer();
             if (!m_store.find(who, coll, parsed, a.body, err, a.needs))
                 return refused(err);
             ++m_c.queries;
@@ -1673,16 +1713,14 @@ db_run::answer db_run::execute(const principal& who, std::string_view method, st
         }
         else if (method == "GET" || method == "HEAD")
         {
-            answer a;
-            if (!m_store.read(who, coll, id, a.body, err, a.needs))
+            answer a = spare_answer();
+            if (!m_store.read(who, coll, id, a.body, err, a.needs, &a.version))
             {
                 // An absence rests on the last change too: one not yet on the disk may be its deletion.
                 answer r = refused(err);
                 r.needs = a.needs;
                 return r;
             }
-            if (const doc* d = m_store.get(coll, id))
-                a.version = d->v;
             ++m_c.reads;
             return a;
         }
@@ -1715,11 +1753,11 @@ db_run::answer db_run::execute(const principal& who, std::string_view method, st
         }
     }
 
-    const bool existed = !is_tx && ops[0].kind == write_op::put && m_store.get(coll, ops[0].id);
     answer a;
     std::string out;
     std::vector<event> evs;
-    if (!m_store.write(who, ops, out, err, &evs))
+    store::first_change first;
+    if (!m_store.write(who, ops, out, err, &evs, &first))
     {
         if (err.status == 409 || err.status == 412)
             ++m_c.conflicts;
@@ -1735,12 +1773,12 @@ db_run::answer db_run::execute(const principal& who, std::string_view method, st
         return a;
     }
     // One change: its document, or its deletion, not the list a transaction answers.
-    a.body = out.substr(1, out.size() - 2);
+    a.body.swap(m_spare);
+    a.body.assign(out, 1, out.size() - 2);
     if (ops[0].kind != write_op::del)
     {
-        if (const doc* d = m_store.get(coll, ops[0].id))
-            a.version = d->v;
-        if (ops[0].kind == write_op::insert || (ops[0].kind == write_op::put && !existed))
+        a.version = first.version;
+        if (ops[0].kind == write_op::insert || (ops[0].kind == write_op::put && !first.existed))
             a.status = 201;
     }
     return a;

@@ -38,6 +38,8 @@ public:
             u64(id);
     }
 
+    void reserve(size_t n) { m_out.reserve(n); }
+
     std::string take() { return std::move(m_out); }
 
 private:

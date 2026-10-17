@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "runtime/db/db_doc.h"
+#include "runtime/db/db_docmap.h"
 #include "runtime/db/db_schema.h"
 #include "runtime/db/db_store.h"
 #include "shared/byte_codec.h"
@@ -133,6 +134,65 @@ std::string ids_of(const std::string& found)
 }
 
 }   // namespace
+
+TEST_CASE("a collection's map finds, keeps and lets go of what a map would, and a node keeps its place")
+{
+    struct val
+    {
+        int n{0};
+    };
+    socketley::db::doc_map<val> m;
+    std::map<std::string, int> want;
+    std::map<std::string, const void*> place;
+    std::mt19937 rng(11);
+    for (int i = 0; i < 200000; ++i)
+    {
+        const std::string id = "k" + std::to_string(rng() % 3000);
+        switch (rng() % 3)
+        {
+            case 0:
+            {
+                const auto [it, made] = m.emplace(id, val{i});
+                REQUIRE(made == !want.contains(id));
+                if (made)
+                {
+                    want[id] = i;
+                    place[id] = &it->second;
+                }
+                break;
+            }
+            case 1:
+                if (auto it = m.find(id); it != m.end())
+                {
+                    REQUIRE(want.contains(id));
+                    m.erase(it);
+                    want.erase(id);
+                    place.erase(id);
+                }
+                else
+                    REQUIRE(!want.contains(id));
+                break;
+            default:
+            {
+                const auto it = m.find(id);
+                REQUIRE((it != m.end()) == want.contains(id));
+                if (it != m.end())
+                {
+                    REQUIRE(it->second.n == want[id]);
+                    REQUIRE(&it->second == place[id]);
+                }
+            }
+        }
+        REQUIRE(m.size() == want.size());
+    }
+    std::map<std::string, int> seen;
+    for (const auto& [id, v] : m)
+        REQUIRE(seen.emplace(id, v.n).second);
+    CHECK(seen == want);
+    m.clear();
+    CHECK(m.empty());
+    CHECK(m.begin() == m.end());
+}
 
 TEST_CASE("documents: written as read, paths, and the order an index keeps")
 {
