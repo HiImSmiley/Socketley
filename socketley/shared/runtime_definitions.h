@@ -76,11 +76,6 @@ inline std::string shards_config_refusal(runtime_type type,
         return "--shards is not available on a sync: it listens on nothing to share, and N of them would carry the "
                "same files over each other and write one index from N processes\n";
 
-    // A code one shard gave would be redeemed at another, which never saw it.
-    if (type == runtime_idp)
-        return "--shards is not available on an idp: an authorization code one shard gives is redeemed at whichever "
-               "shard the client's next connection reaches, which never saw it\n";
-
     // --listen used to be refused here, on the grounds that N processes
     // binding one path unlink each other's node.  That is true of one path and
     // not of N: each shard binds its own, name#0.sock .. name#N-1.sock, the

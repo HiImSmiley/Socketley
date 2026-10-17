@@ -3,6 +3,7 @@
 // it keeps, the keys it signs with, and the commands `socketley idp-user` sends it.
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -13,6 +14,7 @@
 
 #include "idp_accounts.h"
 #include "idp_logic.h"
+#include "idp_shard.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/event_loop_definitions.h"
 #include "../../shared/file_io.h"
@@ -27,7 +29,7 @@ namespace socketley::idp
 // What marks a request channel payload as a `socketley idp-user` command, its arguments a line each after it.
 inline constexpr std::string_view command_marker = "\x02skl-idp\n";
 
-class idp_run : public io_handler
+class idp_run : public io_handler, public request_origin
 {
 public:
     idp_run(idp_instance& owner, event_loop& loop);
@@ -43,6 +45,9 @@ public:
 
     // A `socketley idp-user` command, answered through the request channel under `ticket`.
     void command(uint64_t ticket, std::string_view payload);
+    // Another shard's question, answered under `ticket`.
+    void shard_answer(uint64_t ticket, std::string_view payload);
+    void on_request_reply(uint64_t cookie, request_status st, std::string_view reply) override;
 
 private:
     struct conn
@@ -74,19 +79,6 @@ private:
         std::string content_type;
         std::string forwarded_for;
         std::string host;
-    };
-
-    // An authorization code, good once for a minute.
-    struct code_entry
-    {
-        std::string client_id;
-        std::string redirect;
-        std::string sub;
-        std::string nonce;
-        std::string scope;
-        std::string challenge;
-        int64_t auth_time{0};
-        int64_t expires{0};
     };
 
 
@@ -140,6 +132,8 @@ private:
     void login_page(const std::shared_ptr<conn>& c, const params& p, std::string_view error, int status);
     void reset_page(const std::shared_ptr<conn>& c, const params& p, std::string_view error, int status);
     void issue_tokens(const std::shared_ptr<conn>& c, const client& cl, const code_entry& e, const account& who);
+    // An authorization code exchanged, once the shard that gave it has handed over its entry.
+    void redeemed(const std::shared_ptr<conn>& c, const client& cl, const params& p, bool found, const code_entry& e);
 
     // Whether `password` is the account's, on the hash pool, with `then` called on the loop.
     void check_password(const account* who, std::string_view password, std::function<void(bool)> then);
@@ -153,13 +147,22 @@ private:
     std::string clear_cookie() const;
     std::string client_ip(const conn& c, const request& rq) const;
     bool barred(const std::string& ip, int64_t now);
-    void missed(const std::string& ip, int64_t now);
+    // A failed sign-in from `ip`, with `then` called once every shard bars by it.
+    void missed(const std::string& ip, int64_t now, std::function<void()> then);
     const client* find_client(std::string_view id);
     void load_clients();
     // The profile claims every token of the account carries.
     std::string profile_claims(const account& who) const;
     // Whether a token given at `issued`, in milliseconds, still holds: the account was not signed out everywhere since.
     static bool still_signed_in(const account& who, int64_t issued);
+
+    // Fields of an account set by shard 0, here or asked of it, with `then` called once this shard reads the change.
+    void update_account(const std::string& id, field_list fields, std::function<void(bool, const std::string&)> then);
+    // Asks shard `shard`, with `then` called on its answer, or with false when it gave none.
+    bool cross(uint32_t shard, const shard_call& call, std::function<void(bool, std::string_view)> then);
+    // Shard 0's journal as far as it has written it: said to the other shards, which read it before every answer.
+    void publish_accounts();
+    void catch_up();
 
     void answer_command(uint64_t ticket, std::string_view text);
     // One page of a storage's users, as its request channel answers `users`, taken in as accounts.
@@ -205,9 +208,19 @@ private:
 
     bool m_stopped{false};
 
+    // This shard's place among the runtime's: shard 0 writes the accounts, every other reads its journal.
+    uint32_t m_shard{0};
+    uint32_t m_shards{1};
+    bool m_reader{false};
+    uint64_t m_told_id{0}, m_told_end{0};
+    std::string m_follow_error;
+    std::unordered_map<uint64_t, std::function<void(bool, std::string_view)>> m_crossed;
+    uint64_t m_next_cookie{1};
+
     struct counters
     {
         uint64_t sign_ins{0}, refused{0}, barred{0}, codes{0}, tokens{0}, refreshes{0}, userinfo{0};
+        uint64_t crossed{0}, crossings_served{0}, reopened{0};
     } m_c;
 };
 

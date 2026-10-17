@@ -359,3 +359,99 @@ TEST_CASE("groups are a comma list, read one by one")
     CHECK(a.in_group("beta"));
     CHECK_FALSE(a.in_group("admin"));
 }
+
+#include "runtime/idp/idp_shard.h"
+
+TEST_CASE("a shard that reads the accounts takes each change in, and a new journal behind a snapshot whole")
+{
+    const std::string dir = fresh_dir();
+    std::string a, b, why;
+    account_store w;
+    REQUIRE(w.open(dir, why));
+    REQUIRE(w.create({{"username", "frank"}}, a, why));
+    account_store r;
+    REQUIRE(r.follow_open(dir, why));
+    REQUIRE(r.by_name("frank"));
+    CHECK_FALSE(r.update(a, {{"name", "F"}}, why));
+    CHECK(why == "the accounts are written by shard 0");
+
+    REQUIRE(w.update(a, {{"name", "Frank F"}}, why));
+    REQUIRE(w.create({{"username", "gina"}}, b, why));
+    // Nothing past the length shard 0 said, though the file holds more.
+    CHECK(r.follow(w.journal_id(), 0));
+    CHECK(r.by_name("frank")->field("name").empty());
+    CHECK(r.follow(w.journal_id(), w.journal_end()));
+    CHECK(r.by_name("frank")->field("name") == "Frank F");
+    REQUIRE(r.by_name("gina"));
+
+    const uint64_t before = w.journal_id();
+    REQUIRE(w.compact(why));
+    CHECK(w.journal_id() != before);
+    REQUIRE(w.remove(b, why));
+    // The journal it holds open is one the writer has left, so it reads the new one whole.
+    CHECK_FALSE(r.follow(w.journal_id(), w.journal_end()));
+    REQUIRE(r.follow_open(dir, why));
+    CHECK(r.follow(w.journal_id(), w.journal_end()));
+    CHECK_FALSE(r.by_name("gina"));
+    REQUIRE(r.by_name("frank"));
+    CHECK(r.by_name("frank")->field("name") == "Frank F");
+    CHECK(r.size() == 1);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a shard that reads accounts nobody has written yet starts empty and reads them once there are some")
+{
+    const std::string dir = fresh_dir();
+    std::string a, why;
+    account_store r;
+    REQUIRE(r.follow_open(dir, why));
+    CHECK(r.size() == 0);
+    CHECK(r.follow(0, 0));
+    account_store w;
+    REQUIRE(w.open(dir, why));
+    REQUIRE(w.create({{"username", "hal"}}, a, why));
+    CHECK_FALSE(r.follow(w.journal_id(), w.journal_end()));
+    REQUIRE(r.follow_open(dir, why));
+    CHECK(r.by_name("hal"));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("the shards' questions and answers come back as they were sent")
+{
+    shard_call c{shard_call::update, "acct-id", {{"name", "N"}, {"email", ""}}, 1234};
+    shard_call d;
+    REQUIRE(decode_call(encode_call(c), d));
+    CHECK(d.op == shard_call::update);
+    CHECK(d.key == "acct-id");
+    CHECK(d.at == 1234);
+    REQUIRE(d.fields.size() == 2);
+    CHECK(d.fields[1].first == "email");
+    CHECK(d.fields[1].second.empty());
+    CHECK_FALSE(decode_call("not a call", d));
+    CHECK_FALSE(decode_call(encode_call(c).substr(0, cross_marker.size() + 3), d));
+
+    code_entry e{"wiki", "http://x/cb", "sub", "n", "openid", "chal", 10, 20};
+    bool found = false;
+    code_entry f;
+    REQUIRE(decode_code(encode_code(&e), found, f));
+    CHECK(found);
+    CHECK(f.redirect == "http://x/cb");
+    CHECK(f.challenge == "chal");
+    CHECK(f.expires == 20);
+    REQUIRE(decode_code(encode_code(nullptr), found, f));
+    CHECK_FALSE(found);
+
+    bool ok = true;
+    std::string why;
+    REQUIRE(decode_result(encode_result(false, "no such account"), ok, why));
+    CHECK_FALSE(ok);
+    CHECK(why == "no such account");
+
+    uint32_t shard = 99;
+    CHECK(code_shard("3.abcdef", 4, shard));
+    CHECK(shard == 3);
+    CHECK_FALSE(code_shard("4.abcdef", 4, shard));
+    CHECK_FALSE(code_shard("abcdef", 4, shard));
+    CHECK_FALSE(code_shard("1.abcdef", 1, shard));
+    CHECK_FALSE(code_shard("x.abcdef", 4, shard));
+}

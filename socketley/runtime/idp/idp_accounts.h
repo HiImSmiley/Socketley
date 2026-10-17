@@ -49,7 +49,17 @@ public:
 
     // The accounts kept under `dir`, read whole: the snapshot, then every journal record after it.
     bool open(const std::string& dir, std::string& why);
+    // The same, as a shard that does not write them reads them: the journal stays open, for follow().
+    bool follow_open(const std::string& dir, std::string& why);
+    // The records the writer has added up to `end` of the journal `journal` names; false when it has since begun
+    // another, which follow_open() then reads whole.
+    bool follow(uint64_t journal, uint64_t end);
+    bool following() const { return m_following; }
     void close();
+
+    // The journal written, by its inode, which a compaction changes; and its length, which every change grows.
+    uint64_t journal_id() const { return m_journal_id; }
+    uint64_t journal_end() const { return m_journal_end; }
 
     const account* by_id(std::string_view id) const;
     // By username, case aside.
@@ -83,6 +93,7 @@ private:
     void index(const account& a);
     void unindex(const account& a);
     bool read_snapshot(const std::string& path, std::string& why);
+    void note_journal();
 
     std::string m_dir;
     std::unordered_map<std::string, account> m_accounts;
@@ -90,6 +101,11 @@ private:
     std::unordered_map<std::string, std::string> m_names;
     mutation_journal m_journal;
     uint64_t m_journal_records{0};
+    uint64_t m_journal_id{0};
+    uint64_t m_journal_end{0};
+    bool m_following{false};
+    int m_follow_fd{-1};
+    uint64_t m_follow_off{0};
 };
 
 }   // namespace socketley::idp

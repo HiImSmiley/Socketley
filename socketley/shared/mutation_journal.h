@@ -146,6 +146,46 @@ public:
         return true;
     }
 
+    // replay() of a journal another process writes, open at `fd`, with the offset after its last complete record,
+    // which tail() goes on from.
+    static bool replay_fd(int fd, std::string& owner,
+                          const std::function<void(std::string_view)>& apply,
+                          uint64_t& end)
+    {
+        std::string data;
+        size_t off = 0;
+        if (!slurp_fd(fd, data) || !take_header(data, off, owner))
+            return false;
+        replay_stats st;
+        walk(data, off, &apply, st);
+        end = data.size() - st.dropped_bytes;
+        return true;
+    }
+
+    // The complete records between `from`, where one begins, and `to`, in order; the offset after the last of them.
+    static uint64_t tail(int fd, uint64_t from, uint64_t to,
+                         const std::function<void(std::string_view)>& apply)
+    {
+        if (to <= from)
+            return from;
+        std::string data(static_cast<size_t>(to - from), '\0');
+        size_t got = 0;
+        while (got < data.size())
+        {
+            const ssize_t n = ::pread(fd, data.data() + got, data.size() - got,
+                                      static_cast<off_t>(from + got));
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n <= 0)
+                break;
+            got += static_cast<size_t>(n);
+        }
+        data.resize(got);
+        replay_stats st;
+        walk(data, 0, &apply, st);
+        return from + (data.size() - st.dropped_bytes);
+    }
+
     // Open for appending, writing the head when the file is new or empty; an
     // existing head that does not match `owner` is refused here as well,
     // because the caller's probe and this open race nothing but a mistake.

@@ -2550,7 +2550,7 @@ project "test_idp"
     links { "crypto", "dl" }
 
     files { "test/unit/test_idp.cpp", "socketley/runtime/idp/idp_logic.cpp", "socketley/runtime/idp/idp_accounts.cpp",
-            "socketley/shared/jws.cpp" }
+            "socketley/runtime/idp/idp_shard.cpp", "socketley/shared/jws.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

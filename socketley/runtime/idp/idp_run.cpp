@@ -23,6 +23,7 @@
 #include "../../shared/jws.h"
 #include "../../shared/logging.h"
 #include "../../shared/runtime_manager.h"
+#include "../../shared/shard_target.h"
 #include "../../shared/storage_rpc.h"
 #include "../storage/checksum.h"
 #include "../storage/password_hash.h"
@@ -151,19 +152,21 @@ std::string page(std::string_view title, std::string_view body)
 constexpr std::string_view carried[] = {"client_id", "redirect_uri", "response_type", "scope", "state", "nonce",
                                         "code_challenge", "code_challenge_method", "rd"};
 
-// One scrypt holds 16 MiB, so eight at once is where the cores stop being what bounds the sign-ins.
-unsigned hash_threads()
+// One scrypt holds 16 MiB, so eight at once is where the cores stop being what bounds the sign-ins, shared out
+// among the shards.
+unsigned hash_threads(uint32_t shards)
 {
     cpu_set_t set;
     CPU_ZERO(&set);
     const int n = ::sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : 1;
-    return static_cast<unsigned>(std::clamp(n, 1, 8));
+    const unsigned all = static_cast<unsigned>(std::clamp(n, 1, 8));
+    return std::max(1u, (all + shards - 1) / shards);
 }
 
 }   // namespace
 
 idp_run::idp_run(idp_instance& owner, event_loop& loop)
-    : m_owner(owner), m_loop(loop), m_io(loop, this), m_hash(hash_threads())
+    : m_owner(owner), m_loop(loop), m_io(loop, this), m_hash(hash_threads(std::max<uint32_t>(1, owner.get_shards())))
 {
 }
 
@@ -178,6 +181,9 @@ idp_run::~idp_run()
 
 bool idp_run::start(std::string& why)
 {
+    m_shards = std::max<uint32_t>(1, m_owner.get_shards());
+    m_shard = m_owner.get_shard_index();
+    m_reader = m_shards > 1 && m_shard > 0;
     m_issuer = m_owner.issuer();
     m_cookie_domain = std::string(m_owner.get_cookie_domain());
     m_secure_cookie = m_issuer.starts_with("https://");
@@ -198,7 +204,9 @@ bool idp_run::start(std::string& why)
     }
     const std::string pub = socketley::jws::jwk_of(m_key);
     m_jwk = pub.substr(0, pub.size() - 1) + ",\"kid\":" + json_string(m_kid) + ",\"use\":\"sig\",\"alg\":\"ES256\"}";
-    // The public half where a proxy of this daemon reads it, written whole so a reader never sees half of it.
+    // The public half where a proxy of this daemon reads it, written whole so a reader never sees half of it, by
+    // shard 0 alone, since every shard holds the same key.
+    if (!m_reader)
     {
         const std::string path = idp_jwks_path(m_owner.get_name());
         const std::string tmp = path + ".new";
@@ -217,8 +225,10 @@ bool idp_run::start(std::string& why)
         why = m_clients_error;
         return false;
     }
-    if (!m_accounts.open(idp_accounts_dir(m_owner.get_name()), why))
+    if (!(m_reader ? m_accounts.follow_open(idp_accounts_dir(m_owner.get_name()), why)
+                   : m_accounts.open(idp_accounts_dir(m_owner.get_name()), why)))
         return false;
+    publish_accounts();
     // Password hashes are made and checked off the loop, which an scrypt would hold for tens of milliseconds.
     m_loop.register_owner(this);
     if (!m_hash.attach(m_io))
@@ -233,6 +243,9 @@ bool idp_run::start(std::string& why)
     }
     int one = 1;
     ::setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    // Every shard binds the port, and the kernel spreads the connections over them.
+    if (m_shards > 1)
+        ::setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = m_owner.bind_in_addr();
@@ -256,6 +269,10 @@ void idp_run::stop()
     if (m_stopped)
         return;
     m_stopped = true;
+    // Answers to what this shard asked another are not wanted once it stops.
+    if (auto* mgr = m_owner.get_runtime_manager())
+        mgr->requests().drop_origin(this);
+    m_crossed.clear();
     if (m_listen_fd >= 0)
     {
         ::shutdown(m_listen_fd, SHUT_RDWR);
@@ -293,6 +310,11 @@ std::string idp_run::stats() const
            "\nsign_ins_refused:" + std::to_string(m_c.refused) + "\nsign_ins_barred:" + std::to_string(m_c.barred) +
            "\ncodes:" + std::to_string(m_c.codes) + "\ntokens:" + std::to_string(m_c.tokens) +
            "\nrefreshes:" + std::to_string(m_c.refreshes) + "\nuserinfo:" + std::to_string(m_c.userinfo) +
+           (m_shards > 1 ? "\nshard:" + std::to_string(m_shard) + "/" + std::to_string(m_shards) +
+                               "\nrole:" + (m_reader ? "reader" : "writer") + "\ncrossed:" + std::to_string(m_c.crossed) +
+                               "\ncrossings_served:" + std::to_string(m_c.crossings_served) +
+                               "\nreopened:" + std::to_string(m_c.reopened)
+                         : std::string()) +
            (m_clients_error.empty() ? std::string() : "\nclients_error:" + m_clients_error) + "\n";
 }
 
@@ -666,6 +688,8 @@ void idp_run::json_error(const std::shared_ptr<conn>& c, int status, std::string
 
 void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
 {
+    // What shard 0 has written by now, so an answer here is as current as one it would give.
+    catch_up();
     // The clients file, looked at again at most once a second.
     if (const int64_t now = now_sec(); now != m_clients_checked)
     {
@@ -903,10 +927,26 @@ bool idp_run::barred(const std::string& ip, int64_t now)
     return static_cast<int>(it->second.at.size()) >= miss_limit;
 }
 
-void idp_run::missed(const std::string& ip, int64_t now)
+void idp_run::missed(const std::string& ip, int64_t now, std::function<void()> then)
 {
     m_misses[ip].at.push_back(now);
     arm_tick();
+    // Every shard bars the address, which would otherwise have five tries at each, and the failure is answered once
+    // they all have, so the next try is barred wherever it lands.
+    auto left = std::make_shared<uint32_t>(1);
+    auto one = [left, then](bool, std::string_view)
+    {
+        if (--*left == 0)
+            then();
+    };
+    for (uint32_t j = 0; j < m_shards && m_shards > 1; ++j)
+        if (j != m_shard)
+        {
+            ++*left;
+            if (!cross(j, shard_call{shard_call::miss, ip, {}, now}, one))
+                --*left;
+        }
+    one(true, {});
 }
 
 // ─── Authorize and sign in ──────────────────────────────────────────────────
@@ -1042,17 +1082,25 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
         auto cc = weak.lock();
         if (!cc || cc->dead)
             return;
-        cc->waiting = false;
         const account* a = m_accounts.by_name(user);
         if (!ok || !a || a->disabled())
         {
             ++m_c.refused;
-            missed(ip, now_sec());
             LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": a sign-in as \"" + user + "\" from " + ip +
                       " was refused").c_str());
-            login_page(cc, p, "The user or password is not right.", 401);
+            missed(ip, now_sec(), [this, weak, p]
+            {
+                auto c2 = weak.lock();
+                if (!c2 || c2->dead)
+                    return;
+                c2->waiting = false;
+                login_page(c2, p, "The user or password is not right.", 401);
+                resume(c2);
+            });
+            return;
         }
-        else if (a->field("reset") == "1")
+        cc->waiting = false;
+        if (a->field("reset") == "1")
             reset_page(cc, p, {}, 200);
         else
         {
@@ -1129,7 +1177,9 @@ void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const accou
     const int64_t now = now_sec();
     e.auth_time = now;
     e.expires = now + code_secs;
-    const std::string code = random_token();
+    // Named by the shard that keeps it, which the exchange is taken to.
+    const std::string token = random_token();
+    const std::string code = m_shards > 1 && !token.empty() ? std::to_string(m_shard) + "." + token : token;
     if (code.empty())
     {
         respond(c, 503, "text/plain", "no randomness for a code\n");
@@ -1218,32 +1268,45 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
     const std::string_view grant = param(p, "grant_type");
     if (grant == "authorization_code")
     {
-        const auto it = m_codes.find(std::string(param(p, "code")));
+        const std::string code(param(p, "code"));
+        uint32_t keeper = m_shard;
+        if (code_shard(code, m_shards, keeper) && keeper != m_shard)
+        {
+            std::weak_ptr<conn> weak = c;
+            const bool asked = cross(keeper, shard_call{shard_call::redeem, code, {}, 0},
+                                     [this, weak, p, client_id = cl->id](bool answered, std::string_view reply)
+            {
+                auto cc = weak.lock();
+                if (!cc || cc->dead)
+                    return;
+                cc->waiting = false;
+                bool found = false;
+                code_entry e;
+                if (!answered || !decode_code(reply, found, e))
+                    found = false;
+                // The clients file may have been read again meanwhile, so the client is found again by its id.
+                if (const client* again = find_client(client_id))
+                    redeemed(cc, *again, p, found, e);
+                else
+                    json_error(cc, 401, "invalid_client", "the client is not known or its secret is not right");
+                resume(cc);
+            });
+            if (asked)
+                c->waiting = true;
+            else
+                json_error(c, 400, "invalid_grant", "the code is not known, was used, or has expired");
+            return;
+        }
+        const auto it = m_codes.find(code);
         if (it == m_codes.end())
         {
-            json_error(c, 400, "invalid_grant", "the code is not known, was used, or has expired");
+            redeemed(c, *cl, p, false, {});
             return;
         }
         // Good once, whatever this exchange comes to.
         const code_entry e = std::move(it->second);
         m_codes.erase(it);
-        if (e.expires <= now_sec() || e.client_id != cl->id || e.redirect != param(p, "redirect_uri"))
-        {
-            json_error(c, 400, "invalid_grant", "the code was not given to this client for this redirect");
-            return;
-        }
-        if (!e.challenge.empty() && !pkce_matches(param(p, "code_verifier"), e.challenge))
-        {
-            json_error(c, 400, "invalid_grant", "the code verifier does not match the challenge");
-            return;
-        }
-        const account* who = m_accounts.by_id(e.sub);
-        if (!who || who->disabled())
-        {
-            json_error(c, 400, "invalid_grant", "the account is no longer one that may sign in");
-            return;
-        }
-        issue_tokens(c, *cl, e, *who);
+        redeemed(c, *cl, p, true, e);
         return;
     }
     if (grant == "refresh_token")
@@ -1273,6 +1336,33 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
         return;
     }
     json_error(c, 400, "unsupported_grant_type", "only authorization_code and refresh_token are served");
+}
+
+void idp_run::redeemed(const std::shared_ptr<conn>& c, const client& cl, const params& p, bool found,
+                       const code_entry& e)
+{
+    if (!found)
+    {
+        json_error(c, 400, "invalid_grant", "the code is not known, was used, or has expired");
+        return;
+    }
+    if (e.expires <= now_sec() || e.client_id != cl.id || e.redirect != param(p, "redirect_uri"))
+    {
+        json_error(c, 400, "invalid_grant", "the code was not given to this client for this redirect");
+        return;
+    }
+    if (!e.challenge.empty() && !pkce_matches(param(p, "code_verifier"), e.challenge))
+    {
+        json_error(c, 400, "invalid_grant", "the code verifier does not match the challenge");
+        return;
+    }
+    const account* who = m_accounts.by_id(e.sub);
+    if (!who || who->disabled())
+    {
+        json_error(c, 400, "invalid_grant", "the account is no longer one that may sign in");
+        return;
+    }
+    issue_tokens(c, cl, e, *who);
 }
 
 void idp_run::userinfo(const std::shared_ptr<conn>& c, const request& rq)
@@ -1395,30 +1485,43 @@ void idp_run::account_post(const std::shared_ptr<conn>& c, const request& rq)
         redirect(c, "/login?rd=" + url_encode("/account"));
         return;
     }
+    std::weak_ptr<conn> weak = c;
+    c->waiting = true;
     if (rq.path == "/account/everywhere")
     {
         // Every session and refresh token given before now stops holding, this browser's too.
-        std::string why;
-        if (!m_accounts.update(who->id, {{"revoked_before", std::to_string(now_ms())}}, why))
+        update_account(who->id, {{"revoked_before", std::to_string(now_ms())}},
+                       [this, weak, rq](bool ok, const std::string& why)
         {
-            account_page(c, rq, {}, why, 500);
-            return;
-        }
-        respond(c, 200, "text/html; charset=utf-8",
-                page("Signed out", "<h1>Signed out everywhere</h1><p class=\"small\">Every session of this "
-                                   "account has ended.</p>"),
-                clear_cookie());
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            cc->waiting = false;
+            if (!ok)
+                account_page(cc, rq, {}, why, 500);
+            else
+                respond(cc, 200, "text/html; charset=utf-8",
+                        page("Signed out", "<h1>Signed out everywhere</h1><p class=\"small\">Every session of this "
+                                           "account has ended.</p>"),
+                        clear_cookie());
+            resume(cc);
+        });
         return;
     }
     const params p = parse_form(rq.body);
-    std::string why;
-    if (!m_accounts.update(who->id, {{"name", std::string(param(p, "name"))}, {"email", std::string(param(p, "email"))}},
-                           why))
+    update_account(who->id, {{"name", std::string(param(p, "name"))}, {"email", std::string(param(p, "email"))}},
+                   [this, weak, rq](bool ok, const std::string& why)
     {
-        account_page(c, rq, {}, why, 400);
-        return;
-    }
-    account_page(c, rq, "Saved.", {}, 200);
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        cc->waiting = false;
+        if (!ok)
+            account_page(cc, rq, {}, why, 400);
+        else
+            account_page(cc, rq, "Saved.", {}, 200);
+        resume(cc);
+    });
 }
 
 void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
@@ -1459,8 +1562,18 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
         };
         if (!ok || !a || a->disabled())
         {
-            missed(ip, now_sec());
-            fail("The current password is not right.", 401);
+            missed(ip, now_sec(), [this, weak, rq, p, from_reset]
+            {
+                auto c2 = weak.lock();
+                if (!c2 || c2->dead)
+                    return;
+                c2->waiting = false;
+                if (from_reset)
+                    reset_page(c2, p, "The current password is not right.", 401);
+                else
+                    account_page(c2, rq, {}, "The current password is not right.", 401);
+                resume(c2);
+            });
             return;
         }
         if (!problem.empty())
@@ -1468,33 +1581,48 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
             fail(problem, 400);
             return;
         }
-        hash_password(fresh, [this, weak, rq, p, id, from_reset](std::string hash)
+        hash_password(fresh, [this, weak, p, id, from_reset](std::string hash)
         {
             auto c2 = weak.lock();
             if (!c2 || c2->dead)
                 return;
-            c2->waiting = false;
-            std::string why;
-            const account* a2 = m_accounts.by_id(id);
-            // A new password ends the sessions given before it, as a stolen one would want.
-            if (hash.empty() || !a2 ||
-                !m_accounts.update(id, {{"password", hash}, {"reset", ""}, {"password_set", std::to_string(now_sec())},
-                                        {"revoked_before", std::to_string(now_ms())}},
-                                   why))
+            auto refused = [this, &c2]
             {
+                c2->waiting = false;
                 respond(c2, 500, "text/plain", "the password could not be kept\n");
                 resume(c2);
+            };
+            if (hash.empty() || !m_accounts.by_id(id))
+            {
+                refused();
                 return;
             }
-            ++m_c.sign_ins;
-            if (from_reset)
-                grant(c2, p, *a2, session_cookie(*a2, false));
-            else
-                respond(c2, 200, "text/html; charset=utf-8",
-                        page("Password changed", "<h1>Password changed</h1><p class=\"small\">Every other session "
-                                                 "has ended.</p><p><a href=\"/account\">Your account</a></p>"),
-                        session_cookie(*a2, false));
-            resume(c2);
+            // A new password ends the sessions given before it, as a stolen one would want.
+            update_account(id, {{"password", hash}, {"reset", ""}, {"password_set", std::to_string(now_sec())},
+                                {"revoked_before", std::to_string(now_ms())}},
+                           [this, weak, p, id, from_reset](bool ok, const std::string&)
+            {
+                auto c3 = weak.lock();
+                if (!c3 || c3->dead)
+                    return;
+                c3->waiting = false;
+                const account* a2 = ok ? m_accounts.by_id(id) : nullptr;
+                if (!a2)
+                    respond(c3, 500, "text/plain", "the password could not be kept\n");
+                else
+                {
+                    ++m_c.sign_ins;
+                    if (from_reset)
+                        grant(c3, p, *a2, session_cookie(*a2, false));
+                    else
+                        respond(c3, 200, "text/html; charset=utf-8",
+                                page("Password changed", "<h1>Password changed</h1><p class=\"small\">Every other "
+                                                         "session has ended.</p><p><a href=\"/account\">Your "
+                                                         "account</a></p>"),
+                                session_cookie(*a2, false));
+                }
+                resume(c3);
+            });
         });
     });
 }
@@ -1508,6 +1636,8 @@ namespace socketley::idp
 
 void idp_run::answer_command(uint64_t ticket, std::string_view text)
 {
+    // A change a command made is said to the other shards before it is answered, so none answers from before it.
+    publish_accounts();
     if (auto* mgr = m_owner.get_runtime_manager())
         mgr->requests().complete_deferred(ticket, request_status::ok, text);
 }
@@ -1764,6 +1894,149 @@ void idp_run::import_page(uint64_t ticket, std::string_view reply)
     std::string errors;
     const size_t added = m_accounts.create_many(fresh, errors);
     answer_command(ticket, std::to_string(added) + " " + std::to_string(kept) + "\n" + errors);
+}
+
+// ─── Shards ─────────────────────────────────────────────────────────────────
+
+void idp_run::publish_accounts()
+{
+    if (m_shards <= 1 || m_reader)
+        return;
+    const uint64_t id = m_accounts.journal_id(), end = m_accounts.journal_end();
+    if (id == m_told_id && end == m_told_end)
+        return;
+    m_told_id = id;
+    m_told_end = end;
+    m_owner.shard_stats_table().publish_words(end, id);
+}
+
+void idp_run::catch_up()
+{
+    if (!m_reader)
+        return;
+    // The length before the journal it is of, since shard 0 says the journal first.
+    auto& table = m_owner.shard_stats_table();
+    const uint64_t end = table.word_at(0, 0);
+    const uint64_t id = table.word_at(0, 1);
+    if (m_accounts.follow(id, end))
+        return;
+    // Shard 0 has begun a new journal behind a snapshot, which is read whole.
+    ++m_c.reopened;
+    std::string why;
+    if (!m_accounts.follow_open(idp_accounts_dir(m_owner.get_name()), why))
+    {
+        // Said once a reason, since it is tried again at the next request.
+        if (why != m_follow_error)
+            LOG_WARN(("idp " + std::string(m_owner.get_name()) + " shard " + std::to_string(m_shard) +
+                      ": shard 0's accounts could not be read: " + why)
+                         .c_str());
+        m_follow_error = why;
+        return;
+    }
+    m_follow_error.clear();
+    m_accounts.follow(id, end);
+}
+
+bool idp_run::cross(uint32_t shard, const shard_call& call, std::function<void(bool, std::string_view)> then)
+{
+    auto* mgr = m_owner.get_runtime_manager();
+    if (!mgr)
+        return false;
+    const uint64_t cookie = m_next_cookie++;
+    m_crossed.emplace(cookie, std::move(then));
+    if (!mgr->requests().post(this, cookie, shard_target(m_owner.get_name(), shard), encode_call(call)))
+    {
+        m_crossed.erase(cookie);
+        return false;
+    }
+    ++m_c.crossed;
+    return true;
+}
+
+void idp_run::on_request_reply(uint64_t cookie, request_status st, std::string_view reply)
+{
+    // An answer nobody waits for any more, since this shard stopped.
+    const auto it = m_crossed.find(cookie);
+    if (it == m_crossed.end())
+        return;
+    auto then = std::move(it->second);
+    m_crossed.erase(it);
+    then(st == request_status::ok, reply);
+}
+
+void idp_run::update_account(const std::string& id, field_list fields,
+                             std::function<void(bool, const std::string&)> then)
+{
+    if (!m_reader)
+    {
+        std::string why;
+        const bool ok = m_accounts.update(id, fields, why);
+        publish_accounts();
+        then(ok, why);
+        return;
+    }
+    auto answered = [this, then](bool delivered, std::string_view reply)
+    {
+        bool ok = false;
+        std::string why;
+        if (!delivered || !decode_result(reply, ok, why))
+        {
+            ok = false;
+            why = "shard 0, which keeps the accounts, did not answer";
+        }
+        // Shard 0 said the change before it answered, so it is read here before anything is answered from it.
+        catch_up();
+        then(ok, why);
+    };
+    if (!cross(0, shard_call{shard_call::update, id, std::move(fields), 0}, answered))
+        then(false, "shard 0, which keeps the accounts, cannot be asked");
+}
+
+void idp_run::shard_answer(uint64_t ticket, std::string_view payload)
+{
+    auto* mgr = m_owner.get_runtime_manager();
+    if (!mgr)
+        return;
+    shard_call call;
+    if (!decode_call(payload, call))
+    {
+        mgr->requests().complete_deferred(ticket, request_status::ok, {});
+        return;
+    }
+    ++m_c.crossings_served;
+    switch (call.op)
+    {
+        case shard_call::redeem:
+        {
+            // Good once, whatever the exchange at the asking shard comes to.
+            const auto it = m_codes.find(call.key);
+            if (it == m_codes.end())
+            {
+                mgr->requests().complete_deferred(ticket, request_status::ok, encode_code(nullptr));
+                return;
+            }
+            const std::string reply = encode_code(&it->second);
+            m_codes.erase(it);
+            mgr->requests().complete_deferred(ticket, request_status::ok, reply);
+            return;
+        }
+        case shard_call::update:
+        {
+            std::string why;
+            const bool ok = !m_reader && m_accounts.update(call.key, call.fields, why);
+            if (m_reader)
+                why = "the accounts are written by shard 0";
+            publish_accounts();
+            mgr->requests().complete_deferred(ticket, request_status::ok, encode_result(ok, why));
+            return;
+        }
+        case shard_call::miss:
+            m_misses[call.key].at.push_back(call.at);
+            arm_tick();
+            mgr->requests().complete_deferred(ticket, request_status::ok, {});
+            return;
+    }
+    mgr->requests().complete_deferred(ticket, request_status::ok, {});
 }
 
 }   // namespace socketley::idp

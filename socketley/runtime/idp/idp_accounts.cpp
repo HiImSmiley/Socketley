@@ -46,6 +46,17 @@ std::string new_id()
     return socketley::jws::b64url(std::string_view(reinterpret_cast<const char*>(b), sizeof b));
 }
 
+// A rename kept by syncing the directory that holds it.
+void sync_dir_of(const std::string& path)
+{
+    const std::string dir = std::filesystem::path(path).parent_path().string();
+    if (const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC); dfd >= 0)
+    {
+        if (::fsync(dfd) != 0) {}
+        ::close(dfd);
+    }
+}
+
 // Written beside and renamed into place after its bytes are on the disk, so a crash leaves the old file or the new.
 bool write_whole(const std::string& path, const std::string& data)
 {
@@ -72,13 +83,7 @@ bool write_whole(const std::string& path, const std::string& data)
         ::unlink(tmp.c_str());
         return false;
     }
-    // The rename itself, kept by syncing the directory that holds it.
-    const std::string dir = std::filesystem::path(path).parent_path().string();
-    if (const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC); dfd >= 0)
-    {
-        if (::fsync(dfd) != 0) {}
-        ::close(dfd);
-    }
+    sync_dir_of(path);
     return true;
 }
 
@@ -294,17 +299,78 @@ bool account_store::open(const std::string& dir, std::string& why)
         why = jpath + " cannot be opened for writing";
         return false;
     }
+    note_journal();
     if (m_journal_records >= compact_after && !compact(why))
         return false;
+    return true;
+}
+
+void account_store::note_journal()
+{
+    struct stat st{};
+    if (m_journal.fd() >= 0 && ::fstat(m_journal.fd(), &st) == 0)
+    {
+        m_journal_id = static_cast<uint64_t>(st.st_ino);
+        m_journal_end = static_cast<uint64_t>(st.st_size);
+    }
+}
+
+bool account_store::follow_open(const std::string& dir, std::string& why)
+{
+    close();
+    m_dir = dir;
+    m_following = true;
+    const std::string jpath = dir + "/accounts.journal";
+    // The journal before the snapshot, so a compaction between the two leaves records the snapshot holds already,
+    // which change nothing read again, rather than records neither holds.
+    m_follow_fd = ::open(jpath.c_str(), O_RDONLY | O_CLOEXEC);
+    if (!read_snapshot(dir + "/accounts.snapshot", why))
+        return false;
+    if (m_follow_fd < 0)
+        return true;   // the writer has written nothing yet
+    struct stat st{};
+    std::string owner;
+    if (::fstat(m_follow_fd, &st) != 0 ||
+        !mutation_journal::replay_fd(m_follow_fd, owner, [this](std::string_view rec) {
+            if (apply(rec))
+                ++m_journal_records;
+        }, m_follow_off) ||
+        owner != journal_owner)
+    {
+        why = jpath + " is not this provider's journal";
+        return false;
+    }
+    m_journal_id = static_cast<uint64_t>(st.st_ino);
+    return true;
+}
+
+bool account_store::follow(uint64_t journal, uint64_t end)
+{
+    if (!m_following || journal == 0)
+        return true;
+    if (journal != m_journal_id)
+        return false;
+    if (end > m_follow_off)
+        m_follow_off = mutation_journal::tail(m_follow_fd, m_follow_off, end, [this](std::string_view rec) {
+            if (apply(rec))
+                ++m_journal_records;
+        });
     return true;
 }
 
 void account_store::close()
 {
     m_journal.close();
+    if (m_follow_fd >= 0)
+        ::close(m_follow_fd);
+    m_follow_fd = -1;
+    m_follow_off = 0;
+    m_following = false;
     m_accounts.clear();
     m_names.clear();
     m_journal_records = 0;
+    m_journal_id = 0;
+    m_journal_end = 0;
 }
 
 bool account_store::commit(const std::string& record, std::string& why)
@@ -314,6 +380,11 @@ bool account_store::commit(const std::string& record, std::string& why)
 
 bool account_store::commit_many(const std::vector<std::string>& records, std::string& why)
 {
+    if (m_following)
+    {
+        why = "the accounts are written by shard 0";
+        return false;
+    }
     if (!m_journal.is_open())
     {
         why = "the accounts are not open";
@@ -326,6 +397,7 @@ bool account_store::commit_many(const std::vector<std::string>& records, std::st
         why = "the change could not be written to the disk";
         return false;
     }
+    note_journal();
     for (const auto& r : records)
         apply(r);
     m_journal_records += records.size();
@@ -359,13 +431,25 @@ bool account_store::compact(std::string& why)
         why = "the accounts snapshot could not be written";
         return false;
     }
-    // Behind the snapshot that now holds their effects; a crash before this replays records already in it, which
-    // changes nothing, since a record sets values rather than adding to them.
-    if (!m_journal.reset())
+    // A new journal behind the snapshot that now holds the old one's effects, put in its place, so a shard still
+    // reading the old one reads it to its end; a crash before this replays records the snapshot holds, which changes
+    // nothing, since a record sets values rather than adding to them.
+    const std::string jpath = m_dir + "/accounts.journal";
+    const std::string fresh = jpath + ".new";
+    ::unlink(fresh.c_str());
+    m_journal.close();
+    if (!m_journal.open_append(fresh, journal_owner) || !m_journal.sync() || ::rename(fresh.c_str(), jpath.c_str()) != 0)
     {
-        why = "the journal could not be cut behind the snapshot";
+        ::unlink(fresh.c_str());
+        if (!m_journal.open_append(jpath, journal_owner))
+            why = "the journal could not be opened again after the snapshot";
+        else
+            why = "the journal could not be begun again behind the snapshot";
+        note_journal();
         return false;
     }
+    sync_dir_of(jpath);
+    note_journal();
     m_journal_records = 0;
     return true;
 }

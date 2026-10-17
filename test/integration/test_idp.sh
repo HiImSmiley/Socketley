@@ -64,8 +64,6 @@ EOF
 
 out=$("$BIN" create idp x2 -p "$PI" --issuer "ftp://x" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ok || bad "an issuer that is no http address is refused" "rc $rc: $out"
-out=$("$BIN" create idp x3 -p "$PI" --issuer "http://127.0.0.1:$PI" --shards 2 2>&1); rc=$?
-[ "$rc" -ne 0 ] && ok || bad "--shards is refused" "rc $rc: $out"
 out=$("$BIN" create idp x4 -p "$PI" --issuer "http://127.0.0.1:$PI" --tls 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ok || bad "--tls is refused, since the entrance terminates it" "rc $rc: $out"
 

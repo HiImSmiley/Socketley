@@ -93,6 +93,12 @@ void idp_instance::on_loop_turn()
 
 bool idp_instance::serve_deferred(uint64_t ticket, std::string_view, std::string_view payload)
 {
+    // Another shard's question about a code it was handed, an account it changes, or a failed sign-in.
+    if (m_run && payload.starts_with(socketley::idp::cross_marker))
+    {
+        m_run->shard_answer(ticket, payload);
+        return true;
+    }
     // Only what `socketley idp-user` sends; any other runtime's request is no command this provider takes.
     if (!m_run || !payload.starts_with(socketley::idp::command_marker))
         return false;

@@ -77,7 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `X-Forwarded-User` and `X-Forwarded-Preferred-Username`, which a client
   cannot send itself, a storage takes the account as its user of that name,
   and the dashboard its admins. It serves plain HTTP behind the entrance;
-  `--tls` and `--shards` are refused.
+  `--tls` is refused. `--shards N` serves it from N worker processes on its
+  one port: shard 0 writes the accounts and every shard reads its journal
+  before it answers, so a change holds at every shard once it is answered; a
+  code is redeemed at the shard that gave it, wherever the exchange arrives,
+  and a failed sign-in counts against its address at every shard. Two shards
+  on two cores give 1.6-1.7x the refreshes and single sign-ons of one.
 
 - **A `sync` runtime, which carries a directory to a storage.** One runtime is
   one job, with its own line in `socketley ls`, its own figures, log lines and
