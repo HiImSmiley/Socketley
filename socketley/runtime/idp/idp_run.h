@@ -3,8 +3,10 @@
 // it keeps, the keys it signs with, and the commands `socketley idp-user` sends it.
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -171,8 +173,22 @@ private:
     idp_instance& m_owner;
     event_loop& m_loop;
     file_io m_io;
-    // A thread a core the process may run on, as each sign-in's scrypt is one core's tens of milliseconds.
+    // A thread a core the process may run on, up to four, as each sign-in's scrypt is one core's milliseconds.
     hash_pool m_hash;
+    // Password checks waiting for a hashing thread, which takes up to four at once.
+    struct password_checks
+    {
+        struct check
+        {
+            std::string hash;
+            std::string password;
+            bool real{false};
+            std::function<void(bool)> then;
+        };
+        std::mutex mu;
+        std::deque<check> waiting;
+    };
+    std::shared_ptr<password_checks> m_checks{std::make_shared<password_checks>()};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
     std::string m_issuer;
     std::string m_issuer_json;

@@ -27,6 +27,7 @@
 #include "../../shared/storage_rpc.h"
 #include "../storage/checksum.h"
 #include "../storage/password_hash.h"
+#include "../storage/scrypt.h"
 
 namespace socketley::idp
 {
@@ -152,14 +153,14 @@ std::string page(std::string_view title, std::string_view body)
 constexpr std::string_view carried[] = {"client_id", "redirect_uri", "response_type", "scope", "state", "nonce",
                                         "code_challenge", "code_challenge_method", "rd"};
 
-// One scrypt holds 16 MiB, so eight at once is where the cores stop being what bounds the sign-ins, shared out
+// One scrypt holds 16 MiB and a thread makes up to four at once, so four threads are sixteen at most, shared out
 // among the shards.
 unsigned hash_threads(uint32_t shards)
 {
     cpu_set_t set;
     CPU_ZERO(&set);
     const int n = ::sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : 1;
-    const unsigned all = static_cast<unsigned>(std::clamp(n, 1, 8));
+    const unsigned all = static_cast<unsigned>(std::clamp(n, 1, 4));
     return std::max(1u, (all + shards - 1) / shards);
 }
 
@@ -1118,20 +1119,38 @@ void idp_run::check_password(const account* who, std::string_view password, std:
     static const std::string dummy = socketley::storage::password_hash("socketley-no-such-user");
     const std::string hash(who && !who->field("password").empty() ? who->field("password") : std::string_view(dummy));
     const bool real = who && !who->field("password").empty();
-    auto result = std::make_shared<bool>(false);
-    auto work = [hash, pw = std::string(password), result] {
-        *result = socketley::storage::password_matches(hash, pw);
-    };
     if (!m_hash.enabled())
     {
-        work();
-        then(real && *result);
+        const bool ok = socketley::storage::password_matches(hash, password);
+        then(real && ok);
         return;
     }
-    m_hash.submit(m_hash.next_lane(), std::move(work), [alive = m_alive, result, real, then = std::move(then)] {
-        if (*alive)
-            then(real && *result);
-    });
+    {
+        std::lock_guard<std::mutex> g(m_checks->mu);
+        m_checks->waiting.push_back({hash, std::string(password), real, std::move(then)});
+    }
+    // A piece of work for each check, which takes whatever checks wait, so the thread that is free makes them together.
+    m_hash.submit(m_hash.next_lane(), [checks = m_checks, pool = &m_hash, alive = m_alive]
+    {
+        std::vector<password_checks::check> batch;
+        {
+            std::lock_guard<std::mutex> g(checks->mu);
+            while (!checks->waiting.empty() && batch.size() < socketley::storage::scrypt::max_batch)
+            {
+                batch.push_back(std::move(checks->waiting.front()));
+                checks->waiting.pop_front();
+            }
+        }
+        std::vector<socketley::storage::password_check> asked;
+        for (const auto& c : batch)
+            asked.push_back({c.hash, c.password});
+        socketley::storage::password_matches_many(asked);
+        for (size_t i = 0; i < batch.size(); ++i)
+            pool->post_done([alive, then = std::move(batch[i].then), ok = batch[i].real && asked[i].matches] {
+                if (*alive)
+                    then(ok);
+            });
+    }, [] {});
 }
 
 void idp_run::hash_password(std::string_view password, std::function<void(std::string)> then)

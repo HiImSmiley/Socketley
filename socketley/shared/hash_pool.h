@@ -107,6 +107,16 @@ public:
         l.cv.notify_one();
     }
 
+    // Queues `done` for drain() from any thread, for work that finishes what other work was submitted for.
+    void post_done(completion done)
+    {
+        {
+            std::lock_guard<std::mutex> g(m_done_mu);
+            m_done.push_back(std::move(done));
+        }
+        wake();
+    }
+
     // Runs the completions that are waiting, on the calling thread.
     void drain()
     {
@@ -200,15 +210,16 @@ private:
                 l.q.pop_front();
             }
             it.w();
-            {
-                std::lock_guard<std::mutex> g(m_done_mu);
-                m_done.push_back(std::move(it.done));
-            }
-            if (!m_wake_pending.exchange(true, std::memory_order_seq_cst))
-            {
-                const uint64_t one = 1;
-                if (::write(m_wake, &one, sizeof one) < 0) {}
-            }
+            post_done(std::move(it.done));
+        }
+    }
+
+    void wake()
+    {
+        if (!m_wake_pending.exchange(true, std::memory_order_seq_cst))
+        {
+            const uint64_t one = 1;
+            if (::write(m_wake, &one, sizeof one) < 0) {}
         }
     }
 
