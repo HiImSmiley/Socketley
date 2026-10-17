@@ -30,6 +30,11 @@ stat_of() {
     for _ in $(seq 1 30); do v=$("$BIN" stats "$1" 2>/dev/null | sed -n "s/^$2://p"); [ -n "$v" ] && break; sleep 0.1; done
     echo "$v"
 }
+# A worker's figures come every 250 ms, so one counting what was just answered is waited for.
+stat_at_least() {   # runtime field n -> 0 once the figure is n or more, within three seconds
+    for _ in $(seq 1 30); do [ "$(stat_of "$1" "$2")" -ge "$3" ] 2>/dev/null && return 0; sleep 0.1; done
+    return 1
+}
 
 echo "=== Integration: the db runtime's stream, replicas, backups, and documents past its cache ==="
 daemon_isolate dbstream
@@ -237,7 +242,7 @@ PY
 
 tally < <(run stream)
 tally < <(run ttl)
-[ "$(stat_of data expired)" -ge 1 ] 2>/dev/null && ok || bad "stats count the documents whose time came" "$(stat_of data expired)"
+stat_at_least data expired 1 && ok || bad "stats count the documents whose time came" "$(stat_of data expired)"
 
 # ── A replica, on a runtime of its own ────────────────────────────────────────
 out=$("$BIN" create db rx -p "$PR" --replicate "http://127.0.0.1:$PD" 2>&1); rc=$?
@@ -296,14 +301,14 @@ curl -s -o /dev/null -X PUT -H "Authorization: Bearer streamsecret0123456789" -H
 sleep 4.5
 n=$(ls "$T/backups" | grep -c '^sched-.*\.dbbackup$')
 [ "$n" -eq 2 ] && ok || bad "scheduled backups are taken and the newest --backup-keep kept" "$(ls "$T/backups")"
-[ "$(stat_of sched backups)" -ge 3 ] 2>/dev/null && ok || bad "stats count the backups taken" "$(stat_of sched backups)"
+stat_at_least sched backups 3 && ok || bad "stats count the backups taken" "$(stat_of sched backups)"
 
 # ── More documents than the cache holds ───────────────────────────────────────
 cfg=$("$BIN" show data)
 echo "$cfg" | python3 -c "import json,sys; d=json.load(sys.stdin); d['cache']=1048576; print(json.dumps(d))" > "$T/data.json"
 "$BIN" import data --restart < "$T/data.json" >/dev/null 2>&1; up "$PD"
 tally < <(run many)
-[ "$(stat_of data cache_misses)" -gt 0 ] 2>/dev/null && ok || bad "reads past the cache come from the disk" "$(stat_of data cache_misses)"
+stat_at_least data cache_misses 1 && ok || bad "reads past the cache come from the disk" "$(stat_of data cache_misses)"
 
 # ── Idle ──────────────────────────────────────────────────────────────────────
 # Every worker of this daemon, the databases with backups, a replica's thread and streams among them, over two
