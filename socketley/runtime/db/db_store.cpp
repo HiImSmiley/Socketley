@@ -118,6 +118,47 @@ bool key_meets(const query::cond& c, const ikey& k)
     }
 }
 
+// The least key above `k`, so a bound past every entry of `k` is a lower_bound of it.
+ikey after(ikey k)
+{
+    if (k.rank == ikey::number)
+        k.num = std::nextafter(k.num, INFINITY);
+    else
+        k.str.push_back('\0');
+    return k;
+}
+
+using index_entries = std::set<std::pair<ikey, std::string>>;
+
+// The entries an eq or a range on the index picks, which are one run of it, since it orders them by their values.
+std::pair<index_entries::const_iterator, index_entries::const_iterator> run_of(const index_entries& s,
+                                                                              const query::cond& c)
+{
+    const auto at = [&](const ikey& k) { return s.lower_bound({k, std::string()}); };
+    const ikey& k = c.key;
+    const ikey first{k.rank, -INFINITY, {}};
+    const ikey past{static_cast<uint8_t>(k.rank + 1), -INFINITY, {}};
+    switch (c.op)
+    {
+        case query::cond::gt:  return {at(after(k)), at(past)};
+        case query::cond::gte: return {at(k), at(past)};
+        case query::cond::lt:  return {at(first), at(k)};
+        case query::cond::lte: return {at(first), at(after(k))};
+        case query::cond::prefix:
+        {
+            const ikey from{ikey::string, 0, c.value.s};
+            ikey to = from;
+            while (!to.str.empty() && static_cast<unsigned char>(to.str.back()) == 0xff)
+                to.str.pop_back();
+            if (to.str.empty())
+                return {at(from), at(past)};
+            to.str.back() = static_cast<char>(static_cast<unsigned char>(to.str.back()) + 1);
+            return {at(from), at(to)};
+        }
+        default: return {at(k), at(after(k))};
+    }
+}
+
 bool meets(const query::cond& c, const jvalue* v)
 {
     switch (c.op)
@@ -1200,83 +1241,6 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
     needs_body = needs_body || (!q.sort.empty() && sort_ix == -1);
     const index_state* walk = sort_ix >= 0 ? &c->indexes[static_cast<size_t>(sort_ix)] : nullptr;
 
-    // Where the documents come from: the account's own, one index's values, one index's range, the sort's index in
-    // its order, or every document.
-    std::vector<const std::string*> ids;
-    bool in_order = false;
-    bool planned = false;
-    if (own_only)
-    {
-        for (auto it = c->by_owner.lower_bound({who.sub, std::string()}); it != c->by_owner.end() && it->first == who.sub;
-             ++it)
-            ids.push_back(&it->second);
-        planned = true;
-    }
-    for (const auto& cond : q.where)
-    {
-        if (planned)
-            break;
-        const int pos = system_field(cond.field) ? -1 : index_of(cond.field);
-        if (pos < 0)
-            continue;
-        const index_state* ix = &c->indexes[static_cast<size_t>(pos)];
-        if (cond.op == query::cond::eq || cond.op == query::cond::in)
-        {
-            const auto take = [&](const ikey& k) {
-                for (auto it = ix->entries.lower_bound({k, std::string()}); it != ix->entries.end() && it->first == k;
-                     ++it)
-                    ids.push_back(&it->second);
-            };
-            if (cond.op == query::cond::eq)
-                take(cond.key);
-            else
-                for (const auto& v : cond.value.items)
-                    take(key_of(&v));
-            planned = true;
-        }
-        else if (cond.op != query::cond::ne && cond.op != query::cond::exists)
-        {
-            // A range stays within the kind of its bound, from the bound up or from the kind's smallest value.
-            ikey from = cond.key;
-            if (cond.op == query::cond::lt || cond.op == query::cond::lte)
-            {
-                from.num = -INFINITY;
-                from.str.clear();
-            }
-            for (auto it = ix->entries.lower_bound({from, std::string()});
-                 it != ix->entries.end() && it->first.rank == cond.key.rank; ++it)
-            {
-                if (key_meets(cond, it->first))
-                    ids.push_back(&it->second);
-                else if (cond.op != query::cond::gt)
-                    break;
-            }
-            planned = true;
-        }
-    }
-    if (!planned && walk)
-    {
-        in_order = true;
-        if (q.desc)
-            for (auto it = walk->entries.rbegin(); it != walk->entries.rend(); ++it)
-                ids.push_back(&it->second);
-        else
-            for (const auto& e : walk->entries)
-                ids.push_back(&e.second);
-    }
-    else if (!planned)
-    {
-        ids.reserve(c->docs.size());
-        for (const auto& [id, d] : c->docs)
-            ids.push_back(&id);
-    }
-    if (!in_order)
-    {
-        std::sort(ids.begin(), ids.end(), [](const std::string* x, const std::string* y) { return *x < *y; });
-        ids.erase(std::unique(ids.begin(), ids.end(), [](const std::string* x, const std::string* y) { return *x == *y; }),
-                  ids.end());
-    }
-
     struct hit
     {
         const std::string* id;
@@ -1288,34 +1252,32 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
     const size_t enough = q.skip + q.limit + 1;
     jvalue scratch, body;
     std::string json;
-    for (const std::string* id : ids)
-    {
+    bool in_order = false;
+    bool unreadable = false;
+    // A candidate judged; false once the answer has what it needs.
+    const auto consider = [&](const std::string* id) {
         const doc& d = c->docs.find(*id)->second;
         if (!may_read(who, a, d))
-            continue;
+            return true;
         bool have_body = false;
         if (needs_body)
         {
             if (!json_of(d, json) || !json_reader(json).document(body))
             {
-                err = fail(503, "unreadable", "a document could not be read from the disk");
+                unreadable = true;
                 return false;
             }
             have_body = true;
         }
-        bool ok = true;
-        for (size_t i = 0; ok && i < q.where.size(); ++i)
+        for (size_t i = 0; i < q.where.size(); ++i)
         {
             const auto& cond = q.where[i];
-            if (cond_ix[i] >= 0)
-                ok = meets_key(cond, d.keys[static_cast<size_t>(cond_ix[i])]);
-            else if (cond_ix[i] == -2)
-                ok = meets(cond, system_of(d, *id, cond.field, scratch));
-            else
-                ok = meets(cond, at_path(body, cond.field));
+            const bool ok = cond_ix[i] >= 0  ? meets_key(cond, d.keys[static_cast<size_t>(cond_ix[i])])
+                            : cond_ix[i] == -2 ? meets(cond, system_of(d, *id, cond.field, scratch))
+                                               : meets(cond, at_path(body, cond.field));
+            if (!ok)
+                return true;
         }
-        if (!ok)
-            continue;
         hit h{id, &d, {}, {}};
         if (!q.sort.empty() && !in_order)
             h.sort = sort_ix >= 0      ? d.keys[static_cast<size_t>(sort_ix)]
@@ -1324,8 +1286,81 @@ bool store::find(const principal& who, std::string_view coll, const query& q, st
         if (have_body)
             h.json = std::move(json);
         hits.push_back(std::move(h));
-        if (in_order && !q.count && hits.size() >= enough)
+        return !in_order || q.count || hits.size() < enough;
+    };
+    // A source already in the answer's order, read from the end it starts at as far as the answer needs.
+    const auto walk_run = [&](auto lo, auto hi) {
+        in_order = true;
+        if (q.desc)
+            while (hi != lo && consider(&(--hi)->second)) {}
+        else
+            for (; lo != hi && consider(&lo->second); ++lo) {}
+    };
+
+    // Where the documents come from: the account's own or one index's run of values, read in place when their entries
+    // are already in the answer's order, the sort's index, or every document.
+    std::vector<const std::string*> ids;
+    bool planned = false;
+    if (own_only)
+    {
+        const auto lo = c->by_owner.lower_bound({who.sub, std::string()});
+        const auto hi = c->by_owner.lower_bound({who.sub + '\0', std::string()});
+        if (q.sort.empty())
+            walk_run(lo, hi);
+        else
+            for (auto it = lo; it != hi; ++it)
+                ids.push_back(&it->second);
+        planned = true;
+    }
+    for (const auto& cond : q.where)
+    {
+        if (planned)
             break;
+        const int pos = system_field(cond.field) ? -1 : index_of(cond.field);
+        if (pos < 0 || cond.op == query::cond::ne || cond.op == query::cond::exists)
+            continue;
+        const index_state& ix = c->indexes[static_cast<size_t>(pos)];
+        planned = true;
+        if (cond.op == query::cond::in)
+        {
+            for (const auto& v : cond.value.items)
+            {
+                query::cond one;
+                one.key = key_of(&v);
+                const auto [lo, hi] = run_of(ix.entries, one);
+                for (auto it = lo; it != hi; ++it)
+                    ids.push_back(&it->second);
+            }
+            continue;
+        }
+        const auto [lo, hi] = run_of(ix.entries, cond);
+        if (sort_ix == pos || (q.sort.empty() && cond.op == query::cond::eq))
+            walk_run(lo, hi);
+        else
+            for (auto it = lo; it != hi; ++it)
+                ids.push_back(&it->second);
+    }
+    if (!planned && walk)
+        walk_run(walk->entries.begin(), walk->entries.end());
+    else if (!planned)
+    {
+        ids.reserve(c->docs.size());
+        for (const auto& [id, d] : c->docs)
+            ids.push_back(&id);
+    }
+    if (!in_order)
+    {
+        std::sort(ids.begin(), ids.end(), [](const std::string* x, const std::string* y) { return *x < *y; });
+        ids.erase(std::unique(ids.begin(), ids.end(), [](const std::string* x, const std::string* y) { return *x == *y; }),
+                  ids.end());
+        for (const std::string* id : ids)
+            if (!consider(id))
+                break;
+    }
+    if (unreadable)
+    {
+        err = fail(503, "unreadable", "a document could not be read from the disk");
+        return false;
     }
     if (q.count)
     {

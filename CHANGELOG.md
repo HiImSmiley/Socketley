@@ -31,7 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and sealed at 64 MiB; memory holds where each lies, its figures and its
   index values, and a cache of those last read (`--cache`), and sealed
   segments mostly dead are merged off the event loop. No answer is given
-  before what it rests on is on the disk, a read's included. `GET
+  before what it rests on is on the disk, a read's included, and the newest
+  segment is given its room ahead of its records, so a sync seldom carries a
+  change of its size. A query whose order an index or an account's own
+  documents already keep reads only as far as its page. `GET
   /c/<collection>/_feed` streams every change as a Server-Sent Event,
   numbered, to a reader who may see it, resumed with `Last-Event-ID`; `GET
   /_feed` streams them all to a key. A schema line's `ttl:<field>` gives

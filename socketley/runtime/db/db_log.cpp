@@ -49,6 +49,11 @@ bool sync_dir(const std::string& dir)
     return ok;
 }
 
+// What a room is written from.
+const char zeros[64 << 10] = {};
+// How far past the records a room begins when none is ready, so the loop's next records stay below it.
+constexpr uint64_t room_lead = 512u << 10;
+
 bool pread_all(int fd, char* buf, size_t n, uint64_t off)
 {
     size_t got = 0;
@@ -125,7 +130,8 @@ bool seglog::scan_file(const std::string& path, const visitor& each, bool cut_to
         const char* h = buf.data() + (at - base);
         const uint32_t len = get32(h);
         const uint32_t crc = get32(h + 4);
-        if (len > max_record || at + record_head + len > size)
+        // No record is empty, so a length of 0 is the room past the last one.
+        if (len == 0 || len > max_record || at + record_head + len > size)
             break;
         if (at + record_head + len > base + buf.size())
         {
@@ -225,12 +231,13 @@ bool seglog::open(const std::string& dir, const visitor& each, std::string& why)
         why = path_of(m_active) + " cannot be opened to write";
         return false;
     }
-    m_written = m_segs[m_active].size;
+    m_written = m_alloc = m_segs[m_active].size;
     return true;
 }
 
 bool seglog::begin(uint32_t seg, std::string& why)
 {
+    end_room();
     const std::string path = path_of(seg);
     const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     const std::string head = head_of();
@@ -247,13 +254,18 @@ bool seglog::begin(uint32_t seg, std::string& why)
     m_active = seg;
     m_highest = std::max(m_highest, seg);
     m_segs[seg].size = header_bytes;
-    m_written = header_bytes;
+    m_written = m_alloc = header_bytes;
+    m_room_failed = false;
     m_pending.clear();
     return true;
 }
 
 void seglog::close()
 {
+    end_room();
+    // A file stopped cleanly ends at its last record, the room this log made cut; one a crash left with its room is cut
+    // by the next open.
+    if (m_fd >= 0 && !m_failed && m_alloc > m_written && ::ftruncate(m_fd, static_cast<off_t>(m_written)) != 0) {}
     if (m_fd >= 0)
         ::close(m_fd);
     m_fd = -1;
@@ -263,8 +275,8 @@ void seglog::close()
     m_segs.clear();
     m_pending.clear();
     m_active = m_highest = 0;
-    m_written = 0;
-    m_failed = false;
+    m_written = m_alloc = 0;
+    m_failed = m_room_failed = false;
 }
 
 location seglog::append(std::string_view payload)
@@ -285,6 +297,9 @@ bool seglog::flush()
         return false;
     if (m_pending.empty())
         return true;
+    // Records never land where zeros are still being written.
+    if (m_room && (m_room->done.load(std::memory_order_acquire) || m_written + m_pending.size() > m_room->from))
+        end_room();
     // At the end the bytes before it name, so a write cut short and tried again cannot land twice.
     size_t done = 0;
     while (done < m_pending.size())
@@ -302,7 +317,45 @@ bool seglog::flush()
     }
     m_written += m_pending.size();
     m_pending.clear();
+    plan_room();
     return true;
+}
+
+void seglog::plan_room()
+{
+    if (m_room || m_room_failed || m_fd < 0 || m_alloc >= segment_bytes || m_alloc >= m_written + room_bytes / 2)
+        return;
+    auto job = std::make_unique<room_job>();
+    job->from = std::max(m_alloc, (m_written + room_lead + 4095) / 4096 * 4096);
+    job->to = job->from + room_bytes;
+    room_job* j = job.get();
+    const int fd = m_fd;
+    j->th = std::thread([j, fd] {
+        bool ok = true;
+        for (uint64_t at = j->from; ok && at < j->to;)
+        {
+            const ssize_t n = ::pwrite(fd, zeros, static_cast<size_t>(std::min<uint64_t>(sizeof zeros, j->to - at)),
+                                       static_cast<off_t>(at));
+            if (n < 0 && errno == EINTR)
+                continue;
+            ok = n > 0;
+            at += ok ? static_cast<uint64_t>(n) : 0;
+        }
+        j->ok = ok && ::fdatasync(fd) == 0;
+        j->done.store(true, std::memory_order_release);
+    });
+    m_room = std::move(job);
+}
+
+void seglog::end_room()
+{
+    if (!m_room)
+        return;
+    m_room->th.join();
+    if (m_room->ok)
+        m_alloc = std::max(m_alloc, m_room->to);
+    m_room_failed = !m_room->ok;
+    m_room.reset();
 }
 
 bool seglog::sync()
@@ -341,8 +394,11 @@ bool seglog::roll_if_full(std::string& why)
 {
     if (m_segs[m_active].size < segment_bytes)
         return true;
-    // The sealed segment's records are on the disk before any merge may count on them.
-    if (!sync())
+    // The sealed segment's records, and its end at the last of them, are on the disk before a newer one seals it.
+    const bool synced = sync();
+    // Zeros a room wrote after the cut would lengthen it again.
+    end_room();
+    if (!synced || ::ftruncate(m_fd, static_cast<off_t>(m_written)) != 0 || ::fsync(m_fd) != 0)
     {
         why = "the segment could not be written to the disk";
         return false;

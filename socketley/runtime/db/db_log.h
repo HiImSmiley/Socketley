@@ -4,12 +4,16 @@
 // old segments go.
 //
 // A segment is a header and records, each `u32 length | u32 crc32 | payload`: the CRC tells a record torn by a crash
-// from a whole one, and a torn tail of the newest segment is cut at the start. Damage anywhere else refuses the start.
+// from a whole one, and a torn tail of the newest segment is cut at the start, as is the room of zeros it was given
+// ahead of its records. Damage anywhere else refuses the start.
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace socketley::db
@@ -32,6 +36,8 @@ public:
     static constexpr size_t   max_record     = 64u << 20;
     // Past this the newest segment is closed and another begun.
     static constexpr uint64_t segment_bytes  = 64ull << 20;
+    // The room of zeros made ahead of the newest segment's records, this much at a time.
+    static constexpr uint64_t room_bytes     = 4ull << 20;
 
     using visitor = std::function<bool(uint32_t seg, uint64_t payload_off, std::string_view payload)>;
 
@@ -82,6 +88,9 @@ public:
 private:
     int fd_of(uint32_t seg);
     bool begin(uint32_t seg, std::string& why);
+    // Room asked for once the records near the end of what is made, and a finished or a needed one waited for.
+    void plan_room();
+    void end_room();
 
     std::string m_dir;
     // Every segment by number, with its size and a descriptor opened when first read.
@@ -97,6 +106,21 @@ private:
     // The newest segment's bytes from m_written on, appended and not yet written.
     std::string m_pending;
     uint64_t m_written{0};
+    // Zeros written and synced past the records off the loop, so a sync of records into them changes nothing else of
+    // the file, which on ext4 is a journal commit a sync saved.
+    struct room_job
+    {
+        uint64_t from{0};
+        uint64_t to{0};
+        bool ok{false};
+        std::atomic<bool> done{false};
+        std::thread th;
+    };
+    std::unique_ptr<room_job> m_room;
+    // A room that could not be made is not asked for again in this segment: its records are appended as they come.
+    bool m_room_failed{false};
+    // Below this the newest segment's file is records, or zeros on the disk.
+    uint64_t m_alloc{0};
     bool m_failed{false};
 };
 

@@ -482,6 +482,7 @@ TEST_CASE("queries: conditions, sorting and pages, with and without an index")
         REQUIRE(put(st, user(i % 2 ? "u1" : "u2"), "mine", ("m" + std::to_string(i)).c_str(),
                     "{\"level\":" + std::to_string(i) + "}") == 0);
     CHECK(ids_of(find(st, user("u1"), "mine", "{}")) == "m1 m3 ");
+    CHECK(ids_of(find(st, user("u1"), "mine", R"({"limit":1})")) == "m1 next=1");
     CHECK(ids_of(find(st, user("u1"), "mine", R"({"where":{"level":{"gte":0}},"sort":"-level"})")) == "m3 m1 ");
     CHECK(ids_of(find(st, key, "mine", R"({"where":{"_owner":"u2"}})")) == "m0 m2 ");
     CHECK(find(st, nobody, "mine", "{}") == "401");
@@ -523,7 +524,7 @@ TEST_CASE("queries: an index answers what a scan answers, over random documents 
     for (int i = 0; i < 2000; ++i)
     {
         std::string q = "{\"where\":{";
-        const int conds = 1 + static_cast<int>(rng() % 2);
+        const int conds = static_cast<int>(rng() % 3);
         for (int c = 0; c < conds; ++c)
         {
             const char* op = ops[rng() % std::size(ops)];
@@ -607,6 +608,23 @@ TEST_CASE("persistence: segments, and what a restart reads")
         CHECK(st.documents() == 3);
         CHECK(std::filesystem::file_size(seg) == size_before);
     }
+    // The room of zeros a crash left past the newest segment's last record is cut, its documents kept.
+    {
+        tmpdir copy;
+        {
+            store st;
+            REQUIRE_MESSAGE(st.open(t.path, schema{}, why), why);
+            REQUIRE(put(st, key, "a", "room", R"({"r":1})") == 0);
+            REQUIRE(st.sync());
+        }
+        std::filesystem::copy_file(seg, copy.path + "/seg-00000001.log");
+        std::filesystem::resize_file(copy.path + "/seg-00000001.log", std::filesystem::file_size(seg) + (1u << 20));
+        store st;
+        REQUIRE_MESSAGE(st.open(copy.path, schema{}, why), why);
+        CHECK(st.documents() == 4);
+        CHECK(get(st, key, "a", "room").find("\"r\":1") != std::string::npos);
+        CHECK(std::filesystem::file_size(copy.path + "/seg-00000001.log") == std::filesystem::file_size(seg));
+    }
     // A segment that is not one is refused rather than read in part.
     {
         std::fstream f(seg, std::ios::in | std::ios::out | std::ios::binary);
@@ -636,6 +654,9 @@ TEST_CASE("segments: rolled, merged off the loop, and read back across a restart
             const std::string body = "{\"n\":" + std::to_string(i) + ",\"pad\":\"" + pad + "\"}";
             REQUIRE(put(st, key, "big", id.c_str(), body) == 0);
             want[id] = std::to_string(i);
+            // Synced as a loop would, so rooms are made ahead of the records across the segments' rolls.
+            if (i % 64 == 0)
+                REQUIRE(st.sync());
         }
         REQUIRE(st.sync());
         CHECK(st.segments() > 2);
