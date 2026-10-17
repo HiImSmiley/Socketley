@@ -258,6 +258,7 @@ void db_run::stop()
         all.push_back(c);
     for (auto& c : all)
         close_conn(c);
+    m_feeds.clear();
     for (auto& j : m_jobs)
         m_store.finish(*j->job);
     m_jobs.clear();
@@ -445,9 +446,10 @@ void db_run::publish()
     {
         event e = std::move(m_unpublished.front());
         m_unpublished.pop_front();
-        for (auto& [id, c] : m_conns)
+        for (size_t i = 0; i < m_feeds.size(); ++i)
         {
-            if (!c->feed || c->dead || !c->dump.empty() || !sees(*c, e))
+            const std::shared_ptr<conn> c = m_feeds[i];
+            if (c->dead || !c->dump.empty() || !sees(*c, e))
                 continue;
             send_event(*c, e);
             // A stream that reads slower than changes come is let go; it resumes from the last one it read.
@@ -466,7 +468,7 @@ void db_run::publish()
             m_history.pop_front();
         }
     }
-    // Erased during the walk above leaves the map unchanged: close_conn() keeps a closed stream until its reads end.
+    std::erase_if(m_feeds, [](const std::shared_ptr<conn>& c) { return c->dead; });
 }
 
 void db_run::open_feed(const std::shared_ptr<conn>& c, const request& rq, std::string coll, bool all, bool replica)
@@ -494,6 +496,7 @@ void db_run::open_feed(const std::shared_ptr<conn>& c, const request& rq, std::s
         }
     }
     c->feed = true;
+    m_feeds.push_back(c);
     c->all = all;
     c->replica = replica;
     c->coll = std::move(coll);
@@ -1230,23 +1233,22 @@ void db_run::tick()
     if (m_stopped)
         return;
     const int64_t now = now_sec();
+    // A comment now and then, so a stream nothing changes on is not taken for a dead one.
+    for (size_t i = 0; i < m_feeds.size(); ++i)
+    {
+        const std::shared_ptr<conn> c = m_feeds[i];
+        if (!c->dead && now - c->last >= 15)
+        {
+            c->last = now;
+            c->out += ": ping\n\n";
+            flush(c);
+        }
+    }
+    std::erase_if(m_feeds, [](const std::shared_ptr<conn>& c) { return c->dead; });
     std::vector<std::shared_ptr<conn>> idle;
     for (auto& [id, c] : m_conns)
-    {
-        if (c->feed)
-        {
-            // A comment now and then, so a stream nothing changes on is not taken for a dead one.
-            if (now - c->last >= 15)
-            {
-                c->last = now;
-                c->out += ": ping\n\n";
-                flush(c);
-            }
-            continue;
-        }
-        if (now - c->last > idle_secs && !c->waiting && c->out_off >= c->out.size())
+        if (!c->feed && now - c->last > idle_secs && !c->waiting && c->out_off >= c->out.size())
             idle.push_back(c);
-    }
     for (auto& c : idle)
         close_conn(c);
     // A replica is told of the documents that go by the database it copies, which sends their deletions.

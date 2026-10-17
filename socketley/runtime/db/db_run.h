@@ -177,6 +177,9 @@ private:
     io_request m_accept_req{};
     bool m_accept_pending{false};
     std::unordered_map<uint64_t, std::shared_ptr<conn>> m_conns;
+    // The connections streaming changes, so a change is offered to them and not to every connection; one closed stays
+    // until the walk after it, since close_conn() may run inside a walk.
+    std::vector<std::shared_ptr<conn>> m_feeds;
     std::vector<std::shared_ptr<conn>> m_closing;
     uint64_t m_next_id{1};
 
