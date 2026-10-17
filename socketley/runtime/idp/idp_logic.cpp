@@ -6,7 +6,8 @@
 #include <openssl/bn.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
-#include <openssl/hmac.h>
+#include <openssl/core_names.h>
+#include <openssl/params.h>
 
 #include "../../shared/jws.h"
 #include "../storage/json_doc.h"
@@ -212,25 +213,31 @@ std::string html_escape(std::string_view in)
 std::string json_string(std::string_view in)
 {
     static constexpr char hex[] = "0123456789abcdef";
-    std::string out = "\"";
-    for (const char c : in)
+    std::string out;
+    out.reserve(in.size() + 2);
+    out += '"';
+    size_t from = 0;
+    for (size_t i = 0; i < in.size(); ++i)
     {
-        const auto u = static_cast<unsigned char>(c);
-        if (c == '"' || c == '\\')
+        const auto u = static_cast<unsigned char>(in[i]);
+        if (u >= 0x20 && u != '"' && u != '\\')
+            continue;
+        out.append(in, from, i - from);
+        from = i + 1;
+        if (u < 0x20)
         {
-            out += '\\';
-            out += c;
-        }
-        else if (u < 0x20)
-        {
-            out += "\\u00";
-            out += hex[u >> 4];
-            out += hex[u & 15];
+            const char esc[] = {'\\', 'u', '0', '0', hex[u >> 4], hex[u & 15]};
+            out.append(esc, sizeof esc);
         }
         else
-            out += c;
+        {
+            out += '\\';
+            out += static_cast<char>(u);
+        }
     }
-    return out + "\"";
+    out.append(in, from, in.size() - from);
+    out += '"';
+    return out;
 }
 
 bool pkce_matches(std::string_view verifier, std::string_view challenge)
@@ -307,8 +314,14 @@ bool return_allowed(std::string_view url, std::string_view issuer, std::string_v
 
 std::string sign_token(EVP_PKEY* key, std::string_view kid, std::string_view typ, std::string_view body)
 {
-    const std::string header = "{\"alg\":\"ES256\",\"kid\":" + json_string(kid) + ",\"typ\":" + json_string(typ) + "}";
-    return socketley::jws::compact(key, header, "{" + std::string(body) + "}");
+    std::string header;
+    header.reserve(kid.size() + typ.size() + 40);
+    header.append("{\"alg\":\"ES256\",\"kid\":").append(json_string(kid)).append(",\"typ\":").append(json_string(typ));
+    header += '}';
+    std::string payload;
+    payload.reserve(body.size() + 2);
+    payload.append("{").append(body).append("}");
+    return socketley::jws::compact(key, header, payload);
 }
 
 namespace
@@ -399,13 +412,51 @@ bool read_token(std::string_view want_alg, std::string_view kid, std::string_vie
     return true;
 }
 
+// The MAC this thread made last and its key, kept since making one looks HMAC and SHA-256 up by name every time.
+struct mac_context
+{
+    std::string key;
+    EVP_MAC_CTX* ctx{nullptr};
+    ~mac_context()
+    {
+        EVP_MAC_CTX_free(ctx);
+        OPENSSL_cleanse(key.data(), key.size());
+    }
+};
+thread_local mac_context t_mac;
+
 std::string hs256(std::string_view secret, std::string_view input)
 {
-    unsigned char md[EVP_MAX_MD_SIZE];
-    unsigned int n = 0;
-    if (!HMAC(EVP_sha256(), secret.data(), static_cast<int>(secret.size()),
-              reinterpret_cast<const unsigned char*>(input.data()), input.size(), md, &n))
+    if (!t_mac.ctx)
+    {
+        EVP_MAC* mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
+        t_mac.ctx = mac ? EVP_MAC_CTX_new(mac) : nullptr;
+        EVP_MAC_free(mac);
+        if (!t_mac.ctx)
+            return {};
+    }
+    bool ready = false;
+    if (t_mac.key == secret && !t_mac.key.empty())
+        ready = EVP_MAC_init(t_mac.ctx, nullptr, 0, nullptr) == 1;
+    else
+    {
+        char digest[] = "SHA256";
+        const OSSL_PARAM params[] = {OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest, 0),
+                                     OSSL_PARAM_construct_end()};
+        OPENSSL_cleanse(t_mac.key.data(), t_mac.key.size());
+        t_mac.key.clear();
+        ready = EVP_MAC_init(t_mac.ctx, reinterpret_cast<const unsigned char*>(secret.data()), secret.size(), params) == 1;
+        if (ready)
+            t_mac.key.assign(secret);
+    }
+    unsigned char md[32];
+    size_t n = 0;
+    if (!ready || EVP_MAC_update(t_mac.ctx, reinterpret_cast<const unsigned char*>(input.data()), input.size()) != 1 ||
+        EVP_MAC_final(t_mac.ctx, md, &n, sizeof md) != 1 || n != sizeof md)
+    {
+        t_mac.key.clear();
         return {};
+    }
     return std::string(reinterpret_cast<const char*>(md), n);
 }
 
@@ -465,9 +516,16 @@ std::string token_secret(EVP_PKEY* key)
 std::string sign_secret_token(std::string_view secret, std::string_view typ, std::string_view body)
 {
     const std::string header = "{\"alg\":\"HS256\",\"kid\":\"self\",\"typ\":" + json_string(typ) + "}";
-    const std::string input =
-        socketley::jws::b64url(header) + "." + socketley::jws::b64url("{" + std::string(body) + "}");
-    return input + "." + socketley::jws::b64url(hs256(secret, input));
+    std::string payload;
+    payload.reserve(body.size() + 2);
+    payload.append("{").append(body).append("}");
+    std::string out = socketley::jws::b64url(header);
+    out += '.';
+    out += socketley::jws::b64url(payload);
+    const std::string mac = hs256(secret, out);
+    out += '.';
+    out += socketley::jws::b64url(mac);
+    return out;
 }
 
 bool verify_secret_token(std::string_view secret, std::string_view typ, std::string_view issuer, std::string_view token,

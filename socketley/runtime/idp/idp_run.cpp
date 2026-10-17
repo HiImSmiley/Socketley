@@ -185,6 +185,7 @@ bool idp_run::start(std::string& why)
     m_shard = m_owner.get_shard_index();
     m_reader = m_shards > 1 && m_shard > 0;
     m_issuer = m_owner.issuer();
+    m_issuer_json = json_string(m_issuer);
     m_cookie_domain = std::string(m_owner.get_cookie_domain());
     m_secure_cookie = m_issuer.starts_with("https://");
 
@@ -840,7 +841,7 @@ std::string idp_run::session_cookie(const account& who, bool remember) const
     const int64_t now = now_sec();
     const int64_t life = remember ? remember_secs : session_secs;
     // What a proxy or a storage verifying the cookie on its own needs: the id, the username and the admin bit.
-    const std::string body = "\"iss\":" + json_string(m_issuer) + ",\"aud\":\"session\",\"sub\":" +
+    const std::string body = "\"iss\":" + m_issuer_json + ",\"aud\":\"session\",\"sub\":" +
                              json_string(who.id) + ",\"preferred_username\":" + json_string(who.username()) +
                              ",\"email\":" + json_string(who.field("email")) + ",\"admin\":" +
                              (who.in_group("admins") ? "true" : "false") + ",\"iat\":" + std::to_string(now) +
@@ -1206,31 +1207,42 @@ void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, con
     const int64_t now = now_sec();
     const std::string jti = random_token();
     const std::string profile = profile_claims(who);
-    const std::string common = "\"iss\":" + json_string(m_issuer) + ",\"sub\":" + json_string(who.id) +
-                               ",\"iat\":" + std::to_string(now) + ",\"iat_ms\":" + std::to_string(now_ms()) +
-                               ",\"auth_time\":" + std::to_string(e.auth_time);
-    const std::string id_token = sign_token(m_key, m_kid, "JWT",
-                                            common + ",\"aud\":" + json_string(cl.id) + ",\"exp\":" +
-                                                std::to_string(now + token_secs) +
-                                                (e.nonce.empty() ? "" : ",\"nonce\":" + json_string(e.nonce)) +
-                                                profile);
-    const std::string access = sign_token(m_key, m_kid, "at+jwt",
-                                          common + ",\"aud\":" + json_string(cl.id) + ",\"client_id\":" +
-                                              json_string(cl.id) + ",\"scope\":" + json_string(e.scope) +
-                                              ",\"jti\":" + json_string(jti) + ",\"exp\":" +
-                                              std::to_string(now + token_secs) + profile);
-    std::string body = "{\"access_token\":" + json_string(access) + ",\"token_type\":\"Bearer\",\"expires_in\":" +
-                       std::to_string(token_secs) + ",\"id_token\":" + json_string(id_token) +
-                       ",\"scope\":" + json_string(e.scope);
+    const std::string aud = json_string(cl.id);
+    const std::string scope = json_string(e.scope);
+    const std::string exp = std::to_string(now + token_secs);
+    std::string common;
+    common.reserve(256);
+    common.append("\"iss\":").append(m_issuer_json).append(",\"sub\":").append(json_string(who.id));
+    common.append(",\"iat\":").append(std::to_string(now)).append(",\"iat_ms\":").append(std::to_string(now_ms()));
+    common.append(",\"auth_time\":").append(std::to_string(e.auth_time));
+    // Each token's claims made in the one string, the common ones first.
+    std::string claims;
+    claims.reserve(common.size() + profile.size() + 256);
+    claims.assign(common).append(",\"aud\":").append(aud).append(",\"exp\":").append(exp);
+    if (!e.nonce.empty())
+        claims.append(",\"nonce\":").append(json_string(e.nonce));
+    claims.append(profile);
+    const std::string id_token = sign_token(m_key, m_kid, "JWT", claims);
+    claims.assign(common).append(",\"aud\":").append(aud).append(",\"client_id\":").append(aud);
+    claims.append(",\"scope\":").append(scope).append(",\"jti\":\"").append(jti).append("\",\"exp\":").append(exp);
+    claims.append(profile);
+    const std::string access = sign_token(m_key, m_kid, "at+jwt", claims);
+    std::string refresh;
     if (has_scope(e.scope, "offline_access") || !cl.is_public())
     {
-        const std::string refresh = sign_secret_token(m_secret, "refresh+jwt",
-                                               common + ",\"aud\":\"refresh\",\"client_id\":" + json_string(cl.id) +
-                                                   ",\"scope\":" + json_string(e.scope) + ",\"exp\":" +
-                                                   std::to_string(now + refresh_secs));
-        body += ",\"refresh_token\":" + json_string(refresh);
+        claims.assign(common).append(",\"aud\":\"refresh\",\"client_id\":").append(aud).append(",\"scope\":");
+        claims.append(scope).append(",\"exp\":").append(std::to_string(now + refresh_secs));
+        refresh = sign_secret_token(m_secret, "refresh+jwt", claims);
     }
-    body += "}";
+    // A token is base64url and dots, which a JSON string holds as they are.
+    std::string body;
+    body.reserve(access.size() + id_token.size() + refresh.size() + scope.size() + 128);
+    body.append("{\"access_token\":\"").append(access).append("\",\"token_type\":\"Bearer\",\"expires_in\":");
+    body.append(std::to_string(token_secs)).append(",\"id_token\":\"").append(id_token).append("\",\"scope\":");
+    body.append(scope);
+    if (!refresh.empty())
+        body.append(",\"refresh_token\":\"").append(refresh).append("\"");
+    body += '}';
     ++m_c.tokens;
     respond(c, 200, "application/json", body, "Access-Control-Allow-Origin: *\r\n");
 }

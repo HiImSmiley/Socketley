@@ -455,3 +455,69 @@ TEST_CASE("the shards' questions and answers come back as they were sent")
     CHECK_FALSE(code_shard("1.abcdef", 1, shard));
     CHECK_FALSE(code_shard("x.abcdef", 4, shard));
 }
+
+TEST_CASE("signing with one key, then another, then the first, signs each with its own")
+{
+    EVP_PKEY* a = fresh_key();
+    EVP_PKEY* b = fresh_key();
+    REQUIRE(a);
+    REQUIRE(b);
+    for (int round = 0; round < 2; ++round)
+    {
+        const std::string sa = socketley::jws::es256(a, "input");
+        const std::string sb = socketley::jws::es256(b, "input");
+        REQUIRE(sa.size() == 64);
+        REQUIRE(sb.size() == 64);
+        CHECK(socketley::jws::es256_verify(a, "input", sa));
+        CHECK(socketley::jws::es256_verify(b, "input", sb));
+        CHECK_FALSE(socketley::jws::es256_verify(b, "input", sa));
+        CHECK_FALSE(socketley::jws::es256_verify(a, "input", sb));
+        CHECK_FALSE(socketley::jws::es256_verify(a, "other", sa));
+    }
+    // A signature whose r or s is short, which DER writes without its leading zeros, is padded on the left.
+    int short_ones = 0;
+    for (int i = 0; i < 600 && short_ones < 2; ++i)
+    {
+        const std::string in = "n" + std::to_string(i);
+        const std::string s = socketley::jws::es256(a, in);
+        REQUIRE(socketley::jws::es256_verify(a, in, s));
+        if (s[0] == '\0' || s[32] == '\0')
+            ++short_ones;
+    }
+    CHECK(short_ones > 0);
+    EVP_PKEY_free(a);
+    EVP_PKEY_free(b);
+}
+
+TEST_CASE("a token signed under one secret, then another, verifies under its own alone")
+{
+    claims c;
+    std::string why;
+    const std::string body = "\"iss\":\"https://id.example\",\"sub\":\"a\",\"exp\":2000";
+    for (int round = 0; round < 2; ++round)
+    {
+        const std::string t1 = sign_secret_token("secret-one", "refresh+jwt", body);
+        const std::string t2 = sign_secret_token("secret-two", "refresh+jwt", body);
+        CHECK(t1 != t2);
+        CHECK(verify_secret_token("secret-one", "refresh+jwt", "https://id.example", t1, 1000, c, why));
+        CHECK(verify_secret_token("secret-two", "refresh+jwt", "https://id.example", t2, 1000, c, why));
+        CHECK_FALSE(verify_secret_token("secret-two", "refresh+jwt", "https://id.example", t1, 1000, c, why));
+        CHECK_FALSE(verify_secret_token("secret-one", "refresh+jwt", "https://id.example", t2, 1000, c, why));
+    }
+}
+
+TEST_CASE("a JSON string escapes quotes, backslashes and control characters, and keeps the rest as it is")
+{
+    CHECK(json_string("") == "\"\"");
+    CHECK(json_string("plain") == "\"plain\"");
+    CHECK(json_string("a\"b\\c") == "\"a\\\"b\\\\c\"");
+    CHECK(json_string(std::string_view("x\ny\x01", 4)) == "\"x\\u000ay\\u0001\"");
+    CHECK(json_string("\"") == "\"\\\"\"");
+    CHECK(json_string("ünï") == "\"ünï\"");
+    CHECK(socketley::jws::b64url("") == "");
+    CHECK(socketley::jws::b64url("f") == "Zg");
+    CHECK(socketley::jws::b64url("fo") == "Zm8");
+    CHECK(socketley::jws::b64url("foo") == "Zm9v");
+    CHECK(socketley::jws::b64url("foob") == "Zm9vYg");
+    CHECK(socketley::jws::b64url("\xfb\xff") == "-_8");
+}

@@ -175,6 +175,7 @@ private:
     hash_pool m_hash;
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
     std::string m_issuer;
+    std::string m_issuer_json;
     std::string m_cookie_domain;
     bool m_secure_cookie{true};
 

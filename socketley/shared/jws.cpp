@@ -1,6 +1,7 @@
 #include "jws.h"
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fcntl.h>
 #include <unistd.h>
@@ -20,29 +21,30 @@ namespace socketley::jws
 std::string b64url(std::string_view in)
 {
     static constexpr char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    std::string out;
-    out.reserve((in.size() + 2) / 3 * 4);
+    std::string out(in.size() / 3 * 4 + (in.size() % 3 ? in.size() % 3 + 1 : 0), '\0');
+    const auto* p = reinterpret_cast<const uint8_t*>(in.data());
+    char* o = out.data();
     size_t i = 0;
     for (; i + 2 < in.size(); i += 3)
     {
-        const uint32_t v = (uint8_t(in[i]) << 16) | (uint8_t(in[i + 1]) << 8) | uint8_t(in[i + 2]);
-        out += tbl[v >> 18];
-        out += tbl[(v >> 12) & 63];
-        out += tbl[(v >> 6) & 63];
-        out += tbl[v & 63];
+        const uint32_t v = (uint32_t(p[i]) << 16) | (uint32_t(p[i + 1]) << 8) | p[i + 2];
+        *o++ = tbl[v >> 18];
+        *o++ = tbl[(v >> 12) & 63];
+        *o++ = tbl[(v >> 6) & 63];
+        *o++ = tbl[v & 63];
     }
     if (i + 1 == in.size())
     {
-        const uint32_t v = uint8_t(in[i]) << 16;
-        out += tbl[v >> 18];
-        out += tbl[(v >> 12) & 63];
+        const uint32_t v = uint32_t(p[i]) << 16;
+        *o++ = tbl[v >> 18];
+        *o++ = tbl[(v >> 12) & 63];
     }
     else if (i + 2 == in.size())
     {
-        const uint32_t v = (uint8_t(in[i]) << 16) | (uint8_t(in[i + 1]) << 8);
-        out += tbl[v >> 18];
-        out += tbl[(v >> 12) & 63];
-        out += tbl[(v >> 6) & 63];
+        const uint32_t v = (uint32_t(p[i]) << 16) | (uint32_t(p[i + 1]) << 8);
+        *o++ = tbl[v >> 18];
+        *o++ = tbl[(v >> 12) & 63];
+        *o++ = tbl[(v >> 6) & 63];
     }
     return out;
 }
@@ -159,30 +161,83 @@ std::string thumbprint(EVP_PKEY* k)
     return b64url(sha256(jwk_of(k)));
 }
 
+namespace
+{
+
+// The context of the key this thread signed with last, which holds a reference to it so no other key takes its
+// address, kept since making one looks the digest and the signature up by name every time.
+struct sign_context
+{
+    EVP_PKEY* key{nullptr};
+    EVP_PKEY_CTX* ctx{nullptr};
+    EVP_MD* sha256{nullptr};
+    ~sign_context()
+    {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_MD_free(sha256);
+    }
+};
+thread_local sign_context t_sign;
+
+// r and s of a DER ECDSA signature, each 32 bytes from the left, into `out`; false for anything else.
+bool raw_of_der(const unsigned char* p, size_t n, char* out)
+{
+    // A P-256 signature is under 128 bytes, so every length is one byte.
+    if (n < 8 || p[0] != 0x30 || p[1] != n - 2)
+        return false;
+    size_t at = 2;
+    for (int i = 0; i < 2; ++i)
+    {
+        if (n - at < 2 || p[at] != 0x02)
+            return false;
+        size_t len = p[at + 1];
+        at += 2;
+        if (len == 0 || len > 33 || n - at < len)
+            return false;
+        const unsigned char* v = p + at;
+        at += len;
+        for (; len > 32; --len, ++v)
+            if (*v != 0)
+                return false;
+        std::memset(out + 32 * i, 0, 32 - len);
+        std::memcpy(out + 32 * i + 32 - len, v, len);
+    }
+    return at == n;
+}
+
+}   // namespace
+
 std::string es256(EVP_PKEY* k, std::string_view input)
 {
-    EVP_MD_CTX* md = EVP_MD_CTX_new();
-    size_t n = 0;
-    std::string der;
-    if (EVP_DigestSignInit(md, nullptr, EVP_sha256(), nullptr, k) == 1 &&
-        EVP_DigestSign(md, nullptr, &n, reinterpret_cast<const unsigned char*>(input.data()), input.size()) == 1)
-    {
-        der.resize(n);
-        if (EVP_DigestSign(md, reinterpret_cast<unsigned char*>(der.data()), &n,
-                           reinterpret_cast<const unsigned char*>(input.data()), input.size()) == 1)
-            der.resize(n);
-        else
-            der.clear();
-    }
-    EVP_MD_CTX_free(md);
-    const unsigned char* p = reinterpret_cast<const unsigned char*>(der.data());
-    ECDSA_SIG* sig = der.empty() ? nullptr : d2i_ECDSA_SIG(nullptr, &p, static_cast<long>(der.size()));
-    if (!sig)
+    if (!k)
         return {};
+    if (t_sign.key != k)
+    {
+        EVP_PKEY_CTX_free(t_sign.ctx);
+        t_sign.key = nullptr;
+        t_sign.ctx = EVP_PKEY_CTX_new_from_pkey(nullptr, k, nullptr);
+        if (!t_sign.ctx || EVP_PKEY_sign_init(t_sign.ctx) != 1)
+        {
+            EVP_PKEY_CTX_free(t_sign.ctx);
+            t_sign.ctx = nullptr;
+            return {};
+        }
+        t_sign.key = k;
+    }
+    if (!t_sign.sha256)
+        t_sign.sha256 = EVP_MD_fetch(nullptr, "SHA256", nullptr);
+    unsigned char digest[32];
+    unsigned int dn = 0;
+    if (!t_sign.sha256 || EVP_Digest(input.data(), input.size(), digest, &dn, t_sign.sha256, nullptr) != 1 || dn != 32)
+        return {};
+    unsigned char der[80];
+    size_t n = sizeof der;
     std::string raw(64, '\0');
-    BN_bn2binpad(ECDSA_SIG_get0_r(sig), reinterpret_cast<unsigned char*>(raw.data()), 32);
-    BN_bn2binpad(ECDSA_SIG_get0_s(sig), reinterpret_cast<unsigned char*>(raw.data()) + 32, 32);
-    ECDSA_SIG_free(sig);
+    if (EVP_PKEY_sign(t_sign.ctx, der, &n, digest, sizeof digest) != 1 || !raw_of_der(der, n, raw.data()))
+    {
+        ERR_clear_error();
+        return {};
+    }
     return raw;
 }
 
@@ -217,7 +272,9 @@ bool es256_verify(EVP_PKEY* k, std::string_view input, std::string_view sig)
 
 std::string compact(EVP_PKEY* k, std::string_view header, std::string_view payload)
 {
-    std::string out = b64url(header);
+    std::string out;
+    out.reserve((header.size() + payload.size()) / 3 * 4 + 96);
+    out += b64url(header);
     out += '.';
     out += b64url(payload);
     const std::string sig = es256(k, out);
