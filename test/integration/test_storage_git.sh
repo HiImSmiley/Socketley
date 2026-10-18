@@ -165,6 +165,36 @@ sleep 1
 SOCKETLEY_GIT_ACCESS_KEY=$ALICE_K SOCKETLEY_GIT_SECRET=$ALICE_S "$BIN" git-sync --url "git://127.0.0.1:$GP/demo.git" \
     --branch main --work "$T/byhand" --endpoint "127.0.0.1:$ST" --bucket code --name demo > "$T/byhand.out" 2>&1
 expect "git-sync by hand, with its own clone, ends well" "$?" 0
+# A listener with a certificate nobody vouches for is not handed the credentials when no --ca names it.
+TP=$((P+5))
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=impostor" -days 1 \
+    -keyout "$T/imp.key" -out "$T/imp.crt" >/dev/null 2>&1
+python3 - "$TP" "$T/imp.crt" "$T/imp.key" "$T/imp.log" <<'PY' &
+import socket, ssl, sys
+port, crt, key, log = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(crt, key)
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", port)); s.listen(4)
+s.settimeout(20)
+while True:
+    try:
+        c, _ = s.accept()
+    except Exception:
+        break
+    try:
+        t = ctx.wrap_socket(c, server_side=True); t.settimeout(3)
+        open(log, "ab").write(t.recv(65536) or b"")
+    except Exception:
+        pass
+PY
+IMP=$!
+for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/$TP) 2>/dev/null && break; sleep 0.1; done
+: > "$T/imp.log"
+out=$(SOCKETLEY_GIT_ACCESS_KEY=$ALICE_K SOCKETLEY_GIT_SECRET=$ALICE_S "$BIN" git-sync --url "git://127.0.0.1:$GP/demo.git" \
+    --branch main --work "$T/impostor" --endpoint "127.0.0.1:$TP" --tls --bucket code --name demo 2>&1); rc=$?
+kill $IMP 2>/dev/null
+[ "$rc" -ne 0 ] && ok "git-sync --tls without --ca refuses a certificate the system does not trust" \
+    || bad "git-sync --tls without --ca refuses a certificate the system does not trust" "rc $rc: $out"
+expect "and sends it nothing" "$(grep -c "$ALICE_K" "$T/imp.log")" 0
 left=$(bundles)
 # The runs' own, by their commit rather than their date, which is yesterday's for a run just before midnight.
 expect "the last day's bundles all stay, its own among them" "$(echo "$left" | grep '\.bundle$' | grep -vc '_0000000000\.bundle$')" 3

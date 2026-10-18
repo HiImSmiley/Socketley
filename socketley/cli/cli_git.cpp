@@ -24,6 +24,7 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -276,14 +277,35 @@ private:
                         return false;
                     }
                     X509_STORE_set_flags(SSL_CTX_get_cert_store(m_ctx), X509_V_FLAG_PARTIAL_CHAIN);
-                    SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
                 }
+                // Without the runtime's own certificate the system's roots and the endpoint's name vouch for it.
+                else if (m_ctx && SSL_CTX_set_default_verify_paths(m_ctx) != 1)
+                {
+                    m_error = "the system's certificate roots cannot be read; give the runtime's certificate with --ca";
+                    drop();
+                    return false;
+                }
+                if (m_ctx)
+                    SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
             }
             m_ssl = m_ctx ? SSL_new(m_ctx) : nullptr;
+            if (m_ssl && m_ca.empty())
+            {
+                X509_VERIFY_PARAM* vp = SSL_get0_param(m_ssl);
+                X509_VERIFY_PARAM_set_hostflags(vp, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+                const bool ip = X509_VERIFY_PARAM_set1_ip_asc(vp, m_host.c_str()) == 1;
+                if (!ip && (SSL_set_tlsext_host_name(m_ssl, m_host.c_str()) != 1 || SSL_set1_host(m_ssl, m_host.c_str()) != 1))
+                {
+                    SSL_free(m_ssl);
+                    m_ssl = nullptr;
+                }
+            }
             if (!m_ssl || SSL_set_fd(m_ssl, m_fd) != 1 || SSL_connect(m_ssl) != 1)
             {
                 ERR_clear_error();
-                m_error = "TLS to the runtime failed";
+                m_error = m_ca.empty() ? "TLS to the runtime failed; a certificate the system does not trust for " +
+                                             m_host + " needs --ca"
+                                       : "TLS to the runtime failed";
                 drop();
                 return false;
             }
