@@ -18,6 +18,7 @@
 #include "../../shared/storage/s3_sigv4.h"
 #include "../../shared/util/hex.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/number_parse.h"
 
 namespace socketley::storage
 {
@@ -228,8 +229,8 @@ replicator::replicator(event_loop& loop, file_io& io, io_handler* owner, object_
 {
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_REPLICATION_HOSTS"))
         m_hosts_file = e;
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_CLUSTER_QUEUE"))
-        m_node_queue_max = std::max<size_t>(std::strtoul(e, nullptr, 10), 1);
+    if (const auto v = getenv_whole<size_t>("SOCKETLEY_STORAGE_CLUSTER_QUEUE", 1))
+        m_node_queue_max = *v;
 }
 
 replicator::~replicator()

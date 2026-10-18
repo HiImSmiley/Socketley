@@ -33,6 +33,7 @@
 #include "../../shared/http/status.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/number_parse.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -87,13 +88,8 @@ namespace
 // cores; none to hash on the loop.
 unsigned hash_threads(uint32_t shards)
 {
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_HASH_THREADS"))
-    {
-        char* end;
-        const long v = std::strtol(e, &end, 10);
-        if (end != e && v >= 0 && v <= 16)
-            return static_cast<unsigned>(v);
-    }
+    if (const auto v = getenv_whole<unsigned>("SOCKETLEY_STORAGE_HASH_THREADS", 0, 16))
+        return *v;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
     return std::clamp(cpus / std::max<uint32_t>(shards, 1), 1u, 3u);
 }
@@ -143,13 +139,8 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
         return m_auth->max_bytes_of(owner);
     });
     m_lc_day_ms = lifecycle_day_ms;
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS"))
-    {
-        char* end;
-        const long v = std::strtol(e, &end, 10);
-        if (end != e && v > 0 && v <= 86400)
-            m_lc_day_ms = static_cast<int64_t>(v) * 1000;
-    }
+    if (const auto v = getenv_whole<int64_t>("SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS", 1, 86400))
+        m_lc_day_ms = *v * 1000;
     m_tier.set_day_ms(m_lc_day_ms);
     m_rid_seq = random_u64();
     m_store.set_hash_pool(&m_hash);
@@ -161,22 +152,12 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
     m_max_conns = m_owner.get_max_connections();
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_HTTP2"))
         m_h2 = std::string_view(e) != "0";
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_SPLICE_MIN"))
-    {
-        char* end;
-        const long v = std::strtol(e, &end, 10);
-        if (end != e && v >= 0)
-            m_zero_copy_min = static_cast<size_t>(v);
-    }
+    if (const auto v = getenv_whole<size_t>("SOCKETLEY_STORAGE_SPLICE_MIN"))
+        m_zero_copy_min = *v;
     // A count the tests shrink to make the ring run dry; zero takes it away.
     uint32_t ring_bufs = ring_buf_count;
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_RECV_BUFS"))
-    {
-        char* end;
-        const long v = std::strtol(e, &end, 10);
-        if (end != e && v >= 0 && v <= 4096 && (v & (v - 1)) == 0)
-            ring_bufs = static_cast<uint32_t>(v);
-    }
+    if (const auto v = getenv_whole<uint32_t>("SOCKETLEY_STORAGE_RECV_BUFS", 0, 4096); v && (*v & (*v - 1)) == 0)
+        ring_bufs = *v;
     m_ring      = ring_bufs != 0 && m_loop.setup_buf_ring(ring_group, ring_bufs, ring_buf_bytes);
     m_multishot = m_ring && m_loop.recv_multishot_enabled();
 }
@@ -740,9 +721,8 @@ void storage_run::stop()
     while (m_store.busy() && std::chrono::steady_clock::now() < give_up)
         m_loop.poll_completions(10);
     // A test's stop held past its drain, longer the higher the shard, so a start beside it meets shards that let go one by one.
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_STOP_HOLD_MS"))
-        std::this_thread::sleep_for(std::chrono::milliseconds(std::clamp(std::strtol(e, nullptr, 10), 0L, 3000L) *
-                                                              (m_store.options().shard + 1)));
+    if (const auto v = getenv_whole<long>("SOCKETLEY_STORAGE_STOP_HOLD_MS", 0))
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::min(*v, 3000L) * (m_store.options().shard + 1)));
 
     // The digest threads end first, so none of them writes to a descriptor the
     // loop is about to close, and the read waiting on it is cancelled with it.

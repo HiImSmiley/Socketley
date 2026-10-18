@@ -26,6 +26,7 @@
 #include "../cli/command_hashing.h"
 #include "../runtime/worker/worker_main.h"
 #include "../shared/loop/eventfd_wake.h"
+#include "../shared/util/number_parse.h"
 
 #include <csignal>
 #include <cstdlib>
@@ -851,10 +852,10 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     if (raft_cfg.enabled())
     {
         raft_cfg.dir = (paths.state_dir / "raft").string();
-        if (const char* t = std::getenv("SOCKETLEY_RAFT_TICK_MS"); t && std::atoi(t) > 0)
-            raft_cfg.tick_ms = static_cast<uint32_t>(std::atoi(t));
-        if (const char* c = std::getenv("SOCKETLEY_RAFT_COMPACT_EVERY"); c && std::atoll(c) > 0)
-            raft_cfg.compact_every = static_cast<uint64_t>(std::atoll(c));
+        if (const auto v = socketley::getenv_whole<uint32_t>("SOCKETLEY_RAFT_TICK_MS", 1))
+            raft_cfg.tick_ms = *v;
+        if (const auto v = socketley::getenv_whole<uint64_t>("SOCKETLEY_RAFT_COMPACT_EVERY", 1))
+            raft_cfg.compact_every = *v;
         if (const std::string why = raft_timing_refusal(raft_cfg); !why.empty())
         {
             std::cout << why;

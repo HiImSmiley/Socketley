@@ -32,6 +32,7 @@
 #include "../../shared/util/base64.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/crypto/mac.h"
+#include "../../shared/util/number_parse.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -215,11 +216,7 @@ int64_t burn_grace_ms()
 {
     static const int64_t ms = []
     {
-        const char* e = std::getenv("SOCKETLEY_SHARE_BURN_GRACE_SECS");
-        int64_t secs = 600;
-        if (e && *e)
-            std::from_chars(e, e + std::strlen(e), secs);
-        return std::max<int64_t>(0, secs) * 1000;
+        return getenv_whole<int64_t>("SOCKETLEY_SHARE_BURN_GRACE_SECS", 0, INT64_MAX / 1000).value_or(600) * 1000;
     }();
     return ms;
 }

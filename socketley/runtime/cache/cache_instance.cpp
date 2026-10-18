@@ -26,6 +26,7 @@
 #include <cerrno>
 #include "../../shared/util/glob_match.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/number_parse.h"
 #include <cstdlib>
 #include <cstdio>
 #include <charconv>
@@ -783,16 +784,10 @@ bool cache_instance::setup(event_loop& loop)
     // both tunable so the memory trade-off is measured rather than guessed.
     uint32_t buf_count = BUF_COUNT;
     uint32_t buf_size  = BUF_SIZE;
-    if (const char* e = getenv("SOCKETLEY_CACHE_BUF_COUNT"))
-    {
-        char* end; long v = strtol(e, &end, 10);
-        if (end != e && v > 0) buf_count = static_cast<uint32_t>(v);
-    }
-    if (const char* e = getenv("SOCKETLEY_CACHE_BUF_SIZE"))
-    {
-        char* end; long v = strtol(e, &end, 10);
-        if (end != e && v >= 1024) buf_size = static_cast<uint32_t>(v);
-    }
+    if (const auto v = socketley::getenv_whole<uint32_t>("SOCKETLEY_CACHE_BUF_COUNT", 1))
+        buf_count = *v;
+    if (const auto v = socketley::getenv_whole<uint32_t>("SOCKETLEY_CACHE_BUF_SIZE", 1024))
+        buf_size = *v;
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, buf_count, buf_size);
     // On always, for the server's reason: nothing here declines a read at a
     // watermark, so there is no second side to trade the throughput against.
@@ -819,15 +814,7 @@ bool cache_instance::setup(event_loop& loop)
     // running for every cache runtime wakes each idle loop for nothing -- and
     // the interval trades memory against CPU, never correctness, since every
     // read path checks expiry itself.
-    long sweep_ms = 500;
-    const char* sweep_env = getenv("SOCKETLEY_CACHE_TTL_SWEEP_MS");
-    if (sweep_env)
-    {
-        char* send;
-        long v = strtol(sweep_env, &send, 10);
-        if (send != sweep_env && v > 0)
-            sweep_ms = v;
-    }
+    const long sweep_ms = socketley::getenv_whole<long>("SOCKETLEY_CACHE_TTL_SWEEP_MS", 1).value_or(500);
     // Fresh timers for this run, because the sweep that was running at the
     // stop cannot be cancelled and m_ttl_timer_armed cannot tell the
     // difference.

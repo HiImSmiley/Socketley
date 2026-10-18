@@ -46,6 +46,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/crypto/mac.h"
+#include "../../shared/util/number_parse.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -2346,8 +2347,8 @@ void storage_run::media_evict(const std::string& keep)
 {
     // The least recently asked for media go first, once the cache is past its size, and none that is being made.
     uint64_t cap_mb = cache_default_mb;
-    if (const char* e = std::getenv("SOCKETLEY_MEDIA_CACHE_MB"); e && *e)
-        parse_uint(e, cap_mb);
+    if (const auto v = getenv_whole<uint64_t>("SOCKETLEY_MEDIA_CACHE_MB"))
+        cap_mb = *v;
     const std::string media_dir = m_store.options().dir + "/.media";
     struct entry
     {

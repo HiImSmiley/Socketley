@@ -19,6 +19,7 @@
 
 #include "../../shared/http/h3_endpoint.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/number_parse.h"
 
 namespace socketley::storage
 {
@@ -73,13 +74,8 @@ bool storage_run::h3_open(uint16_t port, uint16_t advertise, uint32_t shard, uin
     // This runtime's own dials, which the endpoint's defaults otherwise answer for.
     if (const char* cc = std::getenv("SOCKETLEY_STORAGE_HTTP3_CC"); cc && *cc)
         o.cc = cc;
-    if (const char* ra = std::getenv("SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER"); ra && *ra)
-    {
-        size_t v = 0;
-        const auto [end, ec] = std::from_chars(ra, ra + std::strlen(ra), v);
-        if (ec == std::errc{} && *end == '\0')
-            o.retry_after = v;
-    }
+    if (const auto v = getenv_whole<size_t>("SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER"))
+        o.retry_after = *v;
     m_h3_host = std::make_unique<storage_h3_host>(*this);
     std::string err;
     m_h3 = h3::open(o, *m_h3_host, m_loop, err);

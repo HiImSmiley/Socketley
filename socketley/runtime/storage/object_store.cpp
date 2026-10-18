@@ -29,6 +29,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/number_parse.h"
 
 namespace socketley::storage
 {
@@ -105,11 +106,11 @@ object_store::object_store(event_loop& loop, file_io& io, store_options opts)
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_HOLD_CONFIRM"))
         m_hold_confirm = e;
     // The hot-object budget per shard, 0 to keep nothing.
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_HOT_BYTES"))
-        m_hot_budget = std::strtoull(e, nullptr, 10);
+    if (const auto v = getenv_whole<uint64_t>("SOCKETLEY_STORAGE_HOT_BYTES"))
+        m_hot_budget = *v;
     // A lower compaction floor, for a test that wants compactions without thousands of writes.
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_COMPACT_FLOOR"))
-        m_opts.compact_floor = std::strtoull(e, nullptr, 10);
+    if (const auto v = getenv_whole<uint64_t>("SOCKETLEY_STORAGE_COMPACT_FLOOR"))
+        m_opts.compact_floor = *v;
 }
 
 const std::string& object_store::hot_id(std::string_view bucket_name, std::string_view key)

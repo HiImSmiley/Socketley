@@ -1,6 +1,7 @@
 #include "event_loop.h"
 #include "../util/logging.h"
 #include "eventfd_wake.h"
+#include "../util/number_parse.h"
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/eventfd.h>
@@ -1006,14 +1007,8 @@ bool event_loop::init()
 
     setup_eventfd();
 
-    const char* napi_env = getenv("SOCKETLEY_NAPI_BUSY_POLL_US");
-    if (napi_env)
-    {
-        char* end;
-        long usec = strtol(napi_env, &end, 10);
-        if (end != napi_env && usec > 0)
-            enable_napi_busy_poll(static_cast<uint32_t>(usec));
-    }
+    if (const auto usec = socketley::getenv_whole<uint32_t>("SOCKETLEY_NAPI_BUSY_POLL_US", 1))
+        enable_napi_busy_poll(*usec);
 
     return true;
 }
