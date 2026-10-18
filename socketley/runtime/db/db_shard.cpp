@@ -7,10 +7,9 @@ namespace socketley::db
 
 std::string encode_crossing(const crossing& c)
 {
-    socketley::bytes::writer w;
+    socketley::bytes::writer w(cross_marker);
     w.reserve(cross_marker.size() + 32 + c.who.sub.size() + c.method.size() + c.path.size() + c.body.size() +
               c.if_match.size() + c.if_none_match.size());
-    std::string out(cross_marker);
     w.u8(static_cast<uint8_t>(c.who.kind));
     w.bytes(c.who.sub);
     w.bytes(c.method);
@@ -18,18 +17,15 @@ std::string encode_crossing(const crossing& c)
     w.bytes(c.body);
     w.bytes(c.if_match);
     w.bytes(c.if_none_match);
-    out += w.take();
-    return out;
+    return w.take();
 }
 
 bool decode_crossing(std::string_view in, crossing& out)
 {
-    if (!in.starts_with(cross_marker))
-        return false;
-    socketley::bytes::reader r(in.substr(cross_marker.size()));
+    socketley::bytes::reader r(in);
     uint8_t kind = 0;
     std::string_view sub;
-    if (!r.u8(kind) || kind > principal::key || !r.view(sub, 4096) || !r.view(out.method, 16) ||
+    if (!r.marker(cross_marker) || !r.u8(kind) || kind > principal::key || !r.view(sub, 4096) || !r.view(out.method, 16) ||
         !r.view(out.path, 4096) || !r.view(out.body, 64u << 20) || !r.view(out.if_match, 256) ||
         !r.view(out.if_none_match, 256) || r.left() != 0)
         return false;

@@ -7,6 +7,7 @@
 #include "shared/util/number_parse.h"
 #include "shared/util/settings.h"
 #include "shared/util/proc_stat.h"
+#include "shared/util/byte_codec.h"
 
 #include <chrono>
 #include <string>
@@ -156,4 +157,26 @@ TEST_CASE("a setting is read through its table entry: its range, its flag rule a
         CHECK(st::by_config_name(st::config_name(e)) == &e);
         CHECK_FALSE(e.meaning.empty());
     }
+}
+
+TEST_CASE("a frame opens with its marker, and a flag is one byte that is 0 or 1")
+{
+    socketley::bytes::writer w("cross:");
+    w.flag(true);
+    w.flag(false);
+    const std::string frame = w.take();
+    CHECK(frame == std::string("cross:\x01\x00", 8));
+
+    socketley::bytes::reader r(frame);
+    bool a = false, b = true;
+    CHECK_FALSE(socketley::bytes::reader(frame).marker("other:"));
+    CHECK(r.marker("cross:"));
+    CHECK(r.flag(a));
+    CHECK(r.flag(b));
+    CHECK(a);
+    CHECK_FALSE(b);
+    CHECK(r.left() == 0);
+
+    bool c = false;
+    CHECK_FALSE(socketley::bytes::reader(std::string_view("\x02", 1)).flag(c));
 }

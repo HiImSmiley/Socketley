@@ -9,7 +9,7 @@ namespace socketley::idp
 
 std::string encode_call(const shard_call& c)
 {
-    socketley::bytes::writer w;
+    socketley::bytes::writer w(cross_marker);
     w.u8(c.op);
     w.bytes(c.key);
     w.u64(static_cast<uint64_t>(c.at));
@@ -19,20 +19,16 @@ std::string encode_call(const shard_call& c)
         w.bytes(k);
         w.bytes(v);
     }
-    std::string out(cross_marker);
-    out += w.take();
-    return out;
+    return w.take();
 }
 
 bool decode_call(std::string_view in, shard_call& out)
 {
-    if (!in.starts_with(cross_marker))
-        return false;
-    socketley::bytes::reader r(in.substr(cross_marker.size()));
+    socketley::bytes::reader r(in);
     uint8_t op = 0;
     uint64_t at = 0;
     uint32_t n = 0;
-    if (!r.u8(op) || op < shard_call::redeem || op > shard_call::miss || !r.bytes(out.key, 256) || !r.u64(at) ||
+    if (!r.marker(cross_marker) || !r.u8(op) || op < shard_call::redeem || op > shard_call::miss || !r.bytes(out.key, 256) || !r.u64(at) ||
         !r.u32(n) || n > account_store::max_fields)
         return false;
     out.op = static_cast<shard_call::op_t>(op);
@@ -51,7 +47,7 @@ bool decode_call(std::string_view in, shard_call& out)
 std::string encode_code(const code_entry* e)
 {
     socketley::bytes::writer w;
-    w.u8(e ? 1 : 0);
+    w.flag(e);
     if (e)
     {
         w.bytes(e->client_id);
@@ -69,10 +65,8 @@ std::string encode_code(const code_entry* e)
 bool decode_code(std::string_view in, bool& found, code_entry& out)
 {
     socketley::bytes::reader r(in);
-    uint8_t f = 0;
-    if (!r.u8(f) || f > 1)
+    if (!r.flag(found))
         return false;
-    found = f == 1;
     if (found)
     {
         uint64_t auth = 0, exp = 0;
@@ -89,7 +83,7 @@ bool decode_code(std::string_view in, bool& found, code_entry& out)
 std::string encode_result(bool ok, std::string_view why)
 {
     socketley::bytes::writer w;
-    w.u8(ok ? 1 : 0);
+    w.flag(ok);
     w.bytes(why);
     return w.take();
 }
@@ -97,11 +91,7 @@ std::string encode_result(bool ok, std::string_view why)
 bool decode_result(std::string_view in, bool& ok, std::string& why)
 {
     socketley::bytes::reader r(in);
-    uint8_t f = 0;
-    if (!r.u8(f) || f > 1 || !r.bytes(why, 4096) || r.left() != 0)
-        return false;
-    ok = f == 1;
-    return true;
+    return r.flag(ok) && r.bytes(why, 4096) && r.left() == 0;
 }
 
 bool code_shard(std::string_view code, uint32_t shards, uint32_t& shard)

@@ -40,7 +40,7 @@ std::string encode(const raft::message& m)
     w.u64(m.index);
     w.u64(m.log_term);
     w.u64(m.commit);
-    w.u8(m.reject ? 1 : 0);
+    w.flag(m.reject);
     w.u64(m.hint_index);
     w.u64(m.hint_term);
     w.u64(m.context);
@@ -52,7 +52,7 @@ std::string encode(const raft::message& m)
         w.u8(static_cast<uint8_t>(e.type));
         w.bytes(e.data);
     }
-    w.u8(m.snap ? 1 : 0);
+    w.flag(m.snap != nullptr);
     if (m.snap)
     {
         w.u64(m.snap->index);
@@ -79,7 +79,7 @@ std::string encode(const join& j)
     w.u64(j.id);
     w.bytes(j.name);
     w.bytes(j.addr);
-    w.u8(j.voter ? 1 : 0);
+    w.flag(j.voter);
     return w.take();
 }
 
@@ -102,7 +102,7 @@ std::string encode(kind k, const lease& l)
         w.u64(rep.incarnation);
         w.u64(rep.epoch);
         w.u64(rep.offset);
-        w.u8(rep.primary ? 1 : 0);
+        w.flag(rep.primary);
     }
     return w.take();
 }

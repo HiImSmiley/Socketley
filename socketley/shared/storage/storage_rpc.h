@@ -174,7 +174,7 @@ inline std::string encode(const reply& r, op kind)
 {
     socketley::bytes::writer w;
     w.u8(version);
-    w.u8(r.ok ? 1 : 0);
+    w.flag(r.ok);
     if (!r.ok)
     {
         w.bytes(r.code);
@@ -197,7 +197,7 @@ inline std::string encode(const reply& r, op kind)
             w.u32(static_cast<uint32_t>(r.objects.size()));
             for (const auto& o : r.objects)
                 encode_info(w, o, true);
-            w.u8(r.truncated ? 1 : 0);
+            w.flag(r.truncated);
             break;
         case op::list:
             w.u32(static_cast<uint32_t>(r.objects.size()));
@@ -206,7 +206,7 @@ inline std::string encode(const reply& r, op kind)
             w.u32(static_cast<uint32_t>(r.prefixes.size()));
             for (const auto& p : r.prefixes)
                 w.bytes(p);
-            w.u8(r.truncated ? 1 : 0);
+            w.flag(r.truncated);
             w.bytes(r.next);
             break;
     }
@@ -216,10 +216,9 @@ inline std::string encode(const reply& r, op kind)
 inline bool decode(std::string_view in, op kind, reply& r)
 {
     socketley::bytes::reader rd(in);
-    uint8_t v = 0, ok = 0;
-    if (!rd.u8(v) || v != version || !rd.u8(ok) || ok > 1)
+    uint8_t v = 0;
+    if (!rd.u8(v) || v != version || !rd.flag(r.ok))
         return false;
-    r.ok = ok == 1;
     if (!r.ok)
         return rd.bytes(r.code, max_field) && rd.bytes(r.message, max_field);
     switch (kind)
@@ -240,11 +239,7 @@ inline bool decode(std::string_view in, op kind, reply& r)
             for (auto& o : r.objects)
                 if (!decode_info(rd, o))
                     return false;
-            uint8_t t = 0;
-            if (!rd.u8(t) || t > 1)
-                return false;
-            r.truncated = t == 1;
-            return true;
+            return rd.flag(r.truncated);
         }
         case op::list:
         {
@@ -261,11 +256,7 @@ inline bool decode(std::string_view in, op kind, reply& r)
             for (auto& p : r.prefixes)
                 if (!rd.bytes(p, max_field))
                     return false;
-            uint8_t t = 0;
-            if (!rd.u8(t) || t > 1)
-                return false;
-            r.truncated = t == 1;
-            return rd.bytes(r.next, max_field);
+            return rd.flag(r.truncated) && rd.bytes(r.next, max_field);
         }
     }
     return false;

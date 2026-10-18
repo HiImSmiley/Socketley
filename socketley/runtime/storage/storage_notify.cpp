@@ -244,7 +244,7 @@ std::string storage_run::encode_change_check(const change_note& n)
     w.bytes(n.bucket);
     w.bytes(n.key);
     w.bytes(n.version_id);
-    w.u8(n.has_object ? 1 : 0);
+    w.flag(n.has_object);
     w.u64(n.size);
     w.bytes(n.etag);
     w.u64(static_cast<uint64_t>(n.mtime_ms));
@@ -254,14 +254,12 @@ std::string storage_run::encode_change_check(const change_note& n)
 bool storage_run::decode_change_check(std::string_view b, change_note& n)
 {
     bytes::reader r(b);
-    uint8_t  has = 0;
     uint32_t event = 0;
     uint64_t mtime = 0;
     if (!r.u32(event) || !r.bytes(n.bucket, 1024) || !r.bytes(n.key, 4096) || !r.bytes(n.version_id, 256) ||
-        !r.u8(has) || !r.u64(n.size) || !r.bytes(n.etag, 256) || !r.u64(mtime))
+        !r.flag(n.has_object) || !r.u64(n.size) || !r.bytes(n.etag, 256) || !r.u64(mtime))
         return false;
     n.event      = static_cast<uint16_t>(event);
-    n.has_object = has != 0;
     n.mtime_ms   = static_cast<int64_t>(mtime);
     // A bucket's name is a directory the check reads below, so anything else is no change this store made.
     return valid_bucket_name(n.bucket) && !n.key.empty();

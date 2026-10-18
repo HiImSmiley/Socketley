@@ -46,21 +46,16 @@ void put_origin(bytes::writer& w, const change_origin& who)
 {
     w.bytes(who.principal);
     w.bytes(who.source_ip);
-    w.u8(who.replica ? 1 : 0);
+    w.flag(who.replica);
     w.bytes(who.source_version);
-    w.u8(who.cluster ? 1 : 0);
+    w.flag(who.cluster);
     w.bytes(who.stamp);
 }
 
 bool get_origin(bytes::reader& r, change_origin& who)
 {
-    uint8_t replica = 0, cluster = 0;
-    if (!r.bytes(who.principal, 1024) || !r.bytes(who.source_ip, 64) || !r.u8(replica) ||
-        !r.bytes(who.source_version, 64) || !r.u8(cluster) || !r.bytes(who.stamp, 128))
-        return false;
-    who.replica = replica != 0;
-    who.cluster = cluster != 0;
-    return true;
+    return r.bytes(who.principal, 1024) && r.bytes(who.source_ip, 64) && r.flag(who.replica) &&
+           r.bytes(who.source_version, 64) && r.flag(who.cluster) && r.bytes(who.stamp, 128);
 }
 
 bool status_byte(bytes::reader& r, st& s)
@@ -130,7 +125,7 @@ std::string encode_remove(std::string_view bucket, std::string_view key, std::st
     w.bytes(bucket);
     w.bytes(key);
     w.bytes(version_id);
-    w.u8(bypass ? 1 : 0);
+    w.flag(bypass);
     put_origin(w, who);
     w.bytes(cond.if_match);
     w.u64(static_cast<uint64_t>(cond.mtime_s));
@@ -172,7 +167,7 @@ std::string encode_set_tags(std::string_view bucket, std::string_view key, std::
     w.bytes(version_id);
     w.bytes(value);
     w.u8(what);
-    w.u8(bypass ? 1 : 0);
+    w.flag(bypass);
     put_origin(w, who);
     return w.take();
 }
@@ -304,7 +299,7 @@ std::string encode_list(std::string_view bucket, const list_query& q)
     w.bytes(q.delimiter);
     w.bytes(q.start_after);
     w.bytes(q.resume_at);
-    w.u8(q.has_resume ? 1 : 0);
+    w.flag(q.has_resume);
     w.u64(q.max_keys);
     return w.take();
 }
@@ -358,8 +353,8 @@ std::string encode_removed(const remove_result& r)
 {
     bytes::writer w;
     w.u8(static_cast<uint8_t>(r.status));
-    w.u8(r.existed ? 1 : 0);
-    w.u8(r.marker ? 1 : 0);
+    w.flag(r.existed);
+    w.flag(r.marker);
     w.bytes(r.version_id);
     return w.take();
 }
@@ -446,7 +441,7 @@ std::string page_writer::finish(st s)
 {
     bytes::writer head;
     head.u8(static_cast<uint8_t>(s));
-    head.u8(m_truncated ? 1 : 0);
+    head.flag(m_truncated);
     head.bytes(m_resume);
     head.u32(m_prefix_count);
     bytes::writer count;
@@ -673,7 +668,7 @@ void put_part(bytes::writer& w, const mpu_part& p)
     w.u64(static_cast<uint64_t>(p.mtime_ms));
     w.u64(p.data_off);
     w.bytes(p.checksum_b64);
-    w.u8(p.in_place ? 1 : 0);
+    w.flag(p.in_place);
 }
 
 bool get_part(bytes::reader& r, mpu_part& p)
@@ -730,7 +725,7 @@ std::string encode_mpu_ref(op o, const mpu_ref& ref)
     w.bytes(ref.id);
     w.u32(ref.a);
     w.u32(ref.b);
-    w.u8(ref.flag ? 1 : 0);
+    w.flag(ref.flag);
     w.u64(ref.size);
     return w.take();
 }
@@ -847,7 +842,7 @@ std::string encode_mpu_plan(const s3_error& err, const assemble_plan& plan)
     w.u32(static_cast<uint32_t>(plan.parts.size()));
     for (const mpu_part& p : plan.parts)
         put_part(w, p);
-    w.u8(plan.in_place ? 1 : 0);
+    w.flag(plan.in_place);
     return w.take();
 }
 
@@ -888,7 +883,7 @@ std::string encode_parts_page(const parts_page& pg)
     w.bytes(pg.key);
     w.bytes(pg.id);
     w.u8(static_cast<uint8_t>(pg.algo));
-    w.u8(pg.truncated ? 1 : 0);
+    w.flag(pg.truncated);
     w.u32(pg.next_marker);
     w.u32(static_cast<uint32_t>(pg.rows.size()));
     for (const part_row& p : pg.rows)
@@ -1030,7 +1025,7 @@ std::string encode_version_page(st s, const version_page& page)
 {
     bytes::writer w;
     w.u8(static_cast<uint8_t>(s));
-    w.u8(page.truncated ? 1 : 0);
+    w.flag(page.truncated);
     w.u32(static_cast<uint32_t>(page.items.size()));
     for (const version_item& it : page.items)
     {

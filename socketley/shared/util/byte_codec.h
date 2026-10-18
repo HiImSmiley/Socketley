@@ -58,11 +58,17 @@ inline void append64(std::string& out, uint64_t v)
 class writer
 {
 public:
+    writer() = default;
+    // A frame that opens with a text marker the receiver dispatches on.
+    explicit writer(std::string_view marker) : m_out(marker) {}
+
     void u8(uint8_t v) { m_out += static_cast<char>(v); }
 
     void u32(uint32_t v) { append32(m_out, v); }
 
     void u64(uint64_t v) { append64(m_out, v); }
+
+    void flag(bool v) { u8(v ? 1 : 0); }
 
     void bytes(std::string_view s)
     {
@@ -89,6 +95,15 @@ class reader
 {
 public:
     explicit reader(std::string_view in) : m_in(in) {}
+
+    // Past the marker a frame opens with, false when it opens with another.
+    bool marker(std::string_view m)
+    {
+        if (!m_in.substr(m_off).starts_with(m))
+            return false;
+        m_off += m.size();
+        return true;
+    }
 
     bool u8(uint8_t& v)
     {
