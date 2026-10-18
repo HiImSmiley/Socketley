@@ -2,6 +2,7 @@
 
 #include "../shared/util/byte_codec.h"
 #include "../shared/net/dial_address.h"
+#include "../shared/net/endpoint.h"
 #include "../shared/loop/event_loop.h"
 #include "../shared/ipc/ipc_framing.h"
 #include "../shared/util/logging.h"
@@ -65,25 +66,11 @@ bool parse_numeric(const std::string& addr, sockaddr_storage& out, socklen_t& le
         return false;
     if (host.size() > 2 && host.front() == '[' && host.back() == ']')
         host = host.substr(1, host.size() - 2);
-    out = sockaddr_storage{};
-    auto* v4 = reinterpret_cast<sockaddr_in*>(&out);
-    auto* v6 = reinterpret_cast<sockaddr_in6*>(&out);
-    if (::inet_pton(AF_INET, host.c_str(), &v4->sin_addr) == 1)
-    {
-        v4->sin_family = AF_INET;
-        v4->sin_port   = htons(port);
-        len = sizeof(sockaddr_in);
-    }
-    else if (::inet_pton(AF_INET6, host.c_str(), &v6->sin6_addr) == 1)
-    {
-        v6->sin6_family = AF_INET6;
-        v6->sin6_port   = htons(port);
-        len = sizeof(sockaddr_in6);
-    }
-    else
-    {
+    socketley::endpoint e;
+    if (!socketley::literal_endpoint(host, port, e))
         return false;
-    }
+    out = e.addr;
+    len = e.len;
     if (host_out)
         *host_out = host;
     return true;

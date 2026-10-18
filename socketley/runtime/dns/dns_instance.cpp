@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "../../shared/net/dns_feed.h"
+#include "../../shared/net/endpoint.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/net/ip_block.h"
@@ -95,24 +96,12 @@ bool parse_target(std::string_view s, sockaddr_storage& out, socklen_t& len)
         if (ec != std::errc{} || e != p.data() + p.size() || port == 0)
             return false;
     }
-    out = sockaddr_storage{};
-    auto* a4 = reinterpret_cast<sockaddr_in*>(&out);
-    auto* a6 = reinterpret_cast<sockaddr_in6*>(&out);
-    if (::inet_pton(AF_INET, host.c_str(), &a4->sin_addr) == 1)
-    {
-        a4->sin_family = AF_INET;
-        a4->sin_port = htons(port);
-        len = sizeof(sockaddr_in);
-        return true;
-    }
-    if (::inet_pton(AF_INET6, host.c_str(), &a6->sin6_addr) == 1)
-    {
-        a6->sin6_family = AF_INET6;
-        a6->sin6_port = htons(port);
-        len = sizeof(sockaddr_in6);
-        return true;
-    }
-    return false;
+    socketley::endpoint e;
+    if (!socketley::literal_endpoint(host, port, e))
+        return false;
+    out = e.addr;
+    len = e.len;
+    return true;
 }
 
 std::vector<std::string> split_csv(std::string_view s)

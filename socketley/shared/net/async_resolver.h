@@ -21,17 +21,15 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include "endpoint.h"
+
 namespace socketley
 {
 
 class async_resolver
 {
 public:
-    struct address
-    {
-        sockaddr_storage addr{};
-        socklen_t        len{0};
-    };
+    using address = endpoint;
 
     enum class state : uint8_t { pending, ready, failed };
 
@@ -112,21 +110,7 @@ private:
 
     static void answer(entry& e, const std::string& host, int family)
     {
-        addrinfo hints{};
-        hints.ai_family   = family;
-        hints.ai_socktype = SOCK_STREAM;
-        addrinfo* res = nullptr;
-        if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) == 0)
-        {
-            for (const addrinfo* a = res; a; a = a->ai_next)
-            {
-                address x;
-                x.len = static_cast<socklen_t>(std::min<size_t>(a->ai_addrlen, sizeof(x.addr)));
-                std::memcpy(&x.addr, a->ai_addr, x.len);
-                e.addrs.push_back(x);
-            }
-            ::freeaddrinfo(res);
-        }
+        e.addrs = resolve_all(host, nullptr, family);
         e.at = std::chrono::steady_clock::now();
         e.done.store(true, std::memory_order_release);
     }

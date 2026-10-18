@@ -218,28 +218,6 @@ bool valid_target_name(std::string_view name)
     return true;
 }
 
-bool literal_endpoint(const std::string& host, uint16_t port, http_endpoint& out)
-{
-    out = http_endpoint{};
-    auto* v4 = reinterpret_cast<struct sockaddr_in*>(&out.addr);
-    if (::inet_pton(AF_INET, host.c_str(), &v4->sin_addr) == 1)
-    {
-        v4->sin_family = AF_INET;
-        v4->sin_port   = htons(port);
-        out.len        = sizeof(struct sockaddr_in);
-        return true;
-    }
-    auto* v6 = reinterpret_cast<struct sockaddr_in6*>(&out.addr);
-    if (::inet_pton(AF_INET6, host.c_str(), &v6->sin6_addr) == 1)
-    {
-        v6->sin6_family = AF_INET6;
-        v6->sin6_port   = htons(port);
-        out.len         = sizeof(struct sockaddr_in6);
-        return true;
-    }
-    return false;
-}
-
 std::vector<http_endpoint> resolve_http_host(const std::string& host, uint16_t port, const std::string& hosts_file)
 {
     std::vector<http_endpoint> out;
@@ -268,22 +246,7 @@ std::vector<http_endpoint> resolve_http_host(const std::string& host, uint16_t p
         if (!out.empty())
             return out;
     }
-    struct addrinfo hints{};
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo* res = nullptr;
-    const std::string p = std::to_string(port);
-    if (::getaddrinfo(host.c_str(), p.c_str(), &hints, &res) != 0 || !res)
-        return out;
-    for (const struct addrinfo* a = res; a; a = a->ai_next)
-    {
-        http_endpoint e;
-        e.len = static_cast<socklen_t>(std::min<size_t>(a->ai_addrlen, sizeof(e.addr)));
-        std::memcpy(&e.addr, a->ai_addr, e.len);
-        out.push_back(e);
-    }
-    ::freeaddrinfo(res);
-    return out;
+    return socketley::resolve_all(host, std::to_string(port).c_str(), AF_UNSPEC);
 }
 
 std::string_view http_answer::header(std::string_view lower) const

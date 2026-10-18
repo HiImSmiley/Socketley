@@ -15,6 +15,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
+#include "../../shared/net/endpoint.h"
 #include "../../shared/crypto/tls_context.h"
 
 namespace socketley::storage
@@ -55,14 +56,9 @@ bool read_targets_file(const std::string& path, std::string_view what, std::stri
 bool valid_target_name(std::string_view name);
 
 // One address a host resolved to.
-struct http_endpoint
-{
-    struct sockaddr_storage addr{};
-    socklen_t len{0};
-};
+using http_endpoint = socketley::endpoint;
 
-// `host` as an address literal, false when it is a name.
-bool literal_endpoint(const std::string& host, uint16_t port, http_endpoint& out);
+using socketley::literal_endpoint;
 
 // The addresses `host` has, in the order the resolver gives them, a name in `hosts_file` (`name address` lines, a
 // test aid) before the system's; blocking, so it runs on the resolver thread.
