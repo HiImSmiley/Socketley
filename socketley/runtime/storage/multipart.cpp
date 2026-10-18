@@ -15,8 +15,8 @@
 
 #include "disk_chain.h"
 #include "s3_xml.h"
-#include "../../shared/logging.h"
-#include "../../shared/random_id.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/util/random_id.h"
 
 namespace fs = std::filesystem;
 

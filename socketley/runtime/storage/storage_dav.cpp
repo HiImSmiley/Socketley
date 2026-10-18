@@ -13,8 +13,8 @@
 #include "s3_names.h"
 #include "s3_xml.h"
 #include "sse.h"
-#include "../../shared/logging.h"
-#include "../../shared/state_persistence.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/persist/state_persistence.h"
 
 namespace socketley::storage
 {

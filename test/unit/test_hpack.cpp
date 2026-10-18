@@ -7,8 +7,8 @@
 #include <string>
 #include <vector>
 
-#include "shared/h2_frame.h"
-#include "shared/hpack.h"
+#include "shared/http/h2_frame.h"
+#include "shared/http/hpack.h"
 
 using namespace socketley::hpack;
 

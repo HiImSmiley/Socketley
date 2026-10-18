@@ -10,7 +10,7 @@
 #include <string>
 #include <thread>
 
-#include "shared/https_client.h"
+#include "shared/http/https_client.h"
 
 namespace
 {

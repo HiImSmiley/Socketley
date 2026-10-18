@@ -3,7 +3,7 @@
 #include "cache_instance.h"
 #include "resp_parser.h"
 #include "../../cli/command_hashing.h"
-#include "../../shared/logging.h"
+#include "../../shared/util/logging.h"
 
 #include <chrono>
 #include <cstring>

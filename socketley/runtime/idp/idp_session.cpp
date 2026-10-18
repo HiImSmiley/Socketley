@@ -9,7 +9,7 @@
 
 #include "idp_instance.h"
 #include "idp_logic.h"
-#include "../../shared/logging.h"
+#include "../../shared/util/logging.h"
 #include "../storage/json_doc.h"
 #include "../storage/s3_federation.h"
 

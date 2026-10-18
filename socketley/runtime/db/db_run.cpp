@@ -19,12 +19,12 @@
 #include <openssl/crypto.h>
 
 #include "db_instance.h"
-#include "../../shared/http_framing.h"
-#include "../../shared/https_client.h"
-#include "../../shared/logging.h"
-#include "../../shared/replaced_file.h"
-#include "../../shared/runtime_manager.h"
-#include "../../shared/shard_target.h"
+#include "../../shared/http/http_framing.h"
+#include "../../shared/http/https_client.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/persist/replaced_file.h"
+#include "../../shared/runtime/runtime_manager.h"
+#include "../../shared/ipc/shard_target.h"
 
 namespace socketley::db
 {

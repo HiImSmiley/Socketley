@@ -1,4 +1,4 @@
-#include "../../shared/byte_codec.h"
+#include "../../shared/util/byte_codec.h"
 #include "shard_node.h"
 
 #include <algorithm>
@@ -13,7 +13,7 @@
 #include "s3_names.h"
 #include "shard_owner.h"
 #include "shard_wire.h"
-#include "../../shared/logging.h"
+#include "../../shared/util/logging.h"
 
 namespace socketley::storage
 {

@@ -16,8 +16,8 @@
 
 #include <openssl/ssl.h>
 
-#include "../../shared/http_framing.h"
-#include "../../shared/logging.h"
+#include "../../shared/http/http_framing.h"
+#include "../../shared/util/logging.h"
 
 namespace socketley::storage
 {

@@ -10,7 +10,7 @@
 #include <string_view>
 #include <vector>
 
-#include "../../shared/byte_codec.h"
+#include "../../shared/util/byte_codec.h"
 #include "multipart.h"
 #include "object_store.h"
 

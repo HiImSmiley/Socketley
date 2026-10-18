@@ -4,10 +4,10 @@
 #include <cstdlib>
 
 #include "../../runtime/cache/stream_log.h"
-#include "../../shared/byte_codec.h"
-#include "../../shared/route_relay.h"
-#include "../../shared/runtime_manager.h"
-#include "../../shared/logging.h"
+#include "../../shared/util/byte_codec.h"
+#include "../../shared/ipc/route_relay.h"
+#include "../../shared/runtime/runtime_manager.h"
+#include "../../shared/util/logging.h"
 
 namespace socketley::storage
 {

@@ -11,7 +11,7 @@
 
 #include <openssl/crypto.h>
 
-#include "../../shared/logging.h"
+#include "../../shared/util/logging.h"
 #include "../storage/checksum.h"
 #include "../storage/s3_sigv4_auth.h"
 #include "../idp/idp_session.h"

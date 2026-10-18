@@ -1,5 +1,5 @@
 #include "s3_iam.h"
-#include "../../shared/glob_match.h"
+#include "../../shared/util/glob_match.h"
 
 #include <openssl/rand.h>
 

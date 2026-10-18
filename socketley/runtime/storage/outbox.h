@@ -27,8 +27,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../../shared/event_loop.h"
-#include "../../shared/file_io.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/file_io.h"
 
 namespace socketley::storage
 {

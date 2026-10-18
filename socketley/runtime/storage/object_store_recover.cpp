@@ -32,7 +32,7 @@
 #include "s3_names.h"
 #include "s3_notify.h"
 #include "shard_owner.h"
-#include "../../shared/logging.h"
+#include "../../shared/util/logging.h"
 
 namespace fs = std::filesystem;
 

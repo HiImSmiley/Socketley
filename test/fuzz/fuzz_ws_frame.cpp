@@ -1,5 +1,5 @@
 // Fuzz target: WebSocket frame parsing and handshake key derivation
-// (socketley/shared/ws_protocol.h).
+// (socketley/shared/http/ws_protocol.h).
 //
 // Reachable by any unauthenticated peer that completes a WebSocket upgrade
 // against a server runtime, or that speaks WebSocket through the proxy.  Frame
@@ -33,7 +33,7 @@
 // deflate (not implemented).
 
 #include "fuzz_common.h"
-#include "shared/ws_protocol.h"
+#include "shared/http/ws_protocol.h"
 
 #include <string>
 #include <vector>

@@ -22,8 +22,8 @@
 #include "digest.h"
 #include "json_doc.h"
 #include "s3_auth.h"
-#include "../../shared/git_names.h"
-#include "../../shared/logging.h"
+#include "../../shared/storage/git_names.h"
+#include "../../shared/util/logging.h"
 
 extern char** environ;
 

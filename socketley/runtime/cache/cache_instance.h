@@ -1,7 +1,7 @@
 #pragma once
-#include "../../shared/fd_table.h"
-#include "../../shared/async_resolver.h"
-#include "../../shared/conn_reachability.h"
+#include "../../shared/loop/fd_table.h"
+#include "../../shared/net/async_resolver.h"
+#include "../../shared/net/conn_reachability.h"
 #include <initializer_list>
 #include <string>
 #include <string_view>
@@ -16,21 +16,21 @@
 #include <sys/uio.h>
 #include <sys/socket.h>
 
-#include "../../shared/runtime_instance.h"
-#include "../../shared/event_loop_definitions.h"
-#include "../../shared/request_channel.h"
+#include "../../shared/runtime/runtime_instance.h"
+#include "../../shared/loop/event_loop_definitions.h"
+#include "../../shared/ipc/request_channel.h"
 
 #include <deque>
-#include "../../shared/cache_shard_map.h"
+#include "../../shared/ipc/cache_shard_map.h"
 #include "cache_store.h"
 #include "cache_script.h"
-#include "../../shared/mutation_journal.h"
-#include "../../shared/trace.h"
-#include "../../shared/write_queue.h"
-#include "../../shared/direct_send.h"
-#include "../../shared/tls_context.h"
-#include "../../shared/unix_companion.h"
-#include "../../shared/replica_role.h"
+#include "../../shared/persist/mutation_journal.h"
+#include "../../shared/util/trace.h"
+#include "../../shared/loop/write_queue.h"
+#include "../../shared/net/direct_send.h"
+#include "../../shared/crypto/tls_context.h"
+#include "../../shared/net/unix_companion.h"
+#include "../../shared/cluster/replica_role.h"
 
 struct client_connection
 {

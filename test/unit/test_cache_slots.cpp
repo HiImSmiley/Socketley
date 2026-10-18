@@ -1,6 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
-#include "../../socketley/shared/cache_shard_map.h"
+#include "../../socketley/shared/ipc/cache_shard_map.h"
 
 #include <cstring>
 #include <set>

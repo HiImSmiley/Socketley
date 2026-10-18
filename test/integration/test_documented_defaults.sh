@@ -19,7 +19,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 MAN="$ROOT/man/socketley.1"
-SRC="$ROOT/socketley/shared/runtime_instance.h"
+SRC="$ROOT/socketley/shared/runtime/runtime_instance.h"
 PASS=0; FAIL=0; TOTAL=0
 
 pass() { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -37,7 +37,7 @@ RB=$(grep -oP 'm_read_buffer\s*=\s*\K[0-9u*\s]+' "$SRC" | head -1 | tr -d ' u' |
 RB_BYTES=$(python3 -c "print($RB)" 2>/dev/null || echo 0)
 if [ "${RB_BYTES:-0}" -gt 0 ]; then pass
 else fail "the read buffer default is readable from the source" \
-          "no m_read_buffer initialiser in shared/runtime_instance.h"; fi
+          "no m_read_buffer initialiser in shared/runtime/runtime_instance.h"; fi
 
 if [ "${RB_BYTES:-0}" -eq $((1024 * 1024)) ]; then
     if grep -q "Default 1M" "$MAN"; then pass
@@ -54,7 +54,7 @@ fi
 MC=$(grep -oP 'm_max_connections\s*=\s*\K[0-9]+' "$SRC" | head -1 || true)
 if [ -n "$MC" ]; then pass
 else fail "the connection cap default is readable from the source" \
-          "no m_max_connections initialiser in shared/runtime_instance.h"; fi
+          "no m_max_connections initialiser in shared/runtime/runtime_instance.h"; fi
 
 if [ "${MC:-x}" = "0" ]; then pass
 else fail "the connection cap still defaults to no limit" \

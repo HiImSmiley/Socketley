@@ -23,8 +23,8 @@
 #include <utility>
 #include <vector>
 
-#include "../../shared/h2_driver.h"
-#include "../../shared/logging.h"
+#include "../../shared/http/h2_driver.h"
+#include "../../shared/util/logging.h"
 
 namespace h2  = socketley::h2;
 namespace mux = socketley::mux;

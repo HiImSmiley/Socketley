@@ -1,8 +1,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include "shared/event_loop.h"
-#include "shared/event_loop_definitions.h"
+#include "shared/loop/event_loop.h"
+#include "shared/loop/event_loop_definitions.h"
 
 #include <cerrno>
 #include <cstring>

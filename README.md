@@ -696,7 +696,7 @@ figure is the 2 MB step the heap happens to be on rather than the connections.
 The proxy's sixty-four kilobyte read buffer is still inline in the connection,
 and deliberately: taking it lazily from the heap made the *bounded* upload path
 hold 113 MB more at 1,100 uploading clients. What changed is that a connection
-is no longer zero-filled when it is built (`shared/conn_alloc.h`), so the pages
+is no longer zero-filled when it is built (`shared/loop/conn_alloc.h`), so the pages
 of that buffer are touched by the reads that use them and an idle connection
 never pays for them. The members that had relied on the zeroing were given
 initialisers, and the whole suite was run with the storage filled with `0xAA`

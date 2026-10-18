@@ -1,6 +1,6 @@
 // Fuzz target: the proxy's HTTP *response* header parser — the one that decides
 // whether a backend socket may be handed back to the connection pool.
-// (socketley/shared/http_framing.h, called from
+// (socketley/shared/http/http_framing.h, called from
 // proxy_instance::handle_backend_read.)
 //
 // ─── ON THE SEAM ────────────────────────────────────────────────────────────
@@ -82,7 +82,7 @@
 
 #include "fuzz_common.h"
 
-#include "shared/http_framing.h"
+#include "shared/http/http_framing.h"
 
 #include <cstdlib>
 #include <cstring>

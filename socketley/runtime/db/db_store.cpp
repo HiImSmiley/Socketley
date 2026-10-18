@@ -14,10 +14,10 @@
 
 #include <openssl/rand.h>
 
-#include "../../shared/byte_codec.h"
-#include "../../shared/jws.h"
-#include "../../shared/mutation_journal.h"
-#include "../../shared/replaced_file.h"
+#include "../../shared/util/byte_codec.h"
+#include "../../shared/crypto/jws.h"
+#include "../../shared/persist/mutation_journal.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::db
 {

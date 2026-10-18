@@ -9,8 +9,8 @@
 #include "runtime/storage/shard_node.h"
 #include "runtime/storage/shard_owner.h"
 #include "runtime/storage/shard_wire.h"
-#include "shared/event_loop.h"
-#include "shared/file_io.h"
+#include "shared/loop/event_loop.h"
+#include "shared/loop/file_io.h"
 
 #include <algorithm>
 #include <cstdlib>

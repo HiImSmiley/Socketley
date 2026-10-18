@@ -3,7 +3,7 @@
 #ifndef SOCKETLEY_NO_LUA
 
 #include "resp_parser.h"
-#include "../../shared/lua_context.h"
+#include "../../shared/lua/lua_context.h"
 
 #include <openssl/evp.h>
 #include <cstdio>

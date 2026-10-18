@@ -1,6 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
-#include "../../socketley/shared/shard_stats.h"
+#include "../../socketley/shared/ipc/shard_stats.h"
 
 #include <algorithm>
 #include <chrono>
@@ -352,7 +352,7 @@ TEST_CASE("what a sum over eight shards costs")
 // shard_clients.h, and every case that claims sharing forks for the reason the
 // cases above do: a single-process test of this passes on a heap allocation.
 
-#include "../../socketley/shared/shard_clients.h"
+#include "../../socketley/shared/ipc/shard_clients.h"
 
 namespace
 {

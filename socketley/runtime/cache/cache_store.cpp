@@ -1,7 +1,7 @@
 #include "cache_store.h"
-#include "../../shared/cache_shard_map.h"
-#include "../../shared/ipc_framing.h"
-#include "../../shared/logging.h"
+#include "../../shared/ipc/cache_shard_map.h"
+#include "../../shared/ipc/ipc_framing.h"
+#include "../../shared/util/logging.h"
 #include <fstream>
 #include <cstring>
 #include <random>
@@ -12,7 +12,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
-#include "../../shared/glob_match.h"
+#include "../../shared/util/glob_match.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>

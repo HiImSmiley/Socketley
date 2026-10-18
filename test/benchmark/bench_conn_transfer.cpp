@@ -77,8 +77,8 @@
 #include <unistd.h>
 #include <vector>
 
-#include "shared/conn_identity.h"
-#include "shared/conn_transfer.h"
+#include "shared/net/conn_identity.h"
+#include "shared/net/conn_transfer.h"
 
 namespace
 {

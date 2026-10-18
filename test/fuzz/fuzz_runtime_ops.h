@@ -92,9 +92,9 @@
 #include <unistd.h>
 
 #include "fuzz_common.h"
-#include "shared/event_loop.h"
-#include "shared/event_loop_definitions.h"
-#include "shared/invariants.h"
+#include "shared/loop/event_loop.h"
+#include "shared/loop/event_loop_definitions.h"
+#include "shared/util/invariants.h"
 
 namespace fuzzrt {
 
@@ -115,7 +115,7 @@ inline void (*&print_program_hook())()
 
 // Give the product's own invariants the same printer.
 //
-// socketley/shared/invariants.h aborts on its own account — invariant 4 is
+// socketley/shared/util/invariants.h aborts on its own account — invariant 4 is
 // literally one of its checks, and two more were added for the loop and the
 // held-and-not-owed pair that 2026-08-01 turned up.  Until now that abort landed
 // as a message with no decoded program behind it, which the nightly has carried

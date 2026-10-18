@@ -26,7 +26,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "../../shared/transparent_string.h"
+#include "../../shared/util/transparent_string.h"
 
 template <class V>
 class key_table

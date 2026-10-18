@@ -1,4 +1,4 @@
-// Fuzz target: the Raft wire codec (socketley/shared/raft_codec.h) and the
+// Fuzz target: the Raft wire codec (socketley/shared/cluster/raft_codec.h) and the
 // frame splitting in front of it.
 //
 // Reachable by anything that can open a TCP connection to a daemon's
@@ -34,9 +34,9 @@
 // hello's identity check against membership, which live in raft_host.
 
 #include "fuzz_common.h"
-#include "shared/ipc_framing.h"
-#include "shared/cluster_state.h"
-#include "shared/raft_codec.h"
+#include "shared/ipc/ipc_framing.h"
+#include "shared/cluster/cluster_state.h"
+#include "shared/cluster/raft_codec.h"
 
 #include <string>
 #include <string_view>

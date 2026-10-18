@@ -1,5 +1,5 @@
-#include "../shared/runtime_manager.h"
-#include "../shared/event_loop.h"
+#include "../shared/runtime/runtime_manager.h"
+#include "../shared/loop/event_loop.h"
 
 // The loop is declared first so it is destroyed last, because runtime
 // destructors reach the ring and a teardown after the loop's own destructor

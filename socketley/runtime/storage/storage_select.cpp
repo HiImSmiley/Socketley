@@ -6,7 +6,7 @@
 #include <cstdio>
 
 #include "s3_select.h"
-#include "../../shared/logging.h"
+#include "../../shared/util/logging.h"
 
 namespace socketley::storage
 {

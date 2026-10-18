@@ -24,7 +24,7 @@
 # of the time, without an error anywhere."
 #
 # What removes it is ownership by key hash: `shard = hash(key) mod N`, computed
-# from shared/cache_shard_map.h so that N processes that never speak to each
+# from shared/ipc/cache_shard_map.h so that N processes that never speak to each
 # other cannot disagree, and a command naming somebody else's key crossing to
 # them through the request channel.
 #

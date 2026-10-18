@@ -380,7 +380,7 @@ setup_refusal ul_both "--listen and -p"  -p $((P + 30)) --listen "unix:$D/both.s
 setup_refusal ul_udp  "--udp asks for"   --listen "unix:$D/udp.sock" --udp
 
 # --listen stopped being a server's flag alone when the listener moved to
-# shared/unix_listener.h: a proxy given one is accepted at parse now.  This
+# shared/net/unix_listener.h: a proxy given one is accepted at parse now.  This
 # inverts the refusal that used to sit here.  What it catches is the flag
 # falling back out of the common parser and becoming per-type again — the
 # behaviour behind it is proved in test_unix_listener_runtimes.sh, not here.

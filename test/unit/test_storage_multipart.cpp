@@ -8,9 +8,9 @@
 #include "runtime/storage/object_store.h"
 #include "runtime/storage/s3_multipart_xml.h"
 #include "runtime/storage/s3_sigv4_auth.h"
-#include "shared/event_loop.h"
-#include "shared/file_io.h"
-#include "shared/raft_storage.h"
+#include "shared/loop/event_loop.h"
+#include "shared/loop/file_io.h"
+#include "shared/cluster/raft_storage.h"
 
 #include <cstdlib>
 #include <cstring>

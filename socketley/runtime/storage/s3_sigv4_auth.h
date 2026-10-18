@@ -1,7 +1,7 @@
 #pragma once
 // The storage runtime's authenticator for AWS Signature Version 4: the
 // credentials it accepts, the verification of each request's signature by the
-// library in shared/s3_sigv4.h, and the body hooks that check a signed payload
+// library in shared/storage/s3_sigv4.h, and the body hooks that check a signed payload
 // hash or decode and verify an aws-chunked stream on its way in.
 #include <chrono>
 #include <cstdint>
@@ -14,7 +14,7 @@
 
 #include "s3_auth.h"
 #include "s3_users.h"
-#include "../../shared/s3_sigv4.h"
+#include "../../shared/storage/s3_sigv4.h"
 
 namespace socketley::storage
 {

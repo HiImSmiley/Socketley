@@ -2,10 +2,10 @@
 
 #include "daemon_handler.h"
 #include "raft_host.h"
-#include "../shared/logging.h"
-#include "../shared/random_id.h"
-#include "../shared/replica_role.h"
-#include "../shared/runtime_manager.h"
+#include "../shared/util/logging.h"
+#include "../shared/util/random_id.h"
+#include "../shared/cluster/replica_role.h"
+#include "../shared/runtime/runtime_manager.h"
 
 #include <algorithm>
 #include <set>

@@ -2,7 +2,7 @@
 #include "doctest.h"
 
 #include "../../socketley/runtime/storage/bucket_policy.h"
-#include "../../socketley/shared/glob_match.h"
+#include "../../socketley/shared/util/glob_match.h"
 #include "../../socketley/runtime/storage/json_doc.h"
 
 #include <string>

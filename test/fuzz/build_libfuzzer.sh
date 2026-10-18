@@ -91,16 +91,16 @@ build() {
 want fuzz_resp     && build fuzz_resp "$ROOT/test/fuzz/fuzz_resp.cpp"
 want fuzz_ws_frame && build fuzz_ws_frame "$ROOT/test/fuzz/fuzz_ws_frame.cpp" -lssl -lcrypto
 want fuzz_raft_msg && build fuzz_raft_msg "$ROOT/test/fuzz/fuzz_raft_msg.cpp" \
-    "$ROOT/socketley/shared/raft_codec.cpp" "$ROOT/socketley/shared/raft.cpp"
+    "$ROOT/socketley/shared/cluster/raft_codec.cpp" "$ROOT/socketley/shared/cluster/raft.cpp"
 want fuzz_s3_sigv4 && build fuzz_s3_sigv4 "$ROOT/test/fuzz/fuzz_s3_sigv4.cpp" \
-    "$ROOT/socketley/shared/s3_sigv4.cpp" -lcrypto
+    "$ROOT/socketley/shared/storage/s3_sigv4.cpp" -lcrypto
 want fuzz_bucket_policy && build fuzz_bucket_policy "$ROOT/test/fuzz/fuzz_bucket_policy.cpp" \
     "$ROOT/socketley/runtime/storage/bucket_policy.cpp"
 want fuzz_dns && build fuzz_dns "$ROOT/test/fuzz/fuzz_dns.cpp" "$ROOT/socketley/runtime/dns/dns_wire.cpp" \
     "$ROOT/socketley/runtime/dns/dns_zone.cpp" "$ROOT/socketley/runtime/dns/dns_answer.cpp"
 want fuzz_db && build fuzz_db "$ROOT/test/fuzz/fuzz_db.cpp" "$ROOT/socketley/runtime/db/db_doc.cpp" \
     "$ROOT/socketley/runtime/db/db_schema.cpp" "$ROOT/socketley/runtime/db/db_store.cpp" \
-    "$ROOT/socketley/shared/jws.cpp" -lcrypto
+    "$ROOT/socketley/shared/crypto/jws.cpp" -lcrypto
 
 # fuzz_cache_ops needs one .cpp out of the runtime rather than the whole SDK,
 # because cache_store.cpp includes nothing but libc headers.
@@ -115,7 +115,7 @@ want fuzz_http_response && build fuzz_http_response "$ROOT/test/fuzz/fuzz_http_r
 # opens a ring, so -luring is a link-time dependency only and the binary runs
 # anywhere.
 want fuzz_event_loop && build fuzz_event_loop \
-    "$ROOT/test/fuzz/fuzz_event_loop.cpp" "$ROOT/socketley/shared/event_loop.cpp" -luring
+    "$ROOT/test/fuzz/fuzz_event_loop.cpp" "$ROOT/socketley/shared/loop/event_loop.cpp" -luring
 
 # ─── the targets that link the runtime ──────────────────────────────────────
 # The four runtime-linking targets cannot use premake's GCC archive, because

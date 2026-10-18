@@ -269,7 +269,7 @@ project "socketley"
     --
     -- It costs two #defines per TU: the header includes
     -- <liburing/io_uring_version.h>, not <liburing.h>.
-    forceincludes { "socketley/shared/liburing_version.h" }
+    forceincludes { "socketley/shared/loop/liburing_version.h" }
 
     libdirs { "thirdparty/luajit", "thirdparty/liburing" }
     -- liburing from its archive only, so no binary loads a liburing.so other than the version it was compiled against.
@@ -545,7 +545,7 @@ project "test_cache_slots"
     -- assert over all 16384 slots at four shard counts without an event loop.
     files {
         "test/unit/test_cache_slots.cpp",
-        "socketley/shared/cache_shard_map.h"
+        "socketley/shared/ipc/cache_shard_map.h"
     }
 
     filter "configurations:Debug"
@@ -584,8 +584,8 @@ project "test_shard_stats"
     -- can fork freely.  A test that had to bring up an event loop could not.
     files {
         "test/unit/test_shard_stats.cpp",
-        "socketley/shared/shard_stats.h",
-        "socketley/shared/shard_clients.h"
+        "socketley/shared/ipc/shard_stats.h",
+        "socketley/shared/ipc/shard_clients.h"
     }
 
     filter "configurations:Debug"
@@ -722,8 +722,8 @@ project "test_request_channel"
     }
 
     files { "test/unit/test_request_channel.cpp",
-            "socketley/shared/request_channel.cpp",
-            "socketley/shared/event_loop.cpp" }
+            "socketley/shared/ipc/request_channel.cpp",
+            "socketley/shared/loop/event_loop.cpp" }
 
     links { "uring:static" }
 
@@ -1333,9 +1333,9 @@ project "fuzz_raft_msg"
         "test/fuzz/fuzz_raft_msg.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
-        "socketley/shared/raft_codec.cpp",
-        "socketley/shared/raft.cpp",
-        "socketley/shared/cluster_state.cpp"
+        "socketley/shared/cluster/raft_codec.cpp",
+        "socketley/shared/cluster/raft.cpp",
+        "socketley/shared/cluster/cluster_state.cpp"
     }
 
     fuzz_target_settings()
@@ -1357,7 +1357,7 @@ project "fuzz_s3_sigv4"
         "test/fuzz/fuzz_s3_sigv4.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
-        "socketley/shared/s3_sigv4.cpp"
+        "socketley/shared/storage/s3_sigv4.cpp"
     }
 
     fuzz_target_settings()
@@ -1421,7 +1421,7 @@ project "fuzz_db"
         "socketley/runtime/db/db_schema.cpp",
         "socketley/runtime/db/db_store.cpp",
         "socketley/runtime/db/db_log.cpp",
-        "socketley/shared/jws.cpp"
+        "socketley/shared/crypto/jws.cpp"
     }
 
     fuzz_target_settings()
@@ -1481,7 +1481,7 @@ project "fuzz_cache_ops"
 --
 -- The counterpart to fuzz_http_request, and the cheap one.  The response parser
 -- used to be a block of statements inside handle_backend_read, reachable only
--- from a running daemon; it is now shared/http_framing.h, which
+-- from a running daemon; it is now shared/http/http_framing.h, which
 -- includes <charconv> and <string_view> and nothing else.  So this target is
 -- three translation units like fuzz_resp, links no libraries, and belongs in
 -- the per-push job — unlike fuzz_http_request, which still needs the whole SDK.
@@ -1497,7 +1497,7 @@ project "fuzz_http_response"
         "test/fuzz/fuzz_http_response.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
-        "socketley/shared/http_framing.h"
+        "socketley/shared/http/http_framing.h"
     }
 
     fuzz_target_settings()
@@ -1523,7 +1523,7 @@ project "fuzz_proxy_tunnel"
         "test/fuzz/fuzz_proxy_tunnel.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
-        "socketley/shared/http_framing.h"
+        "socketley/shared/http/http_framing.h"
     }
 
     fuzz_target_settings()
@@ -1555,7 +1555,7 @@ project "fuzz_event_loop"
         "test/fuzz/fuzz_event_loop.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
-        "socketley/shared/event_loop.cpp"
+        "socketley/shared/loop/event_loop.cpp"
     }
 
     fuzz_target_settings()
@@ -1850,9 +1850,9 @@ project "test_raft"
 
     files {
         "test/unit/test_raft.cpp",
-        "socketley/shared/raft.cpp",
-        "socketley/shared/raft.h",
-        "socketley/shared/raft_codec.cpp"
+        "socketley/shared/cluster/raft.cpp",
+        "socketley/shared/cluster/raft.h",
+        "socketley/shared/cluster/raft_codec.cpp"
     }
 
     filter "configurations:Debug"
@@ -1890,8 +1890,8 @@ project "test_cluster_state"
 
     files {
         "test/unit/test_cluster_state.cpp",
-        "socketley/shared/cluster_state.cpp",
-        "socketley/shared/replica_role.cpp"
+        "socketley/shared/cluster/cluster_state.cpp",
+        "socketley/shared/cluster/replica_role.cpp"
     }
 
     filter "configurations:Debug"
@@ -1967,7 +1967,7 @@ project "test_s3_sigv4"
 
     files {
         "test/unit/test_s3_sigv4.cpp",
-        "socketley/shared/s3_sigv4.cpp"
+        "socketley/shared/storage/s3_sigv4.cpp"
     }
 
     filter "configurations:Debug"
@@ -2006,10 +2006,10 @@ project "test_cluster_brain"
 
     files {
         "test/unit/test_cluster_brain.cpp",
-        "socketley/shared/cluster_brain.cpp",
-        "socketley/shared/cluster_state.cpp",
-        "socketley/shared/replica_role.cpp",
-        "socketley/shared/raft.cpp"
+        "socketley/shared/cluster/cluster_brain.cpp",
+        "socketley/shared/cluster/cluster_state.cpp",
+        "socketley/shared/cluster/replica_role.cpp",
+        "socketley/shared/cluster/raft.cpp"
     }
 
     filter "configurations:Debug"
@@ -2273,7 +2273,7 @@ project "test_hpack"
         "socketley"
     }
 
-    files { "test/unit/test_hpack.cpp", "socketley/shared/hpack.cpp" }
+    files { "test/unit/test_hpack.cpp", "socketley/shared/http/hpack.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }
@@ -2626,7 +2626,7 @@ project "test_idp"
     links { "crypto", "dl" }
 
     files { "test/unit/test_idp.cpp", "socketley/runtime/idp/idp_logic.cpp", "socketley/runtime/idp/idp_accounts.cpp",
-            "socketley/runtime/idp/idp_shard.cpp", "socketley/shared/jws.cpp" }
+            "socketley/runtime/idp/idp_shard.cpp", "socketley/shared/crypto/jws.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }
@@ -2661,7 +2661,7 @@ project "test_db"
 
     files { "test/unit/test_db.cpp", "socketley/runtime/db/db_doc.cpp", "socketley/runtime/db/db_schema.cpp",
             "socketley/runtime/db/db_store.cpp", "socketley/runtime/db/db_log.cpp", "socketley/runtime/db/db_shard.cpp",
-            "socketley/shared/jws.cpp" }
+            "socketley/shared/crypto/jws.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

@@ -12,7 +12,7 @@
 #include <memory>
 #include <string>
 
-#include "../../shared/event_loop.h"
+#include "../../shared/loop/event_loop.h"
 #include "../storage/git_mirrors.h"
 
 class sync_instance;

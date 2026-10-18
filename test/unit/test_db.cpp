@@ -17,9 +17,9 @@
 #include "runtime/db/db_schema.h"
 #include "runtime/db/db_shard.h"
 #include "runtime/db/db_store.h"
-#include "shared/byte_codec.h"
-#include "shared/db_call.h"
-#include "shared/mutation_journal.h"
+#include "shared/util/byte_codec.h"
+#include "shared/lua/db_call.h"
+#include "shared/persist/mutation_journal.h"
 
 using namespace socketley::db;
 

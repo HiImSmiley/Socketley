@@ -8,7 +8,7 @@
 #include "s3_tagging.h"
 #include "s3_xml.h"
 #include "s3_xml_tree.h"
-#include "../../shared/random_id.h"
+#include "../../shared/util/random_id.h"
 
 namespace socketley::storage
 {

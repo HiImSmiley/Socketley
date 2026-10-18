@@ -1,6 +1,6 @@
 #include "s3_federation.h"
-#include "../../shared/logging.h"
-#include "../../shared/tls_context.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/crypto/tls_context.h"
 
 #include <algorithm>
 #include <cerrno>

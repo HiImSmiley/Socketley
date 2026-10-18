@@ -1,5 +1,5 @@
 #include "runtime_schema.h"
-#include "../shared/runtime_config_apply.h"
+#include "../shared/runtime/runtime_config_apply.h"
 
 #include <string_view>
 

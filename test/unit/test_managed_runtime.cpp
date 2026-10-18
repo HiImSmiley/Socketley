@@ -1,9 +1,9 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
-#include "shared/runtime_factory.h"
-#include "shared/runtime_instance.h"
-#include "shared/state_persistence.h"
-#include "shared/event_loop.h"
+#include "shared/runtime/runtime_factory.h"
+#include "shared/runtime/runtime_instance.h"
+#include "shared/persist/state_persistence.h"
+#include "shared/loop/event_loop.h"
 
 #include <filesystem>
 #include <string>

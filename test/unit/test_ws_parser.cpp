@@ -1,6 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
-#include "shared/ws_protocol.h"
+#include "shared/http/ws_protocol.h"
 
 TEST_CASE("ws_frame_text: small payload")
 {

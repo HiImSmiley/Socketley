@@ -23,8 +23,8 @@
 #  error "Socketley requires Linux (io_uring)"
 #endif
 
-#include "../../../socketley/shared/event_loop.h"
-#include "../../../socketley/shared/runtime_manager.h"
+#include "../../../socketley/shared/loop/event_loop.h"
+#include "../../../socketley/shared/runtime/runtime_manager.h"
 #include "../../../socketley/daemon/daemon.h"
 
 namespace socketley {

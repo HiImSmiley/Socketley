@@ -2,7 +2,7 @@
 // the streaming of a body into an object and of an object out to a socket.
 #include "storage_run.h"
 #include "json_doc.h"
-#include "../../shared/git_names.h"
+#include "../../shared/storage/git_names.h"
 
 #include <algorithm>
 #include <unordered_set>
@@ -23,12 +23,12 @@
 #include "s3_vhost.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
-#include "../../shared/logging.h"
-#include "../../shared/random_id.h"
-#include "../../shared/runtime_manager.h"
-#include "../../shared/replaced_file.h"
-#include "../../shared/state_persistence.h"
-#include "../../shared/unix_listener.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/util/random_id.h"
+#include "../../shared/runtime/runtime_manager.h"
+#include "../../shared/persist/replaced_file.h"
+#include "../../shared/persist/state_persistence.h"
+#include "../../shared/net/unix_listener.h"
 
 namespace socketley::storage
 {

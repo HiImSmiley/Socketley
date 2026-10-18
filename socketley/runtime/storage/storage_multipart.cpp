@@ -11,7 +11,7 @@
 #include "s3_vhost.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
-#include "../../shared/logging.h"
+#include "../../shared/util/logging.h"
 
 namespace socketley::storage
 {

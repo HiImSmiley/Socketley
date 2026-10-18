@@ -1,6 +1,6 @@
 #pragma once
-#include "../../shared/fd_table.h"
-#include "../../shared/async_resolver.h"
+#include "../../shared/loop/fd_table.h"
+#include "../../shared/net/async_resolver.h"
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -14,15 +14,15 @@
 #include <netinet/in.h>
 #include <sys/uio.h>
 
-#include "../../shared/runtime_instance.h"
-#include "../../shared/route_table.h"
-#include "../../shared/write_queue.h"
-#include "../../shared/event_loop_definitions.h"
-#include "../../shared/tls_context.h"
-#include "../../shared/trace.h"
-#include "../../shared/invariants.h"
-#include "../../shared/http_framing.h"
-#include "../../shared/transparent_string.h"
+#include "../../shared/runtime/runtime_instance.h"
+#include "../../shared/http/route_table.h"
+#include "../../shared/loop/write_queue.h"
+#include "../../shared/loop/event_loop_definitions.h"
+#include "../../shared/crypto/tls_context.h"
+#include "../../shared/util/trace.h"
+#include "../../shared/util/invariants.h"
+#include "../../shared/http/http_framing.h"
+#include "../../shared/util/transparent_string.h"
 #include "proxy_auth.h"
 
 struct runtime_endpoint;
@@ -93,7 +93,7 @@ static constexpr size_t RETRY_KEEP_BYTES = 64 * 1024;
 // How long a client may take to finish a header block once it has started one,
 // deliberately not a flag and not tied to --idle-timeout, whose default of 0
 // must not switch it off.
-// In shared/http_framing.h now, because the server asks the same question and
+// In shared/http/http_framing.h now, because the server asks the same question and
 // answered it differently -- which is to say not at all.
 static constexpr int PROXY_HEADER_TIMEOUT_SEC = http_header_deadline_secs;
 // A client answered and closed on is read away for at most this long and
@@ -187,7 +187,7 @@ struct proxy_exchange
 
 // An HTTP/2 session and one stream's protocol state, opaque here for the same reason the storage keeps them so:
 // only the file that frames a stream includes the codec, HPACK and the session's own header.
-#include "../../shared/h3_endpoint.h"
+#include "../../shared/http/h3_endpoint.h"
 
 namespace socketley::mux { struct request; }
 

@@ -25,9 +25,9 @@
 #include "outbox.h"
 #include "s3_replication.h"
 #include "sse.h"
-#include "../../shared/event_loop.h"
-#include "../../shared/file_io.h"
-#include "../../shared/hash_pool.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/file_io.h"
+#include "../../shared/loop/hash_pool.h"
 
 namespace socketley::storage
 {

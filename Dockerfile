@@ -19,7 +19,7 @@
 # of them mentions liburing or a version.  There is nothing to probe or fall back
 # to at compile time — the identifiers are simply not declared — so the
 # dependency is a hard floor, not a capability the daemon negotiates at run time
-# the way it negotiates opcodes.  socketley/shared/liburing_version.h now states
+# the way it negotiates opcodes.  socketley/shared/loop/liburing_version.h now states
 # that floor before any of this is reached.
 #
 # This file used to be the only place that had been corrected, and it said so:

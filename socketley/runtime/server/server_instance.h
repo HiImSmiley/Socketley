@@ -1,8 +1,8 @@
 #pragma once
-#include "../../shared/fd_table.h"
-#include "../../shared/async_resolver.h"
-#include "../../shared/conn_reachability.h"
-#include "../../shared/http_framing.h"
+#include "../../shared/loop/fd_table.h"
+#include "../../shared/net/async_resolver.h"
+#include "../../shared/net/conn_reachability.h"
+#include "../../shared/http/http_framing.h"
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -17,21 +17,21 @@
 #include <filesystem>
 #include <sys/stat.h>
 
-#include "../../shared/conn_identity.h"
-#include "../../shared/runtime_instance.h"
-#include "../../shared/unix_companion.h"
-#include "../../shared/write_queue.h"
-#include "../../shared/direct_send.h"
-#include "../../shared/event_loop_definitions.h"
-#include "../../shared/request_channel.h"
-#include "../../shared/tls_context.h"
-#include "../../shared/transparent_string.h"
-#include "../../shared/ws_protocol.h"
+#include "../../shared/net/conn_identity.h"
+#include "../../shared/runtime/runtime_instance.h"
+#include "../../shared/net/unix_companion.h"
+#include "../../shared/loop/write_queue.h"
+#include "../../shared/net/direct_send.h"
+#include "../../shared/loop/event_loop_definitions.h"
+#include "../../shared/ipc/request_channel.h"
+#include "../../shared/crypto/tls_context.h"
+#include "../../shared/util/transparent_string.h"
+#include "../../shared/http/ws_protocol.h"
 #include <linux/time_types.h>
 
 class runtime_manager;
 
-// tls_conn_state lives in shared/tls_context.h, included above: the proxy runs
+// tls_conn_state lives in shared/crypto/tls_context.h, included above: the proxy runs
 // the same state machine on both of its legs, and a second spelling of it
 // would be a second thing to keep in step.
 

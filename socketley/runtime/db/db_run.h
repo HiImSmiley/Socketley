@@ -23,11 +23,11 @@
 #include "db_shard.h"
 #include "db_store.h"
 #include "../idp/idp_session.h"
-#include "../../shared/db_call.h"
-#include "../../shared/event_loop.h"
-#include "../../shared/event_loop_definitions.h"
-#include "../../shared/file_io.h"
-#include "../../shared/request_channel.h"
+#include "../../shared/lua/db_call.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/event_loop_definitions.h"
+#include "../../shared/loop/file_io.h"
+#include "../../shared/ipc/request_channel.h"
 
 class db_instance;
 

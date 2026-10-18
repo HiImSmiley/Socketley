@@ -42,15 +42,15 @@
 #include "s3_auth.h"
 #include "s3_users.h"
 #include "../idp/idp_session.h"
-#include "../../shared/h3_endpoint.h"
-#include "../../shared/storage_rpc.h"
+#include "../../shared/http/h3_endpoint.h"
+#include "../../shared/storage/storage_rpc.h"
 #include "shard_node.h"
 #include "storage_transport.h"
-#include "../../shared/event_loop.h"
-#include "../../shared/file_io.h"
-#include "../../shared/hash_pool.h"
-#include "../../shared/http_framing.h"
-#include "../../shared/tls_context.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/file_io.h"
+#include "../../shared/loop/hash_pool.h"
+#include "../../shared/http/http_framing.h"
+#include "../../shared/crypto/tls_context.h"
 
 // ngtcp2's packet header, named by an HTTP/3 member without its header.
 struct ngtcp2_pkt_hd;
@@ -808,7 +808,7 @@ public:
     void h3_sent(size_t n);
     uint32_t h3_shards() const;
     // The machinery between a datagram and a stream's bytes -- the socket, the packets, the handshakes, the
-    // timers and the congestion control -- is shared/h3_endpoint.cpp's; what stays here is what only this
+    // timers and the congestion control -- is shared/http/h3_endpoint.cpp's; what stays here is what only this
     // runtime can say about a stream, declared above.
 #endif
     void close_conn(const std::shared_ptr<conn>& c);

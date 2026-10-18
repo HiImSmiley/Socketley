@@ -14,8 +14,8 @@
 #include <openssl/rand.h>
 
 #include "idp_logic.h"
-#include "../../shared/byte_codec.h"
-#include "../../shared/jws.h"
+#include "../../shared/util/byte_codec.h"
+#include "../../shared/crypto/jws.h"
 #include "../storage/json_doc.h"
 
 namespace socketley::idp

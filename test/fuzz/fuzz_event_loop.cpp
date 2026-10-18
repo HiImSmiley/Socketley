@@ -31,7 +31,7 @@
 //
 // The decision used to be the body of run()'s io_uring_for_each_cqe, and a
 // block of code inside a loop is not a symbol — the same wall
-// shared/http_framing.h was lifted over, and lifted the same
+// shared/http/http_framing.h was lifted over, and lifted the same
 // way: it is now event_loop::dispatch_cqe(), one completion in, one "keep going
 // or stop" out.  Nothing else about the loop changed.  See the note above it in
 // event_loop.cpp.
@@ -174,7 +174,7 @@
 // Member access affects neither layout nor mangling, so event_loop.cpp compiled
 // normally and this translation unit agree on the object.
 #define private public
-#include "../../socketley/shared/event_loop.h"
+#include "../../socketley/shared/loop/event_loop.h"
 #undef private
 
 // Completion flags this target sets deliberately.  Spelled with a fallback

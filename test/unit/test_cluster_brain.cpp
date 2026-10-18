@@ -1,8 +1,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include "../../socketley/shared/cluster_brain.h"
-#include "../../socketley/shared/raft.h"
+#include "../../socketley/shared/cluster/cluster_brain.h"
+#include "../../socketley/shared/cluster/raft.h"
 
 #include <algorithm>
 #include <cstdint>

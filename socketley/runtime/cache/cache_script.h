@@ -4,7 +4,7 @@
 //
 // ─── WHY THIS IS NOT lua_context ───────────────────────────────────────────
 //
-// shared/lua_context.h says of itself: "This is not a sandbox and says so:
+// shared/lua/lua_context.h says of itself: "This is not a sandbox and says so:
 // `io`, `package` and `base` are open, so a Lua handler runs with the daemon's
 // full privileges."  That is the right trade for a script the operator wrote
 // and pointed --lua at.  It is the wrong one for EVAL, where the script is
@@ -16,7 +16,7 @@
 // cannot read the globals of the operator's.
 //
 // What a script can still do is spend time and allocate, and the answer to
-// both is the count hook shared/lua_context.h already carries -- the same
+// both is the count hook shared/lua/lua_context.h already carries -- the same
 // deadline a callback gets, armed per EVAL.
 
 // Compiled only where Lua is: this file IS the Lua, and the nolua SDK builds
@@ -33,7 +33,7 @@
 #include <vector>
 
 #include <sol/sol.hpp>
-#include "../../shared/transparent_string.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley {
 

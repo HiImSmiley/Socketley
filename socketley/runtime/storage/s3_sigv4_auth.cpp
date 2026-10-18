@@ -21,9 +21,9 @@
 #include "s3_iam.h"
 #include "s3_names.h"
 #include "s3_sts.h"
-#include "../../shared/logging.h"
-#include "../../shared/s3_sigv4.h"
-#include "../../shared/size_suffix.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/storage/s3_sigv4.h"
+#include "../../shared/util/size_suffix.h"
 
 namespace socketley::storage
 {

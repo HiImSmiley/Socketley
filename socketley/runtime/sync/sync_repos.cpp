@@ -6,8 +6,8 @@
 #include <sstream>
 #include <vector>
 
-#include "../../shared/logging.h"
-#include "../../shared/replaced_file.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/persist/replaced_file.h"
 #include "../storage/json_doc.h"
 
 namespace socketley::sync

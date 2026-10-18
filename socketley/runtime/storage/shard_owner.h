@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <string_view>
 
-#include "../../shared/cache_shard_map.h"
+#include "../../shared/ipc/cache_shard_map.h"
 
 namespace socketley::storage
 {

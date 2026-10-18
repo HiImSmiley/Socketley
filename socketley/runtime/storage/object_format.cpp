@@ -8,7 +8,7 @@
 #include <unordered_map>
 
 #include "compression.h"
-#include "../../shared/raft_storage.h"
+#include "../../shared/cluster/raft_storage.h"
 
 namespace socketley::storage
 {

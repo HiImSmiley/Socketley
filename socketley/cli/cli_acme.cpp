@@ -34,11 +34,11 @@
 #include <thread>
 #include <vector>
 
-#include "../shared/cert_keeper.h"
-#include "../shared/https_client.h"
-#include "../shared/jws.h"
-#include "../shared/dns_feed.h"
-#include "../shared/tls_context.h"
+#include "../shared/crypto/cert_keeper.h"
+#include "../shared/http/https_client.h"
+#include "../shared/crypto/jws.h"
+#include "../shared/net/dns_feed.h"
+#include "../shared/crypto/tls_context.h"
 #include "../runtime/storage/json_doc.h"
 
 namespace

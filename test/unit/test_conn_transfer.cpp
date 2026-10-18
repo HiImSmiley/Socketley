@@ -1,9 +1,9 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include "shared/conn_identity.h"
-#include "shared/conn_transfer.h"
-#include "shared/event_loop.h"
+#include "shared/net/conn_identity.h"
+#include "shared/net/conn_transfer.h"
+#include "shared/loop/event_loop.h"
 
 #include <cerrno>
 #include <cstring>

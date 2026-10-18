@@ -1,9 +1,9 @@
 #include "proxy_supervisor.h"
-#include "../shared/log_ring.h"
-#include "../shared/fast_lo.h"
-#include "../shared/worker_env.h"
+#include "../shared/util/log_ring.h"
+#include "../shared/net/fast_lo.h"
+#include "../shared/ipc/worker_env.h"
 
-#include "../shared/peer_link.h"
+#include "../shared/ipc/peer_link.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -17,17 +17,17 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
-#include "../shared/fd_placement.h"
+#include "../shared/net/fd_placement.h"
 
 #include <poll.h>
 
 #include "../runtime/proxy/proxy_instance.h"
-#include "../shared/event_loop.h"
-#include "../shared/logging.h"
-#include "../shared/runtime_instance.h"
-#include "../shared/state_persistence.h"
-#include "../shared/shard_target.h"
-#include "../shared/worker_protocol.h"
+#include "../shared/loop/event_loop.h"
+#include "../shared/util/logging.h"
+#include "../shared/runtime/runtime_instance.h"
+#include "../shared/persist/state_persistence.h"
+#include "../shared/ipc/shard_target.h"
+#include "../shared/ipc/worker_protocol.h"
 
 namespace
 {

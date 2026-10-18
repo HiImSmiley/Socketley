@@ -1,24 +1,24 @@
-#include "../../shared/cert_keeper.h"
-#include "../../shared/socket_tuning.h"
-#include "../../shared/conn_alloc.h"
+#include "../../shared/crypto/cert_keeper.h"
+#include "../../shared/net/socket_tuning.h"
+#include "../../shared/loop/conn_alloc.h"
 #include "server_instance.h"
-#include "../../shared/lua_suspend.h"
-#include "../../shared/coarse_clock.h"
-#include "../../shared/conn_reachability.h"
+#include "../../shared/lua/lua_suspend.h"
+#include "../../shared/loop/coarse_clock.h"
+#include "../../shared/net/conn_reachability.h"
 
 // The HTTP header-line helpers, shared rather than copied, because a second
 // implementation of "is this a whole decimal" is a second place for the answer
 // to differ.
-#include "../../shared/http_framing.h"
-#include "../../shared/unix_listener.h"
-#include "../../shared/blocking_write.h"
-#include "../../shared/event_loop.h"
-#include "../../shared/runtime_manager.h"
-#include "../../shared/route_relay.h"
-#include "../../shared/lua_context.h"
-#include "../../shared/ws_protocol.h"
-#include "../../shared/invariants.h"
-#include "../../shared/logging.h"
+#include "../../shared/http/http_framing.h"
+#include "../../shared/net/unix_listener.h"
+#include "../../shared/loop/blocking_write.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/runtime/runtime_manager.h"
+#include "../../shared/ipc/route_relay.h"
+#include "../../shared/lua/lua_context.h"
+#include "../../shared/http/ws_protocol.h"
+#include "../../shared/util/invariants.h"
+#include "../../shared/util/logging.h"
 #include "../../cli/command_hashing.h"
 // Deliberately not cache_instance.h, because everything this runtime needs of
 // a cache goes through the request channel as bytes.
@@ -2158,7 +2158,7 @@ bool server_instance::setup_tcp_listener(uint16_t port)
     return true;
 }
 
-// The AF_UNIX listener, whose mechanism is shared/unix_listener.h's; what
+// The AF_UNIX listener, whose mechanism is shared/net/unix_listener.h's; what
 // stays here is which member holds the fd and the record of which path was
 // bound.
 bool server_instance::setup_unix_listener(const std::string& path)
@@ -3041,7 +3041,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 if (lua())
                 {
                     auto& sus = lua()->suspender();
-                    // The same clock the record was armed on; see shared/coarse_clock.h
+                    // The same clock the record was armed on; see shared/loop/coarse_clock.h
                     // on why a deadline armed on one and tested on the other is
                     // wrong by a tick in whichever direction the pair happens to sit.
                     const size_t gone = sus.expire(socketley::coarse_now());

@@ -12,7 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../../shared/transparent_string.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::dns
 {

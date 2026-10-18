@@ -8,10 +8,10 @@
 
 #include "runtime_type_parser.h"
 #include "../daemon/ipc_client.h"
-#include "../shared/ipc_framing.h"
+#include "../shared/ipc/ipc_framing.h"
 #include "command_hashing.h"
 #include "../daemon/type_manifest.h"
-#include "../shared/paths.h"
+#include "../shared/persist/paths.h"
 
 namespace {
 

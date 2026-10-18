@@ -5,7 +5,7 @@
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
 # test_server_unix_listen.sh proves the mechanism where it was born; this file
 # proves it is shared rather than copied -- the proxy and cache bind through
-# the same shared/unix_listener.h, the client dials through the same address
+# the same shared/net/unix_listener.h, the client dials through the same address
 # construction, and each runtime's own incompatibilities are refused with their
 # stated reasons.
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────

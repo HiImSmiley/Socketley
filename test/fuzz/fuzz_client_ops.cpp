@@ -62,11 +62,11 @@
 #include "fuzz_common.h"
 #include "fuzz_runtime_ops.h"
 
-#include "shared/event_loop.h"
-#include "shared/event_loop_definitions.h"
-#include "shared/logging.h"
-#include "shared/runtime_instance.h"
-#include "shared/write_queue.h"
+#include "shared/loop/event_loop.h"
+#include "shared/loop/event_loop_definitions.h"
+#include "shared/util/logging.h"
+#include "shared/runtime/runtime_instance.h"
+#include "shared/loop/write_queue.h"
 
 // Reaching inside the class, exactly as fuzz_cache_ops and fuzz_server_ops do
 // and for the same reason: the per-connection half of invariant 2 is about

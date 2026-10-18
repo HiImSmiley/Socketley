@@ -34,7 +34,7 @@
 # ─── WHY THE PREFIX DEFAULTS TO /usr AND NOT /usr/local ─────────────────────
 #
 # The binary decides for itself whether it is installed, by testing
-# /usr/bin/socketley for execute -- socketley/shared/paths.cpp:53.  Under any
+# /usr/bin/socketley for execute -- socketley/shared/persist/paths.cpp:53.  Under any
 # other prefix that test fails, so even as root the daemon stays in user mode:
 # socket at /tmp/socketley.sock, state under $HOME, and `socketley --help`
 # looking for /usr/share/socketley/socketley-help.sh and finding nothing.  /usr
@@ -127,7 +127,7 @@ Options
   -h, --help      this text
 
 The prefix defaults to /usr because the binary tests /usr/bin/socketley to
-decide whether it is installed (socketley/shared/paths.cpp:53).  Under any
+decide whether it is installed (socketley/shared/persist/paths.cpp:53).  Under any
 other prefix the daemon runs in user mode -- socket /tmp/socketley.sock, state
 under $HOME -- so this script installs no systemd service there, and says so.
 
@@ -423,7 +423,7 @@ fi
 if [ "$WANT_SERVICE" = 0 ]; then
     note ""
     note "prefix is $PREFIX and not /usr.  The binary tests /usr/bin/socketley to decide"
-    note "whether it is installed (socketley/shared/paths.cpp:53), so from here it runs in"
+    note "whether it is installed (socketley/shared/persist/paths.cpp:53), so from here it runs in"
     note "user mode: socket /tmp/socketley.sock, state in ~/.local/share/socketley, and"
     note "\`socketley --help\` will not find its help script.  This run installs no systemd"
     note "service, no system user and no /var/lib/socketley."

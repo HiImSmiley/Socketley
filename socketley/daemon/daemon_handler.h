@@ -10,10 +10,10 @@
 #include <chrono>
 #include <sys/un.h>
 
-#include "../shared/event_loop_definitions.h"
-#include "../shared/runtime_instance.h"
-#include "../shared/shard_clients.h"
-#include "../shared/route_relay.h"
+#include "../shared/loop/event_loop_definitions.h"
+#include "../shared/runtime/runtime_instance.h"
+#include "../shared/ipc/shard_clients.h"
+#include "../shared/ipc/route_relay.h"
 #include "../cli/arg_parser.h"
 
 class event_loop;

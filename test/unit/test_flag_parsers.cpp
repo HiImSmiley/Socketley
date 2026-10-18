@@ -144,7 +144,7 @@ TEST_CASE("parse_size_suffix: a size that would wrap is refused, not wrapped")
 // three of the four duration flags never checked from_chars's end pointer, so
 // `--health-interval 5x` configured five seconds without a word about the x.
 
-#include "../../socketley/shared/duration_parse.h"
+#include "../../socketley/shared/util/duration_parse.h"
 
 static constexpr uint64_t dur_max = std::numeric_limits<int>::max();
 

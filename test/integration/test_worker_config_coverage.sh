@@ -70,7 +70,7 @@ trap cleanup EXIT
 
 echo "=== Integration: a worker's runtime is the one that was asked for ==="
 
-SP="$ROOT/socketley/shared/state_persistence.h"
+SP="$ROOT/socketley/shared/persist/state_persistence.h"
 if [ ! -f "$SP" ]; then
     echo "  SKIP: sources not present"
     exit 0
@@ -80,13 +80,13 @@ REPORT=$(python3 - "$ROOT" <<'PY'
 import re, sys, os
 root = sys.argv[1]
 
-sp = open(os.path.join(root, 'socketley/shared/state_persistence.h')).read()
+sp = open(os.path.join(root, 'socketley/shared/persist/state_persistence.h')).read()
 m  = re.search(r'struct runtime_config\s*\{(.*?)\n\};', sp, re.S)
 fields = list(dict.fromkeys(
     re.findall(r'^\s*(?:std::)?[\w:<>,\s]+?\s+(\w+)\s*(?:=|;)', m.group(1), re.M)))
 
 applied = set()
-for f in ('socketley/shared/runtime_config_apply.cpp',
+for f in ('socketley/shared/runtime/runtime_config_apply.cpp',
           'socketley/runtime/worker/worker_main.cpp'):
     applied |= set(re.findall(r'cfg\.(\w+)', open(os.path.join(root, f)).read()))
 

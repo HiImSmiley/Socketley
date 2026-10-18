@@ -10,7 +10,7 @@
 #include "s3_names.h"
 #include "s3_notify.h"
 #include "s3_xml.h"
-#include "../../shared/byte_codec.h"
+#include "../../shared/util/byte_codec.h"
 
 namespace socketley::storage
 {

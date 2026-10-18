@@ -17,9 +17,9 @@
 #include "dashboard.h"
 #include "../runtime/storage/git_mirrors.h"
 #include "../runtime/storage/json_doc.h"
-#include "../shared/https_client.h"
-#include "../shared/log_ring.h"
-#include "../shared/logging.h"
+#include "../shared/http/https_client.h"
+#include "../shared/util/log_ring.h"
+#include "../shared/util/logging.h"
 
 namespace alerts
 {

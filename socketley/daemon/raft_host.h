@@ -8,12 +8,12 @@
 #include <string>
 #include <vector>
 
-#include "../shared/cluster_brain.h"
-#include "../shared/cluster_state.h"
-#include "../shared/event_loop_definitions.h"
-#include "../shared/raft.h"
-#include "../shared/raft_storage.h"
-#include "../shared/tls_context.h"
+#include "../shared/cluster/cluster_brain.h"
+#include "../shared/cluster/cluster_state.h"
+#include "../shared/loop/event_loop_definitions.h"
+#include "../shared/cluster/raft.h"
+#include "../shared/cluster/raft_storage.h"
+#include "../shared/crypto/tls_context.h"
 
 #include <linux/time_types.h>
 #include <netinet/in.h>

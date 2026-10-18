@@ -1,9 +1,9 @@
 #include "db_instance.h"
 
 #include "db_run.h"
-#include "../../shared/logging.h"
-#include "../../shared/paths.h"
-#include "../../shared/runtime_manager.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/persist/paths.h"
+#include "../../shared/runtime/runtime_manager.h"
 
 std::string db_data_dir(std::string_view runtime_name)
 {

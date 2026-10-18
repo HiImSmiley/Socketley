@@ -8,7 +8,7 @@
 # reaching its byte cap, and a flush reporting that nothing reached the ring.
 # It then leaves the teardown to the read that subscriber has armed.
 #
-# That is, on its face, exactly the shape shared/conn_reachability.h exists to
+# That is, on its face, exactly the shape shared/net/conn_reachability.h exists to
 # refuse — a `closing` connection deferring to an armed read, which is the
 # defect fixed in the cache as 87d2c9d and in the server as 86877cc.  It is also
 # the shape on_cqe's chokepoint cannot see, because publish() runs on the

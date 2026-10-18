@@ -1,18 +1,18 @@
 #include "flag_handlers.h"
-#include "../shared/duration_parse.h"
-#include "../shared/runtime_instance.h"
-#include "../shared/unix_listener.h"
-#include "../shared/dial_address.h"
-#include "../shared/appending_file.h"
-#include "../shared/lua_context.h"
-#include "../shared/tls_context.h"
-#include "../shared/cert_keeper.h"
+#include "../shared/util/duration_parse.h"
+#include "../shared/runtime/runtime_instance.h"
+#include "../shared/net/unix_listener.h"
+#include "../shared/net/dial_address.h"
+#include "../shared/persist/appending_file.h"
+#include "../shared/lua/lua_context.h"
+#include "../shared/crypto/tls_context.h"
+#include "../shared/crypto/cert_keeper.h"
 #include <iostream>
 #include <algorithm>
 #include <charconv>
 #include <sys/un.h>
 #include <arpa/inet.h>
-#include "../shared/runtime_manager.h"
+#include "../shared/runtime/runtime_manager.h"
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
@@ -23,8 +23,8 @@
 #include "../runtime/idp/idp_instance.h"
 #include "../runtime/db/db_instance.h"
 #include "../runtime/idp/idp_logic.h"
-#include "../shared/ip_block.h"
-#include "../shared/dns_feed.h"
+#include "../shared/net/ip_block.h"
+#include "../shared/net/dns_feed.h"
 #include "../runtime/storage/s3_vhost.h"
 #include "../runtime/storage/sync_mode.h"
 #include "../runtime/storage/sync_runners.h"
@@ -735,7 +735,7 @@ std::string validate_listen_value(std::string_view value, std::string& out)
         return "no socket path after the unix: prefix";
 
     // The path rules themselves — absolute, under sun_path, no NUL — are
-    // shared/unix_listener.h's, the same ones every setup() re-asks on the
+    // shared/net/unix_listener.h's, the same ones every setup() re-asks on the
     // restore and import paths this parser never sees.
     if (std::string why = socketley::unix_sock::path_refusal(path); !why.empty())
         return why;

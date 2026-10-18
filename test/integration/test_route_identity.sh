@@ -149,7 +149,7 @@ fi
 #
 # Two changes since have removed both halves.  The four map calls travel to the
 # daemon now, and self.route reaches a runtime in another process through
-# shared/route_relay.h.  Measured on this file rather than assumed: with the
+# shared/ipc/route_relay.h.  Measured on this file rather than assumed: with the
 # flag removed it went 9/14, then 13/14, then 14/14 as the two landed, and the
 # fourteenth was a real leak the second one closed.
 #
@@ -369,7 +369,7 @@ EOLUA
 # not happen -- measured, with `false` returned, rid_lone counting 0 and its
 # on_connect never firing.  Right about the symptom and wrong about the cause.
 # route_client() never needed the map; it needed the target's OBJECT, and what
-# it has now is shared/route_relay.h, which addresses the connection by
+# it has now is shared/ipc/route_relay.h, which addresses the connection by
 # conn_ref instead of reaching for the object.
 #
 # These two checks are about a stopped origin leaving stale entries in its

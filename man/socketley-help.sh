@@ -1754,7 +1754,7 @@ lua_config() {
     echo "    need SCM_RIGHTS over a channel nothing had built; across two"
     echo "    runtimes neither hands a descriptor over.  The origin keeps the"
     echo "    socket and relays, so what was missing was a way to name the far"
-    echo "    end's connection: shared/route_relay.h.  pipe(a,fd_a,a,fd_b) still"
+    echo "    end's connection: shared/ipc/route_relay.h.  pipe(a,fd_a,a,fd_b) still"
     echo "    pairs two connections of ONE server and must be called from that"
     echo "    server's own script, because only it holds them."
     echo "    When a runtime holding routed connections goes away - stopped,"

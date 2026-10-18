@@ -1,6 +1,6 @@
 #include "ipc_client.h"
 #include "daemon_handler.h"
-#include "../shared/ipc_framing.h"
+#include "../shared/ipc/ipc_framing.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>

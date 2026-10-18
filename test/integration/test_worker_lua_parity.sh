@@ -412,7 +412,7 @@ WANT_GET="server/running/$PEER_PORT/1/nil"
 # promises and the 8x health tick the behaviour replaced -- a single sample
 # passed only inside the suite and failed five runs of five standalone.
 STATS_MS=$(grep -oE 'stats_interval_ms *= *[0-9]+' \
-           "$(dirname "$0")/../../socketley/shared/worker_protocol.h" 2>/dev/null \
+           "$(dirname "$0")/../../socketley/shared/ipc/worker_protocol.h" 2>/dev/null \
            | grep -oE '[0-9]+$' | head -1)
 case "$STATS_MS" in
     ''|*[!0-9]*)

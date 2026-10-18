@@ -9,7 +9,7 @@
 #include <openssl/core_names.h>
 #include <openssl/params.h>
 
-#include "../../shared/jws.h"
+#include "../../shared/crypto/jws.h"
 #include "../storage/json_doc.h"
 
 namespace socketley::idp

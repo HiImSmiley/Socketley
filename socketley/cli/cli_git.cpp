@@ -42,9 +42,9 @@
 #include <string_view>
 #include <vector>
 
-#include "../shared/http_framing.h"
-#include "../shared/s3_sigv4.h"
-#include "../shared/git_names.h"
+#include "../shared/http/http_framing.h"
+#include "../shared/storage/s3_sigv4.h"
+#include "../shared/storage/git_names.h"
 
 extern char** environ;
 

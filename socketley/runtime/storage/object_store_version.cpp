@@ -20,10 +20,10 @@
 #include <unistd.h>
 
 #include "disk_chain.h"
-#include "../../shared/byte_codec.h"
+#include "../../shared/util/byte_codec.h"
 #include "s3_notify.h"
-#include "../../shared/logging.h"
-#include "../../shared/random_id.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/util/random_id.h"
 
 namespace socketley::storage
 {

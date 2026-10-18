@@ -1,5 +1,5 @@
 // HTTP/3 for a storage runtime with --tls: a UDP socket on the TCP listener's port, whose QUIC, TLS and HTTP/3 are
-// shared/h3_endpoint.cpp's. What is left here is what only this runtime can say about a stream: each request is a
+// shared/http/h3_endpoint.cpp's. What is left here is what only this runtime can say about a stream: each request is a
 // stream, and each stream a conn with no socket, exactly as for HTTP/2 -- its head is written back as the HTTP/1.1
 // head parse_head() reads, its body handed to its phase as a recv's bytes would be, and its answer read back into
 // HTTP/3's fields and DATA. Every operation runs as it does over HTTP/1.1.
@@ -17,8 +17,8 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "../../shared/h3_endpoint.h"
-#include "../../shared/logging.h"
+#include "../../shared/http/h3_endpoint.h"
+#include "../../shared/util/logging.h"
 
 namespace socketley::storage
 {

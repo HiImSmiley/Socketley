@@ -9,8 +9,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../../shared/blocking_write.h"
-#include "../../shared/mutation_journal.h"
+#include "../../shared/loop/blocking_write.h"
+#include "../../shared/persist/mutation_journal.h"
 
 namespace socketley::db
 {

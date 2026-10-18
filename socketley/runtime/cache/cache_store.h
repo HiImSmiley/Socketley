@@ -20,7 +20,7 @@
 #include "stream_log.h"
 #include "heap_cost.h"
 
-#include "../../shared/transparent_string.h"
+#include "../../shared/util/transparent_string.h"
 
 using string_map = key_table<std::string>;
 using list_inner = list_items;

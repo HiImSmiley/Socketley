@@ -1,7 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include "../../socketley/shared/write_queue.h"
+#include "../../socketley/shared/loop/write_queue.h"
 
 #include <memory>
 #include <string>

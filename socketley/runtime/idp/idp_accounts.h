@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-#include "../../shared/mutation_journal.h"
+#include "../../shared/persist/mutation_journal.h"
 
 namespace socketley::idp
 {

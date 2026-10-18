@@ -1,8 +1,8 @@
 #include "idp_instance.h"
 
 #include "idp_run.h"
-#include "../../shared/logging.h"
-#include "../../shared/paths.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/persist/paths.h"
 
 std::string idp_key_path(std::string_view runtime_name)
 {

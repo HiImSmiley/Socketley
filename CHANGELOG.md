@@ -1143,10 +1143,10 @@ runtime is no longer confined to the daemon's process or to one core.
 - **HTTP request framing** was stated nine times across two runtimes, and seven
   of its eight rules existed in only one of them — the server executed smuggled
   requests the proxy refused. It is now one decision in
-  `shared/http_framing.h`.
+  `shared/http/http_framing.h`.
 - A **connection left waiting on a read only its dead peer could finish** — the
   same defect in the cache and, months later, in the server. Now decided once
-  in `shared/conn_reachability.h`.
+  in `shared/net/conn_reachability.h`.
 - **HTTP took one request per read** and left the rest for a read that was
   never coming.
 - `reload-lua` on a script that would not compile left the runtime **with no

@@ -1,5 +1,5 @@
 // HTTP/3 at the entrance, RFC 9114 over QUIC: a UDP socket on the listener's port, whose QUIC, TLS and HTTP/3 are
-// shared/h3_endpoint.cpp's. What is here is what only this runtime can say about a stream, and it is the same answer
+// shared/http/h3_endpoint.cpp's. What is here is what only this runtime can say about a stream, and it is the same answer
 // it gives for HTTP/2: a stream becomes a connection of its own, so the request on it is routed by its `:authority`
 // through the table, the entrance's checks, the filters, the backend pool and the retries, and only the two edges
 // know the difference.
@@ -19,8 +19,8 @@
 #include <cstring>
 #include <sys/socket.h>
 
-#include "../../shared/h3_endpoint.h"
-#include "../../shared/logging.h"
+#include "../../shared/http/h3_endpoint.h"
+#include "../../shared/util/logging.h"
 
 namespace
 {

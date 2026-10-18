@@ -14,10 +14,10 @@
 #include <algorithm>
 #include <shared_mutex>
 
-#include "../../shared/logging.h"
-#include "../../shared/paths.h"
-#include "../../shared/runtime_manager.h"
-#include "../../shared/s3_sigv4.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/persist/paths.h"
+#include "../../shared/runtime/runtime_manager.h"
+#include "../../shared/storage/s3_sigv4.h"
 #include "../storage/s3_names.h"
 
 namespace socketley::sync

@@ -1,13 +1,13 @@
 #include "raft_host.h"
 
-#include "../shared/byte_codec.h"
-#include "../shared/dial_address.h"
-#include "../shared/event_loop.h"
-#include "../shared/ipc_framing.h"
-#include "../shared/logging.h"
-#include "../shared/raft_codec.h"
-#include "../shared/random_id.h"
-#include "../shared/socket_tuning.h"
+#include "../shared/util/byte_codec.h"
+#include "../shared/net/dial_address.h"
+#include "../shared/loop/event_loop.h"
+#include "../shared/ipc/ipc_framing.h"
+#include "../shared/util/logging.h"
+#include "../shared/cluster/raft_codec.h"
+#include "../shared/util/random_id.h"
+#include "../shared/net/socket_tuning.h"
 
 #include <algorithm>
 #include <arpa/inet.h>

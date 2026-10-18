@@ -160,7 +160,7 @@ if [ "$MGMT_OOP_CODE" = "200" ]; then pass; else
     fail "a management call in a worker is answered, not refused" \
          "/mgmt on the out-of-process proxy answered $MGMT_OOP_CODE '$MGMT_OOP_BODY'," \
          "wanted 200 — a 500 is the refusal being reinstalled, and the call" \
-         "has a channel now: see shared/route_relay.h"
+         "has a channel now: see shared/ipc/route_relay.h"
 fi
 
 # A script must not be able to tell which side of the boundary it is on from

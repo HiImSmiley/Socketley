@@ -43,7 +43,7 @@
 // handler does with the value afterwards.  It stops where the value is built.
 
 #include "fuzz_common.h"
-#include "../../socketley/shared/lua_json.h"
+#include "../../socketley/shared/lua/lua_json.h"
 
 #include <cstdio>
 #include <string>

@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-#include "../../shared/byte_codec.h"
+#include "../../shared/util/byte_codec.h"
 
 namespace socketley::storage::wire
 {

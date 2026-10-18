@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "../shared/cluster_brain.h"
+#include "../shared/cluster/cluster_brain.h"
 
 class daemon_handler;
 class raft_host;

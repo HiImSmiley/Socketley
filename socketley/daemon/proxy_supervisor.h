@@ -10,14 +10,14 @@
 #include <unordered_map>
 #include <sys/types.h>
 
-#include "../shared/backlog_gate.h"
-#include "../shared/conn_identity.h"
-#include "../shared/request_channel.h"
+#include "../shared/loop/backlog_gate.h"
+#include "../shared/net/conn_identity.h"
+#include "../shared/ipc/request_channel.h"
 // For runtime_state: await_startup() remembers the state the child reported
 // without adopting it, so the enum is part of this class's own storage now
 // rather than something only the .cpp had to know about.
-#include "../shared/runtime_definitions.h"
-#include "../shared/worker_protocol.h"
+#include "../shared/runtime/runtime_definitions.h"
+#include "../shared/ipc/worker_protocol.h"
 
 class proxy_instance;
 class runtime_instance;

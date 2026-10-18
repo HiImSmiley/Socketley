@@ -1,17 +1,17 @@
-#include "../../shared/cert_keeper.h"
-#include "../../shared/socket_tuning.h"
-#include "../../shared/conn_alloc.h"
+#include "../../shared/crypto/cert_keeper.h"
+#include "../../shared/net/socket_tuning.h"
+#include "../../shared/loop/conn_alloc.h"
 #include "proxy_instance.h"
-#include "../../shared/blocking_write.h"
-#include "../../shared/event_loop.h"
-#include "../../shared/runtime_manager.h"
-#include "../../shared/cluster_discovery.h"
-#include "../../shared/lua_context.h"
-#include "../../shared/logging.h"
-#include "../../shared/invariants.h"
-#include "../../shared/fast_lo.h"
-#include "../../shared/unix_listener.h"
-#include "../../shared/dns_feed.h"
+#include "../../shared/loop/blocking_write.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/runtime/runtime_manager.h"
+#include "../../shared/cluster/cluster_discovery.h"
+#include "../../shared/lua/lua_context.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/util/invariants.h"
+#include "../../shared/net/fast_lo.h"
+#include "../../shared/net/unix_listener.h"
+#include "../../shared/net/dns_feed.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -93,7 +93,7 @@ static bool backend_connect_addr(const backend_info& b,
     {
         // configure_unix_backend has already refused a path that would not
         // fit, and the byte-for-byte address rules are
-        // shared/unix_listener.h's.
+        // shared/net/unix_listener.h's.
         len = socketley::unix_sock::fill_addr(
             b.unix_path, *reinterpret_cast<struct sockaddr_un*>(&out));
         return true;
@@ -1382,7 +1382,7 @@ inline void proxy_instance::tune_socket(int fd)
 static bool configure_unix_backend(backend_info& b, std::string_view path,
                                    std::string_view where, bool announce = true)
 {
-    // The path rules are shared/unix_listener.h's, with absoluteness mattering
+    // The path rules are shared/net/unix_listener.h's, with absoluteness mattering
     // here because a relative path resolves against the daemon's working
     // directory and the pool key needs a leading '/' that no hostname can
     // produce.
@@ -1997,10 +1997,10 @@ bool proxy_instance::setup(event_loop& loop)
 
     if (!listen_path.empty())
     {
-        // The mechanism is shared/unix_listener.h's, one implementation for
+        // The mechanism is shared/net/unix_listener.h's, one implementation for
         // every runtime that listens, with everything below the branch the
         // same for both families.
-        // One node per shard, by the rule shared/unix_listener.h owns: a path
+        // One node per shard, by the rule shared/net/unix_listener.h owns: a path
         // is one listener, and the second process to bind it unlinks the
         // first.  Every shard of a proxy answers every request, so which node
         // a caller takes does not matter here.
@@ -3182,10 +3182,10 @@ void proxy_instance::rearm_accept()
         schedule_accept_backoff();
 }
 
-// header_name_equals and http_eol_framing_ok moved to shared/http_framing.h
+// header_name_equals and http_eol_framing_ok moved to shared/http/http_framing.h
 // with the response side, rather than being declared in two places.
 
-// te_line_codings_ok() moved to shared/http_framing.h with the rest of the
+// te_line_codings_ok() moved to shared/http/http_framing.h with the rest of the
 // request framing decision it was one clause of, so the server has the same
 // rules from the same copy.
 
@@ -4349,7 +4349,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
 
     // The response framing decides both whether the socket may be pooled and
     // how much of this chunk the client may see, which were one question all
-    // along -- with the scan itself in shared/http_framing.h, where a fuzz
+    // along -- with the scan itself in shared/http/http_framing.h, where a fuzz
     // target can drive it.
 
     // The breaker hears the backend answered here rather than on the first

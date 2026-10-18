@@ -19,11 +19,11 @@
 #include "sse.h"
 #include "shard_wire.h"
 #include "storage_run.h"
-#include "../../shared/runtime_manager.h"
-#include "../../shared/event_loop.h"
-#include "../../shared/logging.h"
-#include "../../shared/socket_tuning.h"
-#include "../../shared/unix_listener.h"
+#include "../../shared/runtime/runtime_manager.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/net/socket_tuning.h"
+#include "../../shared/net/unix_listener.h"
 
 using socketley::storage::storage_run;
 

@@ -13,7 +13,7 @@
 #include "s3_logging.h"
 #include "s3_names.h"
 #include "s3_xml.h"
-#include "../../shared/logging.h"
+#include "../../shared/util/logging.h"
 
 namespace socketley::storage
 {

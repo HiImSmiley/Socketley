@@ -9,8 +9,8 @@
 #include <string_view>
 #include <vector>
 
-#include "../../shared/request_channel.h"
-#include "../../shared/runtime_instance.h"
+#include "../../shared/ipc/request_channel.h"
+#include "../../shared/runtime/runtime_instance.h"
 
 namespace socketley::idp
 {

@@ -1,9 +1,9 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include "../../socketley/shared/byte_codec.h"
-#include "../../socketley/shared/cluster_state.h"
-#include "../../socketley/shared/replica_role.h"
+#include "../../socketley/shared/util/byte_codec.h"
+#include "../../socketley/shared/cluster/cluster_state.h"
+#include "../../socketley/shared/cluster/replica_role.h"
 
 #include <algorithm>
 #include <cstdint>

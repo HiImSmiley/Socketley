@@ -38,8 +38,8 @@
 #include "object_store.h"
 #include "s3_auth.h"
 #include "s3_multipart_xml.h"
-#include "../../shared/event_loop.h"
-#include "../../shared/file_io.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/file_io.h"
 
 namespace socketley::storage
 {

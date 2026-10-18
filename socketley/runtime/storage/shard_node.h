@@ -14,7 +14,7 @@
 #include <string>
 #include <string_view>
 
-#include "../../shared/cache_shard_map.h"
+#include "../../shared/ipc/cache_shard_map.h"
 #include "multipart.h"
 #include "object_store.h"
 #include "shard_wire.h"

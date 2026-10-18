@@ -1,5 +1,5 @@
 #pragma once
-#include "../../shared/async_resolver.h"
+#include "../../shared/net/async_resolver.h"
 #include <atomic>
 #include <memory>
 #include <string>
@@ -9,10 +9,10 @@
 #include <netinet/in.h>
 #include <linux/time_types.h>
 
-#include "../../shared/runtime_instance.h"
-#include "../../shared/write_queue.h"
-#include "../../shared/event_loop_definitions.h"
-#include "../../shared/tls_context.h"
+#include "../../shared/runtime/runtime_instance.h"
+#include "../../shared/loop/write_queue.h"
+#include "../../shared/loop/event_loop_definitions.h"
+#include "../../shared/crypto/tls_context.h"
 
 // Everything the ring can name for one run, with a lifetime of its own because
 // a stop deregisters the owner and the flags saying a request is occupied are

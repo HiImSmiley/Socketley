@@ -22,7 +22,7 @@
 -- What changed is not that route became cheaper.  It is that the refusal named
 -- the wrong missing thing: a route does not hand a descriptor to another
 -- process, it keeps the socket here and relays.  So it needed a way to name the
--- far end's connection, which shared/route_relay.h is, and it now works between
+-- far end's connection, which shared/ipc/route_relay.h is, and it now works between
 -- any two runtimes wherever they run.
 --
 -- The handler paths below are opened by the DAEMON, so they resolve against

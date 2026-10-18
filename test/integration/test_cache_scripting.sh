@@ -3,7 +3,7 @@
 #
 # ─── WHAT THIS EXISTS TO CATCH ─────────────────────────────────────────────
 #
-#   THE SANDBOX.  shared/lua_context.h says of itself, in its own comment:
+#   THE SANDBOX.  shared/lua/lua_context.h says of itself, in its own comment:
 #   "This is not a sandbox and says so: `io`, `package` and `base` are open, so
 #   a Lua handler runs with the daemon's full privileges."  That is the right
 #   trade for a script the operator wrote and pointed --lua at, and the wrong

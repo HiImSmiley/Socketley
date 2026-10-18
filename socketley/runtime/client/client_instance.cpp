@@ -1,11 +1,11 @@
-#include "../../shared/socket_tuning.h"
+#include "../../shared/net/socket_tuning.h"
 #include "client_instance.h"
-#include "../../shared/unix_listener.h"
-#include "../../shared/dial_address.h"
-#include "../../shared/event_loop.h"
-#include "../../shared/logging.h"
-#include "../../shared/tls_context.h"
-#include "../../shared/line_framing.h"
+#include "../../shared/net/unix_listener.h"
+#include "../../shared/net/dial_address.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/crypto/tls_context.h"
+#include "../../shared/loop/line_framing.h"
 
 #include <unistd.h>
 #include <cstring>

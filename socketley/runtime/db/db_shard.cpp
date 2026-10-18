@@ -1,6 +1,6 @@
 #include "db_shard.h"
 
-#include "../../shared/byte_codec.h"
+#include "../../shared/util/byte_codec.h"
 
 namespace socketley::db
 {

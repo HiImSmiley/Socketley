@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include "../../shared/transparent_string.h"
+#include "../../shared/util/transparent_string.h"
 
 typedef struct evp_pkey_st EVP_PKEY;
 

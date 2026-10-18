@@ -24,11 +24,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../../shared/dns_feed.h"
-#include "../../shared/paths.h"
-#include "../../shared/event_loop.h"
-#include "../../shared/ip_block.h"
-#include "../../shared/logging.h"
+#include "../../shared/net/dns_feed.h"
+#include "../../shared/persist/paths.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/net/ip_block.h"
+#include "../../shared/util/logging.h"
 
 namespace socketley::dns
 {

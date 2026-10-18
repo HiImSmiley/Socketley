@@ -1,5 +1,5 @@
 #include "bucket_policy.h"
-#include "../../shared/glob_match.h"
+#include "../../shared/util/glob_match.h"
 #include "json_doc.h"
 #include "s3_names.h"
 

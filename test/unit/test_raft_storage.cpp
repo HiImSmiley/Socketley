@@ -1,9 +1,9 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include "shared/event_loop.h"
-#include "shared/raft.h"
-#include "shared/raft_storage.h"
+#include "shared/loop/event_loop.h"
+#include "shared/cluster/raft.h"
+#include "shared/cluster/raft_storage.h"
 
 #include <cstdlib>
 #include <filesystem>

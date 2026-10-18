@@ -3,8 +3,8 @@
 
 #include "runtime/storage/object_format.h"
 #include "runtime/storage/object_store.h"
-#include "shared/event_loop.h"
-#include "shared/file_io.h"
+#include "shared/loop/event_loop.h"
+#include "shared/loop/file_io.h"
 
 #include <cstdlib>
 #include <cstring>

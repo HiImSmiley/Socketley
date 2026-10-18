@@ -10,7 +10,7 @@
 #include <openssl/evp.h>
 
 #include "runtime/idp/idp_logic.h"
-#include "shared/jws.h"
+#include "shared/crypto/jws.h"
 
 using namespace socketley::idp;
 

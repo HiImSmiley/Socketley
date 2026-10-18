@@ -1,8 +1,8 @@
 #include "cli.h"
 #include "../daemon/ipc_client.h"
 #include "command_hashing.h"
-#include "../shared/cluster_discovery.h"
-#include "../shared/cluster_state.h"
+#include "../shared/cluster/cluster_discovery.h"
+#include "../shared/cluster/cluster_state.h"
 
 #include <iostream>
 #include <fstream>

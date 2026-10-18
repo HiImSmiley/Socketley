@@ -8,7 +8,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-#include "../shared/runtime_definitions.h"
+#include "../shared/runtime/runtime_definitions.h"
 
 class runtime_instance;
 struct parsed_args;

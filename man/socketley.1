@@ -14376,7 +14376,7 @@ a pipe hands a file descriptor between runtimes, that a descriptor cannot travel
 in a snapshot of the map, and that it would need
 .B SCM_RIGHTS
 over a channel nothing had built. The mechanism it named
-.RB ( shared/conn_transfer.h )
+.RB ( shared/net/conn_transfer.h )
 was real and the diagnosis was wrong: across two runtimes
 .B socketley.pipe
 does not hand a descriptor over at all. It is
@@ -14385,7 +14385,7 @@ which writes into the target's connection maps, runs the target's
 .B on_connect
 and then keeps the socket where it is and relays the bytes through it. What both
 needed was a way to name another runtime's connection and reach it, which is
-.BR shared/route_relay.h .
+.BR shared/ipc/route_relay.h .
 .PP
 So they cross a process boundary now, and what changes for a script is nothing:
 the same call, the same return value, the same target name. The origin stays in
@@ -17979,7 +17979,7 @@ never needed a descriptor to travel. It needed the target's connection tables,
 which it reaches by
 .B conn_ref
 now, through
-.BR shared/route_relay.h .
+.BR shared/ipc/route_relay.h .
 The origin keeps the socket and relays the bytes, exactly as it does when both
 runtimes are in one process.
 .IP

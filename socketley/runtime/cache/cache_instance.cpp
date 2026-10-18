@@ -1,30 +1,30 @@
-#include "../../shared/socket_tuning.h"
-#include "../../shared/conn_alloc.h"
+#include "../../shared/net/socket_tuning.h"
+#include "../../shared/loop/conn_alloc.h"
 #include "cache_instance.h"
-#include "../../shared/conn_reachability.h"
-#include "../../shared/blocking_write.h"
-#include "../../shared/exit_bound.h"
+#include "../../shared/net/conn_reachability.h"
+#include "../../shared/loop/blocking_write.h"
+#include "../../shared/ipc/exit_bound.h"
 #include "resp_command_table.h"
 #include <random>
-#include "../../shared/dial_address.h"
-#include "../../shared/ipc_framing.h"
-#include "../../shared/trace.h"
+#include "../../shared/net/dial_address.h"
+#include "../../shared/ipc/ipc_framing.h"
+#include "../../shared/util/trace.h"
 #include "resp_parser.h"
-#include "../../shared/event_loop.h"
-#include "../../shared/runtime_manager.h"
-#include "../../shared/lua_context.h"
-#include "../../shared/logging.h"
-#include "../../shared/invariants.h"
-#include "../../shared/unix_listener.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/runtime/runtime_manager.h"
+#include "../../shared/lua/lua_context.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/util/invariants.h"
+#include "../../shared/net/unix_listener.h"
 #include "../../cli/command_hashing.h"
-#include "../../shared/shard_target.h"
-#include "../../shared/version.h"
+#include "../../shared/ipc/shard_target.h"
+#include "../../shared/util/version.h"
 
 #include <unistd.h>
 #include <cmath>
 #include <cstring>
 #include <cerrno>
-#include "../../shared/glob_match.h"
+#include "../../shared/util/glob_match.h"
 #include <cstdlib>
 #include <cstdio>
 #include <charconv>
@@ -665,7 +665,7 @@ bool cache_instance::setup(event_loop& loop)
 
     if (!listen_path.empty())
     {
-        // The mechanism is shared/unix_listener.h's, one implementation for
+        // The mechanism is shared/net/unix_listener.h's, one implementation for
         // every runtime that listens, with everything below the branch the
         // same for both families.
         // One node per shard, because a path is one listener: the second
@@ -1454,7 +1454,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
 #endif
 }
 
-// The rule and its argument live in shared/conn_reachability.h; what is here
+// The rule and its argument live in shared/net/conn_reachability.h; what is here
 // is finding the connection, naming its flags and closing it, with everything
 // before the verdict a guard.
 void cache_instance::finish_unreachable_client(int fd)

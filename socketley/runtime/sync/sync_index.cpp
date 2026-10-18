@@ -6,7 +6,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "../../shared/mutation_journal.h"
+#include "../../shared/persist/mutation_journal.h"
 
 namespace socketley::sync
 {

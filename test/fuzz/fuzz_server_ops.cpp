@@ -91,13 +91,13 @@
 #include "fuzz_common.h"
 #include "fuzz_runtime_ops.h"
 
-#include "shared/event_loop.h"
-#include "shared/event_loop_definitions.h"
-#include "shared/logging.h"
-#include "shared/request_channel.h"
-#include "shared/runtime_instance.h"
-#include "shared/runtime_manager.h"
-#include "shared/write_queue.h"
+#include "shared/loop/event_loop.h"
+#include "shared/loop/event_loop_definitions.h"
+#include "shared/util/logging.h"
+#include "shared/ipc/request_channel.h"
+#include "shared/runtime/runtime_instance.h"
+#include "shared/runtime/runtime_manager.h"
+#include "shared/loop/write_queue.h"
 
 // Reaching inside the class, for the same reason and by the same means as
 // fuzz_cache_ops: invariant 4 is about m_conn_pool, m_conn_retired, m_clients

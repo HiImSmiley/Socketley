@@ -12,7 +12,7 @@
 #include "checksum.h"
 #include "sse.h"
 #include "tierer.h"
-#include "../../shared/logging.h"
+#include "../../shared/util/logging.h"
 
 namespace socketley::storage
 {

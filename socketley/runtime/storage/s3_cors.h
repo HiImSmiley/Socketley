@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "s3_xml.h"
-#include "../../shared/http_framing.h"
+#include "../../shared/http/http_framing.h"
 
 namespace socketley::storage
 {

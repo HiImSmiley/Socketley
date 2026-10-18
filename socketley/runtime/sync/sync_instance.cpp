@@ -7,9 +7,9 @@
 #include <sstream>
 #include <sys/stat.h>
 
-#include "../../shared/logging.h"
-#include "../../shared/paths.h"
-#include "../../shared/runtime_name.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/persist/paths.h"
+#include "../../shared/runtime/runtime_name.h"
 #include "../storage/outbound_http.h"
 #include "../storage/s3_names.h"
 

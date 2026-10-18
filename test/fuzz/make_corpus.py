@@ -2217,7 +2217,7 @@ def eventloop_seeds():
 
 
 # ─────────────────────────────── Raft wire ───────────────────────────────────
-# socketley/shared/raft_codec.cpp, re-stated here so a seed is an independent
+# socketley/shared/cluster/raft_codec.cpp, re-stated here so a seed is an independent
 # statement of the format rather than a copy of whatever the encoder does.
 
 RAFT_TYPES = ["pre_vote", "pre_vote_resp", "vote", "vote_resp", "append", "append_resp",
@@ -2273,7 +2273,7 @@ def raft_refuse(why):
     return struct.pack("<BB", 1, 7) + rw_bytes(why)
 
 
-# socketley/shared/cluster_state.cpp: 'C', op, then the fields of that op.
+# socketley/shared/cluster/cluster_state.cpp: 'C', op, then the fields of that op.
 def rw_args(args):
     return struct.pack("<I", len(args)) + b"".join(rw_bytes(a) for a in args)
 

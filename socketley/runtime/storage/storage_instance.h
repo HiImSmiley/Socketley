@@ -11,10 +11,10 @@
 
 #include "bucket_policy.h"
 #include "s3_auth.h"
-#include "../../shared/request_channel.h"
-#include "../../shared/runtime_instance.h"
-#include "../../shared/tls_context.h"
-#include "../../shared/unix_companion.h"
+#include "../../shared/ipc/request_channel.h"
+#include "../../shared/runtime/runtime_instance.h"
+#include "../../shared/crypto/tls_context.h"
+#include "../../shared/net/unix_companion.h"
 
 namespace socketley::storage
 {

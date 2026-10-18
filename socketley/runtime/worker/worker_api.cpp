@@ -4,7 +4,7 @@
 #include <cstring>
 
 #include "worker_main.h"
-#include "../../shared/type_registry.h"
+#include "../../shared/runtime/type_registry.h"
 #include "../server/server_instance.h"
 
 namespace socketley {

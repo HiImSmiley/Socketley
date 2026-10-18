@@ -8,10 +8,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../../shared/blocking_write.h"
-#include "../../shared/byte_codec.h"
-#include "../../shared/logging.h"
-#include "../../shared/mutation_journal.h"
+#include "../../shared/loop/blocking_write.h"
+#include "../../shared/util/byte_codec.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/persist/mutation_journal.h"
 
 namespace socketley::storage
 {

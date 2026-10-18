@@ -13,11 +13,11 @@
 
 #include "s3_xml.h"
 #include "storage_instance.h"
-#include "../../shared/logging.h"
+#include "../../shared/util/logging.h"
 
 #ifndef SOCKETLEY_NO_LUA
-#include "../../shared/lua_context.h"
-#include "../../shared/lua_suspend.h"
+#include "../../shared/lua/lua_context.h"
+#include "../../shared/lua/lua_suspend.h"
 #endif
 
 namespace socketley::storage

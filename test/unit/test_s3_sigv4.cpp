@@ -1,7 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include "../../socketley/shared/s3_sigv4.h"
+#include "../../socketley/shared/storage/s3_sigv4.h"
 
 #include <algorithm>
 #include <cctype>

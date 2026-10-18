@@ -698,7 +698,7 @@ jobs:
         # decision, not one this change should have made in advance.
         #
         # And one more, which FUZZ_PROXY_SKIP cannot reach, because it is not
-        # one of the harness's checks: it is socketley/shared/invariants.h
+        # one of the harness's checks: it is socketley/shared/util/invariants.h
         # aborting on its own account, and SKL_INV_PAIR has no id and no
         # demotion.  Seed: proxy/found-55a07a18, 32 bytes, both legs over TLS.
         #
@@ -781,7 +781,7 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   # The invariants build.
   #
-  # socketley/shared/invariants.h states the two properties every defect of the
+  # socketley/shared/util/invariants.h states the two properties every defect of the
   # family this project keeps hitting violates: a connection pair with nothing
   # in flight will never be woken again, and a struct returned to a pool while
   # the ring can still name it will be charged someone else's completion.  The
@@ -876,7 +876,7 @@ jobs:
           done
           if [ "$found" -eq 1 ]; then
             echo
-            echo "An invariant stated in socketley/shared/invariants.h was violated."
+            echo "An invariant stated in socketley/shared/util/invariants.h was violated."
             echo "These are not warnings: each one is a connection that will never be woken"
             echo "again, or a completion charged to the wrong connection."
             exit 1

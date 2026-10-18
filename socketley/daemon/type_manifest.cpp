@@ -11,9 +11,9 @@
 #include <shared_mutex>
 
 #include "../cli/arg_parser.h"
-#include "../shared/logging.h"
-#include "../shared/runtime_instance.h"
-#include "../shared/type_registry.h"
+#include "../shared/util/logging.h"
+#include "../shared/runtime/runtime_instance.h"
+#include "../shared/runtime/type_registry.h"
 
 namespace fs = std::filesystem;
 

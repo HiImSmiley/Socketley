@@ -10,8 +10,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "../../shared/logging.h"
-#include "../../shared/random_id.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/util/random_id.h"
 
 namespace socketley::storage
 {

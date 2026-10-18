@@ -11,8 +11,8 @@
 #include <unordered_map>
 
 #include "shard_node.h"
-#include "../../shared/request_channel.h"
-#include "../../shared/shard_target.h"
+#include "../../shared/ipc/request_channel.h"
+#include "../../shared/ipc/shard_target.h"
 
 namespace socketley::storage
 {

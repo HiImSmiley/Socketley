@@ -2,14 +2,14 @@
 
 #include <algorithm>
 #include "dashboard.h"
-#include "../shared/runtime_manager.h"
-#include "../shared/runtime_instance.h"
-#include "../shared/blocking_write.h"
-#include "../shared/logging.h"
-#include "../shared/version.h"
-#include "../shared/runtime_definitions.h"
-#include "../shared/daemon_client.h"
-#include "../shared/fast_lo.h"
+#include "../shared/runtime/runtime_manager.h"
+#include "../shared/runtime/runtime_instance.h"
+#include "../shared/loop/blocking_write.h"
+#include "../shared/util/logging.h"
+#include "../shared/util/version.h"
+#include "../shared/runtime/runtime_definitions.h"
+#include "../shared/ipc/daemon_client.h"
+#include "../shared/net/fast_lo.h"
 #include "daemon_handler.h"
 #include "../runtime/storage/storage_instance.h"
 

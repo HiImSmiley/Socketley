@@ -38,16 +38,16 @@ echo "=== Integration: the bounds a peer is dropped by are in the manual ==="
 
 # ─── What the source says ───────────────────────────────────────────────────
 HS=$(grep -oP 'tls_handshake_deadline_secs\s*=\s*\K[0-9]+' \
-     "$ROOT/socketley/shared/tls_context.h" | head -1 || true)
+     "$ROOT/socketley/shared/crypto/tls_context.h" | head -1 || true)
 HD=$(grep -oP 'http_header_deadline_secs\s*=\s*\K[0-9]+' \
-     "$ROOT/socketley/shared/http_framing.h" | head -1 || true)
+     "$ROOT/socketley/shared/http/http_framing.h" | head -1 || true)
 
 if [ -n "$HS" ]; then pass
 else fail "the handshake deadline is a named constant" \
-          "no tls_handshake_deadline_secs in shared/tls_context.h"; fi
+          "no tls_handshake_deadline_secs in shared/crypto/tls_context.h"; fi
 if [ -n "$HD" ]; then pass
 else fail "the header deadline is a named constant" \
-          "no http_header_deadline_secs in shared/http_framing.h"; fi
+          "no http_header_deadline_secs in shared/http/http_framing.h"; fi
 [ -z "$HS" ] && HS=0
 [ -z "$HD" ] && HD=0
 

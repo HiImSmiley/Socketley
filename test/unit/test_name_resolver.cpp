@@ -1,6 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
-#include "../../socketley/shared/name_resolver.h"
+#include "../../socketley/shared/net/name_resolver.h"
 #include "../../socketley/cli/arg_parser.h"
 
 #include <algorithm>

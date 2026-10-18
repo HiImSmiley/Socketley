@@ -17,13 +17,13 @@
 #include <sys/wait.h>
 
 #include "command_hashing.h"
-#include "../shared/command_usage.h"
+#include "../shared/runtime/command_usage.h"
 #include "../daemon/ipc_client.h"
-#include "../shared/ipc_framing.h"
+#include "../shared/ipc/ipc_framing.h"
 #include "../daemon/daemon_handler.h"
 #include "../runtime/worker/worker_main.h"
-#include "../shared/daemon_client.h"
-#include "../shared/paths.h"
+#include "../shared/ipc/daemon_client.h"
+#include "../shared/persist/paths.h"
 #include <algorithm>
 #include <filesystem>
 #include <chrono>

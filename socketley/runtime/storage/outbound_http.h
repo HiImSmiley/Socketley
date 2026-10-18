@@ -12,10 +12,10 @@
 
 #include <sys/socket.h>
 
-#include "../../shared/event_loop.h"
-#include "../../shared/file_io.h"
-#include "../../shared/hash_pool.h"
-#include "../../shared/tls_context.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/file_io.h"
+#include "../../shared/loop/hash_pool.h"
+#include "../../shared/crypto/tls_context.h"
 
 namespace socketley::storage
 {

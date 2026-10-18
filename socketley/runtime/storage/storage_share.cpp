@@ -24,9 +24,9 @@
 #include "json_doc.h"
 #include "s3_names.h"
 #include "s3_xml.h"
-#include "../../shared/logging.h"
-#include "../../shared/state_persistence.h"
-#include "../../shared/replaced_file.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/persist/state_persistence.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::storage
 {

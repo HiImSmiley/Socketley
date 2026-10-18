@@ -26,11 +26,11 @@
 #include "s3_names.h"
 #include "s3_quota.h"
 #include "s3_tagging.h"
-#include "../../shared/git_names.h"
-#include "../../shared/logging.h"
-#include "../../shared/http_framing.h"
-#include "../../shared/state_persistence.h"
-#include "../../shared/replaced_file.h"
+#include "../../shared/storage/git_names.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/http/http_framing.h"
+#include "../../shared/persist/state_persistence.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::storage
 {

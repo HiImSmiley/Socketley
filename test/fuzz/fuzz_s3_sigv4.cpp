@@ -1,4 +1,4 @@
-// Fuzz target: AWS Signature V4 and V2 verification (socketley/shared/s3_sigv4.h) and the aws-chunked decoder.
+// Fuzz target: AWS Signature V4 and V2 verification (socketley/shared/storage/s3_sigv4.h) and the aws-chunked decoder.
 //
 // Reachable by anything that can send an HTTP request to a storage runtime: every request is verified before any
 // other work, and the chunk decoder reads the body of any request that says it is aws-chunked.
@@ -20,7 +20,7 @@
 // fuzzer cannot forge one; the seeds carry valid ones, so mutations reach the verifying branches from just off them.
 
 #include "fuzz_common.h"
-#include "shared/s3_sigv4.h"
+#include "shared/storage/s3_sigv4.h"
 
 #include <cctype>
 #include <string>

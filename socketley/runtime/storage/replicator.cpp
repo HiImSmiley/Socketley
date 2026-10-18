@@ -12,10 +12,10 @@
 #include "cluster.h"
 #include "s3_names.h"
 #include "s3_tagging.h"
-#include "../../shared/byte_codec.h"
-#include "../../shared/http_framing.h"
-#include "../../shared/logging.h"
-#include "../../shared/s3_sigv4.h"
+#include "../../shared/util/byte_codec.h"
+#include "../../shared/http/http_framing.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/storage/s3_sigv4.h"
 
 namespace socketley::storage
 {

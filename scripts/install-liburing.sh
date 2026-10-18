@@ -14,11 +14,11 @@
 set -euo pipefail
 
 # The tested version; the supported floor is lower and is declared in
-# socketley/shared/liburing_version.h.
+# socketley/shared/loop/liburing_version.h.
 LIBURING_TAG="${LIBURING_TAG:-liburing-2.15}"
 LIBURING_JOBS="${LIBURING_JOBS:-$(nproc)}"
 
-# Kept in step with the minimums in socketley/shared/liburing_version.h, which
+# Kept in step with the minimums in socketley/shared/loop/liburing_version.h, which
 # the compiler is the authority on -- this is only so the script can skip work
 # already done.
 MIN_MAJOR=2

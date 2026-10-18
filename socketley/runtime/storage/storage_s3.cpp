@@ -1,7 +1,7 @@
 // The S3 operations: routing a parsed request to one of them and answering it.
 #include "storage_run.h"
 
-#include "../../shared/cert_keeper.h"
+#include "../../shared/crypto/cert_keeper.h"
 
 #include <algorithm>
 #include <charconv>
@@ -19,7 +19,7 @@
 #include "s3_xml_tree.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
-#include "../../shared/logging.h"
+#include "../../shared/util/logging.h"
 
 namespace socketley::storage
 {

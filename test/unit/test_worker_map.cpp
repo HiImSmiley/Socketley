@@ -1,9 +1,9 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include "../../socketley/shared/runtime_manager.h"
-#include "../../socketley/shared/event_loop.h"
-#include "../../socketley/shared/worker_protocol.h"
+#include "../../socketley/shared/runtime/runtime_manager.h"
+#include "../../socketley/shared/loop/event_loop.h"
+#include "../../socketley/shared/ipc/worker_protocol.h"
 
 #include <string>
 #include <vector>

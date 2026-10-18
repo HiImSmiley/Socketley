@@ -3,7 +3,7 @@
 #include <string>
 #include <string_view>
 
-#include "../shared/version.h"
+#include "../shared/util/version.h"
 
 int cli_dispatch(int argc, char** argv);
 int cli_forward(int argc, char** argv);

@@ -17,12 +17,12 @@
 #include <deque>
 #include <unordered_map>
 
-#include "../../shared/h2_driver.h"
-#include "../../shared/h2_frame.h"
-#include "../../shared/h2_session.h"
-#include "../../shared/hpack.h"
-#include "../../shared/logging.h"
-#include "../../shared/mux_head.h"
+#include "../../shared/http/h2_driver.h"
+#include "../../shared/http/h2_frame.h"
+#include "../../shared/http/h2_session.h"
+#include "../../shared/http/hpack.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/http/mux_head.h"
 
 namespace socketley::storage
 {

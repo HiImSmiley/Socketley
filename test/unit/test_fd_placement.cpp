@@ -1,4 +1,4 @@
-// Unit test: place_descriptors (socketley/shared/fd_placement.h), which a forked worker's descriptors go through.
+// Unit test: place_descriptors (socketley/shared/net/fd_placement.h), which a forked worker's descriptors go through.
 //
 // What each case would catch:
 //   * a source sitting on another's destination destroyed by that placement before its own, as the control socket
@@ -7,7 +7,7 @@
 //   * a source already on its own destination placed wrong, or a lifted copy landing on a destination
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
-#include "shared/fd_placement.h"
+#include "shared/net/fd_placement.h"
 
 #include <sys/socket.h>
 #include <sys/stat.h>

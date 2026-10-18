@@ -8,8 +8,8 @@
 
 #include "../cli/arg_parser.h"
 #include "../cli/command_hashing.h"
-#include "../shared/runtime_definitions.h"
-#include "../shared/size_suffix.h"
+#include "../shared/runtime/runtime_definitions.h"
+#include "../shared/util/size_suffix.h"
 
 // Integer parsing from string_view without allocating, of which parse_double
 // is the exception, because std::stod takes a std::string and from_chars for

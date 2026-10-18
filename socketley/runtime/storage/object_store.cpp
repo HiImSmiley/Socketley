@@ -26,8 +26,8 @@
 #include "s3_object_lock.h"
 #include "s3_versioning.h"
 #include "shard_owner.h"
-#include "../../shared/logging.h"
-#include "../../shared/random_id.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/util/random_id.h"
 
 namespace socketley::storage
 {

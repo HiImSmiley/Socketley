@@ -19,12 +19,12 @@
 #include <openssl/rand.h>
 
 #include "idp_instance.h"
-#include "../../shared/http_framing.h"
-#include "../../shared/jws.h"
-#include "../../shared/logging.h"
-#include "../../shared/runtime_manager.h"
-#include "../../shared/shard_target.h"
-#include "../../shared/storage_rpc.h"
+#include "../../shared/http/http_framing.h"
+#include "../../shared/crypto/jws.h"
+#include "../../shared/util/logging.h"
+#include "../../shared/runtime/runtime_manager.h"
+#include "../../shared/ipc/shard_target.h"
+#include "../../shared/storage/storage_rpc.h"
 #include "../storage/checksum.h"
 #include "../storage/password_hash.h"
 #include "../storage/scrypt.h"

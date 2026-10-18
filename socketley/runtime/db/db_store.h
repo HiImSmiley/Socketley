@@ -22,7 +22,7 @@
 #include "db_docmap.h"
 #include "db_log.h"
 #include "db_schema.h"
-#include "../../shared/transparent_string.h"
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::db
 {

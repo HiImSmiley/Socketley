@@ -17,11 +17,11 @@
 #include "idp_accounts.h"
 #include "idp_logic.h"
 #include "idp_shard.h"
-#include "../../shared/event_loop.h"
-#include "../../shared/event_loop_definitions.h"
-#include "../../shared/file_io.h"
-#include "../../shared/hash_pool.h"
-#include "../../shared/request_channel.h"
+#include "../../shared/loop/event_loop.h"
+#include "../../shared/loop/event_loop_definitions.h"
+#include "../../shared/loop/file_io.h"
+#include "../../shared/loop/hash_pool.h"
+#include "../../shared/ipc/request_channel.h"
 
 class idp_instance;
 

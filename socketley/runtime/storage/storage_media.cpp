@@ -36,13 +36,13 @@
 #include <poll.h>
 #include <sys/syscall.h>
 
-#include "../../shared/http_framing.h"
+#include "../../shared/http/http_framing.h"
 #include "digest.h"
 #include "json_doc.h"
 #include "s3_names.h"
 #include "s3_tagging.h"
 #include "sse.h"
-#include "../../shared/replaced_file.h"
+#include "../../shared/persist/replaced_file.h"
 
 extern char** environ;
 

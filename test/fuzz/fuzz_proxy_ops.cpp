@@ -116,7 +116,7 @@
 //
 // ─── AND THE THREE IT INHERITS FROM THE PRODUCT ─────────────────────────────
 //
-// socketley/shared/invariants.h states three properties of its own and this
+// socketley/shared/util/invariants.h states three properties of its own and this
 // target is built with SOCKETLEY_INVARIANTS, so they are live here and they
 // abort on their own account rather than through RT_FINDING.  Two of the three
 // were written on 2026-08-01 for defects this target could reach and could not
@@ -157,7 +157,7 @@
 // defects were.
 //
 // Both legs can be encrypted, independently, and the harness speaks OpenSSL
-// directly at each end rather than through shared/tls_context.h — see the note
+// directly at each end rather than through shared/crypto/tls_context.h — see the note
 // above write_tls_material() for why a peer built on the record layer under
 // test would report a clean handshake whatever that layer did.
 //
@@ -225,15 +225,15 @@
 #include "fuzz_common.h"
 #include "fuzz_runtime_ops.h"
 
-#include "shared/endpoint_table.h"
-#include "shared/event_loop.h"
-#include "shared/event_loop_definitions.h"
-#include "shared/logging.h"
-#include "shared/runtime_instance.h"
-#include "shared/tls_context.h"
-#include "shared/trace.h"
-#include "shared/write_queue.h"
-#include "shared/http_framing.h"
+#include "shared/net/endpoint_table.h"
+#include "shared/loop/event_loop.h"
+#include "shared/loop/event_loop_definitions.h"
+#include "shared/util/logging.h"
+#include "shared/runtime/runtime_instance.h"
+#include "shared/crypto/tls_context.h"
+#include "shared/util/trace.h"
+#include "shared/loop/write_queue.h"
+#include "shared/http/http_framing.h"
 
 // Reaching inside the class, for the same reason and by the same means as
 // fuzz_server_ops and fuzz_cache_ops: the invariants are about m_backend_pool,
