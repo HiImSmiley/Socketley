@@ -15,6 +15,7 @@
 #include "../storage/checksum.h"
 #include "../storage/s3_sigv4_auth.h"
 #include "../idp/idp_session.h"
+#include "../../shared/persist/read_file.h"
 
 namespace
 {
@@ -120,15 +121,12 @@ void proxy_auth::reload(std::chrono::steady_clock::time_point now)
     m_tokens.clear();
     m_keys.reset();
 
-    std::ifstream f(m_file);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    if (!f)
+    std::string text;
+    if (!socketley::read_whole_file(m_file, text))
     {
         LOG_ERROR(("proxy " + m_runtime + ": --auth: " + m_file + " cannot be read; every request is refused").c_str());
         return;
     }
-    const std::string text = ss.str();
     if (m_kind == kind::bearer)
     {
         for (size_t p = 0; p < text.size();)

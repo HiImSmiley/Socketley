@@ -12,6 +12,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/json/json_doc.h"
 #include "../storage/s3_federation.h"
+#include "../../shared/persist/read_file.h"
 
 namespace socketley::idp
 {
@@ -50,13 +51,11 @@ void session_verifier::reload()
     if (stamp == m_stamp)
         return;
     m_stamp = stamp;
-    std::ifstream f(m_path);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    const std::string text = ss.str();
+    std::string text;
+    const bool read = socketley::read_whole_file(m_path, text);
     socketley::json::jvalue doc;
     std::string issuer, err;
-    if (f && socketley::json::json_reader(text).document(doc))
+    if (read && socketley::json::json_reader(text).document(doc))
         for (const auto& [k, v] : doc.members)
             if (k == "issuer" && v.k == socketley::json::jvalue::kind::string)
                 issuer = v.s;

@@ -14,6 +14,7 @@
 #include "s3_iam.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/persist/replaced_file.h"
+#include "../../shared/persist/read_file.h"
 
 namespace socketley::storage
 {
@@ -21,32 +22,11 @@ namespace socketley::storage
 namespace
 {
 
-bool read_all(const std::string& path, std::string& out)
-{
-    out.clear();
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return errno == ENOENT;
-    char buf[65536];
-    for (;;)
-    {
-        const ssize_t n = ::read(fd, buf, sizeof buf);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-        {
-            ::close(fd);
-            return n == 0;
-        }
-        out.append(buf, static_cast<size_t>(n));
-    }
-}
-
 // The revision of the IAM document the file holds, the time it was changed, 0 for a file never changed in a cluster.
 int64_t read_rev(const std::string& file)
 {
     std::string text;
-    return read_all(file + ".rev", text) ? std::atoll(text.c_str()) : 0;
+    return socketley::read_file(file + ".rev", text, {.missing_ok = true}) ? std::atoll(text.c_str()) : 0;
 }
 
 }   // namespace
@@ -56,14 +36,14 @@ bool storage_run::iam_read(iam_state& out)
     const std::string file = m_auth ? m_auth->iam_file() : std::string();
     std::string text, err;
     out = iam_state{};
-    return file.empty() || (read_all(file, text) && iam_parse(text, out, err));
+    return file.empty() || (socketley::read_file(file, text, {.missing_ok = true}) && iam_parse(text, out, err));
 }
 
 std::string storage_run::iam_record()
 {
     const std::string file = m_auth ? m_auth->iam_file() : std::string();
     std::string text;
-    if (file.empty() || !read_all(file, text) || text.empty())
+    if (file.empty() || !socketley::read_file(file, text, {.missing_ok = true}) || text.empty())
         return {};
     return encode_cluster_record({'i', std::to_string(read_rev(file)), 0, std::move(text), {}});
 }
@@ -158,7 +138,7 @@ void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::
     iam_state st;
     iam_result res;
     int64_t rev = 0;
-    if (!read_all(file, text) || !iam_parse(text, st, err))
+    if (!socketley::read_file(file, text, {.missing_ok = true}) || !iam_parse(text, st, err))
     {
         LOG_WARN(("storage: the IAM file " + file + " is not read: " + err).c_str());
         res.ok = false;

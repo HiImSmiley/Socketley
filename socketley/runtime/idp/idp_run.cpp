@@ -32,6 +32,7 @@
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/http/status.h"
 #include "../../shared/http/request_head.h"
+#include "../../shared/persist/read_file.h"
 
 namespace socketley::idp
 {
@@ -515,12 +516,10 @@ void idp_run::load_clients()
     const socketley::file_stamp mtime = socketley::file_stamp::of(st);
     if (mtime == m_clients_stamp)
         return;
-    std::ifstream f(path);
-    std::stringstream ss;
-    ss << f.rdbuf();
+    std::string text;
     std::vector<client> fresh;
     std::string why;
-    if (!f || !parse_clients(ss.str(), fresh, why))
+    if (!socketley::read_whole_file(path, text) || !parse_clients(text, fresh, why))
     {
         m_clients_error = "the clients file " + path + ": " + (why.empty() ? "cannot be read" : why);
         // A file broken while running keeps the clients read before it, and says so once.

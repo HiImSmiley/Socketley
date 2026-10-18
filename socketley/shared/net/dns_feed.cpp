@@ -1,6 +1,7 @@
 #include "dns_feed.h"
 #include "../persist/paths.h"
 #include "../persist/replaced_file.h"
+#include "../persist/read_file.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -22,12 +23,9 @@ namespace
 
 std::string read_file(const std::string& path)
 {
-    std::ifstream f(path);
-    if (!f)
-        return {};
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+    std::string out;
+    socketley::read_whole_file(path, out);
+    return out;
 }
 
 // Written beside itself and renamed over, so a reader sees the old file or the new one and never half of one.

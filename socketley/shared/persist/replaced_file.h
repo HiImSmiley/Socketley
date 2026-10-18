@@ -8,6 +8,7 @@
 // durability each call names.
 
 #include "../loop/blocking_write.h"
+#include "read_file.h"
 
 #include <atomic>
 #include <cerrno>
@@ -21,27 +22,6 @@
 
 namespace socketley
 {
-
-inline bool read_whole_file(const std::string& path, std::string& out)
-{
-    out.clear();
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return false;
-    char buf[8192];
-    for (;;)
-    {
-        const ssize_t n = ::read(fd, buf, sizeof buf);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-        {
-            ::close(fd);
-            return n == 0;
-        }
-        out.append(buf, static_cast<size_t>(n));
-    }
-}
 
 // How far a replaced file is on the disk when replace_file() returns, said at every call.
 enum class durability : uint8_t

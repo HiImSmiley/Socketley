@@ -107,3 +107,24 @@ TEST_CASE("a stamp tells a missing file, a rewrite and a replacement of the same
     CHECK(socketley::file_stamp::of(p) == b);
     std::filesystem::remove_all(d);
 }
+
+TEST_CASE("a file is read whole, a missing or a too large one refused unless allowed, and a link when asked")
+{
+    const std::string d = fresh_dir(), p = d + "/f";
+    std::string out, why;
+    CHECK_FALSE(socketley::read_file(d + "/none", out, {}, &why));
+    CHECK(why.find("No such file") != std::string::npos);
+    CHECK(socketley::read_file(d + "/none", out, {.missing_ok = true}));
+    CHECK(out.empty());
+    const std::string big(200000, 'x');
+    REQUIRE(socketley::replace_file(p, big, socketley::durability::none));
+    REQUIRE(socketley::read_file(p, out));
+    CHECK(out == big);
+    CHECK_FALSE(socketley::read_file(p, out, {.max_bytes = 100000}, &why));
+    CHECK(out.empty());
+    CHECK(socketley::read_file(p, out, {.max_bytes = 200000}));
+    REQUIRE(::symlink(p.c_str(), (d + "/link").c_str()) == 0);
+    CHECK(socketley::read_file(d + "/link", out));
+    CHECK_FALSE(socketley::read_file(d + "/link", out, {.no_follow = true}));
+    std::filesystem::remove_all(d);
+}

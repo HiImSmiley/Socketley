@@ -2,6 +2,7 @@
 
 #include "../loop/event_loop.h"
 #include "../persist/replaced_file.h"
+#include "../persist/read_file.h"
 
 #include <algorithm>
 #include <array>
@@ -408,31 +409,6 @@ bool parse_snapshot_name(const std::string& n, index_t& index, term_t& term)
     return true;
 }
 
-bool read_file(const std::string& path, std::string& out)
-{
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return false;
-    out.clear();
-    char buf[65536];
-    for (;;)
-    {
-        const ssize_t n = ::read(fd, buf, sizeof buf);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n < 0)
-        {
-            ::close(fd);
-            return false;
-        }
-        if (n == 0)
-            break;
-        out.append(buf, static_cast<size_t>(n));
-    }
-    ::close(fd);
-    return true;
-}
-
 bool fsync_dir(const std::string& dir)
 {
     const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -552,7 +528,7 @@ bool recover(const std::string& dir, recovery& out, std::string& err)
     {
         const std::string path = dir + "/" + segment_name(*it);
         std::string bytes;
-        if (!read_file(path, bytes))
+        if (!socketley::read_whole_file(path, bytes))
         {
             err = "cannot read " + path + ": " + std::strerror(errno);
             return false;
@@ -590,7 +566,7 @@ bool recover(const std::string& dir, recovery& out, std::string& err)
 
         std::string snap_bytes;
         const std::string snap_path = dir + "/" + snapshot_name(base_index, base_term);
-        if (!read_file(snap_path, snap_bytes) || !decode_snapshot_file(snap_bytes, out.state.snap)
+        if (!socketley::read_whole_file(snap_path, snap_bytes) || !decode_snapshot_file(snap_bytes, out.state.snap)
             || out.state.snap.index != base_index || out.state.snap.term != base_term)
         {
             err = path + " is based on " + snap_path + ", which is missing or corrupt";

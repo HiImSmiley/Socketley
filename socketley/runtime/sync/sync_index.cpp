@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "../../shared/persist/mutation_journal.h"
+#include "../../shared/persist/read_file.h"
 
 namespace socketley::sync
 {
@@ -81,29 +82,6 @@ bool write_all(int fd, std::string_view s)
     return true;
 }
 
-bool read_whole(const std::string& path, std::string& out, std::string& why)
-{
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0)
-    {
-        if (errno == ENOENT)
-            return true;
-        why = path + ": " + std::strerror(errno);
-        return false;
-    }
-    char buf[65536];
-    ssize_t n;
-    while ((n = ::read(fd, buf, sizeof buf)) > 0)
-        out.append(buf, static_cast<size_t>(n));
-    ::close(fd);
-    if (n < 0)
-    {
-        why = path + ": " + std::strerror(errno);
-        return false;
-    }
-    return true;
-}
-
 }   // namespace
 
 sync_index::~sync_index()
@@ -124,7 +102,7 @@ bool sync_index::open(std::string path, std::string_view scope, std::string& why
     m_stale = false;
 
     std::string text;
-    if (!read_whole(m_path, text, why))
+    if (!socketley::read_file(m_path, text, {.missing_ok = true, .no_follow = true}, &why))
         return false;
     // Empty, or the magic cut short by a crash before anything was recorded.
     if (text.size() <= magic.size() && magic.starts_with(text))

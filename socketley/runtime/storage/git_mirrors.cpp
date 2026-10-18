@@ -26,6 +26,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/persist/replaced_file.h"
+#include "../../shared/persist/read_file.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -42,17 +43,6 @@ std::string text_of(const jvalue& o, std::string_view n)
 {
     const jvalue* v = member(o, n);
     return v && v->k == jvalue::kind::string ? v->s : std::string{};
-}
-
-bool read_file(const std::string& path, std::string& out)
-{
-    std::ifstream f(path, std::ios::binary);
-    if (!f)
-        return false;
-    std::stringstream ss;
-    ss << f.rdbuf();
-    out = ss.str();
-    return true;
 }
 
 bool write_file(const std::string& path, std::string_view data, mode_t mode)
@@ -192,7 +182,7 @@ std::vector<git_mirrors::repo> git_mirrors::repos()
     if (stamp != m_cache_stamp)
     {
         std::string text;
-        m_cache = read_file(path, text) ? parse(text) : std::vector<repo>{};
+        m_cache = socketley::read_whole_file(path, text) ? parse(text) : std::vector<repo>{};
         m_cache_stamp = stamp;
         m_any = !m_cache.empty();
     }
@@ -306,7 +296,7 @@ bool git_mirrors::running(std::string_view id) const
 std::string git_mirrors::state_json(std::string_view id) const
 {
     std::string text;
-    if (!read_file(work_of(id) + "/state.json", text) || text.empty() || text.front() != '{')
+    if (!socketley::read_whole_file(work_of(id) + "/state.json", text) || text.empty() || text.front() != '{')
         return "null";
     while (!text.empty() && (text.back() == '\n' || text.back() == ' '))
         text.pop_back();
@@ -356,7 +346,7 @@ bool git_mirrors::set_token(authenticator& auth, std::string_view user, std::str
 std::string git_mirrors::token_of(authenticator& auth, std::string_view user) const
 {
     std::string file;
-    if (!read_file(token_path(user), file) || file.size() < 2 + 12 + 16 || !file.starts_with("v1"))
+    if (!socketley::read_whole_file(token_path(user), file) || file.size() < 2 + 12 + 16 || !file.starts_with("v1"))
         return {};
     const std::string key = auth.seal_key(user, "socketley git token");
     if (key.size() != 32)
@@ -417,7 +407,7 @@ std::string git_mirrors::start(const repo& r, const identity& id)
         args.push_back("--ca");
         args.push_back(m_cert);
     }
-    if (std::string old; read_file(work + "/moved-from", old) && !old.empty())
+    if (std::string old; socketley::read_whole_file(work + "/moved-from", old) && !old.empty())
     {
         args.push_back("--move-from");
         args.push_back(old);
@@ -475,7 +465,7 @@ bool git_mirrors::due(const repo& r, int64_t now) const
         return false;
     std::string text;
     jvalue st;
-    const bool ran = read_file(work_of(r.id) + "/state.json", text) && json_reader(text).document(st);
+    const bool ran = socketley::read_whole_file(work_of(r.id) + "/state.json", text) && json_reader(text).document(st);
     const std::time_t t = static_cast<std::time_t>(now);
     std::tm tm{};
     ::localtime_r(&t, &tm);
@@ -517,7 +507,7 @@ void git_mirrors::tick()
             continue;
         it->second = stamp;
         std::string state;
-        if (stamp.exists() && on_run && read_file(work_of(r.id) + "/state.json", state))
+        if (stamp.exists() && on_run && socketley::read_whole_file(work_of(r.id) + "/state.json", state))
             on_run(r, state);
     }
     m_seen_once = true;
@@ -542,9 +532,9 @@ void git_mirrors::serve(const identity& id)
             ++m_done.failures;
             std::string state;
             jvalue st;
-            m_done.last_error = read_file(work_of(it->first) + "/state.json", state) && json_reader(state).document(st)
-                                    ? text_of(st, "error")
-                                    : "the run of " + it->first + " failed";
+            const bool said = socketley::read_whole_file(work_of(it->first) + "/state.json", state) &&
+                              json_reader(state).document(st);
+            m_done.last_error = said ? text_of(st, "error") : "the run of " + it->first + " failed";
             LOG_WARN(("git: the run of " + it->first + " failed; see " + work_of(it->first) + "/log").c_str());
         }
         m_done.running.clear();

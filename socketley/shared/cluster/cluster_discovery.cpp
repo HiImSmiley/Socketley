@@ -6,6 +6,7 @@
 #include "../json/json_escape.h"
 #include "../json/json_doc.h"
 #include "../persist/replaced_file.h"
+#include "../persist/read_file.h"
 
 #include <filesystem>
 #include <fstream>
@@ -73,14 +74,9 @@ cluster_discovery::~cluster_discovery()
 bool cluster_discovery::read_claim_file(const std::string& path,
                                         node_claim& out, int64_t& heartbeat) const
 {
-    std::ifstream f(path);
-    if (!f.is_open())
-        return false;
-
-    std::ostringstream ss;
-    ss << f.rdbuf();
+    std::string text;
     socketley::json::jvalue doc;
-    if (!socketley::json::json_reader(ss.str()).document(doc))
+    if (!socketley::read_whole_file(path, text) || !socketley::json::json_reader(text).document(doc))
         return false;
 
     heartbeat = socketley::json::int_of(doc, "heartbeat");
@@ -369,13 +365,9 @@ void cluster_discovery::scan()
         }
 
         // Read and parse the file
-        std::ifstream f(full_path);
-        if (!f.is_open())
+        std::string content;
+        if (!socketley::read_whole_file(full_path, content))
             continue;
-
-        std::ostringstream ss;
-        ss << f.rdbuf();
-        std::string content = ss.str();
 
         remote_daemon rd;
         if (!parse_daemon_json(content, rd))
