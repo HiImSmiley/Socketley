@@ -363,7 +363,7 @@ bool apply_server_config(server_instance& srv, const runtime_config& cfg, bool b
             continue;
         if (refusal)
         {
-            *refusal = "invalid upstream address: " + u + " (the port must be a number between 1 and 65535)\n";
+            *refusal = server_instance::upstream_refusal(u);
             return false;
         }
         LOG_WARN(("dropping upstream \"" + u + "\" of " + std::string(srv.get_name()) +

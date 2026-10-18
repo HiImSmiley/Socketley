@@ -819,6 +819,24 @@ static int refuse_removed_server_flag(uint32_t which)
     return -1;
 }
 
+// A -u list of host:port separated by ';', refused whole at the first that cannot be, because one of two requested
+// targets is a silent half-configuration.
+static int add_upstream_list(server_instance* srv, std::string_view list)
+{
+    for (size_t start = 0; start <= list.size();)
+    {
+        const size_t semi = std::min(list.find(';', start), list.size());
+        const std::string_view addr = list.substr(start, semi - start);
+        if (!addr.empty() && !srv->add_upstream_target(addr))
+        {
+            std::cout << server_instance::upstream_refusal(addr);
+            return 1;
+        }
+        start = semi + 1;
+    }
+    return 0;
+}
+
 // The server flags create and edit take alike, after each has answered its own.
 static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa, size_t& i, runtime_manager* mgr)
 {
@@ -919,34 +937,7 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
                 std::cout << "-u requires host:port\n";
                 return 1;
             }
-            std::string_view upstream_str = pa.args[++i];
-            // A refused address fails the whole flag rather than being
-            // skipped, because coming up with one of two requested targets is
-            // a silent half-configuration.
-            size_t start = 0;
-            size_t semi;
-            while ((semi = upstream_str.find(';', start)) != std::string_view::npos)
-            {
-                auto addr = upstream_str.substr(start, semi - start);
-                if (!addr.empty() && !srv->add_upstream_target(addr))
-                {
-                    std::cout << "invalid upstream address: " << addr
-                              << " (the port must be a number between 1 and 65535)\n";
-                    return 1;
-                }
-                start = semi + 1;
-            }
-            if (start < upstream_str.size())
-            {
-                auto addr = upstream_str.substr(start);
-                if (!srv->add_upstream_target(addr))
-                {
-                    std::cout << "invalid upstream address: " << addr
-                              << " (the port must be a number between 1 and 65535)\n";
-                    return 1;
-                }
-            }
-            return 0;
+            return add_upstream_list(srv, pa.args[++i]);
         }
         default:
             return parse_server_shared_flags(srv, pa, i, mgr);
@@ -2196,34 +2187,8 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
                 std::cout << "-u requires host:port\n";
                 return 1;
             }
-            std::string_view upstream_str = pa.args[++i];
-            // Same contract as the create path, except that on `edit` the list
-            // is already cleared, so a refusal leaves fewer upstreams and the
-            // message names the address that could not be read.
-            size_t start = 0;
-            size_t semi;
-            while ((semi = upstream_str.find(';', start)) != std::string_view::npos)
-            {
-                auto addr = upstream_str.substr(start, semi - start);
-                if (!addr.empty() && !srv->add_upstream_target(addr))
-                {
-                    std::cout << "invalid upstream address: " << addr
-                              << " (the port must be a number between 1 and 65535)\n";
-                    return 1;
-                }
-                start = semi + 1;
-            }
-            if (start < upstream_str.size())
-            {
-                auto addr = upstream_str.substr(start);
-                if (!srv->add_upstream_target(addr))
-                {
-                    std::cout << "invalid upstream address: " << addr
-                              << " (the port must be a number between 1 and 65535)\n";
-                    return 1;
-                }
-            }
-            return 0;
+            // The list is cleared already on edit, so a refusal leaves fewer upstreams and names the one it read.
+            return add_upstream_list(srv, pa.args[++i]);
         }
         default:
             return parse_server_shared_flags(srv, pa, i, mgr);

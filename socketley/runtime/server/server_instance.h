@@ -779,6 +779,11 @@ public:
     // False when the address named a port that cannot work, storing nothing in
     // that case.
     [[nodiscard]] bool add_upstream_target(std::string_view addr);
+    // What a refused upstream is answered with, one line.
+    static std::string upstream_refusal(std::string_view addr)
+    {
+        return "invalid upstream address: " + std::string(addr) + " (the port must be a number between 1 and 65535)\n";
+    }
     void clear_upstream_targets();
     const std::vector<upstream_target>& get_upstream_targets() const;
 
