@@ -1,5 +1,8 @@
 #pragma once
 
+#include <charconv>
+#include <concepts>
+#include <string>
 #include <string_view>
 #include <type_traits>
 
@@ -39,6 +42,31 @@ inline std::string_view field(std::string_view text, std::string_view key)
         return false;
     });
     return out;
+}
+
+// One key:value line, a number written without a stream and a flag as 1 or 0.
+template <std::integral T>
+void put(std::string& out, std::string_view key, T v)
+{
+    out += key;
+    out += ':';
+    if constexpr (std::is_same_v<T, bool>)
+        out += v ? '1' : '0';
+    else
+    {
+        char buf[24];
+        const auto r = std::to_chars(buf, buf + sizeof buf, v);
+        out.append(buf, static_cast<size_t>(r.ptr - buf));
+    }
+    out += '\n';
+}
+
+inline void put(std::string& out, std::string_view key, std::string_view v)
+{
+    out += key;
+    out += ':';
+    out += v;
+    out += '\n';
 }
 
 }   // namespace socketley::stats_text

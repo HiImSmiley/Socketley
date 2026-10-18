@@ -5,6 +5,7 @@
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/runtime/runtime_manager.h"
+#include "../../shared/runtime/stats_text.h"
 #include "../../shared/cluster/cluster_discovery.h"
 #include "../../shared/lua/lua_context.h"
 #include "../../shared/util/logging.h"
@@ -9853,63 +9854,41 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
 // longer do.
 std::string proxy_instance::stats_lines() const
 {
-    // Use char buffer for integer formatting to avoid ostringstream overhead in stats path
-    char num_buf[32];
+    namespace st = socketley::stats_text;
     std::string out;
     out.reserve(256);
 
-    out += "backend_connections:";
-    auto [p1, e1] = std::to_chars(num_buf, num_buf + sizeof(num_buf), m_backend_count);
-    out.append(num_buf, static_cast<size_t>(p1 - num_buf));
-    out += '\n';
+    st::put(out, "backend_connections", m_backend_count);
 
-    out += "protocol:";
-    out += (m_protocol == protocol_http ? "http" : "tcp");
-    out += '\n';
+    st::put(out, "protocol", m_protocol == protocol_http ? "http" : "tcp");
 
-    out += "backends:";
-    auto [p2, e2] = std::to_chars(num_buf, num_buf + sizeof(num_buf), m_backends.size());
-    out.append(num_buf, static_cast<size_t>(p2 - num_buf));
-    out += '\n';
+    st::put(out, "backends", m_backends.size());
 
     // How many routes this proxy is enforcing out of what its backends
     // published, because a backend that declares nothing and a script that
     // failed to load look alike from the client side.
-    out += "declared_routes:";
-    auto [p2b, e2b] = std::to_chars(num_buf, num_buf + sizeof(num_buf), m_routes.size());
-    out.append(num_buf, static_cast<size_t>(p2b - num_buf));
-    out += '\n';
+    st::put(out, "declared_routes", m_routes.size());
 
     // Only on a listener something actually spoke h2 to, so an HTTP/1.1 entrance's stats do not grow six lines
     // that are always zero.
     if (m_h2.conns > 0)
     {
         const std::pair<const char*, uint64_t> rows[] = {
-            {"h2_conns:", m_h2.conns}, {"h2_streams:", m_h2.streams}, {"h2_refused:", m_h2.refused},
-            {"h2_resets_in:", m_h2.resets_in}, {"h2_resets_out:", m_h2.resets_out},
-            {"h2_goaways:", m_h2.goaways}};
+            {"h2_conns", m_h2.conns}, {"h2_streams", m_h2.streams}, {"h2_refused", m_h2.refused},
+            {"h2_resets_in", m_h2.resets_in}, {"h2_resets_out", m_h2.resets_out},
+            {"h2_goaways", m_h2.goaways}};
         for (const auto& [name, value] : rows)
-        {
-            out += name;
-            auto [ph, eh] = std::to_chars(num_buf, num_buf + sizeof(num_buf), value);
-            out.append(num_buf, static_cast<size_t>(ph - num_buf));
-            out += '\n';
-        }
+            st::put(out, name, value);
     }
 
     // And the HTTP/3 endpoint's, on the same rule: only where something spoke it.
     if (m_h3t.conns > 0)
     {
         const std::pair<const char*, uint64_t> rows[] = {
-            {"h3_conns:", m_h3t.conns}, {"h3_streams:", m_h3t.streams},
-            {"h3_retries:", m_h3t.retries}, {"h3_forwarded:", m_h3t.forwarded}};
+            {"h3_conns", m_h3t.conns}, {"h3_streams", m_h3t.streams},
+            {"h3_retries", m_h3t.retries}, {"h3_forwarded", m_h3t.forwarded}};
         for (const auto& [name, value] : rows)
-        {
-            out += name;
-            auto [p3, e3] = std::to_chars(num_buf, num_buf + sizeof(num_buf), value);
-            out.append(num_buf, static_cast<size_t>(p3 - num_buf));
-            out += '\n';
-        }
+            st::put(out, name, value);
     }
 
     // Pool stats
@@ -9917,22 +9896,12 @@ std::string proxy_instance::stats_lines() const
     for (const auto& pool : m_backend_pool)
         pool_total += pool.size();
     if (pool_total > 0)
-    {
-        out += "pooled_connections:";
-        auto [p3, e3] = std::to_chars(num_buf, num_buf + sizeof(num_buf), pool_total);
-        out.append(num_buf, static_cast<size_t>(p3 - num_buf));
-        out += '\n';
-    }
+        st::put(out, "pooled_connections", pool_total);
 
     // Backends kept on a keep-alive client for its next request, counted in
     // backend_connections as well, and printed only when there are some.
     if (m_parked_count > 0)
-    {
-        out += "parked_connections:";
-        auto [p3b, e3b] = std::to_chars(num_buf, num_buf + sizeof(num_buf), m_parked_count);
-        out.append(num_buf, static_cast<size_t>(p3b - num_buf));
-        out += '\n';
-    }
+        st::put(out, "parked_connections", m_parked_count);
 
     // Include health/circuit info if mesh is configured
     if (m_mesh.health_check != mesh_config::health_none)
@@ -9940,41 +9909,24 @@ std::string proxy_instance::stats_lines() const
         size_t healthy = 0;
         for (const auto& h : m_backend_health)
             if (h.healthy) healthy++;
-        out += "healthy_backends:";
-        auto [p4, e4] = std::to_chars(num_buf, num_buf + sizeof(num_buf), healthy);
-        out.append(num_buf, static_cast<size_t>(p4 - num_buf));
-        out += '\n';
+        st::put(out, "healthy_backends", healthy);
     }
 
-    out += "peak_connections:";
-    auto [p6, e6] = std::to_chars(num_buf, num_buf + sizeof(num_buf), m_peak_connections);
-    out.append(num_buf, static_cast<size_t>(p6 - num_buf));
-    out += '\n';
+    st::put(out, "peak_connections", m_peak_connections);
 
     size_t open_circuits = 0;
     for (const auto& cb : m_circuit_breakers)
         if (cb.current == circuit_breaker::open) open_circuits++;
     if (open_circuits > 0)
-    {
-        out += "open_circuits:";
-        auto [p5, e5] = std::to_chars(num_buf, num_buf + sizeof(num_buf), open_circuits);
-        out.append(num_buf, static_cast<size_t>(p5 - num_buf));
-        out += '\n';
-    }
+        st::put(out, "open_circuits", open_circuits);
 
     // Per-backend circuit breaker state
     for (size_t i = 0; i < m_circuit_breakers.size(); i++)
     {
         auto& cb = m_circuit_breakers[i];
         if (cb.current != circuit_breaker::closed)
-        {
-            out += "backend_";
-            auto [pi, ei] = std::to_chars(num_buf, num_buf + sizeof(num_buf), i);
-            out.append(num_buf, static_cast<size_t>(pi - num_buf));
-            out += "_circuit:";
-            out += (cb.current == circuit_breaker::open ? "open" : "half_open");
-            out += '\n';
-        }
+            st::put(out, "backend_" + std::to_string(i) + "_circuit",
+                    cb.current == circuit_breaker::open ? "open" : "half_open");
     }
 
     // A group member has no index to be named by, so it is named by its

@@ -1,6 +1,7 @@
 #include <malloc.h>
 #include <climits>
 #include "runtime_instance.h"
+#include "stats_text.h"
 #include "../ipc/worker_env.h"
 #include "../lua/lua_suspend.h"
 #include "../util/logging.h"
@@ -1214,38 +1215,24 @@ std::string runtime_instance::get_stats() const
 // what lets the daemon print them for a runtime living somewhere else.
 std::string runtime_instance::stats_prefix() const
 {
+    namespace st = socketley::stats_text;
     std::string out;
     out.reserve(256);
 
-    char buf[32];
-    auto append_u64 = [&](uint64_t v) {
-        auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
-        out.append(buf, static_cast<size_t>(ptr - buf));
-    };
-
     const shard_stats::figures f = worker_figures();
 
-    out += "name:";
-    out += m_name;
-    out += "\ntype:";
-    out += type_to_string(m_type);
-    out += "\nport:";
+    st::put(out, "name", m_name);
+    st::put(out, "type", type_to_string(m_type));
     // The bound port and not the configured one, for `ps`'s reason: a runtime
     // with no -p reported 0 while it was serving on its type's default.
-    append_u64(effective_port());
-    out += "\nconnections:";
+    st::put(out, "port", effective_port());
     // Not get_connection_count(): see reported_connection_count(), which is the
     // same question asked in a way that survives the runtime living in a worker.
-    append_u64(reported_connection_count());
-    out += "\ntotal_connections:";
-    append_u64(f.total_connections);
-    out += "\ntotal_messages:";
-    append_u64(f.total_messages);
-    out += "\nbytes_in:";
-    append_u64(f.bytes_in);
-    out += "\nbytes_out:";
-    append_u64(f.bytes_out);
-    out += '\n';
+    st::put(out, "connections", reported_connection_count());
+    st::put(out, "total_connections", f.total_connections);
+    st::put(out, "total_messages", f.total_messages);
+    st::put(out, "bytes_in", f.bytes_in);
+    st::put(out, "bytes_out", f.bytes_out);
 
     return out;
 }

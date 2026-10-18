@@ -5,6 +5,7 @@
 #include "type_manifest.h"
 #include "../shared/runtime/command_usage.h"
 #include "../shared/runtime/type_registry.h"
+#include "../shared/runtime/stats_text.h"
 #include "../shared/loop/event_loop.h"
 #include "../shared/runtime/runtime_manager.h"
 #include "../shared/runtime/runtime_definitions.h"
@@ -6582,20 +6583,13 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
         const size_t idx = static_cast<size_t>(&sup - it->second.data());
         if (it->second.size() > 1)
         {
-            detail += "[shard ";
-            detail += std::to_string(idx);
-            detail += "]\nshard_connections:";
-            detail += std::to_string(sf.active_connections);
-            detail += "\nshard_total_connections:";
-            detail += std::to_string(sf.total_connections);
-            detail += "\nshard_total_messages:";
-            detail += std::to_string(sf.total_messages);
-            detail += "\nshard_bytes_in:";
-            detail += std::to_string(sf.bytes_in);
-            detail += "\nshard_bytes_out:";
-            detail += std::to_string(sf.bytes_out);
-            detail += '\n';
             const shard_stats::figures sf = region ? region->at(static_cast<uint32_t>(idx)) : s.f;
+            detail += "[shard " + std::to_string(idx) + "]\n";
+            socketley::stats_text::put(detail, "shard_connections", sf.active_connections);
+            socketley::stats_text::put(detail, "shard_total_connections", sf.total_connections);
+            socketley::stats_text::put(detail, "shard_total_messages", sf.total_messages);
+            socketley::stats_text::put(detail, "shard_bytes_in", sf.bytes_in);
+            socketley::stats_text::put(detail, "shard_bytes_out", sf.bytes_out);
         }
         detail += s.detail;
     }
