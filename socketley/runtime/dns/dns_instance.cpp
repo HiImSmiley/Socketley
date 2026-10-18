@@ -29,6 +29,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/net/ip_block.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::dns
 {
@@ -1483,19 +1484,12 @@ bool dns_instance::ensure_zone_files(std::string& why) const
 
         std::error_code ec;
         std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-        const std::string tmp = path + ".tmp";
-        FILE* f = std::fopen(tmp.c_str(), "we");
-        const bool written = f && std::fwrite(text.data(), 1, text.size(), f) == text.size();
-        if (f)
-            std::fclose(f);
-        // Linked rather than renamed, so two shards writing at once leave one whole file and neither is overwritten.
-        if (!written || (::link(tmp.c_str(), path.c_str()) < 0 && errno != EEXIST))
+        // Made once: two shards writing at once leave one whole file, and neither is overwritten.
+        if (std::string err; !socketley::create_file_once(path, text, &err, 0644))
         {
-            ::unlink(tmp.c_str());
-            why = "--zone: " + path + " could not be written: " + std::strerror(errno ? errno : EIO);
+            why = "--zone: " + path + " could not be written: " + err;
             return false;
         }
-        ::unlink(tmp.c_str());
     }
     return true;
 }

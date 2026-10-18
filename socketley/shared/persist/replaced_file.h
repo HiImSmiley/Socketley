@@ -109,4 +109,55 @@ inline bool replace_file(const std::string& path, std::string_view data, durabil
     return synced;
 }
 
+// `data` as `path` unless a file is there already, which then stays as it is: written whole under a name no other
+// writer uses, synced and linked into place, so of writers racing one file wins whole and every one reads it after.
+// False with `why` when there is neither; `made` says whether this call's is the one there.
+inline bool create_file_once(const std::string& path, std::string_view data, std::string* why = nullptr,
+                             mode_t mode = 0600, bool* made = nullptr)
+{
+    static std::atomic<uint64_t> next{0};
+    if (made)
+        *made = false;
+    const std::string tmp = path + "." + std::to_string(::getpid()) + "." +
+                            std::to_string(next.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
+    if (fd < 0)
+    {
+        if (why)
+            *why = "cannot create " + tmp + ": " + std::strerror(errno);
+        return false;
+    }
+    const bool whole = ::fchmod(fd, mode) == 0 && write_all(fd, data.data(), data.size()) && ::fsync(fd) == 0;
+    const int werr = errno;
+    const bool closed = ::close(fd) == 0;
+    if (!whole || !closed)
+    {
+        ::unlink(tmp.c_str());
+        if (why)
+            *why = "cannot write " + tmp + ": " + std::strerror(whole ? errno : werr);
+        return false;
+    }
+    const bool linked = ::link(tmp.c_str(), path.c_str()) == 0;
+    const int lerr = errno;
+    ::unlink(tmp.c_str());
+    if (!linked)
+    {
+        if (lerr == EEXIST)
+            return true;
+        if (why)
+            *why = "cannot link " + path + ": " + std::strerror(lerr);
+        return false;
+    }
+    if (made)
+        *made = true;
+    const size_t slash = path.rfind('/');
+    const std::string dir = slash == std::string::npos ? std::string(".") : path.substr(0, slash ? slash : 1);
+    if (const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC); dfd >= 0)
+    {
+        if (::fsync(dfd) != 0) {}
+        ::close(dfd);
+    }
+    return true;
+}
+
 }   // namespace socketley

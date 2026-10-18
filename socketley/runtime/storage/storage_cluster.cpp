@@ -12,6 +12,7 @@
 
 #include "../../shared/util/logging.h"
 #include "../../shared/util/random_id.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::storage
 {
@@ -40,20 +41,9 @@ bool storage_run::load_cluster_id(std::string& err)
         std::snprintf(hex_id, sizeof hex_id, "%016llx%016llx\n", static_cast<unsigned long long>(random_u64()),
                       static_cast<unsigned long long>(random_u64()));
         const std::string id = hex_id;
-        const std::string tmp = path + ".tmp." + std::to_string(::getpid());
-        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (fd < 0)
-            break;
-        const bool whole = ::write(fd, id.data(), id.size()) == static_cast<ssize_t>(id.size()) && ::fsync(fd) == 0;
-        ::close(fd);
         // The first shard's id stays, and a later one reads it.
-        if (!whole || ::link(tmp.c_str(), path.c_str()) < 0)
-            if (errno != EEXIST)
-            {
-                ::unlink(tmp.c_str());
-                break;
-            }
-        ::unlink(tmp.c_str());
+        if (!create_file_once(path, id, nullptr, 0644))
+            break;
     }
     err = "the cluster id of this node's data in " + path + " can be neither read nor made";
     return false;
