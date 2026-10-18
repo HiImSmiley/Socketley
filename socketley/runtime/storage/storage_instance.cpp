@@ -249,9 +249,7 @@ bool storage_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
 
 bool storage_instance::setup(event_loop& loop)
 {
-    // A run the ring has finished with is freed here, and the ones it still
-    // owes completions stay where they are.
-    std::erase_if(m_graveyard, [](const auto& r) { return r->drained(); });
+    m_graveyard.reap();
 
     m_loop = &loop;
     // Storage waits on the disk rather than on the next packet, so a spin finds nothing and only spends CPU.
@@ -334,8 +332,7 @@ bool storage_instance::setup(event_loop& loop)
         if (!socketley::storage::parse_domains(m_domain, d, why))
         {
             LOG_ERROR(("storage: " + why).c_str());
-            run->stop();
-            m_graveyard.push_back(std::move(run));
+            m_graveyard.retire(std::move(run));
             return false;
         }
         run->set_domains(std::move(d));
@@ -346,8 +343,7 @@ bool storage_instance::setup(event_loop& loop)
         if (!socketley::storage::parse_domains(m_website_domain, d, why))
         {
             LOG_ERROR(("storage: --website-domain: " + why).c_str());
-            run->stop();
-            m_graveyard.push_back(std::move(run));
+            m_graveyard.retire(std::move(run));
             return false;
         }
         run->set_website_domains(std::move(d));
@@ -360,8 +356,7 @@ bool storage_instance::setup(event_loop& loop)
         if (!socketley::storage::load_sse_master(m_sse_key_file, key, why))
         {
             LOG_ERROR(("storage: " + why).c_str());
-            run->stop();
-            m_graveyard.push_back(std::move(run));
+            m_graveyard.retire(std::move(run));
             return false;
         }
         run->set_sse_master(key);
@@ -374,8 +369,7 @@ bool storage_instance::setup(event_loop& loop)
         if (!socketley::storage::load_notify_targets(m_notify_targets, targets, why))
         {
             LOG_ERROR(("storage: " + why).c_str());
-            run->stop();
-            m_graveyard.push_back(std::move(run));
+            m_graveyard.retire(std::move(run));
             return false;
         }
         run->notifications().set_targets(std::move(targets));
@@ -388,8 +382,7 @@ bool storage_instance::setup(event_loop& loop)
         if (!socketley::storage::load_replication_targets(m_replication_targets, targets, why))
         {
             LOG_ERROR(("storage: " + why).c_str());
-            run->stop();
-            m_graveyard.push_back(std::move(run));
+            m_graveyard.retire(std::move(run));
             return false;
         }
         run->replication().set_targets(std::move(targets));
@@ -401,8 +394,7 @@ bool storage_instance::setup(event_loop& loop)
         if (!socketley::storage::load_replication_targets(m_tiers_file, tiers, why))
         {
             LOG_ERROR(("storage: " + why).c_str());
-            run->stop();
-            m_graveyard.push_back(std::move(run));
+            m_graveyard.retire(std::move(run));
             return false;
         }
         run->set_tiers(std::move(tiers));
@@ -414,8 +406,7 @@ bool storage_instance::setup(event_loop& loop)
         if (!socketley::storage::load_federation(m_federation_file, fed, why))
         {
             LOG_ERROR(("storage: " + why).c_str());
-            run->stop();
-            m_graveyard.push_back(std::move(run));
+            m_graveyard.retire(std::move(run));
             return false;
         }
         run->set_federation(std::move(fed));
@@ -431,8 +422,7 @@ bool storage_instance::setup(event_loop& loop)
     if (!run->open(err))
     {
         LOG_ERROR(("storage: " + err).c_str());
-        run->stop();
-        m_graveyard.push_back(std::move(run));
+        m_graveyard.retire(std::move(run));
         return false;
     }
 
@@ -444,8 +434,7 @@ bool storage_instance::setup(event_loop& loop)
                 listen_path, get_port(), get_tls()); !msg.empty())
         {
             LOG_ERROR(("storage: " + msg).c_str());
-            run->stop();
-            m_graveyard.push_back(std::move(run));
+            m_graveyard.retire(std::move(run));
             return false;
         }
         // One node per shard, because a path is one listener and the second
@@ -454,8 +443,7 @@ bool storage_instance::setup(event_loop& loop)
                 listen_path, get_shards()); !msg.empty())
         {
             LOG_ERROR(("storage: " + msg).c_str());
-            run->stop();
-            m_graveyard.push_back(std::move(run));
+            m_graveyard.retire(std::move(run));
             return false;
         }
         const std::string mine = socketley::unix_sock::shard_listen_path(
@@ -464,8 +452,7 @@ bool storage_instance::setup(event_loop& loop)
         if (r.fd < 0)
         {
             LOG_ERROR(("storage: " + r.error).c_str());
-            run->stop();
-            m_graveyard.push_back(std::move(run));
+            m_graveyard.retire(std::move(run));
             return false;
         }
         fd = r.fd;
@@ -473,8 +460,7 @@ bool storage_instance::setup(event_loop& loop)
     }
     else if (!open_listener(effective_port(), /*reuseport=*/get_shards() > 1, fd))
     {
-        run->stop();
-        m_graveyard.push_back(std::move(run));
+        m_graveyard.retire(std::move(run));
         return false;
     }
 
@@ -482,8 +468,7 @@ bool storage_instance::setup(event_loop& loop)
     // twice, the second time whatever had been given its number since.
     if (!run->listen_on(fd))
     {
-        run->stop();
-        m_graveyard.push_back(std::move(run));
+        m_graveyard.retire(std::move(run));
         // The socket node this start bound goes with it, so the next start does not meet a stale path.
         if (!m_bound_listen_path.empty())
         {
@@ -543,11 +528,7 @@ void storage_instance::teardown(event_loop&)
 {
     if (m_companion)
         m_companion->stop();
-    if (m_run)
-    {
-        m_run->stop();
-        m_graveyard.push_back(std::move(m_run));
-    }
+    m_graveyard.retire(std::move(m_run));
     if (!m_bound_listen_path.empty())
     {
         if (::unlink(m_bound_listen_path.c_str()) < 0) {}
@@ -558,8 +539,7 @@ void storage_instance::teardown(event_loop&)
 
 void storage_instance::on_loop_turn()
 {
-    if (!m_graveyard.empty())
-        std::erase_if(m_graveyard, [](const auto& r) { return r->drained(); });
+    m_graveyard.reap();
     if (m_companion)
         m_companion->pump();
     if (m_run)

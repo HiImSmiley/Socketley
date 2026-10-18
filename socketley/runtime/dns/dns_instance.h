@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "../../shared/runtime/runtime_instance.h"
+#include "shared/runtime/retired_runs.h"
 
 namespace socketley::dns
 {
@@ -96,5 +97,5 @@ private:
 
     std::unique_ptr<socketley::dns::dns_run> m_run;
     // Runs the ring still owes completions to, freed once it owes them none.
-    std::vector<std::unique_ptr<socketley::dns::dns_run>> m_graveyard;
+    socketley::retired_runs<socketley::dns::dns_run> m_graveyard;
 };

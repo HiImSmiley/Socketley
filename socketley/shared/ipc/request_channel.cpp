@@ -35,7 +35,7 @@ void request_channel::attach(event_loop& loop)
     // A wakeup in flight across a detach never reports, so the flag is cleared
     // from owner_inflight(), except when the owner table is full and zero
     // would mean unknown.
-    if (loop.owner_inflight(this) == 0 && !loop.owner_table_full())
+    if (loop.owner_drained(this))
     {
         m_wake_armed  = false;
         m_sweep_armed = false;

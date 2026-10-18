@@ -15,6 +15,7 @@
 #include "../../shared/runtime/runtime_instance.h"
 #include "../../shared/crypto/tls_context.h"
 #include "../../shared/net/unix_companion.h"
+#include "shared/runtime/retired_runs.h"
 
 namespace socketley::storage
 {
@@ -194,7 +195,7 @@ private:
 
     std::unique_ptr<socketley::storage::storage_run> m_run;
     // Runs the ring still owes completions to, freed once it owes them none.
-    std::vector<std::unique_ptr<socketley::storage::storage_run>> m_graveyard;
+    socketley::retired_runs<socketley::storage::storage_run> m_graveyard;
     event_loop* m_loop{nullptr};
     std::string m_bound_listen_path;
     // The node beside the port, made once and kept: it owns an io_request the

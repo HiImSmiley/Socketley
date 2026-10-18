@@ -255,7 +255,7 @@ public:
 
     bool start(std::string& why);
     void stop();
-    bool drained() const { return m_loop.owner_inflight(this) == 0 && !m_loop.owner_table_full(); }
+    bool drained() const { return m_loop.owner_drained(this); }
     void on_cqe(struct io_uring_cqe* cqe) override;
 
     const counters& stats() const { return m_c; }
@@ -1547,14 +1547,13 @@ void dns_instance::on_cqe(struct io_uring_cqe*)
 
 bool dns_instance::setup(event_loop& loop)
 {
-    std::erase_if(m_graveyard, [](const auto& r) { return r->drained(); });
+    m_graveyard.reap();
     auto run = std::make_unique<dns_run>(*this, loop);
     std::string why;
     if (!run->start(why))
     {
         LOG_ERROR(("dns: " + why).c_str());
-        run->stop();
-        m_graveyard.push_back(std::move(run));
+        m_graveyard.retire(std::move(run));
         return false;
     }
     m_run = std::move(run);
@@ -1563,17 +1562,12 @@ bool dns_instance::setup(event_loop& loop)
 
 void dns_instance::teardown(event_loop&)
 {
-    if (m_run)
-    {
-        m_run->stop();
-        m_graveyard.push_back(std::move(m_run));
-    }
+    m_graveyard.retire(std::move(m_run));
 }
 
 void dns_instance::on_loop_turn()
 {
-    if (!m_graveyard.empty())
-        std::erase_if(m_graveyard, [](const auto& r) { return r->drained(); });
+    m_graveyard.reap();
 }
 
 std::string dns_instance::stats_lines() const

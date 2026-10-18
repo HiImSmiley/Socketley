@@ -2207,7 +2207,7 @@ bool server_instance::setup(event_loop& loop)
     // completions are dropped and never lower them, so this asks the loop --
     // zero means every request is free, and a full owner table leaves them
     // alone rather than acting on an unknown.
-    if (loop.owner_inflight(this) == 0 && !loop.owner_table_full())
+    if (loop.owner_drained(this))
     {
         m_accept_armed         = false;
         m_idle_sweep_armed     = false;

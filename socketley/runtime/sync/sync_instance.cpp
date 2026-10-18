@@ -194,6 +194,7 @@ bool sync_instance::setup(event_loop& loop)
         if (!repos->start(why))
         {
             LOG_ERROR(("sync: " + why).c_str());
+            m_repo_graveyard.retire(std::move(repos));
             return false;
         }
         m_repos = std::move(repos);
@@ -204,6 +205,7 @@ bool sync_instance::setup(event_loop& loop)
     if (!run->start(why))
     {
         LOG_ERROR(("sync: " + why).c_str());
+        m_graveyard.retire(std::move(run));
         return false;
     }
     m_run = std::move(run);
@@ -212,26 +214,14 @@ bool sync_instance::setup(event_loop& loop)
 
 void sync_instance::teardown(event_loop&)
 {
-    if (m_repos)
-    {
-        m_repos->stop();
-        // Kept until its cancelled timeout has completed into it.
-        m_repo_graveyard.push_back(std::move(m_repos));
-    }
-    if (m_run)
-    {
-        m_run->stop();
-        // Kept until the ring owes it nothing, since a cancelled exchange still completes into it.
-        m_graveyard.push_back(std::move(m_run));
-    }
+    m_repo_graveyard.retire(std::move(m_repos));
+    m_graveyard.retire(std::move(m_run));
 }
 
 void sync_instance::on_loop_turn()
 {
-    if (!m_graveyard.empty())
-        std::erase_if(m_graveyard, [](const auto& r) { return r->drained(); });
-    if (!m_repo_graveyard.empty())
-        std::erase_if(m_repo_graveyard, [](const auto& r) { return r->drained(); });
+    m_graveyard.reap();
+    m_repo_graveyard.reap();
     if (m_run)
         m_run->on_loop_turn();
     if (m_repos)

@@ -410,7 +410,7 @@ void sync_run::stop()
 
 bool sync_run::drained() const
 {
-    return m_loop.owner_inflight(this) == 0 && !m_loop.owner_table_full();
+    return m_loop.owner_drained(this);
 }
 
 void sync_run::on_cqe(struct io_uring_cqe* cqe)

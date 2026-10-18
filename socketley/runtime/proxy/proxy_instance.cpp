@@ -1790,11 +1790,7 @@ bool proxy_instance::setup(event_loop& loop)
     // Nothing from the previous run is cleaned up here, because teardown()
     // hands what it cannot free to retire() -- a POLLOUT on a connect socket,
     // a parked splice and a health-check read all outlive a stop.
-    // The rider event_loop.h puts on owner_inflight(): once the owner table
-    // has run out and handlers share one identity, a zero from it proves
-    // nothing, and this storage holds the io_request the ring still names.
-    if (!m_retired.empty() && loop.owner_inflight(this) == 0 &&
-        !loop.owner_table_full())
+    if (!m_retired.empty() && loop.owner_drained(this))
         m_retired.clear();
 
     m_client_count = 0;

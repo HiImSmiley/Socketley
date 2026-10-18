@@ -94,6 +94,13 @@ public:
     // identity, from which point a zero from owner_inflight() proves nothing.
     bool owner_table_full() const { return m_owner_table_full_logged; }
 
+    // True once nothing the kernel holds can still name this owner, the one
+    // condition under which a handler's storage may be freed.
+    bool owner_drained(const io_handler* owner) const
+    {
+        return owner_inflight(owner) == 0 && !owner_table_full();
+    }
+
     // Give back the provided buffer a completion is carrying, for a caller
     // about to drop it, because the groups are shared by every instance of a
     // runtime type on this loop.

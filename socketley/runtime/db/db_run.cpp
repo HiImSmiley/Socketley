@@ -229,7 +229,7 @@ void db_run::stop()
 
 bool db_run::drained() const
 {
-    return m_loop.owner_inflight(this) == 0 && !m_loop.owner_table_full();
+    return m_loop.owner_drained(this);
 }
 
 void db_run::on_loop_turn()

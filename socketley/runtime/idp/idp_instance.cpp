@@ -65,8 +65,7 @@ bool idp_instance::setup(event_loop& loop)
     if (!run->start(why))
     {
         LOG_ERROR(("idp " + std::string(get_name()) + ": " + why).c_str());
-        run->stop();
-        m_graveyard.push_back(std::move(run));
+        m_graveyard.retire(std::move(run));
         return false;
     }
     m_run = std::move(run);
@@ -75,18 +74,12 @@ bool idp_instance::setup(event_loop& loop)
 
 void idp_instance::teardown(event_loop&)
 {
-    if (m_run)
-    {
-        m_run->stop();
-        // Kept until the ring owes it nothing, since a cancelled read still completes into it.
-        m_graveyard.push_back(std::move(m_run));
-    }
+    m_graveyard.retire(std::move(m_run));
 }
 
 void idp_instance::on_loop_turn()
 {
-    if (!m_graveyard.empty())
-        std::erase_if(m_graveyard, [](const auto& r) { return r->drained(); });
+    m_graveyard.reap();
     if (m_run)
         m_run->on_loop_turn();
 }

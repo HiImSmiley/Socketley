@@ -534,11 +534,7 @@ bool cache_instance::setup(event_loop& loop)
     // hands what it cannot free to retire(); what can go is whatever the loop
     // confirms is finished with, which is the only thing that releases a
     // dropped completion's storage.
-    // The rider event_loop.h puts on owner_inflight(): once the owner table
-    // has run out and handlers share one identity, a zero from it proves
-    // nothing, and this storage holds the io_request the ring still names.
-    if (!m_retired.empty() && loop.owner_inflight(this) == 0 &&
-        !loop.owner_table_full())
+    if (!m_retired.empty() && loop.owner_drained(this))
         m_retired.clear();
 
     // Pre-allocate connection pool

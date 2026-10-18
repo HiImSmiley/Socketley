@@ -11,6 +11,7 @@
 
 #include "../../shared/ipc/request_channel.h"
 #include "../../shared/runtime/runtime_instance.h"
+#include "shared/runtime/retired_runs.h"
 
 namespace socketley::idp
 {
@@ -73,5 +74,5 @@ private:
 
     std::unique_ptr<socketley::idp::idp_run> m_run;
     // Runs stopped but still owed completions by the ring.
-    std::vector<std::unique_ptr<socketley::idp::idp_run>> m_graveyard;
+    socketley::retired_runs<socketley::idp::idp_run> m_graveyard;
 };

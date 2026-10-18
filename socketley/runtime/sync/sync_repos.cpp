@@ -125,7 +125,7 @@ void repo_runner::stop()
 
 bool repo_runner::drained() const
 {
-    return m_loop.owner_inflight(this) == 0 && !m_loop.owner_table_full();
+    return m_loop.owner_drained(this);
 }
 
 void repo_runner::on_cqe(struct io_uring_cqe* cqe)

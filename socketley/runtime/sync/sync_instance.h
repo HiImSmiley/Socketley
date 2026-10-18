@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../../shared/runtime/runtime_instance.h"
+#include "shared/runtime/retired_runs.h"
 
 namespace socketley::sync
 {
@@ -113,7 +114,7 @@ private:
 
     std::unique_ptr<socketley::sync::sync_run> m_run;
     // Runs that were stopped and that the ring still owes a completion.
-    std::vector<std::unique_ptr<socketley::sync::sync_run>> m_graveyard;
+    socketley::retired_runs<socketley::sync::sync_run> m_graveyard;
     std::unique_ptr<socketley::sync::repo_runner> m_repos;
-    std::vector<std::unique_ptr<socketley::sync::repo_runner>> m_repo_graveyard;
+    socketley::retired_runs<socketley::sync::repo_runner> m_repo_graveyard;
 };

@@ -632,7 +632,7 @@ bool client_instance::setup(event_loop& loop)
     // completions are dropped and never lower them, so this asks the loop --
     // zero frees the old struct, non-zero takes a fresh one, and a full owner
     // table takes the conservative branch.
-    if (loop.owner_inflight(this) == 0 && !loop.owner_table_full())
+    if (loop.owner_drained(this))
     {
         m_conn->read_pending  = false;
         m_conn->write_pending = false;
