@@ -2,14 +2,9 @@
 
 #include "lua_db_api.h"
 
-#include <iostream>
-
 #include "db_call.h"
 #include "lua_context.h"
 #include "lua_json.h"
-#include "lua_suspend.h"
-#include "../runtime/runtime_instance.h"
-#include "../runtime/runtime_manager.h"
 #include "../json/json_escape.h"
 
 namespace
@@ -47,82 +42,26 @@ void quoted(std::string& out, std::string_view s)
     socketley::json::quote_into(out, std::string(s));
 }
 
-int db_thunk(lua_State* L)
-{
-    auto* client = static_cast<lua_db_client*>(lua_touserdata(L, lua_upvalueindex(1)));
-    const int v = static_cast<int>(lua_tointeger(L, lua_upvalueindex(2)));
-    if (!client)
-        return 0;
-    return client->call(L, static_cast<verb>(v));
-}
-
 }   // namespace
 
-lua_db_client::lua_db_client(lua_context& ctx, runtime_instance& owner) : m_ctx(ctx), m_owner(owner) {}
-
-lua_db_client::~lua_db_client()
+lua_db_client::lua_db_client(lua_context& ctx, runtime_instance& owner)
+    : lua_request_client(ctx, owner, "socketley.db", "db")
 {
-    cancel();
 }
 
 void lua_db_client::install(sol::state& lua, sol::table& sk)
 {
-    lua_State* L = lua.lua_state();
-    sol::table t = lua.create_table();
-    t.push();
-    static constexpr std::pair<const char*, verb> fns[] = {
-        {"get", verb::get},     {"put", verb::put},    {"insert", verb::insert}, {"patch", verb::patch},
-        {"delete", verb::del},  {"query", verb::query}, {"tx", verb::tx},
+    static constexpr function fns[] = {
+        {"get", int(verb::get)},       {"put", int(verb::put)},     {"insert", int(verb::insert)},
+        {"patch", int(verb::patch)},   {"delete", int(verb::del)},  {"query", int(verb::query)},
+        {"tx", int(verb::tx)},
     };
-    for (const auto& [name, v] : fns)
-    {
-        lua_pushlightuserdata(L, this);
-        lua_pushinteger(L, static_cast<lua_Integer>(v));
-        lua_pushcclosure(L, &db_thunk, 2);
-        lua_setfield(L, -2, name);
-    }
-    lua_pop(L, 1);
-    sk["db"] = t;
+    install_table(lua, sk, "db", fns);
 }
 
-void lua_db_client::cancel()
+lua_db_client::mode lua_db_client::begin(lua_State* L, int tag)
 {
-    if (auto* mgr = m_owner.get_runtime_manager())
-        mgr->requests().drop_origin(this);
-    lua_State* L = m_ctx.state().lua_state();
-    for (auto& [cookie, p] : m_pending)
-        if (p.ref != LUA_NOREF)
-            luaL_unref(L, LUA_REGISTRYINDEX, p.ref);
-    m_pending.clear();
-}
-
-int lua_db_client::call(lua_State* L, verb v)
-{
-    const mode m = begin(L, v);
-    if (m == mode::refused)
-    {
-        lua_pushnil(L);
-        lua_pushlstring(L, m_error.data(), m_error.size());
-        return 2;
-    }
-    if (m == mode::callback)
-    {
-        lua_pushboolean(L, 1);
-        return 1;
-    }
-    // Nothing is left on this frame that a longjmp would skip.
-    return lua_yield(L, 0);
-}
-
-lua_db_client::mode lua_db_client::begin(lua_State* L, verb v)
-{
-    const auto refuse = [&](std::string msg) {
-        m_error = std::move(msg);
-        return mode::refused;
-    };
-    if (m_ctx.registrations_severed())
-        return refuse("this runtime has been stopped, so it makes no more calls");
-
+    const verb v = static_cast<verb>(tag);
     const int nargs = lua_gettop(L);
     const bool has_cb = nargs >= 1 && lua_type(L, nargs) == LUA_TFUNCTION;
     const int logical = has_cb ? nargs - 1 : nargs;
@@ -231,44 +170,10 @@ lua_db_client::mode lua_db_client::begin(lua_State* L, verb v)
     }
     payload += '}';
 
-    auto* mgr = m_owner.get_runtime_manager();
-    if (!mgr)
-        return refuse("this runtime has no runtime manager");
-    if (m_pending.size() >= max_pending)
-        return refuse("too many db calls are already waiting on this runtime");
-    pending p;
-    if (has_cb)
-    {
-        lua_pushvalue(L, nargs);
-        p.ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    }
-    else
-    {
-        p.await = m_ctx.suspender().enrol_await(L);
-        if (p.await == 0)
-            return refuse(std::string("socketley.db waits for an answer, so without a callback it may only be called "
-                                      "from one that can wait (on_message, on_client_message, or a storage runtime's "
-                                      "on_request, on_put and on_delete); pass a function as the last argument "
-                                      "anywhere else"));
-    }
-    const uint64_t cookie = m_next++;
-    if (!mgr->requests().post(this, cookie, target, payload, request_class::client))
-    {
-        if (p.ref != LUA_NOREF)
-            luaL_unref(L, LUA_REGISTRYINDEX, p.ref);
-        return refuse("the request channel is full");
-    }
-    if (!has_cb)
-    {
-        uint64_t held = 0;
-        m_owner.hold_answering_connection(held);
-        m_ctx.suspender().note_await(p.await, 0, held);
-    }
-    m_pending.emplace(cookie, p);
-    return has_cb ? mode::callback : mode::wait;
+    return send(L, tag, target, std::move(payload));
 }
 
-int lua_db_client::push_values(lua_State* L, request_status st, std::string_view reply)
+int lua_db_client::push_values(lua_State* L, int, request_status st, std::string_view reply)
 {
     if (st != request_status::ok)
     {
@@ -308,32 +213,6 @@ int lua_db_client::push_values(lua_State* L, request_status st, std::string_view
     }
     lua_pushstring(L, ("status " + std::to_string(status)).c_str());
     return 2;
-}
-
-void lua_db_client::on_request_reply(uint64_t cookie, request_status st, std::string_view reply)
-{
-    const auto it = m_pending.find(cookie);
-    if (it == m_pending.end())
-        return;
-    const pending p = it->second;
-    m_pending.erase(it);
-    if (p.await != 0)
-    {
-        m_ctx.suspender().settle_with(p.await, [&](lua_State* th) { return push_values(th, st, reply); });
-        return;
-    }
-    lua_State* L = m_ctx.state().lua_state();
-    lua_deadline::scope guard("socketley.db callback", m_ctx.callback_timeout_ms(), m_ctx.owner_name().c_str());
-    lua_rawgeti(L, LUA_REGISTRYINDEX, p.ref);
-    luaL_unref(L, LUA_REGISTRYINDEX, p.ref);
-    const int n = push_values(L, st, reply);
-    if (lua_pcall(L, n, 0, 0) != 0)
-    {
-        const char* msg = lua_tostring(L, -1);
-        std::cerr << lua_diag::tag(m_ctx.owner_name()) << " a socketley.db callback raised: "
-                  << (msg ? msg : "(no message)") << std::endl;
-        lua_pop(L, 1);
-    }
 }
 
 #endif // SOCKETLEY_NO_LUA

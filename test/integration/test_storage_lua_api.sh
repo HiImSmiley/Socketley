@@ -119,6 +119,9 @@ function on_client_message(client_id, msg)
             say(client_id, "cb", show(data), show(type(meta) == "table" and meta.size or meta), show(message))
         end)
         say(client_id, "started", show(started), show(why))
+    elseif cmd == "cbraise" then
+        local started = socketley.storage.get("la_stg", "bkt", w[2], function() error("raised on purpose") end)
+        say(client_id, "started", show(started))
     elseif cmd == "elsewhere" then
         local a, b = socketley.storage.get("no_such_runtime", "bkt", "k")
         say(client_id, "elsewhere", show(a), show(b))
@@ -324,6 +327,10 @@ PYEOF
 contains "a callback call answers true at once" "$out" "started true nil"
 contains "and is called with the object and its metadata" "$out" "cb "
 contains "the callback gets the data, then the metadata table" "$out" "cb callback text 13 nil"
+out=$(ask "cbraise cbtext")
+found=no
+for _ in $(seq 1 50); do grep -qa "\[lua la_srv\] a socketley.storage callback raised: .*raised on purpose" "$SOCKETLEY_DLOG" 2>/dev/null && { found=yes; break; }; sleep 0.1; done
+contains "a callback that raises is reported under its runtime's name" "$out $found" "started true yes"
 
 "$BIN" create cache la_cache -p $((P+2)) --lua "$T/cache.lua" -s >/dev/null 2>&1 || bad "create" "la_cache"
 for _ in $(seq 1 100); do nc -z 127.0.0.1 $((P+2)) 2>/dev/null && break; sleep 0.1; done

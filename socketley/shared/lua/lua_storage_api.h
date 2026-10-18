@@ -19,64 +19,23 @@
 
 #include <sol/sol.hpp>
 
-#include "../ipc/request_channel.h"
+#include "lua_request_client.h"
 #include "../storage/storage_rpc.h"
-
-class lua_context;
-class runtime_instance;
 
 namespace storage_rpc = socketley::storage_rpc;
 
-class lua_storage_client : public request_origin
+class lua_storage_client : public lua_request_client
 {
 public:
-    // How many calls of one runtime may be waiting for an answer.
-    static constexpr size_t max_pending = 1024;
-
     lua_storage_client(lua_context& ctx, runtime_instance& owner);
-    ~lua_storage_client() override;
-
-    lua_storage_client(const lua_storage_client&)            = delete;
-    lua_storage_client& operator=(const lua_storage_client&) = delete;
 
     // Adds `storage` to the `socketley` table being built.
     void install(sol::state& lua, sol::table& sk);
 
-    // Lets go of everything waiting: the runtime this belongs to is stopping
-    // and must execute no more script.  A later call works again.
-    void cancel();
-
-    // The body of the five functions; what it answers is the number of Lua
-    // results, or the yield.
-    int call(lua_State* L, storage_rpc::op kind);
-
-    void on_request_reply(uint64_t cookie, request_status st, std::string_view reply) override;
-
 private:
-    enum class mode { refused, callback, wait };
-
-    struct pending
-    {
-        storage_rpc::op         kind{storage_rpc::op::get};
-        uint32_t                await{0};
-        // The callback, as a registry reference on the state and not on the
-        // coroutine the call was made from, which is pooled and reused once the
-        // caller has finished.
-        int                     ref{LUA_NOREF};
-    };
-
-    mode begin(lua_State* L, storage_rpc::op kind);
-    void drop_refs();
-    int  push_values(lua_State* L, storage_rpc::op kind, request_status st,
-                     const storage_rpc::reply* r);
-
-    lua_context&      m_ctx;
-    runtime_instance& m_owner;
-    std::unordered_map<uint64_t, pending> m_pending;
-    uint64_t          m_next{1};
-    // What begin() says when it refuses, a member so that the frame that yields
-    // holds nothing with a destructor.
-    std::string       m_error;
+    mode        begin(lua_State* L, int tag) override;
+    int         push_values(lua_State* L, int tag, request_status st, std::string_view reply) override;
+    std::string waits_name(int tag) const override;
 };
 
 #endif // SOCKETLEY_NO_LUA

@@ -2,12 +2,7 @@
 
 #include "lua_storage_api.h"
 
-#include <iostream>
-
 #include "lua_context.h"
-#include "lua_suspend.h"
-#include "../runtime/runtime_instance.h"
-#include "../runtime/runtime_manager.h"
 
 using storage_rpc::op;
 
@@ -220,97 +215,30 @@ void push_info(lua_State* L, const storage_rpc::object_info& i, bool with_key, b
     }
 }
 
-// The C function every one of the five is.  It is a lua_CFunction and not a sol
-// binding because sol has no form for a function that yields, and it returns
-// through call() so that the frame that yields owns nothing.
-int storage_thunk(lua_State* L)
-{
-    auto* client = static_cast<lua_storage_client*>(lua_touserdata(L, lua_upvalueindex(1)));
-    const int kind = static_cast<int>(lua_tointeger(L, lua_upvalueindex(2)));
-    if (!client)
-        return 0;
-    return client->call(L, static_cast<op>(kind));
-}
-
 } // namespace
 
 lua_storage_client::lua_storage_client(lua_context& ctx, runtime_instance& owner)
-    : m_ctx(ctx), m_owner(owner)
+    : lua_request_client(ctx, owner, "socketley.storage", "storage")
 {
-}
-
-lua_storage_client::~lua_storage_client()
-{
-    cancel();
 }
 
 void lua_storage_client::install(sol::state& lua, sol::table& sk)
 {
-    lua_State* L = lua.lua_state();
-    sol::table st = lua.create_table();
-    st.push();
-    static constexpr std::pair<const char*, op> fns[] = {
-        {"put", op::put}, {"get", op::get}, {"head", op::head}, {"delete", op::del}, {"list", op::list},
+    static constexpr function fns[] = {
+        {"put", int(op::put)}, {"get", int(op::get)}, {"head", int(op::head)}, {"delete", int(op::del)},
+        {"list", int(op::list)},
     };
-    for (const auto& [name, kind] : fns)
-    {
-        lua_pushlightuserdata(L, this);
-        lua_pushinteger(L, static_cast<lua_Integer>(kind));
-        lua_pushcclosure(L, &storage_thunk, 2);
-        lua_setfield(L, -2, name);
-    }
-    lua_pop(L, 1);
-    sk["storage"] = st;
+    install_table(lua, sk, "storage", fns);
 }
 
-void lua_storage_client::cancel()
+std::string lua_storage_client::waits_name(int tag) const
 {
-    if (auto* mgr = m_owner.get_runtime_manager())
-        mgr->requests().drop_origin(this);
-    drop_refs();
-    m_pending.clear();
+    return storage_rpc::op_name(static_cast<op>(tag));
 }
 
-void lua_storage_client::drop_refs()
+lua_storage_client::mode lua_storage_client::begin(lua_State* L, int tag)
 {
-    lua_State* L = m_ctx.state().lua_state();
-    for (auto& [cookie, p] : m_pending)
-        if (p.ref != LUA_NOREF)
-        {
-            luaL_unref(L, LUA_REGISTRYINDEX, p.ref);
-            p.ref = LUA_NOREF;
-        }
-}
-
-int lua_storage_client::call(lua_State* L, op kind)
-{
-    const mode m = begin(L, kind);
-    if (m == mode::refused)
-    {
-        lua_pushnil(L);
-        lua_pushlstring(L, m_error.data(), m_error.size());
-        return 2;
-    }
-    if (m == mode::callback)
-    {
-        lua_pushboolean(L, 1);
-        return 1;
-    }
-    // Nothing is left on this frame that a longjmp would skip.
-    return lua_yield(L, 0);
-}
-
-lua_storage_client::mode lua_storage_client::begin(lua_State* L, op kind)
-{
-    const auto refuse = [&](std::string msg)
-    {
-        m_error = std::move(msg);
-        return mode::refused;
-    };
-
-    if (m_ctx.registrations_severed())
-        return refuse("this runtime has been stopped, so it makes no more calls");
-
+    const op kind = static_cast<op>(tag);
     const int nargs = lua_gettop(L);
     const bool has_cb = nargs >= 1 && lua_type(L, nargs) == LUA_TFUNCTION;
     const int logical = has_cb ? nargs - 1 : nargs;
@@ -380,56 +308,15 @@ lua_storage_client::mode lua_storage_client::begin(lua_State* L, op kind)
             return shape();   // the identity provider's, which no script is given
     }
 
-    auto* mgr = m_owner.get_runtime_manager();
-    if (!mgr)
-        return refuse("this runtime has no runtime manager");
-    if (m_pending.size() >= max_pending)
-        return refuse("too many storage calls are already waiting on this runtime");
-
-    pending p;
-    p.kind = kind;
-    if (has_cb)
-    {
-        lua_pushvalue(L, nargs);
-        p.ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    }
-    else
-    {
-        // The handle is made here, when a call has to wait, because most
-        // callbacks never do; 0 is a callback that could not stop.
-        auto& sus = m_ctx.suspender();
-        p.await = sus.enrol_await(L);
-        if (p.await == 0)
-            return refuse(std::string(storage_rpc::op_name(kind)) + " waits for an answer, so without a "
-                          "callback it may only be called from one that can wait (on_message, "
-                          "on_client_message, or a storage runtime's on_request, on_put and on_delete); "
-                          "pass a function as the last argument anywhere else");
-    }
-
-    const uint64_t cookie = m_next++;
-    if (!mgr->requests().post(this, cookie, target, storage_rpc::encode(rq), request_class::client))
-    {
-        if (p.ref != LUA_NOREF)
-            luaL_unref(L, LUA_REGISTRYINDEX, p.ref);
-        return refuse("the request channel is full");
-    }
-
-    if (!has_cb)
-    {
-        // The connection whose handler is waiting is kept open for the answer, as
-        // it is for a linked cache's, so a client that has sent its line and shut
-        // its writing side still gets the reply.
-        uint64_t held = 0;
-        m_owner.hold_answering_connection(held);
-        m_ctx.suspender().note_await(p.await, 0, held);
-    }
-    m_pending.emplace(cookie, std::move(p));
-    return has_cb ? mode::callback : mode::wait;
+    return send(L, tag, target, storage_rpc::encode(rq));
 }
 
-int lua_storage_client::push_values(lua_State* L, op kind, request_status st,
-                                    const storage_rpc::reply* r)
+int lua_storage_client::push_values(lua_State* L, int tag, request_status st, std::string_view reply)
 {
+    const op kind = static_cast<op>(tag);
+    storage_rpc::reply decoded;
+    const storage_rpc::reply* r = st == request_status::ok && storage_rpc::decode(reply, kind, decoded) ? &decoded
+                                                                                                          : nullptr;
     if (st != request_status::ok || !r)
     {
         lua_pushnil(L);
@@ -487,43 +374,6 @@ int lua_storage_client::push_values(lua_State* L, op kind, request_status st,
         }
     }
     return 0;
-}
-
-void lua_storage_client::on_request_reply(uint64_t cookie, request_status st, std::string_view reply)
-{
-    const auto it = m_pending.find(cookie);
-    if (it == m_pending.end())
-        return;
-    pending p = std::move(it->second);
-    m_pending.erase(it);
-
-    storage_rpc::reply r;
-    bool decoded = false;
-    if (st == request_status::ok)
-        decoded = storage_rpc::decode(reply, p.kind, r);
-
-    if (p.await != 0)
-    {
-        m_ctx.suspender().settle_with(p.await, [&](lua_State* th)
-        {
-            return push_values(th, p.kind, st, decoded ? &r : nullptr);
-        });
-        return;
-    }
-
-    lua_State* L = m_ctx.state().lua_state();
-    lua_deadline::scope guard("socketley.storage callback", m_ctx.callback_timeout_ms(),
-                              m_ctx.owner_name().c_str());
-    lua_rawgeti(L, LUA_REGISTRYINDEX, p.ref);
-    luaL_unref(L, LUA_REGISTRYINDEX, p.ref);
-    const int n = push_values(L, p.kind, st, decoded ? &r : nullptr);
-    if (lua_pcall(L, n, 0, 0) != 0)
-    {
-        const char* msg = lua_tostring(L, -1);
-        std::cerr << lua_diag::tag(m_ctx.owner_name()) << " a socketley.storage callback raised: "
-                  << (msg ? msg : "(no message)") << std::endl;
-        lua_pop(L, 1);
-    }
 }
 
 #endif // SOCKETLEY_NO_LUA
