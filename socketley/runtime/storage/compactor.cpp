@@ -278,12 +278,6 @@ void compactor::read(const std::shared_ptr<job>& j)
             }
             j->out->clear();
             auto work = [j, n] { lz4_squeeze(j->plain->data(), static_cast<size_t>(n), *j->out, *j->table); };
-            if (!m_hashes.enabled())
-            {
-                work();
-                squeezed(j, n);
-                return;
-            }
             m_hashes.submit(m_lane, std::move(work), [this, alive, j, n]
             {
                 if (*alive)

@@ -3387,3 +3387,17 @@ TEST_CASE("the store refuses to remove a locked version, lets the bypass lift GO
     CHECK(purge(again, "g", g, true) == st::ok);
     CHECK(again.store->find_version("bkt", "g", g) == nullptr);
 }
+
+TEST_CASE("a pool with no threads runs the work and its completion at submit, and a stopped pool runs neither")
+{
+    hash_pool none(0);
+    int order = 0, work_at = 0, done_at = 0;
+    none.submit(0, [&] { work_at = ++order; }, [&] { done_at = ++order; });
+    CHECK(work_at == 1);
+    CHECK(done_at == 2);
+
+    none.stop();
+    bool ran = false;
+    none.submit(0, [&] { ran = true; }, [&] { ran = true; });
+    CHECK_FALSE(ran);
+}

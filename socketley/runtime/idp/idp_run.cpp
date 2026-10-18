@@ -845,12 +845,6 @@ void idp_run::hash_password(std::string_view password, std::function<void(std::s
 {
     auto result = std::make_shared<std::string>();
     auto work = [pw = std::string(password), result] { *result = socketley::storage::password_hash(pw); };
-    if (!m_hash.enabled())
-    {
-        work();
-        then(std::move(*result));
-        return;
-    }
     m_hash.submit(m_hash.next_lane(), std::move(work), [alive = m_alive, result, then = std::move(then)] {
         if (*alive)
             then(std::move(*result));

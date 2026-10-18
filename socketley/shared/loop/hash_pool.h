@@ -36,8 +36,8 @@ public:
     using work       = std::function<void()>;
     using completion = std::function<void()>;
 
-    // Zero threads means nothing is ever queued: enabled() is false and the
-    // caller hashes in line.
+    // Zero threads means nothing is ever queued: enabled() is false and
+    // submit() runs the work and its completion in line, until stop().
     explicit hash_pool(unsigned threads) : m_lanes(threads)
     {
         if (threads)
@@ -102,8 +102,14 @@ public:
     // queues `done` for drain().  Called from the loop's thread only.
     void submit(uint32_t lane_no, work w, completion done)
     {
-        if (!enabled())
+        if (m_stopped)
             return;
+        if (m_lanes.empty())
+        {
+            w();
+            done();
+            return;
+        }
         if (!m_started)
             start();
         // A re-arm that found the ring full is tried again here.
