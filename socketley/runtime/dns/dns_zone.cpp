@@ -887,8 +887,7 @@ bool load_zone(const std::string& path, std::string_view origin_hint, zone& out,
         return false;
     }
     out.path = path;
-    out.mtime_ns = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
-    out.size = static_cast<uint64_t>(st.st_size);
+    out.stamp = socketley::file_stamp::of(st);
     return true;
 }
 

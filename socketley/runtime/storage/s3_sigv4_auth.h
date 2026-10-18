@@ -8,10 +8,12 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "../../shared/persist/file_stamp.h"
 #include "s3_auth.h"
 #include "s3_users.h"
 #include "../../shared/storage/s3_sigv4.h"
@@ -155,20 +157,15 @@ private:
     std::vector<s3::header_field> m_fields;
 
     std::chrono::steady_clock::time_point m_last_check{};
-    // What the file looked like when it was last read.
-    int64_t m_stamp_mtime_ns{0};
-    uint64_t m_stamp_size{0};
-    uint64_t m_stamp_ino{0};
-    bool m_have_stamp{false};
+    // What the file looked like when it was last read, none before the first read.
+    std::optional<socketley::file_stamp> m_stamp;
     // The policy files the users name, by what each looked like when it was read.
-    struct file_stamp
+    struct watched_file
     {
-        std::string path;
-        int64_t     mtime_ns{0};
-        uint64_t    size{0};
-        uint64_t    ino{0};
+        std::string          path;
+        socketley::file_stamp stamp;
     };
-    std::vector<file_stamp> m_policy_stamps;
+    std::vector<watched_file> m_policy_stamps;
 
     // The last session a request was signed for, which a client signs for again and again.
     struct session_entry
@@ -182,7 +179,7 @@ private:
     session_entry m_session;
 
     // The IAM file as last read, and its roles: each one's trust policy, longest session and identity.
-    file_stamp m_iam_stamp;
+    watched_file m_iam_stamp;
     struct role_entry
     {
         std::string trust;

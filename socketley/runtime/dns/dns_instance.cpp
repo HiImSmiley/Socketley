@@ -1194,11 +1194,9 @@ void dns_run::check_zones()
     }
     for (const auto& z : m_zones->zones)
     {
-        struct stat st{};
-        if (::stat(z->path.c_str(), &st) < 0)
-            continue;
-        const int64_t mt = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
-        if (mt != z->mtime_ns || static_cast<uint64_t>(st.st_size) != z->size)
+        // A file gone for a moment is no change; it is read again once it is back.
+        const socketley::file_stamp now = socketley::file_stamp::of(z->path);
+        if (now.exists() && now != z->stamp)
             changed = true;
     }
     if (!changed)
@@ -1235,12 +1233,8 @@ void dns_run::check_zones()
                 if (!old)
                     continue;
                 z = std::make_shared<zone>(*old);
-                struct stat st{};
-                if (::stat(p.c_str(), &st) == 0)
-                {
-                    z->mtime_ns = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
-                    z->size = static_cast<uint64_t>(st.st_size);
-                }
+                if (const socketley::file_stamp now = socketley::file_stamp::of(p); now.exists())
+                    z->stamp = now;
                 kept.push_back(z.get());
             }
             next->zones.push_back(std::move(z));

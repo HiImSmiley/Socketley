@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/persist/file_stamp.h"
 #include "../../shared/loop/fd_table.h"
 #include "../../shared/net/async_resolver.h"
 #include <string>
@@ -1134,7 +1135,7 @@ private:
     // specific wildcard answers.
     std::vector<std::pair<std::string, entrance_route>> m_entrance_wild;
     std::unordered_map<std::string, uint32_t> m_entrance_addr;
-    int64_t m_entrance_stamp{-1};
+    std::optional<socketley::file_stamp> m_entrance_stamp;
     std::chrono::steady_clock::time_point m_entrance_checked{};
     // What this entrance writes into Via and looks for there, so a request
     // that comes round to it again is refused instead of circling.

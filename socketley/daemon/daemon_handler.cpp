@@ -901,22 +901,20 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
 // The origins of a dns runtime's zones, read from its files once and again only when one changes.
 static std::vector<std::string> zone_origins(const runtime_instance& rt)
 {
-    struct cached { int64_t mtime{0}; int64_t size{-1}; std::string origin; };
+    struct cached { std::optional<socketley::file_stamp> stamp; std::string origin; };
     static std::unordered_map<std::string, cached> cache;
     std::vector<std::string> out;
     for (const auto& path : static_cast<const dns_instance&>(rt).zone_paths())
     {
-        struct stat st{};
-        if (::stat(path.c_str(), &st) < 0)
+        const socketley::file_stamp now = socketley::file_stamp::of(path);
+        if (!now.exists())
             continue;
-        const int64_t mt = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
         cached& c = cache[path];
-        if (c.mtime != mt || c.size != st.st_size)
+        if (c.stamp != now)
         {
             socketley::dns::zone z;
             std::string why;
-            c.mtime = mt;
-            c.size = st.st_size;
+            c.stamp = now;
             c.origin = socketley::dns::load_zone(path, {}, z, why) ? socketley::dns::to_text(z.origin) : std::string{};
         }
         if (!c.origin.empty())

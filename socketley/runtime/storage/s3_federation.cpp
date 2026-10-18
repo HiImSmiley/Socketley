@@ -1015,8 +1015,7 @@ const jwks_keys* jwks_file::current(std::string& why)
         why = "cannot read the JWKS file " + m_path + ": " + std::strerror(errno);
         return nullptr;
     }
-    const stamp now{static_cast<int64_t>(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec,
-                    static_cast<uint64_t>(st.st_size), static_cast<uint64_t>(st.st_ino)};
+    const socketley::file_stamp now = socketley::file_stamp::of(st);
     if ((m_loaded && now == m_good) || (m_have_bad && now == m_bad))
     {
         if (m_loaded)

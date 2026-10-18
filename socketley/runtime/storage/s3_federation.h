@@ -12,6 +12,8 @@
 
 #include <openssl/types.h>
 
+#include "../../shared/persist/file_stamp.h"
+
 namespace socketley::storage
 {
 
@@ -127,13 +129,7 @@ public:
     const jwks_keys* current(std::string& why);
 
 private:
-    struct stamp
-    {
-        int64_t  mtime_ns{0};
-        uint64_t size{0};
-        uint64_t ino{0};
-        bool operator==(const stamp&) const = default;
-    };
+    using stamp = socketley::file_stamp;
     std::string m_path;
     jwks_keys   m_keys;
     bool        m_loaded{false};

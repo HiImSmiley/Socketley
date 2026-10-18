@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../../shared/persist/file_stamp.h"
 #include "../../shared/util/transparent_string.h"
 
 namespace socketley::dns
@@ -54,8 +55,7 @@ struct zone
     bool     has_cuts{false};
     // The file it came from and how it stood when read, so a change is noticed.
     std::string path;
-    int64_t     mtime_ns{0};
-    uint64_t    size{0};
+    socketley::file_stamp stamp;
 
     const node* find(std::string_view wire) const
     {

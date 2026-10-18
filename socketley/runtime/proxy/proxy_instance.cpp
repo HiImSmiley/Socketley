@@ -1813,7 +1813,7 @@ bool proxy_instance::setup(event_loop& loop)
         m_entrance_exact.clear();
         m_entrance_wild.clear();
         m_entrance_addr.clear();
-        m_entrance_stamp = -1;
+        m_entrance_stamp.reset();
         m_entrance_zones.clear();
         m_entrance_cert_names.clear();
         // The certificate the daemon named for it, stood in for by one of its
@@ -5651,23 +5651,19 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
 void proxy_instance::entrance_load(std::chrono::milliseconds min_gap)
 {
     const auto now = std::chrono::steady_clock::now();
-    if (m_entrance_stamp >= 0 && now - m_entrance_checked < min_gap)
+    if (m_entrance_stamp && now - m_entrance_checked < min_gap)
         return;
     m_entrance_checked = now;
 
     const std::string path = dns_feed::routes_path(get_name());
-    struct stat st{};
     // No file is an empty table, the same as one with no routes.
-    const int64_t stamp = ::stat(path.c_str(), &st) < 0
-                              ? 0
-                              : static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec +
-                                    static_cast<int64_t>(st.st_size);
-    if (stamp == m_entrance_stamp)
+    const socketley::file_stamp stamp = socketley::file_stamp::of(path);
+    if (m_entrance_stamp && *m_entrance_stamp == stamp)
         return;
     m_entrance_stamp = stamp;
 
     std::string text;
-    if (stamp)
+    if (stamp.exists())
         if (FILE* f = std::fopen(path.c_str(), "re"))
         {
             char buf[8192];

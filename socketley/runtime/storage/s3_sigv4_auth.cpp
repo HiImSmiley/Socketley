@@ -259,22 +259,6 @@ std::string dir_of(const std::string& path)
     return slash == std::string::npos ? std::string(".") : slash == 0 ? std::string("/") : path.substr(0, slash);
 }
 
-// What a file looks like now, all zero for one that is not there.
-bool stamp_of(const std::string& path, int64_t& mtime_ns, uint64_t& size, uint64_t& ino)
-{
-    struct stat st{};
-    if (::stat(path.c_str(), &st) != 0)
-    {
-        mtime_ns = 0;
-        size = ino = 0;
-        return false;
-    }
-    mtime_ns = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
-    size     = static_cast<uint64_t>(st.st_size);
-    ino      = static_cast<uint64_t>(st.st_ino);
-    return true;
-}
-
 const std::shared_ptr<const user_identity>& default_user()
 {
     static const std::shared_ptr<const user_identity> u = []
@@ -614,20 +598,15 @@ bool sigv4_authenticator::rebuild(std::string& err)
         m_policy_stamps.clear();
         for (std::string& f : files)
         {
-            file_stamp fs;
-            fs.path = std::move(f);
-            stamp_of(fs.path, fs.mtime_ns, fs.size, fs.ino);
-            m_policy_stamps.push_back(std::move(fs));
+            const socketley::file_stamp now = socketley::file_stamp::of(f);
+            m_policy_stamps.push_back({std::move(f), now});
         }
         if (!parsed)
         {
             err = m_cfg.credentials_file + ": " + err;
             return false;
         }
-        m_stamp_mtime_ns = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
-        m_stamp_size     = static_cast<uint64_t>(st.st_size);
-        m_stamp_ino      = static_cast<uint64_t>(st.st_ino);
-        m_have_stamp     = true;
+        m_stamp = socketley::file_stamp::of(st);
     }
     // A refused rebuild leaves the authenticator as it was, the IAM parts add_iam() fills included.
     auto file_users = std::move(m_file_users);
@@ -658,8 +637,7 @@ void sigv4_authenticator::add_iam(credential_set& set)
     if (m_cfg.iam_file.empty())
         return;
     std::string text, err;
-    m_iam_stamp = file_stamp{m_cfg.iam_file};
-    stamp_of(m_iam_stamp.path, m_iam_stamp.mtime_ns, m_iam_stamp.size, m_iam_stamp.ino);
+    m_iam_stamp = {m_cfg.iam_file, socketley::file_stamp::of(m_cfg.iam_file)};
     // No file is no IAM users yet.
     if (::access(m_cfg.iam_file.c_str(), F_OK) != 0)
         return;
@@ -759,9 +737,7 @@ bool sigv4_authenticator::iam_changed()
 {
     if (m_cfg.iam_file.empty())
         return false;
-    file_stamp now;
-    stamp_of(m_cfg.iam_file, now.mtime_ns, now.size, now.ino);
-    return now.mtime_ns != m_iam_stamp.mtime_ns || now.size != m_iam_stamp.size || now.ino != m_iam_stamp.ino;
+    return socketley::file_stamp::of(m_cfg.iam_file) != m_iam_stamp.stamp;
 }
 
 void sigv4_authenticator::refresh()
@@ -916,18 +892,12 @@ void sigv4_authenticator::maybe_reload()
         return;
     }
 
-    int64_t  mtime = 0;
-    uint64_t size = 0, ino = 0;
-    if (!stamp_of(m_cfg.credentials_file, mtime, size, ino))
+    const socketley::file_stamp stamp = socketley::file_stamp::of(m_cfg.credentials_file);
+    if (!stamp.exists())
         return;
-    bool same = m_have_stamp && mtime == m_stamp_mtime_ns && size == m_stamp_size && ino == m_stamp_ino;
+    bool same = m_stamp && *m_stamp == stamp;
     for (size_t i = 0; same && i < m_policy_stamps.size(); ++i)
-    {
-        file_stamp now_fs;
-        stamp_of(m_policy_stamps[i].path, now_fs.mtime_ns, now_fs.size, now_fs.ino);
-        same = now_fs.mtime_ns == m_policy_stamps[i].mtime_ns && now_fs.size == m_policy_stamps[i].size &&
-               now_fs.ino == m_policy_stamps[i].ino;
-    }
+        same = socketley::file_stamp::of(m_policy_stamps[i].path) == m_policy_stamps[i].stamp;
     if (same && !iam_changed())
         return;
 
@@ -941,10 +911,7 @@ void sigv4_authenticator::maybe_reload()
         return;
     }
     // Remembered, so files that stay broken are reported once and not every second.
-    m_stamp_mtime_ns = mtime;
-    m_stamp_size     = size;
-    m_stamp_ino      = ino;
-    m_have_stamp     = true;
+    m_stamp = stamp;
     LOG_WARN(("storage: credentials not reloaded, the old set stays: " + err).c_str());
 }
 
