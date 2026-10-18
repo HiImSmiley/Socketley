@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "../../shared/persist/file_stamp.h"
+#include "../../shared/net/failure_bar.h"
 
 namespace socketley::storage { class credential_set; }
 namespace socketley::idp { class session_verifier; }
@@ -62,7 +63,6 @@ private:
     enum class kind { none, bearer, basic, idp };
     void reload(std::chrono::steady_clock::time_point now);
     bool admit(std::string_view authorization) const;
-    void missed(const std::string& key, std::chrono::steady_clock::time_point now);
 
     kind m_kind{kind::none};
     std::string m_file, m_runtime, m_challenge;
@@ -74,10 +74,5 @@ private:
     std::unique_ptr<socketley::storage::credential_set> m_keys;
     std::unique_ptr<socketley::idp::session_verifier> m_sessions;
 
-    struct misses
-    {
-        uint32_t count{0};
-        std::chrono::steady_clock::time_point first{};
-    };
-    std::unordered_map<std::string, misses> m_misses;
+    socketley::failure_bar m_misses{tries, window};
 };

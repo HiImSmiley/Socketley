@@ -2,6 +2,7 @@
 #include "doctest.h"
 
 #include "shared/http/cookie.h"
+#include "shared/net/failure_bar.h"
 #include "shared/util/ascii.h"
 #include "shared/util/number_parse.h"
 #include "shared/util/proc_stat.h"
@@ -86,4 +87,28 @@ TEST_CASE("a number in the environment is read whole or not at all")
     CHECK_FALSE(read("99999999999"));
     ::unsetenv("SOCKETLEY_TEST_NUMBER");
     CHECK_FALSE(socketley::getenv_whole<uint32_t>("SOCKETLEY_TEST_NUMBER"));
+}
+
+TEST_CASE("an address that keeps failing is barred until its window ends, and the remembered ones are bounded")
+{
+    using namespace std::chrono_literals;
+    socketley::failure_bar bar(3, 15min, 64);
+    const auto t0 = socketley::failure_bar::clock::now();
+    for (int i = 0; i < 2; ++i)
+        bar.missed("a", t0);
+    CHECK(bar.barred_for("a", t0) == 0);
+    bar.missed("a", t0 + 1s);
+    CHECK(bar.barred_for("a", t0 + 1s) == 15 * 60 - 1);
+    CHECK(bar.barred_for("a", t0 + 15min - 500ms) == 1);
+    CHECK(bar.barred_for("b", t0 + 1s) == 0);
+    // The window is counted from the first failure, so it ends whole and counting starts again.
+    CHECK(bar.barred_for("a", t0 + 15min) == 0);
+    bar.missed("a", t0 + 15min);
+    CHECK(bar.barred_for("a", t0 + 15min) == 0);
+    // A flood of new addresses past the bound keeps the newest and forgets the oldest.
+    for (int i = 0; i < 1000; ++i)
+        for (int k = 0; k < 3; ++k)
+            bar.missed("flood" + std::to_string(i), t0 + std::chrono::seconds(i));
+    CHECK(bar.barred_for("flood999", t0 + 999s) > 0);
+    CHECK(bar.barred_for("flood0", t0 + 999s) == 0);
 }

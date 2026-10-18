@@ -41,6 +41,7 @@
 #include "s3_federation.h"
 #include "s3_auth.h"
 #include "s3_users.h"
+#include "../../shared/net/failure_bar.h"
 #include "../idp/idp_session.h"
 #include "../../shared/http/h3_endpoint.h"
 #include "../../shared/storage/storage_rpc.h"
@@ -1032,13 +1033,8 @@ public:
     // answering 401.
     bool app_login(const std::shared_ptr<conn>& c, std::string_view realm);
     // Failed sign-ins counted by the client's address, an IPv6 one by its /64, in this shard's memory: past
-    // login_tries within login_window a sign-in from there is refused until the window ends.
-    struct login_misses
-    {
-        uint32_t count{0};
-        std::chrono::steady_clock::time_point first{};
-    };
-    std::unordered_map<std::string, login_misses> m_misses;
+    // ten within a quarter hour a sign-in from there is refused until the quarter hour ends.
+    socketley::failure_bar m_misses{10, std::chrono::minutes(15)};
     std::string miss_key(conn& c);
     // Answers 429 and is true while the client's address may not sign in.
     bool login_barred(const std::shared_ptr<conn>& c);

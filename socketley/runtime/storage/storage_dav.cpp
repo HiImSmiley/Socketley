@@ -37,10 +37,6 @@ constexpr uint64_t app_body_limit = 256 * 1024;
 // A folder's copy reads each of its objects whole, so one past this is refused rather than held.
 constexpr uint64_t tree_object_max = 256ull << 20;
 constexpr size_t   listing_max     = 100000;
-// Ten failed sign-ins a quarter hour from an address, and a bound on the addresses remembered.
-constexpr uint32_t login_tries  = 10;
-constexpr auto     login_window = std::chrono::minutes(15);
-constexpr size_t   misses_max   = 16384;
 
 std::string dav_href(std::string_view bucket, std::string_view key)
 {
@@ -184,21 +180,12 @@ std::string storage_run::miss_key(conn& c)
 
 bool storage_run::login_barred(const std::shared_ptr<conn>& c)
 {
-    const auto it = m_misses.find(miss_key(*c));
-    if (it == m_misses.end())
+    const int64_t left = m_misses.barred_for(miss_key(*c), std::chrono::steady_clock::now());
+    if (!left)
         return false;
-    const auto now = std::chrono::steady_clock::now();
-    if (now - it->second.first >= login_window)
-    {
-        m_misses.erase(it);
-        return false;
-    }
-    if (it->second.count < login_tries)
-        return false;
-    const auto left = std::chrono::ceil<std::chrono::seconds>(it->second.first + login_window - now).count();
     response r;
     r.status = 429;
-    r.headers.emplace_back("Retry-After", std::to_string(std::max<int64_t>(left, 1)));
+    r.headers.emplace_back("Retry-After", std::to_string(left));
     r.headers.emplace_back("Content-Type", "text/plain; charset=utf-8");
     r.body = "Too many failed sign-ins from this address; try again later.\n";
     count_error(*c, "SlowDown");
@@ -208,22 +195,7 @@ bool storage_run::login_barred(const std::shared_ptr<conn>& c)
 
 void storage_run::login_missed(conn& c)
 {
-    const auto now = std::chrono::steady_clock::now();
-    std::string key = miss_key(c);
-    if (m_misses.size() >= misses_max && !m_misses.contains(key))
-    {
-        std::erase_if(m_misses, [&](const auto& m) { return now - m.second.first >= login_window; });
-        if (m_misses.size() >= misses_max)
-            m_misses.erase(std::min_element(m_misses.begin(), m_misses.end(), [](const auto& a, const auto& b)
-                                            { return a.second.first < b.second.first; }));
-    }
-    login_misses& m = m_misses[std::move(key)];
-    if (m.count == 0 || now - m.first >= login_window)
-    {
-        m.count = 0;
-        m.first = now;
-    }
-    ++m.count;
+    m_misses.missed(miss_key(c), std::chrono::steady_clock::now());
 }
 
 bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view realm)

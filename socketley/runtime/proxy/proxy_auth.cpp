@@ -22,7 +22,6 @@
 namespace
 {
 
-constexpr size_t misses_max = 16384;
 
 std::string_view trim(std::string_view s)
 {
@@ -212,36 +211,6 @@ std::string proxy_auth::login_url(std::string_view return_to)
     return m_sessions ? m_sessions->login_url(return_to) : std::string();
 }
 
-void proxy_auth::missed(const std::string& key, std::chrono::steady_clock::time_point now)
-{
-    if (m_misses.size() >= misses_max && !m_misses.contains(key))
-    {
-        // An eighth goes at once, the expired and then the oldest, so a flood of new keys pays a scan per thousands
-        // of them and not one each.
-        std::erase_if(m_misses, [&](const auto& m) { return now - m.second.first >= window; });
-        if (m_misses.size() >= misses_max)
-        {
-            std::vector<std::chrono::steady_clock::time_point> firsts;
-            firsts.reserve(m_misses.size());
-            for (const auto& [k, m] : m_misses)
-                firsts.push_back(m.first);
-            const size_t cut = firsts.size() / 8;
-            std::nth_element(firsts.begin(), firsts.begin() + cut, firsts.end());
-            const auto before = firsts[cut];
-            std::erase_if(m_misses, [&](const auto& m) { return m.second.first < before; });
-            if (m_misses.size() >= misses_max)
-                m_misses.erase(m_misses.begin());
-        }
-    }
-    misses& m = m_misses[key];
-    if (m.count == 0 || now - m.first >= window)
-    {
-        m.count = 0;
-        m.first = now;
-    }
-    ++m.count;
-}
-
 proxy_auth::verdict proxy_auth::check(std::string_view authorization, std::string_view client, int64_t& retry_after)
 {
     if (m_kind == kind::none)
@@ -249,23 +218,17 @@ proxy_auth::verdict proxy_auth::check(std::string_view authorization, std::strin
     const auto now = std::chrono::steady_clock::now();
     reload(now);
     const std::string key = miss_key(client);
-    if (const auto it = m_misses.find(key); it != m_misses.end())
+    if (const int64_t left = m_misses.barred_for(key, now))
     {
-        if (now - it->second.first >= window)
-            m_misses.erase(it);
-        else if (it->second.count >= tries)
-        {
-            retry_after = std::max<int64_t>(
-                1, std::chrono::ceil<std::chrono::seconds>(it->second.first + window - now).count());
-            return verdict::barred;
-        }
+        retry_after = left;
+        return verdict::barred;
     }
     if (admit(authorization))
         return verdict::pass;
     // A request that offered nothing is a browser asking what to offer, not a guess.
     if (authorization.empty())
         return verdict::refuse;
-    missed(key, now);
+    m_misses.missed(key, now);
     LOG_WARN(("proxy " + m_runtime + ": authorization refused from " + std::string(client)).c_str());
     return verdict::refuse;
 }
