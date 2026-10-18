@@ -30,6 +30,7 @@
 #include "../runtime/dns/dns_zone.h"
 #include "../runtime/dns/dns_wire.h"
 #include "../shared/util/proc_stat.h"
+#include "../shared/ipc/one_command.h"
 #include <sys/stat.h>
 
 static void publish_dns_names(runtime_manager& manager);
@@ -7291,8 +7292,7 @@ int daemon_handler::run_cache_action(ipc_connection* conn, std::string_view name
         // Marked as exactly one command: the CLI's own framing carries a
         // value with newlines in it, and the cache's line-split path would
         // read everything past the first one as further commands.
-        std::string framed("\x01skl-one\n");
-        framed.append(command);
+        const std::string framed = socketley::one_command(command);
 
         auto* sup = it->second[0].get();
         if (!sup->send_direct(ticket, framed)

@@ -13,6 +13,20 @@ enum class duration_parse : uint8_t
     out_of_range,
 };
 
+// Seconds in one of the units every duration here is written with, and 0 for any other letter.
+inline constexpr uint64_t duration_unit_seconds(char c)
+{
+    switch (c)
+    {
+        case 's': return 1;
+        case 'm': return 60;
+        case 'h': return 3600;
+        case 'd': return 86400;
+        case 'w': return 604800;
+        default:  return 0;
+    }
+}
+
 // Whole seconds out rather than a chrono type, because every caller stores an
 // integer count of seconds and would unwrap the type on the next line.
 inline duration_parse parse_duration_seconds(std::string_view sv,
@@ -20,19 +34,12 @@ inline duration_parse parse_duration_seconds(std::string_view sv,
                                              uint64_t& out)
 {
     uint64_t per_unit = 1;
-    if (!sv.empty())
+    // Lowercase only: `5M` reads as months everywhere else, and a guess that is wrong by a factor of 43200 is worse
+    // than a refusal.
+    if (const uint64_t u = sv.empty() ? 0 : duration_unit_seconds(sv.back()))
     {
-        // Lowercase only: `5M` reads as months everywhere else, and a guess
-        // that is wrong by a factor of 43200 is worse than a refusal.
-        switch (sv.back())
-        {
-            case 's': per_unit = 1;      sv.remove_suffix(1); break;
-            case 'm': per_unit = 60;     sv.remove_suffix(1); break;
-            case 'h': per_unit = 3600;   sv.remove_suffix(1); break;
-            case 'd': per_unit = 86400;  sv.remove_suffix(1); break;
-            case 'w': per_unit = 604800; sv.remove_suffix(1); break;
-            default: break;
-        }
+        per_unit = u;
+        sv.remove_suffix(1);
     }
 
     // The whole string or nothing, like every parser in flag_handlers.h,

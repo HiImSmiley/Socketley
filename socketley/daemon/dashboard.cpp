@@ -37,6 +37,7 @@
 #include "../shared/util/hex.h"
 #include "../shared/http/http_framing.h"
 #include "../shared/http/cookie.h"
+#include "../shared/net/peer_address.h"
 
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -81,11 +82,6 @@ std::string_view trim(std::string_view s)
     return s;
 }
 
-bool local(std::string_view ip)
-{
-    return ip.empty() || ip.starts_with("127.") || ip == "::1" || ip.starts_with("::ffff:127.");
-}
-
 // The page with the storage interface's look, which it shares rather than copies.
 const std::string& page()
 {
@@ -116,12 +112,9 @@ std::string_view request::header(std::string_view name) const
 
 std::string request::client() const
 {
-    if (!local(peer))
+    if (!socketley::is_loopback(peer))
         return peer;
-    std::string_view xff = header("x-forwarded-for");
-    if (const size_t comma = xff.rfind(','); comma != std::string_view::npos)
-        xff.remove_prefix(comma + 1);
-    xff = trim(xff);
+    const std::string_view xff = http_last_forwarded_hop(header("x-forwarded-for"));
     return xff.empty() ? (peer.empty() ? std::string("local") : peer) : std::string(xff);
 }
 
@@ -458,8 +451,8 @@ std::string last_line_of(const std::string& path)
 // What a certificate file says of itself, as JSON members after `{`; empty when it is no certificate.
 std::string cert_json(const std::string& path)
 {
-    cert_facts c;
-    if (!read_cert(path, c))
+    cert_keeper::cert_facts c;
+    if (!cert_keeper::read_cert(path, c))
         return {};
     std::string names;
     for (const std::string& n : c.names)
@@ -473,37 +466,6 @@ std::string cert_json(const std::string& path)
 }
 
 }   // namespace
-
-bool read_cert(const std::string& path, cert_facts& c)
-{
-    BIO* b = BIO_new_file(path.c_str(), "r");
-    X509* x = b ? PEM_read_bio_X509(b, nullptr, nullptr, nullptr) : nullptr;
-    if (b)
-        BIO_free(b);
-    ERR_clear_error();
-    if (!x)
-        return false;
-    c = cert_facts{};
-    if (auto* gens = static_cast<GENERAL_NAMES*>(X509_get_ext_d2i(x, NID_subject_alt_name, nullptr, nullptr)))
-    {
-        for (int i = 0; i < sk_GENERAL_NAME_num(gens); ++i)
-            if (const GENERAL_NAME* g = sk_GENERAL_NAME_value(gens, i); g->type == GEN_DNS)
-                c.names.emplace_back(reinterpret_cast<const char*>(ASN1_STRING_get0_data(g->d.dNSName)),
-                                     static_cast<size_t>(ASN1_STRING_length(g->d.dNSName)));
-        GENERAL_NAMES_free(gens);
-    }
-    int days = 0, secs = 0;
-    ASN1_TIME_diff(&days, &secs, nullptr, X509_get0_notAfter(x));
-    c.expires_in = static_cast<int64_t>(days) * 86400 + secs;
-    char issuer[256] = {};
-    X509_NAME_get_text_by_NID(X509_get_issuer_name(x), NID_organizationName, issuer, sizeof issuer);
-    if (!issuer[0])
-        X509_NAME_get_text_by_NID(X509_get_issuer_name(x), NID_commonName, issuer, sizeof issuer);
-    c.issuer = issuer;
-    c.self_signed = X509_check_issued(x, x) == X509_V_OK;
-    X509_free(x);
-    return true;
-}
 
 std::string served_cert(const runtime_instance& rt)
 {

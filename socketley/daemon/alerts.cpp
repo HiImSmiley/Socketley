@@ -22,6 +22,7 @@
 #include "../shared/util/logging.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/persist/replaced_file.h"
+#include "../shared/crypto/cert_keeper.h"
 
 namespace alerts
 {
@@ -157,8 +158,8 @@ void monitor::check(int64_t now, const std::vector<facts>& runtimes, const std::
         auto it = m_cert_left.find(r.cert);
         if (it == m_cert_left.end() || now - it->second.second >= 300)
         {
-            dashboard::cert_facts c;
-            const bool ok = dashboard::read_cert(r.cert, c);
+            cert_keeper::cert_facts c;
+            const bool ok = cert_keeper::read_cert(r.cert, c);
             it = m_cert_left.insert_or_assign(r.cert, std::make_pair(ok ? c.expires_in : INT64_MAX, now)).first;
         }
         if (it->second.first == INT64_MAX)

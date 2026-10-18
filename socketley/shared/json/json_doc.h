@@ -9,6 +9,8 @@
 #include <utility>
 #include <vector>
 
+#include "json_escape.h"
+
 namespace socketley::json
 {
 
@@ -370,6 +372,47 @@ inline int64_t int_of(const jvalue& obj, std::string_view name, int64_t otherwis
         return otherwise;
     const auto [end, ec] = std::from_chars(v->s.data(), v->s.data() + v->s.size(), n);
     return ec == std::errc{} && end == v->s.data() + v->s.size() ? n : otherwise;
+}
+
+// The document as compact JSON appended to `out`, as every runtime that answers with one writes it.
+inline void write_into(std::string& out, const jvalue& v)
+{
+    switch (v.k)
+    {
+        case jvalue::kind::null: out += "null"; return;
+        case jvalue::kind::boolean: out += v.b ? "true" : "false"; return;
+        case jvalue::kind::number: out += v.s; return;
+        case jvalue::kind::string: quote_into(out, v.s); return;
+        case jvalue::kind::array:
+            out += '[';
+            for (size_t i = 0; i < v.items.size(); ++i)
+            {
+                if (i)
+                    out += ',';
+                write_into(out, v.items[i]);
+            }
+            out += ']';
+            return;
+        case jvalue::kind::object:
+            out += '{';
+            for (size_t i = 0; i < v.members.size(); ++i)
+            {
+                if (i)
+                    out += ',';
+                quote_into(out, v.members[i].first);
+                out += ':';
+                write_into(out, v.members[i].second);
+            }
+            out += '}';
+            return;
+    }
+}
+
+inline std::string written(const jvalue& v)
+{
+    std::string out;
+    write_into(out, v);
+    return out;
 }
 
 }   // namespace socketley::json

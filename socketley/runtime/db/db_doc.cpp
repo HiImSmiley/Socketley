@@ -7,62 +7,6 @@
 namespace socketley::db
 {
 
-void write_json(const jvalue& v, std::string& out)
-{
-    switch (v.k)
-    {
-        case jvalue::kind::null:
-            out += "null";
-            return;
-        case jvalue::kind::boolean:
-            out += v.b ? "true" : "false";
-            return;
-        case jvalue::kind::number:
-            out += v.s;
-            return;
-        case jvalue::kind::string:
-            socketley::json::quote_into(out, v.s);
-            return;
-        case jvalue::kind::array:
-        {
-            out += '[';
-            bool first = true;
-            for (const auto& i : v.items)
-            {
-                if (!first)
-                    out += ',';
-                first = false;
-                write_json(i, out);
-            }
-            out += ']';
-            return;
-        }
-        case jvalue::kind::object:
-        {
-            out += '{';
-            bool first = true;
-            for (const auto& [k, m] : v.members)
-            {
-                if (!first)
-                    out += ',';
-                first = false;
-                socketley::json::quote_into(out, k);
-                out += ':';
-                write_json(m, out);
-            }
-            out += '}';
-            return;
-        }
-    }
-}
-
-std::string to_json(const jvalue& v)
-{
-    std::string out;
-    write_json(v, out);
-    return out;
-}
-
 bool valid_path(std::string_view path)
 {
     if (path.empty())
@@ -221,7 +165,7 @@ ikey key_of(const jvalue* v)
         case jvalue::kind::array:
         case jvalue::kind::object:
             k.rank = ikey::other;
-            write_json(*v, k.str);
+            json::write_into(k.str, *v);
             break;
     }
     return k;

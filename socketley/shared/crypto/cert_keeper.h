@@ -2,6 +2,7 @@
 // Certificates that change under a running listener: every server context's files are looked at again every few
 // seconds and taken up when replaced, by an ACME renewal or by anyone, and a runtime given --acme has its
 // certificate issued and renewed by `socketley acme issue`, run as a child of its worker.
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -10,6 +11,20 @@ class tls_context;
 
 namespace cert_keeper
 {
+
+// What the dashboard, the alerts and the ACME client read off a certificate file.
+struct cert_facts
+{
+    // The DNS names of its subjectAltName.
+    std::vector<std::string> names;
+    // Seconds, below 0 once it has ended, and whether its end could be read at all.
+    int64_t expires_in{0};
+    bool    expiry_known{false};
+    std::string issuer;
+    bool self_signed{false};
+};
+// The first certificate in the PEM file at `path`; false when it cannot be read.
+bool read_cert(const std::string& path, cert_facts& out);
 
 // A server context's certificate and key, watched from tick() until the context goes.
 void watch(tls_context* ctx, std::string_view cert_path, std::string_view key_path);

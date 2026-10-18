@@ -27,6 +27,7 @@
 #include "../../shared/util/glob_match.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/number_parse.h"
+#include "../../shared/ipc/one_command.h"
 #include <cstdlib>
 #include <cstdio>
 #include <charconv>
@@ -119,12 +120,9 @@ static constexpr char shard_batch_marker = '\x01';
 static constexpr std::string_view shard_batch_text = "\x01skl-shard t\n";
 static constexpr std::string_view shard_batch_resp = "\x01skl-shard r\n";
 
-// One command and not a stream of them, under the same control byte and for a
-// reason the shard batch shares: a caller that has exactly one command whose
-// value may contain newlines cannot send it down a line-split path.  The CLI
-// is that caller -- its own framing carries a three-line value fine, and the
-// cache's text protocol ends a command at the first newline.
-static constexpr std::string_view one_command_text = "\x01skl-one\n";
+// One command and not a stream of them, under the same control byte as the shard batch, for the CLI and the
+// storage's notifier, whose values may hold newlines.
+static constexpr std::string_view one_command_text = socketley::one_command_marker;
 
 // `<len>\n<bytes>`, length-prefixed rather than newline-delimited because RESP
 // commands contain newlines and a text value may as well.

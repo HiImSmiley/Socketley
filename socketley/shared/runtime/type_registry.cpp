@@ -42,17 +42,26 @@ bool valid_type_name(std::string_view name)
     return true;
 }
 
+// The built-in types by name, one table both directions are read from.
+struct builtin_name
+{
+    runtime_type     type;
+    std::string_view name;
+};
+constexpr builtin_name builtins[] = {
+    {runtime_server, "server"},   {runtime_client, "client"}, {runtime_proxy, "proxy"},
+    {runtime_cache, "cache"},     {runtime_storage, "storage"}, {runtime_dns, "dns"},
+    {runtime_sync, "sync"},       {runtime_idp, "idp"},       {runtime_db, "db"},
+};
+
 bool builtin_lookup(std::string_view name, runtime_type& out)
 {
-    if (name == "server") { out = runtime_server; return true; }
-    if (name == "client") { out = runtime_client; return true; }
-    if (name == "proxy")  { out = runtime_proxy;  return true; }
-    if (name == "cache")  { out = runtime_cache;  return true; }
-    if (name == "storage") { out = runtime_storage; return true; }
-    if (name == "dns")     { out = runtime_dns;     return true; }
-    if (name == "sync")    { out = runtime_sync;    return true; }
-    if (name == "idp")     { out = runtime_idp;     return true; }
-    if (name == "db")      { out = runtime_db;      return true; }
+    for (const auto& b : builtins)
+        if (b.name == name)
+        {
+            out = b.type;
+            return true;
+        }
     return false;
 }
 
@@ -171,19 +180,9 @@ bool is_registered(runtime_type t)
 
 const char* type_to_string(runtime_type t)
 {
-    switch (t)
-    {
-        case runtime_server: return "server";
-        case runtime_client: return "client";
-        case runtime_proxy:  return "proxy";
-        case runtime_cache:  return "cache";
-        case runtime_storage: return "storage";
-        case runtime_dns:     return "dns";
-        case runtime_sync:    return "sync";
-        case runtime_idp:     return "idp";
-        case runtime_db:      return "db";
-        default: break;
-    }
+    for (const auto& b : builtins)
+        if (b.type == t)
+            return b.name.data();
 
     std::shared_lock lock(registry_mutex());
     auto& e = entries();

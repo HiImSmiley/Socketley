@@ -726,13 +726,9 @@ void storage_run::stop()
 
     // The digest threads end first, so none of them writes to a descriptor the
     // loop is about to close, and the read waiting on it is cancelled with it.
-    m_hash.stop();
-    if (const int fd = m_hash.release_wake_fd(); fd >= 0)
-        m_loop.close_fd(fd);
+    m_hash.retire(m_loop);
     // A bind in progress is waited out here, which its own deadline bounds.
-    m_ldap_pool.stop();
-    if (const int fd = m_ldap_pool.release_wake_fd(); fd >= 0)
-        m_loop.close_fd(fd);
+    m_ldap_pool.retire(m_loop);
 
     // Marked clean only when nothing is half done, which is decided inside.
     m_store.close(true);

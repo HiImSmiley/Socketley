@@ -1913,7 +1913,7 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
         if (depth_of(op.body) > socketley::json::json_max_depth)
             return refuse(fail(400, "too_deep", "a document nests at most " +
                                                     std::to_string(socketley::json::json_max_depth) + " deep"));
-        std::string json = to_json(op.body);
+        std::string json = json::written(op.body);
         if (json.size() > max_doc)
             return refuse(fail(413, "too_large", "a document is at most 1 MiB; keep large things in a storage and "
                                                  "their address here"));

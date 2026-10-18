@@ -807,38 +807,6 @@ static std::string build_http_416(size_t total, bool keep_alive)
     return resp;
 }
 
-// One comma-separated field, one token, case-insensitive: `Connection` is a
-// list header, and "keep-alive, Upgrade" has to match "keep-alive".
-static bool header_list_has_token(std::string_view v, std::string_view lower_tok)
-{
-    size_t i = 0;
-    while (i < v.size())
-    {
-        while (i < v.size() && (v[i] == ' ' || v[i] == '\t' || v[i] == ',')) ++i;
-        const size_t start = i;
-        while (i < v.size() && v[i] != ',') ++i;
-        size_t end = i;
-        while (end > start && (v[end - 1] == ' ' || v[end - 1] == '\t')) --end;
-        if (end - start == lower_tok.size())
-        {
-            bool eq = true;
-            for (size_t j = 0; j < lower_tok.size(); ++j)
-            {
-                if (static_cast<char>(std::tolower(static_cast<unsigned char>(v[start + j])))
-                    != lower_tok[j])
-                {
-                    eq = false;
-                    break;
-                }
-            }
-            if (eq)
-                return true;
-        }
-        if (i < v.size()) ++i;
-    }
-    return false;
-}
-
 // The client's `Connection` header decides and the version only supplies the
 // default, in one place, because two deciders against 26 readers is how the
 // cached-response path and the Lua path came to disagree.
@@ -848,9 +816,9 @@ static bool http_request_keep_alive(const http_request& req)
     {
         if (fnv1a_lower(k) != fnv1a("connection"))
             continue;
-        if (header_list_has_token(v, "close"))
+        if (http_list_has_token(v, "close", 5))
             return false;
-        if (header_list_has_token(v, "keep-alive"))
+        if (http_list_has_token(v, "keep-alive", 10))
             return true;
         break;
     }

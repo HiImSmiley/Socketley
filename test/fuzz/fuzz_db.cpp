@@ -121,7 +121,7 @@ void patch(std::string_view text)
         FUZZ_CHECK(err.status == 400, "a patch refused is a 400");
         return;
     }
-    const std::string json = db::to_json(doc);
+    const std::string json = socketley::json::written(doc);
     db::jvalue back;
     // A document deeper than the reader takes is refused by the store's write, not by the patch, so it may not read.
     if (db::json_reader(json).document(back))

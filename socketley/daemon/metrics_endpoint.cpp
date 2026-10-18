@@ -1157,6 +1157,31 @@ void metrics_endpoint::sample()
     m_alerts->check(now_ms / 1000, facts, m_state_dir.empty() ? std::vector<std::string>{} : std::vector<std::string>{m_state_dir});
 }
 
+// One runtime as /api/runtimes and /api/runtime/<name> both write it, left open for what the second adds.
+static void append_runtime_row(std::string& j, std::string_view name, runtime_type type, runtime_state state,
+                               uint16_t port, const shard_stats::figures& f, const std::vector<pid_t>& pids)
+{
+    j += "{\"name\":\"";
+    socketley::json::escape_into(j, name);
+    j += "\",\"type\":\"";
+    j += runtime_type_str(type);
+    j += "\",\"state\":\"";
+    j += state_to_string(state);
+    j += "\",\"port\":";
+    json_append_uint(j, port);
+    j += ",\"connections\":";
+    json_append_uint(j, static_cast<uint64_t>(f.active_connections));
+    j += ",\"messages_total\":";
+    json_append_uint(j, f.total_messages);
+    j += ",\"connections_total\":";
+    json_append_uint(j, f.total_connections);
+    j += ",\"bytes_in\":";
+    json_append_uint(j, f.bytes_in);
+    j += ",\"bytes_out\":";
+    json_append_uint(j, f.bytes_out);
+    append_usage_json(j, usage_of(pids));
+}
+
 std::string metrics_endpoint::build_json_runtimes() const
 {
     // Snapshot runtime data under lock
@@ -1165,8 +1190,7 @@ std::string metrics_endpoint::build_json_runtimes() const
         runtime_type type;
         runtime_state state;
         uint16_t port;
-        uint64_t total_connections, total_messages, bytes_in, bytes_out;
-        size_t active_connections;
+        shard_stats::figures figures;
         std::vector<pid_t> pids;
     };
     std::vector<runtimes_snapshot> snapshots;
@@ -1177,18 +1201,11 @@ std::string metrics_endpoint::build_json_runtimes() const
         for (const auto& [name, rt] : runtimes)
         {
             // Published, not live — see build_metrics().
-            const shard_stats::figures f = rt->worker_figures();
             snapshots.push_back({name, rt->get_type(), rt->get_state(),
                 // The bound port, the same one `ps` prints: an unset -p means
                 // the type's default, and this reported 0 for a runtime that
                 // was serving.
-                rt->effective_port(),
-                f.total_connections,
-                f.total_messages,
-                f.bytes_in,
-                f.bytes_out,
-                static_cast<size_t>(f.active_connections),
-                rt->shard_pids()});
+                rt->effective_port(), rt->worker_figures(), rt->shard_pids()});
         }
     }
 
@@ -1202,25 +1219,7 @@ std::string metrics_endpoint::build_json_runtimes() const
         if (!first) j += ",";
         first = false;
 
-        j += "{\"name\":\"";
-        socketley::json::escape_into(j, s.name);
-        j += "\",\"type\":\"";
-        j += runtime_type_str(s.type);
-        j += "\",\"state\":\"";
-        j += state_to_string(s.state);
-        j += "\",\"port\":";
-        json_append_uint(j, s.port);
-        j += ",\"connections\":";
-        json_append_uint(j, static_cast<uint64_t>(s.active_connections));
-        j += ",\"messages_total\":";
-        json_append_uint(j, s.total_messages);
-        j += ",\"connections_total\":";
-        json_append_uint(j, s.total_connections);
-        j += ",\"bytes_in\":";
-        json_append_uint(j, s.bytes_in);
-        j += ",\"bytes_out\":";
-        json_append_uint(j, s.bytes_out);
-        append_usage_json(j, usage_of(s.pids));
+        append_runtime_row(j, s.name, s.type, s.state, s.port, s.figures, s.pids);
         j += "}";
     }
 
@@ -1240,28 +1239,9 @@ std::string metrics_endpoint::build_json_runtime(std::string_view name) const
     const auto& rt = it->second;
     std::string j;
     j.reserve(512);
-    j += "{\"name\":\"";
-    socketley::json::escape_into(j, name);
-    j += "\",\"type\":\"";
-    j += runtime_type_str(rt->get_type());
-    j += "\",\"state\":\"";
-    j += state_to_string(rt->get_state());
-    j += "\",\"port\":";
-    json_append_uint(j, rt->effective_port());
-    j += ",\"connections\":";
-    // Published, not live, and for a runtime in a worker summed out of its
-    // shared table at this instant.
-    const shard_stats::figures f = rt->worker_figures();
-    json_append_uint(j, f.active_connections);
-    j += ",\"messages_total\":";
-    json_append_uint(j, f.total_messages);
-    j += ",\"connections_total\":";
-    json_append_uint(j, f.total_connections);
-    j += ",\"bytes_in\":";
-    json_append_uint(j, f.bytes_in);
-    j += ",\"bytes_out\":";
-    json_append_uint(j, f.bytes_out);
-    append_usage_json(j, usage_of(rt->shard_pids()));
+    // Published, not live, and for a runtime in a worker summed out of its shared table at this instant.
+    append_runtime_row(j, name, rt->get_type(), rt->get_state(), rt->effective_port(), rt->worker_figures(),
+                       rt->shard_pids());
 
     // The published text, because get_stats() is overridden per type and every
     // override reads a container the event loop rewrites underneath this

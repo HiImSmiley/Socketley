@@ -1828,9 +1828,7 @@ void replicator::stop()
     if (m_timer_armed)
         m_loop.submit_timeout_remove(&m_timer_req);
     // A resolve in progress is waited out here, which the system resolver's own timeout bounds.
-    m_resolver.stop();
-    if (const int fd = m_resolver.release_wake_fd(); fd >= 0)
-        m_loop.close_fd(fd);
+    m_resolver.retire(m_loop);
     m_box.stop();
 }
 

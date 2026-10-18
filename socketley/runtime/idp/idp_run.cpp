@@ -37,6 +37,7 @@
 #include "../../shared/util/base64.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/crypto/mac.h"
+#include "../../shared/net/peer_address.h"
 
 namespace socketley::idp
 {
@@ -64,19 +65,6 @@ std::string peer_text(const sockaddr_storage& a)
     else if (a.ss_family == AF_INET6)
         ::inet_ntop(AF_INET6, &reinterpret_cast<const sockaddr_in6&>(a).sin6_addr, buf, sizeof buf);
     return buf;
-}
-
-bool loopback(const sockaddr_storage& a)
-{
-    if (a.ss_family == AF_INET)
-        return (ntohl(reinterpret_cast<const sockaddr_in&>(a).sin_addr.s_addr) >> 24) == 127;
-    if (a.ss_family == AF_INET6)
-    {
-        const auto& v6 = reinterpret_cast<const sockaddr_in6&>(a).sin6_addr;
-        return IN6_IS_ADDR_LOOPBACK(&v6) ||
-               (IN6_IS_ADDR_V4MAPPED(&v6) && v6.s6_addr[12] == 127);
-    }
-    return false;
 }
 
 std::string claim(const claims& c, std::string_view k)
@@ -222,9 +210,7 @@ void idp_run::stop()
     m_crossed.clear();
     m_http.stop();
     // The hashing thread ends before the descriptor it wakes the loop through is closed.
-    m_hash.stop();
-    if (const int fd = m_hash.release_wake_fd(); fd >= 0)
-        m_loop.close_fd(fd);
+    m_hash.retire(m_loop);
     m_accounts.close();
 }
 
@@ -616,15 +602,9 @@ std::string idp_run::clear_cookie() const
 std::string idp_run::client_ip(const conn& c, const request& rq) const
 {
     // Behind the entrance, a hop on this machine, the client is the last one it names.
-    if (loopback(c.peer) && !rq.forwarded_for.empty())
-    {
-        std::string_view f = rq.forwarded_for;
-        if (const size_t comma = f.rfind(','); comma != std::string_view::npos)
-            f.remove_prefix(comma + 1);
-        f = http_trim_ows(f);
-        if (!f.empty())
+    if (is_loopback(c.peer))
+        if (const std::string_view f = http_last_forwarded_hop(rq.forwarded_for); !f.empty())
             return std::string(f);
-    }
     return peer_text(c.peer);
 }
 

@@ -82,6 +82,16 @@ public:
         return fd;
     }
 
+    // Stops the threads and hands the descriptor to `loop` to close, which cancels the read waiting on it; the
+    // teardown every owner does.
+    template <class Loop>
+    void retire(Loop& loop)
+    {
+        stop();
+        if (const int fd = release_wake_fd(); fd >= 0)
+            loop.close_fd(fd);
+    }
+
     // How many pieces of work have been handed over, for a test to tell that the pool was used.
     uint64_t submitted() const { return m_submitted; }
 

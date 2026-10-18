@@ -97,9 +97,7 @@ tierer::~tierer()
     for (auto& t : m_tiers)
         for (auto& p : t->peers)
             p->stop();
-    m_resolver.stop();
-    if (const int fd = m_resolver.release_wake_fd(); fd >= 0)
-        m_loop.close_fd(fd);
+    m_resolver.retire(m_loop);
 }
 
 void tierer::set_tiers(std::vector<replication_target> tiers)

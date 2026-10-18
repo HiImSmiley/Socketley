@@ -17,7 +17,6 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
-#include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -44,6 +43,8 @@
 #include "../shared/persist/replaced_file.h"
 #include "../shared/util/base64.h"
 #include "../shared/util/random_id.h"
+#include "../shared/util/number_parse.h"
+#include "../runtime/dns/dns_wire.h"
 
 namespace
 {
@@ -173,8 +174,8 @@ std::string alpn_cert(const std::string& name, const std::string& key_auth)
 int dns_wait_seconds()
 {
     int wait = 10;
-    if (const char* w = std::getenv("SOCKETLEY_ACME_DNS_WAIT"); w && *w)
-        wait = std::clamp(std::atoi(w), 1, 3600);
+    if (const auto w = socketley::getenv_whole<int>("SOCKETLEY_ACME_DNS_WAIT", 1))
+        wait = std::min(*w, 3600);
     return wait;
 }
 
@@ -183,13 +184,15 @@ std::string dns_ask(const std::string& host, const std::string& port, const std:
                     bool recurse)
 {
     unsigned char id[2];
-    if (RAND_bytes(id, sizeof id) != 1)
+    if (!socketley::random_bytes(id, sizeof id))
         return {};
     std::string q = {static_cast<char>(id[0]), static_cast<char>(id[1]), static_cast<char>(recurse ? 1 : 0), 0,
                      0, 1, 0, 0, 0, 0, 0, 0};
     for (size_t p = 0; p <= qname.size();)
     {
         const size_t dot = std::min(qname.find('.', p), qname.size());
+        if (dot - p > socketley::dns::max_label)
+            return {};
         if (dot > p)
         {
             q += static_cast<char>(dot - p);
@@ -230,41 +233,20 @@ std::string dns_ask(const std::string& host, const std::string& port, const std:
     return answer;
 }
 
-// The name at `off` in a DNS message, compression followed; `off` moves past it. False for a malformed one.
+// The name at `off` in a DNS message as text without its trailing dot, read by the dns runtime's own rules, which
+// refuse a pointer forwards and a name past 255 bytes from a server this does not control; `off` moves past it.
 bool dns_name(const std::string& m, size_t& off, std::string& out)
 {
-    out.clear();
-    size_t at = off;
-    bool jumped = false;
-    for (int hops = 0; hops < 64; ++hops)
-    {
-        if (at >= m.size())
-            return false;
-        const auto len = static_cast<unsigned char>(m[at]);
-        if (len == 0)
-        {
-            if (!jumped)
-                off = at + 1;
-            return true;
-        }
-        if ((len & 0xc0) == 0xc0)
-        {
-            if (at + 1 >= m.size())
-                return false;
-            if (!jumped)
-                off = at + 2;
-            jumped = true;
-            at = (static_cast<size_t>(len & 0x3f) << 8) | static_cast<unsigned char>(m[at + 1]);
-            continue;
-        }
-        if (at + 1 + len > m.size())
-            return false;
-        if (!out.empty())
-            out += '.';
-        out.append(m, at + 1, len);
-        at += 1 + len;
-    }
-    return false;
+    uint8_t wire[socketley::dns::max_name];
+    size_t next = off;
+    const size_t n = socketley::dns::read_name(reinterpret_cast<const uint8_t*>(m.data()), m.size(), off, wire, next);
+    if (n == 0)
+        return false;
+    out = socketley::dns::to_text(std::string_view(reinterpret_cast<const char*>(wire), n));
+    if (!out.empty() && out.back() == '.')
+        out.pop_back();
+    off = next;
+    return true;
 }
 
 // The NS names an answer holds.
@@ -273,8 +255,8 @@ std::vector<std::string> dns_ns_names(const std::string& m)
     std::vector<std::string> out;
     if (m.size() < 12)
         return out;
-    const unsigned qd = (static_cast<unsigned char>(m[4]) << 8) | static_cast<unsigned char>(m[5]);
-    const unsigned an = (static_cast<unsigned char>(m[6]) << 8) | static_cast<unsigned char>(m[7]);
+    const auto* b = reinterpret_cast<const uint8_t*>(m.data());
+    const unsigned qd = socketley::dns::rd16(b + 4), an = socketley::dns::rd16(b + 6);
     size_t off = 12;
     std::string name;
     for (unsigned i = 0; i < qd; ++i)
@@ -284,8 +266,8 @@ std::vector<std::string> dns_ns_names(const std::string& m)
     {
         if (!dns_name(m, off, name) || off + 10 > m.size())
             return out;
-        const unsigned type = (static_cast<unsigned char>(m[off]) << 8) | static_cast<unsigned char>(m[off + 1]);
-        const size_t rdlen = (static_cast<unsigned char>(m[off + 8]) << 8) | static_cast<unsigned char>(m[off + 9]);
+        const unsigned type = socketley::dns::rd16(b + off);
+        const size_t rdlen = socketley::dns::rd16(b + off + 8);
         off += 10;
         size_t rd = off;
         if (type == 2 && dns_name(m, rd, name))
@@ -386,26 +368,12 @@ bool zone_delegated(const std::string& zone, std::string& why)
 // a name one label below a wildcard it has included.
 bool cert_covers(const std::string& path, const std::vector<std::string>& names)
 {
-    BIO* b = BIO_new_file(path.c_str(), "r");
-    X509* x = b ? PEM_read_bio_X509(b, nullptr, nullptr, nullptr) : nullptr;
-    if (b)
-        BIO_free(b);
-    ERR_clear_error();
-    if (!x)
+    cert_keeper::cert_facts c;
+    if (!cert_keeper::read_cert(path, c))
         return false;
-    int days = 0, secs = 0;
-    bool ok = X509_check_issued(x, x) != X509_V_OK &&
-              ASN1_TIME_diff(&days, &secs, nullptr, X509_get0_notAfter(x)) == 1 && days > 30;
-    std::vector<std::string> sans;
-    if (auto* gens = static_cast<GENERAL_NAMES*>(X509_get_ext_d2i(x, NID_subject_alt_name, nullptr, nullptr)))
-    {
-        for (int i = 0; i < sk_GENERAL_NAME_num(gens); ++i)
-            if (const GENERAL_NAME* g = sk_GENERAL_NAME_value(gens, i); g->type == GEN_DNS)
-                sans.emplace_back(reinterpret_cast<const char*>(ASN1_STRING_get0_data(g->d.dNSName)),
-                                  static_cast<size_t>(ASN1_STRING_length(g->d.dNSName)));
-        GENERAL_NAMES_free(gens);
-    }
-    X509_free(x);
+    // More than thirty whole days left, from a CA and not a stand-in.
+    bool ok = c.expiry_known && !c.self_signed && c.expires_in >= 31 * 86400;
+    const std::vector<std::string>& sans = c.names;
     for (const std::string& n : names)
     {
         const size_t dot = n.find('.');

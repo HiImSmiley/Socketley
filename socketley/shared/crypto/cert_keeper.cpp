@@ -41,6 +41,44 @@ extern char** environ;
 namespace cert_keeper
 {
 
+bool read_cert(const std::string& path, cert_facts& c)
+{
+#if SOCKETLEY_CERT_KEEPER_TLS
+    BIO* b = BIO_new_file(path.c_str(), "r");
+    X509* x = b ? PEM_read_bio_X509(b, nullptr, nullptr, nullptr) : nullptr;
+    if (b)
+        BIO_free(b);
+    ERR_clear_error();
+    if (!x)
+        return false;
+    c = cert_facts{};
+    if (auto* gens = static_cast<GENERAL_NAMES*>(X509_get_ext_d2i(x, NID_subject_alt_name, nullptr, nullptr)))
+    {
+        for (int i = 0; i < sk_GENERAL_NAME_num(gens); ++i)
+            if (const GENERAL_NAME* g = sk_GENERAL_NAME_value(gens, i); g->type == GEN_DNS)
+                c.names.emplace_back(reinterpret_cast<const char*>(ASN1_STRING_get0_data(g->d.dNSName)),
+                                     static_cast<size_t>(ASN1_STRING_length(g->d.dNSName)));
+        GENERAL_NAMES_free(gens);
+    }
+    int days = 0, secs = 0;
+    c.expiry_known = ASN1_TIME_diff(&days, &secs, nullptr, X509_get0_notAfter(x)) == 1;
+    c.expires_in = static_cast<int64_t>(days) * 86400 + secs;
+    char issuer[256] = {};
+    X509_NAME_get_text_by_NID(X509_get_issuer_name(x), NID_organizationName, issuer, sizeof issuer);
+    if (!issuer[0])
+        X509_NAME_get_text_by_NID(X509_get_issuer_name(x), NID_commonName, issuer, sizeof issuer);
+    c.issuer = issuer;
+    c.self_signed = X509_check_issued(x, x) == X509_V_OK;
+    X509_free(x);
+    ERR_clear_error();
+    return true;
+#else
+    (void)path;
+    c = cert_facts{};
+    return false;
+#endif
+}
+
 namespace
 {
 
@@ -114,26 +152,12 @@ bool write_file(const std::string& path, std::string_view data, mode_t mode)
 // Seconds the certificate in `path` has left, and whether it is its own issuer; false when it cannot be read.
 bool cert_left(const std::string& path, int64_t& left_s, bool& self_signed)
 {
-#if SOCKETLEY_CERT_KEEPER_TLS
-    BIO* b = BIO_new_file(path.c_str(), "r");
-    X509* x = b ? PEM_read_bio_X509(b, nullptr, nullptr, nullptr) : nullptr;
-    if (b)
-        BIO_free(b);
-    ERR_clear_error();
-    if (!x)
+    cert_facts c;
+    if (!read_cert(path, c))
         return false;
-    int days = 0, secs = 0;
-    const bool ok = ASN1_TIME_diff(&days, &secs, nullptr, X509_get0_notAfter(x)) == 1;
-    left_s = static_cast<int64_t>(days) * 86400 + secs;
-    self_signed = X509_check_issued(x, x) == X509_V_OK;
-    X509_free(x);
-    return ok;
-#else
-    (void)path;
-    left_s = 0;
-    self_signed = false;
-    return false;
-#endif
+    left_s = c.expires_in;
+    self_signed = c.self_signed;
+    return c.expiry_known;
 }
 
 std::string last_line(const std::string& path)

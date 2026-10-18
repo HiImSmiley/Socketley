@@ -124,38 +124,6 @@ std::string positions_json(const std::vector<position>& ps)
     return o;
 }
 
-// A JSON value written back as JSON, for a policy read, changed and stored again.
-void to_json(std::string& o, const jvalue& v)
-{
-    switch (v.k)
-    {
-        case jvalue::kind::null: o += "null"; return;
-        case jvalue::kind::boolean: o += v.b ? "true" : "false"; return;
-        case jvalue::kind::number: o += v.s; return;
-        case jvalue::kind::string: socketley::json::quote_into(o, v.s); return;
-        case jvalue::kind::array:
-            o += '[';
-            for (size_t i = 0; i < v.items.size(); ++i)
-            {
-                o += i ? "," : "";
-                to_json(o, v.items[i]);
-            }
-            o += ']';
-            return;
-        case jvalue::kind::object:
-            o += '{';
-            for (size_t i = 0; i < v.members.size(); ++i)
-            {
-                o += i ? "," : "";
-                socketley::json::quote_into(o, v.members[i].first);
-                o += ':';
-                to_json(o, v.members[i].second);
-            }
-            o += '}';
-            return;
-    }
-}
-
 // The statements the interface writes into a bucket's policy are named by their Sid, socketley-ui-<access>:<user>,
 // and it reads and changes only those; whatever else the policy says stays as it was.
 constexpr std::string_view ui_sid = "socketley-ui-";
@@ -1183,7 +1151,7 @@ void storage_run::ui_access_body(const std::shared_ptr<conn>& c)
                 head += ",";
                 socketley::json::quote_into(head, k);
                 head += ":";
-                to_json(head, v);
+                json::write_into(head, v);
                 continue;
             }
             const auto keep = [&](const jvalue& x)
@@ -1192,7 +1160,7 @@ void storage_run::ui_access_body(const std::shared_ptr<conn>& c)
                 if (sid.starts_with(ui_sid) && sid.ends_with(":" + user))
                     return;
                 std::string t;
-                to_json(t, x);
+                json::write_into(t, x);
                 statements.push_back(std::move(t));
             };
             if (v.k == jvalue::kind::array)

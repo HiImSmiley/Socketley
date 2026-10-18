@@ -9,6 +9,7 @@
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/number_parse.h"
+#include "../../shared/ipc/one_command.h"
 
 namespace socketley::storage
 {
@@ -404,7 +405,7 @@ void notifier::start_runtime(lane& l, const pending& ev)
     arm_timer();
     // A cache takes one command in its text protocol; a stream's entry goes in its exact bytes, since its words are
     // split on spaces.
-    std::string cmd = "\x01skl-one\n";
+    std::string cmd(one_command_marker);
     if (t.k == notify_target::kind::cache_channel)
         cmd += "publish " + t.topic + " " + ev.json;
     else
@@ -470,9 +471,7 @@ void notifier::stop()
     if (m_timer_armed)
         m_loop.submit_timeout_remove(&m_timer_req);
     // A resolve in progress is waited out here, which the system resolver's own timeout bounds.
-    m_resolver.stop();
-    if (const int fd = m_resolver.release_wake_fd(); fd >= 0)
-        m_loop.close_fd(fd);
+    m_resolver.retire(m_loop);
     m_box.stop();
 }
 

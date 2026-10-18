@@ -35,14 +35,6 @@ struct request
 // One request read from `fd`, its head and a body of at most `max_body`; false for none or a malformed one.
 bool read_request(int fd, request& r, size_t max_body = 1 << 20);
 // What a certificate file says of itself; false when it holds none.
-struct cert_facts
-{
-    std::vector<std::string> names;
-    int64_t expires_in{0};   // seconds, below 0 once it has ended
-    std::string issuer;
-    bool self_signed{false};
-};
-bool read_cert(const std::string& path, cert_facts& out);
 // The certificate file a runtime serves with, its --cert or the one --acme keeps for its first name; empty for none.
 std::string served_cert(const runtime_instance& rt);
 

@@ -736,7 +736,7 @@ void db_run::replica_main()
                     if (!e.del)
                     {
                         std::from_chars(ver->s.data(), ver->s.data() + ver->s.size(), e.v);
-                        write_json(*d, e.json);
+                        json::write_into(e.json, *d);
                     }
                     got.push_back(std::move(e));
                 }
@@ -1614,7 +1614,7 @@ void db_run::call(uint64_t ticket, std::string_view json)
     {
         std::string body;
         if (const jvalue* b = member(req, "body"))
-            write_json(*b, body);
+            json::write_into(body, *b);
         const jvalue* im = string_member(req, "if_match");
         const jvalue* inm = string_member(req, "if_none_match");
         // A script of this daemon is the operator's own code, as a key is.

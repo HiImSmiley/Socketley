@@ -1,6 +1,7 @@
 #include "dns_zone.h"
 #include "dns_wire.h"
 #include "../../shared/util/ascii.h"
+#include "../../shared/util/duration_parse.h"
 
 #include <algorithm>
 #include <cctype>
@@ -223,16 +224,10 @@ bool parse_ttl(std::string_view s, uint32_t& out)
         }
         if (!digits)
             return false;
-        uint64_t mul = 0;
-        switch (lower(static_cast<uint8_t>(c)))
-        {
-            case 's': mul = 1; break;
-            case 'm': mul = 60; break;
-            case 'h': mul = 3600; break;
-            case 'd': mul = 86400; break;
-            case 'w': mul = 604800; break;
-            default: return false;
-        }
+        // BIND takes the units in either case, as a zone file is written.
+        const uint64_t mul = duration_unit_seconds(static_cast<char>(lower(static_cast<uint8_t>(c))));
+        if (mul == 0)
+            return false;
         total += num * mul;
         num = 0;
         digits = false;

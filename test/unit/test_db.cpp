@@ -199,7 +199,7 @@ TEST_CASE("a collection's map finds, keeps and lets go of what a map would, and 
 TEST_CASE("documents: written as read, paths, and the order an index keeps")
 {
     const std::string text = R"({"a":1,"b":"x\"y\n","c":[true,false,null],"d":{"e":-1.5e3},"f":"ü"})";
-    CHECK(to_json(parse(text)) == text);
+    CHECK(socketley::json::written(parse(text)) == text);
 
     jvalue d = parse(R"({"a":{"b":{"c":1}}})");
     CHECK(at_path(d, "a.b.c")->s == "1");
@@ -210,11 +210,11 @@ TEST_CASE("documents: written as read, paths, and the order an index keeps")
     REQUIRE(made);
     made->k = jvalue::kind::number;
     made->s = "2";
-    CHECK(to_json(d) == R"({"a":{"b":{"c":1},"n":{"m":2}}})");
+    CHECK(socketley::json::written(d) == R"({"a":{"b":{"c":1},"n":{"m":2}}})");
     CHECK(make_path(d, "a.b.c.z", why) == nullptr);
     CHECK(erase_path(d, "a.b"));
     CHECK_FALSE(erase_path(d, "a.b"));
-    CHECK(to_json(d) == R"({"a":{"n":{"m":2}}})");
+    CHECK(socketley::json::written(d) == R"({"a":{"n":{"m":2}}})");
 
     CHECK(valid_path("a.b_c.d-e"));
     CHECK_FALSE(valid_path(""));

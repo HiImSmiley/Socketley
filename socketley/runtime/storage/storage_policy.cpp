@@ -509,10 +509,7 @@ const client_ip& storage_run::client_address(conn& c)
     if (!c.via_offloader)
         return c.ip;
     // The proxy put the address it was reached from last; anything before that is the client's own word.
-    std::string_view xff = c.req.header("x-forwarded-for");
-    if (const size_t comma = xff.rfind(','); comma != std::string_view::npos)
-        xff.remove_prefix(comma + 1);
-    xff = http_trim_ows(xff);
+    const std::string_view xff = http_last_forwarded_hop(c.req.header("x-forwarded-for"));
     char text[INET6_ADDRSTRLEN]{};
     if (xff.empty() || xff.size() >= sizeof text)
         return c.ip;

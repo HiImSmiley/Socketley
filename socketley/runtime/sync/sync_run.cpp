@@ -403,9 +403,7 @@ void sync_run::stop()
     if (m_tick_armed)
         m_loop.submit_timeout_remove(&m_tick_req);
     // A resolve in progress is waited out here, which the system resolver's own timeout bounds.
-    m_resolver.stop();
-    if (const int fd = m_resolver.release_wake_fd(); fd >= 0)
-        m_loop.close_fd(fd);
+    m_resolver.retire(m_loop);
 }
 
 bool sync_run::drained() const

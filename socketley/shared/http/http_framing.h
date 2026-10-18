@@ -115,6 +115,15 @@ inline std::string_view http_trim_ows(std::string_view s)
     return s;
 }
 
+// The hop an X-Forwarded-For names last, which the proxy on this machine appended; everything before it is the
+// client's own word.
+inline std::string_view http_last_forwarded_hop(std::string_view xff)
+{
+    if (const size_t comma = xff.rfind(','); comma != std::string_view::npos)
+        xff.remove_prefix(comma + 1);
+    return http_trim_ows(xff);
+}
+
 // The credentials an Authorization value carries after `scheme_lower`, a scheme RFC 9110 11.1 matches in any case,
 // trimmed; false for another scheme, so "BASIC" or "Bearer" reaches what "basic" and "bearer" do.
 inline bool http_auth_credentials(std::string_view authorization, std::string_view scheme_lower,

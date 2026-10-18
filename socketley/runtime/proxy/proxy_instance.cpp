@@ -13,6 +13,7 @@
 #include "../../shared/net/unix_listener.h"
 #include "../../shared/net/dns_feed.h"
 #include "../../shared/http/status.h"
+#include "../../shared/net/peer_address.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -4619,12 +4620,6 @@ bool proxy_instance::append_backend_host_header(std::string& out,
     return true;
 }
 
-// Whether a peer is on this machine: a loopback address, or none for a unix socket.
-static bool local_peer(std::string_view ip)
-{
-    return ip.empty() || ip.starts_with("127.") || ip == "::1" || ip.starts_with("::ffff:127.");
-}
-
 // The value of header `lower` in a request's head, with how many times it came.
 static std::string_view request_field(std::string_view head, std::string_view lower, int& count)
 {
@@ -4640,7 +4635,7 @@ static std::string_view request_field(std::string_view head, std::string_view lo
         if (line.empty())
             break;
         if (line.size() > lower.size() && line[lower.size()] == ':' &&
-            std::equal(lower.begin(), lower.end(), line.begin(), [](char a, char b) { return a == (b | 0x20); }))
+            std::equal(lower.begin(), lower.end(), line.begin(), [](char a, char b) { return http_lower_equals(b, a); }))
         {
             ++count;
             value = http_trim_ows(line.substr(lower.size() + 1));
@@ -4663,14 +4658,12 @@ bool proxy_instance::auth_admits(proxy_client_connection* conn)
         conn->peer_probed = true;
     }
     std::string client = conn->peer_addr;
-    if (local_peer(client))
+    if (socketley::is_loopback(client))
     {
         int xff_fields = 0;
-        std::string_view xff = request_field(head, "x-forwarded-for", xff_fields);
-        if (const size_t comma = xff.rfind(','); comma != std::string_view::npos)
-            xff.remove_prefix(comma + 1);
-        if (xff_fields == 1 && !http_trim_ows(xff).empty())
-            client.assign(http_trim_ows(xff));
+        const std::string_view xff = http_last_forwarded_hop(request_field(head, "x-forwarded-for", xff_fields));
+        if (xff_fields == 1 && !xff.empty())
+            client.assign(xff);
     }
     if (client.empty())
         client = "local";
@@ -4719,7 +4712,7 @@ bool proxy_instance::session_admits(proxy_client_connection* conn, std::string_v
     {
         // The scheme the browser used: this proxy's own, or what the entrance in front of it says it was.
         std::string_view scheme = conn->tls() ? "https" : "http";
-        if (local_peer(std::string(client)) || local_peer(conn->peer_addr))
+        if (socketley::is_loopback(std::string(client)) || socketley::is_loopback(conn->peer_addr))
             if (const std::string_view p = http_trim_ows(request_field(head, "x-forwarded-proto", proto_fields));
                 proto_fields == 1 && (p == "https" || p == "http"))
                 scheme = p;
@@ -4875,7 +4868,7 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         conn->peer_addr   = peer_ip(conn->fd);
         conn->peer_probed = true;
     }
-    const bool forwarded_trusted = m_prefix.empty() && !m_entrance && local_peer(conn->peer_addr);
+    const bool forwarded_trusted = m_prefix.empty() && !m_entrance && socketley::is_loopback(conn->peer_addr);
     bool kept_proto = false, kept_host = false;
     std::string prior_forwarded_for;
     std::string_view client_host;

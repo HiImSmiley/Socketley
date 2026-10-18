@@ -18,8 +18,6 @@ using socketley::json::member;
 inline constexpr size_t max_path_depth = 8;
 
 // `v` as JSON, appended to `out`; a number is written as it was read.
-void write_json(const jvalue& v, std::string& out);
-std::string to_json(const jvalue& v);
 
 // Whether `path` is names joined by dots that a document may hold.
 bool valid_path(std::string_view path);
