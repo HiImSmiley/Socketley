@@ -4,6 +4,7 @@
 #include "../shared/cluster/cluster_discovery.h"
 #include "../shared/cluster/cluster_state.h"
 #include "../shared/json/json_doc.h"
+#include "../shared/runtime/stats_text.h"
 
 #include <iostream>
 #include <fstream>
@@ -338,22 +339,7 @@ namespace {
 // One `key:value` line out of the daemon's cluster-status reply.
 std::string status_field(std::string_view body, std::string_view key)
 {
-    size_t pos = 0;
-    while (pos <= body.size())
-    {
-        size_t eol = body.find('\n', pos);
-        std::string_view line = body.substr(pos,
-            eol == std::string_view::npos ? std::string_view::npos : eol - pos);
-
-        if (line.size() > key.size() && line.compare(0, key.size(), key) == 0 &&
-            line[key.size()] == ':')
-            return std::string(line.substr(key.size() + 1));
-
-        if (eol == std::string_view::npos)
-            break;
-        pos = eol + 1;
-    }
-    return {};
+    return std::string(socketley::stats_text::field(body, key));
 }
 
 } // namespace

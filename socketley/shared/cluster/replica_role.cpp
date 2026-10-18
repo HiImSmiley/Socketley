@@ -1,6 +1,7 @@
 #include "replica_role.h"
 
 #include "../util/byte_codec.h"
+#include "../runtime/stats_text.h"
 
 #include <charconv>
 
@@ -121,15 +122,7 @@ std::optional<replica_report> parse_report(std::string_view detail, std::string_
     replica_report rep;
     rep.name = std::string(name);
     bool have_inc = false, have_epoch = false, have_offset = false, have_role = false;
-    while (!detail.empty())
-    {
-        const size_t nl = detail.find('\n');
-        const std::string_view line = detail.substr(0, nl);
-        detail = nl == std::string_view::npos ? std::string_view{} : detail.substr(nl + 1);
-        const size_t colon = line.find(':');
-        if (colon == std::string_view::npos)
-            continue;
-        const std::string_view key = line.substr(0, colon), val = line.substr(colon + 1);
+    socketley::stats_text::for_each_field(detail, [&](std::string_view key, std::string_view val) {
         if (key == "cluster_incarnation")
             have_inc = number(val, rep.incarnation);
         else if (key == "cluster_epoch")
@@ -141,7 +134,7 @@ std::optional<replica_report> parse_report(std::string_view detail, std::string_
             have_role  = true;
             rep.primary = val == "primary";
         }
-    }
+    });
     if (!have_inc || !have_epoch || !have_offset || !have_role || rep.incarnation == 0)
         return std::nullopt;
     return rep;

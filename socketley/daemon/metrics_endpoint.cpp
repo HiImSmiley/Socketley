@@ -15,6 +15,7 @@
 #include "../shared/json/json_escape.h"
 #include "../shared/util/wall_clock.h"
 #include "../shared/util/proc_stat.h"
+#include "../shared/runtime/stats_text.h"
 #include "../shared/loop/eventfd_wake.h"
 
 #include <unistd.h>
@@ -534,35 +535,23 @@ static storage_row parse_storage_row(std::string_view name, std::string_view det
 {
     storage_row row;
     row.name = std::string(name);
-    while (!detail.empty())
-    {
-        const size_t nl = detail.find('\n');
-        const std::string_view line = detail.substr(0, nl);
-        detail = nl == std::string_view::npos ? std::string_view{} : detail.substr(nl + 1);
-        const size_t colon = line.find(':');
-        if (colon == std::string_view::npos)
-            continue;
+    socketley::stats_text::for_each_field(detail, [&](std::string_view key, std::string_view num) {
         uint64_t v = 0;
-        const std::string_view num = line.substr(colon + 1);
         const auto [end, ec] = std::from_chars(num.data(), num.data() + num.size(), v);
         if (ec != std::errc{} || end != num.data() + num.size())
-            continue;
+            return;
         // A sharded runtime's text is one section per shard, so a figure that
         // comes again is the next shard's: added, except the ones every shard
         // holds a whole copy of.
-        const std::string_view key = line.substr(0, colon);
-        bool merged = false;
         for (auto& [k, held] : row.figures)
             if (k == key)
             {
                 if (key != "buckets" && key != "max_bytes" && key != "tls" && key != "shard_index")
                     held += v;
-                merged = true;
-                break;
+                return;
             }
-        if (!merged)
-            row.figures.emplace_back(std::string(key), v);
-    }
+        row.figures.emplace_back(std::string(key), v);
+    });
     return row;
 }
 
@@ -1096,12 +1085,7 @@ void metrics_endpoint::sample()
             else if (rt->get_type() == runtime_sync && rt->get_state() == runtime_running)
             {
                 row.get("failing", a.failing);
-                const std::string detail = rt->stat_detail_snapshot();
-                if (const size_t at = detail.find("\nlast_error:"); at != std::string::npos)
-                {
-                    const size_t from = at + 12;
-                    a.error = detail.substr(from, detail.find('\n', from) - from);
-                }
+                a.error = socketley::stats_text::field(rt->stat_detail_snapshot(), "last_error");
             }
             else if (uint64_t ev = 1; rt->get_type() == runtime_cache && row.get("eviction", ev) && ev == 0)
             {

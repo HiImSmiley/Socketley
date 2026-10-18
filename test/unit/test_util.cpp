@@ -8,9 +8,11 @@
 #include "shared/util/settings.h"
 #include "shared/util/proc_stat.h"
 #include "shared/util/byte_codec.h"
+#include "shared/runtime/stats_text.h"
 
 #include <chrono>
 #include <string>
+#include <vector>
 
 #include <cstdlib>
 
@@ -179,4 +181,23 @@ TEST_CASE("a frame opens with its marker, and a flag is one byte that is 0 or 1"
 
     bool c = false;
     CHECK_FALSE(socketley::bytes::reader(std::string_view("\x02", 1)).flag(c));
+}
+
+TEST_CASE("a stats text is read field by field, the last line too without a newline")
+{
+    const std::string_view text = "name:a\nnot a field\nbytes:10\nbytes:20\nlast_error:disk: full";
+    std::vector<std::pair<std::string, std::string>> seen;
+    socketley::stats_text::for_each_field(text, [&](std::string_view k, std::string_view v) {
+        seen.emplace_back(k, v);
+    });
+    REQUIRE(seen.size() == 4);
+    CHECK(seen[3] == std::pair<std::string, std::string>{"last_error", "disk: full"});
+    CHECK(socketley::stats_text::field(text, "bytes") == "10");
+    CHECK(socketley::stats_text::field(text, "last_error") == "disk: full");
+    CHECK(socketley::stats_text::field(text, "byte").empty());
+    CHECK(socketley::stats_text::field("", "name").empty());
+
+    size_t calls = 0;
+    socketley::stats_text::for_each_field(text, [&](std::string_view, std::string_view) { return ++calls < 2; });
+    CHECK(calls == 2);
 }
