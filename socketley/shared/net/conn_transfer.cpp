@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "../loop/event_loop.h"
+#include "../util/byte_codec.h"
 #include "../util/logging.h"
 
 namespace conn_transfer
@@ -17,12 +18,6 @@ namespace
 
 // [conn_ref][u32 origin_len][origin][u32 backlog_len][backlog], sent as one
 // sendmsg with the descriptor, so a receiver has all of it or none.
-void put_u32(std::string& out, uint32_t v)
-{
-    for (int i = 0; i < 4; ++i)
-        out.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
-}
-
 bool take_u32(const char*& p, const char* end, uint32_t& out)
 {
     if (end - p < 4) return false;
@@ -47,9 +42,9 @@ bool send_handover(int channel_fd, const handover& h, int payload_fd)
     std::string body;
     body.reserve(conn_ref_wire_size + 8 + h.origin.size() + h.backlog.size());
     put_conn_ref(body, h.ref);
-    put_u32(body, static_cast<uint32_t>(h.origin.size()));
+    socketley::bytes::append32(body, static_cast<uint32_t>(h.origin.size()));
     body.append(h.origin);
-    put_u32(body, static_cast<uint32_t>(h.backlog.size()));
+    socketley::bytes::append32(body, static_cast<uint32_t>(h.backlog.size()));
     body.append(h.backlog);
 
     if (body.size() > max_handover_message)
@@ -62,7 +57,7 @@ bool send_handover(int channel_fd, const handover& h, int payload_fd)
     // read even though each was one sendmsg.
     std::string framed;
     framed.reserve(4 + body.size());
-    put_u32(framed, static_cast<uint32_t>(body.size()));
+    socketley::bytes::append32(framed, static_cast<uint32_t>(body.size()));
     framed.append(body);
 
     struct iovec iov{};
@@ -281,7 +276,7 @@ std::string relay_frame(relay_op op, const conn_ref& ref, std::string_view paylo
 {
     std::string out;
     out.reserve(relay_header_size + payload.size());
-    put_u32(out, static_cast<uint32_t>(payload.size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(payload.size()));
     out.push_back(static_cast<char>(op));
     put_conn_ref(out, ref);
     out.append(payload);

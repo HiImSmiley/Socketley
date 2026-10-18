@@ -18,20 +18,6 @@ namespace socketley::db
 namespace
 {
 
-void put32(char* at, uint32_t v)
-{
-    for (int i = 0; i < 4; ++i)
-        at[i] = static_cast<char>((v >> (8 * i)) & 0xFF);
-}
-
-uint32_t get32(const char* at)
-{
-    uint32_t v = 0;
-    for (int i = 0; i < 4; ++i)
-        v |= static_cast<uint32_t>(static_cast<unsigned char>(at[i])) << (8 * i);
-    return v;
-}
-
 std::string head_of()
 {
     std::string h(seglog::magic, sizeof seglog::magic);
@@ -128,8 +114,8 @@ bool seglog::scan_file(const std::string& path, const visitor& each, bool cut_to
             }
         }
         const char* h = buf.data() + (at - base);
-        const uint32_t len = get32(h);
-        const uint32_t crc = get32(h + 4);
+        const uint32_t len = socketley::bytes::load32(h);
+        const uint32_t crc = socketley::bytes::load32(h + 4);
         // No record is empty, so a length of 0 is the room past the last one.
         if (len == 0 || len > max_record || at + record_head + len > size)
             break;
@@ -146,7 +132,7 @@ bool seglog::scan_file(const std::string& path, const visitor& each, bool cut_to
             }
         }
         const std::string_view payload(buf.data() + (at - base) + record_head, len);
-        if (journal_detail::crc32(payload) != crc)
+        if (crc::crc32(payload) != crc)
             break;
         if (!each(0, at + record_head, payload))
         {
@@ -283,8 +269,8 @@ void seglog::close()
 location seglog::append(std::string_view payload)
 {
     char head[record_head];
-    put32(head, static_cast<uint32_t>(payload.size()));
-    put32(head + 4, journal_detail::crc32(payload));
+    socketley::bytes::store32(head, static_cast<uint32_t>(payload.size()));
+    socketley::bytes::store32(head + 4, crc::crc32(payload));
     m_pending.append(head, record_head);
     const uint64_t off = m_written + m_pending.size();
     m_pending.append(payload);
@@ -557,8 +543,8 @@ uint64_t seglog::read_records(uint32_t seg, uint64_t off,
             }
         }
         const char* h = buf.data() + (off - base);
-        const uint32_t len = get32(h);
-        const uint32_t crc = get32(h + 4);
+        const uint32_t len = socketley::bytes::load32(h);
+        const uint32_t crc = socketley::bytes::load32(h + 4);
         if (len == 0 || len > max_record || off + record_head + len > size)
             break;
         if (off + record_head + len > base + buf.size())
@@ -571,7 +557,7 @@ uint64_t seglog::read_records(uint32_t seg, uint64_t off,
                 break;
         }
         const std::string_view payload(buf.data() + (off - base) + record_head, len);
-        if (journal_detail::crc32(payload) != crc || !each(off + record_head, payload))
+        if (crc::crc32(payload) != crc || !each(off + record_head, payload))
             break;
         off += record_head + len;
     }
@@ -607,8 +593,8 @@ bool seglog::write_file(const std::string& path, const std::vector<std::string>&
     for (const auto& p : payloads)
     {
         char head[record_head];
-        put32(head, static_cast<uint32_t>(p.size()));
-        put32(head + 4, journal_detail::crc32(p));
+        socketley::bytes::store32(head, static_cast<uint32_t>(p.size()));
+        socketley::bytes::store32(head + 4, crc::crc32(p));
         buf.append(head, record_head);
         offs.push_back(at + buf.size());
         buf.append(p);

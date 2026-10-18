@@ -100,12 +100,6 @@ bool wildcard(const std::string& addr)
 // Frames this far over a peer's unsent bytes are dropped, because Raft survives loss and a slow peer must not grow memory.
 constexpr size_t outbound_cap = 8u * 1024u * 1024u;
 
-void put_u64(std::string& o, uint64_t v)
-{
-    for (int b = 0; b < 8; ++b)
-        o += static_cast<char>((v >> (8 * b)) & 0xFF);
-}
-
 bool get_u64(std::string_view in, size_t& off, uint64_t& v)
 {
     if (in.size() - off < 8)
@@ -1316,7 +1310,7 @@ std::string raft_host::describe(raft::node_id id) const
 std::string raft_host::encode_record(raft::node_id id, const member& m)
 {
     std::string out = "M";
-    put_u64(out, id);
+    socketley::bytes::append64(out, id);
     out += static_cast<char>(m.voter ? 1 : 0);
     out += static_cast<char>(std::min<size_t>(m.name.size(), 255));
     out.append(m.name, 0, 255);

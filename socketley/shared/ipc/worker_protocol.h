@@ -14,6 +14,7 @@
 // The cluster snapshot travels whole, in the structs the daemon already holds
 // it in.
 #include "../cluster/cluster_view.h"
+#include "../util/byte_codec.h"
 #include <string_view>
 #include <vector>
 
@@ -111,24 +112,12 @@ inline void put_u16(std::string& out, uint16_t v)
     out.push_back(static_cast<char>((v >> 8) & 0xFF));
 }
 
-inline void put_u32(std::string& out, uint32_t v)
-{
-    for (int i = 0; i < 4; ++i)
-        out.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
-}
-
-inline void put_u64(std::string& out, uint64_t v)
-{
-    for (int i = 0; i < 8; ++i)
-        out.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
-}
-
 // Strings carry their own length, so a name with a space or a newline in it is
 // not a parsing problem and no escaping rule has to be agreed between builds.
 inline void put_str(std::string& out, std::string_view s)
 {
     const uint32_t n = static_cast<uint32_t>(s.size());
-    put_u32(out, n);
+    socketley::bytes::append32(out, n);
     out.append(s);
 }
 
@@ -136,7 +125,7 @@ inline std::string frame(frame_type type, std::string_view payload)
 {
     std::string out;
     out.reserve(header_size + payload.size());
-    put_u32(out, static_cast<uint32_t>(payload.size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(payload.size()));
     put_u16(out, version);
     put_u16(out, static_cast<uint16_t>(type));
     out.append(payload);
@@ -291,14 +280,14 @@ inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
                                     const route_decl_wire& group_routes = {})
 {
     std::string out;
-    put_u32(out, static_cast<uint32_t>(names.size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(names.size()));
     for (const auto& e : names)
     {
         put_str(out, e.name);
         put_str(out, e.host);
         put_u16(out, e.port);
     }
-    put_u32(out, static_cast<uint32_t>(groups.size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(groups.size()));
     for (const auto& e : groups)
     {
         put_str(out, e.name);
@@ -309,13 +298,13 @@ inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
     // The declarations by name and by group, appended after the two blocks
     // above so a worker built before this field reads the endpoints it
     // understands and stops.
-    put_u32(out, static_cast<uint32_t>(name_routes.size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(name_routes.size()));
     for (const auto& [n, rt] : name_routes)
     {
         put_str(out, n);
         put_str(out, encode_routes(*rt));
     }
-    put_u32(out, static_cast<uint32_t>(group_routes.size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(group_routes.size()));
     for (const auto& [g, rt] : group_routes)
     {
         put_str(out, g);
@@ -328,13 +317,13 @@ inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
     for (const auto& e : names)
         if (!e.unix_paths.empty())
             ++n_nodes;
-    put_u32(out, n_nodes);
+    socketley::bytes::append32(out, n_nodes);
     for (const auto& e : names)
     {
         if (e.unix_paths.empty())
             continue;
         put_str(out, e.name);
-        put_u32(out, static_cast<uint32_t>(e.unix_paths.size()));
+        socketley::bytes::append32(out, static_cast<uint32_t>(e.unix_paths.size()));
         for (const auto& p : e.unix_paths)
             put_str(out, p);
     }
@@ -346,13 +335,13 @@ inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
     for (const auto& e : groups)
         if (!e.unix_paths.empty())
             ++n_group_nodes;
-    put_u32(out, n_group_nodes);
+    socketley::bytes::append32(out, n_group_nodes);
     for (uint32_t i = 0; i < groups.size(); ++i)
     {
         if (groups[i].unix_paths.empty())
             continue;
-        put_u32(out, i);
-        put_u32(out, static_cast<uint32_t>(groups[i].unix_paths.size()));
+        socketley::bytes::append32(out, i);
+        socketley::bytes::append32(out, static_cast<uint32_t>(groups[i].unix_paths.size()));
         for (const auto& p : groups[i].unix_paths)
             put_str(out, p);
     }
@@ -364,12 +353,12 @@ inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
 inline std::string encode_routes(const route_table& rt)
 {
     std::string out;
-    put_u32(out, static_cast<uint32_t>(rt.all().size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(rt.all().size()));
     for (const auto& d : rt.all())
     {
         put_str(out, d.path);
         out.push_back(d.prefix ? 1 : 0);
-        put_u32(out, static_cast<uint32_t>(d.methods.size()));
+        socketley::bytes::append32(out, static_cast<uint32_t>(d.methods.size()));
         for (const auto& m : d.methods)
             put_str(out, m);
     }
@@ -554,7 +543,7 @@ inline std::string encode_map_request(uint64_t ticket, std::string_view op,
 {
     std::string out;
     out.reserve(20 + op.size() + name.size() + config.size());
-    put_u64(out, ticket);
+    socketley::bytes::append64(out, ticket);
     put_str(out, op);       // "create"|"start"|"stop"|"remove"|"route"
     put_str(out, name);
     put_str(out, config);   // create: the runtime_config JSON
@@ -580,7 +569,7 @@ inline std::string encode_map_reply(uint64_t ticket, bool ok, std::string_view e
 {
     std::string out;
     out.reserve(13 + err.size());
-    put_u64(out, ticket);
+    socketley::bytes::append64(out, ticket);
     out.push_back(ok ? '\1' : '\0');
     put_str(out, err);
     return out;
@@ -708,7 +697,7 @@ inline std::string encode_cluster_event(const cluster_ev_wire& e)
     put_str(out, e.daemon_name);
     put_str(out, e.host);
     put_str(out, e.group_name);
-    put_u32(out, static_cast<uint32_t>(e.members.size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(e.members.size()));
     for (const auto& m : e.members)
     {
         put_str(out, m.daemon);
@@ -769,14 +758,14 @@ struct runtime_wire
 inline std::string encode_runtime_map(const std::vector<runtime_wire>& rts)
 {
     std::string out;
-    put_u32(out, static_cast<uint32_t>(rts.size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(rts.size()));
     for (const auto& r : rts)
     {
         put_str(out, r.name);
         put_str(out, r.type);
         out.push_back(static_cast<char>(r.state));
         put_u16(out, r.port);
-        put_u64(out, r.connections);
+        socketley::bytes::append64(out, r.connections);
         put_str(out, r.owner);
         put_str(out, r.group);
     }
@@ -820,13 +809,13 @@ inline std::string encode_cluster_view(const cluster_view& v)
     std::string out;
     put_str(out, v.daemon_name);
     put_str(out, v.host);
-    put_u32(out, static_cast<uint32_t>(v.remote.size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(v.remote.size()));
     for (const auto& d : v.remote)
     {
         put_str(out, d.name);
         put_str(out, d.host);
-        put_u64(out, static_cast<uint64_t>(d.heartbeat));
-        put_u32(out, static_cast<uint32_t>(d.runtimes.size()));
+        socketley::bytes::append64(out, static_cast<uint64_t>(d.heartbeat));
+        socketley::bytes::append32(out, static_cast<uint32_t>(d.runtimes.size()));
         for (const auto& r : d.runtimes)
         {
             put_str(out, r.daemon_name);
@@ -836,7 +825,7 @@ inline std::string encode_cluster_view(const cluster_view& v)
             put_str(out, r.group);
             put_u16(out, r.port);
             put_str(out, r.state);
-            put_u64(out, static_cast<uint64_t>(r.connections));
+            socketley::bytes::append64(out, static_cast<uint64_t>(r.connections));
         }
     }
     return out;
@@ -908,11 +897,11 @@ struct stats_wire
 inline std::string encode_stats(const stats_wire& s)
 {
     std::string out;
-    put_u64(out, s.total_connections);
-    put_u64(out, s.total_messages);
-    put_u64(out, s.bytes_in);
-    put_u64(out, s.bytes_out);
-    put_u64(out, s.active_connections);
+    socketley::bytes::append64(out, s.total_connections);
+    socketley::bytes::append64(out, s.total_messages);
+    socketley::bytes::append64(out, s.bytes_in);
+    socketley::bytes::append64(out, s.bytes_out);
+    socketley::bytes::append64(out, s.active_connections);
     put_str(out, s.detail);
     return out;
 }
@@ -968,7 +957,7 @@ inline size_t publish_frame_size(std::string_view cache_name, std::string_view c
 inline void append_publish_frame(std::string& out, std::string_view cache_name,
                                  std::string_view channel, std::string_view message)
 {
-    put_u32(out, static_cast<uint32_t>(12 + cache_name.size() + channel.size() + message.size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(12 + cache_name.size() + channel.size() + message.size()));
     put_u16(out, version);
     put_u16(out, static_cast<uint16_t>(frame_type::publish));
     put_str(out, cache_name);
@@ -1007,7 +996,7 @@ inline std::string encode_chan_request(uint64_t ticket, std::string_view target,
 {
     std::string out;
     out.reserve(16 + target.size() + payload.size());
-    put_u64(out, ticket);
+    socketley::bytes::append64(out, ticket);
     put_str(out, target);
     put_str(out, payload);
     return out;
@@ -1027,7 +1016,7 @@ inline std::string encode_chan_reply(uint64_t ticket, uint8_t status,
 {
     std::string out;
     out.reserve(13 + payload.size());
-    put_u64(out, ticket);
+    socketley::bytes::append64(out, ticket);
     out.push_back(static_cast<char>(status));
     put_str(out, payload);
     return out;
@@ -1052,10 +1041,10 @@ inline size_t chan_request_frame_size(std::string_view target, std::string_view 
 inline void append_chan_request_frame(std::string& out, uint64_t ticket,
                                       std::string_view target, std::string_view payload)
 {
-    put_u32(out, static_cast<uint32_t>(16 + target.size() + payload.size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(16 + target.size() + payload.size()));
     put_u16(out, version);
     put_u16(out, static_cast<uint16_t>(frame_type::chan_req));
-    put_u64(out, ticket);
+    socketley::bytes::append64(out, ticket);
     put_str(out, target);
     put_str(out, payload);
 }
@@ -1068,10 +1057,10 @@ inline size_t chan_reply_frame_size(std::string_view payload)
 inline void append_chan_reply_frame(std::string& out, uint64_t ticket, uint8_t status,
                                     std::string_view payload)
 {
-    put_u32(out, static_cast<uint32_t>(13 + payload.size()));
+    socketley::bytes::append32(out, static_cast<uint32_t>(13 + payload.size()));
     put_u16(out, version);
     put_u16(out, static_cast<uint16_t>(frame_type::chan_rep));
-    put_u64(out, ticket);
+    socketley::bytes::append64(out, ticket);
     out.push_back(static_cast<char>(status));
     put_str(out, payload);
 }

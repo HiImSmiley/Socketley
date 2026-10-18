@@ -15,8 +15,6 @@ class event_loop;
 namespace socketley::raft::storage
 {
 
-uint32_t crc32c(const void* data, size_t len, uint32_t crc = 0);
-
 enum class record : uint8_t { hard = 1, entry = 2, truncate = 3, snapshot = 4 };
 
 // Every record is u32 payload length, u32 CRC32C over the type byte and payload, the type byte, the payload.

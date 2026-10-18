@@ -8,22 +8,61 @@
 namespace socketley::bytes
 {
 
+// Spelled out by shift, so the host's own order never decides a file's bytes.
+inline void store32(void* at, uint32_t v)
+{
+    auto* p = static_cast<unsigned char*>(at);
+    for (int i = 0; i < 4; ++i)
+        p[i] = static_cast<unsigned char>(v >> (8 * i));
+}
+
+inline void store64(void* at, uint64_t v)
+{
+    auto* p = static_cast<unsigned char*>(at);
+    for (int i = 0; i < 8; ++i)
+        p[i] = static_cast<unsigned char>(v >> (8 * i));
+}
+
+inline uint32_t load32(const void* at)
+{
+    const auto* p = static_cast<const unsigned char*>(at);
+    uint32_t    v = 0;
+    for (int i = 0; i < 4; ++i)
+        v |= static_cast<uint32_t>(p[i]) << (8 * i);
+    return v;
+}
+
+inline uint64_t load64(const void* at)
+{
+    const auto* p = static_cast<const unsigned char*>(at);
+    uint64_t    v = 0;
+    for (int i = 0; i < 8; ++i)
+        v |= static_cast<uint64_t>(p[i]) << (8 * i);
+    return v;
+}
+
+inline void append32(std::string& out, uint32_t v)
+{
+    char b[4];
+    store32(b, v);
+    out.append(b, 4);
+}
+
+inline void append64(std::string& out, uint64_t v)
+{
+    char b[8];
+    store64(b, v);
+    out.append(b, 8);
+}
+
 class writer
 {
 public:
     void u8(uint8_t v) { m_out += static_cast<char>(v); }
 
-    void u32(uint32_t v)
-    {
-        for (int b = 0; b < 4; ++b)
-            m_out += static_cast<char>((v >> (8 * b)) & 0xFF);
-    }
+    void u32(uint32_t v) { append32(m_out, v); }
 
-    void u64(uint64_t v)
-    {
-        for (int b = 0; b < 8; ++b)
-            m_out += static_cast<char>((v >> (8 * b)) & 0xFF);
-    }
+    void u64(uint64_t v) { append64(m_out, v); }
 
     void bytes(std::string_view s)
     {
@@ -63,9 +102,8 @@ public:
     {
         if (left() < 4)
             return false;
-        v = 0;
-        for (int b = 0; b < 4; ++b)
-            v |= static_cast<uint32_t>(static_cast<unsigned char>(m_in[m_off++])) << (8 * b);
+        v = load32(m_in.data() + m_off);
+        m_off += 4;
         return true;
     }
 
@@ -73,9 +111,8 @@ public:
     {
         if (left() < 8)
             return false;
-        v = 0;
-        for (int b = 0; b < 8; ++b)
-            v |= static_cast<uint64_t>(static_cast<unsigned char>(m_in[m_off++])) << (8 * b);
+        v = load64(m_in.data() + m_off);
+        m_off += 8;
         return true;
     }
 

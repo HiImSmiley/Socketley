@@ -582,7 +582,7 @@ private:
     void send_hello()
     {
         std::string payload;
-        worker_proto::put_u32(payload, static_cast<uint32_t>(::getpid()));
+        socketley::bytes::append32(payload, static_cast<uint32_t>(::getpid()));
         if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::hello, payload))) {}
     }
 

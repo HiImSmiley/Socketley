@@ -11,7 +11,7 @@
 #endif
 
 #include "digest.h"
-#include "../../shared/cluster/raft_storage.h"
+#include "../../shared/util/crc.h"
 
 namespace socketley::storage
 {
@@ -26,19 +26,6 @@ constexpr uint32_t crc32_poly = 0xEDB88320u;
 // The reflected polynomial of CRC-64/NVME.
 constexpr uint64_t crc64_poly = 0x9A6C9329AC4BC9B5ull;
 
-constexpr std::array<uint32_t, 256> make_crc32_table()
-{
-    std::array<uint32_t, 256> t{};
-    for (uint32_t i = 0; i < 256; ++i)
-    {
-        uint32_t c = i;
-        for (int k = 0; k < 8; ++k)
-            c = (c & 1) ? (c >> 1) ^ crc32_poly : c >> 1;
-        t[i] = c;
-    }
-    return t;
-}
-
 constexpr std::array<uint64_t, 256> make_crc64_table()
 {
     std::array<uint64_t, 256> t{};
@@ -52,14 +39,11 @@ constexpr std::array<uint64_t, 256> make_crc64_table()
     return t;
 }
 
-constexpr auto crc32_table = make_crc32_table();
 constexpr auto crc64_table = make_crc64_table();
 
 uint64_t crc32_bytes(uint64_t crc, const unsigned char* p, size_t n)
 {
-    for (size_t i = 0; i < n; ++i)
-        crc = crc32_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
-    return crc;
+    return crc::crc32_register(static_cast<uint32_t>(crc), p, n);
 }
 
 uint64_t crc64_bytes(uint64_t crc, const unsigned char* p, size_t n)
@@ -145,7 +129,7 @@ uint64_t crc_update(const crc_kind& k, uint64_t crc, const unsigned char* p, siz
 
 uint32_t crc32c_update(uint32_t crc, const unsigned char* p, size_t n)
 {
-    return raft::storage::crc32c(p, n, crc);
+    return crc::crc32c(p, n, crc);
 }
 
 // The big-endian bytes S3 base64-encodes for a CRC.

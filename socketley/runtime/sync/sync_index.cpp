@@ -63,7 +63,7 @@ std::string framed(std::string_view body)
 {
     std::string out;
     put_u32(out, static_cast<uint32_t>(body.size()));
-    put_u32(out, journal_detail::crc32(body));
+    put_u32(out, crc::crc32(body));
     out.append(body);
     return out;
 }
@@ -126,7 +126,7 @@ bool sync_index::open(std::string path, std::string_view scope, std::string& why
             break;
         }
         const std::string_view body(text.data() + at, len);
-        if (journal_detail::crc32(body) != crc)
+        if (crc::crc32(body) != crc)
         {
             at = start;
             break;

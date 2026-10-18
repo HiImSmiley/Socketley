@@ -4,6 +4,7 @@
 #include "shared/loop/event_loop.h"
 #include "shared/cluster/raft.h"
 #include "shared/cluster/raft_storage.h"
+#include "shared/util/crc.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -81,14 +82,13 @@ std::vector<std::string> names_in(const std::string& dir)
 
 TEST_CASE("crc32c is the Castagnoli polynomial")
 {
-    CHECK(st::crc32c("123456789", 9) == 0xE3069283u);
-    CHECK(st::crc32c("", 0) == 0u);
+    CHECK(socketley::crc::crc32c("123456789", 9) == 0xE3069283u);
+    CHECK(socketley::crc::crc32c("", 0) == 0u);
 }
 
 TEST_CASE("crc32c agrees with a bitwise reference at every length, offset and seed")
 {
-    // The instruction path steps eight bytes at a time, so its tails and odd
-    // starts are what a single vector does not reach.
+    // Both paths step eight bytes at a time, so their tails and odd starts are what a single vector does not reach.
     auto reference = [](const unsigned char* p, size_t n, uint32_t crc) {
         crc = ~crc;
         while (n--)
@@ -110,7 +110,10 @@ TEST_CASE("crc32c agrees with a bitwise reference at every length, offset and se
         for (size_t n : { 0u, 1u, 7u, 8u, 9u, 15u, 16u, 17u, 63u, 64u, 65u, 1000u, 4096u })
         {
             const uint32_t seed = static_cast<uint32_t>(off * 2654435761u + n);
-            CHECK(st::crc32c(buf.data() + off, n, seed) == reference(buf.data() + off, n, seed));
+            const uint32_t want = reference(buf.data() + off, n, seed);
+            CHECK(socketley::crc::crc32c(buf.data() + off, n, seed) == want);
+            // The table a CPU without SSE4.2 falls back to, which this one never takes on its own.
+            CHECK(~socketley::crc::detail::sliced(socketley::crc::detail::castagnoli, ~seed, buf.data() + off, n) == want);
         }
 }
 

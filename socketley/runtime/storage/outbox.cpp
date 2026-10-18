@@ -102,7 +102,7 @@ bool outbox::open(const std::string& dir, std::string_view sub, uint32_t shard, 
         if (!h.u32(len) || !h.u32(crc) || len > record_cap || text.size() - pos - 8 < len)
             break;
         const std::string_view payload = std::string_view(text).substr(pos + 8, len);
-        if (journal_detail::crc32(payload) != crc)
+        if (crc::crc32(payload) != crc)
             break;
         pos += 8 + len;
         bytes::reader r(payload);
@@ -195,7 +195,7 @@ void outbox::append_record(char type, uint64_t id, std::string_view payload, uin
     rec += payload;
     bytes::writer h;
     h.u32(static_cast<uint32_t>(rec.size()));
-    h.u32(journal_detail::crc32(rec));
+    h.u32(crc::crc32(rec));
     m_buf += h.take();
     m_buf += rec;
     m_appended += 8 + rec.size();

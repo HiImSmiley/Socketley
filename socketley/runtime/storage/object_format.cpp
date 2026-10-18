@@ -8,7 +8,8 @@
 #include <unordered_map>
 
 #include "compression.h"
-#include "../../shared/cluster/raft_storage.h"
+#include "../../shared/util/crc.h"
+#include "../../shared/util/byte_codec.h"
 #include "../../shared/util/number_parse.h"
 
 namespace socketley::storage
@@ -56,23 +57,9 @@ slot_layout layout_of(size_t meta_end, size_t header_len)
     return l;
 }
 
-void put_u32(std::string& out, uint32_t v)
-{
-    char b[4];
-    std::memcpy(b, &v, 4);
-    out.append(b, 4);
-}
-
-void put_u64(std::string& out, uint64_t v)
-{
-    char b[8];
-    std::memcpy(b, &v, 8);
-    out.append(b, 8);
-}
-
 void put_str(std::string& out, std::string_view s)
 {
-    put_u32(out, static_cast<uint32_t>(s.size()));
+    bytes::append32(out, static_cast<uint32_t>(s.size()));
     out.append(s);
 }
 
@@ -309,13 +296,13 @@ void set_class_extra(object_meta& m, std::string_view cls)
 
 void encode_meta(std::string& out, std::string_view key, const object_meta& m)
 {
-    put_u64(out, m.size);
-    put_u64(out, static_cast<uint64_t>(m.mtime_ms));
+    bytes::append64(out, m.size);
+    bytes::append64(out, static_cast<uint64_t>(m.mtime_ms));
     out.append(reinterpret_cast<const char*>(m.md5.data()), 16);
-    put_u32(out, m.parts);
+    bytes::append32(out, m.parts);
     put_str(out, key);
     put_str(out, m.content_type.str());
-    put_u32(out, static_cast<uint32_t>(m.extra.size() + (m.checksum ? 1 : 0)));
+    bytes::append32(out, static_cast<uint32_t>(m.extra.size() + (m.checksum ? 1 : 0)));
     for (const auto& [n, v] : m.extra)
     {
         put_str(out, n);
@@ -983,14 +970,14 @@ std::string encode_part_list(const part_list& l, uint64_t total)
 {
     const uint32_t width = checksum_width(l);
     std::string out(width ? part_list_sums_magic : part_list_magic);
-    put_u64(out, total);
-    put_u32(out, static_cast<uint32_t>(l.sizes.size()));
+    bytes::append64(out, total);
+    bytes::append32(out, static_cast<uint32_t>(l.sizes.size()));
     if (width)
-        put_u32(out, width);
+        bytes::append32(out, width);
     for (size_t i = 0; i < l.sizes.size(); ++i)
     {
-        put_u32(out, i < l.numbers.size() ? l.numbers[i] : 0);
-        put_u64(out, l.sizes[i]);
+        bytes::append32(out, i < l.numbers.size() ? l.numbers[i] : 0);
+        bytes::append64(out, l.sizes[i]);
         if (width)
             out += l.checksums[i];
     }
@@ -1044,14 +1031,14 @@ std::string encode_object_header(std::string_view key, const object_meta& m, siz
     std::string h;
     h.reserve(len);
     h.append(object_magic);
-    put_u32(h, object_version);
-    put_u32(h, static_cast<uint32_t>(len));
-    put_u32(h, static_cast<uint32_t>(body.size()));
+    bytes::append32(h, object_version);
+    bytes::append32(h, static_cast<uint32_t>(len));
+    bytes::append32(h, static_cast<uint32_t>(body.size()));
     // Over the prelude before the checksum and then the body, so a flipped bit
     // anywhere in what the header says is caught.
-    uint32_t crc = raft::storage::crc32c(h.data(), h.size());
-    crc          = raft::storage::crc32c(body.data(), body.size(), crc);
-    put_u32(h, crc);
+    uint32_t crc = crc::crc32c(h.data(), h.size());
+    crc          = crc::crc32c(body.data(), body.size(), crc);
+    bytes::append32(h, crc);
     h.append(body);
     h.resize(len, '\0');
     return h;
@@ -1085,8 +1072,8 @@ decoded_header decode_object_header(std::string_view bytes)
         return d;
     }
     const std::string_view body = bytes.substr(prelude_len, body_len);
-    uint32_t want = raft::storage::crc32c(bytes.data(), 20);
-    want          = raft::storage::crc32c(body.data(), body.size(), want);
+    uint32_t want = crc::crc32c(bytes.data(), 20);
+    want          = crc::crc32c(body.data(), body.size(), want);
     if (want != crc)
         return d;
     if (!decode_meta(body, d.key, d.meta))
@@ -1114,8 +1101,8 @@ decoded_header decode_object_header(std::string_view bytes)
         if (slot_head + len > l.room || bytes.size() < off + slot_head + len || seq <= d.tag_seq)
             continue;
         const std::string_view payload = bytes.substr(off + slot_head, len);
-        uint32_t c = raft::storage::crc32c(bytes.data() + off, 20);
-        c          = raft::storage::crc32c(payload.data(), payload.size(), c);
+        uint32_t c = crc::crc32c(bytes.data() + off, 20);
+        c          = crc::crc32c(payload.data(), payload.size(), c);
         if (c != scrc)
             continue;
         const bool repl = bytes.substr(off, 8) == repl_slot_magic;
@@ -1183,11 +1170,11 @@ std::string encode_tag_slot(const decoded_header& d, const object_meta& want, ui
     if (slot_head + payload.size() > l.room)
         return {};
     std::string s(repl ? repl_slot_magic : lock ? lock_slot_magic : slot_magic);
-    put_u64(s, d.tag_seq + 1);
-    put_u32(s, static_cast<uint32_t>(payload.size()));
-    uint32_t c = raft::storage::crc32c(s.data(), s.size());
-    c          = raft::storage::crc32c(payload.data(), payload.size(), c);
-    put_u32(s, c);
+    bytes::append64(s, d.tag_seq + 1);
+    bytes::append32(s, static_cast<uint32_t>(payload.size()));
+    uint32_t c = crc::crc32c(s.data(), s.size());
+    c          = crc::crc32c(payload.data(), payload.size(), c);
+    bytes::append32(s, c);
     s.append(payload);
     at = l.off[d.tag_slot == 0 ? 1 : 0];
     return s;
@@ -1203,10 +1190,10 @@ std::string encode_tag_slot(const decoded_header& d, std::string_view tags, uint
 std::string encode_journal_header(uint32_t shard, uint32_t nshards)
 {
     std::string h(journal_magic);
-    put_u32(h, journal_format);
-    put_u32(h, shard);
-    put_u32(h, nshards);
-    put_u32(h, 0);
+    bytes::append32(h, journal_format);
+    bytes::append32(h, shard);
+    bytes::append32(h, nshards);
+    bytes::append32(h, 0);
     return h;
 }
 
@@ -1233,8 +1220,8 @@ namespace
 
 void frame_record(std::string& out, std::string_view payload)
 {
-    put_u32(out, static_cast<uint32_t>(payload.size()));
-    put_u32(out, raft::storage::crc32c(payload.data(), payload.size()));
+    bytes::append32(out, static_cast<uint32_t>(payload.size()));
+    bytes::append32(out, crc::crc32c(payload.data(), payload.size()));
     out.append(payload);
 }
 
@@ -1252,7 +1239,7 @@ void encode_delete_record(std::string& out, std::string_view key, int64_t mtime_
 {
     std::string p;
     p.push_back(static_cast<char>(record_type::del));
-    put_u64(p, static_cast<uint64_t>(mtime_ms));
+    bytes::append64(p, static_cast<uint64_t>(mtime_ms));
     put_str(p, key);
     frame_record(out, p);
 }
@@ -1292,7 +1279,7 @@ decoded_record decode_journal_record(std::string_view bytes)
         return d;
 
     const std::string_view payload = bytes.substr(8, len);
-    if (raft::storage::crc32c(payload.data(), payload.size()) != crc)
+    if (crc::crc32c(payload.data(), payload.size()) != crc)
     {
         d.status = record_status::corrupt;
         return d;

@@ -3,6 +3,8 @@
 #include "../loop/event_loop.h"
 #include "../persist/replaced_file.h"
 #include "../persist/read_file.h"
+#include "../util/crc.h"
+#include "../util/byte_codec.h"
 
 #include <algorithm>
 #include <array>
@@ -18,98 +20,9 @@
 namespace socketley::raft::storage
 {
 
-// ─── CRC32C ───
-
-namespace {
-
-constexpr std::array<uint32_t, 256> make_crc_table()
-{
-    std::array<uint32_t, 256> t{};
-    for (uint32_t i = 0; i < 256; ++i)
-    {
-        uint32_t c = i;
-        for (int k = 0; k < 8; ++k)
-            c = (c & 1) ? (c >> 1) ^ 0x82F63B78u : c >> 1;
-        t[i] = c;
-    }
-    return t;
-}
-
-constexpr std::array<uint32_t, 256> crc_table = make_crc_table();
-
-uint32_t crc32c_table(const unsigned char* p, size_t len, uint32_t crc)
-{
-    crc = ~crc;
-    for (size_t i = 0; i < len; ++i)
-        crc = crc_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
-    return ~crc;
-}
-
-#if defined(__x86_64__)
-// SSE4.2's crc32 instruction computes this very polynomial eight bytes a step.
-__attribute__((target("sse4.2")))
-uint32_t crc32c_sse42(const unsigned char* p, size_t len, uint32_t crc)
-{
-    uint64_t c = static_cast<uint32_t>(~crc);
-    while (len >= 8)
-    {
-        uint64_t v;
-        std::memcpy(&v, p, 8);
-        c = __builtin_ia32_crc32di(c, v);
-        p += 8;
-        len -= 8;
-    }
-    uint32_t c32 = static_cast<uint32_t>(c);
-    while (len--)
-        c32 = __builtin_ia32_crc32qi(c32, *p++);
-    return ~c32;
-}
-#endif
-
-}   // namespace
-
-uint32_t crc32c(const void* data, size_t len, uint32_t crc)
-{
-    const auto* p = static_cast<const unsigned char*>(data);
-#if defined(__x86_64__)
-    static const bool hw = __builtin_cpu_supports("sse4.2");
-    if (hw)
-        return crc32c_sse42(p, len, crc);
-#endif
-    return crc32c_table(p, len, crc);
-}
-
 // ─── records ───
 
 namespace {
-
-void put_u32(std::string& o, uint32_t v)
-{
-    for (int b = 0; b < 4; ++b)
-        o += static_cast<char>((v >> (8 * b)) & 0xFF);
-}
-
-void put_u64(std::string& o, uint64_t v)
-{
-    for (int b = 0; b < 8; ++b)
-        o += static_cast<char>((v >> (8 * b)) & 0xFF);
-}
-
-uint32_t get_u32(const char* p)
-{
-    uint32_t v = 0;
-    for (int b = 0; b < 4; ++b)
-        v |= static_cast<uint32_t>(static_cast<unsigned char>(p[b])) << (8 * b);
-    return v;
-}
-
-uint64_t get_u64(const char* p)
-{
-    uint64_t v = 0;
-    for (int b = 0; b < 8; ++b)
-        v |= static_cast<uint64_t>(static_cast<unsigned char>(p[b])) << (8 * b);
-    return v;
-}
 
 // Two record types only a segment's opening image uses: its base snapshot, and the mark that the image is whole.
 constexpr uint8_t rec_base = 5;
@@ -117,10 +30,10 @@ constexpr uint8_t rec_seal = 6;
 
 void frame(std::string& out, uint8_t type, const std::string& payload)
 {
-    put_u32(out, static_cast<uint32_t>(payload.size()));
-    uint32_t crc = crc32c(&type, 1);
-    crc = crc32c(payload.data(), payload.size(), crc);
-    put_u32(out, crc);
+    bytes::append32(out, static_cast<uint32_t>(payload.size()));
+    uint32_t crc = crc::crc32c(&type, 1);
+    crc = crc::crc32c(payload.data(), payload.size(), crc);
+    bytes::append32(out, crc);
     out += static_cast<char>(type);
     out += payload;
 }
@@ -128,8 +41,8 @@ void frame(std::string& out, uint8_t type, const std::string& payload)
 void append_base(std::string& out, index_t index, term_t term)
 {
     std::string p;
-    put_u64(p, index);
-    put_u64(p, term);
+    bytes::append64(p, index);
+    bytes::append64(p, term);
     frame(out, rec_base, p);
 }
 
@@ -147,7 +60,7 @@ struct cursor
     {
         if (in.size() - off < 8)
             return false;
-        v = get_u64(in.data() + off);
+        v = bytes::load64(in.data() + off);
         off += 8;
         return true;
     }
@@ -156,7 +69,7 @@ struct cursor
     {
         if (in.size() - off < 4)
             return false;
-        v = get_u32(in.data() + off);
+        v = bytes::load32(in.data() + off);
         off += 4;
         return true;
     }
@@ -197,14 +110,14 @@ bool next_record(std::string_view bytes, size_t off, uint8_t& type, std::string_
 {
     if (bytes.size() - off < record_header)
         return false;
-    const uint32_t len = get_u32(bytes.data() + off);
-    const uint32_t crc = get_u32(bytes.data() + off + 4);
+    const uint32_t len = bytes::load32(bytes.data() + off);
+    const uint32_t crc = bytes::load32(bytes.data() + off + 4);
     if (len > max_record || bytes.size() - off - record_header < len)
         return false;
     type = static_cast<uint8_t>(bytes[off + 8]);
     payload = bytes.substr(off + record_header, len);
-    uint32_t c = crc32c(&type, 1);
-    c = crc32c(payload.data(), payload.size(), c);
+    uint32_t c = crc::crc32c(&type, 1);
+    c = crc::crc32c(payload.data(), payload.size(), c);
     if (c != crc)
         return false;
     next = off + record_header + len;
@@ -235,8 +148,8 @@ index_t last_of(const persisted& st)
 void append_hard(std::string& out, const hard_state& h)
 {
     std::string p;
-    put_u64(p, h.term);
-    put_u64(p, h.vote);
+    bytes::append64(p, h.term);
+    bytes::append64(p, h.vote);
     frame(out, static_cast<uint8_t>(record::hard), p);
 }
 
@@ -244,10 +157,10 @@ void append_entry(std::string& out, const entry& e)
 {
     std::string p;
     p.reserve(21 + e.data.size());
-    put_u64(p, e.term);
-    put_u64(p, e.index);
+    bytes::append64(p, e.term);
+    bytes::append64(p, e.index);
     p += static_cast<char>(e.type);
-    put_u32(p, static_cast<uint32_t>(e.data.size()));
+    bytes::append32(p, static_cast<uint32_t>(e.data.size()));
     p += e.data;
     frame(out, static_cast<uint8_t>(record::entry), p);
 }
@@ -255,22 +168,22 @@ void append_entry(std::string& out, const entry& e)
 void append_truncate(std::string& out, index_t from)
 {
     std::string p;
-    put_u64(p, from);
+    bytes::append64(p, from);
     frame(out, static_cast<uint8_t>(record::truncate), p);
 }
 
 void append_snapshot(std::string& out, const snapshot& s)
 {
     std::string p;
-    put_u64(p, s.index);
-    put_u64(p, s.term);
-    put_u32(p, static_cast<uint32_t>(s.voters.size()));
+    bytes::append64(p, s.index);
+    bytes::append64(p, s.term);
+    bytes::append32(p, static_cast<uint32_t>(s.voters.size()));
     for (node_id v : s.voters)
-        put_u64(p, v);
-    put_u32(p, static_cast<uint32_t>(s.learners.size()));
+        bytes::append64(p, v);
+    bytes::append32(p, static_cast<uint32_t>(s.learners.size()));
     for (node_id l : s.learners)
-        put_u64(p, l);
-    put_u32(p, static_cast<uint32_t>(s.data.size()));
+        bytes::append64(p, l);
+    bytes::append32(p, static_cast<uint32_t>(s.data.size()));
     p += s.data;
     frame(out, static_cast<uint8_t>(record::snapshot), p);
 }
@@ -542,8 +455,8 @@ bool recover(const std::string& dir, recovery& out, std::string& err)
         bool sealed = false;
         if (next_record(bytes, 0, type, payload, next) && type == rec_base && payload.size() == 16)
         {
-            base_index = get_u64(payload.data());
-            base_term  = get_u64(payload.data() + 8);
+            base_index = bytes::load64(payload.data());
+            base_term  = bytes::load64(payload.data() + 8);
             for (size_t off = next; next_record(bytes, off, type, payload, next); off = next)
                 if (type == rec_seal)
                 {

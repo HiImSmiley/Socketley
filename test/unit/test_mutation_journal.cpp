@@ -84,7 +84,7 @@ TEST_CASE("the record checksum is CRC-32 at every length and alignment")
         }
         return c ^ 0xFFFFFFFFu;
     };
-    CHECK(journal_detail::crc32("123456789") == 0xCBF43926u);
+    CHECK(socketley::crc::crc32("123456789") == 0xCBF43926u);
     std::string buf;
     uint32_t    x = 0x12345678u;
     for (int i = 0; i < 300; ++i)
@@ -94,6 +94,6 @@ TEST_CASE("the record checksum is CRC-32 at every length and alignment")
     }
     for (size_t off = 0; off < 8; ++off)
         for (size_t len = 0; len + off <= 140; ++len)
-            CHECK(journal_detail::crc32(std::string_view(buf).substr(off, len))
+            CHECK(socketley::crc::crc32(std::string_view(buf).substr(off, len))
                   == bitwise(std::string_view(buf).substr(off, len)));
 }

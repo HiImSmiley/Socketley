@@ -10,7 +10,7 @@
 #include "runtime/storage/s3_sigv4_auth.h"
 #include "shared/loop/event_loop.h"
 #include "shared/loop/file_io.h"
-#include "shared/cluster/raft_storage.h"
+#include "shared/util/crc.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -104,13 +104,14 @@ TEST_CASE("a checksum over pieces is the checksum over the whole, whatever the c
 TEST_CASE("crc32c takes the same value on the hardware path and the table path for every length and alignment")
 {
     const std::string data = pattern(300, 3);
-    // The table path is the raft one, which is what the object header is checksummed with.
+    // The table is what a CPU without SSE4.2 checks an object header with.
     for (size_t off = 0; off < 9; ++off)
         for (size_t len = 0; len < 40; ++len)
         {
             checksum_stream s(checksum_algo::crc32c);
             s.update(data.data() + off, len);
-            const uint32_t want = raft::storage::crc32c(data.data() + off, len);
+            const uint32_t want = ~socketley::crc::detail::sliced(socketley::crc::detail::castagnoli, ~0u,
+                                                                   data.data() + off, len);
             std::string raw = s.peek_raw();
             uint32_t got = 0;
             for (unsigned char ch : raw)

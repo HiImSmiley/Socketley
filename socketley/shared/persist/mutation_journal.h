@@ -19,56 +19,9 @@
 #include <sys/stat.h>
 
 #include "../loop/blocking_write.h"
+#include "../util/crc.h"
+#include "../util/byte_codec.h"
 
-// CRC-32 (IEEE), table built at compile time like cache_shard_map's CRC-16,
-// because pasting 256 constants is how a table acquires a typo.
-namespace journal_detail
-{
-// Slicing-by-8: row k is the CRC of a byte followed by k zero bytes, so eight
-// bytes fold in one step of eight independent lookups.
-struct crc32_table
-{
-    uint32_t v[8][256];
-};
-
-inline constexpr crc32_table make_crc32_table()
-{
-    crc32_table t{};
-    for (uint32_t i = 0; i < 256; ++i)
-    {
-        uint32_t c = i;
-        for (int k = 0; k < 8; ++k)
-            c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-        t.v[0][i] = c;
-    }
-    for (uint32_t i = 0; i < 256; ++i)
-        for (int k = 1; k < 8; ++k)
-            t.v[k][i] = t.v[0][t.v[k - 1][i] & 0xFFu] ^ (t.v[k - 1][i] >> 8);
-    return t;
-}
-
-inline constexpr crc32_table crc32_tab = make_crc32_table();
-
-inline uint32_t crc32(std::string_view s)
-{
-    const auto* p = reinterpret_cast<const unsigned char*>(s.data());
-    size_t      n = s.size();
-    uint32_t    c = 0xFFFFFFFFu;
-    const auto& t = crc32_tab.v;
-    while (n >= 8)
-    {
-        const uint32_t lo = c ^ (uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16
-                                 | uint32_t(p[3]) << 24);
-        c = t[7][lo & 0xFFu] ^ t[6][(lo >> 8) & 0xFFu] ^ t[5][(lo >> 16) & 0xFFu] ^ t[4][lo >> 24]
-          ^ t[3][p[4]] ^ t[2][p[5]] ^ t[1][p[6]] ^ t[0][p[7]];
-        p += 8;
-        n -= 8;
-    }
-    while (n--)
-        c = t[0][(c ^ *p++) & 0xFFu] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
-}
-} // namespace journal_detail
 
 class mutation_journal
 {
@@ -210,7 +163,7 @@ public:
             h.reserve(head);
             h.append(magic, sizeof(magic));
             char len4[4];
-            put32(len4, static_cast<uint32_t>(owner.size()));
+            socketley::bytes::store32(len4, static_cast<uint32_t>(owner.size()));
             h.append(len4, 4);
             h.append(owner.data(), owner.size());
             if (!socketley::write_all(fd, h.data(), h.size()))
@@ -268,8 +221,8 @@ public:
             return;
         }
         char head[record_head];
-        put32(head,     static_cast<uint32_t>(record.size()));
-        put32(head + 4, journal_detail::crc32(record));
+        socketley::bytes::store32(head,     static_cast<uint32_t>(record.size()));
+        socketley::bytes::store32(head + 4, socketley::crc::crc32(record));
         m_pending.append(head, record_head);
         m_pending.append(record.data(), record.size());
     }
@@ -327,20 +280,6 @@ public:
     mutation_journal& operator=(const mutation_journal&) = delete;
 
 private:
-    static void put32(char* at, uint32_t v)
-    {
-        for (int i = 0; i < 4; ++i)
-            at[i] = static_cast<char>((v >> (8 * i)) & 0xFF);
-    }
-
-    static uint32_t get32(const char* at)
-    {
-        uint32_t v = 0;
-        for (int i = 0; i < 4; ++i)
-            v |= static_cast<uint32_t>(static_cast<unsigned char>(at[i])) << (8 * i);
-        return v;
-    }
-
     static bool slurp(const std::string& path, std::string& out)
     {
         const int fd = ::open(path.c_str(), O_RDONLY);
@@ -376,7 +315,7 @@ private:
         if (data.size() < sizeof(magic) + 4
             || std::memcmp(data.data(), magic, sizeof(magic)) != 0)
             return false;
-        const uint32_t olen = get32(data.data() + sizeof(magic));
+        const uint32_t olen = socketley::bytes::load32(data.data() + sizeof(magic));
         if (data.size() < sizeof(magic) + 4 + olen)
             return false;
         owner.assign(data.data() + sizeof(magic) + 4, olen);
@@ -393,12 +332,12 @@ private:
         size_t p = off;
         while (data.size() - p >= record_head)
         {
-            const uint32_t len = get32(data.data() + p);
-            const uint32_t crc = get32(data.data() + p + 4);
+            const uint32_t len = socketley::bytes::load32(data.data() + p);
+            const uint32_t crc = socketley::bytes::load32(data.data() + p + 4);
             if (data.size() - p - record_head < len)
                 break;
             const std::string_view rec(data.data() + p + record_head, len);
-            if (journal_detail::crc32(rec) != crc)
+            if (socketley::crc::crc32(rec) != crc)
                 break;
             if (apply)
                 (*apply)(rec);
