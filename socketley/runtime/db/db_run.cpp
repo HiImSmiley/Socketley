@@ -30,6 +30,7 @@
 #include "../../shared/http/status.h"
 #include "../../shared/http/request_head.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/crypto/mac.h"
 
 namespace socketley::db
 {
@@ -1182,7 +1183,7 @@ bool db_run::who_of(const request& rq, principal& who, bool& by_cookie, std::str
             return false;
         }
         for (const auto& k : m_keys)
-            if (k.secret.size() == token.size() && CRYPTO_memcmp(k.secret.data(), token.data(), token.size()) == 0)
+            if (crypto::secure_equal(k.secret, token))
             {
                 who = principal{principal::key, k.name};
                 return true;

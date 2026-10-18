@@ -33,6 +33,8 @@
 #include "../shared/http/url.h"
 #include "../shared/http/status.h"
 #include "../shared/util/base64.h"
+#include "../shared/crypto/mac.h"
+#include "../shared/util/hex.h"
 
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -216,18 +218,9 @@ server::~server() = default;
 std::string server::seal(std::string_view user, int64_t expires) const
 {
     const std::string msg = std::string(user) + "." + std::to_string(expires);
-    unsigned char mac[32];
-    unsigned int n = 0;
     // No MAC is no seal, or a cookie without one would be checked against one without one.
-    if (!HMAC(EVP_sha256(), m_key.data(), static_cast<int>(m_key.size()),
-              reinterpret_cast<const unsigned char*>(msg.data()), msg.size(), mac, &n) ||
-        n != sizeof mac)
-        return {};
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string out = msg + ".";
-    for (unsigned i = 0; i < n; ++i)
-        out += {hex[mac[i] >> 4], hex[mac[i] & 15]};
-    return out;
+    const std::string mac = socketley::crypto::hmac_sha256(m_key, msg);
+    return mac.empty() ? std::string{} : msg + "." + socketley::hex_encode(mac);
 }
 
 std::string server::session_of(const request& r) const
@@ -259,7 +252,7 @@ std::string server::session_of(const request& r) const
     if (expires < static_cast<int64_t>(std::time(nullptr)))
         return {};
     const std::string want = seal(user, expires);
-    if (want.empty() || want.size() != v.size() || CRYPTO_memcmp(want.data(), v.data(), v.size()) != 0)
+    if (want.empty() || !socketley::crypto::secure_equal(want, v))
         return {};
     return user;
 }

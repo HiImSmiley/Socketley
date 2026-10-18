@@ -35,6 +35,7 @@
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/random_id.h"
+#include "../../shared/crypto/mac.h"
 
 namespace socketley::idp
 {
@@ -994,9 +995,7 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
     }
     const client* cl = find_client(id);
     const bool authenticated =
-        cl && (cl->is_public() ? secret.empty()
-                               : secret.size() == cl->secret.size() &&
-                                     CRYPTO_memcmp(secret.data(), cl->secret.data(), secret.size()) == 0);
+        cl && (cl->is_public() ? secret.empty() : crypto::secure_equal(secret, cl->secret));
     if (!authenticated)
     {
         json_error(c, 401, "invalid_client", "the client is not known or its secret is not right",

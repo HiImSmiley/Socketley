@@ -26,6 +26,7 @@
 #include "../../shared/util/size_suffix.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/crypto/mac.h"
 
 namespace socketley::storage
 {
@@ -812,7 +813,7 @@ bool sigv4_authenticator::issue_session(std::string_view access_key, int64_t exp
     out.secret     = sts_secret(g, parent);
     out.token      = sts_token(g, parent);
     out.expires    = expires;
-    return true;
+    return !out.secret.empty() && !out.token.empty();
 }
 
 std::string sigv4_authenticator::seal_key(std::string_view user_id, std::string_view purpose) const
@@ -821,12 +822,7 @@ std::string sigv4_authenticator::seal_key(std::string_view user_id, std::string_
     const std::string_view secret = key.empty() ? std::string_view{} : m_creds.secret(key);
     if (secret.empty())
         return {};
-    unsigned char out[32];
-    unsigned int n = 0;
-    if (!HMAC(EVP_sha256(), secret.data(), static_cast<int>(secret.size()), reinterpret_cast<const unsigned char*>(purpose.data()),
-              purpose.size(), out, &n) || n != 32)
-        return {};
-    return std::string(reinterpret_cast<char*>(out), n);
+    return crypto::hmac_sha256(secret, purpose);
 }
 
 bool sigv4_authenticator::issue_session_as(std::string_view user_id, int64_t expires, std::string_view policy,
@@ -1067,7 +1063,7 @@ auth_verdict sigv4_authenticator::authorize_basic(std::string_view access_key, s
         want = m_creds.secret(access_key);
     }
     // Compared in constant time, as a signature is, so the secret is not guessed by how long a refusal takes.
-    if (want.empty() || want.size() != secret.size() || CRYPTO_memcmp(want.data(), secret.data(), want.size()) != 0)
+    if (want.empty() || !crypto::secure_equal(want, secret))
     {
         v.allowed = false;
         v.error   = {"AccessDenied", "The access key or secret given is not one of this runtime's.", 401};
@@ -1096,7 +1092,7 @@ auth_verdict sigv4_authenticator::authorize_password(std::string_view user, std:
     if (it == m_logins.end())
         ok = (password_matches(none, password), false);
     else if (const auto seen = m_logins_seen.find(user); seen != m_logins_seen.end() && seen->second.until > now &&
-             seen->second.hash == it->second.hash && CRYPTO_memcmp(seen->second.given.data(), given.data(), given.size()) == 0)
+             seen->second.hash == it->second.hash && !given.empty() && crypto::secure_equal(seen->second.given, given))
         ok = true;
     else if ((ok = password_matches(it->second.hash, password)))
     {
@@ -1176,7 +1172,7 @@ auth_verdict sigv4_authenticator::authorize_ui_session(std::string_view access_k
         }
     const std::string_view secret = m_creds.secret(access_key);
     const std::string want = secret.empty() ? std::string{} : hmac_sha256_hex(secret, ui_session_text(access_key, issued_ms, expires_ms));
-    if (want.empty() || want.size() != mac_hex.size() || CRYPTO_memcmp(want.data(), mac_hex.data(), want.size()) != 0)
+    if (want.empty() || !crypto::secure_equal(want, mac_hex))
     {
         v.allowed = false;
         v.error   = {"AccessDenied", "The session is not one of this runtime's.", 401};
@@ -1202,13 +1198,8 @@ auth_verdict sigv4_authenticator::authorize_post(const post_signature& sig)
         const std::string_view key = m_creds.secret(sig.v2_access_key);
         if (key.empty())
             return refuse("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403);
-        unsigned char raw[20];
-        unsigned int len = sizeof raw;
-        HMAC(EVP_sha1(), key.data(), static_cast<int>(key.size()), reinterpret_cast<const unsigned char*>(sig.policy.data()),
-             sig.policy.size(), raw, &len);
-        const std::string want = base64::encode(std::string_view(reinterpret_cast<const char*>(raw), len));
-        if (sig.v2_signature.size() != want.size() ||
-            CRYPTO_memcmp(sig.v2_signature.data(), want.data(), want.size()) != 0)
+        const std::string raw = crypto::hmac_sha1(key, sig.policy);
+        if (raw.empty() || !crypto::secure_equal(sig.v2_signature, base64::encode(raw)))
             return refuse("SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided. Check your key and signing method.", 403);
         v.allowed   = true;
         v.principal = std::string(sig.v2_access_key);
@@ -1235,19 +1226,10 @@ auth_verdict sigv4_authenticator::authorize_post(const post_signature& sig)
     const std::string_view secret = m_creds.secret(rest);
     if (secret.empty())
         return refuse("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403);
-    auto mac = [](std::string_view key, std::string_view msg)
-    {
-        std::string out(32, '\0');
-        unsigned int len = 32;
-        HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), reinterpret_cast<const unsigned char*>(msg.data()),
-             msg.size(), reinterpret_cast<unsigned char*>(out.data()), &len);
-        return out;
-    };
+    const auto mac = [](std::string_view key, std::string_view msg) { return crypto::hmac_sha256(key, msg); };
     const std::string signing = mac(mac(mac(mac("AWS4" + std::string(secret), date), region), service), "aws4_request");
-    const std::string want = mac(signing, sig.policy);
-    const std::string got_hex(sig.signature);
-    const std::string want_hex = hex(reinterpret_cast<const uint8_t*>(want.data()), want.size());
-    if (got_hex.size() != want_hex.size() || CRYPTO_memcmp(got_hex.data(), want_hex.data(), want_hex.size()) != 0)
+    const std::string want = signing.empty() ? std::string{} : mac(signing, sig.policy);
+    if (want.empty() || !crypto::secure_equal(sig.signature, hex(reinterpret_cast<const uint8_t*>(want.data()), want.size())))
         return refuse("SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided. Check your key and signing method.", 403);
     v.allowed   = true;
     v.principal = std::string(rest);

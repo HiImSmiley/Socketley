@@ -15,6 +15,7 @@
 #include "checksum.h"
 #include "compression.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/crypto/mac.h"
 
 namespace socketley::storage
 {
@@ -73,10 +74,7 @@ constexpr std::string_view parts_mac_label = "socketley-sse-c-parts-v1";
 sse_digest hmac_sha256(const uint8_t* key, size_t key_len, std::string_view data)
 {
     sse_digest out{};
-    unsigned int len = 0;
-    if (!HMAC(EVP_sha256(), key, static_cast<int>(key_len), reinterpret_cast<const unsigned char*>(data.data()),
-              data.size(), out.data(), &len) ||
-        len != out.size())
+    if (!crypto::hmac_sha256(std::string_view(reinterpret_cast<const char*>(key), key_len), data, out.data()))
         std::abort();
     return out;
 }

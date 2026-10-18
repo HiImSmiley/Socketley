@@ -9,6 +9,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include "../../shared/util/hex.h"
+#include "../../shared/crypto/mac.h"
 
 namespace socketley::storage
 {
@@ -114,12 +115,8 @@ inline std::string sha256_hex(std::string_view s)
 // HMAC-SHA256 of `msg` under `key`, in hex, as the signatures of media URLs and of the web interface's sessions are.
 inline std::string hmac_sha256_hex(std::string_view key, std::string_view msg)
 {
-    uint8_t      out[EVP_MAX_MD_SIZE];
-    unsigned int n = 0;
-    if (!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), reinterpret_cast<const unsigned char*>(msg.data()),
-              msg.size(), out, &n))
-        return {};
-    return hex(out, n);
+    uint8_t out[crypto::sha256_bytes];
+    return crypto::hmac_sha256(key, msg, out) ? hex(out, sizeof out) : std::string{};
 }
 
 inline md5_t md5_of(std::string_view s)

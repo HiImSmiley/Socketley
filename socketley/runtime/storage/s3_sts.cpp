@@ -8,6 +8,7 @@
 #include "s3_names.h"
 #include "s3_xml.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/crypto/mac.h"
 
 namespace socketley::storage
 {
@@ -27,11 +28,7 @@ std::string mac(std::string_view key, std::string_view label, std::string_view m
     in.append(label);
     in.push_back('\0');
     in.append(msg);
-    std::string out(mac_bytes, '\0');
-    unsigned int len = mac_bytes;
-    HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), reinterpret_cast<const unsigned char*>(in.data()),
-         in.size(), reinterpret_cast<unsigned char*>(out.data()), &len);
-    return out;
+    return crypto::hmac_sha256(key, in);
 }
 
 // The token's body: its version, the expiry, and the parent key, the access key and the policy, each after its
@@ -85,7 +82,8 @@ std::string sts_new_access_key()
 std::string sts_token(const session_grant& g, std::string_view parent_secret)
 {
     const std::string p = payload_of(g);
-    return base64url::encode(p + mac(parent_secret, "token", p));
+    const std::string m = mac(parent_secret, "token", p);
+    return m.empty() ? std::string{} : base64url::encode(p + m);
 }
 
 bool sts_parse(std::string_view token, session_grant& out)
@@ -128,7 +126,7 @@ bool sts_sealed_by(std::string_view token, std::string_view parent_secret)
         return false;
     const std::string_view p(raw.data(), raw.size() - mac_bytes);
     const std::string want = mac(parent_secret, "token", p);
-    return CRYPTO_memcmp(want.data(), raw.data() + p.size(), mac_bytes) == 0;
+    return !want.empty() && crypto::secure_equal(want, std::string_view(raw).substr(p.size()));
 }
 
 std::string sts_secret(const session_grant& g, std::string_view parent_secret)

@@ -14,6 +14,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/http/url.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/crypto/mac.h"
 
 namespace socketley::idp
 {
@@ -452,8 +453,7 @@ bool verify_secret_token(std::string_view secret, std::string_view typ, std::str
     return read_token("HS256", "self", typ, issuer, token, now,
                       [secret](std::string_view input, std::string_view sig) {
                           const std::string want = hs256(secret, input);
-                          return !want.empty() && sig.size() == want.size() &&
-                                 CRYPTO_memcmp(sig.data(), want.data(), want.size()) == 0;
+                          return !want.empty() && crypto::secure_equal(sig, want);
                       },
                       out, why);
 }

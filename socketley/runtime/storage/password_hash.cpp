@@ -10,6 +10,7 @@
 #include "checksum.h"
 #include "scrypt.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/crypto/mac.h"
 
 namespace socketley::storage
 {
@@ -70,7 +71,7 @@ bool password_matches(std::string_view hash, std::string_view password)
     std::string got;
     if (!parse(hash, h) || !derive(password, h.salt, h.ln, h.r, h.p, got))
         return false;
-    return CRYPTO_memcmp(got.data(), h.want.data(), h.want.size()) == 0;
+    return crypto::secure_equal(got, h.want);
 }
 
 void password_matches_many(std::span<password_check> checks)
@@ -93,7 +94,7 @@ void password_matches_many(std::span<password_check> checks)
         {
             std::string one;
             checks[i].matches = derive(checks[i].password, hs[i].salt, hs[i].ln, hs[i].r, hs[i].p, one) &&
-                                CRYPTO_memcmp(one.data(), hs[i].want.data(), hash_bytes) == 0;
+                                crypto::secure_equal(one, hs[i].want);
             done[i] = true;
             continue;
         }
@@ -109,7 +110,7 @@ void password_matches_many(std::span<password_check> checks)
         const bool ok = scrypt::derive_many(jobs, uint64_t(1) << hs[i].ln, static_cast<uint32_t>(hs[i].r), max_mem);
         for (const size_t k : group)
         {
-            checks[k].matches = ok && CRYPTO_memcmp(got[k].data(), hs[k].want.data(), hash_bytes) == 0;
+            checks[k].matches = ok && crypto::secure_equal(got[k], hs[k].want);
             done[k] = true;
         }
     }

@@ -1,6 +1,7 @@
 #include "shared/storage/s3_sigv4.h"
 #include "../http/url.h"
 #include "../util/base64.h"
+#include "../crypto/mac.h"
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -832,7 +833,7 @@ verify_result verify(const request_view& req, const verify_options& opts, const 
 
         uint8_t mac[32];
         hmac_sha256(as_sv(key, 32), {sts}, mac);
-        matched = CRYPTO_memcmp(mac, claimed, 32) == 0;
+        matched = crypto::secure_equal(mac, claimed, 32);
         if (matched)
             hex_encode32(mac, sig_hex);
     }
@@ -949,7 +950,7 @@ bool payload_hasher::matches(const uint8_t expected[32])
 {
     uint8_t got[32];
     finish(got);
-    return CRYPTO_memcmp(got, expected, 32) == 0;
+    return crypto::secure_equal(got, expected, 32);
 }
 
 error_info payload_mismatch()
@@ -1083,14 +1084,10 @@ verify_result verify_v2(const request_view& req, const verify_options& opts, con
     bool matched = false;
     for (const std::string& date : dates)
     {
-        const std::string sts = v2_string_to_sign(req, opts, date);
-        unsigned char mac[EVP_MAX_MD_SIZE];
-        unsigned int len = 0;
-        if (!HMAC(EVP_sha1(), secret.data(), static_cast<int>(secret.size()), reinterpret_cast<const unsigned char*>(sts.data()),
-                  sts.size(), mac, &len))
+        const std::string mac = crypto::hmac_sha1(secret, v2_string_to_sign(req, opts, date));
+        if (mac.empty())
             break;
-        const std::string want = base64::encode(std::string_view(reinterpret_cast<const char*>(mac), len));
-        matched = matched || (want.size() == claimed.size() && CRYPTO_memcmp(want.data(), claimed.data(), want.size()) == 0);
+        matched = matched || crypto::secure_equal(base64::encode(mac), claimed);
     }
     if (!matched)
         return fail(sigv4_status::signature_mismatch, 403, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided. Check your key and signing method.", form);
@@ -1167,7 +1164,7 @@ bool chunk_stream::sign_matches(bool final_chunk, const uint8_t claimed[32])
                  std::string_view(ctx_.prev_signature, 64), "\n", empty_sha256_hex, "\n", std::string_view(chunk_hex, 64)});
     uint8_t mac[32];
     hmac_sha256(as_sv(ctx_.signing_key, 32), {sts}, mac);
-    if (CRYPTO_memcmp(mac, claimed, 32) != 0)
+    if (!crypto::secure_equal(mac, claimed, 32))
         return false;
     hex_encode32(mac, ctx_.prev_signature);
     return true;
@@ -1273,7 +1270,7 @@ bool chunk_stream::on_trailer()
                      std::string_view(ctx_.prev_signature, 64), "\n", std::string_view(hex, 64)});
         uint8_t mac[32];
         hmac_sha256(as_sv(ctx_.signing_key, 32), {sts}, mac);
-        if (CRYPTO_memcmp(mac, claimed, 32) != 0)
+        if (!crypto::secure_equal(mac, claimed, 32))
             return bad(stream_status::bad_signature);
     }
     state_  = state::finished;

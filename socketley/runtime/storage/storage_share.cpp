@@ -31,6 +31,7 @@
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/random_id.h"
+#include "../../shared/crypto/mac.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -406,7 +407,7 @@ bool storage_run::share_open(const std::shared_ptr<conn>& c, std::string_view id
             const size_t colon = pair.find(':');
             const std::string got = pw_hash(s.pw_salt, colon == std::string::npos ? std::string_view{} :
                                                                                    std::string_view(pair).substr(colon + 1));
-            if (got.size() == s.pw_hash.size() && CRYPTO_memcmp(got.data(), s.pw_hash.data(), got.size()) == 0)
+            if (crypto::secure_equal(got, s.pw_hash))
                 return true;
         }
         login_missed(*c);

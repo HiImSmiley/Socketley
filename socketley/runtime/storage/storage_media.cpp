@@ -45,6 +45,7 @@
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/crypto/mac.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -1201,8 +1202,7 @@ void storage_run::media_source(const std::shared_ptr<conn>& c, std::string_view 
     const std::string etag(r.get_query("e"));
     const std::string want = hmac_sha256_hex(m_media_key, bucket + '\n' + key + '\n' + etag + '\n' + std::to_string(expires));
     const std::string_view got = r.get_query("s");
-    if (m_media_key.empty() || want.empty() || got.size() != want.size() ||
-        CRYPTO_memcmp(got.data(), want.data(), want.size()) != 0)
+    if (m_media_key.empty() || want.empty() || !crypto::secure_equal(got, want))
     {
         app_reply(c, 403, "Access denied.\n");
         return;

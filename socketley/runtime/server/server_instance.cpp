@@ -25,6 +25,7 @@
 #include "../cache/resp_parser.h"
 #include "../../shared/http/url.h"
 #include "../../shared/http/status.h"
+#include "../../shared/crypto/mac.h"
 
 #include <unistd.h>
 #include <unordered_set>
@@ -5085,19 +5086,6 @@ submit_next_read:
 }
 
 // Constant-time string compare to prevent timing attacks on password
-static bool constant_time_eq(std::string_view a, std::string_view b)
-{
-    volatile uint8_t diff = static_cast<uint8_t>(a.size() != b.size());
-    size_t max_len = std::max(a.size(), b.size());
-    for (size_t i = 0; i < max_len; i++)
-    {
-        uint8_t ca = (i < a.size()) ? static_cast<uint8_t>(a[i]) : 0;
-        uint8_t cb = (i < b.size()) ? static_cast<uint8_t>(b[i]) : 0;
-        diff = static_cast<uint8_t>(diff | (ca ^ cb));
-    }
-    return diff == 0;
-}
-
 static constexpr uint8_t MAX_AUTH_FAILURES = 5;
 
 static inline __attribute__((always_inline)) bool check_rate_limit(server_connection* conn)
@@ -5673,7 +5661,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 }
                 else if (!m_master_pw.empty())
                 {
-                    auth_ok = constant_time_eq(pw, m_master_pw);
+                    auth_ok = socketley::crypto::secure_equal(pw, m_master_pw);
                 }
 
                 if (auth_ok)

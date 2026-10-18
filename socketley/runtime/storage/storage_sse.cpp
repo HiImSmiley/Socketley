@@ -12,6 +12,7 @@
 #include "storage_instance.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/crypto/mac.h"
 
 namespace socketley::storage
 {
@@ -402,7 +403,7 @@ bool storage_run::sse_parts_mac_ok(const object_meta& m, const std::string& reco
         return false;
     }
     const sse_digest want = sse_parts_mac(m_parts_mac_key, record, parts);
-    if (CRYPTO_memcmp(want.data(), mac.data(), mac.size()) != 0)
+    if (!crypto::secure_equal(want.data(), mac.data(), mac.size()))
     {
         LOG_WARN("storage: an SSE-C object's part list does not match its MAC, so its header was altered");
         err = sse_error("InternalError", "The object's part list does not match its MAC: its header was altered");

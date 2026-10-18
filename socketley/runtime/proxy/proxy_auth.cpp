@@ -17,6 +17,7 @@
 #include "../idp/idp_session.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/crypto/mac.h"
 
 namespace
 {
@@ -34,7 +35,7 @@ std::string_view trim(std::string_view s)
 
 bool equal_secret(std::string_view a, std::string_view b)
 {
-    return !a.empty() && a.size() == b.size() && CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
+    return !a.empty() && socketley::crypto::secure_equal(a, b);
 }
 
 // One holder of an IPv6 network has its whole /64, so that is what counts as one address.
