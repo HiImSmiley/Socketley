@@ -30,6 +30,7 @@
 #include "cert_keeper.h"
 #include "../util/logging.h"
 #include "../util/number_parse.h"
+#include "../util/settings.h"
 
 #if SOCKETLEY_HAS_TLS
 namespace
@@ -393,7 +394,7 @@ std::chrono::seconds inbound_report_every()
 {
     static const std::chrono::seconds every = []
     {
-        return std::chrono::seconds(socketley::getenv_whole<long>("SOCKETLEY_TLS_FAILURE_REPORT_SECS", 1, 3600).value_or(60));
+        return std::chrono::seconds(socketley::settings::number<long>("SOCKETLEY_TLS_FAILURE_REPORT_SECS").value_or(60));
     }();
     return every;
 }

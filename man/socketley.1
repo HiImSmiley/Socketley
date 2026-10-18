@@ -106,6 +106,11 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .B dashboard
 .br
 .B socketley
+.B settings
+.RB [ \-a | \-\-all ]
+.RB [ \-j | \-\-json ]
+.br
+.B socketley
 .B help | \-\-help | \-h
 .br
 .B socketley
@@ -1579,6 +1584,34 @@ T}
     "mode": "inout"
 }
 .fi
+.TP
+.B settings \fR[\fB\-a\fR|\fB\-\-all\fR] [\fB\-j\fR|\fB\-\-json\fR]
+Every
+.B SOCKETLEY_*
+setting as the daemon and the processes it starts see it: its value, and
+whether that came from the daemon's environment, from the
+.B settings
+table of its configuration file (see
+.BR "Daemon Configuration" ),
+or is the default, with what it is for. The plain listing holds the knobs an
+operator may turn;
+.B \-\-all
+adds the test suite's hooks, the variables a command reads from its own
+environment, and the ones the daemon sets for what it starts, each marked in a
+.B FOR
+column.
+.B \-\-json
+prints the same rows as an array of objects with
+.BR name ,
+.BR env ,
+.BR value ,
+.BR from ,
+.B for
+and
+.BR meaning .
+Every variable under
+.B ENVIRONMENT
+is one row.
 .TP
 .B dashboard
 Print the URL of the built-in web dashboard. Requires
@@ -16179,7 +16212,18 @@ or by recreating the runtime.
 .SH ENVIRONMENT
 Read at daemon startup; all are optional. The first selects which daemon this
 is. The rest are tuning knobs whose defaults suit a general-purpose deployment
-and only need changing for an unusual workload.
+and only need changing for an unusual workload. Each knob can be set in the
+.B settings
+table of the daemon's configuration file instead, by its name in lower case
+without
+.B SOCKETLEY_
+(see
+.BR "Daemon Configuration" ),
+and
+.B socketley settings
+lists every one with its value and where that came from. A number outside a
+knob's range, or that is not a whole number, is said once in the log and the
+default is used.
 .TP
 .B SOCKETLEY_SOCKET
 Which daemon you are, or which one you are talking to. Overrides the default
@@ -17086,7 +17130,12 @@ daemon = {
     dashboard_idp = "auth",  -- or as admins of this idp runtime
     alert_webhook = "https://discord.com/api/webhooks/...",
                              -- where alerts are posted
-    cpus = "0-3"             -- where this daemon's I/O runs
+    cpus = "0-3",            -- where this daemon's I/O runs
+    settings = {             -- any SOCKETLEY_* knob, by its short name
+        storage_hash_threads = 4,
+        lua_timeout_ms = 2000,
+        proxy_splice = true,
+    }
 }
 .fi
 .PP
@@ -17104,6 +17153,36 @@ settled before the ring exists, so they are read only from here, and a
 typed on
 .B "socketley daemon"
 outranks the file.
+.PP
+.B settings
+sets any variable under
+.B ENVIRONMENT
+that an operator may turn, by its name without
+.B SOCKETLEY_
+and in lower case:
+.B storage_hash_threads
+is
+.BR SOCKETLEY_STORAGE_HASH_THREADS .
+A number is written as one, an on-or-off as
+.B true
+or
+.BR false ,
+anything else as a string. The daemon puts each in the environment it starts
+its workers with, so a runtime reads the file's value as it would the
+variable's. The file comes first: a variable in the daemon's own environment
+counts only for a setting the file does not name, and the default only for one
+neither sets. A
+name that is no setting, a value outside the setting's range, and a variable a
+command reads from its own environment (the
+.B SOCKETLEY_GIT_*
+ones, and
+.B SOCKETLEY_SOCKET
+and
+.BR SOCKETLEY_CONFIG ,
+which choose this file) are each said on standard output, and the daemon does
+not start.
+.B socketley settings
+shows what was taken.
 .PP
 When
 .B metrics_port

@@ -657,6 +657,7 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("show"):
         case fnv1a("owner"):
         case fnv1a("dashboard"):
+        case fnv1a("settings"):
         // Typed by hand it answers which daemon is on this socket, which
         // without this case fell through to the piped-stdin arm and was
         // answered "empty message".

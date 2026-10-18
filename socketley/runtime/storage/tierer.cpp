@@ -10,6 +10,7 @@
 #include "s3_xml_tree.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/settings.h"
 
 namespace socketley::storage
 {
@@ -87,7 +88,7 @@ struct tierer::sweep
 tierer::tierer(event_loop& loop, file_io& io, object_store& store, hash_pool& hashes)
     : m_loop(loop), m_io(io), m_store(store), m_hashes(hashes)
 {
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_REPLICATION_HOSTS"))
+    if (const char* e = settings::text("SOCKETLEY_STORAGE_REPLICATION_HOSTS"))
         m_hosts_file = e;
 }
 

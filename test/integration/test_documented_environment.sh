@@ -60,16 +60,25 @@ fi
 EXCLUDED="SOCKETLEY_INV_PROGRESS_REPORT"
 
 # ── what the code reads ─────────────────────────────────────────────────────
-# Digits too: SOCKETLEY_STORAGE_HTTP2 and the HTTP3 ones were invisible to [A-Z_]+ and went undocumented.
-IN_CODE=$(grep -rhoE 'getenv\("SOCKETLEY_[A-Z0-9_]+"\)' "$ROOT/socketley/" 2>/dev/null |
-          sed 's/.*getenv("//; s/").*//' | sort -u)
+# The table in settings.h, which every read goes through: a name it lacks does not compile.
+SETTINGS="$ROOT/socketley/shared/util/settings.h"
+IN_CODE=$(grep -oE '^\s*\{"SOCKETLEY_[A-Z0-9_]+", kind::[a-z]+, audience::[a-z]+' "$SETTINGS" 2>/dev/null |
+          grep -v 'audience::internal' | sed 's/.*{"//; s/".*//' | sort -u)
+# Set by the daemon for what it starts: the page may say so, and is not asked to.
+IN_TABLE=$(grep -oE '^\s*\{"SOCKETLEY_[A-Z0-9_]+", kind::' "$SETTINGS" | sed 's/.*{"//; s/".*//' | sort -u)
 if [ -z "$IN_CODE" ]; then
-    bad "the source was read at all" "no getenv(\"SOCKETLEY_...\") found under socketley/" \
-        "the extractor keys off 'getenv(\"SOCKETLEY_' -- if that spelling changed, so must this"
+    bad "the settings table was read at all" "no entries found in $SETTINGS" \
+        "the extractor keys off '{\"SOCKETLEY_..., kind::, audience::' -- if that shape changed, so must this"
     echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
     exit 1
 fi
 ok
+
+# And nothing reads one past the table, which would be a knob no listing and no check knows of.
+AROUND=$(grep -rnE '(getenv|getenv_whole<[a-z0-9_]+>)\("SOCKETLEY_' "$ROOT/socketley/" 2>/dev/null | grep -v '/shared/util/settings.h:')
+if [ -z "$AROUND" ]; then ok; else
+    bad "every SOCKETLEY_* variable is read through the settings table" "read around it:" $AROUND
+fi
 
 # ── what the page documents ─────────────────────────────────────────────────
 # The section only, not the whole page: a variable mentioned in passing in an
@@ -115,6 +124,16 @@ if [ -z "${DUPES// /}" ]; then ok; else
     bad "no variable is documented twice" "repeated: $DUPES" \
         "two entries for one variable means two places to look and one of them" \
         "is the one somebody stops at -- which is how a default went missing"
+fi
+
+# ── and the page names no variable the table does not ───────────────────────
+GONE=""
+while read -r v; do
+    case "$v" in SOCKETLEY_*) grep -qxF -- "$v" <<<"$IN_TABLE" || GONE="$GONE $v" ;; esac
+done <<< "$(printf '%s\n' "$IN_MAN" | sort -u)"
+if [ -z "$GONE" ]; then ok; else
+    bad "every SOCKETLEY_* entry on the page is a setting" "documented but not in the table:$GONE" \
+        "an entry for a knob nothing reads tells an operator to set something that does nothing"
 fi
 
 # ── and the exclusion list is not quietly stale ─────────────────────────────

@@ -30,6 +30,7 @@
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/number_parse.h"
+#include "../../shared/util/settings.h"
 
 namespace socketley::storage
 {
@@ -99,17 +100,17 @@ object_store::object_store(event_loop& loop, file_io& io, store_options opts)
 {
     if (m_opts.nshards == 0)
         m_opts.nshards = 1;
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_KILL_AFTER_RENAME"))
+    if (const char* e = settings::text("SOCKETLEY_STORAGE_KILL_AFTER_RENAME"))
         m_kill_after_rename = e;
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_KILL_AFTER_EVENT"))
+    if (const char* e = settings::text("SOCKETLEY_STORAGE_KILL_AFTER_EVENT"))
         m_kill_after_event = e;
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_HOLD_CONFIRM"))
+    if (const char* e = settings::text("SOCKETLEY_STORAGE_HOLD_CONFIRM"))
         m_hold_confirm = e;
     // The hot-object budget per shard, 0 to keep nothing.
-    if (const auto v = getenv_whole<uint64_t>("SOCKETLEY_STORAGE_HOT_BYTES"))
+    if (const auto v = settings::number<uint64_t>("SOCKETLEY_STORAGE_HOT_BYTES"))
         m_hot_budget = *v;
     // A lower compaction floor, for a test that wants compactions without thousands of writes.
-    if (const auto v = getenv_whole<uint64_t>("SOCKETLEY_STORAGE_COMPACT_FLOOR"))
+    if (const auto v = settings::number<uint64_t>("SOCKETLEY_STORAGE_COMPACT_FLOOR"))
         m_opts.compact_floor = *v;
 }
 

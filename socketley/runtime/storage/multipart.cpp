@@ -19,6 +19,7 @@
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/number_parse.h"
+#include "../../shared/util/settings.h"
 
 namespace fs = std::filesystem;
 
@@ -271,7 +272,7 @@ multipart_store::multipart_store(event_loop& loop, file_io& io, object_store& st
     : m_loop(&loop), m_io(&io), m_store(&store), m_alive(std::make_shared<bool>(true))
 {
     // A smaller room for the part list in the header, so a test reaches the trailer without gigabytes of parts.
-    if (const auto v = getenv_whole<uint64_t>("SOCKETLEY_STORAGE_PART_LIST_MAX"))
+    if (const auto v = settings::number<uint64_t>("SOCKETLEY_STORAGE_PART_LIST_MAX"))
         m_list_max = *v;
 }
 

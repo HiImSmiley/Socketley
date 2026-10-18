@@ -28,6 +28,7 @@
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/number_parse.h"
 #include "../../shared/ipc/one_command.h"
+#include "../../shared/util/settings.h"
 #include <cstdlib>
 #include <cstdio>
 #include <charconv>
@@ -782,9 +783,9 @@ bool cache_instance::setup(event_loop& loop)
     // both tunable so the memory trade-off is measured rather than guessed.
     uint32_t buf_count = BUF_COUNT;
     uint32_t buf_size  = BUF_SIZE;
-    if (const auto v = socketley::getenv_whole<uint32_t>("SOCKETLEY_CACHE_BUF_COUNT", 1))
+    if (const auto v = socketley::settings::number<uint32_t>("SOCKETLEY_CACHE_BUF_COUNT"))
         buf_count = *v;
-    if (const auto v = socketley::getenv_whole<uint32_t>("SOCKETLEY_CACHE_BUF_SIZE", 1024))
+    if (const auto v = socketley::settings::number<uint32_t>("SOCKETLEY_CACHE_BUF_SIZE"))
         buf_size = *v;
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, buf_count, buf_size);
     // On always, for the server's reason: nothing here declines a read at a
@@ -812,7 +813,7 @@ bool cache_instance::setup(event_loop& loop)
     // running for every cache runtime wakes each idle loop for nothing -- and
     // the interval trades memory against CPU, never correctness, since every
     // read path checks expiry itself.
-    const long sweep_ms = socketley::getenv_whole<long>("SOCKETLEY_CACHE_TTL_SWEEP_MS", 1).value_or(500);
+    const long sweep_ms = socketley::settings::number<long>("SOCKETLEY_CACHE_TTL_SWEEP_MS").value_or(500);
     // Fresh timers for this run, because the sweep that was running at the
     // stop cannot be cancelled and m_ttl_timer_armed cannot tell the
     // difference.

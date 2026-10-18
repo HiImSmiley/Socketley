@@ -35,6 +35,7 @@
 #include "../util/logging.h"
 #include "../crypto/tls_context.h"
 #include "../util/number_parse.h"
+#include "../util/settings.h"
 
 #ifndef UDP_SEGMENT
 #define UDP_SEGMENT 103
@@ -355,7 +356,7 @@ bool endpoint::open(uint16_t port, uint16_t advertise, uint32_t shard, uint32_t 
     }
     this->fd = fd;
     this->port = port;
-    if (const char* cc = std::getenv("SOCKETLEY_STORAGE_HTTP3_CC"); cc && *cc)
+    if (const char* cc = settings::text("SOCKETLEY_STORAGE_HTTP3_CC"); cc && *cc)
     {
         const std::string_view v(cc);
         if (v == "bbr")
@@ -367,7 +368,7 @@ bool endpoint::open(uint16_t port, uint16_t advertise, uint32_t shard, uint32_t 
         else
             LOG_WARN("storage: SOCKETLEY_STORAGE_HTTP3_CC is none of bbr, cubic, reno; bbr is used");
     }
-    if (const auto v = socketley::getenv_whole<size_t>("SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER"))
+    if (const auto v = settings::number<size_t>("SOCKETLEY_STORAGE_HTTP3_RETRY_AFTER"))
         this->retry_after = *v;
     this->shard = shard;
     this->shards = std::max<uint32_t>(shards, 1);

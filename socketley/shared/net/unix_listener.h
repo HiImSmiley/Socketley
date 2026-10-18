@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "../runtime/runtime_definitions.h"
+#include "../util/settings.h"
 
 namespace socketley::unix_sock
 {
@@ -221,8 +222,7 @@ inline bool wants_companion(runtime_type type, uint16_t port,
     // inherits the daemon's environment.
     static const bool disabled = []
     {
-        const char* off = ::getenv("SOCKETLEY_NO_COMPANION");
-        return off && *off && *off != '0';
+        return settings::flag("SOCKETLEY_NO_COMPANION", false);
     }();
     if (disabled)
         return false;

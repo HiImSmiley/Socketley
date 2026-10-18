@@ -15,6 +15,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/number_parse.h"
+#include "../../shared/util/settings.h"
 
 namespace socketley::storage
 {
@@ -30,8 +31,7 @@ std::chrono::milliseconds access_log_interval()
     // SOCKETLEY_STORAGE_LOG_FLUSH_MS shortens the wait for a test, between 100 ms and an hour.
     static const long ms = []
     {
-        const auto n = getenv_whole<long>("SOCKETLEY_STORAGE_LOG_FLUSH_MS", 1);
-        return n ? std::clamp(*n, 100L, 3600L * 1000) : 60L * 1000;
+        return settings::number<long>("SOCKETLEY_STORAGE_LOG_FLUSH_MS").value_or(60L * 1000);
     }();
     return std::chrono::milliseconds(ms);
 }

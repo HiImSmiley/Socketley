@@ -1,4 +1,5 @@
 #include "paths.h"
+#include "../util/settings.h"
 #include <unistd.h>
 #include <pwd.h>
 #include <cstdlib>
@@ -48,7 +49,7 @@ socketley_paths socketley_paths::resolve()
 
     // A development affordance for several daemons in one namespace, not how
     // clustering works.
-    const char* env_socket = std::getenv("SOCKETLEY_SOCKET");
+    const char* env_socket = socketley::settings::text("SOCKETLEY_SOCKET");
 
     bool installed = access("/usr/bin/socketley", X_OK) == 0;
     uid_t uid = getuid();

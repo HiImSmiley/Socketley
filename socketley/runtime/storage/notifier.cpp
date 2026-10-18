@@ -10,6 +10,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/util/number_parse.h"
 #include "../../shared/ipc/one_command.h"
+#include "../../shared/util/settings.h"
 
 namespace socketley::storage
 {
@@ -106,9 +107,9 @@ bool load_notify_targets(const std::string& path, std::vector<notify_target>& ou
 notifier::notifier(event_loop& loop, file_io& io, io_handler* owner)
     : m_loop(loop), m_io(io), m_owner(owner), m_box(loop, io, "event outbox")
 {
-    if (const auto v = getenv_whole<size_t>("SOCKETLEY_STORAGE_NOTIFY_QUEUE", 1))
+    if (const auto v = settings::number<size_t>("SOCKETLEY_STORAGE_NOTIFY_QUEUE"))
         m_queue_max = *v;
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_NOTIFY_HOSTS"))
+    if (const char* e = settings::text("SOCKETLEY_STORAGE_NOTIFY_HOSTS"))
         m_hosts_file = e;
 }
 

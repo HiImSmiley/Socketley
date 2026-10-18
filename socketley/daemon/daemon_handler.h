@@ -220,6 +220,7 @@ private:
     int cmd_daemon_name(ipc_connection* conn, const parsed_args& pa);
     int cmd_daemon_cluster(ipc_connection* conn, const parsed_args& pa);
     int cmd_dashboard(ipc_connection* conn);
+    int cmd_settings(ipc_connection* conn, const parsed_args& pa);
 
     // The daemon saying which daemon it is, asked by every CLI command so that
     // "something accepted my connection" stops being read as "a daemon is

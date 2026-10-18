@@ -35,6 +35,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/number_parse.h"
+#include "../../shared/util/settings.h"
 
 namespace fs = std::filesystem;
 
@@ -183,18 +184,6 @@ struct walk_shape
     unsigned depth{0};
 };
 
-unsigned env_count(const char* name, unsigned fallback, unsigned lo, unsigned hi)
-{
-    if (const char* e = std::getenv(name))
-    {
-        char* end;
-        const long v = std::strtol(e, &end, 10);
-        if (end != e && *end == '\0' && v >= static_cast<long>(lo) && v <= static_cast<long>(hi))
-            return static_cast<unsigned>(v);
-    }
-    return fallback;
-}
-
 walk_shape recovery_shape()
 {
     walk_shape w;
@@ -204,8 +193,8 @@ walk_shape recovery_shape()
     const unsigned cpus = ::sched_getaffinity(0, sizeof set, &set) == 0
                               ? static_cast<unsigned>(std::clamp(CPU_COUNT(&set), 1, 16))
                               : 1u;
-    w.threads = env_count("SOCKETLEY_STORAGE_RECOVERY_THREADS", cpus, 1, 64);
-    w.depth   = env_count("SOCKETLEY_STORAGE_RECOVERY_DEPTH", walk_depth, 0, 256);
+    w.threads = settings::number<unsigned>("SOCKETLEY_STORAGE_RECOVERY_THREADS").value_or(cpus);
+    w.depth   = settings::number<unsigned>("SOCKETLEY_STORAGE_RECOVERY_DEPTH").value_or(walk_depth);
 
     // Half of what RLIMIT_NOFILE leaves, since every thread holds a directory, a ring and its files.
     struct rlimit rl{};
@@ -615,16 +604,16 @@ bool object_store::open(std::string& err, recovery_report* report)
     std::error_code ec;
 
     // A test aid: a start that works this long, as one reading a large store's files does.
-    if (const auto v = getenv_whole<long>("SOCKETLEY_STORAGE_START_SPIN_MS", 0))
+    if (const auto v = settings::number<long>("SOCKETLEY_STORAGE_START_SPIN_MS"))
     {
-        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::min(*v, 30000L));
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(*v);
         volatile uint64_t spin = 0;
         while (std::chrono::steady_clock::now() < until)
             spin = spin + 1;
     }
     // And one that waits this long doing nothing, as a wedged start does.
-    if (const auto v = getenv_whole<long>("SOCKETLEY_STORAGE_START_SLEEP_MS", 0))
-        std::this_thread::sleep_for(std::chrono::milliseconds(std::min(*v, 60000L)));
+    if (const auto v = settings::number<long>("SOCKETLEY_STORAGE_START_SLEEP_MS"))
+        std::this_thread::sleep_for(std::chrono::milliseconds(*v));
 
     fs::create_directories(m_opts.dir, ec);
     if (ec)

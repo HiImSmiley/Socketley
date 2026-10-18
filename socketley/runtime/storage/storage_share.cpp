@@ -33,6 +33,7 @@
 #include "../../shared/util/random_id.h"
 #include "../../shared/crypto/mac.h"
 #include "../../shared/util/number_parse.h"
+#include "../../shared/util/settings.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -216,7 +217,7 @@ int64_t burn_grace_ms()
 {
     static const int64_t ms = []
     {
-        return getenv_whole<int64_t>("SOCKETLEY_SHARE_BURN_GRACE_SECS", 0, INT64_MAX / 1000).value_or(600) * 1000;
+        return settings::number<int64_t>("SOCKETLEY_SHARE_BURN_GRACE_SECS").value_or(600) * 1000;
     }();
     return ms;
 }
@@ -1113,7 +1114,7 @@ bool storage_run::notify_allowed(std::string_view url)
     static const std::vector<std::string> allow = []
     {
         std::vector<std::string> out;
-        const char* e = std::getenv("SOCKETLEY_SHARE_NOTIFY_ALLOW");
+        const char* e = settings::text("SOCKETLEY_SHARE_NOTIFY_ALLOW");
         std::string_view v = e && *e ? std::string_view(e)
                                      : "https://discord.com/api/webhooks/,https://discordapp.com/api/webhooks/,"
                                        "https://hooks.slack.com/,https://ntfy.sh/";

@@ -25,6 +25,7 @@
 
 #include "../../shared/http/h2_driver.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/settings.h"
 
 namespace h2  = socketley::h2;
 namespace mux = socketley::mux;
@@ -74,8 +75,7 @@ bool proxy_instance::h2_offered() const
     // order of two lines.
     if (!m_entrance || m_protocol != protocol_http || !get_tls())
         return false;
-    const char* off = std::getenv("SOCKETLEY_PROXY_HTTP2");
-    return !(off && std::string_view(off) == "0");
+    return socketley::settings::flag("SOCKETLEY_PROXY_HTTP2", true);
 }
 
 bool proxy_instance::h2_idle(const proxy_client_connection* conn) const

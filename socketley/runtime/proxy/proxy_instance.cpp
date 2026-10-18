@@ -14,6 +14,7 @@
 #include "../../shared/net/dns_feed.h"
 #include "../../shared/http/status.h"
 #include "../../shared/net/peer_address.h"
+#include "../../shared/util/settings.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -157,8 +158,7 @@ static inline bool retry_safe_method(std::string_view method, bool retry_all)
 static bool splice_opt_in()
 {
     static const bool on = [] {
-        const char* e = std::getenv("SOCKETLEY_PROXY_SPLICE");
-        return e && *e && *e != '0';
+        return socketley::settings::flag("SOCKETLEY_PROXY_SPLICE", false);
     }();
     return on;
 }
@@ -1965,7 +1965,7 @@ bool proxy_instance::setup(event_loop& loop)
     // SOCKETLEY_RECV_MULTISHOT=0 for every runtime, so only the arm this proxy
     // alone has -- overriding its own rule -- is read here.
     m_recv_multishot_supported = m_use_provided_bufs && loop.recv_multishot_enabled();
-    if (const char* e = getenv("SOCKETLEY_RECV_MULTISHOT"); e && e[0] == '1' && e[1] == '\0')
+    if (const char* e = socketley::settings::text("SOCKETLEY_RECV_MULTISHOT"); e && std::string_view(e) == "1")
         m_multishot_arm = multishot_arm::always;
     // A fresh instance holds nothing, so the rule starts on the arm it would
     // choose for that and the first turn moves it if the count says otherwise.

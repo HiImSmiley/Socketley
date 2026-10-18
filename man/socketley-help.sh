@@ -517,6 +517,14 @@ cli_commands() {
     echo -e "  ${CYAN}socketley cluster remove api${NC}"
     echo ""
 
+    echo -e "${BOLD}settings${NC} [-a|--all] [--json|-j]"
+    echo "  Every SOCKETLEY_* setting, its value, and whether it came from the"
+    echo "  environment, from daemon = { settings = { ... } } in config.lua, or is"
+    echo "  the default. --all adds the tests' hooks and the internal ones."
+    echo -e "  ${CYAN}socketley settings${NC}"
+    echo -e "  ${CYAN}socketley settings --all --json${NC}"
+    echo ""
+
     echo -e "${BOLD}dashboard${NC}"
     echo "  Show the live dashboard URL. Requires metrics_port in config.lua."
     echo "  Dashboard served at the metrics endpoint root (/)."

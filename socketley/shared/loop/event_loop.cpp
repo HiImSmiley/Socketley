@@ -2,6 +2,7 @@
 #include "../util/logging.h"
 #include "eventfd_wake.h"
 #include "../util/number_parse.h"
+#include "../util/settings.h"
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/eventfd.h>
@@ -900,7 +901,7 @@ bool event_loop::init()
     // wins because the marker and not the value is what says a choice was made.
     if (!m_cpus_explicit)
     {
-        if (const char* cpus_env = getenv("SOCKETLEY_CPUS"); cpus_env && *cpus_env)
+        if (const char* cpus_env = socketley::settings::text("SOCKETLEY_CPUS"); cpus_env && *cpus_env)
         {
             cpu_set_spec parsed;
             std::string err;
@@ -1007,7 +1008,7 @@ bool event_loop::init()
 
     setup_eventfd();
 
-    if (const auto usec = socketley::getenv_whole<uint32_t>("SOCKETLEY_NAPI_BUSY_POLL_US", 1))
+    if (const auto usec = socketley::settings::number<uint32_t>("SOCKETLEY_NAPI_BUSY_POLL_US"))
         enable_napi_busy_poll(*usec);
 
     return true;
@@ -1821,8 +1822,8 @@ bool event_loop::recv_multishot_enabled() const
     // The environment read once, the same way recv_bundle_enabled() reads its
     // own: neither it nor the kernel changes under a running process.
     static const bool opted_out = [] {
-        const char* e = getenv("SOCKETLEY_RECV_MULTISHOT");
-        return e && e[0] == '0' && e[1] == '\0';
+        const char* e = socketley::settings::text("SOCKETLEY_RECV_MULTISHOT");
+        return e && std::string_view(e) == "0";
     }();
     return m_recv_multishot_supported && !opted_out;
 }
@@ -1903,8 +1904,7 @@ bool event_loop::recv_bundle_enabled() const
     // Read and probed once: neither the kernel nor the environment changes
     // under a running process.
     static const bool enabled = [] {
-        const char* e = getenv("SOCKETLEY_RECV_BUNDLE");
-        if (e && e[0] == '0' && e[1] == '\0')
+        if (!socketley::settings::flag("SOCKETLEY_RECV_BUNDLE", true))
             return false;
         return probe_recv_bundle();
     }();

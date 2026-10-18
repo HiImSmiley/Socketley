@@ -49,6 +49,7 @@
 #include "../shared/http/url.h"
 #include "../shared/util/base64.h"
 #include "../shared/crypto/tls_context.h"
+#include "../shared/util/settings.h"
 
 extern char** environ;
 
@@ -70,7 +71,7 @@ std::vector<std::string> git_env()
     }
     env.emplace_back("GIT_TERMINAL_PROMPT=0");
     env.emplace_back("GIT_ASKPASS=/bin/false");
-    if (const char* t = std::getenv("SOCKETLEY_GIT_TOKEN"); t && *t)
+    if (const char* t = socketley::settings::text("SOCKETLEY_GIT_TOKEN"); t && *t)
     {
         const std::string pair = std::string("x-access-token:") + t;
         env.emplace_back("GIT_CONFIG_COUNT=1");
@@ -195,9 +196,9 @@ public:
     s3_client(std::string host, std::string port, bool tls, std::string ca = {})
         : m_host(std::move(host)), m_port(std::move(port)), m_ca(std::move(ca)), m_tls(tls)
     {
-        const char* k = std::getenv("SOCKETLEY_GIT_ACCESS_KEY");
-        const char* s = std::getenv("SOCKETLEY_GIT_SECRET");
-        const char* t = std::getenv("SOCKETLEY_GIT_SESSION_TOKEN");
+        const char* k = socketley::settings::text("SOCKETLEY_GIT_ACCESS_KEY");
+        const char* s = socketley::settings::text("SOCKETLEY_GIT_SECRET");
+        const char* t = socketley::settings::text("SOCKETLEY_GIT_SESSION_TOKEN");
         m_key = k ? k : "";
         m_secret = s ? s : "";
         m_token = t ? t : "";
@@ -958,7 +959,7 @@ int git_sync_main(int argc, char** argv)
         return 1;
     }
     // The token goes in a header with every request, so only over https, where nobody on the way reads it.
-    if (const char* t = std::getenv("SOCKETLEY_GIT_TOKEN"); t && *t && !o.url.starts_with("https://"))
+    if (const char* t = socketley::settings::text("SOCKETLEY_GIT_TOKEN"); t && *t && !o.url.starts_with("https://"))
     {
         std::cout << "a GitHub token is sent only over https://, and " << o.url << " is not\n";
         return 1;

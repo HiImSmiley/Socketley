@@ -37,6 +37,7 @@ inline constexpr std::string_view for_verb(std::string_view verb)
     if (verb == "ps")     return "ps [-a|--all] [--json|-j|--format json] [--silent|-s] [columns...]";
     if (verb == "ping")   return "ping";
     if (verb == "dashboard") return "dashboard";
+    if (verb == "settings") return "settings [-a|--all] [--json|-j]";
     if (verb == "idp-user")
         return "idp-user <idp> add <user> [--password <pw>|-] [--name ..] [--email ..] [--groups a,b] [--set k=v] "
                "[--reset] | passwd <user> --password <pw>|- [--reset] | set <user> k=v... | disable|enable|logout|"

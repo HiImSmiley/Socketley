@@ -21,6 +21,7 @@
 
 #include "../../shared/http/h3_endpoint.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/settings.h"
 
 namespace
 {
@@ -61,8 +62,7 @@ bool proxy_instance::h3_offered() const
     // HTTP/3 means a UDP socket of its own on the same port.
     if (!h2_offered())
         return false;
-    const char* off = std::getenv("SOCKETLEY_PROXY_HTTP3");
-    return !(off && std::string_view(off) == "0");
+    return socketley::settings::flag("SOCKETLEY_PROXY_HTTP3", true);
 }
 
 bool proxy_instance::h3_open(uint16_t port)

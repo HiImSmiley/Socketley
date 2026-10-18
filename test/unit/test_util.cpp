@@ -5,6 +5,7 @@
 #include "shared/net/failure_bar.h"
 #include "shared/util/ascii.h"
 #include "shared/util/number_parse.h"
+#include "shared/util/settings.h"
 #include "shared/util/proc_stat.h"
 
 #include <chrono>
@@ -111,4 +112,48 @@ TEST_CASE("an address that keeps failing is barred until its window ends, and th
             bar.missed("flood" + std::to_string(i), t0 + std::chrono::seconds(i));
     CHECK(bar.barred_for("flood999", t0 + 999s) > 0);
     CHECK(bar.barred_for("flood0", t0 + 999s) == 0);
+}
+
+TEST_CASE("a setting is read through its table entry: its range, its flag rule and its name in the file")
+{
+    namespace st = socketley::settings;
+    ::setenv("SOCKETLEY_STORAGE_HASH_THREADS", "4", 1);
+    CHECK(st::number<unsigned>("SOCKETLEY_STORAGE_HASH_THREADS") == 4u);
+    // Past the table's range, or no whole number, is the default and never a guess.
+    ::setenv("SOCKETLEY_STORAGE_HASH_THREADS", "17", 1);
+    CHECK_FALSE(st::number<unsigned>("SOCKETLEY_STORAGE_HASH_THREADS"));
+    ::setenv("SOCKETLEY_STORAGE_HASH_THREADS", "4x", 1);
+    CHECK_FALSE(st::number<unsigned>("SOCKETLEY_STORAGE_HASH_THREADS"));
+    ::unsetenv("SOCKETLEY_STORAGE_HASH_THREADS");
+    CHECK_FALSE(st::number<unsigned>("SOCKETLEY_STORAGE_HASH_THREADS"));
+    // A table range wider than the type asked for is still bounded by the type.
+    ::setenv("SOCKETLEY_STORAGE_HOT_BYTES", "70000", 1);
+    CHECK_FALSE(st::number<uint16_t>("SOCKETLEY_STORAGE_HOT_BYTES"));
+    CHECK(st::number<uint64_t>("SOCKETLEY_STORAGE_HOT_BYTES") == 70000u);
+    ::unsetenv("SOCKETLEY_STORAGE_HOT_BYTES");
+
+    ::unsetenv("SOCKETLEY_PROXY_SPLICE");
+    CHECK_FALSE(st::flag("SOCKETLEY_PROXY_SPLICE", false));
+    ::setenv("SOCKETLEY_PROXY_SPLICE", "1", 1);
+    CHECK(st::flag("SOCKETLEY_PROXY_SPLICE", false));
+    ::setenv("SOCKETLEY_PROXY_SPLICE", "0", 1);
+    CHECK_FALSE(st::flag("SOCKETLEY_PROXY_SPLICE", true));
+    ::setenv("SOCKETLEY_PROXY_SPLICE", "", 1);
+    CHECK(st::flag("SOCKETLEY_PROXY_SPLICE", true));
+    ::unsetenv("SOCKETLEY_PROXY_SPLICE");
+
+    const st::setting* s = st::by_config_name("storage_hash_threads");
+    REQUIRE(s);
+    CHECK(s->name == "SOCKETLEY_STORAGE_HASH_THREADS");
+    CHECK(st::refusal(*s, "4").empty());
+    CHECK(st::refusal(*s, "99") == "storage_hash_threads is 99, not a whole number from 0 to 16");
+    CHECK_FALSE(st::by_config_name("SOCKETLEY_STORAGE_HASH_THREADS"));
+    CHECK_FALSE(st::by_config_name("no_such_thing"));
+    // Every name is the program's own, and the file's spelling of each leads back to it.
+    for (const st::setting& e : st::table)
+    {
+        CHECK(e.name.starts_with("SOCKETLEY_"));
+        CHECK(st::by_config_name(st::config_name(e)) == &e);
+        CHECK_FALSE(e.meaning.empty());
+    }
 }

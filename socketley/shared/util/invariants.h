@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include "settings.h"
 
 // Consecutive barren completions before a connection is called a loop,
 // measured rather than chosen and re-derivable with
@@ -67,8 +68,7 @@ inline uint32_t& progress_peak()
 inline bool progress_report_on()
 {
     static const bool on = [] {
-        const char* e = std::getenv("SOCKETLEY_INV_PROGRESS_REPORT");
-        return e && *e && *e != '0';
+        return socketley::settings::flag("SOCKETLEY_INV_PROGRESS_REPORT", false);
     }();
     return on;
 }

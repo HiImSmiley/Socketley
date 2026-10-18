@@ -51,6 +51,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include "../util/settings.h"
 
 extern char** environ;
 
@@ -77,8 +78,7 @@ public:
 
     explicit worker_env(bool hugepages, std::initializer_list<var> extra = {})
     {
-        const char* off = ::getenv("SOCKETLEY_HUGEPAGE");
-        const bool  want = hugepages && !(off && off[0] == '0' && off[1] == '\0');
+        const bool want = hugepages && settings::flag("SOCKETLEY_HUGEPAGE", true);
 
         bool tunables_seen = false;
         for (char** e = environ; e && *e; ++e)

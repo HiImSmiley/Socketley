@@ -1,5 +1,7 @@
 #include "daemon.h"
+#include <cmath>
 #include <unordered_set>
+#include <vector>
 #include "daemon_handler.h"
 #include "metrics_endpoint.h"
 #include "../shared/util/log_ring.h"
@@ -27,6 +29,7 @@
 #include "../runtime/worker/worker_main.h"
 #include "../shared/loop/eventfd_wake.h"
 #include "../shared/util/number_parse.h"
+#include "../shared/util/settings.h"
 
 #include <csignal>
 #include <cstdlib>
@@ -66,6 +69,8 @@ struct daemon_config
     std::string name;
     std::string cluster;
     std::string cpus;
+    // What the file's `settings` table holds that cannot be, one line each; the daemon does not start on it.
+    std::string settings_refusal;
 };
 
 // Which file this daemon reads its settings from, extracted because `dashboard`
@@ -75,7 +80,7 @@ static std::string resolve_config_path(const std::string& config_path)
 {
     // SOCKETLEY_CONFIG first, which is also how the test suite gives each
     // daemon a config of its own.
-    const char* env = std::getenv("SOCKETLEY_CONFIG");
+    const char* env = socketley::settings::text("SOCKETLEY_CONFIG");
     if (env && env[0])
         return env;
     return config_path;
@@ -180,6 +185,53 @@ static daemon_config load_daemon_config(const std::string& config_path)
     sol::optional<std::string> cpus = text("cpus");
     if (cpus && !cpus->empty())
         out.cpus = *cpus;
+
+    // Every SOCKETLEY_* knob by its short name, checked against the table of them before any is taken.
+    if (const auto knobs = table->get<sol::optional<sol::table>>(static_cast<const char*>("settings")))
+    {
+        std::vector<std::pair<const socketley::settings::setting*, std::string>> take;
+        for (const auto& [k, v] : *knobs)
+        {
+            const std::string key = k.is<std::string>() ? k.as<std::string>() : std::string("(a key that is no name)");
+            const auto* s = socketley::settings::by_config_name(key);
+            if (!s)
+            {
+                out.settings_refusal += "[config] settings." + key + " is no setting; socketley settings --all lists them\n";
+                continue;
+            }
+            if (s->who != socketley::settings::audience::tuning && s->who != socketley::settings::audience::test)
+            {
+                out.settings_refusal += "[config] settings." + key + " is read from the environment of the process "
+                                        "that needs it, not from this file\n";
+                continue;
+            }
+            std::string value;
+            if (v.get_type() == sol::type::boolean)
+                value = v.as<bool>() ? "1" : "0";
+            else if (v.get_type() == sol::type::number)
+            {
+                const double d = v.as<double>();
+                if (d != std::floor(d) || d < -9.0e18 || d > 9.0e18)
+                {
+                    out.settings_refusal += "[config] settings." + key + " is not a whole number\n";
+                    continue;
+                }
+                value = std::to_string(static_cast<int64_t>(d));
+            }
+            else if (v.get_type() == sol::type::string)
+                value = v.as<std::string>();
+            if (const std::string why = socketley::settings::refusal(*s, value); !why.empty())
+            {
+                out.settings_refusal += "[config] settings." + why + "\n";
+                continue;
+            }
+            take.emplace_back(s, std::move(value));
+        }
+        // All or nothing, so a daemon that refuses its file has changed nothing.
+        if (out.settings_refusal.empty())
+            for (const auto& [s, value] : take)
+                socketley::settings::apply(*s, value);
+    }
 
     return out;
 #endif
@@ -738,6 +790,11 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     // Load config file (sets log level, metrics port, etc.) before anything else
     const daemon_config config = load_daemon_config(paths.config_path.string());
+    if (!config.settings_refusal.empty())
+    {
+        std::cout << config.settings_refusal;
+        return 1;
+    }
     const uint16_t metrics_port = config.metrics_port;
 
     // The ring setting reaches the loop here because init() is a few lines
@@ -852,9 +909,9 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     if (raft_cfg.enabled())
     {
         raft_cfg.dir = (paths.state_dir / "raft").string();
-        if (const auto v = socketley::getenv_whole<uint32_t>("SOCKETLEY_RAFT_TICK_MS", 1))
+        if (const auto v = socketley::settings::number<uint32_t>("SOCKETLEY_RAFT_TICK_MS"))
             raft_cfg.tick_ms = *v;
-        if (const auto v = socketley::getenv_whole<uint64_t>("SOCKETLEY_RAFT_COMPACT_EVERY", 1))
+        if (const auto v = socketley::settings::number<uint64_t>("SOCKETLEY_RAFT_COMPACT_EVERY"))
             raft_cfg.compact_every = *v;
         if (const std::string why = raft_timing_refusal(raft_cfg); !why.empty())
         {

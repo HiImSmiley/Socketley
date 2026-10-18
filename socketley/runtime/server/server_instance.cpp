@@ -26,6 +26,7 @@
 #include "../../shared/http/url.h"
 #include "../../shared/http/status.h"
 #include "../../shared/crypto/mac.h"
+#include "../../shared/util/settings.h"
 
 #include <unistd.h>
 #include <unordered_set>
@@ -2409,10 +2410,7 @@ bool server_instance::setup(event_loop& loop)
 
     // SOCKETLEY_HTTP_REVALIDATE=0 puts disk mode back on an open and read per
     // request, read here so a restart picks it up.
-    if (const char* rv = ::getenv("SOCKETLEY_HTTP_REVALIDATE"))
-        m_http_reval_enabled = !(rv[0] == '0' && rv[1] == '\0');
-    else
-        m_http_reval_enabled = true;
+    m_http_reval_enabled = socketley::settings::flag("SOCKETLEY_HTTP_REVALIDATE", true);
     m_http_reval.clear();
     m_http_reval_bytes = 0;
     m_http_reval_full_logged = false;

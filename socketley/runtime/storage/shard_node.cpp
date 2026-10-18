@@ -14,6 +14,7 @@
 #include "shard_owner.h"
 #include "shard_wire.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/settings.h"
 
 namespace socketley::storage
 {
@@ -22,7 +23,7 @@ shard_node::shard_node(object_store& store, shard_transport& transport)
     : m_store(store), m_transport(transport), m_alive(std::make_shared<bool>(true))
 {
     m_store.set_peers(this);
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_DOC_FAULT"))
+    if (const char* e = settings::text("SOCKETLEY_STORAGE_DOC_FAULT"))
         m_doc_fault = e;
     // Begun past any number an earlier run of shard 0 handed out, so a late word from it is never taken for a new change.
     m_doc_seq = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(

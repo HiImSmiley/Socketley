@@ -19,6 +19,7 @@
 #include "../../shared/util/hex.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/number_parse.h"
+#include "../../shared/util/settings.h"
 
 namespace socketley::storage
 {
@@ -227,9 +228,9 @@ replicator::replicator(event_loop& loop, file_io& io, io_handler* owner, object_
     : m_loop(loop), m_io(io), m_owner(owner), m_store(store), m_hashes(hashes), m_keys(std::move(keys)),
       m_box(loop, io, "replication outbox")
 {
-    if (const char* e = std::getenv("SOCKETLEY_STORAGE_REPLICATION_HOSTS"))
+    if (const char* e = settings::text("SOCKETLEY_STORAGE_REPLICATION_HOSTS"))
         m_hosts_file = e;
-    if (const auto v = getenv_whole<size_t>("SOCKETLEY_STORAGE_CLUSTER_QUEUE", 1))
+    if (const auto v = settings::number<size_t>("SOCKETLEY_STORAGE_CLUSTER_QUEUE"))
         m_node_queue_max = *v;
 }
 

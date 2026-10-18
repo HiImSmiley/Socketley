@@ -31,6 +31,7 @@
 #include "../runtime/dns/dns_wire.h"
 #include "../shared/util/proc_stat.h"
 #include "../shared/ipc/one_command.h"
+#include "../shared/util/settings.h"
 #include <sys/stat.h>
 
 static void publish_dns_names(runtime_manager& manager);
@@ -93,6 +94,7 @@ static std::string names_refusal(runtime_manager& manager, const runtime_instanc
 #include "../shared/util/logging.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/util/number_parse.h"
+#include "../shared/util/settings.h"
 
 // Two seconds is the backstop for a worker that has wedged, not a budget the
 // normal path spends -- a child reports in 17-22 ms -- and it is one budget
@@ -481,8 +483,7 @@ bool daemon_handler::mesh_fits(size_t shards) const
 {
     // The measurement control, so the mesh and the relay differ in the route
     // alone rather than in the build.
-    if (const char* off = ::getenv("SOCKETLEY_NO_SHARD_MESH");
-        off && *off && *off != '0')
+    if (socketley::settings::flag("SOCKETLEY_NO_SHARD_MESH", false))
     {
         LOG_INFO("shard mesh disabled by SOCKETLEY_NO_SHARD_MESH; shards relay "
                  "through the daemon");
@@ -1428,6 +1429,7 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("daemon-name"):    return cmd_daemon_name(conn, pa);
         case fnv1a("daemon-cluster"): return cmd_daemon_cluster(conn, pa);
         case fnv1a("dashboard"):     return cmd_dashboard(conn);
+        case fnv1a("settings"):      return cmd_settings(conn, pa);
         case fnv1a("ping"):          return cmd_ping(conn);
         case fnv1a("idp-user"):      return cmd_idp_user(conn, pa);
         case fnv1a("db-backup"):     return cmd_db_backup(conn, pa);
@@ -5941,8 +5943,7 @@ void daemon_handler::link_peers(proxy_supervisor* from, const std::string& targe
     // for the same reason.
     static const bool disabled = []
     {
-        const char* off = ::getenv("SOCKETLEY_NO_PEER_LINKS");
-        return off && *off && *off != '0';
+        return socketley::settings::flag("SOCKETLEY_NO_PEER_LINKS", false);
     }();
     if (disabled)
         return;
@@ -8423,6 +8424,73 @@ void daemon_handler::set_config_path(std::string path)
 void daemon_handler::start_restored_workers()
 {
     reconcile_proxy_workers();
+}
+
+// Every SOCKETLEY_* setting as this daemon and what it starts see it: its value and where that came from.
+int daemon_handler::cmd_settings(ipc_connection* conn, const parsed_args& pa)
+{
+    namespace st = socketley::settings;
+    bool all = false, json = false;
+    for (size_t i = 1; i < pa.count; ++i)
+    {
+        switch (pa.hashes[i])
+        {
+            case fnv1a("-a"):
+            case fnv1a("--all"):  all  = true; break;
+            case fnv1a("-j"):
+            case fnv1a("--json"): json = true; break;
+            default:
+                conn->write_buf = "unknown argument: " + std::string(pa.args[i]) +
+                                  "\n  usage: socketley settings [-a|--all] [--json|-j]\n";
+                return 1;
+        }
+    }
+    static constexpr const char* audiences[] = {"tuning", "test", "command", "bootstrap", "internal"};
+    struct row
+    {
+        std::string name, value, from;
+        const st::setting* s;
+    };
+    std::vector<row> rows;
+    size_t wn = 7, wv = 5;
+    for (const st::setting& s : st::table)
+    {
+        if (!all && s.who != st::audience::tuning)
+            continue;
+        const char* v = std::getenv(std::string(s.name).c_str());
+        row r{st::config_name(s), v && *v ? v : std::string(s.fallback),
+              !(v && *v) ? "default" : st::from_file(s).load() ? "config" : "environment", &s};
+        wn = std::max(wn, r.name.size());
+        wv = std::max(wv, std::min<size_t>(r.value.size(), 40));
+        rows.push_back(std::move(r));
+    }
+    std::string out;
+    if (json)
+    {
+        out = "[";
+        for (const row& r : rows)
+        {
+            out += out.size() > 1 ? "," : "";
+            out += "{\"name\":" + socketley::json::quote(r.name) + ",\"env\":" + socketley::json::quote(std::string(r.s->name)) +
+                   ",\"value\":" + socketley::json::quote(r.value) + ",\"from\":\"" + r.from + "\",\"for\":\"" +
+                   audiences[static_cast<int>(r.s->who)] + "\",\"meaning\":" + socketley::json::quote(std::string(r.s->meaning)) +
+                   "}";
+        }
+        out += "]\n";
+    }
+    else
+    {
+        const auto pad = [](std::string t, size_t w) { return t.size() >= w ? t + "  " : t + std::string(w - t.size() + 2, ' '); };
+        out = pad("SETTING", wn) + pad("VALUE", wv) + pad("FROM", 11) + (all ? pad("FOR", 9) : std::string()) + "MEANING\n";
+        for (const row& r : rows)
+        {
+            std::string value = r.value.size() > 40 ? r.value.substr(0, 37) + "..." : r.value;
+            out += pad(r.name, wn) + pad(value, wv) + pad(r.from, 11) +
+                   (all ? pad(audiences[static_cast<int>(r.s->who)], 9) : std::string()) + std::string(r.s->meaning) + "\n";
+        }
+    }
+    conn->write_buf = std::move(out);
+    return 0;
 }
 
 int daemon_handler::cmd_dashboard(ipc_connection* conn)

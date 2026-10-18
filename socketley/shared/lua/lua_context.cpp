@@ -8,6 +8,7 @@
 #include "lua_suspend.h"
 #include "lua_storage_api.h"
 #include "lua_db_api.h"
+#include "../util/settings.h"
 
 // Outside the SOCKETLEY_NO_LUA guard: the no-Lua SDK compiles this file too,
 // and the callers that read a load failure back are not conditional on Lua.
@@ -124,7 +125,7 @@ uint32_t default_ms()
     // Read once, because a parse per lua_context would run at every create for
     // nothing.
     static const uint32_t value = [] () -> uint32_t {
-        const char* e = std::getenv("SOCKETLEY_LUA_TIMEOUT_MS");
+        const char* e = socketley::settings::text("SOCKETLEY_LUA_TIMEOUT_MS");
         if (!e || !*e)
             return builtin_default_ms;
 
@@ -999,7 +1000,7 @@ inline constexpr std::chrono::milliseconds http_resolve_default{60000};
 static std::chrono::milliseconds http_resolve_lifetime()
 {
     static const std::chrono::milliseconds ms = [] {
-        const char* e = ::getenv("SOCKETLEY_DNS_CACHE_MS");
+        const char* e = socketley::settings::text("SOCKETLEY_DNS_CACHE_MS");
         if (!e || !*e)
             return http_resolve_default;
         char* end = nullptr;

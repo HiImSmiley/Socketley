@@ -45,6 +45,7 @@
 #include "../shared/util/random_id.h"
 #include "../shared/util/number_parse.h"
 #include "../runtime/dns/dns_wire.h"
+#include "../shared/util/settings.h"
 
 namespace
 {
@@ -72,7 +73,7 @@ class https : public https_client::client
 public:
     bool init(std::string& err)
     {
-        const char* ca = std::getenv("SOCKETLEY_ACME_CA");
+        const char* ca = socketley::settings::text("SOCKETLEY_ACME_CA");
         return client::init(err, ca && *ca ? ca : "", "socketley-acme");
     }
 };
@@ -174,8 +175,8 @@ std::string alpn_cert(const std::string& name, const std::string& key_auth)
 int dns_wait_seconds()
 {
     int wait = 10;
-    if (const auto w = socketley::getenv_whole<int>("SOCKETLEY_ACME_DNS_WAIT", 1))
-        wait = std::min(*w, 3600);
+    if (const auto w = socketley::settings::number<int>("SOCKETLEY_ACME_DNS_WAIT"))
+        wait = *w;
     return wait;
 }
 
@@ -285,7 +286,7 @@ std::vector<std::string> dns_ns_names(const std::string& m)
 // every failed validation counts against the CA's limits; `why` says which it was.
 bool zone_delegated(const std::string& zone, std::string& why)
 {
-    const char* env = std::getenv("SOCKETLEY_ACME_DNS_PROBE");
+    const char* env = socketley::settings::text("SOCKETLEY_ACME_DNS_PROBE");
     if (env && std::string_view(env) == "off")
         return true;
     std::string host, port = "53";
@@ -552,9 +553,8 @@ int issue(int argc, char** argv)
 {
     std::vector<std::string> names, dns_zones;
     std::string cert, key, email, challenge;
-    std::string dir = std::getenv("SOCKETLEY_ACME_DIRECTORY") && *std::getenv("SOCKETLEY_ACME_DIRECTORY")
-                          ? std::getenv("SOCKETLEY_ACME_DIRECTORY")
-                          : std::string(lets_encrypt);
+    const char* directory = socketley::settings::text("SOCKETLEY_ACME_DIRECTORY");
+    std::string dir = directory ? directory : std::string(lets_encrypt);
     for (int i = 3; i < argc; ++i)
     {
         const std::string_view a = argv[i];
@@ -617,7 +617,7 @@ int issue(int argc, char** argv)
     const bool wildcard = std::any_of(names.begin(), names.end(), [](const std::string& n) { return n.starts_with("*."); });
     if (challenge.empty())
     {
-        const char* env = std::getenv("SOCKETLEY_ACME_CHALLENGE");
+        const char* env = socketley::settings::text("SOCKETLEY_ACME_CHALLENGE");
         challenge = wildcard && dns_zones.empty() ? "dns-01" : env && *env ? env : "http-01";
     }
     // Whether `n` (with or without "*.") is proven over DNS-01: every name when that is the challenge, and the

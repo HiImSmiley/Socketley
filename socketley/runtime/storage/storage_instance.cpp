@@ -24,6 +24,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/net/socket_tuning.h"
 #include "../../shared/net/unix_listener.h"
+#include "../../shared/util/settings.h"
 
 using socketley::storage::storage_run;
 
@@ -268,8 +269,7 @@ bool storage_instance::setup(event_loop& loop)
             return false;
         }
         // A browser that asks for HTTP/2 by ALPN is given it, unless SOCKETLEY_STORAGE_HTTP2=0.
-        const char* h2 = std::getenv("SOCKETLEY_STORAGE_HTTP2");
-        tls->enable_h2(!h2 || std::string_view(h2) != "0");
+        tls->enable_h2(socketley::settings::flag("SOCKETLEY_STORAGE_HTTP2", true));
     }
 
     // Read here, at every start, so an edited cluster file is the one a restart takes.
@@ -483,19 +483,9 @@ bool storage_instance::setup(event_loop& loop)
     {
         // The port the Alt-Svc header names is this one unless SOCKETLEY_STORAGE_HTTP3_ADVERTISE says another --
         // the one a proxy in front forwards UDP from -- or 0, for none.
-        const char* h3 = std::getenv("SOCKETLEY_STORAGE_HTTP3");
-        const char* adv = std::getenv("SOCKETLEY_STORAGE_HTTP3_ADVERTISE");
-        uint16_t advertise = effective_port();
-        if (adv && *adv)
-        {
-            unsigned v = 0;
-            const auto [end, ec] = std::from_chars(adv, adv + std::strlen(adv), v);
-            if (ec == std::errc{} && *end == '\0' && v <= 65535)
-                advertise = static_cast<uint16_t>(v);
-            else
-                LOG_WARN("storage: SOCKETLEY_STORAGE_HTTP3_ADVERTISE is not a port; the runtime's own is advertised");
-        }
-        if (!(h3 && std::string_view(h3) == "0"))
+        const uint16_t advertise =
+            socketley::settings::number<uint16_t>("SOCKETLEY_STORAGE_HTTP3_ADVERTISE").value_or(effective_port());
+        if (socketley::settings::flag("SOCKETLEY_STORAGE_HTTP3", true))
             run->h3_open(effective_port(), advertise, get_shard_index(), std::max<uint32_t>(get_shards(), 1),
                          std::string(get_cert_path()), std::string(get_key_path()), std::string(get_ca_path()));
     }
