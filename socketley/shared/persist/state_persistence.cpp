@@ -17,6 +17,7 @@
 #include "../runtime/type_registry.h"
 
 #include "../util/logging.h"
+#include "../util/thread_stop.h"
 #include "../json/json_escape.h"
 #include "replaced_file.h"
 
@@ -1483,13 +1484,7 @@ void state_persistence::drain()
 
 state_persistence::~state_persistence()
 {
-    {
-        std::lock_guard<std::mutex> lk(m_mx);
-        m_stop = true;
-    }
-    m_cv.notify_all();
-    if (m_writer.joinable())
-        m_writer.join();
+    socketley::stop_and_join(m_writer, m_mx, m_cv, m_stop);
 }
 
 std::string state_persistence::raw_field(const std::string& json,

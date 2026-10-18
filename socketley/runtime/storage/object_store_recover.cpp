@@ -36,6 +36,7 @@
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/number_parse.h"
 #include "../../shared/util/settings.h"
+#include "../../shared/util/thread_stop.h"
 
 namespace fs = std::filesystem;
 
@@ -726,14 +727,7 @@ void object_store::start_syncer()
 
 void object_store::stop_syncer()
 {
-    if (!m_syncer.joinable())
-        return;
-    {
-        std::lock_guard lk(m_syncer_mx);
-        m_syncer_stop = true;
-    }
-    m_syncer_cv.notify_all();
-    m_syncer.join();
+    socketley::stop_and_join(m_syncer, m_syncer_mx, m_syncer_cv, m_syncer_stop);
 }
 
 bool object_store::recover_bucket(const std::string& name, recovery_report& rep, std::vector<recovering>& out,

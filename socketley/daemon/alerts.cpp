@@ -20,6 +20,7 @@
 #include "../shared/http/https_client.h"
 #include "../shared/util/log_ring.h"
 #include "../shared/util/logging.h"
+#include "../shared/util/thread_stop.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/persist/replaced_file.h"
 #include "../shared/crypto/cert_keeper.h"
@@ -90,13 +91,7 @@ monitor::monitor(std::string state_path, std::string webhook) : m_path(std::move
 
 monitor::~monitor()
 {
-    {
-        std::lock_guard lock(m_mtx);
-        m_stop = true;
-    }
-    m_cv.notify_all();
-    if (m_thread.joinable())
-        m_thread.join();
+    socketley::stop_and_join(m_thread, m_mtx, m_cv, m_stop);
 }
 
 void monitor::check(int64_t now, const std::vector<facts>& runtimes, const std::vector<std::string>& extra_dirs)
