@@ -41,6 +41,7 @@
 #include <string_view>
 #include <vector>
 
+#include "../shared/http_framing.h"
 #include "../shared/s3_sigv4.h"
 #include "../shared/git_names.h"
 
@@ -380,21 +381,18 @@ private:
         }
         if (lower.find("\r\ntransfer-encoding: chunked") != std::string::npos)
         {
+            http_chunked_decoder dechunk;
             for (;;)
             {
-                size_t nl;
-                while ((nl = m_in.find("\r\n")) == std::string::npos)
-                    if (!fill())
-                        return false;
-                const size_t n = std::strtoul(m_in.c_str(), nullptr, 16);
-                m_in.erase(0, nl + 2);
-                while (m_in.size() < n + 2)
-                    if (!fill())
-                        return false;
-                r.body.append(m_in, 0, n);
-                m_in.erase(0, n + 2);
-                if (n == 0)
+                std::string_view in(m_in), piece;
+                chunk_step step;
+                while ((step = http_chunked_next(dechunk, in, piece)) == chunk_step::payload)
+                    r.body.append(piece);
+                m_in.erase(0, m_in.size() - in.size());
+                if (step == chunk_step::done)
                     break;
+                if (step == chunk_step::bad || !fill())
+                    return false;
             }
         }
         else

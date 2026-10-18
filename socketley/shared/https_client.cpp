@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "http_framing.h"
 #include "tls_context.h"
 
 namespace https_client
@@ -59,26 +60,14 @@ bool parse(const std::string& raw, bool whole, bool head, reply& out, std::strin
     if (strncasecmp(out.header("transfer-encoding").c_str(), "chunked", 7) == 0)
     {
         std::string plain;
-        size_t p = 0;
-        bool last = false;
-        while (p < body.size())
-        {
-            const size_t eol = body.find("\r\n", p);
-            if (eol == std::string::npos)
-                break;
-            const size_t n = std::strtoul(body.c_str() + p, nullptr, 16);
-            if (n == 0)
-            {
-                last = true;
-                break;
-            }
-            // Compared without the sum, which a chunk size near 2^64 would wrap.
-            if (n > body.size() - (eol + 2))
-                break;
-            plain.append(body, eol + 2, n);
-            p = eol + 2 + n + 2;
-        }
-        if (!last)
+        http_chunked_decoder dechunk;
+        std::string_view in(body), piece;
+        chunk_step step;
+        while ((step = http_chunked_next(dechunk, in, piece)) == chunk_step::payload)
+            plain.append(piece);
+        if (step == chunk_step::bad)
+            return fail(err, "the answer's chunks are not chunked framing");
+        if (step != chunk_step::done)
             return fail(err, "the answer ended before its last chunk");
         body = std::move(plain);
     }
@@ -292,8 +281,8 @@ bool client::stream(const std::string& url, const std::vector<std::pair<std::str
         err = "sending to " + hostport + " failed";
     std::string raw;
     bool head_done = false, chunked = false, closed = false;
-    // A chunked body's state: what of the current chunk is left, and the bytes not yet framed.
-    size_t chunk_left = 0;
+    // A chunked body's state, across reads.
+    http_chunked_decoder dechunk;
     while (ok)
     {
         char buf[16384];
@@ -340,33 +329,23 @@ bool client::stream(const std::string& url, const std::vector<std::pair<std::str
         if (!chunked)
             plain.swap(raw);
         else
-            while (!raw.empty())
+        {
+            std::string_view in(raw), piece;
+            chunk_step step;
+            while ((step = http_chunked_next(dechunk, in, piece)) == chunk_step::payload)
+                plain.append(piece);
+            raw.erase(0, raw.size() - in.size());
+            if (step == chunk_step::done)
             {
-                if (chunk_left == 0)
-                {
-                    const size_t eol = raw.find("\r\n");
-                    if (eol == std::string::npos)
-                        break;
-                    // The CRLF that ends the chunk before is the empty line here.
-                    if (eol == 0)
-                    {
-                        raw.erase(0, 2);
-                        continue;
-                    }
-                    chunk_left = std::strtoul(raw.c_str(), nullptr, 16);
-                    raw.erase(0, eol + 2);
-                    if (chunk_left == 0)
-                    {
-                        closed = true;
-                        ok = false;
-                        break;
-                    }
-                }
-                const size_t take = std::min(chunk_left, raw.size());
-                plain.append(raw, 0, take);
-                raw.erase(0, take);
-                chunk_left -= take;
+                closed = true;
+                ok = false;
             }
+            else if (step == chunk_step::bad)
+            {
+                err = "the stream from " + hostport + " is not chunked framing";
+                ok = false;
+            }
+        }
         if (!plain.empty() && !on_data(plain))
             break;
     }
