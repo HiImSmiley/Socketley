@@ -1464,9 +1464,15 @@ static bool write_state_file(const fs::path& path, std::string_view bytes)
         off += static_cast<size_t>(n);
     }
 
-    // fsync before the rename, through the descriptor that wrote the file,
-    // with its failure ignored as it was before this function existed.
-    if (::fsync(fd) < 0) {}
+    // fsync before the rename, through the descriptor that wrote the file, so
+    // the name never points at bytes the disk has not taken.
+    if (::fsync(fd) < 0)
+    {
+        const int err = errno;
+        ::close(fd);
+        fs::remove(tmp_path, ec);
+        return refuse("fsync", std::strerror(err));
+    }
 
     // Checked, where the fsync is not: close is where a deferred write error
     // surfaces, and it stands in for the f.fail() the ofstream form tested.
@@ -1484,6 +1490,19 @@ static bool write_state_file(const fs::path& path, std::string_view bytes)
         fs::remove(tmp_path, ec);
         return refuse("rename", why);
     }
+    // And the rename, which lives in the directory: without its sync a crash
+    // can bring the record from before back.
+    const int dfd = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0 || ::fsync(dfd) < 0)
+    {
+        LOG_WARN(("state file " + path.string() + ": its directory could not be synced: " + std::strerror(errno) +
+                  " -- a crash may bring the record from before back")
+                     .c_str());
+        if (dfd >= 0)
+            ::close(dfd);
+        return false;
+    }
+    ::close(dfd);
     return true;
 }
 
