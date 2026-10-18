@@ -277,8 +277,17 @@ ready_tcp 127.0.0.1 "$P_BOOT" >/dev/null 2>&1 || true
 # a write still queued would otherwise land on top of it, and inside the full
 # suite the file was not there yet at all.
 STATE_DIR=$(sed -n 's/.*state directory: \(.*\)$/\1/p' "$SOCKETLEY_DLOG" | tail -1)
-for _ in $(seq 1 100); do
-    grep -lq '"name": *"oa_b2"' "$STATE_DIR"/*.json 2>/dev/null && break
+# The removals above are queued on the same writer, each synced with its directory, so the pair's files being there
+# says nothing of them: what is waited for is the removed ones gone as well, or a kill leaves them to come back.
+gone_too() {
+    local n
+    for n in oa_first oa_second oa_proxy oa_tcp oa_udp oa_rst oa_shd oa_clu oa_clash; do
+        grep -lq "\"name\": *\"$n\"" "$STATE_DIR"/*.json 2>/dev/null && return 1
+    done
+    return 0
+}
+for _ in $(seq 1 200); do
+    grep -lq '"name": *"oa_b2"' "$STATE_DIR"/*.json 2>/dev/null && gone_too && break
     sleep 0.05
 done
 daemon_kill
