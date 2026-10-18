@@ -27,6 +27,7 @@
 #include "../../shared/http/status.h"
 #include "../../shared/crypto/mac.h"
 #include "../../shared/util/settings.h"
+#include "../../shared/util/text_list.h"
 
 #include <unistd.h>
 #include <unordered_set>
@@ -4190,8 +4191,7 @@ reparse:
                             // same offer.
                             while (!v.empty())
                             {
-                                const size_t comma = v.find(',');
-                                std::string_view tok = v.substr(0, comma);
+                                std::string_view tok = socketley::take_item(v);
                                 while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
                                     tok.remove_prefix(1);
                                 while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
@@ -4201,9 +4201,6 @@ reparse:
                                     ws_version_13 = true;
                                     break;
                                 }
-                                if (comma == std::string_view::npos)
-                                    break;
-                                v.remove_prefix(comma + 1);
                             }
                             break;
                         }

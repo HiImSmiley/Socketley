@@ -26,6 +26,7 @@
 #include "../../shared/util/size_suffix.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/text_list.h"
 #include "../../shared/crypto/mac.h"
 
 namespace socketley::storage
@@ -71,9 +72,7 @@ bool query_names(std::string_view query, std::string_view name)
 {
     while (!query.empty())
     {
-        const size_t amp = query.find('&');
-        const std::string_view part = query.substr(0, amp);
-        query = amp == std::string_view::npos ? std::string_view{} : query.substr(amp + 1);
+        const std::string_view part = take_item(query, '&');
         const size_t eq = part.find('=');
         if (part.substr(0, eq) == name)
             return true;
@@ -398,9 +397,7 @@ bool parse_credentials(std::string_view text, credential_set& out, std::string& 
     };
     while (!text.empty())
     {
-        const size_t nl = text.find('\n');
-        std::string_view line = trim(text.substr(0, nl));
-        text = nl == std::string_view::npos ? std::string_view{} : text.substr(nl + 1);
+        std::string_view line = trim(take_item(text, '\n'));
         ++line_no;
         const std::string where = "line " + std::to_string(line_no);
         if (line.empty() || line.front() == '#')
@@ -950,9 +947,7 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
     if (token.empty())
         for (std::string_view q = req.raw_query; !q.empty();)
         {
-            const size_t amp = q.find('&');
-            const std::string_view part = q.substr(0, amp);
-            q = amp == std::string_view::npos ? std::string_view{} : q.substr(amp + 1);
+            const std::string_view part = take_item(q, '&');
             if (part.starts_with("X-Amz-Security-Token=") && !percent_decode(part.substr(21), token, false))
                 token.clear();
         }

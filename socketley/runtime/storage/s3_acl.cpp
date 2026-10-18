@@ -5,6 +5,7 @@
 
 #include "s3_xml.h"
 #include "s3_xml_tree.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::storage
 {
@@ -252,9 +253,7 @@ bool acl_from_request(const acl_request& rq, bool bucket, const std::string& own
         std::string_view list = rq.grant[i];
         while (!list.empty())
         {
-            const size_t comma = list.find(',');
-            const std::string_view one = trim(list.substr(0, comma));
-            list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+            const std::string_view one = trim(take_item(list));
             if (one.empty())
                 continue;
             const size_t eq = one.find('=');

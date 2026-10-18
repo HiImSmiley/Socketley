@@ -14,6 +14,7 @@
 #include "s3_xml.h"
 #include "../../shared/http/http_framing.h"
 #include "../../shared/util/ascii.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::storage
 {
@@ -269,9 +270,7 @@ inline const cors_rule* cors_match(const cors_config& c, std::string_view origin
         std::string_view rest = request_headers;
         while (ok && !rest.empty())
         {
-            const size_t comma = rest.find(',');
-            const std::string_view h = http_trim_ows(rest.substr(0, comma));
-            rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+            const std::string_view h = http_trim_ows(take_item(rest));
             if (h.empty())
                 continue;
             ok = false;
@@ -328,9 +327,7 @@ inline void cors_render(std::string& out, const cors_rule& r, std::string_view o
         std::string_view rest = request_headers;
         while (!rest.empty())
         {
-            const size_t comma = rest.find(',');
-            const std::string_view h = http_trim_ows(rest.substr(0, comma));
-            rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+            const std::string_view h = http_trim_ows(take_item(rest));
             if (h.empty())
                 continue;
             if (!first)

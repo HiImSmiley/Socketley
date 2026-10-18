@@ -5,6 +5,7 @@
 #include "s3_names.h"
 #include "s3_xml.h"
 #include "s3_xml_tree.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::storage
 {
@@ -174,9 +175,7 @@ bool parse_tagging_header(std::string_view header, tag_set& out, s3_error& err)
         "duplicates.");
     while (!header.empty())
     {
-        const size_t amp = header.find('&');
-        const std::string_view one = header.substr(0, amp);
-        header = amp == std::string_view::npos ? std::string_view{} : header.substr(amp + 1);
+        const std::string_view one = take_item(header, '&');
         if (one.empty())
             continue;
         const size_t eq = one.find('=');

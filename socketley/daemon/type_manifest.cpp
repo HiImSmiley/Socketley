@@ -12,6 +12,7 @@
 
 #include "../cli/arg_parser.h"
 #include "../shared/util/logging.h"
+#include "../shared/util/text_list.h"
 #include "../shared/runtime/runtime_instance.h"
 #include "../shared/runtime/type_registry.h"
 
@@ -219,14 +220,10 @@ bool array_value(std::string_view raw, std::vector<std::string>& out)
         raw = trim(raw);
         if (raw.empty())
             return !out.empty();
-        const size_t comma = raw.find(',');
         std::string  item;
-        if (!scalar_value(raw.substr(0, comma), item))
+        if (!scalar_value(socketley::take_item(raw), item))
             return false;
         out.push_back(std::move(item));
-        if (comma == std::string_view::npos)
-            return true;
-        raw.remove_prefix(comma + 1);
     }
 }
 

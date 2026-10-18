@@ -14,6 +14,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/http/url.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/text_list.h"
 #include "../../shared/crypto/mac.h"
 
 namespace socketley::idp
@@ -61,9 +62,7 @@ bool parse_clients(std::string_view text, std::vector<client>& out, std::string&
     while (!text.empty())
     {
         ++line_no;
-        const size_t nl = text.find('\n');
-        std::string_view line = text.substr(0, nl);
-        text = nl == std::string_view::npos ? std::string_view{} : text.substr(nl + 1);
+        std::string_view line = take_item(text, '\n');
         // A comment begins at a # that starts a word, so one inside an address is the address's.
         for (size_t h = line.find('#'); h != std::string_view::npos; h = line.find('#', h + 1))
             if (h == 0 || line[h - 1] == ' ' || line[h - 1] == '\t')

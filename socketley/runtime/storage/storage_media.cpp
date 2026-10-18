@@ -48,6 +48,7 @@
 #include "../../shared/crypto/mac.h"
 #include "../../shared/util/number_parse.h"
 #include "../../shared/util/settings.h"
+#include "../../shared/util/text_list.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -276,11 +277,9 @@ std::string search_path(std::string_view name)
     std::string_view rest = path ? path : "/usr/local/bin:/usr/bin:/bin";
     while (!rest.empty())
     {
-        const size_t colon = rest.find(':');
-        const std::string cand = std::string(rest.substr(0, colon)) + "/" + std::string(name);
+        const std::string cand = std::string(take_item(rest, ':')) + "/" + std::string(name);
         if (::access(cand.c_str(), X_OK) == 0)
             return cand;
-        rest = colon == std::string_view::npos ? std::string_view{} : rest.substr(colon + 1);
     }
     return {};
 }

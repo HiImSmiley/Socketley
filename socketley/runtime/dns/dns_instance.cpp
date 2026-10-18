@@ -29,6 +29,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/net/ip_block.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/text_list.h"
 #include "../../shared/persist/replaced_file.h"
 
 namespace socketley::dns
@@ -117,20 +118,15 @@ bool parse_target(std::string_view s, sockaddr_storage& out, socklen_t& len)
 std::vector<std::string> split_csv(std::string_view s)
 {
     std::vector<std::string> out;
-    size_t pos = 0;
-    while (pos < s.size())
+    while (!s.empty())
     {
-        const size_t comma = s.find(',', pos);
-        std::string_view item = s.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
+        std::string_view item = take_item(s);
         while (!item.empty() && item.front() == ' ')
             item.remove_prefix(1);
         while (!item.empty() && item.back() == ' ')
             item.remove_suffix(1);
         if (!item.empty())
             out.emplace_back(item);
-        if (comma == std::string_view::npos)
-            break;
-        pos = comma + 1;
     }
     return out;
 }

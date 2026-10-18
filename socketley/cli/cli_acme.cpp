@@ -44,6 +44,7 @@
 #include "../shared/util/base64.h"
 #include "../shared/util/random_id.h"
 #include "../shared/util/number_parse.h"
+#include "../shared/util/text_list.h"
 #include "../runtime/dns/dns_wire.h"
 #include "../shared/util/settings.h"
 
@@ -568,13 +569,9 @@ int issue(int argc, char** argv)
         bool ok = true;
         if (a == "--domains" && (ok = value(v)))
         {
-            for (size_t p = 0; p <= v.size();)
-            {
-                const size_t comma = std::min(v.find(',', p), v.size());
-                if (comma > p)
-                    names.push_back(v.substr(p, comma - p));
-                p = comma + 1;
-            }
+            for (std::string_view rest = v; !rest.empty();)
+                if (const std::string_view one = socketley::take_item(rest); !one.empty())
+                    names.emplace_back(one);
         }
         else if (a == "--cert")
             ok = value(cert);
@@ -590,13 +587,9 @@ int issue(int argc, char** argv)
         // says, which needs no port open, and --challenge is left for the others.
         else if (a == "--dns-zones" && (ok = value(v)))
         {
-            for (size_t p = 0; p <= v.size();)
-            {
-                const size_t comma = std::min(v.find(',', p), v.size());
-                if (comma > p)
-                    dns_zones.push_back(v.substr(p, comma - p));
-                p = comma + 1;
-            }
+            for (std::string_view rest = v; !rest.empty();)
+                if (const std::string_view one = socketley::take_item(rest); !one.empty())
+                    dns_zones.emplace_back(one);
         }
         else
             ok = false;

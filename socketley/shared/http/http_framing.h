@@ -13,6 +13,8 @@
 #include <string_view>
 #include <system_error>
 
+#include "../util/text_list.h"
+
 // Same spelling and guards as event_loop_definitions.h, repeated rather than
 // included so this header stays reachable from a fuzz target that links
 // nothing.
@@ -234,12 +236,9 @@ inline bool http_eol_framing_ok(std::string_view bytes, bool complete)
 inline bool http_te_codings_ok(std::string_view val, bool& chunked_seen,
                                bool* other_seen = nullptr)
 {
-    size_t pos = 0;
-    for (;;)
+    while (!val.empty())
     {
-        const auto comma = val.find(',', pos);
-        const size_t end = (comma == std::string_view::npos) ? val.size() : comma;
-        std::string_view coding = val.substr(pos, end - pos);
+        std::string_view coding = socketley::take_item(val);
 
         if (const auto semi = coding.find(';'); semi != std::string_view::npos)
             coding = coding.substr(0, semi);
@@ -263,11 +262,8 @@ inline bool http_te_codings_ok(std::string_view val, bool& chunked_seen,
                 // be knowable separately from whether the message is framed.
                 *other_seen = true;
         }
-
-        if (comma == std::string_view::npos)
-            return true;
-        pos = comma + 1;
     }
+    return true;
 }
 
 // What one header block says about the framing of its own message, gathered

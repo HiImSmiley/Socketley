@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 
 #include "../../shared/util/logging.h"
+#include "../../shared/util/text_list.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/runtime/runtime_name.h"
 #include "../storage/outbound_http.h"
@@ -104,17 +105,15 @@ void sync_instance::set_dir(std::string_view path)
 std::vector<std::string> sync_instance::storage_targets() const
 {
     std::vector<std::string> out;
-    for (size_t p = 0; p <= m_storage.size();)
+    for (std::string_view rest = m_storage; !rest.empty();)
     {
-        const size_t comma = std::min(m_storage.find(',', p), m_storage.size());
-        std::string one(m_storage.substr(p, comma - p));
+        std::string one(socketley::take_item(rest));
         while (!one.empty() && (one.front() == ' ' || one.front() == '\t'))
             one.erase(one.begin());
         while (!one.empty() && (one.back() == ' ' || one.back() == '\t'))
             one.pop_back();
         if (!one.empty())
             out.push_back(std::move(one));
-        p = comma + 1;
     }
     return out;
 }

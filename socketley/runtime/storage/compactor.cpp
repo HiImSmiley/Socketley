@@ -9,6 +9,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/util/hex.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::storage
 {
@@ -88,9 +89,7 @@ void compactor::open(const std::string& dir, uint32_t shard)
     std::string_view text(buf, n > 0 ? static_cast<size_t>(n) : 0);
     while (!text.empty())
     {
-        const size_t nl = text.find('\n');
-        const std::string_view line = text.substr(0, nl);
-        text = nl == std::string_view::npos ? std::string_view{} : text.substr(nl + 1);
+        const std::string_view line = take_item(text, '\n');
         const size_t sp = line.find(' ');
         if (sp == std::string_view::npos)
             continue;

@@ -15,6 +15,7 @@
 #include "../../shared/http/status.h"
 #include "../../shared/net/peer_address.h"
 #include "../../shared/util/settings.h"
+#include "../../shared/util/text_list.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -4841,9 +4842,7 @@ void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
                 std::string_view list = line.substr(colon + 1);
                 while (!list.empty())
                 {
-                    const size_t comma = list.find(',');
-                    std::string token(http_trim_ows(list.substr(0, comma)));
-                    list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+                    std::string token(http_trim_ows(socketley::take_item(list)));
                     for (char& ch : token)
                         ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
                     if (!token.empty() && token != "close" && token != "keep-alive" && token != "upgrade" &&

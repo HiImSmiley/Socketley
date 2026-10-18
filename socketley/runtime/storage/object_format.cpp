@@ -12,6 +12,7 @@
 #include "../../shared/util/byte_codec.h"
 #include "../../shared/util/number_parse.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::storage
 {
@@ -738,9 +739,7 @@ bool etag_list_matches(std::string_view list, std::string_view etag)
     };
     while (!list.empty())
     {
-        const size_t comma = list.find(',');
-        std::string_view one = trim(list.substr(0, comma));
-        list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+        std::string_view one = trim(take_item(list));
         if (one.starts_with("W/"))
             one.remove_prefix(2);
         if (one.size() >= 2 && one.front() == '"' && one.back() == '"')

@@ -22,6 +22,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/util/number_parse.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::storage
 {
@@ -149,9 +150,7 @@ bool parse_checksum_request(const s3_request& r, checksum_request& out, s3_error
     std::string_view trailers = r.header("x-amz-trailer");
     while (!trailers.empty())
     {
-        const size_t comma = trailers.find(',');
-        std::string name(http_trim_ows(trailers.substr(0, comma)));
-        trailers = comma == std::string_view::npos ? std::string_view{} : trailers.substr(comma + 1);
+        std::string name(http_trim_ows(take_item(trailers)));
         for (char& ch : name)
             ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
         if (!is_checksum_header(name))
@@ -1202,9 +1201,7 @@ bool storage_run::object_meta_from_headers(const std::shared_ptr<conn>& c, objec
             std::string_view codings = value;
             while (!codings.empty())
             {
-                const size_t comma = codings.find(',');
-                const std::string_view one = http_trim_ows(codings.substr(0, comma));
-                codings = comma == std::string_view::npos ? std::string_view{} : codings.substr(comma + 1);
+                const std::string_view one = http_trim_ows(take_item(codings));
                 if (one.empty() || http_token_equals(one, "aws-chunked", 11))
                     continue;
                 rest += rest.empty() ? "" : ", ";
@@ -1915,9 +1912,7 @@ bool parse_attr_query(const s3_request& q, attr_query& a, std::string_view& bad)
         return false;
     while (!list.empty())
     {
-        const size_t comma = list.find(',');
-        const std::string_view one = http_trim_ows(list.substr(0, comma));
-        list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+        const std::string_view one = http_trim_ows(take_item(list));
         if (one == "ETag")
             a.etag = true;
         else if (one == "Checksum")

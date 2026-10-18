@@ -19,6 +19,7 @@
 #include "../../shared/http/http_framing.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/ascii.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::storage
 {
@@ -155,9 +156,7 @@ std::vector<target_line> split_target_lines(std::string_view text)
     size_t line_no = 0;
     while (!text.empty())
     {
-        const size_t nl = text.find('\n');
-        std::string_view line = trim(text.substr(0, nl));
-        text = nl == std::string_view::npos ? std::string_view{} : text.substr(nl + 1);
+        std::string_view line = trim(take_item(text, '\n'));
         ++line_no;
         target_line t;
         t.line_no = line_no;
@@ -258,9 +257,7 @@ std::vector<http_endpoint> resolve_http_host(const std::string& host, uint16_t p
         std::string_view rest = text;
         while (!rest.empty())
         {
-            const size_t nl = rest.find('\n');
-            std::string_view line = trim(rest.substr(0, nl));
-            rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+            std::string_view line = trim(take_item(rest, '\n'));
             const size_t sp = line.find_first_of(" \t");
             if (sp == std::string_view::npos || line.substr(0, sp) != host)
                 continue;

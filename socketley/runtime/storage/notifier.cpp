@@ -11,6 +11,7 @@
 #include "../../shared/util/number_parse.h"
 #include "../../shared/ipc/one_command.h"
 #include "../../shared/util/settings.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::storage
 {
@@ -49,9 +50,7 @@ bool parse_notify_targets(std::string_view text, std::vector<notify_target>& out
         {
             const bool cache = url.starts_with("cache://");
             std::string_view rest = url.substr(cache ? 8 : 9);
-            const size_t slash = rest.find('/');
-            t.runtime = std::string(rest.substr(0, slash));
-            rest = slash == std::string_view::npos ? std::string_view{} : rest.substr(slash + 1);
+            t.runtime = std::string(take_item(rest, '/'));
             if (cache && rest.starts_with("stream/"))
                 t.k = notify_target::kind::cache_stream;
             else if (cache && rest.starts_with("channel/"))

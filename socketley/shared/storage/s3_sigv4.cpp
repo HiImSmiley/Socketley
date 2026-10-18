@@ -3,6 +3,7 @@
 #include "../util/base64.h"
 #include "../crypto/mac.h"
 #include "../util/ascii.h"
+#include "../util/text_list.h"
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -638,9 +639,7 @@ verify_result verify(const request_view& req, const verify_options& opts, const 
         bool has_cred = false, has_signed = false, has_sig = false;
         while (!v.empty())
         {
-            size_t comma = v.find(',');
-            std::string_view item = trim(v.substr(0, comma));
-            v = comma == std::string_view::npos ? std::string_view{} : v.substr(comma + 1);
+            std::string_view item = trim(take_item(v));
             size_t eq = item.find('=');
             if (eq == std::string_view::npos)
                 return malformed(a.form, "The authorization header is malformed; a component has no value.");
@@ -1237,9 +1236,7 @@ bool chunk_stream::on_trailer()
         std::string canon;
         for (std::string_view headers = body.substr(0, line_start); !headers.empty();)
         {
-            const size_t eol = headers.find('\n');
-            std::string_view line = headers.substr(0, eol);
-            headers = eol == std::string_view::npos ? std::string_view{} : headers.substr(eol + 1);
+            std::string_view line = take_item(headers, '\n');
             if (!line.empty() && line.back() == '\r')
                 line.remove_suffix(1);
             if (line.empty())

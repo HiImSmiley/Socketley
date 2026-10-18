@@ -10,6 +10,7 @@
 #include "../loop/event_loop.h"
 #include "../lua/lua_context.h"
 #include "../util/id_generator.h"
+#include "../util/text_list.h"
 #include "runtime_manager.h"
 #include <iostream>
 #include <iomanip>
@@ -1175,11 +1176,9 @@ void runtime_instance::set_acme_domains(std::string_view comma_list)
     m_acme_domains.clear();
     while (!comma_list.empty())
     {
-        const size_t comma = comma_list.find(',');
-        const std::string_view d = comma_list.substr(0, comma);
+        const std::string_view d = socketley::take_item(comma_list);
         if (!d.empty())
             m_acme_domains.emplace_back(d);
-        comma_list = comma == std::string_view::npos ? std::string_view{} : comma_list.substr(comma + 1);
     }
 }
 std::string_view runtime_instance::get_cert_path() const { return m_cert_path; }

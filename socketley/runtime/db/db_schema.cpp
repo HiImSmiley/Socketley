@@ -1,6 +1,7 @@
 #include "db_schema.h"
 
 #include "db_doc.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::db
 {
@@ -15,9 +16,7 @@ bool each_line(std::string_view text, F&& f)
     size_t line_no = 0;
     while (!text.empty())
     {
-        const size_t nl = text.find('\n');
-        std::string_view line = text.substr(0, nl);
-        text = nl == std::string_view::npos ? std::string_view{} : text.substr(nl + 1);
+        std::string_view line = take_item(text, '\n');
         ++line_no;
         std::vector<std::string_view> words;
         while (true)

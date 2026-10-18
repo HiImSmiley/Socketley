@@ -34,6 +34,7 @@
 #include "../../shared/crypto/mac.h"
 #include "../../shared/util/number_parse.h"
 #include "../../shared/util/settings.h"
+#include "../../shared/util/text_list.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -1120,13 +1121,11 @@ bool storage_run::notify_allowed(std::string_view url)
                                        "https://hooks.slack.com/,https://ntfy.sh/";
         while (!v.empty())
         {
-            const size_t comma = v.find(',');
-            std::string_view one = v.substr(0, comma);
+            std::string_view one = take_item(v);
             while (!one.empty() && one.front() == ' ')
                 one.remove_prefix(1);
             if (!one.empty())
                 out.emplace_back(one);
-            v = comma == std::string_view::npos ? std::string_view{} : v.substr(comma + 1);
         }
         return out;
     }();

@@ -35,6 +35,7 @@
 #include "../../shared/util/base64.h"
 #include "../../shared/util/number_parse.h"
 #include "../../shared/util/settings.h"
+#include "../../shared/util/text_list.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -1970,9 +1971,7 @@ bool storage_run::parse_head(const std::shared_ptr<conn>& c, std::string_view he
     std::string_view qs = r.raw_query;
     while (!qs.empty())
     {
-        const size_t amp = qs.find('&');
-        const std::string_view part = qs.substr(0, amp);
-        qs = amp == std::string_view::npos ? std::string_view{} : qs.substr(amp + 1);
+        const std::string_view part = take_item(qs, '&');
         if (part.empty())
             continue;
         const size_t eq = part.find('=');

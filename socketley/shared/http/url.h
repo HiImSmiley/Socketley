@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "../util/hex.h"
+#include "../util/text_list.h"
 
 namespace socketley::http
 {
@@ -96,9 +97,7 @@ void for_each_pair(std::string_view q, F&& f)
 {
     while (!q.empty())
     {
-        const size_t amp = q.find('&');
-        const std::string_view part = q.substr(0, amp);
-        q = amp == std::string_view::npos ? std::string_view{} : q.substr(amp + 1);
+        const std::string_view part = take_item(q, '&');
         if (part.empty())
             continue;
         const size_t eq = part.find('=');

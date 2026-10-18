@@ -29,6 +29,7 @@
 #include "../runtime/storage/sync_mode.h"
 #include "../runtime/storage/sync_runners.h"
 #include "../shared/util/number_parse.h"
+#include "../shared/util/text_list.h"
 
 // Five flags that describe inbound traffic are refused on a client, which
 // accepts none, because they were stored and reported by `show` while no code
@@ -1281,19 +1282,13 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
                 return 1;
             }
             std::string_view backend_str = pa.args[++i];
-
-            size_t start = 0;
-            size_t comma;
-            while ((comma = backend_str.find(',', start)) != std::string_view::npos)
+            while (!backend_str.empty())
             {
                 // An empty component is a doubled comma and not a backend,
                 // which is the rule --upstream's own loop already applies.
-                if (comma > start)
-                    proxy->add_backend(backend_str.substr(start, comma - start));
-                start = comma + 1;
+                if (const std::string_view one = socketley::take_item(backend_str); !one.empty())
+                    proxy->add_backend(one);
             }
-            if (start < backend_str.size())
-                proxy->add_backend(backend_str.substr(start));
             return 0;
         }
         case fnv1a("--protocol"):

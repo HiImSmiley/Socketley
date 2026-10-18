@@ -13,6 +13,7 @@
 #include "s3_public_access.h"
 #include "s3_sigv4_auth.h"
 #include "s3_xml.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::storage
 {
@@ -123,9 +124,7 @@ private:
     {
         while (!text.empty())
         {
-            const size_t amp = text.find('&');
-            const std::string_view part = text.substr(0, amp);
-            text = amp == std::string_view::npos ? std::string_view{} : text.substr(amp + 1);
+            const std::string_view part = take_item(text, '&');
             const size_t eq = part.find('=');
             std::string k, v;
             if (!percent_decode(part.substr(0, eq), k, true) ||

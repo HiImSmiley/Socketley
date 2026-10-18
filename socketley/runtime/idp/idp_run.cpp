@@ -36,6 +36,7 @@
 #include "../../shared/http/cookie.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/random_id.h"
+#include "../../shared/util/text_list.h"
 #include "../../shared/crypto/mac.h"
 #include "../../shared/net/peer_address.h"
 
@@ -575,9 +576,7 @@ std::string idp_run::profile_claims(const account& who) const
     std::string_view g = who.field("groups");
     while (!g.empty())
     {
-        const size_t comma = g.find(',');
-        std::string_view one = http_trim_ows(g.substr(0, comma));
-        g = comma == std::string_view::npos ? std::string_view{} : g.substr(comma + 1);
+        std::string_view one = http_trim_ows(take_item(g));
         if (one.empty())
             continue;
         if (!groups.empty())
@@ -1357,9 +1356,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
     }
     while (!payload.empty())
     {
-        const size_t nl = payload.find('\n');
-        args.emplace_back(payload.substr(0, nl));
-        payload = nl == std::string_view::npos ? std::string_view{} : payload.substr(nl + 1);
+        args.emplace_back(take_item(payload, '\n'));
     }
     if (args.empty())
     {

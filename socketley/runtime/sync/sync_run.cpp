@@ -15,6 +15,7 @@
 #include <shared_mutex>
 
 #include "../../shared/util/logging.h"
+#include "../../shared/util/text_list.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/storage/s3_sigv4.h"
@@ -336,11 +337,9 @@ bool sync_run::start(std::string& why)
         names.push_back(t.name);
     m_index.retain(names);
 
-    const std::string_view ex = m_rt.get_exclude();
-    for (size_t p = 0; p <= ex.size();)
+    for (std::string_view ex = m_rt.get_exclude(); !ex.empty();)
     {
-        const size_t comma = std::min(ex.find(',', p), ex.size());
-        std::string_view one = ex.substr(p, comma - p);
+        std::string_view one = take_item(ex);
         // `*.tmp, *.md` is how a list is written by hand, and a pattern starting with a space matches nothing.
         while (!one.empty() && (one.front() == ' ' || one.front() == '\t'))
             one.remove_prefix(1);
@@ -348,7 +347,6 @@ bool sync_run::start(std::string& why)
             one.remove_suffix(1);
         if (!one.empty())
             m_exclude.emplace_back(one);
-        p = comma + 1;
     }
 
     // What is being brought from the storage is no file of this side's until it is whole.

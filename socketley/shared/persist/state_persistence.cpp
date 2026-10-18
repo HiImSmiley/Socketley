@@ -18,6 +18,7 @@
 
 #include "../util/logging.h"
 #include "../util/thread_stop.h"
+#include "../util/text_list.h"
 #include "../json/json_escape.h"
 #include "replaced_file.h"
 
@@ -160,20 +161,15 @@ std::string server_send_to_str(uint8_t mask)
 uint8_t str_to_server_send_to(std::string_view s)
 {
     uint8_t mask = 0;
-    size_t start = 0;
-    while (start <= s.size())
+    while (!s.empty())
     {
-        size_t comma = s.find(',', start);
-        if (comma == std::string_view::npos) comma = s.size();
-        switch (fnv1a(s.substr(start, comma - start)))
+        switch (fnv1a(socketley::take_item(s)))
         {
             case fnv1a("sender"): mask |= 1; break;
             case fnv1a("others"): mask |= 2; break;
             case fnv1a("master"): mask |= 4; break;
             default: break;
         }
-        if (comma == s.size()) break;
-        start = comma + 1;
     }
     return mask;
 }

@@ -31,6 +31,7 @@
 #include "outbound_http.h"
 #include "s3_names.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/text_list.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -305,11 +306,7 @@ bool claim_names(const jvalue& v, std::vector<std::string>& out)
     auto split = [&add](std::string_view s)
     {
         while (!s.empty())
-        {
-            const size_t comma = s.find(',');
-            add(s.substr(0, comma));
-            s = comma == std::string_view::npos ? std::string_view{} : s.substr(comma + 1);
-        }
+            add(take_item(s));
     };
     if (v.k == jvalue::kind::string)
         split(v.s);

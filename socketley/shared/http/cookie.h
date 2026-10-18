@@ -2,6 +2,8 @@
 
 #include <string_view>
 
+#include "../util/text_list.h"
+
 namespace socketley::http
 {
 
@@ -13,9 +15,7 @@ bool for_each_cookie(std::string_view header, std::string_view name, F&& visit)
 {
     while (!header.empty())
     {
-        const size_t semi = header.find(';');
-        std::string_view part = header.substr(0, semi);
-        header = semi == std::string_view::npos ? std::string_view{} : header.substr(semi + 1);
+        std::string_view part = take_item(header, ';');
         while (!part.empty() && (part.front() == ' ' || part.front() == '\t'))
             part.remove_prefix(1);
         if (part.size() > name.size() && part.starts_with(name) && part[name.size()] == '=' &&

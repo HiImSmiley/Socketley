@@ -13,6 +13,7 @@
 #include "sse.h"
 #include "tierer.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::storage
 {
@@ -201,9 +202,7 @@ std::string entry_name(std::string_view rel)
     std::string out;
     while (!rel.empty())
     {
-        const size_t slash = rel.find('/');
-        const std::string_view seg = rel.substr(0, slash);
-        rel = slash == std::string_view::npos ? std::string_view{} : rel.substr(slash + 1);
+        const std::string_view seg = take_item(rel, '/');
         if (seg.empty() || seg == "." || seg == "..")
             continue;
         if (!out.empty())

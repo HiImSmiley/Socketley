@@ -25,6 +25,7 @@
 #include "../../shared/net/socket_tuning.h"
 #include "../../shared/net/unix_listener.h"
 #include "../../shared/util/settings.h"
+#include "../../shared/util/text_list.h"
 
 using socketley::storage::storage_run;
 
@@ -140,9 +141,7 @@ bool storage_instance::tls_offloaded_blocks(std::vector<socketley::storage::buck
     std::string_view rest = m_tls_offloaded;
     while (!rest.empty())
     {
-        const size_t comma = rest.find(',');
-        const std::string_view one = rest.substr(0, comma);
-        rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+        const std::string_view one = socketley::take_item(rest);
         socketley::storage::bucket_policy::cidr c;
         if (!socketley::storage::parse_cidr_text(one, c))
             return false;

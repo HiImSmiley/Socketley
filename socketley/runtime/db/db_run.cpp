@@ -30,6 +30,7 @@
 #include "../../shared/http/status.h"
 #include "../../shared/http/request_head.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/text_list.h"
 #include "../../shared/crypto/mac.h"
 #include "../../shared/loop/eventfd_wake.h"
 
@@ -146,9 +147,7 @@ bool db_run::start(std::string& why)
     m_idp.configure(m_owner.get_idp());
     for (std::string_view list = m_owner.get_origins(); !list.empty();)
     {
-        const size_t comma = list.find(',');
-        const std::string_view one = http_trim_ows(list.substr(0, comma));
-        list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+        const std::string_view one = http_trim_ows(take_item(list));
         if (!one.empty())
             m_origins.emplace_back(one);
     }
@@ -433,9 +432,7 @@ void db_run::open_feed(const std::shared_ptr<conn>& c, const request& rq, std::s
     std::string_view s = rq.last_event_id;
     for (std::string_view q = rq.query; s.empty() && !q.empty();)
     {
-        const size_t amp = q.find('&');
-        const std::string_view kv = q.substr(0, amp);
-        q = amp == std::string_view::npos ? std::string_view{} : q.substr(amp + 1);
+        const std::string_view kv = take_item(q, '&');
         if (kv.starts_with("since="))
             s = kv.substr(6);
     }
@@ -694,9 +691,7 @@ void db_run::replica_main()
                     uint64_t id = 0;
                     for (std::string_view rest = block; !rest.empty();)
                     {
-                        const size_t nl = rest.find('\n');
-                        const std::string_view line = rest.substr(0, nl);
-                        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+                        const std::string_view line = take_item(rest, '\n');
                         if (line.starts_with("id: "))
                             std::from_chars(line.data() + 4, line.data() + line.size(), id);
                         else if (line.starts_with("event: "))

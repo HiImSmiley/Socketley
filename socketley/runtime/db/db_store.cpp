@@ -21,6 +21,7 @@
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/random_id.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::db
 {
@@ -1129,9 +1130,7 @@ bool read_v1(const std::string& dir, std::map<std::pair<std::string, std::string
         bool header = false;
         for (std::string_view rest = text; !rest.empty();)
         {
-            const size_t nl = rest.find('\n');
-            const std::string_view line = rest.substr(0, nl);
-            rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+            const std::string_view line = take_item(rest, '\n');
             if (line.empty())
                 continue;
             const size_t tab = line.find('\t');

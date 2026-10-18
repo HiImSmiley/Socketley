@@ -8,6 +8,7 @@
 #include "s3_names.h"
 #include "s3_xml.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/text_list.h"
 #include "../../shared/crypto/mac.h"
 
 namespace socketley::storage
@@ -138,9 +139,7 @@ bool parse_form_fields(std::string_view text, std::vector<std::pair<std::string,
 {
     while (!text.empty())
     {
-        const size_t amp = text.find('&');
-        const std::string_view part = text.substr(0, amp);
-        text = amp == std::string_view::npos ? std::string_view{} : text.substr(amp + 1);
+        const std::string_view part = take_item(text, '&');
         if (part.empty())
             continue;
         const size_t eq = part.find('=');

@@ -3,6 +3,7 @@
 #include "../../runtime/proxy/proxy_instance.h"
 #include "../../runtime/storage/storage_instance.h"
 #include "../../runtime/dns/dns_instance.h"
+#include "../util/text_list.h"
 
 #include <algorithm>
 
@@ -14,17 +15,15 @@ namespace
 
 void add_list(std::string_view csv, std::vector<std::string>& out, bool with_wildcard)
 {
-    for (size_t p = 0; p <= csv.size();)
+    while (!csv.empty())
     {
-        const size_t comma = std::min(csv.find(',', p), csv.size());
-        std::string n = normal(csv.substr(p, comma - p));
+        std::string n = normal(socketley::take_item(csv));
         if (!n.empty())
         {
             if (with_wildcard && !n.starts_with("*."))
                 out.push_back("*." + n);
             out.push_back(std::move(n));
         }
-        p = comma + 1;
     }
 }
 

@@ -20,6 +20,7 @@
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/random_id.h"
+#include "../../shared/util/text_list.h"
 
 namespace socketley::idp
 {
@@ -71,15 +72,13 @@ bool account::in_group(std::string_view group) const
     std::string_view g = field("groups");
     while (!g.empty())
     {
-        const size_t comma = g.find(',');
-        std::string_view one = g.substr(0, comma);
+        std::string_view one = take_item(g);
         while (!one.empty() && one.front() == ' ')
             one.remove_prefix(1);
         while (!one.empty() && one.back() == ' ')
             one.remove_suffix(1);
         if (one == group)
             return true;
-        g = comma == std::string_view::npos ? std::string_view{} : g.substr(comma + 1);
     }
     return false;
 }
