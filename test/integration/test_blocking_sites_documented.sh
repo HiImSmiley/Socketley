@@ -76,8 +76,9 @@ still_there "the resolver on a client's first dial" \
             'lookup_now\(' runtime/client/client_instance.cpp
 still_there "the journal writes from the loop" \
             'journal_flush_now|m_journal\.flush' runtime/cache/cache_instance.cpp
-still_there "the state file is fsynced from the loop" \
-            '(^|[^_a-zA-Z0-9>.])fsync\(' shared/persist/state_persistence.cpp
+# The state file is named as written off the loop, which holds while its writer is a thread.
+if grep -qE 'std::thread\(&state_persistence::writer_loop' "$SRC/shared/persist/state_persistence.cpp"; then pass
+else fail "the state file is written off the loop" "the section says a thread writes it and the source no longer does"; fi
 
 # The measured claim that is NOT a blocking site, kept because a suspicion
 # tested and rejected is worth as much as one confirmed -- and because without

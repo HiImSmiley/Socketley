@@ -8,6 +8,7 @@
 #include "../shared/cluster/raft_codec.h"
 #include "../shared/util/random_id.h"
 #include "../shared/net/socket_tuning.h"
+#include "../shared/persist/replaced_file.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -442,18 +443,8 @@ bool raft_host::load_identity(std::string& err)
     }
 
     m_id = random_u64();
-    const std::string tmp = path + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    const std::string text = hex_id(m_id) + "\n";
-    const bool ok = fd >= 0 && ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size())
-                 && ::fsync(fd) == 0;
-    if (fd >= 0)
-        ::close(fd);
-    if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0)
-    {
-        err = "cannot write " + path + ": " + std::strerror(errno);
+    if (!socketley::replace_file(path, hex_id(m_id) + "\n", socketley::durability::data, &err))
         return false;
-    }
     return true;
 }
 

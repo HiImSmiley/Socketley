@@ -694,7 +694,7 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
                 ++now.downloads;
                 if (now.burn && now.downloads >= now.max_downloads)
                     now.drained_ms = now_ms();
-                allowed = replace_file(path, share_json(now), true);
+                allowed = replace_file(path, share_json(now), durability::data_and_dir);
                 if (allowed)
                     share_sent(id, share_json(now), {});
                 if (allowed && !now.notify.empty())
@@ -909,7 +909,7 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
         app_reply(c, 500, "The links' folder cannot be made.\n");
         return;
     }
-    if (!replace_file(dir + "/" + s.id + ".json", share_json(s), true))
+    if (!replace_file(dir + "/" + s.id + ".json", share_json(s), durability::data_and_dir))
     {
         app_reply(c, 500, "The link could not be kept.\n");
         return;
@@ -974,7 +974,7 @@ st storage_run::share_take(const std::string& id, const std::string& json)
         for (const auto& [node, n] : in.by_node)
             in.downloads += n;
     }
-    const bool ok = replace_file(path, share_json(in), true);
+    const bool ok = replace_file(path, share_json(in), durability::data_and_dir);
     ::flock(fd, LOCK_UN);
     ::close(fd);
     return ok ? st::ok : st::io_error;

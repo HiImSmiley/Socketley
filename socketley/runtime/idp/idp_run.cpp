@@ -29,6 +29,7 @@
 #include "../storage/password_hash.h"
 #include "../storage/scrypt.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::idp
 {
@@ -212,11 +213,8 @@ bool idp_run::start(std::string& why)
     if (!m_reader)
     {
         const std::string path = idp_jwks_path(m_owner.get_name());
-        const std::string tmp = path + ".new";
-        std::ofstream f(tmp, std::ios::trunc);
-        f << "{\"issuer\":" << socketley::json::quote(m_issuer) << ",\"keys\":[" << m_jwk << "]}\n";
-        f.close();
-        if (!f || ::rename(tmp.c_str(), path.c_str()) != 0)
+        const std::string doc = "{\"issuer\":" + socketley::json::quote(m_issuer) + ",\"keys\":[" + m_jwk + "]}\n";
+        if (!replace_file(path, doc, durability::none, nullptr, 0644))
         {
             why = "the public key could not be written to " + path;
             return false;

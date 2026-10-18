@@ -1,5 +1,6 @@
 #include "dns_feed.h"
 #include "../persist/paths.h"
+#include "../persist/replaced_file.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -34,31 +35,7 @@ bool write_atomic(const std::string& path, std::string_view data)
 {
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-    const std::string tmp = path + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0)
-        return false;
-    size_t off = 0;
-    while (off < data.size())
-    {
-        const ssize_t n = ::write(fd, data.data() + off, data.size() - off);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-        {
-            ::close(fd);
-            ::unlink(tmp.c_str());
-            return false;
-        }
-        off += static_cast<size_t>(n);
-    }
-    ::close(fd);
-    if (::rename(tmp.c_str(), path.c_str()) < 0)
-    {
-        ::unlink(tmp.c_str());
-        return false;
-    }
-    return true;
+    return socketley::replace_file(path, data, socketley::durability::none, nullptr, 0644);
 }
 
 }   // namespace

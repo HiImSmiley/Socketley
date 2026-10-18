@@ -25,6 +25,7 @@
 #include "../../shared/storage/git_names.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/persist/replaced_file.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -58,19 +59,7 @@ bool write_file(const std::string& path, std::string_view data, mode_t mode)
 {
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
-    if (fd < 0)
-        return false;
-    bool ok = ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size());
-    ok = ::fsync(fd) == 0 && ok;
-    ok = ::close(fd) == 0 && ok;
-    if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0)
-    {
-        ::unlink(tmp.c_str());
-        return false;
-    }
-    return true;
+    return socketley::replace_file(path, data, socketley::durability::data, nullptr, mode);
 }
 
 int64_t mtime_of(const std::string& path)

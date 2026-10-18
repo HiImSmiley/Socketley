@@ -9,6 +9,7 @@
 #include "body_reader.h"
 #include "digest.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::storage
 {
@@ -106,13 +107,7 @@ void scrubber::save() const
     const std::string text = "began " + std::to_string(m_pass_began) + "\npasses " + std::to_string(m_c.passes) +
                              "\nbucket " + to_hex(m_bucket) + "\nkey " + to_hex(m_key) + "\n";
     // Unsynced: a crash that takes the note reads a few keys again.
-    const std::string tmp = m_path + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0)
-        return;
-    const bool whole = ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
-    ::close(fd);
-    if (whole && ::rename(tmp.c_str(), m_path.c_str()) < 0) {}
+    if (!replace_file(m_path, text, durability::none)) {}
 }
 
 void scrubber::tick()

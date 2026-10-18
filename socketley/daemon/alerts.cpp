@@ -21,6 +21,7 @@
 #include "../shared/util/log_ring.h"
 #include "../shared/util/logging.h"
 #include "../shared/json/json_escape.h"
+#include "../shared/persist/replaced_file.h"
 
 namespace alerts
 {
@@ -404,16 +405,8 @@ void monitor::save() const
     std::ostringstream o;
     for (const auto& [id, told] : m_told)
         o << id << '\t' << told.first << '\t' << told.second << '\n';
-    // Private as the runtimes' files beside it are, and never through a link.
-    const std::string tmp = m_path + ".tmp", s = o.str();
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (fd < 0)
-        return;
-    const bool ok = ::write(fd, s.data(), s.size()) == static_cast<ssize_t>(s.size());
-    if (::close(fd) == 0 && ok)
-        std::rename(tmp.c_str(), m_path.c_str());
-    else
-        std::remove(tmp.c_str());
+    // Private as the runtimes' files beside it are; a crash that takes it tells an alert again.
+    if (!socketley::replace_file(m_path, o.str(), socketley::durability::none)) {}
 }
 
 std::string monitor::json() const

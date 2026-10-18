@@ -1,4 +1,5 @@
 #include "history.h"
+#include "../shared/persist/replaced_file.h"
 
 #include <algorithm>
 #include <array>
@@ -198,23 +199,8 @@ bool keeper::save() const
                 put(out, v);
         }
     }
-    const std::string tmp = m_path + ".tmp";
-    // Private as the runtimes' files beside it are, and never through a link.
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
-    FILE* f = fd < 0 ? nullptr : ::fdopen(fd, "wb");
-    if (!f)
-    {
-        if (fd >= 0)
-            ::close(fd);
-        return false;
-    }
-    const bool wrote = std::fwrite(out.data(), 1, out.size(), f) == out.size();
-    if (std::fclose(f) != 0 || !wrote || std::rename(tmp.c_str(), m_path.c_str()) != 0)
-    {
-        std::remove(tmp.c_str());
-        return false;
-    }
-    return true;
+    // Private as the runtimes' files beside it are; a crash that takes it loses a stretch of history.
+    return socketley::replace_file(m_path, out, socketley::durability::none);
 }
 
 }   // namespace history

@@ -17806,12 +17806,11 @@ The cache's snapshot and its
 .BR fsync ,
 at teardown rather than periodically \(em which is why it is last of the disk
 ones and not first. A stop takes as long as the dump takes.
-.IP \(bu 2
-The state file's write and
-.BR fsync ,
-on a runtime's state changing. Rare, and on the daemon's loop rather than a
-worker's, so what it holds up is every runtime at once.
 .RE
+.PP
+Not among them: a runtime's state file, written and synced with its directory
+on a thread of its own whenever the runtime's state changes, so no loop waits
+for that disk.
 .PP
 .B "A storage runtime blocks twice, and never while it serves."
 On start, before its listener exists, it reads the directory, removes temporary

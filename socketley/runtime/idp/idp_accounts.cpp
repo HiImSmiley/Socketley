@@ -18,6 +18,7 @@
 #include "../../shared/crypto/jws.h"
 #include "../../shared/json/json_doc.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::idp
 {
@@ -61,31 +62,7 @@ void sync_dir_of(const std::string& path)
 // Written beside and renamed into place after its bytes are on the disk, so a crash leaves the old file or the new.
 bool write_whole(const std::string& path, const std::string& data)
 {
-    const std::string tmp = path + ".new";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0)
-        return false;
-    size_t off = 0;
-    bool ok = true;
-    while (off < data.size())
-    {
-        const ssize_t n = ::write(fd, data.data() + off, data.size() - off);
-        if (n <= 0)
-        {
-            ok = false;
-            break;
-        }
-        off += static_cast<size_t>(n);
-    }
-    ok = ok && ::fsync(fd) == 0;
-    ::close(fd);
-    if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0)
-    {
-        ::unlink(tmp.c_str());
-        return false;
-    }
-    sync_dir_of(path);
-    return true;
+    return replace_file(path, data, durability::data_and_dir);
 }
 
 }   // namespace

@@ -1,6 +1,7 @@
 #include "raft_storage.h"
 
 #include "../loop/event_loop.h"
+#include "../persist/replaced_file.h"
 
 #include <algorithm>
 #include <array>
@@ -432,21 +433,6 @@ bool read_file(const std::string& path, std::string& out)
     return true;
 }
 
-bool write_all(int fd, const std::string& data)
-{
-    size_t off = 0;
-    while (off < data.size())
-    {
-        const ssize_t n = ::write(fd, data.data() + off, data.size() - off);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            return false;
-        off += static_cast<size_t>(n);
-    }
-    return true;
-}
-
 bool fsync_dir(const std::string& dir)
 {
     const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -460,22 +446,8 @@ bool fsync_dir(const std::string& dir)
 // Written, fsynced and renamed into place, so a crash leaves the old file or the new one and never half of either.
 bool write_durably(const std::string& dir, const std::string& name, const std::string& data, std::string& err)
 {
-    const std::string tmp = dir + "/" + name + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0)
-    {
-        err = "cannot create " + tmp + ": " + std::strerror(errno);
-        return false;
-    }
-    const bool ok = write_all(fd, data) && ::fsync(fd) == 0;
-    ::close(fd);
-    if (!ok || ::rename(tmp.c_str(), (dir + "/" + name).c_str()) != 0)
-    {
-        err = "cannot write " + dir + "/" + name + ": " + std::strerror(errno);
-        ::unlink(tmp.c_str());
-        return false;
-    }
-    return true;
+    // The directory is synced by the caller, once for the files it puts in place together.
+    return socketley::replace_file(dir + "/" + name, data, socketley::durability::data, &err);
 }
 
 struct listing

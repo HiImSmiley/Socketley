@@ -13,6 +13,7 @@
 
 #include "s3_iam.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/persist/replaced_file.h"
 
 namespace socketley::storage
 {
@@ -39,42 +40,6 @@ bool read_all(const std::string& path, std::string& out)
         }
         out.append(buf, static_cast<size_t>(n));
     }
-}
-
-// Writes `text` beside `path`, syncs it and renames it over, so a crash leaves the old document or the new.
-bool replace_file(const std::string& path, const std::string& text)
-{
-    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd < 0)
-        return false;
-    size_t off = 0;
-    while (off < text.size())
-    {
-        const ssize_t n = ::write(fd, text.data() + off, text.size() - off);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-        {
-            ::close(fd);
-            ::unlink(tmp.c_str());
-            return false;
-        }
-        off += static_cast<size_t>(n);
-    }
-    if (::fsync(fd) < 0 || ::close(fd) < 0 || ::rename(tmp.c_str(), path.c_str()) < 0)
-    {
-        ::unlink(tmp.c_str());
-        return false;
-    }
-    const size_t slash = path.rfind('/');
-    const std::string dir = slash == std::string::npos ? "." : path.substr(0, slash);
-    if (const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC); dfd >= 0)
-    {
-        if (::fsync(dfd) < 0) {}
-        ::close(dfd);
-    }
-    return true;
 }
 
 // The revision of the IAM document the file holds, the time it was changed, 0 for a file never changed in a cluster.
@@ -123,7 +88,8 @@ st storage_run::iam_take(int64_t rev, const std::string& json)
     bool ok = true;
     const bool newer = rev > read_rev(file);
     if (newer)
-        ok = replace_file(file, json) && replace_file(file + ".rev", std::to_string(rev));
+        ok = replace_file(file, json, durability::data_and_dir) &&
+             replace_file(file + ".rev", std::to_string(rev), durability::data_and_dir);
     ::flock(lfd, LOCK_UN);
     ::close(lfd);
     if (newer && ok)
@@ -250,7 +216,8 @@ void storage_run::op_iam(const std::shared_ptr<conn>& c, const std::vector<std::
             rev = std::max(now_ms, read_rev(file) + 1);
             // The revision first: a document written beside a revision that failed was in force on this node alone,
             // while the admin was told it was not made.
-            if ((m_repl.has_nodes() && !replace_file(file + ".rev", std::to_string(rev))) || !replace_file(file, doc))
+            if ((m_repl.has_nodes() && !replace_file(file + ".rev", std::to_string(rev), durability::data_and_dir)) ||
+                !replace_file(file, doc, durability::data_and_dir))
             {
                 res.ok = false;
                 res.status = 500;

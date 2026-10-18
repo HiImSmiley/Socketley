@@ -41,6 +41,7 @@
 #include "../shared/crypto/tls_context.h"
 #include "../shared/json/json_doc.h"
 #include "../shared/json/json_escape.h"
+#include "../shared/persist/replaced_file.h"
 
 namespace
 {
@@ -441,15 +442,9 @@ std::string stage(const std::string& path, const std::string& data, mode_t mode)
 
 bool write_atomic(const std::string& path, const std::string& data, mode_t mode)
 {
-    const std::string tmp = stage(path, data, mode);
-    if (tmp.empty())
-        return false;
-    if (::rename(tmp.c_str(), path.c_str()) != 0)
-    {
-        ::unlink(tmp.c_str());
-        return false;
-    }
-    return true;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    return socketley::replace_file(path, data, socketley::durability::data, nullptr, mode);
 }
 
 // ─── The protocol ───────────────────────────────────────────────────────────

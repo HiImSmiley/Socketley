@@ -5,6 +5,7 @@
 #include "../../cli/command_hashing.h"
 #include "../json/json_escape.h"
 #include "../json/json_doc.h"
+#include "../persist/replaced_file.h"
 
 #include <filesystem>
 #include <fstream>
@@ -306,30 +307,10 @@ void cluster_discovery::publish()
     std::string json = build_publish_json();
     std::string path = m_cluster_dir + "/" + m_daemon_name + ".json";
 
-    // Write atomically: write to tmp, then rename
-    std::string tmp_path = path + ".tmp";
+    // Unsynced, as it is written again within the second.
+    if (!socketley::replace_file(path, json, socketley::durability::none, nullptr, 0644))
     {
-        std::ofstream f(tmp_path, std::ios::trunc);
-        if (!f.is_open())
-        {
-            LOG_WARN("cluster: could not write state file");
-            return;
-        }
-        f << json;
-        f.flush();
-        // A file the disk cut short would be published as whole, so it is not put in place.
-        if (!f)
-        {
-            LOG_WARN("cluster: could not write state file");
-            f.close();
-            std::remove(tmp_path.c_str());
-            return;
-        }
-    }
-
-    if (std::rename(tmp_path.c_str(), path.c_str()) != 0)
-    {
-        LOG_WARN("cluster: could not rename state file");
+        LOG_WARN("cluster: could not write state file");
         return;
     }
 
@@ -353,8 +334,8 @@ void cluster_discovery::scan()
         std::string_view fname(entry->d_name);
 
         // Only .json files, which is also what keeps a half-written
-        // "<name>.json.tmp" out, so renaming the temporary would mean changing
-        // this test with it.
+        // "<name>.json.<pid>.<n>.tmp" out, so renaming the temporary would mean
+        // changing this test with it.
         if (fname.size() < 6 || fname.substr(fname.size() - 5) != ".json")
             continue;
 

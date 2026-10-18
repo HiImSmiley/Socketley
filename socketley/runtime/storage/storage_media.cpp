@@ -805,7 +805,7 @@ int64_t read_int(const std::string& path, int64_t fallback)
 
 void write_int(const std::string& path, int64_t v)
 {
-    replace_file(path, std::to_string(v), false);
+    replace_file(path, std::to_string(v), durability::none);
 }
 
 // A player's ask, which moves the job's furthest point forward and says, by the file's time, that it is watched.
@@ -1744,7 +1744,8 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
         const auto pp = media_probe_of(w.probe_dir);
         // HDR is tone-mapped on the GPU from its mastering display metadata, and with x264 where it has none.
         const bool gpu = (m_hw == media_hw::vaapi || m_hw == media_hw::vaapi_lp) && pp && (!pp->hdr() || pp->mastering);
-        replace_file(w.dir + "/encoder", gpu ? (m_hw == media_hw::vaapi_lp ? "vaapi-lp" : "vaapi") : "x264", false);
+        replace_file(w.dir + "/encoder", gpu ? (m_hw == media_hw::vaapi_lp ? "vaapi-lp" : "vaapi") : "x264",
+                     durability::none);
     }
     write_int(job_file(w.dir, seg, ".pos"), seg);
     // A job begun for an init has been asked no segment yet, which is -1.
@@ -2219,7 +2220,7 @@ void storage_run::media_tick()
                 // A GPU job that fails before the rendition has anything is the GPU's failure with this film: the
                 // rendition is made with x264 from then on. Any other that fails from its very start is the medium's.
                 if (j.gpu && j.next == j.from && !exists(j.want.dir + "/init.mp4"))
-                    replace_file(j.want.dir + "/encoder", "x264", false);
+                    replace_file(j.want.dir + "/encoder", "x264", durability::none);
                 else if (j.next == j.from)
                     mark(j.want.dir, "failed");
             }
@@ -2270,7 +2271,7 @@ void storage_run::media_tick()
                 {
                     const size_t eol = vtt.find('\n');
                     vtt.insert(eol == std::string::npos ? vtt.size() : eol + 1, "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n");
-                    replace_file(j.want.dir + "/subs.vtt", vtt, false);
+                    replace_file(j.want.dir + "/subs.vtt", vtt, durability::none);
                     ::unlink((j.want.dir + "/subs.tmp.vtt").c_str());
                 }
             }

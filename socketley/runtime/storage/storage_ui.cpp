@@ -501,7 +501,7 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
             if ((::mkdir(dir.c_str(), 0700) == 0 || errno == EEXIST) &&
                 (::mkdir((dir + "/revoked").c_str(), 0700) == 0 || errno == EEXIST))
             {
-                if (!replace_file(dir + "/revoked/" + sha256_hex(val).substr(0, 32), "", true)) {}
+                if (!replace_file(dir + "/revoked/" + sha256_hex(val).substr(0, 32), "", durability::data_and_dir)) {}
                 // A cookie lives a month at most, so a mark older than that guards nothing and goes.
                 std::error_code ec;
                 const auto month = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24 * 31);
@@ -536,7 +536,8 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
         const int64_t now = wall_ms();
         if ((::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST) ||
             (::mkdir((dir + "/sessions").c_str(), 0700) < 0 && errno != EEXIST) ||
-            !replace_file(dir + "/sessions/" + sha256_hex(who).substr(0, 32), std::to_string(now), true))
+            !replace_file(dir + "/sessions/" + sha256_hex(who).substr(0, 32), std::to_string(now),
+                          durability::data_and_dir))
         {
             app_reply(c, 500, "The sessions could not be ended.\n");
             return;
@@ -646,7 +647,7 @@ void storage_run::inbox_add(const std::string& user, std::string_view kind, std:
         b.items.insert(b.items.begin(), std::move(it));
         if (b.items.size() > inbox_max)
             b.items.resize(inbox_max);
-        if (!replace_file(path, inbox_json(b), false))
+        if (!replace_file(path, inbox_json(b), durability::none))
             LOG_WARN(("storage: a notification for " + user + " could not be kept").c_str());
     }
     ::flock(fd, LOCK_UN);
@@ -798,7 +799,7 @@ void storage_run::ui_inbox_body(const std::shared_ptr<conn>& c)
                     std::find(b.off.begin(), b.off.end(), k.s) == b.off.end())
                     b.off.push_back(k.s);
     }
-    const bool ok = replace_file(path, inbox_json(b), false);
+    const bool ok = replace_file(path, inbox_json(b), durability::none);
     ::flock(fd, LOCK_UN);
     ::close(fd);
     app_reply(c, ok ? 204 : 500, ok ? std::string{} : "The notifications could not be kept.\n");
@@ -995,7 +996,7 @@ void storage_run::ui_progress_body(const std::shared_ptr<conn>& c)
         std::sort(ps.begin(), ps.end(), [](const position& a, const position& b) { return a.at > b.at; });
         if (ps.size() > progress_max)
             ps.resize(progress_max);
-        const bool ok = replace_file(path, positions_json(ps), false);
+        const bool ok = replace_file(path, positions_json(ps), durability::none);
         ::flock(fd, LOCK_UN);
         ::close(fd);
         app_reply(cc, ok ? 204 : 500, ok ? std::string{} : "The position could not be kept.\n");

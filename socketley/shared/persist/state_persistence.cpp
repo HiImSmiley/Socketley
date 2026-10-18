@@ -18,6 +18,7 @@
 
 #include "../util/logging.h"
 #include "../json/json_escape.h"
+#include "replaced_file.h"
 
 #include <fstream>
 #include <sstream>
@@ -1354,97 +1355,21 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
 }
 
 // Every state file is written here, at a mode stated rather than inherited
-// from the umask, created O_EXCL on a just-unlinked path -- because the record
+// from the umask and made new rather than through a link -- because the record
 // carries --master-pw, the TLS key paths and the --lua script the daemon runs,
 // so whoever can write one chooses what the daemon runs next.
 static bool write_state_file(const fs::path& path, std::string_view bytes)
 {
-    fs::path tmp_path = path;
-    tmp_path += ".tmp";
-
-    std::error_code ec;
-    fs::remove(tmp_path, ec);
-
-    // ─── Said out loud, at every one of them ────────────────────────────────
-    // This function had four ways to fail and not a word for any of them, and
-    // both callers drop the bool -- writer_loop's `write_json(j.cfg); break;`
-    // and the was_running flip's `if (!write_state_file(...)) {}`.  So a state
-    // directory that was full or read-only produced a daemon that accepted
-    // `create`, answered 0, served traffic, and had never heard of the runtime
-    // at the next start, with nothing anywhere to say why.
-    //
-    // The reason the sibling check three hundred lines up already gives for
-    // logging is this same one: a runtime whose state cannot be stored will
-    // not come back.
-    //
-    // errno is taken BEFORE the cleanup, because fs::remove is a syscall too
-    // and would report the tidying rather than the failure.
-    const auto refuse = [&path](const char* step, const std::string& why) {
-        LOG_ERROR(("state file " + path.string() + ": " + step + " failed: " +
-                   why + " -- this runtime will not come back after a restart")
-                      .c_str());
-        return false;
-    };
-
-    int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd < 0)
-        return refuse("open", std::strerror(errno));
-
-    size_t off = 0;
-    while (off < bytes.size())
+    // Said out loud: both callers drop the bool, and a state directory that was
+    // full or read-only once produced a daemon that served a runtime it would
+    // never have heard of at the next start.
+    std::string why;
+    if (!socketley::replace_file(path.string(), bytes, socketley::durability::data_and_dir, &why))
     {
-        ssize_t n = ::write(fd, bytes.data() + off, bytes.size() - off);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-        {
-            const int err = errno;
-            ::close(fd);
-            fs::remove(tmp_path, ec);
-            return refuse("write", n == 0 ? "wrote nothing" : std::strerror(err));
-        }
-        off += static_cast<size_t>(n);
-    }
-
-    // fsync before the rename, through the descriptor that wrote the file, so
-    // the name never points at bytes the disk has not taken.
-    if (::fsync(fd) < 0)
-    {
-        const int err = errno;
-        ::close(fd);
-        fs::remove(tmp_path, ec);
-        return refuse("fsync", std::strerror(err));
-    }
-
-    // Checked, where the fsync is not: close is where a deferred write error
-    // surfaces, and it stands in for the f.fail() the ofstream form tested.
-    if (::close(fd) < 0)
-    {
-        const int err = errno;
-        fs::remove(tmp_path, ec);
-        return refuse("close", std::strerror(err));
-    }
-
-    fs::rename(tmp_path, path, ec);
-    if (ec)
-    {
-        const std::string why = ec.message();
-        fs::remove(tmp_path, ec);
-        return refuse("rename", why);
-    }
-    // And the rename, which lives in the directory: without its sync a crash
-    // can bring the record from before back.
-    const int dfd = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dfd < 0 || ::fsync(dfd) < 0)
-    {
-        LOG_WARN(("state file " + path.string() + ": its directory could not be synced: " + std::strerror(errno) +
-                  " -- a crash may bring the record from before back")
-                     .c_str());
-        if (dfd >= 0)
-            ::close(dfd);
+        LOG_ERROR(("state file " + path.string() + ": " + why +
+                   " -- this runtime will not come back after a restart").c_str());
         return false;
     }
-    ::close(dfd);
     return true;
 }
 

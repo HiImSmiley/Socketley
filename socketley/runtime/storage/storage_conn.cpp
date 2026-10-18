@@ -2929,7 +2929,7 @@ void storage_run::tend_sync_runners()
                 int64_t e = 0;
                 o = "{" + where + "," + credentials_of(user, e) + "}\n";
             }
-            if (!replace_file(file, o, false))
+            if (!replace_file(file, o, durability::none))
                 LOG_WARN(("storage: the sync runtime " + name + " could not be handed its credentials").c_str());
         }
         bool there = false;
