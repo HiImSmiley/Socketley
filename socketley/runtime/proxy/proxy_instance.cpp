@@ -5401,11 +5401,8 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
         // A filter that failed did not say carry on, and the opinion it was
         // there to express is usually no, so the request is refused and the
         // operator told.
-        if (SOCKETLEY_UNLIKELY(!result.valid()))
+        if (SOCKETLEY_UNLIKELY(lua_diag::raised(result, get_name(), "filter")))
         {
-            sol::error err = result;
-            fprintf(stderr, "%s filter error: %s\n",
-                    lua_diag::tag(get_name()).c_str(), err.what());
             conn->partial.clear();
             send_error(conn, "500 Internal Server Error", "Filter Error\n");
             return true;
@@ -6030,13 +6027,7 @@ const backend_info* proxy_instance::select_and_resolve_backend(
             // unlike the filter chain, because on_route expresses no opinion
             // about whether a request may proceed and this path already
             // answers a callback that produced no usable index.
-            if (SOCKETLEY_UNLIKELY(!r.valid()))
-            {
-                sol::error err = r;
-                fprintf(stderr, "%s on_route error: %s\n",
-                        lua_diag::tag(get_name()).c_str(), err.what());
-            }
-            else if (r.return_count() > 0)
+            if (!lua_diag::raised(r, get_name(), "on_route") && r.return_count() > 0)
             {
                 sol::object result = r;
                 if (result.is<int>())
@@ -6223,13 +6214,7 @@ const backend_info* proxy_instance::select_and_resolve_backend(
             // Report and leave `selected` at pool[0], which is what an
             // out-of-range index already gets here and this path's own
             // fallback.
-            if (SOCKETLEY_UNLIKELY(!r.valid()))
-            {
-                sol::error err = r;
-                fprintf(stderr, "%s on_route error: %s\n",
-                        lua_diag::tag(get_name()).c_str(), err.what());
-            }
-            else if (r.return_count() > 0)
+            if (!lua_diag::raised(r, get_name(), "on_route") && r.return_count() > 0)
             {
                 sol::object result = r;
                 if (result.is<int>())
@@ -10199,12 +10184,8 @@ bool proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         // the Sanitize build.
         sol::protected_function_result r = lctx->on_proxy_request()(conn->fd, data);
 
-        if (SOCKETLEY_UNLIKELY(!r.valid()))
+        if (SOCKETLEY_UNLIKELY(lua_diag::raised(r, get_name(), "on_proxy_request", " — refusing the request")))
         {
-            sol::error err = r;
-            fprintf(stderr, "%s on_proxy_request error: %s — refusing the "
-                            "request\n",
-                    lua_diag::tag(get_name()).c_str(), err.what());
             bconn->closing = true;
             conn->closing = true;
             return false;
@@ -10375,12 +10356,8 @@ bool proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
         sol::protected_function_result r =
             lctx->on_proxy_response()(conn->client_fd, data);
 
-        if (SOCKETLEY_UNLIKELY(!r.valid()))
+        if (SOCKETLEY_UNLIKELY(lua_diag::raised(r, get_name(), "on_proxy_response", " — refusing the response")))
         {
-            sol::error err = r;
-            fprintf(stderr, "%s on_proxy_response error: %s — refusing the "
-                            "response\n",
-                    lua_diag::tag(get_name()).c_str(), err.what());
             refuse_response(conn, cconn);
             return false;
         }

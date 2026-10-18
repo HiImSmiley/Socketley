@@ -139,6 +139,23 @@ private:
     lua_deadline::scope  m_scope;
 };
 
+namespace lua_diag
+{
+    // Writes "<tag> <hook> error: <message><then>" to stderr for a callback that raised.
+    void report_raise(const sol::protected_function_result& r, std::string_view owner, std::string_view hook,
+                      std::string_view then);
+
+    // True when `r` raised, which is then reported; what a raise means is the caller's to decide.
+    inline bool raised(const sol::protected_function_result& r, std::string_view owner, std::string_view hook,
+                       std::string_view then = {})
+    {
+        if (__builtin_expect(r.valid(), 1))
+            return false;
+        report_raise(r, owner, hook, then);
+        return true;
+    }
+}
+
 // Lua context for a runtime - manages state and bindings
 class lua_context
 {

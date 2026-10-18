@@ -1212,11 +1212,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
             {
                 {
                     sol::protected_function_result r = lua()->on_expire()(key);
-                    if (SOCKETLEY_UNLIKELY(!r.valid()))
-                    {
-                        sol::error e = r;
-                        std::cerr << lua_diag::tag(get_name()) << " on_expire error: " << e.what() << "\n";
-                    }
+                    lua_diag::raised(r, get_name(), "on_expire");
                 }
             }
         }
@@ -5808,11 +5804,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             {
                 {
                     sol::protected_function_result r = lua()->on_write()(key, value, 0);
-                    if (SOCKETLEY_UNLIKELY(!r.valid()))
-                    {
-                        sol::error e = r;
-                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
-                    }
+                    lua_diag::raised(r, get_name(), "on_write");
                 }
             }
 #endif
@@ -5838,12 +5830,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                     // store a Lua error message in the cache as the fetched
                     // value.
                     sol::protected_function_result res = lua()->on_miss()(args);
-                    if (SOCKETLEY_UNLIKELY(!res.valid()))
-                    {
-                        sol::error e = res;
-                        std::cerr << lua_diag::tag(get_name()) << " on_miss error: " << e.what() << "\n";
-                    }
-                    else
+                    if (!lua_diag::raised(res, get_name(), "on_miss"))
                     {
                         sol::optional<std::string> fetched = res.get<sol::optional<std::string>>(0);
                         if (fetched && !fetched->empty())
@@ -5886,11 +5873,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 {
                     {
                         sol::protected_function_result r = lua()->on_delete_cb()(args);
-                        if (SOCKETLEY_UNLIKELY(!r.valid()))
-                        {
-                            sol::error e = r;
-                            std::cerr << lua_diag::tag(get_name()) << " on_delete error: " << e.what() << "\n";
-                        }
+                        lua_diag::raised(r, get_name(), "on_delete");
                     }
                 }
 #endif
@@ -6064,11 +6047,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 {
                     {
                         sol::protected_function_result r = lua()->on_write()(key, val, 0);
-                        if (SOCKETLEY_UNLIKELY(!r.valid()))
-                        {
-                            sol::error e = r;
-                            std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
-                        }
+                        lua_diag::raised(r, get_name(), "on_write");
                     }
                 }
 #endif
@@ -6797,11 +6776,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 {
                     {
                         sol::protected_function_result r = lua()->on_write()(key, val, 0);
-                        if (SOCKETLEY_UNLIKELY(!r.valid()))
-                        {
-                            sol::error e = r;
-                            std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
-                        }
+                        lua_diag::raised(r, get_name(), "on_write");
                     }
                 }
 #endif
@@ -6830,11 +6805,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             {
                 {
                     sol::protected_function_result r = lua()->on_write()(key, val, sec);
-                    if (SOCKETLEY_UNLIKELY(!r.valid()))
-                    {
-                        sol::error e = r;
-                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
-                    }
+                    lua_diag::raised(r, get_name(), "on_write");
                 }
             }
 #endif
@@ -6864,11 +6835,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             {
                 {
                     sol::protected_function_result r = lua()->on_write()(key, val, 0);
-                    if (SOCKETLEY_UNLIKELY(!r.valid()))
-                    {
-                        sol::error e = r;
-                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
-                    }
+                    lua_diag::raised(r, get_name(), "on_write");
                 }
             }
 #endif
@@ -9389,11 +9356,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 {
                     {
                         sol::protected_function_result r = lua()->on_write()(args[1], args[2], 0);
-                        if (SOCKETLEY_UNLIKELY(!r.valid()))
-                        {
-                            sol::error e = r;
-                            std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
-                        }
+                        lua_diag::raised(r, get_name(), "on_write");
                     }
                 }
 #endif
@@ -9506,11 +9469,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             {
                 {
                     sol::protected_function_result r = lua()->on_write()(args[1], args[2], ex_sec);
-                    if (SOCKETLEY_UNLIKELY(!r.valid()))
-                    {
-                        sol::error e = r;
-                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
-                    }
+                    lua_diag::raised(r, get_name(), "on_write");
                 }
             }
 #endif
@@ -9536,12 +9495,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     // store a Lua error message in the cache as the fetched
                     // value.
                     sol::protected_function_result res = lua()->on_miss()(args[1]);
-                    if (SOCKETLEY_UNLIKELY(!res.valid()))
-                    {
-                        sol::error e = res;
-                        std::cerr << lua_diag::tag(get_name()) << " on_miss error: " << e.what() << "\n";
-                    }
-                    else
+                    if (!lua_diag::raised(res, get_name(), "on_miss"))
                     {
                         sol::optional<std::string> fetched = res.get<sol::optional<std::string>>(0);
                         if (fetched && !fetched->empty())
@@ -9591,11 +9545,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     {
                         {
                             sol::protected_function_result r = lua()->on_delete_cb()(args[i]);
-                            if (SOCKETLEY_UNLIKELY(!r.valid()))
-                            {
-                                sol::error e = r;
-                                std::cerr << lua_diag::tag(get_name()) << " on_delete error: " << e.what() << "\n";
-                            }
+                            lua_diag::raised(r, get_name(), "on_delete");
                         }
                     }
 #endif
@@ -9758,11 +9708,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 {
                     {
                         sol::protected_function_result r = lua()->on_write()(args[i], args[i+1], 0);
-                        if (SOCKETLEY_UNLIKELY(!r.valid()))
-                        {
-                            sol::error e = r;
-                            std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
-                        }
+                        lua_diag::raised(r, get_name(), "on_write");
                     }
                 }
 #endif
@@ -10547,11 +10493,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             {
                 {
                     sol::protected_function_result r = lua()->on_write()(args[1], args[2], 0);
-                    if (SOCKETLEY_UNLIKELY(!r.valid()))
-                    {
-                        sol::error e = r;
-                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
-                    }
+                    lua_diag::raised(r, get_name(), "on_write");
                 }
             }
 #endif
@@ -10577,11 +10519,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             {
                 {
                     sol::protected_function_result r = lua()->on_write()(args[1], args[3], sec);
-                    if (SOCKETLEY_UNLIKELY(!r.valid()))
-                    {
-                        sol::error e = r;
-                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
-                    }
+                    lua_diag::raised(r, get_name(), "on_write");
                 }
             }
 #endif
@@ -10607,11 +10545,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             {
                 {
                     sol::protected_function_result r = lua()->on_write()(args[1], args[3], 0);
-                    if (SOCKETLEY_UNLIKELY(!r.valid()))
-                    {
-                        sol::error e = r;
-                        std::cerr << lua_diag::tag(get_name()) << " on_write error: " << e.what() << "\n";
-                    }
+                    lua_diag::raised(r, get_name(), "on_write");
                 }
             }
 #endif

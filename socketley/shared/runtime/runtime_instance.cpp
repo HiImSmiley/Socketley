@@ -89,11 +89,7 @@ void runtime_instance::fire_tick(int res)
     } else if (m_lua && m_lua->has_on_tick()) {
 #ifndef SOCKETLEY_NO_LUA
         sol::protected_function_result r = m_lua->on_tick()(dt);
-        if (SOCKETLEY_UNLIKELY(!r.valid()))
-        {
-            sol::error e = r;
-            std::cerr << lua_diag::tag(get_name()) << " on_tick error: " << e.what() << "\n";
-        }
+        lua_diag::raised(r, get_name(), "on_tick");
 #endif
     }
     if (!m_tick || !m_event_loop) return;
@@ -802,11 +798,7 @@ void runtime_instance::invoke_on_stop()
 
 #ifndef SOCKETLEY_NO_LUA
     sol::protected_function_result r = m_lua->on_stop()();
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        std::cerr << lua_diag::tag(get_name()) << " on_stop error: " << e.what() << std::endl;
-    }
+    lua_diag::raised(r, get_name(), "on_stop");
 #endif
 }
 
@@ -834,11 +826,7 @@ void runtime_instance::invoke_on_connect(int client_id)
 
 #ifndef SOCKETLEY_NO_LUA
     sol::protected_function_result r = m_lua->on_connect()(client_id);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        std::cerr << lua_diag::tag(get_name()) << " on_connect error: " << e.what() << std::endl;
-    }
+    lua_diag::raised(r, get_name(), "on_connect");
 #endif
 }
 
@@ -850,11 +838,7 @@ void runtime_instance::invoke_on_disconnect(int client_id)
 
 #ifndef SOCKETLEY_NO_LUA
     sol::protected_function_result r = m_lua->on_disconnect()(client_id);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        std::cerr << lua_diag::tag(get_name()) << " on_disconnect error: " << e.what() << std::endl;
-    }
+    lua_diag::raised(r, get_name(), "on_disconnect");
 #endif
 }
 
@@ -869,9 +853,8 @@ bool runtime_instance::invoke_on_auth(int client_id)
     // Sanitize build it does not.
     sol::protected_function_result r = m_lua->on_auth()(client_id);
 
-    if (!r.valid()) {
-        sol::error e = r;
-        std::cerr << lua_diag::tag(get_name()) << " on_auth error: " << e.what() << "\n";
+    if (lua_diag::raised(r, get_name(), "on_auth"))
+    {
         return false;  // Lua error → reject (fail-closed)
     }
     // nil, a non-bool, or no return at all → reject (fail-closed)
@@ -890,11 +873,7 @@ void runtime_instance::invoke_on_send([[maybe_unused]] std::string_view msg)
 
 #ifndef SOCKETLEY_NO_LUA
     sol::protected_function_result r = m_lua->on_send()(msg);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        std::cerr << lua_diag::tag(get_name()) << " on_send error: " << e.what() << std::endl;
-    }
+    lua_diag::raised(r, get_name(), "on_send");
 #endif
 }
 
@@ -1044,11 +1023,7 @@ void runtime_instance::invoke_on_writable([[maybe_unused]] int client_id)
 
 #ifndef SOCKETLEY_NO_LUA
     sol::protected_function_result r = m_lua->on_writable()(client_id);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        std::cerr << lua_diag::tag(get_name()) << " on_writable error: " << e.what() << std::endl;
-    }
+    lua_diag::raised(r, get_name(), "on_writable");
 #endif
 }
 
@@ -1066,11 +1041,7 @@ void runtime_instance::invoke_on_http_body([[maybe_unused]] int client_id,
 
 #ifndef SOCKETLEY_NO_LUA
     sol::protected_function_result r = m_lua->on_http_body()(client_id, chunk, remaining);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        std::cerr << lua_diag::tag(get_name()) << " on_http_body error: " << e.what() << std::endl;
-    }
+    lua_diag::raised(r, get_name(), "on_http_body");
 #endif
 }
 
@@ -1082,11 +1053,7 @@ void runtime_instance::invoke_on_http_body_unknown([[maybe_unused]] int client_i
 
 #ifndef SOCKETLEY_NO_LUA
     sol::protected_function_result r = m_lua->on_http_body()(client_id, chunk, sol::nil);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        std::cerr << lua_diag::tag(get_name()) << " on_http_body error: " << e.what() << std::endl;
-    }
+    lua_diag::raised(r, get_name(), "on_http_body");
 #endif
 }
 
@@ -1102,12 +1069,7 @@ void runtime_instance::invoke_on_upstream_writable([[maybe_unused]] int conn_id)
 
 #ifndef SOCKETLEY_NO_LUA
     sol::protected_function_result r = m_lua->on_upstream_writable()(conn_id);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        std::cerr << lua_diag::tag(get_name()) << " on_upstream_writable error: "
-                  << e.what() << std::endl;
-    }
+    lua_diag::raised(r, get_name(), "on_upstream_writable");
 #endif
 }
 

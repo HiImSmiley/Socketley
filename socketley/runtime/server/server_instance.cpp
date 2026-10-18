@@ -1882,11 +1882,8 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
 
         sol::protected_function_result r = lua()->on_http_request()(lua_req);
 
-        if (SOCKETLEY_UNLIKELY(!r.valid()))
+        if (SOCKETLEY_UNLIKELY(lua_diag::raised(r, get_name(), "on_http_request", " — answering 500")))
         {
-            sol::error e = r;
-            std::cerr << lua_diag::tag(get_name()) << " on_http_request error: " << e.what()
-                      << " — answering 500" << std::endl;
 
             answer_500();
             return;
@@ -5640,11 +5637,8 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                     sol::protected_function_result r =
                         lctx->on_master_auth()(sender->fd, pw);
 
-                    if (SOCKETLEY_UNLIKELY(!r.valid()))
+                    if (SOCKETLEY_UNLIKELY(lua_diag::raised(r, get_name(), "on_master_auth")))
                     {
-                        sol::error err = r;
-                        std::cerr << lua_diag::tag(get_name()) << " on_master_auth error: " << err.what()
-                                  << std::endl;
                         auth_ok = false;
                     }
                     else
@@ -7118,12 +7112,7 @@ void server_instance::invoke_on_websocket(int fd)
     if (!conn->ws_auth.empty())     h["authorization"] = conn->ws_auth;
 
     sol::protected_function_result r = lctx->on_websocket()(fd, h);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        fprintf(stderr, "%s on_websocket error: %s\n",
-                lua_diag::tag(get_name()).c_str(), e.what());
-    }
+    lua_diag::raised(r, get_name(), "on_websocket");
 #endif
 }
 
@@ -8571,12 +8560,7 @@ void server_instance::invoke_on_upstream([[maybe_unused]] int conn_id, [[maybe_u
     auto* lctx = lua();
     if (!lctx || !lctx->has_on_upstream()) return;
     sol::protected_function_result r = lctx->on_upstream()(conn_id, data);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        fprintf(stderr, "%s on_upstream error: %s\n",
-                lua_diag::tag(get_name()).c_str(), e.what());
-    }
+    lua_diag::raised(r, get_name(), "on_upstream");
 #endif
 }
 
@@ -8586,12 +8570,7 @@ void server_instance::invoke_on_upstream_connect([[maybe_unused]] int conn_id)
     auto* lctx = lua();
     if (!lctx || !lctx->has_on_upstream_connect()) return;
     sol::protected_function_result r = lctx->on_upstream_connect()(conn_id);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        fprintf(stderr, "%s on_upstream_connect error: %s\n",
-                lua_diag::tag(get_name()).c_str(), e.what());
-    }
+    lua_diag::raised(r, get_name(), "on_upstream_connect");
 #endif
 }
 
@@ -8601,11 +8580,6 @@ void server_instance::invoke_on_upstream_disconnect([[maybe_unused]] int conn_id
     auto* lctx = lua();
     if (!lctx || !lctx->has_on_upstream_disconnect()) return;
     sol::protected_function_result r = lctx->on_upstream_disconnect()(conn_id);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        fprintf(stderr, "%s on_upstream_disconnect error: %s\n",
-                lua_diag::tag(get_name()).c_str(), e.what());
-    }
+    lua_diag::raised(r, get_name(), "on_upstream_disconnect");
 #endif
 }

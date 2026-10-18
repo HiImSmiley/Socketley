@@ -44,6 +44,13 @@ namespace lua_diag
 
 #ifndef SOCKETLEY_NO_LUA
 
+void lua_diag::report_raise(const sol::protected_function_result& r, std::string_view owner, std::string_view hook,
+                            std::string_view then)
+{
+    const sol::error e = r;
+    std::cerr << tag(owner) << ' ' << hook << " error: " << e.what() << then << '\n';
+}
+
 #include "../runtime/runtime_instance.h"
 #include "../runtime/runtime_definitions.h"
 #include "../runtime/runtime_manager.h"
@@ -340,13 +347,7 @@ struct lua_timer : io_handler
             dispatching = true;
             sol::protected_function_result tr = fn();
             dispatching = false;
-            if (SOCKETLEY_UNLIKELY(!tr.valid()))
-            {
-                sol::error e = tr;
-                fprintf(stderr, "%s timer error: %s\n",
-                        lua_diag::tag(ctx ? std::string_view(ctx->owner_name())
-                                          : std::string_view{}).c_str(), e.what());
-            }
+            lua_diag::raised(tr, ctx ? std::string_view(ctx->owner_name()) : std::string_view{}, "timer");
         }
         if (repeat && *alive && !cancelled)
             loop->submit_timeout(&ts, &req);
@@ -876,12 +877,7 @@ void lua_context::dispatch_publish(std::string_view cache_name, std::string_view
         {
             if (subs[i].dead) continue;
             sol::protected_function_result r = subs[i].fn(channel, message);
-            if (SOCKETLEY_UNLIKELY(!r.valid()))
-            {
-                sol::error e = r;
-                fprintf(stderr, "%s subscribe callback error: %s\n",
-                        lua_diag::tag(m_owner_name).c_str(), e.what());
-            }
+            lua_diag::raised(r, m_owner_name, "subscribe callback");
         }
     }
     if (--m_dispatch_depth == 0)
@@ -1818,12 +1814,7 @@ void lua_context::dispatch_cluster_event(const cluster_ev_wire& ev)
                 if (!ev.host.empty())
                     dt["host"] = ev.host;
                 sol::protected_function_result r = on_cluster_join()(dt);
-                if (SOCKETLEY_UNLIKELY(!r.valid()))
-                {
-                    sol::error e = r;
-                    fprintf(stderr, "%s on_cluster_join error: %s\n",
-                            lua_diag::tag(m_owner_name).c_str(), e.what());
-                }
+                lua_diag::raised(r, m_owner_name, "on_cluster_join");
             }
             break;
 
@@ -1833,12 +1824,7 @@ void lua_context::dispatch_cluster_event(const cluster_ev_wire& ev)
                 sol::table dt = m_lua.create_table();
                 dt["name"] = ev.daemon_name;
                 sol::protected_function_result r = on_cluster_leave()(dt);
-                if (SOCKETLEY_UNLIKELY(!r.valid()))
-                {
-                    sol::error e = r;
-                    fprintf(stderr, "%s on_cluster_leave error: %s\n",
-                            lua_diag::tag(m_owner_name).c_str(), e.what());
-                }
+                lua_diag::raised(r, m_owner_name, "on_cluster_leave");
             }
             break;
 
@@ -1857,12 +1843,7 @@ void lua_context::dispatch_cluster_event(const cluster_ev_wire& ev)
                 }
                 sol::protected_function_result r =
                     on_group_change()(ev.group_name, members);
-                if (SOCKETLEY_UNLIKELY(!r.valid()))
-                {
-                    sol::error e = r;
-                    fprintf(stderr, "%s on_group_change error: %s\n",
-                            lua_diag::tag(m_owner_name).c_str(), e.what());
-                }
+                lua_diag::raised(r, m_owner_name, "on_group_change");
             }
             break;
     }
