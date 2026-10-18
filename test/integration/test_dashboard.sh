@@ -91,6 +91,21 @@ PY
 )
 # "none" is said, never left empty: a schema that did not load fails python, and an empty answer passed for parity.
 expect "every flag a create parser takes is in the dashboard's schema, for its type" "$missing" "none"
+# The key each row names is one a runtime's state is written under, per type: the page reads and writes by it alone.
+keys=$(python3 - "$HERE/../../socketley/shared/persist/state_persistence.cpp" "$T/schema.json" <<'PY'
+import json, re, sys
+src = open(sys.argv[1]).read()
+# The fields written by name, and the arrays written as a quoted key ahead of their bracket.
+written = set(re.findall(r'append_[a-z]+_field\("([a-z_]+)"', src)) | set(re.findall(r'\\"([a-z_]+)\\": \[', src))
+flags = json.load(open(sys.argv[2]))["flags"]
+key = {(f["flag"], t): f.get("key") for f in flags for t in f["types"]}
+out = sorted({f["key"] for f in flags if f.get("key") and f["key"] not in written})
+print(" ".join(out) or "none", key[("--cache", "server")], key[("--cache", "db")], key[("--replicate", "cache")],
+      key[("--replicate", "db")], key[("--mode", "cache")], key[("--mode", "server")], key[("--every", "sync")])
+PY
+)
+expect "every key the schema names is one a runtime's state holds, and each type's own" \
+    "$keys" "none cache_name cache replicate_target replicate cache_mode mode every"
 
 # ─── the page ───────────────────────────────────────────────────────────────
 curl -s "$U/" > "$T/page.html"

@@ -165,6 +165,161 @@ constexpr row rows[] = {
 
 }   // namespace
 
+// The key `show` and `import` name a flag's value by in a runtime's state, the dashboard's to read and write.
+struct state_key_row
+{
+    std::string_view flag, key;
+};
+constexpr state_key_row state_keys[] = {
+    {"-p", "port"},
+    {"-g", "group"},
+    {"--lua", "lua_script"},
+    {"--bind", "bind"},
+    {"--listen", "listen"},
+    {"--shards", "shards"},
+    {"--domain", "domain"},
+    {"--cpus", "cpus"},
+    {"--tls", "tls"},
+    {"--cert", "cert_path"},
+    {"--key", "key_path"},
+    {"--ca", "ca_path"},
+    {"--acme", "acme_domains"},
+    {"--acme-email", "acme_email"},
+    {"--max-connections", "max_connections"},
+    {"--rate-limit", "rate_limit"},
+    {"--global-rate-limit", "global_rate_limit"},
+    {"--idle-timeout", "idle_timeout"},
+    {"--read-buffer", "read_buffer"},
+    {"--write-buffer", "write_buffer"},
+    {"--drain", "drain"},
+    {"--reconnect", "reconnect"},
+    {"--log", "log_file"},
+    {"-w", "write_file"},
+    {"-b", "bash_output"},
+    {"-bp", "bash_prefix"},
+    {"-bt", "bash_timestamp"},
+    {"--send-to", "send_to"},
+    {"--udp", "udp"},
+    {"--http", "http_dir"},
+    {"--http-cache", "http_cache"},
+    {"--master-pw", "master_pw"},
+    {"--cache", "cache_name"},
+    {"-u", "upstreams"},
+    {"-t", "target"},
+    {"--backend", "backends"},
+    {"--protocol", "protocol"},
+    {"--strategy", "strategy"},
+    {"--auth", "auth"},
+    {"--redirect-https", "redirect_https"},
+    {"--backend-timeout", "backend_timeout"},
+    {"--retry", "retry_count"},
+    {"--retry-all", "retry_all"},
+    {"--health-check", "health_check"},
+    {"--health-interval", "health_interval"},
+    {"--health-path", "health_path"},
+    {"--health-threshold", "health_threshold"},
+    {"--circuit-threshold", "circuit_threshold"},
+    {"--circuit-timeout", "circuit_timeout"},
+    {"--client-ca", "mesh_client_ca"},
+    {"--client-cert", "mesh_client_cert"},
+    {"--client-key", "mesh_client_key"},
+    {"--persistent", "persistent_path"},
+    {"--persistent-interval", "persistent_interval"},
+    {"--maxmemory", "max_memory"},
+    {"--eviction", "eviction"},
+    {"--resp", "resp_forced"},
+    {"--replicate", "replicate_target"},
+    {"--public", "public"},
+    {"--cluster", "cluster"},
+    {"--dir", "dir"},
+    {"--credentials", "credentials"},
+    {"--access-key", "access_key"},
+    {"--secret-key", "secret_key"},
+    {"--anonymous", "anonymous"},
+    {"--website-domain", "website_domain"},
+    {"--tls-offloaded", "tls_offloaded"},
+    {"--max-bytes", "max_bytes"},
+    {"--fsync", "fsync"},
+    {"--fsync-interval", "fsync_interval"},
+    {"--scrub", "scrub"},
+    {"--compress", "compress"},
+    {"--mpu-expire", "mpu_expire"},
+    {"--sse-key-file", "sse_key_file"},
+    {"--acls", "acls"},
+    {"--notify-targets", "notify_targets"},
+    {"--replication-targets", "replication_targets"},
+    {"--tiers", "tiers"},
+    {"--federation", "federation"},
+    {"--nodes", "nodes"},
+    {"--zone", "zones"},
+    {"--publish", "publish"},
+    {"--proxy", "proxy"},
+    {"--transfer", "transfer"},
+    {"--notify", "notify"},
+    {"--rrl", "rrl"},
+    {"--clients", "clients"},
+    {"--issuer", "issuer"},
+    {"--cookie-domain", "cookie_domain"},
+    {"--idp", "idp"},
+    {"--schema", "schema"},
+    {"--keys", "keys"},
+    {"--origins", "origins"},
+    {"--replicate-key", "replicate_key"},
+    {"--backup-dir", "backup_dir"},
+    {"--backup-every", "backup_every"},
+    {"--backup-keep", "backup_keep"},
+    {"--storage", "storage"},
+    {"--prefix", "prefix"},
+    {"--exclude", "exclude"},
+    {"--every", "every"},
+    {"--repositories", "repositories"},
+};
+
+// A flag one type keeps under another key than the rest: a cache's access mode, a db's cache size and leader.
+std::string_view state_key(const row& r)
+{
+    if (r.flag == "--mode" && r.types == "K")
+        return "cache_mode";
+    if (r.types == "B" && (r.flag == "--cache" || r.flag == "--replicate"))
+        return r.flag.substr(2);
+    if (r.flag == "--mode")
+        return "mode";
+    for (const state_key_row& k : state_keys)
+        if (k.flag == r.flag)
+            return k.key;
+    return {};
+}
+
+bool is_path_flag(std::string_view flag)
+{
+    for (const row& r : rows)
+        if (r.kind == "path" && (r.flag == flag || r.aliases == flag))
+            return true;
+    return false;
+}
+
+bool offered(std::string_view flag, runtime_type type)
+{
+    char letter = 0;
+    switch (type)
+    {
+        case runtime_server:  letter = 'S'; break;
+        case runtime_client:  letter = 'C'; break;
+        case runtime_proxy:   letter = 'P'; break;
+        case runtime_cache:   letter = 'K'; break;
+        case runtime_storage: letter = 'T'; break;
+        case runtime_dns:     letter = 'D'; break;
+        case runtime_sync:    letter = 'Y'; break;
+        case runtime_idp:     letter = 'I'; break;
+        case runtime_db:      letter = 'B'; break;
+        default: return false;
+    }
+    for (const row& r : rows)
+        if ((r.flag == flag || r.aliases == flag) && r.types.find(letter) != std::string_view::npos)
+            return true;
+    return false;
+}
+
 const std::string& json()
 {
     static const std::string out = [] {
@@ -208,6 +363,11 @@ const std::string& json()
             {
                 o += ",\"aliases\":";
                 socketley::json::quote_into(o, r.aliases);
+            }
+            if (const std::string_view k = state_key(r); !k.empty())
+            {
+                o += ",\"key\":";
+                socketley::json::quote_into(o, k);
             }
             if (r.hidden)
                 o += ",\"hidden\":true";

@@ -54,6 +54,14 @@ ok "$("$BIN" show rel 2>/dev/null | sed -n 's/.*"lua_script": "\([^"]*\)".*/\1/p
 ok "$("$BIN" show rel 2>/dev/null | sed -n 's/.*"log_file": "\([^"]*\)".*/\1/p' | head -1)" \
    "$WORKDIR/rel.log" "a relative --log is resolved the same way"
 
+# Every flag the schema calls a path, not a list the CLI kept beside it, which had none of these.
+: > targets.txt; : > tiers.txt; : > repl.txt
+"$BIN" create storage relst -p $((P + 2)) --dir data --anonymous --notify-targets targets.txt --tiers tiers.txt \
+    --replication-targets repl.txt >/dev/null 2>&1
+field() { "$BIN" show relst 2>/dev/null | sed -n "s/.*\"$1\": \"\([^\"]*\)\".*/\1/p" | head -1; }
+ok "$(field notify_targets) $(field tiers) $(field replication_targets)" \
+   "$WORKDIR/targets.txt $WORKDIR/tiers.txt $WORKDIR/repl.txt" "a storage's relative target and tier files are the caller's"
+
 "$BIN" create server abs -p $((P + 1)) --log /dev/null >/dev/null 2>&1
 ok "$("$BIN" show abs 2>/dev/null | sed -n 's/.*"log_file": "\([^"]*\)".*/\1/p' | head -1)" \
    "/dev/null" "an absolute path comes through unchanged"

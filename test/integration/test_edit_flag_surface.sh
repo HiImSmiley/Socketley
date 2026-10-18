@@ -100,33 +100,33 @@ fi
 COUNT=$(printf '%s\n' "$SURFACE" | grep -c .)
 echo "  $COUNT edit flags across $(printf '%s\n' "$SURFACE" | awk '{print $2}' | sort -u | wc -l) parsers"
 
-# ── the third answer, read out of the handler ───────────────────────────────
+# ── the third answer, read out of the schema ────────────────────────────────
 #
 # There are three answers, not two.  A flag `create` takes on a cache and
 # `edit` cannot change is refused by name -- "--x cannot be changed with
 # `edit`", pointing at `import` -- because "unknown flag" reads as a typo and
-# sends the operator looking for a spelling that does not exist.  The list
-# lives in daemon_handler.cpp and is read from there for the same reason the
-# surface is: a flag added to it must add a row here, not need one written.
-HANDLER="$HERE/../../socketley/daemon/daemon_handler.cpp"
-CACHE_ONLY_SRC=$(python3 - "$HANDLER" <<'PY'
+# sends the operator looking for a spelling that does not exist.  What `create`
+# takes for a type is the dashboard's schema, which the handler asks, so the
+# list is read from there: a flag added to it must add a row here, not need one
+# written.  -s and --test are what create does, not settings, and stay unknown.
+SCHEMA="$HERE/../../socketley/daemon/runtime_schema.cpp"
+CACHE_ONLY_SRC=$(python3 - "$SCHEMA" <<'PY'
 import re, sys
-src = open(sys.argv[1]).read()
-m = re.search(r'cache_only\[\]\s*=\s*\{(.*?)\}', src, re.S)
-for f in re.findall(r'fnv1a\("(-[^"]+)"\)', m.group(1) if m else ''):
-    print(f)
+for flag, types in re.findall(r'^\s*\{"(-[^"]+)", "([A-Z]+)", "[a-z]+"', open(sys.argv[1]).read(), re.M):
+    if 'K' in types and flag not in ('-s', '--test'):
+        print(flag)
 PY
 )
 
 # An empty list would make every assertion below it pass by having nothing to
 # check, which is the failure mode a test cannot report about itself.
 if [ -z "$CACHE_ONLY_SRC" ]; then
-    bad "the refusal list was read at all" "no flags extracted from daemon_handler.cpp" \
-        "the extractor keys off 'cache_only[] = {' and 'fnv1a(\"-...\")'"
+    bad "the refusal list was read at all" "no cache flags extracted from runtime_schema.cpp" \
+        "the extractor keys off '{\"<flag>\", \"<types>\", \"<kind>\"' rows in runtime_schema.cpp"
 else
     ok
 fi
-echo "  $(printf '%s\n' "$CACHE_ONLY_SRC" | grep -c .) cache flags edit refuses by name"
+echo "  $(printf '%s\n' "$CACHE_ONLY_SRC" | grep -c .) flags create takes for a cache"
 
 # ── layer 1: the docs, which need no daemon ─────────────────────────────────
 #

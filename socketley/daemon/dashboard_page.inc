@@ -168,26 +168,8 @@ const TYPES = {
   idp: ['idp', 'Sign-in', 'One sign-in, with a storage\'s users, for apps and for routes behind a proxy.'],
   db: ['db', 'Database', 'JSON documents for apps, each owned by an account of the sign-in.']
 };
-// The configuration key `show` and `import` name each flag by.
-const KEY = { '-p': 'port', '-g': 'group', '--lua': 'lua_script', '--bind': 'bind', '--listen': 'listen', '--shards': 'shards', '--domain': 'domain', '--cpus': 'cpus',
-  '--tls': 'tls', '--cert': 'cert_path', '--key': 'key_path', '--ca': 'ca_path', '--acme': 'acme_domains', '--acme-email': 'acme_email', '--max-connections': 'max_connections',
-  '--rate-limit': 'rate_limit', '--global-rate-limit': 'global_rate_limit', '--idle-timeout': 'idle_timeout', '--read-buffer': 'read_buffer', '--write-buffer': 'write_buffer',
-  '--drain': 'drain', '--reconnect': 'reconnect', '--log': 'log_file', '-w': 'write_file', '-b': 'bash_output', '-bp': 'bash_prefix', '-bt': 'bash_timestamp',
-  '--send-to': 'send_to', '--udp': 'udp', '--http': 'http_dir', '--http-cache': 'http_cache', '--master-pw': 'master_pw', '--cache': 'cache_name', '-u': 'upstreams', '-t': 'target',
-  '--backend': 'backends', '--protocol': 'protocol', '--strategy': 'strategy', '--auth': 'auth', '--redirect-https': 'redirect_https', '--backend-timeout': 'backend_timeout',
-  '--retry': 'retry_count', '--retry-all': 'retry_all', '--health-check': 'health_check', '--health-interval': 'health_interval', '--health-path': 'health_path',
-  '--health-threshold': 'health_threshold', '--circuit-threshold': 'circuit_threshold', '--circuit-timeout': 'circuit_timeout', '--client-ca': 'mesh_client_ca',
-  '--client-cert': 'mesh_client_cert', '--client-key': 'mesh_client_key', '--persistent': 'persistent_path', '--persistent-interval': 'persistent_interval', '--maxmemory': 'max_memory',
-  '--eviction': 'eviction', '--resp': 'resp_forced', '--replicate': 'replicate_target', '--public': 'public', '--cluster': 'cluster', '--dir': 'dir', '--credentials': 'credentials',
-  '--access-key': 'access_key', '--secret-key': 'secret_key', '--anonymous': 'anonymous', '--website-domain': 'website_domain', '--tls-offloaded': 'tls_offloaded',
-  '--max-bytes': 'max_bytes', '--fsync': 'fsync', '--fsync-interval': 'fsync_interval', '--scrub': 'scrub', '--compress': 'compress', '--mpu-expire': 'mpu_expire',
-  '--sse-key-file': 'sse_key_file', '--acls': 'acls', '--notify-targets': 'notify_targets', '--replication-targets': 'replication_targets', '--tiers': 'tiers',
-  '--federation': 'federation', '--nodes': 'nodes', '--zone': 'zones', '--publish': 'publish', '--proxy': 'proxy', '--transfer': 'transfer', '--notify': 'notify', '--rrl': 'rrl',
-  '--clients': 'clients', '--issuer': 'issuer', '--cookie-domain': 'cookie_domain', '--idp': 'idp', '--schema': 'schema', '--keys': 'keys',
-  '--origins': 'origins', '--cache': 'cache',
-  '--replicate': 'replicate', '--replicate-key': 'replicate_key', '--backup-dir': 'backup_dir', '--backup-every': 'backup_every',
-  '--backup-keep': 'backup_keep' };
-const confKey = (f, type) => f.flag === '--mode' ? (type === 'cache' ? 'cache_mode' : 'mode') : KEY[f.flag];
+// The configuration key `show` and `import` name a flag by, which the schema gives for each type's row.
+const confKey = f => f.key;
 const ARRAYS = new Set(['backends', 'upstreams']);
 const HEALTH = ['', 'tcp', 'http'];
 // Durations as the flags take them and seconds as the configuration keeps them; sizes alike in bytes.
@@ -805,7 +787,7 @@ function paintConf() {
 }
 // A key's label: the flag's own where the schema has it.
 function label(k) {
-  if (schema) for (const f of schema.flags) if (KEY[f.flag] === k || (f.flag === '--mode' && (k === 'mode' || k === 'cache_mode'))) return f.label;
+  if (schema) for (const f of schema.flags) if (f.key === k) return f.label;
   return k.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
 }
 

@@ -32,6 +32,7 @@
 #include "../shared/util/proc_stat.h"
 #include "../shared/ipc/one_command.h"
 #include "../shared/util/settings.h"
+#include "runtime_schema.h"
 #include <sys/stat.h>
 
 static void publish_dns_names(runtime_manager& manager);
@@ -4128,71 +4129,25 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
 
         if (result == -1)
         {
-            // Cache flags `create` takes and `edit` does not, so the answer
-            // names `import` instead of reading as a typo.  --mode is in here
-            // because it is the one a reader reaches for first: the page
-            // documents `--mode readonly` on a cache, and asking edit for it
-            // answered "unknown flag: --mode" -- which says the flag does not
-            // exist rather than that this command cannot change it.
-            static constexpr uint32_t cache_only[] = {
-                fnv1a("--maxmemory"), fnv1a("--eviction"), fnv1a("--persistent"),
-                fnv1a("--replicate"), fnv1a("--resp"), fnv1a("--cluster"),
-                fnv1a("--persistent-interval"), fnv1a("--mode"),
-                fnv1a("--public"),
-            };
-            bool is_cache_flag = false;
-            for (uint32_t h : cache_only)
-                if (pa.hashes[i] == h) { is_cache_flag = true; break; }
-
-            if (type == runtime_storage &&
-                (pa.hashes[i] == fnv1a("--dir") || pa.hashes[i] == fnv1a("--anonymous") || pa.hashes[i] == fnv1a("--acls") ||
-                 pa.hashes[i] == fnv1a("--max-bytes") || pa.hashes[i] == fnv1a("--access-key") ||
-                 pa.hashes[i] == fnv1a("--secret-key") || pa.hashes[i] == fnv1a("--credentials") ||
-                 pa.hashes[i] == fnv1a("--mpu-expire") || pa.hashes[i] == fnv1a("--sse-key-file") ||
-                 pa.hashes[i] == fnv1a("--domain") || pa.hashes[i] == fnv1a("--notify-targets") ||
-                 pa.hashes[i] == fnv1a("--website-domain") ||
-                 pa.hashes[i] == fnv1a("--replication-targets") || pa.hashes[i] == fnv1a("--fsync") ||
-                 pa.hashes[i] == fnv1a("--nodes") || pa.hashes[i] == fnv1a("--scrub") ||
-                 pa.hashes[i] == fnv1a("--compress") || pa.hashes[i] == fnv1a("--tiers") ||
-                 pa.hashes[i] == fnv1a("--federation") || pa.hashes[i] == fnv1a("--tls-offloaded") ||
-                 pa.hashes[i] == fnv1a("--fsync-interval") || pa.hashes[i] == fnv1a("--sync") ||
-                 pa.hashes[i] == fnv1a("--idp")))
+            // A flag `create` takes for this type and `edit` does not is named as one `import` changes, so the answer
+            // does not read as a typo; -s and --test are what create does, not settings.
+            const bool own_type = type == runtime_cache || type == runtime_storage || type == runtime_idp ||
+                                  type == runtime_db;
+            if (own_type && pa.hashes[i] != fnv1a("-s") && pa.hashes[i] != fnv1a("--test") &&
+                runtime_schema::offered(pa.args[i], type))
             {
                 restore_edit();
+                // idp and db read their own settings once, at start.
+                const bool restart = type == runtime_idp || type == runtime_db;
                 std::cout << pa.args[i] << " cannot be changed with `edit`\n"
-                             "  A storage runtime's own settings are applied by `import`:\n"
+                          << (type == runtime_cache     ? "  A cache's"
+                              : type == runtime_storage ? "  A storage runtime's"
+                              : type == runtime_idp     ? "  An idp runtime's"
+                                                        : "  A db runtime's")
+                          << " own settings are applied by `import`:\n"
                              "    socketley show " << name
                           << " > cfg.json   # edit the field, then\n"
-                             "    socketley import " << name << " < cfg.json\n";
-                return 1;
-            }
-
-            const uint32_t h = pa.hashes[i];
-            if ((type == runtime_idp &&
-                 (h == fnv1a("--clients") || h == fnv1a("--issuer") || h == fnv1a("--cookie-domain"))) ||
-                (type == runtime_db &&
-                 (h == fnv1a("--schema") || h == fnv1a("--keys") || h == fnv1a("--idp") || h == fnv1a("--origins") ||
-                  h == fnv1a("--max-bytes") || h == fnv1a("--cache") || h == fnv1a("--replicate") ||
-                  h == fnv1a("--replicate-key") || h == fnv1a("--backup-dir") || h == fnv1a("--backup-every") ||
-                  h == fnv1a("--backup-keep"))))
-            {
-                restore_edit();
-                std::cout << pa.args[i] << " cannot be changed with `edit`\n"
-                          << (type == runtime_idp ? "  An idp" : "  A db") << " runtime's own settings are applied by `import`:\n"
-                             "    socketley show " << name
-                          << " > cfg.json   # edit the field, then\n"
-                             "    socketley import " << name << " --restart < cfg.json\n";
-                return 1;
-            }
-
-            if (is_cache_flag && type == runtime_cache)
-            {
-                restore_edit();
-                std::cout << pa.args[i] << " cannot be changed with `edit`\n"
-                             "  A cache's own settings are applied by `import`:\n"
-                             "    socketley show " << name
-                          << " > cfg.json   # edit the field, then\n"
-                             "    socketley import " << name << " < cfg.json\n";
+                             "    socketley import " << name << (restart ? " --restart" : "") << " < cfg.json\n";
                 return 1;
             }
 

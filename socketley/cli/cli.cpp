@@ -21,6 +21,7 @@
 #include "../daemon/ipc_client.h"
 #include "../shared/ipc/ipc_framing.h"
 #include "../daemon/daemon_handler.h"
+#include "../daemon/runtime_schema.h"
 #include "../runtime/worker/worker_main.h"
 #include "../shared/ipc/daemon_client.h"
 #include "../shared/persist/paths.h"
@@ -711,11 +712,6 @@ int cli_dispatch(int argc, char** argv)
 // is "/" under systemd -- and `--lua example.lua` loaded /example.lua.
 std::string cli_caller_path(std::string_view flag, std::string_view value)
 {
-    static constexpr std::string_view path_flags[] = {
-        "--lua", "--log", "-w", "--persistent", "--http", "--dir", "--credentials", "--sse-key-file",
-        "--cert", "--key", "--ca", "--client-ca", "--client-cert", "--client-key", "--zone", "--schema", "--keys",
-        "--replicate-key", "--backup-dir",
-    };
     // A list of zone files, each made absolute in its place.
     if (flag == "--zone" && value.find(',') != std::string_view::npos)
     {
@@ -743,8 +739,9 @@ std::string cli_caller_path(std::string_view flag, std::string_view value)
     }
     std::string_view prefix;
     bool is_path = false;
-    for (std::string_view f : path_flags)
-        if (flag == f) { is_path = true; break; }
+    // The schema's paths, and the zone files a --zone that is no list may name.
+    if (runtime_schema::is_path_flag(flag) || flag == "--zone" || flag == "--keys")
+        is_path = true;
     if (!is_path && flag == "--listen" && value.starts_with("unix:"))
     {
         is_path = true;
