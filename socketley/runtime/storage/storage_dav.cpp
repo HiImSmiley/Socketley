@@ -16,6 +16,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/persist/state_persistence.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -235,7 +236,7 @@ bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view rea
         if (login_barred(c))
             return false;
         std::string pair;
-        const size_t colon = base64_decode(cred, pair) ? pair.find(':') : std::string::npos;
+        const size_t colon = base64::decode(cred, pair) ? pair.find(':') : std::string::npos;
         // An access key and its secret, or a user's name and the password of its login profile.
         if (colon != std::string::npos)
         {

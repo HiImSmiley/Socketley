@@ -86,8 +86,6 @@ inline constexpr int64_t oidc_leeway_secs = 60;
 // The longest token taken, past every IdP's in practice.
 inline constexpr size_t  jwt_max_bytes = 16384;
 
-// Base64url as JWS writes it: no padding and only the one canonical spelling of the bytes.
-bool jws_base64url_decode(std::string_view in, std::string& out);
 // A JWS ECDSA signature, r and s of `coord` bytes each, as the DER SEQUENCE OpenSSL verifies.
 bool jws_ecdsa_to_der(std::string_view raw, size_t coord, std::string& der);
 

@@ -12,6 +12,7 @@
 
 #include "digest.h"
 #include "../../shared/util/crc.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -290,69 +291,10 @@ std::string checksum_stream::peek_raw() const
 
 std::string checksum_stream::peek_b64() const
 {
-    return base64_encode(peek_raw());
+    return base64::encode(peek_raw());
 }
 
-std::string base64_encode(std::string_view in)
-{
-    static constexpr char digits[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    out.reserve((in.size() + 2) / 3 * 4);
-    size_t i = 0;
-    for (; i + 3 <= in.size(); i += 3)
-    {
-        const uint32_t v = (static_cast<uint32_t>(static_cast<unsigned char>(in[i])) << 16) |
-                           (static_cast<uint32_t>(static_cast<unsigned char>(in[i + 1])) << 8) |
-                           static_cast<unsigned char>(in[i + 2]);
-        out.push_back(digits[(v >> 18) & 63]);
-        out.push_back(digits[(v >> 12) & 63]);
-        out.push_back(digits[(v >> 6) & 63]);
-        out.push_back(digits[v & 63]);
-    }
-    if (const size_t rest = in.size() - i; rest > 0)
-    {
-        uint32_t v = static_cast<uint32_t>(static_cast<unsigned char>(in[i])) << 16;
-        if (rest == 2)
-            v |= static_cast<uint32_t>(static_cast<unsigned char>(in[i + 1])) << 8;
-        out.push_back(digits[(v >> 18) & 63]);
-        out.push_back(digits[(v >> 12) & 63]);
-        out.push_back(rest == 2 ? digits[(v >> 6) & 63] : '=');
-        out.push_back('=');
-    }
-    return out;
-}
 
-bool base64_decode(std::string_view in, std::string& out)
-{
-    out.clear();
-    // Padded to a whole number of quanta, as every encoder writes it.
-    if (in.size() % 4 != 0)
-        return false;
-    uint32_t acc = 0;
-    int bits = 0;
-    size_t pad = 0;
-    for (char c : in)
-    {
-        int v;
-        if (c >= 'A' && c <= 'Z') v = c - 'A';
-        else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
-        else if (c >= '0' && c <= '9') v = c - '0' + 52;
-        else if (c == '+') v = 62;
-        else if (c == '/') v = 63;
-        else if (c == '=') { if (++pad > 2) return false; continue; }
-        else return false;
-        if (pad)
-            return false;
-        acc = (acc << 6) | static_cast<uint32_t>(v);
-        bits += 6;
-        if (bits >= 8)
-        {
-            bits -= 8;
-            out.push_back(static_cast<char>((acc >> bits) & 0xFF));
-        }
-    }
-    return true;
-}
 
 namespace
 {
@@ -425,7 +367,7 @@ std::string full_object_checksum_b64(checksum_algo a, const std::vector<std::pai
         }
         crc = f.mul(shift, crc) ^ v;
     }
-    return base64_encode(be_bytes(crc, bytes));
+    return base64::encode(be_bytes(crc, bytes));
 }
 
 std::string composite_checksum_b64(checksum_algo a, std::string_view concatenated_raw, size_t parts)

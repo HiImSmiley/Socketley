@@ -9,12 +9,6 @@ typedef struct evp_pkey_st EVP_PKEY;
 namespace socketley::jws
 {
 
-// Base64url without padding, as every JWS part is written.
-std::string b64url(std::string_view in);
-
-// The bytes of an unpadded base64url string; false on a character or a length no encoder writes.
-bool b64url_decode(std::string_view in, std::string& out);
-
 // SHA-256 of `in`, the 32 raw bytes.
 std::string sha256(std::string_view in);
 

@@ -14,6 +14,7 @@
 #include "object_store.h"
 #include "s3_auth.h"
 #include "s3_names.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -282,7 +283,7 @@ inline std::string list_buckets_xml(const std::vector<bucket_info>& bs, std::str
     }
     x += "</Buckets>";
     if (truncated)
-        x += "<ContinuationToken>" + base64url_encode(last) + "</ContinuationToken>";
+        x += "<ContinuationToken>" + base64url::encode(last) + "</ContinuationToken>";
     if (!page.prefix.empty())
         x += "<Prefix>" + xml_escape(page.prefix) + "</Prefix>";
     x += "</ListAllMyBucketsResult>";

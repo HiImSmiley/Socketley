@@ -14,6 +14,7 @@
 
 #include "checksum.h"
 #include "compression.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -163,11 +164,11 @@ std::string encode_sse(const sse_record& r)
     v += r.per_part ? ";p;" : ";o;";
     v += hex(r.kid.data(), r.kid.size());
     v += ';';
-    v += base64_encode(r.wrapped);
+    v += base64::encode(r.wrapped);
     if (r.mode == sse_mode::kms)
     {
         v += ';';
-        v += base64_encode(r.kms_key);
+        v += base64::encode(r.kms_key);
     }
     return v;
 }
@@ -191,7 +192,7 @@ bool decode_sse(std::string_view v, sse_record& out)
         return false;
     out.version  = f[0] == "1" ? sse_format_v1 : sse_format;
     out.mode     = kms ? sse_mode::kms : f[1] == "c" ? sse_mode::c : sse_mode::s3;
-    if (kms && (!base64_decode(f[6], out.kms_key) || out.kms_key.empty()))
+    if (kms && (!base64::decode(f[6], out.kms_key) || out.kms_key.empty()))
         return false;
     out.per_part = f[3] == "p";
     for (size_t i = 0; i < 4; ++i)
@@ -201,7 +202,7 @@ bool decode_sse(std::string_view v, sse_record& out)
             return false;
         out.kid[i] = static_cast<uint8_t>(hi << 4 | lo);
     }
-    return base64_decode(f[5], out.wrapped) && out.wrapped.size() == sse_wrapped_bytes;
+    return base64::decode(f[5], out.wrapped) && out.wrapped.size() == sse_wrapped_bytes;
 }
 
 const std::string* sse_value(const object_meta& m)

@@ -9,6 +9,7 @@
 #include <fcntl.h>
 
 #include "../../shared/util/logging.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -644,7 +645,7 @@ void put_op::finish_now()
     if (m_hs->ck)
     {
         const std::string got = m_hs->ck->peek_raw();
-        if (!m_ck_expect.empty() && base64_encode(got) != m_ck_expect)
+        if (!m_ck_expect.empty() && base64::encode(got) != m_ck_expect)
         {
             fail(st::bad_digest);
             return;

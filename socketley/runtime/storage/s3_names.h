@@ -64,64 +64,7 @@ inline std::string url_encode(std::string_view in, bool keep_slash = true)
     return socketley::http::url_encode(in, keep_slash);
 }
 
-inline std::string base64url_encode(std::string_view in)
-{
-    static constexpr char tbl[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    std::string out;
-    size_t i = 0;
-    while (i + 2 < in.size())
-    {
-        const uint32_t v = (static_cast<uint8_t>(in[i]) << 16) |
-                           (static_cast<uint8_t>(in[i + 1]) << 8) |
-                            static_cast<uint8_t>(in[i + 2]);
-        out.push_back(tbl[v >> 18]);
-        out.push_back(tbl[(v >> 12) & 63]);
-        out.push_back(tbl[(v >> 6) & 63]);
-        out.push_back(tbl[v & 63]);
-        i += 3;
-    }
-    if (i + 1 == in.size())
-    {
-        const uint32_t v = static_cast<uint8_t>(in[i]) << 16;
-        out.push_back(tbl[v >> 18]);
-        out.push_back(tbl[(v >> 12) & 63]);
-    }
-    else if (i + 2 == in.size())
-    {
-        const uint32_t v = (static_cast<uint8_t>(in[i]) << 16) |
-                           (static_cast<uint8_t>(in[i + 1]) << 8);
-        out.push_back(tbl[v >> 18]);
-        out.push_back(tbl[(v >> 12) & 63]);
-        out.push_back(tbl[(v >> 6) & 63]);
-    }
-    return out;
-}
 
-inline bool base64url_decode(std::string_view in, std::string& out)
-{
-    out.clear();
-    uint32_t acc = 0;
-    int bits = 0;
-    for (char c : in)
-    {
-        int v;
-        if (c >= 'A' && c <= 'Z') v = c - 'A';
-        else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
-        else if (c >= '0' && c <= '9') v = c - '0' + 52;
-        else if (c == '-') v = 62;
-        else if (c == '_') v = 63;
-        else return false;
-        acc = (acc << 6) | static_cast<uint32_t>(v);
-        bits += 6;
-        if (bits >= 8)
-        {
-            bits -= 8;
-            out.push_back(static_cast<char>((acc >> bits) & 0xFF));
-        }
-    }
-    return true;
-}
 
 // A UTC time in its fields, by arithmetic rather than gmtime_r, which takes the time zone lock.
 struct utc_fields

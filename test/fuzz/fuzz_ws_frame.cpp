@@ -13,7 +13,7 @@
 //   ws_parse_frame         copying parse (allocates a payload string)
 //   ws_parse_frame_inplace unmasks the caller's buffer and points into it
 //   ws_unmask_payload      via both of the above — AVX2/SSE2/scalar tails
-//   ws_accept_key          the stack-vs-heap split at 92 bytes of client key
+//   ws_accept_key          the stack-vs-heap split at 92 bytes of client key, against the RFC derivation
 //
 // Properties checked, beyond "did it crash":
 //   * a frame the parser accepts must fit entirely inside the bytes it was
@@ -148,9 +148,15 @@ void accept_key(const uint8_t* data, size_t size)
     std::string_view key(reinterpret_cast<const char*>(data), n);
 
     std::string a = ws_accept_key(key);
-    std::string b;
-    ws_accept_key_into(b, key);
-    FUZZ_CHECK(a == b, "ws_accept_key and ws_accept_key_into produced different accept keys");
+    // RFC 6455's derivation spelled out, which neither branch shares a buffer with.
+    const std::string joined = std::string(key) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int  digest_len = 0;
+    EVP_Digest(joined.data(), joined.size(), digest, &digest_len, EVP_sha1(), nullptr);
+    unsigned char want[64];
+    const int want_len = EVP_EncodeBlock(want, digest, static_cast<int>(digest_len));
+    FUZZ_CHECK(a == std::string_view(reinterpret_cast<const char*>(want), static_cast<size_t>(want_len)),
+               "ws_accept_key is not the base64 of the SHA-1 of the key and the RFC 6455 GUID");
     FUZZ_CHECK(a.size() == 28, "an accept key is not the 28 characters base64 of a SHA-1 digest must be");
 
     std::string resp = ws_handshake_response(key);

@@ -11,6 +11,7 @@
 #include "../../shared/util/crc.h"
 #include "../../shared/util/byte_codec.h"
 #include "../../shared/util/number_parse.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -113,7 +114,7 @@ bool parse_checksum(checksum_algo a, std::string_view v, object_checksum& out)
         composite = static_cast<uint16_t>(parts);
     }
     std::string raw;
-    if (!base64_decode(v.substr(0, chars), raw) || raw.size() != width || base64_encode(raw) != v.substr(0, chars))
+    if (!base64::decode(v.substr(0, chars), raw) || raw.size() != width)
         return false;
     out.set(a, raw, composite);
     return true;
@@ -219,7 +220,7 @@ std::string object_checksum::b64() const
 {
     if (algo == checksum_algo::none)
         return {};
-    std::string v = base64_encode(raw_bytes());
+    std::string v = base64::encode(raw_bytes());
     if (composite)
         v += "-" + std::to_string(composite);
     return v;
@@ -687,7 +688,7 @@ void header_checksums(const object_meta& m, uint32_t count, std::vector<std::str
     }
     const std::string* v = extra_of(m, part_checksums_extra);
     std::string raw;
-    if (!v || !base64_decode(*v, raw) || raw.size() != width * count)
+    if (!v || !base64::decode(*v, raw) || raw.size() != width * count)
         return;
     for (uint32_t i = 0; i < count; ++i)
         out.push_back(raw.substr(i * width, width));
@@ -945,7 +946,7 @@ std::string record_part_list(object_meta& m, const part_list& l, uint64_t body_s
     std::string sums;
     for (size_t i = 0; width && i < l.checksums.size(); ++i)
         sums += l.checksums[i];
-    sums = sums.empty() ? std::string{} : base64_encode(sums);
+    sums = sums.empty() ? std::string{} : base64::encode(sums);
     if (!sizes.empty() && (!numbers || one_to_n || !nums.empty()) && sums.size() <= max)
     {
         m.extra.emplace_back(std::string(part_sizes_extra), std::move(sizes));

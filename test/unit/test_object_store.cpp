@@ -10,6 +10,7 @@
 #include "shared/loop/event_loop.h"
 #include "shared/loop/file_io.h"
 #include "shared/loop/hash_pool.h"
+#include "shared/util/base64.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -1283,7 +1284,7 @@ TEST_CASE("a copy's checksum is of its whole bytes, kept from a source that has 
     const std::string body = pattern((2u << 20) + 77, 3);
     // A composite value is of parts, and a whole one is kept as it is even when nothing checks it.
     object_meta comp;
-    set_checksum_b64(comp, checksum_algo::sha256, base64_encode(std::string(32, 'f')) + "-3");
+    set_checksum_b64(comp, checksum_algo::sha256, socketley::base64::encode(std::string(32, 'f')) + "-3");
     REQUIRE(comp.checksum.composite == 3);
     REQUIRE(r.put("ckb", "comp", body, comp).status == st::ok);
     object_meta whole;

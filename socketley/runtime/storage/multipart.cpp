@@ -17,6 +17,7 @@
 #include "s3_xml.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/random_id.h"
+#include "../../shared/util/base64.h"
 
 namespace fs = std::filesystem;
 
@@ -155,7 +156,7 @@ part_list list_of(const std::vector<mpu_part>& parts, const object_meta& meta)
         l.numbers.push_back(p.number);
         l.sizes.push_back(p.size);
         std::string raw;
-        sums = sums && base64_decode(p.checksum_b64, raw) && raw.size() == checksum_raw_len(a);
+        sums = sums && base64::decode(p.checksum_b64, raw) && raw.size() == checksum_raw_len(a);
         if (sums)
             l.checksums.push_back(std::move(raw));
     }
@@ -1144,7 +1145,7 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
             if (u->algo != checksum_algo::none)
             {
                 std::string raw;
-                if (!base64_decode(have.checksum_b64, raw))
+                if (!base64::decode(have.checksum_b64, raw))
                 {
                     reject("InvalidPart");
                     return;
@@ -1153,7 +1154,7 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
                 part_checksums.emplace_back(std::move(raw), have.size);
             }
             // A part written before parts kept their CRC leaves the object without the default, as it was then.
-            else if (std::string raw; base64_decode(have.crc_b64, raw) && !raw.empty())
+            else if (std::string raw; base64::decode(have.crc_b64, raw) && !raw.empty())
                 part_checksums.emplace_back(std::move(raw), have.size);
             plan.parts.push_back(have);
         }

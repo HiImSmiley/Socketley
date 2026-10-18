@@ -32,6 +32,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/http/status.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/base64.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -2354,7 +2355,7 @@ void storage_run::put_body_complete(const std::shared_ptr<conn>& c)
         const std::string v = c->hook->trailer_value(c->ck_trailer);
         std::string raw;
         const checksum_algo a = checksum_from_header(c->ck_trailer);
-        if (!v.empty() && (!base64_decode(v, raw) || raw.size() != checksum_raw_len(a)))
+        if (!v.empty() && (!base64::decode(v, raw) || raw.size() != checksum_raw_len(a)))
         {
             s3_error e = make_error("InvalidRequest");
             e.message = "Value for " + c->ck_trailer + " header is invalid.";

@@ -3,6 +3,7 @@
 
 #include "runtime/storage/s3_federation.h"
 #include "runtime/storage/s3_names.h"
+#include "shared/util/base64.h"
 
 #include <chrono>
 #include <cstdio>
@@ -93,8 +94,8 @@ std::string rsa_jwk(EVP_PKEY* k, std::string_view kid, std::string_view use = "s
         j += ",\"use\":\"" + std::string(use) + "\"";
     if (!alg.empty())
         j += ",\"alg\":\"" + std::string(alg) + "\"";
-    j += ",\"n\":\"" + base64url_encode(bn_bytes(k, OSSL_PKEY_PARAM_RSA_N)) + "\"";
-    j += ",\"e\":\"" + base64url_encode(bn_bytes(k, OSSL_PKEY_PARAM_RSA_E)) + "\"}";
+    j += ",\"n\":\"" + socketley::base64url::encode(bn_bytes(k, OSSL_PKEY_PARAM_RSA_N)) + "\"";
+    j += ",\"e\":\"" + socketley::base64url::encode(bn_bytes(k, OSSL_PKEY_PARAM_RSA_E)) + "\"}";
     return j;
 }
 
@@ -105,8 +106,8 @@ std::string ec_jwk(EVP_PKEY* k, std::string_view crv, size_t coord, std::string_
         j += ",\"kid\":\"" + std::string(kid) + "\"";
     if (!alg.empty())
         j += ",\"alg\":\"" + std::string(alg) + "\"";
-    j += ",\"x\":\"" + base64url_encode(bn_bytes(k, OSSL_PKEY_PARAM_EC_PUB_X, coord)) + "\"";
-    j += ",\"y\":\"" + base64url_encode(bn_bytes(k, OSSL_PKEY_PARAM_EC_PUB_Y, coord)) + "\"}";
+    j += ",\"x\":\"" + socketley::base64url::encode(bn_bytes(k, OSSL_PKEY_PARAM_EC_PUB_X, coord)) + "\"";
+    j += ",\"y\":\"" + socketley::base64url::encode(bn_bytes(k, OSSL_PKEY_PARAM_EC_PUB_Y, coord)) + "\"}";
     return j;
 }
 
@@ -213,8 +214,8 @@ std::string header_json(std::string_view alg, std::string_view kid, std::string_
 std::string jwt(EVP_PKEY* k, std::string_view alg, std::string_view kid, const claims& c = {},
                 std::string_view header_extra = {})
 {
-    const std::string input = base64url_encode(header_json(alg, kid, header_extra)) + "." + base64url_encode(c.json());
-    return input + "." + base64url_encode(sign(k, alg, input));
+    const std::string input = socketley::base64url::encode(header_json(alg, kid, header_extra)) + "." + socketley::base64url::encode(c.json());
+    return input + "." + socketley::base64url::encode(sign(k, alg, input));
 }
 
 federation_oidc oidc_cfg()
@@ -279,22 +280,22 @@ std::string hex_bytes(std::initializer_list<int> b)
 TEST_CASE("base64url is read only in its one canonical spelling")
 {
     std::string out;
-    CHECK(jws_base64url_decode("", out));
+    CHECK(socketley::base64url::decode("", out));
     CHECK(out.empty());
-    CHECK(jws_base64url_decode("aGk", out));
+    CHECK(socketley::base64url::decode("aGk", out));
     CHECK(out == "hi");
-    CHECK(jws_base64url_decode("_-8", out));
+    CHECK(socketley::base64url::decode("_-8", out));
     CHECK(out == "\xff\xef");
-    CHECK_FALSE(jws_base64url_decode("aGk=", out));
-    CHECK_FALSE(jws_base64url_decode("aGl", out));
-    CHECK_FALSE(jws_base64url_decode("a", out));
-    CHECK_FALSE(jws_base64url_decode("aG+k", out));
-    CHECK_FALSE(jws_base64url_decode("aG/k", out));
-    CHECK_FALSE(jws_base64url_decode("aG k", out));
+    CHECK_FALSE(socketley::base64url::decode("aGk=", out));
+    CHECK_FALSE(socketley::base64url::decode("aGl", out));
+    CHECK_FALSE(socketley::base64url::decode("a", out));
+    CHECK_FALSE(socketley::base64url::decode("aG+k", out));
+    CHECK_FALSE(socketley::base64url::decode("aG/k", out));
+    CHECK_FALSE(socketley::base64url::decode("aG k", out));
     std::string all;
     for (int i = 0; i < 64; ++i)
     {
-        CHECK(jws_base64url_decode(base64url_encode(all), out));
+        CHECK(socketley::base64url::decode(socketley::base64url::encode(all), out));
         CHECK(out == all);
         all.push_back(static_cast<char>(i * 37 + 11));
     }
@@ -472,23 +473,23 @@ TEST_CASE("a token is refused for its alg, its kid or a changed byte")
     REQUIRE(verifies(std_keys(), good, &why));
     const size_t d1 = good.find('.');
     const size_t d2 = good.rfind('.');
-    const std::string payload = base64url_encode(claims{}.json());
+    const std::string payload = socketley::base64url::encode(claims{}.json());
 
     SUBCASE("alg none")
     {
-        const std::string t = base64url_encode(R"({"alg":"none"})") + "." + payload + ".";
+        const std::string t = socketley::base64url::encode(R"({"alg":"none"})") + "." + payload + ".";
         CHECK_FALSE(verifies(std_keys(), t, &why));
         CHECK(why.find("alg") != std::string::npos);
     }
     SUBCASE("alg HS256 keyed with the public key")
     {
-        const std::string input = base64url_encode(header_json("HS256", "r")) + "." + payload;
+        const std::string input = socketley::base64url::encode(header_json("HS256", "r")) + "." + payload;
         const std::string n = bn_bytes(rsa_a(), OSSL_PKEY_PARAM_RSA_N);
         unsigned char mac[32];
         unsigned int len = sizeof mac;
         REQUIRE(HMAC(EVP_sha256(), n.data(), static_cast<int>(n.size()), bytes(input), input.size(), mac, &len) !=
                 nullptr);
-        const std::string t = input + "." + base64url_encode(std::string(reinterpret_cast<char*>(mac), len));
+        const std::string t = input + "." + socketley::base64url::encode(std::string(reinterpret_cast<char*>(mac), len));
         CHECK_FALSE(verifies(std_keys(), t, &why));
         CHECK(why.find("alg") != std::string::npos);
     }
@@ -539,16 +540,16 @@ TEST_CASE("a token is refused for its alg, its kid or a changed byte")
     {
         claims c;
         c.policy = "\"admins\"";
-        const std::string t = good.substr(0, d1) + "." + base64url_encode(c.json()) + good.substr(d2);
+        const std::string t = good.substr(0, d1) + "." + socketley::base64url::encode(c.json()) + good.substr(d2);
         CHECK_FALSE(verifies(std_keys(), t, &why));
         CHECK(why.find("signature") != std::string::npos);
     }
     SUBCASE("a changed signature")
     {
         std::string sig;
-        REQUIRE(jws_base64url_decode(good.substr(d2 + 1), sig));
+        REQUIRE(socketley::base64url::decode(good.substr(d2 + 1), sig));
         sig[sig.size() / 2] = static_cast<char>(sig[sig.size() / 2] ^ 0x01);
-        CHECK_FALSE(verifies(std_keys(), good.substr(0, d2 + 1) + base64url_encode(sig), &why));
+        CHECK_FALSE(verifies(std_keys(), good.substr(0, d2 + 1) + socketley::base64url::encode(sig), &why));
         CHECK(why.find("signature") != std::string::npos);
     }
     SUBCASE("a changed ES256 signature, and one written as DER")
@@ -557,11 +558,11 @@ TEST_CASE("a token is refused for its alg, its kid or a changed byte")
         REQUIRE(verifies(std_keys(), es, &why));
         const size_t s = es.rfind('.');
         std::string sig;
-        REQUIRE(jws_base64url_decode(es.substr(s + 1), sig));
+        REQUIRE(socketley::base64url::decode(es.substr(s + 1), sig));
         sig[5] = static_cast<char>(sig[5] ^ 0x80);
-        CHECK_FALSE(verifies(std_keys(), es.substr(0, s + 1) + base64url_encode(sig), &why));
+        CHECK_FALSE(verifies(std_keys(), es.substr(0, s + 1) + socketley::base64url::encode(sig), &why));
         const std::string der = sign_der(ec_256(), "ES256", es.substr(0, s));
-        CHECK_FALSE(verifies(std_keys(), es.substr(0, s + 1) + base64url_encode(der), &why));
+        CHECK_FALSE(verifies(std_keys(), es.substr(0, s + 1) + socketley::base64url::encode(der), &why));
     }
     SUBCASE("a signature padded or with a fourth part")
     {

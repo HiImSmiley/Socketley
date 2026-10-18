@@ -7,6 +7,7 @@
 #include "s3_cors.h"
 #include "s3_names.h"
 #include "s3_xml.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -22,7 +23,7 @@ void storage_run::op_put_cors(const std::shared_ptr<conn>& c)
     if (const std::string_view md5h = q.header("content-md5"); q.has_header("content-md5"))
     {
         std::string raw;
-        if (!base64_decode(md5h, raw) || raw.size() != 16)
+        if (!base64::decode(md5h, raw) || raw.size() != 16)
         {
             send_error(c, make_error("InvalidDigest"));
             return;

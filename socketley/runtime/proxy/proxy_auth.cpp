@@ -16,6 +16,7 @@
 #include "../storage/s3_sigv4_auth.h"
 #include "../idp/idp_session.h"
 #include "../../shared/persist/read_file.h"
+#include "../../shared/util/base64.h"
 
 namespace
 {
@@ -187,7 +188,7 @@ bool proxy_auth::admit(std::string_view authorization) const
         return ok;
     }
     std::string pair;
-    if (!scheme_is("basic") || !socketley::storage::base64_decode(value, pair))
+    if (!scheme_is("basic") || !socketley::base64::decode(value, pair))
         return false;
     const size_t colon = pair.find(':');
     if (colon == std::string::npos)

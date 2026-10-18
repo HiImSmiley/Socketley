@@ -1357,7 +1357,8 @@ project "fuzz_s3_sigv4"
         "test/fuzz/fuzz_s3_sigv4.cpp",
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
-        "socketley/shared/storage/s3_sigv4.cpp"
+        "socketley/shared/storage/s3_sigv4.cpp",
+        "socketley/shared/util/base64.cpp"
     }
 
     fuzz_target_settings()
@@ -1421,7 +1422,7 @@ project "fuzz_db"
         "socketley/runtime/db/db_schema.cpp",
         "socketley/runtime/db/db_store.cpp",
         "socketley/runtime/db/db_log.cpp",
-        "socketley/shared/crypto/jws.cpp"
+        "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp"
     }
 
     fuzz_target_settings()
@@ -1967,7 +1968,8 @@ project "test_s3_sigv4"
 
     files {
         "test/unit/test_s3_sigv4.cpp",
-        "socketley/shared/storage/s3_sigv4.cpp"
+        "socketley/shared/storage/s3_sigv4.cpp",
+        "socketley/shared/util/base64.cpp"
     }
 
     filter "configurations:Debug"
@@ -2725,7 +2727,7 @@ project "test_idp"
     links { "crypto", "dl" }
 
     files { "test/unit/test_idp.cpp", "socketley/runtime/idp/idp_logic.cpp", "socketley/runtime/idp/idp_accounts.cpp",
-            "socketley/runtime/idp/idp_shard.cpp", "socketley/shared/crypto/jws.cpp" }
+            "socketley/runtime/idp/idp_shard.cpp", "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }
@@ -2760,7 +2762,7 @@ project "test_db"
 
     files { "test/unit/test_db.cpp", "socketley/runtime/db/db_doc.cpp", "socketley/runtime/db/db_schema.cpp",
             "socketley/runtime/db/db_store.cpp", "socketley/runtime/db/db_log.cpp", "socketley/runtime/db/db_shard.cpp",
-            "socketley/shared/crypto/jws.cpp" }
+            "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

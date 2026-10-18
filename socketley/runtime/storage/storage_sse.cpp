@@ -11,6 +11,7 @@
 #include "s3_xml.h"
 #include "storage_instance.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -122,7 +123,7 @@ bool storage_run::sse_customer(const std::shared_ptr<conn>& c, std::string_view 
         return false;
     }
     std::string raw;
-    if (key.empty() || !base64_decode(key, raw) || raw.size() != sse_key_bytes)
+    if (key.empty() || !base64::decode(key, raw) || raw.size() != sse_key_bytes)
     {
         err = sse_error("InvalidArgument", "The secret key was invalid for the specified algorithm.");
         return false;
@@ -135,7 +136,7 @@ bool storage_run::sse_customer(const std::shared_ptr<conn>& c, std::string_view 
         return false;
     }
     const md5_t want = md5_of(raw);
-    if (!base64_decode(md5, raw_md5) || raw_md5.size() != want.size() ||
+    if (!base64::decode(md5, raw_md5) || raw_md5.size() != want.size() ||
         std::memcmp(raw_md5.data(), want.data(), want.size()) != 0)
     {
         err = sse_error("InvalidArgument", "The calculated MD5 hash of the key did not match the hash that was provided.");

@@ -11,6 +11,7 @@
 #include "shared/loop/event_loop.h"
 #include "shared/loop/file_io.h"
 #include "shared/util/crc.h"
+#include "shared/util/base64.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -64,9 +65,9 @@ TEST_CASE("the checksums match their published check values")
 {
     // "123456789" is the check input every CRC catalogue publishes a value for.
     const std::string in = "123456789";
-    CHECK(b64_of(checksum_algo::crc32, in) == base64_encode(std::string("\xCB\xF4\x39\x26", 4)));
-    CHECK(b64_of(checksum_algo::crc32c, in) == base64_encode(std::string("\xE3\x06\x92\x83", 4)));
-    CHECK(b64_of(checksum_algo::crc64nvme, in) == base64_encode(std::string("\xAE\x8B\x14\x86\x0A\x79\x98\x88", 8)));
+    CHECK(b64_of(checksum_algo::crc32, in) == socketley::base64::encode(std::string("\xCB\xF4\x39\x26", 4)));
+    CHECK(b64_of(checksum_algo::crc32c, in) == socketley::base64::encode(std::string("\xE3\x06\x92\x83", 4)));
+    CHECK(b64_of(checksum_algo::crc64nvme, in) == socketley::base64::encode(std::string("\xAE\x8B\x14\x86\x0A\x79\x98\x88", 8)));
     CHECK(b64_of(checksum_algo::sha1, in) == "98O8HYCOBHMq32eZZczDTKeuNEE=");
     CHECK(b64_of(checksum_algo::sha256, "abc") == "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
     CHECK(b64_of(checksum_algo::sha1, "abc") == "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=");
@@ -146,20 +147,30 @@ TEST_CASE("base64 round-trips and refuses what an encoder would not write")
     {
         const std::string in = pattern(n, 5);
         std::string out;
-        REQUIRE(base64_decode(base64_encode(in), out));
+        REQUIRE(socketley::base64::decode(socketley::base64::encode(in), out));
         CHECK(out == in);
     }
     std::string out;
-    CHECK(base64_encode("") == "");
-    CHECK(base64_encode("f") == "Zg==");
-    CHECK(base64_encode("fo") == "Zm8=");
-    CHECK(base64_encode("foo") == "Zm9v");
-    CHECK(!base64_decode("Zm9", out));
-    CHECK(!base64_decode("Zg=", out));
-    CHECK(!base64_decode("Zg===", out));
-    CHECK(!base64_decode("Z=g=", out));
-    CHECK(!base64_decode("Zm9v!", out));
-    CHECK(!base64_decode("Zm 9", out));
+    CHECK(socketley::base64::encode("") == "");
+    CHECK(socketley::base64::encode("f") == "Zg==");
+    CHECK(socketley::base64::encode("fo") == "Zm8=");
+    CHECK(socketley::base64::encode("foo") == "Zm9v");
+    CHECK(!socketley::base64::decode("Zm9", out));
+    CHECK(!socketley::base64::decode("Zg=", out));
+    CHECK(!socketley::base64::decode("Zg===", out));
+    CHECK(!socketley::base64::decode("Z=g=", out));
+    CHECK(!socketley::base64::decode("Zm9v!", out));
+    CHECK(!socketley::base64::decode("Zm 9", out));
+    // "Zg==" is the one spelling of "f"; set bits below its byte would be a second.
+    CHECK(socketley::base64::decode("Zg==", out));
+    CHECK(out == "f");
+    CHECK(!socketley::base64::decode("Zh==", out));
+    CHECK(!socketley::base64::decode("Zm9=", out));
+    // A refusal past the first quantum leaves nothing of what came before it.
+    CHECK(!socketley::base64::decode("Zm9vZm9v!A==", out));
+    CHECK(out.empty());
+    CHECK(socketley::base64::decode("", out));
+    CHECK(out.empty());
 }
 
 TEST_CASE("the composite checksum is the algorithm over the part checksums, with the part count")
@@ -206,7 +217,7 @@ TEST_CASE("CRC32 and CRC64NVME are the bit-at-a-time CRC at every length around 
             std::string raw(static_cast<size_t>(def.bytes), '\0');
             for (int i = 0; i < def.bytes; ++i)
                 raw[static_cast<size_t>(def.bytes - 1 - i)] = static_cast<char>((v >> (8 * i)) & 0xFF);
-            return base64_encode(raw);
+            return socketley::base64::encode(raw);
         };
         const std::string data = pattern(4096 + 300, 11);
         const auto* base = reinterpret_cast<const unsigned char*>(data.data());
@@ -1220,7 +1231,7 @@ TEST_CASE("a part list keeps each part's checksum in the header when it fits and
             joined += c;
         bool kept = false;
         for (const auto& [n, v] : h.extra)
-            kept = kept || (n == part_checksums_extra && v == base64_encode(joined));
+            kept = kept || (n == part_checksums_extra && v == socketley::base64::encode(joined));
         CHECK(kept);
         part_list back;
         REQUIRE(part_list_of(h, back));
@@ -1238,7 +1249,7 @@ TEST_CASE("a part list keeps each part's checksum in the header when it fits and
         record_part_list(odd, l, m.size, false);
         for (auto& [n, v] : odd.extra)
             if (n == part_checksums_extra)
-                v = base64_encode(joined.substr(0, 64));
+                v = socketley::base64::encode(joined.substr(0, 64));
         REQUIRE(part_list_of(odd, back));
         CHECK(back.checksums.empty());
     }

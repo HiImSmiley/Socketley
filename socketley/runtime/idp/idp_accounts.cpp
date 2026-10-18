@@ -19,6 +19,7 @@
 #include "../../shared/json/json_doc.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/persist/replaced_file.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::idp
 {
@@ -45,7 +46,7 @@ std::string new_id()
     unsigned char b[16];
     if (RAND_bytes(b, sizeof b) != 1)
         return {};
-    return socketley::jws::b64url(std::string_view(reinterpret_cast<const char*>(b), sizeof b));
+    return base64url::encode(std::string_view(reinterpret_cast<const char*>(b), sizeof b));
 }
 
 // A rename kept by syncing the directory that holds it.

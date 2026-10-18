@@ -20,6 +20,7 @@
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::db
 {
@@ -45,7 +46,7 @@ std::string new_id()
     unsigned char b[16];
     if (RAND_bytes(b, sizeof b) != 1)
         return {};
-    return socketley::jws::b64url(std::string_view(reinterpret_cast<const char*>(b), sizeof b));
+    return base64url::encode(std::string_view(reinterpret_cast<const char*>(b), sizeof b));
 }
 
 // How deep a value nests, the object it is in counting as none, which json_reader's bound is measured against.

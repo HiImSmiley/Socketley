@@ -6,6 +6,7 @@
 #include "../../shared/json/json_doc.h"
 #include "s3_names.h"
 #include "s3_xml.h"
+#include "../../shared/util/base64.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -244,7 +245,7 @@ bool check_post_policy(post_form& f, std::string_view bucket, int64_t now_ms, s3
     const std::string* p = f.field("policy");
     std::string text;
     jvalue doc;
-    if (!p || !base64_decode(trimmed(*p), text) || !json_reader(text).document(doc))
+    if (!p || !base64::decode(trimmed(*p), text) || !json_reader(text).document(doc))
     {
         err = refusal("InvalidPolicyDocument", "Invalid Policy: Invalid JSON.");
         return false;

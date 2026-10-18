@@ -9,6 +9,7 @@
 #include "s3_names.h"
 #include "s3_xml_tree.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -280,7 +281,7 @@ void tierer::opened(const std::shared_ptr<job>& j, open_result o)
                                                           : std::string(m.content_type));
     // A single part's MD5 is the bytes', which the tier then checks them against.
     if (m.parts == 0)
-        h.emplace_back("content-md5", base64_encode(std::string_view(reinterpret_cast<const char*>(m.md5.data()), 16)));
+        h.emplace_back("content-md5", base64::encode(std::string_view(reinterpret_cast<const char*>(m.md5.data()), 16)));
     http_request rq;
     rq.head        = head(*t, "PUT", j->remote_key, {}, std::move(h), m.size);
     rq.answer_secs = replicator::answer_secs;

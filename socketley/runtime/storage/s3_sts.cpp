@@ -7,6 +7,7 @@
 
 #include "s3_names.h"
 #include "s3_xml.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -84,13 +85,13 @@ std::string sts_new_access_key()
 std::string sts_token(const session_grant& g, std::string_view parent_secret)
 {
     const std::string p = payload_of(g);
-    return base64url_encode(p + mac(parent_secret, "token", p));
+    return base64url::encode(p + mac(parent_secret, "token", p));
 }
 
 bool sts_parse(std::string_view token, session_grant& out)
 {
     std::string raw;
-    if (token.size() > 8192 || !base64url_decode(token, raw) || raw.size() < 1 + 8 + 1 + 1 + 2 + mac_bytes ||
+    if (token.size() > 8192 || !base64url::decode(token, raw) || raw.size() < 1 + 8 + 1 + 1 + 2 + mac_bytes ||
         (static_cast<uint8_t>(raw[0]) != token_version && static_cast<uint8_t>(raw[0]) != token_role_version))
         return false;
     const bool with_role = static_cast<uint8_t>(raw[0]) == token_role_version;
@@ -123,7 +124,7 @@ bool sts_parse(std::string_view token, session_grant& out)
 bool sts_sealed_by(std::string_view token, std::string_view parent_secret)
 {
     std::string raw;
-    if (!base64url_decode(token, raw) || raw.size() <= mac_bytes)
+    if (!base64url::decode(token, raw) || raw.size() <= mac_bytes)
         return false;
     const std::string_view p(raw.data(), raw.size() - mac_bytes);
     const std::string want = mac(parent_secret, "token", p);
@@ -132,7 +133,7 @@ bool sts_sealed_by(std::string_view token, std::string_view parent_secret)
 
 std::string sts_secret(const session_grant& g, std::string_view parent_secret)
 {
-    return base64url_encode(mac(parent_secret, "secret", payload_of(g))).substr(0, 40);
+    return base64url::encode(mac(parent_secret, "secret", payload_of(g))).substr(0, 40);
 }
 
 bool parse_form_fields(std::string_view text, std::vector<std::pair<std::string, std::string>>& out)

@@ -12,6 +12,7 @@
 #include "runtime/idp/idp_logic.h"
 #include "shared/crypto/jws.h"
 #include "shared/json/json_escape.h"
+#include "shared/util/base64.h"
 
 using namespace socketley::idp;
 
@@ -116,7 +117,7 @@ TEST_CASE("a token verifies with its own key and fails every way it was not made
     // A claim changed after signing.
     const size_t d1 = t.find('.'), d2 = t.find('.', d1 + 1);
     const std::string forged = t.substr(0, d1 + 1) +
-                               socketley::jws::b64url("{\"iss\":\"" + iss + "\",\"sub\":\"root\",\"exp\":2000}") +
+                               socketley::base64url::encode("{\"iss\":\"" + iss + "\",\"sub\":\"root\",\"exp\":2000}") +
                                t.substr(d2);
     CHECK_FALSE(verify_token(k, kid, "JWT", iss, forged, 1000, c, why));
     CHECK(why == "the signature does not hold");
@@ -128,7 +129,7 @@ TEST_CASE("a token verifies with its own key and fails every way it was not made
     CHECK_FALSE(verify_token(k, kid, "JWT", iss, theirs, 1000, c, why));
 
     // alg none, which a careless verifier takes.
-    const std::string none = socketley::jws::b64url("{\"alg\":\"none\",\"kid\":\"" + kid + "\",\"typ\":\"JWT\"}") + "." +
+    const std::string none = socketley::base64url::encode("{\"alg\":\"none\",\"kid\":\"" + kid + "\",\"typ\":\"JWT\"}") + "." +
                              t.substr(d1 + 1, d2 - d1 - 1) + ".";
     CHECK_FALSE(verify_token(k, kid, "JWT", iss, none, 1000, c, why));
     CHECK_FALSE(verify_token(k, kid, "JWT", iss, "a.b", 1000, c, why));
@@ -164,7 +165,7 @@ TEST_CASE("a token only the provider reads is HS256 under a secret of its key, a
     CHECK_FALSE(verify_secret_token(secret, "refresh+jwt", iss, sign_token(k, kid, "refresh+jwt", body), 1000, c, why));
     const size_t d1 = t.find('.'), d2 = t.find('.', d1 + 1);
     const std::string forged = t.substr(0, d1 + 1) +
-                               socketley::jws::b64url("{\"iss\":\"" + iss + "\",\"sub\":\"root\",\"exp\":2000}") +
+                               socketley::base64url::encode("{\"iss\":\"" + iss + "\",\"sub\":\"root\",\"exp\":2000}") +
                                t.substr(d2);
     CHECK_FALSE(verify_secret_token(secret, "refresh+jwt", iss, forged, 1000, c, why));
     EVP_PKEY_free(other);
@@ -202,14 +203,16 @@ TEST_CASE("base64url decodes what it encodes and refuses a second spelling")
         for (int i = 0; i < n; ++i)
             in += static_cast<char>(i * 37 + n);
         std::string out;
-        REQUIRE(socketley::jws::b64url_decode(socketley::jws::b64url(in), out));
+        REQUIRE(socketley::base64url::decode(socketley::base64url::encode(in), out));
         CHECK(out == in);
     }
     std::string out;
-    CHECK_FALSE(socketley::jws::b64url_decode("A", out));
-    CHECK_FALSE(socketley::jws::b64url_decode("AB=", out));
-    CHECK_FALSE(socketley::jws::b64url_decode("AB", out));   // the low bits of the last character are not zero
-    CHECK(socketley::jws::b64url_decode("AA", out));
+    CHECK_FALSE(socketley::base64url::decode("A", out));
+    CHECK_FALSE(socketley::base64url::decode("AB=", out));
+    CHECK_FALSE(socketley::base64url::decode("AB", out));   // the low bits of the last character are not zero
+    CHECK(socketley::base64url::decode("AA", out));
+    CHECK_FALSE(socketley::base64url::decode("Zm9vZm9v+A", out));
+    CHECK(out.empty());
 }
 
 // ─── The accounts ───────────────────────────────────────────────────────────
@@ -515,10 +518,10 @@ TEST_CASE("a JSON string escapes quotes, backslashes and control characters, and
     CHECK(socketley::json::quote(std::string_view("x\ny\x01", 4)) == "\"x\\ny\\u0001\"");
     CHECK(socketley::json::quote("\"") == "\"\\\"\"");
     CHECK(socketley::json::quote("ünï") == "\"ünï\"");
-    CHECK(socketley::jws::b64url("") == "");
-    CHECK(socketley::jws::b64url("f") == "Zg");
-    CHECK(socketley::jws::b64url("fo") == "Zm8");
-    CHECK(socketley::jws::b64url("foo") == "Zm9v");
-    CHECK(socketley::jws::b64url("foob") == "Zm9vYg");
-    CHECK(socketley::jws::b64url("\xfb\xff") == "-_8");
+    CHECK(socketley::base64url::encode("") == "");
+    CHECK(socketley::base64url::encode("f") == "Zg");
+    CHECK(socketley::base64url::encode("fo") == "Zm8");
+    CHECK(socketley::base64url::encode("foo") == "Zm9v");
+    CHECK(socketley::base64url::encode("foob") == "Zm9vYg");
+    CHECK(socketley::base64url::encode("\xfb\xff") == "-_8");
 }

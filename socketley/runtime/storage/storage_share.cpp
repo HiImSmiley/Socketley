@@ -29,6 +29,7 @@
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/base64.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -407,7 +408,7 @@ bool storage_run::share_open(const std::shared_ptr<conn>& c, std::string_view id
     {
         if (login_barred(c))
             return false;
-        if (base64_decode(cred, pair))
+        if (base64::decode(cred, pair))
         {
             const size_t colon = pair.find(':');
             const std::string got = pw_hash(s.pw_salt, colon == std::string::npos ? std::string_view{} :
@@ -898,7 +899,7 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
         app_reply(c, 500, "No random bytes for a link.\n");
         return;
     }
-    s.id = base64url_encode(std::string_view(reinterpret_cast<const char*>(raw), sizeof raw));
+    s.id = base64url::encode(std::string_view(reinterpret_cast<const char*>(raw), sizeof raw));
     if (::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST)
     {
         app_reply(c, 500, "The links' folder cannot be made.\n");

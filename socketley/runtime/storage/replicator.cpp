@@ -17,6 +17,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/storage/s3_sigv4.h"
 #include "../../shared/util/hex.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -1113,7 +1114,7 @@ void replicator::run_tags(lane& l, const std::shared_ptr<job>& j)
     {
         rq.body = tagging_xml(decode_tags(j->t.tags));
         const auto md5 = md5_of(rq.body);
-        h.emplace_back("content-md5", base64_encode(std::string_view(reinterpret_cast<const char*>(md5.data()), 16)));
+        h.emplace_back("content-md5", base64::encode(std::string_view(reinterpret_cast<const char*>(md5.data()), 16)));
         h.emplace_back("content-type", "application/xml");
         rq.head = signed_head(l, "PUT", path, query, std::move(h), rq.body.size());
     }
@@ -1197,7 +1198,7 @@ void replicator::run_node(lane& l, const std::shared_ptr<job>& j)
                 rq.body = tagging_xml(decode_tags(t.tags));
                 const auto md5 = md5_of(rq.body);
                 rq.head = signed_head(l, "PUT", path, query,
-                                      {{"content-md5", base64_encode(std::string_view(
+                                      {{"content-md5", base64::encode(std::string_view(
                                                            reinterpret_cast<const char*>(md5.data()), 16))},
                                        {"content-type", "application/xml"}},
                                       rq.body.size());
@@ -1408,7 +1409,7 @@ void replicator::send_single(lane& l, const std::shared_ptr<job>& j)
     const object_meta& m = j->meta;
     auto h = j->t.node_kind ? node_headers(m) : replica_headers(m, j->t.storage_class);
     // The bytes are checked by the destination against the source's own digests, so a copy torn on the way is refused.
-    h.emplace_back("content-md5", base64_encode(std::string_view(reinterpret_cast<const char*>(m.md5.data()), 16)));
+    h.emplace_back("content-md5", base64::encode(std::string_view(reinterpret_cast<const char*>(m.md5.data()), 16)));
     const checksum_algo algo = checksum_algo_of(m);
     if (const std::string v = checksum_value(m, algo); !v.empty() && v.find('-') == std::string::npos)
         h.emplace_back(std::string(checksum_header(algo)), v);
@@ -1482,7 +1483,7 @@ void replicator::mpu_part(lane& l, const std::shared_ptr<job>& j)
         h.emplace_back("x-amz-replication-status", "REPLICA");
     const checksum_algo algo = checksum_algo_of(j->meta);
     if (algo != checksum_algo::none && i < j->parts.checksums.size() && !j->parts.checksums[i].empty())
-        h.emplace_back(std::string(checksum_header(algo)), base64_encode(j->parts.checksums[i]));
+        h.emplace_back(std::string(checksum_header(algo)), base64::encode(j->parts.checksums[i]));
     const std::string query = "partNumber=" + std::to_string(number) + "&uploadId=" + url_encode(j->upload_id, false);
     http_request rq;
     rq.head = signed_head(l, "PUT", object_path(l.target.http, j->t.dest_bucket, j->t.key), query, std::move(h), len);

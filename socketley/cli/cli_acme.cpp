@@ -42,13 +42,13 @@
 #include "../shared/json/json_doc.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/persist/replaced_file.h"
+#include "../shared/util/base64.h"
 
 namespace
 {
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
-using socketley::jws::b64url;
 using socketley::jws::es256;
 using socketley::jws::jwk_of;
 using socketley::jws::sha256;
@@ -476,7 +476,7 @@ public:
         return true;
     }
 
-    std::string thumbprint() const { return b64url(sha256(m_jwk)); }
+    std::string thumbprint() const { return socketley::base64url::encode(sha256(m_jwk)); }
 
     // A signed POST, with a fresh nonce whenever the CA says the last one was bad.
     bool post(const std::string& url, const std::string& payload, reply& r, std::string& err, bool use_jwk = false)
@@ -492,9 +492,9 @@ public:
             }
             std::string prot = "{\"alg\":\"ES256\",\"nonce\":" + socketley::json::quote(m_nonce) + ",\"url\":" + socketley::json::quote(url) + ",";
             prot += use_jwk ? "\"jwk\":" + m_jwk + "}" : "\"kid\":" + socketley::json::quote(m_kid) + "}";
-            const std::string p64 = b64url(prot), b64 = b64url(payload);
+            const std::string p64 = socketley::base64url::encode(prot), b64 = socketley::base64url::encode(payload);
             const std::string body = "{\"protected\":" + socketley::json::quote(p64) + ",\"payload\":" + socketley::json::quote(b64) + ",\"signature\":" +
-                                     socketley::json::quote(b64url(es256(m_key, p64 + "." + b64))) + "}";
+                                     socketley::json::quote(socketley::base64url::encode(es256(m_key, p64 + "." + b64))) + "}";
             m_nonce.clear();
             r = reply{};
             if (!m_h.request("POST", url, "application/jose+json", body, r, err))
@@ -731,7 +731,7 @@ int issue(int argc, char** argv)
         return finish(0);
     const std::string challenges = cert_keeper::challenge_dir();
     const std::string account_path = std::filesystem::path(challenges).parent_path().string() + "/account-" +
-                                     b64url(sha256(dir)).substr(0, 12) + ".key";
+                                     socketley::base64url::encode(sha256(dir)).substr(0, 12) + ".key";
     std::error_code ec;
     std::filesystem::create_directories(challenges, ec);
 
@@ -803,7 +803,7 @@ int issue(int argc, char** argv)
             {
                 // The TXT record of _acme-challenge.<name> (RFC 8555 8.4), the name without a wildcard's "*.".
                 std::string path;
-                if (!dns_feed::write_challenge(ident, b64url(sha256(token + "." + thumb)), token, path))
+                if (!dns_feed::write_challenge(ident, socketley::base64url::encode(sha256(token + "." + thumb)), token, path))
                 {
                     err = "the DNS-01 answer for " + ident + " could not be written to " + dns_feed::dir();
                     return done(2);
@@ -850,7 +850,7 @@ int issue(int argc, char** argv)
         return done(2);
     }
     jvalue fin;
-    if (!c.post(str(order, "finalize"), "{\"csr\":" + socketley::json::quote(b64url(csr)) + "}", r, err) ||
+    if (!c.post(str(order, "finalize"), "{\"csr\":" + socketley::json::quote(socketley::base64url::encode(csr)) + "}", r, err) ||
         !poll(c, order_url, "valid", fin, err))
     {
         EVP_PKEY_free(cert_key);

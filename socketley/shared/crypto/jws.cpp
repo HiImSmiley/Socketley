@@ -1,4 +1,5 @@
 #include "jws.h"
+#include "../util/base64.h"
 
 #include <cstdint>
 #include <cstring>
@@ -18,71 +19,7 @@
 namespace socketley::jws
 {
 
-std::string b64url(std::string_view in)
-{
-    static constexpr char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    std::string out(in.size() / 3 * 4 + (in.size() % 3 ? in.size() % 3 + 1 : 0), '\0');
-    const auto* p = reinterpret_cast<const uint8_t*>(in.data());
-    char* o = out.data();
-    size_t i = 0;
-    for (; i + 2 < in.size(); i += 3)
-    {
-        const uint32_t v = (uint32_t(p[i]) << 16) | (uint32_t(p[i + 1]) << 8) | p[i + 2];
-        *o++ = tbl[v >> 18];
-        *o++ = tbl[(v >> 12) & 63];
-        *o++ = tbl[(v >> 6) & 63];
-        *o++ = tbl[v & 63];
-    }
-    if (i + 1 == in.size())
-    {
-        const uint32_t v = uint32_t(p[i]) << 16;
-        *o++ = tbl[v >> 18];
-        *o++ = tbl[(v >> 12) & 63];
-    }
-    else if (i + 2 == in.size())
-    {
-        const uint32_t v = (uint32_t(p[i]) << 16) | (uint32_t(p[i + 1]) << 8);
-        *o++ = tbl[v >> 18];
-        *o++ = tbl[(v >> 12) & 63];
-        *o++ = tbl[(v >> 6) & 63];
-    }
-    return out;
-}
 
-bool b64url_decode(std::string_view in, std::string& out)
-{
-    // A single leftover character carries six bits, which is no whole byte, so no encoder ends that way.
-    if (in.size() % 4 == 1)
-        return false;
-    auto val = [](char c) -> int
-    {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-        if (c >= '0' && c <= '9') return c - '0' + 52;
-        if (c == '-') return 62;
-        if (c == '_') return 63;
-        return -1;
-    };
-    out.clear();
-    out.reserve(in.size() * 3 / 4);
-    uint32_t acc = 0;
-    int bits = 0;
-    for (const char c : in)
-    {
-        const int v = val(c);
-        if (v < 0)
-            return false;
-        acc = (acc << 6) | static_cast<uint32_t>(v);
-        bits += 6;
-        if (bits >= 8)
-        {
-            bits -= 8;
-            out += static_cast<char>((acc >> bits) & 0xFF);
-        }
-    }
-    // The bits below the last byte are zero in what an encoder writes, so other ones are a second spelling.
-    return (acc & ((1u << bits) - 1)) == 0;
-}
 
 std::string sha256(std::string_view in)
 {
@@ -153,12 +90,12 @@ std::string jwk_of(EVP_PKEY* k)
         BN_bn2binpad(y, reinterpret_cast<unsigned char*>(ys.data()), 32);
     BN_free(x);
     BN_free(y);
-    return "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"" + b64url(xs) + "\",\"y\":\"" + b64url(ys) + "\"}";
+    return "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"" + base64url::encode(xs) + "\",\"y\":\"" + base64url::encode(ys) + "\"}";
 }
 
 std::string thumbprint(EVP_PKEY* k)
 {
-    return b64url(sha256(jwk_of(k)));
+    return base64url::encode(sha256(jwk_of(k)));
 }
 
 namespace
@@ -274,14 +211,14 @@ std::string compact(EVP_PKEY* k, std::string_view header, std::string_view paylo
 {
     std::string out;
     out.reserve((header.size() + payload.size()) / 3 * 4 + 96);
-    out += b64url(header);
+    out += base64url::encode(header);
     out += '.';
-    out += b64url(payload);
+    out += base64url::encode(payload);
     const std::string sig = es256(k, out);
     if (sig.empty())
         return {};
     out += '.';
-    out += b64url(sig);
+    out += base64url::encode(sig);
     return out;
 }
 

@@ -33,6 +33,7 @@
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -325,7 +326,7 @@ bool storage_run::ui_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
     const size_t a = val.find('.'), b = a == std::string_view::npos ? a : val.find('.', a + 1),
                  d = b == std::string_view::npos ? b : val.find('.', b + 1);
     std::string key;
-    if (d == std::string_view::npos || !base64url_decode(val.substr(0, a), key) || key.empty())
+    if (d == std::string_view::npos || !base64url::decode(val.substr(0, a), key) || key.empty())
         return true;
     const auto number = [](std::string_view text, long long& out)
     {
@@ -465,10 +466,8 @@ void storage_run::op_ui(const std::shared_ptr<conn>& c)
         const size_t from = ui_page.find("<script>") + 8, to = ui_page.find("</script>");
         unsigned char md[SHA256_DIGEST_LENGTH];
         SHA256(reinterpret_cast<const unsigned char*>(ui_page.data() + from), to - from, md);
-        unsigned char b64[4 * ((SHA256_DIGEST_LENGTH + 2) / 3) + 1];
-        EVP_EncodeBlock(b64, md, SHA256_DIGEST_LENGTH);
         return "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-" +
-               std::string(reinterpret_cast<const char*>(b64)) +
+               base64::encode(std::string_view(reinterpret_cast<const char*>(md), sizeof md)) +
                "'; media-src 'self' blob:; img-src 'self' blob: data:; frame-ancestors 'none'";
     }();
     resp.headers.emplace_back("Content-Security-Policy", csp);
@@ -573,7 +572,7 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
         const bool remember = r.has_query("remember");
         const int64_t issued = wall::now_ms();
         expires = issued + (remember ? remember_ms : session_ms);
-        std::string cookie = std::string(cookie_name) + "=" + base64url_encode(key) + "." + std::to_string(issued) + "." +
+        std::string cookie = std::string(cookie_name) + "=" + base64url::encode(key) + "." + std::to_string(issued) + "." +
                              std::to_string(expires) + "." + m_auth->ui_session_mac(key, issued, expires) +
                              "; Path=/; HttpOnly; SameSite=Strict" + secure_attr;
         if (remember)

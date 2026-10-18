@@ -9,6 +9,7 @@
 
 #include "checksum.h"
 #include "scrypt.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -49,7 +50,7 @@ bool parse(std::string_view hash, parsed& out)
     if (std::sscanf(params.c_str(), "%d,r=%d,p=%d", &out.ln, &out.r, &out.p) != 3 || out.ln < 10 || out.ln > 20 ||
         out.r < 1 || out.r > 32 || out.p < 1 || out.p > 16)
         return false;
-    return base64_decode(hash.substr(d1 + 1, d2 - d1 - 1), out.salt) && base64_decode(hash.substr(d2 + 1), out.want) &&
+    return base64::decode(hash.substr(d1 + 1, d2 - d1 - 1), out.salt) && base64::decode(hash.substr(d2 + 1), out.want) &&
            out.want.size() == hash_bytes;
 }
 
@@ -60,7 +61,7 @@ std::string password_hash(std::string_view password)
     std::string salt(salt_bytes, '\0'), h;
     if (RAND_bytes(reinterpret_cast<unsigned char*>(salt.data()), salt_bytes) != 1 || !derive(password, salt, 14, 8, 1, h))
         return {};
-    return "$scrypt$ln=14,r=8,p=1$" + base64_encode(salt) + "$" + base64_encode(h);
+    return "$scrypt$ln=14,r=8,p=1$" + base64::encode(salt) + "$" + base64::encode(h);
 }
 
 bool password_matches(std::string_view hash, std::string_view password)

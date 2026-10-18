@@ -194,46 +194,16 @@ inline void ws_unmask_payload(char* payload, size_t len, uint32_t mask32)
 
 // ─── SHA-1 for WS accept key (EVP API, no deprecated calls) ───
 
-// Compute Sec-WebSocket-Accept from a client key, handling up to 92 bytes on
-// the stack though RFC 6455 keys are always 24.
-inline std::string ws_accept_key(std::string_view client_key)
-{
-    // Stack fast path (covers all valid WS keys: 24 + 36 = 60 bytes)
-    constexpr size_t STACK_LIMIT = 92; // 128 - 36 GUID = 92 max key
-    if (client_key.size() <= STACK_LIMIT)
-    {
-        char combined[128];
-        std::memcpy(combined, client_key.data(), client_key.size());
-        std::memcpy(combined + client_key.size(), WS_GUID, 36);
-
-        unsigned char sha1_hash[EVP_MAX_MD_SIZE];
-        unsigned int hash_len = 0;
-        EVP_Digest(combined, client_key.size() + 36, sha1_hash, &hash_len,
-                   ws_sha1_md(), nullptr);
-
-        char b64[32];
-        EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64), sha1_hash, static_cast<int>(hash_len));
-        return std::string(b64);
-    }
-
-    // Heap fallback for oversized keys (shouldn't happen per RFC)
-    std::string combined;
-    combined.reserve(client_key.size() + 36);
-    combined.append(client_key);
-    combined.append(WS_GUID, 36);
-
-    unsigned char sha1_hash[EVP_MAX_MD_SIZE];
-    unsigned int hash_len = 0;
-    EVP_Digest(combined.data(), combined.size(), sha1_hash, &hash_len,
-               ws_sha1_md(), nullptr);
-
-    char b64[32];
-    EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64), sha1_hash, static_cast<int>(hash_len));
-    return std::string(b64);
-}
-
 // Forward declaration — defined below, after frame encoding
 inline void ws_accept_key_into(std::string& buf, std::string_view client_key);
+
+// Sec-WebSocket-Accept for a client key.
+inline std::string ws_accept_key(std::string_view client_key)
+{
+    std::string out;
+    ws_accept_key_into(out, client_key);
+    return out;
+}
 
 // Build 101 Switching Protocols response
 inline std::string ws_handshake_response(std::string_view client_key)

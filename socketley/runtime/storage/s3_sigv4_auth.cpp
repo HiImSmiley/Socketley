@@ -25,6 +25,7 @@
 #include "../../shared/storage/s3_sigv4.h"
 #include "../../shared/util/size_suffix.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -1205,7 +1206,7 @@ auth_verdict sigv4_authenticator::authorize_post(const post_signature& sig)
         unsigned int len = sizeof raw;
         HMAC(EVP_sha1(), key.data(), static_cast<int>(key.size()), reinterpret_cast<const unsigned char*>(sig.policy.data()),
              sig.policy.size(), raw, &len);
-        const std::string want = base64_encode(std::string_view(reinterpret_cast<const char*>(raw), len));
+        const std::string want = base64::encode(std::string_view(reinterpret_cast<const char*>(raw), len));
         if (sig.v2_signature.size() != want.size() ||
             CRYPTO_memcmp(sig.v2_signature.data(), want.data(), want.size()) != 0)
             return refuse("SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided. Check your key and signing method.", 403);

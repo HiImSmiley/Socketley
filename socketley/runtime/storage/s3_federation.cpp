@@ -30,6 +30,7 @@
 #include "../../shared/json/json_doc.h"
 #include "outbound_http.h"
 #include "s3_names.h"
+#include "../../shared/util/base64.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -210,8 +211,8 @@ bool parse_jwk(const jvalue& v, jwk& out)
     if (out.kty == "RSA")
     {
         std::string raw_n, raw_e;
-        if (!string_member(v, "n", n) || !string_member(v, "e", e) || !jws_base64url_decode(n, raw_n) ||
-            !jws_base64url_decode(e, raw_e) || raw_n.empty() || raw_e.empty() || raw_e.size() > 8 ||
+        if (!string_member(v, "n", n) || !string_member(v, "e", e) || !base64url::decode(n, raw_n) ||
+            !base64url::decode(e, raw_e) || raw_n.empty() || raw_e.empty() || raw_e.size() > 8 ||
             raw_n.size() > 2048)
             return false;
         key = rsa_key(raw_n, raw_e);
@@ -222,8 +223,8 @@ bool parse_jwk(const jvalue& v, jwk& out)
             return false;
         const size_t coord = out.crv == "P-256" ? 32 : 48;
         std::string rx, ry;
-        if (!string_member(v, "x", x) || !string_member(v, "y", y) || !jws_base64url_decode(x, rx) ||
-            !jws_base64url_decode(y, ry) || rx.size() != coord || ry.size() != coord)
+        if (!string_member(v, "x", x) || !string_member(v, "y", y) || !base64url::decode(x, rx) ||
+            !base64url::decode(y, ry) || rx.size() != coord || ry.size() != coord)
             return false;
         if (!out.alg.empty() && find_alg(out.alg)->crv != out.crv)
             return false;
@@ -965,11 +966,6 @@ void evp_pkey_free::operator()(EVP_PKEY* k) const
     EVP_PKEY_free(k);
 }
 
-bool jws_base64url_decode(std::string_view in, std::string& out)
-{
-    // Re-encoding refuses padding, a stray length and set unused bits, every spelling but the canonical one.
-    return base64url_decode(in, out) && base64url_encode(out) == in;
-}
 
 bool jws_ecdsa_to_der(std::string_view raw, size_t coord, std::string& der)
 {
@@ -1091,9 +1087,9 @@ bool oidc_verify(const federation_oidc& cfg, const jwks_keys& keys, std::string_
     }
     std::string head_text, body_text, sig;
     jvalue head, body;
-    if (!jws_base64url_decode(token.substr(0, d1), head_text) ||
-        !jws_base64url_decode(token.substr(d1 + 1, d2 - d1 - 1), body_text) ||
-        !jws_base64url_decode(token.substr(d2 + 1), sig))
+    if (!base64url::decode(token.substr(0, d1), head_text) ||
+        !base64url::decode(token.substr(d1 + 1, d2 - d1 - 1), body_text) ||
+        !base64url::decode(token.substr(d2 + 1), sig))
     {
         why = "the token is not base64url";
         return false;

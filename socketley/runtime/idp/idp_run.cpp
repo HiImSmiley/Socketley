@@ -34,6 +34,7 @@
 #include "../../shared/http/request_head.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::idp
 {
@@ -59,7 +60,7 @@ std::string random_token()
     unsigned char b[32];
     if (RAND_bytes(b, sizeof b) != 1)
         return {};
-    return socketley::jws::b64url(std::string_view(reinterpret_cast<const char*>(b), sizeof b));
+    return base64url::encode(std::string_view(reinterpret_cast<const char*>(b), sizeof b));
 }
 
 std::string peer_text(const sockaddr_storage& a)
@@ -989,7 +990,7 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
     if (std::string_view cred; http_auth_credentials(rq.authorization, "basic", cred))
     {
         std::string decoded;
-        if (socketley::storage::base64_decode(cred, decoded))
+        if (base64::decode(cred, decoded))
             if (const size_t colon = decoded.find(':'); colon != std::string::npos)
             {
                 // RFC 6749 2.3.1 form-encodes both halves before they are joined.

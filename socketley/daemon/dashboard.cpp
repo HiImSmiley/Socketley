@@ -32,6 +32,7 @@
 #include "../shared/json/json_escape.h"
 #include "../shared/http/url.h"
 #include "../shared/http/status.h"
+#include "../shared/util/base64.h"
 
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -372,16 +373,9 @@ void server::session(int fd, const request& r)
         send(fd, 401, "text/plain; charset=utf-8", "That access key and secret are no admin's.\n");
         return;
     }
-    // The access key, which the check just took from the same field.
+    // The access key, from the field the check just decoded, so it decodes here too.
     std::string pair;
-    {
-        const std::string_view b64 = trim(authorization.substr(authorization.find(' ') + 1));
-        std::string out(b64.size(), '\0');
-        const int n = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(out.data()),
-                                      reinterpret_cast<const unsigned char*>(b64.data()), static_cast<int>(b64.size()));
-        if (n > 0)
-            pair.assign(out.data(), static_cast<size_t>(n));
-    }
+    socketley::base64::decode(trim(authorization.substr(authorization.find(' ') + 1)), pair);
     // Named as the credentials file names its section, and by the key for a key outside any.
     const std::string key = pair.substr(0, pair.find(':'));
     const std::string named = m_auth->user_of(key);

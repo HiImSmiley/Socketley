@@ -13,6 +13,7 @@
 #include "../../shared/json/json_doc.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/http/url.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::idp
 {
@@ -164,7 +165,7 @@ bool pkce_matches(std::string_view verifier, std::string_view challenge)
     for (const char c : verifier)
         if (!unreserved(c))
             return false;
-    return socketley::jws::b64url(socketley::jws::sha256(verifier)) == challenge;
+    return base64url::encode(socketley::jws::sha256(verifier)) == challenge;
 }
 
 bool has_scope(std::string_view scope, std::string_view want)
@@ -261,9 +262,9 @@ bool read_token(std::string_view want_alg, std::string_view kid, std::string_vie
         return false;
     }
     std::string header, payload, sig;
-    if (!socketley::jws::b64url_decode(token.substr(0, d1), header) ||
-        !socketley::jws::b64url_decode(token.substr(d1 + 1, d2 - d1 - 1), payload) ||
-        !socketley::jws::b64url_decode(token.substr(d2 + 1), sig))
+    if (!base64url::decode(token.substr(0, d1), header) ||
+        !base64url::decode(token.substr(d1 + 1, d2 - d1 - 1), payload) ||
+        !base64url::decode(token.substr(d2 + 1), sig))
     {
         why = "not base64url";
         return false;
@@ -436,12 +437,12 @@ std::string sign_secret_token(std::string_view secret, std::string_view typ, std
     std::string payload;
     payload.reserve(body.size() + 2);
     payload.append("{").append(body).append("}");
-    std::string out = socketley::jws::b64url(header);
+    std::string out = base64url::encode(header);
     out += '.';
-    out += socketley::jws::b64url(payload);
+    out += base64url::encode(payload);
     const std::string mac = hs256(secret, out);
     out += '.';
-    out += socketley::jws::b64url(mac);
+    out += base64url::encode(mac);
     return out;
 }
 

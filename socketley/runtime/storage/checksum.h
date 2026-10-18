@@ -59,10 +59,6 @@ private:
     std::unique_ptr<digest> m_digest;
 };
 
-// Standard base64 with padding, for the checksum headers and Content-MD5.
-std::string base64_encode(std::string_view in);
-bool        base64_decode(std::string_view in, std::string& out);
-
 // The checksum of a multipart object: the algorithm over the raw checksums of
 // its parts in order, in base64 with "-<parts>" after it.
 std::string composite_checksum_b64(checksum_algo a, std::string_view concatenated_raw, size_t parts);

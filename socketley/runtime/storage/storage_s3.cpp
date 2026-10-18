@@ -21,6 +21,7 @@
 #include "storage_instance.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/number_parse.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::storage
 {
@@ -129,7 +130,7 @@ bool parse_checksum_request(const s3_request& r, checksum_request& out, s3_error
         if (!choose(a))
             return false;
         std::string raw;
-        if (!base64_decode(http_trim_ows(value), raw) || raw.size() != checksum_raw_len(a))
+        if (!base64::decode(http_trim_ows(value), raw) || raw.size() != checksum_raw_len(a))
             return bad("Value for " + std::string(name) + " header is invalid.");
         out.expected_b64 = std::string(http_trim_ows(value));
     }
@@ -197,7 +198,7 @@ bool body_md5_ok(const s3_request& r, std::string_view body, s3_error& err)
     if (!r.has_header("content-md5"))
         return true;
     std::string raw;
-    if (!base64_decode(md5h, raw) || raw.size() != 16)
+    if (!base64::decode(md5h, raw) || raw.size() != 16)
     {
         err = make_error("InvalidDigest");
         return false;
@@ -719,7 +720,7 @@ void storage_run::op_list_buckets(const std::shared_ptr<conn>& c)
     }
     std::string after;
     if (q.has_query("continuation-token") &&
-        (q.get_query("continuation-token").empty() || !base64url_decode(q.get_query("continuation-token"), after)))
+        (q.get_query("continuation-token").empty() || !base64url::decode(q.get_query("continuation-token"), after)))
     {
         bad_arg("continuation-token", "The continuation token provided is incorrect");
         return;
@@ -942,7 +943,7 @@ void storage_run::op_list_objects(const std::shared_ptr<conn>& c, bool v2)
             lr.has_continuation   = true;
             std::string bound;
             // An empty token is the first page, and is given back as it came.
-            if (!lr.continuation_token.empty() && !base64url_decode(lr.continuation_token, bound))
+            if (!lr.continuation_token.empty() && !base64url::decode(lr.continuation_token, bound))
             {
                 bad_arg("continuation-token", "The continuation token provided is incorrect");
                 return;
@@ -969,7 +970,7 @@ void storage_run::op_list_objects(const std::shared_ptr<conn>& c, bool v2)
         std::string next_token, next_marker;
         if (v2 && walk.is_truncated())
         {
-            next_token = base64url_encode(walk.resume_at());
+            next_token = base64url::encode(walk.resume_at());
             lr.next_token = next_token;
         }
         if (!v2 && walk.is_truncated())
@@ -1003,7 +1004,7 @@ void storage_run::op_list_objects(const std::shared_ptr<conn>& c, bool v2)
         std::string next_token, next_marker;
         if (v2 && page.truncated)
         {
-            next_token = base64url_encode(page.resume_at);
+            next_token = base64url::encode(page.resume_at);
             lr.next_token = next_token;
         }
         if (!v2 && page.truncated)
@@ -1311,7 +1312,7 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
     if (const std::string_view md5h = r.header("content-md5"); r.has_header("content-md5"))
     {
         std::string raw;
-        if (!base64_decode(md5h, raw) || raw.size() != 16)
+        if (!base64::decode(md5h, raw) || raw.size() != 16)
         {
             r.keep_alive = false;
             send_error(c, make_error("InvalidDigest"), true);
@@ -1998,7 +1999,7 @@ std::string attributes_xml(const object_meta& m, const attr_query& a, const part
             last = l->numbers[i];
             rows += "<Part><PartNumber>" + std::to_string(l->numbers[i]) + "</PartNumber><Size>" +
                     std::to_string(l->sizes[i]) + "</Size>" +
-                    (i < l->checksums.size() ? checksum_element(algo, base64_encode(l->checksums[i])) : std::string{}) +
+                    (i < l->checksums.size() ? checksum_element(algo, base64::encode(l->checksums[i])) : std::string{}) +
                     "</Part>";
         }
         x += truncated ? "<IsTruncated>true</IsTruncated>" : "<IsTruncated>false</IsTruncated>";
@@ -2255,7 +2256,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
             part_list own;
             const part_status ps = list ? part_range_in(*list, part, first, len) : part_range(m, part, first, len, &own);
             if (const part_list& pl = list ? *list : own; ps == part_status::ok && part <= pl.checksums.size())
-                part_checksum = base64_encode(pl.checksums[part - 1]);
+                part_checksum = base64::encode(pl.checksums[part - 1]);
             if (ps == part_status::in_trailer)
             {
                 // The answer is given again once the list is read, from the file whose list it is.

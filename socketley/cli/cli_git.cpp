@@ -47,6 +47,7 @@
 #include "../shared/storage/git_names.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/http/url.h"
+#include "../shared/util/base64.h"
 
 extern char** environ;
 
@@ -71,13 +72,9 @@ std::vector<std::string> git_env()
     if (const char* t = std::getenv("SOCKETLEY_GIT_TOKEN"); t && *t)
     {
         const std::string pair = std::string("x-access-token:") + t;
-        std::string b64(4 * ((pair.size() + 2) / 3) + 1, '\0');
-        b64.resize(static_cast<size_t>(EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64.data()),
-                                                       reinterpret_cast<const unsigned char*>(pair.data()),
-                                                       static_cast<int>(pair.size()))));
         env.emplace_back("GIT_CONFIG_COUNT=1");
         env.emplace_back("GIT_CONFIG_KEY_0=http.extraHeader");
-        env.emplace_back("GIT_CONFIG_VALUE_0=Authorization: Basic " + b64);
+        env.emplace_back("GIT_CONFIG_VALUE_0=Authorization: Basic " + socketley::base64::encode(pair));
     }
     return env;
 }

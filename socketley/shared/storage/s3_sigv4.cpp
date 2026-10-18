@@ -1,5 +1,6 @@
 #include "shared/storage/s3_sigv4.h"
 #include "../http/url.h"
+#include "../util/base64.h"
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -983,14 +984,6 @@ constexpr std::string_view v2_subresources[] = {
     "uploadId", "uploads", "versionId", "versioning", "versions", "website",
 };
 
-std::string base64_of(const uint8_t* p, size_t n)
-{
-    std::string out(4 * ((n + 2) / 3), '\0');
-    const int len = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(out.data()), p, static_cast<int>(n));
-    out.resize(len > 0 ? static_cast<size_t>(len) : 0);
-    return out;
-}
-
 // The string a Signature Version 2 signs, with `date` on the line of the Date header.
 std::string v2_string_to_sign(const request_view& req, const verify_options& opts, std::string_view date)
 {
@@ -1096,7 +1089,7 @@ verify_result verify_v2(const request_view& req, const verify_options& opts, con
         if (!HMAC(EVP_sha1(), secret.data(), static_cast<int>(secret.size()), reinterpret_cast<const unsigned char*>(sts.data()),
                   sts.size(), mac, &len))
             break;
-        const std::string want = base64_of(mac, len);
+        const std::string want = base64::encode(std::string_view(reinterpret_cast<const char*>(mac), len));
         matched = matched || (want.size() == claimed.size() && CRYPTO_memcmp(want.data(), claimed.data(), want.size()) == 0);
     }
     if (!matched)
