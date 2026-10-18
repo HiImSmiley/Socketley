@@ -33,6 +33,7 @@
 #include "../../shared/http/request_head.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/http/cookie.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/crypto/mac.h"
@@ -54,7 +55,6 @@ constexpr size_t  max_body      = 16 * 1024;
 constexpr size_t  max_conns     = 4096;
 constexpr int     miss_limit    = 5;
 constexpr int64_t miss_window   = 15 * 60;
-constexpr std::string_view cookie_name = "skl_idp";
 
 std::string peer_text(const sockaddr_storage& a)
 {
@@ -530,27 +530,19 @@ const client* idp_run::find_client(std::string_view id)
 const account* idp_run::session_of(const request& rq) const
 {
     // Every skl_idp cookie the request carries, since a browser sends one per domain it was set for.
-    std::string_view header = rq.cookie;
     const int64_t now = wall::now_sec();
-    while (!header.empty())
-    {
-        const size_t semi = header.find(';');
-        std::string_view part = header.substr(0, semi);
-        header = semi == std::string_view::npos ? std::string_view{} : header.substr(semi + 1);
-        while (!part.empty() && part.front() == ' ')
-            part.remove_prefix(1);
-        if (!part.starts_with(cookie_name) || part.size() <= cookie_name.size() || part[cookie_name.size()] != '=')
-            continue;
+    const account* found = nullptr;
+    http::for_each_cookie(rq.cookie, session_cookie_name, [&](std::string_view v) {
         claims c;
         std::string why;
-        if (!m_verified.verify(m_key, m_kid, "session+jwt", m_issuer, part.substr(cookie_name.size() + 1), now, c, why) ||
-            claim(c, "aud") != "session")
-            continue;
+        if (!m_verified.verify(m_key, m_kid, "session+jwt", m_issuer, v, now, c, why) || claim(c, "aud") != "session")
+            return false;
         const account* a = m_accounts.by_id(claim(c, "sub"));
         if (a && !a->disabled() && still_signed_in(*a, issued_ms(c)))
-            return a;
-    }
-    return nullptr;
+            found = a;
+        return found != nullptr;
+    });
+    return found;
 }
 
 std::string idp_run::session_cookie(const account& who, bool remember) const
@@ -564,7 +556,7 @@ std::string idp_run::session_cookie(const account& who, bool remember) const
                              (who.in_group("admins") ? "true" : "false") + ",\"iat\":" + std::to_string(now) +
                              ",\"iat_ms\":" + std::to_string(wall::now_ms()) +
                              ",\"auth_time\":" + std::to_string(now) + ",\"exp\":" + std::to_string(now + life);
-    std::string h = "Set-Cookie: " + std::string(cookie_name) + "=" + sign_token(m_key, m_kid, "session+jwt", body) +
+    std::string h = "Set-Cookie: " + std::string(session_cookie_name) + "=" + sign_token(m_key, m_kid, "session+jwt", body) +
                     "; Path=/; HttpOnly; SameSite=Lax";
     if (remember)
         h += "; Max-Age=" + std::to_string(life);
@@ -613,7 +605,7 @@ std::string idp_run::profile_claims(const account& who) const
 
 std::string idp_run::clear_cookie() const
 {
-    std::string h = "Set-Cookie: " + std::string(cookie_name) + "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+    std::string h = "Set-Cookie: " + std::string(session_cookie_name) + "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
     if (m_secure_cookie)
         h += "; Secure";
     if (!m_cookie_domain.empty())

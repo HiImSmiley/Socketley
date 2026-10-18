@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
+#include "shared/http/cookie.h"
 #include "shared/util/ascii.h"
 #include "shared/util/proc_stat.h"
 
@@ -46,4 +47,20 @@ TEST_CASE("a process's /proc stat line is read from after its name, and a gone o
     socketley::proc_stat gone{'x', 1, 2, 3};
     CHECK_FALSE(socketley::read_proc_stat(0x7ffffff0, gone));
     CHECK(gone.state == 'x');
+}
+
+TEST_CASE("every cookie of a name is visited in order until one is taken")
+{
+    const std::string_view h = "a=1; skl=first;skl=second; \tskl=third; skl2=no; xskl=no";
+    std::string seen;
+    CHECK_FALSE(socketley::http::for_each_cookie(h, "skl", [&](std::string_view v) {
+        seen += std::string(v) + ",";
+        return false;
+    }));
+    CHECK(seen == "first,second,third,");
+    CHECK(socketley::http::for_each_cookie(h, "skl", [](std::string_view v) { return v == "second"; }));
+    CHECK(socketley::http::cookie_value(h, "skl") == "first");
+    CHECK(socketley::http::cookie_value(h, "a") == "1");
+    CHECK(socketley::http::cookie_value(h, "missing").empty());
+    CHECK(socketley::http::cookie_value("skl=", "skl").empty());
 }

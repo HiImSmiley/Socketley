@@ -149,6 +149,12 @@ expect "an address that keeps failing is barred, the right secret too" \
     "$(code -X POST -H 'X-Forwarded-For: 10.9.9.9' -H 'Via: 1.1 e' -u "$ADMIN" "$U/api/session")" 429
 expect "while another is not" "$(code -X POST -H 'X-Forwarded-For: 10.9.9.8' -H 'Via: 1.1 e' -u "$ADMIN" "$U/api/session")" 200
 expect "a forged cookie is no session" "$(code -b 'skl_dash=AKIADASHTESTADMIN000.9999999999.00' "$U/api/runtimes")" 401
+# A browser sends one cookie of a name per domain it was set for, so a forged one beside the real one must not win.
+dash=$(awk '$6 == "skl_dash" {print $7}' "$T/jar")
+forged='skl_dash=AKIADASHTESTADMIN000.9999999999.00'
+expect "a forged cookie sent after the real one does not shut the session out" \
+    "$(code -b "skl_dash=$dash; $forged" "$U/api/runtimes")" 200
+expect "nor one sent before it" "$(code -b "$forged; skl_dash=$dash" "$U/api/runtimes")" 200
 
 # ─── commands ───────────────────────────────────────────────────────────────
 run() { curl -s -m 30 -b "$T/jar" -H 'X-Socketley-Dashboard: 1' -H 'Content-Type: application/json' -d "$1" "$U/api/run"; }

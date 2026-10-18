@@ -114,6 +114,10 @@ if phase == "main":
     check("a wrong password does not", sign_in("alice", "alicepassword9")[0], 401)
     check("nor an unknown name", sign_in("nobody", "alicepassword1")[0], 401)
     check("the session is good on either shard", [ui("GET", "/~ui/session", cookie=alice)[0] for _ in range(6)], [200] * 6)
+    # A browser sends one cookie of a name per domain it was set for, so a forged one beside the real one must not win.
+    check("a forged session cookie sent before the real one does not shut it out",
+          ui("GET", "/~ui/session", cookie="skl_ui=Zm9y.1.9999999999999.00; " + alice)[0], 200)
+    check("nor one sent after it", ui("GET", "/~ui/session", cookie=alice + "; skl_ui=Zm9y.1.9999999999999.00")[0], 200)
     check("a WebDAV client's Basic name and password sign in", ui("PROPFIND", "/~dav/", basic=("alice", "alicepassword1"), ui_header=False)[0], 207)
 
     # What a user does to itself without a policy, and what it may not.

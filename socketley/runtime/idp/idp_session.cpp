@@ -14,6 +14,7 @@
 #include "../storage/s3_federation.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/http/cookie.h"
 
 namespace socketley::idp
 {
@@ -89,17 +90,8 @@ bool session_verifier::check(std::string_view cookies, who& out)
     if (!m_keys)
         return false;
     const int64_t now = wall::now_sec();
-    while (!cookies.empty())
-    {
-        const size_t semi = cookies.find(';');
-        std::string_view part = cookies.substr(0, semi);
-        cookies = semi == std::string_view::npos ? std::string_view{} : cookies.substr(semi + 1);
-        while (!part.empty() && part.front() == ' ')
-            part.remove_prefix(1);
-        if (part.starts_with("skl_idp=") && verified(part.substr(8), false, now, out))
-            return true;
-    }
-    return false;
+    return http::for_each_cookie(cookies, session_cookie_name,
+                                 [&](std::string_view v) { return verified(v, false, now, out); });
 }
 
 bool session_verifier::check_bearer(std::string_view token, who& out)

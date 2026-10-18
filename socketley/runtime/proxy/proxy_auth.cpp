@@ -12,12 +12,12 @@
 #include <openssl/crypto.h>
 
 #include "../../shared/util/logging.h"
-#include "../storage/checksum.h"
 #include "../storage/s3_sigv4_auth.h"
 #include "../idp/idp_session.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/crypto/mac.h"
+#include "../../shared/http/http_framing.h"
 
 namespace
 {
@@ -169,18 +169,10 @@ bool proxy_auth::admit(std::string_view authorization) const
     // An idp's sessions are cookies, which check_session answers.
     if (!m_loaded || m_kind == kind::idp)
         return false;
-    const size_t sp = authorization.find(' ');
-    if (sp == std::string_view::npos)
-        return false;
-    const std::string_view scheme = authorization.substr(0, sp);
-    const std::string_view value = trim(authorization.substr(sp + 1));
-    const auto scheme_is = [&](std::string_view want) {
-        return scheme.size() == want.size() &&
-               std::equal(want.begin(), want.end(), scheme.begin(), [](char w, char c) { return w == (c | 0x20); });
-    };
+    std::string_view value;
     if (m_kind == kind::bearer)
     {
-        if (!scheme_is("bearer"))
+        if (!http_auth_credentials(authorization, "bearer", value))
             return false;
         // Every token is compared, so how long a refusal takes says nothing about which came close.
         bool ok = false;
@@ -189,7 +181,7 @@ bool proxy_auth::admit(std::string_view authorization) const
         return ok;
     }
     std::string pair;
-    if (!scheme_is("basic") || !socketley::base64::decode(value, pair))
+    if (!http_auth_credentials(authorization, "basic", value) || !socketley::base64::decode(value, pair))
         return false;
     const size_t colon = pair.find(':');
     if (colon == std::string::npos)

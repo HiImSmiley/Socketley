@@ -35,6 +35,8 @@
 #include "../shared/util/base64.h"
 #include "../shared/crypto/mac.h"
 #include "../shared/util/hex.h"
+#include "../shared/http/http_framing.h"
+#include "../shared/http/cookie.h"
 
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -233,27 +235,22 @@ std::string server::session_of(const request& r) const
         return w.username;
     if (m_key.size() != 32)
         return {};
-    std::string_view v;
-    for (size_t p = 0; p < cookies.size();)
-    {
-        size_t semi = cookies.find(';', p);
-        if (semi == std::string_view::npos)
-            semi = cookies.size();
-        const std::string_view c = trim(cookies.substr(p, semi - p));
-        if (c.starts_with("skl_dash="))
-            v = c.substr(9);
-        p = semi + 1;
-    }
-    const size_t d2 = v.rfind('.'), d1 = d2 == std::string_view::npos ? d2 : v.rfind('.', d2 - 1);
-    if (d1 == std::string_view::npos || d1 == 0)
-        return {};
-    const std::string user(v.substr(0, d1));
-    const int64_t expires = std::strtoll(std::string(v.substr(d1 + 1, d2 - d1 - 1)).c_str(), nullptr, 10);
-    if (expires < static_cast<int64_t>(std::time(nullptr)))
-        return {};
-    const std::string want = seal(user, expires);
-    if (want.empty() || !socketley::crypto::secure_equal(want, v))
-        return {};
+    // Every skl_dash sent, the first whose seal holds taken, so one a sibling domain set does not shut the session out.
+    std::string user;
+    socketley::http::for_each_cookie(cookies, "skl_dash", [&](std::string_view v) {
+        const size_t d2 = v.rfind('.'), d1 = d2 == std::string_view::npos ? d2 : v.rfind('.', d2 - 1);
+        if (d1 == std::string_view::npos || d1 == 0)
+            return false;
+        const std::string who(v.substr(0, d1));
+        const int64_t expires = std::strtoll(std::string(v.substr(d1 + 1, d2 - d1 - 1)).c_str(), nullptr, 10);
+        if (expires < static_cast<int64_t>(std::time(nullptr)))
+            return false;
+        const std::string want = seal(who, expires);
+        if (want.empty() || !socketley::crypto::secure_equal(want, v))
+            return false;
+        user = who;
+        return true;
+    });
     return user;
 }
 
@@ -368,7 +365,8 @@ void server::session(int fd, const request& r)
     }
     // The access key, from the field the check just decoded, so it decodes here too.
     std::string pair;
-    socketley::base64::decode(trim(authorization.substr(authorization.find(' ') + 1)), pair);
+    if (std::string_view cred; http_auth_credentials(authorization, "basic", cred))
+        socketley::base64::decode(cred, pair);
     // Named as the credentials file names its section, and by the key for a key outside any.
     const std::string key = pair.substr(0, pair.find(':'));
     const std::string named = m_auth->user_of(key);

@@ -33,6 +33,7 @@
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/wall_clock.h"
+#include "../../shared/http/cookie.h"
 #include "../../shared/util/base64.h"
 
 namespace socketley::storage
@@ -52,21 +53,6 @@ constexpr int64_t session_ms  = 12ll * 3600 * 1000;
 constexpr int64_t remember_ms = 30ll * 24 * 3600 * 1000;
 // The positions kept for a user, the most recently watched first.
 constexpr size_t  progress_max = 200;
-
-std::string_view cookie_value(std::string_view header, std::string_view name)
-{
-    while (!header.empty())
-    {
-        const size_t semi = header.find(';');
-        std::string_view part = header.substr(0, semi);
-        header = semi == std::string_view::npos ? std::string_view{} : header.substr(semi + 1);
-        while (!part.empty() && part.front() == ' ')
-            part.remove_prefix(1);
-        if (part.size() > name.size() && part.starts_with(name) && part[name.size()] == '=')
-            return part.substr(name.size() + 1);
-    }
-    return {};
-}
 
 std::string num(double v)
 {
@@ -300,8 +286,8 @@ std::string inbox_json(const inbox& b)
 
 bool storage_run::has_ui_cookie(const conn& c)
 {
-    return !cookie_value(c.req.header("cookie"), cookie_name).empty() ||
-           !cookie_value(c.req.header("cookie"), "skl_idp").empty();
+    return !http::cookie_value(c.req.header("cookie"), cookie_name).empty() ||
+           !http::cookie_value(c.req.header("cookie"), socketley::idp::session_cookie_name).empty();
 }
 
 bool storage_run::idp_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
@@ -319,35 +305,42 @@ bool storage_run::idp_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
 bool storage_run::ui_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
 {
     // <access key, base64url>.<issued in ms>.<expiry in ms>.<HMAC-SHA256 under the key's secret, hex>
-    const std::string_view val = cookie_value(c->req.header("cookie"), cookie_name);
-    if (val.empty())
-        return false;
-    v.allowed = false;
-    const size_t a = val.find('.'), b = a == std::string_view::npos ? a : val.find('.', a + 1),
-                 d = b == std::string_view::npos ? b : val.find('.', b + 1);
-    std::string key;
-    if (d == std::string_view::npos || !base64url::decode(val.substr(0, a), key) || key.empty())
-        return true;
-    const auto number = [](std::string_view text, long long& out)
+    const auto verdict_of = [&](std::string_view val)
     {
-        const std::string s(text);
-        char* end = nullptr;
-        out = std::strtoll(s.c_str(), &end, 10);
-        return !s.empty() && end && !*end;
+        auth_verdict refused;
+        refused.allowed = false;
+        const size_t a = val.find('.'), b = a == std::string_view::npos ? a : val.find('.', a + 1),
+                     d = b == std::string_view::npos ? b : val.find('.', b + 1);
+        std::string key;
+        if (d == std::string_view::npos || !base64url::decode(val.substr(0, a), key) || key.empty())
+            return refused;
+        const auto number = [](std::string_view text, long long& out)
+        {
+            const std::string s(text);
+            char* end = nullptr;
+            out = std::strtoll(s.c_str(), &end, 10);
+            return !s.empty() && end && !*end;
+        };
+        long long iat = 0, exp = 0;
+        if (!number(val.substr(a + 1, b - a - 1), iat) || !number(val.substr(b + 1, d - b - 1), exp) ||
+            exp < wall::now_ms())
+            return refused;
+        auth_verdict got = m_auth->authorize_ui_session(key, iat, exp, val.substr(d + 1));
+        struct stat revoked{};
+        if (got.allowed && !got.anonymous &&
+            (iat < sessions_since(got.user ? got.user->id : key) ||
+             ::stat((m_store.options().dir + "/.ui/revoked/" + sha256_hex(val).substr(0, 32)).c_str(), &revoked) == 0))
+            return refused;
+        return got;
     };
-    long long iat = 0, exp = 0;
-    if (!number(val.substr(a + 1, b - a - 1), iat) || !number(val.substr(b + 1, d - b - 1), exp) || exp < wall::now_ms())
-        return true;
-    v = m_auth->authorize_ui_session(key, iat, exp, val.substr(d + 1));
-    struct stat revoked{};
-    if (v.allowed && !v.anonymous &&
-        (iat < sessions_since(v.user ? v.user->id : key) ||
-         ::stat((m_store.options().dir + "/.ui/revoked/" + sha256_hex(val).substr(0, 32)).c_str(), &revoked) == 0))
-    {
-        v         = auth_verdict{};
-        v.allowed = false;
-    }
-    return true;
+    // A request that carried one is answered by its verdict, the first that lets it in or else the last refusal.
+    bool carried = false;
+    http::for_each_cookie(c->req.header("cookie"), cookie_name, [&](std::string_view val) {
+        carried = true;
+        v = verdict_of(val);
+        return v.allowed;
+    });
+    return carried;
 }
 
 int64_t storage_run::sessions_since(const std::string& who)
@@ -488,14 +481,18 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
     const std::string secure_attr = secure(*c) ? "; Secure" : "";
     if (r.method == "DELETE")
     {
-        // The cookie itself is ended too, on the server, so a copy of it taken before is let in no longer.
-        if (const std::string_view val = cookie_value(r.header("cookie"), cookie_name); !val.empty())
+        // Each cookie sent is ended too, on the server, so a copy of one taken before is let in no longer.
+        const std::string_view cookies = r.header("cookie");
+        if (!http::cookie_value(cookies, cookie_name).empty())
         {
             const std::string dir = m_store.options().dir + "/.ui";
             if ((::mkdir(dir.c_str(), 0700) == 0 || errno == EEXIST) &&
                 (::mkdir((dir + "/revoked").c_str(), 0700) == 0 || errno == EEXIST))
             {
-                if (!replace_file(dir + "/revoked/" + sha256_hex(val).substr(0, 32), "", durability::data_and_dir)) {}
+                http::for_each_cookie(cookies, cookie_name, [&](std::string_view val) {
+                    if (!replace_file(dir + "/revoked/" + sha256_hex(val).substr(0, 32), "", durability::data_and_dir)) {}
+                    return false;
+                });
                 // A cookie lives a month at most, so a mark older than that guards nothing and goes.
                 std::error_code ec;
                 const auto month = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24 * 31);
