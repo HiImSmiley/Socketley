@@ -55,6 +55,8 @@ constexpr int64_t idle_secs     = 60;
 constexpr size_t  max_head      = 16 * 1024;
 constexpr size_t  max_body      = 16 * 1024;
 constexpr size_t  max_conns     = 4096;
+// What the endpoints a page's script calls say to every origin alike.
+constexpr std::string_view any_origin = "Access-Control-Allow-Origin: *\r\n";
 constexpr int     miss_limit    = 5;
 constexpr int64_t miss_window   = 15 * 60;
 
@@ -390,7 +392,7 @@ void idp_run::json_error(const std::shared_ptr<conn>& c, int status, std::string
 {
     respond(c, status, "application/json",
             "{\"error\":" + socketley::json::quote(error) + ",\"error_description\":" + socketley::json::quote(description) + "}",
-            "Access-Control-Allow-Origin: *\r\n" + std::string(extra_headers));
+            std::string(any_origin) + std::string(extra_headers));
 }
 
 void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
@@ -410,7 +412,7 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
     {
         // A browser's preflight for the endpoints a single-page client calls.
         respond(c, 200, "text/plain", "",
-                "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST\r\n"
+                std::string(any_origin) + "Access-Control-Allow-Methods: GET, POST\r\n"
                 "Access-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Max-Age: 600\r\n");
         return;
     }
@@ -459,12 +461,12 @@ void idp_run::discovery(const std::shared_ptr<conn>& c)
                 "\"token_endpoint_auth_methods_supported\":[\"client_secret_basic\",\"client_secret_post\",\"none\"],"
                 "\"code_challenge_methods_supported\":[\"S256\"],\"claims_supported\":[\"sub\",\"name\","
                 "\"preferred_username\",\"email\",\"groups\"]}",
-            "Access-Control-Allow-Origin: *\r\n");
+            any_origin);
 }
 
 void idp_run::jwks(const std::shared_ptr<conn>& c)
 {
-    respond(c, 200, "application/json", "{\"keys\":[" + m_jwk + "]}", "Access-Control-Allow-Origin: *\r\n");
+    respond(c, 200, "application/json", "{\"keys\":[" + m_jwk + "]}", any_origin);
 }
 
 // ─── Clients ────────────────────────────────────────────────────────────────
@@ -936,7 +938,7 @@ void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, con
         body.append(",\"refresh_token\":\"").append(refresh).append("\"");
     body += '}';
     ++m_c.tokens;
-    respond(c, 200, "application/json", body, "Access-Control-Allow-Origin: *\r\n");
+    respond(c, 200, "application/json", body, any_origin);
 }
 
 void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
@@ -1095,7 +1097,7 @@ void idp_run::userinfo(const std::shared_ptr<conn>& c, const request& rq)
     }
     ++m_c.userinfo;
     respond(c, 200, "application/json", "{\"sub\":" + socketley::json::quote(who->id) + profile_claims(*who) + "}",
-            "Access-Control-Allow-Origin: *\r\n");
+            any_origin);
 }
 
 void idp_run::logout(const std::shared_ptr<conn>& c, const request& rq)
