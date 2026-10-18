@@ -236,8 +236,11 @@ std::string server::seal(std::string_view user, int64_t expires) const
     const std::string msg = std::string(user) + "." + std::to_string(expires);
     unsigned char mac[32];
     unsigned int n = 0;
-    HMAC(EVP_sha256(), m_key.data(), static_cast<int>(m_key.size()), reinterpret_cast<const unsigned char*>(msg.data()),
-         msg.size(), mac, &n);
+    // No MAC is no seal, or a cookie without one would be checked against one without one.
+    if (!HMAC(EVP_sha256(), m_key.data(), static_cast<int>(m_key.size()),
+              reinterpret_cast<const unsigned char*>(msg.data()), msg.size(), mac, &n) ||
+        n != sizeof mac)
+        return {};
     static constexpr char hex[] = "0123456789abcdef";
     std::string out = msg + ".";
     for (unsigned i = 0; i < n; ++i)
@@ -274,7 +277,7 @@ std::string server::session_of(const request& r) const
     if (expires < static_cast<int64_t>(std::time(nullptr)))
         return {};
     const std::string want = seal(user, expires);
-    if (want.size() != v.size() || CRYPTO_memcmp(want.data(), v.data(), v.size()) != 0)
+    if (want.empty() || want.size() != v.size() || CRYPTO_memcmp(want.data(), v.data(), v.size()) != 0)
         return {};
     return user;
 }
@@ -403,9 +406,15 @@ void server::session(int fd, const request& r)
     const std::string named = m_auth->user_of(key);
     const std::string user = named.empty() ? key : named;
     const int64_t expires = static_cast<int64_t>(std::time(nullptr)) + session_seconds;
+    const std::string sealed = seal(user, expires);
+    if (sealed.empty())
+    {
+        send(fd, 503, "application/json", "{\"error\":\"the session could not be sealed\"}");
+        return;
+    }
     LOG_INFO(("dashboard: " + user + " signed in from " + r.client()).c_str());
     send(fd, 200, "application/json", "{\"user\":" + json_quote(user) + "}",
-         "Set-Cookie: skl_dash=" + seal(user, expires) + "; Path=/; Max-Age=" + std::to_string(session_seconds) +
+         "Set-Cookie: skl_dash=" + sealed + "; Path=/; Max-Age=" + std::to_string(session_seconds) +
              "; HttpOnly; SameSite=Strict" + (https ? "; Secure" : "") + "\r\n");
 }
 
