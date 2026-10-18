@@ -511,87 +511,9 @@ static void restore_runtimes(state_persistence& persistence,
             }
         }
 
-        // Type-specific, and still a second copy knowingly, because
-        // apply_typed_config touches nothing that needs a runtime_manager and
-        // three of these four cases wire exactly that.
-        switch (cfg.type)
-        {
-            case runtime_server:
-            {
-                auto* srv = static_cast<server_instance*>(instance);
-                srv->set_mode(static_cast<server_mode>(cfg.mode));
-                srv->set_send_to(cfg.send_to);
-                if (cfg.udp) srv->set_udp(true);
-                if (!cfg.cache_name.empty())
-                    srv->set_runtime_manager(&manager);
-                if (!cfg.master_pw.empty())
-                    srv->set_master_pw(cfg.master_pw);
-                if (!cfg.http_dir.empty())
-                    srv->set_http_dir(cfg.http_dir);
-                if (cfg.http_cache)
-                    srv->set_http_cache(true);
-                for (const auto& u : cfg.upstreams)
-                {
-                    // The boot restore has nobody to refuse to, so a bad entry
-                    // is logged and skipped rather than taking a serving
-                    // listener down.
-                    if (!srv->add_upstream_target(u))
-                        LOG_WARN(("restore: dropping upstream \"" + u +
-                                  "\" of " + cfg.name +
-                                  ": the port is not a number between 1 and 65535").c_str());
-                }
-                break;
-            }
-            case runtime_client:
-            {
-                auto* cli = static_cast<client_instance*>(instance);
-                cli->set_mode(static_cast<client_mode>(cfg.mode));
-                if (cfg.udp) cli->set_udp(true);
-                break;
-            }
-            case runtime_proxy:
-            {
-                auto* prx = static_cast<proxy_instance*>(instance);
-                prx->set_runtime_manager(&manager);
-                // Shared with the proxy worker, which rebuilds a proxy from
-                // the same runtime_config, so the two cannot drift.
-                apply_proxy_config(*prx, cfg);
-                break;
-            }
-            case runtime_cache:
-            {
-                apply_cache_config(*static_cast<cache_instance*>(instance), cfg);
-                break;
-            }
-            case runtime_storage:
-            {
-                apply_storage_config(*static_cast<storage_instance*>(instance), cfg);
-                break;
-            }
-            case runtime_dns:
-            {
-                apply_dns_config(*static_cast<dns_instance*>(instance), cfg);
-                break;
-            }
-            case runtime_sync:
-            {
-                apply_sync_config(*static_cast<sync_instance*>(instance), cfg);
-                break;
-            }
-            case runtime_idp:
-            {
-                apply_idp_config(*static_cast<idp_instance*>(instance), cfg);
-                break;
-            }
-            case runtime_db:
-            {
-                apply_db_config(*static_cast<db_instance*>(instance), cfg);
-                break;
-            }
-        }
-
-        // A registered type's fields, applied through the placeholder's bag.
-        instance->apply_config(cfg.extra);
+        // Its type's own fields, the same function a worker rebuilds the runtime with; the manager every one
+        // reaches is set above.
+        apply_typed_config(*instance, cfg);
     }
 
     // Pass 2: Start runtimes that were running

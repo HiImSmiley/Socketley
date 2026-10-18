@@ -6,6 +6,8 @@
 
 #include <string>
 
+class server_instance;
+class client_instance;
 class cache_instance;
 class proxy_instance;
 class storage_instance;
@@ -78,6 +80,13 @@ inline constexpr std::string_view live_config_keys[] = {
     "strategy", "health_interval", "health_path", "health_threshold", "circuit_threshold", "circuit_timeout",
     "backend_timeout", "retry_count", "retry_all", "max_bytes"};
 
-// The fields belonging to one type, touching nothing that needs a
-// runtime_manager.
-void apply_typed_config(runtime_instance& rt, const runtime_config& cfg);
+// A server's own fields. An upstream whose port is no port is said into `refusal` and the rest left unapplied when
+// one is given, and logged and skipped when not, since a restore has nobody to refuse to.
+bool apply_server_config(server_instance& srv, const runtime_config& cfg, bool by_presence = false,
+                         std::string* refusal = nullptr);
+void apply_client_config(client_instance& cli, const runtime_config& cfg, bool by_presence = false);
+
+// The fields belonging to one type, touching nothing that needs a runtime_manager; restore, a worker and import all
+// apply a type's fields here, import by the document's keys and with a refusal to answer.
+bool apply_typed_config(runtime_instance& rt, const runtime_config& cfg, bool by_presence = false,
+                        std::string* refusal = nullptr);

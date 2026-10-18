@@ -4989,112 +4989,17 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
         }
     }
 
-    // Apply type-specific fields
-    switch (type)
+    // Its type's own fields by the document's keys, refused whole on an upstream that cannot be.
+    if (std::string why; !apply_typed_config(*instance, cfg, /*by_presence=*/true, &why))
     {
-        case runtime_server:
-        {
-            auto* srv = static_cast<server_instance*>(instance);
-            if (has("mode")) srv->set_mode(static_cast<server_mode>(cfg.mode));
-            if (has("send_to") || has("master_forward"))
-                srv->set_send_to(cfg.send_to);
-            if (has("udp"))  srv->set_udp(cfg.udp);
-            // Parsed by parse_json_string and printed by `show`, and applied
-            // nowhere: an operator who edited "http_dir" in the document the
-            // editor opened got exit 0 and a runtime still serving the old
-            // directory.  The flag door (edit --http-dir) always worked, so
-            // the two disagreed.
-            if (has("http_dir"))   srv->set_http_dir(cfg.http_dir);
-            if (has("http_cache")) srv->set_http_cache(cfg.http_cache);
-            if (!cfg.cache_name.empty())
-                srv->set_runtime_manager(&m_manager);
-            if (!cfg.master_pw.empty())
-                srv->set_master_pw(cfg.master_pw);
-
-            // The list is replaced only when the document names it, because
-            // clearing it on a document that never mentioned upstreams is a
-            // server whose upstream leg stops existing.
-            if (!has("upstreams")) break;
-            srv->clear_upstream_targets();
-            for (const auto& u : cfg.upstreams)
-            {
-                // Reported rather than dropped, because the list was cleared a
-                // line ago and storing fewer upstreams than the document names
-                // is a half-applied import.
-                if (!srv->add_upstream_target(u))
-                {
-                    conn->write_buf = "invalid upstream address: " + u +
-                                      " (the port must be a number between 1 and 65535)\n";
-                    return 1;
-                }
-            }
-            break;
-        }
-        case runtime_client:
-        {
-            auto* cli = static_cast<client_instance*>(instance);
-            if (has("mode")) cli->set_mode(static_cast<client_mode>(cfg.mode));
-            if (has("udp"))  cli->set_udp(cfg.udp);
-            break;
-        }
-        case runtime_proxy:
-        {
-            auto* prx = static_cast<proxy_instance*>(instance);
-            // The restore path's list, asked by presence instead of by "!=
-            // default".  Written out by hand here before, and the hand-written
-            // version applied seven of sixteen: protocol, strategy, backends
-            // and the three mesh_client_* paths.  The nine service-mesh fields
-            // the man page documents as editable in this very document --
-            // health_check, health_interval, health_path, health_threshold,
-            // circuit_threshold, circuit_timeout, backend_timeout,
-            // retry_count and retry_all -- were parsed into cfg, handed to no
-            // setter, and then written back over by save_runtime() at the end
-            // of this function.  The mesh_client_* three keep their meaning:
-            // asked by presence, an omitted path clears them, which is the
-            // escape hatch a proxy restored with unreadable mTLS files needs.
-            apply_proxy_config(*prx, cfg, /*by_presence=*/true);
-            prx->set_runtime_manager(&m_manager);
-            break;
-        }
-        case runtime_cache:
-        {
-            apply_cache_config(*static_cast<cache_instance*>(instance), cfg,
-                               /*by_presence=*/true);
-            break;
-        }
-        case runtime_storage:
-        {
-            apply_storage_config(*static_cast<storage_instance*>(instance), cfg,
-                                 /*by_presence=*/true);
-            break;
-        }
-        case runtime_dns:
-        {
-            apply_dns_config(*static_cast<dns_instance*>(instance), cfg, /*by_presence=*/true);
-            break;
-        }
-        case runtime_sync:
-        {
-            apply_sync_config(*static_cast<sync_instance*>(instance), cfg, /*by_presence=*/true);
-            break;
-        }
-        case runtime_idp:
-        {
-            apply_idp_config(*static_cast<idp_instance*>(instance), cfg, /*by_presence=*/true);
-            break;
-        }
-        case runtime_db:
-        {
-            apply_db_config(*static_cast<db_instance*>(instance), cfg, /*by_presence=*/true);
-            break;
-        }
-        default:
-            // Replaced only when the document names the object, like the
-            // upstream and backend lists above.
-            if (has("extra"))
-                instance->apply_config(cfg.extra);
-            break;
+        conn->write_buf = std::move(why);
+        return 1;
     }
+    // A server that reaches a cache and a proxy route through the manager this daemon holds.
+    if (type == runtime_server && !cfg.cache_name.empty())
+        static_cast<server_instance*>(instance)->set_runtime_manager(&m_manager);
+    if (type == runtime_proxy)
+        static_cast<proxy_instance*>(instance)->set_runtime_manager(&m_manager);
 
     if (renamed)
     {

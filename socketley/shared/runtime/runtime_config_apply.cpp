@@ -338,71 +338,92 @@ void apply_live_config(runtime_instance& rt, const runtime_config& cfg)
     rt.refresh_cached_limits();
 }
 
-void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
+bool apply_server_config(server_instance& srv, const runtime_config& cfg, bool by_presence, std::string* refusal)
+{
+    const auto asked = [&](const char* key, bool otherwise) { return by_presence ? cfg.has(key) : otherwise; };
+    if (asked("mode", true))
+        srv.set_mode(static_cast<server_mode>(cfg.mode));
+    if (asked("send_to", true) || (by_presence && cfg.has("master_forward")))
+        srv.set_send_to(cfg.send_to);
+    if (asked("udp", true))
+        srv.set_udp(cfg.udp);
+    if (asked("http_dir", !cfg.http_dir.empty()))
+        srv.set_http_dir(cfg.http_dir);
+    if (asked("http_cache", cfg.http_cache))
+        srv.set_http_cache(cfg.http_cache);
+    if (!cfg.master_pw.empty())
+        srv.set_master_pw(cfg.master_pw);
+    // A document that never names the list leaves it, since clearing it would end the server's upstream leg.
+    if (!asked("upstreams", true))
+        return true;
+    srv.clear_upstream_targets();
+    for (const auto& u : cfg.upstreams)
+    {
+        if (srv.add_upstream_target(u))
+            continue;
+        if (refusal)
+        {
+            *refusal = "invalid upstream address: " + u + " (the port must be a number between 1 and 65535)\n";
+            return false;
+        }
+        LOG_WARN(("dropping upstream \"" + u + "\" of " + std::string(srv.get_name()) +
+                  ": the port is not a number between 1 and 65535").c_str());
+    }
+    return true;
+}
+
+void apply_client_config(client_instance& cli, const runtime_config& cfg, bool by_presence)
+{
+    if (!by_presence || cfg.has("mode"))
+        cli.set_mode(static_cast<client_mode>(cfg.mode));
+    if (!by_presence || cfg.has("udp"))
+        cli.set_udp(cfg.udp);
+    // `>= 0`, not `!= 0`, because -1 is disabled and 0 is infinite attempts, the spelling `--reconnect` produces
+    // without a number.
+    if (by_presence ? cfg.has("reconnect") : cfg.reconnect >= 0)
+        cli.set_reconnect(cfg.reconnect);
+}
+
+bool apply_typed_config(runtime_instance& rt, const runtime_config& cfg, bool by_presence, std::string* refusal)
 {
     switch (rt.get_type())
     {
         case runtime_server:
-        {
-            auto& srv = static_cast<server_instance&>(rt);
-            srv.set_mode(static_cast<server_mode>(cfg.mode));
-            srv.set_send_to(cfg.send_to);
-            srv.set_udp(cfg.udp);
-            if (!cfg.master_pw.empty())  srv.set_master_pw(cfg.master_pw);
-            if (!cfg.http_dir.empty())   srv.set_http_dir(cfg.http_dir);
-            if (cfg.http_cache)          srv.set_http_cache(true);
-            srv.clear_upstream_targets();
-            for (const auto& u : cfg.upstreams)
-            {
-                // Log and skip, as the boot restore does, because there is no
-                // command in flight to refuse to and dropping the runtime over
-                // one unreadable entry takes down a listener the rest of the
-                // configuration can serve.
-                if (!srv.add_upstream_target(u))
-                    LOG_WARN(("dropping upstream \"" + u +
-                              "\": the port is not a number between 1 and 65535").c_str());
-            }
+            if (!apply_server_config(static_cast<server_instance&>(rt), cfg, by_presence, refusal))
+                return false;
             break;
-        }
         case runtime_client:
-        {
-            auto& cli = static_cast<client_instance&>(rt);
-            cli.set_mode(static_cast<client_mode>(cfg.mode));
-            cli.set_udp(cfg.udp);
-            // `>= 0`, not `!= 0`, because -1 is disabled and 0 is infinite
-            // attempts -- the spelling `--reconnect` produces without a
-            // number, which state_persistence.cpp already writes under the
-            // same test.
-            if (cfg.reconnect >= 0) cli.set_reconnect(cfg.reconnect);
+            apply_client_config(static_cast<client_instance&>(rt), cfg, by_presence);
             break;
-        }
         case runtime_proxy:
-            apply_proxy_config(static_cast<proxy_instance&>(rt), cfg);
+            apply_proxy_config(static_cast<proxy_instance&>(rt), cfg, by_presence);
             break;
 
         case runtime_cache:
-            apply_cache_config(static_cast<cache_instance&>(rt), cfg);
+            apply_cache_config(static_cast<cache_instance&>(rt), cfg, by_presence);
             break;
 
         case runtime_storage:
-            apply_storage_config(static_cast<storage_instance&>(rt), cfg);
+            apply_storage_config(static_cast<storage_instance&>(rt), cfg, by_presence);
             break;
 
         case runtime_dns:
-            apply_dns_config(static_cast<dns_instance&>(rt), cfg);
+            apply_dns_config(static_cast<dns_instance&>(rt), cfg, by_presence);
             break;
         case runtime_sync:
-            apply_sync_config(static_cast<sync_instance&>(rt), cfg);
+            apply_sync_config(static_cast<sync_instance&>(rt), cfg, by_presence);
             break;
         case runtime_idp:
-            apply_idp_config(static_cast<idp_instance&>(rt), cfg);
+            apply_idp_config(static_cast<idp_instance&>(rt), cfg, by_presence);
             break;
         case runtime_db:
-            apply_db_config(static_cast<db_instance&>(rt), cfg);
+            apply_db_config(static_cast<db_instance&>(rt), cfg, by_presence);
             break;
     }
 
-    // Unconditional because it is a no-op for the built-ins, and a registered
-    // type's fields must arrive however the config did.
-    rt.apply_config(cfg.extra);
+    // A no-op for the built-ins, and a registered type's fields must arrive however the config did; a document
+    // that never names the object leaves it.
+    if (!by_presence || cfg.has("extra"))
+        rt.apply_config(cfg.extra);
+    return true;
 }
