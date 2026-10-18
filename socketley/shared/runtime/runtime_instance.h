@@ -368,8 +368,14 @@ public:
         // No region, so the four counters are this object's own atomics, and
         // active_connections is the published count because this runs on a
         // thread that may not walk a runtime's containers.
+        return counted_figures(m_stat_active_connections.load(std::memory_order_relaxed));
+    }
+
+    // This object's four counters, with the active count the caller vouches for.
+    shard_stats::figures counted_figures(uint64_t active) const
+    {
         shard_stats::figures f;
-        f.active_connections = m_stat_active_connections.load(std::memory_order_relaxed);
+        f.active_connections = active;
         f.total_connections  = m_stat_total_connections.load(std::memory_order_relaxed);
         f.total_messages     = m_stat_total_messages.load(std::memory_order_relaxed);
         f.bytes_in           = m_stat_bytes_in.load(std::memory_order_relaxed);

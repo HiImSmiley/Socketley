@@ -15,6 +15,7 @@
 // it in.
 #include "../cluster/cluster_view.h"
 #include "../util/byte_codec.h"
+#include "shard_stats.h"
 #include <string_view>
 #include <vector>
 
@@ -886,22 +887,18 @@ inline constexpr int stats_interval_ms = 250;
 
 struct stats_wire
 {
-    uint64_t    total_connections{0};
-    uint64_t    total_messages{0};
-    uint64_t    bytes_in{0};
-    uint64_t    bytes_out{0};
-    uint64_t    active_connections{0};
-    std::string detail;
+    shard_stats::figures f;
+    std::string          detail;
 };
 
 inline std::string encode_stats(const stats_wire& s)
 {
     std::string out;
-    socketley::bytes::append64(out, s.total_connections);
-    socketley::bytes::append64(out, s.total_messages);
-    socketley::bytes::append64(out, s.bytes_in);
-    socketley::bytes::append64(out, s.bytes_out);
-    socketley::bytes::append64(out, s.active_connections);
+    socketley::bytes::append64(out, s.f.total_connections);
+    socketley::bytes::append64(out, s.f.total_messages);
+    socketley::bytes::append64(out, s.f.bytes_in);
+    socketley::bytes::append64(out, s.f.bytes_out);
+    socketley::bytes::append64(out, s.f.active_connections);
     put_str(out, s.detail);
     return out;
 }
@@ -909,12 +906,12 @@ inline std::string encode_stats(const stats_wire& s)
 inline bool decode_stats(std::string_view payload, stats_wire& s)
 {
     reader r(payload.data(), payload.size());
-    s.total_connections  = r.u64();
-    s.total_messages     = r.u64();
-    s.bytes_in           = r.u64();
-    s.bytes_out          = r.u64();
-    s.active_connections = r.u64();
-    s.detail             = std::string(r.str());
+    s.f.total_connections  = r.u64();
+    s.f.total_messages     = r.u64();
+    s.f.bytes_in           = r.u64();
+    s.f.bytes_out          = r.u64();
+    s.f.active_connections = r.u64();
+    s.detail               = std::string(r.str());
     // Trailing bytes a newer sender appended are left where they are, because
     // the frame header carries the length and take_frame() has already
     // consumed them.

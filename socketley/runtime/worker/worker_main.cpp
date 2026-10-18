@@ -466,16 +466,8 @@ public:
             // where one moves, because the daemon reads them when it prints.
             if (m_rt && m_rt->shard_stats_table().mapped())
             {
-                shard_stats::figures f;
-                f.active_connections =
-                    static_cast<uint64_t>(m_rt->get_connection_count());
-                f.total_connections =
-                    m_rt->m_stat_total_connections.load(std::memory_order_relaxed);
-                f.total_messages =
-                    m_rt->m_stat_total_messages.load(std::memory_order_relaxed);
-                f.bytes_in  = m_rt->m_stat_bytes_in.load(std::memory_order_relaxed);
-                f.bytes_out = m_rt->m_stat_bytes_out.load(std::memory_order_relaxed);
-                m_rt->shard_stats_table().publish(f);
+                m_rt->shard_stats_table().publish(
+                    m_rt->counted_figures(static_cast<uint64_t>(m_rt->get_connection_count())));
             }
         }
 
@@ -615,12 +607,8 @@ private:
         // counters as the fallback for a worker whose region could not be
         // made.
         worker_proto::stats_wire s;
-        s.total_connections  = m_rt->m_stat_total_connections.load(std::memory_order_relaxed);
-        s.total_messages     = m_rt->m_stat_total_messages.load(std::memory_order_relaxed);
-        s.bytes_in           = m_rt->m_stat_bytes_in.load(std::memory_order_relaxed);
-        s.bytes_out          = m_rt->m_stat_bytes_out.load(std::memory_order_relaxed);
-        s.active_connections = static_cast<uint64_t>(m_rt->get_connection_count());
-        s.detail             = m_rt->stats_ring() + m_rt->stats_lines();
+        s.f      = m_rt->counted_figures(static_cast<uint64_t>(m_rt->get_connection_count()));
+        s.detail = m_rt->stats_ring() + m_rt->stats_lines();
 
         // The two numbers that make a mesh measurement mean anything, sent
         // unconditionally including by a shard with no links, because the
@@ -645,14 +633,7 @@ private:
 
         // Did anything the daemon can see actually move, which now decides
         // whether there is a publish at all rather than how far it backs off.
-        const bool changed =
-            !m_have_last
-            || s.total_connections  != m_last_pub.total_connections
-            || s.total_messages     != m_last_pub.total_messages
-            || s.bytes_in           != m_last_pub.bytes_in
-            || s.bytes_out          != m_last_pub.bytes_out
-            || s.active_connections != m_last_pub.active_connections
-            || s.detail             != m_last_pub.detail;
+        const bool changed = !m_have_last || s.f != m_last_pub.f || s.detail != m_last_pub.detail;
 
         // Only when it changed, because the daemon's copy already says the
         // last thing that was true -- which is why the heartbeat could be

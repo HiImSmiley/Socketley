@@ -795,11 +795,7 @@ static fleet_totals fleet_sum(const std::vector<runtime_row>& rows)
     fleet_totals t;
     for (const runtime_row& r : rows)
     {
-        t.sum.active_connections += r.figures.active_connections;
-        t.sum.total_connections += r.figures.total_connections;
-        t.sum.total_messages += r.figures.total_messages;
-        t.sum.bytes_in += r.figures.bytes_in;
-        t.sum.bytes_out += r.figures.bytes_out;
+        t.sum += r.figures;
         t.running += r.state == runtime_running;
     }
     return t;

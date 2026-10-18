@@ -6559,7 +6559,7 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
     if (!inst)
         return;
 
-    uint64_t total_conn = 0, total_msg = 0, in = 0, out = 0, active = 0;
+    shard_stats::figures sum;
     bool     any        = false;
     std::string detail;
 
@@ -6573,12 +6573,8 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
         if (!s.seen)
             continue;
 
-        any          = true;
-        total_conn  += s.total_connections;
-        total_msg   += s.total_messages;
-        in          += s.bytes_in;
-        out         += s.bytes_out;
-        active      += s.active_connections;
+        any  = true;
+        sum += s.f;
 
         // One shard's detail text passes through unchanged and several are
         // labelled, with each shard's own figures under `shard_` names,
@@ -6586,12 +6582,6 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
         const size_t idx = static_cast<size_t>(&sup - it->second.data());
         if (it->second.size() > 1)
         {
-            const shard_stats::figures sf =
-                region ? region->at(static_cast<uint32_t>(idx))
-                       : shard_stats::figures{s.active_connections,
-                                              s.total_connections,
-                                              s.total_messages,
-                                              s.bytes_in, s.bytes_out};
             detail += "[shard ";
             detail += std::to_string(idx);
             detail += "]\nshard_connections:";
@@ -6605,6 +6595,7 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
             detail += "\nshard_bytes_out:";
             detail += std::to_string(sf.bytes_out);
             detail += '\n';
+            const shard_stats::figures sf = region ? region->at(static_cast<uint32_t>(idx)) : s.f;
         }
         detail += s.detail;
     }
@@ -6612,15 +6603,15 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
     if (!any)
         return;
 
-    inst->m_stat_total_connections.store(total_conn, std::memory_order_relaxed);
-    inst->m_stat_total_messages.store(total_msg, std::memory_order_relaxed);
-    inst->m_stat_bytes_in.store(in, std::memory_order_relaxed);
-    inst->m_stat_bytes_out.store(out, std::memory_order_relaxed);
+    inst->m_stat_total_connections.store(sum.total_connections, std::memory_order_relaxed);
+    inst->m_stat_total_messages.store(sum.total_messages, std::memory_order_relaxed);
+    inst->m_stat_bytes_in.store(sum.bytes_in, std::memory_order_relaxed);
+    inst->m_stat_bytes_out.store(sum.bytes_out, std::memory_order_relaxed);
 
     // Where an in-process runtime's would be, so stat_detail_snapshot() — which
     // the metrics endpoint already calls — is answered identically whichever
     // side the runtime is running on, and whether it is one process or four.
-    inst->set_worker_stats(std::move(detail), active);
+    inst->set_worker_stats(std::move(detail), sum.active_connections);
 }
 
 void daemon_handler::reconcile_proxy_workers()

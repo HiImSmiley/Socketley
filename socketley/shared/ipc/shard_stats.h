@@ -84,6 +84,15 @@ struct figures
     uint64_t bytes_out{0};
 
     bool operator==(const figures&) const = default;
+    figures& operator+=(const figures& o)
+    {
+        active_connections += o.active_connections;
+        total_connections  += o.total_connections;
+        total_messages     += o.total_messages;
+        bytes_in           += o.bytes_in;
+        bytes_out          += o.bytes_out;
+        return *this;
+    }
 };
 
 struct alignas(line_size) header

@@ -1419,13 +1419,9 @@ void proxy_supervisor::apply_stats(const std::string& payload)
     // recently; the sum is aggregate_worker_stats()'s to make, and these
     // figures are only the fallback for a runtime whose region could not be
     // created.
-    m_last_stats.total_connections  = s.total_connections;
-    m_last_stats.total_messages     = s.total_messages;
-    m_last_stats.bytes_in           = s.bytes_in;
-    m_last_stats.bytes_out          = s.bytes_out;
-    m_last_stats.active_connections = s.active_connections;
-    m_last_stats.detail             = std::move(s.detail);
-    m_last_stats.seen               = true;
+    m_last_stats.f      = s.f;
+    m_last_stats.detail = std::move(s.detail);
+    m_last_stats.seen   = true;
 }
 
 // Above lua_deadline::builtin_default_ms, deliberately: a runaway callback is

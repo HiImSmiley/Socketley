@@ -115,12 +115,8 @@ public:
     // meant the last frame to arrive won.
     struct published_stats
     {
-        uint64_t    total_connections{0};
-        uint64_t    total_messages{0};
-        uint64_t    bytes_in{0};
-        uint64_t    bytes_out{0};
-        uint64_t    active_connections{0};
-        std::string detail;
+        shard_stats::figures f;
+        std::string          detail;
 
         // Whether this child has published at all, since letting a just-forked
         // shard's zeros into the sum reports a runtime losing connections for
