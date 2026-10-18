@@ -557,6 +557,31 @@ static storage_row parse_storage_row(std::string_view name, std::string_view det
 
 // The series a storage runtime has that no other type does: what it holds, what
 // it was asked, what it moved and how it answered.
+// A family's two comment lines, the name said once for both.
+static void metric_head(std::string& out, std::string_view name, std::string_view type, std::string_view help)
+{
+    out += "# HELP ";
+    out += name;
+    out += ' ';
+    out += help;
+    out += "\n# TYPE ";
+    out += name;
+    out += ' ';
+    out += type;
+    out += '\n';
+}
+
+// A family of one unlabelled value, and the blank line after it.
+static void metric_scalar(std::string& out, std::string_view name, std::string_view type, std::string_view help,
+                          uint64_t v)
+{
+    metric_head(out, name, type, help);
+    out += name;
+    out += ' ';
+    json_append_uint(out, v);
+    out += "\n\n";
+}
+
 static void append_storage_series(std::string& out, const std::vector<storage_row>& rows)
 {
     if (rows.empty())
@@ -568,15 +593,8 @@ static void append_storage_series(std::string& out, const std::vector<storage_ro
                             std::string_view key)
     {
         named.push_back(key);
-        out += "\n# HELP ";
-        out += metric;
-        out += ' ';
-        out += help;
-        out += "\n# TYPE ";
-        out += metric;
-        out += ' ';
-        out += type;
         out += '\n';
+        metric_head(out, metric, type, help);
         for (const auto& r : rows)
         {
             uint64_t v;
@@ -697,8 +715,8 @@ static void append_storage_series(std::string& out, const std::vector<storage_ro
         family(f.metric, f.type, f.help, f.key);
     }
 
-    out += "\n# HELP socketley_storage_requests_total Requests a storage runtime served, by operation.\n"
-           "# TYPE socketley_storage_requests_total counter\n";
+    out += '\n';
+    metric_head(out, "socketley_storage_requests_total", "counter", "Requests a storage runtime served, by operation.");
     static constexpr std::pair<const char*, const char*> ops[] = {
         {"gets", "get"}, {"heads", "head"}, {"puts", "put"},
         {"deletes", "delete"}, {"lists", "list"}, {"copies", "copy"},
@@ -722,8 +740,8 @@ static void append_storage_series(std::string& out, const std::vector<storage_ro
 
     // One line per code that has been answered, so a runtime that has never
     // refused anything has no series to graph.
-    out += "\n# HELP socketley_storage_errors_total S3 errors a storage runtime answered, by code.\n"
-           "# TYPE socketley_storage_errors_total counter\n";
+    out += '\n';
+    metric_head(out, "socketley_storage_errors_total", "counter", "S3 errors a storage runtime answered, by code.");
     for (const auto& r : rows)
         for (const auto& [key, v] : r.figures)
         {
@@ -739,8 +757,8 @@ static void append_storage_series(std::string& out, const std::vector<storage_ro
         }
 
     // Every other figure of `stats`, by the name it has there, so nothing a runtime counts is missing from a scrape.
-    out += "\n# HELP socketley_storage_stat A storage runtime's other stats figures, by name.\n"
-           "# TYPE socketley_storage_stat untyped\n";
+    out += '\n';
+    metric_head(out, "socketley_storage_stat", "untyped", "A storage runtime's other stats figures, by name.");
     for (const auto& r : rows)
         for (const auto& [key, v] : r.figures)
         {
@@ -823,9 +841,8 @@ std::string metrics_endpoint::build_metrics() const
     if (!socketley::self_exe_identity(exe, dev, ino))
         exe.clear();
 
-    out += "# HELP socketley_daemon_info The daemon these numbers come from.\n"
-           "# TYPE socketley_daemon_info gauge\n"
-           "socketley_daemon_info{version=\"";
+    metric_head(out, "socketley_daemon_info", "gauge", "The daemon these numbers come from.");
+    out += "socketley_daemon_info{version=\"";
     label_escape_into(out, SOCKETLEY_VERSION);
     out += "\",pid=\"";
     json_append_uint(out, static_cast<uint64_t>(::getpid()));
@@ -835,49 +852,26 @@ std::string metrics_endpoint::build_metrics() const
     label_escape_into(out, exe);
     out += "\"} 1\n\n";
 
-    out += "# HELP socketley_runtimes_total Total number of runtimes.\n"
-           "# TYPE socketley_runtimes_total gauge\n"
-           "socketley_runtimes_total ";
-    json_append_uint(out, static_cast<uint64_t>(total_count));
-    out += "\n\n# HELP socketley_runtimes_running Number of running runtimes.\n"
-           "# TYPE socketley_runtimes_running gauge\n"
-           "socketley_runtimes_running ";
-    json_append_uint(out, static_cast<uint64_t>(running_count));
-    out += "\n\n# HELP socketley_connections_total Total connections accepted.\n"
-           "# TYPE socketley_connections_total counter\n"
-           "socketley_connections_total ";
-    json_append_uint(out, total_connections);
-    out += "\n\n# HELP socketley_connections_active Current active connections.\n"
-           "# TYPE socketley_connections_active gauge\n"
-           "socketley_connections_active ";
-    json_append_uint(out, active_connections);
-    out += "\n\n# HELP socketley_messages_total Total messages processed.\n"
-           "# TYPE socketley_messages_total counter\n"
-           "socketley_messages_total ";
-    json_append_uint(out, total_messages);
-    out += "\n\n# HELP socketley_bytes_received_total Total bytes received.\n"
-           "# TYPE socketley_bytes_received_total counter\n"
-           "socketley_bytes_received_total ";
-    json_append_uint(out, total_bytes_in);
-    out += "\n\n# HELP socketley_bytes_sent_total Total bytes sent.\n"
-           "# TYPE socketley_bytes_sent_total counter\n"
-           "socketley_bytes_sent_total ";
-    json_append_uint(out, total_bytes_out);
-    out += "\n\n";
+    metric_scalar(out, "socketley_runtimes_total", "gauge", "Total number of runtimes.", total_count);
+    metric_scalar(out, "socketley_runtimes_running", "gauge", "Number of running runtimes.", running_count);
+    metric_scalar(out, "socketley_connections_total", "counter", "Total connections accepted.", total_connections);
+    metric_scalar(out, "socketley_connections_active", "gauge", "Current active connections.", active_connections);
+    metric_scalar(out, "socketley_messages_total", "counter", "Total messages processed.", total_messages);
+    metric_scalar(out, "socketley_bytes_received_total", "counter", "Total bytes received.", total_bytes_in);
+    metric_scalar(out, "socketley_bytes_sent_total", "counter", "Total bytes sent.", total_bytes_out);
 
     // The loopback shortcut, whose bytes no counter on lo sees.
     const socketley::fast_lo_figures lo = socketley::fast_lo_now();
-    out += "# HELP socketley_fast_lo_info The loopback shortcut's mode: off, own, all, trust, or unavailable.\n"
-           "# TYPE socketley_fast_lo_info gauge\n"
-           "socketley_fast_lo_info{mode=\"";
+    metric_head(out, "socketley_fast_lo_info", "gauge",
+                "The loopback shortcut's mode: off, own, all, trust, or unavailable.");
+    out += "socketley_fast_lo_info{mode=\"";
     label_escape_into(out, lo.mode);
     out += "\"} 1\n\n";
     if (lo.mode != "off" && lo.mode != "unavailable")
     {
         auto series = [&out](const char* name, const char* type, const char* help,
                              std::initializer_list<std::pair<const char*, uint64_t>> vals) {
-            out += "# HELP "; out += name; out += ' '; out += help;
-            out += "\n# TYPE "; out += name; out += ' '; out += type; out += '\n';
+            metric_head(out, name, type, help);
             for (const auto& [labels, v] : vals)
             {
                 out += name; out += labels; out += ' ';
@@ -909,8 +903,7 @@ std::string metrics_endpoint::build_metrics() const
     }
 
     // Per-runtime metrics
-    out += "# HELP socketley_runtime_connections Active connections per runtime.\n"
-           "# TYPE socketley_runtime_connections gauge\n";
+    metric_head(out, "socketley_runtime_connections", "gauge", "Active connections per runtime.");
     for (const auto& s : snapshots)
     {
         if (s.state != runtime_running)
@@ -930,8 +923,7 @@ std::string metrics_endpoint::build_metrics() const
     }
     out += "\n";
 
-    out += "# HELP socketley_runtime_messages_total Total messages per runtime.\n"
-           "# TYPE socketley_runtime_messages_total counter\n";
+    metric_head(out, "socketley_runtime_messages_total", "counter", "Total messages per runtime.");
     for (const auto& s : snapshots)
     {
         out += "socketley_runtime_messages_total{name=\"";
@@ -941,8 +933,9 @@ std::string metrics_endpoint::build_metrics() const
         out += "\n";
     }
 
-    out += "\n# HELP socketley_runtime_cpu_seconds_total CPU time of a runtime's processes, user and system.\n"
-           "# TYPE socketley_runtime_cpu_seconds_total counter\n";
+    out += '\n';
+    metric_head(out, "socketley_runtime_cpu_seconds_total", "counter",
+                "CPU time of a runtime's processes, user and system.");
     std::vector<process_usage> usages;
     usages.reserve(snapshots.size());
     for (const auto& s : snapshots)
@@ -956,9 +949,9 @@ std::string metrics_endpoint::build_metrics() const
         out += buf;
         out += "\n";
     }
-    out += "\n# HELP socketley_runtime_resident_memory_bytes Resident memory of a runtime's processes, a page shared "
-           "between shards counted once per shard.\n"
-           "# TYPE socketley_runtime_resident_memory_bytes gauge\n";
+    out += '\n';
+    metric_head(out, "socketley_runtime_resident_memory_bytes", "gauge",
+                "Resident memory of a runtime's processes, a page shared between shards counted once per shard.");
     for (size_t i = 0; i < snapshots.size(); ++i)
     {
         out += "socketley_runtime_resident_memory_bytes{name=\"";
@@ -967,9 +960,10 @@ std::string metrics_endpoint::build_metrics() const
         json_append_uint(out, usages[i].rss_bytes);
         out += "\n";
     }
-    out += "\n# HELP socketley_runtime_memory_bytes What a runtime costs the machine: a page it shares counted by the "
-           "share it holds of it, so the sum over the runtimes is the memory they hold between them.\n"
-           "# TYPE socketley_runtime_memory_bytes gauge\n";
+    out += '\n';
+    metric_head(out, "socketley_runtime_memory_bytes", "gauge",
+                "What a runtime costs the machine: a page it shares counted by the share it holds of it, so the sum "
+                "over the runtimes is the memory they hold between them.");
     for (size_t i = 0; i < snapshots.size(); ++i)
     {
         out += "socketley_runtime_memory_bytes{name=\"";
