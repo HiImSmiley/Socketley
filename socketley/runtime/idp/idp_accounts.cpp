@@ -16,7 +16,8 @@
 #include "idp_logic.h"
 #include "../../shared/util/byte_codec.h"
 #include "../../shared/crypto/jws.h"
-#include "../storage/json_doc.h"
+#include "../../shared/json/json_doc.h"
+#include "../../shared/json/json_escape.h"
 
 namespace socketley::idp
 {
@@ -192,8 +193,8 @@ bool account_store::read_snapshot(const std::string& path, std::string& why)
     std::ifstream f(path);
     if (!f)
         return true;   // no snapshot yet: everything is in the journal
-    using socketley::storage::json_reader;
-    using socketley::storage::jvalue;
+    using socketley::json::json_reader;
+    using socketley::json::jvalue;
     std::string line;
     size_t line_no = 0;
     bool header = false;
@@ -411,18 +412,18 @@ bool account_store::commit_many(const std::vector<std::string>& records, std::st
 
 bool account_store::compact(std::string& why)
 {
-    std::string out = "{\"format\":" + json_string(journal_owner) + ",\"version\":" +
+    std::string out = "{\"format\":" + socketley::json::quote(journal_owner) + ",\"version\":" +
                       std::to_string(format_version) + "}\n";
     for (const auto& [id, a] : m_accounts)
     {
-        out += "{\"id\":" + json_string(id) + ",\"fields\":{";
+        out += "{\"id\":" + socketley::json::quote(id) + ",\"fields\":{";
         bool first = true;
         for (const auto& [k, v] : a.fields)
         {
             if (!first)
                 out += ',';
             first = false;
-            out += json_string(k) + ":" + json_string(v);
+            out += socketley::json::quote(k) + ":" + socketley::json::quote(v);
         }
         out += "}}\n";
     }

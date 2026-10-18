@@ -3,10 +3,13 @@
 
 #include "../../socketley/runtime/storage/bucket_policy.h"
 #include "../../socketley/shared/util/glob_match.h"
-#include "../../socketley/runtime/storage/json_doc.h"
+#include "../../socketley/shared/json/json_doc.h"
 
 #include <string>
 #include <string_view>
+
+using socketley::json::jvalue;
+using socketley::json::json_reader;
 
 // The JSON a bucket policy is read from, at its edges: escapes and raw UTF-8, nesting, numbers, names given twice,
 // a value read into twice, and the size limit; and the refusing policy a stored document that stops compiling becomes.

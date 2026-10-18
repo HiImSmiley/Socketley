@@ -10,6 +10,7 @@
 #include "sse.h"
 #include "tierer.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/json/json_escape.h"
 
 namespace socketley::storage
 {
@@ -166,7 +167,8 @@ std::string_view type_of(std::string_view name)
 // whatever bytes its maker had.
 void json_str(std::string& o, std::string_view v)
 {
-    o += '"';
+    std::string clean;
+    clean.reserve(v.size());
     for (size_t i = 0; i < v.size();)
     {
         const auto c = static_cast<uint8_t>(v[i]);
@@ -177,22 +179,14 @@ void json_str(std::string& o, std::string_view v)
             whole = (static_cast<uint8_t>(v[i + k]) & 0xC0) == 0x80;
         if (!whole)
         {
-            o += "\xEF\xBF\xBD";
+            clean += "\xEF\xBF\xBD";
             ++i;
             continue;
         }
-        if (len == 1)
-        {
-            if (c == '"' || c == '\\')
-                o += '\\';
-            if (c >= 0x20)
-                o += static_cast<char>(c);
-        }
-        else
-            o.append(v.substr(i, len));
+        clean.append(v.substr(i, len));
         i += len;
     }
-    o += '"';
+    socketley::json::quote_into(o, clean);
 }
 
 }   // namespace

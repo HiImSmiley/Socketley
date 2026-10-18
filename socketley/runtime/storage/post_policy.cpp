@@ -3,9 +3,12 @@
 #include <algorithm>
 
 #include "checksum.h"
-#include "json_doc.h"
+#include "../../shared/json/json_doc.h"
 #include "s3_names.h"
 #include "s3_xml.h"
+
+using socketley::json::jvalue;
+using socketley::json::json_reader;
 
 namespace socketley::storage
 {

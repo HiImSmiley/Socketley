@@ -39,13 +39,14 @@
 #include "../shared/crypto/jws.h"
 #include "../shared/net/dns_feed.h"
 #include "../shared/crypto/tls_context.h"
-#include "../runtime/storage/json_doc.h"
+#include "../shared/json/json_doc.h"
+#include "../shared/json/json_escape.h"
 
 namespace
 {
 
-using socketley::storage::jvalue;
-using socketley::storage::json_reader;
+using socketley::json::jvalue;
+using socketley::json::json_reader;
 using socketley::jws::b64url;
 using socketley::jws::es256;
 using socketley::jws::jwk_of;
@@ -53,26 +54,6 @@ using socketley::jws::sha256;
 
 constexpr std::string_view lets_encrypt = "https://acme-v02.api.letsencrypt.org/directory";
 constexpr int poll_seconds = 90;
-
-std::string jstr(std::string_view v)
-{
-    std::string o = "\"";
-    for (char ch : v)
-    {
-        if (ch == '"' || ch == '\\')
-            o += '\\';
-        o += ch;
-    }
-    return o + "\"";
-}
-
-const jvalue* member(const jvalue& o, std::string_view n)
-{
-    for (const auto& [k, v] : o.members)
-        if (k == n)
-            return &v;
-    return nullptr;
-}
 
 std::string str(const jvalue& o, std::string_view n)
 {
@@ -514,11 +495,11 @@ public:
                     return false;
                 m_nonce = n.header("replay-nonce");
             }
-            std::string prot = "{\"alg\":\"ES256\",\"nonce\":" + jstr(m_nonce) + ",\"url\":" + jstr(url) + ",";
-            prot += use_jwk ? "\"jwk\":" + m_jwk + "}" : "\"kid\":" + jstr(m_kid) + "}";
+            std::string prot = "{\"alg\":\"ES256\",\"nonce\":" + socketley::json::quote(m_nonce) + ",\"url\":" + socketley::json::quote(url) + ",";
+            prot += use_jwk ? "\"jwk\":" + m_jwk + "}" : "\"kid\":" + socketley::json::quote(m_kid) + "}";
             const std::string p64 = b64url(prot), b64 = b64url(payload);
-            const std::string body = "{\"protected\":" + jstr(p64) + ",\"payload\":" + jstr(b64) + ",\"signature\":" +
-                                     jstr(b64url(es256(m_key, p64 + "." + b64))) + "}";
+            const std::string body = "{\"protected\":" + socketley::json::quote(p64) + ",\"payload\":" + socketley::json::quote(b64) + ",\"signature\":" +
+                                     socketley::json::quote(b64url(es256(m_key, p64 + "." + b64))) + "}";
             m_nonce.clear();
             r = reply{};
             if (!m_h.request("POST", url, "application/jose+json", body, r, err))
@@ -544,7 +525,7 @@ public:
     {
         std::string payload = "{\"termsOfServiceAgreed\":true";
         if (!email.empty())
-            payload += ",\"contact\":[" + jstr("mailto:" + email) + "]";
+            payload += ",\"contact\":[" + socketley::json::quote("mailto:" + email) + "]";
         payload += "}";
         reply r;
         if (!post(m_new_account, payload, r, err, true))
@@ -788,7 +769,7 @@ int issue(int argc, char** argv)
 
     std::string ids;
     for (const std::string& n : names)
-        ids += (ids.empty() ? "" : ",") + std::string("{\"type\":\"dns\",\"value\":") + jstr(n) + "}";
+        ids += (ids.empty() ? "" : ",") + std::string("{\"type\":\"dns\",\"value\":") + socketley::json::quote(n) + "}";
     reply r;
     jvalue order;
     if (!c.post(c.new_order(), "{\"identifiers\":[" + ids + "]}", r, err) || !json_reader(r.body).document(order))
@@ -874,7 +855,7 @@ int issue(int argc, char** argv)
         return done(2);
     }
     jvalue fin;
-    if (!c.post(str(order, "finalize"), "{\"csr\":" + jstr(b64url(csr)) + "}", r, err) ||
+    if (!c.post(str(order, "finalize"), "{\"csr\":" + socketley::json::quote(b64url(csr)) + "}", r, err) ||
         !poll(c, order_url, "valid", fin, err))
     {
         EVP_PKEY_free(cert_key);

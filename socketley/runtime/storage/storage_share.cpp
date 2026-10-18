@@ -21,12 +21,16 @@
 #include <charconv>
 
 #include "digest.h"
-#include "json_doc.h"
+#include "../../shared/json/json_doc.h"
 #include "s3_names.h"
 #include "s3_xml.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/persist/state_persistence.h"
 #include "../../shared/persist/replaced_file.h"
+#include "../../shared/json/json_escape.h"
+
+using socketley::json::jvalue;
+using socketley::json::json_reader;
 
 namespace socketley::storage
 {
@@ -61,29 +65,22 @@ struct share_link
 namespace
 {
 
-void jstr(std::string& out, std::string_view v)
-{
-    out += '"';
-    out += sp_detail::json_escape(v);
-    out += '"';
-}
-
 std::string share_json(const share_link& s)
 {
     std::string o = "{\"id\":";
-    jstr(o, s.id);
+    socketley::json::quote_into(o, s.id);
     o += ",\"bucket\":";
-    jstr(o, s.bucket);
+    socketley::json::quote_into(o, s.bucket);
     o += ",\"key\":";
-    jstr(o, s.key);
+    socketley::json::quote_into(o, s.key);
     o += s.folder ? ",\"folder\":true" : ",\"folder\":false";
     o += ",\"owner\":";
-    jstr(o, s.owner);
+    socketley::json::quote_into(o, s.owner);
     o += ",\"created\":" + std::to_string(s.created_ms) + ",\"expires\":" + std::to_string(s.expires_ms);
     o += ",\"salt\":";
-    jstr(o, s.pw_salt);
+    socketley::json::quote_into(o, s.pw_salt);
     o += ",\"hash\":";
-    jstr(o, s.pw_hash);
+    socketley::json::quote_into(o, s.pw_hash);
     o += ",\"max_downloads\":" + std::to_string(s.max_downloads) + ",\"downloads\":" + std::to_string(s.downloads);
     if (!s.by_node.empty())
     {
@@ -93,7 +90,7 @@ std::string share_json(const share_link& s)
         {
             o += first ? "" : ",";
             first = false;
-            jstr(o, node);
+            socketley::json::quote_into(o, node);
             o += ':';
             o += std::to_string(n);
         }
@@ -101,24 +98,16 @@ std::string share_json(const share_link& s)
     }
     o += s.upload ? ",\"upload\":true" : ",\"upload\":false";
     o += ",\"note\":";
-    jstr(o, s.note);
+    socketley::json::quote_into(o, s.note);
     if (s.burn)
         o += ",\"burn\":true,\"drained\":" + std::to_string(s.drained_ms);
     if (!s.notify.empty())
     {
         o += ",\"notify\":";
-        jstr(o, s.notify);
+        socketley::json::quote_into(o, s.notify);
     }
     o += "}";
     return o;
-}
-
-const jvalue* member(const jvalue& o, std::string_view n)
-{
-    for (const auto& [k, v] : o.members)
-        if (k == n)
-            return &v;
-    return nullptr;
 }
 
 std::string str_of(const jvalue& o, std::string_view n)
@@ -207,23 +196,23 @@ int64_t now_ms()
 std::string share_view_json(const share_link& s)
 {
     std::string o = "{\"id\":";
-    jstr(o, s.id);
+    socketley::json::quote_into(o, s.id);
     o += ",\"url\":";
-    jstr(o, "/~share/" + s.id + (s.folder ? "/" : ""));
+    socketley::json::quote_into(o, "/~share/" + s.id + (s.folder ? "/" : ""));
     o += ",\"bucket\":";
-    jstr(o, s.bucket);
+    socketley::json::quote_into(o, s.bucket);
     o += ",\"key\":";
-    jstr(o, s.key);
+    socketley::json::quote_into(o, s.key);
     o += s.folder ? ",\"folder\":true" : ",\"folder\":false";
     o += ",\"expires\":";
-    jstr(o, s.expires_ms ? iso8601(s.expires_ms) : std::string{});
+    socketley::json::quote_into(o, s.expires_ms ? iso8601(s.expires_ms) : std::string{});
     o += s.pw_hash.empty() ? ",\"password\":false" : ",\"password\":true";
     o += ",\"max_downloads\":" + std::to_string(s.max_downloads) + ",\"downloads\":" + std::to_string(s.downloads);
     o += s.upload ? ",\"upload\":true" : ",\"upload\":false";
     o += ",\"note\":";
-    jstr(o, s.note);
+    socketley::json::quote_into(o, s.note);
     o += ",\"owner\":";
-    jstr(o, s.owner);
+    socketley::json::quote_into(o, s.owner);
     o += s.burn ? ",\"burn\":true" : ",\"burn\":false";
     o += s.notify.empty() ? ",\"notify\":false" : ",\"notify\":true";
     o += "}";
@@ -562,7 +551,7 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
                 for (size_t i = 0; i < p.prefixes.size(); ++i)
                 {
                     o += i ? "," : "";
-                    jstr(o, p.prefixes[i].substr(prefix.size()));
+                    socketley::json::quote_into(o, p.prefixes[i].substr(prefix.size()));
                 }
                 o += "],\"files\":[";
                 bool first = true;
@@ -573,11 +562,11 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
                     o += first ? "{" : ",{";
                     first = false;
                     o += "\"name\":";
-                    jstr(o, e.key.substr(prefix.size()));
+                    socketley::json::quote_into(o, e.key.substr(prefix.size()));
                     o += ",\"size\":" + std::to_string(e.meta.size) + ",\"modified\":";
-                    jstr(o, iso8601(e.meta.mtime_ms));
+                    socketley::json::quote_into(o, iso8601(e.meta.mtime_ms));
                     o += ",\"type\":";
-                    jstr(o, e.meta.content_type.str());
+                    socketley::json::quote_into(o, e.meta.content_type.str());
                     o += "}";
                 }
                 o += upload ? "],\"upload\":true}" : "],\"upload\":false}";
@@ -1182,9 +1171,9 @@ void storage_run::share_tell(const std::string& url, std::string_view what, cons
             text += " That was the last: it is deleted in a few minutes.";
     }
     std::string body = "{\"content\":";
-    body += '"' + sp_detail::json_escape(text) + '"';
-    body += ",\"text\":\"" + sp_detail::json_escape(text) + "\",\"event\":\"" + std::string(what) + "\",\"bucket\":\"" +
-            sp_detail::json_escape(bucket) + "\",\"key\":\"" + sp_detail::json_escape(key) + "\",\"downloads\":" +
+    body += '"' + socketley::json::escape(text) + '"';
+    body += ",\"text\":\"" + socketley::json::escape(text) + "\",\"event\":\"" + std::string(what) + "\",\"bucket\":\"" +
+            socketley::json::escape(bucket) + "\",\"key\":\"" + socketley::json::escape(key) + "\",\"downloads\":" +
             std::to_string(downloads) + ",\"max_downloads\":" + std::to_string(max_downloads) + ",\"expires\":" +
             std::to_string(expires_ms) + "}";
     // Parsed before a slot is made for it, so a URL that is none leaves no empty hook behind for the sweep.

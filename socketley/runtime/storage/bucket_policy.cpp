@@ -1,6 +1,6 @@
 #include "bucket_policy.h"
 #include "../../shared/util/glob_match.h"
-#include "json_doc.h"
+#include "../../shared/json/json_doc.h"
 #include "s3_names.h"
 
 #include <arpa/inet.h>
@@ -12,6 +12,9 @@
 #include <cstring>
 #include <memory>
 #include <utility>
+
+using socketley::json::jvalue;
+using socketley::json::json_reader;
 
 namespace socketley::storage
 {

@@ -12,6 +12,7 @@
 #include "../shared/net/fast_lo.h"
 #include "daemon_handler.h"
 #include "../runtime/storage/storage_instance.h"
+#include "../shared/json/json_escape.h"
 
 #include <unistd.h>
 #include <cerrno>
@@ -342,37 +343,6 @@ void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)
     }
     if (!m_dash->handle(fd, req))
         dashboard::send(fd, 404, "text/plain; charset=utf-8", "Not Found\n");
-}
-
-// A control character has no literal spelling in a JSON string, and this
-// escaper passed every one but newline through raw -- reachable because
-// m_stat_detail is a registered type's own get_stats() text, which is whatever
-// the plugin author writes.
-static void json_escape_into(std::string& out, std::string_view s)
-{
-    for (char c : s)
-    {
-        switch (c)
-        {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            case '\b': out += "\\b";  break;
-            case '\f': out += "\\f";  break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20)
-                {
-                    char u[7];
-                    std::snprintf(u, sizeof(u), "\\u%04x",
-                                  static_cast<unsigned>(static_cast<unsigned char>(c)));
-                    out += u;
-                }
-                else
-                    out += c;
-        }
-    }
 }
 
 // The same three characters as json_escape_into was before it was fixed, and
@@ -1249,7 +1219,7 @@ std::string metrics_endpoint::build_json_runtimes() const
         first = false;
 
         j += "{\"name\":\"";
-        json_escape_into(j, s.name);
+        socketley::json::escape_into(j, s.name);
         j += "\",\"type\":\"";
         j += runtime_type_str(s.type);
         j += "\",\"state\":\"";
@@ -1287,7 +1257,7 @@ std::string metrics_endpoint::build_json_runtime(std::string_view name) const
     std::string j;
     j.reserve(512);
     j += "{\"name\":\"";
-    json_escape_into(j, name);
+    socketley::json::escape_into(j, name);
     j += "\",\"type\":\"";
     j += runtime_type_str(rt->get_type());
     j += "\",\"state\":\"";
@@ -1316,7 +1286,7 @@ std::string metrics_endpoint::build_json_runtime(std::string_view name) const
     if (!stats.empty())
     {
         j += ",\"stats\":\"";
-        json_escape_into(j, stats);
+        socketley::json::escape_into(j, stats);
         j += "\"";
     }
 

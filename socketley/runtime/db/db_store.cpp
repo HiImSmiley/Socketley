@@ -18,6 +18,7 @@
 #include "../../shared/crypto/jws.h"
 #include "../../shared/persist/mutation_journal.h"
 #include "../../shared/persist/replaced_file.h"
+#include "../../shared/json/json_escape.h"
 
 namespace socketley::db
 {
@@ -348,13 +349,13 @@ bool decode_record(std::string_view payload, std::vector<event>& out, std::vecto
 void write_doc(const std::string& id, const doc& d, std::string_view body_json, std::string& out)
 {
     out += "{\"_id\":";
-    write_string(id, out);
+    socketley::json::quote_into(out, id);
     out += ",\"_v\":";
     out += std::to_string(d.v);
     if (!d.owner.empty())
     {
         out += ",\"_owner\":";
-        write_string(d.owner, out);
+        socketley::json::quote_into(out, d.owner);
     }
     // The body's members follow, its own braces taken off.
     if (body_json.size() > 2)
@@ -1867,7 +1868,7 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
             m_staged.erase(key);
             results += results.size() > 1 ? "," : "";
             results += "{\"_id\":";
-            write_string(op.id, results);
+            socketley::json::quote_into(results, op.id);
             results += ",\"deleted\":true}";
             continue;
         }
@@ -1920,9 +1921,9 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
             nd.owner = who.sub;
         nd.v = old ? old->v + 1 : 1;
         nd.seq = seq;
-        if (depth_of(op.body) > socketley::storage::json_max_depth)
+        if (depth_of(op.body) > socketley::json::json_max_depth)
             return refuse(fail(400, "too_deep", "a document nests at most " +
-                                                    std::to_string(socketley::storage::json_max_depth) + " deep"));
+                                                    std::to_string(socketley::json::json_max_depth) + " deep"));
         std::string json = to_json(op.body);
         if (json.size() > max_doc)
             return refuse(fail(413, "too_large", "a document is at most 1 MiB; keep large things in a storage and "

@@ -14,13 +14,6 @@
 
 #include "../runtime/runtime_definitions.h"
 
-namespace sp_detail
-{
-// Quote-and-backslash escaping for a JSON string body, without the quotes;
-// shared because `ls --json` and `ps --json` also build documents by hand.
-std::string json_escape(std::string_view s);
-}
-
 struct runtime_config
 {
     std::string name;

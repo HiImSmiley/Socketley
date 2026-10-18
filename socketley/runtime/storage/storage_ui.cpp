@@ -21,7 +21,7 @@
 
 #include "compression.h"
 #include "digest.h"
-#include "json_doc.h"
+#include "../../shared/json/json_doc.h"
 #include "s3_iam.h"
 #include "s3_names.h"
 #include "s3_quota.h"
@@ -31,6 +31,7 @@
 #include "../../shared/http/http_framing.h"
 #include "../../shared/persist/state_persistence.h"
 #include "../../shared/persist/replaced_file.h"
+#include "../../shared/json/json_escape.h"
 
 namespace socketley::storage
 {
@@ -39,6 +40,9 @@ namespace
 {
 
 #include "storage_ui_page.inc"
+
+using socketley::json::jvalue;
+using socketley::json::json_reader;
 
 constexpr std::string_view cookie_name = "skl_ui";
 // How long a sign-in lasts: a browser's session, or a month when asked to stay.
@@ -68,33 +72,11 @@ std::string_view cookie_value(std::string_view header, std::string_view name)
     return {};
 }
 
-void jstr(std::string& o, std::string_view v)
-{
-    o += '"';
-    o += sp_detail::json_escape(v);
-    o += '"';
-}
-
-std::string json_quote(std::string_view v)
-{
-    std::string o;
-    jstr(o, v);
-    return o;
-}
-
 std::string num(double v)
 {
     char buf[32];
     std::snprintf(buf, sizeof buf, "%.3f", v);
     return buf;
-}
-
-const jvalue* member(const jvalue& o, std::string_view n)
-{
-    for (const auto& [k, v] : o.members)
-        if (k == n)
-            return &v;
-    return nullptr;
 }
 
 std::string str_of(const jvalue& o, std::string_view n)
@@ -149,11 +131,11 @@ std::string positions_json(const std::vector<position>& ps)
     {
         const position& p = ps[i];
         o += i ? ",{\"b\":" : "{\"b\":";
-        jstr(o, p.bucket);
+        socketley::json::quote_into(o, p.bucket);
         o += ",\"k\":";
-        jstr(o, p.key);
+        socketley::json::quote_into(o, p.key);
         o += ",\"e\":";
-        jstr(o, p.etag);
+        socketley::json::quote_into(o, p.etag);
         o += ",\"t\":" + num(p.t) + ",\"d\":" + num(p.d) + ",\"at\":" + std::to_string(p.at) + "}";
     }
     o += "]}";
@@ -168,7 +150,7 @@ void to_json(std::string& o, const jvalue& v)
         case jvalue::kind::null: o += "null"; return;
         case jvalue::kind::boolean: o += v.b ? "true" : "false"; return;
         case jvalue::kind::number: o += v.s; return;
-        case jvalue::kind::string: jstr(o, v.s); return;
+        case jvalue::kind::string: socketley::json::quote_into(o, v.s); return;
         case jvalue::kind::array:
             o += '[';
             for (size_t i = 0; i < v.items.size(); ++i)
@@ -183,7 +165,7 @@ void to_json(std::string& o, const jvalue& v)
             for (size_t i = 0; i < v.members.size(); ++i)
             {
                 o += i ? "," : "";
-                jstr(o, v.members[i].first);
+                socketley::json::quote_into(o, v.members[i].first);
                 o += ':';
                 to_json(o, v.members[i].second);
             }
@@ -204,21 +186,21 @@ constexpr std::string_view write_actions[] = {"s3:ListBucket", "s3:GetBucketLoca
 std::string ui_statement(std::string_view bucket, std::string_view user, bool write)
 {
     std::string o = "{\"Sid\":";
-    jstr(o, std::string(ui_sid) + (write ? "write:" : "read:") + std::string(user));
+    socketley::json::quote_into(o, std::string(ui_sid) + (write ? "write:" : "read:") + std::string(user));
     o += ",\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[";
-    jstr(o, "arn:aws:iam::000000000000:user/" + std::string(user));
+    socketley::json::quote_into(o, "arn:aws:iam::000000000000:user/" + std::string(user));
     o += "]},\"Action\":[";
     const std::string_view* acts = write ? write_actions : read_actions;
     const size_t n = write ? std::size(write_actions) : std::size(read_actions);
     for (size_t i = 0; i < n; ++i)
     {
         o += i ? "," : "";
-        jstr(o, acts[i]);
+        socketley::json::quote_into(o, acts[i]);
     }
     o += "],\"Resource\":[";
-    jstr(o, "arn:aws:s3:::" + std::string(bucket));
+    socketley::json::quote_into(o, "arn:aws:s3:::" + std::string(bucket));
     o += ',';
-    jstr(o, "arn:aws:s3:::" + std::string(bucket) + "/*");
+    socketley::json::quote_into(o, "arn:aws:s3:::" + std::string(bucket) + "/*");
     o += "]}";
     return o;
 }
@@ -289,13 +271,13 @@ inbox read_inbox(const std::string& path)
 std::string inbox_item_json(const inbox_item& it)
 {
     std::string o = "{\"seq\":" + std::to_string(it.seq) + ",\"at\":" + std::to_string(it.at) + ",\"kind\":";
-    jstr(o, it.kind);
+    socketley::json::quote_into(o, it.kind);
     o += ",\"title\":";
-    jstr(o, it.title);
+    socketley::json::quote_into(o, it.title);
     o += ",\"text\":";
-    jstr(o, it.text);
+    socketley::json::quote_into(o, it.text);
     o += ",\"link\":";
-    jstr(o, it.link);
+    socketley::json::quote_into(o, it.link);
     o += it.read ? ",\"read\":true}" : ",\"read\":false}";
     return o;
 }
@@ -306,7 +288,7 @@ std::string inbox_json(const inbox& b)
     for (size_t i = 0; i < b.off.size(); ++i)
     {
         o += i ? "," : "";
-        jstr(o, b.off[i]);
+        socketley::json::quote_into(o, b.off[i]);
     }
     o += "],\"items\":[";
     for (size_t i = 0; i < b.items.size(); ++i)
@@ -603,9 +585,9 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
         out.headers.emplace_back("Set-Cookie", std::move(cookie));
     }
     std::string o = "{\"user\":";
-    jstr(o, u ? std::string_view(u->id) : std::string_view{});
+    socketley::json::quote_into(o, u ? std::string_view(u->id) : std::string_view{});
     o += ",\"name\":";
-    jstr(o, u ? m_auth->display_name(u->id) : std::string{});
+    socketley::json::quote_into(o, u ? m_auth->display_name(u->id) : std::string{});
     o += u && u->admin ? ",\"admin\":true" : ",\"admin\":false";
     o += c->anonymous ? ",\"anonymous\":true" : ",\"anonymous\":false";
     // Signed in by the identity provider, which is where signing out happens, back to this interface.
@@ -613,7 +595,7 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
         if (const std::string_view host = r.header("host"); !host.empty() && host.find_first_of("\r\n\"\\") == std::string_view::npos)
         {
             o += ",\"idp_logout\":";
-            jstr(o, m_idp.logout_url(std::string(secure(*c) ? "https://" : "http://") + std::string(host) + "/~ui/"));
+            socketley::json::quote_into(o, m_idp.logout_url(std::string(secure(*c) ? "https://" : "http://") + std::string(host) + "/~ui/"));
         }
     // Whether the user has a password, and must set another before anything else, and whether this session is one.
     const int login = u ? m_auth->login_state(u->id) : -1;
@@ -707,9 +689,9 @@ void storage_run::ui_inbox(const std::shared_ptr<conn>& c)
     {
         o += first ? "{\"id\":" : ",{\"id\":";
         first = false;
-        jstr(o, id);
+        socketley::json::quote_into(o, id);
         o += ",\"label\":";
-        jstr(o, label);
+        socketley::json::quote_into(o, label);
         o += std::find(b.off.begin(), b.off.end(), id) == b.off.end() ? ",\"on\":true}" : ",\"on\":false}";
     }
     o += "],\"items\":[";
@@ -912,12 +894,12 @@ void storage_run::ui_progress(const std::shared_ptr<conn>& c)
             if (s == st::ok && m.etag() == p.etag)
             {
                 std::string o = "{\"bucket\":";
-                jstr(o, p.bucket);
+                socketley::json::quote_into(o, p.bucket);
                 o += ",\"key\":";
-                jstr(o, p.key);
+                socketley::json::quote_into(o, p.key);
                 o += ",\"t\":" + num(p.t) + ",\"d\":" + num(p.d) + ",\"at\":" + std::to_string(p.at) +
                      ",\"size\":" + std::to_string(m.size) + ",\"type\":";
-                jstr(o, m.content_type.str());
+                socketley::json::quote_into(o, m.content_type.str());
                 o += "}";
                 g->out[i] = std::move(o);
             }
@@ -1055,7 +1037,7 @@ void storage_run::ui_library(const std::shared_ptr<conn>& c)
         return;
     }
     std::string o = "{\"bucket\":";
-    jstr(o, bucket);
+    socketley::json::quote_into(o, bucket);
     o += makes_web_copies(bucket) ? ",\"web_copies\":true" : ",\"web_copies\":false";
     o += app_allowed(c, "PUT", bucket, {}, "tagging") ? ",\"may_change\":true}" : ",\"may_change\":false}";
     app_reply(c, 200, std::move(o), "application/json");
@@ -1128,9 +1110,9 @@ void storage_run::ui_access(const std::shared_ptr<conn>& c)
         return;
     }
     std::string o = "{\"bucket\":";
-    jstr(o, bucket);
+    socketley::json::quote_into(o, bucket);
     o += ",\"owner\":";
-    jstr(o, owner_of(bucket));
+    socketley::json::quote_into(o, owner_of(bucket));
     o += ",\"grants\":[";
     bool first = true;
     jvalue root;
@@ -1145,9 +1127,9 @@ void storage_run::ui_access(const std::shared_ptr<conn>& c)
                     return;
                 o += first ? "{\"user\":" : ",{\"user\":";
                 first = false;
-                jstr(o, sid.substr(colon + 1));
+                socketley::json::quote_into(o, sid.substr(colon + 1));
                 o += ",\"access\":";
-                jstr(o, sid.substr(ui_sid.size(), colon - ui_sid.size()));
+                socketley::json::quote_into(o, sid.substr(ui_sid.size(), colon - ui_sid.size()));
                 o += "}";
             };
             if (st->k == jvalue::kind::array)
@@ -1207,7 +1189,7 @@ void storage_run::ui_access_body(const std::shared_ptr<conn>& c)
                 if (k == "Version")
                     continue;
                 head += ",";
-                jstr(head, k);
+                socketley::json::quote_into(head, k);
                 head += ":";
                 to_json(head, v);
                 continue;
@@ -1340,9 +1322,9 @@ void storage_run::ui_search(const std::shared_ptr<conn>& c)
                         if (fold(name).find(h->q) != std::string::npos && h->seen.insert(folder).second && h->found < limit)
                         {
                             h->folders += h->folders.empty() ? "{\"bucket\":" : ",{\"bucket\":";
-                            jstr(h->folders, bucket);
+                            socketley::json::quote_into(h->folders, bucket);
                             h->folders += ",\"key\":";
-                            jstr(h->folders, e.key.substr(0, slash + 1));
+                            socketley::json::quote_into(h->folders, e.key.substr(0, slash + 1));
                             h->folders += ",\"dir\":true}";
                             ++h->found;
                         }
@@ -1352,12 +1334,12 @@ void storage_run::ui_search(const std::shared_ptr<conn>& c)
                     if (name.empty() || fold(name).find(h->q) == std::string::npos || !app_allowed(cc, "GET", bucket, e.key))
                         continue;
                     h->files += h->files.empty() ? "{\"bucket\":" : ",{\"bucket\":";
-                    jstr(h->files, bucket);
+                    socketley::json::quote_into(h->files, bucket);
                     h->files += ",\"key\":";
-                    jstr(h->files, e.key);
+                    socketley::json::quote_into(h->files, e.key);
                     h->files += ",\"size\":" + std::to_string(e.meta.size) + ",\"modified\":" + std::to_string(e.meta.mtime_ms) +
                                 ",\"type\":";
-                    jstr(h->files, e.meta.content_type.str());
+                    socketley::json::quote_into(h->files, e.meta.content_type.str());
                     h->files += "}";
                     ++h->found;
                 }
@@ -1447,7 +1429,7 @@ void storage_run::ui_usage(const std::shared_ptr<conn>& c)
         std::string o = "{\"admin\":";
         o += !u || u->admin ? "true" : "false";
         o += ",\"user\":";
-        jstr(o, u ? u->id : std::string{});
+        socketley::json::quote_into(o, u ? u->id : std::string{});
         o += ",\"user_max_bytes\":" + std::to_string(u ? m_auth->max_bytes_of(u->id) : 0) + ",\"libraries\":[";
         bool first = true;
         for (const bucket_info& b : t->buckets)
@@ -1456,9 +1438,9 @@ void storage_run::ui_usage(const std::shared_ptr<conn>& c)
             const std::string owner = b.owner.empty() ? std::string(default_owner) : b.owner;
             o += first ? "{\"bucket\":" : ",{\"bucket\":";
             first = false;
-            jstr(o, b.name);
+            socketley::json::quote_into(o, b.name);
             o += ",\"owner\":";
-            jstr(o, owner);
+            socketley::json::quote_into(o, owner);
             o += owner == me ? ",\"shared\":false" : ",\"shared\":true";
             o += ",\"bytes\":" + std::to_string(n.bytes) + ",\"objects\":" + std::to_string(n.objects);
             o += n.partial ? ",\"partial\":true" : ",\"partial\":false";
@@ -1559,11 +1541,11 @@ void storage_run::ui_taken(const std::shared_ptr<conn>& c)
             if (f.taken.empty() && !f.located)
                 return;
             g->out += g->out.empty() ? "{\"key\":" : ",{\"key\":";
-            jstr(g->out, key);
+            socketley::json::quote_into(g->out, key);
             if (!f.taken.empty())
             {
                 g->out += ",\"taken\":";
-                jstr(g->out, f.taken);
+                socketley::json::quote_into(g->out, f.taken);
             }
             if (f.located)
             {
@@ -1692,18 +1674,18 @@ void storage_run::ui_git(const std::shared_ptr<conn>& c)
                                                  : std::string("repositories are pulled by sync runtimes, and this "
                                                                "storage makes none: --sync is never");
     std::string o = "{\"available\":" + std::string(pulled ? "true" : "false") +
-                    ",\"why\":" + json_quote(why) +
+                    ",\"why\":" + socketley::json::quote(why) +
                     ",\"token\":" + (m_git.has_token(who) ? "true" : "false") +
-                    ",\"runtime\":" + json_quote(sync_runtime_for(who)) + ",\"repos\":[";
+                    ",\"runtime\":" + socketley::json::quote(sync_runtime_for(who)) + ",\"repos\":[";
     bool first = true;
     for (const git_mirrors::repo& g : m_git.repos())
     {
         if (g.owner != who && !c->user->admin)
             continue;
-        o += std::string(first ? "" : ",") + "{\"id\":" + json_quote(g.id) + ",\"owner\":" + json_quote(g.owner) +
-             ",\"url\":" + json_quote(g.url) + ",\"branch\":" + json_quote(g.branch) +
-             ",\"bucket\":" + json_quote(g.bucket) + ",\"name\":" + json_quote(g.name) +
-             ",\"private\":" + (g.private_repo ? "true" : "false") + ",\"every\":" + json_quote(g.every) +
+        o += std::string(first ? "" : ",") + "{\"id\":" + socketley::json::quote(g.id) + ",\"owner\":" + socketley::json::quote(g.owner) +
+             ",\"url\":" + socketley::json::quote(g.url) + ",\"branch\":" + socketley::json::quote(g.branch) +
+             ",\"bucket\":" + socketley::json::quote(g.bucket) + ",\"name\":" + socketley::json::quote(g.name) +
+             ",\"private\":" + (g.private_repo ? "true" : "false") + ",\"every\":" + socketley::json::quote(g.every) +
              ",\"running\":" + (m_git.running(g.id) ? "true" : "false") + ",\"state\":" + m_git.state_json(g.id) + "}";
         first = false;
     }
@@ -1797,9 +1779,9 @@ void storage_run::ui_users(const std::shared_ptr<conn>& c)
             continue;
         o += first ? "{\"id\":" : ",{\"id\":";
         first = false;
-        o += json_quote(u->id);
+        o += socketley::json::quote(u->id);
         o += ",\"name\":";
-        o += json_quote(u->display_name);
+        o += socketley::json::quote(u->display_name);
         if (admin)
         {
             const auto it = st.users.find(u->id);
@@ -1817,7 +1799,7 @@ void storage_run::ui_users(const std::shared_ptr<conn>& c)
             o += ",\"admin\":";
             o += u->admin ? "true" : "false";
             o += ",\"email\":";
-            o += json_quote(u->email);
+            o += socketley::json::quote(u->email);
             o += ",\"max_bytes\":" + std::to_string(u->max_bytes);
             o += ",\"file\":";
             o += file ? "true" : "false";
@@ -1837,7 +1819,7 @@ void storage_run::ui_users(const std::shared_ptr<conn>& c)
             {
                 if (i)
                     o += ',';
-                o += json_quote(iu->groups[i]);
+                o += socketley::json::quote(iu->groups[i]);
             }
             o += ']';
         }
@@ -1854,9 +1836,9 @@ void storage_run::ui_users(const std::shared_ptr<conn>& c)
                 continue;
             o += first ? "{\"id\":" : ",{\"id\":";
             first = false;
-            o += json_quote(id);
+            o += socketley::json::quote(id);
             o += ",\"by\":";
-            o += json_quote(i.by);
+            o += socketley::json::quote(i.by);
             o += ",\"created\":" + std::to_string(i.created_ms) + ",\"expires\":" + std::to_string(i.expires_ms);
             o += ",\"admin\":";
             o += i.admin ? "true" : "false";
@@ -2011,8 +1993,8 @@ void storage_run::ui_git_body(const std::shared_ptr<conn>& c)
         // The first run now rather than at the next hour it is due.
         const std::string why = m_git.run_now(g.id);
         arm_sweep();
-        app_reply(c, 200, "{\"id\":" + json_quote(g.id) + ",\"started\":" + (why.empty() ? "true" : "false") +
-                              ",\"why\":" + json_quote(why) + "}",
+        app_reply(c, 200, "{\"id\":" + socketley::json::quote(g.id) + ",\"started\":" + (why.empty() ? "true" : "false") +
+                              ",\"why\":" + socketley::json::quote(why) + "}",
                   "application/json");
         return;
     }

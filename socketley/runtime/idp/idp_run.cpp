@@ -28,6 +28,7 @@
 #include "../storage/checksum.h"
 #include "../storage/password_hash.h"
 #include "../storage/scrypt.h"
+#include "../../shared/json/json_escape.h"
 
 namespace socketley::idp
 {
@@ -186,7 +187,7 @@ bool idp_run::start(std::string& why)
     m_shard = m_owner.get_shard_index();
     m_reader = m_shards > 1 && m_shard > 0;
     m_issuer = m_owner.issuer();
-    m_issuer_json = json_string(m_issuer);
+    m_issuer_json = socketley::json::quote(m_issuer);
     m_cookie_domain = std::string(m_owner.get_cookie_domain());
     m_secure_cookie = m_issuer.starts_with("https://");
 
@@ -205,7 +206,7 @@ bool idp_run::start(std::string& why)
         return false;
     }
     const std::string pub = socketley::jws::jwk_of(m_key);
-    m_jwk = pub.substr(0, pub.size() - 1) + ",\"kid\":" + json_string(m_kid) + ",\"use\":\"sig\",\"alg\":\"ES256\"}";
+    m_jwk = pub.substr(0, pub.size() - 1) + ",\"kid\":" + socketley::json::quote(m_kid) + ",\"use\":\"sig\",\"alg\":\"ES256\"}";
     // The public half where a proxy of this daemon reads it, written whole so a reader never sees half of it, by
     // shard 0 alone, since every shard holds the same key.
     if (!m_reader)
@@ -213,7 +214,7 @@ bool idp_run::start(std::string& why)
         const std::string path = idp_jwks_path(m_owner.get_name());
         const std::string tmp = path + ".new";
         std::ofstream f(tmp, std::ios::trunc);
-        f << "{\"issuer\":" << json_string(m_issuer) << ",\"keys\":[" << m_jwk << "]}\n";
+        f << "{\"issuer\":" << socketley::json::quote(m_issuer) << ",\"keys\":[" << m_jwk << "]}\n";
         f.close();
         if (!f || ::rename(tmp.c_str(), path.c_str()) != 0)
         {
@@ -684,7 +685,7 @@ void idp_run::json_error(const std::shared_ptr<conn>& c, int status, std::string
                          std::string_view description, std::string_view extra_headers)
 {
     respond(c, status, "application/json",
-            "{\"error\":" + json_string(error) + ",\"error_description\":" + json_string(description) + "}",
+            "{\"error\":" + socketley::json::quote(error) + ",\"error_description\":" + socketley::json::quote(description) + "}",
             "Access-Control-Allow-Origin: *\r\n" + std::string(extra_headers));
 }
 
@@ -744,10 +745,10 @@ void idp_run::discovery(const std::shared_ptr<conn>& c)
 {
     const std::string& i = m_issuer;
     respond(c, 200, "application/json",
-            "{\"issuer\":" + json_string(i) + ",\"authorization_endpoint\":" + json_string(i + "/authorize") +
-                ",\"token_endpoint\":" + json_string(i + "/token") + ",\"userinfo_endpoint\":" +
-                json_string(i + "/userinfo") + ",\"jwks_uri\":" + json_string(i + "/jwks") +
-                ",\"end_session_endpoint\":" + json_string(i + "/logout") +
+            "{\"issuer\":" + socketley::json::quote(i) + ",\"authorization_endpoint\":" + socketley::json::quote(i + "/authorize") +
+                ",\"token_endpoint\":" + socketley::json::quote(i + "/token") + ",\"userinfo_endpoint\":" +
+                socketley::json::quote(i + "/userinfo") + ",\"jwks_uri\":" + socketley::json::quote(i + "/jwks") +
+                ",\"end_session_endpoint\":" + socketley::json::quote(i + "/logout") +
                 ",\"response_types_supported\":[\"code\"],\"grant_types_supported\":[\"authorization_code\","
                 "\"refresh_token\"],\"subject_types_supported\":[\"public\"],\"id_token_signing_alg_values_supported\":"
                 "[\"ES256\"],\"scopes_supported\":[\"openid\",\"profile\",\"email\",\"offline_access\"],"
@@ -843,8 +844,8 @@ std::string idp_run::session_cookie(const account& who, bool remember) const
     const int64_t life = remember ? remember_secs : session_secs;
     // What a proxy or a storage verifying the cookie on its own needs: the id, the username and the admin bit.
     const std::string body = "\"iss\":" + m_issuer_json + ",\"aud\":\"session\",\"sub\":" +
-                             json_string(who.id) + ",\"preferred_username\":" + json_string(who.username()) +
-                             ",\"email\":" + json_string(who.field("email")) + ",\"admin\":" +
+                             socketley::json::quote(who.id) + ",\"preferred_username\":" + socketley::json::quote(who.username()) +
+                             ",\"email\":" + socketley::json::quote(who.field("email")) + ",\"admin\":" +
                              (who.in_group("admins") ? "true" : "false") + ",\"iat\":" + std::to_string(now) +
                              ",\"iat_ms\":" + std::to_string(now_ms()) +
                              ",\"auth_time\":" + std::to_string(now) + ",\"exp\":" + std::to_string(now + life);
@@ -872,11 +873,11 @@ bool idp_run::still_signed_in(const account& who, int64_t issued)
 std::string idp_run::profile_claims(const account& who) const
 {
     const std::string_view name = who.field("name").empty() ? who.username() : who.field("name");
-    std::string out = ",\"name\":" + json_string(name) + ",\"preferred_username\":" + json_string(who.username());
+    std::string out = ",\"name\":" + socketley::json::quote(name) + ",\"preferred_username\":" + socketley::json::quote(who.username());
     if (const std::string_view e = who.field("email"); !e.empty())
-        out += ",\"email\":" + json_string(e);
+        out += ",\"email\":" + socketley::json::quote(e);
     if (const std::string_view p = who.field("picture"); !p.empty())
-        out += ",\"picture\":" + json_string(p);
+        out += ",\"picture\":" + socketley::json::quote(p);
     std::string groups;
     std::string_view g = who.field("groups");
     while (!g.empty())
@@ -888,7 +889,7 @@ std::string idp_run::profile_claims(const account& who) const
             continue;
         if (!groups.empty())
             groups += ',';
-        groups += json_string(one);
+        groups += socketley::json::quote(one);
     }
     if (!groups.empty())
         out += ",\"groups\":[" + groups + "]";
@@ -1226,12 +1227,12 @@ void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, con
     const int64_t now = now_sec();
     const std::string jti = random_token();
     const std::string profile = profile_claims(who);
-    const std::string aud = json_string(cl.id);
-    const std::string scope = json_string(e.scope);
+    const std::string aud = socketley::json::quote(cl.id);
+    const std::string scope = socketley::json::quote(e.scope);
     const std::string exp = std::to_string(now + token_secs);
     std::string common;
     common.reserve(256);
-    common.append("\"iss\":").append(m_issuer_json).append(",\"sub\":").append(json_string(who.id));
+    common.append("\"iss\":").append(m_issuer_json).append(",\"sub\":").append(socketley::json::quote(who.id));
     common.append(",\"iat\":").append(std::to_string(now)).append(",\"iat_ms\":").append(std::to_string(now_ms()));
     common.append(",\"auth_time\":").append(std::to_string(e.auth_time));
     // Each token's claims made in the one string, the common ones first.
@@ -1239,7 +1240,7 @@ void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, con
     claims.reserve(common.size() + profile.size() + 256);
     claims.assign(common).append(",\"aud\":").append(aud).append(",\"exp\":").append(exp);
     if (!e.nonce.empty())
-        claims.append(",\"nonce\":").append(json_string(e.nonce));
+        claims.append(",\"nonce\":").append(socketley::json::quote(e.nonce));
     claims.append(profile);
     const std::string id_token = sign_token(m_key, m_kid, "JWT", claims);
     claims.assign(common).append(",\"aud\":").append(aud).append(",\"client_id\":").append(aud);
@@ -1423,7 +1424,7 @@ void idp_run::userinfo(const std::shared_ptr<conn>& c, const request& rq)
         return;
     }
     ++m_c.userinfo;
-    respond(c, 200, "application/json", "{\"sub\":" + json_string(who->id) + profile_claims(*who) + "}",
+    respond(c, 200, "application/json", "{\"sub\":" + socketley::json::quote(who->id) + profile_claims(*who) + "}",
             "Access-Control-Allow-Origin: *\r\n");
 }
 

@@ -89,6 +89,7 @@ static std::string names_refusal(runtime_manager& manager, const runtime_instanc
 #include <poll.h>
 #include <csignal>
 #include "../shared/util/logging.h"
+#include "../shared/json/json_escape.h"
 
 // Two seconds is the backstop for a worker that has wedged, not a budget the
 // normal path spends -- a child reports in 17-22 ms -- and it is one budget
@@ -2347,19 +2348,19 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             // operator strings -- and where a runtime with no port listens,
             // empty for every other runtime.
             const std::string_view listen_path = instance->get_listen_path();
-            out << "{\"id\":\"" << sp_detail::json_escape(instance->get_id())
-                << "\",\"name\":\"" << sp_detail::json_escape(name)
+            out << "{\"id\":\"" << socketley::json::escape(instance->get_id())
+                << "\",\"name\":\"" << socketley::json::escape(name)
                 << "\",\"type\":\"" << type_to_string(instance->get_type())
                 << "\",\"port\":" << port
                 << ",\"listen\":\""
                 << (listen_path.empty() ? std::string()
-                                        : "unix:" + sp_detail::json_escape(listen_path))
-                << "\",\"bind\":\"" << sp_detail::json_escape(instance->get_bind_address())
+                                        : "unix:" + socketley::json::escape(listen_path))
+                << "\",\"bind\":\"" << socketley::json::escape(instance->get_bind_address())
                 << "\",\"status\":\"" << state_str
                 << "\",\"restarts\":" << instance->restart_count()
                 << ",\"connections\":" << instance->reported_connection_count()
-                << ",\"owner\":\"" << sp_detail::json_escape(owner)
-                << "\",\"group\":\"" << sp_detail::json_escape(group)
+                << ",\"owner\":\"" << socketley::json::escape(owner)
+                << "\",\"group\":\"" << socketley::json::escape(group)
                 << "\",\"cluster\":" << (instance->is_cluster_owned() ? "true" : "false")
                 << "}";
         }
@@ -2566,21 +2567,21 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             // under -a a literal would be a row for a failed runtime claiming
             // to be up.
             const std::string_view listen_path = instance->get_listen_path();
-            out << "{\"id\":\"" << sp_detail::json_escape(instance->get_id())
-                << "\",\"name\":\"" << sp_detail::json_escape(name)
+            out << "{\"id\":\"" << socketley::json::escape(instance->get_id())
+                << "\",\"name\":\"" << socketley::json::escape(name)
                 << "\",\"type\":\"" << type_to_string(instance->get_type())
                 << "\",\"port\":" << port
                 << ",\"listen\":\""
                 << (listen_path.empty() ? std::string()
-                                        : "unix:" + sp_detail::json_escape(listen_path))
-                << "\",\"bind\":\"" << sp_detail::json_escape(instance->get_bind_address())
+                                        : "unix:" + socketley::json::escape(listen_path))
+                << "\",\"bind\":\"" << socketley::json::escape(instance->get_bind_address())
                 << "\",\"status\":\"" << state_json(instance->get_state())
                 << "\",\"uptime\":\""
                 << (running ? format_uptime(instance->get_start_time()) : std::string())
                 << "\",\"restarts\":" << instance->restart_count()
                 << ",\"connections\":" << instance->reported_connection_count()
-                << ",\"owner\":\"" << sp_detail::json_escape(owner)
-                << "\",\"group\":\"" << sp_detail::json_escape(group)
+                << ",\"owner\":\"" << socketley::json::escape(owner)
+                << "\",\"group\":\"" << socketley::json::escape(group)
                 << "\",\"cluster\":" << (instance->is_cluster_owned() ? "true" : "false")
                 << "}";
         }
@@ -2947,7 +2948,7 @@ int daemon_handler::cmd_db_backup(ipc_connection* conn, const parsed_args& pa)
             return 1;
         }
         std::string quoted;
-        socketley::db::write_string(pa.args[2], quoted);
+        socketley::json::quote_into(quoted, pa.args[2]);
         payload += "{\"backup\":" + quoted + "}";
     }
     std::string reply;

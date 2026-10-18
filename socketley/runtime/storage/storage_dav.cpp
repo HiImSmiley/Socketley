@@ -15,6 +15,7 @@
 #include "sse.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/persist/state_persistence.h"
+#include "../../shared/json/json_escape.h"
 
 namespace socketley::storage
 {
@@ -885,7 +886,7 @@ void storage_run::dav_list(const std::shared_ptr<conn>& c, std::string bucket, s
         for (const std::string& sub : p.prefixes)
         {
             x += first ? "\"" : ",\"";
-            x += sp_detail::json_escape(last_name(sub));
+            x += socketley::json::escape(last_name(sub));
             x += '"';
             first = false;
         }
@@ -896,13 +897,13 @@ void storage_run::dav_list(const std::shared_ptr<conn>& c, std::string bucket, s
             if (e.key == prefix)
                 continue;
             x += first ? "[\"" : ",[\"";
-            x += sp_detail::json_escape(last_name(e.key));
+            x += socketley::json::escape(last_name(e.key));
             x += "\",";
             x += std::to_string(e.meta.size);
             x += ',';
             x += std::to_string(e.meta.mtime_ms);
             x += ",\"";
-            x += sp_detail::json_escape(e.meta.content_type.empty() ? std::string_view("application/octet-stream")
+            x += socketley::json::escape(e.meta.content_type.empty() ? std::string_view("application/octet-stream")
                                                          : std::string_view(e.meta.content_type.str()));
             x += "\"]";
             first = false;
@@ -1457,7 +1458,7 @@ void storage_run::dav_trash(const std::shared_ptr<conn>& c, std::string bucket, 
                     {
                         raw->out += raw->first ? "{" : ",{";
                         raw->first = false;
-                        raw->out += "\"key\":\"" + sp_detail::json_escape(it.key) + "\",\"deleted\":\"" +
+                        raw->out += "\"key\":\"" + socketley::json::escape(it.key) + "\",\"deleted\":\"" +
                                     iso8601(it.meta.mtime_ms) + "\"";
                     }
                     continue;

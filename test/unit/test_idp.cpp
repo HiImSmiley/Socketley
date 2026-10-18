@@ -11,6 +11,7 @@
 
 #include "runtime/idp/idp_logic.h"
 #include "shared/crypto/jws.h"
+#include "shared/json/json_escape.h"
 
 using namespace socketley::idp;
 
@@ -62,7 +63,7 @@ TEST_CASE("a form is decoded, and a pair that does not decode is left out")
     CHECK(param(p, "d").empty());
     CHECK(url_encode("a b/c?d=é") == "a%20b%2Fc%3Fd%3D%C3%A9");
     CHECK(html_escape("<a href=\"x\">'&") == "&lt;a href=&quot;x&quot;&gt;&#39;&amp;");
-    CHECK(json_string("a\"b\\c\n") == "\"a\\\"b\\\\c\\u000a\"");
+    CHECK(socketley::json::quote("a\"b\\c\n") == "\"a\\\"b\\\\c\\n\"");
 }
 
 TEST_CASE("PKCE S256 matches RFC 7636's own example and nothing else")
@@ -508,12 +509,12 @@ TEST_CASE("a token signed under one secret, then another, verifies under its own
 
 TEST_CASE("a JSON string escapes quotes, backslashes and control characters, and keeps the rest as it is")
 {
-    CHECK(json_string("") == "\"\"");
-    CHECK(json_string("plain") == "\"plain\"");
-    CHECK(json_string("a\"b\\c") == "\"a\\\"b\\\\c\"");
-    CHECK(json_string(std::string_view("x\ny\x01", 4)) == "\"x\\u000ay\\u0001\"");
-    CHECK(json_string("\"") == "\"\\\"\"");
-    CHECK(json_string("ünï") == "\"ünï\"");
+    CHECK(socketley::json::quote("") == "\"\"");
+    CHECK(socketley::json::quote("plain") == "\"plain\"");
+    CHECK(socketley::json::quote("a\"b\\c") == "\"a\\\"b\\\\c\"");
+    CHECK(socketley::json::quote(std::string_view("x\ny\x01", 4)) == "\"x\\ny\\u0001\"");
+    CHECK(socketley::json::quote("\"") == "\"\\\"\"");
+    CHECK(socketley::json::quote("ünï") == "\"ünï\"");
     CHECK(socketley::jws::b64url("") == "");
     CHECK(socketley::jws::b64url("f") == "Zg");
     CHECK(socketley::jws::b64url("fo") == "Zm8");

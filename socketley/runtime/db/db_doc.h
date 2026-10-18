@@ -5,21 +5,20 @@
 #include <string>
 #include <string_view>
 
-#include "../storage/json_doc.h"
+#include "../../shared/json/json_doc.h"
 
 namespace socketley::db
 {
 
-using socketley::storage::jvalue;
-using socketley::storage::json_reader;
+using socketley::json::jvalue;
+using socketley::json::json_reader;
+using socketley::json::member;
 
 // A path is at most this many names deep, each 1 to 64 of A-Z a-z 0-9 _ -.
 inline constexpr size_t max_path_depth = 8;
 
 // `v` as JSON, appended to `out`; a number is written as it was read.
 void write_json(const jvalue& v, std::string& out);
-// `s` as a JSON string, quoted and escaped.
-void write_string(std::string_view s, std::string& out);
 std::string to_json(const jvalue& v);
 
 // Whether `path` is names joined by dots that a document may hold.
@@ -32,9 +31,6 @@ jvalue* make_path(jvalue& doc, std::string_view path, std::string& why);
 // The member at `path` taken out; false when it was not there.
 bool erase_path(jvalue& doc, std::string_view path);
 
-// The member named `name` of an object, null when it has none.
-const jvalue* member(const jvalue& obj, std::string_view name);
-jvalue* member(jvalue& obj, std::string_view name);
 
 // Two values the same: numbers by their value, objects member for member in any order.
 bool same(const jvalue& a, const jvalue& b);

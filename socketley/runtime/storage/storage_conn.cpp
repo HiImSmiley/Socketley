@@ -1,7 +1,7 @@
 // The wire side of a storage run: accepting, reading, writing, HTTP framing,
 // the streaming of a body into an object and of an object out to a socket.
 #include "storage_run.h"
-#include "json_doc.h"
+#include "../../shared/json/json_doc.h"
 #include "../../shared/storage/git_names.h"
 
 #include <algorithm>
@@ -29,6 +29,10 @@
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/persist/state_persistence.h"
 #include "../../shared/net/unix_listener.h"
+#include "../../shared/json/json_escape.h"
+
+using socketley::json::jvalue;
+using socketley::json::json_reader;
 
 namespace socketley::storage
 {
@@ -2776,11 +2780,6 @@ namespace socketley::storage
 namespace
 {
 
-std::string json_quote(std::string_view v)
-{
-    return "\"" + sp_detail::json_escape(v) + "\"";
-}
-
 }   // namespace
 
 std::string storage_run::sync_runner_name(std::string_view user) const
@@ -2865,19 +2864,19 @@ void storage_run::tend_sync_runners()
     auto credentials_of = [&](const std::string& user, int64_t& expires) -> std::string
     {
         session_credentials creds;
-        std::string o = "\"user\":" + json_quote(user);
+        std::string o = "\"user\":" + socketley::json::quote(user);
         if (m_auth->issue_session_as(user, now + 12 * 3600, "", "", creds))
         {
-            o += ",\"access_key\":" + json_quote(creds.access_key) + ",\"secret\":" + json_quote(creds.secret) +
-                 ",\"session_token\":" + json_quote(creds.token) + ",\"expires\":" + std::to_string(creds.expires) +
-                 ",\"github_token\":" + json_quote(m_git.token_of(*m_auth, user));
+            o += ",\"access_key\":" + socketley::json::quote(creds.access_key) + ",\"secret\":" + socketley::json::quote(creds.secret) +
+                 ",\"session_token\":" + socketley::json::quote(creds.token) + ",\"expires\":" + std::to_string(creds.expires) +
+                 ",\"github_token\":" + socketley::json::quote(m_git.token_of(*m_auth, user));
             expires = creds.expires;
         }
         return o;
     };
-    const std::string where = "\"dir\":" + json_quote(m_store.options().dir) + ",\"endpoint\":" +
-                              json_quote(m_git_endpoint) + ",\"tls\":" + (m_tls ? "true" : "false") +
-                              ",\"ca\":" + json_quote(std::string(m_owner.get_cert_path()));
+    const std::string where = "\"dir\":" + socketley::json::quote(m_store.options().dir) + ",\"endpoint\":" +
+                              socketley::json::quote(m_git_endpoint) + ",\"tls\":" + (m_tls ? "true" : "false") +
+                              ",\"ca\":" + socketley::json::quote(std::string(m_owner.get_cert_path()));
     // What a file last said: when its first credentials run out, and -- for active's -- whose they are.
     auto read_back = [](const std::string& file, int64_t& expires, std::string& users)
     {
@@ -2922,7 +2921,7 @@ void storage_run::tend_sync_runners()
                     if (e)
                         earliest = std::min(earliest, e);
                 }
-                o = "{" + where + ",\"users\":[" + list + "],\"people\":" + json_quote(people_key) +
+                o = "{" + where + ",\"users\":[" + list + "],\"people\":" + socketley::json::quote(people_key) +
                     ",\"expires\":" + std::to_string(earliest == INT64_MAX ? 0 : earliest) + "}\n";
             }
             else

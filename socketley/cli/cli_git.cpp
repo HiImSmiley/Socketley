@@ -45,6 +45,7 @@
 #include "../shared/http/http_framing.h"
 #include "../shared/storage/s3_sigv4.h"
 #include "../shared/storage/git_names.h"
+#include "../shared/json/json_escape.h"
 
 extern char** environ;
 
@@ -472,25 +473,6 @@ struct options
     bool tls{false};
     int keep_days{14}, keep_weeks{8}, keep_months{12};
 };
-
-std::string json_str(std::string_view v)
-{
-    std::string o = "\"";
-    for (unsigned char c : v)
-    {
-        if (c == '"' || c == '\\')
-            o += '\\', o += static_cast<char>(c);
-        else if (c < 0x20)
-        {
-            char b[8];
-            std::snprintf(b, sizeof b, "\\u%04x", c);
-            o += b;
-        }
-        else
-            o += static_cast<char>(c);
-    }
-    return o + "\"";
-}
 
 class run
 {
@@ -923,8 +905,8 @@ private:
         }
         std::ofstream s(m_o.work + "/state.json.tmp");
         s << "{\"ok\":" << (ok ? "true" : "false") << ",\"at\":" << std::time(nullptr)
-          << ",\"commit\":" << json_str(m_commit) << ",\"changed\":" << (m_changed ? "true" : "false")
-          << ",\"files\":" << m_files << ",\"backup\":" << json_str(m_backup) << ",\"error\":" << json_str(m_error)
+          << ",\"commit\":" << socketley::json::quote(m_commit) << ",\"changed\":" << (m_changed ? "true" : "false")
+          << ",\"files\":" << m_files << ",\"backup\":" << socketley::json::quote(m_backup) << ",\"error\":" << socketley::json::quote(m_error)
           << "}\n";
         s.close();
         std::error_code ec;

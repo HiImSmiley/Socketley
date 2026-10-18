@@ -8,7 +8,7 @@
 
 #include "../../shared/util/logging.h"
 #include "../../shared/persist/replaced_file.h"
-#include "../storage/json_doc.h"
+#include "../../shared/json/json_doc.h"
 
 namespace socketley::sync
 {
@@ -16,7 +16,7 @@ namespace socketley::sync
 namespace
 {
 
-std::string text_of(const socketley::storage::jvalue& o, std::string_view n)
+std::string text_of(const socketley::json::jvalue& o, std::string_view n)
 {
     for (const auto& [k, v] : o.members)
         if (k == n)
@@ -24,11 +24,11 @@ std::string text_of(const socketley::storage::jvalue& o, std::string_view n)
     return {};
 }
 
-bool flag_of(const socketley::storage::jvalue& o, std::string_view n)
+bool flag_of(const socketley::json::jvalue& o, std::string_view n)
 {
     for (const auto& [k, v] : o.members)
         if (k == n)
-            return v.k == socketley::storage::jvalue::kind::boolean && v.b;
+            return v.k == socketley::json::jvalue::kind::boolean && v.b;
     return false;
 }
 
@@ -49,8 +49,8 @@ bool repo_runner::reload(std::string& why)
     if (stamp == m_stamp)
         return true;
     std::string text;
-    socketley::storage::jvalue doc;
-    if (!read_whole_file(path, text) || !socketley::storage::json_reader(text).document(doc))
+    socketley::json::jvalue doc;
+    if (!read_whole_file(path, text) || !socketley::json::json_reader(text).document(doc))
     {
         why = path + " cannot be read";
         return false;
@@ -58,7 +58,7 @@ bool repo_runner::reload(std::string& why)
     const std::string dir = text_of(doc, "dir"), endpoint = text_of(doc, "endpoint"), ca = text_of(doc, "ca");
     const bool tls = flag_of(doc, "tls");
     // One user's file names them at the top; active's lists every user under "users".
-    std::vector<const socketley::storage::jvalue*> users;
+    std::vector<const socketley::json::jvalue*> users;
     for (const auto& [k, v] : doc.members)
         if (k == "users")
             for (const auto& u : v.items)

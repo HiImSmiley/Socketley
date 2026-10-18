@@ -1,14 +1,15 @@
 #pragma once
 // A JSON document read strictly: the shortest UTF-8 forms only, no member named twice and a bounded depth, so a
-// document is read here as whoever wrote it meant.  The bucket policy and a POST form's policy are read with it.
+// document is read here as whoever wrote it meant: a bucket policy, a db document, a provider's account snapshot.
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-namespace socketley::storage
+namespace socketley::json
 {
 
 // A policy nests four deep, so anything far past that is not one.
@@ -337,4 +338,38 @@ private:
     size_t m_pos{0};
 };
 
-}   // namespace socketley::storage
+// The value of an object's member `name`, null when it has none or is no object; the reader admits no second.
+inline const jvalue* member(const jvalue& obj, std::string_view name)
+{
+    if (obj.k != jvalue::kind::object)
+        return nullptr;
+    for (const auto& [k, m] : obj.members)
+        if (k == name)
+            return &m;
+    return nullptr;
+}
+
+inline jvalue* member(jvalue& obj, std::string_view name)
+{
+    return const_cast<jvalue*>(member(static_cast<const jvalue&>(obj), name));
+}
+
+// A string member's text, empty when it is missing or no string.
+inline std::string_view string_of(const jvalue& obj, std::string_view name)
+{
+    const jvalue* v = member(obj, name);
+    return v && v->k == jvalue::kind::string ? std::string_view(v->s) : std::string_view{};
+}
+
+// A number member as a whole number, `otherwise` when it is missing, no number or not whole.
+inline int64_t int_of(const jvalue& obj, std::string_view name, int64_t otherwise = 0)
+{
+    const jvalue* v = member(obj, name);
+    int64_t n = 0;
+    if (!v || v->k != jvalue::kind::number)
+        return otherwise;
+    const auto [end, ec] = std::from_chars(v->s.data(), v->s.data() + v->s.size(), n);
+    return ec == std::errc{} && end == v->s.data() + v->s.size() ? n : otherwise;
+}
+
+}   // namespace socketley::json

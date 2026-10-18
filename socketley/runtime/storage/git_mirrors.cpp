@@ -20,10 +20,14 @@
 #include <sstream>
 
 #include "digest.h"
-#include "json_doc.h"
+#include "../../shared/json/json_doc.h"
 #include "s3_auth.h"
 #include "../../shared/storage/git_names.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/json/json_escape.h"
+
+using socketley::json::jvalue;
+using socketley::json::json_reader;
 
 extern char** environ;
 
@@ -33,43 +37,10 @@ namespace socketley::storage
 namespace
 {
 
-std::string json_str(std::string_view v)
-{
-    std::string o = "\"";
-    for (unsigned char c : v)
-    {
-        if (c == '"' || c == '\\')
-            o += '\\', o += static_cast<char>(c);
-        else if (c < 0x20)
-        {
-            char b[8];
-            std::snprintf(b, sizeof b, "\\u%04x", c);
-            o += b;
-        }
-        else
-            o += static_cast<char>(c);
-    }
-    return o + "\"";
-}
-
-const jvalue* field(const jvalue& o, std::string_view n)
-{
-    for (const auto& [k, v] : o.members)
-        if (k == n)
-            return &v;
-    return nullptr;
-}
-
 std::string text_of(const jvalue& o, std::string_view n)
 {
-    const jvalue* v = field(o, n);
+    const jvalue* v = member(o, n);
     return v && v->k == jvalue::kind::string ? v->s : std::string{};
-}
-
-int64_t int_of(const jvalue& o, std::string_view n, int64_t dflt)
-{
-    const jvalue* v = field(o, n);
-    return v && v->k == jvalue::kind::number ? std::strtoll(v->s.c_str(), nullptr, 10) : dflt;
 }
 
 bool read_file(const std::string& path, std::string& out)
@@ -140,7 +111,7 @@ std::vector<git_mirrors::repo> parse(const std::string& text)
     jvalue doc;
     if (!json_reader(text).document(doc))
         return out;
-    const jvalue* list = field(doc, "repos");
+    const jvalue* list = member(doc, "repos");
     if (!list || list->k != jvalue::kind::array)
         return out;
     for (const jvalue& i : list->items)
@@ -152,12 +123,12 @@ std::vector<git_mirrors::repo> parse(const std::string& text)
         r.branch = text_of(i, "branch");
         r.bucket = text_of(i, "bucket");
         r.name = text_of(i, "name");
-        const jvalue* p = field(i, "private");
+        const jvalue* p = member(i, "private");
         r.private_repo = p && p->k == jvalue::kind::boolean && p->b;
         r.every = text_of(i, "every");
         if (!git_mirrors::valid_every(r.every))
             r.every = "never";
-        r.added = int_of(i, "added", 0);
+        r.added = socketley::json::int_of(i, "added", 0);
         if (!r.id.empty() && !r.url.empty())
             out.push_back(std::move(r));
     }
@@ -251,10 +222,10 @@ bool git_mirrors::save(const std::vector<repo>& rs)
     for (size_t i = 0; i < rs.size(); ++i)
     {
         const repo& r = rs[i];
-        o += (i ? ",\n" : "\n") + std::string("{\"id\":") + json_str(r.id) + ",\"owner\":" + json_str(r.owner) +
-             ",\"url\":" + json_str(r.url) + ",\"branch\":" + json_str(r.branch) + ",\"bucket\":" + json_str(r.bucket) +
-             ",\"name\":" + json_str(r.name) + ",\"private\":" + (r.private_repo ? "true" : "false") +
-             ",\"every\":" + json_str(r.every) + ",\"added\":" + std::to_string(r.added) + "}";
+        o += (i ? ",\n" : "\n") + std::string("{\"id\":") + socketley::json::quote(r.id) + ",\"owner\":" + socketley::json::quote(r.owner) +
+             ",\"url\":" + socketley::json::quote(r.url) + ",\"branch\":" + socketley::json::quote(r.branch) + ",\"bucket\":" + socketley::json::quote(r.bucket) +
+             ",\"name\":" + socketley::json::quote(r.name) + ",\"private\":" + (r.private_repo ? "true" : "false") +
+             ",\"every\":" + socketley::json::quote(r.every) + ",\"added\":" + std::to_string(r.added) + "}";
     }
     o += "\n]}\n";
     const bool ok = write_file(m_dir + "/.ui/git.json", o, 0600);
@@ -527,8 +498,8 @@ bool git_mirrors::due(const repo& r, int64_t now) const
     ::localtime_r(&t, &tm);
     if (!ran)
         return true;
-    const int64_t at = int_of(st, "at", 0);
-    const jvalue* ok = field(st, "ok");
+    const int64_t at = socketley::json::int_of(st, "at", 0);
+    const jvalue* ok = member(st, "ok");
     // One that failed is tried again an hour later.
     if (!(ok && ok->b))
         return now - at >= 3600;
@@ -633,7 +604,7 @@ void git_mirrors::serve(const identity& id)
         std::error_code ec;
         std::filesystem::create_directories(work_of(next->id), ec);
         write_file(work_of(next->id) + "/state.json",
-                   "{\"ok\":false,\"at\":" + std::to_string(now) + ",\"error\":" + json_str(why) + "}\n", 0600);
+                   "{\"ok\":false,\"at\":" + std::to_string(now) + ",\"error\":" + socketley::json::quote(why) + "}\n", 0600);
     }
 }
 

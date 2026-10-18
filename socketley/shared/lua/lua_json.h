@@ -1,4 +1,5 @@
 #pragma once
+#include "../json/json_escape.h"
 #include <cstdlib>
 // JSON for socketley.json_encode and json_decode, a header rather than
 // file-static so a parser pointed at network data can be reached by a test and
@@ -34,32 +35,6 @@ enum class json_status
 inline bool json_encode_value(std::string& out, const sol::object& val,
                               int depth, std::vector<const void*>& path,
                               std::string& err);
-
-inline void json_encode_string(std::string& out, const std::string& s)
-{
-    out += '"';
-    for (char c : s)
-    {
-        switch (c)
-        {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20)
-                {
-                    char hex[8];
-                    snprintf(hex, sizeof(hex), "\\u%04x", static_cast<unsigned char>(c));
-                    out += hex;
-                }
-                else
-                    out += c;
-        }
-    }
-    out += '"';
-}
 
 // The count when `t` is exactly {1..n}, else 0 meaning encode as an object,
 // with keys collected because nothing promises lua_next arrives in index
@@ -136,7 +111,7 @@ inline bool json_encode_value(std::string& out, const sol::object& val,
             break;
         }
         case sol::type::string:
-            json_encode_string(out, val.as<std::string>());
+            socketley::json::quote_into(out, val.as<std::string>());
             break;
         case sol::type::table:
         {
@@ -221,7 +196,7 @@ inline bool json_encode_value(std::string& out, const sol::object& val,
                 {
                     if (!first) out += ',';
                     first = false;
-                    json_encode_string(out, f.key);
+                    socketley::json::quote_into(out, f.key);
                     out += ':';
                     if (!json_encode_value(out, f.val, depth + 1, path, err))
                         return false;

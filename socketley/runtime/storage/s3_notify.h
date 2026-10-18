@@ -9,6 +9,7 @@
 
 #include "s3_names.h"
 #include "s3_xml_tree.h"
+#include "../../shared/json/json_escape.h"
 
 namespace socketley::storage
 {
@@ -319,29 +320,6 @@ inline void notify_key_encode(std::string& out, std::string_view key)
     }
 }
 
-inline void notify_json_string(std::string& out, std::string_view s)
-{
-    out += '"';
-    for (const char ch : s)
-    {
-        const auto c = static_cast<unsigned char>(ch);
-        if (c == '"' || c == '\\')
-        {
-            out += '\\';
-            out += ch;
-        }
-        else if (c < 0x20)
-        {
-            char buf[8];
-            std::snprintf(buf, sizeof buf, "\\u%04x", c);
-            out += buf;
-        }
-        else
-            out += ch;
-    }
-    out += '"';
-}
-
 // What one event record says beyond its name.
 struct notify_fields
 {
@@ -369,19 +347,19 @@ inline std::string notify_event_json(uint16_t bit, const notify_fields& f)
     j += R"({"Records":[{"eventVersion":"2.1","eventSource":"aws:s3","awsRegion":"us-east-1","eventTime":")";
     append_iso8601(j, f.time_ms);
     j += R"(","eventName":)";
-    notify_json_string(j, notify_event_name(bit));
+    socketley::json::quote_into(j, notify_event_name(bit));
     j += R"(,"userIdentity":{"principalId":)";
-    notify_json_string(j, f.principal);
+    socketley::json::quote_into(j, f.principal);
     j += R"(},"requestParameters":{"sourceIPAddress":)";
-    notify_json_string(j, f.source_ip);
+    socketley::json::quote_into(j, f.source_ip);
     j += R"(},"responseElements":{},"s3":{"s3SchemaVersion":"1.0","configurationId":)";
-    notify_json_string(j, f.config_id);
+    socketley::json::quote_into(j, f.config_id);
     j += R"(,"bucket":{"name":)";
-    notify_json_string(j, f.bucket);
+    socketley::json::quote_into(j, f.bucket);
     j += R"(,"ownerIdentity":{"principalId":)";
-    notify_json_string(j, f.owner);
+    socketley::json::quote_into(j, f.owner);
     j += R"(},"arn":)";
-    notify_json_string(j, "arn:aws:s3:::" + std::string(f.bucket));
+    socketley::json::quote_into(j, "arn:aws:s3:::" + std::string(f.bucket));
     j += R"(},"object":{"key":")";
     notify_key_encode(j, f.key);
     j += '"';
@@ -390,15 +368,15 @@ inline std::string notify_event_json(uint16_t bit, const notify_fields& f)
         j += R"(,"size":)";
         j += std::to_string(f.size);
         j += R"(,"eTag":)";
-        notify_json_string(j, f.etag);
+        socketley::json::quote_into(j, f.etag);
     }
     if (!f.version_id.empty())
     {
         j += R"(,"versionId":)";
-        notify_json_string(j, f.version_id);
+        socketley::json::quote_into(j, f.version_id);
     }
     j += R"(,"sequencer":)";
-    notify_json_string(j, f.sequencer);
+    socketley::json::quote_into(j, f.sequencer);
     j += "}}}]}";
     return j;
 }

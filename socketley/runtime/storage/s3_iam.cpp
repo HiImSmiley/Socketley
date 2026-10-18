@@ -8,9 +8,13 @@
 
 #include "bucket_policy.h"
 #include "digest.h"
-#include "json_doc.h"
+#include "../../shared/json/json_doc.h"
 #include "password_hash.h"
 #include "s3_names.h"
+#include "../../shared/json/json_escape.h"
+
+using socketley::json::jvalue;
+using socketley::json::json_reader;
 
 namespace socketley::storage
 {
@@ -27,30 +31,6 @@ constexpr std::string_view alnum = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
 
 // ─── JSON out ───────────────────────────────────────────────────────────────
 
-void jstr(std::string& out, std::string_view v)
-{
-    static constexpr char hexd[] = "0123456789abcdef";
-    out += '"';
-    for (char ch : v)
-    {
-        const auto c = static_cast<unsigned char>(ch);
-        if (ch == '"' || ch == '\\')
-        {
-            out += '\\';
-            out += ch;
-        }
-        else if (c < 0x20)
-        {
-            out += "\\u00";
-            out += hexd[c >> 4];
-            out += hexd[c & 15];
-        }
-        else
-            out += ch;
-    }
-    out += '"';
-}
-
 void jvalue_out(std::string& out, const jvalue& v)
 {
     switch (v.k)
@@ -58,7 +38,7 @@ void jvalue_out(std::string& out, const jvalue& v)
         case jvalue::kind::null: out += "null"; return;
         case jvalue::kind::boolean: out += v.b ? "true" : "false"; return;
         case jvalue::kind::number: out += v.s; return;
-        case jvalue::kind::string: jstr(out, v.s); return;
+        case jvalue::kind::string: socketley::json::quote_into(out, v.s); return;
         case jvalue::kind::array:
             out += '[';
             for (size_t i = 0; i < v.items.size(); ++i)
@@ -75,7 +55,7 @@ void jvalue_out(std::string& out, const jvalue& v)
             {
                 if (i)
                     out += ',';
-                jstr(out, v.members[i].first);
+                socketley::json::quote_into(out, v.members[i].first);
                 out += ':';
                 jvalue_out(out, v.members[i].second);
             }
@@ -93,29 +73,21 @@ void policies_out(std::string& out, const iam_policies& p)
         if (!first)
             out += ',';
         first = false;
-        jstr(out, n);
+        socketley::json::quote_into(out, n);
         out += ':';
-        jstr(out, d);
+        socketley::json::quote_into(out, d);
     }
     out += "},\"attached\":[";
     for (size_t i = 0; i < p.attached.size(); ++i)
     {
         if (i)
             out += ',';
-        jstr(out, p.attached[i]);
+        socketley::json::quote_into(out, p.attached[i]);
     }
     out += ']';
 }
 
 // ─── JSON in ────────────────────────────────────────────────────────────────
-
-const jvalue* member(const jvalue& o, std::string_view name)
-{
-    for (const auto& [n, v] : o.members)
-        if (n == name)
-            return &v;
-    return nullptr;
-}
 
 std::string text_of(const jvalue& o, std::string_view name)
 {
@@ -458,18 +430,18 @@ std::string iam_json(const iam_state& s)
     {
         o += first ? "" : ",";
         first = false;
-        jstr(o, n);
+        socketley::json::quote_into(o, n);
         o += ":{\"id\":";
-        jstr(o, u.id);
+        socketley::json::quote_into(o, u.id);
         o += ",\"path\":";
-        jstr(o, u.path);
+        socketley::json::quote_into(o, u.path);
         o += ",\"created\":" + std::to_string(u.created_ms) + ",";
         policies_out(o, u.policies);
         o += ",\"groups\":[";
         for (size_t i = 0; i < u.groups.size(); ++i)
         {
             o += i ? "," : "";
-            jstr(o, u.groups[i]);
+            socketley::json::quote_into(o, u.groups[i]);
         }
         o += ']';
         if (u.external)
@@ -477,10 +449,10 @@ std::string iam_json(const iam_state& s)
         if (!u.password.empty())
         {
             o += ",\"password\":";
-            jstr(o, u.password);
+            socketley::json::quote_into(o, u.password);
             o += u.password_reset ? ",\"password_reset\":true" : "";
             o += ",\"password_set\":" + std::to_string(u.password_ms) + ",\"login_secret\":";
-            jstr(o, u.login_secret);
+            socketley::json::quote_into(o, u.login_secret);
         }
         if (!u.tags.empty())
         {
@@ -490,9 +462,9 @@ std::string iam_json(const iam_state& s)
             {
                 o += tfirst ? "" : ",";
                 tfirst = false;
-                jstr(o, k);
+                socketley::json::quote_into(o, k);
                 o += ':';
-                jstr(o, v);
+                socketley::json::quote_into(o, v);
             }
             o += '}';
         }
@@ -504,11 +476,11 @@ std::string iam_json(const iam_state& s)
     {
         o += first ? "" : ",";
         first = false;
-        jstr(o, n);
+        socketley::json::quote_into(o, n);
         o += ":{\"secret\":";
-        jstr(o, k.secret);
+        socketley::json::quote_into(o, k.secret);
         o += ",\"user\":";
-        jstr(o, k.user);
+        socketley::json::quote_into(o, k.user);
         o += k.active ? ",\"status\":\"Active\"" : ",\"status\":\"Inactive\"";
         o += ",\"created\":" + std::to_string(k.created_ms) + "}";
     }
@@ -518,11 +490,11 @@ std::string iam_json(const iam_state& s)
     {
         o += first ? "" : ",";
         first = false;
-        jstr(o, n);
+        socketley::json::quote_into(o, n);
         o += ":{\"id\":";
-        jstr(o, g.id);
+        socketley::json::quote_into(o, g.id);
         o += ",\"path\":";
-        jstr(o, g.path);
+        socketley::json::quote_into(o, g.path);
         o += ",\"created\":" + std::to_string(g.created_ms) + ",";
         policies_out(o, g.policies);
         o += "}";
@@ -533,15 +505,15 @@ std::string iam_json(const iam_state& s)
     {
         o += first ? "" : ",";
         first = false;
-        jstr(o, n);
+        socketley::json::quote_into(o, n);
         o += ":{\"id\":";
-        jstr(o, r.id);
+        socketley::json::quote_into(o, r.id);
         o += ",\"path\":";
-        jstr(o, r.path);
+        socketley::json::quote_into(o, r.path);
         o += ",\"created\":" + std::to_string(r.created_ms) + ",\"trust\":";
-        jstr(o, r.trust);
+        socketley::json::quote_into(o, r.trust);
         o += ",\"description\":";
-        jstr(o, r.description);
+        socketley::json::quote_into(o, r.description);
         o += ",\"max_session\":" + std::to_string(r.max_session) + ",";
         policies_out(o, r.policies);
         o += "}";
@@ -552,12 +524,12 @@ std::string iam_json(const iam_state& s)
     {
         o += first ? "" : ",";
         first = false;
-        jstr(o, n);
+        socketley::json::quote_into(o, n);
         o += ":{\"hash\":";
-        jstr(o, i.hash);
+        socketley::json::quote_into(o, i.hash);
         o += ",\"created\":" + std::to_string(i.created_ms) + ",\"expires\":" + std::to_string(i.expires_ms);
         o += ",\"by\":";
-        jstr(o, i.by);
+        socketley::json::quote_into(o, i.by);
         o += i.admin ? ",\"admin\":true" : ",\"admin\":false";
         o += ",\"max_bytes\":" + std::to_string(i.max_bytes);
         o += i.libraries ? ",\"libraries\":true}" : ",\"libraries\":false}";

@@ -10,7 +10,7 @@
 #include "idp_instance.h"
 #include "idp_logic.h"
 #include "../../shared/util/logging.h"
-#include "../storage/json_doc.h"
+#include "../../shared/json/json_doc.h"
 #include "../storage/s3_federation.h"
 
 namespace socketley::idp
@@ -58,11 +58,11 @@ void session_verifier::reload()
     std::stringstream ss;
     ss << f.rdbuf();
     const std::string text = ss.str();
-    socketley::storage::jvalue doc;
+    socketley::json::jvalue doc;
     std::string issuer, err;
-    if (f && socketley::storage::json_reader(text).document(doc))
+    if (f && socketley::json::json_reader(text).document(doc))
         for (const auto& [k, v] : doc.members)
-            if (k == "issuer" && v.k == socketley::storage::jvalue::kind::string)
+            if (k == "issuer" && v.k == socketley::json::jvalue::kind::string)
                 issuer = v.s;
     auto keys = std::make_unique<socketley::storage::jwks_keys>();
     if (issuer.empty() || !socketley::storage::parse_jwks(text, *keys, err))

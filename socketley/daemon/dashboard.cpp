@@ -17,7 +17,7 @@
 #include "runtime_schema.h"
 #include "ipc_client.h"
 #include "../runtime/proxy/proxy_auth.h"
-#include "../runtime/storage/json_doc.h"
+#include "../shared/json/json_doc.h"
 #include "../shared/loop/blocking_write.h"
 #include "../shared/util/logging.h"
 #include "../shared/util/log_ring.h"
@@ -54,27 +54,9 @@ namespace
 {
 
 #include "dashboard_page.inc"
+#include "../shared/json/json_escape.h"
 
 constexpr int64_t session_seconds = 12 * 3600;
-
-std::string json_quote(std::string_view v)
-{
-    std::string o = "\"";
-    for (unsigned char c : v)
-    {
-        if (c == '"' || c == '\\')
-            o += '\\', o += static_cast<char>(c);
-        else if (c < 0x20)
-        {
-            char b[8];
-            std::snprintf(b, sizeof b, "\\u%04x", c);
-            o += b;
-        }
-        else
-            o += static_cast<char>(c);
-    }
-    return o + "\"";
-}
 
 std::string lower(std::string_view s)
 {
@@ -340,12 +322,12 @@ void server::session(int fd, const request& r)
             {
                 const std::string back =
                     std::string(r.header("x-forwarded-proto") == "https" ? "https://" : "http://") + std::string(host) + "/";
-                idp = ",\"idp_login\":" + json_quote(m_idp.login_url(back)) + ",\"idp_logout\":" +
-                      json_quote(m_idp.logout_url(back));
+                idp = ",\"idp_login\":" + socketley::json::quote(m_idp.login_url(back)) + ",\"idp_logout\":" +
+                      socketley::json::quote(m_idp.logout_url(back));
             }
         send(fd, 200, "application/json",
              "{\"configured\":" + std::string(configured() ? "true" : "false") + ",\"user\":" +
-                 (who.empty() ? std::string("null") : json_quote(who)) + idp + "}");
+                 (who.empty() ? std::string("null") : socketley::json::quote(who)) + idp + "}");
         return;
     }
     const bool https = r.header("x-forwarded-proto") == "https";
@@ -413,7 +395,7 @@ void server::session(int fd, const request& r)
         return;
     }
     LOG_INFO(("dashboard: " + user + " signed in from " + r.client()).c_str());
-    send(fd, 200, "application/json", "{\"user\":" + json_quote(user) + "}",
+    send(fd, 200, "application/json", "{\"user\":" + socketley::json::quote(user) + "}",
          "Set-Cookie: skl_dash=" + sealed + "; Path=/; Max-Age=" + std::to_string(session_seconds) +
              "; HttpOnly; SameSite=Strict" + (https ? "; Secure" : "") + "\r\n");
 }
@@ -466,7 +448,7 @@ void server::logs(int fd, const request& r)
     {
         const auto& e = lines[i];
         o += (i ? ",{" : "{") + std::string("\"seq\":") + std::to_string(e.seq) + ",\"at\":" + std::to_string(e.at_ms) +
-             ",\"rt\":" + json_quote(e.runtime) + ",\"lv\":\"" + e.level + "\",\"text\":" + json_quote(e.text) + "}";
+             ",\"rt\":" + socketley::json::quote(e.runtime) + ",\"lv\":\"" + e.level + "\",\"text\":" + socketley::json::quote(e.text) + "}";
     }
     o += "]}";
     send(fd, 200, "application/json", o);
@@ -514,10 +496,10 @@ std::string cert_json(const std::string& path)
     {
         if (!names.empty())
             names += ',';
-        names += json_quote(n);
+        names += socketley::json::quote(n);
     }
     return "\"names\":[" + names + "],\"expires_in\":" + std::to_string(c.expires_in) + ",\"issuer\":" +
-           json_quote(c.issuer) + ",\"self_signed\":" + (c.self_signed ? "true" : "false");
+           socketley::json::quote(c.issuer) + ",\"self_signed\":" + (c.self_signed ? "true" : "false");
 }
 
 }   // namespace
@@ -610,7 +592,7 @@ void server::edge(int fd, const request& r)
         const std::string table = read_text(dns_feed::routes_path(i.name));
         if (table.empty() && !i.entrance)
             continue;
-        o += std::string(first ? "" : ",") + "{\"name\":" + json_quote(i.name) + ",\"zones\":[";
+        o += std::string(first ? "" : ",") + "{\"name\":" + socketley::json::quote(i.name) + ",\"zones\":[";
         first = false;
         std::string zones, routes;
         std::istringstream lines(table);
@@ -621,7 +603,7 @@ void server::edge(int fd, const request& r)
             {
                 if (!zones.empty())
                     zones += ',';
-                zones += json_quote(line.substr(5));
+                zones += socketley::json::quote(line.substr(5));
             }
             else if (line.starts_with("route "))
             {
@@ -633,15 +615,15 @@ void server::edge(int fd, const request& r)
                     if (!to.empty())
                         to += ',';
                     to += "{\"address\":";
-                    to += json_quote(addr);
+                    to += socketley::json::quote(addr);
                     to += ",\"runtime\":";
-                    to += json_quote(by_address.count(addr) ? by_address[addr] : std::string{});
+                    to += socketley::json::quote(by_address.count(addr) ? by_address[addr] : std::string{});
                     to += '}';
                 }
                 if (!routes.empty())
                     routes += ',';
                 routes += "{\"name\":";
-                routes += json_quote(name);
+                routes += socketley::json::quote(name);
                 routes += ",\"to\":[";
                 routes += to;
                 routes += "]}";
@@ -659,9 +641,9 @@ void server::edge(int fd, const request& r)
         struct stat st{};
         const bool partial = ::stat((i.cert + ".partial").c_str(), &st) == 0;
         const std::string log = i.acme || i.entrance ? last_line_of(i.cert + ".log") : std::string{};
-        o += std::string(first ? "" : ",") + "{\"runtime\":" + json_quote(i.name) + ",\"path\":" + json_quote(i.cert) +
+        o += std::string(first ? "" : ",") + "{\"runtime\":" + socketley::json::quote(i.name) + ",\"path\":" + socketley::json::quote(i.cert) +
              ",\"auto\":" + (i.acme || i.entrance ? "true" : "false") + ",\"partial\":" + (partial ? "true" : "false") +
-             ",\"acme_log\":" + json_quote(log) + (c.empty() ? ",\"missing\":true" : "," + c) + "}";
+             ",\"acme_log\":" + socketley::json::quote(log) + (c.empty() ? ",\"missing\":true" : "," + c) + "}";
         first = false;
     }
     o += "],\"zones\":[";
@@ -672,10 +654,10 @@ void server::edge(int fd, const request& r)
             socketley::dns::zone z;
             std::string why;
             const bool ok = socketley::dns::load_zone(p, {}, z, why);
-            o += std::string(first ? "" : ",") + "{\"runtime\":" + json_quote(i.name) + ",\"path\":" + json_quote(p) +
-                 ",\"origin\":" + json_quote(ok ? socketley::dns::to_text(z.origin) : std::string{}) +
-                 ",\"serial\":" + std::to_string(ok ? z.serial : 0) + ",\"error\":" + json_quote(ok ? std::string{} : why) +
-                 ",\"proxy\":" + json_quote(i.proxy) + "}";
+            o += std::string(first ? "" : ",") + "{\"runtime\":" + socketley::json::quote(i.name) + ",\"path\":" + socketley::json::quote(p) +
+                 ",\"origin\":" + socketley::json::quote(ok ? socketley::dns::to_text(z.origin) : std::string{}) +
+                 ",\"serial\":" + std::to_string(ok ? z.serial : 0) + ",\"error\":" + socketley::json::quote(ok ? std::string{} : why) +
+                 ",\"proxy\":" + socketley::json::quote(i.proxy) + "}";
             first = false;
         }
     o += "]}";
@@ -702,11 +684,11 @@ void server::zone(int fd, const request& r)
             send(fd, 403, "text/plain; charset=utf-8", "A change comes from the dashboard's own page.\n");
             return;
         }
-        socketley::storage::jvalue doc;
-        if (socketley::storage::json_reader(r.body).document(doc))
+        socketley::json::jvalue doc;
+        if (socketley::json::json_reader(r.body).document(doc))
             for (const auto& [k, v] : doc.members)
             {
-                if (v.k != socketley::storage::jvalue::kind::string)
+                if (v.k != socketley::json::jvalue::kind::string)
                     continue;
                 if (k == "runtime")
                     runtime = v.s;
@@ -795,11 +777,11 @@ void server::run(int fd, const request& r)
         send(fd, 403, "text/plain; charset=utf-8", "A command comes from the dashboard's own page.\n");
         return;
     }
-    socketley::storage::jvalue doc;
-    const socketley::storage::jvalue* args = nullptr;
-    if (socketley::storage::json_reader(r.body).document(doc))
+    socketley::json::jvalue doc;
+    const socketley::json::jvalue* args = nullptr;
+    if (socketley::json::json_reader(r.body).document(doc))
         for (const auto& [k, v] : doc.members)
-            if (k == "args" && v.k == socketley::storage::jvalue::kind::array)
+            if (k == "args" && v.k == socketley::json::jvalue::kind::array)
                 args = &v;
     if (!args || args->items.empty())
     {
@@ -810,7 +792,7 @@ void server::run(int fd, const request& r)
     for (size_t i = 0; i < args->items.size(); ++i)
     {
         const auto& a = args->items[i];
-        if (a.k != socketley::storage::jvalue::kind::string || a.s.empty() ||
+        if (a.k != socketley::json::jvalue::kind::string || a.s.empty() ||
             a.s.find_first_of("\r\n\0", 0, 3) != std::string::npos)
         {
             send(fd, 400, "text/plain; charset=utf-8", "Each word is a string of one line.\n");
@@ -863,7 +845,7 @@ void server::run(int fd, const request& r)
                                  : "The daemon's control socket did not answer.\n");
         return;
     }
-    send(fd, 200, "application/json", "{\"code\":" + std::to_string(rc) + ",\"out\":" + json_quote(out) + "}");
+    send(fd, 200, "application/json", "{\"code\":" + std::to_string(rc) + ",\"out\":" + socketley::json::quote(out) + "}");
 }
 
 }   // namespace dashboard

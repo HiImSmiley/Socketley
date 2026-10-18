@@ -27,9 +27,12 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
-#include "json_doc.h"
+#include "../../shared/json/json_doc.h"
 #include "outbound_http.h"
 #include "s3_names.h"
+
+using socketley::json::jvalue;
+using socketley::json::json_reader;
 
 namespace socketley::storage
 {
@@ -44,16 +47,6 @@ std::string_view trim_ws(std::string_view s)
     while (!s.empty() && (s.back() == ' ' || s.back() == '\t'))
         s.remove_suffix(1);
     return s;
-}
-
-const jvalue* member(const jvalue& o, std::string_view name)
-{
-    if (o.k != jvalue::kind::object)
-        return nullptr;
-    for (const auto& [k, v] : o.members)
-        if (k == name)
-            return &v;
-    return nullptr;
 }
 
 // The string member `name`, empty when it is absent, false when it is there and not a string.

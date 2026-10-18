@@ -13,6 +13,7 @@
 #include "checksum.h"
 #include "s3_xml.h"
 #include "s3_xml_tree.h"
+#include "../../shared/json/json_escape.h"
 
 namespace socketley::storage
 {
@@ -422,37 +423,6 @@ private:
     size_t           m_pos{0};
 };
 
-void json_string_to(std::string& out, std::string_view s)
-{
-    static constexpr char hex[] = "0123456789abcdef";
-    out.push_back('"');
-    size_t run = 0;
-    for (size_t i = 0; i < s.size(); ++i)
-    {
-        const unsigned char c = static_cast<unsigned char>(s[i]);
-        if (c >= 0x20 && c != '"' && c != '\\')
-            continue;
-        out.append(s.substr(run, i - run));
-        run = i + 1;
-        switch (c)
-        {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            default:
-                out += "\\u00";
-                out.push_back(hex[c >> 4]);
-                out.push_back(hex[c & 0xF]);
-        }
-    }
-    out.append(s.substr(run));
-    out.push_back('"');
-}
-
 void json_node_to(std::string& out, const jnode& n)
 {
     switch (n.k)
@@ -460,7 +430,7 @@ void json_node_to(std::string& out, const jnode& n)
         case jnode::kind::null:    out += "null"; return;
         case jnode::kind::boolean: out += n.b ? "true" : "false"; return;
         case jnode::kind::number:  out += n.s; return;
-        case jnode::kind::string:  json_string_to(out, n.s); return;
+        case jnode::kind::string:  socketley::json::quote_into(out, n.s); return;
         case jnode::kind::array:
             out.push_back('[');
             for (size_t i = 0; i < n.items.size(); ++i)
@@ -477,7 +447,7 @@ void json_node_to(std::string& out, const jnode& n)
             {
                 if (i)
                     out.push_back(',');
-                json_string_to(out, n.members[i].first);
+                socketley::json::quote_into(out, n.members[i].first);
                 out.push_back(':');
                 json_node_to(out, n.members[i].second);
             }
@@ -658,7 +628,7 @@ void json_value_to(std::string& out, const value& v)
             else
                 out += "null";
             return;
-        case vk::string:  json_string_to(out, v.s); return;
+        case vk::string:  socketley::json::quote_into(out, v.s); return;
         case vk::node:    json_node_to(out, *v.n); return;
     }
 }
@@ -2871,11 +2841,11 @@ struct select_engine::impl
                     continue;
                 }
                 if (k < header.size())
-                    json_string_to(out, header[k]);
+                    socketley::json::quote_into(out, header[k]);
                 else
-                    json_string_to(out, "_" + std::to_string(k + 1));
+                    socketley::json::quote_into(out, "_" + std::to_string(k + 1));
                 out.push_back(':');
-                json_string_to(out, f);
+                socketley::json::quote_into(out, f);
             }
             if (!csv_out)
                 out.push_back('}');
@@ -2926,7 +2896,7 @@ struct select_engine::impl
             if (any)
                 out.push_back(',');
             any = true;
-            json_string_to(out, prog.items[k].name);
+            socketley::json::quote_into(out, prog.items[k].name);
             out.push_back(':');
             json_value_to(out, vals[k]);
         }

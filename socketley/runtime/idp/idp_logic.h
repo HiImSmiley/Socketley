@@ -46,8 +46,6 @@ std::string url_encode(std::string_view in);
 // Text safe inside HTML, attribute values included.
 std::string html_escape(std::string_view in);
 
-// A JSON string literal, quotes included.
-std::string json_string(std::string_view in);
 
 // RFC 7636: a verifier of 43 to 128 unreserved characters whose SHA-256, base64url, is the S256 challenge.
 bool pkce_matches(std::string_view verifier, std::string_view challenge);

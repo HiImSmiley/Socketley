@@ -3,6 +3,7 @@
 #include "command_hashing.h"
 #include "../shared/cluster/cluster_discovery.h"
 #include "../shared/cluster/cluster_state.h"
+#include "../shared/json/json_doc.h"
 
 #include <iostream>
 #include <fstream>
@@ -22,9 +23,8 @@ namespace fs = std::filesystem;
 
 namespace {
 
-using cd_detail::json_get_array_objects;
-using cd_detail::json_get_number;
-using cd_detail::json_get_string;
+using socketley::json::int_of;
+using socketley::json::string_of;
 
 struct cluster_daemon
 {
@@ -71,28 +71,32 @@ std::vector<cluster_daemon> load_cluster_dir(const std::string& dir)
         ss << f.rdbuf();
         std::string content = ss.str();
 
+        socketley::json::jvalue doc;
+        if (!socketley::json::json_reader(content).document(doc))
+            continue;
+
         cluster_daemon cd;
-        cd.name = json_get_string(content, "daemon");
-        cd.host = json_get_string(content, "host");
-        cd.heartbeat = json_get_number(content, "heartbeat");
+        cd.name = std::string(string_of(doc, "daemon"));
+        cd.host = std::string(string_of(doc, "host"));
+        cd.heartbeat = int_of(doc, "heartbeat");
 
         if (cd.name.empty())
             continue;
 
         cd.stale = (now - cd.heartbeat) > 10;
 
-        auto objects = json_get_array_objects(content, "runtimes");
-        for (auto obj : objects)
-        {
-            cluster_daemon::rt_info rt;
-            rt.name = json_get_string(obj, "name");
-            rt.type = json_get_string(obj, "type");
-            rt.group = json_get_string(obj, "group");
-            rt.port = static_cast<uint16_t>(json_get_number(obj, "port"));
-            rt.state = json_get_string(obj, "state");
-            rt.connections = json_get_number(obj, "connections");
-            cd.runtimes.push_back(std::move(rt));
-        }
+        if (const auto* list = socketley::json::member(doc, "runtimes"))
+            for (const auto& obj : list->items)
+            {
+                cluster_daemon::rt_info rt;
+                rt.name = std::string(string_of(obj, "name"));
+                rt.type = std::string(string_of(obj, "type"));
+                rt.group = std::string(string_of(obj, "group"));
+                rt.port = static_cast<uint16_t>(int_of(obj, "port"));
+                rt.state = std::string(string_of(obj, "state"));
+                rt.connections = int_of(obj, "connections");
+                cd.runtimes.push_back(std::move(rt));
+            }
 
         daemons.push_back(std::move(cd));
     }

@@ -38,11 +38,15 @@
 
 #include "../../shared/http/http_framing.h"
 #include "digest.h"
-#include "json_doc.h"
+#include "../../shared/json/json_doc.h"
 #include "s3_names.h"
 #include "s3_tagging.h"
 #include "sse.h"
 #include "../../shared/persist/replaced_file.h"
+#include "../../shared/json/json_escape.h"
+
+using socketley::json::jvalue;
+using socketley::json::json_reader;
 
 extern char** environ;
 
@@ -339,21 +343,14 @@ std::string media_key(const std::string& media_dir)
 
 // ─── What ffprobe said ──────────────────────────────────────────────────────
 
-const jvalue* member(const jvalue& o, std::string_view n)
-{
-    for (const auto& [k, v] : o.members)
-        if (k == n)
-            return &v;
-    return nullptr;
-}
-
 std::string str_of(const jvalue& o, std::string_view n)
 {
     const jvalue* v = member(o, n);
     return v && (v->k == jvalue::kind::string || v->k == jvalue::kind::number) ? v->s : std::string{};
 }
 
-int64_t int_of(const jvalue& o, std::string_view n)
+// ffprobe writes its numbers as strings as often as not, so this reads either.
+int64_t probe_int(const jvalue& o, std::string_view n)
 {
     return std::strtoll(str_of(o, n).c_str(), nullptr, 10);
 }
@@ -411,7 +408,7 @@ bool parse_probe(const std::string& text, media_probe& p)
     if (const jvalue* f = member(root, "format"))
     {
         p.duration = seconds_of(*f, "duration");
-        p.bitrate = int_of(*f, "bit_rate");
+        p.bitrate = probe_int(*f, "bit_rate");
         p.format = str_of(*f, "format_name");
         song_tags(member(*f, "tags"), p);
     }
@@ -426,13 +423,13 @@ bool parse_probe(const std::string& text, media_probe& p)
             const std::string type = str_of(s, "codec_type");
             // A cover picture is a video stream too, and not the film.
             const jvalue* disp = member(s, "disposition");
-            if (type == "video" && p.vcodec.empty() && !(disp && int_of(*disp, "attached_pic")))
+            if (type == "video" && p.vcodec.empty() && !(disp && probe_int(*disp, "attached_pic")))
             {
                 p.vcodec = str_of(s, "codec_name");
                 p.vprofile = str_of(s, "profile");
-                p.vlevel = int_of(s, "level");
-                p.width = int_of(s, "width");
-                p.height = int_of(s, "height");
+                p.vlevel = probe_int(s, "level");
+                p.width = probe_int(s, "width");
+                p.height = probe_int(s, "height");
                 p.transfer = str_of(s, "color_transfer");
                 p.fps = rate_of(str_of(s, "avg_frame_rate"));
                 if (p.fps <= 0 || p.fps > 240)
@@ -442,14 +439,14 @@ bool parse_probe(const std::string& text, media_probe& p)
             else if (type == "audio")
             {
                 const jvalue* tags = member(s, "tags");
-                p.tracks.push_back({int_of(s, "channels"), str_of(s, "codec_name"), tag_of(tags, "language"),
-                                    tag_of(tags, "title"), disp && int_of(*disp, "default")});
+                p.tracks.push_back({probe_int(s, "channels"), str_of(s, "codec_name"), tag_of(tags, "language"),
+                                    tag_of(tags, "title"), disp && probe_int(*disp, "default")});
                 if (!p.audio)
                 {
                     sound_tags = tags;
                     p.audio = true;
                     p.acodec = str_of(s, "codec_name");
-                    p.achannels = int_of(s, "channels");
+                    p.achannels = probe_int(s, "channels");
                 }
             }
             else if (type == "subtitle")
@@ -459,7 +456,7 @@ bool parse_probe(const std::string& text, media_probe& p)
                     codec != "text")
                     continue;
                 media_probe::subtitle sub;
-                sub.index = int_of(s, "index");
+                sub.index = probe_int(s, "index");
                 sub.codec = codec;
                 if (const jvalue* tags = member(s, "tags"))
                 {
@@ -657,19 +654,6 @@ int64_t trick_count(const media_probe& p)
     return std::max<int64_t>(1, static_cast<int64_t>(std::ceil(p.duration / static_cast<double>(trick_every(p)))));
 }
 
-void json_str(std::string& o, std::string_view v)
-{
-    o += '"';
-    for (char ch : v)
-    {
-        if (ch == '"' || ch == '\\')
-            o += '\\';
-        if (static_cast<unsigned char>(ch) >= 0x20)
-            o += ch;
-    }
-    o += '"';
-}
-
 // What a browser is asked whether it plays the file itself: its container and codecs as a MIME type.
 std::string info_text(const media_probe& p, std::string_view version)
 {
@@ -688,17 +672,17 @@ std::string info_text(const media_probe& p, std::string_view version)
         mime += "; codecs=\"" + codecs + "\"";
     std::string o = "{\"duration\":" + std::to_string(p.duration) + ",\"width\":" + std::to_string(p.width) +
                     ",\"height\":" + std::to_string(p.height) + ",\"fps\":" + std::to_string(p.fps) + ",\"video\":";
-    json_str(o, p.vcodec);
+    socketley::json::quote_into(o, p.vcodec);
     o += ",\"audio\":";
-    json_str(o, p.acodec);
+    socketley::json::quote_into(o, p.acodec);
     o += ",\"hdr\":";
     o += p.hdr() ? "true" : "false";
     o += ",\"mime\":";
-    json_str(o, mime);
+    socketley::json::quote_into(o, mime);
     o += ",\"copy\":";
-    json_str(o, v.empty() ? std::string{} : v + (p.audio ? ",mp4a.40.2" : ""));
+    socketley::json::quote_into(o, v.empty() ? std::string{} : v + (p.audio ? ",mp4a.40.2" : ""));
     o += ",\"version\":";
-    json_str(o, version);
+    socketley::json::quote_into(o, version);
     o += ",\"renditions\":[";
     bool first = true;
     for (const rung* r : rungs_of(p))
@@ -714,9 +698,9 @@ std::string info_text(const media_probe& p, std::string_view version)
         o += first ? "{" : ",{";
         first = false;
         o += "\"index\":" + std::to_string(s.index) + ",\"lang\":";
-        json_str(o, s.lang);
+        socketley::json::quote_into(o, s.lang);
         o += ",\"title\":";
-        json_str(o, s.title);
+        socketley::json::quote_into(o, s.title);
         o += "}";
     }
     o += "],\"tracks\":[";
@@ -726,11 +710,11 @@ std::string info_text(const media_probe& p, std::string_view version)
         o += first ? "{" : ",{";
         first = false;
         o += "\"codec\":";
-        json_str(o, t.codec);
+        socketley::json::quote_into(o, t.codec);
         o += ",\"channels\":" + std::to_string(t.channels) + ",\"lang\":";
-        json_str(o, t.lang);
+        socketley::json::quote_into(o, t.lang);
         o += ",\"title\":";
-        json_str(o, t.title);
+        socketley::json::quote_into(o, t.title);
         o += t.main ? ",\"default\":true}" : ",\"default\":false}";
     }
     o += "],\"chapters\":[";
@@ -742,7 +726,7 @@ std::string info_text(const media_probe& p, std::string_view version)
         o += first ? "" : ",";
         first = false;
         o += buf;
-        json_str(o, ch.title);
+        socketley::json::quote_into(o, ch.title);
         o += "}";
     }
     o += "],\"tags\":{";
@@ -752,7 +736,7 @@ std::string info_text(const media_probe& p, std::string_view version)
         o += '"';
         o += name;
         o += "\":";
-        json_str(o, *value);
+        socketley::json::quote_into(o, *value);
         o += ',';
     }
     o += "\"track\":" + std::to_string(p.track) + ",\"disc\":" + std::to_string(p.disc) + "}";

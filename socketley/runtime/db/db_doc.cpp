@@ -1,47 +1,11 @@
 #include "db_doc.h"
+#include "../../shared/json/json_escape.h"
 
 #include <charconv>
 #include <cmath>
 
 namespace socketley::db
 {
-
-void write_string(std::string_view s, std::string& out)
-{
-    static constexpr char hex[] = "0123456789abcdef";
-    out.reserve(out.size() + s.size() + 2);
-    out += '"';
-    size_t from = 0;
-    for (size_t i = 0; i < s.size(); ++i)
-    {
-        const char c = s[i];
-        const auto u = static_cast<unsigned char>(c);
-        if (u >= 0x20 && c != '"' && c != '\\')
-            continue;
-        // The run before it as it is, then the character escaped.
-        out.append(s.data() + from, i - from);
-        from = i + 1;
-        if (c == '"' || c == '\\')
-        {
-            out += '\\';
-            out += c;
-        }
-        else if (c == '\n')
-            out += "\\n";
-        else if (c == '\t')
-            out += "\\t";
-        else if (c == '\r')
-            out += "\\r";
-        else
-        {
-            out += "\\u00";
-            out += hex[u >> 4];
-            out += hex[u & 15];
-        }
-    }
-    out.append(s.data() + from, s.size() - from);
-    out += '"';
-}
 
 void write_json(const jvalue& v, std::string& out)
 {
@@ -57,7 +21,7 @@ void write_json(const jvalue& v, std::string& out)
             out += v.s;
             return;
         case jvalue::kind::string:
-            write_string(v.s, out);
+            socketley::json::quote_into(out, v.s);
             return;
         case jvalue::kind::array:
         {
@@ -82,7 +46,7 @@ void write_json(const jvalue& v, std::string& out)
                 if (!first)
                     out += ',';
                 first = false;
-                write_string(k, out);
+                socketley::json::quote_into(out, k);
                 out += ':';
                 write_json(m, out);
             }
@@ -117,21 +81,6 @@ bool valid_path(std::string_view path)
             return true;
         path.remove_prefix(dot + 1);
     }
-}
-
-const jvalue* member(const jvalue& obj, std::string_view name)
-{
-    if (obj.k != jvalue::kind::object)
-        return nullptr;
-    for (const auto& [k, m] : obj.members)
-        if (k == name)
-            return &m;
-    return nullptr;
-}
-
-jvalue* member(jvalue& obj, std::string_view name)
-{
-    return const_cast<jvalue*>(member(static_cast<const jvalue&>(obj), name));
 }
 
 const jvalue* at_path(const jvalue& doc, std::string_view path)

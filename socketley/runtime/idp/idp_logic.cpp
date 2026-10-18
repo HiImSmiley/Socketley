@@ -10,7 +10,8 @@
 #include <openssl/params.h>
 
 #include "../../shared/crypto/jws.h"
-#include "../storage/json_doc.h"
+#include "../../shared/json/json_doc.h"
+#include "../../shared/json/json_escape.h"
 
 namespace socketley::idp
 {
@@ -210,36 +211,6 @@ std::string html_escape(std::string_view in)
     return out;
 }
 
-std::string json_string(std::string_view in)
-{
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(in.size() + 2);
-    out += '"';
-    size_t from = 0;
-    for (size_t i = 0; i < in.size(); ++i)
-    {
-        const auto u = static_cast<unsigned char>(in[i]);
-        if (u >= 0x20 && u != '"' && u != '\\')
-            continue;
-        out.append(in, from, i - from);
-        from = i + 1;
-        if (u < 0x20)
-        {
-            const char esc[] = {'\\', 'u', '0', '0', hex[u >> 4], hex[u & 15]};
-            out.append(esc, sizeof esc);
-        }
-        else
-        {
-            out += '\\';
-            out += static_cast<char>(u);
-        }
-    }
-    out.append(in, from, in.size() - from);
-    out += '"';
-    return out;
-}
-
 bool pkce_matches(std::string_view verifier, std::string_view challenge)
 {
     if (verifier.size() < 43 || verifier.size() > 128 || challenge.empty())
@@ -316,7 +287,7 @@ std::string sign_token(EVP_PKEY* key, std::string_view kid, std::string_view typ
 {
     std::string header;
     header.reserve(kid.size() + typ.size() + 40);
-    header.append("{\"alg\":\"ES256\",\"kid\":").append(json_string(kid)).append(",\"typ\":").append(json_string(typ));
+    header.append("{\"alg\":\"ES256\",\"kid\":").append(socketley::json::quote(kid)).append(",\"typ\":").append(socketley::json::quote(typ));
     header += '}';
     std::string payload;
     payload.reserve(body.size() + 2);
@@ -333,8 +304,8 @@ template <class Holds>
 bool read_token(std::string_view want_alg, std::string_view kid, std::string_view typ, std::string_view issuer,
                 std::string_view token, int64_t now, Holds&& holds, claims& out, std::string& why)
 {
-    using socketley::storage::json_reader;
-    using socketley::storage::jvalue;
+    using socketley::json::json_reader;
+    using socketley::json::jvalue;
     out.clear();
     const size_t d1 = token.find('.');
     const size_t d2 = d1 == std::string_view::npos ? d1 : token.find('.', d1 + 1);
@@ -515,7 +486,7 @@ std::string token_secret(EVP_PKEY* key)
 
 std::string sign_secret_token(std::string_view secret, std::string_view typ, std::string_view body)
 {
-    const std::string header = "{\"alg\":\"HS256\",\"kid\":\"self\",\"typ\":" + json_string(typ) + "}";
+    const std::string header = "{\"alg\":\"HS256\",\"kid\":\"self\",\"typ\":" + socketley::json::quote(typ) + "}";
     std::string payload;
     payload.reserve(body.size() + 2);
     payload.append("{").append(body).append("}");

@@ -17,6 +17,7 @@
 #include "../runtime/type_registry.h"
 
 #include "../util/logging.h"
+#include "../json/json_escape.h"
 
 #include <fstream>
 #include <sstream>
@@ -33,65 +34,6 @@ namespace fs = std::filesystem;
 // ─── Minimal JSON helpers ───
 
 namespace sp_detail {
-
-std::string json_escape(std::string_view s)
-{
-    std::string out;
-    out.reserve(s.size() + 4);
-    for (char c : s)
-    {
-        switch (c)
-        {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                // Everything below 0x20 has to go as \u00xx or the document is
-                // not JSON.
-                if (static_cast<unsigned char>(c) < 0x20)
-                {
-                    char hex[8];
-                    std::snprintf(hex, sizeof(hex), "\\u%04x",
-                                  static_cast<unsigned>(static_cast<unsigned char>(c)));
-                    out += hex;
-                }
-                else
-                    out += c;
-                break;
-        }
-    }
-    return out;
-}
-
-void json_escape_into(std::string& out, std::string_view s)
-{
-    for (char c : s)
-    {
-        switch (c)
-        {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                // Everything below 0x20 has to go as \u00xx or the document is
-                // not JSON.
-                if (static_cast<unsigned char>(c) < 0x20)
-                {
-                    char hex[8];
-                    std::snprintf(hex, sizeof(hex), "\\u%04x",
-                                  static_cast<unsigned>(static_cast<unsigned char>(c)));
-                    out += hex;
-                }
-                else
-                    out += c;
-                break;
-        }
-    }
-}
 
 std::string json_unescape(std::string_view s)
 {
@@ -841,7 +783,7 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         j += "    \"";
         j += key;
         j += "\": \"";
-        json_escape_into(j, val);
+        socketley::json::escape_into(j, val);
         j += "\",\n";
     };
 
@@ -1000,7 +942,7 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 {
                     if (i > 0) j += ", ";
                     j += "\"";
-                    json_escape_into(j, cfg.upstreams[i]);
+                    socketley::json::escape_into(j, cfg.upstreams[i]);
                     j += "\"";
                 }
                 j += "],\n";
@@ -1021,7 +963,7 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 {
                     if (i > 0) j += ", ";
                     j += "\"";
-                    json_escape_into(j, cfg.backends[i]);
+                    socketley::json::escape_into(j, cfg.backends[i]);
                     j += "\"";
                 }
                 j += "],\n";
@@ -1191,9 +1133,9 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 j += ", ";
             first = false;
             j += "\"";
-            json_escape_into(j, k);
+            socketley::json::escape_into(j, k);
             j += "\": \"";
-            json_escape_into(j, v);
+            socketley::json::escape_into(j, v);
             j += "\"";
         }
         j += "},\n";

@@ -10,6 +10,7 @@
 #include "lua_suspend.h"
 #include "../runtime/runtime_instance.h"
 #include "../runtime/runtime_manager.h"
+#include "../json/json_escape.h"
 
 namespace
 {
@@ -43,7 +44,7 @@ bool string_at(lua_State* L, int idx, std::string& out)
 
 void quoted(std::string& out, std::string_view s)
 {
-    socketley::lua_json::json_encode_string(out, std::string(s));
+    socketley::json::quote_into(out, std::string(s));
 }
 
 int db_thunk(lua_State* L)

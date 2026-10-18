@@ -25,6 +25,7 @@
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/ipc/shard_target.h"
+#include "../../shared/json/json_escape.h"
 
 namespace socketley::db
 {
@@ -72,9 +73,9 @@ const char* reason(int status)
 std::string error_body(std::string_view code, std::string_view message)
 {
     std::string out = "{\"error\":";
-    write_string(code, out);
+    socketley::json::quote_into(out, code);
     out += ",\"message\":";
-    write_string(message, out);
+    socketley::json::quote_into(out, message);
     out += '}';
     return out;
 }
@@ -451,13 +452,13 @@ void db_run::send_event(conn& c, const event& e)
     std::string& o = c.out;
     o += "id: " + std::to_string(e.seq) + (e.del ? "\nevent: delete\ndata: " : "\nevent: put\ndata: ");
     o += "{\"collection\":";
-    write_string(e.coll, o);
+    socketley::json::quote_into(o, e.coll);
     o += ",\"id\":";
-    write_string(e.id, o);
+    socketley::json::quote_into(o, e.id);
     if (!e.owner.empty())
     {
         o += ",\"owner\":";
-        write_string(e.owner, o);
+        socketley::json::quote_into(o, e.owner);
     }
     if (e.del)
         o += ",\"deleted\":true}\n\n";
@@ -1551,7 +1552,7 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
         else
         {
             std::string body = who.kind == principal::key ? "{\"key\":" : "{\"sub\":";
-            write_string(who.sub, body);
+            socketley::json::quote_into(body, who.sub);
             body += '}';
             respond(c, 200, body, allow);
         }
@@ -1560,7 +1561,7 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
     if (rq.path == "/" && reads)
     {
         std::string body = "{\"database\":";
-        write_string(m_owner.get_name(), body);
+        socketley::json::quote_into(body, m_owner.get_name());
         if (who.kind == principal::key)
         {
             body += ",\"collections\":[";
@@ -1569,7 +1570,7 @@ void db_run::handle(const std::shared_ptr<conn>& c, request& rq)
             {
                 body += first ? "" : ",";
                 first = false;
-                write_string(name, body);
+                socketley::json::quote_into(body, name);
             }
             body += ']';
         }
@@ -1894,9 +1895,9 @@ void db_run::call(uint64_t ticket, std::string_view json)
             body = "{\"status\":200,\"body\":{\"done\":" + std::string(it->second.done ? "true" : "false") +
                    ",\"ok\":" + (it->second.ok ? "true" : "false") + ",\"documents\":" +
                    std::to_string(it->second.documents) + ",\"file\":";
-            write_string(it->second.file, body);
+            socketley::json::quote_into(body, it->second.file);
             body += ",\"message\":";
-            write_string(it->second.why, body);
+            socketley::json::quote_into(body, it->second.why);
             body += "}}";
             if (it->second.done)
                 m_backups.erase(it);

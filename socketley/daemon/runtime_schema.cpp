@@ -1,5 +1,6 @@
 #include "runtime_schema.h"
 #include "../shared/runtime/runtime_config_apply.h"
+#include "../shared/json/json_escape.h"
 
 #include <string_view>
 
@@ -162,18 +163,6 @@ constexpr row rows[] = {
     {"--repositories", "Y", "path", "Repositories", "The file a storage writes for a user's own sync runtime, which pulls their git repositories.", "Sync", {}, "/var/lib/socketley/storage/ui/.ui/sync/user.json"},
 };
 
-void quote(std::string& o, std::string_view v)
-{
-    o += '"';
-    for (char c : v)
-    {
-        if (c == '"' || c == '\\')
-            o += '\\';
-        o += c;
-    }
-    o += '"';
-}
-
 }   // namespace
 
 const std::string& json()
@@ -186,7 +175,7 @@ const std::string& json()
             o += first ? "\n" : ",\n";
             first = false;
             o += "{\"flag\":";
-            quote(o, r.flag);
+            socketley::json::quote_into(o, r.flag);
             o += ",\"types\":[";
             bool f2 = true;
             for (char t : r.types)
@@ -195,30 +184,30 @@ const std::string& json()
                                  : t == 'T' ? "storage" : t == 'Y' ? "sync" : t == 'I' ? "idp" : t == 'B' ? "db" : "dns";
                 o += f2 ? "" : ",";
                 f2 = false;
-                quote(o, name);
+                socketley::json::quote_into(o, name);
             }
             o += "],\"kind\":";
-            quote(o, r.kind);
+            socketley::json::quote_into(o, r.kind);
             o += ",\"label\":";
-            quote(o, r.label);
+            socketley::json::quote_into(o, r.label);
             o += ",\"help\":";
-            quote(o, r.help);
+            socketley::json::quote_into(o, r.help);
             o += ",\"section\":";
-            quote(o, r.section);
+            socketley::json::quote_into(o, r.section);
             if (!r.choices.empty())
             {
                 o += ",\"choices\":";
-                quote(o, r.choices);
+                socketley::json::quote_into(o, r.choices);
             }
             if (!r.placeholder.empty())
             {
                 o += ",\"placeholder\":";
-                quote(o, r.placeholder);
+                socketley::json::quote_into(o, r.placeholder);
             }
             if (!r.aliases.empty())
             {
                 o += ",\"aliases\":";
-                quote(o, r.aliases);
+                socketley::json::quote_into(o, r.aliases);
             }
             if (r.hidden)
                 o += ",\"hidden\":true";
@@ -230,7 +219,7 @@ const std::string& json()
         {
             o += f3 ? "" : ",";
             f3 = false;
-            quote(o, k);
+            socketley::json::quote_into(o, k);
         }
         o += "]}";
         return o;

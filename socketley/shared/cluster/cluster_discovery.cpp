@@ -3,6 +3,8 @@
 #include "../runtime/runtime_manager.h"
 #include "../util/logging.h"
 #include "../../cli/command_hashing.h"
+#include "../json/json_escape.h"
+#include "../json/json_doc.h"
 
 #include <filesystem>
 #include <fstream>
@@ -20,145 +22,6 @@ namespace fs = std::filesystem;
 // ─── Minimal JSON helpers (local to this TU) ───
 
 namespace cd_detail {
-
-std::string json_escape(std::string_view s)
-{
-    std::string out;
-    out.reserve(s.size() + 4);
-    for (char c : s)
-    {
-        switch (c)
-        {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:   out += c;      break;
-        }
-    }
-    return out;
-}
-
-// Extract a string value for a given key from a flat JSON object
-// Simple parser — sufficient for our well-known format
-std::string json_get_string(std::string_view json, std::string_view key)
-{
-    // Look for "key":"value"
-    std::string needle = "\"";
-    needle += key;
-    needle += "\":\"";
-    auto pos = json.find(needle);
-    if (pos == std::string_view::npos)
-        return {};
-
-    pos += needle.size();
-    // Read back as json_escape wrote it, so a name with a quote or a backslash in it is the same name on every daemon.
-    std::string out;
-    for (; pos < json.size(); ++pos)
-    {
-        const char c = json[pos];
-        if (c == '"')
-            return out;
-        if (c != '\\')
-        {
-            out += c;
-            continue;
-        }
-        if (++pos >= json.size())
-            return {};
-        switch (json[pos])
-        {
-            case 'n': out += '\n'; break;
-            case 'r': out += '\r'; break;
-            case 't': out += '\t'; break;
-            default:  out += json[pos]; break;
-        }
-    }
-    return {};
-}
-
-// Extract a numeric value for a given key
-int64_t json_get_number(std::string_view json, std::string_view key)
-{
-    std::string needle = "\"";
-    needle += key;
-    needle += "\":";
-    auto pos = json.find(needle);
-    if (pos == std::string_view::npos)
-        return 0;
-
-    pos += needle.size();
-    // Skip whitespace
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
-        ++pos;
-
-    int64_t val = 0;
-    auto [ptr, ec] = std::from_chars(json.data() + pos,
-        json.data() + json.size(), val);
-    if (ec != std::errc{})
-        return 0;
-    return val;
-}
-
-// Parse the "runtimes" array from the JSON
-// Returns vector of {start_pos, end_pos} for each object in the array
-std::vector<std::string_view> json_get_array_objects(std::string_view json, std::string_view key)
-{
-    std::vector<std::string_view> result;
-
-    std::string needle = "\"";
-    needle += key;
-    needle += "\":[";
-    auto pos = json.find(needle);
-    if (pos == std::string_view::npos)
-        return result;
-
-    pos += needle.size();
-
-    while (pos < json.size())
-    {
-        // Skip whitespace
-        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' ||
-               json[pos] == '\n' || json[pos] == '\r' || json[pos] == ','))
-            ++pos;
-
-        if (pos >= json.size() || json[pos] == ']')
-            break;
-
-        if (json[pos] != '{')
-            break;
-
-        // The closing brace outside every string, since a name may hold one.
-        size_t end = std::string_view::npos;
-        bool in_string = false;
-        for (size_t i = pos + 1; i < json.size(); ++i)
-        {
-            const char c = json[i];
-            if (in_string)
-            {
-                if (c == '\\')
-                    ++i;
-                else if (c == '"')
-                    in_string = false;
-            }
-            else if (c == '"')
-                in_string = true;
-            else if (c == '}')
-            {
-                end = i;
-                break;
-            }
-        }
-        if (end == std::string_view::npos)
-            break;
-
-        result.push_back(json.substr(pos, end - pos + 1));
-        pos = end + 1;
-    }
-
-    return result;
-}
 
 const char* type_str(runtime_type t)
 {
@@ -209,21 +72,21 @@ cluster_discovery::~cluster_discovery()
 bool cluster_discovery::read_claim_file(const std::string& path,
                                         node_claim& out, int64_t& heartbeat) const
 {
-    using namespace cd_detail;
-
     std::ifstream f(path);
     if (!f.is_open())
         return false;
 
     std::ostringstream ss;
     ss << f.rdbuf();
-    const std::string content = ss.str();
+    socketley::json::jvalue doc;
+    if (!socketley::json::json_reader(ss.str()).document(doc))
+        return false;
 
-    heartbeat = json_get_number(content, "heartbeat");
-    out.host  = json_get_string(content, "host");
-    out.sock  = json_get_string(content, "sock");
-    out.boot  = json_get_string(content, "boot");
-    out.pid   = json_get_number(content, "pid");
+    heartbeat = socketley::json::int_of(doc, "heartbeat");
+    out.host  = std::string(socketley::json::string_of(doc, "host"));
+    out.sock  = std::string(socketley::json::string_of(doc, "sock"));
+    out.boot  = std::string(socketley::json::string_of(doc, "boot"));
+    out.pid   = socketley::json::int_of(doc, "pid");
     return true;
 }
 
@@ -368,17 +231,17 @@ std::string cluster_discovery::build_publish_json() const
     json.reserve(1024);
 
     json += "{\"daemon\":\"";
-    json += json_escape(m_daemon_name);
+    json += socketley::json::escape(m_daemon_name);
     json += "\",\"host\":\"";
-    json += json_escape(m_cluster_addr);
+    json += socketley::json::escape(m_cluster_addr);
 
     // The claim, which a reader of this directory needs none of and this
     // daemon needs all of when it finds the file under its own name on the
     // next boot.
     json += "\",\"sock\":\"";
-    json += json_escape(m_socket_path);
+    json += socketley::json::escape(m_socket_path);
     json += "\",\"boot\":\"";
-    json += json_escape(m_boot_id);
+    json += socketley::json::escape(m_boot_id);
     json += "\",\"pid\":";
 
     char pid_buf[16];
@@ -406,11 +269,11 @@ std::string cluster_discovery::build_publish_json() const
             first = false;
 
             json += "{\"name\":\"";
-            json += json_escape(name);
+            json += socketley::json::escape(name);
             json += "\",\"type\":\"";
             json += type_str(inst->get_type());
             json += "\",\"group\":\"";
-            json += json_escape(inst->get_group());
+            json += socketley::json::escape(inst->get_group());
             json += "\",\"port\":";
 
             char port_buf[8];
@@ -668,28 +531,32 @@ void cluster_discovery::unpublish()
 
 bool cluster_discovery::parse_daemon_json(const std::string& json, remote_daemon& out) const
 {
-    using namespace cd_detail;
-    out.name = json_get_string(json, "daemon");
-    out.host = json_get_string(json, "host");
-    out.heartbeat = static_cast<time_t>(json_get_number(json, "heartbeat"));
+    using socketley::json::int_of;
+    using socketley::json::string_of;
+    socketley::json::jvalue doc;
+    if (!socketley::json::json_reader(json).document(doc))
+        return false;
+    out.name = std::string(string_of(doc, "daemon"));
+    out.host = std::string(string_of(doc, "host"));
+    out.heartbeat = static_cast<time_t>(int_of(doc, "heartbeat"));
 
     if (out.name.empty() || out.heartbeat == 0)
         return false;
 
-    auto objects = json_get_array_objects(json, "runtimes");
-    for (auto obj : objects)
-    {
-        remote_runtime rt;
-        rt.daemon_name = out.name;
-        rt.host = out.host;
-        rt.name = json_get_string(obj, "name");
-        rt.type = json_get_string(obj, "type");
-        rt.group = json_get_string(obj, "group");
-        rt.port = static_cast<uint16_t>(json_get_number(obj, "port"));
-        rt.state = json_get_string(obj, "state");
-        rt.connections = static_cast<size_t>(json_get_number(obj, "connections"));
-        out.runtimes.push_back(std::move(rt));
-    }
+    if (const auto* list = socketley::json::member(doc, "runtimes"))
+        for (const auto& obj : list->items)
+        {
+            remote_runtime rt;
+            rt.daemon_name = out.name;
+            rt.host = out.host;
+            rt.name = std::string(string_of(obj, "name"));
+            rt.type = std::string(string_of(obj, "type"));
+            rt.group = std::string(string_of(obj, "group"));
+            rt.port = static_cast<uint16_t>(int_of(obj, "port"));
+            rt.state = std::string(string_of(obj, "state"));
+            rt.connections = static_cast<size_t>(int_of(obj, "connections"));
+            out.runtimes.push_back(std::move(rt));
+        }
 
     return true;
 }

@@ -16,35 +16,17 @@
 
 #include "dashboard.h"
 #include "../runtime/storage/git_mirrors.h"
-#include "../runtime/storage/json_doc.h"
+#include "../shared/json/json_doc.h"
 #include "../shared/http/https_client.h"
 #include "../shared/util/log_ring.h"
 #include "../shared/util/logging.h"
+#include "../shared/json/json_escape.h"
 
 namespace alerts
 {
 
 namespace
 {
-
-std::string quote(std::string_view s)
-{
-    std::string o = "\"";
-    for (const char c : s)
-    {
-        if (c == '"' || c == '\\')
-            o += '\\', o += c;
-        else if (static_cast<unsigned char>(c) < 0x20)
-        {
-            char b[8];
-            std::snprintf(b, sizeof b, "\\u%04x", c);
-            o += b;
-        }
-        else
-            o += c;
-    }
-    return o + "\"";
-}
 
 std::string size_text(double b)
 {
@@ -74,27 +56,19 @@ std::string days_text(int64_t left)
 std::string alert_json(const alert& a)
 {
     std::string o = "{\"id\":";
-    o += quote(a.id);
+    o += socketley::json::quote(a.id);
     o += ",\"level\":";
-    o += quote(a.level);
+    o += socketley::json::quote(a.level);
     o += ",\"runtime\":";
-    o += quote(a.runtime);
+    o += socketley::json::quote(a.runtime);
     o += ",\"title\":";
-    o += quote(a.title);
+    o += socketley::json::quote(a.title);
     o += ",\"detail\":";
-    o += quote(a.detail);
+    o += socketley::json::quote(a.detail);
     o += ",\"since\":";
     o += std::to_string(a.since);
     o += '}';
     return o;
-}
-
-const socketley::storage::jvalue* member(const socketley::storage::jvalue& o, std::string_view k)
-{
-    for (const auto& [name, v] : o.members)
-        if (name == k)
-            return &v;
-    return nullptr;
 }
 
 }   // namespace
@@ -265,12 +239,12 @@ void monitor::check(int64_t now, const std::vector<facts>& runtimes, const std::
             g.open(r.dir, 1, {}, false, {});
             for (const auto& repo : g.repos())
             {
-                socketley::storage::jvalue st;
-                if (!socketley::storage::json_reader(g.state_json(repo.id)).document(st))
+                socketley::json::jvalue st;
+                if (!socketley::json::json_reader(g.state_json(repo.id)).document(st))
                     continue;
                 const auto* ok = member(st, "ok");
                 const auto* err = member(st, "error");
-                if (ok && ok->k == socketley::storage::jvalue::kind::boolean && !ok->b)
+                if (ok && ok->k == socketley::json::jvalue::kind::boolean && !ok->b)
                     m_git[r.name].push_back(alert{"git:" + r.name + ":" + repo.id, "warning", r.name,
                                                   "Git: pulling " + repo.name + " into " + r.name + " failed",
                                                   err ? err->s : std::string(), 0});
@@ -370,8 +344,8 @@ void monitor::post(const alert& a, bool raised, int64_t now)
         text.resize(at);
     }
     std::string body = "{\"content\":";
-    body.append(quote(text)).append(",\"text\":").append(quote(text)).append(",\"state\":");
-    body.append(quote(raised ? "firing" : "resolved")).append(",\"host\":").append(quote(m_host));
+    body.append(socketley::json::quote(text)).append(",\"text\":").append(socketley::json::quote(text)).append(",\"state\":");
+    body.append(socketley::json::quote(raised ? "firing" : "resolved")).append(",\"host\":").append(socketley::json::quote(m_host));
     body.append(",\"alert\":").append(alert_json(a)).append("}");
     bool first_drop = false;
     {
@@ -488,7 +462,7 @@ std::string monitor::test()
     std::string err;
     if (!c.init(err, {}, "socketley-alerts") ||
         !c.request("POST", m_webhook, "application/json",
-                   "{\"content\":" + quote(text) + ",\"text\":" + quote(text) + ",\"state\":\"test\",\"host\":" + quote(m_host) + "}", r,
+                   "{\"content\":" + socketley::json::quote(text) + ",\"text\":" + socketley::json::quote(text) + ",\"state\":\"test\",\"host\":" + socketley::json::quote(m_host) + "}", r,
                    err, 10))
         return err;
     if (r.status < 200 || r.status >= 300)
