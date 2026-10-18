@@ -766,6 +766,8 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
 std::string state_persistence::format_json_pretty(const runtime_config& cfg) const
 {
     using namespace sp_detail;
+    // What a field is when nobody set it, so only a field that differs is written.
+    static const runtime_config defaults;
 
     // Helper lambdas for direct string building
     std::string j;
@@ -968,7 +970,7 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             }
             if (cfg.health_check > 0)
                 append_int_field("health_check", static_cast<int>(cfg.health_check));
-            if (cfg.health_interval != 5)
+            if (cfg.health_interval != defaults.health_interval)
                 append_int_field("health_interval", cfg.health_interval);
             if (!cfg.health_path.empty() && cfg.health_path != "/health")
                 append_str_field("health_path", cfg.health_path);
@@ -976,13 +978,13 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("auth", cfg.proxy_auth);
             if (cfg.https_redirect != 0)
                 append_int_field("redirect_https", cfg.https_redirect);
-            if (cfg.health_threshold != 3)
+            if (cfg.health_threshold != defaults.health_threshold)
                 append_int_field("health_threshold", cfg.health_threshold);
-            if (cfg.circuit_threshold != 5)
+            if (cfg.circuit_threshold != defaults.circuit_threshold)
                 append_int_field("circuit_threshold", cfg.circuit_threshold);
-            if (cfg.circuit_timeout != 30)
+            if (cfg.circuit_timeout != defaults.circuit_timeout)
                 append_int_field("circuit_timeout", cfg.circuit_timeout);
-            if (cfg.backend_timeout != 2)
+            if (cfg.backend_timeout != defaults.backend_timeout)
                 append_int_field("backend_timeout", cfg.backend_timeout);
             if (cfg.retry_count > 0)
                 append_int_field("retry_count", cfg.retry_count);

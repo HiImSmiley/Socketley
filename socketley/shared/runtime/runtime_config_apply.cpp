@@ -23,6 +23,7 @@ void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
     const auto want = [&](const char* key, bool differs) {
         return by_presence ? cfg.has(key) : differs;
     };
+    static const runtime_config defaults;
 
     if (want("protocol", true))
         prx.set_protocol(static_cast<proxy_protocol>(cfg.protocol));
@@ -42,17 +43,17 @@ void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
 
     if (want("health_check", cfg.health_check > 0))
         prx.set_health_check(static_cast<mesh_config::health_type>(cfg.health_check));
-    if (want("health_interval", cfg.health_interval != 5))
+    if (want("health_interval", cfg.health_interval != defaults.health_interval))
         prx.set_health_interval(cfg.health_interval);
     if (want("health_path", !cfg.health_path.empty()))
         prx.set_health_path(cfg.health_path);
-    if (want("health_threshold", cfg.health_threshold != 3))
+    if (want("health_threshold", cfg.health_threshold != defaults.health_threshold))
         prx.set_health_threshold(cfg.health_threshold);
-    if (want("circuit_threshold", cfg.circuit_threshold != 5))
+    if (want("circuit_threshold", cfg.circuit_threshold != defaults.circuit_threshold))
         prx.set_circuit_threshold(cfg.circuit_threshold);
-    if (want("circuit_timeout", cfg.circuit_timeout != 30))
+    if (want("circuit_timeout", cfg.circuit_timeout != defaults.circuit_timeout))
         prx.set_circuit_timeout(cfg.circuit_timeout);
-    if (want("backend_timeout", cfg.backend_timeout != 2))
+    if (want("backend_timeout", cfg.backend_timeout != defaults.backend_timeout))
         prx.set_backend_timeout(cfg.backend_timeout);
     if (want("retry_count", cfg.retry_count > 0))
         prx.set_retry_count(cfg.retry_count);
