@@ -29,6 +29,9 @@
 #include "../runtime/dns/dns_instance.h"
 #include "../runtime/dns/dns_zone.h"
 #include "../runtime/dns/dns_wire.h"
+#include "../shared/json/json_escape.h"
+#include "../shared/http/url.h"
+#include "../shared/http/status.h"
 
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -54,7 +57,6 @@ namespace
 {
 
 #include "dashboard_page.inc"
-#include "../shared/json/json_escape.h"
 
 constexpr int64_t session_seconds = 12 * 3600;
 
@@ -182,10 +184,7 @@ bool read_request(int fd, request& r, size_t max_body)
 
 void send(int fd, int status, std::string_view type, std::string_view body, std::string_view extra_headers)
 {
-    const char* reason = status == 200 ? "OK" : status == 204 ? "No Content" : status == 400 ? "Bad Request"
-                       : status == 401 ? "Unauthorized" : status == 403 ? "Forbidden" : status == 404 ? "Not Found"
-                       : status == 405 ? "Method Not Allowed" : status == 413 ? "Payload Too Large"
-                       : status == 429 ? "Too Many Requests" : status == 502 ? "Bad Gateway" : "Error";
+    const char* reason = socketley::http::status_text(status);
     std::string out = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
     if (!type.empty())
         out += "Content-Type: " + std::string(type) + "\r\n";
@@ -402,31 +401,17 @@ void server::session(int fd, const request& r)
 
 std::string query_field(std::string_view q, std::string_view name)
 {
-    for (size_t p = 0; p < q.size();)
-    {
-        size_t amp = q.find('&', p);
-        if (amp == std::string_view::npos)
-            amp = q.size();
-        const std::string_view kv = q.substr(p, amp - p);
-        p = amp + 1;
-        const size_t eq = kv.find('=');
-        if (kv.substr(0, eq) != name)
-            continue;
-        std::string out;
-        const std::string_view v = eq == std::string_view::npos ? std::string_view{} : kv.substr(eq + 1);
-        for (size_t i = 0; i < v.size(); ++i)
-        {
-            if (v[i] == '%' && i + 2 < v.size())
-            {
-                out += static_cast<char>(std::strtol(std::string(v.substr(i + 1, 2)).c_str(), nullptr, 16));
-                i += 2;
-            }
-            else
-                out += v[i] == '+' ? ' ' : v[i];
-        }
-        return out;
-    }
-    return {};
+    // The first of the name, empty when its escape spells nothing.
+    std::string out;
+    bool found = false;
+    socketley::http::for_each_pair(q, [&](std::string_view k, std::string_view v) {
+        if (found || k != name)
+            return;
+        found = true;
+        if (!socketley::http::percent_decode(v, out, true))
+            out.clear();
+    });
+    return out;
 }
 
 void server::logs(int fd, const request& r)

@@ -561,8 +561,6 @@ struct conn
 // header prefix, and the fields S3 reports.
 storage_rpc::object_info rpc_info_of(const object_meta& m, std::string key = {});
 
-// The text a status line gives after the code.
-const char* reason_phrase(int status);
 
 // A pass of the lifecycle sweep over every bucket with rules, which keeps its place between steps.
 struct lifecycle_pass

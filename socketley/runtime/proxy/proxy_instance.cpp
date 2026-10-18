@@ -12,6 +12,7 @@
 #include "../../shared/net/fast_lo.h"
 #include "../../shared/net/unix_listener.h"
 #include "../../shared/net/dns_feed.h"
+#include "../../shared/http/status.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -5305,41 +5306,6 @@ static bool filter_response_header_forbidden(std::string_view lower)
            lower == "connection";
 }
 
-static std::string_view filter_reason(int status)
-{
-    switch (status)
-    {
-        case 200: return "OK";
-        case 201: return "Created";
-        case 202: return "Accepted";
-        case 204: return "No Content";
-        case 301: return "Moved Permanently";
-        case 302: return "Found";
-        case 304: return "Not Modified";
-        case 307: return "Temporary Redirect";
-        case 308: return "Permanent Redirect";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 407: return "Proxy Authentication Required";
-        case 409: return "Conflict";
-        case 413: return "Content Too Large";
-        case 418: return "I'm a teapot";
-        case 421: return "Misdirected Request";
-        case 422: return "Unprocessable Content";
-        case 429: return "Too Many Requests";
-        case 451: return "Unavailable For Legal Reasons";
-        case 500: return "Internal Server Error";
-        case 501: return "Not Implemented";
-        case 502: return "Bad Gateway";
-        case 503: return "Service Unavailable";
-        case 504: return "Gateway Timeout";
-        default:  return "Unknown";
-    }
-}
-
 // Lowercase the name and trim the value for the table handed to a filter,
 // because a table lookup is exact and HTTP field names are not.
 static void filter_collect_header(sol::table& out, std::string_view line)
@@ -5615,7 +5581,7 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
         auto [cend, cec] = std::to_chars(code_buf, code_buf + sizeof(code_buf), status);
         response.append(code_buf, static_cast<size_t>(cend - code_buf));
         response += ' ';
-        response += filter_reason(status);
+        response += socketley::http::status_text(status);
         response += "\r\n";
 
         // A pointer key: gcc folds sol2's literal-key getters of two lengths into one and warns of a bound none crosses.

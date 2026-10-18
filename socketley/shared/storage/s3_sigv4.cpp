@@ -1,4 +1,5 @@
 #include "shared/storage/s3_sigv4.h"
+#include "../http/url.h"
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -251,27 +252,12 @@ constexpr auto unreserved_table = []
 
 bool kept_as_is(unsigned char c, bool keep_slash)
 {
-    return unreserved_table[c] || (keep_slash && c == '/');
+    return socketley::http::url_keeps(c, keep_slash);
 }
 
 void uri_encode_append(std::string& out, std::string_view s, bool keep_slash)
 {
-    static constexpr char digits[] = "0123456789ABCDEF";
-    out.reserve(out.size() + s.size());
-    size_t i = 0;
-    while (i < s.size())
-    {
-        size_t run = i;
-        while (run < s.size() && kept_as_is(static_cast<unsigned char>(s[run]), keep_slash))
-            ++run;
-        out.append(s.data() + i, run - i);
-        if (run == s.size())
-            break;
-        const auto c = static_cast<unsigned char>(s[run]);
-        const char esc[3] = {'%', digits[c >> 4], digits[c & 15]};
-        out.append(esc, 3);
-        i = run + 1;
-    }
+    socketley::http::url_encode_to(out, s, keep_slash);
 }
 
 // A path that decoding leaves alone and encoding gives back unchanged.
@@ -287,20 +273,7 @@ bool canonical_already(std::string_view path)
 std::string decode_component(std::string_view s, bool plus_is_space)
 {
     std::string out;
-    out.reserve(s.size());
-    for (size_t i = 0; i < s.size(); i++)
-    {
-        char c = s[i];
-        if (c == '%' && i + 2 < s.size() && hex_val(s[i + 1]) >= 0 && hex_val(s[i + 2]) >= 0)
-        {
-            out.push_back(static_cast<char>(hex_val(s[i + 1]) << 4 | hex_val(s[i + 2])));
-            i += 2;
-        }
-        else if (c == '+' && plus_is_space)
-            out.push_back(' ');
-        else
-            out.push_back(c);
-    }
+    socketley::http::percent_decode(s, out, plus_is_space, socketley::http::bad_escape::keep);
     return out;
 }
 
@@ -308,19 +281,7 @@ std::string decode_component(std::string_view s, bool plus_is_space)
 template <class F>
 void for_each_param(std::string_view q, F&& f)
 {
-    while (!q.empty())
-    {
-        size_t amp = q.find('&');
-        std::string_view part = q.substr(0, amp);
-        q = amp == std::string_view::npos ? std::string_view{} : q.substr(amp + 1);
-        if (part.empty())
-            continue;
-        size_t eq = part.find('=');
-        if (eq == std::string_view::npos)
-            f(part, std::string_view{});
-        else
-            f(part.substr(0, eq), part.substr(eq + 1));
-    }
+    socketley::http::for_each_pair(q, std::forward<F>(f));
 }
 
 void canonical_query(std::string& out, std::string_view raw_query, std::string_view drop)

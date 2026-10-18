@@ -19,6 +19,7 @@
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/storage/s3_sigv4.h"
 #include "../storage/s3_names.h"
+#include "../../shared/http/url.h"
 
 namespace socketley::sync
 {
@@ -150,7 +151,7 @@ int64_t mtime_of(const struct stat& st)
 std::string encode_key(std::string_view key)
 {
     std::string out;
-    socketley::storage::url_encode_to(out, key, true);
+    socketley::http::url_encode_to(out, key, true);
     return out;
 }
 
@@ -943,7 +944,7 @@ void sync_run::send_part(target& t, lane& l)
     const uint64_t off = (n - 1) * up.part;
     const uint64_t len = std::min(up.part, up.j.size - off);
     std::string query = "partNumber=" + std::to_string(n) + "&uploadId=";
-    socketley::storage::url_encode_to(query, up.id, false);
+    socketley::http::url_encode_to(query, up.id, false);
     http_request rq = signed_request(t, "PUT", up.j.path, query, {{"content-length", std::to_string(len)}});
     body_from(t, rq, up.fd, off, len);
     l.peer->exchange(std::move(rq), [this, &t, &l](http_answer a) {
@@ -973,7 +974,7 @@ void sync_run::complete_upload(target& t, lane& l)
         xml += "<Part><PartNumber>" + std::to_string(i + 1) + "</PartNumber><ETag>" + up.etags[i] + "</ETag></Part>";
     xml += "</CompleteMultipartUpload>";
     std::string query = "uploadId=";
-    socketley::storage::url_encode_to(query, up.id, false);
+    socketley::http::url_encode_to(query, up.id, false);
     // The length taken before the body is moved into the call, whose arguments may be read in any order.
     const std::string length = std::to_string(xml.size());
     std::vector<std::pair<std::string, std::string>> headers = {{"content-length", length},
@@ -1008,7 +1009,7 @@ void sync_run::abort_upload(target& t, lane& l, const std::string& why)
     if (!id.empty() && l.peer && !l.peer->busy())
     {
         std::string query = "uploadId=";
-        socketley::storage::url_encode_to(query, id, false);
+        socketley::http::url_encode_to(query, id, false);
         l.peer->exchange(signed_request(t, "DELETE", j.path, query, {}), [](http_answer) {});
     }
     if (!why.empty())
@@ -1354,11 +1355,11 @@ void sync_run::list_page(target& t, lane& l)
     if (!m_list_token.empty())
     {
         query = "continuation-token=";
-        socketley::storage::url_encode_to(query, m_list_token, false);
+        socketley::http::url_encode_to(query, m_list_token, false);
         query += "&";
     }
     query += "list-type=2&prefix=";
-    socketley::storage::url_encode_to(query, key_of({}), false);
+    socketley::http::url_encode_to(query, key_of({}), false);
     l.peer->exchange(signed_bucket_request(t, query), [this, &t, &l](http_answer a) {
         if (m_stopped)
             return;

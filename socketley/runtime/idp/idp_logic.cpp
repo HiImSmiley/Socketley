@@ -12,6 +12,7 @@
 #include "../../shared/crypto/jws.h"
 #include "../../shared/json/json_doc.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/http/url.h"
 
 namespace socketley::idp
 {
@@ -21,40 +22,7 @@ namespace
 
 bool unreserved(char c)
 {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '.' || c == '_' || c == '~';
-}
-
-int hex_value(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-bool form_decode(std::string_view in, std::string& out)
-{
-    out.clear();
-    out.reserve(in.size());
-    for (size_t i = 0; i < in.size(); ++i)
-    {
-        const char c = in[i];
-        if (c == '+')
-            out += ' ';
-        else if (c == '%')
-        {
-            if (i + 2 >= in.size())
-                return false;
-            const int hi = hex_value(in[i + 1]), lo = hex_value(in[i + 2]);
-            if (hi < 0 || lo < 0)
-                return false;
-            out += static_cast<char>(hi * 16 + lo);
-            i += 2;
-        }
-        else
-            out += c;
-    }
-    return true;
+    return socketley::http::url_keeps(static_cast<unsigned char>(c), false);
 }
 
 std::vector<std::string_view> words(std::string_view line)
@@ -149,21 +117,13 @@ bool parse_clients(std::string_view text, std::vector<client>& out, std::string&
 
 params parse_form(std::string_view in)
 {
+    // A pair whose escape spells nothing is left out rather than read as something else.
     params out;
-    while (!in.empty())
-    {
-        const size_t amp = in.find('&');
-        const std::string_view pair = in.substr(0, amp);
-        in = amp == std::string_view::npos ? std::string_view{} : in.substr(amp + 1);
-        if (pair.empty())
-            continue;
-        const size_t eq = pair.find('=');
+    socketley::http::for_each_pair(in, [&out](std::string_view name, std::string_view value) {
         std::string k, v;
-        if (!form_decode(pair.substr(0, eq), k) ||
-            !form_decode(eq == std::string_view::npos ? std::string_view{} : pair.substr(eq + 1), v))
-            continue;
-        out.emplace_back(std::move(k), std::move(v));
-    }
+        if (socketley::http::percent_decode(name, k, true) && socketley::http::percent_decode(value, v, true))
+            out.emplace_back(std::move(k), std::move(v));
+    });
     return out;
 }
 
@@ -177,21 +137,7 @@ std::string_view param(const params& p, std::string_view name)
 
 std::string url_encode(std::string_view in)
 {
-    static constexpr char hex[] = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(in.size() * 3);
-    for (const char c : in)
-    {
-        if (unreserved(c))
-            out += c;
-        else
-        {
-            out += '%';
-            out += hex[static_cast<unsigned char>(c) >> 4];
-            out += hex[static_cast<unsigned char>(c) & 15];
-        }
-    }
-    return out;
+    return socketley::http::url_encode(in, false);
 }
 
 std::string html_escape(std::string_view in)

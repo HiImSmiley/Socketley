@@ -30,6 +30,7 @@
 #include "../storage/scrypt.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/persist/replaced_file.h"
+#include "../../shared/http/status.h"
 
 namespace socketley::idp
 {
@@ -91,26 +92,6 @@ bool loopback(const sockaddr_storage& a)
                (IN6_IS_ADDR_V4MAPPED(&v6) && v6.s6_addr[12] == 127);
     }
     return false;
-}
-
-const char* reason(int status)
-{
-    switch (status)
-    {
-        case 200: return "OK";
-        case 302: return "Found";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 411: return "Length Required";
-        case 413: return "Content Too Large";
-        case 429: return "Too Many Requests";
-        case 431: return "Request Header Fields Too Large";
-        case 502: return "Bad Gateway";
-        case 503: return "Service Unavailable";
-        default:  return "Error";
-    }
 }
 
 std::string claim(const claims& c, std::string_view k)
@@ -656,7 +637,7 @@ void idp_run::respond(const std::shared_ptr<conn>& c, int status, std::string_vi
     o += "HTTP/1.1 ";
     o += std::to_string(status);
     o += ' ';
-    o += reason(status);
+    o += socketley::http::status_text(status);
     o += "\r\nContent-Type: ";
     o += type;
     o += "\r\nContent-Length: ";

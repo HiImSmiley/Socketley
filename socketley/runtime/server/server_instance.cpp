@@ -23,6 +23,8 @@
 // Deliberately not cache_instance.h, because everything this runtime needs of
 // a cache goes through the request channel as bytes.
 #include "../cache/resp_parser.h"
+#include "../../shared/http/url.h"
+#include "../../shared/http/status.h"
 
 #include <unistd.h>
 #include <unordered_set>
@@ -1205,37 +1207,12 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
     std::string_view url_path = (path == "/") ? std::string_view("/index.html")
                                               : std::string_view(path);
 
-    // Percent-decode the path to catch %2e%2e → .. traversal
-    auto percent_decode = [](std::string_view s) {
-        std::string out;
-        out.reserve(s.size());
-        for (size_t i = 0; i < s.size(); i++)
-        {
-            if (s[i] == '%' && i + 2 < s.size())
-            {
-                auto hex = [](char c) -> int {
-                    if (c >= '0' && c <= '9') return c - '0';
-                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-                    return -1;
-                };
-                int h = hex(s[i+1]), l = hex(s[i+2]);
-                if (h >= 0 && l >= 0)
-                {
-                    out += static_cast<char>((h << 4) | l);
-                    i += 2;
-                    continue;
-                }
-            }
-            out += s[i];
-        }
-        return out;
-    };
+    // Percent-decoded to catch %2e%2e as .. traversal, a '%' that spells nothing kept as it is.
     // Without a '%' the decode is the identity, so only a path that has one
     // pays for the copy.
     if (url_path.find('%') != std::string_view::npos)
     {
-        owned = percent_decode(url_path);
+        socketley::http::percent_decode(url_path, owned, false, socketley::http::bad_escape::keep);
         url_path = owned;
     }
 
@@ -1645,32 +1622,6 @@ void server_instance::serve_http(server_connection* conn, const std::string& pat
     }
 }
 
-// Only reachable from the Lua on_http_request path below, so the no-Lua build
-// has no caller for any of these helpers.
-// Lifted out of the no-Lua guard below: a status-to-phrase map with no Lua
-// in it, and begin_chunked_response() is a caller outside that path.
-static std::string_view http_reason(int status)
-{
-    switch (status)
-    {
-        case 200: return "OK";
-        case 201: return "Created";
-        case 204: return "No Content";
-        case 301: return "Moved Permanently";
-        case 302: return "Found";
-        case 304: return "Not Modified";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 500: return "Internal Server Error";
-        case 502: return "Bad Gateway";
-        case 503: return "Service Unavailable";
-        default:  return "Unknown";
-    }
-}
-
 #ifndef SOCKETLEY_NO_LUA
 static std::string build_http_response_full(int status, std::string_view reason,
     const std::vector<std::pair<std::string, std::string>>& headers,
@@ -1924,7 +1875,7 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
         // reason a raise is answered this way: a 200 with the unreadable part
         // dropped reads at the client exactly like a handler that meant it.
         auto answer_500 = [&] {
-            answer(build_http_response_full(500, http_reason(500), {},
+            answer(build_http_response_full(500, socketley::http::status_text(500), {},
                                             "500 Internal Server Error", keep_alive));
         };
 
@@ -1985,7 +1936,7 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
                 // the response below is the only copy of it.
                 const std::string_view body = lua_field_present(body_obj)
                     ? body_obj.as<std::string_view>() : std::string_view();
-                std::string_view reason = http_reason(status);
+                std::string_view reason = socketley::http::status_text(status);
 
                 // A header this end cannot read costs the client that header,
                 // while a status or body it cannot read costs the whole
@@ -4004,7 +3955,7 @@ bool server_instance::begin_chunked_response(server_connection* conn, int status
     auto [s_end, s_ec] = std::to_chars(sbuf, sbuf + sizeof(sbuf), status);
     head.append(sbuf, s_end - sbuf);
     head.push_back(' ');
-    head.append(http_reason(status));
+    head.append(socketley::http::status_text(status));
     head.append("\r\n");
 
     // The script's headers first, minus the two this owns: a Content-Length

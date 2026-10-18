@@ -9,6 +9,7 @@
 #include <ctime>
 #include <string>
 #include <string_view>
+#include "../../shared/http/url.h"
 
 namespace socketley::storage
 {
@@ -48,83 +49,19 @@ inline bool valid_bucket_name(std::string_view n)
     return true;
 }
 
-inline int hex_digit(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
+using socketley::http::hex_digit;
+using socketley::http::percent_decode;
+using socketley::http::url_keeps;
 
-// %XX decoding, false on a malformed escape; `plus_is_space` is the query
-// string's reading and never the path's.
-inline bool percent_decode(std::string_view in, std::string& out, bool plus_is_space)
-{
-    out.clear();
-    out.reserve(in.size());
-    for (size_t i = 0; i < in.size(); ++i)
-    {
-        const char c = in[i];
-        if (c == '%')
-        {
-            if (i + 2 >= in.size())
-                return false;
-            const int hi = hex_digit(in[i + 1]);
-            const int lo = hex_digit(in[i + 2]);
-            if (hi < 0 || lo < 0)
-                return false;
-            out.push_back(static_cast<char>(hi * 16 + lo));
-            i += 2;
-        }
-        else if (c == '+' && plus_is_space)
-            out.push_back(' ');
-        else
-            out.push_back(c);
-    }
-    return true;
-}
-
-// The bytes url_encode keeps as they are: the unreserved set and '/'.
-inline bool url_keeps(unsigned char c, bool keep_slash)
-{
-    static constexpr auto table = []
-    {
-        std::array<bool, 256> t{};
-        for (int i = 0; i < 256; ++i)
-            t[static_cast<size_t>(i)] = (i >= '0' && i <= '9') || (i >= 'a' && i <= 'z') ||
-                                        (i >= 'A' && i <= 'Z') || i == '-' || i == '_' ||
-                                        i == '.' || i == '~';
-        return t;
-    }();
-    return table[c] || (keep_slash && c == '/');
-}
-
-// The encoding `encoding-type=url` asks for in a listing: everything but the
-// unreserved set and '/' is escaped; appended to `out` without a temporary.
+// S3's encoding-type=url keeps '/' unless told otherwise.
 inline void url_encode_to(std::string& out, std::string_view in, bool keep_slash = true)
 {
-    static constexpr char digits[] = "0123456789ABCDEF";
-    size_t run = 0;
-    for (size_t i = 0; i < in.size(); ++i)
-    {
-        const unsigned char c = static_cast<unsigned char>(in[i]);
-        if (url_keeps(c, keep_slash))
-            continue;
-        out.append(in, run, i - run);
-        out.push_back('%');
-        out.push_back(digits[c >> 4]);
-        out.push_back(digits[c & 15]);
-        run = i + 1;
-    }
-    out.append(in, run, in.size() - run);
+    socketley::http::url_encode_to(out, in, keep_slash);
 }
 
 inline std::string url_encode(std::string_view in, bool keep_slash = true)
 {
-    std::string out;
-    out.reserve(in.size());
-    url_encode_to(out, in, keep_slash);
-    return out;
+    return socketley::http::url_encode(in, keep_slash);
 }
 
 inline std::string base64url_encode(std::string_view in)

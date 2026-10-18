@@ -30,6 +30,7 @@
 #include "../../shared/persist/state_persistence.h"
 #include "../../shared/net/unix_listener.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/http/status.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -1587,7 +1588,7 @@ std::string storage_run::response_head(const conn& c, const response& r, size_t 
         cached_date = http_date(now_s * 1000);
     }
 
-    const std::string_view reason = r.reason.empty() ? std::string_view(reason_phrase(r.status)) : r.reason;
+    const std::string_view reason = r.reason.empty() ? std::string_view(socketley::http::status_text(r.status)) : r.reason;
     size_t need = 200 + reason.size() + cached_date.size() + 2 * c.req.request_id.size();
     for (const auto& [k, v] : r.headers)
         need += k.size() + v.size() + 4;
@@ -1641,39 +1642,6 @@ std::string storage_run::response_head(const conn& c, const response& r, size_t 
     }
     h += r.close ? "Connection: close\r\n\r\n" : "Connection: keep-alive\r\n\r\n";
     return h;
-}
-
-const char* reason_phrase(int status)
-{
-    switch (status)
-    {
-        case 100: return "Continue";
-        case 200: return "OK";
-        case 204: return "No Content";
-        case 206: return "Partial Content";
-        case 301: return "Moved Permanently";
-        case 302: return "Found";
-        case 303: return "See Other";
-        case 307: return "Temporary Redirect";
-        case 308: return "Permanent Redirect";
-        case 304: return "Not Modified";
-        case 400: return "Bad Request";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 409: return "Conflict";
-        case 411: return "Length Required";
-        case 412: return "Precondition Failed";
-        case 413: return "Payload Too Large";
-        case 416: return "Range Not Satisfiable";
-        case 431: return "Request Header Fields Too Large";
-        case 500: return "Internal Server Error";
-        case 501: return "Not Implemented";
-        case 503: return "Service Unavailable";
-        case 505: return "HTTP Version Not Supported";
-        case 507: return "Insufficient Storage";
-        default:  return "Status";
-    }
 }
 
 void storage_run::send_response(const std::shared_ptr<conn>& c, response r)

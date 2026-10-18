@@ -46,6 +46,7 @@
 #include "../shared/storage/s3_sigv4.h"
 #include "../shared/storage/git_names.h"
 #include "../shared/json/json_escape.h"
+#include "../shared/http/url.h"
 
 extern char** environ;
 
@@ -181,21 +182,7 @@ bool read_full(int fd, char* p, size_t n)
 
 std::string uri_encode(std::string_view s, bool keep_slash)
 {
-    static constexpr char hex[] = "0123456789ABCDEF";
-    std::string out;
-    for (unsigned char c : s)
-    {
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
-            c == '.' || c == '~' || (keep_slash && c == '/'))
-            out += static_cast<char>(c);
-        else
-        {
-            out += '%';
-            out += hex[c >> 4];
-            out += hex[c & 15];
-        }
-    }
-    return out;
+    return socketley::http::url_encode(s, keep_slash);
 }
 
 struct reply

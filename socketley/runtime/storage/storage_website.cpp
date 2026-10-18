@@ -4,6 +4,7 @@
 #include "s3_names.h"
 #include "s3_website.h"
 #include "s3_xml.h"
+#include "../../shared/http/status.h"
 
 namespace socketley::storage
 {
@@ -221,7 +222,7 @@ void storage_run::website_error_page(const std::shared_ptr<conn>& c, const s3_er
         send_response(c, std::move(r));
         return;
     }
-    const std::string title = std::to_string(e.status) + " " + reason_phrase(e.status);
+    const std::string title = std::to_string(e.status) + " " + socketley::http::status_text(e.status);
     std::string& b = r.body;
     b = "<html>\n<head><title>";
     b += title;

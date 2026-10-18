@@ -26,6 +26,8 @@
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/ipc/shard_target.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/http/url.h"
+#include "../../shared/http/status.h"
 
 namespace socketley::db
 {
@@ -44,30 +46,6 @@ int64_t now_sec()
     timespec ts{};
     ::clock_gettime(CLOCK_REALTIME_COARSE, &ts);
     return static_cast<int64_t>(ts.tv_sec);
-}
-
-const char* reason(int status)
-{
-    switch (status)
-    {
-        case 200: return "OK";
-        case 201: return "Created";
-        case 204: return "No Content";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 409: return "Conflict";
-        case 411: return "Length Required";
-        case 412: return "Precondition Failed";
-        case 413: return "Content Too Large";
-        case 415: return "Unsupported Media Type";
-        case 431: return "Request Header Fields Too Large";
-        case 503: return "Service Unavailable";
-        case 507: return "Insufficient Storage";
-        default:  return "Error";
-    }
 }
 
 std::string error_body(std::string_view code, std::string_view message)
@@ -93,21 +71,7 @@ db_run::answer refused(const error& e)
 // A path's segment with its %XX spelled out; false for a % that spells nothing or a byte no id holds.
 bool unescape(std::string_view in, std::string& out)
 {
-    out.clear();
-    for (size_t i = 0; i < in.size(); ++i)
-    {
-        if (in[i] != '%')
-        {
-            out += in[i];
-            continue;
-        }
-        unsigned v = 0;
-        if (i + 2 >= in.size() || std::from_chars(in.data() + i + 1, in.data() + i + 3, v, 16).ptr != in.data() + i + 3)
-            return false;
-        out += static_cast<char>(v);
-        i += 2;
-    }
-    return true;
+    return socketley::http::percent_decode(in, out, false);
 }
 
 // The version an If-Match names, "3" or 3; 0 for none or one that is not a version.
@@ -1414,7 +1378,7 @@ void db_run::put_head(std::string& o, const conn& c, int status, std::string_vie
     o += "HTTP/1.1 ";
     number(static_cast<uint64_t>(status));
     o += ' ';
-    o += reason(status);
+    o += socketley::http::status_text(status);
     o += "\r\nContent-Type: ";
     o += type;
     o += "\r\nContent-Length: ";
