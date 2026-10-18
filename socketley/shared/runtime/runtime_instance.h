@@ -665,6 +665,8 @@ public:
     // holding the control socket, since the placeholder's store is empty.
     virtual request_sink* as_request_sink()
     { return m_sink_override; }
+    // The daemon's override when there is one, else the runtime itself.
+    request_sink* sink_or(request_sink* self) { return m_sink_override ? m_sink_override : self; }
 
     // What a runtime in a worker says it will answer, sent up and kept here
     // because the declaration is produced by running the script and the

@@ -148,19 +148,10 @@ using control_writer = frame_writer;
 // Every runtime this process does not hold, as the mirror of
 // proxy_supervisor's sink: the request goes out on the control socket, the
 // daemon resolves the name, and the answer comes back as a chan_rep.
-class remote_sink : public request_sink
+class remote_sink : public deferred_request_sink
 {
 public:
     explicit remote_sink(control_writer* w) : m_w(w) {}
-
-    void serve_request(std::string_view, std::string& out) override
-    {
-        // Unreachable because serves_inline() is false, and an answer invented
-        // here would be worse than none.
-        out.clear();
-    }
-
-    bool serves_inline() const override { return false; }
 
     bool serve_deferred(uint64_t ticket, std::string_view target,
                         std::string_view payload) override

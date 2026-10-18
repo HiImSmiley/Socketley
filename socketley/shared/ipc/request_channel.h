@@ -57,6 +57,14 @@ public:
     { return false; }
 };
 
+// A sink whose every answer comes on a later turn, so the inline path is never taken.
+class deferred_request_sink : public request_sink
+{
+public:
+    void serve_request(std::string_view, std::string& out) final { out.clear(); }
+    bool serves_inline() const final { return false; }
+};
+
 // What asks, whose reply carries the cookie and nothing else, because by then
 // the connection that asked may be gone.
 class request_origin

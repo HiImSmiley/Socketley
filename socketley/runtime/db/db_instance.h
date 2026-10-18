@@ -21,7 +21,7 @@ class db_run;
 // <state>/db/<name>/, the documents' snapshot and journal.
 std::string db_data_dir(std::string_view runtime_name);
 
-class db_instance : public runtime_instance, public request_sink
+class db_instance : public runtime_instance, public deferred_request_sink
 {
 public:
     explicit db_instance(std::string_view name);
@@ -76,14 +76,7 @@ public:
     std::string stats_lines() const override;
 
     // A script's socketley.db reaches the worker as a request on the channel, answered once the change is on the disk.
-    request_sink* as_request_sink() override
-    {
-        if (auto* o = runtime_instance::as_request_sink())
-            return o;
-        return this;
-    }
-    void serve_request(std::string_view, std::string& out) override { out.clear(); }
-    bool serves_inline() const override { return false; }
+    request_sink* as_request_sink() override { return sink_or(this); }
     bool serve_deferred(uint64_t ticket, std::string_view target, std::string_view payload) override;
     void listen_addresses(std::vector<std::string>& out) const override;
     uint16_t effective_port() const override;

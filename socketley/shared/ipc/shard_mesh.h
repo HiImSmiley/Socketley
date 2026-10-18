@@ -462,18 +462,11 @@ private:
 // What `name#j` resolves to in a shard's own sink table, registered under the
 // qualified name so the lookup hits here instead of falling through to the
 // daemon.
-class mesh_sink : public request_sink
+class mesh_sink : public deferred_request_sink
 {
 public:
     mesh_sink(shard_link* link, request_sink* relay)
         : m_link(link), m_relay(relay) {}
-
-    void serve_request(std::string_view, std::string& out) override
-    {
-        out.clear();          // unreachable: serves_inline() is false
-    }
-
-    bool serves_inline() const override { return false; }
 
     bool serve_deferred(uint64_t ticket, std::string_view target,
                         std::string_view payload) override

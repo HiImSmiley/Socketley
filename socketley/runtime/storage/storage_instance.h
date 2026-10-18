@@ -26,7 +26,7 @@ class storage_run;
 // because setup() and listen_addresses() have to answer with the same number.
 inline constexpr uint16_t storage_default_port = 9000;
 
-class storage_instance : public runtime_instance, public request_sink
+class storage_instance : public runtime_instance, public deferred_request_sink
 {
 public:
     explicit storage_instance(std::string_view name);
@@ -149,17 +149,10 @@ public:
     // magic that opens the payload) and another runtime's script calling
     // socketley.storage.*.  Both are answered on a later turn, because each of
     // them waits on the disk, so a slow disk is latency and never a stopped loop.
-    void serve_request(std::string_view payload, std::string& out) override;
-    bool serves_inline() const override { return false; }
     bool serve_deferred(uint64_t ticket, std::string_view target, std::string_view payload) override;
     // Itself in the worker, and the daemon's override where the runtime is a
     // placeholder for a worker, whose run is empty.
-    request_sink* as_request_sink() override
-    {
-        if (auto* o = runtime_instance::as_request_sink())
-            return o;
-        return this;
-    }
+    request_sink* as_request_sink() override { return sink_or(this); }
 
     // What was counted, for the tests that read it through `stats`.
     socketley::storage::storage_run* run() const { return m_run.get(); }

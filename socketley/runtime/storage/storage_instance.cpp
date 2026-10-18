@@ -151,12 +151,6 @@ bool storage_instance::tls_offloaded_blocks(std::vector<socketley::storage::buck
     return true;
 }
 
-void storage_instance::serve_request(std::string_view, std::string& out)
-{
-    // Unreachable because serves_inline() is false.
-    out.clear();
-}
-
 bool storage_instance::serve_deferred(uint64_t ticket, std::string_view, std::string_view payload)
 {
     // A sibling shard's request opens with the magic of the shard protocol, and

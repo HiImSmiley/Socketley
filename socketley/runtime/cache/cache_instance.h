@@ -484,12 +484,7 @@ public:
     // Itself when it is here, and the daemon's override when it is not: the
     // placeholder for an out-of-process cache has an empty store, so answering
     // from it would be confidently wrong rather than merely absent.
-    request_sink* as_request_sink() override
-    {
-        if (auto* o = runtime_instance::as_request_sink())
-            return o;
-        return this;
-    }
+    request_sink* as_request_sink() override { return sink_or(this); }
 
     // Maxmemory / Eviction
     void set_max_memory(size_t bytes);

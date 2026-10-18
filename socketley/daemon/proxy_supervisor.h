@@ -34,7 +34,7 @@ inline constexpr auto     restart_burst_window = std::chrono::seconds(10);
 // Also the request_sink for the runtime it supervises and the request_origin
 // for requests coming the other way, because the daemon holds the whole map
 // and is the only process that can route.
-class proxy_supervisor : public request_sink, public request_origin,
+class proxy_supervisor : public deferred_request_sink, public request_origin,
                          public io_handler
 {
 public:
@@ -50,10 +50,6 @@ public:
 
     void on_cqe(struct io_uring_cqe* cqe) override;
 
-    // Never inline: the answer is in another process and the only ways to
-    // pretend otherwise are to block this thread or to make it up.
-    bool serves_inline() const override { return false; }
-    void serve_request(std::string_view, std::string&) override {}
     bool serve_deferred(uint64_t ticket, std::string_view target,
                         std::string_view payload) override;
 
