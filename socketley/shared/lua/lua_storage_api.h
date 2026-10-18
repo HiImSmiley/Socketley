@@ -24,6 +24,9 @@
 
 namespace storage_rpc = socketley::storage_rpc;
 
+// An object's facts as the Lua table socketley.storage answers with and on_put is given, pushed on L.
+void push_object_info(lua_State* L, const storage_rpc::object_info& i, bool with_key, bool with_metadata);
+
 class lua_storage_client : public lua_request_client
 {
 public:

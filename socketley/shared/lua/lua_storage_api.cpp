@@ -193,7 +193,10 @@ void set_number(lua_State* L, const char* field, double v)
     lua_setfield(L, -2, field);
 }
 
-void push_info(lua_State* L, const storage_rpc::object_info& i, bool with_key, bool with_metadata)
+
+} // namespace
+
+void push_object_info(lua_State* L, const storage_rpc::object_info& i, bool with_key, bool with_metadata)
 {
     lua_createtable(L, 0, 6);
     if (with_key)
@@ -214,8 +217,6 @@ void push_info(lua_State* L, const storage_rpc::object_info& i, bool with_key, b
         lua_setfield(L, -2, "metadata");
     }
 }
-
-} // namespace
 
 lua_storage_client::lua_storage_client(lua_context& ctx, runtime_instance& owner)
     : lua_request_client(ctx, owner, "socketley.storage", "storage")
@@ -335,11 +336,11 @@ int lua_storage_client::push_values(lua_State* L, int tag, request_status st, st
     {
         case op::put:
         case op::head:
-            push_info(L, r->info, false, true);
+            push_object_info(L, r->info, false, true);
             return 1;
         case op::get:
             lua_pushlstring(L, r->data.data(), r->data.size());
-            push_info(L, r->info, false, true);
+            push_object_info(L, r->info, false, true);
             return 2;
         case op::del:
             lua_pushboolean(L, 1);
@@ -354,7 +355,7 @@ int lua_storage_client::push_values(lua_State* L, int tag, request_status st, st
             int i = 1;
             for (const auto& o : r->objects)
             {
-                push_info(L, o, true, false);
+                push_object_info(L, o, true, false);
                 lua_rawseti(L, -2, i++);
             }
             lua_setfield(L, -2, "objects");

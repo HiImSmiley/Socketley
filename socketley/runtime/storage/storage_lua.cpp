@@ -18,6 +18,7 @@
 #ifndef SOCKETLEY_NO_LUA
 #include "../../shared/lua/lua_context.h"
 #include "../../shared/lua/lua_suspend.h"
+#include "../../shared/lua/lua_storage_api.h"
 #endif
 
 namespace socketley::storage
@@ -155,18 +156,6 @@ std::string_view storage_run::operation_name(const s3_request& r)
 
 namespace
 {
-
-void set_info(sol::state& L, sol::table& t, const storage_rpc::object_info& i)
-{
-    t["size"]         = static_cast<double>(i.size);
-    t["etag"]         = i.etag;
-    t["content_type"] = i.content_type;
-    t["mtime_ms"]     = static_cast<double>(i.mtime_ms);
-    sol::table md = L.create_table();
-    for (const auto& [k, v] : i.metadata)
-        md[k] = v;
-    t["metadata"] = md;
-}
 
 // What on_request returned, as the refusal it amounts to or none.  A raise is a
 // refusal that says so, because a hook whose failure lets requests through is
@@ -306,9 +295,9 @@ void storage_run::notify_put(std::string_view bucket, std::string_view key, cons
     lua_context* lua = m_owner.lua();
     if (!lua || !lua->has_on_put() || m_stopped)
         return;
-    sol::state& L = lua->state();
-    sol::table t = L.create_table(0, 5);
-    set_info(L, t, rpc_info_of(m));
+    lua_State* L = lua->state().lua_state();
+    push_object_info(L, rpc_info_of(m), false, true);
+    sol::table t = sol::stack::pop<sol::table>(L);
     lua_suspender::id_t id = 0;
     lua->suspender().start(lua->raw_on_put(), "on_put", lua->callback_timeout_ms(), id,
                            std::string(bucket), std::string(key), t);
