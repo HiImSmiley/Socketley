@@ -8,6 +8,7 @@
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include "../../shared/util/hex.h"
 
 namespace socketley::storage
 {
@@ -97,15 +98,7 @@ public:
 
 inline std::string hex(const uint8_t* p, size_t n)
 {
-    static constexpr char digits[] = "0123456789abcdef";
-    std::string out;
-    out.resize(n * 2);
-    for (size_t i = 0; i < n; ++i)
-    {
-        out[2 * i]     = digits[p[i] >> 4];
-        out[2 * i + 1] = digits[p[i] & 15];
-    }
-    return out;
+    return socketley::hex_encode(p, n);
 }
 
 inline std::string hex(const md5_t& d) { return hex(d.data(), d.size()); }

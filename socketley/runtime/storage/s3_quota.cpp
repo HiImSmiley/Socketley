@@ -3,6 +3,7 @@
 #include <charconv>
 
 #include "s3_xml_tree.h"
+#include "../../shared/util/number_parse.h"
 
 namespace socketley::storage
 {
@@ -15,10 +16,7 @@ constexpr size_t quota_max_bytes = 4096;
 
 bool whole_number(const xml_node& n, uint64_t& out)
 {
-    if (!n.kids.empty() || n.text.empty())
-        return false;
-    const auto r = std::from_chars(n.text.data(), n.text.data() + n.text.size(), out);
-    return r.ec == std::errc{} && r.ptr == n.text.data() + n.text.size();
+    return n.kids.empty() && socketley::parse_whole(n.text, out);
 }
 
 }   // namespace

@@ -20,6 +20,7 @@
 #include "s3_xml.h"
 #include "storage_instance.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/number_parse.h"
 
 namespace socketley::storage
 {
@@ -96,14 +97,6 @@ bool unsupported_subresource(const s3_request& r, bool object)
     return false;
 }
 
-
-bool parse_uint(std::string_view s, uint64_t& out)
-{
-    if (s.empty())
-        return false;
-    const auto r = std::from_chars(s.data(), s.data() + s.size(), out);
-    return r.ec == std::errc{} && r.ptr == s.data() + s.size();
-}
 
 }   // namespace
 
@@ -717,7 +710,7 @@ void storage_run::op_list_buckets(const std::shared_ptr<conn>& c)
     if (q.has_query("max-buckets"))
     {
         uint64_t v;
-        if (!parse_uint(q.get_query("max-buckets"), v) || v < 1 || v > 10000)
+        if (!socketley::parse_whole(q.get_query("max-buckets"), v) || v < 1 || v > 10000)
         {
             bad_arg("max-buckets", "max-buckets must be an integer from 1 to 10000");
             return;
@@ -907,7 +900,7 @@ void storage_run::op_list_objects(const std::shared_ptr<conn>& c, bool v2)
     if (q.has_query("max-keys"))
     {
         uint64_t v;
-        if (!parse_uint(q.get_query("max-keys"), v))
+        if (!socketley::parse_whole(q.get_query("max-keys"), v))
         {
             bad_arg("maxKeys", "Provided max-keys not an integer or within integer range");
             return;
@@ -1941,14 +1934,14 @@ bool parse_attr_query(const s3_request& q, attr_query& a, std::string_view& bad)
     bad = "x-amz-max-parts";
     if (q.has_header("x-amz-max-parts"))
     {
-        if (!parse_uint(q.header("x-amz-max-parts"), v))
+        if (!socketley::parse_whole(q.header("x-amz-max-parts"), v))
             return false;
         a.max_parts = static_cast<uint32_t>(std::min<uint64_t>(v, 1000));
     }
     bad = "x-amz-part-number-marker";
     if (q.has_header("x-amz-part-number-marker"))
     {
-        if (!parse_uint(q.header("x-amz-part-number-marker"), v) || v > mpu_max_parts)
+        if (!socketley::parse_whole(q.header("x-amz-part-number-marker"), v) || v > mpu_max_parts)
             return false;
         a.marker = static_cast<uint32_t>(v);
     }
@@ -2124,7 +2117,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head, bool 
     if (q.has_query("partNumber"))
     {
         uint64_t n = 0;
-        if (!parse_uint(q.get_query("partNumber"), n) || n < 1 || n > mpu_max_parts)
+        if (!socketley::parse_whole(q.get_query("partNumber"), n) || n < 1 || n > mpu_max_parts)
         {
             s3_error e = make_error("InvalidArgument");
             e.message = "Part number must be an integer between 1 and 10000, inclusive";

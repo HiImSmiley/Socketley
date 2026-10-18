@@ -90,6 +90,7 @@ static std::string names_refusal(runtime_manager& manager, const runtime_instanc
 #include <csignal>
 #include "../shared/util/logging.h"
 #include "../shared/json/json_escape.h"
+#include "../shared/util/number_parse.h"
 
 // Two seconds is the backstop for a worker that has wedged, not a budget the
 // normal path spends -- a child reports in 17-22 ms -- and it is one budget
@@ -4562,7 +4563,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
     // 4464 and there is nothing left for anyone downstream to refuse -- the
     // runtime is configured for a port nobody asked for and `show` reports it
     // as though it had been typed.  The flag door has always refused the same
-    // input: parse_uint16() checks std::errc::result_out_of_range and prints
+    // input: socketley::parse_whole() checks std::errc::result_out_of_range and prints
     // "invalid port number".
     //
     // The typed-extra-digit case is exactly what the interactive editor makes
@@ -5627,7 +5628,7 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
     uint16_t port = 0;
     {
         auto sv = pa.args[3];
-        if (!parse_uint16(sv, port) || port == 0)
+        if (!socketley::parse_whole(sv, port) || port == 0)
         {
             conn->write_buf = "invalid port: " + std::string(sv) + "\n";
             return 1;

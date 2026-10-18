@@ -49,7 +49,7 @@ inline bool valid_bucket_name(std::string_view n)
     return true;
 }
 
-using socketley::http::hex_digit;
+using socketley::hex_digit;
 using socketley::http::percent_decode;
 using socketley::http::url_keeps;
 

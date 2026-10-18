@@ -12,6 +12,7 @@
 #include "s3_xml.h"
 #include "storage_instance.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/number_parse.h"
 
 namespace socketley::storage
 {
@@ -21,17 +22,8 @@ namespace
 
 constexpr uint32_t list_page_max = 1000;
 
-template <class T>
-bool parse_number(std::string_view s, T& out)
-{
-    if (s.empty())
-        return false;
-    const auto r = std::from_chars(s.data(), s.data() + s.size(), out);
-    return r.ec == std::errc{} && r.ptr == s.data() + s.size();
-}
-
-bool parse_u32(std::string_view s, uint32_t& out) { return parse_number(s, out); }
-bool parse_u64(std::string_view s, uint64_t& out) { return parse_number(s, out); }
+bool parse_u32(std::string_view s, uint32_t& out) { return socketley::parse_whole(s, out); }
+bool parse_u64(std::string_view s, uint64_t& out) { return socketley::parse_whole(s, out); }
 
 }   // namespace
 

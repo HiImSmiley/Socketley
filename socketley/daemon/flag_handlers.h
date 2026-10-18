@@ -10,22 +10,10 @@
 #include "../cli/command_hashing.h"
 #include "../shared/runtime/runtime_definitions.h"
 #include "../shared/util/size_suffix.h"
+#include "../shared/util/number_parse.h"
 
-// Integer parsing from string_view without allocating, of which parse_double
-// is the exception, because std::stod takes a std::string and from_chars for
-// double is not available everywhere.
-inline bool parse_uint16(std::string_view sv, uint16_t& out)
-{
-    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), out);
-    return ec == std::errc{} && ptr == sv.data() + sv.size();
-}
-
-inline bool parse_uint32(std::string_view sv, uint32_t& out)
-{
-    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), out);
-    return ec == std::errc{} && ptr == sv.data() + sv.size();
-}
-
+// parse_double is the one number not read by parse_whole, because std::stod
+// takes a std::string and from_chars for double is not available everywhere.
 // The whole string or nothing, because std::stod reports success for a prefix
 // and accepted `5abc` as 5, and the position it reports is what closes the
 // gap.

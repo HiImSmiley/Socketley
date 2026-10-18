@@ -4,6 +4,7 @@
 #include <charconv>
 
 #include "s3_xml_tree.h"
+#include "../../shared/util/number_parse.h"
 
 namespace socketley::storage
 {
@@ -31,10 +32,7 @@ bool leaf(const xml_node& n, std::string& out)
 
 bool number(const xml_node& n, int& out)
 {
-    if (!n.kids.empty() || n.text.empty())
-        return false;
-    const auto r = std::from_chars(n.text.data(), n.text.data() + n.text.size(), out);
-    return r.ec == std::errc{} && r.ptr == n.text.data() + n.text.size();
+    return n.kids.empty() && socketley::parse_whole(n.text, out);
 }
 
 // A host a redirect may name, with its port: what goes into a Location header and nothing that would end or split it.

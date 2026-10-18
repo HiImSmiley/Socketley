@@ -7,16 +7,10 @@
 #include <string>
 #include <string_view>
 
+#include "../util/hex.h"
+
 namespace socketley::http
 {
-
-inline int hex_digit(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
 
 // What a '%' that is not followed by two hex digits means.
 enum class bad_escape : uint8_t
@@ -36,8 +30,8 @@ inline bool percent_decode(std::string_view in, std::string& out, bool plus_is_s
         const char c = in[i];
         if (c == '%')
         {
-            const int hi = i + 2 < in.size() ? hex_digit(in[i + 1]) : -1;
-            const int lo = hi >= 0 ? hex_digit(in[i + 2]) : -1;
+            const int hi = i + 2 < in.size() ? socketley::hex_digit(in[i + 1]) : -1;
+            const int lo = hi >= 0 ? socketley::hex_digit(in[i + 2]) : -1;
             if (lo < 0)
             {
                 if (bad == bad_escape::reject)

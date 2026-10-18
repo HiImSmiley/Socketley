@@ -9,6 +9,7 @@
 
 #include "compression.h"
 #include "../../shared/cluster/raft_storage.h"
+#include "../../shared/util/number_parse.h"
 
 namespace socketley::storage
 {
@@ -109,12 +110,6 @@ struct reader
     }
 };
 
-bool decimal(std::string_view s, uint64_t& out)
-{
-    const auto r = std::from_chars(s.data(), s.data() + s.size(), out);
-    return !s.empty() && r.ec == std::errc{} && r.ptr == s.data() + s.size();
-}
-
 // The checksum `v` is in `a`, false unless b64() renders it back byte for byte.
 bool parse_checksum(checksum_algo a, std::string_view v, object_checksum& out)
 {
@@ -126,7 +121,7 @@ bool parse_checksum(checksum_algo a, std::string_view v, object_checksum& out)
     if (const std::string_view n = v.substr(chars); !n.empty())
     {
         uint64_t parts = 0;
-        if (n.size() < 2 || n[0] != '-' || n[1] == '0' || !decimal(n.substr(1), parts) || parts > UINT16_MAX)
+        if (n.size() < 2 || n[0] != '-' || n[1] == '0' || !socketley::parse_whole(n.substr(1), parts) || parts > UINT16_MAX)
             return false;
         composite = static_cast<uint16_t>(parts);
     }
@@ -784,7 +779,7 @@ bool part_list_of(const object_meta& m, part_list& out)
         if (v->find(',') == std::string::npos)
         {
             uint64_t each = 0;
-            if (!decimal(*v, each) || each == 0 || each > m.size / (count - 1))
+            if (!socketley::parse_whole(*v, each) || each == 0 || each > m.size / (count - 1))
                 return false;
             out.sizes.assign(count - 1, each);
             out.sizes.push_back(m.size - each * (count - 1));
@@ -796,7 +791,7 @@ bool part_list_of(const object_meta& m, part_list& out)
             const bool ok = each_item(*v, [&](std::string_view item)
             {
                 uint64_t s = 0;
-                if (!decimal(item, s) || s > m.size - total || out.sizes.size() == count)
+                if (!socketley::parse_whole(item, s) || s > m.size - total || out.sizes.size() == count)
                     return false;
                 total += s;
                 out.sizes.push_back(s);
@@ -819,11 +814,11 @@ bool part_list_of(const object_meta& m, part_list& out)
         {
             const size_t dash = item.find('-');
             uint64_t lo = 0, hi = 0;
-            if (!decimal(item.substr(0, dash), lo))
+            if (!socketley::parse_whole(item.substr(0, dash), lo))
                 return false;
             if (dash == std::string_view::npos)
                 hi = lo;
-            else if (!decimal(item.substr(dash + 1), hi))
+            else if (!socketley::parse_whole(item.substr(dash + 1), hi))
                 return false;
             if (lo < 1 || hi < lo || hi > 10000 || (!out.numbers.empty() && lo <= out.numbers.back()) ||
                 out.numbers.size() + (hi - lo + 1) > count)
@@ -899,8 +894,8 @@ bool part_trailer_of(const object_meta& m, part_trailer& out)
     const std::string_view hexd = semi == std::string_view::npos ? std::string_view{}
                                                                   : s.substr(semi + 1, semi2 - semi - 1);
     uint64_t width = 0;
-    if (!decimal(s.substr(0, semi), out.at) || hexd.size() != 2 * out.digest.size() ||
-        (semi2 != std::string_view::npos && (!decimal(s.substr(semi2 + 1), width) || width == 0 || width > 64)))
+    if (!socketley::parse_whole(s.substr(0, semi), out.at) || hexd.size() != 2 * out.digest.size() ||
+        (semi2 != std::string_view::npos && (!socketley::parse_whole(s.substr(semi2 + 1), width) || width == 0 || width > 64)))
         return false;
     for (size_t i = 0; i < out.digest.size(); ++i)
     {

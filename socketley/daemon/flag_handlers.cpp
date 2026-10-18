@@ -28,6 +28,7 @@
 #include "../runtime/storage/s3_vhost.h"
 #include "../runtime/storage/sync_mode.h"
 #include "../runtime/storage/sync_runners.h"
+#include "../shared/util/number_parse.h"
 
 // Five flags that describe inbound traffic are refused on a client, which
 // accepts none, because they were stored and reported by `show` while no code
@@ -81,7 +82,7 @@ static int parse_port_flag(runtime_instance* instance, std::string_view value)
 {
     const size_t colon = value.rfind(':');
     uint16_t port;
-    if (!parse_uint16(colon == std::string_view::npos ? value : value.substr(colon + 1), port))
+    if (!socketley::parse_whole(colon == std::string_view::npos ? value : value.substr(colon + 1), port))
     {
         std::cout << "invalid port number\n";
         return 1;
@@ -249,7 +250,7 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             }
 
             uint32_t n = 0;
-            if (!parse_uint32(pa.args[++i], n) || n < 1)
+            if (!socketley::parse_whole(pa.args[++i], n) || n < 1)
             {
                 std::cout << "invalid shard count\n";
                 return 1;
@@ -374,7 +375,7 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 return 1;
             }
             uint32_t max;
-            if (!parse_uint32(pa.args[++i], max))
+            if (!socketley::parse_whole(pa.args[++i], max))
             {
                 std::cout << "invalid max-connections value\n";
                 return 1;
@@ -1494,7 +1495,7 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
         case fnv1a("--proxy-port"):
         {
             uint32_t port = 0;
-            if (i + 1 >= pa.count || !parse_uint32(pa.args[i + 1], port) || port == 0 || port > 65535)
+            if (i + 1 >= pa.count || !socketley::parse_whole(pa.args[i + 1], port) || port == 0 || port > 65535)
             {
                 std::cout << "--proxy-port requires the port the entrance listens on, 1 to 65535\n";
                 return 1;
@@ -1517,7 +1518,7 @@ int parse_dns_flags(dns_instance* dns, const parsed_args& pa, size_t& i, std::st
         case fnv1a("--rrl"):
         {
             uint32_t n = 0;
-            if (i + 1 >= pa.count || !parse_uint32(pa.args[i + 1], n) || n > 1000000)
+            if (i + 1 >= pa.count || !socketley::parse_whole(pa.args[i + 1], n) || n > 1000000)
             {
                 std::cout << "--rrl requires responses a second per client network, 0 for no limit\n";
                 return 1;
@@ -2115,7 +2116,7 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 return 1;
             }
             uint32_t n = 0;
-            if (!parse_uint32(pa.args[++i], n) || n < 1)
+            if (!socketley::parse_whole(pa.args[++i], n) || n < 1)
             {
                 std::cout << "invalid shard count\n";
                 return 1;
@@ -2224,7 +2225,7 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 return 1;
             }
             uint32_t max;
-            if (!parse_uint32(pa.args[++i], max))
+            if (!socketley::parse_whole(pa.args[++i], max))
             {
                 std::cout << "invalid max-connections value\n";
                 return 1;

@@ -10,6 +10,7 @@
 #include "digest.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/persist/replaced_file.h"
+#include "../../shared/util/hex.h"
 
 namespace socketley::storage
 {
@@ -25,16 +26,8 @@ std::string to_hex(std::string_view s)
 std::string from_hex(std::string_view h)
 {
     std::string out;
-    if (h == "-" || h.size() % 2)
-        return out;
-    const auto digit = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
-    for (size_t i = 0; i < h.size(); i += 2)
-    {
-        const int a = digit(h[i]), b = digit(h[i + 1]);
-        if (a < 0 || b < 0)
-            return {};
-        out.push_back(static_cast<char>(a << 4 | b));
-    }
+    if (h == "-" || !socketley::hex_decode(h, out))
+        return {};
     return out;
 }
 

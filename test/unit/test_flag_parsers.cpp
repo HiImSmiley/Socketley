@@ -34,28 +34,28 @@
 TEST_CASE("parse_uint16 takes the whole string or nothing")
 {
     uint16_t v = 0;
-    CHECK(parse_uint16("0", v));      CHECK(v == 0);
-    CHECK(parse_uint16("8080", v));   CHECK(v == 8080);
-    CHECK(parse_uint16("65535", v));  CHECK(v == 65535);
+    CHECK(socketley::parse_whole("0", v));      CHECK(v == 0);
+    CHECK(socketley::parse_whole("8080", v));   CHECK(v == 8080);
+    CHECK(socketley::parse_whole("65535", v));  CHECK(v == 65535);
 
-    CHECK_FALSE(parse_uint16("65536", v));   // out of range
-    CHECK_FALSE(parse_uint16("80a", v));     // trailing
-    CHECK_FALSE(parse_uint16("a80", v));     // leading
-    CHECK_FALSE(parse_uint16("", v));
-    CHECK_FALSE(parse_uint16("-1", v));
-    CHECK_FALSE(parse_uint16(" 80", v));     // from_chars does not skip space
+    CHECK_FALSE(socketley::parse_whole("65536", v));   // out of range
+    CHECK_FALSE(socketley::parse_whole("80a", v));     // trailing
+    CHECK_FALSE(socketley::parse_whole("a80", v));     // leading
+    CHECK_FALSE(socketley::parse_whole("", v));
+    CHECK_FALSE(socketley::parse_whole("-1", v));
+    CHECK_FALSE(socketley::parse_whole(" 80", v));     // from_chars does not skip space
 }
 
 TEST_CASE("parse_uint32 takes the whole string or nothing")
 {
     uint32_t v = 0;
-    CHECK(parse_uint32("4294967295", v)); CHECK(v == 4294967295u);
-    CHECK(parse_uint32("77", v));         CHECK(v == 77u);
+    CHECK(socketley::parse_whole("4294967295", v)); CHECK(v == 4294967295u);
+    CHECK(socketley::parse_whole("77", v));         CHECK(v == 77u);
 
-    CHECK_FALSE(parse_uint32("4294967296", v));
-    CHECK_FALSE(parse_uint32("77x", v));
-    CHECK_FALSE(parse_uint32("", v));
-    CHECK_FALSE(parse_uint32("-5", v));
+    CHECK_FALSE(socketley::parse_whole("4294967296", v));
+    CHECK_FALSE(socketley::parse_whole("77x", v));
+    CHECK_FALSE(socketley::parse_whole("", v));
+    CHECK_FALSE(socketley::parse_whole("-5", v));
 }
 
 TEST_CASE("parse_double takes the whole string or nothing")

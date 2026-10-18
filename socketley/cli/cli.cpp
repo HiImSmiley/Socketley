@@ -223,7 +223,7 @@ int cli_dispatch(int argc, char** argv)
                 std::string sock;
                 if (!std::getline(f, sock) || sock.empty())
                     continue;
-                // The whole stem or nothing, the rule parse_uint32 states:
+                // The whole stem or nothing, the rule parse_whole states:
                 // strtol took the digits in front of a typo, and the removal
                 // below then rebuilt a name that was another file's.
                 const std::string stem = e.path().stem().string();

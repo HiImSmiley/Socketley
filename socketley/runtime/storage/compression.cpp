@@ -6,18 +6,13 @@
 #include <cstring>
 
 #include "lz4_block.h"
+#include "../../shared/util/number_parse.h"
 
 namespace socketley::storage
 {
 
 namespace
 {
-
-bool to_u64(std::string_view s, uint64_t& out)
-{
-    const auto r = std::from_chars(s.data(), s.data() + s.size(), out);
-    return !s.empty() && r.ec == std::errc{} && r.ptr == s.data() + s.size();
-}
 
 }   // namespace
 
@@ -40,8 +35,8 @@ bool lz4_record_of(const object_meta& m, lz4_record& out)
         s    = i == 3 ? std::string_view{} : s.substr(semi + 1);
     }
     uint64_t chunk = 0;
-    if (f[0] != "1" || !to_u64(f[1], chunk) || chunk != lz4_chunk || !to_u64(f[2], out.table_at) ||
-        !to_u64(f[3], out.chunks))
+    if (f[0] != "1" || !socketley::parse_whole(f[1], chunk) || chunk != lz4_chunk || !socketley::parse_whole(f[2], out.table_at) ||
+        !socketley::parse_whole(f[3], out.chunks))
         return false;
     return m.parts == 0 && m.size > 0 && out.chunks == lz4_chunks_of(m.size) &&
            out.table_at <= m.size;

@@ -16,6 +16,7 @@
 #include "../../shared/http/http_framing.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/storage/s3_sigv4.h"
+#include "../../shared/util/hex.h"
 
 namespace socketley::storage
 {
@@ -85,17 +86,7 @@ std::string hex_of(std::string_view s)
 std::string unhex(std::string_view h)
 {
     std::string out;
-    if (h.size() % 2)
-        return out;
-    const auto digit = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
-    for (size_t i = 0; i < h.size(); i += 2)
-    {
-        const int a = digit(h[i]), b = digit(h[i + 1]);
-        if (a < 0 || b < 0)
-            return {};
-        out.push_back(static_cast<char>(a << 4 | b));
-    }
-    return out;
+    return socketley::hex_decode(h, out) ? out : std::string();
 }
 
 // Writes `text` beside `path` and renames it over, unsynced, for a note a crash may take back to an older one.
