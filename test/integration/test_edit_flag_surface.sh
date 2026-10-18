@@ -81,9 +81,11 @@ SURFACE=$(python3 - "$SRC" <<'PY'
 import re, sys
 fn = None
 for line in open(sys.argv[1]):
-    m = re.match(r'^int (parse_\w+)\(', line)
+    m = re.match(r'^(?:static )?int (parse_\w+)\(', line)
     if m:
+        # The flags create and edit share are edit's common ones as well.
         fn = m.group(1)
+        fn = 'parse_common_edit_flags' if fn == 'parse_shared_flags' else fn.replace('_shared_flags', '_edit_flags')
         continue
     if fn and fn.endswith('_edit_flags'):
         for f in re.findall(r'case fnv1a\("(-[^"]+)"\)', line):

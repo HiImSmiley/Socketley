@@ -72,7 +72,8 @@ for f in schema["flags"]:
     for n in names:
         known.setdefault(n, set()).update(f["types"])
 # The create parsers, each one's cases.
-parsers = {"parse_common_flags": None, "parse_server_flags": "server", "parse_client_flags": "client",
+parsers = {"parse_common_flags": None, "parse_shared_flags": None, "parse_server_shared_flags": "server",
+           "parse_client_shared_flags": "client", "parse_proxy_shared_flags": "proxy", "parse_server_flags": "server", "parse_client_flags": "client",
            "parse_proxy_gate_flag": "proxy", "parse_proxy_flags": "proxy", "parse_cache_flags": "cache",
            "parse_dns_flags": "dns", "parse_storage_flags": "storage", "parse_sync_flags": "sync",
            "parse_idp_flags": "idp", "parse_db_flags": "db"}

@@ -199,6 +199,37 @@ static bool parse_duration_flag(const char* flag, std::string_view value,
     }
 }
 
+// A duration flag's value, whole seconds from `min` to `max`; false after saying `usage` when there is none or it
+// cannot be.
+static bool take_duration(const parsed_args& pa, size_t& i, uint64_t min, uint64_t max, const char* usage,
+                          uint64_t& out)
+{
+    const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+    if (v.empty() || parse_duration_seconds(v, max, out) != duration_parse::ok || out < min)
+    {
+        std::cout << usage;
+        return false;
+    }
+    ++i;
+    return true;
+}
+
+// A size flag's value in bytes, with a K, M or G suffix; false after saying which when there is none or it cannot be.
+static bool take_size(const parsed_args& pa, size_t& i, const char* flag, size_t& out)
+{
+    if (i + 1 >= pa.count)
+    {
+        std::cout << flag << " requires a size value\n";
+        return false;
+    }
+    if (!parse_size_suffix(pa.args[++i], out))
+    {
+        std::cout << "invalid " << flag << " value (use K/M/G suffix)\n";
+        return false;
+    }
+    return true;
+}
+
 // The counts, next to the durations and for the same reason: three flags spelled
 // this check by hand and all three forgot the end pointer, so `--retry 2x` was
 // two and said nothing about the x.
@@ -221,18 +252,12 @@ static bool parse_count_flag(const char* flag, std::string_view value,
     return true;
 }
 
-int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
-                       size_t& i, bool& autostart, std::string& lua_script)
+// The flags create and edit take alike, after each has answered its own: one body per flag, so a fix to one
+// reaches both.
+static int parse_shared_flags(runtime_instance* instance, const parsed_args& pa, size_t& i)
 {
     switch (pa.hashes[i])
     {
-        // One flag for where a runtime runs, naming the non-default state,
-        // because two names for one bit have to be kept level in four places
-        // -- and --listen is here rather than in three per-type parsers for
-        // the same reason.
-        case fnv1a("--listen"):
-            return parse_listen_flag(instance, pa, i);
-
         // N workers sharing one listening socket, for the saturated case and
         // no other, asked for and never inferred, because sharding is correct
         // exactly when nothing is shared between connections and nothing can
@@ -274,7 +299,7 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         {
             if (i + 1 >= pa.count)
             {
-                std::cout << "-p requires a port\n";
+                std::cout << "-p requires a port number\n";
                 return 1;
             }
             return parse_port_flag(instance, pa.args[++i]);
@@ -290,18 +315,10 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             return apply_bind_address(instance, pa.args[++i]);
         }
 
-        case fnv1a("-s"):
-            autostart = true;
-            return 0;
-
-        case fnv1a("--test"):
-            instance->set_test_mode(true);
-            return 0;
-
         case fnv1a("--log"):
             if (i + 1 >= pa.count)
             {
-                std::cout << "--log requires a file\n";
+                std::cout << "--log requires a file path\n";
                 return 1;
             }
             // Absolute only: a relative path is resolved against the
@@ -318,7 +335,7 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("-w"):
             if (i + 1 >= pa.count)
             {
-                std::cout << "-w requires a file\n";
+                std::cout << "-w requires a file path\n";
                 return 1;
             }
             // Absolute only: a relative path is resolved against the
@@ -330,19 +347,6 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 return 1;
             }
             instance->set_write_file(pa.args[++i]);
-            return 0;
-
-        // Recorded here and loaded by the caller, because loading snapshots
-        // the `self` table as the instance is at that moment, so `--lua x.lua
-        // -p 9000` and `-p 9000 --lua x.lua` gave one runtime two different
-        // self.port values.
-        case fnv1a("--lua"):
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--lua requires a Lua script path\n";
-                return 1;
-            }
-            lua_script = pa.args[++i];
             return 0;
 
         case fnv1a("-b"):
@@ -459,40 +463,120 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
 
         case fnv1a("--read-buffer"):
         {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--read-buffer requires a size value\n";
-                return 1;
-            }
             size_t bytes;
-            if (!parse_size_suffix(pa.args[++i], bytes))
-            {
-                std::cout << "invalid --read-buffer value (use K/M/G suffix)\n";
+            if (!take_size(pa, i, "--read-buffer", bytes))
                 return 1;
-            }
+            // Live on a running runtime too: the bound is compared on every read.
             instance->set_read_buffer(bytes);
             return 0;
         }
 
         case fnv1a("--write-buffer"):
         {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--write-buffer requires a size value\n";
-                return 1;
-            }
             size_t bytes;
-            if (!parse_size_suffix(pa.args[++i], bytes))
-            {
-                std::cout << "invalid --write-buffer value (use K/M/G suffix)\n";
+            if (!take_size(pa, i, "--write-buffer", bytes))
                 return 1;
-            }
             // Every runtime has a write queue, so unlike --idle-timeout there
             // is nothing to refuse this on: the client's queue is the one that
             // fills when its server stops reading.
             instance->set_write_buffer(bytes);
             return 0;
         }
+
+        // Stored for the roles that perform a handshake and refused for a type
+        // that would answer cleartext on an endpoint `inspect` calls
+        // encrypted, while whether the set is complete is decided once parsing
+        // is done.
+        case fnv1a("--tls"):
+            if (!tls_role_has_handshake(instance->get_type()))
+            {
+                std::cout << tls_not_implemented_error("--tls");
+                return 1;
+            }
+            instance->set_tls(true);
+            return 0;
+
+        case fnv1a("--acme"):
+        case fnv1a("--acme-email"):
+            return parse_acme_flag(instance, pa, i);
+
+        case fnv1a("--domain"):
+            return parse_domain_flag(instance, pa, i);
+
+        case fnv1a("--cert"):
+        case fnv1a("--key"):
+        case fnv1a("--ca"):
+        {
+            const uint32_t which = pa.hashes[i];
+            const char* flag = which == fnv1a("--cert") ? "--cert"
+                             : which == fnv1a("--key")  ? "--key"
+                                                        : "--ca";
+            if (!tls_role_has_handshake(instance->get_type()))
+            {
+                std::cout << tls_not_implemented_error(flag);
+                return 1;
+            }
+            if (i + 1 >= pa.count)
+            {
+                std::cout << flag << " requires a file\n";
+                return 1;
+            }
+            const std::string_view path = pa.args[++i];
+            if (which == fnv1a("--cert"))     instance->set_cert_path(path);
+            else if (which == fnv1a("--key")) instance->set_key_path(path);
+            else                              instance->set_ca_path(path);
+            return 0;
+        }
+
+        case fnv1a("--group"):
+        case fnv1a("-g"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--group requires a value\n";
+                return 1;
+            }
+            instance->set_group(pa.args[++i]);
+            return 0;
+        }
+
+        default:
+            return -1;
+    }
+}
+
+int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
+                       size_t& i, bool& autostart, std::string& lua_script)
+{
+    switch (pa.hashes[i])
+    {
+        // One flag for where a runtime runs, naming the non-default state,
+        // because two names for one bit have to be kept level in four places
+        // -- and --listen is here rather than in three per-type parsers for
+        // the same reason.
+        case fnv1a("--listen"):
+            return parse_listen_flag(instance, pa, i);
+
+        case fnv1a("-s"):
+            autostart = true;
+            return 0;
+
+        case fnv1a("--test"):
+            instance->set_test_mode(true);
+            return 0;
+
+        // Recorded here and loaded by the caller, because loading snapshots
+        // the `self` table as the instance is at that moment, so `--lua x.lua
+        // -p 9000` and `-p 9000 --lua x.lua` gave one runtime two different
+        // self.port values.
+        case fnv1a("--lua"):
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--lua requires a Lua script path\n";
+                return 1;
+            }
+            lua_script = pa.args[++i];
+            return 0;
 
         case fnv1a("--drain"):
             // The fifth of them.  get_drain() is read by the server, the proxy
@@ -569,63 +653,6 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
-        // Stored for the roles that perform a handshake and refused for a type
-        // that would answer cleartext on an endpoint `inspect` calls
-        // encrypted, while whether the set is complete is decided once parsing
-        // is done.
-        case fnv1a("--tls"):
-            if (!tls_role_has_handshake(instance->get_type()))
-            {
-                std::cout << tls_not_implemented_error("--tls");
-                return 1;
-            }
-            instance->set_tls(true);
-            return 0;
-
-        case fnv1a("--acme"):
-        case fnv1a("--acme-email"):
-            return parse_acme_flag(instance, pa, i);
-
-        case fnv1a("--domain"):
-            return parse_domain_flag(instance, pa, i);
-
-        case fnv1a("--cert"):
-        case fnv1a("--key"):
-        case fnv1a("--ca"):
-        {
-            const uint32_t which = pa.hashes[i];
-            const char* flag = which == fnv1a("--cert") ? "--cert"
-                             : which == fnv1a("--key")  ? "--key"
-                                                        : "--ca";
-            if (!tls_role_has_handshake(instance->get_type()))
-            {
-                std::cout << tls_not_implemented_error(flag);
-                return 1;
-            }
-            if (i + 1 >= pa.count)
-            {
-                std::cout << flag << " requires a file\n";
-                return 1;
-            }
-            const std::string_view path = pa.args[++i];
-            if (which == fnv1a("--cert"))     instance->set_cert_path(path);
-            else if (which == fnv1a("--key")) instance->set_key_path(path);
-            else                              instance->set_ca_path(path);
-            return 0;
-        }
-
-        case fnv1a("--group"):
-        case fnv1a("-g"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--group requires a value\n";
-                return 1;
-            }
-            instance->set_group(pa.args[++i]);
-            return 0;
-        }
-
         // ── Where this runtime's I/O runs ────────────────────────────────────
         // --cpus takes max, a range or a list, refusing a set this machine
         // cannot satisfy rather than rounding up to "all" -- and there is
@@ -650,7 +677,7 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         }
 
         default:
-            return -1;
+            return parse_shared_flags(instance, pa, i);
     }
 }
 
@@ -792,15 +819,11 @@ static int refuse_removed_server_flag(uint32_t which)
     return -1;
 }
 
-int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
-                       runtime_manager* mgr, std::string_view /*name*/)
+// The server flags create and edit take alike, after each has answered its own.
+static int parse_server_shared_flags(server_instance* srv, const parsed_args& pa, size_t& i, runtime_manager* mgr)
 {
-    if (const int removed = refuse_removed_server_flag(pa.hashes[i]); removed >= 0)
-        return removed;
-
     switch (pa.hashes[i])
     {
-
         case fnv1a("--mode"):
         {
             if (i + 1 >= pa.count)
@@ -849,9 +872,6 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
             srv->set_runtime_manager(mgr);
             return 0;
         }
-        case fnv1a("--udp"):
-            srv->set_udp(true);
-            return 0;
         case fnv1a("--master-pw"):
         {
             if (i + 1 >= pa.count)
@@ -874,6 +894,22 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
         }
         case fnv1a("--http-cache"):
             srv->set_http_cache(true);
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
+                       runtime_manager* mgr, std::string_view /*name*/)
+{
+    if (const int removed = refuse_removed_server_flag(pa.hashes[i]); removed >= 0)
+        return removed;
+
+    switch (pa.hashes[i])
+    {
+        case fnv1a("--udp"):
+            srv->set_udp(true);
             return 0;
         case fnv1a("-u"):
         case fnv1a("--upstream"):
@@ -910,6 +946,33 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
                     return 1;
                 }
             }
+            return 0;
+        }
+        default:
+            return parse_server_shared_flags(srv, pa, i, mgr);
+    }
+}
+
+// The client flags create and edit take alike, after each has answered its own.
+static int parse_client_shared_flags(client_instance* cli, const parsed_args& pa, size_t& i)
+{
+    switch (pa.hashes[i])
+    {
+        case fnv1a("--mode"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--mode requires a value\n";
+                return 1;
+            }
+            ++i;
+            client_mode mode;
+            if (!parse_client_mode(pa.hashes[i], mode))
+            {
+                std::cout << "unknown mode: " << pa.args[i] << "\n";
+                return 1;
+            }
+            cli->set_mode(mode);
             return 0;
         }
         default:
@@ -951,28 +1014,11 @@ int parse_client_flags(client_instance* cli, const parsed_args& pa, size_t& i,
             cli->set_target(pa.args[i]);
             return 0;
         }
-        case fnv1a("--mode"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--mode requires a value\n";
-                return 1;
-            }
-            ++i;
-            client_mode mode;
-            if (!parse_client_mode(pa.hashes[i], mode))
-            {
-                std::cout << "unknown mode: " << pa.args[i] << "\n";
-                return 1;
-            }
-            cli->set_mode(mode);
-            return 0;
-        }
         case fnv1a("--udp"):
             cli->set_udp(true);
             return 0;
         default:
-            return -1;
+            return parse_client_shared_flags(cli, pa, i);
     }
 }
 
@@ -1031,36 +1077,11 @@ static int parse_proxy_gate_flag(proxy_instance* proxy, const parsed_args& pa, s
     }
 }
 
-int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
-                      std::string_view /*name*/)
+// The proxy flags create and edit take alike, after each has answered its own.
+static int parse_proxy_shared_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i)
 {
-    if (const int rc = parse_proxy_gate_flag(proxy, pa, i); rc >= 0)
-        return rc;
     switch (pa.hashes[i])
     {
-        case fnv1a("--backend"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--backend requires a value\n";
-                return 1;
-            }
-            std::string_view backend_str = pa.args[++i];
-
-            size_t start = 0;
-            size_t comma;
-            while ((comma = backend_str.find(',', start)) != std::string_view::npos)
-            {
-                // An empty component is a doubled comma and not a backend,
-                // which is the rule --upstream's own loop already applies.
-                if (comma > start)
-                    proxy->add_backend(backend_str.substr(start, comma - start));
-                start = comma + 1;
-            }
-            if (start < backend_str.size())
-                proxy->add_backend(backend_str.substr(start));
-            return 0;
-        }
         case fnv1a("--strategy"):
         {
             if (i + 1 >= pa.count)
@@ -1082,28 +1103,6 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
                     break;
                 default:
                     std::cout << "unknown strategy: " << pa.args[i] << "\n";
-                    return 1;
-            }
-            return 0;
-        }
-        case fnv1a("--protocol"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--protocol requires a value\n";
-                return 1;
-            }
-            ++i;
-            switch (pa.hashes[i])
-            {
-                case fnv1a("http"):
-                    proxy->set_protocol(protocol_http);
-                    break;
-                case fnv1a("tcp"):
-                    proxy->set_protocol(protocol_tcp);
-                    break;
-                default:
-                    std::cout << "unknown protocol: " << pa.args[i] << "\n";
                     return 1;
             }
             return 0;
@@ -1271,6 +1270,63 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
             else                                      proxy->set_mesh_client_key(path);
             return 0;
         }
+        default:
+            return -1;
+    }
+}
+
+int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
+                      std::string_view /*name*/)
+{
+    if (const int rc = parse_proxy_gate_flag(proxy, pa, i); rc >= 0)
+        return rc;
+    switch (pa.hashes[i])
+    {
+        case fnv1a("--backend"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--backend requires a value\n";
+                return 1;
+            }
+            std::string_view backend_str = pa.args[++i];
+
+            size_t start = 0;
+            size_t comma;
+            while ((comma = backend_str.find(',', start)) != std::string_view::npos)
+            {
+                // An empty component is a doubled comma and not a backend,
+                // which is the rule --upstream's own loop already applies.
+                if (comma > start)
+                    proxy->add_backend(backend_str.substr(start, comma - start));
+                start = comma + 1;
+            }
+            if (start < backend_str.size())
+                proxy->add_backend(backend_str.substr(start));
+            return 0;
+        }
+        case fnv1a("--protocol"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--protocol requires a value\n";
+                return 1;
+            }
+            ++i;
+            switch (pa.hashes[i])
+            {
+                case fnv1a("http"):
+                    proxy->set_protocol(protocol_http);
+                    break;
+                case fnv1a("tcp"):
+                    proxy->set_protocol(protocol_tcp);
+                    break;
+                default:
+                    std::cout << "unknown protocol: " << pa.args[i] << "\n";
+                    return 1;
+            }
+            return 0;
+        }
         case fnv1a("--sidecar"):
             // Sidecar mode: shorthand for health-check tcp + circuit + retry + drain
             proxy->set_health_check(mesh_config::health_tcp);
@@ -1280,7 +1336,7 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
             proxy->set_drain(true);
             return 0;
         default:
-            return -1;
+            return parse_proxy_shared_flags(proxy, pa, i);
     }
 }
 
@@ -1340,17 +1396,9 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
         }
         case fnv1a("--maxmemory"):
         {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--maxmemory requires a size value\n";
-                return 1;
-            }
             size_t bytes;
-            if (!parse_size_suffix(pa.args[++i], bytes))
-            {
-                std::cout << "invalid maxmemory value (use K/M/G suffix)\n";
+            if (!take_size(pa, i, "--maxmemory", bytes))
                 return 1;
-            }
             cache->set_max_memory(bytes);
             return 0;
         }
@@ -1777,12 +1825,8 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
         case fnv1a("--backup-every"):
         {
             uint64_t secs = 0;
-            if (next.empty() || parse_duration_seconds(next, 365ull * 24 * 3600, secs) != duration_parse::ok || secs < 1)
-            {
-                std::cout << "--backup-every requires how often, as 6h or 1d\n";
+            if (!take_duration(pa, i, 1, 365ull * 24 * 3600, "--backup-every requires how often, as 6h or 1d\n", secs))
                 return 1;
-            }
-            ++i;
             db->set_backup_every(static_cast<uint32_t>(secs));
             return 0;
         }
@@ -1930,13 +1974,8 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         case fnv1a("--fsync-interval"):
         {
             uint64_t secs = 0;
-            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
-            if (parse_duration_seconds(v, 3600, secs) != duration_parse::ok || secs == 0)
-            {
-                std::cout << "--fsync-interval requires a duration from 1s to 1h\n";
+            if (!take_duration(pa, i, 1, 3600, "--fsync-interval requires a duration from 1s to 1h\n", secs))
                 return 1;
-            }
-            ++i;
             stg->set_fsync_interval_secs(static_cast<uint32_t>(secs));
             return 0;
         }
@@ -2025,57 +2064,34 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         case fnv1a("--mpu-expire"):
         {
             uint64_t secs = 0;
-            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
-            if (parse_duration_seconds(v, uint64_t{10} * 365 * 86400, secs) != duration_parse::ok || secs == 0)
-            {
-                std::cout << "--mpu-expire requires a duration such as 24h or 7d\n";
+            if (!take_duration(pa, i, 1, uint64_t{10} * 365 * 86400, "--mpu-expire requires a duration such as 24h or 7d\n", secs))
                 return 1;
-            }
-            ++i;
-            stg->set_mpu_expire_secs(static_cast<uint32_t>(std::min<uint64_t>(secs, UINT32_MAX)));
+            stg->set_mpu_expire_secs(static_cast<uint32_t>(secs));
             return 0;
         }
         // Every object read back and checked once in this long, at a pace that spreads the reads over it.
         case fnv1a("--scrub"):
         {
             uint64_t secs = 0;
-            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
-            if (parse_duration_seconds(v, uint64_t{10} * 365 * 86400, secs) != duration_parse::ok || secs == 0)
-            {
-                std::cout << "--scrub requires a duration such as 7d or 30d\n";
+            if (!take_duration(pa, i, 1, uint64_t{10} * 365 * 86400, "--scrub requires a duration such as 7d or 30d\n", secs))
                 return 1;
-            }
-            ++i;
-            stg->set_scrub_secs(static_cast<uint32_t>(std::min<uint64_t>(secs, UINT32_MAX)));
+            stg->set_scrub_secs(static_cast<uint32_t>(secs));
             return 0;
         }
         // Versions left unwritten this long are compressed where they lie.
         case fnv1a("--compress"):
         {
             uint64_t secs = 0;
-            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
-            if (parse_duration_seconds(v, uint64_t{10} * 365 * 86400, secs) != duration_parse::ok || secs == 0)
-            {
-                std::cout << "--compress requires a duration such as 1h or 7d\n";
+            if (!take_duration(pa, i, 1, uint64_t{10} * 365 * 86400, "--compress requires a duration such as 1h or 7d\n", secs))
                 return 1;
-            }
-            ++i;
-            stg->set_compress_secs(static_cast<uint32_t>(std::min<uint64_t>(secs, UINT32_MAX)));
+            stg->set_compress_secs(static_cast<uint32_t>(secs));
             return 0;
         }
         case fnv1a("--max-bytes"):
         {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--max-bytes requires a size value\n";
-                return 1;
-            }
             size_t bytes;
-            if (!parse_size_suffix(pa.args[++i], bytes))
-            {
-                std::cout << "invalid max-bytes value (use K/M/G suffix)\n";
+            if (!take_size(pa, i, "--max-bytes", bytes))
                 return 1;
-            }
             stg->set_max_bytes(bytes);
             return 0;
         }
@@ -2100,318 +2116,6 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             }
             return parse_listen_flag(instance, pa, i);
 
-        // Editable and refused while running, because applying it means
-        // forking or retiring workers under live connections and there is no
-        // answer yet for the connections a retired shard holds.
-        case fnv1a("--shards"):
-        {
-            if (is_running)
-            {
-                std::cout << "cannot change the shard count while running\n";
-                return 1;
-            }
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--shards requires a count\n";
-                return 1;
-            }
-            uint32_t n = 0;
-            if (!socketley::parse_whole(pa.args[++i], n) || n < 1)
-            {
-                std::cout << "invalid shard count\n";
-                return 1;
-            }
-            // --listen can be typed further along this same command line, so
-            // this asks only the half of the question whose inputs are final.
-            if (const std::string msg = shards_config_refusal(
-                    instance->get_type(), n); !msg.empty())
-            {
-                std::cout << msg;
-                return 1;
-            }
-            instance->set_shards(n);
-            return 0;
-        }
-
-        case fnv1a("-p"):
-        {
-            if (is_running)
-            {
-                std::cout << "cannot change port while running\n";
-                return 1;
-            }
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "-p requires a port number\n";
-                return 1;
-            }
-            return parse_port_flag(instance, pa.args[++i]);
-        }
-        case fnv1a("--bind"):
-        {
-            if (is_running)
-            {
-                std::cout << "cannot change the bind address while running\n";
-                return 1;
-            }
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--bind requires an address\n";
-                return 1;
-            }
-            return apply_bind_address(instance, pa.args[++i]);
-        }
-        case fnv1a("-b"):
-            instance->set_bash_output(true);
-            return 0;
-
-        case fnv1a("-bp"):
-            instance->set_bash_output(true);
-            instance->set_bash_prefix(true);
-            return 0;
-
-        case fnv1a("-bt"):
-            instance->set_bash_output(true);
-            instance->set_bash_timestamp(true);
-            return 0;
-
-        case fnv1a("-bpt"):
-        case fnv1a("-btp"):
-            instance->set_bash_output(true);
-            instance->set_bash_prefix(true);
-            instance->set_bash_timestamp(true);
-            return 0;
-
-        case fnv1a("--log"):
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--log requires a file path\n";
-                return 1;
-            }
-            // Absolute only: a relative path is resolved against the
-            // daemon's working directory, not the operator's.
-            if (const std::string why = socketley::appended_path_refusal(
-                    "--log", pa.args[i + 1]); !why.empty())
-            {
-                std::cout << why;
-                return 1;
-            }
-            instance->set_log_file(pa.args[++i]);
-            return 0;
-
-        case fnv1a("-w"):
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "-w requires a file path\n";
-                return 1;
-            }
-            // Absolute only: a relative path is resolved against the
-            // daemon's working directory, not the operator's.
-            if (const std::string why = socketley::appended_path_refusal(
-                    "-w", pa.args[i + 1]); !why.empty())
-            {
-                std::cout << why;
-                return 1;
-            }
-            instance->set_write_file(pa.args[++i]);
-            return 0;
-
-        case fnv1a("--max-connections"):
-        case fnv1a("--max-conn"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--max-connections requires a value\n";
-                return 1;
-            }
-            uint32_t max;
-            if (!socketley::parse_whole(pa.args[++i], max))
-            {
-                std::cout << "invalid max-connections value\n";
-                return 1;
-            }
-            if (refuse_inbound_flag_on_client(instance, "--max-connections",
-                                              "it opens one connection outward and "
-                                              "accepts none"))
-                return 1;
-            instance->set_max_connections(max);
-            return 0;
-        }
-
-        case fnv1a("--rate-limit"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--rate-limit requires a value\n";
-                return 1;
-            }
-            double rate;
-            if (!parse_double(pa.args[++i], rate) || rate < 0)
-            {
-                std::cout << "invalid rate-limit value\n";
-                return 1;
-            }
-            if (refuse_inbound_flag_on_client(instance, "--rate-limit",
-                                              "it limits what a peer may send to a "
-                                              "runtime, and nothing connects to a client"))
-                return 1;
-            instance->set_rate_limit(rate);
-            return 0;
-        }
-
-        case fnv1a("--global-rate-limit"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--global-rate-limit requires a value\n";
-                return 1;
-            }
-            double rate;
-            if (!parse_double(pa.args[++i], rate) || rate < 0)
-            {
-                std::cout << "invalid global-rate-limit value\n";
-                return 1;
-            }
-            // The fourth of them, and the one whose sibling was already
-            // refused: check_global_rate_limit() is called by the cache, the
-            // server and the proxy and by no client code at all, and "across
-            // all connections" means nothing to a runtime that has one.
-            if (refuse_inbound_flag_on_client(instance, "--global-rate-limit",
-                                              "it caps the total across all "
-                                              "inbound connections, and a client "
-                                              "has one outbound connection -- "
-                                              "--rate-limit is refused here for "
-                                              "the same reason"))
-                return 1;
-            instance->set_global_rate_limit(rate);
-            return 0;
-        }
-
-        case fnv1a("--idle-timeout"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--idle-timeout requires a value\n";
-                return 1;
-            }
-            uint64_t secs;
-            if (!parse_duration_flag("idle-timeout", pa.args[++i],
-                                     std::numeric_limits<uint32_t>::max(), secs))
-                return 1;
-            if (refuse_inbound_flag_on_client(instance, "--idle-timeout",
-                                              "it reaps idle inbound connections, and "
-                                              "a client's own connection is reconnected "
-                                              "the moment it is dropped"))
-                return 1;
-            instance->set_idle_timeout(static_cast<uint32_t>(secs));
-            return 0;
-        }
-
-        case fnv1a("--read-buffer"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--read-buffer requires a size value\n";
-                return 1;
-            }
-            size_t bytes;
-            if (!parse_size_suffix(pa.args[++i], bytes))
-            {
-                std::cout << "invalid --read-buffer value (use K/M/G suffix)\n";
-                return 1;
-            }
-            // Live, like its outbound twin: the bound is compared on every
-            // read and the bulk cap is derived at each parse, so nothing holds
-            // the old value.  A buffer already past a lowered bound is closed
-            // at its next read, which is the same answer it would get for
-            // having grown there.
-            instance->set_read_buffer(bytes);
-            return 0;
-        }
-
-        case fnv1a("--write-buffer"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--write-buffer requires a size value\n";
-                return 1;
-            }
-            size_t bytes;
-            if (!parse_size_suffix(pa.args[++i], bytes))
-            {
-                std::cout << "invalid --write-buffer value (use K/M/G suffix)\n";
-                return 1;
-            }
-            // Live: the bound is read on every send rather than cached per
-            // connection, so there is nothing to refresh and nothing holding
-            // the old value.  A queue already past a lowered bound is closed
-            // at its next send, which is the same answer it would get for
-            // having grown there.
-            instance->set_write_buffer(bytes);
-            return 0;
-        }
-
-        case fnv1a("--group"):
-        case fnv1a("-g"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--group requires a value\n";
-                return 1;
-            }
-            instance->set_group(pa.args[++i]);
-            return 0;
-        }
-
-        // Same rule as the create path, and the path that matters most,
-        // because a generic "unknown flag" reads as a typo and sends the
-        // operator to try a different spelling.
-        // Not a setting of the runtime: it says the caller wants the change carried across a stop and a start, and
-        // the command has already acted on it by the time the flags are read.
-        case fnv1a("--restart"):
-            return 0;
-
-        case fnv1a("--tls"):
-            if (!tls_role_has_handshake(instance->get_type()))
-            {
-                std::cout << tls_not_implemented_error("--tls");
-                return 1;
-            }
-            instance->set_tls(true);
-            return 0;
-
-        case fnv1a("--acme"):
-        case fnv1a("--acme-email"):
-            return parse_acme_flag(instance, pa, i);
-
-        case fnv1a("--domain"):
-            return parse_domain_flag(instance, pa, i);
-
-        case fnv1a("--cert"):
-        case fnv1a("--key"):
-        case fnv1a("--ca"):
-        {
-            const uint32_t which = pa.hashes[i];
-            const char* flag = which == fnv1a("--cert") ? "--cert"
-                             : which == fnv1a("--key")  ? "--key"
-                                                        : "--ca";
-            if (!tls_role_has_handshake(instance->get_type()))
-            {
-                std::cout << tls_not_implemented_error(flag);
-                return 1;
-            }
-            if (i + 1 >= pa.count)
-            {
-                std::cout << flag << " requires a file\n";
-                return 1;
-            }
-            const std::string_view path = pa.args[++i];
-            if (which == fnv1a("--cert"))     instance->set_cert_path(path);
-            else if (which == fnv1a("--key")) instance->set_key_path(path);
-            else                              instance->set_ca_path(path);
-            return 0;
-        }
-
         // Not editable, because io_uring fixes a ring's CPU set at creation
         // and accepting the edit would store a value the next `stats`
         // contradicts.
@@ -2420,8 +2124,35 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                          "recreate the runtime to change it\n";
             return 1;
 
+        // Bound to what the workers already hold, so a running runtime keeps them until it is stopped.
+        case fnv1a("--shards"):
+            if (is_running)
+            {
+                std::cout << "cannot change the shard count while running\n";
+                return 1;
+            }
+            return parse_shared_flags(instance, pa, i);
+        case fnv1a("-p"):
+            if (is_running)
+            {
+                std::cout << "cannot change port while running\n";
+                return 1;
+            }
+            return parse_shared_flags(instance, pa, i);
+        case fnv1a("--bind"):
+            if (is_running)
+            {
+                std::cout << "cannot change the bind address while running\n";
+                return 1;
+            }
+            return parse_shared_flags(instance, pa, i);
+        // Not a setting of the runtime: it says the caller wants the change carried across a stop and a start, and
+        // the command has already acted on it by the time the flags are read.
+        case fnv1a("--restart"):
+            return 0;
+
         default:
-            return -1;
+            return parse_shared_flags(instance, pa, i);
     }
 }
 
@@ -2433,54 +2164,6 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
 
     switch (pa.hashes[i])
     {
-        case fnv1a("--mode"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--mode requires a value\n";
-                return 1;
-            }
-            ++i;
-            server_mode mode;
-            if (!parse_server_mode(pa.hashes[i], mode))
-            {
-                std::cout << "unknown mode: " << pa.args[i] << "\n";
-                return 1;
-            }
-            srv->set_mode(mode);
-            return 0;
-        }
-        case fnv1a("--send-to"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--send-to requires sender, others or master, "
-                             "comma separated\n";
-                return 1;
-            }
-            ++i;
-            uint8_t mask = 0;
-            std::string bad;
-            if (!parse_server_send_to(pa.args[i], mask, bad))
-            {
-                std::cout << "unknown --send-to: " << (bad.empty() ? pa.args[i] : bad)
-                          << " (sender, others, master; comma separated)\n";
-                return 1;
-            }
-            srv->set_send_to(mask);
-            return 0;
-        }
-        case fnv1a("--cache"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--cache requires a cache name\n";
-                return 1;
-            }
-            srv->set_cache_name(pa.args[++i]);
-            srv->set_runtime_manager(mgr);
-            return 0;
-        }
         case fnv1a("--udp"):
         {
             if (is_running)
@@ -2491,16 +2174,6 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
             srv->set_udp(true);
             return 0;
         }
-        case fnv1a("--master-pw"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--master-pw requires a password\n";
-                return 1;
-            }
-            srv->set_master_pw(pa.args[++i]);
-            return 0;
-        }
         // The way back out of master mode.  `--master-pw ""` cannot express
         // this: the daemon receives one line and splits it on whitespace, so an
         // empty argument does not survive the wire and arrives as the flag with
@@ -2509,19 +2182,6 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
         // the pair is refused as a set and only one half was removable.
         case fnv1a("--no-master-pw"):
             srv->set_master_pw("");
-            return 0;
-        case fnv1a("--http"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--http requires a directory path\n";
-                return 1;
-            }
-            srv->set_http_dir(pa.args[++i]);
-            return 0;
-        }
-        case fnv1a("--http-cache"):
-            srv->set_http_cache(true);
             return 0;
         case fnv1a("-u"):
         case fnv1a("--upstream"):
@@ -2566,7 +2226,7 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
             return 0;
         }
         default:
-            return -1;
+            return parse_server_shared_flags(srv, pa, i, mgr);
     }
 }
 
@@ -2607,23 +2267,6 @@ int parse_client_edit_flags(client_instance* cli, const parsed_args& pa, size_t&
             cli->set_target(pa.args[i]);
             return 0;
         }
-        case fnv1a("--mode"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--mode requires a value\n";
-                return 1;
-            }
-            ++i;
-            client_mode mode;
-            if (!parse_client_mode(pa.hashes[i], mode))
-            {
-                std::cout << "unknown mode: " << pa.args[i] << "\n";
-                return 1;
-            }
-            cli->set_mode(mode);
-            return 0;
-        }
         case fnv1a("--udp"):
         {
             if (is_running)
@@ -2635,7 +2278,7 @@ int parse_client_edit_flags(client_instance* cli, const parsed_args& pa, size_t&
             return 0;
         }
         default:
-            return -1;
+            return parse_client_shared_flags(cli, pa, i);
     }
 }
 
@@ -2653,193 +2296,8 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
     }
     switch (pa.hashes[i])
     {
-        case fnv1a("--strategy"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--strategy requires a value\n";
-                return 1;
-            }
-            ++i;
-            switch (pa.hashes[i])
-            {
-                case fnv1a("round-robin"):
-                    proxy->set_strategy(strategy_round_robin);
-                    break;
-                case fnv1a("random"):
-                    proxy->set_strategy(strategy_random);
-                    break;
-                case fnv1a("lua"):
-                    proxy->set_strategy(strategy_lua);
-                    break;
-                default:
-                    std::cout << "unknown strategy: " << pa.args[i] << "\n";
-                    return 1;
-            }
-            return 0;
-        }
-        case fnv1a("--health-check"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--health-check requires tcp or http\n";
-                return 1;
-            }
-            ++i;
-            switch (pa.hashes[i])
-            {
-                case fnv1a("tcp"):
-                    proxy->set_health_check(mesh_config::health_tcp);
-                    break;
-                case fnv1a("http"):
-                    proxy->set_health_check(mesh_config::health_http);
-                    break;
-                default:
-                    std::cout << "unknown health-check type: " << pa.args[i] << "\n";
-                    return 1;
-            }
-            return 0;
-        }
-        case fnv1a("--health-interval"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--health-interval requires a value\n";
-                return 1;
-            }
-            uint64_t secs;
-            if (!parse_duration_flag("health-interval", pa.args[++i],
-                                     std::numeric_limits<int>::max(), secs))
-                return 1;
-            if (secs == 0)
-            {
-                std::cout << "invalid health-interval value\n";
-                return 1;
-            }
-            proxy->set_health_interval(static_cast<int>(secs));
-            return 0;
-        }
-        case fnv1a("--health-path"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--health-path requires a value\n";
-                return 1;
-            }
-            {
-                // The value is written into a GET request line as it stands,
-                // so anything that is not a path fails every health check for
-                // what is a typo in a flag nobody re-reads.
-                const std::string_view hp = pa.args[i + 1];
-                if (hp.empty() || hp.front() != '/')
-                {
-                    std::cout << "--health-path must begin with '/'\n";
-                    return 1;
-                }
-            }
-            proxy->set_health_path(pa.args[++i]);
-            return 0;
-        }
-        case fnv1a("--health-threshold"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--health-threshold requires a value\n";
-                return 1;
-            }
-            int val;
-            if (!parse_count_flag("health-threshold", pa.args[++i], 1, val))
-                return 1;
-            proxy->set_health_threshold(val);
-            return 0;
-        }
-        case fnv1a("--circuit-threshold"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--circuit-threshold requires a value\n";
-                return 1;
-            }
-            int val;
-            if (!parse_count_flag("circuit-threshold", pa.args[++i], 1, val))
-                return 1;
-            proxy->set_circuit_threshold(val);
-            return 0;
-        }
-        case fnv1a("--circuit-timeout"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--circuit-timeout requires a value\n";
-                return 1;
-            }
-            uint64_t secs;
-            if (!parse_duration_flag("circuit-timeout", pa.args[++i],
-                                     std::numeric_limits<int>::max(), secs))
-                return 1;
-            if (secs == 0)
-            {
-                std::cout << "invalid circuit-timeout value\n";
-                return 1;
-            }
-            proxy->set_circuit_timeout(static_cast<int>(secs));
-            return 0;
-        }
-        // 0 is accepted and means "no deadline" — see the create-path handler
-        // for why that is a choice an operator has to make explicitly.
-        case fnv1a("--backend-timeout"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--backend-timeout requires a value\n";
-                return 1;
-            }
-            uint64_t secs;
-            if (!parse_duration_flag("backend-timeout", pa.args[++i],
-                                     std::numeric_limits<int>::max(), secs))
-                return 1;
-            proxy->set_backend_timeout(static_cast<int>(secs));
-            return 0;
-        }
-        case fnv1a("--retry"):
-        {
-            if (i + 1 >= pa.count)
-            {
-                std::cout << "--retry requires a value\n";
-                return 1;
-            }
-            int val;
-            if (!parse_count_flag("retry", pa.args[++i], 0, val))
-                return 1;
-            proxy->set_retry_count(val);
-            return 0;
-        }
-        case fnv1a("--retry-all"):
-            proxy->set_retry_all(true);
-            return 0;
-        // The mesh client-certificate flags live with the proxy because that
-        // is where they exist at all, and like every TLS option they take
-        // effect at the next start.
-        case fnv1a("--client-ca"):
-        case fnv1a("--client-cert"):
-        case fnv1a("--client-key"):
-        {
-            const uint32_t which = pa.hashes[i];
-            const char* flag = which == fnv1a("--client-ca")   ? "--client-ca"
-                             : which == fnv1a("--client-cert") ? "--client-cert"
-                                                               : "--client-key";
-            if (i + 1 >= pa.count)
-            {
-                std::cout << flag << " requires a file\n";
-                return 1;
-            }
-            const std::string_view path = pa.args[++i];
-            if (which == fnv1a("--client-ca"))        proxy->set_mesh_client_ca(path);
-            else if (which == fnv1a("--client-cert")) proxy->set_mesh_client_cert(path);
-            else                                      proxy->set_mesh_client_key(path);
-            return 0;
-        }
+
         default:
-            return -1;
+            return parse_proxy_shared_flags(proxy, pa, i);
     }
 }
