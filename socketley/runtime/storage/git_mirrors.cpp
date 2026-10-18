@@ -27,6 +27,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/persist/read_file.h"
+#include "../../shared/util/random_id.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -105,18 +106,6 @@ std::vector<git_mirrors::repo> parse(const std::string& text)
         if (!r.id.empty() && !r.url.empty())
             out.push_back(std::move(r));
     }
-    return out;
-}
-
-std::string random_hex(size_t bytes)
-{
-    std::vector<unsigned char> b(bytes);
-    if (RAND_bytes(b.data(), static_cast<int>(bytes)) != 1)
-        return {};
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string out;
-    for (unsigned char c : b)
-        out += {hex[c >> 4], hex[c & 15]};
     return out;
 }
 

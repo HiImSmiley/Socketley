@@ -43,6 +43,7 @@
 #include "../shared/json/json_escape.h"
 #include "../shared/persist/replaced_file.h"
 #include "../shared/util/base64.h"
+#include "../shared/util/random_id.h"
 
 namespace
 {
@@ -338,15 +339,10 @@ bool zone_delegated(const std::string& zone, std::string& why)
         return false;
     }
 
-    unsigned char rnd[24];
-    if (RAND_bytes(rnd, sizeof rnd) != 1)
+    const std::string id = socketley::random_hex(8), value = socketley::random_hex(16);
+    if (id.empty() || value.empty())
         return false;
-    static constexpr char hexd[] = "0123456789abcdef";
-    std::string label = "probe-", value;
-    for (int i = 0; i < 8; ++i)
-        label += {hexd[rnd[i] >> 4], hexd[rnd[i] & 15]};
-    for (int i = 8; i < 24; ++i)
-        value += {hexd[rnd[i] >> 4], hexd[rnd[i] & 15]};
+    const std::string label = "probe-" + id;
     std::string path;
     if (!dns_feed::write_challenge(label + "." + zone, value, label, path))
     {

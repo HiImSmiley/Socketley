@@ -12,7 +12,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <openssl/rand.h>
 
 #include "../../shared/util/byte_codec.h"
 #include "../../shared/crypto/jws.h"
@@ -21,6 +20,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/random_id.h"
 
 namespace socketley::db
 {
@@ -39,14 +39,6 @@ constexpr uint64_t merge_floor = 32ull << 20;
 error fail(int status, std::string_view code, std::string message)
 {
     return error{status, std::string(code), std::move(message)};
-}
-
-std::string new_id()
-{
-    unsigned char b[16];
-    if (RAND_bytes(b, sizeof b) != 1)
-        return {};
-    return base64url::encode(std::string_view(reinterpret_cast<const char*>(b), sizeof b));
 }
 
 // How deep a value nests, the object it is in counting as none, which json_reader's bound is measured against.
@@ -1831,7 +1823,7 @@ bool store::write(const principal& who, std::vector<write_op>& ops, std::string&
         {
             // An id the API reads as its own path, _ first, is drawn again.
             do
-                op.id = new_id();
+                op.id = random_b64url(16);
             while (!op.id.empty() && (!valid_id(op.id) || c->docs.contains(op.id)));
             if (op.id.empty())
                 return refuse(fail(503, "no_randomness", "no randomness for an id"));

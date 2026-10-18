@@ -13,6 +13,7 @@
 #include "shared/crypto/jws.h"
 #include "shared/json/json_escape.h"
 #include "shared/util/base64.h"
+#include "shared/util/random_id.h"
 
 using namespace socketley::idp;
 
@@ -524,4 +525,23 @@ TEST_CASE("a JSON string escapes quotes, backslashes and control characters, and
     CHECK(socketley::base64url::encode("foo") == "Zm9v");
     CHECK(socketley::base64url::encode("foob") == "Zm9vYg");
     CHECK(socketley::base64url::encode("\xfb\xff") == "-_8");
+}
+
+TEST_CASE("random tokens have the length asked for, in their alphabet, and do not repeat")
+{
+    const std::string a = socketley::random_b64url(32), b = socketley::random_b64url(32);
+    CHECK(a.size() == 43);
+    CHECK(a != b);
+    std::string raw;
+    CHECK(socketley::base64url::decode(a, raw));
+    CHECK(raw.size() == 32);
+    const std::string h = socketley::random_hex(16), u = socketley::random_hex(8, true);
+    CHECK(h.size() == 32);
+    CHECK(h.find_first_not_of("0123456789abcdef") == std::string::npos);
+    CHECK(u.size() == 16);
+    CHECK(u.find_first_not_of("0123456789ABCDEF") == std::string::npos);
+    // A request larger than one getrandom call answers whole, which the loop over short reads is for.
+    std::string big(1 << 20, '\0');
+    CHECK(socketley::random_bytes(big.data(), big.size()));
+    CHECK(big.find(std::string(64, '\0')) == std::string::npos);
 }

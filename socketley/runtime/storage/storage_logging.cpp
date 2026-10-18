@@ -4,7 +4,6 @@
 #include "storage_run.h"
 
 #include <arpa/inet.h>
-#include <openssl/rand.h>
 #include <openssl/ssl.h>
 
 #include <algorithm>
@@ -14,6 +13,7 @@
 #include "s3_names.h"
 #include "s3_xml.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/random_id.h"
 
 namespace socketley::storage
 {
@@ -332,19 +332,14 @@ void storage_run::deliver_access_log(const std::string& target, std::string key,
     n += std::snprintf(stamp + n, sizeof stamp - static_cast<size_t>(n), "%04lld-%02u-%02u-%02u-%02u-%02u-",
                        static_cast<long long>(f.year), f.month, f.day, f.hour, f.minute, f.second);
     key.append(stamp, static_cast<size_t>(n));
-    unsigned char raw[8];
-    if (RAND_bytes(raw, sizeof raw) != 1)
+    const std::string suffix = random_hex(8, true);
+    if (suffix.empty())
     {
         LOG_WARN(("storage: access log lines for " + target + " are dropped: no random bytes to name their object")
                      .c_str());
         return;
     }
-    static constexpr char hexd[] = "0123456789ABCDEF";
-    for (unsigned char b : raw)
-    {
-        key += hexd[b >> 4];
-        key += hexd[b & 15];
-    }
+    key += suffix;
 
     object_meta meta;
     meta.content_type = "text/plain";

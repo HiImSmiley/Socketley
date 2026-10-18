@@ -6,7 +6,6 @@
 
 #include <algorithm>
 
-#include <openssl/rand.h>
 
 #include "checksum.h"
 #include "digest.h"
@@ -17,6 +16,7 @@
 #include "../../shared/persist/state_persistence.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/random_id.h"
 
 namespace socketley::storage
 {
@@ -573,9 +573,13 @@ void storage_run::dav_body(const std::shared_ptr<conn>& c)
     if (m == "LOCK")
     {
         // Locks are granted and not enforced, which is what the drives of Windows and macOS need to write at all.
-        unsigned char raw[16];
-        RAND_bytes(raw, sizeof raw);
-        const std::string token = "opaquelocktoken:" + hex(raw, sizeof raw);
+        const std::string id = random_hex(16);
+        if (id.empty())
+        {
+            app_reply(c, 503, "No random bytes could be had for a lock token.\n");
+            return;
+        }
+        const std::string token = "opaquelocktoken:" + id;
         std::string x = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:prop xmlns:D=\"DAV:\"><D:lockdiscovery><D:activelock>"
                         "<D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>0</D:depth>"
                         "<D:timeout>Second-3600</D:timeout><D:locktoken><D:href>" + token +

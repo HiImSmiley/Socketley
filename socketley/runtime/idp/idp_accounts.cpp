@@ -11,7 +11,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <openssl/rand.h>
 
 #include "idp_logic.h"
 #include "../../shared/util/byte_codec.h"
@@ -20,6 +19,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/random_id.h"
 
 namespace socketley::idp
 {
@@ -39,14 +39,6 @@ std::string lower(std::string_view s)
     for (char& c : out)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return out;
-}
-
-std::string new_id()
-{
-    unsigned char b[16];
-    if (RAND_bytes(b, sizeof b) != 1)
-        return {};
-    return base64url::encode(std::string_view(reinterpret_cast<const char*>(b), sizeof b));
 }
 
 // A rename kept by syncing the directory that holds it.
@@ -517,7 +509,7 @@ bool account_store::create(const field_list& fields, std::string& id, std::strin
         why = "the username \"" + std::string(username) + "\" is taken";
         return false;
     }
-    id = new_id();
+    id = random_b64url(16);
     if (id.empty() || m_accounts.contains(id))
     {
         why = "no randomness for an id";
@@ -544,7 +536,7 @@ size_t account_store::create_many(const std::vector<field_list>& accounts, std::
             why += std::string(username) + ": the username is taken\n";
         else
         {
-            const std::string id = new_id();
+            const std::string id = random_b64url(16);
             if (id.empty())
             {
                 why += std::string(username) + ": no randomness for an id\n";

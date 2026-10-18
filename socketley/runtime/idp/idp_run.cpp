@@ -16,7 +16,6 @@
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
-#include <openssl/rand.h>
 
 #include "idp_instance.h"
 #include "../../shared/http/http_framing.h"
@@ -35,6 +34,7 @@
 #include "../../shared/persist/read_file.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/random_id.h"
 
 namespace socketley::idp
 {
@@ -54,14 +54,6 @@ constexpr size_t  max_conns     = 4096;
 constexpr int     miss_limit    = 5;
 constexpr int64_t miss_window   = 15 * 60;
 constexpr std::string_view cookie_name = "skl_idp";
-
-std::string random_token()
-{
-    unsigned char b[32];
-    if (RAND_bytes(b, sizeof b) != 1)
-        return {};
-    return base64url::encode(std::string_view(reinterpret_cast<const char*>(b), sizeof b));
-}
 
 std::string peer_text(const sockaddr_storage& a)
 {
@@ -913,7 +905,7 @@ void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const accou
     e.auth_time = now;
     e.expires = now + code_secs;
     // Named by the shard that keeps it, which the exchange is taken to.
-    const std::string token = random_token();
+    const std::string token = random_b64url(32);
     const std::string code = m_shards > 1 && !token.empty() ? std::to_string(m_shard) + "." + token : token;
     if (code.empty())
     {
@@ -939,7 +931,7 @@ void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const accou
 void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, const code_entry& e, const account& who)
 {
     const int64_t now = wall::now_sec();
-    const std::string jti = random_token();
+    const std::string jti = random_b64url(32);
     const std::string profile = profile_claims(who);
     const std::string aud = socketley::json::quote(cl.id);
     const std::string scope = socketley::json::quote(e.scope);

@@ -30,6 +30,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/random_id.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -173,14 +174,6 @@ bool valid_id(std::string_view id)
 std::string pw_hash(std::string_view salt, std::string_view password)
 {
     return sha256_hex(std::string(salt) + std::string(password));
-}
-
-std::string random_hex(size_t n)
-{
-    unsigned char raw[32];
-    if (n > sizeof raw || RAND_bytes(raw, static_cast<int>(n)) != 1)
-        return {};
-    return hex(raw, n);
 }
 
 std::string_view last_name_of(std::string_view key)
