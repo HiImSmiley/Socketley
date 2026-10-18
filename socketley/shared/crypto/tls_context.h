@@ -134,6 +134,14 @@ public:
     // 1 when any was loaded, as SSL_CTX_set_default_verify_paths answers.
     static int load_system_roots(SSL_CTX* ctx);
 
+    // A TLS 1.2+ client context that verifies every peer against `ca_file`, or the system's roots when it is empty;
+    // null with `why` naming what could not be loaded, since a context with no roots verifies nobody.
+    static SSL_CTX* make_client_ctx(std::string_view ca_file, std::string& why);
+
+    // Pins the name the peer's certificate must carry: an address literal as an iPAddress SAN and never as SNI, a
+    // host name with SNI and no partial-label wildcard; false leaves `ssl` unusable, never half-verified.
+    static bool pin_peer_name(SSL* ssl, std::string_view name);
+
     // Free an SSL connection
     static void free_ssl(SSL* ssl);
     // The name the client asked for in its handshake (SNI), or nullptr.

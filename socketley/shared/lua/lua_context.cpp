@@ -1423,16 +1423,11 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         static SSL_CTX* shared_ctx = nullptr;
         if (!shared_ctx)
         {
-            SSL_CTX* made = SSL_CTX_new(TLS_client_method());
-            if (!made) { ::close(sock); result["error"] = "SSL_CTX_new failed"; return result; }
-            // SSL_VERIFY_PEER and the host pin are both needed, because a
-            // certificate for a domain the attacker owns is entirely valid.
-            SSL_CTX_set_min_proto_version(made, TLS1_2_VERSION);
-            SSL_CTX_set_verify(made, SSL_VERIFY_PEER, nullptr);
-            if (tls_context::load_system_roots(made) != 1) {
-                std::string why = ssl_error_text();
-                SSL_CTX_free(made); ::close(sock);
-                result["error"] = "no system CA store available" + (why.empty() ? "" : ": " + why);
+            std::string why;
+            SSL_CTX* made = tls_context::make_client_ctx({}, why);
+            if (!made) {
+                ::close(sock);
+                result["error"] = "no system CA store available: " + why;
                 return result;
             }
 #if defined(SSL_OP_IGNORE_UNEXPECTED_EOF)
@@ -1451,20 +1446,9 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         if (!ssl) { ::close(sock); result["error"] = "SSL_new failed"; return result; }
         SSL_set_fd(ssl, sock);
 
-        // An address literal is matched against the certificate's iPAddress SAN
-        // and must not be sent as SNI (RFC 6066 permits host names there only).
-        unsigned char ip_probe[16];
-        const bool host_is_ip = inet_pton(AF_INET,  host.c_str(), ip_probe) == 1 ||
-                                inet_pton(AF_INET6, host.c_str(), ip_probe) == 1;
-        bool pinned;
-        if (host_is_ip) {
-            pinned = X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host.c_str()) == 1;
-        } else {
-            SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-            pinned = SSL_set1_host(ssl, host.c_str()) == 1 &&
-                     SSL_set_tlsext_host_name(ssl, host.c_str()) == 1;
-        }
-        if (!pinned) {
+        // SSL_VERIFY_PEER and the host pin are both needed, because a
+        // certificate for a domain the attacker owns is entirely valid.
+        if (!tls_context::pin_peer_name(ssl, host)) {
             // Refuse rather than continue unpinned: a connection that verifies
             // the chain and not the name looks identical to a good one.
             std::string why = ssl_error_text();

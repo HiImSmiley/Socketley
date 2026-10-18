@@ -103,14 +103,9 @@ client::~client()
 bool client::init(std::string& err, const std::string& ca_file, std::string user_agent)
 {
     m_agent = std::move(user_agent);
-    m_ctx = SSL_CTX_new(TLS_client_method());
-    if (!m_ctx)
-        return fail(err, "no TLS context");
-    SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION);
-    SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
-    const bool ok = !ca_file.empty() ? SSL_CTX_load_verify_locations(m_ctx, ca_file.c_str(), nullptr) == 1
-                                     : tls_context::load_system_roots(m_ctx) == 1;
-    return ok || fail(err, "the trust roots could not be loaded" + (ca_file.empty() ? std::string() : ": " + ca_file));
+    std::string why;
+    m_ctx = tls_context::make_client_ctx(ca_file, why);
+    return m_ctx || fail(err, why);
 }
 
 int client::dial(const std::string& url, std::string& path, std::string& hostport, SSL*& ssl, std::string& err,
@@ -185,9 +180,15 @@ int client::dial(const std::string& url, std::string& path, std::string& hostpor
     if (tls)
     {
         ssl = SSL_new(m_ctx);
-        SSL_set_fd(ssl, fd);
-        SSL_set_tlsext_host_name(ssl, host.c_str());
-        SSL_set1_host(ssl, host.c_str());
+        if (!ssl || SSL_set_fd(ssl, fd) != 1 || !tls_context::pin_peer_name(ssl, host))
+        {
+            err = "TLS to " + hostport + " could not be set up to check the name " + host;
+            if (ssl)
+                SSL_free(ssl);
+            ssl = nullptr;
+            ::close(fd);
+            return -1;
+        }
         if (SSL_connect(ssl) != 1)
         {
             const unsigned long e = ERR_get_error();

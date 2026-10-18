@@ -412,12 +412,6 @@ bool ber_read_uint(std::string_view c, int32_t& out)
 
 // ---- the LDAP connection ----
 
-bool is_literal_ip(const std::string& host)
-{
-    unsigned char buf[sizeof(struct in6_addr)];
-    return ::inet_pton(AF_INET, host.c_str(), buf) == 1 || ::inet_pton(AF_INET6, host.c_str(), buf) == 1;
-}
-
 // One blocking exchange with an LDAP server, plain or TLS, every wait bounded by one deadline.
 class ldap_link
 {
@@ -589,32 +583,16 @@ public:
 private:
     bool handshake(const federation_ldap& cfg, std::string& why)
     {
-        m_ctx = SSL_CTX_new(TLS_client_method());
-        if (!m_ctx || SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION) != 1)
-        {
-            why = "cannot make a TLS context";
+        m_ctx = tls_context::make_client_ctx(cfg.ca_file, why);
+        if (!m_ctx)
             return false;
-        }
-        SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
-        if (!cfg.ca_file.empty() ? SSL_CTX_load_verify_locations(m_ctx, cfg.ca_file.c_str(), nullptr) != 1
-                                 : tls_context::load_system_roots(m_ctx) != 1)
-        {
-            why = cfg.ca_file.empty() ? "cannot load the system's CA certificates"
-                                      : "cannot load the LDAP CA file " + cfg.ca_file;
-            return false;
-        }
         m_ssl = SSL_new(m_ctx);
         if (!m_ssl || SSL_set_fd(m_ssl, m_fd) != 1)
         {
             why = "cannot make a TLS connection";
             return false;
         }
-        // The certificate must name the host the URL does, as an IP address or as a DNS name sent in SNI too.
-        const bool named = is_literal_ip(cfg.host)
-                               ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(m_ssl), cfg.host.c_str()) == 1
-                               : SSL_set_tlsext_host_name(m_ssl, cfg.host.c_str()) == 1 &&
-                                     SSL_set1_host(m_ssl, cfg.host.c_str()) == 1;
-        if (!named)
+        if (!tls_context::pin_peer_name(m_ssl, cfg.host))
         {
             why = "cannot pin the LDAP server's name " + cfg.host;
             return false;

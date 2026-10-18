@@ -669,14 +669,14 @@ bool tls_context::init_client(std::string_view ca_path,
                               std::string_view client_key)
 {
 #if SOCKETLEY_HAS_TLS
-    m_ctx = SSL_CTX_new(TLS_client_method());
+    std::string why;
+    m_ctx = make_client_ctx(ca_path, why);
     if (!m_ctx)
     {
-        LOG_ERROR("tls: failed to create SSL context");
-        log_ssl_errors("SSL_CTX_new");
+        LOG_ERROR(("tls: " + why).c_str());
+        log_ssl_errors("client context");
         return false;
     }
-    SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION);
 
     // No internal cache on a client, because OpenSSL never reads one: a
     // ClientHello offers the session the application put on the SSL and
@@ -687,24 +687,6 @@ bool tls_context::init_client(std::string_view ca_path,
 
     // Apply common performance options (tickets, modes, fragment size)
     apply_ctx_performance_options(m_ctx);
-
-    if (!ca_path.empty())
-    {
-        if (SSL_CTX_load_verify_locations(m_ctx, std::string(ca_path).c_str(), nullptr) <= 0)
-        {
-            LOG_ERROR((std::string("tls: failed to load CA file: ") + std::string(ca_path)).c_str());
-            log_ssl_errors("CA file load");
-            SSL_CTX_free(m_ctx);
-            m_ctx = nullptr;
-            return false;
-        }
-        SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
-    }
-    else
-    {
-        load_system_roots(m_ctx);
-        SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, nullptr);
-    }
 
     // mTLS client certificate (for connecting to backends that require client auth)
     if (!client_cert.empty() && !client_key.empty())
@@ -807,31 +789,7 @@ SSL* tls_context::create_ssl_client(std::string_view expected_hostname) const
         return nullptr;
 
     const std::string name(expected_hostname);
-
-    // An address literal is checked against the iPAddress SAN and never sent
-    // as SNI, probed with inet_pton so no failed parse leaves a reason on the
-    // error queue.
-    unsigned char ip_probe[16];
-    const bool is_ip = inet_pton(AF_INET,  name.c_str(), ip_probe) == 1 ||
-                       inet_pton(AF_INET6, name.c_str(), ip_probe) == 1;
-
-    bool pinned;
-    if (is_ip)
-    {
-        // No SSL_set1_ip_asc convenience wrapper exists the way SSL_set1_host
-        // does; go through the connection's verify param directly.
-        pinned = X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), name.c_str()) == 1;
-    }
-    else
-    {
-        // Reject partial-label wildcards ("w*.example.com"): still issuable,
-        // never what an operator writing a backend address meant.
-        SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-        pinned = SSL_set1_host(ssl, name.c_str()) == 1 &&
-                 SSL_set_tlsext_host_name(ssl, name.c_str()) == 1;
-    }
-
-    if (!pinned)
+    if (!pin_peer_name(ssl, name))
     {
         // Fail rather than return a connection that would verify the chain and
         // not the name: a half-verified SSL here is the exact outcome this
@@ -1093,6 +1051,56 @@ int tls_context::load_system_roots(SSL_CTX* ctx)
 #else
     (void)ctx;
     return 0;
+#endif
+}
+
+SSL_CTX* tls_context::make_client_ctx(std::string_view ca_file, std::string& why)
+{
+#if SOCKETLEY_HAS_TLS
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx || SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) != 1)
+    {
+        if (ctx)
+            SSL_CTX_free(ctx);
+        why = "no TLS client context could be made";
+        return nullptr;
+    }
+    const bool rooted = !ca_file.empty()
+                            ? SSL_CTX_load_verify_locations(ctx, std::string(ca_file).c_str(), nullptr) == 1
+                            : load_system_roots(ctx) == 1;
+    if (!rooted)
+    {
+        SSL_CTX_free(ctx);
+        why = ca_file.empty() ? std::string("the system's trusted roots could not be loaded")
+                              : "the CA file " + std::string(ca_file) + " could not be loaded";
+        return nullptr;
+    }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+    return ctx;
+#else
+    (void)ca_file;
+    why = "this build has no TLS";
+    return nullptr;
+#endif
+}
+
+bool tls_context::pin_peer_name(SSL* ssl, std::string_view name)
+{
+#if SOCKETLEY_HAS_TLS
+    if (!ssl || name.empty())
+        return false;
+    const std::string n(name);
+    // Probed with inet_pton, so no failed parse leaves a reason on the error queue.
+    unsigned char ip_probe[16];
+    if (inet_pton(AF_INET, n.c_str(), ip_probe) == 1 || inet_pton(AF_INET6, n.c_str(), ip_probe) == 1)
+        return X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), n.c_str()) == 1;
+    // "w*.example.com" is still issuable and never what an operator writing an address meant.
+    SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    return SSL_set1_host(ssl, n.c_str()) == 1 && SSL_set_tlsext_host_name(ssl, n.c_str()) == 1;
+#else
+    (void)ssl;
+    (void)name;
+    return false;
 #endif
 }
 
