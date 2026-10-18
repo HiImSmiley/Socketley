@@ -31,6 +31,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/http/status.h"
+#include "../../shared/http/request_head.h"
 
 namespace socketley::idp
 {
@@ -150,7 +151,8 @@ unsigned hash_threads(uint32_t shards)
 }   // namespace
 
 idp_run::idp_run(idp_instance& owner, event_loop& loop)
-    : m_owner(owner), m_loop(loop), m_io(loop, this), m_hash(hash_threads(std::max<uint32_t>(1, owner.get_shards())))
+    : m_owner(owner), m_loop(loop), m_io(loop, this), m_http(loop, this, owner, *this, max_conns),
+      m_hash(hash_threads(std::max<uint32_t>(1, owner.get_shards())))
 {
 }
 
@@ -216,31 +218,10 @@ bool idp_run::start(std::string& why)
     if (!m_hash.attach(m_io))
         m_hash.stop();
 
-    const uint16_t port = m_owner.effective_port();
-    m_listen_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (m_listen_fd < 0)
-    {
-        why = std::string("no socket: ") + std::strerror(errno);
+    if (!m_http.listen_tcp(m_owner.bind_in_addr(), m_owner.effective_port(), m_shards > 1, why))
         return false;
-    }
-    int one = 1;
-    ::setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    // Every shard binds the port, and the kernel spreads the connections over them.
-    if (m_shards > 1)
-        ::setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = m_owner.bind_in_addr();
-    a.sin_port = htons(port);
-    if (::bind(m_listen_fd, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0 || ::listen(m_listen_fd, 1024) < 0)
-    {
-        why = "port " + std::to_string(port) + " could not be bound: " + std::strerror(errno);
-        ::close(m_listen_fd);
-        m_listen_fd = -1;
-        return false;
-    }
     m_loop.register_owner(this);
-    arm_accept();
+    m_http.start_accepting();
     LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": issuer " + m_issuer + ", " +
               std::to_string(m_accounts.size()) + " account(s), " + std::to_string(m_clients.size()) + " client(s)").c_str());
     return true;
@@ -255,17 +236,7 @@ void idp_run::stop()
     if (auto* mgr = m_owner.get_runtime_manager())
         mgr->requests().drop_origin(this);
     m_crossed.clear();
-    if (m_listen_fd >= 0)
-    {
-        ::shutdown(m_listen_fd, SHUT_RDWR);
-        m_loop.close_fd(m_listen_fd);
-        m_listen_fd = -1;
-    }
-    std::vector<std::shared_ptr<conn>> all;
-    for (auto& [id, c] : m_conns)
-        all.push_back(c);
-    for (auto& c : all)
-        close_conn(c);
+    m_http.stop();
     // The hashing thread ends before the descriptor it wakes the loop through is closed.
     m_hash.stop();
     if (const int fd = m_hash.release_wake_fd(); fd >= 0)
@@ -280,9 +251,7 @@ bool idp_run::drained() const
 
 void idp_run::on_loop_turn()
 {
-    // A listener whose accept the ring had no room for is asked again here, or it would be deaf for good.
-    if (!m_accept_pending && !m_stopped)
-        arm_accept();
+    m_http.on_loop_turn();
 }
 
 std::string idp_run::stats() const
@@ -302,61 +271,6 @@ std::string idp_run::stats() const
 
 // ─── Connections ────────────────────────────────────────────────────────────
 
-void idp_run::arm_accept()
-{
-    if (m_stopped || m_listen_fd < 0 || m_accept_pending)
-        return;
-    m_accept_req = io_request{};
-    m_accept_req.owner = this;
-    m_accept_req.fd = m_listen_fd;
-    m_accept_req.type = event_loop::supports_multishot_accept() ? op_multishot_accept : op_accept;
-    m_accept_pending = m_accept_req.type == op_multishot_accept
-                           ? m_loop.submit_multishot_accept(m_listen_fd, &m_accept_req)
-                           : m_loop.submit_accept(m_listen_fd, nullptr, nullptr, &m_accept_req);
-}
-
-void idp_run::accept_done(struct io_uring_cqe* cqe)
-{
-    if (!(cqe->flags & IORING_CQE_F_MORE))
-        m_accept_pending = false;
-    const int fd = cqe->res;
-    if (fd >= 0)
-    {
-        const size_t limit = m_owner.get_max_connections() ? m_owner.get_max_connections() : max_conns;
-        if (m_stopped || m_conns.size() >= limit)
-            m_loop.close_fd(fd);
-        else
-        {
-            auto c = std::make_shared_for_overwrite<conn>();
-            c->id = m_next_id++;
-            c->fd = fd;
-            socklen_t len = sizeof c->peer;
-            if (::getpeername(fd, reinterpret_cast<sockaddr*>(&c->peer), &len) < 0) {}
-            int one = 1;
-            ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-            c->last = now_sec();
-            m_conns.emplace(c->id, c);
-            runtime_instance::stat_add(m_owner.m_stat_total_connections, 1);
-            m_owner.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
-            arm_read(c);
-            arm_tick();
-        }
-    }
-    if (!m_accept_pending && !m_stopped && fd != -ECANCELED)
-        arm_accept();
-}
-
-std::shared_ptr<idp_run::conn> idp_run::conn_of(io_request* req)
-{
-    auto* raw = reinterpret_cast<conn*>(req->buffer);
-    if (auto it = m_conns.find(raw->id); it != m_conns.end() && it->second.get() == raw)
-        return it->second;
-    for (const auto& c : m_closing)
-        if (c.get() == raw)
-            return c;
-    return nullptr;
-}
-
 void idp_run::on_cqe(struct io_uring_cqe* cqe)
 {
     auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
@@ -367,60 +281,23 @@ void idp_run::on_cqe(struct io_uring_cqe* cqe)
         m_io.on_cqe(cqe);
         return;
     }
-    if (req == &m_accept_req)
-    {
-        accept_done(cqe);
-        return;
-    }
     if (req == &m_tick_req)
     {
         m_tick_armed = false;
         tick();
         return;
     }
-    auto c = conn_of(req);
-    if (!c)
-        return;
-    if (req == &c->rd)
-        read_done(c, cqe->res);
-    else if (req == &c->wr)
-        write_done(c, cqe->res);
+    m_http.on_cqe(req, cqe);
 }
 
-void idp_run::arm_read(const std::shared_ptr<conn>& c)
+std::shared_ptr<socketley::http::server_conn> idp_run::make_conn()
 {
-    if (c->dead || c->rd_pending || c->fd < 0)
-        return;
-    c->rd = io_request{};
-    c->rd.owner = this;
-    c->rd.buffer = reinterpret_cast<char*>(c.get());
-    c->rd.fd = c->fd;
-    c->rd.type = op_read;
-    c->rd_pending = m_loop.submit_read(c->fd, c->rbuf, sizeof c->rbuf, &c->rd);
-    if (!c->rd_pending)
-        close_conn(c);
+    return std::make_shared_for_overwrite<conn>();
 }
 
-void idp_run::read_done(const std::shared_ptr<conn>& c, int res)
+void idp_run::accepted(const std::shared_ptr<conn>&)
 {
-    c->rd_pending = false;
-    if (c->dead)
-    {
-        if (!c->wr_pending)
-            std::erase(m_closing, c);
-        return;
-    }
-    if (res <= 0)
-    {
-        close_conn(c);
-        return;
-    }
-    c->last = now_sec();
-    c->in.append(c->rbuf, static_cast<size_t>(res));
-    runtime_instance::stat_add(m_owner.m_stat_bytes_in, static_cast<uint64_t>(res));
-    serve(c);
-    if (!c->dead && !c->waiting)
-        arm_read(c);
+    arm_tick();
 }
 
 // Requests in order, one at a time: one whose answer waits on the storage holds those behind it.
@@ -429,81 +306,19 @@ void idp_run::serve(const std::shared_ptr<conn>& c)
     while (!c->dead && !c->waiting && !c->in.empty())
     {
         request rq;
-        std::string refusal;
+        int refusal = 400;
         const int r = take_request(*c, rq, refusal);
         if (r == 0)
             break;
         if (r < 0)
         {
             c->keep_alive = false;
-            respond(c, refusal == "413" ? 413 : refusal == "431" ? 431 : refusal == "411" ? 411 : 400, "text/plain",
-                    "the request could not be read\n");
-            return;
+            respond(c, refusal, "text/plain", "the request could not be read\n");
+            break;
         }
         runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
         handle(c, rq);
     }
-    flush(c);
-}
-
-void idp_run::flush(const std::shared_ptr<conn>& c)
-{
-    if (c->dead || c->wr_pending)
-        return;
-    if (c->out_off >= c->out.size())
-    {
-        c->out.clear();
-        c->out_off = 0;
-        if (!c->keep_alive && !c->waiting)
-            close_conn(c);
-        return;
-    }
-    c->wr = io_request{};
-    c->wr.owner = this;
-    c->wr.buffer = reinterpret_cast<char*>(c.get());
-    c->wr.fd = c->fd;
-    c->wr.type = op_write;
-    const size_t chunk = std::min<size_t>(c->out.size() - c->out_off, 1u << 20);
-    c->wr_pending = m_loop.submit_write(c->fd, c->out.data() + c->out_off, static_cast<uint32_t>(chunk), &c->wr);
-    if (!c->wr_pending)
-        close_conn(c);
-}
-
-void idp_run::write_done(const std::shared_ptr<conn>& c, int res)
-{
-    c->wr_pending = false;
-    if (c->dead)
-    {
-        if (!c->rd_pending)
-            std::erase(m_closing, c);
-        return;
-    }
-    if (res <= 0)
-    {
-        close_conn(c);
-        return;
-    }
-    c->out_off += static_cast<size_t>(res);
-    c->last = now_sec();
-    runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(res));
-    flush(c);
-}
-
-void idp_run::close_conn(const std::shared_ptr<conn>& c)
-{
-    if (c->dead)
-        return;
-    c->dead = true;
-    if (c->fd >= 0)
-    {
-        ::shutdown(c->fd, SHUT_RDWR);
-        m_loop.close_fd(c->fd);
-        c->fd = -1;
-    }
-    m_conns.erase(c->id);
-    m_owner.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
-    if (c->rd_pending || c->wr_pending)
-        m_closing.push_back(c);
 }
 
 // Once a second while there is anything to look after: idle connections, codes to forget, failures to age; an
@@ -524,12 +339,7 @@ void idp_run::tick()
     if (m_stopped)
         return;
     const int64_t now = now_sec();
-    std::vector<std::shared_ptr<conn>> idle;
-    for (auto& [id, c] : m_conns)
-        if (now - c->last > idle_secs && !c->waiting && c->out_off >= c->out.size())
-            idle.push_back(c);
-    for (auto& c : idle)
-        close_conn(c);
+    m_http.sweep(now, idle_secs);
     std::erase_if(m_codes, [now](const auto& kv) { return kv.second.expires <= now; });
     // A loop rather than erase_if, whose predicate GCC 12's library hands each entry as const.
     for (auto it = m_misses.begin(); it != m_misses.end();)
@@ -537,63 +347,17 @@ void idp_run::tick()
         std::erase_if(it->second.at, [now](int64_t t) { return now - t > miss_window; });
         it = it->second.at.empty() ? m_misses.erase(it) : std::next(it);
     }
-    if (!m_conns.empty() || !m_codes.empty() || !m_misses.empty())
+    if (!m_http.empty() || !m_codes.empty() || !m_misses.empty())
         arm_tick();
 }
 
 // ─── HTTP ───────────────────────────────────────────────────────────────────
 
-int idp_run::take_request(conn& c, request& rq, std::string& refusal)
+int idp_run::take_request(conn& c, request& rq, int& refusal)
 {
-    const size_t end = c.in.find("\r\n\r\n");
-    if (end == std::string::npos)
-    {
-        if (c.in.size() > max_head)
-        {
-            refusal = "431";
-            return -1;
-        }
-        return 0;
-    }
-    const std::string_view head(c.in.data(), end + 2);
-    if (!http_eol_framing_ok(head, true))
-        return -1;
-    const size_t line_end = head.find("\r\n");
-    const std::string_view line = head.substr(0, line_end);
-    const size_t sp1 = line.find(' ');
-    const size_t sp2 = sp1 == std::string_view::npos ? sp1 : line.find(' ', sp1 + 1);
-    if (sp2 == std::string_view::npos)
-        return -1;
-    rq.method.assign(line.substr(0, sp1));
-    const std::string_view target = line.substr(sp1 + 1, sp2 - sp1 - 1);
-    const std::string_view version = line.substr(sp2 + 1);
-    if (version != "HTTP/1.1" && version != "HTTP/1.0")
-        return -1;
-    const size_t q = target.find('?');
-    rq.path.assign(target.substr(0, q));
-    if (q != std::string_view::npos)
-        rq.query.assign(target.substr(q + 1));
-
-    const std::string_view fields = head.substr(line_end + 2);
-    const http_request_framing_scan scan = http_scan_request_headers(fields);
-    if (!scan.ok || scan.transfer_encoding)
-    {
-        refusal = scan.ok ? "411" : "";
-        return -1;
-    }
-    bool close = version == "HTTP/1.0";
-    size_t pos = 0;
-    while (pos < fields.size())
-    {
-        size_t nl = fields.find("\r\n", pos);
-        if (nl == std::string_view::npos)
-            nl = fields.size();
-        const std::string_view f = fields.substr(pos, nl - pos);
-        pos = nl + 2;
-        const size_t colon = f.find(':');
-        if (colon == std::string_view::npos)
-            continue;
-        const std::string_view value = http_trim_ows(f.substr(colon + 1));
+    socketley::http::request_view v;
+    const int r = socketley::http::take_request(c.in, max_head, max_body, v, refusal,
+                                                [&rq](std::string_view f, std::string_view value) {
         if (header_name_equals(f, "cookie", 6))
         {
             if (!rq.cookie.empty())
@@ -608,25 +372,15 @@ int idp_run::take_request(conn& c, request& rq, std::string& refusal)
             rq.forwarded_for.assign(value);
         else if (header_name_equals(f, "host", 4))
             rq.host.assign(value);
-        else if (header_name_equals(f, "connection", 10))
-        {
-            if (http_list_has_token(value, "close", 5))
-                close = true;
-            else if (http_list_has_token(value, "keep-alive", 10))
-                close = false;
-        }
-    }
-    const size_t body_len = scan.has_content_length ? scan.content_length : 0;
-    if (body_len > max_body)
-    {
-        refusal = "413";
-        return -1;
-    }
-    if (c.in.size() < end + 4 + body_len)
-        return 0;
-    rq.body.assign(c.in, end + 4, body_len);
-    c.in.erase(0, end + 4 + body_len);
-    c.keep_alive = !close;
+    });
+    if (r <= 0)
+        return r;
+    rq.method.assign(v.method);
+    rq.path.assign(v.path);
+    rq.query.assign(v.query);
+    rq.body.assign(c.in, v.head_len, v.body_len);
+    c.in.erase(0, v.head_len + v.body_len);
+    c.keep_alive = !v.close;
     return 1;
 }
 
@@ -1077,7 +831,7 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
                     return;
                 c2->waiting = false;
                 login_page(c2, p, "The user or password is not right.", 401);
-                resume(c2);
+                m_http.resume(c2);
             });
             return;
         }
@@ -1089,7 +843,7 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
             ++m_c.sign_ins;
             grant(cc, p, *a, session_cookie(*a, remember));
         }
-        resume(cc);
+        m_http.resume(cc);
     });
 }
 
@@ -1147,14 +901,6 @@ void idp_run::hash_password(std::string_view password, std::function<void(std::s
         if (*alive)
             then(std::move(*result));
     });
-}
-
-void idp_run::resume(const std::shared_ptr<conn>& c)
-{
-    // What the connection brought while it waited, then more of it.
-    serve(c);
-    if (!c->dead && !c->waiting)
-        arm_read(c);
 }
 
 void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const account& who, std::string_view set_cookie)
@@ -1300,7 +1046,7 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
                     redeemed(cc, *again, p, found, e);
                 else
                     json_error(cc, 401, "invalid_client", "the client is not known or its secret is not right");
-                resume(cc);
+                m_http.resume(cc);
             });
             if (asked)
                 c->waiting = true;
@@ -1515,7 +1261,7 @@ void idp_run::account_post(const std::shared_ptr<conn>& c, const request& rq)
                         page("Signed out", "<h1>Signed out everywhere</h1><p class=\"small\">Every session of this "
                                            "account has ended.</p>"),
                         clear_cookie());
-            resume(cc);
+            m_http.resume(cc);
         });
         return;
     }
@@ -1531,7 +1277,7 @@ void idp_run::account_post(const std::shared_ptr<conn>& c, const request& rq)
             account_page(cc, rq, {}, why, 400);
         else
             account_page(cc, rq, "Saved.", {}, 200);
-        resume(cc);
+        m_http.resume(cc);
     });
 }
 
@@ -1569,7 +1315,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
                 reset_page(cc, p, msg, status);
             else
                 account_page(cc, rq, {}, msg, status);
-            resume(cc);
+            m_http.resume(cc);
         };
         if (!ok || !a || a->disabled())
         {
@@ -1583,7 +1329,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
                     reset_page(c2, p, "The current password is not right.", 401);
                 else
                     account_page(c2, rq, {}, "The current password is not right.", 401);
-                resume(c2);
+                m_http.resume(c2);
             });
             return;
         }
@@ -1601,7 +1347,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
             {
                 c2->waiting = false;
                 respond(c2, 500, "text/plain", "the password could not be kept\n");
-                resume(c2);
+                m_http.resume(c2);
             };
             if (hash.empty() || !m_accounts.by_id(id))
             {
@@ -1632,7 +1378,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
                                                          "account</a></p>"),
                                 session_cookie(*a2, false));
                 }
-                resume(c3);
+                m_http.resume(c3);
             });
         });
     });

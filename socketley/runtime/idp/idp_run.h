@@ -17,6 +17,7 @@
 #include "idp_accounts.h"
 #include "idp_logic.h"
 #include "idp_shard.h"
+#include "../../shared/http/conn_server.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../../shared/loop/file_io.h"
@@ -31,7 +32,7 @@ namespace socketley::idp
 // What marks a request channel payload as a `socketley idp-user` command, its arguments a line each after it.
 inline constexpr std::string_view command_marker = "\x02skl-idp\n";
 
-class idp_run : public io_handler, public request_origin
+class idp_run : public io_handler, public request_origin, public socketley::http::conn_hooks
 {
 public:
     idp_run(idp_instance& owner, event_loop& loop);
@@ -42,7 +43,7 @@ public:
     void on_loop_turn();
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool drained() const;
-    size_t conn_count() const { return m_conns.size(); }
+    size_t conn_count() const { return m_http.size(); }
     std::string stats() const;
 
     // A `socketley idp-user` command, answered through the request channel under `ticket`.
@@ -52,22 +53,7 @@ public:
     void on_request_reply(uint64_t cookie, request_status st, std::string_view reply) override;
 
 private:
-    struct conn
-    {
-        uint64_t id{0};
-        int fd{-1};
-        sockaddr_storage peer{};
-        io_request rd{}, wr{};
-        bool rd_pending{false}, wr_pending{false}, dead{false};
-        // An answer is being made on a later turn, so nothing more is read off this connection meanwhile.
-        bool waiting{false};
-        bool keep_alive{true};
-        std::string in;
-        std::string out;
-        size_t out_off{0};
-        int64_t last{0};
-        char rbuf[16384];
-    };
+    using conn = socketley::http::server_conn;
 
     // One request, read whole.
     struct request
@@ -90,22 +76,14 @@ private:
         std::vector<int64_t> at;
     };
 
-    void arm_accept();
-    void accept_done(struct io_uring_cqe* cqe);
-    std::shared_ptr<conn> conn_of(io_request* req);
-    void arm_read(const std::shared_ptr<conn>& c);
-    void read_done(const std::shared_ptr<conn>& c, int res);
-    void serve(const std::shared_ptr<conn>& c);
-    // A connection whose answer waited on a later turn takes up its requests again.
-    void resume(const std::shared_ptr<conn>& c);
-    void flush(const std::shared_ptr<conn>& c);
-    void write_done(const std::shared_ptr<conn>& c, int res);
-    void close_conn(const std::shared_ptr<conn>& c);
+    std::shared_ptr<socketley::http::server_conn> make_conn() override;
+    void accepted(const std::shared_ptr<conn>& c) override;
+    void serve(const std::shared_ptr<conn>& c) override;
     void arm_tick();
     void tick();
 
     // The request at the front of `in`: 1 taken, 0 not whole yet, -1 malformed.
-    int take_request(conn& c, request& rq, std::string& refusal);
+    int take_request(conn& c, request& rq, int& refusal);
     void handle(const std::shared_ptr<conn>& c, request& rq);
     void respond(const std::shared_ptr<conn>& c, int status, std::string_view type, std::string_view body,
                  std::string_view extra_headers = {});
@@ -173,6 +151,7 @@ private:
     idp_instance& m_owner;
     event_loop& m_loop;
     file_io m_io;
+    socketley::http::conn_server m_http;
     // A thread a core the process may run on, up to four, as each sign-in's scrypt is one core's milliseconds.
     hash_pool m_hash;
     // Password checks waiting for a hashing thread, which takes up to four at once.
@@ -195,12 +174,6 @@ private:
     std::string m_cookie_domain;
     bool m_secure_cookie{true};
 
-    int m_listen_fd{-1};
-    io_request m_accept_req{};
-    bool m_accept_pending{false};
-    std::unordered_map<uint64_t, std::shared_ptr<conn>> m_conns;
-    std::vector<std::shared_ptr<conn>> m_closing;
-    uint64_t m_next_id{1};
 
     io_request m_tick_req{};
     __kernel_timespec m_tick_ts{};

@@ -20,6 +20,7 @@
 #include <time.h>
 
 #include "db_schema.h"
+#include "../../shared/http/conn_server.h"
 #include "db_shard.h"
 #include "db_store.h"
 #include "../idp/idp_session.h"
@@ -34,7 +35,7 @@ class db_instance;
 namespace socketley::db
 {
 
-class db_run : public io_handler, public request_origin
+class db_run : public io_handler, public request_origin, public socketley::http::conn_hooks
 {
 public:
     db_run(db_instance& owner, event_loop& loop);
@@ -45,7 +46,7 @@ public:
     void on_loop_turn();
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool drained() const;
-    size_t conn_count() const { return m_conns.size(); }
+    size_t conn_count() const { return m_http.size(); }
     std::string stats() const;
 
     // A call through the request channel, `{"method":...}` from socketley.db or `{"backup":...}` from the daemon,
@@ -75,19 +76,9 @@ public:
                    std::string_view if_match, std::string_view if_none_match, bool sibling = false);
 
 private:
-    struct conn
+    // A connection, and what it keeps when it streams changes.
+    struct conn : socketley::http::server_conn
     {
-        uint64_t id{0};
-        int fd{-1};
-        io_request rd{}, wr{};
-        bool rd_pending{false}, wr_pending{false}, dead{false};
-        // An answer waits for the disk, so nothing more is read off this connection meanwhile.
-        bool waiting{false};
-        bool keep_alive{true};
-        std::string in;
-        std::string out;
-        size_t out_off{0};
-        int64_t last{0};
         // A stream of changes: of one collection, or of all for a key or a replica, as `who` may see them.
         bool feed{false};
         bool all{false};
@@ -98,7 +89,6 @@ private:
         std::vector<copy_job::item> dump;
         size_t dump_at{0};
         uint64_t dump_seq{0};
-        char rbuf[16384];
     };
 
     struct request
@@ -127,16 +117,12 @@ private:
         bool call{false};
     };
 
-    void arm_accept();
-    void accept_done(struct io_uring_cqe* cqe);
-    std::shared_ptr<conn> conn_of(io_request* req);
-    void arm_read(const std::shared_ptr<conn>& c);
-    void read_done(const std::shared_ptr<conn>& c, int res);
-    void serve(const std::shared_ptr<conn>& c);
-    void resume(const std::shared_ptr<conn>& c);
-    void flush(const std::shared_ptr<conn>& c);
-    void write_done(const std::shared_ptr<conn>& c, int res);
-    void close_conn(const std::shared_ptr<conn>& c);
+    std::shared_ptr<socketley::http::server_conn> make_conn() override;
+    void serve(const std::shared_ptr<socketley::http::server_conn>& c) override;
+    void accepted(const std::shared_ptr<socketley::http::server_conn>& c) override;
+    bool written(const std::shared_ptr<socketley::http::server_conn>& c) override;
+    bool keeps_open(const socketley::http::server_conn& c) const override;
+    void closing(const std::shared_ptr<socketley::http::server_conn>& c) override;
     void arm_tick();
     void tick();
 
@@ -195,6 +181,7 @@ private:
     db_instance& m_owner;
     event_loop& m_loop;
     file_io m_io;
+    socketley::http::conn_server m_http;
     store m_store;
     socketley::idp::session_verifier m_idp;
     std::vector<service_key> m_keys;
@@ -206,10 +193,6 @@ private:
     std::string m_keys_error;
     bool m_broken{false};
 
-    int m_listen_fd{-1};
-    io_request m_accept_req{};
-    bool m_accept_pending{false};
-    std::unordered_map<uint64_t, std::shared_ptr<conn>> m_conns;
     // The connections streaming changes, so a change is offered to them and not to every connection; one closed stays
     // until the walk after it, since close_conn() may run inside a walk.
     std::vector<std::shared_ptr<conn>> m_feeds;
@@ -225,8 +208,6 @@ private:
     uint64_t m_next_cookie{1};
     // The buffer the last answer's body was built in, kept for the next.
     std::string m_spare;
-    std::vector<std::shared_ptr<conn>> m_closing;
-    uint64_t m_next_id{1};
 
     io_request m_tick_req{};
     __kernel_timespec m_tick_ts{};

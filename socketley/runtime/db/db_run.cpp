@@ -28,6 +28,7 @@
 #include "../../shared/json/json_escape.h"
 #include "../../shared/http/url.h"
 #include "../../shared/http/status.h"
+#include "../../shared/http/request_head.h"
 
 namespace socketley::db
 {
@@ -101,7 +102,10 @@ const jvalue* string_member(const jvalue& obj, std::string_view name)
 }   // namespace
 
 
-db_run::db_run(db_instance& owner, event_loop& loop) : m_owner(owner), m_loop(loop), m_io(loop, this) {}
+db_run::db_run(db_instance& owner, event_loop& loop)
+    : m_owner(owner), m_loop(loop), m_io(loop, this), m_http(loop, this, owner, *this, max_conns)
+{
+}
 
 db_run::~db_run()
 {
@@ -162,29 +166,8 @@ bool db_run::start(std::string& why)
             m_origins.emplace_back(one);
     }
 
-    const uint16_t port = m_owner.effective_port();
-    m_listen_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (m_listen_fd < 0)
-    {
-        why = std::string("no socket: ") + std::strerror(errno);
+    if (!m_http.listen_tcp(m_owner.bind_in_addr(), m_owner.effective_port(), m_shards > 1, why))
         return false;
-    }
-    int one = 1;
-    ::setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    // Every shard binds the port, and the kernel spreads the connections over them.
-    if (m_shards > 1)
-        ::setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = m_owner.bind_in_addr();
-    a.sin_port = htons(port);
-    if (::bind(m_listen_fd, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0 || ::listen(m_listen_fd, 1024) < 0)
-    {
-        why = "port " + std::to_string(port) + " could not be bound: " + std::strerror(errno);
-        ::close(m_listen_fd);
-        m_listen_fd = -1;
-        return false;
-    }
     m_wake_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (m_wake_fd < 0)
     {
@@ -192,7 +175,7 @@ bool db_run::start(std::string& why)
         return false;
     }
     m_loop.register_owner(this);
-    arm_accept();
+    m_http.start_accepting();
     arm_wake();
     if (!m_owner.get_backup_dir().empty())
         m_next_backup = now_sec() + m_owner.get_backup_every();
@@ -239,17 +222,7 @@ void db_run::stop()
         const uint64_t covered = m_store.seq();
         synced(!m_broken && m_store.sync(), covered);
     }
-    if (m_listen_fd >= 0)
-    {
-        ::shutdown(m_listen_fd, SHUT_RDWR);
-        m_loop.close_fd(m_listen_fd);
-        m_listen_fd = -1;
-    }
-    std::vector<std::shared_ptr<conn>> all;
-    for (auto& [id, c] : m_conns)
-        all.push_back(c);
-    for (auto& c : all)
-        close_conn(c);
+    m_http.stop();
     m_feeds.clear();
     for (auto& j : m_jobs)
         m_store.finish(*j->job);
@@ -275,9 +248,7 @@ void db_run::on_loop_turn()
     maybe_merge();
     // A merge finished or a segment removed, said to the reading shards.
     publish_log();
-    // A listener whose accept the ring had no room for is asked again here, or it would be deaf for good.
-    if (!m_accept_pending)
-        arm_accept();
+    m_http.on_loop_turn();
     if (!m_wake_armed)
         arm_wake();
 }
@@ -357,7 +328,7 @@ void db_run::synced(bool ok, uint64_t covered)
             w.c->out += head(*w.c, 503, "application/json", body.size(), {});
             w.c->out += body;
             w.c->waiting = false;
-            flush(w.c);
+            m_http.flush(w.c);
         }
         return;
     }
@@ -384,7 +355,7 @@ void db_run::synced(bool ok, uint64_t covered)
         if (m_stopped)
             w.c->waiting = false;
         else
-            resume(w.c);
+            m_http.resume(w.c);
     }
     publish();
 }
@@ -449,10 +420,10 @@ void db_run::publish()
                 continue;
             send_event(*c, e);
             // A stream that reads slower than changes come is let go; it resumes from the last one it read.
-            if (c->out.size() - c->out_off > (16u << 20))
-                close_conn(c);
+            if (c->unsent() > (16u << 20))
+                m_http.close_conn(c);
             else
-                flush(c);
+                m_http.flush(c);
         }
         m_history_bytes += e.json.size() + e.coll.size() + e.id.size() + 64;
         m_history.push_back(std::move(e));
@@ -508,7 +479,7 @@ void db_run::open_feed(const std::shared_ptr<conn>& c, const request& rq, std::s
         for (const auto& e : m_history)
             if (e.seq > since && sees(*c, e))
                 send_event(*c, e);
-        flush(c);
+        m_http.flush(c);
         arm_tick();
         return;
     }
@@ -516,7 +487,7 @@ void db_run::open_feed(const std::shared_ptr<conn>& c, const request& rq, std::s
     if (!replica)
     {
         // A page told to read again what it shows, and then the changes after it.
-        flush(c);
+        m_http.flush(c);
         arm_tick();
         return;
     }
@@ -531,7 +502,7 @@ void db_run::open_feed(const std::shared_ptr<conn>& c, const request& rq, std::s
 void db_run::pump_dump(const std::shared_ptr<conn>& c)
 {
     std::string json;
-    while (!c->dump.empty() && c->out.size() - c->out_off < (1u << 20))
+    while (!c->dump.empty() && c->unsent() < (1u << 20))
     {
         if (c->dump_at == c->dump.size())
         {
@@ -556,12 +527,12 @@ void db_run::pump_dump(const std::shared_ptr<conn>& c)
         const auto& it = c->dump[c->dump_at++];
         if (!m_store.body_at(it.from, json))
         {
-            close_conn(c);
+            m_http.close_conn(c);
             return;
         }
         send_event(*c, event{it.seq, it.coll, it.id, it.owner, it.v, false, json});
     }
-    flush(c);
+    m_http.flush(c);
 }
 
 // ─── Work off the loop ──────────────────────────────────────────────────────
@@ -850,12 +821,9 @@ void db_run::take_replicated()
         m_history_from = 1;
         m_unpublished.clear();
         // Streams of this database, past what it now holds, start over.
-        std::vector<std::shared_ptr<conn>> feeds;
-        for (auto& [id, c] : m_conns)
-            if (c->feed)
-                feeds.push_back(c);
-        for (auto& c : feeds)
-            close_conn(c);
+        const std::vector<std::shared_ptr<conn>> feeds = m_feeds;
+        for (const auto& c : feeds)
+            m_http.close_conn(c);
     }
     if (!evs.empty())
     {
@@ -889,9 +857,8 @@ std::string db_run::stats() const
                   "\nreplica_connected:" + (m_replica_connected ? "1" : "0") +
                   "\nreplicated:" + std::to_string(m_c.replicated) + "\nresets:" + std::to_string(m_c.resets);
     }
-    size_t feeds = 0;
-    for (const auto& [id, c] : m_conns)
-        feeds += c->feed ? 1 : 0;
+    const size_t feeds = static_cast<size_t>(
+        std::count_if(m_feeds.begin(), m_feeds.end(), [](const std::shared_ptr<conn>& c) { return !c->dead; }));
     return "documents:" + std::to_string(m_store.documents()) + "\ncollections:" + std::to_string(m_store.collections()) +
            "\nbytes:" + std::to_string(m_store.bytes()) + "\nmax_bytes:" + std::to_string(m_owner.get_max_bytes()) +
            "\ndisk_bytes:" + std::to_string(m_store.disk_bytes()) + "\nsegments:" + std::to_string(m_store.segments()) +
@@ -966,98 +933,10 @@ void db_run::reload_files(std::string& why)
 
 // ─── Connections ────────────────────────────────────────────────────────────
 
-void db_run::arm_accept()
-{
-    if (m_stopped || m_listen_fd < 0 || m_accept_pending)
-        return;
-    m_accept_req = io_request{};
-    m_accept_req.owner = this;
-    m_accept_req.fd = m_listen_fd;
-    m_accept_req.type = event_loop::supports_multishot_accept() ? op_multishot_accept : op_accept;
-    m_accept_pending = m_accept_req.type == op_multishot_accept
-                           ? m_loop.submit_multishot_accept(m_listen_fd, &m_accept_req)
-                           : m_loop.submit_accept(m_listen_fd, nullptr, nullptr, &m_accept_req);
-}
-
-void db_run::accept_done(struct io_uring_cqe* cqe)
-{
-    if (!(cqe->flags & IORING_CQE_F_MORE))
-        m_accept_pending = false;
-    const int fd = cqe->res;
-    if (fd >= 0)
-    {
-        const size_t limit = m_owner.get_max_connections() ? m_owner.get_max_connections() : max_conns;
-        if (m_stopped || m_conns.size() >= limit)
-            m_loop.close_fd(fd);
-        else
-        {
-            auto c = std::make_shared_for_overwrite<conn>();
-            c->id = m_next_id++;
-            c->fd = fd;
-            int one = 1;
-            ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-            c->last = now_sec();
-            m_conns.emplace(c->id, c);
-            runtime_instance::stat_add(m_owner.m_stat_total_connections, 1);
-            m_owner.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
-            arm_read(c);
-            arm_tick();
-        }
-    }
-    if (!m_accept_pending && !m_stopped && fd != -ECANCELED)
-        arm_accept();
-}
-
-std::shared_ptr<db_run::conn> db_run::conn_of(io_request* req)
-{
-    auto* raw = reinterpret_cast<conn*>(req->buffer);
-    if (auto it = m_conns.find(raw->id); it != m_conns.end() && it->second.get() == raw)
-        return it->second;
-    for (const auto& c : m_closing)
-        if (c.get() == raw)
-            return c;
-    return nullptr;
-}
-
-void db_run::arm_read(const std::shared_ptr<conn>& c)
-{
-    if (c->dead || c->rd_pending || c->fd < 0)
-        return;
-    c->rd = io_request{};
-    c->rd.owner = this;
-    c->rd.buffer = reinterpret_cast<char*>(c.get());
-    c->rd.fd = c->fd;
-    c->rd.type = op_read;
-    c->rd_pending = m_loop.submit_read(c->fd, c->rbuf, sizeof c->rbuf, &c->rd);
-    if (!c->rd_pending)
-        close_conn(c);
-}
-
-void db_run::read_done(const std::shared_ptr<conn>& c, int res)
-{
-    c->rd_pending = false;
-    if (c->dead)
-    {
-        if (!c->wr_pending)
-            std::erase(m_closing, c);
-        return;
-    }
-    if (res <= 0)
-    {
-        close_conn(c);
-        return;
-    }
-    c->last = now_sec();
-    c->in.append(c->rbuf, static_cast<size_t>(res));
-    runtime_instance::stat_add(m_owner.m_stat_bytes_in, static_cast<uint64_t>(res));
-    serve(c);
-    if (!c->dead && !c->waiting)
-        arm_read(c);
-}
-
 // Requests in order, one at a time: a write's answer waits for the turn's sync and holds those behind it.
-void db_run::serve(const std::shared_ptr<conn>& c)
+void db_run::serve(const std::shared_ptr<socketley::http::server_conn>& sc)
 {
+    const auto c = std::static_pointer_cast<conn>(sc);
     while (!c->dead && !c->waiting && !c->in.empty())
     {
         request rq;
@@ -1074,91 +953,41 @@ void db_run::serve(const std::shared_ptr<conn>& c)
         runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
         handle(c, rq);
     }
-    flush(c);
 }
 
-void db_run::resume(const std::shared_ptr<conn>& c)
+std::shared_ptr<socketley::http::server_conn> db_run::make_conn()
 {
-    c->waiting = false;
-    serve(c);
-    if (!c->dead && !c->waiting)
-        arm_read(c);
+    return std::make_shared_for_overwrite<conn>();
 }
 
-void db_run::flush(const std::shared_ptr<conn>& c)
+void db_run::accepted(const std::shared_ptr<socketley::http::server_conn>&)
 {
-    if (c->dead || c->wr_pending)
-        return;
-    if (c->out_off >= c->out.size())
-    {
-        c->out.clear();
-        c->out_off = 0;
-        if (!c->keep_alive && !c->waiting && !c->feed)
-            close_conn(c);
-        return;
-    }
-    c->wr = io_request{};
-    c->wr.owner = this;
-    c->wr.buffer = reinterpret_cast<char*>(c.get());
-    c->wr.fd = c->fd;
-    c->wr.type = op_write;
-    const size_t chunk = std::min<size_t>(c->out.size() - c->out_off, 1u << 20);
-    c->wr_pending = m_loop.submit_write(c->fd, c->out.data() + c->out_off, static_cast<uint32_t>(chunk), &c->wr);
-    if (!c->wr_pending)
-        close_conn(c);
+    arm_tick();
 }
 
-void db_run::write_done(const std::shared_ptr<conn>& c, int res)
+bool db_run::written(const std::shared_ptr<socketley::http::server_conn>& sc)
 {
-    c->wr_pending = false;
-    if (c->dead)
-    {
-        if (!c->rd_pending)
-            std::erase(m_closing, c);
-        return;
-    }
-    if (res <= 0)
-    {
-        close_conn(c);
-        return;
-    }
-    c->out_off += static_cast<size_t>(res);
-    c->last = now_sec();
-    runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(res));
-    // A stream's buffer is cut behind what went, and a whole copy being sent goes on as it drains.
-    if (c->feed && c->out_off == c->out.size())
-    {
-        c->out.clear();
-        c->out_off = 0;
-        if (!c->dump.empty())
-        {
-            pump_dump(c);
-            return;
-        }
-    }
-    flush(c);
+    // A whole copy being sent goes on as what went before it drains.
+    const auto c = std::static_pointer_cast<conn>(sc);
+    if (!c->feed || c->dump.empty())
+        return false;
+    pump_dump(c);
+    return true;
 }
 
-void db_run::close_conn(const std::shared_ptr<conn>& c)
+bool db_run::keeps_open(const socketley::http::server_conn& c) const
 {
-    if (c->dead)
-        return;
-    c->dead = true;
-    if (!c->dump.empty())
+    return static_cast<const conn&>(c).feed;
+}
+
+void db_run::closing(const std::shared_ptr<socketley::http::server_conn>& sc)
+{
+    auto& c = static_cast<conn&>(*sc);
+    if (!c.dump.empty())
     {
-        c->dump.clear();
+        c.dump.clear();
         m_store.unpin();
     }
-    if (c->fd >= 0)
-    {
-        ::shutdown(c->fd, SHUT_RDWR);
-        m_loop.close_fd(c->fd);
-        c->fd = -1;
-    }
-    m_conns.erase(c->id);
-    m_owner.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
-    if (c->rd_pending || c->wr_pending)
-        m_closing.push_back(c);
 }
 
 
@@ -1170,11 +999,6 @@ void db_run::on_cqe(struct io_uring_cqe* cqe)
     if (file_io::owns_type(req->type))
     {
         m_io.on_cqe(cqe);
-        return;
-    }
-    if (req == &m_accept_req)
-    {
-        accept_done(cqe);
         return;
     }
     if (req == &m_tick_req)
@@ -1194,13 +1018,7 @@ void db_run::on_cqe(struct io_uring_cqe* cqe)
         arm_wake();
         return;
     }
-    auto c = conn_of(req);
-    if (!c)
-        return;
-    if (req == &c->rd)
-        read_done(c, cqe->res);
-    else if (req == &c->wr)
-        write_done(c, cqe->res);
+    m_http.on_cqe(req, cqe);
 }
 
 // Woken for what is due: every second while connections are open, else at the next document to go or backup to
@@ -1217,7 +1035,7 @@ void db_run::arm_tick()
         const int64_t d = std::clamp<int64_t>(at - now, 1, 60);
         delay = delay ? std::min(delay, d) : d;
     };
-    if (!m_conns.empty() || !m_owner.get_replicate().empty())
+    if (!m_http.empty() || !m_owner.get_replicate().empty())
         delay = 1;
     if (m_owner.get_replicate().empty())
         due(m_store.next_expiry());
@@ -1245,16 +1063,11 @@ void db_run::tick()
         {
             c->last = now;
             c->out += ": ping\n\n";
-            flush(c);
+            m_http.flush(c);
         }
     }
     std::erase_if(m_feeds, [](const std::shared_ptr<conn>& c) { return c->dead; });
-    std::vector<std::shared_ptr<conn>> idle;
-    for (auto& [id, c] : m_conns)
-        if (!c->feed && now - c->last > idle_secs && !c->waiting && c->out_off >= c->out.size())
-            idle.push_back(c);
-    for (auto& c : idle)
-        close_conn(c);
+    m_http.sweep(now, idle_secs);
     catch_up();
     // A replica is told of the documents that go by the database it copies, which sends their deletions; a shard
     // reading shard 0's log is told them by it.
@@ -1277,55 +1090,9 @@ void db_run::tick()
 
 int db_run::take_request(conn& c, request& rq, int& refusal)
 {
-    const size_t end = c.in.find("\r\n\r\n");
-    if (end == std::string::npos)
-    {
-        if (c.in.size() > max_head)
-        {
-            refusal = 431;
-            return -1;
-        }
-        return 0;
-    }
-    const std::string_view head(c.in.data(), end + 2);
-    if (!http_eol_framing_ok(head, true))
-        return -1;
-    const size_t line_end = head.find("\r\n");
-    const std::string_view line = head.substr(0, line_end);
-    const size_t sp1 = line.find(' ');
-    const size_t sp2 = sp1 == std::string_view::npos ? sp1 : line.find(' ', sp1 + 1);
-    if (sp2 == std::string_view::npos)
-        return -1;
-    rq.method.assign(line.substr(0, sp1));
-    const std::string_view target = line.substr(sp1 + 1, sp2 - sp1 - 1);
-    const std::string_view version = line.substr(sp2 + 1);
-    if (version != "HTTP/1.1" && version != "HTTP/1.0")
-        return -1;
-    const size_t q = target.find('?');
-    rq.path.assign(target.substr(0, q));
-    if (q != std::string_view::npos)
-        rq.query.assign(target.substr(q + 1));
-
-    const std::string_view fields = head.substr(line_end + 2);
-    const http_request_framing_scan scan = http_scan_request_headers(fields);
-    if (!scan.ok || scan.transfer_encoding)
-    {
-        refusal = scan.ok ? 411 : 400;
-        return -1;
-    }
-    bool close = version == "HTTP/1.0";
-    size_t pos = 0;
-    while (pos < fields.size())
-    {
-        size_t nl = fields.find("\r\n", pos);
-        if (nl == std::string_view::npos)
-            nl = fields.size();
-        const std::string_view f = fields.substr(pos, nl - pos);
-        pos = nl + 2;
-        const size_t colon = f.find(':');
-        if (colon == std::string_view::npos)
-            continue;
-        const std::string_view value = http_trim_ows(f.substr(colon + 1));
+    socketley::http::request_view v;
+    const int r = socketley::http::take_request(c.in, max_head, max_body, v, refusal,
+                                                [&rq](std::string_view f, std::string_view value) {
         if (header_name_equals(f, "cookie", 6))
         {
             if (!rq.cookie.empty())
@@ -1346,25 +1113,15 @@ int db_run::take_request(conn& c, request& rq, int& refusal)
             rq.origin.assign(value);
         else if (header_name_equals(f, "host", 4))
             rq.host.assign(value);
-        else if (header_name_equals(f, "connection", 10))
-        {
-            if (http_list_has_token(value, "close", 5))
-                close = true;
-            else if (http_list_has_token(value, "keep-alive", 10))
-                close = false;
-        }
-    }
-    const size_t body_len = scan.has_content_length ? scan.content_length : 0;
-    if (body_len > max_body)
-    {
-        refusal = 413;
-        return -1;
-    }
-    if (c.in.size() < end + 4 + body_len)
-        return 0;
-    rq.body.assign(c.in, end + 4, body_len);
-    c.in.erase(0, end + 4 + body_len);
-    c.keep_alive = !close;
+    });
+    if (r <= 0)
+        return r;
+    rq.method.assign(v.method);
+    rq.path.assign(v.path);
+    rq.query.assign(v.query);
+    rq.body.assign(c.in, v.head_len, v.body_len);
+    c.in.erase(0, v.head_len + v.body_len);
+    c.keep_alive = !v.close;
     return 1;
 }
 
@@ -1963,7 +1720,7 @@ void db_run::catch_up()
         m_ready = false;
         std::vector<std::shared_ptr<conn>> streams = m_feeds;
         for (auto& c : streams)
-            close_conn(c);
+            m_http.close_conn(c);
         try_follow();
         return;
     }
@@ -2038,7 +1795,7 @@ void db_run::deliver(const crossed& to, int status, std::string_view body, uint6
     // Shard 0 answered once the write was on its disk and had said so first, so a read behind it here sees it.
     catch_up();
     respond(c, status, to.head ? std::string_view{} : body, to.allow, version);
-    resume(c);
+    m_http.resume(c);
 }
 
 void db_run::cross_call(uint64_t ticket, std::string_view payload)

@@ -6,6 +6,11 @@
 #include <string_view>
 
 #include "shared/http/http_framing.h"
+#include "shared/http/request_head.h"
+
+#include <string>
+#include <utility>
+#include <vector>
 
 TEST_CASE("a field name matches a literal in any letter case")
 {
@@ -46,4 +51,70 @@ TEST_CASE("an Authorization scheme is matched in any case and its credentials tr
     CHECK_FALSE(http_auth_credentials("Bearer", "bearer", cred));
     CHECK_FALSE(http_auth_credentials("Basic x", "bearer", cred));
     CHECK_FALSE(http_auth_credentials(std::string_view("Bea\rer x", 8), "bearer", cred));
+}
+
+namespace
+{
+
+struct taken
+{
+    int r{0};
+    int status{0};
+    socketley::http::request_view v;
+    std::vector<std::pair<std::string, std::string>> fields;
+};
+
+taken take(std::string_view in, size_t max_head = 1024, size_t max_body = 64)
+{
+    taken t;
+    t.r = socketley::http::take_request(in, max_head, max_body, t.v, t.status, [&t](std::string_view f, std::string_view v) {
+        t.fields.emplace_back(std::string(f.substr(0, f.find(':'))), std::string(v));
+    });
+    return t;
+}
+
+}   // namespace
+
+TEST_CASE("a request is taken whole: its line, its fields, its body, and the next one behind it left alone")
+{
+    const std::string two = "POST /c/x?y=1 HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\nX-A:  v \r\n\r\nabcGET / HTTP/1.1\r\n\r\n";
+    taken t = take(two);
+    REQUIRE(t.r == 1);
+    CHECK(t.v.method == "POST");
+    CHECK(t.v.path == "/c/x");
+    CHECK(t.v.query == "y=1");
+    CHECK(t.v.body_len == 3);
+    CHECK(two.substr(t.v.head_len, t.v.body_len) == "abc");
+    CHECK_FALSE(t.v.close);
+    REQUIRE(t.fields.size() == 3);
+    CHECK(t.fields[2] == std::pair<std::string, std::string>{"X-A", "v"});
+    taken next = take(std::string_view(two).substr(t.v.head_len + t.v.body_len));
+    CHECK(next.r == 1);
+    CHECK(next.v.method == "GET");
+}
+
+TEST_CASE("a request not yet whole waits, and one that cannot be read is refused with its status")
+{
+    CHECK(take("GET / HTTP/1.1\r\nHost: h\r\n").r == 0);
+    CHECK(take("POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nab").r == 0);
+    taken big = take("POST / HTTP/1.1\r\nContent-Length: 65\r\n\r\n");
+    CHECK(big.r == -1);
+    CHECK(big.status == 413);
+    taken te = take("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+    CHECK(te.r == -1);
+    CHECK(te.status == 411);
+    CHECK(take(std::string(2000, 'a'), 1024).status == 431);
+    CHECK(take("GET / HTTP/2.0\r\n\r\n").status == 400);
+    CHECK(take("GET /\r\n\r\n").r == -1);
+    CHECK(take("GET / HTTP/1.1\nHost: h\r\n\r\n").r == -1);
+}
+
+TEST_CASE("keep-alive is the version's, and the last Connection field's when there is one")
+{
+    CHECK(take("GET / HTTP/1.0\r\n\r\n").v.close);
+    CHECK_FALSE(take("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").v.close);
+    CHECK(take("GET / HTTP/1.1\r\nConnection: close\r\n\r\n").v.close);
+    CHECK_FALSE(take("GET / HTTP/1.1\r\nConnection: close\r\nConnection: keep-alive\r\n\r\n").v.close);
+    CHECK(take("GET / HTTP/1.1\r\nConnection: Upgrade, close\r\n\r\n").v.close);
+    CHECK(take("GET / HTTP/1.1\r\nConnection: close\r\n\r\n").fields.empty());
 }
