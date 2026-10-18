@@ -767,63 +767,63 @@ static void append_storage_series(std::string& out, const std::vector<storage_ro
         }
 }
 
+// One runtime as every view of the fleet reads it, taken under the manager's lock and written out after it.
+struct runtime_row
+{
+    std::string name;
+    runtime_type type;
+    runtime_state state;
+    uint16_t port;
+    // Published and not live, so nothing here walks a table the event loop rewrites.
+    shard_stats::figures figures;
+    // What a storage's worker last published, whose counters are series of their own.
+    std::string detail;
+    std::vector<pid_t> pids;
+};
+
+static std::vector<runtime_row> runtime_rows(const runtime_manager& manager)
+{
+    std::shared_lock lock(manager.mutex);
+    const auto& runtimes = manager.list();
+    std::vector<runtime_row> rows;
+    rows.reserve(runtimes.size());
+    for (const auto& [name, rt] : runtimes)
+        // The bound port, the one `ps` prints: an unset -p is the type's default.
+        rows.push_back({name, rt->get_type(), rt->get_state(), rt->effective_port(), rt->worker_figures(),
+                        rt->get_type() == runtime_storage ? rt->stat_detail_snapshot() : std::string{},
+                        rt->shard_pids()});
+    return rows;
+}
+
+struct fleet_totals
+{
+    shard_stats::figures sum;
+    uint64_t running{0};
+};
+
+static fleet_totals fleet_sum(const std::vector<runtime_row>& rows)
+{
+    fleet_totals t;
+    for (const runtime_row& r : rows)
+    {
+        t.sum.active_connections += r.figures.active_connections;
+        t.sum.total_connections += r.figures.total_connections;
+        t.sum.total_messages += r.figures.total_messages;
+        t.sum.bytes_in += r.figures.bytes_in;
+        t.sum.bytes_out += r.figures.bytes_out;
+        t.running += r.state == runtime_running;
+    }
+    return t;
+}
+
 std::string metrics_endpoint::build_metrics() const
 {
-    // Snapshot runtime data under lock
-    struct runtime_snapshot {
-        std::string name;
-        runtime_type type;
-        runtime_state state;
-        uint64_t total_connections, total_messages, bytes_in, bytes_out;
-        size_t active_connections;
-        // What the worker last published, kept for the types whose own
-        // counters are series of their own.
-        std::string detail;
-        std::vector<pid_t> pids;
-    };
-    std::vector<runtime_snapshot> snapshots;
-    {
-        std::shared_lock lock(m_manager.mutex);
-        const auto& runtimes = m_manager.list();
-        snapshots.reserve(runtimes.size());
-        for (const auto& [name, rt] : runtimes)
-        {
-            // The published count and not get_connection_count(), which walks
-            // tables the event loop rewrites unsynchronised -- except for a
-            // runtime in a worker, where worker_figures() sums a shared table
-            // as safely as reading an atomic.
-            const shard_stats::figures f = rt->worker_figures();
-            snapshots.push_back({name, rt->get_type(), rt->get_state(),
-                f.total_connections,
-                f.total_messages,
-                f.bytes_in,
-                f.bytes_out,
-                static_cast<size_t>(f.active_connections),
-                rt->get_type() == runtime_storage ? rt->stat_detail_snapshot() : std::string{},
-                rt->shard_pids()});
-        }
-    }
-
-    // Now build metrics string without holding lock
-    uint64_t total_connections = 0;
-    uint64_t total_messages = 0;
-    uint64_t total_bytes_in = 0;
-    uint64_t total_bytes_out = 0;
-    uint64_t active_connections = 0;
-    int running_count = 0;
-    int total_count = static_cast<int>(snapshots.size());
-
-    for (const auto& s : snapshots)
-    {
-        total_connections += s.total_connections;
-        total_messages += s.total_messages;
-        total_bytes_in += s.bytes_in;
-        total_bytes_out += s.bytes_out;
-        active_connections += s.active_connections;
-
-        if (s.state == runtime_running)
-            running_count++;
-    }
+    const std::vector<runtime_row> snapshots = runtime_rows(m_manager);
+    const fleet_totals totals = fleet_sum(snapshots);
+    const uint64_t total_connections = totals.sum.total_connections, total_messages = totals.sum.total_messages,
+                   total_bytes_in = totals.sum.bytes_in, total_bytes_out = totals.sum.bytes_out,
+                   active_connections = totals.sum.active_connections, running_count = totals.running;
+    const uint64_t total_count = snapshots.size();
 
     std::string out;
     out.reserve(2048 + snapshots.size() * 256);
@@ -940,7 +940,7 @@ std::string metrics_endpoint::build_metrics() const
         out += "\",type=\"";
         label_escape_into(out, type_str);
         out += "\"} ";
-        json_append_uint(out, static_cast<uint64_t>(s.active_connections));
+        json_append_uint(out, s.figures.active_connections);
         out += "\n";
     }
     out += "\n";
@@ -952,7 +952,7 @@ std::string metrics_endpoint::build_metrics() const
         out += "socketley_runtime_messages_total{name=\"";
         label_escape_into(out, s.name);
         out += "\"} ";
-        json_append_uint(out, s.total_messages);
+        json_append_uint(out, s.figures.total_messages);
         out += "\n";
     }
 
@@ -1003,7 +1003,7 @@ std::string metrics_endpoint::build_metrics() const
             // The byte counts are the shared table's, summed as the other
             // runtimes' are, and not part of the published text.
             row.figures.insert(row.figures.begin(),
-                               {{"bytes_in", s.bytes_in}, {"bytes_out", s.bytes_out}});
+                               {{"bytes_in", s.figures.bytes_in}, {"bytes_out", s.figures.bytes_out}});
             storage_rows.push_back(std::move(row));
         }
     append_storage_series(out, storage_rows);
@@ -1018,32 +1018,15 @@ static const char* runtime_type_str(runtime_type t)
 
 std::string metrics_endpoint::build_json_overview() const
 {
-    // Snapshot under lock
-    uint64_t total_connections = 0, total_messages = 0;
-    uint64_t total_bytes_in = 0, total_bytes_out = 0;
-    uint64_t active_connections = 0;
-    int running_count = 0;
-    size_t runtimes_total = 0;
+    const std::vector<runtime_row> rows = runtime_rows(m_manager);
+    const fleet_totals totals = fleet_sum(rows);
+    const uint64_t total_connections = totals.sum.total_connections, total_messages = totals.sum.total_messages,
+                   total_bytes_in = totals.sum.bytes_in, total_bytes_out = totals.sum.bytes_out,
+                   active_connections = totals.sum.active_connections, running_count = totals.running;
+    const size_t runtimes_total = rows.size();
     std::vector<pid_t> pids{::getpid()};
-    {
-        std::shared_lock lock(m_manager.mutex);
-        const auto& runtimes = m_manager.list();
-        runtimes_total = runtimes.size();
-        for (const auto& [name, rt] : runtimes)
-        {
-            for (const pid_t pid : rt->shard_pids())
-                pids.push_back(pid);
-            // Published, not live, and for a runtime in a worker summed out of
-            // its shared table at this instant.
-            const shard_stats::figures f = rt->worker_figures();
-            total_connections += f.total_connections;
-            total_messages    += f.total_messages;
-            total_bytes_in    += f.bytes_in;
-            total_bytes_out   += f.bytes_out;
-            active_connections += f.active_connections;
-            if (rt->get_state() == runtime_running) running_count++;
-        }
-    }
+    for (const runtime_row& r : rows)
+        pids.insert(pids.end(), r.pids.begin(), r.pids.end());
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - m_start_time).count();
@@ -1184,30 +1167,7 @@ static void append_runtime_row(std::string& j, std::string_view name, runtime_ty
 
 std::string metrics_endpoint::build_json_runtimes() const
 {
-    // Snapshot runtime data under lock
-    struct runtimes_snapshot {
-        std::string name;
-        runtime_type type;
-        runtime_state state;
-        uint16_t port;
-        shard_stats::figures figures;
-        std::vector<pid_t> pids;
-    };
-    std::vector<runtimes_snapshot> snapshots;
-    {
-        std::shared_lock lock(m_manager.mutex);
-        const auto& runtimes = m_manager.list();
-        snapshots.reserve(runtimes.size());
-        for (const auto& [name, rt] : runtimes)
-        {
-            // Published, not live — see build_metrics().
-            snapshots.push_back({name, rt->get_type(), rt->get_state(),
-                // The bound port, the same one `ps` prints: an unset -p means
-                // the type's default, and this reported 0 for a runtime that
-                // was serving.
-                rt->effective_port(), rt->worker_figures(), rt->shard_pids()});
-        }
-    }
+    const std::vector<runtime_row> snapshots = runtime_rows(m_manager);
 
     std::string j;
     j.reserve(snapshots.size() * 256);
