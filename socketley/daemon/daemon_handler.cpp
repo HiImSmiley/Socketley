@@ -2714,7 +2714,7 @@ int daemon_handler::cmd_startup(ipc_connection* conn, const parsed_args& pa)
                 std::string line;
                 std::getline(f, line);
                 // utime and stime are the 14th and 15th fields, counted after the command's closing parenthesis.
-                if (const size_t at = line.rfind(')'); at != std::string::npos)
+                if (const size_t at = line.rfind(')'); at != std::string::npos && at + 2 <= line.size())
                 {
                     std::istringstream rest(line.substr(at + 2));
                     std::string field;
