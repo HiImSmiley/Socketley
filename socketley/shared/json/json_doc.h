@@ -28,17 +28,26 @@ struct jvalue
     std::vector<std::pair<std::string, jvalue>> members;
 };
 
+// What a reader admits past a configuration document's rules, for a reader of data such as S3 Select's records.
+struct json_policy
+{
+    int  max_depth{json_max_depth};
+    bool object_root{true};
+    bool unique_names{true};
+    bool check_utf8{true};
+};
+
 class json_reader
 {
 public:
-    explicit json_reader(std::string_view in) : m_in(in) {}
+    explicit json_reader(std::string_view in, json_policy policy = {}) : m_in(in), m_policy(policy) {}
 
     bool document(jvalue& out)
     {
         // A value read into before would otherwise keep its members, and each read again would be named twice.
         out = jvalue{};
         ws();
-        if (m_pos >= m_in.size() || m_in[m_pos] != '{')
+        if (m_policy.object_root && (m_pos >= m_in.size() || m_in[m_pos] != '{'))
             return false;
         if (!value(out, 0))
             return false;
@@ -64,7 +73,7 @@ private:
 
     bool value(jvalue& v, int depth)
     {
-        if (depth > json_max_depth)
+        if (depth > m_policy.max_depth)
             return false;
         ws();
         if (m_pos >= m_in.size())
@@ -202,12 +211,25 @@ private:
         return true;
     }
 
+    // A byte a string holds as it is, copied with the ones beside it.
+    bool plain(unsigned char c) const
+    {
+        return c >= 0x20 && c != '"' && c != '\\' && (c < 0x80 || !m_policy.check_utf8);
+    }
+
     bool string(std::string& out)
     {
         ++m_pos;
         out.clear();
         while (m_pos < m_in.size())
         {
+            size_t run = m_pos;
+            while (run < m_in.size() && plain(static_cast<unsigned char>(m_in[run])))
+                ++run;
+            out.append(m_in.data() + m_pos, run - m_pos);
+            m_pos = run;
+            if (m_pos >= m_in.size())
+                return false;
             const char c = m_in[m_pos++];
             if (c == '"')
                 return true;
@@ -318,7 +340,7 @@ private:
             if (m_in[m_pos] == '}')
             {
                 ++m_pos;
-                return unique_names(v);
+                return !m_policy.unique_names || unique_names(v);
             }
             if (m_in[m_pos++] != ',')
                 return false;
@@ -337,6 +359,7 @@ private:
     }
 
     std::string_view m_in;
+    json_policy      m_policy;
     size_t m_pos{0};
 };
 

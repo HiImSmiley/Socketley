@@ -634,6 +634,15 @@ TEST_CASE("JSON DOCUMENT: top-level values one after another, each spanning any 
     CHECK(run_failure("SELECT * FROM S3Object", json_doc, "{\"x\":\"\\ud800\"}") == "JSONParsingError");
 }
 
+TEST_CASE("JSON records are data: a name given twice, raw bytes and deep nesting are taken as written")
+{
+    CHECK(run("SELECT * FROM S3Object", json_doc, "{\"a\":1,\"a\":2}", json_out) == "{\"a\":1,\"a\":2}\n");
+    CHECK(run("SELECT s.t FROM S3Object s", json_doc, "{\"t\":\"\xC0\xAF\"}") == "\xC0\xAF\n");
+    const std::string deep = std::string(40, '[') + "1" + std::string(40, ']');
+    CHECK(run("SELECT COUNT(*) FROM S3Object", json_doc, "{\"d\":" + deep + "}") == "1\n");
+    CHECK(run_failure("SELECT * FROM S3Object", json_doc, "{\"t\":\"a\x01\"}") == "JSONParsingError");
+}
+
 // ─── Bounds ───
 
 TEST_CASE("a record of more than 1 MiB fails the query, and one of exactly 1 MiB does not")

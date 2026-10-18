@@ -13,6 +13,7 @@
 #include "checksum.h"
 #include "s3_xml.h"
 #include "s3_xml_tree.h"
+#include "../../shared/json/json_doc.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/ascii.h"
 
@@ -121,30 +122,6 @@ size_t char_step(std::string_view s, size_t i)
     return std::min(n, s.size() - i);
 }
 
-void put_utf8(std::string& out, uint32_t cp)
-{
-    if (cp < 0x80)
-        out.push_back(static_cast<char>(cp));
-    else if (cp < 0x800)
-    {
-        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    }
-    else if (cp < 0x10000)
-    {
-        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    }
-    else
-    {
-        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
-        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
-        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    }
-}
-
 void int_to(std::string& out, int64_t v)
 {
     char buf[24];
@@ -161,248 +138,18 @@ void real_to(std::string& out, double v)
 
 // ─── JSON ───────────────────────────────────────────────────────────────────
 
-struct jnode
+using jnode = socketley::json::jvalue;
+
+// One complete JSON value of any kind, members kept in document order and names given twice kept twice.
+bool parse_json(std::string_view text, jnode& out)
 {
-    enum class kind : uint8_t { null, boolean, number, string, array, object };
-    kind k{kind::null};
-    bool b{false};
-    // A string's bytes, or a number's text as the document wrote it.
-    std::string s;
-    std::vector<jnode> items;
-    std::vector<std::pair<std::string, jnode>> members;
-};
-
-// One complete JSON value, members kept in document order and names given twice kept twice.
-class json_parser
-{
-public:
-    explicit json_parser(std::string_view in) : m_in(in) {}
-
-    bool parse(jnode& out)
-    {
-        ws();
-        if (!value(out, 0))
-            return false;
-        ws();
-        return m_pos == m_in.size();
-    }
-
-private:
-    static constexpr int max_depth = 128;
-
-    void ws()
-    {
-        while (m_pos < m_in.size() &&
-               (m_in[m_pos] == ' ' || m_in[m_pos] == '\t' || m_in[m_pos] == '\n' || m_in[m_pos] == '\r'))
-            ++m_pos;
-    }
-
-    bool at(char c) const { return m_pos < m_in.size() && m_in[m_pos] == c; }
-
-    bool literal(std::string_view w)
-    {
-        if (m_in.substr(m_pos, w.size()) != w)
-            return false;
-        m_pos += w.size();
-        return true;
-    }
-
-    bool hex4(uint32_t& v)
-    {
-        if (m_in.size() - m_pos < 4)
-            return false;
-        v = 0;
-        for (int k = 0; k < 4; ++k)
-        {
-            const char c = m_in[m_pos++];
-            const int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
-                                                         : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
-            if (d < 0)
-                return false;
-            v = v * 16 + static_cast<uint32_t>(d);
-        }
-        return true;
-    }
-
-    bool string(std::string& out)
-    {
-        ++m_pos;
-        for (;;)
-        {
-            size_t run = m_pos;
-            while (run < m_in.size() && m_in[run] != '"' && m_in[run] != '\\' &&
-                   static_cast<unsigned char>(m_in[run]) >= 0x20)
-                ++run;
-            out.append(m_in.substr(m_pos, run - m_pos));
-            m_pos = run;
-            if (m_pos >= m_in.size())
-                return false;
-            const char c = m_in[m_pos++];
-            if (c == '"')
-                return true;
-            if (c != '\\' || m_pos >= m_in.size())
-                return false;
-            const char e = m_in[m_pos++];
-            switch (e)
-            {
-                case '"':  out.push_back('"'); break;
-                case '\\': out.push_back('\\'); break;
-                case '/':  out.push_back('/'); break;
-                case 'b':  out.push_back('\b'); break;
-                case 'f':  out.push_back('\f'); break;
-                case 'n':  out.push_back('\n'); break;
-                case 'r':  out.push_back('\r'); break;
-                case 't':  out.push_back('\t'); break;
-                case 'u':
-                {
-                    uint32_t cp = 0;
-                    if (!hex4(cp) || (cp >= 0xDC00 && cp <= 0xDFFF))
-                        return false;
-                    if (cp >= 0xD800 && cp <= 0xDBFF)
-                    {
-                        uint32_t lo = 0;
-                        if (m_in.substr(m_pos, 2) != "\\u")
-                            return false;
-                        m_pos += 2;
-                        if (!hex4(lo) || lo < 0xDC00 || lo > 0xDFFF)
-                            return false;
-                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                    }
-                    put_utf8(out, cp);
-                    break;
-                }
-                default: return false;
-            }
-        }
-    }
-
-    bool digits()
-    {
-        const size_t b = m_pos;
-        while (m_pos < m_in.size() && is_digit(m_in[m_pos]))
-            ++m_pos;
-        return m_pos > b;
-    }
-
-    bool number(std::string& out)
-    {
-        const size_t b = m_pos;
-        if (at('-'))
-            ++m_pos;
-        if (at('0'))
-            ++m_pos;
-        else if (!digits())
-            return false;
-        if (at('.'))
-        {
-            ++m_pos;
-            if (!digits())
-                return false;
-        }
-        if (at('e') || at('E'))
-        {
-            ++m_pos;
-            if (at('+') || at('-'))
-                ++m_pos;
-            if (!digits())
-                return false;
-        }
-        out.assign(m_in.substr(b, m_pos - b));
-        return true;
-    }
-
-    bool value(jnode& v, int depth)
-    {
-        if (depth > max_depth || m_pos >= m_in.size())
-            return false;
-        const char c = m_in[m_pos];
-        if (c == '{')
-        {
-            v.k = jnode::kind::object;
-            ++m_pos;
-            ws();
-            if (at('}'))
-            {
-                ++m_pos;
-                return true;
-            }
-            for (;;)
-            {
-                ws();
-                std::string name;
-                if (!at('"') || !string(name))
-                    return false;
-                ws();
-                if (!at(':'))
-                    return false;
-                ++m_pos;
-                ws();
-                v.members.emplace_back(std::move(name), jnode{});
-                if (!value(v.members.back().second, depth + 1))
-                    return false;
-                ws();
-                if (at(','))
-                {
-                    ++m_pos;
-                    continue;
-                }
-                if (!at('}'))
-                    return false;
-                ++m_pos;
-                return true;
-            }
-        }
-        if (c == '[')
-        {
-            v.k = jnode::kind::array;
-            ++m_pos;
-            ws();
-            if (at(']'))
-            {
-                ++m_pos;
-                return true;
-            }
-            for (;;)
-            {
-                ws();
-                v.items.emplace_back();
-                if (!value(v.items.back(), depth + 1))
-                    return false;
-                ws();
-                if (at(','))
-                {
-                    ++m_pos;
-                    continue;
-                }
-                if (!at(']'))
-                    return false;
-                ++m_pos;
-                return true;
-            }
-        }
-        if (c == '"')
-        {
-            v.k = jnode::kind::string;
-            return string(v.s);
-        }
-        if (c == 't' || c == 'f')
-        {
-            v.k = jnode::kind::boolean;
-            v.b = c == 't';
-            return literal(v.b ? "true" : "false");
-        }
-        if (c == 'n')
-        {
-            v.k = jnode::kind::null;
-            return literal("null");
-        }
-        v.k = jnode::kind::number;
-        return number(v.s);
-    }
-
-    std::string_view m_in;
-    size_t           m_pos{0};
-};
+    socketley::json::json_policy p;
+    p.max_depth    = 128;
+    p.object_root  = false;
+    p.unique_names = false;
+    p.check_utf8   = false;
+    return socketley::json::json_reader(text, p).document(out);
+}
 
 void json_node_to(std::string& out, const jnode& n)
 {
@@ -2703,8 +2450,7 @@ struct select_engine::impl
         if (trim_ws(text).empty())
             return;
         jnode doc;
-        json_parser p(text);
-        if (!p.parse(doc))
+        if (!parse_json(text, doc))
         {
             fault("JSONParsingError");
             return;
