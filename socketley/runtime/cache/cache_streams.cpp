@@ -4,6 +4,7 @@
 #include "resp_parser.h"
 #include "../../cli/command_hashing.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/wall_clock.h"
 
 #include <chrono>
 #include <cstring>
@@ -18,12 +19,6 @@ constexpr sv bad_id    = "Invalid stream ID specified as stream command argument
 constexpr sv syntax    = "syntax error";
 constexpr sv not_int   = "value is not an integer or out of range";
 constexpr sv oom       = "OOM command not allowed when used memory > 'maxmemory'";
-
-int64_t wall_ms()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-}
 
 // strcasecmp, which is how Redis matches every option word.
 bool ieq(sv a, sv b)
@@ -284,7 +279,7 @@ struct stream_commands
         stream_id id;
         if (!t.id_given)
         {
-            const uint64_t ms = static_cast<uint64_t>(wall_ms());
+            const uint64_t ms = static_cast<uint64_t>(socketley::wall::now_ms());
             if (ms > last.ms) id = { ms, 0 };
             else { id = last; id.incr(); }
         }
@@ -410,7 +405,7 @@ struct stream_commands
         }
         else
         {
-            const int64_t now = wall_ms();
+            const int64_t now = socketley::wall::now_ms();
             ci.m_store.stream_change(key, s, [&](stream_inner& st) {
                 consumer* c = st.find_consumer(*g, cname);
                 if (!c) c = st.create_consumer(*g, cname, now);
@@ -803,7 +798,7 @@ struct stream_commands
             g = s->find_group(gname);
             bool made = false;
             ci.m_store.stream_change(key, *s, [&](stream_inner& st) {
-                made = st.create_consumer(*g, a[4], wall_ms()) != nullptr;
+                made = st.create_consumer(*g, a[4], socketley::wall::now_ms()) != nullptr;
             });
             resp::encode_integer_into(rb, made ? 1 : 0);
             if (made && logging()) ci.stream_repl(key, { "XGROUP", "CREATECONSUMER", key, gname, a[4] });
@@ -964,7 +959,7 @@ struct stream_commands
             only = s->find_consumer(*g, cname);
             if (!only) { rb.append("*0\r\n", 4); return; }
         }
-        const int64_t now = wall_ms();
+        const int64_t now = socketley::wall::now_ms();
         std::string& body = ci.m_stream_scratch;
         body.clear();
         int n = 0;
@@ -1015,7 +1010,7 @@ struct stream_commands
             if (!stream_parse_id(a[j], id, 0, true, nullptr)) break;
             ids.push_back(id);
         }
-        const int64_t now = wall_ms();
+        const int64_t now = socketley::wall::now_ms();
         int64_t delivery = -1, retry = -1;
         bool force = false, justid = false;
         stream_id lastid;
@@ -1134,7 +1129,7 @@ struct stream_commands
         if (!g) { nogroup_key(a[1], a[2]); return; }
 
         const sv key = a[1], gname = a[2], cname = a[3];
-        const int64_t now = wall_ms();
+        const int64_t now = socketley::wall::now_ms();
         std::string& body = ci.m_stream_scratch;
         body.clear();
         std::vector<stream_id> deleted;
@@ -1236,7 +1231,7 @@ struct stream_commands
         if (bad) return;
         if (!s) { err(rb, "no such key"); return; }
         ci.m_store.stream_get(a[2]);
-        const int64_t now = wall_ms();
+        const int64_t now = socketley::wall::now_ms();
 
         if (cons)
         {

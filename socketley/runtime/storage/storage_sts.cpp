@@ -11,6 +11,7 @@
 #include "digest.h"
 #include "s3_iam.h"
 #include "s3_sts.h"
+#include "../../shared/util/wall_clock.h"
 
 namespace socketley::storage
 {
@@ -191,8 +192,7 @@ void storage_run::op_sts(const std::shared_ptr<conn>& c)
         return;
     }
 
-    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t now = wall::now_sec();
     session_credentials sc;
     if (!m_auth->issue_session(v.principal, now + duration, policy, role, sc))
     {
@@ -266,8 +266,7 @@ void storage_run::op_sts_federated(const std::shared_ptr<conn>& c,
                      "characters.");
             return;
         }
-        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        const int64_t now = wall::now_sec();
         oidc_identity id;
         std::string why, user;
         if (!m_oidc->verify(*token, now, id, why))
@@ -361,8 +360,7 @@ void storage_run::sts_federated_session(const std::shared_ptr<conn>& c, std::str
             role     = std::string(rname);
         }
     }
-    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t now = wall::now_sec();
     session_credentials sc;
     if (!m_auth->issue_session_as(user, now + duration, policy, role, sc))
     {

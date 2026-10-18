@@ -31,6 +31,7 @@
 #include "../../shared/net/unix_listener.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/http/status.h"
+#include "../../shared/util/wall_clock.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -1580,8 +1581,7 @@ std::string storage_run::response_head(const conn& c, const response& r, size_t 
 {
     static thread_local int64_t cached_sec = -1;
     static thread_local std::string cached_date;
-    const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t now_s = wall::now_sec();
     if (now_s != cached_sec)
     {
         cached_sec  = now_s;
@@ -2745,10 +2745,6 @@ void storage_run::file_done(const std::shared_ptr<conn>& c)
 namespace socketley::storage
 {
 
-namespace
-{
-
-}   // namespace
 
 std::string storage_run::sync_runner_name(std::string_view user) const
 {

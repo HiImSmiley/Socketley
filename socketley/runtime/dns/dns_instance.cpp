@@ -58,7 +58,7 @@ constexpr int      notify_backoff[] = {1, 3, 7, 15, 31};
 // The client blocks the rate limit remembers, so a flood from forged sources cannot grow the table without end.
 constexpr size_t   rrl_max_blocks = 1u << 18;
 
-int64_t now_sec()
+int64_t steady_sec()
 {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -417,7 +417,7 @@ bool dns_run::start(std::string& why)
     if (m_auto_addresses)
     {
         public_addresses(m_v4, m_v6);
-        m_addresses_at = now_sec();
+        m_addresses_at = steady_sec();
         if (m_v4.empty() && m_v6.empty())
             LOG_WARN("dns: --proxy is set but this machine has no public address on its interfaces (behind NAT?); "
                      "no runtime's name is published until --publish names one");
@@ -691,7 +691,7 @@ bool dns_run::rrl_limited(const sockaddr_storage& src, bool& slip)
     if (m_rrl.size() >= rrl_max_blocks && !m_rrl.count(key))
         m_rrl.clear();
     rrl_bucket& b = m_rrl[key];
-    const int64_t now = now_sec();
+    const int64_t now = steady_sec();
     if (b.sec != now)
     {
         b.sec = now;
@@ -873,7 +873,7 @@ void dns_run::accept_done(tcp_listener& l, struct io_uring_cqe* cqe)
             if (::getpeername(fd, reinterpret_cast<sockaddr*>(&c->peer), &len) < 0) {}
             int one = 1;
             ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-            c->last = now_sec();
+            c->last = steady_sec();
             m_conns.emplace(c->id, c);
             ++m_c.tcp_conns;
             runtime_instance::stat_add(m_owner.m_stat_total_connections, 1);
@@ -924,7 +924,7 @@ void dns_run::read_done(const std::shared_ptr<tcp_conn>& c, int res)
         close_conn(c);
         return;
     }
-    c->last = now_sec();
+    c->last = steady_sec();
     c->in.append(c->rbuf, static_cast<size_t>(res));
     runtime_instance::stat_add(m_owner.m_stat_bytes_in, static_cast<uint64_t>(res));
     tcp_serve(c);
@@ -1060,7 +1060,7 @@ void dns_run::write_done(const std::shared_ptr<tcp_conn>& c, int res)
         return;
     }
     c->out_off += static_cast<size_t>(res);
-    c->last = now_sec();
+    c->last = steady_sec();
     runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(res));
     // Nothing reads `out` now, so what waited beside it joins it.
     if (!c->later.empty())
@@ -1104,7 +1104,7 @@ void dns_run::arm_tick()
 
 void dns_run::tick()
 {
-    const int64_t now = now_sec();
+    const int64_t now = steady_sec();
     // A read or accept the ring had no room for when it was last asked is asked again here, or the socket would be
     // deaf for good.
     for (auto& ep : m_udp)
@@ -1179,9 +1179,9 @@ void dns_run::check_zones()
 {
     bool changed = dns_feed::stamp_ns() != m_feed_stamp;
     // This machine's addresses, looked at once a minute when they are what is published.
-    if (m_auto_addresses && now_sec() - m_addresses_at >= 60)
+    if (m_auto_addresses && steady_sec() - m_addresses_at >= 60)
     {
-        m_addresses_at = now_sec();
+        m_addresses_at = steady_sec();
         std::vector<std::string> v4, v6;
         public_addresses(v4, v6);
         if (v4 != m_v4 || v6 != m_v6)
@@ -1302,7 +1302,7 @@ void dns_run::send_notify(notify_job& j)
     for (const auto& zz : m_zones->zones)
         if (to_text(zz->origin) == j.origin)
             z = zz.get();
-    j.next_at = now_sec() + notify_backoff[std::min<size_t>(j.tries, std::size(notify_backoff) - 1)];
+    j.next_at = steady_sec() + notify_backoff[std::min<size_t>(j.tries, std::size(notify_backoff) - 1)];
     ++j.tries;
     if (!z)
         return;

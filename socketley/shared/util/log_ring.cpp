@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "logging.h"
+#include "wall_clock.h"
 
 namespace log_ring
 {
@@ -66,18 +67,12 @@ std::string level_of(std::string_view line)
     return "info";
 }
 
-int64_t now_ms()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
 void keep(std::string_view runtime, std::string_view line)
 {
     std::lock_guard lock(st().ring_mtx);
     entry e;
     e.seq = ++st().seq;
-    e.at_ms = now_ms();
+    e.at_ms = socketley::wall::now_ms();
     e.runtime.assign(runtime);
     e.level = level_of(line);
     e.text.assign(line.substr(0, 4096));

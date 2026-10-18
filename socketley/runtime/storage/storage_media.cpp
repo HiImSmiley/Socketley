@@ -44,6 +44,7 @@
 #include "sse.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/util/wall_clock.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -129,12 +130,6 @@ struct rung
 };
 constexpr rung ladder[] = {{2160, 20000}, {1440, 12000}, {1080, 7000}, {720, 4000}, {480, 2000}, {360, 1000}, {240, 600}};
 constexpr int64_t audio_kbps = 160;
-
-int64_t now_ms()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-}
 
 int64_t mtime_ms(const struct stat& sb)
 {
@@ -1074,7 +1069,7 @@ void storage_run::op_media(const std::shared_ptr<conn>& c)
                 o.meta.etag() == etag &&
                 !m_media_srcs.contains(want2.object))
             {
-                m_media_srcs[want2.object] = {o.fd, o.data_off, o.meta.size, now_ms()};
+                m_media_srcs[want2.object] = {o.fd, o.data_off, o.meta.size, wall::now_ms()};
                 o.fd = -1;
             }
             if (o.fd >= 0)
@@ -1142,7 +1137,7 @@ bool storage_run::media_hw_test(bool low_power)
     media_job j;
     j.pid = pid;
     j.want.kind = k_hwtest;
-    j.started_ms = now_ms();
+    j.started_ms = wall::now_ms();
     j.seeked = low_power;
     m_media_jobs.push_back(std::move(j));
     media_watch_exit(pid);
@@ -1177,7 +1172,7 @@ std::shared_ptr<const media_probe> storage_run::media_probe_of(const std::string
 
 void storage_run::media_touch(const std::string& dir)
 {
-    const int64_t now = now_ms();
+    const int64_t now = wall::now_ms();
     auto& last = m_media_touched[dir];
     if (now - last < touch_every_ms)
         return;
@@ -1195,7 +1190,7 @@ void storage_run::media_source(const std::shared_ptr<conn>& c, std::string_view 
     const size_t slash = rest.find('/');
     uint64_t expires = 0;
     if (slash == std::string_view::npos || !parse_uint(r.get_query("t"), expires) ||
-        static_cast<int64_t>(expires) * 1000 < now_ms())
+        static_cast<int64_t>(expires) * 1000 < wall::now_ms())
     {
         app_reply(c, 403, "Access denied.\n");
         return;
@@ -1346,7 +1341,7 @@ void storage_run::media_put(std::string_view bucket, std::string_view key, const
 bool storage_run::media_unasked(const media_want& w)
 {
     struct stat sb{};
-    const int64_t now = now_ms();
+    const int64_t now = wall::now_ms();
     // One that waited longer than a copy may take is let go: a look at its link asks for it again.
     if (now - w.asked_ms > web_job_ms || m_media_done.contains(w.dir) || exists(w.dir + "/done"))
         return true;
@@ -1398,7 +1393,7 @@ void storage_run::media_name(media_want& w, const object_meta& m)
     w.dir = medium_dir(media_dir, w.variant, w.object);
     // The second probe's, which also holds chapters; the first's are left for eviction.
     w.probe_dir = medium_dir(media_dir, "probe2", w.object);
-    w.asked_ms = now_ms();
+    w.asked_ms = wall::now_ms();
     w.deadline_ms = w.asked_ms + media_wait_ms;
 }
 
@@ -1456,12 +1451,12 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
         pp = media_probe_of(w.probe_dir);
         if (!pp)
         {
-            if (::stat((w.probe_dir + "/failed").c_str(), &sb) == 0 && now_ms() - mtime_ms(sb) < failed_hold_ms)
+            if (::stat((w.probe_dir + "/failed").c_str(), &sb) == 0 && wall::now_ms() - mtime_ms(sb) < failed_hold_ms)
             {
                 app_reply(c, 415, "ffmpeg could not read this object as a medium.\n");
                 return true;
             }
-            if (now_ms() > w.deadline_ms)
+            if (wall::now_ms() > w.deadline_ms)
             {
                 app_reply(c, 504, "The medium is still being looked at; ask again.\n");
                 return true;
@@ -1567,12 +1562,12 @@ bool storage_run::media_try(const std::shared_ptr<conn>& c, const media_want& w)
         app_reply(c, 404, "No such part of this stream.\n");
         return true;
     }
-    if (::stat((w.dir + "/failed").c_str(), &sb) == 0 && now_ms() - mtime_ms(sb) < failed_hold_ms)
+    if (::stat((w.dir + "/failed").c_str(), &sb) == 0 && wall::now_ms() - mtime_ms(sb) < failed_hold_ms)
     {
         app_reply(c, 415, "ffmpeg could not make this from the object.\n");
         return true;
     }
-    if (now_ms() > w.deadline_ms)
+    if (wall::now_ms() > w.deadline_ms)
     {
         app_reply(c, 504, "The medium is still being made; ask again.\n");
         return true;
@@ -1659,7 +1654,7 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
             if (j.want.kind == k_rendition && j.want.dir == w.dir && j.from == r.from)
             {
                 j.wanted = std::max(j.wanted, seg);
-                j.asked_ms = now_ms();
+                j.asked_ms = wall::now_ms();
                 if (j.paused && j.wanted + resume_within >= j.next)
                 {
                     ::kill(j.pid, SIGCONT);
@@ -1674,13 +1669,13 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
     // Made already, by any job of any shard: served as it is.
     if (media_serve(c, w, false))
         return true;
-    if (now_ms() > w.deadline_ms)
+    if (wall::now_ms() > w.deadline_ms)
     {
         app_reply(c, 504, "The segment is still being made; ask again.\n");
         return true;
     }
     // A rendition ffmpeg failed on is answered so for a while, and segments past the picture's end are none.
-    if (::stat((w.dir + "/failed").c_str(), &sb) == 0 && now_ms() - mtime_ms(sb) < failed_hold_ms)
+    if (::stat((w.dir + "/failed").c_str(), &sb) == 0 && wall::now_ms() - mtime_ms(sb) < failed_hold_ms)
     {
         app_reply(c, 415, "ffmpeg could not make this from the object.\n");
         return true;
@@ -1711,7 +1706,7 @@ bool storage_run::media_segment(const std::shared_ptr<conn>& c, const media_want
         size_t oldest = m_media_jobs.size();
         for (size_t i = 0; i < m_media_jobs.size(); ++i)
             if (m_media_jobs[i].want.kind == k_rendition && m_media_jobs[i].paused &&
-                now_ms() - m_media_jobs[i].asked_ms > unasked_ms &&
+                wall::now_ms() - m_media_jobs[i].asked_ms > unasked_ms &&
                 (oldest == m_media_jobs.size() || m_media_jobs[i].asked_ms < m_media_jobs[oldest].asked_ms))
                 oldest = i;
         if (oldest == m_media_jobs.size())
@@ -1770,7 +1765,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
     std::string url;
     if (auto it = m_media_srcs.find(w.object); it != m_media_srcs.end())
     {
-        it->second.used_ms = now_ms();
+        it->second.used_ms = wall::now_ms();
         src_fd = it->second.fd;
         url = "subfile,,start," + std::to_string(it->second.off) + ",end," + std::to_string(it->second.off + it->second.len) +
               ",,:/proc/self/fd/3";
@@ -1803,7 +1798,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             m_media_key = media_key(m_store.options().dir + "/.media");
         if (m_media_key.empty())
             return false;
-        const int64_t expires = now_ms() / 1000 + source_ttl_s;
+        const int64_t expires = wall::now_ms() / 1000 + source_ttl_s;
         const std::string etag = w.object.substr(w.object.rfind('\n') + 1);
         url = std::string(tls_enabled() ? "https://" : "http://") + host + ":" + std::to_string(port) + "/~media/src/";
         url_encode_to(url, w.bucket, true);
@@ -2017,7 +2012,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
             j.from = from;
             j.next = from;
             j.wanted = w.seg < 0 ? -1 : from;
-            j.asked_ms = now_ms();
+            j.asked_ms = wall::now_ms();
             j.total = segments_of(p);
             break;
         }
@@ -2068,7 +2063,7 @@ bool storage_run::media_start(const media_want& w, int lock_fd, int64_t from)
     j.pid = pid;
     j.lock_fd = lock_fd;
     j.want = w;
-    j.started_ms = now_ms();
+    j.started_ms = wall::now_ms();
     m_media_jobs.push_back(std::move(j));
     media_watch_exit(pid);
     media_arm();
@@ -2131,7 +2126,7 @@ void storage_run::media_tick()
         int status = 0;
         const pid_t r = ::waitpid(j.pid, &status, WNOHANG);
         struct stat sb{};
-        const int64_t now = now_ms();
+        const int64_t now = wall::now_ms();
         if (j.want.kind == k_hwtest)
         {
             if (r == 0 && now - j.started_ms < 15000)
@@ -2327,7 +2322,7 @@ void storage_run::media_tick()
     }
     std::erase_if(m_media_unasked, [this](const media_want& w) { return media_unasked(w); });
     // An object's file no job has started from for a minute is let go.
-    const int64_t now = now_ms();
+    const int64_t now = wall::now_ms();
     for (auto it = m_media_srcs.begin(); it != m_media_srcs.end();)
     {
         if (now - it->second.used_ms > source_keep_ms)

@@ -25,6 +25,7 @@
 #include <cstring>
 #include <cerrno>
 #include "../../shared/util/glob_match.h"
+#include "../../shared/util/wall_clock.h"
 #include <cstdlib>
 #include <cstdio>
 #include <charconv>
@@ -3816,8 +3817,7 @@ void cache_instance::journal_mutation(std::string_view cmd)
         constexpr int64_t far = std::numeric_limits<int64_t>::max();
         if (seconds)
             n = n > far / 1000 ? far : n < -(far / 1000) ? -far : n * 1000;
-        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        const int64_t now = socketley::wall::now_ms();
         return n > far - now ? far : now + n;
     };
     const auto put_pexpireat = [&](std::string_view key, int64_t at) {
@@ -4063,8 +4063,7 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
         l += std::to_string(bus <= 65535u ? bus : 0u);
         l += (sh == me) ? " myself,master - 0 " : " master - 0 ";
         l += std::to_string(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
+            socketley::wall::now_ms());
         // config epoch 1 for every node, and it never changes: no slot here is
         // ever migrating, so there is nothing for an epoch to order.
         l += " 1 connected ";
@@ -6915,8 +6914,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 if (!parse_int_sv(ts_str, unix_s)) { rb.append("error: invalid timestamp\n", 25); return; }
             }
             {
-                const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
+                const int64_t now_s = socketley::wall::now_sec();
                 // Replicated verbatim, because the argument is an absolute
                 // timestamp and the follower arrives at the same expiry
                 // however long the line took.
@@ -6935,8 +6933,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 if (!parse_int_sv(ts_str, unix_ms)) { rb.append("error: invalid timestamp\n", 25); return; }
             }
             {
-                const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
+                const int64_t now_ms = socketley::wall::now_ms();
                 // Verbatim like expireat and, like it once was, this was not
                 // replicated at all.
                 answered_expire(m_store.expire_in(key, saturating_until(unix_ms, now_ms), true),
@@ -10656,8 +10653,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             int64_t unix_s = 0;
             if (!parse_int_sv(args[2], unix_s)) { resp::encode_error_into(rb, "invalid timestamp"); return; }
             {
-                const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
+                const int64_t now_s = socketley::wall::now_sec();
                 const int64_t rel_s = saturating_until(unix_s, now_s);
                 if (!expire_gated(ms_of(rel_s))) break;
                 answered_expire(m_store.expire_in(args[1], rel_s, false));
@@ -10671,8 +10667,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             int64_t unix_ms = 0;
             if (!parse_int_sv(args[2], unix_ms)) { resp::encode_error_into(rb, "invalid timestamp"); return; }
             {
-                const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
+                const int64_t now_ms = socketley::wall::now_ms();
                 const int64_t rel_ms = saturating_until(unix_ms, now_ms);
                 if (!expire_gated(rel_ms)) break;
                 answered_expire(m_store.expire_in(args[1], rel_ms, true));

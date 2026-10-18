@@ -13,19 +13,11 @@
 #include "../../shared/json/json_doc.h"
 #include "../storage/s3_federation.h"
 #include "../../shared/persist/read_file.h"
+#include "../../shared/util/wall_clock.h"
 
 namespace socketley::idp
 {
 
-namespace
-{
-
-int64_t now_sec()
-{
-    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
-}   // namespace
 
 session_verifier::session_verifier() = default;
 session_verifier::~session_verifier() = default;
@@ -43,7 +35,7 @@ void session_verifier::configure(std::string_view idp_runtime)
 void session_verifier::reload()
 {
     // The provider's file, looked at once a second, and read again only when it changed.
-    const int64_t now = now_sec();
+    const int64_t now = wall::now_sec();
     if (m_stamp && now == m_checked)
         return;
     m_checked = now;
@@ -96,7 +88,7 @@ bool session_verifier::check(std::string_view cookies, who& out)
     reload();
     if (!m_keys)
         return false;
-    const int64_t now = now_sec();
+    const int64_t now = wall::now_sec();
     while (!cookies.empty())
     {
         const size_t semi = cookies.find(';');
@@ -115,7 +107,7 @@ bool session_verifier::check_bearer(std::string_view token, who& out)
     if (!enabled())
         return false;
     reload();
-    return m_keys && !token.empty() && verified(token, true, now_sec(), out);
+    return m_keys && !token.empty() && verified(token, true, wall::now_sec(), out);
 }
 
 std::string session_verifier::login_url(std::string_view return_to)

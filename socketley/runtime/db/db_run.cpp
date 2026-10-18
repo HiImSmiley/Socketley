@@ -29,6 +29,7 @@
 #include "../../shared/http/url.h"
 #include "../../shared/http/status.h"
 #include "../../shared/http/request_head.h"
+#include "../../shared/util/wall_clock.h"
 
 namespace socketley::db
 {
@@ -40,14 +41,6 @@ constexpr int64_t idle_secs = 120;
 constexpr size_t  max_head  = 16 * 1024;
 constexpr size_t  max_body  = 4u << 20;
 constexpr size_t  max_conns = 4096;
-
-// The coarse clock, a read of what the kernel last ticked: every use counts whole seconds, three times a request.
-int64_t now_sec()
-{
-    timespec ts{};
-    ::clock_gettime(CLOCK_REALTIME_COARSE, &ts);
-    return static_cast<int64_t>(ts.tv_sec);
-}
 
 std::string error_body(std::string_view code, std::string_view message)
 {
@@ -170,7 +163,7 @@ bool db_run::start(std::string& why)
     m_http.start_accepting();
     arm_wake();
     if (!m_owner.get_backup_dir().empty())
-        m_next_backup = now_sec() + m_owner.get_backup_every();
+        m_next_backup = wall::now_sec_coarse() + m_owner.get_backup_every();
     if (m_reader)
         try_follow();
     else
@@ -620,7 +613,7 @@ void db_run::maybe_merge()
 
 void db_run::scheduled_backup()
 {
-    if (m_reader || m_owner.get_backup_dir().empty() || now_sec() < m_next_backup)
+    if (m_reader || m_owner.get_backup_dir().empty() || wall::now_sec_coarse() < m_next_backup)
         return;
     std::error_code ec;
     std::filesystem::create_directories(std::string(m_owner.get_backup_dir()), ec);
@@ -634,7 +627,7 @@ void db_run::scheduled_backup()
     auto job = m_store.plan_backup(dest);
     if (!job)
         return;   // a merge is running; the next tick tries again
-    m_next_backup = now_sec() + m_owner.get_backup_every();
+    m_next_backup = wall::now_sec_coarse() + m_owner.get_backup_every();
     start_job(std::move(job), 0);
 }
 
@@ -879,7 +872,7 @@ std::string db_run::stats() const
 void db_run::reload_files(std::string& why)
 {
     const bool first = m_files_checked == 0;
-    const int64_t now = now_sec();
+    const int64_t now = wall::now_sec_coarse();
     if (!first && now == m_files_checked)
         return;
     m_files_checked = now;
@@ -1020,7 +1013,7 @@ void db_run::arm_tick()
     if (m_tick_armed || m_stopped)
         return;
     int64_t delay = 0;
-    const int64_t now = now_sec();
+    const int64_t now = wall::now_sec_coarse();
     const auto due = [&](int64_t at) {
         if (at <= 0)
             return;
@@ -1046,7 +1039,7 @@ void db_run::tick()
 {
     if (m_stopped)
         return;
-    const int64_t now = now_sec();
+    const int64_t now = wall::now_sec_coarse();
     // A comment now and then, so a stream nothing changes on is not taken for a dead one.
     for (size_t i = 0; i < m_feeds.size(); ++i)
     {

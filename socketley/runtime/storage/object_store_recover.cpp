@@ -33,6 +33,7 @@
 #include "s3_notify.h"
 #include "shard_owner.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/wall_clock.h"
 
 namespace fs = std::filesystem;
 
@@ -90,13 +91,6 @@ std::string slurp(const std::string& path, size_t max = 4096)
     }
     ::close(fd);
     return out;
-}
-
-int64_t wall_ms()
-{
-    struct timespec ts{};
-    ::clock_gettime(CLOCK_REALTIME, &ts);
-    return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
 }
 
 // The shard a tmp/ entry belongs to, from the "<shard>." its name begins with,
@@ -801,7 +795,7 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
             struct stat sb{};
             ms = ::stat(base.c_str(), &sb) == 0
                      ? static_cast<int64_t>(sb.st_mtim.tv_sec) * 1000
-                     : wall_ms();
+                     : wall::now_ms();
             // Shard 0 writes it, since two shards truncating one file at once could
             // leave each reading the other's half.
             const int fd = m_opts.shard != 0 ? -1

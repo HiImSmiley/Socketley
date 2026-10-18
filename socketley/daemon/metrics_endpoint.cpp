@@ -13,6 +13,7 @@
 #include "daemon_handler.h"
 #include "../runtime/storage/storage_instance.h"
 #include "../shared/json/json_escape.h"
+#include "../shared/util/wall_clock.h"
 
 #include <unistd.h>
 #include <cerrno>
@@ -52,7 +53,7 @@ bool metrics_endpoint::start(uint16_t port, options o)
     m_history = std::make_unique<history::keeper>(o.state_dir.empty() ? std::string() : o.state_dir + "/.history");
     m_alerts = std::make_unique<alerts::monitor>(o.state_dir.empty() ? std::string() : o.state_dir + "/.alerts",
                                                  std::move(o.alert_webhook));
-    m_history->load(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    m_history->load(socketley::wall::now_sec());
     // SOCK_CLOEXEC because the daemon forks proxy workers, and with
     // SO_REUSEADDR but not SO_REUSEPORT an inherited copy keeps the metrics
     // port bound after the daemon is gone.
@@ -303,7 +304,7 @@ void metrics_endpoint::serve(int fd, const dashboard::request& req, bool via)
             dashboard::send(fd, 401, "text/plain; charset=utf-8", "Sign in first.\n");
             return;
         }
-        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        const int64_t now = socketley::wall::now_sec();
         const std::string body = m_history->query(dashboard::query_field(req.query, "runtime"), now,
             std::strtoll(dashboard::query_field(req.query, "range").c_str(), nullptr, 10),
             std::strtoul(dashboard::query_field(req.query, "points").c_str(), nullptr, 10));
@@ -1168,7 +1169,7 @@ void metrics_endpoint::sample()
         all.rss_bytes += u.memory_bytes;
     }
     readings.emplace_back(std::string(), all);
-    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t now_ms = socketley::wall::now_ms();
     m_history->record(now_ms, readings);
     m_alerts->check(now_ms / 1000, facts, m_state_dir.empty() ? std::vector<std::string>{} : std::vector<std::string>{m_state_dir});
 }

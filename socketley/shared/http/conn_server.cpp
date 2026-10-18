@@ -10,22 +10,11 @@
 #include <unistd.h>
 
 #include "../runtime/runtime_instance.h"
+#include "../util/wall_clock.h"
 
 namespace socketley::http
 {
 
-namespace
-{
-
-// The coarse clock, what the kernel last ticked: a connection's activity is counted in whole seconds.
-int64_t now_sec()
-{
-    timespec ts{};
-    ::clock_gettime(CLOCK_REALTIME_COARSE, &ts);
-    return static_cast<int64_t>(ts.tv_sec);
-}
-
-}   // namespace
 
 conn_server::conn_server(event_loop& loop, io_handler* owner, runtime_instance& rt, conn_hooks& hooks,
                          size_t max_conns)
@@ -122,7 +111,7 @@ void conn_server::accept_done(struct io_uring_cqe* cqe)
             if (::getpeername(fd, reinterpret_cast<sockaddr*>(&c->peer), &len) < 0) {}
             int one = 1;
             ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-            c->last = now_sec();
+            c->last = wall::now_sec_coarse();
             m_conns.emplace(c->id, c);
             runtime_instance::stat_add(m_rt.m_stat_total_connections, 1);
             m_rt.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
@@ -192,7 +181,7 @@ void conn_server::read_done(const std::shared_ptr<server_conn>& c, int res)
         close_conn(c);
         return;
     }
-    c->last = now_sec();
+    c->last = wall::now_sec_coarse();
     c->in.append(c->rbuf, static_cast<size_t>(res));
     runtime_instance::stat_add(m_rt.m_stat_bytes_in, static_cast<uint64_t>(res));
     m_hooks.serve(c);
@@ -254,7 +243,7 @@ void conn_server::write_done(const std::shared_ptr<server_conn>& c, int res)
         return;
     }
     c->sent += static_cast<size_t>(res);
-    c->last = now_sec();
+    c->last = wall::now_sec_coarse();
     runtime_instance::stat_add(m_rt.m_stat_bytes_out, static_cast<uint64_t>(res));
     if (c->unsent() == 0 && m_hooks.written(c))
         return;

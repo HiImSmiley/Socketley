@@ -24,6 +24,7 @@
 #include "../../shared/util/logging.h"
 #include "../../shared/storage/s3_sigv4.h"
 #include "../../shared/util/size_suffix.h"
+#include "../../shared/util/wall_clock.h"
 
 namespace socketley::storage
 {
@@ -993,8 +994,7 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
         }
     std::shared_ptr<const user_identity> session_user;
     bool expired = false;
-    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t now = wall::now_sec();
     // A named object, because the lookup keeps a pointer to what it is built from.
     const auto lookup = [&](std::string_view access_key) -> std::string_view
     {

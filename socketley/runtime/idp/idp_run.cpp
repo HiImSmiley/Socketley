@@ -33,6 +33,7 @@
 #include "../../shared/http/status.h"
 #include "../../shared/http/request_head.h"
 #include "../../shared/persist/read_file.h"
+#include "../../shared/util/wall_clock.h"
 
 namespace socketley::idp
 {
@@ -52,18 +53,6 @@ constexpr size_t  max_conns     = 4096;
 constexpr int     miss_limit    = 5;
 constexpr int64_t miss_window   = 15 * 60;
 constexpr std::string_view cookie_name = "skl_idp";
-
-int64_t now_sec()
-{
-    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
-// Milliseconds, which tell a session given before a sign-out everywhere from one given in the same second after it.
-int64_t now_ms()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
 
 std::string random_token()
 {
@@ -339,7 +328,7 @@ void idp_run::tick()
 {
     if (m_stopped)
         return;
-    const int64_t now = now_sec();
+    const int64_t now = wall::now_sec();
     m_http.sweep(now, idle_secs);
     std::erase_if(m_codes, [now](const auto& kv) { return kv.second.expires <= now; });
     // A loop rather than erase_if, whose predicate GCC 12's library hands each entry as const.
@@ -428,7 +417,7 @@ void idp_run::handle(const std::shared_ptr<conn>& c, request& rq)
     // What shard 0 has written by now, so an answer here is as current as one it would give.
     catch_up();
     // The clients file, looked at again at most once a second.
-    if (const int64_t now = now_sec(); now != m_clients_checked)
+    if (const int64_t now = wall::now_sec(); now != m_clients_checked)
     {
         m_clients_checked = now;
         load_clients();
@@ -548,7 +537,7 @@ const account* idp_run::session_of(const request& rq) const
 {
     // Every skl_idp cookie the request carries, since a browser sends one per domain it was set for.
     std::string_view header = rq.cookie;
-    const int64_t now = now_sec();
+    const int64_t now = wall::now_sec();
     while (!header.empty())
     {
         const size_t semi = header.find(';');
@@ -572,14 +561,14 @@ const account* idp_run::session_of(const request& rq) const
 
 std::string idp_run::session_cookie(const account& who, bool remember) const
 {
-    const int64_t now = now_sec();
+    const int64_t now = wall::now_sec();
     const int64_t life = remember ? remember_secs : session_secs;
     // What a proxy or a storage verifying the cookie on its own needs: the id, the username and the admin bit.
     const std::string body = "\"iss\":" + m_issuer_json + ",\"aud\":\"session\",\"sub\":" +
                              socketley::json::quote(who.id) + ",\"preferred_username\":" + socketley::json::quote(who.username()) +
                              ",\"email\":" + socketley::json::quote(who.field("email")) + ",\"admin\":" +
                              (who.in_group("admins") ? "true" : "false") + ",\"iat\":" + std::to_string(now) +
-                             ",\"iat_ms\":" + std::to_string(now_ms()) +
+                             ",\"iat_ms\":" + std::to_string(wall::now_ms()) +
                              ",\"auth_time\":" + std::to_string(now) + ",\"exp\":" + std::to_string(now + life);
     std::string h = "Set-Cookie: " + std::string(cookie_name) + "=" + sign_token(m_key, m_kid, "session+jwt", body) +
                     "; Path=/; HttpOnly; SameSite=Lax";
@@ -802,7 +791,7 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
         return;
     }
     const std::string ip = client_ip(*c, rq);
-    if (barred(ip, now_sec()))
+    if (barred(ip, wall::now_sec()))
     {
         ++m_c.barred;
         login_page(c, p, "Too many failed sign-ins from here; try again in a quarter of an hour.", 429);
@@ -823,7 +812,7 @@ void idp_run::sign_in(const std::shared_ptr<conn>& c, const request& rq)
             ++m_c.refused;
             LOG_INFO(("idp " + std::string(m_owner.get_name()) + ": a sign-in as \"" + user + "\" from " + ip +
                       " was refused").c_str());
-            missed(ip, now_sec(), [this, weak, p]
+            missed(ip, wall::now_sec(), [this, weak, p]
             {
                 auto c2 = weak.lock();
                 if (!c2 || c2->dead)
@@ -919,7 +908,7 @@ void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const accou
     e.nonce.assign(param(p, "nonce"));
     e.scope.assign(param(p, "scope"));
     e.challenge.assign(param(p, "code_challenge"));
-    const int64_t now = now_sec();
+    const int64_t now = wall::now_sec();
     e.auth_time = now;
     e.expires = now + code_secs;
     // Named by the shard that keeps it, which the exchange is taken to.
@@ -948,7 +937,7 @@ void idp_run::grant(const std::shared_ptr<conn>& c, const params& p, const accou
 
 void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, const code_entry& e, const account& who)
 {
-    const int64_t now = now_sec();
+    const int64_t now = wall::now_sec();
     const std::string jti = random_token();
     const std::string profile = profile_claims(who);
     const std::string aud = socketley::json::quote(cl.id);
@@ -957,7 +946,7 @@ void idp_run::issue_tokens(const std::shared_ptr<conn>& c, const client& cl, con
     std::string common;
     common.reserve(256);
     common.append("\"iss\":").append(m_issuer_json).append(",\"sub\":").append(socketley::json::quote(who.id));
-    common.append(",\"iat\":").append(std::to_string(now)).append(",\"iat_ms\":").append(std::to_string(now_ms()));
+    common.append(",\"iat\":").append(std::to_string(now)).append(",\"iat_ms\":").append(std::to_string(wall::now_ms()));
     common.append(",\"auth_time\":").append(std::to_string(e.auth_time));
     // Each token's claims made in the one string, the common ones first.
     std::string claims;
@@ -1069,7 +1058,7 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
     {
         claims r;
         std::string why;
-        if (!verify_secret_token(m_secret, "refresh+jwt", m_issuer, param(p, "refresh_token"), now_sec(), r, why) ||
+        if (!verify_secret_token(m_secret, "refresh+jwt", m_issuer, param(p, "refresh_token"), wall::now_sec(), r, why) ||
             claim(r, "aud") != "refresh" || claim(r, "client_id") != cl->id)
         {
             json_error(c, 400, "invalid_grant", "the refresh token is not one this client may use");
@@ -1102,7 +1091,7 @@ void idp_run::redeemed(const std::shared_ptr<conn>& c, const client& cl, const p
         json_error(c, 400, "invalid_grant", "the code is not known, was used, or has expired");
         return;
     }
-    if (e.expires <= now_sec() || e.client_id != cl.id || e.redirect != param(p, "redirect_uri"))
+    if (e.expires <= wall::now_sec() || e.client_id != cl.id || e.redirect != param(p, "redirect_uri"))
     {
         json_error(c, 400, "invalid_grant", "the code was not given to this client for this redirect");
         return;
@@ -1132,7 +1121,7 @@ void idp_run::userinfo(const std::shared_ptr<conn>& c, const request& rq)
     }
     claims a;
     std::string why;
-    if (!m_verified.verify(m_key, m_kid, "at+jwt", m_issuer, token, now_sec(), a, why) ||
+    if (!m_verified.verify(m_key, m_kid, "at+jwt", m_issuer, token, wall::now_sec(), a, why) ||
         !has_scope(claim(a, "scope"), "openid"))
     {
         json_error(c, 401, "invalid_token", "the access token is not valid: " + why,
@@ -1246,7 +1235,7 @@ void idp_run::account_post(const std::shared_ptr<conn>& c, const request& rq)
     if (rq.path == "/account/everywhere")
     {
         // Every session and refresh token given before now stops holding, this browser's too.
-        update_account(who->id, {{"revoked_before", std::to_string(now_ms())}},
+        update_account(who->id, {{"revoked_before", std::to_string(wall::now_ms())}},
                        [this, weak, rq](bool ok, const std::string& why)
         {
             auto cc = weak.lock();
@@ -1289,7 +1278,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
     if (!who)
         who = m_accounts.by_name(param(p, "username"));
     const std::string ip = client_ip(*c, rq);
-    if (barred(ip, now_sec()))
+    if (barred(ip, wall::now_sec()))
     {
         ++m_c.barred;
         respond(c, 429, "text/plain", "Too many failed sign-ins from here; try again in a quarter of an hour.\n");
@@ -1318,7 +1307,7 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
         };
         if (!ok || !a || a->disabled())
         {
-            missed(ip, now_sec(), [this, weak, rq, p, from_reset]
+            missed(ip, wall::now_sec(), [this, weak, rq, p, from_reset]
             {
                 auto c2 = weak.lock();
                 if (!c2 || c2->dead)
@@ -1354,8 +1343,8 @@ void idp_run::password_post(const std::shared_ptr<conn>& c, const request& rq)
                 return;
             }
             // A new password ends the sessions given before it, as a stolen one would want.
-            update_account(id, {{"password", hash}, {"reset", ""}, {"password_set", std::to_string(now_sec())},
-                                {"revoked_before", std::to_string(now_ms())}},
+            update_account(id, {{"password", hash}, {"reset", ""}, {"password_set", std::to_string(wall::now_sec())},
+                                {"revoked_before", std::to_string(wall::now_ms())}},
                            [this, weak, p, id, from_reset](bool ok, const std::string&)
             {
                 auto c3 = weak.lock();
@@ -1438,7 +1427,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
     const std::string user = args[1];
     if (action == "add")
     {
-        field_list fields{{"username", user}, {"created", std::to_string(now_sec())}};
+        field_list fields{{"username", user}, {"created", std::to_string(wall::now_sec())}};
         std::string password;
         for (size_t i = 2; i < args.size(); ++i)
         {
@@ -1502,7 +1491,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         else
             hash_password(password, [create, fields = std::move(fields)](std::string hash) mutable {
                 fields.emplace_back("password", std::move(hash));
-                fields.emplace_back("password_set", std::to_string(now_sec()));
+                fields.emplace_back("password_set", std::to_string(wall::now_sec()));
                 create(std::move(fields));
             });
         return;
@@ -1542,8 +1531,8 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
             return;
         }
         hash_password(password, [apply, reset](std::string hash) {
-            const std::string now = std::to_string(now_sec());
-            apply({{"password", std::move(hash)}, {"password_set", now}, {"revoked_before", std::to_string(now_ms())},
+            const std::string now = std::to_string(wall::now_sec());
+            apply({{"password", std::move(hash)}, {"password_set", now}, {"revoked_before", std::to_string(wall::now_ms())},
                    {"reset", reset ? "1" : ""}},
                   "");
         });
@@ -1583,7 +1572,7 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
     }
     if (action == "logout")
     {
-        apply({{"revoked_before", std::to_string(now_ms())}}, "");
+        apply({{"revoked_before", std::to_string(wall::now_ms())}}, "");
         return;
     }
     if (action == "remove")
@@ -1632,7 +1621,7 @@ void idp_run::import_page(uint64_t ticket, std::string_view reply)
             ++kept;
             continue;
         }
-        field_list f{{"username", u.key}, {"created", std::to_string(now_sec())}};
+        field_list f{{"username", u.key}, {"created", std::to_string(wall::now_sec())}};
         for (const auto& [k, v] : u.metadata)
         {
             if (v.empty())

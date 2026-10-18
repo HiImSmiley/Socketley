@@ -19,6 +19,7 @@
 #include "../../shared/persist/mutation_journal.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/util/wall_clock.h"
 
 namespace socketley::db
 {
@@ -74,11 +75,6 @@ std::string staged_key(std::string_view coll, std::string_view id)
     k += '\0';
     k += id;
     return k;
-}
-
-int64_t now_sec()
-{
-    return static_cast<int64_t>(::time(nullptr));
 }
 
 // A system field of a document as a query sees it, null for one of the document's own.
@@ -1312,7 +1308,7 @@ std::vector<std::string> store::collection_names() const
 
 bool store::expired(const doc& d) const
 {
-    return d.expires && d.expires <= now_sec();
+    return d.expires && d.expires <= wall::now_sec();
 }
 
 bool store::may_read(const principal& who, access a, const doc& d) const

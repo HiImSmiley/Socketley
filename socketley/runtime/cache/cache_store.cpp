@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <algorithm>
 #include "../../shared/util/glob_match.h"
+#include "../../shared/util/wall_clock.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -2711,12 +2712,6 @@ static int64_t expiry_left_ms(uint8_t flag, int64_t v, int64_t wall_now_ms)
     return flag == expiry_absolute ? v - wall_now_ms : v;
 }
 
-static int64_t wall_clock_ms()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
 // Append-only: an older build reads a dump it does not know the types in,
 // which is why a new one goes on the end and never in the middle.
 enum : uint8_t { TYPE_STRING = 0, TYPE_LIST = 1, TYPE_SET = 2, TYPE_HASH = 3,
@@ -2878,7 +2873,7 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
 
     char* p = static_cast<char*>(map);
     auto now = std::chrono::steady_clock::now();
-    const int64_t wall_now_ms = wall_clock_ms();
+    const int64_t wall_now_ms = socketley::wall::now_ms();
 
     auto emit = [&](const void* src, size_t n) { std::memcpy(p, src, n); p += n; };
     auto emit_u8  = [&](uint8_t v)  { *p++ = static_cast<char>(v); };
@@ -3086,7 +3081,7 @@ bool cache_store::load_v2(const char* data, size_t size)
     flush_all();
 
     auto now = std::chrono::steady_clock::now();
-    const int64_t wall_now_ms = wall_clock_ms();
+    const int64_t wall_now_ms = socketley::wall::now_ms();
     const char* p = data;
     const char* end = data + size;
 
@@ -3252,7 +3247,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
     flush_all();
 
     auto now = std::chrono::steady_clock::now();
-    const int64_t wall_now_ms = wall_clock_ms();
+    const int64_t wall_now_ms = socketley::wall::now_ms();
 
     auto read_string = [&](std::string& out) -> bool {
         uint32_t len = 0;

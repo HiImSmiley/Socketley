@@ -28,6 +28,7 @@
 #include "../../shared/persist/state_persistence.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/util/wall_clock.h"
 
 using socketley::json::jvalue;
 using socketley::json::json_reader;
@@ -185,12 +186,6 @@ std::string_view last_name_of(std::string_view key)
 {
     const size_t slash = key.rfind('/');
     return slash == std::string_view::npos ? key : key.substr(slash + 1);
-}
-
-int64_t now_ms()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 std::string share_view_json(const share_link& s)
@@ -398,7 +393,7 @@ bool storage_run::share_open(const std::shared_ptr<conn>& c, std::string_view id
         app_reply(c, 404, "No such link.\n");
         return false;
     }
-    if (s.expires_ms && now_ms() > s.expires_ms)
+    if (s.expires_ms && wall::now_ms() > s.expires_ms)
     {
         app_reply(c, 410, "This link has expired.\n");
         return false;
@@ -626,7 +621,7 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
             auto cc = weak.lock();
             if (!cc || cc->dead)
                 return;
-            app_reply(cc, 200, landing_page(s, last_name_of(key), found == st::ok ? &m : nullptr, now_ms()),
+            app_reply(cc, 200, landing_page(s, last_name_of(key), found == st::ok ? &m : nullptr, wall::now_ms()),
                       "text/html; charset=utf-8");
         });
         return;
@@ -693,7 +688,7 @@ void storage_run::op_share(const std::shared_ptr<conn>& c)
                 }
                 ++now.downloads;
                 if (now.burn && now.downloads >= now.max_downloads)
-                    now.drained_ms = now_ms();
+                    now.drained_ms = wall::now_ms();
                 allowed = replace_file(path, share_json(now), durability::data_and_dir);
                 if (allowed)
                     share_sent(id, share_json(now), {});
@@ -809,7 +804,7 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
                 if (!read_whole_file(dir + "/" + std::string(n), text) || !parse_share(text, s))
                     continue;
                 // An expired link is gone for good, and is cleared away here rather than listed.
-                if (s.expires_ms && now_ms() > s.expires_ms)
+                if (s.expires_ms && wall::now_ms() > s.expires_ms)
                 {
                     // One that burns is left to the sweep, which removes what it names first.
                     if (s.burn)
@@ -888,7 +883,7 @@ void storage_run::share_body(const std::shared_ptr<conn>& c)
         return;
     }
     s.owner = u ? u->id : std::string(default_owner);
-    s.created_ms = now_ms();
+    s.created_ms = wall::now_ms();
     // A lifetime past a hundred years is one that does not end, and is not multiplied past int64 into the past.
     constexpr uint64_t century_s = 100ull * 365 * 86400;
     s.expires_ms = !expires_in || expires_in > century_s ? 0 : s.created_ms + static_cast<int64_t>(expires_in) * 1000;
@@ -1012,7 +1007,7 @@ void storage_run::share_burn_tick()
         return;
     m_burn_next = now + std::chrono::seconds(5);
     const std::string dir = m_store.options().dir + "/.shares";
-    const int64_t t = now_ms();
+    const int64_t t = wall::now_ms();
     size_t seen = 0;
     DIR* d = ::opendir(dir.c_str());
     if (!d)

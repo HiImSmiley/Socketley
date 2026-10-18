@@ -32,6 +32,7 @@
 #include "../../shared/persist/state_persistence.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/util/wall_clock.h"
 
 namespace socketley::storage
 {
@@ -50,12 +51,6 @@ constexpr int64_t session_ms  = 12ll * 3600 * 1000;
 constexpr int64_t remember_ms = 30ll * 24 * 3600 * 1000;
 // The positions kept for a user, the most recently watched first.
 constexpr size_t  progress_max = 200;
-
-int64_t wall_ms()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-}
 
 std::string_view cookie_value(std::string_view header, std::string_view name)
 {
@@ -340,7 +335,7 @@ bool storage_run::ui_cookie(const std::shared_ptr<conn>& c, auth_verdict& v)
         return !s.empty() && end && !*end;
     };
     long long iat = 0, exp = 0;
-    if (!number(val.substr(a + 1, b - a - 1), iat) || !number(val.substr(b + 1, d - b - 1), exp) || exp < wall_ms())
+    if (!number(val.substr(a + 1, b - a - 1), iat) || !number(val.substr(b + 1, d - b - 1), exp) || exp < wall::now_ms())
         return true;
     v = m_auth->authorize_ui_session(key, iat, exp, val.substr(d + 1));
     struct stat revoked{};
@@ -533,7 +528,7 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
         }
         const std::string who = c->user ? c->user->id : c->principal;
         const std::string dir = m_store.options().dir + "/.ui";
-        const int64_t now = wall_ms();
+        const int64_t now = wall::now_ms();
         if ((::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST) ||
             (::mkdir((dir + "/sessions").c_str(), 0700) < 0 && errno != EEXIST) ||
             !replace_file(dir + "/sessions/" + sha256_hex(who).substr(0, 32), std::to_string(now),
@@ -576,7 +571,7 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
         // password signs as.
         const std::string& key = c->principal;
         const bool remember = r.has_query("remember");
-        const int64_t issued = wall_ms();
+        const int64_t issued = wall::now_ms();
         expires = issued + (remember ? remember_ms : session_ms);
         std::string cookie = std::string(cookie_name) + "=" + base64url_encode(key) + "." + std::to_string(issued) + "." +
                              std::to_string(expires) + "." + m_auth->ui_session_mac(key, issued, expires) +
@@ -639,7 +634,7 @@ void storage_run::inbox_add(const std::string& user, std::string_view kind, std:
     {
         inbox_item it;
         it.seq   = ++b.seq;
-        it.at    = wall_ms();
+        it.at    = wall::now_ms();
         it.kind  = std::string(kind);
         it.title = std::move(title);
         it.text  = std::move(text);
@@ -972,7 +967,7 @@ void storage_run::ui_progress_body(const std::shared_ptr<conn>& c)
             return;
         }
         p.etag = m.etag();
-        p.at   = wall_ms();
+        p.at   = wall::now_ms();
         const std::string dir = m_store.options().dir + "/.ui";
         if ((::mkdir(dir.c_str(), 0700) < 0 && errno != EEXIST) ||
             (::mkdir((dir + "/progress").c_str(), 0700) < 0 && errno != EEXIST))
@@ -1764,7 +1759,7 @@ void storage_run::ui_users(const std::shared_ptr<conn>& c)
         return;
     }
     const bool admin = c->user->admin;
-    const int64_t now = wall_ms();
+    const int64_t now = wall::now_ms();
     // Each user's key count from one pass over the keys, not one pass per user.
     std::unordered_map<std::string, size_t> keys_of;
     if (admin)
@@ -1888,7 +1883,7 @@ void storage_run::ui_invite(const std::shared_ptr<conn>& c)
     const std::string token(r.get_query("token"));
     const std::string h = sha256_hex(token);
     const auto it = st.invites.find(h.substr(0, 16));
-    const bool valid = !token.empty() && it != st.invites.end() && it->second.hash == h && it->second.expires_ms > wall_ms();
+    const bool valid = !token.empty() && it != st.invites.end() && it->second.hash == h && it->second.expires_ms > wall::now_ms();
     std::string o = "{\"valid\":";
     o += valid ? "true" : "false";
     if (valid)

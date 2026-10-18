@@ -28,6 +28,7 @@
 #include "shard_owner.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/random_id.h"
+#include "../../shared/util/wall_clock.h"
 
 namespace socketley::storage
 {
@@ -375,8 +376,7 @@ object_store::~object_store()
 
 uint64_t object_store::now_ms() const
 {
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count());
+    return static_cast<uint64_t>(wall::now_ms());
 }
 
 std::string object_store::tmp_name() const
