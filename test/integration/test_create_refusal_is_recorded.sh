@@ -58,7 +58,13 @@ if "$BIN" ls --name 2>/dev/null | grep -qx cr_kept; then pass
 else fail "a refused create keeps the runtime" "ls does not list cr_kept"; fi
 
 # ─── The assertion ──────────────────────────────────────────────────────────
-REC=$(find "$HOME/.local/share/socketley" -name 'cr_kept.json' -type f -print -quit 2>/dev/null)
+# Written by the state writer's own thread, synced with its directory, so it is waited for rather than slept on.
+REC=""
+for _ in $(seq 1 50); do
+    REC=$(find "$HOME/.local/share/socketley" -name 'cr_kept.json' -type f -print -quit 2>/dev/null)
+    [ -n "$REC" ] && break
+    sleep 0.1
+done
 if [ -n "$REC" ] && [ -f "$REC" ]; then pass
 else fail "the kept runtime has a state record" \
           "no cr_kept.json under $HOME/.local/share/socketley" \
