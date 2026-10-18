@@ -40,13 +40,22 @@ inline constexpr int http_header_deadline_secs = 10;
 
 // ─── shared header-line helpers ─────────────────────────────────────────────
 
+// One byte of a name against a lowercase literal's: a letter in either case, anything else exactly, since folding
+// with | 0x20 alone reads a CR as '-' and "Content\rLength" as Content-Length.
+inline bool http_lower_equals(char c, char lower)
+{
+    // The same byte, or a letter's other case, which differs from it in 0x20 alone.
+    const auto d = static_cast<unsigned char>(c ^ lower);
+    return d == 0 || (d == 0x20 && static_cast<unsigned char>(lower - 'a') < 26);
+}
+
 inline bool header_name_equals(std::string_view line, const char* lower_name, size_t name_len)
 {
     if (line.size() < name_len + 1 || line[name_len] != ':')
         return false;
     for (size_t i = 0; i < name_len; i++)
     {
-        if ((line[i] | 0x20) != lower_name[i])
+        if (!http_lower_equals(line[i], lower_name[i]))
             return false;
     }
     return true;
@@ -60,7 +69,7 @@ inline bool http_token_equals(std::string_view s, const char* lower, size_t len)
         return false;
     for (size_t i = 0; i < len; i++)
     {
-        if ((s[i] | 0x20) != lower[i])
+        if (!http_lower_equals(s[i], lower[i]))
             return false;
     }
     return true;
