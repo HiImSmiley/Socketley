@@ -124,15 +124,18 @@ else fail "the client connects at all" "no handshake against port $((P + 1)); no
 # the suite there are hundreds still unwritten and it aborted every time.
 # run_all.sh and lib_daemon.sh both carry this warning already; this is the
 # third place it has been learned.
+# The server end of the one connection from client port $2: a port window reused after another file leaves that
+# file's TIME-WAITs on the same server port for a minute.
 srv_state() {
-    ss -tan 2>/dev/null | awk -v p="$1" '
+    ss -tan 2>/dev/null | awk -v p="$1" -v c="$2" '
         got == "" { n = split($4, l, ":"); m = split($5, r, ":")
-                    if (l[n] == p && r[m] != "*") got = $1 }
+                    if (l[n] == p && r[m] == c) got = $1 }
         END { print got }'
 }
 ST=""
+CPORT=$(awk '/^connected/ { print $2 }' "$WORK/hold.out" 2>/dev/null)
 for _ in $(seq 1 10); do        # 10 x 0.1s = 1s, well inside the old 1s deferral
-    ST=$(srv_state $((P + 1)))
+    ST=$(srv_state $((P + 1)) "$CPORT")
     [ -n "$ST" ] && break
     sleep 0.1
 done

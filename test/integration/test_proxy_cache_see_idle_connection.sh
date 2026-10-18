@@ -99,10 +99,12 @@ CA_DROP=$((P + 4))
 # `set -o pipefail` the pipeline reports 141 — so the assertion would blow the
 # file up precisely when it MATCHES.  Third place in this tree that has been
 # learned; see the sibling file and lib_daemon.sh.
+# The server end of the one connection from client port $2: a port window reused after another file leaves that
+# file's TIME-WAITs on the same server port for a minute.
 srv_state() {
-    ss -tan 2>/dev/null | awk -v p="$1" '
+    ss -tan 2>/dev/null | awk -v p="$1" -v c="$2" '
         got == "" { n = split($4, l, ":"); m = split($5, r, ":")
-                    if (l[n] == p && r[m] != "*") got = $1 }
+                    if (l[n] == p && r[m] == c) got = $1 }
         END { print got }'
 }
 
@@ -119,8 +121,10 @@ check_idle_established() {   # label port
     else fail "$label: the client connects at all" \
               "no handshake against port $port; the state assertion below is not a result"; fi
 
+    local cport
+    cport=$(awk '/^connected/ { print $2 }' "$WORK/hold.$label" 2>/dev/null)
     for _ in $(seq 1 10); do
-        st=$(srv_state "$port")
+        st=$(srv_state "$port" "$cport")
         [ -n "$st" ] && break
         sleep 0.1
     done

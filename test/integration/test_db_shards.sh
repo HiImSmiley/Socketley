@@ -173,9 +173,11 @@ if phase == "main":
     check("numbered as shard 0 numbers them", len({tuple(x) for x in ids}), 1)
 
     # A document whose time came is gone on every shard.
-    db(pd, "PUT", "/c/temps/soon", {"exp": int(time.time()) + 1})
+    # Whole seconds, so +1 could end a fraction of a second after the PUT; four leaves three at the least.
+    exp = int(time.time()) + 4
+    db(pd, "PUT", "/c/temps/soon", {"exp": exp})
     check("a document with a time to go is read on every shard", [db(pd, "GET", "/c/temps/soon")[0] for _ in range(8)], [200] * 8)
-    time.sleep(2.2)
+    time.sleep(max(0.0, exp - time.time()) + 1.2)
     check("and on none once its time came", [db(pd, "GET", "/c/temps/soon")[0] for _ in range(8)], [404] * 8)
 
 elif phase == "after":

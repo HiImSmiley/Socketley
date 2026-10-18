@@ -32,7 +32,8 @@ import time
 
 def hold(host, port, seconds):
     s = socket.create_connection((host, int(port)), timeout=10)
-    print("connected", flush=True)
+    # Its own port too, so the server end of this connection is found and not another on the same port.
+    print("connected", s.getsockname()[1], flush=True)
     time.sleep(float(seconds))
     print("held", flush=True)
     s.close()
