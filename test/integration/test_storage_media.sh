@@ -283,6 +283,12 @@ check "a segment by a versioned URL is cached for good" "$(grep -i '^cache-contr
 etag=$(grep -i '^etag' <<<"$hdrs" | cut -d' ' -f2 | tr -d '\r')
 check "and revalidates to 304" "$(code -u "$A" -H "If-None-Match: $etag" "$U/~media/hls-240/films/clip.mp4/$seg")" 304
 check "a range of it is 206" "$(curl -s -u "$A" -r 0-99 -o "$T/r.bin" -w '%{http_code}' "$U/~media/hls-240/films/clip.mp4/$seg") $(wc -c < "$T/r.bin")" "206 100"
+# A range wholly past the end is told the length, not handed the whole segment.
+seglen=$(curl -s -u "$A" -o /dev/null -w '%{size_download}' "$U/~media/hls-240/films/clip.mp4/$seg")
+check "a range past its end is 416 with its length" \
+    "$(curl -s -u "$A" -H "Range: bytes=$seglen-" -D - -o "$T/r416.bin" "$U/~media/hls-240/films/clip.mp4/$seg" | tr -d '\r' | grep -iE '^(HTTP|content-range)' | tr '\n' ' ')$(wc -c < "$T/r416.bin")" \
+    "HTTP/1.1 416 Range Not Satisfiable Content-Range: bytes */$seglen 0"
+check "and a suffix of it is its last bytes" "$(curl -s -u "$A" -H 'Range: bytes=-10' -o "$T/rs.bin" -w '%{http_code}' "$U/~media/hls-240/films/clip.mp4/$seg") $(wc -c < "$T/rs.bin")" "206 10"
 check "the master is asked again, and has an ETag" \
       "$(curl -s -u "$A" -D - -o /dev/null "$U/~media/hls/films/clip.mp4/master.m3u8" | grep -ciE '^(cache-control: private, no-cache|etag:)')" 2
 # The info's tag names its text, so what a browser kept from a binary that wrote less is sent again, as it is not 304.

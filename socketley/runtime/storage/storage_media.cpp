@@ -36,6 +36,7 @@
 #include <poll.h>
 #include <sys/syscall.h>
 
+#include "../../shared/http_framing.h"
 #include "digest.h"
 #include "json_doc.h"
 #include "s3_names.h"
@@ -903,36 +904,6 @@ bool etag_matches(std::string_view if_none_match, std::string_view etag)
     return !if_none_match.empty() && (if_none_match == "*" || if_none_match.find(etag) != std::string_view::npos);
 }
 
-// A Range header's one range over a body of `len`: false when there is none or it is not one this answers.
-bool one_range(std::string_view h, uint64_t len, uint64_t& off, uint64_t& n)
-{
-    if (!h.starts_with("bytes=") || h.find(',') != std::string_view::npos || len == 0)
-        return false;
-    h.remove_prefix(6);
-    const size_t dash = h.find('-');
-    if (dash == std::string_view::npos)
-        return false;
-    uint64_t a = 0, b = 0;
-    const std::string_view first = h.substr(0, dash), last = h.substr(dash + 1);
-    if (first.empty())
-    {
-        if (!parse_uint(last, b) || b == 0)
-            return false;
-        off = b >= len ? 0 : len - b;
-        n = len - off;
-        return true;
-    }
-    if (!parse_uint(first, a) || a >= len)
-        return false;
-    if (last.empty())
-        b = len - 1;
-    else if (!parse_uint(last, b) || b < a)
-        return false;
-    off = a;
-    n = std::min(b, len - 1) - a + 1;
-    return true;
-}
-
 }   // namespace
 
 web_plan web_plan_of(const media_probe& p)
@@ -1313,13 +1284,23 @@ bool storage_run::media_serve(const std::shared_ptr<conn>& c, const media_want& 
         send_response(c, std::move(head));
         return true;
     }
-    if (uint64_t ro = 0, rn = 0; one_range(c->req.header("range"), len, ro, rn))
+    const http_range range = http_parse_range(c->req.header("range"), static_cast<size_t>(len));
+    // A range wholly past the end is told the length, as the S3 path and a server tell it.
+    if (range.unsatisfiable)
+    {
+        ::close(fd);
+        head.status = 416;
+        head.headers.emplace_back("Content-Range", "bytes */" + std::to_string(len));
+        send_response(c, std::move(head));
+        return true;
+    }
+    if (range.usable)
     {
         head.status = 206;
-        head.headers.emplace_back("Content-Range", "bytes " + std::to_string(ro) + "-" + std::to_string(ro + rn - 1) + "/" +
-                                                       std::to_string(len));
-        off = ro;
-        len = rn;
+        head.headers.emplace_back("Content-Range", "bytes " + std::to_string(range.first) + "-" +
+                                                       std::to_string(range.last) + "/" + std::to_string(len));
+        off = range.first;
+        len = range.last - range.first + 1;
     }
     if (w.head)
     {
