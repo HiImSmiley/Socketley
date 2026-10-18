@@ -2,6 +2,7 @@
 #include "../../shared/persist/file_stamp.h"
 #include "../../shared/loop/fd_table.h"
 #include "../../shared/net/async_resolver.h"
+#include "../../shared/net/mesh_defaults.h"
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -497,18 +498,18 @@ struct mesh_config
     // Health checks
     enum health_type : uint8_t { health_none = 0, health_tcp = 1, health_http = 2 };
     health_type health_check{health_none};
-    int health_interval{5};      // seconds
+    int health_interval{socketley::mesh_defaults::health_interval};
     std::string health_path{"/health"};
-    int health_threshold{3};     // consecutive failures to mark unhealthy
+    int health_threshold{socketley::mesh_defaults::health_threshold};
 
     // Circuit breaker
-    int circuit_threshold{5};    // errors to open circuit
-    int circuit_timeout{30};     // seconds before half-open
+    int circuit_threshold{socketley::mesh_defaults::circuit_threshold};
+    int circuit_timeout{socketley::mesh_defaults::circuit_timeout};
 
     // How long a backend may take to produce the first byte, on by default
     // because the failure it covers is invisible to everything else, measuring
     // time to the first byte so a streaming body is never cut short.
-    int backend_timeout{2};      // seconds, 0 = disabled
+    int backend_timeout{socketley::mesh_defaults::backend_timeout};
 
     // Retries
     int retry_count{0};          // 0 = disabled

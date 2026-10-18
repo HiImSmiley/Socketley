@@ -13,6 +13,7 @@
 #include <cstdint>
 
 #include "../runtime/runtime_definitions.h"
+#include "../net/mesh_defaults.h"
 
 struct runtime_config
 {
@@ -120,13 +121,13 @@ struct runtime_config
 
     // Proxy service mesh
     uint8_t health_check = 0;    // mesh_config::health_type
-    int health_interval = 5;
+    int health_interval = socketley::mesh_defaults::health_interval;
     std::string health_path;
-    int health_threshold = 3;
-    int circuit_threshold = 5;
-    int circuit_timeout = 30;
+    int health_threshold = socketley::mesh_defaults::health_threshold;
+    int circuit_threshold = socketley::mesh_defaults::circuit_threshold;
+    int circuit_timeout = socketley::mesh_defaults::circuit_timeout;
     // 0 means "no deadline" here, so absence cannot be read off the value.
-    int backend_timeout = 2;
+    int backend_timeout = socketley::mesh_defaults::backend_timeout;
     int retry_count = 0;
     bool retry_all = false;
     std::string mesh_client_ca;
