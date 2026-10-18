@@ -4,11 +4,11 @@
 #include "resp_parser.h"
 #include "../../cli/command_hashing.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/ascii.h"
 #include "../../shared/util/wall_clock.h"
 
 #include <chrono>
 #include <cstring>
-#include <strings.h>
 
 namespace
 {
@@ -20,11 +20,7 @@ constexpr sv syntax    = "syntax error";
 constexpr sv not_int   = "value is not an integer or out of range";
 constexpr sv oom       = "OOM command not allowed when used memory > 'maxmemory'";
 
-// strcasecmp, which is how Redis matches every option word.
-bool ieq(sv a, sv b)
-{
-    return a.size() == b.size() && strncasecmp(a.data(), b.data(), a.size()) == 0;
-}
+using socketley::ascii::iequals;
 
 void err(std::string& rb, sv m) { resp::encode_error_into(rb, m); }
 void err_code(std::string& rb, sv m) { resp::encode_error_code_into(rb, m); }
@@ -104,8 +100,8 @@ int parse_trim(sv* a, int argc, bool xadd, trim_args& t, std::string& rb)
         const sv  o = a[i];
         if (xadd && o == "*")
             break;
-        const bool maxlen = ieq(o, "maxlen");
-        if ((maxlen || ieq(o, "minid")) && more)
+        const bool maxlen = iequals(o, "maxlen");
+        if ((maxlen || iequals(o, "minid")) && more)
         {
             if (t.spec.by != by::none)
             {
@@ -130,7 +126,7 @@ int parse_trim(sv* a, int argc, bool xadd, trim_args& t, std::string& rb)
             }
             ++i;
         }
-        else if (ieq(o, "limit") && more)
+        else if (iequals(o, "limit") && more)
         {
             int64_t v = 0;
             if (!stream_strict_ll(a[i + 1], v)) { err(rb, not_int); return -1; }
@@ -139,7 +135,7 @@ int parse_trim(sv* a, int argc, bool xadd, trim_args& t, std::string& rb)
             limit_given = true;
             ++i;
         }
-        else if (xadd && ieq(o, "nomkstream"))
+        else if (xadd && iequals(o, "nomkstream"))
             t.nomkstream = true;
         else if (xadd)
         {
@@ -348,7 +344,7 @@ struct stream_commands
         int64_t count = -1;
         for (int j = 4; j < argc; ++j)
         {
-            if (ieq(a[j], "count") && argc - j - 1 >= 1)
+            if (iequals(a[j], "count") && argc - j - 1 >= 1)
             {
                 if (!stream_strict_ll(a[j + 1], count)) { err(rb, not_int); return; }
                 if (count < 0) count = 0;
@@ -470,7 +466,7 @@ struct stream_commands
         {
             const int more = argc - i - 1;
             const sv  o = a[i];
-            if (ieq(o, "block") && more)
+            if (iequals(o, "block") && more)
             {
 #ifndef SOCKETLEY_NO_LUA
                 if (ci.m_script_depth > 0)
@@ -485,13 +481,13 @@ struct stream_commands
                 if (!stream_strict_ll(a[i], timeout)) { err(rb, "timeout is not an integer or out of range"); return; }
                 if (timeout < 0) { err(rb, "timeout is negative"); return; }
             }
-            else if (ieq(o, "count") && more)
+            else if (iequals(o, "count") && more)
             {
                 ++i;
                 if (!stream_strict_ll(a[i], count)) { err(rb, not_int); return; }
                 if (count < 0) count = 0;
             }
-            else if (ieq(o, "streams") && more)
+            else if (iequals(o, "streams") && more)
             {
                 sarg = i + 1;
                 ns = argc - sarg;
@@ -503,7 +499,7 @@ struct stream_commands
                 ns /= 2;
                 break;
             }
-            else if (ieq(o, "group") && more >= 2)
+            else if (iequals(o, "group") && more >= 2)
             {
                 if (!grp) { err(rb, "The GROUP option is only supported by XREADGROUP. You called XREAD instead."); return; }
                 gname = a[i + 1];
@@ -511,7 +507,7 @@ struct stream_commands
                 has_group = true;
                 i += 2;
             }
-            else if (ieq(o, "noack"))
+            else if (iequals(o, "noack"))
             {
                 if (!grp) { err(rb, "The NOACK option is only supported by XREADGROUP. You called XREAD instead."); return; }
                 noack = true;
@@ -662,9 +658,9 @@ struct stream_commands
     {
         if (argc < 2) { err_arity(rb, "xgroup"); return; }
         const sv sub = a[1];
-        const bool create = ieq(sub, "create"), setid = ieq(sub, "setid"), destroy = ieq(sub, "destroy"),
-                   mkcons = ieq(sub, "createconsumer"), delcons = ieq(sub, "delconsumer"),
-                   help = ieq(sub, "help");
+        const bool create = iequals(sub, "create"), setid = iequals(sub, "setid"), destroy = iequals(sub, "destroy"),
+                   mkcons = iequals(sub, "createconsumer"), delcons = iequals(sub, "delconsumer"),
+                   help = iequals(sub, "help");
         if (!(create || setid || destroy || mkcons || delcons || help))
         {
             err_subcommand(rb, sub, "XGROUP");
@@ -710,8 +706,8 @@ struct stream_commands
         int64_t entries_read = -1;
         for (int i = 5; i < argc;)
         {
-            if (create && ieq(a[i], "mkstream")) { mkstream = true; ++i; }
-            else if ((create || setid) && ieq(a[i], "entriesread") && i + 1 < argc)
+            if (create && iequals(a[i], "mkstream")) { mkstream = true; ++i; }
+            else if ((create || setid) && iequals(a[i], "entriesread") && i + 1 < argc)
             {
                 if (!stream_strict_ll(a[i + 1], entries_read)) { err(rb, not_int); return; }
                 if (entries_read < 0 && entries_read != -1)
@@ -822,13 +818,13 @@ struct stream_commands
         for (int i = 3; i < argc;)
         {
             const int more = argc - 1 - i;
-            if (ieq(a[i], "entriesadded") && more)
+            if (iequals(a[i], "entriesadded") && more)
             {
                 if (!stream_strict_ll(a[i + 1], added)) { err(rb, not_int); return; }
                 if (added < 0) { err(rb, "entries_added must be positive"); return; }
                 i += 2;
             }
-            else if (ieq(a[i], "maxdeletedid") && more)
+            else if (iequals(a[i], "maxdeletedid") && more)
             {
                 if (!stream_parse_id(a[i + 1], maxdel, 0, true, nullptr)) { err(rb, bad_id); return; }
                 if (id < maxdel)
@@ -911,7 +907,7 @@ struct stream_commands
         if (argc >= 6)
         {
             int at = 3;
-            if (ieq(a[3], "idle"))
+            if (iequals(a[3], "idle"))
             {
                 if (!stream_strict_ll(a[4], minidle)) { err(rb, not_int); return; }
                 if (argc < 8) { err(rb, syntax); return; }
@@ -1018,22 +1014,22 @@ struct stream_commands
         {
             const int more = argc - 1 - j;
             const sv o = a[j];
-            if (ieq(o, "force")) force = true;
-            else if (ieq(o, "justid")) justid = true;
-            else if (ieq(o, "idle") && more)
+            if (iequals(o, "force")) force = true;
+            else if (iequals(o, "justid")) justid = true;
+            else if (iequals(o, "idle") && more)
             {
                 if (!stream_strict_ll(a[++j], delivery)) { err(rb, "Invalid IDLE option argument for XCLAIM"); return; }
                 delivery = now - delivery;
             }
-            else if (ieq(o, "time") && more)
+            else if (iequals(o, "time") && more)
             {
                 if (!stream_strict_ll(a[++j], delivery)) { err(rb, "Invalid TIME option argument for XCLAIM"); return; }
             }
-            else if (ieq(o, "retrycount") && more)
+            else if (iequals(o, "retrycount") && more)
             {
                 if (!stream_strict_ll(a[++j], retry)) { err(rb, "Invalid RETRYCOUNT option argument for XCLAIM"); return; }
             }
-            else if (ieq(o, "lastid") && more)
+            else if (iequals(o, "lastid") && more)
             {
                 if (!stream_parse_id(a[++j], lastid, 0, true, nullptr)) { err(rb, bad_id); return; }
             }
@@ -1110,7 +1106,7 @@ struct stream_commands
         for (int j = 6; j < argc; ++j)
         {
             const int more = argc - 1 - j;
-            if (ieq(a[j], "count") && more)
+            if (iequals(a[j], "count") && more)
             {
                 if (!stream_strict_ll(a[j + 1], count) || count < 1 || count > INT64_MAX / 16)
                 {
@@ -1119,7 +1115,7 @@ struct stream_commands
                 }
                 ++j;
             }
-            else if (ieq(a[j], "justid")) justid = true;
+            else if (iequals(a[j], "justid")) justid = true;
             else { err(rb, syntax); return; }
         }
         bool bad = false;
@@ -1200,8 +1196,8 @@ struct stream_commands
     {
         if (argc < 2) { err_arity(rb, "xinfo"); return; }
         const sv sub = a[1];
-        const bool cons = ieq(sub, "consumers"), grps = ieq(sub, "groups"), strm = ieq(sub, "stream"),
-                   help = ieq(sub, "help");
+        const bool cons = iequals(sub, "consumers"), grps = iequals(sub, "groups"), strm = iequals(sub, "stream"),
+                   help = iequals(sub, "help");
         if (!(cons || grps || strm || help)) { err_subcommand(rb, sub, "XINFO"); return; }
         const bool arity_ok = cons ? argc == 4 : grps ? argc == 3 : strm ? argc >= 3 : argc == 2;
         if (!arity_ok)
@@ -1279,8 +1275,8 @@ struct stream_commands
         const int optc = argc - 3;
         if (optc)
         {
-            if ((optc != 1 && optc != 3) || !ieq(a[3], "full")
-                || (optc == 3 && !ieq(a[4], "count")))
+            if ((optc != 1 && optc != 3) || !iequals(a[3], "full")
+                || (optc == 3 && !iequals(a[4], "count")))
             {
                 err_subcommand_syntax(rb, sub, "XINFO");
                 return;

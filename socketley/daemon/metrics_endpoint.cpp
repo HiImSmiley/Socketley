@@ -14,6 +14,8 @@
 #include "../runtime/storage/storage_instance.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/util/wall_clock.h"
+#include "../shared/util/proc_stat.h"
+#include "../shared/loop/eventfd_wake.h"
 
 #include <unistd.h>
 #include <cerrno>
@@ -130,12 +132,7 @@ void metrics_endpoint::stop()
     // thread is inside a syscall on frees the number at once and a runtime
     // starting its listener is handed it.
     if (m_wake_fd >= 0)
-    {
-        const uint64_t one = 1;
-        // Nothing to do if it fails: a full eventfd counter is already a
-        // pending wake, and the loop re-reads m_running on every pass anyway.
-        if (write(m_wake_fd, &one, sizeof(one)) < 0) {}
-    }
+        socketley::eventfd_bump(m_wake_fd);
 
     if (was && m_thread.joinable())
         m_thread.join();
@@ -480,28 +477,14 @@ static void refresh_pss(const std::vector<pid_t>& every)
 
 static void add_process_usage(pid_t pid, process_usage& u)
 {
-    char path[48];
-    std::snprintf(path, sizeof path, "/proc/%d/stat", static_cast<int>(pid));
-    FILE* f = std::fopen(path, "re");
-    if (!f)
-        return;
-    char buf[1024];
-    const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
-    std::fclose(f);
-    buf[n] = '\0';
-    // The command name may hold spaces and parentheses, so the fields are counted from its last closing parenthesis.
-    const char* p = std::strrchr(buf, ')');
-    if (!p)
-        return;
-    unsigned long long utime = 0, stime = 0;
-    long long rss_pages = 0;
-    if (std::sscanf(p + 1, " %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %llu %llu %*s %*s %*s %*s %*s %*s %*s %*s %lld",
-                    &utime, &stime, &rss_pages) != 3)
+    socketley::proc_stat st;
+    if (!socketley::read_proc_stat(pid, st))
         return;
     static const long tick = ::sysconf(_SC_CLK_TCK);
     static const long page = ::sysconf(_SC_PAGESIZE);
-    u.cpu_seconds += static_cast<double>(utime + stime) / static_cast<double>(tick > 0 ? tick : 100);
-    u.rss_bytes += rss_pages > 0 ? static_cast<uint64_t>(rss_pages) * static_cast<uint64_t>(page > 0 ? page : 4096) : 0;
+    u.cpu_seconds += static_cast<double>(st.utime + st.stime) / static_cast<double>(tick > 0 ? tick : 100);
+    u.rss_bytes += st.rss_pages > 0 ? static_cast<uint64_t>(st.rss_pages) * static_cast<uint64_t>(page > 0 ? page : 4096)
+                                    : 0;
     u.memory_bytes += cached_pss(pid);
     ++u.processes;
 }

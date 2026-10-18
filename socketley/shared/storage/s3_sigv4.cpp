@@ -2,6 +2,7 @@
 #include "../http/url.h"
 #include "../util/base64.h"
 #include "../crypto/mac.h"
+#include "../util/ascii.h"
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -216,21 +217,6 @@ void hex_encode32(const uint8_t in[32], char out[64])
     }
 }
 
-char lower(char c)
-{
-    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-}
-
-bool ieq(std::string_view a, std::string_view b)
-{
-    if (a.size() != b.size())
-        return false;
-    for (size_t i = 0; i < a.size(); i++)
-        if (lower(a[i]) != lower(b[i]))
-            return false;
-    return true;
-}
-
 bool is_space(char c)
 {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
@@ -338,7 +324,7 @@ bool append_canonical_headers(std::string& out, std::span<const header_field> he
         out.push_back(':');
         for (const header_field& h : headers)
         {
-            if (!ieq(h.name, name))
+            if (!ascii::iequals(h.name, name))
                 continue;
             if (found)
                 out.push_back(',');
@@ -377,7 +363,7 @@ bool append_canonical_headers(std::string& out, std::span<const header_field> he
 const header_field* find_header(std::span<const header_field> headers, std::string_view name)
 {
     for (const header_field& h : headers)
-        if (ieq(h.name, name))
+        if (ascii::iequals(h.name, name))
             return &h;
     return nullptr;
 }
@@ -1003,7 +989,7 @@ std::string v2_string_to_sign(const request_view& req, const verify_options& opt
             continue;
         std::string name(h.name);
         for (char& ch : name)
-            ch = lower(ch);
+            ch = ascii::lower(ch);
         if (!name.starts_with("x-amz-"))
             continue;
         const auto it = std::ranges::find_if(amz, [&](const auto& e) { return e.first == name; });
@@ -1241,7 +1227,7 @@ bool chunk_stream::on_trailer()
         size_t line_start = body.size() >= 3 ? body.rfind("\r\n", body.size() - 3) : std::string_view::npos;
         line_start = line_start == std::string_view::npos ? 0 : line_start + 2;
         std::string_view sig_line = body.substr(line_start, body.size() - line_start - 2);
-        if (sig_line.size() != name.size() + 64 || !ieq(sig_line.substr(0, name.size()), name))
+        if (sig_line.size() != name.size() + 64 || !ascii::iequals(sig_line.substr(0, name.size()), name))
             return bad(stream_status::malformed);
         uint8_t claimed[32];
         if (!hex_decode32(sig_line.substr(name.size()), claimed))
@@ -1293,7 +1279,7 @@ std::string_view chunk_stream::trailer_value(std::string_view name) const
         if (!line.empty() && line.back() == '\r')
             line.remove_suffix(1);
         size_t colon = line.find(':');
-        if (colon != std::string_view::npos && ieq(trim(line.substr(0, colon)), name))
+        if (colon != std::string_view::npos && ascii::iequals(trim(line.substr(0, colon)), name))
             return trim(line.substr(colon + 1));
     }
     return {};

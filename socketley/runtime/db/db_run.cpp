@@ -31,6 +31,7 @@
 #include "../../shared/http/request_head.h"
 #include "../../shared/util/wall_clock.h"
 #include "../../shared/crypto/mac.h"
+#include "../../shared/loop/eventfd_wake.h"
 
 namespace socketley::db
 {
@@ -545,8 +546,7 @@ void db_run::start_job(std::unique_ptr<copy_job> job, uint64_t ticket)
     raw->th = std::thread([raw, wake] {
         raw->job->run();
         raw->done = true;
-        const uint64_t one = 1;
-        if (::write(wake, &one, sizeof one) < 0) {}
+        eventfd_bump(wake);
     });
     m_jobs.push_back(std::move(slot));
 }
@@ -653,10 +653,7 @@ void db_run::replica_main()
     std::string base(m_owner.get_replicate());
     while (!base.empty() && base.back() == '/')
         base.pop_back();
-    const auto wake = [this] {
-        const uint64_t one = 1;
-        if (::write(m_wake_fd, &one, sizeof one) < 0) {}
-    };
+    const auto wake = [this] { eventfd_bump(m_wake_fd); };
     while (!m_replica_stop)
     {
         const std::string url = base + "/_replicate?since=" + std::to_string(m_replica_seq.load());

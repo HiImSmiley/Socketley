@@ -13,6 +13,7 @@
 
 #include "s3_xml.h"
 #include "../../shared/http/http_framing.h"
+#include "../../shared/util/ascii.h"
 
 namespace socketley::storage
 {
@@ -44,20 +45,10 @@ inline bool cors_method_known(std::string_view m)
     return m == "GET" || m == "PUT" || m == "HEAD" || m == "POST" || m == "DELETE";
 }
 
-inline bool cors_ieq(std::string_view a, std::string_view b)
-{
-    if (a.size() != b.size())
-        return false;
-    for (size_t i = 0; i < a.size(); ++i)
-        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
-            return false;
-    return true;
-}
-
 // `pattern` with at most one '*' standing for any run of bytes; header names compare without case.
 inline bool cors_wildcard_match(std::string_view pattern, std::string_view s, bool fold)
 {
-    const auto eq = [fold](std::string_view a, std::string_view b) { return fold ? cors_ieq(a, b) : a == b; };
+    const auto eq = [fold](std::string_view a, std::string_view b) { return fold ? ascii::iequals(a, b) : a == b; };
     const size_t star = pattern.find('*');
     if (star == std::string_view::npos)
         return eq(pattern, s);

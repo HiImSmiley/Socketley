@@ -18,6 +18,7 @@
 
 #include "../../shared/http/http_framing.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/ascii.h"
 
 namespace socketley::storage
 {
@@ -40,16 +41,6 @@ std::string_view trim(std::string_view s)
     return s;
 }
 
-bool iequals(std::string_view a, std::string_view b)
-{
-    if (a.size() != b.size())
-        return false;
-    for (size_t i = 0; i < a.size(); ++i)
-        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
-            return false;
-    return true;
-}
-
 // The value of header `lower` in a head of CRLF-ended lines, empty when it has none.
 std::string_view head_value(std::string_view head, std::string_view lower)
 {
@@ -60,7 +51,7 @@ std::string_view head_value(std::string_view head, std::string_view lower)
         const size_t end   = head.find("\r\n", start);
         const std::string_view line = head.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start);
         const size_t colon = line.find(':');
-        if (colon != std::string_view::npos && iequals(trim(line.substr(0, colon)), lower))
+        if (colon != std::string_view::npos && ascii::iequals(trim(line.substr(0, colon)), lower))
             return trim(line.substr(colon + 1));
         pos = end;
     }

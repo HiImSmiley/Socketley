@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "file_io.h"
+#include "eventfd_wake.h"
 
 namespace socketley
 {
@@ -218,8 +219,7 @@ private:
     {
         if (!m_wake_pending.exchange(true, std::memory_order_seq_cst))
         {
-            const uint64_t one = 1;
-            if (::write(m_wake, &one, sizeof one) < 0) {}
+            eventfd_bump(m_wake);
         }
     }
 

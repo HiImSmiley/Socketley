@@ -14,6 +14,7 @@
 #include "s3_xml.h"
 #include "s3_xml_tree.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/util/ascii.h"
 
 namespace socketley::storage
 {
@@ -92,26 +93,6 @@ s3_error fail(std::string_view code, std::string message = {})
 }
 
 // ─── Text ───────────────────────────────────────────────────────────────────
-
-char lower_ascii(char c)
-{
-    return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
-}
-
-char upper_ascii(char c)
-{
-    return c >= 'a' && c <= 'z' ? static_cast<char>(c - 'a' + 'A') : c;
-}
-
-bool ci_equal(std::string_view a, std::string_view b)
-{
-    if (a.size() != b.size())
-        return false;
-    for (size_t i = 0; i < a.size(); ++i)
-        if (lower_ascii(a[i]) != lower_ascii(b[i]))
-            return false;
-    return true;
-}
 
 bool is_space(char c)
 {
@@ -559,9 +540,9 @@ bool parse_number(std::string_view t, value& out)
 bool parse_bool(std::string_view t, bool& b)
 {
     t = trim_ws(t);
-    if (ci_equal(t, "true"))
+    if (ascii::iequals(t, "true"))
         b = true;
-    else if (ci_equal(t, "false"))
+    else if (ascii::iequals(t, "false"))
         b = false;
     else
         return false;
@@ -1011,7 +992,7 @@ bool reserved(const token& t)
     if (t.t != tk::ident)
         return false;
     for (const std::string_view w : reserved_words)
-        if (ci_equal(t.text, w))
+        if (ascii::iequals(t.text, w))
             return true;
     return false;
 }
@@ -1064,7 +1045,7 @@ private:
     bool is_kw(std::string_view kw, size_t ahead = 0) const
     {
         const token& t = cur(ahead);
-        return t.t == tk::ident && ci_equal(t.text, kw);
+        return t.t == tk::ident && ascii::iequals(t.text, kw);
     }
 
     bool accept_kw(std::string_view kw)
@@ -1425,7 +1406,7 @@ private:
         const std::string name = cur().text;
         next();
         next();
-        if (ci_equal(name, "CAST"))
+        if (ascii::iequals(name, "CAST"))
         {
             const uint32_t e = expr();
             if (e == bad)
@@ -1436,14 +1417,14 @@ private:
             cast_to to = cast_to::integer;
             if (t.t != tk::ident)
                 return error("ParseExpectedTypeName");
-            if (ci_equal(t.text, "INT") || ci_equal(t.text, "INTEGER") || ci_equal(t.text, "BIGINT"))
+            if (ascii::iequals(t.text, "INT") || ascii::iequals(t.text, "INTEGER") || ascii::iequals(t.text, "BIGINT"))
                 to = cast_to::integer;
-            else if (ci_equal(t.text, "FLOAT") || ci_equal(t.text, "DECIMAL") || ci_equal(t.text, "DOUBLE") ||
-                     ci_equal(t.text, "REAL") || ci_equal(t.text, "NUMERIC"))
+            else if (ascii::iequals(t.text, "FLOAT") || ascii::iequals(t.text, "DECIMAL") || ascii::iequals(t.text, "DOUBLE") ||
+                     ascii::iequals(t.text, "REAL") || ascii::iequals(t.text, "NUMERIC"))
                 to = cast_to::real;
-            else if (ci_equal(t.text, "STRING") || ci_equal(t.text, "VARCHAR") || ci_equal(t.text, "CHAR"))
+            else if (ascii::iequals(t.text, "STRING") || ascii::iequals(t.text, "VARCHAR") || ascii::iequals(t.text, "CHAR"))
                 to = cast_to::string;
-            else if (ci_equal(t.text, "BOOL") || ci_equal(t.text, "BOOLEAN"))
+            else if (ascii::iequals(t.text, "BOOL") || ascii::iequals(t.text, "BOOLEAN"))
                 to = cast_to::boolean;
             else
                 return error("ParseExpectedTypeName", "CAST to " + t.text + " is not supported.");
@@ -1453,13 +1434,13 @@ private:
             return make(op::cast, {e}, false, static_cast<uint8_t>(to));
         }
         // INT(x) and FLOAT(x), Ceph's shorthands of the casts, which its clients write.
-        if (ci_equal(name, "INT") || ci_equal(name, "FLOAT"))
+        if (ascii::iequals(name, "INT") || ascii::iequals(name, "FLOAT"))
         {
             const uint32_t e = expr();
             if (e == bad || close_call() == bad)
                 return bad;
             return make(op::cast, {e}, false,
-                        static_cast<uint8_t>(ci_equal(name, "INT") ? cast_to::integer : cast_to::real));
+                        static_cast<uint8_t>(ascii::iequals(name, "INT") ? cast_to::integer : cast_to::real));
         }
 
         static constexpr std::pair<std::string_view, agg_fn> aggregates[] = {
@@ -1467,7 +1448,7 @@ private:
             {"MIN", agg_fn::min},     {"MAX", agg_fn::max}};
         for (const auto& [agg_name, fn] : aggregates)
         {
-            if (!ci_equal(name, agg_name))
+            if (!ascii::iequals(name, agg_name))
                 continue;
             node n;
             n.o = op::agg;
@@ -1495,7 +1476,7 @@ private:
             return id;
         }
 
-        if (ci_equal(name, "TRIM"))
+        if (ascii::iequals(name, "TRIM"))
         {
             // TRIM([LEADING|TRAILING|BOTH] [chars] FROM s) or TRIM(s).
             trim_side side = trim_side::both;
@@ -1539,7 +1520,7 @@ private:
             return make(op::trim, std::move(args), false, static_cast<uint8_t>(side));
         }
 
-        if (ci_equal(name, "SUBSTRING"))
+        if (ascii::iequals(name, "SUBSTRING"))
         {
             const uint32_t s = expr();
             if (s == bad)
@@ -1567,18 +1548,18 @@ private:
         op o = op::lit;
         size_t min_args = 1;
         size_t max_args = 1;
-        if (ci_equal(name, "LOWER"))
+        if (ascii::iequals(name, "LOWER"))
             o = op::lower;
-        else if (ci_equal(name, "UPPER"))
+        else if (ascii::iequals(name, "UPPER"))
             o = op::upper;
-        else if (ci_equal(name, "CHAR_LENGTH") || ci_equal(name, "CHARACTER_LENGTH"))
+        else if (ascii::iequals(name, "CHAR_LENGTH") || ascii::iequals(name, "CHARACTER_LENGTH"))
             o = op::char_length;
-        else if (ci_equal(name, "COALESCE"))
+        else if (ascii::iequals(name, "COALESCE"))
         {
             o        = op::coalesce;
             max_args = std::numeric_limits<size_t>::max();
         }
-        else if (ci_equal(name, "NULLIF"))
+        else if (ascii::iequals(name, "NULLIF"))
         {
             o        = op::nullif;
             min_args = 2;
@@ -1711,7 +1692,7 @@ private:
             m_p.from.erase(m_p.from.begin());
         if (!alias(m_p.alias))
             return bad;
-        if (qualified_star && !ci_equal(star_alias, m_p.alias) && !ci_equal(star_alias, "S3Object"))
+        if (qualified_star && !ascii::iequals(star_alias, m_p.alias) && !ascii::iequals(star_alias, "S3Object"))
             return error("InvalidTableAlias");
 
         if (accept_kw("WHERE"))
@@ -1772,7 +1753,7 @@ private:
                 continue;
             const path_step& s = n.path.front();
             if (s.k == step_kind::name && !s.quoted &&
-                ((!m_p.alias.empty() && ci_equal(s.name, m_p.alias)) || ci_equal(s.name, "S3Object")))
+                ((!m_p.alias.empty() && ascii::iequals(s.name, m_p.alias)) || ascii::iequals(s.name, "S3Object")))
                 n.path.erase(n.path.begin());
         }
         for (size_t k = 0; k < m_p.items.size(); ++k)
@@ -1853,7 +1834,7 @@ const jnode* member_of(const jnode& obj, const path_step& s)
             return &m.second;
     if (!s.quoted)
         for (const auto& m : obj.members)
-            if (ci_equal(m.first, s.name))
+            if (ascii::iequals(m.first, s.name))
                 return &m.second;
     return nullptr;
 }
@@ -1962,12 +1943,12 @@ bool parse_input(const xml_node& in, select_request& out, s3_error& err)
     if (k[0])
     {
         const std::string_view c = trim_ws(k[0]->text);
-        if (ci_equal(c, "GZIP") || ci_equal(c, "BZIP2"))
+        if (ascii::iequals(c, "GZIP") || ascii::iequals(c, "BZIP2"))
         {
             err = fail("NotImplemented", "SelectObjectContent over a " + std::string(c) + " object is not supported.");
             return false;
         }
-        if (!c.empty() && !ci_equal(c, "NONE"))
+        if (!c.empty() && !ascii::iequals(c, "NONE"))
         {
             err = fail("InvalidCompressionFormat");
             return false;
@@ -1995,9 +1976,9 @@ bool parse_input(const xml_node& in, select_request& out, s3_error& err)
         }
         out.input = select_format::json;
         const std::string_view t = j[0] ? trim_ws(j[0]->text) : std::string_view("DOCUMENT");
-        if (ci_equal(t, "DOCUMENT"))
+        if (ascii::iequals(t, "DOCUMENT"))
             out.json_type = select_json_type::document;
-        else if (ci_equal(t, "LINES"))
+        else if (ascii::iequals(t, "LINES"))
             out.json_type = select_json_type::lines;
         else
         {
@@ -2020,11 +2001,11 @@ bool parse_input(const xml_node& in, select_request& out, s3_error& err)
     if (c[0])
     {
         const std::string_view h = trim_ws(c[0]->text);
-        if (ci_equal(h, "USE"))
+        if (ascii::iequals(h, "USE"))
             csv.header = select_header::use;
-        else if (ci_equal(h, "IGNORE"))
+        else if (ascii::iequals(h, "IGNORE"))
             csv.header = select_header::ignore;
-        else if (ci_equal(h, "NONE"))
+        else if (ascii::iequals(h, "NONE"))
             csv.header = select_header::none;
         else
         {
@@ -2090,9 +2071,9 @@ bool parse_output(const xml_node& o, select_request& out, s3_error& err)
     if (c[0])
     {
         const std::string_view q = trim_ws(c[0]->text);
-        if (ci_equal(q, "ALWAYS"))
+        if (ascii::iequals(q, "ALWAYS"))
             csv.quote_always = true;
-        else if (ci_equal(q, "ASNEEDED"))
+        else if (ascii::iequals(q, "ASNEEDED"))
             csv.quote_always = false;
         else
         {
@@ -2134,7 +2115,7 @@ bool parse_select_request(std::string_view xml, select_request& out, s3_error& e
         err = fail("MissingRequiredParameter");
         return false;
     }
-    if (!ci_equal(trim_ws(k[1]->text), "SQL"))
+    if (!ascii::iequals(trim_ws(k[1]->text), "SQL"))
     {
         err = fail("InvalidExpressionType");
         return false;
@@ -2370,7 +2351,7 @@ struct select_engine::impl
                 if (header[i] == s.name)
                     n.field = static_cast<int64_t>(i);
             for (size_t i = 0; i < header.size() && n.field < 0 && !s.quoted; ++i)
-                if (ci_equal(header[i], s.name))
+                if (ascii::iequals(header[i], s.name))
                     n.field = static_cast<int64_t>(i);
             if (n.field < 0)
             {
@@ -3415,7 +3396,7 @@ struct select_engine::impl
                 if (absent(a) || !want_string(a))
                     return v_null();
                 for (char& c : a.s)
-                    c = n.o == op::lower ? lower_ascii(c) : upper_ascii(c);
+                    c = n.o == op::lower ? ascii::lower(c) : ascii::upper(c);
                 return a;
             }
             case op::trim: return trim(n, r);

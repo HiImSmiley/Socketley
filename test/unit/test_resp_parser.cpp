@@ -257,30 +257,6 @@ TEST_CASE("RESP parsing — parse_message_views, the parser the runtimes call")
     }
 }
 
-TEST_CASE("RESP to_lower")
-{
-    SUBCASE("uppercase")
-    {
-        std::string s = "GET";
-        resp::to_lower(s);
-        CHECK(s == "get");
-    }
-
-    SUBCASE("mixed case")
-    {
-        std::string s = "HgEtAlL";
-        resp::to_lower(s);
-        CHECK(s == "hgetall");
-    }
-
-    SUBCASE("already lowercase")
-    {
-        std::string s = "set";
-        resp::to_lower(s);
-        CHECK(s == "set");
-    }
-}
-
 TEST_CASE("a bulk value's trailing CRLF is part of the frame, not padding")
 {
     // Both parsers skipped the two bytes after a bulk payload without reading

@@ -1,4 +1,5 @@
 #include "fast_lo.h"
+#include "../loop/eventfd_wake.h"
 
 #include <linux/bpf.h>
 #include <linux/magic.h>
@@ -1077,8 +1078,7 @@ void fast_lo::stop_reconciler()
 {
     if (m_recon)
     {
-        const uint64_t one = 1;
-        if (::write(m_stop_fd, &one, sizeof(one)) < 0) {}
+        eventfd_bump(m_stop_fd);
         pthread_join(static_cast<pthread_t>(m_recon), nullptr);
         m_recon = 0;
     }

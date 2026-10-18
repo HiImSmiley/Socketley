@@ -1,5 +1,6 @@
 #include "dns_zone.h"
 #include "dns_wire.h"
+#include "../../shared/util/ascii.h"
 
 #include <algorithm>
 #include <cctype>
@@ -188,16 +189,6 @@ std::string unescape(std::string_view s)
     return out;
 }
 
-bool iequals(std::string_view a, std::string_view b)
-{
-    if (a.size() != b.size())
-        return false;
-    for (size_t i = 0; i < a.size(); ++i)
-        if (lower(static_cast<uint8_t>(a[i])) != lower(static_cast<uint8_t>(b[i])))
-            return false;
-    return true;
-}
-
 // ─── Numbers ────────────────────────────────────────────────────────────────
 
 template <typename T>
@@ -273,17 +264,17 @@ constexpr type_name known_types[] = {
 bool parse_type(std::string_view s, uint16_t& out)
 {
     for (const auto& t : known_types)
-        if (iequals(s, t.name))
+        if (ascii::iequals(s, t.name))
         {
             out = t.code;
             return true;
         }
-    if (s.size() > 4 && iequals(s.substr(0, 4), "TYPE"))
+    if (s.size() > 4 && ascii::iequals(s.substr(0, 4), "TYPE"))
         return parse_uint(s.substr(4), out) && out != 0;
     return false;
 }
 
-bool is_class(std::string_view s) { return iequals(s, "IN") || iequals(s, "CH") || iequals(s, "HS") || iequals(s, "CS"); }
+bool is_class(std::string_view s) { return ascii::iequals(s, "IN") || ascii::iequals(s, "CH") || ascii::iequals(s, "HS") || ascii::iequals(s, "CS"); }
 
 void put16(std::string& o, uint16_t v) { o += static_cast<char>(v >> 8); o += static_cast<char>(v & 0xFF); }
 void put32(std::string& o, uint32_t v) { put16(o, static_cast<uint16_t>(v >> 16)); put16(o, static_cast<uint16_t>(v)); }
@@ -649,7 +640,7 @@ bool parse_zone(std::string_view text, std::string_view origin_hint, zone& z, st
         if (!e.continues_owner && !tk[0].quoted && !tk[0].text.empty() && tk[0].text[0] == '$')
         {
             const std::string_view d = tk[0].text;
-            if (iequals(d, "$ORIGIN"))
+            if (ascii::iequals(d, "$ORIGIN"))
             {
                 // Read into a name of its own: a relative one is made from the origin it replaces.
                 std::string next;
@@ -658,7 +649,7 @@ bool parse_zone(std::string_view text, std::string_view origin_hint, zone& z, st
                 origin = std::move(next);
                 continue;
             }
-            if (iequals(d, "$TTL"))
+            if (ascii::iequals(d, "$TTL"))
             {
                 if (tk.size() != 2 || !parse_ttl(tk[1].text, default_ttl))
                     return fail(why, e.line, "$TTL takes one time, such as 3600 or 1h");
@@ -692,7 +683,7 @@ bool parse_zone(std::string_view text, std::string_view origin_hint, zone& z, st
         {
             if (is_class(tk[i].text))
             {
-                if (!iequals(tk[i].text, "IN"))
+                if (!ascii::iequals(tk[i].text, "IN"))
                     return fail(why, e.line, "only class IN is served");
                 ++i;
                 continue;

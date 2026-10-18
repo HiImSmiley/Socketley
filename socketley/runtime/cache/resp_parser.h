@@ -514,14 +514,4 @@ inline parse_result parse_message_views(std::string_view buf,
     return parse_result::ok;
 }
 
-// Convert uppercase Redis command to lowercase for FNV-1a dispatch
-inline void to_lower(std::string& s)
-{
-    for (auto& c : s)
-    {
-        if (c >= 'A' && c <= 'Z')
-            c += 32;
-    }
-}
-
 } // namespace resp

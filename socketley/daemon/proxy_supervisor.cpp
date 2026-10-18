@@ -28,6 +28,7 @@
 #include "../shared/persist/state_persistence.h"
 #include "../shared/ipc/shard_target.h"
 #include "../shared/ipc/worker_protocol.h"
+#include "../shared/util/proc_stat.h"
 
 namespace
 {
@@ -1438,54 +1439,6 @@ static constexpr auto wedge_silence = std::chrono::seconds(15);
 // to do sits in poll_completions() and spends none.
 static constexpr double wedge_cpu_share = 0.5;
 
-// utime + stime out of /proc/<pid>/stat, counted from the last ')' because a
-// process name may contain both spaces and parentheses and the fields before it
-// cannot be split on whitespace.
-static bool read_cpu_ticks(pid_t pid, uint64_t& out)
-{
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/stat", static_cast<int>(pid));
-    FILE* f = ::fopen(path, "re");
-    if (!f)
-        return false;
-
-    char buf[4096];
-    const size_t n = ::fread(buf, 1, sizeof(buf) - 1, f);
-    ::fclose(f);
-    if (n == 0)
-        return false;
-    buf[n] = '\0';
-
-    const char* p = ::strrchr(buf, ')');
-    if (!p)
-        return false;
-
-    // Field 3 (state) begins after the ')'; utime is 14 and stime 15, so the
-    // twelfth and thirteenth values from here.
-    unsigned long long utime = 0, stime = 0;
-    int matched = 0;
-    ++p;
-    for (int field = 3; field <= 15 && *p; ++field)
-    {
-        while (*p == ' ') ++p;
-        char* end = nullptr;
-        const unsigned long long v = ::strtoull(p, &end, 10);
-        if (end == p)
-        {
-            // The state field is a letter, skipped rather than parsed.
-            while (*p && *p != ' ') ++p;
-            continue;
-        }
-        if (field == 14) { utime = v; ++matched; }
-        if (field == 15) { stime = v; ++matched; }
-        p = end;
-    }
-    if (matched != 2)
-        return false;
-    out = utime + stime;
-    return true;
-}
-
 void proxy_supervisor::check_wedged()
 {
     if (m_pid <= 0)
@@ -1494,9 +1447,10 @@ void proxy_supervisor::check_wedged()
         return;
     }
 
-    uint64_t ticks = 0;
-    if (!read_cpu_ticks(m_pid, ticks))
+    socketley::proc_stat st;
+    if (!socketley::read_proc_stat(m_pid, st))
         return;   // the child is going away; check_liveness owns that
+    const uint64_t ticks = st.utime + st.stime;
 
     const auto now = std::chrono::steady_clock::now();
 

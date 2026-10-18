@@ -7,17 +7,13 @@
 #include <vector>
 
 #include "s3_names.h"
+#include "../../shared/util/ascii.h"
 
 namespace socketley::storage
 {
 
 namespace vhost_detail
 {
-
-inline char lower(char c)
-{
-    return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
-}
 
 // A DNS name of labels of letters, digits and inner hyphens, at most 253 bytes.
 inline bool valid_domain(std::string_view d)
@@ -54,7 +50,7 @@ inline bool parse_domains(std::string_view list, std::vector<std::string>& out, 
         const size_t comma = list.find(',');
         std::string d(list.substr(0, comma));
         for (char& c : d)
-            c = vhost_detail::lower(c);
+            c = ascii::lower(c);
         if (!d.empty() && d.back() == '.')
             d.pop_back();
         if (!vhost_detail::valid_domain(d))
@@ -84,7 +80,7 @@ inline bool vhost_bucket(std::string_view host, const std::vector<std::string>& 
         if (host.size() < d.size())
             return false;
         for (size_t i = 0; i < d.size(); ++i)
-            if (vhost_detail::lower(host[host.size() - d.size() + i]) != d[i])
+            if (ascii::lower(host[host.size() - d.size() + i]) != d[i])
                 return false;
         return true;
     };
@@ -106,7 +102,7 @@ inline bool vhost_bucket(std::string_view host, const std::vector<std::string>& 
             if (at + d.size() + 1 >= host.size() || host[at + d.size()] != '.')
                 return false;
             for (size_t i = 0; i < d.size(); ++i)
-                if (vhost_detail::lower(host[at + i]) != d[i])
+                if (ascii::lower(host[at + i]) != d[i])
                     return false;
             return true;
         };
@@ -123,7 +119,7 @@ inline bool vhost_bucket(std::string_view host, const std::vector<std::string>& 
         return false;
     bucket.assign(host.substr(0, bucket_len));
     for (char& c : bucket)
-        c = vhost_detail::lower(c);
+        c = ascii::lower(c);
     return true;
 }
 

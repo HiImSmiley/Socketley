@@ -13,6 +13,7 @@
 
 #include "logging.h"
 #include "wall_clock.h"
+#include "../loop/eventfd_wake.h"
 
 namespace log_ring
 {
@@ -216,8 +217,7 @@ int worker_pipe(std::string_view runtime)
         s.runtime.assign(runtime);
         st().fresh.push_back(std::move(s));
     }
-    const uint64_t one = 1;
-    if (::write(g_wake, &one, sizeof one) < 0) {}
+    socketley::eventfd_bump(g_wake);
     return p[1];
 }
 

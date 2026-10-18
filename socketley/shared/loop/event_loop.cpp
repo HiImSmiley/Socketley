@@ -1,5 +1,6 @@
 #include "event_loop.h"
 #include "../util/logging.h"
+#include "eventfd_wake.h"
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/eventfd.h>
@@ -1295,10 +1296,7 @@ void event_loop::request_stop()
     m_running.store(false, std::memory_order_release);
 
     if (m_eventfd >= 0)
-    {
-        uint64_t val = 1;
-        if (write(m_eventfd, &val, sizeof(val)) < 0) {}
-    }
+        socketley::eventfd_bump(m_eventfd);
 }
 
 int event_loop::get_signal_write_fd() const

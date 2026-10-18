@@ -2,6 +2,7 @@
 #include "../../shared/util/glob_match.h"
 #include "../../shared/json/json_doc.h"
 #include "s3_names.h"
+#include "../../shared/util/ascii.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -24,11 +25,6 @@ namespace
 
 // ─── Matching ───────────────────────────────────────────────────────────────
 
-char lower(char c)
-{
-    return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
-}
-
 // IAM's StringLike: * any run of characters, ? one.
 bool glob(std::string_view pat, std::string_view text)
 {
@@ -40,7 +36,7 @@ std::string lowered(std::string_view in)
     std::string out;
     out.reserve(in.size());
     for (char c : in)
-        out += lower(c);
+        out += ascii::lower(c);
     return out;
 }
 
@@ -371,7 +367,7 @@ struct compiler
         {
             std::string_view pat = a;
             // An identity policy may name IAM's actions, any IAM has, of which those this runtime answers get a bit.
-            if (identity && pat.size() > 4 && lower(pat[0]) == 'i' && lower(pat[1]) == 'a' && lower(pat[2]) == 'm' &&
+            if (identity && pat.size() > 4 && ascii::lower(pat[0]) == 'i' && ascii::lower(pat[1]) == 'a' && ascii::lower(pat[2]) == 'm' &&
                 pat[3] == ':')
             {
                 pat.remove_prefix(4);
@@ -385,7 +381,7 @@ struct compiler
             }
             if (pat != "*")
             {
-                if (pat.size() < 3 || lower(pat[0]) != 's' || pat[1] != '3' || pat[2] != ':')
+                if (pat.size() < 3 || ascii::lower(pat[0]) != 's' || pat[1] != '3' || pat[2] != ':')
                     return fail("Policy has invalid action: " + a);
                 pat.remove_prefix(3);
             }
@@ -519,7 +515,7 @@ struct compiler
         const std::string& name = block.members[0].first;
         bool same = name.size() == key.size();
         for (size_t i = 0; same && i < key.size(); ++i)
-            same = lower(name[i]) == lower(key[i]);
+            same = ascii::lower(name[i]) == ascii::lower(key[i]);
         if (!same)
             return fail("Condition key " + name + " is not supported with " + std::string(op) +
                         " (only " + std::string(key) + ")");
@@ -627,7 +623,7 @@ struct compiler
         {
             cond c = proto;
             for (char ch : key_text)
-                c.key += lower(ch);
+                c.key += ascii::lower(ch);
             if (c.key.starts_with("s3:requestobjecttag/"))
                 c.key = "s3:requestobjecttag/" + key_text.substr(20);
             if (!known_key(c.key))
@@ -1254,7 +1250,7 @@ bool equal_ci(std::string_view a, std::string_view b)
     if (a.size() != b.size())
         return false;
     for (size_t i = 0; i < a.size(); ++i)
-        if (lower(a[i]) != lower(b[i]))
+        if (ascii::lower(a[i]) != ascii::lower(b[i]))
             return false;
     return true;
 }

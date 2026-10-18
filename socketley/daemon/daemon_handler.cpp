@@ -29,6 +29,7 @@
 #include "../shared/crypto/cert_keeper.h"
 #include "../runtime/dns/dns_zone.h"
 #include "../runtime/dns/dns_wire.h"
+#include "../shared/util/proc_stat.h"
 #include <sys/stat.h>
 
 static void publish_dns_names(runtime_manager& manager);
@@ -118,16 +119,8 @@ static int col_width(int base, size_t longest)
 // corpse is the failure this hint exists to prevent, in miniature.
 static bool is_zombie(pid_t pid)
 {
-    std::ifstream f("/proc/" + std::to_string(pid) + "/stat");
-    std::string line;
-    if (!std::getline(f, line))
-        return false;
-
-    // From the last `)`, because a comm field may hold both spaces and parens.
-    const size_t close = line.rfind(')');
-    if (close == std::string::npos || close + 2 >= line.size())
-        return false;
-    return line[close + 2] == 'Z';
+    socketley::proc_stat st;
+    return socketley::read_proc_stat(pid, st) && st.state == 'Z';
 }
 
 // A second daemon is invisible from inside the first: SOCKETLEY_SOCKET moves
@@ -2710,22 +2703,8 @@ int daemon_handler::cmd_startup(ipc_connection* conn, const parsed_args& pa)
         for (const auto& sup : it->second)
             if (sup->pid() > 0)
             {
-                std::ifstream f("/proc/" + std::to_string(sup->pid()) + "/stat");
-                std::string line;
-                std::getline(f, line);
-                // utime and stime are the 14th and 15th fields, counted after the command's closing parenthesis.
-                if (const size_t at = line.rfind(')'); at != std::string::npos && at + 2 <= line.size())
-                {
-                    std::istringstream rest(line.substr(at + 2));
-                    std::string field;
-                    uint64_t utime = 0, stime = 0;
-                    for (int i = 3; i <= 15 && rest >> field; ++i)
-                        if (i == 14)
-                            utime = std::strtoull(field.c_str(), nullptr, 10);
-                        else if (i == 15)
-                            stime = std::strtoull(field.c_str(), nullptr, 10);
-                    ticks += utime + stime;
-                }
+                if (socketley::proc_stat st; socketley::read_proc_stat(sup->pid(), st))
+                    ticks += st.utime + st.stime;
             }
     conn->write_buf = "starting " + std::to_string(ticks) + "\n";
     return 2;
