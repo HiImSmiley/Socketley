@@ -507,13 +507,13 @@ void idp_run::load_clients()
     if (::stat(path.c_str(), &st) != 0)
     {
         m_clients_error = "the clients file " + path + " cannot be read";
-        if (m_clients_mtime >= 0)
+        if (m_clients_stamp)
             LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": " + m_clients_error +
                       "; the clients read before stay").c_str());
         return;
     }
-    const int64_t mtime = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
-    if (mtime == m_clients_mtime)
+    const socketley::file_stamp mtime = socketley::file_stamp::of(st);
+    if (mtime == m_clients_stamp)
         return;
     std::ifstream f(path);
     std::stringstream ss;
@@ -524,15 +524,15 @@ void idp_run::load_clients()
     {
         m_clients_error = "the clients file " + path + ": " + (why.empty() ? "cannot be read" : why);
         // A file broken while running keeps the clients read before it, and says so once.
-        if (m_clients_mtime >= 0)
+        if (m_clients_stamp)
             LOG_WARN(("idp " + std::string(m_owner.get_name()) + ": " + m_clients_error +
                       "; the clients read before stay").c_str());
-        m_clients_mtime = mtime;
+        m_clients_stamp = mtime;
         return;
     }
     m_clients = std::move(fresh);
     m_clients_error.clear();
-    m_clients_mtime = mtime;
+    m_clients_stamp = mtime;
 }
 
 const client* idp_run::find_client(std::string_view id)

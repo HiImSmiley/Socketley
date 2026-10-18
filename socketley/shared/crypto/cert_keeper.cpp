@@ -34,6 +34,7 @@
 #include "../persist/paths.h"
 #include "tls_context.h"
 #include "../persist/replaced_file.h"
+#include "../persist/file_stamp.h"
 
 extern char** environ;
 
@@ -54,21 +55,11 @@ constexpr auto backoff_first = std::chrono::seconds(60);
 constexpr auto partial_again = std::chrono::hours(6);
 constexpr auto backoff_most  = std::chrono::hours(6);
 
-struct file_sig
-{
-    int64_t mtime_ns{0};
-    int64_t size{-1};
-    uint64_t ino{0};
-    bool operator==(const file_sig&) const = default;
-};
+using file_sig = socketley::file_stamp;
 
 file_sig sig_of(const std::string& path)
 {
-    struct stat sb{};
-    if (::stat(path.c_str(), &sb) != 0)
-        return {};
-    return {static_cast<int64_t>(sb.st_mtim.tv_sec) * 1000000000 + sb.st_mtim.tv_nsec, static_cast<int64_t>(sb.st_size),
-            static_cast<uint64_t>(sb.st_ino)};
+    return socketley::file_stamp::of(path);
 }
 
 struct watched

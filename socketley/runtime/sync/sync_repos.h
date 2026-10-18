@@ -7,6 +7,7 @@
 // What it needs it reads from the file --repositories names, which the storage writes and makes again before the
 // temporary credentials in it run out: the storage's directory, where the list and each repository's state are, the
 // address it is reached on, and for each user the credentials and GitHub token a run signs and fetches with.
+#include <optional>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -14,6 +15,7 @@
 
 #include "../../shared/loop/event_loop.h"
 #include "../storage/git_mirrors.h"
+#include "../../shared/persist/file_stamp.h"
 
 class sync_instance;
 
@@ -49,7 +51,7 @@ private:
         socketley::storage::git_mirrors::identity id;
     };
     std::map<std::string, pull> m_pulls;
-    int64_t     m_stamp{-1};
+    std::optional<socketley::file_stamp> m_stamp;
     bool        m_opened{false};
     std::string m_problem;
     __kernel_timespec m_tick_ts{};

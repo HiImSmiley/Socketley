@@ -62,12 +62,6 @@ bool write_file(const std::string& path, std::string_view data, mode_t mode)
     return socketley::replace_file(path, data, socketley::durability::data, nullptr, mode);
 }
 
-int64_t mtime_of(const std::string& path)
-{
-    struct stat st{};
-    return ::stat(path.c_str(), &st) != 0 ? 0 : static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
-}
-
 // A short lock on the list, so two shards changing it at once both get their change in.
 class list_lock
 {
@@ -194,7 +188,7 @@ size_t git_mirrors::mine()
 std::vector<git_mirrors::repo> git_mirrors::repos()
 {
     const std::string path = m_dir + "/.ui/git.json";
-    const int64_t stamp = mtime_of(path);
+    const socketley::file_stamp stamp = socketley::file_stamp::of(path);
     if (stamp != m_cache_stamp)
     {
         std::string text;
@@ -218,7 +212,7 @@ bool git_mirrors::save(const std::vector<repo>& rs)
     }
     o += "\n]}\n";
     const bool ok = write_file(m_dir + "/.ui/git.json", o, 0600);
-    m_cache_stamp = -1;
+    m_cache_stamp.reset();
     return ok;
 }
 
@@ -236,7 +230,7 @@ std::string git_mirrors::add(repo& r)
     list_lock lock(m_dir);
     if (!lock.held())
         return "the list of repositories could not be locked";
-    m_cache_stamp = -1;
+    m_cache_stamp.reset();
     std::vector<repo> rs = repos();
     if (rs.size() >= max_repos)
         return "this runtime keeps at most " + std::to_string(max_repos) + " repositories";
@@ -256,7 +250,7 @@ bool git_mirrors::remove(std::string_view id)
     list_lock lock(m_dir);
     if (!lock.held())
         return false;
-    m_cache_stamp = -1;
+    m_cache_stamp.reset();
     std::vector<repo> rs = repos();
     const size_t before = rs.size();
     std::erase_if(rs, [&](const repo& r) { return r.id == id; });
@@ -277,7 +271,7 @@ bool git_mirrors::set_every(std::string_view id, std::string_view every)
     list_lock lock(m_dir);
     if (!lock.held())
         return false;
-    m_cache_stamp = -1;
+    m_cache_stamp.reset();
     std::vector<repo> rs = repos();
     for (repo& r : rs)
         if (r.id == id)
@@ -515,7 +509,7 @@ void git_mirrors::tick()
     // A run is told of once its state is written and its lock let go; what the first look finds is no news.
     for (const repo& r : repos())
     {
-        const int64_t stamp = mtime_of(work_of(r.id) + "/state.json");
+        const socketley::file_stamp stamp = socketley::file_stamp::of(work_of(r.id) + "/state.json");
         auto [it, fresh] = m_seen.try_emplace(r.id, stamp);
         if (stamp == it->second && !(fresh && m_seen_once))
             continue;
@@ -523,7 +517,7 @@ void git_mirrors::tick()
             continue;
         it->second = stamp;
         std::string state;
-        if (stamp && on_run && read_file(work_of(r.id) + "/state.json", state))
+        if (stamp.exists() && on_run && read_file(work_of(r.id) + "/state.json", state))
             on_run(r, state);
     }
     m_seen_once = true;

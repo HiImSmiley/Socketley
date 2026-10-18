@@ -1,6 +1,7 @@
 #pragma once
 // The identity provider's running half: its listener, its connections and the HTTP it speaks on them, the accounts
 // it keeps, the keys it signs with, and the commands `socketley idp-user` sends it.
+#include <optional>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -23,6 +24,7 @@
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
 #include "../../shared/ipc/request_channel.h"
+#include "../../shared/persist/file_stamp.h"
 
 class idp_instance;
 
@@ -190,7 +192,7 @@ private:
     account_store m_accounts;
     std::vector<client> m_clients;
     std::string m_clients_error;
-    int64_t m_clients_mtime{-1};
+    std::optional<socketley::file_stamp> m_clients_stamp;
     int64_t m_clients_checked{0};
 
     std::unordered_map<std::string, code_entry> m_codes;

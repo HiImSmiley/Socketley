@@ -34,7 +34,7 @@ void session_verifier::configure(std::string_view idp_runtime)
     m_path = idp_runtime.empty() ? std::string() : idp_jwks_path(idp_runtime);
     m_issuer.clear();
     m_keys.reset();
-    m_stamp = -1;
+    m_stamp.reset();
     m_checked = 0;
     m_seen.clear();
 }
@@ -43,14 +43,10 @@ void session_verifier::reload()
 {
     // The provider's file, looked at once a second, and read again only when it changed.
     const int64_t now = now_sec();
-    if (m_stamp >= 0 && now == m_checked)
+    if (m_stamp && now == m_checked)
         return;
     m_checked = now;
-    struct stat st{};
-    const int64_t stamp = ::stat(m_path.c_str(), &st) != 0
-                              ? 0
-                              : static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec +
-                                    static_cast<int64_t>(st.st_ino);
+    const socketley::file_stamp stamp = socketley::file_stamp::of(m_path);
     if (stamp == m_stamp)
         return;
     m_stamp = stamp;

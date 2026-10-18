@@ -10,6 +10,7 @@
 // Either file is read again when it changes, at most once a second; one that has gone or no longer parses refuses
 // everybody until it is whole again. An address that keeps failing is refused even the right answer for a while,
 // so guessing costs it the window and tells it nothing.
+#include <optional>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -17,6 +18,8 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include "../../shared/persist/file_stamp.h"
 
 namespace socketley::storage { class credential_set; }
 namespace socketley::idp { class session_verifier; }
@@ -64,7 +67,8 @@ private:
     kind m_kind{kind::none};
     std::string m_file, m_runtime, m_challenge;
     std::chrono::steady_clock::time_point m_checked{};
-    int64_t m_stamp{-1};
+    // What the file was when last read, none before the first read.
+    std::optional<socketley::file_stamp> m_stamp;
     bool m_loaded{false};
     std::vector<std::string> m_tokens;
     std::unique_ptr<socketley::storage::credential_set> m_keys;

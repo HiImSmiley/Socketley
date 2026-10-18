@@ -85,14 +85,6 @@ uint64_t version_of(std::string_view tag)
     return r.ec == std::errc() && r.ptr == tag.data() + tag.size() ? v : 0;
 }
 
-int64_t mtime_of(const std::string& path)
-{
-    struct stat st{};
-    if (::stat(path.c_str(), &st) != 0)
-        return 0;
-    return static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec + static_cast<int64_t>(st.st_size);
-}
-
 const jvalue* string_member(const jvalue& obj, std::string_view name)
 {
     const jvalue* m = member(obj, name);
@@ -134,7 +126,7 @@ bool db_run::start(std::string& why)
             why = path + " " + why;
             return false;
         }
-        m_schema_mtime = mtime_of(path);
+        m_schema_stamp = socketley::file_stamp::of(path);
     }
     m_shards = std::max<uint32_t>(1, m_owner.get_shards());
     m_shard = m_owner.get_shard_index();
@@ -893,9 +885,9 @@ void db_run::reload_files(std::string& why)
     m_files_checked = now;
     if (const std::string path(m_owner.get_schema_path()); !path.empty())
     {
-        if (const int64_t mt = mtime_of(path); mt != m_schema_mtime)
+        if (const socketley::file_stamp mt = socketley::file_stamp::of(path); mt != m_schema_stamp)
         {
-            m_schema_mtime = mt;
+            m_schema_stamp = mt;
             std::string text, err;
             schema s;
             if (!read_whole_file(path, text))
@@ -911,9 +903,9 @@ void db_run::reload_files(std::string& why)
     }
     if (const std::string path(m_owner.get_keys_path()); !path.empty())
     {
-        if (const int64_t mt = mtime_of(path); mt != m_keys_mtime)
+        if (const socketley::file_stamp mt = socketley::file_stamp::of(path); mt != m_keys_stamp)
         {
-            m_keys_mtime = mt;
+            m_keys_stamp = mt;
             std::string text, err;
             std::vector<service_key> keys;
             if (!read_whole_file(path, text))

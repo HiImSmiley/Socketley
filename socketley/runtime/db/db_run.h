@@ -6,6 +6,7 @@
 // sync of the newest segment runs at a time, off the loop, and takes every record written while the one before ran.
 // Changes are streamed to feeds and replicas once they are on the disk; a replica follows another database's stream
 // on a thread of its own and writes what it is told.
+#include <optional>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -29,6 +30,7 @@
 #include "../../shared/loop/event_loop_definitions.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/ipc/request_channel.h"
+#include "../../shared/persist/file_stamp.h"
 
 class db_instance;
 
@@ -186,8 +188,8 @@ private:
     socketley::idp::session_verifier m_idp;
     std::vector<service_key> m_keys;
     std::vector<std::string> m_origins;
-    int64_t m_schema_mtime{-1};
-    int64_t m_keys_mtime{-1};
+    std::optional<socketley::file_stamp> m_schema_stamp;
+    std::optional<socketley::file_stamp> m_keys_stamp;
     int64_t m_files_checked{0};
     std::string m_schema_error;
     std::string m_keys_error;

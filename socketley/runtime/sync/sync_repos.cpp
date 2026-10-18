@@ -45,7 +45,7 @@ bool repo_runner::reload(std::string& why)
         why = path + " is not there";
         return false;
     }
-    const int64_t stamp = int64_t(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
+    const socketley::file_stamp stamp = socketley::file_stamp::of(st);
     if (stamp == m_stamp)
         return true;
     std::string text;

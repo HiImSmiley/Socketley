@@ -100,7 +100,7 @@ void proxy_auth::configure(std::string_view spec, std::string_view runtime)
     m_runtime.assign(runtime);
     m_challenge = m_kind == kind::basic ? "WWW-Authenticate: Basic realm=\"" + m_runtime + "\", charset=\"UTF-8\"\r\n"
                                         : "WWW-Authenticate: Bearer realm=\"" + m_runtime + "\"\r\n";
-    m_stamp = -1;
+    m_stamp.reset();
     m_loaded = false;
     m_tokens.clear();
     m_keys.reset();
@@ -109,14 +109,10 @@ void proxy_auth::configure(std::string_view spec, std::string_view runtime)
 
 void proxy_auth::reload(std::chrono::steady_clock::time_point now)
 {
-    if (m_stamp >= 0 && now - m_checked < std::chrono::seconds(1))
+    if (m_stamp && now - m_checked < std::chrono::seconds(1))
         return;
     m_checked = now;
-    struct stat st{};
-    const int64_t stamp = ::stat(m_file.c_str(), &st) != 0
-                              ? 0
-                              : static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec +
-                                    static_cast<int64_t>(st.st_size) + static_cast<int64_t>(st.st_ino);
+    const socketley::file_stamp stamp = socketley::file_stamp::of(m_file);
     if (stamp == m_stamp)
         return;
     m_stamp = stamp;

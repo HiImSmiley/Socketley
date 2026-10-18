@@ -1,12 +1,14 @@
 #pragma once
 // A sign-in an idp runtime of this daemon gave, verified where it is used -- a proxy, a storage, the dashboard --
 // against the key the provider publishes beside its state, with no request to the provider.
+#include <optional>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 
 #include "idp_logic.h"
+#include "../../shared/persist/file_stamp.h"
 
 namespace socketley::storage
 {
@@ -53,7 +55,7 @@ private:
     std::string m_path;
     std::string m_issuer;
     std::unique_ptr<socketley::storage::jwks_keys> m_keys;
-    int64_t m_stamp{-1};
+    std::optional<socketley::file_stamp> m_stamp;
     int64_t m_checked{0};
     bool verified(std::string_view token, bool bearer, int64_t now, who& out);
     // Sessions already verified, so a signature is checked once a session and not once a request.
