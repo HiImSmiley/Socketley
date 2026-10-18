@@ -239,6 +239,16 @@ public:
     const_iterator begin() const { return const_iterator(this, 0); }
     const_iterator end()   const { return const_iterator(this, m_cap); }
 
+    // The first entry at or after slot `i` taken modulo the capacity, wrapping to the front, so a random `i` costs
+    // capacity over size slots where begin() costs every slot emptied ahead of it.
+    const_iterator at_or_after(size_t i) const
+    {
+        if (m_cap == 0)
+            return end();
+        const_iterator it(this, i & (m_cap - 1));
+        return it == end() ? begin() : it;
+    }
+
     size_t               bucket_count() const { return m_cap; }
     local_iterator       begin(size_t b)       { return local_iterator(m_slots[b].live() ? m_slots[b].e() : nullptr); }
     local_iterator       end(size_t)           { return local_iterator(); }
@@ -517,6 +527,7 @@ public:
     bool   empty() const { return m_t.empty(); }
     const_iterator begin() const { return const_iterator(m_t.begin()); }
     const_iterator end()   const { return const_iterator(m_t.end()); }
+    const_iterator at_or_after(size_t i) const { return const_iterator(m_t.at_or_after(i)); }
 
     size_t               bucket_count() const { return m_t.bucket_count(); }
     size_t capacity_after_insert() const { return m_t.capacity_after_insert(); }

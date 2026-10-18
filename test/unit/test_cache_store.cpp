@@ -4366,3 +4366,38 @@ TEST_CASE("allkeys-random evicts a key drawn from the whole keyspace, never the 
         CHECK(store.get_memory_used() <= 16 * 1024);
     }
 }
+
+TEST_CASE("SPOP and SRANDMEMBER take a member from anywhere in the set, and SPOP empties it once each")
+{
+    cache_store store;
+    const int n = 20000;
+    for (int i = 0; i < n; ++i)
+        store.sadd("s", "m" + std::to_string(i));
+
+    std::set<std::string> drawn;
+    std::string m;
+    for (int i = 0; i < 64; ++i)
+        if (store.srandmember("s", m))
+            drawn.insert(m);
+    CHECK(drawn.size() > 1);
+
+    std::set<std::string> popped;
+    while (store.spop("s", m))
+        popped.insert(m);
+    CHECK(popped.size() == static_cast<size_t>(n));
+    CHECK_FALSE(store.srandmember("s", m));
+}
+
+TEST_CASE("RANDOMKEY draws from every key of every type")
+{
+    cache_store store;
+    CHECK(store.random_key().empty());
+    for (int i = 0; i < 50; ++i)
+        store.set("k" + std::to_string(i), "v");
+    store.sadd("a-set", "m");
+    store.lpush("a-list", "x");
+    std::set<std::string> seen;
+    for (int i = 0; i < 4000; ++i)
+        seen.insert(std::string(store.random_key()));
+    CHECK(seen.size() == 52);
+}

@@ -951,15 +951,41 @@ int cache_store::copy_key(std::string_view src, std::string_view dst, bool repla
     return 1;
 }
 
+// The draws RANDOMKEY, SPOP and SRANDMEMBER make, one generator per thread.
+static std::mt19937_64& sample_rng()
+{
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    return rng;
+}
+
 std::string_view cache_store::random_key() const
 {
-    if (!m_data.empty())   return m_data.begin()->first;
-    if (!m_lists.empty())  return m_lists.begin()->first;
-    if (!m_sets.empty())   return m_sets.begin()->first;
-    if (!m_hashes.empty()) return m_hashes.begin()->first;
-    if (!m_zsets.empty())  return m_zsets.begin()->first;
-    if (!m_streams.empty()) return m_streams.begin()->first;
-    return {};
+    // A type by its share of the keys, then a slot at random in its table, as Redis answers RANDOMKEY.
+    const size_t total = m_data.size() + m_lists.size() + m_sets.size() + m_hashes.size() + m_zsets.size() +
+                         m_streams.size();
+    if (total == 0)
+        return {};
+    size_t r = static_cast<size_t>(sample_rng()() % total);
+    std::string_view out;
+    bool found = false;
+    const auto pick = [&](const auto& t) {
+        if (found)
+            return;
+        if (r >= t.size())
+        {
+            r -= t.size();
+            return;
+        }
+        out = t.at_or_after(static_cast<size_t>(sample_rng()()))->first;
+        found = true;
+    };
+    pick(m_data);
+    pick(m_lists);
+    pick(m_sets);
+    pick(m_hashes);
+    pick(m_zsets);
+    pick(m_streams);
+    return out;
 }
 
 int64_t cache_store::expire_time(std::string_view key, bool millis) const
@@ -2067,6 +2093,12 @@ bool cache_store::lmove(std::string_view src, std::string_view dst,
 
 // ─── Sets, the sampling spellings ───
 
+// A member from a random slot on, which is Redis's choice and keeps SPOP from walking every slot it emptied before.
+static set_inner::const_iterator any_member(const set_inner& s)
+{
+    return s.at_or_after(static_cast<size_t>(sample_rng()()));
+}
+
 bool cache_store::spop(std::string_view key, std::string& out)
 {
     check_expiry(key);
@@ -2074,7 +2106,7 @@ bool cache_store::spop(std::string_view key, std::string& out)
     if (it == m_sets.end() || it->second.empty())
         return false;
 
-    auto mit = it->second.begin();
+    auto mit = any_member(it->second);
     out = *mit;
     const size_t shape = shape_cost(it->second);
     track_sub(stored_string(*mit));
@@ -2099,7 +2131,7 @@ bool cache_store::srandmember(std::string_view key, std::string& out) const
     auto it = m_sets.find(key);
     if (it == m_sets.end() || it->second.empty())
         return false;
-    out = *it->second.begin();
+    out = *any_member(it->second);
     return true;
 }
 

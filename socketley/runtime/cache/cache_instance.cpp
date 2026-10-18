@@ -11177,8 +11177,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         }
 
         // ─── Sets, the sampling spellings ───
-        // SPOP picks a member this process's iteration order decides, so it
-        // replicates as the SREM it turned out to be rather than as itself.
+        // SPOP picks a member at random, so it replicates as the SREM it
+        // turned out to be rather than as itself.
         case fnv1a("spop"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
