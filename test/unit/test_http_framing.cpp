@@ -33,3 +33,17 @@ TEST_CASE("a request whose Content-Length is spelled with a CR for its hyphen is
     CHECK(t.has_content_length);
     CHECK(t.content_length == 5);
 }
+
+TEST_CASE("an Authorization scheme is matched in any case and its credentials trimmed")
+{
+    std::string_view cred;
+    REQUIRE(http_auth_credentials("Basic dXNlcjpwdw==", "basic", cred));
+    CHECK(cred == "dXNlcjpwdw==");
+    REQUIRE(http_auth_credentials("BEARER   tok  ", "bearer", cred));
+    CHECK(cred == "tok");
+    CHECK(http_auth_credentials("bearer x", "bearer", cred));
+    CHECK_FALSE(http_auth_credentials("Bearerx", "bearer", cred));
+    CHECK_FALSE(http_auth_credentials("Bearer", "bearer", cred));
+    CHECK_FALSE(http_auth_credentials("Basic x", "bearer", cred));
+    CHECK_FALSE(http_auth_credentials(std::string_view("Bea\rer x", 8), "bearer", cred));
+}

@@ -229,13 +229,13 @@ bool storage_run::app_login(const std::shared_ptr<conn>& c, std::string_view rea
 {
     const std::string_view h = c->req.header("authorization");
     auth_verdict v;
-    if (h.starts_with("Basic ") || h.starts_with("basic "))
+    if (std::string_view cred; http_auth_credentials(h, "basic", cred))
     {
         // An address that keeps guessing is refused even the right secret, so the answer tells it nothing.
         if (login_barred(c))
             return false;
         std::string pair;
-        const size_t colon = base64_decode(http_trim_ows(h.substr(6)), pair) ? pair.find(':') : std::string::npos;
+        const size_t colon = base64_decode(cred, pair) ? pair.find(':') : std::string::npos;
         // An access key and its secret, or a user's name and the password of its login profile.
         if (colon != std::string::npos)
         {

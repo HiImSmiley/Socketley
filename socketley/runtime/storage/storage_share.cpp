@@ -408,11 +408,11 @@ bool storage_run::share_open(const std::shared_ptr<conn>& c, std::string_view id
     // Any user name, and the link's password, as a browser asks for them.
     const std::string_view h = c->req.header("authorization");
     std::string pair;
-    if (h.starts_with("Basic ") || h.starts_with("basic "))
+    if (std::string_view cred; http_auth_credentials(h, "basic", cred))
     {
         if (login_barred(c))
             return false;
-        if (base64_decode(http_trim_ows(h.substr(6)), pair))
+        if (base64_decode(cred, pair))
         {
             const size_t colon = pair.find(':');
             const std::string got = pw_hash(s.pw_salt, colon == std::string::npos ? std::string_view{} :

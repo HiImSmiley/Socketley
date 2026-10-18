@@ -1252,10 +1252,10 @@ void idp_run::token(const std::shared_ptr<conn>& c, const request& rq)
     // The client, by HTTP Basic or by the form, and a public one by its id alone.
     std::string id(param(p, "client_id")), secret(param(p, "client_secret"));
     bool basic = false;
-    if (rq.authorization.size() > 6 && (rq.authorization.starts_with("Basic ") || rq.authorization.starts_with("basic ")))
+    if (std::string_view cred; http_auth_credentials(rq.authorization, "basic", cred))
     {
         std::string decoded;
-        if (socketley::storage::base64_decode(http_trim_ows(std::string_view(rq.authorization).substr(6)), decoded))
+        if (socketley::storage::base64_decode(cred, decoded))
             if (const size_t colon = decoded.find(':'); colon != std::string::npos)
             {
                 // RFC 6749 2.3.1 form-encodes both halves before they are joined.
@@ -1378,8 +1378,8 @@ void idp_run::redeemed(const std::shared_ptr<conn>& c, const client& cl, const p
 
 void idp_run::userinfo(const std::shared_ptr<conn>& c, const request& rq)
 {
-    std::string_view auth = rq.authorization;
-    if (!auth.starts_with("Bearer ") && !auth.starts_with("bearer "))
+    std::string_view token;
+    if (!http_auth_credentials(rq.authorization, "bearer", token))
     {
         json_error(c, 401, "invalid_token", "a bearer access token is required",
                    "WWW-Authenticate: Bearer error=\"invalid_token\"\r\n");
@@ -1387,7 +1387,7 @@ void idp_run::userinfo(const std::shared_ptr<conn>& c, const request& rq)
     }
     claims a;
     std::string why;
-    if (!m_verified.verify(m_key, m_kid, "at+jwt", m_issuer, http_trim_ows(auth.substr(7)), now_sec(), a, why) ||
+    if (!m_verified.verify(m_key, m_kid, "at+jwt", m_issuer, token, now_sec(), a, why) ||
         !has_scope(claim(a, "scope"), "openid"))
     {
         json_error(c, 401, "invalid_token", "the access token is not valid: " + why,

@@ -551,7 +551,7 @@ void storage_run::ui_session(const std::shared_ptr<conn>& c)
     }
     // A sign-in is made from the credentials themselves and never from a session, so a cookie cannot extend itself.
     const std::string_view h = r.header("authorization");
-    if (r.method == "POST" && !h.starts_with("Basic ") && !h.starts_with("basic "))
+    if (std::string_view cred; r.method == "POST" && !http_auth_credentials(h, "basic", cred))
     {
         static const std::vector<header_ref> none;
         request_view rv;

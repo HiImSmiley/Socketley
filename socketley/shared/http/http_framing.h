@@ -115,6 +115,21 @@ inline std::string_view http_trim_ows(std::string_view s)
     return s;
 }
 
+// The credentials an Authorization value carries after `scheme_lower`, a scheme RFC 9110 11.1 matches in any case,
+// trimmed; false for another scheme, so "BASIC" or "Bearer" reaches what "basic" and "bearer" do.
+inline bool http_auth_credentials(std::string_view authorization, std::string_view scheme_lower,
+                                  std::string_view& credentials)
+{
+    const size_t n = scheme_lower.size();
+    if (authorization.size() <= n || authorization[n] != ' ')
+        return false;
+    for (size_t i = 0; i < n; ++i)
+        if (!http_lower_equals(authorization[i], scheme_lower[i]))
+            return false;
+    credentials = http_trim_ows(authorization.substr(n + 1));
+    return true;
+}
+
 // Does a comma-separated field value carry this token, since Connection and
 // Transfer-Encoding are lists and matching the whole value finds neither
 // member.

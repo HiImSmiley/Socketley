@@ -1433,13 +1433,12 @@ bool db_run::who_of(const request& rq, principal& who, bool& by_cookie, std::str
     by_cookie = false;
     if (!rq.authorization.empty())
     {
-        std::string_view a = rq.authorization;
-        if (!a.starts_with("Bearer ") && !a.starts_with("bearer "))
+        std::string_view token;
+        if (!http_auth_credentials(rq.authorization, "bearer", token))
         {
             refusal = "Authorization takes Bearer and a key's secret or the provider's access token";
             return false;
         }
-        const std::string_view token = http_trim_ows(a.substr(7));
         for (const auto& k : m_keys)
             if (k.secret.size() == token.size() && CRYPTO_memcmp(k.secret.data(), token.data(), token.size()) == 0)
             {
