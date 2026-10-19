@@ -10,6 +10,8 @@
 #   * mqtt-sessions, mqtt-kick or mqtt-sub seeing one shard only
 #   * a shard's sessions lost across a restart because the shards share one snapshot
 #   * a message a QoS 1 publisher had answered lost because the shard it was for could not take it then
+#   * a flood at QoS 0 dropped between two shards that both keep up, or its publisher cut off while it is held
+#   * a publisher at QoS 0 held for good by a shard that stopped
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -204,27 +206,41 @@ if phase == "main":
         time.sleep(1.6)
     guarded("keep", keep)
 
-if phase == "stall":
-    def stall():
-        import os, re, signal
+if phase in ("stall", "hang"):
+    import os, re, signal, socket, threading
 
-        def owner(c):
-            lport = c.sock.getsockname()[1]
-            out = subprocess.run(["ss", "-tnpH", "sport = :%d and dport = :%d" % (port, lport)],
-                                 capture_output=True, timeout=10).stdout.decode()
-            m = re.search(r"pid=(\d+)", out)
-            return int(m.group(1)) if m else None
+    def owner(c):
+        lport = c.sock.getsockname()[1]
+        out = subprocess.run(["ss", "-tnpH", "sport = :%d and dport = :%d" % (port, lport)],
+                             capture_output=True, timeout=10).stdout.decode()
+        m = re.search(r"pid=(\d+)", out)
+        return int(m.group(1)) if m else None
 
-        pub = connected(port, "fl-pub")
+    def apart(name):
+        # A publisher, and a subscriber the kernel gave another shard than the publisher's.
+        pub = connected(port, name + "-pub")
         home = owner(pub)
-        far = None
         for i in range(32):
-            c = connected(port, "fl-sub-%d" % i)
+            c = connected(port, "%s-sub-%d" % (name, i))
             if owner(c) not in (home, None):
-                far = c
-                break
+                return pub, c
             c.disconnect()
-        truth("a subscriber lands on another shard than the publisher", far is not None, home)
+        return pub, None
+
+    def counted():
+        out = subprocess.run([binary, "stats", "fl"], capture_output=True, timeout=10).stdout.decode()
+        got = {"shard_dropped": 0, "dropped": 0}
+        for line in out.splitlines():
+            k, _, v = line.partition(":")
+            if k == "shard_dropped":
+                got[k] += int(v)
+            elif k in ("dropped_slow", "dropped_queue"):
+                got["dropped"] += int(v)
+        return got
+
+    def stall():
+        pub, far = apart("fl")
+        truth("a subscriber lands on another shard than the publisher", far is not None)
         if far is None:
             return
         far.subscribe(("flood/#", 1))
@@ -236,7 +252,8 @@ if phase == "stall":
         def pump(until):
             nonlocal sent, acked
             while time.time() < until and acked < total:
-                while sent < total and sent - acked < 1000:
+                # A window its socket holds while the shard does not read it.
+                while sent < total and sent - acked < 200:
                     pub.publish("flood/x", b"%06d" % sent + pad, qos=1, wait=False)
                     sent += 1
                 p = pub.read(0.1)
@@ -258,7 +275,93 @@ if phase == "stall":
               got == [b"%06d" % i for i in range(total)], True)
         far.disconnect()
         pub.disconnect()
-    guarded("stall", stall)
+    if phase == "stall":
+        guarded("stall", stall)
+
+    def flood():
+        pub, far = apart("fq")
+        truth("a subscriber of the flood lands on another shard than its publisher", far is not None)
+        if far is None:
+            return
+        far.subscribe(("fq/#", 0))
+        time.sleep(0.5)
+        before = counted()
+        # Forty MiB at QoS 0 as fast as the socket takes it, which the publisher's shard reads far faster than it
+        # hands on, and more than a publisher may send while it waits.
+        total = 100000
+        body = s("fq/x") + b"\x00" + b"." * 400
+        blob = (bytes([PUBLISH << 4]) + varint(len(body)) + body) * total
+        sender = threading.Thread(target=lambda: pub.sock.sendall(blob))
+        pub.sock.settimeout(None)
+        sender.start()
+        got, buf, sock = 0, bytearray(), far.sock
+        sock.settimeout(3)
+        while got < total:
+            try:
+                chunk = sock.recv(1 << 20)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            at = 0
+            while True:
+                n, mul, i = 0, 1, at + 1
+                while i < len(buf):
+                    c = buf[i]
+                    n += (c & 0x7F) * mul
+                    i += 1
+                    if not c & 0x80:
+                        break
+                    mul *= 128
+                else:
+                    break
+                if i + n > len(buf):
+                    break
+                if buf[at] >> 4 == PUBLISH:
+                    got += 1
+                at = i + n
+            del buf[:at]
+        sender.join(30)
+        after = counted()
+        check("a shard drops nothing of a flood at QoS 0 on the way to another one that keeps taking it",
+              after["shard_dropped"] - before["shard_dropped"], 0)
+        check("every message of it reaches the subscriber or is counted dropped for it",
+              got + after["dropped"] - before["dropped"], total)
+        truth("and the publisher it held is still connected", pub.ping(), sender.is_alive())
+        far.disconnect()
+        pub.disconnect()
+    if phase == "stall":
+        guarded("flood", flood)
+
+if phase == "hang":
+    def hang():
+        pub, far = apart("fh")
+        truth("a subscriber of the hung shard lands on another shard than its publisher", far is not None)
+        if far is None:
+            return
+        far.subscribe(("fh/#", 0))
+        time.sleep(0.5)
+        before = counted()
+        body = s("fh/x") + b"\x00" + b"." * 400
+        blob = (bytes([PUBLISH << 4]) + varint(len(body)) + body) * 40000
+        sender = threading.Thread(target=lambda: pub.sock.sendall(blob))
+        pub.sock.settimeout(None)
+        victim = owner(far)
+        os.kill(victim, signal.SIGSTOP)
+        try:
+            sender.start()
+            sender.join(15)
+            truth("a publisher at QoS 0 goes on while a shard its messages are for has stopped", not sender.is_alive())
+        finally:
+            os.kill(victim, signal.SIGCONT)
+        sender.join(30)
+        truth("and what the stopped shard could not take is counted dropped",
+              counted()["shard_dropped"] - before["shard_dropped"] > 0)
+        truth("and the publisher is still connected", pub.ping())
+        far.disconnect()
+        pub.disconnect()
+    guarded("hang", hang)
 
 if phase == "after":
     def after():
@@ -293,6 +396,7 @@ done
 tally < <(run stall "$FP")
 dr=$("$BIN" stats fl 2>&1 | awk -F: '$1=="shard_dropped"{s+=$2} END{print s+0}')
 [ "$dr" -eq 0 ] && ok || bad "a shard drops nothing on the way to one that stopped for a while" "dropped $dr"
+tally < <(run hang "$FP")
 "$BIN" remove fl >/dev/null 2>&1
 [ "$snaps" -eq 3 ] && ok || bad "each shard keeps a snapshot of its own" "$(find "$HOME" -name 'sh.snapshot*')"
 

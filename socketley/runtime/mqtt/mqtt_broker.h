@@ -71,6 +71,8 @@ struct broker_config
     // Where they go below $SYS/broker/, "shard/<i>/" for one shard of several.
     std::string sys_prefix;
     std::string version;
+    // One shard of several, whose publishers may wait for room on the way to the others; asked for nowhere else.
+    bool sharded{false};
 };
 
 // A session's waiting messages, read from a head index: it holds nothing until one waits, and little after.
@@ -319,6 +321,8 @@ public:
     // Ends a connection once what was sent has gone; disconnected() follows.
     virtual void close(uint64_t conn) = 0;
     virtual int64_t now_ms() const = 0;
+    // Stops reading a connection, or goes on, so the bytes of a publisher that is held wait in its socket.
+    virtual void pause_reading(uint64_t /*conn*/, bool /*paused*/) {}
 };
 
 class broker_hooks
@@ -354,9 +358,9 @@ public:
     // Whether this shard delivers a message to the shared group `key` ($share/<group>/<filter>) it has members of;
     // false when another shard with members was chosen.
     virtual bool shared_here(std::string_view /*key*/) { return true; }
-    // Whether the way to the other shards can take another message; while it cannot, publishers at QoS 1 and 2 are
-    // held, and room() lets them go on.
-    virtual bool publish_room() const { return true; }
+    // Whether the way to the other shards can take another message at `qos`; while it cannot, its publisher is held,
+    // and room() lets it go on.
+    virtual bool publish_room(uint8_t /*qos*/) const { return true; }
     // Whether a subscriber elsewhere would hear the topic, for the reason code a 5.0 publisher is answered with.
     virtual bool heard_elsewhere(std::string_view /*topic*/) { return false; }
     // A filter some session here subscribes to now and none did before, and the last one gone, for the shards that
@@ -419,7 +423,7 @@ public:
     std::vector<std::string> filters() const;
     // A retained message another shard set or cleared.
     void apply_retained(const std::string& topic, message_ptr m);
-    // There is room again: the publishers held for it go on.
+    // There may be room again: the publishers held for it that have some go on.
     void room();
     // A client disconnected by name, its session ended too when `end_session`; false when there is none.
     bool kick(std::string_view client_id, bool end_session);
@@ -537,8 +541,9 @@ private:
         bool        sent_disconnect{false};
         // Set when the connection ends without a will: a DISCONNECT 0x00, or a takeover that keeps the session.
         bool        no_will{false};
-        // Its next PUBLISH waits for room on the way to the other shards.
+        // Its next PUBLISH, at held_qos, waits for room on the way to the other shards.
         bool        held{false};
+        uint8_t     held_qos{0};
         uint64_t    generation{0};
         // The CONNECT while it is being answered; nothing once the connection is open.
         std::unique_ptr<connect_packet> pending;

@@ -44,13 +44,15 @@ enum class sverb : uint8_t
 constexpr size_t batch_bytes = 128u << 10;
 // What may be posted to one shard and not yet receipted.
 constexpr size_t flying_cap = 1u << 20;
-// What may wait here for one shard: past the first a publisher at QoS 1 or 2 is held, past the second a delivery
-// is dropped.
+// What may wait here for one shard: past the first a publisher is held, past the second a delivery at QoS 0 is
+// dropped.
 constexpr size_t hold_bytes = 4u << 20;
 constexpr size_t drop_bytes = 8u << 20;
 // A shard whose batches fail is asked again this often, and after this long counts as unreachable.
 constexpr int64_t resend_ms      = 250;
 constexpr int64_t unreachable_ms = 3000;
+// A shard that answers none of its batches for this long holds publishers at QoS 0 no longer.
+constexpr int64_t stall_ms = 1000;
 // How long a retained topic's last change is remembered, to tell an older one crossing a newer from behind.
 constexpr int64_t stamp_keep_ns = 10'000'000'000;
 
@@ -111,7 +113,7 @@ bool mqtt_run::queue_shard(uint32_t to, std::string_view frame, bool droppable)
     if (to >= m_squeue.size())
         return false;
     shard_queue& q = m_squeue[to];
-    if (droppable && (q.waiting() >= drop_bytes || unreachable(q)))
+    if (droppable && (q.waiting() >= drop_bytes || unreachable(q) || stalled(q)))
     {
         ++m_shard_dropped;
         return false;
@@ -127,6 +129,11 @@ bool mqtt_run::queue_shard(uint32_t to, std::string_view frame, bool droppable)
 bool mqtt_run::unreachable(const shard_queue& q) const
 {
     return q.failing_since && now_ms() - q.failing_since >= unreachable_ms;
+}
+
+bool mqtt_run::stalled(const shard_queue& q) const
+{
+    return q.flying && now_ms() - q.heard_ms >= stall_ms;
 }
 
 void mqtt_run::send_shard(uint32_t to)
@@ -156,6 +163,8 @@ void mqtt_run::send_shard(uint32_t to)
                                   frame_of(sverb::batch, me) + frames, request_class::client))
             break;
         q.head += cut;
+        if (!q.flying)
+            q.heard_ms = now_ms();
         q.flying += frames.size();
         m_shard_batches.emplace(cookie, shard_batch{to, std::move(frames)});
     }
@@ -179,7 +188,8 @@ void mqtt_run::send_shards()
     for (uint32_t j = 0; j < m_squeue.size(); ++j)
         if (m_squeue[j].waiting() > 0)
             send_shard(j);
-    if (m_broker && publish_room())
+    // Every turn and not only on a receipt, since a shard that stalls lets publishers at QoS 0 go on by the clock.
+    if (m_broker)
         m_broker->room();
 }
 
@@ -192,6 +202,7 @@ bool mqtt_run::shard_receipt(uint64_t cookie, request_status st)
     m_shard_batches.erase(it);
     shard_queue& q = m_squeue[b.to];
     q.flying -= std::min(q.flying, b.frames.size());
+    q.heard_ms = now_ms();
     if (st == request_status::ok)
         q.failing_since = 0;
     else
@@ -205,15 +216,16 @@ bool mqtt_run::shard_receipt(uint64_t cookie, request_status st)
         ++m_shard_resent;
     }
     send_shard(b.to);
-    if (m_broker && publish_room())
+    if (m_broker)
         m_broker->room();
     return true;
 }
 
-bool mqtt_run::publish_room() const
+bool mqtt_run::publish_room(uint8_t qos) const
 {
+    // A message at QoS 0 may be dropped, so it waits only for a shard that is still answering.
     for (const auto& q : m_squeue)
-        if (q.waiting() >= hold_bytes && !unreachable(q))
+        if (q.waiting() >= hold_bytes && !unreachable(q) && (qos > 0 || !stalled(q)))
             return false;
     return true;
 }
@@ -361,6 +373,10 @@ bool mqtt_run::shared_here(std::string_view key)
 void mqtt_run::share_message(const message_ptr& m)
 {
     if (!sharded() || m_peers.empty())
+        return;
+    // Most messages are for this shard alone, with no group decided for another and nobody elsewhere to hear them.
+    if (std::all_of(m_assign.begin(), m_assign.end(), [](const auto& a) { return a.empty(); }) &&
+        !heard_elsewhere(m->topic))
         return;
     const uint32_t n = m_owner.get_shards();
     const uint32_t me = m_owner.get_shard_index();

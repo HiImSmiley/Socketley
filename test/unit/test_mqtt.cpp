@@ -34,6 +34,13 @@ struct fake_io : broker_io
     }
     void close(uint64_t conn) override { closed.insert(conn); }
     int64_t now_ms() const override { return now; }
+    std::map<uint64_t, bool> paused;
+    std::map<uint64_t, int> resumed;
+    void pause_reading(uint64_t conn, bool p) override
+    {
+        paused[conn] = p;
+        resumed[conn] += p ? 0 : 1;
+    }
 };
 
 struct fake_hooks : broker_hooks
@@ -70,9 +77,18 @@ struct fake_hooks : broker_hooks
     {
         disconnects.push_back(c.client_id + ":" + std::string(why));
     }
-    void accepted(const message_ptr& m) override { accepted_topics.push_back(m->topic); }
+    void accepted(const message_ptr& m) override
+    {
+        accepted_topics.push_back(m->topic);
+        if (room_left > 0)
+            --room_left;
+    }
+    // Room for QoS 1 and 2, and for QoS 0, which a shard that stopped answering no longer holds; room_left counts
+    // the messages there is room for, when it is not -1.
     bool room{true};
-    bool publish_room() const override { return room; }
+    bool room0{true};
+    int room_left{-1};
+    bool publish_room(uint8_t qos) const override { return room_left != 0 && (qos ? room : room0); }
 };
 
 // What a test client reads back: every packet the broker wrote to it since the last look.
@@ -1149,11 +1165,13 @@ TEST_CASE("the subscription tree takes its wildcard levels away with their last 
     CHECK(topic_levels(deep).view().size() == 41);
 }
 
-TEST_CASE("a publisher at QoS 1 waits for room on the way to the other shards, one at QoS 0 does not")
+TEST_CASE("a publisher waits for room on the way to the other shards, and is not read meanwhile")
 {
-    rig r;
+    broker_config cfg;
+    cfg.sharded = true;
+    rig r(cfg);
     const uint64_t s = r.connect("s");
-    const uint64_t p = r.connect("p");
+    const uint64_t p = r.connect("p", level_311, true, 0, {}, 1);
     r.send(s, sub("t/#", 1));
     r.packets(s);
     r.packets(p);
@@ -1161,21 +1179,73 @@ TEST_CASE("a publisher at QoS 1 waits for room on the way to the other shards, o
     r.send(p, pub("t/a", "held", 1, 5) + pub("t/b", "behind", 1, 6));
     CHECK(r.packets(p).empty());
     CHECK(r.packets(s).empty());
+    CHECK(r.io.paused[p]);
     r.send(p, pub("t/c", "later", 1, 7));
     CHECK(r.packets(p).empty());
-    // Room again: what waited goes on, in order, each answered once.
+    // Its keep alive is a second, and while it is not read its silence is the broker's.
+    r.io.now += 10000;
+    r.b->tick();
+    CHECK(r.io.closed.count(p) == 0);
+    // Room again: what waited goes on, in order, each answered once, and the connection is read again.
     r.hooks.room = true;
     r.b->room();
+    CHECK_FALSE(r.io.paused[p]);
     const auto acks = r.packets(p);
     REQUIRE(acks.size() == 3);
     const auto got = r.packets(s);
     REQUIRE(got.size() == 3);
     CHECK(publish_of(got[0], level_311).payload == "held");
     CHECK(publish_of(got[2], level_311).payload == "later");
-    // QoS 0 asks for no answer, so nothing holds it.
+    r.b->tick();
+    CHECK(r.io.closed.count(p) == 0);
+
+    // A shard that stopped answering holds QoS 0 no longer, while QoS 1 still waits for it.
     r.hooks.room = false;
     r.send(p, pub("t/d", "free", 0));
     const auto free = r.packets(s);
     REQUIRE(free.size() == 1);
     CHECK(publish_of(free[0], level_311).payload == "free");
+
+    // One that is answering, only slower, holds QoS 0 too, until there is room for it.
+    r.hooks.room = true;
+    r.hooks.room0 = false;
+    r.send(p, pub("t/e", "slow", 0));
+    CHECK(r.packets(s).empty());
+    CHECK(r.io.paused[p]);
+    r.b->room();
+    CHECK(r.packets(s).empty());
+    CHECK(r.io.paused[p]);
+    r.hooks.room0 = true;
+    r.b->room();
+    const auto slow = r.packets(s);
+    REQUIRE(slow.size() == 1);
+    CHECK(publish_of(slow[0], level_311).payload == "slow");
+    CHECK_FALSE(r.io.paused[p]);
+}
+
+TEST_CASE("a held publisher is read again only once what waited of it has gone on")
+{
+    broker_config cfg;
+    cfg.sharded = true;
+    rig r(cfg);
+    const uint64_t s = r.connect("s");
+    const uint64_t p = r.connect("p");
+    r.send(s, sub("t/#", 1));
+    r.packets(s);
+    r.packets(p);
+    r.hooks.room = false;
+    r.send(p, pub("t/a", "one", 1, 5) + pub("t/b", "two", 1, 6) + pub("t/c", "three", 1, 7));
+    CHECK(r.io.paused[p]);
+    // Room for one message: it goes on, the next is held again, and the socket stays unread meanwhile.
+    r.hooks.room = true;
+    r.hooks.room_left = 1;
+    r.b->room();
+    CHECK(r.packets(s).size() == 1);
+    CHECK(r.io.paused[p]);
+    CHECK(r.io.resumed[p] == 0);
+    r.hooks.room_left = -1;
+    r.b->room();
+    CHECK(r.packets(s).size() == 2);
+    CHECK_FALSE(r.io.paused[p]);
+    CHECK(r.io.resumed[p] == 1);
 }

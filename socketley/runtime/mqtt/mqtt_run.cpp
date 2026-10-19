@@ -171,7 +171,8 @@ bool mqtt_run::start(std::string& why)
     cfg.version            = SOCKETLEY_VERSION;
     cfg.sys_interval_s     = 10;
     // A shard of several publishes its own figures under its number, and every shard keeps them all.
-    if (m_owner.get_shards() > 1)
+    cfg.sharded            = m_owner.get_shards() > 1;
+    if (cfg.sharded)
         cfg.sys_prefix = "shard/" + std::to_string(m_owner.get_shard_index()) + "/";
     m_broker = std::make_unique<broker>(cfg, *this, *this);
 
@@ -426,7 +427,7 @@ const mqtt_run::conn* mqtt_run::find(uint64_t id) const
 
 void mqtt_run::arm_read(conn& c)
 {
-    if (c.dead || c.rd_pending || c.fd < 0)
+    if (c.dead || c.rd_pending || c.fd < 0 || c.paused)
         return;
     c.rd        = io_request{};
     c.rd.owner  = this;
@@ -457,8 +458,12 @@ void mqtt_run::read_done(conn& c, struct io_uring_cqe* cqe)
     if (c.rd.type == op_recv_multishot)
     {
         const bool more = cqe->flags & IORING_CQE_F_MORE;
+        const bool was_withdrawing = c.withdrawing;
         if (!more)
+        {
             c.rd_pending = false;
+            c.withdrawing = false;
+        }
         if (res > 0)
         {
             m_loop.for_each_cqe_buf(ring_group, cqe, [&](const char* p, uint32_t n) {
@@ -480,6 +485,12 @@ void mqtt_run::read_done(conn& c, struct io_uring_cqe* cqe)
                 c.rearm = true;
             return;
         }
+        // Taken back by withdraw_read(), and armed again here when the connection went on before it came back.
+        if (res == -ECANCELED && !more && was_withdrawing)
+        {
+            arm_read(c);
+            return;
+        }
         if (res <= 0)
         {
             close_conn(c);
@@ -487,6 +498,8 @@ void mqtt_run::read_done(conn& c, struct io_uring_cqe* cqe)
         }
         if (!more)
             arm_read(c);
+        else if (c.paused)
+            withdraw_read(c);
         return;
     }
     c.rd_pending = false;
@@ -758,6 +771,25 @@ void mqtt_run::send_parts(uint64_t id, std::string_view head, const std::shared_
     c->queue.emplace_back(owner, off, static_cast<uint32_t>(body.size()));
     c->owed += body.size();
     flush(*c);
+}
+
+void mqtt_run::pause_reading(uint64_t id, bool paused)
+{
+    conn* c = find(id);
+    if (!c || c->dead || c->paused == paused)
+        return;
+    c->paused = paused;
+    if (paused)
+        withdraw_read(*c);
+    else
+        arm_read(*c);
+}
+
+void mqtt_run::withdraw_read(conn& c)
+{
+    // A single read ends by itself and is not armed again; one the ring would not take back is asked at its next.
+    if (c.rd_pending && c.rd.type == op_recv_multishot && !c.withdrawing)
+        c.withdrawing = m_loop.submit_cancel_request(&c.rd);
 }
 
 size_t mqtt_run::backlog(uint64_t id) const

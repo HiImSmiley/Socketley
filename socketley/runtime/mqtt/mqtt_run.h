@@ -66,6 +66,7 @@ public:
     size_t backlog(uint64_t conn) const override;
     void close(uint64_t conn) override;
     int64_t now_ms() const override;
+    void pause_reading(uint64_t conn, bool paused) override;
 
     // ── broker_hooks ────────────────────────────────────────────────────────
     void authenticate(const auth_ask& ask, std::function<void(auth_answer)> done) override;
@@ -83,7 +84,7 @@ public:
     void accepted(const message_ptr& m) override;
     void retained_changed(const std::string& topic, const message_ptr& now) override;
     bool shared_here(std::string_view key) override;
-    bool publish_room() const override;
+    bool publish_room(uint8_t qos) const override;
     bool heard_elsewhere(std::string_view topic) override;
     void filter_added(const std::string& filter) override;
     void filter_removed(const std::string& filter) override;
@@ -102,6 +103,9 @@ private:
         // The ring had no buffer to give, or no room for a write, so it is asked again on a later turn.
         bool rearm{false};
         bool reflush{false};
+        // The broker holds its next packet, so it is not read until it may go on; a multishot read is being taken back.
+        bool paused{false};
+        bool withdrawing{false};
         // A read buffer of its own, only where the buffer ring cannot be used.
         std::unique_ptr<char[]> rbuf;
         // Bytes not yet gone, oldest first: the ones queued since the last write, and the ones the ring is sending
@@ -149,6 +153,7 @@ private:
     conn* find(uint64_t id);
     const conn* find(uint64_t id) const;
     void arm_read(conn& c);
+    void withdraw_read(conn& c);
     void read_done(conn& c, struct io_uring_cqe* cqe);
     void bytes_in(conn& c, const char* p, size_t n);
     void tls_in(conn& c, const char* p, size_t n);
@@ -190,6 +195,8 @@ private:
         size_t      flying{0};
         int64_t     failing_since{0};
         int64_t     retry_at{0};
+        // When a receipt last came, or the first batch since the last went out.
+        int64_t     heard_ms{0};
         size_t waiting() const { return pending.size() - head; }
     };
     struct shard_batch
@@ -202,6 +209,8 @@ private:
     void send_shard(uint32_t to);
     void send_shards();
     bool unreachable(const shard_queue& q) const;
+    // Handed batches and answered none of them for a while, as a shard that is stopped does.
+    bool stalled(const shard_queue& q) const;
     // True when the cookie was a batch's, whatever its answer.
     bool shard_receipt(uint64_t cookie, request_status st);
     // One word from another shard, alone or out of a batch; `reply` is what a question is answered with.

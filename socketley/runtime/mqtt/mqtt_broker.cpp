@@ -257,15 +257,18 @@ size_t broker::consume(connection& c, std::string_view in)
             break;
         }
         c.last_rx_ms = now;
-        // A publisher waiting for answers is held while the other shards cannot take more, and its bytes wait here,
-        // rather than its messages being dropped on the way; it is alive, so its keep alive goes on counting.
-        if (f.type == packet_type::publish && (f.flags & 0x06) && c.ph == connection::phase::open &&
-            !m_hooks.publish_room())
+        // A publisher is held while the other shards cannot take more, its bytes waiting in its socket rather than its
+        // messages being dropped on the way.
+        const uint8_t qos = static_cast<uint8_t>((f.flags >> 1) & 3);
+        if (m_cfg.sharded && f.type == packet_type::publish && c.ph == connection::phase::open &&
+            !m_hooks.publish_room(qos))
         {
+            c.held_qos = qos;
             if (!c.held)
             {
                 c.held = true;
                 m_held.push_back(c.id);
+                m_io.pause_reading(c.id, true);
             }
             break;
         }
@@ -799,12 +802,24 @@ void broker::room()
     std::vector<uint64_t> held;
     held.swap(m_held);
     for (const uint64_t id : held)
-        if (connection* c = conn_of(id); c && c->held)
+    {
+        connection* c = conn_of(id);
+        if (!c || !c->held)
+            continue;
+        if (!m_hooks.publish_room(c->held_qos))
         {
-            c->held = false;
-            if (!c->busy && !c->processing)
-                process(*c);
+            m_held.push_back(id);
+            continue;
         }
+        c->held = false;
+        // Its silence while it was held was not its own.
+        c->last_rx_ms = m_io.now_ms();
+        if (!c->busy && !c->processing)
+            process(*c);
+        // Read again only once what waited is taken, or a publisher held again at once would pile up its socket here.
+        if (connection* again = conn_of(id); again && !again->held)
+            m_io.pause_reading(id, false);
+    }
 }
 
 void broker::deliver_remote(const message_ptr& m, const std::vector<std::string>& groups)
@@ -1409,7 +1424,8 @@ void broker::tick()
         if ((c->ph == connection::phase::awaiting_connect || c->ph == connection::phase::authenticating) &&
             now - c->opened_ms > m_cfg.connect_timeout_ms)
             late.push_back(id);
-        else if (c->ph == connection::phase::open && c->keepalive &&
+        // A held connection is not read, so its silence is this broker's and not its own.
+        else if (c->ph == connection::phase::open && c->keepalive && !c->held &&
                  now - c->last_rx_ms > static_cast<int64_t>(c->keepalive) * 1500)
             silent.push_back(id);
     }
