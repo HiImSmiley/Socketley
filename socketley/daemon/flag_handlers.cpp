@@ -22,6 +22,7 @@
 #include "../runtime/sync/sync_instance.h"
 #include "../runtime/idp/idp_instance.h"
 #include "../runtime/db/db_instance.h"
+#include "../runtime/mqtt/mqtt_instance.h"
 #include "../runtime/idp/idp_logic.h"
 #include "../shared/net/ip_block.h"
 #include "../shared/net/dns_feed.h"
@@ -1827,6 +1828,144 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
             }
             ++i;
             db->set_backup_keep(n);
+            return 0;
+        }
+        default:
+            return -1;
+    }
+}
+
+int parse_mqtt_flags(mqtt_instance* mq, const parsed_args& pa, size_t& i, std::string_view /*name*/)
+{
+    const std::string_view next = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+    // A whole number from `lo` to `hi`, said wrong as `usage`.
+    const auto count = [&](uint64_t lo, uint64_t hi, const char* usage, uint64_t& out) {
+        const auto r = std::from_chars(next.data(), next.data() + next.size(), out);
+        if (next.empty() || r.ec != std::errc() || r.ptr != next.data() + next.size() || out < lo || out > hi)
+        {
+            std::cout << usage;
+            return false;
+        }
+        ++i;
+        return true;
+    };
+    const auto file = [&](const char* usage, void (mqtt_instance::*set)(std::string_view)) {
+        if (next.empty() || next.front() != '/')
+        {
+            std::cout << usage;
+            return 1;
+        }
+        (mq->*set)(pa.args[++i]);
+        return 0;
+    };
+    switch (pa.hashes[i])
+    {
+        // Accounts with a password, `user:hash` a line.
+        case fnv1a("--users"):
+            return file("--users requires the absolute path of a file socketley mqtt-passwd writes\n",
+                        &mqtt_instance::set_users);
+        // Who may publish and subscribe to what.
+        case fnv1a("--acl"):
+            return file("--acl requires the absolute path of a file of user, topic and pattern lines\n",
+                        &mqtt_instance::set_acl);
+        // Where messages go besides their subscribers.
+        case fnv1a("--routes"):
+            return file("--routes requires the absolute path of a file of topic rules, `filter -> target` a line\n",
+                        &mqtt_instance::set_routes);
+        // The idp runtime whose access tokens sign clients in.
+        case fnv1a("--idp"):
+            if (next.empty() || next.find_first_of("/ ") != std::string_view::npos)
+            {
+                std::cout << "--idp requires the name of an idp runtime of this daemon\n";
+                return 1;
+            }
+            mq->set_idp(pa.args[++i]);
+            return 0;
+        case fnv1a("--anonymous"):
+            mq->set_anonymous(true);
+            return 0;
+        // A second port, for browsers, speaking MQTT inside WebSocket.
+        case fnv1a("--ws"):
+        {
+            uint64_t port = 0;
+            if (!count(1, 65535, "--ws requires a port from 1 to 65535\n", port))
+                return 1;
+            mq->set_ws_port(static_cast<uint16_t>(port));
+            return 0;
+        }
+        // The snapshot file, `on` for one under the state directory.
+        case fnv1a("--persistent"):
+            if (next != "on" && (next.empty() || next.front() != '/'))
+            {
+                std::cout << "--persistent requires the absolute path of a file, or on for one under the state "
+                             "directory\n";
+                return 1;
+            }
+            mq->set_persistent(pa.args[++i]);
+            return 0;
+        case fnv1a("--persistent-interval"):
+        {
+            uint64_t secs = 0;
+            if (!take_duration(pa, i, 1, 3600, "--persistent-interval requires how often, from 1s to 1h\n", secs))
+                return 1;
+            mq->set_persist_interval(static_cast<uint32_t>(secs));
+            return 0;
+        }
+        case fnv1a("--max-packet"):
+        {
+            size_t bytes = 0;
+            if (next.empty() || !parse_size_suffix(next, bytes) || bytes < 64 || bytes > 268435455)
+            {
+                std::cout << "--max-packet requires a size from 64 bytes to 256M, such as 1M\n";
+                return 1;
+            }
+            ++i;
+            mq->set_max_packet(static_cast<uint32_t>(bytes));
+            return 0;
+        }
+        case fnv1a("--session-expiry"):
+        {
+            uint64_t secs = 0;
+            if (!take_duration(pa, i, 0, 0xFFFFFFFEull, "--session-expiry requires a duration such as 1d, or 0\n",
+                               secs))
+                return 1;
+            mq->set_session_expiry(static_cast<uint32_t>(secs));
+            return 0;
+        }
+        case fnv1a("--session-queue"):
+        {
+            uint64_t n = 0;
+            if (!count(1, 10000000, "--session-queue requires how many messages, from 1\n", n))
+                return 1;
+            mq->set_session_queue(static_cast<uint32_t>(n));
+            return 0;
+        }
+        case fnv1a("--retained-max"):
+        {
+            size_t bytes = 0;
+            if (next.empty() || !parse_size_suffix(next, bytes))
+            {
+                std::cout << "--retained-max requires a size such as 64M\n";
+                return 1;
+            }
+            ++i;
+            mq->set_retained_max(bytes);
+            return 0;
+        }
+        case fnv1a("--max-sessions"):
+        {
+            uint64_t n = 0;
+            if (!count(1, 100000000, "--max-sessions requires how many, from 1\n", n))
+                return 1;
+            mq->set_max_sessions(static_cast<uint32_t>(n));
+            return 0;
+        }
+        case fnv1a("--keepalive-max"):
+        {
+            uint64_t n = 0;
+            if (!count(1, 65535, "--keepalive-max requires seconds from 1 to 65535\n", n))
+                return 1;
+            mq->set_keepalive_max(static_cast<uint16_t>(n));
             return 0;
         }
         default:

@@ -2700,6 +2700,160 @@ def dns_seeds():
     }
 
 
+# ── MQTT ────────────────────────────────────────────────────────────────────
+# Packets as test/integration/lib_mqtt.py and the Mosquitto clients send them,
+# and broker programs for the odd-first-byte half of fuzz_mqtt.cpp: records of
+# [op][conn][len lo][len hi][bytes], op 0 bytes in, 1 the connection ends, 2 the
+# clock moves, 3 the connection stops reading, 4 a snapshot is read back.
+
+def mq_varint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def mq_str(s):
+    s = s.encode() if isinstance(s, str) else s
+    return struct.pack(">H", len(s)) + s
+
+
+def mq_packet(first, body):
+    return bytes([first]) + mq_varint(len(body)) + body
+
+
+def mq_props(*pairs):
+    body = b"".join(bytes([i]) + v for i, v in pairs)
+    return mq_varint(len(body)) + body
+
+
+def mq_connect(cid, level=4, clean=True, keepalive=60, will=None, user=None, pw=None, props=None, will_props=None):
+    flags = 0x02 if clean else 0
+    if will:
+        topic, msg, qos, retain = will
+        flags |= 0x04 | (qos << 3) | (0x20 if retain else 0)
+    if pw is not None:
+        flags |= 0x40
+    if user is not None:
+        flags |= 0x80
+    body = mq_str("MQIsdp" if level == 3 else "MQTT") + bytes([level, flags]) + struct.pack(">H", keepalive)
+    if level == 5:
+        body += props if props is not None else mq_props()
+    body += mq_str(cid)
+    if will:
+        if level == 5:
+            body += will_props if will_props is not None else mq_props()
+        body += mq_str(will[0]) + mq_str(will[1])
+    if user is not None:
+        body += mq_str(user)
+    if pw is not None:
+        body += mq_str(pw)
+    return mq_packet(0x10, body)
+
+
+def mq_publish(topic, payload, qos=0, pid=0, retain=False, dup=False, level=4, props=None):
+    first = 0x30 | (qos << 1) | (0x08 if dup else 0) | (0x01 if retain else 0)
+    body = mq_str(topic) + (struct.pack(">H", pid) if qos else b"")
+    if level == 5:
+        body += props if props is not None else mq_props()
+    payload = payload.encode() if isinstance(payload, str) else payload
+    return mq_packet(first, body + payload)
+
+
+def mq_subscribe(pid, entries, level=4, props=None):
+    body = struct.pack(">H", pid)
+    if level == 5:
+        body += props if props is not None else mq_props()
+    for f, opts in entries:
+        body += mq_str(f) + bytes([opts])
+    return mq_packet(0x82, body)
+
+
+def mq_unsubscribe(pid, filters, level=4):
+    body = struct.pack(">H", pid) + (mq_props() if level == 5 else b"")
+    for f in filters:
+        body += mq_str(f)
+    return mq_packet(0xA2, body)
+
+
+def mq_ack(kind, pid, level=4, reason=None):
+    first = {"puback": 0x40, "pubrec": 0x50, "pubrel": 0x62, "pubcomp": 0x70}[kind]
+    body = struct.pack(">H", pid)
+    if level == 5 and reason is not None:
+        body += bytes([reason]) + mq_props()
+    return mq_packet(first, body)
+
+
+def mq_rec(op, conn, data=b""):
+    return bytes([op, conn, len(data) & 0xFF, len(data) >> 8]) + data
+
+
+def mqtt_seeds():
+    v5 = 5
+    expiry = mq_props((0x11, struct.pack(">I", 3600)), (0x21, struct.pack(">H", 4)))
+    pub_props = mq_props((0x02, struct.pack(">I", 30)), (0x03, mq_str("text/plain")),
+                         (0x26, mq_str("k") + mq_str("v")), (0x23, struct.pack(">H", 1)))
+    seeds = {
+        "codec_connect_311": b"\0" + mq_connect("dev-1", user="alice", pw="secret"),
+        "codec_connect_31": b"\0" + mq_connect("old", level=3),
+        "codec_connect_will": b"\0" + mq_connect("w", will=("wills/w", "gone", 1, True)),
+        "codec_connect_5": b"\2" + mq_connect("dev-5", level=v5, props=expiry, clean=False,
+                                              will=("w/5", "x", 2, False),
+                                              will_props=mq_props((0x18, struct.pack(">I", 5)))),
+        "codec_connect_reserved_flag": b"\0" + mq_packet(0x10, mq_str("MQTT") + bytes([4, 0x03, 0, 60]) + mq_str("x")),
+        "codec_connect_level_6": b"\0" + mq_packet(0x10, mq_str("MQTT") + bytes([6, 0x02, 0, 60]) + mq_str("x")),
+        "codec_publish_qos": b"\0" + mq_publish("a/b", "0") + mq_publish("a/b", "1", 1, 1) +
+                             mq_publish("a/b", "2", 2, 2, retain=True) + mq_publish("a/b", "3", 1, 3, dup=True),
+        "codec_publish_props": b"\2" + mq_publish("t/5", "hello", 1, 9, level=v5, props=pub_props),
+        "codec_publish_alias_only": b"\2" + mq_publish("", "x", 0, level=v5,
+                                                        props=mq_props((0x23, struct.pack(">H", 1)))),
+        "codec_publish_dup_prop": b"\2" + mq_publish("t", "x", 0, level=v5,
+                                                      props=mq_props((0x03, mq_str("a")), (0x03, mq_str("b")))),
+        "codec_publish_wildcard": b"\0" + mq_publish("a/+", "x"),
+        "codec_subscribe": b"\0" + mq_subscribe(1, [("a/#", 1), ("+/b", 0), ("$share/g/x", 2)]),
+        "codec_subscribe_5": b"\2" + mq_subscribe(2, [("a", 0x2C | 1)], level=v5,
+                                                    props=mq_props((0x0B, mq_varint(7)))),
+        "codec_unsubscribe": b"\0" + mq_unsubscribe(3, ["a/#", "b"]),
+        "codec_acks": b"\0" + mq_ack("puback", 1) + mq_ack("pubrec", 2) + mq_ack("pubrel", 2) + mq_ack("pubcomp", 2),
+        "codec_acks_5": b"\2" + mq_ack("puback", 1, v5, 0x10) + mq_ack("pubrec", 2, v5, 0x87),
+        "codec_ping_disconnect": b"\0" + b"\xc0\x00\xe0\x00",
+        "codec_disconnect_5": b"\2" + mq_packet(0xE0, b"\x04" + mq_props((0x11, struct.pack(">I", 10)))),
+        "codec_auth_5": b"\2" + mq_packet(0xF0, b"\x18" + mq_props((0x15, mq_str("SCRAM")))),
+        "codec_varint_five": b"\0" + b"\x30\xff\xff\xff\xff\x01",
+        "codec_truncated": b"\0" + mq_publish("a/b", "payload")[:-3],
+        "broker_pubsub": b"\1" + mq_rec(0, 0, mq_connect("s") + mq_subscribe(1, [("t/#", 2)])) +
+                         mq_rec(0, 1, mq_connect("p") + mq_publish("t/x", "q0") + mq_publish("t/x", "q1", 1, 1) +
+                                mq_publish("t/x", "q2", 2, 2) + mq_ack("pubrel", 2)) +
+                         mq_rec(0, 0, mq_ack("puback", 1) + mq_ack("pubrec", 2) + mq_ack("pubcomp", 2)),
+        "broker_session_back": b"\1" + mq_rec(0, 0, mq_connect("keep", clean=False) + mq_subscribe(1, [("n", 1)])) +
+                               mq_rec(1, 0) + mq_rec(0, 1, mq_connect("p") + mq_publish("n", "missed", 1, 1)) +
+                               mq_rec(0, 0, mq_connect("keep", clean=False)) + mq_rec(4, 0),
+        "broker_will_and_expiry": b"\1" + mq_rec(0, 0, mq_connect("w", level=v5, props=expiry,
+                                                                     will=("wills/w", "x", 1, True),
+                                                                     will_props=mq_props((0x18, struct.pack(">I", 2))))) +
+                                  mq_rec(0, 1, mq_connect("watch", level=v5) +
+                                         mq_subscribe(1, [("wills/#", 1)], level=v5)) +
+                                  mq_rec(1, 0) + mq_rec(2, 0, b"\0" * 300) + mq_rec(4, 0),
+        "broker_retained": b"\1" + mq_rec(0, 0, mq_connect("r") + mq_publish("s/1", "on", retain=True) +
+                                          mq_publish("s/2", "off", 1, 1, retain=True) + mq_publish("s/1", "", retain=True)) +
+                           mq_rec(0, 1, mq_connect("n") + mq_subscribe(1, [("s/+", 1)])) + mq_rec(4, 0),
+        "broker_takeover": b"\1" + mq_rec(0, 0, mq_connect("same", level=v5, props=expiry, clean=False)) +
+                           mq_rec(0, 1, mq_connect("same", level=v5, props=expiry, clean=False)),
+        "broker_slow_reader": b"\1" + mq_rec(0, 0, mq_connect("slow") + mq_subscribe(1, [("#", 1)])) + mq_rec(3, 0) +
+                              mq_rec(0, 1, mq_connect("p") + b"".join(mq_publish("x", str(i), 1, i + 1) for i in range(12))) +
+                              mq_rec(3, 0),
+        "broker_refused": b"\1" + mq_rec(0, 0, mq_connect("x", user="no", pw="p")) +
+                          mq_rec(0, 1, mq_subscribe(1, [("a", 0)])),
+        "broker_shared": b"\1" + mq_rec(0, 0, mq_connect("w1") + mq_subscribe(1, [("$share/g/j/#", 1)])) +
+                         mq_rec(0, 1, mq_connect("w2") + mq_subscribe(1, [("$share/g/j/#", 1)])) +
+                         mq_rec(0, 2, mq_connect("p") + mq_publish("j/1", "a", 1, 1) + mq_publish("j/2", "b", 1, 2)),
+    }
+    return seeds
+
+
 def main(argv):
     root = argv[1] if len(argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus")
     total = 0
@@ -2713,7 +2867,8 @@ def main(argv):
                         ("raftmsg", raftmsg_seeds()),
                         ("s3sigv4", s3sigv4_seeds()),
                         ("bucketpolicy", bucketpolicy_seeds()),
-                        ("dns", dns_seeds())):
+                        ("dns", dns_seeds()),
+                        ("mqtt", mqtt_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

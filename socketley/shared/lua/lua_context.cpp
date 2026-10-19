@@ -8,6 +8,8 @@
 #include "lua_suspend.h"
 #include "lua_storage_api.h"
 #include "lua_db_api.h"
+#include "lua_mqtt_api.h"
+#include "../../runtime/mqtt/mqtt_lua_table.h"
 #include "../util/settings.h"
 
 // Outside the SOCKETLEY_NO_LUA guard: the no-Lua SDK compiles this file too,
@@ -656,6 +658,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_http_request       = m_lua["on_http_request"];
     m_on_request            = m_lua["on_request"];
     m_on_put                = m_lua["on_put"];
+    m_on_publish            = m_lua["on_publish"];
+    m_on_subscribe          = m_lua["on_subscribe"];
 
     // Build callback bitmask for O(1) has_on_*() checks
     m_callback_mask = 0;
@@ -689,6 +693,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     if (m_on_http_request.valid())       m_callback_mask |= CB_ON_HTTP_REQUEST;
     if (m_on_request.valid())            m_callback_mask |= CB_ON_REQUEST;
     if (m_on_put.valid())                m_callback_mask |= CB_ON_PUT;
+    if (m_on_publish.valid())            m_callback_mask |= CB_ON_PUBLISH;
+    if (m_on_subscribe.valid())          m_callback_mask |= CB_ON_SUBSCRIBE;
 
     // The filter chain, where a malformed entry refuses the script rather than
     // being skipped, because a quietly dropped filter is a runtime that admits
@@ -968,6 +974,8 @@ void lua_context::cancel_timers()
         m_storage_client->cancel();
     if (m_db_client)
         m_db_client->cancel();
+    if (m_mqtt_client)
+        m_mqtt_client->cancel();
 }
 
 void lua_context::update_self_state(const char* state_str)
@@ -2975,6 +2983,9 @@ void lua_context::register_bindings(runtime_instance* owner)
     if (!m_db_client)
         m_db_client = std::make_unique<lua_db_client>(*this, *owner);
     m_db_client->install(m_lua, sk);
+    if (!m_mqtt_client)
+        m_mqtt_client = std::make_unique<lua_mqtt_client>(*this, *owner);
+    m_mqtt_client->install(m_lua, sk);
 
     // Last and over the top of the bindings above, so the two builds differ in
     // one place and the list of what is refused is readable in one place.
@@ -3006,6 +3017,9 @@ void lua_context::register_bindings(runtime_instance* owner)
             break;
         case runtime_proxy:
             register_proxy_table(owner, self);
+            break;
+        case runtime_mqtt:
+            socketley::mqtt::register_lua_table(owner, m_lua, self);
             break;
         case runtime_storage:
         case runtime_dns:

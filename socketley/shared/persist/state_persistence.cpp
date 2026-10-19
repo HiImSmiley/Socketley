@@ -13,6 +13,7 @@
 #include "../../runtime/sync/sync_instance.h"
 #include "../../runtime/idp/idp_instance.h"
 #include "../../runtime/db/db_instance.h"
+#include "../../runtime/mqtt/mqtt_instance.h"
 #include "../../cli/command_hashing.h"
 #include "../runtime/type_registry.h"
 
@@ -724,6 +725,25 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.db_backup_keep = db->get_backup_keep();
             break;
         }
+        case runtime_mqtt:
+        {
+            auto* mq = static_cast<const mqtt_instance*>(instance);
+            cfg.mqtt_users = std::string(mq->get_users());
+            cfg.mqtt_idp = std::string(mq->get_idp());
+            cfg.mqtt_acl = std::string(mq->get_acl());
+            cfg.mqtt_routes = std::string(mq->get_routes());
+            cfg.mqtt_anonymous = mq->get_anonymous();
+            cfg.mqtt_ws_port = mq->get_ws_port();
+            cfg.mqtt_max_packet = mq->get_max_packet();
+            cfg.mqtt_session_expiry = mq->get_session_expiry();
+            cfg.mqtt_session_queue = mq->get_session_queue();
+            cfg.mqtt_retained_max = mq->get_retained_max();
+            cfg.mqtt_max_sessions = mq->get_max_sessions();
+            cfg.mqtt_keepalive_max = mq->get_keepalive_max();
+            cfg.persistent_path = std::string(mq->get_persistent());
+            cfg.persistent_interval = mq->get_persist_interval();
+            break;
+        }
         case runtime_storage:
         {
             auto* stg = static_cast<const storage_instance*>(instance);
@@ -1119,6 +1139,29 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             append_int_field("backup_every", cfg.db_backup_every);
             append_int_field("backup_keep", cfg.db_backup_keep);
             break;
+        case runtime_mqtt:
+            if (!cfg.mqtt_users.empty())
+                append_str_field("users", cfg.mqtt_users);
+            if (!cfg.mqtt_idp.empty())
+                append_str_field("idp", cfg.mqtt_idp);
+            if (!cfg.mqtt_acl.empty())
+                append_str_field("acl", cfg.mqtt_acl);
+            if (!cfg.mqtt_routes.empty())
+                append_str_field("routes", cfg.mqtt_routes);
+            if (cfg.mqtt_anonymous)
+                append_bool_field("anonymous", true);
+            if (cfg.mqtt_ws_port)
+                append_int_field("ws_port", cfg.mqtt_ws_port);
+            append_int_field("max_packet", cfg.mqtt_max_packet);
+            append_int_field("session_expiry", cfg.mqtt_session_expiry);
+            append_int_field("session_queue", cfg.mqtt_session_queue);
+            append_int_field("retained_max", cfg.mqtt_retained_max);
+            append_int_field("max_sessions", cfg.mqtt_max_sessions);
+            append_int_field("keepalive_max", cfg.mqtt_keepalive_max);
+            if (!cfg.persistent_path.empty())
+                append_str_field("persistent_path", cfg.persistent_path);
+            append_int_field("persistent_interval", cfg.persistent_interval);
+            break;
     }
 
     // A registered type's fields as one nested object, absent when there are
@@ -1345,6 +1388,22 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.db_backup_dir = json_get_string(json, "backup_dir");
             cfg.db_backup_every = json_get_uint32(json, "backup_every", 86400);
             cfg.db_backup_keep = json_get_uint32(json, "backup_keep", 7);
+            break;
+        case runtime_mqtt:
+            cfg.mqtt_users = json_get_string(json, "users");
+            cfg.mqtt_idp = json_get_string(json, "idp");
+            cfg.mqtt_acl = json_get_string(json, "acl");
+            cfg.mqtt_routes = json_get_string(json, "routes");
+            cfg.mqtt_anonymous = json_get_bool(json, "anonymous");
+            cfg.mqtt_ws_port = static_cast<uint16_t>(json_get_uint32(json, "ws_port"));
+            cfg.mqtt_max_packet = json_get_uint32(json, "max_packet", 256u << 10);
+            cfg.mqtt_session_expiry = json_get_uint32(json, "session_expiry", 86400);
+            cfg.mqtt_session_queue = json_get_uint32(json, "session_queue", 1000);
+            cfg.mqtt_retained_max = json_get_size(json, "retained_max", 64ull << 20);
+            cfg.mqtt_max_sessions = json_get_uint32(json, "max_sessions", 100000);
+            cfg.mqtt_keepalive_max = static_cast<uint16_t>(json_get_uint32(json, "keepalive_max", 1200));
+            cfg.persistent_path = json_get_string(json, "persistent_path");
+            cfg.persistent_interval = json_get_uint32(json, "persistent_interval", 1);
             break;
     }
 

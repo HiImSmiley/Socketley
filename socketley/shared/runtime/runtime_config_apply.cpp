@@ -12,6 +12,7 @@
 #include "../../runtime/sync/sync_instance.h"
 #include "../../runtime/idp/idp_instance.h"
 #include "../../runtime/db/db_instance.h"
+#include "../../runtime/mqtt/mqtt_instance.h"
 
 void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
                         bool by_presence)
@@ -182,6 +183,42 @@ void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presenc
         db.set_backup_every(cfg.db_backup_every);
     if (asked("backup_keep", true))
         db.set_backup_keep(cfg.db_backup_keep);
+}
+
+void apply_mqtt_config(mqtt_instance& mq, const runtime_config& cfg, bool by_presence)
+{
+    auto asked = [&](std::string_view key, bool nondefault) {
+        return by_presence ? cfg.has(key) : nondefault;
+    };
+    static const runtime_config defaults;
+    if (asked("users", !cfg.mqtt_users.empty()))
+        mq.set_users(cfg.mqtt_users);
+    if (asked("idp", !cfg.mqtt_idp.empty()))
+        mq.set_idp(cfg.mqtt_idp);
+    if (asked("acl", !cfg.mqtt_acl.empty()))
+        mq.set_acl(cfg.mqtt_acl);
+    if (asked("routes", !cfg.mqtt_routes.empty()))
+        mq.set_routes(cfg.mqtt_routes);
+    if (asked("anonymous", cfg.mqtt_anonymous))
+        mq.set_anonymous(cfg.mqtt_anonymous);
+    if (asked("ws_port", cfg.mqtt_ws_port != 0))
+        mq.set_ws_port(cfg.mqtt_ws_port);
+    if (asked("max_packet", cfg.mqtt_max_packet != defaults.mqtt_max_packet))
+        mq.set_max_packet(cfg.mqtt_max_packet);
+    if (asked("session_expiry", cfg.mqtt_session_expiry != defaults.mqtt_session_expiry))
+        mq.set_session_expiry(cfg.mqtt_session_expiry);
+    if (asked("session_queue", cfg.mqtt_session_queue != defaults.mqtt_session_queue))
+        mq.set_session_queue(cfg.mqtt_session_queue);
+    if (asked("retained_max", cfg.mqtt_retained_max != defaults.mqtt_retained_max))
+        mq.set_retained_max(cfg.mqtt_retained_max);
+    if (asked("max_sessions", cfg.mqtt_max_sessions != defaults.mqtt_max_sessions))
+        mq.set_max_sessions(cfg.mqtt_max_sessions);
+    if (asked("keepalive_max", cfg.mqtt_keepalive_max != defaults.mqtt_keepalive_max))
+        mq.set_keepalive_max(cfg.mqtt_keepalive_max);
+    if (asked("persistent_path", !cfg.persistent_path.empty()))
+        mq.set_persistent(cfg.persistent_path);
+    if (asked("persistent_interval", cfg.persistent_interval > 0))
+        mq.set_persist_interval(cfg.persistent_interval);
 }
 
 void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool by_presence)
@@ -419,6 +456,9 @@ bool apply_typed_config(runtime_instance& rt, const runtime_config& cfg, bool by
             break;
         case runtime_db:
             apply_db_config(static_cast<db_instance&>(rt), cfg, by_presence);
+            break;
+        case runtime_mqtt:
+            apply_mqtt_config(static_cast<mqtt_instance&>(rt), cfg, by_presence);
             break;
     }
 

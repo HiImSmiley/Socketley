@@ -30,7 +30,7 @@
 #                      Set this anywhere the runner is known to have clang —
 #                      otherwise a broken build_libfuzzer.sh downgrades the job
 #                      to the GCC floor and still reports green.
-#   FUZZ_TARGETS       which targets to run (default: all nine).  Every target
+#   FUZZ_TARGETS       which targets to run (default: every one below).  Every target
 #                      named here must exist or the run fails — narrowing the
 #                      set is a decision the caller states, never something that
 #                      happens because a binary quietly was not built.
@@ -170,9 +170,10 @@ declare -A CORPUS=(
     [fuzz_s3_sigv4]=s3sigv4
     [fuzz_bucket_policy]=bucketpolicy
     [fuzz_dns]=dns
+    [fuzz_mqtt]=mqtt
 )
 
-read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns}"
+read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_mqtt}"
 
 # The pinned configurations the proxy seed corpus is replayed over, on top of
 # the default run.  ';' separated because the values themselves are comma

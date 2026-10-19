@@ -1,4 +1,5 @@
 #pragma once
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -193,7 +194,9 @@ private:
     int cmd_db_restore(ipc_connection* conn, const parsed_args& pa);
     // One request to a runtime's worker and its answer, waited for here; false with the reason in conn's write_buf.
     bool ask_worker(ipc_connection* conn, std::string_view runtime, std::string_view payload, std::string& reply,
-                    std::chrono::milliseconds bound = std::chrono::milliseconds(4000));
+                    std::chrono::milliseconds bound = std::chrono::milliseconds(4000), size_t shard = 0);
+    // mqtt-pub, mqtt-sessions, mqtt-kick, mqtt-retained and mqtt-tap, which ask a broker's shards.
+    int cmd_mqtt(ipc_connection* conn, const parsed_args& pa);
     int cmd_stats(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload_lua(ipc_connection* conn, const parsed_args& pa);
@@ -409,6 +412,9 @@ private:
 
     // Whether a retired worker of `name` is still running, reaping the ones that are not.
     bool predecessor_running(const std::string& name);
+    // Brokers removed whose snapshots go once their last worker has exited, which writes one as it stops.
+    std::set<std::string, std::less<>> m_forget_snapshots;
+    void forget_settled_snapshots();
 
     // Runtimes wanted running whose fork the last reconcile held back for a predecessor.
     std::unordered_set<std::string> m_spawn_waiting;

@@ -21,7 +21,8 @@ enum runtime_type : uint8_t
     runtime_dns     = 5,
     runtime_sync    = 6,
     runtime_idp     = 7,
-    runtime_db      = 8
+    runtime_db      = 8,
+    runtime_mqtt    = 9
 };
 
 // The names, once.  Five places had this switch -- lua_context,

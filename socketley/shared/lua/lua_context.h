@@ -64,6 +64,7 @@ class runtime_instance;
 class lua_suspender;
 class lua_storage_client;
 class lua_db_client;
+class lua_mqtt_client;
 
 // How long one Lua callback may hold the event-loop thread, enforced by a
 // count hook that fires every N VM instructions and tests wall-clock time --
@@ -202,7 +203,7 @@ public:
     void allow_registrations() { m_severed = false; }
 
     // Callback bitmask constants
-    enum : uint32_t {
+    enum : uint64_t {
         CB_ON_START              = 1u << 0,
         CB_ON_STOP               = 1u << 1,
         CB_ON_MESSAGE            = 1u << 2,
@@ -237,6 +238,9 @@ public:
         // has not begun, and an object that has just been committed.
         CB_ON_REQUEST            = 1u << 30,
         CB_ON_PUT                = 1u << 31,
+        // An mqtt runtime's: a message or a subscription on its way in, either of which the script may refuse.
+        CB_ON_PUBLISH            = 1ull << 32,
+        CB_ON_SUBSCRIBE          = 1ull << 33,
     };
 
     // Check if context has valid callbacks (bitmask lookup)
@@ -277,6 +281,8 @@ public:
     bool has_on_http_request()       const { return m_callback_mask & CB_ON_HTTP_REQUEST; }
     bool has_on_request()            const { return m_callback_mask & CB_ON_REQUEST; }
     bool has_on_put()                const { return m_callback_mask & CB_ON_PUT; }
+    bool has_on_publish()            const { return m_callback_mask & CB_ON_PUBLISH; }
+    bool has_on_subscribe()          const { return m_callback_mask & CB_ON_SUBSCRIBE; }
     // Whether the script declared a non-empty `filters` chain, a mask bit
     // because it is asked once per request on the proxy's route path.
     bool has_filters()               const { return m_callback_mask & CB_FILTERS; }
@@ -337,6 +343,12 @@ public:
     sol::protected_function& raw_on_request()  { return m_on_request; }
     sol::protected_function& raw_on_put()      { return m_on_put; }
     sol::protected_function& raw_on_delete()   { return m_on_delete; }
+    // An mqtt runtime's deciding hooks, run on a coroutine for the same reason.
+    sol::protected_function& raw_on_auth()      { return m_on_auth; }
+    sol::protected_function& raw_on_publish()   { return m_on_publish; }
+    sol::protected_function& raw_on_subscribe() { return m_on_subscribe; }
+    sol::protected_function& raw_on_connect()   { return m_on_connect; }
+    sol::protected_function& raw_on_disconnect() { return m_on_disconnect; }
     // The chain in the order the script listed it, handed back raw because the
     // caller arms one scope around the whole walk so ten filters share one
     // request's budget.
@@ -437,6 +449,8 @@ private:
     // failure has to arrive as a value rather than as an unwind the Sanitize
     // build swallows.
     sol::protected_function m_on_auth;
+    sol::protected_function m_on_publish;
+    sol::protected_function m_on_subscribe;
     sol::protected_function m_on_websocket;
     // Both refuse on error, so the error has to arrive as a value: a refusal
     // nobody can explain is barely better than the admission it replaced.
@@ -464,6 +478,7 @@ private:
     std::unique_ptr<lua_storage_client> m_storage_client;
     // And what socketley.db waits on, alike.
     std::unique_ptr<lua_db_client> m_db_client;
+    std::unique_ptr<lua_mqtt_client> m_mqtt_client;
 
     // The `filters` chain as a vector because order is the whole point,
     // collected once at load time, and protected because a filter is where
@@ -476,7 +491,7 @@ private:
     route_table m_routes;
 
     uint32_t m_tick_ms{0};
-    uint32_t m_callback_mask{0};
+    uint64_t m_callback_mask{0};
 
     // What one callback invocation may spend in ms, starting at the process
     // default so the top-level chunk is bounded too, and replaced by the
@@ -598,6 +613,8 @@ public:
     bool has_on_delete()         const { return false; }
     bool has_on_expire()         const { return false; }
     bool has_on_auth()           const { return false; }
+    bool has_on_publish()        const { return false; }
+    bool has_on_subscribe()      const { return false; }
     bool has_on_websocket()      const { return false; }
     bool has_on_proxy_request()  const { return false; }
     bool has_on_proxy_response() const { return false; }

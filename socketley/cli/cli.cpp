@@ -675,6 +675,16 @@ int cli_dispatch(int argc, char** argv)
             return cli_idp_user(argc, argv);
         case fnv1a("db-backup"):
             return cli_db_backup(argc, argv);
+        case fnv1a("mqtt-pub"):
+            return cli_mqtt_pub(argc, argv);
+        case fnv1a("mqtt-sub"):
+            return cli_mqtt_sub(argc, argv);
+        case fnv1a("mqtt-passwd"):
+            return cli_mqtt_passwd(argc, argv);
+        case fnv1a("mqtt-sessions"):
+        case fnv1a("mqtt-kick"):
+        case fnv1a("mqtt-retained"):
+            return cli_forward(argc, argv);
         case fnv1a("db-restore"):
         {
             // The backup is read by the daemon, against whose directory a relative path means something else.
@@ -737,6 +747,9 @@ std::string cli_caller_path(std::string_view flag, std::string_view value)
         if (!std::filesystem::exists(value, ec))
             return std::string(value);
     }
+    // A broker's --persistent on asks for the file under the state directory, which the daemon names.
+    if (flag == "--persistent" && value == "on")
+        return std::string(value);
     std::string_view prefix;
     bool is_path = false;
     // The schema's paths, and the zone files a --zone that is no list may name.

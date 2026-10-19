@@ -52,6 +52,7 @@ constexpr builtin_name builtins[] = {
     {runtime_server, "server"},   {runtime_client, "client"}, {runtime_proxy, "proxy"},
     {runtime_cache, "cache"},     {runtime_storage, "storage"}, {runtime_dns, "dns"},
     {runtime_sync, "sync"},       {runtime_idp, "idp"},       {runtime_db, "db"},
+    {runtime_mqtt, "mqtt"},
 };
 
 bool builtin_lookup(std::string_view name, runtime_type& out)

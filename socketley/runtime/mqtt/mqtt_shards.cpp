@@ -1,0 +1,570 @@
+// The shards of one mqtt runtime as one broker: a session lives on the shard its client is connected to and moves
+// there when it connects to another, a message goes to the shards that have a subscriber for it, each shared group
+// is served by one shard per message, and the retained messages are the same on every shard.
+//
+// Every word between shards is a request on the channel to "<name>#<shard>", which the shard mesh carries directly
+// and the daemon carries when it cannot; each is answered, a receipt where nothing more is owed.
+#include "mqtt_run.h"
+
+#include <chrono>
+
+#include "mqtt_command.h"
+#include "mqtt_instance.h"
+#include "../../shared/ipc/shard_target.h"
+#include "../../shared/runtime/runtime_manager.h"
+#include "../../shared/runtime/stats_text.h"
+#include "../../shared/util/byte_codec.h"
+#include "../../shared/util/logging.h"
+
+namespace socketley::mqtt
+{
+
+namespace
+{
+
+enum class sverb : uint8_t
+{
+    deliver       = 1,
+    retained      = 2,
+    interest_add  = 3,
+    interest_del  = 4,
+    interest_full = 5,
+    interest_dump = 6,
+    retained_dump = 7,
+    claim         = 8,
+};
+
+constexpr int64_t claim_patience_ms = 3000;
+
+std::string frame_of(sverb v, uint32_t from)
+{
+    socketley::bytes::writer w(shard_prefix);
+    w.u8(static_cast<uint8_t>(v));
+    w.u32(from);
+    return w.take();
+}
+
+void put_list(socketley::bytes::writer& w, const std::vector<std::string>& list)
+{
+    w.u32(static_cast<uint32_t>(list.size()));
+    for (const auto& s : list)
+        w.bytes(s);
+}
+
+bool get_list(socketley::bytes::reader& r, std::vector<std::string>& list)
+{
+    uint32_t n = 0;
+    if (!r.u32(n) || n > (1u << 24))
+        return false;
+    list.resize(n);
+    for (auto& s : list)
+        if (!r.bytes(s, 1u << 16))
+            return false;
+    return true;
+}
+
+uint64_t claim_stamp(uint32_t shard)
+{
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    return (static_cast<uint64_t>(ns) << 6) | (shard & 63);
+}
+
+}   // namespace
+
+bool mqtt_run::sharded() const
+{
+    return m_owner.get_shards() > 1;
+}
+
+void mqtt_run::post_shard(uint32_t to, std::string payload, uint64_t cookie)
+{
+    auto* mgr = m_owner.get_runtime_manager();
+    if (!mgr || !mgr->requests().post(this, cookie, shard_target(m_owner.get_name(), to), payload,
+                                      request_class::client))
+        ++m_shard_unreached;
+}
+
+void mqtt_run::shards_start()
+{
+    if (!sharded())
+        return;
+    const uint32_t n = m_owner.get_shards();
+    const uint32_t me = m_owner.get_shard_index();
+    m_peers.resize(n);
+    m_assign.assign(n, {});
+    for (auto& p : m_peers)
+        p.filters = std::make_unique<subscription_tree>();
+    // What this shard holds, told whole, so a peer that knew an older picture of it replaces that one.
+    const std::vector<std::string> mine = m_broker->filters();
+    for (uint32_t j = 0; j < n; ++j)
+    {
+        if (j == me)
+            continue;
+        std::string full = frame_of(sverb::interest_full, me);
+        {
+            socketley::bytes::writer w;
+            put_list(w, mine);
+            full += w.take();
+        }
+        post_shard(j, std::move(full), m_shard_cookie_base++);
+        const uint64_t cookie = m_next_cookie++;
+        m_dump_asks[cookie] = {j, false};
+        post_shard(j, frame_of(sverb::interest_dump, me), cookie);
+    }
+    // A shard that starts with nothing retained asks the next one for what it holds.
+    if (m_broker->retained_count() == 0)
+    {
+        const uint64_t cookie = m_next_cookie++;
+        m_dump_asks[cookie] = {(me + 1) % n, true};
+        post_shard((me + 1) % n, frame_of(sverb::retained_dump, me), cookie);
+    }
+}
+
+bool mqtt_run::dump_reply(uint64_t cookie, request_status st, std::string_view reply)
+{
+    const auto it = m_dump_asks.find(cookie);
+    if (it == m_dump_asks.end())
+        return false;
+    const auto [from, retained] = it->second;
+    m_dump_asks.erase(it);
+    if (st != request_status::ok || from >= m_peers.size())
+        return true;
+    socketley::bytes::reader r(reply);
+    if (retained)
+    {
+        uint32_t n = 0;
+        if (!r.u32(n))
+            return true;
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            std::string_view body;
+            auto m = std::make_shared<message>();
+            if (!r.view(body, 1u << 28) || !message_from(body, *m))
+                return true;
+            m_broker->apply_retained(m->topic, m);
+        }
+        return true;
+    }
+    std::vector<std::string> list;
+    if (!get_list(r, list))
+        return true;
+    peer& p = m_peers[from];
+    p.filters = std::make_unique<subscription_tree>();
+    p.held.clear();
+    p.known = true;
+    for (const auto& f : list)
+    {
+        std::string_view group, inner = f;
+        const bool is_shared = split_shared(f, group, inner);
+        if (p.held[f]++ == 0)
+        {
+            sub_options o;
+            o.qos = 2;
+            p.filters->add(inner, is_shared ? group : std::string_view{}, from, o);
+        }
+    }
+    return true;
+}
+
+// ── What this shard tells the others ────────────────────────────────────────
+
+void mqtt_run::share_interest(uint8_t v, const std::vector<std::string>& filters)
+{
+    const uint32_t n = m_owner.get_shards();
+    const uint32_t me = m_owner.get_shard_index();
+    for (uint32_t j = 0; j < n; ++j)
+    {
+        if (j == me)
+            continue;
+        std::string f = frame_of(static_cast<sverb>(v), me);
+        socketley::bytes::writer w;
+        put_list(w, filters);
+        f += w.take();
+        post_shard(j, std::move(f), m_shard_cookie_base++);
+    }
+}
+
+void mqtt_run::filter_added(const std::string& filter)
+{
+    if (sharded() && !m_peers.empty())
+        share_interest(static_cast<uint8_t>(sverb::interest_add), {filter});
+}
+
+void mqtt_run::filter_removed(const std::string& filter)
+{
+    if (sharded() && !m_peers.empty())
+        share_interest(static_cast<uint8_t>(sverb::interest_del), {filter});
+}
+
+bool mqtt_run::shared_here(std::string_view key)
+{
+    if (!sharded() || m_peers.empty())
+        return true;
+    const uint32_t me = m_owner.get_shard_index();
+    std::vector<uint32_t> candidates{me};
+    for (uint32_t j = 0; j < m_peers.size(); ++j)
+        if (j != me && m_peers[j].held.contains(std::string(key)))
+            candidates.push_back(j);
+    if (candidates.size() == 1)
+        return true;
+    uint64_t& turn = m_group_turn[std::string(key)];
+    const uint32_t pick = candidates[turn++ % candidates.size()];
+    if (pick == me)
+        return true;
+    m_assign[pick].push_back(std::string(key));
+    return false;
+}
+
+void mqtt_run::share_message(const message_ptr& m)
+{
+    if (!sharded() || m_peers.empty())
+        return;
+    const uint32_t n = m_owner.get_shards();
+    const uint32_t me = m_owner.get_shard_index();
+    std::vector<std::vector<std::string>> assign(n);
+    assign.swap(m_assign);
+    m_assign.assign(n, {});
+    // The groups whose decision was made while the message was routed here, so they are not decided twice.
+    std::vector<std::string> decided;
+    for (const auto& a : assign)
+        decided.insert(decided.end(), a.begin(), a.end());
+    std::vector<bool> plain(n, false);
+    std::unordered_map<std::string, std::vector<uint32_t>> elsewhere;
+    for (uint32_t j = 0; j < n; ++j)
+    {
+        if (j == me || !m_peers[j].filters)
+            continue;
+        m_peers[j].filters->match(
+            m->topic, [&](uint64_t, const sub_options&) { plain[j] = true; },
+            [&](std::string_view key, uint64_t, const sub_options&) { elsewhere[std::string(key)].push_back(j); });
+    }
+    for (auto& [key, peers] : elsewhere)
+    {
+        // A group with members here was decided by shared_here(); one only the others have is decided now.
+        if (m_broker && m_broker->has_filter(key))
+            continue;
+        if (std::find(decided.begin(), decided.end(), key) != decided.end())
+            continue;
+        uint64_t& turn = m_group_turn[key];
+        assign[peers[turn++ % peers.size()]].push_back(key);
+    }
+    std::string body;
+    for (uint32_t j = 0; j < n; ++j)
+    {
+        if (j == me || (!plain[j] && assign[j].empty()))
+            continue;
+        if (body.empty())
+            body = message_bytes(*m);
+        std::string f = frame_of(sverb::deliver, me);
+        socketley::bytes::writer w;
+        w.bytes(body);
+        put_list(w, assign[j]);
+        f += w.take();
+        ++m_shard_forwarded;
+        post_shard(j, std::move(f), m_shard_cookie_base++);
+    }
+}
+
+void mqtt_run::share_retained(const std::string& topic, const message_ptr& now)
+{
+    if (!sharded() || m_peers.empty())
+        return;
+    const uint32_t n = m_owner.get_shards();
+    const uint32_t me = m_owner.get_shard_index();
+    std::string body;
+    {
+        socketley::bytes::writer w;
+        w.bytes(topic);
+        w.flag(now != nullptr);
+        if (now)
+            w.bytes(message_bytes(*now));
+        body = w.take();
+    }
+    for (uint32_t j = 0; j < n; ++j)
+        if (j != me)
+            post_shard(j, frame_of(sverb::retained, me) + body, m_shard_cookie_base++);
+}
+
+// ── Taking a session over from another shard ────────────────────────────────
+
+void mqtt_run::claim(const auth_ask& ask, auth_answer a, std::function<void(auth_answer)> done)
+{
+    if (!sharded() || m_peers.empty())
+    {
+        done(std::move(a));
+        return;
+    }
+    const uint32_t n = m_owner.get_shards();
+    const uint32_t me = m_owner.get_shard_index();
+    const uint64_t id = m_next_claim++;
+    pending_claim& pc = m_claims[id];
+    pc.ask        = ask;
+    pc.answer     = std::move(a);
+    pc.done       = std::move(done);
+    pc.stamp      = claim_stamp(me);
+    pc.started_ms = now_ms();
+    ++m_claims_made;
+    for (uint32_t j = 0; j < n; ++j)
+    {
+        if (j == me)
+            continue;
+        std::string f = frame_of(sverb::claim, me);
+        socketley::bytes::writer w;
+        w.bytes(ask.client_id);
+        w.flag(ask.clean_start);
+        w.u64(pc.stamp);
+        f += w.take();
+        const uint64_t cookie = m_next_cookie++;
+        auto* mgr = m_owner.get_runtime_manager();
+        if (mgr && mgr->requests().post(this, cookie, shard_target(m_owner.get_name(), j), f, request_class::client))
+        {
+            m_claim_cookies[cookie] = id;
+            ++pc.waiting;
+        }
+        else
+            ++m_shard_unreached;
+    }
+    if (pc.waiting == 0)
+        finish_claim(id);
+}
+
+void mqtt_run::claim_reply(uint64_t cookie, request_status st, std::string_view reply)
+{
+    const auto it = m_claim_cookies.find(cookie);
+    if (it == m_claim_cookies.end())
+        return;
+    const uint64_t id = it->second;
+    m_claim_cookies.erase(it);
+    const auto c = m_claims.find(id);
+    if (c == m_claims.end())
+        return;
+    pending_claim& pc = c->second;
+    if (st == request_status::ok)
+    {
+        socketley::bytes::reader r(reply);
+        uint8_t status = 0;
+        if (r.u8(status))
+        {
+            if (status == 2)
+                pc.lost = true;
+            else if (status == 1)
+            {
+                std::string s;
+                if (r.bytes(s, 1u << 28) && pc.session.empty())
+                    pc.session = std::move(s);
+            }
+        }
+    }
+    if (pc.waiting)
+        --pc.waiting;
+    if (pc.waiting == 0)
+        finish_claim(id);
+}
+
+void mqtt_run::finish_claim(uint64_t id)
+{
+    const auto it = m_claims.find(id);
+    if (it == m_claims.end())
+        return;
+    pending_claim pc = std::move(it->second);
+    m_claims.erase(it);
+    std::erase_if(m_claim_cookies, [&](const auto& kv) { return kv.second == id; });
+    if (pc.lost)
+    {
+        // A newer connection to the same client on another shard wins; this one is told to come back.
+        ++m_claims_lost;
+        pc.done({pc.ask.level == level_5 ? reason::session_taken_over : reason::server_unavailable, {}});
+        return;
+    }
+    if (!pc.session.empty())
+    {
+        m_broker->adopt(pc.session);
+        ++m_sessions_moved;
+    }
+    pc.done(std::move(pc.answer));
+}
+
+void mqtt_run::sweep_claims(int64_t now)
+{
+    std::vector<uint64_t> late;
+    for (const auto& [id, pc] : m_claims)
+        if (now - pc.started_ms > claim_patience_ms)
+            late.push_back(id);
+    for (const uint64_t id : late)
+        finish_claim(id);
+}
+
+// ── What the others tell this shard ─────────────────────────────────────────
+
+void mqtt_run::shard_request(uint64_t ticket, std::string_view payload)
+{
+    auto* mgr = m_owner.get_runtime_manager();
+    if (!mgr)
+        return;
+    std::string reply;
+    socketley::bytes::reader r(payload);
+    uint8_t v = 0;
+    uint32_t from = 0;
+    if (!r.marker(shard_prefix) || !r.u8(v) || !r.u32(from) || from >= m_peers.size() ||
+        from == m_owner.get_shard_index())
+    {
+        mgr->requests().complete_deferred(ticket, request_status::ok, reply);
+        return;
+    }
+    ++m_shard_received;
+    peer& p = m_peers[from];
+    const auto take_filter = [&](const std::string& f, bool add) {
+        std::string_view group, inner = f;
+        const bool is_shared = split_shared(f, group, inner);
+        if (add)
+        {
+            if (p.held[f]++ == 0)
+            {
+                sub_options o;
+                o.qos = 2;
+                p.filters->add(inner, is_shared ? group : std::string_view{}, from, o);
+            }
+            return;
+        }
+        const auto it = p.held.find(f);
+        if (it == p.held.end())
+            return;
+        if (--it->second == 0)
+        {
+            p.held.erase(it);
+            p.filters->remove(inner, is_shared ? group : std::string_view{}, from);
+        }
+    };
+    switch (static_cast<sverb>(v))
+    {
+        case sverb::deliver:
+        {
+            std::string_view body;
+            std::vector<std::string> groups;
+            auto m = std::make_shared<message>();
+            if (r.view(body, 1u << 28) && get_list(r, groups) && message_from(body, *m))
+            {
+                message_ptr held = m;
+                // Not tapped here: a tap is open on every shard, and the shard that accepted it tapped it.
+                m_broker->deliver_remote(held, groups);
+            }
+            break;
+        }
+        case sverb::retained:
+        {
+            std::string topic;
+            bool has = false;
+            if (r.bytes(topic, 1u << 16) && r.flag(has))
+            {
+                if (!has)
+                    m_broker->apply_retained(topic, nullptr);
+                else
+                {
+                    std::string_view body;
+                    auto m = std::make_shared<message>();
+                    if (r.view(body, 1u << 28) && message_from(body, *m))
+                        m_broker->apply_retained(topic, m);
+                }
+            }
+            break;
+        }
+        case sverb::interest_full:
+        {
+            p.filters = std::make_unique<subscription_tree>();
+            p.held.clear();
+            p.known = true;
+            std::vector<std::string> list;
+            if (get_list(r, list))
+                for (const auto& f : list)
+                    take_filter(f, true);
+            break;
+        }
+        case sverb::interest_add:
+        case sverb::interest_del:
+        {
+            std::vector<std::string> list;
+            if (get_list(r, list))
+                for (const auto& f : list)
+                    take_filter(f, static_cast<sverb>(v) == sverb::interest_add);
+            break;
+        }
+        case sverb::interest_dump:
+        {
+            // Answered with what this shard holds, which the asker takes as a full picture of it.
+            socketley::bytes::writer w;
+            put_list(w, m_broker->filters());
+            reply = w.take();
+            break;
+        }
+        case sverb::retained_dump:
+        {
+            socketley::bytes::writer w;
+            std::vector<message_ptr> all;
+            m_broker->retained_each("#", [&](const message_ptr& m) { all.push_back(m); });
+            w.u32(static_cast<uint32_t>(all.size()));
+            for (const auto& m : all)
+                w.bytes(message_bytes(*m));
+            reply = w.take();
+            break;
+        }
+        case sverb::claim:
+        {
+            std::string client;
+            bool clean = false;
+            uint64_t stamp = 0;
+            if (!r.bytes(client, 1u << 16) || !r.flag(clean) || !r.u64(stamp))
+                break;
+            socketley::bytes::writer w;
+            bool newer_here = false;
+            for (auto& [id, pc] : m_claims)
+                if (pc.ask.client_id == client)
+                {
+                    if (pc.stamp > stamp)
+                        newer_here = true;
+                    else
+                        pc.lost = true;
+                }
+            if (newer_here)
+            {
+                w.u8(2);
+                reply = w.take();
+                break;
+            }
+            std::string bytes = m_broker->surrender(client, clean);
+            if (bytes.empty())
+                w.u8(0);
+            else
+            {
+                w.u8(1);
+                w.bytes(bytes);
+                ++m_sessions_moved;
+            }
+            reply = w.take();
+            break;
+        }
+        default:
+            break;
+    }
+    mgr->requests().complete_deferred(ticket, request_status::ok, reply);
+}
+
+void mqtt_run::shard_stats(std::string& out) const
+{
+    if (!sharded())
+        return;
+    namespace st = socketley::stats_text;
+    size_t known = 0;
+    for (const auto& p : m_peers)
+        known += p.known;
+    st::put(out, "shard_peers_known", known);
+    st::put(out, "shard_forwarded", m_shard_forwarded);
+    st::put(out, "shard_received", m_shard_received);
+    st::put(out, "shard_unreached", m_shard_unreached);
+    st::put(out, "session_claims", m_claims_made);
+    st::put(out, "session_claims_lost", m_claims_lost);
+    st::put(out, "sessions_moved", m_sessions_moved);
+}
+
+}   // namespace socketley::mqtt

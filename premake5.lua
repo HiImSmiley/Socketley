@@ -1273,6 +1273,30 @@ project "fuzz_resp"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: the MQTT codec and broker ───────────────────────────────────────
+--
+-- What every peer of an mqtt runtime reaches with its first bytes, read with
+-- the broker's whole state machine behind it on four connections at once.
+
+project "fuzz_mqtt"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_mqtt.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/runtime/mqtt/mqtt_codec.cpp",
+        "socketley/runtime/mqtt/mqtt_topics.cpp",
+        "socketley/runtime/mqtt/mqtt_broker.cpp",
+        "socketley/runtime/mqtt/mqtt_broker_store.cpp"
+    }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: the JSON pair behind socketley.json_decode / json_encode ─────────
 --
 -- The one binding written to be pointed at data from the network, and the one
@@ -2761,6 +2785,40 @@ project "test_idp"
 
     files { "test/unit/test_idp.cpp", "socketley/runtime/idp/idp_logic.cpp", "socketley/runtime/idp/idp_accounts.cpp",
             "socketley/runtime/idp/idp_shard.cpp", "socketley/shared/crypto/jws.cpp", "socketley/shared/util/base64.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+project "test_mqtt"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files { "test/unit/test_mqtt.cpp", "socketley/runtime/mqtt/mqtt_codec.cpp", "socketley/runtime/mqtt/mqtt_topics.cpp",
+            "socketley/runtime/mqtt/mqtt_auth.cpp", "socketley/runtime/mqtt/mqtt_broker.cpp",
+            "socketley/runtime/mqtt/mqtt_broker_store.cpp", "socketley/runtime/mqtt/mqtt_routes.cpp",
+            "socketley/shared/util/base64.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }

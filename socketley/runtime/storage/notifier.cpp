@@ -4,6 +4,8 @@
 #include <cstdlib>
 
 #include "../../runtime/cache/stream_log.h"
+#include "../../runtime/mqtt/mqtt_codec.h"
+#include "../../runtime/mqtt/mqtt_command.h"
 #include "../../shared/util/byte_codec.h"
 #include "../../shared/ipc/route_relay.h"
 #include "../../shared/runtime/runtime_manager.h"
@@ -44,9 +46,22 @@ bool parse_notify_targets(std::string_view text, std::vector<notify_target>& out
             why = where + "a target's name is letters, digits, '-', '_' and '.'";
             return false;
         }
-        // Another runtime of the daemon: a cache's stream or channel, or a server's clients.
+        // Another runtime of the daemon: a cache's stream or channel, a server's clients, or a broker's topic.
         const std::string_view url = fields[1];
-        if (url.starts_with("cache://") || url.starts_with("server://"))
+        if (url.starts_with("mqtt://"))
+        {
+            std::string_view rest = url.substr(7);
+            t.runtime = std::string(take_item(rest, '/'));
+            t.topic = std::string(rest);
+            t.k = notify_target::kind::mqtt;
+            if (t.runtime.empty() || fields.size() == 3 || !socketley::mqtt::valid_topic(t.topic) ||
+                t.topic.front() == '$')
+            {
+                why = where + "a broker target is mqtt://<runtime>/<topic>, the topic without + or #";
+                return false;
+            }
+        }
+        else if (url.starts_with("cache://") || url.starts_with("server://"))
         {
             const bool cache = url.starts_with("cache://");
             std::string_view rest = url.substr(cache ? 8 : 9);
@@ -62,8 +77,8 @@ bool parse_notify_targets(std::string_view text, std::vector<notify_target>& out
             if (t.k == notify_target::kind::webhook || t.runtime.empty() || fields.size() == 3 ||
                 (cache && (t.topic.empty() || t.topic.find_first_of(" \t") != std::string::npos)))
             {
-                why = where + "a runtime target is cache://<runtime>/stream/<key>, cache://<runtime>/channel/<channel> "
-                              "or server://<runtime>";
+                why = where + "a runtime target is cache://<runtime>/stream/<key>, cache://<runtime>/channel/<channel>, "
+                              "server://<runtime> or mqtt://<runtime>/<topic>";
                 return false;
             }
         }
@@ -406,7 +421,10 @@ void notifier::start_runtime(lane& l, const pending& ev)
     // A cache takes one command in its text protocol; a stream's entry goes in its exact bytes, since its words are
     // split on spaces.
     std::string cmd(one_command_marker);
-    if (t.k == notify_target::kind::cache_channel)
+    // A broker takes the event as a message at QoS 1, which it answers once its subscribers have it queued.
+    if (t.k == notify_target::kind::mqtt)
+        cmd = socketley::mqtt::command_publish(t.topic, ev.json, 1, false);
+    else if (t.k == notify_target::kind::cache_channel)
         cmd += "publish " + t.topic + " " + ev.json;
     else
     {

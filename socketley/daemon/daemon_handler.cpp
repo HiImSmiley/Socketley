@@ -20,6 +20,9 @@
 #include "../runtime/sync/sync_instance.h"
 #include "../runtime/idp/idp_instance.h"
 #include "../runtime/db/db_instance.h"
+#include "../runtime/mqtt/mqtt_command.h"
+#include "../shared/util/base64.h"
+#include "../runtime/mqtt/mqtt_instance.h"
 #include "../runtime/db/db_log.h"
 #include "../runtime/db/db_store.h"
 #include "../shared/lua/db_call.h"
@@ -1433,6 +1436,11 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("ping"):          return cmd_ping(conn);
         case fnv1a("idp-user"):      return cmd_idp_user(conn, pa);
         case fnv1a("db-backup"):     return cmd_db_backup(conn, pa);
+        case fnv1a("mqtt-pub"):
+        case fnv1a("mqtt-sessions"):
+        case fnv1a("mqtt-kick"):
+        case fnv1a("mqtt-retained"):
+        case fnv1a("mqtt-tap"):      return cmd_mqtt(conn, pa);
         case fnv1a("db-restore"):    return cmd_db_restore(conn, pa);
         case fnv1a("startup"):       return cmd_startup(conn, pa);
         default:
@@ -1554,6 +1562,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                     break;
                 case runtime_db:
                     result = parse_db_flags(static_cast<db_instance*>(instance), pa, i, name);
+                    break;
+                case runtime_mqtt:
+                    result = parse_mqtt_flags(static_cast<mqtt_instance*>(instance), pa, i, name);
                     break;
                 default:
                     // A registered type's flags come from its manifest schema.
@@ -2217,16 +2228,36 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
         // Its index describes objects nobody answers for any more, and a job made again under the name starts empty.
         const auto* gone = m_manager.get(n);
         const bool sync_job = gone && gone->get_type() == runtime_sync;
+        // A broker's sessions under the state directory go with it; a file of its own naming is the operator's.
+        const bool broker_state = gone && gone->get_type() == runtime_mqtt &&
+                                  static_cast<const mqtt_instance*>(gone)->get_persistent() == "on";
         if (m_manager.remove(n))
         {
             if (m_persistence)
                 m_persistence->remove_runtime(n);
             if (sync_job && ::unlink(sync_index_path(n).c_str()) != 0 && errno != ENOENT)
                 LOG_WARN(("sync " + n + ": its index was not removed: " + std::strerror(errno)).c_str());
+            if (broker_state)
+                m_forget_snapshots.insert(n);
         }
     }
 
+    forget_settled_snapshots();
     return withheld ? 1 : 0;
+}
+
+void daemon_handler::forget_settled_snapshots()
+{
+    for (auto it = m_forget_snapshots.begin(); it != m_forget_snapshots.end();)
+    {
+        if (predecessor_running(*it))
+        {
+            ++it;
+            continue;
+        }
+        mqtt_forget_snapshots(*it);
+        it = m_forget_snapshots.erase(it);
+    }
 }
 
 // The refusal `ls` and `ps` share, because both read a set of column names out
@@ -2874,10 +2905,10 @@ void daemon_handler::on_worker_deliver(proxy_supervisor* from,
 }
 
 bool daemon_handler::ask_worker(ipc_connection* conn, std::string_view runtime, std::string_view payload,
-                                std::string& reply, std::chrono::milliseconds bound)
+                                std::string& reply, std::chrono::milliseconds bound, size_t shard)
 {
     auto it = m_proxy_workers.find(std::string(runtime));
-    if (it == m_proxy_workers.end() || it->second.empty() || !it->second[0])
+    if (it == m_proxy_workers.end() || it->second.size() <= shard || !it->second[shard])
     {
         conn->write_buf = "could not reach the worker holding " + std::string(runtime) + "\n";
         return false;
@@ -2885,7 +2916,7 @@ bool daemon_handler::ask_worker(ipc_connection* conn, std::string_view runtime, 
     const uint64_t ticket = proxy_supervisor::direct_ticket_bit | ++m_direct_ticket_seq;
     uint8_t st = 0;
     const worker_wait_scope waiting{m_worker_wait_depth};
-    auto* sup = it->second[0].get();
+    auto* sup = it->second[shard].get();
     if (!sup->send_direct(ticket, payload) || !sup->await_direct(ticket, bound, st, reply))
     {
         conn->write_buf = "no answer from the worker holding " + std::string(runtime) + "\n";
@@ -2897,6 +2928,241 @@ bool daemon_handler::ask_worker(ipc_connection* conn, std::string_view runtime, 
         return false;
     }
     return true;
+}
+
+// A broker's commands: a publish goes to one shard, which hands it to the others; sessions, kicks and taps ask every
+// shard, since each holds the sessions of the clients connected to it; retained messages are on all of them alike.
+int daemon_handler::cmd_mqtt(ipc_connection* conn, const parsed_args& pa)
+{
+    namespace mq = socketley::mqtt;
+    const std::string verb(pa.args[0]);
+    if (pa.count < 2)
+    {
+        conn->write_buf = command_usage::line(verb);
+        return 1;
+    }
+    const std::string_view name = pa.args[1];
+    auto* instance = m_manager.get(name);
+    if (!instance || instance->get_type() != runtime_mqtt)
+    {
+        conn->write_buf = "no mqtt runtime named " + std::string(name) + "\n";
+        return 1;
+    }
+    if (instance->get_state() != runtime_running)
+    {
+        conn->write_buf = "runtime is not running: " + std::string(name) + "\n";
+        return 1;
+    }
+    const auto it = m_proxy_workers.find(std::string(name));
+    const size_t shards = it == m_proxy_workers.end() ? 0 : it->second.size();
+    if (shards == 0)
+    {
+        conn->write_buf = "could not reach the worker holding " + std::string(name) + "\n";
+        return 2;
+    }
+    // One shard's answer, or false with the reason already in the write buffer.
+    const auto ask = [&](size_t shard, std::string_view payload, std::string& reply) {
+        if (!ask_worker(conn, name, payload, reply, std::chrono::milliseconds(4000), shard))
+            return false;
+        if (reply.starts_with("error: "))
+        {
+            conn->write_buf = reply.substr(7) + "\n";
+            return false;
+        }
+        return true;
+    };
+    // A JSON array of every shard's answer, one element a line.
+    const auto merged = [&](std::string_view payload) {
+        std::string out = "[";
+        bool any = false;
+        for (size_t j = 0; j < shards; ++j)
+        {
+            std::string reply;
+            if (!ask(j, payload, reply))
+                return false;
+            if (reply.size() < 2 || reply.front() != '[' || reply.back() != ']')
+            {
+                conn->write_buf = "the worker holding " + std::string(name) + " gave no list\n";
+                return false;
+            }
+            std::string_view body(reply);
+            body = body.substr(1, body.size() - 2);
+            // Each element is an object, cut out at the brace that closes it outside a string.
+            size_t depth = 0, from = 0;
+            bool in_str = false, esc = false;
+            for (size_t k = 0; k < body.size(); ++k)
+            {
+                const char c = body[k];
+                if (in_str)
+                {
+                    if (esc)
+                        esc = false;
+                    else if (c == '\\')
+                        esc = true;
+                    else if (c == '"')
+                        in_str = false;
+                    continue;
+                }
+                if (c == '"')
+                    in_str = true;
+                else if (c == '{' && depth++ == 0)
+                    from = k;
+                else if (c == '}' && depth > 0 && --depth == 0)
+                {
+                    out += any ? ",\n" : "\n";
+                    any = true;
+                    out.append(body.substr(from, k + 1 - from));
+                }
+            }
+        }
+        conn->write_buf = out + (any ? "\n]\n" : "]\n");
+        return true;
+    };
+
+    if (verb == "mqtt-pub")
+    {
+        // mqtt-pub <rt> [--qos n] [--retain] <topic> [payload...]
+        uint8_t qos = 0;
+        bool retain = false;
+        size_t i = 2;
+        for (; i < pa.count; ++i)
+        {
+            if (pa.args[i] == "--retain")
+                retain = true;
+            else if (pa.args[i] == "--qos" && i + 1 < pa.count && pa.args[i + 1].size() == 1 &&
+                     pa.args[i + 1][0] >= '0' && pa.args[i + 1][0] <= '2')
+                qos = static_cast<uint8_t>(pa.args[++i][0] - '0');
+            else if (pa.args[i].starts_with("--"))
+            {
+                conn->write_buf = command_usage::line(verb);
+                return 1;
+            }
+            else
+                break;
+        }
+        if (i >= pa.count)
+        {
+            conn->write_buf = command_usage::line(verb);
+            return 1;
+        }
+        const std::string_view topic = pa.args[i];
+        // The CLI sends the payload in base64, which no space, tab or byte of it can change on the way.
+        std::string payload(pa.rest_from(i + 1));
+        if (i + 1 < pa.count && pa.args[i + 1] == "--base64")
+        {
+            payload.clear();
+            if (i + 3 < pa.count || (i + 2 < pa.count && !socketley::base64::decode(pa.args[i + 2], payload)))
+            {
+                conn->write_buf = "--base64 takes one payload in base64\n";
+                return 1;
+            }
+        }
+        std::string reply;
+        if (!ask(0, mq::command_publish(topic, payload, qos, retain), reply))
+            return 1;
+        return 0;
+    }
+    if (verb == "mqtt-sessions")
+        return merged(mq::command_text(mq::verb::sessions)) ? 0 : 1;
+    if (verb == "mqtt-kick")
+    {
+        // mqtt-kick <rt> <client> [--end]
+        const bool end = pa.count == 4 && pa.args[3] == "--end";
+        if (pa.count < 3 || (pa.count == 4 && !end) || pa.count > 4)
+        {
+            conn->write_buf = command_usage::line(verb);
+            return 1;
+        }
+        const std::string payload = mq::command_text(mq::verb::kick, pa.args[2], end);
+        bool kicked = false;
+        for (size_t j = 0; j < shards; ++j)
+        {
+            std::string reply;
+            if (!ask_worker(conn, name, payload, reply, std::chrono::milliseconds(4000), j))
+                return 2;
+            kicked = kicked || reply == "kicked";
+        }
+        if (!kicked)
+        {
+            conn->write_buf = "no session of " + std::string(pa.args[2]) + "\n";
+            return 1;
+        }
+        return 0;
+    }
+    if (verb == "mqtt-retained")
+    {
+        // mqtt-retained <rt> [filter] | --clear <topic>
+        if (pa.count >= 3 && pa.args[2] == "--clear")
+        {
+            if (pa.count != 4)
+            {
+                conn->write_buf = command_usage::line(verb);
+                return 1;
+            }
+            std::string reply;
+            return ask(0, mq::command_text(mq::verb::clear, pa.args[3]), reply) ? 0 : 1;
+        }
+        if (pa.count > 3)
+        {
+            conn->write_buf = command_usage::line(verb);
+            return 1;
+        }
+        std::string reply;
+        if (!ask(0, mq::command_text(mq::verb::retained, pa.count == 3 ? pa.args[2] : std::string_view("#")), reply))
+            return 1;
+        conn->write_buf = reply + "\n";
+        return 0;
+    }
+    if (verb == "mqtt-tap")
+    {
+        // mqtt-tap <rt> open <filter> | poll <id,...> | close <id,...>, one tap a shard.
+        if (pa.count != 4 || (pa.args[2] != "open" && pa.args[2] != "poll" && pa.args[2] != "close"))
+        {
+            conn->write_buf = "usage: mqtt-tap <mqtt> open <filter> | poll <ids> | close <ids>\n";
+            return 1;
+        }
+        if (pa.args[2] == "open")
+        {
+            std::string ids;
+            for (size_t j = 0; j < shards; ++j)
+            {
+                std::string reply;
+                if (!ask(j, mq::command_text(mq::verb::tap_open, pa.args[3]), reply))
+                    return 1;
+                ids += (j ? "," : "") + reply;
+            }
+            conn->write_buf = ids + "\n";
+            return 0;
+        }
+        const bool poll = pa.args[2] == "poll";
+        std::vector<std::string_view> ids;
+        for (std::string_view rest = pa.args[3];;)
+        {
+            const size_t comma = rest.find(',');
+            ids.push_back(rest.substr(0, comma));
+            if (comma == std::string_view::npos)
+                break;
+            rest.remove_prefix(comma + 1);
+        }
+        if (ids.size() != shards)
+        {
+            conn->write_buf = "the tap was opened on another number of shards; open it again\n";
+            return 1;
+        }
+        std::string out;
+        for (size_t j = 0; j < shards; ++j)
+        {
+            std::string reply;
+            if (!ask(j, mq::command_text(poll ? mq::verb::tap_poll : mq::verb::tap_close, ids[j]), reply))
+                return 1;
+            if (poll)
+                out += reply;
+        }
+        conn->write_buf = out;
+        return 0;
+    }
+    conn->write_buf = "unknown command\n";
+    return 1;
 }
 
 // A backup of a db runtime into a file: started by the worker, which answers its number at once, and asked after by
@@ -4114,8 +4380,9 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                 case runtime_sync:
                 case runtime_idp:
                 case runtime_db:
-                    // A storage, DNS, sync, idp or db runtime's own settings
-                    // are applied by `import`, as a cache's are.
+                case runtime_mqtt:
+                    // A storage, DNS, sync, idp, db or mqtt runtime's own
+                    // settings are applied by `import`, as a cache's are.
                     result = -1;
                     break;
                 default:
@@ -4131,17 +4398,18 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
             // A flag `create` takes for this type and `edit` does not is named as one `import` changes, so the answer
             // does not read as a typo; -s and --test are what create does, not settings.
             const bool own_type = type == runtime_cache || type == runtime_storage || type == runtime_idp ||
-                                  type == runtime_db;
+                                  type == runtime_db || type == runtime_mqtt;
             if (own_type && pa.hashes[i] != fnv1a("-s") && pa.hashes[i] != fnv1a("--test") &&
                 runtime_schema::offered(pa.args[i], type))
             {
                 restore_edit();
-                // idp and db read their own settings once, at start.
-                const bool restart = type == runtime_idp || type == runtime_db;
+                // idp, db and mqtt read their own settings once, at start.
+                const bool restart = type == runtime_idp || type == runtime_db || type == runtime_mqtt;
                 std::cout << pa.args[i] << " cannot be changed with `edit`\n"
                           << (type == runtime_cache     ? "  A cache's"
                               : type == runtime_storage ? "  A storage runtime's"
                               : type == runtime_idp     ? "  An idp runtime's"
+                              : type == runtime_mqtt    ? "  An mqtt runtime's"
                                                         : "  A db runtime's")
                           << " own settings are applied by `import`:\n"
                              "    socketley show " << name
@@ -6323,10 +6591,11 @@ bool daemon_handler::serve_map_request(const std::string& op,
         // The runtime this builds runs in the daemon as it always has,
         // deliberately, because making the same three lines of Lua build a
         // different thing depending on which process ran them is the property
-        // this work exists to remove. A sync, an idp and a db are the
-        // exceptions: their work is done on a worker's own loop, which only a
-        // worker turns.
-        if (cfg.type == runtime_sync || cfg.type == runtime_idp || cfg.type == runtime_db)
+        // this work exists to remove. A sync, an idp, a db and an mqtt broker
+        // are the exceptions: their work is done on a worker's own loop, which
+        // only a worker turns.
+        if (cfg.type == runtime_sync || cfg.type == runtime_idp || cfg.type == runtime_db ||
+            cfg.type == runtime_mqtt)
             inst->mark_out_of_process();
         inst->set_lua_created(true);
         inst->set_child_policy(
@@ -6610,6 +6879,8 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
 
 void daemon_handler::reconcile_proxy_workers()
 {
+    // Before a worker of a name is forked again, so a broker made again under it never reads the old one's state.
+    forget_settled_snapshots();
     // What the map says should be running out of process and how many
     // processes each wants, because the count is part of what is being
     // reconciled and not just the presence.
@@ -7399,6 +7670,7 @@ void daemon_handler::on_exit_watch(const io_request* req)
     if (w->pidfd >= 0)
         m_loop.close_fd(w->pidfd);
     m_exit_watches.erase(w);
+    forget_settled_snapshots();
     if (m_torn_down || (m_spawn_waiting.empty() && m_deferred_starts.empty()))
         return;
 
@@ -7478,6 +7750,7 @@ void daemon_handler::park_reply(ipc_connection* conn, std::vector<std::string> n
 
 void daemon_handler::reap_orphan_workers()
 {
+    forget_settled_snapshots();
     if (m_orphan_workers.empty())
         return;
 

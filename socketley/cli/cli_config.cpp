@@ -163,6 +163,18 @@ constexpr config_key config_keys[] = {
     { "backup_dir",         "--backup-dir",         key_kind::text    },
     { "backup_every",       "--backup-every",       key_kind::scalar  },
     { "backup_keep",        "--backup-keep",        key_kind::integer },
+    // ── mqtt ────────────────────────────────────────────────────────────────
+    // idp, anonymous, persistent and persistent_interval are above, shared with the storage's and the cache's.
+    { "users",              "--users",              key_kind::text    },
+    { "acl",                "--acl",                key_kind::text    },
+    { "routes",             "--routes",             key_kind::text    },
+    { "ws",                 "--ws",                 key_kind::integer },
+    { "max_packet",         "--max-packet",         key_kind::scalar  },
+    { "session_expiry",     "--session-expiry",     key_kind::scalar  },
+    { "session_queue",      "--session-queue",      key_kind::integer },
+    { "retained_max",       "--retained-max",       key_kind::scalar  },
+    { "max_sessions",       "--max-sessions",       key_kind::integer },
+    { "keepalive_max",      "--keepalive-max",      key_kind::integer },
 };
 
 // Keys with no flag of their own, listed so an unknown key can still be

@@ -32,20 +32,21 @@ namespace socketley::storage
 {
 
 // Where a bucket's events may be sent, by the name its ARN gives it: a webhook, or another runtime of the daemon -- a
-// cache's stream or pub/sub channel, or a server that hands them to every client it has.
+// cache's stream or pub/sub channel, a server that hands them to every client it has, or a broker's topic.
 struct notify_target
 {
-    enum class kind : uint8_t { webhook, cache_stream, cache_channel, server };
+    enum class kind : uint8_t { webhook, cache_stream, cache_channel, server, mqtt };
     std::string name;
     kind        k{kind::webhook};
     http_target http;
-    // The runtime a target of another kind names, and the stream or channel of a cache's.
+    // The runtime a target of another kind names, and the stream or channel of a cache's or the topic of a broker's.
     std::string runtime;
     std::string topic;
 };
 
 // The targets a file's text names, one `name url [ca=file]` per line with '#' starting a comment, the url a webhook's
-// http(s) one or cache://<runtime>/stream/<key>, cache://<runtime>/channel/<channel> or server://<runtime>; false with
+// http(s) one or cache://<runtime>/stream/<key>, cache://<runtime>/channel/<channel>, server://<runtime> or
+// mqtt://<runtime>/<topic>; false with
 // `why` for a line that is none of these or a name given twice.  Nothing is resolved.
 bool parse_notify_targets(std::string_view text, std::vector<notify_target>& out, std::string& why);
 

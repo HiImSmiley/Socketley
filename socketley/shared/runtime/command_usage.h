@@ -44,6 +44,12 @@ inline constexpr std::string_view for_verb(std::string_view verb)
                "remove|show <user> | list | import <storage>";
     if (verb == "db-backup")  return "db-backup <db> <file>";
     if (verb == "db-restore") return "db-restore <db> <file>";
+    if (verb == "mqtt-pub")      return "mqtt-pub <mqtt> [--qos 0|1|2] [--retain] <topic> [payload]";
+    if (verb == "mqtt-sub")      return "mqtt-sub <mqtt> <filter> [--count <n>]";
+    if (verb == "mqtt-sessions") return "mqtt-sessions <mqtt>";
+    if (verb == "mqtt-kick")     return "mqtt-kick <mqtt> <client> [--end]";
+    if (verb == "mqtt-retained") return "mqtt-retained <mqtt> [filter] | --clear <topic>";
+    if (verb == "mqtt-passwd")   return "mqtt-passwd <file> <user> [--delete]";
     if (verb == "cluster")
         return "cluster [ls|ps|group <name>|stats|watch|show <daemon>|raft-status|placement|"
                "create <type> <name> [flags] [--replicas <n>]|scale <name> <n>|remove <name>]";
@@ -56,6 +62,8 @@ inline constexpr std::string_view for_verb(std::string_view verb)
 inline constexpr std::string_view second_line(std::string_view verb)
 {
     if (verb == "send") return "       echo 'msg' | socketley send <name>";
+    if (verb == "mqtt-pub") return "       echo 'msg' | socketley mqtt-pub <mqtt> <topic>";
+    if (verb == "mqtt-passwd") return "       the password is read from stdin, or asked for on a terminal";
     if (verb == "ls")
         return "       columns: --id --name --type --port --status --conn "
                "--owner --created --group";

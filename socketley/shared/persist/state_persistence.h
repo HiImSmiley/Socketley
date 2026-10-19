@@ -218,6 +218,20 @@ struct runtime_config
     uint32_t db_backup_every = 86400;
     uint32_t db_backup_keep = 7;
 
+    // Mqtt; its snapshot is persistent_path and persistent_interval, as a cache's file is.
+    std::string mqtt_users;
+    std::string mqtt_idp;
+    std::string mqtt_acl;
+    std::string mqtt_routes;
+    bool mqtt_anonymous = false;
+    uint16_t mqtt_ws_port = 0;
+    uint32_t mqtt_max_packet = 256u << 10;
+    uint32_t mqtt_session_expiry = 86400;
+    uint32_t mqtt_session_queue = 1000;
+    uint64_t mqtt_retained_max = 64ull << 20;
+    uint32_t mqtt_max_sessions = 100000;
+    uint16_t mqtt_keepalive_max = 1200;
+
     // A registered type's own fields in declaration order, opaque here, held
     // as strings because the schema that gives them kinds lives in a manifest.
     std::vector<std::pair<std::string, std::string>> extra;
