@@ -461,6 +461,40 @@ cli_commands() {
     echo -e "  ${CYAN}socketley db-restore data /var/backups/data.dbbackup${NC}"
     echo ""
 
+    echo -e "${BOLD}mqtt-pub <mqtt> [--qos 0|1|2] [--retain] <topic> [payload]${NC}"
+    echo "  A message published on a broker as its own; the payload is the"
+    echo "  words after the topic, or stdin. Silent when the broker has it."
+    echo -e "  ${CYAN}socketley mqtt-pub broker --qos 1 --retain firmware/latest 2.4.1${NC}"
+    echo ""
+
+    echo -e "${BOLD}mqtt-sub <mqtt> <filter> [--count <n>]${NC}"
+    echo "  Every message the broker accepts on a matching topic, one JSON"
+    echo "  line each, until interrupted or n have arrived."
+    echo -e "  ${CYAN}socketley mqtt-sub broker 'sensor/#'${NC}"
+    echo ""
+
+    echo -e "${BOLD}mqtt-sessions <mqtt>${NC}"
+    echo "  The broker's sessions on every shard as JSON: client, user,"
+    echo "  connected, subscriptions, queued and in flight."
+    echo -e "  ${CYAN}socketley mqtt-sessions broker${NC}"
+    echo ""
+
+    echo -e "${BOLD}mqtt-kick <mqtt> <client> [--end]${NC}"
+    echo "  Disconnects a client without its will; --end ends its session too."
+    echo -e "  ${CYAN}socketley mqtt-kick broker sensor-17 --end${NC}"
+    echo ""
+
+    echo -e "${BOLD}mqtt-retained <mqtt> [filter] | --clear <topic>${NC}"
+    echo "  The retained messages a filter matches as JSON, or one cleared."
+    echo -e "  ${CYAN}socketley mqtt-retained broker 'firmware/#'${NC}"
+    echo ""
+
+    echo -e "${BOLD}mqtt-passwd <file> <user> [--delete]${NC}"
+    echo "  Sets a user's password in a --users file, read from stdin or asked"
+    echo "  for twice, kept as a scrypt hash; needs no daemon."
+    echo -e "  ${CYAN}socketley mqtt-passwd /etc/socketley/mqtt.users sensor-17${NC}"
+    echo ""
+
     echo -e "${BOLD}git-sync --url <url> --branch <name|*> --work <dir> --endpoint <host:port> [--tls [--ca <file>]] --bucket <library> --name <folder> [--keep <d,w,m>] [--move-from <library>]${NC}"
     echo "  Fetch one repository into a storage runtime's library: the branch's"
     echo "  files under <folder>/ and a bundle of its history under _backups/."
@@ -831,6 +865,26 @@ runtime_types() {
     echo -e "${CYAN}│${NC} Scripts: socketley.db.get/put/patch/query(\"data\", ...)         ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Example: socketley create db data -p 9500 --idp auth \\         ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   --schema /etc/socketley/db.schema --keys /etc/socketley/k -s ${CYAN}│${NC}"
+    echo -e "${CYAN}└─────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+
+    echo -e "${CYAN}┌─────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC} ${BOLD}MQTT${NC}                                                          ${CYAN}│${NC}"
+    echo -e "${CYAN}├─────────────────────────────────────────────────────────────────┤${NC}"
+    echo -e "${CYAN}│${NC} A broker for devices, apps and browsers: MQTT 3.1, 3.1.1, 5.0  ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   on TCP, TLS and WebSocket (--ws port). Default port 1883.    ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Sessions wait for clients that went away: QoS 0/1/2, retained, ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   wills, shared subscriptions, kept across restarts with       ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   --persistent on.                                             ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Who: --users file (mqtt-passwd), --idp auth, --ca for client   ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   certificates, --anonymous; what: --acl file (Mosquitto's).   ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Rules: --routes file, filter -> cache://, db://, storage://,   ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   server:// or mqtt://, queued while a target is down.         ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} In: socketley.mqtt.publish, mqtt-pub, a storage's mqtt://.     ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Cores: --shards N, one broker over the shards.                 ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Lua: on_auth, on_publish, on_subscribe, on_connect.            ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} Example: socketley create mqtt broker --anonymous \\            ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   --ws 8083 --persistent on -s                                 ${CYAN}│${NC}"
     echo -e "${CYAN}└─────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
 
@@ -3254,7 +3308,8 @@ sdk_cross() {
 # stdout with a live stdin still cannot show a menu worth drawing.
 plain_help() {
     cat <<'EOF'
-socketley — a daemon for long-living network runtimes (server, client, proxy, cache, storage, dns)
+socketley — a daemon for long-living network runtimes (server, client, proxy, cache, storage, dns, sync, idp,
+db, mqtt)
 
 USAGE
   socketley <command> [options]
@@ -3263,8 +3318,8 @@ USAGE
   socketley --lua <file>
 
 RUNTIMES
-  create <type> <name> [flags]   create a server, client, proxy, cache, storage, dns, sync, or
-                                 a manifest-registered type (man: REGISTERED TYPES)
+  create <type> <name> [flags]   create a server, client, proxy, cache, storage, dns, sync, idp,
+                                 db, mqtt, or a manifest-registered type (man: REGISTERED TYPES)
   start|stop|restart <name>      lifecycle
   remove <name>                  remove a runtime
   ls | ps [-a] [--json]          list runtimes
@@ -3281,6 +3336,9 @@ OTHER
   attach <type> <name> <port>    register a process the daemon did not start
   dashboard                      terminal dashboard
   ping                           is the daemon answering
+  mqtt-pub | mqtt-sub            publish on a broker, or read what it accepts
+  mqtt-sessions | mqtt-kick      a broker's sessions, or one disconnected
+  mqtt-retained | mqtt-passwd    retained messages, or a --users file's password
   version | --version | -v       version
 
   --help, -h                     this text; in a terminal, an interactive browser

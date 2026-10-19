@@ -122,7 +122,8 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .SH DESCRIPTION
 .B socketley
 is a high-performance Linux daemon and CLI that manages network runtimes
-(servers, clients, proxies, Redis-compatible caches, S3 object storage, authoritative DNS) in a Docker-like style \(em
+(servers, clients, proxies, Redis-compatible caches, S3 object storage, authoritative DNS, MQTT brokers) in a
+Docker-like style \(em
 with clustering, WebSocket, Lua scripting, and io_uring async I/O.
 .PP
 .B "TLS terminates on a server or cache listener, on both of a proxy's legs, and on a client's dial."
@@ -163,7 +164,13 @@ thing it refuses is
 together with
 .BR \-\-replicate :
 replication is not encrypted, so the pair would put the whole dataset on the
-wire in the clear. A runtime carrying a configuration that cannot be honoured
+wire in the clear. An
+.B mqtt
+broker terminates TLS on its MQTT and WebSocket ports with the same three flags,
+and with
+.B \-\-ca
+takes the name of a verified client certificate as the client's user. A runtime
+carrying a configuration that cannot be honoured
 (for example one restored from a state file written by an older release)
 refuses to start rather than running in cleartext. See
 .B TLS
@@ -507,7 +514,7 @@ socketley daemon --name new-name   # rename while cluster is active
 .BI "create " "type name " "[flags]"
 Create a new runtime instance.
 .I type
-can be: server, client, proxy, cache, storage, dns, sync, idp, db, or any registered type \(em see
+can be: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, or any registered type \(em see
 .BR "REGISTERED TYPES" .
 .I name
 is a unique identifier for the runtime.
@@ -884,6 +891,77 @@ and one that is not a backup changes nothing; then the runtime is stopped, its
 documents kept aside beside them as
 .IB dir .before\-restore ,
 the backup put in their place, and the runtime started again if it was running.
+.TP
+.BI "mqtt\-pub " "mqtt " "\fR[\fB\-\-qos \fR0|1|2] [\fB\-\-retain\fR] \fItopic\fR [\fIpayload\fR]"
+A message published on an mqtt runtime as its own, at the QoS and retained when
+asked: the payload is the words after the topic, or stdin when there are none,
+its last newline dropped, carried byte for byte. Silent when the broker has it;
+a topic with
+.B +
+or
+.B #
+or one starting with
+.B $
+is refused with exit 1.
+.RS
+.PP
+.nf
+socketley mqtt\-pub broker \-\-qos 1 \-\-retain firmware/latest 2.4.1
+gzip \-c report.json | socketley mqtt\-pub broker reports/daily
+.fi
+.RE
+.TP
+.BI "mqtt\-sub " "mqtt filter " "\fR[\fB\-\-count \fIn\fR]"
+Every message the broker accepts whose topic
+.I filter
+matches, printed as it arrives as one JSON line,
+.BR {"topic":..,"payload":..,"qos":..,"retain":..,"client":..} ,
+a payload that is not UTF-8 as
+.BR {"base64":..} ,
+until interrupted or
+.I n
+have been printed. It takes no session and changes nothing; a line
+.B {"dropped":n}
+says that many were not read in time.
+.TP
+.BI "mqtt\-sessions " mqtt
+The broker's sessions, of every shard, as a JSON array: the client id, the
+user, whether it is connected, the protocol version, the peer, its
+subscriptions, the messages queued and in flight, the seconds left until it
+expires while away, and its shard.
+.TP
+.BI "mqtt\-kick " "mqtt client " "\fR[\fB\-\-end\fR]"
+Disconnects the client, telling a 5.0 client it was an administrative action,
+without sending its will; the session stays for it to come back to, or with
+.B \-\-end
+ends too. A client id with no session is exit 1.
+.TP
+.BI "mqtt\-retained " mqtt " \fR[\fIfilter\fR] | \fB\-\-clear \fItopic"
+The retained messages whose topics the filter matches
+.RB ( # ,
+every one but
+.BR $SYS ,
+unless given) as a JSON array, or the one on
+.I topic
+cleared.
+.TP
+.BI "mqtt\-passwd " "file user " "\fR[\fB\-\-delete\fR]"
+Sets the password of
+.I user
+in a users file for
+.BR \-\-users ,
+read from stdin, or asked for twice without echo on a terminal, and kept as a
+scrypt hash; the file is made with mode 0600 and replaced whole, every other
+line kept. With
+.B \-\-delete
+the user goes. It needs no daemon; a broker reads the file again within two
+seconds.
+.RS
+.PP
+.nf
+socketley mqtt\-passwd /etc/socketley/mqtt.users sensor\-17
+.fi
+.RE
 .TP
 .B git\-sync \-\-url \fIurl\fR \-\-branch \fIname\fR|\fB*\fR \-\-work \fIdir\fR \-\-endpoint \fIhost\fB:\fIport\fR \fR[\fB\-\-tls\fR [\fB\-\-ca \fIfile\fR]] \fB\-\-bucket \fIlibrary\fR \fB\-\-name \fIfolder\fR [\fB\-\-keep \fIdays\fB,\fIweeks\fB,\fImonths\fR] [\fB\-\-move\-from \fIlibrary\fR]
 One run of a repository a storage runtime keeps (see
@@ -1340,7 +1418,7 @@ name	Runtime name \fB(requires restart)\fR
 id	6-char hex identifier (read-only, ignored on import)
 type	T{
 .ad l
-Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db (read-only, ignored on import)
+Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt (read-only, ignored on import)
 T}
 was_running	Internal daemon state (ignored on import)
 .TE
@@ -6761,6 +6839,7 @@ thumbs   https://thumbs.internal/hook ca=/etc/ssl/internal\-ca.pem
 feed     cache://events/stream/s3
 live     cache://events/channel/s3
 panel    server://dashboard
+bus      mqtt://broker/storage/events
 .fi
 .RE
 .IP
@@ -6771,7 +6850,10 @@ appends each event to that cache's stream as an entry of one field
 .BI cache:// runtime /channel/ channel
 publishes it on that channel, and
 .BI server:// runtime
-broadcasts it to the server's clients; such a line takes no
+broadcasts it to the server's clients, and
+.BI mqtt:// runtime / topic
+publishes it on that broker's topic at QoS 1, answered once the broker holds
+it; such a line takes no
 .BR ca= .
 An event a cache refuses or a runtime that is not running is retried like a
 webhook that does not answer.
@@ -12047,6 +12129,380 @@ socketley.db.tx("data", { { op = "put", c = "a", id = "x", doc = {} }, { op = "d
 Each answers the document (or the transaction's results), or nil, an error
 code and a sentence. Inside a callback that can wait it waits; anywhere else
 the last argument is a function called with the answer.
+.SH MQTT FLAGS
+An
+.B mqtt
+runtime is an MQTT broker, for 3.1, 3.1.1 and 5.0, on TCP, TLS and WebSocket:
+devices, apps and browsers publish to topics and subscribe to them, and a
+client that goes away keeps its session \(em its subscriptions and the messages
+sent to them while it was gone \(em until it comes back or the session expires.
+It is a runtime like the others: messages reach a cache, a db, a storage, a
+server or another broker by rules of its own, and a storage's events and a
+script's messages reach its subscribers.
+.PP
+.nf
+socketley mqtt\-passwd /etc/socketley/mqtt.users sensor\-17
+socketley create mqtt broker \-\-users /etc/socketley/mqtt.users \e
+    \-\-acl /etc/socketley/mqtt.acl \-\-ws 8083 \-\-persistent on \-s
+socketley create mqtt devices \-p 8883 \-\-tls \-\-cert dev.pem \-\-key dev.key \e
+    \-\-ca devices\-ca.pem \-\-routes /etc/socketley/mqtt.routes \-s
+.fi
+.PP
+It listens on 1883, or 8883 with
+.BR \-\-tls ,
+unless
+.B \-p
+says otherwise.
+.B \-\-max\-connections
+and
+.B \-\-write\-buffer
+hold as for a server: past the write buffer owed to a slow client its QoS 0
+messages are dropped and counted, and QoS 1 and 2 wait in its session.
+.PP
+.B What it implements.
+QoS 0, 1 and 2, the last exactly once by its packet identifier; retained
+messages, cleared by an empty one; wills, sent when a connection is lost or a
+5.0 client disconnects asking for it and not when it disconnects cleanly, after
+a 5.0 will delay if one is given and not at all when the client comes back
+within it; sessions kept by 3.1.1's clean session 0 and 5.0's session expiry,
+one connection to a client id, a second taking the session over and the first
+told so; keep alive, a client silent for one and a half times it disconnected;
+a CONNECT within ten seconds or the connection closed; and of 5.0 the session
+and message expiry, the receive maximum both ways, topic aliases, the maximum
+packet size, subscription identifiers, no local, retain as published, retain
+handling, shared subscriptions
+.RB ( $share/\fIgroup\fB/\fIfilter\fR,
+each message to one member, in turn), request and response (the response
+topic and correlation data carried), user properties, the content type and the
+payload format, and reason codes and strings on what it refuses. Wildcards
+.B +
+and
+.B #
+do not match a topic beginning with
+.BR $ .
+It publishes its own figures, retained, under
+.B $SYS/broker/
+every ten seconds: version, uptime, clients, messages and subscriptions. It
+does not take the 5.0 AUTH exchange (a CONNECT naming an authentication method
+is refused with 0x8C) and does not bridge to brokers outside the daemon.
+.PP
+.B Who may connect.
+At least one of
+.BR \-\-users ,
+.BR \-\-idp ,
+.B \-\-ca
+or
+.B \-\-anonymous
+must be given. A client certificate the
+.B \-\-ca
+verified lets its client in under the certificate's common name. A password is
+checked against the users file, off the event loop, or else, with
+.BR \-\-idp ,
+taken as an access token of that provider, its account's name the user (a user
+name given with it must be that name). Without credentials a client is let in
+only with
+.BR \-\-anonymous .
+A refusal is 0x86 (bad user name or password), 4 to a 3.1.1 client. A script's
+.B on_auth
+has the last word (see
+.B Lua
+below).
+.PP
+.B What each may do.
+.B \-\-acl
+names rules in Mosquitto's form, read again within two seconds of a change:
+.RS
+.PP
+.nf
+# before any user line: clients without one
+topic read public/#
+user alice
+topic readwrite home/alice/#
+topic write telemetry/#
+topic deny telemetry/secret/#
+pattern readwrite users/%u/#
+pattern write devices/%c/state
+.fi
+.RE
+.IP
+.B topic
+.RB [ read | write | readwrite | deny ]
+.I filter
+applies to the user named last;
+.B pattern
+to everyone, with
+.B %u
+the user and
+.B %c
+the client id, each standing for one level. A deny wins over any grant; what
+no rule grants is refused. A publish refused is answered 0x87 to a 5.0 client,
+acknowledged and dropped for a 3.1.1 one; a subscription is refused only when
+no rule grants all of it, and a message a deny covers is held back from a
+subscription it covers in part. Without
+.B \-\-acl
+every client may do everything.
+.PP
+.B Sessions across a restart.
+With
+.B \-\-persistent
+the sessions, their queues and messages in flight, the retained messages and
+the topic rules' queues are written to a snapshot every
+.B \-\-persistent\-interval
+when something changed, off the event loop, and at stop; a start reads them
+back, so a stop, a restart of the daemon or a killed worker loses at most that
+interval. A session with no expiry left, and the wills it was owed, are ended
+and sent at the start that finds them. Without it the broker keeps nothing
+across a restart.
+.PP
+.B Topic rules.
+.B \-\-routes
+names a file of rules, a filter and a target a line, that hand every message
+the filter matches to another runtime of the daemon beside the broker's own
+subscribers:
+.RS
+.PP
+.nf
+# filter          target
+sensor/+/temp     cache://telemetry/stream/temps\-%1
+alarm/#           cache://events/channel/alarms
+device/+/state    db://fleet/devices/%1
+log/#             storage://raw/mqtt/%Y/%m/%d/
+chat/#            server://chat
+share/#           mqtt://other/from\-edge/%t
+.fi
+.RE
+.IP
+.BI cache:// runtime /stream/ key
+adds a stream entry of the fields
+.BR topic ,
+.BR payload ,
+.B qos
+and
+.BR client ;
+.BI cache:// runtime /channel/ name
+publishes the payload on the channel;
+.BI db:// runtime / collection\fR[\fB/\fIid\fR]
+puts the payload as the document when it is a JSON object, and else
+.B {"topic":..,"payload":..,"client":..,"qos":..}
+\(em under
+.I id
+when given, as a new document otherwise;
+.BI storage:// runtime / bucket\fR[\fB/\fIprefix\fR]
+gathers the messages as JSON lines,
+.BR {"at":..,"topic":..,"payload":..,"qos":..,"client":..} ,
+into one
+.B .ndjson
+object a minute (or a megabyte, or at stop) under the prefix;
+.BI server:// runtime
+sends every client of the server
+.B {"topic":..,"payload":..}
+as a line; and
+.BI mqtt:// runtime / topic
+publishes on that broker, at the message's QoS and retained as it was.
+.B %1
+to
+.B %9
+stand for the levels the filter's
+.B +
+matched,
+.B %t
+for the whole topic and
+.B %c
+for the client that published; a storage prefix also takes
+.BR %Y ,
+.BR %m ,
+.BR %d ,
+.B %H
+and
+.BR %M .
+A line beginning with
+.B #
+is a comment, and so is a
+.B #
+after a target. The file is read at start; one that does not read stops it,
+naming the line.
+.IP
+Each rule has a queue of its own, in order: a target that is stopped or does
+not answer holds its messages, tried again after a pause that grows to five
+seconds, without holding up the broker or the other rules, and up to 100000
+messages, the oldest dropped past them and counted. What a rule holds goes into
+the snapshot, those in flight in their place, so a restart sends them again: a
+target gets each message at least once.
+.B stats
+names each rule with what it delivered, what its target refused, what was
+dropped, what it holds and its last error.
+.PP
+.B From the other runtimes.
+.B socketley mqtt\-pub
+and a script's
+.B socketley.mqtt.publish
+publish as the broker's own, a storage's
+.BI mqtt:// runtime / topic
+notification target publishes its events (see
+.BR \-\-notify\-targets ),
+and
+.B mqtt://
+rules of another broker publish theirs:
+.RS
+.PP
+.nf
+local ok, err = socketley.mqtt.publish("broker", "game/" .. id .. "/move", move, { qos = 1 })
+socketley.mqtt.publish("broker", "chat/lobby", text, { retain = false }, function(ok, err) end)
+.fi
+.RE
+.IP
+It answers true once the broker has the message, or nil and the reason; inside
+a callback that can wait it waits, anywhere else the last argument is a function
+called with the answer.
+.PP
+.B WebSocket.
+.BI "\-\-ws " port
+serves MQTT inside WebSocket on a second port for browsers (any path,
+.B /mqtt
+by convention), the subprotocol
+.B mqtt
+or
+.B mqttv3.1
+chosen when offered, a packet carried in any number of frames and frames
+holding any number of packets. With
+.B \-\-tls
+it is wss.
+.PP
+.B On several cores.
+With
+.BI "\-\-shards " N
+the broker is
+.I N
+worker processes sharing its ports
+.RB ( SO_REUSEPORT ),
+one broker to its clients: each shard tells the others what its clients
+subscribe to and hands them the messages their subscribers want, a retained
+message is kept by all, a shared subscription's message goes to one member of
+the group over all the shards, and a client connecting to another shard than
+before takes its session with it, the newest connection of a client id winning.
+Each shard keeps a snapshot of its own,
+.IB file . shard\fR,
+and publishes its figures under
+.BI $SYS/broker/shard/ n /\fR.
+.PP
+.B Lua.
+A broker's
+.B \-\-lua
+script may decide who connects and what passes. Each hook that decides
+answers
+.B true
+to allow,
+.B false
+to refuse, and nothing to keep what the broker decided; a hook that fails
+refuses. A client is a table of
+.BR id ,
+.BR username ,
+.B peer
+and
+.BR version .
+.RS
+.PP
+.nf
+function on_auth(c)          \-\- c.id c.username c.password c.peer
+    if c.username == "robot" then return c.password == "beep" end
+end                          \-\- c.certificate c.authenticated c.account c.version
+function on_publish(client, msg)              \-\- msg.topic msg.payload msg.qos msg.retain
+    if msg.topic == "shout" then return { payload = string.upper(msg.payload) } end
+end
+function on_subscribe(client, filter, qos) return filter ~= "secret/#" end
+function on_connect(client) self.publish("presence/" .. client.id, "online", { retain = true }) end
+function on_disconnect(client, why) self.publish("presence/" .. client.id, "offline", { retain = true }) end
+.fi
+.RE
+.IP
+.B on_auth
+is given whether the credentials checked out
+.RB ( authenticated )
+and as whom
+.RB ( account );
+letting in a client they refused makes the user name it gave its user.
+.B on_publish
+may also answer a table, the message as it is to go on (any of
+.BR topic ,
+.BR payload ,
+.BR qos ,
+.BR retain );
+a refused publish is answered 0x87.
+.B self.publish(topic, payload [, {qos=, retain=}])
+publishes as the broker,
+.B self.retained(topic)
+reads a retained payload,
+.B self.sessions()
+lists this shard's sessions and
+.B self.kick(client_id [, end])
+disconnects one. While a hook decides, that connection's next packets wait.
+.TP
+.BI "\-\-users " file
+The accounts that sign in with a password,
+.IB user : hash
+a line as
+.B socketley mqtt\-passwd
+writes them; read again within two seconds of a change.
+.TP
+.BI "\-\-idp " runtime
+The idp runtime whose access tokens, given as the password, sign clients in.
+.TP
+.BI "\-\-acl " file
+Who may publish and subscribe to what (see
+.B What each may do
+above).
+.TP
+.B \-\-anonymous
+Lets in clients without credentials, as the rules allow.
+.TP
+.BI "\-\-routes " file
+Where messages go besides their subscribers (see
+.B Topic rules
+above).
+.TP
+.BI "\-\-ws " port
+A second port, for MQTT over WebSocket.
+.TP
+.BI "\-\-persistent " file \fR|\fBon
+The snapshot sessions and retained messages are kept in;
+.B on
+for
+.IB state /mqtt/ name .snapshot
+under the state directory.
+.TP
+.BI "\-\-persistent\-interval " duration
+How often what changed reaches the snapshot, 1s unless given.
+.TP
+.BI "\-\-max\-packet " size
+The largest packet a client may send, 64 bytes to 256M, 256K unless given; a
+larger one is answered 0x95 and the connection closed. It is told to 5.0
+clients, and no message larger than a client says it takes is sent to it.
+.TP
+.BI "\-\-session\-expiry " duration
+The longest a session outlives its connection, whatever the client asks; 1d
+unless given. A 3.1.1 session kept by clean session 0 lasts this long.
+.TP
+.BI "\-\-session\-queue " n
+The messages kept for one session while its client is away or slow, 1000
+unless given; past it the oldest go, counted.
+.TP
+.BI "\-\-retained\-max " size
+The most bytes retained messages take, 64M unless given; a new one past it is
+not kept, counted.
+.TP
+.BI "\-\-max\-sessions " n
+The most sessions, connected or not, 100000 unless given; a new client past it
+is refused with 0x97.
+.TP
+.BI "\-\-keepalive\-max " seconds
+The longest keep alive granted, 1200 unless given; a 5.0 client asking more or
+none is told this one.
+.PP
+.B stats
+says the sessions and those connected, the subscriptions, the retained
+messages and their bytes, what is queued and in flight, the messages received
+and sent at each QoS, what was dropped and why, the connects and the refusals,
+the snapshots, each topic rule, and over shards what was handed between them.
 .SH REGISTERED TYPES
 A runtime type beyond the built-in seven is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never
@@ -12716,6 +13172,19 @@ assume anything about its value.
 .TP
 .B on_disconnect(client_id)
 Called when a client disconnects (server/client).
+.TP
+.B on_publish(client, msg) \(-> bool | table
+.TQ
+.B on_subscribe(client, filter, qos) \(-> bool
+An mqtt runtime's, deciding what passes; there
+.BR on_auth ,
+.B on_connect
+and
+.B on_disconnect
+are given a client table. See
+.B Lua
+under
+.BR "MQTT FLAGS" .
 .TP
 .B on_send(msg)
 Called when message sent.
@@ -14167,6 +14636,13 @@ than once \(em
 .B on_tick
 is the ordinary one \(em registers the same handler again on every call, and
 each publish is delivered to every copy.
+.TP
+.B socketley.mqtt.publish(runtime, topic, payload [, {qos=, retain=}] [, fn]) \(-> true | nil, why
+A message published on an mqtt runtime of this daemon, as the broker's own;
+true once the broker has it. See
+.B From the other runtimes
+under
+.BR "MQTT FLAGS" .
 .TP
 .B socketley.http(opts) \(-> table
 Synchronous HTTP/HTTPS client.
