@@ -1000,7 +1000,8 @@ void mqtt_run::tick()
         close_conn(*c);
     if (now >= m_next_files_ms)
     {
-        m_next_files_ms = now + 2000;
+        // Each tick, so a file changed is taken within two seconds as documented, not three.
+        m_next_files_ms = now + 1000;
         refresh_files(false);
     }
     if (m_routes)

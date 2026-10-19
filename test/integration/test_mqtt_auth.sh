@@ -248,6 +248,10 @@ if phase == "main":
 
 if phase == "reread":
     def reread():
+        # Taken within two seconds of the change; asked again for a while, since a loaded box delays a tick.
+        end = time.time() + 5
+        while time.time() < end and code_of(pa, client_id="r1", username="alice", password="alicenew9") != 0:
+            time.sleep(0.2)
         check("a password changed in the file is taken while running",
               code_of(pa, client_id="r1", username="alice", password="alicenew9"), 0)
         check("and the old one refused", code_of(pa, client_id="r2", username="alice", password="alicepass1"), 0x86)
@@ -263,7 +267,6 @@ tally < <(run main)
 
 printf 'alicenew9\n' | "$BIN" mqtt-passwd "$T/users" alice >/dev/null 2>&1
 sed -i 's|^topic read public/#|topic read granted/now|' "$T/acl"
-sleep 2.5
 tally < <(run reread)
 
 st=$("$BIN" stats a 2>&1)
