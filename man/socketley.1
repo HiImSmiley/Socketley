@@ -12380,6 +12380,12 @@ subscribe to and hands them the messages their subscribers want, a retained
 message is kept by all, a shared subscription's message goes to one member of
 the group over all the shards, and a client connecting to another shard than
 before takes its session with it, the newest connection of a client id winning.
+A shard that cannot take what another hands it as fast holds back that other
+shard's QoS 1 and 2 publishers, whose answer waits, rather than lose what they
+were answered for. A message for it is dropped only at QoS 0 once 8 MiB wait
+for it, or at any QoS once what it was handed has failed for three seconds, and
+counted in
+.BR shard_dropped .
 Each shard keeps a snapshot of its own,
 .IB file . shard\fR,
 and publishes its figures under

@@ -71,6 +71,8 @@ struct fake_hooks : broker_hooks
         disconnects.push_back(c.client_id + ":" + std::string(why));
     }
     void accepted(const message_ptr& m) override { accepted_topics.push_back(m->topic); }
+    bool room{true};
+    bool publish_room() const override { return room; }
 };
 
 // What a test client reads back: every packet the broker wrote to it since the last look.
@@ -1145,4 +1147,35 @@ TEST_CASE("the subscription tree takes its wildcard levels away with their last 
     std::sort(got.begin(), got.end());
     CHECK(got == std::vector<uint64_t>{3, 4});
     CHECK(topic_levels(deep).view().size() == 41);
+}
+
+TEST_CASE("a publisher at QoS 1 waits for room on the way to the other shards, one at QoS 0 does not")
+{
+    rig r;
+    const uint64_t s = r.connect("s");
+    const uint64_t p = r.connect("p");
+    r.send(s, sub("t/#", 1));
+    r.packets(s);
+    r.packets(p);
+    r.hooks.room = false;
+    r.send(p, pub("t/a", "held", 1, 5) + pub("t/b", "behind", 1, 6));
+    CHECK(r.packets(p).empty());
+    CHECK(r.packets(s).empty());
+    r.send(p, pub("t/c", "later", 1, 7));
+    CHECK(r.packets(p).empty());
+    // Room again: what waited goes on, in order, each answered once.
+    r.hooks.room = true;
+    r.b->room();
+    const auto acks = r.packets(p);
+    REQUIRE(acks.size() == 3);
+    const auto got = r.packets(s);
+    REQUIRE(got.size() == 3);
+    CHECK(publish_of(got[0], level_311).payload == "held");
+    CHECK(publish_of(got[2], level_311).payload == "later");
+    // QoS 0 asks for no answer, so nothing holds it.
+    r.hooks.room = false;
+    r.send(p, pub("t/d", "free", 0));
+    const auto free = r.packets(s);
+    REQUIRE(free.size() == 1);
+    CHECK(publish_of(free[0], level_311).payload == "free");
 }

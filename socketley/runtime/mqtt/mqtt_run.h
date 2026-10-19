@@ -83,6 +83,8 @@ public:
     void accepted(const message_ptr& m) override;
     void retained_changed(const std::string& topic, const message_ptr& now) override;
     bool shared_here(std::string_view key) override;
+    bool publish_room() const override;
+    bool heard_elsewhere(std::string_view topic) override;
     void filter_added(const std::string& filter) override;
     void filter_removed(const std::string& filter) override;
 
@@ -180,6 +182,30 @@ private:
     void share_retained(const std::string& topic, const message_ptr& now);
     void share_interest(uint8_t verb, const std::vector<std::string>& filters);
     void post_shard(uint32_t to, std::string payload, uint64_t cookie);
+    // What waits here for one shard, and what is posted to it and not yet receipted.
+    struct shard_queue
+    {
+        std::string pending;
+        size_t      head{0};
+        size_t      flying{0};
+        int64_t     failing_since{0};
+        int64_t     retry_at{0};
+        size_t waiting() const { return pending.size() - head; }
+    };
+    struct shard_batch
+    {
+        uint32_t    to{0};
+        std::string frames;
+    };
+    // A word owed only a receipt, kept for the next batch; false when it is dropped instead.
+    bool queue_shard(uint32_t to, std::string_view frame, bool droppable);
+    void send_shard(uint32_t to);
+    void send_shards();
+    bool unreachable(const shard_queue& q) const;
+    // True when the cookie was a batch's, whatever its answer.
+    bool shard_receipt(uint64_t cookie, request_status st);
+    // One word from another shard, alone or out of a batch; `reply` is what a question is answered with.
+    void shard_frame(std::string_view payload, std::string& reply);
     // Asks every other shard to give up the session of a client about to connect here, then answers `done`.
     void claim(const auth_ask& ask, auth_answer a, std::function<void(auth_answer)> done);
     void claim_reply(uint64_t cookie, request_status st, std::string_view reply);
@@ -249,6 +275,12 @@ private:
         bool known{false};
     };
     std::vector<peer> m_peers;
+    std::vector<shard_queue> m_squeue;
+    std::unordered_map<uint64_t, shard_batch> m_shard_batches;
+    // Each retained topic's last change by its stamp, for as long as an older one could still be on its way.
+    std::unordered_map<std::string, uint64_t> m_retained_stamps;
+    uint64_t m_shard_dropped{0};
+    uint64_t m_shard_resent{0};
     // The shared groups this message's delivery chose another shard for, filled while it is routed here.
     std::vector<std::vector<std::string>> m_assign;
     std::unordered_map<std::string, uint64_t> m_group_turn;

@@ -9,6 +9,7 @@
 #   * a shared subscription's message delivered once per shard instead of once per group
 #   * mqtt-sessions, mqtt-kick or mqtt-sub seeing one shard only
 #   * a shard's sessions lost across a restart because the shards share one snapshot
+#   * a message a QoS 1 publisher had answered lost because the shard it was for could not take it then
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -38,7 +39,7 @@ for _ in $(seq 1 50); do
 done
 
 run() {
-    PYTHONPATH="$HERE" python3 - "$1" "$P" "$BIN" 2>&1 <<'PY'
+    PYTHONPATH="$HERE" python3 - "$1" "${2:-$P}" "$BIN" 2>&1 <<'PY'
 import json, subprocess, sys, time
 from lib_mqtt import *
 phase, port, binary = sys.argv[1], int(sys.argv[2]), sys.argv[3]
@@ -203,6 +204,62 @@ if phase == "main":
         time.sleep(1.6)
     guarded("keep", keep)
 
+if phase == "stall":
+    def stall():
+        import os, re, signal
+
+        def owner(c):
+            lport = c.sock.getsockname()[1]
+            out = subprocess.run(["ss", "-tnpH", "sport = :%d and dport = :%d" % (port, lport)],
+                                 capture_output=True, timeout=10).stdout.decode()
+            m = re.search(r"pid=(\d+)", out)
+            return int(m.group(1)) if m else None
+
+        pub = connected(port, "fl-pub")
+        home = owner(pub)
+        far = None
+        for i in range(32):
+            c = connected(port, "fl-sub-%d" % i)
+            if owner(c) not in (home, None):
+                far = c
+                break
+            c.disconnect()
+        truth("a subscriber lands on another shard than the publisher", far is not None, home)
+        if far is None:
+            return
+        far.subscribe(("flood/#", 1))
+        time.sleep(0.5)
+        # Sixteen MiB for a shard that stopped taking: past what the other shard queues for it.
+        total, pad = 4000, b"." * 4090
+        sent = acked = 0
+
+        def pump(until):
+            nonlocal sent, acked
+            while time.time() < until and acked < total:
+                while sent < total and sent - acked < 1000:
+                    pub.publish("flood/x", b"%06d" % sent + pad, qos=1, wait=False)
+                    sent += 1
+                p = pub.read(0.1)
+                if p is not None and p.kind == PUBACK:
+                    acked += 1
+
+        victim = owner(far)
+        os.kill(victim, signal.SIGSTOP)
+        try:
+            pump(time.time() + 2.5)
+        finally:
+            os.kill(victim, signal.SIGCONT)
+        truth("a QoS 1 publisher is held while a shard its messages are for cannot take them", acked < total,
+              (sent, acked))
+        pump(time.time() + 20)
+        check("and answered for every message once it could", acked, total)
+        got = [m.payload[:6] for m in far.messages(total, 20)]
+        check("every message it was answered for reaches the subscriber on that shard, in order",
+              got == [b"%06d" % i for i in range(total)], True)
+        far.disconnect()
+        pub.disconnect()
+    guarded("stall", stall)
+
 if phase == "after":
     def after():
         got = []
@@ -224,6 +281,19 @@ fw=$(echo "$st" | awk -F: '$1=="shard_forwarded"{s+=$2} END{print s+0}')
 mv=$(echo "$st" | awk -F: '$1=="sessions_moved"{s+=$2} END{print s+0}')
 [ "$fw" -gt 0 ] && [ "$mv" -gt 0 ] && ok || bad "stats count the messages forwarded and the sessions moved between shards" "forwarded $fw moved $mv"
 snaps=$(find "$HOME" -name 'sh.snapshot.*' | wc -l)
+
+FP=$((P + 1))
+"$BIN" create mqtt fl -p "$FP" --anonymous --shards 3 --session-queue 100000 -s >/dev/null 2>&1 \
+    && ok || bad "a second broker of three shards is made" "$(tail -3 "$SOCKETLEY_DLOG")"
+ready_tcp 127.0.0.1 "$FP" || bad "it listens" "$(tail -5 "$SOCKETLEY_DLOG")"
+for _ in $(seq 1 50); do
+    [ "$("$BIN" stats fl 2>/dev/null | awk -F: '$1=="shard_peers_known"{s+=$2} END{print s+0}')" -ge 6 ] && break
+    sleep 0.2
+done
+tally < <(run stall "$FP")
+dr=$("$BIN" stats fl 2>&1 | awk -F: '$1=="shard_dropped"{s+=$2} END{print s+0}')
+[ "$dr" -eq 0 ] && ok || bad "a shard drops nothing on the way to one that stopped for a while" "dropped $dr"
+"$BIN" remove fl >/dev/null 2>&1
 [ "$snaps" -eq 3 ] && ok || bad "each shard keeps a snapshot of its own" "$(find "$HOME" -name 'sh.snapshot*')"
 
 "$BIN" stop sh >/dev/null 2>&1 && "$BIN" start sh >/dev/null 2>&1

@@ -257,6 +257,18 @@ size_t broker::consume(connection& c, std::string_view in)
             break;
         }
         c.last_rx_ms = now;
+        // A publisher waiting for answers is held while the other shards cannot take more, and its bytes wait here,
+        // rather than its messages being dropped on the way; it is alive, so its keep alive goes on counting.
+        if (f.type == packet_type::publish && (f.flags & 0x06) && c.ph == connection::phase::open &&
+            !m_hooks.publish_room())
+        {
+            if (!c.held)
+            {
+                c.held = true;
+                m_held.push_back(c.id);
+            }
+            break;
+        }
         // The handler copies what it keeps, so the bytes may go once it returns.
         at += f.size;
         if (!handle(c, f))
@@ -698,7 +710,8 @@ void broker::finish_publish(uint64_t conn, uint64_t generation, uint8_t qos, uin
         if (out->retain)
             retained_ok = store_retained(out, true);
         // Only a 5.0 publisher waiting for an answer is told nobody heard it, so only then is it asked.
-        const bool heard = !(qos > 0 && level == level_5) || m_subs.any_match(out->topic);
+        const bool heard = !(qos > 0 && level == level_5) || m_subs.any_match(out->topic) ||
+                           m_hooks.heard_elsewhere(out->topic);
         route(out, true);
         if (!retained_ok)
             code = reason::quota_exceeded;
@@ -777,6 +790,21 @@ std::vector<std::string> broker::filters() const
     for (const auto& [f, n] : m_filter_refs)
         out.push_back(f);
     return out;
+}
+
+void broker::room()
+{
+    if (m_held.empty())
+        return;
+    std::vector<uint64_t> held;
+    held.swap(m_held);
+    for (const uint64_t id : held)
+        if (connection* c = conn_of(id); c && c->held)
+        {
+            c->held = false;
+            if (!c->busy && !c->processing)
+                process(*c);
+        }
 }
 
 void broker::deliver_remote(const message_ptr& m, const std::vector<std::string>& groups)

@@ -354,6 +354,11 @@ public:
     // Whether this shard delivers a message to the shared group `key` ($share/<group>/<filter>) it has members of;
     // false when another shard with members was chosen.
     virtual bool shared_here(std::string_view /*key*/) { return true; }
+    // Whether the way to the other shards can take another message; while it cannot, publishers at QoS 1 and 2 are
+    // held, and room() lets them go on.
+    virtual bool publish_room() const { return true; }
+    // Whether a subscriber elsewhere would hear the topic, for the reason code a 5.0 publisher is answered with.
+    virtual bool heard_elsewhere(std::string_view /*topic*/) { return false; }
     // A filter some session here subscribes to now and none did before, and the last one gone, for the shards that
     // send only where someone listens.
     virtual void filter_added(const std::string& /*filter*/) {}
@@ -414,6 +419,8 @@ public:
     std::vector<std::string> filters() const;
     // A retained message another shard set or cleared.
     void apply_retained(const std::string& topic, message_ptr m);
+    // There is room again: the publishers held for it go on.
+    void room();
     // A client disconnected by name, its session ended too when `end_session`; false when there is none.
     bool kick(std::string_view client_id, bool end_session);
     // The retained message of `topic` cleared, false when there was none.
@@ -530,6 +537,8 @@ private:
         bool        sent_disconnect{false};
         // Set when the connection ends without a will: a DISCONNECT 0x00, or a takeover that keeps the session.
         bool        no_will{false};
+        // Its next PUBLISH waits for room on the way to the other shards.
+        bool        held{false};
         uint64_t    generation{0};
         // The CONNECT while it is being answered; nothing once the connection is open.
         std::unique_ptr<connect_packet> pending;
@@ -621,6 +630,7 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<connection>> m_conns;
     // The connection conn_of() last answered with, which only disconnected() takes out of the table.
     connection* m_last_conn{nullptr};
+    std::vector<uint64_t> m_held;
     std::unordered_map<std::string, std::unique_ptr<session>> m_sessions;
     std::unordered_map<uint64_t, session*> m_by_key;
     uint64_t m_next_key{1};

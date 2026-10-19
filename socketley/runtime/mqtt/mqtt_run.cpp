@@ -297,6 +297,8 @@ void mqtt_run::stop()
     if (m_stopped)
         return;
     m_stopped = true;
+    // What the other shards are still owed goes before this one stops listening for their answers.
+    send_shards();
     for (listener* l : {&m_tcp, &m_ws})
         if (l->fd >= 0)
         {
@@ -973,6 +975,7 @@ void mqtt_run::on_loop_turn()
             flush(*c);
     }
     pump_routes();
+    send_shards();
     settle();
 }
 
@@ -1295,6 +1298,8 @@ void mqtt_run::on_request_reply(uint64_t cookie, request_status st, std::string_
         return;
     }
     if (dump_reply(cookie, st, reply))
+        return;
+    if (shard_receipt(cookie, st))
         return;
     const auto it = m_route_asks.find(cookie);
     if (it == m_route_asks.end())
