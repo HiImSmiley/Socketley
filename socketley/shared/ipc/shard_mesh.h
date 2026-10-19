@@ -5,6 +5,7 @@
 // correctness never depends on the mesh and every crossing is counted by
 // route.
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -209,7 +210,13 @@ public:
         {
             // A recv and not a readiness notification, so the bytes are
             // already here and no second syscall follows.
-            m_in.append(m_rbuf, static_cast<size_t>(res));
+            m_in.append(m_rbuf.get(), static_cast<size_t>(res));
+            // A read that filled the buffer left more behind it, and a link that streams is read in larger pieces.
+            if (static_cast<size_t>(res) == m_rsize && m_rsize < max_read_bytes)
+            {
+                m_rsize *= 2;
+                m_rbuf = std::make_unique<char[]>(m_rsize);
+            }
             take_frames();
             return;                    // re-armed by pump(), at the end of the turn
         }
@@ -320,8 +327,8 @@ private:
         // The request carries its own owner, and one left empty matches no
         // live registration, so the completion is dropped and every crossing
         // hangs.
-        m_req   = { this, nullptr, m_fd, sizeof(m_rbuf), op_read };
-        m_armed = m_loop->submit_read(m_fd, m_rbuf, sizeof(m_rbuf), &m_req);
+        m_req   = { this, nullptr, m_fd, static_cast<uint32_t>(m_rsize), op_read };
+        m_armed = m_loop->submit_read(m_fd, m_rbuf.get(), static_cast<uint32_t>(m_rsize), &m_req);
         // A submission the ring refused is not a dead link, so needs_wake()
         // clamps the wait and pump() tries again next turn.
     }
@@ -453,7 +460,11 @@ private:
     // is the hop, not the read.  Measured at one request in flight per
     // connection, which is where a per-turn quantum would show worst: with
     // many queued, one read already drains many frames.
-    char        m_rbuf[16 * 1024];
+    //
+    // Doubled whenever a read fills it, since one recv a turn would otherwise hold a streaming link to 16 KiB a turn.
+    static constexpr size_t max_read_bytes = 256 * 1024;
+    size_t                  m_rsize{16 * 1024};
+    std::unique_ptr<char[]> m_rbuf{std::make_unique<char[]>(16 * 1024)};
     std::string m_in;
 
     std::unordered_set<uint64_t> m_owed;
