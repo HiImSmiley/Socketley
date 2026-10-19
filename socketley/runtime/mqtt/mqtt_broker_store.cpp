@@ -138,7 +138,7 @@ std::string broker::encode_session(const session& s) const
     // A session connected now counts as gone from this moment, which is when whoever reads this takes it in.
     w.u64(static_cast<uint64_t>(s.conn ? m_io.now_ms() : s.gone_ms));
     w.flag(s.conn != 0);
-    w.u32(s.next_id);
+    w.u32(s.out.next_id());
     w.u64(s.next_seq);
     w.u32(static_cast<uint32_t>(s.subs.size()));
     for (const auto& [filter, o] : s.subs)
@@ -160,13 +160,12 @@ std::string broker::encode_session(const session& s) const
     for (const auto& q : s.queue)
         put_queued(q);
     w.u32(static_cast<uint32_t>(s.out.size()));
-    for (const auto& [id, f] : s.out)
-    {
+    s.out.each([&](uint16_t id, const inflight& f) {
         w.u32(id);
         w.u64(f.seq);
         w.u8(static_cast<uint8_t>(f.st));
         put_queued(f.item);
-    }
+    });
     w.u32(static_cast<uint32_t>(s.incoming_qos2.size()));
     for (const uint16_t id : s.incoming_qos2)
         w.u32(id);
@@ -196,7 +195,6 @@ bool broker::decode_session(std::string_view in, session& s,
         !r.u64(s.next_seq) || !r.u32(n) || n > cap_count)
         return bad("head");
     s.gone_ms = static_cast<int64_t>(gone);
-    s.next_id = static_cast<uint16_t>(next_id);
     s.conn    = 0;
     subs.clear();
     for (uint32_t i = 0; i < n; ++i)
@@ -229,6 +227,8 @@ bool broker::decode_session(std::string_view in, session& s,
     if (!r.u32(n) || n > 65535)
         return bad("unanswered messages");
     s.out.clear();
+    // Put back in the order they were sent, which a snapshot of an older build did not keep.
+    std::vector<std::pair<uint16_t, inflight>> sent;
     for (uint32_t i = 0; i < n; ++i)
     {
         uint32_t id = 0;
@@ -237,8 +237,13 @@ bool broker::decode_session(std::string_view in, session& s,
         if (!r.u32(id) || id == 0 || id > 65535 || !r.u64(f.seq) || !r.u8(st) || st > 2 || !get_queued(f.item))
             return bad("unanswered message");
         f.st = static_cast<inflight::state>(st);
-        s.out.emplace(static_cast<uint16_t>(id), std::move(f));
+        sent.emplace_back(static_cast<uint16_t>(id), std::move(f));
     }
+    std::sort(sent.begin(), sent.end(), [](const auto& a, const auto& b) { return a.second.seq < b.second.seq; });
+    for (auto& [id, f] : sent)
+        if (!s.out.restore(id, std::move(f)))
+            return bad("unanswered message");
+    s.out.set_next_id(static_cast<uint16_t>(next_id));
     if (!r.u32(n) || n > 65535)
         return bad("QoS 2 identifiers");
     s.incoming_qos2.clear();

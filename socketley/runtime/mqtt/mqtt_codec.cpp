@@ -546,9 +546,20 @@ bool read_connect(const frame& f, connect_packet& out, refusal& err)
     return true;
 }
 
+// What a reader writes into is cleared field by field, since assigning a fresh packet moves every property of
+// one that is empty, and that was the largest cost of a PUBACK.
+static void clear_props(properties& p)
+{
+    if (!p.empty())
+        p = properties{};
+}
+
 bool read_publish(const frame& f, uint8_t level, publish_packet& out, refusal& err)
 {
-    out = publish_packet{};
+    out.topic.clear();
+    out.payload.clear();
+    out.packet_id = 0;
+    clear_props(out.props);
     out.dup    = f.flags & 0x08;
     out.qos    = (f.flags >> 1) & 0x03;
     out.retain = f.flags & 0x01;
@@ -578,7 +589,9 @@ bool read_publish(const frame& f, uint8_t level, publish_packet& out, refusal& e
 
 bool read_ack(const frame& f, uint8_t level, ack_packet& out, refusal& err)
 {
-    out = ack_packet{};
+    out.packet_id = 0;
+    out.reason = reason::success;
+    clear_props(out.props);
     out.type = f.type;
     if (!check_flags(f, f.type == packet_type::pubrel ? 0x02 : 0x00, err))
         return false;
@@ -998,6 +1011,69 @@ void write_publish(std::string& out, uint8_t level, const publish_packet& p)
         put_u16(out, p.packet_id);
     out += props;
     out += p.payload;
+}
+
+size_t publish_parts_size(uint8_t level, const publish_parts& p)
+{
+    size_t body = 2 + p.topic.size() + (p.qos ? 2 : 0) + p.payload.size();
+    if (level == level_5)
+        body += varint_size(static_cast<uint32_t>(p.props.size())) + p.props.size();
+    return 1 + varint_size(static_cast<uint32_t>(body)) + body;
+}
+
+void write_publish_parts(std::string& out, uint8_t level, const publish_parts& p)
+{
+    uint8_t first = 0x30 | static_cast<uint8_t>((p.qos & 0x03) << 1);
+    if (p.dup)
+        first |= 0x08;
+    if (p.retain)
+        first |= 0x01;
+    size_t body = 2 + p.topic.size() + (p.qos ? 2 : 0) + p.payload.size();
+    if (level == level_5)
+        body += varint_size(static_cast<uint32_t>(p.props.size())) + p.props.size();
+    out.reserve(out.size() + 1 + varint_size(static_cast<uint32_t>(body)) + body);
+    out.push_back(static_cast<char>(first));
+    put_varint(out, static_cast<uint32_t>(body));
+    put_str(out, p.topic);
+    if (p.qos)
+        put_u16(out, p.packet_id);
+    if (level == level_5)
+    {
+        put_varint(out, static_cast<uint32_t>(p.props.size()));
+        out += p.props;
+    }
+    out += p.payload;
+}
+
+void put_prop_byte(std::string& out, uint8_t id, uint8_t v)
+{
+    out.push_back(static_cast<char>(id));
+    out.push_back(static_cast<char>(v));
+}
+
+void put_prop_u32(std::string& out, uint8_t id, uint32_t v)
+{
+    out.push_back(static_cast<char>(id));
+    put_u32(out, v);
+}
+
+void put_prop_varint(std::string& out, uint8_t id, uint32_t v)
+{
+    out.push_back(static_cast<char>(id));
+    put_varint(out, v);
+}
+
+void put_prop_str(std::string& out, uint8_t id, std::string_view v)
+{
+    out.push_back(static_cast<char>(id));
+    put_str(out, v);
+}
+
+void put_prop_pair(std::string& out, uint8_t id, std::string_view k, std::string_view v)
+{
+    out.push_back(static_cast<char>(id));
+    put_str(out, k);
+    put_str(out, v);
 }
 
 void write_ack(std::string& out, uint8_t level, const ack_packet& p)

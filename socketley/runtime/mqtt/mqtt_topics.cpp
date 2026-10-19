@@ -22,15 +22,47 @@ std::vector<std::string_view> split_levels(std::string_view s)
     }
 }
 
+topic_levels::topic_levels(std::string_view topic)
+{
+    size_t start = 0;
+    while (true)
+    {
+        const size_t slash = topic.find('/', start);
+        const std::string_view level = topic.substr(start, slash == std::string_view::npos ? slash : slash - start);
+        if (m_count < m_few.size())
+            m_few[m_count++] = level;
+        else
+        {
+            if (m_many.empty())
+                m_many.assign(m_few.begin(), m_few.end());
+            m_many.push_back(level);
+        }
+        if (slash == std::string_view::npos)
+            return;
+        start = slash + 1;
+    }
+}
+
 subscription_tree::subscription_tree() : m_root(std::make_unique<node>()) {}
 subscription_tree::~subscription_tree() = default;
+
+std::unique_ptr<subscription_tree::node>* subscription_tree::child(node& n, std::string_view level, bool make)
+{
+    if (level == "+")
+        return &n.plus;
+    if (level == "#")
+        return &n.hash;
+    if (const auto it = n.children.find(level); it != n.children.end())
+        return &it->second;
+    return make ? &n.children[std::string(level)] : nullptr;
+}
 
 subscription_tree::node* subscription_tree::find_or_make(std::string_view filter)
 {
     node* n = m_root.get();
     for (const auto l : split_levels(filter))
     {
-        auto& c = n->children[std::string(l)];
+        auto& c = *child(*n, l, true);
         if (!c)
             c = std::make_unique<node>();
         n = c.get();
@@ -65,10 +97,10 @@ bool subscription_tree::remove(std::string_view filter, std::string_view group, 
     std::vector<node*> path{m_root.get()};
     for (const auto l : levels)
     {
-        const auto it = path.back()->children.find(std::string(l));
-        if (it == path.back()->children.end())
+        const auto* c = child(*path.back(), l, false);
+        if (!c || !*c)
             return false;
-        path.push_back(it->second.get());
+        path.push_back(c->get());
     }
     node* n = path.back();
     bool removed = false;
@@ -101,7 +133,13 @@ bool subscription_tree::remove(std::string_view filter, std::string_view group, 
     --m_count;
     // Empty levels go, deepest first, so a tree never keeps the shape of subscriptions long gone.
     for (size_t i = path.size() - 1; i > 0 && path[i]->empty(); --i)
-        path[i - 1]->children.erase(std::string(levels[i - 1]));
+    {
+        const std::string_view l = levels[i - 1];
+        if (l == "+" || l == "#")
+            child(*path[i - 1], l, false)->reset();
+        else
+            path[i - 1]->children.erase(path[i - 1]->children.find(l));
+    }
     return true;
 }
 
@@ -134,26 +172,24 @@ void subscription_tree::take(node& n, const std::function<void(uint64_t, const s
     }
 }
 
-void subscription_tree::collect(node& n, const std::vector<std::string_view>& levels, size_t i, bool root_dollar,
+void subscription_tree::collect(node& n, std::span<const std::string_view> levels, size_t i, bool root_dollar,
                                 const std::function<void(uint64_t, const sub_options&)>& plain,
                                 const std::function<void(std::string_view, uint64_t, const sub_options&)>& shared,
                                 const std::function<bool(uint64_t)>& online)
 {
     // A wildcard at the first level does not reach a topic starting with '$'.
     const bool wild_ok = !(i == 0 && root_dollar);
-    if (wild_ok)
-        if (const auto h = n.children.find("#"); h != n.children.end())
-            take(*h->second, plain, shared, online);
+    if (wild_ok && n.hash)
+        take(*n.hash, plain, shared, online);
     if (i == levels.size())
     {
         take(n, plain, shared, online);
         return;
     }
-    if (const auto c = n.children.find(std::string(levels[i])); c != n.children.end())
+    if (const auto c = n.children.find(levels[i]); c != n.children.end())
         collect(*c->second, levels, i + 1, root_dollar, plain, shared, online);
-    if (wild_ok)
-        if (const auto p = n.children.find("+"); p != n.children.end())
-            collect(*p->second, levels, i + 1, root_dollar, plain, shared, online);
+    if (wild_ok && n.plus)
+        collect(*n.plus, levels, i + 1, root_dollar, plain, shared, online);
 }
 
 void subscription_tree::match(std::string_view topic,
@@ -161,34 +197,27 @@ void subscription_tree::match(std::string_view topic,
                               const std::function<void(std::string_view, uint64_t, const sub_options&)>& shared,
                               const std::function<bool(uint64_t)>& online)
 {
-    const auto levels = split_levels(topic);
-    collect(*m_root, levels, 0, !topic.empty() && topic.front() == '$', plain, shared, online);
+    const topic_levels levels(topic);
+    collect(*m_root, levels.view(), 0, !topic.empty() && topic.front() == '$', plain, shared, online);
 }
 
-bool subscription_tree::any_at(const node& n, const std::vector<std::string_view>& levels, size_t i,
-                               bool root_dollar)
+bool subscription_tree::any_at(const node& n, std::span<const std::string_view> levels, size_t i, bool root_dollar)
 {
     const bool wild_ok = !(i == 0 && root_dollar);
-    if (wild_ok)
-        if (const auto h = n.children.find("#"); h != n.children.end() && !h->second->plain.empty())
-            return true;
-    if (wild_ok)
-        if (const auto h = n.children.find("#"); h != n.children.end() && !h->second->groups.empty())
-            return true;
+    if (wild_ok && n.hash && (!n.hash->plain.empty() || !n.hash->groups.empty()))
+        return true;
     if (i == levels.size())
         return !n.plain.empty() || !n.groups.empty();
-    if (const auto c = n.children.find(std::string(levels[i])); c != n.children.end() &&
-                                                                  any_at(*c->second, levels, i + 1, root_dollar))
+    if (const auto c = n.children.find(levels[i]); c != n.children.end() &&
+                                                    any_at(*c->second, levels, i + 1, root_dollar))
         return true;
-    if (wild_ok)
-        if (const auto p = n.children.find("+"); p != n.children.end() && any_at(*p->second, levels, i + 1, root_dollar))
-            return true;
-    return false;
+    return wild_ok && n.plus && any_at(*n.plus, levels, i + 1, root_dollar);
 }
 
 bool subscription_tree::any_match(std::string_view topic) const
 {
-    return any_at(*m_root, split_levels(topic), 0, !topic.empty() && topic.front() == '$');
+    const topic_levels levels(topic);
+    return any_at(*m_root, levels.view(), 0, !topic.empty() && topic.front() == '$');
 }
 
 }   // namespace socketley::mqtt

@@ -1013,3 +1013,133 @@ TEST_CASE("a target's answer says delivered, refused or worth another try")
     CHECK(judge_reply(target_kind::cache_stream, "error: wrong type", why) == reply_verdict::refused);
     CHECK(judge_reply(target_kind::mqtt, "ok", why) == reply_verdict::delivered);
 }
+
+TEST_CASE("a PUBLISH written from its parts is byte for byte the one written from a packet")
+{
+    publish_packet p;
+    p.qos = 1;
+    p.retain = true;
+    p.dup = true;
+    p.packet_id = 513;
+    p.topic = "a/b/c";
+    p.payload = std::string(300, 'x');
+    p.props.payload_format = 1;
+    p.props.message_expiry = 42;
+    p.props.content_type = "text/plain";
+    p.props.response_topic = "r/t";
+    p.props.correlation_data = "corr";
+    p.props.subscription_ids = {7, 300};
+    p.props.user = {{"k", "v"}, {"k", "w"}};
+    std::string props;
+    put_prop_byte(props, 0x01, 1);
+    put_prop_u32(props, 0x02, 42);
+    put_prop_str(props, 0x03, "text/plain");
+    put_prop_str(props, 0x08, "r/t");
+    put_prop_str(props, 0x09, "corr");
+    put_prop_varint(props, 0x0B, 7);
+    put_prop_varint(props, 0x0B, 300);
+    put_prop_pair(props, 0x26, "k", "v");
+    put_prop_pair(props, 0x26, "k", "w");
+    publish_parts q{p.qos, p.retain, p.dup, p.packet_id, p.topic, p.payload, props};
+    for (const uint8_t level : {level_311, level_5})
+    {
+        std::string a, b;
+        write_publish(a, level, p);
+        write_publish_parts(b, level, q);
+        CHECK(a == b);
+        CHECK(publish_parts_size(level, q) == b.size());
+    }
+}
+
+TEST_CASE("the window of unanswered messages finds, frees and wraps its identifiers")
+{
+    id_window<int> w;
+    CHECK(w.add(10) == 1);
+    CHECK(w.add(20) == 2);
+    CHECK(w.add(30) == 3);
+    REQUIRE(w.find(2));
+    CHECK(*w.find(2) == 20);
+    CHECK_FALSE(w.find(4));
+    CHECK_FALSE(w.find(0));
+    // Answered out of turn: the middle one goes, the others stay where they were.
+    CHECK(w.erase(2));
+    CHECK_FALSE(w.erase(2));
+    CHECK_FALSE(w.find(2));
+    CHECK(*w.find(3) == 30);
+    CHECK(w.size() == 2);
+    std::vector<uint16_t> ids;
+    w.each([&](uint16_t id, const int&) { ids.push_back(id); });
+    CHECK(ids == std::vector<uint16_t>{1, 3});
+    CHECK(w.erase(1));
+    CHECK(w.erase(3));
+    CHECK(w.empty());
+    CHECK(w.add(40) == 4);
+
+    // Past 65535 the identifiers start again at 1, never at 0.
+    id_window<int> wrap;
+    wrap.set_next_id(65534);
+    CHECK(wrap.add(1) == 65534);
+    CHECK(wrap.add(2) == 65535);
+    CHECK(wrap.add(3) == 1);
+    CHECK(*wrap.find(65535) == 2);
+    CHECK(*wrap.find(1) == 3);
+    CHECK(wrap.erase(65534));
+    CHECK(*wrap.find(1) == 3);
+
+    // One never answered holds every identifier after it, and once all 65535 are spanned none is free.
+    id_window<int> full;
+    for (int i = 0; i < 65535; ++i)
+        full.add(i);
+    CHECK(full.full());
+    for (uint32_t id = 2; id <= 65535; ++id)
+        full.erase(static_cast<uint16_t>(id));
+    CHECK(full.size() == 1);
+    CHECK(full.full());
+    CHECK(full.erase(1));
+    CHECK_FALSE(full.full());
+    CHECK(full.empty());
+
+    // A snapshot's identifiers come back in the order they were sent, with the gaps of those answered.
+    id_window<int> back;
+    CHECK(back.restore(65530, 1));
+    CHECK(back.restore(65533, 2));
+    CHECK(back.restore(4, 3));
+    CHECK_FALSE(back.restore(4, 9));
+    CHECK(back.size() == 3);
+    CHECK_FALSE(back.find(65531));
+    CHECK(*back.find(4) == 3);
+    CHECK(back.add(5) == 5);
+}
+
+TEST_CASE("the subscription tree takes its wildcard levels away with their last subscription, and long topics")
+{
+    subscription_tree t;
+    CHECK(t.add("a/+/#", "", 1, {}));
+    CHECK(t.add("a/+", "", 2, {}));
+    std::vector<uint64_t> got;
+    const auto plain = [&](uint64_t s, const sub_options&) { got.push_back(s); };
+    const auto none = [](std::string_view, uint64_t, const sub_options&) {};
+    t.match("a/x/y", plain, none);
+    CHECK(got == std::vector<uint64_t>{1});
+    CHECK(t.remove("a/+/#", "", 1));
+    CHECK_FALSE(t.remove("a/+/#", "", 1));
+    got.clear();
+    t.match("a/x/y", plain, none);
+    CHECK(got.empty());
+    t.match("a/x", plain, none);
+    CHECK(got == std::vector<uint64_t>{2});
+    CHECK(t.remove("a/+", "", 2));
+    CHECK(t.size() == 0);
+    CHECK_FALSE(t.any_match("a/x"));
+
+    std::string deep = "d";
+    for (int i = 0; i < 40; ++i)
+        deep += "/l" + std::to_string(i);
+    CHECK(t.add(deep, "", 3, {}));
+    CHECK(t.add("d/+/l1/#", "", 4, {}));
+    got.clear();
+    t.match(deep, plain, none);
+    std::sort(got.begin(), got.end());
+    CHECK(got == std::vector<uint64_t>{3, 4});
+    CHECK(topic_levels(deep).view().size() == 41);
+}

@@ -62,8 +62,14 @@ void broker::set_limits(const broker_config& cfg)
 
 broker::connection* broker::conn_of(uint64_t id)
 {
+    // A delivery asks after the same connection from deliver, pump and the writer in turn.
+    if (m_last_conn && m_last_conn->id == id)
+        return m_last_conn;
     const auto it = m_conns.find(id);
-    return it == m_conns.end() ? nullptr : it->second.get();
+    if (it == m_conns.end())
+        return nullptr;
+    m_last_conn = it->second.get();
+    return m_last_conn;
 }
 
 broker::session* broker::session_of_key(uint64_t key)
@@ -134,6 +140,26 @@ void broker::send_packet(connection& c, std::string_view bytes)
     m_io.send(c.id, bytes);
 }
 
+void broker::send_ack(connection& c, packet_type type, uint16_t id, uint8_t code)
+{
+    // The one most sent, four bytes, written without a packet built for it.
+    if (c.level < level_5 || code == reason::success)
+    {
+        const char b[4] = {static_cast<char>((static_cast<uint8_t>(type) << 4) |
+                                             (type == packet_type::pubrel ? 0x02 : 0x00)),
+                           2, static_cast<char>(id >> 8), static_cast<char>(id & 0xFF)};
+        send_packet(c, std::string_view(b, sizeof b));
+        return;
+    }
+    ack_packet a;
+    a.type      = type;
+    a.packet_id = id;
+    a.reason    = code;
+    std::string out;
+    write_ack(out, c.level, a);
+    send_packet(c, out);
+}
+
 // ── The transport's side ────────────────────────────────────────────────────
 
 void broker::connected(uint64_t conn, conn_info info)
@@ -152,6 +178,17 @@ void broker::input(uint64_t conn, std::string_view bytes)
     connection* c = conn_of(conn);
     if (!c || c->ph == connection::phase::closing)
         return;
+    // The common case, nothing kept from before: the packets are read where they arrived, and only what is left
+    // of one at the end is copied.
+    if (c->in.empty() && !c->busy && !c->processing)
+    {
+        c->processing = true;
+        const size_t used = consume(*c, bytes);
+        c->processing = false;
+        if (c->ph != connection::phase::closing && used < bytes.size())
+            c->in.assign(bytes.substr(used));
+        return;
+    }
     c->in.append(bytes);
     // What a script holds a connection up on is bounded: past this a client that will not wait is let go.
     if (c->in.size() > static_cast<size_t>(m_cfg.max_packet) * 4 + (16u << 20))
@@ -175,24 +212,38 @@ void broker::disconnected(uint64_t conn)
     if (it == m_conns.end())
         return;
     detach(*it->second, it->second->sent_disconnect ? "disconnected by the broker" : "connection closed");
+    if (m_last_conn == it->second.get())
+        m_last_conn = nullptr;
     m_conns.erase(it);
 }
 
 void broker::process(connection& c)
 {
     c.processing = true;
+    const size_t used = consume(c, c.in);
+    // Erased once for every packet handled, not once each, which moved the rest of the buffer per packet.
+    c.in.erase(0, std::min(used, c.in.size()));
+    c.processing = false;
+}
+
+size_t broker::consume(connection& c, std::string_view in)
+{
+    // One clock read for all the packets that came together.
+    const int64_t now = m_io.now_ms();
+    size_t at = 0;
     while (!c.busy && c.ph != connection::phase::closing)
     {
+        const std::string_view rest = in.substr(at);
         // The first byte already says whether a CONNECT is coming, so an HTTP request or noise is not waited out.
-        if (c.ph == connection::phase::awaiting_connect && !c.in.empty() &&
-            static_cast<uint8_t>(c.in[0]) != (static_cast<uint8_t>(packet_type::connect) << 4))
+        if (c.ph == connection::phase::awaiting_connect && !rest.empty() &&
+            static_cast<uint8_t>(rest[0]) != (static_cast<uint8_t>(packet_type::connect) << 4))
         {
             c.ph = connection::phase::closing;
             m_io.close(c.id);
             break;
         }
         frame f;
-        const frame_status st = take_frame(c.in, m_cfg.max_packet, f);
+        const frame_status st = take_frame(rest, m_cfg.max_packet, f);
         if (st == frame_status::incomplete)
             break;
         if (st == frame_status::malformed)
@@ -205,15 +256,13 @@ void broker::process(connection& c)
             protocol_failure(c, reason::packet_too_large, "a packet larger than the broker takes");
             break;
         }
-        c.last_rx_ms = m_io.now_ms();
-        const size_t size = f.size;
-        const bool keep_going = handle(c, f);
-        // The bytes of a handled packet go; the handler copied what it keeps.
-        c.in.erase(0, size);
-        if (!keep_going)
+        c.last_rx_ms = now;
+        // The handler copies what it keeps, so the bytes may go once it returns.
+        at += f.size;
+        if (!handle(c, f))
             break;
     }
-    c.processing = false;
+    return at;
 }
 
 bool broker::handle(connection& c, const frame& f)
@@ -554,13 +603,7 @@ bool broker::on_publish(connection& c, const frame& f)
     const auto ack = [&](uint8_t code) {
         if (p.qos == 0)
             return;
-        ack_packet a;
-        a.type      = p.qos == 1 ? packet_type::puback : packet_type::pubrec;
-        a.packet_id = p.packet_id;
-        a.reason    = c.level == level_5 ? code : reason::success;
-        std::string out;
-        write_ack(out, c.level, a);
-        send_packet(c, out);
+        send_ack(c, p.qos == 1 ? packet_type::puback : packet_type::pubrec, p.packet_id, code);
         if (p.qos == 2)
         {
             s.incoming_qos2.insert(p.packet_id);
@@ -654,7 +697,8 @@ void broker::finish_publish(uint64_t conn, uint64_t generation, uint8_t qos, uin
         bool retained_ok = true;
         if (out->retain)
             retained_ok = store_retained(out, true);
-        const bool heard = m_subs.any_match(out->topic);
+        // Only a 5.0 publisher waiting for an answer is told nobody heard it, so only then is it asked.
+        const bool heard = !(qos > 0 && level == level_5) || m_subs.any_match(out->topic);
         route(out, true);
         if (!retained_ok)
             code = reason::quota_exceeded;
@@ -665,13 +709,7 @@ void broker::finish_publish(uint64_t conn, uint64_t generation, uint8_t qos, uin
         return;
     if (qos > 0)
     {
-        ack_packet a;
-        a.type      = qos == 1 ? packet_type::puback : packet_type::pubrec;
-        a.packet_id = id;
-        a.reason    = level == level_5 ? code : reason::success;
-        std::string bytes;
-        write_ack(bytes, level, a);
-        send_packet(*c, bytes);
+        send_ack(*c, qos == 1 ? packet_type::puback : packet_type::pubrec, id, level == level_5 ? code : reason::success);
         if (qos == 2 && c->s)
         {
             c->s->incoming_qos2.insert(id);
@@ -750,21 +788,27 @@ void broker::deliver_remote(const message_ptr& m, const std::vector<std::string>
 
 void broker::route(const message_ptr& m, bool notify, const std::vector<std::string>* groups)
 {
-    struct agg
-    {
-        uint8_t qos{0};
-        bool retain{false};
-        std::vector<uint32_t> ids;
-    };
-    std::unordered_map<uint64_t, agg> plain;
-    std::vector<std::pair<uint64_t, sub_options>> shared;
+    // The list is kept from one message to the next; a route begun inside another takes one of its own.
+    std::vector<route_target> own;
+    std::vector<route_target>& plain = m_routing ? own : m_route_scratch;
+    const bool outer = !m_routing;
+    m_routing = true;
+    plain.clear();
+    const uint64_t stamp = ++m_route_stamp;
+    std::vector<std::pair<session*, sub_options>> shared;
     m_subs.match(
         m->topic,
         [&](uint64_t key, const sub_options& o) {
             session* s = session_of_key(key);
             if (!s || (o.no_local && s->client_id == m->from_client))
                 return;
-            agg& a = plain[key];
+            if (s->route_stamp != stamp)
+            {
+                s->route_stamp = stamp;
+                s->route_slot  = plain.size();
+                plain.push_back({s, 0, false, {}});
+            }
+            route_target& a = plain[s->route_slot];
             a.qos = std::max(a.qos, std::min(m->qos, o.qos));
             a.retain = a.retain || (o.retain_as_published && m->retain);
             if (o.subscription_id)
@@ -774,29 +818,28 @@ void broker::route(const message_ptr& m, bool notify, const std::vector<std::str
             const bool mine = groups ? std::find(groups->begin(), groups->end(), group_key) != groups->end()
                                      : m_hooks.shared_here(group_key);
             if (mine)
-                shared.emplace_back(key, o);
+                if (session* s = session_of_key(key))
+                    shared.emplace_back(s, o);
         },
         [&](uint64_t key) {
             const session* s = session_of_key(key);
             return s && s->conn;
         });
-    for (auto& [key, a] : plain)
+    const bool checked = m_hooks.reads_checked();
+    for (route_target& a : plain)
+        if (!checked || m_hooks.may_read(a.s->username, a.s->client_id, m->topic))
+            deliver(*a.s, m, a.qos, a.retain, std::move(a.ids));
+    for (const auto& [s, o] : shared)
     {
-        session* s = session_of_key(key);
-        if (!s || !m_hooks.may_read(s->username, s->client_id, m->topic))
-            continue;
-        deliver(*s, m, a.qos, a.retain, std::move(a.ids));
-    }
-    for (const auto& [key, o] : shared)
-    {
-        session* s = session_of_key(key);
-        if (!s || !m_hooks.may_read(s->username, s->client_id, m->topic))
+        if (checked && !m_hooks.may_read(s->username, s->client_id, m->topic))
             continue;
         std::vector<uint32_t> ids;
         if (o.subscription_id)
             ids.push_back(o.subscription_id);
         deliver(*s, m, std::min(m->qos, o.qos), false, std::move(ids));
     }
+    if (outer)
+        m_routing = false;
     if (notify)
         m_hooks.accepted(m);
 }
@@ -825,27 +868,35 @@ void broker::deliver(session& s, const message_ptr& m, uint8_t qos, bool retain_
             ++m_stats.sent[0];
         return;
     }
+    mark();
+    // Nothing waiting before it and room for it: sent now, without a turn through the queue.
+    if (c && s.queue.empty() && s.out.size() < s.receive_max && !s.out.full() &&
+        m_io.backlog(c->id) <= m_cfg.write_limit)
+    {
+        send_queued(s, *c, std::move(q));
+        return;
+    }
     if (s.queue.size() >= m_cfg.session_queue)
     {
         s.queue.pop_front();
         ++m_stats.dropped_queue;
     }
     s.queue.push_back(std::move(q));
-    mark();
     if (c)
         pump(s);
 }
 
-uint16_t broker::take_id(session& s)
+void broker::send_queued(session& s, connection& c, queued q)
 {
-    for (uint32_t tries = 0; tries < 65536; ++tries)
-    {
-        const uint16_t id = s.next_id ? s.next_id : 1;
-        s.next_id = static_cast<uint16_t>(id == 65535 ? 1 : id + 1);
-        if (!s.out.contains(id))
-            return id;
-    }
-    return 0;
+    const uint16_t id = s.out.next_id();
+    if (!write_publish_to(s, c, id, q, false))
+        return;
+    ++m_stats.sent[q.qos];
+    inflight f;
+    f.seq  = s.next_seq++;
+    f.st   = q.qos == 1 ? inflight::state::await_puback : inflight::state::await_pubrec;
+    f.item = std::move(q);
+    s.out.add(std::move(f));
 }
 
 void broker::pump(session& s)
@@ -863,79 +914,70 @@ void broker::pump(session& s)
             ++m_stats.dropped_expired;
             continue;
         }
-        const uint16_t id = take_id(s);
-        if (!id)
+        if (s.out.full())
         {
             s.queue.push_front(std::move(q));
             break;
         }
-        if (!write_publish_to(s, *c, id, q, false))
-            continue;
-        ++m_stats.sent[q.qos];
-        inflight f;
-        f.seq  = s.next_seq++;
-        f.st   = q.qos == 1 ? inflight::state::await_puback : inflight::state::await_pubrec;
-        f.item = std::move(q);
-        s.out.emplace(id, std::move(f));
+        send_queued(s, *c, std::move(q));
     }
 }
 
 bool broker::write_publish_to(session& s, connection& c, uint16_t id, const queued& q, bool dup)
 {
-    publish_packet p;
+    const message& m = *q.msg;
+    publish_parts p;
     p.dup       = dup && q.qos > 0;
     p.qos       = q.qos;
     p.retain    = q.retain_flag;
-    p.topic     = q.msg->topic;
+    p.topic     = m.topic;
     p.packet_id = id;
-    p.payload   = q.msg->payload;
+    p.payload   = m.payload;
     if (c.level == level_5)
     {
-        p.props.payload_format   = q.msg->payload_format;
-        p.props.content_type     = q.msg->content_type;
-        p.props.response_topic   = q.msg->response_topic;
-        p.props.correlation_data = q.msg->correlation_data;
-        p.props.user             = q.msg->user;
-        p.props.subscription_ids = q.sub_ids;
-        if (q.msg->expires_ms)
+        // In the order the specification lists them, as put_properties writes a packet's own.
+        std::string& pr = m_props_scratch;
+        pr.clear();
+        if (m.payload_format)
+            put_prop_byte(pr, 0x01, *m.payload_format);
+        if (m.expires_ms)
         {
-            const int64_t left = q.msg->expires_ms - m_io.now_ms();
-            p.props.message_expiry = static_cast<uint32_t>(std::max<int64_t>(1, (left + 999) / 1000));
+            const int64_t left = m.expires_ms - m_io.now_ms();
+            put_prop_u32(pr, 0x02, static_cast<uint32_t>(std::max<int64_t>(1, (left + 999) / 1000)));
         }
+        if (m.content_type)
+            put_prop_str(pr, 0x03, *m.content_type);
+        if (m.response_topic)
+            put_prop_str(pr, 0x08, *m.response_topic);
+        if (m.correlation_data)
+            put_prop_str(pr, 0x09, *m.correlation_data);
+        for (const uint32_t sid : q.sub_ids)
+            put_prop_varint(pr, 0x0B, sid);
+        for (const auto& [k, v] : m.user)
+            put_prop_pair(pr, 0x26, k, v);
+        p.props = pr;
     }
-    if (s.max_packet && publish_size(c.level, p) > s.max_packet)
+    if (s.max_packet && publish_parts_size(c.level, p) > s.max_packet)
     {
         ++m_stats.dropped_too_large;
         return false;
     }
-    std::string out;
-    write_publish(out, c.level, p);
+    std::string& out = m_out_scratch;
+    out.clear();
+    write_publish_parts(out, c.level, p);
     send_packet(c, out);
     return true;
 }
 
 void broker::resend(session& s, connection& c)
 {
-    std::vector<std::pair<uint64_t, uint16_t>> order;
-    order.reserve(s.out.size());
-    for (const auto& [id, f] : s.out)
-        order.emplace_back(f.seq, id);
-    std::sort(order.begin(), order.end());
-    for (const auto& [seq, id] : order)
-    {
-        const inflight& f = s.out.at(id);
+    // Oldest first, which is the order they were sent in.
+    s.out.each([&](uint16_t id, const inflight& f) {
         if (f.st == inflight::state::await_pubcomp)
-        {
-            ack_packet rel;
-            rel.type      = packet_type::pubrel;
-            rel.packet_id = id;
-            std::string out;
-            write_ack(out, c.level, rel);
-            send_packet(c, out);
-        }
+            send_ack(c, packet_type::pubrel, id, reason::success);
         else
             write_publish_to(s, c, id, f.item, true);
-    }
+    });
 }
 
 void broker::send_retained(session& s, const std::string& filter, const sub_options& o)
@@ -974,10 +1016,10 @@ bool broker::on_ack(connection& c, const frame& f)
     {
         case packet_type::puback:
         {
-            const auto it = s.out.find(a.packet_id);
-            if (it != s.out.end() && it->second.st == inflight::state::await_puback)
+            const inflight* f = s.out.find(a.packet_id);
+            if (f && f->st == inflight::state::await_puback)
             {
-                s.out.erase(it);
+                s.out.erase(a.packet_id);
                 mark();
                 pump(s);
             }
@@ -985,39 +1027,31 @@ bool broker::on_ack(connection& c, const frame& f)
         }
         case packet_type::pubrec:
         {
-            const auto it = s.out.find(a.packet_id);
-            ack_packet rel;
-            rel.type      = packet_type::pubrel;
-            rel.packet_id = a.packet_id;
-            if (it == s.out.end() || it->second.st == inflight::state::await_puback)
+            inflight* f = s.out.find(a.packet_id);
+            if (!f || f->st == inflight::state::await_puback)
             {
-                rel.reason = reason::packet_id_not_found;
-                std::string out;
-                write_ack(out, c.level, rel);
-                send_packet(c, out);
+                send_ack(c, packet_type::pubrel, a.packet_id, reason::packet_id_not_found);
                 return true;
             }
             if (a.reason >= 0x80)
             {
                 // The client refused it; the exchange ends here and its identifier is free.
-                s.out.erase(it);
+                s.out.erase(a.packet_id);
                 mark();
                 pump(s);
                 return true;
             }
-            it->second.st = inflight::state::await_pubcomp;
+            f->st = inflight::state::await_pubcomp;
             mark();
-            std::string out;
-            write_ack(out, c.level, rel);
-            send_packet(c, out);
+            send_ack(c, packet_type::pubrel, a.packet_id, reason::success);
             return true;
         }
         case packet_type::pubcomp:
         {
-            const auto it = s.out.find(a.packet_id);
-            if (it != s.out.end() && it->second.st == inflight::state::await_pubcomp)
+            const inflight* f = s.out.find(a.packet_id);
+            if (f && f->st == inflight::state::await_pubcomp)
             {
-                s.out.erase(it);
+                s.out.erase(a.packet_id);
                 mark();
                 pump(s);
             }
@@ -1025,16 +1059,12 @@ bool broker::on_ack(connection& c, const frame& f)
         }
         case packet_type::pubrel:
         {
-            ack_packet comp;
-            comp.type      = packet_type::pubcomp;
-            comp.packet_id = a.packet_id;
+            uint8_t code = reason::success;
             if (s.incoming_qos2.erase(a.packet_id))
                 mark();
             else
-                comp.reason = reason::packet_id_not_found;
-            std::string out;
-            write_ack(out, c.level, comp);
-            send_packet(c, out);
+                code = reason::packet_id_not_found;
+            send_ack(c, packet_type::pubcomp, a.packet_id, code);
             return true;
         }
         default:

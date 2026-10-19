@@ -128,6 +128,128 @@ private:
     size_t         m_head{0};
 };
 
+// What a session sent and the client has not answered, by packet identifier. Identifiers are given in turn and
+// mostly answered in turn, so the entries are a ring from the oldest, found by their distance from it rather than
+// searched for, and one answered out of turn is marked and leaves when those before it have.
+template <class T>
+class id_window
+{
+public:
+    size_t size() const { return m_live; }
+    bool empty() const { return m_live == 0; }
+    // All 65535 identifiers lie between the oldest unanswered and the next, so none is free.
+    bool full() const { return m_slots.size() - m_head >= 65535; }
+    uint16_t next_id() const { return m_next; }
+    void set_next_id(uint16_t id)
+    {
+        if (m_slots.size() == m_head)
+            m_next = id ? id : 1;
+    }
+
+    T* find(uint16_t id)
+    {
+        slot* sl = slot_of(id);
+        return sl ? &sl->value : nullptr;
+    }
+    // The next identifier given to `v`; full() must be false.
+    uint16_t add(T v)
+    {
+        const uint16_t id = m_next;
+        push(id, std::move(v), true);
+        return id;
+    }
+    // One read back from a snapshot, in the order they were sent; false when it cannot follow the last.
+    bool restore(uint16_t id, T v)
+    {
+        if (id == 0)
+            return false;
+        if (m_slots.size() > m_head)
+        {
+            const uint16_t back = m_slots.back().id;
+            const size_t d = distance(back, id);
+            if (d == 0 || d + (m_slots.size() - m_head) > 65535)
+                return false;
+            for (uint16_t gap = after(back); gap != id; gap = after(gap))
+                push(gap, T{}, false);
+        }
+        push(id, std::move(v), true);
+        return true;
+    }
+    bool erase(uint16_t id)
+    {
+        slot* sl = slot_of(id);
+        if (!sl)
+            return false;
+        sl->live  = false;
+        sl->value = T{};
+        --m_live;
+        while (m_head < m_slots.size() && !m_slots[m_head].live)
+            ++m_head;
+        if (m_head == m_slots.size())
+            reset();
+        else if (m_head >= 32 && m_head * 2 >= m_slots.size())
+        {
+            m_slots.erase(m_slots.begin(), m_slots.begin() + static_cast<std::ptrdiff_t>(m_head));
+            m_head = 0;
+        }
+        return true;
+    }
+    // Each unanswered one, oldest first.
+    template <class F>
+    void each(F&& fn) const
+    {
+        for (size_t i = m_head; i < m_slots.size(); ++i)
+            if (m_slots[i].live)
+                fn(m_slots[i].id, m_slots[i].value);
+    }
+    void clear()
+    {
+        reset();
+        m_live = 0;
+    }
+
+private:
+    struct slot
+    {
+        uint16_t id{0};
+        bool     live{false};
+        T        value{};
+    };
+    static size_t distance(uint16_t from, uint16_t to) { return (size_t(to) + 65535 - from) % 65535; }
+    static uint16_t after(uint16_t id) { return id == 65535 ? 1 : static_cast<uint16_t>(id + 1); }
+    slot* slot_of(uint16_t id)
+    {
+        const size_t n = m_slots.size() - m_head;
+        if (n == 0 || id == 0)
+            return nullptr;
+        const size_t d = distance(m_slots[m_head].id, id);
+        if (d >= n)
+            return nullptr;
+        slot& sl = m_slots[m_head + d];
+        return sl.live && sl.id == id ? &sl : nullptr;
+    }
+    void push(uint16_t id, T v, bool live)
+    {
+        m_slots.push_back({id, live, std::move(v)});
+        m_live += live;
+        m_next = after(id);
+    }
+    // Emptied, its room kept only while that is small, as a fifo's is.
+    void reset()
+    {
+        if (m_slots.capacity() > 8)
+            std::vector<slot>().swap(m_slots);
+        else
+            m_slots.clear();
+        m_head = 0;
+    }
+
+    std::vector<slot> m_slots;
+    size_t   m_head{0};
+    size_t   m_live{0};
+    uint16_t m_next{1};
+};
+
 // What a connection looks like from outside, as the transport saw it.
 struct conn_info
 {
@@ -194,6 +316,8 @@ public:
     virtual void authenticate(const auth_ask& ask, std::function<void(auth_answer)> done) = 0;
     virtual bool may_write(std::string_view user, std::string_view client, std::string_view topic) = 0;
     virtual bool may_read(std::string_view user, std::string_view client, std::string_view topic) = 0;
+    // Whether may_read can say no at all, asked once a message rather than once a subscriber.
+    virtual bool reads_checked() const { return true; }
     virtual bool may_subscribe(std::string_view user, std::string_view client, std::string_view filter) = 0;
     // Whether a script wants to see publishes and subscriptions; without one they take no turn.
     virtual bool hooks_publish() const { return false; }
@@ -357,9 +481,8 @@ private:
         uint64_t    conn{0};
         std::map<std::string, sub_options> subs;
         fifo<queued> queue;
-        std::map<uint16_t, inflight> out;
+        id_window<inflight> out;
         std::set<uint16_t> incoming_qos2;
-        uint16_t    next_id{1};
         uint64_t    next_seq{1};
         uint32_t    expiry{0};
         int64_t     gone_ms{0};
@@ -371,6 +494,9 @@ private:
         uint32_t    max_packet{0};
         bool        problem_info{true};
         std::string peer;
+        // Which message's subscribers it was last gathered for, and where, so overlapping filters fold into one.
+        uint64_t    route_stamp{0};
+        size_t      route_slot{0};
     };
     struct connection
     {
@@ -400,7 +526,13 @@ private:
     connection* conn_of(uint64_t id);
     session* session_of_key(uint64_t key);
 
+    // Room the writing of each PUBLISH reuses, so a subscriber's copy costs no allocation once warm.
+    std::string m_props_scratch;
+    std::string m_out_scratch;
+    void send_ack(connection& c, packet_type type, uint16_t id, uint8_t code);
     void process(connection& c);
+    // The whole packets at the front of `in` handled, until one must wait; how many bytes they took.
+    size_t consume(connection& c, std::string_view in);
     bool handle(connection& c, const frame& f);
     void protocol_failure(connection& c, uint8_t code, const std::string& why);
     void disconnect_with(connection& c, uint8_t code, const std::string& why = {});
@@ -428,6 +560,17 @@ private:
     // The message delivered to everyone whose subscription matches; `groups`, when given, are the only shared groups
     // delivered to, as another shard chose them.
     void route(const message_ptr& m, bool notify, const std::vector<std::string>* groups = nullptr);
+    // One subscriber of the message being routed, all its matching subscriptions folded in.
+    struct route_target
+    {
+        session*              s{nullptr};
+        uint8_t               qos{0};
+        bool                  retain{false};
+        std::vector<uint32_t> ids;
+    };
+    std::vector<route_target> m_route_scratch;
+    uint64_t m_route_stamp{0};
+    bool     m_routing{false};
     void filter_ref(const std::string& filter, bool add);
     // Whether the message was routed; false for one the retained store refused, which the publisher is told of.
     bool store_retained(const message_ptr& m, bool notify);
@@ -435,12 +578,13 @@ private:
     void send_retained(session& s, const std::string& filter, const sub_options& o);
     // QoS 1 and 2 messages written as far as the client's Receive Maximum and the write limit allow.
     void pump(session& s);
+    // A QoS 1 or 2 message written now and held until it is answered; one too large for the client is dropped.
+    void send_queued(session& s, connection& c, queued q);
     // False when the message is larger than the client takes, which counts as delivered.
     bool write_publish_to(session& s, connection& c, uint16_t id, const queued& q, bool dup);
     void send_packet(connection& c, std::string_view bytes);
     client_info info_of(const connection& c) const;
     void resend(session& s, connection& c);
-    uint16_t take_id(session& s);
     bool expired(const message& m) const;
 
     void end_session(session& s, bool publish_will);
@@ -462,6 +606,8 @@ private:
     broker_hooks& m_hooks;
 
     std::unordered_map<uint64_t, std::unique_ptr<connection>> m_conns;
+    // The connection conn_of() last answered with, which only disconnected() takes out of the table.
+    connection* m_last_conn{nullptr};
     std::unordered_map<std::string, std::unique_ptr<session>> m_sessions;
     std::unordered_map<uint64_t, session*> m_by_key;
     uint64_t m_next_key{1};

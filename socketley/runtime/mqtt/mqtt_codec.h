@@ -251,6 +251,27 @@ void write_auth(std::string& out, const auth_packet& p);
 // The bytes write_publish() would produce, so a sender can hold a packet to a peer's Maximum Packet Size first.
 size_t publish_size(uint8_t level, const publish_packet& p);
 
+// A PUBLISH as views of what it carries, which is how the broker writes one to each subscriber: a publish_packet
+// copied the topic, the payload and every property once per subscriber.
+struct publish_parts
+{
+    uint8_t          qos{0};
+    bool             retain{false};
+    bool             dup{false};
+    uint16_t         packet_id{0};
+    std::string_view topic;
+    std::string_view payload;
+    // 5.0's properties, written by the put_prop_* below without their length.
+    std::string_view props;
+};
+size_t publish_parts_size(uint8_t level, const publish_parts& p);
+void write_publish_parts(std::string& out, uint8_t level, const publish_parts& p);
+void put_prop_byte(std::string& out, uint8_t id, uint8_t v);
+void put_prop_u32(std::string& out, uint8_t id, uint32_t v);
+void put_prop_varint(std::string& out, uint8_t id, uint32_t v);
+void put_prop_str(std::string& out, uint8_t id, std::string_view v);
+void put_prop_pair(std::string& out, uint8_t id, std::string_view k, std::string_view v);
+
 // ── Names ───────────────────────────────────────────────────────────────────
 
 // Well-formed UTF-8 without U+0000, which every string of the protocol must be.

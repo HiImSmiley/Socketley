@@ -1,6 +1,7 @@
 #include "mqtt_run.h"
 
 #include <algorithm>
+#include <utility>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -145,9 +146,10 @@ mqtt_run::~mqtt_run()
     m_loop.deregister_owner(this);
 }
 
+// Keep alive, expiry and wills are counted in seconds, so the coarse clock serves, at a fraction of the cost.
 int64_t mqtt_run::now_ms() const
 {
-    return wall::now_ms();
+    return wall::now_ms_coarse();
 }
 
 // ── Starting and stopping ───────────────────────────────────────────────────
@@ -405,14 +407,19 @@ mqtt_run::conn* mqtt_run::conn_of(io_request* req)
 
 mqtt_run::conn* mqtt_run::find(uint64_t id)
 {
-    const auto it = m_conns.find(id);
-    return it == m_conns.end() ? nullptr : it->second.get();
+    return const_cast<conn*>(std::as_const(*this).find(id));
 }
 
 const mqtt_run::conn* mqtt_run::find(uint64_t id) const
 {
+    // The broker asks after one connection several times a delivery: what it owes, then the bytes for it.
+    if (m_last_conn && m_last_conn->id == id)
+        return m_last_conn;
     const auto it = m_conns.find(id);
-    return it == m_conns.end() ? nullptr : it->second.get();
+    if (it == m_conns.end())
+        return nullptr;
+    m_last_conn = it->second.get();
+    return m_last_conn;
 }
 
 void mqtt_run::arm_read(conn& c)
@@ -792,6 +799,8 @@ void mqtt_run::close_conn(conn& c)
     const auto it = m_conns.find(id);
     if (it != m_conns.end())
     {
+        if (m_last_conn == it->second.get())
+            m_last_conn = nullptr;
         m_closing.push_back(std::move(it->second));
         m_conns.erase(it);
     }

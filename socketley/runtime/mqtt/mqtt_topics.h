@@ -5,17 +5,38 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <array>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include "../../shared/util/transparent_string.h"
 
 namespace socketley::mqtt
 {
 
 // The levels of a topic or filter, as views into it.
 std::vector<std::string_view> split_levels(std::string_view s);
+
+// A topic's levels where a publish needs them, held on the stack for a topic of up to 32 of them.
+class topic_levels
+{
+public:
+    explicit topic_levels(std::string_view topic);
+    std::span<const std::string_view> view() const
+    {
+        return m_many.empty() ? std::span<const std::string_view>(m_few.data(), m_count)
+                              : std::span<const std::string_view>(m_many);
+    }
+
+private:
+    std::array<std::string_view, 32> m_few{};
+    size_t m_count{0};
+    std::vector<std::string_view> m_many;
+};
 
 // A subscription's options as the tree keeps them.
 struct sub_options
@@ -71,18 +92,24 @@ private:
     };
     struct node
     {
-        std::unordered_map<std::string, std::unique_ptr<node>> children;
+        // The literal levels below, looked up by a topic's level without a string built for it.
+        std::unordered_map<std::string, std::unique_ptr<node>, string_hash, std::equal_to<>> children;
+        // The wildcards' levels apart, since every topic asks after both at every level.
+        std::unique_ptr<node> plus;
+        std::unique_ptr<node> hash;
         std::vector<member> plain;
         std::unordered_map<std::string, group_set> groups;
-        bool empty() const { return children.empty() && plain.empty() && groups.empty(); }
+        bool empty() const { return children.empty() && !plus && !hash && plain.empty() && groups.empty(); }
     };
 
+    // The slot a filter's level lives in below `n`, made when `make`; null when there is none.
+    static std::unique_ptr<node>* child(node& n, std::string_view level, bool make);
     node* find_or_make(std::string_view filter);
-    void collect(node& n, const std::vector<std::string_view>& levels, size_t i, bool root_dollar,
+    void collect(node& n, std::span<const std::string_view> levels, size_t i, bool root_dollar,
                  const std::function<void(uint64_t, const sub_options&)>& plain,
                  const std::function<void(std::string_view, uint64_t, const sub_options&)>& shared,
                  const std::function<bool(uint64_t)>& online);
-    static bool any_at(const node& n, const std::vector<std::string_view>& levels, size_t i, bool root_dollar);
+    static bool any_at(const node& n, std::span<const std::string_view> levels, size_t i, bool root_dollar);
     static void take(node& n, const std::function<void(uint64_t, const sub_options&)>& plain,
                      const std::function<void(std::string_view, uint64_t, const sub_options&)>& shared,
                      const std::function<bool(uint64_t)>& online);

@@ -28,4 +28,12 @@ inline int64_t now_sec_coarse()
     return static_cast<int64_t>(ts.tv_sec);
 }
 
+// The same in milliseconds, a few of them behind, for what is counted in seconds and asked per packet.
+inline int64_t now_ms_coarse()
+{
+    timespec ts{};
+    ::clock_gettime(CLOCK_REALTIME_COARSE, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
 } // namespace socketley::wall

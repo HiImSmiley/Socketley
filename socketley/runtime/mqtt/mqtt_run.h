@@ -67,6 +67,7 @@ public:
     void authenticate(const auth_ask& ask, std::function<void(auth_answer)> done) override;
     bool may_write(std::string_view user, std::string_view client, std::string_view topic) override;
     bool may_read(std::string_view user, std::string_view client, std::string_view topic) override;
+    bool reads_checked() const override { return !m_acl.value().empty(); }
     bool may_subscribe(std::string_view user, std::string_view client, std::string_view filter) override;
     bool hooks_publish() const override;
     void on_publish(const client_info& c, const message_ptr& m, std::function<void(publish_verdict)> done) override;
@@ -184,6 +185,8 @@ private:
 
     listener m_tcp, m_ws;
     std::unordered_map<uint64_t, std::unique_ptr<conn>> m_conns;
+    // The connection find() last answered with, which only close_conn() takes out of the table.
+    mutable const conn* m_last_conn{nullptr};
     std::vector<std::unique_ptr<conn>> m_closing;
     std::vector<uint64_t> m_close_soon;
     uint64_t m_next_id{1};
