@@ -964,6 +964,14 @@ bool broker::write_publish_to(session& s, connection& c, uint16_t id, const queu
     }
     std::string& out = m_out_scratch;
     out.clear();
+    // A large payload is sent from the message itself by every subscriber, as a cache sends a PUBLISH from one
+    // segment; below this a copy costs less than the slice that would carry it.
+    if (m.payload.size() >= shared_payload_bytes)
+    {
+        write_publish_head(out, c.level, p);
+        m_io.send_parts(c.id, out, std::shared_ptr<const std::string>(q.msg, &m.payload), m.payload);
+        return true;
+    }
     write_publish_parts(out, c.level, p);
     send_packet(c, out);
     return true;

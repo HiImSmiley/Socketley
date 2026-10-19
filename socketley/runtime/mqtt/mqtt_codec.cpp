@@ -1021,7 +1021,7 @@ size_t publish_parts_size(uint8_t level, const publish_parts& p)
     return 1 + varint_size(static_cast<uint32_t>(body)) + body;
 }
 
-void write_publish_parts(std::string& out, uint8_t level, const publish_parts& p)
+void write_publish_head(std::string& out, uint8_t level, const publish_parts& p)
 {
     uint8_t first = 0x30 | static_cast<uint8_t>((p.qos & 0x03) << 1);
     if (p.dup)
@@ -1031,7 +1031,7 @@ void write_publish_parts(std::string& out, uint8_t level, const publish_parts& p
     size_t body = 2 + p.topic.size() + (p.qos ? 2 : 0) + p.payload.size();
     if (level == level_5)
         body += varint_size(static_cast<uint32_t>(p.props.size())) + p.props.size();
-    out.reserve(out.size() + 1 + varint_size(static_cast<uint32_t>(body)) + body);
+    out.reserve(out.size() + 1 + varint_size(static_cast<uint32_t>(body)) + body - p.payload.size());
     out.push_back(static_cast<char>(first));
     put_varint(out, static_cast<uint32_t>(body));
     put_str(out, p.topic);
@@ -1042,6 +1042,12 @@ void write_publish_parts(std::string& out, uint8_t level, const publish_parts& p
         put_varint(out, static_cast<uint32_t>(p.props.size()));
         out += p.props;
     }
+}
+
+void write_publish_parts(std::string& out, uint8_t level, const publish_parts& p)
+{
+    out.reserve(out.size() + publish_parts_size(level, p));
+    write_publish_head(out, level, p);
     out += p.payload;
 }
 

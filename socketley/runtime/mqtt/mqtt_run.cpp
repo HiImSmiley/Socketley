@@ -523,7 +523,7 @@ void mqtt_run::tls_in(conn& c, const char* p, size_t n)
     if (!c.handshaken)
     {
         const int r = tls_context::do_handshake(c.ssl);
-        tls_context::take_out(c.ssl, c.out);
+        queue_tls_out(c);
         flush(c);
         if (r < 0)
         {
@@ -555,7 +555,7 @@ void mqtt_run::tls_in(conn& c, const char* p, size_t n)
     }
     if (!c.dead && tls_context::has_pending_out(c.ssl))
     {
-        tls_context::take_out(c.ssl, c.out);
+        queue_tls_out(c);
         flush(c);
     }
 }
@@ -704,11 +704,58 @@ void mqtt_run::raw_out(conn& c, std::string_view bytes)
                 break;
             off += static_cast<size_t>(w);
         }
-        tls_context::take_out(c.ssl, c.out);
+        queue_tls_out(c);
     }
     else
-        c.out.append(bytes);
+        queue_owned(c, bytes);
     flush(c);
+}
+
+void mqtt_run::queue_owned(conn& c, std::string_view bytes)
+{
+    if (bytes.empty())
+        return;
+    c.owed += bytes.size();
+    if (!c.queue.empty() && c.queue.back().owns())
+        c.queue.back().append(bytes);
+    else
+    {
+        std::string b = std::move(c.spare);
+        b.assign(bytes);
+        c.queue.emplace_back(std::move(b));
+    }
+}
+
+void mqtt_run::queue_tls_out(conn& c)
+{
+    m_tls_out.clear();
+    tls_context::take_out(c.ssl, m_tls_out);
+    queue_owned(c, m_tls_out);
+}
+
+void mqtt_run::send_parts(uint64_t id, std::string_view head, const std::shared_ptr<const std::string>& owner,
+                          std::string_view body)
+{
+    conn* c = find(id);
+    if (!c || c->dead)
+        return;
+    // TLS encrypts every byte into a record anyway, so a slice saves it nothing.
+    if (c->ssl)
+    {
+        broker_io::send_parts(id, head, owner, body);
+        return;
+    }
+    if (c->ws)
+    {
+        char frame[14];
+        const int n = ws_write_header(frame, static_cast<uint8_t>(0x80 | WS_OP_BINARY), head.size() + body.size());
+        queue_owned(*c, std::string_view(frame, static_cast<size_t>(n)));
+    }
+    queue_owned(*c, head);
+    const auto off = static_cast<uint32_t>(body.data() - owner->data());
+    c->queue.emplace_back(owner, off, static_cast<uint32_t>(body.size()));
+    c->owed += body.size();
+    flush(*c);
 }
 
 size_t mqtt_run::backlog(uint64_t id) const
@@ -721,25 +768,42 @@ void mqtt_run::flush(conn& c)
 {
     if (c.dead || c.wr_pending)
         return;
-    if (c.sent >= c.sending.size())
+    if (c.sending_at >= c.sending.size())
     {
         c.sending.clear();
+        c.sending_at = 0;
         c.sent = 0;
-        if (c.out.empty())
+        if (c.queue.empty())
         {
             if (c.closing)
                 m_close_soon.push_back(c.id);
             return;
         }
-        c.sending.swap(c.out);
+        c.sending.swap(c.queue);
     }
     c.wr        = io_request{};
     c.wr.owner  = this;
     c.wr.buffer = reinterpret_cast<char*>(&c);
     c.wr.fd     = c.fd;
-    c.wr.type   = op_write;
-    const size_t chunk = std::min<size_t>(c.sending.size() - c.sent, 1u << 20);
-    c.wr_pending = m_loop.submit_write(c.fd, c.sending.data() + c.sent, static_cast<uint32_t>(chunk), &c.wr);
+    const size_t left = c.sending.size() - c.sending_at;
+    if (left == 1)
+    {
+        const std::string_view b = c.sending[c.sending_at].view().substr(c.sent);
+        c.wr.type    = op_write;
+        c.wr_pending = m_loop.submit_write(c.fd, b.data(), static_cast<uint32_t>(std::min<size_t>(b.size(), 1u << 20)),
+                                           &c.wr);
+    }
+    else
+    {
+        c.iov.clear();
+        for (size_t i = c.sending_at; i < c.sending.size() && c.iov.size() < 128; ++i)
+        {
+            const std::string_view b = c.sending[i].view().substr(i == c.sending_at ? c.sent : 0);
+            c.iov.push_back({const_cast<char*>(b.data()), b.size()});
+        }
+        c.wr.type    = op_writev;
+        c.wr_pending = m_loop.submit_writev(c.fd, c.iov.data(), static_cast<uint32_t>(c.iov.size()), &c.wr);
+    }
     // The ring had no room; a turn later it may.
     c.reflush = !c.wr_pending;
 }
@@ -758,7 +822,32 @@ void mqtt_run::write_done(conn& c, int res)
         close_conn(c);
         return;
     }
-    c.sent += static_cast<size_t>(res);
+    auto done = static_cast<size_t>(res);
+    c.owed -= std::min(c.owed, done);
+    while (done && c.sending_at < c.sending.size())
+    {
+        const size_t rest = c.sending[c.sending_at].size() - c.sent;
+        if (done < rest)
+        {
+            c.sent += done;
+            break;
+        }
+        done -= rest;
+        // Let go at once, so a payload's message is freed as soon as its last subscriber has it; its own room is
+        // kept for the next, since a capped one was grown again from nothing on every batch (0.65 at 4 KiB).
+        socketley::write_chunk& sent = c.sending[c.sending_at++];
+        if (sent.owns())
+        {
+            std::string room = sent.take_owned();
+            if (room.capacity() > c.spare.capacity())
+            {
+                room.clear();
+                c.spare.swap(room);
+            }
+        }
+        sent = socketley::write_chunk{};
+        c.sent = 0;
+    }
     runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(res));
     if (c.unsent() == 0 && c.told_broker && !c.closing)
         m_broker->drained(c.id);

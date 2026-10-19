@@ -1048,6 +1048,9 @@ TEST_CASE("a PUBLISH written from its parts is byte for byte the one written fro
         write_publish_parts(b, level, q);
         CHECK(a == b);
         CHECK(publish_parts_size(level, q) == b.size());
+        std::string head;
+        write_publish_head(head, level, q);
+        CHECK(head + p.payload == b);
     }
 }
 

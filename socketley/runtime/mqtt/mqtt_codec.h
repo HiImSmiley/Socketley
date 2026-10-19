@@ -266,6 +266,8 @@ struct publish_parts
 };
 size_t publish_parts_size(uint8_t level, const publish_parts& p);
 void write_publish_parts(std::string& out, uint8_t level, const publish_parts& p);
+// The same without the payload's bytes, its length counted, for a sender that sends the payload from where it is.
+void write_publish_head(std::string& out, uint8_t level, const publish_parts& p);
 void put_prop_byte(std::string& out, uint8_t id, uint8_t v);
 void put_prop_u32(std::string& out, uint8_t id, uint32_t v);
 void put_prop_varint(std::string& out, uint8_t id, uint32_t v);

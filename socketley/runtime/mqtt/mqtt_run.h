@@ -13,6 +13,7 @@
 #include <openssl/ssl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 
 #include "mqtt_auth.h"
 #include "mqtt_broker.h"
@@ -21,6 +22,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
+#include "../../shared/loop/write_queue.h"
 
 class mqtt_instance;
 class tls_context;
@@ -59,6 +61,8 @@ public:
 
     // ── broker_io ───────────────────────────────────────────────────────────
     void send(uint64_t conn, std::string_view bytes) override;
+    void send_parts(uint64_t conn, std::string_view head, const std::shared_ptr<const std::string>& owner,
+                    std::string_view body) override;
     size_t backlog(uint64_t conn) const override;
     void close(uint64_t conn) override;
     int64_t now_ms() const override;
@@ -98,10 +102,17 @@ private:
         bool reflush{false};
         // A read buffer of its own, only where the buffer ring cannot be used.
         std::unique_ptr<char[]> rbuf;
-        // Bytes not yet gone, and the ones the ring is sending now.
-        std::string out;
-        std::string sending;
+        // Bytes not yet gone, oldest first: the ones queued since the last write, and the ones the ring is sending
+        // now, which stay where they are until it has. A large payload is a slice of the message every subscriber
+        // sends from, as a cache's subscribers send a PUBLISH from one segment.
+        std::vector<socketley::write_chunk> queue;
+        std::vector<socketley::write_chunk> sending;
+        size_t sending_at{0};
         size_t sent{0};
+        size_t owed{0};
+        std::vector<iovec> iov;
+        // The room of a sent chunk of its own, taken by the next one, as out and sending traded theirs before.
+        std::string spare;
         // The broker asked it closed once what it owes has gone; the time it asked, for a peer that never reads.
         bool closing{false};
         int64_t closing_ms{0};
@@ -112,7 +123,7 @@ private:
         bool ws_open{false};
         std::string ws_in;
         bool told_broker{false};
-        size_t unsent() const { return sending.size() - sent + out.size(); }
+        size_t unsent() const { return owed; }
     };
     struct listener
     {
@@ -143,6 +154,11 @@ private:
     void ws_handshake(conn& c);
     void ws_frames(conn& c);
     void raw_out(conn& c, std::string_view bytes);
+    // Bytes of the connection's own at the end of what it owes.
+    static void queue_owned(conn& c, std::string_view bytes);
+    // What OpenSSL has encrypted, moved to the end of what the connection owes.
+    void queue_tls_out(conn& c);
+    std::string m_tls_out;
     void flush(conn& c);
     void write_done(conn& c, int res);
     void close_conn(conn& c);

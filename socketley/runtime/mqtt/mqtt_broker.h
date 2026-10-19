@@ -302,6 +302,18 @@ class broker_io
 public:
     virtual ~broker_io() = default;
     virtual void send(uint64_t conn, std::string_view bytes) = 0;
+    // A packet whose body is a slice of bytes `owner` keeps alive and other connections send too; a transport that
+    // cannot send a slice sends the two together.
+    virtual void send_parts(uint64_t conn, std::string_view head, const std::shared_ptr<const std::string>& owner,
+                            std::string_view body)
+    {
+        (void)owner;
+        std::string all;
+        all.reserve(head.size() + body.size());
+        all.append(head);
+        all.append(body);
+        send(conn, all);
+    }
     // Bytes handed to send() for this connection and not yet gone.
     virtual size_t backlog(uint64_t conn) const = 0;
     // Ends a connection once what was sent has gone; disconnected() follows.
@@ -526,6 +538,7 @@ private:
     connection* conn_of(uint64_t id);
     session* session_of_key(uint64_t key);
 
+    static constexpr size_t shared_payload_bytes = 8192;
     // Room the writing of each PUBLISH reuses, so a subscriber's copy costs no allocation once warm.
     std::string m_props_scratch;
     std::string m_out_scratch;
