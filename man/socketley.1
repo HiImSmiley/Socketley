@@ -12273,6 +12273,7 @@ device/+/state    db://fleet/devices/%1
 log/#             storage://raw/mqtt/%Y/%m/%d/
 chat/#            server://chat
 share/#           mqtt://other/from\-edge/%t
+door/#            https://hooks.example.com/door
 .fi
 .RE
 .IP
@@ -12302,7 +12303,14 @@ sends every client of the server
 .B {"topic":..,"payload":..}
 as a line; and
 .BI mqtt:// runtime / topic
-publishes on that broker, at the message's QoS and retained as it was.
+publishes on that broker, at the message's QoS and retained as it was; and
+.BR http:// " or " https:// " URL"
+POSTs
+.B {"topic":..,"payload":..,"qos":..,"retain":..,"client":..}
+to it, one at a time and in order on a connection it keeps, the host resolved
+on the broker's loop (see What can stop the event loop): a 2xx is delivered, a
+400 or another refusal is counted failed and not sent again, and no answer, a
+408, a 429 or a 5xx is tried again as a stopped runtime is.
 .B %1
 to
 .B %9

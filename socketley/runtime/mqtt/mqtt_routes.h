@@ -27,7 +27,7 @@
 namespace socketley::mqtt
 {
 
-enum class target_kind : uint8_t { cache_stream, cache_channel, db, storage, server, mqtt };
+enum class target_kind : uint8_t { cache_stream, cache_channel, db, storage, server, mqtt, webhook };
 
 // A request waiting for its target, numbered so one sent again goes back to where it stood.
 struct route_request

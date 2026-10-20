@@ -203,6 +203,21 @@ bool mqtt_run::start(std::string& why)
             why = path + ": " + why;
             return false;
         }
+        // A webhook rule's connection, kept from one message to the next and asked for its host now.
+        m_route_peers.resize(m_routes->routes().size());
+        m_route_posting.resize(m_routes->routes().size());
+        for (size_t i = 0; i < m_routes->routes().size(); ++i)
+        {
+            const route& r = m_routes->routes()[i];
+            socketley::http_target t;
+            std::string bad;
+            if (r.kind != target_kind::webhook || !socketley::parse_http_url(r.name, t, bad))
+                continue;
+            m_route_peers[i] = std::make_unique<socketley::http_peer>(
+                m_loop, m_fio, m_pool, t, std::string{},
+                "mqtt " + std::string(m_owner.get_name()) + ": the webhook of " + r.text);
+            m_route_peers[i]->prime();
+        }
     }
     std::string file_why;
     if (!m_users.refresh([](user_table& t, std::string_view text, std::string& w) { return t.parse(text, w); },
@@ -309,6 +324,19 @@ void mqtt_run::stop()
         }
     if (auto* mgr = m_owner.get_runtime_manager())
         mgr->requests().drop_origin(this);
+    // A webhook's request in flight goes back to the head of its queue, so the snapshot keeps it.
+    for (size_t i = 0; i < m_route_peers.size(); ++i)
+        if (m_route_peers[i])
+        {
+            m_route_peers[i]->stop();
+            if (m_route_posting[i] && m_routes)
+            {
+                m_routes->routes()[i].put_back(std::move(*m_route_posting[i]));
+                m_route_posting[i].reset();
+                if (m_routes->routes()[i].inflight)
+                    --m_routes->routes()[i].inflight;
+            }
+        }
     if (m_routes)
         m_routes->cut_batches(now_ms(), m_owner.get_shard_index(), true);
     // A broker that keeps its state writes it while the sessions still have their connections, so their wills are
@@ -1042,6 +1070,11 @@ void mqtt_run::tick()
     }
     if (m_routes)
         m_routes->cut_batches(now, m_owner.get_shard_index(), false);
+    // A webhook's exchange that stalled ends, and its connection kept too long goes.
+    const auto steady = std::chrono::steady_clock::now();
+    for (auto& p : m_route_peers)
+        if (p)
+            p->tick(steady);
     if (now >= m_next_persist_ms)
     {
         m_next_persist_ms = now + static_cast<int64_t>(m_owner.get_persist_interval()) * 1000;
@@ -1093,6 +1126,13 @@ void mqtt_run::persist(bool now_and_wait)
         for (const auto& [cookie, ask] : m_route_asks)
             if (ask.index < flying.size())
                 flying[ask.index].push_back(&ask.request);
+    }
+    if (m_routes)
+    {
+        flying.resize(m_routes->routes().size());
+        for (size_t i = 0; i < m_route_posting.size() && i < flying.size(); ++i)
+            if (m_route_posting[i])
+                flying[i].push_back(&*m_route_posting[i]);
     }
     w.bytes(m_routes ? m_routes->save(flying) : std::string());
     std::string data = w.take();
@@ -1294,6 +1334,13 @@ void mqtt_run::pump_routes()
             continue;
         while (!r.queue.empty() && r.inflight < route_table::window)
         {
+            // One at a time, so a webhook is told in the order the messages came.
+            if (r.kind == target_kind::webhook)
+            {
+                if (r.inflight == 0)
+                    post_route(i);
+                break;
+            }
             if (r.kind == target_kind::server)
             {
                 if (!route_relay::broadcast(mgr, r.runtime, m_owner.get_name(), r.queue.front().bytes))
@@ -1321,6 +1368,59 @@ void mqtt_run::pump_routes()
             m_route_asks.emplace(cookie, route_ask{i, std::move(q)});
         }
     }
+}
+
+void mqtt_run::post_route(size_t i)
+{
+    route& r = m_routes->routes()[i];
+    socketley::http_peer* peer = i < m_route_peers.size() ? m_route_peers[i].get() : nullptr;
+    if (!peer || peer->busy() || r.queue.empty())
+        return;
+    m_route_posting[i] = std::move(r.queue.front());
+    r.queue.pop_front();
+    ++r.inflight;
+    const socketley::http_target& t = peer->target();
+    socketley::http_request rq;
+    rq.head = "POST " + (t.path.empty() ? std::string("/") : t.path) + " HTTP/1.1\r\nHost: " + t.authority() +
+              "\r\nContent-Type: application/json\r\nContent-Length: " +
+              std::to_string(m_route_posting[i]->bytes.size()) +
+              "\r\nConnection: keep-alive\r\nUser-Agent: socketley-mqtt\r\n\r\n";
+    rq.body = m_route_posting[i]->bytes;
+    peer->exchange(std::move(rq), [this, i](socketley::http_answer a)
+    {
+        if (!m_routes || i >= m_routes->routes().size() || !m_route_posting[i])
+            return;
+        route& r = m_routes->routes()[i];
+        if (r.inflight)
+            --r.inflight;
+        std::string why;
+        const reply_verdict v = judge_reply(target_kind::webhook, std::to_string(a.status), why);
+        if (a.status == 0 && !a.failure.empty())
+            why = "the webhook did not answer: " + a.failure;
+        switch (v)
+        {
+            case reply_verdict::delivered:
+                ++r.delivered;
+                r.backoff_ms = 0;
+                break;
+            case reply_verdict::refused:
+                ++r.failed;
+                if (r.last_error != why)
+                    LOG_WARN(("mqtt " + std::string(m_owner.get_name()) + ": " + r.text + " refused a message: " + why)
+                                 .c_str());
+                r.last_error = why;
+                break;
+            case reply_verdict::retry:
+                r.put_back(std::move(*m_route_posting[i]));
+                r.back_off(now_ms());
+                r.last_error = why;
+                break;
+        }
+        m_route_posting[i].reset();
+        m_routes_dirty = true;
+        if (!m_stopped)
+            pump_routes();
+    });
 }
 
 void mqtt_run::on_request_reply(uint64_t cookie, request_status st, std::string_view reply)

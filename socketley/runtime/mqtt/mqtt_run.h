@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -18,6 +19,7 @@
 #include "mqtt_auth.h"
 #include "mqtt_broker.h"
 #include "mqtt_routes.h"
+#include "../../shared/http/outbound_http.h"
 #include "../../shared/ipc/request_channel.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
@@ -278,6 +280,11 @@ private:
         route_request request;
     };
     std::unordered_map<uint64_t, route_ask> m_route_asks;
+    // Each webhook rule's connection, null for a rule of any other kind, and the one request it has in flight, kept so
+    // a snapshot holds it in its place.
+    std::vector<std::unique_ptr<socketley::http_peer>> m_route_peers;
+    std::vector<std::optional<route_request>>         m_route_posting;
+    void post_route(size_t i);
     uint64_t m_next_cookie{1};
     bool m_routes_dirty{false};
 

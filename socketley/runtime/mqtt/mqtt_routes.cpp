@@ -9,6 +9,7 @@
 #include "mqtt_command.h"
 #include "mqtt_topics.h"
 #include "../cache/stream_log.h"
+#include "../../shared/http/http_url.h"
 #include "../../shared/ipc/one_command.h"
 #include "../../shared/json/json_doc.h"
 #include "../../shared/json/json_escape.h"
@@ -31,6 +32,7 @@ const char* target_kind_name(target_kind k)
         case target_kind::storage:       return "storage";
         case target_kind::server:        return "server";
         case target_kind::mqtt:          return "mqtt";
+        case target_kind::webhook:       return "webhook";
     }
     return "?";
 }
@@ -231,8 +233,20 @@ bool route_table::parse(std::string_view text, std::string& why)
         r.text   = std::string(filter) + " " + std::string(target);
         const size_t scheme_end = target.find("://");
         if (scheme_end == std::string_view::npos)
-            return refuse("`" + std::string(target) + "` is not cache://, db://, storage://, server:// or mqtt://");
+            return refuse("`" + std::string(target) + "` is not cache://, db://, storage://, server://, mqtt:// or a URL");
         const std::string_view scheme = target.substr(0, scheme_end);
+        // A webhook names a host and not a runtime: the message is POSTed to it as JSON.
+        if (scheme == "http" || scheme == "https")
+        {
+            socketley::http_target t;
+            std::string problem;
+            if (!socketley::parse_http_url(target, t, problem))
+                return refuse(problem);
+            r.kind = target_kind::webhook;
+            r.name = std::string(target);
+            m_routes.push_back(std::move(r));
+            continue;
+        }
         std::string_view path = target.substr(scheme_end + 3);
         const std::string_view runtime = socketley::take_item(path, '/');
         if (!valid_runtime_name(runtime))
@@ -292,7 +306,8 @@ bool route_table::parse(std::string_view text, std::string& why)
                 return refuse(problem);
         }
         else
-            return refuse("`" + std::string(scheme) + "://` is not cache://, db://, storage://, server:// or mqtt://");
+            return refuse("`" + std::string(scheme) + "://` is not cache://, db://, storage://, server://, mqtt:// or "
+                          "http(s)://");
         m_routes.push_back(std::move(r));
     }
     return true;
@@ -356,6 +371,19 @@ std::string route_table::request_for(const route& r, const message& m, const std
         }
         case target_kind::mqtt:
             return command_publish(expand(r.name, m, plus, false), m.payload, m.qos, m.retain);
+        case target_kind::webhook:
+        {
+            std::string body = "{\"topic\":";
+            socketley::json::quote_into(body, m.topic);
+            body += ",\"payload\":";
+            payload_json(body, m.payload);
+            body += ",\"qos\":" + std::to_string(m.qos) + ",\"retain\":";
+            body += m.retain ? "true" : "false";
+            body += ",\"client\":";
+            socketley::json::quote_into(body, m.from_client);
+            body += "}";
+            return body;
+        }
         case target_kind::storage:
             break;
     }
@@ -556,6 +584,18 @@ reply_verdict judge_reply(target_kind k, std::string_view reply, std::string& wh
             return reply_verdict::refused;
         case target_kind::server:
             return reply_verdict::delivered;
+        case target_kind::webhook:
+        {
+            // The status alone, as a webhook says what it has to say in it.
+            int status = 0;
+            std::from_chars(reply.data(), reply.data() + reply.size(), status);
+            if (status >= 200 && status < 300)
+                return reply_verdict::delivered;
+            why = status ? "the webhook answered " + std::string(reply) : "the webhook did not answer";
+            // One that is down, busy or asks for time is tried again; one that says the message is wrong is not.
+            return status == 0 || status == 408 || status == 429 || status >= 500 ? reply_verdict::retry
+                                                                                  : reply_verdict::refused;
+        }
     }
     return reply_verdict::refused;
 }

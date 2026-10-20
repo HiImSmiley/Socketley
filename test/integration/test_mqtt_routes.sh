@@ -9,6 +9,8 @@
 #   * messages for a target that is down lost, reordered or sent twice when it is back
 #   * what was delivered before a restart sent again after it
 #   * a rule that does not read taken, or refused without naming its line
+#   * a webhook rule's message lost when the hook fails for a while, sent twice, reordered, or sent again when the
+#     hook refused it
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -29,7 +31,9 @@ T=$SOCKETLEY_TMPD
 PK=$((SL_PORT_BASE + 1940))
 PD=$((SL_PORT_BASE + 1941))
 PE=$((SL_PORT_BASE + 1944))
-trap 'daemon_stop' EXIT
+PH=$((SL_PORT_BASE + 1945))
+HOOK_PID=""
+trap '[ -n "$HOOK_PID" ] && kill "$HOOK_PID" 2>/dev/null; daemon_stop' EXIT
 daemon_start "$BIN"
 
 printf 'devices private\n' > "$T/schema"
@@ -52,13 +56,33 @@ alarm/#           cache://kv/channel/alarms
 device/+/state    db://fleet/devices/%1
 fwd/#             mqtt://edge/from-edge/%t     # back into the broker, under another topic
 EOF
+printf 'web/#             http://127.0.0.1:%s/in\nnope/#            http://127.0.0.1:%s/bad\n' "$PH" "$PH" >> "$T/routes"
+# A webhook that fails its first two messages, as one that is restarting does, and refuses every one at /bad.
+python3 - "$PH" "$T/hook.log" <<'PY' &
+import http.server, sys
+out, fails = open(sys.argv[2], "a"), {"n": 0}
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        b = self.rfile.read(int(self.headers.get("content-length", 0)))
+        if self.path == "/bad":
+            self.send_response(400); self.end_headers(); return
+        if fails["n"] < 2:
+            fails["n"] += 1
+            self.send_response(500); self.end_headers(); return
+        out.write(self.path + " " + b.decode() + "\n"); out.flush()
+        self.send_response(204); self.end_headers()
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+HOOK_PID=$!
+export HOOKLOG="$T/hook.log"
 "$BIN" create mqtt edge -p "$PE" --anonymous --routes "$T/routes" --persistent on -s >/dev/null 2>&1 \
     && ok || bad "a broker with topic rules is made" "$(tail -3 "$SOCKETLEY_DLOG")"
 for p in "$PK" "$PD" "$PE"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens" "$(tail -5 "$SOCKETLEY_DLOG")"; done
 
 run() {
     PYTHONPATH="$HERE" python3 - "$1" "$PK" "$PD" "$PE" "$BIN" 2>&1 <<'PY'
-import json, subprocess, sys, time, urllib.request, urllib.error
+import json, os, subprocess, sys, time, urllib.request, urllib.error
 from lib_mqtt import *
 phase = sys.argv[1]
 pk, pd, pe = (int(x) for x in sys.argv[2:5])
@@ -156,9 +180,31 @@ if phase == "rules":
         check("and all of them reach it once it is back, once each and in order", got,
               ["held-%d" % i for i in range(5)])
 
+        # A webhook rule: every message, in order and once, though the hook answered the first two with a 500.
+        for i in range(3):
+            pub.publish("web/a/b", "w%d" % i, qos=1)
+        end = time.time() + 20
+        lines = []
+        while time.time() < end and len(lines) < 3:
+            try:
+                lines = [l for l in open(os.environ["HOOKLOG"]).read().splitlines() if l.startswith("/in ")]
+            except OSError:
+                pass
+            time.sleep(0.2)
+        bodies = [json.loads(l.split(" ", 1)[1]) for l in lines]
+        check("a webhook rule POSTs each message as JSON, in order and once, though the hook failed twice",
+              [(b.get("topic"), b.get("payload"), b.get("qos"), b.get("client")) for b in bodies],
+              [("web/a/b", "w%d" % i, 1, "edge-pub") for i in range(3)])
+        check("and counts them delivered", stat_sum(binary, "edge", "rule_4_delivered"), 3)
+        pub.publish("nope/x", "no", qos=1)
+        end = time.time() + 10
+        while time.time() < end and stat_sum(binary, "edge", "rule_5_failed") < 1:
+            time.sleep(0.2)
+        check("a message the hook refuses with a 400 is counted failed and not sent again",
+              (stat_sum(binary, "edge", "rule_5_failed"), stat_sum(binary, "edge", "rule_5_queued")), (1, 0))
+
         # Past what a rule holds for a target that is down the oldest go, and the log says so once and then how
         # many, where the broken build only counted them.
-        import os
         dlog = os.environ.get("SOCKETLEY_DLOG", "")
 
         def said(text):
