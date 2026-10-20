@@ -367,7 +367,8 @@ if phase == "main":
         c = connected(port, "short", props={SESSION_EXPIRY: 1})
         c.subscribe(("short", 1))
         c.disconnect()
-        time.sleep(2.5)
+        # Sooner than the once-a-second sweep is sure to have come by, which the connect does not wait for.
+        time.sleep(1.3)
         c = Client(port)
         present, _, _ = c.connect("short", clean=False, props={SESSION_EXPIRY: 1})
         check("a session ends once its expiry has passed", present, False)
@@ -549,8 +550,17 @@ if phase == "killed":
         c = Client(port)
         present, code, _ = c.connect("durable", clean=False, props={SESSION_EXPIRY: 3600})
         check("a session is there after its worker was killed", present, True)
-        m = c.message(3)
-        check("with the message queued a second before", m.payload if m else None, b"for-next")
+        # A kill may come before the last snapshot of the answers to what was sent: those go again, marked DUP, as QoS 1
+        # allows after a crash, and the message queued since is there behind them.
+        got = []
+        end = time.time() + 5
+        while time.time() < end and b"for-next" not in [x.payload for x in got]:
+            m = c.message(1)
+            if m is not None:
+                got.append(m)
+        check("with the message queued a second before", b"for-next" in [x.payload for x in got], True)
+        check("and before it only what went before, again and marked so",
+              [x.payload for x in got if x.payload != b"for-next" and not x.dup], [])
         c.disconnect(reason=0)
         e = Client(port)
         e.connect("durable", clean=True)

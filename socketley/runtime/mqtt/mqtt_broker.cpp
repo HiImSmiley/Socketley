@@ -474,6 +474,14 @@ void broker::finish_connect(uint64_t conn, uint64_t generation, auth_answer a)
     }
     const int64_t now = m_io.now_ms();
     auto it = m_sessions.find(p.client_id);
+    // One whose expiry passed since it was left is over, whether or not the sweep has come round to it yet.
+    if (it != m_sessions.end() && !it->second->conn && it->second->expiry != never &&
+        now - it->second->gone_ms >= static_cast<int64_t>(it->second->expiry) * 1000)
+    {
+        ++m_stats.sessions_expired;
+        end_session(*it->second, true);
+        it = m_sessions.find(p.client_id);
+    }
     if (it == m_sessions.end() && m_sessions.size() >= m_cfg.max_sessions)
     {
         refuse(c->level == level_5 ? reason::quota_exceeded : reason::server_unavailable);
