@@ -125,6 +125,11 @@ static constexpr std::string_view shard_batch_resp = "\x01skl-shard r\n";
 // storage's notifier, whose values may hold newlines.
 static constexpr std::string_view one_command_text = socketley::one_command_marker;
 
+// A script's publishes for one sibling go when they reach the first, and a
+// refused batch is given up at the second, well inside a mesh frame's 4 MiB.
+static constexpr size_t lua_pub_batch_bytes = 128u << 10;
+static constexpr size_t lua_pub_keep_bytes  = 1u << 20;
+
 // `<len>\n<bytes>`, length-prefixed rather than newline-delimited because RESP
 // commands contain newlines and a text value may as well.
 static void shard_frame_append(std::string& out, std::string_view bytes)
@@ -1714,6 +1719,8 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
 
 void cache_instance::on_loop_turn()
 {
+    if (SOCKETLEY_UNLIKELY(!m_lua_pub.empty()))
+        flush_lua_publishes();
     // Readers an XADD has woken this turn, served now the commands are done.
     if (SOCKETLEY_UNLIKELY(!m_stream_ready.empty()))
         serve_stream_ready();
@@ -4599,6 +4606,15 @@ void cache_instance::batch_finish(uint64_t id)
 void cache_instance::on_request_reply(uint64_t cookie, request_status st,
                                       std::string_view reply)
 {
+    if (const auto lit = m_lua_pub_posts.find(cookie); lit != m_lua_pub_posts.end())
+    {
+        if (st != request_status::ok)
+            LOG_WARN(("cache: a sibling shard did not take " + std::to_string(lit->second) +
+                      " script publish(es) (" + request_status_text(st) +
+                      "); its subscribers did not hear them").c_str());
+        m_lua_pub_posts.erase(lit);
+        return;
+    }
     const auto pit = m_posts.find(cookie);
     if (pit == m_posts.end())
         return;                       // already answered, or withdrawn
@@ -8246,8 +8262,8 @@ bool cache_instance::lua_persist(std::string_view key)
 // 17, the wire's PUBLISH 40.
 //
 // So the message takes the wire's own road for the half publish() cannot do --
-// one mesh frame per sibling that may hold a subscriber, exactly the set
-// fan_publish() picks.  No reply is collected: the frames answer on a later
+// one batch a turn for each sibling that may hold a subscriber, exactly the
+// set fan_publish() picks.  No reply is collected: the batches answer on a later
 // turn and self.publish() answers on this one, which is the same wall the
 // keyspace calls above run into.  That is why the count is this shard's
 // subscribers and not the cache's, and it is the count this call has always
@@ -8255,22 +8271,20 @@ bool cache_instance::lua_persist(std::string_view key)
 void cache_instance::fan_publish_siblings(std::string_view channel,
                                           std::string_view message)
 {
-    auto* mgr = get_runtime_manager();
-    if (!mgr)
-        return;
-
     // RESP and not the text form, because a message holding a newline or a
     // space is a message and not two commands.
     std::string_view args[3] = {"publish", channel, message};
     std::string      cmd;
     rebuild_resp(cmd, args, 3);
 
-    std::string frame(shard_batch_resp);
-    shard_frame_append(frame, cmd);
-
     const auto&    tbl      = shard_stats_table();
     const bool     filtered = tbl.mapped() && tbl.count() == m_shard_n;
     const uint32_t bit      = shard_stats::channel_bit(channel);
+    if (m_lua_pub.size() != m_shard_n)
+    {
+        m_lua_pub.assign(m_shard_n, {});
+        m_lua_pub_count.assign(m_shard_n, 0);
+    }
 
     for (uint32_t sh = 0; sh < m_shard_n; ++sh)
     {
@@ -8283,15 +8297,59 @@ void cache_instance::fan_publish_siblings(std::string_view channel,
             && !tbl.channel_may_have(sh, shard_stats::pattern_bit))
             continue;
 
-        // A cookie that is deliberately not in m_posts: on_request_reply()
-        // already drops one it does not know, which is the whole of what
-        // "fire and forget" needs here.
-        if (!mgr->requests().post(this, m_next_cookie++,
-                                  shard_target(get_name(), sh), frame,
-                                  request_class::client))
-            LOG_WARN("cache: a script's publish could not be posted to a "
-                     "sibling shard; its subscribers did not hear it");
+        // Gathered for the turn, because a crossing each for a script that
+        // publishes in a loop filled the channel and the sibling's parked
+        // requests, and three quarters of 2,000 publishes were lost.
+        std::string& batch = m_lua_pub[sh];
+        if (batch.empty())
+            batch.assign(shard_batch_resp);
+        shard_frame_append(batch, cmd);
+        ++m_lua_pub_count[sh];
+        if (batch.size() >= lua_pub_batch_bytes)
+            flush_lua_publish(sh);
     }
+}
+
+void cache_instance::flush_lua_publishes()
+{
+    bool kept = false;
+    for (uint32_t sh = 0; sh < m_lua_pub.size(); ++sh)
+    {
+        if (!m_lua_pub[sh].empty())
+            flush_lua_publish(sh);
+        kept |= !m_lua_pub[sh].empty();
+    }
+    // Emptied when nothing is kept, so a turn with nothing to send costs one test.
+    if (!kept)
+    {
+        m_lua_pub.clear();
+        m_lua_pub_count.clear();
+    }
+}
+
+void cache_instance::flush_lua_publish(uint32_t sh)
+{
+    auto* mgr = get_runtime_manager();
+    std::string& batch = m_lua_pub[sh];
+    // A cookie m_posts does not hold, so on_request_reply() takes it here and
+    // only says something when the sibling would not take the batch.
+    const uint64_t cookie = m_next_cookie++;
+    if (mgr && mgr->requests().post(this, cookie, shard_target(get_name(), sh),
+                                    batch, request_class::client))
+    {
+        m_lua_pub_posts.emplace(cookie, m_lua_pub_count[sh]);
+        batch.clear();
+        m_lua_pub_count[sh] = 0;
+        return;
+    }
+    // Refused here, so kept for the next turn, up to what a channel takes.
+    if (batch.size() < lua_pub_keep_bytes)
+        return;
+    LOG_WARN(("cache: " + std::to_string(m_lua_pub_count[sh]) +
+              " script publish(es) could not be posted to a sibling shard; "
+              "its subscribers did not hear them").c_str());
+    batch.clear();
+    m_lua_pub_count[sh] = 0;
 }
 
 int cache_instance::lua_publish(std::string_view channel, std::string_view message)

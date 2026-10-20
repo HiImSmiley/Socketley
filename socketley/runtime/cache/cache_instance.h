@@ -708,6 +708,13 @@ private:
     // The same set of targets with no reply collected, for a publish that has
     // to answer on the turn it was called.
     void fan_publish_siblings(std::string_view channel, std::string_view message);
+    // A script's publishes for each sibling, sent as one batch a turn rather than one crossing each, and the
+    // count each batch carries until it is answered.
+    std::vector<std::string> m_lua_pub;
+    std::vector<uint32_t> m_lua_pub_count;
+    std::unordered_map<uint64_t, uint32_t> m_lua_pub_posts;
+    void flush_lua_publishes();
+    void flush_lua_publish(uint32_t sh);
     static void on_channel_presence(void* ctx, std::string_view channel, bool present);
     void        channel_presence(std::string_view channel, bool present);
     // The one bit with no channel name behind it: patterns.

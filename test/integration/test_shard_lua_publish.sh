@@ -43,6 +43,21 @@
 # The wire PUBLISH arm is the control that says this file is about the Lua door
 # and not about publishing: it is green on the broken build and must stay green.
 # The one-shard arm is the control that says it is about sharding.
+#
+# ─── A SCRIPT THAT PUBLISHES IN A LOOP ─────────────────────────────────────
+#
+# One crossing per self.publish was a request each, posted without waiting.  A
+# script publishing 2,000 times in one on_miss filled the request channel and
+# the sibling's parked requests in the same turn, and what did not fit was
+# dropped with a warning.  Measured on 32f842c6, Release, four shards, eight
+# subscribers:
+#
+#   burst 2,000    12,192 of 16,000 delivered (76.2%)   -> fixed: 16,000
+#   burst 5,000    14,558 of 40,000 delivered (36.4%)   -> fixed: 40,000
+#   one shard      every one, on both builds
+#
+# Now a turn's publishes go to each sibling as one batch.  Section 3 counts
+# every delivery and checks each subscriber got them in the order sent.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -99,6 +114,11 @@ cat > "$W/pub.lua" <<'LUAEOF'
 function on_miss(key)
     if key == "shout" then
         self.publish("chan", "FROMLUA")
+        return "done"
+    end
+    local n = tonumber(key:match("^burst(%d+)$"))
+    if n then
+        for i = 1, n do self.publish("burst", "B" .. i) end
         return "done"
     end
     return nil
@@ -172,6 +192,63 @@ r, d = collect(b"FROMWIRE")
 print("wire %d %d %s" % (r, d, said))
 PYEOF
 
+cat > "$W/burst.py" <<'PYEOF'
+import re, socket, sys, time
+
+def enc(*parts):
+    out = b"*%d\r\n" % len(parts)
+    for p in parts:
+        b = p.encode()
+        out += b"$%d\r\n%s\r\n" % (len(b), b)
+    return out
+
+port, n, burst = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+subs = []
+for _ in range(n):
+    c = socket.create_connection(("127.0.0.1", port), 5)
+    c.sendall(enc("SUBSCRIBE", "burst"))
+    subs.append(c)
+time.sleep(1.0)
+for c in subs:
+    c.settimeout(0.05)
+    try:
+        while c.recv(65536):
+            pass
+    except Exception:
+        pass
+
+t = socket.create_connection(("127.0.0.1", port), 5)
+t.settimeout(10)
+t.sendall(enc("GET", "burst%d" % burst))
+t.recv(64)
+
+# Read until every subscriber has the last message or nothing has come for two
+# seconds, so a lost message ends the wait instead of the deadline.
+last = b"$%d\r\nB%d\r\n" % (len("B%d" % burst), burst)
+bufs = [b""] * n
+quiet = time.time()
+while time.time() - quiet < 2.0 and not all(b.endswith(last) for b in bufs):
+    for i, c in enumerate(subs):
+        c.settimeout(0.02)
+        try:
+            d = c.recv(1 << 20)
+            if d:
+                bufs[i] += d
+                quiet = time.time()
+        except Exception:
+            pass
+
+delivered = 0
+ordered = 0
+want = list(range(1, burst + 1))
+for b in bufs:
+    seq = [int(x) for x in re.findall(rb"\r\nB(\d+)\r\n", b)]
+    delivered += len(seq)
+    if seq == want:
+        ordered += 1
+print("burst %d %d" % (delivered, ordered))
+PYEOF
+
 run_arm() {   # port shards label
     local port=$1 shards=$2 name=$3
     "$BIN" create cache "$name" -p "$port" --shards "$shards" --lua "$W/pub.lua" >/dev/null 2>&1
@@ -214,6 +291,18 @@ assert_eq "and does not double-deliver"                "$N" "$LD"
 assert_eq "and the wire's PUBLISH agrees with it"      "$N" "$WR"
 assert_eq "exactly once there too"                     "$N" "$WD"
 assert_eq "and counts the same forty"               ":$N" "$WS"
+
+echo "--- 3. a script that publishes in a loop, on four shards ---"
+B=2000
+OUT=$(python3 "$W/burst.py" "$P4" 8 "$B") || daemon_required "burst"
+BD=$(echo "$OUT" | awk '/^burst/{print $2}'); BO=$(echo "$OUT" | awk '/^burst/{print $3}')
+echo "  observed: $BD of $((8*B)) deliveries, $BO of 8 subscribers had all $B in order"
+# 12,192 of 16,000 on the broken build: what the channel and the sibling could
+# not hold that turn was dropped.
+assert_eq "every publish of the loop reaches every subscriber" "$((8*B))" "$BD"
+# 2 of 8 on the broken build, the publishing shard's own; a batch must also
+# keep the order the script published in.
+assert_eq "and each subscriber has them in the order sent"     "8"        "$BO"
 
 echo ""
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
