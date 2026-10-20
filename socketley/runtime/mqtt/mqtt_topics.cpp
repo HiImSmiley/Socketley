@@ -143,9 +143,9 @@ bool subscription_tree::remove(std::string_view filter, std::string_view group, 
     return true;
 }
 
-void subscription_tree::take(node& n, const std::function<void(uint64_t, const sub_options&)>& plain,
-                             const std::function<void(std::string_view, uint64_t, const sub_options&)>& shared,
-                             const std::function<bool(uint64_t)>& online)
+void subscription_tree::take(node& n, fn_ref<void(uint64_t, const sub_options&)> plain,
+                             fn_ref<void(std::string_view, uint64_t, const sub_options&)> shared,
+                             fn_ref<bool(uint64_t)> online)
 {
     for (const auto& m : n.plain)
         plain(m.session, m.opts);
@@ -173,9 +173,9 @@ void subscription_tree::take(node& n, const std::function<void(uint64_t, const s
 }
 
 void subscription_tree::collect(node& n, std::span<const std::string_view> levels, size_t i, bool root_dollar,
-                                const std::function<void(uint64_t, const sub_options&)>& plain,
-                                const std::function<void(std::string_view, uint64_t, const sub_options&)>& shared,
-                                const std::function<bool(uint64_t)>& online)
+                                fn_ref<void(uint64_t, const sub_options&)> plain,
+                                fn_ref<void(std::string_view, uint64_t, const sub_options&)> shared,
+                                fn_ref<bool(uint64_t)> online)
 {
     // A wildcard at the first level does not reach a topic starting with '$'.
     const bool wild_ok = !(i == 0 && root_dollar);
@@ -193,9 +193,9 @@ void subscription_tree::collect(node& n, std::span<const std::string_view> level
 }
 
 void subscription_tree::match(std::string_view topic,
-                              const std::function<void(uint64_t session, const sub_options&)>& plain,
-                              const std::function<void(std::string_view, uint64_t, const sub_options&)>& shared,
-                              const std::function<bool(uint64_t)>& online)
+                              fn_ref<void(uint64_t session, const sub_options&)> plain,
+                              fn_ref<void(std::string_view, uint64_t, const sub_options&)> shared,
+                              fn_ref<bool(uint64_t)> online)
 {
     const topic_levels levels(topic);
     collect(*m_root, levels.view(), 0, !topic.empty() && topic.front() == '$', plain, shared, online);

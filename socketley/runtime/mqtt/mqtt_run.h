@@ -84,7 +84,8 @@ public:
     void accepted(const message_ptr& m) override;
     void retained_changed(const std::string& topic, const message_ptr& now) override;
     bool shared_here(std::string_view key) override;
-    bool publish_room(uint8_t qos) const override;
+    bool publish_room(uint8_t qos, uint64_t sent_to) const override;
+    uint64_t shards_reached() const override { return m_reached; }
     bool heard_elsewhere(std::string_view topic) override;
     void filter_added(const std::string& filter) override;
     void filter_removed(const std::string& filter) override;
@@ -202,10 +203,14 @@ private:
     struct shard_batch
     {
         uint32_t    to{0};
+        // The batch as posted, its frames from `head` on.
         std::string frames;
+        size_t      head{0};
     };
     // A word owed only a receipt, kept for the next batch; false when it is dropped instead.
     bool queue_shard(uint32_t to, std::string_view frame, bool droppable);
+    // A message for another shard, dropped where queue_shard() drops a delivery.
+    bool queue_deliver(uint32_t to, std::string_view body, const std::vector<std::string>& groups);
     void send_shard(uint32_t to);
     void send_shards();
     bool unreachable(const shard_queue& q) const;
@@ -279,11 +284,16 @@ private:
     // What the other shards subscribe to, one tree each, and the shared groups among it.
     struct peer
     {
-        std::unique_ptr<subscription_tree> filters;
         std::unordered_map<std::string, size_t> held;
         bool known{false};
     };
     std::vector<peer> m_peers;
+    // What every other shard subscribes to, in one tree whose sessions are the shards, so a message is matched once
+    // for all of them.
+    subscription_tree m_remote;
+    // A filter a shard took up or let go, counted per shard; and all of one shard's let go.
+    void peer_filter(uint32_t from, const std::string& filter, bool add);
+    void forget_peer(uint32_t from);
     std::vector<shard_queue> m_squeue;
     std::unordered_map<uint64_t, shard_batch> m_shard_batches;
     // Each retained topic's last change by its stamp, for as long as an older one could still be on its way.
@@ -292,6 +302,11 @@ private:
     uint64_t m_shard_resent{0};
     // The shared groups this message's delivery chose another shard for, filled while it is routed here.
     std::vector<std::vector<std::string>> m_assign;
+    // What share_message() works in, kept from one message to the next.
+    std::vector<std::vector<std::string>> m_sharing;
+    std::vector<uint8_t> m_plain;
+    // The shards the last message shared was handed to.
+    uint64_t m_reached{0};
     std::unordered_map<std::string, uint64_t> m_group_turn;
     // A CONNECT waiting for the other shards to give its session up.
     struct pending_claim

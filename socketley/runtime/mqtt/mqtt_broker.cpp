@@ -191,7 +191,7 @@ void broker::input(uint64_t conn, std::string_view bytes)
     }
     c->in.append(bytes);
     // What a script holds a connection up on is bounded: past this a client that will not wait is let go.
-    if (c->in.size() > static_cast<size_t>(m_cfg.max_packet) * 4 + (16u << 20))
+    if (c->in.size() - c->in_at > static_cast<size_t>(m_cfg.max_packet) * 4 + (16u << 20))
     {
         protocol_failure(*c, reason::quota_exceeded, "sent far more than is taken while it waits");
         return;
@@ -220,9 +220,18 @@ void broker::disconnected(uint64_t conn)
 void broker::process(connection& c)
 {
     c.processing = true;
-    const size_t used = consume(c, c.in);
-    // Erased once for every packet handled, not once each, which moved the rest of the buffer per packet.
-    c.in.erase(0, std::min(used, c.in.size()));
+    c.in_at += consume(c, std::string_view(c.in).substr(c.in_at));
+    // The handled front goes once it is half of what is kept, not on every call, which moved the rest each time.
+    if (c.in_at >= c.in.size())
+    {
+        c.in.clear();
+        c.in_at = 0;
+    }
+    else if (c.in_at > c.in.size() / 2)
+    {
+        c.in.erase(0, c.in_at);
+        c.in_at = 0;
+    }
     c.processing = false;
 }
 
@@ -261,7 +270,7 @@ size_t broker::consume(connection& c, std::string_view in)
         // messages being dropped on the way.
         const uint8_t qos = static_cast<uint8_t>((f.flags >> 1) & 3);
         if (m_cfg.sharded && f.type == packet_type::publish && c.ph == connection::phase::open &&
-            !m_hooks.publish_room(qos))
+            !m_hooks.publish_room(qos, c.sent_to))
         {
             c.held_qos = qos;
             if (!c.held)
@@ -716,6 +725,8 @@ void broker::finish_publish(uint64_t conn, uint64_t generation, uint8_t qos, uin
         const bool heard = !(qos > 0 && level == level_5) || m_subs.any_match(out->topic) ||
                            m_hooks.heard_elsewhere(out->topic);
         route(out, true);
+        if (live && m_cfg.sharded)
+            c->sent_to = m_hooks.shards_reached();
         if (!retained_ok)
             code = reason::quota_exceeded;
         else if (!heard)
@@ -806,7 +817,7 @@ void broker::room()
         connection* c = conn_of(id);
         if (!c || !c->held)
             continue;
-        if (!m_hooks.publish_room(c->held_qos))
+        if (!m_hooks.publish_room(c->held_qos, c->sent_to))
         {
             m_held.push_back(id);
             continue;

@@ -42,8 +42,9 @@ enum class sverb : uint8_t
 
 // A batch is cut at this, far below the 4 MiB a link's backlog holds before it gives up.
 constexpr size_t batch_bytes = 128u << 10;
-// What may be posted to one shard and not yet receipted.
-constexpr size_t flying_cap = 1u << 20;
+// What may be posted to one shard and not yet receipted: half of what the link's backlog holds, the rest for what
+// else goes over it.
+constexpr size_t flying_cap = 2u << 20;
 // What may wait here for one shard: past the first a publisher is held, past the second a delivery at QoS 0 is
 // dropped.
 constexpr size_t hold_bytes = 4u << 20;
@@ -157,16 +158,18 @@ void mqtt_run::send_shard(uint32_t to)
                 break;
             cut = end;
         }
-        std::string frames(rest.substr(0, cut));
+        // Kept whole with its head for a retry, which takes the frames after it.
+        std::string batch = frame_of(sverb::batch, me);
+        const size_t head = batch.size();
+        batch.append(rest.substr(0, cut));
         const uint64_t cookie = m_shard_cookie_base++;
-        if (!mgr->requests().post(this, cookie, shard_target(m_owner.get_name(), to),
-                                  frame_of(sverb::batch, me) + frames, request_class::client))
+        if (!mgr->requests().post(this, cookie, shard_target(m_owner.get_name(), to), batch, request_class::client))
             break;
         q.head += cut;
         if (!q.flying)
             q.heard_ms = now_ms();
-        q.flying += frames.size();
-        m_shard_batches.emplace(cookie, shard_batch{to, std::move(frames)});
+        q.flying += cut;
+        m_shard_batches.emplace(cookie, shard_batch{to, std::move(batch), head});
     }
     // The front taken away once half of what is held has gone, not once a batch.
     if (q.head == q.pending.size())
@@ -201,7 +204,7 @@ bool mqtt_run::shard_receipt(uint64_t cookie, request_status st)
     shard_batch b = std::move(it->second);
     m_shard_batches.erase(it);
     shard_queue& q = m_squeue[b.to];
-    q.flying -= std::min(q.flying, b.frames.size());
+    q.flying -= std::min(q.flying, b.frames.size() - b.head);
     q.heard_ms = now_ms();
     if (st == request_status::ok)
         q.failing_since = 0;
@@ -212,7 +215,7 @@ bool mqtt_run::shard_receipt(uint64_t cookie, request_status st)
         if (!q.failing_since)
             q.failing_since = now_ms();
         q.retry_at = now_ms() + resend_ms;
-        q.pending.insert(q.head, b.frames);
+        q.pending.insert(q.head, std::string_view(b.frames).substr(b.head));
         ++m_shard_resent;
     }
     send_shard(b.to);
@@ -221,21 +224,62 @@ bool mqtt_run::shard_receipt(uint64_t cookie, request_status st)
     return true;
 }
 
-bool mqtt_run::publish_room(uint8_t qos) const
+bool mqtt_run::publish_room(uint8_t qos, uint64_t sent_to) const
 {
-    // A message at QoS 0 may be dropped, so it waits only for a shard that is still answering.
-    for (const auto& q : m_squeue)
-        if (q.waiting() >= hold_bytes && !unreachable(q) && (qos > 0 || !stalled(q)))
+    for (uint32_t j = 0; j < m_squeue.size(); ++j)
+    {
+        const shard_queue& q = m_squeue[j];
+        if (q.waiting() < hold_bytes || unreachable(q))
+            continue;
+        // QoS 1 and 2 wait for every shard, since what is answered may go anywhere next and past the second mark
+        // would be dropped; QoS 0 may be dropped, so it waits only for a shard its last message went to that is
+        // still answering, and the others take it meanwhile.
+        if (qos > 0 || (!stalled(q) && (j >= 64 || (sent_to >> j & 1))))
             return false;
+    }
     return true;
 }
 
 bool mqtt_run::heard_elsewhere(std::string_view topic)
 {
-    for (const auto& p : m_peers)
-        if (p.filters && p.filters->any_match(topic))
-            return true;
-    return false;
+    return m_remote.size() && m_remote.any_match(topic);
+}
+
+void mqtt_run::peer_filter(uint32_t from, const std::string& filter, bool add)
+{
+    peer& p = m_peers[from];
+    std::string_view group, inner = filter;
+    const bool is_shared = split_shared(filter, group, inner);
+    if (add)
+    {
+        if (p.held[filter]++ == 0)
+        {
+            sub_options o;
+            o.qos = 2;
+            m_remote.add(inner, is_shared ? group : std::string_view{}, from, o);
+        }
+        return;
+    }
+    const auto it = p.held.find(filter);
+    if (it == p.held.end())
+        return;
+    if (--it->second == 0)
+    {
+        p.held.erase(it);
+        m_remote.remove(inner, is_shared ? group : std::string_view{}, from);
+    }
+}
+
+void mqtt_run::forget_peer(uint32_t from)
+{
+    peer& p = m_peers[from];
+    for (const auto& [filter, count] : p.held)
+    {
+        std::string_view group, inner = filter;
+        const bool is_shared = split_shared(filter, group, inner);
+        m_remote.remove(inner, is_shared ? group : std::string_view{}, from);
+    }
+    p.held.clear();
 }
 
 void mqtt_run::shards_start()
@@ -247,8 +291,7 @@ void mqtt_run::shards_start()
     m_peers.resize(n);
     m_squeue.assign(n, {});
     m_assign.assign(n, {});
-    for (auto& p : m_peers)
-        p.filters = std::make_unique<subscription_tree>();
+    m_sharing.assign(n, {});
     // What this shard holds, told whole, so a peer that knew an older picture of it replaces that one.
     const std::vector<std::string> mine = m_broker->filters();
     for (uint32_t j = 0; j < n; ++j)
@@ -303,21 +346,10 @@ bool mqtt_run::dump_reply(uint64_t cookie, request_status st, std::string_view r
     std::vector<std::string> list;
     if (!get_list(r, list))
         return true;
-    peer& p = m_peers[from];
-    p.filters = std::make_unique<subscription_tree>();
-    p.held.clear();
-    p.known = true;
+    forget_peer(from);
+    m_peers[from].known = true;
     for (const auto& f : list)
-    {
-        std::string_view group, inner = f;
-        const bool is_shared = split_shared(f, group, inner);
-        if (p.held[f]++ == 0)
-        {
-            sub_options o;
-            o.qos = 2;
-            p.filters->add(inner, is_shared ? group : std::string_view{}, from, o);
-        }
-    }
+        peer_filter(from, f, true);
     return true;
 }
 
@@ -372,56 +404,80 @@ bool mqtt_run::shared_here(std::string_view key)
 
 void mqtt_run::share_message(const message_ptr& m)
 {
+    m_reached = 0;
     if (!sharded() || m_peers.empty())
         return;
-    // Most messages are for this shard alone, with no group decided for another and nobody elsewhere to hear them.
-    if (std::all_of(m_assign.begin(), m_assign.end(), [](const auto& a) { return a.empty(); }) &&
-        !heard_elsewhere(m->topic))
-        return;
     const uint32_t n = m_owner.get_shards();
-    const uint32_t me = m_owner.get_shard_index();
-    std::vector<std::vector<std::string>> assign(n);
-    assign.swap(m_assign);
-    m_assign.assign(n, {});
-    // The groups whose decision was made while the message was routed here, so they are not decided twice.
-    std::vector<std::string> decided;
-    for (const auto& a : assign)
-        decided.insert(decided.end(), a.begin(), a.end());
-    std::vector<bool> plain(n, false);
-    std::unordered_map<std::string, std::vector<uint32_t>> elsewhere;
-    for (uint32_t j = 0; j < n; ++j)
+    // The groups decided for another shard while the message was routed here, taken whole and left empty for the next.
+    m_sharing.swap(m_assign);
+    bool any = std::any_of(m_sharing.begin(), m_sharing.end(), [](const auto& a) { return !a.empty(); });
+    m_plain.assign(n, 0);
+    if (m_remote.size())
+        m_remote.match(
+            m->topic,
+            [&](uint64_t j, const sub_options&) {
+                if (j < n)
+                {
+                    m_plain[j] = 1;
+                    any = true;
+                }
+            },
+            [&](std::string_view key, uint64_t j, const sub_options&) {
+                // A group with members here was decided by shared_here(), and one decided while routing stays so.
+                if (j >= n || (m_broker && m_broker->has_filter(key)) ||
+                    std::any_of(m_sharing.begin(), m_sharing.end(),
+                                [&](const auto& a) { return std::find(a.begin(), a.end(), key) != a.end(); }))
+                    return;
+                m_sharing[j].emplace_back(key);
+                any = true;
+            });
+    if (any)
     {
-        if (j == me || !m_peers[j].filters)
-            continue;
-        m_peers[j].filters->match(
-            m->topic, [&](uint64_t, const sub_options&) { plain[j] = true; },
-            [&](std::string_view key, uint64_t, const sub_options&) { elsewhere[std::string(key)].push_back(j); });
+        const std::string body = message_bytes(*m);
+        for (uint32_t j = 0; j < n; ++j)
+        {
+            if (!m_plain[j] && m_sharing[j].empty())
+                continue;
+            if (j < 64)
+                m_reached |= uint64_t{1} << j;
+            if (queue_deliver(j, body, m_sharing[j]))
+                ++m_shard_forwarded;
+        }
     }
-    for (auto& [key, peers] : elsewhere)
+    for (auto& a : m_sharing)
+        a.clear();
+}
+
+bool mqtt_run::queue_deliver(uint32_t to, std::string_view body, const std::vector<std::string>& groups)
+{
+    if (to >= m_squeue.size() || to == m_owner.get_shard_index())
+        return false;
+    shard_queue& q = m_squeue[to];
+    if (q.waiting() >= drop_bytes || unreachable(q) || stalled(q))
     {
-        // A group with members here was decided by shared_here(); one only the others have is decided now.
-        if (m_broker && m_broker->has_filter(key))
-            continue;
-        if (std::find(decided.begin(), decided.end(), key) != decided.end())
-            continue;
-        uint64_t& turn = m_group_turn[key];
-        assign[peers[turn++ % peers.size()]].push_back(key);
+        ++m_shard_dropped;
+        return false;
     }
-    std::string body;
-    for (uint32_t j = 0; j < n; ++j)
+    // The frame queue_shard() would make, written where it waits rather than built and copied there.
+    size_t size = shard_prefix.size() + 1 + 4 + 4 + body.size() + 4;
+    for (const auto& g : groups)
+        size += 4 + g.size();
+    std::string& out = q.pending;
+    socketley::bytes::append32(out, static_cast<uint32_t>(size));
+    out.append(shard_prefix);
+    out += static_cast<char>(sverb::deliver);
+    socketley::bytes::append32(out, m_owner.get_shard_index());
+    socketley::bytes::append32(out, static_cast<uint32_t>(body.size()));
+    out.append(body);
+    socketley::bytes::append32(out, static_cast<uint32_t>(groups.size()));
+    for (const auto& g : groups)
     {
-        if (j == me || (!plain[j] && assign[j].empty()))
-            continue;
-        if (body.empty())
-            body = message_bytes(*m);
-        std::string f = frame_of(sverb::deliver, me);
-        socketley::bytes::writer w;
-        w.bytes(body);
-        put_list(w, assign[j]);
-        f += w.take();
-        if (queue_shard(j, f, true))
-            ++m_shard_forwarded;
+        socketley::bytes::append32(out, static_cast<uint32_t>(g.size()));
+        out.append(g);
     }
+    if (q.waiting() >= batch_bytes)
+        send_shard(to);
+    return true;
 }
 
 void mqtt_run::share_retained(const std::string& topic, const message_ptr& now)
@@ -598,29 +654,6 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply)
         from == m_owner.get_shard_index())
         return;
     ++m_shard_received;
-    peer& p = m_peers[from];
-    const auto take_filter = [&](const std::string& f, bool add) {
-        std::string_view group, inner = f;
-        const bool is_shared = split_shared(f, group, inner);
-        if (add)
-        {
-            if (p.held[f]++ == 0)
-            {
-                sub_options o;
-                o.qos = 2;
-                p.filters->add(inner, is_shared ? group : std::string_view{}, from, o);
-            }
-            return;
-        }
-        const auto it = p.held.find(f);
-        if (it == p.held.end())
-            return;
-        if (--it->second == 0)
-        {
-            p.held.erase(it);
-            p.filters->remove(inner, is_shared ? group : std::string_view{}, from);
-        }
-    };
     switch (static_cast<sverb>(v))
     {
         case sverb::deliver:
@@ -661,13 +694,12 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply)
         }
         case sverb::interest_full:
         {
-            p.filters = std::make_unique<subscription_tree>();
-            p.held.clear();
-            p.known = true;
+            forget_peer(from);
+            m_peers[from].known = true;
             std::vector<std::string> list;
             if (get_list(r, list))
                 for (const auto& f : list)
-                    take_filter(f, true);
+                    peer_filter(from, f, true);
             break;
         }
         case sverb::interest_add:
@@ -676,7 +708,7 @@ void mqtt_run::shard_frame(std::string_view payload, std::string& reply)
             std::vector<std::string> list;
             if (get_list(r, list))
                 for (const auto& f : list)
-                    take_filter(f, static_cast<sverb>(v) == sverb::interest_add);
+                    peer_filter(from, f, static_cast<sverb>(v) == sverb::interest_add);
             break;
         }
         case sverb::interest_dump:

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <type_traits>
 #include <array>
 #include <memory>
 #include <span>
@@ -38,6 +39,29 @@ private:
     std::vector<std::string_view> m_many;
 };
 
+// A callable borrowed for one call, so a lambda that captures much is not copied to the heap for every message.
+template <class Sig>
+class fn_ref;
+template <class R, class... A>
+class fn_ref<R(A...)>
+{
+public:
+    fn_ref() = default;
+    template <class F>
+        requires(!std::is_same_v<std::remove_cvref_t<F>, fn_ref> && std::is_invocable_r_v<R, F&, A...>)
+    fn_ref(F&& f)   // NOLINT: taken implicitly, as a std::function would be
+        : m_obj(const_cast<void*>(static_cast<const void*>(std::addressof(f)))),
+          m_call([](void* o, A... a) -> R { return (*static_cast<std::remove_reference_t<F>*>(o))(a...); })
+    {
+    }
+    R operator()(A... a) const { return m_call(m_obj, a...); }
+    explicit operator bool() const { return m_call != nullptr; }
+
+private:
+    void* m_obj{nullptr};
+    R (*m_call)(void*, A...){nullptr};
+};
+
 // A subscription's options as the tree keeps them.
 struct sub_options
 {
@@ -67,9 +91,9 @@ public:
     // group named by its $share/<group>/<filter>. `online` says which sessions have a connection, which a shared
     // group prefers.
     void match(std::string_view topic,
-               const std::function<void(uint64_t session, const sub_options&)>& plain,
-               const std::function<void(std::string_view group, uint64_t session, const sub_options&)>& shared,
-               const std::function<bool(uint64_t session)>& online = {});
+               fn_ref<void(uint64_t session, const sub_options&)> plain,
+               fn_ref<void(std::string_view group, uint64_t session, const sub_options&)> shared,
+               fn_ref<bool(uint64_t session)> online = {});
 
     // Whether anything at all matches, for a peer that only needs to know whether to send.
     bool any_match(std::string_view topic) const;
@@ -106,13 +130,13 @@ private:
     static std::unique_ptr<node>* child(node& n, std::string_view level, bool make);
     node* find_or_make(std::string_view filter);
     void collect(node& n, std::span<const std::string_view> levels, size_t i, bool root_dollar,
-                 const std::function<void(uint64_t, const sub_options&)>& plain,
-                 const std::function<void(std::string_view, uint64_t, const sub_options&)>& shared,
-                 const std::function<bool(uint64_t)>& online);
+                 fn_ref<void(uint64_t, const sub_options&)> plain,
+                 fn_ref<void(std::string_view, uint64_t, const sub_options&)> shared,
+                 fn_ref<bool(uint64_t)> online);
     static bool any_at(const node& n, std::span<const std::string_view> levels, size_t i, bool root_dollar);
-    static void take(node& n, const std::function<void(uint64_t, const sub_options&)>& plain,
-                     const std::function<void(std::string_view, uint64_t, const sub_options&)>& shared,
-                     const std::function<bool(uint64_t)>& online);
+    static void take(node& n, fn_ref<void(uint64_t, const sub_options&)> plain,
+                     fn_ref<void(std::string_view, uint64_t, const sub_options&)> shared,
+                     fn_ref<bool(uint64_t)> online);
 
     std::unique_ptr<node> m_root;
     size_t m_count{0};

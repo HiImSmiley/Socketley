@@ -358,9 +358,11 @@ public:
     // Whether this shard delivers a message to the shared group `key` ($share/<group>/<filter>) it has members of;
     // false when another shard with members was chosen.
     virtual bool shared_here(std::string_view /*key*/) { return true; }
-    // Whether the way to the other shards can take another message at `qos`; while it cannot, its publisher is held,
-    // and room() lets it go on.
-    virtual bool publish_room(uint8_t /*qos*/) const { return true; }
+    // Whether the way to the other shards can take another message at `qos` from a publisher whose last one went to
+    // the shards in `sent_to`; while it cannot, the publisher is held, and room() lets it go on.
+    virtual bool publish_room(uint8_t /*qos*/, uint64_t /*sent_to*/) const { return true; }
+    // The shards the message just routed was handed to, one bit each.
+    virtual uint64_t shards_reached() const { return 0; }
     // Whether a subscriber elsewhere would hear the topic, for the reason code a 5.0 publisher is answered with.
     virtual bool heard_elsewhere(std::string_view /*topic*/) { return false; }
     // A filter some session here subscribes to now and none did before, and the last one gone, for the shards that
@@ -528,6 +530,8 @@ private:
         enum class phase : uint8_t { awaiting_connect, authenticating, open, closing } ph{phase::awaiting_connect};
         uint8_t     level{level_311};
         std::string in;
+        // Where what is not yet handled of `in` begins, so a publisher held again and again is not moved each time.
+        size_t      in_at{0};
         bool        busy{false};
         // Inside process(), so an answer that comes at once does not start a second walk over the same bytes.
         bool        processing{false};
@@ -544,6 +548,8 @@ private:
         // Its next PUBLISH, at held_qos, waits for room on the way to the other shards.
         bool        held{false};
         uint8_t     held_qos{0};
+        // The shards its last message was handed to.
+        uint64_t    sent_to{0};
         uint64_t    generation{0};
         // The CONNECT while it is being answered; nothing once the connection is open.
         std::unique_ptr<connect_packet> pending;

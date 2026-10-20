@@ -88,7 +88,14 @@ struct fake_hooks : broker_hooks
     bool room{true};
     bool room0{true};
     int room_left{-1};
-    bool publish_room(uint8_t qos) const override { return room_left != 0 && (qos ? room : room0); }
+    // The shards a message is handed to, and the ones that cannot take more for QoS 0.
+    uint64_t reached{0};
+    uint64_t backlogged{0};
+    uint64_t shards_reached() const override { return reached; }
+    bool publish_room(uint8_t qos, uint64_t sent_to) const override
+    {
+        return room_left != 0 && (qos ? room : room0 && !(sent_to & backlogged));
+    }
 };
 
 // What a test client reads back: every packet the broker wrote to it since the last look.
@@ -1221,6 +1228,37 @@ TEST_CASE("a publisher waits for room on the way to the other shards, and is not
     REQUIRE(slow.size() == 1);
     CHECK(publish_of(slow[0], level_311).payload == "slow");
     CHECK_FALSE(r.io.paused[p]);
+}
+
+TEST_CASE("a publisher at QoS 0 waits only for the shards its last message went to")
+{
+    broker_config cfg;
+    cfg.sharded = true;
+    rig r(cfg);
+    const uint64_t s = r.connect("s");
+    const uint64_t far = r.connect("far");
+    const uint64_t near = r.connect("near");
+    r.send(s, sub("t/#", 0));
+    r.packets(s);
+    // One publisher's message goes to shard 1, the other's to none, and then shard 1 cannot take more.
+    r.hooks.reached = 0b10;
+    r.send(far, pub("t/a", "first", 0));
+    r.hooks.reached = 0;
+    r.send(near, pub("t/b", "local", 0));
+    CHECK(r.packets(s).size() == 2);
+    r.hooks.backlogged = 0b10;
+    r.send(far, pub("t/a", "waits", 0));
+    r.send(near, pub("t/b", "goes", 0));
+    const auto got = r.packets(s);
+    REQUIRE(got.size() == 1);
+    CHECK(publish_of(got[0], level_311).payload == "goes");
+    CHECK(r.io.paused[far]);
+    CHECK_FALSE(r.io.paused[near]);
+    r.hooks.backlogged = 0;
+    r.b->room();
+    const auto later = r.packets(s);
+    REQUIRE(later.size() == 1);
+    CHECK(publish_of(later[0], level_311).payload == "waits");
 }
 
 TEST_CASE("a held publisher is read again only once what waited of it has gone on")
