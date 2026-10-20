@@ -402,7 +402,9 @@ def attempt(with_cert):
     except Exception:
         return False          # refused during the handshake itself (TLS 1.2)
     try:
-        tls.settimeout(2)
+        # Longer without a certificate, because the refusal is what is awaited and a
+        # sanitized server under a parallel suite sent it after more than 2 s.
+        tls.settimeout(2 if with_cert else 10)
         tls.sendall(b"mtls-probe\n")
         try:
             return True if tls.recv(1) else False   # data: alive; EOF: refused
