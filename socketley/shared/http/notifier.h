@@ -102,8 +102,10 @@ public:
     bool open(const std::string& dir, std::string_view sub, uint32_t shard, const outbox::change_made& made,
               std::string& err);
 
-    // Queues `json` for `target`, its record written with the next batch; false when it was dropped.
-    bool add(std::string_view target, std::string json);
+    // Queues `json` for `target`, its record written with the next batch; false when it was dropped.  A broker
+    // publishes it on its topic and then `sub`, kept as its retained message when `retain`, and an empty `json`
+    // retained clears that.
+    bool add(std::string_view target, std::string json, std::string_view sub = {}, bool retain = false);
     // Writes the events, each `{target, json}`, of a change about to be made, held back until settle(), and starts
     // their sync; returns the change's ticket, 0 when every event was dropped.
     uint64_t stage(std::string_view check, std::vector<std::pair<std::string, std::string>> events);
@@ -135,6 +137,9 @@ private:
     {
         uint64_t    id{0};
         std::string json;
+        // A broker's: the topic under the target's it is published on, and whether the broker keeps it.
+        std::string sub;
+        bool        retain{false};
     };
     // One target's queue and the one delivery it has in flight.
     struct lane

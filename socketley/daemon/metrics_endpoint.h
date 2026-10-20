@@ -27,6 +27,8 @@ public:
         // The URL alerts are posted to, empty for none, and what takes each message for it.
         std::string alert_webhook;
         std::function<void(std::string)> alert_send;
+        // What publishes each alert raised and cleared on daemon.events, empty for nothing.
+        std::function<void(std::string, std::string)> alert_event;
         // The idp runtime whose admins sign in to the dashboard, empty for none.
         std::string dashboard_idp;
     };

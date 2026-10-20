@@ -55,7 +55,8 @@ bool metrics_endpoint::start(uint16_t port, options o)
     m_state_dir = o.state_dir;
     m_history = std::make_unique<history::keeper>(o.state_dir.empty() ? std::string() : o.state_dir + "/.history");
     m_alerts = std::make_unique<alerts::monitor>(o.state_dir.empty() ? std::string() : o.state_dir + "/.alerts",
-                                                 std::move(o.alert_webhook), std::move(o.alert_send));
+                                                 std::move(o.alert_webhook), std::move(o.alert_send),
+                                                 std::move(o.alert_event));
     m_history->load(socketley::wall::now_sec());
     // SOCK_CLOEXEC because the daemon forks proxy workers, and with
     // SO_REUSEADDR but not SO_REUSEPORT an inherited copy keeps the metrics

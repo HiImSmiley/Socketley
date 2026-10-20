@@ -75,8 +75,8 @@ std::string alert_json(const alert& a)
 
 }   // namespace
 
-monitor::monitor(std::string state_path, std::string webhook, sender send)
-    : m_path(std::move(state_path)), m_webhook(std::move(webhook)), m_send(std::move(send))
+monitor::monitor(std::string state_path, std::string webhook, sender send, event_sender event)
+    : m_path(std::move(state_path)), m_webhook(std::move(webhook)), m_send(std::move(send)), m_event(std::move(event))
 {
     char host[256] = {};
     if (::gethostname(host, sizeof host - 1) == 0)
@@ -315,6 +315,13 @@ void monitor::post(const alert& a, bool raised, int64_t now)
         LOG_WARN(("alert: " + a.title + (a.detail.empty() ? "" : ": " + a.detail)).c_str());
     else
         LOG_INFO(("alert cleared: " + a.title).c_str());
+    if (m_event)
+    {
+        // An id is a topic's last levels, with what a topic may not hold in it taken out.
+        std::string sub = "alerts/" + a.id;
+        std::replace_if(sub.begin(), sub.end(), [](char c) { return c == '+' || c == '#'; }, '_');
+        m_event(std::move(sub), raised ? alert_json(a) : std::string());
+    }
     if (m_webhook.empty() || !m_send)
         return;
     std::string text = !raised ? "\xe2\x9c\x85 " : a.level == "critical" ? "\xf0\x9f\x94\xb4 " : "\xe2\x9a\xa0\xef\xb8\x8f ";

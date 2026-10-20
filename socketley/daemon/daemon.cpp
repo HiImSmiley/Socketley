@@ -66,6 +66,8 @@ struct daemon_config
     std::string dashboard_idp;
     // Where alerts are posted, empty for nowhere.
     std::string alert_webhook;
+    // The mqtt runtime the daemon publishes its alerts and its runtimes' states on, empty for none.
+    std::string events;
     std::string name;
     std::string cluster;
     std::string cpus;
@@ -173,6 +175,10 @@ static daemon_config load_daemon_config(const std::string& config_path)
     sol::optional<std::string> hook = text("alert_webhook");
     if (hook && !hook->empty())
         out.alert_webhook = *hook;
+
+    sol::optional<std::string> events = text("events");
+    if (events && !events->empty())
+        out.events = *events;
 
     sol::optional<std::string> name = text("name");
     if (name && !name->empty())
@@ -906,24 +912,31 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
             std::cerr << "[config] " << why;
     }
 
+    // The alerts' webhook and the events' broker are reached from this loop, so they are opened first; one that cannot
+    // be is said, and the alerts are still logged and shown.
+    bool told_open = false;
+    if (!config.alert_webhook.empty() || !config.events.empty())
+    {
+        std::string why;
+        told_open = handler.open_notifications(config.alert_webhook, config.events, paths.state_dir.string(), why);
+        if (!told_open)
+            LOG_ERROR(("daemon: neither daemon.alert_webhook nor daemon.events is told anything: " + why).c_str());
+    }
+
     // Start metrics endpoint if configured
     metrics_endpoint metrics(manager);
     bool metrics_bound = false;
     if (metrics_port > 0)
     {
-        // The alerts' webhook is posted to from this loop, so it is opened first; one that cannot be is said, and the
-        // alerts are still logged and shown.
         std::function<void(std::string)> alert_send;
-        if (!config.alert_webhook.empty())
-        {
-            std::string why;
-            if (handler.open_alert_webhook(config.alert_webhook, paths.state_dir.string(), why))
-                alert_send = [&handler](std::string body) { handler.send_alert(std::move(body)); };
-            else
-                LOG_ERROR(("alerts: daemon.alert_webhook is not posted to: " + why).c_str());
-        }
+        std::function<void(std::string, std::string)> alert_event;
+        if (told_open && !config.alert_webhook.empty())
+            alert_send = [&handler](std::string body) { handler.send_alert(std::move(body)); };
+        if (told_open && !config.events.empty())
+            alert_event = [&handler](std::string sub, std::string json)
+            { handler.send_event(std::move(sub), std::move(json)); };
         metrics_bound = metrics.start(metrics_port, {config.dashboard_credentials, paths.state_dir.string(), config.alert_webhook,
-                                                     std::move(alert_send), config.dashboard_idp});
+                                                     std::move(alert_send), std::move(alert_event), config.dashboard_idp});
         if (metrics_bound)
             LOG_INFO("metrics endpoint started");
         else

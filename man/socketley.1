@@ -15218,6 +15218,26 @@ and
 .B POST /api/alerts/test
 with the page's header posts a test through the hook.
 .IP
+With
+.B daemon.events
+naming an mqtt runtime, the daemon publishes on it at QoS 1, retained, how
+each runtime stands, on
+.BI socketley/runtimes/ name /state
+as JSON with its
+.BR name ", " type ", " state " and " port ,
+at every change and cleared when the runtime is removed; and each alert while
+it holds, on
+.BI socketley/alerts/ id
+as the JSON
+.B alert
+carries above, cleared when it clears. A subscriber to
+.B socketley/#
+reads how things stand the moment it subscribes and is told of every change
+after. The broker may be made after the daemon starts: until it runs, what is
+owed waits in
+.B .notify
+in the state directory, as the webhook's does.
+.IP
 Its Logs follow the daemon's recent log live, filtered by runtime, by level and
 by text, and each runtime's page shows its own; a runtime that failed says the
 last warning or error it wrote, where it is listed and on its page, beside how
@@ -17623,6 +17643,8 @@ daemon = {
     dashboard_idp = "auth",  -- or as admins of this idp runtime
     alert_webhook = "https://discord.com/api/webhooks/...",
                              -- where alerts are posted
+    events = "bus",          -- an mqtt runtime the runtimes' states and
+                             -- the alerts are published on
     cpus = "0-3",            -- where this daemon's I/O runs
     settings = {             -- any SOCKETLEY_* knob, by its short name
         storage_hash_threads = 4,

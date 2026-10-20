@@ -48,9 +48,12 @@ class monitor
 public:
     // Called from the thread that checks, with a message for the webhook.
     using sender = std::function<void(std::string body)>;
-    // `state_path` keeps the alerts told of, `webhook` is the URL they are posted to, empty for none, and `send` takes
-    // each message for it.
-    monitor(std::string state_path, std::string webhook, sender send);
+    // Called from the same thread with the topic under daemon.events an alert is kept on and its JSON, empty when it
+    // is cleared.
+    using event_sender = std::function<void(std::string sub, std::string json)>;
+    // `state_path` keeps the alerts told of, `webhook` is the URL they are posted to, empty for none, `send` takes
+    // each message for it and `event` each alert for the broker.
+    monitor(std::string state_path, std::string webhook, sender send, event_sender event = {});
 
     // One look at everything, at `now` (seconds); `extra_dirs` are directories whose disks are watched besides the
     // runtimes'.
@@ -89,6 +92,7 @@ private:
     std::set<std::string> m_git_dirs;
 
     sender m_send;
+    event_sender m_event;
 };
 
 }   // namespace alerts

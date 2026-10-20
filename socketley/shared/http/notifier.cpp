@@ -284,8 +284,10 @@ bool notifier::open(const std::string& dir, std::string_view sub, uint32_t shard
     const bool ok = m_box.open(dir, sub, shard, made, [&](uint64_t id, std::string_view payload)
     {
         bytes::reader r(payload);
-        std::string target, json, why;
-        const bool read = r.bytes(target, 4096) && r.bytes(json, 8u << 20);
+        std::string target, json, why, sub;
+        uint8_t retain = 0;
+        const bool read = r.bytes(target, 4096) && r.bytes(json, 8u << 20) &&
+                          (r.left() == 0 || (r.bytes(sub, 4096) && r.u8(retain)));
         lane* l = read ? find_lane(target) : nullptr;
         // A webhook named by its URL comes back with the first event still owed to it.
         if (!l && read && m_dynamic && add_webhook(target, why))
@@ -295,7 +297,7 @@ bool notifier::open(const std::string& dir, std::string_view sub, uint32_t shard
             ++dropped;
             return false;
         }
-        l->q.push_back({id, std::move(json)});
+        l->q.push_back({id, std::move(json), std::move(sub), retain != 0});
         ++m_queued;
         return true;
     }, err);
@@ -315,7 +317,7 @@ bool notifier::open(const std::string& dir, std::string_view sub, uint32_t shard
     return true;
 }
 
-bool notifier::add(std::string_view target, std::string json)
+bool notifier::add(std::string_view target, std::string json, std::string_view sub, bool retain)
 {
     lane* l = find_lane(target);
     if (!l || m_stopped || !m_full.admit(m_queued, 1, m_queue_max, m_full_text.c_str(), full_lost))
@@ -327,8 +329,14 @@ bool notifier::add(std::string_view target, std::string json)
     bytes::writer w;
     w.bytes(target);
     w.bytes(json);
+    // After the two every record has, so an outbox written before a topic could be given still reads.
+    if (!sub.empty() || retain)
+    {
+        w.bytes(sub);
+        w.u8(retain ? 1 : 0);
+    }
     const uint64_t id = m_box.add(w.take());
-    l->q.push_back({id, std::move(json)});
+    l->q.push_back({id, std::move(json), std::string(sub), retain});
     ++m_queued;
     start(*l);
     return true;
@@ -350,7 +358,7 @@ uint64_t notifier::stage(std::string_view check, std::vector<std::pair<std::stri
         w.bytes(target);
         w.bytes(json);
         payloads.push_back(w.take());
-        kept.emplace_back(l, pending{0, std::move(json)});
+        kept.emplace_back(l, pending{0, std::move(json), {}, false});
     }
     if (kept.empty())
         return 0;
@@ -483,7 +491,7 @@ void notifier::start_runtime(lane& l, const pending& ev)
     std::string cmd(one_command_marker);
     // A broker takes the event as a message at QoS 1, which it answers once its subscribers have it queued.
     if (t.k == notify_target::kind::mqtt)
-        cmd = socketley::mqtt::command_publish(t.topic, ev.json, 1, false);
+        cmd = socketley::mqtt::command_publish(ev.sub.empty() ? t.topic : t.topic + "/" + ev.sub, ev.json, 1, ev.retain);
     else if (t.k == notify_target::kind::cache_channel)
         cmd += "publish " + t.topic + " " + ev.json;
     else

@@ -5966,6 +5966,8 @@ std::string daemon_handler::build_runtime_map_payload()
 
 void daemon_handler::publish_runtime_map_to_workers()
 {
+    // Rides the map's pushes, which come at every change the map has and at each health tick.
+    publish_runtime_events();
     if (m_proxy_workers.empty())
         return;
 
@@ -8692,15 +8694,32 @@ bool daemon_handler::send_response(ipc_connection* conn)
     return true;
 }
 
-bool daemon_handler::open_alert_webhook(const std::string& url, const std::string& state_dir, std::string& why)
+bool daemon_handler::open_notifications(const std::string& webhook, const std::string& events,
+                                        const std::string& state_dir, std::string& why)
 {
-    socketley::notify_target t;
-    t.name = "alerts";
-    t.k    = socketley::notify_target::kind::webhook;
-    if (!socketley::parse_http_url(url, t.http, why))
-        return false;
     std::vector<socketley::notify_target> targets;
-    targets.push_back(std::move(t));
+    if (!webhook.empty())
+    {
+        socketley::notify_target t;
+        t.name = "alerts";
+        t.k    = socketley::notify_target::kind::webhook;
+        if (!socketley::parse_http_url(webhook, t.http, why))
+            return false;
+        targets.push_back(std::move(t));
+    }
+    if (!events.empty())
+    {
+        // Every event is published under socketley/ on the broker, which may be made after the daemon starts: until
+        // it runs, what is owed waits in the outbox.
+        socketley::notify_target t;
+        t.name    = "events";
+        t.k       = socketley::notify_target::kind::mqtt;
+        t.runtime = events;
+        t.topic   = "socketley";
+        targets.push_back(std::move(t));
+        m_alert_out.set_runtimes(&m_manager, "daemon");
+        m_events = true;
+    }
     m_alert_out.set_targets(std::move(targets));
     if (!m_alert_box.attach(m_fio))
     {
@@ -8714,4 +8733,34 @@ bool daemon_handler::open_alert_webhook(const std::string& url, const std::strin
 void daemon_handler::send_alert(std::string body)
 {
     m_alert_box.post_done([this, b = std::move(body)]() mutable { m_alert_out.add("alerts", std::move(b)); });
+}
+
+void daemon_handler::send_event(std::string sub, std::string json)
+{
+    m_alert_box.post_done([this, s = std::move(sub), j = std::move(json)]() mutable
+                          { m_alert_out.add("events", std::move(j), s, true); });
+}
+
+void daemon_handler::publish_runtime_events()
+{
+    if (!m_events)
+        return;
+    std::unordered_map<std::string, std::string> now;
+    {
+        std::shared_lock lock(m_manager.mutex);
+        now.reserve(m_manager.list().size());
+        for (const auto& [name, inst] : m_manager.list())
+            now.emplace(name, "{\"name\":" + socketley::json::quote(name) + ",\"type\":" +
+                                  socketley::json::quote(type_to_string(inst->get_type())) + ",\"state\":" +
+                                  socketley::json::quote(state_to_string(inst->get_state())) +
+                                  ",\"port\":" + std::to_string(inst->get_port()) + "}");
+    }
+    // Retained, so a subscriber that comes later reads how each runtime stands, and cleared for one that is gone.
+    for (const auto& [name, json] : now)
+        if (const auto it = m_event_states.find(name); it == m_event_states.end() || it->second != json)
+            m_alert_out.add("events", json, "runtimes/" + name + "/state", true);
+    for (const auto& [name, json] : m_event_states)
+        if (!now.contains(name))
+            m_alert_out.add("events", std::string(), "runtimes/" + name + "/state", true);
+    m_event_states = std::move(now);
 }

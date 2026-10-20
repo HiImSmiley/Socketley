@@ -109,11 +109,14 @@ public:
     // where to put the setting it is asking for.
     void set_config_path(std::string path);
 
-    // The webhook the alerts go to, its outbox under `state_dir` so what it had not taken goes after a restart;
-    // blocking, so it runs before the loop, and false with `why`.
-    bool open_alert_webhook(const std::string& url, const std::string& state_dir, std::string& why);
-    // An alert's message for that webhook, from any thread.
+    // The webhook the alerts go to and the mqtt runtime the daemon's events are published on, either empty for none,
+    // their outbox under `state_dir` so what they had not taken goes after a restart; blocking, so it runs before the
+    // loop, and false with `why`.
+    bool open_notifications(const std::string& webhook, const std::string& events, const std::string& state_dir,
+                            std::string& why);
+    // An alert's message for that webhook, and an event kept on the broker under `sub`, from any thread.
     void send_alert(std::string body);
+    void send_event(std::string sub, std::string json);
 
     // Called once after restore and before the loop runs.  restore_runtimes()
     // puts a runtime in `running` and forks nothing, so the first child used
@@ -277,6 +280,10 @@ private:
     socketley::file_io  m_fio;
     socketley::notifier m_alert_out;
     socketley::hash_pool m_alert_box{1};
+    // Each runtime's state as last published on daemon.events, by name; empty and unused when none is set.
+    bool m_events{false};
+    std::unordered_map<std::string, std::string> m_event_states;
+    void publish_runtime_events();
 
     int m_listen_fd;
     struct sockaddr_un m_accept_addr;
