@@ -10,6 +10,7 @@
 #   * mqtt-sessions, mqtt-kick or mqtt-sub seeing one shard only
 #   * a shard's sessions lost across a restart because the shards share one snapshot
 #   * a message a QoS 1 publisher had answered lost because the shard it was for could not take it then
+#   * one lost because that shard had stopped answering for a second, though nothing filled its queue
 #   * a flood at QoS 0 dropped between two shards that both keep up, or its publisher cut off while it is held
 #   * a publisher at QoS 0 held for good by a shard that stopped
 set -uo pipefail
@@ -277,6 +278,35 @@ if phase in ("stall", "hang"):
         pub.disconnect()
     if phase == "stall":
         guarded("stall", stall)
+
+    def trickle():
+        pub, far = apart("ft")
+        truth("a subscriber of the trickle lands on another shard than its publisher", far is not None)
+        if far is None:
+            return
+        far.subscribe(("ft/#", 1))
+        time.sleep(0.5)
+        # Far too little to fill what the publisher's shard queues for the stopped one, so it is never held; each
+        # message is answered while the shard it is for has not heard anything for over a second.
+        total = 100
+        victim = owner(far)
+        stopped = threading.Timer(0.5, lambda: os.kill(victim, signal.SIGSTOP))
+        stopped.start()
+        try:
+            for i in range(total):
+                pub.publish("ft/x", b"%03d" % i, qos=1)
+                time.sleep(0.04)
+        finally:
+            stopped.join()
+            time.sleep(max(0.0, 3.0 - total * 0.04))
+            os.kill(victim, signal.SIGCONT)
+        got = [m.payload for m in far.messages(total, 20)]
+        check("every QoS 1 message answered while a shard had stopped reaches its subscriber there, in order",
+              got == [b"%03d" % i for i in range(total)], True)
+        far.disconnect()
+        pub.disconnect()
+    if phase == "stall":
+        guarded("trickle", trickle)
 
     def flood():
         pub, far = apart("fq")

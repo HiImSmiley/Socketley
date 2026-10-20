@@ -210,7 +210,7 @@ private:
     // A word owed only a receipt, kept for the next batch; false when it is dropped instead.
     bool queue_shard(uint32_t to, std::string_view frame, bool droppable);
     // A message for another shard, dropped where queue_shard() drops a delivery.
-    bool queue_deliver(uint32_t to, std::string_view body, const std::vector<std::string>& groups);
+    bool queue_deliver(uint32_t to, uint8_t qos, std::string_view body, const std::vector<std::string>& groups);
     void send_shard(uint32_t to);
     void send_shards();
     bool unreachable(const shard_queue& q) const;

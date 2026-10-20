@@ -8,7 +8,8 @@
 // The words owed only a receipt -- deliveries, retained messages, interest -- wait here for each shard in the order
 // made and go as batches, a bounded number of bytes in flight, so neither the channel's table nor the link's backlog
 // is ever filled; a batch not receipted goes again. A publisher at QoS 1 or 2 is held while a reachable shard cannot
-// take more; a delivery is dropped, and counted, only past a harder bound or to a shard that does not answer.
+// take more; a delivery is dropped, and counted, only past a harder bound or to a shard that does not answer, and at
+// QoS 1 or 2 only to one that cannot be reached at all.
 #include "mqtt_run.h"
 
 #include <chrono>
@@ -440,7 +441,7 @@ void mqtt_run::share_message(const message_ptr& m)
                 continue;
             if (j < 64)
                 m_reached |= uint64_t{1} << j;
-            if (queue_deliver(j, body, m_sharing[j]))
+            if (queue_deliver(j, m->qos, body, m_sharing[j]))
                 ++m_shard_forwarded;
         }
     }
@@ -448,12 +449,14 @@ void mqtt_run::share_message(const message_ptr& m)
         a.clear();
 }
 
-bool mqtt_run::queue_deliver(uint32_t to, std::string_view body, const std::vector<std::string>& groups)
+bool mqtt_run::queue_deliver(uint32_t to, uint8_t qos, std::string_view body, const std::vector<std::string>& groups)
 {
     if (to >= m_squeue.size() || to == m_owner.get_shard_index())
         return false;
     shard_queue& q = m_squeue[to];
-    if (q.waiting() >= drop_bytes || unreachable(q) || stalled(q))
+    // A shard that has gone quiet still has QoS 1 and 2 kept for it, since their publisher was answered and is held
+    // at hold_bytes.
+    if (q.waiting() >= drop_bytes || unreachable(q) || (qos == 0 && stalled(q)))
     {
         ++m_shard_dropped;
         return false;
