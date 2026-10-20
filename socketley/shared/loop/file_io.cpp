@@ -37,6 +37,8 @@ struct file_io::op
 
     struct sockaddr_storage addr{};
     socklen_t   addr_len{0};
+
+    struct __kernel_timespec ts{};
 };
 
 file_io::file_io(event_loop& loop, io_handler* owner) : m_loop(&loop), m_owner(owner)
@@ -95,6 +97,9 @@ bool file_io::submit(op* o)
         case op_io_splice:
             queued = o->off == at_stream ? m_loop->submit_splice(o->fd, o->fd2, o->len, &o->req, op_io_splice)
                                          : m_loop->submit_splice_file(o->fd, o->off, o->fd2, o->len, &o->req, op_io_splice);
+            break;
+        case op_file_timer:
+            queued = m_loop->submit_timeout(&o->ts, &o->req);
             break;
         default:
             break;
@@ -259,6 +264,22 @@ bool file_io::pwrite(int fd, const char* buf, uint32_t len, uint64_t off, done c
     return true;
 }
 
+bool file_io::after(std::chrono::nanoseconds wait, done cb)
+{
+    auto* o = new op;
+    o->kind       = op_file_timer;
+    o->ts.tv_sec  = wait.count() / 1000000000;
+    o->ts.tv_nsec = wait.count() % 1000000000;
+    o->cb         = std::move(cb);
+    if (!submit(o))
+    {
+        delete o;
+        return false;
+    }
+    m_live.insert(o);
+    return true;
+}
+
 bool file_io::splice(int fd_in, uint64_t off, int fd_out, uint32_t len, done cb)
 {
     auto* o = new op;
@@ -342,7 +363,8 @@ void file_io::on_cqe(struct io_uring_cqe* cqe)
         finish(o, static_cast<int64_t>(o->len));
         return;
     }
-    finish(o, res);
+    // A timeout that ran its course says -ETIME, which is this op's success.
+    finish(o, o->kind == op_file_timer && res == -ETIME ? 0 : res);
 }
 
 }   // namespace socketley

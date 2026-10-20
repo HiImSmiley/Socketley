@@ -180,6 +180,8 @@ inline constexpr setting table[] = {
      "a hosts file the notifier resolves names from"},
     {"SOCKETLEY_STORAGE_REPLICATION_HOSTS", kind::text, audience::test, 0, 0, "none",
      "a hosts file replication and tiering resolve names from"},
+    {"SOCKETLEY_RESOLV_CONF", kind::text, audience::test, 0, 0, "/etc/resolv.conf",
+     "the resolv.conf the resolver on the loop reads its nameservers from"},
     {"SOCKETLEY_STORAGE_STOP_HOLD_MS", kind::number, audience::test, 0, 3000, "0",
      "milliseconds a shard's stop holds its directory, times its shard number"},
     {"SOCKETLEY_STORAGE_START_SPIN_MS", kind::number, audience::test, 0, 30000, "0",

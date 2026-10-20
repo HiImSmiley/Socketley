@@ -17,6 +17,8 @@
 #include <openssl/ssl.h>
 
 #include "http_framing.h"
+#include "../net/async_resolver.h"
+#include "../net/dns_client.h"
 #include "../util/logging.h"
 #include "../util/ascii.h"
 #include "../util/text_list.h"
@@ -297,14 +299,64 @@ void http_peer::prime()
 bool http_peer::resolve()
 {
     const auto now = std::chrono::steady_clock::now();
-    if (m_literal || m_stopped || !m_resolver.enabled())
+    if (m_literal || m_stopped)
         return false;
     if (m_resolving)
         return true;
     if (m_resolved_at != std::chrono::steady_clock::time_point{} &&
         now - m_resolved_at < std::chrono::milliseconds(resolve_floor_ms))
         return false;
+    // The test aid's hosts file is read where it always was, before the system's resolver and on its thread.
+    if (m_hosts_file.empty())
+    {
+        m_resolving = true;
+        m_ask_wait  = std::chrono::milliseconds(0);
+        if (ask_loop())
+            return true;
+        m_resolving = false;
+    }
+    if (!m_resolver.enabled())
+        return false;
     m_resolving = true;
+    ask_thread();
+    return true;
+}
+
+bool http_peer::ask_loop()
+{
+    std::vector<endpoint> out;
+    switch (dns_client::here().ask(m_target.host, AF_UNSPEC, out))
+    {
+        case dns_client::state::ready:
+            for (endpoint& e : out)
+                async_resolver::set_port(e, m_target.port);
+            resolved(std::move(out));
+            return true;
+        case dns_client::state::unsure:
+            return false;
+        case dns_client::state::pending:
+            break;
+    }
+    // From 2 ms up to 50: a nearby resolver answers within the first few, one far away within a few of the last.
+    m_ask_wait = std::min(m_ask_wait.count() ? m_ask_wait * 2 : std::chrono::milliseconds(2),
+                          std::chrono::milliseconds(50));
+    auto alive = m_alive;
+    return m_io.after(m_ask_wait, [this, alive](int64_t)
+    {
+        if (!*alive || !m_resolving || m_stopped)
+            return;
+        if (!ask_loop())
+        {
+            if (m_resolver.enabled())
+                ask_thread();
+            else
+                resolved({});
+        }
+    });
+}
+
+void http_peer::ask_thread()
+{
     auto out = std::make_shared<std::vector<http_endpoint>>();
     auto alive = m_alive;
     m_resolver.submit(0,
@@ -315,7 +367,6 @@ bool http_peer::resolve()
             if (*alive)
                 resolved(std::move(*out));
         });
-    return true;
 }
 
 void http_peer::resolved(std::vector<http_endpoint> addrs)

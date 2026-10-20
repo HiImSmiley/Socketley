@@ -16970,12 +16970,22 @@ interface).
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_RESOLV_CONF
+A test aid: the file the resolver on a runtime's loop reads its nameservers,
+search list and options from, in
+.BR resolv.conf (5)'s
+form, so a test can point it at a nameserver of its own; /etc/resolv.conf when
+unset (see What can stop the event loop).
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_STORAGE_NOTIFY_HOSTS
 A test aid: a file of
 .I name address
 lines that the resolver of a storage runtime's notification webhooks reads before
 the system resolver, on every resolve, so a test can point a webhook's host name at
-another address. Unset, only the system resolver is asked (see Event notifications).
+another address. Unset, a name is asked of the resolver on the loop and then of
+the system's (see Event notifications).
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
@@ -16999,7 +17009,8 @@ A test aid: a file of
 .I name address
 lines that the resolver of a storage runtime's replication targets reads before
 the system resolver, on every resolve, so a test can name a target by a host.
-Unset, only the system resolver is asked (see Replication).
+Unset, a name is asked of the resolver on the loop and then of the system's (see
+Replication).
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
@@ -18386,9 +18397,17 @@ into.
 on a client's first dial and a proxy's setup, both before the runtime serves
 anything, so a start against a resolver that is not answering takes as long as
 the resolver does. A client's reconnect, a server's upstream, a cache's
-.B \-\-replicate
-and a proxy's later lookups ask on a thread of their own and dial once the
-answer is in, a tenth of a second at a time.
+.B \-\-replicate,
+a proxy's later lookups and every webhook, replication target and tier named by
+a host ask the nameservers of
+.I /etc/resolv.conf
+from the loop itself, after
+.IR /etc/hosts ,
+over UDP on a socket that never waits, and take the answer when they next look;
+no call there takes longer than a tenth of a millisecond, a nameserver that does
+not answer included, which is passed over for the next at its timeout. A name
+those cannot answer \(em one only an NSS module knows, an answer cut short \(em
+is asked of the system's resolver on a thread, as every name was before.
 .IP \(bu 2
 The mutation journal's flush, once per
 .B \-\-persistent\-interval

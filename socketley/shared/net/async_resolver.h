@@ -1,9 +1,10 @@
 #pragma once
-// Host names resolved off the event loop: each lookup runs on a thread of its own and its answer is taken up by the
-// caller on a later turn, so a resolver that hangs costs the loop nothing.
+// Host names resolved without the event loop waiting: the loop's own resolver is asked first (dns_client), and only
+// a name it cannot say about goes to the system's on a thread of its own, its answer taken up by the caller on a later
+// turn, so a resolver that hangs costs the loop nothing either way.
 //
-// The caller asks again until the answer is there -- a timer or a retry it already has -- since a runtime's loop
-// has no completion for a thread to post into without a ring of its own.
+// The caller asks again until the answer is there -- a timer or a retry it already has -- which is also what reads
+// the loop resolver's answer off its socket.
 
 #include <algorithm>
 #include <atomic>
@@ -21,6 +22,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include "dns_client.h"
 #include "endpoint.h"
 
 namespace socketley
@@ -69,8 +71,28 @@ public:
                 prune(now, fresh);
             e = std::make_shared<entry>();
             e->at = now;
-            auto job = e;
-            std::thread([job, host, family]() { answer(*job, host, family); }).detach();
+            e->on_loop = true;
+        }
+        if (e->on_loop)
+        {
+            std::vector<address> got;
+            switch (dns_client::here().ask(host, family, got))
+            {
+                case dns_client::state::pending:
+                    return state::pending;
+                case dns_client::state::ready:
+                    e->on_loop = false;
+                    e->addrs   = got;
+                    e->at      = now;
+                    e->done.store(true, std::memory_order_release);
+                    out = std::move(got);
+                    return state::ready;
+                case dns_client::state::unsure:
+                    e->on_loop = false;
+                    auto job = e;
+                    std::thread([job, host, family]() { answer(*job, host, family); }).detach();
+                    break;
+            }
         }
         return state::pending;
     }
@@ -104,6 +126,8 @@ private:
         std::atomic<bool>                     done{false};
         std::chrono::steady_clock::time_point at{};
         std::vector<address>                  addrs;
+        // Still with the loop's resolver, which no thread touches.
+        bool                                  on_loop{false};
     };
 
     static constexpr size_t max_entries = 1024;

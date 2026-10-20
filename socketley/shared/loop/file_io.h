@@ -2,6 +2,7 @@
 // Disk operations on a runtime's own ring, each with a completion callback, so
 // a runtime that serves files never blocks its loop on the disk.
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <string>
 #include <unordered_set>
@@ -64,12 +65,16 @@ public:
     // without their passing through this process.
     bool splice(int fd_in, uint64_t off, int fd_out, uint32_t len, done cb);
 
+    // `cb` once `wait` has passed, with 0.
+    bool after(std::chrono::nanoseconds wait, done cb);
+
     // Whether a completion of this kind is one of this object's.
     static bool owns_type(uint8_t type)
     {
         return type == op_file_read || type == op_file_write || type == op_fsync ||
                type == op_rename || type == op_unlink || type == op_openat ||
-               type == op_mkdir || type == op_link || type == op_connect || type == op_io_splice;
+               type == op_mkdir || type == op_link || type == op_connect || type == op_io_splice ||
+               type == op_file_timer;
     }
 
     // Runs the callback of the operation `cqe` completes.

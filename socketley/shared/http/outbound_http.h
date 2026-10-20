@@ -143,6 +143,10 @@ public:
 
 private:
     bool resolve();
+    // The loop's resolver asked, and asked again on a short timer while it waits; false when it cannot say and the
+    // system's must be asked on the resolver's thread.
+    bool ask_loop();
+    void ask_thread();
     void resolved(std::vector<http_endpoint> addrs);
     void connect();
     void connected(int64_t res);
@@ -183,6 +187,8 @@ private:
     size_t      m_cur{0};
     bool        m_literal{false};
     bool        m_resolving{false};
+    // The pause before the loop's resolver is asked again, doubled each time up to a cap.
+    std::chrono::milliseconds m_ask_wait{0};
     std::chrono::steady_clock::time_point m_resolved_at{};
     uint64_t    m_resolves{0};
     uint64_t    m_connects{0};
