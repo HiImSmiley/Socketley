@@ -413,6 +413,8 @@ st=$("$BIN" stats sh 2>&1)
 fw=$(echo "$st" | awk -F: '$1=="shard_forwarded"{s+=$2} END{print s+0}')
 mv=$(echo "$st" | awk -F: '$1=="sessions_moved"{s+=$2} END{print s+0}')
 [ "$fw" -gt 0 ] && [ "$mv" -gt 0 ] && ok || bad "stats count the messages forwarded and the sessions moved between shards" "forwarded $fw moved $mv"
+# Each shard writes its own at its interval, which beside a parallel suite can come a while after the phase.
+for _ in $(seq 1 50); do [ "$(find "$HOME" -name 'sh.snapshot.*' | wc -l)" -ge 3 ] && break; sleep 0.2; done
 snaps=$(find "$HOME" -name 'sh.snapshot.*' | wc -l)
 
 FP=$((P + 1))

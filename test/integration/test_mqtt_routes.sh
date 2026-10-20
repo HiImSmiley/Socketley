@@ -167,14 +167,18 @@ if phase == "rules":
             except OSError:
                 return -1
         subprocess.run([binary, "stop", "kv"], capture_output=True, timeout=30)
-        limit, over = 100000, 10
+        # Past the queue's bound and the rule's window of 64 in flight, which a loaded machine keeps fuller.
+        limit, window, over = 100000, 64, 10
+        total = limit + window + over
         body = s("alarm/flood") + b"\x00" + b"f"   # 5.0: no properties
-        pub.sock.sendall((bytes([PUBLISH << 4]) + varint(len(body)) + body) * (limit + over))
-        end = time.time() + 30
-        while time.time() < end and stat_sum(binary, "edge", "rule_1_dropped") < over:
+        pub.sock.sendall((bytes([PUBLISH << 4]) + varint(len(body)) + body) * total)
+        end = time.time() + 60
+        while time.time() < end and stat_sum(binary, "edge", "received_qos0") < total:
             time.sleep(0.2)
-        check("a rule holding as much as it may for a stopped target drops the oldest, counted",
-              stat_sum(binary, "edge", "rule_1_dropped"), over)
+        dropped = stat_sum(binary, "edge", "rule_1_dropped")
+        held = stat_sum(binary, "edge", "rule_1_queued")
+        truth("a rule holding as much as it may for a stopped target drops the oldest, counted",
+              dropped >= over and dropped + held == total, "dropped %d held %d of %d" % (dropped, held, total))
         check("and says so in the log once", said("mqtt: the rule for alarm/# holds 100000 requests"), 1)
         subprocess.run([binary, "start", "kv"], capture_output=True, timeout=30)
         end = time.time() + 120
@@ -182,10 +186,10 @@ if phase == "rules":
             time.sleep(0.2)
         pub.publish("alarm/after", "x", qos=1)
         end = time.time() + 10
-        while time.time() < end and said("%d mqtt rule request(s) were dropped while it was full" % over) < 1:
+        while time.time() < end and said("%d mqtt rule request(s) were dropped while it was full" % dropped) < 1:
             time.sleep(0.2)
         check("and how many, once it has room again",
-              said("%d mqtt rule request(s) were dropped while it was full" % over), 1)
+              said("%d mqtt rule request(s) were dropped while it was full" % dropped), 1)
         pub.disconnect()
         back.disconnect()
     guarded("rules", rules)
