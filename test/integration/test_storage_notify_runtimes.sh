@@ -150,6 +150,34 @@ for _ in $(seq 1 150); do xr | grep -q '"key":"k2.feed"' && break; sleep 0.1; do
 xr | grep -q '"key":"k2.feed"' && ok "and reaches its stream once the cache is back" \
     || bad "and reaches its stream once the cache is back" "$(xr | tail -3)"
 
+# A server that is stopped was counted reached, because a broadcast to it was posted rather than refused, and the
+# event left the outbox for nobody.
+f0=$(stat_of notify_failed)
+"$BIN" stop nrv >/dev/null 2>&1
+code -X PUT --data-binary two "http://127.0.0.1:$PS3/evb/k2.panel" >/dev/null
+for _ in $(seq 1 50); do [ "$(stat_of notify_failed)" -gt "$f0" ] && break; sleep 0.1; done
+[ "$(stat_of notify_failed)" -gt "$f0" ] && [ "$(stat_of notify_queued)" -ge 1 ] \
+    && ok "an event for a server that is stopped fails and waits" \
+    || bad "an event for a server that is stopped fails and waits" "failed $(stat_of notify_failed) queued $(stat_of notify_queued)"
+"$BIN" start nrv >/dev/null 2>&1
+wait_port "$PV"
+back=$(python3 - "$PV" <<'PY'
+import socket, sys, time
+c = socket.create_connection(("127.0.0.1", int(sys.argv[1])), 5)
+c.sendall(b"hello\n")
+c.settimeout(0.2)
+got, end = b"", time.time() + 20
+while time.time() < end and b"k2.panel" not in got:
+    try:
+        got += c.recv(65536)
+    except socket.timeout:
+        pass
+print(b"k2.panel" in got)
+PY
+)
+[ "$back" = True ] && ok "and reaches the server's clients once it is back" \
+    || bad "and reaches the server's clients once it is back" "$back"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

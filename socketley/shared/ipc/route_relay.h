@@ -61,7 +61,7 @@ bool write(runtime_manager* mgr, std::string_view to, std::string_view from,
 void drop(runtime_manager* mgr, std::string_view to, std::string_view from,
           const conn_ref& ref);
 
-// broadcast on the origin; the one verb naming no connection.
+// broadcast on the origin; the one verb naming no connection, and false when the map says it does not run.
 bool broadcast(runtime_manager* mgr, std::string_view to, std::string_view from,
                std::string_view msg);
 

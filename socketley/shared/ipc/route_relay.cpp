@@ -116,6 +116,11 @@ void drop(runtime_manager* mgr, std::string_view to, std::string_view from,
 bool broadcast(runtime_manager* mgr, std::string_view to, std::string_view from,
                std::string_view msg)
 {
+    // Refused unless the map says the target runs, which in a worker is the daemon's copy of it, so a sender that
+    // retries waits for a stopped server instead of counting it reached.
+    auto* rt = mgr ? mgr->get(to) : nullptr;
+    if (!rt || rt->get_state() != runtime_running)
+        return false;
     if (auto* srv = local_server(mgr, to))
     {
         srv->broadcast(msg);
