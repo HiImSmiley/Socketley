@@ -911,8 +911,19 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     bool metrics_bound = false;
     if (metrics_port > 0)
     {
+        // The alerts' webhook is posted to from this loop, so it is opened first; one that cannot be is said, and the
+        // alerts are still logged and shown.
+        std::function<void(std::string)> alert_send;
+        if (!config.alert_webhook.empty())
+        {
+            std::string why;
+            if (handler.open_alert_webhook(config.alert_webhook, paths.state_dir.string(), why))
+                alert_send = [&handler](std::string body) { handler.send_alert(std::move(body)); };
+            else
+                LOG_ERROR(("alerts: daemon.alert_webhook is not posted to: " + why).c_str());
+        }
         metrics_bound = metrics.start(metrics_port, {config.dashboard_credentials, paths.state_dir.string(), config.alert_webhook,
-                                                     config.dashboard_idp});
+                                                     std::move(alert_send), config.dashboard_idp});
         if (metrics_bound)
             LOG_INFO("metrics endpoint started");
         else

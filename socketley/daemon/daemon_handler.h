@@ -15,6 +15,9 @@
 #include "../shared/runtime/runtime_instance.h"
 #include "../shared/ipc/shard_clients.h"
 #include "../shared/ipc/route_relay.h"
+#include "../shared/http/notifier.h"
+#include "../shared/loop/file_io.h"
+#include "../shared/loop/hash_pool.h"
 #include "../cli/arg_parser.h"
 
 class event_loop;
@@ -105,6 +108,12 @@ public:
     // The file this daemon read its settings from, so `dashboard` can say
     // where to put the setting it is asking for.
     void set_config_path(std::string path);
+
+    // The webhook the alerts go to, its outbox under `state_dir` so what it had not taken goes after a restart;
+    // blocking, so it runs before the loop, and false with `why`.
+    bool open_alert_webhook(const std::string& url, const std::string& state_dir, std::string& why);
+    // An alert's message for that webhook, from any thread.
+    void send_alert(std::string body);
 
     // Called once after restore and before the loop runs.  restore_runtimes()
     // puts a runtime in `running` and forks nothing, so the first child used
@@ -261,6 +270,13 @@ private:
 
     runtime_manager& m_manager;
     event_loop& m_loop;
+
+    // The alerts' webhook, posted to from this loop and retried until it answers, the file operations its outbox and
+    // connections go through, and the way a message comes here from the thread that checks; only post_done() is used
+    // of the pool, which starts no thread.
+    socketley::file_io  m_fio;
+    socketley::notifier m_alert_out;
+    socketley::hash_pool m_alert_box{1};
 
     int m_listen_fd;
     struct sockaddr_un m_accept_addr;

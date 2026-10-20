@@ -15,7 +15,7 @@
 #include <string_view>
 #include <vector>
 
-#include "outbound_http.h"
+#include "../../shared/http/outbound_http.h"
 #include "replicator.h"
 
 namespace socketley::storage

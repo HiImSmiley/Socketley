@@ -109,8 +109,8 @@ std::string storage_instance::config_refusal() const
         return "storage: --fsync is always, interval or never, not " + m_fsync + "\n";
     if (!m_notify_targets.empty())
     {
-        std::vector<socketley::storage::notify_target> targets;
-        if (std::string why; !socketley::storage::load_notify_targets(m_notify_targets, targets, why))
+        std::vector<socketley::notify_target> targets;
+        if (std::string why; !socketley::load_notify_targets(m_notify_targets, targets, why))
             return "storage: " + why + "\n";
     }
     if (!m_replication_targets.empty())
@@ -357,9 +357,9 @@ bool storage_instance::setup(event_loop& loop)
     // Read here, at every start, so an edited targets file is the one a restart delivers to.
     if (!m_notify_targets.empty())
     {
-        std::vector<socketley::storage::notify_target> targets;
+        std::vector<socketley::notify_target> targets;
         std::string why;
-        if (!socketley::storage::load_notify_targets(m_notify_targets, targets, why))
+        if (!socketley::load_notify_targets(m_notify_targets, targets, why))
         {
             LOG_ERROR(("storage: " + why).c_str());
             m_graveyard.retire(std::move(run));

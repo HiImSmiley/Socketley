@@ -12,13 +12,13 @@
 
 #include <sys/socket.h>
 
-#include "../../shared/loop/event_loop.h"
-#include "../../shared/loop/file_io.h"
-#include "../../shared/loop/hash_pool.h"
-#include "../../shared/net/endpoint.h"
-#include "../../shared/crypto/tls_context.h"
+#include "../loop/event_loop.h"
+#include "../loop/file_io.h"
+#include "../loop/hash_pool.h"
+#include "../net/endpoint.h"
+#include "../crypto/tls_context.h"
 
-namespace socketley::storage
+namespace socketley
 {
 
 // Where a target's requests go: the URL's scheme, host, port and path, and the CA an https host is checked against.
@@ -115,7 +115,8 @@ public:
     static constexpr int resolve_every_secs = 60;
     static constexpr int resolve_floor_ms   = 1000;
 
-    // `resolver` asks for a named host's addresses, `hosts_file` is the test aid, and `what` names the target in the log.
+    // `resolver` asks for a named host's addresses, `hosts_file` is the test aid, and `what` names the target in the
+    // log, the runtime it is for first.
     http_peer(event_loop& loop, file_io& io, hash_pool& resolver, http_target target, std::string hosts_file,
               std::string what);
     ~http_peer();
@@ -221,4 +222,4 @@ private:
     std::chrono::steady_clock::time_point m_idle_since{};
 };
 
-}   // namespace socketley::storage
+}   // namespace socketley

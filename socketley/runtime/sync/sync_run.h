@@ -24,7 +24,7 @@
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
-#include "../storage/outbound_http.h"
+#include "../../shared/http/outbound_http.h"
 
 class sync_instance;
 
@@ -126,7 +126,7 @@ private:
     // One exchange at a time, on a connection kept between them, and the path it is about.
     struct lane
     {
-        std::unique_ptr<socketley::storage::http_peer> peer;
+        std::unique_ptr<socketley::http_peer> peer;
         bool busy{false};
         std::string path;
         std::unique_ptr<upload> mpu;
@@ -151,7 +151,7 @@ private:
         bool        addressed{false};
         // The runtime of this daemon it names, empty for an address.
         std::string runtime;
-        socketley::storage::http_target http;
+        socketley::http_target http;
         sync_credentials cred;
         // The exchanges in flight to it, one per lane, each on a connection of its own; empty until it is addressed.
         std::vector<std::unique_ptr<lane>> lanes;
@@ -182,12 +182,12 @@ private:
     // A walk in retry_secs, whatever --every says, for what a target refused or did not answer.
     void owe_retry();
     // A request for `rel`'s key, signed, with `extra` among its headers and `body` held whole.
-    socketley::storage::http_request signed_request(const target& t, std::string_view method, const std::string& rel,
+    socketley::http_request signed_request(const target& t, std::string_view method, const std::string& rel,
                                                     std::string_view query,
                                                     std::vector<std::pair<std::string, std::string>> extra,
                                                     std::string body = {}) const;
     // [off, off + len) of `fd` as the request's body.
-    void body_from(const target& t, socketley::storage::http_request& rq, const std::shared_ptr<int>& fd,
+    void body_from(const target& t, socketley::http_request& rq, const std::shared_ptr<int>& fd,
                    uint64_t off, uint64_t len) const;
     void carry(target& t, lane& l, const job& j);
     void begin_upload(target& t, lane& l, const job& j, std::shared_ptr<int> fd);
@@ -198,7 +198,7 @@ private:
     void remove(target& t, lane& l, const job& j);
     // What an exchange came to: a file the target now holds, or an answer that is not that.
     void carried(target& t, lane& l, const job& j, std::string etag);
-    void refused(target& t, lane& l, const job& j, const socketley::storage::http_answer& a);
+    void refused(target& t, lane& l, const job& j, const socketley::http_answer& a);
     // Whether `rel` is one of --exclude's patterns.
     bool excluded(const std::string& rel) const;
 
@@ -230,7 +230,7 @@ private:
     // Where a copy of `rel` is kept when both sides changed it: beside it, named for the moment.
     std::string conflict_name(const std::string& rel) const;
     // A request of the bucket itself rather than of a key in it, as a listing is.
-    socketley::storage::http_request signed_bucket_request(const target& t, std::string_view query) const;
+    socketley::http_request signed_bucket_request(const target& t, std::string_view query) const;
     bool m_pull_due{false};
     bool m_pulling{false};
     // The listing is still being read, so no fetch is decided yet.

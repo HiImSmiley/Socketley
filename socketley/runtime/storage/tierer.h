@@ -21,7 +21,7 @@
 
 #include "body_reader.h"
 #include "object_store.h"
-#include "outbound_http.h"
+#include "../../shared/http/outbound_http.h"
 #include "replicator.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"

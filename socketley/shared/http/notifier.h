@@ -1,6 +1,7 @@
 #pragma once
-// The events of a storage runtime's buckets on their way to webhooks: a durable outbox per shard, and the HTTP(S)
-// POSTs that empty it, each on the loop and none on a request's path.
+// Events on their way to webhooks and to the daemon's runtimes: a durable outbox per shard, and the HTTP(S) POSTs
+// and requests that empty it, each on the loop and none on a request's path.  A storage runtime's buckets send theirs
+// through one, and the daemon its alerts.
 //
 // ─── THE OUTBOX ─────────────────────────────────────────────────────────────
 //   <dir>/.notify/outbox.<shard>   an entry's payload is its target's name and its JSON, each length-prefixed
@@ -20,16 +21,16 @@
 #include <vector>
 
 #include "outbound_http.h"
-#include "outbox.h"
-#include "../../shared/ipc/request_channel.h"
-#include "../../shared/loop/backlog_gate.h"
-#include "../../shared/loop/event_loop.h"
-#include "../../shared/loop/file_io.h"
-#include "../../shared/loop/hash_pool.h"
+#include "../persist/outbox.h"
+#include "../ipc/request_channel.h"
+#include "../loop/backlog_gate.h"
+#include "../loop/event_loop.h"
+#include "../loop/file_io.h"
+#include "../loop/hash_pool.h"
 
 class runtime_manager;
 
-namespace socketley::storage
+namespace socketley
 {
 
 // Where a bucket's events may be sent, by the name its ARN gives it: a webhook, or another runtime of the daemon -- a
@@ -70,14 +71,25 @@ public:
     static constexpr int64_t backoff_first_ms = 250;
     static constexpr int64_t backoff_cap_ms   = 8000;
 
-    // `owner` is the handler the timer's completion is delivered to, which hands it to on_timer().
-    notifier(event_loop& loop, file_io& io, io_handler* owner);
+    // `owner` is the handler the timer's completion is delivered to, which hands it to on_timer(); `who` begins its
+    // log lines and names it to a webhook.
+    notifier(event_loop& loop, file_io& io, io_handler* owner, std::string who);
     ~notifier();
 
     notifier(const notifier&)            = delete;
     notifier& operator=(const notifier&) = delete;
 
+    // Before set_targets(): the most events held undelivered, and the test aid's hosts file.
+    void set_queue_max(size_t n) { m_queue_max = n; }
+    void set_hosts_file(std::string path) { m_hosts_file = std::move(path); }
     void set_targets(std::vector<notify_target> targets);
+    // Before open(): webhooks named by their URL rather than configured, each made by add_webhook() and by a start
+    // that finds events for it.
+    void set_dynamic() { m_dynamic = true; }
+    // A webhook at `url` from now on, if there is none yet; false with `why` when the URL is not one.
+    bool add_webhook(std::string_view url, std::string& why);
+    // The webhooks with nothing to send and nothing sent for `idle` let go.
+    void forget_idle(std::chrono::steady_clock::duration idle);
     // The daemon's runtimes a target of another runtime is reached through, and this runtime's own name, which a
     // server is told a broadcast comes from.
     void set_runtimes(runtime_manager* mgr, std::string self);
@@ -85,8 +97,10 @@ public:
     bool has_target(std::string_view name) const;
     bool enabled() const { return !m_lanes.empty(); }
 
-    // Opens the shard's outbox under `dir` and queues again what it holds undelivered; blocking, so it runs at start.
-    bool open(const std::string& dir, uint32_t shard, const outbox::change_made& made, std::string& err);
+    // Opens the shard's outbox in `sub` under `dir` and queues again what it holds undelivered; blocking, so it runs
+    // at start.
+    bool open(const std::string& dir, std::string_view sub, uint32_t shard, const outbox::change_made& made,
+              std::string& err);
 
     // Queues `json` for `target`, its record written with the next batch; false when it was dropped.
     bool add(std::string_view target, std::string json);
@@ -133,9 +147,15 @@ private:
         bool        busy{false};
         uint32_t    failures{0};
         std::chrono::steady_clock::time_point next_try{};
+        // When an event was last queued for it, for forget_idle().
+        std::chrono::steady_clock::time_point used{};
     };
 
     lane* find_lane(std::string_view name);
+    // The lane of a webhook `t`, made and asked for its host now.
+    lane& make_webhook_lane(notify_target t);
+    // The resolver waited for on the loop, once; false when it cannot be.
+    bool resolver_ready();
     void start(lane& l);
     // A delivery to another runtime of the daemon.
     void start_runtime(lane& l, const pending& ev);
@@ -151,6 +171,8 @@ private:
     event_loop& m_loop;
     file_io&    m_io;
     io_handler* m_owner;
+    std::string m_who;
+    std::string m_full_text;
     std::vector<std::unique_ptr<lane>> m_lanes;
     size_t      m_queue_max{default_queue_max};
     uint64_t    m_queued{0};
@@ -160,6 +182,7 @@ private:
     std::unordered_map<uint64_t, std::vector<std::pair<lane*, pending>>> m_staged;
     notify_counters m_c;
     bool        m_stopped{false};
+    bool        m_dynamic{false};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
     outbox      m_box;
 
@@ -171,8 +194,9 @@ private:
     uint64_t         m_next_cookie{0};
 
     // One thread that resolves hosts, its answers handed back through an eventfd the ring reads, and the test aid's
-    // hosts file (SOCKETLEY_STORAGE_NOTIFY_HOSTS).
+    // hosts file.
     hash_pool   m_resolver{1};
+    bool        m_resolver_attached{false};
     std::string m_hosts_file;
 
     io_request  m_timer_req{};
@@ -180,4 +204,4 @@ private:
     bool        m_timer_armed{false};
 };
 
-}   // namespace socketley::storage
+}   // namespace socketley

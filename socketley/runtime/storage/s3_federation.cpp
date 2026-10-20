@@ -28,7 +28,7 @@
 #include <openssl/x509v3.h>
 
 #include "../../shared/json/json_doc.h"
-#include "outbound_http.h"
+#include "../../shared/http/outbound_http.h"
 #include "s3_names.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/util/text_list.h"

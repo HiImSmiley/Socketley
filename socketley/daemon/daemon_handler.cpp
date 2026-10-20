@@ -415,7 +415,7 @@ const char* state_json(runtime_state s)
 }   // namespace
 
 daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
-    : m_manager(manager), m_loop(loop), m_listen_fd(-1)
+    : m_manager(manager), m_loop(loop), m_fio(loop, this), m_alert_out(loop, m_fio, this, "alerts"), m_listen_fd(-1)
 {
     std::memset(&m_accept_addr, 0, sizeof(m_accept_addr));
     m_accept_addrlen = sizeof(m_accept_addr);
@@ -771,6 +771,10 @@ void daemon_handler::teardown()
     }
     m_torn_down = true;
 
+    // What the alerts' webhook has not taken stays in its outbox for the next start.
+    m_alert_out.stop();
+    m_alert_box.retire(m_loop);
+
     // Nothing is forked from here on, so a reply waiting for a fork is given up, and every exit watch withdrawn.
     finish_deferred_starts(true);
     for (auto& w : m_exit_watches)
@@ -840,6 +844,11 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
     auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
     if (!req)
         return;
+    if (socketley::file_io::owns_type(req->type))
+    {
+        m_fio.on_cqe(cqe);
+        return;
+    }
 
     switch (req->type)
     {
@@ -864,6 +873,11 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
             }
             break;
         case op_timeout:
+            if (m_alert_out.owns(req))
+            {
+                m_alert_out.on_timer();
+                break;
+            }
             if (req == &m_health_req)
             {
                 m_health_pending = false;
@@ -8676,4 +8690,28 @@ bool daemon_handler::send_response(ipc_connection* conn)
 
     conn->write_pending = true;
     return true;
+}
+
+bool daemon_handler::open_alert_webhook(const std::string& url, const std::string& state_dir, std::string& why)
+{
+    socketley::notify_target t;
+    t.name = "alerts";
+    t.k    = socketley::notify_target::kind::webhook;
+    if (!socketley::parse_http_url(url, t.http, why))
+        return false;
+    std::vector<socketley::notify_target> targets;
+    targets.push_back(std::move(t));
+    m_alert_out.set_targets(std::move(targets));
+    if (!m_alert_box.attach(m_fio))
+    {
+        why = "the alerts' handoff to the loop cannot be waited for";
+        return false;
+    }
+    // An alert is never staged with a change, so a start has nothing to look for.
+    return m_alert_out.open(state_dir, ".notify", 0, [](std::string_view) { return true; }, why);
+}
+
+void daemon_handler::send_alert(std::string body)
+{
+    m_alert_box.post_done([this, b = std::move(body)]() mutable { m_alert_out.add("alerts", std::move(b)); });
 }

@@ -11,7 +11,7 @@
 #include "../../shared/util/text_list.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/runtime/runtime_name.h"
-#include "../storage/outbound_http.h"
+#include "../../shared/http/outbound_http.h"
 #include "../storage/s3_names.h"
 
 std::string sync_index_path(std::string_view runtime_name)
@@ -41,8 +41,8 @@ bool parse_sync_target(std::string_view entry, sync_target_spec& out, std::strin
     if (where.find("://") != std::string_view::npos || where.find(':') != std::string_view::npos)
     {
         out.url = where.find("://") == std::string_view::npos ? "http://" + std::string(where) : std::string(where);
-        socketley::storage::http_target t;
-        if (!socketley::storage::parse_http_url(out.url, t, why))
+        socketley::http_target t;
+        if (!socketley::parse_http_url(out.url, t, why))
         {
             why = "'" + out.name + "': " + why;
             return false;

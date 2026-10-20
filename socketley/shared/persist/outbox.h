@@ -27,16 +27,16 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../../shared/loop/event_loop.h"
-#include "../../shared/loop/file_io.h"
+#include "../loop/event_loop.h"
+#include "../loop/file_io.h"
 
-namespace socketley::storage
+namespace socketley
 {
 
 class outbox
 {
 public:
-    // `what` names the outbox in the log.
+    // `what` names the outbox in the log, the runtime it is for first.
     outbox(event_loop& loop, file_io& io, std::string what);
     ~outbox();
 
@@ -119,4 +119,4 @@ private:
     bool        m_write_failed{false};
 };
 
-}   // namespace socketley::storage
+}   // namespace socketley

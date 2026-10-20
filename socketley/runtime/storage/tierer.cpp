@@ -189,7 +189,7 @@ void tierer::pump(tier& t)
         if (!free && t.peers.size() < peers_per_tier)
         {
             t.peers.push_back(std::make_unique<http_peer>(m_loop, m_io, m_resolver, t.t.http, m_hosts_file,
-                                                          "the tier " + t.t.name));
+                                                          "storage: the tier " + t.t.name));
             free = t.peers.back().get();
         }
         if (!free)

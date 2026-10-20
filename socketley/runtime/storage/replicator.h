@@ -21,8 +21,8 @@
 #include <vector>
 
 #include "object_store.h"
-#include "outbound_http.h"
-#include "outbox.h"
+#include "../../shared/http/outbound_http.h"
+#include "../../shared/persist/outbox.h"
 #include "s3_replication.h"
 #include "sse.h"
 #include "../../shared/loop/event_loop.h"

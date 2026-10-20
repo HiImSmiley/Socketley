@@ -226,7 +226,7 @@ struct replicator::job
 replicator::replicator(event_loop& loop, file_io& io, io_handler* owner, object_store& store, hash_pool& hashes,
                        key_opener keys)
     : m_loop(loop), m_io(io), m_owner(owner), m_store(store), m_hashes(hashes), m_keys(std::move(keys)),
-      m_box(loop, io, "replication outbox")
+      m_box(loop, io, "storage: the replication outbox")
 {
     if (const char* e = settings::text("SOCKETLEY_STORAGE_REPLICATION_HOSTS"))
         m_hosts_file = e;
@@ -281,7 +281,7 @@ void replicator::add_lanes(std::vector<replication_target> targets, bool nodes)
 std::unique_ptr<http_peer> replicator::new_peer(const replication_target& t)
 {
     return std::make_unique<http_peer>(m_loop, m_io, m_resolver, t.http, m_hosts_file,
-                                       (t.node ? "the cluster node " : "the replication target ") + t.name);
+                                       (t.node ? "storage: the cluster node " : "storage: the replication target ") + t.name);
 }
 
 size_t replicator::free_slot(lane& l)

@@ -20,7 +20,6 @@
 #include "../shared/http/https_client.h"
 #include "../shared/util/log_ring.h"
 #include "../shared/util/logging.h"
-#include "../shared/util/thread_stop.h"
 #include "../shared/json/json_escape.h"
 #include "../shared/persist/replaced_file.h"
 #include "../shared/crypto/cert_keeper.h"
@@ -76,7 +75,8 @@ std::string alert_json(const alert& a)
 
 }   // namespace
 
-monitor::monitor(std::string state_path, std::string webhook) : m_path(std::move(state_path)), m_webhook(std::move(webhook))
+monitor::monitor(std::string state_path, std::string webhook, sender send)
+    : m_path(std::move(state_path)), m_webhook(std::move(webhook)), m_send(std::move(send))
 {
     char host[256] = {};
     if (::gethostname(host, sizeof host - 1) == 0)
@@ -85,13 +85,6 @@ monitor::monitor(std::string state_path, std::string webhook) : m_path(std::move
     for (std::string line; std::getline(f, line);)
         if (const size_t a = line.find('\t'), b = line.find('\t', a + 1); b != std::string::npos)
             m_told[line.substr(0, a)] = {std::strtoll(line.c_str() + a + 1, nullptr, 10), line.substr(b + 1)};
-    if (!m_webhook.empty())
-        m_thread = std::thread(&monitor::sender, this);
-}
-
-monitor::~monitor()
-{
-    socketley::stop_and_join(m_thread, m_mtx, m_cv, m_stop);
 }
 
 void monitor::check(int64_t now, const std::vector<facts>& runtimes, const std::vector<std::string>& extra_dirs)
@@ -322,7 +315,7 @@ void monitor::post(const alert& a, bool raised, int64_t now)
         LOG_WARN(("alert: " + a.title + (a.detail.empty() ? "" : ": " + a.detail)).c_str());
     else
         LOG_INFO(("alert cleared: " + a.title).c_str());
-    if (m_webhook.empty())
+    if (m_webhook.empty() || !m_send)
         return;
     std::string text = !raised ? "\xe2\x9c\x85 " : a.level == "critical" ? "\xf0\x9f\x94\xb4 " : "\xe2\x9a\xa0\xef\xb8\x8f ";
     if (!m_host.empty())
@@ -344,54 +337,7 @@ void monitor::post(const alert& a, bool raised, int64_t now)
     body.append(socketley::json::quote(text)).append(",\"text\":").append(socketley::json::quote(text)).append(",\"state\":");
     body.append(socketley::json::quote(raised ? "firing" : "resolved")).append(",\"host\":").append(socketley::json::quote(m_host));
     body.append(",\"alert\":").append(alert_json(a)).append("}");
-    bool first_drop = false;
-    {
-        std::lock_guard lock(m_mtx);
-        // The oldest goes for the newest, since what a hook that comes back needs is how things stand now.
-        if (m_queue.size() >= 50)
-        {
-            m_queue.pop_front();
-            first_drop = m_dropped++ == 0;
-        }
-        m_queue.push_back(std::move(body));
-    }
-    if (first_drop)
-        LOG_WARN("alert webhook: the hook is not keeping up, and the oldest messages for it are dropped");
-    m_cv.notify_one();
-}
-
-void monitor::sender()
-{
-    for (;;)
-    {
-        std::string body;
-        {
-            std::unique_lock lock(m_mtx);
-            m_cv.wait(lock, [&] { return m_stop || !m_queue.empty(); });
-            if (m_stop)
-                return;
-            body = std::move(m_queue.front());
-            m_queue.pop_front();
-        }
-        https_client::client c;
-        https_client::reply r;
-        std::string err;
-        if (!c.init(err, {}, "socketley-alerts") || !c.request("POST", m_webhook, "application/json", body, r, err, 10))
-            LOG_WARN(("alert webhook: " + err).c_str());
-        else if (r.status < 200 || r.status >= 300)
-            LOG_WARN(("alert webhook: answered " + std::to_string(r.status)).c_str());
-        else
-        {
-            uint64_t dropped = 0;
-            {
-                std::lock_guard lock(m_mtx);
-                dropped = std::exchange(m_dropped, 0);
-            }
-            if (dropped)
-                LOG_WARN(("alert webhook: answering again; " + std::to_string(dropped) +
-                          " message(s) were dropped while it was behind").c_str());
-        }
-    }
+    m_send(std::move(body));
 }
 
 void monitor::save() const

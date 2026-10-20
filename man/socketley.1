@@ -10329,6 +10329,10 @@ what a link that burns names is removed:
 (a sentence, as Discord and Slack show it),
 .BR event " (" downloaded " or " deleted ),
 .BR bucket ", " key ", " downloads ", " max_downloads " and " expires .
+One the hook does not take is posted again as a bucket's webhook events are,
+and kept across a restart in
+.B .share\-notify
+under the runtime's directory.
 Since the runtime makes the request for the link's maker, the URL must begin
 with one of the prefixes
 .B SOCKETLEY_SHARE_NOTIFY_ALLOW
@@ -15200,7 +15204,12 @@ whose
 .BR resolved )
 and
 .B alert
-carry the rest. The alerts told of are kept in
+carry the rest. A message the hook does not take with a 2xx is posted again,
+after a pause that doubles up to eight seconds, and one it has not taken is
+kept in
+.B .notify
+in the state directory and posted after a restart. The alerts told of are kept
+in
 .B .alerts
 in the state directory, readable by the daemon's user alone, so a daemon
 started again does not tell of them a second time.

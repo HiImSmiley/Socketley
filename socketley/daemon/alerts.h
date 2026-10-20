@@ -5,17 +5,16 @@
 //
 // An alert is raised when its condition has held for `hold` readings -- one for what does not come and go, three for
 // a level that can -- and cleared when it has not held for three. Raising and clearing are logged, kept for the page,
-// and posted to daemon.alert_webhook when one is set, from a thread of their own so a slow hook holds nothing up. The
-// ones already told of are written to the state directory, so a restart does not tell of them again.
-#include <condition_variable>
+// and handed to the daemon's loop for daemon.alert_webhook when one is set, which posts each until the hook takes it,
+// across a restart. The ones already told of are written to the state directory, so a restart does not tell of them
+// again.
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
-#include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 
 namespace alerts
@@ -47,9 +46,11 @@ struct alert
 class monitor
 {
 public:
-    // `state_path` keeps the alerts told of, `webhook` is the URL they are posted to, empty for none.
-    monitor(std::string state_path, std::string webhook);
-    ~monitor();
+    // Called from the thread that checks, with a message for the webhook.
+    using sender = std::function<void(std::string body)>;
+    // `state_path` keeps the alerts told of, `webhook` is the URL they are posted to, empty for none, and `send` takes
+    // each message for it.
+    monitor(std::string state_path, std::string webhook, sender send);
 
     // One look at everything, at `now` (seconds); `extra_dirs` are directories whose disks are watched besides the
     // runtimes'.
@@ -70,7 +71,6 @@ private:
     };
     void consider(int64_t now, std::map<std::string, alert>& seen);
     void post(const alert& a, bool raised, int64_t now);
-    void sender();
     void save() const;
 
     std::string m_path, m_webhook, m_host;
@@ -88,13 +88,7 @@ private:
     std::map<std::string, std::vector<alert>> m_git;
     std::set<std::string> m_git_dirs;
 
-    std::mutex m_mtx;
-    std::condition_variable m_cv;
-    std::deque<std::string> m_queue;
-    // Messages pushed out of a full queue since the hook last answered.
-    uint64_t m_dropped = 0;
-    bool m_stop{false};
-    std::thread m_thread;
+    sender m_send;
 };
 
 }   // namespace alerts

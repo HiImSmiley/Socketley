@@ -16,12 +16,12 @@
 
 #include <openssl/ssl.h>
 
-#include "../../shared/http/http_framing.h"
-#include "../../shared/util/logging.h"
-#include "../../shared/util/ascii.h"
-#include "../../shared/util/text_list.h"
+#include "http_framing.h"
+#include "../util/logging.h"
+#include "../util/ascii.h"
+#include "../util/text_list.h"
 
-namespace socketley::storage
+namespace socketley
 {
 
 namespace
@@ -266,7 +266,7 @@ http_peer::http_peer(event_loop& loop, file_io& io, hash_pool& resolver, http_ta
         m_tls = std::make_unique<tls_context>();
         if (!m_tls->init_client(m_target.ca_file))
         {
-            LOG_ERROR(("storage: " + m_what + " has no TLS context, so nothing is sent to it").c_str());
+            LOG_ERROR((m_what + " has no TLS context, so nothing is sent to it").c_str());
             m_tls.reset();
         }
     }
@@ -329,7 +329,7 @@ void http_peer::resolved(std::vector<http_endpoint> addrs)
     const bool waiting = m_busy && m_fd < 0 && m_addrs.empty();
     if (addrs.empty())
     {
-        LOG_WARN(("storage: " + m_what + " names host " + m_target.host +
+        LOG_WARN((m_what + " names host " + m_target.host +
                   ", which does not resolve; what is for it waits and it is asked again").c_str());
         // A host known before keeps its addresses, since a resolver that does not answer says nothing about them.
         if (waiting)
@@ -925,4 +925,4 @@ void http_peer::stop()
     drop_pipe();
 }
 
-}   // namespace socketley::storage
+}   // namespace socketley

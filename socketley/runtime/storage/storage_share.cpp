@@ -1046,16 +1046,8 @@ void storage_run::share_burn_tick()
         share_burn(s.id, s.bucket, s.key, s.folder);
     }
     ::closedir(d);
-    // The webhooks' exchanges that stalled end, and peers left with nothing to do go.
-    const auto tnow = std::chrono::steady_clock::now();
-    for (auto it = m_hooks.begin(); it != m_hooks.end();)
-    {
-        it->second->peer->tick(tnow);
-        if (!it->second->peer->busy() && it->second->queue.empty() && tnow - it->second->used > std::chrono::seconds(30))
-            it = m_hooks.erase(it);
-        else
-            ++it;
-    }
+    // The links' webhooks left with nothing to do go.
+    m_share_hooks.forget_idle(std::chrono::seconds(30));
     m_burns = seen;
 }
 
@@ -1163,46 +1155,27 @@ void storage_run::share_tell(const std::string& url, std::string_view what, cons
             socketley::json::escape(bucket) + "\",\"key\":\"" + socketley::json::escape(key) + "\",\"downloads\":" +
             std::to_string(downloads) + ",\"max_downloads\":" + std::to_string(max_downloads) + ",\"expires\":" +
             std::to_string(expires_ms) + "}";
-    // Parsed before a slot is made for it, so a URL that is none leaves no empty hook behind for the sweep.
-    auto found = m_hooks.find(url);
-    if (found == m_hooks.end() || !found->second)
+    std::string why;
+    if (!share_hooks_open() || !m_share_hooks.add_webhook(url, why))
     {
-        http_target t;
-        std::string why;
-        if (!parse_http_url(url, t, why))
-            return;
-        found = m_hooks.insert_or_assign(url, std::make_unique<hook_peer>()).first;
-        found->second->peer = std::make_unique<http_peer>(m_loop, m_io, m_hash, t, std::string{}, "a link's webhook");
+        if (!why.empty())
+            LOG_WARN(("storage: a link's webhook is not one: " + why).c_str());
+        return;
     }
-    auto& h = found->second;
-    // At most a few waiting, so a webhook that does not answer cannot hold memory without bound.
-    if (h->queue.size() < 16)
-        h->queue.push_back(std::move(body));
-    h->used = std::chrono::steady_clock::now();
-    share_tell_next(url);
-    arm_sweep();
+    m_share_hooks.add(url, std::move(body));
 }
 
-void storage_run::share_tell_next(const std::string& url)
+bool storage_run::share_hooks_open()
 {
-    auto it = m_hooks.find(url);
-    if (it == m_hooks.end() || it->second->peer->busy() || it->second->queue.empty())
-        return;
-    hook_peer& h = *it->second;
-    const http_target& t = h.peer->target();
-    http_request req;
-    req.body = std::move(h.queue.front());
-    h.queue.pop_front();
-    req.head = "POST " + (t.path.empty() ? std::string("/") : t.path) + " HTTP/1.1\r\nHost: " + t.authority() +
-               "\r\nUser-Agent: socketley\r\nContent-Type: application/json\r\nContent-Length: " +
-               std::to_string(req.body.size()) + "\r\n\r\n";
-    h.peer->exchange(std::move(req), [this, url](http_answer a)
-    {
-        if (a.status < 200 || a.status >= 300)
-            LOG_WARN(("storage: a link's webhook answered " + std::to_string(a.status) +
-                      (a.failure.empty() ? std::string{} : " (" + a.failure + ")")).c_str());
-        share_tell_next(url);
-    });
+    if (m_share_hooks_open)
+        return true;
+    std::string err;
+    // A link's message is never staged with a change, so a start has nothing to look for.
+    m_share_hooks_open = m_share_hooks.open(m_store.options().dir, ".share-notify", m_store.shard(),
+                                            [](std::string_view) { return true; }, err);
+    if (!m_share_hooks_open)
+        LOG_WARN(("storage: the links' webhooks' outbox: " + err).c_str());
+    return m_share_hooks_open;
 }
 
 }   // namespace socketley::storage

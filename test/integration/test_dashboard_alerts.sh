@@ -38,12 +38,14 @@ HP=$((SL_PORT_BASE+1951))
 S1=$((SL_PORT_BASE+1952))
 S2=$((SL_PORT_BASE+1953))
 S3=$((SL_PORT_BASE+1954))
+S4=$((SL_PORT_BASE+1955))
 HOOK_PID=""
 trap '[ -n "$HOOK_PID" ] && kill "$HOOK_PID" 2>/dev/null; daemon_stop' EXIT
 
 echo "=== Integration: the daemon's alerts ==="
 
 # A hook that keeps every body it is sent, one a line.
+start_hook() {
 python3 - "$HP" "$T/hook.log" <<'PY' &
 import http.server, os, sys
 port, log = int(sys.argv[1]), sys.argv[2]
@@ -61,6 +63,9 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(('127.0.0.1', port), H).serve_forever()
 PY
 HOOK_PID=$!
+for _ in $(seq 1 50); do curl -s -o /dev/null -X POST "http://127.0.0.1:$HP/" && break; sleep 0.1; done
+}
+start_hook
 : > "$T/hook.log"
 
 ADMIN="AKIADASHALERTADMIN00:dashalertadminsecretdashalertadminsec00"
@@ -155,6 +160,28 @@ expect "kept in the history as cleared" "$(al | j "[e['raised'] for e in d['rece
 for _ in $(seq 1 20); do [ "$(hook "d['state']" | grep -c resolved)" -ge 1 ] && break; sleep 0.5; done
 expect "and posted as resolved" "$(hook "(d['state'], d['alert']['id']) if 'alert' in d else ()" | grep -c "('resolved', 'failed:broke')")" 1
 expect "and no longer kept as told of" "$(grep -c failed:broke "$file")" 0
+
+# ─── a hook that is down ────────────────────────────────────────────────────
+# Posted from a thread that gave up at the first failure, an alert raised while the hook was down was told to nobody,
+# and once told of it was not sent again after a restart either.
+kill "$HOOK_PID"; wait "$HOOK_PID" 2>/dev/null; HOOK_PID=""
+: > "$T/hook.log"
+echo '-- fine' > "$T/s2.lua"
+"$BIN" create server broke2 -p "$S4" --lua "$T/s2.lua" -s >/dev/null 2>&1
+echo 'this is not lua (' > "$T/s2.lua"
+"$BIN" stop broke2 >/dev/null 2>&1
+"$BIN" start broke2 >/dev/null 2>&1
+until_al 30 "any(a['id'] == 'failed:broke2' for a in d['active'])"
+# Tried and refused a few times while the hook is away, then the daemon goes with the message still owed.
+sleep 2
+kill "$SOCKETLEY_DPID"; wait "$SOCKETLEY_DPID" 2>/dev/null
+daemon_start "$BIN"
+start_hook
+for _ in $(seq 1 60); do [ "$(hook "d['alert']['id'] if 'alert' in d else ''" 2>/dev/null | grep -c '^failed:broke2$')" -ge 1 ] && break; sleep 0.5; done
+expect "an alert raised while the hook was down reaches it once it is up, though the daemon restarted between" \
+    "$(hook "(d['state'], d['alert']['id']) if 'alert' in d else ()" | grep -c "('firing', 'failed:broke2')")" 1
+sleep 2
+expect "and once" "$(hook "d['alert']['id'] if 'alert' in d else ''" | grep -c '^failed:broke2$')" 1
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

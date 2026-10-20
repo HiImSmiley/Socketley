@@ -102,7 +102,8 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
     : m_owner(owner), m_loop(loop), m_io(loop, this), m_hash(hash_threads(opts.nshards)),
       m_store(loop, m_io, std::move(opts)),
       m_mpu(loop, m_io, m_store),
-      m_notify(loop, m_io, this),
+      m_notify(loop, m_io, this, "storage"),
+      m_share_hooks(loop, m_io, this, "storage"),
       m_repl(loop, m_io, this, m_store, m_hash,
              [this](const object_meta& m, sse_key& out)
              {
@@ -122,6 +123,11 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
                   std::string(owner.get_name())),
       m_node(m_store, m_transport), m_auth(auth)
 {
+    // The notifier's test aids: a lower bound on what waits, and a hosts file read before the system's resolver.
+    if (const auto v = settings::number<size_t>("SOCKETLEY_STORAGE_NOTIFY_QUEUE"))
+        m_notify.set_queue_max(*v);
+    if (const char* e = settings::text("SOCKETLEY_STORAGE_NOTIFY_HOSTS"))
+        m_notify.set_hosts_file(e);
     m_idp.configure(owner.get_idp());
     // Uploads are each on the shard that owns their key; a bucket is dropped only
     // when no shard is at work on one, and the idle ones are aborted with it, as in S3.
@@ -186,8 +192,12 @@ bool storage_run::open(std::string& err)
         change_note n;
         return decode_change_check(check, n) && m_store.change_on_disk(n);
     };
-    if (!m_notify.open(m_store.options().dir, m_store.shard(), made, err))
+    if (!m_notify.open(m_store.options().dir, ".notify", m_store.shard(), made, err))
         return false;
+    // Opened now only when a stop left something owed in it, so a runtime whose links name no webhook makes no file.
+    m_share_hooks.set_dynamic();
+    if (::access((m_store.options().dir + "/.share-notify").c_str(), F_OK) == 0 && !share_hooks_open())
+        LOG_WARN("storage: the links' webhooks' outbox could not be opened, so what it owed is not sent");
     if (!m_repl.open(m_store.options().dir, m_store.shard(), made, err))
         return false;
     if (!m_cluster_self.empty() && !load_cluster_id(err))
@@ -391,6 +401,11 @@ void storage_run::on_cqe(struct io_uring_cqe* cqe)
     if (m_notify.owns(req))
     {
         m_notify.on_timer();
+        return;
+    }
+    if (m_share_hooks.owns(req))
+    {
+        m_share_hooks.on_timer();
         return;
     }
     if (m_repl.owns(req))
@@ -644,7 +659,7 @@ void storage_run::sweep()
     flush_access_logs(false);
     if (!m_conns.empty() || m_mpu_expire_secs != 0 || m_start_note != start_note::told || m_lc ||
         m_store.lifecycle_buckets() != 0 || m_store.any_doubt() || !m_access_logs.empty() || m_scrub.enabled() ||
-        m_compact.enabled() || m_tier.enabled() || m_git.enabled() || m_burns != 0 || !m_burning.empty() || !m_hooks.empty())
+        m_compact.enabled() || m_tier.enabled() || m_git.enabled() || m_burns != 0 || !m_burning.empty() || m_share_hooks.enabled())
         arm_sweep();
 }
 
@@ -672,8 +687,6 @@ void storage_run::stop()
     m_stopped = true;
     stop_rpc();
     m_git.stop();
-    for (auto& [url, h] : m_hooks)
-        h->peer->stop();
     // Access log lines not yet delivered are dropped with the deliveries in flight.
     for (auto& d : m_log_deliveries)
         d->abort();
@@ -712,6 +725,7 @@ void storage_run::stop()
     m_transport.stop();
     m_node.stop();
     m_notify.stop();
+    m_share_hooks.stop();
     m_repl.stop();
     m_scrub.stop();
     m_compact.stop();

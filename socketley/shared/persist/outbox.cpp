@@ -8,12 +8,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../../shared/loop/blocking_write.h"
-#include "../../shared/util/byte_codec.h"
-#include "../../shared/util/logging.h"
-#include "../../shared/persist/mutation_journal.h"
+#include "../loop/blocking_write.h"
+#include "../util/byte_codec.h"
+#include "../util/logging.h"
+#include "../persist/mutation_journal.h"
 
-namespace socketley::storage
+namespace socketley
 {
 
 namespace
@@ -142,7 +142,7 @@ bool outbox::open(const std::string& dir, std::string_view sub, uint32_t shard, 
         return e.change != 0 && (it == changes.end() || it->second.end != 'C');
     });
     if (unmade)
-        LOG_INFO(("storage: the " + m_what + " drops what it owed for " + std::to_string(unmade) +
+        LOG_INFO((m_what + " drops what it owed for " + std::to_string(unmade) +
                   " change(s) a crash cut short before they were made").c_str());
 
     // Written again with only what is still owed, so the file never outgrows its undelivered entries.
@@ -316,7 +316,7 @@ void outbox::written(int64_t res, uint64_t upto, bool synced)
     if (res < 0 && !m_write_failed)
     {
         m_write_failed = true;
-        LOG_ERROR(("storage: writing the " + m_what + " failed (" + std::string(std::strerror(static_cast<int>(-res))) +
+        LOG_ERROR((m_what + ": writing it failed (" + std::string(std::strerror(static_cast<int>(-res))) +
                    "); what it holds is delivered but would not survive a crash").c_str());
     }
     if (res >= 0 && synced)
@@ -351,7 +351,7 @@ void outbox::maybe_rotate()
     const std::string tmp = m_name + ".new";
     auto fail = [this](std::string_view why)
     {
-        LOG_WARN(("storage: the " + m_what + " could not be started again empty: " + std::string(why)).c_str());
+        LOG_WARN((m_what + " could not be started again empty: " + std::string(why)).c_str());
         m_rotating = false;
         kick();
     };
@@ -442,4 +442,4 @@ void outbox::stop()
     m_dir_fd = -1;
 }
 
-}   // namespace socketley::storage
+}   // namespace socketley

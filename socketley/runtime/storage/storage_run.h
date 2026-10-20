@@ -29,7 +29,7 @@
 #include "bucket_policy.h"
 #include "checksum.h"
 #include "multipart.h"
-#include "notifier.h"
+#include "../../shared/http/notifier.h"
 #include "object_store.h"
 #include "post_policy.h"
 #include "cluster.h"
@@ -1250,18 +1250,15 @@ public:
     // Links that burn what they name, ended at their expiry or after their last download: looked over by the sweep.
     void share_burn_tick();
     void share_burn(std::string id, std::string bucket, std::string key, bool folder);
-    // A link's webhook told of a download or of its files' removal, in order, one exchange at a time per URL.
+    // A link's webhook told of a download or of its files' removal, in order, one exchange at a time per URL, and
+    // again until it takes it, across a restart.
     static bool notify_allowed(std::string_view url);
     void share_tell(const std::string& url, std::string_view what, const std::string& bucket, const std::string& key,
                     uint64_t downloads, uint64_t max_downloads, int64_t expires_ms, bool burn);
-    void share_tell_next(const std::string& url);
-    struct hook_peer
-    {
-        std::unique_ptr<http_peer> peer;
-        std::deque<std::string> queue;
-        std::chrono::steady_clock::time_point used{};
-    };
-    std::unordered_map<std::string, std::unique_ptr<hook_peer>> m_hooks;
+    // The links' webhooks' outbox opened, at start when it has anything and else at the first message; false when it
+    // cannot be.
+    bool share_hooks_open();
+    bool m_share_hooks_open{false};
     std::vector<std::string> share_records();
     // Who a request's change is told as: its user or "anonymous", and the client's address, left empty for a
     // bucket that sends no events.
@@ -1441,6 +1438,8 @@ private:
     object_store      m_store;
     multipart_store   m_mpu;
     notifier          m_notify;
+    // The links' webhooks, each made by the first message for its URL.
+    notifier          m_share_hooks;
     replicator        m_repl;
     scrubber          m_scrub;
     git_mirrors       m_git;

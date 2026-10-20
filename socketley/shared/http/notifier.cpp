@@ -6,25 +6,22 @@
 #include "../../runtime/cache/stream_log.h"
 #include "../../runtime/mqtt/mqtt_codec.h"
 #include "../../runtime/mqtt/mqtt_command.h"
-#include "../../shared/util/byte_codec.h"
-#include "../../shared/ipc/route_relay.h"
-#include "../../shared/runtime/runtime_manager.h"
-#include "../../shared/util/logging.h"
-#include "../../shared/util/number_parse.h"
-#include "../../shared/ipc/one_command.h"
-#include "../../shared/util/settings.h"
-#include "../../shared/util/text_list.h"
+#include "../util/byte_codec.h"
+#include "../ipc/route_relay.h"
+#include "../runtime/runtime_manager.h"
+#include "../util/logging.h"
+#include "../util/number_parse.h"
+#include "../ipc/one_command.h"
+#include "../util/text_list.h"
 
-namespace socketley::storage
+namespace socketley
 {
 
 namespace
 {
 
 constexpr long tick_ns = 250'000'000;
-constexpr const char* full_text = "storage: the notification queue is full, and new events are dropped until its "
-                                  "targets take what waits";
-constexpr const char* full_lost = "storage event(s) were dropped";
+constexpr const char* full_lost = "event(s) to be notified of were dropped";
 
 }   // namespace
 
@@ -121,13 +118,12 @@ bool load_notify_targets(const std::string& path, std::vector<notify_target>& ou
 
 // ─── The notifier ───────────────────────────────────────────────────────────
 
-notifier::notifier(event_loop& loop, file_io& io, io_handler* owner)
-    : m_loop(loop), m_io(io), m_owner(owner), m_box(loop, io, "event outbox")
+notifier::notifier(event_loop& loop, file_io& io, io_handler* owner, std::string who)
+    : m_loop(loop), m_io(io), m_owner(owner), m_who(std::move(who)),
+      m_full_text(m_who + ": the notification queue is full, and new events are dropped until its targets take what "
+                          "waits"),
+      m_box(loop, io, m_who + ": the event outbox")
 {
-    if (const auto v = settings::number<size_t>("SOCKETLEY_STORAGE_NOTIFY_QUEUE"))
-        m_queue_max = *v;
-    if (const char* e = settings::text("SOCKETLEY_STORAGE_NOTIFY_HOSTS"))
-        m_hosts_file = e;
 }
 
 notifier::~notifier()
@@ -146,22 +142,77 @@ void notifier::set_targets(std::vector<notify_target> targets)
         http_endpoint e;
         names = names || (t.k == notify_target::kind::webhook && !literal_endpoint(t.http.host, t.http.port, e));
     }
-    if (names && !m_resolver.attach(m_io))
-        LOG_ERROR("storage: the notification resolver cannot be waited for, so webhooks named by a host are not delivered to");
+    if (names && !resolver_ready())
+        LOG_ERROR((m_who + ": the notification resolver cannot be waited for, so webhooks named by a host are not "
+                   "delivered to").c_str());
     for (notify_target& t : targets)
     {
-        auto l  = std::make_unique<lane>();
-        l->name = t.name;
         if (t.k == notify_target::kind::webhook)
         {
-            l->peer = std::make_unique<http_peer>(m_loop, m_io, m_resolver, t.http, m_hosts_file,
-                                                  "the notification target " + t.name);
-            // Every name is asked for now, so the first event does not wait for its answer.
-            l->peer->prime();
+            make_webhook_lane(std::move(t));
+            continue;
         }
+        auto l  = std::make_unique<lane>();
+        l->name = t.name;
         l->target = std::move(t);
         m_lanes.push_back(std::move(l));
     }
+}
+
+notifier::lane& notifier::make_webhook_lane(notify_target t)
+{
+    auto l  = std::make_unique<lane>();
+    l->name = t.name;
+    l->peer = std::make_unique<http_peer>(m_loop, m_io, m_resolver, t.http, m_hosts_file,
+                                          m_who + ": the notification target " + t.name);
+    // Every name is asked for now, so the first event does not wait for its answer.
+    l->peer->prime();
+    l->used   = std::chrono::steady_clock::now();
+    l->target = std::move(t);
+    m_lanes.push_back(std::move(l));
+    return *m_lanes.back();
+}
+
+bool notifier::resolver_ready()
+{
+    if (!m_resolver_attached)
+        m_resolver_attached = m_resolver.attach(m_io);
+    return m_resolver_attached;
+}
+
+bool notifier::add_webhook(std::string_view url, std::string& why)
+{
+    if (find_lane(url))
+        return true;
+    notify_target t;
+    t.name = std::string(url);
+    t.k    = notify_target::kind::webhook;
+    if (!parse_http_url(url, t.http, why))
+        return false;
+    http_endpoint e;
+    if (!literal_endpoint(t.http.host, t.http.port, e) && !resolver_ready())
+        LOG_ERROR((m_who + ": the notification resolver cannot be waited for, so webhooks named by a host are not "
+                   "delivered to").c_str());
+    make_webhook_lane(std::move(t));
+    return true;
+}
+
+void notifier::forget_idle(std::chrono::steady_clock::duration idle)
+{
+    const auto now = std::chrono::steady_clock::now();
+    // One an event of a change still staged points to stays, as does one with anything owed or under way.
+    const auto staged = [&](const lane* l)
+    {
+        for (const auto& [ticket, evs] : m_staged)
+            for (const auto& [sl, ev] : evs)
+                if (sl == l)
+                    return true;
+        return false;
+    };
+    std::erase_if(m_lanes, [&](const std::unique_ptr<lane>& l)
+    {
+        return l->peer && !l->busy && l->q.empty() && now - l->used > idle && !l->peer->busy() && !staged(l.get());
+    });
 }
 
 void notifier::set_runtimes(runtime_manager* mgr, std::string self)
@@ -224,16 +275,21 @@ uint64_t notifier::reuses() const
     return n;
 }
 
-bool notifier::open(const std::string& dir, uint32_t shard, const outbox::change_made& made, std::string& err)
+bool notifier::open(const std::string& dir, std::string_view sub, uint32_t shard, const outbox::change_made& made,
+                    std::string& err)
 {
-    if (m_lanes.empty())
+    if (m_lanes.empty() && !m_dynamic)
         return true;
     uint64_t dropped = 0;
-    const bool ok = m_box.open(dir, ".notify", shard, made, [&](uint64_t id, std::string_view payload)
+    const bool ok = m_box.open(dir, sub, shard, made, [&](uint64_t id, std::string_view payload)
     {
         bytes::reader r(payload);
-        std::string target, json;
-        lane* l = r.bytes(target, 4096) && r.bytes(json, 8u << 20) ? find_lane(target) : nullptr;
+        std::string target, json, why;
+        const bool read = r.bytes(target, 4096) && r.bytes(json, 8u << 20);
+        lane* l = read ? find_lane(target) : nullptr;
+        // A webhook named by its URL comes back with the first event still owed to it.
+        if (!l && read && m_dynamic && add_webhook(target, why))
+            l = find_lane(target);
         if (!l || m_queued >= m_queue_max)
         {
             ++dropped;
@@ -247,12 +303,12 @@ bool notifier::open(const std::string& dir, uint32_t shard, const outbox::change
         return false;
     m_c.dropped += dropped;
     if (dropped)
-        LOG_WARN(("storage: " + std::to_string(dropped) +
+        LOG_WARN((m_who + ": " + std::to_string(dropped) +
                   " undelivered event(s) in the outbox name a target that is gone or overflow the queue, and are dropped")
                      .c_str());
     if (m_queued)
     {
-        LOG_INFO(("storage: " + std::to_string(m_queued) + " undelivered event(s) are sent again").c_str());
+        LOG_INFO((m_who + ": " + std::to_string(m_queued) + " undelivered event(s) are sent again").c_str());
         for (auto& l : m_lanes)
             start(*l);
     }
@@ -262,11 +318,12 @@ bool notifier::open(const std::string& dir, uint32_t shard, const outbox::change
 bool notifier::add(std::string_view target, std::string json)
 {
     lane* l = find_lane(target);
-    if (!l || m_stopped || !m_full.admit(m_queued, 1, m_queue_max, full_text, full_lost))
+    if (!l || m_stopped || !m_full.admit(m_queued, 1, m_queue_max, m_full_text.c_str(), full_lost))
     {
         ++m_c.dropped;
         return false;
     }
+    l->used = std::chrono::steady_clock::now();
     bytes::writer w;
     w.bytes(target);
     w.bytes(json);
@@ -284,7 +341,7 @@ uint64_t notifier::stage(std::string_view check, std::vector<std::pair<std::stri
     for (auto& [target, json] : events)
     {
         lane* l = find_lane(target);
-        if (!l || m_stopped || !m_full.admit(m_queued + kept.size(), 1, m_queue_max, full_text, full_lost))
+        if (!l || m_stopped || !m_full.admit(m_queued + kept.size(), 1, m_queue_max, m_full_text.c_str(), full_lost))
         {
             ++m_c.dropped;
             continue;
@@ -386,7 +443,7 @@ void notifier::start(lane& l)
     http_request rq;
     rq.head = "POST " + t.path + " HTTP/1.1\r\nHost: " + t.authority() +
               "\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(ev.json.size()) +
-              "\r\nConnection: keep-alive\r\nUser-Agent: socketley-storage\r\nX-Socketley-Event-Id: " +
+              "\r\nConnection: keep-alive\r\nUser-Agent: socketley-" + m_who + "\r\nX-Socketley-Event-Id: " +
               std::to_string(ev.id) + "\r\n\r\n";
     // A webhook says all it has to say in its status, but its whole answer is read so the connection carries the next.
     rq.body      = ev.json;
@@ -496,4 +553,4 @@ void notifier::stop()
     m_box.stop();
 }
 
-}   // namespace socketley::storage
+}   // namespace socketley

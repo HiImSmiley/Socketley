@@ -24,8 +24,9 @@ public:
         std::string dashboard_credentials;
         // Where the history and the alerts told of are kept, empty to keep them in memory only.
         std::string state_dir;
-        // The URL alerts are posted to, empty for none.
+        // The URL alerts are posted to, empty for none, and what takes each message for it.
         std::string alert_webhook;
+        std::function<void(std::string)> alert_send;
         // The idp runtime whose admins sign in to the dashboard, empty for none.
         std::string dashboard_idp;
     };

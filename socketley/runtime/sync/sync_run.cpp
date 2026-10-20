@@ -26,10 +26,10 @@ namespace socketley::sync
 {
 
 namespace fs = std::filesystem;
-using socketley::storage::http_answer;
-using socketley::storage::http_peer;
-using socketley::storage::http_request;
-using socketley::storage::http_target;
+using socketley::http_answer;
+using socketley::http_peer;
+using socketley::http_request;
+using socketley::http_target;
 
 namespace
 {
@@ -249,7 +249,7 @@ bool sync_run::resolve_targets(std::string& why)
         // daemon's map, once that has arrived.
         if (!spec.url.empty())
         {
-            if (!socketley::storage::parse_http_url(spec.url, t.http, why))
+            if (!socketley::parse_http_url(spec.url, t.http, why))
                 return false;
             t.addressed = true;
         }
@@ -298,7 +298,7 @@ bool sync_run::ensure_address(target& t)
             return false;
         }
         std::string why;
-        if (!socketley::storage::parse_http_url("http://127.0.0.1:" + std::to_string(port), t.http, why))
+        if (!socketley::parse_http_url("http://127.0.0.1:" + std::to_string(port), t.http, why))
             return false;
         t.told = false;
     }
@@ -821,7 +821,7 @@ void sync_run::body_from(const target& t, http_request& rq, const std::shared_pt
     // With it they are read a piece at a time, so a file larger than memory still goes.
     auto left = std::make_shared<uint64_t>(len);
     auto at = std::make_shared<uint64_t>(off);
-    rq.source = [left, at, fd](socketley::storage::http_body_give give)
+    rq.source = [left, at, fd](socketley::http_body_give give)
     {
         if (*left == 0)
         {

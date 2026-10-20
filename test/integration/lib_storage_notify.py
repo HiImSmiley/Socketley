@@ -486,8 +486,8 @@ def mode_main(port, hook_port, other_port):
         check("the full queue is said in the log once",
               wait_for(lambda: said("the notification queue is full") == 1, 5), said("the notification queue is full"))
         check("and how many it dropped, once it has room again",
-              wait_for(lambda: said("3 storage event(s) were dropped while it was full") == 1, 5),
-              said("storage event(s) were dropped"))
+              wait_for(lambda: said("3 event(s) to be notified of were dropped while it was full") == 1, 5),
+              said("event(s) to be notified of were dropped"))
 
     s = stats_shards()[0]
     check("stats counts what was sent, failed, queued and dropped",

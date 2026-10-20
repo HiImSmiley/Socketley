@@ -188,9 +188,15 @@ check "a link's ZIP names nothing outside the visitor's folder" "$(zipsafe "$T/z
 python3 - "$HOOK_PORT" "$T/hook" <<'PYEOF2' &
 import http.server, sys
 out = open(sys.argv[2], "a")
+refused = {"n": 0}
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
+        # A hook that fails its first two tries, as one that is restarting does.
+        if self.path.startswith("/flaky") and refused["n"] < 2:
+            refused["n"] += 1
+            self.send_response(500); self.end_headers()
+            return
         out.write(self.path + " " + body.decode() + "\n"); out.flush()
         self.send_response(204); self.end_headers()
     def log_message(self, *a): pass
@@ -210,6 +216,12 @@ check "a download is told to its webhook, at its path" \
       "/hook/x downloaded send/told.txt 1 1 True"
 check "and so is the removal of what burned, once whatever shard sees it" \
       "$(waithook '"event":"deleted"' && sleep 6 && grep -c '"event":"deleted"' "$T/hook")" 1
+# Told once and forgotten at the first failure, a download a hook answered 500 for reached it never.
+printf 'again' | curl -s -u "$A" -T - -o /dev/null "$U/~dav/ann/send/again.txt"
+fl=$(mk "$A" '{"bucket":"ann","key":"send/again.txt","max_downloads":5,"notify":"http://127.0.0.1:'"$HOOK_PORT"'/flaky"}')
+curl -s -o /dev/null "$U/~share/$fl?download"
+check "a webhook that fails is told again until it takes it, once" \
+      "$(waithook '^/flaky ' && sleep 1 && grep -c '^/flaky .*"event":"downloaded"' "$T/hook")" 1
 
 # Links that burn what they name, as a file sent once.
 gone() { for _ in $(seq 1 40); do [ "$(code -u "$A" "$U/~dav/ann/$1")" = 404 ] && { echo gone; return; }; sleep 0.5; done; echo there; }
