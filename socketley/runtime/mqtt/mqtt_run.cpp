@@ -824,7 +824,8 @@ void mqtt_run::flush(conn& c)
     {
         const std::string_view b = c.sending[c.sending_at].view().substr(c.sent);
         c.wr.type    = op_write;
-        c.wr_pending = m_loop.submit_write(c.fd, b.data(), static_cast<uint32_t>(std::min<size_t>(b.size(), 1u << 20)),
+        // All of it, since a write capped at 1 MiB sent a subscriber 1 MiB a turn while the turn queued far more.
+        c.wr_pending = m_loop.submit_write(c.fd, b.data(), static_cast<uint32_t>(std::min<size_t>(b.size(), UINT32_MAX)),
                                            &c.wr);
     }
     else
