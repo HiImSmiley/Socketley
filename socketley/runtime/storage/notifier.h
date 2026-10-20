@@ -22,6 +22,7 @@
 #include "outbound_http.h"
 #include "outbox.h"
 #include "../../shared/ipc/request_channel.h"
+#include "../../shared/loop/backlog_gate.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/loop/hash_pool.h"
@@ -153,6 +154,8 @@ private:
     std::vector<std::unique_ptr<lane>> m_lanes;
     size_t      m_queue_max{default_queue_max};
     uint64_t    m_queued{0};
+    // Says once that events are being dropped at m_queue_max, and how many when the queue is back under half.
+    backlog_gate m_full;
     // The events of each change staged and not yet settled, by ticket, counted in m_queued.
     std::unordered_map<uint64_t, std::vector<std::pair<lane*, pending>>> m_staged;
     notify_counters m_c;

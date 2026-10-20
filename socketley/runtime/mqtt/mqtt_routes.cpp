@@ -417,7 +417,12 @@ void route_table::cut_batches(int64_t now, uint32_t shard, bool force)
 
 void route::push(std::string bytes, size_t limit)
 {
+    // Built only when it may be said, since this runs for every message a rule takes.
+    std::string full;
     if (queue.size() >= limit)
+        full = "mqtt: the rule for " + filter + " holds " + std::to_string(limit) +
+               " requests its target has not taken; the oldest are dropped";
+    if (!gate.admit(queue.size(), 1, limit, full.c_str(), "mqtt rule request(s) were dropped"))
     {
         queue.pop_front();
         ++dropped;

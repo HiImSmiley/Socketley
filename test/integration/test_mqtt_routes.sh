@@ -155,6 +155,37 @@ if phase == "rules":
         got = [w for l in out.splitlines() for w in l.split() if w.startswith("held-")]
         check("and all of them reach it once it is back, once each and in order", got,
               ["held-%d" % i for i in range(5)])
+
+        # Past what a rule holds for a target that is down the oldest go, and the log says so once and then how
+        # many, where the broken build only counted them.
+        import os
+        dlog = os.environ.get("SOCKETLEY_DLOG", "")
+
+        def said(text):
+            try:
+                return open(dlog, errors="replace").read().count(text)
+            except OSError:
+                return -1
+        subprocess.run([binary, "stop", "kv"], capture_output=True, timeout=30)
+        limit, over = 100000, 10
+        body = s("alarm/flood") + b"\x00" + b"f"   # 5.0: no properties
+        pub.sock.sendall((bytes([PUBLISH << 4]) + varint(len(body)) + body) * (limit + over))
+        end = time.time() + 30
+        while time.time() < end and stat_sum(binary, "edge", "rule_1_dropped") < over:
+            time.sleep(0.2)
+        check("a rule holding as much as it may for a stopped target drops the oldest, counted",
+              stat_sum(binary, "edge", "rule_1_dropped"), over)
+        check("and says so in the log once", said("mqtt: the rule for alarm/# holds 100000 requests"), 1)
+        subprocess.run([binary, "start", "kv"], capture_output=True, timeout=30)
+        end = time.time() + 120
+        while time.time() < end and stat_sum(binary, "edge", "rule_1_queued") > limit // 2:
+            time.sleep(0.2)
+        pub.publish("alarm/after", "x", qos=1)
+        end = time.time() + 10
+        while time.time() < end and said("%d mqtt rule request(s) were dropped while it was full" % over) < 1:
+            time.sleep(0.2)
+        check("and how many, once it has room again",
+              said("%d mqtt rule request(s) were dropped while it was full" % over), 1)
         pub.disconnect()
         back.disconnect()
     guarded("rules", rules)
@@ -174,6 +205,7 @@ if phase == "after":
 PY
 }
 
+export SOCKETLEY_DLOG
 tally < <(run rules)
 "$BIN" stop edge >/dev/null 2>&1
 "$BIN" start edge >/dev/null 2>&1

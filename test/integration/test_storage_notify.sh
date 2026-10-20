@@ -72,6 +72,8 @@ echo "hooky.test 127.0.0.1" > "$SOCKETLEY_STORAGE_NOTIFY_HOSTS"
 export SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS=2
 # The bound on what waits, lowered so a test reaches it.
 export SOCKETLEY_STORAGE_NOTIFY_QUEUE=40
+# Read by the library for what the shards said while the bound was reached.
+export SOCKETLEY_DLOG
 # Crash aids for the keys of the staged half alone: killed once an event is durable, and a confirmation never written.
 export SOCKETLEY_STORAGE_KILL_AFTER_EVENT=r/kae/
 export SOCKETLEY_STORAGE_HOLD_CONFIRM=r/hold/

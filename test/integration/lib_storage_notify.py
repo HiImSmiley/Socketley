@@ -473,6 +473,21 @@ def mode_main(port, hook_port, other_port):
         check("and the ones that waited are delivered",
               wait_for(lambda: stat("notify_queued") == 0, 30) and
               sum(1 for _, k, _ in hook.records() if k.startswith("c/flood")) >= QUEUE_MAX, nstats())
+        # Said once when it filled and once, with the count, by the first event after it emptied; on the broken build
+        # the drops were counted and nothing at all was logged.
+        req("PUT", "/%s/c/afterflood" % B, b"x")
+        dlog = os.environ.get("SOCKETLEY_DLOG", "")
+
+        def said(text):
+            try:
+                return open(dlog, errors="replace").read().count(text)
+            except OSError:
+                return -1
+        check("the full queue is said in the log once",
+              wait_for(lambda: said("the notification queue is full") == 1, 5), said("the notification queue is full"))
+        check("and how many it dropped, once it has room again",
+              wait_for(lambda: said("3 storage event(s) were dropped while it was full") == 1, 5),
+              said("storage event(s) were dropped"))
 
     s = stats_shards()[0]
     check("stats counts what was sent, failed, queued and dropped",

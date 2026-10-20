@@ -13,7 +13,9 @@ struct backlog_gate
 
     // Warned once per stall, cleared only at half the cap: a queue held at the
     // cap reopens on every partial send, and clearing there warned per frame.
-    bool admit(size_t pending, size_t add, size_t cap, const char* stalled)
+    // `lost` names what a refusal costs in the line that says it is over.
+    bool admit(size_t pending, size_t add, size_t cap, const char* stalled,
+               const char* lost = "frame(s) were refused")
     {
         if (pending + add > cap)
         {
@@ -27,8 +29,8 @@ struct backlog_gate
         }
         if (full && pending + add <= cap / 2)
         {
-            LOG_WARN(("backlog drained; " + std::to_string(refused) +
-                      " frame(s) were refused while it was full").c_str());
+            LOG_WARN(("backlog drained; " + std::to_string(refused) + " " + lost +
+                      " while it was full").c_str());
             full    = false;
             refused = 0;
         }

@@ -22,6 +22,9 @@ namespace
 {
 
 constexpr long tick_ns = 250'000'000;
+constexpr const char* full_text = "storage: the notification queue is full, and new events are dropped until its "
+                                  "targets take what waits";
+constexpr const char* full_lost = "storage event(s) were dropped";
 
 }   // namespace
 
@@ -259,7 +262,7 @@ bool notifier::open(const std::string& dir, uint32_t shard, const outbox::change
 bool notifier::add(std::string_view target, std::string json)
 {
     lane* l = find_lane(target);
-    if (!l || m_stopped || m_queued >= m_queue_max)
+    if (!l || m_stopped || !m_full.admit(m_queued, 1, m_queue_max, full_text, full_lost))
     {
         ++m_c.dropped;
         return false;
@@ -281,7 +284,7 @@ uint64_t notifier::stage(std::string_view check, std::vector<std::pair<std::stri
     for (auto& [target, json] : events)
     {
         lane* l = find_lane(target);
-        if (!l || m_stopped || m_queued + kept.size() >= m_queue_max)
+        if (!l || m_stopped || !m_full.admit(m_queued + kept.size(), 1, m_queue_max, full_text, full_lost))
         {
             ++m_c.dropped;
             continue;

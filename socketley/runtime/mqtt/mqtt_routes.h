@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "mqtt_broker.h"
+#include "../../shared/loop/backlog_gate.h"
 
 namespace socketley::mqtt
 {
@@ -57,6 +58,7 @@ struct route
     uint64_t delivered{0};
     uint64_t failed{0};
     uint64_t dropped{0};
+    backlog_gate gate;
     // A storage rule's lines gathered for its next object.
     std::string batch;
     size_t   batch_lines{0};
