@@ -110,6 +110,7 @@ private:
     void sync(const std::string& user, const std::shared_ptr<imap_folder>& f, std::string after,
               std::vector<std::pair<std::string, std::pair<uint64_t, int64_t>>> seen);
     void put_object(std::string key, std::string data, std::function<void(bool)> done);
+    void put_made(std::string key, std::string data, std::function<void(bool)> done);
     void delete_object(const std::string& key, std::function<void(bool)> done);
     std::string path_of(const std::string& user) const;
     std::shared_ptr<imap_folder> make_folder(user_state& u, const std::string& name);

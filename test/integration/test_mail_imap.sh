@@ -50,6 +50,20 @@ done
     --tls --cert "$T/cert.pem" --key "$T/key.pem" -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$IM" || bad "the IMAP port listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 
+# Before any mail came, so the storage has no bucket yet: a client's first act may be to put a message in.
+"$BIN" idp-user auth add bob --password bobpassword12 --email bob@example.test >/dev/null 2>&1
+got=$(python3 - "$IM" <<'PY'
+import imaplib, sys
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1]))
+M.login("bob", "bobpassword12")
+typ, data = M.append("INBOX", None, None, b"From: bob@example.test\r\nSubject: kept\r\n\r\nfirst of all\r\n")
+print(typ, data[0].decode(errors="replace"))
+print(M.select("INBOX")[1][0].decode())
+PY
+)
+[[ "$got" == "OK [APPENDUID "*" 1] "*$'\n'1 ]] && ok "APPEND to a mailbox the storage has no bucket for yet" \
+    || bad "APPEND before any mail" "$got"
+
 # Three messages for alice, one of them a multipart.
 python3 - "$P" <<'PY'
 import smtplib, sys

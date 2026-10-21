@@ -41,6 +41,9 @@ public:
     void deliver(const entry_ptr& e, const std::string& user, const std::string& folder, std::string head,
                  std::function<void(int, std::string)> done);
 
+    // The bucket made in the storage runtime, once, before the first write to it.
+    void make_bucket(std::function<void(bool)> then);
+
     // A request to another runtime and its answer, through the runtime's channel.
     void ask(const std::string& target, std::string payload, std::function<void(request_status, std::string_view)> cb);
 
@@ -68,7 +71,6 @@ private:
     void put_piece(const std::shared_ptr<writing>& w);
     void read_on(const std::shared_ptr<writing>& w);
     void finish(const std::shared_ptr<writing>& w, int code, std::string text);
-    void make_bucket(std::function<void(bool)> then);
 
     mail_run& m_run;
     std::string m_storage;

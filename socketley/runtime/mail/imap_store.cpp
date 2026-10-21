@@ -424,6 +424,22 @@ void imap_store::delete_object(const std::string& key, std::function<void(bool)>
 
 void imap_store::put_object(std::string key, std::string data, std::function<void(bool)> done)
 {
+    // A mailbox written by IMAP before any mail came to it has no bucket yet.
+    m_run.boxes()->make_bucket([this, key = std::move(key), data = std::move(data), done = std::move(done),
+                                alive = m_alive](bool made) mutable {
+        if (!*alive)
+            return;
+        if (!made)
+        {
+            done(false);
+            return;
+        }
+        put_made(std::move(key), std::move(data), std::move(done));
+    });
+}
+
+void imap_store::put_made(std::string key, std::string data, std::function<void(bool)> done)
+{
     mailboxes* boxes = m_run.boxes();
     if (data.size() <= rpc::max_value)
     {
