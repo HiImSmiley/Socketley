@@ -222,22 +222,16 @@ std::string quoted_printable(std::string_view text)
         const auto c = static_cast<unsigned char>(text[i]);
         if (c == '\r' && i + 1 < text.size() && text[i + 1] == '\n')
         {
-            // A space or tab before a line's end is encoded, since a mail system may strip it.
-            if (!out.empty() && (out.back() == ' ' || out.back() == '\t'))
-            {
-                const char last = out.back();
-                out.pop_back();
-                out += '=';
-                out += hex[static_cast<unsigned char>(last) >> 4];
-                out += hex[static_cast<unsigned char>(last) & 15];
-            }
             out += "\r\n";
             ++i;
             col = 0;
             continue;
         }
-        const bool literal = (c >= 33 && c <= 126 && c != '=') || c == ' ' || c == '\t';
+        // A space or tab before a line's end is encoded, since a mail system may strip it.
+        const bool line_ends = i + 1 >= text.size() || (text[i + 1] == '\r' && i + 2 < text.size() && text[i + 2] == '\n');
+        const bool literal = (c >= 33 && c <= 126 && c != '=') || ((c == ' ' || c == '\t') && !line_ends);
         const size_t width = literal ? 1 : 3;
+        // Lines of 76 at most, the soft break's '=' among them.
         if (col + width > 75)
         {
             out += "=\r\n";
