@@ -130,10 +130,12 @@ private:
         uint64_t snapshot_bytes{0};
         bool unsynced{false};
         bool compacting{false};
+        // The index's path, worked out once: resolving the state directory costs several syscalls.
+        std::string base;
     };
     user_state& user(const std::string& name);
     // The snapshot and the whole journal read, everything known before forgotten.
-    void reload(const std::string& name, user_state& u);
+    void reload(user_state& u);
     // The journal's lines from `text`, applied; `fresh` says a message they add is \Recent.
     void apply(user_state& u, std::string_view text, bool fresh);
     // `change` made to `u` under the user's lock, the index read to its end first; it appends the lines it logs.
@@ -148,7 +150,7 @@ private:
     void put_made(std::string key, std::string data, std::function<void(bool)> done);
     void delete_object(const std::string& key, std::function<void(bool)> done);
     std::string path_of(const std::string& user) const;
-    void refresh(const std::string& name, user_state& u);
+    void catch_up(user_state& u);
     std::shared_ptr<imap_folder> make_folder(user_state& u, const std::string& name);
 
     mail_run& m_run;

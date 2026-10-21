@@ -61,7 +61,7 @@ void imap_store::flush_now()
     for (auto& [name, u] : m_users)
         if (u.unsynced)
         {
-            const int fd = ::open((path_of(name) + ".log").c_str(), O_WRONLY | O_CLOEXEC);
+            const int fd = ::open((u.base + ".log").c_str(), O_WRONLY | O_CLOEXEC);
             if (fd >= 0)
             {
                 if (::fdatasync(fd) != 0) {}
@@ -102,7 +102,8 @@ imap_store::user_state& imap_store::user(const std::string& name)
     if (!u.loaded)
     {
         u.loaded = true;
-        reload(name, u);
+        u.base = path_of(name);
+        reload(u);
         // The folders every mailbox has, logged by the first shard to want them so every shard has their UIDVALIDITY.
         bool missing = false;
         for (const auto& [f, use] : special())
@@ -234,10 +235,10 @@ void imap_store::apply(user_state& u, std::string_view text, bool fresh)
     }
 }
 
-void imap_store::reload(const std::string& name, user_state& u)
+void imap_store::reload(user_state& u)
 {
     // Under the user's lock, shared, so a compaction is not caught between its snapshot and its journal.
-    const std::string base = path_of(name);
+    const std::string& base = u.base;
     const int lock = ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lock >= 0 && ::flock(lock, LOCK_SH) != 0) {}
     std::map<std::string, std::shared_ptr<imap_folder>> before = std::move(u.folders);
@@ -341,22 +342,22 @@ void imap_store::reload(const std::string& name, user_state& u)
 void imap_store::refresh(const std::string& name)
 {
     if (const auto it = m_users.find(name); it != m_users.end() && it->second.loaded)
-        refresh(name, it->second);
+        catch_up(it->second);
 }
 
-void imap_store::refresh(const std::string& name, user_state& u)
+void imap_store::catch_up(user_state& u)
 {
-    const std::string log = path_of(name) + ".log";
+    const std::string log = u.base + ".log";
     struct stat st{};
     if (::stat(log.c_str(), &st) != 0)
     {
         if (u.log_ino)
-            reload(name, u);
+            reload(u);
         return;
     }
     if (st.st_ino != u.log_ino || static_cast<uint64_t>(st.st_size) < u.log_off)
     {
-        reload(name, u);
+        reload(u);
         return;
     }
     if (static_cast<uint64_t>(st.st_size) == u.log_off)
@@ -381,13 +382,15 @@ void imap_store::refresh(const std::string& name, user_state& u)
 void imap_store::mutate(const std::string& name, const std::function<void(user_state&, std::string& lines)>& change)
 {
     user_state& u = m_users[name];
-    const std::string base = path_of(name);
+    if (u.base.empty())
+        u.base = path_of(name);
+    const std::string& base = u.base;
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(base).parent_path(), ec);
     // Held only for a read of what is new and an append: no shard waits on another's disk.
     const int lock = ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lock >= 0 && ::flock(lock, LOCK_EX) != 0) {}
-    refresh(name, u);
+    catch_up(u);
     std::string lines;
     change(u, lines);
     if (!lines.empty())
@@ -435,7 +438,7 @@ void imap_store::compact(const std::string& name, user_state& u)
     auto done = std::make_shared<bool>(false);
     m_run.pool().submit(
         0,
-        [base = path_of(name), text = std::move(text), gen, expect = u.log_off, ino = u.log_ino, done] {
+        [base = u.base, text = std::move(text), gen, expect = u.log_off, ino = u.log_ino, done] {
             const int lock = ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
             if (lock < 0 || ::flock(lock, LOCK_EX) != 0)
             {
@@ -462,7 +465,7 @@ void imap_store::compact(const std::string& name, user_state& u)
             it->second.compacting = false;
             // The new journal is another file, which the next refresh reads from its start.
             if (*done)
-                reload(name, it->second);
+                reload(it->second);
         });
 }
 
@@ -492,11 +495,11 @@ void imap_store::tick(int64_t)
     {
         if (!u.loaded)
             continue;
-        refresh(name, u);
+        catch_up(u);
         if (u.unsynced)
         {
             u.unsynced = false;
-            m_run.pool().submit(0, [log = path_of(name) + ".log"] {
+            m_run.pool().submit(0, [log = u.base + ".log"] {
                 const int fd = ::open(log.c_str(), O_WRONLY | O_CLOEXEC);
                 if (fd >= 0)
                 {
@@ -555,7 +558,7 @@ void imap_store::folders(const std::string& name, std::function<void(std::vector
 uint64_t imap_store::usage(const std::string& name)
 {
     user_state& u = user(name);
-    refresh(name, u);
+    catch_up(u);
     uint64_t total = 0;
     for (const auto& [n, f] : u.folders)
         for (const auto& m : f->msgs)
@@ -631,7 +634,7 @@ void imap_store::open(const std::string& name, const std::string& folder,
     if (f->syncing)
         return;
     f->syncing = true;
-    refresh(name, u);
+    catch_up(u);
     f->sync_from = f->highestmodseq;
     sync(name, f, {}, {});
 }
