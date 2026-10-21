@@ -18,6 +18,7 @@
 #include "../idp/idp_session.h"
 #include "../storage/password_hash.h"
 #include "../../shared/crypto/tls_context.h"
+#include "../../shared/json/json_escape.h"
 #include "../../shared/net/dns_feed.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/persist/replaced_file.h"
@@ -269,6 +270,37 @@ bool mail_run::start(std::string& why)
     m_mailboxes = std::make_unique<mailboxes>(*this);
     if (!m_mailboxes->configure(why))
         return false;
+    if (const std::string path(m_owner.get_notify_targets()); !path.empty())
+    {
+        std::vector<socketley::notify_target> targets;
+        if (!socketley::load_notify_targets(path, targets, why))
+            return false;
+        for (const auto& t : targets)
+            m_notify_names.push_back(t.name);
+        m_notify = std::make_unique<socketley::notifier>(m_loop, m_fio, this, "mail " + std::string(m_owner.get_name()));
+        m_notify->set_targets(std::move(targets));
+        m_notify->set_runtimes(m_owner.get_runtime_manager(), std::string(m_owner.get_name()));
+        if (!m_notify->open(m_state_dir, ".notify", m_owner.get_shard_index(), [](std::string_view) { return true; },
+                            why))
+            return false;
+        m_mailboxes->on_stored = [this](const mailboxes::stored_info& s) {
+            std::string j = "{\"event\":\"mail.received\",\"id\":";
+            socketley::json::quote_into(j, s.id);
+            j += ",\"mailbox\":";
+            socketley::json::quote_into(j, s.user);
+            j += ",\"folder\":";
+            socketley::json::quote_into(j, s.folder);
+            j += ",\"key\":";
+            socketley::json::quote_into(j, s.key);
+            j += ",\"from\":";
+            socketley::json::quote_into(j, s.from);
+            j += ",\"subject\":";
+            socketley::json::quote_into(j, s.subject);
+            j += ",\"size\":" + std::to_string(s.size) + "}";
+            for (const auto& n : m_notify_names)
+                m_notify->add(n, j, "mail/" + s.user);
+        };
+    }
     m_delivery = std::make_unique<delivery>(*this);
     if (!m_delivery->start(why))
         return false;
@@ -331,6 +363,8 @@ void mail_run::stop()
         mgr->requests().drop_origin(this);
     if (m_delivery)
         m_delivery->stop();
+    if (m_notify)
+        m_notify->stop();
     std::vector<conn*> all;
     for (auto& [id, c] : m_conns)
         all.push_back(c.get());
@@ -1112,7 +1146,9 @@ void mail_run::on_cqe(struct io_uring_cqe* cqe)
     auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
     if (!req)
         return;
-    if (file_io::owns_type(req->type))
+    if (m_notify && m_notify->owns(req))
+        m_notify->on_timer();
+    else if (file_io::owns_type(req->type))
         m_fio.on_cqe(cqe);
     else if (req == &m_tick_req)
     {

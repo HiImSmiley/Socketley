@@ -36,6 +36,7 @@ PI=$((SL_PORT_BASE+1962))
 PS=$((SL_PORT_BASE+1963))
 SINK=$((SL_PORT_BASE+1964))
 NS=$((SL_PORT_BASE+1965))
+HOOK=$((SL_PORT_BASE+1966))
 PIDS=()
 cleanup() {
     for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
@@ -58,6 +59,19 @@ mkdir -p "$T/sink"
 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/sink" >/dev/null 2>&1 &
 PIDS+=($!)
 ready_tcp 127.0.0.1 "$SINK" || bad "the sink listens" "-"
+python3 - "$HOOK" "$T/hook.log" <<'PY' &
+import http.server, sys
+out = open(sys.argv[2], "a")
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        b = self.rfile.read(int(self.headers.get("content-length", 0)))
+        out.write(b.decode(errors="replace").replace("\n", " ") + "\n"); out.flush()
+        self.send_response(204); self.end_headers()
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+PIDS+=($!)
+printf 'hook http://127.0.0.1:%s/mail\n' "$HOOK" > "$T/targets"
 daemon_start "$BIN"
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=mail.example.test" \
@@ -70,6 +84,7 @@ for p in "$PI/jwks" "$PS/"; do
 done
 "$BIN" idp-user auth add alice --password alicepassword1 --email alice@example.test >/dev/null 2>&1
 "$BIN" create mail m -p "$P" --mail-domain example.test --idp auth --storage st/mail --submission "$SUB" \
+    --notify-targets "$T/targets" \
     --tls --cert "$T/cert.pem" --key "$T/key.pem" -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$P" || bad "the mail runtime listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 
@@ -114,6 +129,9 @@ printf '%s' "$body" | grep -q '^Return-Path: <carol@else.test>' && printf '%s' "
 printf '%s' "$body" | grep -q '^Authentication-Results: mail.example.test; spf=pass smtp.mailfrom=else.test; dkim=none; dmarc=none' \
     && ok "with what SPF, DKIM and DMARC said" || bad "with what SPF, DKIM and DMARC said" "$(printf '%s' "$body" | grep Authentication-Results)"
 check "and none forged under this host's name" "$(printf '%s' "$body" | grep -c 'forged')" "0"
+for _ in $(seq 1 50); do grep -q 'hello alice' "$T/hook.log" 2>/dev/null && break; sleep 0.1; done
+grep -q '"event":"mail.received".*"mailbox":"alice","folder":"INBOX".*"subject":"hello alice"' "$T/hook.log" 2>/dev/null \
+    && ok "and a webhook of --notify-targets is told of it" || bad "and a webhook of --notify-targets is told of it" "$(cat "$T/hook.log" 2>&1)"
 
 # ─── DMARC ──────────────────────────────────────────────────────────────────
 printf 'From: boss@evil.test\r\nTo: alice@example.test\r\nSubject: wire money\r\n\r\nplease\r\n' > "$T/m2"

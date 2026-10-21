@@ -346,7 +346,16 @@ void mailboxes::finish(const std::shared_ptr<writing>& w, int code, std::string 
     if (!w->done)
         return;
     if (code / 100 == 2)
+    {
         ++m_stored;
+        if (on_stored)
+        {
+            const size_t slash = w->key.find('/');
+            const size_t slash2 = w->key.find('/', slash + 1);
+            on_stored({w->e->id, w->key.substr(0, slash), w->key.substr(slash + 1, slash2 - slash - 1), w->key,
+                       w->from, w->subject, w->total});
+        }
+    }
     else
         ++m_store_failures;
     auto done = std::move(w->done);

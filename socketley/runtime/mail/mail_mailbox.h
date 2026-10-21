@@ -44,6 +44,14 @@ public:
     // A request to another runtime and its answer, through the runtime's channel.
     void ask(const std::string& target, std::string payload, std::function<void(request_status, std::string_view)> cb);
 
+    // A message is in a mailbox, told to whoever --notify-targets names.
+    struct stored_info
+    {
+        std::string id, user, folder, key, from, subject;
+        uint64_t size{0};
+    };
+    std::function<void(const stored_info&)> on_stored;
+
     uint64_t stored() const { return m_stored; }
     uint64_t store_failures() const { return m_store_failures; }
 

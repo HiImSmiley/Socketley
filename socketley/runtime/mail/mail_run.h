@@ -21,6 +21,7 @@
 #include "mail_spool.h"
 #include "smtp_session.h"
 #include "../../shared/crypto/password_file.h"
+#include "../../shared/http/notifier.h"
 #include "../../shared/ipc/request_channel.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
@@ -205,6 +206,9 @@ private:
     std::unique_ptr<socketley::idp::session_verifier> m_idp;
     std::unique_ptr<delivery> m_delivery;
     std::unique_ptr<mailboxes> m_mailboxes;
+    // Each message stored in a mailbox, told to the targets of --notify-targets.
+    std::unique_ptr<socketley::notifier> m_notify;
+    std::vector<std::string> m_notify_names;
     socketley::watched<socketley::user_table> m_users;
     socketley::watched<alias_table> m_aliases;
     std::string m_hostname;
