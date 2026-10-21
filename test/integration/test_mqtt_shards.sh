@@ -229,7 +229,8 @@ if phase in ("stall", "hang"):
         return pub, None
 
     def counted():
-        out = subprocess.run([binary, "stats", "fl"], capture_output=True, timeout=10).stdout.decode()
+        # What is counted, not how soon: a sanitized gate beside others was seen past 10 s where alone it takes 0.2.
+        out = subprocess.run([binary, "stats", "fl"], capture_output=True, timeout=30).stdout.decode()
         got = {"shard_dropped": 0, "dropped": 0}
         for line in out.splitlines():
             k, _, v = line.partition(":")
