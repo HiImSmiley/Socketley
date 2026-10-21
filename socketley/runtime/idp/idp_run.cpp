@@ -1,5 +1,7 @@
 #include "idp_run.h"
 
+#include "../../shared/util/ascii.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
@@ -1382,6 +1384,39 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
         return;
     }
     const std::string user = args[1];
+    // A mail runtime asking whether an address is a user's, and whether a password it was given is theirs: by the
+    // username, or the address being the account's email.
+    const auto named = [this](std::string_view name) -> const account* {
+        if (const account* a = m_accounts.by_name(name))
+            return a;
+        const size_t at = name.find('@');
+        if (at == std::string_view::npos)
+            return nullptr;
+        for (const account* a : m_accounts.all())
+            if (socketley::ascii::iequals(a->field("email"), name))
+                return a;
+        return m_accounts.by_name(name.substr(0, at));
+    };
+    if (action == "lookup")
+    {
+        const account* who = named(user);
+        answer_command(ticket, who && !who->disabled() ? "ok " + std::string(who->username()) + "\t" +
+                                                             std::string(who->field("email"))
+                                                       : std::string("none"));
+        return;
+    }
+    if (action == "verify")
+    {
+        const account* who = named(user);
+        if (who && who->disabled())
+            who = nullptr;
+        const std::string name = who ? std::string(who->username()) : std::string();
+        const std::string email = who ? std::string(who->field("email")) : std::string();
+        check_password(who, args.size() > 2 ? args[2] : std::string(), [this, ticket, name, email](bool ok) {
+            answer_command(ticket, ok ? "ok " + name + "\t" + email : std::string("error: no"));
+        });
+        return;
+    }
     if (action == "add")
     {
         field_list fields{{"username", user}, {"created", std::to_string(wall::now_sec())}};
