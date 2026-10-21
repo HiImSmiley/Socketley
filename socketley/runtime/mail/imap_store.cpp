@@ -239,7 +239,7 @@ void imap_store::reload(user_state& u)
 {
     // Under the user's lock, shared, so a compaction is not caught between its snapshot and its journal.
     const std::string& base = u.base;
-    const int lock = ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    const int lock = u.locked ? -1 : ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lock >= 0 && ::flock(lock, LOCK_SH) != 0) {}
     std::map<std::string, std::shared_ptr<imap_folder>> before = std::move(u.folders);
     u.folders.clear();
@@ -388,8 +388,10 @@ void imap_store::mutate(const std::string& name, const std::function<void(user_s
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(base).parent_path(), ec);
     // Held only for a read of what is new and an append: no shard waits on another's disk.
-    const int lock = ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    const int lock = u.locked ? -1 : ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lock >= 0 && ::flock(lock, LOCK_EX) != 0) {}
+    const bool outer = !u.locked;
+    u.locked = true;
     catch_up(u);
     std::string lines;
     change(u, lines);
@@ -417,6 +419,8 @@ void imap_store::mutate(const std::string& name, const std::function<void(user_s
         if (fd >= 0)
             ::close(fd);
     }
+    if (outer)
+        u.locked = false;
     if (lock >= 0)
         ::close(lock);
 }
@@ -469,9 +473,10 @@ void imap_store::compact(const std::string& name, user_state& u)
         });
 }
 
-void imap_store::set_flags(const std::string& name, const std::shared_ptr<imap_folder>& f,
-                           const std::vector<uint32_t>& uids, const std::function<uint8_t(uint8_t)>& change)
+size_t imap_store::set_flags(const std::string& name, const std::shared_ptr<imap_folder>& f,
+                             const std::vector<uint32_t>& uids, const std::function<uint8_t(uint8_t)>& change)
 {
+    size_t changed = 0;
     mutate(name, [&](user_state&, std::string& lines) {
         for (const uint32_t uid : uids)
             if (imap_message* m = f->by_uid(uid))
@@ -479,6 +484,7 @@ void imap_store::set_flags(const std::string& name, const std::shared_ptr<imap_f
                 const uint8_t now = change(m->flags);
                 if (now == m->flags)
                     continue;
+                ++changed;
                 m->flags = now;
                 m->modseq = ++f->highestmodseq;
                 lines += "S " + std::to_string(uid) + " " + std::to_string(now) + " " + std::to_string(m->modseq) + " " +
@@ -487,6 +493,7 @@ void imap_store::set_flags(const std::string& name, const std::shared_ptr<imap_f
         if (!lines.empty())
             ++f->version;
     });
+    return changed;
 }
 
 void imap_store::tick(int64_t)
@@ -898,6 +905,13 @@ uint32_t imap_store::add_message(const std::string& name, const std::shared_ptr<
 {
     uint32_t uid = 0;
     mutate(name, [&](user_state&, std::string& lines) {
+        // A shard that listed the bucket while the object was on its way has given it a UID already.
+        for (auto it = f->msgs.rbegin(); it != f->msgs.rend(); ++it)
+            if (it->key == key)
+            {
+                uid = it->uid;
+                return;
+            }
         imap_message m{f->uidnext++, key, size, date_ms, flags, true, ++f->highestmodseq};
         uid = m.uid;
         lines += "A " + std::to_string(m.uid) + " " + std::to_string(m.flags) + " " + std::to_string(m.size) + " " +
@@ -909,12 +923,13 @@ uint32_t imap_store::add_message(const std::string& name, const std::shared_ptr<
 }
 
 void imap_store::expunge(const std::string& name, const std::shared_ptr<imap_folder>& f,
-                         const std::vector<uint32_t>& only, std::function<void(std::vector<uint32_t>)> done)
+                         const std::vector<uint32_t>& only, bool any, std::function<void(std::vector<uint32_t>)> done)
 {
     refresh(name);
     std::vector<std::pair<uint32_t, std::string>> going;
     for (const auto& m : f->msgs)
-        if ((m.flags & flag_deleted) && (only.empty() || std::find(only.begin(), only.end(), m.uid) != only.end()))
+        if ((any || (m.flags & flag_deleted)) &&
+            (only.empty() || std::find(only.begin(), only.end(), m.uid) != only.end()))
             going.emplace_back(m.uid, m.key);
     if (going.empty())
     {
@@ -1053,15 +1068,7 @@ void imap_store::remove(const std::string& name, const std::string& folder, std:
             done(false);
             return;
         }
-        for (auto& m : f->msgs)
-            m.flags |= flag_deleted;
-        expunge(name, f, {}, [this, name, fname, done](std::vector<uint32_t>) {
-            mutate(name, [&](user_state& u, std::string& lines) {
-                if (u.folders.erase(fname))
-                    lines += "D " + fname + "\n";
-            });
-            done(true);
-        });
+        empty_out(name, f, fname, {}, 4, done);
     }, true);
 }
 
@@ -1080,18 +1087,47 @@ void imap_store::rename(const std::string& name, const std::string& from, const 
             done(false);
             return;
         }
-        std::vector<uint32_t> uids;
-        for (const auto& m : f->msgs)
-            uids.push_back(m.uid);
-        copy(name, f, uids, b, [this, name, a, done](bool ok, uint32_t, std::vector<uint32_t>) {
-            if (!ok)
-            {
-                done(false);
-                return;
-            }
-            remove(name, a, done);
-        });
+        empty_out(name, f, a, b, 4, done);
     }, true);
+}
+
+void imap_store::empty_out(const std::string& name, const std::shared_ptr<imap_folder>& f, const std::string& fname,
+                           const std::string& to, int passes, std::function<void(bool)> done)
+{
+    refresh(name);
+    std::vector<uint32_t> uids;
+    for (const auto& m : f->msgs)
+        uids.push_back(m.uid);
+    if (uids.empty() || passes == 0)
+    {
+        bool gone = false;
+        mutate(name, [&](user_state& u, std::string& lines) {
+            // A message that came in while the last pass ran keeps the folder.
+            if (!f->msgs.empty())
+                return;
+            if (u.folders.erase(fname))
+                lines += "D " + fname + "\n";
+            gone = true;
+        });
+        done(gone);
+        return;
+    }
+    const auto expunge_them = [this, name, f, fname, to, passes, done, uids] {
+        expunge(name, f, uids, true, [this, name, f, fname, to, passes, done](std::vector<uint32_t>) {
+            empty_out(name, f, fname, to, passes - 1, done);
+        });
+    };
+    if (to.empty())
+    {
+        expunge_them();
+        return;
+    }
+    copy(name, f, uids, to, [expunge_them, done](bool ok, uint32_t, std::vector<uint32_t>) {
+        if (ok)
+            expunge_them();
+        else
+            done(false);
+    });
 }
 
 }   // namespace socketley::mail

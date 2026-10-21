@@ -368,6 +368,153 @@ check "forty APPENDs from eight connections across the shards fail none" "${1:-x
 [ "${2:-}" = True ] && [ "${3:-}" = True ] && ok "and every connection sees the same forty UIDs, each one message" \
     || bad "and every connection sees the same forty UIDs, each one message" "$r"
 check "a flag one shard sets the others see" "${4:-x}" "5"
+# A FETCH that marks \Seen as it reads, while other shards append and unmark: what they log, and the snapshot their
+# flood folds the journal into, move the folder's messages under it.
+r=$(python3 - "$IMSH" <<'PY'
+import imaplib, sys, threading, time
+port = int(sys.argv[1])
+errs = []
+stop = threading.Event()
+def conn():
+    # A shard that stops answering is a failure here, not a test that never ends.
+    M = imaplib.IMAP4("127.0.0.1", port, timeout=60); M.login("alice", "alicepassword1"); return M
+def appender(i):
+    try:
+        M = conn()
+        for k in range(70):
+            M.append("Shared", None, None, b"From: y@else.test\r\nSubject: more %d-%d\r\n\r\nm\r\n" % (i, k))
+        M.logout()
+    except Exception as e:
+        errs.append(repr(e))
+def unmarker():
+    try:
+        U = conn(); U.select("Shared")
+        i = 0
+        while not stop.is_set():
+            U.uid("STORE", "1:*", "-FLAGS.SILENT" if i % 2 == 0 else "+FLAGS.SILENT",
+                  "(\\Seen \\Flagged)" if i % 2 == 0 else "(\\Flagged)")
+            i += 1
+    except Exception as e:
+        errs.append(repr(e))
+R = conn(); R.select("Shared")
+ts = [threading.Thread(target=appender, args=(i,)) for i in range(6)] + \
+     [threading.Thread(target=unmarker) for _ in range(2)]
+[t.start() for t in ts]
+reads = loops = 0
+end = time.time() + 8
+try:
+    while time.time() < end:
+        loops += 1
+        typ, data = R.fetch("1:*", "(BODY[])")
+        reads += typ == "OK"
+except Exception as e:
+    errs.append(repr(e))
+stop.set(); [t.join() for t in ts]
+typ, data = conn().uid("SEARCH", "UNSEEN") if errs else R.uid("SEARCH", "UNSEEN")
+print(len(errs), reads == loops, typ)
+PY
+)
+check "a FETCH that marks \\Seen while other shards append and unmark runs to its end" "$r" "0 True OK"
+# APPENDs of large messages, each logged once the storage has it, while other shards flood the journal past the size
+# it is folded at: a shard that finds the journal folded as it logs reads the new one under the lock it holds.
+r=$(python3 - "$IMSH" <<'PY'
+import imaplib, sys, threading, time
+port = int(sys.argv[1])
+errs = []
+stop = threading.Event()
+def conn():
+    M = imaplib.IMAP4("127.0.0.1", port, timeout=30); M.login("alice", "alicepassword1"); return M
+M = conn(); M.create("Bulk"); M.create("Flood")
+for k in range(60):
+    M.append("Flood", None, None, b"Subject: flood %d\r\n\r\nf\r\n" % k)
+big = b"Subject: bulk\r\n\r\n" + (b"b" * 78 + b"\r\n") * 25000
+appended = []
+def appender():
+    try:
+        A = conn()
+        for _ in range(8):
+            appended.append(A.append("Bulk", None, None, big)[0])
+    except Exception as e:
+        errs.append(repr(e))
+def flooder():
+    try:
+        F = conn(); F.select("Flood")
+        i = 0
+        while not stop.is_set():
+            F.uid("STORE", "1:*", "+FLAGS.SILENT" if i % 2 == 0 else "-FLAGS.SILENT", "(\\Answered)")
+            i += 1
+    except Exception as e:
+        errs.append(repr(e))
+fs = [threading.Thread(target=flooder) for _ in range(3)]
+aps = [threading.Thread(target=appender) for _ in range(4)]
+[t.start() for t in fs + aps]
+[t.join() for t in aps]
+stop.set(); [t.join() for t in fs]
+print(len(errs), appended.count("OK"), errs[:1])
+PY
+)
+check "thirty-two large APPENDs while three shards flood the journal past its fold all go in" "$r" "0 32 []"
+# MOVE and DELETE while other shards change the same messages' flags: what they log must not undo what goes.
+r=$(python3 - "$IMSH" <<'PY'
+import imaplib, sys, threading
+port = int(sys.argv[1])
+def conn():
+    M = imaplib.IMAP4("127.0.0.1", port, timeout=60); M.login("alice", "alicepassword1"); return M
+def count(M, folder):
+    typ, data = M.status(folder, "(MESSAGES)")
+    return int(data[0].split(b"MESSAGES ")[1].split(b")")[0]) if typ == "OK" else -1
+M = conn()
+for f in ("Src", "Dst", "Doomed"):
+    M.create(f)
+for k in range(30):
+    M.append("Src", None, None, b"From: m@else.test\r\nSubject: move %d\r\n\r\nm\r\n" % k)
+    M.append("Doomed", None, None, b"From: m@else.test\r\nSubject: doomed %d\r\n\r\nd\r\n" % k)
+def flagger(folder, stop, going):
+    try:
+        F = conn(); F.select(folder)
+        i = 0
+        while not stop.is_set():
+            F.uid("STORE", "1:*", "+FLAGS.SILENT" if i % 2 == 0 else "-FLAGS.SILENT", "(\\Flagged)")
+            i += 1
+            going.release()
+    except Exception:
+        pass
+def flip(folder):
+    stop, going = threading.Event(), threading.Semaphore(0)
+    ts = [threading.Thread(target=flagger, args=(folder, stop, going)) for _ in range(2)]
+    [t.start() for t in ts]
+    # Both are flipping before the folder's messages go.
+    for _ in range(4):
+        going.acquire(timeout=10)
+    return stop, ts
+stop, ts = flip("Src")
+M.select("Src")
+for u in M.uid("SEARCH", "ALL")[1][0].split():
+    M.uid("MOVE", u, "Dst")
+stop.set(); [t.join() for t in ts]
+moved = (count(M, "Src"), count(M, "Dst"))
+M.select("INBOX")
+stop, ts = flip("Doomed")
+typ, _ = M.delete("Doomed")
+stop.set(); [t.join() for t in ts]
+N = conn()
+listed = any(b"Doomed" in l for l in N.list()[1])
+print(moved[0], moved[1], typ, listed)
+PY
+)
+check "thirty MOVEs and a DELETE while two shards flip the messages' flags leave none behind" "$r" "0 30 OK False"
+# A sequence set of an empty folder names nothing, its * included.
+r=$(python3 - "$IMSH" <<'PY'
+import imaplib, sys
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1])); M.login("alice", "alicepassword1"); M.create("Empty")
+M.select("Empty")
+try:
+    print(M.fetch("1:*", "(FLAGS)")[0], M.fetch("*", "(FLAGS)")[0], M.store("1:*", "+FLAGS", "(\\Seen)")[0], M.noop()[0])
+except Exception as e:
+    print("gone", repr(e))
+PY
+)
+check "FETCH 1:*, FETCH * and STORE 1:* of an empty folder answer OK" "$r" "OK OK OK OK"
 # Thousands of changes outgrow the journal, which is folded into a snapshot; every shard reads on from it.
 r=$(python3 - "$IMSH" <<'PY'
 import imaplib, sys, time
@@ -391,6 +538,24 @@ idx=$(find "$HOME/.local/share" -path '*/mail/msh.imap/alice' 2>/dev/null | head
     || bad "a journal past a quarter of a mebibyte is folded into its snapshot" "$(head -c 20 "$idx" 2>/dev/null) $(stat -c %s "$idx.log" 2>/dev/null)"
 check "and every shard reads the same flags after" "$r" "1 True"
 
+# A literal inside a literal names a length that wraps past the end: the command is refused, the connection answers.
+r=$(python3 - "$IM" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3); f = s.makefile("rb"); f.readline()
+# The inner literal's length is 2^64 less where its bytes would begin, so begin plus length is 0.
+inner_at = len(b"a X Y{27}\r\n") + 1 + 1 + 20 + 3
+content = b" {%d}\r\nzz" % (2 ** 64 - inner_at)
+assert len(content) == 27
+s.sendall(b"a X Y{27}\r\n")
+try:
+    f.readline()
+    s.sendall(content + b"\r\nb NOOP\r\n")
+    print(" ".join(f.readline()[:5].decode(errors="replace") for _ in range(2)))
+except Exception as e:
+    print("no answer", repr(e))
+PY
+)
+check "a literal's length that wraps is refused, and the next command answered" "$r" "a BAD b OK "
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

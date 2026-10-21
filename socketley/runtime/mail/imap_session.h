@@ -101,7 +101,8 @@ private:
     void cmd_copy(const std::string& tag, const std::vector<token>& a, size_t from, bool uid, bool move);
     // SORT, or THREAD where `thread` says, over what the search criteria find.
     void cmd_order(const std::string& tag, const std::vector<token>& a, size_t from, bool uid, bool thread);
-    void cmd_expunge(const std::string& tag, const std::vector<uint32_t>& only, bool silent, std::string_view done_text);
+    // Those of `only` with \Deleted expunged, or with `moved` every one of them, as MOVE takes what it copied.
+    void cmd_expunge(const std::string& tag, const std::vector<uint32_t>& only, bool moved, std::string_view done_text);
 
     // The messages of a sequence set, as indexes into the view; false for one that is not a set.
     bool parse_set(std::string_view set, bool uid, std::vector<size_t>& out) const;

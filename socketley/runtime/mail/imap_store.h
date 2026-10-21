@@ -99,12 +99,14 @@ public:
 
     // What other shards changed in `user`'s index read in; a stat where they changed nothing.
     void refresh(const std::string& user);
-    // The flags of `uids` in `f` made what `change` makes of each, logged; those it changes get the next modseq.
-    void set_flags(const std::string& user, const std::shared_ptr<imap_folder>& f, const std::vector<uint32_t>& uids,
+    // The flags of `uids` in `f` made what `change` makes of each, logged; those it changes get the next modseq, and
+    // how many it changed is answered.
+    size_t set_flags(const std::string& user, const std::shared_ptr<imap_folder>& f, const std::vector<uint32_t>& uids,
                    const std::function<uint8_t(uint8_t)>& change);
-    // Those with \Deleted among `uids`, or every one where `uids` is empty, removed from the bucket and the folder.
+    // Those with \Deleted among `only`, or of the folder where it is empty, removed from the bucket and the folder;
+    // with `any` whatever their flags, since a flag set in memory alone is lost to what another shard logs.
     void expunge(const std::string& user, const std::shared_ptr<imap_folder>& f, const std::vector<uint32_t>& only,
-                 std::function<void(std::vector<uint32_t> gone)> done);
+                 bool any, std::function<void(std::vector<uint32_t> gone)> done);
     // Copies into another folder, answering the new UIDs in the order of `uids`.
     void copy(const std::string& user, const std::shared_ptr<imap_folder>& from, const std::vector<uint32_t>& uids,
               const std::string& to, std::function<void(bool, uint32_t uidvalidity, std::vector<uint32_t>)> done);
@@ -130,6 +132,8 @@ private:
         uint64_t snapshot_bytes{0};
         bool unsynced{false};
         bool compacting{false};
+        // Held by this shard in mutate, which a reload inside does not take again: a second flock waits on the first.
+        bool locked{false};
         // The index's path, worked out once: resolving the state directory costs several syscalls.
         std::string base;
     };
@@ -149,6 +153,10 @@ private:
     void put_object(std::string key, std::string data, std::function<void(bool)> done);
     void put_made(std::string key, std::string data, std::function<void(bool)> done);
     void delete_object(const std::string& key, std::function<void(bool)> done);
+    // `f` emptied, its messages copied to `to` first where it names a folder, and its D logged; again for what came in
+    // meanwhile, `passes` times at most.
+    void empty_out(const std::string& name, const std::shared_ptr<imap_folder>& f, const std::string& fname,
+                   const std::string& to, int passes, std::function<void(bool)> done);
     std::string path_of(const std::string& user) const;
     void catch_up(user_state& u);
     std::shared_ptr<imap_folder> make_folder(user_state& u, const std::string& name);

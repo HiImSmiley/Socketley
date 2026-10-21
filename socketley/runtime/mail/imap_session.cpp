@@ -388,7 +388,7 @@ bool imap_session::tokenize(std::string_view s, std::vector<token>& out) const
                 num.remove_suffix(1);
             const size_t n = std::strtoull(std::string(num).c_str(), nullptr, 10);
             const size_t start = close + 3;
-            if (s.substr(close + 1, 2) != "\r\n" || start + n > s.size())
+            if (s.substr(close + 1, 2) != "\r\n" || n > s.size() - start)
                 return false;
             out.push_back({token::string, std::string(s.substr(start, n))});
             i = start + n;
@@ -663,7 +663,8 @@ bool imap_session::parse_set(std::string_view set, bool uid, std::vector<size_t>
         {
             if (b > count && !(count == 0 && one.find('*') != std::string_view::npos))
                 return false;
-            for (uint64_t i = a; i <= b && i <= count; ++i)
+            // A * of an empty folder is 0, which names no message.
+            for (uint64_t i = std::max<uint64_t>(a, 1); i <= b && i <= count; ++i)
                 take[i - 1] = true;
         }
     }
@@ -875,7 +876,7 @@ void imap_session::command(std::string tag, std::vector<token> a)
         }
         // CLOSE expunges without telling the client what went.
         m_waiting = true;
-        m_store.expunge(m_user, m_folder, {}, [this, alive = m_alive, done](std::vector<uint32_t>) {
+        m_store.expunge(m_user, m_folder, {}, false, [this, alive = m_alive, done](std::vector<uint32_t>) {
             if (!*alive)
                 return;
             done();
@@ -1186,22 +1187,30 @@ void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a,
             auto self = weak.lock();
             if (!*alive || !self)
                 return;
-            if (*at >= listed.size())
+            // A folder opened at once goes on in this loop, not a call deeper, as thousands of folders may.
+            while (*at < listed.size())
             {
-                finish(tag, "OK", "LIST completed");
-                resume();
+                untagged(listed[*at]);
+                const std::string name = listed[*at + 1];
+                *at += 2;
+                auto inline_answer = std::make_shared<int>(0);
+                m_store.open(m_user, name, [this, alive, status, self, inline_answer](std::shared_ptr<imap_folder> f) {
+                    if (!*alive)
+                        return;
+                    if (f)
+                        untagged(status_text(*f, status));
+                    if (*inline_answer == 0)
+                        *inline_answer = 1;
+                    else
+                        (*self)();
+                });
+                if (*inline_answer == 1)
+                    continue;
+                *inline_answer = 2;
                 return;
             }
-            untagged(listed[*at]);
-            const std::string name = listed[*at + 1];
-            *at += 2;
-            m_store.open(m_user, name, [this, alive, status, self](std::shared_ptr<imap_folder> f) {
-                if (!*alive)
-                    return;
-                if (f)
-                    untagged(status_text(*f, status));
-                (*self)();
-            });
+            finish(tag, "OK", "LIST completed");
+            resume();
         };
         auto keep = step;
         (*keep)();
@@ -1478,10 +1487,24 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
             }
             if (seen_now && !m_readonly && !(m->flags & flag_seen))
             {
-                const bool told_all = m_told_modseq == m_folder->highestmodseq;
-                m_store.set_flags(m_user, m_folder, {m->uid}, [](uint8_t f) { return static_cast<uint8_t>(f | flag_seen); });
-                if (told_all)
+                // What this session did is not told again, unless another shard's changes came in with it.
+                const uint64_t was = m_folder->highestmodseq;
+                const bool told_all = m_told_modseq == was;
+                const uint32_t uid = m->uid;
+                const size_t n = m_store.set_flags(m_user, m_folder, {uid},
+                                                   [](uint8_t f) { return static_cast<uint8_t>(f | flag_seen); });
+                if (told_all && m_folder->highestmodseq == was + n)
                     m_told_modseq = m_folder->highestmodseq;
+                // The change read what other shards logged too, which may have moved the folder's messages.
+                m = m_folder->by_uid(uid);
+                if (!m)
+                {
+                    out += ")\r\n";
+                    m_hooks.reply(out);
+                    j->bytes.reset();
+                    ++j->at;
+                    continue;
+                }
             }
             const bool flags = std::any_of(j->items.begin(), j->items.end(),
                                            [](const item& it) { return it.name == "FLAGS"; });
@@ -1563,9 +1586,10 @@ void imap_session::cmd_store(const std::string& tag, const std::vector<token>& a
         else if (m)
             uids.push_back(m->uid);
     }
-    const bool told_all = m_told_modseq == m_folder->highestmodseq;
+    const uint64_t was = m_folder->highestmodseq;
+    const bool told_all = m_told_modseq == was;
     // Changed under the user's lock on the flags as they are now, whichever shard last changed them.
-    m_store.set_flags(m_user, m_folder, uids, [&op, bits](uint8_t f) {
+    const size_t changed = m_store.set_flags(m_user, m_folder, uids, [&op, bits](uint8_t f) {
         return static_cast<uint8_t>(op == "FLAGS" ? bits : op == "+FLAGS" ? f | bits : f & ~bits);
     });
     for (const size_t i : idx)
@@ -1579,8 +1603,8 @@ void imap_session::cmd_store(const std::string& tag, const std::vector<token>& a
                      "FLAGS " + flags_text(m->flags, false) +
                      (m_condstore ? " MODSEQ (" + std::to_string(m->modseq) + ")" : std::string()) + ")");
     }
-    // What this session did itself it is not told again.
-    if (told_all)
+    // What this session did itself it is not told again, unless another shard's changes came in with it.
+    if (told_all && m_folder->highestmodseq == was + changed)
         m_told_modseq = m_folder->highestmodseq;
     finish(tag, "OK", (modified.empty() ? std::string() : "[MODIFIED " + set_text(modified) + "] ") +
                           (uid ? "UID STORE completed" : "STORE completed"));
@@ -2068,18 +2092,16 @@ void imap_session::cmd_copy(const std::string& tag, const std::vector<token>& a,
                      }
                      // MOVE: what was copied goes from here, said as expunged (RFC 6851).
                      untagged("OK " + code + "Moved");
-                     for (const uint32_t u : uids)
-                         if (imap_message* m = m_folder->by_uid(u))
-                             m->flags |= flag_deleted;
                      m_waiting = false;
-                     cmd_expunge(tag, uids, false, uid ? "UID MOVE completed" : "MOVE completed");
+                     cmd_expunge(tag, uids, true, uid ? "UID MOVE completed" : "MOVE completed");
                  });
 }
 
-void imap_session::cmd_expunge(const std::string& tag, const std::vector<uint32_t>& only, bool, std::string_view done_text)
+void imap_session::cmd_expunge(const std::string& tag, const std::vector<uint32_t>& only, bool moved,
+                               std::string_view done_text)
 {
     m_waiting = true;
-    m_store.expunge(m_user, m_folder, only,
+    m_store.expunge(m_user, m_folder, only, moved,
                     [this, alive = m_alive, tag, text = std::string(done_text)](std::vector<uint32_t> gone) {
                         if (!*alive)
                             return;
