@@ -242,6 +242,8 @@ public:
         // An mqtt runtime's: a message or a subscription on its way in, either of which the script may refuse.
         CB_ON_PUBLISH            = 1ull << 32,
         CB_ON_SUBSCRIBE          = 1ull << 33,
+        // A mail runtime's: a recipient on its way in, which the script may take or refuse.
+        CB_ON_RCPT               = 1ull << 34,
     };
 
     // Check if context has valid callbacks (bitmask lookup)
@@ -284,6 +286,7 @@ public:
     bool has_on_put()                const { return m_callback_mask & CB_ON_PUT; }
     bool has_on_publish()            const { return m_callback_mask & CB_ON_PUBLISH; }
     bool has_on_subscribe()          const { return m_callback_mask & CB_ON_SUBSCRIBE; }
+    bool has_on_rcpt()               const { return m_callback_mask & CB_ON_RCPT; }
     // Whether the script declared a non-empty `filters` chain, a mask bit
     // because it is asked once per request on the proxy's route path.
     bool has_filters()               const { return m_callback_mask & CB_FILTERS; }
@@ -348,6 +351,7 @@ public:
     sol::protected_function& raw_on_auth()      { return m_on_auth; }
     sol::protected_function& raw_on_publish()   { return m_on_publish; }
     sol::protected_function& raw_on_subscribe() { return m_on_subscribe; }
+    sol::protected_function& raw_on_rcpt()      { return m_on_rcpt; }
     sol::protected_function& raw_on_connect()   { return m_on_connect; }
     sol::protected_function& raw_on_disconnect() { return m_on_disconnect; }
     // The chain in the order the script listed it, handed back raw because the
@@ -452,6 +456,7 @@ private:
     sol::protected_function m_on_auth;
     sol::protected_function m_on_publish;
     sol::protected_function m_on_subscribe;
+    sol::protected_function m_on_rcpt;
     sol::protected_function m_on_websocket;
     // Both refuse on error, so the error has to arrive as a value: a refusal
     // nobody can explain is barely better than the admission it replaced.
@@ -617,6 +622,7 @@ public:
     bool has_on_auth()           const { return false; }
     bool has_on_publish()        const { return false; }
     bool has_on_subscribe()      const { return false; }
+    bool has_on_rcpt()           const { return false; }
     bool has_on_websocket()      const { return false; }
     bool has_on_proxy_request()  const { return false; }
     bool has_on_proxy_response() const { return false; }

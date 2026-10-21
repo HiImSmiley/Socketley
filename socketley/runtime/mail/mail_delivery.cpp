@@ -391,7 +391,11 @@ void delivery::dispatch(const entry_ptr& e)
             const route_to r = m_run.route(a, e->from.empty());
             if (r.k == route_to::none)
             {
-                m_run.queue().mark(*e, i, rcpt_state::failed, "550 5.1.1 no such user here");
+                // A recipient the script took is the script's: on_message had the message.
+                if (m_run.script_takes())
+                    m_run.queue().mark(*e, i, rcpt_state::delivered, "taken by the script");
+                else
+                    m_run.queue().mark(*e, i, rcpt_state::failed, "550 5.1.1 no such user here");
                 continue;
             }
             if (r.k == route_to::sink)

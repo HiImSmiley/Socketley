@@ -13,6 +13,7 @@
 #include "mail_delivery.h"
 #include "mail_compose.h"
 #include "mail_instance.h"
+#include "mail_lua.h"
 #include "mail_mailbox.h"
 #include "mail_verify.h"
 #include "../idp/idp_session.h"
@@ -88,6 +89,11 @@ mail_run::~mail_run()
 uint32_t mail_run::shard() const
 {
     return m_owner.get_shard_index();
+}
+
+bool mail_run::script_takes() const
+{
+    return m_lua && m_lua->wants_rcpt();
 }
 
 bool mail_run::is_local_domain(std::string_view d) const
@@ -258,6 +264,7 @@ bool mail_run::start(std::string& why)
         why = file_why;
         return false;
     }
+    m_lua = std::make_unique<mail_lua>(m_owner);
     m_mailboxes = std::make_unique<mailboxes>(*this);
     if (!m_mailboxes->configure(why))
         return false;
@@ -963,9 +970,24 @@ void mail_run::conn::mail_from(const address& from, std::function<void(rcpt_verd
     done({250, ""});
 }
 
-void mail_run::conn::rcpt_to(const address& to, std::function<void(rcpt_verdict)> done)
+void mail_run::conn::rcpt_to(const address& to, std::function<void(rcpt_verdict)> answer)
 {
     mail_run& r = *run;
+    // The script has the last word on each recipient, told what would be answered without it.
+    const std::string sender = smtp->sender().text(), who = smtp->user(), ip = peer_ip(peer);
+    std::function<void(rcpt_verdict)> done = [&r, answer, to, sender, who, ip](rcpt_verdict v) {
+        if (!r.m_lua || !r.m_lua->wants_rcpt())
+        {
+            answer(v);
+            return;
+        }
+        r.m_lua->rcpt(to.text(), sender, ip, who, v.code / 100 == 2, [answer, v](bool take) {
+            if (take)
+                answer(v.code / 100 == 2 ? v : rcpt_verdict{250, "Taken by the script"});
+            else
+                answer(v.code / 100 == 2 ? rcpt_verdict{550, "Recipient refused"} : v);
+        });
+    };
     const route_to where = r.route(to, smtp->sender().empty());
     switch (where.k)
     {
@@ -1149,6 +1171,8 @@ void mail_run::accepted(const entry_ptr& e)
 {
     ++m_received;
     runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
+    if (m_lua)
+        m_lua->message(*e);
     if (m_delivery)
         m_delivery->queued(e);
 }

@@ -43,6 +43,7 @@ namespace socketley::mail
 
 class delivery;
 class mailboxes;
+class mail_lua;
 
 // Where a recipient's mail goes: a mailbox of this runtime, an address elsewhere, or nowhere.
 struct route_to
@@ -98,6 +99,8 @@ public:
     // A request to another runtime of the daemon, and its answer.
     void ask(const std::string& target, std::string payload, std::function<void(request_status, std::string_view)> cb);
     mailboxes* boxes() const { return m_mailboxes.get(); }
+    // Whether the script decides recipients, and so takes those no mailbox has.
+    bool script_takes() const;
 
 private:
     enum class port_kind : uint8_t { smtp, submission, submissions, imap, imaps };
@@ -209,6 +212,7 @@ private:
     std::unique_ptr<socketley::idp::session_verifier> m_idp;
     std::unique_ptr<delivery> m_delivery;
     std::unique_ptr<mailboxes> m_mailboxes;
+    std::unique_ptr<mail_lua> m_lua;
     // Each message stored in a mailbox, told to the targets of --notify-targets.
     std::unique_ptr<socketley::notifier> m_notify;
     std::vector<std::string> m_notify_names;

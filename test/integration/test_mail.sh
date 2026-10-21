@@ -173,6 +173,33 @@ mail_with "later body" >/dev/null && ok "and a flush delivers it" || bad "and a 
 for _ in $(seq 1 50); do [ -z "$("$BIN" mail m queue 2>/dev/null)" ] && break; sleep 0.1; done
 check "and the queue is empty after" "$("$BIN" mail m queue 2>/dev/null)" ""
 
+# ─── its own script ─────────────────────────────────────────────────────────
+cat > "$T/hooks.lua" <<'LUA'
+function on_rcpt(r, default)
+    if r.to == "hook@example.test" then return true end
+    if r.to == "blocked@example.test" then return false end
+    return nil
+end
+function on_message(m)
+    socketley.mail.send("ml", {from = "alice@example.test", to = {"watch@remote.test"},
+                               subject = "seen " .. m.id, text = "to " .. m.to[1] .. ": " .. (m.subject or "")})
+end
+LUA
+printf 'blocked@example.test bob@remote.test\n' > "$T/aliases2"
+"$BIN" create mail ml -p $((SL_PORT_BASE+1986)) --mail-domain example.test --aliases "$T/aliases2" --lua "$T/hooks.lua" -s >/dev/null 2>&1
+ready_tcp 127.0.0.1 $((SL_PORT_BASE+1986)) || bad "the scripted runtime listens" "$(tail -3 "$SOCKETLEY_DLOG")"
+check "on_rcpt takes an address no mailbox has" "$(smtp $((SL_PORT_BASE+1986)) carol@else.test hook@example.test 'Subject: for the script
+
+x')" "sent"
+f=$(mail_with "to hook@example.test: for the script")
+[ -n "$f" ] && ok "and on_message is told of it, and may send on" || bad "and on_message is told of it, and may send on" "nothing at the sink"
+check "on_rcpt refuses one an alias would take" "$(smtp $((SL_PORT_BASE+1986)) carol@else.test blocked@example.test 'Subject: x
+
+x')" "rcpt 550"
+check "and keeps the default where it says nothing" "$(smtp $((SL_PORT_BASE+1986)) carol@else.test nobody@example.test 'Subject: x
+
+x')" "rcpt 550"
+
 # ─── what it counted, before a restart sets it to nothing ─────────────────────────────────────────────────────────
 s=$("$BIN" stats m 2>/dev/null)
 for k in mail_received mail_delivered mail_bounced mail_refused_relay auth_failed starttls; do

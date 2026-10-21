@@ -661,6 +661,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_put                = m_lua["on_put"];
     m_on_publish            = m_lua["on_publish"];
     m_on_subscribe          = m_lua["on_subscribe"];
+    m_on_rcpt               = m_lua["on_rcpt"];
 
     // Build callback bitmask for O(1) has_on_*() checks
     m_callback_mask = 0;
@@ -696,6 +697,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     if (m_on_put.valid())                m_callback_mask |= CB_ON_PUT;
     if (m_on_publish.valid())            m_callback_mask |= CB_ON_PUBLISH;
     if (m_on_subscribe.valid())          m_callback_mask |= CB_ON_SUBSCRIBE;
+    if (m_on_rcpt.valid())               m_callback_mask |= CB_ON_RCPT;
 
     // The filter chain, where a malformed entry refuses the script rather than
     // being skipped, because a quietly dropped filter is a runtime that admits
