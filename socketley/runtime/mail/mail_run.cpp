@@ -1151,6 +1151,12 @@ void mail_run::conn::login(std::string user, std::string password, std::function
     authenticate("IMAP", std::move(user), std::move(password), std::move(done));
 }
 
+void mail_run::conn::acknowledge()
+{
+    const int on = 1;
+    if (fd >= 0 && ::setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &on, sizeof on) < 0) {}
+}
+
 std::string mail_run::received_line(const conn& c, const std::string& id, const std::string& rcpt) const
 {
     const bool tls = c.ssl && c.handshaken;

@@ -205,6 +205,32 @@ tally < <(timeout 60 python3 "$T/client.py" "$IM" "$P" after "$T/status.after" 2
 v1=$(printf '%s' "$before" | grep -o 'UIDVALIDITY [0-9]*'); v2=$(grep -o 'UIDVALIDITY [0-9]*' "$T/status.after" 2>/dev/null)
 [ -n "$v1" ] && [ "$v1" = "$v2" ] && ok "UIDVALIDITY is the same after a restart" || bad "UIDVALIDITY is the same after a restart" "$v1 / $v2"
 
+# A literal sent as Python's imaplib sends it, its line end in a write of its own that Nagle holds until the literal is
+# acknowledged: the ACK must not wait for the 40 ms delayed-ACK timer.
+acked=$(timeout 60 python3 - "$IM" <<'PY'
+import socket, struct, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1]))); f = s.makefile("rb"); f.readline()
+s.sendall(b"a LOGIN bob bobpassword12\r\n")
+while not f.readline().startswith(b"a "): pass
+took = []
+for i in range(5):
+    msg = b"From: bob@example.test\r\nSubject: acked\r\n\r\n" + b"line\r\n" * 200
+    s.sendall(b"b%d APPEND Trash {%d}\r\n" % (i, len(msg)))
+    assert f.readline().startswith(b"+")
+    s.sendall(msg)
+    t = time.perf_counter()
+    # tcpi_unacked, after the eight bytes and four words that come before it in struct tcp_info.
+    while struct.unpack_from("I", s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104), 24)[0] and time.perf_counter() - t < 0.5:
+        time.sleep(0.0005)
+    took.append(time.perf_counter() - t)
+    s.sendall(b"\r\n")
+    while not f.readline().startswith(b"b%d " % i): pass
+took.sort(); print("%.1f" % (took[2] * 1000))
+PY
+)
+[ -n "$acked" ] && awk -v t="$acked" 'BEGIN{exit !(t < 20)}' && ok "a literal is acknowledged at once, not after the delayed-ACK timer (${acked} ms)" \
+    || bad "a literal is acknowledged at once" "median ${acked:-?} ms to the ACK"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

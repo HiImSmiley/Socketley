@@ -353,6 +353,8 @@ void imap_session::run()
                 m_state = state::logout;
                 m_hooks.close();
             }
+            else if (!m_cmd.empty())
+                m_hooks.acknowledge();
             break;
         }
         std::string line = m_in.substr(0, nl);

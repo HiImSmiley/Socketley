@@ -154,6 +154,7 @@ private:
         void data_abort() override;
         void close() override;
         void login(std::string user, std::string password, std::function<void(bool, std::string)> done) override;
+        void acknowledge() override;
     };
     struct listener
     {
