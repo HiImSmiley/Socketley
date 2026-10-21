@@ -9,6 +9,7 @@
 
 #include <algorithm>
 
+#include "body_reader.h"
 #include "s3_encryption.h"
 #include "s3_names.h"
 #include "s3_xml.h"
@@ -435,12 +436,13 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                     answer(op::get_range, refusal_for(o.status));
                     return;
                 }
-                if (is_encrypted(o.meta) || is_compressed(o.meta) || is_tiered(o.meta))
+                // A script holds no client's key, so an object sealed under one is not its to read.
+                if (sse_mode_of(o.meta) == sse_mode::c)
                 {
                     state->done = true;
                     m_loop.close_fd(o.fd);
-                    answer(op::get_range, refusal("InvalidRequest", "the object is not stored as it came; read it "
-                                                                    "whole with get, or over the S3 port"));
+                    answer(op::get_range, refusal("InvalidRequest", "the object is encrypted with a customer key -- "
+                                                                    "read it over the S3 port with that key"));
                     return;
                 }
                 state->fd = o.fd;
@@ -451,7 +453,8 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                     if (state->done)
                         return;
                     state->done = true;
-                    m_loop.close_fd(state->fd);
+                    if (state->fd >= 0)
+                        m_loop.close_fd(state->fd);
                     state->fd = -1;
                     if (!ok)
                     {
@@ -468,9 +471,60 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                     done(true);
                     return;
                 }
-                if (!m_io.pread(state->fd, state->body.data(), static_cast<uint32_t>(n), o.data_off + off,
-                                [state, done, n](int64_t res) { done(res == static_cast<int64_t>(n)); }))
+                if (!is_encrypted(o.meta) && !is_compressed(o.meta) && !is_tiered(o.meta))
+                {
+                    if (!m_io.pread(state->fd, state->body.data(), static_cast<uint32_t>(n), o.data_off + off,
+                                    [state, done, n](int64_t res) { done(res == static_cast<int64_t>(n)); }))
+                        done(false);
+                    return;
+                }
+                // A sealed, compressed or tiered body is opened a window at a time, only the chunks the range
+                // touches, the decryption and the decompression on the hash pool.
+                sse_key key{};
+                if (s3_error err; is_encrypted(o.meta) && !sse_data_key(o.meta, std::nullopt, key, err))
+                {
                     done(false);
+                    return;
+                }
+                std::shared_ptr<body_reader> rd;
+                if (is_tiered(o.meta))
+                {
+                    m_loop.close_fd(state->fd);
+                    state->fd = -1;
+                    rd = m_tier.reader(o.meta, off, n);
+                }
+                else
+                    rd = body_reader::make(m_io, &m_hash, m_store.alive_token(), state->fd, o.data_off, o.meta,
+                                           is_encrypted(o.meta) ? &key : nullptr, off, n);
+                if (!rd)
+                {
+                    done(false);
+                    return;
+                }
+                state->body.clear();
+                state->body.reserve(static_cast<size_t>(n));
+                auto pull = std::make_shared<std::function<void()>>();
+                std::weak_ptr<std::function<void()>> weak = pull;
+                *pull = [state, done, rd, n, weak] {
+                    rd->next([state, done, n, self = weak.lock()](bool ok, std::string_view plain) {
+                        if (state->done || !self)
+                            return;
+                        if (!ok || (plain.empty() && state->body.size() < n))
+                        {
+                            done(false);
+                            return;
+                        }
+                        state->body.append(plain.substr(0, static_cast<size_t>(n - state->body.size())));
+                        if (state->body.size() >= n)
+                        {
+                            done(true);
+                            return;
+                        }
+                        (*self)();
+                    });
+                };
+                // The read in flight holds the loop, and nothing else does once it ends.
+                (*pull)();
             });
             return true;
         }

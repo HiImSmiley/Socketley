@@ -275,6 +275,44 @@ PY
     || bad "a FETCH to a client that does not read waits for it" "${held:-?} of 24 read from the storage"
 [ "${whole:-0}" -gt 24000000 ] && ok "and the whole folder comes once it does" || bad "and the whole folder comes once it does" "${whole:-0} bytes"
 
+# ─── a bucket that encrypts what it keeps ───────────────────────────────────
+# A message over a mebibyte is written in pieces and read back a range at a time: both through the encryption.
+PSX=$((SL_PORT_BASE+1954)); PX=$((SL_PORT_BASE+1955)); IMX=$((SL_PORT_BASE+1956))
+head -c 32 /dev/urandom > "$T/sse.key"; chmod 600 "$T/sse.key"
+"$BIN" create storage sx -p "$PSX" --dir "$T/datax" --anonymous --sse-key-file "$T/sse.key" -s >/dev/null 2>&1
+for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PSX/")" != 000 ] && break; sleep 0.1; done
+curl -s -X PUT "http://127.0.0.1:$PSX/mail" >/dev/null
+curl -s -X PUT "http://127.0.0.1:$PSX/mail?encryption" -d '<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>' >/dev/null
+"$BIN" create mail mx -p "$PX" --mail-domain example.test --idp auth --storage sx/mail --imap "$IMX" -s >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$IMX" || bad "the runtime on the encrypting bucket listens" "$(tail -3 "$SOCKETLEY_DLOG")"
+r=$(python3 - "$PX" "$IMX" "$T/datax" <<'PY'
+import hashlib, imaplib, os, smtplib, sys, time
+body = b"".join(b"sealed line %07d of a message larger than a mebibyte\r\n" % i for i in range(40000))
+msg = b"From: carol@else.test\r\nTo: alice@example.test\r\nSubject: sealed\r\n\r\n" + body
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1])); s.ehlo("x"); s.sendmail("carol@else.test", ["alice@example.test"], msg); s.quit()
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[2]))
+M.login("alice", "alicepassword1")
+got = None
+for _ in range(100):
+    n = int(M.select("INBOX")[1][0])
+    if n:
+        typ, data = M.fetch("1", "(BODY.PEEK[TEXT])")
+        got = [d for d in data if isinstance(d, tuple)][0][1]
+        break
+    time.sleep(0.1)
+plain_on_disk = False
+for root, _, files in os.walk(sys.argv[3]):
+    for f in files:
+        with open(os.path.join(root, f), "rb") as fh:
+            plain_on_disk = plain_on_disk or b"sealed line 0000001" in fh.read()
+print(len(body), len(got or b""), got == body, plain_on_disk)
+PY
+)
+set -- $r
+[ "${3:-}" = True ] && ok "a message over a mebibyte in a bucket that encrypts is read back whole ($2 bytes)" \
+    || bad "a message over a mebibyte in a bucket that encrypts is read back whole" "$r"
+[ "${4:-}" = False ] && ok "and is kept encrypted" || bad "and is kept encrypted" "$r"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
