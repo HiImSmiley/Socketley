@@ -790,6 +790,8 @@ struct world
     bool             tls_front{false};   // the proxy terminates TLS on its listener
     bool             tls_back{false};    // the proxy dials its backends over TLS
     uint32_t         epoch{0};      // bumped by every start, stop and destroy
+    // A backend left an answer unfinished, or one this proxy cannot frame, which a359d47 lets cost the next answer.
+    bool             answer_left_unfinished{false};
     client_sock      cli[NCLIENTS];
     backend_listener be[NBACKENDS];
     backend_sock     bs[NBSOCK];
@@ -1425,7 +1427,8 @@ void client_report_close(world& w, client_sock& c)
                        c.fd, c.proxy_fd, c.reqs_sent,
                        c.fin_sent ? " and then half-closed" : "", c.rx_since_req,
                        c.rx_total);
-    if (c.fin_sent)
+    // A half-close behind bytes the proxy forwarded unframed is the a359d47 shape below, not a FIN read as abort.
+    if (c.fin_sent && !(c.rx_total > 0 && w.answer_left_unfinished))
     {
         RT_FINDING("answer-lost-to-a-half-close", false,
                    "a client that had sent a whole request and then half-closed its write "
@@ -2228,6 +2231,8 @@ void bsock_respond(world& w, int idx, int shape)
     // A short write leaves the answer unfinished as surely as a shape that was
     // never going to finish it.
     b.resp_pending = !complete || static_cast<size_t>(n) != buf.size();
+    if (b.resp_pending)
+        w.answer_left_unfinished = true;
 
     // Where the wire now runs to, and where the last boundary on it is.  A
     // boundary only counts if the write actually reached it: a short write that

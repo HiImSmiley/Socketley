@@ -10987,6 +10987,31 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
             conn->write_batch[i].clear();
         conn->write_batch_count = 0;
+        // Nothing more is written to a socket a write failed on, and bytes left queued would hold its close forever.
+        conn->write_queue.clear();
+        // A backend lost under a request is answered as handle_backend_read answers one lost before its reply:
+        // a retry where one is configured, else 502, rather than a client closed with its answer still owed.
+        if (m_protocol == protocol_http && cqe->res != -ECANCELED && !conn->closing && conn->client_fd >= 0 &&
+            conn->client_fd < MAX_FDS && m_conn_idx[conn->client_fd].side == conn_client)
+        {
+            auto* cconn = m_conn_idx[conn->client_fd].client;
+            if (!cconn->closing && cconn->ex.backend_fd == fd)
+            {
+                if (cconn->ex.response_started)
+                {
+                    // Part of the answer is out and the rest has no way to come.
+                    close_pair(conn->client_fd, fd, close_reason::force);
+                    return;
+                }
+                note_backend_failure(cconn);
+                cconn->ex.backend_fd = -1;
+                conn->client_fd = -1;
+                if (!try_retry(cconn))
+                    answer_gateway_failure(cconn, false);
+                close_pair(-1, fd);
+                return;
+            }
+        }
         close_pair(conn->client_fd, fd);
         return;
     }
@@ -11028,6 +11053,13 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
         if (SOCKETLEY_UNLIKELY(!flush_backend_write_queue(conn)))
         {
             close_pair(conn->client_fd, conn->fd);
+            return;
+        }
+        // tls_flush holds a request back on an unfinished handshake, which a closing leg with no read armed never
+        // finishes, so it is closed as close_pair would have closed it rather than left with nothing to wake it.
+        if (conn->closing && !backend_op_in_flight(conn))
+        {
+            close_pair(conn->client_fd, fd);
             return;
         }
     }
