@@ -1,5 +1,6 @@
 #include "cli.h"
 
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -130,6 +131,47 @@ int cli_mail_send(int argc, char** argv)
     return ask(cmd);
 }
 
+// `socketley mail <mail> sieve <user> list | get <name> | put <name> <file|-> | check <file|-> | activate <name> |
+// deactivate | delete <name>`: the script's text is read here, where the file is, and sent with the verb.
+int cli_mail_sieve(int argc, char** argv)
+{
+    const std::string_view what = argc > 5 ? argv[5] : "";
+    const bool named = what == "get" || what == "put" || what == "activate" || what == "delete";
+    const bool texted = what == "put" || what == "check";
+    if (argc < 6 || !(named || texted || what == "list" || what == "deactivate") ||
+        (named && argc < 7) || (texted && argc < (what == "put" ? 8 : 7)))
+    {
+        std::cerr << "usage: socketley mail <mail> sieve <user> list | get <name> | put <name> <file|-> | "
+                     "check <file|-> | activate <name> | deactivate | delete <name>\n";
+        return 1;
+    }
+    std::string name = named ? argv[6] : "", text;
+    if (texted)
+    {
+        const std::string src = argv[what == "put" ? 7 : 6];
+        std::ostringstream ss;
+        if (src == "-")
+            ss << std::cin.rdbuf();
+        else
+        {
+            std::ifstream f(src, std::ios::binary);
+            if (!f)
+            {
+                std::cout << src << " cannot be read\n";
+                return 1;
+            }
+            ss << f.rdbuf();
+        }
+        text = ss.str();
+    }
+    std::string cmd = "mail ";
+    ipc_frame::append_arg(cmd, argv[2]);
+    cmd += " sieve ";
+    ipc_frame::append_arg(cmd, socketley::base64::encode(std::string(argv[4]) + "\n" + std::string(what) + "\n" +
+                                                         name + "\n" + text));
+    return ask(cmd);
+}
+
 // `socketley mail <mail> queue|show|flush|drop [arg]`.
 int cli_mail(int argc, char** argv)
 {
@@ -140,11 +182,13 @@ int cli_mail(int argc, char** argv)
     }
     const std::string_view verb = argv[3];
     if (verb != "queue" && verb != "show" && verb != "flush" && verb != "drop" && verb != "dns" &&
-        verb != "suppressed" && verb != "forgive")
+        verb != "suppressed" && verb != "forgive" && verb != "sieve")
     {
         std::cerr << command_usage::line("mail");
         return 1;
     }
+    if (verb == "sieve")
+        return cli_mail_sieve(argc, argv);
     if ((verb == "show" || verb == "drop" || verb == "forgive") && argc < 5)
     {
         std::cerr << command_usage::line("mail");

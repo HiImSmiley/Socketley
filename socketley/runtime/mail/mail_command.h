@@ -24,6 +24,8 @@ enum class verb : uint8_t
     // The addresses a bounce to no-reply@ said failed, which are not sent to again, and one of them let go.
     suppressed = 7,
     forgive    = 8,
+    // A user's Sieve scripts: the argument is the user, the verb, a name and a script's text, a line each.
+    sieve      = 9,
 };
 
 struct attachment

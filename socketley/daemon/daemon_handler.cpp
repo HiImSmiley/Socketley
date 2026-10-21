@@ -3028,7 +3028,7 @@ int daemon_handler::cmd_mail(ipc_connection* conn, const parsed_args& pa)
     const ml::verb v = what == "queue" ? ml::verb::queue : what == "show" ? ml::verb::show
                      : what == "flush" ? ml::verb::flush : what == "drop" ? ml::verb::drop
                      : what == "dns"   ? ml::verb::dns   : what == "suppressed" ? ml::verb::suppressed
-                     : what == "forgive" ? ml::verb::forgive : ml::verb::send;
+                     : what == "forgive" ? ml::verb::forgive : what == "sieve" ? ml::verb::sieve : ml::verb::send;
     if (v == ml::verb::send)
     {
         conn->write_buf = command_usage::line("mail");
@@ -3036,6 +3036,15 @@ int daemon_handler::cmd_mail(ipc_connection* conn, const parsed_args& pa)
     }
     const std::string arg = pa.count > 3 ? std::string(pa.args[3]) : std::string();
     const std::string payload = ml::command_text(v, arg);
+    // The users' scripts are files every shard reads, so the first shard keeps them.
+    if (v == ml::verb::sieve)
+    {
+        std::string one;
+        if (!ask_worker(conn, name, payload, one, std::chrono::seconds(10), 0))
+            return 1;
+        conn->write_buf = one.empty() || one.ends_with('\n') ? one : one + "\n";
+        return one.starts_with("error") ? 1 : 0;
+    }
     const size_t shards = std::max<size_t>(1, instance->get_shards());
     std::string all;
     bool found = false;

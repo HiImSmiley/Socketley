@@ -20,6 +20,7 @@
 
 #include "mail_command.h"
 #include "mail_dkim.h"
+#include "mail_sieve.h"
 #include "mail_spool.h"
 #include "mail_tls_policy.h"
 #include "../../shared/loop/event_loop.h"
@@ -132,6 +133,14 @@ private:
     };
     void sign_read(const std::shared_ptr<sign_job>& j);
     void deliver_local(const entry_ptr& e, const target& t);
+    // A mailbox delivery the user's Sieve script decides: run on the pool, and its actions taken on the loop.
+    void filter(const std::shared_ptr<item>& it, const std::string& user, const std::string& email, std::string head,
+                std::shared_ptr<const sieve::script> script, std::function<void(int, const std::string&)> settle);
+    void apply(const std::shared_ptr<item>& it, const std::string& user, const std::string& own,
+               const std::string& head, std::string_view bytes, const sieve::outcome& out,
+               std::function<void(int, const std::string&)> settle);
+    void redirect(const entry_ptr& e, const std::string& own, const std::string& to);
+    void vacation(const std::string& own, const sieve::vacation& v, std::string_view msgid);
     std::string signing_domain(std::string_view from_header) const;
 
     // ── one connection ─────────────────────────────────────────────────────
@@ -186,6 +195,9 @@ private:
     uint64_t m_failed{0};
     uint64_t m_bounced{0};
     uint64_t m_reports{0};
+    uint64_t m_sieve_rejected{0};
+    uint64_t m_sieve_redirected{0};
+    uint64_t m_sieve_vacations{0};
     uint64_t m_connects{0};
     uint64_t m_tls_sessions{0};
     uint64_t m_transactions{0};

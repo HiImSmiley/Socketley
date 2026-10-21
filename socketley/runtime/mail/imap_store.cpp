@@ -245,7 +245,13 @@ void imap_store::open(const std::string& name, const std::string& folder,
     const auto it = u.folders.find(canonical(folder));
     if (it == u.folders.end())
     {
-        done(nullptr);
+        // A folder a delivery or another client made is in the bucket before this session has listed it.
+        folders(name, [this, name, folder, done, force](std::vector<std::string>) {
+            if (user(name).folders.count(canonical(folder)))
+                open(name, folder, done, force);
+            else
+                done(nullptr);
+        });
         return;
     }
     std::shared_ptr<imap_folder> f = it->second;
@@ -302,7 +308,7 @@ void imap_store::sync(const std::string& name, const std::shared_ptr<imap_folder
                        for (const auto& [k, v] : *acc)
                            if (!known.count(k))
                            {
-                               f->msgs.push_back({f->uidnext++, k, v.first, v.second, 0, true});
+                               f->msgs.push_back({f->uidnext++, k, v.first, v.second, flags_of_key(k), true});
                                changed = true;
                            }
                        if (changed)

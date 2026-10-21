@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# suite: isolated -- its own daemon, socket, state directory and port window, so it runs beside the others
+# Integration test: a mail runtime's users filter their mail with Sieve (RFC 5228), put over ManageSieve
+# (RFC 5804) or with `socketley mail ... sieve`.
+#
+# ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
+#
+#   * a password taken in the clear from a stranger, or a script put by someone not signed in
+#   * a script that does not compile kept, or kept without the line its error is on
+#   * a literal past a script's size read as commands, or the active script deleted
+#   * fileinto not filing, its imap4flags lost, discard keeping, reject not telling the sender
+#   * redirect :copy not sending a copy, or not keeping one
+#   * a vacation answered twice to one sender, or not at all, or from a sender a bounce could answer
+#   * a script deactivated still run
+set -uo pipefail
+
+BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/lib_ports.sh"
+. "$HERE/lib_daemon.sh"
+. "$HERE/lib_ready.sh"
+
+command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
+command -v openssl >/dev/null 2>&1 || { echo "  SKIP: openssl is required"; exit 0; }
+command -v curl >/dev/null 2>&1 || { echo "  SKIP: curl is required"; exit 0; }
+
+PASS=0; FAIL=0; TOTAL=0
+ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
+bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
+check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2', want '$3'"; fi; }
+
+daemon_isolate mail_sieve
+T="$SOCKETLEY_TMPD"
+P=$((SL_PORT_BASE+1940))
+IM=$((SL_PORT_BASE+1941))
+SV=$((SL_PORT_BASE+1942))
+PI=$((SL_PORT_BASE+1943))
+PS=$((SL_PORT_BASE+1944))
+SINK=$((SL_PORT_BASE+1945))
+NS=$((SL_PORT_BASE+1946))
+PIDS=()
+cleanup() {
+    for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
+    daemon_stop
+}
+trap cleanup EXIT
+
+echo "=== Integration: Sieve filters and ManageSieve ==="
+
+python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 \
+    >/dev/null 2>&1 &
+PIDS+=($!)
+printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
+export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK"
+mkdir -p "$T/sink"
+python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/sink" >/dev/null 2>&1 &
+PIDS+=($!)
+ready_tcp 127.0.0.1 "$SINK" || bad "the sink listens" "-"
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=mail.example.test" \
+    -keyout "$T/key.pem" -out "$T/cert.pem" >/dev/null 2>&1
+daemon_start "$BIN"
+printf 'spa - http://localhost:5173/cb\n' > "$T/clients"
+"$BIN" create idp auth -p "$PI" --clients "$T/clients" --issuer "http://127.0.0.1:$PI" -s >/dev/null 2>&1
+"$BIN" create storage st -p "$PS" --dir "$T/data" --anonymous -s >/dev/null 2>&1
+for p in "$PI/jwks" "$PS/"; do
+    for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p")" != 000 ] && break; sleep 0.1; done
+done
+"$BIN" idp-user auth add alice --password alicepassword1 --email alice@example.test >/dev/null 2>&1
+"$BIN" create mail m -p "$P" --mail-domain example.test --idp auth --storage st/mail --imap "$IM" --sieve "$SV" \
+    --tls --cert "$T/cert.pem" --key "$T/key.pem" -s >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$SV" || bad "the ManageSieve port listens" "$(tail -3 "$SOCKETLEY_DLOG")"
+
+# ─── ManageSieve ────────────────────────────────────────────────────────────
+cat > "$T/script.sieve" <<'SIEVE'
+require ["fileinto", "imap4flags", "vacation", "reject", "copy"];
+if header :contains "subject" "invoice" { fileinto :flags "\\Flagged" "Bills"; stop; }
+if header :contains "subject" "spam" { discard; stop; }
+if address :is "from" "pest@remote.test" { reject "Not from you"; stop; }
+if header :contains "subject" "share" { redirect :copy "friend@remote.test"; }
+vacation :days 1 :subject "Away" "I am away until Monday.";
+SIEVE
+python3 - "$SV" "$T/script.sieve" > "$T/ms.out" 2>&1 <<'PY'
+import base64, socket, ssl, sys
+port, script = int(sys.argv[1]), open(sys.argv[2], "rb").read()
+def session(src):
+    s = socket.create_connection(("127.0.0.1", port), timeout=10, source_address=(src, 0))
+    return s, s.makefile("rb")
+def response(f):
+    # The lines up to and with the one that begins with OK, NO or BYE.
+    lines = []
+    while True:
+        l = f.readline()
+        if not l: return lines
+        lines.append(l.decode(errors="replace").rstrip("\r\n"))
+        if l[:2] in (b"OK", b"NO", b"BY"): return lines
+def say(name, cond, why=""):
+    print(("ok " if cond else "bad ") + name + ("" if cond else ": " + str(why)))
+plain = lambda u, p: base64.b64encode(b"\0" + u + b"\0" + p).decode()
+# A stranger in the clear is offered no password mechanism, and asked for STARTTLS.
+s, f = session("127.0.0.2")
+caps = response(f)
+say("a stranger in the clear is offered STARTTLS and no SASL mechanism",
+    '"STARTTLS"' in caps and '"SASL" ""' in caps and any(c.startswith('"SIEVE" "') and "vacation" in c for c in caps), caps)
+s.sendall(('AUTHENTICATE "PLAIN" "%s"\r\n' % plain(b"alice", b"alicepassword1")).encode())
+r = response(f)
+say("and a password in the clear is refused", r[-1].startswith("NO (ENCRYPT-NEEDED)"), r)
+s.sendall(b"STARTTLS\r\n")
+r = response(f)
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+t = ctx.wrap_socket(s); f = t.makefile("rb")
+caps = response(f)
+say("after STARTTLS the capabilities come again, PLAIN among them", '"SASL" "PLAIN"' in caps and caps[-1].startswith("OK"), caps)
+t.sendall(('AUTHENTICATE "PLAIN" "%s"\r\n' % plain(b"alice", b"wrong")).encode())
+say("a wrong password is refused", response(f)[-1].startswith("NO"))
+t.sendall(b'AUTHENTICATE "PLAIN"\r\n')
+f.readline()
+t.sendall(('"%s"\r\n' % plain(b"alice", b"alicepassword1")).encode())
+say("PLAIN over TLS, its response on a line of its own, signs in", response(f)[-1].startswith("OK"))
+broken = b"if true { fileinto 1; }"
+t.sendall(b'PUTSCRIPT "broken" {%d+}\r\n%s\r\n' % (len(broken), broken))
+r = response(f)
+say("a script that does not compile is refused with where", r[-1].startswith("NO") and "line" in r[-1], r)
+t.sendall(b'PUTSCRIPT "main" {%d+}\r\n%s\r\n' % (len(script), script))
+r = response(f)
+say("one that does is kept", r[-1].startswith("OK"), r)
+t.sendall(b'HAVESPACE "big" 999999\r\n')
+r = response(f)
+say("HAVESPACE says what is too large", r[-1].startswith("NO (QUOTA/MAXSIZE)"), r)
+t.sendall(b'PUTSCRIPT "huge" {200000+}\r\n' + b"#" * 200000 + b'\r\nNOOP "x"\r\n')
+r = response(f); r2 = response(f)
+say("a script past the size is refused and read past, the next command answered",
+    r[-1].startswith("NO (QUOTA/MAXSIZE)") and r2[-1].startswith('OK (TAG "x")'), (r, r2))
+t.sendall(b'SETACTIVE "main"\r\nLISTSCRIPTS\r\n')
+response(f)
+r = response(f)
+say("LISTSCRIPTS says which is active", '"main" ACTIVE' in r and not any("broken" in x for x in r), r)
+t.sendall(b'GETSCRIPT "main"\r\n')
+r = response(f)
+say("GETSCRIPT gives it back as it was put", r[0] == "{%d}" % len(script) and r[-1].startswith("OK"), r[:2])
+t.sendall(b'DELETESCRIPT "main"\r\n')
+r = response(f)
+say("the active script is not deleted", r[-1].startswith("NO (ACTIVE)"), r)
+t.sendall(b"LOGOUT\r\n")
+say("LOGOUT", response(f)[-1].startswith("OK"))
+PY
+while read -r verdict name; do
+    case "$verdict" in ok) ok "$name" ;; bad) bad "${name%%:*}" "${name#*:}" ;; esac
+done < <(grep -E '^(ok|bad) ' "$T/ms.out" || echo "bad the ManageSieve client ran: $(tail -3 "$T/ms.out")")
+
+# ─── what the script does with mail ─────────────────────────────────────────
+send() { # send <from> <subject>: a message for alice, from a stranger's server
+    python3 - "$P" "$1" "$2" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=("127.0.0.1", 0))
+s.ehlo("x")
+s.sendmail(sys.argv[2], ["alice@example.test"],
+           "From: %s\r\nTo: alice@example.test\r\nSubject: %s\r\nMessage-ID: <%s@remote.test>\r\n\r\nbody of %s\r\n"
+           % (sys.argv[2], sys.argv[3], sys.argv[3].replace(" ", "."), sys.argv[3]))
+PY
+}
+keys() { curl -s "http://127.0.0.1:$PS/mail?list-type=2&prefix=alice/$1/" | grep -o '<Key>[^<]*</Key>'; }
+at_sink() {
+    for _ in $(seq 1 60); do
+        f=$(grep -l -- "$1" "$T"/sink/*.eml 2>/dev/null | head -1)
+        [ -n "$f" ] && { echo "$f"; return 0; }
+        sleep 0.1
+    done
+    return 1
+}
+send bob@remote.test "your invoice"
+send bob@remote.test "cheap spam"
+send pest@remote.test "hello"
+send bob@remote.test "please share"
+send bob@remote.test "first plain"
+send bob@remote.test "second plain"
+for _ in $(seq 1 60); do [ -n "$(keys Bills)" ] && [ "$(keys INBOX | wc -l)" -ge 3 ] && break; sleep 0.1; done
+case "$(keys Bills)" in *",F.eml</Key>") ok "fileinto files into its folder, its \\Flagged in the key" ;;
+    *) bad "fileinto files into its folder, its \\Flagged in the key" "$(keys Bills)" ;; esac
+r=$(python3 - "$IM" <<'PY'
+import imaplib, sys
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1]))
+M.login("alice", "alicepassword1")
+M.select("Bills")
+print(M.fetch("1", "(FLAGS)")[1][0].decode())
+M.select("INBOX")
+typ, data = M.fetch("1:*", "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+print(" | ".join(d[1].decode().strip() for d in data if isinstance(d, tuple)))
+PY
+)
+case "$r" in *'\Flagged'*) ok "and IMAP tells the flag" ;; *) bad "and IMAP tells the flag" "$r" ;; esac
+inbox=$(printf '%s\n' "$r" | tail -1)
+case "$inbox" in *spam*) bad "discard keeps nothing" "$inbox" ;; *) ok "discard keeps nothing" ;; esac
+case "$inbox" in *"Subject: hello"*) bad "reject keeps nothing" "$inbox" ;; *) ok "reject keeps nothing" ;; esac
+f=$(at_sink "Not from you")
+[ -n "$f" ] && grep -q '^rcpt pest@remote.test' "$f" && ok "and the sender is told why" \
+    || bad "and the sender is told why" "$(ls "$T/sink")"
+f=$(at_sink "body of please share")
+[ -n "$f" ] && grep -q '^rcpt friend@remote.test' "$f" && grep -q '^from alice@example.test' "$f" \
+    && ok "redirect sends a copy on, from the user's own address" || bad "redirect sends a copy on, from the user's own address" "$(head -4 "$f" 2>/dev/null)"
+case "$inbox" in *"please share"*) ok "and :copy keeps one" ;; *) bad "and :copy keeps one" "$inbox" ;; esac
+for _ in $(seq 1 30); do [ "$(grep -l '^Subject: Away' "$T"/sink/*.eml 2>/dev/null | wc -l)" -ge 1 ] && break; sleep 0.1; done
+sleep 0.5
+v=$(grep -l '^Subject: Away' "$T"/sink/*.eml 2>/dev/null)
+check "a vacation answers bob once for his messages" "$(printf '%s\n' "$v" | grep -c .)" "1"
+f=$(printf '%s\n' "$v" | head -1)
+[ -n "$f" ] && grep -q '^from $' "$f" && grep -q '^Auto-Submitted: auto-replied' "$f" && grep -q '^In-Reply-To: <' "$f" \
+    && ok "from the null sender, auto-replied, in reply to his message" \
+    || bad "from the null sender, auto-replied, in reply to his message" "$(head -12 "$f" 2>/dev/null)"
+
+# ─── the CLI ────────────────────────────────────────────────────────────────
+check "socketley mail sieve lists a user's scripts" "$("$BIN" mail m sieve alice list 2>&1)" "main	active"
+printf 'require "fileinto";\nfileinto "Elsewhere"\n' > "$T/bad.sieve"
+out=$("$BIN" mail m sieve alice put other "$T/bad.sieve" 2>&1); rc=$?
+case "$out" in error*line*) [ $rc = 1 ] && ok "and refuses one that does not compile, saying where" \
+    || bad "and refuses one that does not compile" "rc $rc" ;; *) bad "and refuses one that does not compile, saying where" "$out" ;; esac
+"$BIN" mail m sieve alice deactivate >/dev/null 2>&1
+send carol@remote.test "after deactivate"
+for _ in $(seq 1 60); do [ "$(keys INBOX | wc -l)" -ge 4 ] && break; sleep 0.1; done
+sleep 0.5
+check "a script deactivated is no longer run" \
+    "$(grep -l '^Subject: Away' "$T"/sink/*.eml 2>/dev/null | xargs -r grep -l '^rcpt carol@remote.test' | wc -l)" "0"
+
+echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+[ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
+exit "$FAIL"

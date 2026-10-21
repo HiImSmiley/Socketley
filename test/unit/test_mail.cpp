@@ -8,11 +8,15 @@
 #include <filesystem>
 #include <vector>
 
+#include <unistd.h>
+
 #include "runtime/mail/mail_aliases.h"
 #include "runtime/mail/mail_compose.h"
 #include "runtime/mail/mail_dkim.h"
 #include "runtime/mail/mail_mime.h"
 #include "runtime/mail/mail_tls_policy.h"
+#include "runtime/mail/mail_sieve_store.h"
+#include "runtime/mail/managesieve_session.h"
 #include "runtime/mail/mail_verify.h"
 #include "runtime/mail/smtp_session.h"
 #include "shared/net/public_suffix.h"
@@ -913,4 +917,51 @@ TEST_CASE("the Public Suffix List: rules, wildcards and exceptions decide the re
         CHECK(organizational_domain("mail.example.co.uk") == "example.co.uk");
         CHECK(organizational_domain("a.b.example.com.au") == "example.com.au");
     }
+}
+
+TEST_CASE("ManageSieve: a sign-in answered at once, the commands pipelined behind it, a literal cut anywhere")
+{
+    struct h : managesieve_session::hooks
+    {
+        std::string out;
+        void reply(std::string_view b) override { out.append(b); }
+        void start_tls() override {}
+        void login(std::string u, std::string p, std::function<void(bool, std::string)> done) override
+        {
+            done(u == "alice" && p == "pw", u);
+        }
+        void close() override {}
+    } hooks;
+    const std::string dir = "/tmp/test-mail-sieve-" + std::to_string(::getpid());
+    std::filesystem::remove_all(dir);
+    sieve_store store(dir);
+    managesieve_config cfg;
+    cfg.hostname = "mx.test";
+    cfg.login_in_clear = true;
+    managesieve_session s(cfg, hooks, store);
+    s.greet();
+    CHECK(hooks.out.find("\"SASL\" \"PLAIN\"") != std::string::npos);
+    hooks.out.clear();
+    // The response on a line of its own, answered at once, with a PUTSCRIPT whose literal follows in the same read.
+    const std::string all = std::string("AUTHENTICATE \"PLAIN\"\r\n\"") + socketley::base64::encode(std::string("\0alice\0pw", 9)) +
+                            "\"\r\nPUTSCRIPT \"s\" {5+}\r\nkeep;\r\nSETACTIVE \"s\"\r\n";
+    s.input(all);
+    CHECK(s.user() == "alice");
+    CHECK(hooks.out.find("OK \"Putscript completed\"") != std::string::npos);
+    CHECK(hooks.out.find("OK \"Setactive completed\"") != std::string::npos);
+    CHECK(store.active_name("alice") == "s");
+    CHECK(store.active("alice") != nullptr);
+    hooks.out.clear();
+    s.input("GETSCRIPT \"s\"\r\nDELETESCRIPT \"s\"\r\nRENAMESCRIPT \"s\" \"t\"\r\nLISTSCRIPTS\r\n");
+    CHECK(hooks.out.find("{5}\r\nkeep;\r\nOK") != std::string::npos);
+    CHECK(hooks.out.find("NO (ACTIVE)") != std::string::npos);
+    CHECK(hooks.out.find("\"t\" ACTIVE") != std::string::npos);
+    // The same conversation cut every three bytes.
+    hooks.out.clear();
+    managesieve_session cut(cfg, hooks, store);
+    for (size_t i = 0; i < all.size(); i += 3)
+        cut.input(all.substr(i, 3));
+    CHECK(cut.user() == "alice");
+    CHECK(hooks.out.find("OK \"Setactive completed\"") != std::string::npos);
+    std::filesystem::remove_all(dir);
 }

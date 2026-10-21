@@ -991,7 +991,7 @@ socketley mqtt\-passwd /etc/socketley/mqtt.users sensor\-17
 .fi
 .RE
 .TP
-.BI "mail " "mail " "queue \fR[\fIfilter\fR] | \fBshow \fIid\fR | \fBflush \fR[\fIid\fR] | \fBdrop \fIid\fR | \fBdns\fR | \fBsuppressed\fR | \fBforgive \fIaddress"
+.BI "mail " "mail " "queue \fR[\fIfilter\fR] | \fBshow \fIid\fR | \fBflush \fR[\fIid\fR] | \fBdrop \fIid\fR | \fBdns\fR | \fBsuppressed\fR | \fBforgive \fIaddress\fR | \fBsieve \fIuser \fBlist\fR|\fBget \fIname\fR|\fBput \fIname file\fR|\fBcheck \fIfile\fR|\fBactivate \fIname\fR|\fBdeactivate\fR|\fBdelete \fIname"
 A mail runtime's spool, of every shard:
 .B queue
 lists what waits (its id, size, sender, the recipients still waiting and the
@@ -1010,7 +1010,13 @@ elsewhere than a dns runtime of this daemon;
 .B suppressed
 the addresses bounces said are dead, which are not mailed again until
 .B forgive
-lets one go. See
+lets one go.
+.B sieve
+lists a user's Sieve scripts, the active one marked, prints one, puts one from
+a file
+.RB ( \-
+for stdin) once it compiles, checks one, makes one active or none, or deletes
+one, as ManageSieve does. See
 .BR "MAIL FLAGS" .
 .RS
 .PP
@@ -1018,6 +1024,8 @@ lets one go. See
 socketley mail m queue
 socketley mail m show 65e5113d0e2120000000
 socketley mail m dns >> /etc/bind/example.com.zone
+socketley mail m sieve alice put main filter.sieve
+socketley mail m sieve alice activate main
 .fi
 .RE
 .TP
@@ -12850,6 +12858,24 @@ local id, err = socketley.mail.send("m", { to = "ops@example.com",
 .fi
 .RE
 .PP
+.B Sieve.
+A user files their own mail with Sieve (RFC 5228) and its extensions fileinto,
+reject, ereject, envelope, encoded\-character, imap4flags, copy, vacation,
+vacation\-seconds, subaddress, body, relational, comparator\-i;ascii\-numeric,
+variables, date and mailbox. Their scripts are put over ManageSieve (RFC 5804)
+on
+.B \-\-sieve
+(STARTTLS, and SASL PLAIN with the password IMAP takes) or with
+.BR "socketley mail" " ... " sieve ,
+compiled as they are put, at most 32 of 64 KiB and 1 MiB in all, and kept
+under the runtime's state for every shard. The active one is run on a thread
+for each message that reaches the user's mailbox, its first mebibyte what it
+reads: keep and fileinto file it, with the imap4flags' flags IMAP shows;
+discard keeps nothing; reject bounces it to its sender; redirect sends it on
+from the user's own address, never again if it comes back; vacation answers a
+sender once in its days, from the null sender. A script that fails keeps the
+message in INBOX.
+.PP
 .B Lua.
 A script of the runtime decides each recipient and is told each message:
 .RS
@@ -12945,6 +12971,12 @@ How long a message is tried before it is bounced, 1m to 30d, 5d unless given.
 .BI "\-\-dkim\-selector " name
 The selector its DKIM key is published and signed under, skl unless given.
 .TP
+.BI "\-\-sieve " port
+ManageSieve (RFC 5804), for the users' Sieve scripts; needs
+.B \-\-idp
+and
+.BR \-\-storage .
+.TP
 .BI "\-\-dnsbl " zone\fR[,\fIzone\fR...]
 DNS blocklists (RFC 5782), such as zen.spamhaus.org: a stranger's address is
 asked under each as it connects, and MAIL from one a list names is refused with
@@ -12959,9 +12991,8 @@ taken and the addresses suppressed, what was stored in mailboxes, the sign\-ins
 and their failures, STARTTLS and TLS failures, the connections out, their TLS
 and transactions, the certificates DANE and MTA\-STS checked and the
 connections refused for want of TLS, the policies fetched and what testing ones
-would have failed, the MX lookups, and the IMAP connections and reads.
-.PP
-It reads no Sieve.
+would have failed, what Sieve rejected, sent on and answered on vacation, the
+MX lookups, and the IMAP connections and reads.
 .SH REGISTERED TYPES
 A runtime type beyond the built-in seven is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never

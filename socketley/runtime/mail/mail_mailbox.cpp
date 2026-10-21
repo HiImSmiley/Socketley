@@ -167,12 +167,35 @@ void mailboxes::make_bucket(std::function<void(bool)> then)
     });
 }
 
+std::string key_flags(uint8_t flags)
+{
+    std::string out;
+    for (const auto& [bit, letter] : {std::pair{16, 'D'}, {4, 'F'}, {2, 'R'}, {1, 'S'}, {8, 'T'}})
+        if (flags & bit)
+            out += letter;
+    return out.empty() ? out : "," + out;
+}
+
+uint8_t flags_of_key(std::string_view key)
+{
+    if (!key.ends_with(".eml"))
+        return 0;
+    key.remove_suffix(4);
+    const size_t comma = key.rfind(',');
+    if (comma == std::string_view::npos || key.find('/', comma) != std::string_view::npos)
+        return 0;
+    uint8_t out = 0;
+    for (const char c : key.substr(comma + 1))
+        out |= c == 'D' ? 16 : c == 'F' ? 4 : c == 'R' ? 2 : c == 'S' ? 1 : c == 'T' ? 8 : 0;
+    return out;
+}
+
 void mailboxes::deliver(const entry_ptr& e, const std::string& user, const std::string& folder, std::string head,
-                        std::function<void(int, std::string)> done)
+                        std::function<void(int, std::string)> done, uint8_t flags)
 {
     auto w = std::make_shared<writing>();
     w->e = e;
-    w->key = user + "/" + folder + "/" + e->id + ".eml";
+    w->key = user + "/" + folder + "/" + e->id + key_flags(flags) + ".eml";
     w->head = std::move(head);
     w->done = std::move(done);
     make_bucket([this, w](bool ok) {

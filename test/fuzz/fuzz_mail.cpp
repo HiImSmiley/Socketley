@@ -15,6 +15,8 @@
 //   4  text written as quoted-printable, whose lines are at most 76 characters and whose bytes are all printable.
 //   5  a Sieve script and a message, split at the first NUL: a script that compiles is run, and what it decides has
 //      an action, a mailbox for every fileinto, at most 4 redirects and one reject, and a plain keep where it failed.
+//   6  bytes a ManageSieve client sends, in pieces cut where a 0xFF byte stands, user u password p signing in: every
+//      reply is lines that are a status, a quoted string or a literal that says its own length.
 
 #include "fuzz_common.h"
 
@@ -23,12 +25,17 @@
 #include "../../socketley/runtime/mail/mail_dkim.h"
 #include "../../socketley/runtime/mail/mail_mime.h"
 #include "../../socketley/runtime/mail/mail_sieve.h"
+#include "../../socketley/runtime/mail/mail_sieve_store.h"
+#include "../../socketley/runtime/mail/managesieve_session.h"
 #include "../../socketley/runtime/mail/smtp_session.h"
 
+#include <charconv>
 #include <deque>
 #include <functional>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 using namespace socketley::mail;
 
@@ -269,6 +276,56 @@ void sieve_case(std::string_view in)
     FUZZ_CHECK(rejects == 0 || redirects + vacations == 0, "a reject beside a redirect or a vacation");
 }
 
+struct sieve_hooks : managesieve_session::hooks
+{
+    std::string out;
+    bool closed{false};
+    void reply(std::string_view b) override { out.append(b); }
+    void start_tls() override {}
+    void login(std::string user, std::string password, std::function<void(bool, std::string)> done) override
+    {
+        done(user == "u" && password == "p", user);
+    }
+    void close() override { closed = true; }
+};
+
+void managesieve_case(std::string_view in)
+{
+    static sieve_store store("/tmp/fuzz-mail-sieve-" + std::to_string(::getpid()));
+    sieve_hooks h;
+    managesieve_config cfg;
+    cfg.hostname = "mx.example.com";
+    cfg.tls_offered = true;
+    cfg.login_in_clear = true;
+    managesieve_session s(cfg, h, store);
+    s.greet();
+    while (!in.empty() && !h.closed)
+    {
+        const size_t cut = in.find('\xff');
+        s.input(in.substr(0, cut));
+        in = cut == std::string_view::npos ? std::string_view{} : in.substr(cut + 1);
+    }
+    std::string_view r = h.out;
+    while (!r.empty())
+    {
+        const size_t nl = r.find("\r\n");
+        FUZZ_CHECK(nl != std::string_view::npos, "a reply that is no whole line");
+        const std::string_view line = r.substr(0, nl);
+        r.remove_prefix(nl + 2);
+        if (line.starts_with("{"))
+        {
+            size_t n = 0;
+            const auto res = std::from_chars(line.data() + 1, line.data() + line.size(), n);
+            FUZZ_CHECK(res.ec == std::errc() && *res.ptr == '}' && r.size() >= n + 2 && r.substr(n, 2) == "\r\n",
+                       "a literal that does not say its own length");
+            r.remove_prefix(n + 2);
+            continue;
+        }
+        FUZZ_CHECK(line.starts_with("OK") || line.starts_with("NO") || line.starts_with("BYE") || line.starts_with("\""),
+                   "a reply line that is no status, string or literal");
+    }
+}
+
 }   // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
@@ -278,7 +335,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     if (size < 1 || size > (64u << 10))
         return 0;
     const std::string_view in(reinterpret_cast<const char*>(data) + 1, size - 1);
-    switch (data[0] % 6)
+    switch (data[0] % 7)
     {
         case 0: smtp(in); break;
         case 1: mime_case(in); break;
@@ -286,6 +343,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         case 3: address_case(in); break;
         case 4: qp_case(in); break;
         case 5: sieve_case(in); break;
+        case 6: managesieve_case(in); break;
     }
     return 0;
 }

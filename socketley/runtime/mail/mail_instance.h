@@ -24,6 +24,8 @@ void mail_forget_state(std::string_view runtime_name);
 std::string mail_suppressed_path(std::string_view runtime_name);
 // The DKIM key every shard of the runtime signs with: <state>/mail/<name>.dkim.<selector>.key.
 std::string mail_key_path(std::string_view runtime_name, std::string_view selector);
+// Where the users' Sieve scripts are kept, the same for every shard.
+std::string mail_sieve_dir(std::string_view runtime_name);
 
 class mail_instance : public runtime_instance, public deferred_request_sink
 {

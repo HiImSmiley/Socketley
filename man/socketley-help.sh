@@ -501,9 +501,11 @@ cli_commands() {
     echo -e "  ${CYAN}socketley mqtt-passwd /etc/socketley/mqtt.users sensor-17${NC}"
     echo ""
     echo -e "${BOLD}mail <mail> queue [filter] | show <id> | flush [id] | drop <id> | dns | suppressed | forgive <a>${NC}"
+    echo -e "${BOLD}mail <mail> sieve <user> list | get|put|activate|delete <name> [file] | check <file> | deactivate${NC}"
     echo "  A mail runtime's spool: what waits and why, tried now or dropped; the DNS records"
-    echo "  its domains need; the addresses bounces said are dead."
+    echo "  its domains need; the addresses bounces said are dead; a user's Sieve filters."
     echo -e "  ${CYAN}socketley mail m queue${NC}"
+    echo -e "  ${CYAN}socketley mail m sieve alice put main filter.sieve${NC}"
     echo ""
 
     echo -e "${BOLD}git-sync --url <url> --branch <name|*> --work <dir> --endpoint <host:port> [--tls [--ca <file>]] --bucket <library> --name <folder> [--keep <d,w,m>] [--move-from <library>]${NC}"

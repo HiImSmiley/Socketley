@@ -18,6 +18,11 @@ namespace socketley::mail
 
 class mail_run;
 
+// The flags a delivery gives a message, in its key's name as Maildir writes them: ",FS" before ".eml", the letters
+// D (draft), F (flagged), R (answered), S (seen) and T (deleted) in that order; nothing where there are none.
+std::string key_flags(uint8_t flags);
+uint8_t flags_of_key(std::string_view key);
+
 class mailboxes
 {
 public:
@@ -38,8 +43,9 @@ public:
 
     // `e` into `user`'s `folder`, `head` put ahead of it and every Authentication-Results this host would have
     // written taken out of it; `done` with 250, or a 4xx or 5xx and why.
+    // `flags`, imap4flags' system flags as IMAP's bits, go in the key, which IMAP reads them from as it takes it.
     void deliver(const entry_ptr& e, const std::string& user, const std::string& folder, std::string head,
-                 std::function<void(int, std::string)> done);
+                 std::function<void(int, std::string)> done, uint8_t flags = 0);
 
     // The bucket made in the storage runtime, once, before the first write to it.
     void make_bucket(std::function<void(bool)> then);

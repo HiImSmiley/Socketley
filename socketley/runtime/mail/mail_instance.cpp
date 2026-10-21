@@ -24,6 +24,11 @@ std::string mail_key_path(std::string_view runtime_name, std::string_view select
         .string();
 }
 
+std::string mail_sieve_dir(std::string_view runtime_name)
+{
+    return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".sieve")).string();
+}
+
 std::string mail_suppressed_path(std::string_view runtime_name)
 {
     return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".suppressed")).string();

@@ -19,7 +19,9 @@
 #include "mail_aliases.h"
 #include "mail_command.h"
 #include "imap_session.h"
+#include "managesieve_session.h"
 #include "mail_dnsbl.h"
+#include "mail_sieve_store.h"
 #include "mail_spool.h"
 #include "smtp_session.h"
 #include "../../shared/crypto/password_file.h"
@@ -102,12 +104,13 @@ public:
     // A request to another runtime of the daemon, and its answer.
     void ask(const std::string& target, std::string payload, std::function<void(request_status, std::string_view)> cb);
     mailboxes* boxes() const { return m_mailboxes.get(); }
+    sieve_store* filters() const { return m_sieve.get(); }
     // Whether the script decides recipients, and so takes those no mailbox has.
     bool script_takes() const;
 
 private:
-    enum class port_kind : uint8_t { smtp, submission, submissions, imap, imaps };
-    struct conn : smtp_session::hooks, imap_session::hooks
+    enum class port_kind : uint8_t { smtp, submission, submissions, imap, imaps, sieve };
+    struct conn : smtp_session::hooks, imap_session::hooks, managesieve_session::hooks
     {
         mail_run* run{nullptr};
         uint64_t id{0};
@@ -134,6 +137,7 @@ private:
         bool upgrading{false};
         std::unique_ptr<smtp_session> smtp;
         std::unique_ptr<imap_session> imap;
+        std::unique_ptr<managesieve_session> sieve;
         // The message being received, its spool writer and envelope.
         uint64_t writer{0};
         entry_ptr entry;
@@ -213,6 +217,8 @@ private:
     std::string received_line(const conn& c, const std::string& id, const std::string& rcpt) const;
     void accepted(const entry_ptr& e);
     std::string queue_text(std::string_view filter) const;
+    // `socketley mail ... sieve`: a user's scripts listed, read, put, checked, activated or deleted.
+    std::string sieve_command(const std::string& arg);
     std::string show_text(const std::string& id) const;
     void send_command(uint64_t ticket, socketley::bytes::reader& r);
 
@@ -224,6 +230,7 @@ private:
     hash_pool m_checks;
     spool m_spool;
     std::unique_ptr<dnsbl> m_dnsbl;
+    std::unique_ptr<sieve_store> m_sieve;
     std::unique_ptr<tls_context> m_tls;
     std::unique_ptr<socketley::idp::session_verifier> m_idp;
     std::unique_ptr<delivery> m_delivery;
@@ -238,7 +245,7 @@ private:
     std::vector<std::string> m_domains;
     std::string m_state_dir;
 
-    listener m_smtp, m_sub, m_subs, m_imap_l, m_imaps_l;
+    listener m_smtp, m_sub, m_subs, m_imap_l, m_imaps_l, m_sieve_l;
     std::unique_ptr<imap_store> m_imap;
     std::unordered_map<uint64_t, std::unique_ptr<conn>> m_conns;
     std::vector<std::unique_ptr<conn>> m_closing;

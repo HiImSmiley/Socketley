@@ -27,6 +27,7 @@
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/runtime/stats_text.h"
 #include "../../shared/util/ascii.h"
+#include "../../shared/util/base64.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/text_list.h"
 #include "../../shared/util/wall_clock.h"
@@ -328,10 +329,23 @@ bool mail_run::start(std::string& why)
         if (m_owner.get_imaps_port() && !open_listener(m_imaps_l, m_owner.get_imaps_port(), port_kind::imaps, why))
             return false;
     }
+    // Sieve filters the mail a mailbox takes, so its scripts are every shard's, and ManageSieve listens on each.
+    if (m_mailboxes && m_mailboxes->enabled())
+    {
+        m_sieve = std::make_unique<sieve_store>(mail_sieve_dir(m_owner.get_name()));
+        if (m_owner.get_sieve_port() &&
+            !open_listener(m_sieve_l, m_owner.get_sieve_port(), port_kind::sieve, why))
+            return false;
+    }
+    else if (m_owner.get_sieve_port())
+    {
+        why = "--sieve keeps the filters of mailboxes, which need --idp and --storage";
+        return false;
+    }
     m_delivery = std::make_unique<delivery>(*this);
     if (!m_delivery->start(why))
         return false;
-    for (listener* l : {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l})
+    for (listener* l : {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l, &m_sieve_l})
         if (l->fd >= 0)
             arm_accept(*l);
     publish_records();
@@ -379,7 +393,7 @@ void mail_run::stop()
     if (m_stopped)
         return;
     m_stopped = true;
-    for (listener* l : {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l})
+    for (listener* l : {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l, &m_sieve_l})
         if (l->fd >= 0)
         {
             ::shutdown(l->fd, SHUT_RDWR);
@@ -490,7 +504,17 @@ smtp_config mail_run::session_config(const conn& c) const
 void mail_run::begin_session(conn& c)
 {
     c.in_input = true;
-    if (c.kind == port_kind::imap || c.kind == port_kind::imaps)
+    if (c.kind == port_kind::sieve)
+    {
+        managesieve_config cfg;
+        cfg.hostname = m_hostname;
+        cfg.tls_offered = m_tls != nullptr;
+        cfg.tls_active = c.ssl != nullptr && c.handshaken;
+        cfg.login_in_clear = loopback(c.peer);
+        c.sieve = std::make_unique<managesieve_session>(cfg, c, *m_sieve);
+        c.sieve->greet();
+    }
+    else if (c.kind == port_kind::imap || c.kind == port_kind::imaps)
     {
         imap_config cfg;
         cfg.hostname = m_hostname;
@@ -659,6 +683,8 @@ void mail_run::tls_in(conn& c, const char* p, size_t n)
             c.in_input = true;
             if (c.imap)
                 c.imap->tls_started();
+            else if (c.sieve)
+                c.sieve->tls_started();
             else
                 c.smtp->tls_started();
             c.in_input = false;
@@ -691,11 +717,13 @@ void mail_run::tls_in(conn& c, const char* p, size_t n)
 
 void mail_run::plain_in(conn& c, const char* p, size_t n)
 {
-    if (!c.smtp && !c.imap)
+    if (!c.smtp && !c.imap && !c.sieve)
         return;
     c.in_input = true;
     if (c.imap)
         c.imap->input(std::string_view(p, n));
+    else if (c.sieve)
+        c.sieve->input(std::string_view(p, n));
     else
         c.smtp->input(std::string_view(p, n));
     c.in_input = false;
@@ -1327,6 +1355,8 @@ void mail_run::on_cqe(struct io_uring_cqe* cqe)
         accept_done(m_imap_l, cqe);
     else if (req == &m_imaps_l.req)
         accept_done(m_imaps_l, cqe);
+    else if (req == &m_sieve_l.req)
+        accept_done(m_sieve_l, cqe);
     else if (conn* c = conn_of(req))
     {
         if (req == &c->rd)
@@ -1343,7 +1373,7 @@ void mail_run::on_loop_turn()
 {
     if (m_stopped)
         return;
-    for (listener* l : {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l})
+    for (listener* l : {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l, &m_sieve_l})
         if (l->fd >= 0 && !l->pending)
             arm_accept(*l);
     for (auto& [id, c] : m_conns)
@@ -1397,6 +1427,11 @@ void mail_run::tick()
         else if (c->smtp && !(c->ssl && !c->handshaken))
         {
             out(*c, "421 4.4.2 " + m_hostname + " idle too long, closing\r\n");
+            close_soon(*c);
+        }
+        else if (c->sieve && !(c->ssl && !c->handshaken))
+        {
+            out(*c, "BYE \"idle too long\"\r\n");
             close_soon(*c);
         }
         else
@@ -1614,6 +1649,11 @@ void mail_run::command(uint64_t ticket, std::string_view payload)
             answer(out);
             return;
         }
+        case verb::sieve:
+        {
+            answer(sieve_command(arg));
+            return;
+        }
         case verb::forgive:
         {
             std::string a = arg;
@@ -1675,6 +1715,49 @@ void mail_run::send_command(uint64_t ticket, socketley::bytes::reader& r)
     queue_message(from, rcpts, std::move(body), false, "local", [answer](bool ok, std::string id) {
         answer(ok ? "queued " + id : "error: the message could not be written to the spool");
     });
+}
+
+std::string mail_run::sieve_command(const std::string& arg)
+{
+    if (!m_sieve)
+        return "error: Sieve filters mailboxes, which need --idp and --storage";
+    std::string all;
+    if (!socketley::base64::decode(arg, all))
+        return "error: the command did not arrive whole";
+    std::string_view rest = all;
+    const auto line = [&rest] {
+        const size_t nl = rest.find('\n');
+        const std::string_view l = rest.substr(0, nl);
+        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+        return std::string(l);
+    };
+    const std::string user = line(), what = line(), name = line();
+    const std::string_view text = rest;
+    if (!sieve_store::name_ok(user))
+        return "error: " + user + " is no user";
+    std::string code, why;
+    if (what == "list")
+    {
+        std::string out;
+        for (const auto& [n, active] : m_sieve->list(user))
+            out += n + (active ? "\tactive\n" : "\n");
+        return out;
+    }
+    if (what == "get")
+    {
+        std::string t;
+        return m_sieve->get(user, name, t) ? t : "error: " + user + " has no script " + name;
+    }
+    if (what == "put")
+        return m_sieve->put(user, name, text, code, why) ? std::string() : "error: " + why;
+    if (what == "check")
+        return sieve::script::compile(text, why) ? std::string() : "error: " + why;
+    if (what == "activate" || what == "deactivate")
+        return m_sieve->activate(user, what == "activate" ? name : std::string(), code, why) ? std::string()
+                                                                                              : "error: " + why;
+    if (what == "delete")
+        return m_sieve->remove(user, name, code, why) ? std::string() : "error: " + why;
+    return "error: no sieve verb " + what;
 }
 
 std::string mail_run::stats() const
