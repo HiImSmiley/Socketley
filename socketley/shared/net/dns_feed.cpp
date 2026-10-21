@@ -123,9 +123,15 @@ bool write_records(std::string_view runtime, std::string_view text)
     return write_atomic(path, text);
 }
 
+// Beside the directory and not in it, since the directory's time dates the records and the zones are none of them.
+std::string zones_path()
+{
+    return dir() + "-zones";
+}
+
 bool write_zones(std::string_view text)
 {
-    const std::string path = dir() + "/zones";
+    const std::string path = zones_path();
     struct stat st{};
     if (::stat(path.c_str(), &st) < 0 ? text.empty() : read_file(path) == text)
         return true;
@@ -135,7 +141,7 @@ bool write_zones(std::string_view text)
 std::vector<std::pair<std::string, std::string>> read_zones()
 {
     std::vector<std::pair<std::string, std::string>> out;
-    std::istringstream in(read_file(dir() + "/zones"));
+    std::istringstream in(read_file(zones_path()));
     std::string rt, origin;
     while (in >> rt >> origin)
         out.emplace_back(rt, origin);

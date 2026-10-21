@@ -12,7 +12,9 @@
 //                    checks it and removed after; served as the TXT record of _acme-challenge.<name>
 //   records-<rt>     master-file lines with absolute owners, a runtime's records for the zones they fall in: a mail
 //                    runtime's MX, SPF, DKIM and DMARC; the zone file wins where it names the type at the name
-//   zones            "<dns runtime> <origin>" lines, written by the daemon, the zones each dns runtime serves
+//
+// Beside the directory, as .dns-zones, the daemon writes "<dns runtime> <origin>" lines: the zones each dns runtime
+// serves, which a mail runtime reads for its domains and which would move every serial if they lay inside.
 //
 // Files rather than messages because each side already has what it takes: the daemon writes its state there, and a
 // dns runtime, in a worker process of its own, reads a file when it changes. The directory's own time is when the
