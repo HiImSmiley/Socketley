@@ -1,7 +1,9 @@
 #pragma once
-// The messages a mail runtime holds until they are delivered: a file each, its envelope in lines ahead of the message
-// and its length after it, written on the ring and synced before the client is told 250, as Postfix does.  A file
-// whose end says no length is one a crash cut while it was received, and is deleted at the next start.
+// The messages a mail runtime holds until they are delivered, each its envelope in lines ahead of the message and its
+// length after it, synced before the client is told 250.  One up to a mebibyte is a record of a segment, a file of
+// 32 MiB written before it is used, so one fdatasync of a few overwritten blocks commits every message waiting for
+// it; a larger one is a file of its own.  A record is checked by its segment's generation and a CRC, so what a crash
+// cut or an earlier use of the segment left is where reading stops; a file whose end says no length is deleted.
 //
 // What became of each recipient is appended to one log beside the files and read back at the start; a line it lost
 // to a crash is a recipient tried again, never one forgotten.  A message small enough is kept in memory as well, so
@@ -17,6 +19,7 @@
 
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
+#include "../../shared/loop/hash_pool.h"
 
 namespace socketley::mail
 {
@@ -47,6 +50,9 @@ struct spool_entry
     // DMARC sent it to.
     std::string auth;
     std::string folder;
+    // The segment generation its record is in, 0 for a file of its own, the record's length, and where the body lies.
+    uint32_t    seg{0};
+    uint32_t    rec_len{0};
     uint64_t    body_off{0};
     uint64_t    body_len{0};
     uint32_t    attempts{0};
@@ -60,7 +66,8 @@ using entry_ptr = std::shared_ptr<spool_entry>;
 class spool
 {
 public:
-    spool(event_loop& loop, file_io& io) : m_loop(loop), m_io(io) {}
+    // Segments are made ready on `pool`'s lane 0, which takes blocking work.
+    spool(event_loop& loop, file_io& io, hash_pool& pool) : m_loop(loop), m_io(io), m_pool(pool) {}
     ~spool();
     spool(const spool&)            = delete;
     spool& operator=(const spool&) = delete;
@@ -83,7 +90,7 @@ public:
     void retry(spool_entry& e, uint32_t attempts, int64_t next_ms);
     // What the checks of its arrival said, kept for its mailboxes.
     void note_auth(spool_entry& e, std::string results, std::string folder);
-    // Every recipient's delivery is over: the file goes.
+    // Every recipient's delivery is over, or the message is dropped: its file goes, or its record no longer counts.
     void remove(const std::string& id);
     // A message written and then refused before it was taken, which nothing will deliver.
     void forget_written(const std::string& id) { remove(id); }
@@ -91,22 +98,37 @@ public:
     std::map<std::string, entry_ptr>& entries() { return m_entries; }
     const std::map<std::string, entry_ptr>& entries() const { return m_entries; }
     entry_ptr find(const std::string& id) const;
-    // The file a message is kept in, for a helper thread that reads it whole.
-    std::string file_of(const std::string& id) const { return path_of(id); }
+    // The file a message is kept in, its segment's or its own, for a helper thread that reads it at body_off.
+    std::string file_of(const spool_entry& e) const;
+    // Sparse segments' messages moved to the current one, so the segment can be used again.
+    void tick(int64_t now_ms);
     // `len` bytes of a message's body from `off`, read from memory or its file.
     void read(const entry_ptr& e, uint64_t off, uint32_t len, std::function<void(bool ok, std::string_view bytes)> cb);
 
     uint64_t bytes() const { return m_bytes; }
     uint64_t written() const { return m_written; }
     uint64_t write_failures() const { return m_write_failures; }
+    // Syncs of the segments and the messages they committed, and the segments on the disk.
+    uint64_t commits() const { return m_commits; }
+    uint64_t committed() const { return m_committed; }
+    uint64_t moved() const { return m_moved; }
+    size_t segments() const { return m_segs.size() + m_spare.size() + m_free.size(); }
     // A message's body kept in memory up to this size, and all of them up to the second.
     static constexpr size_t keep_one = 1u << 20;
     static constexpr size_t keep_all = 64u << 20;
+    static constexpr uint64_t seg_size = 32u << 20;
+    // The block at the start of a segment that names its generation; its records follow.
+    static constexpr uint64_t seg_head = 4096;
+    static constexpr size_t rec_head = 16;
 
 private:
     struct writer
     {
         entry_ptr   e;
+        // In a file of its own once it outgrew a record; until then its bytes wait in `buf`.
+        bool        own{false};
+        // The envelope's length ahead of the body in `buf`.
+        size_t      head{0};
         int         fd{-1};
         bool        opening{false};
         bool        writing{false};
@@ -116,13 +138,41 @@ private:
         uint64_t    off{0};
         std::string buf;
         std::string flying;
-        // The body as it came, kept while it is small enough to be the in-memory copy.
-        std::string copy;
-        bool        copying{true};
         std::function<void(bool)> done;
     };
+    struct segment
+    {
+        uint32_t    gen{0};
+        int         fd{-1};
+        std::string path;
+        uint64_t    tail{seg_head};
+        uint32_t    live{0};
+        uint64_t    live_bytes{0};
+        // Reads in flight, which keep it from being used again.
+        uint32_t    reading{0};
+        bool        sealed{false};
+        int64_t     sealed_ms{0};
+    };
+    // A record waiting for the next commit: a writer's message, or a message moved out of a sparse segment.
+    struct queued
+    {
+        uint64_t    writer{0};
+        entry_ptr   moved;
+        uint32_t    from_seg{0};
+        size_t      at{0};
+        size_t      len{0};
+        size_t      header_len{0};
+    };
     void pump(uint64_t w);
+    void go_own(uint64_t w);
     void end(uint64_t w, bool ok);
+    void enqueue(queued q, std::string_view header, std::string_view body);
+    void commit();
+    void committed(bool ok);
+    void prepare();
+    void release(spool_entry& e);
+    void recycle(uint32_t gen);
+    void move_out(uint32_t gen);
     void log(std::string line);
     std::string path_of(const std::string& id) const { return m_dir + "/" + id + ".msg"; }
     // The opened file of a message being read, kept while its delivery reads it.
@@ -136,6 +186,7 @@ private:
 
     event_loop& m_loop;
     file_io&    m_io;
+    hash_pool&  m_pool;
     std::string m_dir;
     bool        m_relaxed{false};
     int         m_log_fd{-1};
@@ -149,6 +200,26 @@ private:
     uint64_t m_kept{0};
     uint64_t m_written{0};
     uint64_t m_write_failures{0};
+    // The segments by generation, the current one taking records, and those ready or free to be made ready.
+    std::map<uint32_t, segment> m_segs;
+    uint32_t m_cur{0};
+    std::vector<segment> m_spare;
+    std::vector<segment> m_free;
+    bool     m_preparing{false};
+    uint32_t m_next_gen{1};
+    uint32_t m_next_file{1};
+    // Records waiting, and the batch being written and synced.
+    std::string m_batch;
+    std::vector<queued> m_waiting;
+    std::string m_flying;
+    std::vector<queued> m_flying_recs;
+    uint32_t m_flying_seg{0};
+    uint64_t m_flying_at{0};
+    bool     m_committing{false};
+    uint64_t m_commits{0};
+    uint64_t m_committed{0};
+    uint64_t m_moved{0};
+    int64_t  m_moved_ms{0};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};
 };
 

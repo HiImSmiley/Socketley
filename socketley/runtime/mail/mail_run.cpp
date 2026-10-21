@@ -70,7 +70,7 @@ bool loopback(const sockaddr_in& a)
 }   // namespace
 
 mail_run::mail_run(mail_instance& owner, event_loop& loop)
-    : m_owner(owner), m_loop(loop), m_fio(loop, this), m_pool(1 + std::clamp(std::thread::hardware_concurrency() / 2, 1u, 4u)), m_checks(4), m_spool(loop, m_fio),
+    : m_owner(owner), m_loop(loop), m_fio(loop, this), m_pool(1 + std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u)), m_checks(4), m_spool(loop, m_fio, m_pool),
       m_alive(std::make_shared<bool>(true))
 {
 }
@@ -1100,9 +1100,10 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
             return;
         }
         auto result = std::make_shared<inbound_result>();
-        const std::string path = r.m_spool.file_of(e->id);
+        const std::string path = r.m_spool.file_of(*e);
+        const uint64_t off = e->body_off, len = e->body_len;
         r.m_checks.submit(r.m_checks.next_lane(),
-                          [e, result, ip, helo, path] {
+                          [e, result, ip, helo, path, off, len] {
                               std::string whole;
                               std::string_view msg;
                               if (e->body)
@@ -1110,12 +1111,12 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
                               else
                               {
                                   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-                                  whole.resize(e->body_len);
+                                  whole.resize(len);
                                   size_t got = 0;
                                   while (fd >= 0 && got < whole.size())
                                   {
                                       const ssize_t n = ::pread(fd, whole.data() + got, whole.size() - got,
-                                                                static_cast<off_t>(e->body_off + got));
+                                                                static_cast<off_t>(off + got));
                                       if (n <= 0)
                                           break;
                                       got += static_cast<size_t>(n);
@@ -1362,6 +1363,7 @@ void mail_run::tick()
         refresh_domains();
         load_suppressed(false);
     }
+    m_spool.tick(now);
     if (m_delivery)
         m_delivery->tick(now);
     if (m_imap)
@@ -1631,6 +1633,10 @@ std::string mail_run::stats() const
     put(out, "mail_refused_relay", m_refused_relay);
     put(out, "mail_too_big", m_too_big);
     put(out, "mail_spool_failures", m_spool_failed + m_spool.write_failures());
+    put(out, "mail_spool_commits", m_spool.commits());
+    put(out, "mail_spool_committed", m_spool.committed());
+    put(out, "mail_spool_segments", m_spool.segments());
+    put(out, "mail_spool_moved", m_spool.moved());
     put(out, "mail_bounces_taken", m_bounces_taken);
     put(out, "mail_suppressed", m_suppressed.size());
     if (m_imap)

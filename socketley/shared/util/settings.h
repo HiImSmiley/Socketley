@@ -184,6 +184,8 @@ inline constexpr setting table[] = {
      "the resolv.conf the resolver on the loop reads its nameservers from"},
     {"SOCKETLEY_MAIL_MX_PORT", kind::number, audience::test, 1, 65535, "25",
      "the port a mail runtime delivers to a domain's mail exchangers on"},
+    {"SOCKETLEY_MAIL_SPOOL_MOVE_MS", kind::number, audience::test, 0, no_max, "60000",
+     "milliseconds a mail spool segment is full before the few messages left in it are moved"},
     {"SOCKETLEY_STORAGE_STOP_HOLD_MS", kind::number, audience::test, 0, 3000, "0",
      "milliseconds a shard's stop holds its directory, times its shard number"},
     {"SOCKETLEY_STORAGE_START_SPIN_MS", kind::number, audience::test, 0, 30000, "0",

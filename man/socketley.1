@@ -12667,13 +12667,17 @@ domain DMARC compares is the last two labels of a name, which the Public Suffix
 List would correct for a name such as example.co.uk.
 .PP
 .B The spool.
-A message is written to a file of its own under
+A message is synced before the client is told 250, kept under
 .IB state /mail/ name /spool
-as it arrives and synced before the client is told 250, its envelope ahead of it
-and its length after it; a file a crash cut is deleted at the next start, and
-what became of each recipient is kept in a log beside them, so a restart tries
-again what was waiting. A message under a mebibyte is kept in memory as well,
-and its delivery reads nothing back.
+until every recipient is done. One up to a mebibyte is a record of a segment, a
+file of 32 MiB written out before it is used, so one fdatasync commits every
+message that ended while the last one ran; a larger one is a file of its own.
+Each record carries its segment's generation and a CRC, so a record a crash cut
+is dropped at the next start, and the log says so. What became of each
+recipient is kept in a log beside them, so a restart tries again what was
+waiting and never brings back what was dropped. A segment a few deferred
+messages keep has them moved after a minute and is used again. A message under
+a mebibyte is kept in memory as well, and its delivery reads nothing back.
 .PP
 .B Sending it on.
 Recipients of one domain go in one transaction, and a connection to a domain

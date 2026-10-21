@@ -12,7 +12,9 @@
 #include <unistd.h>
 
 #include "../../shared/loop/blocking_write.h"
+#include "../../shared/util/crc.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/settings.h"
 #include "../../shared/util/text_list.h"
 #include "../../shared/util/wall_clock.h"
 
@@ -120,6 +122,95 @@ bool parse_header(std::string_view text, spool_entry& e, size_t& header_len)
     return false;
 }
 
+
+constexpr uint32_t rec_magic = 0x31434552;
+constexpr std::string_view seg_magic = "SKLSPOOL1\n";
+// A record's envelope and its message: a mebibyte of body and the envelope ahead of it.
+constexpr size_t rec_max = (2u << 20);
+
+void put32(char* p, uint32_t v) { std::memcpy(p, &v, 4); }
+uint32_t get32(const char* p)
+{
+    uint32_t v = 0;
+    std::memcpy(&v, p, 4);
+    return v;
+}
+
+bool pwrite_all(int fd, const char* p, size_t n, uint64_t off)
+{
+    while (n)
+    {
+        const ssize_t w = ::pwrite(fd, p, n, static_cast<off_t>(off));
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w <= 0)
+            return false;
+        p += w;
+        n -= static_cast<size_t>(w);
+        off += static_cast<uint64_t>(w);
+    }
+    return true;
+}
+
+std::string seg_header(uint32_t gen)
+{
+    std::string h(seg_magic);
+    h += "gen " + std::to_string(gen) + "\n";
+    h.resize(spool::seg_head, '\0');
+    return h;
+}
+
+bool seg_gen_of(std::string_view h, uint32_t& gen)
+{
+    if (!h.starts_with(seg_magic) || !h.substr(seg_magic.size()).starts_with("gen "))
+        return false;
+    h.remove_prefix(seg_magic.size() + 4);
+    const size_t nl = h.find('\n');
+    return nl != std::string_view::npos && number(h.substr(0, nl), gen) && gen != 0;
+}
+
+// Off the loop: a new segment written to its end, so a record is an overwrite of blocks it has, and a used one given
+// its next generation, which ends what its records were; synced before a record goes in.
+bool make_ready(int& fd, const std::string& path, const std::string& dir, uint32_t gen)
+{
+    const bool fresh = fd < 0;
+    if (fresh)
+    {
+        fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0)
+            return false;
+        static const std::string zeros(1u << 20, '\0');
+        for (uint64_t off = 0; off < spool::seg_size; off += zeros.size())
+            if (!pwrite_all(fd, zeros.data(), zeros.size(), off))
+                return false;
+    }
+    const std::string h = seg_header(gen);
+    if (!pwrite_all(fd, h.data(), h.size(), 0) || (fresh ? ::fsync(fd) : ::fdatasync(fd)) != 0)
+        return false;
+    if (fresh)
+    {
+        const int d = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        const bool ok = d >= 0 && ::fsync(d) == 0;
+        if (d >= 0)
+            ::close(d);
+        return ok;
+    }
+    return true;
+}
+
+std::string trailer_of(uint64_t body_len) { return "\nend " + std::to_string(body_len) + "\n"; }
+
+// The body length a record's or a file's last bytes say, and how long that line is; false when they say none.
+bool trailer_says(std::string_view tail, uint64_t& len, size_t& line)
+{
+    const size_t mark = tail.rfind("\nend ");
+    if (mark == std::string_view::npos || tail.empty() || tail.back() != '\n' ||
+        !number(tail.substr(mark + 5, tail.size() - mark - 6), len))
+        return false;
+    line = tail.size() - mark;
+    return true;
+}
+
 }   // namespace
 
 size_t spool_entry::waiting() const
@@ -161,12 +252,36 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
     }
     if (::chmod(dir.c_str(), 0700) != 0) {}
     std::vector<std::string> cut;
+    std::vector<segment> found;
     for (const auto& de : std::filesystem::directory_iterator(dir, ec))
     {
         const std::string name = de.path().filename().string();
+        const std::string path = de.path().string();
+        if (name.starts_with("seg-") && name.ends_with(".spool"))
+        {
+            uint32_t file_no = 0;
+            if (number(std::string_view(name).substr(4, name.size() - 10), file_no))
+                m_next_file = std::max(m_next_file, file_no + 1);
+            segment s;
+            s.path = path;
+            s.fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+            struct stat st{};
+            std::string h;
+            if (s.fd < 0 || ::fstat(s.fd, &st) != 0 || static_cast<uint64_t>(st.st_size) != seg_size ||
+                !read_at(s.fd, h, seg_head, 0) || !seg_gen_of(h, s.gen))
+            {
+                // A segment whose making a crash cut holds no record yet.
+                if (s.fd >= 0)
+                    ::close(s.fd);
+                std::filesystem::remove(path, ec);
+                continue;
+            }
+            m_next_gen = std::max(m_next_gen, s.gen + 1);
+            found.push_back(std::move(s));
+            continue;
+        }
         if (!name.ends_with(".msg"))
             continue;
-        const std::string path = de.path().string();
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0)
             continue;
@@ -185,11 +300,9 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
             // "\nend <length>\n" closes a file written to its end.
             const size_t n = std::min<size_t>(static_cast<size_t>(st.st_size), 40);
             read_at(fd, tail, n, static_cast<uint64_t>(st.st_size) - n);
-            const size_t mark = tail.rfind("\nend ");
             uint64_t len = 0;
-            ok = mark != std::string::npos && tail.back() == '\n' &&
-                 number(std::string_view(tail).substr(mark + 5, tail.size() - mark - 6), len) &&
-                 header_len + len + (tail.size() - mark) == static_cast<uint64_t>(st.st_size);
+            size_t line = 0;
+            ok = trailer_says(tail, len, line) && header_len + len + line == static_cast<uint64_t>(st.st_size);
             e->body_off = header_len;
             e->body_len = len;
         }
@@ -209,8 +322,52 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
                      .c_str());
         std::filesystem::remove(p, ec);
     }
+    // Each segment's records up to the first a crash cut or an earlier generation left, a message moved to a later
+    // segment read from there.
+    std::sort(found.begin(), found.end(), [](const segment& a, const segment& b) { return a.gen < b.gen; });
+    for (auto& s : found)
+    {
+        uint64_t pos = seg_head;
+        std::string rh, payload;
+        while (pos + rec_head <= seg_size && read_at(s.fd, rh, rec_head, pos))
+        {
+            const uint32_t len = get32(rh.data() + 4);
+            // Zeros, or a record of the segment's last use, is where its records end.
+            if (get32(rh.data()) != rec_magic || get32(rh.data() + 8) != s.gen)
+                break;
+            if (len > rec_max || pos + rec_head + len > seg_size || !read_at(s.fd, payload, len, pos + rec_head) ||
+                socketley::crc::crc32c(payload) != get32(rh.data() + 12))
+            {
+                LOG_WARN(("mail: a message in " + s.path + " was cut short by a crash while it was written, and is "
+                          "dropped; its sender was never told it was taken")
+                             .c_str());
+                break;
+            }
+            auto e = std::make_shared<spool_entry>();
+            size_t header_len = 0;
+            uint64_t body_len = 0;
+            size_t line = 0;
+            if (!parse_header(payload, *e, header_len) ||
+                !trailer_says(std::string_view(payload).substr(payload.size() - std::min<size_t>(payload.size(), 40)),
+                              body_len, line) ||
+                header_len + body_len + line != len)
+                break;
+            e->seg = s.gen;
+            e->rec_len = static_cast<uint32_t>(rec_head + len);
+            e->body_off = pos + rec_head + header_len;
+            e->body_len = body_len;
+            pos += rec_head + len;
+            if (const auto it = m_entries.find(e->id); it != m_entries.end())
+                m_bytes -= it->second->body_len;
+            m_bytes += e->body_len;
+            m_entries[e->id] = std::move(e);
+        }
+        s.tail = pos;
+        m_segs.emplace(s.gen, std::move(s));
+    }
     // What became of each recipient, the log rewritten with only the messages still here.
     const std::string log_path = dir + "/state.log";
+    std::vector<std::string> dropped;
     {
         std::string text;
         const int fd = ::open(log_path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -237,7 +394,9 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
             line.remove_prefix(std::min<size_t>(line.size(), 2));
             const size_t b = line.find(' ');
             size_t i = 0;
-            if (kind == 'a')
+            if (kind == 'x')
+                dropped.push_back(e.id);
+            else if (kind == 'a')
             {
                 e.folder = std::string(line.substr(0, b));
                 e.auth = b == std::string_view::npos ? std::string() : std::string(line.substr(b + 1));
@@ -255,6 +414,10 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
             }
         }
     }
+    for (const auto& id : dropped)
+        if (const auto it = m_entries.find(id); it != m_entries.end())
+            for (auto& r : it->second->rcpts)
+                r.state = rcpt_state::failed;
     std::string compact;
     std::vector<std::string> over;
     for (const auto& [id, e] : m_entries)
@@ -275,9 +438,70 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
     }
     for (const auto& id : over)
     {
-        std::filesystem::remove(path_of(id), ec);
+        if (m_entries[id]->seg == 0)
+            std::filesystem::remove(path_of(id), ec);
         m_bytes -= m_entries[id]->body_len;
         m_entries.erase(id);
+    }
+    for (const auto& [id, e] : m_entries)
+        if (e->seg)
+        {
+            segment& s = m_segs[e->seg];
+            ++s.live;
+            s.live_bytes += e->rec_len;
+        }
+    // The last segment takes records again where its last one ended; one before it that holds none is free.
+    const int64_t now = wall::now_ms_coarse();
+    std::vector<uint32_t> empty;
+    for (auto& [gen, s] : m_segs)
+    {
+        if (gen != m_segs.rbegin()->first || s.tail + rec_max > seg_size)
+        {
+            s.sealed = true;
+            s.sealed_ms = now;
+            if (s.live == 0)
+                empty.push_back(gen);
+        }
+        else
+            m_cur = gen;
+    }
+    for (const uint32_t gen : empty)
+    {
+        segment s = std::move(m_segs[gen]);
+        m_segs.erase(gen);
+        if (m_free.size() < 2)
+            m_free.push_back(std::move(s));
+        else
+        {
+            ::close(s.fd);
+            std::filesystem::remove(s.path, ec);
+        }
+    }
+    if (!m_cur)
+    {
+        // The first segment made here and now, so the first message waits for nothing.
+        segment s;
+        if (!m_free.empty())
+        {
+            s = std::move(m_free.back());
+            m_free.pop_back();
+        }
+        else
+            s.path = m_dir + "/seg-" + std::to_string(m_next_file++) + ".spool";
+        s.gen = m_next_gen++;
+        s.tail = seg_head;
+        s.sealed = false;
+        s.live = 0;
+        s.live_bytes = 0;
+        if (!make_ready(s.fd, s.path, m_dir, s.gen))
+        {
+            if (s.fd >= 0)
+                ::close(s.fd);
+            why = "the spool segment " + s.path + " cannot be written";
+            return false;
+        }
+        m_cur = s.gen;
+        m_segs.emplace(s.gen, std::move(s));
     }
     const std::string tmp = log_path + ".tmp";
     const int wfd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
@@ -296,6 +520,7 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
         why = log_path + " cannot be opened";
         return false;
     }
+    prepare();
     return true;
 }
 
@@ -312,6 +537,18 @@ void spool::close()
         if (r.fd >= 0)
             ::close(r.fd);
     m_readers.clear();
+    for (auto* list : {&m_spare, &m_free})
+    {
+        for (auto& s : *list)
+            if (s.fd >= 0)
+                ::close(s.fd);
+        list->clear();
+    }
+    for (auto& [gen, s] : m_segs)
+        if (s.fd >= 0)
+            ::close(s.fd);
+    m_segs.clear();
+    m_cur = 0;
 }
 
 entry_ptr spool::find(const std::string& id) const
@@ -320,39 +557,25 @@ entry_ptr spool::find(const std::string& id) const
     return it == m_entries.end() ? nullptr : it->second;
 }
 
+std::string spool::file_of(const spool_entry& e) const
+{
+    if (e.seg)
+        if (const auto it = m_segs.find(e.seg); it != m_segs.end())
+            return it->second.path;
+    return path_of(e.id);
+}
+
 uint64_t spool::begin(entry_ptr e, std::string_view head)
 {
     const uint64_t id = m_next_writer++;
     auto w = std::make_unique<writer>();
-    std::string h = header_of(*e);
-    e->body_off = h.size();
+    w->buf = header_of(*e);
+    w->head = w->buf.size();
+    e->body_off = w->head;
     e->body_len = head.size();
-    w->buf = std::move(h);
     w->buf.append(head);
-    w->copy.assign(head);
     w->e = std::move(e);
-    w->opening = true;
-    writer* raw = w.get();
     m_writers.emplace(id, std::move(w));
-    const bool queued = m_io.openat(AT_FDCWD, path_of(raw->e->id), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600,
-                                    [this, id, alive = m_alive](int64_t res) {
-                                        if (!*alive)
-                                            return;
-                                        const auto it = m_writers.find(id);
-                                        if (it == m_writers.end())
-                                            return;
-                                        it->second->opening = false;
-                                        if (res < 0)
-                                            it->second->failed = true;
-                                        else
-                                            it->second->fd = static_cast<int>(res);
-                                        pump(id);
-                                    });
-    if (!queued)
-    {
-        raw->opening = false;
-        raw->failed = true;
-    }
     return id;
 }
 
@@ -364,18 +587,39 @@ void spool::append(uint64_t w, std::string_view bytes)
     writer& x = *it->second;
     x.buf.append(bytes);
     x.e->body_len += bytes.size();
-    if (x.copying)
-    {
-        if (x.copy.size() + bytes.size() <= keep_one)
-            x.copy.append(bytes);
-        else
-        {
-            x.copying = false;
-            std::string().swap(x.copy);
-        }
-    }
-    if (x.buf.size() >= flush_at)
+    if (!x.own && x.e->body_len > keep_one)
+        go_own(w);
+    else if (x.own && x.buf.size() >= flush_at)
         pump(w);
+}
+
+void spool::go_own(uint64_t w)
+{
+    writer& x = *m_writers.at(w);
+    x.own = true;
+    x.opening = true;
+    if (!m_io.openat(AT_FDCWD, path_of(x.e->id), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600,
+                     [this, w, alive = m_alive](int64_t res) {
+                         if (!*alive)
+                             return;
+                         const auto it = m_writers.find(w);
+                         if (it == m_writers.end())
+                         {
+                             if (res >= 0)
+                                 m_loop.close_fd(static_cast<int>(res));
+                             return;
+                         }
+                         it->second->opening = false;
+                         if (res < 0)
+                             it->second->failed = true;
+                         else
+                             it->second->fd = static_cast<int>(res);
+                         pump(w);
+                     }))
+    {
+        x.opening = false;
+        x.failed = true;
+    }
 }
 
 void spool::finish(uint64_t w, std::function<void(bool)> done)
@@ -389,8 +633,16 @@ void spool::finish(uint64_t w, std::function<void(bool)> done)
     writer& x = *it->second;
     x.done = std::move(done);
     x.finishing = true;
-    x.buf += "\nend " + std::to_string(x.e->body_len) + "\n";
-    pump(w);
+    if (x.own)
+    {
+        x.buf += trailer_of(x.e->body_len);
+        pump(w);
+        return;
+    }
+    queued q;
+    q.writer = w;
+    q.header_len = x.head;
+    enqueue(q, x.buf, trailer_of(x.e->body_len));
 }
 
 void spool::abort(uint64_t w)
@@ -398,7 +650,16 @@ void spool::abort(uint64_t w)
     const auto it = m_writers.find(w);
     if (it == m_writers.end())
         return;
-    it->second->aborted = true;
+    writer& x = *it->second;
+    // A record handed to a commit is the commit's to finish.
+    if (x.finishing && !x.own)
+        return;
+    x.aborted = true;
+    if (!x.own)
+    {
+        m_writers.erase(it);
+        return;
+    }
     pump(w);
 }
 
@@ -408,7 +669,7 @@ void spool::pump(uint64_t w)
     if (it == m_writers.end())
         return;
     writer& x = *it->second;
-    if (x.opening || x.writing)
+    if (!x.own || x.opening || x.writing)
         return;
     if (x.aborted || x.failed)
     {
@@ -490,19 +751,293 @@ void spool::end(uint64_t w, bool ok)
     }
     if (ok)
     {
-        if (x->copying && m_kept + x->copy.size() <= keep_all)
+        spool_entry& e = *x->e;
+        if (!x->own)
         {
-            m_kept += x->copy.size();
-            x->e->body = std::make_shared<const std::string>(std::move(x->copy));
+            // The record's bytes are the copy kept in memory, while there is room for it.
+            if (m_kept + e.body_len <= keep_all)
+            {
+                x->buf.erase(0, x->head);
+                m_kept += x->buf.size();
+                e.body = std::make_shared<const std::string>(std::move(x->buf));
+            }
+            segment& s = m_segs[e.seg];
+            ++s.live;
+            s.live_bytes += e.rec_len;
         }
-        m_bytes += x->e->body_len;
+        m_bytes += e.body_len;
         ++m_written;
-        m_entries[x->e->id] = x->e;
+        m_entries[e.id] = x->e;
     }
     else
         ++m_write_failures;
     if (x->done)
         x->done(ok);
+}
+
+void spool::enqueue(queued q, std::string_view header, std::string_view body)
+{
+    const uint32_t len = static_cast<uint32_t>(header.size() + body.size());
+    q.at = m_batch.size();
+    q.len = rec_head + len;
+    char h[rec_head];
+    put32(h, rec_magic);
+    put32(h + 4, len);
+    put32(h + 8, 0);
+    put32(h + 12, socketley::crc::crc32c(body, socketley::crc::crc32c(header)));
+    m_batch.append(h, rec_head);
+    m_batch.append(header);
+    m_batch.append(body);
+    m_waiting.push_back(std::move(q));
+    commit();
+}
+
+void spool::commit()
+{
+    if (m_committing || m_waiting.empty())
+        return;
+    const auto cur = m_segs.find(m_cur);
+    // As many waiting records as the segment has room for go in one write and one sync.
+    size_t n = 0, bytes = 0;
+    if (cur != m_segs.end())
+        while (n < m_waiting.size() && cur->second.tail + bytes + m_waiting[n].len <= seg_size)
+            bytes += m_waiting[n++].len;
+    if (n == 0)
+    {
+        if (cur != m_segs.end())
+        {
+            cur->second.sealed = true;
+            cur->second.sealed_ms = wall::now_ms_coarse();
+            m_cur = 0;
+            if (cur->second.live == 0)
+                recycle(cur->first);
+        }
+        if (m_spare.empty())
+        {
+            prepare();
+            return;
+        }
+        segment s = std::move(m_spare.front());
+        m_spare.erase(m_spare.begin());
+        m_cur = s.gen;
+        m_segs.emplace(s.gen, std::move(s));
+        prepare();
+        commit();
+        return;
+    }
+    segment& s = m_segs[m_cur];
+    m_flying_recs.assign(std::make_move_iterator(m_waiting.begin()), std::make_move_iterator(m_waiting.begin() + n));
+    m_waiting.erase(m_waiting.begin(), m_waiting.begin() + n);
+    if (m_waiting.empty())
+    {
+        m_flying.swap(m_batch);
+        m_batch.clear();
+    }
+    else
+    {
+        m_flying.assign(m_batch, 0, bytes);
+        m_batch.erase(0, bytes);
+        for (auto& q : m_waiting)
+            q.at -= bytes;
+    }
+    for (const auto& q : m_flying_recs)
+        put32(m_flying.data() + q.at + 8, s.gen);
+    m_flying_seg = s.gen;
+    m_flying_at = s.tail;
+    s.tail += bytes;
+    m_committing = true;
+    if (s.tail > seg_size / 2)
+        prepare();
+    const int fd = s.fd;
+    if (!m_io.pwrite(fd, m_flying.data(), static_cast<uint32_t>(m_flying.size()), m_flying_at,
+                     [this, fd, alive = m_alive](int64_t res) {
+                         if (!*alive)
+                             return;
+                         if (res < 0)
+                         {
+                             committed(false);
+                             return;
+                         }
+                         if (!m_io.sync(fd, true, [this, alive](int64_t r) {
+                                 if (*alive)
+                                     committed(r >= 0);
+                             }))
+                             committed(false);
+                     }))
+        committed(false);
+}
+
+void spool::committed(bool ok)
+{
+    m_committing = false;
+    const uint32_t gen = m_flying_seg;
+    if (ok)
+    {
+        ++m_commits;
+        m_committed += m_flying_recs.size();
+    }
+    else if (const auto it = m_segs.find(gen); it != m_segs.end() && gen == m_cur)
+    {
+        // A segment the disk would not take is used no further.
+        it->second.sealed = true;
+        it->second.sealed_ms = wall::now_ms_coarse();
+        m_cur = 0;
+    }
+    std::vector<queued> recs = std::move(m_flying_recs);
+    m_flying_recs.clear();
+    m_flying.clear();
+    for (auto& q : recs)
+    {
+        const uint64_t body_off = m_flying_at + q.at + rec_head + q.header_len;
+        if (q.writer)
+        {
+            const auto it = m_writers.find(q.writer);
+            if (it == m_writers.end())
+                continue;
+            spool_entry& e = *it->second->e;
+            e.seg = gen;
+            e.rec_len = static_cast<uint32_t>(q.len);
+            e.body_off = body_off;
+            end(q.writer, ok);
+            continue;
+        }
+        // A moved message counts in its new segment once there, if it is still here and still where it was.
+        const auto it = m_entries.find(q.moved->id);
+        if (!ok || it == m_entries.end() || it->second != q.moved || q.moved->seg != q.from_seg)
+            continue;
+        release(*q.moved);
+        ++m_moved;
+        q.moved->seg = gen;
+        q.moved->rec_len = static_cast<uint32_t>(q.len);
+        q.moved->body_off = body_off;
+        segment& s = m_segs[gen];
+        ++s.live;
+        s.live_bytes += q.len;
+    }
+    if (const auto it = m_segs.find(gen); it != m_segs.end() && it->second.sealed && it->second.live == 0)
+        recycle(gen);
+    commit();
+}
+
+void spool::prepare()
+{
+    if (m_preparing || !m_spare.empty())
+        return;
+    m_preparing = true;
+    auto job = std::make_shared<segment>();
+    if (!m_free.empty())
+    {
+        *job = std::move(m_free.back());
+        m_free.pop_back();
+    }
+    else
+        job->path = m_dir + "/seg-" + std::to_string(m_next_file++) + ".spool";
+    job->gen = m_next_gen++;
+    job->tail = seg_head;
+    job->live = 0;
+    job->live_bytes = 0;
+    job->sealed = false;
+    auto ok = std::make_shared<bool>(false);
+    m_pool.submit(0, [job, ok, dir = m_dir] { *ok = make_ready(job->fd, job->path, dir, job->gen); },
+                  [this, job, ok, alive = m_alive] {
+                      if (!*alive)
+                      {
+                          if (job->fd >= 0)
+                              ::close(job->fd);
+                          return;
+                      }
+                      m_preparing = false;
+                      if (*ok)
+                      {
+                          m_spare.push_back(std::move(*job));
+                          commit();
+                          return;
+                      }
+                      LOG_WARN(("mail: the spool segment " + job->path + " cannot be written").c_str());
+                      if (job->fd >= 0)
+                          m_loop.close_fd(job->fd);
+                      if (!m_io.unlinkat(AT_FDCWD, job->path, 0, [](int64_t) {})) {}
+                      // With no segment to write to, what waits is refused rather than left without an answer.
+                      if (m_segs.find(m_cur) != m_segs.end())
+                          return;
+                      std::vector<queued> waiting = std::move(m_waiting);
+                      m_waiting.clear();
+                      m_batch.clear();
+                      for (auto& q : waiting)
+                          if (q.writer)
+                              end(q.writer, false);
+                  });
+}
+
+void spool::release(spool_entry& e)
+{
+    if (!e.seg)
+        return;
+    const auto it = m_segs.find(e.seg);
+    e.seg = 0;
+    if (it == m_segs.end())
+        return;
+    segment& s = it->second;
+    s.live -= std::min<uint32_t>(s.live, 1);
+    s.live_bytes -= std::min<uint64_t>(s.live_bytes, e.rec_len);
+    if (s.sealed && s.live == 0)
+        recycle(it->first);
+}
+
+void spool::recycle(uint32_t gen)
+{
+    const auto it = m_segs.find(gen);
+    if (it == m_segs.end() || it->second.reading)
+        return;
+    segment s = std::move(it->second);
+    m_segs.erase(it);
+    if (m_free.size() + m_spare.size() < 2)
+    {
+        m_free.push_back(std::move(s));
+        return;
+    }
+    m_loop.close_fd(s.fd);
+    if (!m_io.unlinkat(AT_FDCWD, s.path, 0, [](int64_t) {}))
+        ::unlink(s.path.c_str());
+}
+
+void spool::move_out(uint32_t gen)
+{
+    for (const auto& [id, e] : m_entries)
+    {
+        if (e->seg != gen)
+            continue;
+        queued q;
+        q.moved = e;
+        q.from_seg = gen;
+        const std::string header = header_of(*e);
+        q.header_len = header.size();
+        if (e->body)
+        {
+            enqueue(q, header, *e->body + trailer_of(e->body_len));
+            continue;
+        }
+        read(e, 0, static_cast<uint32_t>(e->body_len),
+             [this, q, header, e, alive = m_alive](bool ok, std::string_view bytes) {
+                 if (*alive && ok && bytes.size() == e->body_len && e->seg == q.from_seg)
+                     enqueue(q, header, std::string(bytes) + trailer_of(e->body_len));
+             });
+    }
+}
+
+void spool::tick(int64_t now_ms)
+{
+    // A segment a few deferred messages keep holds them in a fraction of its size; moved, it is used again.
+    static const int64_t after = settings::number<int64_t>("SOCKETLEY_MAIL_SPOOL_MOVE_MS").value_or(60000);
+    if (now_ms - m_moved_ms < std::min<int64_t>(after, 10000))
+        return;
+    m_moved_ms = now_ms;
+    for (const auto& [gen, s] : m_segs)
+        if (s.sealed && s.live && s.live_bytes * 4 < seg_size && now_ms - s.sealed_ms >= after)
+        {
+            move_out(gen);
+            return;
+        }
 }
 
 void spool::log(std::string line)
@@ -559,10 +1094,18 @@ void spool::remove(const std::string& id)
     const auto it = m_entries.find(id);
     if (it == m_entries.end())
         return;
-    if (it->second->body)
-        m_kept -= std::min<uint64_t>(m_kept, it->second->body->size());
-    m_bytes -= std::min<uint64_t>(m_bytes, it->second->body_len);
+    entry_ptr e = it->second;
+    if (e->body)
+        m_kept -= std::min<uint64_t>(m_kept, e->body->size());
+    m_bytes -= std::min<uint64_t>(m_bytes, e->body_len);
     m_entries.erase(it);
+    // A record stays in its segment until the segment is used again, so the log says it is gone.
+    log(id + " x\n");
+    if (e->seg)
+    {
+        release(*e);
+        return;
+    }
     if (const auto r = m_readers.find(id); r != m_readers.end())
     {
         if (r->second.fd >= 0)
@@ -587,8 +1130,40 @@ void spool::read(const entry_ptr& e, uint64_t off, uint32_t len,
         cb(true, std::string_view(*e->body).substr(off, len));
         return;
     }
-    const std::string id = e->id;
     const uint64_t file_off = e->body_off + off;
+    if (e->seg)
+    {
+        // A segment being read from is not used again until the read is back.
+        const auto it = m_segs.find(e->seg);
+        if (it == m_segs.end())
+        {
+            cb(false, {});
+            return;
+        }
+        const uint32_t gen = e->seg;
+        ++it->second.reading;
+        auto buf = std::make_shared<std::string>(len, '\0');
+        if (!m_io.pread(it->second.fd, buf->data(), len, file_off, [this, gen, buf, cb, len, alive = m_alive](int64_t res) {
+                if (!*alive)
+                    return;
+                if (const auto s = m_segs.find(gen); s != m_segs.end())
+                {
+                    --s->second.reading;
+                    if (s->second.sealed && s->second.live == 0)
+                        recycle(gen);
+                }
+                if (res != static_cast<int64_t>(len))
+                    cb(false, {});
+                else
+                    cb(true, *buf);
+            }))
+        {
+            --it->second.reading;
+            cb(false, {});
+        }
+        return;
+    }
+    const std::string id = e->id;
     auto go = [this, id, file_off, len, cb, alive = m_alive](int fd) {
         if (!*alive)
             return;
