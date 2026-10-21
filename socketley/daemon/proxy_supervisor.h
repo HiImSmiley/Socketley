@@ -278,6 +278,8 @@ public:
     // Drain whatever the child has sent and apply it to the placeholder, from
     // the health timer and before any command that reads figures.
     void poll();
+    // Up to `slice` ms on the control and map sockets, the control backlog written as the child takes it.
+    void wait_on_sockets(int slice);
 
     // What the child made of the configuration it was handed, because `create`
     // used to report rc=0 and an `ls` line saying Up while the reason arrived

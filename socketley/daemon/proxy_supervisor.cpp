@@ -1061,11 +1061,7 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
         {
             // Both descriptors, because either can end this wait and watching
             // only the control socket cost the full slice on every turn.
-            struct pollfd pfds[2];
-            nfds_t        n = 0;
-            if (m_control_fd >= 0) pfds[n++] = {m_control_fd, POLLIN, 0};
-            if (m_map_fd     >= 0) pfds[n++] = {m_map_fd,     POLLIN, 0};
-            if (::poll(pfds, n, slice) < 0) {}
+            wait_on_sockets(slice);
         }
         else
         {
@@ -1082,6 +1078,20 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
             if (::nanosleep(&ts, nullptr) < 0) {}
         }
     }
+}
+
+void proxy_supervisor::wait_on_sockets(int slice)
+{
+    // A frame larger than the socket takes waits in m_out, and nothing but this
+    // loop runs while the daemon waits, so it is written on here or never.
+    flush_control();
+    struct pollfd pfds[2];
+    nfds_t        n = 0;
+    if (m_control_fd >= 0)
+        pfds[n++] = {m_control_fd, static_cast<short>(POLLIN | (pending_out() ? POLLOUT : 0)), 0};
+    if (m_map_fd >= 0)
+        pfds[n++] = {m_map_fd, POLLIN, 0};
+    if (n && ::poll(pfds, n, slice) < 0) {}
 }
 
 bool proxy_supervisor::send_direct(uint64_t ticket, std::string_view payload)
@@ -1144,11 +1154,7 @@ bool proxy_supervisor::await_direct(uint64_t ticket,
         if (slice < 0)
             slice = 0;
 
-        struct pollfd pfds[2];
-        nfds_t        n = 0;
-        if (m_control_fd >= 0) pfds[n++] = {m_control_fd, POLLIN, 0};
-        if (m_map_fd     >= 0) pfds[n++] = {m_map_fd,     POLLIN, 0};
-        if (n && ::poll(pfds, n, slice) < 0) {}
+        wait_on_sockets(slice);
     }
 }
 
@@ -1189,11 +1195,7 @@ bool proxy_supervisor::await_routes(const void* previous,
         if (slice < 0)
             slice = 0;
 
-        struct pollfd pfds[2];
-        nfds_t        n = 0;
-        if (m_control_fd >= 0) pfds[n++] = {m_control_fd, POLLIN, 0};
-        if (m_map_fd     >= 0) pfds[n++] = {m_map_fd,     POLLIN, 0};
-        if (n && ::poll(pfds, n, slice) < 0) {}
+        wait_on_sockets(slice);
     }
 }
 
