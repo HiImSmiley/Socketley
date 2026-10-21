@@ -12635,13 +12635,15 @@ signed in, and from 127.0.0.1, this machine's own programs; from anyone else it
 is refused with 554, so the server is not a relay.
 .PP
 .B Taking mail.
-ESMTP with PIPELINING, SIZE, 8BITMIME, SMTPUTF8, ENHANCEDSTATUSCODES, STARTTLS
-and AUTH PLAIN and LOGIN; replies come in the order the commands came. A message
+ESMTP with PIPELINING, SIZE, 8BITMIME, SMTPUTF8, ENHANCEDSTATUSCODES, STARTTLS,
+AUTH PLAIN and LOGIN, CHUNKING (BDAT) and DSN; replies come in the order the
+commands came. A message
 past
 .B \-\-max\-size
 is refused, said at MAIL when its SIZE says so, after its end otherwise. Its end
-is a CRLF, a dot and a CRLF and nothing else, and a bare LF in it is written as
-CRLF, so a dot between bare LFs ends no message here or on the next server; what
+is a CRLF, a dot and a CRLF and nothing else, or the chunk BDAT says is the
+last, and a bare LF in it is written as CRLF, so a dot between bare LFs ends no
+message here or on the next server; what
 a client sent after STARTTLS before the handshake is dropped. AUTH is offered
 over TLS, and in the clear to 127.0.0.1 alone; a wrong password is answered a
 second later. On the submission ports nothing is taken from a client that has
@@ -12694,7 +12696,13 @@ never sent in the clear. A recipient refused for now is tried again after
 1m, 5m, 15m, 30m, 1h, 2h, 4h and every 8h after, until
 .BR \-\-queue\-lifetime ;
 one refused for good, or out of time, is bounced to the sender as a delivery
-status report from the null sender. Mail from one of its domains is signed with
+status report from the null sender. A server that offers CHUNKING is sent the
+message in BDAT chunks, nothing stuffed. What a sender asked of reports (RFC
+3461) is kept with each recipient: NOTIFY, ORCPT, RET and ENVID go on to a
+server that offers DSN, which reports from there; elsewhere this runtime reports
+a SUCCESS asked for as delivered or relayed, a DELAY once a message has waited
+four hours, and no failure where NOTIFY said NEVER. RET=FULL has the report
+carry the message whole, up to 4 MiB; otherwise it carries the header. Mail from one of its domains is signed with
 DKIM (rsa\-sha256, relaxed), with a key made at its first start and kept in
 .IB state /mail/ name .dkim. selector .key
 for every shard.

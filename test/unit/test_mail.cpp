@@ -89,7 +89,7 @@ struct fake : smtp_session::hooks
         messages.push_back(body);
         answer([done] { done({250, "queued"}); });
     }
-    void data_abort() override
+    void data_abort(bool) override
     {
         in_data = false;
         ++aborted;
@@ -207,6 +207,63 @@ TEST_CASE("a whole conversation pipelined in one read is answered in order, its 
     CHECK(f.messages[0] == "Subject: hi\r\n\r\n.leading dot\r\n");
     CHECK(f.closed);
     CHECK(s.messages() == 1);
+}
+
+TEST_CASE("BDAT: chunks cut anywhere are the message as sent, a bare LF made CRLF, and a dot ends nothing")
+{
+    fake f;
+    smtp_session s(plain_config(), f);
+    s.greet();
+    f.codes();
+    s.input("EHLO c\r\nMAIL FROM:<a@example.org>\r\nRCPT TO:<b@example.com>\r\nBDAT 12\r\nSubject: x\r");
+    CHECK(f.codes() == std::vector<int>{250, 250, 250});
+    // The CR of a line's end in one chunk, its LF in the next.
+    s.input("\nBDAT 9 LAST\r\n\n.\r\nbare\n");
+    CHECK(f.codes() == std::vector<int>{250, 250});
+    REQUIRE(f.messages.size() == 1);
+    CHECK(f.messages[0] == "Subject: x\r\n\r\n.\r\nbare\r\n");
+    // A zero chunk with LAST ends a message; one byte at a time is the same message.
+    s.input("MAIL FROM:<a@example.org>\r\nRCPT TO:<b@example.com>\r\nBDAT 3\r\n");
+    for (const char c : std::string("abc"))
+        s.input(std::string(1, c));
+    s.input("BDAT 0 LAST\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 250, 250, 250});
+    REQUIRE(f.messages.size() == 2);
+    CHECK(f.messages[1] == "abc");
+    // DATA after a chunk is refused, and RSET drops what the chunks began.
+    s.input("MAIL FROM:<a@example.org>\r\nRCPT TO:<b@example.com>\r\nBDAT 2\r\nhiDATA\r\nRSET\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 250, 250, 503, 250});
+    CHECK(f.aborted == 1);
+    CHECK(f.messages.size() == 2);
+}
+
+TEST_CASE("DSN: NOTIFY, ORCPT, RET and ENVID are read, kept with each recipient, and refused when malformed")
+{
+    fake f;
+    smtp_session s(plain_config(), f);
+    s.greet();
+    f.codes();
+    s.input("EHLO c\r\nMAIL FROM:<a@example.org> RET=HDRS ENVID=QQ+2B1\r\n"
+            "RCPT TO:<b@example.com> NOTIFY=SUCCESS,DELAY ORCPT=rfc822;b+40example.com\r\n"
+            "RCPT TO:<c@example.com> NOTIFY=NEVER\r\nRCPT TO:<d@example.com>\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 250, 250, 250, 250});
+    CHECK(s.ret() == 2);
+    CHECK(s.envid() == "QQ+2B1");
+    REQUIRE(s.recipients_dsn().size() == 3);
+    CHECK(s.recipients_dsn()[0].notify == (notify_success | notify_delay));
+    CHECK(s.recipients_dsn()[0].orcpt == "rfc822;b+40example.com");
+    CHECK(s.recipients_dsn()[1].notify == notify_never);
+    CHECK(s.recipients_dsn()[2].notify == 0);
+    s.input("RCPT TO:<e@example.com> NOTIFY=NEVER,SUCCESS\r\nRCPT TO:<e@example.com> NOTIFY=SOMETIMES\r\n"
+            "RCPT TO:<e@example.com> ORCPT=rfc822;bad=x\r\nRCPT TO:<e@example.com> FOO=1\r\nRSET\r\n"
+            "MAIL FROM:<a@example.org> RET=FULL RET=HDRS\r\nMAIL FROM:<a@example.org> ENVID=a+zz\r\n");
+    CHECK(f.codes() == std::vector<int>{501, 501, 501, 555, 250, 501, 501});
+    std::string plain;
+    CHECK(xtext_decode("a+2Bb+3Dc", plain));
+    CHECK(plain == "a+b=c");
+    CHECK(xtext_encode("a+b=c d") == "a+2Bb+3Dc+20d");
+    CHECK_FALSE(xtext_decode("a+2", plain));
+    CHECK_FALSE(xtext_decode("a=b", plain));
 }
 
 TEST_CASE("EHLO says what is offered, and only where it may be used")

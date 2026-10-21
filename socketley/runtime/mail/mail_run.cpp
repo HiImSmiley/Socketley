@@ -1056,8 +1056,18 @@ bool mail_run::conn::data_begin()
     auto e = std::make_shared<spool_entry>();
     e->id = new_spool_id(r.shard());
     e->from = smtp->sender().text();
-    for (const auto& a : smtp->recipients())
-        e->rcpts.push_back({a.text(), rcpt_state::waiting, {}});
+    const auto& dsn = smtp->recipients_dsn();
+    for (size_t i = 0; i < smtp->recipients().size(); ++i)
+    {
+        e->rcpts.emplace_back(smtp->recipients()[i].text());
+        if (i < dsn.size())
+        {
+            e->rcpts.back().notify = dsn[i].notify;
+            e->rcpts.back().orcpt = dsn[i].orcpt;
+        }
+    }
+    e->ret = smtp->ret();
+    e->envid = smtp->envid();
     e->user = smtp->user();
     e->peer = peer_ip(peer);
     e->helo = smtp->helo();
@@ -1150,7 +1160,7 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
     });
 }
 
-void mail_run::conn::data_abort()
+void mail_run::conn::data_abort(bool too_big)
 {
     if (writer)
     {
@@ -1158,7 +1168,7 @@ void mail_run::conn::data_abort()
         writer = 0;
     }
     entry.reset();
-    ++run->m_too_big;
+    run->m_too_big += too_big;
 }
 
 void mail_run::conn::close()
@@ -1236,7 +1246,7 @@ void mail_run::queue_message(const std::string& from, const std::vector<std::str
     e->id = new_spool_id(shard());
     e->from = from;
     for (const auto& a : rcpts)
-        e->rcpts.push_back({a, rcpt_state::waiting, {}});
+        e->rcpts.emplace_back(a);
     e->user = std::move(user);
     e->peer = "local";
     e->helo = m_hostname;

@@ -155,7 +155,8 @@ struct delivery::out_conn
     size_t addr_at{0};
     bool resolved{false};
     // What the other side said it does.
-    bool pipelining{false}, starttls{false}, eightbit{false}, utf8{false}, auth_plain{false};
+    bool pipelining{false}, starttls{false}, eightbit{false}, utf8{false}, auth_plain{false}, chunking{false},
+        dsn{false};
     uint64_t size_max{0};
     std::string in;
     int reply_code{0};
@@ -177,6 +178,12 @@ struct delivery::out_conn
     bool bol{true};
     bool reading{false};
     bool signature_sent{false};
+    // The body goes in BDAT chunks: those whose answer is still to come, whether the last went, and what refused one.
+    bool bdat{false};
+    uint32_t bdat_out{0};
+    bool bdat_last{false};
+    int bdat_code{0};
+    std::string bdat_text;
     int64_t deadline_ms{0};
     int64_t idle_ms{0};
     std::string last_error;
@@ -468,7 +475,7 @@ void delivery::deliver_local(const entry_ptr& e, const target& t)
     it->e = e;
     it->to.push_back(t);
     const auto settle = [this, it](int code, const std::string& text) {
-        result(*it, 0, code, text, code / 100 == 4);
+        result(*it, 0, code, text, code / 100 == 4, 1);
         if (--m_out[it->e->id] == 0)
             attempt_over(it->e);
     };
@@ -747,7 +754,7 @@ std::string delivery::dkim_record() const
 
 // ── Results ─────────────────────────────────────────────────────────────────
 
-void delivery::result(const item& it, size_t t, int code, const std::string& text, bool temporary)
+void delivery::result(const item& it, size_t t, int code, const std::string& text, bool temporary, uint8_t report)
 {
     const size_t i = it.to[t].rcpt;
     spool_entry& e = *it.e;
@@ -759,6 +766,10 @@ void delivery::result(const item& it, size_t t, int code, const std::string& tex
         if (i < pending.size() && pending[i] > 0 && --pending[i] > 0)
             return;
         ++m_delivered;
+        // A success asked to be told is this runtime's to tell where it went no further, or where the next hop
+        // could not be asked to.
+        if (report && (e.rcpts[i].notify & notify_success))
+            e.rcpts[i].report = report;
         m_run.queue().mark(e, i, rcpt_state::delivered, text);
         return;
     }
@@ -791,6 +802,19 @@ void delivery::attempt_over(const entry_ptr& e)
         finished(e);
         return;
     }
+    // A sender who asked to hear of a delay is told once, after delay_notice of trying.
+    static const int64_t notice = settings::number<int64_t>("SOCKETLEY_MAIL_DELAY_NOTICE_MS").value_or(4 * 3600000);
+    if (!e->delay_told && !e->bounce && !e->from.empty() && now - e->at_ms >= notice)
+    {
+        bool asked = false;
+        for (const auto& r : e->rcpts)
+            asked = asked || (r.state == rcpt_state::waiting && (r.notify & notify_delay));
+        if (asked)
+        {
+            m_run.queue().delay_told(*e);
+            report(e, true);
+        }
+    }
     constexpr size_t n = std::size(retry_delays);
     const uint32_t delay = retry_delays[std::min<size_t>(e->attempts, n - 1)];
     m_run.queue().retry(*e, e->attempts + 1, now + static_cast<int64_t>(delay) * 1000);
@@ -799,61 +823,119 @@ void delivery::attempt_over(const entry_ptr& e)
 
 void delivery::finished(const entry_ptr& e)
 {
-    bool failed = false;
+    bool told = false;
     for (const auto& r : e->rcpts)
-        failed = failed || r.state == rcpt_state::failed;
+        told = told || reported(r, false);
     m_signed.erase(e->id);
     m_pending_targets.erase(e->id);
-    if (failed && !e->bounce && !e->from.empty())
+    if (told && !e->bounce && !e->from.empty())
     {
-        bounce(e);
+        report(e, false);
         return;
     }
     m_run.queue().remove(e->id);
 }
 
-void delivery::bounce(const entry_ptr& e)
+bool delivery::reported(const spool_rcpt& r, bool delay)
 {
-    const uint32_t want = static_cast<uint32_t>(std::min<uint64_t>(e->body_len, 65536));
-    m_run.queue().read(e, 0, want, [this, e, alive = m_alive](bool ok, std::string_view head) {
+    if (delay)
+        return r.state == rcpt_state::waiting && (r.notify & notify_delay);
+    // A failure is told unless NOTIFY said otherwise; a success only where it asked and was not passed on.
+    if (r.state == rcpt_state::failed)
+        return r.notify == 0 || (r.notify & notify_failure);
+    return r.state == rcpt_state::delivered && r.report;
+}
+
+void delivery::report(const entry_ptr& e, bool delay)
+{
+    // The whole message under RET=FULL, up to a few mebibytes; its header otherwise, as RET=HDRS or no RET says.
+    const bool full = e->ret == 1 && e->body_len <= (4u << 20);
+    const uint32_t want = static_cast<uint32_t>(full ? e->body_len : std::min<uint64_t>(e->body_len, 65536));
+    m_run.queue().read(e, 0, want, [this, e, delay, full, alive = m_alive](bool ok, std::string_view got) {
         if (!*alive)
             return;
-        const std::string headers(ok ? header_block(head) : std::string_view{});
         const std::string host = m_run.hostname();
         const std::string b = "=_skl_" + socketley::random_hex(12);
         const int64_t now = wall::now_ms();
         std::string text, status;
+        bool failed = false;
         for (const auto& r : e->rcpts)
         {
-            if (r.state != rcpt_state::failed)
+            if (!reported(r, delay))
                 continue;
-            text += "<" + r.addr + ">: " + r.why + "\r\n";
-            std::string code = "5.0.0";
-            for (size_t i = 0; i + 4 < r.why.size(); ++i)
-                if (r.why[i] == '5' && r.why[i + 1] == '.' && std::isdigit(static_cast<unsigned char>(r.why[i + 2])))
-                {
-                    const size_t sp = r.why.find(' ', i);
-                    code = r.why.substr(i, sp - i);
-                    break;
-                }
-            status += "\r\nFinal-Recipient: rfc822; " + r.addr + "\r\nAction: failed\r\nStatus: " + code +
-                      "\r\nDiagnostic-Code: smtp; " + r.why + "\r\n";
+            std::string action, code;
+            if (delay)
+            {
+                action = "delayed";
+                code = "4.0.0";
+                text += "<" + r.addr + ">: still being tried" + (r.why.empty() ? "" : ": " + r.why) + "\r\n";
+            }
+            else if (r.state == rcpt_state::failed)
+            {
+                failed = true;
+                action = "failed";
+                code = "5.0.0";
+                for (size_t i = 0; i + 4 < r.why.size(); ++i)
+                    if (r.why[i] == '5' && r.why[i + 1] == '.' && std::isdigit(static_cast<unsigned char>(r.why[i + 2])))
+                    {
+                        code = r.why.substr(i, r.why.find(' ', i) - i);
+                        break;
+                    }
+                text += "<" + r.addr + ">: " + r.why + "\r\n";
+            }
+            else
+            {
+                action = r.report == 1 ? "delivered" : "relayed";
+                code = "2.0.0";
+                text += "<" + r.addr + ">: " + (r.report == 1 ? "delivered to the mailbox" :
+                                                "handed to a server that sends no delivery reports") + "\r\n";
+            }
+            status += "\r\n";
+            if (!r.orcpt.empty())
+            {
+                const size_t semi = r.orcpt.find(';');
+                std::string plain;
+                if (xtext_decode(std::string_view(r.orcpt).substr(semi + 1), plain))
+                    status += "Original-Recipient: " + r.orcpt.substr(0, semi) + "; " + plain + "\r\n";
+            }
+            status += "Final-Recipient: rfc822; " + r.addr + "\r\nAction: " + action + "\r\nStatus: " + code + "\r\n";
+            if (!r.why.empty() && action != "delivered")
+                status += "Diagnostic-Code: smtp; " + r.why + "\r\n";
+            if (delay)
+                status += "Will-Retry-Until: " +
+                          rfc5322_date(e->at_ms + static_cast<int64_t>(m_run.owner().get_queue_lifetime()) * 1000) +
+                          "\r\n";
         }
+        const std::string subject = delay ? "Delayed Mail (still being retried)" : failed ?
+                                    "Undelivered Mail Returned to Sender" : "Successful Mail Delivery Report";
+        const std::string said = delay ? "Your message has not been delivered yet to the recipients below; it is "
+                                         "still being tried, and nothing needs to be done:" :
+                                 failed ? "Your message could not be delivered to one or more of its recipients:" :
+                                          "Your message was delivered to the recipients below:";
+        std::string envid;
+        if (!e->envid.empty() && xtext_decode(e->envid, envid))
+            envid = "Original-Envelope-Id: " + envid + "\r\n";
+        else
+            envid.clear();
+        const std::string enclosed = !ok ? std::string() : full ? std::string(got) : std::string(header_block(got));
         std::string msg = "From: Mail Delivery System <MAILER-DAEMON@" + host + ">\r\nTo: <" + e->from +
-                          ">\r\nSubject: Undelivered Mail Returned to Sender\r\nDate: " + rfc5322_date(now) +
-                          "\r\nMessage-ID: <" + e->id + ".bounce@" + host +
+                          ">\r\nSubject: " + subject + "\r\nDate: " + rfc5322_date(now) + "\r\nMessage-ID: <" + e->id +
+                          (delay ? ".delay@" : ".report@") + host +
                           ">\r\nAuto-Submitted: auto-replied\r\nMIME-Version: 1.0\r\n"
                           "Content-Type: multipart/report; report-type=delivery-status; boundary=\"" + b +
-                          "\"\r\n\r\n--" + b +
-                          "\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nThis is the mail system at " + host +
-                          ".\r\n\r\nYour message could not be delivered to one or more of its recipients:\r\n\r\n" +
-                          text + "\r\n--" + b + "\r\nContent-Type: message/delivery-status\r\n\r\nReporting-MTA: dns; " +
-                          host + "\r\nArrival-Date: " + rfc5322_date(e->at_ms) + "\r\n" + status + "\r\n--" + b +
-                          "\r\nContent-Type: text/rfc822-headers\r\n\r\n" + headers + "\r\n--" + b + "--\r\n";
-        ++m_bounced;
+                          "\"\r\n\r\n--" + b + "\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nThis is the mail system at " +
+                          host + ".\r\n\r\n" + said + "\r\n\r\n" + text + "\r\n--" + b +
+                          "\r\nContent-Type: message/delivery-status\r\n\r\nReporting-MTA: dns; " + host + "\r\n" + envid +
+                          "Arrival-Date: " + rfc5322_date(e->at_ms) + "\r\n" + status + "\r\n--" + b +
+                          (full ? "\r\nContent-Type: message/rfc822\r\n\r\n" : "\r\nContent-Type: text/rfc822-headers\r\n\r\n") +
+                          enclosed + "\r\n--" + b + "--\r\n";
+        if (failed)
+            ++m_bounced;
+        else
+            ++m_reports;
         const std::string id = e->id;
-        m_run.queue_message("", {e->from}, std::move(msg), true, {}, [this, id, alive](bool, std::string) {
-            if (*alive)
+        m_run.queue_message("", {e->from}, std::move(msg), true, {}, [this, id, delay, alive](bool, std::string) {
+            if (*alive && !delay)
                 m_run.queue().remove(id);
         });
     });
@@ -901,6 +983,7 @@ void delivery::stats(std::string& out) const
     put(out, "mail_deferred", m_deferred);
     put(out, "mail_failed", m_failed);
     put(out, "mail_bounced", m_bounced);
+    put(out, "mail_reports", m_reports);
     put(out, "mail_out_connections", m_conns.size());
     put(out, "mail_out_connects", m_connects);
     put(out, "mail_out_tls", m_tls_sessions);
@@ -1121,7 +1204,7 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
             {
                 // The conversation starts over inside TLS (RFC 3207 4.2).
                 c.state = out_conn::st::ehlo;
-                c.pipelining = c.starttls = c.eightbit = c.utf8 = c.auth_plain = false;
+                c.pipelining = c.starttls = c.eightbit = c.utf8 = c.auth_plain = c.chunking = c.dsn = false;
                 c.expect.push_back('E');
                 conn_send(c, "EHLO " + m_run.hostname() + "\r\n");
             }
@@ -1286,6 +1369,10 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                         c.eightbit = true;
                     else if (line == "smtputf8")
                         c.utf8 = true;
+                    else if (line == "chunking")
+                        c.chunking = true;
+                    else if (line == "dsn")
+                        c.dsn = true;
                     else if (line.starts_with("size"))
                         c.size_max = static_cast<uint64_t>(std::atoll(line.c_str() + 4));
                     else if (line.starts_with("auth ") || line.starts_with("auth="))
@@ -1395,6 +1482,21 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                               c.mail_code / 100 != 2 ? c.mail_text : said);
                 return;
             }
+            // With BDAT, the body goes once every recipient is answered, if one was taken.
+            if (c.bdat && c.expect.empty() && c.unsent.empty())
+            {
+                if (c.mail_code / 100 == 2 && c.rcpt_ok > 0)
+                {
+                    c.state = st::body;
+                    c.body_off = 0;
+                    c.signature_sent = false;
+                    conn_body(c);
+                }
+                else
+                    conn_end_item(c, c.mail_code / 100 != 2 ? c.mail_code : c.rcpt_code.empty() ? 554 : c.rcpt_code[0],
+                                  c.mail_code / 100 != 2 ? c.mail_text : c.rcpt_text.empty() ? "" : c.rcpt_text[0]);
+                return;
+            }
             // Without pipelining, the next command goes once this one is answered.
             if (!c.unsent.empty() && c.expect.empty())
             {
@@ -1405,7 +1507,38 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
             }
             return;
         }
+        case st::body:
         case st::dot:
+            if (c.bdat)
+            {
+                // Each chunk is answered; the first refusal is the message's, and the last answer ends it.
+                if (c.bdat_out)
+                    --c.bdat_out;
+                if (!ok && !c.bdat_code)
+                {
+                    c.bdat_code = code;
+                    c.bdat_text = said;
+                }
+                if (c.bdat_out || !(c.bdat_last || c.bdat_code))
+                {
+                    if (c.bdat_code == 0 && c.state == st::body && c.outq.empty() && !c.reading)
+                        conn_body(c);
+                    return;
+                }
+                c.deadline_ms = 0;
+                if (c.bdat_code)
+                {
+                    // A chunk refused before the last leaves a transaction for RSET to clear.
+                    if (!c.bdat_last)
+                        c.state = st::transaction;
+                    conn_end_item(c, c.bdat_code, c.bdat_text);
+                    return;
+                }
+                conn_end_item(c, code, said);
+                return;
+            }
+            if (c.state == st::body)
+                return;
             c.deadline_ms = 0;
             conn_end_item(c, code, said);
             return;
@@ -1472,19 +1605,52 @@ void delivery::conn_begin(out_conn& c)
         mail += " BODY=8BITMIME";
     if (utf8 && c.utf8)
         mail += " SMTPUTF8";
+    // What the sender asked to be told goes on to a server that tells it (RFC 3461 6.2).
+    if (c.dsn && e.ret)
+        mail += e.ret == 1 ? " RET=FULL" : " RET=HDRS";
+    if (c.dsn && !e.envid.empty())
+        mail += " ENVID=" + e.envid;
     mail += "\r\n";
     std::vector<std::string> cmds;
     cmds.push_back(std::move(mail));
     for (const auto& t : it.to)
-        cmds.push_back("RCPT TO:<" + t.addr + ">\r\n");
-    cmds.push_back("DATA\r\n");
+    {
+        std::string rcpt = "RCPT TO:<" + t.addr + ">";
+        if (c.dsn && t.rcpt < e.rcpts.size())
+        {
+            const spool_rcpt& r = e.rcpts[t.rcpt];
+            if (r.notify)
+            {
+                std::string n;
+                for (const auto& [bit, word] : {std::pair{notify_never, "NEVER"}, {notify_success, "SUCCESS"},
+                                                {notify_failure, "FAILURE"}, {notify_delay, "DELAY"}})
+                    if (r.notify & bit)
+                        n += (n.empty() ? "" : ",") + std::string(word);
+                rcpt += " NOTIFY=" + n;
+            }
+            // An address an alias rewrote keeps the one the sender gave.
+            if (!r.orcpt.empty())
+                rcpt += " ORCPT=" + r.orcpt;
+            else if (t.addr != r.addr)
+                rcpt += " ORCPT=rfc822;" + xtext_encode(r.addr);
+        }
+        cmds.push_back(rcpt + "\r\n");
+    }
+    // BDAT where it is offered with PIPELINING: the body goes as it is, with nothing to stuff.
+    c.bdat = c.chunking && c.pipelining;
+    c.bdat_out = 0;
+    c.bdat_last = false;
+    c.bdat_code = 0;
+    c.bdat_text.clear();
+    if (!c.bdat)
+        cmds.push_back("DATA\r\n");
     if (c.pipelining)
     {
         std::string all;
         for (size_t i = 0; i < cmds.size(); ++i)
         {
             all += cmds[i];
-            c.expect.push_back(i == 0 ? 'M' : i + 1 == cmds.size() ? 'D' : 'R');
+            c.expect.push_back(i == 0 ? 'M' : i + 1 == cmds.size() && !c.bdat ? 'D' : 'R');
         }
         conn_send(c, std::move(all));
         return;
@@ -1500,6 +1666,11 @@ void delivery::conn_body(out_conn& c)
     if (!c.cur || c.reading)
         return;
     const entry_ptr e = c.cur->e;
+    if (c.bdat)
+    {
+        conn_chunk(c);
+        return;
+    }
     if (!c.signature_sent)
     {
         c.signature_sent = true;
@@ -1541,6 +1712,63 @@ void delivery::conn_body(out_conn& c)
     });
 }
 
+void delivery::conn_chunk(out_conn& c)
+{
+    if (c.bdat_last || c.bdat_code)
+        return;
+    const entry_ptr e = c.cur->e;
+    std::string sig;
+    if (!c.signature_sent)
+    {
+        c.signature_sent = true;
+        if (const auto it = m_signed.find(e->id); it != m_signed.end())
+            sig = it->second;
+    }
+    const auto send = [this](out_conn& c, std::string sig, std::string_view b, bool last) {
+        std::string out = "BDAT " + std::to_string(sig.size() + b.size()) + (last ? " LAST\r\n" : "\r\n");
+        out.reserve(out.size() + sig.size() + b.size());
+        out += sig;
+        out.append(b);
+        ++c.bdat_out;
+        c.bdat_last = last;
+        if (last)
+        {
+            c.state = out_conn::st::dot;
+            c.deadline_ms = wall::now_ms_coarse() + final_ms;
+        }
+        else
+            c.deadline_ms = wall::now_ms_coarse() + command_ms;
+        conn_send(c, std::move(out));
+    };
+    if (c.body_off >= e->body_len)
+    {
+        send(c, std::move(sig), {}, true);
+        return;
+    }
+    c.reading = true;
+    const uint64_t id = c.id, gen = c.gen;
+    m_run.queue().read(e, c.body_off, body_chunk,
+                       [this, id, gen, send, sig = std::move(sig), alive = m_alive](bool ok, std::string_view b) mutable {
+                           if (!*alive)
+                               return;
+                           const auto it = m_conns.find(id);
+                           if (it == m_conns.end() || it->second->gen != gen)
+                               return;
+                           out_conn& c = *it->second;
+                           c.reading = false;
+                           // A chunk refused while this one was read ended the message.
+                           if (!c.cur || c.state != out_conn::st::body || c.bdat_code)
+                               return;
+                           if (!ok || b.empty())
+                           {
+                               conn_fail(c, "451 4.3.0 the message could not be read from the spool", false);
+                               return;
+                           }
+                           c.body_off += b.size();
+                           send(c, std::move(sig), b, c.body_off >= c.cur->e->body_len);
+                       });
+}
+
 void delivery::conn_end_item(out_conn& c, int code, const std::string& text)
 {
     if (!c.cur)
@@ -1557,7 +1785,7 @@ void delivery::conn_end_item(out_conn& c, int code, const std::string& text)
             rc = c.rcpt_code[t];
             rt = c.rcpt_text[t];
         }
-        result(*it, t, rc, rt.empty() ? std::to_string(rc) : rt, rc / 100 == 4 || rc == 0);
+        result(*it, t, rc, rt.empty() ? std::to_string(rc) : rt, rc / 100 == 4 || rc == 0, c.dsn ? 0 : 2);
     }
     if (--m_out[it->e->id] == 0)
         attempt_over(it->e);

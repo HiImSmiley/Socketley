@@ -28,10 +28,17 @@ enum class rcpt_state : uint8_t { waiting, delivered, failed };
 
 struct spool_rcpt
 {
+    spool_rcpt() = default;
+    explicit spool_rcpt(std::string a) : addr(std::move(a)) {}
     std::string addr;
     rcpt_state  state{rcpt_state::waiting};
     // The last answer, for the bounce and for `socketley mail ... show`.
     std::string why;
+    // What its sender asked to be told (RFC 3461): NOTIFY's bits and ORCPT as given.
+    uint8_t     notify{0};
+    std::string orcpt;
+    // Delivered where its NOTIFY went no further, so a success is this runtime's to report: 1 delivered, 2 relayed.
+    uint8_t     report{0};
 };
 
 struct spool_entry
@@ -46,6 +53,10 @@ struct spool_entry
     int64_t     at_ms{0};
     // A bounce this runtime wrote, so a failure of its own is not answered with another.
     bool        bounce{false};
+    // RET (1 FULL, 2 HDRS) and ENVID of its MAIL, and whether its delay was reported.
+    uint8_t     ret{0};
+    std::string envid;
+    bool        delay_told{false};
     // What SPF, DKIM and DMARC said of it as it arrived: the value of its Authentication-Results, and the folder
     // DMARC sent it to.
     std::string auth;
@@ -88,6 +99,8 @@ public:
     void mark(spool_entry& e, size_t rcpt, rcpt_state s, std::string_view why);
     // The next try of what is still waiting.
     void retry(spool_entry& e, uint32_t attempts, int64_t next_ms);
+    // Its sender was told the message is late.
+    void delay_told(spool_entry& e);
     // What the checks of its arrival said, kept for its mailboxes.
     void note_auth(spool_entry& e, std::string results, std::string folder);
     // Every recipient's delivery is over, or the message is dropped: its file goes, or its record no longer counts.

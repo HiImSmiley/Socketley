@@ -72,7 +72,7 @@ struct hooks : smtp_session::hooks
         messages.push_back(body);
         answer([done] { done({250, ""}); });
     }
-    void data_abort() override {}
+    void data_abort(bool) override {}
     void close() override {}
 };
 

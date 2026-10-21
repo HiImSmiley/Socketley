@@ -27,6 +27,25 @@ struct address
     std::string text() const { return empty() ? std::string() : local + "@" + domain; }
 };
 
+// What a client asked to be told of a recipient (RFC 3461): NOTIFY as bits, none of them for the default, and ORCPT
+// as it was given, its address type and its xtext.
+enum : uint8_t
+{
+    notify_never = 1,
+    notify_success = 2,
+    notify_failure = 4,
+    notify_delay = 8,
+};
+struct dsn_rcpt
+{
+    uint8_t     notify{0};
+    std::string orcpt;
+};
+
+// The xtext of RFC 3461 4: printable ASCII but '+' and '=', the rest as "+XX"; false for text that is not one.
+bool xtext_decode(std::string_view in, std::string& out);
+std::string xtext_encode(std::string_view in);
+
 // `<local@domain>` with the brackets, a quoted local part and an internationalized one allowed where `utf8`;
 // false for anything else, or one past RFC 5321's lengths.
 bool parse_path(std::string_view in, address& out, bool allow_null, bool utf8);
@@ -77,8 +96,8 @@ public:
         virtual void data_bytes(std::string_view piece) = 0;
         // The whole of it is in: `done` with 250 once it is on the disk, or why not.
         virtual void data_end(std::function<void(rcpt_verdict)> done) = 0;
-        // What data_begin() began goes, the message refused or the connection gone.
-        virtual void data_abort() = 0;
+        // What data_begin() began goes: refused for its size, or not (the connection gone, the transaction reset).
+        virtual void data_abort(bool too_big) = 0;
         // QUIT answered, or too many errors: the connection closes once the reply is out.
         virtual void close() = 0;
     };
@@ -104,6 +123,10 @@ public:
     const std::string& user() const { return m_user; }
     const address&     sender() const { return m_from; }
     const std::vector<address>& recipients() const { return m_rcpts; }
+    // What the client asked of reports: per recipient, RET=HDRS (2) or FULL (1) or neither, and ENVID.
+    const std::vector<dsn_rcpt>& recipients_dsn() const { return m_rcpt_dsn; }
+    uint8_t            ret() const { return m_ret; }
+    const std::string& envid() const { return m_envid; }
     bool               body_8bit() const { return m_8bit; }
     bool               smtputf8() const { return m_utf8; }
     // The bytes of the message counted so far, before the size limit is told.
@@ -116,13 +139,18 @@ public:
     static constexpr uint32_t max_errors = 20;
 
 private:
-    enum class phase : uint8_t { command, auth_plain, auth_login_user, auth_login_pass, data, waiting, closed };
+    enum class phase : uint8_t { command, auth_plain, auth_login_user, auth_login_pass, data, chunk, waiting, closed };
 
     // The commands in `m_in` from `m_at` on, until one waits for an answer or the input runs out.
     void run();
     void command(std::string_view line);
     // Message bytes from `m_in`; true once the end is seen.
     bool data(std::string_view& in);
+    // BDAT: its argument, and the bytes of the chunk, taken as they are but for a bare LF; true once the chunk is in.
+    void bdat(std::string_view arg);
+    bool chunk(std::string_view& in);
+    // The message is in: kept, or refused for what its size or a hook said.
+    void message_end();
     void say(std::string_view line);
     void say(int code, std::string_view enhanced, std::string_view text);
     void ehlo(std::string_view arg, bool extended);
@@ -158,6 +186,17 @@ private:
     uint8_t     m_dstate{0};
     uint64_t    m_size{0};
     bool        m_dropping{false};
+    // BDAT: the bytes of the chunk still to come, whether it is the last, whether the message began, and whether the
+    // chunk is refused already and read only to be dropped.
+    uint64_t    m_chunk_left{0};
+    bool        m_chunk_last{false};
+    bool        m_chunking{false};
+    bool        m_chunk_refused{false};
+    bool        m_chunk_cr{false};
+    std::string m_chunk_reply;
+    std::vector<dsn_rcpt> m_rcpt_dsn;
+    uint8_t     m_ret{0};
+    std::string m_envid;
     int         m_drop_code{0};
     std::string m_drop_text;
     uint32_t    m_errors{0};

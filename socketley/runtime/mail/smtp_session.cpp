@@ -136,6 +136,52 @@ bool parse_path(std::string_view in, address& out, bool allow_null, bool utf8)
     return parse_address(inner, out, utf8);
 }
 
+bool xtext_decode(std::string_view in, std::string& out)
+{
+    out.clear();
+    for (size_t i = 0; i < in.size(); ++i)
+    {
+        const auto c = static_cast<unsigned char>(in[i]);
+        if (c == '+')
+        {
+            // Two upper-case hex digits follow the '+'.
+            unsigned v = 0;
+            if (i + 2 >= in.size() || std::islower(static_cast<unsigned char>(in[i + 1])) ||
+                std::islower(static_cast<unsigned char>(in[i + 2])))
+                return false;
+            const auto r = std::from_chars(in.data() + i + 1, in.data() + i + 3, v, 16);
+            if (r.ec != std::errc() || r.ptr != in.data() + i + 3)
+                return false;
+            out.push_back(static_cast<char>(v));
+            i += 2;
+            continue;
+        }
+        if (c < 33 || c > 126 || c == '=')
+            return false;
+        out.push_back(static_cast<char>(c));
+    }
+    return true;
+}
+
+std::string xtext_encode(std::string_view in)
+{
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string out;
+    for (const char ch : in)
+    {
+        const auto c = static_cast<unsigned char>(ch);
+        if (c < 33 || c > 126 || c == '+' || c == '=')
+        {
+            out.push_back('+');
+            out.push_back(hex[c >> 4]);
+            out.push_back(hex[c & 15]);
+        }
+        else
+            out.push_back(ch);
+    }
+    return out;
+}
+
 smtp_session::smtp_session(const smtp_config& cfg, hooks& h)
     : m_cfg(cfg), m_hooks(h), m_alive(std::make_shared<bool>(true))
 {
@@ -188,9 +234,18 @@ void smtp_session::error(int code, std::string_view enhanced, std::string_view t
 
 void smtp_session::reset()
 {
+    // A message BDAT began goes with the transaction.
+    if (m_chunking)
+    {
+        m_chunking = false;
+        m_hooks.data_abort(false);
+    }
     m_from = {};
     m_have_from = false;
     m_rcpts.clear();
+    m_rcpt_dsn.clear();
+    m_ret = 0;
+    m_envid.clear();
     m_8bit = false;
     m_utf8 = false;
     m_declared = 0;
@@ -216,11 +271,11 @@ void smtp_session::input(std::string_view bytes)
     if (m_phase == phase::closed)
         return;
     // A message's bytes with nothing kept ahead of them are read where they lie.
-    if (m_phase == phase::data && m_at == m_in.size())
+    if ((m_phase == phase::data || m_phase == phase::chunk) && m_at == m_in.size())
     {
         m_in.clear();
         m_at = 0;
-        if (!data(bytes))
+        if (!(m_phase == phase::data ? data(bytes) : chunk(bytes)))
             return;
         m_in.assign(bytes);
         run();
@@ -235,11 +290,11 @@ void smtp_session::run()
     m_running = true;
     while (m_phase != phase::waiting && m_phase != phase::closed && m_at < m_in.size())
     {
-        if (m_phase == phase::data)
+        if (m_phase == phase::data || m_phase == phase::chunk)
         {
             std::string_view rest(m_in.data() + m_at, m_in.size() - m_at);
             const size_t before = rest.size();
-            const bool ended = data(rest);
+            const bool ended = m_phase == phase::data ? data(rest) : chunk(rest);
             m_at += before - rest.size();
             if (!ended)
                 break;
@@ -344,6 +399,8 @@ void smtp_session::command(std::string_view line)
             return error(503, "5.5.1", "MAIL first");
         if (m_rcpts.empty())
             return error(554, "5.5.1", "No valid recipients");
+        if (m_chunking)
+            return error(503, "5.5.1", "BDAT already began the message");
         if (!m_hooks.data_begin())
         {
             say(451, "4.3.0", "The message cannot be kept now, try again later");
@@ -357,6 +414,8 @@ void smtp_session::command(std::string_view line)
         say(354, {}, "End data with <CR><LF>.<CR><LF>");
         return;
     }
+    if (iequals(verb, "BDAT"))
+        return bdat(arg);
     if (iequals(verb, "RSET"))
     {
         reset();
@@ -420,6 +479,8 @@ void smtp_session::ehlo(std::string_view arg, bool extended)
     out += "250-SIZE " + std::to_string(m_cfg.max_size) + "\r\n";
     out += "250-8BITMIME\r\n";
     out += "250-SMTPUTF8\r\n";
+    out += "250-CHUNKING\r\n";
+    out += "250-DSN\r\n";
     if (m_cfg.tls_offered && !m_cfg.tls_active)
         out += "250-STARTTLS\r\n";
     if (m_cfg.auth_offered && m_user.empty() && (m_cfg.tls_active || m_cfg.auth_in_clear))
@@ -448,6 +509,8 @@ void smtp_session::mail(std::string_view arg)
     std::string_view params = trim(rest.substr(close + 1));
     bool utf8 = false, eight = false;
     uint64_t declared = 0;
+    uint8_t ret = 0;
+    std::string envid;
     while (!params.empty())
     {
         const size_t sp = params.find(' ');
@@ -476,6 +539,20 @@ void smtp_session::mail(std::string_view arg)
         {
             // The identity a relay says it was told: taken as said, since only a signed-in client may say one.
         }
+        else if (istarts(p, "RET="))
+        {
+            const std::string_view v = p.substr(4);
+            if (ret || !(socketley::ascii::iequals(v, "FULL") || socketley::ascii::iequals(v, "HDRS")))
+                return error(501, "5.5.4", "Bad RET");
+            ret = socketley::ascii::iequals(v, "FULL") ? 1 : 2;
+        }
+        else if (istarts(p, "ENVID="))
+        {
+            std::string plain;
+            if (!envid.empty() || !xtext_decode(p.substr(6), plain) || plain.empty() || plain.size() > 100)
+                return error(501, "5.5.4", "Bad ENVID");
+            envid = std::string(p.substr(6));
+        }
         else
             return error(555, "5.5.4", "Unsupported parameter");
     }
@@ -485,13 +562,15 @@ void smtp_session::mail(std::string_view arg)
     if (!from.empty() && from.domain.empty())
         return error(501, "5.1.7", "Bad sender address syntax");
     wait();
-    m_hooks.mail_from(from, [this, alive = m_alive, from, utf8, eight, declared](rcpt_verdict v) {
+    m_hooks.mail_from(from, [this, alive = m_alive, from, utf8, eight, declared, ret, envid](rcpt_verdict v) {
         if (!*alive)
             return;
         if (v.code / 100 == 2)
         {
             m_from = from;
             m_have_from = true;
+            m_ret = ret;
+            m_envid = envid;
             m_utf8 = utf8;
             m_8bit = eight;
             m_declared = declared;
@@ -516,15 +595,55 @@ void smtp_session::rcpt(std::string_view arg)
     address to;
     if (!parse_path(rest.substr(0, close + 1), to, false, m_utf8))
         return error(501, "5.1.3", "Bad recipient address syntax");
+    dsn_rcpt dsn;
+    std::string_view params = trim(rest.substr(close + 1));
+    while (!params.empty())
+    {
+        const size_t sp = params.find(' ');
+        const std::string_view p = params.substr(0, sp);
+        params = sp == std::string_view::npos ? std::string_view{} : trim(params.substr(sp + 1));
+        if (istarts(p, "NOTIFY="))
+        {
+            std::string_view list = p.substr(7);
+            if (dsn.notify || list.empty())
+                return error(501, "5.5.4", "Bad NOTIFY");
+            while (!list.empty())
+            {
+                const size_t comma = list.find(',');
+                const std::string_view w = list.substr(0, comma);
+                list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+                using socketley::ascii::iequals;
+                const uint8_t bit = iequals(w, "NEVER") ? notify_never : iequals(w, "SUCCESS") ? notify_success
+                                  : iequals(w, "FAILURE") ? notify_failure : iequals(w, "DELAY") ? notify_delay : 0;
+                // NEVER stands alone (RFC 3461 4.1).
+                if (!bit || (dsn.notify & bit) || (bit == notify_never && dsn.notify) || (dsn.notify & notify_never))
+                    return error(501, "5.5.4", "Bad NOTIFY");
+                dsn.notify |= bit;
+            }
+        }
+        else if (istarts(p, "ORCPT="))
+        {
+            const std::string_view v = p.substr(6);
+            const size_t semi = v.find(';');
+            std::string plain;
+            if (!dsn.orcpt.empty() || semi == 0 || semi == std::string_view::npos || v.size() > 500 ||
+                !xtext_decode(v.substr(semi + 1), plain))
+                return error(501, "5.5.4", "Bad ORCPT");
+            dsn.orcpt = std::string(v);
+        }
+        else
+            return error(555, "5.5.4", "Unsupported parameter");
+    }
     if (m_rcpts.size() >= m_cfg.max_rcpt)
         return say(452, "4.5.3", "Too many recipients");
     wait();
-    m_hooks.rcpt_to(to, [this, alive = m_alive, to](rcpt_verdict v) {
+    m_hooks.rcpt_to(to, [this, alive = m_alive, to, dsn = std::move(dsn)](rcpt_verdict v) {
         if (!*alive)
             return;
         if (v.code / 100 == 2)
         {
             m_rcpts.push_back(to);
+            m_rcpt_dsn.push_back(dsn);
             say(250, "2.1.5", v.text.empty() ? "OK" : v.text);
         }
         else
@@ -631,8 +750,9 @@ void smtp_session::tls_started()
 
 void smtp_session::gone()
 {
-    if (m_phase == phase::data)
-        m_hooks.data_abort();
+    if (m_phase == phase::data || m_chunking)
+        m_hooks.data_abort(false);
+    m_chunking = false;
     m_phase = phase::closed;
 }
 
@@ -744,7 +864,7 @@ bool smtp_session::data(std::string_view& in)
         if (m_size > m_cfg.max_size)
         {
             drop_data(552, "5.3.4", "Message size exceeds the limit");
-            m_hooks.data_abort();
+            m_hooks.data_abort(true);
         }
         else
             m_hooks.data_bytes(out);
@@ -761,6 +881,12 @@ bool smtp_session::data(std::string_view& in)
         say(std::to_string(code) + " " + text);
         return true;
     }
+    message_end();
+    return true;
+}
+
+void smtp_session::message_end()
+{
     wait();
     m_hooks.data_end([this, alive = m_alive](rcpt_verdict v) {
         if (!*alive)
@@ -772,6 +898,111 @@ bool smtp_session::data(std::string_view& in)
         reset();
         resume();
     });
+}
+
+void smtp_session::bdat(std::string_view arg)
+{
+    const size_t sp = arg.find(' ');
+    const std::string_view n = arg.substr(0, sp);
+    const std::string_view rest = sp == std::string_view::npos ? std::string_view{} : trim(arg.substr(sp + 1));
+    uint64_t size = 0;
+    const auto r = std::from_chars(n.data(), n.data() + n.size(), size);
+    if (n.empty() || r.ec != std::errc() || r.ptr != n.data() + n.size() ||
+        !(rest.empty() || socketley::ascii::iequals(rest, "LAST")))
+        // A chunk whose size cannot be read cannot be skipped either: the connection is not to be trusted after it.
+        return error(501, "5.5.4", "Syntax: BDAT <size> [LAST]");
+    m_chunk_left = size;
+    m_chunk_last = !rest.empty();
+    m_chunk_refused = false;
+    m_chunk_reply.clear();
+    // A chunk that cannot be taken is read all the same, as its bytes are no commands (RFC 3030 2).
+    if (!m_have_from)
+    {
+        m_chunk_refused = true;
+        m_chunk_reply = "503 5.5.1 MAIL first";
+    }
+    else if (m_rcpts.empty())
+    {
+        m_chunk_refused = true;
+        m_chunk_reply = "554 5.5.1 No valid recipients";
+    }
+    else if (!m_chunking)
+    {
+        if (!m_hooks.data_begin())
+        {
+            m_chunk_refused = true;
+            m_chunk_reply = "451 4.3.0 The message cannot be kept now, try again later";
+        }
+        else
+        {
+            m_chunking = true;
+            m_size = 0;
+            m_dropping = false;
+            m_chunk_cr = false;
+        }
+    }
+    m_phase = phase::chunk;
+    if (m_chunk_left == 0)
+    {
+        std::string_view none;
+        chunk(none);
+    }
+}
+
+bool smtp_session::chunk(std::string_view& in)
+{
+    const size_t n = static_cast<size_t>(std::min<uint64_t>(m_chunk_left, in.size()));
+    const std::string_view piece = in.substr(0, n);
+    in.remove_prefix(n);
+    m_chunk_left -= n;
+    if (!m_chunk_refused && !m_dropping && !piece.empty())
+    {
+        // A bare LF is written as CRLF, as DATA writes it, so what is relayed by DATA ends where this one ends.
+        std::string out;
+        out.reserve(piece.size() + 16);
+        size_t from = 0;
+        for (size_t i = 0; i < piece.size(); ++i)
+            if (piece[i] == '\n' && !(i ? piece[i - 1] == '\r' : m_chunk_cr))
+            {
+                out.append(piece, from, i - from);
+                out.append("\r\n");
+                from = i + 1;
+            }
+        out.append(piece, from, piece.size() - from);
+        m_chunk_cr = piece.back() == '\r';
+        m_size += out.size();
+        if (m_size > m_cfg.max_size)
+        {
+            m_dropping = true;
+            m_hooks.data_abort(true);
+        }
+        else
+            m_hooks.data_bytes(out);
+    }
+    if (m_chunk_left > 0)
+        return false;
+    m_phase = phase::command;
+    if (m_chunk_refused)
+    {
+        say(m_chunk_reply);
+        return true;
+    }
+    if (m_dropping)
+    {
+        // The message is over its size: the transaction goes, and a BDAT after this one is told MAIL first.
+        m_chunking = false;
+        m_dropping = false;
+        reset();
+        say(552, "5.3.4", "Message size exceeds the limit");
+        return true;
+    }
+    if (!m_chunk_last)
+    {
+        say(250, "2.0.0", std::to_string(m_size) + " octets received");
+        return true;
+    }
+    m_chunking = false;
+    message_end();
     return true;
 }
 

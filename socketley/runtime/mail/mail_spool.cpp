@@ -44,7 +44,15 @@ std::string header_of(const spool_entry& e)
     h += "at " + std::to_string(e.at_ms) + "\n";
     h += "from " + one_line(e.from) + "\n";
     for (const auto& r : e.rcpts)
+    {
         h += "rcpt " + one_line(r.addr) + "\n";
+        if (r.notify || !r.orcpt.empty())
+            h += "dsn " + std::to_string(r.notify) + " " + one_line(r.orcpt) + "\n";
+    }
+    if (e.ret)
+        h += "ret " + std::to_string(e.ret) + "\n";
+    if (!e.envid.empty())
+        h += "envid " + one_line(e.envid) + "\n";
     if (!e.user.empty())
         h += "user " + one_line(e.user) + "\n";
     if (!e.peer.empty())
@@ -109,7 +117,7 @@ bool parse_header(std::string_view text, spool_entry& e, size_t& header_len)
         else if (key == "from")
             e.from = std::string(val);
         else if (key == "rcpt")
-            e.rcpts.push_back({std::string(val), rcpt_state::waiting, {}});
+            e.rcpts.emplace_back(std::string(val));
         else if (key == "user")
             e.user = std::string(val);
         else if (key == "peer")
@@ -118,6 +126,17 @@ bool parse_header(std::string_view text, spool_entry& e, size_t& header_len)
             e.helo = std::string(val);
         else if (key == "bounce")
             e.bounce = val == "1";
+        else if (key == "dsn" && !e.rcpts.empty())
+        {
+            const size_t sp = val.find(' ');
+            number(val.substr(0, sp), e.rcpts.back().notify);
+            if (sp != std::string_view::npos)
+                e.rcpts.back().orcpt = std::string(val.substr(sp + 1));
+        }
+        else if (key == "ret")
+            number(val, e.ret);
+        else if (key == "envid")
+            e.envid = std::string(val);
     }
     return false;
 }
@@ -396,6 +415,8 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
             size_t i = 0;
             if (kind == 'x')
                 dropped.push_back(e.id);
+            else if (kind == 'w')
+                e.delay_told = true;
             else if (kind == 'a')
             {
                 e.folder = std::string(line.substr(0, b));
@@ -431,6 +452,8 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
             compact += id + " r " + std::to_string(e->attempts) + " " + std::to_string(e->next_ms) + "\n";
         if (!e->auth.empty())
             compact += id + " a " + (e->folder.empty() ? "INBOX" : e->folder) + " " + e->auth + "\n";
+        if (e->delay_told)
+            compact += id + " w\n";
         for (size_t i = 0; i < e->rcpts.size(); ++i)
             if (e->rcpts[i].state != rcpt_state::waiting)
                 compact += id + (e->rcpts[i].state == rcpt_state::delivered ? " d " : " f ") + std::to_string(i) +
@@ -1080,6 +1103,12 @@ void spool::retry(spool_entry& e, uint32_t attempts, int64_t next_ms)
     e.attempts = attempts;
     e.next_ms = next_ms;
     log(e.id + " r " + std::to_string(attempts) + " " + std::to_string(next_ms) + "\n");
+}
+
+void spool::delay_told(spool_entry& e)
+{
+    e.delay_told = true;
+    log(e.id + " w\n");
 }
 
 void spool::note_auth(spool_entry& e, std::string results, std::string folder)

@@ -100,8 +100,12 @@ private:
     void open_conn(route& r);
     void finished(const entry_ptr& e);
     void attempt_over(const entry_ptr& e);
-    void result(const item& it, size_t t, int code, const std::string& text, bool temporary);
-    void bounce(const entry_ptr& e);
+    // `report` says who tells a success its sender asked to hear of: 1 delivered here, 2 relayed to a server that
+    // was not asked to, 0 the next hop.
+    void result(const item& it, size_t t, int code, const std::string& text, bool temporary, uint8_t report = 0);
+    // The delivery status report of what failed and what NOTIFY asked to hear of, or of a delay.
+    void report(const entry_ptr& e, bool delay);
+    static bool reported(const spool_rcpt& r, bool delay);
     void sign_then(const entry_ptr& e, std::function<void()> go);
     struct sign_job
     {
@@ -126,6 +130,7 @@ private:
     void conn_next(out_conn& c);
     void conn_begin(out_conn& c);
     void conn_body(out_conn& c);
+    void conn_chunk(out_conn& c);
     void conn_fail(out_conn& c, const std::string& why, bool next_address);
     void conn_close(out_conn& c);
     void conn_end_item(out_conn& c, int code, const std::string& text);
@@ -161,6 +166,7 @@ private:
     uint64_t m_deferred{0};
     uint64_t m_failed{0};
     uint64_t m_bounced{0};
+    uint64_t m_reports{0};
     uint64_t m_connects{0};
     uint64_t m_tls_sessions{0};
     uint64_t m_transactions{0};

@@ -153,7 +153,7 @@ private:
         bool data_begin() override;
         void data_bytes(std::string_view piece) override;
         void data_end(std::function<void(rcpt_verdict)> done) override;
-        void data_abort() override;
+        void data_abort(bool too_big) override;
         void close() override;
         void login(std::string user, std::string password, std::function<void(bool, std::string)> done) override;
         void acknowledge() override;
