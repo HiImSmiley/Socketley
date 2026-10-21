@@ -4,10 +4,16 @@
 #include <filesystem>
 #include <set>
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "mail_instance.h"
 #include "mail_mailbox.h"
 #include "mail_run.h"
 #include "mail_spool.h"
+#include "../../shared/loop/blocking_write.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/persist/read_file.h"
 #include "../../shared/persist/replaced_file.h"
@@ -51,10 +57,18 @@ imap_store::~imap_store()
 
 void imap_store::flush_now()
 {
-    // Every one, since a save handed to the pool before the stop may never have been written.
+    // What was appended since the last sync, synced in line, since nothing after a stop waits for the pool.
     for (auto& [name, u] : m_users)
-        if (u.loaded)
-            save(name, true);
+        if (u.unsynced)
+        {
+            const int fd = ::open((path_of(name) + ".log").c_str(), O_WRONLY | O_CLOEXEC);
+            if (fd >= 0)
+            {
+                if (::fdatasync(fd) != 0) {}
+                ::close(fd);
+            }
+            u.unsynced = false;
+        }
 }
 
 const std::vector<std::pair<std::string, std::string>>& imap_store::special()
@@ -79,7 +93,6 @@ std::shared_ptr<imap_folder> imap_store::make_folder(user_state& u, const std::s
     f->name = name;
     f->uidvalidity = static_cast<uint32_t>(wall::now_ms() / 1000);
     u.folders[name] = f;
-    u.dirty = true;
     return f;
 }
 
@@ -89,103 +102,406 @@ imap_store::user_state& imap_store::user(const std::string& name)
     if (!u.loaded)
     {
         u.loaded = true;
-        load(name, u);
+        reload(name, u);
+        // The folders every mailbox has, logged by the first shard to want them so every shard has their UIDVALIDITY.
+        bool missing = false;
         for (const auto& [f, use] : special())
-            if (!u.folders.count(f))
-                make_folder(u, f);
+            missing = missing || !u.folders.count(f);
+        if (missing)
+            mutate(name, [this](user_state& us, std::string& lines) {
+                for (const auto& [f, use] : special())
+                    if (!us.folders.count(f))
+                    {
+                        auto made = make_folder(us, f);
+                        lines += "F " + std::to_string(made->uidvalidity) + " " + f + "\n";
+                    }
+            });
     }
     return u;
 }
 
-void imap_store::load(const std::string& name, user_state& u)
+void imap_store::apply(user_state& u, std::string_view text, bool fresh)
 {
-    std::string text;
-    if (!socketley::read_file(path_of(name), text, {.missing_ok = true}, nullptr) || !text.starts_with("SKLIMAP1\n"))
-        return;
-    std::string_view rest = std::string_view(text).substr(9);
-    std::shared_ptr<imap_folder> f;
-    while (!rest.empty())
-    {
-        std::string_view line = socketley::take_item(rest, '\n');
-        if (line.size() < 2)
-            continue;
+    const auto num = [](std::string_view v) { return std::strtoull(std::string(v).c_str(), nullptr, 10); };
+    // The words of a line before its last field, which may hold spaces.
+    const auto words = [](std::string_view& l, int n) {
         std::vector<std::string_view> w;
-        std::string_view l = line.substr(2);
-        // F <uidvalidity> <uidnext> <subscribed> <name>, M <uid> <flags> <size> <date> <key>; the last word may hold spaces.
-        const int fixed = line[0] == 'F' ? 3 : 4;
-        for (int i = 0; i < fixed; ++i)
+        for (int i = 0; i < n; ++i)
         {
             const size_t sp = l.find(' ');
             w.push_back(l.substr(0, sp));
             l = sp == std::string_view::npos ? std::string_view{} : l.substr(sp + 1);
         }
-        const auto num = [](std::string_view s) { return std::strtoull(std::string(s).c_str(), nullptr, 10); };
-        if (line[0] == 'F' && !l.empty())
+        return w;
+    };
+    const auto folder = [&u](std::string_view name) -> imap_folder* {
+        const auto it = u.folders.find(std::string(name));
+        return it == u.folders.end() ? nullptr : it->second.get();
+    };
+    while (!text.empty())
+    {
+        std::string_view line = socketley::take_item(text, '\n');
+        if (line.size() < 3 || line[1] != ' ')
+            continue;
+        std::string_view l = line.substr(2);
+        switch (line[0])
         {
-            f = std::make_shared<imap_folder>();
-            f->name = std::string(l);
-            f->uidvalidity = static_cast<uint32_t>(num(w[0]));
-            f->uidnext = static_cast<uint32_t>(num(w[1]));
-            f->subscribed = w[2] == "1";
-            u.folders[f->name] = f;
-        }
-        else if (line[0] == 'M' && f && !l.empty())
-        {
-            imap_message m;
-            m.uid = static_cast<uint32_t>(num(w[0]));
-            m.flags = static_cast<uint8_t>(num(w[1]));
-            m.size = num(w[2]);
-            m.date_ms = static_cast<int64_t>(num(w[3]));
-            m.key = std::string(l);
-            m.recent = false;
-            f->msgs.push_back(std::move(m));
+            case 'F':
+            {
+                const auto w = words(l, 1);
+                if (l.empty() || u.folders.count(std::string(l)))
+                    break;
+                auto f = std::make_shared<imap_folder>();
+                f->name = std::string(l);
+                f->uidvalidity = static_cast<uint32_t>(num(w[0]));
+                u.folders[f->name] = std::move(f);
+                break;
+            }
+            case 'D':
+                u.folders.erase(std::string(l));
+                break;
+            case 'U':
+            {
+                const auto w = words(l, 1);
+                if (imap_folder* f = folder(l))
+                    f->subscribed = w[0] == "1";
+                break;
+            }
+            case 'A':
+            {
+                // A <uid> <flags> <size> <date> <modseq> <folder>\t<key>
+                const auto w = words(l, 5);
+                const size_t tab = l.find('\t');
+                imap_folder* f = tab == std::string_view::npos ? nullptr : folder(l.substr(0, tab));
+                if (!f)
+                    break;
+                imap_message m;
+                m.uid = static_cast<uint32_t>(num(w[0]));
+                m.flags = static_cast<uint8_t>(num(w[1]));
+                m.size = num(w[2]);
+                m.date_ms = static_cast<int64_t>(num(w[3]));
+                m.modseq = num(w[4]);
+                m.key = std::string(l.substr(tab + 1));
+                m.recent = fresh;
+                f->uidnext = std::max(f->uidnext, m.uid + 1);
+                f->highestmodseq = std::max(f->highestmodseq, m.modseq);
+                if (f->msgs.empty() || f->msgs.back().uid < m.uid)
+                    f->msgs.push_back(std::move(m));
+                else if (!f->by_uid(m.uid))
+                {
+                    const auto at = std::lower_bound(f->msgs.begin(), f->msgs.end(), m.uid,
+                                                     [](const imap_message& x, uint32_t uid) { return x.uid < uid; });
+                    f->msgs.insert(at, std::move(m));
+                }
+                ++f->version;
+                break;
+            }
+            case 'S':
+            case 'X':
+            {
+                // S <uid> <flags> <modseq> <folder>, X <uid> <modseq> <folder>
+                const auto w = words(l, line[0] == 'S' ? 3 : 2);
+                imap_folder* f = folder(l);
+                if (!f)
+                    break;
+                const uint32_t uid = static_cast<uint32_t>(num(w[0]));
+                const uint64_t modseq = num(w.back());
+                f->highestmodseq = std::max(f->highestmodseq, modseq);
+                if (line[0] == 'S')
+                {
+                    if (imap_message* m = f->by_uid(uid))
+                    {
+                        m->flags = static_cast<uint8_t>(num(w[1]));
+                        m->modseq = modseq;
+                    }
+                }
+                else
+                {
+                    std::erase_if(f->msgs, [uid](const imap_message& m) { return m.uid == uid; });
+                    f->vanished.emplace_back(modseq, uid);
+                    if (f->vanished.size() > 20000)
+                        f->vanished.erase(f->vanished.begin(), f->vanished.begin() + 10000);
+                }
+                ++f->version;
+                break;
+            }
+            default:
+                break;
         }
     }
-    for (auto& [n, folder] : u.folders)
-        std::sort(folder->msgs.begin(), folder->msgs.end(),
-                  [](const imap_message& a, const imap_message& b) { return a.uid < b.uid; });
 }
 
-void imap_store::save(const std::string& name, bool now)
+void imap_store::reload(const std::string& name, user_state& u)
 {
-    auto it = m_users.find(name);
-    if (it == m_users.end())
+    // Under the user's lock, shared, so a compaction is not caught between its snapshot and its journal.
+    const std::string base = path_of(name);
+    const int lock = ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock >= 0 && ::flock(lock, LOCK_SH) != 0) {}
+    std::map<std::string, std::shared_ptr<imap_folder>> before = std::move(u.folders);
+    u.folders.clear();
+    std::string snap, log;
+    socketley::read_file(base, snap, {.missing_ok = true}, nullptr);
+    u.snapshot_gen = 0;
+    u.snapshot_bytes = snap.size();
+    if (snap.starts_with("SKLIMAP"))
+    {
+        const bool v1 = snap.starts_with("SKLIMAP1\n");
+        std::string_view rest = snap;
+        const std::string_view head = socketley::take_item(rest, '\n');
+        if (!v1 && head.size() > 9)
+            u.snapshot_gen = std::strtoull(std::string(head.substr(9)).c_str(), nullptr, 10);
+        std::shared_ptr<imap_folder> f;
+        const auto num = [](std::string_view v) { return std::strtoull(std::string(v).c_str(), nullptr, 10); };
+        while (!rest.empty())
+        {
+            std::string_view line = socketley::take_item(rest, '\n');
+            if (line.size() < 2)
+                continue;
+            std::vector<std::string_view> w;
+            std::string_view l = line.substr(2);
+            // F <uidvalidity> <uidnext> <subscribed> [<highestmodseq>] <name>,
+            // M <uid> <flags> <size> <date> [<modseq>] <key>: the last word may hold spaces, and v1 has no modseq.
+            const int fixed = (line[0] == 'F' ? 3 : 4) + (v1 ? 0 : 1);
+            for (int i = 0; i < fixed; ++i)
+            {
+                const size_t sp = l.find(' ');
+                w.push_back(l.substr(0, sp));
+                l = sp == std::string_view::npos ? std::string_view{} : l.substr(sp + 1);
+            }
+            if (line[0] == 'F' && !l.empty())
+            {
+                f = std::make_shared<imap_folder>();
+                f->name = std::string(l);
+                f->uidvalidity = static_cast<uint32_t>(num(w[0]));
+                f->uidnext = static_cast<uint32_t>(num(w[1]));
+                f->subscribed = w[2] == "1";
+                f->highestmodseq = v1 ? 1 : std::max<uint64_t>(1, num(w[3]));
+                u.folders[f->name] = f;
+            }
+            else if (line[0] == 'M' && f && !l.empty())
+            {
+                imap_message m;
+                m.uid = static_cast<uint32_t>(num(w[0]));
+                m.flags = static_cast<uint8_t>(num(w[1]));
+                m.size = num(w[2]);
+                m.date_ms = static_cast<int64_t>(num(w[3]));
+                m.modseq = v1 ? 1 : std::max<uint64_t>(1, num(w[4]));
+                m.key = std::string(l);
+                m.recent = false;
+                f->msgs.push_back(std::move(m));
+            }
+        }
+        for (auto& [n, folder] : u.folders)
+            std::sort(folder->msgs.begin(), folder->msgs.end(),
+                      [](const imap_message& a, const imap_message& b) { return a.uid < b.uid; });
+    }
+    struct stat st{};
+    u.log_ino = 0;
+    u.log_off = 0;
+    if (socketley::read_file(base + ".log", log, {.missing_ok = true}, nullptr) && ::stat((base + ".log").c_str(), &st) == 0)
+    {
+        u.log_ino = st.st_ino;
+        // A journal of another snapshot is one a compaction already folded in.
+        std::string_view rest = log;
+        const std::string_view head = socketley::take_item(rest, '\n');
+        const size_t whole = log.rfind('\n') == std::string::npos ? 0 : log.rfind('\n') + 1;
+        if (head.starts_with("SKLIMAPLOG ") &&
+            std::strtoull(std::string(head.substr(11)).c_str(), nullptr, 10) == u.snapshot_gen)
+            apply(u, std::string_view(log).substr(head.size() + 1, whole > head.size() ? whole - head.size() - 1 : 0),
+                  false);
+        u.log_off = whole;
+    }
+    if (lock >= 0)
+        ::close(lock);
+    // The folder objects sessions hold are kept, their contents those just read.
+    for (auto& [n, f] : u.folders)
+        if (const auto it = before.find(n); it != before.end())
+        {
+            imap_folder& old = *it->second;
+            old.uidvalidity = f->uidvalidity;
+            old.uidnext = f->uidnext;
+            old.subscribed = f->subscribed;
+            old.highestmodseq = f->highestmodseq;
+            for (auto& m : f->msgs)
+                if (const imap_message* was = old.by_uid(m.uid))
+                    m.recent = was->recent;
+            old.msgs = std::move(f->msgs);
+            ++old.version;
+            f = it->second;
+        }
+}
+
+void imap_store::refresh(const std::string& name)
+{
+    if (const auto it = m_users.find(name); it != m_users.end() && it->second.loaded)
+        refresh(name, it->second);
+}
+
+void imap_store::refresh(const std::string& name, user_state& u)
+{
+    const std::string log = path_of(name) + ".log";
+    struct stat st{};
+    if (::stat(log.c_str(), &st) != 0)
+    {
+        if (u.log_ino)
+            reload(name, u);
         return;
-    it->second.dirty = false;
-    std::string text = "SKLIMAP1\n";
-    for (const auto& [n, f] : it->second.folders)
+    }
+    if (st.st_ino != u.log_ino || static_cast<uint64_t>(st.st_size) < u.log_off)
+    {
+        reload(name, u);
+        return;
+    }
+    if (static_cast<uint64_t>(st.st_size) == u.log_off)
+        return;
+    // The lines another shard appended, up to the last whole one.
+    const int fd = ::open(log.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    std::string more(static_cast<size_t>(st.st_size) - u.log_off, '\0');
+    const ssize_t n = ::pread(fd, more.data(), more.size(), static_cast<off_t>(u.log_off));
+    ::close(fd);
+    if (n <= 0)
+        return;
+    more.resize(static_cast<size_t>(n));
+    const size_t whole = more.rfind('\n');
+    if (whole == std::string::npos)
+        return;
+    apply(u, std::string_view(more).substr(0, whole + 1), true);
+    u.log_off += whole + 1;
+}
+
+void imap_store::mutate(const std::string& name, const std::function<void(user_state&, std::string& lines)>& change)
+{
+    user_state& u = m_users[name];
+    const std::string base = path_of(name);
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(base).parent_path(), ec);
+    // Held only for a read of what is new and an append: no shard waits on another's disk.
+    const int lock = ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock >= 0 && ::flock(lock, LOCK_EX) != 0) {}
+    refresh(name, u);
+    std::string lines;
+    change(u, lines);
+    if (!lines.empty())
+    {
+        const std::string log = base + ".log";
+        const int fd = ::open(log.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+        struct stat st{};
+        if (fd >= 0 && ::fstat(fd, &st) == 0)
+        {
+            if (st.st_size == 0)
+                lines = "SKLIMAPLOG " + std::to_string(u.snapshot_gen) + "\n" + lines;
+            if (socketley::write_all(fd, lines.data(), lines.size()))
+            {
+                // What this shard wrote is read already; another's lines in between were read by the refresh.
+                if (st.st_ino != u.log_ino || static_cast<uint64_t>(st.st_size) != u.log_off)
+                    u.log_off = static_cast<uint64_t>(st.st_size);
+                u.log_ino = st.st_ino;
+                u.log_off += lines.size();
+                u.unsynced = true;
+            }
+            else
+                LOG_WARN(("mail: the IMAP journal " + log + " could not be written").c_str());
+        }
+        if (fd >= 0)
+            ::close(fd);
+    }
+    if (lock >= 0)
+        ::close(lock);
+}
+
+void imap_store::compact(const std::string& name, user_state& u)
+{
+    // The journal folded into a new snapshot on a helper thread, given up there if a line came since it was built.
+    u.compacting = true;
+    const uint64_t gen = u.snapshot_gen + 1;
+    std::string text = "SKLIMAP2 " + std::to_string(gen) + "\n";
+    for (const auto& [n, f] : u.folders)
     {
         text += "F " + std::to_string(f->uidvalidity) + " " + std::to_string(f->uidnext) + " " +
-                (f->subscribed ? "1" : "0") + " " + n + "\n";
+                (f->subscribed ? "1" : "0") + " " + std::to_string(f->highestmodseq) + " " + n + "\n";
         for (const auto& m : f->msgs)
             text += "M " + std::to_string(m.uid) + " " + std::to_string(m.flags) + " " + std::to_string(m.size) + " " +
-                    std::to_string(m.date_ms) + " " + m.key + "\n";
+                    std::to_string(m.date_ms) + " " + std::to_string(m.modseq) + " " + m.key + "\n";
     }
-    // Written by a helper thread, since its sync is the disk's and not the loop's to wait for; in line at a stop.
-    const std::string path = path_of(name);
-    auto write = [path, text = std::move(text)] {
-        std::error_code ec;
-        std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-        std::string why;
-        if (!socketley::replace_file(path, text, socketley::durability::data, &why))
-            LOG_WARN(("mail: the IMAP index " + path + " could not be written: " + why).c_str());
-    };
-    if (now || !m_run.pool().enabled())
-        write();
-    else
-        m_run.pool().submit(0, std::move(write), [] {});
+    auto done = std::make_shared<bool>(false);
+    m_run.pool().submit(
+        0,
+        [base = path_of(name), text = std::move(text), gen, expect = u.log_off, ino = u.log_ino, done] {
+            const int lock = ::open((base + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+            if (lock < 0 || ::flock(lock, LOCK_EX) != 0)
+            {
+                if (lock >= 0)
+                    ::close(lock);
+                return;
+            }
+            struct stat st{};
+            std::string why;
+            if (::stat((base + ".log").c_str(), &st) == 0 && st.st_ino == ino &&
+                static_cast<uint64_t>(st.st_size) == expect &&
+                socketley::replace_file(base, text, socketley::durability::data, &why) &&
+                socketley::replace_file(base + ".log", "SKLIMAPLOG " + std::to_string(gen) + "\n",
+                                        socketley::durability::data, &why))
+                *done = true;
+            ::close(lock);
+        },
+        [this, name, done, alive = m_alive] {
+            if (!*alive)
+                return;
+            const auto it = m_users.find(name);
+            if (it == m_users.end())
+                return;
+            it->second.compacting = false;
+            // The new journal is another file, which the next refresh reads from its start.
+            if (*done)
+                reload(name, it->second);
+        });
 }
 
-void imap_store::touched(const std::string& name)
+void imap_store::set_flags(const std::string& name, const std::shared_ptr<imap_folder>& f,
+                           const std::vector<uint32_t>& uids, const std::function<uint8_t(uint8_t)>& change)
 {
-    m_users[name].dirty = true;
+    mutate(name, [&](user_state&, std::string& lines) {
+        for (const uint32_t uid : uids)
+            if (imap_message* m = f->by_uid(uid))
+            {
+                const uint8_t now = change(m->flags);
+                if (now == m->flags)
+                    continue;
+                m->flags = now;
+                m->modseq = ++f->highestmodseq;
+                lines += "S " + std::to_string(uid) + " " + std::to_string(now) + " " + std::to_string(m->modseq) + " " +
+                         f->name + "\n";
+            }
+        if (!lines.empty())
+            ++f->version;
+    });
 }
 
 void imap_store::tick(int64_t)
 {
     for (auto& [name, u] : m_users)
-        if (u.dirty)
-            save(name);
+    {
+        if (!u.loaded)
+            continue;
+        refresh(name, u);
+        if (u.unsynced)
+        {
+            u.unsynced = false;
+            m_run.pool().submit(0, [log = path_of(name) + ".log"] {
+                const int fd = ::open(log.c_str(), O_WRONLY | O_CLOEXEC);
+                if (fd >= 0)
+                {
+                    if (::fdatasync(fd) != 0) {}
+                    ::close(fd);
+                }
+            }, [] {});
+        }
+        // A journal grown past its snapshot and a quarter of a mebibyte is folded into a new one.
+        if (!u.compacting && u.log_off > (256u << 10) && u.log_off > u.snapshot_bytes)
+            compact(name, u);
+    }
 }
 
 void imap_store::folders(const std::string& name, std::function<void(std::vector<std::string>)> done)
@@ -202,15 +518,26 @@ void imap_store::folders(const std::string& name, std::function<void(std::vector
                        return;
                    user_state& u = user(name);
                    rpc::reply r;
+                   std::vector<std::string> found;
                    if (st == request_status::ok && rpc::decode(bytes, rpc::op::list, r) && r.ok)
                        for (const auto& p : r.prefixes)
                        {
                            std::string f = p.substr(name.size() + 1);
                            if (!f.empty() && f.back() == '/')
                                f.pop_back();
-                           if (!f.empty() && !u.folders.count(canonical(f)))
-                               make_folder(u, canonical(f));
+                           if (!f.empty() && !u.folders.count(canonical(f)) && f.find('\t') == std::string::npos)
+                               found.push_back(canonical(f));
                        }
+                   // A folder the bucket has and the index not is given its UIDVALIDITY once, for every shard.
+                   if (!found.empty())
+                       mutate(name, [&](user_state& us, std::string& lines) {
+                           for (const auto& f : found)
+                               if (!us.folders.count(f))
+                               {
+                                   auto x = make_folder(us, f);
+                                   lines += "F " + std::to_string(x->uidvalidity) + " " + f + "\n";
+                               }
+                       });
                    std::vector<std::string> out;
                    for (const auto& [n, f] : u.folders)
                        out.push_back(n);
@@ -220,22 +547,31 @@ void imap_store::folders(const std::string& name, std::function<void(std::vector
 
 bool imap_store::create(const std::string& name, const std::string& folder)
 {
-    user_state& u = user(name);
+    user(name);
     const std::string f = canonical(folder);
-    if (u.folders.count(f) || f.empty() || f.find_first_of("\r\n*%") != std::string::npos)
+    if (f.empty() || f.find_first_of("\r\n\t*%") != std::string::npos)
         return false;
-    make_folder(u, f);
-    return true;
+    bool made = false;
+    mutate(name, [&](user_state& u, std::string& lines) {
+        if (u.folders.count(f))
+            return;
+        auto x = make_folder(u, f);
+        lines += "F " + std::to_string(x->uidvalidity) + " " + f + "\n";
+        made = true;
+    });
+    return made;
 }
 
 void imap_store::set_subscribed(const std::string& name, const std::string& folder, bool on)
 {
-    user_state& u = user(name);
-    if (const auto it = u.folders.find(canonical(folder)); it != u.folders.end())
-    {
-        it->second->subscribed = on;
-        u.dirty = true;
-    }
+    user(name);
+    mutate(name, [&](user_state& u, std::string& lines) {
+        if (const auto it = u.folders.find(canonical(folder)); it != u.folders.end() && it->second->subscribed != on)
+        {
+            it->second->subscribed = on;
+            lines += std::string("U ") + (on ? "1 " : "0 ") + it->first + "\n";
+        }
+    });
 }
 
 void imap_store::open(const std::string& name, const std::string& folder,
@@ -265,6 +601,8 @@ void imap_store::open(const std::string& name, const std::string& folder,
     if (f->syncing)
         return;
     f->syncing = true;
+    refresh(name, u);
+    f->sync_from = f->highestmodseq;
     sync(name, f, {}, {});
 }
 
@@ -298,24 +636,38 @@ void imap_store::sync(const std::string& name, const std::shared_ptr<imap_folder
                        std::set<std::string> there;
                        for (const auto& [k, v] : *acc)
                            there.insert(k);
-                       std::set<std::string> known;
-                       const size_t before = f->msgs.size();
-                       std::erase_if(f->msgs, [&](const imap_message& m) { return !there.count(m.key); });
-                       bool changed = f->msgs.size() != before;
-                       for (const auto& m : f->msgs)
-                           known.insert(m.key);
                        std::sort(acc->begin(), acc->end());
-                       for (const auto& [k, v] : *acc)
-                           if (!known.count(k))
+                       // Under the user's lock, the index read to its end: what another shard gave a UID is known,
+                       // and a message logged after the listing began is not expunged for being missing from it.
+                       mutate(name, [&](user_state&, std::string& lines) {
+                           std::set<std::string> known;
+                           std::vector<uint32_t> gone;
+                           for (const auto& m : f->msgs)
                            {
-                               f->msgs.push_back({f->uidnext++, k, v.first, v.second, flags_of_key(k), true});
-                               changed = true;
+                               known.insert(m.key);
+                               if (!there.count(m.key) && m.modseq <= f->sync_from)
+                                   gone.push_back(m.uid);
                            }
-                       if (changed)
-                       {
-                           ++f->version;
-                           user(name).dirty = true;
-                       }
+                           for (const uint32_t uid : gone)
+                           {
+                               const uint64_t ms = ++f->highestmodseq;
+                               std::erase_if(f->msgs, [uid](const imap_message& m) { return m.uid == uid; });
+                               f->vanished.emplace_back(ms, uid);
+                               lines += "X " + std::to_string(uid) + " " + std::to_string(ms) + " " + f->name + "\n";
+                           }
+                           for (const auto& [k, v] : *acc)
+                               if (!known.count(k))
+                               {
+                                   imap_message m{f->uidnext++, k, v.first, v.second, flags_of_key(k), true,
+                                                  ++f->highestmodseq};
+                                   lines += "A " + std::to_string(m.uid) + " " + std::to_string(m.flags) + " " +
+                                            std::to_string(m.size) + " " + std::to_string(m.date_ms) + " " +
+                                            std::to_string(m.modseq) + " " + f->name + "\t" + k + "\n";
+                                   f->msgs.push_back(std::move(m));
+                               }
+                           if (!lines.empty())
+                               ++f->version;
+                       });
                        f->synced_ms = wall::now_ms_coarse();
                    }
                    f->syncing = false;
@@ -508,9 +860,25 @@ void imap_store::put_made(std::string key, std::string data, std::function<void(
                });
 }
 
+uint32_t imap_store::add_message(const std::string& name, const std::shared_ptr<imap_folder>& f, const std::string& key,
+                                 uint64_t size, int64_t date_ms, uint8_t flags)
+{
+    uint32_t uid = 0;
+    mutate(name, [&](user_state&, std::string& lines) {
+        imap_message m{f->uidnext++, key, size, date_ms, flags, true, ++f->highestmodseq};
+        uid = m.uid;
+        lines += "A " + std::to_string(m.uid) + " " + std::to_string(m.flags) + " " + std::to_string(m.size) + " " +
+                 std::to_string(m.date_ms) + " " + std::to_string(m.modseq) + " " + f->name + "\t" + key + "\n";
+        f->msgs.push_back(std::move(m));
+        ++f->version;
+    });
+    return uid;
+}
+
 void imap_store::expunge(const std::string& name, const std::shared_ptr<imap_folder>& f,
                          const std::vector<uint32_t>& only, std::function<void(std::vector<uint32_t>)> done)
 {
+    refresh(name);
     std::vector<std::pair<uint32_t, std::string>> going;
     for (const auto& m : f->msgs)
         if ((m.flags & flag_deleted) && (only.empty() || std::find(only.begin(), only.end(), m.uid) != only.end()))
@@ -525,15 +893,21 @@ void imap_store::expunge(const std::string& name, const std::shared_ptr<imap_fol
     for (const auto& [uid, key] : going)
         delete_object(key, [this, name, f, uid, left, gone, done](bool ok) {
             if (ok)
-            {
                 gone->push_back(uid);
-                std::erase_if(f->msgs, [uid](const imap_message& m) { return m.uid == uid; });
-            }
             if (--*left)
                 return;
-            ++f->version;
-            touched(name);
             std::sort(gone->begin(), gone->end());
+            mutate(name, [&](user_state&, std::string& lines) {
+                for (const uint32_t g : *gone)
+                    if (f->by_uid(g))
+                    {
+                        const uint64_t ms = ++f->highestmodseq;
+                        std::erase_if(f->msgs, [g](const imap_message& m) { return m.uid == g; });
+                        f->vanished.emplace_back(ms, g);
+                        lines += "X " + std::to_string(g) + " " + std::to_string(ms) + " " + f->name + "\n";
+                    }
+                ++f->version;
+            });
             done(std::move(*gone));
         });
 }
@@ -570,7 +944,6 @@ void imap_store::copy(const std::string& name, const std::shared_ptr<imap_folder
             return;
         if (j->at >= j->todo.size() || !j->ok)
         {
-            touched(name);
             done(j->ok, dest->uidvalidity, j->made);
             return;
         }
@@ -583,16 +956,15 @@ void imap_store::copy(const std::string& name, const std::shared_ptr<imap_folder
                 return;
             }
             const std::string key = name + "/" + dest->name + "/" + new_spool_id(0) + ".eml";
-            put_object(key, *b, [dest, j, m, key, self](bool ok) {
+            put_object(key, *b, [this, name, dest, j, m, key, self](bool ok) {
                 if (!ok)
                 {
                     j->ok = false;
                     (*self)();
                     return;
                 }
-                const uint32_t uid = dest->uidnext++;
-                dest->msgs.push_back({uid, key, m.size, m.date_ms, static_cast<uint8_t>(m.flags & ~flag_deleted), true});
-                ++dest->version;
+                const uint32_t uid = add_message(name, dest, key, m.size, m.date_ms,
+                                                 static_cast<uint8_t>(m.flags & ~flag_deleted));
                 j->made.push_back(uid);
                 (*self)();
             });
@@ -622,10 +994,7 @@ void imap_store::append(const std::string& name, const std::string& folder, std:
             done(false, 0, 0);
             return;
         }
-        const uint32_t uid = f->uidnext++;
-        f->msgs.push_back({uid, key, size, date_ms, flags, true});
-        ++f->version;
-        touched(name);
+        const uint32_t uid = add_message(name, f, key, size, date_ms, flags);
         done(true, f->uidvalidity, uid);
     });
 }
@@ -649,8 +1018,10 @@ void imap_store::remove(const std::string& name, const std::string& folder, std:
         for (auto& m : f->msgs)
             m.flags |= flag_deleted;
         expunge(name, f, {}, [this, name, fname, done](std::vector<uint32_t>) {
-            m_users[name].folders.erase(fname);
-            touched(name);
+            mutate(name, [&](user_state& u, std::string& lines) {
+                if (u.folders.erase(fname))
+                    lines += "D " + fname + "\n";
+            });
             done(true);
         });
     }, true);

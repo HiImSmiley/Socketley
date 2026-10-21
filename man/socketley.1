@@ -12834,11 +12834,15 @@ a password goes over STARTTLS or
 only (LOGINDISABLED before), except from 127.0.0.1. Every mailbox has INBOX,
 Sent, Drafts, Junk and Trash, and CREATE makes more. A folder's UIDs and flags
 are kept per user in
-.IB state /mail/ name .imap/ user ;
-the bucket stays what counts, looked at when a folder is opened and at most every
-two seconds after, so what a delivery or another client put there has the next
-UID and what went is expunged. IDLE is told of new mail within a second. The
-first shard alone serves IMAP. A connection quiet for thirty minutes is closed.
+.IB state /mail/ name .imap/ user ,
+a snapshot and a journal beside it: every shard serves IMAP, a change is a line
+appended under the user's lock once the journal is read to its end, so a UID is
+given once whichever shard gives it, and each shard reads the lines it has not
+before each command. The journal is folded into the snapshot once it passes a
+quarter of a mebibyte. The bucket stays what counts, looked at when a folder is
+opened and at most every two seconds after, so what a delivery or another client
+put there has the next UID and what went is expunged. IDLE is told of new mail
+within a second. A connection quiet for thirty minutes is closed.
 .PP
 .B From the other runtimes.
 .B socketley send

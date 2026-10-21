@@ -25,6 +25,7 @@ command -v openssl >/dev/null 2>&1 || { echo "  SKIP: openssl is required"; exit
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
+check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2', want '$3'"; fi; }
 
 daemon_isolate mailimap
 T="$SOCKETLEY_TMPD"
@@ -312,6 +313,83 @@ set -- $r
 [ "${3:-}" = True ] && ok "a message over a mebibyte in a bucket that encrypts is read back whole ($2 bytes)" \
     || bad "a message over a mebibyte in a bucket that encrypts is read back whole" "$r"
 [ "${4:-}" = False ] && ok "and is kept encrypted" || bad "and is kept encrypted" "$r"
+
+# ─── every shard serves IMAP ────────────────────────────────────────────────
+# Three shards share alice's mailbox: what one gives a UID or a flag, the others see the same.
+PSH=$((SL_PORT_BASE+1957)); IMSH=$((SL_PORT_BASE+1958))
+"$BIN" create mail msh -p "$PSH" --mail-domain example.test --idp auth --storage st/mail --imap "$IMSH" --shards 3 \
+    -s >/dev/null 2>&1
+for _ in $(seq 1 100); do [ "$(ss -ltnpH "sport = :$IMSH" | grep -o 'pid=[0-9]*' | sort -u | wc -l)" -ge 3 ] && break; sleep 0.1; done
+check_shards=$(ss -ltnpH "sport = :$IMSH" | grep -o 'pid=[0-9]*' | sort -u | wc -l)
+[ "$check_shards" -ge 3 ] && ok "IMAP listens on every shard ($check_shards)" || bad "IMAP listens on every shard" "$check_shards"
+r=$(python3 - "$IMSH" <<'PY'
+import imaplib, sys, threading
+port = int(sys.argv[1])
+def conn():
+    M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1"); return M
+errs = []
+def appender(i):
+    try:
+        M = conn()
+        for k in range(5):
+            typ, data = M.append("Shared", None, None, b"From: x@else.test\r\nSubject: s%d-%d\r\n\r\nb\r\n" % (i, k))
+            if typ != "OK": errs.append(data)
+        M.logout()
+    except Exception as e:
+        errs.append(repr(e))
+M0 = conn(); M0.create("Shared"); M0.logout()
+ts = [threading.Thread(target=appender, args=(i,)) for i in range(8)]
+[t.start() for t in ts]; [t.join() for t in ts]
+views = []
+for _ in range(6):
+    M = conn(); M.select("Shared")
+    typ, data = M.uid("FETCH", "1:*", "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+    view = {}
+    for d in data:
+        if isinstance(d, tuple):
+            uid = int(d[0].split(b"UID ")[1].split()[0])
+            view[uid] = d[1].strip()
+    views.append((M, view))
+same = all(v == views[0][1] for _, v in views)
+unique = len(set(views[0][1].values())) == 40 and len(views[0][1]) == 40
+# A flag one connection sets, every other sees after a NOOP.
+first = min(views[0][1])
+views[0][0].uid("STORE", str(first), "+FLAGS", "(\\Flagged)")
+seen = 0
+for M, _ in views[1:]:
+    M.noop()
+    typ, data = M.uid("FETCH", str(first), "(FLAGS)")
+    seen += b"\\Flagged" in data[0]
+print(len(errs), same, unique, seen)
+PY
+)
+set -- $r
+check "forty APPENDs from eight connections across the shards fail none" "${1:-x}" "0"
+[ "${2:-}" = True ] && [ "${3:-}" = True ] && ok "and every connection sees the same forty UIDs, each one message" \
+    || bad "and every connection sees the same forty UIDs, each one message" "$r"
+check "a flag one shard sets the others see" "${4:-x}" "5"
+# Thousands of changes outgrow the journal, which is folded into a snapshot; every shard reads on from it.
+r=$(python3 - "$IMSH" <<'PY'
+import imaplib, sys, time
+port = int(sys.argv[1])
+M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1"); M.select("Shared")
+for i in range(400):
+    M.uid("STORE", "1:*", "+FLAGS.SILENT" if i % 2 == 0 else "-FLAGS.SILENT", "(\\Seen)")
+M.uid("STORE", "1:*", "+FLAGS.SILENT", "(\\Answered)")
+time.sleep(3)
+flags = set()
+for _ in range(6):
+    N = imaplib.IMAP4("127.0.0.1", port); N.login("alice", "alicepassword1"); N.select("Shared")
+    typ, data = N.uid("FETCH", "1:*", "(FLAGS)")
+    flags.add(tuple(sorted(d.decode() for d in data)))
+print(len(flags), all("Answered" in x for x in next(iter(flags))))
+PY
+)
+idx=$(find "$HOME/.local/share" -path '*/mail/msh.imap/alice' 2>/dev/null | head -1)
+[ "$(head -c 10 "$idx" 2>/dev/null)" = "SKLIMAP2 1" ] || [ "$(head -c 9 "$idx" 2>/dev/null)" = "SKLIMAP2 " ] \
+    && [ "$(stat -c %s "$idx.log" 2>/dev/null)" -lt 262144 ] && ok "a journal past a quarter of a mebibyte is folded into its snapshot" \
+    || bad "a journal past a quarter of a mebibyte is folded into its snapshot" "$(head -c 20 "$idx" 2>/dev/null) $(stat -c %s "$idx.log" 2>/dev/null)"
+check "and every shard reads the same flags after" "$r" "1 True"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

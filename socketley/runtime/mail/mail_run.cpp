@@ -320,8 +320,8 @@ bool mail_run::start(std::string& why)
     if (m_owner.get_submissions_port() &&
         !open_listener(m_subs, m_owner.get_submissions_port(), port_kind::submissions, why))
         return false;
-    // IMAP on the first shard alone, whose index of each folder's UIDs is then the one there is.
-    if (m_mailboxes && m_mailboxes->enabled() && m_owner.get_shard_index() == 0)
+    // IMAP on every shard, each reading the others' changes from the users' journals.
+    if (m_mailboxes && m_mailboxes->enabled())
     {
         m_imap = std::make_unique<imap_store>(*this);
         if (m_owner.get_imap_port() && !open_listener(m_imap_l, m_owner.get_imap_port(), port_kind::imap, why))

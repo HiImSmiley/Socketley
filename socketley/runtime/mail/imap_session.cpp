@@ -598,6 +598,9 @@ void imap_session::command(std::string tag, std::vector<token> a)
     const std::string cmd = upper(a[0].text);
     const bool authed = m_state == state::auth || m_state == state::selected;
     const bool selected = m_state == state::selected;
+    // What another shard changed of this user's mailboxes is read in before each command.
+    if (authed)
+        m_store.refresh(m_user);
     const auto str = [&](size_t i) -> const std::string* {
         return i < a.size() && (a[i].k == token::atom || a[i].k == token::string) ? &a[i].text : nullptr;
     };
@@ -1137,10 +1140,7 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                 }
             }
             if (seen_now && !m_readonly && !(m->flags & flag_seen))
-            {
-                m->flags |= flag_seen;
-                m_store.touched(m_user);
-            }
+                m_store.set_flags(m_user, m_folder, {m->uid}, [](uint8_t f) { return static_cast<uint8_t>(f | flag_seen); });
             const bool flags = std::any_of(j->items.begin(), j->items.end(),
                                            [](const item& it) { return it.name == "FLAGS"; });
             if (flags || seen_now)
@@ -1195,22 +1195,20 @@ void imap_session::cmd_store(const std::string& tag, const std::vector<token>& a
     for (size_t i = from + 2; i < a.size(); ++i)
         if (a[i].k == token::atom || a[i].k == token::string)
             bits |= flag_bit(a[i].text);
+    std::vector<uint32_t> uids;
+    for (const size_t i : idx)
+        uids.push_back(m_view[i]);
+    // Changed under the user's lock on the flags as they are now, whichever shard last changed them.
+    m_store.set_flags(m_user, m_folder, uids, [&op, bits](uint8_t f) {
+        return static_cast<uint8_t>(op == "FLAGS" ? bits : op == "+FLAGS" ? f | bits : f & ~bits);
+    });
     for (const size_t i : idx)
     {
-        imap_message* m = m_folder->by_uid(m_view[i]);
-        if (!m)
-            continue;
-        if (op == "FLAGS")
-            m->flags = bits;
-        else if (op == "+FLAGS")
-            m->flags |= bits;
-        else
-            m->flags &= static_cast<uint8_t>(~bits);
-        if (!silent)
+        const imap_message* m = m_folder->by_uid(m_view[i]);
+        if (m && !silent)
             untagged(std::to_string(i + 1) + " FETCH (" + (uid ? "UID " + std::to_string(m->uid) + " " : std::string()) +
                      "FLAGS " + flags_text(m->flags, false) + ")");
     }
-    m_store.touched(m_user);
     finish(tag, "OK", uid ? "UID STORE completed" : "STORE completed");
 }
 
