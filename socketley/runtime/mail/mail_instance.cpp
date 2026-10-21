@@ -3,6 +3,7 @@
 #include <filesystem>
 
 #include "mail_run.h"
+#include "../../shared/net/dns_feed.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/text_list.h"
@@ -16,6 +17,18 @@ std::string mail_state_dir(std::string_view runtime_name, uint32_t shard, uint32
     return (socketley_paths::resolve().state_dir / "mail" / leaf).string();
 }
 
+std::string mail_key_path(std::string_view runtime_name, std::string_view selector)
+{
+    return (socketley_paths::resolve().state_dir / "mail" /
+            (std::string(runtime_name) + ".dkim." + std::string(selector) + ".key"))
+        .string();
+}
+
+std::string mail_suppressed_path(std::string_view runtime_name)
+{
+    return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".suppressed")).string();
+}
+
 void mail_forget_state(std::string_view runtime_name)
 {
     const std::filesystem::path base = socketley_paths::resolve().state_dir / "mail";
@@ -25,10 +38,13 @@ void mail_forget_state(std::string_view runtime_name)
     {
         const std::string f = e.path().filename().string();
         const std::string_view rest = std::string_view(f).substr(std::min(f.size(), stem.size()));
-        if (f.starts_with(stem) && (rest.empty() || (rest.front() == '.' && rest.size() > 1 &&
-                                                     rest.find_first_not_of("0123456789", 1) == std::string_view::npos)))
+        if (f.starts_with(stem) && (rest.empty() || rest.starts_with(".dkim.") || rest == ".suppressed" ||
+                                    (rest.front() == '.' && rest.size() > 1 &&
+                                     rest.find_first_not_of("0123456789", 1) == std::string_view::npos)))
             std::filesystem::remove_all(e.path(), ec);
     }
+    // And the records it gave a dns runtime.
+    dns_feed::write_records(runtime_name, {});
 }
 
 mail_instance::mail_instance(std::string_view name) : runtime_instance(runtime_mail, name) {}

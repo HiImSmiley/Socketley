@@ -139,12 +139,13 @@ int cli_mail(int argc, char** argv)
         return 1;
     }
     const std::string_view verb = argv[3];
-    if (verb != "queue" && verb != "show" && verb != "flush" && verb != "drop")
+    if (verb != "queue" && verb != "show" && verb != "flush" && verb != "drop" && verb != "dns" &&
+        verb != "suppressed" && verb != "forgive")
     {
         std::cerr << command_usage::line("mail");
         return 1;
     }
-    if ((verb == "show" || verb == "drop") && argc < 5)
+    if ((verb == "show" || verb == "drop" || verb == "forgive") && argc < 5)
     {
         std::cerr << command_usage::line("mail");
         return 1;

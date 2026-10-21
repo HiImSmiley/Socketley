@@ -15,6 +15,9 @@
 #include "../idp/idp_session.h"
 #include "../storage/password_hash.h"
 #include "../../shared/crypto/tls_context.h"
+#include "../../shared/net/dns_feed.h"
+#include "../../shared/persist/read_file.h"
+#include "../../shared/persist/replaced_file.h"
 #include "../../shared/runtime/runtime_manager.h"
 #include "../../shared/runtime/stats_text.h"
 #include "../../shared/util/ascii.h"
@@ -111,6 +114,96 @@ route_to mail_run::route(const address& a, bool from_null) const
     return {};
 }
 
+bool mail_run::suppressed(std::string_view addr) const
+{
+    std::string a(addr);
+    socketley::ascii::lower_in_place(a);
+    return m_suppressed.count(a) > 0;
+}
+
+void mail_run::suppress(std::string addr)
+{
+    socketley::ascii::lower_in_place(addr);
+    if (addr.empty() || addr.find('@') == std::string::npos || m_suppressed.count(addr))
+        return;
+    // What another shard added since is kept beside this one.
+    load_suppressed(true);
+    m_suppressed.insert(addr);
+    ++m_suppressions;
+    save_suppressed();
+}
+
+void mail_run::load_suppressed(bool merge)
+{
+    const std::string path = mail_suppressed_path(m_owner.get_name());
+    const auto stamp = socketley::file_stamp::of(path);
+    if (!merge && m_suppressed_stamp && *m_suppressed_stamp == stamp)
+        return;
+    m_suppressed_stamp = stamp;
+    std::string text;
+    if (!socketley::read_file(path, text, {.missing_ok = true}, nullptr))
+        return;
+    std::unordered_set<std::string> got;
+    std::string_view rest = text;
+    while (!rest.empty())
+        if (std::string_view one = socketley::take_item(rest, '\n'); !one.empty())
+            got.emplace(one);
+    if (merge)
+        m_suppressed.insert(got.begin(), got.end());
+    else
+        m_suppressed = std::move(got);
+}
+
+void mail_run::save_suppressed()
+{
+    std::string text;
+    for (const auto& a : m_suppressed)
+        text += a + "\n";
+    std::string why;
+    const std::string path = mail_suppressed_path(m_owner.get_name());
+    const bool ok = socketley::replace_file(path, text, socketley::durability::data, &why);
+    m_suppressed_stamp = socketley::file_stamp::of(path);
+    if (!ok)
+        LOG_WARN(("mail " + std::string(m_owner.get_name()) + ": the suppressed addresses could not be kept: " + why)
+                     .c_str());
+}
+
+void mail_run::bounce_taken(std::string_view message)
+{
+    ++m_bounces_taken;
+    // A delivery status report names each recipient, then what was done with it (RFC 3464 2.3).
+    std::string_view rest = message;
+    std::string recipient;
+    while (!rest.empty())
+    {
+        const size_t nl = rest.find('\n');
+        std::string_view line = rest.substr(0, nl);
+        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        const size_t colon = line.find(':');
+        if (colon == std::string_view::npos)
+            continue;
+        const std::string_view name = line.substr(0, colon);
+        std::string_view value = line.substr(colon + 1);
+        while (!value.empty() && value.front() == ' ')
+            value.remove_prefix(1);
+        if (socketley::ascii::iequals(name, "Final-Recipient"))
+        {
+            const size_t semi = value.find(';');
+            recipient = std::string(semi == std::string_view::npos ? value : value.substr(semi + 1));
+            while (!recipient.empty() && recipient.front() == ' ')
+                recipient.erase(0, 1);
+        }
+        else if (socketley::ascii::iequals(name, "Action") && !recipient.empty())
+        {
+            if (socketley::ascii::iequals(value.substr(0, 6), "failed"))
+                suppress(recipient);
+            recipient.clear();
+        }
+    }
+}
+
 // ── Starting and stopping ───────────────────────────────────────────────────
 
 bool mail_run::start(std::string& why)
@@ -126,6 +219,8 @@ bool mail_run::start(std::string& why)
         return false;
     m_domains = m_owner.domains();
     m_hostname = m_owner.greeting_name();
+    refresh_domains();
+    load_suppressed(false);
     if (m_owner.get_tls())
     {
         m_tls = std::make_unique<tls_context>();
@@ -167,6 +262,7 @@ bool mail_run::start(std::string& why)
     for (listener* l : {&m_smtp, &m_sub, &m_subs})
         if (l->fd >= 0)
             arm_accept(*l);
+    publish_records();
     arm_tick();
     LOG_INFO(("mail " + std::string(m_owner.get_name()) + ": serving SMTP on " +
               std::to_string(m_owner.effective_port()) +
@@ -988,6 +1084,8 @@ void mail_run::tick()
     {
         m_next_files_ms = now + 1000;
         refresh_files();
+        refresh_domains();
+        load_suppressed(false);
     }
     if (m_delivery)
         m_delivery->tick(now);
@@ -1005,6 +1103,69 @@ void mail_run::refresh_files()
     if (!m_aliases.refresh([](alias_table& t, std::string_view text, std::string& w) { return t.parse(text, w); },
                            why))
         LOG_WARN(("mail " + std::string(m_owner.get_name()) + ": " + why + "; the aliases read before are kept")
+                     .c_str());
+}
+
+void mail_run::refresh_domains()
+{
+    if (m_owner.get_dns().empty() || !m_owner.get_mail_domains().empty())
+        return;
+    std::vector<std::string> now;
+    for (auto& [rt, origin] : dns_feed::read_zones())
+        if (rt == m_owner.get_dns())
+        {
+            std::string d = origin;
+            if (!d.empty() && d.back() == '.')
+                d.pop_back();
+            socketley::ascii::lower_in_place(d);
+            if (!d.empty())
+                now.push_back(std::move(d));
+        }
+    if (now == m_domains)
+        return;
+    m_domains = std::move(now);
+    m_owner.set_resolved_domains(m_domains);
+    m_hostname = m_owner.greeting_name();
+    std::string list;
+    for (const auto& d : m_domains)
+        list += (list.empty() ? "" : ", ") + d;
+    LOG_INFO(("mail " + std::string(m_owner.get_name()) + ": the zones of " + std::string(m_owner.get_dns()) +
+              " are its domains: " + (list.empty() ? std::string("none") : list))
+                 .c_str());
+    publish_records();
+}
+
+std::string mail_run::records_text() const
+{
+    std::string out;
+    const std::string dkim = m_delivery ? m_delivery->dkim_record() : std::string();
+    const std::string sel = m_delivery ? m_delivery->dkim_selector() : std::string("skl");
+    // Mail for elsewhere through a smarthost leaves from its addresses, which SPF cannot name here, so it only softfails.
+    const std::string spf = m_owner.get_relay().empty() ? "v=spf1 mx -all" : "v=spf1 mx ~all";
+    for (const auto& d : m_domains)
+    {
+        out += d + ". 300 IN MX 10 " + m_hostname + ".\n";
+        out += d + ". 300 IN TXT \"" + spf + "\"\n";
+        if (!dkim.empty())
+            out += sel + "._domainkey." + d + ". 300 IN TXT \"" + dkim + "\"\n";
+        out += "_dmarc." + d + ". 300 IN TXT \"v=DMARC1; p=quarantine; adkim=r; aspf=r\"\n";
+    }
+    return out;
+}
+
+void mail_run::publish_records()
+{
+    // One shard writes them, since every shard's are the same.
+    if (m_owner.get_dns().empty() || m_owner.get_shard_index() != 0)
+        return;
+    const std::string text = records_text();
+    if (text == m_published)
+        return;
+    if (dns_feed::write_records(m_owner.get_name(), text))
+        m_published = text;
+    else
+        LOG_WARN(("mail " + std::string(m_owner.get_name()) + ": its records could not be written for " +
+                  std::string(m_owner.get_dns()))
                      .c_str());
 }
 
@@ -1093,6 +1254,33 @@ void mail_run::command(uint64_t ticket, std::string_view payload)
         case verb::show:
             answer(show_text(arg));
             return;
+        case verb::dns:
+            answer(records_text());
+            return;
+        case verb::suppressed:
+        {
+            std::vector<std::string> all(m_suppressed.begin(), m_suppressed.end());
+            std::sort(all.begin(), all.end());
+            std::string out;
+            for (const auto& a : all)
+                out += a + "\n";
+            answer(out);
+            return;
+        }
+        case verb::forgive:
+        {
+            std::string a = arg;
+            socketley::ascii::lower_in_place(a);
+            load_suppressed(false);
+            if (!m_suppressed.erase(a))
+            {
+                answer("error: " + arg + " is not suppressed");
+                return;
+            }
+            save_suppressed();
+            answer("ok");
+            return;
+        }
         case verb::flush:
             if (m_delivery)
                 m_delivery->flush(arg);
@@ -1153,6 +1341,8 @@ std::string mail_run::stats() const
     put(out, "mail_refused_relay", m_refused_relay);
     put(out, "mail_too_big", m_too_big);
     put(out, "mail_spool_failures", m_spool_failed + m_spool.write_failures());
+    put(out, "mail_bounces_taken", m_bounces_taken);
+    put(out, "mail_suppressed", m_suppressed.size());
     put(out, "auth_ok", m_auth_ok);
     put(out, "auth_failed", m_auth_failed);
     put(out, "starttls", m_starttls);

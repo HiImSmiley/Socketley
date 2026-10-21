@@ -251,13 +251,10 @@ bool delivery::start(std::string& why)
         }
         m_relay = true;
     }
-    // A key of the runtime's own, made at its first start, signs the mail its domains send.
-    if (!m_run.domains().empty())
-    {
-        m_key = dkim::load_or_make(m_run.state_dir() + "/dkim." + m_selector + ".key", why);
-        if (!m_key)
-            return false;
-    }
+    // A key of the runtime's own, made at its first start and shared by its shards, signs the mail its domains send.
+    m_key = dkim::load_or_make(mail_key_path(o.get_name(), m_selector), why);
+    if (!m_key)
+        return false;
     const int64_t now = wall::now_ms_coarse();
     for (const auto& [id, e] : m_run.queue().entries())
         schedule(e, std::max(now, e->next_ms));
@@ -398,6 +395,12 @@ void delivery::dispatch(const entry_ptr& e)
             }
             if (r.k == route_to::sink)
             {
+                // A bounce to no-reply@: whom it says failed is not mailed again.
+                const uint32_t want = static_cast<uint32_t>(std::min<uint64_t>(e->body_len, 256u << 10));
+                m_run.queue().read(e, 0, want, [this, alive = m_alive](bool ok, std::string_view b) {
+                    if (*alive && ok)
+                        m_run.bounce_taken(b);
+                });
                 m_run.queue().mark(*e, i, rcpt_state::delivered, "taken as a bounce");
                 continue;
             }
@@ -412,6 +415,13 @@ void delivery::dispatch(const entry_ptr& e)
             targets.push_back(a.text());
         for (const auto& t : targets)
         {
+            if (t.find('@') != std::string::npos && m_run.suppressed(t))
+            {
+                m_run.queue().mark(*e, i, rcpt_state::failed,
+                                   "550 5.1.1 " + t + " bounced before and is not sent to again; `socketley mail " +
+                                       std::string(m_run.owner().get_name()) + " forgive " + t + "` lets it");
+                break;
+            }
             ++pending[i];
             if (t.find('@') == std::string::npos)
             {

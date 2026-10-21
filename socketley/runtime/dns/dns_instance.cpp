@@ -1152,6 +1152,7 @@ extra_records dns_run::feed_extra()
     x.v4 = m_v4;
     x.v6 = m_v6;
     x.challenges = std::move(s.challenges);
+    x.records = std::move(s.records);
     // Seconds since November 2023 that the feed last changed: it only grows, so the serial a secondary sees grows
     // whenever the feed or the file changes, and is the same in every shard and after every restart.
     constexpr int64_t base = 1700000000;

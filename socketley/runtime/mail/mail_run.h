@@ -4,6 +4,7 @@
 // as it arrives and answered once it is on the disk, then handed to the delivery.
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -76,6 +77,11 @@ public:
     const std::vector<std::string>& domains() const { return m_domains; }
     bool is_local_domain(std::string_view d) const;
     const alias_table& aliases() const { return m_aliases.value(); }
+    // An address a bounce said is dead, which mail is not sent to again until it is forgiven.
+    bool suppressed(std::string_view addr) const;
+    void suppress(std::string addr);
+    // A bounce taken for no-reply@: the recipients it says failed, suppressed.
+    void bounce_taken(std::string_view message);
     // Where mail for `a` goes, by the aliases, the no-reply address and the mailboxes.
     route_to route(const address& a, bool from_null) const;
     // A message of this runtime's own making queued, as a bounce or `socketley send` is: false when it cannot be.
@@ -162,6 +168,16 @@ private:
     void arm_tick();
     void tick();
     void refresh_files();
+    // The domains of --dns, from the zones the daemon writes, and the records this runtime gives them.
+    void refresh_domains();
+    void publish_records();
+    std::string records_text() const;
+    std::string m_published;
+    std::unordered_set<std::string> m_suppressed;
+    std::optional<socketley::file_stamp> m_suppressed_stamp;
+    // Read again when another shard changed it, or merged with what is here before this one writes.
+    void load_suppressed(bool merge);
+    void save_suppressed();
     // The session of a connection once it may speak: at the accept, or once its TLS handshake is done.
     void begin_session(conn& c);
     smtp_config session_config(const conn& c) const;
@@ -215,6 +231,7 @@ private:
     uint64_t m_too_big{0};
     uint64_t m_spool_failed{0};
     uint64_t m_bounces_taken{0};
+    uint64_t m_suppressions{0};
 };
 
 }   // namespace socketley::mail

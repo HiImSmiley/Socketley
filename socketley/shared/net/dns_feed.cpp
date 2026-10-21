@@ -105,6 +105,43 @@ void remove_routes_except(const std::vector<std::string>& entrances)
         ::unlink((dir() + "/" + g).c_str());
 }
 
+bool write_records(std::string_view runtime, std::string_view text)
+{
+    std::string safe;
+    for (char c : runtime)
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.')
+            safe += c;
+    if (safe.empty() || safe.front() == '.')
+        return false;
+    const std::string path = dir() + "/records-" + safe;
+    struct stat st{};
+    const bool there = ::stat(path.c_str(), &st) == 0;
+    if (text.empty())
+        return !there || ::unlink(path.c_str()) == 0;
+    if (there && read_file(path) == text)
+        return true;
+    return write_atomic(path, text);
+}
+
+bool write_zones(std::string_view text)
+{
+    const std::string path = dir() + "/zones";
+    struct stat st{};
+    if (::stat(path.c_str(), &st) < 0 ? text.empty() : read_file(path) == text)
+        return true;
+    return write_atomic(path, text);
+}
+
+std::vector<std::pair<std::string, std::string>> read_zones()
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    std::istringstream in(read_file(dir() + "/zones"));
+    std::string rt, origin;
+    while (in >> rt >> origin)
+        out.emplace_back(rt, origin);
+    return out;
+}
+
 int64_t stamp_ns()
 {
     struct stat st{};
@@ -131,6 +168,14 @@ snapshot read()
     while (const dirent* e = ::readdir(d))
     {
         const std::string_view fn = e->d_name;
+        if (fn.starts_with("records-") && !fn.ends_with(".tmp"))
+        {
+            std::istringstream rin(read_file(dir() + "/" + std::string(fn)));
+            for (std::string line; std::getline(rin, line);)
+                if (!line.empty())
+                    s.records.push_back(line);
+            continue;
+        }
         if (!fn.starts_with("acme-") || fn.ends_with(".tmp"))
             continue;
         std::istringstream in(read_file(dir() + "/" + std::string(fn)));

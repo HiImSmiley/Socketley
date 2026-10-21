@@ -20,6 +20,10 @@ enum class verb : uint8_t
     show  = 3,
     flush = 4,
     drop  = 5,
+    dns   = 6,
+    // The addresses a bounce to no-reply@ said failed, which are not sent to again, and one of them let go.
+    suppressed = 7,
+    forgive    = 8,
 };
 
 struct attachment

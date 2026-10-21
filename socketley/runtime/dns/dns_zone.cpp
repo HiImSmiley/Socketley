@@ -947,6 +947,45 @@ size_t add_extra(zone& z, const extra_records& x)
     }
     for (const auto& [name, values] : txt)
         put(name, type::TXT, challenge_ttl, values);
+    // Another runtime's records where they fall in this zone, a set to a name and type, as the file would hold them.
+    struct set_of
+    {
+        std::string name;
+        uint16_t t{0};
+        uint32_t ttl{0};
+        std::vector<std::string> rdata;
+    };
+    std::vector<set_of> sets;
+    for (const auto& line : x.records)
+    {
+        std::vector<entry> es;
+        std::string why;
+        if (!tokenize(line, es, why) || es.size() != 1 || es[0].tokens.size() < 4)
+            continue;
+        const auto& tk = es[0].tokens;
+        std::string w;
+        uint32_t ttl = 0;
+        uint16_t t = 0;
+        size_t i = 1;
+        if (!name_from_text(tk[0].text, z.origin, w) || !is_subdomain(w, z.origin) || !parse_ttl(tk[i++].text, ttl))
+            continue;
+        if (i < tk.size() && is_class(tk[i].text))
+            ++i;
+        // The zone's own apex records, and what cuts it, stay the file's.
+        if (i >= tk.size() || !parse_type(tk[i++].text, t) || t == type::SOA || t == type::NS || t == type::DS ||
+            t == type::OPT || t == type::CNAME)
+            continue;
+        std::string rd;
+        if (i >= tk.size() || !parse_rdata(t, tk, i, z.origin, rd, why) || rd.size() > 65535)
+            continue;
+        auto it = std::find_if(sets.begin(), sets.end(), [&](const set_of& s) { return s.name == w && s.t == t; });
+        if (it == sets.end())
+            sets.push_back({w, t, ttl, {rd}});
+        else if (std::find(it->rdata.begin(), it->rdata.end(), rd) == it->rdata.end())
+            it->rdata.push_back(rd);
+    }
+    for (const auto& s : sets)
+        put(s.name, s.t, s.ttl, s.rdata);
     z.records += added;
     z.serial += x.serial_add;
     // The serial the SOA record itself carries, which is what a secondary compares.

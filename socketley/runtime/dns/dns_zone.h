@@ -136,6 +136,8 @@ struct extra_records
     std::vector<std::string> v4, v6;
     // The name asked about (absolute, without "_acme-challenge.") and its TXT value.
     std::vector<std::pair<std::string, std::string>> challenges;
+    // Master-file lines another runtime wrote, owners absolute: "mail.example.com. 300 IN MX 10 mx.example.com."
+    std::vector<std::string> records;
     // What is added to the file's serial, so a secondary sees a change of these.
     uint32_t serial_add{0};
 };

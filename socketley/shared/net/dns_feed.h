@@ -10,6 +10,9 @@
 //                    the addresses it listens on
 //   acme-<token>     one line, "<name> <value>": an ACME DNS-01 answer, written by `socketley acme issue` while a CA
 //                    checks it and removed after; served as the TXT record of _acme-challenge.<name>
+//   records-<rt>     master-file lines with absolute owners, a runtime's records for the zones they fall in: a mail
+//                    runtime's MX, SPF, DKIM and DMARC; the zone file wins where it names the type at the name
+//   zones            "<dns runtime> <origin>" lines, written by the daemon, the zones each dns runtime serves
 //
 // Files rather than messages because each side already has what it takes: the daemon writes its state there, and a
 // dns runtime, in a worker process of its own, reads a file when it changes. The directory's own time is when the
@@ -39,9 +42,18 @@ void remove_routes_except(const std::vector<std::string>& entrances);
 // The file entrance `name` reads.
 std::string routes_path(std::string_view entrance);
 
+// A runtime's records, rewritten only when they change; removed when `text` is empty.
+bool write_records(std::string_view runtime, std::string_view text);
+// The zones of every dns runtime, "<runtime> <origin>" a line, rewritten only when they change.
+bool write_zones(std::string_view text);
+// Those zones read back, each runtime's origins in the order written.
+std::vector<std::pair<std::string, std::string>> read_zones();
+
 struct snapshot
 {
     std::vector<std::string> names;
+    // Every runtime's record lines.
+    std::vector<std::string> records;
     // Name (the one asked about, without "_acme-challenge.") and TXT value.
     std::vector<std::pair<std::string, std::string>> challenges;
     // The directory's modification time, nanoseconds; 0 when there is none.

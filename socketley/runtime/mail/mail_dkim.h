@@ -17,6 +17,9 @@ using key_ptr = std::shared_ptr<EVP_PKEY>;
 
 // The key kept at `path`, made (RSA, 2048 bits) and written there first when there is none.
 key_ptr load_or_make(const std::string& path, std::string& why);
+key_ptr load_pem(const std::string& path, const std::string& pem, std::string& why);
+// A new key linked in at `path`, or nothing where one is there already; false when neither could be.
+bool make_key(const std::string& path, std::string& why);
 // "v=DKIM1; k=rsa; p=<public key>", the TXT record <selector>._domainkey.<domain> carries.
 std::string public_record(EVP_PKEY* key);
 

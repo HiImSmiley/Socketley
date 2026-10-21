@@ -946,6 +946,7 @@ static std::vector<std::string> zone_origins(const runtime_instance& rt)
 static void publish_dns_names(runtime_manager& manager)
 {
     std::vector<std::string> names;
+    std::string zones;
     std::vector<std::pair<std::string, std::string>> tables;
     {
         std::shared_lock lock(manager.mutex);
@@ -965,7 +966,37 @@ static void publish_dns_names(runtime_manager& manager)
         for (const runtime_instance* r : all)
             if (runtime_names::is_entrance(*r))
                 tables.emplace_back(std::string(r->get_name()), runtime_names::entrance_table(*r, all, zone_origins));
+        // Each dns runtime's zones, which a mail runtime naming it with --dns takes as its domains, and whose
+        // host name, mail.<zone> unless it says another, is then given the dns runtime's addresses.
+        std::unordered_map<std::string, std::vector<std::string>> origins;
+        for (const runtime_instance* r : all)
+            if (r->get_type() == runtime_dns)
+                for (const auto& o : zone_origins(*r))
+                {
+                    origins[std::string(r->get_name())].push_back(o);
+                    zones += std::string(r->get_name()) + " " + o + "\n";
+                }
+        for (const runtime_instance* r : all)
+        {
+            if (r->get_type() != runtime_mail)
+                continue;
+            const auto& ml = static_cast<const mail_instance&>(*r);
+            const auto it = origins.find(std::string(ml.get_dns()));
+            if (ml.get_dns().empty() || it == origins.end() || it->second.empty())
+                continue;
+            std::string host(ml.get_hostname());
+            if (host.empty())
+            {
+                host = "mail." + it->second.front();
+                if (host.back() == '.')
+                    host.pop_back();
+            }
+            if (std::string why; dns_feed::valid_name(host, why))
+                names.push_back(runtime_names::normal(host));
+        }
     }
+    if (!dns_feed::write_zones(zones))
+        LOG_WARN(("the zones for mail runtimes could not be written to " + dns_feed::dir()).c_str());
     std::vector<std::string> entrances;
     for (const auto& [entrance, table] : tables)
     {
@@ -2995,7 +3026,9 @@ int daemon_handler::cmd_mail(ipc_connection* conn, const parsed_args& pa)
     }
     const std::string_view what = pa.args[2];
     const ml::verb v = what == "queue" ? ml::verb::queue : what == "show" ? ml::verb::show
-                     : what == "flush" ? ml::verb::flush : what == "drop" ? ml::verb::drop : ml::verb::send;
+                     : what == "flush" ? ml::verb::flush : what == "drop" ? ml::verb::drop
+                     : what == "dns"   ? ml::verb::dns   : what == "suppressed" ? ml::verb::suppressed
+                     : what == "forgive" ? ml::verb::forgive : ml::verb::send;
     if (v == ml::verb::send)
     {
         conn->write_buf = command_usage::line("mail");
@@ -3011,21 +3044,23 @@ int daemon_handler::cmd_mail(ipc_connection* conn, const parsed_args& pa)
         std::string one;
         if (!ask_worker(conn, name, payload, one, std::chrono::seconds(10), s))
             return 1;
-        if ((v == ml::verb::show || v == ml::verb::drop) && one.starts_with("error"))
+        if ((v == ml::verb::show || v == ml::verb::drop || v == ml::verb::forgive) && one.starts_with("error"))
             continue;
         found = true;
-        if (v == ml::verb::flush || v == ml::verb::drop)
+        if (v == ml::verb::flush || v == ml::verb::drop || v == ml::verb::forgive)
             continue;
         all += one;
-        if (v == ml::verb::show)
+        // Every shard's records are the same, and its show is of one message.
+        if (v == ml::verb::show || v == ml::verb::dns)
             break;
     }
     if (!found)
     {
-        conn->write_buf = "error: no message " + arg + " is queued\n";
+        conn->write_buf = v == ml::verb::forgive ? "error: " + arg + " is not suppressed\n"
+                                                 : "error: no message " + arg + " is queued\n";
         return 1;
     }
-    conn->write_buf = v == ml::verb::flush || v == ml::verb::drop ? std::string() : all;
+    conn->write_buf = v == ml::verb::flush || v == ml::verb::drop || v == ml::verb::forgive ? std::string() : all;
     return 0;
 }
 

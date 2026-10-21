@@ -1,5 +1,6 @@
 #include "mail_dkim.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -114,23 +115,36 @@ key_ptr load_or_make(const std::string& path, std::string& why)
 {
     std::string pem;
     if (socketley::read_file(path, pem, {.missing_ok = true}, nullptr) && !pem.empty())
+        return load_pem(path, pem, why);
+    if (!make_key(path, why))
+        return nullptr;
+    // What is at the path now, this one's key or the one another shard linked there first.
+    if (!socketley::read_file(path, pem, {}, &why) || pem.empty())
+        return nullptr;
+    return load_pem(path, pem, why);
+}
+
+key_ptr load_pem(const std::string& path, const std::string& pem, std::string& why)
+{
+    BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    EVP_PKEY* k = bio ? PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr) : nullptr;
+    if (bio)
+        BIO_free(bio);
+    if (!k)
     {
-        BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
-        EVP_PKEY* k = bio ? PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr) : nullptr;
-        if (bio)
-            BIO_free(bio);
-        if (!k)
-        {
-            why = path + " holds no private key";
-            return nullptr;
-        }
-        return key_ptr(k, EVP_PKEY_free);
+        why = path + " holds no private key";
+        return nullptr;
     }
+    return key_ptr(k, EVP_PKEY_free);
+}
+
+bool make_key(const std::string& path, std::string& why)
+{
     EVP_PKEY* k = EVP_PKEY_Q_keygen(nullptr, nullptr, "RSA", static_cast<size_t>(2048));
     if (!k)
     {
         why = "no DKIM key could be made";
-        return nullptr;
+        return false;
     }
     key_ptr key(k, EVP_PKEY_free);
     BIO* bio = BIO_new(BIO_s_mem());
@@ -139,22 +153,22 @@ key_ptr load_or_make(const std::string& path, std::string& why)
         if (bio)
             BIO_free(bio);
         why = "the DKIM key could not be written";
-        return nullptr;
+        return false;
     }
     char* data = nullptr;
     const long n = BIO_get_mem_data(bio, &data);
-    const std::string tmp = path + ".tmp";
+    // Linked into place, which fails where a shard starting beside this one put its key first; that one is kept.
+    const std::string tmp = path + "." + std::to_string(::getpid()) + ".tmp";
     const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     const bool ok = fd >= 0 && socketley::write_all(fd, data, static_cast<size_t>(n)) && ::fsync(fd) == 0;
     if (fd >= 0)
         ::close(fd);
     BIO_free(bio);
-    if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0)
-    {
+    const bool linked = ok && (::link(tmp.c_str(), path.c_str()) == 0 || errno == EEXIST);
+    ::unlink(tmp.c_str());
+    if (!linked)
         why = path + " cannot be written";
-        return nullptr;
-    }
-    return key;
+    return linked;
 }
 
 std::string public_record(EVP_PKEY* key)
