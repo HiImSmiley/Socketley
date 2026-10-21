@@ -1668,6 +1668,23 @@ private:
     // Calls from other runtimes' scripts still in flight, so a stop can answer them.
     struct rpc_state;
     std::unordered_map<uint64_t, std::shared_ptr<rpc_state>> m_rpc;
+    // An object another runtime writes in pieces, put_begin to the last put_more: the piece being taken and the
+    // request it answers.
+    struct rpc_stream
+    {
+        std::shared_ptr<put_op> put;
+        std::string bucket, key;
+        std::string buf;
+        size_t      off{0};
+        bool        last{false};
+        bool        finishing{false};
+        uint64_t    ticket{0};
+        int64_t     touched_ms{0};
+    };
+    std::unordered_map<std::string, std::shared_ptr<rpc_stream>> m_rpc_streams;
+    void pump_stream(const std::string& id);
+    void end_stream(const std::string& id, st s, const put_result* pr);
+    void sweep_streams();
     // A cap on what streaming puts hold, so a thousand uploaders cannot ask for a thousand buffers.
     uint32_t    m_max_active_puts{512};
     size_t      m_zero_copy_min{64 * 1024};

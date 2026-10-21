@@ -25,7 +25,10 @@ const char* usage(op kind)
         case op::list:
             return "socketley.storage.list(runtime, bucket [, prefix] [, {delimiter=, max_keys=, start_after=}] [, callback])";
         case op::users:
-            break;   // the identity provider's, which no script is given
+        case op::put_begin:
+        case op::put_more:
+        case op::make_bucket:
+            break;   // the identity provider's and the mail runtime's, which no script is given
     }
     return "";
 }
@@ -306,7 +309,10 @@ lua_storage_client::mode lua_storage_client::begin(lua_State* L, int tag)
             break;
         }
         case op::users:
-            return shape();   // the identity provider's, which no script is given
+        case op::put_begin:
+        case op::put_more:
+        case op::make_bucket:
+            return shape();   // the identity provider's and the mail runtime's, which no script is given
     }
 
     return send(L, tag, target, storage_rpc::encode(rq));
@@ -347,6 +353,12 @@ int lua_storage_client::push_values(lua_State* L, int tag, request_status st, st
             return 1;
         case op::users:
             lua_pushnil(L);   // the identity provider's, which no script is given
+            return 1;
+        case op::put_begin:
+        case op::put_more:
+        case op::make_bucket:
+            // The mail runtime's, which no script asks.
+            lua_pushnil(L);
             return 1;
         case op::list:
         {

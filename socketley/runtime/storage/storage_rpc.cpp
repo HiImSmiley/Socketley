@@ -14,6 +14,8 @@
 #include "s3_xml.h"
 #include "storage_instance.h"
 #include "../../shared/util/logging.h"
+#include "../../shared/util/random_id.h"
+#include "../../shared/util/wall_clock.h"
 #include "../../shared/runtime/runtime_manager.h"
 
 namespace socketley::storage
@@ -97,7 +99,7 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
         answer(op::get, refusal("InvalidRequest", "the request could not be read"));
         return true;
     }
-    if (!valid_bucket_name(rq.bucket) && rq.kind == op::put)
+    if (!valid_bucket_name(rq.bucket) && (rq.kind == op::put || rq.kind == op::put_begin || rq.kind == op::make_bucket))
     {
         answer(rq.kind, refusal_for(st::invalid_bucket_name));
         return true;
@@ -411,8 +413,142 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
             }
             return true;
         }
+
+        case op::make_bucket:
+        {
+            m_rpc[ticket] = std::make_shared<rpc_state>();
+            m_store.create_bucket(rq.bucket, {}, [this, ticket, answer](st s) {
+                // Answered by stop_rpc() already when the runtime stopped first.
+                if (!m_rpc.count(ticket))
+                    return;
+                answer(op::make_bucket, s == st::ok || s == st::bucket_exists ? storage_rpc::reply{} : refusal_for(s));
+            });
+            return true;
+        }
+
+        case op::put_begin:
+        {
+            sweep_streams();
+            ++m_c.puts;
+            object_meta meta;
+            meta.content_type = rq.content_type.empty() ? "binary/octet-stream" : rq.content_type;
+            for (const auto& [k, v] : rq.metadata)
+                meta.extra.emplace_back(std::string(user_prefix) + k, v);
+            s3_error err;
+            auto put = begin_own_put(rq.bucket, rq.key, std::move(meta), rq.size, err);
+            if (!put)
+            {
+                answer(rq.kind, refusal(err.code, err.message));
+                return true;
+            }
+            auto s = std::make_shared<rpc_stream>();
+            s->put = std::move(put);
+            s->bucket = rq.bucket;
+            s->key = rq.key;
+            s->touched_ms = wall::now_ms_coarse();
+            std::string id = socketley::random_hex(12);
+            const std::string sid = id;
+            s->put->on_ready([this, sid]() { pump_stream(sid); });
+            s->put->on_failed([this, sid](st why) { end_stream(sid, why, nullptr); });
+            m_rpc_streams[id] = std::move(s);
+            storage_rpc::reply r;
+            r.next = std::move(id);
+            answer(op::put_begin, r);
+            return true;
+        }
+
+        case op::put_more:
+        {
+            const auto it = m_rpc_streams.find(rq.stream);
+            if (it == m_rpc_streams.end() || it->second->ticket)
+            {
+                answer(rq.kind, refusal("NoSuchUpload", "no stream " + rq.stream + " is open"));
+                return true;
+            }
+            rpc_stream& s = *it->second;
+            s.buf = std::move(rq.data);
+            s.off = 0;
+            s.last = rq.last;
+            s.ticket = ticket;
+            s.touched_ms = wall::now_ms_coarse();
+            m_rpc[ticket] = std::make_shared<rpc_state>();
+            pump_stream(rq.stream);
+            return true;
+        }
     }
     return false;
+}
+
+void storage_run::pump_stream(const std::string& id)
+{
+    const auto it = m_rpc_streams.find(id);
+    if (it == m_rpc_streams.end())
+        return;
+    std::shared_ptr<rpc_stream> s = it->second;
+    if (s->finishing || !s->ticket)
+        return;
+    if (s->put->failed())
+    {
+        end_stream(id, s->put->status(), nullptr);
+        return;
+    }
+    while (s->off < s->buf.size())
+    {
+        const size_t took = s->put->append(s->buf.data() + s->off, s->buf.size() - s->off);
+        s->off += took;
+        if (took == 0)
+            return;   // resumed by the put's ready callback
+    }
+    if (!s->last)
+    {
+        // The piece is taken: the next is asked for.
+        const uint64_t ticket = s->ticket;
+        s->ticket = 0;
+        s->buf.clear();
+        m_rpc.erase(ticket);
+        if (auto* m = m_owner.get_runtime_manager())
+            m->requests().complete_deferred(ticket, request_status::ok,
+                                            storage_rpc::encode(storage_rpc::reply{}, op::put_more));
+        return;
+    }
+    s->finishing = true;
+    s->put->finish(nullptr, [this, id](put_result pr) { end_stream(id, pr.status, pr.status == st::ok ? &pr : nullptr); });
+}
+
+void storage_run::end_stream(const std::string& id, st s, const put_result* pr)
+{
+    const auto it = m_rpc_streams.find(id);
+    if (it == m_rpc_streams.end())
+        return;
+    std::shared_ptr<rpc_stream> stream = it->second;
+    m_rpc_streams.erase(it);
+    stream->put->on_ready(nullptr);
+    stream->put->on_failed(nullptr);
+    if (s != st::ok)
+        stream->put->abort();
+    if (pr)
+        notify_put(stream->bucket, stream->key, pr->meta);
+    if (!stream->ticket)
+        return;
+    const uint64_t ticket = stream->ticket;
+    m_rpc.erase(ticket);
+    storage_rpc::reply r = s == st::ok ? storage_rpc::reply{} : refusal_for(s);
+    if (pr)
+        r.info = rpc_info_of(pr->meta);
+    if (auto* m = m_owner.get_runtime_manager())
+        m->requests().complete_deferred(ticket, request_status::ok, storage_rpc::encode(r, op::put_more));
+}
+
+void storage_run::sweep_streams()
+{
+    // A stream its writer stopped feeding a minute ago is given up, and what it wrote removed.
+    const int64_t now = wall::now_ms_coarse();
+    std::vector<std::string> stale;
+    for (const auto& [id, s] : m_rpc_streams)
+        if (!s->ticket && !s->finishing && now - s->touched_ms > 60000)
+            stale.push_back(id);
+    for (const auto& id : stale)
+        end_stream(id, st::io_error, nullptr);
 }
 
 std::shared_ptr<put_op> storage_run::begin_own_put(const std::string& bucket, const std::string& key, object_meta meta,
@@ -526,6 +662,11 @@ void storage_run::whole_put::abort()
 // removed and every call in flight is told the service went.
 void storage_run::stop_rpc()
 {
+    std::vector<std::string> streams;
+    for (const auto& [id, s] : m_rpc_streams)
+        streams.push_back(id);
+    for (const auto& id : streams)
+        end_stream(id, st::io_error, nullptr);
     auto* mgr = m_owner.get_runtime_manager();
     auto owed = std::move(m_rpc);
     m_rpc.clear();

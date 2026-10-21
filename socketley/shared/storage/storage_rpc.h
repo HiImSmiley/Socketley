@@ -22,11 +22,14 @@ namespace socketley::storage_rpc
 inline constexpr size_t max_value = 1u << 20;
 inline constexpr size_t max_field = 1u << 16;
 inline constexpr uint32_t max_list = 1000;
-inline constexpr uint8_t version = 1;
+inline constexpr uint8_t version = 2;
 
 // users answers for the storage's users rather than its objects, a page of them after start_after, each an
 // object_info whose key is the user and whose metadata holds name, email, admin, reset and the password's hash.
-enum class op : uint8_t { put = 1, get = 2, head = 3, del = 4, list = 5, users = 6 };
+// An object larger than max_value goes in pieces: put_begin with its size answers a stream in `next`, and put_more
+// hands each piece to it, the last answered with the object.  make_bucket makes a bucket, or finds it made.
+enum class op : uint8_t { put = 1, get = 2, head = 3, del = 4, list = 5, users = 6, put_begin = 7, put_more = 8,
+                          make_bucket = 9 };
 
 inline const char* op_name(op o)
 {
@@ -38,6 +41,9 @@ inline const char* op_name(op o)
         case op::del:  return "delete";
         case op::list: return "list";
         case op::users: return "users";
+        case op::put_begin: return "put_begin";
+        case op::put_more: return "put_more";
+        case op::make_bucket: return "make_bucket";
     }
     return "?";
 }
@@ -57,6 +63,10 @@ struct request
     std::string delimiter;
     std::string start_after;
     uint32_t    max_keys{max_list};
+    // put_begin's size, and put_more's stream and whether its piece is the last.
+    uint64_t    size{0};
+    std::string stream;
+    bool        last{false};
 };
 
 inline std::string encode(const request& r)
@@ -78,6 +88,9 @@ inline std::string encode(const request& r)
     w.bytes(r.delimiter);
     w.bytes(r.start_after);
     w.u32(r.max_keys);
+    w.u64(r.size);
+    w.bytes(r.stream);
+    w.flag(r.last);
     return w.take();
 }
 
@@ -85,7 +98,7 @@ inline bool decode(std::string_view in, request& r)
 {
     socketley::bytes::reader rd(in);
     uint8_t v = 0, k = 0;
-    if (!rd.u8(v) || v != version || !rd.u8(k) || k < 1 || k > 6)
+    if (!rd.u8(v) || v != version || !rd.u8(k) || k < 1 || k > 9)
         return false;
     r.kind = static_cast<op>(k);
     uint32_t n = 0;
@@ -101,7 +114,8 @@ inline bool decode(std::string_view in, request& r)
         r.metadata.emplace_back(std::move(name), std::move(value));
     }
     return rd.bytes(r.prefix, max_field) && rd.bytes(r.delimiter, max_field) &&
-           rd.bytes(r.start_after, max_field) && rd.u32(r.max_keys);
+           rd.bytes(r.start_after, max_field) && rd.u32(r.max_keys) && rd.u64(r.size) &&
+           rd.bytes(r.stream, max_field) && rd.flag(r.last);
 }
 
 struct object_info
@@ -185,7 +199,13 @@ inline std::string encode(const reply& r, op kind)
     {
         case op::put:
         case op::head:
+        case op::put_more:
             encode_info(w, r.info, true);
+            break;
+        case op::put_begin:
+            w.bytes(r.next);
+            break;
+        case op::make_bucket:
             break;
         case op::get:
             encode_info(w, r.info, true);
@@ -225,7 +245,12 @@ inline bool decode(std::string_view in, op kind, reply& r)
     {
         case op::put:
         case op::head:
+        case op::put_more:
             return decode_info(rd, r.info);
+        case op::put_begin:
+            return rd.bytes(r.next, max_field);
+        case op::make_bucket:
+            return true;
         case op::get:
             return decode_info(rd, r.info) && rd.bytes(r.data, max_value);
         case op::del:
