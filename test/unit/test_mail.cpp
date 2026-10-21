@@ -11,6 +11,7 @@
 #include "runtime/mail/mail_aliases.h"
 #include "runtime/mail/mail_compose.h"
 #include "runtime/mail/mail_dkim.h"
+#include "runtime/mail/mail_mime.h"
 #include "runtime/mail/mail_verify.h"
 #include "runtime/mail/smtp_session.h"
 #include "shared/util/base64.h"
@@ -657,4 +658,118 @@ TEST_CASE("DMARC: a DKIM signature of the From domain passes where SPF does not"
     res = check_inbound(changed, "203.0.113.5", "h", "x@else.test", r, 1792552976);
     CHECK(res.dkim[0].first == "fail");
     CHECK(res.reject());
+}
+
+namespace
+{
+
+const std::string mime_msg =
+    "From: \"Alice A.\" <alice@example.test>\r\n"
+    "To: bob@remote.test, Undisclosed: carol@x.test, dan@y.test;\r\n"
+    "Subject: =?UTF-8?B?R3LDvMOfZQ==?=\r\n"
+    "Date: Wed, 21 Oct 2026 03:00:00 +0000\r\n"
+    "Message-ID: <m1@example.test>\r\n"
+    "MIME-Version: 1.0\r\n"
+    "Content-Type: multipart/mixed; boundary=\"outer\"\r\n"
+    "\r\n"
+    "preamble\r\n"
+    "--outer\r\n"
+    "Content-Type: multipart/alternative; boundary=inner\r\n"
+    "\r\n"
+    "--inner\r\n"
+    "Content-Type: text/plain; charset=utf-8\r\n"
+    "\r\n"
+    "plain text\r\n"
+    "second line\r\n"
+    "--inner\r\n"
+    "Content-Type: text/html; charset=utf-8\r\n"
+    "\r\n"
+    "<p>html</p>\r\n"
+    "--inner--\r\n"
+    "--outer\r\n"
+    "Content-Type: application/pdf; name=\"a.pdf\"\r\n"
+    "Content-Disposition: attachment; filename=\"a.pdf\"\r\n"
+    "Content-Transfer-Encoding: base64\r\n"
+    "\r\n"
+    "JVBERi0=\r\n"
+    "--outer\r\n"
+    "Content-Type: message/rfc822\r\n"
+    "\r\n"
+    "From: inner@z.test\r\n"
+    "Subject: enclosed\r\n"
+    "\r\n"
+    "inner body\r\n"
+    "--outer--\r\n"
+    "epilogue\r\n";
+
+}   // namespace
+
+TEST_CASE("MIME: a message's parts, nested multiparts and an enclosed message")
+{
+    const auto root = mime::parse(mime_msg);
+    CHECK(root.multipart());
+    REQUIRE(root.children.size() == 3);
+    CHECK(root.children[0].subtype == "alternative");
+    REQUIRE(root.children[0].children.size() == 2);
+    CHECK(root.children[0].children[0].lines == 2);
+    CHECK(root.children[1].type == "application");
+    CHECK(root.children[1].encoding == "BASE64");
+    CHECK(root.children[1].disposition == "attachment");
+    CHECK(root.children[2].message());
+    REQUIRE(root.children[2].children.size() == 1);
+    std::string out;
+    REQUIRE(mime::section(mime_msg, root, "1.1", out));
+    CHECK(out == "plain text\r\nsecond line");
+    REQUIRE(mime::section(mime_msg, root, "1.2", out));
+    CHECK(out == "<p>html</p>");
+    REQUIRE(mime::section(mime_msg, root, "2", out));
+    CHECK(out == "JVBERi0=");
+    REQUIRE(mime::section(mime_msg, root, "2.MIME", out));
+    CHECK(out.find("Content-Disposition: attachment") != std::string::npos);
+    REQUIRE(mime::section(mime_msg, root, "3.HEADER", out));
+    CHECK(out == "From: inner@z.test\r\nSubject: enclosed\r\n\r\n");
+    REQUIRE(mime::section(mime_msg, root, "3.TEXT", out));
+    CHECK(out == "inner body");
+    REQUIRE(mime::section(mime_msg, root, "3.1", out));
+    CHECK(out == "inner body");
+    REQUIRE(mime::section(mime_msg, root, "HEADER.FIELDS (SUBJECT DATE)", out));
+    CHECK(out == "Subject: =?UTF-8?B?R3LDvMOfZQ==?=\r\nDate: Wed, 21 Oct 2026 03:00:00 +0000\r\n\r\n");
+    REQUIRE(mime::section(mime_msg, root, "HEADER.FIELDS.NOT (SUBJECT DATE FROM TO MESSAGE-ID MIME-VERSION)", out));
+    CHECK(out == "Content-Type: multipart/mixed; boundary=\"outer\"\r\n\r\n");
+    REQUIRE(mime::section(mime_msg, root, "TEXT", out));
+    CHECK(out.starts_with("preamble\r\n--outer"));
+    REQUIRE(mime::section(mime_msg, root, "", out));
+    CHECK(out == mime_msg);
+    CHECK_FALSE(mime::section(mime_msg, root, "4", out));
+    CHECK_FALSE(mime::section(mime_msg, root, "1.3", out));
+    CHECK_FALSE(mime::section(mime_msg, root, "0", out));
+}
+
+TEST_CASE("MIME: ENVELOPE and BODYSTRUCTURE as RFC 3501 writes them")
+{
+    const auto root = mime::parse(mime_msg);
+    const std::string env = mime::envelope(std::string_view(mime_msg).substr(0, root.header_len));
+    CHECK(env == "(\"Wed, 21 Oct 2026 03:00:00 +0000\" \"=?UTF-8?B?R3LDvMOfZQ==?=\" "
+                 "((\"Alice A.\" NIL \"alice\" \"example.test\")) ((\"Alice A.\" NIL \"alice\" \"example.test\")) "
+                 "((\"Alice A.\" NIL \"alice\" \"example.test\")) "
+                 "((NIL NIL \"bob\" \"remote.test\")(NIL NIL \"Undisclosed\" NIL)(NIL NIL \"carol\" \"x.test\")"
+                 "(NIL NIL \"dan\" \"y.test\")(NIL NIL NIL NIL)) NIL NIL NIL \"<m1@example.test>\")");
+    const std::string bs = mime::structure(root, mime_msg, true);
+    CHECK(bs.starts_with("(((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"utf-8\") NIL NIL \"7BIT\" 23 2 NIL NIL NIL NIL)"));
+    CHECK(bs.find("(\"APPLICATION\" \"PDF\" (\"NAME\" \"a.pdf\") NIL NIL \"BASE64\" 8 NIL (\"ATTACHMENT\" "
+                  "(\"FILENAME\" \"a.pdf\")) NIL NIL)") != std::string::npos);
+    CHECK(bs.find("(\"MESSAGE\" \"RFC822\" NIL NIL NIL \"7BIT\"") != std::string::npos);
+    CHECK(bs.find("\"MIXED\" (\"BOUNDARY\" \"outer\") NIL NIL NIL)") != std::string::npos);
+    const std::string body = mime::structure(root, mime_msg, false);
+    CHECK(body.find("(\"BOUNDARY\"") == std::string::npos);
+    CHECK(body.find("ATTACHMENT") == std::string::npos);
+    // A message that is no MIME at all is one text part.
+    const std::string plain = "Subject: x\r\n\r\nhello\r\nworld\r\n";
+    const auto p = mime::parse(plain);
+    CHECK(mime::structure(p, plain, false) == "(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 14 2)");
+    std::string out;
+    REQUIRE(mime::section(plain, p, "1", out));
+    CHECK(out == "hello\r\nworld\r\n");
+    CHECK(mime::imap_string("a\"b") == "\"a\\\"b\"");
+    CHECK(mime::imap_string("Gr\xc3\xbc\xc3\x9f") == "{6}\r\nGr\xc3\xbc\xc3\x9f");
 }

@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# suite: isolated -- its own daemon, socket, state directory and port window, so it runs beside the others
+# Integration test: a mail runtime's IMAP, as a mail client reads and keeps its mailbox with it.
+#
+# ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
+#
+#   * a password taken in the clear from a stranger, or not taken over TLS
+#   * the folders a client expects (Sent, Drafts, Junk, Trash) missing, or without their special use
+#   * a FETCH a client makes (UID, flags, size, the headers it lists, BODYSTRUCTURE, the body) answered wrong
+#   * \Seen not set by reading, a flag not kept, a search not finding what it should
+#   * APPEND, COPY and MOVE without the UIDs UIDPLUS gives, or EXPUNGE leaving the object in the storage
+#   * new mail not told by NOOP or IDLE, or flags and UIDs lost by a restart
+set -uo pipefail
+
+BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/lib_ports.sh"
+. "$HERE/lib_daemon.sh"
+. "$HERE/lib_ready.sh"
+
+command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
+command -v openssl >/dev/null 2>&1 || { echo "  SKIP: openssl is required"; exit 0; }
+
+PASS=0; FAIL=0; TOTAL=0
+ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
+bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
+
+daemon_isolate mailimap
+T="$SOCKETLEY_TMPD"
+P=$((SL_PORT_BASE+1950))
+IM=$((SL_PORT_BASE+1951))
+PI=$((SL_PORT_BASE+1952))
+PS=$((SL_PORT_BASE+1953))
+trap daemon_stop EXIT
+
+echo "=== Integration: IMAP on a mail runtime's mailboxes ==="
+
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=mail.example.test" \
+    -keyout "$T/key.pem" -out "$T/cert.pem" >/dev/null 2>&1
+daemon_start "$BIN"
+printf 'spa - http://localhost:5173/cb\n' > "$T/clients"
+"$BIN" create idp auth -p "$PI" --clients "$T/clients" --issuer "http://127.0.0.1:$PI" -s >/dev/null 2>&1
+"$BIN" create storage st -p "$PS" --dir "$T/data" --anonymous -s >/dev/null 2>&1
+for p in "$PI/jwks" "$PS/"; do
+    for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p")" != 000 ] && break; sleep 0.1; done
+done
+"$BIN" idp-user auth add alice --password alicepassword1 --email alice@example.test >/dev/null 2>&1
+"$BIN" create mail m -p "$P" --mail-domain example.test --idp auth --storage st/mail --imap "$IM" \
+    --tls --cert "$T/cert.pem" --key "$T/key.pem" -s >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$IM" || bad "the IMAP port listens" "$(tail -3 "$SOCKETLEY_DLOG")"
+
+# Three messages for alice, one of them a multipart.
+python3 - "$P" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]))
+s.ehlo("x")
+s.sendmail("carol@else.test", ["alice@example.test"], "From: Carol <carol@else.test>\r\nTo: alice@example.test\r\nSubject: one\r\nMessage-ID: <one@else.test>\r\n\r\nfirst body\r\n")
+s.sendmail("dave@else.test", ["alice@example.test"], "From: dave@else.test\r\nTo: alice@example.test\r\nSubject: two\r\n\r\nsecond body with needle\r\n")
+s.sendmail("erin@else.test", ["alice@example.test"], "From: erin@else.test\r\nTo: alice@example.test\r\nSubject: three\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nthe text\r\n--b\r\nContent-Type: application/octet-stream; name=x.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAAEC\r\n--b--\r\n")
+PY
+for _ in $(seq 1 100); do [ "$(curl -s "http://127.0.0.1:$PS/mail?list-type=2&prefix=alice/INBOX/" | grep -c '<Key>')" -ge 3 ] && break; sleep 0.1; done
+
+cat > "$T/client.py" <<'PY'
+import imaplib, socket, ssl, sys, time
+port, smtp_port = int(sys.argv[1]), int(sys.argv[2])
+step = sys.argv[3]
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+def say(name, cond, why=""):
+    print(("ok " if cond else "bad ") + name + ("" if cond else ": " + str(why)))
+class Stranger(imaplib.IMAP4):
+    # From 127.0.0.2, a client that is not this machine.
+    def _create_socket(self, timeout):
+        return socket.create_connection((self.host, self.port), timeout, source_address=("127.0.0.2", 0))
+M = Stranger("127.0.0.1", port)
+if step == "first":
+    say("LOGINDISABLED is said before STARTTLS", b"LOGINDISABLED" in M.capability()[1][0])
+    try:
+        M.login("alice", "alicepassword1")
+        say("a password is refused in the clear", False, "it was taken")
+    except imaplib.IMAP4.error:
+        say("a password is refused in the clear", True)
+M.starttls(ssl_context=ctx)
+typ, _ = M.login("alice", "alicepassword1")
+if step == "first":
+    say("and taken over TLS", typ == "OK")
+    typ, boxes = M.list()
+    names = b" ".join(boxes)
+    say("LIST has INBOX, Sent, Drafts, Junk and Trash, with their special use",
+        all(x in names for x in [b'"INBOX"', b'\\Sent) "/" "Sent"', b'\\Drafts', b'\\Junk', b'\\Trash']), names)
+    typ, data = M.select("INBOX")
+    say("SELECT tells three messages", data == [b"3"], data)
+    typ, data = M.uid("FETCH", "1:*", "(UID RFC822.SIZE FLAGS BODY.PEEK[HEADER.FIELDS (From To Subject Date Message-ID)])")
+    heads = [d for d in data if isinstance(d, tuple)]
+    say("the headers a client lists come for each", len(heads) == 3 and b"Subject: one" in heads[0][1] and
+        b"Received" not in heads[0][1], data)
+    say("unread", all(b"\\Seen" not in h[0] for h in heads), [h[0] for h in heads])
+    typ, data = M.fetch("3", "(BODYSTRUCTURE)")
+    say("BODYSTRUCTURE of the multipart", b'"TEXT" "PLAIN"' in data[0] and b'"APPLICATION" "OCTET-STREAM"' in data[0]
+        and b'"MIXED"' in data[0], data)
+    typ, data = M.fetch("3", "(BODY.PEEK[2])")
+    say("its second part", data[0][1] == b"AAEC", data)
+    typ, data = M.fetch("1", "(BODY[])")
+    say("a body read whole", b"first body" in data[0][1] and b"Return-Path: <carol@else.test>" in data[0][1], data)
+    typ, data = M.fetch("1", "(FLAGS)")
+    say("and reading it sets \\Seen", b"\\Seen" in data[0], data)
+    typ, data = M.fetch("1", "(ENVELOPE)")
+    say("ENVELOPE names the sender", b'("Carol" NIL "carol" "else.test")' in data[0], data)
+    M.store("2", "+FLAGS", "(\\Flagged)")
+    typ, data = M.search(None, "FLAGGED")
+    say("a flag set is found by SEARCH", data == [b"2"], data)
+    typ, data = M.search(None, "UNSEEN")
+    say("SEARCH UNSEEN", data == [b"2 3"], data)
+    typ, data = M.search(None, "BODY", "needle")
+    say("SEARCH BODY", data == [b"2"], data)
+    typ, data = M.search(None, "OR", "SUBJECT", "one", "SUBJECT", "three")
+    say("SEARCH OR SUBJECT", data == [b"1 3"], data)
+    typ, data = M.uid("SEARCH", "UID", "2:*")
+    say("UID SEARCH", data == [b"2 3"], data)
+    typ, data = M.append("Sent", "(\\Seen)", None, b"From: alice@example.test\r\nTo: x@remote.test\r\nSubject: sent one\r\n\r\nhi\r\n")
+    say("APPEND answers APPENDUID", typ == "OK" and b"APPENDUID" in data[0], data)
+    typ, data = M.copy("1", "Trash")
+    say("COPY answers COPYUID", typ == "OK" and b"COPYUID" in data[0], data)
+    typ, data = M.uid("MOVE", "3", "Junk") if hasattr(M, "uid") else ("NO", [])
+    say("MOVE moves it", typ == "OK", data)
+    typ, data = M.select("INBOX")
+    say("and the inbox has two left", data == [b"2"], data)
+    M.store("1", "+FLAGS", "(\\Deleted)")
+    typ, data = M.expunge()
+    say("EXPUNGE takes what is deleted", data == [b"1"], data)
+    typ, data = M.select("INBOX")
+    say("leaving one", data == [b"1"], data)
+    # Mail that comes while the folder is selected is told by NOOP.
+    s = __import__("smtplib").SMTP("127.0.0.1", smtp_port); s.ehlo("x")
+    s.sendmail("fred@else.test", ["alice@example.test"], "From: fred@else.test\r\nSubject: four\r\n\r\nfourth\r\n")
+    told = False
+    for _ in range(40):
+        typ, data = M.noop()
+        if any(b"EXISTS" in d for d in M.untagged_responses.get("EXISTS", [])) or M.untagged_responses.get("EXISTS"):
+            told = True
+            break
+        time.sleep(0.25)
+    say("new mail is told by NOOP", told, M.untagged_responses)
+    typ, data = M.select("Sent")
+    say("Sent holds what was appended", data == [b"1"], data)
+    M.logout()
+elif step == "idle":
+    M.select("INBOX")
+    tag = M._new_tag().decode()
+    M.send(("%s IDLE\r\n" % tag).encode())
+    first = M.readline()
+    s = __import__("smtplib").SMTP("127.0.0.1", smtp_port); s.ehlo("x")
+    s.sendmail("gina@else.test", ["alice@example.test"], "From: gina@else.test\r\nSubject: five\r\n\r\nfifth\r\n")
+    M.sock.settimeout(8)
+    line = b""
+    try:
+        while b"EXISTS" not in line:
+            line = M.readline()
+    except Exception as e:
+        line = repr(e).encode()
+    say("IDLE tells new mail as it comes", first.startswith(b"+") and b"EXISTS" in line, (first, line))
+    M.send(b"DONE\r\n")
+    M.readline()
+    M.logout()
+elif step == "after":
+    typ, data = M.select("INBOX")
+    typ, data = M.fetch("1", "(FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+    whole = b"".join(x if isinstance(x, bytes) else b"".join(x) for x in data)
+    say("flags are kept across a restart", b"\\Flagged" in whole and b"Subject: two" in whole, data)
+    typ, data = M.status("Sent", "(MESSAGES UIDNEXT UIDVALIDITY)")
+    say("STATUS after a restart", b"MESSAGES 1" in data[0], data)
+    open(sys.argv[4], "w").write(data[0].decode())
+    M.logout()
+PY
+tally() { while read -r verdict rest; do case "$verdict" in ok) ok "$rest" ;; bad) bad "${rest%%:*}" "${rest#*:}" ;; esac; done; }
+tally < <(timeout 120 python3 "$T/client.py" "$IM" "$P" first 2>&1 | grep -E '^(ok|bad) ' || echo "bad the client ran: $(timeout 60 python3 "$T/client.py" "$IM" "$P" first 2>&1 | tail -2)")
+for _ in $(seq 1 30); do [ -z "$(curl -s "http://127.0.0.1:$PS/mail?list-type=2&prefix=alice/INBOX/" | grep -o '<Key>[^<]*one[^<]*</Key>')" ] && break; sleep 0.1; done
+n=$(curl -s "http://127.0.0.1:$PS/mail?list-type=2&prefix=alice/" | grep -o '<Key>' | wc -l)
+[ "$n" -ge 4 ] && ok "the folders are objects in the storage, the expunged one gone" || bad "the folders are objects in the storage, the expunged one gone" "$n objects"
+tally < <(timeout 60 python3 "$T/client.py" "$IM" "$P" idle 2>&1 | grep -E '^(ok|bad) ')
+before=$(timeout 60 python3 - "$IM" <<'PY'
+import imaplib, ssl, sys
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1])); M.starttls(ssl_context=ctx); M.login("alice", "alicepassword1")
+print(M.status("Sent", "(UIDVALIDITY)")[1][0].decode()); M.logout()
+PY
+)
+"$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$IM" >/dev/null
+tally < <(timeout 60 python3 "$T/client.py" "$IM" "$P" after "$T/status.after" 2>&1 | grep -E '^(ok|bad) ')
+v1=$(printf '%s' "$before" | grep -o 'UIDVALIDITY [0-9]*'); v2=$(grep -o 'UIDVALIDITY [0-9]*' "$T/status.after" 2>/dev/null)
+[ -n "$v1" ] && [ "$v1" = "$v2" ] && ok "UIDVALIDITY is the same after a restart" || bad "UIDVALIDITY is the same after a restart" "$v1 / $v2"
+
+echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+[ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
+exit "$FAIL"

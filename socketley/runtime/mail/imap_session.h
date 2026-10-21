@@ -1,0 +1,117 @@
+#pragma once
+// One IMAP4rev1 conversation (RFC 3501, with LITERAL+, SASL-IR, IDLE, NAMESPACE, UIDPLUS, MOVE, UNSELECT, SPECIAL-USE,
+// ID and ENABLE), without a socket: bytes in, replies out through its hooks, the mailboxes read and written through an
+// imap_store.  Commands are taken one after the other, one that waits for the store holding the ones behind it.
+//
+// A session keeps its own numbering of the folder it has selected, which changes only where it is told: new messages
+// as EXISTS at the end of a command, and messages gone as EXPUNGE, so a client's message numbers mean what it thinks.
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "imap_store.h"
+
+namespace socketley::mail
+{
+
+struct imap_config
+{
+    std::string hostname;
+    bool tls_offered{false};
+    bool tls_active{false};
+    // A password may be said in the clear: this machine's own client.
+    bool login_in_clear{false};
+    uint64_t max_append{25ull << 20};
+};
+
+class imap_session
+{
+public:
+    struct hooks
+    {
+        virtual ~hooks() = default;
+        virtual void reply(std::string_view bytes) = 0;
+        virtual void start_tls() = 0;
+        virtual void close() = 0;
+        // A password for `user`; `done(true, name)` signs the session in as `name`, whose mailbox it then reads.
+        virtual void login(std::string user, std::string password, std::function<void(bool, std::string)> done) = 0;
+    };
+
+    imap_session(const imap_config& cfg, hooks& h, imap_store& store);
+    ~imap_session();
+    imap_session(const imap_session&)            = delete;
+    imap_session& operator=(const imap_session&) = delete;
+
+    void greet();
+    void input(std::string_view bytes);
+    void tls_started();
+    void gone();
+    // The selected folder looked at again, for IDLE, once a second.
+    void poll();
+    bool idling() const { return m_idle; }
+    const std::string& user() const { return m_user; }
+
+    static constexpr size_t max_line = 65536;
+
+private:
+    struct token
+    {
+        enum kind : uint8_t { atom, string, open, close } k{atom};
+        std::string text;
+    };
+    enum class state : uint8_t { not_auth, auth, selected, logout };
+
+    void run();
+    void command(std::string tag, std::vector<token> args);
+    void finish(const std::string& tag, std::string_view status, std::string_view text);
+    void untagged(std::string_view line);
+    bool tokenize(std::string_view s, std::vector<token>& out) const;
+    void resume();
+
+    void cmd_login(const std::string& tag, const std::vector<token>& a);
+    void cmd_authenticate(const std::string& tag, const std::vector<token>& a);
+    void cmd_select(const std::string& tag, const std::vector<token>& a, bool readonly);
+    void cmd_list(const std::string& tag, const std::vector<token>& a, bool lsub);
+    void cmd_status(const std::string& tag, const std::vector<token>& a);
+    void cmd_append(const std::string& tag, const std::vector<token>& a);
+    void cmd_fetch(const std::string& tag, const std::vector<token>& a, size_t from, bool uid);
+    void cmd_store(const std::string& tag, const std::vector<token>& a, size_t from, bool uid);
+    void cmd_search(const std::string& tag, const std::vector<token>& a, size_t from, bool uid);
+    void cmd_copy(const std::string& tag, const std::vector<token>& a, size_t from, bool uid, bool move);
+    void cmd_expunge(const std::string& tag, const std::vector<uint32_t>& only, bool silent, std::string_view done_text);
+
+    // The messages of a sequence set, as indexes into the view; false for one that is not a set.
+    bool parse_set(std::string_view set, bool uid, std::vector<size_t>& out) const;
+    // EXISTS and EXPUNGE for what changed in the folder since the session last looked.
+    void update_view();
+    std::string flags_text(uint8_t f, bool recent) const;
+    void sign_in(const std::string& tag, std::string user, std::string password);
+
+    imap_config m_cfg;
+    hooks& m_hooks;
+    imap_store& m_store;
+    state m_state{state::not_auth};
+    std::string m_user;
+    // The selected folder, and the UIDs of what the session has been told of, in its order.
+    std::shared_ptr<imap_folder> m_folder;
+    bool m_readonly{false};
+    std::vector<uint32_t> m_view;
+    uint64_t m_seen_version{0};
+    // Input: what is not yet a whole command, the command being gathered with its literals, and how much of a literal
+    // is still to come.
+    std::string m_in;
+    std::string m_cmd;
+    size_t m_literal{0};
+    bool m_waiting{false};
+    bool m_running{false};
+    bool m_idle{false};
+    std::string m_idle_tag;
+    std::string m_auth_tag;
+    bool m_auth_continue{false};
+    std::shared_ptr<bool> m_alive;
+};
+
+}   // namespace socketley::mail

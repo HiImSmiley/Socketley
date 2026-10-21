@@ -18,6 +18,7 @@
 
 #include "mail_aliases.h"
 #include "mail_command.h"
+#include "imap_session.h"
 #include "mail_spool.h"
 #include "smtp_session.h"
 #include "../../shared/crypto/password_file.h"
@@ -100,7 +101,7 @@ public:
 
 private:
     enum class port_kind : uint8_t { smtp, submission, submissions, imap, imaps };
-    struct conn : smtp_session::hooks
+    struct conn : smtp_session::hooks, imap_session::hooks
     {
         mail_run* run{nullptr};
         uint64_t id{0};
@@ -126,6 +127,7 @@ private:
         // STARTTLS answered: what comes next is a handshake, after which the session starts over.
         bool upgrading{false};
         std::unique_ptr<smtp_session> smtp;
+        std::unique_ptr<imap_session> imap;
         // The message being received, its spool writer and envelope.
         uint64_t writer{0};
         entry_ptr entry;
@@ -146,6 +148,7 @@ private:
         void data_end(std::function<void(rcpt_verdict)> done) override;
         void data_abort() override;
         void close() override;
+        void login(std::string user, std::string password, std::function<void(bool, std::string)> done) override;
     };
     struct listener
     {
@@ -216,6 +219,7 @@ private:
     std::string m_state_dir;
 
     listener m_smtp, m_sub, m_subs, m_imap_l, m_imaps_l;
+    std::unique_ptr<imap_store> m_imap;
     std::unordered_map<uint64_t, std::unique_ptr<conn>> m_conns;
     std::vector<std::unique_ptr<conn>> m_closing;
     std::vector<uint64_t> m_close_soon;

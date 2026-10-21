@@ -41,8 +41,9 @@ constexpr uint32_t ring_bufs = 1024;
 constexpr uint32_t ring_buf_bytes = 4096;
 constexpr int64_t close_grace_ms = 5000;
 constexpr int64_t handshake_ms = 30000;
-// RFC 5321 4.5.3.2.7 has a server wait five minutes for the next command.
+// RFC 5321 4.5.3.2.7 has a server wait five minutes for the next command, RFC 3501 5.4 an IMAP one thirty.
 constexpr int64_t idle_ms = 300000;
+constexpr int64_t imap_idle_ms = 31 * 60000;
 // A wrong password is answered after this, so guessing one costs a client a second a try.
 constexpr auto auth_delay = std::chrono::seconds(1);
 
@@ -257,16 +258,6 @@ bool mail_run::start(std::string& why)
         why = file_why;
         return false;
     }
-    m_ring = m_loop.setup_buf_ring(ring_group, ring_bufs, ring_buf_bytes);
-    m_multishot = m_ring && m_loop.recv_multishot_enabled();
-    if (!open_listener(m_smtp, m_owner.effective_port(), port_kind::smtp, why))
-        return false;
-    if (m_owner.get_submission_port() &&
-        !open_listener(m_sub, m_owner.get_submission_port(), port_kind::submission, why))
-        return false;
-    if (m_owner.get_submissions_port() &&
-        !open_listener(m_subs, m_owner.get_submissions_port(), port_kind::submissions, why))
-        return false;
     m_mailboxes = std::make_unique<mailboxes>(*this);
     if (!m_mailboxes->configure(why))
         return false;
@@ -301,10 +292,29 @@ bool mail_run::start(std::string& why)
                 m_notify->add(n, j, "mail/" + s.user);
         };
     }
+    m_ring = m_loop.setup_buf_ring(ring_group, ring_bufs, ring_buf_bytes);
+    m_multishot = m_ring && m_loop.recv_multishot_enabled();
+    if (!open_listener(m_smtp, m_owner.effective_port(), port_kind::smtp, why))
+        return false;
+    if (m_owner.get_submission_port() &&
+        !open_listener(m_sub, m_owner.get_submission_port(), port_kind::submission, why))
+        return false;
+    if (m_owner.get_submissions_port() &&
+        !open_listener(m_subs, m_owner.get_submissions_port(), port_kind::submissions, why))
+        return false;
+    // IMAP on the first shard alone, whose index of each folder's UIDs is then the one there is.
+    if (m_mailboxes && m_mailboxes->enabled() && m_owner.get_shard_index() == 0)
+    {
+        m_imap = std::make_unique<imap_store>(*this);
+        if (m_owner.get_imap_port() && !open_listener(m_imap_l, m_owner.get_imap_port(), port_kind::imap, why))
+            return false;
+        if (m_owner.get_imaps_port() && !open_listener(m_imaps_l, m_owner.get_imaps_port(), port_kind::imaps, why))
+            return false;
+    }
     m_delivery = std::make_unique<delivery>(*this);
     if (!m_delivery->start(why))
         return false;
-    for (listener* l : {&m_smtp, &m_sub, &m_subs})
+    for (listener* l : {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l})
         if (l->fd >= 0)
             arm_accept(*l);
     publish_records();
@@ -352,7 +362,7 @@ void mail_run::stop()
     if (m_stopped)
         return;
     m_stopped = true;
-    for (listener* l : {&m_smtp, &m_sub, &m_subs})
+    for (listener* l : {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l})
         if (l->fd >= 0)
         {
             ::shutdown(l->fd, SHUT_RDWR);
@@ -365,6 +375,8 @@ void mail_run::stop()
         m_delivery->stop();
     if (m_notify)
         m_notify->stop();
+    if (m_imap)
+        m_imap->flush_now();
     std::vector<conn*> all;
     for (auto& [id, c] : m_conns)
         all.push_back(c.get());
@@ -422,7 +434,7 @@ void mail_run::accept_done(listener& l, struct io_uring_cqe* cqe)
             runtime_instance::stat_add(m_owner.m_stat_total_connections, 1);
             m_owner.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
             // A port that speaks TLS from the first byte begins with the handshake, any other with the greeting.
-            if (l.kind == port_kind::submissions)
+            if (l.kind == port_kind::submissions || l.kind == port_kind::imaps)
             {
                 raw->ssl = m_tls ? m_tls->create_ssl_server() : nullptr;
                 if (!raw->ssl)
@@ -460,9 +472,23 @@ smtp_config mail_run::session_config(const conn& c) const
 
 void mail_run::begin_session(conn& c)
 {
-    c.smtp = std::make_unique<smtp_session>(session_config(c), c);
     c.in_input = true;
-    c.smtp->greet();
+    if (c.kind == port_kind::imap || c.kind == port_kind::imaps)
+    {
+        imap_config cfg;
+        cfg.hostname = m_hostname;
+        cfg.tls_offered = m_tls != nullptr && c.kind == port_kind::imap;
+        cfg.tls_active = c.ssl != nullptr && c.handshaken;
+        cfg.login_in_clear = loopback(c.peer);
+        cfg.max_append = m_owner.get_max_size();
+        c.imap = std::make_unique<imap_session>(cfg, c, *m_imap);
+        c.imap->greet();
+    }
+    else
+    {
+        c.smtp = std::make_unique<smtp_session>(session_config(c), c);
+        c.smtp->greet();
+    }
     c.in_input = false;
     flush(c);
 }
@@ -595,7 +621,10 @@ void mail_run::tls_in(conn& c, const char* p, size_t n)
             c.upgrading = false;
             ++m_starttls;
             c.in_input = true;
-            c.smtp->tls_started();
+            if (c.imap)
+                c.imap->tls_started();
+            else
+                c.smtp->tls_started();
             c.in_input = false;
             flush(c);
         }
@@ -626,10 +655,13 @@ void mail_run::tls_in(conn& c, const char* p, size_t n)
 
 void mail_run::plain_in(conn& c, const char* p, size_t n)
 {
-    if (!c.smtp)
+    if (!c.smtp && !c.imap)
         return;
     c.in_input = true;
-    c.smtp->input(std::string_view(p, n));
+    if (c.imap)
+        c.imap->input(std::string_view(p, n));
+    else
+        c.smtp->input(std::string_view(p, n));
     c.in_input = false;
     if (!c.dead)
         flush(c);
@@ -783,6 +815,8 @@ void mail_run::close_conn(conn& c)
     c.dead = true;
     if (c.smtp)
         c.smtp->gone();
+    if (c.imap)
+        c.imap->gone();
     if (c.writer)
     {
         m_spool.abort(c.writer);
@@ -1089,6 +1123,11 @@ void mail_run::conn::close()
     run->close_soon(*this);
 }
 
+void mail_run::conn::login(std::string user, std::string password, std::function<void(bool, std::string)> done)
+{
+    authenticate("IMAP", std::move(user), std::move(password), std::move(done));
+}
+
 std::string mail_run::received_line(const conn& c, const std::string& id, const std::string& rcpt) const
 {
     const bool tls = c.ssl && c.handshaken;
@@ -1162,6 +1201,10 @@ void mail_run::on_cqe(struct io_uring_cqe* cqe)
         accept_done(m_sub, cqe);
     else if (req == &m_subs.req)
         accept_done(m_subs, cqe);
+    else if (req == &m_imap_l.req)
+        accept_done(m_imap_l, cqe);
+    else if (req == &m_imaps_l.req)
+        accept_done(m_imaps_l, cqe);
     else if (conn* c = conn_of(req))
     {
         if (req == &c->rd)
@@ -1178,7 +1221,7 @@ void mail_run::on_loop_turn()
 {
     if (m_stopped)
         return;
-    for (listener* l : {&m_smtp, &m_sub, &m_subs})
+    for (listener* l : {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l})
         if (l->fd >= 0 && !l->pending)
             arm_accept(*l);
     for (auto& [id, c] : m_conns)
@@ -1211,12 +1254,25 @@ void mail_run::tick()
     for (auto& [id, c] : m_conns)
     {
         const bool shaking = c->ssl && !c->handshaken;
-        if (!c->closing && ((shaking && now - c->closing_ms > handshake_ms) || now - c->heard_ms > idle_ms))
+        const int64_t quiet = c->imap ? imap_idle_ms : idle_ms;
+        if (!c->closing && ((shaking && now - c->closing_ms > handshake_ms) || now - c->heard_ms > quiet))
             late.push_back(c.get());
+        else if (c->imap && c->imap->idling())
+        {
+            c->in_input = true;
+            c->imap->poll();
+            c->in_input = false;
+            flush(*c);
+        }
     }
     for (conn* c : late)
     {
-        if (c->smtp && !(c->ssl && !c->handshaken))
+        if (c->imap && !(c->ssl && !c->handshaken))
+        {
+            out(*c, "* BYE " + m_hostname + " idle too long\r\n");
+            close_soon(*c);
+        }
+        else if (c->smtp && !(c->ssl && !c->handshaken))
         {
             out(*c, "421 4.4.2 " + m_hostname + " idle too long, closing\r\n");
             close_soon(*c);
@@ -1233,6 +1289,8 @@ void mail_run::tick()
     }
     if (m_delivery)
         m_delivery->tick(now);
+    if (m_imap)
+        m_imap->tick(now);
     tls_context::report_inbound_failures();
     settle();
     arm_tick();
@@ -1500,6 +1558,15 @@ std::string mail_run::stats() const
     put(out, "mail_spool_failures", m_spool_failed + m_spool.write_failures());
     put(out, "mail_bounces_taken", m_bounces_taken);
     put(out, "mail_suppressed", m_suppressed.size());
+    if (m_imap)
+    {
+        size_t imap = 0;
+        for (const auto& [id, c] : m_conns)
+            imap += c->imap != nullptr;
+        put(out, "imap_connections", imap);
+        put(out, "imap_reads", m_imap->gets());
+        put(out, "imap_cache_hits", m_imap->cache_hits());
+    }
     if (m_mailboxes && m_mailboxes->enabled())
     {
         put(out, "mail_stored", m_mailboxes->stored());
