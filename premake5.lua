@@ -2816,7 +2816,7 @@ project "test_mqtt"
     }
 
     files { "test/unit/test_mqtt.cpp", "socketley/runtime/mqtt/mqtt_codec.cpp", "socketley/runtime/mqtt/mqtt_topics.cpp",
-            "socketley/runtime/mqtt/mqtt_auth.cpp", "socketley/runtime/mqtt/mqtt_broker.cpp",
+            "socketley/runtime/mqtt/mqtt_auth.cpp", "socketley/shared/crypto/password_file.cpp", "socketley/runtime/mqtt/mqtt_broker.cpp",
             "socketley/runtime/mqtt/mqtt_broker_store.cpp", "socketley/runtime/mqtt/mqtt_routes.cpp",
             "socketley/shared/util/base64.cpp", "socketley/shared/http/http_url.cpp" }
 
