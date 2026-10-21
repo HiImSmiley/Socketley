@@ -94,14 +94,16 @@ code -X PUT --data-binary "$cfg" "http://127.0.0.1:$PS3/evb?notification" >/dev/
 code -X PUT --data-binary one "http://127.0.0.1:$PS3/evb/warm.txt" >/dev/null
 sleep 0.5
 WP=$("$BIN" stats st 2>/dev/null | sed -n 's/^pid://p' | head -1)
-before=$(ls "/proc/$WP/task" 2>/dev/null | wc -l)
+# io_uring's own workers come and go with the file writes, so only the process's threads are counted.
+threads() { for t in /proc/"$1"/task/*; do cat "$t/comm" 2>/dev/null; done | grep -cv '^iou-'; }
+before=$(threads "$WP")
 code -X PUT --data-binary two "http://127.0.0.1:$PS3/evb/k.told" >/dev/null
 for _ in $(seq 1 40); do grep -q 'k.told' "$T/hook.log" 2>/dev/null && break; sleep 0.25; done
 grep -q 'k.told' "$T/hook.log" 2>/dev/null && ok "a webhook named by a host the loop's resolver answers is told" \
     || bad "a webhook named by a host the loop's resolver answers is told" "$(tail -3 "$T/hook.log" 2>/dev/null)"
-after=$(ls "/proc/$WP/task" 2>/dev/null | wc -l)
-[ "$before" -gt 0 ] && [ "$after" = "$before" ] && ok "and no thread was started to resolve it" \
-    || bad "and no thread was started to resolve it" "the worker had $before thread(s) before and $after after"
+after=$(threads "$WP")
+[ "$before" = 1 ] && [ "$after" = 1 ] && ok "and no thread was started to resolve it" \
+    || bad "and no thread was started to resolve it" "the worker had $before thread(s) before and $after after, not its loop's alone"
 
 # ─── a nameserver that does not answer ──────────────────────────────────────
 # Read again once a second, so the runtimes take the new file without a restart.
