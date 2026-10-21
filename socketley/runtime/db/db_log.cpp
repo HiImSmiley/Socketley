@@ -39,6 +39,10 @@ bool sync_dir(const std::string& dir)
 const char zeros[64 << 10] = {};
 // How far past the records a room begins when none is ready, so the loop's next records stay below it.
 constexpr uint64_t room_lead = 512u << 10;
+// How far ahead of a segment's end the next one is made, at 200 MB/s eighty milliseconds.
+constexpr uint64_t next_lead = 16ull << 20;
+// The next segment while it is made, a name a start deletes.
+constexpr const char* next_name = "next-segment.tmp";
 
 bool pread_all(int fd, char* buf, size_t n, uint64_t off)
 {
@@ -224,6 +228,8 @@ bool seglog::open(const std::string& dir, const visitor& each, std::string& why)
 bool seglog::begin(uint32_t seg, std::string& why)
 {
     end_room();
+    end_seal();
+    end_next();
     const std::string path = path_of(seg);
     const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     const std::string head = head_of();
@@ -249,6 +255,8 @@ bool seglog::begin(uint32_t seg, std::string& why)
 
 void seglog::close()
 {
+    end_seal();
+    end_next();
     end_room();
     // A file stopped cleanly ends at its last record, the room this log made cut; one a crash left with its room is cut
     // by the next open.
@@ -284,9 +292,14 @@ bool seglog::flush()
         return false;
     if (m_pending.empty())
         return true;
-    // Records never land where zeros are still being written.
-    if (m_room && (m_room->done.load(std::memory_order_acquire) || m_written + m_pending.size() > m_room->from))
-        end_room();
+    // Records never land where zeros are still to be written: a room is stopped only when they reach past what it zeroed.
+    if (m_room)
+    {
+        const uint64_t end = m_written + m_pending.size();
+        if (m_room->done.load(std::memory_order_acquire) ||
+            (end > m_room->from && m_room->zeroed.load(std::memory_order_acquire) < std::min(end, m_room->to)))
+            end_room();
+    }
     // At the end the bytes before it name, so a write cut short and tried again cannot land twice.
     size_t done = 0;
     while (done < m_pending.size())
@@ -305,6 +318,8 @@ bool seglog::flush()
     m_written += m_pending.size();
     m_pending.clear();
     plan_room();
+    if (!m_next && !m_seal && m_written + next_lead >= segment_bytes)
+        start_next();
     return true;
 }
 
@@ -315,20 +330,34 @@ void seglog::plan_room()
     auto job = std::make_unique<room_job>();
     job->from = std::max(m_alloc, (m_written + room_lead + 4095) / 4096 * 4096);
     job->to = job->from + room_bytes;
+    job->zeroed.store(job->from, std::memory_order_relaxed);
+    // A descriptor of its own, so a seal or a close of the segment's never pulls it from under the thread.
+    job->fd = ::dup(m_fd);
+    if (job->fd < 0)
+    {
+        m_room_failed = true;
+        return;
+    }
     room_job* j = job.get();
-    const int fd = m_fd;
-    j->th = std::thread([j, fd] {
-        bool ok = true;
-        for (uint64_t at = j->from; ok && at < j->to;)
+    j->th = std::thread([j] {
+        bool wrote = true;
+        uint64_t at = j->from;
+        while (wrote && at < j->to && !j->stop.load(std::memory_order_relaxed))
         {
-            const ssize_t n = ::pwrite(fd, zeros, static_cast<size_t>(std::min<uint64_t>(sizeof zeros, j->to - at)),
+            const ssize_t n = ::pwrite(j->fd, zeros, static_cast<size_t>(std::min<uint64_t>(sizeof zeros, j->to - at)),
                                        static_cast<off_t>(at));
             if (n < 0 && errno == EINTR)
                 continue;
-            ok = n > 0;
-            at += ok ? static_cast<uint64_t>(n) : 0;
+            wrote = n > 0;
+            if (wrote)
+            {
+                at += static_cast<uint64_t>(n);
+                j->zeroed.store(at, std::memory_order_release);
+            }
         }
-        j->ok = ok && ::fdatasync(fd) == 0;
+        j->ok = wrote && at == j->to && ::fdatasync(j->fd) == 0;
+        j->failed = !wrote || (at == j->to && !j->ok);
+        ::close(j->fd);
         j->done.store(true, std::memory_order_release);
     });
     m_room = std::move(job);
@@ -338,15 +367,61 @@ void seglog::end_room()
 {
     if (!m_room)
         return;
+    m_room->stop.store(true, std::memory_order_relaxed);
     m_room->th.join();
-    if (m_room->ok)
-        m_alloc = std::max(m_alloc, m_room->to);
-    m_room_failed = !m_room->ok;
+    // Zeros a stopped room wrote are file it made, synced or not.
+    m_alloc = std::max(m_alloc, m_room->ok ? m_room->to : m_room->zeroed.load(std::memory_order_relaxed));
+    m_room_failed = m_room->failed;
     m_room.reset();
+}
+
+void seglog::start_next()
+{
+    auto job = std::make_unique<next_job>();
+    next_job* j = job.get();
+    const std::string path = m_dir + "/" + next_name;
+    j->th = std::thread([j, path] {
+        j->fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        const std::string head = head_of();
+        j->ok = j->fd >= 0 && write_all(j->fd, head.data(), head.size()) && ::fdatasync(j->fd) == 0;
+        j->done.store(true, std::memory_order_release);
+    });
+    m_next = std::move(job);
+}
+
+void seglog::end_next()
+{
+    if (!m_next)
+        return;
+    m_next->th.join();
+    if (m_next->fd >= 0)
+        ::close(m_next->fd);
+    ::unlink((m_dir + "/" + next_name).c_str());
+    m_next.reset();
+}
+
+void seglog::end_seal()
+{
+    if (!m_seal)
+        return;
+    m_seal->th.join();
+    m_failed = m_failed || !m_seal->ok;
+    m_seal.reset();
+}
+
+bool seglog::sealing()
+{
+    if (!m_seal)
+        return false;
+    if (!m_seal->done.load(std::memory_order_acquire))
+        return true;
+    end_seal();
+    return false;
 }
 
 bool seglog::sync()
 {
+    end_seal();
     return flush() && m_fd >= 0 && ::fdatasync(m_fd) == 0;
 }
 
@@ -391,6 +466,57 @@ bool seglog::roll_if_full(std::string& why)
 {
     if (m_segs[m_active].size < segment_bytes)
         return true;
+    // A seal still running, or a next segment still being made, lets this one grow past its size a little longer.
+    if (sealing() || (m_next && !m_next->done.load(std::memory_order_acquire)))
+        return true;
+    if (!m_next || !m_next->ok)
+        return roll_here(why);
+    if (!flush())
+    {
+        why = "the segment could not be written to the disk";
+        return false;
+    }
+    m_next->th.join();
+    auto job = std::make_unique<seal_job>();
+    job->seg = m_active;
+    job->end = m_written;
+    job->fd = ::dup(m_fd);
+    if (job->fd < 0)
+        return roll_here(why);
+    job->room = std::move(m_room);
+    const uint32_t seg = reserve();
+    job->from = m_dir + "/" + next_name;
+    job->to = path_of(seg);
+    job->dir = m_dir;
+    seal_job* j = job.get();
+    // The order a crash leaves readable: the full segment's records and end on the disk, and only then the next named,
+    // so a start finds either the full one newest or both whole; until then the next's records are told to no one.
+    j->th = std::thread([j] {
+        if (j->room)
+        {
+            j->room->stop.store(true, std::memory_order_relaxed);
+            j->room->th.join();
+        }
+        j->ok = ::fdatasync(j->fd) == 0 && ::ftruncate(j->fd, static_cast<off_t>(j->end)) == 0 && ::fsync(j->fd) == 0 &&
+                ::rename(j->from.c_str(), j->to.c_str()) == 0 && sync_dir(j->dir);
+        ::close(j->fd);
+        j->done.store(true, std::memory_order_release);
+    });
+    m_seal = std::move(job);
+    m_segs[m_active].fd = m_fd;
+    m_fd = m_next->fd;
+    m_next.reset();
+    m_active = seg;
+    m_segs[seg].size = header_bytes;
+    ++m_layout;
+    m_written = m_alloc = header_bytes;
+    m_room_failed = false;
+    return true;
+}
+
+bool seglog::roll_here(std::string& why)
+{
+    end_next();
     // The sealed segment's records, and its end at the last of them, are on the disk before a newer one seals it.
     const bool synced = sync();
     // Zeros a room wrote after the cut would lengthen it again.
@@ -452,6 +578,8 @@ bool seglog::adopt(uint32_t seg, std::string& why)
 
 void seglog::remove(uint32_t seg)
 {
+    if (m_seal && m_seal->seg == seg)
+        end_seal();
     const auto it = m_segs.find(seg);
     if (it == m_segs.end() || seg == m_active)
         return;

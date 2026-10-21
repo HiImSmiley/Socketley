@@ -211,6 +211,8 @@ public:
     bool flush() { return m_log.flush(); }
     bool sync() { return m_log.sync(); }
     int journal_fd() const { return m_log.fd(); }
+    // True while a full segment is sealed off the loop and the newest's sync must wait for it.
+    bool sealing() { return m_log.sealing(); }
     // The last sequence number written.
     uint64_t seq() const { return m_seq; }
 

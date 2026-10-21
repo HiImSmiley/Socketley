@@ -261,6 +261,21 @@ void db_run::finish_turn()
         need = need || w.needs > m_durable;
     if (!need || m_sync_inflight)
         return;
+    if (m_store.sealing())
+    {
+        // The records past the seal are told once it is on the disk, so the loop goes on and looks again.
+        if (!m_seal_poll)
+            m_seal_poll = m_io.after(std::chrono::milliseconds(1), [this](int64_t) {
+                m_seal_poll = false;
+                if (!m_stopped)
+                    finish_turn();
+            });
+        if (m_seal_poll)
+            return;
+        // The ring had no room for the timer: the seal is waited for here, which only blocks the loop for it.
+        synced(m_store.sync(), m_store.seq());
+        return;
+    }
     if (!m_store.flush())
     {
         synced(false, 0);

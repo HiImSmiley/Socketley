@@ -63,6 +63,8 @@ public:
 
     // A new newest segment when this one is past segment_bytes, its own records written first.
     bool roll_if_full(std::string& why);
+    // True while the segment before the newest is sealed off the loop, when no sync of the newest may be told.
+    bool sealing();
     uint32_t active() const { return m_active; }
     // Every segment but the newest, oldest first.
     std::vector<uint32_t> sealed() const;
@@ -130,11 +132,44 @@ private:
     {
         uint64_t from{0};
         uint64_t to{0};
+        int fd{-1};
+        // Records below `zeroed` go on while the rest is written, since no zero is written there again.
+        std::atomic<uint64_t> zeroed{0};
+        std::atomic<bool> stop{false};
         bool ok{false};
+        bool failed{false};
         std::atomic<bool> done{false};
         std::thread th;
     };
     std::unique_ptr<room_job> m_room;
+    // The next segment's file made and synced off the loop as the newest nears its size, under a name a start deletes.
+    struct next_job
+    {
+        int fd{-1};
+        bool ok{false};
+        std::atomic<bool> done{false};
+        std::thread th;
+    };
+    std::unique_ptr<next_job> m_next;
+    // A full segment sealed off the loop: its room ended, its records synced and its end cut, then the next one renamed
+    // into place and the directory synced.
+    struct seal_job
+    {
+        uint32_t seg{0};
+        uint64_t end{0};
+        int fd{-1};
+        std::unique_ptr<room_job> room;
+        std::string from, to, dir;
+        bool ok{false};
+        std::atomic<bool> done{false};
+        std::thread th;
+    };
+    std::unique_ptr<seal_job> m_seal;
+    void start_next();
+    void end_next();
+    void end_seal();
+    // The old way, every step on the loop, when no next segment could be made ahead.
+    bool roll_here(std::string& why);
     // A room that could not be made is not asked for again in this segment: its records are appended as they come.
     bool m_room_failed{false};
     // Below this the newest segment's file is records, or zeros on the disk.

@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "runtime/db/db_doc.h"
+#include "runtime/db/db_log.h"
 #include "runtime/db/db_docmap.h"
 #include "runtime/db/db_schema.h"
 #include "runtime/db/db_shard.h"
@@ -813,6 +814,82 @@ TEST_CASE("a shard reading another's log sees what is on the disk, across rolls 
 
     // A log that went back -- cleared, or another put in its place -- is no log this reading goes on with.
     CHECK_FALSE(r.follow(1, nullptr));
+}
+
+TEST_CASE("a full segment is sealed off the loop, and a crash before the seal leaves a log that starts")
+{
+    namespace fs = std::filesystem;
+    const auto seg_path = [](const std::string& dir, unsigned n) {
+        char name[32];
+        std::snprintf(name, sizeof name, "seg-%08u.log", n);
+        return dir + "/" + name;
+    };
+    const auto count = [](const std::string& dir, std::string& why) {
+        seglog log;
+        size_t n = 0;
+        const bool ok = log.open(dir, [&](uint32_t, uint64_t, std::string_view) { ++n; return true; }, why);
+        return ok ? n : static_cast<size_t>(-1);
+    };
+    tmpdir t;
+    std::string why;
+    const std::string rec(64 << 10, 'r');
+    size_t written = 0;
+    {
+        seglog log;
+        REQUIRE(log.open(t.path, [](uint32_t, uint64_t, std::string_view) { return true; }, why));
+        // Past the segment's size, rolled as the loop would after each batch: the roll waits for the next segment made
+        // ahead, then hands the seal to a thread.
+        for (int i = 0; log.active() == 1 && i < 4000; ++i)
+        {
+            log.append(rec);
+            ++written;
+            REQUIRE(log.flush());
+            REQUIRE(log.roll_if_full(why));
+            if (log.size_of(1) >= seglog::segment_bytes)
+                usleep(1000);
+        }
+        REQUIRE(log.active() == 2);
+        for (int i = 0; log.sealing() && i < 5000; ++i)
+            usleep(1000);
+        CHECK_FALSE(log.sealing());
+        CHECK(static_cast<uint64_t>(fs::file_size(seg_path(t.path, 1))) == log.size_of(1));
+        CHECK(fs::exists(seg_path(t.path, 2)));
+        CHECK_FALSE(fs::exists(t.path + "/next-segment.tmp"));
+        log.append(rec);
+        ++written;
+        REQUIRE(log.sync());
+    }
+    CHECK(count(t.path, why) == written);
+
+    // What a crash between the roll and the end of the seal leaves: the full segment with its room's zeros, the next
+    // one made but not yet named.  A start reads the full one as the newest and deletes the other.
+    tmpdir c;
+    {
+        seglog log;
+        REQUIRE(log.open(c.path, [](uint32_t, uint64_t, std::string_view) { return true; }, why));
+        for (int i = 0; i < 3; ++i)
+            log.append(rec);
+        REQUIRE(log.sync());
+    }
+    std::string next;
+    {
+        std::ifstream in(seg_path(c.path, 1), std::ios::binary);
+        next.assign(std::istreambuf_iterator<char>(in), {});
+        next.resize(seglog::header_bytes);
+        std::ofstream z(seg_path(c.path, 1), std::ios::binary | std::ios::app);
+        z << std::string(1 << 20, '\0');
+    }
+    std::ofstream(c.path + "/next-segment.tmp", std::ios::binary) << next;
+    CHECK(count(c.path, why) == 3);
+    CHECK_FALSE(fs::exists(c.path + "/next-segment.tmp"));
+
+    // The other order, the next named before the full one is cut, leaves a start that refuses: why the seal renames last.
+    {
+        std::ofstream z(seg_path(c.path, 1), std::ios::binary | std::ios::app);
+        z << std::string(1 << 20, '\0');
+    }
+    std::ofstream(seg_path(c.path, 2), std::ios::binary) << next;
+    CHECK(count(c.path, why) == static_cast<size_t>(-1));
 }
 
 TEST_CASE("segments: rolled, merged off the loop, and read back across a restart, with more than the cache holds")

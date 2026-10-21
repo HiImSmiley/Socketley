@@ -218,6 +218,8 @@ private:
     std::vector<waiter> m_waiting;
     uint64_t m_durable{0};
     bool m_sync_inflight{false};
+    // A look again armed while a segment's seal holds the next sync back.
+    bool m_seal_poll{false};
     // Changes written and not yet on the disk, and those on it kept for a stream that resumes.
     std::deque<event> m_unpublished;
     std::deque<event> m_history;
