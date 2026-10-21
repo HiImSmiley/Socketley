@@ -248,6 +248,7 @@ for f in "$BIN_DIR"/fuzz_*; do
         fuzz_dns)            corpus=dns ;;
         fuzz_db)             corpus=db ;;
         fuzz_mqtt)           corpus=mqtt ;;
+        fuzz_mail)           corpus=mail ;;
         *)
             echo "ERROR: $fname has no corpus mapping in run_all.sh."
             echo "       A target nothing replays is a target that does not run."

@@ -1,0 +1,16 @@
+From: "A B" <a@b.test>
+To: c@d.test, G: e@f.test;
+Subject: =?UTF-8?B?w6Q=?=
+Content-Type: multipart/mixed; boundary=o
+
+--o
+Content-Type: text/plain
+
+text
+--o
+Content-Type: message/rfc822
+
+Subject: in
+
+body
+--o--

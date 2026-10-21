@@ -17,7 +17,7 @@ REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 # because the SDK-linking targets drag in fifteen translation units -- and
 # narrowing is always the caller's explicit decision, never a target dropped
 # because building it failed.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_mqtt"
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_db fuzz_mqtt fuzz_mail"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -101,6 +101,10 @@ want fuzz_dns && build fuzz_dns "$ROOT/test/fuzz/fuzz_dns.cpp" "$ROOT/socketley/
 want fuzz_mqtt && build fuzz_mqtt "$ROOT/test/fuzz/fuzz_mqtt.cpp" "$ROOT/socketley/runtime/mqtt/mqtt_codec.cpp" \
     "$ROOT/socketley/runtime/mqtt/mqtt_topics.cpp" "$ROOT/socketley/runtime/mqtt/mqtt_broker.cpp" \
     "$ROOT/socketley/runtime/mqtt/mqtt_broker_store.cpp"
+want fuzz_mail && build fuzz_mail "$ROOT/test/fuzz/fuzz_mail.cpp" "$ROOT/socketley/runtime/mail/smtp_session.cpp" \
+    "$ROOT/socketley/runtime/mail/mail_compose.cpp" "$ROOT/socketley/runtime/mail/mail_dkim.cpp" \
+    "$ROOT/socketley/runtime/mail/mail_mime.cpp" "$ROOT/socketley/runtime/mail/mail_aliases.cpp" \
+    "$ROOT/socketley/shared/util/base64.cpp" -lssl -lcrypto
 want fuzz_db && build fuzz_db "$ROOT/test/fuzz/fuzz_db.cpp" "$ROOT/socketley/runtime/db/db_doc.cpp" \
     "$ROOT/socketley/runtime/db/db_schema.cpp" "$ROOT/socketley/runtime/db/db_store.cpp" \
     "$ROOT/socketley/shared/crypto/jws.cpp" -lcrypto

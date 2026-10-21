@@ -1297,6 +1297,33 @@ project "fuzz_mqtt"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: what a mail runtime reads from others ─────────────────────────────
+--
+-- An SMTP client's bytes, a message as IMAP parses it, its DKIM signatures,
+-- address lists and aliases, and quoted-printable.
+
+project "fuzz_mail"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_mail.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/runtime/mail/smtp_session.cpp",
+        "socketley/runtime/mail/mail_compose.cpp",
+        "socketley/runtime/mail/mail_dkim.cpp",
+        "socketley/runtime/mail/mail_mime.cpp",
+        "socketley/runtime/mail/mail_aliases.cpp",
+        "socketley/shared/util/base64.cpp"
+    }
+    links(tls_libs())
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: the JSON pair behind socketley.json_decode / json_encode ─────────
 --
 -- The one binding written to be pointed at data from the network, and the one

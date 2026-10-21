@@ -514,7 +514,7 @@ socketley daemon --name new-name   # rename while cluster is active
 .BI "create " "type name " "[flags]"
 Create a new runtime instance.
 .I type
-can be: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, or any registered type \(em see
+can be: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail, or any registered type \(em see
 .BR "REGISTERED TYPES" .
 .I name
 is a unique identifier for the runtime.
@@ -696,6 +696,33 @@ Send a message to a running server or client runtime.
 For servers, the message is broadcast to all connected clients.
 For clients, the message is sent to the connected server.
 Respects the runtime's mode setting (fails if mode is receive-only).
+.TP
+.BI "send " "mail " "\fB\-\-to \fIaddress\fR [\fB\-\-cc\fR|\fB\-\-bcc \fIaddress\fR] [\fB\-\-from \fIaddress\fR] [\fB\-\-reply\-to \fIaddress\fR] [\fB\-\-subject \fItext\fR] [\fB\-\-text \fItext\fR] [\fB\-\-html \fIfile\fR] [\fB\-\-attach \fIfile\fR[:\fItype\fR]] [\fB\-\-header \fR'\fIName\fR: \fIvalue\fR'] [\fB\-\-raw\fR]"
+A message written and queued by a mail runtime, which answers its queue id:
+its text from
+.B \-\-text
+or stdin, an HTML part beside it from a file, attachments in base64, every
+flag but
+.B \-\-to
+said as often as needed. A name or address may be
+.BR "Name <a@b>" .
+Without
+.B \-\-from
+a runtime with
+.B \-\-no\-reply
+sends from no\-reply@ its first domain.
+.B \-\-raw
+queues stdin as the whole message, its headers its own. See
+.BR "MAIL FLAGS" .
+.RS
+.PP
+.nf
+socketley send m \-\-to ops@example.com \-\-subject "Backup done" \-\-text ok
+df \-h | socketley send m \-\-to "Ops <ops@example.com>" \-\-subject "Disks" \e
+    \-\-attach report.pdf:application/pdf
+.fi
+.RE
+.PP
 .PP
 If no message is given, reads from stdin:
 .nf
@@ -954,12 +981,43 @@ read from stdin, or asked for twice without echo on a terminal, and kept as a
 scrypt hash; the file is made with mode 0600 and replaced whole, every other
 line kept. With
 .B \-\-delete
-the user goes. It needs no daemon; a broker reads the file again within two
-seconds.
+the user goes. It needs no daemon; a broker, and a mail runtime's
+.BR \-\-users ,
+read the file again within two seconds.
 .RS
 .PP
 .nf
 socketley mqtt\-passwd /etc/socketley/mqtt.users sensor\-17
+.fi
+.RE
+.TP
+.BI "mail " "mail " "queue \fR[\fIfilter\fR] | \fBshow \fIid\fR | \fBflush \fR[\fIid\fR] | \fBdrop \fIid\fR | \fBdns\fR | \fBsuppressed\fR | \fBforgive \fIaddress"
+A mail runtime's spool, of every shard:
+.B queue
+lists what waits (its id, size, sender, the recipients still waiting and the
+tries), those whose id or sender holds
+.I filter
+where one is given;
+.B show
+the envelope of one, each recipient with what it was last answered;
+.B flush
+tries every message, or the one named, now;
+.B drop
+deletes one, told to nobody.
+.B dns
+prints the MX, SPF, DKIM and DMARC records its domains need, for a zone kept
+elsewhere than a dns runtime of this daemon;
+.B suppressed
+the addresses bounces said are dead, which are not mailed again until
+.B forgive
+lets one go. See
+.BR "MAIL FLAGS" .
+.RS
+.PP
+.nf
+socketley mail m queue
+socketley mail m show 65e5113d0e2120000000
+socketley mail m dns >> /etc/bind/example.com.zone
 .fi
 .RE
 .TP
@@ -1418,7 +1476,7 @@ name	Runtime name \fB(requires restart)\fR
 id	6-char hex identifier (read-only, ignored on import)
 type	T{
 .ad l
-Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt (read-only, ignored on import)
+Runtime type: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail (read-only, ignored on import)
 T}
 was_running	Internal daemon state (ignored on import)
 .TE
@@ -6840,6 +6898,7 @@ feed     cache://events/stream/s3
 live     cache://events/channel/s3
 panel    server://dashboard
 bus      mqtt://broker/storage/events
+oncall   mail://m/ops@example.com,dev@example.com
 .fi
 .RE
 .IP
@@ -6853,7 +6912,10 @@ publishes it on that channel, and
 broadcasts it to the server's clients, and
 .BI mqtt:// runtime / topic
 publishes it on that broker's topic at QoS 1, answered once the broker holds
-it; such a line takes no
+it, and
+.BI mail:// runtime / address\fR[,\fIaddress\fR...]
+mails it to those addresses through that mail runtime, its subject what the
+event is, answered once the message is in the spool; such a line takes no
 .BR ca= .
 An event a cache refuses or a runtime that is not running is retried like a
 webhook that does not answer.
@@ -12523,6 +12585,319 @@ says the sessions and those connected, the subscriptions, the retained
 messages and their bytes, what is queued and in flight, the messages received
 and sent at each QoS, what was dropped and why, the connects and the refusals,
 the snapshots, each topic rule, and over shards what was handed between them.
+.SH MAIL FLAGS
+A
+.B mail
+runtime is a mail server: it takes the mail of its domains and the mail its
+users send, keeps each message in a spool until it is delivered, hands mail for
+elsewhere to the domain's exchanger or a smarthost, and keeps its users'
+mailboxes in a storage runtime, read over IMAP. It is a runtime like the
+others: a dns runtime gives its domains their records, an idp runtime its users,
+a storage runtime its mailboxes, and the other runtimes, the CLI and the daemon's
+alerts send mail through it.
+.PP
+.nf
+socketley create mail m \-p 25 \-\-dns ns \-\-no\-reply \-s
+socketley send m \-\-to ops@example.com \-\-subject "Backup done" \-\-text ok
+
+socketley create mail m \-p 25 \-\-dns ns \-\-idp auth \-\-storage files/mail \e
+    \-\-submission 587 \-\-imap 143 \-\-tls \-\-cert mail.pem \-\-key mail.key \-s
+.fi
+.PP
+It listens for SMTP on 25 unless
+.B \-p
+says otherwise; port 25 needs the daemon to be allowed to bind it.
+.B \-\-submission
+adds a port its users send from, with STARTTLS and a password,
+.B \-\-submissions
+one that speaks TLS from the first byte, and
+.B \-\-imap
+and
+.B \-\-imaps
+the same two for reading the mailboxes.
+.PP
+.B Whose mail it takes.
+Its domains are
+.BR \-\-mail\-domain ,
+or the zones of the dns runtime
+.B \-\-dns
+names, followed as they change. Mail for an address of them is taken when an
+alias names it
+.RB ( \-\-aliases ),
+when it is a user's
+.RB ( \-\-idp :
+the local part a username, or the address the account's email), when it is
+.B no\-reply@
+and a bounce, or when the script takes it
+.RB ( on_rcpt );
+any other is refused at RCPT with 550. Mail for elsewhere is taken from a user
+signed in, and from 127.0.0.1, this machine's own programs; from anyone else it
+is refused with 554, so the server is not a relay.
+.PP
+.B Taking mail.
+ESMTP with PIPELINING, SIZE, 8BITMIME, SMTPUTF8, ENHANCEDSTATUSCODES, STARTTLS
+and AUTH PLAIN and LOGIN; replies come in the order the commands came. A message
+past
+.B \-\-max\-size
+is refused, said at MAIL when its SIZE says so, after its end otherwise. Its end
+is a CRLF, a dot and a CRLF and nothing else, and a bare LF in it is written as
+CRLF, so a dot between bare LFs ends no message here or on the next server; what
+a client sent after STARTTLS before the handshake is dropped. AUTH is offered
+over TLS, and in the clear to 127.0.0.1 alone; a wrong password is answered a
+second later. On the submission ports nothing is taken from a client that has
+not signed in, and a user of the idp runtime sends only as their own address,
+their username at one of its domains or their account's email. A connection
+quiet for five minutes is closed.
+.PP
+.B What it checks.
+Mail from elsewhere (port 25, no user signed in, not 127.0.0.1) is checked
+before it is taken: SPF (RFC 7208) for the sender's domain, or HELO's for a
+bounce; every DKIM signature (up to five); and DMARC (RFC 7489) for the domain
+of From, with SPF or DKIM aligned as its record says. A message DMARC fails
+under
+.B p=reject
+is refused with 550 and not kept; under
+.B p=quarantine
+it goes to the recipient's Junk folder. What each said is written into the
+mailbox's
+.B Authentication\-Results
+line, and one a sender put there under this host's name is taken out. The
+lookups run on a pool of their own and never on the loop. The organizational
+domain DMARC compares is the last two labels of a name, which the Public Suffix
+List would correct for a name such as example.co.uk.
+.PP
+.B The spool.
+A message is written to a file of its own under
+.IB state /mail/ name /spool
+as it arrives and synced before the client is told 250, its envelope ahead of it
+and its length after it; a file a crash cut is deleted at the next start, and
+what became of each recipient is kept in a log beside them, so a restart tries
+again what was waiting. A message under a mebibyte is kept in memory as well,
+and its delivery reads nothing back.
+.PP
+.B Sending it on.
+Recipients of one domain go in one transaction, and a connection to a domain
+carries one message after another while there are more for it, at most four to
+a domain and 128 in all; MAIL, RCPT and DATA go in one write where the other
+side offers PIPELINING. The exchangers are the domain's MX records, from the
+resolver on the loop, or the domain itself when it has none; a domain that does
+not exist or says it takes no mail (RFC 7505) fails at once. With
+.B \-\-relay
+everything for elsewhere goes through that smarthost. TLS is spoken wherever
+it is offered; an exchanger's certificate is not checked, as no mail server
+checks one without DANE or MTA\-STS, and a smarthost's is, and its password is
+never sent in the clear. A recipient refused for now is tried again after
+1m, 5m, 15m, 30m, 1h, 2h, 4h and every 8h after, until
+.BR \-\-queue\-lifetime ;
+one refused for good, or out of time, is bounced to the sender as a delivery
+status report from the null sender. Mail from one of its domains is signed with
+DKIM (rsa\-sha256, relaxed), with a key made at its first start and kept in
+.IB state /mail/ name .dkim. selector .key
+for every shard.
+.PP
+.B Its records.
+With
+.B \-\-dns
+it gives each of its domains, through the dns runtime:
+.RS
+.PP
+.nf
+example.com.                 MX   10 mail.example.com.
+example.com.                 TXT  "v=spf1 mx \-all"
+skl._domainkey.example.com.  TXT  "v=DKIM1; k=rsa; p=..."
+_dmarc.example.com.          TXT  "v=DMARC1; p=quarantine; adkim=r; aspf=r"
+.fi
+.RE
+.IP
+and its host,
+.BI mail. domain
+unless
+.B \-\-hostname
+says another, the addresses the dns runtime's
+.B \-\-publish
+gives its names. A record the zone file has at the name wins. With
+.B \-\-relay
+SPF ends in ~all, since mail leaves from the smarthost's addresses. Without a
+dns runtime,
+.B socketley mail
+.I m
+.B dns
+prints the four lines for the zone kept elsewhere.
+.PP
+.B No\-reply.
+With
+.BR \-\-no\-reply ,
+a message
+.B socketley send
+or a script writes without a sender goes from
+.BI no\-reply@ domain\fR.
+Mail to that address is refused, but a bounce is taken and read: every
+recipient its report says failed is suppressed, not mailed again by any shard
+until
+.B socketley mail
+.I m
+.B forgive
+.I address
+lets it go. The runtime's own bounce of such a message arrives there too, so an
+address is learned dead from its first try.
+.PP
+.B Mailboxes.
+With
+.B \-\-idp
+and
+.BR \-\-storage ,
+a user's mail is an object of the storage runtime's bucket (mail unless
+.B \-\-storage
+names another), made when first needed:
+.IB user /INBOX/ id .eml
+under a Return\-Path, a Delivered\-To and the Authentication\-Results line,
+written whole under a mebibyte and in pieces of one above. A message in a
+mailbox is told to the targets of
+.B \-\-notify\-targets
+as
+.BR {"event":"mail.received","mailbox":..,"folder":..,"key":..,"from":..,"subject":..,"size":..} ,
+under
+.BI mail/ user
+for a broker. The bucket keeps objects as they came; one that encrypts or
+compresses its objects cannot hold mail over a mebibyte.
+.PP
+.B IMAP.
+IMAP4rev1 with LITERAL+, SASL\-IR, IDLE, NAMESPACE, UIDPLUS, MOVE, UNSELECT,
+CHILDREN, SPECIAL\-USE, ID and ENABLE, on the mailboxes of
+.BR \-\-storage ;
+a password goes over STARTTLS or
+.B \-\-imaps
+only (LOGINDISABLED before), except from 127.0.0.1. Every mailbox has INBOX,
+Sent, Drafts, Junk and Trash, and CREATE makes more. A folder's UIDs and flags
+are kept per user in
+.IB state /mail/ name .imap/ user ;
+the bucket stays what counts, looked at when a folder is opened and at most every
+two seconds after, so what a delivery or another client put there has the next
+UID and what went is expunged. IDLE is told of new mail within a second. The
+first shard alone serves IMAP. A connection quiet for thirty minutes is closed.
+.PP
+.B From the other runtimes.
+.B socketley send
+and a script's
+.B socketley.mail.send
+write and queue a message; a storage's
+.BI mail:// runtime / address
+notification target mails its events; and
+.B daemon.alert_mail
+mails the daemon's alerts.
+.RS
+.PP
+.nf
+local id, err = socketley.mail.send("m", { to = "ops@example.com",
+    subject = "order " .. order.id, text = "paid",
+    attachments = { { name = "invoice.pdf", type = "application/pdf", data = pdf } } })
+.fi
+.RE
+.PP
+.B Lua.
+A script of the runtime decides each recipient and is told each message:
+.RS
+.PP
+.nf
+function on_rcpt(r, default)          -- r.to, r.from, r.peer, r.user
+    if r.to == "orders@example.com" then return true end   -- the script's alone
+    if r.from:match("@spam%.test$") then return false end  -- refused 550
+end                                   -- nil keeps the default
+function on_message(m)                -- m.id, m.from, m.to, m.size, m.subject, m.message
+    socketley.mqtt.publish("bus", "mail/in", m.subject or "", { qos = 1 })
+end
+.fi
+.RE
+.IP
+A recipient
+.B on_rcpt
+takes that no mailbox or alias has is the script's: its message reaches
+.B on_message
+and nowhere else.
+.B m.message
+is the whole message where it is under a mebibyte.
+.TP
+.BI "\-\-mail\-domain " domain\fR[,\fIdomain\fR...]
+The domains whose mail it takes.
+.TP
+.BI "\-\-dns " runtime
+The dns runtime whose zones are its domains, given their records.
+.TP
+.BI "\-\-hostname " name
+The name it greets with and its MX records name, mail.\fIfirst domain\fR unless given.
+.TP
+.B \-\-no\-reply
+Send from no\-reply@ where no sender is said, take no mail there but bounces,
+and learn from those.
+.TP
+.BI "\-\-idp " runtime
+The idp runtime whose users have mailboxes here and sign in to send and read.
+.TP
+.BI "\-\-storage " runtime\fR[/\fIbucket\fR]
+The storage runtime, and bucket, the mailboxes are kept in.
+.TP
+.BI "\-\-users " file
+Accounts that sign in to send, a name and a scrypt hash a line as
+.B socketley mqtt\-passwd
+writes them, read again when it changes.
+.TP
+.BI "\-\-aliases " file
+Addresses taken besides the users',
+.IR "address target" [, target ...]
+a line, a target a mailbox (a name) or an address mail is sent on to, and
+.BI *@ domain
+any local part of a domain that names none of its own; read again when it
+changes.
+.TP
+.BI "\-\-relay " smtp\fR[\fBs\fR]\fB://\fR[\fIuser\fB:\fIpassword\fB@\fR]\fIhost\fR[\fB:\fIport\fR]
+A smarthost every message for elsewhere goes through; smtps:// speaks TLS from
+the first byte (465), smtp:// STARTTLS (587).
+.TP
+.BI "\-\-submission " port
+A port users send from with STARTTLS and a password; it needs
+.B \-\-tls
+and
+.B \-\-users
+or
+.BR \-\-idp .
+.TP
+.BI "\-\-submissions " port
+A port users send from over TLS from the first byte; it needs
+.BR \-\-tls .
+.TP
+.BI "\-\-imap " port
+.TQ
+.BI "\-\-imaps " port
+A port mail clients read the mailboxes on, with STARTTLS or over TLS from the
+first byte; they need
+.BR \-\-storage .
+.TP
+.BI "\-\-notify\-targets " file
+Where each message stored in a mailbox is told, in the form a storage runtime's
+file takes.
+.TP
+.BI "\-\-max\-size " size
+The largest message taken, 1K to 1G, 25M unless given.
+.TP
+.BI "\-\-max\-recipients " n
+The most recipients of one message, 100 unless given; past them a RCPT is
+answered 452.
+.TP
+.BI "\-\-queue\-lifetime " duration
+How long a message is tried before it is bounced, 1m to 30d, 5d unless given.
+.TP
+.BI "\-\-dkim\-selector " name
+The selector its DKIM key is published and signed under, skl unless given.
+.PP
+.B stats
+says what was received, delivered, deferred, failed and bounced, what is queued
+and its bytes, the recipients and relays refused, what was too big, the spool's
+failures, what was checked and what DMARC refused or quarantined, the bounces
+taken and the addresses suppressed, what was stored in mailboxes, the sign\-ins
+and their failures, STARTTLS and TLS failures, the connections out, their TLS
+and transactions, the MX lookups, and the IMAP connections and reads.
+.PP
+It does not speak CHUNKING (BDAT), DSN, DANE or MTA\-STS, and reads no Sieve.
 .SH REGISTERED TYPES
 A runtime type beyond the built-in seven is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never
@@ -13192,6 +13567,15 @@ assume anything about its value.
 .TP
 .B on_disconnect(client_id)
 Called when a client disconnects (server/client).
+.TP
+.B on_rcpt(rcpt, default) \(-> bool
+A mail runtime's, deciding each recipient as it is said, and told each message
+taken by
+.BR on_message(msg) .
+See
+.B Lua
+under
+.BR "MAIL FLAGS" .
 .TP
 .B on_publish(client, msg) \(-> bool | table
 .TQ
@@ -14664,6 +15048,18 @@ true once the broker has it. See
 under
 .BR "MQTT FLAGS" .
 .TP
+.B socketley.mail.send(runtime, {to=, cc=, bcc=, from=, reply_to=, subject=, text=, html=, headers=, attachments=, raw=} [, fn]) \(-> id | nil, why
+A message written and queued by a mail runtime of this daemon; its queue id once
+it is in the spool.
+.BR to ,
+.B cc
+and
+.B bcc
+are an address or a list of them, an attachment
+.BR {name=,type=,data=} .
+See
+.BR "MAIL FLAGS" .
+.TP
 .B socketley.http(opts) \(-> table
 Synchronous HTTP/HTTPS client.
 .B WARNING:
@@ -15216,7 +15612,12 @@ carry the rest. A message the hook does not take with a 2xx is posted again,
 after a pause that doubles up to eight seconds, and one it has not taken is
 kept in
 .B .notify
-in the state directory and posted after a restart. The alerts told of are kept
+in the state directory and posted after a restart. With
+.B daemon.alert_mail
+set to
+.BI mail:// runtime / address\fR[,\fIaddress\fR...]
+each is mailed as well, or instead, by that mail runtime, its subject the
+alert's first line, held the same way until the runtime runs. The alerts told of are kept
 in
 .B .alerts
 in the state directory, readable by the daemon's user alone, so a daemon
@@ -16983,7 +17384,14 @@ A test aid: the file the resolver on a runtime's loop reads its nameservers,
 search list and options from, in
 .BR resolv.conf (5)'s
 form, so a test can point it at a nameserver of its own; /etc/resolv.conf when
-unset (see What can stop the event loop).
+unset (see What can stop the event loop). A mail runtime's SPF, DKIM and DMARC
+lookups ask its nameservers too.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MAIL_MX_PORT
+A test aid: the port a mail runtime hands mail to a domain's exchangers on, 25
+when unset, so a test's own server can be one.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
@@ -17662,6 +18070,8 @@ daemon = {
     dashboard_idp = "auth",  -- or as admins of this idp runtime
     alert_webhook = "https://discord.com/api/webhooks/...",
                              -- where alerts are posted
+    alert_mail = "mail://m/ops@example.com",
+                             -- and mailed, by this mail runtime
     events = "bus",          -- an mqtt runtime the runtimes' states and
                              -- the alerts are published on
     cpus = "0-3",            -- where this daemon's I/O runs

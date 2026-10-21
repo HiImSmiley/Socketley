@@ -2791,6 +2791,30 @@ def mq_rec(op, conn, data=b""):
     return bytes([op, conn, len(data) & 0xFF, len(data) >> 8]) + data
 
 
+# What a mail runtime reads: SMTP sessions as swaks and Postfix send them, messages
+# a mail client opens, a DKIM-signed one, address lists and text for
+# quoted-printable, each led by the byte fuzz_mail.cpp chooses the case by.
+def mail_seeds():
+    smtp = (b"EHLO c.test\r\nMAIL FROM:<a@b.test> SIZE=20 BODY=8BITMIME\r\nRCPT TO:<cc@d.test>\r\n"
+            b"RCPT TO:<xyz@d.test>\r\nDATA\r\nSubject: x\r\n\r\n..dot\r\nbare\nline\r\n.\r\nQUIT\r\n")
+    msg = (b"From: \"A B\" <a@b.test>\r\nTo: c@d.test, G: e@f.test;\r\nSubject: =?UTF-8?B?w6Q=?=\r\n"
+           b"Content-Type: multipart/mixed; boundary=o\r\n\r\n--o\r\nContent-Type: text/plain\r\n\r\ntext\r\n"
+           b"--o\r\nContent-Type: message/rfc822\r\n\r\nSubject: in\r\n\r\nbody\r\n--o--\r\n")
+    dkim = (b"DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.test; s=skl; h=from:to;\r\n"
+            b" bh=AAAA; b=BBBB\r\nFrom: a@example.test\r\nTo: b@c.test\r\n\r\n  body \t text  \r\n\r\n")
+    return {
+        "smtp_session": b"\0" + smtp,
+        "smtp_pieces": b"\0" + smtp.replace(b"\r\n", b"\r\n\xff", 3),
+        "smtp_auth": b"\0EHLO x\r\nAUTH PLAIN AGFiAGNk\r\nAUTH LOGIN\r\nYWI=\r\nY2Q=\r\nSTARTTLS\r\nMAIL FROM:<>\r\n",
+        "smtp_smuggle": b"\0HELO x\r\nMAIL FROM:<a@b.test>\r\nRCPT TO:<cd@d.test>\r\nDATA\r\na\n.\nb\r\n.\r\n",
+        "mime_nested": b"\x01" + msg,
+        "mime_plain": b"\x01Subject: x\r\n\r\nhello\r\n",
+        "dkim_signed": b"\x02" + dkim,
+        "addresses": b"\x03\"Q, R\" <q@r.test>, plain@s.test, Group: a@b.test, c@d.test;, <@route:x@y.test>",
+        "aliases": b"\x03info@example.test alice, bob@remote.test\n*@example.test carol\nbad line\n",
+        "quoted": b"\x04" + ("Zeile mit Umlaut \u00e4 und =Gleich " * 6 + "\n trailing  \n").encode(),
+    }
+
 def mqtt_seeds():
     v5 = 5
     expiry = mq_props((0x11, struct.pack(">I", 3600)), (0x21, struct.pack(">H", 4)))
@@ -2868,7 +2892,8 @@ def main(argv):
                         ("s3sigv4", s3sigv4_seeds()),
                         ("bucketpolicy", bucketpolicy_seeds()),
                         ("dns", dns_seeds()),
-                        ("mqtt", mqtt_seeds())):
+                        ("mqtt", mqtt_seeds()),
+                        ("mail", mail_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

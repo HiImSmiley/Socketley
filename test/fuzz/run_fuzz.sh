@@ -171,9 +171,10 @@ declare -A CORPUS=(
     [fuzz_bucket_policy]=bucketpolicy
     [fuzz_dns]=dns
     [fuzz_mqtt]=mqtt
+    [fuzz_mail]=mail
 )
 
-read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_mqtt}"
+read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg fuzz_s3_sigv4 fuzz_bucket_policy fuzz_dns fuzz_mqtt fuzz_mail}"
 
 # The pinned configurations the proxy seed corpus is replayed over, on top of
 # the default run.  ';' separated because the values themselves are comma
