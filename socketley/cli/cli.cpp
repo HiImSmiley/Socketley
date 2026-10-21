@@ -584,6 +584,10 @@ int cli_dispatch(int argc, char** argv)
         }
     }
 
+    // A users file is written here and needs no daemon, which reaching for one would have forked and left running.
+    if (cmd == "mqtt-passwd")
+        return cli_mqtt_passwd(argc, argv);
+
     // All other commands need the daemon — auto-start if not running
     if (!ensure_daemon(argv[0]))
         return 2;
@@ -679,8 +683,6 @@ int cli_dispatch(int argc, char** argv)
             return cli_mqtt_pub(argc, argv);
         case fnv1a("mqtt-sub"):
             return cli_mqtt_sub(argc, argv);
-        case fnv1a("mqtt-passwd"):
-            return cli_mqtt_passwd(argc, argv);
         case fnv1a("mqtt-sessions"):
         case fnv1a("mqtt-kick"):
         case fnv1a("mqtt-retained"):
