@@ -1673,4 +1673,15 @@ ssl_st* tls_of(const stream& st) { return st.owner ? st.owner->ssl : nullptr; }
 
 }   // namespace socketley::h3
 
+#else
+
+namespace socketley::h3
+{
+
+// What a runtime holds of HTTP/3 whether or not it is built in: an endpoint never opened, a stream never made.
+void endpoint_free::operator()(endpoint*) const {}
+ssl_st* tls_of(const stream&) { return nullptr; }
+
+}   // namespace socketley::h3
+
 #endif   // SOCKETLEY_HTTP3

@@ -26,7 +26,22 @@ struct jvalue
     std::string s;
     std::vector<jvalue> items;
     std::vector<std::pair<std::string, jvalue>> members;
+
+    // Defined once the type is whole, since clang sizes a pair holding one while it is still being declared.
+    jvalue();
+    jvalue(const jvalue&);
+    jvalue(jvalue&&) noexcept;
+    jvalue& operator=(const jvalue&);
+    jvalue& operator=(jvalue&&) noexcept;
+    ~jvalue();
 };
+
+inline jvalue::jvalue()                               = default;
+inline jvalue::jvalue(const jvalue&)                  = default;
+inline jvalue::jvalue(jvalue&&) noexcept              = default;
+inline jvalue& jvalue::operator=(const jvalue&)       = default;
+inline jvalue& jvalue::operator=(jvalue&&) noexcept   = default;
+inline jvalue::~jvalue()                              = default;
 
 // What a reader admits past a configuration document's rules, for a reader of data such as S3 Select's records.
 struct json_policy

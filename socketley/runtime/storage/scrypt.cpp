@@ -200,12 +200,12 @@ bool derive_sse(std::string_view password, std::string_view salt, uint64_t N, ui
     return pbkdf2(password, std::string_view(reinterpret_cast<const char*>(B.get()), blen), out, out_len);
 }
 
-#pragma GCC push_options
-#pragma GCC target("avx2")
+// The AVX2 code is named so per function, since clang ignores a target pragma and does not carry one onto lambdas.
+#define SKL_AVX2 __attribute__((target("avx2")))
 
 // C chains of four 256-bit vectors, each holding two hashes, one a 128-bit lane: 2C hashes in one stream.
 template <int C>
-inline void salsa8x(__m256i (&B)[C][4])
+SKL_AVX2 inline void salsa8x(__m256i (&B)[C][4])
 {
     __m256i X[C][4], T[C];
     for (int c = 0; c < C; ++c)
@@ -243,7 +243,7 @@ inline void salsa8x(__m256i (&B)[C][4])
 
 // blockmix() of 2C hashes; vector (blk * C + c) * 4 + k is block blk's k-th of chain c.
 template <int C>
-void blockmixx(const __m256i* in, __m256i* out, size_t r)
+SKL_AVX2 void blockmixx(const __m256i* in, __m256i* out, size_t r)
 {
     __m256i X[C][4];
     for (int c = 0; c < C; ++c)
@@ -277,7 +277,7 @@ size_t lane_word(size_t k, int h, size_t i)
 
 // smix() of 2C hashes at once, each with a V of its own.
 template <int C>
-void smixx(unsigned char* const* B, size_t r, uint64_t N, __m128i* const* V, __m256i* X, __m256i* Y)
+SKL_AVX2 void smixx(unsigned char* const* B, size_t r, uint64_t N, __m128i* const* V, __m256i* X, __m256i* Y)
 {
     constexpr int H = 2 * C;
     const size_t vb = 8 * r;
@@ -285,7 +285,7 @@ void smixx(unsigned char* const* B, size_t r, uint64_t N, __m128i* const* V, __m
         for (size_t k = 0; k < 2 * r; ++k)
             for (size_t i = 0; i < 16; ++i)
                 set_word(X, lane_word<C>(k, h, i), word_at(B[h], k * 16 + i * 5 % 16));
-    auto keep = [&](uint64_t i, const __m256i* S)
+    auto keep = [&](uint64_t i, const __m256i* S) SKL_AVX2
     {
         for (size_t blk = 0; blk < 2 * r; ++blk)
             for (int c = 0; c < C; ++c)
@@ -296,7 +296,7 @@ void smixx(unsigned char* const* B, size_t r, uint64_t N, __m128i* const* V, __m
                     _mm_store_si128(V[2 * c + 1] + i * vb + blk * 4 + k, _mm256_extracti128_si256(v, 1));
                 }
     };
-    auto mix_in = [&](__m256i* S)
+    auto mix_in = [&](__m256i* S) SKL_AVX2
     {
         uint64_t j[H];
         for (int h = 0; h < H; ++h)
@@ -334,7 +334,7 @@ void smixx(unsigned char* const* B, size_t r, uint64_t N, __m128i* const* V, __m
 }
 
 template <int C>
-bool derive_avx2(const job* jobs, uint64_t N, uint32_t r)
+SKL_AVX2 bool derive_avx2(const job* jobs, uint64_t N, uint32_t r)
 {
     constexpr int H = 2 * C;
     const size_t blen = size_t(128) * r;
@@ -362,7 +362,7 @@ bool derive_avx2(const job* jobs, uint64_t N, uint32_t r)
 }
 
 // Two hashes in one stream, or four in two, the most AVX2's sixteen registers hold without spilling.
-bool derive_avx2_any(std::span<const job> jobs, uint64_t N, uint32_t r)
+SKL_AVX2 bool derive_avx2_any(std::span<const job> jobs, uint64_t N, uint32_t r)
 {
     if (jobs.size() == 2)
         return derive_avx2<1>(jobs.data(), N, r);
@@ -373,7 +373,7 @@ bool derive_avx2_any(std::span<const job> jobs, uint64_t N, uint32_t r)
     return derive_avx2<2>(four, N, r);
 }
 
-#pragma GCC pop_options
+#undef SKL_AVX2
 
 bool has_avx2()
 {
