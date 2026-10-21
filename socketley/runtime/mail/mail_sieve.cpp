@@ -1574,16 +1574,6 @@ bool address_part(const parsed_address& a, apart p, std::string& out)
 
 // ─── dates ─────────────────────────────────────────────────────────────────
 
-int64_t days_from_civil(int64_t y, unsigned m, unsigned d)
-{
-    y -= m <= 2;
-    const int64_t era = (y >= 0 ? y : y - 399) / 400;
-    const auto yoe = static_cast<unsigned>(y - era * 400);
-    const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
-    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + static_cast<int64_t>(doe) - 719468;
-}
-
 void civil_from_days(int64_t z, int64_t& y, unsigned& m, unsigned& d)
 {
     z += 719468;
@@ -1596,104 +1586,6 @@ void civil_from_days(int64_t z, int64_t& y, unsigned& m, unsigned& d)
     d = doy - (153 * mp + 2) / 5 + 1;
     m = mp < 10 ? mp + 3 : mp - 9;
     y += m <= 2;
-}
-
-bool small_number(std::string_view s, int& out, size_t max_digits)
-{
-    if (s.empty() || s.size() > max_digits)
-        return false;
-    out = 0;
-    for (const char c : s)
-    {
-        if (!is_digit(c))
-            return false;
-        out = out * 10 + (c - '0');
-    }
-    return true;
-}
-
-// An RFC 5322 date, the obsolete forms among it, as unix time and the zone it was written in.
-bool parse_date(std::string_view v, int64_t& t, int& zone)
-{
-    std::string clean;
-    int depth = 0;
-    for (const char c : v)
-    {
-        if (c == '(')
-            ++depth;
-        else if (c == ')' && depth > 0)
-            --depth;
-        else if (depth == 0)
-            clean += c == ',' ? ' ' : c;
-    }
-    std::vector<std::string_view> w;
-    std::string_view rest = clean;
-    while (!rest.empty())
-    {
-        rest = trim(rest);
-        if (rest.empty())
-            break;
-        size_t n = 0;
-        while (n < rest.size() && !is_wsp(rest[n]))
-            ++n;
-        w.push_back(rest.substr(0, n));
-        rest.remove_prefix(n);
-    }
-    size_t k = 0;
-    if (k < w.size() && !w[k].empty() && is_alpha(w[k][0]))
-        ++k;
-    if (w.size() < k + 4)
-        return false;
-    int day = 0, year = 0, hour = 0, minute = 0, second = 0;
-    if (!small_number(w[k], day, 2) || day < 1 || day > 31)
-        return false;
-    static constexpr std::string_view months[] = {"jan", "feb", "mar", "apr", "may", "jun",
-                                                  "jul", "aug", "sep", "oct", "nov", "dec"};
-    unsigned month = 0;
-    for (unsigned mi = 0; mi < 12; ++mi)
-        if (socketley::ascii::iequals(w[k + 1], months[mi]))
-            month = mi + 1;
-    if (!month || !small_number(w[k + 2], year, 4))
-        return false;
-    if (w[k + 2].size() == 2)
-        year += year < 50 ? 2000 : 1900;
-    else if (w[k + 2].size() == 3)
-        year += 1900;
-    const std::string_view time = w[k + 3];
-    const size_t c1 = time.find(':');
-    const size_t c2 = c1 == std::string_view::npos ? c1 : time.find(':', c1 + 1);
-    if (c1 == std::string_view::npos || !small_number(time.substr(0, c1), hour, 2) ||
-        !small_number(time.substr(c1 + 1, c2 == std::string_view::npos ? std::string_view::npos : c2 - c1 - 1),
-                      minute, 2) ||
-        (c2 != std::string_view::npos && !small_number(time.substr(c2 + 1), second, 2)))
-        return false;
-    if (hour > 23 || minute > 59 || second > 60)
-        return false;
-    zone = 0;
-    if (w.size() > k + 4)
-    {
-        const std::string_view z = w[k + 4];
-        if ((z[0] == '+' || z[0] == '-') && z.size() == 5)
-        {
-            int hh = 0, mm = 0;
-            if (!small_number(z.substr(1, 2), hh, 2) || !small_number(z.substr(3, 2), mm, 2) || mm > 59)
-                return false;
-            zone = (z[0] == '-' ? -1 : 1) * (hh * 60 + mm);
-        }
-        else
-        {
-            static constexpr std::pair<std::string_view, int> names[] = {
-                {"ut", 0},          {"gmt", 0},         {"z", 0},           {"est", -5 * 60}, {"edt", -4 * 60},
-                {"cst", -6 * 60},   {"cdt", -5 * 60},   {"mst", -7 * 60},   {"mdt", -6 * 60}, {"pst", -8 * 60},
-                {"pdt", -7 * 60}};
-            for (const auto& [name, off] : names)
-                if (socketley::ascii::iequals(z, name))
-                    zone = off;
-        }
-    }
-    t = days_from_civil(year, month, static_cast<unsigned>(day)) * 86400 + hour * 3600 + minute * 60 + second -
-        static_cast<int64_t>(zone) * 60;
-    return true;
 }
 
 // The part of time `t` RFC 5260 names, as it reads in `zone`.
@@ -2500,7 +2392,7 @@ struct runner
                 return false;
             const size_t idx = first_index(name, t.line);
             int original = 0;
-            if (idx == headers.size() || !parse_date(header_text(idx), when, original))
+            if (idx == headers.size() || !mime::parse_date(header_text(idx), when, original))
                 return false;
             if (t.original_zone)
                 zone = original;

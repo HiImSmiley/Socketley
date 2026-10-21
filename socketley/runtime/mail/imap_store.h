@@ -58,6 +58,8 @@ struct imap_folder
     // The mod-sequence of its last change, and of the expunges since, for QRESYNC's VANISHED.
     uint64_t    highestmodseq{1};
     std::vector<std::pair<uint64_t, uint32_t>> vanished;
+    // Expunges are known from this mod-sequence on; before it, VANISHED says every UID it does not have.
+    uint64_t    vanished_from{0};
     int64_t     synced_ms{0};
     bool        syncing{false};
     // The mod-sequence the folder had as its listing in the bucket began.
@@ -85,6 +87,10 @@ public:
     void remove(const std::string& user, const std::string& folder, std::function<void(bool)> done);
     void rename(const std::string& user, const std::string& from, const std::string& to, std::function<void(bool)> done);
     void set_subscribed(const std::string& user, const std::string& folder, bool on);
+    bool subscribed(const std::string& user, const std::string& folder);
+    // The bytes of every message the user's index has, and the bound their idp account puts on them, 0 for none.
+    uint64_t usage(const std::string& user);
+    uint64_t quota(const std::string& user) const;
 
     // A message's bytes, from the cache or the bucket.
     void body(const std::string& key, uint64_t size, std::function<void(std::shared_ptr<const std::string>)> done);

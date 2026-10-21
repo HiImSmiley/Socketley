@@ -220,7 +220,10 @@ void imap_store::apply(user_state& u, std::string_view text, bool fresh)
                     std::erase_if(f->msgs, [uid](const imap_message& m) { return m.uid == uid; });
                     f->vanished.emplace_back(modseq, uid);
                     if (f->vanished.size() > 20000)
+                    {
+                        f->vanished_from = f->vanished[9999].first;
                         f->vanished.erase(f->vanished.begin(), f->vanished.begin() + 10000);
+                    }
                 }
                 ++f->version;
                 break;
@@ -276,6 +279,8 @@ void imap_store::reload(const std::string& name, user_state& u)
                 f->uidnext = static_cast<uint32_t>(num(w[1]));
                 f->subscribed = w[2] == "1";
                 f->highestmodseq = v1 ? 1 : std::max<uint64_t>(1, num(w[3]));
+                // What the snapshot folded in is no longer known as expunged.
+                f->vanished_from = f->highestmodseq;
                 u.folders[f->name] = f;
             }
             else if (line[0] == 'M' && f && !l.empty())
@@ -322,6 +327,8 @@ void imap_store::reload(const std::string& name, user_state& u)
             old.uidnext = f->uidnext;
             old.subscribed = f->subscribed;
             old.highestmodseq = f->highestmodseq;
+            old.vanished = std::move(f->vanished);
+            old.vanished_from = f->vanished_from;
             for (auto& m : f->msgs)
                 if (const imap_message* was = old.by_uid(m.uid))
                     m.recent = was->recent;
@@ -543,6 +550,29 @@ void imap_store::folders(const std::string& name, std::function<void(std::vector
                        out.push_back(n);
                    done(std::move(out));
                });
+}
+
+uint64_t imap_store::usage(const std::string& name)
+{
+    user_state& u = user(name);
+    refresh(name, u);
+    uint64_t total = 0;
+    for (const auto& [n, f] : u.folders)
+        for (const auto& m : f->msgs)
+            total += m.size;
+    return total;
+}
+
+uint64_t imap_store::quota(const std::string& name) const
+{
+    return m_run.boxes() ? m_run.boxes()->quota_of(name) : 0;
+}
+
+bool imap_store::subscribed(const std::string& name, const std::string& folder)
+{
+    const user_state& u = user(name);
+    const auto it = u.folders.find(canonical(folder));
+    return it != u.folders.end() && it->second->subscribed;
 }
 
 bool imap_store::create(const std::string& name, const std::string& folder)
@@ -988,6 +1018,11 @@ void imap_store::append(const std::string& name, const std::string& folder, std:
     std::shared_ptr<imap_folder> f = it->second;
     const std::string key = name + "/" + f->name + "/" + new_spool_id(0) + ".eml";
     const uint64_t size = message.size();
+    if (const uint64_t q = quota(name); q && usage(name) + size > q)
+    {
+        done(false, 0, 0);
+        return;
+    }
     put_object(key, std::move(message), [this, name, f, key, size, flags, date_ms, done](bool ok) {
         if (!ok)
         {

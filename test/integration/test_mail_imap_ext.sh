@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# suite: isolated -- its own daemon, socket, state directory and port window, so it runs beside the others
+# Integration test: the IMAP extensions a mail client leans on beyond IMAP4rev1: CONDSTORE and QRESYNC (RFC 7162),
+# ESEARCH (RFC 4731), LIST-EXTENDED and LIST-STATUS (RFC 5258, 5819), STATUS=SIZE (RFC 8438), QUOTA (RFC 9208),
+# SORT and THREAD (RFC 5256).
+#
+# ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
+#
+#   * a flag change that does not raise the mod-sequence, or a FETCH CHANGEDSINCE that misses one
+#   * a STORE UNCHANGEDSINCE that overwrites what changed since, without MODIFIED
+#   * a QRESYNC SELECT that does not say what vanished and what changed, or EXPUNGE where VANISHED is due
+#   * an ESEARCH whose MIN, MAX, COUNT or ALL is not the search's
+#   * LIST RETURN (STATUS) without each folder's STATUS, a STATUS SIZE that is not the bytes
+#   * a quota not told, or a message delivered or appended past it
+#   * SORT out of the criteria's order, a base subject that keeps its Re:, THREAD not tying a reply to its parent
+set -uo pipefail
+
+BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/lib_ports.sh"
+. "$HERE/lib_daemon.sh"
+. "$HERE/lib_ready.sh"
+
+command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
+command -v curl >/dev/null 2>&1 || { echo "  SKIP: curl is required"; exit 0; }
+
+PASS=0; FAIL=0; TOTAL=0
+ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
+bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
+
+daemon_isolate mail_imap_ext
+T="$SOCKETLEY_TMPD"
+P=$((SL_PORT_BASE+1930))
+IM=$((SL_PORT_BASE+1931))
+PI=$((SL_PORT_BASE+1932))
+PS=$((SL_PORT_BASE+1933))
+trap daemon_stop EXIT
+
+echo "=== Integration: IMAP's CONDSTORE, QRESYNC, ESEARCH, LIST-STATUS, QUOTA, SORT and THREAD ==="
+
+daemon_start "$BIN"
+printf 'spa - http://localhost:5173/cb\n' > "$T/clients"
+"$BIN" create idp auth -p "$PI" --clients "$T/clients" --issuer "http://127.0.0.1:$PI" -s >/dev/null 2>&1
+"$BIN" create storage st -p "$PS" --dir "$T/data" --anonymous -s >/dev/null 2>&1
+for p in "$PI/jwks" "$PS/"; do
+    for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p")" != 000 ] && break; sleep 0.1; done
+done
+"$BIN" idp-user auth add alice --password alicepassword1 --email alice@example.test --set mail_quota=40K >/dev/null 2>&1
+"$BIN" create mail m -p "$P" --mail-domain example.test --idp auth --storage st/mail --imap "$IM" -s >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$IM" || bad "the IMAP port listens" "$(tail -3 "$SOCKETLEY_DLOG")"
+
+# Five messages for alice: a thread of three by References, a second subject, and a reply to it by subject alone.
+python3 - "$P" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1])); s.ehlo("x")
+def send(frm, subj, date, mid, extra=""):
+    s.sendmail(frm, ["alice@example.test"], "From: %s\r\nTo: alice@example.test\r\nSubject: %s\r\nDate: %s\r\n"
+               "Message-ID: <%s>\r\n%s\r\nbody of %s\r\n" % (frm, subj, date, mid, extra, mid))
+send("zed@else.test", "Lunch", "Mon, 19 Oct 2026 10:00:00 +0000", "a@else")
+send("amy@else.test", "Re: Lunch", "Mon, 19 Oct 2026 11:00:00 +0000", "b@else", "References: <a@else>\r\n")
+send("bob@else.test", "Budget", "Sun, 18 Oct 2026 09:00:00 +0000", "c@else")
+send("cat@else.test", "[list] Re: Fwd: Lunch", "Mon, 19 Oct 2026 12:00:00 +0000", "d@else", "References: <a@else> <b@else>\r\n")
+send("dan@else.test", "RE: Budget", "Tue, 20 Oct 2026 09:00:00 +0000", "e@else")
+PY
+for _ in $(seq 1 100); do [ "$(curl -s "http://127.0.0.1:$PS/mail?list-type=2&prefix=alice/INBOX/" | grep -c '<Key>')" -ge 5 ] && break; sleep 0.1; done
+
+python3 - "$IM" "$P" > "$T/ext.out" 2>&1 <<'PY'
+import re, smtplib, socket, sys, time
+port, smtp_port = int(sys.argv[1]), int(sys.argv[2])
+def say(name, cond, why=""):
+    print(("ok " if cond else "bad ") + name + ("" if cond else ": " + str(why)[:600]))
+class C:
+    def __init__(self):
+        self.s = socket.create_connection(("127.0.0.1", port), timeout=10); self.f = self.s.makefile("rb"); self.n = 0
+        self.f.readline()
+    def cmd(self, text):
+        self.n += 1; tag = "t%d" % self.n
+        self.s.sendall(("%s %s\r\n" % (tag, text)).encode())
+        out = []
+        while True:
+            l = self.f.readline().decode(errors="replace").rstrip("\r\n")
+            out.append(l)
+            if l.startswith(tag + " "): return out
+a = C(); a.cmd("LOGIN alice alicepassword1")
+r = a.cmd("CAPABILITY")
+say("CAPABILITY offers what is tested", all(x in r[0] for x in ["CONDSTORE", "QRESYNC", "ESEARCH", "LIST-STATUS",
+    "STATUS=SIZE", "QUOTA", "SORT", "THREAD=REFERENCES"]), r[0])
+r = a.cmd("SELECT INBOX (CONDSTORE)")
+hms = int(re.search(r"HIGHESTMODSEQ (\d+)", "\n".join(r)).group(1))
+say("SELECT (CONDSTORE) says HIGHESTMODSEQ", hms >= 5, r)
+r = a.cmd("UID STORE 1 +FLAGS (\\Flagged)")
+m1 = int(re.search(r"MODSEQ \((\d+)\)", "\n".join(r)).group(1))
+say("STORE gives the message the next mod-sequence, and says it", m1 > hms, r)
+r = a.cmd("UID FETCH 1:* (FLAGS) (CHANGEDSINCE %d)" % hms)
+say("FETCH CHANGEDSINCE gives what changed since, and only that", len([x for x in r if x.startswith("* ") and " FETCH " in x]) == 1 and
+    "MODSEQ (%d)" % m1 in r[0], (m1, hms, r))
+r = a.cmd("UID STORE 1 (UNCHANGEDSINCE %d) +FLAGS (\\Seen)" % hms)
+say("STORE UNCHANGEDSINCE leaves what changed since, and says MODIFIED", "[MODIFIED 1]" in r[-1] and
+    not any("\\Seen" in x for x in r[:-1]), r)
+r = a.cmd("UID SEARCH MODSEQ %d" % m1)
+say("SEARCH MODSEQ finds it, with the highest mod-sequence", r[0].startswith("* SEARCH 1 (MODSEQ %d)" % m1), r)
+r = a.cmd("SEARCH RETURN (MIN MAX COUNT ALL) FROM else.test")
+say("ESEARCH answers MIN, MAX, COUNT and ALL", r[0] == '* ESEARCH (TAG "t%d") MIN 1 MAX 5 COUNT 5 ALL 1:5' % a.n, r)
+r = a.cmd("STATUS INBOX (MESSAGES SIZE HIGHESTMODSEQ)")
+size = int(re.search(r"SIZE (\d+)", r[0]).group(1))
+say("STATUS SIZE is the bytes of the folder, HIGHESTMODSEQ its last change", 1000 < size < 6000 and
+    "HIGHESTMODSEQ %d" % m1 in r[0], r)
+r = a.cmd('LIST "" "*" RETURN (STATUS (MESSAGES UNSEEN))')
+lines = [x for x in r if x.startswith("* ")]
+say("LIST RETURN (STATUS) says each folder's STATUS after it", any(x.startswith('* STATUS "INBOX" (MESSAGES 5 UNSEEN 5)') for x in lines)
+    and len([x for x in lines if x.startswith("* STATUS")]) == len([x for x in lines if x.startswith("* LIST")]), r)
+# SORT and THREAD
+r = a.cmd("SORT (DATE) UTF-8 ALL")
+say("SORT (DATE) orders by the Date header", r[0] == "* SORT 3 1 2 4 5", r)
+r = a.cmd("SORT (REVERSE SUBJECT DATE) UTF-8 ALL")
+say("SORT (REVERSE SUBJECT) by the base subject, its Re: and [list] taken off", r[0] == "* SORT 1 2 4 3 5", r)
+r = a.cmd("SORT (FROM) UTF-8 SEARCH-NOTHING") if False else a.cmd("UID SORT (FROM) UTF-8 ALL")
+say("UID SORT (FROM) by the sender's mailbox", r[0] == "* SORT 2 3 4 5 1", r)
+r = a.cmd("THREAD REFERENCES UTF-8 ALL")
+say("THREAD REFERENCES ties the replies to what they answer", r[0] == "* THREAD (3 5)(1 2 4)", r)
+r = a.cmd("THREAD ORDEREDSUBJECT UTF-8 ALL")
+say("THREAD ORDEREDSUBJECT gathers each base subject", r[0] == "* THREAD (3 5)(1 (2)(4))", r)
+# QRESYNC: a second session expunges, the first reconnects with what it knew.
+r = a.cmd("SELECT INBOX")
+uv = int(re.search(r"UIDVALIDITY (\d+)", "\n".join(r)).group(1))
+known = int(re.search(r"HIGHESTMODSEQ (\d+)", "\n".join(r)).group(1))
+b = C(); b.cmd("LOGIN alice alicepassword1"); b.cmd("SELECT INBOX")
+b.cmd("UID STORE 2 +FLAGS (\\Deleted)"); b.cmd("UID STORE 3 +FLAGS (\\Answered)"); b.cmd("EXPUNGE")
+c = C(); c.cmd("LOGIN alice alicepassword1")
+r = c.cmd("ENABLE QRESYNC")
+say("ENABLE QRESYNC", "* ENABLED QRESYNC" in r, r)
+r = c.cmd("SELECT INBOX (QRESYNC (%d %d 1:5))" % (uv, known))
+say("SELECT (QRESYNC) says what vanished since", "* VANISHED (EARLIER) 2" in r, r)
+say("and what changed", any(" FETCH (UID 3 FLAGS (\\Answered) MODSEQ" in x for x in r) and
+    not any("UID 1 " in x and " FETCH " in x for x in r), r)
+r = c.cmd("UID FETCH 1:5 (FLAGS) (CHANGEDSINCE %d VANISHED)" % known)
+say("UID FETCH VANISHED says it too", r[0] == "* VANISHED (EARLIER) 2", r)
+b.cmd("UID STORE 4 +FLAGS (\\Deleted)"); b.cmd("EXPUNGE")
+r = c.cmd("NOOP")
+say("an expunge another session made is VANISHED under QRESYNC, not EXPUNGE", "* VANISHED 4" in r and
+    not any("EXPUNGE" in x for x in r), r)
+r = a.cmd("NOOP")
+say("and the flags another session changed are told as FETCH", any(" FETCH (UID 3 FLAGS (\\Answered)" in x for x in r), r)
+# QUOTA: 40K for alice.
+r = a.cmd("GETQUOTAROOT INBOX")
+say("GETQUOTAROOT names the root and its storage", r[0] == '* QUOTAROOT "INBOX" ""' and
+    re.match(r'\* QUOTA "" \(STORAGE \d+ 40\)', r[1] or ""), r)
+big = "x" * 45000
+lit = "Subject: big\r\n\r\n" + big
+r = a.cmd("APPEND INBOX {%d+}\r\n%s" % (len(lit), lit))
+say("an APPEND past the quota is refused OVERQUOTA", "[OVERQUOTA]" in r[-1], r[-1])
+s = smtplib.SMTP("127.0.0.1", smtp_port); s.ehlo("x")
+s.sendmail("zed@else.test", ["alice@example.test"], "Subject: too big\r\n\r\n" + big + "\r\n")
+# Past the two seconds a folder's listing is kept, so the NOOP looks in the bucket again.
+time.sleep(2.5)
+a.cmd("NOOP")
+r = a.cmd("SEARCH SUBJECT \"too big\"")
+say("and a delivery past it is not kept", r[0] == "* SEARCH", r)
+PY
+while read -r verdict name; do
+    case "$verdict" in ok) ok "$name" ;; bad) bad "${name%%:*}" "${name#*:}" ;; esac
+done < <(grep -E '^(ok|bad) ' "$T/ext.out" || echo "bad the client ran: $(tail -5 "$T/ext.out")")
+s=$("$BIN" stats m 2>/dev/null | sed -n 's/^mail_over_quota://p')
+[ "${s:-0}" -ge 1 ] && ok "stats count mail_over_quota" || bad "stats count mail_over_quota" "${s:-absent}"
+
+echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+[ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
+exit "$FAIL"

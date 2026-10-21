@@ -524,6 +524,13 @@ void delivery::deliver_local(const entry_ptr& e, const target& t)
             return;
         }
         const spool_entry& e = *it->e;
+        // A mailbox at its bound takes no more, as Dovecot's default refuses it (RFC 3463 5.2.2).
+        if (const uint64_t q = m_run.boxes()->quota_of(user); q && m_run.imap() && m_run.imap()->usage(user) + e.body_len > q)
+        {
+            ++m_over_quota;
+            settle(552, "552 5.2.2 the mailbox of " + it->to[0].addr + " is full");
+            return;
+        }
         // What a reader of the mailbox is told of the message's way: who it came from, to whom, and what was checked.
         std::string head = "Return-Path: <" + e.from + ">\r\nDelivered-To: " + user +
                            (m_run.domains().empty() ? std::string() : "@" + m_run.domains().front()) + "\r\n";
@@ -1410,6 +1417,7 @@ void delivery::stats(std::string& out) const
     put(out, "mail_bounced", m_bounced);
     put(out, "mail_reports", m_reports);
     put(out, "mail_sieve_rejected", m_sieve_rejected);
+    put(out, "mail_over_quota", m_over_quota);
     put(out, "mail_sieve_redirected", m_sieve_redirected);
     put(out, "mail_sieve_vacations", m_sieve_vacations);
     put(out, "mail_out_connections", m_conns.size());

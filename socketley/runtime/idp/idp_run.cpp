@@ -1400,8 +1400,10 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
     if (action == "lookup")
     {
         const account* who = named(user);
+        // The user, the email and the mail quota a mail runtime keeps their mailbox within.
         answer_command(ticket, who && !who->disabled() ? "ok " + std::string(who->username()) + "\t" +
-                                                             std::string(who->field("email"))
+                                                             std::string(who->field("email")) + "\t" +
+                                                             std::string(who->field("mail_quota"))
                                                        : std::string("none"));
         return;
     }
@@ -1412,8 +1414,9 @@ void idp_run::command(uint64_t ticket, std::string_view payload)
             who = nullptr;
         const std::string name = who ? std::string(who->username()) : std::string();
         const std::string email = who ? std::string(who->field("email")) : std::string();
-        check_password(who, args.size() > 2 ? args[2] : std::string(), [this, ticket, name, email](bool ok) {
-            answer_command(ticket, ok ? "ok " + name + "\t" + email : std::string("error: no"));
+        const std::string quota = who ? std::string(who->field("mail_quota")) : std::string();
+        check_password(who, args.size() > 2 ? args[2] : std::string(), [this, ticket, name, email, quota](bool ok) {
+            answer_command(ticket, ok ? "ok " + name + "\t" + email + "\t" + quota : std::string("error: no"));
         });
         return;
     }

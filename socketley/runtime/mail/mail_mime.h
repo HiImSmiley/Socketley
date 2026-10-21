@@ -3,6 +3,7 @@
 // type, parameters and where its header and body lie, and from that the ENVELOPE, BODY and BODYSTRUCTURE of RFC 3501
 // and the bytes of a section a FETCH names.  Offsets into the message, so a part is read where it lies.
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -51,5 +52,8 @@ std::string to_utf8(std::string_view text, std::string_view charset);
 // A header's value with its RFC 2047 encoded words decoded where their charset is UTF-8, US-ASCII or ISO-8859-1, and
 // the space between two of them dropped; a word of another charset is left as it is.
 std::string decode_words(std::string_view value);
+
+// An RFC 5322 date, the obsolete forms among it, as unix time and the zone it was written in, minutes east of UTC.
+bool parse_date(std::string_view v, int64_t& t, int& zone);
 
 }   // namespace socketley::mail::mime

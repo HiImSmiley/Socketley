@@ -1,6 +1,7 @@
 #pragma once
 // One IMAP4rev1 conversation (RFC 3501, with LITERAL+, SASL-IR, IDLE, NAMESPACE, UIDPLUS, MOVE, UNSELECT, SPECIAL-USE,
-// ID and ENABLE), without a socket: bytes in, replies out through its hooks, the mailboxes read and written through an
+// ID, ENABLE, CONDSTORE and QRESYNC, ESEARCH, LIST-EXTENDED, LIST-STATUS, STATUS=SIZE, QUOTA, SORT and THREAD), without
+// a socket: bytes in, replies out through its hooks, the mailboxes read and written through an
 // imap_store.  Commands are taken one after the other, one that waits for the store holding the ones behind it.
 //
 // A session keeps its own numbering of the folder it has selected, which changes only where it is told: new messages
@@ -96,6 +97,8 @@ private:
     void cmd_store(const std::string& tag, const std::vector<token>& a, size_t from, bool uid);
     void cmd_search(const std::string& tag, const std::vector<token>& a, size_t from, bool uid);
     void cmd_copy(const std::string& tag, const std::vector<token>& a, size_t from, bool uid, bool move);
+    // SORT, or THREAD where `thread` says, over what the search criteria find.
+    void cmd_order(const std::string& tag, const std::vector<token>& a, size_t from, bool uid, bool thread);
     void cmd_expunge(const std::string& tag, const std::vector<uint32_t>& only, bool silent, std::string_view done_text);
 
     // The messages of a sequence set, as indexes into the view; false for one that is not a set.
@@ -103,6 +106,8 @@ private:
     // EXISTS and EXPUNGE for what changed in the folder since the session last looked.
     void update_view();
     std::string flags_text(uint8_t f, bool recent) const;
+    // A folder's STATUS line with the items asked.
+    std::string status_text(const imap_folder& f, const std::vector<std::string>& items) const;
     void sign_in(const std::string& tag, std::string user, std::string password);
 
     imap_config m_cfg;
@@ -115,6 +120,10 @@ private:
     bool m_readonly{false};
     std::vector<uint32_t> m_view;
     uint64_t m_seen_version{0};
+    // CONDSTORE and QRESYNC enabled (RFC 7162), and the mod-sequence of the last flags the session was told.
+    bool m_condstore{false};
+    bool m_qresync{false};
+    uint64_t m_told_modseq{0};
     // Input: what is not yet a whole command, the command being gathered with its literals, and how much of a literal
     // is still to come.
     std::string m_in;

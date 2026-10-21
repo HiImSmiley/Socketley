@@ -105,6 +105,7 @@ public:
     void ask(const std::string& target, std::string payload, std::function<void(request_status, std::string_view)> cb);
     mailboxes* boxes() const { return m_mailboxes.get(); }
     sieve_store* filters() const { return m_sieve.get(); }
+    imap_store* imap() const { return m_imap.get(); }
     // Whether the script decides recipients, and so takes those no mailbox has.
     bool script_takes() const;
 

@@ -61,6 +61,8 @@ public:
     };
     std::function<void(const stored_info&)> on_stored;
 
+    // The bytes `user`'s mailboxes may hold, as the idp runtime's mail_quota field said when last asked; 0 for no bound.
+    uint64_t quota_of(const std::string& user) const;
     uint64_t stored() const { return m_stored; }
     uint64_t store_failures() const { return m_store_failures; }
 
@@ -69,8 +71,10 @@ private:
     {
         bool        found{false};
         std::string user, email;
+        uint64_t    quota{0};
         int64_t     until_ms{0};
     };
+    static void take_answer(std::string_view rest, known& k);
     struct writing;
     void put_small(const std::shared_ptr<writing>& w);
     void put_stream(const std::shared_ptr<writing>& w);
@@ -85,6 +89,7 @@ private:
     bool m_bucket_made{false};
     std::vector<std::function<void(bool)>> m_bucket_waiting;
     std::unordered_map<std::string, known> m_known;
+    std::unordered_map<std::string, uint64_t> m_quota;
     uint64_t m_stored{0};
     uint64_t m_store_failures{0};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};

@@ -1321,6 +1321,7 @@ project "fuzz_mail"
         "socketley/runtime/mail/mail_sieve.cpp",
         "socketley/runtime/mail/mail_sieve_store.cpp",
         "socketley/runtime/mail/managesieve_session.cpp",
+        "socketley/runtime/mail/imap_order.cpp",
         "socketley/shared/util/base64.cpp"
     }
     links(tls_libs())
@@ -2885,7 +2886,7 @@ project "test_mail"
             "test/unit/test_mail_sieve.cpp", "socketley/runtime/mail/mail_sieve.cpp",
             "socketley/shared/util/base64.cpp", "socketley/runtime/mail/mail_tls_policy.cpp",
             "socketley/shared/net/public_suffix.cpp", "socketley/runtime/mail/mail_sieve_store.cpp",
-            "socketley/runtime/mail/managesieve_session.cpp" }
+            "socketley/runtime/mail/managesieve_session.cpp", "socketley/runtime/mail/imap_order.cpp" }
     links(tls_libs())
 
     filter "configurations:Debug"

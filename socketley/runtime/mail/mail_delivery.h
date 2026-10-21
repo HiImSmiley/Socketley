@@ -196,6 +196,7 @@ private:
     uint64_t m_bounced{0};
     uint64_t m_reports{0};
     uint64_t m_sieve_rejected{0};
+    uint64_t m_over_quota{0};
     uint64_t m_sieve_redirected{0};
     uint64_t m_sieve_vacations{0};
     uint64_t m_connects{0};

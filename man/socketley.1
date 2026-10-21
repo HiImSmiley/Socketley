@@ -12827,7 +12827,9 @@ mail too, and a message is read back a range at a time either way.
 .PP
 .B IMAP.
 IMAP4rev1 with LITERAL+, SASL\-IR, IDLE, NAMESPACE, UIDPLUS, MOVE, UNSELECT,
-CHILDREN, SPECIAL\-USE, ID and ENABLE, on the mailboxes of
+CHILDREN, SPECIAL\-USE, ID, ENABLE, CONDSTORE and QRESYNC, ESEARCH,
+LIST\-EXTENDED and LIST\-STATUS, STATUS=SIZE, QUOTA, SORT (with DISPLAYFROM and
+DISPLAYTO) and THREAD (ORDEREDSUBJECT, REFERENCES), on the mailboxes of
 .BR \-\-storage ;
 a password goes over STARTTLS or
 .B \-\-imaps
@@ -12842,7 +12844,16 @@ before each command. The journal is folded into the snapshot once it passes a
 quarter of a mebibyte. The bucket stays what counts, looked at when a folder is
 opened and at most every two seconds after, so what a delivery or another client
 put there has the next UID and what went is expunged. IDLE is told of new mail
-within a second. A connection quiet for thirty minutes is closed.
+within a second. Every change of a message has the folder's next
+mod\-sequence, so a client that reconnects asks for what changed and vanished
+since it last looked. A user's
+.B mail_quota
+field in the idp runtime
+.RB ( "socketley idp\-user" " ... " "\-\-set mail_quota=500M" )
+bounds what their mailboxes hold: IMAP tells it as one quota root over every
+folder, an APPEND or a COPY past it is refused OVERQUOTA, and a delivery past it
+is refused 552 5.2.2, as Dovecot refuses one. A connection quiet for thirty
+minutes is closed.
 .PP
 .B From the other runtimes.
 .B socketley send

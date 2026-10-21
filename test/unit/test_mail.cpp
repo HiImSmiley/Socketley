@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <map>
@@ -17,6 +18,7 @@
 #include "runtime/mail/mail_tls_policy.h"
 #include "runtime/mail/mail_sieve_store.h"
 #include "runtime/mail/managesieve_session.h"
+#include "runtime/mail/imap_order.h"
 #include "runtime/mail/mail_verify.h"
 #include "runtime/mail/smtp_session.h"
 #include "shared/net/public_suffix.h"
@@ -964,4 +966,55 @@ TEST_CASE("ManageSieve: a sign-in answered at once, the commands pipelined behin
     CHECK(cut.user() == "alice");
     CHECK(hooks.out.find("OK \"Setactive completed\"") != std::string::npos);
     std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("SORT and THREAD: the base subject, the keys, and threads by subject and by references")
+{
+    namespace io = socketley::mail::imap_order;
+    bool reply = false;
+    CHECK(io::base_subject("Re: Re:  Lunch   plans (fwd)", &reply) == "Lunch plans");
+    CHECK(reply);
+    CHECK(io::base_subject("[list] Fwd: [x] re : Budget", &reply) == "Budget");
+    CHECK(io::base_subject("[fwd: Re: Lunch]", &reply) == "Lunch");
+    CHECK(io::base_subject("[only a blob]", &reply) == "[only a blob]");
+    CHECK(io::base_subject("Budget", &reply) == "Budget");
+    CHECK_FALSE(reply);
+    CHECK(io::base_subject("=?utf-8?q?R=C3=A9sum=C3=A9?=") == "R\xc3\xa9sum\xc3\xa9");
+    std::vector<io::key> keys;
+    CHECK(io::parse_keys({"REVERSE", "date", "SUBJECT"}, keys));
+    CHECK(keys.size() == 2);
+    CHECK(keys[0].reverse);
+    CHECK_FALSE(io::parse_keys({"REVERSE"}, keys));
+    CHECK_FALSE(io::parse_keys({"COLOUR"}, keys));
+    const auto make = [](uint32_t n, std::string head) {
+        io::entry e;
+        e.number = n;
+        e.seq = n - 1;
+        e.arrival_ms = 1000;
+        io::read(e, head + "\r\n");
+        return e;
+    };
+    std::vector<io::entry> v = {
+        make(1, "Subject: A\r\nMessage-ID: <1@x>\r\nDate: Mon, 19 Oct 2026 10:00:00 +0000\r\n"),
+        make(2, "Subject: Re: A\r\nMessage-ID: <2@x>\r\nReferences: <1@x>\r\nDate: Mon, 19 Oct 2026 11:00:00 +0000\r\n"),
+        make(3, "Subject: Re: A\r\nMessage-ID: <3@x>\r\nReferences: <1@x>\r\nDate: Mon, 19 Oct 2026 12:00:00 +0000\r\n"),
+        make(4, "Subject: B\r\nMessage-ID: <4@x>\r\nIn-Reply-To: <gone@x>\r\nDate: Sun, 18 Oct 2026 10:00:00 +0000\r\n"),
+        make(5, "Subject: B\r\nMessage-ID: <5@x>\r\nReferences: <gone@x>\r\nDate: Tue, 20 Oct 2026 10:00:00 +0000\r\n"),
+    };
+    // A parent never seen is a placeholder over its two replies; 1 has two children, so they are branches.
+    CHECK(io::references(v) == "((4)(5))(1 (2)(3))");
+    CHECK(io::ordered_subject(v) == "(4 5)(1 (2)(3))");
+    io::sort(v, {{io::key::kind::date, true}});
+    CHECK(v.front().number == 5);
+    // A loop in the references and a chain far deeper than any thread are taken without a loop or a crash.
+    std::vector<io::entry> deep;
+    for (uint32_t i = 1; i <= 3000; ++i)
+        deep.push_back(make(i, "Subject: d\r\nMessage-ID: <" + std::to_string(i) + "@d>\r\nReferences: <" +
+                                   std::to_string(i + 1) + "@d>\r\n"));
+    const std::string t = io::references(deep);
+    CHECK(t.find("3000") != std::string::npos);
+    CHECK(std::count(t.begin(), t.end(), '(') == std::count(t.begin(), t.end(), ')'));
+    std::vector<io::entry> loop = {make(1, "Message-ID: <a@l>\r\nReferences: <b@l>"),
+                                   make(2, "Message-ID: <b@l>\r\nReferences: <a@l>")};
+    CHECK(io::references(loop).size() > 2);
 }

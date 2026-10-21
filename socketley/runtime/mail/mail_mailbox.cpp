@@ -6,6 +6,7 @@
 #include "../idp/idp_run.h"
 #include "../../shared/storage/storage_rpc.h"
 #include "../../shared/util/ascii.h"
+#include "../../shared/util/size_suffix.h"
 #include "../../shared/util/wall_clock.h"
 
 namespace socketley::mail
@@ -100,12 +101,10 @@ void mailboxes::find(const std::string& name, std::function<void(bool, std::stri
         const int64_t now = wall::now_ms_coarse();
         if (st == request_status::ok && reply.starts_with("ok "))
         {
-            const std::string_view rest = reply.substr(3);
-            const size_t tab = rest.find('\t');
+            take_answer(reply.substr(3), k);
             k.found = true;
-            k.user = std::string(rest.substr(0, tab));
-            k.email = tab == std::string_view::npos ? std::string() : std::string(rest.substr(tab + 1));
             k.until_ms = now + known_ms;
+            m_quota[lower(k.user)] = k.quota;
         }
         else if (st == request_status::ok)
             k.until_ms = now + unknown_ms;
@@ -126,7 +125,7 @@ void mailboxes::verify(const std::string& user, const std::string& password,
     }
     std::string payload(socketley::idp::command_marker);
     payload += "verify\n" + user + "\n" + password;
-    ask(m_idp, std::move(payload), [done, alive = m_alive](request_status st, std::string_view reply) {
+    ask(m_idp, std::move(payload), [this, done, alive = m_alive](request_status st, std::string_view reply) {
         if (!*alive)
             return;
         if (st != request_status::ok || !reply.starts_with("ok "))
@@ -134,11 +133,29 @@ void mailboxes::verify(const std::string& user, const std::string& password,
             done(false, {}, {});
             return;
         }
-        const std::string_view rest = reply.substr(3);
-        const size_t tab = rest.find('\t');
-        done(true, std::string(rest.substr(0, tab)),
-             tab == std::string_view::npos ? std::string() : std::string(rest.substr(tab + 1)));
+        known k;
+        take_answer(reply.substr(3), k);
+        m_quota[lower(k.user)] = k.quota;
+        done(true, k.user, k.email);
     });
+}
+
+void mailboxes::take_answer(std::string_view rest, known& k)
+{
+    // <user> TAB <email> TAB <mail quota>, the quota a size such as 500M, none where it is empty.
+    const size_t a = rest.find('\t');
+    k.user = std::string(rest.substr(0, a));
+    const std::string_view after = a == std::string_view::npos ? std::string_view{} : rest.substr(a + 1);
+    const size_t b = after.find('\t');
+    k.email = std::string(after.substr(0, b));
+    size_t q = 0;
+    k.quota = b != std::string_view::npos && parse_size_suffix(after.substr(b + 1), q) ? q : 0;
+}
+
+uint64_t mailboxes::quota_of(const std::string& user) const
+{
+    const auto it = m_quota.find(lower(user));
+    return it == m_quota.end() ? 0 : it->second;
 }
 
 void mailboxes::make_bucket(std::function<void(bool)> then)

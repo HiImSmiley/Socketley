@@ -106,7 +106,8 @@ want fuzz_mail && build fuzz_mail "$ROOT/test/fuzz/fuzz_mail.cpp" "$ROOT/socketl
     "$ROOT/socketley/runtime/mail/mail_compose.cpp" "$ROOT/socketley/runtime/mail/mail_dkim.cpp" \
     "$ROOT/socketley/runtime/mail/mail_mime.cpp" "$ROOT/socketley/runtime/mail/mail_aliases.cpp" \
     "$ROOT/socketley/runtime/mail/mail_sieve.cpp" "$ROOT/socketley/runtime/mail/mail_sieve_store.cpp" \
-    "$ROOT/socketley/runtime/mail/managesieve_session.cpp" "$ROOT/socketley/shared/util/base64.cpp" -lssl -lcrypto
+    "$ROOT/socketley/runtime/mail/managesieve_session.cpp" "$ROOT/socketley/runtime/mail/imap_order.cpp" \
+    "$ROOT/socketley/shared/util/base64.cpp" -lssl -lcrypto
 want fuzz_db && build fuzz_db "$ROOT/test/fuzz/fuzz_db.cpp" "$ROOT/socketley/runtime/db/db_doc.cpp" \
     "$ROOT/socketley/runtime/db/db_schema.cpp" "$ROOT/socketley/runtime/db/db_store.cpp" \
     "$ROOT/socketley/runtime/db/db_log.cpp" "$ROOT/socketley/shared/crypto/jws.cpp" \

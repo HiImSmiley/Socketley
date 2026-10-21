@@ -15,6 +15,8 @@
 //   4  text written as quoted-printable, whose lines are at most 76 characters and whose bytes are all printable.
 //   5  a Sieve script and a message, split at the first NUL: a script that compiles is run, and what it decides has
 //      an action, a mailbox for every fileinto, at most 4 redirects and one reject, and a plain keep where it failed.
+//   7  header blocks split at NULs, sorted by every key and threaded both ways: each message is in each answer
+//      once, and every parenthesis has its partner.
 //   6  bytes a ManageSieve client sends, in pieces cut where a 0xFF byte stands, user u password p signing in: every
 //      reply is lines that are a status, a quoted string or a literal that says its own length.
 
@@ -27,6 +29,7 @@
 #include "../../socketley/runtime/mail/mail_sieve.h"
 #include "../../socketley/runtime/mail/mail_sieve_store.h"
 #include "../../socketley/runtime/mail/managesieve_session.h"
+#include "../../socketley/runtime/mail/imap_order.h"
 #include "../../socketley/runtime/mail/smtp_session.h"
 
 #include <charconv>
@@ -326,6 +329,62 @@ void managesieve_case(std::string_view in)
     }
 }
 
+void order_case(std::string_view in)
+{
+    namespace io = socketley::mail::imap_order;
+    std::vector<io::entry> v;
+    while (!in.empty() && v.size() < 64)
+    {
+        const size_t cut = in.find('\0');
+        io::entry e;
+        e.number = static_cast<uint32_t>(v.size() + 1);
+        e.seq = v.size();
+        e.arrival_ms = static_cast<int64_t>(v.size()) * 1000;
+        io::read(e, in.substr(0, cut));
+        v.push_back(std::move(e));
+        in = cut == std::string_view::npos ? std::string_view{} : in.substr(cut + 1);
+    }
+    // Every message once, by number, and the parentheses in pairs.
+    const auto each_once = [&v](const std::string& t) {
+        std::vector<int> seen(v.size() + 1, 0);
+        long open = 0;
+        for (size_t i = 0; i < t.size();)
+        {
+            if (t[i] == '(' || t[i] == ')')
+            {
+                open += t[i] == '(' ? 1 : -1;
+                FUZZ_CHECK(open >= 0, "a thread closed before it opened");
+                ++i;
+                continue;
+            }
+            if (t[i] == ' ')
+            {
+                ++i;
+                continue;
+            }
+            size_t n = 0;
+            while (i < t.size() && t[i] >= '0' && t[i] <= '9')
+                n = n * 10 + static_cast<size_t>(t[i++] - '0');
+            FUZZ_CHECK(n >= 1 && n <= v.size(), "a thread names a message there is not");
+            ++seen[n];
+        }
+        FUZZ_CHECK(open == 0, "a thread left open");
+        for (size_t n = 1; n <= v.size(); ++n)
+            FUZZ_CHECK(seen[n] == 1, "a message not in the threads once");
+    };
+    each_once(io::references(v));
+    each_once(io::ordered_subject(v));
+    std::vector<io::key> keys;
+    for (const char* k : {"reverse", "arrival", "cc", "date", "from", "size", "subject", "to", "displayfrom", "displayto"})
+    {
+        std::vector<io::key> one;
+        if (io::parse_keys({k, "subject"}, one))
+            keys.insert(keys.end(), one.begin(), one.end());
+    }
+    io::sort(v, keys);
+    FUZZ_CHECK(v.size() <= 64, "sort lost or made messages");
+}
+
 }   // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
@@ -335,7 +394,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     if (size < 1 || size > (64u << 10))
         return 0;
     const std::string_view in(reinterpret_cast<const char*>(data) + 1, size - 1);
-    switch (data[0] % 7)
+    switch (data[0] % 8)
     {
         case 0: smtp(in); break;
         case 1: mime_case(in); break;
@@ -344,6 +403,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         case 4: qp_case(in); break;
         case 5: sieve_case(in); break;
         case 6: managesieve_case(in); break;
+        case 7: order_case(in); break;
     }
     return 0;
 }
