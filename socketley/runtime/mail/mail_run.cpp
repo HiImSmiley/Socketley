@@ -6,12 +6,15 @@
 #include <filesystem>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
 
 #include "mail_delivery.h"
 #include "mail_compose.h"
 #include "mail_instance.h"
+#include "mail_mailbox.h"
+#include "mail_verify.h"
 #include "../idp/idp_session.h"
 #include "../storage/password_hash.h"
 #include "../../shared/crypto/tls_context.h"
@@ -59,7 +62,7 @@ bool loopback(const sockaddr_in& a)
 }   // namespace
 
 mail_run::mail_run(mail_instance& owner, event_loop& loop)
-    : m_owner(owner), m_loop(loop), m_fio(loop, this), m_pool(2), m_spool(loop, m_fio),
+    : m_owner(owner), m_loop(loop), m_fio(loop, this), m_pool(2), m_checks(4), m_spool(loop, m_fio),
       m_alive(std::make_shared<bool>(true))
 {
 }
@@ -68,7 +71,9 @@ mail_run::~mail_run()
 {
     *m_alive = false;
     m_pool.stop();
+    m_checks.stop();
     m_delivery.reset();
+    m_mailboxes.reset();
     for (auto& [id, c] : m_conns)
         if (c->ssl)
             tls_context::free_ssl(c->ssl);
@@ -111,6 +116,9 @@ route_to mail_run::route(const address& a, bool from_null) const
         return first.find('@') == std::string::npos ? route_to{route_to::mailbox, first}
                                                      : route_to{route_to::remote, first};
     }
+    // A user's own address, which the mailboxes say is one or is not.
+    if (m_mailboxes && m_mailboxes->enabled() && !m_owner.get_idp().empty())
+        return {route_to::mailbox, a.local};
     return {};
 }
 
@@ -211,6 +219,8 @@ bool mail_run::start(std::string& why)
     m_loop.register_owner(this);
     if (!m_pool.attach(m_fio))
         m_pool.stop();
+    if (!m_checks.attach(m_fio))
+        m_checks.stop();
     m_state_dir = mail_state_dir(m_owner.get_name(), m_owner.get_shard_index(), m_owner.get_shards());
     std::error_code ec;
     std::filesystem::create_directories(m_state_dir, ec);
@@ -255,6 +265,9 @@ bool mail_run::start(std::string& why)
         return false;
     if (m_owner.get_submissions_port() &&
         !open_listener(m_subs, m_owner.get_submissions_port(), port_kind::submissions, why))
+        return false;
+    m_mailboxes = std::make_unique<mailboxes>(*this);
+    if (!m_mailboxes->configure(why))
         return false;
     m_delivery = std::make_unique<delivery>(*this);
     if (!m_delivery->start(why))
@@ -324,6 +337,7 @@ void mail_run::stop()
     for (conn* c : all)
         close_conn(*c);
     m_pool.stop();
+    m_checks.stop();
     m_spool.close();
     *m_alive = false;
 }
@@ -843,15 +857,41 @@ void mail_run::conn::authenticate(std::string_view, std::string user, std::strin
         socketley::idp::session_verifier::who who;
         if (r.m_idp->check_bearer(secret, who) && (user == who.username || user == who.sub || user == who.email))
         {
+            idp_user = true;
+            user_email = who.email;
             finish(true, who.username.empty() ? who.sub : who.username);
             return;
         }
+        // A password, which only the idp runtime can check, on its own threads.
+        const uint64_t me = id;
+        r.m_mailboxes->verify(user, secret, [&r, me, finish](bool ok, std::string name, std::string email) {
+            if (conn* c = r.find(me); c && ok)
+            {
+                c->idp_user = true;
+                c->user_email = std::move(email);
+            }
+            finish(ok, std::move(name));
+        });
+        return;
     }
     finish(false, {});
 }
 
-void mail_run::conn::mail_from(const address&, std::function<void(rcpt_verdict)> done)
+void mail_run::conn::mail_from(const address& from, std::function<void(rcpt_verdict)> done)
 {
+    // A user of the idp runtime sends as their own address, its username at a domain of this runtime or the email
+    // their account names, as Postfix's reject_sender_login_mismatch has it.
+    if (idp_user && !from.empty())
+    {
+        const std::string user = smtp->user();
+        const bool own = (run->is_local_domain(from.domain) && socketley::ascii::iequals(from.local, user)) ||
+                         (!user_email.empty() && socketley::ascii::iequals(from.text(), user_email));
+        if (!own)
+        {
+            done({553, "Sender address not owned by " + user});
+            return;
+        }
+    }
     done({250, ""});
 }
 
@@ -862,6 +902,20 @@ void mail_run::conn::rcpt_to(const address& to, std::function<void(rcpt_verdict)
     switch (where.k)
     {
         case route_to::mailbox:
+        {
+            if (!r.m_mailboxes || !r.m_mailboxes->enabled())
+            {
+                ++r.m_refused_rcpt;
+                done({550, "No mailbox is kept here"});
+                return;
+            }
+            r.m_mailboxes->find(where.target, [&r, done](bool found, std::string, std::string) {
+                if (!found)
+                    ++r.m_refused_rcpt;
+                done(found ? rcpt_verdict{250, ""} : rcpt_verdict{550, "No such user here"});
+            });
+            return;
+        }
         case route_to::sink:
             done({250, ""});
             return;
@@ -917,7 +971,10 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
     const uint64_t w = writer;
     writer = 0;
     entry_ptr e = std::move(entry);
-    r.m_spool.finish(w, [&r, alive = r.m_alive, e, done](bool ok) {
+    // Mail from elsewhere is checked before it is taken: from a user signed in, or this machine, it is not.
+    const bool check = kind == port_kind::smtp && smtp->user().empty() && !loopback(peer);
+    const std::string ip = peer_ip(peer), helo = smtp->helo();
+    r.m_spool.finish(w, [&r, alive = r.m_alive, e, done, check, ip, helo](bool ok) {
         if (!*alive)
             return;
         if (!ok)
@@ -926,8 +983,59 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
             done({451, "The message could not be written, try again later"});
             return;
         }
-        done({250, "OK queued as " + e->id});
-        r.accepted(e);
+        if (!check)
+        {
+            done({250, "OK queued as " + e->id});
+            r.accepted(e);
+            return;
+        }
+        auto result = std::make_shared<inbound_result>();
+        const std::string path = r.m_spool.file_of(e->id);
+        r.m_checks.submit(r.m_checks.next_lane(),
+                          [e, result, ip, helo, path] {
+                              std::string whole;
+                              std::string_view msg;
+                              if (e->body)
+                                  msg = *e->body;
+                              else
+                              {
+                                  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+                                  whole.resize(e->body_len);
+                                  size_t got = 0;
+                                  while (fd >= 0 && got < whole.size())
+                                  {
+                                      const ssize_t n = ::pread(fd, whole.data() + got, whole.size() - got,
+                                                                static_cast<off_t>(e->body_off + got));
+                                      if (n <= 0)
+                                          break;
+                                      got += static_cast<size_t>(n);
+                                  }
+                                  if (fd >= 0)
+                                      ::close(fd);
+                                  whole.resize(got);
+                                  msg = whole;
+                              }
+                              auto resolver = system_check_resolver();
+                              *result = check_inbound(msg, ip, helo, e->from, *resolver, wall::now_ms() / 1000);
+                          },
+                          [&r, alive, e, done, result] {
+                              if (!*alive)
+                                  return;
+                              ++r.m_checked;
+                              if (result->reject())
+                              {
+                                  // DMARC says its domain's own mail never comes so: it is refused, not kept.
+                                  ++r.m_dmarc_rejected;
+                                  r.m_spool.forget_written(e->id);
+                                  done({550, "Message refused: DMARC policy of " + result->from_domain + " is reject"});
+                                  return;
+                              }
+                              if (result->quarantine())
+                                  ++r.m_quarantined;
+                              r.m_spool.note_auth(*e, result->header(), result->quarantine() ? "Junk" : "");
+                              done({250, "OK queued as " + e->id});
+                              r.accepted(e);
+                          });
     });
 }
 
@@ -1176,6 +1284,19 @@ void mail_run::expect_reply(uint64_t cookie, std::function<void(request_status, 
     m_replies[cookie] = std::move(cb);
 }
 
+void mail_run::ask(const std::string& target, std::string payload,
+                   std::function<void(request_status, std::string_view)> cb)
+{
+    auto* mgr = m_owner.get_runtime_manager();
+    const uint64_t cookie = next_cookie();
+    expect_reply(cookie, cb);
+    if (!mgr || m_stopped || !mgr->requests().post(this, cookie, target, payload, request_class::background))
+    {
+        m_replies.erase(cookie);
+        cb(request_status::no_target, {});
+    }
+}
+
 void mail_run::on_request_reply(uint64_t cookie, request_status st, std::string_view reply)
 {
     const auto it = m_replies.find(cookie);
@@ -1343,6 +1464,14 @@ std::string mail_run::stats() const
     put(out, "mail_spool_failures", m_spool_failed + m_spool.write_failures());
     put(out, "mail_bounces_taken", m_bounces_taken);
     put(out, "mail_suppressed", m_suppressed.size());
+    if (m_mailboxes && m_mailboxes->enabled())
+    {
+        put(out, "mail_stored", m_mailboxes->stored());
+        put(out, "mail_store_failures", m_mailboxes->store_failures());
+    }
+    put(out, "mail_checked", m_checked);
+    put(out, "mail_dmarc_rejected", m_dmarc_rejected);
+    put(out, "mail_quarantined", m_quarantined);
     put(out, "auth_ok", m_auth_ok);
     put(out, "auth_failed", m_auth_failed);
     put(out, "starttls", m_starttls);

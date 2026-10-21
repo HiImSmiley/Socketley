@@ -237,7 +237,12 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
             line.remove_prefix(std::min<size_t>(line.size(), 2));
             const size_t b = line.find(' ');
             size_t i = 0;
-            if (kind == 'r')
+            if (kind == 'a')
+            {
+                e.folder = std::string(line.substr(0, b));
+                e.auth = b == std::string_view::npos ? std::string() : std::string(line.substr(b + 1));
+            }
+            else if (kind == 'r')
             {
                 number(line.substr(0, b), e.attempts);
                 if (b != std::string_view::npos)
@@ -261,6 +266,8 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
         }
         if (e->attempts)
             compact += id + " r " + std::to_string(e->attempts) + " " + std::to_string(e->next_ms) + "\n";
+        if (!e->auth.empty())
+            compact += id + " a " + (e->folder.empty() ? "INBOX" : e->folder) + " " + e->auth + "\n";
         for (size_t i = 0; i < e->rcpts.size(); ++i)
             if (e->rcpts[i].state != rcpt_state::waiting)
                 compact += id + (e->rcpts[i].state == rcpt_state::delivered ? " d " : " f ") + std::to_string(i) +
@@ -538,6 +545,13 @@ void spool::retry(spool_entry& e, uint32_t attempts, int64_t next_ms)
     e.attempts = attempts;
     e.next_ms = next_ms;
     log(e.id + " r " + std::to_string(attempts) + " " + std::to_string(next_ms) + "\n");
+}
+
+void spool::note_auth(spool_entry& e, std::string results, std::string folder)
+{
+    e.auth = one_line(results);
+    e.folder = one_line(folder);
+    log(e.id + " a " + (e.folder.empty() ? "INBOX" : e.folder) + " " + e.auth + "\n");
 }
 
 void spool::remove(const std::string& id)

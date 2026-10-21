@@ -91,6 +91,8 @@ std::string mail_instance::config_refusal() const
         return "mail: --submissions and --imaps speak TLS from the first byte, which needs --tls with --cert and --key\n";
     if (m_submission && m_users.empty() && m_idp.empty())
         return "mail: --submission takes mail from users who sign in, from --users or --idp\n";
+    if (m_submission && !get_tls())
+        return "mail: --submission takes passwords, which go only over TLS: give it --tls with --cert and --key\n";
     if (m_max_size < 1024)
         return "mail: --max-size below 1K takes no message\n";
     const uint16_t ports[] = {effective_port(), m_submission, m_submissions, m_imap, m_imaps};

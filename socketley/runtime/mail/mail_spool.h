@@ -43,6 +43,10 @@ struct spool_entry
     int64_t     at_ms{0};
     // A bounce this runtime wrote, so a failure of its own is not answered with another.
     bool        bounce{false};
+    // What SPF, DKIM and DMARC said of it as it arrived: the value of its Authentication-Results, and the folder
+    // DMARC sent it to.
+    std::string auth;
+    std::string folder;
     uint64_t    body_off{0};
     uint64_t    body_len{0};
     uint32_t    attempts{0};
@@ -77,12 +81,18 @@ public:
     void mark(spool_entry& e, size_t rcpt, rcpt_state s, std::string_view why);
     // The next try of what is still waiting.
     void retry(spool_entry& e, uint32_t attempts, int64_t next_ms);
+    // What the checks of its arrival said, kept for its mailboxes.
+    void note_auth(spool_entry& e, std::string results, std::string folder);
     // Every recipient's delivery is over: the file goes.
     void remove(const std::string& id);
+    // A message written and then refused before it was taken, which nothing will deliver.
+    void forget_written(const std::string& id) { remove(id); }
 
     std::map<std::string, entry_ptr>& entries() { return m_entries; }
     const std::map<std::string, entry_ptr>& entries() const { return m_entries; }
     entry_ptr find(const std::string& id) const;
+    // The file a message is kept in, for a helper thread that reads it whole.
+    std::string file_of(const std::string& id) const { return path_of(id); }
     // `len` bytes of a message's body from `off`, read from memory or its file.
     void read(const entry_ptr& e, uint64_t off, uint32_t len, std::function<void(bool ok, std::string_view bytes)> cb);
 

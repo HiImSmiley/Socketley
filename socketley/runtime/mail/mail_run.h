@@ -40,6 +40,7 @@ namespace socketley::mail
 {
 
 class delivery;
+class mailboxes;
 
 // Where a recipient's mail goes: a mailbox of this runtime, an address elsewhere, or nowhere.
 struct route_to
@@ -92,6 +93,9 @@ public:
     uint64_t next_cookie() { return m_next_cookie++; }
     // Who answers a request this runtime posted, by cookie.
     void expect_reply(uint64_t cookie, std::function<void(request_status, std::string_view)> cb);
+    // A request to another runtime of the daemon, and its answer.
+    void ask(const std::string& target, std::string payload, std::function<void(request_status, std::string_view)> cb);
+    mailboxes* boxes() const { return m_mailboxes.get(); }
 
 private:
     enum class port_kind : uint8_t { smtp, submission, submissions, imap, imaps };
@@ -126,6 +130,9 @@ private:
         entry_ptr entry;
         // Bytes said in reply while input is being taken, written once it has all been.
         bool in_input{false};
+        // An idp user signed in, and the address the account names, which with its username are what it sends as.
+        bool idp_user{false};
+        std::string user_email;
 
         void reply(std::string_view bytes) override;
         void start_tls() override;
@@ -191,10 +198,13 @@ private:
     event_loop& m_loop;
     file_io m_fio;
     hash_pool m_pool;
+    // SPF, DKIM and DMARC of mail from elsewhere, whose lookups block a thread of these and never the loop.
+    hash_pool m_checks;
     spool m_spool;
     std::unique_ptr<tls_context> m_tls;
     std::unique_ptr<socketley::idp::session_verifier> m_idp;
     std::unique_ptr<delivery> m_delivery;
+    std::unique_ptr<mailboxes> m_mailboxes;
     socketley::watched<socketley::user_table> m_users;
     socketley::watched<alias_table> m_aliases;
     std::string m_hostname;
@@ -232,6 +242,9 @@ private:
     uint64_t m_spool_failed{0};
     uint64_t m_bounces_taken{0};
     uint64_t m_suppressions{0};
+    uint64_t m_checked{0};
+    uint64_t m_dmarc_rejected{0};
+    uint64_t m_quarantined{0};
 };
 
 }   // namespace socketley::mail

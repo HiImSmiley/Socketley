@@ -3,6 +3,7 @@
 
 #include <deque>
 #include <functional>
+#include <map>
 #include <string>
 #include <filesystem>
 #include <vector>
@@ -10,6 +11,7 @@
 #include "runtime/mail/mail_aliases.h"
 #include "runtime/mail/mail_compose.h"
 #include "runtime/mail/mail_dkim.h"
+#include "runtime/mail/mail_verify.h"
 #include "runtime/mail/smtp_session.h"
 #include "shared/util/base64.h"
 
@@ -538,4 +540,121 @@ TEST_CASE("aliases: addresses and catch-alls, refused when a line is none")
     CHECK_FALSE(t.parse("info@example.test\n", why));
     CHECK_FALSE(t.parse("not-an-address alice\n", why));
     CHECK_FALSE(t.parse("a@example.test bad@@x\n", why));
+}
+
+namespace
+{
+
+// Records of a test's own, by name; a name named nowhere does not exist.
+struct table_resolver : check_resolver
+{
+    std::map<std::string, std::vector<std::string>> txts, addresses, mxs;
+    int asked{0};
+    bool txt(const std::string& name, std::vector<std::string>& out, bool& nx) override { return get(txts, name, out, nx); }
+    bool addrs(const std::string& name, std::vector<std::string>& out, bool& nx) override
+    {
+        return get(addresses, name, out, nx);
+    }
+    bool mx(const std::string& name, std::vector<std::string>& out, bool& nx) override { return get(mxs, name, out, nx); }
+    bool get(const std::map<std::string, std::vector<std::string>>& m, const std::string& name,
+             std::vector<std::string>& out, bool& nx)
+    {
+        ++asked;
+        const auto it = m.find(name);
+        nx = it == m.end();
+        if (!nx)
+            out = it->second;
+        return true;
+    }
+};
+
+}   // namespace
+
+TEST_CASE("SPF: mechanisms, qualifiers, include, redirect, macros and the lookup limit")
+{
+    table_resolver r;
+    r.txts["example.org"] = {"v=spf1 ip4:192.0.2.0/24 a:mail.example.org mx include:_spf.partner.test -all"};
+    r.addresses["mail.example.org"] = {"198.51.100.7"};
+    r.mxs["example.org"] = {"mx1.example.org"};
+    r.addresses["mx1.example.org"] = {"203.0.113.9", "2001:db8::25"};
+    r.txts["_spf.partner.test"] = {"v=spf1 ip4:10.1.0.0/16 ~all"};
+    CHECK(spf_check("192.0.2.44", "example.org", "a@example.org", r) == "pass");
+    CHECK(spf_check("198.51.100.7", "example.org", "a@example.org", r) == "pass");
+    CHECK(spf_check("203.0.113.9", "example.org", "a@example.org", r) == "pass");
+    CHECK(spf_check("10.1.2.3", "example.org", "a@example.org", r) == "pass");
+    CHECK(spf_check("8.8.8.8", "example.org", "a@example.org", r) == "fail");
+    r.txts["soft.test"] = {"v=spf1 ?ip4:1.2.3.4 ~all"};
+    CHECK(spf_check("1.2.3.4", "soft.test", "x@soft.test", r) == "neutral");
+    CHECK(spf_check("1.2.3.5", "soft.test", "x@soft.test", r) == "softfail");
+    CHECK(spf_check("1.2.3.5", "nowhere.test", "x@nowhere.test", r) == "none");
+    r.txts["two.test"] = {"v=spf1 -all", "v=spf1 +all"};
+    CHECK(spf_check("1.2.3.5", "two.test", "x@two.test", r) == "permerror");
+    r.txts["redir.test"] = {"v=spf1 redirect=example.org"};
+    CHECK(spf_check("192.0.2.1", "redir.test", "x@redir.test", r) == "pass");
+    CHECK(spf_check("9.9.9.9", "redir.test", "x@redir.test", r) == "fail");
+    r.txts["macro.test"] = {"v=spf1 exists:%{i}.%{l}._spf.%{d} -all"};
+    r.addresses["192.0.2.5.alice._spf.macro.test"] = {"127.0.0.2"};
+    CHECK(spf_check("192.0.2.5", "macro.test", "alice@macro.test", r) == "pass");
+    CHECK(spf_check("192.0.2.5", "macro.test", "bob@macro.test", r) == "fail");
+    // An include that loops on itself runs out of lookups rather than recursing for ever.
+    r.txts["loop.test"] = {"v=spf1 include:loop.test -all"};
+    CHECK(spf_check("1.1.1.1", "loop.test", "x@loop.test", r) == "permerror");
+    r.txts["cidr.test"] = {"v=spf1 a:host.cidr.test/24 -all"};
+    r.addresses["host.cidr.test"] = {"192.0.2.200"};
+    CHECK(spf_check("192.0.2.9", "cidr.test", "x@cidr.test", r) == "pass");
+    CHECK(spf_check("192.0.3.9", "cidr.test", "x@cidr.test", r) == "fail");
+}
+
+TEST_CASE("DMARC: aligned SPF or DKIM passes, a policy is taken from the organizational domain")
+{
+    table_resolver r;
+    const std::string msg = "From: Alice <alice@news.example.test>\r\nTo: b@here.test\r\nSubject: x\r\n\r\nbody\r\n";
+    r.txts["example.test"] = {"v=spf1 ip4:192.0.2.1 -all"};
+    r.txts["_dmarc.example.test"] = {"v=DMARC1; p=reject; sp=quarantine"};
+    // SPF passes for the parent domain, aligned under relaxed alignment.
+    auto res = check_inbound(msg, "192.0.2.1", "mx.example.test", "bounce@example.test", r, 0);
+    CHECK(res.spf == "pass");
+    CHECK(res.dmarc == "pass");
+    CHECK_FALSE(res.reject());
+    // From another address: SPF fails, nothing aligned, and the subdomain's policy is sp=quarantine.
+    res = check_inbound(msg, "203.0.113.5", "evil.test", "x@example.test", r, 0);
+    CHECK(res.spf == "fail");
+    CHECK(res.dmarc == "fail");
+    CHECK(res.dmarc_policy == "quarantine");
+    CHECK(res.quarantine());
+    CHECK(res.header().find("dmarc=fail header.from=news.example.test (p=quarantine)") != std::string::npos);
+    // The domain's own address is the policy's own p=.
+    const std::string own = "From: alice@example.test\r\n\r\nx\r\n";
+    res = check_inbound(own, "203.0.113.5", "evil.test", "x@else.test", r, 0);
+    CHECK(res.dmarc == "fail");
+    CHECK(res.reject());
+    // No record: none, whatever SPF says.
+    res = check_inbound("From: a@nodmarc.test\r\n\r\nx\r\n", "1.2.3.4", "h", "a@nodmarc.test", r, 0);
+    CHECK(res.dmarc == "none");
+    // Two From addresses are no domain DMARC can judge.
+    res = check_inbound("From: a@example.test, b@else.test\r\n\r\nx\r\n", "1.2.3.4", "h", "", r, 0);
+    CHECK(res.dmarc == "permerror");
+    // A bounce's SPF is HELO's.
+    res = check_inbound(own, "192.0.2.1", "example.test", "", r, 0);
+    CHECK(res.spf_domain == "example.test");
+    CHECK(res.spf == "pass");
+    CHECK(organizational_domain("a.b.example.test") == "example.test");
+    CHECK(organizational_domain("example") == "example");
+}
+
+TEST_CASE("DMARC: a DKIM signature of the From domain passes where SPF does not")
+{
+    table_resolver r;
+    r.txts["skl._domainkey.example.test"] = {dkim_record};
+    r.txts["_dmarc.example.test"] = {"v=DMARC1; p=reject; adkim=s"};
+    auto res = check_inbound(dkim_signed_relaxed, "203.0.113.5", "h", "x@else.test", r, 1792552976);
+    REQUIRE(res.dkim.size() == 1);
+    CHECK(res.dkim[0].first == "pass");
+    CHECK(res.dkim[0].second == "example.test");
+    CHECK(res.dmarc == "pass");
+    std::string changed = dkim_signed_relaxed;
+    changed.replace(changed.find("Body line one"), 4, "Bodx");
+    res = check_inbound(changed, "203.0.113.5", "h", "x@else.test", r, 1792552976);
+    CHECK(res.dkim[0].first == "fail");
+    CHECK(res.reject());
 }

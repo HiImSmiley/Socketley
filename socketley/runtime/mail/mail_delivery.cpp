@@ -13,6 +13,7 @@
 
 #include "mail_compose.h"
 #include "mail_instance.h"
+#include "mail_mailbox.h"
 #include "mail_run.h"
 #include "../dns/dns_wire.h"
 #include "../../shared/crypto/tls_context.h"
@@ -459,13 +460,40 @@ void delivery::dispatch(const entry_ptr& e)
 
 void delivery::deliver_local(const entry_ptr& e, const target& t)
 {
-    // A mailbox named by an alias, which needs the mailboxes of --storage.
-    item it;
-    it.e = e;
-    it.to.push_back(t);
-    result(it, 0, 550, "550 5.1.1 the mailbox " + t.addr + " is kept nowhere: this runtime has no --storage", false);
-    if (--m_out[e->id] == 0)
-        attempt_over(e);
+    auto it = std::make_shared<item>();
+    it->e = e;
+    it->to.push_back(t);
+    const auto settle = [this, it](int code, const std::string& text) {
+        result(*it, 0, code, text, code / 100 == 4);
+        if (--m_out[it->e->id] == 0)
+            attempt_over(it->e);
+    };
+    mailboxes* boxes = m_run.boxes();
+    if (!boxes || !boxes->enabled())
+    {
+        settle(550, "550 5.1.1 the mailbox " + t.addr + " is kept nowhere: this runtime has no --storage");
+        return;
+    }
+    boxes->find(t.addr, [this, it, settle, alive = m_alive](bool found, std::string user, std::string) {
+        if (!*alive)
+            return;
+        if (!found)
+        {
+            settle(550, "550 5.1.1 no mailbox " + it->to[0].addr + " here");
+            return;
+        }
+        const spool_entry& e = *it->e;
+        // What a reader of the mailbox is told of the message's way: who it came from, to whom, and what was checked.
+        std::string head = "Return-Path: <" + e.from + ">\r\nDelivered-To: " + user +
+                           (m_run.domains().empty() ? std::string() : "@" + m_run.domains().front()) + "\r\n";
+        if (!e.auth.empty())
+            head += "Authentication-Results: " + m_run.hostname() + "; " + e.auth + "\r\n";
+        m_run.boxes()->deliver(it->e, user, e.folder.empty() ? "INBOX" : e.folder, std::move(head),
+                               [settle, alive](int code, std::string text) {
+                                   if (*alive)
+                                       settle(code, text);
+                               });
+    });
 }
 
 void delivery::pump(route& r)

@@ -2851,6 +2851,7 @@ project "test_mail"
 
     files { "test/unit/test_mail.cpp", "socketley/runtime/mail/smtp_session.cpp", "socketley/runtime/mail/mail_compose.cpp",
             "socketley/runtime/mail/mail_dkim.cpp", "socketley/runtime/mail/mail_aliases.cpp",
+            "socketley/runtime/mail/mail_verify.cpp", "socketley/runtime/dns/dns_wire.cpp",
             "socketley/shared/util/base64.cpp" }
     links(tls_libs())
 
