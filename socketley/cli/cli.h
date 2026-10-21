@@ -12,6 +12,8 @@ int cli_idp_user(int argc, char** argv);
 int cli_db_backup(int argc, char** argv);
 // `socketley mqtt-pub`, `mqtt-sub` and `mqtt-passwd`, in cli_mqtt.cpp.
 int cli_mqtt_pub(int argc, char** argv);
+int cli_mail_send(int argc, char** argv);
+int cli_mail(int argc, char** argv);
 int cli_mqtt_sub(int argc, char** argv);
 int cli_mqtt_passwd(int argc, char** argv);
 int cli_stdin_send(int argc, char** argv);

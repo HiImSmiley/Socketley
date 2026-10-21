@@ -51,6 +51,7 @@ class sync_instance;
 class idp_instance;
 class db_instance;
 class mqtt_instance;
+class mail_instance;
 
 enum server_mode : uint8_t;
 enum server_send_to : uint8_t;
@@ -82,6 +83,7 @@ int parse_sync_flags(sync_instance* sy, const parsed_args& pa, size_t& i, std::s
 int parse_idp_flags(idp_instance* ip, const parsed_args& pa, size_t& i, std::string_view name);
 int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::string_view name);
 int parse_mqtt_flags(mqtt_instance* mq, const parsed_args& pa, size_t& i, std::string_view name);
+int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::string_view name);
 
 // A `--listen` value, one function because the flag and an `import` document's
 // "listen" field must judge it the same way, returning an empty string on

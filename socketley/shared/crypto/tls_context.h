@@ -58,7 +58,7 @@ inline bool tls_role_has_handshake(runtime_type type)
 {
     return type == runtime_server || type == runtime_proxy ||
            type == runtime_client || type == runtime_cache ||
-           type == runtime_storage || type == runtime_mqtt;
+           type == runtime_storage || type == runtime_mqtt || type == runtime_mail;
 }
 
 // TLS context wrapper for server/client runtimes

@@ -26,7 +26,10 @@ inline constexpr std::string_view for_verb(std::string_view verb)
     if (verb == "restart") return "restart <name> [edit flags] [-i]";
     if (verb == "remove") return "remove <name|pattern>...";
     if (verb == "owner")  return "owner <name>";
-    if (verb == "send")   return "send <name> <message>";
+    if (verb == "send")
+        return "send <name> <message> | send <mail> --to <address> [--cc|--bcc <address>] [--from <address>] "
+               "[--reply-to <address>] [--subject <text>] [--text <text>] [--html <file>] [--attach <file>[:type]] "
+               "[--header 'Name: value'] [--raw]";
     if (verb == "edit")   return "edit <name> [flags]";
     if (verb == "show")   return "show <name|pattern>...";
     if (verb == "import") return "import <name> <json>";
@@ -50,6 +53,7 @@ inline constexpr std::string_view for_verb(std::string_view verb)
     if (verb == "mqtt-kick")     return "mqtt-kick <mqtt> <client> [--end]";
     if (verb == "mqtt-retained") return "mqtt-retained <mqtt> [filter] | --clear <topic>";
     if (verb == "mqtt-passwd")   return "mqtt-passwd <file> <user> [--delete]";
+    if (verb == "mail")          return "mail <mail> queue [filter] | show <id> | flush [id] | drop <id>";
     if (verb == "cluster")
         return "cluster [ls|ps|group <name>|stats|watch|show <daemon>|raft-status|placement|"
                "create <type> <name> [flags] [--replicas <n>]|scale <name> <n>|remove <name>]";

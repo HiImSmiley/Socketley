@@ -232,6 +232,26 @@ struct runtime_config
     uint32_t mqtt_max_sessions = 100000;
     uint16_t mqtt_keepalive_max = 1200;
 
+    // Mail; its spool and DKIM key live under the state directory.
+    uint16_t mail_submission = 0;
+    uint16_t mail_submissions = 0;
+    uint16_t mail_imap = 0;
+    uint16_t mail_imaps = 0;
+    std::string mail_dns;
+    std::string mail_domains;
+    std::string mail_hostname;
+    bool mail_no_reply = false;
+    std::string mail_idp;
+    std::string mail_storage;
+    std::string mail_users;
+    std::string mail_relay;
+    std::string mail_aliases;
+    std::string mail_notify;
+    uint64_t mail_max_size = 25ull << 20;
+    uint32_t mail_max_rcpt = 100;
+    uint32_t mail_lifetime = 5 * 86400;
+    std::string mail_selector = "skl";
+
     // A registered type's own fields in declaration order, opaque here, held
     // as strings because the schema that gives them kinds lives in a manifest.
     std::vector<std::pair<std::string, std::string>> extra;

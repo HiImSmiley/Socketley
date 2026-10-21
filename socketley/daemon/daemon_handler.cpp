@@ -23,6 +23,8 @@
 #include "../runtime/mqtt/mqtt_command.h"
 #include "../shared/util/base64.h"
 #include "../runtime/mqtt/mqtt_instance.h"
+#include "../runtime/mail/mail_instance.h"
+#include "../runtime/mail/mail_command.h"
 #include "../runtime/db/db_log.h"
 #include "../runtime/db/db_store.h"
 #include "../shared/lua/db_call.h"
@@ -1455,6 +1457,8 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("mqtt-kick"):
         case fnv1a("mqtt-retained"):
         case fnv1a("mqtt-tap"):      return cmd_mqtt(conn, pa);
+        case fnv1a("mail-send"):
+        case fnv1a("mail"):          return cmd_mail(conn, pa);
         case fnv1a("db-restore"):    return cmd_db_restore(conn, pa);
         case fnv1a("startup"):       return cmd_startup(conn, pa);
         default:
@@ -1579,6 +1583,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                     break;
                 case runtime_mqtt:
                     result = parse_mqtt_flags(static_cast<mqtt_instance*>(instance), pa, i, name);
+                    break;
+                case runtime_mail:
+                    result = parse_mail_flags(static_cast<mail_instance*>(instance), pa, i, name);
                     break;
                 default:
                     // A registered type's flags come from its manifest schema.
@@ -2243,8 +2250,10 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
         const auto* gone = m_manager.get(n);
         const bool sync_job = gone && gone->get_type() == runtime_sync;
         // A broker's sessions under the state directory go with it; a file of its own naming is the operator's.
-        const bool broker_state = gone && gone->get_type() == runtime_mqtt &&
-                                  static_cast<const mqtt_instance*>(gone)->get_persistent() == "on";
+        const bool broker_state = gone && ((gone->get_type() == runtime_mqtt &&
+                                            static_cast<const mqtt_instance*>(gone)->get_persistent() == "on") ||
+                                           gone->get_type() == runtime_mail);
+        const runtime_type gone_type = gone ? gone->get_type() : runtime_server;
         if (m_manager.remove(n))
         {
             if (m_persistence)
@@ -2252,7 +2261,7 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
             if (sync_job && ::unlink(sync_index_path(n).c_str()) != 0 && errno != ENOENT)
                 LOG_WARN(("sync " + n + ": its index was not removed: " + std::strerror(errno)).c_str());
             if (broker_state)
-                m_forget_snapshots.insert(n);
+                m_forget_snapshots[n] = gone_type;
         }
     }
 
@@ -2264,12 +2273,15 @@ void daemon_handler::forget_settled_snapshots()
 {
     for (auto it = m_forget_snapshots.begin(); it != m_forget_snapshots.end();)
     {
-        if (predecessor_running(*it))
+        if (predecessor_running(it->first))
         {
             ++it;
             continue;
         }
-        mqtt_forget_snapshots(*it);
+        if (it->second == runtime_mail)
+            mail_forget_state(it->first);
+        else
+            mqtt_forget_snapshots(it->first);
         it = m_forget_snapshots.erase(it);
     }
 }
@@ -2942,6 +2954,79 @@ bool daemon_handler::ask_worker(ipc_connection* conn, std::string_view runtime, 
         return false;
     }
     return true;
+}
+
+// A mail runtime's commands: a message to send goes to one shard, which queues it; the queue, a flush and a drop ask
+// every shard, since each keeps a spool of its own.
+int daemon_handler::cmd_mail(ipc_connection* conn, const parsed_args& pa)
+{
+    namespace ml = socketley::mail;
+    const std::string verb(pa.args[0]);
+    if (pa.count < 3)
+    {
+        conn->write_buf = command_usage::line(verb == "mail-send" ? "send" : "mail");
+        return 1;
+    }
+    const std::string_view name = pa.args[1];
+    auto* instance = m_manager.get(name);
+    if (!instance || instance->get_type() != runtime_mail)
+    {
+        conn->write_buf = "no mail runtime named " + std::string(name) + "\n";
+        return 1;
+    }
+    if (instance->get_state() != runtime_running)
+    {
+        conn->write_buf = std::string(name) + " is not running\n";
+        return 1;
+    }
+    std::string reply;
+    if (verb == "mail-send")
+    {
+        std::string payload;
+        if (!socketley::base64::decode(pa.args[2], payload) || !payload.starts_with(ml::command_prefix))
+        {
+            conn->write_buf = "the message did not arrive whole\n";
+            return 1;
+        }
+        if (!ask_worker(conn, name, payload, reply, std::chrono::seconds(30)))
+            return 1;
+        conn->write_buf = reply + (reply.ends_with('\n') ? "" : "\n");
+        return reply.starts_with("error") ? 1 : 0;
+    }
+    const std::string_view what = pa.args[2];
+    const ml::verb v = what == "queue" ? ml::verb::queue : what == "show" ? ml::verb::show
+                     : what == "flush" ? ml::verb::flush : what == "drop" ? ml::verb::drop : ml::verb::send;
+    if (v == ml::verb::send)
+    {
+        conn->write_buf = command_usage::line("mail");
+        return 1;
+    }
+    const std::string arg = pa.count > 3 ? std::string(pa.args[3]) : std::string();
+    const std::string payload = ml::command_text(v, arg);
+    const size_t shards = std::max<size_t>(1, instance->get_shards());
+    std::string all;
+    bool found = false;
+    for (size_t s = 0; s < shards; ++s)
+    {
+        std::string one;
+        if (!ask_worker(conn, name, payload, one, std::chrono::seconds(10), s))
+            return 1;
+        if ((v == ml::verb::show || v == ml::verb::drop) && one.starts_with("error"))
+            continue;
+        found = true;
+        if (v == ml::verb::flush || v == ml::verb::drop)
+            continue;
+        all += one;
+        if (v == ml::verb::show)
+            break;
+    }
+    if (!found)
+    {
+        conn->write_buf = "error: no message " + arg + " is queued\n";
+        return 1;
+    }
+    conn->write_buf = v == ml::verb::flush || v == ml::verb::drop ? std::string() : all;
+    return 0;
 }
 
 // A broker's commands: a publish goes to one shard, which hands it to the others; sessions, kicks and taps ask every
@@ -4395,7 +4480,8 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                 case runtime_idp:
                 case runtime_db:
                 case runtime_mqtt:
-                    // A storage, DNS, sync, idp, db or mqtt runtime's own
+                case runtime_mail:
+                    // A storage, DNS, sync, idp, db, mqtt or mail runtime's own
                     // settings are applied by `import`, as a cache's are.
                     result = -1;
                     break;
@@ -4412,18 +4498,20 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
             // A flag `create` takes for this type and `edit` does not is named as one `import` changes, so the answer
             // does not read as a typo; -s and --test are what create does, not settings.
             const bool own_type = type == runtime_cache || type == runtime_storage || type == runtime_idp ||
-                                  type == runtime_db || type == runtime_mqtt;
+                                  type == runtime_db || type == runtime_mqtt || type == runtime_mail;
             if (own_type && pa.hashes[i] != fnv1a("-s") && pa.hashes[i] != fnv1a("--test") &&
                 runtime_schema::offered(pa.args[i], type))
             {
                 restore_edit();
                 // idp, db and mqtt read their own settings once, at start.
-                const bool restart = type == runtime_idp || type == runtime_db || type == runtime_mqtt;
+                const bool restart = type == runtime_idp || type == runtime_db || type == runtime_mqtt ||
+                                     type == runtime_mail;
                 std::cout << pa.args[i] << " cannot be changed with `edit`\n"
                           << (type == runtime_cache     ? "  A cache's"
                               : type == runtime_storage ? "  A storage runtime's"
                               : type == runtime_idp     ? "  An idp runtime's"
                               : type == runtime_mqtt    ? "  An mqtt runtime's"
+                              : type == runtime_mail    ? "  A mail runtime's"
                                                         : "  A db runtime's")
                           << " own settings are applied by `import`:\n"
                              "    socketley show " << name
@@ -6611,7 +6699,7 @@ bool daemon_handler::serve_map_request(const std::string& op,
         // are the exceptions: their work is done on a worker's own loop, which
         // only a worker turns.
         if (cfg.type == runtime_sync || cfg.type == runtime_idp || cfg.type == runtime_db ||
-            cfg.type == runtime_mqtt)
+            cfg.type == runtime_mqtt || cfg.type == runtime_mail)
             inst->mark_out_of_process();
         inst->set_lua_created(true);
         inst->set_child_policy(
@@ -8694,10 +8782,25 @@ bool daemon_handler::send_response(ipc_connection* conn)
     return true;
 }
 
-bool daemon_handler::open_notifications(const std::string& webhook, const std::string& events,
+bool daemon_handler::open_notifications(const std::string& webhook, const std::string& mail, const std::string& events,
                                         const std::string& state_dir, std::string& why)
 {
     std::vector<socketley::notify_target> targets;
+    m_alert_hook = !webhook.empty();
+    m_alert_mail = !mail.empty();
+    if (m_alert_mail)
+    {
+        // A mail runtime that mails every alert to its addresses, mail://<runtime>/<address>[,<address>...].
+        std::vector<socketley::notify_target> one;
+        if (!socketley::parse_notify_targets("alert-mail " + mail, one, why) || one.empty() ||
+            one.front().k != socketley::notify_target::kind::mail)
+        {
+            why = "daemon.alert_mail is not mail://<runtime>/<address>: " + why;
+            return false;
+        }
+        targets.push_back(std::move(one.front()));
+        m_alert_out.set_runtimes(&m_manager, "daemon");
+    }
     if (!webhook.empty())
     {
         socketley::notify_target t;
@@ -8732,7 +8835,12 @@ bool daemon_handler::open_notifications(const std::string& webhook, const std::s
 
 void daemon_handler::send_alert(std::string body)
 {
-    m_alert_box.post_done([this, b = std::move(body)]() mutable { m_alert_out.add("alerts", std::move(b)); });
+    m_alert_box.post_done([this, b = std::move(body)]() mutable {
+        if (m_alert_mail)
+            m_alert_out.add("alert-mail", b);
+        if (m_alert_hook)
+            m_alert_out.add("alerts", std::move(b));
+    });
 }
 
 void daemon_handler::send_event(std::string sub, std::string json)

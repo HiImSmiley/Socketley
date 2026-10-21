@@ -9,6 +9,7 @@
 #include "lua_storage_api.h"
 #include "lua_db_api.h"
 #include "lua_mqtt_api.h"
+#include "lua_mail_api.h"
 #include "../../runtime/mqtt/mqtt_lua_table.h"
 #include "../util/settings.h"
 
@@ -976,6 +977,8 @@ void lua_context::cancel_timers()
         m_db_client->cancel();
     if (m_mqtt_client)
         m_mqtt_client->cancel();
+    if (m_mail_client)
+        m_mail_client->cancel();
 }
 
 void lua_context::update_self_state(const char* state_str)
@@ -2986,6 +2989,9 @@ void lua_context::register_bindings(runtime_instance* owner)
     if (!m_mqtt_client)
         m_mqtt_client = std::make_unique<lua_mqtt_client>(*this, *owner);
     m_mqtt_client->install(m_lua, sk);
+    if (!m_mail_client)
+        m_mail_client = std::make_unique<lua_mail_client>(*this, *owner);
+    m_mail_client->install(m_lua, sk);
 
     // Last and over the top of the bindings above, so the two builds differ in
     // one place and the list of what is refused is readable in one place.
@@ -3026,6 +3032,7 @@ void lua_context::register_bindings(runtime_instance* owner)
         case runtime_sync:
         case runtime_idp:
         case runtime_db:
+        case runtime_mail:
             // No verbs of their own yet.
             break;
     }

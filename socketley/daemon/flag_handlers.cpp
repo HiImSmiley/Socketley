@@ -23,6 +23,7 @@
 #include "../runtime/idp/idp_instance.h"
 #include "../runtime/db/db_instance.h"
 #include "../runtime/mqtt/mqtt_instance.h"
+#include "../runtime/mail/mail_instance.h"
 #include "../runtime/idp/idp_logic.h"
 #include "../shared/net/ip_block.h"
 #include "../shared/net/dns_feed.h"
@@ -1830,6 +1831,144 @@ int parse_db_flags(db_instance* db, const parsed_args& pa, size_t& i, std::strin
             db->set_backup_keep(n);
             return 0;
         }
+        default:
+            return -1;
+    }
+}
+
+int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::string_view /*name*/)
+{
+    const std::string_view next = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+    const auto port = [&](const char* usage, void (mail_instance::*set)(uint16_t)) {
+        uint64_t p = 0;
+        const auto r = std::from_chars(next.data(), next.data() + next.size(), p);
+        if (next.empty() || r.ec != std::errc() || r.ptr != next.data() + next.size() || p < 1 || p > 65535)
+        {
+            std::cout << usage;
+            return 1;
+        }
+        ++i;
+        (ml->*set)(static_cast<uint16_t>(p));
+        return 0;
+    };
+    const auto file = [&](const char* usage, void (mail_instance::*set)(std::string_view)) {
+        if (next.empty() || next.front() != '/')
+        {
+            std::cout << usage;
+            return 1;
+        }
+        (ml->*set)(pa.args[++i]);
+        return 0;
+    };
+    const auto runtime = [&](const char* usage, void (mail_instance::*set)(std::string_view), bool slash_ok) {
+        if (next.empty() || next.find(' ') != std::string_view::npos ||
+            (!slash_ok && next.find('/') != std::string_view::npos))
+        {
+            std::cout << usage;
+            return 1;
+        }
+        (ml->*set)(pa.args[++i]);
+        return 0;
+    };
+    switch (pa.hashes[i])
+    {
+        // Mail from users who sign in, with STARTTLS (587) and over TLS from the first byte (465).
+        case fnv1a("--submission"):
+            return port("--submission requires a port from 1 to 65535, such as 587\n", &mail_instance::set_submission_port);
+        case fnv1a("--submissions"):
+            return port("--submissions requires a port from 1 to 65535, such as 465\n",
+                        &mail_instance::set_submissions_port);
+        case fnv1a("--imap"):
+            return port("--imap requires a port from 1 to 65535, such as 143\n", &mail_instance::set_imap_port);
+        case fnv1a("--imaps"):
+            return port("--imaps requires a port from 1 to 65535, such as 993\n", &mail_instance::set_imaps_port);
+        // The dns runtime whose zones are the mail domains.
+        case fnv1a("--dns"):
+            return runtime("--dns requires the name of a dns runtime of this daemon\n", &mail_instance::set_dns, false);
+        case fnv1a("--mail-domain"):
+            if (next.empty() || next.find_first_of(" /@") != std::string_view::npos)
+            {
+                std::cout << "--mail-domain requires a domain, or a comma list of them, such as example.com\n";
+                return 1;
+            }
+            ml->set_mail_domains(pa.args[++i]);
+            return 0;
+        case fnv1a("--hostname"):
+            if (next.empty() || next.find_first_of(" /@,") != std::string_view::npos)
+            {
+                std::cout << "--hostname requires the name the runtime greets with, such as mail.example.com\n";
+                return 1;
+            }
+            ml->set_hostname(pa.args[++i]);
+            return 0;
+        case fnv1a("--no-reply"):
+            ml->set_no_reply(true);
+            return 0;
+        case fnv1a("--idp"):
+            return runtime("--idp requires the name of an idp runtime of this daemon\n", &mail_instance::set_idp, false);
+        // The storage runtime and bucket the mailboxes are kept in.
+        case fnv1a("--storage"):
+            return runtime("--storage requires a storage runtime of this daemon, as name or name/bucket\n",
+                           &mail_instance::set_storage, true);
+        case fnv1a("--users"):
+            return file("--users requires the absolute path of a file socketley mqtt-passwd writes\n",
+                        &mail_instance::set_users);
+        case fnv1a("--aliases"):
+            return file("--aliases requires the absolute path of a file of `address target` lines\n",
+                        &mail_instance::set_aliases);
+        case fnv1a("--notify-targets"):
+            return file("--notify-targets requires the absolute path of a file of `name url` lines\n",
+                        &mail_instance::set_notify_targets);
+        case fnv1a("--relay"):
+            if (!next.starts_with("smtp://") && !next.starts_with("smtps://"))
+            {
+                std::cout << "--relay requires smtp://[user:password@]host[:port] or smtps://...\n";
+                return 1;
+            }
+            ml->set_relay(pa.args[++i]);
+            return 0;
+        case fnv1a("--max-size"):
+        {
+            size_t bytes = 0;
+            if (next.empty() || !parse_size_suffix(next, bytes) || bytes < 1024 || bytes > (1ull << 30))
+            {
+                std::cout << "--max-size requires a size from 1K to 1G, such as 25M\n";
+                return 1;
+            }
+            ++i;
+            ml->set_max_size(bytes);
+            return 0;
+        }
+        case fnv1a("--max-recipients"):
+        {
+            uint64_t n = 0;
+            const auto r = std::from_chars(next.data(), next.data() + next.size(), n);
+            if (next.empty() || r.ec != std::errc() || r.ptr != next.data() + next.size() || n < 1 || n > 100000)
+            {
+                std::cout << "--max-recipients requires how many, from 1\n";
+                return 1;
+            }
+            ++i;
+            ml->set_max_recipients(static_cast<uint32_t>(n));
+            return 0;
+        }
+        case fnv1a("--queue-lifetime"):
+        {
+            uint64_t secs = 0;
+            if (!take_duration(pa, i, 60, 30 * 86400, "--queue-lifetime requires a duration from 1m to 30d, such as 5d\n",
+                               secs))
+                return 1;
+            ml->set_queue_lifetime(static_cast<uint32_t>(secs));
+            return 0;
+        }
+        case fnv1a("--dkim-selector"):
+            if (next.empty() || next.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") != std::string_view::npos)
+            {
+                std::cout << "--dkim-selector requires a name of lower-case letters, digits and hyphens\n";
+                return 1;
+            }
+            ml->set_dkim_selector(pa.args[++i]);
+            return 0;
         default:
             return -1;
     }

@@ -2837,6 +2837,40 @@ project "test_mqtt"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+project "test_mail"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files { "test/unit/test_mail.cpp", "socketley/runtime/mail/smtp_session.cpp", "socketley/runtime/mail/mail_compose.cpp",
+            "socketley/runtime/mail/mail_dkim.cpp", "socketley/runtime/mail/mail_aliases.cpp",
+            "socketley/shared/util/base64.cpp" }
+    links(tls_libs())
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 project "test_db"
     kind "ConsoleApp"
     language "C++"

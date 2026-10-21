@@ -6,6 +6,8 @@
 #include "../../runtime/cache/stream_log.h"
 #include "../../runtime/mqtt/mqtt_codec.h"
 #include "../../runtime/mqtt/mqtt_command.h"
+#include "../../runtime/mail/mail_command.h"
+#include "../json/json_doc.h"
 #include "../util/byte_codec.h"
 #include "../ipc/route_relay.h"
 #include "../runtime/runtime_manager.h"
@@ -58,6 +60,19 @@ bool parse_notify_targets(std::string_view text, std::vector<notify_target>& out
                 t.topic.front() == '$')
             {
                 why = where + "a broker target is mqtt://<runtime>/<topic>, the topic without + or #";
+                return false;
+            }
+        }
+        else if (url.starts_with("mail://"))
+        {
+            std::string_view rest = url.substr(7);
+            t.runtime = std::string(take_item(rest, '/'));
+            t.topic = std::string(rest);
+            t.k = notify_target::kind::mail;
+            if (t.runtime.empty() || fields.size() == 3 || t.topic.find('@') == std::string::npos ||
+                t.topic.find_first_of(" \t") != std::string::npos)
+            {
+                why = where + "a mail target is mail://<runtime>/<address>[,<address>...]";
                 return false;
             }
         }
@@ -466,6 +481,29 @@ void notifier::start(lane& l)
     });
 }
 
+// An event as a mail: its subject the alert's first line or what the event is, its text the event's own words where
+// it has some, and its JSON after them.
+static socketley::mail::compose mail_of(const notify_target& t, std::string_view json, std::string_view sub)
+{
+    socketley::mail::compose c;
+    std::string_view list = t.topic;
+    while (!list.empty())
+        if (std::string_view one = take_item(list, ','); !one.empty())
+            c.to.emplace_back(one);
+    std::string what(sub.empty() ? std::string_view(t.name) : sub);
+    std::string text;
+    socketley::json::jvalue doc;
+    if (socketley::json::json_reader(json).document(doc))
+    {
+        if (const std::string_view content = socketley::json::string_of(doc, "content"); !content.empty())
+            what = std::string(content.substr(0, std::min(content.find('\n'), size_t{200})));
+        text = std::string(socketley::json::string_of(doc, "text"));
+    }
+    c.subject = "[socketley] " + what;
+    c.text = (text.empty() ? std::string() : text + "\n\n") + std::string(json) + "\n";
+    return c;
+}
+
 void notifier::start_runtime(lane& l, const pending& ev)
 {
     const notify_target& t = l.target;
@@ -492,6 +530,8 @@ void notifier::start_runtime(lane& l, const pending& ev)
     // A broker takes the event as a message at QoS 1, which it answers once its subscribers have it queued.
     if (t.k == notify_target::kind::mqtt)
         cmd = socketley::mqtt::command_publish(ev.sub.empty() ? t.topic : t.topic + "/" + ev.sub, ev.json, 1, ev.retain);
+    else if (t.k == notify_target::kind::mail)
+        cmd = socketley::mail::command_send(mail_of(t, ev.json, ev.sub));
     else if (t.k == notify_target::kind::cache_channel)
         cmd += "publish " + t.topic + " " + ev.json;
     else

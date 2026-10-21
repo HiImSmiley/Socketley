@@ -1,4 +1,5 @@
 #pragma once
+#include <map>
 #include <set>
 #include <string>
 #include <string_view>
@@ -112,7 +113,8 @@ public:
     // The webhook the alerts go to and the mqtt runtime the daemon's events are published on, either empty for none,
     // their outbox under `state_dir` so what they had not taken goes after a restart; blocking, so it runs before the
     // loop, and false with `why`.
-    bool open_notifications(const std::string& webhook, const std::string& events, const std::string& state_dir,
+    bool open_notifications(const std::string& webhook, const std::string& mail, const std::string& events,
+                            const std::string& state_dir,
                             std::string& why);
     // An alert's message for that webhook, and an event kept on the broker under `sub`, from any thread.
     void send_alert(std::string body);
@@ -209,6 +211,7 @@ private:
                     std::chrono::milliseconds bound = std::chrono::milliseconds(4000), size_t shard = 0);
     // mqtt-pub, mqtt-sessions, mqtt-kick, mqtt-retained and mqtt-tap, which ask a broker's shards.
     int cmd_mqtt(ipc_connection* conn, const parsed_args& pa);
+    int cmd_mail(ipc_connection* conn, const parsed_args& pa);
     int cmd_stats(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload(ipc_connection* conn, const parsed_args& pa);
     int cmd_reload_lua(ipc_connection* conn, const parsed_args& pa);
@@ -279,6 +282,9 @@ private:
     // of the pool, which starts no thread.
     socketley::file_io  m_fio;
     socketley::notifier m_alert_out;
+    // Which of the alerts' ways open_notifications() opened: a webhook, a mail runtime.
+    bool m_alert_hook{false};
+    bool m_alert_mail{false};
     socketley::hash_pool m_alert_box{1};
     // Each runtime's state as last published on daemon.events, by name; empty and unused when none is set.
     bool m_events{false};
@@ -435,8 +441,9 @@ private:
 
     // Whether a retired worker of `name` is still running, reaping the ones that are not.
     bool predecessor_running(const std::string& name);
-    // Brokers removed whose snapshots go once their last worker has exited, which writes one as it stops.
-    std::set<std::string, std::less<>> m_forget_snapshots;
+    // Brokers and mail runtimes removed, whose files under the state directory go once their last worker has exited,
+    // which writes them as it stops.
+    std::map<std::string, runtime_type, std::less<>> m_forget_snapshots;
     void forget_settled_snapshots();
 
     // Runtimes wanted running whose fork the last reconcile held back for a predecessor.

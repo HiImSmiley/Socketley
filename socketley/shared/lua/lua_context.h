@@ -65,6 +65,7 @@ class lua_suspender;
 class lua_storage_client;
 class lua_db_client;
 class lua_mqtt_client;
+class lua_mail_client;
 
 // How long one Lua callback may hold the event-loop thread, enforced by a
 // count hook that fires every N VM instructions and tests wall-clock time --
@@ -479,6 +480,7 @@ private:
     // And what socketley.db waits on, alike.
     std::unique_ptr<lua_db_client> m_db_client;
     std::unique_ptr<lua_mqtt_client> m_mqtt_client;
+    std::unique_ptr<lua_mail_client> m_mail_client;
 
     // The `filters` chain as a vector because order is the whole point,
     // collected once at load time, and protected because a filter is where

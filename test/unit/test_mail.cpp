@@ -1,0 +1,541 @@
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "doctest.h"
+
+#include <deque>
+#include <functional>
+#include <string>
+#include <filesystem>
+#include <vector>
+
+#include "runtime/mail/mail_aliases.h"
+#include "runtime/mail/mail_compose.h"
+#include "runtime/mail/mail_dkim.h"
+#include "runtime/mail/smtp_session.h"
+#include "shared/util/base64.h"
+
+using namespace socketley::mail;
+namespace dkim = socketley::mail::dkim;
+
+namespace
+{
+
+// A session's other side: what it says is kept, and every question is answered at once or held for the test.
+struct fake : smtp_session::hooks
+{
+    std::string out;
+    std::vector<std::string> messages;
+    std::string body;
+    bool in_data{false};
+    bool closed{false};
+    bool tls{false};
+    bool hold{false};
+    bool refuse_data{false};
+    int aborted{0};
+    std::deque<std::function<void()>> held;
+    std::function<rcpt_verdict(const address&)> rcpt_rule = [](const address&) { return rcpt_verdict{250, ""}; };
+    std::function<bool(const std::string&, const std::string&)> password = [](const std::string& u,
+                                                                            const std::string& p) {
+        return u == "alice" && p == "secret";
+    };
+
+    void answer(std::function<void()> f)
+    {
+        if (hold)
+            held.push_back(std::move(f));
+        else
+            f();
+    }
+    void release()
+    {
+        while (!held.empty())
+        {
+            auto f = std::move(held.front());
+            held.pop_front();
+            f();
+        }
+    }
+    void reply(std::string_view b) override { out.append(b); }
+    void start_tls() override { tls = true; }
+    void authenticate(std::string_view, std::string user, std::string secret,
+                      std::function<void(bool, std::string)> done) override
+    {
+        const bool ok = password(user, secret);
+        answer([done, ok, user] { done(ok, user); });
+    }
+    void mail_from(const address&, std::function<void(rcpt_verdict)> done) override
+    {
+        answer([done] { done({250, ""}); });
+    }
+    void rcpt_to(const address& to, std::function<void(rcpt_verdict)> done) override
+    {
+        const rcpt_verdict v = rcpt_rule(to);
+        answer([done, v] { done(v); });
+    }
+    bool data_begin() override
+    {
+        if (refuse_data)
+            return false;
+        in_data = true;
+        body.clear();
+        return true;
+    }
+    void data_bytes(std::string_view p) override { body.append(p); }
+    void data_end(std::function<void(rcpt_verdict)> done) override
+    {
+        in_data = false;
+        messages.push_back(body);
+        answer([done] { done({250, "queued"}); });
+    }
+    void data_abort() override
+    {
+        in_data = false;
+        ++aborted;
+    }
+    void close() override { closed = true; }
+
+    // The reply codes said since the last call, in order.
+    std::vector<int> codes()
+    {
+        std::vector<int> c;
+        size_t at = 0;
+        while (at < out.size())
+        {
+            const size_t nl = out.find("\r\n", at);
+            if (nl == std::string::npos)
+                break;
+            const std::string line = out.substr(at, nl - at);
+            if (line.size() >= 4 && line[3] == ' ')
+                c.push_back(std::stoi(line.substr(0, 3)));
+            at = nl + 2;
+        }
+        out.clear();
+        return c;
+    }
+};
+
+// Signed by dkimpy 1.1, its key's record below: the vectors of the DKIM tests.
+const std::string dkim_record = "v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC0OmYp7o/anNQznPEOYYwMtebEZfJ1oPFrWbywRlRqGOOHBd6jkFYgGQe89oUDbjUewHFwBRCPNeNkBHcZSO3zkgUO64j/hpMu7RqISKGLW0+GvfEyp6AqRmhW7OddocgLQWk/eKnjeqxOIju3N5TXd3AbzJQGXk6gLBsoSsQwLwIDAQAB";
+const std::string dkim_signed_relaxed = "DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.test;\r\n"
+    " i=@example.test; q=dns/txt; s=skl; t=1792553002; h=from : to : subject\r\n"
+    " : date : message-id; bh=LPJyf0TSjlshXtMhRZTZeGRtSPkTOX71Ks5ftyjz2xc=;\r\n"
+    " b=pb92pzZFjun/K3ljHrvySrbAlAnd7IpoLkAD22aS5aAF4jLaGNmY/QWi13erHMg5IkuBX\r\n"
+    " bC4+/8OTX6RpdRYuNjgX+lK/8+ah64RTVRoZuCVRdnm63ePhLLJwPN7dpWbBZOXKGbflHr3\r\n"
+    " H2bTOw6AyORAoGveJf5gPvYUUKAzSa8=\r\n"
+    "From: Alice <alice@example.test>\r\n"
+    "To: bob@remote.test\r\n"
+    "Subject:  Hello   there \r\n"
+    "\twrapped\r\n"
+    "Date: Wed, 21 Oct 2026 03:00:00 +0000\r\n"
+    "Message-ID: <v1@example.test>\r\n"
+    "\r\n"
+    "Body line one  \r\n"
+    "  indented\twith tab \r\n"
+    "\r\n"
+    "\r\n"
+    "";
+const std::string dkim_signed_simple = "DKIM-Signature: v=1; a=rsa-sha256; c=simple/simple; d=example.test;\r\n"
+    " i=@example.test; q=dns/txt; s=skl; t=1792553002; h=from : to : subject\r\n"
+    " : date : message-id; bh=1gNY5oeOVcvTugDME0A/TCf3x/rY50inNVHjD4V9+lc=;\r\n"
+    " b=TBp0g+YTE/xmr0ZGyammHx3wHEyjPceFoaqTv78lAzxT44Nsimu0qeu5MNsv4rufjlMVO\r\n"
+    " ZiY7K8ce2a+NtMUlPGjWw9PdjtA0cVxYRopxzgAohk6DW6uQJuOUwTYUuCf4z9bRBoo041S\r\n"
+    " cFQGIyTimVInzUmLUXAGMFzQ34ylksk=\r\n"
+    "From: Alice <alice@example.test>\r\n"
+    "To: bob@remote.test\r\n"
+    "Subject:  Hello   there \r\n"
+    "\twrapped\r\n"
+    "Date: Wed, 21 Oct 2026 03:00:00 +0000\r\n"
+    "Message-ID: <v1@example.test>\r\n"
+    "\r\n"
+    "Body line one  \r\n"
+    "  indented\twith tab \r\n"
+    "\r\n"
+    "\r\n"
+    "";
+
+smtp_config plain_config()
+{
+    smtp_config c;
+    c.hostname = "mx.example.com";
+    c.max_size = 1 << 20;
+    return c;
+}
+
+}   // namespace
+
+TEST_CASE("addresses: paths and plain addresses as RFC 5321 writes them")
+{
+    address a;
+    CHECK(parse_path("<Alice@Example.COM>", a, false, false));
+    CHECK(a.local == "Alice");
+    CHECK(a.domain == "example.com");
+    CHECK(parse_path("<>", a, true, false));
+    CHECK(a.empty());
+    CHECK_FALSE(parse_path("<>", a, false, false));
+    CHECK(parse_path("<\"john doe\"@example.com>", a, false, false));
+    CHECK(parse_path("<@relay.example:bob@example.org>", a, false, false));
+    CHECK(a.text() == "bob@example.org");
+    CHECK(parse_path("<postmaster>", a, false, false));
+    CHECK(a.local == "postmaster");
+    CHECK(a.domain.empty());
+    CHECK(parse_path("<x@[192.0.2.1]>", a, false, false));
+    CHECK_FALSE(parse_path("alice@example.com", a, false, false));
+    CHECK_FALSE(parse_path("<alice>", a, false, false));
+    CHECK_FALSE(parse_path("<a..b@example.com>", a, false, false));
+    CHECK_FALSE(parse_path("<.a@example.com>", a, false, false));
+    CHECK_FALSE(parse_path("<a@-example.com>", a, false, false));
+    CHECK_FALSE(parse_path("<a@exa_mple.com>", a, false, false));
+    CHECK_FALSE(parse_path("<" + std::string(65, 'x') + "@example.com>", a, false, false));
+    CHECK_FALSE(parse_path("<j\xc3\xb6rg@example.com>", a, false, false));
+    CHECK(parse_path("<j\xc3\xb6rg@example.com>", a, false, true));
+}
+
+TEST_CASE("a whole conversation pipelined in one read is answered in order, its message unstuffed")
+{
+    fake f;
+    smtp_session s(plain_config(), f);
+    s.greet();
+    CHECK(f.codes() == std::vector<int>{220});
+    s.input("EHLO client.example\r\nMAIL FROM:<a@example.org> SIZE=100 BODY=8BITMIME\r\n"
+            "RCPT TO:<b@example.com>\r\nRCPT TO:<c@example.com>\r\nDATA\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 250, 250, 250, 354});
+    s.input("Subject: hi\r\n\r\n..leading dot\r\n.\r\nQUIT\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 221});
+    REQUIRE(f.messages.size() == 1);
+    CHECK(f.messages[0] == "Subject: hi\r\n\r\n.leading dot\r\n");
+    CHECK(f.closed);
+    CHECK(s.messages() == 1);
+}
+
+TEST_CASE("EHLO says what is offered, and only where it may be used")
+{
+    fake f;
+    smtp_config c = plain_config();
+    c.tls_offered = true;
+    c.auth_offered = true;
+    smtp_session s(c, f);
+    s.input("EHLO x\r\n");
+    CHECK(f.out.find("250-STARTTLS") != std::string::npos);
+    CHECK(f.out.find("AUTH") == std::string::npos);
+    CHECK(f.out.find("250-SIZE 1048576") != std::string::npos);
+    CHECK(f.out.find("250 ENHANCEDSTATUSCODES") != std::string::npos);
+    f.out.clear();
+    s.input("AUTH PLAIN AGFsaWNlAHNlY3JldA==\r\n");
+    CHECK(f.codes() == std::vector<int>{538});
+}
+
+TEST_CASE("the end of a message is found wherever the reads cut it")
+{
+    const std::string wire = "Subject: x\r\n\r\nline one\r\n..two\r\n.\r\n";
+    const std::string want = "Subject: x\r\n\r\nline one\r\n.two\r\n";
+    for (size_t cut = 1; cut < wire.size(); ++cut)
+    {
+        fake f;
+        smtp_session s(plain_config(), f);
+        s.input("HELO x\r\nMAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\n");
+        s.input(wire.substr(0, cut));
+        s.input(wire.substr(cut));
+        REQUIRE_MESSAGE(f.messages.size() == 1, cut);
+        CHECK_MESSAGE(f.messages[0] == want, cut);
+    }
+    // And a byte at a time.
+    fake f;
+    smtp_session s(plain_config(), f);
+    s.input("HELO x\r\nMAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\n");
+    for (char ch : wire)
+        s.input(std::string_view(&ch, 1));
+    REQUIRE(f.messages.size() == 1);
+    CHECK(f.messages[0] == want);
+}
+
+TEST_CASE("a bare LF is a line's end written as CRLF, and a dot between bare LFs ends nothing")
+{
+    fake f;
+    smtp_session s(plain_config(), f);
+    s.input("HELO x\r\nMAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\n");
+    f.codes();
+    // The smuggling of 2023: a sender that ends at LF.LF would see a second message here, and this server sees one.
+    s.input("one\n.\nMAIL FROM:<evil@b.org>\r\nRCPT TO:<victim@d.org>\r\nDATA\r\nforged\r\n.\r\n");
+    CHECK(f.codes() == std::vector<int>{250});
+    REQUIRE(f.messages.size() == 1);
+    CHECK(f.messages[0] == "one\r\n\r\nMAIL FROM:<evil@b.org>\r\nRCPT TO:<victim@d.org>\r\nDATA\r\nforged\r\n");
+    // A bare CR is kept as it came.
+    s.input("MAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\nx\ry\r\n.\r\n");
+    REQUIRE(f.messages.size() == 2);
+    CHECK(f.messages[1] == "x\ry\r\n");
+}
+
+TEST_CASE("a message past the size is read to its end and refused, and the next one is taken")
+{
+    fake f;
+    smtp_config c = plain_config();
+    c.max_size = 100;
+    smtp_session s(c, f);
+    s.input("EHLO x\r\nMAIL FROM:<a@b.org> SIZE=101\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 552});
+    s.input("MAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\n");
+    f.codes();
+    s.input(std::string(150, 'x') + "\r\n" + std::string(50, 'y') + "\r\n.\r\n");
+    CHECK(f.codes() == std::vector<int>{552});
+    CHECK(f.aborted == 1);
+    CHECK(f.messages.empty());
+    s.input("MAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\nsmall\r\n.\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 250, 354, 250});
+    CHECK(f.messages.size() == 1);
+}
+
+TEST_CASE("answers that come later are said in the order of the commands they answer")
+{
+    fake f;
+    f.hold = true;
+    f.rcpt_rule = [](const address& a) {
+        return a.local == "nobody" ? rcpt_verdict{550, "No such user"} : rcpt_verdict{250, ""};
+    };
+    smtp_session s(plain_config(), f);
+    s.input("EHLO x\r\nMAIL FROM:<a@b.org>\r\nRCPT TO:<one@d.org>\r\nRCPT TO:<nobody@d.org>\r\n"
+            "RCPT TO:<two@d.org>\r\nDATA\r\nbody\r\n.\r\nNOOP\r\n");
+    CHECK(f.codes() == std::vector<int>{250});
+    for (int round = 0; round < 10 && !f.held.empty(); ++round)
+        f.release();
+    CHECK(f.codes() == std::vector<int>{250, 250, 550, 250, 354, 250, 250});
+    CHECK(s.recipients().empty());
+    REQUIRE(f.messages.size() == 1);
+    CHECK(f.messages[0] == "body\r\n");
+}
+
+TEST_CASE("STARTTLS drops what was pipelined behind it and starts the conversation over")
+{
+    fake f;
+    smtp_config c = plain_config();
+    c.tls_offered = true;
+    c.auth_offered = true;
+    smtp_session s(c, f);
+    s.input("EHLO x\r\nSTARTTLS\r\nMAIL FROM:<injected@b.org>\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 220});
+    CHECK(f.tls);
+    s.tls_started();
+    CHECK(f.out.empty());
+    s.input("MAIL FROM:<a@b.org>\r\n");
+    CHECK(f.codes() == std::vector<int>{503});
+    s.input("EHLO x\r\n");
+    CHECK(f.out.find("STARTTLS") == std::string::npos);
+    CHECK(f.out.find("250-AUTH PLAIN LOGIN") != std::string::npos);
+    f.out.clear();
+    s.input("STARTTLS\r\n");
+    CHECK(f.codes() == std::vector<int>{503});
+}
+
+TEST_CASE("AUTH PLAIN and LOGIN sign in, a wrong password is refused, and a submission port asks for it")
+{
+    fake f;
+    smtp_config c = plain_config();
+    c.auth_offered = true;
+    c.auth_in_clear = true;
+    c.auth_required = true;
+    smtp_session s(c, f);
+    s.input("EHLO x\r\nMAIL FROM:<a@b.org>\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 530});
+    const std::string bad = socketley::base64::encode(std::string("\0alice\0wrong", 12));
+    s.input("AUTH PLAIN " + bad + "\r\n");
+    CHECK(f.codes() == std::vector<int>{535});
+    s.input("AUTH LOGIN\r\n");
+    CHECK(f.out == "334 VXNlcm5hbWU6\r\n");
+    f.out.clear();
+    s.input(socketley::base64::encode("alice") + "\r\n");
+    CHECK(f.out == "334 UGFzc3dvcmQ6\r\n");
+    f.out.clear();
+    s.input(socketley::base64::encode("secret") + "\r\n");
+    CHECK(f.codes() == std::vector<int>{235});
+    CHECK(s.user() == "alice");
+    s.input("AUTH PLAIN\r\n");
+    CHECK(f.codes() == std::vector<int>{503});
+    s.input("MAIL FROM:<a@b.org>\r\n");
+    CHECK(f.codes() == std::vector<int>{250});
+
+    fake g;
+    smtp_session t(c, g);
+    t.input("EHLO x\r\nAUTH PLAIN\r\n");
+    CHECK(g.out.substr(g.out.size() - 6) == "334 \r\n");
+    g.out.clear();
+    t.input(socketley::base64::encode(std::string("alice\0alice\0secret", 18)) + "\r\n");
+    CHECK(g.codes() == std::vector<int>{235});
+    // An identity asked for that is not the one signed in as is refused.
+    fake h;
+    smtp_session u(c, h);
+    u.input("EHLO x\r\nAUTH PLAIN " + socketley::base64::encode(std::string("bob\0alice\0secret", 17)) + "\r\n");
+    CHECK(h.codes() == std::vector<int>{250, 535});
+}
+
+TEST_CASE("errors past the limit close the connection, and a long line is refused without being kept")
+{
+    fake f;
+    smtp_session s(plain_config(), f);
+    std::string many;
+    for (uint32_t i = 0; i < smtp_session::max_errors; ++i)
+        many += "BOGUS\r\n";
+    s.input(many);
+    const auto c = f.codes();
+    CHECK(c.back() == 421);
+    CHECK(f.closed);
+    fake g;
+    smtp_session t(plain_config(), g);
+    t.input(std::string(smtp_session::max_command + 10, 'x'));
+    CHECK(g.codes() == std::vector<int>{500});
+    t.input("\r\nNOOP\r\n");
+    CHECK(g.codes().back() == 250);
+}
+
+TEST_CASE("commands out of order, and a DATA the store cannot take")
+{
+    fake f;
+    smtp_session s(plain_config(), f);
+    s.input("MAIL FROM:<a@b.org>\r\n");
+    CHECK(f.codes() == std::vector<int>{503});
+    s.input("HELO x\r\nRCPT TO:<c@d.org>\r\nDATA\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 503, 503});
+    s.input("MAIL FROM:<a@b.org>\r\nMAIL FROM:<a@b.org>\r\nDATA\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 503, 554});
+    f.refuse_data = true;
+    s.input("RCPT TO:<c@d.org>\r\nDATA\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 451});
+    s.input("RCPT TO:<c@d.org>\r\n");
+    CHECK(f.codes() == std::vector<int>{503});
+    s.input("GET / HTTP/1.1\r\n");
+    CHECK(f.codes() == std::vector<int>{554});
+    CHECK(f.closed);
+}
+
+TEST_CASE("DKIM: dkimpy's signatures verify here, in both canonicalizations, and a changed message does not")
+{
+    for (const std::string* m : {&dkim_signed_relaxed, &dkim_signed_simple})
+    {
+        const auto sigs = dkim::signatures(*m);
+        REQUIRE(sigs.size() == 1);
+        CHECK(sigs[0].d == "example.test");
+        CHECK(sigs[0].s == "skl");
+        std::string why;
+        CHECK_MESSAGE(dkim::verify(*m, sigs[0], dkim_record, 1792552976, &why) == dkim::result::pass, why);
+        // A word of the body changed, and a header the signature covers.
+        std::string body = *m;
+        body.replace(body.find("Body line one"), 4, "Bodx");
+        CHECK(dkim::verify(body, sigs[0], dkim_record, 1792552976) == dkim::result::fail);
+        std::string head = *m;
+        head.replace(head.find("bob@remote.test"), 3, "eve");
+        CHECK(dkim::verify(head, sigs[0], dkim_record, 1792552976) == dkim::result::fail);
+    }
+    const auto sigs = dkim::signatures(dkim_signed_relaxed);
+    CHECK(dkim::verify(dkim_signed_relaxed, sigs[0], "", 0) == dkim::result::permerror);
+    CHECK(dkim::verify(dkim_signed_relaxed, sigs[0], "v=DKIM1; p=", 0) == dkim::result::fail);
+    // Whitespace the relaxed canonicalization is allowed to take changes nothing.
+    std::string spaced = dkim_signed_relaxed;
+    spaced.replace(spaced.find("Body line one"), 13, "Body   line\tone");
+    CHECK(dkim::verify(spaced, sigs[0], dkim_record, 1792552976) == dkim::result::pass);
+}
+
+TEST_CASE("DKIM: what this signs, it verifies, and the canonicalizations are RFC 6376's examples")
+{
+    // RFC 6376 3.4.5.
+    CHECK(dkim::relaxed_header("A", " X") == "a:X");
+    CHECK(dkim::relaxed_header("B ", " Y\t\r\n\tZ  ") == "b:Y Z");
+    CHECK(dkim::relaxed_body(" C \r\nD \t E\r\n\r\n\r\n") == " C\r\nD E\r\n");
+    CHECK(dkim::simple_body(" C \r\nD \t E\r\n\r\n\r\n") == " C \r\nD \t E\r\n");
+    CHECK(dkim::relaxed_body("") == "");
+    CHECK(dkim::simple_body("") == "\r\n");
+    std::string why;
+    char tmpl[] = "/tmp/test_mail_dkim_XXXXXX";
+    REQUIRE(mkdtemp(tmpl) != nullptr);
+    const std::string path = std::string(tmpl) + "/k.pem";
+    const auto key = dkim::load_or_make(path, why);
+    REQUIRE_MESSAGE(key, why);
+    // Kept, and the same key read back.
+    const auto again = dkim::load_or_make(path, why);
+    REQUIRE(again);
+    CHECK(dkim::public_record(key.get()) == dkim::public_record(again.get()));
+    const std::string msg = "From: a@example.test\r\nTo: b@remote.test\r\nSubject: hi\r\n\r\nbody\r\n";
+    const std::string signed_msg = dkim::sign(msg, "example.test", "skl", key.get(), 1000) + msg;
+    const auto sigs = dkim::signatures(signed_msg);
+    REQUIRE(sigs.size() == 1);
+    CHECK(dkim::verify(signed_msg, sigs[0], dkim::public_record(key.get()), 1000) == dkim::result::pass);
+    // A second From added on the way is caught, since From is signed once more than it is there.
+    const std::string forged = signed_msg + "";
+    std::string two = signed_msg;
+    two.insert(two.find("To: "), "From: evil@else.test\r\n");
+    CHECK(dkim::verify(two, sigs[0], dkim::public_record(key.get()), 1000) == dkim::result::fail);
+    std::filesystem::remove_all(tmpl);
+}
+
+TEST_CASE("compose: headers encoded, text quoted-printable, parts and attachments, and no recipient refused")
+{
+    compose c;
+    c.to = {"Bob Smith <bob@remote.test>", "carol@remote.test"};
+    c.bcc = {"hidden@remote.test"};
+    c.subject = "Grüße";
+    c.text = "Zeile mit Umlaut ä\n.Punkt\n";
+    c.html = "<p>hi</p>";
+    c.attachments.push_back({"a.txt", "text/plain", "attached"});
+    address from;
+    REQUIRE(parse_address("alice@example.test", from));
+    composed out;
+    std::string why;
+    REQUIRE_MESSAGE(compose_message(c, from, "Alice Ä", "id1@example.test", 0, out, why), why);
+    CHECK(out.from == "alice@example.test");
+    CHECK(out.rcpts == std::vector<std::string>{"bob@remote.test", "carol@remote.test", "hidden@remote.test"});
+    const std::string_view h = header_block(out.message);
+    CHECK(header_value(h, "Subject") == "=?UTF-8?B?R3LDvMOfZQ==?=");
+    CHECK(header_value(h, "From") == "=?UTF-8?B?QWxpY2Ugw4Q=?= <alice@example.test>");
+    CHECK(header_value(h, "To") == "Bob Smith <bob@remote.test>, carol@remote.test");
+    CHECK(header_value(h, "Bcc").empty());
+    CHECK(header_value(h, "Date") == "Thu, 01 Jan 1970 00:00:00 +0000");
+    CHECK(header_value(h, "Content-Type").starts_with("multipart/mixed; boundary="));
+    CHECK(out.message.find("multipart/alternative") != std::string::npos);
+    CHECK(out.message.find("Zeile mit Umlaut =C3=A4\r\n.Punkt\r\n") != std::string::npos);
+    CHECK(out.message.find("YXR0YWNoZWQ=\r\n") != std::string::npos);
+    // Every line ends in CRLF.
+    for (size_t i = 0; i < out.message.size(); ++i)
+        if (out.message[i] == '\n')
+            REQUIRE(i > 0);
+    CHECK(out.message.find("\r\r") == std::string::npos);
+    compose none;
+    CHECK_FALSE(compose_message(none, from, "", "x@y", 0, out, why));
+    compose injected = c;
+    injected.headers = {"X-Ok: fine\r\nBcc: evil@else.test"};
+    CHECK_FALSE(compose_message(injected, from, "", "x@y", 0, out, why));
+    compose own = c;
+    own.headers = {"Subject: second"};
+    CHECK_FALSE(compose_message(own, from, "", "x@y", 0, out, why));
+}
+
+TEST_CASE("quoted-printable keeps lines under 76 and a trailing space safe")
+{
+    const std::string qp = quoted_printable(std::string(200, 'a') + " \r\nend\r\n");
+    size_t line = 0;
+    for (size_t i = 0; i < qp.size(); ++i)
+    {
+        if (qp[i] == '\r')
+        {
+            CHECK(line <= 76);
+            line = 0;
+            ++i;
+            continue;
+        }
+        ++line;
+    }
+    CHECK(qp.find("=20\r\nend") != std::string::npos);
+    CHECK(quoted_printable("a=b") == "a=3Db");
+}
+
+TEST_CASE("aliases: addresses and catch-alls, refused when a line is none")
+{
+    alias_table t;
+    std::string why;
+    REQUIRE(t.parse("# who gets what\ninfo@Example.test  alice, bob@remote.test\n*@example.test carol\n", why));
+    const auto* a = t.find("INFO", "example.test");
+    REQUIRE(a);
+    CHECK(*a == std::vector<std::string>{"alice", "bob@remote.test"});
+    const auto* any = t.find("whoever", "example.test");
+    REQUIRE(any);
+    CHECK(*any == std::vector<std::string>{"carol"});
+    CHECK(t.find("x", "other.test") == nullptr);
+    CHECK_FALSE(t.parse("info@example.test\n", why));
+    CHECK_FALSE(t.parse("not-an-address alice\n", why));
+    CHECK_FALSE(t.parse("a@example.test bad@@x\n", why));
+}

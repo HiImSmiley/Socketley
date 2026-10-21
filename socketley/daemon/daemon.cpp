@@ -66,6 +66,7 @@ struct daemon_config
     std::string dashboard_idp;
     // Where alerts are posted, empty for nowhere.
     std::string alert_webhook;
+    std::string alert_mail;
     // The mqtt runtime the daemon publishes its alerts and its runtimes' states on, empty for none.
     std::string events;
     std::string name;
@@ -175,6 +176,10 @@ static daemon_config load_daemon_config(const std::string& config_path)
     sol::optional<std::string> hook = text("alert_webhook");
     if (hook && !hook->empty())
         out.alert_webhook = *hook;
+
+    sol::optional<std::string> mail = text("alert_mail");
+    if (mail && !mail->empty())
+        out.alert_mail = *mail;
 
     sol::optional<std::string> events = text("events");
     if (events && !events->empty())
@@ -915,12 +920,15 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // The alerts' webhook and the events' broker are reached from this loop, so they are opened first; one that cannot
     // be is said, and the alerts are still logged and shown.
     bool told_open = false;
-    if (!config.alert_webhook.empty() || !config.events.empty())
+    if (!config.alert_webhook.empty() || !config.alert_mail.empty() || !config.events.empty())
     {
         std::string why;
-        told_open = handler.open_notifications(config.alert_webhook, config.events, paths.state_dir.string(), why);
+        told_open = handler.open_notifications(config.alert_webhook, config.alert_mail, config.events,
+                                               paths.state_dir.string(), why);
         if (!told_open)
-            LOG_ERROR(("daemon: neither daemon.alert_webhook nor daemon.events is told anything: " + why).c_str());
+            LOG_ERROR(("daemon: none of daemon.alert_webhook, daemon.alert_mail and daemon.events is told anything: " +
+                       why)
+                          .c_str());
     }
 
     // Start metrics endpoint if configured
@@ -930,7 +938,7 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     {
         std::function<void(std::string)> alert_send;
         std::function<void(std::string, std::string)> alert_event;
-        if (told_open && !config.alert_webhook.empty())
+        if (told_open && (!config.alert_webhook.empty() || !config.alert_mail.empty()))
             alert_send = [&handler](std::string body) { handler.send_alert(std::move(body)); };
         if (told_open && !config.events.empty())
             alert_event = [&handler](std::string sub, std::string json)

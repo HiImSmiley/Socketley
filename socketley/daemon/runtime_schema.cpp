@@ -10,7 +10,8 @@ namespace runtime_schema
 namespace
 {
 
-// The types a flag is offered for, one letter each: Server, Client, Proxy, cache (K), sTorage, Dns, sYnc, Idp, dB, Mqtt.
+// The types a flag is offered for, one letter each: Server, Client, Proxy, cache (K), sTorage, Dns, sYnc, Idp, dB, Mqtt,
+// mail (E).
 struct row
 {
     std::string_view flag, types, kind, label, help, section, choices = {}, placeholder = {}, aliases = {};
@@ -19,29 +20,29 @@ struct row
 
 constexpr row rows[] = {
     // ── basics ──────────────────────────────────────────────────────────────
-    {"-p", "SCPKTDIBM", "int", "Port", "The port it listens on (a client: the port of its target).", "Basics", {}, "8080"},
-    {"-s", "SCPKTDIBM", "switch", "Start now", "Start it as soon as it is made.", "Basics"},
-    {"-g", "SCPKTDM", "text", "Group", "A group its proxies reach all members of with --backend @group.", "Basics", {}, "web", "--group"},
-    {"--lua", "SCPKTM", "path", "Lua script", "A script with the runtime's callbacks, run at start.", "Basics", {}, "/etc/socketley/app.lua"},
-    {"--test", "SCPKTDIBM", "switch", "Dry run", "Check the type, the name and every flag, and keep nothing.", "Basics", {}, {}, {}, true},
+    {"-p", "SCPKTDIBME", "int", "Port", "The port it listens on (a client: the port of its target).", "Basics", {}, "8080"},
+    {"-s", "SCPKTDIBME", "switch", "Start now", "Start it as soon as it is made.", "Basics"},
+    {"-g", "SCPKTDME", "text", "Group", "A group its proxies reach all members of with --backend @group.", "Basics", {}, "web", "--group"},
+    {"--lua", "SCPKTME", "path", "Lua script", "A script with the runtime's callbacks, run at start.", "Basics", {}, "/etc/socketley/app.lua"},
+    {"--test", "SCPKTDIBME", "switch", "Dry run", "Check the type, the name and every flag, and keep nothing.", "Basics", {}, {}, {}, true},
 
     // ── network ─────────────────────────────────────────────────────────────
-    {"--bind", "SPKTDIBM", "text", "Bind address", "The address the port is bound on alone, such as 127.0.0.1 for one only a proxy here reaches.", "Network", {}, "127.0.0.1"},
+    {"--bind", "SPKTDIBME", "text", "Bind address", "The address the port is bound on alone, such as 127.0.0.1 for one only a proxy here reaches.", "Network", {}, "127.0.0.1"},
     {"--listen", "SPKT", "text", "Unix socket", "Listen on a unix socket instead of a port.", "Network", {}, "unix:/run/socketley/app.sock"},
-    {"--shards", "SPKTDIBM", "int", "Shards", "Worker processes sharing the port: the way one runtime uses more than one core.", "Network", {}, "4"},
+    {"--shards", "SPKTDIBME", "int", "Shards", "Worker processes sharing the port: the way one runtime uses more than one core.", "Network", {}, "4"},
     {"--domain", "SPKTIB", "list", "Names", "The names it is reached by through the entrance; empty for its own name.", "Network", {}, "chat, api.example.com"},
-    {"--cpus", "SCPKTDIBM", "text", "CPUs", "The CPUs its I/O may run on, as 0-3,6.", "Network", {}, "0-3"},
+    {"--cpus", "SCPKTDIBME", "text", "CPUs", "The CPUs its I/O may run on, as 0-3,6.", "Network", {}, "0-3"},
 
     // ── TLS ─────────────────────────────────────────────────────────────────
-    {"--tls", "SCPKTM", "switch", "TLS", "Encrypt its transport: terminate TLS on its port, or dial over it.", "TLS"},
-    {"--cert", "SCPKTM", "path", "Certificate", "The PEM certificate (chain allowed) a listener presents.", "TLS", {}, "/etc/ssl/site.pem"},
-    {"--key", "SCPKTM", "path", "Key", "The PEM key of the certificate.", "TLS", {}, "/etc/ssl/site.key"},
+    {"--tls", "SCPKTME", "switch", "TLS", "Encrypt its transport: terminate TLS on its port, or dial over it.", "TLS"},
+    {"--cert", "SCPKTME", "path", "Certificate", "The PEM certificate (chain allowed) a listener presents.", "TLS", {}, "/etc/ssl/site.pem"},
+    {"--key", "SCPKTME", "path", "Key", "The PEM key of the certificate.", "TLS", {}, "/etc/ssl/site.key"},
     {"--ca", "SCPKTM", "path", "CA", "Mutual TLS on a listener; the trust store of a client or a proxy's backends.", "TLS", {}, "/etc/ssl/ca.pem"},
     {"--acme", "SPKT", "list", "ACME names", "Names to get a Let's Encrypt certificate for, renewed by itself.", "TLS", {}, "example.com, www.example.com"},
     {"--acme-email", "SPKT", "text", "ACME e-mail", "The address the CA writes to about the certificate.", "TLS", {}, "ops@example.com"},
 
     // ── limits ──────────────────────────────────────────────────────────────
-    {"--max-connections", "SPKTIBM", "int", "Max connections", "The most clients at once.", "Limits", {}, "10000", "--max-conn"},
+    {"--max-connections", "SPKTIBME", "int", "Max connections", "The most clients at once.", "Limits", {}, "10000", "--max-conn"},
     {"--rate-limit", "SPK", "int", "Rate limit", "Messages a second per connection.", "Limits", {}, "100"},
     {"--global-rate-limit", "SPK", "int", "Global rate limit", "Messages a second over all connections.", "Limits", {}, "10000"},
     {"--idle-timeout", "SPKT", "duration", "Idle timeout", "Close a connection quiet this long; none is closed for it unless this is given.", "Limits", {}, "5m"},
@@ -51,7 +52,7 @@ constexpr row rows[] = {
     {"--reconnect", "C", "int", "Reconnect", "Connect again, backing off, when the connection is lost: the most attempts, 0 for no end.", "Limits", {}, "0"},
 
     // ── output ──────────────────────────────────────────────────────────────
-    {"--log", "SCPKTDM", "path", "State log", "A file it appends each state change to.", "Output", {}, "/var/log/socketley/app.log"},
+    {"--log", "SCPKTDME", "path", "State log", "A file it appends each state change to.", "Output", {}, "/var/log/socketley/app.log"},
     {"-w", "SC", "path", "Message file", "A file every received message is written to.", "Output", {}, "/var/log/socketley/msgs"},
     {"-b", "SC", "switch", "Print messages", "Print every received message.", "Output"},
     {"-bp", "SC", "switch", "…with name", "Print them with the runtime's name before each.", "Output"},
@@ -177,6 +178,26 @@ constexpr row rows[] = {
     {"--retained-max", "M", "size", "Retained bytes", "The most bytes retained messages take; 64M unless given.", "MQTT limits", {}, "64M"},
     {"--max-sessions", "M", "int", "Max sessions", "The most sessions it keeps, connected or not; 100000 unless given.", "MQTT limits", {}, "100000"},
     {"--keepalive-max", "M", "int", "Max keep alive", "The longest keep alive a client is granted, in seconds; 1200 unless given.", "MQTT limits", {}, "1200"},
+
+    // ── mail ────────────────────────────────────────────────────────────────
+    {"--mail-domain", "E", "list", "Mail domains", "The domains whose mail it takes; the zones of --dns where none is given.", "Mail", {}, "example.com"},
+    {"--dns", "E", "text", "DNS runtime", "The dns runtime whose zones are its domains, given their MX, SPF, DKIM and DMARC records.", "Mail", {}, "ns"},
+    {"--hostname", "E", "text", "Host name", "The name it greets with and its MX records name; mail.<first domain> unless given.", "Mail", {}, "mail.example.com"},
+    {"--no-reply", "E", "switch", "No-reply sender", "Send as no-reply@<domain> where no sender is said, and take no mail to that address.", "Mail"},
+    {"--idp", "E", "text", "Identity provider", "The idp runtime whose users have mailboxes here and sign in to send.", "Mail", {}, "auth"},
+    {"--storage", "E", "text", "Mailboxes", "The storage runtime, and bucket, the mailboxes are kept in.", "Mail", {}, "files/mail"},
+    {"--users", "E", "path", "Users", "Accounts that sign in to send, user:hash a line as `socketley mqtt-passwd` writes them.", "Mail", {}, "/etc/socketley/mail.users"},
+    {"--aliases", "E", "path", "Aliases", "Addresses taken besides the users', `address target` a line.", "Mail", {}, "/etc/socketley/mail.aliases"},
+    {"--relay", "E", "text", "Smarthost", "Send all mail for elsewhere through this server, smtp[s]://[user:password@]host[:port].", "Mail", {}, "smtps://user:pw@smtp.example.net"},
+    {"--submission", "E", "int", "Submission port", "A port users send from with STARTTLS and a password.", "Mail ports", {}, "587"},
+    {"--submissions", "E", "int", "Submission over TLS", "A port users send from over TLS from the first byte.", "Mail ports", {}, "465"},
+    {"--imap", "E", "int", "IMAP port", "A port mail clients read the mailboxes on.", "Mail ports", {}, "143"},
+    {"--imaps", "E", "int", "IMAP over TLS", "A port mail clients read the mailboxes on over TLS.", "Mail ports", {}, "993"},
+    {"--notify-targets", "E", "path", "Event targets", "Where each message taken is told: webhooks and other runtimes, `name url` a line.", "Mail", {}, "/etc/socketley/mail.targets"},
+    {"--max-size", "E", "size", "Max message", "The largest message taken; 25M unless given.", "Mail limits", {}, "25M"},
+    {"--max-recipients", "E", "int", "Max recipients", "The most recipients of one message; 100 unless given.", "Mail limits", {}, "100"},
+    {"--queue-lifetime", "E", "duration", "Queue lifetime", "How long a message is tried before it is bounced; 5d unless given.", "Mail limits", {}, "5d"},
+    {"--dkim-selector", "E", "text", "DKIM selector", "The selector its DKIM key is published under; skl unless given.", "Mail", {}, "skl"},
 };
 
 }   // namespace
@@ -299,6 +320,20 @@ constexpr state_key_row state_keys[] = {
     {"--retained-max", "retained_max"},
     {"--max-sessions", "max_sessions"},
     {"--keepalive-max", "keepalive_max"},
+    {"--mail-domain", "mail_domain"},
+    {"--dns", "dns"},
+    {"--hostname", "hostname"},
+    {"--no-reply", "no_reply"},
+    {"--aliases", "aliases"},
+    {"--relay", "relay"},
+    {"--submission", "submission"},
+    {"--submissions", "submissions"},
+    {"--imap", "imap"},
+    {"--imaps", "imaps"},
+    {"--max-size", "max_size"},
+    {"--max-recipients", "max_recipients"},
+    {"--queue-lifetime", "queue_lifetime"},
+    {"--dkim-selector", "dkim_selector"},
 };
 
 // A flag one type keeps under another key than the rest: a cache's access mode, a db's cache size and leader.
@@ -339,6 +374,7 @@ bool offered(std::string_view flag, runtime_type type)
         case runtime_idp:     letter = 'I'; break;
         case runtime_db:      letter = 'B'; break;
         case runtime_mqtt:    letter = 'M'; break;
+        case runtime_mail:    letter = 'E'; break;
         default: return false;
     }
     for (const row& r : rows)
@@ -350,7 +386,7 @@ bool offered(std::string_view flag, runtime_type type)
 const std::string& json()
 {
     static const std::string out = [] {
-        std::string o = "{\"types\":[\"server\",\"client\",\"proxy\",\"cache\",\"storage\",\"dns\",\"sync\",\"idp\",\"db\",\"mqtt\"],\"flags\":[";
+        std::string o = "{\"types\":[\"server\",\"client\",\"proxy\",\"cache\",\"storage\",\"dns\",\"sync\",\"idp\",\"db\",\"mqtt\",\"mail\"],\"flags\":[";
         bool first = true;
         for (const row& r : rows)
         {
@@ -363,7 +399,7 @@ const std::string& json()
             for (char t : r.types)
             {
                 const char* name = t == 'S' ? "server" : t == 'C' ? "client" : t == 'P' ? "proxy" : t == 'K' ? "cache"
-                                 : t == 'T' ? "storage" : t == 'Y' ? "sync" : t == 'I' ? "idp" : t == 'B' ? "db" : t == 'M' ? "mqtt" : "dns";
+                                 : t == 'T' ? "storage" : t == 'Y' ? "sync" : t == 'I' ? "idp" : t == 'B' ? "db" : t == 'M' ? "mqtt" : t == 'E' ? "mail" : "dns";
                 o += f2 ? "" : ",";
                 f2 = false;
                 socketley::json::quote_into(o, name);

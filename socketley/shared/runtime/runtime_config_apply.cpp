@@ -13,6 +13,7 @@
 #include "../../runtime/idp/idp_instance.h"
 #include "../../runtime/db/db_instance.h"
 #include "../../runtime/mqtt/mqtt_instance.h"
+#include "../../runtime/mail/mail_instance.h"
 
 void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
                         bool by_presence)
@@ -183,6 +184,50 @@ void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presenc
         db.set_backup_every(cfg.db_backup_every);
     if (asked("backup_keep", true))
         db.set_backup_keep(cfg.db_backup_keep);
+}
+
+void apply_mail_config(mail_instance& ml, const runtime_config& cfg, bool by_presence)
+{
+    auto asked = [&](std::string_view key, bool nondefault) {
+        return by_presence ? cfg.has(key) : nondefault;
+    };
+    static const runtime_config defaults;
+    if (asked("submission", cfg.mail_submission != defaults.mail_submission))
+        ml.set_submission_port(cfg.mail_submission);
+    if (asked("submissions", cfg.mail_submissions != defaults.mail_submissions))
+        ml.set_submissions_port(cfg.mail_submissions);
+    if (asked("imap", cfg.mail_imap != defaults.mail_imap))
+        ml.set_imap_port(cfg.mail_imap);
+    if (asked("imaps", cfg.mail_imaps != defaults.mail_imaps))
+        ml.set_imaps_port(cfg.mail_imaps);
+    if (asked("dns", !cfg.mail_dns.empty()))
+        ml.set_dns(cfg.mail_dns);
+    if (asked("mail_domain", !cfg.mail_domains.empty()))
+        ml.set_mail_domains(cfg.mail_domains);
+    if (asked("hostname", !cfg.mail_hostname.empty()))
+        ml.set_hostname(cfg.mail_hostname);
+    if (asked("no_reply", cfg.mail_no_reply))
+        ml.set_no_reply(cfg.mail_no_reply);
+    if (asked("idp", !cfg.mail_idp.empty()))
+        ml.set_idp(cfg.mail_idp);
+    if (asked("storage", !cfg.mail_storage.empty()))
+        ml.set_storage(cfg.mail_storage);
+    if (asked("users", !cfg.mail_users.empty()))
+        ml.set_users(cfg.mail_users);
+    if (asked("relay", !cfg.mail_relay.empty()))
+        ml.set_relay(cfg.mail_relay);
+    if (asked("aliases", !cfg.mail_aliases.empty()))
+        ml.set_aliases(cfg.mail_aliases);
+    if (asked("notify_targets", !cfg.mail_notify.empty()))
+        ml.set_notify_targets(cfg.mail_notify);
+    if (asked("max_size", cfg.mail_max_size != defaults.mail_max_size))
+        ml.set_max_size(cfg.mail_max_size);
+    if (asked("max_recipients", cfg.mail_max_rcpt != defaults.mail_max_rcpt))
+        ml.set_max_recipients(cfg.mail_max_rcpt);
+    if (asked("queue_lifetime", cfg.mail_lifetime != defaults.mail_lifetime))
+        ml.set_queue_lifetime(cfg.mail_lifetime);
+    if (asked("dkim_selector", cfg.mail_selector != defaults.mail_selector))
+        ml.set_dkim_selector(cfg.mail_selector);
 }
 
 void apply_mqtt_config(mqtt_instance& mq, const runtime_config& cfg, bool by_presence)
@@ -459,6 +504,9 @@ bool apply_typed_config(runtime_instance& rt, const runtime_config& cfg, bool by
             break;
         case runtime_mqtt:
             apply_mqtt_config(static_cast<mqtt_instance&>(rt), cfg, by_presence);
+            break;
+        case runtime_mail:
+            apply_mail_config(static_cast<mail_instance&>(rt), cfg, by_presence);
             break;
     }
 

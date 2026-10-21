@@ -182,6 +182,8 @@ inline constexpr setting table[] = {
      "a hosts file replication and tiering resolve names from"},
     {"SOCKETLEY_RESOLV_CONF", kind::text, audience::test, 0, 0, "/etc/resolv.conf",
      "the resolv.conf the resolver on the loop reads its nameservers from"},
+    {"SOCKETLEY_MAIL_MX_PORT", kind::number, audience::test, 1, 65535, "25",
+     "the port a mail runtime delivers to a domain's mail exchangers on"},
     {"SOCKETLEY_STORAGE_STOP_HOLD_MS", kind::number, audience::test, 0, 3000, "0",
      "milliseconds a shard's stop holds its directory, times its shard number"},
     {"SOCKETLEY_STORAGE_START_SPIN_MS", kind::number, audience::test, 0, 30000, "0",

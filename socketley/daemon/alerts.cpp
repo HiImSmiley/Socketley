@@ -322,7 +322,8 @@ void monitor::post(const alert& a, bool raised, int64_t now)
         std::replace_if(sub.begin(), sub.end(), [](char c) { return c == '+' || c == '#'; }, '_');
         m_event(std::move(sub), raised ? alert_json(a) : std::string());
     }
-    if (m_webhook.empty() || !m_send)
+    // Sent wherever the daemon was told to send alerts, a webhook, a mail runtime or both.
+    if (!m_send)
         return;
     std::string text = !raised ? "\xe2\x9c\x85 " : a.level == "critical" ? "\xf0\x9f\x94\xb4 " : "\xe2\x9a\xa0\xef\xb8\x8f ";
     if (!m_host.empty())

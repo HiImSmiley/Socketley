@@ -683,6 +683,8 @@ int cli_dispatch(int argc, char** argv)
             return cli_mqtt_pub(argc, argv);
         case fnv1a("mqtt-sub"):
             return cli_mqtt_sub(argc, argv);
+        case fnv1a("mail"):
+            return cli_mail(argc, argv);
         case fnv1a("mqtt-sessions"):
         case fnv1a("mqtt-kick"):
         case fnv1a("mqtt-retained"):
@@ -948,6 +950,10 @@ int cli_send(int argc, char** argv)
         std::cerr << "       echo 'msg' | socketley send <name>\n";
         return 1;
     }
+
+    // A recipient said with --to makes it a message for a mail runtime, written there.
+    if (argc >= 4 && std::string_view(argv[3]).starts_with("-"))
+        return cli_mail_send(argc, argv);
 
     std::string name = argv[2];
     std::string message;

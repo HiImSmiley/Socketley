@@ -16,6 +16,7 @@ class sync_instance;
 class idp_instance;
 class db_instance;
 class mqtt_instance;
+class mail_instance;
 class runtime_instance;
 struct runtime_config;
 
@@ -54,6 +55,7 @@ void apply_sync_config(sync_instance& sy, const runtime_config& cfg, bool by_pre
 void apply_idp_config(idp_instance& ip, const runtime_config& cfg, bool by_presence = false);
 void apply_db_config(db_instance& db, const runtime_config& cfg, bool by_presence = false);
 void apply_mqtt_config(mqtt_instance& mq, const runtime_config& cfg, bool by_presence = false);
+void apply_mail_config(mail_instance& ml, const runtime_config& cfg, bool by_presence = false);
 
 // The fields every type has; not the ring settings, and not --lua, whose
 // failure to load means different things to a daemon and to a worker.

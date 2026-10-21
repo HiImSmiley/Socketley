@@ -14,6 +14,7 @@
 #include "../../runtime/idp/idp_instance.h"
 #include "../../runtime/db/db_instance.h"
 #include "../../runtime/mqtt/mqtt_instance.h"
+#include "../../runtime/mail/mail_instance.h"
 #include "../../cli/command_hashing.h"
 #include "../runtime/type_registry.h"
 
@@ -744,6 +745,29 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.persistent_interval = mq->get_persist_interval();
             break;
         }
+        case runtime_mail:
+        {
+            auto* ml = static_cast<const mail_instance*>(instance);
+            cfg.mail_submission = ml->get_submission_port();
+            cfg.mail_submissions = ml->get_submissions_port();
+            cfg.mail_imap = ml->get_imap_port();
+            cfg.mail_imaps = ml->get_imaps_port();
+            cfg.mail_dns = std::string(ml->get_dns());
+            cfg.mail_domains = std::string(ml->get_mail_domains());
+            cfg.mail_hostname = std::string(ml->get_hostname());
+            cfg.mail_no_reply = ml->get_no_reply();
+            cfg.mail_idp = std::string(ml->get_idp());
+            cfg.mail_storage = std::string(ml->get_storage());
+            cfg.mail_users = std::string(ml->get_users());
+            cfg.mail_relay = std::string(ml->get_relay());
+            cfg.mail_aliases = std::string(ml->get_aliases());
+            cfg.mail_notify = std::string(ml->get_notify_targets());
+            cfg.mail_max_size = ml->get_max_size();
+            cfg.mail_max_rcpt = ml->get_max_recipients();
+            cfg.mail_lifetime = ml->get_queue_lifetime();
+            cfg.mail_selector = std::string(ml->get_dkim_selector());
+            break;
+        }
         case runtime_storage:
         {
             auto* stg = static_cast<const storage_instance*>(instance);
@@ -1162,6 +1186,40 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_str_field("persistent_path", cfg.persistent_path);
             append_int_field("persistent_interval", cfg.persistent_interval);
             break;
+        case runtime_mail:
+            if (cfg.mail_submission)
+                append_int_field("submission", cfg.mail_submission);
+            if (cfg.mail_submissions)
+                append_int_field("submissions", cfg.mail_submissions);
+            if (cfg.mail_imap)
+                append_int_field("imap", cfg.mail_imap);
+            if (cfg.mail_imaps)
+                append_int_field("imaps", cfg.mail_imaps);
+            if (!cfg.mail_dns.empty())
+                append_str_field("dns", cfg.mail_dns);
+            if (!cfg.mail_domains.empty())
+                append_str_field("mail_domain", cfg.mail_domains);
+            if (!cfg.mail_hostname.empty())
+                append_str_field("hostname", cfg.mail_hostname);
+            if (cfg.mail_no_reply)
+                append_bool_field("no_reply", true);
+            if (!cfg.mail_idp.empty())
+                append_str_field("idp", cfg.mail_idp);
+            if (!cfg.mail_storage.empty())
+                append_str_field("storage", cfg.mail_storage);
+            if (!cfg.mail_users.empty())
+                append_str_field("users", cfg.mail_users);
+            if (!cfg.mail_relay.empty())
+                append_str_field("relay", cfg.mail_relay);
+            if (!cfg.mail_aliases.empty())
+                append_str_field("aliases", cfg.mail_aliases);
+            if (!cfg.mail_notify.empty())
+                append_str_field("notify_targets", cfg.mail_notify);
+            append_int_field("max_size", cfg.mail_max_size);
+            append_int_field("max_recipients", cfg.mail_max_rcpt);
+            append_int_field("queue_lifetime", cfg.mail_lifetime);
+            append_str_field("dkim_selector", cfg.mail_selector);
+            break;
     }
 
     // A registered type's fields as one nested object, absent when there are
@@ -1404,6 +1462,27 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.mqtt_keepalive_max = static_cast<uint16_t>(json_get_uint32(json, "keepalive_max", 1200));
             cfg.persistent_path = json_get_string(json, "persistent_path");
             cfg.persistent_interval = json_get_uint32(json, "persistent_interval", 1);
+            break;
+        case runtime_mail:
+            cfg.mail_submission = static_cast<uint16_t>(json_get_uint32(json, "submission"));
+            cfg.mail_submissions = static_cast<uint16_t>(json_get_uint32(json, "submissions"));
+            cfg.mail_imap = static_cast<uint16_t>(json_get_uint32(json, "imap"));
+            cfg.mail_imaps = static_cast<uint16_t>(json_get_uint32(json, "imaps"));
+            cfg.mail_dns = json_get_string(json, "dns");
+            cfg.mail_domains = json_get_string(json, "mail_domain");
+            cfg.mail_hostname = json_get_string(json, "hostname");
+            cfg.mail_no_reply = json_get_bool(json, "no_reply");
+            cfg.mail_idp = json_get_string(json, "idp");
+            cfg.mail_storage = json_get_string(json, "storage");
+            cfg.mail_users = json_get_string(json, "users");
+            cfg.mail_relay = json_get_string(json, "relay");
+            cfg.mail_aliases = json_get_string(json, "aliases");
+            cfg.mail_notify = json_get_string(json, "notify_targets");
+            cfg.mail_max_size = json_get_size(json, "max_size", 25ull << 20);
+            cfg.mail_max_rcpt = json_get_uint32(json, "max_recipients", 100);
+            cfg.mail_lifetime = json_get_uint32(json, "queue_lifetime", 5 * 86400);
+            if (json_has_key(json, "dkim_selector"))
+                cfg.mail_selector = json_get_string(json, "dkim_selector");
             break;
     }
 
