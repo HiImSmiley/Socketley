@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-namespace socketley::storage
+namespace socketley
 {
 
 namespace
@@ -367,4 +367,4 @@ inflater::result inflater::run(std::string& out, size_t max_out)
     }
 }
 
-}   // namespace socketley::storage
+}   // namespace socketley

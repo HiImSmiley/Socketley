@@ -719,6 +719,33 @@ void mail_run::plain_in(conn& c, const char* p, size_t n)
 {
     if (!c.smtp && !c.imap && !c.sieve)
         return;
+    // Under COMPRESS what came is opened first, a bounded amount at a time.
+    if (c.zin)
+    {
+        c.zin->feed(reinterpret_cast<const uint8_t*>(p), n);
+        for (;;)
+        {
+            c.zopened.clear();
+            const auto r = c.zin->run(c.zopened, 1u << 20);
+            if (r == socketley::inflater::result::bad || r == socketley::inflater::result::done)
+            {
+                close_conn(c);
+                return;
+            }
+            if (!c.zopened.empty())
+            {
+                c.in_input = true;
+                c.imap->input(c.zopened);
+                c.in_input = false;
+                if (c.dead)
+                    return;
+            }
+            if (r == socketley::inflater::result::need_input)
+                break;
+        }
+        flush(c);
+        return;
+    }
     c.in_input = true;
     if (c.imap)
         c.imap->input(std::string_view(p, n));
@@ -737,6 +764,21 @@ void mail_run::out(conn& c, std::string_view bytes)
 {
     if (c.dead)
         return;
+    // Under COMPRESS, what a turn of the loop says goes out as one compressed block, at its flush.
+    if (c.zout)
+    {
+        c.zplain.append(bytes);
+        c.reflush = true;
+        return;
+    }
+    send_raw(c, bytes);
+    // Replies said while input is taken go in one write once all of it is, as pipelining wants them.
+    if (!c.in_input)
+        flush(c);
+}
+
+void mail_run::send_raw(conn& c, std::string_view bytes)
+{
     if (c.ssl && c.handshaken && !c.upgrading)
     {
         size_t off = 0;
@@ -752,9 +794,6 @@ void mail_run::out(conn& c, std::string_view bytes)
     }
     else
         queue_owned(c, bytes);
-    // Replies said while input is taken go in one write once all of it is, as pipelining wants them.
-    if (!c.in_input)
-        flush(c);
 }
 
 void mail_run::queue_owned(conn& c, std::string_view bytes)
@@ -790,6 +829,13 @@ void mail_run::queue_tls_out(conn& c)
 
 void mail_run::flush(conn& c)
 {
+    if (!c.dead && c.zout && !c.zplain.empty())
+    {
+        std::string z;
+        c.zout->compress(c.zplain, z);
+        c.zplain.clear();
+        send_raw(c, z);
+    }
     if (c.dead || c.wr_pending)
         return;
     if (c.sending_at >= c.sending.size())
@@ -1247,8 +1293,8 @@ void mail_run::conn::login(std::string user, std::string password, std::function
 
 void mail_run::conn::reply_shared(const std::shared_ptr<const std::string>& bytes, size_t off, size_t len)
 {
-    // TLS encrypts a copy anyway, and a slice is at most what 32 bits count.
-    if (dead || (ssl && handshaken && !upgrading) || len > UINT32_MAX || off > UINT32_MAX)
+    // TLS and COMPRESS make a copy anyway, and a slice is at most what 32 bits count.
+    if (dead || zout || (ssl && handshaken && !upgrading) || len > UINT32_MAX || off > UINT32_MAX)
     {
         reply(std::string_view(*bytes).substr(off, len));
         return;
@@ -1268,6 +1314,13 @@ void mail_run::conn::when_drained(std::function<void()> f)
         return;
     }
     drained = std::move(f);
+}
+
+bool mail_run::conn::start_compress()
+{
+    zout = std::make_unique<socketley::deflater>();
+    zin = std::make_unique<socketley::inflater>();
+    return true;
 }
 
 void mail_run::conn::acknowledge()

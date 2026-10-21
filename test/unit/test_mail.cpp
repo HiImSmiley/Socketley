@@ -23,6 +23,8 @@
 #include "runtime/mail/smtp_session.h"
 #include "shared/net/public_suffix.h"
 #include "shared/util/base64.h"
+#include "shared/util/deflate.h"
+#include "shared/util/inflate.h"
 
 using namespace socketley::mail;
 namespace dkim = socketley::mail::dkim;
@@ -1017,4 +1019,48 @@ TEST_CASE("SORT and THREAD: the base subject, the keys, and threads by subject a
     std::vector<io::entry> loop = {make(1, "Message-ID: <a@l>\r\nReferences: <b@l>"),
                                    make(2, "Message-ID: <b@l>\r\nReferences: <a@l>")};
     CHECK(io::references(loop).size() > 2);
+}
+
+TEST_CASE("DEFLATE: what the compressor writes in pieces, each flushed, the inflater opens as it comes")
+{
+    socketley::deflater d;
+    socketley::inflater in;
+    std::string sent, got, wire;
+    std::string text;
+    for (int i = 0; i < 4000; ++i)
+        text += "* " + std::to_string(i) + " FETCH (UID " + std::to_string(i + 100) + " FLAGS (\\Seen))\r\n";
+    uint32_t x = 12345;
+    std::string noise(70000, '\0');
+    for (char& c : noise)
+    {
+        x = x * 1103515245u + 12345u;
+        c = static_cast<char>(x >> 24);
+    }
+    const std::string runs(100000, 'a');
+    // Many pieces, small and large, across the 32 KiB the history holds; each one opens fully on its own arrival.
+    for (const std::string* part : std::initializer_list<const std::string*>{&text, &noise, &runs, &text})
+        for (size_t at = 0; at < part->size();)
+        {
+            const size_t n = std::min<size_t>(part->size() - at, 1 + (at * 7919) % 20000);
+            const std::string piece = part->substr(at, n);
+            at += n;
+            std::string z;
+            d.compress(piece, z);
+            wire += z;
+            sent += piece;
+            in.feed(reinterpret_cast<const uint8_t*>(z.data()), z.size());
+            for (;;)
+            {
+                const auto r = in.run(got, 1u << 20);
+                if (r != socketley::inflater::result::output_full)
+                {
+                    CHECK(r == socketley::inflater::result::need_input);
+                    break;
+                }
+            }
+            REQUIRE(got.size() == sent.size());
+        }
+    CHECK(got == sent);
+    // Text compresses; noise grows by little.
+    CHECK(wire.size() < sent.size() - noise.size() / 2);
 }

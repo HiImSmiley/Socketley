@@ -50,6 +50,8 @@ public:
         virtual size_t backlog() const { return 0; }
         // `f` once what is said is written down to a little.
         virtual void when_drained(std::function<void()> f) { f(); }
+        // The OK to COMPRESS is out: what comes and goes after it is DEFLATE (RFC 4978); false where it cannot be.
+        virtual bool start_compress() { return false; }
     };
 
     imap_session(const imap_config& cfg, hooks& h, imap_store& store);
@@ -121,6 +123,7 @@ private:
     std::vector<uint32_t> m_view;
     uint64_t m_seen_version{0};
     // CONDSTORE and QRESYNC enabled (RFC 7162), and the mod-sequence of the last flags the session was told.
+    bool m_compressing{false};
     bool m_condstore{false};
     bool m_qresync{false};
     uint64_t m_told_modseq{0};

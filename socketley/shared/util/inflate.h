@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace socketley::storage
+namespace socketley
 {
 
 class inflater
@@ -65,4 +65,4 @@ private:
     uint64_t    m_produced{0};
 };
 
-}   // namespace socketley::storage
+}   // namespace socketley

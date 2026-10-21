@@ -6,7 +6,7 @@
 
 #include "body_reader.h"
 #include "checksum.h"
-#include "inflate.h"
+#include "../../shared/util/inflate.h"
 #include "sse.h"
 #include "tierer.h"
 #include "../../shared/util/logging.h"

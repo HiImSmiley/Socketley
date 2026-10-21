@@ -9,9 +9,9 @@
 
 #include <dlfcn.h>
 
-#include "runtime/storage/inflate.h"
+#include "shared/util/inflate.h"
 
-using namespace socketley::storage;
+using socketley::inflater;
 
 namespace
 {

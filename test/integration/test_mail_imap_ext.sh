@@ -67,6 +67,9 @@ for _ in $(seq 1 100); do [ "$(curl -s "http://127.0.0.1:$PS/mail?list-type=2&pr
 
 python3 - "$IM" "$P" > "$T/ext.out" 2>&1 <<'PY'
 import re, smtplib, socket, sys, time
+def crashed(kind, value, tb):
+    print("bad the client ran to its end: " + repr(value))
+sys.excepthook = crashed
 port, smtp_port = int(sys.argv[1]), int(sys.argv[2])
 def say(name, cond, why=""):
     print(("ok " if cond else "bad ") + name + ("" if cond else ": " + str(why)[:600]))
@@ -157,6 +160,47 @@ time.sleep(2.5)
 a.cmd("NOOP")
 r = a.cmd("SEARCH SUBJECT \"too big\"")
 say("and a delivery past it is not kept", r[0] == "* SEARCH", r)
+PY
+# COMPRESS=DEFLATE: what one session reads compressed is what another reads in the clear.
+python3 - "$IM" >> "$T/ext.out" 2>&1 <<'PY'
+import socket, sys, zlib
+port = int(sys.argv[1])
+def say(name, cond, why=""):
+    print(("ok " if cond else "bad ") + name + ("" if cond else ": " + str(why)[:400]))
+def session(compress):
+    s = socket.create_connection(("127.0.0.1", port), timeout=10); f = s.makefile("rb"); f.readline()
+    s.sendall(b"a LOGIN alice alicepassword1\r\n")
+    while not f.readline().startswith(b"a "): pass
+    if not compress:
+        s.sendall(b"b SELECT INBOX\r\nc FETCH 1:* (BODY.PEEK[])\r\nd LOGOUT\r\n")
+        data = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk: break
+            data += chunk
+        return data, 0, None
+    s.sendall(b"z COMPRESS DEFLATE\r\n")
+    ok = f.readline()
+    co = zlib.compressobj(wbits=-15); do = zlib.decompressobj(-15)
+    def send(b): s.sendall(co.compress(b) + co.flush(zlib.Z_SYNC_FLUSH))
+    send(b"b SELECT INBOX\r\nc FETCH 1:* (BODY.PEEK[])\r\ny COMPRESS DEFLATE\r\nd LOGOUT\r\n")
+    data, wire = b"", 0
+    while True:
+        chunk = s.recv(65536)
+        if not chunk: break
+        wire += len(chunk); data += do.decompress(chunk)
+    return data, wire, ok
+try:
+    plain, _, _ = session(False)
+    got, wire, ok = session(True)
+except Exception as e:
+    say("the COMPRESS client ran", False, repr(e)); sys.exit(0)
+say("COMPRESS DEFLATE is answered in the clear, then speaks DEFLATE", ok.startswith(b"z OK"), ok)
+strip = lambda d: [l for l in d.split(b"\r\n") if not l.startswith(b"* OK [HIGHESTMODSEQ") and not l.startswith(b"y ")]
+say("and what comes compressed is what comes in the clear", strip(got) == strip(plain) and b"c OK" in got,
+    (len(got), len(plain)))
+say("smaller on the wire", 0 < wire < len(plain), (wire, len(plain)))
+say("a second COMPRESS is refused", b"y NO [COMPRESSIONACTIVE]" in got, got[-300:])
 PY
 while read -r verdict name; do
     case "$verdict" in ok) ok "$name" ;; bad) bad "${name%%:*}" "${name#*:}" ;; esac

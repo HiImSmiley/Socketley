@@ -21,6 +21,8 @@
 #include "imap_session.h"
 #include "managesieve_session.h"
 #include "mail_dnsbl.h"
+#include "../../shared/util/deflate.h"
+#include "../../shared/util/inflate.h"
 #include "mail_sieve_store.h"
 #include "mail_spool.h"
 #include "smtp_session.h"
@@ -139,6 +141,11 @@ private:
         std::unique_ptr<smtp_session> smtp;
         std::unique_ptr<imap_session> imap;
         std::unique_ptr<managesieve_session> sieve;
+        // COMPRESS=DEFLATE: what goes out compressed as one block a loop turn, and what comes in opened.
+        std::unique_ptr<socketley::deflater> zout;
+        std::unique_ptr<socketley::inflater> zin;
+        std::string zplain;
+        std::string zopened;
         // The message being received, its spool writer and envelope.
         uint64_t writer{0};
         entry_ptr entry;
@@ -169,7 +176,8 @@ private:
         void login(std::string user, std::string password, std::function<void(bool, std::string)> done) override;
         void acknowledge() override;
         void reply_shared(const std::shared_ptr<const std::string>& bytes, size_t off, size_t len) override;
-        size_t backlog() const override { return owed; }
+        size_t backlog() const override { return owed + zplain.size(); }
+        bool start_compress() override;
         void when_drained(std::function<void()> f) override;
     };
     struct listener
@@ -195,6 +203,8 @@ private:
     void queue_shared(conn& c, const std::shared_ptr<const std::string>& bytes, size_t off, size_t len);
     void queue_tls_out(conn& c);
     void flush(conn& c);
+    // Bytes onto the connection as they are, encrypted where it speaks TLS: what out() does once compression is done.
+    void send_raw(conn& c, std::string_view bytes);
     void write_done(conn& c, int res);
     void close_soon(conn& c);
     void close_conn(conn& c);

@@ -301,7 +301,7 @@ static std::string capabilities(const imap_config& cfg)
 {
     std::string c = "IMAP4rev1 LITERAL+ SASL-IR IDLE NAMESPACE UIDPLUS MOVE UNSELECT CHILDREN SPECIAL-USE ID ENABLE "
                     "CONDSTORE QRESYNC ESEARCH LIST-EXTENDED LIST-STATUS STATUS=SIZE QUOTA QUOTA=RES-STORAGE SORT "
-                    "SORT=DISPLAY THREAD=ORDEREDSUBJECT THREAD=REFERENCES";
+                    "SORT=DISPLAY THREAD=ORDEREDSUBJECT THREAD=REFERENCES COMPRESS=DEFLATE";
     if (cfg.tls_offered && !cfg.tls_active)
         c += " STARTTLS";
     c += cfg.tls_active || cfg.login_in_clear ? " AUTH=PLAIN" : " LOGINDISABLED";
@@ -714,6 +714,18 @@ void imap_session::command(std::string tag, std::vector<token> a)
         finish(tag, "OK", "LOGOUT completed");
         m_state = state::logout;
         m_hooks.close();
+        return;
+    }
+    if (cmd == "COMPRESS")
+    {
+        if (!authed)
+            return finish(tag, "BAD", "Log in first");
+        if (m_compressing)
+            return finish(tag, "NO", "[COMPRESSIONACTIVE] DEFLATE is active already");
+        if (a.size() < 2 || upper(a[1].text) != "DEFLATE")
+            return finish(tag, "BAD", "COMPRESS takes DEFLATE");
+        finish(tag, "OK", "DEFLATE active");
+        m_compressing = m_hooks.start_compress();
         return;
     }
     if (cmd == "ID")

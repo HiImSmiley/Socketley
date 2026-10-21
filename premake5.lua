@@ -2399,7 +2399,7 @@ project "test_storage_inflate"
 
     links { "dl" }
 
-    files { "test/unit/test_storage_inflate.cpp", "socketley/runtime/storage/inflate.cpp" }
+    files { "test/unit/test_storage_inflate.cpp", "socketley/shared/util/inflate.cpp" }
 
     filter "configurations:Debug"
         defines { "DEBUG" }
@@ -2886,7 +2886,8 @@ project "test_mail"
             "test/unit/test_mail_sieve.cpp", "socketley/runtime/mail/mail_sieve.cpp",
             "socketley/shared/util/base64.cpp", "socketley/runtime/mail/mail_tls_policy.cpp",
             "socketley/shared/net/public_suffix.cpp", "socketley/runtime/mail/mail_sieve_store.cpp",
-            "socketley/runtime/mail/managesieve_session.cpp", "socketley/runtime/mail/imap_order.cpp" }
+            "socketley/runtime/mail/managesieve_session.cpp", "socketley/runtime/mail/imap_order.cpp",
+            "socketley/shared/util/deflate.cpp", "socketley/shared/util/inflate.cpp" }
     links(tls_libs())
 
     filter "configurations:Debug"
