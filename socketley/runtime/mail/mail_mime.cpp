@@ -419,9 +419,11 @@ std::string structure(const part& p, std::string_view message, bool extended)
     return out + ")";
 }
 
-bool section(std::string_view message, const part& root, std::string_view spec, std::string& out)
+bool section_of(std::string_view message, const part& root, std::string_view spec, std::string_view& got,
+                std::string& built)
 {
-    out.clear();
+    got = {};
+    built.clear();
     // The part numbers first, then what of the part is asked.
     const part* node = &root;
     bool numbered = false;
@@ -461,17 +463,17 @@ bool section(std::string_view message, const part& root, std::string_view spec, 
     {
         if (!numbered)
         {
-            out.assign(message);
+            got = message;
             return true;
         }
-        out.assign(message.substr(node->body_off, node->body_len));
+        got = message.substr(node->body_off, node->body_len);
         return true;
     }
     if (text == "MIME")
     {
         if (!numbered)
             return false;
-        out.assign(message.substr(node->header_off, node->header_len));
+        got = message.substr(node->header_off, node->header_len);
         return true;
     }
     if (!msg)
@@ -479,12 +481,12 @@ bool section(std::string_view message, const part& root, std::string_view spec, 
     const std::string_view head = message.substr(msg->header_off, msg->header_len);
     if (text == "HEADER")
     {
-        out.assign(head);
+        got = head;
         return true;
     }
     if (text == "TEXT")
     {
-        out.assign(message.substr(msg->body_off, msg->body_len));
+        got = message.substr(msg->body_off, msg->body_len);
         return true;
     }
     const bool fields = text.starts_with("HEADER.FIELDS ") || text.starts_with("HEADER.FIELDS(");
@@ -509,12 +511,27 @@ bool section(std::string_view message, const part& root, std::string_view spec, 
     }
     for (const auto& [name, value] : split_headers(head))
     {
-        const bool listed = std::find(names.begin(), names.end(), upper(trim(name))) != names.end();
+        const std::string_view n = trim(name);
+        const bool listed = std::any_of(names.begin(), names.end(),
+                                        [n](const std::string& w) { return socketley::ascii::iequals(n, w); });
         if (listed == fields)
-            out.append(name.data(), name.size()).append(":").append(value.data(), value.size()).append("\r\n");
+            built.append(name.data(), name.size()).append(":").append(value.data(), value.size()).append("\r\n");
     }
-    out += "\r\n";
+    built += "\r\n";
+    got = built;
     return true;
+}
+
+bool section(std::string_view message, const part& root, std::string_view spec, std::string& out)
+{
+    std::string_view got;
+    std::string built;
+    const bool ok = section_of(message, root, spec, got, built);
+    if (got.data() == built.data())
+        out = std::move(built);
+    else
+        out.assign(got);
+    return ok;
 }
 
 }   // namespace socketley::mail::mime

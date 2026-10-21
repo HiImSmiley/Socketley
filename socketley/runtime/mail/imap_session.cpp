@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <ctime>
 #include <map>
 
@@ -32,12 +33,25 @@ bool iequal(std::string_view a, std::string_view b)
 
 std::string internal_date(int64_t ms)
 {
+    static constexpr char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
     const time_t t = static_cast<time_t>(ms / 1000);
     struct tm tm{};
     ::gmtime_r(&t, &tm);
-    char buf[64];
-    std::strftime(buf, sizeof buf, "%d-%b-%Y %H:%M:%S +0000", &tm);
-    return "\"" + std::string(buf) + "\"";
+    // Written by hand rather than by strftime, since a header listing writes one for every message.
+    char b[29] = "\"00-Jan-0000 00:00:00 +0000\"";
+    const auto two = [&b](int at, int v) {
+        b[at] = static_cast<char>('0' + v / 10 % 10);
+        b[at + 1] = static_cast<char>('0' + v % 10);
+    };
+    two(1, tm.tm_mday);
+    std::memcpy(b + 4, months + 3 * std::clamp(tm.tm_mon, 0, 11), 3);
+    const int year = std::clamp(tm.tm_year + 1900, 0, 9999);
+    two(8, year / 100);
+    two(10, year % 100);
+    two(13, tm.tm_hour);
+    two(16, tm.tm_min);
+    two(19, tm.tm_sec);
+    return std::string(b, 28);
 }
 
 // A SEARCH date, 1-Feb-1994, as days since 1970; -1 for none.
@@ -1066,25 +1080,34 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
             std::shared_ptr<const mime::part> part;
             if (j->needs_body && j->bytes && !j->bytes->empty())
                 part = m_store.structure(m->key, j->bytes);
-            std::string out;
+            // The line is said in pieces, a body the store holds going out as it is held, not copied into it.
+            std::string out = "* " + std::to_string(i + 1) + " FETCH (";
+            bool first = true;
+            const auto next = [&] {
+                if (!first)
+                    out += ' ';
+                first = false;
+            };
             bool seen_now = false;
             for (const auto& it : j->items)
             {
-                std::string v;
-                if (it.name == "UID")
-                    v = std::to_string(m->uid);
-                else if (it.name == "FLAGS")
+                if (it.name == "FLAGS")
                     continue;
+                next();
+                out += it.answer;
+                out += ' ';
+                if (it.name == "UID")
+                    out += std::to_string(m->uid);
                 else if (it.name == "INTERNALDATE")
-                    v = internal_date(m->date_ms);
+                    out += internal_date(m->date_ms);
                 else if (it.name == "RFC822.SIZE")
-                    v = std::to_string(j->bytes && !j->bytes->empty() ? j->bytes->size() : m->size);
+                    out += std::to_string(j->bytes && !j->bytes->empty() ? j->bytes->size() : m->size);
                 else if (!part)
-                    v = it.name == "ENVELOPE" ? "(NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)" : mime::imap_string("", false);
+                    out += it.name == "ENVELOPE" ? "(NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)" : mime::imap_string("", false);
                 else if (it.name == "ENVELOPE")
-                    v = mime::envelope(std::string_view(*j->bytes).substr(0, part->header_len));
+                    out += mime::envelope(std::string_view(*j->bytes).substr(0, part->header_len));
                 else if (it.name == "BODYSTRUCTURE" || it.name == "BODY")
-                    v = mime::structure(*part, *j->bytes, it.name == "BODYSTRUCTURE");
+                    out += mime::structure(*part, *j->bytes, it.name == "BODYSTRUCTURE");
                 else
                 {
                     std::string spec = it.section;
@@ -1092,16 +1115,26 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                         spec = "HEADER";
                     else if (it.name == "RFC822.TEXT")
                         spec = "TEXT";
-                    std::string bytes;
-                    if (!mime::section(*j->bytes, *part, spec, bytes))
-                        bytes.clear();
+                    std::string_view got;
+                    std::string built;
+                    if (!mime::section_of(*j->bytes, *part, spec, got, built))
+                        got = {};
                     if (it.partial)
-                        bytes = it.from >= bytes.size() ? std::string() : bytes.substr(it.from, it.count);
-                    v = "{" + std::to_string(bytes.size()) + "}\r\n" + bytes;
+                        got = it.from >= got.size() ? std::string_view() : got.substr(it.from, it.count);
+                    out += "{" + std::to_string(got.size()) + "}\r\n";
+                    const std::string_view held(*j->bytes);
+                    if (got.size() >= shared_from && got.data() >= held.data() &&
+                        got.data() + got.size() <= held.data() + held.size())
+                    {
+                        m_hooks.reply(out);
+                        out.clear();
+                        m_hooks.reply_shared(j->bytes, static_cast<size_t>(got.data() - held.data()), got.size());
+                    }
+                    else
+                        out.append(got);
                     if (!it.peek && it.name != "RFC822.HEADER")
                         seen_now = true;
                 }
-                out += (out.empty() ? "" : " ") + it.answer + " " + v;
             }
             if (seen_now && !m_readonly && !(m->flags & flag_seen))
             {
@@ -1111,10 +1144,30 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
             const bool flags = std::any_of(j->items.begin(), j->items.end(),
                                            [](const item& it) { return it.name == "FLAGS"; });
             if (flags || seen_now)
-                out += (out.empty() ? "" : " ") + std::string("FLAGS ") + flags_text(m->flags, false);
-            untagged(std::to_string(i + 1) + " FETCH (" + out + ")");
+            {
+                next();
+                out += "FLAGS " + flags_text(m->flags, false);
+            }
+            out += ")\r\n";
+            m_hooks.reply(out);
             j->bytes.reset();
             ++j->at;
+            if (j->at < j->idx.size() && m_hooks.backlog() > max_backlog)
+            {
+                j->waiting = true;
+                m_hooks.when_drained([j, self, alive] {
+                    if (!*alive)
+                        return;
+                    j->waiting = false;
+                    if (!j->looping)
+                        (*self)();
+                });
+                if (j->waiting)
+                {
+                    j->looping = false;
+                    return;
+                }
+            }
         }
         j->looping = false;
         finish(tag, "OK", uid ? "UID FETCH completed" : "FETCH completed");

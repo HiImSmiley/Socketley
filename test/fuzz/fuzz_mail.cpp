@@ -6,8 +6,9 @@
 //   0  bytes an SMTP client sends, in pieces cut where a 0xFF byte stands, to a session whose questions are answered
 //      at once or later as the next byte says.  Every reply is whole lines of a three-digit code, and a message
 //      taken holds no bare LF.
-//   1  a message, parsed as IMAP reads it: every part lies inside it, every section asked of it is a slice of it or
-//      a header block made of its lines, and every literal ENVELOPE and BODYSTRUCTURE write says its own length.
+//   1  a message, parsed as IMAP reads it: every part lies inside it, every section asked of it is a slice
+//      pointing into it or a header block made of its lines, and every literal ENVELOPE and BODYSTRUCTURE write
+//      says its own length.
 //   2  a message whose DKIM signatures are read and checked against a fixed key; the relaxed canonicalizations
 //      give the same text twice over.
 //   3  address lists, paths and an aliases file.
@@ -160,10 +161,17 @@ void mime_case(std::string_view msg)
                                             "2.HEADER", "HEADER.FIELDS (FROM SUBJECT)", "HEADER.FIELDS.NOT (TO)"};
     for (const char* spec : specs)
     {
-        std::string out;
-        if (mime::section(msg, root, spec, out) && std::string_view(spec).find("FIELDS") == std::string_view::npos)
-            FUZZ_CHECK(out.size() <= msg.size() && msg.find(out) != std::string_view::npos,
+        std::string_view got;
+        std::string built;
+        if (!mime::section_of(msg, root, spec, got, built))
+            continue;
+        if (std::string_view(spec).find("FIELDS") == std::string_view::npos)
+            FUZZ_CHECK(got.data() >= msg.data() && got.data() + got.size() <= msg.data() + msg.size(),
                        "a section that is not a slice of the message");
+        else
+            FUZZ_CHECK(got.data() == built.data() && got.size() == built.size(), "a header list not the one built");
+        std::string out;
+        FUZZ_CHECK(mime::section(msg, root, spec, out) && out == got, "section and section_of disagree");
     }
     const std::string bs = mime::structure(root, msg, true);
     check_literals(bs);

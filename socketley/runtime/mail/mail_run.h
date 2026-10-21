@@ -138,6 +138,8 @@ private:
         entry_ptr entry;
         // Bytes said in reply while input is being taken, written once it has all been.
         bool in_input{false};
+        // What waits for the writes to come down to drained_at.
+        std::function<void()> drained;
         // An idp user signed in, and the address the account names, which with its username are what it sends as.
         bool idp_user{false};
         std::string user_email;
@@ -155,6 +157,9 @@ private:
         void close() override;
         void login(std::string user, std::string password, std::function<void(bool, std::string)> done) override;
         void acknowledge() override;
+        void reply_shared(const std::shared_ptr<const std::string>& bytes, size_t off, size_t len) override;
+        size_t backlog() const override { return owed; }
+        void when_drained(std::function<void()> f) override;
     };
     struct listener
     {
@@ -176,6 +181,7 @@ private:
     void plain_in(conn& c, const char* p, size_t n);
     void out(conn& c, std::string_view bytes);
     void queue_owned(conn& c, std::string_view bytes);
+    void queue_shared(conn& c, const std::shared_ptr<const std::string>& bytes, size_t off, size_t len);
     void queue_tls_out(conn& c);
     void flush(conn& c);
     void write_done(conn& c, int res);

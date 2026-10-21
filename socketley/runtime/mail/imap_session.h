@@ -40,6 +40,15 @@ public:
         virtual void login(std::string user, std::string password, std::function<void(bool, std::string)> done) = 0;
         // What came acknowledged at once, for a client whose Nagle holds back a literal's line end until it is.
         virtual void acknowledge() {}
+        // A stretch of `bytes` said without copying it, for a body the store holds.
+        virtual void reply_shared(const std::shared_ptr<const std::string>& bytes, size_t off, size_t len)
+        {
+            reply(std::string_view(*bytes).substr(off, len));
+        }
+        // How much said is not yet written.
+        virtual size_t backlog() const { return 0; }
+        // `f` once what is said is written down to a little.
+        virtual void when_drained(std::function<void()> f) { f(); }
     };
 
     imap_session(const imap_config& cfg, hooks& h, imap_store& store);
@@ -57,6 +66,10 @@ public:
     const std::string& user() const { return m_user; }
 
     static constexpr size_t max_line = 65536;
+    // A FETCH waits for its client past this much unwritten, so a mailbox is not read into memory faster than it goes.
+    static constexpr size_t max_backlog = 1u << 20;
+    // A body this long goes out as the store holds it; a shorter one is copied into the line around it.
+    static constexpr size_t shared_from = 4096;
 
 private:
     struct token

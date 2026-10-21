@@ -231,6 +231,50 @@ PY
 [ -n "$acked" ] && awk -v t="$acked" 'BEGIN{exit !(t < 20)}' && ok "a literal is acknowledged at once, not after the delayed-ACK timer (${acked} ms)" \
     || bad "a literal is acknowledged at once" "median ${acked:-?} ms to the ACK"
 
+# A FETCH of more than the socket holds, to a client that does not read: the runtime reads from the storage only as
+# fast as the client takes it, not the whole folder into memory at once.
+timeout 60 python3 - "$IM" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1]))); f = s.makefile("rb"); f.readline()
+def cmd(line, data=b""):
+    s.sendall(line + data)
+    tag = line.split(b" ")[0]
+    while True:
+        l = f.readline()
+        if l.startswith(tag + b" "):
+            assert b" OK" in l, l
+            return
+cmd(b"a LOGIN bob bobpassword12\r\n")
+cmd(b"c CREATE Big\r\n")
+for i in range(24):
+    body = b"From: bob@example.test\r\nSubject: big %d\r\n\r\n" % i + (b"%07d" % i + b"x" * 1015 + b"\r\n") * 1024
+    cmd(b"p%d APPEND Big {%d+}\r\n" % (i, len(body)), body + b"\r\n")
+PY
+"$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$IM" >/dev/null
+read -r held whole < <(timeout 60 python3 - "$IM" "$BIN" <<'PY'
+import socket, subprocess, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1]))); f = s.makefile("rb"); f.readline()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 16)
+s.sendall(b"a LOGIN bob bobpassword12\r\nb SELECT Big\r\n")
+while not f.readline().startswith(b"b "): pass
+s.sendall(b"f UID FETCH 1:* (BODY.PEEK[])\r\n")
+time.sleep(2)
+st = subprocess.run([sys.argv[2], "stats", "m"], capture_output=True, text=True).stdout
+held = next((l.split(":")[1].strip() for l in st.splitlines() if l.startswith("imap_reads:")), "?")
+got = 0
+while True:
+    l = f.readline()
+    got += len(l)
+    if l.startswith(b"f "):
+        break
+print(held, got)
+PY
+)
+[ -n "$held" ] && [ "$held" != "?" ] && [ "$held" -lt 20 ] && ok "a FETCH to a client that does not read waits for it ($held of 24 read)" \
+    || bad "a FETCH to a client that does not read waits for it" "${held:-?} of 24 read from the storage"
+[ "${whole:-0}" -gt 24000000 ] && ok "and the whole folder comes once it does" || bad "and the whole folder comes once it does" "${whole:-0} bytes"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

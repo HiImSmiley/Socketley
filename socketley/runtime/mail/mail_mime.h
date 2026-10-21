@@ -40,5 +40,8 @@ std::string structure(const part& p, std::string_view message, bool extended);
 // The bytes of the section `spec` names ("", "1.2", "HEADER", "1.TEXT", "HEADER.FIELDS (FROM TO)", "2.MIME"); false
 // when the message has no such section.
 bool section(std::string_view message, const part& root, std::string_view spec, std::string& out);
+// The same, as `got`: a stretch of `message` where the section is one, else a view of `built`.
+bool section_of(std::string_view message, const part& root, std::string_view spec, std::string_view& got,
+                std::string& built);
 
 }   // namespace socketley::mail::mime

@@ -42,6 +42,10 @@ constexpr uint16_t ring_group = 7;
 constexpr uint32_t ring_bufs = 1024;
 constexpr uint32_t ring_buf_bytes = 4096;
 constexpr int64_t close_grace_ms = 5000;
+// An owned write chunk grows to this and no further.
+constexpr size_t chunk_max = 256u << 10;
+// A writer waiting on a slow client goes on once this little is left to write.
+constexpr size_t drained_at = 256u << 10;
 constexpr int64_t handshake_ms = 30000;
 // RFC 5321 4.5.3.2.7 has a server wait five minutes for the next command, RFC 3501 5.4 an IMAP one thirty.
 constexpr int64_t idle_ms = 300000;
@@ -706,7 +710,8 @@ void mail_run::queue_owned(conn& c, std::string_view bytes)
     if (bytes.empty())
         return;
     c.owed += bytes.size();
-    if (!c.queue.empty() && c.queue.back().owns())
+    // A long reply goes in pieces, so the queue never moves a buffer it has grown to the whole of it.
+    if (!c.queue.empty() && c.queue.back().owns() && c.queue.back().size() + bytes.size() <= chunk_max)
         c.queue.back().append(bytes);
     else
     {
@@ -714,6 +719,14 @@ void mail_run::queue_owned(conn& c, std::string_view bytes)
         b.assign(bytes);
         c.queue.emplace_back(std::move(b));
     }
+}
+
+void mail_run::queue_shared(conn& c, const std::shared_ptr<const std::string>& bytes, size_t off, size_t len)
+{
+    if (len == 0)
+        return;
+    c.owed += len;
+    c.queue.emplace_back(bytes, static_cast<uint32_t>(off), static_cast<uint32_t>(len));
 }
 
 void mail_run::queue_tls_out(conn& c)
@@ -802,6 +815,12 @@ void mail_run::write_done(conn& c, int res)
     }
     runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(res));
     flush(c);
+    if (c.drained && c.owed <= drained_at)
+    {
+        auto f = std::move(c.drained);
+        c.drained = nullptr;
+        f();
+    }
 }
 
 void mail_run::close_soon(conn& c)
@@ -1149,6 +1168,31 @@ void mail_run::conn::close()
 void mail_run::conn::login(std::string user, std::string password, std::function<void(bool, std::string)> done)
 {
     authenticate("IMAP", std::move(user), std::move(password), std::move(done));
+}
+
+void mail_run::conn::reply_shared(const std::shared_ptr<const std::string>& bytes, size_t off, size_t len)
+{
+    // TLS encrypts a copy anyway, and a slice is at most what 32 bits count.
+    if (dead || (ssl && handshaken && !upgrading) || len > UINT32_MAX || off > UINT32_MAX)
+    {
+        reply(std::string_view(*bytes).substr(off, len));
+        return;
+    }
+    run->queue_shared(*this, bytes, off, len);
+    if (!in_input)
+        run->flush(*this);
+}
+
+void mail_run::conn::when_drained(std::function<void()> f)
+{
+    run->flush(*this);
+    if (dead || owed <= drained_at)
+    {
+        if (!dead)
+            f();
+        return;
+    }
+    drained = std::move(f);
 }
 
 void mail_run::conn::acknowledge()
