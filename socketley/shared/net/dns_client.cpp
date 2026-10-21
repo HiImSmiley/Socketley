@@ -248,9 +248,9 @@ dns_client::state dns_client::ask(const std::string& host, int family, std::vect
         if (!absolute && dots < m_cfg.ndots)
             j.names.push_back(n);
         if (family != AF_INET6)
-            j.qs.push_back(question{dns::type::A, 0, -1, false, false, {}});
+            j.qs.push_back(question{dns::type::A, 0, -1, false, false, {}, {}, false});
         if (family != AF_INET)
-            j.qs.push_back(question{dns::type::AAAA, 0, -1, false, false, {}});
+            j.qs.push_back(question{dns::type::AAAA, 0, -1, false, false, {}, {}, false});
         if (!send(j))
         {
             close_all(j);
@@ -300,15 +300,21 @@ bool dns_client::send(job& j)
         if (::connect(q.fd, reinterpret_cast<const sockaddr*>(&server.addr), server.len) != 0)
             return false;
         q.id = random_id();
-        uint8_t msg[dns::header_len + 260 + 4]{};
+        uint8_t msg[dns::header_len + 260 + 4 + 11]{};
         dns::wr16(msg, q.id);
         msg[2] = 0x01;   // recursion desired
         dns::wr16(msg + 4, 1);
+        // An OPT record, so an answer up to 1232 bytes comes whole over UDP rather than cut at 512 (RFC 6891).
+        dns::wr16(msg + 10, 1);
         std::memcpy(msg + dns::header_len, wire.data(), wire.size());
         size_t len = dns::header_len + wire.size();
         dns::wr16(msg + len, q.type);
         dns::wr16(msg + len + 2, dns::rclass::IN);
         len += 4;
+        msg[len] = 0;
+        dns::wr16(msg + len + 1, dns::type::OPT);
+        dns::wr16(msg + len + 3, dns::udp_payload);
+        len += 11;
         // One a full socket buffer kept is answered by the deadline as a lost one is.
         if (::send(q.fd, msg, len, MSG_DONTWAIT) < 0 && errno != EAGAIN) {}
         ++m_c.sent;
@@ -373,7 +379,7 @@ void dns_client::take(job& j, question& q, const uint8_t* msg, size_t len)
     const uint8_t rc = msg[3] & 0x0F;
     if (rc == dns::rcode::NXDOMAIN)
     {
-        q.done = q.none = true;
+        q.done = q.none = q.nxdomain = true;
         return;
     }
     if (rc != dns::rcode::NOERROR)
@@ -394,7 +400,29 @@ void dns_client::take(job& j, question& q, const uint8_t* msg, size_t len)
             break;
         // The chain of aliases is the server's to follow; what it ends in is every record of the type asked.
         endpoint e;
-        if (cls == dns::rclass::IN && type == q.type && type == dns::type::A && rdlen == 4)
+        if (cls == dns::rclass::IN && type == q.type && type == dns::type::MX && rdlen > 2)
+        {
+            uint8_t ex[dns::max_name];
+            size_t after = 0;
+            const size_t el = dns::read_name(msg, len, next + 12, ex, after);
+            if (el > 0)
+                q.records.push_back({dns::rd16(rd), dns::to_text(std::string_view(reinterpret_cast<char*>(ex), el))});
+        }
+        else if (cls == dns::rclass::IN && type == q.type && type == dns::type::TXT)
+        {
+            // Character strings, each a length and its bytes, one record's joined as SPF and DKIM read them.
+            std::string text;
+            for (size_t i = 0; i < rdlen;)
+            {
+                const size_t n = rd[i];
+                if (i + 1 + n > rdlen)
+                    break;
+                text.append(reinterpret_cast<const char*>(rd + i + 1), n);
+                i += 1 + n;
+            }
+            q.records.push_back({0, std::move(text)});
+        }
+        else if (cls == dns::rclass::IN && type == q.type && type == dns::type::A && rdlen == 4)
         {
             auto* v4 = reinterpret_cast<sockaddr_in*>(&e.addr);
             v4->sin_family = AF_INET;
@@ -414,7 +442,91 @@ void dns_client::take(job& j, question& q, const uint8_t* msg, size_t len)
     }
     q.addrs = std::move(got);
     q.done  = true;
-    q.none  = q.addrs.empty();
+    q.none  = q.addrs.empty() && q.records.empty();
+}
+
+dns_client::state dns_client::ask_records(const std::string& name, uint16_t type, std::vector<record>& out,
+                                          bool& no_domain)
+{
+    refresh();
+    no_domain = false;
+    const auto now = clock::now();
+    std::string n = lower_copy(name);
+    if (!n.empty() && n.back() == '.')
+        n.pop_back();
+    const std::string key = n + '\n' + std::to_string(type) + "\nr";
+    auto it = m_jobs.find(key);
+    if (it == m_jobs.end())
+    {
+        std::string wire;
+        if (m_cfg.servers.empty() || !to_wire(n, wire))
+        {
+            ++m_c.unsure;
+            return state::unsure;
+        }
+        job j;
+        j.names.push_back(n);
+        j.qs.push_back(question{type, 0, -1, false, false, {}, {}, false});
+        if (!send(j))
+        {
+            close_all(j);
+            ++m_c.unsure;
+            return state::unsure;
+        }
+        j.sent = now;
+        m_jobs.emplace(key, std::move(j));
+        return state::pending;
+    }
+    job& j = it->second;
+    if (!j.over)
+    {
+        pump_records(j);
+        if (!j.over)
+            return state::pending;
+    }
+    const state st = j.result;
+    if (st == state::ready)
+    {
+        out = std::move(j.qs.front().records);
+        no_domain = j.qs.front().nxdomain;
+        ++m_c.answered;
+    }
+    else
+        ++m_c.unsure;
+    close_all(j);
+    m_jobs.erase(it);
+    return st;
+}
+
+void dns_client::pump_records(job& j)
+{
+    uint8_t buf[dns::max_message < 4096 ? dns::max_message : 4096];
+    question& q = j.qs.front();
+    while (!q.done && !j.over && q.fd >= 0)
+    {
+        const ssize_t n = ::recv(q.fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (n <= 0)
+            break;
+        take(j, q, buf, static_cast<size_t>(n));
+    }
+    if (j.over)
+        return;
+    if (q.done)
+    {
+        // An answer with no record, or no such name, is as good an answer as one with some.
+        j.over = true;
+        j.result = state::ready;
+        return;
+    }
+    if (clock::now() - j.sent < m_cfg.timeout)
+        return;
+    ++m_c.timeouts;
+    ++j.server;
+    if (j.tries >= m_cfg.attempts * static_cast<int>(m_cfg.servers.size()) || !send(j))
+    {
+        j.over = true;
+        j.result = state::unsure;
+    }
 }
 
 void dns_client::settle(job& j)
@@ -432,7 +544,7 @@ void dns_client::settle(job& j)
     // No address under this candidate: the next, from the first server again.
     ++j.at;
     for (question& q : j.qs)
-        q = question{q.type, 0, q.fd, false, false, {}};
+        q = question{q.type, 0, q.fd, false, false, {}, {}, false};
     j.server = 0;
     j.tries  = 0;
     if (j.at >= j.names.size() || !send(j))

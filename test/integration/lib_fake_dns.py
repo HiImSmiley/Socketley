@@ -1,13 +1,16 @@
 # A nameserver for a test: lib_fake_dns.py <port> <delay_ms> <mode> name=ip ..., on FAKEDNS_ADDR (127.0.0.1 unless
-# given), answering A and AAAA for the names given and NXDOMAIN for the rest.  <mode> is normal, truncate (every
+# given), answering A and AAAA for the names given and NXDOMAIN for the rest; name=MX:<pref>:<host> and name=TXT:<text>
+# give a name those records.  <mode> is normal, truncate (every
 # answer cut short), silent (none) or servfail.  A test points the resolver on the loop at it with SOCKETLEY_RESOLV_CONF
 # and `options port:<port>`, which the system's resolver passes over.
 import socket, struct, sys, threading, time
 port, delay, mode = int(sys.argv[1]), float(sys.argv[2]) / 1000, sys.argv[3]
 table = {}
 for kv in sys.argv[4:]:
-    n, ip = kv.split("=")
+    n, ip = kv.split("=", 1)
     table.setdefault(n.lower().rstrip("."), []).append(ip)
+def wire(name):
+    return b"".join(bytes([len(l)]) + l.encode() for l in name.rstrip(".").split(".")) + b"\0"
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 import os
 s.bind((os.environ.get("FAKEDNS_ADDR", "127.0.0.1"), port))
@@ -22,7 +25,23 @@ def answer(m, peer):
     name, off = name_at(m, 12)
     qtype, qclass = struct.unpack(">HH", m[off:off + 4])
     q = m[12:off + 4]
-    ips = [ip for ip in table.get(name, []) if (":" in ip) == (qtype == 28)]
+    vals = table.get(name, [])
+    if qtype in (15, 16):
+        rrs = b""; n = 0
+        for v in vals:
+            if qtype == 15 and v.startswith("MX:"):
+                _, pref, host = v.split(":", 2)
+                rd = struct.pack(">H", int(pref)) + wire(host)
+            elif qtype == 16 and v.startswith("TXT:"):
+                t = v[4:].encode()
+                rd = b"".join(bytes([len(t[i:i + 255])]) + t[i:i + 255] for i in range(0, max(len(t), 1), 255))
+            else:
+                continue
+            rrs += b"\xc0\x0c" + struct.pack(">HHIH", qtype, 1, 60, len(rd)) + rd; n += 1
+        if name not in table:
+            s.sendto(struct.pack(">HHHHHH", qid, 0x8183, 1, 0, 0, 0) + q, peer); return
+        s.sendto(struct.pack(">HHHHHH", qid, 0x8180, 1, n, 0, 0) + q + rrs, peer); return
+    ips = [ip for ip in vals if not ip.startswith(("MX:", "TXT:")) and (":" in ip) == (qtype == 28)]
     if mode == "servfail":
         s.sendto(struct.pack(">HHHHHH", qid, 0x8182, 1, 0, 0, 0) + q, peer); return
     if name not in table:
