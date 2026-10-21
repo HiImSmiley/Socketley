@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <thread>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -65,7 +66,7 @@ bool loopback(const sockaddr_in& a)
 }   // namespace
 
 mail_run::mail_run(mail_instance& owner, event_loop& loop)
-    : m_owner(owner), m_loop(loop), m_fio(loop, this), m_pool(2), m_checks(4), m_spool(loop, m_fio),
+    : m_owner(owner), m_loop(loop), m_fio(loop, this), m_pool(1 + std::clamp(std::thread::hardware_concurrency() / 2, 1u, 4u)), m_checks(4), m_spool(loop, m_fio),
       m_alive(std::make_shared<bool>(true))
 {
 }
@@ -921,7 +922,7 @@ void mail_run::conn::authenticate(std::string_view, std::string user, std::strin
     {
         // scrypt costs tens of milliseconds, which the loop does not spend.
         auto matched = std::make_shared<bool>(false);
-        r.m_pool.submit(1, [h = *hash, pw = std::move(secret), matched] {
+        r.m_pool.submit(r.cpu_lane(), [h = *hash, pw = std::move(secret), matched] {
                             *matched = socketley::storage::password_matches(h, pw);
                         },
                         [matched, user, finish] { finish(*matched, user); });

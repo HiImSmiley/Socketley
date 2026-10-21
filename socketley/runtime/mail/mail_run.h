@@ -76,6 +76,8 @@ public:
     event_loop& loop() { return m_loop; }
     file_io& fio() { return m_fio; }
     hash_pool& pool() { return m_pool; }
+    // A lane for work that only computes, spread over every thread but the first, which waits on files and the network.
+    uint32_t cpu_lane() { return 1 + m_pool.next_lane() % (m_pool.threads() > 1 ? m_pool.threads() - 1 : 1); }
     spool& queue() { return m_spool; }
     const std::string& hostname() const { return m_hostname; }
     const std::vector<std::string>& domains() const { return m_domains; }

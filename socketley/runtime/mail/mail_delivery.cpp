@@ -715,7 +715,7 @@ void delivery::sign_read(const std::shared_ptr<sign_job>& j)
         return;
     }
     auto sig = std::make_shared<std::string>();
-    m_run.pool().submit(1, [j, sig, dom, sel = m_selector, key = m_key] {
+    m_run.pool().submit(m_run.cpu_lane(), [j, sig, dom, sel = m_selector, key = m_key] {
                             *sig = dkim::sign(j->data, dom, sel, key.get(), wall::now_ms() / 1000);
                         },
                         [this, id, sig, alive = m_alive] {
