@@ -28,8 +28,10 @@ inline constexpr uint8_t version = 2;
 // object_info whose key is the user and whose metadata holds name, email, admin, reset and the password's hash.
 // An object larger than max_value goes in pieces: put_begin with its size answers a stream in `next`, and put_more
 // hands each piece to it, the last answered with the object.  make_bucket makes a bucket, or finds it made.
+// get_range reads at most max_value bytes from `size` on, of an object stored as it came (not sealed, packed or
+// moved to a tier), however large the object is.
 enum class op : uint8_t { put = 1, get = 2, head = 3, del = 4, list = 5, users = 6, put_begin = 7, put_more = 8,
-                          make_bucket = 9 };
+                          make_bucket = 9, get_range = 10 };
 
 inline const char* op_name(op o)
 {
@@ -44,6 +46,7 @@ inline const char* op_name(op o)
         case op::put_begin: return "put_begin";
         case op::put_more: return "put_more";
         case op::make_bucket: return "make_bucket";
+        case op::get_range: return "get_range";
     }
     return "?";
 }
@@ -98,7 +101,7 @@ inline bool decode(std::string_view in, request& r)
 {
     socketley::bytes::reader rd(in);
     uint8_t v = 0, k = 0;
-    if (!rd.u8(v) || v != version || !rd.u8(k) || k < 1 || k > 9)
+    if (!rd.u8(v) || v != version || !rd.u8(k) || k < 1 || k > 10)
         return false;
     r.kind = static_cast<op>(k);
     uint32_t n = 0;
@@ -208,6 +211,7 @@ inline std::string encode(const reply& r, op kind)
         case op::make_bucket:
             break;
         case op::get:
+        case op::get_range:
             encode_info(w, r.info, true);
             w.bytes(r.data);
             break;
@@ -252,6 +256,7 @@ inline bool decode(std::string_view in, op kind, reply& r)
         case op::make_bucket:
             return true;
         case op::get:
+        case op::get_range:
             return decode_info(rd, r.info) && rd.bytes(r.data, max_value);
         case op::del:
             return true;

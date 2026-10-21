@@ -414,6 +414,67 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
             return true;
         }
 
+        case op::get_range:
+        {
+            ++m_c.gets;
+            auto state = std::make_shared<rpc_state>();
+            state->ticket = ticket;
+            m_rpc[ticket] = state;
+            const uint64_t off = rq.size;
+            const uint64_t len = std::min<uint64_t>(rq.max_keys, storage_rpc::max_value);
+            m_store.open_object(rq.bucket, rq.key, 4096, [this, state, answer, off, len](open_result o) {
+                if (state->done)
+                {
+                    if (o.fd >= 0)
+                        m_loop.close_fd(o.fd);
+                    return;
+                }
+                if (o.status != st::ok)
+                {
+                    state->done = true;
+                    answer(op::get_range, refusal_for(o.status));
+                    return;
+                }
+                if (is_encrypted(o.meta) || is_compressed(o.meta) || is_tiered(o.meta))
+                {
+                    state->done = true;
+                    m_loop.close_fd(o.fd);
+                    answer(op::get_range, refusal("InvalidRequest", "the object is not stored as it came; read it "
+                                                                    "whole with get, or over the S3 port"));
+                    return;
+                }
+                state->fd = o.fd;
+                state->meta = o.meta;
+                const uint64_t n = off >= o.meta.size ? 0 : std::min<uint64_t>(len, o.meta.size - off);
+                state->body.resize(static_cast<size_t>(n));
+                const auto done = [this, state, answer](bool ok) {
+                    if (state->done)
+                        return;
+                    state->done = true;
+                    m_loop.close_fd(state->fd);
+                    state->fd = -1;
+                    if (!ok)
+                    {
+                        answer(op::get_range, refusal_for(st::io_error));
+                        return;
+                    }
+                    storage_rpc::reply r;
+                    r.info = rpc_info_of(state->meta);
+                    r.data = std::move(state->body);
+                    answer(op::get_range, r);
+                };
+                if (n == 0)
+                {
+                    done(true);
+                    return;
+                }
+                if (!m_io.pread(state->fd, state->body.data(), static_cast<uint32_t>(n), o.data_off + off,
+                                [state, done, n](int64_t res) { done(res == static_cast<int64_t>(n)); }))
+                    done(false);
+            });
+            return true;
+        }
+
         case op::make_bucket:
         {
             m_rpc[ticket] = std::make_shared<rpc_state>();
