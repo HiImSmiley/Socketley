@@ -1,0 +1,102 @@
+#include "public_suffix.h"
+
+#include <vector>
+
+#include "../persist/read_file.h"
+#include "../util/ascii.h"
+
+namespace socketley::public_suffix
+{
+
+namespace
+{
+
+std::string lower(std::string_view s)
+{
+    std::string out(s);
+    socketley::ascii::lower_in_place(out);
+    while (!out.empty() && out.back() == '.')
+        out.pop_back();
+    return out;
+}
+
+}   // namespace
+
+void list::load(std::string_view text)
+{
+    while (!text.empty())
+    {
+        const size_t nl = text.find('\n');
+        std::string_view line = text.substr(0, nl);
+        text = nl == std::string_view::npos ? std::string_view{} : text.substr(nl + 1);
+        // A rule is the line up to its first white space; "//" begins a comment.
+        if (const size_t ws = line.find_first_of(" \t\r"); ws != std::string_view::npos)
+            line = line.substr(0, ws);
+        if (line.empty() || line.starts_with("//"))
+            continue;
+        if (line.starts_with("!"))
+            m_except.insert(lower(line.substr(1)));
+        else if (line.starts_with("*."))
+            m_wild.insert(lower(line.substr(2)));
+        else
+            m_rules.insert(lower(line));
+    }
+}
+
+std::string list::registrable(std::string_view name) const
+{
+    const std::string n = lower(name);
+    std::vector<size_t> starts;   // where each label begins, from the left
+    starts.push_back(0);
+    for (size_t i = 0; i < n.size(); ++i)
+        if (n[i] == '.')
+            starts.push_back(i + 1);
+    const size_t labels = starts.size();
+    // The suffix is the longest rule that matches, one label where none does, and an exception's rule less its
+    // first label wherever one matches (publicsuffix.org's algorithm).
+    size_t best = 1;
+    bool excepted = false;
+    for (size_t k = 1; k <= labels && !excepted; ++k)
+    {
+        const std::string_view s = std::string_view(n).substr(starts[labels - k]);
+        if (m_except.count(std::string(s)))
+        {
+            best = k - 1;
+            excepted = true;
+        }
+        else if (m_rules.count(std::string(s)))
+            best = k;
+        else if (k >= 2 && m_wild.count(std::string(std::string_view(n).substr(starts[labels - k + 1]))))
+            best = k;
+    }
+    if (best >= labels)
+        return n;
+    return n.substr(starts[labels - best - 1]);
+}
+
+const list& system_list()
+{
+    static const list l = [] {
+        list out;
+        std::string text;
+        if (socketley::read_file("/usr/share/publicsuffix/public_suffix_list.dat", text))
+            out.load(text);
+        return out;
+    }();
+    return l;
+}
+
+std::string registrable(std::string_view name)
+{
+    const list& l = system_list();
+    if (!l.empty())
+        return l.registrable(name);
+    const std::string n = lower(name);
+    const size_t last = n.rfind('.');
+    if (last == std::string::npos || last == 0)
+        return n;
+    const size_t before = n.rfind('.', last - 1);
+    return before == std::string::npos ? n : n.substr(before + 1);
+}
+
+}   // namespace socketley::public_suffix

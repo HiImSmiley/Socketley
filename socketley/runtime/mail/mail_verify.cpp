@@ -14,6 +14,7 @@
 #include "mail_compose.h"
 #include "mail_dkim.h"
 #include "../dns/dns_wire.h"
+#include "../../shared/net/public_suffix.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/settings.h"
 
@@ -484,11 +485,7 @@ std::unique_ptr<check_resolver> system_check_resolver()
 
 std::string organizational_domain(std::string_view domain)
 {
-    const size_t last = domain.rfind('.');
-    if (last == std::string_view::npos || last == 0)
-        return std::string(domain);
-    const size_t before = domain.rfind('.', last - 1);
-    return lower(before == std::string_view::npos ? domain : domain.substr(before + 1));
+    return socketley::public_suffix::registrable(domain);
 }
 
 std::string spf_check(const std::string& ip, const std::string& domain, const std::string& sender, check_resolver& r)

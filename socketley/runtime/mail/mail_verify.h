@@ -47,8 +47,7 @@ struct inbound_result
 inbound_result check_inbound(std::string_view message, const std::string& ip, const std::string& helo,
                              const std::string& mail_from, check_resolver& r, int64_t now_s);
 
-// The domain DMARC's relaxed alignment compares: the last two labels, which the Public Suffix List would correct for
-// a domain such as example.co.uk.
+// The domain DMARC's relaxed alignment compares, its registrable domain by the Public Suffix List.
 std::string organizational_domain(std::string_view domain);
 
 }   // namespace socketley::mail

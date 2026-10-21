@@ -12665,8 +12665,11 @@ mailbox's
 .B Authentication\-Results
 line, and one a sender put there under this host's name is taken out. The
 lookups run on a pool of their own and never on the loop. The organizational
-domain DMARC compares is the last two labels of a name, which the Public Suffix
-List would correct for a name such as example.co.uk.
+domain DMARC compares is a name's registrable domain by the Public Suffix List
+of the publicsuffix package
+.RB ( /usr/share/publicsuffix ),
+so mail.example.co.uk is example.co.uk; without the package, its last two
+labels.
 .PP
 .B The spool.
 A message is synced before the client is told 250, kept under

@@ -2881,7 +2881,8 @@ project "test_mail"
             "socketley/runtime/mail/mail_dkim.cpp", "socketley/runtime/mail/mail_aliases.cpp",
             "socketley/runtime/mail/mail_verify.cpp", "socketley/runtime/dns/dns_wire.cpp", "socketley/runtime/mail/mail_mime.cpp",
             "test/unit/test_mail_sieve.cpp", "socketley/runtime/mail/mail_sieve.cpp",
-            "socketley/shared/util/base64.cpp", "socketley/runtime/mail/mail_tls_policy.cpp" }
+            "socketley/shared/util/base64.cpp", "socketley/runtime/mail/mail_tls_policy.cpp",
+            "socketley/shared/net/public_suffix.cpp" }
     links(tls_libs())
 
     filter "configurations:Debug"

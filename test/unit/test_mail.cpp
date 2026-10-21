@@ -15,6 +15,7 @@
 #include "runtime/mail/mail_tls_policy.h"
 #include "runtime/mail/mail_verify.h"
 #include "runtime/mail/smtp_session.h"
+#include "shared/net/public_suffix.h"
 #include "shared/util/base64.h"
 
 using namespace socketley::mail;
@@ -889,4 +890,27 @@ TEST_CASE("DANE: TLSA records SMTP can use, and those it cannot")
     REQUIRE(tp::parse_tlsa(std::string("\x03\x01\x00", 3) + "der", t));
     CHECK(tp::usable(t));
     CHECK_FALSE(tp::parse_tlsa("\x03\x01\x01", t));
+}
+
+TEST_CASE("the Public Suffix List: rules, wildcards and exceptions decide the registrable domain")
+{
+    socketley::public_suffix::list l;
+    l.load("// a comment\ncom\nuk\nco.uk\n*.ck\n!www.ck\n// ===BEGIN PRIVATE DOMAINS===\nblogspot.com\n");
+    CHECK(l.registrable("mail.example.co.uk") == "example.co.uk");
+    CHECK(l.registrable("Example.CO.UK.") == "example.co.uk");
+    CHECK(l.registrable("co.uk") == "co.uk");
+    CHECK(l.registrable("a.b.example.com") == "example.com");
+    CHECK(l.registrable("x.y.ck") == "x.y.ck");
+    CHECK(l.registrable("z.x.y.ck") == "x.y.ck");
+    CHECK(l.registrable("www.ck") == "www.ck");
+    CHECK(l.registrable("a.www.ck") == "www.ck");
+    CHECK(l.registrable("me.blogspot.com") == "me.blogspot.com");
+    CHECK(l.registrable("a.b.example.test") == "example.test");
+    CHECK(l.registrable("localhost") == "localhost");
+    // The system's list, where the publicsuffix package put one.
+    if (!socketley::public_suffix::system_list().empty())
+    {
+        CHECK(organizational_domain("mail.example.co.uk") == "example.co.uk");
+        CHECK(organizational_domain("a.b.example.com.au") == "example.com.au");
+    }
 }
