@@ -11,6 +11,7 @@
 #   * a message dropped with `socketley mail ... drop` brought back by a restart, as its record is still there
 #   * a record a crash cut taken as a message, or the messages before it lost with it
 #   * a segment a deferred message keeps never used again, or the message lost by its move
+#   * a message of a commit read back from where another, begun while that commit ended, put its own
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -45,15 +46,16 @@ python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test 
     >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
-# A segment emptied but for a deferred message is moved out of at once.
-export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_SPOOL_MOVE_MS=0
+# A segment emptied but for a deferred message is moved out of at once; a body past 64 KiB is read back from it.
+export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_SPOOL_MOVE_MS=0 \
+    SOCKETLEY_MAIL_SPOOL_KEEP_BYTES=65536
 mkdir -p "$T/sink"
 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/sink" --reply later@remote.test 451 >/dev/null 2>&1 &
 PIDS+=($!)
 ready_tcp 127.0.0.1 "$SINK" || bad "the sink listens" "-"
 daemon_start "$BIN"
 
-"$BIN" create mail s -p "$P" --mail-domain example.test -s >/dev/null 2>&1
+"$BIN" create mail s -p "$P" --mail-domain example.test --no-reply -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$P" || bad "the mail runtime listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 stat_of() { "$BIN" stats s 2>/dev/null | sed -n "s/^$1://p"; }
 spool_dir() { find "$HOME/.local/share" -type d -path '*/mail/s/spool' 2>/dev/null | head -1; }
@@ -84,6 +86,52 @@ commits=$(stat_of mail_spool_commits)
 [ "${committed:-0}" -ge 20 ] && [ "${commits:-99}" -lt 20 ] \
     && ok "and share their commits ($committed messages in $commits syncs)" \
     || bad "and share their commits" "$committed messages in $commits syncs"
+
+# A commit that holds mail failing at once and larger mail after it: the failure's report is queued as the commit ends,
+# and the larger messages, not kept in memory, are read back from where they are. gone@ fails at once, suppressed.
+printf 'From: <>\r\nSubject: failed\r\n\r\nFinal-Recipient: rfc822; gone@remote.test\r\nAction: failed\r\n' > "$T/dsn.txt"
+python3 - "$P" "$T/dsn.txt" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1])); s.ehlo("x")
+s.sendmail("", ["no-reply@example.test"], open(sys.argv[2], "rb").read())
+PY
+for _ in $(seq 1 50); do [ "$("$BIN" mail s suppressed 2>/dev/null)" = gone@remote.test ] && break; sleep 0.1; done
+r=$(python3 - "$P" <<'PY'
+import socket, sys, time
+port = int(sys.argv[1])
+taken = 0
+for rnd in range(3):
+    socks = []
+    for i in range(16):
+        s = socket.create_connection(("127.0.0.1", port)); f = s.makefile("rb"); f.readline()
+        s.sendall(b"EHLO x\r\n")
+        while not f.readline().startswith(b"250 "): pass
+        to = b"gone@remote.test" if i % 2 == 0 else b"whole%d-%d@remote.test" % (rnd, i)
+        s.sendall(b"MAIL FROM:<back@remote.test>\r\nRCPT TO:<" + to + b">\r\nDATA\r\n")
+        for _ in range(3): f.readline()
+        if i % 2 == 0:
+            s.sendall(b"Subject: dead %d-%d\r\n\r\nd\r\n" % (rnd, i))
+        else:
+            s.sendall(b"Subject: whole %d-%d\r\n\r\n" % (rnd, i) + (b"marker-%d-%d " % (rnd, i) + b"y" * 70 + b"\r\n") * 1200)
+        socks.append((s, f))
+    # The bodies are in before any ends, so the ends come in the order sent, a failing one before each larger one.
+    time.sleep(0.5)
+    for s, f in socks: s.sendall(b".\r\n")
+    taken += sum(f.readline().startswith(b"250") for s, f in socks)
+print(taken)
+PY
+)
+check "forty-eight messages, half of them failing at once, are taken" "$r" "48"
+whole() {
+    n=0
+    for rnd in 0 1 2; do for i in 1 3 5 7 9 11 13 15; do
+        f=$(grep -l "^Subject: whole $rnd-$i[[:space:]]*$" "$T"/sink/*.eml 2>/dev/null | head -1)
+        [ -n "$f" ] && [ "$(grep -c "^marker-$rnd-$i y" "$f")" = 1200 ] && n=$((n+1))
+    done; done
+    echo "$n"
+}
+for _ in $(seq 1 100); do [ "$(whole)" = 24 ] && break; sleep 0.2; done
+check "and every larger one arrives whole, read back from its own place" "$(whole)" "24"
 
 # ─── a large message, and the restart ───────────────────────────────────────
 "$BIN" send s --from keep1@example.test --to later@remote.test --subject small --text "small kept" >/dev/null 2>&1

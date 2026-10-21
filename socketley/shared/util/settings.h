@@ -194,6 +194,8 @@ inline constexpr setting table[] = {
      "milliseconds a mail runtime tries a message before a sender who asked is told it is late"},
     {"SOCKETLEY_MAIL_SPOOL_MOVE_MS", kind::number, audience::test, 0, no_max, "60000",
      "milliseconds a mail spool segment is full before the few messages left in it are moved"},
+    {"SOCKETLEY_MAIL_SPOOL_KEEP_BYTES", kind::number, audience::test, 0, no_max, "67108864",
+     "bytes of message bodies a mail spool keeps in memory beside its segments"},
     {"SOCKETLEY_STORAGE_STOP_HOLD_MS", kind::number, audience::test, 0, 3000, "0",
      "milliseconds a shard's stop holds its directory, times its shard number"},
     {"SOCKETLEY_STORAGE_START_SPIN_MS", kind::number, audience::test, 0, 30000, "0",

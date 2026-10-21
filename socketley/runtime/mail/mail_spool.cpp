@@ -778,7 +778,9 @@ void spool::end(uint64_t w, bool ok)
         if (!x->own)
         {
             // The record's bytes are the copy kept in memory, while there is room for it.
-            if (m_kept + e.body_len <= keep_all)
+            static const uint64_t room =
+                settings::number<uint64_t>("SOCKETLEY_MAIL_SPOOL_KEEP_BYTES").value_or(keep_all);
+            if (m_kept + e.body_len <= room)
             {
                 x->buf.erase(0, x->head);
                 m_kept += x->buf.size();
@@ -893,7 +895,9 @@ void spool::commit()
 void spool::committed(bool ok)
 {
     m_committing = false;
+    // What a record's done starts may be the next commit, which takes these over.
     const uint32_t gen = m_flying_seg;
+    const uint64_t at = m_flying_at;
     if (ok)
     {
         ++m_commits;
@@ -911,7 +915,7 @@ void spool::committed(bool ok)
     m_flying.clear();
     for (auto& q : recs)
     {
-        const uint64_t body_off = m_flying_at + q.at + rec_head + q.header_len;
+        const uint64_t body_off = at + q.at + rec_head + q.header_len;
         if (q.writer)
         {
             const auto it = m_writers.find(q.writer);
