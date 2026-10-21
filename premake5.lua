@@ -1300,7 +1300,7 @@ project "fuzz_mqtt"
 -- ─── Fuzz: what a mail runtime reads from others ─────────────────────────────
 --
 -- An SMTP client's bytes, a message as IMAP parses it, its DKIM signatures,
--- address lists and aliases, and quoted-printable.
+-- address lists and aliases, quoted-printable, and a Sieve script run on a message.
 
 project "fuzz_mail"
     kind "ConsoleApp"
@@ -1318,6 +1318,7 @@ project "fuzz_mail"
         "socketley/runtime/mail/mail_dkim.cpp",
         "socketley/runtime/mail/mail_mime.cpp",
         "socketley/runtime/mail/mail_aliases.cpp",
+        "socketley/runtime/mail/mail_sieve.cpp",
         "socketley/shared/util/base64.cpp"
     }
     links(tls_libs())
@@ -2879,6 +2880,7 @@ project "test_mail"
     files { "test/unit/test_mail.cpp", "socketley/runtime/mail/smtp_session.cpp", "socketley/runtime/mail/mail_compose.cpp",
             "socketley/runtime/mail/mail_dkim.cpp", "socketley/runtime/mail/mail_aliases.cpp",
             "socketley/runtime/mail/mail_verify.cpp", "socketley/runtime/dns/dns_wire.cpp", "socketley/runtime/mail/mail_mime.cpp",
+            "test/unit/test_mail_sieve.cpp", "socketley/runtime/mail/mail_sieve.cpp",
             "socketley/shared/util/base64.cpp" }
     links(tls_libs())
 

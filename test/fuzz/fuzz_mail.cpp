@@ -13,6 +13,8 @@
 //      give the same text twice over.
 //   3  address lists, paths and an aliases file.
 //   4  text written as quoted-printable, whose lines are at most 76 characters and whose bytes are all printable.
+//   5  a Sieve script and a message, split at the first NUL: a script that compiles is run, and what it decides has
+//      an action, a mailbox for every fileinto, at most 4 redirects and one reject, and a plain keep where it failed.
 
 #include "fuzz_common.h"
 
@@ -20,6 +22,7 @@
 #include "../../socketley/runtime/mail/mail_compose.h"
 #include "../../socketley/runtime/mail/mail_dkim.h"
 #include "../../socketley/runtime/mail/mail_mime.h"
+#include "../../socketley/runtime/mail/mail_sieve.h"
 #include "../../socketley/runtime/mail/smtp_session.h"
 
 #include <deque>
@@ -225,6 +228,47 @@ void qp_case(std::string_view in)
     }
 }
 
+void sieve_case(std::string_view in)
+{
+    const size_t nul = in.find('\0');
+    const std::string_view text = in.substr(0, nul);
+    const std::string_view msg = nul == std::string_view::npos ? std::string_view{} : in.substr(nul + 1);
+    std::string err;
+    const auto s = sieve::script::compile(text, err);
+    FUZZ_CHECK(s || err.starts_with("line "), "a script refused without the line it is wrong at");
+    if (!s)
+        return;
+    sieve::context c;
+    c.own = {"me@example.com"};
+    c.now_s = 1700000000;
+    c.zone_min = 60;
+    c.mailbox_exists = [](std::string_view f) { return f.size() % 2 == 0; };
+    const sieve::outcome o = s->run({msg, "alice@example.org", "me+tag@example.com"}, c);
+    FUZZ_CHECK(!o.actions.empty(), "an outcome with no action");
+    if (!o.error.empty())
+    {
+        FUZZ_CHECK(o.error.starts_with("line "), "a run error without its line");
+        FUZZ_CHECK(o.actions.size() == 1 && o.actions[0].k == sieve::action::kind::keep && o.actions[0].flags.empty(),
+                   "a failed run that does more than keep");
+    }
+    size_t redirects = 0, rejects = 0, vacations = 0;
+    for (const auto& a : o.actions)
+    {
+        using k = sieve::action::kind;
+        if (a.k == k::fileinto)
+            FUZZ_CHECK(!a.arg.empty(), "a fileinto that names no mailbox");
+        redirects += a.k == k::redirect;
+        rejects += a.k == k::reject;
+        vacations += a.k == k::vacation;
+        FUZZ_CHECK((a.k == k::vacation) == a.v.has_value(), "a vacation action without its answer");
+        if (a.v)
+            FUZZ_CHECK(a.v->to == "alice@example.org" && !a.v->handle.empty(), "a vacation answering no sender");
+    }
+    FUZZ_CHECK(redirects <= 4, "more than 4 redirects");
+    FUZZ_CHECK(rejects <= 1 && vacations <= 1, "a second reject or vacation");
+    FUZZ_CHECK(rejects == 0 || redirects + vacations == 0, "a reject beside a redirect or a vacation");
+}
+
 }   // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
@@ -234,13 +278,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     if (size < 1 || size > (64u << 10))
         return 0;
     const std::string_view in(reinterpret_cast<const char*>(data) + 1, size - 1);
-    switch (data[0] % 5)
+    switch (data[0] % 6)
     {
         case 0: smtp(in); break;
         case 1: mime_case(in); break;
         case 2: dkim_case(in); break;
         case 3: address_case(in); break;
         case 4: qp_case(in); break;
+        case 5: sieve_case(in); break;
     }
     return 0;
 }

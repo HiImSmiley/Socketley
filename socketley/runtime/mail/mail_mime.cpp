@@ -5,6 +5,7 @@
 
 #include "mail_compose.h"
 #include "../../shared/util/ascii.h"
+#include "../../shared/util/base64.h"
 
 namespace socketley::mail::mime
 {
@@ -532,6 +533,194 @@ bool section(std::string_view message, const part& root, std::string_view spec, 
     else
         out.assign(got);
     return ok;
+}
+
+namespace
+{
+
+int hex_value(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+std::string unquote_printable(std::string_view in, bool underscore_space)
+{
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i)
+    {
+        const char c = in[i];
+        if (c == '_' && underscore_space)
+        {
+            out += ' ';
+            continue;
+        }
+        if (c != '=')
+        {
+            out += c;
+            continue;
+        }
+        if (i + 2 < in.size() && hex_value(in[i + 1]) >= 0 && hex_value(in[i + 2]) >= 0)
+        {
+            out += static_cast<char>(hex_value(in[i + 1]) * 16 + hex_value(in[i + 2]));
+            i += 2;
+            continue;
+        }
+        // A soft line break, the white space an encoder may leave before it included.
+        size_t j = i + 1;
+        while (j < in.size() && (in[j] == ' ' || in[j] == '\t'))
+            ++j;
+        if (j + 1 < in.size() && in[j] == '\r' && in[j + 1] == '\n')
+        {
+            i = j + 1;
+            continue;
+        }
+        if (j < in.size() && in[j] == '\n')
+        {
+            i = j;
+            continue;
+        }
+        if (j == in.size())
+            break;
+        out += c;
+    }
+    return out;
+}
+
+// Base64 with the line breaks and other bytes outside its alphabet taken out first, as a body carries it.
+bool unbase64(std::string_view in, std::string& out)
+{
+    std::string digits;
+    digits.reserve(in.size());
+    for (const char c : in)
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/' ||
+            c == '=')
+            digits += c;
+    return socketley::base64::decode(digits, out);
+}
+
+enum class charset_kind : uint8_t { utf8, latin1, other };
+
+charset_kind charset_of(std::string_view name)
+{
+    // RFC 2231 lets a language follow the charset after a star.
+    name = trim(name.substr(0, name.find('*')));
+    const std::string n = lower(name);
+    if (n.empty() || n == "utf-8" || n == "utf8" || n == "us-ascii" || n == "ascii")
+        return charset_kind::utf8;
+    if (n == "iso-8859-1" || n == "iso8859-1" || n == "iso_8859-1" || n == "latin1" || n == "l1")
+        return charset_kind::latin1;
+    return charset_kind::other;
+}
+
+std::string latin1_to_utf8(std::string_view in)
+{
+    std::string out;
+    out.reserve(in.size() + in.size() / 8);
+    for (const unsigned char c : in)
+    {
+        if (c < 0x80)
+            out += static_cast<char>(c);
+        else
+        {
+            out += static_cast<char>(0xC0 | (c >> 6));
+            out += static_cast<char>(0x80 | (c & 0x3F));
+        }
+    }
+    return out;
+}
+
+// The encoded word at the start of `in`, decoded into `out`; its length, or 0 when it is none or of a charset left
+// as it is.
+size_t encoded_word(std::string_view in, std::string& out)
+{
+    if (!in.starts_with("=?"))
+        return 0;
+    const size_t q1 = in.find('?', 2);
+    if (q1 == std::string_view::npos || q1 + 2 >= in.size() || in[q1 + 2] != '?')
+        return 0;
+    const size_t end = in.find("?=", q1 + 3);
+    if (end == std::string_view::npos)
+        return 0;
+    const std::string_view charset = in.substr(2, q1 - 2);
+    const char enc = socketley::ascii::upper(in[q1 + 1]);
+    const std::string_view text = in.substr(q1 + 3, end - q1 - 3);
+    if (charset.empty() || text.find_first_of(" \t\r\n") != std::string_view::npos ||
+        charset.find_first_of(" \t\r\n") != std::string_view::npos)
+        return 0;
+    const charset_kind kind = charset_of(charset);
+    if (kind == charset_kind::other)
+        return 0;
+    std::string raw;
+    if (enc == 'B')
+    {
+        if (!socketley::base64::decode(text, raw))
+            return 0;
+    }
+    else if (enc == 'Q')
+        raw = unquote_printable(text, true);
+    else
+        return 0;
+    out = kind == charset_kind::latin1 ? latin1_to_utf8(raw) : std::move(raw);
+    return end + 2;
+}
+
+}   // namespace
+
+std::string decoded_body(std::string_view body, std::string_view encoding)
+{
+    const std::string e = lower(trim(encoding));
+    if (e == "quoted-printable")
+        return unquote_printable(body, false);
+    if (e == "base64")
+    {
+        std::string out;
+        if (unbase64(body, out))
+            return out;
+    }
+    return std::string(body);
+}
+
+std::string to_utf8(std::string_view text, std::string_view charset)
+{
+    if (charset_of(charset) == charset_kind::latin1)
+        return latin1_to_utf8(text);
+    return std::string(text);
+}
+
+std::string decode_words(std::string_view value)
+{
+    std::string out;
+    out.reserve(value.size());
+    // Where the white space after the last decoded word began, while nothing else has followed it.
+    size_t after_word = std::string::npos;
+    for (size_t i = 0; i < value.size();)
+    {
+        if (value[i] == '=' && i + 1 < value.size() && value[i + 1] == '?')
+        {
+            std::string word;
+            if (const size_t n = encoded_word(value.substr(i), word); n > 0)
+            {
+                if (after_word != std::string::npos)
+                    out.resize(after_word);
+                out += word;
+                after_word = out.size();
+                i += n;
+                continue;
+            }
+        }
+        const char c = value[i++];
+        out += c;
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+            after_word = std::string::npos;
+    }
+    return out;
 }
 
 }   // namespace socketley::mail::mime
