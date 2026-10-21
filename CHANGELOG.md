@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A `mail` runtime: a mail server for the domains of a dns runtime and the
+  users of an idp runtime, its mailboxes in a storage runtime.** It takes
+  ESMTP on 25 (PIPELINING, SIZE, 8BITMIME, SMTPUTF8, STARTTLS, AUTH, CHUNKING
+  and DSN), and on `--submission`/`--submissions` only from a user signed in
+  and only as their own address; mail from elsewhere is checked against
+  `--dnsbl` lists, SPF, DKIM and DMARC, the organizational domain read off the
+  Public Suffix List. A message is synced to a spool of 32 MiB segments before
+  250 is answered, one fdatasync committing every message that ended while the
+  last ran, and it goes on to the domain's MX, with DANE where DNSSEC signed it
+  and MTA-STS where the domain publishes a policy, or to a `--relay`; what is
+  refused for now is tried again until `--queue-lifetime`, and the sender gets
+  the delivery status reports DSN asked for. With `--dns` it publishes MX,
+  SPF, DKIM, DMARC and the SRV records of its ports. Mail for a user is filed
+  by their Sieve script (fileinto, reject, vacation, imap4flags and more, kept
+  with `socketley mail <name> sieve` or over ManageSieve on `--sieve`) into a
+  bucket, bounded by their `mail_quota`, and read over IMAP4rev1 with IDLE,
+  CONDSTORE and QRESYNC, SORT, THREAD, QUOTA and COMPRESS=DEFLATE from every
+  shard, which share each user's UIDs through a journal. `socketley send`, a
+  script's `socketley.mail.send`, a storage's `mail://` notification target
+  and `daemon.alert_mail` send through it. Measured against Postfix on this
+  machine it took 7,140 messages of 1 KB a second from 50 clients to Postfix's
+  2,654, and against Dovecot it answered eight clients' SEARCH in a tenth of
+  the time.
 - **A `db` runtime: JSON documents for applications, owned by the accounts
   of an `idp` runtime.** Collections of documents at `/c/<collection>/<id>`,
   read with GET, replaced with PUT, changed in place with PATCH (`set`,
