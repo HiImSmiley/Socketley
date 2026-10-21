@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# suite: isolated -- its own daemon, socket, state directory and port window, so it runs beside the others
+# suite: quiet -- two brokers of three shards under a sanitizer, shards stopped under 16 and 40 MiB floods, which beside
+# other files pages the box out rather than tests the broker
 # An mqtt runtime of several shards: one broker to its clients whichever process the kernel gave each connection.
 #
 # What each part would catch:

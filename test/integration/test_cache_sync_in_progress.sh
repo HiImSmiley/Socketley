@@ -186,14 +186,15 @@ else fail "a leader does not answer a follower's question" \
 # poll that has to land inside it is a coin toss.  An accept that happened is
 # permanent.
 ACC=0
-for _ in $(seq 1 50); do
+# Ninety seconds for a 30s deadline and a one-second redial, since a loaded box runs the deadline's sweep late.
+for _ in $(seq 1 90); do
     ACC=$(cat "$ACCEPTS" 2>/dev/null || echo 0)
     [ "${ACC:-0}" -ge 2 ] && break
     sleep 1
 done
 if [ "${ACC:-0}" -ge 2 ]; then pass
 else fail "a sync that never finishes is given up on and dialled again" \
-          "the silent leader was connected to ${ACC:-0} time(s) in 50s, expected at least 2"; fi
+          "the silent leader was connected to ${ACC:-0} time(s) in 90s, expected at least 2"; fi
 
 # The real follower is not collateral: its deadline fires too, finds itself
 # synced, and must do nothing.

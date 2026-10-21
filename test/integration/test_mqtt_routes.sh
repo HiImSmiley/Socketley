@@ -195,6 +195,10 @@ if phase == "rules":
         check("a webhook rule POSTs each message as JSON, in order and once, though the hook failed twice",
               [(b.get("topic"), b.get("payload"), b.get("qos"), b.get("client")) for b in bodies],
               [("web/a/b", "w%d" % i, 1, "edge-pub") for i in range(3)])
+        # The hook logs a body before its answer is read and the count pushed, so the count is waited for.
+        end = time.time() + 20
+        while time.time() < end and stat_sum(binary, "edge", "rule_4_delivered") < 3:
+            time.sleep(0.2)
         check("and counts them delivered", stat_sum(binary, "edge", "rule_4_delivered"), 3)
         pub.publish("nope/x", "no", qos=1)
         end = time.time() + 10
