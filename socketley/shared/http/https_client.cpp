@@ -149,9 +149,15 @@ int client::dial(const std::string& url, std::string& path, std::string& hostpor
         host = hostport.substr(0, colon);
         port = hostport.substr(colon + 1);
     }
+    std::string dial_host = host, dial_port = port;
+    if (const size_t colon = m_connect.rfind(':'); colon != std::string::npos)
+    {
+        dial_host = m_connect.substr(0, colon);
+        dial_port = m_connect.substr(colon + 1);
+    }
     addrinfo hints{}, *res = nullptr;
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res)
+    if (getaddrinfo(dial_host.c_str(), dial_port.c_str(), &hints, &res) != 0 || !res)
     {
         err = "cannot resolve " + host;
         return -1;

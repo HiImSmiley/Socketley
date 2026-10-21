@@ -12690,9 +12690,33 @@ resolver on the loop, or the domain itself when it has none; a domain that does
 not exist or says it takes no mail (RFC 7505) fails at once. With
 .B \-\-relay
 everything for elsewhere goes through that smarthost. TLS is spoken wherever
-it is offered; an exchanger's certificate is not checked, as no mail server
-checks one without DANE or MTA\-STS, and a smarthost's is, and its password is
-never sent in the clear. A recipient refused for now is tried again after
+it is offered, and an exchanger's certificate is checked where its domain asks:
+.RS
+.IP \(bu 2
+DANE (RFC 7672): where DNSSEC signed a domain's MX records, the TLSA records of
+each exchanger are asked, and with any there the mail goes over TLS only, its
+certificate one they name (DANE\-TA or DANE\-EE). A record is believed only
+when the resolver set the AD bit and every nameserver
+.B /etc/resolv.conf
+names is on this machine, a validating resolver such as unbound; elsewhere
+nothing is believed and nothing is checked.
+.IP \(bu 2
+MTA\-STS (RFC 8461): where a domain has an
+.B _mta\-sts
+TXT record, its policy is fetched from
+.BI https://mta\-sts. domain /.well\-known/mta\-sts.txt
+on a thread, again when its id changes, and kept under the runtime's state for
+the next start. Under
+.B mode: enforce
+only the exchangers it names are tried, over TLS, each with a certificate for
+its name from the system's CAs; under
+.B testing
+what would have failed is logged and counted, and the mail goes as before.
+.RE
+.IP
+Mail that cannot go so waits and is tried again (4.7.5). Elsewhere the
+certificate is not checked, as no mail server checks one, and a smarthost's
+always is, and its password is never sent in the clear. A recipient refused for now is tried again after
 1m, 5m, 15m, 30m, 1h, 2h, 4h and every 8h after, until
 .BR \-\-queue\-lifetime ;
 one refused for good, or out of time, is bounced to the sender as a delivery
@@ -12902,14 +12926,17 @@ How long a message is tried before it is bounced, 1m to 30d, 5d unless given.
 The selector its DKIM key is published and signed under, skl unless given.
 .PP
 .B stats
-says what was received, delivered, deferred, failed and bounced, what is queued
-and its bytes, the recipients and relays refused, what was too big, the spool's
+says what was received, delivered, deferred, failed and bounced, the other
+delivery reports, what is queued and its bytes, the spool's commits, segments
+and moves, the recipients and relays refused, what was too big, the spool's
 failures, what was checked and what DMARC refused or quarantined, the bounces
 taken and the addresses suppressed, what was stored in mailboxes, the sign\-ins
 and their failures, STARTTLS and TLS failures, the connections out, their TLS
-and transactions, the MX lookups, and the IMAP connections and reads.
+and transactions, the certificates DANE and MTA\-STS checked and the
+connections refused for want of TLS, the policies fetched and what testing ones
+would have failed, the MX lookups, and the IMAP connections and reads.
 .PP
-It does not speak CHUNKING (BDAT), DSN, DANE or MTA\-STS, and reads no Sieve.
+It reads no Sieve.
 .SH REGISTERED TYPES
 A runtime type beyond the built-in seven is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never

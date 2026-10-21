@@ -33,14 +33,17 @@ public:
     state ask(const std::string& host, int family, std::vector<endpoint>& out);
 
     // A record set other than addresses, for an absolute name: MX with its preference and exchange, TXT with the
-    // strings of a record joined.  Ready with none for a name with none of the type, and `no_domain` for one that does
-    // not exist; unsure for an answer cut short or no nameserver answering, which the system's resolver then asks.
+    // strings of a record joined, TLSA with its record data as it came.  Ready with none for a name with none of the
+    // type, and `no_domain` for one that does not exist; unsure for an answer cut short or no nameserver answering,
+    // which the system's resolver then asks.  `secure`, when given, says the answer was validated by DNSSEC: the
+    // nameserver set its AD bit and is on this machine, the only place its say-so is not an attacker's to forge.
     struct record
     {
         uint16_t    pref{0};
         std::string text;
     };
-    state ask_records(const std::string& name, uint16_t type, std::vector<record>& out, bool& no_domain);
+    state ask_records(const std::string& name, uint16_t type, std::vector<record>& out, bool& no_domain,
+                      bool* secure = nullptr);
 
     // How often each way out was taken, for a test and a benchmark to read.
     struct counters
@@ -76,6 +79,7 @@ private:
         std::vector<endpoint> addrs;
         std::vector<record>   records;
         bool        nxdomain{false};
+        bool        authentic{false};
     };
     struct job
     {

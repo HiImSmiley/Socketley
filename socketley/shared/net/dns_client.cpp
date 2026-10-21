@@ -1,4 +1,5 @@
 #include "dns_client.h"
+#include "peer_address.h"
 
 #include <algorithm>
 #include <cctype>
@@ -303,6 +304,8 @@ bool dns_client::send(job& j)
         uint8_t msg[dns::header_len + 260 + 4 + 11]{};
         dns::wr16(msg, q.id);
         msg[2] = 0x01;   // recursion desired
+        // AD asked of a validating resolver, which says so without the signatures DO would bring (RFC 6840 5.7).
+        msg[3] = 0x20;
         dns::wr16(msg + 4, 1);
         // An OPT record, so an answer up to 1232 bytes comes whole over UDP rather than cut at 512 (RFC 6891).
         dns::wr16(msg + 10, 1);
@@ -377,6 +380,7 @@ void dns_client::take(job& j, question& q, const uint8_t* msg, size_t len)
     size_t at = next + 4;
 
     const uint8_t rc = msg[3] & 0x0F;
+    q.authentic = (msg[3] & 0x20) != 0;
     if (rc == dns::rcode::NXDOMAIN)
     {
         q.done = q.none = q.nxdomain = true;
@@ -422,6 +426,8 @@ void dns_client::take(job& j, question& q, const uint8_t* msg, size_t len)
             }
             q.records.push_back({0, std::move(text)});
         }
+        else if (cls == dns::rclass::IN && type == q.type && type == dns::type::TLSA && rdlen >= 3)
+            q.records.push_back({0, std::string(reinterpret_cast<const char*>(rd), rdlen)});
         else if (cls == dns::rclass::IN && type == q.type && type == dns::type::A && rdlen == 4)
         {
             auto* v4 = reinterpret_cast<sockaddr_in*>(&e.addr);
@@ -446,10 +452,12 @@ void dns_client::take(job& j, question& q, const uint8_t* msg, size_t len)
 }
 
 dns_client::state dns_client::ask_records(const std::string& name, uint16_t type, std::vector<record>& out,
-                                          bool& no_domain)
+                                          bool& no_domain, bool* secure)
 {
     refresh();
     no_domain = false;
+    if (secure)
+        *secure = false;
     const auto now = clock::now();
     std::string n = lower_copy(name);
     if (!n.empty() && n.back() == '.')
@@ -489,6 +497,14 @@ dns_client::state dns_client::ask_records(const std::string& name, uint16_t type
     {
         out = std::move(j.qs.front().records);
         no_domain = j.qs.front().nxdomain;
+        if (secure)
+        {
+            // Every nameserver asked is on this machine, or the AD bit came across a network anyone may write to.
+            bool local = !m_cfg.servers.empty();
+            for (const endpoint& e : m_cfg.servers)
+                local = local && is_loopback(e.addr);
+            *secure = local && j.qs.front().authentic;
+        }
         ++m_c.answered;
     }
     else

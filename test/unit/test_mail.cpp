@@ -12,6 +12,7 @@
 #include "runtime/mail/mail_compose.h"
 #include "runtime/mail/mail_dkim.h"
 #include "runtime/mail/mail_mime.h"
+#include "runtime/mail/mail_tls_policy.h"
 #include "runtime/mail/mail_verify.h"
 #include "runtime/mail/smtp_session.h"
 #include "shared/util/base64.h"
@@ -829,4 +830,63 @@ TEST_CASE("MIME: ENVELOPE and BODYSTRUCTURE as RFC 3501 writes them")
     CHECK(out == "hello\r\nworld\r\n");
     CHECK(mime::imap_string("a\"b") == "\"a\\\"b\"");
     CHECK(mime::imap_string("Gr\xc3\xbc\xc3\x9f") == "{6}\r\nGr\xc3\xbc\xc3\x9f");
+}
+
+TEST_CASE("MTA-STS: the record's id, the policy's fields, the exchangers it names, and the cache line")
+{
+    namespace tp = socketley::mail::tls_policy;
+    std::string id;
+    CHECK(tp::sts_record_id("v=STSv1; id=20261021T1", id));
+    CHECK(id == "20261021T1");
+    CHECK(tp::sts_record_id("v=STSv1;id=a1;", id));
+    CHECK_FALSE(tp::sts_record_id("id=a1; v=STSv1", id));
+    CHECK_FALSE(tp::sts_record_id("v=STSv2; id=a1", id));
+    CHECK_FALSE(tp::sts_record_id("v=STSv1; id=bad-id", id));
+    CHECK_FALSE(tp::sts_record_id("v=spf1 -all", id));
+    tp::sts p;
+    int64_t age = 0;
+    std::string why;
+    REQUIRE(tp::parse_sts("version: STSv1\r\nmode: enforce\r\nmx: mail.example.com\r\nmx: *.Example.NET.\r\n"
+                          "max_age: 99999999\r\n", p, age, why));
+    CHECK(p.mode == tp::sts_mode::enforce);
+    CHECK(age == 31557600);
+    CHECK(tp::mx_matches(p, "MAIL.example.com."));
+    CHECK(tp::mx_matches(p, "mx1.example.net"));
+    CHECK_FALSE(tp::mx_matches(p, "example.net"));
+    CHECK_FALSE(tp::mx_matches(p, "a.b.example.net"));
+    CHECK_FALSE(tp::mx_matches(p, "evilexample.net"));
+    CHECK_FALSE(tp::parse_sts("version: STSv1\nmode: enforce\nmax_age: 60\n", p, age, why));
+    CHECK_FALSE(tp::parse_sts("version: STSv1\nmode: sometimes\nmx: a\nmax_age: 60\n", p, age, why));
+    CHECK_FALSE(tp::parse_sts("mode: testing\nmx: a\nmax_age: 60\n", p, age, why));
+    REQUIRE(tp::parse_sts("version: STSv1\nmode: none\nmax_age: 60\n", p, age, why));
+    p.id = "x1";
+    p.mode = tp::sts_mode::testing;
+    p.mx = {"a.test", "*.b.test"};
+    p.expires_s = 1792553002;
+    std::string domain;
+    tp::sts back;
+    REQUIRE(tp::from_cache_line(tp::cache_line("b.test", p), domain, back));
+    CHECK(domain == "b.test");
+    CHECK(back.id == "x1");
+    CHECK(back.mode == tp::sts_mode::testing);
+    CHECK(back.mx == p.mx);
+    CHECK(back.expires_s == p.expires_s);
+}
+
+TEST_CASE("DANE: TLSA records SMTP can use, and those it cannot")
+{
+    namespace tp = socketley::mail::tls_policy;
+    tp::tlsa t;
+    REQUIRE(tp::parse_tlsa(std::string("\x03\x01\x01", 3) + std::string(32, 'a'), t));
+    CHECK(t.usage == 3);
+    CHECK(tp::usable(t));
+    t.data.resize(31);
+    CHECK_FALSE(tp::usable(t));
+    REQUIRE(tp::parse_tlsa(std::string("\x02\x00\x02", 3) + std::string(64, 'b'), t));
+    CHECK(tp::usable(t));
+    REQUIRE(tp::parse_tlsa(std::string("\x01\x01\x01", 3) + std::string(32, 'c'), t));
+    CHECK_FALSE(tp::usable(t));
+    REQUIRE(tp::parse_tlsa(std::string("\x03\x01\x00", 3) + "der", t));
+    CHECK(tp::usable(t));
+    CHECK_FALSE(tp::parse_tlsa("\x03\x01\x01", t));
 }

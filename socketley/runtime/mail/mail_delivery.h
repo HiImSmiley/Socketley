@@ -21,6 +21,7 @@
 #include "mail_command.h"
 #include "mail_dkim.h"
 #include "mail_spool.h"
+#include "mail_tls_policy.h"
 #include "../../shared/loop/event_loop.h"
 #include "../../shared/loop/file_io.h"
 #include "../../shared/net/endpoint.h"
@@ -89,6 +90,13 @@ private:
         bool looked{false};
         // A domain that does not exist, or one that says it takes no mail (RFC 7505).
         std::string dead;
+        // Its MX records came validated by DNSSEC, so DANE may be looked for beside them.
+        bool mx_secure{false};
+        // Its MTA-STS policy: not looked at, being looked at or fetched, known; and whether the exchangers it
+        // does not name were taken out of `hosts`.
+        uint8_t sts_state{0};
+        int64_t sts_ms{0};
+        bool sts_filtered{false};
     };
     struct out_conn;
 
@@ -96,6 +104,13 @@ private:
     void schedule(const entry_ptr& e, int64_t at);
     void pump(route& r);
     void lookup(route& r);
+    // The domain's MTA-STS policy brought up to date: its TXT record asked, and the policy fetched where its id
+    // changed; the route is pumped once it is known.
+    void sts_check(route& r);
+    void sts_fetch(const std::string& domain, const std::string& id);
+    // The policy that counts for `domain` now, null where there is none or it says none.
+    const tls_policy::sts* sts_for(const std::string& domain) const;
+    void sts_save();
     void poll_lookups();
     void open_conn(route& r);
     void finished(const entry_ptr& e);
@@ -158,6 +173,10 @@ private:
     uint16_t m_relay_port{25};
     std::string m_relay_user, m_relay_pass;
     uint16_t m_mx_port{25};
+    // MTA-STS policies by domain, kept across a restart so a policy gone from DNS still counts until it expires.
+    std::unordered_map<std::string, tls_policy::sts> m_sts;
+    std::string m_sts_path;
+    bool m_dane{false};
     bool m_stopped{false};
     bool m_polling{false};
     std::shared_ptr<bool> m_alive;
@@ -171,6 +190,11 @@ private:
     uint64_t m_tls_sessions{0};
     uint64_t m_transactions{0};
     uint64_t m_lookups{0};
+    uint64_t m_dane_verified{0};
+    uint64_t m_sts_verified{0};
+    uint64_t m_sts_fetched{0};
+    uint64_t m_sts_testing_failed{0};
+    uint64_t m_tls_refused{0};
 };
 
 }   // namespace socketley::mail

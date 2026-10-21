@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <resolv.h>
@@ -17,6 +18,9 @@
 #include "mail_run.h"
 #include "../dns/dns_wire.h"
 #include "../../shared/crypto/tls_context.h"
+#include "../../shared/http/https_client.h"
+#include "../../shared/loop/blocking_write.h"
+#include "../../shared/persist/read_file.h"
 #include "../../shared/net/dns_client.h"
 #include "../../shared/runtime/stats_text.h"
 #include "../../shared/util/ascii.h"
@@ -178,6 +182,12 @@ struct delivery::out_conn
     bool bol{true};
     bool reading{false};
     bool signature_sent{false};
+    // The exchanger's TLSA records, asked for the host at `tlsa_for`: DANE applies where there are any, and they
+    // authenticate where one is usable; and what the domain's MTA-STS policy asks.
+    size_t tlsa_for{SIZE_MAX};
+    bool dane{false};
+    std::vector<tls_policy::tlsa> tlsa;
+    tls_policy::sts_mode sts{tls_policy::sts_mode::none};
     // The body goes in BDAT chunks: those whose answer is still to come, whether the last went, and what refused one.
     bool bdat{false};
     uint32_t bdat_out{0};
@@ -214,8 +224,28 @@ bool delivery::start(std::string& why)
     m_selector = std::string(o.get_dkim_selector());
     m_mx_port = settings::number<uint16_t>("SOCKETLEY_MAIL_MX_PORT").value_or(25);
     m_tls = std::make_unique<tls_context>();
-    if (!m_tls->init_client())
+    const char* ca = settings::text("SOCKETLEY_MAIL_TLS_CA");
+    if (!m_tls->init_client(ca ? std::string_view(ca) : std::string_view{}))
         m_tls.reset();
+    // DANE checks a certificate against TLSA records rather than a CA, which the context must be readied for.
+    m_dane = m_tls && SSL_CTX_dane_enable(m_tls->native()) > 0;
+    m_sts_path = m_run.state_dir() + "/mta-sts";
+    {
+        std::string text;
+        if (socketley::read_file(m_sts_path, text))
+        {
+            std::string_view rest = text;
+            while (!rest.empty())
+            {
+                const size_t nl = rest.find('\n');
+                std::string domain;
+                tls_policy::sts p;
+                if (tls_policy::from_cache_line(rest.substr(0, nl), domain, p))
+                    m_sts[domain] = std::move(p);
+                rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+            }
+        }
+    }
     if (const std::string_view url = o.get_relay(); !url.empty())
     {
         std::string_view rest = url;
@@ -531,6 +561,40 @@ void delivery::pump(route& r)
         if (!r.looked)
             return;
     }
+    if (!m_relay)
+    {
+        if (r.sts_state == 2 && now - r.sts_ms > lookup_ms)
+            r.sts_state = 0;
+        if (r.sts_state != 2)
+        {
+            sts_check(r);
+            if (r.sts_state != 2)
+                return;
+        }
+        // Under an enforced policy only the exchangers it names are tried, and with none of them nothing is sent.
+        if (const tls_policy::sts* p = sts_for(r.key); p && p->mode == tls_policy::sts_mode::enforce)
+        {
+            if (!r.sts_filtered)
+            {
+                r.sts_filtered = true;
+                std::erase_if(r.hosts, [p](const std::string& h) { return !tls_policy::mx_matches(*p, h); });
+            }
+            if (r.hosts.empty())
+            {
+                while (!r.waiting.empty())
+                {
+                    item it = std::move(r.waiting.front());
+                    r.waiting.pop_front();
+                    for (size_t t = 0; t < it.to.size(); ++t)
+                        result(it, t, 451, "451 4.7.0 no exchanger of " + r.key + " is one its MTA-STS policy names",
+                               true);
+                    if (--m_out[it.e->id] == 0)
+                        attempt_over(it.e);
+                }
+                return;
+            }
+        }
+    }
     // A connection that waits for work takes the next message first.
     std::vector<uint64_t> idle;
     for (auto& [id, c] : m_conns)
@@ -554,8 +618,10 @@ void delivery::lookup(route& r)
         return;
     }
     std::vector<dns_client::record> recs;
-    bool nx = false;
-    const dns_client::state st = dns_client::here().ask_records(r.key, dns::type::MX, recs, nx);
+    bool nx = false, secure = false;
+    const dns_client::state st = dns_client::here().ask_records(r.key, dns::type::MX, recs, nx, &secure);
+    r.mx_secure = st == dns_client::state::ready && secure;
+    r.sts_filtered = false;
     if (st == dns_client::state::pending)
     {
         r.looking = true;
@@ -633,13 +699,139 @@ void delivery::lookup(route& r)
                         });
 }
 
+void delivery::sts_check(route& r)
+{
+    r.sts_state = 1;
+    std::vector<dns_client::record> recs;
+    bool nx = false;
+    const dns_client::state st = dns_client::here().ask_records("_mta-sts." + r.key, dns::type::TXT, recs, nx);
+    if (st == dns_client::state::pending)
+    {
+        poll_lookups();
+        return;
+    }
+    // One record says the policy's id; none or two say there is none to fetch, and a cached one still counts.
+    std::string id;
+    int found = 0;
+    for (const auto& rec : recs)
+    {
+        std::string i;
+        if (tls_policy::sts_record_id(rec.text, i))
+        {
+            id = std::move(i);
+            ++found;
+        }
+    }
+    const auto it = m_sts.find(r.key);
+    const bool cached = it != m_sts.end() && it->second.expires_s > wall::now_ms() / 1000;
+    if (found != 1 || (cached && it->second.id == id))
+    {
+        r.sts_state = 2;
+        r.sts_ms = wall::now_ms_coarse();
+        return;
+    }
+    r.sts_state = 3;
+    sts_fetch(r.key, id);
+}
+
+void delivery::sts_fetch(const std::string& domain, const std::string& id)
+{
+    struct fetched
+    {
+        bool ok{false};
+        tls_policy::sts p;
+        int64_t max_age{0};
+        std::string why;
+    };
+    auto out = std::make_shared<fetched>();
+    const char* ca = settings::text("SOCKETLEY_MAIL_STS_CA");
+    const char* to = settings::text("SOCKETLEY_MAIL_STS_CONNECT");
+    m_run.pool().submit(
+        0,
+        [domain, out, ca = std::string(ca ? ca : ""), to = std::string(to ? to : "")] {
+            // The policy is fetched over HTTPS with a certificate for mta-sts.<domain>, and no redirect is followed.
+            https_client::client cl;
+            if (!cl.init(out->why, ca))
+                return;
+            if (!to.empty())
+                cl.connect_to(to);
+            https_client::reply rep;
+            if (!cl.request("GET", "https://mta-sts." + domain + "/.well-known/mta-sts.txt", {}, {}, rep, out->why, 10))
+                return;
+            if (rep.status != 200)
+            {
+                out->why = "the policy was answered " + std::to_string(rep.status);
+                return;
+            }
+            if (!lower(rep.header("content-type")).starts_with("text/plain"))
+            {
+                out->why = "the policy is not text/plain";
+                return;
+            }
+            if (rep.body.size() > 65536)
+            {
+                out->why = "the policy is larger than 64 KiB";
+                return;
+            }
+            out->ok = tls_policy::parse_sts(rep.body, out->p, out->max_age, out->why);
+        },
+        [this, domain, id, out, alive = m_alive] {
+            if (!*alive)
+                return;
+            ++m_sts_fetched;
+            if (out->ok)
+            {
+                out->p.id = id;
+                out->p.expires_s = wall::now_ms() / 1000 + out->max_age;
+                m_sts[domain] = std::move(out->p);
+                sts_save();
+            }
+            else
+                LOG_WARN(("mail: the MTA-STS policy of " + domain + " could not be fetched: " + out->why +
+                          (m_sts.count(domain) ? "; the one fetched before counts until it expires" : ""))
+                             .c_str());
+            route& r = m_routes[domain];
+            r.sts_state = 2;
+            r.sts_ms = wall::now_ms_coarse();
+            // The exchangers looked up again, so a new policy is applied to the whole list.
+            r.looked = false;
+            r.sts_filtered = false;
+            pump(r);
+        });
+}
+
+const tls_policy::sts* delivery::sts_for(const std::string& domain) const
+{
+    const auto it = m_sts.find(domain);
+    if (it == m_sts.end() || it->second.mode == tls_policy::sts_mode::none ||
+        it->second.expires_s <= wall::now_ms() / 1000)
+        return nullptr;
+    return &it->second;
+}
+
+void delivery::sts_save()
+{
+    std::string text;
+    for (const auto& [domain, p] : m_sts)
+        if (p.expires_s > wall::now_ms() / 1000)
+            text += tls_policy::cache_line(domain, p);
+    // A cache: written whole and moved into place, and a crash loses at most the last fetch.
+    const std::string tmp = m_sts_path + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    const bool ok = fd >= 0 && socketley::write_all(fd, text.data(), text.size());
+    if (fd >= 0)
+        ::close(fd);
+    if (!ok || ::rename(tmp.c_str(), m_sts_path.c_str()) != 0)
+        ::unlink(tmp.c_str());
+}
+
 void delivery::poll_lookups()
 {
     if (m_polling)
         return;
     bool any = false;
     for (auto& [k, r] : m_routes)
-        any = any || (r.looking && !m_relay);
+        any = any || (r.looking && !m_relay) || r.sts_state == 1;
     for (auto& [id, c] : m_conns)
         any = any || c->state == out_conn::st::resolving;
     if (!any)
@@ -649,6 +841,7 @@ void delivery::poll_lookups()
             return;
         m_polling = false;
         for (auto& [k, r] : m_routes)
+        {
             if (r.looking && !m_relay)
             {
                 r.looked = false;
@@ -656,6 +849,13 @@ void delivery::poll_lookups()
                 if (r.looked)
                     pump(r);
             }
+            else if (r.sts_state == 1)
+            {
+                sts_check(r);
+                if (r.sts_state == 2)
+                    pump(r);
+            }
+        }
         std::vector<uint64_t> ids;
         for (auto& [id, c] : m_conns)
             if (c->state == out_conn::st::resolving)
@@ -989,6 +1189,11 @@ void delivery::stats(std::string& out) const
     put(out, "mail_out_tls", m_tls_sessions);
     put(out, "mail_out_transactions", m_transactions);
     put(out, "mail_mx_lookups", m_lookups);
+    put(out, "mail_out_dane_verified", m_dane_verified);
+    put(out, "mail_out_sts_verified", m_sts_verified);
+    put(out, "mail_out_tls_refused", m_tls_refused);
+    put(out, "mail_sts_fetched", m_sts_fetched);
+    put(out, "mail_sts_testing_failures", m_sts_testing_failed);
 }
 
 // ── One connection ──────────────────────────────────────────────────────────
@@ -1004,6 +1209,8 @@ void delivery::open_conn(route& r)
     out_conn& raw = *c;
     m_conns.emplace(raw.id, std::move(c));
     raw.host = r.hosts.empty() ? r.key : r.hosts.front();
+    if (const tls_policy::sts* p = m_relay ? nullptr : sts_for(r.key))
+        raw.sts = p->mode;
     conn_connect(raw);
 }
 
@@ -1022,6 +1229,41 @@ void delivery::conn_connect(out_conn& c)
                 return;
             }
             c.host = r.hosts[c.host_at];
+            // An exchanger of a domain whose MX records DNSSEC signed has its TLSA records asked first (RFC 7672).
+            if (!m_relay && r.mx_secure && c.tlsa_for != c.host_at)
+            {
+                std::vector<dns_client::record> recs;
+                bool nx = false, secure = false;
+                const dns_client::state ts =
+                    dns_client::here().ask_records("_" + std::to_string(m_mx_port) + "._tcp." + c.host, dns::type::TLSA, recs, nx, &secure);
+                if (ts == dns_client::state::pending)
+                {
+                    c.state = out_conn::st::resolving;
+                    poll_lookups();
+                    return;
+                }
+                if (ts == dns_client::state::unsure)
+                {
+                    // Records that may be there but could not be read are no licence to send without them.
+                    c.last_error = "451 4.7.5 the TLSA records of " + c.host + " could not be looked up";
+                    ++c.host_at;
+                    continue;
+                }
+                c.tlsa_for = c.host_at;
+                c.dane = secure && !nx && !recs.empty();
+                c.tlsa.clear();
+                for (const auto& rec : recs)
+                {
+                    tls_policy::tlsa t;
+                    if (tls_policy::parse_tlsa(rec.text, t) && tls_policy::usable(t))
+                        c.tlsa.push_back(std::move(t));
+                }
+            }
+            else if (!r.mx_secure)
+            {
+                c.dane = false;
+                c.tlsa.clear();
+            }
             std::vector<endpoint> found;
             const dns_client::state st = dns_client::here().ask(c.host, AF_UNSPEC, found);
             if (st == dns_client::state::pending)
@@ -1192,7 +1434,12 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
             }
             if (r < 0)
             {
-                conn_fail(c, "451 4.7.0 the TLS handshake with " + c.host + " failed", !c.after_starttls);
+                const long v = SSL_get_verify_result(c.ssl);
+                conn_fail(c, "451 4.7.5 the TLS handshake with " + c.host + " failed" +
+                                 (v != X509_V_OK ? std::string(": ") + X509_verify_cert_error_string(v) +
+                                                   (c.dane ? ", against its TLSA records" : "")
+                                                 : std::string()),
+                          !c.after_starttls);
                 return;
             }
             if (r == 0)
@@ -1200,6 +1447,18 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
             c.handshaken = true;
             c.verified = SSL_get_verify_result(c.ssl) == X509_V_OK;
             ++m_tls_sessions;
+            if (c.verified && c.dane && !c.tlsa.empty())
+                ++m_dane_verified;
+            else if (c.verified && c.sts == tls_policy::sts_mode::enforce)
+                ++m_sts_verified;
+            else if (!c.verified && c.sts == tls_policy::sts_mode::testing)
+            {
+                // A policy in testing mode is told of, never acted on.
+                ++m_sts_testing_failed;
+                LOG_WARN(("mail: " + c.host + " would fail the MTA-STS policy of " + c.route + ": " +
+                          X509_verify_cert_error_string(SSL_get_verify_result(c.ssl)))
+                             .c_str());
+            }
             if (c.after_starttls)
             {
                 // The conversation starts over inside TLS (RFC 3207 4.2).
@@ -1386,6 +1645,15 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                 conn_send(c, "STARTTLS\r\n");
                 return;
             }
+            if (!c.ssl && (c.dane || c.sts == tls_policy::sts_mode::enforce))
+            {
+                // Its domain says its mail goes over TLS, so it is not sent in the clear (RFC 7672 2.2, RFC 8461 5).
+                ++m_tls_refused;
+                conn_fail(c, "451 4.7.5 " + c.host + " offers no STARTTLS, which " +
+                                 (c.dane ? "its TLSA records" : "the MTA-STS policy of " + c.route) + " require",
+                          false);
+                return;
+            }
             if (m_relay && !m_relay_user.empty())
             {
                 if (!c.ssl && !loopback)
@@ -1410,6 +1678,12 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
         case st::starttls:
             if (code != 220)
             {
+                if (c.dane || c.sts == tls_policy::sts_mode::enforce)
+                {
+                    ++m_tls_refused;
+                    conn_fail(c, "451 4.7.5 " + c.host + " refused STARTTLS: " + said, false);
+                    return;
+                }
                 // Refused: the mail goes in the clear, as it would to a server that never offered TLS.
                 c.starttls = false;
                 c.state = st::ehlo;
@@ -1422,10 +1696,27 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                 conn_fail(c, "451 4.7.0 no TLS session could be made for " + c.host, false);
                 return;
             }
-            // An exchanger's certificate is not checked: TLS against an eavesdropper, as every MTA speaks it unless
-            // DANE or MTA-STS say more; a smarthost's is.
+            // An exchanger's certificate is checked against its TLSA records where there are usable ones, against
+            // the CAs and its name under an enforced MTA-STS policy, and not at all otherwise: TLS against an
+            // eavesdropper, as every MTA speaks it.  A smarthost's is checked always.
             if (!m_relay)
-                SSL_set_verify(c.ssl, SSL_VERIFY_NONE, nullptr);
+            {
+                if (c.dane && !c.tlsa.empty())
+                {
+                    bool added = m_dane && SSL_dane_enable(c.ssl, c.host.c_str()) > 0;
+                    for (const auto& t : c.tlsa)
+                        added = added && SSL_dane_tlsa_add(c.ssl, t.usage, t.selector, t.mtype,
+                                                           reinterpret_cast<const unsigned char*>(t.data.data()),
+                                                           t.data.size()) > 0;
+                    if (!added)
+                    {
+                        conn_fail(c, "451 4.7.5 the TLSA records of " + c.host + " could not be used", false);
+                        return;
+                    }
+                }
+                else if (c.sts != tls_policy::sts_mode::enforce)
+                    SSL_set_verify(c.ssl, SSL_VERIFY_NONE, nullptr);
+            }
             c.after_starttls = true;
             c.state = st::handshake;
             {

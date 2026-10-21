@@ -19,7 +19,7 @@ namespace socketley::dns
 namespace type
 {
 inline constexpr uint16_t A = 1, NS = 2, CNAME = 5, SOA = 6, PTR = 12, HINFO = 13, MX = 15, TXT = 16, AAAA = 28,
-                          SRV = 33, OPT = 41, DS = 43, IXFR = 251, AXFR = 252, ANY = 255, CAA = 257;
+                          SRV = 33, OPT = 41, DS = 43, TLSA = 52, IXFR = 251, AXFR = 252, ANY = 255, CAA = 257;
 }
 namespace rclass
 {

@@ -29,6 +29,9 @@ public:
     client& operator=(const client&) = delete;
     ~client();
 
+    // Where every request connects, a host:port in place of the URL's, which is still the name sent and verified.
+    void connect_to(std::string hostport) { m_connect = std::move(hostport); }
+
     // Trusts `ca_file`, or the system's roots when it is empty; false with `err` when they do not load.
     bool init(std::string& err, const std::string& ca_file = {}, std::string user_agent = "socketley");
 
@@ -51,6 +54,7 @@ private:
 
     SSL_CTX* m_ctx{nullptr};
     std::string m_agent;
+    std::string m_connect;
 };
 
 }   // namespace https_client
