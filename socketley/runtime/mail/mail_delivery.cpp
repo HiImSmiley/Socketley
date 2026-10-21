@@ -703,15 +703,34 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
     // A message that came back to the user it was sent on from is not sent on again.
     const bool looped = headers.find("Delivered-To: " + own + "\r\n") != std::string_view::npos;
     if (!redirects.empty() && looped)
+    {
         LOG_WARN(("mail: a message " + own + "'s filter sent on came back, and is kept rather than sent again").c_str());
-    if (!looped)
-        for (const auto& to : redirects)
-            redirect(e, own, to);
-    if (looped && !redirects.empty() && puts.empty())
-        puts.push_back({inbox, 0});
+        redirects.clear();
+        if (puts.empty())
+            puts.push_back({inbox, 0});
+    }
+    // Sent on once the copies kept are in for good, so a retry of them sends nothing twice.
+    const auto then = [this, e, own, redirects, settle, kept = !puts.empty()](int code, const std::string& text) {
+        if (redirects.empty() || code / 100 == 4)
+        {
+            settle(code, text);
+            return;
+        }
+        redirect(e, own, redirects, [own, settle, kept, code, text](bool ok) {
+            if (ok || kept)
+            {
+                if (!ok)
+                    LOG_WARN(("mail: a message " + own + "'s filter sends on could not be read, and is not sent on")
+                                 .c_str());
+                settle(code, text);
+                return;
+            }
+            settle(451, "451 4.3.0 the message could not be read from the spool to send it on");
+        });
+    };
     if (puts.empty())
     {
-        settle(250, "250 2.0.0 " + std::string(redirects.empty() ? "discarded" : "sent on") + " by the filter");
+        then(250, "250 2.0.0 " + std::string(redirects.empty() ? "discarded" : "sent on") + " by the filter");
         return;
     }
     // Every copy in, or the first refusal of one: the message is delivered once all of them are.
@@ -719,24 +738,29 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
     auto worst = std::make_shared<std::pair<int, std::string>>(250, "250 2.0.0 filed");
     for (const auto& p : puts)
         m_run.boxes()->deliver(e, user, p.folder, head,
-                               [left, worst, settle, alive = m_alive](int code, std::string text) {
+                               [left, worst, then, alive = m_alive](int code, std::string text) {
                                    if (!*alive)
                                        return;
                                    if (code / 100 != 2 && worst->first / 100 == 2)
                                        *worst = {code, std::move(text)};
                                    if (--*left == 0)
-                                       settle(worst->first, worst->second);
+                                       then(worst->first, worst->second);
                                },
                                p.flags);
 }
 
-void delivery::redirect(const entry_ptr& e, const std::string& own, const std::string& to)
+void delivery::redirect(const entry_ptr& e, const std::string& own, std::vector<std::string> to,
+                        std::function<void(bool)> done)
 {
     // Sent from the user's own address, so a bounce comes to them and SPF is this runtime's to pass.
-    const auto send = [this, own, to](std::string_view whole) {
-        ++m_sieve_redirected;
-        m_run.queue_message(own, {to}, "Delivered-To: " + own + "\r\n" + std::string(whole), false, {},
-                            [](bool, std::string) {});
+    const auto send = [this, own, to = std::move(to), done](std::string_view whole) {
+        for (const auto& t : to)
+        {
+            ++m_sieve_redirected;
+            m_run.queue_message(own, {t}, "Delivered-To: " + own + "\r\n" + std::string(whole), false, {},
+                                [](bool, std::string) {});
+        }
+        done(true);
     };
     if (e->body)
     {
@@ -744,9 +768,13 @@ void delivery::redirect(const entry_ptr& e, const std::string& own, const std::s
         return;
     }
     m_run.queue().read(e, 0, static_cast<uint32_t>(std::min<uint64_t>(e->body_len, UINT32_MAX)),
-                       [send, alive = m_alive](bool ok, std::string_view b) {
-                           if (*alive && ok)
+                       [send, done, alive = m_alive](bool ok, std::string_view b) {
+                           if (!*alive)
+                               return;
+                           if (ok)
                                send(b);
+                           else
+                               done(false);
                        });
 }
 
@@ -1365,10 +1393,19 @@ void delivery::report(const entry_ptr& e, bool delay)
             ++m_bounced;
         else
             ++m_reports;
-        const std::string id = e->id;
-        m_run.queue_message("", {e->from}, std::move(msg), true, {}, [this, id, delay, alive](bool, std::string) {
-            if (*alive && !delay)
-                m_run.queue().remove(id);
+        m_run.queue_message("", {e->from}, std::move(msg), true, {}, [this, e, delay, alive](bool ok, std::string) {
+            if (!*alive || delay)
+                return;
+            if (ok)
+            {
+                m_run.queue().remove(e->id);
+                return;
+            }
+            // A report the spool would not take is made again later, and the message kept until it is.
+            LOG_WARN(("mail: the report on " + e->id + " could not be queued, and is tried again").c_str());
+            const int64_t next = wall::now_ms_coarse() + 300000;
+            m_run.queue().retry(*e, e->attempts, next);
+            schedule(e, next);
         });
     });
 }

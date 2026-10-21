@@ -139,7 +139,9 @@ private:
     void apply(const std::shared_ptr<item>& it, const std::string& user, const std::string& own,
                const std::string& head, std::string_view bytes, const sieve::outcome& out,
                std::function<void(int, const std::string&)> settle);
-    void redirect(const entry_ptr& e, const std::string& own, const std::string& to);
+    // The message sent on to each of `to`, `done` once it is queued for them or false where it could not be read.
+    void redirect(const entry_ptr& e, const std::string& own, std::vector<std::string> to,
+                  std::function<void(bool)> done);
     void vacation(const std::string& own, const sieve::vacation& v, std::string_view msgid);
     std::string signing_domain(std::string_view from_header) const;
 

@@ -10,6 +10,8 @@
 #   * a literal past a script's size read as commands, or the active script deleted
 #   * fileinto not filing, its imap4flags lost, discard keeping, reject not telling the sender
 #   * redirect :copy not sending a copy, or not keeping one
+#   * a message past a mebibyte a filter sends on lost, or sent on again by every try of the copy it keeps
+#   * a command of literals before sign-in held in memory past what any command takes
 #   * a vacation answered twice to one sender, or not at all, or from a sender a bounce could answer
 #   * a script deactivated still run
 set -uo pipefail
@@ -78,6 +80,8 @@ if header :contains "subject" "invoice" { fileinto :flags "\\Flagged" "Bills"; s
 if header :contains "subject" "spam" { discard; stop; }
 if address :is "from" "pest@remote.test" { reject "Not from you"; stop; }
 if header :contains "subject" "share" { redirect :copy "friend@remote.test"; }
+if header :contains "subject" "large" { redirect "big@remote.test"; stop; }
+if header :contains "subject" "twice" { redirect :copy "copy@remote.test"; stop; }
 vacation :days 1 :subject "Away" "I am away until Monday.";
 SIEVE
 python3 - "$SV" "$T/script.sieve" > "$T/ms.out" 2>&1 <<'PY'
@@ -208,6 +212,58 @@ f=$(printf '%s\n' "$v" | head -1)
     && ok "from the null sender, auto-replied, in reply to his message" \
     || bad "from the null sender, auto-replied, in reply to his message" "$(head -12 "$f" 2>/dev/null)"
 
+# ─── what is sent on ────────────────────────────────────────────────────────
+# Past a mebibyte the message is a file of its own, read back to be sent on before the spool lets it go.
+python3 - "$P" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1])); s.ehlo("x")
+body = "".join("large line %06d %s\r\n" % (i, "z" * 60) for i in range(20000))
+s.sendmail("dave@remote.test", ["alice@example.test"],
+           "From: dave@remote.test\r\nTo: alice@example.test\r\nSubject: large one\r\n\r\n" + body)
+PY
+f=$(at_sink "^Subject: large one")
+[ -n "$f" ] && grep -q '^rcpt big@remote.test' "$f" && [ "$(grep -c '^large line ' "$f")" = 20000 ] \
+    && ok "a message past a mebibyte that a filter only sends on arrives whole" \
+    || bad "a message past a mebibyte that a filter only sends on arrives whole" "${f:-none} $(grep -c '^large line ' "$f" 2>/dev/null)"
+# The copy kept fails while the storage is down and is tried three times; the one sent on goes once.
+"$BIN" stop st >/dev/null 2>&1
+send erin@remote.test "twice over"
+for _ in $(seq 1 50); do "$BIN" mail m queue 2>/dev/null | grep -q erin@remote.test && break; sleep 0.1; done
+sleep 1; "$BIN" mail m flush >/dev/null 2>&1; sleep 1; "$BIN" mail m flush >/dev/null 2>&1; sleep 1
+"$BIN" start st >/dev/null 2>&1
+for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PS/")" != 000 ] && break; sleep 0.1; done
+"$BIN" mail m flush >/dev/null 2>&1
+for _ in $(seq 1 100); do "$BIN" mail m queue 2>/dev/null | grep -q erin@remote.test || break; sleep 0.1; done
+sleep 0.5
+check "a message whose kept copy is tried again is sent on once" \
+    "$(grep -l '^rcpt copy@remote.test' "$T"/sink/*.eml 2>/dev/null | xargs -r grep -l 'body of twice over' | wc -l)" "1"
+# Three hundred literals of a command before sign-in: what is held stays near a script's size, and it is refused.
+pid=$(ss -ltnpH "sport = :$SV" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+r=$(python3 - "$SV" "$pid" <<'PY'
+import socket, sys, time
+port, pid = int(sys.argv[1]), sys.argv[2]
+def rss():
+    for l in open("/proc/%s/status" % pid):
+        if l.startswith("VmRSS:"):
+            return int(l.split()[1])
+s = socket.create_connection(("127.0.0.1", port), timeout=10); f = s.makefile("rb")
+while not f.readline().startswith(b"OK"): pass
+before = rss()
+s.sendall(b"NOOP {60000+}\r\n")
+for _ in range(299):
+    s.sendall(b"a" * 60000 + b" {60000+}\r\n")
+s.sendall(b"a" * 60000)
+time.sleep(1)
+grown = rss() - before
+s.sendall(b'\r\nNOOP "after"\r\n')
+r1 = f.readline()
+while r1[:2] not in (b"OK", b"NO", b"BY"):
+    r1 = f.readline()
+print(grown < 8192, r1[:2].decode(), f.readline()[:2].decode())
+PY
+)
+check "a command of three hundred literals before sign-in is held small, refused, and the next one answered" "$r" "True NO OK"
+
 # ─── the CLI ────────────────────────────────────────────────────────────────
 check "socketley mail sieve lists a user's scripts" "$("$BIN" mail m sieve alice list 2>&1)" "main	active"
 printf 'require "fileinto";\nfileinto "Elsewhere"\n' > "$T/bad.sieve"
@@ -215,8 +271,9 @@ out=$("$BIN" mail m sieve alice put other "$T/bad.sieve" 2>&1); rc=$?
 case "$out" in error*line*) [ $rc = 1 ] && ok "and refuses one that does not compile, saying where" \
     || bad "and refuses one that does not compile" "rc $rc" ;; *) bad "and refuses one that does not compile, saying where" "$out" ;; esac
 "$BIN" mail m sieve alice deactivate >/dev/null 2>&1
+n0=$(keys INBOX | wc -l)
 send carol@remote.test "after deactivate"
-for _ in $(seq 1 60); do [ "$(keys INBOX | wc -l)" -ge 4 ] && break; sleep 0.1; done
+for _ in $(seq 1 60); do [ "$(keys INBOX | wc -l)" -gt "$n0" ] && break; sleep 0.1; done
 sleep 0.5
 check "a script deactivated is no longer run" \
     "$(grep -l '^Subject: Away' "$T"/sink/*.eml 2>/dev/null | xargs -r grep -l '^rcpt carol@remote.test' | wc -l)" "0"

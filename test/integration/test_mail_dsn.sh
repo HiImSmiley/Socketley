@@ -181,6 +181,44 @@ check "and told once" "$(grep -l 'Delayed Mail' "$T"/rich/*.eml 2>/dev/null | wc
 s=$("$BIN" stats d 2>/dev/null | sed -n 's/^mail_reports://p')
 [ "${s:-0}" -ge 2 ] && ok "stats count mail_reports ($s)" || bad "stats count mail_reports" "${s:-absent}"
 
+# ─── a report the spool cannot take ─────────────────────────────────────────
+# With the spool's directory shut, a message just under a mebibyte is a record and its RET=FULL report a file it cannot
+# make: the message waits for the report rather than going without one.
+SPD=$(find "$HOME/.local/share" -type d -path '*/mail/d/spool' 2>/dev/null | head -1)
+if [ "$(id -u)" = 0 ] || [ -z "$SPD" ]; then
+    echo "  SKIP: a report the spool cannot take needs a spool directory root cannot write past"
+else
+    chmod 555 "$SPD"
+    id=$(python3 - "$P" <<'PY'
+import re, smtplib, sys
+head = "Subject: unwritable\r\n\r\n"
+# The largest size the spool takes as a record, where its own Received line is all the room left.
+for size in range(1048570, 1046000, -40):
+    rest = size - len(head)
+    body = head + ("u" * 78 + "\r\n") * (rest // 80) + "v" * max(rest % 80 - 2, 0) + "\r\n"
+    s = smtplib.SMTP("127.0.0.1", int(sys.argv[1])); s.ehlo("c")
+    s.mail("s@remote.test", ["RET=FULL"]); s.rcpt("bad@plain.test")
+    code, text = s.data(body.encode())
+    if code != 250:
+        continue
+    m = re.search(rb"queued as (\S+)", text)
+    print(m.group(1).decode() if m else "")
+    break
+PY
+)
+    sleep 2
+    "$BIN" mail d show "$id" >/dev/null 2>&1
+    check "a message whose report cannot be queued is kept for it" "$?" "0"
+    chmod 755 "$SPD"
+    "$BIN" mail d flush "$id" >/dev/null 2>&1
+    f=$(mail_in rich "^Subject: unwritable")
+    [ -n "$f" ] && grep -q '^Action: failed' "$f" && ok "and its report goes once it can" \
+        || bad "and its report goes once it can" "${f:-none}"
+    for _ in $(seq 1 50); do "$BIN" mail d show "$id" >/dev/null 2>&1 || break; sleep 0.1; done
+    "$BIN" mail d show "$id" >/dev/null 2>&1
+    check "and the message then goes" "$?" "1"
+fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

@@ -50,6 +50,8 @@ public:
     const std::string& user() const { return m_user; }
 
     static constexpr size_t max_line = 8192;
+    // More arguments than any command takes.
+    static constexpr size_t max_args = 8;
 
 private:
     // One argument as the command line gave it: a quoted string, a literal's bytes, or an atom.

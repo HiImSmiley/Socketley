@@ -157,8 +157,12 @@ void managesieve_session::run()
                     bad = true;
                     break;
                 }
-                // A literal past a script's size is read and dropped, and the command refused.
-                m_dropping = len > sieve_store::max_script + 1024;
+                // A literal past a script's size, or a command past what any takes, is read and dropped, and refused.
+                size_t held = 0;
+                for (const auto& a : m_args)
+                    held += a.text.size();
+                m_dropping = m_dropping || len > sieve_store::max_script + 1024 ||
+                             held + len > sieve_store::max_script + max_line;
                 m_args.push_back({{}, true});
                 m_literal = len;
                 literal = true;
@@ -169,6 +173,11 @@ void managesieve_session::run()
                 j = line.size();
             m_args.push_back({std::string(line.substr(i, j - i)), false});
             i = j;
+        }
+        if (m_args.size() > max_args)
+        {
+            m_args.resize(max_args);
+            m_dropping = true;
         }
         if (bad)
         {
@@ -252,6 +261,11 @@ void managesieve_session::command()
     }
     const std::string& verb = m_args[0].text;
     using socketley::ascii::iequals;
+    if (m_dropping && !iequals(verb, "PUTSCRIPT") && !iequals(verb, "CHECKSCRIPT"))
+    {
+        no({}, "The command is longer than any this server takes");
+        return;
+    }
     const auto str = [this](size_t i) -> const std::string* {
         return i < m_args.size() && m_args[i].string ? &m_args[i].text : nullptr;
     };
