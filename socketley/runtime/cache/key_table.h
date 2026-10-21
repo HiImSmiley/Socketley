@@ -249,6 +249,23 @@ public:
         return it == end() ? begin() : it;
     }
 
+    // An entry drawn alike for every one, a slot at random until a live one, where at_or_after() favours an entry
+    // behind empty slots; past 256 misses the table is that sparse and at_or_after() answers.
+    template <class Draw>
+    const_iterator at_random(Draw&& draw) const
+    {
+        if (m_size == 0)
+            return end();
+        size_t i = 0;
+        for (int t = 0; t < 256; ++t)
+        {
+            i = static_cast<size_t>(draw()) & (m_cap - 1);
+            if (m_slots[i].live())
+                return const_iterator(this, i);
+        }
+        return at_or_after(i);
+    }
+
     size_t               bucket_count() const { return m_cap; }
     local_iterator       begin(size_t b)       { return local_iterator(m_slots[b].live() ? m_slots[b].e() : nullptr); }
     local_iterator       end(size_t)           { return local_iterator(); }
@@ -528,6 +545,8 @@ public:
     const_iterator begin() const { return const_iterator(m_t.begin()); }
     const_iterator end()   const { return const_iterator(m_t.end()); }
     const_iterator at_or_after(size_t i) const { return const_iterator(m_t.at_or_after(i)); }
+    template <class Draw>
+    const_iterator at_random(Draw&& draw) const { return const_iterator(m_t.at_random(draw)); }
 
     size_t               bucket_count() const { return m_t.bucket_count(); }
     size_t capacity_after_insert() const { return m_t.capacity_after_insert(); }

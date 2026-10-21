@@ -976,7 +976,7 @@ std::string_view cache_store::random_key() const
             r -= t.size();
             return;
         }
-        out = t.at_or_after(static_cast<size_t>(sample_rng()()))->first;
+        out = t.at_random(sample_rng())->first;
         found = true;
     };
     pick(m_data);
@@ -2093,10 +2093,10 @@ bool cache_store::lmove(std::string_view src, std::string_view dst,
 
 // ─── Sets, the sampling spellings ───
 
-// A member from a random slot on, which is Redis's choice and keeps SPOP from walking every slot it emptied before.
+// A member drawn alike for each, which keeps SPOP from walking every slot it emptied before.
 static set_inner::const_iterator any_member(const set_inner& s)
 {
-    return s.at_or_after(static_cast<size_t>(sample_rng()()));
+    return s.at_random(sample_rng());
 }
 
 bool cache_store::spop(std::string_view key, std::string& out)

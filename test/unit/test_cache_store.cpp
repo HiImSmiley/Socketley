@@ -4401,3 +4401,32 @@ TEST_CASE("RANDOMKEY draws from every key of every type")
         seen.insert(std::string(store.random_key()));
     CHECK(seen.size() == 52);
 }
+
+TEST_CASE("RANDOMKEY and SRANDMEMBER draw every key about as often as any other")
+{
+    // A key behind a neighbour in a sparse table was drawn once for every forty of a key behind empty slots.
+    cache_store store;
+    for (int i = 0; i < 50; ++i)
+        store.set("k" + std::to_string(i), "v");
+    std::map<std::string, int> keys;
+    for (int i = 0; i < 50000; ++i)
+        ++keys[std::string(store.random_key())];
+    REQUIRE(keys.size() == 50);
+    const auto [kmin, kmax] = std::minmax_element(keys.begin(), keys.end(),
+        [](const auto& a, const auto& b) { return a.second < b.second; });
+    CHECK(kmin->second * 2 > kmax->second);
+
+    for (int i = 0; i < 100; ++i)
+        store.sadd("s", "m" + std::to_string(i));
+    std::map<std::string, int> members;
+    std::string m;
+    for (int i = 0; i < 100000; ++i)
+    {
+        REQUIRE(store.srandmember("s", m));
+        ++members[m];
+    }
+    REQUIRE(members.size() == 100);
+    const auto [mmin, mmax] = std::minmax_element(members.begin(), members.end(),
+        [](const auto& a, const auto& b) { return a.second < b.second; });
+    CHECK(mmin->second * 2 > mmax->second);
+}
