@@ -40,6 +40,12 @@ public:
     uint16_t get_imap_port() const { return m_imap; }
     void set_imaps_port(uint16_t p) { m_imaps = p; }
     uint16_t get_imaps_port() const { return m_imaps; }
+    // ManageSieve (RFC 5804), where users put their filters.
+    void set_sieve_port(uint16_t p) { m_sieve = p; }
+    uint16_t get_sieve_port() const { return m_sieve; }
+    // The DNS blocklists a connection's address is looked up in, a comma list of zones.
+    void set_dnsbl(std::string_view zones) { m_dnsbl = std::string(zones); }
+    std::string_view get_dnsbl() const { return m_dnsbl; }
     // The dns runtime whose zones are the mail domains, and which is given their MX, SPF, DKIM and DMARC records.
     void set_dns(std::string_view rt) { m_dns = std::string(rt); }
     std::string_view get_dns() const { return m_dns; }
@@ -102,6 +108,8 @@ private:
     uint16_t    m_submissions{0};
     uint16_t    m_imap{0};
     uint16_t    m_imaps{0};
+    uint16_t    m_sieve{0};
+    std::string m_dnsbl;
     std::string m_dns;
     std::string m_domains;
     std::string m_hostname;

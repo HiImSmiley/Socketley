@@ -1882,6 +1882,17 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             return port("--imap requires a port from 1 to 65535, such as 143\n", &mail_instance::set_imap_port);
         case fnv1a("--imaps"):
             return port("--imaps requires a port from 1 to 65535, such as 993\n", &mail_instance::set_imaps_port);
+        case fnv1a("--sieve"):
+            return port("--sieve requires a port from 1 to 65535, such as 4190\n", &mail_instance::set_sieve_port);
+        case fnv1a("--dnsbl"):
+            if (next.empty() || next.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789.-,") != std::string_view::npos ||
+                next.front() == '.' || next.find("..") != std::string_view::npos)
+            {
+                std::cout << "--dnsbl requires a blocklist's zone, or a comma list of them, such as zen.spamhaus.org\n";
+                return 1;
+            }
+            ml->set_dnsbl(pa.args[++i]);
+            return 0;
         // The dns runtime whose zones are the mail domains.
         case fnv1a("--dns"):
             return runtime("--dns requires the name of a dns runtime of this daemon\n", &mail_instance::set_dns, false);

@@ -200,6 +200,10 @@ void apply_mail_config(mail_instance& ml, const runtime_config& cfg, bool by_pre
         ml.set_imap_port(cfg.mail_imap);
     if (asked("imaps", cfg.mail_imaps != defaults.mail_imaps))
         ml.set_imaps_port(cfg.mail_imaps);
+    if (asked("sieve", cfg.mail_sieve != defaults.mail_sieve))
+        ml.set_sieve_port(cfg.mail_sieve);
+    if (asked("dnsbl", !cfg.mail_dnsbl.empty()))
+        ml.set_dnsbl(cfg.mail_dnsbl);
     if (asked("dns", !cfg.mail_dns.empty()))
         ml.set_dns(cfg.mail_dns);
     if (asked("mail_domain", !cfg.mail_domains.empty()))

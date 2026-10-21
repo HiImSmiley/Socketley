@@ -752,6 +752,8 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.mail_submissions = ml->get_submissions_port();
             cfg.mail_imap = ml->get_imap_port();
             cfg.mail_imaps = ml->get_imaps_port();
+            cfg.mail_sieve = ml->get_sieve_port();
+            cfg.mail_dnsbl = std::string(ml->get_dnsbl());
             cfg.mail_dns = std::string(ml->get_dns());
             cfg.mail_domains = std::string(ml->get_mail_domains());
             cfg.mail_hostname = std::string(ml->get_hostname());
@@ -1195,6 +1197,10 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_int_field("imap", cfg.mail_imap);
             if (cfg.mail_imaps)
                 append_int_field("imaps", cfg.mail_imaps);
+            if (cfg.mail_sieve)
+                append_int_field("sieve", cfg.mail_sieve);
+            if (!cfg.mail_dnsbl.empty())
+                append_str_field("dnsbl", cfg.mail_dnsbl);
             if (!cfg.mail_dns.empty())
                 append_str_field("dns", cfg.mail_dns);
             if (!cfg.mail_domains.empty())
@@ -1468,6 +1474,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.mail_submissions = static_cast<uint16_t>(json_get_uint32(json, "submissions"));
             cfg.mail_imap = static_cast<uint16_t>(json_get_uint32(json, "imap"));
             cfg.mail_imaps = static_cast<uint16_t>(json_get_uint32(json, "imaps"));
+            cfg.mail_sieve = static_cast<uint16_t>(json_get_uint32(json, "sieve"));
+            cfg.mail_dnsbl = json_get_string(json, "dnsbl");
             cfg.mail_dns = json_get_string(json, "dns");
             cfg.mail_domains = json_get_string(json, "mail_domain");
             cfg.mail_hostname = json_get_string(json, "hostname");

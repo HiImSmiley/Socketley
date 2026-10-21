@@ -237,6 +237,8 @@ struct runtime_config
     uint16_t mail_submissions = 0;
     uint16_t mail_imap = 0;
     uint16_t mail_imaps = 0;
+    uint16_t mail_sieve = 0;
+    std::string mail_dnsbl;
     std::string mail_dns;
     std::string mail_domains;
     std::string mail_hostname;

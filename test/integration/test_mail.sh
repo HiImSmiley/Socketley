@@ -14,6 +14,7 @@
 #   * a recipient refused for good not bounced to its sender, one refused for now not tried again
 #   * a queued message lost by a restart
 #   * the end of a message read where another server would not see one (SMTP smuggling), or a message past the size
+#   * mail taken from an address a --dnsbl list names, or refused from one it does not, or for its error answer
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -47,7 +48,7 @@ trap cleanup EXIT
 echo "=== Integration: a mail runtime takes, keeps, signs, sends, retries and bounces mail ==="
 
 python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 \
-    >/dev/null 2>&1 &
+    2.0.0.127.bl.test=127.0.0.2 4.0.0.127.bl.test=127.255.255.254 >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
 export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK"
@@ -258,6 +259,23 @@ mail_with "lua body" >/dev/null && ok "socketley.mail.send from another runtime'
     || bad "socketley.mail.send from another runtime's script queues and sends" "$(tail -3 "$SOCKETLEY_DLOG")"
 
 "$BIN" mail m show nosuchid >/dev/null 2>&1; check "show of a message not queued says so" "$?" "1"
+
+# ─── a blocklist ────────────────────────────────────────────────────────────
+"$BIN" create mail mb -p $((SL_PORT_BASE+1987)) --mail-domain example.test --aliases "$T/aliases" --dnsbl bl.test -s \
+    >/dev/null 2>&1
+ready_tcp 127.0.0.1 $((SL_PORT_BASE+1987)) || bad "the runtime with a blocklist listens" "$(tail -3 "$SOCKETLEY_DLOG")"
+from_ip() { # from_ip <ip>: what MAIL is answered from that address
+    python3 - "$1" $((SL_PORT_BASE+1987)) <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[2]), source_address=(sys.argv[1], 0), timeout=10)
+s.ehlo("x")
+c, m = s.docmd("MAIL FROM:<carol@else.test>")
+print(c, m.decode().split(";")[-1].strip() if c != 250 else "")
+PY
+}
+check "an address the list names sends nothing" "$(from_ip 127.0.0.2)" "554 127.0.0.2 is listed by bl.test"
+check "one it does not name is taken" "$(from_ip 127.0.0.3)" "250 "
+check "and a list's error answer names nobody" "$(from_ip 127.0.0.4)" "250 "
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

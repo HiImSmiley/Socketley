@@ -1005,7 +1005,7 @@ tries every message, or the one named, now;
 .B drop
 deletes one, told to nobody.
 .B dns
-prints the MX, SPF, DKIM and DMARC records its domains need, for a zone kept
+prints the MX, SPF, DKIM, DMARC and SRV records its domains need, for a zone kept
 elsewhere than a dns runtime of this daemon;
 .B suppressed
 the addresses bounces said are dead, which are not mailed again until
@@ -12652,6 +12652,13 @@ their username at one of its domains or their account's email. A connection
 quiet for five minutes is closed.
 .PP
 .B What it checks.
+With
+.BR \-\-dnsbl ,
+a connection on port 25 not from 127.0.0.1 has its address asked of each list
+while it is greeted, and its MAIL waits for the answer if it has not come: one
+a list names (an address in 127/8) sends nothing, 554, unless it signs in. A
+list's error answer (127.255.255.x) names nobody, and a list that does not
+answer lets the mail by; an answer is kept five minutes.
 Mail from elsewhere (port 25, no user signed in, not 127.0.0.1) is checked
 before it is taken: SPF (RFC 7208) for the sender's domain, or HELO's for a
 bounce; every DKIM signature (up to five); and DMARC (RFC 7489) for the domain
@@ -12745,8 +12752,18 @@ example.com.                 MX   10 mail.example.com.
 example.com.                 TXT  "v=spf1 mx \-all"
 skl._domainkey.example.com.  TXT  "v=DKIM1; k=rsa; p=..."
 _dmarc.example.com.          TXT  "v=DMARC1; p=quarantine; adkim=r; aspf=r"
+_imaps._tcp.example.com.     SRV  0 1 993 mail.example.com.
 .fi
 .RE
+.IP
+with an SRV record (RFC 6186, RFC 8314) for each of
+.BR \-\-submission ,
+.BR \-\-submissions ,
+.BR \-\-imap ,
+.B \-\-imaps
+and
+.B \-\-sieve
+it opens, so a mail client finds them from the address alone,
 .IP
 and its host,
 .BI mail. domain
@@ -12761,7 +12778,7 @@ dns runtime,
 .B socketley mail
 .I m
 .B dns
-prints the four lines for the zone kept elsewhere.
+prints the lines for a zone kept elsewhere.
 .PP
 .B No\-reply.
 With
@@ -12927,6 +12944,11 @@ How long a message is tried before it is bounced, 1m to 30d, 5d unless given.
 .TP
 .BI "\-\-dkim\-selector " name
 The selector its DKIM key is published and signed under, skl unless given.
+.TP
+.BI "\-\-dnsbl " zone\fR[,\fIzone\fR...]
+DNS blocklists (RFC 5782), such as zen.spamhaus.org: a stranger's address is
+asked under each as it connects, and MAIL from one a list names is refused with
+554.
 .PP
 .B stats
 says what was received, delivered, deferred, failed and bounced, the other

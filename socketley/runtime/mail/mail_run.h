@@ -19,6 +19,7 @@
 #include "mail_aliases.h"
 #include "mail_command.h"
 #include "imap_session.h"
+#include "mail_dnsbl.h"
 #include "mail_spool.h"
 #include "smtp_session.h"
 #include "../../shared/crypto/password_file.h"
@@ -143,6 +144,11 @@ private:
         // An idp user signed in, and the address the account names, which with its username are what it sends as.
         bool idp_user{false};
         std::string user_email;
+        // Its address in --dnsbl's lists: not asked, being asked, listed nowhere, listed by `listed_by`; and the
+        // MAIL that waits for the answer.
+        uint8_t blocklist{0};
+        std::string listed_by;
+        std::function<void()> after_blocklist;
 
         void reply(std::string_view bytes) override;
         void start_tls() override;
@@ -217,6 +223,7 @@ private:
     // SPF, DKIM and DMARC of mail from elsewhere, whose lookups block a thread of these and never the loop.
     hash_pool m_checks;
     spool m_spool;
+    std::unique_ptr<dnsbl> m_dnsbl;
     std::unique_ptr<tls_context> m_tls;
     std::unique_ptr<socketley::idp::session_verifier> m_idp;
     std::unique_ptr<delivery> m_delivery;
@@ -265,6 +272,7 @@ private:
     uint64_t m_suppressions{0};
     uint64_t m_checked{0};
     uint64_t m_dmarc_rejected{0};
+    uint64_t m_blocklisted{0};
     uint64_t m_quarantined{0};
 };
 

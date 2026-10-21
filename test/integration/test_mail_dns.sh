@@ -19,6 +19,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_ready.sh"
 
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 is required"; exit 0; }
+command -v openssl >/dev/null 2>&1 || { echo "  SKIP: openssl is required"; exit 0; }
 command -v dig >/dev/null 2>&1 || { echo "  SKIP: dig is required"; exit 0; }
 
 PASS=0; FAIL=0; TOTAL=0
@@ -64,7 +65,10 @@ q() { dig +short +time=2 +tries=1 -p "$DNSP" @127.0.0.1 "$@" 2>/dev/null; }
 
 "$BIN" create dns ns -p "$DNSP" --zone example.test --publish 192.0.2.10 --proxy none -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$DNSP" >/dev/null 2>&1 || true
-"$BIN" create mail m -p "$P" --dns ns --no-reply -s >/dev/null 2>&1
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=mail.example.test" -keyout "$T/key.pem" \
+    -out "$T/cert.pem" >/dev/null 2>&1
+"$BIN" create mail m -p "$P" --dns ns --no-reply --tls --cert "$T/cert.pem" --key "$T/key.pem" \
+    --submissions $((P+5)) -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$P" || bad "the mail runtime listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 
 # ─── its records ────────────────────────────────────────────────────────────
@@ -77,7 +81,9 @@ served=$(q skl._domainkey.example.test TXT | tr -d '" \n')
 want=$("$BIN" mail m dns 2>/dev/null | sed -n 's/^skl._domainkey.example.test. 300 IN TXT "\(.*\)"$/\1/p' | tr -d ' ')
 [ -n "$want" ] && [ "$served" = "$want" ] && ok "and its DKIM key, whole across the 255-byte strings" \
     || bad "and its DKIM key, whole across the 255-byte strings" "served ${served:0:60}..., want ${want:0:60}..."
-check "socketley mail dns prints the four for a zone kept elsewhere" "$("$BIN" mail m dns 2>/dev/null | wc -l)" "4"
+check "and where a mail client sends from" "$(q _submissions._tcp.example.test SRV)" "0 1 $((P+5)) mail.example.test."
+check "and no SRV for a port it does not open" "$(q _imap._tcp.example.test SRV)" ""
+check "socketley mail dns prints the five for a zone kept elsewhere" "$("$BIN" mail m dns 2>/dev/null | wc -l)" "5"
 
 # ─── no-reply ───────────────────────────────────────────────────────────────
 "$BIN" send m --to amy@remote.test --subject "notice" --text "noreply body" >/dev/null 2>&1

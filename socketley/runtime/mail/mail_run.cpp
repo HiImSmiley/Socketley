@@ -242,6 +242,11 @@ bool mail_run::start(std::string& why)
         return false;
     m_domains = m_owner.domains();
     m_hostname = m_owner.greeting_name();
+    if (!m_owner.get_dnsbl().empty())
+    {
+        m_dnsbl = std::make_unique<dnsbl>(m_fio);
+        m_dnsbl->set_zones(m_owner.get_dnsbl());
+    }
     refresh_domains();
     load_suppressed(false);
     if (m_owner.get_tls())
@@ -500,6 +505,25 @@ void mail_run::begin_session(conn& c)
     {
         c.smtp = std::make_unique<smtp_session>(session_config(c), c);
         c.smtp->greet();
+        // A stranger's address is asked of the blocklists while it greets, so MAIL seldom waits for them.
+        if (c.kind == port_kind::smtp && m_dnsbl && m_dnsbl->enabled() && !loopback(c.peer))
+        {
+            c.blocklist = 1;
+            m_dnsbl->check(peer_ip(c.peer), [this, id = c.id, alive = m_alive](std::string zone) {
+                conn* x = *alive ? find(id) : nullptr;
+                if (!x || x->dead)
+                    return;
+                x->blocklist = zone.empty() ? 2 : 3;
+                x->listed_by = std::move(zone);
+                if (auto go = std::move(x->after_blocklist))
+                {
+                    x->in_input = true;
+                    go();
+                    x->in_input = false;
+                    flush(*x);
+                }
+            });
+        }
     }
     c.in_input = false;
     flush(c);
@@ -974,6 +998,18 @@ void mail_run::conn::authenticate(std::string_view, std::string user, std::strin
 
 void mail_run::conn::mail_from(const address& from, std::function<void(rcpt_verdict)> done)
 {
+    // A stranger's address its blocklists list sends nothing, and MAIL waits for their answer if it has not come.
+    if (blocklist == 1)
+    {
+        after_blocklist = [this, from, done] { mail_from(from, done); };
+        return;
+    }
+    if (blocklist == 3 && smtp->user().empty())
+    {
+        ++run->m_blocklisted;
+        done({554, "Service unavailable; " + peer_ip(peer) + " is listed by " + listed_by});
+        return;
+    }
     // A user of the idp runtime sends as their own address, its username at a domain of this runtime or the email
     // their account names, as Postfix's reject_sender_login_mismatch has it.
     if (idp_user && !from.empty())
@@ -1438,6 +1474,15 @@ std::string mail_run::records_text() const
         if (!dkim.empty())
             out += sel + "._domainkey." + d + ". 300 IN TXT \"" + dkim + "\"\n";
         out += "_dmarc." + d + ". 300 IN TXT \"v=DMARC1; p=quarantine; adkim=r; aspf=r\"\n";
+        // Where a mail client finds the ports it sends and reads on (RFC 6186, RFC 8314), and its filters' (RFC 5804).
+        for (const auto& [service, port] : {std::pair{"_submissions", m_owner.get_submissions_port()},
+                                            {"_submission", m_owner.get_submission_port()},
+                                            {"_imaps", m_owner.get_imaps_port()},
+                                            {"_imap", m_owner.get_imap_port()},
+                                            {"_sieve", m_owner.get_sieve_port()}})
+            if (port)
+                out += std::string(service) + "._tcp." + d + ". 300 IN SRV 0 1 " + std::to_string(port) + " " +
+                       m_hostname + ".\n";
     }
     return out;
 }
@@ -1665,6 +1710,12 @@ std::string mail_run::stats() const
     }
     put(out, "mail_checked", m_checked);
     put(out, "mail_dmarc_rejected", m_dmarc_rejected);
+    if (m_dnsbl)
+    {
+        put(out, "mail_dnsbl_asked", m_dnsbl->asked());
+        put(out, "mail_dnsbl_listed", m_dnsbl->listed());
+        put(out, "mail_blocklisted", m_blocklisted);
+    }
     put(out, "mail_quarantined", m_quarantined);
     put(out, "auth_ok", m_auth_ok);
     put(out, "auth_failed", m_auth_failed);
