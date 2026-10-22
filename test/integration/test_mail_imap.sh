@@ -9,7 +9,8 @@
 #   * a FETCH a client makes (UID, flags, size, the headers it lists, BODYSTRUCTURE, the body) answered wrong
 #   * \Seen not set by reading, a flag not kept, a search not finding what it should
 #   * APPEND, COPY and MOVE without the UIDs UIDPLUS gives, or EXPUNGE leaving the object in the storage
-#   * new mail not told by NOOP or IDLE, or flags and UIDs lost by a restart
+#   * new mail not told by NOOP or IDLE, or told only when the bucket is next listed
+#   * flags and UIDs lost by a restart
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -176,6 +177,13 @@ elif step == "idle":
     say("IDLE tells new mail as it comes", first.startswith(b"+") and b"EXISTS" in line, (first, line))
     M.send(b"DONE\r\n")
     M.readline()
+    # Just after a listing of the bucket, so only the index can tell what came since.
+    n = int(M.select("INBOX")[1][0])
+    s.sendmail("hal@else.test", ["alice@example.test"], "From: hal@else.test\r\nSubject: six\r\n\r\nsixth\r\n")
+    time.sleep(0.5)
+    M.noop()
+    exists = M.untagged_responses.get("EXISTS", [b"0"])[-1]
+    say("a delivery is told by the next NOOP, not by the next listing of the bucket", int(exists) == n + 1, (n, exists))
     M.logout()
 elif step == "after":
     typ, data = M.select("INBOX")
@@ -551,24 +559,21 @@ idx=$(find "$HOME/.local/share" -path '*/mail/msh.imap/alice' 2>/dev/null | head
     || bad "a journal past a quarter of a mebibyte is folded into its snapshot" "$(head -c 20 "$idx" 2>/dev/null) $(stat -c %s "$idx.log" 2>/dev/null)"
 check "and every shard reads the same flags after" "$r" "1 True"
 
-# A literal inside a literal names a length that wraps past the end: the command is refused, the connection answers.
+# A literal's marker glued to an atom is no literal, so the bytes after it are never taken as one; a length that wraps
+# past the end of what came is refused before sign-in, and the connection answers on.
 r=$(python3 - "$IM" <<'PY'
 import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3); f = s.makefile("rb"); f.readline()
-# The inner literal's length is 2^64 less where its bytes would begin, so begin plus length is 0.
-inner_at = len(b"a X Y{27}\r\n") + 1 + 1 + 20 + 3
-content = b" {%d}\r\nzz" % (2 ** 64 - inner_at)
-assert len(content) == 27
 s.sendall(b"a X Y{27}\r\n")
 try:
-    f.readline()
-    s.sendall(content + b"\r\nb NOOP\r\n")
-    print(" ".join(f.readline()[:5].decode(errors="replace") for _ in range(2)))
+    first = f.readline()[:5].decode(errors="replace")
+    s.sendall(b"c X {18446744073709551580}\r\nb NOOP\r\n")
+    print(first, " ".join(f.readline()[:5].decode(errors="replace") for _ in range(2)))
 except Exception as e:
     print("no answer", repr(e))
 PY
 )
-check "a literal's length that wraps is refused, and the next command answered" "$r" "a BAD b OK "
+check "a literal's marker glued to an atom is no literal, a huge one is refused, and the next command answered" "$r" "a BAD c NO  b OK "
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

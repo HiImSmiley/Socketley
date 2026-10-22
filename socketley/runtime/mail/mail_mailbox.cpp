@@ -421,6 +421,14 @@ void mailboxes::finish(const std::shared_ptr<writing>& w, int code, std::string 
     if (code / 100 == 2)
     {
         ++m_stored;
+        // The IMAP index is told at once, rather than when a listing of the bucket finds it.
+        if (imap_store* imap = m_run.imap())
+        {
+            const size_t first = w->key.find('/'), last = w->key.rfind('/');
+            if (first != std::string::npos && last > first)
+                imap->delivered(w->key.substr(0, first), w->key.substr(first + 1, last - first - 1), w->key, w->total,
+                                w->e->at_ms);
+        }
         if (on_stored)
         {
             const size_t slash = w->key.find('/');

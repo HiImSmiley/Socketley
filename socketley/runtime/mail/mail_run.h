@@ -190,6 +190,7 @@ private:
         void reply_shared(const std::shared_ptr<const std::string>& bytes, size_t off, size_t len) override;
         size_t backlog() const override { return owed + zplain.size(); }
         bool start_compress() override;
+        void later(std::function<void()> f) override;
         void when_drained(std::function<void()> f) override;
     };
     struct listener

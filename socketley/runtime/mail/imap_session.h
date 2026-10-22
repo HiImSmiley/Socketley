@@ -53,6 +53,8 @@ public:
         virtual void when_drained(std::function<void()> f) { f(); }
         // The OK to COMPRESS is out: what comes and goes after it is DEFLATE (RFC 4978); false where it cannot be.
         virtual bool start_compress() { return false; }
+        // `f` at the loop's next turn, so a long SEARCH or SORT lets the others on the shard go between its stretches.
+        virtual void later(std::function<void()> f) { f(); }
     };
 
     imap_session(const imap_config& cfg, hooks& h, imap_store& store);
@@ -110,8 +112,12 @@ private:
     // The messages of a sequence set, as indexes into the view; false for one that is not a set.
     bool parse_set(std::string_view set, bool uid, std::vector<size_t>& out) const;
     // EXISTS and EXPUNGE for what changed in the folder since the session last looked.
+    // The bytes of the message at `idx` asked for ahead of its turn, unless they are held or large.
+    void read_ahead(size_t idx, bool whole);
     void update_view();
     std::string flags_text(uint8_t f, bool recent) const;
+    // A message's flags and its keywords.
+    std::string flags_text(const imap_message& m, bool recent) const;
     // A folder's STATUS line with the items asked.
     std::string status_text(const imap_folder& f, const std::vector<std::string>& items) const;
     void sign_in(const std::string& tag, std::string user, std::string password);

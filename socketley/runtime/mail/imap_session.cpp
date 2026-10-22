@@ -1,6 +1,7 @@
 #include "imap_session.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cctype>
 #include <cstring>
 #include <ctime>
@@ -76,6 +77,34 @@ int64_t search_day(std::string_view s)
     return static_cast<int64_t>(::timegm(&tm)) / 86400;
 }
 
+// An INTERNALDATE as APPEND gives it, "dd-Mon-yyyy hh:mm:ss +hhmm", as unix milliseconds; -1 where it is none.
+int64_t internal_date_ms(std::string_view v)
+{
+    const size_t sp = v.find(' ');
+    const int64_t day = search_day(v.substr(0, sp));
+    if (day < 0 || sp == std::string_view::npos)
+        return day < 0 ? -1 : day * 86400000;
+    std::string_view rest = v.substr(sp + 1);
+    int hh = 0, mm = 0, ss = 0, zone = 0;
+    char sign = '+';
+    if (rest.size() < 14 || std::sscanf(std::string(rest).c_str(), "%2d:%2d:%2d %c%4d", &hh, &mm, &ss, &sign, &zone) != 5 ||
+        hh > 23 || mm > 59 || ss > 60 || (sign != '+' && sign != '-'))
+        return day * 86400000;
+    const int64_t offset = (zone / 100 * 60 + zone % 100) * 60 * (sign == '-' ? -1 : 1);
+    return (day * 86400 + hh * 3600 + mm * 60 + ss - offset) * 1000;
+}
+
+// A keyword a client may set: an atom of IMAP's, not a system flag, short enough to keep (RFC 3501 9 flag-keyword).
+bool keyword_ok(std::string_view k)
+{
+    if (k.empty() || k.size() > 64 || k.front() == '\\')
+        return false;
+    for (const unsigned char c : k)
+        if (c <= 0x20 || c >= 0x7f || std::strchr("(){%*\"\\]", c))
+            return false;
+    return true;
+}
+
 uint8_t flag_bit(std::string_view f)
 {
     if (iequal(f, "\\Seen"))
@@ -126,14 +155,68 @@ bool wildmatch(std::string_view pat, std::string_view name)
     return can[name.size()];
 }
 
+// Whether `hay` holds `needle`, letters of either case alike: Knuth-Morris-Pratt, so a long needle of a repeated
+// letter costs the haystack's length and not its product with the needle's.
 bool contains_ci(std::string_view hay, std::string_view needle)
 {
-    if (needle.empty())
+    const size_t m = needle.size();
+    if (m == 0)
         return true;
-    const auto it = std::search(hay.begin(), hay.end(), needle.begin(), needle.end(), [](char a, char b) {
-        return socketley::ascii::lower(a) == socketley::ascii::lower(b);
-    });
-    return it != hay.end();
+    if (hay.size() < m)
+        return false;
+    using socketley::ascii::lower;
+    std::vector<size_t> fail(m, 0);
+    for (size_t i = 1, k = 0; i < m; ++i)
+    {
+        while (k > 0 && lower(needle[i]) != lower(needle[k]))
+            k = fail[k - 1];
+        if (lower(needle[i]) == lower(needle[k]))
+            ++k;
+        fail[i] = k;
+    }
+    for (size_t i = 0, k = 0; i < hay.size(); ++i)
+    {
+        while (k > 0 && lower(hay[i]) != lower(needle[k]))
+            k = fail[k - 1];
+        if (lower(hay[i]) == lower(needle[k]) && ++k == m)
+            return true;
+    }
+    return false;
+}
+
+// Whether a header of `head` named `name` holds `needle`, as it is written or with its encoded words decoded; every
+// header of the name, not only the first (RFC 3501 6.4.4).
+bool header_has(std::string_view head, std::string_view name, std::string_view needle)
+{
+    for (const auto& [n, v] : split_headers(head))
+    {
+        std::string_view nn = n;
+        while (!nn.empty() && (nn.back() == ' ' || nn.back() == '\t'))
+            nn.remove_suffix(1);
+        if (!name.empty() && !socketley::ascii::iequals(nn, name))
+            continue;
+        if (contains_ci(v, needle) || (v.find("=?") != std::string_view::npos && contains_ci(mime::decode_words(v), needle)))
+            return true;
+    }
+    return false;
+}
+
+// Whether a text part of the message holds `needle` once its transfer encoding and its charset are undone.
+bool text_has(std::string_view msg, const mime::part& p, std::string_view needle, int depth = 0)
+{
+    if (depth > 32)
+        return false;
+    for (const auto& c : p.children)
+        if (text_has(msg, c, needle, depth + 1))
+            return true;
+    if (!p.children.empty() || p.type != "text" || p.body_off + p.body_len > msg.size())
+        return false;
+    std::string charset;
+    for (const auto& [k, v] : p.params)
+        if (socketley::ascii::iequals(k, "charset"))
+            charset = v;
+    const std::string body = mime::decoded_body(msg.substr(p.body_off, p.body_len), p.encoding);
+    return contains_ci(mime::to_utf8(body, charset), needle);
 }
 
 // UIDs as a sequence set, runs written as ranges: 1:3,7,9:12.
@@ -184,12 +267,49 @@ bool uid_ranges(std::string_view set, uint32_t top, std::vector<std::pair<uint32
     return true;
 }
 
+// Ranges sorted and merged, so a UID is looked up in them by halving.
+void merge_ranges(std::vector<std::pair<uint32_t, uint32_t>>& r)
+{
+    std::sort(r.begin(), r.end());
+    size_t w = 0;
+    for (size_t i = 0; i < r.size(); ++i)
+        if (w > 0 && static_cast<uint64_t>(r[w - 1].second) + 1 >= r[i].first)
+            r[w - 1].second = std::max(r[w - 1].second, r[i].second);
+        else
+            r[w++] = r[i];
+    r.resize(w);
+}
+
 bool in_ranges(const std::vector<std::pair<uint32_t, uint32_t>>& r, uint32_t uid)
 {
-    for (const auto& [a, b] : r)
-        if (uid >= a && uid <= b)
-            return true;
-    return false;
+    const auto it = std::upper_bound(r.begin(), r.end(), uid,
+                                     [](uint32_t u, const std::pair<uint32_t, uint32_t>& x) { return u < x.first; });
+    return it != r.begin() && std::prev(it)->second >= uid;
+}
+
+// The UIDs of `r` below uidnext that `f` does not have, as ranges: a walk of the messages it has, not of every UID.
+std::string missing_text(const imap_folder& f, const std::vector<std::pair<uint32_t, uint32_t>>& r)
+{
+    std::string out;
+    const auto add = [&out](uint64_t lo, uint64_t hi) {
+        if (lo > hi)
+            return;
+        out += (out.empty() ? "" : ",") + std::to_string(lo) + (lo == hi ? std::string() : ":" + std::to_string(hi));
+    };
+    for (const auto& [lo, hi_asked] : r)
+    {
+        const uint64_t hi = std::min<uint64_t>(hi_asked, f.uidnext ? f.uidnext - 1 : 0);
+        uint64_t at = lo;
+        auto it = std::lower_bound(f.msgs.begin(), f.msgs.end(), lo,
+                                   [](const imap_message& m, uint64_t u) { return m.uid < u; });
+        for (; it != f.msgs.end() && it->uid <= hi; ++it)
+        {
+            add(at, static_cast<uint64_t>(it->uid) - 1);
+            at = static_cast<uint64_t>(it->uid) + 1;
+        }
+        add(at, hi);
+    }
+    return out;
 }
 
 // A FETCH item: its name as asked and as answered, and the section and range of a BODY[...].
@@ -205,6 +325,17 @@ struct item
     {
         return name == "ENVELOPE" || name == "BODYSTRUCTURE" || name == "BODY" || name.starts_with("BODY[") ||
                name.starts_with("BODY.PEEK[") || name == "RFC822" || name == "RFC822.HEADER" || name == "RFC822.TEXT";
+    }
+    // Whether the message's header alone answers it: ENVELOPE, and the top-level header or its fields.
+    bool header_only() const
+    {
+        if (name == "ENVELOPE" || name == "RFC822.HEADER")
+            return true;
+        const size_t br = name.find('[');
+        if (br == std::string::npos)
+            return false;
+        const std::string_view sec = std::string_view(name).substr(br + 1);
+        return sec.starts_with("HEADER]") || sec.starts_with("HEADER.FIELDS");
     }
 };
 
@@ -254,6 +385,18 @@ struct crit
     std::string arg, arg2;
     std::vector<crit> kids;
     std::vector<size_t> set;
+    // The argument read once as a day or a number, rather than for every message it is tried on.
+    int64_t day{-1};
+    uint64_t num{0};
+    bool decoded() const
+    {
+        if (key == "BODY" || key == "TEXT")
+            return true;
+        for (const auto& k : kids)
+            if (k.decoded())
+                return true;
+        return false;
+    }
     bool content() const
     {
         if (key == "FROM" || key == "TO" || key == "CC" || key == "BCC" || key == "SUBJECT" || key == "HEADER" ||
@@ -346,7 +489,8 @@ bool imap_session::tokenize(std::string_view s, std::vector<token>& out) const
     while (i < s.size())
     {
         const char c = s[i];
-        if (c == ' ')
+        // A line's end inside a command is only ever after a literal's marker, and separates like a space.
+        if (c == ' ' || c == '\r' || c == '\n')
         {
             ++i;
             continue;
@@ -396,7 +540,7 @@ bool imap_session::tokenize(std::string_view s, std::vector<token>& out) const
         }
         // An atom, a section in brackets read whole with its spaces and parentheses.
         std::string a;
-        while (i < s.size() && s[i] != ' ' && s[i] != '(' && s[i] != ')')
+        while (i < s.size() && s[i] != ' ' && s[i] != '(' && s[i] != ')' && s[i] != '\r' && s[i] != '\n')
         {
             if (s[i] == '[')
             {
@@ -476,6 +620,12 @@ void imap_session::run()
                 finish(m_auth_tag, "NO", "[AUTHENTICATIONFAILED] Malformed response");
                 continue;
             }
+            // To act as another user is not offered: an authorization identity is the user's own or none (RFC 4616).
+            if (a > 0 && raw.compare(0, a, raw, a + 1, b - a - 1) != 0)
+            {
+                finish(m_auth_tag, "NO", "[AUTHORIZATIONFAILED] Acting as another user is not offered");
+                continue;
+            }
             sign_in(m_auth_tag, raw.substr(a + 1, b - a - 1), raw.substr(b + 1));
             continue;
         }
@@ -483,7 +633,9 @@ void imap_session::run()
         if (!line.empty() && line.back() == '}')
         {
             const size_t open = line.rfind('{');
-            if (open != std::string::npos)
+            // A literal is a token of its own: after a space or a parenthesis, or where a line goes on after one.
+            if (open != std::string::npos &&
+                (open == 0 ? !m_cmd.empty() : line[open - 1] == ' ' || line[open - 1] == '('))
             {
                 std::string num = line.substr(open + 1, line.size() - open - 2);
                 const bool plus = !num.empty() && num.back() == '+';
@@ -493,9 +645,14 @@ void imap_session::run()
                 if (digits)
                 {
                     const uint64_t n = std::strtoull(num.c_str(), nullptr, 10);
-                    if (n > m_cfg.max_append + max_line)
+                    // The literals of one command together take no more than a message and a few lines, and before
+                    // sign-in no more than a name and a password would.
+                    const bool authed = m_state == state::auth || m_state == state::selected;
+                    const uint64_t cap = authed ? m_cfg.max_append + 4 * max_line : 4 * max_line;
+                    if (n > cap || m_cmd.size() + line.size() + n > cap)
                     {
-                        const std::string tag = line.substr(0, line.find(' '));
+                        const std::string& first = m_cmd.empty() ? line : m_cmd;
+                        const std::string tag = first.substr(0, first.find(' '));
                         m_cmd.clear();
                         finish(tag, "NO", "[TOOBIG] Literal too large");
                         if (plus)
@@ -575,45 +732,78 @@ std::string imap_session::flags_text(uint8_t f, bool recent) const
     return "(" + out + ")";
 }
 
+std::string imap_session::flags_text(const imap_message& m, bool recent) const
+{
+    std::string out = flags_text(m.flags, recent);
+    for (const auto& k : m.keywords)
+        out.insert(out.size() - 1, (out.size() > 2 ? " " : "") + k);
+    return out;
+}
+
 void imap_session::update_view()
 {
     if (!m_folder || m_folder->version == m_seen_version)
         return;
     m_seen_version = m_folder->version;
-    // What went first, from the highest number down so each one said is still where the client has it; under QRESYNC
-    // as the UIDs that vanished.
-    std::vector<uint32_t> vanished;
-    for (size_t i = m_view.size(); i-- > 0;)
-        if (!m_folder->by_uid(m_view[i]))
+    // One pass over the view and the folder, both in UID order: what went, what changed and what is new.
+    std::vector<imap_message>& msgs = m_folder->msgs;
+    std::vector<size_t> gone;
+    std::vector<uint32_t> kept;
+    std::vector<const imap_message*> kept_msgs;
+    kept.reserve(m_view.size());
+    kept_msgs.reserve(m_view.size());
+    size_t j = 0;
+    for (size_t i = 0; i < m_view.size(); ++i)
+    {
+        const uint32_t u = m_view[i];
+        while (j < msgs.size() && msgs[j].uid < u)
+            ++j;
+        if (j < msgs.size() && msgs[j].uid == u)
         {
-            if (m_qresync)
-                vanished.push_back(m_view[i]);
-            else
-                untagged(std::to_string(i + 1) + " EXPUNGE");
-            m_view.erase(m_view.begin() + static_cast<long>(i));
+            kept.push_back(u);
+            kept_msgs.push_back(&msgs[j]);
         }
-    if (!vanished.empty())
-        untagged("VANISHED " + set_text(std::move(vanished)));
+        else
+            gone.push_back(i);
+    }
+    // What went, from the highest number down so each one said is still where the client has it; under QRESYNC as
+    // the UIDs that vanished.
+    if (!gone.empty())
+    {
+        if (m_qresync)
+        {
+            std::vector<uint32_t> vanished;
+            vanished.reserve(gone.size());
+            for (const size_t i : gone)
+                vanished.push_back(m_view[i]);
+            untagged("VANISHED " + set_text(std::move(vanished)));
+        }
+        else
+            for (size_t k = gone.size(); k-- > 0;)
+                untagged(std::to_string(gone[k] + 1) + " EXPUNGE");
+        m_view = std::move(kept);
+    }
     // Flags another session changed since this one was last told, said as FETCH.
     for (size_t i = 0; i < m_view.size(); ++i)
-        if (const imap_message* m = m_folder->by_uid(m_view[i]); m && m->modseq > m_told_modseq)
+        if (const imap_message* m = kept_msgs[i]; m->modseq > m_told_modseq)
             untagged(std::to_string(i + 1) + " FETCH (UID " + std::to_string(m->uid) + " FLAGS " +
-                     flags_text(m->flags, false) +
+                     flags_text(*m, false) +
                      (m_condstore ? " MODSEQ (" + std::to_string(m->modseq) + ")" : std::string()) + ")");
     const uint32_t last = m_view.empty() ? 0 : m_view.back();
     size_t recent = 0;
     bool grew = false;
-    for (auto& m : m_folder->msgs)
-        if (m.uid > last)
+    auto from = std::upper_bound(msgs.begin(), msgs.end(), last,
+                                 [](uint32_t u, const imap_message& m) { return u < m.uid; });
+    for (; from != msgs.end(); ++from)
+    {
+        m_view.push_back(from->uid);
+        grew = true;
+        if (from->recent)
         {
-            m_view.push_back(m.uid);
-            grew = true;
-            if (m.recent)
-            {
-                ++recent;
-                m.recent = false;
-            }
+            ++recent;
+            from->recent = false;
         }
+    }
     if (grew)
     {
         untagged(std::to_string(m_view.size()) + " EXISTS");
@@ -627,7 +817,8 @@ bool imap_session::parse_set(std::string_view set, bool uid, std::vector<size_t>
     out.clear();
     const uint32_t max_uid = m_view.empty() ? 0 : m_view.back();
     const size_t count = m_view.size();
-    std::vector<bool> take(count, false);
+    // The ranges first, as UIDs or as numbers, merged in order; then one walk of the view takes what they cover.
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
     while (!set.empty())
     {
         const size_t comma = set.find(',');
@@ -640,7 +831,7 @@ bool imap_session::parse_set(std::string_view set, bool uid, std::vector<size_t>
                 n = uid ? max_uid : count;
                 return true;
             }
-            if (v.empty() || v.find_first_not_of("0123456789") != std::string_view::npos)
+            if (v.empty() || v.size() > 10 || v.find_first_not_of("0123456789") != std::string_view::npos)
                 return false;
             n = std::strtoull(std::string(v).c_str(), nullptr, 10);
             return n > 0;
@@ -657,22 +848,24 @@ bool imap_session::parse_set(std::string_view set, bool uid, std::vector<size_t>
             // n:* takes the highest UID even where n is past it.
             if (one.substr(colon == std::string_view::npos ? 0 : colon + 1) == "*" && a > max_uid)
                 a = max_uid;
-            for (size_t i = 0; i < count; ++i)
-                if (m_view[i] >= a && m_view[i] <= b)
-                    take[i] = true;
         }
-        else
-        {
-            if (b > count && !(count == 0 && one.find('*') != std::string_view::npos))
-                return false;
-            // A * of an empty folder is 0, which names no message.
-            for (uint64_t i = std::max<uint64_t>(a, 1); i <= b && i <= count; ++i)
-                take[i - 1] = true;
-        }
+        else if (b > count && !(count == 0 && one.find('*') != std::string_view::npos))
+            return false;
+        // A * of an empty folder is 0, which names no message.
+        a = std::max<uint64_t>(a, 1);
+        if (a <= b)
+            ranges.emplace_back(a, b);
     }
-    for (size_t i = 0; i < count; ++i)
-        if (take[i])
+    std::sort(ranges.begin(), ranges.end());
+    size_t r = 0;
+    for (size_t i = 0; i < count && r < ranges.size(); ++i)
+    {
+        const uint64_t key = uid ? m_view[i] : i + 1;
+        while (r < ranges.size() && ranges[r].second < key)
+            ++r;
+        if (r < ranges.size() && ranges[r].first <= key)
             out.push_back(i);
+    }
     return true;
 }
 
@@ -701,6 +894,8 @@ void imap_session::command(std::string tag, std::vector<token> a)
     {
         if (!selected)
             return finish(tag, "OK", cmd + " completed");
+        // What this runtime delivers comes by the journal at once; the bucket is listed again once a minute, for what
+        // another program put there, as a client may say NOOP every few seconds.
         m_waiting = true;
         m_store.open(m_user, m_folder->name, [this, alive = m_alive, tag, cmd](std::shared_ptr<imap_folder>) {
             if (!*alive)
@@ -708,7 +903,7 @@ void imap_session::command(std::string tag, std::vector<token> a)
             update_view();
             finish(tag, "OK", cmd + " completed");
             resume();
-        });
+        }, false, 60000);
         return;
     }
     if (cmd == "LOGOUT")
@@ -738,6 +933,8 @@ void imap_session::command(std::string tag, std::vector<token> a)
     }
     if (cmd == "ENABLE")
     {
+        if (!authed)
+            return finish(tag, "BAD", "Log in first");
         std::string on;
         for (size_t i = 1; i < a.size(); ++i)
         {
@@ -756,7 +953,7 @@ void imap_session::command(std::string tag, std::vector<token> a)
     }
     if (cmd == "STARTTLS")
     {
-        if (!m_cfg.tls_offered || m_cfg.tls_active)
+        if (!m_cfg.tls_offered || m_cfg.tls_active || authed)
             return finish(tag, "BAD", "STARTTLS not available");
         finish(tag, "OK", "Begin TLS negotiation now");
         // What was pipelined behind it in the clear is dropped (CVE-2011-0411's lesson).
@@ -917,6 +1114,8 @@ void imap_session::command(std::string tag, std::vector<token> a)
             return cmd_copy(tag, a, 2, true, sub == "MOVE");
         if (sub == "EXPUNGE")
         {
+            if (m_readonly)
+                return finish(tag, "NO", "[READ-ONLY] Mailbox is read-only");
             std::vector<size_t> idx;
             if (a.size() < 3 || !parse_set(a[2].text, true, idx))
                 return finish(tag, "BAD", "UID EXPUNGE needs a set");
@@ -1019,8 +1218,21 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
             if (!(m.flags & flag_seen) && !first_unseen)
                 first_unseen = m_view.size();
         }
-        untagged("FLAGS (" + std::string(all_flags) + ")");
-        untagged("OK [PERMANENTFLAGS (" + std::string(readonly ? "" : all_flags) + ")] Flags permitted");
+        // The keywords the folder's messages have are said with the flags, and any new one may be set (\*).
+        std::string words;
+        {
+            std::vector<std::string> seen_words;
+            for (const auto& m : f->msgs)
+                for (const auto& w : m.keywords)
+                    if (seen_words.size() < 256 && std::none_of(seen_words.begin(), seen_words.end(),
+                                                                [&](const std::string& x) { return iequal(x, w); }))
+                        seen_words.push_back(w);
+            for (const auto& w : seen_words)
+                words += " " + w;
+        }
+        untagged("FLAGS (" + std::string(all_flags) + words + ")");
+        untagged("OK [PERMANENTFLAGS (" + (readonly ? std::string() : std::string(all_flags) + words + " \\*") +
+                 ")] Flags permitted");
         untagged(std::to_string(m_view.size()) + " EXISTS");
         untagged(std::to_string(recent) + " RECENT");
         if (first_unseen)
@@ -1033,36 +1245,29 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
         {
             std::vector<std::pair<uint32_t, uint32_t>> known;
             const bool limited = !qr.known.empty() && uid_ranges(qr.known, f->uidnext - 1, known);
-            std::vector<uint32_t> gone;
+            merge_ranges(known);
             if (qr.modseq >= f->vanished_from)
             {
+                std::vector<uint32_t> gone;
                 for (const auto& [ms, uid] : f->vanished)
                     if (ms > qr.modseq && (!limited || in_ranges(known, uid)))
                         gone.push_back(uid);
+                if (!gone.empty())
+                    untagged("VANISHED (EARLIER) " + set_text(std::move(gone)));
             }
             else
             {
                 // Expunges older than what is remembered: every UID the client may know that is not here.
-                const auto here = [&f](uint32_t uid) { return f->by_uid(uid) != nullptr; };
-                if (limited)
-                {
-                    for (const auto& [lo, hi] : known)
-                        for (uint64_t u = lo; u <= hi && u < f->uidnext && gone.size() < 1000000; ++u)
-                            if (!here(static_cast<uint32_t>(u)))
-                                gone.push_back(static_cast<uint32_t>(u));
-                }
-                else
-                    for (uint32_t u = 1; u < f->uidnext && gone.size() < 1000000; ++u)
-                        if (!here(u))
-                            gone.push_back(u);
+                const std::string missing =
+                    missing_text(*f, limited ? known : std::vector<std::pair<uint32_t, uint32_t>>{{1, UINT32_MAX}});
+                if (!missing.empty())
+                    untagged("VANISHED (EARLIER) " + missing);
             }
-            if (!gone.empty())
-                untagged("VANISHED (EARLIER) " + set_text(std::move(gone)));
             for (size_t i = 0; i < m_view.size(); ++i)
                 if (const imap_message* m = f->by_uid(m_view[i]);
                     m && m->modseq > qr.modseq && (!limited || in_ranges(known, m->uid)))
                     untagged(std::to_string(i + 1) + " FETCH (UID " + std::to_string(m->uid) + " FLAGS " +
-                             flags_text(m->flags, false) + " MODSEQ (" + std::to_string(m->modseq) + "))");
+                             flags_text(*m, false) + " MODSEQ (" + std::to_string(m->modseq) + "))");
         }
         finish(tag, "OK", readonly ? "[READ-ONLY] EXAMINE completed" : "[READ-WRITE] SELECT completed");
         resume();
@@ -1071,14 +1276,17 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
 
 std::string imap_session::status_text(const imap_folder& f, const std::vector<std::string>& items) const
 {
+    // The messages are walked only for what is asked that needs it.
     size_t unseen = 0, recent = 0;
     uint64_t size = 0;
-    for (const auto& m : f.msgs)
-    {
-        unseen += !(m.flags & flag_seen);
-        recent += m.recent;
-        size += m.size;
-    }
+    if (std::any_of(items.begin(), items.end(),
+                    [](const std::string& it) { return it == "UNSEEN" || it == "RECENT" || it == "SIZE"; }))
+        for (const auto& m : f.msgs)
+        {
+            unseen += !(m.flags & flag_seen);
+            recent += m.recent;
+            size += m.size;
+        }
     std::string out;
     for (const auto& it : items)
     {
@@ -1150,7 +1358,9 @@ void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a,
                              status](std::vector<std::string> names) {
         if (!*alive)
             return;
-        // Each line, then the folder it is of.
+        // Each line, then the folder it is of; a folder's children found by halving the names in order.
+        std::vector<std::string> sorted(names.begin(), names.end());
+        std::sort(sorted.begin(), sorted.end());
         std::vector<std::string> listed;
         for (const auto& n : names)
         {
@@ -1160,9 +1370,9 @@ void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a,
             const bool sub = m_store.subscribed(m_user, n);
             if (!hit || (only_subscribed && !sub))
                 continue;
-            bool children = false;
-            for (const auto& o : names)
-                children = children || (o.size() > n.size() + 1 && o.starts_with(n + "/"));
+            const std::string under = n + "/";
+            const auto at = std::upper_bound(sorted.begin(), sorted.end(), under);
+            const bool children = at != sorted.end() && at->starts_with(under);
             std::string attrs = children ? "\\HasChildren" : "\\HasNoChildren";
             if (told_subscribed && sub)
                 attrs += " \\Subscribed";
@@ -1249,19 +1459,22 @@ void imap_session::cmd_append(const std::string& tag, const std::vector<token>& 
         return finish(tag, "BAD", "APPEND needs a mailbox and a message");
     size_t i = 2;
     uint8_t flags = 0;
+    std::vector<std::string> keywords;
     if (a[i].k == token::open)
     {
         for (++i; i < a.size() && a[i].k != token::close; ++i)
-            flags |= flag_bit(a[i].text);
+            if (const uint8_t bit = flag_bit(a[i].text))
+                flags |= bit;
+            else if (keyword_ok(a[i].text) && keywords.size() < 64)
+                keywords.push_back(a[i].text);
         ++i;
     }
     int64_t date_ms = 0;
     if (i + 1 < a.size() && a[i].k == token::string && a[i + 1].k == token::string)
     {
-        // An INTERNALDATE the client gave, read for its day and taken at midnight; its own time otherwise.
-        const int64_t day = search_day(a[i].text.substr(0, a[i].text.find(' ')));
-        if (day >= 0)
-            date_ms = day * 86400000;
+        // An INTERNALDATE the client gave, its time and zone kept, so a migrated mailbox keeps its order.
+        if (const int64_t t = internal_date_ms(a[i].text); t >= 0)
+            date_ms = t;
         ++i;
     }
     if (i >= a.size() || a[i].k != token::string)
@@ -1270,17 +1483,14 @@ void imap_session::cmd_append(const std::string& tag, const std::vector<token>& 
         date_ms = static_cast<int64_t>(::time(nullptr)) * 1000;
     std::string message = crlf_lines(a[i].text);
     m_waiting = true;
-    const uint64_t size = message.size();
-    m_store.append(m_user, a[1].text, std::move(message), flags, date_ms,
-                   [this, alive = m_alive, tag, size](bool ok, uint32_t validity, uint32_t uid) {
+    m_store.append(m_user, a[1].text, std::move(message), flags, std::move(keywords), date_ms,
+                   [this, alive = m_alive, tag](imap_store::refusal why, uint32_t validity, uint32_t uid) {
                        if (!*alive)
                            return;
-                       if (!ok)
-                       {
-                           const uint64_t q = m_store.quota(m_user);
-                           finish(tag, "NO", q && m_store.usage(m_user) + size > q ? "[OVERQUOTA] The mailbox is full"
-                                                                                  : "[TRYCREATE] APPEND failed");
-                       }
+                       if (why != imap_store::refusal::none)
+                           finish(tag, "NO", why == imap_store::refusal::quota ? "[OVERQUOTA] The mailbox is full"
+                                             : why == imap_store::refusal::no_folder ? "[TRYCREATE] No such mailbox"
+                                                                                    : "[UNAVAILABLE] The message could not be kept");
                        else
                        {
                            update_view();
@@ -1360,24 +1570,25 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
     {
         std::vector<std::pair<uint32_t, uint32_t>> asked;
         uid_ranges(a[from].text, m_folder->uidnext - 1, asked);
-        std::vector<uint32_t> gone;
+        merge_ranges(asked);
         if (since >= m_folder->vanished_from)
         {
+            std::vector<uint32_t> gone;
             for (const auto& [ms, u] : m_folder->vanished)
                 if (ms > since && in_ranges(asked, u))
                     gone.push_back(u);
+            if (!gone.empty())
+                untagged("VANISHED (EARLIER) " + set_text(std::move(gone)));
         }
-        else
-            for (const auto& [lo, hi] : asked)
-                for (uint64_t u = lo; u <= hi && u < m_folder->uidnext && gone.size() < 1000000; ++u)
-                    if (!m_folder->by_uid(static_cast<uint32_t>(u)))
-                        gone.push_back(static_cast<uint32_t>(u));
-        if (!gone.empty())
-            untagged("VANISHED (EARLIER) " + set_text(std::move(gone)));
+        else if (const std::string missing = missing_text(*m_folder, asked); !missing.empty())
+            untagged("VANISHED (EARLIER) " + missing);
     }
     if (uid && std::none_of(items.begin(), items.end(), [](const item& i) { return i.name == "UID"; }))
         items.insert(items.begin(), {"UID", "UID", {}, false, false, 0, 0});
     const bool needs_body = std::any_of(items.begin(), items.end(), [](const item& i) { return i.body(); });
+    // Items the header answers read the header alone, not a message of megabytes for its first lines.
+    const bool head_only = needs_body && std::all_of(items.begin(), items.end(),
+                                                     [](const item& i) { return !i.body() || i.header_only(); });
     struct job
     {
         std::vector<size_t> idx;
@@ -1387,11 +1598,20 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
         bool looping{false};
         bool waiting{false};
         std::shared_ptr<const std::string> bytes;
+        // The messages this FETCH marks \Seen, written together at its end.
+        std::vector<uint32_t> seen;
+        bool head_only{false};
+        // Whether the bytes of the message answered are its header alone.
+        bool from_head{false};
+        bool unreadable{false};
+        // How far the reads asked for ahead of the one answered reach.
+        size_t ahead{0};
     };
     auto j = std::make_shared<job>();
     j->idx = std::move(idx);
     j->items = std::move(items);
     j->needs_body = needs_body;
+    j->head_only = head_only;
     m_waiting = true;
     // One message after the other, each answered once its bytes are read, whether they come at once or later.
     // Held by the reads it waits on and by `keep` while it runs, and gone once neither is.
@@ -1413,24 +1633,55 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
             }
             if (j->needs_body && !j->bytes)
             {
+                // The next few are asked for while this one is read, so a cold FETCH waits about one round trip per
+                // eight messages; a large one is left to be read when its turn comes.
+                if (!m_store.holds(m->key, j->head_only))
+                    for (j->ahead = std::max(j->ahead, j->at + 1); j->ahead < std::min(j->idx.size(), j->at + 9);
+                         ++j->ahead)
+                        read_ahead(j->idx[j->ahead], !j->head_only);
                 j->waiting = true;
-                m_store.body(m->key, m->size, [j, self, alive](std::shared_ptr<const std::string> b) {
+                const auto got = [j, self, alive](std::shared_ptr<const std::string> b) {
                     if (!*alive)
                         return;
+                    j->unreadable = !b;
                     j->bytes = b ? b : std::make_shared<const std::string>();
                     j->waiting = false;
                     if (!j->looping)
                         (*self)();
-                });
+                };
+                // A message read whole already answers from its parsed structure rather than its header parsed again.
+                j->from_head = j->head_only && !m_store.holds(m->key, false);
+                if (j->from_head)
+                    m_store.head(m->key, m->size, got);
+                else
+                    m_store.body(m->key, m->size, got);
                 if (j->waiting)
                 {
                     j->looping = false;
                     return;
                 }
             }
+            // A message the storage cannot give is no empty message: the FETCH says it could not be answered.
+            if (j->unreadable)
+            {
+                j->looping = false;
+                finish(tag, "NO", "[UNAVAILABLE] A message could not be read from the storage");
+                resume();
+                return;
+            }
+            if (j->needs_body && j->bytes && !j->from_head && !j->bytes->empty() &&
+                m_store.parse_later(m->key, j->bytes, [j, self, alive] {
+                    if (*alive && !j->looping)
+                        (*self)();
+                }))
+            {
+                j->looping = false;
+                return;
+            }
             std::shared_ptr<const mime::part> part;
             if (j->needs_body && j->bytes && !j->bytes->empty())
-                part = m_store.structure(m->key, j->bytes);
+                part = j->from_head ? std::make_shared<const mime::part>(mime::parse(*j->bytes))
+                                    : m_store.structure(m->key, j->bytes);
             // The line is said in pieces, a body the store holds going out as it is held, not copied into it.
             std::string out = "* " + std::to_string(i + 1) + " FETCH (";
             bool first = true;
@@ -1454,7 +1705,9 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                 else if (it.name == "RFC822.SIZE")
                     out += std::to_string(j->bytes && !j->bytes->empty() ? j->bytes->size() : m->size);
                 else if (!part)
-                    out += it.name == "ENVELOPE" ? "(NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)" : mime::imap_string("", false);
+                    // A message with no part reads as an empty text one, so a strict client parses the answer.
+                    out += it.name == "ENVELOPE" ? "(NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)"
+                                                 : "(\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 0 0)";
                 else if (it.name == "ENVELOPE")
                     out += mime::envelope(std::string_view(*j->bytes).substr(0, part->header_len));
                 else if (it.name == "BODYSTRUCTURE" || it.name == "BODY")
@@ -1487,7 +1740,11 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                         seen_now = true;
                 }
             }
-            if (seen_now && !m_readonly && !(m->flags & flag_seen))
+            // Without CONDSTORE the \Seen of every message is written at the end, one journal line set for the FETCH; with
+            // it each is written as it goes, as its MODSEQ is told with it.
+            if (seen_now && !m_readonly && !(m->flags & flag_seen) && !m_condstore)
+                j->seen.push_back(m->uid);
+            else if (seen_now && !m_readonly && !(m->flags & flag_seen))
             {
                 // What this session did is not told again, unless another shard's changes came in with it.
                 const uint64_t was = m_folder->highestmodseq;
@@ -1513,7 +1770,11 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
             if (flags || seen_now)
             {
                 next();
-                out += "FLAGS " + flags_text(m->flags, false);
+                // A \Seen this FETCH sets is told with the message, written with the others once it is done.
+                imap_message shown = *m;
+                if (seen_now && !m_readonly)
+                    shown.flags |= flag_seen;
+                out += "FLAGS " + flags_text(shown, false);
             }
             if (std::any_of(j->items.begin(), j->items.end(), [](const item& it) { return it.name == "MODSEQ"; }) ||
                 (seen_now && m_condstore))
@@ -1543,6 +1804,16 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
             }
         }
         j->looping = false;
+        if (!j->seen.empty())
+        {
+            const uint64_t was = m_folder->highestmodseq;
+            const bool told_all = m_told_modseq == was;
+            const size_t n = m_store.set_flags(m_user, m_folder, j->seen,
+                                               [](uint8_t f) { return static_cast<uint8_t>(f | flag_seen); });
+            if (told_all && m_folder->highestmodseq == was + n)
+                m_told_modseq = m_folder->highestmodseq;
+            j->seen.clear();
+        }
         finish(tag, "OK", uid ? "UID FETCH completed" : "FETCH completed");
         resume();
     };
@@ -1575,9 +1846,17 @@ void imap_session::cmd_store(const std::string& tag, const std::vector<token>& a
     if (op != "FLAGS" && op != "+FLAGS" && op != "-FLAGS")
         return finish(tag, "BAD", "STORE takes FLAGS, +FLAGS or -FLAGS");
     uint8_t bits = 0;
+    keyword_change words;
+    words.k = op == "FLAGS" ? keyword_change::kind::set : op == "+FLAGS" ? keyword_change::kind::add
+                                                                         : keyword_change::kind::remove;
     for (size_t i = at + 1; i < a.size(); ++i)
         if (a[i].k == token::atom || a[i].k == token::string)
-            bits |= flag_bit(a[i].text);
+        {
+            if (const uint8_t bit = flag_bit(a[i].text))
+                bits |= bit;
+            else if (keyword_ok(a[i].text) && words.words.size() < 64)
+                words.words.push_back(a[i].text);
+        }
     // A message changed since the mod-sequence the client gave is left as it is, and said so.
     std::vector<uint32_t> uids, modified;
     for (const size_t i : idx)
@@ -1591,9 +1870,10 @@ void imap_session::cmd_store(const std::string& tag, const std::vector<token>& a
     const uint64_t was = m_folder->highestmodseq;
     const bool told_all = m_told_modseq == was;
     // Changed under the user's lock on the flags as they are now, whichever shard last changed them.
-    const size_t changed = m_store.set_flags(m_user, m_folder, uids, [&op, bits](uint8_t f) {
-        return static_cast<uint8_t>(op == "FLAGS" ? bits : op == "+FLAGS" ? f | bits : f & ~bits);
-    });
+    const size_t changed = m_store.set_flags(
+        m_user, m_folder, uids,
+        [&op, bits](uint8_t f) { return static_cast<uint8_t>(op == "FLAGS" ? bits : op == "+FLAGS" ? f | bits : f & ~bits); },
+        words);
     for (const size_t i : idx)
     {
         const imap_message* m = m_folder->by_uid(m_view[i]);
@@ -1602,7 +1882,7 @@ void imap_session::cmd_store(const std::string& tag, const std::vector<token>& a
             continue;
         if (!silent || (m_condstore && unchanged != UINT64_MAX))
             untagged(std::to_string(i + 1) + " FETCH (" + (uid ? "UID " + std::to_string(m->uid) + " " : std::string()) +
-                     "FLAGS " + flags_text(m->flags, false) +
+                     "FLAGS " + flags_text(*m, false) +
                      (m_condstore ? " MODSEQ (" + std::to_string(m->modseq) + ")" : std::string()) + ")");
     }
     // What this session did itself it is not told again, unless another shard's changes came in with it.
@@ -1635,6 +1915,8 @@ bool parse_one(const std::vector<std::string>& t, size_t& i, crit& out, int dept
         if (i >= t.size())
             return false;
         out.arg = t[i++];
+        out.day = search_day(out.arg);
+        out.num = std::strtoull(out.arg.c_str(), nullptr, 10);
         return true;
     }
     if (k == "HEADER")
@@ -1653,6 +1935,7 @@ bool parse_one(const std::vector<std::string>& t, size_t& i, crit& out, int dept
         if (i >= t.size() || t[i].empty() || t[i].find_first_not_of("0123456789") != std::string::npos)
             return false;
         out.arg = t[i++];
+        out.num = std::strtoull(out.arg.c_str(), nullptr, 10);
         return true;
     }
     if (k == "NOT")
@@ -1693,22 +1976,24 @@ bool parse_one(const std::vector<std::string>& t, size_t& i, crit& out, int dept
 namespace
 {
 
-// Whether message `m`, number `idx` in the session's view, its bytes `msg` and its header `head`, meets `c`.
-bool matches(const crit& c, const imap_message& m, size_t idx, std::string_view msg, std::string_view head)
+// Whether message `m`, number `idx` in the session's view, its bytes `msg`, its header `head` and its structure `root`
+// where a criterion reads decoded text, meets `c`.
+bool matches(const crit& c, const imap_message& m, size_t idx, std::string_view msg, std::string_view head,
+             const mime::part* root)
 {
     const int64_t day = m.date_ms / 86400000;
     const std::string& k = c.key;
     if (k == "AND")
     {
         for (const auto& x : c.kids)
-            if (!matches(x, m, idx, msg, head))
+            if (!matches(x, m, idx, msg, head, root))
                 return false;
         return true;
     }
     if (k == "NOT")
-        return !matches(c.kids[0], m, idx, msg, head);
+        return !matches(c.kids[0], m, idx, msg, head, root);
     if (k == "OR")
-        return matches(c.kids[0], m, idx, msg, head) || matches(c.kids[1], m, idx, msg, head);
+        return matches(c.kids[0], m, idx, msg, head, root) || matches(c.kids[1], m, idx, msg, head, root);
     if (k == "SET" || k == "UID")
         return std::binary_search(c.set.begin(), c.set.end(), idx);
     if (k == "ALL")
@@ -1737,31 +2022,41 @@ bool matches(const crit& c, const imap_message& m, size_t idx, std::string_view 
         return m.recent && (k == "RECENT" || !(m.flags & flag_seen));
     if (k == "OLD")
         return !m.recent;
-    if (k == "KEYWORD")
-        return false;
-    if (k == "UNKEYWORD")
-        return true;
+    if (k == "KEYWORD" || k == "UNKEYWORD")
+    {
+        const bool has = std::any_of(m.keywords.begin(), m.keywords.end(),
+                                     [&](const std::string& w) { return iequal(w, c.arg); });
+        return k == "KEYWORD" ? has : !has;
+    }
     if (k == "MODSEQ")
-        return m.modseq >= std::strtoull(c.arg.c_str(), nullptr, 10);
+        return m.modseq >= c.num;
     if (k == "LARGER")
-        return m.size > std::strtoull(c.arg.c_str(), nullptr, 10);
+        return m.size > c.num;
     if (k == "SMALLER")
-        return m.size < std::strtoull(c.arg.c_str(), nullptr, 10);
-    const int64_t d = search_day(c.arg);
+        return m.size < c.num;
+    // SENT* read the Date header's day, as it was written there (RFC 3501 6.4.4), the internal date where it has none.
+    int64_t sent = day;
+    if (k.starts_with("SENT"))
+    {
+        int64_t t = 0;
+        int zone = 0;
+        if (mime::parse_date(header_value(head, "Date"), t, zone))
+            sent = (t + static_cast<int64_t>(zone) * 60) / 86400;
+    }
     if (k == "BEFORE" || k == "SENTBEFORE")
-        return day < d;
+        return (k == "BEFORE" ? day : sent) < c.day;
     if (k == "ON" || k == "SENTON")
-        return day == d;
+        return (k == "ON" ? day : sent) == c.day;
     if (k == "SINCE" || k == "SENTSINCE")
-        return day >= d;
+        return (k == "SINCE" ? day : sent) >= c.day;
     if (k == "HEADER")
-        return contains_ci(header_value(head, c.arg), c.arg2);
+        return header_has(head, c.arg, c.arg2);
     if (k == "FROM" || k == "TO" || k == "CC" || k == "BCC" || k == "SUBJECT")
-        return contains_ci(header_value(head, k), c.arg);
+        return header_has(head, k, c.arg);
     if (k == "BODY")
-        return contains_ci(msg.substr(head.size()), c.arg);
+        return contains_ci(msg.substr(head.size()), c.arg) || (root && text_has(msg, *root, c.arg));
     if (k == "TEXT")
-        return contains_ci(msg, c.arg);
+        return contains_ci(msg, c.arg) || header_has(head, {}, c.arg) || (root && text_has(msg, *root, c.arg));
     return false;
 }
 
@@ -1824,21 +2119,25 @@ void imap_session::cmd_search(const std::string& tag, const std::vector<token>& 
         uint64_t top_modseq{0};
         std::shared_ptr<const std::string> bytes;
         bool looping{false}, waiting{false};
+        size_t ahead{0};
     };
     auto j = std::make_shared<job>();
     j->all = std::move(all);
     const bool content = j->all.content();
+    // A search of headers reads the headers alone; one of the text, the whole message.
+    const bool whole = j->all.decoded();
     const bool modseq = asks_modseq(j->all);
     if (modseq)
         m_condstore = true;
     m_waiting = true;
     auto step = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak = step;
-    *step = [this, j, tag, uid, content, modseq, esearch, want, weak, alive = m_alive]() {
+    *step = [this, j, tag, uid, content, whole, modseq, esearch, want, weak, alive = m_alive]() {
         auto self = weak.lock();
         if (!*alive || !self)
             return;
         j->looping = true;
+        size_t stretch = 0;
         while (j->at < m_view.size())
         {
             const size_t idx = j->at;
@@ -1848,26 +2147,51 @@ void imap_session::cmd_search(const std::string& tag, const std::vector<token>& 
                 ++j->at;
                 continue;
             }
+            // Past a stretch answered at once from what is held, the rest waits for the loop's next turn.
+            if (++stretch > 2000)
+            {
+                j->looping = false;
+                m_hooks.later([self] { (*self)(); });
+                return;
+            }
             if (content && !j->bytes)
             {
+                if (!m_store.holds(m->key, !whole))
+                    for (j->ahead = std::max(j->ahead, idx + 1); j->ahead < std::min(m_view.size(), idx + 9); ++j->ahead)
+                        read_ahead(j->ahead, whole);
                 j->waiting = true;
-                m_store.body(m->key, m->size, [j, self, alive](std::shared_ptr<const std::string> b) {
+                const auto got = [j, self, alive](std::shared_ptr<const std::string> b) {
                     if (!*alive)
                         return;
                     j->bytes = b ? b : std::make_shared<const std::string>();
                     j->waiting = false;
                     if (!j->looping)
                         (*self)();
-                });
+                };
+                if (whole)
+                    m_store.body(m->key, m->size, got);
+                else
+                    m_store.head(m->key, m->size, got);
                 if (j->waiting)
                 {
                     j->looping = false;
                     return;
                 }
             }
+            if (whole && j->bytes && !j->bytes->empty() &&
+                m_store.parse_later(m->key, j->bytes, [j, self, alive] {
+                    if (*alive && !j->looping)
+                        (*self)();
+                }))
+            {
+                j->looping = false;
+                return;
+            }
             const std::string_view msg = j->bytes ? std::string_view(*j->bytes) : std::string_view{};
             const std::string_view head = header_block(msg);
-            if (matches(j->all, *m, idx, msg, head))
+            const std::shared_ptr<const mime::part> root =
+                whole && j->bytes && !j->bytes->empty() ? m_store.structure(m->key, j->bytes) : nullptr;
+            if (matches(j->all, *m, idx, msg, head, root.get()))
             {
                 j->hits.push_back(uid ? m->uid : static_cast<uint32_t>(idx + 1));
                 j->top_modseq = std::max(j->top_modseq, m->modseq);
@@ -1972,18 +2296,22 @@ void imap_session::cmd_order(const std::string& tag, const std::vector<token>& a
         std::vector<imap_order::entry> hits;
         std::shared_ptr<const std::string> bytes;
         bool looping{false}, waiting{false};
+        size_t ahead{0};
     };
     auto j = std::make_shared<job>();
     j->all = std::move(all);
     const bool read_bytes = headers || j->all.content();
+    // SORT and THREAD read headers; only a search of the text needs the whole message.
+    const bool whole = j->all.decoded();
     m_waiting = true;
     auto step = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak = step;
-    *step = [this, j, tag, uid, thread, keys, algorithm, what, read_bytes, weak, alive = m_alive]() {
+    *step = [this, j, tag, uid, thread, keys, algorithm, what, read_bytes, whole, weak, alive = m_alive]() {
         auto self = weak.lock();
         if (!*alive || !self)
             return;
         j->looping = true;
+        size_t stretch = 0;
         while (j->at < m_view.size())
         {
             const size_t idx = j->at;
@@ -1993,26 +2321,50 @@ void imap_session::cmd_order(const std::string& tag, const std::vector<token>& a
                 ++j->at;
                 continue;
             }
+            if (++stretch > 2000)
+            {
+                j->looping = false;
+                m_hooks.later([self] { (*self)(); });
+                return;
+            }
             if (read_bytes && !j->bytes)
             {
+                if (!m_store.holds(m->key, !whole))
+                    for (j->ahead = std::max(j->ahead, idx + 1); j->ahead < std::min(m_view.size(), idx + 9); ++j->ahead)
+                        read_ahead(j->ahead, whole);
                 j->waiting = true;
-                m_store.body(m->key, m->size, [j, self, alive](std::shared_ptr<const std::string> b) {
+                const auto got = [j, self, alive](std::shared_ptr<const std::string> b) {
                     if (!*alive)
                         return;
                     j->bytes = b ? b : std::make_shared<const std::string>();
                     j->waiting = false;
                     if (!j->looping)
                         (*self)();
-                });
+                };
+                if (whole)
+                    m_store.body(m->key, m->size, got);
+                else
+                    m_store.head(m->key, m->size, got);
                 if (j->waiting)
                 {
                     j->looping = false;
                     return;
                 }
             }
+            if (whole && j->bytes && !j->bytes->empty() &&
+                m_store.parse_later(m->key, j->bytes, [j, self, alive] {
+                    if (*alive && !j->looping)
+                        (*self)();
+                }))
+            {
+                j->looping = false;
+                return;
+            }
             const std::string_view msg = j->bytes ? std::string_view(*j->bytes) : std::string_view{};
             const std::string_view head = header_block(msg);
-            if (matches(j->all, *m, idx, msg, head))
+            const std::shared_ptr<const mime::part> root =
+                whole && j->bytes && !j->bytes->empty() ? m_store.structure(m->key, j->bytes) : nullptr;
+            if (matches(j->all, *m, idx, msg, head, root.get()))
             {
                 imap_order::entry e;
                 e.number = uid ? m->uid : static_cast<uint32_t>(idx + 1);
@@ -2029,8 +2381,12 @@ void imap_session::cmd_order(const std::string& tag, const std::vector<token>& a
         }
         j->looping = false;
         if (thread)
-            untagged("THREAD " + (algorithm == "REFERENCES" ? imap_order::references(std::move(j->hits))
-                                                             : imap_order::ordered_subject(std::move(j->hits))));
+        {
+            const std::string threads = algorithm == "REFERENCES" ? imap_order::references(std::move(j->hits))
+                                                                   : imap_order::ordered_subject(std::move(j->hits));
+            // No thread is THREAD alone, with no space after it (RFC 5256 thread-data).
+            untagged(threads.empty() ? std::string("THREAD") : "THREAD " + threads);
+        }
         else
         {
             imap_order::sort(j->hits, keys);
@@ -2057,33 +2413,48 @@ void imap_session::cmd_copy(const std::string& tag, const std::vector<token>& a,
         return finish(tag, "BAD", "Invalid sequence set");
     std::vector<uint32_t> uids;
     uint64_t bytes = 0;
+    // Only messages still there, so each UID COPYUID names is paired with its own copy.
     for (const size_t i : idx)
-    {
-        uids.push_back(m_view[i]);
         if (const imap_message* m = m_folder->by_uid(m_view[i]))
+        {
+            uids.push_back(m_view[i]);
             bytes += m->size;
-    }
+        }
     if (uids.empty())
         return finish(tag, "OK", "Nothing to copy");
     // A copy takes room a move gives back.
     if (const uint64_t q = m_store.quota(m_user); !move && q && m_store.usage(m_user) + bytes > q)
         return finish(tag, "NO", "[OVERQUOTA] The mailbox is full");
     m_waiting = true;
-    m_store.copy(m_user, m_folder, uids, a[from + 1].text,
-                 [this, alive = m_alive, tag, uids, move, uid](bool ok, uint32_t validity, std::vector<uint32_t> made) {
+    const std::string to = a[from + 1].text;
+    m_store.copy(m_user, m_folder, uids, to, !move,
+                 [this, alive = m_alive, tag, uids, move, uid, to](bool ok, uint32_t validity, std::vector<uint32_t> made) {
                      if (!*alive)
                          return;
                      if (!ok)
                      {
-                         finish(tag, "NO", "[TRYCREATE] COPY failed");
+                         // TRYCREATE says the target is not there, and only then (RFC 3501 6.4.7).
+                         const uint64_t q = m_store.quota(m_user);
+                         finish(tag, "NO", validity == 0 ? "[TRYCREATE] No such mailbox"
+                                           : !move && q && m_store.usage(m_user) >= q ? "[OVERQUOTA] The mailbox is full"
+                                                                                      : "[UNAVAILABLE] COPY failed");
                          resume();
                          return;
                      }
+                     // Runs of both rising together are written as ranges, which keeps each pair (RFC 4315 3).
                      std::string src, dst;
-                     for (size_t i = 0; i < made.size() && i < uids.size(); ++i)
+                     for (size_t i = 0; i < made.size() && i < uids.size();)
                      {
-                         src += (i ? "," : "") + std::to_string(uids[i]);
-                         dst += (i ? "," : "") + std::to_string(made[i]);
+                         size_t e = i;
+                         while (e + 1 < made.size() && e + 1 < uids.size() && uids[e + 1] == uids[e] + 1 &&
+                                made[e + 1] == made[e] + 1)
+                             ++e;
+                         const auto span = [&](const std::vector<uint32_t>& v) {
+                             return std::to_string(v[i]) + (e > i ? ":" + std::to_string(v[e]) : std::string());
+                         };
+                         src += (src.empty() ? "" : ",") + span(uids);
+                         dst += (dst.empty() ? "" : ",") + span(made);
+                         i = e + 1;
                      }
                      const std::string code = "[COPYUID " + std::to_string(validity) + " " + src + " " + dst + "] ";
                      if (!move)
@@ -2104,26 +2475,26 @@ void imap_session::cmd_expunge(const std::string& tag, const std::vector<uint32_
 {
     m_waiting = true;
     m_store.expunge(m_user, m_folder, only, moved,
-                    [this, alive = m_alive, tag, text = std::string(done_text)](std::vector<uint32_t> gone) {
+                    [this, alive = m_alive, tag, text = std::string(done_text)](std::vector<uint32_t>) {
                         if (!*alive)
                             return;
-                        // Highest number first, so each one said is where the client has it; VANISHED under QRESYNC.
-                        std::vector<uint32_t> vanished;
-                        for (size_t i = m_view.size(); i-- > 0;)
-                            if (std::binary_search(gone.begin(), gone.end(), m_view[i]))
-                            {
-                                if (m_qresync)
-                                    vanished.push_back(m_view[i]);
-                                else
-                                    untagged(std::to_string(i + 1) + " EXPUNGE");
-                                m_view.erase(m_view.begin() + static_cast<long>(i));
-                            }
-                        if (!vanished.empty())
-                            untagged("VANISHED " + set_text(std::move(vanished)));
-                        m_seen_version = m_folder->version;
+                        // The view is brought up to the folder: what this EXPUNGE took, and what other sessions
+                        // changed meanwhile, which marking the version seen without telling would lose.
+                        update_view();
                         finish(tag, "OK", text);
                         resume();
                     });
+}
+
+void imap_session::read_ahead(size_t idx, bool whole)
+{
+    const imap_message* m = idx < m_view.size() ? m_folder->by_uid(m_view[idx]) : nullptr;
+    if (!m || m->size > (1u << 20) || m_store.holds(m->key, !whole))
+        return;
+    if (whole)
+        m_store.body(m->key, m->size, [](std::shared_ptr<const std::string>) {});
+    else
+        m_store.head(m->key, m->size, [](std::shared_ptr<const std::string>) {});
 }
 
 void imap_session::poll()
@@ -2133,7 +2504,7 @@ void imap_session::poll()
     m_store.open(m_user, m_folder->name, [this, alive = m_alive](std::shared_ptr<imap_folder>) {
         if (*alive && m_idle)
             update_view();
-    });
+    }, false, 60000);
 }
 
 }   // namespace socketley::mail

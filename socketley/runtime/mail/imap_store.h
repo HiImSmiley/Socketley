@@ -11,6 +11,7 @@
 // outgrows it.
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <string>
@@ -44,6 +45,18 @@ struct imap_message
     // A message delivered since a session last looked, \Recent to the first to see it.
     bool        recent{true};
     uint64_t    modseq{1};
+    // The keywords a client set on it ($Forwarded, $Junk, its own), as it gave them.
+    std::vector<std::string> keywords;
+};
+
+// What STORE or APPEND asks of a message's keywords: none, these as they are, or these added or taken away.
+struct keyword_change
+{
+    enum class kind : uint8_t { none, set, add, remove };
+    kind k{kind::none};
+    std::vector<std::string> words;
+    // The keywords `have` become, true where they changed.
+    bool apply(std::vector<std::string>& have) const;
 };
 
 struct imap_folder
@@ -62,8 +75,10 @@ struct imap_folder
     uint64_t    vanished_from{0};
     int64_t     synced_ms{0};
     bool        syncing{false};
-    // The mod-sequence the folder had as its listing in the bucket began.
+    // The mod-sequence the folder had as its listing in the bucket began, and the keys expunged since a while, which a
+    // listing taken before they went still holds and does not bring back.
     uint64_t    sync_from{0};
+    std::vector<std::pair<uint64_t, std::string>> gone_keys;
     std::vector<std::function<void(bool)>> waiting;
     bool        subscribed{true};
     imap_message* by_uid(uint32_t uid);
@@ -80,39 +95,65 @@ public:
 
     // The user's folders, those the bucket has and those made empty here.
     void folders(const std::string& user, std::function<void(std::vector<std::string>)> done);
-    // A folder brought up to what the bucket holds; null when it does not exist and is not one every mailbox has.
+    // A folder brought up to what the bucket holds, listed again where it was last listed longer than `max_age_ms` ago;
+    // null when it does not exist and is not one every mailbox has.
     void open(const std::string& user, const std::string& folder, std::function<void(std::shared_ptr<imap_folder>)> done,
-              bool force = false);
+              bool force = false, int64_t max_age_ms = 2000);
     bool create(const std::string& user, const std::string& folder);
     void remove(const std::string& user, const std::string& folder, std::function<void(bool)> done);
     void rename(const std::string& user, const std::string& from, const std::string& to, std::function<void(bool)> done);
     void set_subscribed(const std::string& user, const std::string& folder, bool on);
     bool subscribed(const std::string& user, const std::string& folder);
-    // The bytes of every message the user's index has, and the bound their idp account puts on them, 0 for none.
+    // The bytes of every message the user's index has, and those of APPENDs and COPYs still being written, and the
+    // bound their idp account puts on them, 0 for none.
     uint64_t usage(const std::string& user);
     uint64_t quota(const std::string& user) const;
+    // Room taken for a message being written, so two at once cannot pass the bound together; given back after.
+    bool reserve(const std::string& user, uint64_t bytes);
+    void unreserve(const std::string& user, uint64_t bytes);
 
-    // A message's bytes, from the cache or the bucket.
-    void body(const std::string& key, uint64_t size, std::function<void(std::shared_ptr<const std::string>)> done);
+    // A message's bytes, from the cache or the bucket; kept in the cache only where `keep`.
+    void body(const std::string& key, uint64_t size, std::function<void(std::shared_ptr<const std::string>)> done,
+              bool keep = true);
+    // Its header block alone, read from its start, what ENVELOPE, SORT and a header SEARCH need; the whole message
+    // where the header is longer than the first read.
+    void head(const std::string& key, uint64_t size, std::function<void(std::shared_ptr<const std::string>)> done);
+    // Whether body() or, given `head`, head() would answer at once.
+    bool holds(const std::string& key, bool head) const
+    {
+        const auto it = m_cache.find(key);
+        return (it != m_cache.end() && it->second.bytes) || (head && m_heads.count(key));
+    }
     // Its structure, parsed once.
     std::shared_ptr<const mime::part> structure(const std::string& key, const std::shared_ptr<const std::string>& bytes);
+    // True where a message too large to parse on the loop is parsed on the pool, `done` called once structure() has it.
+    bool parse_later(const std::string& key, const std::shared_ptr<const std::string>& bytes, std::function<void()> done);
 
     // What other shards changed in `user`'s index read in; a stat where they changed nothing.
     void refresh(const std::string& user);
     // The flags of `uids` in `f` made what `change` makes of each, logged; those it changes get the next modseq, and
     // how many it changed is answered.
     size_t set_flags(const std::string& user, const std::shared_ptr<imap_folder>& f, const std::vector<uint32_t>& uids,
-                   const std::function<uint8_t(uint8_t)>& change);
+                   const std::function<uint8_t(uint8_t)>& change, const keyword_change& words = {});
     // Those with \Deleted among `only`, or of the folder where it is empty, removed from the bucket and the folder;
     // with `any` whatever their flags, since a flag set in memory alone is lost to what another shard logs.
     void expunge(const std::string& user, const std::shared_ptr<imap_folder>& f, const std::vector<uint32_t>& only,
                  bool any, std::function<void(std::vector<uint32_t> gone)> done);
-    // Copies into another folder, answering the new UIDs in the order of `uids`.
+    // Copies into another folder, answering the new UIDs in the order of `uids`, the room they take held against the
+    // quota where `counts` (a MOVE gives it back); a target that does not exist answers a UIDVALIDITY of 0.
     void copy(const std::string& user, const std::shared_ptr<imap_folder>& from, const std::vector<uint32_t>& uids,
-              const std::string& to, std::function<void(bool, uint32_t uidvalidity, std::vector<uint32_t>)> done);
+              const std::string& to, bool counts,
+              std::function<void(bool, uint32_t uidvalidity, std::vector<uint32_t>)> done);
+    // A message a delivery put into the bucket, given its UID now, so IDLE and every shard know of it at once and
+    // its bytes count against the quota; the folder is made where a filter named one not there.
+    void delivered(const std::string& user, const std::string& folder, const std::string& key, uint64_t size,
+                   int64_t date_ms);
     // A message put into a folder, as APPEND does.
-    void append(const std::string& user, const std::string& folder, std::string message, uint8_t flags, int64_t date_ms,
-                std::function<void(bool, uint32_t uidvalidity, uint32_t uid)> done);
+    // Its answer is false with why: over the quota, no such folder, or the storage refused it.
+    enum class refusal : uint8_t { none, quota, no_folder, storage };
+    void append(const std::string& user, const std::string& folder, std::string message, uint8_t flags,
+                std::vector<std::string> keywords, int64_t date_ms,
+                std::function<void(refusal, uint32_t uidvalidity, uint32_t uid)> done);
 
     void tick(int64_t now);
     // Every journal synced now, in line, as the runtime stops.
@@ -134,6 +175,15 @@ private:
         bool compacting{false};
         // Held by this shard in mutate, which a reload inside does not take again: a second flock waits on the first.
         bool locked{false};
+        // The bytes of its messages, kept as they come and go, and those reserved for messages being written.
+        uint64_t used{0};
+        uint64_t reserved{0};
+        // A UIDVALIDITY given out, so a folder made again in the same second gets a later one.
+        uint32_t last_validity{0};
+        // A compaction that lost to new lines waits for the journal to grow this far before the next.
+        uint64_t compact_after{0};
+        // The journal's length at the last turn since a fold lost to new lines, tried again once it holds still.
+        uint64_t compact_quiet{UINT64_MAX};
         // The index's path, worked out once: resolving the state directory costs several syscalls.
         std::string base;
     };
@@ -143,11 +193,16 @@ private:
     // The journal's lines from `text`, applied; `fresh` says a message they add is \Recent.
     void apply(user_state& u, std::string_view text, bool fresh);
     // `change` made to `u` under the user's lock, the index read to its end first; it appends the lines it logs.
-    void mutate(const std::string& name, const std::function<void(user_state&, std::string& lines)>& change);
+    // False where the lock could not be taken or the lines not written, the change then read back as the disk has it.
+    bool mutate(const std::string& name, const std::function<void(user_state&, std::string& lines)>& change);
     void compact(const std::string& name, user_state& u);
     // A message put into `f`, given the next UID under the lock and logged.
+    // 0 where the folder went meanwhile, or the journal took no line.
     uint32_t add_message(const std::string& name, const std::shared_ptr<imap_folder>& f, const std::string& key,
-                         uint64_t size, int64_t date_ms, uint8_t flags);
+                         uint64_t size, int64_t date_ms, uint8_t flags, const std::vector<std::string>& keywords = {});
+    // Messages put into `f` together, their UIDs in order under one lock and one write; empty where the folder went.
+    std::vector<uint32_t> add_messages(const std::string& name, const std::shared_ptr<imap_folder>& f,
+                                       const std::vector<imap_message>& ms);
     void sync(const std::string& user, const std::shared_ptr<imap_folder>& f, std::string after,
               std::vector<std::pair<std::string, std::pair<uint64_t, int64_t>>> seen);
     void put_object(std::string key, std::string data, std::function<void(bool)> done);
@@ -168,11 +223,23 @@ private:
     {
         std::shared_ptr<const std::string> bytes;
         std::shared_ptr<const mime::part> part;
-        int64_t used_ms{0};
+        std::list<std::string>::iterator lru;
+        // The bytes counted for it in m_cached, its parsed structure among them.
+        size_t counted{0};
     };
+    // Counts `c` again after its bytes or structure changed.
+    void recount(cached& c);
     std::unordered_map<std::string, cached> m_cache;
+    std::list<std::string> m_lru;
     size_t m_cached{0};
+    // A key's entry made or read now, ahead of the others in leaving.
+    cached& touch(const std::string& key);
+    void evict();
+    // Header blocks read on their own, a few mebibytes of them.
+    std::unordered_map<std::string, std::shared_ptr<const std::string>> m_heads;
+    size_t m_heads_bytes{0};
     std::unordered_map<std::string, std::vector<std::function<void(std::shared_ptr<const std::string>)>>> m_reading;
+    std::unordered_map<std::string, std::vector<std::function<void(std::shared_ptr<const std::string>)>>> m_head_reading;
     uint64_t m_gets{0};
     uint64_t m_hits{0};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};

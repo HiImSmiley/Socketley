@@ -1677,6 +1677,23 @@ void mail_run::conn::when_drained(std::function<void()> f)
     drained = std::move(f);
 }
 
+void mail_run::conn::later(std::function<void()> f)
+{
+    const uint64_t me = id;
+    if (!run->m_fio.after(std::chrono::milliseconds(0), [r = run, me, f = std::move(f), alive = run->m_alive](int64_t) {
+            if (!*alive)
+                return;
+            if (conn* c = r->find(me); c && !c->dead)
+            {
+                c->in_input = true;
+                f();
+                c->in_input = false;
+                r->flush(*c);
+            }
+        }))
+        f();
+}
+
 bool mail_run::conn::start_compress()
 {
     zout = std::make_unique<socketley::deflater>();

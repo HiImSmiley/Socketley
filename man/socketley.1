@@ -12870,17 +12870,19 @@ loop turn says compressed as one flushed block, on the mailboxes of
 a password goes over STARTTLS or
 .B \-\-imaps
 only (LOGINDISABLED before), except from 127.0.0.1. Every mailbox has INBOX,
-Sent, Drafts, Junk and Trash, and CREATE makes more. A folder's UIDs and flags
-are kept per user in
+Sent, Drafts, Junk and Trash, and CREATE makes more, with the folders above a
+name such as Work/2026; a client sets keywords of its own beside the system
+flags. A folder's UIDs, flags and keywords are kept per user in
 .IB state /mail/ name .imap/ user ,
 a snapshot and a journal beside it: every shard serves IMAP, a change is a line
 appended under the user's lock once the journal is read to its end, so a UID is
 given once whichever shard gives it, and each shard reads the lines it has not
 before each command. The journal is folded into the snapshot once it passes a
-quarter of a mebibyte. The bucket stays what counts, looked at when a folder is
-opened and at most every two seconds after, so what a delivery or another client
-put there has the next UID and what went is expunged. IDLE is told of new mail
-within a second. Every change of a message has the folder's next
+quarter of a mebibyte. A delivery, an APPEND and a COPY write their line as
+the message is stored, so IDLE is told of new mail within a second and the
+quota counts it at once. The bucket stays what counts: listed when a folder is
+selected, and every minute under NOOP and IDLE, what went from it is expunged,
+and a message no line names is given the next UID once it is a minute old. Every change of a message has the folder's next
 mod\-sequence, so a client that reconnects asks for what changed and vanished
 since it last looked. A user's
 .B mail_quota

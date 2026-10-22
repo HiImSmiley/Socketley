@@ -51,12 +51,24 @@ done
 ready_tcp 127.0.0.1 "$IM" || bad "the IMAP port listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 
 # Five messages for alice: a thread of three by References, a second subject, and a reply to it by subject alone.
-python3 - "$P" <<'PY'
-import smtplib, sys
+# Each is in the mailbox before the next is sent, so their UIDs follow the order they were sent in.
+python3 - "$P" "$PS" <<'PY'
+import smtplib, sys, time, urllib.request
 s = smtplib.SMTP("127.0.0.1", int(sys.argv[1])); s.ehlo("x")
+sent = 0
 def send(frm, subj, date, mid, extra=""):
+    global sent
     s.sendmail(frm, ["alice@example.test"], "From: %s\r\nTo: alice@example.test\r\nSubject: %s\r\nDate: %s\r\n"
                "Message-ID: <%s>\r\n%s\r\nbody of %s\r\n" % (frm, subj, date, mid, extra, mid))
+    sent += 1
+    for _ in range(100):
+        try:
+            got = urllib.request.urlopen("http://127.0.0.1:%s/mail?list-type=2&prefix=alice/INBOX/" % sys.argv[2]).read()
+            if got.count(b"<Key>") >= sent:
+                return
+        except Exception:
+            pass
+        time.sleep(0.05)
 send("zed@else.test", "Lunch", "Mon, 19 Oct 2026 10:00:00 +0000", "a@else")
 send("amy@else.test", "Re: Lunch", "Mon, 19 Oct 2026 11:00:00 +0000", "b@else", "References: <a@else>\r\n")
 send("bob@else.test", "Budget", "Sun, 18 Oct 2026 09:00:00 +0000", "c@else")
