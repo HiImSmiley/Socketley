@@ -24,6 +24,10 @@
 #   * METADATA not kept, not kept across a restart, or past its bounds; DEPTH and MAXSIZE not followed
 #   * imapsieve not run for what a client APPENDs or COPYs into a folder that names a script, or its fileinto,
 #     discard and addflag not done there
+#   * NOTIFY not telling another folder's new mail, a folder made or gone, or new mail in the selected one outside
+#     IDLE; taking an event it cannot tell, or telling after NONE
+#   * IMAP4rev2 still saying RECENT or UNSEEN, or answering SEARCH without ESEARCH; $ not what SAVE kept; a SELECT
+#     not saying CLOSED; STATUS without DELETED
 #   * BINARY giving a part still encoded, a NUL in a plain literal, or an encoding it cannot undo answered OK
 set -uo pipefail
 
@@ -326,6 +330,63 @@ elif step == "meta":
     say("and takes it out of the folder, and what it discards", not any("to-archive" in x or "drop-me" in x for x in lines), lines)
     say("and sets the flags it adds", any("flag-me" in x and "\\Flagged" in x for x in lines), lines)
     say("and runs for a COPY into it too, with cause COPY", any("copied-one" in x and "$Copied" in x for x in lines), lines)
+elif step == "notify":
+    w = C(("bob", "bobpassword12")); w.cmd("SELECT INBOX")
+    r = w.cmd("NOTIFY SET (personal (MessageNew))")
+    say("NOTIFY refuses MessageNew without MessageExpunge", r[-1].split()[1] == "BAD", r)
+    r = w.cmd("NOTIFY SET (personal (AnnotationChange))")
+    say("and an event it does not tell, saying which it does", "[BADEVENT" in r[-1], r)
+    r = w.cmd("NOTIFY SET STATUS (selected (MessageNew MessageExpunge FlagChange)) "
+              "(personal (MessageNew MessageExpunge MailboxName))")
+    say("NOTIFY SET STATUS says each watched folder at once", r[-1].split()[1] == "OK" and any(x.startswith('* STATUS "Multi"') for x in r), r)
+    def unsolicited(secs):
+        # Read off the socket itself: a timed-out read would leave the file object unusable.
+        import select
+        raw = b""; end = time.time() + secs
+        while time.time() < end:
+            if select.select([w.s], [], [], 0.2)[0]:
+                raw += w.s.recv(65536)
+        return [l for l in raw.decode(errors="replace").split("\r\n") if l]
+    o = C(("bob", "bobpassword12"))
+    o.append("Multi", msg("notified"))
+    o.cmd("CREATE Brandnew")
+    mail("bob@example.test", "From: x@else.test\r\nSubject: to-selected\r\n\r\nhi\r\n")
+    got = unsolicited(4)
+    say("another session's APPEND elsewhere is told as STATUS, outside IDLE", any(x.startswith('* STATUS "Multi"') and "MESSAGES" in x for x in got), got)
+    say("a folder made is told as LIST", any(x.startswith('* LIST') and "Brandnew" in x for x in got), got)
+    say("and new mail in the selected folder as EXISTS", any(x.endswith(" EXISTS") for x in got), got)
+    o.cmd("DELETE Brandnew")
+    got = unsolicited(3)
+    say("and a folder gone as LIST \\NonExistent", any("\\NonExistent" in x and "Brandnew" in x for x in got), got)
+    r = w.cmd("NOTIFY NONE")
+    o.append("Multi", msg("not told"))
+    got = unsolicited(3)
+    say("NOTIFY NONE ends it", r[-1].split()[1] == "OK" and not any("STATUS" in x for x in got), (r, got))
+elif step == "rev2":
+    v = C(("bob", "bobpassword12"))
+    caps = v.cmd("CAPABILITY")[0].split()
+    say("CAPABILITY offers IMAP4rev2 and SEARCHRES", "IMAP4rev2" in caps and "SEARCHRES" in caps, caps)
+    r = v.cmd("ENABLE IMAP4rev2")
+    say("ENABLE IMAP4rev2 is enabled", "* ENABLED IMAP4rev2" in r, r)
+    r = v.cmd("SELECT INBOX")
+    say("its SELECT says no RECENT and no UNSEEN, and LISTs the folder", not any(x.endswith(" RECENT") or "[UNSEEN" in x for x in r)
+        and any(x.startswith("* LIST ") and "INBOX" in x for x in r), r)
+    r = v.cmd("UID SEARCH ALL")
+    say("its SEARCH is answered as ESEARCH", r[0].startswith("* ESEARCH (TAG ") and " UID ALL " in r[0], r)
+    r = v.cmd("UID SEARCH RETURN (SAVE) SUBJECT copied-one")
+    say("SEARCH RETURN (SAVE) says nothing but OK", len(r) == 1 and r[0].split()[1] == "OK", r)
+    r = v.cmd("UID FETCH $ (UID BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+    say("and $ names what it kept", len(r) == 2 and "copied-one" in r[0], r)
+    r = v.cmd("UID SEARCH UID $")
+    say("in SEARCH too", r[0].startswith("* ESEARCH") and r[0].count(" ALL ") == 1, r)
+    v.cmd("UID STORE 1 +FLAGS (\\Deleted)")
+    r = v.cmd("STATUS INBOX (DELETED)")
+    say("STATUS counts DELETED", re.search(r"DELETED [1-9]", r[0]) is not None, r)
+    v.cmd("UID STORE 1 -FLAGS (\\Deleted)")
+    r = v.cmd("SELECT Multi")
+    say("a SELECT of another folder says the first is CLOSED", any("[CLOSED]" in x for x in r), r)
+    r = v.cmd("UID FETCH $ (UID)")
+    say("and $ is empty in it", len(r) == 1, r)
 elif step == "after":
     b = C(("bob", "bobpassword12")); b.cmd("SELECT INBOX")
     r = b.cmd("UID SEARCH KEYWORD project-x")
@@ -358,6 +419,8 @@ if environment :is "imap.cause" "COPY" { addflag "$Copied"; }
 SV
 out=$("$BIN" mail m sieve bob put onfile "$T/onfile.sieve" 2>&1) || bad "the imapsieve script is put" "$out"
 tally < <(run meta | grep -E '^(ok|bad) ')
+tally < <(run notify | grep -E '^(ok|bad) ')
+tally < <(run rev2 | grep -E '^(ok|bad) ')
 "$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1; ready_tcp 127.0.0.1 "$IM" >/dev/null
 tally < <(run after | grep -E '^(ok|bad) ')
 

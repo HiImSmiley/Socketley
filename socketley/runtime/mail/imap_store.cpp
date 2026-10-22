@@ -913,6 +913,15 @@ void imap_store::tick(int64_t)
     }
 }
 
+std::vector<std::shared_ptr<imap_folder>> imap_store::known(const std::string& name)
+{
+    refresh(name);
+    std::vector<std::shared_ptr<imap_folder>> out;
+    for (const auto& [n, f] : user(name).folders)
+        out.push_back(f);
+    return out;
+}
+
 std::vector<std::string> imap_store::folder_names(const std::string& name)
 {
     std::vector<std::string> out;

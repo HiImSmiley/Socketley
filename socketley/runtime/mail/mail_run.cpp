@@ -2308,7 +2308,7 @@ void mail_run::tick()
         // One closing with output its client does not read is closed once its grace is over.
         else if (c->closing && now - c->closing_ms >= close_grace_ms)
             m_close_soon.push_back(c->id);
-        else if (c->imap && c->imap->idling())
+        else if (c->imap && (c->imap->idling() || c->imap->notifying()))
         {
             c->in_input = true;
             c->imap->poll();

@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "mail_account.h"
@@ -72,9 +73,10 @@ public:
     void input(std::string_view bytes);
     void tls_started();
     void gone();
-    // The selected folder looked at again, for IDLE, once a second.
+    // The selected folder looked at again, for IDLE, once a second; and, under NOTIFY, the folders it watches.
     void poll();
     bool idling() const { return m_idle; }
+    bool notifying() const { return !m_notify.empty() || m_notify_selected; }
     // What came and is not taken yet, the command being gathered included.
     size_t buffered() const { return m_in.size() + m_cmd.size(); }
     const std::string& user() const { return m_user; }
@@ -108,6 +110,10 @@ private:
     void cmd_append(const std::string& tag, const std::vector<token>& a);
     // GETMETADATA and SETMETADATA (RFC 5464), the server's entries under the mailbox "".
     void cmd_metadata(const std::string& tag, const std::vector<token>& a, bool set);
+    // NOTIFY SET and NONE (RFC 5465).
+    void cmd_notify(const std::string& tag, const std::vector<token>& a);
+    // What changed in the folders NOTIFY watches since they were last looked at, said as STATUS and LIST.
+    void notify_changes(bool all);
     void cmd_fetch(const std::string& tag, const std::vector<token>& a, size_t from, bool uid);
     void cmd_store(const std::string& tag, const std::vector<token>& a, size_t from, bool uid);
     void cmd_search(const std::string& tag, const std::vector<token>& a, size_t from, bool uid);
@@ -149,6 +155,22 @@ private:
     bool m_qresync{false};
     // ENABLE UTF8=ACCEPT: mailbox names come and go as UTF-8, kept in the index as modified UTF-7 (RFC 6855 3).
     bool m_utf8{false};
+    // ENABLE IMAP4rev2 (RFC 9051): no \Recent, SEARCH answered as ESEARCH, SELECT without UNSEEN and with LIST.
+    bool m_rev2{false};
+    // SEARCHRES (RFC 5182): the UIDs SEARCH RETURN (SAVE) kept, which $ names until the next SELECT.
+    std::vector<uint32_t> m_saved;
+    // NOTIFY's filters other than the selected folder's: which folders, and the events of each, as bits.
+    struct notify_filter
+    {
+        enum class which : uint8_t { inboxes, personal, subscribed, subtree, mailboxes } w{which::personal};
+        std::vector<std::string> names;
+        uint8_t events{0};
+    };
+    std::vector<notify_filter> m_notify;
+    // The selected folder is told of between commands, not only in IDLE.
+    bool m_notify_selected{false};
+    // What each watched folder was when last looked at: its version, whether it was subscribed.
+    std::unordered_map<std::string, std::pair<uint64_t, bool>> m_notify_seen;
     uint64_t m_told_modseq{0};
     // Input: what is not yet a whole command, the command being gathered with its literals, and how much of a literal
     // is still to come.

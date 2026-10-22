@@ -12969,7 +12969,8 @@ for a broker. A bucket that encrypts or compresses what it keeps does so to
 mail too, and a message is read back a range at a time either way.
 .PP
 .B IMAP.
-IMAP4rev1 with LITERAL+, SASL\-IR, IDLE, NAMESPACE, UIDPLUS, MOVE, UNSELECT,
+IMAP4rev1, and IMAP4rev2 (RFC 9051) for a client that enables it, with LITERAL+,
+SEARCHRES, SASL\-IR, IDLE, NAMESPACE, UIDPLUS, MOVE, UNSELECT,
 CHILDREN, SPECIAL\-USE, ID, ENABLE, CONDSTORE and QRESYNC, ESEARCH,
 LIST\-EXTENDED and LIST\-STATUS, STATUS=SIZE, QUOTA, SORT (with DISPLAYFROM and
 DISPLAYTO), THREAD (ORDEREDSUBJECT, REFERENCES) and COMPRESS=DEFLATE, what a
@@ -13011,7 +13012,10 @@ go as UTF\-8 and a message may be a literal8, CREATE\-SPECIAL\-USE, which takes
 a special use only of the folder whose name has it, BINARY, which gives a part
 with its transfer encoding undone, OBJECTID, whose MAILBOXID a RENAME keeps,
 METADATA (RFC 5464), entries of the server and of each folder kept in the
-index, at most 1000 a user of 64 KiB each, and APPENDLIMIT; RENAME
+index, at most 1000 a user of 64 KiB each, NOTIFY (RFC 5465), which tells a
+session of new mail, expunges and flags in the folders it watches as STATUS,
+of folders made and gone as LIST, and of the selected folder between commands,
+within a second, and APPENDLIMIT; RENAME
 takes the folders under a name along, and RENAME INBOX moves its messages and
 leaves it empty. A connection quiet for thirty minutes is closed.
 .PP

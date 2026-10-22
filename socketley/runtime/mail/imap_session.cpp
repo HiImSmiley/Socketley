@@ -455,10 +455,11 @@ void imap_session::finish(const std::string& tag, std::string_view status, std::
 
 static std::string capabilities(const imap_config& cfg)
 {
-    std::string c = "IMAP4rev1 LITERAL+ SASL-IR IDLE NAMESPACE UIDPLUS MOVE UNSELECT CHILDREN SPECIAL-USE ID ENABLE "
+    std::string c = "IMAP4rev1 IMAP4rev2 LITERAL+ LITERAL- SASL-IR IDLE NAMESPACE UIDPLUS MOVE UNSELECT CHILDREN "
+                    "SPECIAL-USE ID ENABLE SEARCHRES "
                     "CONDSTORE QRESYNC ESEARCH LIST-EXTENDED LIST-STATUS STATUS=SIZE QUOTA QUOTA=RES-STORAGE SORT "
                     "SORT=DISPLAY THREAD=ORDEREDSUBJECT THREAD=REFERENCES COMPRESS=DEFLATE MULTIAPPEND UTF8=ACCEPT "
-                    "CREATE-SPECIAL-USE BINARY OBJECTID METADATA APPENDLIMIT=" +
+                    "CREATE-SPECIAL-USE BINARY OBJECTID METADATA NOTIFY APPENDLIMIT=" +
                     std::to_string(cfg.max_append);
     if (!cfg.imapsieve.empty())
         c += " IMAPSIEVE=" + cfg.imapsieve;
@@ -767,7 +768,7 @@ std::string imap_session::flags_text(uint8_t f, bool recent) const
         add("\\Deleted");
     if (f & flag_draft)
         add("\\Draft");
-    if (recent)
+    if (recent && !m_rev2)
         add("\\Recent");
     return "(" + out + ")";
 }
@@ -847,7 +848,8 @@ void imap_session::update_view()
     if (grew)
     {
         untagged(std::to_string(m_view.size()) + " EXISTS");
-        untagged(std::to_string(recent) + " RECENT");
+        if (!m_rev2)
+            untagged(std::to_string(recent) + " RECENT");
     }
     m_told_modseq = m_folder->highestmodseq;
 }
@@ -855,6 +857,14 @@ void imap_session::update_view()
 bool imap_session::parse_set(std::string_view set, bool uid, std::vector<size_t>& out) const
 {
     out.clear();
+    // $ is what SEARCH RETURN (SAVE) kept, those of its UIDs still here (RFC 5182 2.1).
+    if (set == "$")
+    {
+        for (size_t i = 0; i < m_view.size(); ++i)
+            if (std::binary_search(m_saved.begin(), m_saved.end(), m_view[i]))
+                out.push_back(i);
+        return true;
+    }
     const uint32_t max_uid = m_view.empty() ? 0 : m_view.back();
     const size_t count = m_view.size();
     // The ranges first, as UIDs or as numbers, merged in order; then one walk of the view takes what they cover.
@@ -986,6 +996,13 @@ void imap_session::command(std::string tag, std::vector<token> a)
                 m_utf8 = true;
                 continue;
             }
+            if (e == "IMAP4REV2")
+            {
+                if (!m_rev2)
+                    on += " IMAP4rev2";
+                m_rev2 = true;
+                continue;
+            }
             if (e == "CONDSTORE" && !m_condstore)
                 on += " CONDSTORE";
             else if (e == "QRESYNC" && !m_qresync)
@@ -1094,6 +1111,8 @@ void imap_session::command(std::string tag, std::vector<token> a)
         return cmd_append(tag, a);
     if (cmd == "GETMETADATA" || cmd == "SETMETADATA")
         return cmd_metadata(tag, a, cmd == "SETMETADATA");
+    if (cmd == "NOTIFY")
+        return cmd_notify(tag, a);
     // One quota root, "", over every folder of the user, in kibibytes (RFC 9208).
     if (cmd == "GETQUOTAROOT" || cmd == "GETQUOTA")
     {
@@ -1127,6 +1146,7 @@ void imap_session::command(std::string tag, std::vector<token> a)
         const auto done = [this, tag, cmd] {
             m_folder.reset();
             m_view.clear();
+            m_saved.clear();
             m_state = state::auth;
             finish(tag, "OK", cmd + " completed");
         };
@@ -1249,8 +1269,12 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
             break;
         }
     }
+    // The folder selected before is closed first, and said so where the client can tell (RFC 7162 3.2.11).
+    if (m_folder && (m_qresync || m_rev2))
+        untagged("OK [CLOSED] Previous mailbox is now closed");
     m_folder.reset();
     m_view.clear();
+    m_saved.clear();
     m_state = state::auth;
     m_waiting = true;
     m_store.open(m_user, box(a[1].text), [this, alive = m_alive, tag, readonly, condstore, qr](std::shared_ptr<imap_folder> f) {
@@ -1296,9 +1320,13 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
         untagged("OK [PERMANENTFLAGS (" + (readonly ? std::string() : std::string(all_flags) + words + " \\*") +
                  ")] Flags permitted");
         untagged(std::to_string(m_view.size()) + " EXISTS");
-        untagged(std::to_string(recent) + " RECENT");
-        if (first_unseen)
+        if (!m_rev2)
+            untagged(std::to_string(recent) + " RECENT");
+        if (first_unseen && !m_rev2)
             untagged("OK [UNSEEN " + std::to_string(first_unseen) + "] First unseen");
+        // IMAP4rev2 names the folder as the server spells it (RFC 9051 6.3.2).
+        if (m_rev2)
+            untagged("LIST () \"/\" " + mime::imap_string(shown(f->name), false));
         untagged("OK [UIDVALIDITY " + std::to_string(f->uidvalidity) + "] UIDs valid");
         untagged("OK [UIDNEXT " + std::to_string(f->uidnext) + "] Predicted next UID");
         untagged("OK [HIGHESTMODSEQ " + std::to_string(f->highestmodseq) + "] Highest");
@@ -1340,13 +1368,16 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
 std::string imap_session::status_text(const imap_folder& f, const std::vector<std::string>& items) const
 {
     // The messages are walked only for what is asked that needs it.
-    size_t unseen = 0, recent = 0;
+    size_t unseen = 0, recent = 0, deleted = 0;
     uint64_t size = 0;
     if (std::any_of(items.begin(), items.end(),
-                    [](const std::string& it) { return it == "UNSEEN" || it == "RECENT" || it == "SIZE"; }))
+                    [](const std::string& it) {
+                        return it == "UNSEEN" || it == "RECENT" || it == "SIZE" || it == "DELETED";
+                    }))
         for (const auto& m : f.msgs)
         {
             unseen += !(m.flags & flag_seen);
+            deleted += (m.flags & flag_deleted) != 0;
             recent += m.recent;
             size += m.size;
         }
@@ -1368,6 +1399,8 @@ std::string imap_session::status_text(const imap_folder& f, const std::vector<st
             v = std::to_string(f.highestmodseq);
         else if (it == "SIZE")
             v = std::to_string(size);
+        else if (it == "DELETED")
+            v = std::to_string(deleted);
         else if (it == "APPENDLIMIT")
             v = std::to_string(m_cfg.max_append);
         else if (it == "MAILBOXID")
@@ -2225,7 +2258,7 @@ bool parse_one(const std::vector<std::string>& t, size_t& i, crit& out, int dept
         return true;
     }
     // A sequence set.
-    if (!k.empty() && (std::isdigit(static_cast<unsigned char>(k[0])) || k[0] == '*'))
+    if (!k.empty() && (std::isdigit(static_cast<unsigned char>(k[0])) || k[0] == '*' || k == "$"))
     {
         out.key = "SET";
         out.arg = k;
@@ -2346,6 +2379,15 @@ void imap_session::cmd_search(const std::string& tag, const std::vector<token>& 
         if (want.empty())
             want.push_back("ALL");
     }
+    // IMAP4rev2 answers every SEARCH as ESEARCH (RFC 9051 7.3.4).
+    if (m_rev2 && !esearch)
+    {
+        esearch = true;
+        want.push_back("ALL");
+    }
+    const bool save = std::find(want.begin(), want.end(), "SAVE") != want.end();
+    if (save)
+        m_saved.clear();
     if (i < t.size() && iequal(t[i], "CHARSET"))
         i += 2;
     crit all;
@@ -2466,9 +2508,30 @@ void imap_session::cmd_search(const std::string& tag, const std::vector<token>& 
             ++j->at;
         }
         j->looping = false;
-        if (esearch)
+        const auto asked = [&want](std::string_view w) { return std::find(want.begin(), want.end(), w) != want.end(); };
+        if (asked("SAVE"))
         {
-            const auto asked = [&want](std::string_view w) { return std::find(want.begin(), want.end(), w) != want.end(); };
+            // With MIN or MAX alone, what is kept is those (RFC 5182 2.4).
+            std::vector<uint32_t> keep;
+            if (!j->hits.empty() && !asked("ALL") && !asked("COUNT") && (asked("MIN") || asked("MAX")))
+            {
+                if (asked("MIN"))
+                    keep.push_back(j->hits.front());
+                if (asked("MAX"))
+                    keep.push_back(j->hits.back());
+            }
+            else
+                keep = j->hits;
+            for (uint32_t& h : keep)
+                if (!uid)
+                    h = h - 1 < m_view.size() ? m_view[h - 1] : 0;
+            std::sort(keep.begin(), keep.end());
+            keep.erase(std::unique(keep.begin(), keep.end()), keep.end());
+            m_saved = std::move(keep);
+        }
+        // SAVE alone asks for nothing to be said.
+        if (esearch && !(asked("SAVE") && want.size() == 1))
+        {
             std::string out = "ESEARCH (TAG " + mime::imap_string(tag, false) + ")" + (uid ? " UID" : "");
             if (!j->hits.empty() && asked("MIN"))
                 out += " MIN " + std::to_string(j->hits.front());
@@ -2482,7 +2545,7 @@ void imap_session::cmd_search(const std::string& tag, const std::vector<token>& 
                 out += " MODSEQ " + std::to_string(j->top_modseq);
             untagged(out);
         }
-        else
+        else if (!esearch)
         {
             std::string out = "SEARCH";
             for (const uint32_t h : j->hits)
@@ -2766,12 +2829,201 @@ void imap_session::read_ahead(size_t idx, bool whole)
 
 void imap_session::poll()
 {
-    if (!m_idle || !m_folder)
+    // Unsolicited lines go only between commands, never inside one's answer.
+    const bool between = !m_running && !m_waiting && m_cmd.empty() && m_literal == 0 &&
+                         (m_state == state::auth || m_state == state::selected);
+    if (between && !m_notify.empty())
+        notify_changes(false);
+    if (!m_folder || !(m_idle || (between && m_notify_selected)))
         return;
     m_store.open(m_user, m_folder->name, [this, alive = m_alive](std::shared_ptr<imap_folder>) {
-        if (*alive && m_idle)
+        if (*alive && (m_idle || m_notify_selected) && !m_running && !m_waiting)
             update_view();
     }, false, 60000);
+}
+
+namespace
+{
+
+enum : uint8_t
+{
+    ev_new = 1,
+    ev_expunge = 2,
+    ev_flags = 4,
+    ev_name = 8,
+    ev_subscription = 16,
+};
+
+}   // namespace
+
+void imap_session::cmd_notify(const std::string& tag, const std::vector<token>& a)
+{
+    // NOTIFY NONE | NOTIFY SET [STATUS] (filter events) ... (RFC 5465 3).
+    if (a.size() == 2 && upper(a[1].text) == "NONE")
+    {
+        m_notify.clear();
+        m_notify_selected = false;
+        m_notify_seen.clear();
+        return finish(tag, "OK", "NOTIFY completed");
+    }
+    if (a.size() < 3 || upper(a[1].text) != "SET")
+        return finish(tag, "BAD", "NOTIFY SET or NOTIFY NONE");
+    size_t i = 2;
+    bool status = false;
+    if (a[i].k == token::atom && upper(a[i].text) == "STATUS")
+    {
+        status = true;
+        ++i;
+    }
+    std::vector<notify_filter> filters;
+    bool selected = false;
+    while (i < a.size())
+    {
+        if (a[i].k != token::open || i + 2 >= a.size())
+            return finish(tag, "BAD", "A NOTIFY filter is (filter events)");
+        ++i;
+        const std::string kind = upper(a[i++].text);
+        notify_filter f;
+        bool is_selected = false;
+        if (kind == "SELECTED" || kind == "SELECTED-DELAYED")
+            is_selected = true;
+        else if (kind == "INBOXES")
+            f.w = notify_filter::which::inboxes;
+        else if (kind == "PERSONAL")
+            f.w = notify_filter::which::personal;
+        else if (kind == "SUBSCRIBED")
+            f.w = notify_filter::which::subscribed;
+        else if (kind == "SUBTREE" || kind == "MAILBOXES")
+        {
+            f.w = kind == "SUBTREE" ? notify_filter::which::subtree : notify_filter::which::mailboxes;
+            if (i < a.size() && a[i].k == token::open)
+            {
+                for (++i; i < a.size() && a[i].k != token::close; ++i)
+                    f.names.push_back(box(a[i].text));
+                ++i;
+            }
+            else if (i < a.size())
+                f.names.push_back(box(a[i++].text));
+        }
+        else
+            return finish(tag, "NO", "[BADEVENT (MessageNew MessageExpunge FlagChange MailboxName "
+                                     "SubscriptionChange)] Unknown filter " +
+                                         kind);
+        if (i >= a.size())
+            return finish(tag, "BAD", "A NOTIFY filter needs its events");
+        if (a[i].k == token::atom && upper(a[i].text) == "NONE")
+            ++i;
+        else if (a[i].k == token::open)
+        {
+            for (++i; i < a.size() && a[i].k != token::close; ++i)
+            {
+                const std::string e = upper(a[i].text);
+                if (e == "MESSAGENEW")
+                {
+                    f.events |= ev_new;
+                    // Its fetch attributes: what the index answers, said with each new message's EXISTS.
+                    if (i + 1 < a.size() && a[i + 1].k == token::open)
+                        for (i += 2; i < a.size() && a[i].k != token::close; ++i) {}
+                }
+                else if (e == "MESSAGEEXPUNGE")
+                    f.events |= ev_expunge;
+                else if (e == "FLAGCHANGE")
+                    f.events |= ev_flags;
+                else if (e == "MAILBOXNAME")
+                    f.events |= ev_name;
+                else if (e == "SUBSCRIPTIONCHANGE")
+                    f.events |= ev_subscription;
+                else
+                    return finish(tag, "NO", "[BADEVENT (MessageNew MessageExpunge FlagChange MailboxName "
+                                             "SubscriptionChange)] Not an event this server tells");
+            }
+            ++i;
+        }
+        else
+            return finish(tag, "BAD", "A NOTIFY filter needs its events");
+        if (i >= a.size() || a[i].k != token::close)
+            return finish(tag, "BAD", "A NOTIFY filter is (filter events)");
+        ++i;
+        // MessageNew and FlagChange come with MessageExpunge, or a client's numbers could not follow (RFC 5465 5).
+        if ((f.events & (ev_new | ev_flags)) && !(f.events & ev_expunge))
+            return finish(tag, "BAD", "MessageNew and FlagChange need MessageExpunge");
+        if (is_selected)
+            selected = f.events != 0;
+        else
+            filters.push_back(std::move(f));
+    }
+    m_notify = std::move(filters);
+    m_notify_selected = selected;
+    m_notify_seen.clear();
+    notify_changes(true);
+    // STATUS asks each watched folder's state at once; without it what is now is only where the telling begins.
+    if (status)
+        for (const auto& f : m_store.known(m_user))
+            if (f != m_folder && m_notify_seen.count(f->name))
+                untagged(status_text(*f, {"MESSAGES", "UIDNEXT", "UIDVALIDITY", "UNSEEN"}));
+    return finish(tag, "OK", "NOTIFY completed");
+}
+
+void imap_session::notify_changes(bool all)
+{
+    const auto events_of = [this](const imap_folder& f) {
+        uint8_t ev = 0;
+        for (const auto& n : m_notify)
+        {
+            bool hit = false;
+            switch (n.w)
+            {
+                case notify_filter::which::inboxes: hit = f.name == "INBOX"; break;
+                case notify_filter::which::personal: hit = true; break;
+                case notify_filter::which::subscribed: hit = f.subscribed; break;
+                case notify_filter::which::mailboxes:
+                    hit = std::find(n.names.begin(), n.names.end(), f.name) != n.names.end();
+                    break;
+                case notify_filter::which::subtree:
+                    hit = std::any_of(n.names.begin(), n.names.end(), [&](const std::string& s) {
+                        return f.name == s || f.name.starts_with(s + "/");
+                    });
+                    break;
+            }
+            if (hit)
+                ev |= n.events;
+        }
+        return ev;
+    };
+    const auto folders = m_store.known(m_user);
+    std::unordered_map<std::string, std::pair<uint64_t, bool>> now;
+    for (const auto& f : folders)
+    {
+        if (f == m_folder)
+            continue;
+        const uint8_t ev = events_of(*f);
+        if (!ev)
+            continue;
+        now[f->name] = {f->version, f->subscribed};
+        if (all)
+            continue;
+        const auto was = m_notify_seen.find(f->name);
+        if (was == m_notify_seen.end())
+        {
+            if (ev & ev_name)
+                untagged("LIST () \"/\" " + mime::imap_string(shown(f->name), false));
+            continue;
+        }
+        if (was->second.first != f->version && (ev & (ev_new | ev_expunge | ev_flags)))
+            untagged(status_text(*f, (ev & ev_flags) ? std::vector<std::string>{"MESSAGES", "UIDNEXT", "UIDVALIDITY", "UNSEEN"}
+                                                     : std::vector<std::string>{"MESSAGES", "UIDNEXT", "UIDVALIDITY"}));
+        if (was->second.second != f->subscribed && (ev & ev_subscription))
+            untagged(std::string("LIST (") + (f->subscribed ? "\\Subscribed" : "") + ") \"/\" " +
+                     mime::imap_string(shown(f->name), false));
+    }
+    // A folder gone since it was looked at is said to be no longer there.
+    if (!all)
+        for (const auto& [name, was] : m_notify_seen)
+            if (!now.count(name) && std::none_of(folders.begin(), folders.end(),
+                                                 [&](const auto& f) { return f->name == name; }))
+                if (std::any_of(m_notify.begin(), m_notify.end(), [](const notify_filter& n) { return n.events & ev_name; }))
+                    untagged("LIST (\\NonExistent) \"/\" " + mime::imap_string(shown(name), false));
+    m_notify_seen = std::move(now);
 }
 
 }   // namespace socketley::mail

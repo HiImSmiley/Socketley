@@ -100,6 +100,8 @@ public:
 
     // The folders the index knows for `user`, as they are now.
     std::vector<std::string> folder_names(const std::string& user);
+    // The folders themselves, with what other shards logged read in first, for NOTIFY to see what changed.
+    std::vector<std::shared_ptr<imap_folder>> known(const std::string& user);
     // The user's folders, those the bucket has and those made empty here.
     void folders(const std::string& user, std::function<void(std::vector<std::string>)> done);
     // A folder brought up to what the bucket holds, listed again where it was last listed longer than `max_age_ms` ago;
