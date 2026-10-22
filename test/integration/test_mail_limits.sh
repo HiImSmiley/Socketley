@@ -130,7 +130,8 @@ PY
 check "input pipelined past a message's size while a command waits is answered 421" "$r" "421 4.7.0"
 r=$(python3 - "$P" <<'PY'
 import socket, sys, time
-s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=20); s.recv(200)
+# The runtime reads on until some 58 MB of replies wait, which a loaded machine takes longer than 20 s to answer.
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=90); s.recv(200)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
 for _ in range(20):
     s.sendall(b"EHLO x\r\n" * 20000)

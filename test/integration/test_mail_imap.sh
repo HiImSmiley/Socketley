@@ -66,11 +66,25 @@ PY
 [[ "$got" == "OK [APPENDUID "*" 1] "*$'\n'1 ]] && ok "APPEND to a mailbox the storage has no bucket for yet" \
     || bad "APPEND before any mail" "$got"
 
-# Three messages for alice, one of them a multipart.
-timeout 180 python3 - "$P" <<'PY'
-import smtplib, sys
+# Three messages for alice, one of them a multipart, each in her mailbox before the next is sent: deliveries run side
+# by side, so a later one could take the lower UID, and the checks below read them by their numbers.
+timeout 180 python3 - "$P" "$PS" <<'PY'
+import smtplib, sys, time, urllib.request
 s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]))
 s.ehlo("x")
+def stored(n):
+    for _ in range(100):
+        listing = urllib.request.urlopen("http://127.0.0.1:%s/mail?list-type=2&prefix=alice/INBOX/" % sys.argv[2]).read()
+        if listing.count(b"<Key>") >= n:
+            return
+        time.sleep(0.1)
+send = s.sendmail
+def sendmail(*a):
+    send(*a)
+    sendmail.n += 1
+    stored(sendmail.n)
+sendmail.n = 0
+s.sendmail = sendmail
 s.sendmail("carol@else.test", ["alice@example.test"], "From: Carol <carol@else.test>\r\nTo: alice@example.test\r\nSubject: one\r\nMessage-ID: <one@else.test>\r\n\r\nfirst body\r\n")
 s.sendmail("dave@else.test", ["alice@example.test"], "From: dave@else.test\r\nTo: alice@example.test\r\nSubject: two\r\n\r\nsecond body with needle\r\n")
 s.sendmail("erin@else.test", ["alice@example.test"], "From: erin@else.test\r\nTo: alice@example.test\r\nSubject: three\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nthe text\r\n--b\r\nContent-Type: application/octet-stream; name=x.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAAEC\r\n--b--\r\n")
