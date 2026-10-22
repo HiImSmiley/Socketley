@@ -145,6 +145,139 @@ std::vector<std::pair<std::string, std::string>> imap_store::meta_under(const st
     return out;
 }
 
+std::string imap_store::rights(const std::string& owner, const std::string& folder, const std::string& who)
+{
+    if (owner == who)
+        return std::string(all_rights);
+    const auto& folders = user(owner).folders;
+    const auto it = folders.find(canonical(folder));
+    if (it == folders.end())
+        return {};
+    std::string out;
+    for (const char* id : {who.c_str(), "anyone"})
+        if (const auto a = it->second->acl.find(id); a != it->second->acl.end())
+            for (const char c : a->second)
+                if (out.find(c) == std::string::npos)
+                    out += c;
+    return out;
+}
+
+bool imap_store::set_acl(const std::string& owner, const std::string& folder, const std::string& who,
+                         const std::string& r)
+{
+    user(owner);
+    const std::string fname = canonical(folder);
+    bool there = false;
+    mutate(owner, [&](user_state& u, std::string& lines) {
+        if (!u.folders.count(fname))
+            return;
+        there = true;
+        const std::string line = "L " + fname + "\t" + who + "\t" + r + "\n";
+        apply(u, line, false);
+        lines += line;
+    });
+    if (there)
+        note_share(owner, fname, who, !r.empty());
+    return there;
+}
+
+std::map<std::string, std::string> imap_store::acl(const std::string& owner, const std::string& folder)
+{
+    const auto& folders = user(owner).folders;
+    const auto it = folders.find(canonical(folder));
+    return it == folders.end() ? std::map<std::string, std::string>{} : it->second->acl;
+}
+
+std::string imap_store::shares_path() const
+{
+    return (socketley_paths::resolve().state_dir / "mail" / (std::string(m_run.owner().get_name()) + ".imap") /
+            ".shares")
+        .string();
+}
+
+void imap_store::note_share(const std::string& owner, const std::string& folder, const std::string& who, bool on)
+{
+    // A line a share, appended under a lock of its own; a share is checked against the owner's ACL whenever it is used.
+    const std::string path = shares_path();
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    const int lock = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock < 0 || ::flock(lock, LOCK_EX) != 0)
+    {
+        if (lock >= 0)
+            ::close(lock);
+        return;
+    }
+    const std::string line = owner + "\t" + folder + "\t" + who + "\t" + (on ? "+" : "-") + "\n";
+    struct stat st{};
+    if (::stat(path.c_str(), &st) == 0 && st.st_size > (1 << 20))
+    {
+        // Past a mebibyte the list is written again with the shares that are on, this one with them.
+        std::string text;
+        socketley::read_file(path, text, {.missing_ok = true}, nullptr);
+        text += line;
+        std::map<std::string, bool> live;
+        for (std::string_view rest = text; !rest.empty();)
+        {
+            const std::string_view l = socketley::take_item(rest, '\n');
+            const size_t last = l.rfind('\t');
+            if (last != std::string_view::npos)
+                live[std::string(l.substr(0, last))] = l.substr(last + 1) == "+";
+        }
+        std::string folded;
+        for (const auto& [k, is_on] : live)
+            if (is_on)
+                folded += k + "\t+\n";
+        const std::string tmp = path + ".new." + std::to_string(::getpid());
+        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        const bool ok = fd >= 0 && socketley::write_all(fd, folded.data(), folded.size());
+        if (fd >= 0)
+            ::close(fd);
+        if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0)
+            ::unlink(tmp.c_str());
+        ::close(lock);
+        return;
+    }
+    const int fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    if (fd >= 0)
+    {
+        if (!socketley::write_all(fd, line.data(), line.size()))
+            LOG_WARN(("mail: the IMAP shares list " + path + " could not be written").c_str());
+        ::close(fd);
+    }
+    ::close(lock);
+}
+
+std::vector<std::pair<std::string, std::string>> imap_store::shared_with(const std::string& who)
+{
+    std::string text;
+    socketley::read_file(shares_path(), text, {.missing_ok = true}, nullptr);
+    std::set<std::pair<std::string, std::string>> on;
+    for (std::string_view rest = text; !rest.empty();)
+    {
+        const std::string_view line = socketley::take_item(rest, '\n');
+        const size_t a = line.find('\t'), b = a == std::string_view::npos ? a : line.find('\t', a + 1),
+                     c = b == std::string_view::npos ? b : line.find('\t', b + 1);
+        if (c == std::string_view::npos)
+            continue;
+        const std::string_view grantee = line.substr(b + 1, c - b - 1);
+        if (grantee != who && grantee != "anyone")
+            continue;
+        std::pair<std::string, std::string> key{std::string(line.substr(0, a)), std::string(line.substr(a + 1, b - a - 1))};
+        if (key.first == who)
+            continue;
+        if (line.substr(c + 1) == "+")
+            on.insert(std::move(key));
+        else
+            on.erase(key);
+    }
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const auto& [owner, folder] : on)
+        if (rights(owner, folder, who).find('l') != std::string::npos)
+            out.emplace_back(owner, folder);
+    return out;
+}
+
 std::string imap_store::mailbox_id(const std::string& name, const std::string& folder)
 {
     const auto& folders = user(name).folders;
@@ -390,6 +523,22 @@ void imap_store::apply(user_state& u, std::string_view text, bool fresh)
                     u.meta.erase(fname);
                 break;
             }
+            case 'L':
+            {
+                // L <folder>\t<identifier>\t<rights>: an ACL entry, none taking it away.
+                const size_t t1 = l.find('\t'), t2 = t1 == std::string_view::npos ? t1 : l.find('\t', t1 + 1);
+                if (t2 == std::string_view::npos)
+                    break;
+                if (imap_folder* f = folder(l.substr(0, t1)))
+                {
+                    const std::string who(l.substr(t1 + 1, t2 - t1 - 1)), r(l.substr(t2 + 1));
+                    if (r.empty())
+                        f->acl.erase(who);
+                    else
+                        f->acl[who] = r;
+                }
+                break;
+            }
             case 'I':
             {
                 // I <mailboxid> <folder>: the id a folder took from the one it was renamed from.
@@ -553,7 +702,7 @@ void imap_store::reload(user_state& u)
             }
             else if (line[0] == 'I' && f)
                 f->objectid = std::string(line.substr(2));
-            else if (line[0] == 'T')
+            else if (line[0] == 'T' || line[0] == 'L')
                 apply(u, std::string(line) + "\n", false);
             else if (line[0] == 'W' && f && !f->msgs.empty())
             {
@@ -751,6 +900,8 @@ void imap_store::compact(const std::string& name, user_state& u)
                 (f->subscribed ? "1" : "0") + " " + std::to_string(f->highestmodseq) + " " + n + "\n";
         if (!f->objectid.empty())
             text += "I " + f->objectid + "\n";
+        for (const auto& [who, r] : f->acl)
+            text += "L " + n + "\t" + who + "\t" + r + "\n";
         for (const auto& m : f->msgs)
         {
             text += "M " + std::to_string(m.uid) + " " + std::to_string(m.flags) + " " + std::to_string(m.size) + " " +
@@ -1847,6 +1998,19 @@ void imap_store::rename(const std::string& name, const std::string& from, const 
                         moved += "T " + socketley::base64::encode(value) + " " + to_name + "\t" + entry + "\n";
                     apply(u, moved, false);
                     lines += moved;
+                }
+                if (const auto f = u.folders.find(from_name); f != u.folders.end() && !f->second->acl.empty())
+                {
+                    std::string moved;
+                    for (const auto& [who, r] : f->second->acl)
+                        moved += "L " + to_name + "\t" + who + "\t" + r + "\n";
+                    apply(u, moved, false);
+                    lines += moved;
+                    for (const auto& [who, r] : f->second->acl)
+                    {
+                        note_share(name, from_name, who, false);
+                        note_share(name, to_name, who, true);
+                    }
                 }
             });
         open(name, from_name, [this, name, from_name, to_name, done, self, at](std::shared_ptr<imap_folder> f) {

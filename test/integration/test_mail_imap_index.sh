@@ -28,6 +28,8 @@
 #     IDLE; taking an event it cannot tell, or telling after NONE
 #   * IMAP4rev2 still saying RECENT or UNSEEN, or answering SEARCH without ESEARCH; $ not what SAVE kept; a SELECT
 #     not saying CLOSED; STATUS without DELETED
+#   * a folder shared by ACL not listed, read or written as its rights say, a right not given taken anyway, or one
+#     taken away kept; a MOVE into another's folder
 #   * BINARY giving a part still encoded, a NUL in a plain literal, or an encoding it cannot undo answered OK
 set -uo pipefail
 
@@ -387,6 +389,51 @@ elif step == "rev2":
     say("a SELECT of another folder says the first is CLOSED", any("[CLOSED]" in x for x in r), r)
     r = v.cmd("UID FETCH $ (UID)")
     say("and $ is empty in it", len(r) == 1, r)
+elif step == "acl":
+    b = C(("bob", "bobpassword12")); a = C(("alice", "alicepassword1"))
+    say("CAPABILITY offers ACL", "ACL" in b.cmd("CAPABILITY")[0].split())
+    b.cmd("CREATE Team"); b.append("Team", msg("team note"))
+    r = b.cmd("SETACL Team alice lr")
+    g = b.cmd("GETACL Team")
+    say("SETACL gives a right and GETACL says it", r[-1].split()[1] == "OK" and any('"alice" lr' in x for x in g), (r, g))
+    say("NAMESPACE names where others' folders are", any('"Other Users/"' in x for x in a.cmd("NAMESPACE")))
+    l = a.cmd('LIST "" "*"')
+    say("LIST shows another's folder shared with the user, and the levels above it", any('"Other Users/bob/Team"' in x for x in l)
+        and any("\\Noselect" in x and '"Other Users/bob"' in x for x in l), l)
+    r = a.cmd('MYRIGHTS "Other Users/bob/Team"')
+    say("MYRIGHTS says what the user may", any(x.endswith(" lr") for x in r), r)
+    r = a.cmd('SELECT "Other Users/bob/Team"')
+    f = a.cmd("FETCH 1 (BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+    say("with r it is selected, read-only, and read", "[READ-ONLY]" in r[-1] and any("team note" in x for x in f), (r, f))
+    m5 = msg("from alice")
+    r = a.send(('APPEND "Other Users/bob/Team" {%d+}\r\n' % len(m5)).encode() + m5 + b"\r\n")
+    say("without i nothing is appended to it", "[NOPERM]" in r[-1], r)
+    b.cmd("SETACL Team alice +is")
+    r = a.send(('APPEND "Other Users/bob/Team" {%d+}\r\n' % len(m5)).encode() + m5 + b"\r\n")
+    st = b.cmd("STATUS Team (MESSAGES)")
+    say("SETACL +is adds to the rights, and with i it is appended to the owner's folder", r[-1].split()[1] == "OK" and "MESSAGES 2" in st[0], (r, st))
+    a.cmd('SELECT "Other Users/bob/Team"')
+    a.cmd("STORE 1 +FLAGS (\\Seen \\Flagged)")
+    f = b.cmd("SELECT Team") and b.cmd("FETCH 1 (FLAGS)")
+    say("a STORE sets only the flags its rights give: \\Seen by s, not \\Flagged without w",
+        "\\Seen" in f[0] and "\\Flagged" not in f[0], f)
+    r = a.cmd('SETACL "Other Users/bob/Team" carl r')
+    say("without a the ACL is not the user's to change", "[NOPERM]" in r[-1], r)
+    r = b.cmd("SETACL Team bob lr")
+    say("and the owner's own rights are not taken", "[CANNOT]" in r[-1], r)
+    r = b.cmd("LISTRIGHTS Team alice")
+    say("LISTRIGHTS says each right may be given apart", any(x.startswith("* LISTRIGHTS") and ' "" l r s' in x for x in r), r)
+    a.cmd("SELECT INBOX"); a.append("INBOX", msg("moving over"))
+    a.cmd("SELECT INBOX")
+    u = a.cmd("UID SEARCH SUBJECT moving")[0].split()[-1]
+    r = a.cmd('UID MOVE %s "Other Users/bob/Team"' % u)
+    st = b.cmd("STATUS Team (MESSAGES)")
+    left = a.cmd("UID SEARCH SUBJECT moving")[0]
+    say("a MOVE goes into another's folder and from the user's own", r[-1].split()[1] == "OK" and "MESSAGES 3" in st[0] and left.strip() == "* SEARCH", (r, st, left))
+    b.cmd("DELETEACL Team alice")
+    r = a.cmd('SELECT "Other Users/bob/Team"')
+    l = a.cmd('LIST "" "Other Users/*"')
+    say("DELETEACL takes it all away: not selected, not listed", "[NONEXISTENT]" in r[-1] and not any("Team" in x for x in l), (r, l))
 elif step == "after":
     b = C(("bob", "bobpassword12")); b.cmd("SELECT INBOX")
     r = b.cmd("UID SEARCH KEYWORD project-x")
@@ -421,6 +468,7 @@ out=$("$BIN" mail m sieve bob put onfile "$T/onfile.sieve" 2>&1) || bad "the ima
 tally < <(run meta | grep -E '^(ok|bad) ')
 tally < <(run notify | grep -E '^(ok|bad) ')
 tally < <(run rev2 | grep -E '^(ok|bad) ')
+tally < <(run acl | grep -E '^(ok|bad) ')
 "$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1; ready_tcp 127.0.0.1 "$IM" >/dev/null
 tally < <(run after | grep -E '^(ok|bad) ')
 

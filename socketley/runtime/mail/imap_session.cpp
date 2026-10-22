@@ -6,6 +6,7 @@
 #include <cstring>
 #include <ctime>
 #include <map>
+#include <set>
 
 #include "imap_order.h"
 #include "imap_utf7.h"
@@ -459,7 +460,7 @@ static std::string capabilities(const imap_config& cfg)
                     "SPECIAL-USE ID ENABLE SEARCHRES "
                     "CONDSTORE QRESYNC ESEARCH LIST-EXTENDED LIST-STATUS STATUS=SIZE QUOTA QUOTA=RES-STORAGE SORT "
                     "SORT=DISPLAY THREAD=ORDEREDSUBJECT THREAD=REFERENCES COMPRESS=DEFLATE MULTIAPPEND UTF8=ACCEPT "
-                    "CREATE-SPECIAL-USE BINARY OBJECTID METADATA NOTIFY APPENDLIMIT=" +
+                    "CREATE-SPECIAL-USE BINARY OBJECTID METADATA NOTIFY ACL RIGHTS=texk APPENDLIMIT=" +
                     std::to_string(cfg.max_append);
     if (!cfg.imapsieve.empty())
         c += " IMAPSIEVE=" + cfg.imapsieve;
@@ -483,6 +484,38 @@ std::string imap_session::shown(std::string_view kept) const
         return std::string(kept);
     std::string text = imap_utf7::decode(kept);
     return text.empty() && !kept.empty() ? std::string(kept) : text;
+}
+
+imap_session::place imap_session::resolve(const std::string& name)
+{
+    place p;
+    if (!name.starts_with(others))
+    {
+        p.owner = m_user;
+        p.folder = name;
+        p.rights = std::string(imap_store::all_rights);
+        return p;
+    }
+    const std::string_view rest = std::string_view(name).substr(others.size());
+    const size_t slash = rest.find('/');
+    if (slash == std::string_view::npos || slash == 0 || slash + 1 >= rest.size())
+        return p;
+    p.owner = std::string(rest.substr(0, slash));
+    p.folder = std::string(rest.substr(slash + 1));
+    p.rights = m_store.rights(p.owner, p.folder, m_user);
+    return p;
+}
+
+std::string imap_session::seen_as(const std::string& owner, const std::string& folder) const
+{
+    return owner == m_user ? folder : std::string(others) + owner + "/" + folder;
+}
+
+void imap_session::refuse(const std::string& tag, const place& p)
+{
+    if (p.owner.empty() || !(p.may('l') || p.may('r')))
+        return finish(tag, "NO", "[NONEXISTENT] No such mailbox");
+    finish(tag, "NO", "[NOPERM] The mailbox's owner has not given that right");
 }
 
 void imap_session::greet()
@@ -932,6 +965,8 @@ void imap_session::command(std::string tag, std::vector<token> a)
     // What another shard changed of this user's mailboxes is read in before each command.
     if (authed)
         m_store.refresh(m_user);
+    if (selected && m_owner != m_user)
+        m_store.refresh(m_owner);
     const auto str = [&](size_t i) -> const std::string* {
         return i < a.size() && (a[i].k == token::atom || a[i].k == token::string) ? &a[i].text : nullptr;
     };
@@ -947,7 +982,7 @@ void imap_session::command(std::string tag, std::vector<token> a)
         // What this runtime delivers comes by the journal at once; the bucket is listed again once a minute, for what
         // another program put there, as a client may say NOOP every few seconds.
         m_waiting = true;
-        m_store.open(m_user, m_folder->name, [this, alive = m_alive, tag, cmd](std::shared_ptr<imap_folder>) {
+        m_store.open(m_owner, m_folder->name, [this, alive = m_alive, tag, cmd](std::shared_ptr<imap_folder>) {
             if (!*alive)
                 return;
             update_view();
@@ -1051,7 +1086,7 @@ void imap_session::command(std::string tag, std::vector<token> a)
         return cmd_list(tag, a, cmd == "LSUB");
     if (cmd == "NAMESPACE")
     {
-        untagged("NAMESPACE ((\"\" \"/\")) NIL NIL");
+        untagged("NAMESPACE ((\"\" \"/\")) ((\"" + std::string(others) + "\" \"/\")) NIL");
         return finish(tag, "OK", "NAMESPACE completed");
     }
     if (cmd == "STATUS")
@@ -1076,8 +1111,19 @@ void imap_session::command(std::string tag, std::vector<token> a)
                     return finish(tag, "NO", "[USEATTR] Only " + (fixed.empty() ? std::string("no use") : fixed) +
                                                  " is " + n + "'s");
         }
-        return m_store.create(m_user, n)
-                   ? finish(tag, "OK", "[MAILBOXID (" + m_store.mailbox_id(m_user, n) + ")] CREATE completed")
+        // Under another user's folder only with its k right (RFC 4314 4).
+        const place p = resolve(n);
+        if (p.owner.empty())
+            return finish(tag, "NO", "[CANNOT] Not a name a mailbox can have");
+        if (!p.own(m_user))
+        {
+            const size_t up = p.folder.rfind('/');
+            const place parent = resolve(seen_as(p.owner, up == std::string::npos ? std::string() : p.folder.substr(0, up)));
+            if (up == std::string::npos || !parent.may('k'))
+                return refuse(tag, parent);
+        }
+        return m_store.create(p.owner, p.folder)
+                   ? finish(tag, "OK", "[MAILBOXID (" + m_store.mailbox_id(p.owner, p.folder) + ")] CREATE completed")
                    : finish(tag, "NO", "[ALREADYEXISTS] Mailbox exists");
     }
     if (cmd == "DELETE" || cmd == "RENAME")
@@ -1093,10 +1139,27 @@ void imap_session::command(std::string tag, std::vector<token> a)
             finish(tag, ok ? "OK" : "NO", ok ? cmd + " completed" : "[NONEXISTENT] " + cmd + " failed");
             resume();
         };
+        // Another user's folder is deleted with its x right, renamed with it and k above where it goes.
+        const place from = resolve(box(*name));
+        const place dest = cmd == "RENAME" ? resolve(box(*to)) : place{};
+        if (!from.may('x') || (cmd == "RENAME" && dest.owner != from.owner))
+        {
+            m_waiting = false;
+            return refuse(tag, from);
+        }
+        if (cmd == "RENAME" && !dest.own(m_user))
+        {
+            const size_t up = dest.folder.rfind('/');
+            if (up == std::string::npos || !resolve(seen_as(dest.owner, dest.folder.substr(0, up))).may('k'))
+            {
+                m_waiting = false;
+                return refuse(tag, dest);
+            }
+        }
         if (cmd == "DELETE")
-            m_store.remove(m_user, box(*name), done);
+            m_store.remove(from.owner, from.folder, done);
         else
-            m_store.rename(m_user, box(*name), box(*to), done);
+            m_store.rename(from.owner, from.folder, dest.folder, done);
         return;
     }
     if (cmd == "SUBSCRIBE" || cmd == "UNSUBSCRIBE")
@@ -1104,7 +1167,9 @@ void imap_session::command(std::string tag, std::vector<token> a)
         const std::string* name = str(1);
         if (!name)
             return finish(tag, "BAD", cmd + " needs a mailbox");
-        m_store.set_subscribed(m_user, box(*name), cmd == "SUBSCRIBE");
+        // Another user's folders are listed as their ACL lets this one see them, subscribed or not.
+        if (const place p = resolve(box(*name)); p.own(m_user))
+            m_store.set_subscribed(m_user, p.folder, cmd == "SUBSCRIBE");
         return finish(tag, "OK", cmd + " completed");
     }
     if (cmd == "APPEND")
@@ -1113,6 +1178,8 @@ void imap_session::command(std::string tag, std::vector<token> a)
         return cmd_metadata(tag, a, cmd == "SETMETADATA");
     if (cmd == "NOTIFY")
         return cmd_notify(tag, a);
+    if (cmd == "SETACL" || cmd == "DELETEACL" || cmd == "GETACL" || cmd == "LISTRIGHTS" || cmd == "MYRIGHTS")
+        return cmd_acl(tag, cmd, a);
     // One quota root, "", over every folder of the user, in kibibytes (RFC 9208).
     if (cmd == "GETQUOTAROOT" || cmd == "GETQUOTA")
     {
@@ -1150,14 +1217,14 @@ void imap_session::command(std::string tag, std::vector<token> a)
             m_state = state::auth;
             finish(tag, "OK", cmd + " completed");
         };
-        if (cmd == "UNSELECT" || m_readonly)
+        // CLOSE expunges without telling the client what went, where the folder's ACL lets it.
+        if (cmd == "UNSELECT" || m_readonly || m_rights.find('e') == std::string::npos)
         {
             done();
             return;
         }
-        // CLOSE expunges without telling the client what went.
         m_waiting = true;
-        m_store.expunge(m_user, m_folder, {}, false, [this, alive = m_alive, done](std::vector<uint32_t>) {
+        m_store.expunge(m_owner, m_folder, {}, false, [this, alive = m_alive, done](std::vector<uint32_t>) {
             if (!*alive)
                 return;
             done();
@@ -1276,8 +1343,14 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
     m_view.clear();
     m_saved.clear();
     m_state = state::auth;
+    // Another user's folder is read with its r right, and changed only with one of s, w, t and e (RFC 4314 4).
+    const place p = resolve(box(a[1].text));
+    if (!p.may('r'))
+        return refuse(tag, p);
+    const bool writable = p.may('s') || p.may('w') || p.may('t') || p.may('e');
     m_waiting = true;
-    m_store.open(m_user, box(a[1].text), [this, alive = m_alive, tag, readonly, condstore, qr](std::shared_ptr<imap_folder> f) {
+    m_store.open(p.owner, p.folder, [this, alive = m_alive, tag, readonly = readonly || !writable, condstore, qr,
+                                     p](std::shared_ptr<imap_folder> f) {
         if (!*alive)
             return;
         if (!f)
@@ -1287,6 +1360,8 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
             return;
         }
         m_folder = f;
+        m_owner = p.owner;
+        m_rights = p.rights;
         m_readonly = readonly;
         m_state = state::selected;
         m_seen_version = f->version;
@@ -1326,7 +1401,7 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
             untagged("OK [UNSEEN " + std::to_string(first_unseen) + "] First unseen");
         // IMAP4rev2 names the folder as the server spells it (RFC 9051 6.3.2).
         if (m_rev2)
-            untagged("LIST () \"/\" " + mime::imap_string(shown(f->name), false));
+            untagged("LIST () \"/\" " + mime::imap_string(shown(seen_as(p.owner, f->name)), false));
         untagged("OK [UIDVALIDITY " + std::to_string(f->uidvalidity) + "] UIDs valid");
         untagged("OK [UIDNEXT " + std::to_string(f->uidnext) + "] Predicted next UID");
         untagged("OK [HIGHESTMODSEQ " + std::to_string(f->highestmodseq) + "] Highest");
@@ -1365,7 +1440,7 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
     }, true);
 }
 
-std::string imap_session::status_text(const imap_folder& f, const std::vector<std::string>& items) const
+std::string imap_session::status_text(const imap_folder& f, const std::vector<std::string>& items, std::string_view as) const
 {
     // The messages are walked only for what is asked that needs it.
     size_t unseen = 0, recent = 0, deleted = 0;
@@ -1409,7 +1484,7 @@ std::string imap_session::status_text(const imap_folder& f, const std::vector<st
             continue;
         out += (out.empty() ? "" : " ") + it + " " + v;
     }
-    return "STATUS " + mime::imap_string(shown(f.name), false) + " (" + out + ")";
+    return "STATUS " + mime::imap_string(shown(as.empty() ? std::string_view(f.name) : as), false) + " (" + out + ")";
 }
 
 void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a, bool lsub)
@@ -1483,6 +1558,37 @@ void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a,
                              mime::imap_string(shown(n), false));
             listed.push_back(n);
         }
+        // What other users let this one see, under Other Users/<owner>/, with the levels above as \Noselect.
+        if (!only_subscribed)
+        {
+            std::vector<std::string> shared;
+            for (const auto& [owner, folder] : m_store.shared_with(m_user))
+                shared.push_back(seen_as(owner, folder));
+            std::sort(shared.begin(), shared.end());
+            std::set<std::string> levels;
+            for (const auto& n : shared)
+                for (size_t at = n.find('/'); at != std::string::npos; at = n.find('/', at + 1))
+                    levels.insert(n.substr(0, at));
+            const auto hit = [&](const std::string& n) {
+                return std::any_of(pats.begin(), pats.end(), [&](const std::string& p) { return wildmatch(ref + p, n); });
+            };
+            for (const auto& n : levels)
+                if (!std::binary_search(shared.begin(), shared.end(), n) && hit(n))
+                {
+                    listed.push_back("LIST (\\Noselect \\HasChildren) \"/\" " + mime::imap_string(shown(n), false));
+                    listed.push_back({});
+                }
+            for (const auto& n : shared)
+            {
+                if (!hit(n))
+                    continue;
+                const auto at = std::upper_bound(shared.begin(), shared.end(), n + "/");
+                const bool children = at != shared.end() && at->starts_with(n + "/");
+                listed.push_back(std::string("LIST (") + (children ? "\\HasChildren" : "\\HasNoChildren") + ") \"/\" " +
+                                 mime::imap_string(shown(n), false));
+                listed.push_back(n);
+            }
+        }
         if (status.empty())
         {
             for (size_t k = 0; k < listed.size(); k += 2)
@@ -1505,12 +1611,16 @@ void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a,
                 untagged(listed[*at]);
                 const std::string name = listed[*at + 1];
                 *at += 2;
+                // A level no one can select has no status to tell.
+                const place p = name.empty() ? place{} : resolve(name);
+                if (!p.may('r'))
+                    continue;
                 auto inline_answer = std::make_shared<int>(0);
-                m_store.open(m_user, name, [this, alive, status, self, inline_answer](std::shared_ptr<imap_folder> f) {
+                m_store.open(p.owner, p.folder, [this, alive, status, self, inline_answer, name](std::shared_ptr<imap_folder> f) {
                     if (!*alive)
                         return;
                     if (f)
-                        untagged(status_text(*f, status));
+                        untagged(status_text(*f, status, name));
                     if (*inline_answer == 0)
                         *inline_answer = 1;
                     else
@@ -1536,9 +1646,12 @@ void imap_session::cmd_status(const std::string& tag, const std::vector<token>& 
     std::vector<std::string> items;
     for (size_t i = 3; i < a.size() && a[i].k != token::close; ++i)
         items.push_back(upper(a[i].text));
-    const std::string name = box(a[1].text);
+    // Another user's folder is told of with its r right (RFC 4314 4).
+    const place p = resolve(box(a[1].text));
+    if (!p.may('r'))
+        return refuse(tag, p);
     m_waiting = true;
-    m_store.open(m_user, name, [this, alive = m_alive, tag, items, name](std::shared_ptr<imap_folder> f) {
+    m_store.open(p.owner, p.folder, [this, alive = m_alive, tag, items, p](std::shared_ptr<imap_folder> f) {
         if (!*alive)
             return;
         if (!f)
@@ -1547,7 +1660,7 @@ void imap_session::cmd_status(const std::string& tag, const std::vector<token>& 
             resume();
             return;
         }
-        untagged(status_text(*f, items));
+        untagged(status_text(*f, items, seen_as(p.owner, p.folder)));
         finish(tag, "OK", "STATUS completed");
         resume();
     });
@@ -1580,15 +1693,20 @@ void imap_session::cmd_metadata(const std::string& tag, const std::vector<token>
     }
     if (i + 1 >= a.size())
         return finish(tag, "BAD", "METADATA needs a mailbox and entries");
-    const std::string folder = box(a[i].text);
+    // Another user's folder: its /shared entries read with r and set with w; /private ones are each user's own.
+    const place p = a[i].text.empty() ? place{m_user, {}, std::string(imap_store::all_rights)} : resolve(box(a[i].text));
+    const std::string owner = p.owner;
+    const std::string folder = p.folder;
     const std::string shown_name = a[i].text;
     ++i;
+    if (owner.empty() || (!p.own(m_user) && !p.may(set ? 'w' : 'r')))
+        return refuse(tag, p);
     const auto lower_entry = [](std::string e) {
         for (char& c : e)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         return e;
     };
-    if (!folder.empty() && m_store.mailbox_id(m_user, folder).empty())
+    if (!folder.empty() && m_store.mailbox_id(owner, folder).empty())
         return finish(tag, "NO", "[NONEXISTENT] No such mailbox");
     if (set)
     {
@@ -1599,7 +1717,9 @@ void imap_session::cmd_metadata(const std::string& tag, const std::vector<token>
         {
             const std::string entry = lower_entry(a[i].text);
             const bool nil = a[i + 1].k == token::atom && upper(a[i + 1].text) == "NIL";
-            const auto why = m_store.set_meta(m_user, folder, entry, nil ? nullptr : &a[i + 1].text);
+            if (!p.own(m_user) && !entry.starts_with("/shared"))
+                return finish(tag, "NO", "[NOPERM] A private entry of another user's mailbox is theirs");
+            const auto why = m_store.set_meta(owner, folder, entry, nil ? nullptr : &a[i + 1].text);
             if (why == imap_store::meta_refusal::too_large)
                 return finish(tag, "NO", "[METADATA MAXSIZE " + std::to_string(imap_store::meta_max_value) +
                                              "] The value is too large");
@@ -1634,11 +1754,13 @@ void imap_session::cmd_metadata(const std::string& tag, const std::vector<token>
     {
         if (!imap_store::meta_name_ok(e))
             return finish(tag, "BAD", "Not an entry name");
-        const std::string* v = m_store.meta(m_user, folder, e);
+        const bool readable = p.own(m_user) || e.starts_with("/shared");
+        const std::string* v = readable ? m_store.meta(owner, folder, e) : nullptr;
         if (v || depth == 0)
             add(e, v);
-        for (const auto& [k, value] : m_store.meta_under(m_user, folder, e, depth))
-            add(k, &value);
+        if (readable)
+            for (const auto& [k, value] : m_store.meta_under(owner, folder, e, depth))
+                add(k, &value);
     }
     if (!out.empty())
         untagged("METADATA " + mime::imap_string(shown_name, false) + " (" + out + ")");
@@ -1698,19 +1820,24 @@ void imap_session::cmd_append(const std::string& tag, const std::vector<token>& 
         if (all->size() > 1000)
             return finish(tag, "NO", "[LIMIT] Too many messages in one APPEND");
     }
+    // Into another user's folder with its i right (RFC 4314 4).
+    const place p = resolve(box(a[1].text));
+    if (!p.owner.empty() && !p.may('i'))
+        return refuse(tag, p);
+    const std::string owner = p.owner.empty() ? m_user : p.owner;
+    const std::string folder = p.owner.empty() ? box(a[1].text) : p.folder;
     m_waiting = true;
-    const std::string folder = box(a[1].text);
     auto made = std::make_shared<std::vector<uint32_t>>();
     auto step = std::make_shared<std::function<void(size_t)>>();
     std::weak_ptr<std::function<void(size_t)>> weak = step;
-    *step = [this, alive = m_alive, tag, all, made, folder, weak](size_t at) {
+    *step = [this, alive = m_alive, tag, all, made, owner, folder, weak](size_t at) {
         // The chain is held by the write it waits on, and goes with the last.
         auto self = weak.lock();
         if (!*alive || !self)
             return;
         one& m = (*all)[at];
-        m_store.append(m_user, folder, std::move(m.message), m.flags, std::move(m.keywords), m.date_ms,
-                       [this, alive, tag, all, made, folder, self, at](imap_store::refusal why, uint32_t validity,
+        m_store.append(owner, folder, std::move(m.message), m.flags, std::move(m.keywords), m.date_ms,
+                       [this, alive, tag, all, made, owner, folder, self, at](imap_store::refusal why, uint32_t validity,
                                                                        uint32_t uid) {
                            if (!*alive)
                                return;
@@ -1726,7 +1853,7 @@ void imap_session::cmd_append(const std::string& tag, const std::vector<token>& 
                                finish(tag, "OK",
                                       "[APPENDUID " + std::to_string(validity) + " " + set_text(*made) +
                                           "] APPEND completed");
-                               m_hooks.imap_acted(m_user, folder, "APPEND", *made, {});
+                               m_hooks.imap_acted(owner, folder, "APPEND", *made, {});
                                resume();
                                return;
                            }
@@ -1741,7 +1868,7 @@ void imap_session::cmd_append(const std::string& tag, const std::vector<token>& 
                                return;
                            }
                            // What went in before the refusal is taken out again, so none of them is appended.
-                           m_store.open(m_user, folder, [this, alive, tag, made, text](std::shared_ptr<imap_folder> f) {
+                           m_store.open(owner, folder, [this, alive, tag, made, owner, text](std::shared_ptr<imap_folder> f) {
                                if (!*alive)
                                    return;
                                const auto told = [this, alive, tag, text] {
@@ -1752,7 +1879,7 @@ void imap_session::cmd_append(const std::string& tag, const std::vector<token>& 
                                };
                                if (!f)
                                    return told();
-                               m_store.expunge(m_user, f, *made, true, [told](std::vector<uint32_t>) { told(); });
+                               m_store.expunge(owner, f, *made, true, [told](std::vector<uint32_t>) { told(); });
                            });
                        });
     };
@@ -2025,6 +2152,8 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                         seen_now = true;
                 }
             }
+            // Reading sets \Seen only where the folder's ACL gives the s right.
+            seen_now = seen_now && m_rights.find('s') != std::string::npos;
             // Without CONDSTORE the \Seen of every message is written at the end, one journal line set for the FETCH; with
             // it each is written as it goes, as its MODSEQ is told with it.
             if (seen_now && !m_readonly && !(m->flags & flag_seen) && !m_condstore)
@@ -2035,7 +2164,7 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                 const uint64_t was = m_folder->highestmodseq;
                 const bool told_all = m_told_modseq == was;
                 const uint32_t uid = m->uid;
-                const size_t n = m_store.set_flags(m_user, m_folder, {uid},
+                const size_t n = m_store.set_flags(m_owner, m_folder, {uid},
                                                    [](uint8_t f) { return static_cast<uint8_t>(f | flag_seen); });
                 if (told_all && m_folder->highestmodseq == was + n)
                     m_told_modseq = m_folder->highestmodseq;
@@ -2093,7 +2222,7 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
         {
             const uint64_t was = m_folder->highestmodseq;
             const bool told_all = m_told_modseq == was;
-            const size_t n = m_store.set_flags(m_user, m_folder, j->seen,
+            const size_t n = m_store.set_flags(m_owner, m_folder, j->seen,
                                                [](uint8_t f) { return static_cast<uint8_t>(f | flag_seen); });
             if (told_all && m_folder->highestmodseq == was + n)
                 m_told_modseq = m_folder->highestmodseq;
@@ -2157,10 +2286,19 @@ void imap_session::cmd_store(const std::string& tag, const std::vector<token>& a
     }
     const uint64_t was = m_folder->highestmodseq;
     const bool told_all = m_told_modseq == was;
-    // Changed under the user's lock on the flags as they are now, whichever shard last changed them.
+    // Only the flags the folder's ACL gives a right to are changed: \Seen by s, \Deleted by t, the rest by w.
+    const auto may = [this](char r) { return m_rights.find(r) != std::string::npos; };
+    const uint8_t allowed = static_cast<uint8_t>((may('s') ? flag_seen : 0) | (may('t') ? flag_deleted : 0) |
+                                                 (may('w') ? flag_answered | flag_flagged | flag_draft : 0));
+    if (!may('w'))
+        words.k = keyword_change::kind::none;
+    // Changed under the owner's lock on the flags as they are now, whichever shard last changed them.
     const size_t changed = m_store.set_flags(
-        m_user, m_folder, uids,
-        [&op, bits](uint8_t f) { return static_cast<uint8_t>(op == "FLAGS" ? bits : op == "+FLAGS" ? f | bits : f & ~bits); },
+        m_owner, m_folder, uids,
+        [&op, bits, allowed](uint8_t f) {
+            const uint8_t to = static_cast<uint8_t>(op == "FLAGS" ? bits : op == "+FLAGS" ? f | bits : f & ~bits);
+            return static_cast<uint8_t>((to & allowed) | (f & ~allowed));
+        },
         words);
     for (const size_t i : idx)
     {
@@ -2182,7 +2320,7 @@ void imap_session::cmd_store(const std::string& tag, const std::vector<token>& a
         for (size_t i = at + 1; i < a.size(); ++i)
             if (a[i].k == token::atom || a[i].k == token::string)
                 flags += (flags.empty() ? "" : " ") + a[i].text;
-        m_hooks.imap_acted(m_user, m_folder->name, "FLAG", uids, std::move(flags));
+        m_hooks.imap_acted(m_owner, m_folder->name, "FLAG", uids, std::move(flags));
     }
     finish(tag, "OK", (modified.empty() ? std::string() : "[MODIFIED " + set_text(modified) + "] ") +
                           (uid ? "UID STORE completed" : "STORE completed"));
@@ -2737,6 +2875,12 @@ void imap_session::cmd_copy(const std::string& tag, const std::vector<token>& a,
         return finish(tag, "BAD", "COPY needs a set and a mailbox");
     if (move && m_readonly)
         return finish(tag, "NO", "[READ-ONLY] Mailbox is read-only");
+    // A MOVE takes the t and e rights here, a copy the i right where it goes (RFC 6851 3.3, RFC 4314 4).
+    if (move && (m_rights.find('t') == std::string::npos || m_rights.find('e') == std::string::npos))
+        return finish(tag, "NO", "[NOPERM] The mailbox's owner has not given the right to move from it");
+    const place target = resolve(box(a[from + 1].text));
+    if (!target.owner.empty() && !target.may('i'))
+        return refuse(tag, target);
     std::vector<size_t> idx;
     if (!parse_set(a[from].text, uid, idx))
         return finish(tag, "BAD", "Invalid sequence set");
@@ -2751,22 +2895,25 @@ void imap_session::cmd_copy(const std::string& tag, const std::vector<token>& a,
         }
     if (uids.empty())
         return finish(tag, "OK", "Nothing to copy");
-    // A copy takes room a move gives back.
-    if (const uint64_t q = m_store.quota(m_user); !move && q && m_store.usage(m_user) + bytes > q)
+    // A copy takes room a move within one user's mailboxes gives back; what goes to another's is theirs to hold.
+    const std::string& to_owner = target.owner.empty() ? m_user : target.owner;
+    const bool counts = !move || to_owner != m_owner;
+    if (const uint64_t q = m_store.quota(to_owner); counts && q && m_store.usage(to_owner) + bytes > q)
         return finish(tag, "NO", "[OVERQUOTA] The mailbox is full");
     m_waiting = true;
-    const std::string to = box(a[from + 1].text);
-    m_store.copy(m_user, m_folder, uids, to, !move,
-                 [this, alive = m_alive, tag, uids, move, uid, to](bool ok, uint32_t validity, std::vector<uint32_t> made) {
+    const std::string to = target.owner.empty() ? box(a[from + 1].text) : target.folder;
+    m_store.copy(to_owner, m_folder, uids, to, counts,
+                 [this, alive = m_alive, tag, uids, move, uid, to, to_owner, counts](bool ok, uint32_t validity,
+                                                                                    std::vector<uint32_t> made) {
                      if (!*alive)
                          return;
                      if (!ok)
                      {
                          // TRYCREATE says the target is not there, and only then (RFC 3501 6.4.7).
-                         const uint64_t q = m_store.quota(m_user);
+                         const uint64_t q = m_store.quota(to_owner);
                          finish(tag, "NO", validity == 0 ? "[TRYCREATE] No such mailbox"
-                                           : !move && q && m_store.usage(m_user) >= q ? "[OVERQUOTA] The mailbox is full"
-                                                                                      : "[UNAVAILABLE] COPY failed");
+                                           : counts && q && m_store.usage(to_owner) >= q ? "[OVERQUOTA] The mailbox is full"
+                                                                                        : "[UNAVAILABLE] COPY failed");
                          resume();
                          return;
                      }
@@ -2786,7 +2933,7 @@ void imap_session::cmd_copy(const std::string& tag, const std::vector<token>& a,
                          i = e + 1;
                      }
                      const std::string code = "[COPYUID " + std::to_string(validity) + " " + src + " " + dst + "] ";
-                     m_hooks.imap_acted(m_user, to, "COPY", made, {});
+                     m_hooks.imap_acted(to_owner, to, "COPY", made, {});
                      if (!move)
                      {
                          finish(tag, "OK", code + (uid ? "UID COPY completed" : "COPY completed"));
@@ -2803,8 +2950,15 @@ void imap_session::cmd_copy(const std::string& tag, const std::vector<token>& a,
 void imap_session::cmd_expunge(const std::string& tag, const std::vector<uint32_t>& only, bool moved,
                                std::string_view done_text)
 {
+    if (m_rights.find('e') == std::string::npos)
+    {
+        finish(tag, "NO", "[NOPERM] The mailbox's owner has not given the right to expunge");
+        if (moved)
+            resume();
+        return;
+    }
     m_waiting = true;
-    m_store.expunge(m_user, m_folder, only, moved,
+    m_store.expunge(m_owner, m_folder, only, moved,
                     [this, alive = m_alive, tag, text = std::string(done_text)](std::vector<uint32_t>) {
                         if (!*alive)
                             return;
@@ -2836,7 +2990,7 @@ void imap_session::poll()
         notify_changes(false);
     if (!m_folder || !(m_idle || (between && m_notify_selected)))
         return;
-    m_store.open(m_user, m_folder->name, [this, alive = m_alive](std::shared_ptr<imap_folder>) {
+    m_store.open(m_owner, m_folder->name, [this, alive = m_alive](std::shared_ptr<imap_folder>) {
         if (*alive && (m_idle || m_notify_selected) && !m_running && !m_waiting)
             update_view();
     }, false, 60000);
@@ -2855,6 +3009,91 @@ enum : uint8_t
 };
 
 }   // namespace
+
+void imap_session::cmd_acl(const std::string& tag, const std::string& cmd, const std::vector<token>& a)
+{
+    // SETACL m id rights, DELETEACL m id, GETACL m, LISTRIGHTS m id, MYRIGHTS m (RFC 4314 3).
+    if (a.size() < 2 || (cmd == "SETACL" && a.size() < 4) || ((cmd == "DELETEACL" || cmd == "LISTRIGHTS") && a.size() < 3))
+        return finish(tag, "BAD", cmd + " needs a mailbox" + (cmd == "GETACL" || cmd == "MYRIGHTS" ? "" : " and an identifier"));
+    const place p = resolve(box(a[1].text));
+    if (p.owner.empty() || m_store.mailbox_id(p.owner, p.folder).empty())
+        return finish(tag, "NO", "[NONEXISTENT] No such mailbox");
+    const std::string shown_name = mime::imap_string(a[1].text, false);
+    if (cmd == "MYRIGHTS")
+    {
+        if (!p.may('l') && !p.may('r') && !p.may('i') && !p.may('k') && !p.may('x') && !p.may('a'))
+            return refuse(tag, p);
+        untagged("MYRIGHTS " + shown_name + " " + p.rights);
+        return finish(tag, "OK", "MYRIGHTS completed");
+    }
+    // Every other ACL command takes the a right, which only the owner has unless they gave it.
+    if (!p.may('a'))
+        return refuse(tag, p);
+    if (cmd == "GETACL")
+    {
+        std::string out = "ACL " + shown_name + " " + mime::imap_string(p.owner, false) + " " +
+                          std::string(imap_store::all_rights);
+        for (const auto& [who, r] : m_store.acl(p.owner, p.folder))
+            out += " " + mime::imap_string(who, false) + " " + r;
+        untagged(out);
+        return finish(tag, "OK", "GETACL completed");
+    }
+    const std::string who = a[2].text;
+    if (who.empty() || who.size() > 255 || who.find_first_of(" \t\r\n\"\\") != std::string::npos || who.front() == '-')
+        return finish(tag, "BAD", "Not an identifier");
+    if (cmd == "LISTRIGHTS")
+    {
+        // The owner has them all and always; anyone else none of them unless given, each apart from the others.
+        untagged("LISTRIGHTS " + shown_name + " " + mime::imap_string(who, false) +
+                 (who == p.owner ? " " + std::string(imap_store::all_rights) : std::string(" \"\" l r s w i p k x t e a")));
+        return finish(tag, "OK", "LISTRIGHTS completed");
+    }
+    if (who == p.owner)
+        return finish(tag, "NO", "[CANNOT] The owner's rights are all of them, always");
+    std::string now = m_store.acl(p.owner, p.folder)[who];
+    if (cmd == "DELETEACL")
+        now.clear();
+    else
+    {
+        std::string_view given = a[3].text;
+        const char mode = !given.empty() && (given.front() == '+' || given.front() == '-') ? given.front() : '=';
+        if (mode != '=')
+            given.remove_prefix(1);
+        // The obsolete c is k, and d is x, t and e (RFC 4314 2.1.1).
+        std::string wanted;
+        for (const char c : given)
+        {
+            const std::string_view adds = c == 'c' ? "k" : c == 'd' ? "xte" : std::string_view(&c, 1);
+            for (const char r : adds)
+            {
+                if (imap_store::all_rights.find(r) == std::string_view::npos)
+                    return finish(tag, "BAD", "Not a right this server knows");
+                if (wanted.find(r) == std::string::npos)
+                    wanted += r;
+            }
+        }
+        if (mode == '=')
+            now = wanted;
+        else
+            for (const char r : wanted)
+            {
+                const size_t at = now.find(r);
+                if (mode == '+' && at == std::string::npos)
+                    now += r;
+                else if (mode == '-' && at != std::string::npos)
+                    now.erase(at, 1);
+            }
+        // Kept in the order RFC 4314 lists them, so GETACL says each the same way.
+        std::string ordered;
+        for (const char r : imap_store::all_rights)
+            if (now.find(r) != std::string::npos)
+                ordered += r;
+        now = ordered;
+    }
+    if (!m_store.set_acl(p.owner, p.folder, who, now))
+        return finish(tag, "NO", "[NONEXISTENT] No such mailbox");
+    return finish(tag, "OK", cmd + " completed");
+}
 
 void imap_session::cmd_notify(const std::string& tag, const std::vector<token>& a)
 {

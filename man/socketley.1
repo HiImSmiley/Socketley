@@ -13015,7 +13015,10 @@ METADATA (RFC 5464), entries of the server and of each folder kept in the
 index, at most 1000 a user of 64 KiB each, NOTIFY (RFC 5465), which tells a
 session of new mail, expunges and flags in the folders it watches as STATUS,
 of folders made and gone as LIST, and of the selected folder between commands,
-within a second, and APPENDLIMIT; RENAME
+within a second, ACL (RFC 4314), by which a user gives others rights on a
+folder, seen by them under
+.BI "Other Users/" owner /
+with what those rights allow (l r s w i k x t e a), and APPENDLIMIT; RENAME
 takes the folders under a name along, and RENAME INBOX moves its messages and
 leaves it empty. A connection quiet for thirty minutes is closed.
 .PP

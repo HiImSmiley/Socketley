@@ -133,19 +133,38 @@ private:
     // A message's flags and its keywords.
     std::string flags_text(const imap_message& m, bool recent) const;
     // A folder's STATUS line with the items asked.
-    std::string status_text(const imap_folder& f, const std::vector<std::string>& items) const;
+    std::string status_text(const imap_folder& f, const std::vector<std::string>& items, std::string_view as = {}) const;
     void sign_in(const std::string& tag, std::string user, std::string password);
     // A mailbox name as the client wrote it, as the index keeps it; and one the index keeps, as the client reads it.
     std::string box(std::string_view given) const;
     std::string shown(std::string_view kept) const;
+    // The folder a name means: the user's own, or another user's under "Other Users/<owner>/" (RFC 2342), with the
+    // rights this user has on it (RFC 4314); an owner empty where the name is none.
+    struct place
+    {
+        std::string owner, folder, rights;
+        bool may(char r) const { return rights.find(r) != std::string::npos; }
+        bool own(const std::string& user) const { return owner == user; }
+    };
+    place resolve(const std::string& name);
+    // A folder's name as this user sees it.
+    std::string seen_as(const std::string& owner, const std::string& folder) const;
+    // NO [NONEXISTENT] where the user may not even see the folder, NO [NOPERM] where they may but not do this.
+    void refuse(const std::string& tag, const place& p);
+    // SETACL, DELETEACL, GETACL, LISTRIGHTS and MYRIGHTS (RFC 4314).
+    void cmd_acl(const std::string& tag, const std::string& cmd, const std::vector<token>& a);
+    static constexpr std::string_view others = "Other Users/";
 
     imap_config m_cfg;
     hooks& m_hooks;
     imap_store& m_store;
     state m_state{state::not_auth};
     std::string m_user;
-    // The selected folder, and the UIDs of what the session has been told of, in its order.
+    // The selected folder, whose it is and what this user may do in it, and the UIDs of what the session has been
+    // told of, in its order.
     std::shared_ptr<imap_folder> m_folder;
+    std::string m_owner;
+    std::string m_rights;
     bool m_readonly{false};
     std::vector<uint32_t> m_view;
     uint64_t m_seen_version{0};

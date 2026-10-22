@@ -85,6 +85,8 @@ struct imap_folder
     bool        subscribed{true};
     // Its MAILBOXID (RFC 8474), the one of the folder a RENAME made it from, else of its UIDVALIDITY.
     std::string objectid;
+    // Who else may do what with it (RFC 4314): an identifier, a user or "anyone", and their rights.
+    std::map<std::string, std::string> acl;
     std::string id() const;
     imap_message* by_uid(uint32_t uid);
 };
@@ -124,6 +126,15 @@ public:
     std::vector<std::pair<std::string, std::string>> meta_under(const std::string& user, const std::string& folder,
                                                                 const std::string& entry, int depth);
     static constexpr size_t meta_max_value = 64u << 10;
+
+    // ACL (RFC 4314).  A folder's owner has every right; another user what the folder's ACL gives them and anyone.
+    static constexpr std::string_view all_rights = "lrswipkxtea";
+    std::string rights(const std::string& owner, const std::string& folder, const std::string& who);
+    // The rights of `who` on the owner's folder made `rights`, none taking them away; false where there is no folder.
+    bool set_acl(const std::string& owner, const std::string& folder, const std::string& who, const std::string& rights);
+    std::map<std::string, std::string> acl(const std::string& owner, const std::string& folder);
+    // The folders others gave `who`, or anyone, a right on, as owner and folder, from the runtime's list of shares.
+    std::vector<std::pair<std::string, std::string>> shared_with(const std::string& who);
     static bool meta_name_ok(std::string_view entry);
     void remove(const std::string& user, const std::string& folder, std::function<void(bool)> done);
     void rename(const std::string& user, const std::string& from, const std::string& to, std::function<void(bool)> done);
@@ -217,6 +228,8 @@ private:
         size_t meta_count{0};
     };
     user_state& user(const std::string& name);
+    std::string shares_path() const;
+    void note_share(const std::string& owner, const std::string& folder, const std::string& who, bool on);
     // The snapshot and the whole journal read, everything known before forgotten.
     void reload(user_state& u);
     // The journal's lines from `text`, applied; `fresh` says a message they add is \Recent.
