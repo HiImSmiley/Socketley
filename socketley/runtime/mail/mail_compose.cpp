@@ -1,5 +1,6 @@
 #include "mail_compose.h"
 
+#include <cctype>
 #include <ctime>
 
 #include "../../shared/util/ascii.h"
@@ -373,10 +374,31 @@ bool compose_message(const compose& c, const address& from, std::string_view fro
                 why = "the attachment " + a.name + " has a name or type no header can hold";
                 return false;
             }
-            const std::string name = plain_ascii(a.name) ? a.name : encoded_words(a.name);
-            body += "--" + b + "\r\nContent-Type: " + type + "; name=\"" + name +
-                    "\"\r\nContent-Disposition: attachment; filename=\"" + name +
-                    "\"\r\nContent-Transfer-Encoding: base64\r\n\r\n" + base64_lines(a.data) + "\r\n";
+            // A name past ASCII is written as RFC 2231 has it, UTF-8''%XX, never as an encoded word inside quotes,
+            // which RFC 2047 5 forbids and a client shows as it is.
+            std::string named;
+            if (plain_ascii(a.name))
+                named = "name=\"" + a.name + "\"";
+            else
+            {
+                static constexpr char hex[] = "0123456789ABCDEF";
+                named = "name*=UTF-8''";
+                for (const char ch : a.name)
+                {
+                    const auto u = static_cast<unsigned char>(ch);
+                    if (std::isalnum(u) || ch == '.' || ch == '-' || ch == '_')
+                        named += ch;
+                    else
+                    {
+                        named += '%';
+                        named += hex[u >> 4];
+                        named += hex[u & 15];
+                    }
+                }
+            }
+            body += "--" + b + "\r\nContent-Type: " + type + "; " + named +
+                    "\r\nContent-Disposition: attachment; file" + named +
+                    "\r\nContent-Transfer-Encoding: base64\r\n\r\n" + base64_lines(a.data) + "\r\n";
         }
         body += "--" + b + "--\r\n";
     }

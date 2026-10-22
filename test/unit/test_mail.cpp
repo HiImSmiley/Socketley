@@ -2,6 +2,7 @@
 #include "doctest.h"
 
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <map>
@@ -1069,4 +1070,99 @@ TEST_CASE("DEFLATE: what the compressor writes in pieces, each flushed, the infl
     CHECK(got == sent);
     // Text compresses; noise grows by little.
     CHECK(wire.size() < sent.size() - noise.size() / 2);
+}
+
+TEST_CASE("MIME: hostile shapes cost their length, and parameters and charsets read as clients write them")
+{
+    using clock = std::chrono::steady_clock;
+    // A header of a million bytes of words never closed, and of a quarter million "Re: ", each read in linear time.
+    std::string open_words;
+    while (open_words.size() < (1u << 20))
+        open_words += "=?x?q?a";
+    auto t0 = clock::now();
+    CHECK(mime::decode_words(open_words).size() == open_words.size());
+    std::string res;
+    while (res.size() < (1u << 20))
+        res += "Re: ";
+    res += "Lunch";
+    CHECK(socketley::mail::imap_order::base_subject(res) == "Lunch");
+    CHECK(clock::now() - t0 < std::chrono::seconds(2));
+    // Fifty thousand empty parts are read as ten thousand at most.
+    std::string many = "Content-Type: multipart/mixed; boundary=b\r\n\r\n";
+    for (int i = 0; i < 50000; ++i)
+        many += "--b\r\n\r\n";
+    many += "--b--\r\n";
+    CHECK(mime::parse(many).children.size() < 10000);
+    // A line the boundary only begins is no delimiter (RFC 2046 5.1.1).
+    const std::string prefix = "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\none\r\n--bXYZ\r\nstill one\r\n"
+                               "--b  \r\n\r\ntwo\r\n--b--\r\n";
+    const auto p = mime::parse(prefix);
+    REQUIRE(p.children.size() == 2);
+    std::string out;
+    REQUIRE(mime::section(prefix, p, "1", out));
+    CHECK(out == "one\r\n--bXYZ\r\nstill one");
+    CHECK_FALSE(mime::section(prefix, p, "18446744073709551617", out));
+    // RFC 2231: continuations joined, the encoded value kept as name* for BODYSTRUCTURE and read as UTF-8.
+    const std::string named = "Content-Type: application/pdf; name*0*=utf-8''r%C3%A9; name*1=sum.pdf\r\n"
+                              "Content-Disposition: attachment; filename*=iso-8859-1'en'%E9t%E9.txt\r\n\r\nx";
+    const auto q = mime::parse(named);
+    CHECK(mime::param(q.params, "name") == "r\xc3\xa9sum.pdf");
+    CHECK(mime::param(q.disposition_params, "filename") == "\xc3\xa9t\xc3\xa9.txt");
+    REQUIRE(q.params.size() == 1);
+    CHECK(q.params[0].first == "name*");
+    CHECK(mime::structure(q, named, true).find("\"NAME*\" \"utf-8''r%C3%A9sum.pdf\"") != std::string::npos);
+    CHECK(mime::to_utf8("\x80", "windows-1252") == "\xe2\x82\xac");
+}
+
+TEST_CASE("compose: an attachment's name past ASCII is written by RFC 2231")
+{
+    compose c;
+    c.to = {"bob@remote.test"};
+    c.text = "hi";
+    c.attachments.push_back({"Résumé.pdf", "application/pdf", "x"});
+    address from;
+    REQUIRE(parse_address("alice@example.test", from));
+    composed out;
+    std::string why;
+    REQUIRE_MESSAGE(compose_message(c, from, "", "id@example.test", 0, out, why), why);
+    CHECK(out.message.find("name*=UTF-8''R%C3%A9sum%C3%A9.pdf") != std::string::npos);
+    CHECK(out.message.find("filename*=UTF-8''R%C3%A9sum%C3%A9.pdf") != std::string::npos);
+    CHECK(out.message.find("name=\"=?") == std::string::npos);
+    const auto root = mime::parse(out.message);
+    REQUIRE(root.children.size() == 2);
+    CHECK(mime::param(root.children[1].params, "name") == "Résumé.pdf");
+}
+
+TEST_CASE("SORT and THREAD: a display name with a comma, and a reply chain fifty thousand long in time")
+{
+    namespace io = socketley::mail::imap_order;
+    io::entry e;
+    io::read(e, "From: \"Doe, John\" <john@example.com>\r\nTo: Zed <z@x>, Amy <a@x>\r\n\r\n");
+    CHECK(e.display_from == "doe, john");
+    CHECK(e.display_to == "zed");
+    std::vector<io::entry> chain;
+    for (uint32_t i = 1; i <= 50000; ++i)
+    {
+        io::entry c;
+        c.number = i;
+        c.seq = i - 1;
+        io::read(c, "Subject: s\r\nMessage-ID: <" + std::to_string(i) + "@c>\r\n" +
+                        (i > 1 ? "In-Reply-To: <" + std::to_string(i - 1) + "@c>\r\n" : std::string()) + "\r\n");
+        chain.push_back(std::move(c));
+    }
+    // Many replies to parents not here: one placeholder each, pruned in one pass.
+    for (uint32_t i = 1; i <= 20000; ++i)
+    {
+        io::entry c;
+        c.number = 50000 + i;
+        c.seq = 50000 + i - 1;
+        io::read(c, "Subject: o" + std::to_string(i) + "\r\nMessage-ID: <o" + std::to_string(i) + "@c>\r\nIn-Reply-To: <gone" +
+                        std::to_string(i) + "@c>\r\n\r\n");
+        chain.push_back(std::move(c));
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string t = io::references(chain);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(3));
+    CHECK(t.find("(50000") == std::string::npos);
+    CHECK(std::count(t.begin(), t.end(), '(') == std::count(t.begin(), t.end(), ')'));
 }

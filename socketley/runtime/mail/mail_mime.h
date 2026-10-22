@@ -47,11 +47,13 @@ bool section_of(std::string_view message, const part& root, std::string_view spe
 
 // A part's body with its Content-Transfer-Encoding undone: quoted-printable and base64 decoded, any other as it is.
 std::string decoded_body(std::string_view body, std::string_view encoding);
-// `text` of `charset` in UTF-8 where the charset is ISO-8859-1, as it is where it is any other.
+// `text` of `charset` in UTF-8, by iconv for a charset past UTF-8 and ISO-8859-1; as it is where none knows it.
 std::string to_utf8(std::string_view text, std::string_view charset);
-// A header's value with its RFC 2047 encoded words decoded where their charset is UTF-8, US-ASCII or ISO-8859-1, and
-// the space between two of them dropped; a word of another charset is left as it is.
+// A header's value with its RFC 2047 encoded words decoded into UTF-8 and the space between two of them dropped; a
+// word of a charset no decoder knows is left as it is.
 std::string decode_words(std::string_view value);
+// A parameter's value as UTF-8, its RFC 2231 encoding undone; empty where the part has none of that name.
+std::string param(const std::vector<std::pair<std::string, std::string>>& params, std::string_view name);
 
 // An RFC 5322 date, the obsolete forms among it, as unix time and the zone it was written in, minutes east of UTC.
 bool parse_date(std::string_view v, int64_t& t, int& zone);

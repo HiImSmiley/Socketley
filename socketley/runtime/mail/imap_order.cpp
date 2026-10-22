@@ -29,7 +29,7 @@ bool istarts(std::string_view s, std::string_view p)
 }
 
 // A [blob] and the spaces after it, from `p`; false where there is none.
-bool skip_blob(const std::string& t, size_t& p)
+bool skip_blob(std::string_view t, size_t& p)
 {
     if (p >= t.size() || t[p] != '[')
         return false;
@@ -60,10 +60,11 @@ std::vector<std::string> ids_in(std::string_view v)
     return out;
 }
 
+// Keys are lowered once as they are read, so a comparison is of the bytes.
 int compare_text(const std::string& a, const std::string& b)
 {
-    const std::string x = lower(a), y = lower(b);
-    return x < y ? -1 : x > y ? 1 : 0;
+    const int c = a.compare(b);
+    return c < 0 ? -1 : c > 0 ? 1 : 0;
 }
 
 }   // namespace
@@ -86,65 +87,67 @@ std::string base_subject(std::string_view raw, bool* reply)
         space = false;
         t += c;
     }
-    // RFC 5256 2.1, steps 2 to 5, again while a [fwd: ...] wraps what is left.
+    // RFC 5256 2.1, steps 2 to 5, again while a [fwd: ...] wraps what is left; what is taken off moves the ends of a
+    // view rather than the bytes, so a subject of a million "Re: " costs its length.
+    std::string_view v = t;
     for (int round = 0; round < 64; ++round)
     {
         for (bool again = true; again;)
         {
             again = false;
-            while (!t.empty() && t.back() == ' ')
+            while (!v.empty() && v.back() == ' ')
             {
-                t.pop_back();
+                v.remove_suffix(1);
                 again = true;
             }
-            if (t.size() >= 5 && socketley::ascii::iequals(std::string_view(t).substr(t.size() - 5), "(fwd)"))
+            if (v.size() >= 5 && socketley::ascii::iequals(v.substr(v.size() - 5), "(fwd)"))
             {
-                t.resize(t.size() - 5);
+                v.remove_suffix(5);
                 again = marked = true;
             }
         }
-        for (bool again = true; again && !t.empty();)
+        for (bool again = true; again && !v.empty();)
         {
             again = false;
             size_t lead = 0;
-            while (lead < t.size() && t[lead] == ' ')
+            while (lead < v.size() && v[lead] == ' ')
                 ++lead;
             if (lead)
             {
-                t.erase(0, lead);
+                v.remove_prefix(lead);
                 again = true;
                 continue;
             }
             // *blob ("re" / "fw" / "fwd") *WSP [blob] ":"
             size_t p = 0;
-            while (skip_blob(t, p))
+            while (skip_blob(v, p))
             {
             }
-            const std::string_view at = std::string_view(t).substr(p);
+            const std::string_view at = v.substr(p);
             size_t q = istarts(at, "fwd") ? p + 3 : istarts(at, "fw") || istarts(at, "re") ? p + 2 : std::string::npos;
             if (q != std::string::npos)
             {
-                while (q < t.size() && t[q] == ' ')
+                while (q < v.size() && v[q] == ' ')
                     ++q;
-                skip_blob(t, q);
-                if (q < t.size() && t[q] == ':')
+                skip_blob(v, q);
+                if (q < v.size() && v[q] == ':')
                 {
-                    t.erase(0, q + 1);
+                    v.remove_prefix(q + 1);
                     again = marked = true;
                     continue;
                 }
             }
             // A blob ahead of the rest goes, as long as something is left after it.
             size_t b = 0;
-            if (skip_blob(t, b) && b < t.size())
+            if (skip_blob(v, b) && b < v.size())
             {
-                t.erase(0, b);
+                v.remove_prefix(b);
                 again = true;
             }
         }
-        if (t.size() > 6 && istarts(t, "[fwd:") && t.back() == ']')
+        if (v.size() > 6 && istarts(v, "[fwd:") && v.back() == ']')
         {
-            t = t.substr(5, t.size() - 6);
+            v = v.substr(5, v.size() - 6);
             marked = true;
             continue;
         }
@@ -152,12 +155,12 @@ std::string base_subject(std::string_view raw, bool* reply)
     }
     if (reply)
         *reply = marked;
-    return t;
+    return std::string(v);
 }
 
 void read(entry& e, std::string_view header)
 {
-    e.subject = base_subject(header_value(header, "Subject"), &e.reply);
+    e.subject = lower(base_subject(header_value(header, "Subject"), &e.reply));
     const auto first = [&header](std::string_view name, std::string& mailbox, std::string* display) {
         std::vector<address> list;
         const std::string v = header_value(header, name);
@@ -166,14 +169,33 @@ void read(entry& e, std::string_view header)
         mailbox = lower(list[0].local);
         if (display)
         {
-            // The display name of the first address, or the address where it has none (RFC 5957).
+            // The display name of the first address, or the address where it has none (RFC 5957); the first is cut
+            // at a comma outside quotes, brackets and comments, so "Doe, John" <j@x> is one.
+            size_t cut = 0;
+            for (int depth = 0; cut < v.size(); ++cut)
+            {
+                const char c = v[cut];
+                if (c == '\\' && cut + 1 < v.size())
+                    ++cut;
+                else if (c == '"')
+                {
+                    for (++cut; cut < v.size() && v[cut] != '"'; ++cut)
+                        if (v[cut] == '\\')
+                            ++cut;
+                }
+                else if (c == '<' || c == '(')
+                    ++depth;
+                else if ((c == '>' || c == ')') && depth > 0)
+                    --depth;
+                else if (c == ',' && depth == 0)
+                    break;
+            }
             address a;
             std::string name_shown;
-            const std::string one = v.substr(0, v.find(','));
-            if (parse_mailbox(one, a, &name_shown) && !name_shown.empty())
-                *display = mime::decode_words(name_shown);
+            if (parse_mailbox(v.substr(0, cut), a, &name_shown) && !name_shown.empty())
+                *display = lower(mime::decode_words(name_shown));
             else
-                *display = list[0].text();
+                *display = lower(list[0].text());
         }
     };
     first("From", e.from, &e.display_from);
@@ -316,8 +338,9 @@ constexpr int max_depth = 500;
 // Whether `a` is `of` or above it; a walk too long to finish says it is, so no loop is ever made.
 bool ancestor(const node* a, const node* of)
 {
+    // A chain deeper than a thread is printed is cut there anyway, so the walk stops where it is.
     for (int d = 0; of; of = of->parent)
-        if (of == a || ++d > 100000)
+        if (of == a || ++d > max_depth + 1)
             return true;
     return false;
 }
@@ -394,35 +417,38 @@ std::string members(const node* n)
     return out;
 }
 
-// Placeholders with nothing under them go, and one's children take its place, at the top only where it had one.
+// Placeholders with nothing under them go, and one's children take its place, at the top only where it had one; the
+// level is built anew in one pass, children taken up being pruned in their turn.
 void prune(std::vector<node*>& level, node* parent)
 {
-    for (size_t i = 0; i < level.size();)
+    std::vector<node*> out;
+    out.reserve(level.size());
+    std::vector<node*> todo(level.rbegin(), level.rend());
+    while (!todo.empty())
     {
-        node* n = level[i];
+        node* n = todo.back();
+        todo.pop_back();
         prune(n->kids, n);
         if (n->msg)
         {
-            ++i;
+            out.push_back(n);
             continue;
         }
         if (n->kids.empty())
-        {
-            level.erase(level.begin() + static_cast<long>(i));
             continue;
-        }
         if (parent || n->kids.size() == 1)
         {
             std::vector<node*> kids = std::move(n->kids);
             n->kids.clear();
             for (node* k : kids)
                 k->parent = parent;
-            level.erase(level.begin() + static_cast<long>(i));
-            level.insert(level.begin() + static_cast<long>(i), kids.begin(), kids.end());
+            // Already pruned beneath, each is placed as it is.
+            out.insert(out.end(), kids.begin(), kids.end());
             continue;
         }
-        ++i;
+        out.push_back(n);
     }
+    level = std::move(out);
 }
 
 }   // namespace
@@ -494,7 +520,7 @@ std::string references(std::vector<entry> v)
     std::map<std::string, node*> by_subject;
     const auto subject_of = [](const node* n) {
         const node* m = n->msg ? n : n->kids.empty() ? nullptr : n->kids.front();
-        return m && m->msg ? lower(m->msg->subject) : std::string();
+        return m && m->msg ? m->msg->subject : std::string();
     };
     std::vector<node*> kept;
     for (node* r : roots)

@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <unordered_map>
+
+#include <iconv.h>
 
 #include "mail_compose.h"
 #include "../../shared/util/ascii.h"
@@ -14,6 +18,9 @@ namespace
 {
 
 constexpr int max_depth = 32;
+// The parts one message is read into at most, the rest of a multipart past them left unsplit, as a server does to
+// keep a message of millions of empty parts from becoming a gigabyte of them.
+constexpr size_t max_parts = 10000;
 
 std::string upper(std::string_view s)
 {
@@ -72,6 +79,92 @@ std::string uncommented(std::string_view v)
     return out;
 }
 
+// RFC 2231's continuations of one parameter, name*0, name*1 and on, joined in order; where any is encoded the whole
+// is kept as name* in charset'language'%XX form, so what BODYSTRUCTURE writes stays seven bits and param() reads it.
+void joined_2231(std::vector<std::pair<std::string, std::string>>& params)
+{
+    if (std::none_of(params.begin(), params.end(), [](const auto& p) { return p.first.find('*') != std::string::npos; }))
+        return;
+    struct segment
+    {
+        size_t index;
+        std::string value;
+        bool encoded;
+    };
+    std::vector<std::pair<std::string, std::vector<segment>>> groups;
+    std::vector<std::pair<std::string, std::string>> out;
+    const auto group = [&](const std::string& base) -> std::vector<segment>& {
+        for (auto& g : groups)
+            if (g.first == base)
+                return g.second;
+        out.emplace_back(base, std::string());
+        return groups.emplace_back(base, std::vector<segment>{}).second;
+    };
+    for (auto& [name, value] : params)
+    {
+        const size_t star = name.find('*');
+        if (star == std::string::npos)
+        {
+            out.emplace_back(name, std::move(value));
+            continue;
+        }
+        const std::string base = name.substr(0, star);
+        std::string_view rest = std::string_view(name).substr(star + 1);
+        size_t index = 0;
+        bool encoded = rest.empty();
+        if (!rest.empty())
+        {
+            size_t n = 0;
+            while (n < rest.size() && std::isdigit(static_cast<unsigned char>(rest[n])) && n < 4)
+                index = index * 10 + static_cast<size_t>(rest[n++] - '0');
+            if (n == 0 || (n < rest.size() && rest.substr(n) != "*"))
+                continue;
+            encoded = n < rest.size();
+        }
+        group(base).push_back({index, std::move(value), encoded});
+    }
+    static constexpr char hex[] = "0123456789ABCDEF";
+    for (auto& [base, segs] : groups)
+    {
+        std::stable_sort(segs.begin(), segs.end(), [](const segment& a, const segment& b) { return a.index < b.index; });
+        const bool encoded = std::any_of(segs.begin(), segs.end(), [](const segment& s) { return s.encoded; });
+        std::string value;
+        // The first segment of an encoded value carries its charset'language' (RFC 2231 4.1); an unencoded one has none.
+        if (encoded && !segs.front().encoded)
+            value = "''";
+        for (const auto& s : segs)
+        {
+            if (!encoded || s.encoded)
+            {
+                value += s.value;
+                continue;
+            }
+            for (const char c : s.value)
+            {
+                const auto u = static_cast<unsigned char>(c);
+                if (std::isalnum(u) || c == '.' || c == '-' || c == '_')
+                    value += c;
+                else
+                {
+                    value += '%';
+                    value += hex[u >> 4];
+                    value += hex[u & 15];
+                }
+            }
+        }
+        // A plain value under the same name gives way to the continued one, as RFC 2231 3 has it.
+        std::erase_if(out, [&](const auto& p) { return p.first == base && !p.second.empty(); });
+        for (auto& p : out)
+            if (p.first == base && p.second.empty())
+            {
+                p.first = encoded ? base + "*" : base;
+                p.second = std::move(value);
+                break;
+            }
+    }
+    params = std::move(out);
+}
+
 // "value; name=value; name="quoted"": the value, and the parameters with their names in lower case.
 std::string with_params(std::string_view v, std::vector<std::pair<std::string, std::string>>& params)
 {
@@ -111,6 +204,7 @@ std::string with_params(std::string_view v, std::vector<std::pair<std::string, s
         if (!name.empty())
             params.emplace_back(name, value);
     }
+    joined_2231(params);
     return head;
 }
 
@@ -123,8 +217,9 @@ size_t count_lines(std::string_view body)
     return n + (!body.empty() && !body.ends_with("\r\n") ? 1 : 0);
 }
 
-void parse_into(part& p, std::string_view msg, size_t off, size_t len, int depth, bool digest)
+void parse_into(part& p, std::string_view msg, size_t off, size_t len, int depth, bool digest, size_t& parts)
 {
+    ++parts;
     const std::string_view region = msg.substr(off, len);
     const std::string_view head = header_block(region);
     p.header_off = off;
@@ -186,7 +281,7 @@ void parse_into(part& p, std::string_view msg, size_t off, size_t len, int depth
     if (p.message())
     {
         part inner;
-        parse_into(inner, msg, p.body_off, p.body_len, depth + 1, false);
+        parse_into(inner, msg, p.body_off, p.body_len, depth + 1, false, parts);
         p.children.push_back(std::move(inner));
         return;
     }
@@ -215,8 +310,18 @@ void parse_into(part& p, std::string_view msg, size_t off, size_t len, int depth
             at = after;
             continue;
         }
-        closed = body.substr(after, 2) == "--";
-        const size_t eol = body.find("\r\n", after);
+        // A delimiter is the boundary, perhaps "--", and nothing but white space to the line's end (RFC 2046 5.1.1).
+        const bool closing = body.substr(after, 2) == "--";
+        size_t tail = after + (closing ? 2 : 0);
+        while (tail < body.size() && (body[tail] == ' ' || body[tail] == '\t'))
+            ++tail;
+        if (tail < body.size() && body.substr(tail, 2) != "\r\n")
+        {
+            at = after;
+            continue;
+        }
+        closed = closing;
+        const size_t eol = tail < body.size() ? tail : std::string_view::npos;
         const size_t end_before = hit >= 2 ? hit - 2 : 0;
         if (!starts.empty())
             starts.back().second = end_before;
@@ -229,8 +334,10 @@ void parse_into(part& p, std::string_view msg, size_t off, size_t len, int depth
     {
         if (e < s)
             continue;
+        if (parts >= max_parts)
+            break;
         part child;
-        parse_into(child, msg, p.body_off + s, e - s, depth + 1, p.subtype == "digest");
+        parse_into(child, msg, p.body_off + s, e - s, depth + 1, p.subtype == "digest", parts);
         p.children.push_back(std::move(child));
     }
 }
@@ -374,7 +481,8 @@ std::string imap_string(std::string_view s, bool nil_if_empty)
 part parse(std::string_view message)
 {
     part root;
-    parse_into(root, message, 0, message.size(), 0, false);
+    size_t parts = 0;
+    parse_into(root, message, 0, message.size(), 0, false, parts);
     return root;
 }
 
@@ -433,6 +541,9 @@ bool section_of(std::string_view message, const part& root, std::string_view spe
         size_t k = 0;
         while (!spec.empty() && std::isdigit(static_cast<unsigned char>(spec.front())))
         {
+            // A number past any part there could be is none, rather than one that wrapped round to a small one.
+            if (k > max_parts)
+                return false;
             k = k * 10 + static_cast<size_t>(spec.front() - '0');
             spec.remove_prefix(1);
         }
@@ -636,26 +747,122 @@ std::string latin1_to_utf8(std::string_view in)
     return out;
 }
 
-// The encoded word at the start of `in`, decoded into `out`; its length, or 0 when it is none or of a charset left
-// as it is.
-size_t encoded_word(std::string_view in, std::string& out)
+// `in` of `charset` as UTF-8 by iconv, a byte it cannot take as U+FFFD; false where it knows no such charset.
+bool iconv_utf8(std::string_view charset, std::string_view in, std::string& out)
 {
+    // A descriptor a charset a thread, kept for the thread's life: opening one reads a module, and few are ever asked.
+    struct held
+    {
+        std::unordered_map<std::string, iconv_t> open;
+        ~held()
+        {
+            for (auto& [n, cd] : open)
+                if (cd != reinterpret_cast<iconv_t>(-1))
+                    ::iconv_close(cd);
+        }
+    };
+    thread_local held h;
+    const std::string name = lower(trim(charset.substr(0, charset.find('*'))));
+    if (name.empty() || name.size() > 40 || !std::all_of(name.begin(), name.end(), [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.' || c == ':';
+        }))
+        return false;
+    auto it = h.open.find(name);
+    if (it == h.open.end())
+    {
+        if (h.open.size() >= 64)
+            return false;
+        it = h.open.emplace(name, ::iconv_open("UTF-8", name.c_str())).first;
+    }
+    iconv_t cd = it->second;
+    if (cd == reinterpret_cast<iconv_t>(-1))
+        return false;
+    if (::iconv(cd, nullptr, nullptr, nullptr, nullptr) == static_cast<size_t>(-1)) {}
+    out.assign(in.size() * 4 + 16, '\0');
+    char* ip = const_cast<char*>(in.data());
+    size_t il = in.size();
+    char* op = out.data();
+    size_t ol = out.size();
+    while (il > 0)
+    {
+        if (::iconv(cd, &ip, &il, &op, &ol) != static_cast<size_t>(-1))
+            break;
+        if (errno == E2BIG)
+        {
+            const size_t done = static_cast<size_t>(op - out.data());
+            out.resize(out.size() * 2);
+            op = out.data() + done;
+            ol = out.size() - done;
+            continue;
+        }
+        // A byte not of the charset, or one cut off at the end: U+FFFD for it, and on past it.
+        if (ol < 3)
+        {
+            const size_t done = static_cast<size_t>(op - out.data());
+            out.resize(out.size() + 16);
+            op = out.data() + done;
+            ol = out.size() - done;
+        }
+        *op++ = '\xEF';
+        *op++ = '\xBF';
+        *op++ = '\xBD';
+        ol -= 3;
+        ++ip;
+        --il;
+        if (::iconv(cd, nullptr, nullptr, nullptr, nullptr) == static_cast<size_t>(-1)) {}
+    }
+    if (::iconv(cd, nullptr, nullptr, &op, &ol) == static_cast<size_t>(-1)) {}
+    out.resize(static_cast<size_t>(op - out.data()));
+    return true;
+}
+
+// Where the next "?=" and the next white space lie, each found once for a run of searches from rising places, so a
+// value of a million "=?" is read in time linear in it.
+struct word_scan
+{
+    std::string_view v;
+    size_t close_from{std::string_view::npos}, close_at{std::string_view::npos};
+    size_t space_from{std::string_view::npos}, space_at{std::string_view::npos};
+
+    size_t next_close(size_t p)
+    {
+        if (close_from == std::string_view::npos || p < close_from || (close_at != std::string_view::npos && p > close_at))
+        {
+            close_from = p;
+            close_at = v.find("?=", p);
+        }
+        return close_at;
+    }
+    size_t next_space(size_t p)
+    {
+        if (space_from == std::string_view::npos || p < space_from || (space_at != std::string_view::npos && p > space_at))
+        {
+            space_from = p;
+            space_at = v.find_first_of(" \t\r\n", p);
+        }
+        return space_at;
+    }
+};
+
+// The encoded word at `i`, decoded into `out`; its length, or 0 when it is none or of a charset no decoder knows.
+size_t encoded_word(word_scan& sc, size_t i, std::string& out)
+{
+    const std::string_view in = sc.v.substr(i);
     if (!in.starts_with("=?"))
         return 0;
-    const size_t q1 = in.find('?', 2);
+    // A charset is a few dozen bytes at most, looked for no further.
+    const size_t q1 = in.substr(0, 80).find('?', 2);
     if (q1 == std::string_view::npos || q1 + 2 >= in.size() || in[q1 + 2] != '?')
         return 0;
-    const size_t end = in.find("?=", q1 + 3);
-    if (end == std::string_view::npos)
+    const size_t close = sc.next_close(i + q1 + 3);
+    // A word holds no white space, so one whose end lies past the next is none.
+    if (close == std::string_view::npos || sc.next_space(i + 2) < close)
         return 0;
+    const size_t end = close - i;
     const std::string_view charset = in.substr(2, q1 - 2);
     const char enc = socketley::ascii::upper(in[q1 + 1]);
     const std::string_view text = in.substr(q1 + 3, end - q1 - 3);
-    if (charset.empty() || text.find_first_of(" \t\r\n") != std::string_view::npos ||
-        charset.find_first_of(" \t\r\n") != std::string_view::npos)
-        return 0;
-    const charset_kind kind = charset_of(charset);
-    if (kind == charset_kind::other)
+    if (charset.empty())
         return 0;
     std::string raw;
     if (enc == 'B')
@@ -667,7 +874,14 @@ size_t encoded_word(std::string_view in, std::string& out)
         raw = unquote_printable(text, true);
     else
         return 0;
-    out = kind == charset_kind::latin1 ? latin1_to_utf8(raw) : std::move(raw);
+    const charset_kind kind = charset_of(charset);
+    if (kind == charset_kind::other)
+    {
+        if (!iconv_utf8(charset, raw, out))
+            return 0;
+    }
+    else
+        out = kind == charset_kind::latin1 ? latin1_to_utf8(raw) : std::move(raw);
     return end + 2;
 }
 
@@ -687,10 +901,47 @@ std::string decoded_body(std::string_view body, std::string_view encoding)
     return std::string(body);
 }
 
+std::string param(const std::vector<std::pair<std::string, std::string>>& params, std::string_view name)
+{
+    for (const auto& [k, v] : params)
+    {
+        if (k == name)
+            return v;
+        if (k.size() == name.size() + 1 && k.back() == '*' && std::string_view(k).substr(0, name.size()) == name)
+        {
+            // charset'language'%XX (RFC 2231 4).
+            const size_t a = v.find('\''), b = a == std::string::npos ? a : v.find('\'', a + 1);
+            if (b == std::string::npos)
+                return v;
+            std::string raw;
+            for (size_t i = b + 1; i < v.size(); ++i)
+            {
+                const auto hex = [](char c) {
+                    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                         : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+                };
+                if (v[i] == '%' && i + 2 < v.size() && hex(v[i + 1]) >= 0 && hex(v[i + 2]) >= 0)
+                {
+                    raw += static_cast<char>(hex(v[i + 1]) * 16 + hex(v[i + 2]));
+                    i += 2;
+                }
+                else
+                    raw += v[i];
+            }
+            return to_utf8(raw, std::string_view(v).substr(0, a));
+        }
+    }
+    return {};
+}
+
 std::string to_utf8(std::string_view text, std::string_view charset)
 {
-    if (charset_of(charset) == charset_kind::latin1)
+    const charset_kind kind = charset_of(charset);
+    if (kind == charset_kind::latin1)
         return latin1_to_utf8(text);
+    std::string out;
+    if (kind == charset_kind::other && iconv_utf8(charset, text, out))
+        return out;
     return std::string(text);
 }
 
@@ -700,12 +951,13 @@ std::string decode_words(std::string_view value)
     out.reserve(value.size());
     // Where the white space after the last decoded word began, while nothing else has followed it.
     size_t after_word = std::string::npos;
+    word_scan sc{value};
     for (size_t i = 0; i < value.size();)
     {
         if (value[i] == '=' && i + 1 < value.size() && value[i + 1] == '?')
         {
             std::string word;
-            if (const size_t n = encoded_word(value.substr(i), word); n > 0)
+            if (const size_t n = encoded_word(sc, i, word); n > 0)
             {
                 if (after_word != std::string::npos)
                     out.resize(after_word);

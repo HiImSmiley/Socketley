@@ -166,8 +166,11 @@ private:
         // Whether the user signed in on it may send as `a`: their username at one of the domains, the account's email,
         // or the username where it is an address.
         bool owns(const address& a) const;
-        // The header of the message being received, up to its blank line, for its From to be checked.
+        // The header of the message being received, up to its blank line, for its From to be checked; a signed-in
+        // user's is held back from the spool until it is whole, so the Date and Message-ID it lacks go ahead of it.
         std::string head_seen;
+        bool holding{false};
+        void release_head(bool at_end);
         // Its address in --dnsbl's lists: not asked, being asked, listed nowhere, listed by `listed_by`; and the
         // MAIL that waits for the answer.
         uint8_t blocklist{0};

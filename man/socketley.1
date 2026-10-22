@@ -12622,7 +12622,9 @@ one that speaks TLS from the first byte, and
 .B \-\-imap
 and
 .B \-\-imaps
-the same two for reading the mailboxes. With no
+the same two for reading the mailboxes. A message a signed\-in user sends
+without a Date or a Message\-ID is given them, as Postfix's cleanup does; one
+from another server is passed on as it came. With no
 .B \-\-bind
 a port takes IPv6 and IPv4 alike; an IPv4 client is seen, checked and logged by
 its IPv4 address.

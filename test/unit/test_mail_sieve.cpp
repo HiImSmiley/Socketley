@@ -619,7 +619,9 @@ TEST_CASE("sieve: header values are unfolded and RFC 2047 decoded")
                                "X-Other: =?KOI8-R?B?9MXT1A==?=\n\nb\n";
     CHECK(summary_of("if header :is \"subject\" \"\xc3\xa4" "bc Andr\xc3\xa9\" { discard; }", m) == "discard");
     CHECK(summary_of("if header :is \"x-folded\" \"one two\" { discard; }", m) == "discard");
-    CHECK(summary_of("if header :is \"x-other\" \"=?KOI8-R?B?9MXT1A==?=\" { discard; }", m) == "discard");
+    CHECK(summary_of("if header :is \"x-other\" \"\xd0\xa2\xd0\xb5\xd1\x81\xd1\x82\" { discard; }", m) == "discard");
+    CHECK(mime::decode_words("=?windows-1252?Q?=80uro?=") == "\xe2\x82\xac" "uro");
+    CHECK(mime::decode_words("=?x-no-such?Q?a?=") == "=?x-no-such?Q?a?=");
     CHECK(mime::decode_words("a =?utf-8?q?b?= c") == "a b c");
     CHECK(mime::decoded_body("a=3Db=\r\nc", "quoted-printable") == "a=bc");
     CHECK(mime::decoded_body("aGVs\r\nbG8=\r\n", "BASE64") == "hello");

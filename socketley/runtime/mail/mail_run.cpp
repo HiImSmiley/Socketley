@@ -1506,21 +1506,61 @@ bool mail_run::conn::data_begin()
         r.received_line(*this, e->id, smtp->recipients().size() == 1 ? smtp->recipients().front().text() : "");
     entry = e;
     writer = r.m_spool.begin(std::move(e), head);
+    head_seen.clear();
+    holding = !smtp->user().empty();
     return writer != 0;
 }
 
 void mail_run::conn::data_bytes(std::string_view piece)
 {
+    if (!holding)
+    {
+        if (writer)
+            run->m_spool.append(writer, piece);
+        return;
+    }
+    // A signed-in user's header is held until its blank line or 64 KiB, then written with what it lacks.
+    head_seen.append(piece);
+    if (head_seen.find("\r\n\r\n") != std::string::npos || head_seen.starts_with("\r\n") ||
+        head_seen.size() >= (64u << 10))
+        release_head(false);
+}
+
+void mail_run::conn::release_head(bool at_end)
+{
+    holding = false;
+    // A message submitted without a Date or a Message-ID is given one, as RFC 5322 3.6 asks and Postfix's cleanup does;
+    // where the header did not end within what was held it is left as it came.
+    std::string add;
+    const bool whole = at_end || head_seen.find("\r\n\r\n") != std::string::npos || head_seen.starts_with("\r\n");
+    if (whole)
+    {
+        bool date = false, id = false;
+        for (const auto& [name, value] : split_headers(header_block(head_seen)))
+        {
+            date = date || socketley::ascii::iequals(name, "Date");
+            id = id || socketley::ascii::iequals(name, "Message-ID");
+        }
+        if (!date)
+            add += "Date: " + rfc5322_date(wall::now_ms()) + "\r\n";
+        if (!id)
+            add += "Message-ID: <" + socketley::random_hex(16) + "@" + run->hostname() + ">\r\n";
+    }
     if (writer)
-        run->m_spool.append(writer, piece);
-    // A signed-in user's From is checked at the end, read from the header kept until its blank line.
-    if (smtp && !smtp->user().empty() && head_seen.size() < (64u << 10) && head_seen.find("\r\n\r\n") == std::string::npos)
-        head_seen.append(piece.substr(0, (64u << 10) - head_seen.size()));
+    {
+        if (!add.empty())
+            run->m_spool.append(writer, add);
+        run->m_spool.append(writer, head_seen);
+    }
+    // What is kept is the header alone, for the From check at the end.
+    head_seen.resize(header_block(head_seen).size());
 }
 
 void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
 {
     mail_run& r = *run;
+    if (holding)
+        release_head(true);
     const uint64_t w = writer;
     writer = 0;
     entry_ptr e = std::move(entry);
@@ -1633,6 +1673,8 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
 
 void mail_run::conn::data_abort(bool too_big)
 {
+    holding = false;
+    head_seen.clear();
     if (writer)
     {
         run->m_spool.abort(writer);

@@ -8,6 +8,7 @@
 # A mail server is judged by the mail it takes that it should not, and the mail it loses:
 #   * mail for an alias not handed to the alias's domain's exchanger, or handed on without a Received line
 #   * a stranger let relay through it, or mail taken for a user that does not exist
+#   * a message submitted without a Date or Message-ID sent on without them
 #   * STARTTLS that leaves the session in the clear, or a submission port that takes mail unsigned in, or a password
 #     tried as fast as a script can guess
 #   * `socketley send` and socketley.mail.send not queuing, or sending unsigned from a domain with a key
@@ -143,7 +144,13 @@ check "a submission port takes nothing in the clear from a stranger" "$(smtp "$S
 check "a user signed in sends to another domain" "$(smtp "$SUB" alice@example.test carol@remote.test 'Subject: sub
 
 from alice' starttls login alice alicepass1)" "sent"
-mail_with "from alice" >/dev/null && ok "which is delivered there" || bad "which is delivered there" "nothing at the sink"
+f=$(mail_with "from alice") && ok "which is delivered there" || bad "which is delivered there" "nothing at the sink"
+[ -n "$f" ] && grep -q '^Date: ' "$f" && grep -q '^Message-ID: <.*@mail.example.test>' "$f" \
+    && ok "given the Date and Message-ID it was submitted without" \
+    || bad "given the Date and Message-ID it was submitted without" "$(head -12 "$f" 2>/dev/null)"
+f=$(mail_with "alias body")
+[ -n "$f" ] && ! grep -q '^Message-ID: ' "$f" && ok "while a stranger's message is passed on as it came" \
+    || bad "while a stranger's message is passed on as it came" "$(head -12 "$f" 2>/dev/null)"
 r=$(smtp "$SUB" alice@example.test carol@remote.test 'x' starttls login alice wrongpass)
 case "$r" in
     "auth 535 "1.*|"auth 535 "2.*) ok "a wrong password is refused a second later" ;;
