@@ -520,11 +520,15 @@ void jmap_session::api(const request& rq)
             if (v.k == json::jvalue::kind::string)
                 cs->created[k] = v.s;
     }
-    // The index as it is now, every Email by its id.
-    for (const auto& f : m_store.known(m_user))
-        for (const auto& m : f->msgs)
-            m_ids[imap_store::email_id(m.key)] = {f, m.uid};
-    next_call(cs);
+    // The index as it is now, every Email by its id, with what the bucket holds and no journal names taken up first.
+    m_store.freshen(m_user, [this, cs, alive = m_alive] {
+        if (!*alive)
+            return;
+        for (const auto& f : m_store.known(m_user))
+            for (const auto& m : f->msgs)
+                m_ids[imap_store::email_id(m.key)] = {f, m.uid};
+        next_call(cs);
+    });
 }
 
 void jmap_session::next_call(const std::shared_ptr<call_state>& cs)

@@ -106,6 +106,8 @@ public:
     std::vector<std::shared_ptr<imap_folder>> known(const std::string& user);
     // The user's folders, those the bucket has and those made empty here.
     void folders(const std::string& user, std::function<void(std::vector<std::string>)> done);
+    // The user's folders listed and each brought up to the bucket at most once a minute, for a client that never SELECTs.
+    void freshen(const std::string& user, std::function<void()> done);
     // A folder brought up to what the bucket holds, listed again where it was last listed longer than `max_age_ms` ago;
     // null when it does not exist and is not one every mailbox has.
     void open(const std::string& user, const std::string& folder, std::function<void(std::shared_ptr<imap_folder>)> done,
@@ -236,6 +238,8 @@ private:
         std::map<std::string, std::map<std::string, std::string>> meta;
         uint64_t meta_bytes{0};
         size_t meta_count{0};
+        // When freshen last listed the bucket for this user.
+        int64_t listed_ms{0};
     };
     user_state& user(const std::string& name);
     // Uploads older than a day taken away, a page of them each hour.

@@ -1231,6 +1231,25 @@ void imap_store::folders(const std::string& name, std::function<void(std::vector
                });
 }
 
+void imap_store::freshen(const std::string& name, std::function<void()> done)
+{
+    user_state& u = user(name);
+    const int64_t now = wall::now_ms_coarse();
+    if (now - u.listed_ms < 60000)
+        return done();
+    u.listed_ms = now;
+    folders(name, [this, name, done = std::move(done)](std::vector<std::string> names) {
+        auto left = std::make_shared<size_t>(names.size() + 1);
+        const auto one = [left, done] {
+            if (--*left == 0)
+                done();
+        };
+        for (const auto& f : names)
+            open(name, f, [one](std::shared_ptr<imap_folder>) { one(); }, false, 60000);
+        one();
+    });
+}
+
 uint64_t imap_store::usage(const std::string& name)
 {
     user_state& u = user(name);
