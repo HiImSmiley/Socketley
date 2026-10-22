@@ -27,12 +27,15 @@ std::string lower(std::string_view s)
     return out;
 }
 
-// What a storage's refusal is for the sender: worth trying again, or not.
-int code_for(const rpc::reply& r)
+// What a storage's refusal is for the sender, its reply's start: a message too large for good, a store that is full
+// for now, as its operator may make room, and anything else worth trying again.
+std::string refusal_of(const rpc::reply& r)
 {
-    if (r.code == "QuotaExceeded" || r.code == "EntityTooLarge")
-        return 552;
-    return 451;
+    if (r.code == "EntityTooLarge")
+        return "552 5.3.4";
+    if (r.code == "QuotaExceeded")
+        return "452 4.2.2";
+    return "451 4.3.0";
 }
 
 }   // namespace
@@ -77,19 +80,19 @@ void mailboxes::ask(const std::string& target, std::string payload,
     m_run.ask(target, std::move(payload), std::move(cb));
 }
 
-void mailboxes::find(const std::string& name, std::function<void(bool, std::string, std::string)> done)
+void mailboxes::find(const std::string& name, std::function<void(account, std::string, std::string)> done)
 {
     const std::string key = lower(name);
     if (m_idp.empty())
     {
         // Without an idp runtime a mailbox is a name an alias gave it.
-        done(name.find('@') == std::string::npos, key, {});
+        done(name.find('@') == std::string::npos ? account::yes : account::no, key, {});
         return;
     }
     const int64_t now = wall::now_ms_coarse();
     if (const auto it = m_known.find(key); it != m_known.end() && it->second.until_ms > now)
     {
-        done(it->second.found, it->second.user, it->second.email);
+        done(it->second.found ? account::yes : account::no, it->second.user, it->second.email);
         return;
     }
     std::string payload(socketley::idp::command_marker);
@@ -108,19 +111,30 @@ void mailboxes::find(const std::string& name, std::function<void(bool, std::stri
         }
         else if (st == request_status::ok)
             k.until_ms = now + unknown_ms;
-        // An idp runtime that does not answer leaves nothing known, so the next ask asks again.
-        if (st == request_status::ok)
-            m_known[key] = k;
-        done(k.found, k.user, k.email);
+        // An idp runtime that does not answer leaves nothing known, so the next ask asks again, and the mail waits.
+        if (st != request_status::ok)
+        {
+            done(account::unreachable, {}, {});
+            return;
+        }
+        // Names a stranger tries are kept a while, never without bound: what has expired goes first, then all.
+        if (m_known.size() >= 65536)
+        {
+            std::erase_if(m_known, [now](const auto& kv) { return kv.second.until_ms <= now; });
+            if (m_known.size() >= 65536)
+                m_known.clear();
+        }
+        m_known[key] = k;
+        done(k.found ? account::yes : account::no, k.user, k.email);
     });
 }
 
 void mailboxes::verify(const std::string& user, const std::string& password,
-                       std::function<void(bool, std::string, std::string)> done)
+                       std::function<void(account, std::string, std::string)> done)
 {
     if (m_idp.empty() || user.find('\n') != std::string::npos || password.find('\n') != std::string::npos)
     {
-        done(false, {}, {});
+        done(account::no, {}, {});
         return;
     }
     std::string payload(socketley::idp::command_marker);
@@ -130,13 +144,13 @@ void mailboxes::verify(const std::string& user, const std::string& password,
             return;
         if (st != request_status::ok || !reply.starts_with("ok "))
         {
-            done(false, {}, {});
+            done(st == request_status::ok ? account::no : account::unreachable, {}, {});
             return;
         }
         known k;
         take_answer(reply.substr(3), k);
         m_quota[lower(k.user)] = k.quota;
-        done(true, k.user, k.email);
+        done(account::yes, k.user, k.email);
     });
 }
 
@@ -291,8 +305,8 @@ void mailboxes::put_small(const std::shared_ptr<writing>& w)
         }
         if (!r.ok)
         {
-            finish(w, code_for(r), std::to_string(code_for(r)) + " " + (code_for(r) == 552 ? "5.2.2" : "4.3.0") +
-                                       " the mailbox store refused it: " + r.code + " " + r.message);
+            const std::string why = refusal_of(r);
+            finish(w, std::atoi(why.c_str()), why + " the mailbox store refused it: " + r.code + " " + r.message);
             return;
         }
         finish(w, 250, "250 2.0.0 delivered to " + w->key);
@@ -317,7 +331,8 @@ void mailboxes::put_stream(const std::shared_ptr<writing>& w)
         rpc::reply r;
         if (st != request_status::ok || !rpc::decode(bytes, rpc::op::put_begin, r) || !r.ok || r.next.empty())
         {
-            finish(w, r.ok ? 451 : code_for(r), "451 4.3.0 the mailbox store would not take it: " + r.code);
+            const std::string why = r.ok ? std::string("451 4.3.0") : refusal_of(r);
+            finish(w, std::atoi(why.c_str()), why + " the mailbox store would not take it: " + r.code);
             return;
         }
         w->stream = r.next;
@@ -370,8 +385,8 @@ void mailboxes::put_piece(const std::shared_ptr<writing>& w)
         }
         if (!r.ok)
         {
-            finish(w, code_for(r), std::to_string(code_for(r)) + " " + (code_for(r) == 552 ? "5.2.2" : "4.3.0") +
-                                       " the mailbox store refused it: " + r.code + " " + r.message);
+            const std::string why = refusal_of(r);
+            finish(w, std::atoi(why.c_str()), why + " the mailbox store refused it: " + r.code + " " + r.message);
             return;
         }
         if (last)

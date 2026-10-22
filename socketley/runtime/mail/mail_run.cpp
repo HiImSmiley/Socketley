@@ -1015,25 +1015,25 @@ void mail_run::conn::start_tls()
 }
 
 void mail_run::conn::authenticate(std::string_view, std::string user, std::string secret,
-                                  std::function<void(bool, std::string)> done)
+                                  std::function<void(account, std::string)> done)
 {
     mail_run& r = *run;
     // A wrong answer waits a second before it is said.
-    auto finish = [&r, alive = r.m_alive, done](bool ok, std::string name) {
+    auto finish = [&r, alive = r.m_alive, done](account a, std::string name) {
         if (!*alive)
             return;
-        if (ok)
+        if (a != account::no)
         {
-            ++r.m_auth_ok;
-            done(true, std::move(name));
+            r.m_auth_ok += a == account::yes;
+            done(a, std::move(name));
             return;
         }
         ++r.m_auth_failed;
         if (!r.m_fio.after(auth_delay, [alive, done](int64_t) {
                 if (*alive)
-                    done(false, {});
+                    done(account::no, {});
             }))
-            done(false, {});
+            done(account::no, {});
     };
     if (const std::string* hash = r.m_users.value().hash_of(user))
     {
@@ -1042,7 +1042,7 @@ void mail_run::conn::authenticate(std::string_view, std::string user, std::strin
         r.m_pool.submit(r.cpu_lane(), [h = *hash, pw = std::move(secret), matched] {
                             *matched = socketley::storage::password_matches(h, pw);
                         },
-                        [matched, user, finish] { finish(*matched, user); });
+                        [matched, user, finish] { finish(*matched ? account::yes : account::no, user); });
         return;
     }
     if (r.m_idp)
@@ -1052,22 +1052,22 @@ void mail_run::conn::authenticate(std::string_view, std::string user, std::strin
         {
             idp_user = true;
             user_email = who.email;
-            finish(true, who.username.empty() ? who.sub : who.username);
+            finish(account::yes, who.username.empty() ? who.sub : who.username);
             return;
         }
         // A password, which only the idp runtime can check, on its own threads.
         const uint64_t me = id;
-        r.m_mailboxes->verify(user, secret, [&r, me, finish](bool ok, std::string name, std::string email) {
-            if (conn* c = r.find(me); c && ok)
+        r.m_mailboxes->verify(user, secret, [&r, me, finish](account a, std::string name, std::string email) {
+            if (conn* c = r.find(me); c && a == account::yes)
             {
                 c->idp_user = true;
                 c->user_email = std::move(email);
             }
-            finish(ok, std::move(name));
+            finish(a, std::move(name));
         });
         return;
     }
-    finish(false, {});
+    finish(account::no, {});
 }
 
 void mail_run::conn::mail_from(const address& from, std::function<void(rcpt_verdict)> done)
@@ -1111,8 +1111,10 @@ void mail_run::conn::rcpt_to(const address& to, std::function<void(rcpt_verdict)
             answer(v);
             return;
         }
-        r.m_lua->rcpt(to.text(), sender, ip, who, v.code / 100 == 2, [answer, v](bool take) {
-            if (take)
+        r.m_lua->rcpt(to.text(), sender, ip, who, v.code / 100 == 2, [answer, v](account take) {
+            if (take == account::unreachable)
+                answer(rcpt_verdict{451, "The recipient cannot be decided now; try again later"});
+            else if (take == account::yes)
                 answer(v.code / 100 == 2 ? v : rcpt_verdict{250, "Taken by the script"});
             else
                 answer(v.code / 100 == 2 ? rcpt_verdict{550, "Recipient refused"} : v);
@@ -1129,10 +1131,15 @@ void mail_run::conn::rcpt_to(const address& to, std::function<void(rcpt_verdict)
                 done({550, "No mailbox is kept here"});
                 return;
             }
-            r.m_mailboxes->find(where.target, [&r, done](bool found, std::string, std::string) {
-                if (!found)
+            r.m_mailboxes->find(where.target, [&r, done](account a, std::string, std::string) {
+                if (a == account::unreachable)
+                {
+                    done({451, "The accounts cannot be checked now; try again later"});
+                    return;
+                }
+                if (a == account::no)
                     ++r.m_refused_rcpt;
-                done(found ? rcpt_verdict{250, ""} : rcpt_verdict{550, "No such user here"});
+                done(a == account::yes ? rcpt_verdict{250, ""} : rcpt_verdict{550, "No such user here"});
             });
             return;
         }
@@ -1286,7 +1293,7 @@ void mail_run::conn::close()
     run->close_soon(*this);
 }
 
-void mail_run::conn::login(std::string user, std::string password, std::function<void(bool, std::string)> done)
+void mail_run::conn::login(std::string user, std::string password, std::function<void(account, std::string)> done)
 {
     authenticate("IMAP", std::move(user), std::move(password), std::move(done));
 }

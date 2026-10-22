@@ -15,6 +15,8 @@
 #include <string_view>
 #include <vector>
 
+#include "mail_account.h"
+
 namespace socketley::mail
 {
 
@@ -86,9 +88,9 @@ public:
         virtual void reply(std::string_view bytes) = 0;
         // The 220 to STARTTLS is out: what follows on the connection is a TLS handshake.
         virtual void start_tls() = 0;
-        // A password or an access token said for `user`; `done(true, name)` signs the connection in as `name`.
+        // A password or an access token said for `user`; `done(yes, name)` signs the connection in as `name`.
         virtual void authenticate(std::string_view mech, std::string user, std::string secret,
-                                  std::function<void(bool ok, std::string name)> done) = 0;
+                                  std::function<void(account, std::string name)> done) = 0;
         virtual void mail_from(const address& from, std::function<void(rcpt_verdict)> done) = 0;
         virtual void rcpt_to(const address& to, std::function<void(rcpt_verdict)> done) = 0;
         // The message begins; false when it cannot be kept, answered 451.

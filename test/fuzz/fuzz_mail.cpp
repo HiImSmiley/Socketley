@@ -61,9 +61,11 @@ struct hooks : smtp_session::hooks
     }
     void reply(std::string_view b) override { out.append(b); }
     void start_tls() override {}
-    void authenticate(std::string_view, std::string user, std::string, std::function<void(bool, std::string)> done) override
+    void authenticate(std::string_view, std::string user, std::string,
+                      std::function<void(account, std::string)> done) override
     {
-        answer([done, user] { done(user.size() % 2 == 0, user); });
+        const account a = user.size() % 3 == 0 ? account::yes : user.size() % 3 == 1 ? account::no : account::unreachable;
+        answer([done, user, a] { done(a, user); });
     }
     void mail_from(const address&, std::function<void(rcpt_verdict)> done) override { answer([done] { done({250, ""}); }); }
     void rcpt_to(const address& to, std::function<void(rcpt_verdict)> done) override
@@ -285,9 +287,9 @@ struct sieve_hooks : managesieve_session::hooks
     bool closed{false};
     void reply(std::string_view b) override { out.append(b); }
     void start_tls() override {}
-    void login(std::string user, std::string password, std::function<void(bool, std::string)> done) override
+    void login(std::string user, std::string password, std::function<void(account, std::string)> done) override
     {
-        done(user == "u" && password == "p", user);
+        done(user == "u" && password == "p" ? account::yes : user == "x" ? account::unreachable : account::no, user);
     }
     void close() override { closed = true; }
 };

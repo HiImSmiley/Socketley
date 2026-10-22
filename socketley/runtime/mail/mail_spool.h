@@ -39,6 +39,12 @@ struct spool_rcpt
     std::string orcpt;
     // Delivered where its NOTIFY went no further, so a success is this runtime's to report: 1 delivered, 2 relayed.
     uint8_t     report{0};
+    // Its sender was told what became of it, by a report made before the message's end.
+    bool        told{false};
+    // The targets an alias made of it that took the message, which a later try does not send to again, and those
+    // that refused it for good, with why.
+    std::vector<std::string> targets_done;
+    std::vector<std::string> targets_failed;
 };
 
 struct spool_entry
@@ -97,6 +103,10 @@ public:
 
     // A recipient delivered or failed for good, its answer kept.
     void mark(spool_entry& e, size_t rcpt, rcpt_state s, std::string_view why);
+    // One of the targets an alias made of a recipient took the message, or refused it for good.
+    void target_over(spool_entry& e, size_t rcpt, std::string_view addr, bool ok, std::string_view why);
+    // Its sender was told of the recipient.
+    void told(spool_entry& e, size_t rcpt);
     // The next try of what is still waiting.
     void retry(spool_entry& e, uint32_t attempts, int64_t next_ms);
     // Its sender was told the message is late.

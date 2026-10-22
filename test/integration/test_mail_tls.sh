@@ -57,7 +57,7 @@ leaf() { # leaf <file> <name>...: a certificate the CA signs for the names
 leaf dane mx.dane.test
 leaf sts mx.sts.test
 leaf wrong some.other.name
-leaf web mta-sts.sts.test mta-sts.sts2.test mta-sts.sts3.test mta-sts.stt.test
+leaf web mta-sts.sts.test mta-sts.sts2.test mta-sts.sts3.test mta-sts.stt.test mta-sts.slow.test
 spki() { openssl x509 -in "$1" -noout -pubkey | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -c1-64; }
 DANE=$(spki dane.pem)
 OTHER=$(spki wrong.pem)
@@ -77,6 +77,7 @@ python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal \
     sts2.test=MX:10:mx.elsewhere.test mx.elsewhere.test=127.0.0.6 "_mta-sts.sts2.test=TXT:v=STSv1; id=one" \
     sts3.test=MX:10:mx.sts3.test mx.sts3.test=127.0.0.7 "_mta-sts.sts3.test=TXT:v=STSv1; id=one" \
     stt.test=MX:10:mx.stt.test mx.stt.test=127.0.0.7 "_mta-sts.stt.test=TXT:v=STSv1; id=one" \
+    slow.test=MX:10:mx.sts.test "_mta-sts.slow.test=TXT:v=STSv1; id=one" \
     >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
@@ -91,9 +92,10 @@ FAKESINK_ADDR=127.0.0.6 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/s6" --tls "
 PIDS+=($!)
 FAKESINK_ADDR=127.0.0.7 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/s7" --tls "$T/wrong.pem" "$T/wrong.key" >/dev/null 2>&1 &
 PIDS+=($!)
-python3 - "$WEB" "$T/web.pem" "$T/web.key" >/dev/null 2>&1 <<'PY' &
-import http.server, ssl, sys
+python3 - "$WEB" "$T/web.pem" "$T/web.key" "$T/fetches" >/dev/null 2>&1 <<'PY' &
+import http.server, ssl, sys, time
 policies = {
+    "mta-sts.slow.test": "version: STSv1\nmode: enforce\nmx: mx.sts.test\nmax_age: 86400\n",
     "mta-sts.sts.test": "version: STSv1\nmode: enforce\nmx: mx.sts.test\nmax_age: 86400\n",
     "mta-sts.sts2.test": "version: STSv1\nmode: enforce\nmx: mx.sts2.test\nmax_age: 86400\n",
     "mta-sts.sts3.test": "version: STSv1\nmode: enforce\nmx: *.sts3.test\nmax_age: 86400\n",
@@ -101,7 +103,11 @@ policies = {
 }
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        body = policies.get(self.headers.get("Host", "").split(":")[0])
+        host = self.headers.get("Host", "").split(":")[0]
+        with open(sys.argv[4], "a") as f: f.write(host + "\n")
+        # One policy takes two seconds to come, as a slow server's would.
+        if host == "mta-sts.slow.test": time.sleep(2)
+        body = policies.get(host)
         if self.path != "/.well-known/mta-sts.txt" or body is None:
             self.send_response(404); self.end_headers(); return
         self.send_response(200); self.send_header("Content-Type", "text/plain")
@@ -179,6 +185,12 @@ for _ in $(seq 1 30); do [ "${n:-0}" -ge 1 ] && break; n=$(stat_of mail_sts_test
 cache=$(find "$HOME/.local/share" -name mta-sts -path '*/mail/t/*' 2>/dev/null | head -1)
 grep -q '^sts.test one enforce [0-9]* mx.sts.test$' "$cache" 2>/dev/null && ok "a fetched policy is kept for the next start" \
     || bad "a fetched policy is kept for the next start" "$(cat "$cache" 2>&1)"
+
+# A policy that takes its time is fetched once while the mail for its domain waits on it.
+for i in 1 2 3 4 5; do send_to "u$i@slow.test" >/dev/null; done
+for i in 1 2 3 4 5; do at_sink s6 "for u$i@slow.test" >/dev/null || break; done
+check "five messages waiting on a slow policy have it fetched once" "$(grep -c '^mta-sts.slow.test$' "$T/fetches")" "1"
+check "and go once it is there" "$(grep -l 'for u[1-5]@slow.test' "$T"/s6/*.eml 2>/dev/null | wc -l)" "5"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

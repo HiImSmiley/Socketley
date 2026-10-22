@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "mail_account.h"
 #include "mail_spool.h"
 
 class mail_instance;
@@ -19,9 +20,9 @@ public:
     explicit mail_lua(mail_instance& owner) : m_owner(owner) {}
 
     bool wants_rcpt() const;
-    // `done(take)` with the script's answer, `fallback` when it has none.
+    // `done(take)` with the script's answer, `fallback` when it has none, and unreachable where the script failed.
     void rcpt(const std::string& to, const std::string& from, const std::string& peer, const std::string& user,
-              bool fallback, std::function<void(bool)> done);
+              bool fallback, std::function<void(account)> done);
     void message(const spool_entry& e);
 
 private:

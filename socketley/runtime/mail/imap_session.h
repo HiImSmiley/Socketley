@@ -13,6 +13,7 @@
 #include <string_view>
 #include <vector>
 
+#include "mail_account.h"
 #include "imap_store.h"
 
 namespace socketley::mail
@@ -38,7 +39,7 @@ public:
         virtual void start_tls() = 0;
         virtual void close() = 0;
         // A password for `user`; `done(true, name)` signs the session in as `name`, whose mailbox it then reads.
-        virtual void login(std::string user, std::string password, std::function<void(bool, std::string)> done) = 0;
+        virtual void login(std::string user, std::string password, std::function<void(account, std::string)> done) = 0;
         // What came acknowledged at once, for a client whose Nagle holds back a literal's line end until it is.
         virtual void acknowledge() {}
         // A stretch of `bytes` said without copying it, for a body the store holds.

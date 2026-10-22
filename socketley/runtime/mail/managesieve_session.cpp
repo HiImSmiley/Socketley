@@ -229,11 +229,13 @@ void managesieve_session::sign_in(std::string_view b64)
         return;
     }
     m_waiting = true;
-    m_hooks.login(std::move(user), std::move(pass), [this, alive = m_alive](bool good, std::string name) {
+    m_hooks.login(std::move(user), std::move(pass), [this, alive = m_alive](account a, std::string name) {
         if (!*alive)
             return;
         m_waiting = false;
-        if (good)
+        if (a == account::unreachable)
+            no("TRYLATER", "The accounts cannot be checked now");
+        else if (a == account::yes)
         {
             m_user = std::move(name);
             ok("Logged in");

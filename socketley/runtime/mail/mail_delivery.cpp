@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cstring>
+#include <random>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -36,7 +38,8 @@ namespace socketley::mail
 namespace
 {
 
-constexpr uint32_t per_route = 4;
+// Connections to one domain, grown from four to twenty while it takes mail, as Postfix's slow start does.
+constexpr uint32_t per_route_max = 20;
 constexpr size_t all_routes = 128;
 constexpr uint32_t read_bytes = 16384;
 constexpr uint32_t body_chunk = 256u << 10;
@@ -159,13 +162,16 @@ struct delivery::out_conn
     size_t addr_at{0};
     bool resolved{false};
     // What the other side said it does.
-    bool pipelining{false}, starttls{false}, eightbit{false}, utf8{false}, auth_plain{false}, chunking{false},
-        dsn{false};
+    bool pipelining{false}, starttls{false}, eightbit{false}, utf8{false}, auth_plain{false}, auth_login{false},
+        chunking{false}, dsn{false};
+    // Where AUTH LOGIN is: the username sent, then the password.
+    uint8_t login_step{0};
     uint64_t size_max{0};
     std::string in;
     int reply_code{0};
     std::string reply_text;
-    std::deque<std::string> outq;
+    // What goes out, each piece held by the write in flight too, so a connection closed under it frees nothing.
+    std::deque<std::shared_ptr<const std::string>> outq;
     size_t out_off{0};
     bool writing{false};
     // The message it carries, the commands not yet sent where there is no pipelining, and what each reply answers.
@@ -265,20 +271,39 @@ bool delivery::start(std::string& why)
             why = "--relay must be smtp:// or smtps://, not " + std::string(url);
             return false;
         }
-        if (const size_t slash = rest.find('/'); slash != std::string_view::npos)
-            rest = rest.substr(0, slash);
+        // Credentials end at the last '@' before the host, and are percent-decoded as a URL's userinfo is.
+        const auto decoded = [](std::string_view v) {
+            std::string out;
+            for (size_t i = 0; i < v.size(); ++i)
+            {
+                const auto hex = [](char ch) { return std::isxdigit(static_cast<unsigned char>(ch)) != 0; };
+                if (v[i] == '%' && i + 2 < v.size() && hex(v[i + 1]) && hex(v[i + 2]))
+                {
+                    out += static_cast<char>(std::stoi(std::string(v.substr(i + 1, 2)), nullptr, 16));
+                    i += 2;
+                }
+                else
+                    out += v[i];
+            }
+            return out;
+        };
         if (const size_t at = rest.rfind('@'); at != std::string_view::npos)
         {
             const std::string_view cred = rest.substr(0, at);
             const size_t colon = cred.find(':');
-            m_relay_user = std::string(cred.substr(0, colon));
-            m_relay_pass = colon == std::string_view::npos ? std::string() : std::string(cred.substr(colon + 1));
+            m_relay_user = decoded(cred.substr(0, colon));
+            m_relay_pass = colon == std::string_view::npos ? std::string() : decoded(cred.substr(colon + 1));
             rest = rest.substr(at + 1);
         }
+        if (const size_t slash = rest.find('/'); slash != std::string_view::npos)
+            rest = rest.substr(0, slash);
         if (const size_t colon = rest.rfind(':'); colon != std::string_view::npos && rest.front() != '[')
         {
-            const std::string port(rest.substr(colon + 1));
-            m_relay_port = static_cast<uint16_t>(std::atoi(port.c_str()));
+            const std::string_view port = rest.substr(colon + 1);
+            unsigned value = 0;
+            const auto r = std::from_chars(port.data(), port.data() + port.size(), value);
+            m_relay_port = r.ec == std::errc() && r.ptr == port.data() + port.size() && value <= 65535
+                               ? static_cast<uint16_t>(value) : 0;
             rest = rest.substr(0, colon);
         }
         m_relay_host = std::string(rest);
@@ -324,9 +349,9 @@ void delivery::on_cqe(struct io_uring_cqe* cqe)
 
 void delivery::schedule(const entry_ptr& e, int64_t at)
 {
-    for (auto it = m_due.begin(); it != m_due.end();)
-        it = it->second == e->id ? m_due.erase(it) : std::next(it);
-    m_due.emplace(at, e->id);
+    if (const auto it = m_due_at.find(e->id); it != m_due_at.end())
+        m_due.erase(it->second);
+    m_due_at[e->id] = m_due.emplace(at, e->id);
 }
 
 void delivery::queued(const entry_ptr& e)
@@ -346,22 +371,29 @@ void delivery::flush(std::string_view id)
 
 void delivery::forget(const std::string& id)
 {
-    for (auto it = m_due.begin(); it != m_due.end();)
-        it = it->second == id ? m_due.erase(it) : std::next(it);
+    if (const auto it = m_due_at.find(id); it != m_due_at.end())
+    {
+        m_due.erase(it->second);
+        m_due_at.erase(it);
+    }
     m_signed.erase(id);
     m_pending_targets.erase(id);
+    m_target_count.erase(id);
 }
 
 void delivery::on_loop_turn()
 {
-    if (m_stopped)
+    // Only the routes the global limit held back are tried again, once a connection is free.
+    if (m_stopped || m_starved.empty() || m_conns.size() >= all_routes)
         return;
     std::vector<std::string> keys;
-    for (auto& [key, r] : m_routes)
-        if (!r.waiting.empty())
-            keys.push_back(key);
+    keys.reserve(m_starved.size());
+    for (const auto& [key, _] : m_starved)
+        keys.push_back(key);
+    m_starved.clear();
     for (const auto& k : keys)
-        pump(m_routes[k]);
+        if (const auto it = m_routes.find(k); it != m_routes.end())
+            pump(it->second);
 }
 
 void delivery::tick(int64_t now)
@@ -372,6 +404,7 @@ void delivery::tick(int64_t now)
     {
         const std::string id = m_due.begin()->second;
         m_due.erase(m_due.begin());
+        m_due_at.erase(id);
         if (const entry_ptr e = m_run.queue().find(id))
             dispatch(e);
     }
@@ -398,7 +431,7 @@ void delivery::tick(int64_t now)
             if (c.state == out_conn::st::quit)
                 conn_close(c);
             else
-                conn_fail(c, "no answer from " + c.host + " in time", c.state <= out_conn::st::greeting);
+                conn_fail(c, "451 4.4.2 no answer from " + c.host + " in time", early_move(c));
         }
 }
 
@@ -411,6 +444,8 @@ void delivery::dispatch(const entry_ptr& e)
     std::map<std::string, item> by_route;
     std::vector<uint32_t>& pending = m_pending_targets[e->id];
     pending.assign(e->rcpts.size(), 0);
+    std::vector<uint32_t>& counts = m_target_count[e->id];
+    counts.assign(e->rcpts.size(), 1);
     std::vector<target> local;
     for (size_t i = 0; i < e->rcpts.size(); ++i)
     {
@@ -448,21 +483,70 @@ void delivery::dispatch(const entry_ptr& e)
             }
             const std::string dom = a.domain.empty() ? (m_run.domains().empty() ? "" : m_run.domains().front())
                                                      : a.domain;
+            // An alias's targets in one of this runtime's domains are followed here, a few aliases deep, to the
+            // mailboxes they name, rather than sent out to come back.
+            const auto expand = [&](const auto& self, const std::string& t, int depth) -> void {
+                address ta;
+                if (t.find('@') != std::string::npos && parse_address(t, ta) && m_run.is_local_domain(ta.domain))
+                {
+                    if (const auto* more = m_run.aliases().find(ta.local, ta.domain); more && depth < 8)
+                    {
+                        for (const auto& x : *more)
+                            self(self, x, depth + 1);
+                        return;
+                    }
+                    if (const route_to rt = m_run.route(ta, e->from.empty()); rt.k == route_to::mailbox)
+                    {
+                        if (std::find(targets.begin(), targets.end(), rt.target) == targets.end())
+                            targets.push_back(rt.target);
+                        return;
+                    }
+                }
+                if (std::find(targets.begin(), targets.end(), t) == targets.end())
+                    targets.push_back(t);
+            };
             if (const auto* t = m_run.aliases().find(a.local, dom))
-                targets = *t;
+                for (const auto& x : *t)
+                    expand(expand, x, 1);
             else
                 targets.push_back(r.target);
         }
         else
             targets.push_back(a.text());
+        counts[i] = static_cast<uint32_t>(targets.size());
+        const spool_rcpt& rc = e->rcpts[i];
+        const auto over = [&rc](const std::string& t) {
+            if (std::find(rc.targets_done.begin(), rc.targets_done.end(), t) != rc.targets_done.end())
+                return true;
+            for (const auto& f : rc.targets_failed)
+                if (f.size() > t.size() && f.starts_with(t) && f.compare(t.size(), 2, ": ") == 0)
+                    return true;
+            return false;
+        };
         for (const auto& t : targets)
         {
+            // A target an earlier try took, or refused for good, is not sent to again.
+            if (targets.size() > 1 && over(t))
+                continue;
+            if (address ta; t.find('@') != std::string::npos && parse_address(t, ta) && m_run.is_local_domain(ta.domain))
+            {
+                // An address of this runtime that is no mailbox, or an alias loop: no one here, and not sent out.
+                const std::string why = "550 5.1.1 " + t + " is no mailbox here";
+                if (targets.size() > 1)
+                    m_run.queue().target_over(*e, i, t, false, why);
+                else
+                    m_run.queue().mark(*e, i, rcpt_state::failed, why);
+                continue;
+            }
             if (t.find('@') != std::string::npos && m_run.suppressed(t))
             {
-                m_run.queue().mark(*e, i, rcpt_state::failed,
-                                   "550 5.1.1 " + t + " bounced before and is not sent to again; `socketley mail " +
-                                       std::string(m_run.owner().get_name()) + " forgive " + t + "` lets it");
-                break;
+                const std::string why = "550 5.1.1 " + t + " bounced before and is not sent to again; `socketley mail " +
+                                        std::string(m_run.owner().get_name()) + " forgive " + t + "` lets it";
+                if (targets.size() > 1)
+                    m_run.queue().target_over(*e, i, t, false, why);
+                else
+                    m_run.queue().mark(*e, i, rcpt_state::failed, why);
+                continue;
             }
             ++pending[i];
             if (t.find('@') == std::string::npos)
@@ -476,6 +560,11 @@ void delivery::dispatch(const entry_ptr& e)
             it.to.push_back({i, t});
         }
     }
+    // A recipient whose every target is over is decided by them now.
+    for (size_t i = 0; i < e->rcpts.size(); ++i)
+        if (e->rcpts[i].state == rcpt_state::waiting && pending[i] == 0 &&
+            (!e->rcpts[i].targets_done.empty() || !e->rcpts[i].targets_failed.empty()))
+            targets_settled(*e, i);
     m_out[e->id] = static_cast<uint32_t>(by_route.size() + local.size());
     if (m_out[e->id] == 0)
     {
@@ -486,11 +575,20 @@ void delivery::dispatch(const entry_ptr& e)
         deliver_local(e, t);
     if (by_route.empty())
         return;
-    sign_then(e, [this, e, by_route = std::move(by_route), alive = m_alive]() mutable {
+    sign_then(e, [this, e, by_route = std::move(by_route), alive = m_alive](bool ok) mutable {
         if (!*alive || m_stopped)
             return;
         for (auto& [key, it] : by_route)
         {
+            if (!ok)
+            {
+                // A message that could not be read to be signed waits, rather than going out unsigned.
+                for (size_t t = 0; t < it.to.size(); ++t)
+                    result(it, t, 451, "451 4.3.0 the message could not be read from the spool to be signed", true);
+                if (--m_out[it.e->id] == 0)
+                    attempt_over(it.e);
+                continue;
+            }
             route& r = m_routes[key];
             r.key = key;
             r.waiting.push_back(std::move(it));
@@ -515,10 +613,15 @@ void delivery::deliver_local(const entry_ptr& e, const target& t)
         settle(550, "550 5.1.1 the mailbox " + t.addr + " is kept nowhere: this runtime has no --storage");
         return;
     }
-    boxes->find(t.addr, [this, it, settle, alive = m_alive](bool found, std::string user, std::string email) {
+    boxes->find(t.addr, [this, it, settle, alive = m_alive](account a, std::string user, std::string email) {
         if (!*alive)
             return;
-        if (!found)
+        if (a == account::unreachable)
+        {
+            settle(451, "451 4.3.0 the accounts cannot be checked now");
+            return;
+        }
+        if (a == account::no)
         {
             settle(550, "550 5.1.1 no mailbox " + it->to[0].addr + " here");
             return;
@@ -532,8 +635,13 @@ void delivery::deliver_local(const entry_ptr& e, const target& t)
             return;
         }
         // What a reader of the mailbox is told of the message's way: who it came from, to whom, and what was checked.
-        std::string head = "Return-Path: <" + e.from + ">\r\nDelivered-To: " + user +
-                           (m_run.domains().empty() ? std::string() : "@" + m_run.domains().front()) + "\r\n";
+        // Delivered-To names the address it came for where that is the user's at one of these domains.
+        std::string to = user + (m_run.domains().empty() ? std::string() : "@" + m_run.domains().front());
+        if (const size_t ri = it->to[0].rcpt; ri < e.rcpts.size())
+            if (address ra; parse_address(e.rcpts[ri].addr, ra) && m_run.is_local_domain(ra.domain) &&
+                            socketley::ascii::iequals(ra.local, user))
+                to = ra.text();
+        std::string head = "Return-Path: <" + e.from + ">\r\nDelivered-To: " + to + "\r\n";
         if (!e.auth.empty())
             head += "Authentication-Results: " + m_run.hostname() + "; " + e.auth + "\r\n";
         // The user's Sieve script decides where it goes, where they have one active.
@@ -667,6 +775,10 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
                 std::string folder = a.k == sieve::action::kind::keep ? inbox : a.arg;
                 if (!folder_ok(folder))
                     folder = inbox;
+                // INBOX is one name whatever its case (RFC 3501 5.1), and the one IMAP lists.
+                if (socketley::ascii::iequals(std::string_view(folder).substr(0, 5), "inbox") &&
+                    (folder.size() == 5 || folder[5] == '/'))
+                    folder.replace(0, 5, "INBOX");
                 // Two actions into one folder are one copy, its flags those of both.
                 auto f = std::find_if(puts.begin(), puts.end(), [&](const put_to& p) { return p.folder == folder; });
                 if (f == puts.end())
@@ -709,9 +821,9 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
         if (puts.empty())
             puts.push_back({inbox, 0});
     }
-    // Sent on once the copies kept are in for good, so a retry of them sends nothing twice.
+    // Sent on once the copies kept are in, so a retry of them sends nothing twice and a refusal sends nothing on.
     const auto then = [this, e, own, redirects, settle, kept = !puts.empty()](int code, const std::string& text) {
-        if (redirects.empty() || code / 100 == 4)
+        if (redirects.empty() || code / 100 != 2)
         {
             settle(code, text);
             return;
@@ -797,40 +909,50 @@ void delivery::vacation(const std::string& own, const sieve::vacation& v, std::s
     m_run.queue_message("", {v.to}, std::move(msg), true, {}, [](bool, std::string) {});
 }
 
+void delivery::fail_waiting(route& r, int code, const std::string& text, bool temporary)
+{
+    while (!r.waiting.empty())
+    {
+        item it = std::move(r.waiting.front());
+        r.waiting.pop_front();
+        for (size_t t = 0; t < it.to.size(); ++t)
+            result(it, t, code, text, temporary);
+        if (--m_out[it.e->id] == 0)
+            attempt_over(it.e);
+    }
+}
+
 void delivery::pump(route& r)
 {
     if (m_stopped || r.waiting.empty())
         return;
-    if (!r.dead.empty())
-    {
-        while (!r.waiting.empty())
-        {
-            item it = std::move(r.waiting.front());
-            r.waiting.pop_front();
-            for (size_t t = 0; t < it.to.size(); ++t)
-                result(it, t, 550, r.dead, false);
-            if (--m_out[it.e->id] == 0)
-                attempt_over(it.e);
-        }
-        return;
-    }
     const int64_t now = wall::now_ms_coarse();
-    if (!r.looked || now - r.looked_ms > lookup_ms)
+    // A domain found dead is asked again after ten minutes, a live one's exchangers after an hour.
+    static const int64_t dead_ms = settings::number<int64_t>("SOCKETLEY_MAIL_DEAD_DOMAIN_MS").value_or(600000);
+    if (!r.looked || now - r.looked_ms > (r.dead.empty() ? lookup_ms : dead_ms))
     {
-        lookup(r);
+        // Live exchangers serve while they are asked again; a dead answer does not.
+        if (!r.dead.empty())
+            r.looked = false;
+        if (!r.looking)
+            lookup(r);
         if (!r.looked)
             return;
+    }
+    if (!r.dead.empty())
+    {
+        fail_waiting(r, std::atoi(r.dead.c_str()), r.dead, false);
+        return;
     }
     if (!m_relay)
     {
         if (r.sts_state == 2 && now - r.sts_ms > lookup_ms)
             r.sts_state = 0;
-        if (r.sts_state != 2)
-        {
+        // A policy's record asked or its fetch out is waited for, never asked again meanwhile.
+        if (r.sts_state == 0)
             sts_check(r);
-            if (r.sts_state != 2)
-                return;
-        }
+        if (r.sts_state != 2)
+            return;
         // Under an enforced policy only the exchangers it names are tried, and with none of them nothing is sent.
         if (const tls_policy::sts* p = sts_for(r.key); p && p->mode == tls_policy::sts_mode::enforce)
         {
@@ -841,16 +963,7 @@ void delivery::pump(route& r)
             }
             if (r.hosts.empty())
             {
-                while (!r.waiting.empty())
-                {
-                    item it = std::move(r.waiting.front());
-                    r.waiting.pop_front();
-                    for (size_t t = 0; t < it.to.size(); ++t)
-                        result(it, t, 451, "451 4.7.0 no exchanger of " + r.key + " is one its MTA-STS policy names",
-                               true);
-                    if (--m_out[it.e->id] == 0)
-                        attempt_over(it.e);
-                }
+                fail_waiting(r, 451, "451 4.7.0 no exchanger of " + r.key + " is one its MTA-STS policy names", true);
                 return;
             }
         }
@@ -863,9 +976,16 @@ void delivery::pump(route& r)
     for (const uint64_t id : idle)
         if (const auto it = m_conns.find(id); it != m_conns.end() && !r.waiting.empty())
             conn_next(*it->second);
-    // As many connections as messages wait, up to the limits.
-    while (!r.waiting.empty() && r.active < per_route && m_conns.size() < all_routes && r.active < r.waiting.size())
+    // As many connections as messages wait, up to the route's limit and the runtime's.
+    while (!r.waiting.empty() && r.active < r.limit && r.active < r.waiting.size())
+    {
+        if (m_conns.size() >= all_routes)
+        {
+            m_starved[r.key] = true;
+            return;
+        }
         open_conn(r);
+    }
 }
 
 void delivery::lookup(route& r)
@@ -894,6 +1014,7 @@ void delivery::lookup(route& r)
         rt.looked_ms = wall::now_ms_coarse();
         ++m_lookups;
         rt.hosts.clear();
+        rt.dead.clear();
         if (no_domain)
         {
             rt.dead = "550 5.1.2 the domain " + rt.key + " does not exist";
@@ -905,7 +1026,10 @@ void delivery::lookup(route& r)
             rt.hosts.push_back(rt.key);
             return;
         }
-        std::sort(rs.begin(), rs.end(), [](const auto& a, const auto& b) { return a.pref < b.pref; });
+        // Exchangers of one preference are tried in an order of chance, so the load spreads (RFC 5321 5.1).
+        static thread_local std::minstd_rand rng(static_cast<uint32_t>(wall::now_ms() ^ ::getpid()));
+        std::shuffle(rs.begin(), rs.end(), rng);
+        std::stable_sort(rs.begin(), rs.end(), [](const auto& a, const auto& b) { return a.pref < b.pref; });
         if (rs.size() == 1 && (rs[0].text.empty() || rs[0].text == "."))
         {
             rt.dead = "556 5.1.10 the domain " + rt.key + " says it takes no mail";
@@ -948,13 +1072,14 @@ void delivery::lookup(route& r)
                             route& rt = m_routes[key];
                             if (!*ok)
                             {
+                                // An answer that did not come is no answer that there is no MX: the mail waits.
                                 rt.looking = false;
-                                rt.looked = true;
-                                rt.looked_ms = wall::now_ms_coarse() - lookup_ms + 60000;
-                                rt.hosts = {key};
+                                rt.looked = false;
+                                fail_waiting(rt, 451, "451 4.4.3 the exchangers of " + key + " could not be looked up",
+                                             true);
+                                return;
                             }
-                            else
-                                take(rt, std::move(*out), *no);
+                            take(rt, std::move(*out), *no);
                             pump(rt);
                         });
 }
@@ -968,6 +1093,13 @@ void delivery::sts_check(route& r)
     if (st == dns_client::state::pending)
     {
         poll_lookups();
+        return;
+    }
+    if (st == dns_client::state::unsure)
+    {
+        // A record that could not be read says nothing: a cached policy still counts, and it is asked again soon.
+        r.sts_state = 2;
+        r.sts_ms = wall::now_ms_coarse() - lookup_ms + 300000;
         return;
     }
     // One record says the policy's id; none or two say there is none to fetch, and a cached one still counts.
@@ -1127,11 +1259,11 @@ void delivery::poll_lookups()
     });
 }
 
-void delivery::sign_then(const entry_ptr& e, std::function<void()> go)
+void delivery::sign_then(const entry_ptr& e, std::function<void(bool)> go)
 {
     if (!m_key || m_signed.count(e->id) || e->body_len > m_run.owner().get_max_size() + (1u << 20))
     {
-        go();
+        go(true);
         return;
     }
     auto& waiting = m_signing[e->id];
@@ -1140,15 +1272,31 @@ void delivery::sign_then(const entry_ptr& e, std::function<void()> go)
         return;
     auto j = std::make_shared<sign_job>();
     j->e = e;
-    j->data.reserve(e->body_len);
-    sign_read(j);
+    m_signs_waiting.push_back(std::move(j));
+    sign_next();
+}
+
+void delivery::sign_next()
+{
+    // A queue read back at a start is signed a few messages at a time, not every one read into memory at once.
+    while (m_signs_out < 8 && !m_signs_waiting.empty())
+    {
+        auto j = std::move(m_signs_waiting.front());
+        m_signs_waiting.pop_front();
+        ++m_signs_out;
+        if (j->e->body)
+            j->kept = j->e->body;
+        else
+            j->data.reserve(j->e->body_len);
+        sign_read(j);
+    }
 }
 
 void delivery::sign_read(const std::shared_ptr<sign_job>& j)
 {
-    // The message whole, from memory or read back a piece at a time, whether each piece comes at once or later.
+    // The message whole, from memory as it is or read back a piece at a time, each piece at once or later.
     j->looping = true;
-    while (!j->failed && j->data.size() < j->e->body_len)
+    while (!j->kept && !j->failed && j->data.size() < j->e->body_len)
     {
         j->waiting = true;
         m_run.queue().read(j->e, j->data.size(), body_chunk, [this, j, alive = m_alive](bool ok, std::string_view b) {
@@ -1170,29 +1318,39 @@ void delivery::sign_read(const std::shared_ptr<sign_job>& j)
     }
     j->looping = false;
     const std::string id = j->e->id;
-    const std::string dom = j->failed ? std::string() : signing_domain(header_value(header_block(j->data), "From"));
-    if (dom.empty())
-    {
-        // Mail not from one of its domains, or not read back, goes unsigned.
-        m_signed[id];
+    const auto done = [this, id](bool ok) {
+        --m_signs_out;
         auto gos = std::move(m_signing[id]);
         m_signing.erase(id);
         for (auto& g : gos)
-            g();
+            g(ok);
+        sign_next();
+    };
+    if (j->failed)
+    {
+        // Not read back, it is not sent unsigned: it waits for the next try.
+        done(false);
+        return;
+    }
+    const std::string_view whole = j->kept ? std::string_view(*j->kept) : std::string_view(j->data);
+    const std::string dom = signing_domain(header_value(header_block(whole), "From"));
+    if (dom.empty())
+    {
+        // Mail not from one of its domains goes unsigned.
+        m_signed[id];
+        done(true);
         return;
     }
     auto sig = std::make_shared<std::string>();
     m_run.pool().submit(m_run.cpu_lane(), [j, sig, dom, sel = m_selector, key = m_key] {
-                            *sig = dkim::sign(j->data, dom, sel, key.get(), wall::now_ms() / 1000);
+                            const std::string_view w = j->kept ? std::string_view(*j->kept) : std::string_view(j->data);
+                            *sig = dkim::sign(w, dom, sel, key.get(), wall::now_ms() / 1000);
                         },
-                        [this, id, sig, alive = m_alive] {
+                        [this, id, sig, done, alive = m_alive] {
                             if (!*alive)
                                 return;
                             m_signed[id] = std::move(*sig);
-                            auto gos = std::move(m_signing[id]);
-                            m_signing.erase(id);
-                            for (auto& g : gos)
-                                g();
+                            done(true);
                         });
 }
 
@@ -1214,22 +1372,46 @@ std::string delivery::dkim_record() const
 
 // ── Results ─────────────────────────────────────────────────────────────────
 
-void delivery::result(const item& it, size_t t, int code, const std::string& text, bool temporary, uint8_t report)
+void delivery::result(const item& it, size_t t, int code, const std::string& said, bool temporary, uint8_t report)
 {
     const size_t i = it.to[t].rcpt;
     spool_entry& e = *it.e;
     if (i >= e.rcpts.size() || e.rcpts[i].state != rcpt_state::waiting)
         return;
+    // A remote reply's lines are one line here, as the log, the report and `show` take them.
+    std::string text = said;
+    for (char& ch : text)
+        if (ch == '\n' || ch == '\r')
+            ch = ' ';
+    const auto count = m_target_count.find(e.id);
+    const uint32_t targets = count != m_target_count.end() && i < count->second.size() ? count->second[i] : 1;
+    if (code / 100 == 2 && report && (e.rcpts[i].notify & notify_success))
+        e.rcpts[i].report = std::max(e.rcpts[i].report, report);
+    if (targets > 1)
+    {
+        // Each target an alias made is over on its own, and the recipient once they all are.
+        if (code / 100 == 2)
+        {
+            ++m_delivered;
+            m_run.queue().target_over(e, i, it.to[t].addr, true, {});
+        }
+        else if (temporary)
+        {
+            ++m_deferred;
+            e.rcpts[i].why = it.to[t].addr + ": " + text;
+        }
+        else
+        {
+            ++m_failed;
+            m_run.queue().target_over(e, i, it.to[t].addr, false, text);
+        }
+        if (e.rcpts[i].targets_done.size() + e.rcpts[i].targets_failed.size() >= targets)
+            targets_settled(e, i);
+        return;
+    }
     if (code / 100 == 2)
     {
-        auto& pending = m_pending_targets[e.id];
-        if (i < pending.size() && pending[i] > 0 && --pending[i] > 0)
-            return;
         ++m_delivered;
-        // A success asked to be told is this runtime's to tell where it went no further, or where the next hop
-        // could not be asked to.
-        if (report && (e.rcpts[i].notify & notify_success))
-            e.rcpts[i].report = report;
         m_run.queue().mark(e, i, rcpt_state::delivered, text);
         return;
     }
@@ -1241,6 +1423,21 @@ void delivery::result(const item& it, size_t t, int code, const std::string& tex
     }
     ++m_failed;
     m_run.queue().mark(e, i, rcpt_state::failed, (it.to[t].addr != e.rcpts[i].addr ? it.to[t].addr + ": " : "") + text);
+}
+
+void delivery::targets_settled(spool_entry& e, size_t i)
+{
+    const spool_rcpt& r = e.rcpts[i];
+    if (r.targets_failed.empty())
+    {
+        m_run.queue().mark(e, i, rcpt_state::delivered,
+                           "250 2.0.0 delivered to its " + std::to_string(r.targets_done.size()) + " targets");
+        return;
+    }
+    std::string why;
+    for (const auto& f : r.targets_failed)
+        why += (why.empty() ? "" : "; ") + f;
+    m_run.queue().mark(e, i, rcpt_state::failed, why);
 }
 
 void delivery::attempt_over(const entry_ptr& e)
@@ -1257,7 +1454,7 @@ void delivery::attempt_over(const entry_ptr& e)
         for (size_t i = 0; i < e->rcpts.size(); ++i)
             if (e->rcpts[i].state == rcpt_state::waiting)
                 m_run.queue().mark(*e, i, rcpt_state::failed,
-                                   "given up after " + std::to_string(e->attempts + 1) + " tries: " +
+                                   "550 5.4.7 given up after " + std::to_string(e->attempts + 1) + " tries: " +
                                        (e->rcpts[i].why.empty() ? std::string("no answer") : e->rcpts[i].why));
         finished(e);
         return;
@@ -1272,8 +1469,17 @@ void delivery::attempt_over(const entry_ptr& e)
         if (asked)
         {
             m_run.queue().delay_told(*e);
-            report(e, true);
+            report(e, report_kind::delay);
         }
+    }
+    // What failed for good is told now, not once the recipients still waiting are over, as Postfix tells it.
+    if (!e->bounce && !e->from.empty())
+    {
+        bool tell = false;
+        for (const auto& r : e->rcpts)
+            tell = tell || (r.state == rcpt_state::failed && !r.told && reported(r, false));
+        if (tell)
+            report(e, report_kind::partial);
     }
     constexpr size_t n = std::size(retry_delays);
     const uint32_t delay = retry_delays[std::min<size_t>(e->attempts, n - 1)];
@@ -1285,12 +1491,13 @@ void delivery::finished(const entry_ptr& e)
 {
     bool told = false;
     for (const auto& r : e->rcpts)
-        told = told || reported(r, false);
+        told = told || (!r.told && reported(r, false));
     m_signed.erase(e->id);
     m_pending_targets.erase(e->id);
+    m_target_count.erase(e->id);
     if (told && !e->bounce && !e->from.empty())
     {
-        report(e, false);
+        report(e, report_kind::final);
         return;
     }
     m_run.queue().remove(e->id);
@@ -1306,12 +1513,13 @@ bool delivery::reported(const spool_rcpt& r, bool delay)
     return r.state == rcpt_state::delivered && r.report;
 }
 
-void delivery::report(const entry_ptr& e, bool delay)
+void delivery::report(const entry_ptr& e, report_kind kind)
 {
+    const bool delay = kind == report_kind::delay;
     // The whole message under RET=FULL, up to a few mebibytes; its header otherwise, as RET=HDRS or no RET says.
     const bool full = e->ret == 1 && e->body_len <= (4u << 20);
     const uint32_t want = static_cast<uint32_t>(full ? e->body_len : std::min<uint64_t>(e->body_len, 65536));
-    m_run.queue().read(e, 0, want, [this, e, delay, full, alive = m_alive](bool ok, std::string_view got) {
+    m_run.queue().read(e, 0, want, [this, e, kind, delay, full, alive = m_alive](bool ok, std::string_view got) {
         if (!*alive)
             return;
         const std::string host = m_run.hostname();
@@ -1319,10 +1527,20 @@ void delivery::report(const entry_ptr& e, bool delay)
         const int64_t now = wall::now_ms();
         std::string text, status;
         bool failed = false;
-        for (const auto& r : e->rcpts)
+        // A value a sender gave is put into a header only as one line of printable text.
+        const auto clean = [](std::string_view v) {
+            std::string out;
+            for (const unsigned char ch : v.substr(0, 1000))
+                out += ch < 0x20 || ch == 0x7f ? ' ' : static_cast<char>(ch);
+            return out;
+        };
+        std::vector<size_t> included;
+        for (size_t ri = 0; ri < e->rcpts.size(); ++ri)
         {
-            if (!reported(r, delay))
+            const spool_rcpt& r = e->rcpts[ri];
+            if (!reported(r, delay) || (!delay && r.told) || (kind == report_kind::partial && r.state != rcpt_state::failed))
                 continue;
+            included.push_back(ri);
             std::string action, code;
             if (delay)
             {
@@ -1355,12 +1573,13 @@ void delivery::report(const entry_ptr& e, bool delay)
             {
                 const size_t semi = r.orcpt.find(';');
                 std::string plain;
-                if (xtext_decode(std::string_view(r.orcpt).substr(semi + 1), plain))
-                    status += "Original-Recipient: " + r.orcpt.substr(0, semi) + "; " + plain + "\r\n";
+                if (semi != std::string::npos && xtext_decode(std::string_view(r.orcpt).substr(semi + 1), plain))
+                    status += "Original-Recipient: " + clean(r.orcpt.substr(0, semi)) + "; " + clean(plain) + "\r\n";
             }
-            status += "Final-Recipient: rfc822; " + r.addr + "\r\nAction: " + action + "\r\nStatus: " + code + "\r\n";
+            status += "Final-Recipient: rfc822; " + clean(r.addr) + "\r\nAction: " + action + "\r\nStatus: " + code +
+                      "\r\n";
             if (!r.why.empty() && action != "delivered")
-                status += "Diagnostic-Code: smtp; " + r.why + "\r\n";
+                status += "Diagnostic-Code: smtp; " + clean(r.why) + "\r\n";
             if (delay)
                 status += "Will-Retry-Until: " +
                           rfc5322_date(e->at_ms + static_cast<int64_t>(m_run.owner().get_queue_lifetime()) * 1000) +
@@ -1374,7 +1593,7 @@ void delivery::report(const entry_ptr& e, bool delay)
                                           "Your message was delivered to the recipients below:";
         std::string envid;
         if (!e->envid.empty() && xtext_decode(e->envid, envid))
-            envid = "Original-Envelope-Id: " + envid + "\r\n";
+            envid = "Original-Envelope-Id: " + clean(envid) + "\r\n";
         else
             envid.clear();
         const std::string enclosed = !ok ? std::string() : full ? std::string(got) : std::string(header_block(got));
@@ -1393,14 +1612,26 @@ void delivery::report(const entry_ptr& e, bool delay)
             ++m_bounced;
         else
             ++m_reports;
-        m_run.queue_message("", {e->from}, std::move(msg), true, {}, [this, e, delay, alive](bool ok, std::string) {
-            if (!*alive || delay)
+        if (included.empty())
+        {
+            if (kind == report_kind::final)
+                m_run.queue().remove(e->id);
+            return;
+        }
+        m_run.queue_message("", {e->from}, std::move(msg), true, {},
+                            [this, e, kind, included, alive](bool ok, std::string) {
+            if (!*alive || kind == report_kind::delay)
                 return;
             if (ok)
             {
-                m_run.queue().remove(e->id);
+                for (const size_t ri : included)
+                    m_run.queue().told(*e, ri);
+                if (kind == report_kind::final)
+                    m_run.queue().remove(e->id);
                 return;
             }
+            if (kind == report_kind::partial)
+                return;
             // A report the spool would not take is made again later, and the message kept until it is.
             LOG_WARN(("mail: the report on " + e->id + " could not be queued, and is tried again").c_str());
             const int64_t next = wall::now_ms_coarse() + 300000;
@@ -1497,8 +1728,9 @@ void delivery::conn_connect(out_conn& c)
         {
             if (c.host_at >= r.hosts.size())
             {
-                conn_fail(c, c.last_error.empty() ? "no exchanger of " + r.key + " could be reached" : c.last_error,
-                          false);
+                conn_fail(c, c.last_error.empty() ? "451 4.4.1 no exchanger of " + r.key + " could be reached"
+                                                  : c.last_error,
+                          move_on::none);
                 return;
             }
             c.host = r.hosts[c.host_at];
@@ -1602,7 +1834,7 @@ void delivery::conn_connect(out_conn& c)
     c.fd = ::socket(ep.addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (c.fd < 0)
     {
-        conn_fail(c, "451 4.3.0 no socket could be made", false);
+        conn_fail(c, "451 4.3.0 no socket could be made", move_on::none);
         return;
     }
     const int one = 1;
@@ -1620,13 +1852,15 @@ void delivery::conn_connect(out_conn& c)
                           if (it != m_conns.end() && it->second->gen == gen)
                               conn_connected(*it->second, res);
                       }))
-        conn_fail(c, "451 4.3.0 the ring is full", false);
+        conn_fail(c, "451 4.3.0 the ring is full", move_on::none);
 }
 
 void delivery::conn_connected(out_conn& c, int64_t res)
 {
     if (res < 0)
     {
+        if (route& r = m_routes[c.route]; r.limit > 1)
+            r.limit /= 2;
         c.last_error = "451 4.4.1 " + c.host + " refused the connection: " + std::strerror(static_cast<int>(-res));
         ::close(c.fd);
         c.fd = -1;
@@ -1640,14 +1874,14 @@ void delivery::conn_connected(out_conn& c, int64_t res)
         c.ssl = m_tls ? m_tls->create_ssl_client(c.host) : nullptr;
         if (!c.ssl)
         {
-            conn_fail(c, "451 4.7.0 no TLS session could be made for " + c.host, false);
+            conn_fail(c, "451 4.7.0 no TLS session could be made for " + c.host, move_on::none);
             return;
         }
         c.state = out_conn::st::handshake;
         tls_context::do_handshake(c.ssl);
         std::string hello;
         tls_context::take_out(c.ssl, hello);
-        c.outq.push_back(std::move(hello));
+        c.outq.push_back(std::make_shared<const std::string>(std::move(hello)));
         conn_write(c);
     }
     else
@@ -1671,14 +1905,14 @@ void delivery::conn_receive(out_conn& c)
                 if (c.state == out_conn::st::quit)
                     conn_close(c);
                 else
-                    conn_fail(c, "451 4.4.2 " + c.host + " closed the connection", c.state <= out_conn::st::greeting);
+                    conn_fail(c, "451 4.4.2 " + c.host + " closed the connection", early_move(c));
                 return;
             }
             conn_got(c, buf.get(), static_cast<size_t>(res));
             if (m_conns.count(id) && m_conns[id]->gen == gen)
                 conn_receive(*m_conns[id]);
         }))
-        conn_fail(c, "451 4.3.0 the ring is full", false);
+        conn_fail(c, "451 4.3.0 the ring is full", move_on::none);
 }
 
 void delivery::conn_got(out_conn& c, const char* p, size_t n)
@@ -1692,7 +1926,7 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
     {
         if (tls_context::bio_write_in(c.ssl, p, static_cast<int>(n)) < 0)
         {
-            conn_fail(c, "451 4.7.0 the TLS record layer took no more", false);
+            conn_fail(c, "451 4.7.0 the TLS record layer took no more", early_move(c));
             return;
         }
         if (!c.handshaken)
@@ -1702,7 +1936,7 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
             tls_context::take_out(c.ssl, out);
             if (!out.empty())
             {
-                c.outq.push_back(std::move(out));
+                c.outq.push_back(std::make_shared<const std::string>(std::move(out)));
                 conn_write(c);
             }
             if (r < 0)
@@ -1712,7 +1946,7 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
                                  (v != X509_V_OK ? std::string(": ") + X509_verify_cert_error_string(v) +
                                                    (c.dane ? ", against its TLSA records" : "")
                                                  : std::string()),
-                          !c.after_starttls);
+                          m_relay ? move_on::none : move_on::host);
                 return;
             }
             if (r == 0)
@@ -1751,7 +1985,7 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
             {
                 if (r < 0)
                 {
-                    conn_fail(c, "451 4.7.0 TLS failed on the connection to " + c.host, false);
+                    conn_fail(c, "451 4.7.0 TLS failed on the connection to " + c.host, early_move(c));
                     return;
                 }
                 break;
@@ -1761,6 +1995,12 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
     }
     else
         c.in.append(p, n);
+    // A reply longer than any server sends is no reply: what it said is not held without bound.
+    if (c.in.size() > (64u << 10) && c.in.find('\n') == std::string::npos)
+    {
+        conn_fail(c, "451 4.4.2 " + c.host + " sent a line longer than 64 KiB", move_on::none);
+        return;
+    }
     size_t at = 0;
     while (live())
     {
@@ -1778,6 +2018,11 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
         if (!c.reply_text.empty())
             c.reply_text += '\n';
         c.reply_text += std::string(line.substr(std::min<size_t>(line.size(), 4)));
+        if (c.reply_text.size() > (64u << 10))
+        {
+            conn_fail(c, "451 4.4.2 " + c.host + " sent a reply longer than 64 KiB", move_on::none);
+            return;
+        }
         if (more)
             continue;
         std::string text = std::move(c.reply_text);
@@ -1803,16 +2048,30 @@ void delivery::conn_send(out_conn& c, std::string bytes)
         }
         std::string out;
         tls_context::take_out(c.ssl, out);
-        c.outq.push_back(std::move(out));
+        c.outq.push_back(std::make_shared<const std::string>(std::move(out)));
+        if (off < bytes.size())
+        {
+            // What TLS would not take is no message cut short: the connection fails, after the caller is done with it.
+            const uint64_t id = c.id, gen = c.gen;
+            if (!m_io.after(std::chrono::milliseconds(0), [this, id, gen, alive = m_alive](int64_t) {
+                    if (!*alive)
+                        return;
+                    const auto it = m_conns.find(id);
+                    if (it != m_conns.end() && it->second->gen == gen)
+                        conn_fail(*it->second, "451 4.7.0 TLS took no more on the connection to " + it->second->host,
+                                  move_on::none);
+                })) {}
+            return;
+        }
     }
     else
-        c.outq.push_back(std::move(bytes));
+        c.outq.push_back(std::make_shared<const std::string>(std::move(bytes)));
     conn_write(c);
 }
 
 void delivery::conn_write(out_conn& c)
 {
-    while (!c.writing && !c.outq.empty() && c.outq.front().size() == c.out_off)
+    while (!c.writing && !c.outq.empty() && c.outq.front()->size() == c.out_off)
     {
         c.outq.pop_front();
         c.out_off = 0;
@@ -1825,10 +2084,10 @@ void delivery::conn_write(out_conn& c)
         return;
     }
     c.writing = true;
-    const std::string& b = c.outq.front();
+    std::shared_ptr<const std::string> b = c.outq.front();
     const uint64_t id = c.id, gen = c.gen;
-    if (!m_io.pwrite(c.fd, b.data() + c.out_off, static_cast<uint32_t>(b.size() - c.out_off), file_io::at_stream,
-                     [this, id, gen, alive = m_alive](int64_t res) {
+    if (!m_io.pwrite(c.fd, b->data() + c.out_off, static_cast<uint32_t>(b->size() - c.out_off), file_io::at_stream,
+                     [this, id, gen, b, alive = m_alive](int64_t res) {
                          if (!*alive)
                              return;
                          const auto it = m_conns.find(id);
@@ -1838,7 +2097,7 @@ void delivery::conn_write(out_conn& c)
                          c.writing = false;
                          if (res <= 0)
                          {
-                             conn_fail(c, "451 4.4.2 the connection to " + c.host + " broke", false);
+                             conn_fail(c, "451 4.4.2 the connection to " + c.host + " broke", early_move(c));
                              return;
                          }
                          c.out_off += static_cast<size_t>(res);
@@ -1846,7 +2105,7 @@ void delivery::conn_write(out_conn& c)
                      }))
     {
         c.writing = false;
-        conn_fail(c, "451 4.3.0 the ring is full", false);
+        conn_fail(c, "451 4.3.0 the ring is full", move_on::none);
     }
 }
 
@@ -1861,7 +2120,9 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
         case st::greeting:
             if (code != 220)
             {
-                conn_fail(c, "451 4.4.0 " + c.host + " greeted with " + said, true);
+                // A refusal at the door keeps its class: the next exchanger is tried, and a 5xx from the last is final.
+                conn_fail(c, (code / 100 == 5 ? "554 5.4.0 " : "451 4.4.0 ") + c.host + " greeted with " + said,
+                          move_on::host);
                 return;
             }
             c.state = st::ehlo;
@@ -1882,7 +2143,8 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                     conn_send(c, "HELO " + m_run.hostname() + "\r\n");
                     return;
                 }
-                conn_fail(c, "451 4.4.0 " + c.host + " refused HELO: " + said, true);
+                conn_fail(c, (code / 100 == 5 ? "554 5.4.0 " : "451 4.4.0 ") + c.host + " refused HELO: " + said,
+                          move_on::host);
                 return;
             }
             if (c.state == st::ehlo)
@@ -1908,7 +2170,18 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                     else if (line.starts_with("size"))
                         c.size_max = static_cast<uint64_t>(std::atoll(line.c_str() + 4));
                     else if (line.starts_with("auth ") || line.starts_with("auth="))
-                        c.auth_plain = line.find("plain") != std::string::npos;
+                    {
+                        // The mechanisms are words of the line, not parts of others such as XPLAIN.
+                        std::string_view words = std::string_view(line).substr(5);
+                        while (!words.empty())
+                        {
+                            const size_t sp = words.find(' ');
+                            const std::string_view w = words.substr(0, sp);
+                            c.auth_plain = c.auth_plain || w == "plain";
+                            c.auth_login = c.auth_login || w == "login";
+                            words = sp == std::string_view::npos ? std::string_view{} : words.substr(sp + 1);
+                        }
+                    }
                 }
             }
             const bool loopback = c.host == "localhost" || c.host.starts_with("127.") || c.host == "::1";
@@ -1924,7 +2197,7 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                 ++m_tls_refused;
                 conn_fail(c, "451 4.7.5 " + c.host + " offers no STARTTLS, which " +
                                  (c.dane ? "its TLSA records" : "the MTA-STS policy of " + c.route) + " require",
-                          false);
+                          move_on::host);
                 return;
             }
             if (m_relay && !m_relay_user.empty())
@@ -1932,10 +2205,21 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                 if (!c.ssl && !loopback)
                 {
                     conn_fail(c, "451 4.7.0 the relay " + c.host + " offers no TLS, and its password is not sent "
-                                 "in the clear", false);
+                                 "in the clear", move_on::none);
+                    return;
+                }
+                if (!c.auth_plain && !c.auth_login)
+                {
+                    conn_fail(c, "451 4.7.0 the relay " + c.host + " offers neither AUTH PLAIN nor LOGIN", move_on::none);
                     return;
                 }
                 c.state = st::auth;
+                if (!c.auth_plain)
+                {
+                    c.login_step = 1;
+                    conn_send(c, "AUTH LOGIN\r\n");
+                    return;
+                }
                 std::string plain;
                 plain += '\0';
                 plain += m_relay_user;
@@ -1954,7 +2238,7 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                 if (c.dane || c.sts == tls_policy::sts_mode::enforce)
                 {
                     ++m_tls_refused;
-                    conn_fail(c, "451 4.7.5 " + c.host + " refused STARTTLS: " + said, false);
+                    conn_fail(c, "451 4.7.5 " + c.host + " refused STARTTLS: " + said, move_on::host);
                     return;
                 }
                 // Refused: the mail goes in the clear, as it would to a server that never offered TLS.
@@ -1966,7 +2250,7 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
             c.ssl = m_tls->create_ssl_client(c.host);
             if (!c.ssl)
             {
-                conn_fail(c, "451 4.7.0 no TLS session could be made for " + c.host, false);
+                conn_fail(c, "451 4.7.0 no TLS session could be made for " + c.host, move_on::none);
                 return;
             }
             // An exchanger's certificate is checked against its TLSA records where there are usable ones, against
@@ -1983,7 +2267,7 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                                                            t.data.size()) > 0;
                     if (!added)
                     {
-                        conn_fail(c, "451 4.7.5 the TLSA records of " + c.host + " could not be used", false);
+                        conn_fail(c, "451 4.7.5 the TLSA records of " + c.host + " could not be used", move_on::host);
                         return;
                     }
                 }
@@ -1996,14 +2280,21 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                 tls_context::do_handshake(c.ssl);
                 std::string hello;
                 tls_context::take_out(c.ssl, hello);
-                c.outq.push_back(std::move(hello));
+                c.outq.push_back(std::make_shared<const std::string>(std::move(hello)));
                 conn_write(c);
             }
             return;
         case st::auth:
+            if (code == 334 && (c.login_step == 1 || c.login_step == 2))
+            {
+                conn_send(c, socketley::base64::encode(c.login_step == 1 ? m_relay_user : m_relay_pass) + "\r\n");
+                ++c.login_step;
+                return;
+            }
             if (code != 235)
             {
-                conn_fail(c, "530 5.7.8 the relay " + c.host + " refused the credentials: " + said, false);
+                // Mail waits for credentials a relay refused, as Postfix's soft bounce has it: they may be fixed.
+                conn_fail(c, "454 4.7.0 the relay " + c.host + " refused the credentials: " + said, move_on::none);
                 return;
             }
             c.state = st::ready;
@@ -2019,6 +2310,13 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
             {
                 c.mail_code = code;
                 c.mail_text = said;
+                // A refused MAIL ends the transaction: without pipelining nothing more of it is sent.
+                if (!ok && !c.pipelining)
+                {
+                    c.unsent.clear();
+                    conn_end_item(c, code, said);
+                    return;
+                }
             }
             else if (what == 'R')
             {
@@ -2265,7 +2563,7 @@ void delivery::conn_body(out_conn& c)
         c.reading = false;
         if (!ok || b.empty())
         {
-            conn_fail(c, "451 4.3.0 the message could not be read from the spool", false);
+            conn_fail(c, "451 4.3.0 the message could not be read from the spool", move_on::none);
             return;
         }
         c.body_off += b.size();
@@ -2325,7 +2623,7 @@ void delivery::conn_chunk(out_conn& c)
                                return;
                            if (!ok || b.empty())
                            {
-                               conn_fail(c, "451 4.3.0 the message could not be read from the spool", false);
+                               conn_fail(c, "451 4.3.0 the message could not be read from the spool", move_on::none);
                                return;
                            }
                            c.body_off += b.size();
@@ -2343,14 +2641,24 @@ void delivery::conn_end_item(out_conn& c, int code, const std::string& text)
     {
         int rc = code;
         std::string rt = text;
-        // A recipient its RCPT refused keeps that answer, whatever the end of the data was answered.
-        if (t < c.rcpt_code.size() && c.rcpt_code[t] && c.rcpt_code[t] / 100 != 2)
+        // A recipient its RCPT refused keeps that answer, whatever the end of the data was answered; under a refused
+        // MAIL the RCPTs were answered for want of one, and MAIL's answer is every recipient's.
+        if (c.mail_code / 100 != 2 && c.mail_code)
+        {
+            rc = c.mail_code;
+            rt = c.mail_text;
+        }
+        else if (t < c.rcpt_code.size() && c.rcpt_code[t] && c.rcpt_code[t] / 100 != 2)
         {
             rc = c.rcpt_code[t];
             rt = c.rcpt_text[t];
         }
         result(*it, t, rc, rt.empty() ? std::to_string(rc) : rt, rc / 100 == 4 || rc == 0, c.dsn ? 0 : 2);
     }
+    // A domain that takes its mail is given more connections, up to the most.
+    if (data_answered && code / 100 == 2)
+        if (route& r = m_routes[c.route]; r.limit < per_route_max)
+            ++r.limit;
     if (--m_out[it->e->id] == 0)
         attempt_over(it->e);
     if (!data_answered && c.state == out_conn::st::transaction)
@@ -2364,10 +2672,18 @@ void delivery::conn_end_item(out_conn& c, int code, const std::string& text)
     conn_next(c);
 }
 
-void delivery::conn_fail(out_conn& c, const std::string& why, bool next_address)
+delivery::move_on delivery::early_move(const out_conn& c)
+{
+    return c.state <= out_conn::st::greeting ? move_on::address
+         : c.state < out_conn::st::ready     ? move_on::host
+                                             : move_on::none;
+}
+
+void delivery::conn_fail(out_conn& c, const std::string& why, move_on next)
 {
     c.last_error = why;
-    if (next_address && c.state <= out_conn::st::greeting)
+    // Before a transaction began the message is no one's yet: the next address or exchanger is tried with it.
+    if (next != move_on::none && c.state < out_conn::st::ready && !m_stopped)
     {
         if (c.ssl)
         {
@@ -2380,7 +2696,10 @@ void delivery::conn_fail(out_conn& c, const std::string& why, bool next_address)
             m_loop.close_fd(c.fd);
             c.fd = -1;
         }
-        c.handshaken = c.after_starttls = false;
+        c.handshaken = c.after_starttls = c.verified = false;
+        c.pipelining = c.starttls = c.eightbit = c.utf8 = c.auth_plain = c.auth_login = c.chunking = c.dsn = false;
+        c.size_max = 0;
+        c.login_step = 0;
         c.in.clear();
         c.reply_text.clear();
         c.outq.clear();
@@ -2388,7 +2707,13 @@ void delivery::conn_fail(out_conn& c, const std::string& why, bool next_address)
         c.writing = false;
         c.expect.clear();
         ++c.gen;
-        ++c.addr_at;
+        if (next == move_on::host)
+        {
+            ++c.host_at;
+            c.resolved = false;
+        }
+        else
+            ++c.addr_at;
         conn_connect(c);
         return;
     }

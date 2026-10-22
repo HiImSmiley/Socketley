@@ -535,10 +535,12 @@ void imap_session::run()
 void imap_session::sign_in(const std::string& tag, std::string user, std::string password)
 {
     m_waiting = true;
-    m_hooks.login(std::move(user), std::move(password), [this, alive = m_alive, tag](bool ok, std::string name) {
+    m_hooks.login(std::move(user), std::move(password), [this, alive = m_alive, tag](account a, std::string name) {
         if (!*alive)
             return;
-        if (ok)
+        if (a == account::unreachable)
+            finish(tag, "NO", "[UNAVAILABLE] The accounts cannot be checked now");
+        else if (a == account::yes)
         {
             m_user = std::move(name);
             m_state = state::auth;

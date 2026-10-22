@@ -433,6 +433,12 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
                 e.rcpts[i].state = kind == 'd' ? rcpt_state::delivered : rcpt_state::failed;
                 e.rcpts[i].why = b == std::string_view::npos ? std::string() : std::string(line.substr(b + 1));
             }
+            else if (kind == 'b' && number(line.substr(0, b), i) && i < e.rcpts.size())
+                e.rcpts[i].told = true;
+            else if ((kind == 't' || kind == 'u') && b != std::string_view::npos && number(line.substr(0, b), i) &&
+                     i < e.rcpts.size())
+                (kind == 't' ? e.rcpts[i].targets_done : e.rcpts[i].targets_failed)
+                    .push_back(std::string(line.substr(b + 1)));
         }
     }
     for (const auto& id : dropped)
@@ -455,9 +461,18 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
         if (e->delay_told)
             compact += id + " w\n";
         for (size_t i = 0; i < e->rcpts.size(); ++i)
-            if (e->rcpts[i].state != rcpt_state::waiting)
-                compact += id + (e->rcpts[i].state == rcpt_state::delivered ? " d " : " f ") + std::to_string(i) +
-                           " " + one_line(e->rcpts[i].why) + "\n";
+        {
+            const spool_rcpt& r = e->rcpts[i];
+            if (r.state != rcpt_state::waiting)
+                compact += id + (r.state == rcpt_state::delivered ? " d " : " f ") + std::to_string(i) + " " +
+                           one_line(r.why) + "\n";
+            if (r.told)
+                compact += id + " b " + std::to_string(i) + "\n";
+            for (const auto& t : r.targets_done)
+                compact += id + " t " + std::to_string(i) + " " + t + "\n";
+            for (const auto& t : r.targets_failed)
+                compact += id + " u " + std::to_string(i) + " " + t + "\n";
+        }
     }
     for (const auto& id : over)
     {
@@ -1100,6 +1115,24 @@ void spool::mark(spool_entry& e, size_t rcpt, rcpt_state s, std::string_view why
     e.rcpts[rcpt].state = s;
     e.rcpts[rcpt].why = one_line(why);
     log(e.id + (s == rcpt_state::delivered ? " d " : " f ") + std::to_string(rcpt) + " " + e.rcpts[rcpt].why + "\n");
+}
+
+void spool::target_over(spool_entry& e, size_t rcpt, std::string_view addr, bool ok, std::string_view why)
+{
+    if (rcpt >= e.rcpts.size())
+        return;
+    // A refused target keeps its answer beside it, so the report can say which of an alias's targets failed.
+    const std::string word = one_line(ok ? addr : std::string(addr) + ": " + std::string(why));
+    (ok ? e.rcpts[rcpt].targets_done : e.rcpts[rcpt].targets_failed).push_back(word);
+    log(e.id + (ok ? " t " : " u ") + std::to_string(rcpt) + " " + word + "\n");
+}
+
+void spool::told(spool_entry& e, size_t rcpt)
+{
+    if (rcpt >= e.rcpts.size() || e.rcpts[rcpt].told)
+        return;
+    e.rcpts[rcpt].told = true;
+    log(e.id + " b " + std::to_string(rcpt) + "\n");
 }
 
 void spool::retry(spool_entry& e, uint32_t attempts, int64_t next_ms)

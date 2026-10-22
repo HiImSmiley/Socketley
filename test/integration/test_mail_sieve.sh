@@ -82,6 +82,7 @@ if address :is "from" "pest@remote.test" { reject "Not from you"; stop; }
 if header :contains "subject" "share" { redirect :copy "friend@remote.test"; }
 if header :contains "subject" "large" { redirect "big@remote.test"; stop; }
 if header :contains "subject" "twice" { redirect :copy "copy@remote.test"; stop; }
+if header :contains "subject" "lower inbox" { fileinto "inbox"; stop; }
 vacation :days 1 :subject "Away" "I am away until Monday.";
 SIEVE
 python3 - "$SV" "$T/script.sieve" > "$T/ms.out" 2>&1 <<'PY'
@@ -263,6 +264,12 @@ print(grown < 8192, r1[:2].decode(), f.readline()[:2].decode())
 PY
 )
 check "a command of three hundred literals before sign-in is held small, refused, and the next one answered" "$r" "True NO OK"
+
+# INBOX is one name whatever its case, so fileinto "inbox" files where IMAP lists it.
+n0=$(keys INBOX | wc -l)
+send bob@remote.test "lower inbox"
+for _ in $(seq 1 60); do [ "$(keys INBOX | wc -l)" -gt "$n0" ] && break; sleep 0.1; done
+check "fileinto \"inbox\" files into INBOX" "$(keys INBOX | wc -l)" "$((n0 + 1))"
 
 # ─── the CLI ────────────────────────────────────────────────────────────────
 check "socketley mail sieve lists a user's scripts" "$("$BIN" mail m sieve alice list 2>&1)" "main	active"

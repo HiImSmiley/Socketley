@@ -165,7 +165,7 @@ private:
         void reply(std::string_view bytes) override;
         void start_tls() override;
         void authenticate(std::string_view mech, std::string user, std::string secret,
-                          std::function<void(bool, std::string)> done) override;
+                          std::function<void(account, std::string)> done) override;
         void mail_from(const address& from, std::function<void(rcpt_verdict)> done) override;
         void rcpt_to(const address& to, std::function<void(rcpt_verdict)> done) override;
         bool data_begin() override;
@@ -173,7 +173,7 @@ private:
         void data_end(std::function<void(rcpt_verdict)> done) override;
         void data_abort(bool too_big) override;
         void close() override;
-        void login(std::string user, std::string password, std::function<void(bool, std::string)> done) override;
+        void login(std::string user, std::string password, std::function<void(account, std::string)> done) override;
         void acknowledge() override;
         void reply_shared(const std::shared_ptr<const std::string>& bytes, size_t off, size_t len) override;
         size_t backlog() const override { return owed + zplain.size(); }

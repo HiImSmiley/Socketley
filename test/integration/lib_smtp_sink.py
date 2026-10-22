@@ -2,6 +2,10 @@
 # the envelope first ("from <addr>", "rcpt <addr>" lines, "tls 0|1", a blank line) and the data after.
 #   --tls <cert> <key>    offer STARTTLS
 #   --auth <user:pass>    offer AUTH PLAIN, and take mail only from it
+#   --auth-login          offer AUTH LOGIN instead of PLAIN
+#   --auth-code <code>    answer every AUTH with <code> (e.g. 454)
+#   --mail <addr> <code>  answer MAIL FROM <addr> with <code>, once when it ends in "!"
+#   --greet <code>        greet with <code> instead of 220
 #   --reply <addr> <code> answer RCPT for <addr> with <code> (e.g. 550 or 451), once when <code> ends in "!"
 #   --data <code>         answer the end of the data with <code>, once when it ends in "!"
 #   --no-pipelining       leave PIPELINING out of EHLO
@@ -14,11 +18,16 @@ port, out = int(sys.argv[1]), sys.argv[2]
 args = sys.argv[3:]
 tls = auth = None
 replies, data_code, pipelining, chunking, dsn = {}, None, True, False, False
+auth_login, auth_code, mail_replies, greet = False, None, {}, "220"
 i = 0
 while i < len(args):
     a = args[i]
     if a == "--tls": tls = (args[i + 1], args[i + 2]); i += 3
     elif a == "--auth": auth = args[i + 1]; i += 2
+    elif a == "--auth-login": auth_login = True; i += 1
+    elif a == "--auth-code": auth_code = args[i + 1]; i += 2
+    elif a == "--mail": mail_replies[args[i + 1].lower()] = args[i + 2]; i += 3
+    elif a == "--greet": greet = args[i + 1]; i += 2
     elif a == "--reply": replies[args[i + 1].lower()] = args[i + 2]; i += 3
     elif a == "--data": data_code = args[i + 1]; i += 2
     elif a == "--no-pipelining": pipelining = False; i += 1
@@ -39,7 +48,9 @@ def serve(conn):
     f = conn.makefile("rb")
     secure = [False]
     def say(x): conn.sendall(x.encode())
-    say("220 sink ESMTP\r\n")
+    say("%s sink ESMTP\r\n" % greet)
+    if greet != "220":
+        f.readline(); say("221 bye\r\n"); conn.close(); return
     frm, rcpts, authed = None, [], auth is None
     mparams, rparams, chunks = "", [], []
     while True:
@@ -51,7 +62,7 @@ def serve(conn):
             ext = ["sink", "8BITMIME", "SIZE 50000000"]
             if pipelining: ext.append("PIPELINING")
             if tls and not secure[0]: ext.append("STARTTLS")
-            if auth: ext.append("AUTH PLAIN")
+            if auth: ext.append("AUTH LOGIN" if auth_login else "AUTH PLAIN")
             if chunking: ext.append("CHUNKING")
             if dsn: ext.append("DSN")
             say("".join("250-%s\r\n" % e for e in ext[:-1]) + "250 %s\r\n" % ext[-1])
@@ -59,17 +70,28 @@ def serve(conn):
             say("220 go ahead\r\n")
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(*tls)
             conn = ctx.wrap_socket(conn, server_side=True); f = conn.makefile("rb"); secure[0] = True
-        elif v.startswith("AUTH PLAIN"):
-            parts = base64.b64decode(u.split()[2]).split(b"\0")
-            if auth and parts[1].decode() + ":" + parts[2].decode() == auth:
+        elif v.startswith("AUTH PLAIN") or v.startswith("AUTH LOGIN"):
+            if v.startswith("AUTH PLAIN") == auth_login:
+                say("504 5.5.4 mechanism not offered\r\n"); continue
+            if v.startswith("AUTH LOGIN"):
+                say("334 VXNlcm5hbWU6\r\n"); user_ = base64.b64decode(f.readline().strip()).decode()
+                say("334 UGFzc3dvcmQ6\r\n"); pass_ = base64.b64decode(f.readline().strip()).decode()
+            else:
+                parts = base64.b64decode(u.split()[2]).split(b"\0")
+                user_, pass_ = parts[1].decode(), parts[2].decode()
+            if auth_code: say("%s %s.7.0 told to\r\n" % (auth_code, auth_code[0]))
+            elif auth and user_ + ":" + pass_ == auth:
                 authed = True; say("235 2.7.0 ok\r\n")
             else: say("535 5.7.8 no\r\n")
         elif v.startswith("MAIL FROM:"):
             if not authed: say("530 5.7.0 sign in\r\n"); continue
             frm, rcpts = u[10:].split(">")[0].lstrip("<"), []
             mparams, rparams, chunks = u[10:].split(">", 1)[1].strip(), [], []
+            c = take_code(mail_replies, frm.lower())
+            if c: say("%s %s.0.0 told to\r\n" % (c, c[0])); frm = None; continue
             say("250 ok\r\n")
         elif v.startswith("RCPT TO:"):
+            if frm is None: say("503 5.5.1 need MAIL command\r\n"); continue
             to = u[8:].split(">")[0].lstrip("<")
             c = take_code(replies, to.lower())
             if c: say("%s %s.0.0 told to\r\n" % (c, c[0]))

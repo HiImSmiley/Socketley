@@ -70,10 +70,10 @@ struct fake : smtp_session::hooks
     void reply(std::string_view b) override { out.append(b); }
     void start_tls() override { tls = true; }
     void authenticate(std::string_view, std::string user, std::string secret,
-                      std::function<void(bool, std::string)> done) override
+                      std::function<void(account, std::string)> done) override
     {
         const bool ok = password(user, secret);
-        answer([done, ok, user] { done(ok, user); });
+        answer([done, ok, user] { done(ok ? account::yes : account::no, user); });
     }
     void mail_from(const address&, std::function<void(rcpt_verdict)> done) override
     {
@@ -930,9 +930,9 @@ TEST_CASE("ManageSieve: a sign-in answered at once, the commands pipelined behin
         std::string out;
         void reply(std::string_view b) override { out.append(b); }
         void start_tls() override {}
-        void login(std::string u, std::string p, std::function<void(bool, std::string)> done) override
+        void login(std::string u, std::string p, std::function<void(account, std::string)> done) override
         {
-            done(u == "alice" && p == "pw", u);
+            done(u == "alice" && p == "pw" ? account::yes : account::no, u);
         }
         void close() override {}
     } hooks;

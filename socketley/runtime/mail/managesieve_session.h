@@ -10,6 +10,8 @@
 #include <string_view>
 #include <vector>
 
+#include "mail_account.h"
+
 namespace socketley::mail
 {
 
@@ -33,7 +35,7 @@ public:
         virtual void reply(std::string_view bytes) = 0;
         // The OK to STARTTLS is out: what follows is a TLS handshake.
         virtual void start_tls() = 0;
-        virtual void login(std::string user, std::string password, std::function<void(bool, std::string)> done) = 0;
+        virtual void login(std::string user, std::string password, std::function<void(account, std::string)> done) = 0;
         virtual void close() = 0;
     };
 

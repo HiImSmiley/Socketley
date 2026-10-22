@@ -22,12 +22,12 @@ bool mail_lua::wants_rcpt() const
 }
 
 void mail_lua::rcpt(const std::string& to, const std::string& from, const std::string& peer, const std::string& user,
-                    bool fallback, std::function<void(bool)> done)
+                    bool fallback, std::function<void(account)> done)
 {
     lua_context* lua = m_owner.lua();
     if (!lua || !lua->has_on_rcpt())
     {
-        done(fallback);
+        done(fallback ? account::yes : account::no);
         return;
     }
     sol::state& L = lua->state();
@@ -41,14 +41,15 @@ void mail_lua::rcpt(const std::string& to, const std::string& from, const std::s
     sus.set_next_result([done, fallback, owner](lua_State* th, int n, const char* error) {
         if (error)
         {
-            std::cerr << lua_diag::tag(owner) << " on_rcpt " << error << " -- refused\n";
-            done(false);
+            // A script that broke decides nothing: the sender is told to try again, not that the address is wrong.
+            std::cerr << lua_diag::tag(owner) << " on_rcpt " << error << " -- answered 451\n";
+            done(account::unreachable);
             return;
         }
         if (n >= 1 && lua_type(th, 1) == LUA_TBOOLEAN)
-            done(lua_toboolean(th, 1) != 0);
+            done(lua_toboolean(th, 1) != 0 ? account::yes : account::no);
         else
-            done(fallback);
+            done(fallback ? account::yes : account::no);
     });
     lua_suspender::id_t id = 0;
     sus.start(lua->raw_on_rcpt(), "on_rcpt", lua->callback_timeout_ms(), id, t, fallback);
@@ -88,9 +89,9 @@ bool mail_lua::wants_rcpt() const
 }
 
 void mail_lua::rcpt(const std::string&, const std::string&, const std::string&, const std::string&, bool fallback,
-                    std::function<void(bool)> done)
+                    std::function<void(account)> done)
 {
-    done(fallback);
+    done(fallback ? account::yes : account::no);
 }
 
 void mail_lua::message(const spool_entry&) {}

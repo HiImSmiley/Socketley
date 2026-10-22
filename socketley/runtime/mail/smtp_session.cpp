@@ -723,14 +723,16 @@ void smtp_session::auth_plain(std::string_view b64)
 void smtp_session::sign_in(std::string_view mech, std::string user, std::string secret)
 {
     wait();
-    m_hooks.authenticate(mech, std::move(user), std::move(secret), [this, alive = m_alive](bool ok, std::string name) {
+    m_hooks.authenticate(mech, std::move(user), std::move(secret), [this, alive = m_alive](account a, std::string name) {
         if (!*alive)
             return;
-        if (ok)
+        if (a == account::yes)
         {
             m_user = std::move(name);
             say(235, "2.7.0", "Authentication successful");
         }
+        else if (a == account::unreachable)
+            error(454, "4.7.0", "Temporary authentication failure");
         else
             error(535, "5.7.8", "Authentication credentials invalid");
         resume();

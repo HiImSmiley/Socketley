@@ -83,8 +83,9 @@ for p in "$PI/jwks" "$PS/"; do
     for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p")" != 000 ] && break; sleep 0.1; done
 done
 "$BIN" idp-user auth add alice --password alicepassword1 --email alice@example.test >/dev/null 2>&1
+printf 'team@example.test alice@example.test\n' > "$T/aliases"
 "$BIN" create mail m -p "$P" --mail-domain example.test --idp auth --storage st/mail --submission "$SUB" \
-    --notify-targets "$T/targets" \
+    --notify-targets "$T/targets" --aliases "$T/aliases" \
     --tls --cert "$T/cert.pem" --key "$T/key.pem" -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$P" || bad "the mail runtime listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 
@@ -170,6 +171,23 @@ for k in mail_stored mail_checked mail_dmarc_rejected mail_quarantined; do
     for _ in $(seq 1 30); do v=$("$BIN" stats m 2>/dev/null | sed -n "s/^$k://p"); [ "${v:-0}" -ge 1 ] && break; sleep 0.2; done
     [ "${v:-0}" -ge 1 ] && ok "stats count $k" || bad "stats count $k" "${v:-absent}"
 done
+
+# ─── an alias of a user here ────────────────────────────────────────────────
+n0=$(keys alice/INBOX | wc -l)
+printf 'From: carol@else.test\r\nTo: team@example.test\r\nSubject: to the team\r\n\r\nfor the team\r\n' > "$T/m6"
+check "mail for an alias of a user here is taken" "$(smtp "$P" carol@else.test team@example.test "$T/m6")" "sent"
+wait_keys alice/INBOX $((n0 + 1)) && ok "and filed in that user's mailbox, not sent out" \
+    || bad "and filed in that user's mailbox, not sent out" "$(keys alice/INBOX) $(ls "$T/sink")"
+k=$(for x in $(keys alice/INBOX); do obj "$x" | grep -q 'for the team' && echo "$x"; done | head -1)
+check "under the address it came for" "$(obj "$k" | tr -d '\r' | sed -n 's/^Delivered-To: //p' | head -1)" "alice@example.test"
+
+# ─── the idp runtime away ───────────────────────────────────────────────────
+"$BIN" stop auth >/dev/null 2>&1
+check "with the idp runtime stopped, a recipient it would decide is answered 451" \
+    "$(smtp "$P" carol@else.test someone@example.test "$T/m1")" "rcpt 451"
+check "and a password it would check 454" "$(smtp "$SUB" alice@example.test dan@remote.test "$T/m5" alice alicepassword1)" \
+    "auth 454"
+"$BIN" start auth >/dev/null 2>&1
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

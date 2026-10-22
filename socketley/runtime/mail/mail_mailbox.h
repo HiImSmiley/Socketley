@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "mail_account.h"
 #include "mail_spool.h"
 #include "../../shared/ipc/request_channel.h"
 
@@ -34,12 +35,13 @@ public:
     const std::string& storage() const { return m_storage; }
     const std::string& bucket() const { return m_bucket; }
 
-    // Whether `name`, a local part or an address, is a user's: `done(true, username, email)`, asked of the idp
-    // runtime and kept a minute; without one, any name an alias gave is a mailbox of that name.
-    void find(const std::string& name, std::function<void(bool, std::string, std::string)> done);
+    // Whether `name`, a local part or an address, is a user's: `done(yes, username, email)`, asked of the idp
+    // runtime and kept a minute, `unreachable` where it does not answer; without one, any name an alias gave is a
+    // mailbox of that name.
+    void find(const std::string& name, std::function<void(account, std::string, std::string)> done);
     // Whether `password` is `user`'s, asked of the idp runtime, which hashes it.
     void verify(const std::string& user, const std::string& password,
-                std::function<void(bool, std::string, std::string)> done);
+                std::function<void(account, std::string, std::string)> done);
 
     // `e` into `user`'s `folder`, `head` put ahead of it and every Authentication-Results this host would have
     // written taken out of it; `done` with 250, or a 4xx or 5xx and why.
