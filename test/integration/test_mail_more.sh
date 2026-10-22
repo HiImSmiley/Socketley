@@ -17,7 +17,8 @@
 #   * a server's LIMITS RCPTMAX ignored, so recipients past it are put off to a retry
 #   * a server that said 421 connected to again at once by the next message
 #   * what Rspamd says to reject taken, what it says to mark kept in INBOX, or its score not told to the mailbox
-#   * mail taken by a sharded runtime's shards not all delivered, or not listed together as it waits
+#   * a sharded runtime taking mail on more than one shard, whose spools sync apart, or the mail it takes not all
+#     delivered, or not listed together as it waits
 #   * a quiet connection, or a TLS handshake that never comes, held open for ever
 #   * a message refused for now not tried again by itself, or kept past --queue-lifetime rather than given up
 #     and bounced; a server that answers 354 to a pipelined DATA after refusing every RCPT left waiting for the
@@ -381,10 +382,12 @@ tries=$(grep -c 'temp connect' "$T/servers.log")
            "$(ls "$T/sink" | wc -l) at the sink, queue: $("$BIN" mail lt queue 2>&1 | head -3 | tr '\n' ' ')"
 
 # ─── a runtime of three shards ──────────────────────────────────────────────
-for _ in $(seq 1 50); do [ "$(ss -ltnpH "sport = :$PSH" | grep -o 'pid=[0-9]*' | sort -u | wc -l)" -ge 3 ] && break; sleep 0.1; done
+ready_tcp 127.0.0.1 "$PSH" >/dev/null
+check "a sharded runtime takes mail on one shard, whose spool commits it all" \
+    "$(ss -ltnpH "sport = :$PSH" | grep -o 'pid=[0-9]*' | sort -u | wc -l)" "1"
 r=$(python3 - "$PSH" <<'PY'
 import smtplib, sys
-# Each a connection of its own, so the kernel spreads them over the shards.
+# Each a connection of its own.
 for i in range(12):
     s = smtplib.SMTP("127.0.0.1", int(sys.argv[1])); s.ehlo("x")
     s.sendmail("ops@remote.test", ["good%d@remote.test" % i], "From: ops@remote.test\r\nSubject: sharded %d\r\n\r\nsharded body\r\n" % i)

@@ -649,12 +649,15 @@ bool mail_run::start(std::string& why)
     }
     m_ring = m_loop.setup_buf_ring(ring_group, ring_bufs, ring_buf_bytes);
     m_multishot = m_ring && m_loop.recv_multishot_enabled();
-    if (!open_listener(m_smtp, m_owner.effective_port(), port_kind::smtp, why))
+    // Mail is taken on shard 0 alone, since each shard's spool syncs apart: on one disk four shards took half of what
+    // one did.
+    const bool takes_mail = m_owner.get_shard_index() == 0;
+    if (takes_mail && !open_listener(m_smtp, m_owner.effective_port(), port_kind::smtp, why))
         return false;
-    if (m_owner.get_submission_port() &&
+    if (takes_mail && m_owner.get_submission_port() &&
         !open_listener(m_sub, m_owner.get_submission_port(), port_kind::submission, why))
         return false;
-    if (m_owner.get_submissions_port() &&
+    if (takes_mail && m_owner.get_submissions_port() &&
         !open_listener(m_subs, m_owner.get_submissions_port(), port_kind::submissions, why))
         return false;
     // IMAP on every shard, each reading the others' changes from the users' journals.
@@ -689,7 +692,7 @@ bool mail_run::start(std::string& why)
         if (m_owner.get_jmap_port() && !open_listener(m_jmap_l, m_owner.get_jmap_port(), port_kind::jmap, why))
             return false;
     }
-    if (m_mailboxes && m_mailboxes->enabled() && m_owner.get_lmtp_port() &&
+    if (takes_mail && m_mailboxes && m_mailboxes->enabled() && m_owner.get_lmtp_port() &&
         !open_listener(m_lmtp_l, m_owner.get_lmtp_port(), port_kind::lmtp, why))
         return false;
     if (m_owner.get_mta_sts_port() && !open_listener(m_sts_l, m_owner.get_mta_sts_port(), port_kind::sts, why))
@@ -708,8 +711,9 @@ bool mail_run::start(std::string& why)
             arm_accept(*l);
     publish_records();
     arm_tick();
-    LOG_INFO(("mail " + std::string(m_owner.get_name()) + ": serving SMTP on " +
-              std::to_string(m_owner.effective_port()) +
+    LOG_INFO(("mail " + std::string(m_owner.get_name()) +
+              (m_smtp.fd >= 0 ? ": serving SMTP on " + std::to_string(m_owner.effective_port())
+                              : " shard " + std::to_string(m_owner.get_shard_index()) + ": serving the mailboxes, mail taken on shard 0") +
               (m_sub.fd >= 0 ? ", submission on " + std::to_string(m_owner.get_submission_port()) : std::string()) +
               (m_subs.fd >= 0 ? ", submission over TLS on " + std::to_string(m_owner.get_submissions_port())
                               : std::string()) +

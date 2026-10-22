@@ -12636,7 +12636,10 @@ socketley create mail m \-p 25 \-\-dns ns \-\-idp auth \-\-storage files/mail \e
 .PP
 It listens for SMTP on 25 unless
 .B \-p
-says otherwise; port 25 needs the daemon to be allowed to bind it.
+says otherwise; port 25 needs the daemon to be allowed to bind it. With
+.B \-\-shards
+the first shard alone takes mail, on SMTP, submission and LMTP, so one spool
+commits it all with one sync, while every shard serves the mailboxes.
 .B \-\-submission
 adds a port its users send from, with STARTTLS and a password,
 .B \-\-submissions

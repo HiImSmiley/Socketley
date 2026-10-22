@@ -149,7 +149,6 @@ check "a suppressed address is still suppressed after a restart" "$("$BIN" mail 
 PSH=$((SL_PORT_BASE+1994))
 "$BIN" create mail msh -p "$PSH" --mail-domain example.test --no-reply --shards 3 -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$PSH" || bad "the sharded runtime listens" "$(tail -3 "$SOCKETLEY_DLOG")"
-for _ in $(seq 1 50); do [ "$(ss -ltnpH "sport = :$PSH" | grep -o 'pid=[0-9]*' | sort -u | wc -l)" -ge 3 ] && break; sleep 0.1; done
 "$BIN" send msh --to tagme@remote.test --subject "for the tag" --text "shard tag body" >/dev/null 2>&1
 f=$(mail_with "shard tag body")
 tag2=$(sed -n 's/^from //p' "$f" 2>/dev/null | head -1)

@@ -214,7 +214,7 @@ check "a domain whose lookup fails for now has its mail wait, not bounce" "$(sta
 check "and no notice goes to the sender" "$(at sink 'sf@broken.test')" "0"
 
 # ─── a flush of three shards ────────────────────────────────────────────────
-for _ in $(seq 1 50); do [ "$(ss -ltnpH "sport = :$PSH" | grep -o 'pid=[0-9]*' | sort -u | wc -l)" -ge 3 ] && break; sleep 0.1; done
+ready_tcp 127.0.0.1 "$PSH" >/dev/null
 ids=()
 for i in 1 2 3 4 5 6 7 8 9; do ids+=("$(send "$PSH" s@remote.test slow@remote.test)"); done
 tries_all() { for id in "${ids[@]}"; do "$BIN" mail msh show "$id" 2>/dev/null | sed -n 's/^tries: //p'; done | sort -u | tr '\n' ' '; }
