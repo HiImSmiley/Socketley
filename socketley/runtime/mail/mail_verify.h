@@ -19,6 +19,17 @@ struct check_resolver
     virtual bool txt(const std::string& name, std::vector<std::string>& out, bool& nx) = 0;
     // The addresses of a name, as text.
     virtual bool addrs(const std::string& name, std::vector<std::string>& out, bool& nx) = 0;
+    // Its IPv4 addresses alone, as exists asks (RFC 7208 5.7).
+    virtual bool addrs4(const std::string& name, std::vector<std::string>& out, bool& nx)
+    {
+        std::vector<std::string> all;
+        if (!addrs(name, all, nx))
+            return false;
+        for (auto& a : all)
+            if (a.find(':') == std::string::npos)
+                out.push_back(std::move(a));
+        return true;
+    }
     virtual bool mx(const std::string& name, std::vector<std::string>& out, bool& nx) = 0;
 };
 
@@ -26,8 +37,10 @@ struct check_resolver
 // state and the last minute's answers are the calling thread's, and a lookup past `budget_ms` from now fails.
 std::unique_ptr<check_resolver> system_check_resolver(int64_t budget_ms = 20000);
 
-// SPF's verdict for `ip` sending as `domain` (pass, fail, softfail, neutral, none, temperror, permerror).
-std::string spf_check(const std::string& ip, const std::string& domain, const std::string& sender, check_resolver& r);
+// SPF's verdict for `ip` sending as `domain` (pass, fail, softfail, neutral, none, temperror, permerror), `helo` what
+// %{h} stands for.
+std::string spf_check(const std::string& ip, const std::string& domain, const std::string& sender, check_resolver& r,
+                      const std::string& helo = {});
 
 struct inbound_result
 {
@@ -38,6 +51,17 @@ struct inbound_result
     std::string dmarc;
     std::string dmarc_policy;
     std::string from_domain;
+    // The ARC chain: none, pass or fail, its sets, the newest sealer, and whether that sealer's word let a message
+    // that failed DMARC through.
+    std::string arc{"none"};
+    int arc_sets{0};
+    std::string arc_sealer;
+    bool arc_vouched{false};
+    // The DMARC record's domain and what it published, for the aggregate report its rua asks for.
+    std::string policy_domain, rua, adkim{"r"}, aspf{"r"}, p{"none"}, sp;
+    int pct{100};
+    // Whether SPF and a DKIM signature passed aligned with From, as a report's policy_evaluated says.
+    bool spf_aligned{false}, dkim_aligned{false};
     // Why it is refused where that is not a domain's policy.
     std::string why;
     // The value of the Authentication-Results this host writes, after its own name.
@@ -46,9 +70,11 @@ struct inbound_result
     bool quarantine() const { return dmarc == "fail" && dmarc_policy == "quarantine"; }
 };
 
-// Every check of `message`, received from `ip` that said HELO `helo` and MAIL FROM `mail_from` (empty for a bounce).
+// Every check of `message`, received from `ip` that said HELO `helo` and MAIL FROM `mail_from` (empty for a bounce);
+// a passing ARC chain sealed last by one of `arc_trusted` stands in for a failed DMARC.
 inbound_result check_inbound(std::string_view message, const std::string& ip, const std::string& helo,
-                             const std::string& mail_from, check_resolver& r, int64_t now_s);
+                             const std::string& mail_from, check_resolver& r, int64_t now_s,
+                             const std::vector<std::string>& arc_trusted = {});
 
 // The domain DMARC's relaxed alignment compares, its registrable domain by the Public Suffix List.
 std::string organizational_domain(std::string_view domain);

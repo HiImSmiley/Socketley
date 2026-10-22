@@ -303,6 +303,10 @@ for _ in $(seq 1 60); do [ "$(keys INBOX | wc -l)" -gt "$n0" ] && break; sleep 0
 sleep 0.5
 check "a script deactivated is no longer run" \
     "$(grep -l '^Subject: Away' "$T"/sink/*.eml 2>/dev/null | xargs -r grep -l '^rcpt carol@remote.test' | wc -l)" "0"
+{ printf 'require "fileinto";\n'; for i in $(seq 1 400); do printf '# a line of comment to make the script long %04d\n' "$i"; done
+  printf 'keep;\n'; } > "$T/long.sieve"
+out=$("$BIN" mail m sieve alice put long "$T/long.sieve" 2>&1)
+check "a script of 20 KB is put by the CLI" "$out" ""
 dir=$(find "$HOME/.local/share" -type d -path '*m.sieve/alice' 2>/dev/null | head -1)
 printf 'if true { nope; }\n' > "$dir/edited.sieve"
 out=$("$BIN" mail m sieve alice activate edited 2>&1); rc=$?
@@ -369,6 +373,17 @@ f=$(at_sink "You have mail")
 [ -n "$f" ] && grep -q '^rcpt watcher@remote.test' "$f" && grep -q '^Auto-Submitted: auto-notified' "$f" && grep -q '^from $' "$f" \
     && ok "notify mails the mailto URI, auto-notified, from the null sender" \
     || bad "notify mails the mailto URI, auto-notified, from the null sender" "$(head -8 "$f" 2>/dev/null)"
+
+caps=$(python3 - "$IM" <<'PY'
+import imaplib, sys
+print(" ".join(imaplib.IMAP4("127.0.0.1", int(sys.argv[1])).capabilities))
+PY
+)
+case " ${caps,,} " in *" imapsieve=sieve://"*":$SV "*) ok "IMAP names where imapsieve's scripts are put (RFC 6785)" ;;
+    *) bad "IMAP names where imapsieve's scripts are put (RFC 6785)" "$caps" ;; esac
+r=$(printf 'CAPABILITY\r\nLOGOUT\r\n' | timeout 3 nc -q1 127.0.0.1 "$SV" 2>/dev/null | grep '^"SIEVE"')
+case "$r" in *imapsieve*) ok "and ManageSieve lists imapsieve among its extensions" ;;
+    *) bad "and ManageSieve lists imapsieve among its extensions" "$r" ;; esac
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

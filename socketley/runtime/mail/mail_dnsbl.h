@@ -55,6 +55,8 @@ private:
     std::unordered_map<std::string, kept> m_kept;
     std::unordered_map<std::string, asking> m_asking;
     bool m_polling{false};
+    // How long the next poll waits: 2 ms after an answer, doubling to 64 while none comes.
+    uint32_t m_poll_ms{2};
     uint64_t m_listed{0};
     uint64_t m_asked{0};
     std::shared_ptr<bool> m_alive{std::make_shared<bool>(true)};

@@ -204,6 +204,36 @@ void apply_mail_config(mail_instance& ml, const runtime_config& cfg, bool by_pre
         ml.set_sieve_port(cfg.mail_sieve);
     if (asked("dnsbl", !cfg.mail_dnsbl.empty()))
         ml.set_dnsbl(cfg.mail_dnsbl);
+    if (asked("pop3", cfg.mail_pop3 != defaults.mail_pop3))
+        ml.set_pop3_port(cfg.mail_pop3);
+    if (asked("pop3s", cfg.mail_pop3s != defaults.mail_pop3s))
+        ml.set_pop3s_port(cfg.mail_pop3s);
+    if (asked("lmtp", cfg.mail_lmtp != defaults.mail_lmtp))
+        ml.set_lmtp_port(cfg.mail_lmtp);
+    if (asked("mta_sts_port", cfg.mail_sts_port != defaults.mail_sts_port))
+        ml.set_mta_sts_port(cfg.mail_sts_port);
+    if (asked("greylist", cfg.mail_greylist != defaults.mail_greylist))
+        ml.set_greylist(cfg.mail_greylist);
+    if (asked("rspamd", cfg.mail_rspamd != defaults.mail_rspamd))
+        ml.set_rspamd(cfg.mail_rspamd);
+    if (asked("recipient_delimiter", cfg.mail_delimiter != defaults.mail_delimiter))
+        ml.set_recipient_delimiter(cfg.mail_delimiter);
+    if (asked("reports", cfg.mail_reports != defaults.mail_reports))
+        ml.set_reports(cfg.mail_reports);
+    if (asked("dmarc_rua", cfg.mail_dmarc_rua != defaults.mail_dmarc_rua))
+        ml.set_dmarc_rua(cfg.mail_dmarc_rua);
+    if (asked("tls_rpt", cfg.mail_tls_rpt != defaults.mail_tls_rpt))
+        ml.set_tls_rpt(cfg.mail_tls_rpt);
+    if (asked("mta_sts", cfg.mail_mta_sts != defaults.mail_mta_sts))
+        ml.set_mta_sts(cfg.mail_mta_sts);
+    if (asked("default_quota", cfg.mail_default_quota != defaults.mail_default_quota))
+        ml.set_default_quota(cfg.mail_default_quota);
+    if (asked("quota_warn", cfg.mail_quota_warn != defaults.mail_quota_warn))
+        ml.set_quota_warn(cfg.mail_quota_warn);
+    if (asked("arc_trust", !cfg.mail_arc_trust.empty()))
+        ml.set_arc_trust(cfg.mail_arc_trust);
+    if (asked("dkim_next", !cfg.mail_dkim_next.empty()))
+        ml.set_dkim_next(cfg.mail_dkim_next);
     if (asked("dns", !cfg.mail_dns.empty()))
         ml.set_dns(cfg.mail_dns);
     if (asked("mail_domain", !cfg.mail_domains.empty()))

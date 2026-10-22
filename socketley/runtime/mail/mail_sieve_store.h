@@ -54,6 +54,8 @@ public:
 
     // The active script compiled, null where there is none or it no longer compiles; safe from any thread.
     std::shared_ptr<const sieve::script> active(const std::string& user);
+    // The script `name` compiled, as imapsieve runs one a folder names; null where there is none.
+    std::shared_ptr<const sieve::script> named(const std::string& user, const std::string& name);
 
     // Whether a vacation with `handle` answered `sender` for `user` within `seconds`; marks it answered when not, and
     // says it was where the memory cannot be read or written, so an unknown answers no one twice.
@@ -87,6 +89,8 @@ private:
         std::vector<std::pair<std::string, stamp>> files;
         std::shared_ptr<const sieve::script> script;
     };
+    // `c` compiled again where its script or one it includes changed since; under m_mu.
+    std::shared_ptr<const sieve::script> fresh(compiled& c, const std::string& user, const char* what);
     // What one kind of memory of one user holds: each key's hash and when it runs out, read from its file up to
     // `read` bytes, the inode it was read from, and the lines the file holds past what is live.
     struct memory
@@ -102,6 +106,7 @@ private:
 
     std::mutex m_mu;
     std::unordered_map<std::string, compiled> m_cache;
+    std::unordered_map<std::string, compiled> m_named;
     std::unordered_map<std::string, memory> m_memory;
 };
 

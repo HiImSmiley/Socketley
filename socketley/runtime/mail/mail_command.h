@@ -26,6 +26,9 @@ enum class verb : uint8_t
     forgive    = 8,
     // A user's Sieve scripts: the argument is the user, the verb, a name and a script's text, a line each.
     sieve      = 9,
+    // A message to send too large for the channel, its send command in a file of the runtime's outbox: the
+    // argument is the file's name, and the file is gone once it is read.
+    send_file  = 10,
 };
 
 struct attachment

@@ -1,19 +1,25 @@
 #include "cli.h"
 
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <string_view>
 
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "../daemon/ipc_client.h"
 #include "../runtime/mail/mail_command.h"
+#include "../runtime/mail/mail_instance.h"
+#include "../shared/loop/blocking_write.h"
 #include "../shared/ipc/ipc_framing.h"
 #include "../shared/persist/read_file.h"
 #include "../shared/runtime/command_usage.h"
 #include "../shared/util/base64.h"
+#include "../shared/util/random_id.h"
 
 namespace
 {
@@ -86,13 +92,20 @@ int cli_mail_send(int argc, char** argv)
         }
         else if (a == "--attach" && has)
         {
-            // file[:type], the type guessed by the reader where none is said.
+            // file[:type], the type guessed by the reader where none is said; a colon is a type's only where what
+            // follows it is one, type/subtype, so a path with a colon in a directory's name is read as the path.
             std::string spec = value();
             socketley::mail::attachment at;
             const size_t colon = spec.rfind(':');
-            if (colon != std::string::npos && spec.find('/', colon) != std::string::npos)
+            const std::string_view after = colon == std::string::npos ? std::string_view{}
+                                                                       : std::string_view(spec).substr(colon + 1);
+            const size_t slash = after.find('/');
+            const bool typed = slash != std::string_view::npos && slash > 0 && slash + 1 < after.size() &&
+                               after.find('/', slash + 1) == std::string_view::npos &&
+                               after.find_first_of(" \t") == std::string_view::npos;
+            if (typed && ::access(spec.c_str(), F_OK) != 0)
             {
-                at.type = spec.substr(colon + 1);
+                at.type = std::string(after);
                 spec.resize(colon);
             }
             if (!file_arg(spec, at.data))
@@ -127,7 +140,34 @@ int cli_mail_send(int argc, char** argv)
     std::string cmd = "mail-send ";
     ipc_frame::append_arg(cmd, argv[2]);
     cmd += ' ';
-    cmd += socketley::base64::encode(socketley::mail::command_send(c));
+    std::string payload = socketley::mail::command_send(c);
+    // Past what the daemon's channels carry, the message is left in the runtime's outbox and only its name is sent.
+    if (payload.size() > (4u << 20))
+    {
+        const std::string dir = mail_outbox_dir(argv[2]);
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        ::chmod(dir.c_str(), 0700);
+        const std::string file = socketley::random_hex(16) + ".msg";
+        const std::string path = dir + "/" + file;
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        const bool written = fd >= 0 && socketley::write_all(fd, payload.data(), payload.size());
+        if (fd >= 0)
+            ::close(fd);
+        if (!written)
+        {
+            ::unlink(path.c_str());
+            std::cout << "the message could not be written to " << dir << "\n";
+            return 2;
+        }
+        payload = socketley::mail::command_text(socketley::mail::verb::send_file, file);
+        cmd += socketley::base64::encode(payload);
+        const int rc = ask(cmd);
+        // Taken away by the runtime once read; one the runtime never came for is not left behind.
+        ::unlink(path.c_str());
+        return rc;
+    }
+    cmd += socketley::base64::encode(payload);
     return ask(cmd);
 }
 

@@ -754,6 +754,21 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.mail_imaps = ml->get_imaps_port();
             cfg.mail_sieve = ml->get_sieve_port();
             cfg.mail_dnsbl = std::string(ml->get_dnsbl());
+            cfg.mail_pop3 = ml->get_pop3_port();
+            cfg.mail_pop3s = ml->get_pop3s_port();
+            cfg.mail_lmtp = ml->get_lmtp_port();
+            cfg.mail_sts_port = ml->get_mta_sts_port();
+            cfg.mail_greylist = ml->get_greylist();
+            cfg.mail_rspamd = std::string(ml->get_rspamd());
+            cfg.mail_delimiter = std::string(ml->get_recipient_delimiter());
+            cfg.mail_reports = ml->get_reports();
+            cfg.mail_dmarc_rua = std::string(ml->get_dmarc_rua());
+            cfg.mail_tls_rpt = std::string(ml->get_tls_rpt());
+            cfg.mail_mta_sts = std::string(ml->get_mta_sts());
+            cfg.mail_default_quota = ml->get_default_quota();
+            cfg.mail_quota_warn = ml->get_quota_warn();
+            cfg.mail_arc_trust = std::string(ml->get_arc_trust());
+            cfg.mail_dkim_next = std::string(ml->get_dkim_next());
             cfg.mail_dns = std::string(ml->get_dns());
             cfg.mail_domains = std::string(ml->get_mail_domains());
             cfg.mail_hostname = std::string(ml->get_hostname());
@@ -1201,6 +1216,36 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_int_field("sieve", cfg.mail_sieve);
             if (!cfg.mail_dnsbl.empty())
                 append_str_field("dnsbl", cfg.mail_dnsbl);
+            if (cfg.mail_pop3 != 0)
+                append_int_field("pop3", cfg.mail_pop3);
+            if (cfg.mail_pop3s != 0)
+                append_int_field("pop3s", cfg.mail_pop3s);
+            if (cfg.mail_lmtp != 0)
+                append_int_field("lmtp", cfg.mail_lmtp);
+            if (cfg.mail_sts_port != 0)
+                append_int_field("mta_sts_port", cfg.mail_sts_port);
+            if (cfg.mail_greylist != 0)
+                append_int_field("greylist", cfg.mail_greylist);
+            if (!cfg.mail_rspamd.empty())
+                append_str_field("rspamd", cfg.mail_rspamd);
+            if (cfg.mail_delimiter != "+")
+                append_str_field("recipient_delimiter", cfg.mail_delimiter);
+            if (cfg.mail_reports)
+                append_bool_field("reports", true);
+            if (!cfg.mail_dmarc_rua.empty())
+                append_str_field("dmarc_rua", cfg.mail_dmarc_rua);
+            if (!cfg.mail_tls_rpt.empty())
+                append_str_field("tls_rpt", cfg.mail_tls_rpt);
+            if (!cfg.mail_mta_sts.empty())
+                append_str_field("mta_sts", cfg.mail_mta_sts);
+            if (cfg.mail_default_quota != 0)
+                append_int_field("default_quota", cfg.mail_default_quota);
+            if (cfg.mail_quota_warn != 90)
+                append_int_field("quota_warn", cfg.mail_quota_warn);
+            if (!cfg.mail_arc_trust.empty())
+                append_str_field("arc_trust", cfg.mail_arc_trust);
+            if (!cfg.mail_dkim_next.empty())
+                append_str_field("dkim_next", cfg.mail_dkim_next);
             if (!cfg.mail_dns.empty())
                 append_str_field("dns", cfg.mail_dns);
             if (!cfg.mail_domains.empty())
@@ -1476,6 +1521,22 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.mail_imaps = static_cast<uint16_t>(json_get_uint32(json, "imaps"));
             cfg.mail_sieve = static_cast<uint16_t>(json_get_uint32(json, "sieve"));
             cfg.mail_dnsbl = json_get_string(json, "dnsbl");
+            cfg.mail_pop3 = static_cast<uint16_t>(json_get_uint32(json, "pop3"));
+            cfg.mail_pop3s = static_cast<uint16_t>(json_get_uint32(json, "pop3s"));
+            cfg.mail_lmtp = static_cast<uint16_t>(json_get_uint32(json, "lmtp"));
+            cfg.mail_sts_port = static_cast<uint16_t>(json_get_uint32(json, "mta_sts_port"));
+            cfg.mail_greylist = json_get_uint32(json, "greylist", 0);
+            cfg.mail_rspamd = json_get_string(json, "rspamd");
+            if (json_has_key(json, "recipient_delimiter"))
+                cfg.mail_delimiter = json_get_string(json, "recipient_delimiter");
+            cfg.mail_reports = json_get_bool(json, "reports");
+            cfg.mail_dmarc_rua = json_get_string(json, "dmarc_rua");
+            cfg.mail_tls_rpt = json_get_string(json, "tls_rpt");
+            cfg.mail_mta_sts = json_get_string(json, "mta_sts");
+            cfg.mail_default_quota = json_get_size(json, "default_quota", 0);
+            cfg.mail_quota_warn = json_get_uint32(json, "quota_warn", 90);
+            cfg.mail_arc_trust = json_get_string(json, "arc_trust");
+            cfg.mail_dkim_next = json_get_string(json, "dkim_next");
             cfg.mail_dns = json_get_string(json, "dns");
             cfg.mail_domains = json_get_string(json, "mail_domain");
             cfg.mail_hostname = json_get_string(json, "hostname");

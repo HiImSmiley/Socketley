@@ -11,6 +11,9 @@
 #   * an exchanger an enforced policy does not name tried, or a certificate for another name taken
 #   * a policy in testing mode acted on rather than only told of
 #   * a fetched policy not kept for the next start
+#   * a policy that never ends read to its end
+#   * REQUIRETLS offered or taken outside TLS, or its mail sent on to a server DANE or MTA-STS did not vouch for, or
+#     to one that does not keep the requirement on, or without saying REQUIRETLS
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -57,7 +60,7 @@ leaf() { # leaf <file> <name>...: a certificate the CA signs for the names
 leaf dane mx.dane.test
 leaf sts mx.sts.test
 leaf wrong some.other.name
-leaf web mta-sts.sts.test mta-sts.sts2.test mta-sts.sts3.test mta-sts.stt.test mta-sts.slow.test
+leaf web mta-sts.sts.test mta-sts.sts2.test mta-sts.sts3.test mta-sts.stt.test mta-sts.slow.test mta-sts.huge.test
 spki() { openssl x509 -in "$1" -noout -pubkey | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -c1-64; }
 DANE=$(spki dane.pem)
 OTHER=$(spki wrong.pem)
@@ -78,6 +81,8 @@ python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal \
     sts3.test=MX:10:mx.sts3.test mx.sts3.test=127.0.0.7 "_mta-sts.sts3.test=TXT:v=STSv1; id=one" \
     stt.test=MX:10:mx.stt.test mx.stt.test=127.0.0.7 "_mta-sts.stt.test=TXT:v=STSv1; id=one" \
     slow.test=MX:10:mx.sts.test "_mta-sts.slow.test=TXT:v=STSv1; id=one" \
+    huge.test=MX:10:mx.sts.test "_mta-sts.huge.test=TXT:v=STSv1; id=one" \
+    plain.test=MX:10:mx.plain.test mx.plain.test=127.0.0.6 \
     >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
@@ -88,7 +93,8 @@ FAKESINK_ADDR=127.0.0.4 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/s4" --tls "
 PIDS+=($!)
 FAKESINK_ADDR=127.0.0.5 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/s5" >/dev/null 2>&1 &
 PIDS+=($!)
-FAKESINK_ADDR=127.0.0.6 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/s6" --tls "$T/sts.pem" "$T/sts.key" >/dev/null 2>&1 &
+FAKESINK_ADDR=127.0.0.6 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/s6" --tls "$T/sts.pem" "$T/sts.key" --requiretls \
+    >/dev/null 2>&1 &
 PIDS+=($!)
 FAKESINK_ADDR=127.0.0.7 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/s7" --tls "$T/wrong.pem" "$T/wrong.key" >/dev/null 2>&1 &
 PIDS+=($!)
@@ -107,6 +113,17 @@ class H(http.server.BaseHTTPRequestHandler):
         with open(sys.argv[4], "a") as f: f.write(host + "\n")
         # One policy takes two seconds to come, as a slow server's would.
         if host == "mta-sts.slow.test": time.sleep(2)
+        # One never ends: what was taken of it before the fetch gave up is written down.
+        if host == "mta-sts.huge.test":
+            self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+            sent = 0
+            try:
+                while sent < (256 << 20):
+                    self.wfile.write(b"x" * 65536); sent += 65536
+            except Exception:
+                pass
+            with open(sys.argv[4] + ".huge", "w") as f: f.write(str(sent))
+            return
         body = policies.get(host)
         if self.path != "/.well-known/mta-sts.txt" or body is None:
             self.send_response(404); self.end_headers(); return
@@ -191,6 +208,54 @@ for i in 1 2 3 4 5; do send_to "u$i@slow.test" >/dev/null; done
 for i in 1 2 3 4 5; do at_sink s6 "for u$i@slow.test" >/dev/null || break; done
 check "five messages waiting on a slow policy have it fetched once" "$(grep -c '^mta-sts.slow.test$' "$T/fetches")" "1"
 check "and go once it is there" "$(grep -l 'for u[1-5]@slow.test' "$T"/s6/*.eml 2>/dev/null | wc -l)" "5"
+
+# A policy that never ends is given up past 64 KiB, and the mail goes as it would with none.
+send_to "u@huge.test" >/dev/null
+at_sink s6 "for u@huge.test" >/dev/null && ok "a policy that never ends is no policy, and the mail goes" \
+    || bad "a policy that never ends is no policy, and the mail goes" "$(tail -3 "$SOCKETLEY_DLOG")"
+for _ in $(seq 1 50); do [ -s "$T/fetches.huge" ] && break; sleep 0.1; done
+taken=$(cat "$T/fetches.huge" 2>/dev/null || echo 0)
+[ "$taken" -gt 0 ] && [ "$taken" -lt $((32 << 20)) ] && ok "and is read no further than its bound and the kernel's buffers" \
+    || bad "and is read no further than its bound and the kernel's buffers" "$taken bytes sent"
+
+# ─── REQUIRETLS ─────────────────────────────────────────────────────────────
+notice_for() { # the notice at s6 that mail for $1 was refused for REQUIRETLS
+    for _ in $(seq 1 60); do
+        f=$(grep -l '5\.7\.10' "$T"/s6/*.eml 2>/dev/null | xargs -r grep -l -- "$1" | head -1)
+        [ -n "$f" ] && { echo "$f"; return 0; }
+        sleep 0.1
+    done
+}
+P2=$((SL_PORT_BASE+1964))
+"$BIN" create mail t2 -p "$P2" --mail-domain example.test --tls --cert "$T/web.pem" --key "$T/web.key" -s >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$P2" || bad "the second mail runtime listens" "$(tail -3 "$SOCKETLEY_DLOG")"
+r=$(python3 - "$P2" <<'PY'
+import smtplib, ssl, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1])); s.ehlo("x")
+print("clear", s.has_extn("requiretls"), s.docmd("MAIL FROM:<back@sts.test> REQUIRETLS")[0])
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+s.starttls(context=ctx); s.ehlo("x")
+print("tls", s.has_extn("requiretls"))
+msg = "From: back@sts.test\r\nSubject: required\r\n\r\nonly over checked tls %s\r\n"
+for to in ("v@sts.test", "v@dane.test", "v@plain.test"):
+    s.mail("back@sts.test", ["REQUIRETLS"]); s.rcpt(to); s.data(msg % to)
+print("sent")
+PY
+)
+check "REQUIRETLS is not offered in the clear, and is refused there" "$(sed -n 's/^clear //p' <<<"$r")" "False 530"
+check "and is offered inside TLS" "$(sed -n 's/^tls //p' <<<"$r")" "True"
+f=$(at_sink s6 "only over checked tls v@sts.test")
+[ -n "$f" ] && grep -q '^mailparams.*REQUIRETLS' "$f" && ok "its mail goes on to a server an enforced policy vouched for, still REQUIRETLS" \
+    || bad "its mail goes on to a server an enforced policy vouched for, still REQUIRETLS" "$(head -5 "$f" 2>/dev/null)"
+b=$(notice_for v@dane.test)
+[ -n "$b" ] && grep -q 'does not offer REQUIRETLS' "$b" && ok "and is returned by one DANE vouched for that does not keep it on" \
+    || bad "and is returned by one DANE vouched for that does not keep it on" "$(ls "$T/s6" | wc -l)"
+at_sink s4 "only over checked tls v@dane.test" >/dev/null && bad "and not sent there" "sent" || ok "and not sent there"
+b=$(notice_for v@plain.test)
+[ -n "$b" ] && grep -q 'vouched for' "$b" && ok "and by one reached over TLS that nothing vouched for" \
+    || bad "and by one reached over TLS that nothing vouched for" "$(grep -l 'v@plain.test' "$T"/s6/*.eml 2>/dev/null)"
+[ -n "$b" ] && ! grep -q 'only over checked tls v@plain' "$b" && ok "a notice of REQUIRETLS mail carries no more than its header" \
+    || bad "a notice of REQUIRETLS mail carries no more than its header" "$b"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

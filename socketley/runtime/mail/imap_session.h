@@ -27,6 +27,8 @@ struct imap_config
     // A password may be said in the clear: this machine's own client.
     bool login_in_clear{false};
     uint64_t max_append{25ull << 20};
+    // The ManageSieve URL imapsieve's scripts are put at, where there is one (RFC 6785 2).
+    std::string imapsieve;
 };
 
 class imap_session
@@ -55,6 +57,10 @@ public:
         virtual bool start_compress() { return false; }
         // `f` at the loop's next turn, so a long SEARCH or SORT lets the others on the shard go between its stretches.
         virtual void later(std::function<void()> f) { f(); }
+        // What the client did to messages of a folder, APPEND, COPY or FLAG and the flags it changed, as imapsieve is
+        // told of it (RFC 6785).
+        virtual void imap_acted(const std::string& /*user*/, const std::string& /*folder*/, std::string /*cause*/,
+                                std::vector<uint32_t> /*uids*/, std::string /*changed*/) {}
     };
 
     imap_session(const imap_config& cfg, hooks& h, imap_store& store);
@@ -100,6 +106,8 @@ private:
     void cmd_list(const std::string& tag, const std::vector<token>& a, bool lsub);
     void cmd_status(const std::string& tag, const std::vector<token>& a);
     void cmd_append(const std::string& tag, const std::vector<token>& a);
+    // GETMETADATA and SETMETADATA (RFC 5464), the server's entries under the mailbox "".
+    void cmd_metadata(const std::string& tag, const std::vector<token>& a, bool set);
     void cmd_fetch(const std::string& tag, const std::vector<token>& a, size_t from, bool uid);
     void cmd_store(const std::string& tag, const std::vector<token>& a, size_t from, bool uid);
     void cmd_search(const std::string& tag, const std::vector<token>& a, size_t from, bool uid);
@@ -121,6 +129,9 @@ private:
     // A folder's STATUS line with the items asked.
     std::string status_text(const imap_folder& f, const std::vector<std::string>& items) const;
     void sign_in(const std::string& tag, std::string user, std::string password);
+    // A mailbox name as the client wrote it, as the index keeps it; and one the index keeps, as the client reads it.
+    std::string box(std::string_view given) const;
+    std::string shown(std::string_view kept) const;
 
     imap_config m_cfg;
     hooks& m_hooks;
@@ -136,6 +147,8 @@ private:
     bool m_compressing{false};
     bool m_condstore{false};
     bool m_qresync{false};
+    // ENABLE UTF8=ACCEPT: mailbox names come and go as UTF-8, kept in the index as modified UTF-7 (RFC 6855 3).
+    bool m_utf8{false};
     uint64_t m_told_modseq{0};
     // Input: what is not yet a whole command, the command being gathered with its literals, and how much of a literal
     // is still to come.

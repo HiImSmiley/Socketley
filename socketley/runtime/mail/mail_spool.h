@@ -63,6 +63,8 @@ struct spool_entry
     uint8_t     ret{0};
     std::string envid;
     bool        delay_told{false};
+    // REQUIRETLS was asked of its MAIL: it goes on only to a server checked by DANE or MTA-STS (RFC 8689).
+    bool        requiretls{false};
     // What SPF, DKIM and DMARC said of it as it arrived: the value of its Authentication-Results, and the folder
     // DMARC sent it to.
     std::string auth;

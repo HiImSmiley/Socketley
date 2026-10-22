@@ -114,6 +114,7 @@ private:
     clock::time_point                           m_checked{};
     int64_t                                     m_conf_mtime{-1}, m_hosts_mtime{-1};
     std::unordered_map<std::string, job>        m_jobs;
+    clock::time_point                           m_swept{};
     counters                                    m_c;
 };
 

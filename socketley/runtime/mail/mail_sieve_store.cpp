@@ -361,6 +361,22 @@ std::shared_ptr<const sieve::script> sieve_store::active(const std::string& user
         c.name = active_name(user);
         c.files.clear();
     }
+    return fresh(c, user, "the active Sieve script");
+}
+
+std::shared_ptr<const sieve::script> sieve_store::named(const std::string& user, const std::string& name)
+{
+    std::lock_guard<std::mutex> g(m_mu);
+    // A bound on what a stranger's metadata could make this keep.
+    if (m_named.size() > 4096)
+        m_named.clear();
+    compiled& c = m_named[user + '\n' + name];
+    c.name = name;
+    return fresh(c, user, "the imapsieve script");
+}
+
+std::shared_ptr<const sieve::script> sieve_store::fresh(compiled& c, const std::string& user, const char* what)
+{
     // The script and what it includes are looked at; any of them changed, it is read and compiled again.
     const bool same = !c.files.empty() && std::all_of(c.files.begin(), c.files.end(), [](const auto& f) {
         return stamp_of(f.first) == f.second;
@@ -379,7 +395,7 @@ std::shared_ptr<const sieve::script> sieve_store::active(const std::string& user
     c.script = sieve::script::compile(text, why, loader_for(user));
     if (!c.script)
     {
-        LOG_WARN(("mail: the active Sieve script " + c.name + " no longer compiles, and filters nothing: " + why)
+        LOG_WARN(("mail: " + std::string(what) + " " + c.name + " no longer compiles, and filters nothing: " + why)
                      .c_str());
         return nullptr;
     }

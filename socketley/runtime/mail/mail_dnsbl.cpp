@@ -1,5 +1,7 @@
 #include "mail_dnsbl.h"
 
+#include <algorithm>
+
 #include <arpa/inet.h>
 
 #include "../../shared/net/dns_client.h"
@@ -75,8 +77,9 @@ void dnsbl::check(const std::string& ip, std::function<void(std::string zone)> d
     if (!fresh)
         return;
     ++m_asked;
+    // Absolute, so no search domain of resolv.conf is put after a name a list does not hold.
     for (const auto& z : m_zones)
-        it->second.names.push_back(rev + "." + z);
+        it->second.names.push_back(rev + "." + z + ".");
     it->second.done.assign(it->second.names.size(), false);
     step(ip);
 }
@@ -100,6 +103,7 @@ void dnsbl::step(const std::string& ip)
             continue;
         }
         a.done[i] = true;
+        m_poll_ms = 2;
         for (const auto& e : got)
         {
             const uint32_t v = ntohl(reinterpret_cast<const sockaddr_in*>(&e.addr)->sin_addr.s_addr);
@@ -140,10 +144,12 @@ void dnsbl::poll()
                 w({});
         }
     };
-    m_polling = m_io.after(std::chrono::milliseconds(2), [this, alive = m_alive](int64_t) {
+    // Every 2 ms while answers come, backing off to 64 ms while a slow resolver gives none.
+    m_polling = m_io.after(std::chrono::milliseconds(m_poll_ms), [this, alive = m_alive](int64_t) {
         if (!*alive)
             return;
         m_polling = false;
+        m_poll_ms = std::min<uint32_t>(64, m_poll_ms * 2);
         std::vector<std::string> ips;
         for (const auto& [ip, a] : m_asking)
             ips.push_back(ip);

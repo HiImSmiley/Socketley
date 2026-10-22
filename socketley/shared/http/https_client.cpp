@@ -1,6 +1,8 @@
 #include "https_client.h"
 
+#include <arpa/inet.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -10,6 +12,8 @@
 #include <openssl/ssl.h>
 
 #include <cerrno>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
@@ -108,6 +112,37 @@ bool client::init(std::string& err, const std::string& ca_file, std::string user
     return m_ctx || fail(err, why);
 }
 
+namespace
+{
+
+// Whether `sa` is an address anyone may reach: not loopback, private, link-local, shared, unspecified or multicast.
+bool public_address(const sockaddr* sa)
+{
+    if (sa->sa_family == AF_INET)
+    {
+        const auto a = ntohl(reinterpret_cast<const sockaddr_in*>(sa)->sin_addr.s_addr);
+        const auto in = [a](uint32_t net, int bits) { return (a >> (32 - bits)) == (net >> (32 - bits)); };
+        return !(in(0x00000000, 8) || in(0x0A000000, 8) || in(0x7F000000, 8) || in(0xA9FE0000, 16) ||
+                 in(0xAC100000, 12) || in(0xC0A80000, 16) || in(0x64400000, 10) || in(0xE0000000, 3));
+    }
+    if (sa->sa_family == AF_INET6)
+    {
+        const auto& a = reinterpret_cast<const sockaddr_in6*>(sa)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(&a))
+        {
+            sockaddr_in v4{};
+            v4.sin_family = AF_INET;
+            std::memcpy(&v4.sin_addr, a.s6_addr + 12, 4);
+            return public_address(reinterpret_cast<const sockaddr*>(&v4));
+        }
+        return !(IN6_IS_ADDR_UNSPECIFIED(&a) || IN6_IS_ADDR_LOOPBACK(&a) || IN6_IS_ADDR_LINKLOCAL(&a) ||
+                 IN6_IS_ADDR_MULTICAST(&a) || (a.s6_addr[0] & 0xFE) == 0xFC);
+    }
+    return false;
+}
+
+}   // namespace
+
 int client::dial(const std::string& url, std::string& path, std::string& hostport, SSL*& ssl, std::string& err,
                  int timeout_s)
 {
@@ -163,8 +198,14 @@ int client::dial(const std::string& url, std::string& path, std::string& hostpor
         return -1;
     }
     int fd = -1;
+    bool refused = false;
     for (addrinfo* a = res; a && fd < 0; a = a->ai_next)
     {
+        if (m_public_only && m_connect.empty() && !public_address(a->ai_addr))
+        {
+            refused = true;
+            continue;
+        }
         fd = ::socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
         if (fd < 0)
             continue;
@@ -180,7 +221,7 @@ int client::dial(const std::string& url, std::string& path, std::string& hostpor
     freeaddrinfo(res);
     if (fd < 0)
     {
-        err = "cannot connect to " + hostport;
+        err = refused ? host + " names no public address" : "cannot connect to " + hostport;
         return -1;
     }
     if (tls)
@@ -230,8 +271,11 @@ bool put_all(int fd, SSL* ssl, const std::string& s)
 }   // namespace
 
 bool client::request(std::string_view method, const std::string& url, std::string_view type, std::string_view body,
-                     reply& out, std::string& err, int timeout_s)
+                     reply& out, std::string& err, int timeout_s, size_t max_bytes,
+                     const std::vector<std::pair<std::string, std::string>>& headers)
 {
+    // One deadline for the whole exchange, so a server that drips a byte a second cannot hold it longer.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
     std::string path, hostport;
     SSL* ssl = nullptr;
     const int fd = dial(url, path, hostport, ssl, err, timeout_s);
@@ -241,6 +285,10 @@ bool client::request(std::string_view method, const std::string& url, std::strin
                       m_agent + "\r\nAccept: */*\r\nConnection: close\r\n";
     if (!type.empty())
         req += "Content-Type: " + std::string(type) + "\r\n";
+    // A header whose name or value would end the line is left out, not let split the request.
+    for (const auto& [k, v] : headers)
+        if (k.find_first_of("\r\n:") == std::string::npos && v.find_first_of("\r\n") == std::string::npos)
+            req += k + ": " + v + "\r\n";
     req += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
     req += body;
     bool ok = put_all(fd, ssl, req);
@@ -250,11 +298,27 @@ bool client::request(std::string_view method, const std::string& url, std::strin
     bool whole = false;
     while (ok)
     {
+        const auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now());
+        if (left.count() <= 0)
+        {
+            err = hostport + " did not answer within " + std::to_string(timeout_s) + "s";
+            ok = false;
+            break;
+        }
+        timeval tv{static_cast<time_t>(left.count() / 1000000), static_cast<suseconds_t>(left.count() % 1000000)};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         char buf[16384];
         const int n = ssl ? SSL_read(ssl, buf, sizeof buf) : static_cast<int>(::recv(fd, buf, sizeof buf, 0));
         if (n > 0)
         {
             raw.append(buf, static_cast<size_t>(n));
+            // The head is allowed its own 16 KiB beside the body's bound.
+            if (max_bytes && raw.size() > max_bytes + (16u << 10))
+            {
+                err = hostport + " answered more than " + std::to_string(max_bytes) + " bytes";
+                ok = false;
+                break;
+            }
             continue;
         }
         if (!ssl && n < 0 && errno == EINTR)

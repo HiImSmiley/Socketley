@@ -1322,6 +1322,7 @@ project "fuzz_mail"
         "socketley/runtime/mail/mail_sieve_store.cpp",
         "socketley/runtime/mail/managesieve_session.cpp",
         "socketley/runtime/mail/imap_order.cpp",
+        "socketley/runtime/mail/pop3_session.cpp",
         "socketley/shared/util/base64.cpp"
     }
     links(tls_libs())
@@ -2868,6 +2869,44 @@ project "test_mqtt"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+project "test_mail_more"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        ".",
+        "thirdparty/doctest",
+        "thirdparty/sol2",
+        "thirdparty/luajit",
+        "socketley",
+        "include/linux"
+    }
+
+    libdirs { "thirdparty/luajit", "thirdparty/liburing" }
+    links { "socketley_sdk", "luajit", "uring:static" } links(tls_libs())
+
+    files { "test/unit/test_mail_more.cpp" }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 project "test_mail"
     kind "ConsoleApp"
     language "C++"
@@ -2882,10 +2921,12 @@ project "test_mail"
 
     files { "test/unit/test_mail.cpp", "socketley/runtime/mail/smtp_session.cpp", "socketley/runtime/mail/mail_compose.cpp",
             "socketley/runtime/mail/mail_dkim.cpp", "socketley/runtime/mail/mail_aliases.cpp",
-            "socketley/runtime/mail/mail_verify.cpp", "socketley/runtime/dns/dns_wire.cpp", "socketley/runtime/mail/mail_mime.cpp",
+            "socketley/runtime/mail/mail_verify.cpp", "socketley/runtime/mail/mail_arc.cpp",
+            "socketley/runtime/dns/dns_wire.cpp", "socketley/runtime/mail/mail_mime.cpp",
             "test/unit/test_mail_sieve.cpp", "socketley/runtime/mail/mail_sieve.cpp",
             "socketley/shared/util/base64.cpp", "socketley/runtime/mail/mail_tls_policy.cpp",
-            "socketley/shared/net/public_suffix.cpp", "socketley/runtime/mail/mail_sieve_store.cpp",
+            "socketley/shared/net/public_suffix.cpp", "socketley/shared/net/idna.cpp",
+            "socketley/runtime/mail/mail_sieve_store.cpp",
             "socketley/runtime/mail/managesieve_session.cpp", "socketley/runtime/mail/imap_order.cpp",
             "socketley/shared/util/deflate.cpp", "socketley/shared/util/inflate.cpp" }
     links(tls_libs())

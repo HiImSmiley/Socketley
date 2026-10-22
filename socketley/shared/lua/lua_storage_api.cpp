@@ -29,6 +29,7 @@ const char* usage(op kind)
         case op::put_more:
         case op::make_bucket:
         case op::get_range:
+        case op::abort:
             break;   // the identity provider's and the mail runtime's, which no script is given
     }
     return "";
@@ -314,6 +315,7 @@ lua_storage_client::mode lua_storage_client::begin(lua_State* L, int tag)
         case op::put_more:
         case op::make_bucket:
         case op::get_range:
+        case op::abort:
             return shape();   // the identity provider's and the mail runtime's, which no script is given
     }
 
@@ -360,6 +362,7 @@ int lua_storage_client::push_values(lua_State* L, int tag, request_status st, st
         case op::put_more:
         case op::make_bucket:
         case op::get_range:
+        case op::abort:
             // The mail runtime's, which no script asks.
             lua_pushnil(L);
             return 1;

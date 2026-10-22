@@ -19,6 +19,12 @@
 //      once, and every parenthesis has its partner.
 //   6  bytes a ManageSieve client sends, in pieces cut where a 0xFF byte stands, user u password p signing in: every
 //      reply is lines that are a status, a quoted string or a literal that says its own length.
+//   8  bytes a POP3 client sends, in pieces cut where a 0xFF byte stands, user u password p signing in to a maildrop
+//      of two: nothing is removed but at QUIT, each once, and a line of a multi-line answer that begins with a dot
+//      is stuffed.
+
+#include <algorithm>
+#include <cctype>
 
 #include "fuzz_common.h"
 
@@ -29,6 +35,7 @@
 #include "../../socketley/runtime/mail/mail_sieve.h"
 #include "../../socketley/runtime/mail/mail_sieve_store.h"
 #include "../../socketley/runtime/mail/managesieve_session.h"
+#include "../../socketley/runtime/mail/pop3_session.h"
 #include "../../socketley/runtime/mail/imap_order.h"
 #include "../../socketley/runtime/mail/smtp_session.h"
 
@@ -429,6 +436,71 @@ void order_case(std::string_view in)
     FUZZ_CHECK(v.size() <= 64, "sort lost or made messages");
 }
 
+struct pop3_hooks : pop3_session::hooks
+{
+    std::string out;
+    bool closed{false};
+    bool quit_seen{false};
+    std::vector<uint32_t> removed;
+    void reply(std::string_view b) override { out.append(b); }
+    void start_tls() override {}
+    void login(std::string user, std::string password, std::function<void(account, std::string)> done) override
+    {
+        done(user == "u" && password == "p" ? account::yes : user == "x" ? account::unreachable : account::no, user);
+    }
+    void maildrop(const std::string&, std::function<void(bool, uint32_t, std::vector<pop3_session::message>)> done) override
+    {
+        done(true, 7, {{3, 40, "a"}, {9, 22, "b"}});
+    }
+    void read(const pop3_session::message& m, std::function<void(std::shared_ptr<const std::string>)> done) override
+    {
+        // The first a message whose body has a line that is a dot alone, the second one cut without a final CRLF.
+        done(std::make_shared<const std::string>(m.key == "a" ? "Subject: x\r\n\r\n.\r\n..two\r\nend\r\n"
+                                                              : "Subject: y\r\n\r\nno end"));
+    }
+    void remove(const std::string&, std::vector<uint32_t> uids, std::function<void(bool)> done) override
+    {
+        removed.insert(removed.end(), uids.begin(), uids.end());
+        done(true);
+    }
+    void close() override { closed = true; }
+};
+
+void pop3_case(std::string_view in)
+{
+    pop3_hooks h;
+    pop3_config cfg;
+    cfg.hostname = "mx.example.com";
+    cfg.tls_offered = true;
+    cfg.login_in_clear = true;
+    pop3_session s(cfg, h);
+    s.greet();
+    std::string upper_in(in);
+    for (char& c : upper_in)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    while (!in.empty() && !h.closed)
+    {
+        const size_t cut = in.find('\xff');
+        s.input(in.substr(0, cut));
+        in = cut == std::string_view::npos ? std::string_view{} : in.substr(cut + 1);
+    }
+    // Nothing is deleted but at a QUIT, and only what the maildrop had, each once.
+    FUZZ_CHECK(h.removed.empty() || upper_in.find("QUIT") != std::string::npos, "a message removed before QUIT");
+    std::vector<uint32_t> r = h.removed;
+    std::sort(r.begin(), r.end());
+    FUZZ_CHECK(std::adjacent_find(r.begin(), r.end()) == r.end(), "a message removed twice");
+    FUZZ_CHECK(std::all_of(r.begin(), r.end(), [](uint32_t u) { return u == 3 || u == 9; }), "a UID the maildrop lacks");
+    // Every reply is whole lines, and a line of a multi-line answer that begins with a dot is stuffed.
+    std::string_view o = h.out;
+    FUZZ_CHECK(o.starts_with("+OK"), "a greeting that is not +OK");
+    FUZZ_CHECK(o.empty() || o.ends_with("\r\n"), "a reply that is no whole line");
+    for (size_t at = 0; (at = o.find("\r\n.", at)) != std::string_view::npos; at += 3)
+    {
+        const std::string_view after = o.substr(at + 3);
+        FUZZ_CHECK(after.starts_with("\r\n") || after.starts_with("."), "a dot line neither stuffed nor the end");
+    }
+}
+
 }   // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
@@ -438,7 +510,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     if (size < 1 || size > (64u << 10))
         return 0;
     const std::string_view in(reinterpret_cast<const char*>(data) + 1, size - 1);
-    switch (data[0] % 8)
+    switch (data[0] % 9)
     {
         case 0: smtp(in); break;
         case 1: mime_case(in); break;
@@ -448,6 +520,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         case 5: sieve_case(in); break;
         case 6: managesieve_case(in); break;
         case 7: order_case(in); break;
+        case 8: pop3_case(in); break;
     }
     return 0;
 }

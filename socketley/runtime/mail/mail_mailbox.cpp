@@ -40,6 +40,23 @@ std::string refusal_of(const rpc::reply& r)
 
 }   // namespace
 
+namespace
+{
+
+// `s` cut to at most `n` bytes between whole UTF-8 characters, so metadata and an event hold no broken one.
+std::string utf8_cut(std::string s, size_t n)
+{
+    if (s.size() <= n)
+        return s;
+    size_t k = n;
+    while (k > 0 && (static_cast<unsigned char>(s[k]) & 0xC0) == 0x80)
+        --k;
+    s.resize(k);
+    return s;
+}
+
+}   // namespace
+
 struct mailboxes::writing
 {
     entry_ptr e;
@@ -170,8 +187,9 @@ void mailboxes::take_answer(std::string_view rest, known& k)
 
 uint64_t mailboxes::quota_of(const std::string& user) const
 {
+    // A user with no quota of their own has the runtime's --default-quota.
     const auto it = m_quota.find(lower(user));
-    return it == m_quota.end() ? 0 : it->second;
+    return it == m_quota.end() || it->second == 0 ? m_run.owner().get_default_quota() : it->second;
 }
 
 void mailboxes::make_bucket(std::function<void(bool)> then)
@@ -284,9 +302,9 @@ void mailboxes::deliver(const entry_ptr& e, const std::string& user, const std::
                         continue;
                     kept.append(name.data(), name.size()).append(":").append(value.data(), value.size()).append("\r\n");
                     if (socketley::ascii::iequals(name, "From"))
-                        w->from = header_value(source, "From").substr(0, 256);
+                        w->from = utf8_cut(header_value(source, "From"), 256);
                     else if (socketley::ascii::iequals(name, "Subject"))
-                        w->subject = header_value(source, "Subject").substr(0, 512);
+                        w->subject = utf8_cut(header_value(source, "Subject"), 512);
                 }
                 if (source.ends_with("\r\n\r\n") || source == "\r\n")
                     kept += "\r\n";
@@ -393,8 +411,17 @@ void mailboxes::put_piece(const std::shared_ptr<writing>& w)
     rq.kind = rpc::op::put_more;
     rq.stream = w->stream;
     const size_t n = std::min<size_t>(w->pending.size(), rpc::max_value);
-    rq.data = w->pending.substr(0, n);
-    w->pending.erase(0, n);
+    // The last piece is moved into the request rather than copied out of the buffer.
+    if (n == w->pending.size())
+    {
+        rq.data = std::move(w->pending);
+        w->pending.clear();
+    }
+    else
+    {
+        rq.data.assign(w->pending, 0, n);
+        w->pending.erase(0, n);
+    }
     rq.last = w->pending.empty() && w->read_off >= w->e->body_len;
     const bool last = rq.last;
     ask(m_storage, rpc::encode(rq), [this, w, last, alive = m_alive](request_status st, std::string_view bytes) {
@@ -423,6 +450,15 @@ void mailboxes::finish(const std::shared_ptr<writing>& w, int code, std::string 
 {
     if (!w->done)
         return;
+    // A stream begun and given up is ended at the store now, not when it next sweeps for stale ones.
+    if (code / 100 != 2 && !w->stream.empty())
+    {
+        rpc::request rq;
+        rq.kind = rpc::op::abort;
+        rq.stream = std::move(w->stream);
+        w->stream.clear();
+        ask(m_storage, rpc::encode(rq), [](request_status, std::string_view) {});
+    }
     if (code / 100 == 2)
     {
         ++m_stored;
@@ -431,8 +467,11 @@ void mailboxes::finish(const std::shared_ptr<writing>& w, int code, std::string 
         {
             const size_t first = w->key.find('/'), last = w->key.rfind('/');
             if (first != std::string::npos && last > first)
+            {
                 imap->delivered(w->key.substr(0, first), w->key.substr(first + 1, last - first - 1), w->key, w->total,
                                 w->e->at_ms);
+                m_run.stored(w->key.substr(0, first), w->total);
+            }
         }
         if (on_stored)
         {

@@ -2,6 +2,7 @@
 // The mail runtime on its sockets: SMTP on its port, submission with STARTTLS and over TLS on theirs, reads from a
 // buffer ring so a connection that says nothing holds no read buffer of its own, each message streamed to the spool
 // as it arrives and answered once it is on the disk, then handed to the delivery.
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -21,6 +22,9 @@
 #include "imap_session.h"
 #include "managesieve_session.h"
 #include "mail_dnsbl.h"
+#include "mail_greylist.h"
+#include "mail_reports.h"
+#include "pop3_session.h"
 #include "../../shared/util/deflate.h"
 #include "../../shared/util/inflate.h"
 #include "mail_sieve_store.h"
@@ -102,7 +106,7 @@ public:
     route_to route(const address& a, bool from_null) const;
     // A message of this runtime's own making queued, as a bounce or `socketley send` is: false when it cannot be.
     void queue_message(const std::string& from, const std::vector<std::string>& rcpts, std::string body, bool bounce,
-                       std::string user, std::function<void(bool ok, std::string id)> done);
+                       std::string user, std::function<void(bool ok, std::string id)> done, bool requiretls = false);
     uint32_t shard() const;
     std::string state_dir() const { return m_state_dir; }
     uint64_t next_cookie() { return m_next_cookie++; }
@@ -115,10 +119,22 @@ public:
     imap_store* imap() const { return m_imap.get(); }
     // Whether the script decides recipients, and so takes those no mailbox has.
     bool script_takes() const;
+    // The runtime's own secret, which SRS signs the senders it rewrites with.
+    const std::string& secret() const { return m_verp_key; }
+    // A message `size` bytes long stored in `user`'s mailbox: the user is told once their quota is nearly full.
+    void stored(const std::string& user, uint64_t size);
+    // The DMARC and TLS results the reports of a day are made of.
+    reports& report_book() { return m_reports; }
+    // A local part less its tag, user+tag being user's, by --recipient-delimiter.
+    std::string_view without_detail(std::string_view local) const;
+    // imapsieve (RFC 6785): the script `folder` names run for what a client did to `uids` there, APPEND, COPY or
+    // FLAG, and what it decided done to them.
+    void imap_sieve(const std::string& user, const std::string& folder, std::string cause, std::vector<uint32_t> uids,
+                    std::string changed);
 
 private:
-    enum class port_kind : uint8_t { smtp, submission, submissions, imap, imaps, sieve };
-    struct conn : smtp_session::hooks, imap_session::hooks, managesieve_session::hooks
+    enum class port_kind : uint8_t { smtp, submission, submissions, imap, imaps, sieve, pop3, pop3s, lmtp, sts };
+    struct conn : smtp_session::hooks, imap_session::hooks, managesieve_session::hooks, pop3_session::hooks
     {
         mail_run* run{nullptr};
         uint64_t id{0};
@@ -148,6 +164,10 @@ private:
         std::unique_ptr<smtp_session> smtp;
         std::unique_ptr<imap_session> imap;
         std::unique_ptr<managesieve_session> sieve;
+        std::unique_ptr<pop3_session> pop3;
+        // An MTA-STS policy fetch: its request, read until its head ends.
+        bool sts{false};
+        std::string sts_in;
         // COMPRESS=DEFLATE: what goes out compressed as one block a loop turn, and what comes in opened.
         std::unique_ptr<socketley::deflater> zout;
         std::unique_ptr<socketley::inflater> zin;
@@ -190,12 +210,21 @@ private:
         void close() override;
         void login(std::string user, std::string password, std::function<void(account, std::string)> done) override;
         void offload(std::function<void()> job, std::function<void()> done) override;
+        void maildrop(const std::string& user,
+                      std::function<void(bool, uint32_t, std::vector<pop3_session::message>)> done) override;
+        void read(const pop3_session::message& m, std::function<void(std::shared_ptr<const std::string>)> done) override;
+        void remove(const std::string& user, std::vector<uint32_t> uids, std::function<void(bool)> done) override;
         void acknowledge() override;
         void reply_shared(const std::shared_ptr<const std::string>& bytes, size_t off, size_t len) override;
         size_t backlog() const override { return owed + zplain.size(); }
         bool start_compress() override;
         void later(std::function<void()> f) override;
         void when_drained(std::function<void()> f) override;
+        void imap_acted(const std::string& user, const std::string& folder, std::string cause, std::vector<uint32_t> uids,
+                        std::string changed) override
+        {
+            run->imap_sieve(user, folder, std::move(cause), std::move(uids), std::move(changed));
+        }
     };
     struct listener
     {
@@ -215,6 +244,8 @@ private:
     void bytes_in(conn& c, const char* p, size_t n);
     void tls_in(conn& c, const char* p, size_t n);
     void plain_in(conn& c, const char* p, size_t n);
+    // An MTA-STS policy fetch: the policy for mta-sts.<one of its domains>, else 404, and the connection closed.
+    void sts_input(conn& c, std::string_view bytes);
     void out(conn& c, std::string_view bytes);
     void queue_owned(conn& c, std::string_view bytes);
     void queue_shared(conn& c, const std::shared_ptr<const std::string>& bytes, size_t off, size_t len);
@@ -276,9 +307,26 @@ private:
     socketley::watched<alias_table> m_aliases;
     std::string m_hostname;
     std::vector<std::string> m_domains;
+    // --arc-trust, split.
+    std::vector<std::string> m_arc_trusted;
     std::string m_state_dir;
 
-    listener m_smtp, m_sub, m_subs, m_imap_l, m_imaps_l, m_sieve_l;
+    listener m_smtp, m_sub, m_subs, m_imap_l, m_imaps_l, m_sieve_l, m_pop3_l, m_pop3s_l, m_lmtp_l, m_sts_l;
+    // Every listener, for the loops over them.
+    std::array<listener*, 10> listeners()
+    {
+        return {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l, &m_sieve_l, &m_pop3_l, &m_pop3s_l, &m_lmtp_l, &m_sts_l};
+    }
+    // The MTA-STS policy its domains publish, and the id its TXT names it by.
+    std::string sts_policy() const;
+    std::string sts_id() const;
+    std::unique_ptr<greylist> m_greylist;
+    reports m_reports;
+    int64_t m_next_report_ms{0};
+    // Reports made and their TLS ones' rua looked up, and mail of them sent.
+    void send_reports();
+    // What a user is told once their mailbox passes --quota-warn, kept for the run.
+    std::unordered_set<std::string> m_quota_warned;
     std::unique_ptr<imap_store> m_imap;
     std::unordered_map<uint64_t, std::unique_ptr<conn>> m_conns;
     // Connections and failed sign-ins by client address, and each address's message rate, for the limits on them.
@@ -312,6 +360,8 @@ private:
 
     std::unordered_map<uint64_t, std::function<void(request_status, std::string_view)>> m_replies;
     uint64_t m_next_cookie{1};
+    void imap_sieve_apply(const std::string& user, const std::shared_ptr<imap_folder>& f, uint32_t uid,
+                          std::string_view bytes, const sieve::outcome& out, const std::string& own);
     std::shared_ptr<bool> m_alive;
 
     uint64_t m_received{0};
@@ -333,6 +383,12 @@ private:
     uint64_t m_dmarc_rejected{0};
     uint64_t m_blocklisted{0};
     uint64_t m_quarantined{0};
+    uint64_t m_spam_rejected{0};
+    // The spool's disk has too little room for more mail.
+    bool m_disk_low{false};
+    uint64_t m_spam_junked{0};
+    uint64_t m_greylisted{0};
+    uint64_t m_reports_sent{0};
 };
 
 }   // namespace socketley::mail

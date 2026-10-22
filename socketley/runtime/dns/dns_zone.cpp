@@ -253,7 +253,7 @@ struct type_name { const char* name; uint16_t code; };
 constexpr type_name known_types[] = {
     {"A", type::A}, {"NS", type::NS}, {"CNAME", type::CNAME}, {"SOA", type::SOA}, {"PTR", type::PTR},
     {"HINFO", type::HINFO}, {"MX", type::MX}, {"TXT", type::TXT}, {"AAAA", type::AAAA}, {"SRV", type::SRV},
-    {"CAA", type::CAA}, {"DS", type::DS},
+    {"CAA", type::CAA}, {"DS", type::DS}, {"TLSA", type::TLSA},
 };
 
 bool parse_type(std::string_view s, uint16_t& out)
@@ -323,6 +323,7 @@ bool rdata_fits(uint16_t t, std::string_view rd)
         case type::PTR:   return wire_name_end(rd, 0) == rd.size();
         case type::MX:    return rd.size() >= 3 && wire_name_end(rd, 2) == rd.size();
         case type::SRV:   return rd.size() >= 7 && wire_name_end(rd, 6) == rd.size();
+        case type::TLSA:  return rd.size() >= 4;
         case type::SOA:
         {
             const size_t m = wire_name_end(rd, 0);
@@ -526,6 +527,45 @@ bool parse_rdata(uint16_t t, const std::vector<token>& tk, size_t from, std::str
             for (char c : tag)
                 out += static_cast<char>(lower(static_cast<uint8_t>(c)));
             out += text_of(tk[from + 2]);
+            return true;
+        }
+        case type::TLSA:
+        {
+            // usage selector matching-type and the data in hex (RFC 6698 2.2).
+            if (n < 4)
+            {
+                why = "takes a usage, a selector, a matching type and the data in hex";
+                return false;
+            }
+            for (size_t k = 0; k < 3; ++k)
+            {
+                uint8_t v = 0;
+                if (!parse_uint(arg(k), v))
+                {
+                    why = "'" + std::string(arg(k)) + "' is not a number from 0 to 255";
+                    return false;
+                }
+                out += static_cast<char>(v);
+            }
+            std::string hex;
+            for (size_t k = 3; k < n; ++k)
+                hex += arg(k);
+            if (hex.empty() || hex.size() % 2)
+            {
+                why = "the TLSA data is hex, two digits a byte";
+                return false;
+            }
+            for (size_t k = 0; k < hex.size(); k += 2)
+            {
+                uint8_t b = 0;
+                const auto [e, ec] = std::from_chars(hex.data() + k, hex.data() + k + 2, b, 16);
+                if (ec != std::errc{} || e != hex.data() + k + 2)
+                {
+                    why = "the TLSA data is not hex";
+                    return false;
+                }
+                out += static_cast<char>(b);
+            }
             return true;
         }
         default:

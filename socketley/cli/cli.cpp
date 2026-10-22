@@ -951,9 +951,20 @@ int cli_send(int argc, char** argv)
         return 1;
     }
 
-    // A recipient said with --to makes it a message for a mail runtime, written there.
-    if (argc >= 4 && std::string_view(argv[3]).starts_with("-"))
+    // A flag only a mail message takes makes it one for a mail runtime, written there; any other words, a "-1" or a
+    // "--" among them, are a message for a server or a client as they are.
+    static constexpr std::string_view mail_flags[] = {"--to",   "-t",     "--cc",   "--bcc",  "--from",   "--reply-to",
+                                                      "--subject", "-s", "--text", "--header", "--html", "--attach",
+                                                      "--raw"};
+    if (argc >= 4 && std::any_of(std::begin(mail_flags), std::end(mail_flags),
+                                 [&](std::string_view f) { return f == argv[3]; }))
         return cli_mail_send(argc, argv);
+    if (argc >= 4 && std::string_view(argv[3]) == "--")
+    {
+        for (int i = 3; i + 1 < argc; ++i)
+            argv[i] = argv[i + 1];
+        --argc;
+    }
 
     std::string name = argv[2];
     std::string message;

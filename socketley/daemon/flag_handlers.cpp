@@ -27,6 +27,7 @@
 #include "../runtime/idp/idp_logic.h"
 #include "../shared/net/ip_block.h"
 #include "../shared/net/dns_feed.h"
+#include "../shared/net/idna.h"
 #include "../runtime/storage/s3_vhost.h"
 #include "../runtime/storage/sync_mode.h"
 #include "../runtime/storage/sync_runners.h"
@@ -1893,25 +1894,141 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             }
             ml->set_dnsbl(pa.args[++i]);
             return 0;
+        case fnv1a("--pop3"):
+            return port("--pop3 requires a port from 1 to 65535, such as 110\n", &mail_instance::set_pop3_port);
+        case fnv1a("--pop3s"):
+            return port("--pop3s requires a port from 1 to 65535, such as 995\n", &mail_instance::set_pop3s_port);
+        case fnv1a("--lmtp"):
+            return port("--lmtp requires a port from 1 to 65535, such as 24\n", &mail_instance::set_lmtp_port);
+        case fnv1a("--mta-sts-port"):
+            return port("--mta-sts-port requires a port from 1 to 65535, such as 443\n", &mail_instance::set_mta_sts_port);
+        case fnv1a("--greylist"):
+        {
+            uint64_t secs = 0;
+            if (!take_duration(pa, i, 0, 86400, "--greylist requires a duration up to 1d, such as 5m, or 0 for none\n", secs))
+                return 1;
+            ml->set_greylist(static_cast<uint32_t>(secs));
+            return 0;
+        }
+        case fnv1a("--rspamd"):
+            if (!(next.starts_with("http://") || next.starts_with("https://")) || next.find(' ') != std::string_view::npos)
+            {
+                std::cout << "--rspamd requires an http:// or https:// URL, such as http://127.0.0.1:11333\n";
+                return 1;
+            }
+            ml->set_rspamd(pa.args[++i]);
+            return 0;
+        case fnv1a("--recipient-delimiter"):
+            if (next.empty() || (next != "none" && (next.size() > 4 || next.find_first_of(" @\"") != std::string_view::npos)))
+            {
+                std::cout << "--recipient-delimiter requires the characters that divide a user from a tag, such as +, or none\n";
+                return 1;
+            }
+            ml->set_recipient_delimiter(next == "none" ? std::string_view{} : next);
+            ++i;
+            return 0;
+        case fnv1a("--reports"):
+            ml->set_reports(true);
+            return 0;
+        case fnv1a("--dmarc-rua"):
+            if (next.empty() || next.find('@') == std::string_view::npos || next.find_first_of(" ,;\"") != std::string_view::npos)
+            {
+                std::cout << "--dmarc-rua requires the address reports are mailed to, such as dmarc@example.com\n";
+                return 1;
+            }
+            ml->set_dmarc_rua(pa.args[++i]);
+            return 0;
+        case fnv1a("--tls-rpt"):
+            if (next.empty() || next.find('@') == std::string_view::npos || next.find_first_of(" ,;\"") != std::string_view::npos)
+            {
+                std::cout << "--tls-rpt requires the address reports are mailed to, such as tlsrpt@example.com\n";
+                return 1;
+            }
+            ml->set_tls_rpt(pa.args[++i]);
+            return 0;
+        case fnv1a("--mta-sts"):
+            if (next != "enforce" && next != "testing")
+            {
+                std::cout << "--mta-sts requires enforce or testing\n";
+                return 1;
+            }
+            ml->set_mta_sts(pa.args[++i]);
+            return 0;
+        case fnv1a("--default-quota"):
+        {
+            size_t bytes = 0;
+            if (next.empty() || !parse_size_suffix(next, bytes))
+            {
+                std::cout << "--default-quota requires a size, such as 1G, or 0 for no bound\n";
+                return 1;
+            }
+            ++i;
+            ml->set_default_quota(bytes);
+            return 0;
+        }
+        case fnv1a("--quota-warn"):
+        {
+            uint64_t n = 0;
+            const auto r = std::from_chars(next.data(), next.data() + next.size(), n);
+            if (next.empty() || r.ec != std::errc() || r.ptr != next.data() + next.size() || n > 100)
+            {
+                std::cout << "--quota-warn requires a percent from 0 to 100, such as 90\n";
+                return 1;
+            }
+            ++i;
+            ml->set_quota_warn(static_cast<uint32_t>(n));
+            return 0;
+        }
+        case fnv1a("--arc-trust"):
+            if (next.empty() || next.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789.-,") != std::string_view::npos ||
+                next.front() == '.' || next.find("..") != std::string_view::npos)
+            {
+                std::cout << "--arc-trust requires a forwarder's domain, or a comma list of them, such as lists.example.org\n";
+                return 1;
+            }
+            ml->set_arc_trust(pa.args[++i]);
+            return 0;
+        case fnv1a("--dkim-next"):
+            if (next.empty() || next.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") != std::string_view::npos)
+            {
+                std::cout << "--dkim-next requires a name of lower-case letters, digits and hyphens\n";
+                return 1;
+            }
+            ml->set_dkim_next(pa.args[++i]);
+            return 0;
         // The dns runtime whose zones are the mail domains.
         case fnv1a("--dns"):
             return runtime("--dns requires the name of a dns runtime of this daemon\n", &mail_instance::set_dns, false);
         case fnv1a("--mail-domain"):
-            if (next.empty() || next.find_first_of(" /@") != std::string_view::npos)
-            {
-                std::cout << "--mail-domain requires a domain, or a comma list of them, such as example.com\n";
-                return 1;
-            }
-            ml->set_mail_domains(pa.args[++i]);
-            return 0;
         case fnv1a("--hostname"):
-            if (next.empty() || next.find_first_of(" /@,") != std::string_view::npos)
+        {
+            // Each a DNS name, as it goes into MX and HELO; one past ASCII is kept as its A-labels.
+            const bool host = pa.hashes[i] == fnv1a("--hostname");
+            std::string names, why;
+            bool good = !next.empty();
+            for (std::string_view rest = next; good && !rest.empty();)
             {
-                std::cout << "--hostname requires the name the runtime greets with, such as mail.example.com\n";
+                const size_t comma = rest.find(',');
+                const std::string one = socketley::idna::to_ascii(rest.substr(0, comma));
+                rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+                good = !one.empty() && (!host || comma == std::string_view::npos) &&
+                       dns_feed::valid_name(one, why);
+                names += (names.empty() ? "" : ",") + one;
+            }
+            if (!good)
+            {
+                std::cout << (host ? "--hostname requires the name the runtime greets with, such as mail.example.com"
+                                   : "--mail-domain requires a domain, or a comma list of them, such as example.com")
+                          << (why.empty() ? "" : ": " + why) << "\n";
                 return 1;
             }
-            ml->set_hostname(pa.args[++i]);
+            ++i;
+            if (host)
+                ml->set_hostname(names);
+            else
+                ml->set_mail_domains(names);
             return 0;
+        }
         case fnv1a("--no-reply"):
             ml->set_no_reply(true);
             return 0;

@@ -70,6 +70,7 @@ enum cap : uint32_t
     c_virustest = 1u << 24,
     c_enotify = 1u << 25,
     c_ihave = 1u << 26,
+    c_imapsieve = 1u << 27,
 };
 
 struct cap_name
@@ -107,6 +108,7 @@ constexpr cap_name cap_names[] = {
     {"virustest", c_virustest},
     {"enotify", c_enotify},
     {"ihave", c_ihave},
+    {"imapsieve", c_imapsieve},
     {"comparator-i;octet", 0},
     {"comparator-i;ascii-casemap", 0},
 };
@@ -2323,7 +2325,12 @@ namespace
 
 struct runner
 {
-    runner(const script::program& prog, const message& msg, const context& ctx) : p(prog), cur(&prog), m(msg), c(ctx) {}
+    runner(const script::program& prog, const message& msg, const context& ctx) : p(prog), cur(&prog), m(msg), c(ctx)
+    {
+        // A message already in a folder starts with the flags it has there (RFC 6785 3.5).
+        if (c.imap)
+            flags = c.imap->flags;
+    }
 
     const script::program& p;
     // The script being run, the root or one it included, whose require decides what its strings mean.
@@ -2880,16 +2887,29 @@ struct runner
                     return false;
                 // The items RFC 5183 names; one this server does not know makes the test false.
                 std::string value;
+                // Under imapsieve the message is in the store, after delivery, and imap.* say what was done (RFC 6785 3.7).
                 if (name == "domain")
                     value = c.domain;
                 else if (name == "host")
                     value = c.host;
                 else if (name == "location")
-                    value = "MDA";
+                    value = c.imap ? "MS" : "MDA";
                 else if (name == "name")
                     value = "socketley";
                 else if (name == "phase")
-                    value = "during";
+                    value = c.imap ? "post" : "during";
+                else if (name.starts_with("imap.") && !c.imap)
+                    return false;
+                else if (name == "imap.cause")
+                    value = c.imap->cause;
+                else if (name == "imap.mailbox")
+                    value = c.imap->mailbox;
+                else if (name == "imap.user")
+                    value = c.imap->user;
+                else if (name == "imap.email")
+                    value = c.imap->email;
+                else if (name == "imap.changedflags")
+                    value = c.imap->changed;
                 else if (name == "remote-host")
                     value = c.remote_host;
                 else if (name == "remote-ip")
@@ -3312,6 +3332,12 @@ struct runner
             case ck::reject:
             case ck::ereject:
             {
+                // A message in a folder has no one left to refuse it to (RFC 6785 3.3).
+                if (c.imap)
+                {
+                    fail(k.line, "reject cannot be used on a message in a folder");
+                    return;
+                }
                 if (rejected)
                 {
                     fail(k.line, "a second reject");
@@ -3334,7 +3360,11 @@ struct runner
                 actions.push_back(std::move(a));
                 return;
             }
-            case ck::vacation: vacation_command(k); return;
+            // A client filing its own mail answers no one (RFC 6785 3.3).
+            case ck::vacation:
+                if (!c.imap)
+                    vacation_command(k);
+                return;
             case ck::set:
             {
                 std::string v(expand(k.b, s1, k.line));
@@ -3884,7 +3914,7 @@ std::string_view extensions()
 {
     return "fileinto reject ereject envelope encoded-character imap4flags copy vacation vacation-seconds subaddress "
            "body relational comparator-i;ascii-numeric variables date index mailbox regex editheader duplicate "
-           "include environment spamtest spamtestplus virustest enotify ihave";
+           "include environment spamtest spamtestplus virustest enotify ihave imapsieve";
 }
 
 bool parse_mailto(std::string_view uri, std::vector<std::string>& to, std::string& subject, std::string& body)

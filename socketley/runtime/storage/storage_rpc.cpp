@@ -107,6 +107,8 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
     }
     ++m_c.requests;
     runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
+    // A stream its writer stopped feeding is looked for at every request, not only as another begins.
+    sweep_streams();
 
     switch (rq.kind)
     {
@@ -422,7 +424,7 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
             state->ticket = ticket;
             m_rpc[ticket] = state;
             const uint64_t off = rq.size;
-            const uint64_t len = std::min<uint64_t>(rq.max_keys, storage_rpc::max_value);
+            const uint64_t len = std::min<uint64_t>(rq.length, storage_rpc::max_value);
             m_store.open_object(rq.bucket, rq.key, 4096, [this, state, answer, off, len](open_result o) {
                 if (state->done)
                 {
@@ -543,7 +545,6 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
 
         case op::put_begin:
         {
-            sweep_streams();
             ++m_c.puts;
             object_meta meta;
             meta.content_type = rq.content_type.empty() ? "binary/octet-stream" : rq.content_type;
@@ -569,6 +570,15 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
             storage_rpc::reply r;
             r.next = std::move(id);
             answer(op::put_begin, r);
+            return true;
+        }
+
+        case op::abort:
+        {
+            // A writer that gave up says so, and its stream goes now rather than at the next sweep.
+            if (m_rpc_streams.count(rq.stream))
+                end_stream(rq.stream, st::io_error, nullptr);
+            answer(rq.kind, storage_rpc::reply{});
             return true;
         }
 

@@ -171,6 +171,12 @@ bool from_cache_line(std::string_view line, std::string& domain, sts& p)
         return false;
     domain = std::string(w[0]);
     p.id = std::string(w[1]);
+    // A line that does not read is dropped, never taken as no policy, which would let an enforced one go.
+    if (p.id.empty() || p.id.size() > 32 ||
+        !std::all_of(p.id.begin(), p.id.end(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)); }))
+        return false;
+    if (w[2] != "enforce" && w[2] != "testing" && w[2] != "none")
+        return false;
     p.mode = w[2] == "enforce" ? sts_mode::enforce : w[2] == "testing" ? sts_mode::testing : sts_mode::none;
     const auto r = std::from_chars(w[3].data(), w[3].data() + w[3].size(), p.expires_s);
     if (r.ec != std::errc())

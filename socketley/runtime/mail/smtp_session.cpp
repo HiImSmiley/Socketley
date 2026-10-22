@@ -247,7 +247,7 @@ void smtp_session::say(int code, std::string_view enhanced, std::string_view tex
 
 void smtp_session::greet()
 {
-    say(220, {}, m_cfg.hostname + " ESMTP socketley");
+    say(220, {}, m_cfg.hostname + (m_cfg.lmtp ? " LMTP socketley" : " ESMTP socketley"));
 }
 
 void smtp_session::error(int code, std::string_view enhanced, std::string_view text)
@@ -276,6 +276,7 @@ void smtp_session::reset()
     m_rcpt_dsn.clear();
     m_ret = 0;
     m_envid.clear();
+    m_requiretls = false;
     m_8bit = false;
     m_utf8 = false;
     m_declared = 0;
@@ -422,6 +423,11 @@ void smtp_session::command(std::string_view line)
     const std::string_view verb = line.substr(0, sp);
     const std::string_view arg = sp == std::string_view::npos ? std::string_view{} : trim(line.substr(sp + 1));
     using socketley::ascii::iequals;
+    // LMTP's greeting is LHLO alone, which EHLO and HELO are not (RFC 2033 4.1).
+    if (m_cfg.lmtp && iequals(verb, "LHLO"))
+        return ehlo(arg, true);
+    if (m_cfg.lmtp && (iequals(verb, "EHLO") || iequals(verb, "HELO")))
+        return error(500, "5.5.1", "This is LMTP: LHLO");
     if (iequals(verb, "EHLO") || iequals(verb, "HELO"))
         return ehlo(arg, iequals(verb, "EHLO"));
     if (iequals(verb, "MAIL"))
@@ -521,8 +527,13 @@ void smtp_session::ehlo(std::string_view arg, bool extended)
     out += "250-SMTPUTF8\r\n";
     out += "250-CHUNKING\r\n";
     out += "250-DSN\r\n";
+    // What a client may pipeline into one transaction before it is told 452 (RFC 9422).
+    out += "250-LIMITS RCPTMAX=" + std::to_string(m_cfg.max_rcpt) + "\r\n";
     if (m_cfg.tls_offered && !m_cfg.tls_active)
         out += "250-STARTTLS\r\n";
+    // Offered inside TLS only, where the message came protected (RFC 8689 4.1).
+    if (m_cfg.tls_active && !m_cfg.lmtp)
+        out += "250-REQUIRETLS\r\n";
     if (m_cfg.auth_offered && m_user.empty() && (m_cfg.tls_active || m_cfg.auth_in_clear))
         out += "250-AUTH PLAIN LOGIN\r\n";
     out += "250 ENHANCEDSTATUSCODES\r\n";
@@ -551,6 +562,7 @@ void smtp_session::mail(std::string_view arg)
     uint64_t declared = 0;
     uint8_t ret = 0;
     std::string envid;
+    bool requiretls = false;
     while (!params.empty())
     {
         const size_t sp = params.find(' ');
@@ -593,6 +605,12 @@ void smtp_session::mail(std::string_view arg)
                 return error(501, "5.5.4", "Bad ENVID");
             envid = std::string(p.substr(6));
         }
+        else if (socketley::ascii::iequals(p, "REQUIRETLS"))
+        {
+            if (!m_cfg.tls_active)
+                return error(530, "5.7.10", "REQUIRETLS needs TLS");
+            requiretls = true;
+        }
         else
             return error(555, "5.5.4", "Unsupported parameter");
     }
@@ -602,7 +620,7 @@ void smtp_session::mail(std::string_view arg)
     if (!from.empty() && from.domain.empty())
         return error(501, "5.1.7", "Bad sender address syntax");
     wait();
-    m_hooks.mail_from(from, [this, alive = m_alive, from, utf8, eight, declared, ret, envid](rcpt_verdict v) {
+    m_hooks.mail_from(from, [this, alive = m_alive, from, utf8, eight, declared, ret, envid, requiretls](rcpt_verdict v) {
         if (!*alive)
             return;
         if (v.code / 100 == 2)
@@ -611,6 +629,7 @@ void smtp_session::mail(std::string_view arg)
             m_have_from = true;
             m_ret = ret;
             m_envid = envid;
+            m_requiretls = requiretls;
             m_utf8 = utf8;
             m_8bit = eight;
             m_declared = declared;
@@ -951,8 +970,11 @@ void smtp_session::message_end()
             return;
         if (v.code / 100 == 2)
             ++m_messages;
-        say(v.code, v.code / 100 == 2 ? "2.0.0" : v.code / 100 == 4 ? "4.3.0" : "5.7.1",
-            v.text.empty() ? (v.code / 100 == 2 ? "OK" : "Message refused") : v.text);
+        // LMTP answers once for each recipient it took, in their order (RFC 2033 4.2).
+        const size_t answers = m_cfg.lmtp ? std::max<size_t>(1, m_rcpts.size()) : 1;
+        for (size_t i = 0; i < answers; ++i)
+            say(v.code, v.code / 100 == 2 ? "2.0.0" : v.code / 100 == 4 ? "4.3.0" : "5.7.1",
+                v.text.empty() ? (v.code / 100 == 2 ? "OK" : "Message refused") : v.text);
         reset();
         resume();
     });

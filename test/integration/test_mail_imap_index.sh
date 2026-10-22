@@ -16,6 +16,15 @@
 #   * SEARCH missing a word in a base64 part, an encoded subject, or a header's second occurrence
 #   * a message the storage lost answered as empty, or an empty one without a BODYSTRUCTURE
 #   * an EXPUNGE that swallows what another session added meanwhile
+#   * MULTIAPPEND taking part of what it was given, or not saying every UID
+#   * a UTF-8 folder name under UTF8=ACCEPT kept as other than modified UTF-7, or a literal8 message refused
+#   * RENAME leaving the folders under it behind, or RENAME INBOX refused or leaving its messages
+#   * CREATE taking a special use its name does not have
+#   * a MAILBOXID a RENAME changes, an EMAILID SEARCH cannot find
+#   * METADATA not kept, not kept across a restart, or past its bounds; DEPTH and MAXSIZE not followed
+#   * imapsieve not run for what a client APPENDs or COPYs into a folder that names a script, or its fileinto,
+#     discard and addflag not done there
+#   * BINARY giving a part still encoded, a NUL in a plain literal, or an encoding it cannot undo answered OK
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -208,10 +217,121 @@ elif step == "copy":
     r += b.cmd("NOOP")
     ex = [int(x.split()[1]) for x in r if x.endswith(" EXISTS")]
     say("an EXPUNGE tells what another session added meanwhile", ex and ex[-1] == 301, r)
+elif step == "ext":
+    b = C(("bob", "bobpassword12"))
+    caps = b.cmd("CAPABILITY")[0].split()
+    say("CAPABILITY offers MULTIAPPEND, UTF8=ACCEPT, CREATE-SPECIAL-USE and APPENDLIMIT",
+        all(c in caps for c in ("MULTIAPPEND", "UTF8=ACCEPT", "CREATE-SPECIAL-USE")) and any(c.startswith("APPENDLIMIT=") for c in caps), caps)
+    r = b.cmd("STATUS INBOX (APPENDLIMIT)")
+    say("STATUS answers APPENDLIMIT", re.search(r"APPENDLIMIT \d+", r[0]) is not None, r)
+    b.cmd("CREATE Multi")
+    m1, m2 = msg("multi one"), msg("multi two")
+    r = b.send(("APPEND Multi (\\Seen) {%d+}\r\n" % len(m1)).encode() + m1 + (" {%d+}\r\n" % len(m2)).encode() + m2 + b"\r\n")
+    st = b.cmd("STATUS Multi (MESSAGES)")
+    say("MULTIAPPEND puts both in and says both UIDs", re.search(r"APPENDUID \d+ 1:2\]", r[-1]) is not None and "MESSAGES 2" in st[0], (r, st))
+    r = b.cmd("CREATE Foo (USE (\\Sent))")
+    say("CREATE with a special use the name does not have says USEATTR", "[USEATTR]" in r[-1], r)
+    r = b.cmd("ENABLE UTF8=ACCEPT")
+    say("ENABLE UTF8=ACCEPT is enabled", any(x == "* ENABLED UTF8=ACCEPT" for x in r), r)
+    r = b.send('CREATE "Entwürfe-ä"\r\n'.encode())
+    say("and a folder is made under its UTF-8 name", r[-1].split()[1] == "OK", r)
+    r = b.cmd('LIST "" "Entw*"')
+    say("which LIST says in UTF-8 to it", any("Entwürfe-ä" in x for x in r), r)
+    r = C(("bob", "bobpassword12")).cmd('LIST "" "Entw*"')
+    say("and in modified UTF-7 to a client that did not enable it", any("Entw&APw-rfe-&AOQ-" in x for x in r), r)
+    m3 = "From: x@else.test\r\nSubject: Grüße\r\n\r\nüber\r\n".encode()
+    r = b.send(("APPEND INBOX UTF8 (~{%d+}\r\n" % len(m3)).encode() + m3 + b")\r\n")
+    say("APPEND takes a message as UTF8 (~{n}...)", r[-1].split()[1] == "OK" and "APPENDUID" in r[-1], r)
+    raw = bytes(range(256))
+    m4 = ("From: x@else.test\r\nSubject: bin\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=zz\r\n\r\n"
+          "--zz\r\nContent-Type: text/plain\r\n\r\nhi\r\n--zz\r\nContent-Type: application/octet-stream\r\n"
+          "Content-Transfer-Encoding: base64\r\n\r\n%s\r\n--zz\r\nContent-Type: text/plain\r\n"
+          "Content-Transfer-Encoding: x-uuencode\r\n\r\nbegin 644 x\r\n--zz--\r\n" % base64.b64encode(raw).decode()).encode()
+    r = b.send(("APPEND INBOX {%d+}\r\n" % len(m4)).encode() + m4 + b"\r\n")
+    u4 = int(re.search(r"APPENDUID \d+ (\d+)", r[-1]).group(1))
+    b.cmd("SELECT INBOX")
+    b.s.sendall(b"bin1 UID FETCH %d (BINARY.SIZE[2] BINARY.PEEK[2])\r\n" % u4)
+    got = b""
+    while True:
+        got += b.s.recv(65536)
+        i = got.find(b"\r\nbin1 ")
+        if i >= 0 and got.find(b"\r\n", i + 2) >= 0:
+            break
+    say("BINARY.SIZE says a base64 part's size decoded", b"BINARY.SIZE[2] 256" in got, got[:200])
+    say("and BINARY gives its bytes decoded, as a literal8 since a NUL is among them", b"BINARY[2] ~{256}\r\n" + raw in got, got[:200])
+    r = b.cmd("UID FETCH %d (BINARY.PEEK[3])" % u4)
+    say("a part of an encoding none decodes is NO [UNKNOWN-CTE]", "[UNKNOWN-CTE]" in r[-1], r)
+    r = b.cmd("UID FETCH %d (EMAILID THREADID)" % u4)
+    eid = re.search(r"EMAILID \((\w+)\)", r[0])
+    say("FETCH gives an EMAILID and a THREADID of NIL", eid is not None and "THREADID NIL" in r[0], r)
+    r = b.cmd("UID SEARCH EMAILID %s" % (eid.group(1) if eid else "x"))
+    say("and SEARCH EMAILID finds that message alone", r[0].split()[2:] == [str(u4)], r)
+    b.cmd("CREATE Work/2026/Q1")
+    before = re.search(r"MAILBOXID \((\w+)\)", b.cmd("STATUS Work/2026 (MAILBOXID)")[0])
+    sel = b.cmd("SELECT Work")
+    say("SELECT says the folder's MAILBOXID", any("[MAILBOXID (" in x for x in sel), sel)
+    r = b.cmd("RENAME Work Job")
+    l = b.cmd('LIST "" "*"')
+    names = [x.rsplit(" ", 1)[1].strip('"') for x in l if x.startswith("* LIST")]
+    say("RENAME takes the folders under it along", r[-1].split()[1] == "OK" and "Job/2026" in names and "Job/2026/Q1" in names
+        and not any(n.startswith("Work") for n in names), (r, names))
+    after = re.search(r"MAILBOXID \((\w+)\)", b.cmd("STATUS Job/2026 (MAILBOXID)")[0])
+    say("and each keeps its MAILBOXID", before is not None and after is not None and before.group(1) == after.group(1), (before, after))
+    a = C(("alice", "alicepassword1"))
+    n = int(re.search(r"MESSAGES (\d+)", a.cmd("STATUS INBOX (MESSAGES)")[0]).group(1))
+    r = a.cmd("RENAME INBOX Old")
+    s1, s2 = a.cmd("STATUS Old (MESSAGES)")[0], a.cmd("STATUS INBOX (MESSAGES)")[0]
+    say("RENAME INBOX moves its messages and leaves it empty", n > 0 and r[-1].split()[1] == "OK" and
+        "MESSAGES %d" % n in s1 and "MESSAGES 0" in s2, (n, r, s1, s2))
+    a.cmd("CREATE Atom")
+    small, big = msg("small"), msg("big", body="z" * 60000 + "\r\n")
+    r = a.send(("APPEND Atom {%d+}\r\n" % len(small)).encode() + small + (" {%d+}\r\n" % len(big)).encode() + big + b"\r\n")
+    st = a.cmd("STATUS Atom (MESSAGES)")
+    say("a MULTIAPPEND one of which is refused puts none of them in", "[OVERQUOTA]" in r[-1] and "MESSAGES 0" in st[0], (r, st))
+elif step == "meta":
+    b = C(("bob", "bobpassword12"))
+    say("CAPABILITY offers METADATA", "METADATA" in b.cmd("CAPABILITY")[0].split())
+    r = b.cmd('SETMETADATA "" (/private/comment "hello there")')
+    g = b.cmd('GETMETADATA "" /private/comment')
+    say("a server entry is set and read back", r[-1].split()[1] == "OK" and any('/private/comment "hello there"' in x for x in g), (r, g))
+    b.cmd('SETMETADATA INBOX (/shared/comment "inbox note" /shared/vendor/x/y "deep")')
+    g = b.cmd("GETMETADATA (DEPTH infinity) INBOX /shared")
+    say("DEPTH infinity gives every entry under a name", any("/shared/comment" in x and "/shared/vendor/x/y" in x for x in g), g)
+    g = b.cmd("GETMETADATA (DEPTH 1) INBOX /shared")
+    say("and DEPTH 1 those one level down", any("/shared/comment" in x and "/shared/vendor/x/y" not in x for x in g), g)
+    g = b.cmd("GETMETADATA (MAXSIZE 3) \"\" /private/comment")
+    say("an entry past MAXSIZE is left out and said LONGENTRIES", "[METADATA LONGENTRIES 11]" in g[-1] and not g[0].startswith("* METADATA"), g)
+    b.cmd("SETMETADATA INBOX (/shared/comment NIL)")
+    g = b.cmd("GETMETADATA INBOX /shared/comment")
+    say("NIL takes an entry away", any("/shared/comment NIL" in x for x in g), g)
+    r = b.cmd('SETMETADATA Nowhere (/shared/comment "x")')
+    say("an entry of a folder not there is refused", "[NONEXISTENT]" in r[-1], r)
+    r = b.cmd('SETMETADATA INBOX (/other/comment "x")')
+    say("and one not under /private or /shared", r[-1].split()[1] == "BAD", r)
+    # imapsieve
+    b.cmd("CREATE Filtered")
+    r = b.cmd('SETMETADATA Filtered (/shared/imapsieve/script "onfile")')
+    for subject in ("to-archive", "flag-me", "drop-me"):
+        b.append("Filtered", msg(subject))
+    b.cmd("SELECT INBOX")
+    b.append("INBOX", msg("copied-one"))
+    b.cmd("SELECT INBOX")
+    uidc = int(b.cmd("UID SEARCH SUBJECT copied-one")[0].split()[-1])
+    b.cmd("UID COPY %d Filtered" % uidc)
+    time.sleep(1.5)
+    st = b.cmd("STATUS Archive2 (MESSAGES)")
+    say("imapsieve files what a client put into its folder where the script says", "MESSAGES 1" in st[0], st)
+    b.cmd("SELECT Filtered")
+    lines = b.cmd("FETCH 1:* (FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+    say("and takes it out of the folder, and what it discards", not any("to-archive" in x or "drop-me" in x for x in lines), lines)
+    say("and sets the flags it adds", any("flag-me" in x and "\\Flagged" in x for x in lines), lines)
+    say("and runs for a COPY into it too, with cause COPY", any("copied-one" in x and "$Copied" in x for x in lines), lines)
 elif step == "after":
     b = C(("bob", "bobpassword12")); b.cmd("SELECT INBOX")
     r = b.cmd("UID SEARCH KEYWORD project-x")
     say("a keyword is kept across a restart", len(r[0].split()) == 3, r)
+    g = b.cmd('GETMETADATA "" /private/comment')
+    say("and METADATA too", any('"hello there"' in x for x in g), g)
 PY
 
 run() { timeout 120 python3 "$T/client.py" "$IM" "$P" "$PS" "$@" 2>&1; }
@@ -226,6 +346,18 @@ done
 tally < <(run lost "$lost" "$key" | grep -E '^(ok|bad) ')
 tally < <(run quota | grep -E '^(ok|bad) ')
 tally < <(run copy | grep -E '^(ok|bad) ')
+tally < <(run ext | grep -E '^(ok|bad) ')
+cat > "$T/onfile.sieve" <<'SV'
+require ["imapsieve", "environment", "fileinto", "imap4flags", "mailbox"];
+if environment :is "imap.cause" "APPEND" {
+    if header :contains "subject" "to-archive" { fileinto :create "Archive2"; }
+    elsif header :contains "subject" "flag-me" { addflag "\\Flagged"; }
+    elsif header :contains "subject" "drop-me" { discard; }
+}
+if environment :is "imap.cause" "COPY" { addflag "$Copied"; }
+SV
+out=$("$BIN" mail m sieve bob put onfile "$T/onfile.sieve" 2>&1) || bad "the imapsieve script is put" "$out"
+tally < <(run meta | grep -E '^(ok|bad) ')
 "$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1; ready_tcp 127.0.0.1 "$IM" >/dev/null
 tally < <(run after | grep -E '^(ok|bad) ')
 

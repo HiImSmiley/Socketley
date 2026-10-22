@@ -8,6 +8,7 @@
 #include <map>
 
 #include "imap_order.h"
+#include "imap_utf7.h"
 #include "mail_compose.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/base64.h"
@@ -321,10 +322,13 @@ struct item
     bool peek{false};
     bool partial{false};
     uint64_t from{0}, count{0};
+    // BINARY[...] (1) or BINARY.SIZE[...] (2), a part with its encoding undone (RFC 3516).
+    uint8_t binary{0};
     bool body() const
     {
         return name == "ENVELOPE" || name == "BODYSTRUCTURE" || name == "BODY" || name.starts_with("BODY[") ||
-               name.starts_with("BODY.PEEK[") || name == "RFC822" || name == "RFC822.HEADER" || name == "RFC822.TEXT";
+               name.starts_with("BODY.PEEK[") || name == "RFC822" || name == "RFC822.HEADER" || name == "RFC822.TEXT" ||
+               binary;
     }
     // Whether the message's header alone answers it: ENVELOPE, and the top-level header or its fields.
     bool header_only() const
@@ -335,7 +339,7 @@ struct item
         if (br == std::string::npos)
             return false;
         const std::string_view sec = std::string_view(name).substr(br + 1);
-        return sec.starts_with("HEADER]") || sec.starts_with("HEADER.FIELDS");
+        return !binary && (sec.starts_with("HEADER]") || sec.starts_with("HEADER.FIELDS"));
     }
 };
 
@@ -350,19 +354,26 @@ bool parse_item(std::string_view t, item& it)
         it.answer = u;
         static constexpr std::string_view known[] = {"UID", "FLAGS", "INTERNALDATE", "RFC822.SIZE", "ENVELOPE",
                                                      "BODYSTRUCTURE", "BODY", "RFC822", "RFC822.HEADER", "RFC822.TEXT",
-                                                     "MODSEQ"};
+                                                     "MODSEQ", "EMAILID", "THREADID"};
         return std::find(std::begin(known), std::end(known), u) != std::end(known);
     }
     const size_t close = u.find(']', br);
     if (close == std::string::npos)
         return false;
     const std::string head = u.substr(0, br);
-    if (head != "BODY" && head != "BODY.PEEK")
+    const bool binary = head == "BINARY" || head == "BINARY.PEEK" || head == "BINARY.SIZE";
+    if (head != "BODY" && head != "BODY.PEEK" && !binary)
         return false;
-    it.peek = head == "BODY.PEEK";
+    it.peek = head == "BODY.PEEK" || head == "BINARY.PEEK" || head == "BINARY.SIZE";
     it.section = std::string(t.substr(br + 1, close - br - 1));
-    it.name = "BODY[" + upper(it.section) + "]";
+    // A BINARY section is part numbers alone.
+    if (binary && it.section.find_first_not_of("0123456789.") != std::string::npos)
+        return false;
+    it.binary = !binary ? 0 : head == "BINARY.SIZE" ? 2 : 1;
+    it.name = (head == "BINARY.SIZE" ? "BINARY.SIZE[" : binary ? "BINARY[" : "BODY[") + upper(it.section) + "]";
     it.answer = it.name;
+    if (it.binary == 2 && close + 1 != t.size())
+        return false;
     std::string_view rest = t.substr(close + 1);
     if (!rest.empty())
     {
@@ -435,7 +446,9 @@ void imap_session::finish(const std::string& tag, std::string_view status, std::
     out += ' ';
     out.append(status);
     out += ' ';
-    out.append(text);
+    // A line's end in what a client gave and is said back would start a response of its own.
+    for (const char c : text)
+        out += c == '\r' || c == '\n' || c == '\0' ? ' ' : c;
     out += "\r\n";
     m_hooks.reply(out);
 }
@@ -444,11 +457,31 @@ static std::string capabilities(const imap_config& cfg)
 {
     std::string c = "IMAP4rev1 LITERAL+ SASL-IR IDLE NAMESPACE UIDPLUS MOVE UNSELECT CHILDREN SPECIAL-USE ID ENABLE "
                     "CONDSTORE QRESYNC ESEARCH LIST-EXTENDED LIST-STATUS STATUS=SIZE QUOTA QUOTA=RES-STORAGE SORT "
-                    "SORT=DISPLAY THREAD=ORDEREDSUBJECT THREAD=REFERENCES COMPRESS=DEFLATE";
+                    "SORT=DISPLAY THREAD=ORDEREDSUBJECT THREAD=REFERENCES COMPRESS=DEFLATE MULTIAPPEND UTF8=ACCEPT "
+                    "CREATE-SPECIAL-USE BINARY OBJECTID METADATA APPENDLIMIT=" +
+                    std::to_string(cfg.max_append);
+    if (!cfg.imapsieve.empty())
+        c += " IMAPSIEVE=" + cfg.imapsieve;
     if (cfg.tls_offered && !cfg.tls_active)
         c += " STARTTLS";
     c += cfg.tls_active || cfg.login_in_clear ? " AUTH=PLAIN" : " LOGINDISABLED";
     return c;
+}
+
+std::string imap_session::box(std::string_view given) const
+{
+    if (!m_utf8)
+        return std::string(given);
+    std::string kept = imap_utf7::encode(given);
+    return kept.empty() && !given.empty() ? std::string(given) : kept;
+}
+
+std::string imap_session::shown(std::string_view kept) const
+{
+    if (!m_utf8)
+        return std::string(kept);
+    std::string text = imap_utf7::decode(kept);
+    return text.empty() && !kept.empty() ? std::string(kept) : text;
 }
 
 void imap_session::greet()
@@ -520,6 +553,12 @@ bool imap_session::tokenize(std::string_view s, std::vector<token>& out) const
                 return false;
             ++i;
             out.push_back({token::string, std::move(v)});
+            continue;
+        }
+        // A literal8 (RFC 3516), as UTF8=ACCEPT's APPEND sends a message, is read as a literal.
+        if (c == '~' && i + 1 < s.size() && s[i + 1] == '{')
+        {
+            ++i;
             continue;
         }
         if (c == '{')
@@ -634,8 +673,9 @@ void imap_session::run()
         {
             const size_t open = line.rfind('{');
             // A literal is a token of its own: after a space or a parenthesis, or where a line goes on after one.
+            const size_t mark = open != std::string::npos && open > 0 && line[open - 1] == '~' ? open - 1 : open;
             if (open != std::string::npos &&
-                (open == 0 ? !m_cmd.empty() : line[open - 1] == ' ' || line[open - 1] == '('))
+                (mark == 0 ? !m_cmd.empty() : line[mark - 1] == ' ' || line[mark - 1] == '('))
             {
                 std::string num = line.substr(open + 1, line.size() - open - 2);
                 const bool plus = !num.empty() && num.back() == '+';
@@ -939,6 +979,13 @@ void imap_session::command(std::string tag, std::vector<token> a)
         for (size_t i = 1; i < a.size(); ++i)
         {
             const std::string e = upper(a[i].text);
+            if (e == "UTF8=ACCEPT")
+            {
+                if (!m_utf8)
+                    on += " UTF8=ACCEPT";
+                m_utf8 = true;
+                continue;
+            }
             if (e == "CONDSTORE" && !m_condstore)
                 on += " CONDSTORE";
             else if (e == "QRESYNC" && !m_qresync)
@@ -997,11 +1044,24 @@ void imap_session::command(std::string tag, std::vector<token> a)
         const std::string* name = str(1);
         if (!name)
             return finish(tag, "BAD", "CREATE needs a name");
-        std::string n = *name;
+        std::string n = box(*name);
         if (!n.empty() && n.back() == '/')
             n.pop_back();
-        return m_store.create(m_user, n) ? finish(tag, "OK", "CREATE completed")
-                                         : finish(tag, "NO", "[ALREADYEXISTS] Mailbox exists");
+        // CREATE name (USE (...)): a special use is a folder's by its name here, so only that one's is taken (RFC 6154 3).
+        if (a.size() > 4 && a[2].k == token::open && upper(a[3].text) == "USE" && a[4].k == token::open)
+        {
+            std::string fixed;
+            for (const auto& [sp, use] : imap_store::special())
+                if (iequal(sp, n))
+                    fixed = use;
+            for (size_t k = 5; k < a.size() && a[k].k != token::close; ++k)
+                if (!iequal(a[k].text, fixed))
+                    return finish(tag, "NO", "[USEATTR] Only " + (fixed.empty() ? std::string("no use") : fixed) +
+                                                 " is " + n + "'s");
+        }
+        return m_store.create(m_user, n)
+                   ? finish(tag, "OK", "[MAILBOXID (" + m_store.mailbox_id(m_user, n) + ")] CREATE completed")
+                   : finish(tag, "NO", "[ALREADYEXISTS] Mailbox exists");
     }
     if (cmd == "DELETE" || cmd == "RENAME")
     {
@@ -1017,9 +1077,9 @@ void imap_session::command(std::string tag, std::vector<token> a)
             resume();
         };
         if (cmd == "DELETE")
-            m_store.remove(m_user, *name, done);
+            m_store.remove(m_user, box(*name), done);
         else
-            m_store.rename(m_user, *name, *to, done);
+            m_store.rename(m_user, box(*name), box(*to), done);
         return;
     }
     if (cmd == "SUBSCRIBE" || cmd == "UNSUBSCRIBE")
@@ -1027,11 +1087,13 @@ void imap_session::command(std::string tag, std::vector<token> a)
         const std::string* name = str(1);
         if (!name)
             return finish(tag, "BAD", cmd + " needs a mailbox");
-        m_store.set_subscribed(m_user, *name, cmd == "SUBSCRIBE");
+        m_store.set_subscribed(m_user, box(*name), cmd == "SUBSCRIBE");
         return finish(tag, "OK", cmd + " completed");
     }
     if (cmd == "APPEND")
         return cmd_append(tag, a);
+    if (cmd == "GETMETADATA" || cmd == "SETMETADATA")
+        return cmd_metadata(tag, a, cmd == "SETMETADATA");
     // One quota root, "", over every folder of the user, in kibibytes (RFC 9208).
     if (cmd == "GETQUOTAROOT" || cmd == "GETQUOTA")
     {
@@ -1191,7 +1253,7 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
     m_view.clear();
     m_state = state::auth;
     m_waiting = true;
-    m_store.open(m_user, a[1].text, [this, alive = m_alive, tag, readonly, condstore, qr](std::shared_ptr<imap_folder> f) {
+    m_store.open(m_user, box(a[1].text), [this, alive = m_alive, tag, readonly, condstore, qr](std::shared_ptr<imap_folder> f) {
         if (!*alive)
             return;
         if (!f)
@@ -1240,6 +1302,7 @@ void imap_session::cmd_select(const std::string& tag, const std::vector<token>& 
         untagged("OK [UIDVALIDITY " + std::to_string(f->uidvalidity) + "] UIDs valid");
         untagged("OK [UIDNEXT " + std::to_string(f->uidnext) + "] Predicted next UID");
         untagged("OK [HIGHESTMODSEQ " + std::to_string(f->highestmodseq) + "] Highest");
+        untagged("OK [MAILBOXID (" + f->id() + ")] Ok");
         // What changed since the client last looked, under the UIDVALIDITY it knows (RFC 7162 3.2.5).
         if (qr.asked && qr.uidvalidity == f->uidvalidity)
         {
@@ -1305,11 +1368,15 @@ std::string imap_session::status_text(const imap_folder& f, const std::vector<st
             v = std::to_string(f.highestmodseq);
         else if (it == "SIZE")
             v = std::to_string(size);
+        else if (it == "APPENDLIMIT")
+            v = std::to_string(m_cfg.max_append);
+        else if (it == "MAILBOXID")
+            v = "(" + f.id() + ")";
         else
             continue;
         out += (out.empty() ? "" : " ") + it + " " + v;
     }
-    return "STATUS " + mime::imap_string(f.name, false) + " (" + out + ")";
+    return "STATUS " + mime::imap_string(shown(f.name), false) + " (" + out + ")";
 }
 
 void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a, bool lsub)
@@ -1326,16 +1393,16 @@ void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a,
     }
     if (i + 1 >= a.size())
         return finish(tag, "BAD", "LIST needs a reference and a pattern");
-    const std::string ref = a[i++].text;
+    const std::string ref = box(a[i++].text);
     std::vector<std::string> pats;
     if (a[i].k == token::open)
     {
         for (++i; i < a.size() && a[i].k != token::close; ++i)
-            pats.push_back(a[i].text);
+            pats.push_back(box(a[i].text));
         ++i;
     }
     else
-        pats.push_back(a[i++].text);
+        pats.push_back(box(a[i++].text));
     bool told_subscribed = only_subscribed && !lsub;
     std::vector<std::string> status;
     if (i + 1 < a.size() && upper(a[i].text) == "RETURN" && a[i + 1].k == token::open)
@@ -1380,7 +1447,7 @@ void imap_session::cmd_list(const std::string& tag, const std::vector<token>& a,
                 if (sp == n && !use.empty())
                     attrs += " " + use;
             listed.push_back(std::string(lsub ? "LSUB" : "LIST") + " (" + attrs + ") \"/\" " +
-                             mime::imap_string(n, false));
+                             mime::imap_string(shown(n), false));
             listed.push_back(n);
         }
         if (status.empty())
@@ -1436,7 +1503,7 @@ void imap_session::cmd_status(const std::string& tag, const std::vector<token>& 
     std::vector<std::string> items;
     for (size_t i = 3; i < a.size() && a[i].k != token::close; ++i)
         items.push_back(upper(a[i].text));
-    const std::string name = a[1].text;
+    const std::string name = box(a[1].text);
     m_waiting = true;
     m_store.open(m_user, name, [this, alive = m_alive, tag, items, name](std::shared_ptr<imap_folder> f) {
         if (!*alive)
@@ -1453,53 +1520,210 @@ void imap_session::cmd_status(const std::string& tag, const std::vector<token>& 
     });
 }
 
+void imap_session::cmd_metadata(const std::string& tag, const std::vector<token>& a, bool set)
+{
+    // GETMETADATA [(MAXSIZE n DEPTH 0|1|infinity)] mailbox entry|(entries), SETMETADATA mailbox (entry value ...).
+    size_t i = 1;
+    uint64_t maxsize = UINT64_MAX;
+    int depth = 0;
+    if (!set && i < a.size() && a[i].k == token::open)
+    {
+        for (++i; i < a.size() && a[i].k != token::close; ++i)
+        {
+            const std::string o = upper(a[i].text);
+            if (o == "MAXSIZE" && i + 1 < a.size())
+                maxsize = std::strtoull(a[++i].text.c_str(), nullptr, 10);
+            else if (o == "DEPTH" && i + 1 < a.size())
+            {
+                const std::string d = upper(a[++i].text);
+                if (d != "0" && d != "1" && d != "INFINITY")
+                    return finish(tag, "BAD", "DEPTH is 0, 1 or infinity");
+                depth = d == "0" ? 0 : d == "1" ? 1 : INT32_MAX;
+            }
+            else
+                return finish(tag, "BAD", "Unknown GETMETADATA option");
+        }
+        ++i;
+    }
+    if (i + 1 >= a.size())
+        return finish(tag, "BAD", "METADATA needs a mailbox and entries");
+    const std::string folder = box(a[i].text);
+    const std::string shown_name = a[i].text;
+    ++i;
+    const auto lower_entry = [](std::string e) {
+        for (char& c : e)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return e;
+    };
+    if (!folder.empty() && m_store.mailbox_id(m_user, folder).empty())
+        return finish(tag, "NO", "[NONEXISTENT] No such mailbox");
+    if (set)
+    {
+        if (a[i].k != token::open)
+            return finish(tag, "BAD", "SETMETADATA needs a list of entries and values");
+        // Each pair is set in turn; the first refused says why, and what came before it stays set.
+        for (++i; i + 1 < a.size() && a[i].k != token::close; i += 2)
+        {
+            const std::string entry = lower_entry(a[i].text);
+            const bool nil = a[i + 1].k == token::atom && upper(a[i + 1].text) == "NIL";
+            const auto why = m_store.set_meta(m_user, folder, entry, nil ? nullptr : &a[i + 1].text);
+            if (why == imap_store::meta_refusal::too_large)
+                return finish(tag, "NO", "[METADATA MAXSIZE " + std::to_string(imap_store::meta_max_value) +
+                                             "] The value is too large");
+            if (why == imap_store::meta_refusal::too_many)
+                return finish(tag, "NO", "[METADATA TOOMANY] Too many entries");
+            if (why == imap_store::meta_refusal::bad_name)
+                return finish(tag, "BAD", "Not an entry name");
+            if (why == imap_store::meta_refusal::no_folder)
+                return finish(tag, "NO", "[NONEXISTENT] No such mailbox");
+        }
+        return finish(tag, "OK", "SETMETADATA completed");
+    }
+    std::vector<std::string> entries;
+    if (a[i].k == token::open)
+        for (++i; i < a.size() && a[i].k != token::close; ++i)
+            entries.push_back(lower_entry(a[i].text));
+    else
+        entries.push_back(lower_entry(a[i].text));
+    std::string out;
+    uint64_t longest = 0;
+    const auto add = [&](const std::string& entry, const std::string* value) {
+        if (value && value->size() > maxsize)
+        {
+            longest = std::max<uint64_t>(longest, value->size());
+            return;
+        }
+        // An entry's name is an atom, as set_meta took only names that are.
+        out += (out.empty() ? "" : " ") + entry + " " +
+               (value ? mime::imap_string(*value, false) : std::string("NIL"));
+    };
+    for (const auto& e : entries)
+    {
+        if (!imap_store::meta_name_ok(e))
+            return finish(tag, "BAD", "Not an entry name");
+        const std::string* v = m_store.meta(m_user, folder, e);
+        if (v || depth == 0)
+            add(e, v);
+        for (const auto& [k, value] : m_store.meta_under(m_user, folder, e, depth))
+            add(k, &value);
+    }
+    if (!out.empty())
+        untagged("METADATA " + mime::imap_string(shown_name, false) + " (" + out + ")");
+    return finish(tag, "OK",
+                  longest ? "[METADATA LONGENTRIES " + std::to_string(longest) + "] GETMETADATA completed"
+                          : "GETMETADATA completed");
+}
+
 void imap_session::cmd_append(const std::string& tag, const std::vector<token>& a)
 {
     if (a.size() < 3)
         return finish(tag, "BAD", "APPEND needs a mailbox and a message");
-    size_t i = 2;
-    uint8_t flags = 0;
-    std::vector<std::string> keywords;
-    if (a[i].k == token::open)
+    // One message or, MULTIAPPEND's, several, each with its flags and date (RFC 3502 6.3.11).
+    struct one
     {
-        for (++i; i < a.size() && a[i].k != token::close; ++i)
-            if (const uint8_t bit = flag_bit(a[i].text))
-                flags |= bit;
-            else if (keyword_ok(a[i].text) && keywords.size() < 64)
-                keywords.push_back(a[i].text);
-        ++i;
-    }
-    int64_t date_ms = 0;
-    if (i + 1 < a.size() && a[i].k == token::string && a[i + 1].k == token::string)
+        uint8_t flags{0};
+        std::vector<std::string> keywords;
+        int64_t date_ms{0};
+        std::string message;
+    };
+    auto all = std::make_shared<std::vector<one>>();
+    for (size_t i = 2; i < a.size();)
     {
-        // An INTERNALDATE the client gave, its time and zone kept, so a migrated mailbox keeps its order.
-        if (const int64_t t = internal_date_ms(a[i].text); t >= 0)
-            date_ms = t;
-        ++i;
+        one m;
+        if (a[i].k == token::open)
+        {
+            for (++i; i < a.size() && a[i].k != token::close; ++i)
+                if (const uint8_t bit = flag_bit(a[i].text))
+                    m.flags |= bit;
+                else if (keyword_ok(a[i].text) && m.keywords.size() < 64)
+                    m.keywords.push_back(a[i].text);
+            ++i;
+        }
+        // An INTERNALDATE the client gave, its time and zone kept, so a migrated mailbox keeps its order; a string
+        // that is none is the message, as MULTIAPPEND's next follows it.
+        if (i + 1 < a.size() && a[i].k == token::string && a[i + 1].k == token::string)
+            if (const int64_t t = internal_date_ms(a[i].text); t >= 0)
+            {
+                m.date_ms = t;
+                ++i;
+            }
+        // UTF8 (~{n}...), the message as a client that enabled UTF8=ACCEPT sends it (RFC 6855 4).
+        if (m_utf8 && i + 3 < a.size() && a[i].k == token::atom && upper(a[i].text) == "UTF8" &&
+            a[i + 1].k == token::open && a[i + 2].k == token::string && a[i + 3].k == token::close)
+        {
+            m.message = a[i + 2].text;
+            i += 4;
+        }
+        else if (i < a.size() && a[i].k == token::string)
+            m.message = a[i++].text;
+        else
+            return finish(tag, "BAD", "APPEND needs the message as a literal");
+        if (m.date_ms == 0)
+            m.date_ms = static_cast<int64_t>(::time(nullptr)) * 1000;
+        m.message = crlf_lines(m.message);
+        all->push_back(std::move(m));
+        if (all->size() > 1000)
+            return finish(tag, "NO", "[LIMIT] Too many messages in one APPEND");
     }
-    if (i >= a.size() || a[i].k != token::string)
-        return finish(tag, "BAD", "APPEND needs the message as a literal");
-    if (date_ms == 0)
-        date_ms = static_cast<int64_t>(::time(nullptr)) * 1000;
-    std::string message = crlf_lines(a[i].text);
     m_waiting = true;
-    m_store.append(m_user, a[1].text, std::move(message), flags, std::move(keywords), date_ms,
-                   [this, alive = m_alive, tag](imap_store::refusal why, uint32_t validity, uint32_t uid) {
-                       if (!*alive)
-                           return;
-                       if (why != imap_store::refusal::none)
-                           finish(tag, "NO", why == imap_store::refusal::quota ? "[OVERQUOTA] The mailbox is full"
-                                             : why == imap_store::refusal::no_folder ? "[TRYCREATE] No such mailbox"
-                                                                                    : "[UNAVAILABLE] The message could not be kept");
-                       else
-                       {
-                           update_view();
-                           finish(tag, "OK",
-                                  "[APPENDUID " + std::to_string(validity) + " " + std::to_string(uid) +
-                                      "] APPEND completed");
-                       }
-                       resume();
-                   });
+    const std::string folder = box(a[1].text);
+    auto made = std::make_shared<std::vector<uint32_t>>();
+    auto step = std::make_shared<std::function<void(size_t)>>();
+    std::weak_ptr<std::function<void(size_t)>> weak = step;
+    *step = [this, alive = m_alive, tag, all, made, folder, weak](size_t at) {
+        // The chain is held by the write it waits on, and goes with the last.
+        auto self = weak.lock();
+        if (!*alive || !self)
+            return;
+        one& m = (*all)[at];
+        m_store.append(m_user, folder, std::move(m.message), m.flags, std::move(m.keywords), m.date_ms,
+                       [this, alive, tag, all, made, folder, self, at](imap_store::refusal why, uint32_t validity,
+                                                                       uint32_t uid) {
+                           if (!*alive)
+                               return;
+                           if (why == imap_store::refusal::none)
+                           {
+                               made->push_back(uid);
+                               if (at + 1 < all->size())
+                               {
+                                   (*self)(at + 1);
+                                   return;
+                               }
+                               update_view();
+                               finish(tag, "OK",
+                                      "[APPENDUID " + std::to_string(validity) + " " + set_text(*made) +
+                                          "] APPEND completed");
+                               m_hooks.imap_acted(m_user, folder, "APPEND", *made, {});
+                               resume();
+                               return;
+                           }
+                           const std::string text = why == imap_store::refusal::quota ? "[OVERQUOTA] The mailbox is full"
+                                                    : why == imap_store::refusal::no_folder
+                                                        ? "[TRYCREATE] No such mailbox"
+                                                        : "[UNAVAILABLE] The message could not be kept";
+                           if (made->empty())
+                           {
+                               finish(tag, "NO", text);
+                               resume();
+                               return;
+                           }
+                           // What went in before the refusal is taken out again, so none of them is appended.
+                           m_store.open(m_user, folder, [this, alive, tag, made, text](std::shared_ptr<imap_folder> f) {
+                               if (!*alive)
+                                   return;
+                               const auto told = [this, alive, tag, text] {
+                                   if (!*alive)
+                                       return;
+                                   finish(tag, "NO", text);
+                                   resume();
+                               };
+                               if (!f)
+                                   return told();
+                               m_store.expunge(m_user, f, *made, true, [told](std::vector<uint32_t>) { told(); });
+                           });
+                       });
+    };
+    (*step)(0);
 }
 
 void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a, size_t from, bool uid)
@@ -1515,11 +1739,11 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
         if (u == "ALL" || u == "FAST" || u == "FULL")
         {
             for (const char* n : {"FLAGS", "INTERNALDATE", "RFC822.SIZE"})
-                items.push_back({n, n, {}, false, false, 0, 0});
+                items.push_back({n, n, {}, false, false, 0, 0, 0});
             if (u != "FAST")
-                items.push_back({"ENVELOPE", "ENVELOPE", {}, false, false, 0, 0});
+                items.push_back({"ENVELOPE", "ENVELOPE", {}, false, false, 0, 0, 0});
             if (u == "FULL")
-                items.push_back({"BODY", "BODY", {}, false, false, 0, 0});
+                items.push_back({"BODY", "BODY", {}, false, false, 0, 0, 0});
             return true;
         }
         item it;
@@ -1563,9 +1787,9 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
     }
     if ((since || m_condstore) && std::any_of(items.begin(), items.end(), [](const item& i) { return i.name == "FLAGS"; }) &&
         std::none_of(items.begin(), items.end(), [](const item& i) { return i.name == "MODSEQ"; }))
-        items.push_back({"MODSEQ", "MODSEQ", {}, false, false, 0, 0});
+        items.push_back({"MODSEQ", "MODSEQ", {}, false, false, 0, 0, 0});
     if (since && std::none_of(items.begin(), items.end(), [](const item& i) { return i.name == "MODSEQ"; }))
-        items.push_back({"MODSEQ", "MODSEQ", {}, false, false, 0, 0});
+        items.push_back({"MODSEQ", "MODSEQ", {}, false, false, 0, 0, 0});
     if (vanished)
     {
         std::vector<std::pair<uint32_t, uint32_t>> asked;
@@ -1584,7 +1808,7 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
             untagged("VANISHED (EARLIER) " + missing);
     }
     if (uid && std::none_of(items.begin(), items.end(), [](const item& i) { return i.name == "UID"; }))
-        items.insert(items.begin(), {"UID", "UID", {}, false, false, 0, 0});
+        items.insert(items.begin(), {"UID", "UID", {}, false, false, 0, 0, 0});
     const bool needs_body = std::any_of(items.begin(), items.end(), [](const item& i) { return i.body(); });
     // Items the header answers read the header alone, not a message of megabytes for its first lines.
     const bool head_only = needs_body && std::all_of(items.begin(), items.end(),
@@ -1604,6 +1828,8 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
         // Whether the bytes of the message answered are its header alone.
         bool from_head{false};
         bool unreadable{false};
+        // A BINARY of a part whose encoding is none this decodes, answered NIL and told at the end (RFC 3516 4.2).
+        bool unknown_cte{false};
         // How far the reads asked for ahead of the one answered reach.
         size_t ahead{0};
     };
@@ -1700,6 +1926,10 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                 out += ' ';
                 if (it.name == "UID")
                     out += std::to_string(m->uid);
+                else if (it.name == "EMAILID")
+                    out += "(" + imap_store::email_id(m->key) + ")";
+                else if (it.name == "THREADID")
+                    out += "NIL";
                 else if (it.name == "INTERNALDATE")
                     out += internal_date(m->date_ms);
                 else if (it.name == "RFC822.SIZE")
@@ -1712,6 +1942,28 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                     out += mime::envelope(std::string_view(*j->bytes).substr(0, part->header_len));
                 else if (it.name == "BODYSTRUCTURE" || it.name == "BODY")
                     out += mime::structure(*part, *j->bytes, it.name == "BODYSTRUCTURE");
+                else if (it.binary)
+                {
+                    std::string decoded;
+                    const int r = mime::binary_of(*j->bytes, *part, it.section, decoded);
+                    j->unknown_cte = j->unknown_cte || r < 0;
+                    if (it.binary == 2)
+                        out += r > 0 ? std::to_string(decoded.size()) : std::string("0");
+                    else if (r < 0)
+                        out += "NIL";
+                    else
+                    {
+                        std::string_view got = decoded;
+                        if (it.partial)
+                            got = it.from >= got.size() ? std::string_view() : got.substr(it.from, it.count);
+                        // A literal8 where a NUL is in it, which no literal may hold.
+                        out += (got.find('\0') != std::string_view::npos ? "~{" : "{") + std::to_string(got.size()) +
+                               "}\r\n";
+                        out.append(got);
+                    }
+                    if (!it.peek)
+                        seen_now = true;
+                }
                 else
                 {
                     std::string spec = it.section;
@@ -1814,7 +2066,10 @@ void imap_session::cmd_fetch(const std::string& tag, const std::vector<token>& a
                 m_told_modseq = m_folder->highestmodseq;
             j->seen.clear();
         }
-        finish(tag, "OK", uid ? "UID FETCH completed" : "FETCH completed");
+        if (j->unknown_cte)
+            finish(tag, "NO", "[UNKNOWN-CTE] A part's Content-Transfer-Encoding is none this decodes");
+        else
+            finish(tag, "OK", uid ? "UID FETCH completed" : "FETCH completed");
         resume();
     };
     auto keep = step;
@@ -1888,6 +2143,14 @@ void imap_session::cmd_store(const std::string& tag, const std::vector<token>& a
     // What this session did itself it is not told again, unless another shard's changes came in with it.
     if (told_all && m_folder->highestmodseq == was + changed)
         m_told_modseq = m_folder->highestmodseq;
+    if (changed)
+    {
+        std::string flags;
+        for (size_t i = at + 1; i < a.size(); ++i)
+            if (a[i].k == token::atom || a[i].k == token::string)
+                flags += (flags.empty() ? "" : " ") + a[i].text;
+        m_hooks.imap_acted(m_user, m_folder->name, "FLAG", uids, std::move(flags));
+    }
     finish(tag, "OK", (modified.empty() ? std::string() : "[MODIFIED " + set_text(modified) + "] ") +
                           (uid ? "UID STORE completed" : "STORE completed"));
 }
@@ -1909,7 +2172,7 @@ bool parse_one(const std::vector<std::string>& t, size_t& i, crit& out, int dept
         return true;
     static constexpr std::string_view one[] = {"KEYWORD", "UNKEYWORD", "LARGER", "SMALLER", "BEFORE", "ON",
                                                "SINCE", "SENTBEFORE", "SENTON", "SENTSINCE", "FROM", "TO",
-                                               "CC", "BCC", "SUBJECT", "BODY", "TEXT", "UID"};
+                                               "CC", "BCC", "SUBJECT", "BODY", "TEXT", "UID", "EMAILID", "THREADID"};
     if (std::find(std::begin(one), std::end(one), k) != std::end(one))
     {
         if (i >= t.size())
@@ -2030,6 +2293,9 @@ bool matches(const crit& c, const imap_message& m, size_t idx, std::string_view 
     }
     if (k == "MODSEQ")
         return m.modseq >= c.num;
+    // No message has a THREADID here, as FETCH says NIL.
+    if (k == "EMAILID" || k == "THREADID")
+        return k == "EMAILID" && c.arg == imap_store::email_id(m.key);
     if (k == "LARGER")
         return m.size > c.num;
     if (k == "SMALLER")
@@ -2426,7 +2692,7 @@ void imap_session::cmd_copy(const std::string& tag, const std::vector<token>& a,
     if (const uint64_t q = m_store.quota(m_user); !move && q && m_store.usage(m_user) + bytes > q)
         return finish(tag, "NO", "[OVERQUOTA] The mailbox is full");
     m_waiting = true;
-    const std::string to = a[from + 1].text;
+    const std::string to = box(a[from + 1].text);
     m_store.copy(m_user, m_folder, uids, to, !move,
                  [this, alive = m_alive, tag, uids, move, uid, to](bool ok, uint32_t validity, std::vector<uint32_t> made) {
                      if (!*alive)
@@ -2457,6 +2723,7 @@ void imap_session::cmd_copy(const std::string& tag, const std::vector<token>& a,
                          i = e + 1;
                      }
                      const std::string code = "[COPYUID " + std::to_string(validity) + " " + src + " " + dst + "] ";
+                     m_hooks.imap_acted(m_user, to, "COPY", made, {});
                      if (!move)
                      {
                          finish(tag, "OK", code + (uid ? "UID COPY completed" : "COPY completed"));

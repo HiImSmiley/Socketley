@@ -1,6 +1,7 @@
 #include "mail_run.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -10,14 +11,21 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/statvfs.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
+
+#include <openssl/pem.h>
+#include <openssl/sha.h>
+#include <openssl/x509.h>
 
 #include "mail_delivery.h"
 #include "mail_compose.h"
 #include "mail_instance.h"
 #include "mail_lua.h"
 #include "mail_mailbox.h"
+#include "mail_rspamd.h"
+#include "mail_srs.h"
 #include "mail_verify.h"
 #include "../idp/idp_session.h"
 #include "../storage/password_hash.h"
@@ -132,6 +140,173 @@ bool mail_run::script_takes() const
     return m_lua && m_lua->wants_rcpt();
 }
 
+void mail_run::stored(const std::string& user, uint64_t size)
+{
+    const uint32_t warn = m_owner.get_quota_warn();
+    const uint64_t quota = m_mailboxes ? m_mailboxes->quota_of(user) : 0;
+    if (!warn || !quota || !m_imap || m_domains.empty())
+        return;
+    const uint64_t used = m_imap->usage(user), mark = quota / 100 * warn;
+    // Told once as it passes the mark, and again only after it fell below it.
+    if (used < mark)
+    {
+        m_quota_warned.erase(user);
+        return;
+    }
+    if (used - std::min(used, size) >= mark || !m_quota_warned.insert(user).second)
+        return;
+    compose c;
+    c.from = "postmaster@" + m_domains.front();
+    c.to = {user.find('@') == std::string::npos ? user + "@" + m_domains.front() : user};
+    c.subject = "Your mailbox is " + std::to_string(used * 100 / quota) + "% full";
+    const auto amount = [](uint64_t b) {
+        return b >= (uint64_t{1} << 20) ? std::to_string(b >> 20) + " MiB" : std::to_string((b + 1023) >> 10) + " KiB";
+    };
+    c.text = "Your mailbox holds " + amount(used) + " of the " + amount(quota) +
+             " it may.\nOnce it is full, mail for you is refused until you delete some.\n";
+    c.headers = {"Auto-Submitted: auto-generated"};
+    std::string from, body, why;
+    std::vector<std::string> rcpts;
+    if (m_delivery && m_delivery->compose_message(c, from, rcpts, body, why))
+        queue_message(from, rcpts, std::move(body), false, "local", [](bool, std::string) {});
+}
+
+void mail_run::send_reports()
+{
+    if (!m_owner.get_reports() || m_domains.empty() || !m_delivery)
+        return;
+    auto list = std::make_shared<std::vector<report_mail>>(
+        m_reports.due(wall::now_ms() / 1000, m_hostname, "postmaster@" + m_domains.front()));
+    if (list->empty())
+        return;
+    // A TLS report's address is its domain's _smtp._tls record's, looked up off the loop (RFC 8460 3).
+    m_checks.submit(m_checks.next_lane(), [list] {
+        auto r = system_check_resolver();
+        for (auto& m : *list)
+        {
+            if (!m.to.empty())
+                continue;
+            std::string domain;
+            for (const auto& [k, v] : m.headers)
+                if (k == "TLS-Report-Domain")
+                    domain = v;
+            std::vector<std::string> txts;
+            bool nx = false;
+            if (domain.empty() || !r->txt("_smtp._tls." + domain, txts, nx))
+                continue;
+            for (const auto& t : txts)
+            {
+                std::string l = t;
+                socketley::ascii::lower_in_place(l);
+                if (!l.starts_with("v=tlsrptv1"))
+                    continue;
+                const size_t at = l.find("rua=");
+                if (at == std::string::npos)
+                    continue;
+                std::string_view rest = std::string_view(t).substr(at + 4);
+                rest = rest.substr(0, rest.find(';'));
+                while (!rest.empty())
+                {
+                    const size_t comma = rest.find(',');
+                    std::string_view uri = rest.substr(0, comma);
+                    rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+                    while (!uri.empty() && uri.front() == ' ')
+                        uri.remove_prefix(1);
+                    if (uri.size() > 7 && socketley::ascii::iequals(uri.substr(0, 7), "mailto:"))
+                        m.to.emplace_back(uri.substr(7));
+                }
+            }
+        }
+    }, [this, list, alive = m_alive] {
+        if (!*alive)
+            return;
+        for (const auto& m : *list)
+        {
+            if (m.to.empty())
+                continue;
+            compose c;
+            c.from = "postmaster@" + m_domains.front();
+            c.to = m.to;
+            c.subject = m.subject;
+            c.text = "A report of the mail this server handled, attached.\n";
+            for (const auto& [k, v] : m.headers)
+                c.headers.push_back(k + ": " + v);
+            c.attachments.push_back({m.filename, m.content_type, m.data});
+            std::string from, body, why;
+            std::vector<std::string> rcpts;
+            if (!m_delivery->compose_message(c, from, rcpts, body, why))
+                continue;
+            ++m_reports_sent;
+            queue_message(from, rcpts, std::move(body), false, "local", [](bool, std::string) {});
+        }
+    });
+}
+
+std::string_view mail_run::without_detail(std::string_view local) const
+{
+    const std::string_view delims = m_owner.get_recipient_delimiter();
+    if (delims.empty())
+        return local;
+    const size_t cut = local.find_first_of(delims);
+    // A local part that begins with the delimiter has no user before it, and is left as it is.
+    return cut == std::string_view::npos || cut == 0 ? local : local.substr(0, cut);
+}
+
+std::string mail_run::sts_policy() const
+{
+    // The one exchanger every domain names, kept a week by the senders that fetch it (RFC 8461 3.2).
+    return "version: STSv1\r\nmode: " + std::string(m_owner.get_mta_sts()) + "\r\nmx: " + m_hostname +
+           "\r\nmax_age: 604800\r\n";
+}
+
+std::string mail_run::sts_id() const
+{
+    const std::string h = socketley::crypto::hmac_sha256("socketley mta-sts", sts_policy());
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    for (size_t i = 0; i < 10 && i < h.size(); ++i)
+    {
+        out += hex[static_cast<uint8_t>(h[i]) >> 4];
+        out += hex[static_cast<uint8_t>(h[i]) & 15];
+    }
+    return out;
+}
+
+void mail_run::sts_input(conn& c, std::string_view bytes)
+{
+    c.sts_in.append(bytes.substr(0, std::min<size_t>(bytes.size(), 8192)));
+    const size_t end = c.sts_in.find("\r\n\r\n");
+    if (end == std::string::npos)
+    {
+        if (c.sts_in.size() >= 8192)
+            close_conn(c);
+        return;
+    }
+    // GET /.well-known/mta-sts.txt for mta-sts.<a domain of this runtime>, and nothing else.
+    const std::string_view head(c.sts_in.data(), end);
+    const std::string_view first = head.substr(0, head.find("\r\n"));
+    std::string host;
+    for (const auto& [name, value] : split_headers(head.substr(first.size() + 2)))
+        if (socketley::ascii::iequals(name, "Host"))
+        {
+            std::string_view v = value;
+            while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
+                v.remove_prefix(1);
+            host = std::string(v.substr(0, v.find_first_of(": \t\r\n")));
+            socketley::ascii::lower_in_place(host);
+        }
+    const bool asked = first.starts_with("GET /.well-known/mta-sts.txt ") && host.starts_with("mta-sts.") &&
+                       is_local_domain(std::string_view(host).substr(8));
+    const std::string body = asked ? sts_policy() : std::string("not found\r\n");
+    c.in_input = true;
+    out(c, std::string(asked ? "HTTP/1.1 200 OK" : "HTTP/1.1 404 Not Found") +
+               "\r\nContent-Type: text/plain\r\nContent-Length: " + std::to_string(body.size()) +
+               "\r\nCache-Control: max-age=86400\r\nConnection: close\r\n\r\n" + body);
+    c.in_input = false;
+    flush(c);
+    close_soon(c);
+}
+
 bool mail_run::is_local_domain(std::string_view d) const
 {
     for (const auto& x : m_domains)
@@ -154,7 +329,21 @@ route_to mail_run::route(const address& a, bool from_null) const
         return {route_to::remote, a.text()};
     if (m_owner.get_no_reply() && no_reply_local(a.local))
         return from_null ? route_to{route_to::sink, {}} : route_to{};
-    if (const auto* t = m_aliases.value().find(a.local, domain))
+    // A bounce to an address SRS made of a sender goes back to that sender, where the address is this runtime's and
+    // young enough; one it did not make is no one's.
+    if (const std::string head = a.local.substr(0, 5);
+        socketley::ascii::iequals(head, "srs0=") || socketley::ascii::iequals(head, "srs1="))
+    {
+        const std::string back = srs::reverse(a.local + "@" + domain, domain, m_verp_key,
+                                              wall::now_ms() / 86400000);
+        return back.empty() ? route_to{} : route_to{route_to::remote, back};
+    }
+    // The address as given first, then the user it is a tag of (user+tag).
+    const std::string base(without_detail(a.local));
+    const auto* t = m_aliases.value().find(a.local, domain);
+    if (!t && base.size() != a.local.size())
+        t = m_aliases.value().find(base, domain);
+    if (t)
     {
         const std::string& first = t->front();
         return first.find('@') == std::string::npos ? route_to{route_to::mailbox, first}
@@ -162,7 +351,7 @@ route_to mail_run::route(const address& a, bool from_null) const
     }
     // A user's own address, which the mailboxes say is one or is not.
     if (m_mailboxes && m_mailboxes->enabled() && !m_owner.get_idp().empty())
-        return {route_to::mailbox, a.local};
+        return {route_to::mailbox, base};
     return {};
 }
 
@@ -358,6 +547,14 @@ bool mail_run::start(std::string& why)
     if (!m_spool.open(m_state_dir + "/spool", false, why))
         return false;
     m_domains = m_owner.domains();
+    m_arc_trusted.clear();
+    for (std::string_view rest = m_owner.get_arc_trust(); !rest.empty();)
+    {
+        const size_t comma = rest.find(',');
+        if (const std::string_view d = rest.substr(0, comma); !d.empty())
+            m_arc_trusted.emplace_back(d);
+        rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+    }
     m_hostname = m_owner.greeting_name();
     if (!m_owner.get_dnsbl().empty())
     {
@@ -481,10 +678,29 @@ bool mail_run::start(std::string& why)
         why = "--sieve keeps the filters of mailboxes, which need --idp and --storage";
         return false;
     }
+    // POP3 reads the INBOX IMAP keeps, and LMTP hands mail to the mailboxes, on every shard.
+    if (m_mailboxes && m_mailboxes->enabled() && m_imap)
+    {
+        if (m_owner.get_pop3_port() && !open_listener(m_pop3_l, m_owner.get_pop3_port(), port_kind::pop3, why))
+            return false;
+        if (m_owner.get_pop3s_port() && !open_listener(m_pop3s_l, m_owner.get_pop3s_port(), port_kind::pop3s, why))
+            return false;
+    }
+    if (m_mailboxes && m_mailboxes->enabled() && m_owner.get_lmtp_port() &&
+        !open_listener(m_lmtp_l, m_owner.get_lmtp_port(), port_kind::lmtp, why))
+        return false;
+    if (m_owner.get_mta_sts_port() && !open_listener(m_sts_l, m_owner.get_mta_sts_port(), port_kind::sts, why))
+        return false;
+    if (m_owner.get_greylist())
+        m_greylist = std::make_unique<greylist>(
+            (std::filesystem::path(mail_suppressed_path(m_owner.get_name())).parent_path() /
+             (std::string(m_owner.get_name()) + ".greylist"))
+                .string(),
+            static_cast<int64_t>(m_owner.get_greylist()) * 1000);
     m_delivery = std::make_unique<delivery>(*this);
     if (!m_delivery->start(why))
         return false;
-    for (listener* l : {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l, &m_sieve_l})
+    for (listener* l : listeners())
         if (l->fd >= 0)
             arm_accept(*l);
     publish_records();
@@ -557,7 +773,7 @@ void mail_run::stop()
     if (m_stopped)
         return;
     m_stopped = true;
-    for (listener* l : {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l, &m_sieve_l})
+    for (listener* l : listeners())
         if (l->fd >= 0)
         {
             ::shutdown(l->fd, SHUT_RDWR);
@@ -624,19 +840,25 @@ void mail_run::accept_done(listener& l, struct io_uring_cqe* cqe)
         socklen_t len = sizeof peer;
         if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &len) < 0) {}
         const std::string ip = peer_ip(peer);
-        const bool smtp_port = l.kind == port_kind::smtp || l.kind == port_kind::submission;
+        const bool smtp_port = l.kind == port_kind::smtp || l.kind == port_kind::submission || l.kind == port_kind::lmtp;
         const bool imap_port = l.kind == port_kind::imap || l.kind == port_kind::imaps;
         const size_t limit = m_owner.get_max_connections() ? m_owner.get_max_connections() : default_max_conns;
         const uint32_t per_ip = l.kind == port_kind::smtp ? smtp_per_ip : other_per_ip;
         const bool full = limit && m_conns.size() >= limit;
         const bool crowded = !loopback(peer) && m_clients[ip].conns >= per_ip;
-        if (m_stopped || full || crowded)
+        // LMTP takes mail for the mailboxes with no check of it, so only a server on this machine may speak it.
+        const bool stranger = l.kind == port_kind::lmtp && !loopback(peer);
+        if (m_stopped || full || crowded || stranger)
         {
             // Refused with a word where the port speaks first in the clear, so a client knows it is a full server.
-            const std::string why = full ? "too many connections" : "too many connections from " + ip;
+            const std::string why = stranger ? "LMTP is for this machine"
+                                    : full   ? "too many connections"
+                                             : "too many connections from " + ip;
             const std::string said = smtp_port ? "421 4.7.0 " + m_hostname + " " + why + ", try again later\r\n"
                                      : imap_port && l.kind == port_kind::imap ? "* BYE " + why + "\r\n"
-                                     : l.kind == port_kind::sieve ? "BYE \"" + why + "\"\r\n" : std::string();
+                                     : l.kind == port_kind::sieve ? "BYE \"" + why + "\"\r\n"
+                                     : l.kind == port_kind::pop3  ? "-ERR [SYS/TEMP] " + why + "\r\n"
+                                                                  : std::string();
             if (!m_stopped && !said.empty() && ::send(fd, said.data(), said.size(), MSG_DONTWAIT | MSG_NOSIGNAL) < 0) {}
             if (m_clients[ip].conns == 0 && m_clients[ip].failures == 0)
                 m_clients.erase(ip);
@@ -660,7 +882,8 @@ void mail_run::accept_done(listener& l, struct io_uring_cqe* cqe)
             runtime_instance::stat_add(m_owner.m_stat_total_connections, 1);
             m_owner.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
             // A port that speaks TLS from the first byte begins with the handshake, any other with the greeting.
-            if (l.kind == port_kind::submissions || l.kind == port_kind::imaps)
+            if (l.kind == port_kind::submissions || l.kind == port_kind::imaps || l.kind == port_kind::pop3s ||
+                l.kind == port_kind::sts)
             {
                 raw->ssl = m_tls ? m_tls->create_ssl_server() : nullptr;
                 if (!raw->ssl)
@@ -697,8 +920,15 @@ smtp_config mail_run::session_config(const conn& c) const
     cfg.auth_offered = signs_in;
     // A loopback peer is this machine, whose own programs need no TLS to sign in.
     cfg.auth_in_clear = loopback(c.peer);
-    cfg.auth_required = c.kind != port_kind::smtp;
+    cfg.auth_required = c.kind != port_kind::smtp && c.kind != port_kind::lmtp;
     cfg.tls_required = c.kind == port_kind::submission && m_tls != nullptr && !loopback(c.peer);
+    // LMTP is a server on this machine handing mail over: no TLS and no sign-in, as RFC 2033 has it.
+    if (c.kind == port_kind::lmtp)
+    {
+        cfg.lmtp = true;
+        cfg.tls_offered = false;
+        cfg.auth_offered = false;
+    }
     return cfg;
 }
 
@@ -715,6 +945,18 @@ void mail_run::begin_session(conn& c)
         c.sieve = std::make_unique<managesieve_session>(cfg, c, *m_sieve);
         c.sieve->greet();
     }
+    else if (c.kind == port_kind::pop3 || c.kind == port_kind::pop3s)
+    {
+        pop3_config cfg;
+        cfg.hostname = m_hostname;
+        cfg.tls_offered = m_tls != nullptr && c.kind == port_kind::pop3;
+        cfg.tls_active = c.ssl != nullptr && c.handshaken;
+        cfg.login_in_clear = loopback(c.peer);
+        c.pop3 = std::make_unique<pop3_session>(cfg, c);
+        c.pop3->greet();
+    }
+    else if (c.kind == port_kind::sts)
+        c.sts = true;
     else if (c.kind == port_kind::imap || c.kind == port_kind::imaps)
     {
         imap_config cfg;
@@ -723,6 +965,8 @@ void mail_run::begin_session(conn& c)
         cfg.tls_active = c.ssl != nullptr && c.handshaken;
         cfg.login_in_clear = loopback(c.peer);
         cfg.max_append = m_owner.get_max_size();
+        if (m_sieve && m_owner.get_sieve_port())
+            cfg.imapsieve = "sieve://" + m_hostname + ":" + std::to_string(m_owner.get_sieve_port());
         c.imap = std::make_unique<imap_session>(cfg, c, *m_imap);
         c.imap->greet();
     }
@@ -897,6 +1141,8 @@ void mail_run::tls_in(conn& c, const char* p, size_t n)
                 c.imap->tls_started();
             else if (c.sieve)
                 c.sieve->tls_started();
+            else if (c.pop3)
+                c.pop3->tls_started();
             else
                 c.smtp->tls_started();
             c.in_input = false;
@@ -929,7 +1175,12 @@ void mail_run::tls_in(conn& c, const char* p, size_t n)
 
 void mail_run::plain_in(conn& c, const char* p, size_t n)
 {
-    if (!c.smtp && !c.imap && !c.sieve)
+    if (c.sts)
+    {
+        sts_input(c, std::string_view(p, n));
+        return;
+    }
+    if (!c.smtp && !c.imap && !c.sieve && !c.pop3)
         return;
     // Under COMPRESS what came is opened first, a bounded amount at a time.
     if (c.zin)
@@ -963,6 +1214,8 @@ void mail_run::plain_in(conn& c, const char* p, size_t n)
         c.imap->input(std::string_view(p, n));
     else if (c.sieve)
         c.sieve->input(std::string_view(p, n));
+    else if (c.pop3)
+        c.pop3->input(std::string_view(p, n));
     else
         c.smtp->input(std::string_view(p, n));
     c.in_input = false;
@@ -970,12 +1223,15 @@ void mail_run::plain_in(conn& c, const char* p, size_t n)
         return;
     // A client that sends past what a command and its largest message take while one waits, or that reads none of
     // what it is told, is not held in memory: it is told so and closed.
-    const size_t cap = (c.sieve ? 0 : m_owner.get_max_size()) + backlog_slack;
-    const size_t held = c.imap ? c.imap->buffered() : c.sieve ? c.sieve->buffered() : c.smtp->buffered();
+    const size_t cap = (c.sieve || c.pop3 ? 0 : m_owner.get_max_size()) + backlog_slack;
+    const size_t held = c.imap ? c.imap->buffered() : c.sieve ? c.sieve->buffered() : c.pop3 ? c.pop3->buffered()
+                                                                                         : c.smtp->buffered();
     if (held > cap || c.owed > owed_max + cap)
     {
         out(c, c.smtp ? "421 4.7.0 " + m_hostname + " too much input unanswered, closing\r\n"
-               : c.imap ? std::string("* BYE Too much input unanswered\r\n") : std::string("BYE \"Too much input\"\r\n"));
+               : c.imap ? std::string("* BYE Too much input unanswered\r\n")
+               : c.pop3 ? std::string("-ERR too much input unanswered\r\n")
+                        : std::string("BYE \"Too much input\"\r\n"));
         close_soon(c);
         return;
     }
@@ -1371,6 +1627,12 @@ void mail_run::conn::mail_from(const address& from, std::function<void(rcpt_verd
         done({553, "Sender address not owned by " + smtp->user()});
         return;
     }
+    // A spool whose disk is nearly full takes no more mail, which its senders keep and try again (RFC 5321 4.5.3.1.10).
+    if (run->m_disk_low)
+    {
+        done({452, "Insufficient system storage; try again later"});
+        return;
+    }
     // --rate-limit holds each sender to so many messages a second, its address or its account; the runtime is held to
     // --global-rate-limit's.
     if (!run->may_send(smtp->user().empty() ? ip : "user:" + smtp->user()))
@@ -1433,7 +1695,38 @@ void mail_run::conn::rcpt_to(const address& to, std::function<void(rcpt_verdict)
                 answer(v.code / 100 == 2 ? rcpt_verdict{550, "Recipient refused"} : v);
         });
     };
+    // A first triplet of a stranger's network, sender and recipient is told to come back, decided on the pool (RFC
+    // 6647); a recipient refused anyway is refused as it is.
+    if (r.m_greylist && kind == port_kind::smtp && smtp->user().empty() && !loopback(peer))
+        done = [&r, then = std::move(done), net = greylist::network_of(ip), sender, rcpt = to.text()](rcpt_verdict v) {
+            if (v.code / 100 != 2)
+            {
+                then(v);
+                return;
+            }
+            auto wait = std::make_shared<int64_t>(0);
+            r.m_pool.submit(0, [g = r.m_greylist.get(), net, sender, rcpt, wait] {
+                *wait = g->check(net, sender, rcpt, wall::now_ms());
+            }, [&r, then, v, wait, alive = r.m_alive] {
+                if (!*alive)
+                    return;
+                if (*wait)
+                {
+                    ++r.m_greylisted;
+                    then({451, "Greylisted, try again in " + std::to_string(*wait) + " seconds"});
+                }
+                else
+                    then(v);
+            });
+        };
     const route_to where = r.route(to, smtp->sender().empty());
+    // LMTP hands mail to this runtime's mailboxes, and to nothing else.
+    if (kind == port_kind::lmtp && where.k != route_to::mailbox)
+    {
+        ++r.m_refused_rcpt;
+        done({550, "LMTP takes mail for the mailboxes here"});
+        return;
+    }
     switch (where.k)
     {
         case route_to::mailbox:
@@ -1498,6 +1791,7 @@ bool mail_run::conn::data_begin()
     }
     e->ret = smtp->ret();
     e->envid = smtp->envid();
+    e->requiretls = smtp->requiretls();
     e->user = smtp->user();
     e->peer = ip;
     e->helo = smtp->helo();
@@ -1606,11 +1900,13 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
         }
         ++r.m_checks_out;
         auto result = std::make_shared<inbound_result>();
+        auto spam = std::make_shared<spam_verdict>();
         auto unread = std::make_shared<bool>(false);
         const std::string path = r.m_spool.file_of(*e);
         const uint64_t off = e->body_off, len = e->body_len;
         r.m_checks.submit(r.m_checks.next_lane(),
-                          [e, result, unread, ip, helo, path, off, len] {
+                          [e, result, spam, unread, ip, helo, path, off, len, trusted = r.m_arc_trusted,
+                           rspamd = std::string(r.m_owner.get_rspamd())] {
                               std::string whole;
                               std::string_view msg;
                               if (e->body)
@@ -1639,9 +1935,18 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
                                   msg = whole;
                               }
                               auto resolver = system_check_resolver();
-                              *result = check_inbound(msg, ip, helo, e->from, *resolver, wall::now_ms() / 1000);
+                              *result = check_inbound(msg, ip, helo, e->from, *resolver, wall::now_ms() / 1000,
+                                                      trusted);
+                              // Scored by Rspamd beside the checks, where it is named.
+                              if (!rspamd.empty() && !result->reject())
+                              {
+                                  std::vector<std::string> rcpts;
+                                  for (const auto& rc : e->rcpts)
+                                      rcpts.push_back(rc.addr);
+                                  *spam = rspamd_check(rspamd, msg, ip, helo, e->from, rcpts, {});
+                              }
                           },
-                          [&r, alive, e, done, result, unread] {
+                          [&r, alive, e, done, result, unread, spam, ip] {
                               if (!*alive)
                                   return;
                               --r.m_checks_out;
@@ -1652,6 +1957,27 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
                                   return;
                               }
                               ++r.m_checked;
+                              if (r.m_owner.get_reports() && !result->rua.empty())
+                              {
+                                  reports::dmarc_seen s;
+                                  s.policy_domain = result->policy_domain;
+                                  s.rua = result->rua;
+                                  s.adkim = result->adkim;
+                                  s.aspf = result->aspf;
+                                  s.p = result->p;
+                                  s.sp = result->sp;
+                                  s.pct = result->pct;
+                                  s.header_from = result->from_domain;
+                                  s.source_ip = ip;
+                                  s.disposition = result->reject() ? "reject" : result->quarantine() ? "quarantine" : "none";
+                                  s.dkim_pass = result->dkim_aligned;
+                                  s.spf_pass = result->spf_aligned;
+                                  for (const auto& [res, d] : result->dkim)
+                                      s.dkim.emplace_back(d, res);
+                                  s.spf_domain = result->spf_domain;
+                                  s.spf_result = result->spf;
+                                  r.m_reports.dmarc(s);
+                              }
                               if (result->reject())
                               {
                                   // DMARC says its domain's own mail never comes so: it is refused, not kept.
@@ -1662,9 +1988,35 @@ void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
                                                                          : result->why)});
                                   return;
                               }
-                              if (result->quarantine())
+                              // What Rspamd's rules decide: refused, told to come back, or kept in Junk.
+                              std::string header = result->header();
+                              bool junk = result->quarantine();
+                              if (spam->scored)
+                              {
+                                  const std::string& a = spam->action;
+                                  if (a == "reject")
+                                  {
+                                      ++r.m_spam_rejected;
+                                      r.m_spool.forget_written(e->id);
+                                      done({554, "Message refused as spam"});
+                                      return;
+                                  }
+                                  if (a == "soft reject" || a == "greylist")
+                                  {
+                                      r.m_spool.forget_written(e->id);
+                                      done({451, "Message deferred by the spam filter; try again later"});
+                                      return;
+                                  }
+                                  const bool flagged = a == "add header" || a == "rewrite subject";
+                                  junk = junk || flagged;
+                                  r.m_spam_junked += flagged;
+                                  char buf[96];
+                                  std::snprintf(buf, sizeof buf, " (score=%.2f required=%.2f)", spam->score, spam->required);
+                                  header += "; x-spam=" + std::string(flagged ? "yes" : "no") + buf;
+                              }
+                              if (junk)
                                   ++r.m_quarantined;
-                              r.m_spool.note_auth(*e, result->header(), result->quarantine() ? "Junk" : "");
+                              r.m_spool.note_auth(*e, header, junk ? "Junk" : "");
                               done({250, "OK queued as " + e->id});
                               r.accepted(e);
                           });
@@ -1707,6 +2059,43 @@ void mail_run::conn::offload(std::function<void()> job, std::function<void()> do
             c->in_input = false;
             r->flush(*c);
         }
+    });
+}
+
+void mail_run::conn::maildrop(const std::string& user,
+                              std::function<void(bool, uint32_t, std::vector<pop3_session::message>)> done)
+{
+    run->m_imap->open(user, "INBOX", [done](std::shared_ptr<imap_folder> f) {
+        if (!f)
+        {
+            done(false, 0, {});
+            return;
+        }
+        std::vector<pop3_session::message> drop;
+        drop.reserve(f->msgs.size());
+        for (const auto& m : f->msgs)
+            drop.push_back({m.uid, m.size, m.key});
+        done(true, f->uidvalidity, std::move(drop));
+    }, true);
+}
+
+void mail_run::conn::read(const pop3_session::message& m, std::function<void(std::shared_ptr<const std::string>)> done)
+{
+    run->m_imap->body(m.key, m.size, std::move(done));
+}
+
+void mail_run::conn::remove(const std::string& user, std::vector<uint32_t> uids, std::function<void(bool)> done)
+{
+    imap_store* store = run->m_imap.get();
+    store->open(user, "INBOX", [store, user, uids = std::move(uids), done](std::shared_ptr<imap_folder> f) {
+        if (!f)
+        {
+            done(false);
+            return;
+        }
+        store->expunge(user, f, uids, true, [want = uids.size(), done](std::vector<uint32_t> gone) {
+            done(gone.size() == want);
+        });
     });
 }
 
@@ -1793,9 +2182,11 @@ void mail_run::accepted(const entry_ptr& e)
 }
 
 void mail_run::queue_message(const std::string& from, const std::vector<std::string>& rcpts, std::string body,
-                             bool bounce, std::string user, std::function<void(bool, std::string)> done)
+                             bool bounce, std::string user, std::function<void(bool, std::string)> done,
+                             bool requiretls)
 {
     auto e = std::make_shared<spool_entry>();
+    e->requiretls = requiretls;
     e->id = new_spool_id(shard());
     e->from = from;
     for (const auto& a : rcpts)
@@ -1846,6 +2237,14 @@ void mail_run::on_cqe(struct io_uring_cqe* cqe)
         accept_done(m_imaps_l, cqe);
     else if (req == &m_sieve_l.req)
         accept_done(m_sieve_l, cqe);
+    else if (req == &m_pop3_l.req)
+        accept_done(m_pop3_l, cqe);
+    else if (req == &m_pop3s_l.req)
+        accept_done(m_pop3s_l, cqe);
+    else if (req == &m_lmtp_l.req)
+        accept_done(m_lmtp_l, cqe);
+    else if (req == &m_sts_l.req)
+        accept_done(m_sts_l, cqe);
     else if (conn* c = conn_of(req))
     {
         if (req == &c->rd)
@@ -1863,7 +2262,7 @@ void mail_run::on_loop_turn()
     if (m_stopped)
         return;
     if (wall::now_ms_coarse() >= m_accept_paused_until_ms)
-        for (listener* l : {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l, &m_sieve_l})
+        for (listener* l : listeners())
             if (l->fd >= 0 && !l->pending)
                 arm_accept(*l);
     // Only the connections whose read or write the ring could not take, not every one each turn.
@@ -1934,6 +2333,11 @@ void mail_run::tick()
             out(*c, "BYE \"idle too long\"\r\n");
             close_soon(*c);
         }
+        else if (c->pop3 && !(c->ssl && !c->handshaken))
+        {
+            out(*c, "-ERR idle too long\r\n");
+            close_soon(*c);
+        }
         else
             close_conn(*c);
     }
@@ -1949,6 +2353,18 @@ void mail_run::tick()
         refresh_files();
         refresh_domains();
         load_suppressed();
+        // Below four messages of the largest size, or 256 MiB, of room on the spool's disk, MAIL is told 452.
+        struct statvfs fs{};
+        if (::statvfs(m_spool.dir().c_str(), &fs) == 0)
+        {
+            const uint64_t room = static_cast<uint64_t>(fs.f_bavail) * fs.f_frsize;
+            m_disk_low = room < std::max<uint64_t>(256ull << 20, 4 * m_owner.get_max_size());
+        }
+    }
+    if (now >= m_next_report_ms)
+    {
+        m_next_report_ms = now + 60000;
+        send_reports();
     }
     m_spool.tick(now);
     if (m_delivery)
@@ -2004,26 +2420,68 @@ void mail_run::refresh_domains()
 std::string mail_run::records_text() const
 {
     std::string out;
-    const std::string dkim = m_delivery ? m_delivery->dkim_record() : std::string();
-    const std::string sel = m_delivery ? m_delivery->dkim_selector() : std::string("skl");
+    const auto keys = m_delivery ? m_delivery->dkim_records() : std::vector<std::pair<std::string, std::string>>{};
     // Mail for elsewhere through a smarthost leaves from its addresses, which SPF cannot name here, so it only softfails.
     const std::string spf = m_owner.get_relay().empty() ? "v=spf1 mx -all" : "v=spf1 mx ~all";
     for (const auto& d : m_domains)
     {
         out += d + ". 300 IN MX 10 " + m_hostname + ".\n";
         out += d + ". 300 IN TXT \"" + spf + "\"\n";
-        if (!dkim.empty())
-            out += sel + "._domainkey." + d + ". 300 IN TXT \"" + dkim + "\"\n";
-        out += "_dmarc." + d + ". 300 IN TXT \"v=DMARC1; p=quarantine; adkim=r; aspf=r\"\n";
+        for (const auto& [sel, record] : keys)
+            out += sel + "._domainkey." + d + ". 300 IN TXT \"" + record + "\"\n";
+        const std::string_view rua = m_owner.get_dmarc_rua();
+        out += "_dmarc." + d + ". 300 IN TXT \"v=DMARC1; p=quarantine; adkim=r; aspf=r" +
+               (rua.empty() ? std::string() : "; rua=mailto:" + std::string(rua)) + "\"\n";
+        // MTA-STS (RFC 8461) and where TLS reports go (RFC 8460), where it publishes them.
+        if (!m_owner.get_mta_sts().empty())
+            out += "_mta-sts." + d + ". 300 IN TXT \"v=STSv1; id=" + sts_id() + "\"\n";
+        // The policy's host is this one where it serves the policy itself.
+        if (!m_owner.get_mta_sts().empty() && m_owner.get_mta_sts_port())
+            out += "mta-sts." + d + ". 300 IN CNAME " + m_hostname + ".\n";
+        if (!m_owner.get_tls_rpt().empty())
+            out += "_smtp._tls." + d + ". 300 IN TXT \"v=TLSRPTv1; rua=mailto:" + std::string(m_owner.get_tls_rpt()) +
+                   "\"\n";
         // Where a mail client finds the ports it sends and reads on (RFC 6186, RFC 8314), and its filters' (RFC 5804).
         for (const auto& [service, port] : {std::pair{"_submissions", m_owner.get_submissions_port()},
                                             {"_submission", m_owner.get_submission_port()},
                                             {"_imaps", m_owner.get_imaps_port()},
                                             {"_imap", m_owner.get_imap_port()},
+                                            {"_pop3s", m_owner.get_pop3s_port()},
+                                            {"_pop3", m_owner.get_pop3_port()},
                                             {"_sieve", m_owner.get_sieve_port()}})
             if (port)
                 out += std::string(service) + "._tcp." + d + ". 300 IN SRV 0 1 " + std::to_string(port) + " " +
                        m_hostname + ".\n";
+    }
+    // Its certificate's key pinned for senders that check DANE (RFC 7672): 3 1 1, its SubjectPublicKeyInfo's SHA-256.
+    if (m_tls && !m_domains.empty())
+    {
+        std::string pem;
+        if (socketley::read_file(std::string(m_owner.get_cert_path()), pem))
+            if (BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())))
+            {
+                if (X509* x = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr))
+                {
+                    unsigned char* der = nullptr;
+                    const int n = i2d_PUBKEY(X509_get0_pubkey(x), &der);
+                    if (n > 0)
+                    {
+                        unsigned char md[SHA256_DIGEST_LENGTH];
+                        SHA256(der, static_cast<size_t>(n), md);
+                        static constexpr char hex[] = "0123456789abcdef";
+                        std::string h;
+                        for (const unsigned char b : md)
+                        {
+                            h += hex[b >> 4];
+                            h += hex[b & 15];
+                        }
+                        out += "_25._tcp." + m_hostname + ". 300 IN TLSA 3 1 1 " + h + "\n";
+                        OPENSSL_free(der);
+                    }
+                    X509_free(x);
+                }
+                BIO_free(bio);
+            }
     }
     return out;
 }
@@ -2128,14 +2586,45 @@ void mail_run::command(uint64_t ticket, std::string_view payload)
         send_command(ticket, r);
         return;
     }
+    // A Sieve script of 64 KiB and its user and name, in base64, fit in a mebibyte.
     std::string arg;
-    if (!r.bytes(arg, 4096))
+    if (!r.bytes(arg, 1u << 20))
     {
-        answer("error: the command is cut off");
+        answer("error: the command is cut off past a mebibyte");
         return;
     }
     switch (static_cast<verb>(v))
     {
+        case verb::send_file:
+        {
+            // Only a name this runtime's outbox gives, read and taken away off the loop.
+            if (arg.size() != 36 || !arg.ends_with(".msg") ||
+                !std::all_of(arg.begin(), arg.end() - 4, [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); }))
+            {
+                answer("error: no message file " + arg);
+                return;
+            }
+            auto whole = std::make_shared<std::string>();
+            auto read = std::make_shared<bool>(false);
+            m_pool.submit(0,
+                          [path = mail_outbox_dir(m_owner.get_name()) + "/" + arg, whole, read] {
+                              *read = socketley::read_file(path, *whole);
+                              ::unlink(path.c_str());
+                          },
+                          [this, ticket, whole, read, answer, alive = m_alive] {
+                              if (!*alive)
+                                  return;
+                              socketley::bytes::reader fr(*whole);
+                              uint8_t fv = 0;
+                              if (!*read || !fr.marker(command_prefix) || !fr.u8(fv) || static_cast<verb>(fv) != verb::send)
+                              {
+                                  answer("error: the message file could not be read");
+                                  return;
+                              }
+                              send_command(ticket, fr);
+                          });
+            return;
+        }
         case verb::queue:
             answer(queue_text(arg));
             return;
@@ -2313,6 +2802,10 @@ std::string mail_run::stats() const
         put(out, "mail_blocklisted", m_blocklisted);
     }
     put(out, "mail_quarantined", m_quarantined);
+    put(out, "mail_spam_rejected", m_spam_rejected);
+    put(out, "mail_spam_junked", m_spam_junked);
+    put(out, "mail_greylisted", m_greylisted);
+    put(out, "mail_reports_sent", m_reports_sent);
     put(out, "auth_ok", m_auth_ok);
     put(out, "auth_failed", m_auth_failed);
     put(out, "auth_locked_out", m_auth_locked);

@@ -261,6 +261,11 @@ void put_op::staged(size_t n)
         fail(st::too_large);
         return;
     }
+    if (m_whole != UINT64_MAX && m_received > m_whole)
+    {
+        fail(st::io_error);
+        return;
+    }
     // A placed body past its room would write over the next part's.
     if (m_placed && m_received > m_place_room)
     {
@@ -630,6 +635,12 @@ void put_op::finish_now()
 {
     m_eof  = true;
 
+    // A body of a declared size is that size, or no object: one cut short or run long is no write to acknowledge.
+    if (m_whole != UINT64_MAX && m_received != m_whole)
+    {
+        fail(st::io_error);
+        return;
+    }
     m_meta.size     = m_received;
     m_meta.md5      = m_hs->md5.finish();
     // Another node's write keeps the time it was made there.

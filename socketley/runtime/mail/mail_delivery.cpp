@@ -15,9 +15,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "mail_arc.h"
 #include "mail_compose.h"
 #include "mail_instance.h"
 #include "mail_mailbox.h"
+#include "mail_rspamd.h"
+#include "mail_srs.h"
 #include "mail_run.h"
 #include "../dns/dns_wire.h"
 #include "../../shared/crypto/tls_context.h"
@@ -164,10 +167,12 @@ struct delivery::out_conn
     bool resolved{false};
     // What the other side said it does.
     bool pipelining{false}, starttls{false}, eightbit{false}, utf8{false}, auth_plain{false}, auth_login{false},
-        chunking{false}, dsn{false};
+        chunking{false}, dsn{false}, requiretls{false};
     // Where AUTH LOGIN is: the username sent, then the password.
     uint8_t login_step{0};
     uint64_t size_max{0};
+    // The recipients it takes in one transaction, as its LIMITS said (RFC 9422); 0 where it said none.
+    uint32_t rcpt_max{0};
     std::string in;
     int reply_code{0};
     std::string reply_text;
@@ -315,10 +320,21 @@ bool delivery::start(std::string& why)
         }
         m_relay = true;
     }
-    // A key of the runtime's own, made at its first start and shared by its shards, signs the mail its domains send.
+    // A key of the runtime's own, made at its first start and shared by its shards, signs the mail its domains send;
+    // an Ed25519 one under <selector>-ed signs it too, and --dkim-next's pair is made to be published first.
     m_key = dkim::load_or_make(mail_key_path(o.get_name(), m_selector), why);
-    if (!m_key)
+    m_ed_key = m_key ? dkim::load_or_make(mail_key_path(o.get_name(), m_selector + "-ed"), why, true) : nullptr;
+    if (!m_key || !m_ed_key)
         return false;
+    m_next_selector = std::string(o.get_dkim_next());
+    if (!m_next_selector.empty() && m_next_selector != m_selector)
+    {
+        m_next_key = dkim::load_or_make(mail_key_path(o.get_name(), m_next_selector), why);
+        m_next_ed_key = m_next_key ? dkim::load_or_make(mail_key_path(o.get_name(), m_next_selector + "-ed"), why, true)
+                                   : nullptr;
+        if (!m_next_key || !m_next_ed_key)
+            return false;
+    }
     const int64_t now = wall::now_ms_coarse();
     for (const auto& [id, e] : m_run.queue().entries())
         schedule(e, std::max(now, e->next_ms));
@@ -408,6 +424,18 @@ void delivery::tick(int64_t now)
         m_due_at.erase(id);
         if (const entry_ptr e = m_run.queue().find(id))
             dispatch(e);
+    }
+    for (auto it = m_held.begin(); it != m_held.end();)
+    {
+        const auto r = m_routes.find(*it);
+        if (r != m_routes.end() && now < r->second.held_until)
+        {
+            ++it;
+            continue;
+        }
+        it = m_held.erase(it);
+        if (r != m_routes.end())
+            pump(r->second);
     }
     std::vector<uint64_t> late, idle;
     for (auto& [id, c] : m_conns)
@@ -733,6 +761,20 @@ void delivery::filter(const std::shared_ptr<item>& it, const std::string& user, 
         ctx.host = m_run.hostname();
         ctx.domain = m_run.domains().empty() ? std::string() : m_run.domains().front();
         ctx.remote_ip = e->peer;
+        // What Rspamd scored it, as this host's checks wrote it, for spamtest (RFC 5235).
+        if (const size_t at = e->auth.find("x-spam="); at != std::string::npos)
+        {
+            spam_verdict v;
+            const size_t s = e->auth.find("score=", at), q = e->auth.find("required=", at);
+            if (s != std::string::npos && q != std::string::npos)
+            {
+                v.scored = true;
+                v.score = std::strtod(e->auth.c_str() + s + 6, nullptr);
+                v.required = std::strtod(e->auth.c_str() + q + 9, nullptr);
+                ctx.spam = v.level();
+                ctx.spam_percent = v.percent();
+            }
+        }
         // The folders the index knows, read here on the loop, so the run's question is answered from a copy.
         if (imap_store* imap = m_run.imap())
         {
@@ -933,7 +975,7 @@ void delivery::redirect(const entry_ptr& e, const std::string& own, std::vector<
 {
     // Sent from the user's own address, so a bounce comes to them and SPF is this runtime's to pass; with the header
     // editheader left, where it changed it.
-    const auto send = [this, own, header, to = std::move(to), done](std::string_view whole) {
+    const auto send = [this, own, header, to = std::move(to), done, requiretls = e->requiretls](std::string_view whole) {
         const std::string_view block = header_block(whole);
         const std::string message = header.empty() || block.size() >= whole.size()
                                         ? std::string(whole)
@@ -941,8 +983,9 @@ void delivery::redirect(const entry_ptr& e, const std::string& own, std::vector<
         for (const auto& t : to)
         {
             ++m_sieve_redirected;
+            // What had to go over checked TLS still does, forwarded (RFC 8689 4.3).
             m_run.queue_message(own, {t}, "Delivered-To: " + own + "\r\n" + message, false, {},
-                                [](bool, std::string) {});
+                                [](bool, std::string) {}, requiretls);
         }
         done(true);
     };
@@ -1009,6 +1052,27 @@ void delivery::notify(const std::string& own, const sieve::notification& n, std:
     m_run.queue_message("", to, std::move(msg), true, {}, [](bool, std::string) {});
 }
 
+void delivery::tls_told(const out_conn& c, bool success, const char* failure)
+{
+    // Told only of a domain whose policy asked for TLS, the sessions RFC 8460 counts.
+    if (!m_run.owner().get_reports() || m_relay || (!c.dane && c.sts == tls_policy::sts_mode::none))
+        return;
+    std::vector<std::string> lines;
+    std::string type = "tlsa";
+    if (!c.dane)
+    {
+        type = "sts";
+        if (const tls_policy::sts* p = sts_for(c.route))
+        {
+            lines.push_back("version: STSv1");
+            lines.push_back(std::string("mode: ") + (p->mode == tls_policy::sts_mode::enforce ? "enforce" : "testing"));
+            for (const auto& m : p->mx)
+                lines.push_back("mx: " + m);
+        }
+    }
+    m_run.report_book().tls(c.route, type, lines, c.host, success, failure, "", "");
+}
+
 void delivery::fail_waiting(route& r, int code, const std::string& text, bool temporary)
 {
     while (!r.waiting.empty())
@@ -1067,6 +1131,11 @@ void delivery::pump(route& r)
                 return;
             }
         }
+    }
+    if (now < r.held_until)
+    {
+        m_held.insert(r.key);
+        return;
     }
     // A connection that waits for work takes the next message first.
     std::vector<uint64_t> idle;
@@ -1247,8 +1316,11 @@ void delivery::sts_fetch(const std::string& domain, const std::string& id)
                 return;
             if (!to.empty())
                 cl.connect_to(to);
+            // The name is the recipient domain's to point anywhere, so it is dialled only where it is public.
+            cl.public_only(true);
             https_client::reply rep;
-            if (!cl.request("GET", "https://mta-sts." + domain + "/.well-known/mta-sts.txt", {}, {}, rep, out->why, 10))
+            if (!cl.request("GET", "https://mta-sts." + domain + "/.well-known/mta-sts.txt", {}, {}, rep, out->why, 10,
+                            65536))
                 return;
             if (rep.status != 200)
             {
@@ -1279,9 +1351,13 @@ void delivery::sts_fetch(const std::string& domain, const std::string& id)
                 sts_save();
             }
             else
+            {
                 LOG_WARN(("mail: the MTA-STS policy of " + domain + " could not be fetched: " + out->why +
                           (m_sts.count(domain) ? "; the one fetched before counts until it expires" : ""))
                              .c_str());
+                if (m_run.owner().get_reports())
+                    m_run.report_book().tls(domain, "sts", {}, "", false, "sts-policy-fetch-error", "", "");
+            }
             route& r = m_routes[domain];
             r.sts_state = 2;
             r.sts_ms = wall::now_ms_coarse();
@@ -1434,17 +1510,30 @@ void delivery::sign_read(const std::shared_ptr<sign_job>& j)
     }
     const std::string_view whole = j->kept ? std::string_view(*j->kept) : std::string_view(j->data);
     const std::string dom = signing_domain(header_value(header_block(whole), "From"));
-    if (dom.empty())
+    // Mail from elsewhere that was checked here and is sent on, as an alias does, is sealed by ARC (RFC 8617), so the
+    // next hop can know what it was as it came; other mail not from one of its domains goes unsigned.
+    const bool forwarded = dom.empty() && !j->e->auth.empty() && !m_run.domains().empty();
+    if (dom.empty() && !forwarded)
     {
-        // Mail not from one of its domains goes unsigned.
         m_signed[id];
         done(true);
         return;
     }
     auto sig = std::make_shared<std::string>();
-    m_run.pool().submit(m_run.cpu_lane(), [j, sig, dom, sel = m_selector, key = m_key] {
+    m_run.pool().submit(m_run.cpu_lane(),
+                        [j, sig, dom, forwarded, sel = m_selector, key = m_key, ed = m_ed_key,
+                         authserv = m_run.hostname(), seal_domain = m_run.domains().front()] {
                             const std::string_view w = j->kept ? std::string_view(*j->kept) : std::string_view(j->data);
-                            *sig = dkim::sign(w, dom, sel, key.get(), wall::now_ms() / 1000);
+                            const int64_t now = wall::now_ms() / 1000;
+                            if (forwarded)
+                            {
+                                // What the chain was as it came, as this host's checks wrote it.
+                                const std::string& auth = j->e->auth;
+                                const std::string cv = auth.find("arc=pass") != std::string::npos ? "pass" : "fail";
+                                *sig = arc::seal(w, authserv, auth, seal_domain, sel, key.get(), now, cv);
+                                return;
+                            }
+                            *sig = dkim::sign(w, dom, sel, key.get(), now) + dkim::sign(w, dom, sel + "-ed", ed.get(), now);
                         },
                         [this, id, sig, done, alive = m_alive] {
                             if (!*alive)
@@ -1465,9 +1554,14 @@ std::string delivery::signing_domain(std::string_view from_header) const
     return {};
 }
 
-std::string delivery::dkim_record() const
+std::vector<std::pair<std::string, std::string>> delivery::dkim_records() const
 {
-    return m_key ? dkim::public_record(m_key.get()) : std::string();
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const auto& [sel, key] : {std::pair{m_selector, m_key}, {m_selector + "-ed", m_ed_key},
+                                   {m_next_selector, m_next_key}, {m_next_selector + "-ed", m_next_ed_key}})
+        if (key)
+            out.emplace_back(sel, dkim::public_record(key.get()));
+    return out;
 }
 
 // ── Results ─────────────────────────────────────────────────────────────────
@@ -1616,8 +1710,9 @@ bool delivery::reported(const spool_rcpt& r, bool delay)
 void delivery::report(const entry_ptr& e, report_kind kind)
 {
     const bool delay = kind == report_kind::delay;
-    // The whole message under RET=FULL, up to a few mebibytes; its header otherwise, as RET=HDRS or no RET says.
-    const bool full = e->ret == 1 && e->body_len <= (4u << 20);
+    // The whole message under RET=FULL, up to a few mebibytes; its header otherwise, as RET=HDRS or no RET says, and
+    // always for REQUIRETLS mail, whose notice goes back with no such requirement.
+    const bool full = e->ret == 1 && !e->requiretls && e->body_len <= (4u << 20);
     const uint32_t want = static_cast<uint32_t>(full ? e->body_len : std::min<uint64_t>(e->body_len, 65536));
     m_run.queue().read(e, 0, want, [this, e, kind, delay, full, alive = m_alive](bool ok, std::string_view got) {
         if (!*alive)
@@ -1836,6 +1931,15 @@ void delivery::conn_connect(out_conn& c)
             }
             c.host = r.hosts[c.host_at];
             // An exchanger of a domain whose MX records DNSSEC signed has its TLSA records asked first (RFC 7672).
+            // An answer is kept five minutes for the next connection to the same exchanger.
+            if (!m_relay && r.mx_secure && c.tlsa_for != c.host_at)
+                if (const auto held = m_tlsa_kept.find(c.host);
+                    held != m_tlsa_kept.end() && held->second.until_ms > wall::now_ms_coarse())
+                {
+                    c.tlsa_for = c.host_at;
+                    c.dane = held->second.dane;
+                    c.tlsa = held->second.tlsa;
+                }
             if (!m_relay && r.mx_secure && c.tlsa_for != c.host_at)
             {
                 std::vector<dns_client::record> recs;
@@ -1864,6 +1968,9 @@ void delivery::conn_connect(out_conn& c)
                     if (tls_policy::parse_tlsa(rec.text, t) && tls_policy::usable(t))
                         c.tlsa.push_back(std::move(t));
                 }
+                if (m_tlsa_kept.size() > 4096)
+                    m_tlsa_kept.clear();
+                m_tlsa_kept[c.host] = {wall::now_ms_coarse() + 300000, c.dane, c.tlsa};
             }
             else if (!r.mx_secure)
             {
@@ -1871,7 +1978,11 @@ void delivery::conn_connect(out_conn& c)
                 c.tlsa.clear();
             }
             std::vector<endpoint> found;
-            const dns_client::state st = dns_client::here().ask(c.host, AF_UNSPEC, found);
+            // An exchanger an MX record named is an absolute name, asked with no search domain after it.
+            unsigned char lit[16];
+            const bool literal = ::inet_pton(AF_INET, c.host.c_str(), lit) == 1 || ::inet_pton(AF_INET6, c.host.c_str(), lit) == 1;
+            const dns_client::state st =
+                dns_client::here().ask(m_relay || literal || c.host.ends_with('.') ? c.host : c.host + ".", AF_UNSPEC, found);
             if (st == dns_client::state::pending)
             {
                 c.state = out_conn::st::resolving;
@@ -2043,6 +2154,8 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
             if (r < 0)
             {
                 const long v = SSL_get_verify_result(c.ssl);
+                tls_told(c, false, c.dane ? "validation-failure" : v != X509_V_OK ? "certificate-not-trusted"
+                                                                                   : "validation-failure");
                 conn_fail(c, "451 4.7.5 the TLS handshake with " + c.host + " failed" +
                                  (v != X509_V_OK ? std::string(": ") + X509_verify_cert_error_string(v) +
                                                    (c.dane ? ", against its TLSA records" : "")
@@ -2055,6 +2168,7 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
             c.handshaken = true;
             c.verified = SSL_get_verify_result(c.ssl) == X509_V_OK;
             ++m_tls_sessions;
+            tls_told(c, c.verified, c.verified ? "" : "certificate-host-mismatch");
             if (c.verified && c.dane && !c.tlsa.empty())
                 ++m_dane_verified;
             else if (c.verified && c.sts == tls_policy::sts_mode::enforce)
@@ -2072,6 +2186,8 @@ void delivery::conn_got(out_conn& c, const char* p, size_t n)
                 // The conversation starts over inside TLS (RFC 3207 4.2).
                 c.state = out_conn::st::ehlo;
                 c.pipelining = c.starttls = c.eightbit = c.utf8 = c.auth_plain = c.chunking = c.dsn = false;
+                c.requiretls = false;
+                c.rcpt_max = 0;
                 c.expect.push_back('E');
                 conn_send(c, "EHLO " + m_run.hostname() + "\r\n");
             }
@@ -2216,6 +2332,16 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
     const bool ok = code / 100 == 2;
     c.deadline_ms = wall::now_ms_coarse() + command_ms;
     const std::string said = std::to_string(code) + " " + text;
+    if (code == 421)
+    {
+        // A server that says it is busy is given a rest from new connections (RFC 5321 4.2.3).
+        static const int64_t hold_first_ms = settings::number<int64_t>("SOCKETLEY_MAIL_BUSY_HOLD_MS").value_or(30000);
+        route& r = m_routes[c.route];
+        r.hold_ms = std::min<int64_t>(r.hold_ms ? r.hold_ms * 2 : hold_first_ms, 900000);
+        r.held_until = wall::now_ms_coarse() + r.hold_ms;
+        r.limit = 1;
+        m_held.insert(r.key);
+    }
     switch (c.state)
     {
         case st::greeting:
@@ -2268,8 +2394,13 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                         c.chunking = true;
                     else if (line == "dsn")
                         c.dsn = true;
+                    else if (line == "requiretls")
+                        c.requiretls = true;
                     else if (line.starts_with("size"))
                         c.size_max = static_cast<uint64_t>(std::atoll(line.c_str() + 4));
+                    else if (line.starts_with("limits ") && line.find("rcptmax=") != std::string::npos)
+                        c.rcpt_max = static_cast<uint32_t>(
+                            std::clamp<long long>(std::atoll(line.c_str() + line.find("rcptmax=") + 8), 0, 100000));
                     else if (line.starts_with("auth ") || line.starts_with("auth="))
                     {
                         // The mechanisms are words of the line, not parts of others such as XPLAIN.
@@ -2296,6 +2427,7 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
             {
                 // Its domain says its mail goes over TLS, so it is not sent in the clear (RFC 7672 2.2, RFC 8461 5).
                 ++m_tls_refused;
+                tls_told(c, false, "starttls-not-supported");
                 conn_fail(c, "451 4.7.5 " + c.host + " offers no STARTTLS, which " +
                                  (c.dane ? "its TLSA records" : "the MTA-STS policy of " + c.route) + " require",
                           move_on::host);
@@ -2339,6 +2471,7 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                 if (c.dane || c.sts == tls_policy::sts_mode::enforce)
                 {
                     ++m_tls_refused;
+                    tls_told(c, false, "starttls-not-supported");
                     conn_fail(c, "451 4.7.5 " + c.host + " refused STARTTLS: " + said, move_on::host);
                     return;
                 }
@@ -2368,6 +2501,7 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                                                            t.data.size()) > 0;
                     if (!added)
                     {
+                        tls_told(c, false, "tlsa-invalid");
                         conn_fail(c, "451 4.7.5 the TLSA records of " + c.host + " could not be used", move_on::host);
                         return;
                     }
@@ -2539,11 +2673,29 @@ void delivery::conn_begin(out_conn& c)
 {
     item& it = *c.cur;
     const spool_entry& e = *it.e;
+    if (c.rcpt_max && it.to.size() > c.rcpt_max)
+    {
+        // The recipients past the server's limit go in a transaction of their own, next.
+        item rest{it.e, std::vector<target>(it.to.begin() + c.rcpt_max, it.to.end())};
+        it.to.resize(c.rcpt_max);
+        ++m_out[e.id];
+        m_routes[c.route].waiting.push_front(std::move(rest));
+    }
     const auto sig = m_signed.find(e.id);
     const uint64_t size = e.body_len + (sig == m_signed.end() ? 0 : sig->second.size());
     if (c.size_max && size > c.size_max)
     {
         conn_end_item(c, 552, "552 5.3.4 the message is larger than " + c.host + " takes");
+        return;
+    }
+    // REQUIRETLS mail goes only over TLS whose certificate DANE or MTA-STS vouched for, to a server that keeps the
+    // requirement on (RFC 8689 4.2.1); a smarthost's is checked always.
+    const bool vouched = c.ssl && c.handshaken && c.verified &&
+                         (m_relay || (c.dane && !c.tlsa.empty()) || c.sts == tls_policy::sts_mode::enforce);
+    if (e.requiretls && (!vouched || !c.requiretls))
+    {
+        conn_end_item(c, 550, "550 5.7.10 REQUIRETLS: " + c.host +
+                                  (vouched ? " does not offer REQUIRETLS" : " was not reached over TLS DANE or MTA-STS vouched for"));
         return;
     }
     ++m_transactions;
@@ -2566,6 +2718,9 @@ void delivery::conn_begin(out_conn& c)
     if (address na; m_run.owner().get_no_reply() && parse_address(e.from, na) &&
                     socketley::ascii::iequals(na.local, "no-reply") && m_run.is_local_domain(na.domain) && !it.to.empty())
         sender = "no-reply+" + m_run.verp_token(domain_of(it.to.front().addr)) + "@" + na.domain;
+    // Mail from elsewhere sent on goes from an SRS address of ours, so SPF at the far end judges this host.
+    else if (!e.auth.empty() && !e.from.empty() && !m_run.domains().empty() && !m_run.is_local_domain(domain_of(e.from)))
+        sender = srs::forward(e.from, m_run.domains().front(), m_run.secret(), wall::now_ms() / 86400000);
     std::string mail = "MAIL FROM:<" + sender + ">";
     if (c.size_max)
         mail += " SIZE=" + std::to_string(size);
@@ -2578,6 +2733,8 @@ void delivery::conn_begin(out_conn& c)
         mail += e.ret == 1 ? " RET=FULL" : " RET=HDRS";
     if (c.dsn && !e.envid.empty())
         mail += " ENVID=" + e.envid;
+    if (e.requiretls)
+        mail += " REQUIRETLS";
     mail += "\r\n";
     std::vector<std::string> cmds;
     cmds.push_back(std::move(mail));
@@ -2763,8 +2920,12 @@ void delivery::conn_end_item(out_conn& c, int code, const std::string& text)
     }
     // A domain that takes its mail is given more connections, up to the most.
     if (data_answered && code / 100 == 2)
-        if (route& r = m_routes[c.route]; r.limit < per_route_max)
+    {
+        route& r = m_routes[c.route];
+        r.hold_ms = 0;
+        if (r.limit < per_route_max)
             ++r.limit;
+    }
     if (--m_out[it->e->id] == 0)
         attempt_over(it->e);
     if (!data_answered && c.state == out_conn::st::transaction)
@@ -2805,6 +2966,8 @@ void delivery::conn_fail(out_conn& c, const std::string& why, move_on next)
         c.handshaken = c.after_starttls = c.verified = false;
         c.pipelining = c.starttls = c.eightbit = c.utf8 = c.auth_plain = c.auth_login = c.chunking = c.dsn = false;
         c.size_max = 0;
+        c.rcpt_max = 0;
+        c.requiretls = false;
         c.login_step = 0;
         c.in.clear();
         c.reply_text.clear();

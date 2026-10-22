@@ -45,6 +45,9 @@ bool section(std::string_view message, const part& root, std::string_view spec, 
 bool section_of(std::string_view message, const part& root, std::string_view spec, std::string_view& got,
                 std::string& built);
 
+// The bytes of the part `spec` numbers, "" the whole message, with its Content-Transfer-Encoding undone, as BINARY
+// reads them (RFC 3516): 1, or 0 where there is no such part, -1 where its encoding is none this decodes.
+int binary_of(std::string_view message, const part& root, std::string_view spec, std::string& out);
 // A part's body with its Content-Transfer-Encoding undone: quoted-printable and base64 decoded, any other as it is.
 std::string decoded_body(std::string_view body, std::string_view encoding);
 // `text` of `charset` in UTF-8, by iconv for a charset past UTF-8 and ISO-8859-1; as it is where none knows it.

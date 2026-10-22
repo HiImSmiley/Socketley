@@ -528,14 +528,14 @@ std::string structure(const part& p, std::string_view message, bool extended)
     return out + ")";
 }
 
-bool section_of(std::string_view message, const part& root, std::string_view spec, std::string_view& got,
-                std::string& built)
+namespace
 {
-    got = {};
-    built.clear();
-    // The part numbers first, then what of the part is asked.
+
+// The part the leading numbers of `spec` name, `spec` left with what follows them; null where they name none.
+const part* numbered_part(const part& root, std::string_view& spec, bool& numbered)
+{
     const part* node = &root;
-    bool numbered = false;
+    numbered = false;
     while (!spec.empty() && std::isdigit(static_cast<unsigned char>(spec.front())))
     {
         size_t k = 0;
@@ -543,14 +543,14 @@ bool section_of(std::string_view message, const part& root, std::string_view spe
         {
             // A number past any part there could be is none, rather than one that wrapped round to a small one.
             if (k > max_parts)
-                return false;
+                return nullptr;
             k = k * 10 + static_cast<size_t>(spec.front() - '0');
             spec.remove_prefix(1);
         }
         if (!spec.empty() && spec.front() == '.')
             spec.remove_prefix(1);
         if (k == 0)
-            return false;
+            return nullptr;
         // A message/rfc822 part's numbers are of the message it encloses.
         const part* within = node;
         if (node->message() && !node->children.empty() && (numbered || node != &root))
@@ -558,15 +558,30 @@ bool section_of(std::string_view message, const part& root, std::string_view spe
         if (within->multipart())
         {
             if (k > within->children.size())
-                return false;
+                return nullptr;
             node = &within->children[k - 1];
         }
         else if (k == 1)
             node = within;
         else
-            return false;
+            return nullptr;
         numbered = true;
     }
+    return node;
+}
+
+}   // namespace
+
+bool section_of(std::string_view message, const part& root, std::string_view spec, std::string_view& got,
+                std::string& built)
+{
+    got = {};
+    built.clear();
+    // The part numbers first, then what of the part is asked.
+    bool numbered = false;
+    const part* node = numbered_part(root, spec, numbered);
+    if (!node)
+        return false;
     const std::string text = upper(spec);
     // What HEADER and TEXT name: the root message, or the one a numbered message/rfc822 part encloses.
     const part* msg = numbered ? (node->message() && !node->children.empty() ? &node->children.front() : nullptr)
@@ -886,6 +901,29 @@ size_t encoded_word(word_scan& sc, size_t i, std::string& out)
 }
 
 }   // namespace
+
+int binary_of(std::string_view message, const part& root, std::string_view spec, std::string& out)
+{
+    out.clear();
+    bool numbered = false;
+    const part* node = numbered_part(root, spec, numbered);
+    if (!node || !spec.empty())
+        return 0;
+    if (!numbered)
+    {
+        out.assign(message);
+        return 1;
+    }
+    const std::string_view body = message.substr(node->body_off, node->body_len);
+    const std::string e = lower(trim(node->encoding));
+    if (node->multipart() || node->message() || e.empty() || e == "7bit" || e == "8bit" || e == "binary")
+        out.assign(body);
+    else if (e == "quoted-printable")
+        out = unquote_printable(body, false);
+    else if (e != "base64" || !unbase64(body, out))
+        return -1;
+    return 1;
+}
 
 std::string decoded_body(std::string_view body, std::string_view encoding)
 {

@@ -81,9 +81,15 @@ served=$(q skl._domainkey.example.test TXT | tr -d '" \n')
 want=$("$BIN" mail m dns 2>/dev/null | sed -n 's/^skl._domainkey.example.test. 300 IN TXT "\(.*\)"$/\1/p' | tr -d ' ')
 [ -n "$want" ] && [ "$served" = "$want" ] && ok "and its DKIM key, whole across the 255-byte strings" \
     || bad "and its DKIM key, whole across the 255-byte strings" "served ${served:0:60}..., want ${want:0:60}..."
+check "and its Ed25519 key beside it (RFC 8463)" "$(q skl-ed._domainkey.example.test TXT | tr -d '" ' | cut -c1-20)" \
+    "v=DKIM1;k=ed25519;p="
 check "and where a mail client sends from" "$(q _submissions._tcp.example.test SRV)" "0 1 $((P+5)) mail.example.test."
 check "and no SRV for a port it does not open" "$(q _imap._tcp.example.test SRV)" ""
-check "socketley mail dns prints the five for a zone kept elsewhere" "$("$BIN" mail m dns 2>/dev/null | wc -l)" "5"
+tlsa=$("$BIN" mail m dns 2>/dev/null | sed -n 's/^_25._tcp.mail.example.test. 300 IN TLSA 3 1 1 //p')
+want=$(openssl x509 -in "$T/cert.pem" -noout -pubkey | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
+check "and DANE's TLSA for its certificate's key (RFC 7672)" "$tlsa" "$want"
+check "which the dns runtime serves" "$(q _25._tcp.mail.example.test TLSA | tr -d ' ' | tr 'A-F' 'a-f')" "311$want"
+check "socketley mail dns prints the seven for a zone kept elsewhere" "$("$BIN" mail m dns 2>/dev/null | wc -l)" "7"
 
 # ─── no-reply ───────────────────────────────────────────────────────────────
 "$BIN" send m --to amy@remote.test --subject "notice" --text "noreply body" >/dev/null 2>&1

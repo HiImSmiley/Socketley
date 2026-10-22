@@ -32,6 +32,24 @@ std::string mail_sieve_dir(std::string_view runtime_name)
     return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".sieve")).string();
 }
 
+std::string mail_redacted_relay(std::string_view url)
+{
+    // scheme://user:password@host:port, the password between the first colon after "//" and the last "@".
+    const size_t start = url.find("//");
+    const size_t at = url.rfind('@');
+    if (start == std::string_view::npos || at == std::string_view::npos || at < start)
+        return std::string(url);
+    const size_t colon = url.find(':', start + 2);
+    if (colon == std::string_view::npos || colon > at)
+        return std::string(url);
+    return std::string(url.substr(0, colon + 1)) + "***" + std::string(url.substr(at));
+}
+
+std::string mail_outbox_dir(std::string_view runtime_name)
+{
+    return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".outbox")).string();
+}
+
 std::string mail_verp_key_path(std::string_view runtime_name)
 {
     return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".verp")).string();
@@ -42,6 +60,53 @@ std::string mail_suppressed_path(std::string_view runtime_name)
     return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".suppressed")).string();
 }
 
+namespace
+{
+
+// What follows a runtime's name in a file of its state, where the file is its: its spool or a shard's, its keys,
+// suppressed list, VERP key, IMAP index, Sieve scripts and outbox; empty where the file is none of them.
+std::string_view state_suffix(std::string_view file, std::string_view stem)
+{
+    if (!file.starts_with(stem))
+        return "-";
+    const std::string_view rest = file.substr(stem.size());
+    if (rest.empty() || rest.starts_with(".dkim.") || rest == ".suppressed" || rest == ".suppressed.lock" ||
+        rest == ".verp" || rest == ".imap" || rest == ".sieve" || rest == ".outbox" ||
+        (rest.front() == '.' && rest.size() > 1 && rest.find_first_not_of("0123456789", 1) == std::string_view::npos))
+        return rest.empty() ? std::string_view(".") : rest;
+    return "-";
+}
+
+}   // namespace
+
+bool mail_rename_state(std::string_view from, std::string_view to, std::string& why)
+{
+    const std::filesystem::path base = socketley_paths::resolve().state_dir / "mail";
+    std::error_code ec;
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> moves;
+    for (const auto& e : std::filesystem::directory_iterator(base, ec))
+    {
+        const std::string f = e.path().filename().string();
+        const std::string_view rest = state_suffix(f, from);
+        if (rest == "-")
+            continue;
+        const std::string target = std::string(to) + (rest == "." ? std::string() : std::string(rest));
+        if (std::filesystem::exists(base / target))
+        {
+            why = "the state of " + std::string(to) + " is there already: " + (base / target).string();
+            return false;
+        }
+        moves.emplace_back(e.path(), base / target);
+    }
+    for (const auto& [a, b] : moves)
+        if (std::filesystem::rename(a, b, ec); ec)
+        {
+            why = a.string() + " could not be renamed: " + ec.message();
+            return false;
+        }
+    return true;
+}
+
 void mail_forget_state(std::string_view runtime_name)
 {
     const std::filesystem::path base = socketley_paths::resolve().state_dir / "mail";
@@ -49,16 +114,8 @@ void mail_forget_state(std::string_view runtime_name)
     std::error_code ec;
     std::vector<std::filesystem::path> gone;
     for (const auto& e : std::filesystem::directory_iterator(base, ec))
-    {
-        const std::string f = e.path().filename().string();
-        const std::string_view rest = std::string_view(f).substr(std::min(f.size(), stem.size()));
-        if (f.starts_with(stem) && (rest.empty() || rest.starts_with(".dkim.") || rest == ".suppressed" ||
-                                    rest == ".suppressed.lock" || rest == ".verp" || rest == ".imap" ||
-                                    rest == ".sieve" ||
-                                    (rest.front() == '.' && rest.size() > 1 &&
-                                     rest.find_first_not_of("0123456789", 1) == std::string_view::npos)))
+        if (state_suffix(e.path().filename().string(), stem) != "-")
             gone.push_back(e.path());
-    }
     for (const auto& p : gone)
     {
         // A spool that still holds mail it answered 250 for is kept aside, not deleted with the runtime.
@@ -117,13 +174,23 @@ std::string mail_instance::config_refusal() const
 {
     if (m_domains.empty() && m_dns.empty() && m_relay.empty() && m_users.empty() && m_idp.empty())
         return "mail: say whose mail this is: --mail-domain <domain>, --dns <runtime> for its zones, or --relay "
-               "<url> with --users or --idp for a runtime that only sends\n";
+               "<url> for a runtime that only sends what this machine and its users give it\n";
     if (!get_listen_path().empty())
         return "mail: --listen unix: is not served; the runtime listens on its ports\n";
     if (!m_storage.empty() && m_idp.empty() && m_aliases.empty())
         return "mail: --storage keeps mailboxes, which are the users of --idp or the addresses of --aliases\n";
     if ((m_imap || m_imaps) && m_storage.empty())
         return "mail: --imap reads the mailboxes of --storage, which is not given\n";
+    if (m_sieve && (m_storage.empty() || m_idp.empty()))
+        return "mail: --sieve keeps the filters of mailboxes, which need --idp and --storage\n";
+    if ((m_pop3 || m_pop3s) && (m_storage.empty() || m_idp.empty()))
+        return "mail: --pop3 reads the mailboxes of --storage, whose users are --idp's\n";
+    if (m_lmtp && m_storage.empty())
+        return "mail: --lmtp hands mail to the mailboxes of --storage, which is not given\n";
+    if ((m_pop3s || m_sts_port) && !get_tls())
+        return "mail: --pop3s and --mta-sts-port speak TLS from the first byte, which needs --tls with --cert and --key\n";
+    if (m_sts_port && m_mta_sts.empty())
+        return "mail: --mta-sts-port serves the policy --mta-sts enforce or testing says\n";
     if ((m_submissions || m_imaps) && !get_tls())
         return "mail: --submissions and --imaps speak TLS from the first byte, which needs --tls with --cert and --key\n";
     if (m_submission && m_users.empty() && m_idp.empty())
@@ -132,9 +199,10 @@ std::string mail_instance::config_refusal() const
         return "mail: --submission takes passwords, which go only over TLS: give it --tls with --cert and --key\n";
     if (m_max_size < 1024)
         return "mail: --max-size below 1K takes no message\n";
-    const uint16_t ports[] = {effective_port(), m_submission, m_submissions, m_imap, m_imaps};
-    for (size_t i = 0; i < 5; ++i)
-        for (size_t j = i + 1; j < 5; ++j)
+    const uint16_t ports[] = {effective_port(), m_submission, m_submissions, m_imap, m_imaps, m_sieve,
+                              m_pop3,           m_pop3s,      m_lmtp,        m_sts_port};
+    for (size_t i = 0; i < std::size(ports); ++i)
+        for (size_t j = i + 1; j < std::size(ports); ++j)
             if (ports[i] && ports[i] == ports[j])
                 return "mail: two of its listeners name port " + std::to_string(ports[i]) + "\n";
     return {};
@@ -193,7 +261,7 @@ std::string mail_instance::stats_lines() const
 void mail_instance::listen_addresses(std::vector<std::string>& out) const
 {
     out.push_back("tcp:" + std::to_string(effective_port()));
-    for (const uint16_t p : {m_submission, m_submissions, m_imap, m_imaps})
+    for (const uint16_t p : {m_submission, m_submissions, m_imap, m_imaps, m_sieve, m_pop3, m_pop3s, m_lmtp, m_sts_port})
         if (p)
             out.push_back("tcp:" + std::to_string(p));
 }

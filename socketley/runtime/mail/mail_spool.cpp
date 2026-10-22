@@ -53,6 +53,8 @@ std::string header_of(const spool_entry& e)
         h += "ret " + std::to_string(e.ret) + "\n";
     if (!e.envid.empty())
         h += "envid " + one_line(e.envid) + "\n";
+    if (e.requiretls)
+        h += "requiretls 1\n";
     if (!e.user.empty())
         h += "user " + one_line(e.user) + "\n";
     if (!e.peer.empty())
@@ -137,6 +139,8 @@ bool parse_header(std::string_view text, spool_entry& e, size_t& header_len)
             number(val, e.ret);
         else if (key == "envid")
             e.envid = std::string(val);
+        else if (key == "requiretls")
+            e.requiretls = val == "1";
     }
     return false;
 }

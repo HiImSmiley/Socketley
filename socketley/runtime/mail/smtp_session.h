@@ -70,6 +70,8 @@ struct smtp_config
     bool        auth_required{false};
     // A message is accepted only where STARTTLS was spoken first.
     bool        tls_required{false};
+    // LMTP (RFC 2033): LHLO for EHLO, and once a message ends, an answer for each recipient taken.
+    bool        lmtp{false};
 };
 
 // What a recipient became, once its hook decided.
@@ -130,6 +132,8 @@ public:
     const std::vector<dsn_rcpt>& recipients_dsn() const { return m_rcpt_dsn; }
     uint8_t            ret() const { return m_ret; }
     const std::string& envid() const { return m_envid; }
+    // MAIL said REQUIRETLS: the message goes on only over TLS to a server whose certificate was checked (RFC 8689).
+    bool requiretls() const { return m_requiretls; }
     bool               body_8bit() const { return m_8bit; }
     bool               smtputf8() const { return m_utf8; }
     // The bytes of the message counted so far, before the size limit is told.
@@ -204,6 +208,7 @@ private:
     std::vector<dsn_rcpt> m_rcpt_dsn;
     uint8_t     m_ret{0};
     std::string m_envid;
+    bool m_requiretls{false};
     int         m_drop_code{0};
     std::string m_drop_text;
     uint32_t    m_errors{0};

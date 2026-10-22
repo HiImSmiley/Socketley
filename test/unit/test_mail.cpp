@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "runtime/mail/mail_aliases.h"
+#include "runtime/mail/mail_arc.h"
 #include "runtime/mail/mail_compose.h"
 #include "runtime/mail/mail_dkim.h"
 #include "runtime/mail/mail_mime.h"
@@ -22,6 +23,7 @@
 #include "runtime/mail/imap_order.h"
 #include "runtime/mail/mail_verify.h"
 #include "runtime/mail/smtp_session.h"
+#include "shared/net/idna.h"
 #include "shared/net/public_suffix.h"
 #include "shared/util/base64.h"
 #include "shared/util/deflate.h"
@@ -1165,4 +1167,188 @@ TEST_CASE("SORT and THREAD: a display name with a comma, and a reply chain fifty
     CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(3));
     CHECK(t.find("(50000") == std::string::npos);
     CHECK(std::count(t.begin(), t.end(), '(') == std::count(t.begin(), t.end(), ')'));
+}
+
+TEST_CASE("DKIM: Ed25519 signs and verifies, l= short of the body is no pass, and a weak or wrong key is refused")
+{
+    char tmpl[] = "/tmp/test_mail_ed_XXXXXX";
+    REQUIRE(mkdtemp(tmpl) != nullptr);
+    std::string why;
+    const auto ed = dkim::load_or_make(std::string(tmpl) + "/ed.pem", why, true);
+    REQUIRE_MESSAGE(ed, why);
+    CHECK(dkim::algorithm_of(ed.get()) == "ed25519-sha256");
+    const std::string record = dkim::public_record(ed.get());
+    CHECK(record.starts_with("v=DKIM1; k=ed25519; p="));
+    const std::string msg = "From: a@example.test\r\nTo: b@remote.test\r\nSubject: hi\r\n\r\nbody\r\n";
+    const std::string signed_msg = dkim::sign(msg, "example.test", "skl-ed", ed.get(), 1000) + msg;
+    auto sigs = dkim::signatures(signed_msg);
+    REQUIRE(sigs.size() == 1);
+    CHECK(sigs[0].a == "ed25519-sha256");
+    CHECK(dkim::verify(signed_msg, sigs[0], record, 1000, &why) == dkim::result::pass);
+    std::string changed = signed_msg;
+    changed.replace(changed.find("Subject: hi"), 11, "Subject: ho");
+    CHECK(dkim::verify(changed, sigs[0], record, 1000) == dkim::result::fail);
+    // An RSA key record for an Ed25519 signature is a key of another algorithm.
+    const auto rsa = dkim::load_or_make(std::string(tmpl) + "/rsa.pem", why);
+    REQUIRE(rsa);
+    CHECK(dkim::verify(signed_msg, sigs[0], dkim::public_record(rsa.get()), 1000) == dkim::result::permerror);
+    // A 512-bit RSA key says nothing of who signed.
+    EVP_PKEY* weak = EVP_PKEY_Q_keygen(nullptr, nullptr, "RSA", static_cast<size_t>(512));
+    REQUIRE(weak);
+    const std::string weak_signed = dkim::sign(msg, "example.test", "w", weak, 1000) + msg;
+    sigs = dkim::signatures(weak_signed);
+    REQUIRE(sigs.size() == 1);
+    CHECK(dkim::verify(weak_signed, sigs[0], dkim::public_record(weak), 1000, &why) == dkim::result::permerror);
+    CHECK(why.find("1024") != std::string::npos);
+    EVP_PKEY_free(weak);
+    // l= naming less than the body: what follows could be anyone's, so it is neutral, not a pass.
+    const std::string m2 = "From: a@example.test\r\nSubject: l\r\n\r\nline one\r\n";
+    const std::string s2 = dkim::sign(m2, "example.test", "skl", rsa.get(), 1000, "DKIM-Signature", "v=1; l=10; ") + m2;
+    auto s = dkim::signatures(s2);
+    REQUIRE(s.size() == 1);
+    CHECK(s[0].l == "10");
+    CHECK(dkim::verify(s2, s[0], dkim::public_record(rsa.get()), 1000) == dkim::result::pass);
+    const std::string appended = s2 + "a line of someone else's\r\n";
+    CHECK(dkim::verify(appended, dkim::signatures(appended)[0], dkim::public_record(rsa.get()), 1000) ==
+          dkim::result::neutral);
+    // A d= with a space in it would write a result of its own into this host's Authentication-Results.
+    std::string spaced = s2;
+    spaced.replace(spaced.find("d=example.test"), 14, "d=example.test dkim=pass");
+    CHECK(dkim::signatures(spaced).empty());
+    std::filesystem::remove_all(tmpl);
+}
+
+TEST_CASE("DKIM: h= names past 256 are refused, and one signature's body is canonicalized once for all")
+{
+    std::string h;
+    for (int i = 0; i < 300; ++i)
+        h += "from:";
+    const std::string m = "DKIM-Signature: v=1; a=rsa-sha256; d=example.test; s=skl; c=relaxed/relaxed; h=" + h +
+                          "subject; bh=" + std::string(44, 'A') + "; b=AAAA\r\nFrom: a@example.test\r\n\r\nbody\r\n";
+    const auto sigs = dkim::signatures(m);
+    REQUIRE(sigs.size() == 1);
+    std::string why;
+    dkim::bodies cache;
+    const auto r = dkim::verify(m, sigs[0], "v=DKIM1; p=AAAA", 0, &why, &cache);
+    CHECK(r == dkim::result::fail);
+    CHECK(cache.have_relaxed);
+}
+
+TEST_CASE("SPF: IPv6 %{i}, %{h} from HELO, other delimiters, upper-case escapes, strict CIDR and exists by A alone")
+{
+    table_resolver r;
+    r.txts["six.test"] = {"v=spf1 exists:%{ir}.%{v}._spf.six.test -all"};
+    r.addresses["1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6._spf.six.test"] = {"127.0.0.2"};
+    CHECK(spf_check("2001:db8::1", "six.test", "x@six.test", r) == "pass");
+    r.txts["helo.test"] = {"v=spf1 exists:%{h}.ok.helo.test -all"};
+    r.addresses["mx.sender.test.ok.helo.test"] = {"127.0.0.2"};
+    CHECK(spf_check("192.0.2.1", "helo.test", "x@helo.test", r, "mx.sender.test") == "pass");
+    r.txts["dash.test"] = {"v=spf1 exists:%{l1r-}.dash.test -all"};
+    r.addresses["first.dash.test"] = {"127.0.0.2"};
+    CHECK(spf_check("192.0.2.1", "dash.test", "first-second@dash.test", r) == "pass");
+    r.txts["esc.test"] = {"v=spf1 exists:%{L}.esc.test -all"};
+    r.addresses["a%2Bb.esc.test"] = {"127.0.0.2"};
+    CHECK(spf_check("192.0.2.1", "esc.test", "a+b@esc.test", r) == "pass");
+    // An empty or wrong length is a syntax error, never /0, which would take the whole internet.
+    r.txts["slash.test"] = {"v=spf1 ip4:192.0.2.1/ -all"};
+    CHECK(spf_check("8.8.8.8", "slash.test", "x@slash.test", r) == "permerror");
+    r.txts["bits.test"] = {"v=spf1 a:h.bits.test/33 -all"};
+    CHECK(spf_check("8.8.8.8", "bits.test", "x@bits.test", r) == "permerror");
+    r.txts["ex.test"] = {"v=spf1 exists:only6.ex.test -all"};
+    r.addresses["only6.ex.test"] = {"2001:db8::5"};
+    CHECK(spf_check("192.0.2.1", "ex.test", "x@ex.test", r) == "fail");
+}
+
+TEST_CASE("DMARC: pct= samples the policy, two records are none, a name past ASCII is its A-labels")
+{
+    table_resolver r;
+    const std::string msg = "From: a@sample.test\r\nMessage-ID: <%s@x>\r\n\r\nbody\r\n";
+    r.txts["_dmarc.sample.test"] = {"v=DMARC1; p=reject; pct=0"};
+    auto res = check_inbound("From: a@sample.test\r\nMessage-ID: <1@x>\r\n\r\nx\r\n", "1.2.3.4", "h", "", r, 0);
+    CHECK(res.dmarc == "fail");
+    CHECK(res.dmarc_policy == "quarantine");
+    r.txts["_dmarc.sample.test"] = {"v=DMARC1; p=quarantine; pct=0"};
+    res = check_inbound("From: a@sample.test\r\nMessage-ID: <1@x>\r\n\r\nx\r\n", "1.2.3.4", "h", "", r, 0);
+    CHECK(res.dmarc_policy == "none");
+    int rejected = 0;
+    r.txts["_dmarc.sample.test"] = {"v=DMARC1; p=reject; pct=50"};
+    for (int i = 0; i < 200; ++i)
+        rejected += check_inbound("From: a@sample.test\r\nMessage-ID: <" + std::to_string(i) + "@x>\r\n\r\nx\r\n",
+                                  "1.2.3.4", "h", "", r, 0).reject();
+    CHECK(rejected > 60);
+    CHECK(rejected < 140);
+    r.txts["_dmarc.two.test"] = {"v=DMARC1; p=reject", "v=DMARC1; p=none"};
+    CHECK(check_inbound("From: a@two.test\r\n\r\nx\r\n", "1.2.3.4", "h", "", r, 0).dmarc == "none");
+    r.txts["_dmarc.ver.test"] = {"v=DMARC1x; p=reject"};
+    CHECK(check_inbound("From: a@ver.test\r\n\r\nx\r\n", "1.2.3.4", "h", "", r, 0).dmarc == "none");
+    r.txts["_dmarc.xn--bcher-kva.test"] = {"v=DMARC1; p=reject"};
+    res = check_inbound("From: a@b\xc3\xbc" "cher.test\r\n\r\nx\r\n", "1.2.3.4", "h", "", r, 0);
+    CHECK(res.from_domain == "xn--bcher-kva.test");
+    CHECK(res.reject());
+    CHECK(socketley::idna::to_ascii("M\xc3\xbcnchen.DE") == "xn--mnchen-3ya.de");
+}
+
+TEST_CASE("PSL: a rule past ASCII matches its A-labels, so two tenants under it are two organizations")
+{
+    socketley::public_suffix::list l;
+    l.load("cn\n\xe5\x85\xac\xe5\x8f\xb8.cn\n");
+    CHECK(l.registrable("a.xn--55qx5d.cn") == "a.xn--55qx5d.cn");
+    CHECK(l.registrable("x.a.xn--55qx5d.cn") == "a.xn--55qx5d.cn");
+    CHECK(l.registrable("x.b.\xe5\x85\xac\xe5\x8f\xb8.cn") == "b.xn--55qx5d.cn");
+}
+
+TEST_CASE("ARC: a set sealed here verifies, a chain broken on the way fails, and a trusted sealer vouches")
+{
+    char tmpl[] = "/tmp/test_mail_arc_XXXXXX";
+    REQUIRE(mkdtemp(tmpl) != nullptr);
+    std::string why;
+    const auto key = dkim::load_or_make(std::string(tmpl) + "/k.pem", why);
+    REQUIRE(key);
+    const auto ed = dkim::load_or_make(std::string(tmpl) + "/e.pem", why, true);
+    REQUIRE(ed);
+    table_resolver r;
+    r.txts["arc._domainkey.fwd.test"] = {dkim::public_record(key.get())};
+    r.txts["arc2._domainkey.second.test"] = {dkim::public_record(ed.get())};
+    const auto key_of = [&r](const std::string& name, std::string& record) {
+        std::vector<std::string> t;
+        bool nx = false;
+        r.txt(name, t, nx);
+        record = t.empty() ? std::string() : t.front();
+        return true;
+    };
+    const std::string msg = "From: a@origin.test\r\nTo: list@fwd.test\r\nSubject: hello\r\n\r\nbody\r\n";
+    CHECK(arc::verify(msg, key_of, 1000).result == "none");
+    const std::string one = arc::seal(msg, "mx.fwd.test", "spf=pass smtp.mailfrom=origin.test", "fwd.test", "arc",
+                                      key.get(), 1000, "none") + msg;
+    CHECK(one.starts_with("ARC-Seal: i=1; a=rsa-sha256; cv=none; d=fwd.test; s=arc;"));
+    auto c = arc::verify(one, key_of, 1000);
+    CHECK_MESSAGE(c.result == "pass", c.why);
+    CHECK(c.count == 1);
+    CHECK(c.sealer == "fwd.test");
+    // A second hop seals over the first, by Ed25519.
+    const std::string two = arc::seal(one, "mx.second.test", "arc=pass", "second.test", "arc2", ed.get(), 1001, "pass") + one;
+    c = arc::verify(two, key_of, 1001);
+    CHECK_MESSAGE(c.result == "pass", c.why);
+    CHECK(c.count == 2);
+    CHECK(c.sealer == "second.test");
+    // The body changed after the last seal breaks its message signature; a results header changed breaks a seal.
+    std::string body = two;
+    body.replace(body.find("body\r\n"), 4, "evil");
+    CHECK(arc::verify(body, key_of, 1001).result == "fail");
+    std::string results = two;
+    results.replace(results.find("spf=pass"), 8, "spf=fail");
+    CHECK(arc::verify(results, key_of, 1001).result == "fail");
+    // A set given twice is no chain.
+    CHECK(arc::verify(one.substr(0, one.find("From: ")) + one, key_of, 1000).result == "fail");
+    // DMARC: a failing message whose chain a trusted forwarder sealed is let through; an untrusted one's is not.
+    r.txts["_dmarc.origin.test"] = {"v=DMARC1; p=reject"};
+    auto res = check_inbound(one, "203.0.113.9", "mx.fwd.test", "list@fwd.test", r, 1000, {"fwd.test"});
+    CHECK(res.arc == "pass");
+    CHECK(res.dmarc == "fail");
+    CHECK(res.arc_vouched);
+    CHECK_FALSE(res.reject());
+    CHECK(res.header().find("arc=pass (i=1 d=fwd.test, vouched)") != std::string::npos);
+    res = check_inbound(one, "203.0.113.9", "mx.fwd.test", "list@fwd.test", r, 1000, {"other.test"});
+    CHECK(res.reject());
+    std::filesystem::remove_all(tmpl);
 }

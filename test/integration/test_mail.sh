@@ -9,6 +9,10 @@
 #   * mail for an alias not handed to the alias's domain's exchanger, or handed on without a Received line
 #   * a stranger let relay through it, or mail taken for a user that does not exist
 #   * a message submitted without a Date or Message-ID sent on without them
+#   * send of "-1" to a server taken as mail flags, a message past the channel's bound lost, a colon path misread
+#   * --sieve without its idp and storage, or a --hostname that is no name, taken as it is made
+#   * show printing a smarthost's password, or an import of it losing it
+#   * a rename by import leaving the spool and keys under the old name, or renaming a running one
 #   * STARTTLS that leaves the session in the clear, or a submission port that takes mail unsigned in, or a password
 #     tried as fast as a script can guess
 #   * `socketley send` and socketley.mail.send not queuing, or sending unsigned from a domain with a key
@@ -289,6 +293,45 @@ PY
 check "an address the list names sends nothing" "$(from_ip 127.0.0.2)" "554 127.0.0.2 is listed by bl.test"
 check "one it does not name is taken" "$(from_ip 127.0.0.3)" "250 "
 check "and a list's error answer names nobody" "$(from_ip 127.0.0.4)" "250 "
+
+# ─── the CLI and the daemon ─────────────────────────────────────────────────
+"$BIN" send luasend -1 >/dev/null 2>&1; check "send of a message that begins with - to a server reaches it" "$?" "0"
+head -c 6000000 /dev/urandom > "$T/big.bin"
+id=$("$BIN" send m --from alice@example.test --to dave@remote.test --subject "big one" --text "big body" \
+    --attach "$T/big.bin" 2>&1)
+case "$id" in queued\ *) ok "a message past what the channel carries is sent by the outbox" ;;
+    *) bad "a message past what the channel carries is sent by the outbox" "$id" ;; esac
+f=$(mail_with "^Subject: big one")
+[ -n "$f" ] && [ "$(stat -c %s "$f")" -gt 8000000 ] && ok "and arrives whole" || bad "and arrives whole" "$(stat -c %s "$f" 2>&1)"
+outbox=$(find "$HOME/.local/share" -type d -name 'm.outbox' 2>/dev/null | head -1)
+check "and leaves nothing in the outbox" "$(ls "$outbox" 2>/dev/null | wc -l)" "0"
+mkdir -p "$T/a:b"; printf 'colon dir\n' > "$T/a:b/x.txt"
+"$BIN" send m --from alice@example.test --to dave@remote.test --subject "colon path" --text t --attach "$T/a:b/x.txt" >/dev/null 2>&1
+f=$(mail_with "^Subject: colon path")
+[ -n "$f" ] && grep -q 'filename="x.txt"' "$f" && ok "an attachment under a directory with a colon is read from its path" \
+    || bad "an attachment under a directory with a colon is read from its path" "${f:-nothing sent}"
+r=$("$BIN" create mail sv1 -p $((SL_PORT_BASE+1988)) --mail-domain example.test --sieve $((SL_PORT_BASE+1989)) 2>&1)
+case "$r" in *"--sieve keeps the filters"*) ok "--sieve without --idp and --storage is refused as it is made" ;;
+    *) bad "--sieve without --idp and --storage is refused as it is made" "$r" ;; esac
+r=$("$BIN" create mail hn -p $((SL_PORT_BASE+1988)) --mail-domain example.test --hostname bad_name.test 2>&1)
+case "$r" in *"--hostname requires"*) ok "a --hostname that is no DNS name is refused" ;; *) bad "a --hostname that is no DNS name is refused" "$r" ;; esac
+"$BIN" create mail rl -p $((SL_PORT_BASE+1988)) --mail-domain example.test --relay smtps://user:pw123secret@relay.test:465 >/dev/null 2>&1
+check "show writes a smarthost's password as ***" "$("$BIN" show rl 2>/dev/null | grep -c 'pw123secret')" "0"
+"$BIN" show rl > "$T/rl.json" 2>/dev/null
+"$BIN" import rl < "$T/rl.json" >/dev/null 2>&1
+state=$(find "$HOME/.local/share" -name 'rl.json' -path '*runtimes*' 2>/dev/null | head -1)
+check "and an import of what it showed keeps the password" "$(grep -c 'pw123secret' "$state" 2>/dev/null)" "1"
+"$BIN" create mail ren -p $((SL_PORT_BASE+1988)) --mail-domain example.test -s >/dev/null 2>&1
+ready_tcp 127.0.0.1 $((SL_PORT_BASE+1988)) >/dev/null
+"$BIN" show ren 2>/dev/null | sed 's/"name": "ren"/"name": "ren2"/' > "$T/ren.json"
+r=$("$BIN" import ren < "$T/ren.json" 2>&1)
+case "$r" in *"cannot rename while running"*) ok "a running mail runtime is not renamed" ;; *) bad "a running mail runtime is not renamed" "$r" ;; esac
+"$BIN" stop ren >/dev/null 2>&1
+"$BIN" import ren < "$T/ren.json" >/dev/null 2>&1
+mail_dir=$(dirname "$(find "$HOME/.local/share" -name 'm.outbox' -type d 2>/dev/null | head -1)")
+[ -e "$mail_dir/ren2" ] && [ -e "$mail_dir/ren2.dkim.skl.key" ] && [ ! -e "$mail_dir/ren" ] \
+    && ok "a stopped one renamed by import takes its spool and keys along" \
+    || bad "a stopped one renamed by import takes its spool and keys along" "$(ls "$mail_dir" 2>&1 | tr '\n' ' ')"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

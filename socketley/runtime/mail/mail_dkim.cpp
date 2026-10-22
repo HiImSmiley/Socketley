@@ -1,7 +1,10 @@
 #include "mail_dkim.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
+#include <unordered_map>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -82,7 +85,8 @@ std::string simple_header(std::string_view name, std::string_view value)
     return std::string(name) + ":" + std::string(value);
 }
 
-// The signature's own header with the value of b= emptied, as it is hashed.
+}   // namespace
+
 std::string without_b(std::string_view raw)
 {
     std::string out(raw);
@@ -109,14 +113,13 @@ std::string without_b(std::string_view raw)
     return out;
 }
 
-}   // namespace
 
-key_ptr load_or_make(const std::string& path, std::string& why)
+key_ptr load_or_make(const std::string& path, std::string& why, bool ed25519)
 {
     std::string pem;
     if (socketley::read_file(path, pem, {.missing_ok = true}, nullptr) && !pem.empty())
         return load_pem(path, pem, why);
-    if (!make_key(path, why))
+    if (!make_key(path, why, ed25519))
         return nullptr;
     // What is at the path now, this one's key or the one another shard linked there first.
     if (!socketley::read_file(path, pem, {}, &why) || pem.empty())
@@ -138,9 +141,10 @@ key_ptr load_pem(const std::string& path, const std::string& pem, std::string& w
     return key_ptr(k, EVP_PKEY_free);
 }
 
-bool make_key(const std::string& path, std::string& why)
+bool make_key(const std::string& path, std::string& why, bool ed25519)
 {
-    EVP_PKEY* k = EVP_PKEY_Q_keygen(nullptr, nullptr, "RSA", static_cast<size_t>(2048));
+    EVP_PKEY* k = ed25519 ? EVP_PKEY_Q_keygen(nullptr, nullptr, "ED25519")
+                          : EVP_PKEY_Q_keygen(nullptr, nullptr, "RSA", static_cast<size_t>(2048));
     if (!k)
     {
         why = "no DKIM key could be made";
@@ -171,8 +175,22 @@ bool make_key(const std::string& path, std::string& why)
     return linked;
 }
 
+std::string algorithm_of(EVP_PKEY* key)
+{
+    return EVP_PKEY_get_base_id(key) == EVP_PKEY_ED25519 ? "ed25519-sha256" : "rsa-sha256";
+}
+
 std::string public_record(EVP_PKEY* key)
 {
+    // An Ed25519 key is published as its 32 bytes, not as a SubjectPublicKeyInfo (RFC 8463 4).
+    if (EVP_PKEY_get_base_id(key) == EVP_PKEY_ED25519)
+    {
+        unsigned char raw[32];
+        size_t n = sizeof raw;
+        if (EVP_PKEY_get_raw_public_key(key, raw, &n) != 1)
+            return {};
+        return "v=DKIM1; k=ed25519; p=" + socketley::base64::encode(std::string_view(reinterpret_cast<char*>(raw), n));
+    }
     unsigned char* der = nullptr;
     const int n = i2d_PUBKEY(key, &der);
     if (n <= 0)
@@ -255,8 +273,36 @@ std::string simple_body(std::string_view body)
     return out;
 }
 
+std::string sign_bytes(EVP_PKEY* key, std::string_view data)
+{
+    // Ed25519 signs the SHA-256 of what RSA would sign, with no digest of its own (RFC 8463 3).
+    const bool ed = EVP_PKEY_get_base_id(key) == EVP_PKEY_ED25519;
+    unsigned char md[SHA256_DIGEST_LENGTH];
+    if (ed)
+    {
+        SHA256(reinterpret_cast<const unsigned char*>(data.data()), data.size(), md);
+        data = std::string_view(reinterpret_cast<char*>(md), sizeof md);
+    }
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    size_t len = 0;
+    std::string sig;
+    if (ctx && EVP_DigestSignInit(ctx, nullptr, ed ? nullptr : EVP_sha256(), nullptr, key) == 1 &&
+        EVP_DigestSign(ctx, nullptr, &len, reinterpret_cast<const unsigned char*>(data.data()), data.size()) == 1)
+    {
+        sig.resize(len);
+        if (EVP_DigestSign(ctx, reinterpret_cast<unsigned char*>(sig.data()), &len,
+                           reinterpret_cast<const unsigned char*>(data.data()), data.size()) == 1)
+            sig.resize(len);
+        else
+            sig.clear();
+    }
+    if (ctx)
+        EVP_MD_CTX_free(ctx);
+    return sig.empty() ? std::string() : socketley::base64::encode(sig);
+}
+
 std::string sign(std::string_view message, std::string_view domain, std::string_view selector, EVP_PKEY* key,
-                 int64_t now_s)
+                 int64_t now_s, std::string_view header, std::string_view first_tags)
 {
     const std::string_view head = header_block(message);
     const std::string_view body = message.substr(head.size());
@@ -281,39 +327,46 @@ std::string sign(std::string_view message, std::string_view domain, std::string_
     // From named once more than it is there, so a second From added on the way breaks the signature.
     h += ":from";
     const std::string bh = sha256_b64(relaxed_body(body));
-    std::string value = " v=1; a=rsa-sha256; c=relaxed/relaxed; d=" + std::string(domain) + "; s=" +
+    std::string value = " " + std::string(first_tags) + (first_tags.empty() ? "v=1; " : "") + "a=" +
+                        algorithm_of(key) + "; c=relaxed/relaxed; d=" + std::string(domain) + "; s=" +
                         std::string(selector) + ";\r\n\tt=" + std::to_string(now_s) + "; h=" + h + ";\r\n\tbh=" + bh +
                         ";\r\n\tb=";
-    data += relaxed_header("DKIM-Signature", value);
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    size_t len = 0;
-    std::string sig;
-    if (ctx && EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr, key) == 1 &&
-        EVP_DigestSignUpdate(ctx, data.data(), data.size()) == 1 && EVP_DigestSignFinal(ctx, nullptr, &len) == 1)
-    {
-        sig.resize(len);
-        if (EVP_DigestSignFinal(ctx, reinterpret_cast<unsigned char*>(sig.data()), &len) == 1)
-            sig.resize(len);
-        else
-            sig.clear();
-    }
-    if (ctx)
-        EVP_MD_CTX_free(ctx);
-    if (sig.empty())
+    data += relaxed_header(header, value);
+    const std::string b = sign_bytes(key, data);
+    if (b.empty())
         return {};
-    const std::string b = socketley::base64::encode(sig);
     for (size_t at = 0; at < b.size(); at += 72)
         value += (at ? "\r\n\t " : "") + b.substr(at, 72);
-    return "DKIM-Signature:" + value + "\r\n";
+    return std::string(header) + ":" + value + "\r\n";
 }
 
-std::vector<signature> signatures(std::string_view message)
+bool ldh_name(std::string_view name)
+{
+    if (name.empty() || name.size() > 253)
+        return false;
+    for (size_t at = 0; at <= name.size();)
+    {
+        const size_t dot = std::min(name.find('.', at), name.size());
+        const std::string_view label = name.substr(at, dot - at);
+        if (label.empty() || label.size() > 63 || label.front() == '-' || label.back() == '-')
+            return false;
+        for (const char c : label)
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_')
+                return false;
+        if (dot == name.size())
+            break;
+        at = dot + 1;
+    }
+    return true;
+}
+
+std::vector<signature> signatures(std::string_view message, std::string_view header)
 {
     std::vector<signature> out;
     const auto headers = split_headers(header_block(message));
     for (size_t i = 0; i < headers.size(); ++i)
     {
-        if (!socketley::ascii::iequals(trim(headers[i].first), "dkim-signature"))
+        if (!socketley::ascii::iequals(trim(headers[i].first), header))
             continue;
         signature s;
         s.raw = std::string(headers[i].second);
@@ -333,14 +386,105 @@ std::vector<signature> signatures(std::string_view message)
             else if (k == "t") s.t = v;
             else if (k == "x") s.x = v;
         }
-        if (!s.d.empty() && !s.s.empty())
+        // A domain or selector that is no name would be a DNS name and a header of a sender's making.
+        if (ldh_name(s.d) && ldh_name(s.s))
             out.push_back(std::move(s));
     }
     return out;
 }
 
+bool header_data(const std::vector<std::pair<std::string_view, std::string_view>>& headers, std::string_view h,
+                 bool relaxed, size_t skip, std::string& data, bool& from_signed)
+{
+    // Each name's places from the bottom, so a name of h= costs one step however many headers there are.
+    std::unordered_map<std::string, std::vector<size_t>> places;
+    for (size_t i = 0; i < headers.size(); ++i)
+        if (i != skip)
+            places[lower(trim(headers[i].first))].push_back(i);
+    size_t names = 0;
+    while (!h.empty())
+    {
+        const size_t colon = h.find(':');
+        const std::string name = lower(trim(h.substr(0, colon)));
+        h = colon == std::string_view::npos ? std::string_view{} : h.substr(colon + 1);
+        if (++names > 256)
+            return false;
+        from_signed = from_signed || name == "from";
+        const auto it = places.find(name);
+        if (it == places.end() || it->second.empty())
+            continue;
+        const size_t i = it->second.back();
+        it->second.pop_back();
+        data += (relaxed ? relaxed_header(headers[i].first, headers[i].second)
+                         : simple_header(headers[i].first, headers[i].second)) +
+                "\r\n";
+    }
+    return true;
+}
+
+result verify_bytes(std::string_view record, std::string_view algorithm, std::string_view data, std::string_view b64,
+                    std::string* why)
+{
+    const auto fail = [&](result r, const char* w) {
+        if (why)
+            *why = w;
+        return r;
+    };
+    const bool ed = algorithm == "ed25519-sha256";
+    if (!ed && algorithm != "rsa-sha256")
+        return fail(result::permerror, "an algorithm other than rsa-sha256 and ed25519-sha256");
+    if (record.empty())
+        return fail(result::permerror, "no key record for the selector");
+    std::string p;
+    std::string k = "rsa";
+    for (const auto& [name, v] : tags(record))
+        if (name == "p")
+            p = no_space(v);
+        else if (name == "k")
+            k = lower(v);
+    if (p.empty())
+        return fail(result::fail, "the key is revoked");
+    if (k != (ed ? "ed25519" : "rsa"))
+        return fail(result::permerror, "a key not of the signature's algorithm");
+    std::string der, sig;
+    if (!socketley::base64::decode(p, der) || !socketley::base64::decode(b64, sig))
+        return fail(result::permerror, "base64 that does not decode");
+    EVP_PKEY* pub = nullptr;
+    if (ed)
+        pub = der.size() == 32 ? EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr,
+                                                              reinterpret_cast<const unsigned char*>(der.data()), 32)
+                               : nullptr;
+    else
+    {
+        const auto* q = reinterpret_cast<const unsigned char*>(der.data());
+        pub = d2i_PUBKEY(nullptr, &q, static_cast<long>(der.size()));
+    }
+    if (!pub)
+        return fail(result::permerror, "a public key that does not parse");
+    // RSA under 1024 bits is too weak to say who signed (RFC 8301 3.2).
+    if (!ed && (EVP_PKEY_get_base_id(pub) != EVP_PKEY_RSA || EVP_PKEY_get_bits(pub) < 1024))
+    {
+        EVP_PKEY_free(pub);
+        return fail(result::permerror, "an RSA key shorter than 1024 bits");
+    }
+    unsigned char md[SHA256_DIGEST_LENGTH];
+    if (ed)
+    {
+        SHA256(reinterpret_cast<const unsigned char*>(data.data()), data.size(), md);
+        data = std::string_view(reinterpret_cast<char*>(md), sizeof md);
+    }
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    const bool ok = ctx && EVP_DigestVerifyInit(ctx, nullptr, ed ? nullptr : EVP_sha256(), nullptr, pub) == 1 &&
+                    EVP_DigestVerify(ctx, reinterpret_cast<const unsigned char*>(sig.data()), sig.size(),
+                                     reinterpret_cast<const unsigned char*>(data.data()), data.size()) == 1;
+    if (ctx)
+        EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pub);
+    return ok ? result::pass : fail(result::fail, "the signature does not verify");
+}
+
 result verify(std::string_view message, const signature& sig, std::string_view record, int64_t now_s,
-              std::string* why)
+              std::string* why, bodies* cache)
 {
     const auto fail = [&](result r, const char* w) {
         if (why)
@@ -349,8 +493,8 @@ result verify(std::string_view message, const signature& sig, std::string_view r
     };
     if (sig.v != "1" || sig.h.empty() || sig.bh.empty() || sig.b.empty())
         return fail(result::permerror, "a tag the signature needs is missing");
-    if (sig.a != "rsa-sha256")
-        return fail(result::permerror, "an algorithm other than rsa-sha256");
+    if (sig.a != "rsa-sha256" && sig.a != "ed25519-sha256")
+        return fail(result::permerror, "an algorithm other than rsa-sha256 and ed25519-sha256");
     if (!sig.x.empty() && std::atoll(sig.x.c_str()) < now_s)
         return fail(result::fail, "the signature has expired");
     std::string hc = "simple", bc = "simple";
@@ -363,71 +507,50 @@ result verify(std::string_view message, const signature& sig, std::string_view r
     }
     if ((hc != "simple" && hc != "relaxed") || (bc != "simple" && bc != "relaxed"))
         return fail(result::permerror, "an unknown canonicalization");
-    std::string p;
-    bool from_signed = false;
-    for (const auto& [k, v] : tags(record))
-        if (k == "p")
-            p = no_space(v);
-        else if (k == "k" && v != "rsa")
-            return fail(result::permerror, "a key that is not RSA");
     if (record.empty())
         return fail(result::permerror, "no key record for the selector");
-    if (p.empty())
-        return fail(result::fail, "the key is revoked");
     const std::string_view head = header_block(message);
-    std::string body(message.substr(head.size()));
-    std::string canon = bc == "relaxed" ? relaxed_body(body) : simple_body(body);
+    const std::string_view body = message.substr(head.size());
+    bodies own;
+    bodies& b = cache ? *cache : own;
+    const bool relaxed_body_wanted = bc == "relaxed";
+    if (relaxed_body_wanted && !b.have_relaxed)
+    {
+        b.relaxed = relaxed_body(body);
+        b.have_relaxed = true;
+    }
+    if (!relaxed_body_wanted && !b.have_simple)
+    {
+        b.simple = simple_body(body);
+        b.have_simple = true;
+    }
+    std::string_view canon = relaxed_body_wanted ? b.relaxed : b.simple;
+    bool partial = false;
     if (!sig.l.empty())
     {
         const auto l = static_cast<size_t>(std::atoll(sig.l.c_str()));
         if (l > canon.size())
             return fail(result::permerror, "l= is longer than the body");
-        canon.resize(l);
+        partial = l < canon.size();
+        canon = canon.substr(0, l);
     }
     if (sha256_b64(canon) != sig.bh)
         return fail(result::fail, "the body hash does not match");
     const auto headers = split_headers(head);
-    std::vector<bool> used(headers.size(), false);
     std::string data;
-    std::string_view list = sig.h;
-    while (!list.empty())
-    {
-        const size_t colon = list.find(':');
-        const std::string name = lower(trim(list.substr(0, colon)));
-        list = colon == std::string_view::npos ? std::string_view{} : list.substr(colon + 1);
-        from_signed = from_signed || name == "from";
-        for (size_t i = headers.size(); i-- > 0;)
-            if (!used[i] && i != sig.index && socketley::ascii::iequals(trim(headers[i].first), name))
-            {
-                used[i] = true;
-                data += (hc == "relaxed" ? relaxed_header(headers[i].first, headers[i].second)
-                                         : simple_header(headers[i].first, headers[i].second)) +
-                        "\r\n";
-                break;
-            }
-    }
+    bool from_signed = false;
+    if (!header_data(headers, sig.h, hc == "relaxed", sig.index, data, from_signed))
+        return fail(result::permerror, "h= names more than 256 headers");
     if (!from_signed)
         return fail(result::permerror, "From is not signed");
-    const auto& own = headers[sig.index];
-    data += hc == "relaxed" ? relaxed_header(own.first, without_b(own.second))
-                            : simple_header(own.first, without_b(own.second));
-    std::string der;
-    std::string signature_bytes;
-    if (!socketley::base64::decode(p, der) || !socketley::base64::decode(sig.b, signature_bytes))
-        return fail(result::permerror, "base64 that does not decode");
-    const auto* q = reinterpret_cast<const unsigned char*>(der.data());
-    EVP_PKEY* pub = d2i_PUBKEY(nullptr, &q, static_cast<long>(der.size()));
-    if (!pub)
-        return fail(result::permerror, "a public key that does not parse");
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    const bool ok = ctx && EVP_DigestVerifyInit(ctx, nullptr, EVP_sha256(), nullptr, pub) == 1 &&
-                    EVP_DigestVerify(ctx, reinterpret_cast<const unsigned char*>(signature_bytes.data()),
-                                     signature_bytes.size(), reinterpret_cast<const unsigned char*>(data.data()),
-                                     data.size()) == 1;
-    if (ctx)
-        EVP_MD_CTX_free(ctx);
-    EVP_PKEY_free(pub);
-    return ok ? result::pass : fail(result::fail, "the signature does not verify");
+    const auto& self = headers[sig.index];
+    data += hc == "relaxed" ? relaxed_header(self.first, without_b(self.second))
+                            : simple_header(self.first, without_b(self.second));
+    const result r = verify_bytes(record, sig.a, data, sig.b, why);
+    // What l= leaves out could be anyone's, so a signature of part of the body says nothing of the rest.
+    if (r == result::pass && partial)
+        return fail(result::neutral, "l= leaves part of the body unsigned");
+    return r;
 }
 
 const char* result_name(result r)

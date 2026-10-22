@@ -28,6 +28,13 @@ std::string mail_verp_key_path(std::string_view runtime_name);
 std::string mail_key_path(std::string_view runtime_name, std::string_view selector);
 // Where the users' Sieve scripts are kept, the same for every shard.
 std::string mail_sieve_dir(std::string_view runtime_name);
+// A runtime's state moved under a new name, as an import that renames it asks; false with `why` where a file of the
+// new name's is there already or one could not be moved.
+bool mail_rename_state(std::string_view from, std::string_view to, std::string& why);
+// A --relay URL with its password written ***, as show prints it; the URL as it is where it has none.
+std::string mail_redacted_relay(std::string_view url);
+// Where `socketley send` leaves a message too large for the daemon's channel, for the runtime to take.
+std::string mail_outbox_dir(std::string_view runtime_name);
 
 class mail_instance : public runtime_instance, public deferred_request_sink
 {
@@ -50,6 +57,51 @@ public:
     // The DNS blocklists a connection's address is looked up in, a comma list of zones.
     void set_dnsbl(std::string_view zones) { m_dnsbl = std::string(zones); }
     std::string_view get_dnsbl() const { return m_dnsbl; }
+    // The forwarders whose ARC seal of a passing chain lets mail that fails DMARC through, a comma list of domains.
+    void set_arc_trust(std::string_view domains) { m_arc_trust = std::string(domains); }
+    std::string_view get_arc_trust() const { return m_arc_trust; }
+    // POP3 (RFC 1939) for the INBOX of each user, over STLS.
+    void set_pop3_port(uint16_t v) { m_pop3 = v; }
+    uint16_t get_pop3_port() const { return m_pop3; }
+    // POP3 over TLS from the first byte.
+    void set_pop3s_port(uint16_t v) { m_pop3s = v; }
+    uint16_t get_pop3s_port() const { return m_pop3s; }
+    // LMTP (RFC 2033) from this machine, for the mailboxes.
+    void set_lmtp_port(uint16_t v) { m_lmtp = v; }
+    uint16_t get_lmtp_port() const { return m_lmtp; }
+    // The HTTPS port its MTA-STS policy is served on.
+    void set_mta_sts_port(uint16_t v) { m_sts_port = v; }
+    uint16_t get_mta_sts_port() const { return m_sts_port; }
+    // Seconds a first triplet is greylisted for, 0 for none.
+    void set_greylist(uint32_t v) { m_greylist_s = v; }
+    uint32_t get_greylist() const { return m_greylist_s; }
+    // Where a stranger's mail is scored.
+    void set_rspamd(std::string_view v) { m_rspamd = std::string(v); }
+    std::string_view get_rspamd() const { return m_rspamd; }
+    // What divides a user from a tag; empty for none.
+    void set_recipient_delimiter(std::string_view v) { m_delimiter = std::string(v); }
+    std::string_view get_recipient_delimiter() const { return m_delimiter; }
+    // Whether DMARC and TLS reports go to the domains that ask for them.
+    void set_reports(bool v) { m_reports = v; }
+    bool get_reports() const { return m_reports; }
+    // The address its published DMARC record names for reports.
+    void set_dmarc_rua(std::string_view v) { m_dmarc_rua = std::string(v); }
+    std::string_view get_dmarc_rua() const { return m_dmarc_rua; }
+    // The address its _smtp._tls record names for TLS reports.
+    void set_tls_rpt(std::string_view v) { m_tls_rpt = std::string(v); }
+    std::string_view get_tls_rpt() const { return m_tls_rpt; }
+    // The MTA-STS mode it publishes for its domains, empty for none.
+    void set_mta_sts(std::string_view v) { m_mta_sts = std::string(v); }
+    std::string_view get_mta_sts() const { return m_mta_sts; }
+    // What a mailbox holds where its user has no quota of their own, 0 for no bound.
+    void set_default_quota(uint64_t v) { m_default_quota = v; }
+    uint64_t get_default_quota() const { return m_default_quota; }
+    // At what percent of their quota a user is told, once; 0 for never.
+    void set_quota_warn(uint32_t v) { m_quota_warn = v; }
+    uint32_t get_quota_warn() const { return m_quota_warn; }
+    // The selector of the DKIM key made and published ahead of signing with it, for a key's rotation.
+    void set_dkim_next(std::string_view s) { m_dkim_next = std::string(s); }
+    std::string_view get_dkim_next() const { return m_dkim_next; }
     // The dns runtime whose zones are the mail domains, and which is given their MX, SPF, DKIM and DMARC records.
     void set_dns(std::string_view rt) { m_dns = std::string(rt); }
     std::string_view get_dns() const { return m_dns; }
@@ -116,6 +168,21 @@ private:
     uint16_t    m_imaps{0};
     uint16_t    m_sieve{0};
     std::string m_dnsbl;
+    std::string m_arc_trust;
+    uint16_t m_pop3{0};
+    uint16_t m_pop3s{0};
+    uint16_t m_lmtp{0};
+    uint16_t m_sts_port{0};
+    uint32_t m_greylist_s{0};
+    std::string m_rspamd;
+    std::string m_delimiter{"+"};
+    bool m_reports{false};
+    std::string m_dmarc_rua;
+    std::string m_tls_rpt;
+    std::string m_mta_sts;
+    uint64_t m_default_quota{0};
+    uint32_t m_quota_warn{90};
+    std::string m_dkim_next;
     std::string m_dns;
     std::string m_domains;
     std::string m_hostname;

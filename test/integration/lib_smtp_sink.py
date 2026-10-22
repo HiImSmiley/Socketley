@@ -11,6 +11,7 @@
 #   --no-pipelining       leave PIPELINING out of EHLO
 #   --chunking            offer CHUNKING, and take BDAT
 #   --dsn                 offer DSN
+#   --requiretls          offer REQUIRETLS inside TLS
 # A message's file says "via DATA" or "via BDAT", and "mailparams"/"rcptparams <addr>" lines say what came with them.
 # FAKESINK_ADDR binds another address than 127.0.0.1.
 import base64, os, socket, ssl, sys, threading, time
@@ -18,6 +19,7 @@ port, out = int(sys.argv[1]), sys.argv[2]
 args = sys.argv[3:]
 tls = auth = None
 replies, data_code, pipelining, chunking, dsn = {}, None, True, False, False
+requiretls = False
 auth_login, auth_code, mail_replies, greet = False, None, {}, "220"
 i = 0
 while i < len(args):
@@ -33,6 +35,7 @@ while i < len(args):
     elif a == "--no-pipelining": pipelining = False; i += 1
     elif a == "--chunking": chunking = True; i += 1
     elif a == "--dsn": dsn = True; i += 1
+    elif a == "--requiretls": requiretls = True; i += 1
     else: raise SystemExit("unknown option " + a)
 data_codes = {"d": data_code}
 lock = threading.Lock()
@@ -65,6 +68,7 @@ def serve(conn):
             if auth: ext.append("AUTH LOGIN" if auth_login else "AUTH PLAIN")
             if chunking: ext.append("CHUNKING")
             if dsn: ext.append("DSN")
+            if requiretls and secure[0]: ext.append("REQUIRETLS")
             say("".join("250-%s\r\n" % e for e in ext[:-1]) + "250 %s\r\n" % ext[-1])
         elif v == "STARTTLS" and tls:
             say("220 go ahead\r\n")

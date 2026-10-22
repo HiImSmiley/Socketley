@@ -21,6 +21,7 @@
 #include "../../shared/persist/read_file.h"
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/storage/storage_rpc.h"
+#include "../../shared/util/base64.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/text_list.h"
@@ -43,6 +44,113 @@ std::string canonical(const std::string& folder)
 }
 
 }   // namespace
+
+std::string imap_folder::id() const
+{
+    if (!objectid.empty())
+        return objectid;
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out = "F";
+    for (int i = 28; i >= 0; i -= 4)
+        out += hex[(uidvalidity >> i) & 15];
+    return out;
+}
+
+std::string imap_store::email_id(std::string_view key)
+{
+    // FNV-1a over the key: the same on every shard and at every start, and as unique as the keys are among a user's.
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char c : key)
+        h = (h ^ c) * 1099511628211ull;
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out = "M";
+    for (int i = 60; i >= 0; i -= 4)
+        out += hex[(h >> i) & 15];
+    return out;
+}
+
+bool imap_store::meta_name_ok(std::string_view entry)
+{
+    // /private or /shared and what is under them, an atom with no wildcard, no empty level and no slash at its end
+    // (RFC 5464 3.2).
+    return (entry == "/private" || entry == "/shared" || entry.starts_with("/private/") || entry.starts_with("/shared/")) &&
+           entry.size() <= 1024 && entry.find_first_of("*%\"(){}[]\\") == std::string_view::npos &&
+           entry.find("//") == std::string_view::npos && entry.back() != '/' &&
+           std::all_of(entry.begin(), entry.end(), [](char c) { return c > 0x20 && c < 0x7f; });
+}
+
+imap_store::meta_refusal imap_store::set_meta(const std::string& name, const std::string& folder,
+                                              const std::string& entry, const std::string* value)
+{
+    if (!meta_name_ok(entry) || entry == "/private" || entry == "/shared")
+        return meta_refusal::bad_name;
+    if (value && value->size() > meta_max_value)
+        return meta_refusal::too_large;
+    user(name);
+    const std::string fname = folder.empty() ? std::string() : canonical(folder);
+    meta_refusal why = meta_refusal::none;
+    mutate(name, [&](user_state& u, std::string& lines) {
+        if (!fname.empty() && !u.folders.count(fname))
+        {
+            why = meta_refusal::no_folder;
+            return;
+        }
+        const auto f = u.meta.find(fname);
+        const std::string* had = nullptr;
+        if (f != u.meta.end())
+            if (const auto e = f->second.find(entry); e != f->second.end())
+                had = &e->second;
+        if (value && !had && u.meta_count >= 1000)
+        {
+            why = meta_refusal::too_many;
+            return;
+        }
+        if (value && u.meta_bytes - (had ? had->size() : 0) + value->size() > (1u << 20))
+        {
+            why = meta_refusal::too_large;
+            return;
+        }
+        if (!value && !had)
+            return;
+        const std::string line = "T " + (value ? socketley::base64::encode(*value) : std::string("-")) + " " + fname +
+                                 "\t" + entry + "\n";
+        apply(u, line, false);
+        lines += line;
+    });
+    return why;
+}
+
+const std::string* imap_store::meta(const std::string& name, const std::string& folder, const std::string& entry)
+{
+    user_state& u = user(name);
+    const auto f = u.meta.find(folder.empty() ? std::string() : canonical(folder));
+    if (f == u.meta.end())
+        return nullptr;
+    const auto e = f->second.find(entry);
+    return e == f->second.end() ? nullptr : &e->second;
+}
+
+std::vector<std::pair<std::string, std::string>> imap_store::meta_under(const std::string& name, const std::string& folder,
+                                                                        const std::string& entry, int depth)
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    user_state& u = user(name);
+    const auto f = u.meta.find(folder.empty() ? std::string() : canonical(folder));
+    if (f == u.meta.end() || depth <= 0)
+        return out;
+    const std::string under = entry + "/";
+    for (auto it = f->second.lower_bound(under); it != f->second.end() && it->first.starts_with(under); ++it)
+        if (depth > 1 || it->first.find('/', under.size()) == std::string::npos)
+            out.emplace_back(it->first, it->second);
+    return out;
+}
+
+std::string imap_store::mailbox_id(const std::string& name, const std::string& folder)
+{
+    const auto& folders = user(name).folders;
+    const auto it = folders.find(canonical(folder));
+    return it == folders.end() ? std::string() : it->second->id();
+}
 
 imap_message* imap_folder::by_uid(uint32_t uid)
 {
@@ -239,6 +347,13 @@ void imap_store::apply(user_state& u, std::string_view text, bool fresh)
                         if (m.size != UINT64_MAX)
                             u.used -= std::min(u.used, m.size);
                     u.last_validity = std::max(u.last_validity, it->second->uidvalidity);
+                    if (const auto m = u.meta.find(it->first); m != u.meta.end())
+                    {
+                        for (const auto& [e, v] : m->second)
+                            u.meta_bytes -= std::min<uint64_t>(u.meta_bytes, v.size());
+                        u.meta_count -= std::min(u.meta_count, m->second.size());
+                        u.meta.erase(m);
+                    }
                     u.folders.erase(it);
                 }
                 break;
@@ -247,6 +362,40 @@ void imap_store::apply(user_state& u, std::string_view text, bool fresh)
                 const auto w = words(l, 1);
                 if (imap_folder* f = folder(l))
                     f->subscribed = w[0] == "1";
+                break;
+            }
+            case 'T':
+            {
+                // T <base64 value, or - for none> <folder>\t<entry>: a METADATA entry set or taken away.
+                const auto w = words(l, 1);
+                const size_t tab = l.find('\t');
+                if (tab == std::string_view::npos)
+                    break;
+                const std::string fname(l.substr(0, tab)), entry(l.substr(tab + 1));
+                auto& entries = u.meta[fname];
+                if (const auto it = entries.find(entry); it != entries.end())
+                {
+                    u.meta_bytes -= std::min<uint64_t>(u.meta_bytes, it->second.size());
+                    --u.meta_count;
+                    entries.erase(it);
+                }
+                std::string value;
+                if (w[0] != "-" && socketley::base64::decode(w[0], value))
+                {
+                    u.meta_bytes += value.size();
+                    ++u.meta_count;
+                    entries[entry] = std::move(value);
+                }
+                if (entries.empty())
+                    u.meta.erase(fname);
+                break;
+            }
+            case 'I':
+            {
+                // I <mailboxid> <folder>: the id a folder took from the one it was renamed from.
+                const auto w = words(l, 1);
+                if (imap_folder* f = folder(l))
+                    f->objectid = std::string(w[0]);
                 break;
             }
             case 'A':
@@ -358,6 +507,9 @@ void imap_store::reload(user_state& u)
     if (lock >= 0 && ::flock(lock, LOCK_SH) != 0) {}
     std::map<std::string, std::shared_ptr<imap_folder>> before = std::move(u.folders);
     u.folders.clear();
+    u.meta.clear();
+    u.meta_bytes = 0;
+    u.meta_count = 0;
     std::string snap, log;
     socketley::read_file(base, snap, {.missing_ok = true}, nullptr);
     u.snapshot_gen = 0;
@@ -399,6 +551,10 @@ void imap_store::reload(user_state& u)
                 f->vanished_from = f->highestmodseq;
                 u.folders[f->name] = f;
             }
+            else if (line[0] == 'I' && f)
+                f->objectid = std::string(line.substr(2));
+            else if (line[0] == 'T')
+                apply(u, std::string(line) + "\n", false);
             else if (line[0] == 'W' && f && !f->msgs.empty())
             {
                 // W <keyword> ...: the keywords of the message on the line before.
@@ -593,6 +749,8 @@ void imap_store::compact(const std::string& name, user_state& u)
     {
         text += "F " + std::to_string(f->uidvalidity) + " " + std::to_string(f->uidnext) + " " +
                 (f->subscribed ? "1" : "0") + " " + std::to_string(f->highestmodseq) + " " + n + "\n";
+        if (!f->objectid.empty())
+            text += "I " + f->objectid + "\n";
         for (const auto& m : f->msgs)
         {
             text += "M " + std::to_string(m.uid) + " " + std::to_string(m.flags) + " " + std::to_string(m.size) + " " +
@@ -606,6 +764,9 @@ void imap_store::compact(const std::string& name, user_state& u)
             }
         }
     }
+    for (const auto& [fname, entries] : u.meta)
+        for (const auto& [entry, value] : entries)
+            text += "T " + socketley::base64::encode(value) + " " + fname + "\t" + entry + "\n";
     // 0 where the files could not be written, 1 where they moved in, 2 where a line came since the snapshot was built.
     auto done = std::make_shared<int>(0);
     m_run.pool().submit(
@@ -856,7 +1017,8 @@ bool imap_store::create(const std::string& name, const std::string& folder)
     }
     bool made = false;
     mutate(name, [&](user_state& u, std::string& lines) {
-        if (u.folders.count(f))
+        // A user keeps a thousand folders at most, so CREATE in a loop does not grow the index without end.
+        if (u.folders.count(f) || u.folders.size() + levels.size() > 1000)
             return;
         for (const auto& level : levels)
             if (!u.folders.count(level))
@@ -954,11 +1116,19 @@ void imap_store::sync(const std::string& name, const std::shared_ptr<imap_folder
                            for (const auto& [ms, k] : f->gone_keys)
                                if (ms > f->sync_from)
                                    known.insert(k);
+                           const int64_t now = wall::now_ms_coarse();
+                           std::erase_if(f->missing_since, [&](const auto& e) { return there.count(e.first) > 0; });
                            for (auto& m : f->msgs)
                            {
                                known.insert(m.key);
                                if (!there.count(m.key) && m.modseq <= f->sync_from)
                                {
+                                   // A message a listing lacks goes once it has been missing a minute, so one the
+                                   // store took and lists late is not expunged for it.
+                                   const auto [miss, fresh] = f->missing_since.try_emplace(m.key, now);
+                                   if (now - miss->second < 60000)
+                                       continue;
+                                   f->missing_since.erase(miss);
                                    const uint64_t ms = ++f->highestmodseq;
                                    u.used -= std::min(u.used, m.size);
                                    f->gone_keys.emplace_back(ms, m.key);
@@ -1061,7 +1231,7 @@ void imap_store::body(const std::string& key, uint64_t size, std::function<void(
         const bool ranged = size > rpc::max_value;
         rq.kind = ranged ? rpc::op::get_range : rpc::op::get;
         rq.size = data->size();
-        rq.max_keys = static_cast<uint32_t>(rpc::max_value);
+        rq.length = static_cast<uint32_t>(rpc::max_value);
         boxes->ask(boxes->storage(), rpc::encode(rq),
                    [self, data, finish, ranged, alive, kind = rq.kind](request_status st, std::string_view bytes) {
                        if (!*alive)
@@ -1130,7 +1300,7 @@ void imap_store::head(const std::string& key, uint64_t size, std::function<void(
     rq.bucket = boxes->bucket();
     rq.key = key;
     rq.size = 0;
-    rq.max_keys = first;
+    rq.length = first;
     boxes->ask(boxes->storage(), rpc::encode(rq),
                [this, key, size, give, alive = m_alive](request_status st, std::string_view bytes) {
                    if (!*alive)
@@ -1622,20 +1792,69 @@ void imap_store::rename(const std::string& name, const std::string& from, const 
                         std::function<void(bool)> done)
 {
     const std::string a = canonical(from), b = canonical(to);
-    // The source is looked for before the destination is made, so a RENAME of nothing leaves nothing behind.
-    if (a == "INBOX" || !user(name).folders.count(a) || user(name).folders.count(b) || !create(name, b))
+    // The source is looked for before the destination is made, so a RENAME of nothing leaves nothing behind; a
+    // folder is not renamed into itself.
+    if (a == b || b == "INBOX" || b.starts_with(a + "/") || !user(name).folders.count(a) || user(name).folders.count(b))
     {
         done(false);
         return;
     }
-    open(name, a, [this, name, a, b, done](std::shared_ptr<imap_folder> f) {
-        if (!f)
+    // The folders under it go with it, each as the one above it is done (RFC 3501 6.3.5); INBOX's stay.
+    std::vector<std::pair<std::string, std::string>> moves{{a, b}};
+    if (a != "INBOX")
+        for (const auto& [f, _] : user(name).folders)
+            if (f.starts_with(a + "/") && !user(name).folders.count(b + f.substr(a.size())))
+                moves.emplace_back(f, b + f.substr(a.size()));
+    auto step = std::make_shared<std::function<void(size_t)>>();
+    std::weak_ptr<std::function<void(size_t)>> weak = step;
+    *step = [this, name, moves, done, weak](size_t at) {
+        auto self = weak.lock();
+        if (!self)
+            return;
+        if (at == moves.size())
+        {
+            done(true);
+            return;
+        }
+        const auto& [from_name, to_name] = moves[at];
+        const std::string id = from_name == "INBOX" ? std::string() : mailbox_id(name, from_name);
+        if (!create(name, to_name))
         {
             done(false);
             return;
         }
-        empty_out(name, f, a, b, 4, done);
-    }, true);
+        // A renamed folder keeps its MAILBOXID and its METADATA; INBOX's stay INBOX's (RFC 8474 4.1, RFC 5464 3.4).
+        if (!id.empty())
+            mutate(name, [&](user_state& u, std::string& lines) {
+                if (const auto it = u.folders.find(to_name); it != u.folders.end())
+                {
+                    it->second->objectid = id;
+                    lines += "I " + id + " " + to_name + "\n";
+                }
+                if (const auto m = u.meta.find(from_name); m != u.meta.end())
+                {
+                    std::string moved;
+                    for (const auto& [entry, value] : m->second)
+                        moved += "T " + socketley::base64::encode(value) + " " + to_name + "\t" + entry + "\n";
+                    apply(u, moved, false);
+                    lines += moved;
+                }
+            });
+        open(name, from_name, [this, name, from_name, to_name, done, self, at](std::shared_ptr<imap_folder> f) {
+            if (!f)
+            {
+                done(false);
+                return;
+            }
+            empty_out(name, f, from_name, to_name, 4, [done, self, at](bool ok) {
+                if (ok)
+                    (*self)(at + 1);
+                else
+                    done(false);
+            });
+        }, true);
+    };
+    (*step)(0);
 }
 
 void imap_store::empty_out(const std::string& name, const std::shared_ptr<imap_folder>& f, const std::string& fname,
@@ -1649,6 +1868,12 @@ void imap_store::empty_out(const std::string& name, const std::shared_ptr<imap_f
     {
         bool gone = false;
         mutate(name, [&](user_state& u, std::string& lines) {
+            // INBOX stays, emptied, as a RENAME of it leaves it (RFC 3501 6.3.5).
+            if (fname == "INBOX")
+            {
+                gone = true;
+                return;
+            }
             // A message that came in while the last pass ran keeps the folder.
             if (!f->msgs.empty())
                 return;

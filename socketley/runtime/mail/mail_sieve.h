@@ -2,7 +2,7 @@
 // Sieve (RFC 5228), the language a user filters the mail delivered to them with, and the extensions ManageSieve
 // offers: fileinto, reject and ereject, envelope, encoded-character, imap4flags, copy, vacation and vacation-seconds,
 // subaddress, body, relational with i;ascii-numeric, variables, date and index, mailbox, regex, editheader,
-// duplicate, include, environment, spamtest, spamtestplus and virustest, enotify with mailto, and ihave.  A script is
+// duplicate, include, environment, spamtest, spamtestplus and virustest, enotify with mailto, ihave and imapsieve.  A script is
 // compiled once and run against each message, which decides the actions and touches nothing itself: the caller
 // files, forwards, answers, notifies and keeps what duplicate saw.
 // Every bound a hostile script or message could push on is fixed here, so a run costs at most its step budget.
@@ -44,6 +44,14 @@ struct context
     // What a spam and a virus scanner said, 0 where none looked: spamtest 1 to 10, spamtestplus a percentage, and
     // virustest 1 (clean) to 5 (infected).
     int spam{0}, spam_percent{0}, virus{0};
+    // A run for what an IMAP client did to a message in a folder (RFC 6785): APPEND, COPY or FLAG, the folder, the
+    // user and their address, the flags it changed, and the flags the message has, which imap4flags starts from.
+    struct imap_event
+    {
+        std::string cause, mailbox, user, email, changed;
+        std::vector<std::string> flags;
+    };
+    std::optional<imap_event> imap;
 };
 
 // An answer vacation decided to send, the memory of whom was answered within `seconds` being the caller's.

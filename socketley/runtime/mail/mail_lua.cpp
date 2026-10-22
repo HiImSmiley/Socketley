@@ -71,11 +71,19 @@ void mail_lua::message(const spool_entry& e)
     t["size"] = e.body_len;
     t["peer"] = e.peer;
     t["user"] = e.user;
-    // A message small enough to be kept in memory is handed whole, its subject read out of it.
+    // A message small enough to be kept in memory is handed whole, its subject read out of it; its bytes are
+    // copied into the script only when it reads m.message, so a script that reads the sender copies none.
     if (e.body)
     {
-        t["message"] = *e.body;
         t["subject"] = header_value(header_block(*e.body), "Subject");
+        sol::table meta = L.create_table(0, 1);
+        meta[sol::meta_function::index] = [body = e.body](sol::table, const std::string& key,
+                                                          sol::this_state s) -> sol::object {
+            if (key == "message")
+                return sol::make_object(s, std::string_view(*body));
+            return sol::lua_nil;
+        };
+        t[sol::metatable_key] = meta;
     }
     lua_suspender::id_t id = 0;
     lua->suspender().start(lua->raw_on_message(), "on_message", lua->callback_timeout_ms(), id, t);

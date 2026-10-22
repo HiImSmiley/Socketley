@@ -712,7 +712,15 @@ a runtime with
 .B \-\-no\-reply
 sends from no\-reply@ its first domain.
 .B \-\-raw
-queues stdin as the whole message, its headers its own. See
+queues stdin as the whole message, its headers its own. A message past 4 MiB
+goes to the runtime by a file in its outbox under the state directory, so one
+up to
+.B \-\-max\-size
+is sent whole; a message to a server or a client that begins with \- is given
+after \-\-. A
+.B :type
+after an attachment is taken as its type only where it is one, type/subtype,
+and the file does not exist with it. See
 .BR "MAIL FLAGS" .
 .RS
 .PP
@@ -12602,7 +12610,21 @@ elsewhere to the domain's exchanger or a smarthost, and keeps its users'
 mailboxes in a storage runtime, read over IMAP. It is a runtime like the
 others: a dns runtime gives its domains their records, an idp runtime its users,
 a storage runtime its mailboxes, and the other runtimes, the CLI and the daemon's
-alerts send mail through it.
+alerts send mail through it. Its settings are changed with
+.B import
+(\-\-restart to take them at once): a running runtime takes its connection,
+rate and idle limits as they come and the rest at its next start, and
+.B \-\-users
+and
+.B \-\-aliases
+are read again whenever their files change. A rename by
+.B import
+moves its spool, keys and mailboxes' state with it, and is refused while it
+runs.
+.B show
+prints a
+.B \-\-relay
+password as ***, which an import of what it printed keeps as it was.
 .PP
 .nf
 socketley create mail m \-p 25 \-\-dns ns \-\-no\-reply \-s
@@ -12622,7 +12644,14 @@ one that speaks TLS from the first byte, and
 .B \-\-imap
 and
 .B \-\-imaps
-the same two for reading the mailboxes. A message a signed\-in user sends
+the same two for reading the mailboxes;
+.B \-\-pop3
+and
+.B \-\-pop3s
+read INBOX over POP3 (RFC 1939, with STLS, SASL PLAIN, UIDL and TOP), and
+.B \-\-lmtp
+takes mail from this machine's own programs into the mailboxes over LMTP (RFC
+2033), one answer for each recipient. A message a signed\-in user sends
 without a Date or a Message\-ID is given them, as Postfix's cleanup does; one
 from another server is passed on as it came. With no
 .B \-\-bind
@@ -12643,14 +12672,21 @@ the local part a username, or the address the account's email), when it is
 .B no\-reply@
 and a bounce, or when the script takes it
 .RB ( on_rcpt );
-any other is refused at RCPT with 550. Mail for elsewhere is taken from a user
+any other is refused at RCPT with 550. A local part with a tag,
+.IB user + tag @\fR,
+is the user's, the tag what Sieve's subaddress reads;
+.B \-\-recipient\-delimiter
+names other characters for it, or none. An address this runtime rewrote under
+SRS (below) is the sender it stands for, taken while it is 21 days old and only
+under the runtime's own key. Mail for elsewhere is taken from a user
 signed in, and from 127.0.0.1, this machine's own programs; from anyone else it
 is refused with 554, so the server is not a relay.
 .PP
 .B Taking mail.
 ESMTP with PIPELINING, SIZE, 8BITMIME, SMTPUTF8, ENHANCEDSTATUSCODES, STARTTLS,
-AUTH PLAIN and LOGIN, CHUNKING (BDAT) and DSN; replies come in the order the
-commands came. A message
+AUTH PLAIN and LOGIN, CHUNKING (BDAT), DSN, LIMITS (RCPTMAX, RFC 9422) and,
+inside TLS, REQUIRETLS (RFC 8689); replies come in the order the commands
+came. A message
 past
 .B \-\-max\-size
 is refused, said at MAIL when its SIZE says so, after its end otherwise. Its end
@@ -12693,17 +12729,34 @@ a connection on port 25 not from 127.0.0.1 has its address asked of each list
 while it is greeted, and its MAIL waits for the answer if it has not come: one
 a list names (an address in 127/8) sends nothing, 554, unless it signs in. A
 list's error answer (127.255.255.x) names nobody, and a list that does not
-answer lets the mail by; an answer is kept five minutes.
+answer lets the mail by; an answer is kept five minutes. With
+.BR \-\-greylist ,
+a stranger's first try of a sender and a recipient from a network (a /24, or a
+/64) is told 451 and taken once it tries again after the delay and within a
+day, and from then on for 36 days; what a shard learns every shard knows. With
+.BR \-\-rspamd ,
+each message from elsewhere is scanned by that Rspamd's
+.B /checkv2
+beside the checks: reject refuses it with 554, soft reject and greylist with
+451, add header and rewrite subject file it in Junk, and its score goes into
+Authentication\-Results as x\-spam, which Sieve's spamtest reads. A scanner that
+does not answer in ten seconds lets the mail by.
 Mail from elsewhere (port 25, no user signed in, not 127.0.0.1) is checked
 before it is taken: SPF (RFC 7208) for the sender's domain, or HELO's for a
-bounce; every DKIM signature (up to five); and DMARC (RFC 7489) for the domain
-of From, with SPF or DKIM aligned as its record says. A message DMARC fails
-under
+bounce; every DKIM signature, rsa\-sha256 and ed25519\-sha256, up to ten, those
+of the From's organization first, one whose l= leaves part of the body out
+neutral and an RSA key under 1024 bits refused; the ARC chain; and DMARC (RFC
+7489) for the domain of From, its labels past ASCII as A\-labels, with SPF or
+DKIM aligned as its record says and pct= sampling what its policy is for. A
+message DMARC fails under
 .B p=reject
 is refused with 550 and not kept, as is one whose author cannot be told
 \(em two From headers, one that does not read, or authors of two domains; under
 .B p=quarantine
-it goes to the recipient's Junk folder. What each said is written into the
+it goes to the recipient's Junk folder; a passing ARC chain sealed last by one
+of
+.B \-\-arc\-trust
+takes the policy off. What each said is written into the
 mailbox's
 .B Authentication\-Results
 line, and one a sender put there under this host's name is taken out, as is
@@ -12715,8 +12768,9 @@ told 451. The organizational
 domain DMARC compares is a name's registrable domain by the Public Suffix List
 of the publicsuffix package
 .RB ( /usr/share/publicsuffix ),
-so mail.example.co.uk is example.co.uk; without the package, its last two
-labels.
+so mail.example.co.uk is example.co.uk, its rules past ASCII compared as
+A\-labels; without the package a name is its own, so relaxed alignment is
+strict, and the log says so once.
 .PP
 .B The spool.
 A message is synced before the client is told 250, kept under
@@ -12771,15 +12825,47 @@ always is, and its password is never sent in the clear. A recipient refused for 
 .BR \-\-queue\-lifetime ;
 one refused for good, or out of time, is bounced to the sender as a delivery
 status report from the null sender. A server that offers CHUNKING is sent the
-message in BDAT chunks, nothing stuffed. What a sender asked of reports (RFC
+message in BDAT chunks, nothing stuffed, and one whose LIMITS say how many
+recipients a transaction takes is sent them that many at a time. A server that
+answers 421 is given a rest: no new connection to its domain for thirty
+seconds, doubled by each 421 until it takes a message, to fifteen minutes.
+REQUIRETLS mail goes on only over TLS whose certificate DANE or an enforced
+MTA\-STS policy vouched for (a smarthost's always is), to a server that offers
+REQUIRETLS, and is returned 550 5.7.10 otherwise, its notice carrying no more
+than its header; a Sieve redirect keeps the requirement on. Mail from
+elsewhere that it sends on goes from an SRS address of its first domain
+(SRS0=hash=time=domain=local@), so SPF at the next hop judges this host and a
+bounce finds its way back. What a sender asked of reports (RFC
 3461) is kept with each recipient: NOTIFY, ORCPT, RET and ENVID go on to a
 server that offers DSN, which reports from there; elsewhere this runtime reports
 a SUCCESS asked for as delivered or relayed, a DELAY once a message has waited
 four hours, and no failure where NOTIFY said NEVER. RET=FULL has the report
 carry the message whole, up to 4 MiB; otherwise it carries the header. Mail from one of its domains is signed with
-DKIM (rsa\-sha256, relaxed), with a key made at its first start and kept in
+DKIM twice, rsa\-sha256 under the selector and ed25519\-sha256 (RFC 8463) under
+.IB selector \-ed ,
+relaxed, with keys made at its first start and kept in
 .IB state /mail/ name .dkim. selector .key
-for every shard.
+for every shard. A key is rotated by naming the new selector with
+.B \-\-dkim\-next
+first, which makes its pair and publishes it beside the old one, and with
+.B \-\-dkim\-selector
+once DNS has it. Mail from elsewhere that it sends on, as an alias does, is
+sealed with ARC (RFC 8617): what its checks found, signed and sealed for its
+first domain, so the next hop can know what the message was as it came.
+.PP
+.B Reports.
+With
+.BR \-\-reports ,
+it sends the reports other domains ask for: DMARC aggregate reports (RFC 7489)
+to the rua of each domain whose mail it checked, and TLS reports (RFC 8460) to
+the rua of each domain's
+.B _smtp._tls
+record it sent mail to under DANE or MTA\-STS, once a day, after midnight UTC,
+gzip'd, each shard what it saw.
+.B \-\-dmarc\-rua
+and
+.B \-\-tls\-rpt
+publish where others send theirs about its own domains.
 .PP
 .B Its records.
 With
@@ -12791,8 +12877,10 @@ it gives each of its domains, through the dns runtime:
 example.com.                 MX   10 mail.example.com.
 example.com.                 TXT  "v=spf1 mx \-all"
 skl._domainkey.example.com.  TXT  "v=DKIM1; k=rsa; p=..."
+skl\-ed._domainkey.example.com. TXT "v=DKIM1; k=ed25519; p=..."
 _dmarc.example.com.          TXT  "v=DMARC1; p=quarantine; adkim=r; aspf=r"
 _imaps._tcp.example.com.     SRV  0 1 993 mail.example.com.
+_25._tcp.mail.example.com.   TLSA 3 1 1 ...
 .fi
 .RE
 .IP
@@ -12800,10 +12888,28 @@ with an SRV record (RFC 6186, RFC 8314) for each of
 .BR \-\-submission ,
 .BR \-\-submissions ,
 .BR \-\-imap ,
-.B \-\-imaps
+.BR \-\-imaps ,
+.BR \-\-pop3 ,
+.B \-\-pop3s
 and
 .B \-\-sieve
-it opens, so a mail client finds them from the address alone,
+it opens, so a mail client finds them from the address alone; with
+.B \-\-tls
+the TLSA record of its certificate's key, for senders that check DANE where the
+zone is signed; with
+.B \-\-mta\-sts
+an
+.B _mta\-sts
+record whose id follows the policy, and with
+.B \-\-mta\-sts\-port
+.BI mta\-sts. domain
+as a CNAME of its host, which serves the policy there over TLS; with
+.B \-\-tls\-rpt
+an
+.B _smtp._tls
+record, and with
+.B \-\-dmarc\-rua
+a rua in its DMARC record,
 .IP
 and its host,
 .BI mail. domain
@@ -12892,8 +12998,22 @@ field in the idp runtime
 .RB ( "socketley idp\-user" " ... " "\-\-set mail_quota=500M" )
 bounds what their mailboxes hold: IMAP tells it as one quota root over every
 folder, an APPEND or a COPY past it is refused OVERQUOTA, and a delivery past it
-is refused 552 5.2.2, as Dovecot refuses one. A connection quiet for thirty
-minutes is closed.
+is refused 552 5.2.2, as Dovecot refuses one; a user with no
+.B mail_quota
+has
+.BR \-\-default\-quota .
+A user whose mailboxes pass
+.B \-\-quota\-warn
+percent of their quota (90 unless it says) is mailed a warning once, and again
+only after they fell below it. IMAP also offers MULTIAPPEND, which puts every
+message it is given in or none, UTF8=ACCEPT, under which folder names come and
+go as UTF\-8 and a message may be a literal8, CREATE\-SPECIAL\-USE, which takes
+a special use only of the folder whose name has it, BINARY, which gives a part
+with its transfer encoding undone, OBJECTID, whose MAILBOXID a RENAME keeps,
+METADATA (RFC 5464), entries of the server and of each folder kept in the
+index, at most 1000 a user of 64 KiB each, and APPENDLIMIT; RENAME
+takes the folders under a name along, and RENAME INBOX moves its messages and
+leaves it empty. A connection quiet for thirty minutes is closed.
 .PP
 .B From the other runtimes.
 .B socketley send
@@ -12944,6 +13064,17 @@ include :personal the user's own. environment tells host, domain,
 remote\-ip, location MDA, phase during, name and version; spamtest and
 virustest are 0 until a scanner says more. A script that fails keeps the
 message in INBOX.
+.IP
+imapsieve (RFC 6785): a folder whose
+.B /shared/imapsieve/script
+entry names one of the user's scripts, set by SETMETADATA, has it run for each
+message a client APPENDs or COPYs or MOVEs into it, and for each whose flags a
+STORE changes there; environment's imap.cause, imap.mailbox, imap.user,
+imap.email and imap.changedflags say what was done, and imap4flags starts from
+the message's flags. keep leaves it with the flags the script left, fileinto
+files a copy, redirect sends one on, and where nothing keeps it the message
+leaves the folder once its copies are in; reject is an error and vacation does
+nothing. What its own fileinto puts elsewhere runs no script there.
 .PP
 .B Lua.
 A script of the runtime decides each recipient and is told each message:
@@ -13038,13 +13169,71 @@ answered 452.
 How long a message is tried before it is bounced, 1m to 30d, 5d unless given.
 .TP
 .BI "\-\-dkim\-selector " name
-The selector its DKIM key is published and signed under, skl unless given.
+The selector its DKIM key is published and signed under, skl unless given; its
+Ed25519 key is
+.IR name \-ed .
+.TP
+.BI "\-\-dkim\-next " name
+A selector whose keys are made and published, not yet signed with, for a key's
+rotation.
+.TP
+.BI "\-\-arc\-trust " domain\fR[,\fIdomain\fR...]
+Forwarders, such as a mailing list's domain, whose ARC seal of a chain that
+passes lets mail through that fails DMARC because they forwarded it.
 .TP
 .BI "\-\-sieve " port
 ManageSieve (RFC 5804), for the users' Sieve scripts; needs
 .B \-\-idp
 and
 .BR \-\-storage .
+.TP
+.BI "\-\-pop3 " port
+POP3, STLS on it; needs
+.B \-\-idp
+and
+.BR \-\-storage .
+.TP
+.BI "\-\-pop3s " port
+POP3 over TLS from the first byte.
+.TP
+.BI "\-\-lmtp " port
+LMTP for this machine's own programs, into the mailboxes only; a connection
+from elsewhere is closed.
+.TP
+.BI "\-\-mta\-sts " enforce\fR|\fBtesting
+Publish an MTA\-STS policy (RFC 8461) of that mode naming its host.
+.TP
+.BI "\-\-mta\-sts\-port " port
+Serve the policy over HTTPS on this port, with the certificate of
+.BR \-\-tls ,
+which the daemon's ACME asks for
+.BI mta\-sts. domain
+too; senders fetch it on 443.
+.TP
+.BI "\-\-tls\-rpt " address
+Publish where TLS reports (RFC 8460) about its domains go.
+.TP
+.BI "\-\-dmarc\-rua " address
+Publish where DMARC aggregate reports about its domains go.
+.TP
+.B \-\-reports
+Send the DMARC and TLS reports other domains ask for.
+.TP
+.BI "\-\-greylist " duration
+Greylist strangers (RFC 6647) for this long, such as 5m; 0 for none.
+.TP
+.BI "\-\-rspamd " url
+The Rspamd that scans mail from elsewhere, such as http://127.0.0.1:11333.
+.TP
+.BI "\-\-recipient\-delimiter " chars\fR|\fBnone
+What divides a user from a tag in an address, + unless it says.
+.TP
+.BI "\-\-default\-quota " size
+The quota of a user whose idp account names none; 0 for no bound.
+.TP
+.BI "\-\-quota\-warn " percent
+How full a user's mailboxes get before they are told, 90 unless it says; 0 for
+never.
 .TP
 .BI "\-\-dnsbl " zone\fR[,\fIzone\fR...]
 DNS blocklists (RFC 5782), such as zen.spamhaus.org: a stranger's address is
@@ -13061,7 +13250,8 @@ and their failures, STARTTLS and TLS failures, the connections out, their TLS
 and transactions, the certificates DANE and MTA\-STS checked and the
 connections refused for want of TLS, the policies fetched and what testing ones
 would have failed, what Sieve rejected, sent on and answered on vacation, the
-MX lookups, and the IMAP connections and reads.
+MX lookups, what the spam filter refused and filed in Junk, what was
+greylisted, the reports sent, and the IMAP connections and reads.
 .SH REGISTERED TYPES
 A runtime type beyond the built-in seven is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never
@@ -17596,6 +17786,13 @@ Inherited by worker processes, which have no command line of their own.
 .B SOCKETLEY_MAIL_DEAD_DOMAIN_MS
 A test aid: the milliseconds a mail runtime holds a domain it found not to exist,
 or to take no mail, before it looks it up again, ten minutes when unset.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MAIL_BUSY_HOLD_MS
+A test aid: the milliseconds a mail runtime opens no new connection to a domain
+after one of its exchangers answered 421, doubled by each 421 until a message is
+taken, to fifteen minutes; thirty seconds when unset.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

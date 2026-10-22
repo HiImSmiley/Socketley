@@ -984,15 +984,31 @@ static void publish_dns_names(runtime_manager& manager)
             const auto it = origins.find(std::string(ml.get_dns()));
             if (ml.get_dns().empty() || it == origins.end() || it->second.empty())
                 continue;
+            // The name the runtime greets with and its MX names: of its first --mail-domain, else of the zone.
             std::string host(ml.get_hostname());
             if (host.empty())
             {
-                host = "mail." + it->second.front();
+                const auto own = ml.domains();
+                host = "mail." + (own.empty() ? it->second.front() : own.front());
                 if (host.back() == '.')
                     host.pop_back();
             }
             if (std::string why; dns_feed::valid_name(host, why))
                 names.push_back(runtime_names::normal(host));
+            // The host an MTA-STS policy is fetched from is this one too, where the runtime serves it.
+            if (ml.get_mta_sts_port())
+            {
+                auto own = ml.domains();
+                if (own.empty())
+                    own = it->second;
+                for (std::string d : own)
+                {
+                    if (!d.empty() && d.back() == '.')
+                        d.pop_back();
+                    if (std::string why; dns_feed::valid_name("mta-sts." + d, why))
+                        names.push_back(runtime_names::normal("mta-sts." + d));
+                }
+            }
         }
     }
     if (!dns_feed::write_zones(zones))
@@ -4708,6 +4724,8 @@ int daemon_handler::cmd_dump(ipc_connection* conn, const parsed_args& pa)
             conn->write_buf += '\n';
         first = false;
         runtime_config cfg = m_persistence->read_from_instance(inst);
+        // A smarthost's password is shown as ***, which an import of what this printed puts back as it was.
+        cfg.mail_relay = mail_redacted_relay(cfg.mail_relay);
         conn->write_buf += m_persistence->format_json_pretty(cfg);
     }
     return 0;
@@ -4888,6 +4906,13 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
     }
     if (!named)
         cfg.name = std::string(name);
+    // The *** show writes for a smarthost's password is the password this runtime has.
+    if (instance->get_type() == runtime_mail && cfg.mail_relay.find(":***@") != std::string::npos)
+    {
+        const std::string had(static_cast<const mail_instance*>(instance)->get_relay());
+        if (mail_redacted_relay(had) == cfg.mail_relay)
+            cfg.mail_relay = had;
+    }
 
     // The listener field is re-read from the document rather than taken from
     // cfg, because parse_json_string cannot tell a missing `unix:` prefix from
@@ -5416,11 +5441,16 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
 
     if (renamed)
     {
+        // A mail runtime's spool, keys and mailboxes' state are files named for it, moved with it.
+        const runtime_instance* before = m_manager.get(old_name);
+        const bool mail = before && before->get_type() == runtime_mail;
         if (!m_manager.rename(old_name, cfg.name))
         {
             conn->write_buf = "rename failed: name already taken\n";
             return 1;
         }
+        if (std::string why; mail && !mail_rename_state(old_name, cfg.name, why))
+            LOG_WARN(("mail " + cfg.name + ": its state stayed under " + old_name + ": " + why).c_str());
         instance = m_manager.get(cfg.name);
         // The children it took along name it on disk too.
         for (const auto& child : m_manager.get_children(cfg.name))
@@ -5440,6 +5470,9 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa, bool
     // worker nothing.
     if (instance->get_state() == runtime_running)
         push_config_to_workers(pa.args[1], instance);
+    // A running mail runtime takes its limits at once and the rest of its settings at its next start.
+    if (instance->get_type() == runtime_mail && instance->get_state() == runtime_running)
+        conn->write_buf += cfg.name + ": its ports, domains, relay, keys and mailboxes change at its next start\n";
 
     return 0;
 }

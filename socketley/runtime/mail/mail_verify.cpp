@@ -13,9 +13,11 @@
 #include <netinet/in.h>
 #include <resolv.h>
 
+#include "mail_arc.h"
 #include "mail_compose.h"
 #include "mail_dkim.h"
 #include "../dns/dns_wire.h"
+#include "../../shared/net/idna.h"
 #include "../../shared/net/public_suffix.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/settings.h"
@@ -74,9 +76,37 @@ struct spf_state
     const std::string& ip;
     const std::string& sender;
     check_resolver& r;
+    const std::string& helo;
     int lookups{0};
     int voids{0};
 };
+
+// An IPv6 address as %{i} writes it, its 32 nibbles dot-separated (RFC 7208 7.3); an IPv4 one as it is.
+std::string macro_ip(const std::string& ip)
+{
+    unsigned char a[16];
+    if (ip.find(':') == std::string::npos || ::inet_pton(AF_INET6, ip.c_str(), a) != 1)
+        return ip;
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    for (const unsigned char b : a)
+    {
+        out += (out.empty() ? "" : ".");
+        out += hex[b >> 4];
+        out += '.';
+        out += hex[b & 15];
+    }
+    return out;
+}
+
+// A length after a slash, read strictly: digits up to `max`, or -1 for none that is one.
+int cidr_bits(std::string_view s, int max)
+{
+    if (s.empty() || s.size() > 3 || !std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        return -1;
+    const int n = std::atoi(std::string(s).c_str());
+    return n <= max ? n : -1;
+}
 
 // The macros of RFC 7208 7, the letters a mechanism's domain is written with, without the ones only exp= takes.
 bool expand(std::string_view spec, const std::string& domain, spf_state& s, std::string& out)
@@ -105,7 +135,8 @@ bool expand(std::string_view spec, const std::string& domain, spf_state& s, std:
             const size_t close = spec.find('}', i);
             if (close == std::string_view::npos || close == i + 1)
                 return false;
-            const char letter = socketley::ascii::lower(spec[i + 1]);
+            const char given = spec[i + 1];
+            const char letter = socketley::ascii::lower(given);
             std::string_view tr = spec.substr(i + 2, close - i - 2);
             i = close;
             std::string v;
@@ -115,12 +146,13 @@ bool expand(std::string_view spec, const std::string& domain, spf_state& s, std:
                 case 'l': v = local; break;
                 case 'o': v = sdom; break;
                 case 'd': v = domain; break;
-                case 'i': v = s.ip; break;
-                case 'h': v = domain; break;
+                case 'i': v = macro_ip(s.ip); break;
+                case 'h': v = s.helo.empty() ? domain : s.helo; break;
                 case 'v': v = s.ip.find(':') == std::string::npos ? "in-addr" : "ip6"; break;
                 default: return false;
             }
-            // Digits keep that many labels from the right, r reverses them first.
+            // Digits keep that many labels from the right, r reverses them first, and what follows names the
+            // delimiters the value is split on, a dot where none is named (RFC 7208 7.1).
             size_t keep = 0;
             bool reverse = false;
             while (!tr.empty() && std::isdigit(static_cast<unsigned char>(tr.front())))
@@ -129,11 +161,22 @@ bool expand(std::string_view spec, const std::string& domain, spf_state& s, std:
                 tr.remove_prefix(1);
             }
             if (!tr.empty() && socketley::ascii::lower(tr.front()) == 'r')
+            {
                 reverse = true;
+                tr.remove_prefix(1);
+            }
+            if (tr.find_first_not_of(".-+,/_=") != std::string_view::npos)
+                return false;
+            const std::string_view delims = tr.empty() ? std::string_view(".") : tr;
             std::vector<std::string> labels;
-            std::stringstream ss(v);
-            for (std::string l; std::getline(ss, l, '.');)
-                labels.push_back(l);
+            for (size_t from = 0;;)
+            {
+                const size_t cut = v.find_first_of(delims, from);
+                labels.push_back(v.substr(from, cut == std::string::npos ? std::string::npos : cut - from));
+                if (cut == std::string::npos)
+                    break;
+                from = cut + 1;
+            }
             if (reverse)
                 std::reverse(labels.begin(), labels.end());
             if (keep && keep < labels.size())
@@ -141,6 +184,25 @@ bool expand(std::string_view spec, const std::string& domain, spf_state& s, std:
             std::string joined;
             for (const auto& l : labels)
                 joined += (joined.empty() ? "" : ".") + l;
+            // An upper-case letter asks for the value URL-escaped (RFC 7208 7.3).
+            if (given != letter)
+            {
+                static constexpr char hex[] = "0123456789ABCDEF";
+                std::string esc;
+                for (const char c : joined)
+                {
+                    const auto u = static_cast<unsigned char>(c);
+                    if (std::isalnum(u) || c == '-' || c == '.' || c == '_' || c == '~')
+                        esc += c;
+                    else
+                    {
+                        esc += '%';
+                        esc += hex[u >> 4];
+                        esc += hex[u & 15];
+                    }
+                }
+                joined = std::move(esc);
+            }
             out += joined;
         }
         else
@@ -178,15 +240,18 @@ hit mechanism(std::string_view term, const std::string& domain, spf_state& s, in
     {
         std::string_view cidr = arg.substr(cut);
         dspec = arg.substr(0, cut);
+        // A length that is not one is a syntax error, not /0 (RFC 7208 5.6).
         if (cidr.starts_with("//"))
-            v6bits = std::atoi(std::string(cidr.substr(2)).c_str());
+            v6bits = cidr_bits(cidr.substr(2), 128);
         else
         {
             const size_t dbl = cidr.find("//");
-            v4bits = std::atoi(std::string(cidr.substr(1, dbl == std::string_view::npos ? std::string_view::npos : dbl - 1)).c_str());
+            v4bits = cidr_bits(cidr.substr(1, dbl == std::string_view::npos ? std::string_view::npos : dbl - 1), 32);
             if (dbl != std::string_view::npos)
-                v6bits = std::atoi(std::string(cidr.substr(dbl + 2)).c_str());
+                v6bits = cidr_bits(cidr.substr(dbl + 2), 128);
         }
+        if (v4bits < 0 || v6bits < 0)
+            return hit::permerror;
     }
     std::string target = domain;
     if (!dspec.empty() && n != "ip4" && n != "ip6" && !expand(dspec, domain, s, target))
@@ -212,9 +277,14 @@ hit mechanism(std::string_view term, const std::string& domain, spf_state& s, in
         int bits = -1;
         if (const size_t cut = net.find('/'); cut != std::string_view::npos)
         {
-            bits = std::atoi(std::string(net.substr(cut + 1)).c_str());
+            bits = cidr_bits(net.substr(cut + 1), n == "ip4" ? 32 : 128);
+            if (bits < 0)
+                return hit::permerror;
             net = net.substr(0, cut);
         }
+        unsigned char probe[16];
+        if (::inet_pton(n == "ip4" ? AF_INET : AF_INET6, std::string(net).c_str(), probe) != 1)
+            return hit::permerror;
         return in_net(s.ip, net, bits) ? hit::yes : hit::no;
     }
     if (++s.lookups > 10)
@@ -254,7 +324,7 @@ hit mechanism(std::string_view term, const std::string& domain, spf_state& s, in
     {
         std::vector<std::string> addrs;
         bool nx = false;
-        if (!s.r.addrs(target, addrs, nx))
+        if (!s.r.addrs4(target, addrs, nx))
             return hit::temperror;
         return addrs.empty() ? hit::no : hit::yes;
     }
@@ -426,6 +496,10 @@ public:
         nx = nx && nx6;
         return a && b;
     }
+    bool addrs4(const std::string& name, std::vector<std::string>& out, bool& nx) override
+    {
+        return ask(name, dns::type::A, out, nx);
+    }
     bool mx(const std::string& name, std::vector<std::string>& out, bool& nx) override
     {
         return ask(name, dns::type::MX, out, nx);
@@ -538,9 +612,10 @@ std::string organizational_domain(std::string_view domain)
     return socketley::public_suffix::registrable(domain);
 }
 
-std::string spf_check(const std::string& ip, const std::string& domain, const std::string& sender, check_resolver& r)
+std::string spf_check(const std::string& ip, const std::string& domain, const std::string& sender, check_resolver& r,
+                      const std::string& helo)
 {
-    spf_state s{ip, sender, r};
+    spf_state s{ip, sender, r, helo};
     return check_host(lower(domain), s, 0);
 }
 
@@ -554,45 +629,69 @@ std::string inbound_result::header() const
     out += "; dmarc=" + dmarc + (from_domain.empty() ? std::string() : " header.from=" + from_domain);
     if (dmarc == "fail" && !dmarc_policy.empty())
         out += " (p=" + dmarc_policy + ")";
+    if (arc != "none")
+        out += "; arc=" + arc + " (i=" + std::to_string(arc_sets) + (arc_sealer.empty() ? "" : " d=" + arc_sealer) +
+               (arc_vouched ? ", vouched" : "") + ")";
     return out;
 }
 
 inbound_result check_inbound(std::string_view message, const std::string& ip, const std::string& helo,
-                             const std::string& mail_from, check_resolver& r, int64_t now_s)
+                             const std::string& mail_from, check_resolver& r, int64_t now_s,
+                             const std::vector<std::string>& arc_trusted)
 {
     inbound_result out;
     // SPF of the envelope sender's domain, or of HELO's for a bounce (RFC 7208 2.4).
     const size_t at = mail_from.rfind('@');
-    out.spf_domain = lower(at == std::string::npos ? helo : mail_from.substr(at + 1));
-    out.spf = spf_check(ip, out.spf_domain, mail_from.empty() ? "postmaster@" + out.spf_domain : mail_from, r);
+    out.spf_domain = socketley::idna::to_ascii(lower(at == std::string::npos ? helo : mail_from.substr(at + 1)));
+    out.spf = spf_check(ip, out.spf_domain, mail_from.empty() ? "postmaster@" + out.spf_domain : mail_from, r, helo);
 
-    for (const auto& sig : dkim::signatures(message))
-    {
-        if (out.dkim.size() >= 5)
-            break;
+    // A selector's key record: the one TXT that holds a key, empty where there is none.
+    const auto key_of = [&r](const std::string& name, std::string& record) {
         std::vector<std::string> txts;
         bool nx = false;
+        if (!r.txt(name, txts, nx))
+            return false;
+        record.clear();
+        for (const auto& t : txts)
+            if (t.find("p=") != std::string::npos)
+            {
+                record = t;
+                break;
+            }
+        return true;
+    };
+    const std::string_view head = header_block(message);
+    const std::string from_header = header_value(head, "From");
+    std::string from_org;
+    {
+        std::vector<address> a;
+        if (parse_mailbox_list(from_header, a) && !a.empty())
+            from_org = organizational_domain(socketley::idna::to_ascii(lower(a[0].domain)));
+    }
+    // Ten at most are checked, those of the From's organization first, so one that aligns is never left past the cap.
+    auto sigs = dkim::signatures(message);
+    std::stable_partition(sigs.begin(), sigs.end(),
+                          [&](const dkim::signature& s) { return organizational_domain(s.d) == from_org; });
+    dkim::bodies bodies;
+    for (const auto& sig : sigs)
+    {
+        if (out.dkim.size() >= 10)
+            break;
         std::string record;
         dkim::result res = dkim::result::permerror;
-        if (!r.txt(sig.s + "._domainkey." + sig.d, txts, nx))
+        if (!key_of(sig.s + "._domainkey." + sig.d, record))
             res = dkim::result::temperror;
         else
-        {
-            for (const auto& t : txts)
-                if (t.find("p=") != std::string::npos)
-                {
-                    record = t;
-                    break;
-                }
-            res = dkim::verify(message, sig, record, now_s);
-        }
+            res = dkim::verify(message, sig, record, now_s, nullptr, &bodies);
         out.dkim.emplace_back(dkim::result_name(res), sig.d);
     }
+    const arc::chain chain = arc::verify(message, key_of, now_s);
+    out.arc = chain.result;
+    out.arc_sets = chain.count;
+    out.arc_sealer = chain.sealer;
 
     // DMARC of the domain From names, the one a reader sees.
     std::vector<address> from;
-    const std::string_view head = header_block(message);
-    const std::string from_header = header_value(head, "From");
     size_t from_headers = 0;
     for (std::string_view rest = head; !rest.empty();)
     {
@@ -620,10 +719,16 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
         out.why = "its From names no single author's domain";
         return out;
     }
-    out.from_domain = from[0].domain;
+    // A name past ASCII is looked up and compared as its A-labels, as DNS and a signature's d= write it.
+    out.from_domain = socketley::idna::to_ascii(lower(from[0].domain));
+    if (out.from_domain.empty())
+    {
+        out.dmarc = "permerror";
+        return out;
+    }
     const std::string org = organizational_domain(out.from_domain);
     std::string record;
-    bool from_org = false;
+    bool at_org = false;
     for (const std::string& d : {out.from_domain, org})
     {
         std::vector<std::string> txts;
@@ -633,12 +738,29 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
             out.dmarc = "temperror";
             return out;
         }
+        // A record begins v=DMARC1 and a ; or its end; two of them at one name are none (RFC 7489 6.6.3).
+        size_t found = 0;
         for (const auto& t : txts)
-            if (lower(t.substr(0, 8)) == "v=dmarc1")
-                record = t;
-        if (!record.empty())
         {
-            from_org = d != out.from_domain;
+            const std::string l = lower(t);
+            size_t q = 0;
+            while (q < l.size() && l[q] == ' ')
+                ++q;
+            if (l.compare(q, 8, "v=dmarc1") != 0)
+                continue;
+            q += 8;
+            while (q < l.size() && l[q] == ' ')
+                ++q;
+            if (q < l.size() && l[q] != ';')
+                continue;
+            ++found;
+            record = t;
+        }
+        if (found > 1)
+            record.clear();
+        if (found > 0)
+        {
+            at_org = d != out.from_domain;
             break;
         }
         if (d == org)
@@ -650,6 +772,7 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
         return out;
     }
     std::string p = "none", sp, adkim = "r", aspf = "r";
+    int pct = 100;
     std::string_view rest = record;
     while (!rest.empty())
     {
@@ -673,15 +796,46 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
             adkim = v;
         else if (k == "aspf")
             aspf = v;
+        else if (k == "pct" && !v.empty() && v.size() <= 3 &&
+                 std::all_of(v.begin(), v.end(), [](char c) { return c >= '0' && c <= '9'; }))
+            pct = std::min(100, std::atoi(v.c_str()));
+        else if (k == "rua")
+            out.rua = std::string(tag.substr(eq + 1));
     }
+    out.policy_domain = at_org ? org : out.from_domain;
+    out.adkim = adkim;
+    out.aspf = aspf;
+    out.p = p;
+    out.sp = sp;
+    out.pct = pct;
     const auto aligned = [&](const std::string& d, const std::string& mode) {
-        return mode == "s" ? lower(d) == out.from_domain : organizational_domain(d) == org;
+        const std::string a = socketley::idna::to_ascii(lower(d));
+        return mode == "s" ? a == out.from_domain : organizational_domain(a) == org;
     };
-    bool pass = out.spf == "pass" && aligned(out.spf_domain, aspf);
+    out.spf_aligned = out.spf == "pass" && aligned(out.spf_domain, aspf);
     for (const auto& [res, d] : out.dkim)
-        pass = pass || (res == "pass" && aligned(d, adkim));
+        out.dkim_aligned = out.dkim_aligned || (res == "pass" && aligned(d, adkim));
+    const bool pass = out.spf_aligned || out.dkim_aligned;
     out.dmarc = pass ? "pass" : "fail";
-    out.dmarc_policy = from_org && !sp.empty() ? sp : p;
+    out.dmarc_policy = at_org && !sp.empty() ? sp : p;
+    if (pass)
+        return out;
+    // pct= samples the failing mail the policy is for; the rest is taken by the policy below it (RFC 7489 6.6.4),
+    // the sample the same for every copy of one message.
+    if (pct < 100)
+    {
+        uint64_t h = 1469598103934665603ull;
+        for (const unsigned char c : header_value(head, "Message-ID"))
+            h = (h ^ c) * 1099511628211ull;
+        if (static_cast<int>(h % 100) >= pct)
+            out.dmarc_policy = out.dmarc_policy == "reject" ? "quarantine" : "none";
+    }
+    // A forwarder trusted here vouches with a passing chain for what it broke (RFC 8617 7.2).
+    if (out.arc == "pass" && std::find(arc_trusted.begin(), arc_trusted.end(), out.arc_sealer) != arc_trusted.end())
+    {
+        out.arc_vouched = true;
+        out.dmarc_policy = "none";
+    }
     return out;
 }
 

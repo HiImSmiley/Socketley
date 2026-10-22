@@ -22,16 +22,16 @@ namespace socketley::storage_rpc
 inline constexpr size_t max_value = 1u << 20;
 inline constexpr size_t max_field = 1u << 16;
 inline constexpr uint32_t max_list = 1000;
-inline constexpr uint8_t version = 2;
+inline constexpr uint8_t version = 3;
 
 // users answers for the storage's users rather than its objects, a page of them after start_after, each an
 // object_info whose key is the user and whose metadata holds name, email, admin, reset and the password's hash.
 // An object larger than max_value goes in pieces: put_begin with its size answers a stream in `next`, and put_more
 // hands each piece to it, the last answered with the object.  make_bucket makes a bucket, or finds it made.
-// get_range reads at most max_value bytes from `size` on, of an object stored as it came (not sealed, packed or
-// moved to a tier), however large the object is.
+// get_range reads `length` bytes, max_value at most, from `size` on, of an object stored as it came (not sealed,
+// packed or moved to a tier), however large the object is.  abort gives up the stream `stream`, and what it wrote.
 enum class op : uint8_t { put = 1, get = 2, head = 3, del = 4, list = 5, users = 6, put_begin = 7, put_more = 8,
-                          make_bucket = 9, get_range = 10 };
+                          make_bucket = 9, get_range = 10, abort = 11 };
 
 inline const char* op_name(op o)
 {
@@ -47,6 +47,7 @@ inline const char* op_name(op o)
         case op::put_more: return "put_more";
         case op::make_bucket: return "make_bucket";
         case op::get_range: return "get_range";
+        case op::abort: return "abort";
     }
     return "?";
 }
@@ -70,6 +71,8 @@ struct request
     uint64_t    size{0};
     std::string stream;
     bool        last{false};
+    // get_range's length.
+    uint32_t    length{0};
 };
 
 inline std::string encode(const request& r)
@@ -94,6 +97,7 @@ inline std::string encode(const request& r)
     w.u64(r.size);
     w.bytes(r.stream);
     w.flag(r.last);
+    w.u32(r.length);
     return w.take();
 }
 
@@ -101,7 +105,7 @@ inline bool decode(std::string_view in, request& r)
 {
     socketley::bytes::reader rd(in);
     uint8_t v = 0, k = 0;
-    if (!rd.u8(v) || v != version || !rd.u8(k) || k < 1 || k > 10)
+    if (!rd.u8(v) || v != version || !rd.u8(k) || k < 1 || k > 11)
         return false;
     r.kind = static_cast<op>(k);
     uint32_t n = 0;
@@ -118,7 +122,7 @@ inline bool decode(std::string_view in, request& r)
     }
     return rd.bytes(r.prefix, max_field) && rd.bytes(r.delimiter, max_field) &&
            rd.bytes(r.start_after, max_field) && rd.u32(r.max_keys) && rd.u64(r.size) &&
-           rd.bytes(r.stream, max_field) && rd.flag(r.last);
+           rd.bytes(r.stream, max_field) && rd.flag(r.last) && rd.u32(r.length);
 }
 
 struct object_info
@@ -209,6 +213,7 @@ inline std::string encode(const reply& r, op kind)
             w.bytes(r.next);
             break;
         case op::make_bucket:
+        case op::abort:
             break;
         case op::get:
         case op::get_range:
@@ -254,6 +259,7 @@ inline bool decode(std::string_view in, op kind, reply& r)
         case op::put_begin:
             return rd.bytes(r.next, max_field);
         case op::make_bucket:
+        case op::abort:
             return true;
         case op::get:
         case op::get_range:

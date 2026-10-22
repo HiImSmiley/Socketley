@@ -78,9 +78,14 @@ struct imap_folder
     // The mod-sequence the folder had as its listing in the bucket began, and the keys expunged since a while, which a
     // listing taken before they went still holds and does not bring back.
     uint64_t    sync_from{0};
+    // When a listing first lacked each message the index holds, as a store may list a write it acknowledged late.
+    std::unordered_map<std::string, int64_t> missing_since;
     std::vector<std::pair<uint64_t, std::string>> gone_keys;
     std::vector<std::function<void(bool)>> waiting;
     bool        subscribed{true};
+    // Its MAILBOXID (RFC 8474), the one of the folder a RENAME made it from, else of its UIDVALIDITY.
+    std::string objectid;
+    std::string id() const;
     imap_message* by_uid(uint32_t uid);
 };
 
@@ -102,6 +107,22 @@ public:
     void open(const std::string& user, const std::string& folder, std::function<void(std::shared_ptr<imap_folder>)> done,
               bool force = false, int64_t max_age_ms = 2000);
     bool create(const std::string& user, const std::string& folder);
+    // A folder's MAILBOXID, empty where there is no such folder.
+    std::string mailbox_id(const std::string& user, const std::string& folder);
+    // A message's EMAILID (RFC 8474): of its object, which nothing changes while it is in the folder.
+    static std::string email_id(std::string_view key);
+
+    // METADATA (RFC 5464): the entries of a folder, "" the server's, kept in the index for every shard.  An entry is
+    // its name in lower case, /private/... or /shared/..., at most 1000 a user, of 64 KiB each and 1 MiB in all.
+    enum class meta_refusal : uint8_t { none, no_folder, too_many, too_large, bad_name };
+    meta_refusal set_meta(const std::string& user, const std::string& folder, const std::string& entry,
+                          const std::string* value);
+    // The value of `entry`, null where it has none; and, with `depth` 1 or past, the entries under it that deep.
+    const std::string* meta(const std::string& user, const std::string& folder, const std::string& entry);
+    std::vector<std::pair<std::string, std::string>> meta_under(const std::string& user, const std::string& folder,
+                                                                const std::string& entry, int depth);
+    static constexpr size_t meta_max_value = 64u << 10;
+    static bool meta_name_ok(std::string_view entry);
     void remove(const std::string& user, const std::string& folder, std::function<void(bool)> done);
     void rename(const std::string& user, const std::string& from, const std::string& to, std::function<void(bool)> done);
     void set_subscribed(const std::string& user, const std::string& folder, bool on);
@@ -188,6 +209,10 @@ private:
         uint64_t compact_quiet{UINT64_MAX};
         // The index's path, worked out once: resolving the state directory costs several syscalls.
         std::string base;
+        // METADATA entries by folder, "" the server's, and the bytes of their values.
+        std::map<std::string, std::map<std::string, std::string>> meta;
+        uint64_t meta_bytes{0};
+        size_t meta_count{0};
     };
     user_state& user(const std::string& name);
     // The snapshot and the whole journal read, everything known before forgotten.

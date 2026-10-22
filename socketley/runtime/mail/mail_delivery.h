@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -60,7 +61,9 @@ public:
     bool compose_message(const compose& c, std::string& from, std::vector<std::string>& rcpts, std::string& body,
                          std::string& why);
     // The TXT record of the DKIM key, for the dns runtime and `socketley show`; empty without a key.
-    std::string dkim_record() const;
+    // Each key's selector and the TXT record it is published as: the RSA and the Ed25519 key that sign, and the pair
+    // --dkim-next has ready.
+    std::vector<std::pair<std::string, std::string>> dkim_records() const;
     std::string dkim_selector() const { return m_selector; }
 
     // The delays between tries, in seconds, the last repeated until the lifetime is over.
@@ -100,6 +103,9 @@ private:
         uint8_t sts_state{0};
         int64_t sts_ms{0};
         bool sts_filtered{false};
+        // A 421 from it holds new connections back, for a pause doubled by each 421 since its last message taken.
+        int64_t held_until{0};
+        int64_t hold_ms{0};
     };
     struct out_conn;
 
@@ -155,6 +161,8 @@ private:
     void redirect(const entry_ptr& e, const std::string& own, std::vector<std::string> to, const std::string& header,
                   std::function<void(bool)> done);
     void vacation(const std::string& own, const sieve::vacation& v, std::string_view msgid);
+    // A session to an exchanger under an MTA-STS or DANE policy counted for the TLS report of its domain.
+    void tls_told(const out_conn& c, bool success, const char* failure);
     // A notification enotify decided, mailed to the URI's recipients.
     void notify(const std::string& own, const sieve::notification& n, std::string_view headers);
     std::string signing_domain(std::string_view from_header) const;
@@ -190,6 +198,8 @@ private:
     std::unordered_map<std::string, std::multimap<int64_t, std::string>::iterator> m_due_at;
     // Routes that wait for a connection the global limit holds back, and those whose lookup is out.
     std::unordered_map<std::string, bool> m_starved;
+    // The routes a 421 holds back, pumped again by the tick once their pause is over.
+    std::set<std::string> m_held;
     // Messages read whole to be signed, at most a few at once, and those that wait for a turn.
     uint32_t m_signs_out{0};
     std::deque<std::shared_ptr<sign_job>> m_signs_waiting;
@@ -201,8 +211,18 @@ private:
     // DKIM signatures by message id, made once and put ahead of each copy sent.
     std::unordered_map<std::string, std::string> m_signed;
     std::unordered_map<std::string, std::vector<std::function<void(bool)>>> m_signing;
-    dkim::key_ptr m_key;
-    std::string m_selector;
+    // The RSA key and the Ed25519 one beside it (RFC 8463 recommends both), and the pair --dkim-next makes and
+    // publishes ahead of signing with them.
+    dkim::key_ptr m_key, m_ed_key, m_next_key, m_next_ed_key;
+    // The TLSA answer of each DANE exchanger, kept a while for the connections that follow.
+    struct tlsa_kept
+    {
+        int64_t until_ms{0};
+        bool dane{false};
+        std::vector<tls_policy::tlsa> tlsa;
+    };
+    std::unordered_map<std::string, tlsa_kept> m_tlsa_kept;
+    std::string m_selector, m_next_selector;
     // --relay, parsed.
     bool m_relay{false};
     bool m_relay_tls{false};

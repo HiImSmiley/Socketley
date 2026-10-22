@@ -211,15 +211,20 @@ dns_client::state dns_client::ask(const std::string& host, int family, std::vect
         return state::ready;
     }
 
+    // Questions no caller came back for are let go once a second, not on every ask.
     const auto now = clock::now();
-    for (auto it = m_jobs.begin(); it != m_jobs.end();)
-        if (now - it->second.sent > abandoned)
-        {
-            close_all(it->second);
-            it = m_jobs.erase(it);
-        }
-        else
-            ++it;
+    if (now - m_swept > std::chrono::seconds(1))
+    {
+        m_swept = now;
+        for (auto it = m_jobs.begin(); it != m_jobs.end();)
+            if (now - it->second.sent > abandoned)
+            {
+                close_all(it->second);
+                it = m_jobs.erase(it);
+            }
+            else
+                ++it;
+    }
 
     const std::string key = lower_copy(host) + '\n' + std::to_string(family);
     auto it = m_jobs.find(key);

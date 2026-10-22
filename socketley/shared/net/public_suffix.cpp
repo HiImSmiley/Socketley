@@ -1,9 +1,12 @@
 #include "public_suffix.h"
 
+#include <algorithm>
 #include <vector>
 
+#include "idna.h"
 #include "../persist/read_file.h"
 #include "../util/ascii.h"
+#include "../util/logging.h"
 
 namespace socketley::public_suffix
 {
@@ -11,9 +14,12 @@ namespace socketley::public_suffix
 namespace
 {
 
+// A name as the rules and the headers compare: lower case, its labels past ASCII as A-labels, no trailing dot.
 std::string lower(std::string_view s)
 {
     std::string out(s);
+    if (std::any_of(out.begin(), out.end(), [](char c) { return static_cast<unsigned char>(c) >= 0x80; }))
+        out = socketley::idna::to_ascii(out);
     socketley::ascii::lower_in_place(out);
     while (!out.empty() && out.back() == '.')
         out.pop_back();
@@ -91,12 +97,13 @@ std::string registrable(std::string_view name)
     const list& l = system_list();
     if (!l.empty())
         return l.registrable(name);
-    const std::string n = lower(name);
-    const size_t last = n.rfind('.');
-    if (last == std::string::npos || last == 0)
-        return n;
-    const size_t before = n.rfind('.', last - 1);
-    return before == std::string::npos ? n : n.substr(before + 1);
+    // Without the list no two names are known to be one organization's, so relaxed alignment is strict: the last two
+    // labels would make bank.co.uk and attacker.co.uk one.
+    [[maybe_unused]] static const bool told = [] {
+        LOG_WARN("no public suffix list at /usr/share/publicsuffix: DMARC aligns names strictly");
+        return true;
+    }();
+    return lower(name);
 }
 
 }   // namespace socketley::public_suffix
