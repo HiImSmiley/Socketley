@@ -191,6 +191,11 @@ public:
                 std::vector<std::string> keywords, int64_t date_ms,
                 std::function<void(refusal, uint32_t uidvalidity, uint32_t uid)> done);
 
+    // A JMAP upload (RFC 8620 6.1): kept under .jmap-uploads/ of the bucket, apart from every user's folders, for a
+    // day, its id naming its size so it is read back in one; the id answered, empty where it could not be written.
+    void put_upload(const std::string& user, std::string data, std::function<void(std::string id)> done);
+    void get_upload(const std::string& user, const std::string& id, std::function<void(std::shared_ptr<const std::string>)> done);
+
     void tick(int64_t now);
     // Every journal synced now, in line, as the runtime stops.
     void flush_now();
@@ -229,6 +234,9 @@ private:
     };
     user_state& user(const std::string& name);
     std::string shares_path() const;
+    // Uploads older than a day taken away, a page of them each hour.
+    void sweep_uploads(std::string after = {});
+    int64_t m_uploads_swept_ms{0};
     void note_share(const std::string& owner, const std::string& folder, const std::string& who, bool on);
     // The snapshot and the whole journal read, everything known before forgotten.
     void reload(user_state& u);

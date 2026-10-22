@@ -208,6 +208,8 @@ void apply_mail_config(mail_instance& ml, const runtime_config& cfg, bool by_pre
         ml.set_pop3_port(cfg.mail_pop3);
     if (asked("pop3s", cfg.mail_pop3s != defaults.mail_pop3s))
         ml.set_pop3s_port(cfg.mail_pop3s);
+    if (asked("jmap", cfg.mail_jmap != defaults.mail_jmap))
+        ml.set_jmap_port(cfg.mail_jmap);
     if (asked("lmtp", cfg.mail_lmtp != defaults.mail_lmtp))
         ml.set_lmtp_port(cfg.mail_lmtp);
     if (asked("mta_sts_port", cfg.mail_sts_port != defaults.mail_sts_port))

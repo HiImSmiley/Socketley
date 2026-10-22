@@ -66,6 +66,9 @@ public:
     // POP3 over TLS from the first byte.
     void set_pop3s_port(uint16_t v) { m_pop3s = v; }
     uint16_t get_pop3s_port() const { return m_pop3s; }
+    // JMAP (RFC 8620, RFC 8621) for the mailboxes, over HTTPS where --tls is given.
+    void set_jmap_port(uint16_t v) { m_jmap = v; }
+    uint16_t get_jmap_port() const { return m_jmap; }
     // LMTP (RFC 2033) from this machine, for the mailboxes.
     void set_lmtp_port(uint16_t v) { m_lmtp = v; }
     uint16_t get_lmtp_port() const { return m_lmtp; }
@@ -171,6 +174,7 @@ private:
     std::string m_arc_trust;
     uint16_t m_pop3{0};
     uint16_t m_pop3s{0};
+    uint16_t m_jmap{0};
     uint16_t m_lmtp{0};
     uint16_t m_sts_port{0};
     uint32_t m_greylist_s{0};

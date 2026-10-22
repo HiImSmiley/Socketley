@@ -685,6 +685,8 @@ bool mail_run::start(std::string& why)
             return false;
         if (m_owner.get_pop3s_port() && !open_listener(m_pop3s_l, m_owner.get_pop3s_port(), port_kind::pop3s, why))
             return false;
+        if (m_owner.get_jmap_port() && !open_listener(m_jmap_l, m_owner.get_jmap_port(), port_kind::jmap, why))
+            return false;
     }
     if (m_mailboxes && m_mailboxes->enabled() && m_owner.get_lmtp_port() &&
         !open_listener(m_lmtp_l, m_owner.get_lmtp_port(), port_kind::lmtp, why))
@@ -882,8 +884,9 @@ void mail_run::accept_done(listener& l, struct io_uring_cqe* cqe)
             runtime_instance::stat_add(m_owner.m_stat_total_connections, 1);
             m_owner.m_stat_active_connections.store(m_conns.size(), std::memory_order_relaxed);
             // A port that speaks TLS from the first byte begins with the handshake, any other with the greeting.
+            // JMAP is HTTPS where the runtime has a certificate, HTTP for this machine's own clients where it has none.
             if (l.kind == port_kind::submissions || l.kind == port_kind::imaps || l.kind == port_kind::pop3s ||
-                l.kind == port_kind::sts)
+                l.kind == port_kind::sts || (l.kind == port_kind::jmap && m_tls))
             {
                 raw->ssl = m_tls ? m_tls->create_ssl_server() : nullptr;
                 if (!raw->ssl)
@@ -957,6 +960,15 @@ void mail_run::begin_session(conn& c)
     }
     else if (c.kind == port_kind::sts)
         c.sts = true;
+    else if (c.kind == port_kind::jmap)
+    {
+        jmap_config cfg;
+        cfg.hostname = m_hostname;
+        cfg.tls_active = c.ssl != nullptr && c.handshaken;
+        cfg.login_in_clear = loopback(c.peer);
+        cfg.max_size = m_owner.get_max_size();
+        c.jmap = std::make_unique<jmap_session>(cfg, c, *m_imap);
+    }
     else if (c.kind == port_kind::imap || c.kind == port_kind::imaps)
     {
         imap_config cfg;
@@ -1180,7 +1192,7 @@ void mail_run::plain_in(conn& c, const char* p, size_t n)
         sts_input(c, std::string_view(p, n));
         return;
     }
-    if (!c.smtp && !c.imap && !c.sieve && !c.pop3)
+    if (!c.smtp && !c.imap && !c.sieve && !c.pop3 && !c.jmap)
         return;
     // Under COMPRESS what came is opened first, a bounded amount at a time.
     if (c.zin)
@@ -1216,6 +1228,8 @@ void mail_run::plain_in(conn& c, const char* p, size_t n)
         c.sieve->input(std::string_view(p, n));
     else if (c.pop3)
         c.pop3->input(std::string_view(p, n));
+    else if (c.jmap)
+        c.jmap->input(std::string_view(p, n));
     else
         c.smtp->input(std::string_view(p, n));
     c.in_input = false;
@@ -1223,12 +1237,14 @@ void mail_run::plain_in(conn& c, const char* p, size_t n)
         return;
     // A client that sends past what a command and its largest message take while one waits, or that reads none of
     // what it is told, is not held in memory: it is told so and closed.
-    const size_t cap = (c.sieve || c.pop3 ? 0 : m_owner.get_max_size()) + backlog_slack;
+    const size_t cap = (c.sieve || c.pop3 ? 0 : c.jmap ? std::max<size_t>(m_owner.get_max_size(), jmap_session::max_request)
+                                                       : m_owner.get_max_size()) + backlog_slack;
     const size_t held = c.imap ? c.imap->buffered() : c.sieve ? c.sieve->buffered() : c.pop3 ? c.pop3->buffered()
-                                                                                         : c.smtp->buffered();
+                        : c.jmap ? c.jmap->buffered() : c.smtp->buffered();
     if (held > cap || c.owed > owed_max + cap)
     {
-        out(c, c.smtp ? "421 4.7.0 " + m_hostname + " too much input unanswered, closing\r\n"
+        out(c, c.jmap ? std::string()
+               : c.smtp ? "421 4.7.0 " + m_hostname + " too much input unanswered, closing\r\n"
                : c.imap ? std::string("* BYE Too much input unanswered\r\n")
                : c.pop3 ? std::string("-ERR too much input unanswered\r\n")
                         : std::string("BYE \"Too much input\"\r\n"));
@@ -2046,6 +2062,32 @@ void mail_run::conn::login(std::string user, std::string password, std::function
     authenticate("IMAP", std::move(user), std::move(password), std::move(done));
 }
 
+void mail_run::conn::bearer(std::string token, std::function<void(account, std::string)> done)
+{
+    socketley::idp::session_verifier::who who;
+    if (!run->m_idp || !run->m_idp->check_bearer(token, who))
+    {
+        done(account::no, {});
+        return;
+    }
+    idp_user = true;
+    user_email = who.email;
+    done(account::yes, who.username.empty() ? who.sub : who.username);
+}
+
+std::string mail_run::conn::address_of(const std::string& user)
+{
+    if (!user_email.empty())
+        return user_email;
+    return user.find('@') != std::string::npos || run->m_domains.empty() ? user : user + "@" + run->m_domains.front();
+}
+
+void mail_run::conn::submit(const std::string& user, const std::string& from, std::vector<std::string> rcpts,
+                            std::string message, std::function<void(bool, std::string)> done)
+{
+    run->queue_message(from, rcpts, std::move(message), false, user, std::move(done));
+}
+
 void mail_run::conn::offload(std::function<void()> job, std::function<void()> done)
 {
     const uint64_t me = id;
@@ -2245,6 +2287,8 @@ void mail_run::on_cqe(struct io_uring_cqe* cqe)
         accept_done(m_lmtp_l, cqe);
     else if (req == &m_sts_l.req)
         accept_done(m_sts_l, cqe);
+    else if (req == &m_jmap_l.req)
+        accept_done(m_jmap_l, cqe);
     else if (conn* c = conn_of(req))
     {
         if (req == &c->rd)
@@ -2312,6 +2356,15 @@ void mail_run::tick()
         {
             c->in_input = true;
             c->imap->poll();
+            c->in_input = false;
+            flush(*c);
+        }
+        else if (c->jmap && c->jmap->streaming())
+        {
+            // An EventSource's client says nothing: it is kept while it reads what it is told.
+            c->heard_ms = now;
+            c->in_input = true;
+            c->jmap->poll();
             c->in_input = false;
             flush(*c);
         }
@@ -2448,6 +2501,7 @@ std::string mail_run::records_text() const
                                             {"_imap", m_owner.get_imap_port()},
                                             {"_pop3s", m_owner.get_pop3s_port()},
                                             {"_pop3", m_owner.get_pop3_port()},
+                                            {"_jmap", m_owner.get_jmap_port()},
                                             {"_sieve", m_owner.get_sieve_port()}})
             if (port)
                 out += std::string(service) + "._tcp." + d + ". 300 IN SRV 0 1 " + std::to_string(port) + " " +

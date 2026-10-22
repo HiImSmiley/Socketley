@@ -756,6 +756,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.mail_dnsbl = std::string(ml->get_dnsbl());
             cfg.mail_pop3 = ml->get_pop3_port();
             cfg.mail_pop3s = ml->get_pop3s_port();
+            cfg.mail_jmap = ml->get_jmap_port();
             cfg.mail_lmtp = ml->get_lmtp_port();
             cfg.mail_sts_port = ml->get_mta_sts_port();
             cfg.mail_greylist = ml->get_greylist();
@@ -1220,6 +1221,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_int_field("pop3", cfg.mail_pop3);
             if (cfg.mail_pop3s != 0)
                 append_int_field("pop3s", cfg.mail_pop3s);
+            if (cfg.mail_jmap != 0)
+                append_int_field("jmap", cfg.mail_jmap);
             if (cfg.mail_lmtp != 0)
                 append_int_field("lmtp", cfg.mail_lmtp);
             if (cfg.mail_sts_port != 0)
@@ -1523,6 +1526,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.mail_dnsbl = json_get_string(json, "dnsbl");
             cfg.mail_pop3 = static_cast<uint16_t>(json_get_uint32(json, "pop3"));
             cfg.mail_pop3s = static_cast<uint16_t>(json_get_uint32(json, "pop3s"));
+            cfg.mail_jmap = static_cast<uint16_t>(json_get_uint32(json, "jmap"));
             cfg.mail_lmtp = static_cast<uint16_t>(json_get_uint32(json, "lmtp"));
             cfg.mail_sts_port = static_cast<uint16_t>(json_get_uint32(json, "mta_sts_port"));
             cfg.mail_greylist = json_get_uint32(json, "greylist", 0);

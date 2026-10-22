@@ -25,6 +25,7 @@
 #include "mail_greylist.h"
 #include "mail_reports.h"
 #include "pop3_session.h"
+#include "jmap_session.h"
 #include "../../shared/util/deflate.h"
 #include "../../shared/util/inflate.h"
 #include "mail_sieve_store.h"
@@ -133,8 +134,9 @@ public:
                     std::string changed);
 
 private:
-    enum class port_kind : uint8_t { smtp, submission, submissions, imap, imaps, sieve, pop3, pop3s, lmtp, sts };
-    struct conn : smtp_session::hooks, imap_session::hooks, managesieve_session::hooks, pop3_session::hooks
+    enum class port_kind : uint8_t { smtp, submission, submissions, imap, imaps, sieve, pop3, pop3s, lmtp, sts, jmap };
+    struct conn : smtp_session::hooks, imap_session::hooks, managesieve_session::hooks, pop3_session::hooks,
+                  jmap_session::hooks
     {
         mail_run* run{nullptr};
         uint64_t id{0};
@@ -165,6 +167,7 @@ private:
         std::unique_ptr<imap_session> imap;
         std::unique_ptr<managesieve_session> sieve;
         std::unique_ptr<pop3_session> pop3;
+        std::unique_ptr<jmap_session> jmap;
         // An MTA-STS policy fetch: its request, read until its head ends.
         bool sts{false};
         std::string sts_in;
@@ -225,6 +228,15 @@ private:
         {
             run->imap_sieve(user, folder, std::move(cause), std::move(uids), std::move(changed));
         }
+        void acted(const std::string& user, const std::string& folder, std::string cause,
+                   std::vector<uint32_t> uids) override
+        {
+            run->imap_sieve(user, folder, std::move(cause), std::move(uids), {});
+        }
+        void bearer(std::string token, std::function<void(account, std::string)> done) override;
+        std::string address_of(const std::string& user) override;
+        void submit(const std::string& user, const std::string& from, std::vector<std::string> rcpts, std::string message,
+                    std::function<void(bool, std::string)> done) override;
     };
     struct listener
     {
@@ -311,11 +323,12 @@ private:
     std::vector<std::string> m_arc_trusted;
     std::string m_state_dir;
 
-    listener m_smtp, m_sub, m_subs, m_imap_l, m_imaps_l, m_sieve_l, m_pop3_l, m_pop3s_l, m_lmtp_l, m_sts_l;
+    listener m_smtp, m_sub, m_subs, m_imap_l, m_imaps_l, m_sieve_l, m_pop3_l, m_pop3s_l, m_lmtp_l, m_sts_l, m_jmap_l;
     // Every listener, for the loops over them.
-    std::array<listener*, 10> listeners()
+    std::array<listener*, 11> listeners()
     {
-        return {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l, &m_sieve_l, &m_pop3_l, &m_pop3s_l, &m_lmtp_l, &m_sts_l};
+        return {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l, &m_sieve_l, &m_pop3_l, &m_pop3s_l, &m_lmtp_l, &m_sts_l,
+                &m_jmap_l};
     }
     // The MTA-STS policy its domains publish, and the id its TXT names it by.
     std::string sts_policy() const;

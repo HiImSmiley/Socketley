@@ -185,6 +185,8 @@ std::string mail_instance::config_refusal() const
         return "mail: --sieve keeps the filters of mailboxes, which need --idp and --storage\n";
     if ((m_pop3 || m_pop3s) && (m_storage.empty() || m_idp.empty()))
         return "mail: --pop3 reads the mailboxes of --storage, whose users are --idp's\n";
+    if (m_jmap && (m_storage.empty() || m_idp.empty()))
+        return "mail: --jmap reads the mailboxes of --storage, whose users are --idp's\n";
     if (m_lmtp && m_storage.empty())
         return "mail: --lmtp hands mail to the mailboxes of --storage, which is not given\n";
     if ((m_pop3s || m_sts_port) && !get_tls())
@@ -200,7 +202,7 @@ std::string mail_instance::config_refusal() const
     if (m_max_size < 1024)
         return "mail: --max-size below 1K takes no message\n";
     const uint16_t ports[] = {effective_port(), m_submission, m_submissions, m_imap, m_imaps, m_sieve,
-                              m_pop3,           m_pop3s,      m_lmtp,        m_sts_port};
+                              m_pop3,           m_pop3s,      m_lmtp,        m_sts_port, m_jmap};
     for (size_t i = 0; i < std::size(ports); ++i)
         for (size_t j = i + 1; j < std::size(ports); ++j)
             if (ports[i] && ports[i] == ports[j])
@@ -261,7 +263,8 @@ std::string mail_instance::stats_lines() const
 void mail_instance::listen_addresses(std::vector<std::string>& out) const
 {
     out.push_back("tcp:" + std::to_string(effective_port()));
-    for (const uint16_t p : {m_submission, m_submissions, m_imap, m_imaps, m_sieve, m_pop3, m_pop3s, m_lmtp, m_sts_port})
+    for (const uint16_t p : {m_submission, m_submissions, m_imap, m_imaps, m_sieve, m_pop3, m_pop3s, m_lmtp, m_sts_port,
+                             m_jmap})
         if (p)
             out.push_back("tcp:" + std::to_string(p));
 }

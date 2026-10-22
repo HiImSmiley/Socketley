@@ -22,6 +22,7 @@
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/storage/storage_rpc.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/random_id.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/text_list.h"
@@ -58,9 +59,12 @@ std::string imap_folder::id() const
 
 std::string imap_store::email_id(std::string_view key)
 {
-    // FNV-1a over the key: the same on every shard and at every start, and as unique as the keys are among a user's.
+    // FNV-1a over the object's name past its folder, which a copy and a move keep: the same on every shard and at
+    // every start, and as unique as those names are among a user's.
+    const size_t slash = key.rfind('/');
+    const std::string_view base = slash == std::string_view::npos ? key : key.substr(slash + 1);
     uint64_t h = 1469598103934665603ull;
-    for (const unsigned char c : key)
+    for (const unsigned char c : base)
         h = (h ^ c) * 1099511628211ull;
     static constexpr char hex[] = "0123456789abcdef";
     std::string out = "M";
@@ -1035,8 +1039,91 @@ size_t imap_store::set_flags(const std::string& name, const std::shared_ptr<imap
     return changed;
 }
 
+namespace
+{
+
+std::string upload_key(const std::string& user, const std::string& id)
+{
+    return ".jmap-uploads/" + socketley::base64url::encode(user) + "/" + id;
+}
+
+}   // namespace
+
+void imap_store::put_upload(const std::string& user, std::string data, std::function<void(std::string)> done)
+{
+    // U<time>x<size>x<random>: when it came, which a sweep reads, and its size, which a read needs.
+    static constexpr char hex[] = "0123456789abcdef";
+    const auto to_hex = [](uint64_t v) {
+        std::string out;
+        do
+        {
+            out.insert(out.begin(), hex[v & 15]);
+            v >>= 4;
+        } while (v);
+        return out;
+    };
+    const std::string id = "U" + to_hex(static_cast<uint64_t>(wall::now_ms())) + "x" + to_hex(data.size()) + "x" +
+                           socketley::random_hex(8);
+    put_object(upload_key(user, id), std::move(data), [id, done](bool ok) { done(ok ? id : std::string()); });
+}
+
+void imap_store::get_upload(const std::string& user, const std::string& id,
+                            std::function<void(std::shared_ptr<const std::string>)> done)
+{
+    const size_t a = id.find('x'), b = a == std::string::npos ? a : id.find('x', a + 1);
+    if (!id.starts_with("U") || b == std::string::npos || id.find_first_not_of("0123456789abcdefxU") != std::string::npos)
+    {
+        done(nullptr);
+        return;
+    }
+    const uint64_t size = std::strtoull(id.substr(a + 1, b - a - 1).c_str(), nullptr, 16);
+    if (size == 0)
+    {
+        done(std::make_shared<const std::string>());
+        return;
+    }
+    body(upload_key(user, id), size, std::move(done), false);
+}
+
+void imap_store::sweep_uploads(std::string after)
+{
+    mailboxes* boxes = m_run.boxes();
+    if (!boxes || !boxes->enabled())
+        return;
+    rpc::request rq;
+    rq.kind = rpc::op::list;
+    rq.bucket = boxes->bucket();
+    rq.prefix = ".jmap-uploads/";
+    rq.start_after = std::move(after);
+    boxes->ask(boxes->storage(), rpc::encode(rq), [this, alive = m_alive](request_status st, std::string_view bytes) {
+        if (!*alive)
+            return;
+        rpc::reply r;
+        if (st != request_status::ok || !rpc::decode(bytes, rpc::op::list, r) || !r.ok)
+            return;
+        const int64_t now = wall::now_ms();
+        for (const auto& o : r.objects)
+        {
+            const size_t at = o.key.rfind("/U");
+            const int64_t made = at == std::string::npos
+                                     ? 0
+                                     : static_cast<int64_t>(std::strtoull(o.key.c_str() + at + 2, nullptr, 16));
+            if (now - made > 86400000)
+                delete_object(o.key, [](bool) {});
+        }
+        // Page after page, so young uploads early in the list do not keep old ones after them.
+        if (r.truncated && !r.objects.empty())
+            sweep_uploads(r.objects.back().key);
+    });
+}
+
 void imap_store::tick(int64_t)
 {
+    if (const int64_t now = wall::now_ms_coarse(); now - m_uploads_swept_ms > 3600000)
+    {
+        m_uploads_swept_ms = now;
+        sweep_uploads();
+    }
     for (auto& [name, u] : m_users)
     {
         if (!u.loaded)
@@ -1780,8 +1867,23 @@ void imap_store::copy(const std::string& name, const std::shared_ptr<imap_folder
         done(false, dest->uidvalidity, {});
         return;
     }
-    // Up to 32 and 16 MiB read and written at once, logged in the order asked as they are in, so the UIDs answered keep that order.
+    // A copy keeps its object's name in the folder it goes to, so its EMAILID is the original's, unless the folder
+    // has that name already, or had it lately and its removal may still be on its way.
+    std::set<std::string> taken;
+    for (const auto& m : dest->msgs)
+        taken.insert(m.key.substr(m.key.rfind('/') + 1));
+    for (const auto& [ms, k] : dest->gone_keys)
+        taken.insert(k.substr(k.rfind('/') + 1));
     j->keys.resize(j->todo.size());
+    for (size_t i = 0; i < j->todo.size(); ++i)
+    {
+        const std::string& k = j->todo[i].key;
+        const std::string base = k.substr(k.rfind('/') + 1);
+        j->keys[i] = taken.insert(base).second && base.ends_with(".eml")
+                         ? name + "/" + dest->name + "/" + base
+                         : name + "/" + dest->name + "/" + new_spool_id(0) + ".eml";
+    }
+    // Up to 32 and 16 MiB read and written at once, logged in the order asked as they are in, so the UIDs answered keep that order.
     j->state.assign(j->todo.size(), 0);
     auto next = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak = next;
@@ -1858,7 +1960,6 @@ void imap_store::copy(const std::string& name, const std::shared_ptr<imap_folder
                     (*self)();
                     return;
                 }
-                j->keys[i] = name + "/" + dest->name + "/" + new_spool_id(0) + ".eml";
                 put_object(j->keys[i], *b, [j, i, self](bool ok) {
                     --j->running;
                     j->running_bytes -= j->todo[i].size;

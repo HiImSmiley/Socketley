@@ -12651,7 +12651,10 @@ and
 read INBOX over POP3 (RFC 1939, with STLS, SASL PLAIN, UIDL and TOP), and
 .B \-\-lmtp
 takes mail from this machine's own programs into the mailboxes over LMTP (RFC
-2033), one answer for each recipient. A message a signed\-in user sends
+2033), one answer for each recipient, and
+.B \-\-jmap
+serves JMAP (RFC 8620, RFC 8621) for mail clients and web apps, over HTTPS with
+.BR \-\-tls . A message a signed\-in user sends
 without a Date or a Message\-ID is given them, as Postfix's cleanup does; one
 from another server is passed on as it came. With no
 .B \-\-bind
@@ -12890,7 +12893,8 @@ with an SRV record (RFC 6186, RFC 8314) for each of
 .BR \-\-imap ,
 .BR \-\-imaps ,
 .BR \-\-pop3 ,
-.B \-\-pop3s
+.BR \-\-pop3s ,
+.B \-\-jmap
 and
 .B \-\-sieve
 it opens, so a mail client finds them from the address alone; with
@@ -13021,6 +13025,27 @@ folder, seen by them under
 with what those rights allow (l r s w i k x t e a), and APPENDLIMIT; RENAME
 takes the folders under a name along, and RENAME INBOX moves its messages and
 leaves it empty. A connection quiet for thirty minutes is closed.
+.PP
+.B JMAP.
+.B /.well\-known/jmap
+is the session; the API at
+.B /jmap/api
+takes Core/echo, Mailbox/get, query, set and changes, Email/get, query, set,
+import and changes, Thread/get, Identity/get and EmailSubmission/set with its
+onSuccessUpdateEmail and onSuccessDestroyEmail, back\-references among them;
+.B /jmap/upload
+and
+.B /jmap/download
+move blobs, and
+.B /jmap/eventsource
+tells of state changes. A user signs in with HTTP Basic, their idp password,
+over TLS or from 127.0.0.1, or with an idp bearer token. Their account is the
+mailboxes IMAP reads: a Mailbox id is its MAILBOXID and an Email id its EMAILID,
+which a move keeps, each Email its own Thread, a keyword an IMAP flag, so a
+client of either sees what the other did at once. A state is a digest of the
+index, the same on every shard, and a */changes since another answers
+cannotCalculateChanges, after which a client reads again. An upload is kept a
+day; an EmailSubmission sends as the user's own address only.
 .PP
 .B From the other runtimes.
 .B socketley send
@@ -13202,6 +13227,14 @@ and
 .TP
 .BI "\-\-pop3s " port
 POP3 over TLS from the first byte.
+.TP
+.BI "\-\-jmap " port
+JMAP for the mailboxes, HTTPS with
+.BR \-\-tls ;
+needs
+.B \-\-idp
+and
+.BR \-\-storage .
 .TP
 .BI "\-\-lmtp " port
 LMTP for this machine's own programs, into the mailboxes only; a connection

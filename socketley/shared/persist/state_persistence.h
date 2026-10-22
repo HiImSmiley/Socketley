@@ -241,6 +241,7 @@ struct runtime_config
     std::string mail_dnsbl;
     uint16_t mail_pop3{0};
     uint16_t mail_pop3s{0};
+    uint16_t mail_jmap{0};
     uint16_t mail_lmtp{0};
     uint16_t mail_sts_port{0};
     uint32_t mail_greylist{0};
