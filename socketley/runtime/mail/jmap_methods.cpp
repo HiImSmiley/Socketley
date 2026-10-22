@@ -30,6 +30,15 @@ std::string q(std::string_view s)
     return json::quote(s);
 }
 
+// The state of an entry kept as one, a digest of what it holds.
+std::string entry_state(const std::string* kept)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char c : kept ? std::string_view(*kept) : std::string_view())
+        h = (h ^ c) * 1099511628211ull;
+    return "s" + std::to_string(kept ? h : 0);
+}
+
 std::string utc(int64_t ms)
 {
     std::tm tm{};
@@ -1208,7 +1217,7 @@ void jmap_session::identity_get(const jvalue&, std::function<void(answer)> done)
         return x ? json::written(*x) : std::string(otherwise);
     };
     done({{"Identity/get", "{\"accountId\":" + q(account_of(m_user)) + ",\"state\":" +
-                               q("s" + std::to_string(kept ? kept->size() : 0)) + ",\"list\":[{\"id\":\"i0\",\"name\":" +
+                               q(entry_state(kept)) + ",\"list\":[{\"id\":\"i0\",\"name\":" +
                                field("name", "\"\"") + ",\"email\":" + q(email) + ",\"replyTo\":" + field("replyTo", "null") +
                                ",\"bcc\":" + field("bcc", "null") + ",\"textSignature\":" + field("textSignature", "\"\"") +
                                ",\"htmlSignature\":" + field("htmlSignature", "\"\"") + ",\"mayDelete\":false}],\"notFound\":[]}"}});
@@ -1219,7 +1228,7 @@ void jmap_session::identity_set(const jvalue& args, std::function<void(answer)> 
     // The address is the account's, so an Identity is neither made nor taken away here; the rest is the user's.
     std::string updated = "{", not_updated = "{", not_created = "{", not_destroyed = "{";
     const std::string* kept = m_store.meta(m_user, {}, std::string(identity_entry));
-    const std::string old_state = "s" + std::to_string(kept ? kept->size() : 0);
+    const std::string old_state = entry_state(kept);
     jvalue v;
     if (!kept || !json::json_reader(*kept).document(v))
     {
@@ -1264,7 +1273,7 @@ void jmap_session::identity_set(const jvalue& args, std::function<void(answer)> 
         }
     const std::string* now = m_store.meta(m_user, {}, std::string(identity_entry));
     done({{"Identity/set", "{\"accountId\":" + q(account_of(m_user)) + ",\"oldState\":" + q(old_state) +
-                               ",\"newState\":" + q("s" + std::to_string(now ? now->size() : 0)) +
+                               ",\"newState\":" + q(entry_state(now)) +
                                ",\"created\":{},\"updated\":" + updated + "},\"destroyed\":[],\"notCreated\":" +
                                not_created + "},\"notUpdated\":" + not_updated + "},\"notDestroyed\":" + not_destroyed + "}}"}});
 }
@@ -1751,7 +1760,7 @@ void jmap_session::vacation_get(const jvalue&, std::function<void(answer)> done)
         return x ? json::written(*x) : std::string(otherwise);
     };
     done({{"VacationResponse/get", "{\"accountId\":" + q(account_of(m_user)) + ",\"state\":" +
-                                       q("s" + std::to_string(kept ? kept->size() : 0)) +
+                                       q(entry_state(kept)) +
                                        ",\"list\":[{\"id\":\"singleton\",\"isEnabled\":" + field("isEnabled", "false") +
                                        ",\"fromDate\":" + field("fromDate", "null") + ",\"toDate\":" +
                                        field("toDate", "null") + ",\"subject\":" + field("subject", "null") +
@@ -1763,6 +1772,8 @@ void jmap_session::vacation_set(const jvalue& args, std::function<void(answer)> 
 {
     std::string updated = "{", not_updated = "{";
     const std::string* kept = m_store.meta(m_user, {}, std::string(vacation_entry));
+    // Taken now, since a set replaces what `kept` points at.
+    const std::string old_state = entry_state(kept);
     jvalue v;
     json::json_policy policy;
     if (!kept || !json::json_reader(*kept, policy).document(v))
@@ -1815,8 +1826,7 @@ void jmap_session::vacation_set(const jvalue& args, std::function<void(answer)> 
         return done({{"error", set_error("invalidArguments", "a VacationResponse is not destroyed: turn it off")}});
     const std::string* now = m_store.meta(m_user, {}, std::string(vacation_entry));
     done({{"VacationResponse/set", "{\"accountId\":" + q(account_of(m_user)) + ",\"oldState\":" +
-                                       q("s" + std::to_string(kept ? kept->size() : 0)) + ",\"newState\":" +
-                                       q("s" + std::to_string(now ? now->size() : 0)) + ",\"updated\":" + updated +
+                                       q(old_state) + ",\"newState\":" + q(entry_state(now)) + ",\"updated\":" + updated +
                                        "},\"notUpdated\":" + not_updated + "}}"}});
 }
 

@@ -54,7 +54,7 @@ ready_tcp 127.0.0.1 "$IM" || bad "the IMAP port listens" "$(tail -3 "$SOCKETLEY_
 
 # Before any mail came, so the storage has no bucket yet: a client's first act may be to put a message in.
 "$BIN" idp-user auth add bob --password bobpassword12 --email bob@example.test >/dev/null 2>&1
-got=$(python3 - "$IM" <<'PY'
+got=$(timeout 180 python3 - "$IM" <<'PY'
 import imaplib, sys
 M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1]))
 M.login("bob", "bobpassword12")
@@ -67,7 +67,7 @@ PY
     || bad "APPEND before any mail" "$got"
 
 # Three messages for alice, one of them a multipart.
-python3 - "$P" <<'PY'
+timeout 180 python3 - "$P" <<'PY'
 import smtplib, sys
 s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]))
 s.ehlo("x")
@@ -308,7 +308,7 @@ curl -s -X PUT "http://127.0.0.1:$PSX/mail" >/dev/null
 curl -s -X PUT "http://127.0.0.1:$PSX/mail?encryption" -d '<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>' >/dev/null
 "$BIN" create mail mx -p "$PX" --mail-domain example.test --idp auth --storage sx/mail --imap "$IMX" -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$IMX" || bad "the runtime on the encrypting bucket listens" "$(tail -3 "$SOCKETLEY_DLOG")"
-r=$(python3 - "$PX" "$IMX" "$T/datax" <<'PY'
+r=$(timeout 180 python3 - "$PX" "$IMX" "$T/datax" <<'PY'
 import hashlib, imaplib, os, smtplib, sys, time
 body = b"".join(b"sealed line %07d of a message larger than a mebibyte\r\n" % i for i in range(40000))
 msg = b"From: carol@else.test\r\nTo: alice@example.test\r\nSubject: sealed\r\n\r\n" + body
@@ -344,7 +344,7 @@ PSH=$((SL_PORT_BASE+1957)); IMSH=$((SL_PORT_BASE+1958))
 for _ in $(seq 1 100); do [ "$(ss -ltnpH "sport = :$IMSH" | grep -o 'pid=[0-9]*' | sort -u | wc -l)" -ge 3 ] && break; sleep 0.1; done
 check_shards=$(ss -ltnpH "sport = :$IMSH" | grep -o 'pid=[0-9]*' | sort -u | wc -l)
 [ "$check_shards" -ge 3 ] && ok "IMAP listens on every shard ($check_shards)" || bad "IMAP listens on every shard" "$check_shards"
-r=$(python3 - "$IMSH" <<'PY'
+r=$(timeout 180 python3 - "$IMSH" <<'PY'
 import imaplib, sys, threading
 port = int(sys.argv[1])
 def conn():
@@ -392,7 +392,7 @@ check "forty APPENDs from eight connections across the shards fail none" "${1:-x
 check "a flag one shard sets the others see" "${4:-x}" "5"
 # A FETCH that marks \Seen as it reads, while other shards append and unmark: what they log, and the snapshot their
 # flood folds the journal into, move the folder's messages under it.
-r=$(python3 - "$IMSH" <<'PY'
+r=$(timeout 180 python3 - "$IMSH" <<'PY'
 import imaplib, sys, threading, time
 port = int(sys.argv[1])
 errs = []
@@ -439,7 +439,7 @@ PY
 check "a FETCH that marks \\Seen while other shards append and unmark runs to its end" "$r" "0 True OK"
 # APPENDs of large messages, each logged once the storage has it, while other shards flood the journal past the size
 # it is folded at: a shard that finds the journal folded as it logs reads the new one under the lock it holds.
-r=$(python3 - "$IMSH" <<'PY'
+r=$(timeout 180 python3 - "$IMSH" <<'PY'
 import imaplib, sys, threading, time
 port = int(sys.argv[1])
 errs = []
@@ -477,7 +477,7 @@ PY
 )
 check "thirty-two large APPENDs while three shards flood the journal past its fold all go in" "$r" "0 32 []"
 # MOVE and DELETE while other shards change the same messages' flags: what they log must not undo what goes.
-r=$(python3 - "$IMSH" <<'PY'
+r=$(timeout 180 python3 - "$IMSH" <<'PY'
 import imaplib, sys, threading
 port = int(sys.argv[1])
 def conn():
@@ -526,7 +526,7 @@ PY
 )
 check "thirty MOVEs and a DELETE while two shards flip the messages' flags leave none behind" "$r" "0 30 OK False"
 # A sequence set of an empty folder names nothing, its * included.
-r=$(python3 - "$IMSH" <<'PY'
+r=$(timeout 180 python3 - "$IMSH" <<'PY'
 import imaplib, sys
 M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1])); M.login("alice", "alicepassword1"); M.create("Empty")
 M.select("Empty")
@@ -538,7 +538,7 @@ PY
 )
 check "FETCH 1:*, FETCH * and STORE 1:* of an empty folder answer OK" "$r" "OK OK OK OK"
 # Thousands of changes outgrow the journal, which is folded into a snapshot; every shard reads on from it.
-r=$(python3 - "$IMSH" <<'PY'
+r=$(timeout 180 python3 - "$IMSH" <<'PY'
 import imaplib, sys, time
 port = int(sys.argv[1])
 M = imaplib.IMAP4("127.0.0.1", port); M.login("alice", "alicepassword1"); M.select("Shared")
@@ -562,7 +562,7 @@ check "and every shard reads the same flags after" "$r" "1 True"
 
 # A literal's marker glued to an atom is no literal, so the bytes after it are never taken as one; a length that wraps
 # past the end of what came is refused before sign-in, and the connection answers on.
-r=$(python3 - "$IM" <<'PY'
+r=$(timeout 180 python3 - "$IM" <<'PY'
 import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3); f = s.makefile("rb"); f.readline()
 s.sendall(b"a X Y{27}\r\n")

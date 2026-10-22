@@ -240,6 +240,10 @@ r = api(["Identity/set", {"accountId": acct, "update": {"i0": {"name": "Alice A.
 ident = r["ig"][0][1]["list"][0]
 say("Identity/set keeps a name and a signature, and makes no other address", r["is"][0][1]["updated"] == {"i0": None} and
     "n" in r["is"][0][1]["notCreated"] and ident["name"] == "Alice A." and ident["textSignature"] == "-- \nAlice", r)
+before = r["ig"][0][1]["state"]
+r = api(["Identity/set", {"accountId": acct, "update": {"i0": {"name": "Alice B."}}}, "is"], ["Identity/get", {"accountId": acct}, "ig"])
+say("an Identity changed to a name of the same length is a new state", r["is"][0][1]["oldState"] == before and
+    r["is"][0][1]["newState"] == r["ig"][0][1]["state"] and r["ig"][0][1]["state"] != before, r)
 # EventSource
 es = socket.create_connection(("127.0.0.1", jm), timeout=10)
 es.sendall(("GET /jmap/eventsource?types=*&closeafter=state&ping=0 HTTP/1.1\r\nHost: x\r\nAuthorization: %s\r\n\r\n" % AUTH).encode())
@@ -265,11 +269,20 @@ pr = r["p"][0][1]
 say("Email/parse reads an upload as an Email that is not the account's", pr["parsed"].get(pb, {}).get("subject") == "only parsed"
     and pr["parsed"][pb].get("id") is None and pr["notFound"] == ["Unone"], pr)
 # VacationResponse
-r = api(["VacationResponse/set", {"accountId": acct, "update": {"singleton": {"isEnabled": True, "subject": "Away now",
+r = api(["VacationResponse/get", {"accountId": acct}, "g0"],
+        ["VacationResponse/set", {"accountId": acct, "update": {"singleton": {"isEnabled": True, "subject": "Away now",
          "textBody": "Back on Monday."}}}, "v"], ["VacationResponse/get", {"accountId": acct}, "g"])
 vr = r["g"][0][1]["list"][0]
 say("VacationResponse/set turns it on, and get says so", r["v"][0][1].get("updated") == {"singleton": None} and
     vr["isEnabled"] is True and vr["textBody"] == "Back on Monday.", r)
+vs = r["v"][0][1]
+say("and its oldState is the state before, its newState the one get gives after", vs["oldState"] == r["g0"][0][1]["state"]
+    and vs["newState"] == r["g"][0][1]["state"] and vs["oldState"] != vs["newState"], r)
+r = api(["VacationResponse/set", {"accountId": acct, "update": {"singleton": {"subject": "Away w0w"}}}, "v"])
+w0w = r["v"][0][1]["newState"]
+r = api(["VacationResponse/set", {"accountId": acct, "update": {"singleton": {"subject": "Away now"}}}, "v"])
+say("a change of the same length is a new state, and the same text again the same state", r["v"][0][1]["oldState"] == w0w
+    and w0w != vs["newState"] and r["v"][0][1]["newState"] == vs["newState"], r)
 sm = smtplib.SMTP("127.0.0.1", int(sys.argv[4])); sm.ehlo("x")
 for subject in ("first while away", "second while away"):
     sm.sendmail("vera@remote.test", ["alice@example.test"], "From: vera@remote.test\r\nSubject: %s\r\n\r\nhi\r\n" % subject)

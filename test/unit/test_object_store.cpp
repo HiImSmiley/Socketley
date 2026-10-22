@@ -757,6 +757,33 @@ TEST_CASE("a body that fails its digest is not stored and leaves no temporary fi
     CHECK(r.put("bkt", "k", "second", {}, 100, &right).status == st::ok);
 }
 
+TEST_CASE("a body shorter or longer than its declared size is not stored and leaves no temporary file")
+{
+    tmpdir d;
+    rig r(d.path);
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    REQUIRE(r.put("bkt", "k", "first").status == st::ok);
+
+    for (const std::string body : {"short", "much too long"})
+    {
+        st why = st::ok;
+        auto op = r.store->begin_put("bkt", "k", {}, 8, true, why);
+        REQUIRE(op);
+        op->append(body.data(), body.size());
+        put_result p;
+        bool fired = false;
+        op->finish(nullptr, [&](put_result res) { p = std::move(res); fired = true; });
+        REQUIRE(r.until([&] { return fired; }));
+        CHECK(p.status == st::io_error);
+        r.settle();
+
+        std::string got;
+        REQUIRE(r.get("bkt", "k", got) == st::ok);
+        CHECK(got == "first");
+        CHECK(fs::is_empty(d.path + "/bkt/tmp"));
+    }
+}
+
 TEST_CASE("a delete removes the object and a later put brings it back")
 {
     tmpdir d;
@@ -1165,12 +1192,10 @@ TEST_CASE("puts that arrive while the journal is being compacted are not lost")
         for (int i = 0; i < 300; ++i)
         {
             st why;
-            auto op = r.store->begin_put("bkt", "k" + std::to_string(i % 40), {}, 10, true, why);
-            REQUIRE(op);
             const std::string body = "body-" + std::to_string(i);
+            auto op = r.store->begin_put("bkt", "k" + std::to_string(i % 40), {}, body.size(), true, why);
+            REQUIRE(op);
             op->append(body.data(), body.size());
-            // The size was promised as 10 and the body is shorter or longer;
-            // the store only cares what arrived.
             op->finish(nullptr, [&](put_result res) { CHECK(res.status == st::ok); ++done; });
             ops.push_back(op);
         }

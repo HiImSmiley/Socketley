@@ -176,13 +176,15 @@ end = b.find(b"\n", end + 1)
 with open(p, "r+b") as f:
     f.seek(end); f.write(b"#")
 PY
+from=$(($(wc -l < "$SOCKETLEY_DLOG") + 1))
 "$BIN" start s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$P" >/dev/null
 "$BIN" mail s show "$id" >/dev/null 2>&1
 check "a record a crash cut is not a message" "$?" "1"
 check "and the messages before it are kept" "$(kept)" "2"
-grep -q "cut short by a crash while it was written" "$SOCKETLEY_DLOG" && ok "and the log says one was dropped" \
-    || bad "and the log says one was dropped" "$(grep -i 'mail' "$SOCKETLEY_DLOG" | tail -3)"
+# A move the spool made since may have put a whole record after the cut one, which makes it one damaged in the middle.
+tail -n +"$from" "$SOCKETLEY_DLOG" | grep -qE "cut short by a crash while it was written|was damaged on disk, and is dropped" \
+    && ok "and the log says one was dropped" || bad "and the log says one was dropped" "$(grep -i 'mail' "$SOCKETLEY_DLOG" | tail -3)"
 
 # ─── a record damaged in the middle of a segment ────────────────────────────
 mids=()
@@ -200,6 +202,7 @@ at = b.find(b"mid body 1")
 with open(p, "r+b") as f:
     f.seek(at); f.write(b"M")
 PY
+from=$(($(wc -l < "$SOCKETLEY_DLOG") + 1))
 "$BIN" start s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$P" >/dev/null
 "$BIN" mail s show "${mids[0]}" >/dev/null 2>&1
@@ -208,7 +211,7 @@ for i in 1 2; do
     "$BIN" mail s show "${mids[$i]}" >/dev/null 2>&1
     check "and the one after it, $((i+1)), is kept" "$?" "0"
 done
-grep -q "was damaged on disk, and is dropped; the messages after it are kept" "$SOCKETLEY_DLOG" \
+tail -n +"$from" "$SOCKETLEY_DLOG" | grep -q "was damaged on disk, and is dropped; the messages after it are kept" \
     && ok "and the log says one was damaged" || bad "and the log says one was damaged" "$(grep -i 'mail' "$SOCKETLEY_DLOG" | tail -3)"
 for i in 1 2; do "$BIN" mail s drop "${mids[$i]}" >/dev/null 2>&1; done
 

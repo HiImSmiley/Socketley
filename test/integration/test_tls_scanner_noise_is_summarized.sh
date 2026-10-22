@@ -73,9 +73,17 @@ EACH=$(grep -cE "handshake failed" "$SOCKETLEY_DLOG" 2>/dev/null || true)
 if [ "$EACH" -eq 0 ]; then pass
 else fail "no failed handshake has a line of its own" "$EACH lines: $(grep -m1 'handshake failed' "$SOCKETLEY_DLOG")"; fi
 
-# A client that speaks TLS is served as before.
-if echo | timeout 5 openssl s_client -connect "127.0.0.1:$P" -servername localhost </dev/null 2>/dev/null | grep -q "BEGIN CERTIFICATE"; then pass
-else fail "a TLS client still completes its handshake" "openssl s_client got no certificate"; fi
+# A client that speaks TLS is served as before; s_client with stdin at EOF may quit before it prints the certificate.
+if python3 - "$P" <<'PY'
+import socket, ssl, sys
+c = ssl.create_default_context()
+c.check_hostname = False
+c.verify_mode = ssl.CERT_NONE
+with c.wrap_socket(socket.create_connection(("127.0.0.1", int(sys.argv[1])), 5), server_hostname="localhost") as s:
+    sys.exit(0 if s.getpeercert(binary_form=True) else 1)
+PY
+then pass
+else fail "a TLS client still completes its handshake" "no certificate came back"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] || exit 1

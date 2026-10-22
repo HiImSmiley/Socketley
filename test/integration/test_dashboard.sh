@@ -97,7 +97,7 @@ keys=$(python3 - "$HERE/../../socketley/shared/persist/state_persistence.cpp" "$
 import json, re, sys
 src = open(sys.argv[1]).read()
 # The fields written by name, and the arrays written as a quoted key ahead of their bracket.
-written = set(re.findall(r'append_[a-z]+_field\("([a-z_]+)"', src)) | set(re.findall(r'\\"([a-z_]+)\\": \[', src))
+written = set(re.findall(r'append_[a-z]+_field\("([a-z0-9_]+)"', src)) | set(re.findall(r'\\"([a-z0-9_]+)\\": \[', src))
 flags = json.load(open(sys.argv[2]))["flags"]
 key = {(f["flag"], t): f.get("key") for f in flags for t in f["types"]}
 out = sorted({f["key"] for f in flags if f.get("key") and f["key"] not in written})

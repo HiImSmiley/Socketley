@@ -31,16 +31,14 @@ public:
 
     // Where every request connects, a host:port in place of the URL's, which is still the name sent and verified.
     void connect_to(std::string hostport) { m_connect = std::move(hostport); }
-    // Whether a name may only lead to a public address, as one a stranger's DNS chose must: no loopback, private,
-    // link-local or unspecified one; a host:port given connect_to is the caller's own choice and is dialled.
+    // Whether a name may lead only to a public address, as a stranger's must, while connect_to's is dialled.
     void public_only(bool on) { m_public_only = on; }
 
     // Trusts `ca_file`, or the system's roots when it is empty; false with `err` when they do not load.
     bool init(std::string& err, const std::string& ca_file = {}, std::string user_agent = "socketley");
 
-    // `method` `url` with `body` of `type` and `headers`; a reply that came is true whatever its status. The whole
-    // exchange is bounded by `timeout_s` seconds, and a reply past `max_bytes` is refused as it passes it where that is
-    // not 0.
+    // `method` `url` with `body` of `type` and `headers`, true for a reply whatever its status, within `timeout_s`
+    // seconds for the whole exchange and refused once it passes a `max_bytes` that is not 0.
     bool request(std::string_view method, const std::string& url, std::string_view type, std::string_view body, reply& out,
                  std::string& err, int timeout_s = 30, size_t max_bytes = 0,
                  const std::vector<std::pair<std::string, std::string>>& headers = {});
