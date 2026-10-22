@@ -17506,6 +17506,46 @@ when unset, so a test's own server can be one.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_MAIL_TLS_CA
+A test aid: the CA file a mail runtime checks an exchanger's certificate
+against where DANE or MTA\-STS asks it to, the system's roots when unset, so a
+test's own exchanger can be trusted.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MAIL_STS_CA
+A test aid: the CA file a mail runtime checks the server of an MTA\-STS policy
+against, the system's roots when unset.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MAIL_STS_CONNECT
+A test aid: the
+.IR host : port
+every MTA\-STS policy is fetched from, the name in its URL still the one
+checked, so a test can serve the policies of domains it does not own; each
+policy's own host when unset.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MAIL_DELAY_NOTICE_MS
+A test aid: the milliseconds a mail runtime tries a message before a sender who
+asked (NOTIFY=DELAY) is told it is late, four hours when unset.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MAIL_SPOOL_MOVE_MS
+A test aid: the milliseconds a sealed spool segment waits before the few
+messages still in it are moved and it is used again, a minute when unset.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MAIL_SPOOL_KEEP_BYTES
+A test aid: the bytes of message bodies a mail spool keeps in memory beside its
+segments, 64 MiB when unset, so a test can have them read back from disk.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_STORAGE_NOTIFY_HOSTS
 A test aid: a file of
 .I name address
