@@ -752,6 +752,14 @@ void imap_store::tick(int64_t)
     }
 }
 
+std::vector<std::string> imap_store::folder_names(const std::string& name)
+{
+    std::vector<std::string> out;
+    for (const auto& [n, f] : user(name).folders)
+        out.push_back(n);
+    return out;
+}
+
 void imap_store::folders(const std::string& name, std::function<void(std::vector<std::string>)> done)
 {
     mailboxes* boxes = m_run.boxes();

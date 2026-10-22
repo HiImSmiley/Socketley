@@ -9,6 +9,11 @@
 #   * a script that does not compile kept, or kept without the line its error is on
 #   * a literal past a script's size read as commands, or the active script deleted
 #   * fileinto not filing, its imap4flags lost, discard keeping, reject not telling the sender
+#   * fileinto of a folder not there without :create making it, mailboxexists not seeing one made
+#   * size or body reading only a message's first mebibyte
+#   * editheader's changes not in what is kept, an include :global not run, duplicate keeping a message twice
+#   * notify not mailing its URI, or not as an automatic message
+#   * HAVESPACE answering OK for a name PUTSCRIPT refuses, a script that no longer compiles made active
 #   * redirect :copy not sending a copy, or not keeping one
 #   * a message past a mebibyte a filter sends on lost, or sent on again by every try of the copy it keeps
 #   * a command of literals before sign-in held in memory past what any command takes
@@ -75,8 +80,8 @@ ready_tcp 127.0.0.1 "$SV" || bad "the ManageSieve port listens" "$(tail -3 "$SOC
 
 # ─── ManageSieve ────────────────────────────────────────────────────────────
 cat > "$T/script.sieve" <<'SIEVE'
-require ["fileinto", "imap4flags", "vacation", "reject", "copy"];
-if header :contains "subject" "invoice" { fileinto :flags "\\Flagged" "Bills"; stop; }
+require ["fileinto", "imap4flags", "vacation", "reject", "copy", "mailbox"];
+if header :contains "subject" "invoice" { fileinto :create :flags "\\Flagged" "Bills"; stop; }
 if header :contains "subject" "spam" { discard; stop; }
 if address :is "from" "pest@remote.test" { reject "Not from you"; stop; }
 if header :contains "subject" "share" { redirect :copy "friend@remote.test"; }
@@ -132,6 +137,9 @@ say("one that does is kept", r[-1].startswith("OK"), r)
 t.sendall(b'HAVESPACE "big" 999999\r\n')
 r = response(f)
 say("HAVESPACE says what is too large", r[-1].startswith("NO (QUOTA/MAXSIZE)"), r)
+t.sendall(b'HAVESPACE "a/b" 10\r\n')
+r = response(f)
+say("and refuses a name PUTSCRIPT would", r[-1].startswith("NO"), r)
 t.sendall(b'PUTSCRIPT "huge" {200000+}\r\n' + b"#" * 200000 + b'\r\nNOOP "x"\r\n')
 r = response(f); r2 = response(f)
 say("a script past the size is refused and read past, the next command answered",
@@ -295,6 +303,72 @@ for _ in $(seq 1 60); do [ "$(keys INBOX | wc -l)" -gt "$n0" ] && break; sleep 0
 sleep 0.5
 check "a script deactivated is no longer run" \
     "$(grep -l '^Subject: Away' "$T"/sink/*.eml 2>/dev/null | xargs -r grep -l '^rcpt carol@remote.test' | wc -l)" "0"
+dir=$(find "$HOME/.local/share" -type d -path '*m.sieve/alice' 2>/dev/null | head -1)
+printf 'if true { nope; }\n' > "$dir/edited.sieve"
+out=$("$BIN" mail m sieve alice activate edited 2>&1); rc=$?
+case "$out" in error*) [ $rc = 1 ] && ok "a script that no longer compiles is not made active" \
+    || bad "a script that no longer compiles is not made active" "rc $rc" ;;
+    *) bad "a script that no longer compiles is not made active" "$out" ;; esac
+rm -f "$dir/edited.sieve"
+
+# ─── the extensions ─────────────────────────────────────────────────────────
+printf 'require "editheader";\naddheader "X-Global" "seen";\n' > "$T/global.sieve"
+"$BIN" mail m sieve .global put tag "$T/global.sieve" >/dev/null 2>&1
+cat > "$T/ext.sieve" <<'SIEVE'
+require ["fileinto", "mailbox", "editheader", "duplicate", "enotify", "include"];
+include :global "tag";
+deleteheader "X-Remove";
+addheader "X-Sieve" "filtered";
+if size :over 1500K { fileinto :create "Big"; stop; }
+if header :contains "subject" "notify me" { notify :message "You have mail" "mailto:watcher@remote.test"; }
+if duplicate { discard; stop; }
+if header :contains "subject" "nowhere" { fileinto "Missing"; stop; }
+if allof (mailboxexists "Big", header :contains "subject" "check exists") { fileinto "Big"; stop; }
+SIEVE
+out=$("$BIN" mail m sieve alice put ext "$T/ext.sieve" 2>&1; "$BIN" mail m sieve alice activate ext 2>&1)
+check "a script that includes a global one is put and made active" "$out" ""
+n0=$(keys INBOX | wc -l)
+python3 - "$P" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1])); s.ehlo("x")
+s.sendmail("gil@remote.test", ["alice@example.test"], "From: gil@remote.test\r\nTo: alice@example.test\r\n"
+           "Subject: edited\r\nX-Remove: me\r\nMessage-ID: <edited@remote.test>\r\n\r\nbody of edited\r\n")
+body = "".join("big line %06d %s\r\n" % (i, "y" * 60) for i in range(25000))
+s.sendmail("gil@remote.test", ["alice@example.test"], "From: gil@remote.test\r\nTo: alice@example.test\r\n"
+           "Subject: huge one\r\nMessage-ID: <huge@remote.test>\r\n\r\n" + body)
+PY
+send gil@remote.test "dup one"
+send gil@remote.test "dup one"
+send gil@remote.test "nowhere"
+send gil@remote.test "notify me"
+for _ in $(seq 1 80); do [ "$(keys INBOX | wc -l)" -ge "$((n0 + 4))" ] && [ -n "$(keys Big)" ] && break; sleep 0.1; done
+send gil@remote.test "check exists"
+for _ in $(seq 1 60); do [ "$(keys Big | wc -l)" -ge 2 ] && break; sleep 0.1; done
+sleep 0.5
+r=$(python3 - "$IM" <<'PY'
+import imaplib, sys
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1])); M.login("alice", "alicepassword1")
+M.select("INBOX")
+typ, data = M.search(None, 'HEADER Message-ID "<edited@remote.test>"')
+n = data[0].split()[-1]
+h = M.fetch(n, "(BODY.PEEK[HEADER])")[1][0][1].decode()
+print("X-Sieve: filtered" in h, "X-Global: seen" in h, "X-Remove" in h)
+print(len(M.search(None, 'SUBJECT "dup one"')[1][0].split()), len(M.search(None, 'SUBJECT "nowhere"')[1][0].split()))
+print(M.status("Missing", "(MESSAGES)")[0])
+M.select("Big")
+print(" | ".join(d[1].decode().strip() for d in M.fetch("1:*", "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")[1] if isinstance(d, tuple)))
+PY
+)
+check "editheader's header is the one kept, a global include's among it" "$(sed -n 1p <<<"$r")" "True True False"
+check "duplicate keeps a message the second time it comes not again, and fileinto of a folder not there files into INBOX" \
+    "$(sed -n 2p <<<"$r")" "1 1"
+check "and makes no folder for it" "$(sed -n 3p <<<"$r")" "NO"
+case "$(sed -n 4p <<<"$r")" in *"huge one"*"check exists"*) ok "size reads a message past a mebibyte whole, and mailboxexists sees the folder made" ;;
+    *) bad "size reads a message past a mebibyte whole, and mailboxexists sees the folder made" "$(sed -n 4p <<<"$r")" ;; esac
+f=$(at_sink "You have mail")
+[ -n "$f" ] && grep -q '^rcpt watcher@remote.test' "$f" && grep -q '^Auto-Submitted: auto-notified' "$f" && grep -q '^from $' "$f" \
+    && ok "notify mails the mailto URI, auto-notified, from the null sender" \
+    || bad "notify mails the mailto URI, auto-notified, from the null sender" "$(head -8 "$f" 2>/dev/null)"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

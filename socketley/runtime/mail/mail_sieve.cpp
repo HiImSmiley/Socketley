@@ -4,6 +4,9 @@
 #include <array>
 #include <deque>
 #include <functional>
+#include <unordered_map>
+
+#include <regex.h>
 
 #include "mail_compose.h"
 #include "mail_mime.h"
@@ -25,6 +28,13 @@ constexpr size_t max_vars = 128;
 constexpr size_t max_expanded = 64u << 10;
 constexpr size_t max_list_bytes = 1u << 20;
 constexpr size_t max_match_vars = 10;
+constexpr size_t max_includes = 32;
+constexpr int max_include_depth = 10;
+constexpr size_t max_notifies = 3;
+constexpr size_t max_added_headers = 64;
+// What duplicate keeps an ID for when the script names no time, and the most it may name (RFC 7352 3.1).
+constexpr uint64_t duplicate_default_s = 12 * 3600;
+constexpr uint64_t duplicate_max_s = 7 * 86400;
 // What one step buys: bytes scanned or decoded, and turns of the wildcard matcher.
 constexpr uint64_t bytes_per_step = 512;
 constexpr uint64_t glob_per_step = 256;
@@ -49,6 +59,17 @@ enum cap : uint32_t
     c_variables = 1u << 13,
     c_date = 1u << 14,
     c_mailbox = 1u << 15,
+    c_regex = 1u << 16,
+    c_editheader = 1u << 17,
+    c_duplicate = 1u << 18,
+    c_include = 1u << 19,
+    c_environment = 1u << 20,
+    c_index = 1u << 21,
+    c_spamtest = 1u << 22,
+    c_spamtestplus = 1u << 23,
+    c_virustest = 1u << 24,
+    c_enotify = 1u << 25,
+    c_ihave = 1u << 26,
 };
 
 struct cap_name
@@ -75,6 +96,17 @@ constexpr cap_name cap_names[] = {
     {"variables", c_variables},
     {"date", c_date},
     {"mailbox", c_mailbox},
+    {"regex", c_regex},
+    {"editheader", c_editheader},
+    {"duplicate", c_duplicate},
+    {"include", c_include},
+    {"environment", c_environment},
+    {"index", c_index},
+    {"spamtest", c_spamtest},
+    {"spamtestplus", c_spamtest | c_spamtestplus},
+    {"virustest", c_virustest},
+    {"enotify", c_enotify},
+    {"ihave", c_ihave},
     {"comparator-i;octet", 0},
     {"comparator-i;ascii-casemap", 0},
 };
@@ -148,7 +180,7 @@ void append_utf8(std::string& out, uint32_t cp)
 size_t utf8_len(std::string_view s, size_t i)
 {
     const auto c = static_cast<unsigned char>(s[i]);
-    const size_t n = c < 0x80 ? 1 : c >= 0xF0 && c < 0xF8 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+    const size_t n = c < 0x80 ? 1 : c >= 0xF0 && c < 0xF8 ? 4 : c >= 0xE0 && c < 0xF0 ? 3 : c >= 0xC0 && c < 0xE0 ? 2 : 1;
     if (i + n > s.size())
         return 1;
     for (size_t k = 1; k < n; ++k)
@@ -190,6 +222,56 @@ std::string fnv_hex(std::string_view s)
 std::string at_line(int line, std::string_view why)
 {
     return "line " + std::to_string(line) + ": " + std::string(why);
+}
+
+// A POSIX extended regular expression, freed with it.
+struct posix_regex
+{
+    regex_t r{};
+    bool ok{false};
+    posix_regex(const std::string& pat, bool fold)
+    {
+        ok = ::regcomp(&r, pat.c_str(), REG_EXTENDED | (fold ? REG_ICASE : 0)) == 0;
+    }
+    ~posix_regex()
+    {
+        if (ok)
+            ::regfree(&r);
+    }
+    posix_regex(const posix_regex&)            = delete;
+    posix_regex& operator=(const posix_regex&) = delete;
+};
+
+// Whether `pat` is an extended expression this takes: one that compiles, with no back-reference, which glibc would
+// take as its own extension and match in time exponential in the string.
+bool regex_ok(std::string_view pat, bool fold, std::string& why)
+{
+    if (pat.size() > 1024)
+    {
+        why = "is longer than 1024 bytes";
+        return false;
+    }
+    if (pat.find('\0') != std::string_view::npos)
+    {
+        why = "holds a NUL";
+        return false;
+    }
+    for (size_t i = 0; i + 1 < pat.size(); ++i)
+        if (pat[i] == '\\')
+        {
+            if (pat[i + 1] >= '1' && pat[i + 1] <= '9')
+            {
+                why = "refers back, which an extended expression does not";
+                return false;
+            }
+            ++i;
+        }
+    if (!posix_regex(std::string(pat), fold).ok)
+    {
+        why = "does not compile";
+        return false;
+    }
+    return true;
 }
 
 // ─── lexer ─────────────────────────────────────────────────────────────────
@@ -252,7 +334,7 @@ bool lex(std::string_view s, std::vector<token>& out, std::string& err)
             t.text = lower(s.substr(i, j - i));
             if (t.text == "text" && j < s.size() && s[j] == ':')
             {
-                // A multi-line string: its lines up to one holding a lone dot, a leading dot doubled.
+                // A multi-line string: its lines up to one holding a lone dot, a leading dot stuffed.
                 size_t k = j + 1;
                 while (k < s.size() && (s[k] == ' ' || s[k] == '\t'))
                     ++k;
@@ -279,8 +361,13 @@ bool lex(std::string_view s, std::vector<token>& out, std::string& err)
                         break;
                     }
                     if (nl == std::string_view::npos)
+                    {
+                        // Said where it began, as an unclosed quoted string is.
+                        line = t.line;
                         return fail("a text: string not ended by a line holding a dot");
-                    if (l.starts_with(".."))
+                    }
+                    // A line's leading dot is its stuffing, taken off (RFC 5228 2.4.2).
+                    if (l.starts_with('.'))
                         l.remove_prefix(1);
                     t.text.append(l).append("\r\n");
                     k = nl + 1;
@@ -463,7 +550,7 @@ struct str
 using strs = std::vector<str>;
 
 enum class cmp : uint8_t { octet, casemap, numeric };
-enum class mtype : uint8_t { is, contains, matches, count, value };
+enum class mtype : uint8_t { is, contains, matches, count, value, regex };
 enum class rel : uint8_t { gt, ge, lt, le, eq, ne };
 enum class apart : uint8_t { all, localpart, domain, user, detail };
 enum class transform : uint8_t { text, raw, content };
@@ -492,7 +579,14 @@ enum class tk : uint8_t
     date,
     currentdate,
     hasflag,
-    mailboxexists
+    mailboxexists,
+    environment,
+    duplicate,
+    spamtest,
+    virustest,
+    valid_notify_method,
+    notify_method_capability,
+    ihave
 };
 
 struct test_node
@@ -504,6 +598,9 @@ struct test_node
     transform tr{transform::text};
     bool over{false}, zone_set{false}, original_zone{false};
     uint64_t limit{0};
+    // index's :index and :last; duplicate's :last, and whether its ID is a header's or given.
+    uint32_t index{0};
+    bool last{false}, by_header{false}, by_id{false}, percent{false};
     str zone, part;
     // Header names, envelope parts, sources, variables or mailboxes, by the test.
     strs a;
@@ -525,7 +622,14 @@ enum class ck : uint8_t
     set,
     setflag,
     addflag,
-    removeflag
+    removeflag,
+    addheader,
+    deleteheader,
+    include,
+    return_,
+    global,
+    notify,
+    error
 };
 
 enum set_mod : uint8_t
@@ -535,7 +639,9 @@ enum set_mod : uint8_t
     m_lowerfirst = 4,
     m_upperfirst = 8,
     m_quotewildcard = 16,
-    m_length = 32
+    m_length = 32,
+    m_quoteregex = 64,
+    m_encodeurl = 128
 };
 
 struct cmd_node
@@ -554,6 +660,14 @@ struct cmd_node
     uint64_t seconds{7 * 86400};
     bool has_subject{false}, has_from{false}, has_handle{false};
     str subject, from, handle;
+    // editheader's :last and :index with deleteheader's match; include's location and the script it names.
+    bool last{false}, global{false}, once{false}, optional{false}, has_importance{false};
+    uint32_t index{0};
+    match m;
+    int sub{-1};
+    // notify's :importance and :options.
+    str importance;
+    strs options;
 };
 
 constexpr std::string_view date_parts[] = {"year", "month", "day", "date", "julian", "hour", "minute",
@@ -579,6 +693,32 @@ bool parse_zone(std::string_view z, int& minutes)
         return false;
     minutes = (z[0] == '-' ? -1 : 1) * (h * 60 + m);
     return true;
+}
+
+// A header's name as editheader may write it: printable, no colon, a line's worth at most.
+bool field_name_ok(std::string_view n)
+{
+    if (n.empty() || n.size() > 76)
+        return false;
+    return std::all_of(n.begin(), n.end(), [](char c) { return c > 32 && c < 127 && c != ':'; });
+}
+
+std::string percent_decoded(std::string_view s)
+{
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        const int h = s[i] == '%' && i + 2 < s.size() ? hex_digit(s[i + 1]) : -1;
+        const int l = h >= 0 ? hex_digit(s[i + 2]) : -1;
+        if (l >= 0)
+        {
+            out += static_cast<char>(h * 16 + l);
+            i += 2;
+        }
+        else
+            out += s[i];
+    }
+    return out;
 }
 
 // ─── parser ────────────────────────────────────────────────────────────────
@@ -732,7 +872,7 @@ struct parser
         std::vector<garg> a;
         if (!parse_args(a) || !parse_tests(out.kids, depth + 1))
             return false;
-        return build_test(id, line, a, out);
+        return build_test(id, line, a, out) && check_regex(out.m, out.keys, line);
     }
 
     // ── arguments ──
@@ -800,7 +940,8 @@ struct parser
                 return bad(line, "unknown comparator \"" + name + "\"");
             return 1;
         }
-        const bool is_mt = tag == "is" || tag == "contains" || tag == "matches" || tag == "count" || tag == "value";
+        const bool is_mt = tag == "is" || tag == "contains" || tag == "matches" || tag == "count" || tag == "value" ||
+                           tag == "regex";
         if (is_mt)
         {
             if (seen & 2)
@@ -808,6 +949,12 @@ struct parser
             seen |= 2;
             if (tag == "is")
                 m.t = mtype::is;
+            else if (tag == "regex")
+            {
+                if (!need(c_regex, line, ":regex", "regex"))
+                    return -1;
+                m.t = mtype::regex;
+            }
             else if (tag == "contains")
                 m.t = mtype::contains;
             else if (tag == "matches")
@@ -864,8 +1011,24 @@ struct parser
 
     bool check_match(const match& m, int line)
     {
-        if (m.c == cmp::numeric && (m.t == mtype::contains || m.t == mtype::matches))
-            return fail(line, "i;ascii-numeric compares no substrings, so :contains and :matches are not for it");
+        if (m.c == cmp::numeric && (m.t == mtype::contains || m.t == mtype::matches || m.t == mtype::regex))
+            return fail(line, "i;ascii-numeric compares no substrings, so :contains, :matches and :regex are not for it");
+        return true;
+    }
+
+    // A pattern :regex is given as written, which must be an extended regular expression without back-references.
+    bool check_regex(const match& m, const strs& keys, int line)
+    {
+        if (m.t != mtype::regex)
+            return true;
+        for (const auto& k : keys)
+        {
+            if (k.vars)
+                continue;
+            std::string why;
+            if (!regex_ok(k.s, m.c != cmp::octet, why))
+                return fail(line, "the regular expression \"" + k.s + "\" " + why);
+        }
         return true;
     }
 
@@ -921,12 +1084,36 @@ struct parser
             }
             return check_match(out.m, line);
         };
+        // index's :index and :last, for header, address and date (RFC 5260 4).
+        const std::function<int(const std::string&, size_t&)> index_tag = [&](const std::string& tag,
+                                                                               size_t& kk) -> int {
+            if (tag == "index")
+            {
+                if (!need(c_index, line, ":index", "index"))
+                    return -1;
+                uint64_t n = 0;
+                if (out.index || !num_arg(a, kk, n, line, ":index") || n == 0 || n > 1000000)
+                    return bad(line, ":index takes one number, counted from 1");
+                out.index = static_cast<uint32_t>(n);
+                return 1;
+            }
+            if (tag == "last")
+            {
+                if (!need(c_index, line, ":last", "index"))
+                    return -1;
+                out.last = true;
+                return 1;
+            }
+            return 0;
+        };
+        const auto indexed = [&] { return !out.last || out.index ? true : fail(line, ":last needs :index"); };
         if (id == "address" || id == "envelope")
         {
             out.k = id == "address" ? tk::address : tk::envelope;
             if (out.k == tk::envelope && !need(c_envelope, line, "envelope", "envelope"))
                 return false;
-            if (!tags(&out.ap, nullptr) || !list_arg(a, k, out.a, line, id) || !list_arg(a, k, out.keys, line, id))
+            if (!tags(&out.ap, out.k == tk::address ? index_tag : nullptr) || !indexed() ||
+                !list_arg(a, k, out.a, line, id) || !list_arg(a, k, out.keys, line, id))
                 return false;
             if (out.k == tk::envelope)
                 for (const auto& p : out.a)
@@ -937,7 +1124,8 @@ struct parser
         if (id == "header")
         {
             out.k = tk::header;
-            if (!tags(nullptr, nullptr) || !list_arg(a, k, out.a, line, id) || !list_arg(a, k, out.keys, line, id))
+            if (!tags(nullptr, index_tag) || !indexed() || !list_arg(a, k, out.a, line, id) ||
+                !list_arg(a, k, out.keys, line, id))
                 return false;
             return done(a, k, id);
         }
@@ -1028,9 +1216,9 @@ struct parser
                     out.original_zone = true;
                     return 1;
                 }
-                return 0;
+                return out.k == tk::date ? index_tag(tag, kk) : 0;
             };
-            if (!tags(nullptr, own))
+            if (!tags(nullptr, own) || !indexed())
                 return false;
             if (out.k == tk::date)
             {
@@ -1075,6 +1263,109 @@ struct parser
                 return false;
             return done(a, k, id);
         }
+        if (id == "environment")
+        {
+            out.k = tk::environment;
+            if (!need(c_environment, line, id, "environment") || !tags(nullptr, nullptr))
+                return false;
+            out.a.emplace_back();
+            if (!str_arg(a, k, out.a.back(), line, id) || !list_arg(a, k, out.keys, line, id))
+                return false;
+            return done(a, k, id);
+        }
+        if (id == "duplicate")
+        {
+            out.k = tk::duplicate;
+            if (!need(c_duplicate, line, id, "duplicate"))
+                return false;
+            out.limit = duplicate_default_s;
+            bool timed = false, handled = false;
+            while (k < a.size() && a[k].k == garg::kind::tag)
+            {
+                const std::string tag = a[k].tag;
+                const int tl = a[k].line;
+                ++k;
+                if (tag == "handle" && !handled)
+                {
+                    handled = true;
+                    if (!str_arg(a, k, out.part, tl, ":handle"))
+                        return false;
+                }
+                else if ((tag == "header" || tag == "uniqueid") && !out.by_header && !out.by_id)
+                {
+                    (tag == "header" ? out.by_header : out.by_id) = true;
+                    if (!str_arg(a, k, out.zone, tl, ":" + tag))
+                        return false;
+                }
+                else if (tag == "seconds" && !timed)
+                {
+                    timed = true;
+                    uint64_t n = 0;
+                    if (!num_arg(a, k, n, tl, ":seconds"))
+                        return false;
+                    out.limit = std::min(n, duplicate_max_s);
+                }
+                else if (tag == "last" && !out.last)
+                    out.last = true;
+                else
+                    return fail(tl, "duplicate takes :handle, one of :header and :uniqueid, :seconds and :last, each once");
+            }
+            return done(a, k, id);
+        }
+        if (id == "spamtest" || id == "virustest")
+        {
+            out.k = id == "spamtest" ? tk::spamtest : tk::virustest;
+            if (!need(out.k == tk::spamtest ? c_spamtest : c_virustest, line, id, id))
+                return false;
+            const auto own = [&](const std::string& tag, size_t&) -> int {
+                if (tag != "percent" || out.k != tk::spamtest)
+                    return 0;
+                if (!need(c_spamtestplus, line, ":percent", "spamtestplus"))
+                    return -1;
+                out.percent = true;
+                return 1;
+            };
+            if (!tags(nullptr, own) || !list_arg(a, k, out.keys, line, id))
+                return false;
+            return done(a, k, id);
+        }
+        if (id == "valid_notify_method")
+        {
+            out.k = tk::valid_notify_method;
+            if (!need(c_enotify, line, id, "enotify") || !list_arg(a, k, out.a, line, id))
+                return false;
+            return done(a, k, id);
+        }
+        if (id == "notify_method_capability")
+        {
+            out.k = tk::notify_method_capability;
+            if (!need(c_enotify, line, id, "enotify") || !tags(nullptr, nullptr))
+                return false;
+            out.a.resize(2);
+            if (!str_arg(a, k, out.a[0], line, id) || !str_arg(a, k, out.a[1], line, id) ||
+                !list_arg(a, k, out.keys, line, id))
+                return false;
+            return done(a, k, id);
+        }
+        if (id == "ihave")
+        {
+            out.k = tk::ihave;
+            if (!need(c_ihave, line, id, "ihave") || !list_arg(a, k, out.a, line, id))
+                return false;
+            // Known as the script is read: whether every extension named is here, and what its block may use.
+            out.over = true;
+            for (const auto& n : out.a)
+            {
+                const std::string name = lower(n.s);
+                const auto hit = std::find_if(std::begin(cap_names), std::end(cap_names),
+                                              [&](const cap_name& c) { return c.name == name; });
+                if (n.vars || hit == std::end(cap_names))
+                    out.over = false;
+                else
+                    out.limit |= hit->bits;
+            }
+            return done(a, k, id);
+        }
         return fail(line, "unknown test \"" + id + "\"");
     }
 
@@ -1095,14 +1386,32 @@ struct parser
                 return false;
             std::vector<cmd_node> block;
             bool has_block = false;
+            // The block of an ihave may use what it names; one naming what is not here is never run, nor read.
+            const bool ihave = (id == "if" || id == "elsif") && tests.size() == 1 && tests.front().k == tk::ihave;
             if (peek().t == tok::semi)
                 ++i;
+            else if (peek().t == tok::lbrace && ihave && !tests.front().over)
+            {
+                ++i;
+                for (int open = 1; open > 0; ++i)
+                {
+                    if (peek().t == tok::end)
+                        return fail(peek().line, "a block not closed by }");
+                    open += peek().t == tok::lbrace ? 1 : peek().t == tok::rbrace ? -1 : 0;
+                }
+                has_block = true;
+            }
             else if (peek().t == tok::lbrace)
             {
                 if (depth + 1 > max_depth)
                     return fail(peek().line, "nested deeper than 32");
                 ++i;
-                if (!parse_commands(block, depth + 1, false))
+                const uint32_t outside = caps;
+                if (ihave)
+                    caps |= static_cast<uint32_t>(tests.front().limit);
+                const bool parsed = parse_commands(block, depth + 1, false);
+                caps = outside;
+                if (!parsed)
                     return false;
                 if (peek().t != tok::rbrace)
                     return fail(peek().line, "a block not closed by }");
@@ -1274,9 +1583,11 @@ struct parser
                     uint64_t n = 0;
                     if (!num_arg(a, k, n, tl, ":" + tag))
                         return false;
-                    // A day at least and a year at most, as RFC 5230 lets a site bound them.
+                    // A day at least for :days and an hour for :seconds, a year at most, as RFC 5230 and 6131 let a
+                    // site bound them; an hour keeps a forged sender from drawing an answer to every message.
                     constexpr uint64_t year = 365ull * 86400;
-                    c.seconds = tag == "days" ? std::clamp<uint64_t>(n, 1, 365) * 86400 : std::min(n, year);
+                    c.seconds = tag == "days" ? std::clamp<uint64_t>(n, 1, 365) * 86400
+                                              : std::clamp<uint64_t>(n, 3600, year);
                 }
                 else if (tag == "subject")
                 {
@@ -1332,22 +1643,32 @@ struct parser
                                     : tag == "upperfirst"    ? m_upperfirst
                                     : tag == "quotewildcard" ? m_quotewildcard
                                     : tag == "length"        ? m_length
+                                    : tag == "quoteregex"    ? m_quoteregex
+                                    : tag == "encodeurl"     ? m_encodeurl
                                                              : 0;
                 if (!bit)
                     return unknown_tag(tag, tl, id);
+                if ((bit == m_quoteregex && !need(c_regex, tl, ":quoteregex", "regex")) ||
+                    (bit == m_encodeurl && !need(c_enotify, tl, ":encodeurl", "enotify")))
+                    return false;
                 // Two modifiers of one precedence cannot both apply.
                 uint8_t rival = bit;
                 if (bit & (m_lower | m_upper))
                     rival = m_lower | m_upper;
                 else if (bit & (m_lowerfirst | m_upperfirst))
                     rival = m_lowerfirst | m_upperfirst;
+                else if (bit & (m_quotewildcard | m_quoteregex))
+                    rival = m_quotewildcard | m_quoteregex;
                 if (c.mods & rival)
                     return fail(tl, "two modifiers of one precedence");
                 c.mods |= bit;
             }
             if (!str_arg(a, k, c.a, line, id) || !str_arg(a, k, c.b, line, id))
                 return false;
-            if (!valid_identifier(c.a.s))
+            // A global one is named in its namespace where include is required (RFC 6609 3.5).
+            const bool in_global = (caps & c_include) && lower(c.a.s).starts_with("global.") &&
+                                   valid_identifier(std::string_view(c.a.s).substr(7));
+            if (!valid_identifier(c.a.s) && !in_global)
                 return fail(line, "\"" + c.a.s + "\" is no variable name");
             c.a.s = lower(c.a.s);
             c.a.vars = false;
@@ -1370,6 +1691,173 @@ struct parser
                 c.has_var = true;
             }
             if (!list_arg(a, k, c.list, line, id))
+                return false;
+            return done(a, k, id);
+        }
+        if (id == "addheader")
+        {
+            c.k = ck::addheader;
+            if (!need(c_editheader, line, id, "editheader"))
+                return false;
+            while (k < a.size() && a[k].k == garg::kind::tag)
+            {
+                if (a[k].tag != "last")
+                    return unknown_tag(a[k].tag, a[k].line, id);
+                c.last = true;
+                ++k;
+            }
+            if (!str_arg(a, k, c.a, line, id) || !str_arg(a, k, c.b, line, id))
+                return false;
+            if (!c.a.vars && !field_name_ok(c.a.s))
+                return fail(line, "\"" + c.a.s + "\" is no header name");
+            return done(a, k, id);
+        }
+        if (id == "deleteheader")
+        {
+            c.k = ck::deleteheader;
+            if (!need(c_editheader, line, id, "editheader"))
+                return false;
+            uint8_t seen = 0;
+            while (k < a.size() && a[k].k == garg::kind::tag)
+            {
+                const std::string tag = a[k].tag;
+                const int tl = a[k].line;
+                ++k;
+                const int r = common(tag, a, k, tl, c.m, seen, nullptr);
+                if (r < 0)
+                    return false;
+                if (r > 0)
+                    continue;
+                if (tag == "index")
+                {
+                    uint64_t n = 0;
+                    if (c.index || !num_arg(a, k, n, tl, ":index") || n == 0 || n > 1000000)
+                        return fail(tl, ":index takes one number, counted from 1");
+                    c.index = static_cast<uint32_t>(n);
+                }
+                else if (tag == "last")
+                    c.last = true;
+                else
+                    return unknown_tag(tag, tl, id);
+            }
+            if (c.last && !c.index)
+                return fail(line, ":last needs :index");
+            if (!check_match(c.m, line) || !str_arg(a, k, c.a, line, id))
+                return false;
+            if (k < a.size())
+            {
+                if (!list_arg(a, k, c.list, line, id))
+                    return false;
+                c.has_flags = true;
+            }
+            if (!check_regex(c.m, c.list, line))
+                return false;
+            if (!c.a.vars && !field_name_ok(c.a.s))
+                return fail(line, "\"" + c.a.s + "\" is no header name");
+            return done(a, k, id);
+        }
+        if (id == "include")
+        {
+            c.k = ck::include;
+            if (!need(c_include, line, id, "include"))
+                return false;
+            bool located = false;
+            while (k < a.size() && a[k].k == garg::kind::tag)
+            {
+                const std::string& tag = a[k].tag;
+                const int tl = a[k].line;
+                ++k;
+                if ((tag == "personal" || tag == "global") && !located)
+                {
+                    located = true;
+                    c.global = tag == "global";
+                }
+                else if (tag == "once")
+                    c.once = true;
+                else if (tag == "optional")
+                    c.optional = true;
+                else
+                    return fail(tl, "include takes one of :personal and :global, and :once and :optional");
+            }
+            if (!str_arg(a, k, c.a, line, id))
+                return false;
+            if (c.a.vars || c.a.s.empty() || c.a.s.size() > 128 || c.a.s.find('/') != std::string::npos ||
+                c.a.s.front() == '.')
+                return fail(line, "include names a script as written, with no / in it");
+            return done(a, k, id);
+        }
+        if (id == "return")
+        {
+            c.k = ck::return_;
+            if (!need(c_include, line, id, "include"))
+                return false;
+            return done(a, 0, id);
+        }
+        if (id == "global")
+        {
+            c.k = ck::global;
+            if (!need(c_include, line, id, "include") || !need(c_variables, line, id, "variables") ||
+                !list_arg(a, k, c.list, line, id))
+                return false;
+            for (auto& v : c.list)
+            {
+                if (!valid_identifier(v.s))
+                    return fail(line, "\"" + v.s + "\" is no variable name");
+                v.s = lower(v.s);
+                v.vars = false;
+            }
+            return done(a, k, id);
+        }
+        if (id == "notify")
+        {
+            c.k = ck::notify;
+            if (!need(c_enotify, line, id, "enotify"))
+                return false;
+            while (k < a.size() && a[k].k == garg::kind::tag)
+            {
+                const std::string tag = a[k].tag;
+                const int tl = a[k].line;
+                ++k;
+                if (tag == "from" && !c.has_from)
+                {
+                    c.has_from = true;
+                    if (!str_arg(a, k, c.from, tl, ":from"))
+                        return false;
+                }
+                else if (tag == "importance" && !c.has_importance)
+                {
+                    c.has_importance = true;
+                    if (!str_arg(a, k, c.importance, tl, ":importance"))
+                        return false;
+                    if (!c.importance.vars && c.importance.s != "1" && c.importance.s != "2" && c.importance.s != "3")
+                        return fail(tl, ":importance is \"1\", \"2\" or \"3\"");
+                }
+                else if (tag == "options" && c.options.empty())
+                {
+                    if (!list_arg(a, k, c.options, tl, ":options"))
+                        return false;
+                }
+                else if (tag == "message" && !c.has_subject)
+                {
+                    c.has_subject = true;
+                    if (!str_arg(a, k, c.subject, tl, ":message"))
+                        return false;
+                }
+                else
+                    return fail(tl, "notify takes :from, :importance, :options and :message, each once");
+            }
+            if (!str_arg(a, k, c.a, line, id))
+                return false;
+            std::vector<std::string> to;
+            std::string subject, body;
+            if (!c.a.vars && !parse_mailto(c.a.s, to, subject, body))
+                return fail(line, "\"" + c.a.s + "\" is no mailto URI this server notifies by");
+            return done(a, k, id);
+        }
+        if (id == "error")
+        {
+            c.k = ck::error;
+            if (!need(c_ihave, line, id, "ihave") || !str_arg(a, k, c.a, line, id))
                 return false;
             return done(a, k, id);
         }
@@ -1709,9 +2197,10 @@ bool contains(std::string_view hay, std::string_view needle, cmp c)
         return true;
     if (c == cmp::octet)
         return hay.find(needle) != std::string_view::npos;
+    // Boyer-Moore with its good-suffix rule, which finds the first match in time linear in both.
     const auto eq = [](char x, char y) { return socketley::ascii::lower(x) == socketley::ascii::lower(y); };
     const auto hash = [](char x) { return std::hash<char>{}(socketley::ascii::lower(x)); };
-    const std::boyer_moore_horspool_searcher<std::string_view::const_iterator, decltype(hash), decltype(eq)> s(
+    const std::boyer_moore_searcher<std::string_view::const_iterator, decltype(hash), decltype(eq)> s(
         needle.begin(), needle.end(), hash, eq);
     return std::search(hay.begin(), hay.end(), s) != hay.end();
 }
@@ -1723,25 +2212,39 @@ struct glob_tok
     uint8_t k;
 };
 
-// Whether `s` matches the wildcard pattern `pat`, with one backtrack point on the last star so a pattern costs at
-// most its length times the string's; `work` counts the steps and gives up past `budget`.
-bool glob(std::string_view pat, std::string_view s, bool fold, std::vector<std::pair<size_t, size_t>>* caps,
-          uint64_t& work, uint64_t budget)
+// A wildcard pattern read once: its tokens, and each wildcard's place among the captures.
+struct glob_pat
 {
     std::vector<glob_tok> p;
     std::vector<uint32_t> wild;
-    p.reserve(pat.size());
-    wild.reserve(pat.size());
-    uint32_t nwild = 0;
+    uint32_t nwild{0};
+};
+
+glob_pat glob_compile(std::string_view pat)
+{
+    glob_pat g;
+    g.p.reserve(pat.size());
+    g.wild.reserve(pat.size());
     for (size_t i = 0; i < pat.size(); ++i)
     {
         const char c = pat[i];
         if (c == '\\' && i + 1 < pat.size())
-            p.push_back({pat[++i], 0});
+            g.p.push_back({pat[++i], 0});
         else
-            p.push_back({c, static_cast<uint8_t>(c == '*' ? 1 : c == '?' ? 2 : 0)});
-        wild.push_back(p.back().k ? nwild++ : 0);
+            g.p.push_back({c, static_cast<uint8_t>(c == '*' ? 1 : c == '?' ? 2 : 0)});
+        g.wild.push_back(g.p.back().k ? g.nwild++ : 0);
     }
+    return g;
+}
+
+// Whether `s` matches the wildcard pattern `g`, with one backtrack point on the last star so a pattern costs at
+// most its length times the string's; `work` counts the steps and gives up past `budget`.
+bool glob(const glob_pat& g, std::string_view s, bool fold, std::vector<std::pair<size_t, size_t>>* caps,
+          uint64_t& work, uint64_t budget)
+{
+    const std::vector<glob_tok>& p = g.p;
+    const std::vector<uint32_t>& wild = g.wild;
+    const uint32_t nwild = g.nwild;
     if (caps)
         caps->assign(nwild, {0, 0});
     const auto step = [&](size_t at) { return fold ? utf8_len(s, at) : size_t{1}; };
@@ -1810,6 +2313,9 @@ struct script::program
 {
     std::vector<cmd_node> top;
     uint32_t caps{0};
+    // The root's alone: every script it includes, at the index an include names, and how each was asked for.
+    std::vector<std::unique_ptr<program>> subs;
+    std::vector<std::pair<bool, std::string>> included;
 };
 
 namespace
@@ -1817,9 +2323,11 @@ namespace
 
 struct runner
 {
-    runner(const script::program& prog, const message& msg, const context& ctx) : p(prog), m(msg), c(ctx) {}
+    runner(const script::program& prog, const message& msg, const context& ctx) : p(prog), cur(&prog), m(msg), c(ctx) {}
 
     const script::program& p;
+    // The script being run, the root or one it included, whose require decides what its strings mean.
+    const script::program* cur;
     const message& m;
     const context& c;
     std::vector<action> actions;
@@ -1831,6 +2339,18 @@ struct runner
     std::vector<std::pair<std::string, std::string>> vars;
     std::array<std::string, max_match_vars> mv;
     size_t mv_count{0};
+    // Variables every included script shares, and the names the running one declared global.
+    std::vector<std::pair<std::string, std::string>> globals;
+    std::vector<std::string> global_names;
+    std::vector<int> once;
+    int include_depth{0};
+    bool returning{false};
+    // What editheader changed: the names and values it wrote, kept here as the header list points into them.
+    bool edited{false};
+    size_t added{0};
+    std::deque<std::string> owned;
+    std::vector<std::pair<std::string, uint32_t>> seen_ids;
+    std::unordered_map<std::string, std::unique_ptr<posix_regex>> regexes;
 
     bool headers_read{false};
     std::vector<std::pair<std::string_view, std::string_view>> headers;
@@ -1840,6 +2360,10 @@ struct runner
     mime::part root;
     bool text_read{false};
     std::vector<std::string> texts;
+    // The parts body :content took, by the types it named.
+    std::vector<std::pair<std::string, std::vector<std::string>>> contents;
+    std::unordered_map<std::string, glob_pat> globs;
+    std::vector<std::pair<size_t, size_t>> caps;
 
     bool fail(int line, std::string_view why)
     {
@@ -1860,16 +2384,30 @@ struct runner
 
     // ── variables ──
 
-    const std::string* variable(std::string_view name) const
+    // Where `name` lives: the shared variables for global.x or a name this script declared global, its own otherwise.
+    std::vector<std::pair<std::string, std::string>>& space(std::string_view& name)
     {
-        for (const auto& [k, v] : vars)
+        if (name.size() > 7 && socketley::ascii::iequals(name.substr(0, 7), "global."))
+        {
+            name.remove_prefix(7);
+            return globals;
+        }
+        for (const auto& g : global_names)
+            if (socketley::ascii::iequals(g, name))
+                return globals;
+        return vars;
+    }
+
+    const std::string* variable(std::string_view name)
+    {
+        for (const auto& [k, v] : space(name))
             if (socketley::ascii::iequals(k, name))
                 return &v;
         return nullptr;
     }
 
     // What ${name} stands for, or nothing where it is no reference and stays as written.
-    std::optional<std::string_view> reference(std::string_view name) const
+    std::optional<std::string_view> reference(std::string_view name)
     {
         if (!name.empty() && std::all_of(name.begin(), name.end(), is_digit))
         {
@@ -1882,7 +2420,10 @@ struct runner
             }
             return n < mv_count ? std::string_view(mv[n]) : std::string_view{};
         }
-        if (!valid_identifier(name))
+        const bool in_global = (cur->caps & c_include) && name.size() > 7 &&
+                               socketley::ascii::iequals(name.substr(0, 7), "global.") &&
+                               valid_identifier(name.substr(7));
+        if (!valid_identifier(name) && !in_global)
             return std::nullopt;
         const std::string* v = variable(name);
         return v ? std::string_view(*v) : std::string_view{};
@@ -1953,15 +2494,16 @@ struct runner
     bool set_variable(std::string_view name, std::string value, int line)
     {
         clip(value, max_var_len);
-        for (auto& [k, v] : vars)
-            if (k == name)
+        auto& in = space(name);
+        for (auto& [k, v] : in)
+            if (socketley::ascii::iequals(k, name))
             {
                 v = std::move(value);
                 return true;
             }
-        if (vars.size() >= max_vars)
+        if (in.size() >= max_vars)
             return fail(line, "more than 128 variables");
-        vars.emplace_back(std::string(name), std::move(value));
+        in.emplace_back(std::string(name), std::move(value));
         return true;
     }
 
@@ -2006,7 +2548,7 @@ struct runner
     bool scan(int line)
     {
         read_headers();
-        return step(line, 1 + headers.size() / 32);
+        return step(line, 1 + headers.size());
     }
 
     // The index of the first header named `name`, the count of headers where there is none.
@@ -2028,6 +2570,25 @@ struct runner
     }
 
     bool has_header(std::string_view name, int line) { return first_index(name, line) < headers.size(); }
+
+    // The places of the headers named `name`, cut to the one :index names where the test gives it.
+    std::vector<size_t> occurrences(std::string_view name, const test_node& t)
+    {
+        std::vector<size_t> out;
+        if (!scan(t.line))
+            return out;
+        for (size_t i = 0; i < headers.size(); ++i)
+            if (named(i, name))
+                out.push_back(i);
+        if (t.index)
+        {
+            if (t.index > out.size())
+                return {};
+            const size_t at = t.last ? out.size() - t.index : t.index - 1;
+            return {out[at]};
+        }
+        return out;
+    }
 
     void addresses_of(std::string_view name, std::vector<parsed_address>& out, int line)
     {
@@ -2100,18 +2661,65 @@ struct runner
         {
             case mtype::is: return compare3(value, key, mt.c) == 0;
             case mtype::contains:
-                if (!step(line, value.size() / bytes_per_step))
+                if (!step(line, (value.size() + key.size()) / bytes_per_step))
                     return false;
                 return contains(value, key, mt.c);
             case mtype::value: return relate(compare3(value, key, mt.c), mt.r);
             case mtype::count: return false;
+            case mtype::regex:
+            {
+                if (!step(line, 1 + value.size() * (1 + key.size() / 16) / bytes_per_step))
+                    return false;
+                const bool fold = mt.c != cmp::octet;
+                const std::string id = std::string(fold ? "i" : "o") + std::string(key);
+                auto it = regexes.find(id);
+                if (it == regexes.end())
+                {
+                    std::string why;
+                    if (!regex_ok(key, fold, why))
+                        return fail(line, "the regular expression \"" + std::string(key) + "\" " + why);
+                    if (regexes.size() >= 64)
+                        regexes.clear();
+                    it = regexes.emplace(id, std::make_unique<posix_regex>(std::string(key), fold)).first;
+                }
+                std::array<regmatch_t, max_match_vars> mm{};
+                mm[0].rm_so = 0;
+                mm[0].rm_eo = static_cast<regoff_t>(value.size());
+                // The value is matched as the bytes it is, a NUL in it no end of it.
+                if (::regexec(&it->second->r, value.data(), mm.size(), mm.data(), REG_STARTEND) != 0)
+                    return false;
+                if (cur->caps & c_variables)
+                {
+                    mv_count = 0;
+                    for (size_t k = 0; k < mm.size(); ++k)
+                    {
+                        if (mm[k].rm_so < 0)
+                        {
+                            mv[k].clear();
+                            continue;
+                        }
+                        mv[k] = std::string(value.substr(static_cast<size_t>(mm[k].rm_so),
+                                                         static_cast<size_t>(mm[k].rm_eo - mm[k].rm_so)));
+                        clip(mv[k], max_var_len);
+                        mv_count = k + 1;
+                    }
+                }
+                return true;
+            }
             case mtype::matches:
             {
-                const bool want = (p.caps & c_variables) != 0;
-                std::vector<std::pair<size_t, size_t>> caps;
+                const bool want = (cur->caps & c_variables) != 0;
                 uint64_t work = 0;
                 const uint64_t budget = (max_steps - std::min(steps, max_steps)) * glob_per_step;
-                const bool hit = glob(key, value, mt.c != cmp::octet, want ? &caps : nullptr, work, budget);
+                // Each pattern is read once a run, however many values it is matched against.
+                auto it = globs.find(std::string(key));
+                if (it == globs.end())
+                {
+                    if (globs.size() >= 256)
+                        globs.clear();
+                    it = globs.emplace(std::string(key), glob_compile(key)).first;
+                }
+                const bool hit = glob(it->second, value, mt.c != cmp::octet, want ? &caps : nullptr, work, budget);
                 if (!step(line, work / glob_per_step))
                     return false;
                 if (work > budget)
@@ -2203,13 +2811,10 @@ struct runner
                     return false;
                 std::vector<std::string_view> values;
                 for (const auto name : names.v)
-                {
-                    if (!scan(t.line))
-                        return false;
-                    for (size_t i = 0; i < headers.size(); ++i)
-                        if (named(i, name))
-                            values.push_back(header_text(i));
-                }
+                    for (const size_t i : occurrences(name, t))
+                        values.push_back(header_text(i));
+                if (!ok())
+                    return false;
                 return compare(values, keys, t.m, t.line);
             }
             case tk::exists:
@@ -2266,8 +2871,102 @@ struct runner
                         return false;
                 return true;
             }
+            case tk::environment:
+            {
+                std::string s;
+                const std::string name = lower(expand(t.a.front(), s, t.line));
+                xlist keys;
+                if (!ok() || !expand_list(t.keys, keys, t.line))
+                    return false;
+                // The items RFC 5183 names; one this server does not know makes the test false.
+                std::string value;
+                if (name == "domain")
+                    value = c.domain;
+                else if (name == "host")
+                    value = c.host;
+                else if (name == "location")
+                    value = "MDA";
+                else if (name == "name")
+                    value = "socketley";
+                else if (name == "phase")
+                    value = "during";
+                else if (name == "remote-host")
+                    value = c.remote_host;
+                else if (name == "remote-ip")
+                    value = c.remote_ip;
+                else if (name == "version")
+                    value = "1.0";
+                else
+                    return false;
+                return compare({value}, keys, t.m, t.line);
+            }
+            case tk::duplicate: return duplicate_test(t);
+            case tk::spamtest:
+            case tk::virustest:
+            {
+                xlist keys;
+                if (!expand_list(t.keys, keys, t.line))
+                    return false;
+                const int v = t.k == tk::virustest ? c.virus : !t.percent ? c.spam : c.spam ? c.spam_percent : 0;
+                return compare({std::to_string(v)}, keys, t.m, t.line);
+            }
+            case tk::valid_notify_method:
+            {
+                xlist uris;
+                if (!expand_list(t.a, uris, t.line))
+                    return false;
+                std::vector<std::string> to;
+                std::string subject, body;
+                for (const auto u : uris.v)
+                    if (!parse_mailto(u, to, subject, body))
+                        return false;
+                return !uris.v.empty();
+            }
+            case tk::notify_method_capability:
+            {
+                std::string s1, s2;
+                const std::string uri(expand(t.a[0], s1, t.line));
+                const std::string capability = lower(expand(t.a[1], s2, t.line));
+                xlist keys;
+                if (!ok() || !expand_list(t.keys, keys, t.line))
+                    return false;
+                std::vector<std::string> to;
+                std::string subject, body;
+                // Mail may be read at once or never: whether its reader is online is "maybe" (RFC 5436 2.6).
+                if (!parse_mailto(uri, to, subject, body) || capability != "online")
+                    return false;
+                return compare({std::string("maybe")}, keys, t.m, t.line);
+            }
+            case tk::ihave: return t.over;
         }
         return false;
+    }
+
+    bool duplicate_test(const test_node& t)
+    {
+        std::string hs, is;
+        const std::string handle(expand(t.part, hs, t.line));
+        std::string id;
+        if (t.by_id)
+            id = std::string(expand(t.zone, is, t.line));
+        else
+        {
+            const std::string name = t.by_header ? std::string(expand(t.zone, is, t.line)) : "Message-ID";
+            const size_t i = first_index(name, t.line);
+            if (i < headers.size())
+                id = unfolded(headers[i].second);
+        }
+        // A message without the ID is no duplicate, and nothing is kept of it (RFC 7352 3).
+        if (!ok() || id.empty())
+            return false;
+        std::string key = handle;
+        key += '\0';
+        key += id;
+        const bool dup = c.seen && c.seen(key);
+        const auto held = std::find_if(seen_ids.begin(), seen_ids.end(), [&](const auto& s) { return s.first == key; });
+        if ((!dup || t.last) && held == seen_ids.end())
+            seen_ids.emplace_back(std::move(key), static_cast<uint32_t>(t.limit));
+        return dup;
     }
 
     bool address_test(const test_node& t)
@@ -2313,7 +3012,12 @@ struct runner
                 continue;
             }
             std::vector<parsed_address> list;
-            addresses_of(name, list, t.line);
+            for (const size_t i : occurrences(name, t))
+            {
+                if (!step(t.line, headers[i].second.size() / bytes_per_step))
+                    return false;
+                parse_addresses(unfolded(headers[i].second), list);
+            }
             if (!ok() || !step(t.line, list.size()))
                 return false;
             for (const auto& a : list)
@@ -2351,6 +3055,14 @@ struct runner
             xlist types;
             if (!expand_list(t.types, types, t.line))
                 return false;
+            std::string named_types;
+            for (const auto ty : types.v)
+                named_types.append(ty).push_back('\0');
+            const auto held = std::find_if(contents.begin(), contents.end(),
+                                           [&](const auto& c) { return c.first == named_types; });
+            if (held != contents.end())
+                return compare(std::vector<std::string_view>(held->second.begin(), held->second.end()), keys, t.m,
+                               t.line);
             read_mime();
             const auto want = [&](const mime::part& q) {
                 for (const auto ty : types.v)
@@ -2365,7 +3077,10 @@ struct runner
                 return false;
             };
             collect(root, want, parts, t.line);
-            values.assign(parts.begin(), parts.end());
+            if (!ok())
+                return false;
+            contents.emplace_back(std::move(named_types), std::move(parts));
+            values.assign(contents.back().second.begin(), contents.back().second.end());
         }
         if (!ok())
             return false;
@@ -2381,7 +3096,7 @@ struct runner
         const std::string_view part = expand(t.part, part_s, t.line);
         int zone = c.zone_min;
         if (t.zone_set && !parse_zone(expand(t.zone, zone_s, t.line), zone))
-            return false;
+            return fail(t.line, "a zone is written +hhmm or -hhmm");
         if (!ok())
             return false;
         int64_t when = c.now_s;
@@ -2390,9 +3105,9 @@ struct runner
             const std::string_view name = expand(t.a.front(), name_s, t.line);
             if (!ok())
                 return false;
-            const size_t idx = first_index(name, t.line);
+            const std::vector<size_t> at = occurrences(name, t);
             int original = 0;
-            if (idx == headers.size() || !mime::parse_date(header_text(idx), when, original))
+            if (at.empty() || !mime::parse_date(header_text(at.front()), when, original))
                 return false;
             if (t.original_zone)
                 zone = original;
@@ -2477,7 +3192,7 @@ struct runner
     {
         for (const auto& k : cmds)
         {
-            if (stopped || !ok())
+            if (stopped || returning || !ok())
                 return;
             command(k);
         }
@@ -2630,14 +3345,34 @@ struct runner
                         ch = k.mods & m_lower ? socketley::ascii::lower(ch) : socketley::ascii::upper(ch);
                 if ((k.mods & (m_lowerfirst | m_upperfirst)) && !v.empty())
                     v[0] = k.mods & m_lowerfirst ? socketley::ascii::lower(v[0]) : socketley::ascii::upper(v[0]);
-                if (k.mods & m_quotewildcard)
+                if (k.mods & (m_quotewildcard | m_quoteregex))
                 {
+                    const std::string_view special = k.mods & m_quotewildcard ? "*?\\" : "\\^$.[]|()*+?{}";
                     std::string q;
                     for (const char ch : v)
                     {
-                        if (ch == '*' || ch == '?' || ch == '\\')
+                        if (special.find(ch) != std::string_view::npos)
                             q += '\\';
                         q += ch;
+                    }
+                    v = std::move(q);
+                }
+                if (k.mods & m_encodeurl)
+                {
+                    // Every byte but RFC 3986's unreserved ones as %XX (RFC 5435 4.1).
+                    static constexpr char hex[] = "0123456789ABCDEF";
+                    std::string q;
+                    for (const char ch : v)
+                    {
+                        const auto u = static_cast<unsigned char>(ch);
+                        if (is_alpha(ch) || is_digit(ch) || ch == '-' || ch == '.' || ch == '_' || ch == '~')
+                            q += ch;
+                        else
+                        {
+                            q += '%';
+                            q += hex[u >> 4];
+                            q += hex[u & 15];
+                        }
                     }
                     v = std::move(q);
                 }
@@ -2678,7 +3413,205 @@ struct runner
                     flags = std::move(target);
                 return;
             }
+            case ck::addheader: add_header(k); return;
+            case ck::deleteheader: delete_header(k); return;
+            case ck::include: include(k); return;
+            case ck::return_: returning = true; return;
+            case ck::global:
+                for (const auto& v : k.list)
+                    if (std::none_of(global_names.begin(), global_names.end(),
+                                     [&](const std::string& g) { return g == v.s; }))
+                        global_names.push_back(v.s);
+                return;
+            case ck::notify: notify(k); return;
+            case ck::error:
+            {
+                const std::string_view why = expand(k.a, s1, k.line);
+                if (ok())
+                    fail(k.line, "the script ended in error: " + std::string(why));
+                return;
+            }
         }
+    }
+
+    // ── editheader ──
+
+    // Headers a script may neither add nor take away, as RFC 5293 7 asks of the trace and of a loop's guard.
+    static bool kept_header(std::string_view name)
+    {
+        return socketley::ascii::iequals(name, "Received") || socketley::ascii::iequals(name, "Auto-Submitted");
+    }
+
+    void add_header(const cmd_node& k)
+    {
+        std::string s1, s2;
+        const std::string name(expand(k.a, s1, k.line));
+        std::string value(expand(k.b, s2, k.line));
+        if (!ok())
+            return;
+        if (!field_name_ok(name))
+        {
+            fail(k.line, "\"" + name + "\" is no header name");
+            return;
+        }
+        if (kept_header(name))
+            return;
+        if (added >= max_added_headers)
+        {
+            fail(k.line, "more than 64 headers added");
+            return;
+        }
+        for (char& ch : value)
+            if (ch == '\r' || ch == '\n')
+                ch = ' ';
+        clip(value, 4096);
+        read_headers();
+        const std::string& n = owned.emplace_back(name);
+        const std::string& v = owned.emplace_back(" " + encode_header_value(name, value));
+        const size_t at = k.last ? headers.size() : 0;
+        headers.insert(headers.begin() + static_cast<ptrdiff_t>(at), {n, v});
+        decoded.insert(decoded.begin() + static_cast<ptrdiff_t>(at), std::string());
+        have_decoded.insert(have_decoded.begin() + static_cast<ptrdiff_t>(at), 0);
+        edited = true;
+        ++added;
+    }
+
+    void delete_header(const cmd_node& k)
+    {
+        std::string s1;
+        const std::string name(expand(k.a, s1, k.line));
+        xlist patterns;
+        if (!ok() || (k.has_flags && !expand_list(k.list, patterns, k.line)) || kept_header(name))
+            return;
+        test_node where;
+        where.line = k.line;
+        where.index = k.index;
+        where.last = k.last;
+        std::vector<size_t> at = occurrences(name, where);
+        // The last first, so each erase leaves the places still to erase where they were.
+        for (auto it = at.rbegin(); it != at.rend() && ok(); ++it)
+        {
+            const size_t i = *it;
+            if (k.has_flags && !compare({header_text(i)}, patterns, k.m, k.line))
+                continue;
+            headers.erase(headers.begin() + static_cast<ptrdiff_t>(i));
+            decoded.erase(decoded.begin() + static_cast<ptrdiff_t>(i));
+            have_decoded.erase(have_decoded.begin() + static_cast<ptrdiff_t>(i));
+            edited = true;
+        }
+    }
+
+    // The header block as editheader left it, its blank line ending it.
+    std::string header_block_now() const
+    {
+        std::string out;
+        for (const auto& [n, v] : headers)
+            out.append(n).append(":").append(v).append("\r\n");
+        return out + "\r\n";
+    }
+
+    // ── include ──
+
+    void include(const cmd_node& k)
+    {
+        const script::program* sub = k.sub >= 0 && static_cast<size_t>(k.sub) < p.subs.size()
+                                         ? p.subs[static_cast<size_t>(k.sub)].get()
+                                         : nullptr;
+        if (!sub)
+        {
+            if (!k.optional)
+                fail(k.line, "include of \"" + k.a.s + "\", which is not there");
+            return;
+        }
+        // :once includes a script no other include ran already in this run (RFC 6609 3.2).
+        const bool ran = std::find(once.begin(), once.end(), k.sub) != once.end();
+        if (k.once && ran)
+            return;
+        if (!ran)
+            once.push_back(k.sub);
+        if (include_depth >= max_include_depth)
+        {
+            fail(k.line, "includes nested deeper than 10");
+            return;
+        }
+        // Its own variables and match variables, the global ones shared and the flags and actions every script's.
+        auto saved_vars = std::move(vars);
+        auto saved_names = std::move(global_names);
+        auto saved_mv = mv;
+        const size_t saved_count = mv_count;
+        const script::program* saved_cur = cur;
+        vars.clear();
+        global_names.clear();
+        mv_count = 0;
+        cur = sub;
+        ++include_depth;
+        block(sub->top);
+        --include_depth;
+        returning = false;
+        cur = saved_cur;
+        vars = std::move(saved_vars);
+        global_names = std::move(saved_names);
+        mv = std::move(saved_mv);
+        mv_count = saved_count;
+    }
+
+    // ── enotify ──
+
+    void notify(const cmd_node& k)
+    {
+        std::string s1, s2, s3, s4;
+        const std::string method(expand(k.a, s1, k.line));
+        if (!ok())
+            return;
+        std::vector<std::string> to;
+        std::string subject, body;
+        if (!parse_mailto(method, to, subject, body))
+        {
+            fail(k.line, "\"" + method + "\" is no mailto URI this server notifies by");
+            return;
+        }
+        // Nothing is told of a message sent by a machine, so two of them cannot answer each other (RFC 5436 2.7).
+        if (!scan(k.line))
+            return;
+        for (size_t i = 0; i < headers.size(); ++i)
+            if (named(i, "Auto-Submitted"))
+            {
+                const std::string v(header_text(i));
+                if (lower(trim(v.substr(0, v.find_first_of(";(")))) != "no")
+                    return;
+            }
+        size_t notifies = 0;
+        for (const auto& a : actions)
+            if (a.k == action::kind::notify)
+            {
+                if (a.n && a.n->method == method)
+                    return;
+                ++notifies;
+            }
+        if (notifies >= max_notifies)
+            return;
+        notification n;
+        n.method = method;
+        if (k.has_from)
+        {
+            address from;
+            if (parse_mailbox(expand(k.from, s2, k.line), from) && !from.domain.empty())
+                n.from = from.text();
+        }
+        n.importance = k.has_importance ? std::string(expand(k.importance, s3, k.line)) : "2";
+        if (n.importance != "1" && n.importance != "3")
+            n.importance = "2";
+        if (k.has_subject)
+            n.message = std::string(expand(k.subject, s4, k.line));
+        xlist opts;
+        if (!ok() || !expand_list(k.options, opts, k.line))
+            return;
+        n.options.assign(opts.v.begin(), opts.v.end());
+        action a;
+        a.k = action::kind::notify;
+        a.arg = method;
+        a.n = std::move(n);
+        actions.push_back(std::move(a));
     }
 
     bool own_address(std::string_view a, const std::vector<std::string>& extra) const
@@ -2700,10 +3633,16 @@ struct runner
             return false;
         if (own_address(from, extra))
             return false;
-        const std::string submitted = first_header("Auto-Submitted", line);
-        if (has_header("Auto-Submitted", line) &&
-            lower(trim(submitted.substr(0, submitted.find_first_of(";(")))) != "no")
+        // Any Auto-Submitted but "no" is an automatic message, whichever of several says it (RFC 3834 5).
+        if (!scan(line))
             return false;
+        for (size_t i = 0; i < headers.size(); ++i)
+            if (named(i, "Auto-Submitted"))
+            {
+                const std::string submitted(header_text(i));
+                if (lower(trim(submitted.substr(0, submitted.find_first_of(";(")))) != "no")
+                    return false;
+            }
         if (has_header("List-Id", line) || has_header("List-Unsubscribe", line))
             return false;
         const std::string precedence = lower(first_header("Precedence", line));
@@ -2739,7 +3678,19 @@ struct runner
         if (k.has_subject)
             v.subject = std::string(expand(k.subject, s, k.line));
         if (k.has_from)
-            v.from = std::string(expand(k.from, s, k.line));
+        {
+            // An address it can be, or none: what goes into the answer's From is a mailbox and no more.
+            const std::string_view f = expand(k.from, s, k.line);
+            address parsed;
+            std::string display;
+            if (parse_mailbox(f, parsed, &display) && !parsed.domain.empty())
+            {
+                const bool plain = !display.empty() && std::all_of(display.begin(), display.end(), [](char ch) {
+                    return ch >= 0x20 && ch < 0x7f && ch != '"' && ch != '\\';
+                });
+                v.from = plain ? "\"" + display + "\" <" + parsed.text() + ">" : parsed.text();
+            }
+        }
         if (k.has_handle)
             v.handle = std::string(expand(k.handle, s, k.line));
         xlist addrs;
@@ -2773,34 +3724,120 @@ struct runner
 
 }   // namespace
 
-script::script() : p_(std::make_unique<program>()) {}
-script::~script() = default;
-
-std::shared_ptr<const script> script::compile(std::string_view text, std::string& err)
+namespace
 {
-    err.clear();
+
+// One script's text read into `out`, its includes not yet looked for.
+bool parse_into(script::program& out, std::string_view text, std::string& err)
+{
     if (text.size() > max_script)
     {
         err = "line 1: the script is larger than 64 KiB";
-        return nullptr;
+        return false;
     }
+    std::vector<token> toks;
+    if (!lex(text, toks, err))
+        return false;
+    parser ps{toks, err};
+    if (!ps.parse_commands(out.top, 0, true))
+        return false;
+    if (ps.peek().t != tok::end)
+        return ps.fail(ps.peek().line, "a } that closes no block");
+    if (!ps.check_conflicts(out.top))
+        return false;
+    out.caps = ps.caps;
+    return true;
+}
+
+void each_command(std::vector<cmd_node>& cmds, const std::function<void(cmd_node&)>& fn)
+{
+    for (auto& c : cmds)
+    {
+        fn(c);
+        for (auto& b : c.blocks)
+            each_command(b, fn);
+    }
+}
+
+// The scripts `prog` includes compiled into the root's table, each once, a script that includes itself refused.
+bool resolve(script::program& root, script::program& prog, const loader& load,
+             std::vector<std::pair<bool, std::string>>& stack, std::string& err)
+{
+    if (stack.size() > static_cast<size_t>(max_include_depth))
+    {
+        err = "includes nested deeper than 10";
+        return false;
+    }
+    bool good = true;
+    each_command(prog.top, [&](cmd_node& c) {
+        if (!good || c.k != ck::include)
+            return;
+        const std::pair<bool, std::string> key{c.global, c.a.s};
+        if (std::find(stack.begin(), stack.end(), key) != stack.end())
+        {
+            err = at_line(c.line, "\"" + c.a.s + "\" includes itself");
+            good = false;
+            return;
+        }
+        const auto it = std::find(root.included.begin(), root.included.end(), key);
+        if (it != root.included.end())
+        {
+            c.sub = static_cast<int>(it - root.included.begin());
+            return;
+        }
+        if (root.included.size() >= max_includes)
+        {
+            err = at_line(c.line, "more than 32 scripts included");
+            good = false;
+            return;
+        }
+        c.sub = static_cast<int>(root.included.size());
+        root.included.push_back(key);
+        std::string text;
+        // One not there fails the run that reaches it, unless :optional, as RFC 6609 3.2 lets it come later.
+        if (!load || !load(key.first, key.second, text))
+        {
+            root.subs.emplace_back();
+            return;
+        }
+        auto sub = std::make_unique<script::program>();
+        std::string why;
+        if (!parse_into(*sub, text, why))
+        {
+            err = at_line(c.line, "in \"" + key.second + "\", " + why);
+            good = false;
+            return;
+        }
+        script::program& made = *sub;
+        root.subs.push_back(std::move(sub));
+        stack.push_back(key);
+        good = resolve(root, made, load, stack, err);
+        stack.pop_back();
+    });
+    return good;
+}
+
+}   // namespace
+
+script::script() : p_(std::make_unique<program>()) {}
+script::~script() = default;
+
+const std::vector<std::pair<bool, std::string>>& script::included() const
+{
+    return p_->included;
+}
+
+std::shared_ptr<const script> script::compile(std::string_view text, std::string& err, const loader& load)
+{
+    err.clear();
     try
     {
-        std::vector<token> toks;
-        if (!lex(text, toks, err))
-            return nullptr;
         std::shared_ptr<script> s(new script());
-        parser ps{toks, err};
-        if (!ps.parse_commands(s->p_->top, 0, true))
+        if (!parse_into(*s->p_, text, err))
             return nullptr;
-        if (ps.peek().t != tok::end)
-        {
-            ps.fail(ps.peek().line, "a } that closes no block");
+        std::vector<std::pair<bool, std::string>> stack;
+        if (!resolve(*s->p_, *s->p_, load, stack, err))
             return nullptr;
-        }
-        if (!ps.check_conflicts(s->p_->top))
-            return nullptr;
-        s->p_->caps = ps.caps;
         return s;
     }
     catch (const std::exception&)
@@ -2819,6 +3856,9 @@ outcome script::run(const message& m, const context& c) const
         r.block(p_->top);
         if (r.ok())
         {
+            if (r.edited)
+                out.header = r.header_block_now();
+            out.seen = std::move(r.seen_ids);
             out.actions = std::move(r.actions);
             if (r.implicit_keep)
             {
@@ -2843,7 +3883,49 @@ outcome script::run(const message& m, const context& c) const
 std::string_view extensions()
 {
     return "fileinto reject ereject envelope encoded-character imap4flags copy vacation vacation-seconds subaddress "
-           "body relational comparator-i;ascii-numeric variables date mailbox";
+           "body relational comparator-i;ascii-numeric variables date index mailbox regex editheader duplicate "
+           "include environment spamtest spamtestplus virustest enotify ihave";
+}
+
+bool parse_mailto(std::string_view uri, std::vector<std::string>& to, std::string& subject, std::string& body)
+{
+    to.clear();
+    if (uri.size() < 7 || !socketley::ascii::iequals(uri.substr(0, 7), "mailto:"))
+        return false;
+    uri.remove_prefix(7);
+    const size_t q = uri.find('?');
+    const auto add = [&](std::string_view list) {
+        while (!list.empty())
+        {
+            const size_t comma = list.find(',');
+            const std::string one = percent_decoded(list.substr(0, comma));
+            list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+            address a;
+            if (!parse_mailbox(one, a) || a.domain.empty() || to.size() >= 10)
+                return false;
+            to.push_back(a.text());
+        }
+        return true;
+    };
+    if (!add(uri.substr(0, q)))
+        return false;
+    for (std::string_view rest = q == std::string_view::npos ? std::string_view{} : uri.substr(q + 1); !rest.empty();)
+    {
+        const size_t amp = rest.find('&');
+        const std::string_view pair = rest.substr(0, amp);
+        rest = amp == std::string_view::npos ? std::string_view{} : rest.substr(amp + 1);
+        const size_t eq = pair.find('=');
+        const std::string name = lower(percent_decoded(pair.substr(0, eq)));
+        const std::string_view value = eq == std::string_view::npos ? std::string_view{} : pair.substr(eq + 1);
+        // Only the recipients, the subject and the body are taken; a header such as From is not the URI's to set.
+        if ((name == "to" || name == "cc") && !add(value))
+            return false;
+        if (name == "subject")
+            subject = percent_decoded(value);
+        else if (name == "body")
+            body = percent_decoded(value);
+    }
+    return !to.empty();
 }
 
 }   // namespace socketley::mail::sieve

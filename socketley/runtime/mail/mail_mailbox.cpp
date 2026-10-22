@@ -50,6 +50,8 @@ struct mailboxes::writing
     uint64_t total{0};
     std::string stream;
     std::string from, subject;
+    // The header block a filter's editheader left, written in place of the message's own.
+    std::string header;
     std::function<void(int, std::string)> done;
     bool retried{false};
 };
@@ -222,10 +224,11 @@ uint8_t flags_of_key(std::string_view key)
 }
 
 void mailboxes::deliver(const entry_ptr& e, const std::string& user, const std::string& folder, std::string head,
-                        std::function<void(int, std::string)> done, uint8_t flags)
+                        std::function<void(int, std::string)> done, uint8_t flags, std::string header)
 {
     auto w = std::make_shared<writing>();
     w->e = e;
+    w->header = std::move(header);
     w->key = user + "/" + folder + "/" + e->id + key_flags(flags) + ".eml";
     w->head = std::move(head);
     w->done = std::move(done);
@@ -248,9 +251,11 @@ void mailboxes::deliver(const entry_ptr& e, const std::string& user, const std::
             const std::string_view block = header_block(chunk);
             const bool whole_head = block.size() < chunk.size() || chunk.size() == w->e->body_len;
             std::string kept;
+            // The headers kept are the edited ones where a filter changed them, the body following the original's.
+            const std::string_view source = whole_head && !w->header.empty() ? std::string_view(w->header) : block;
             if (whole_head)
             {
-                for (const auto& [name, value] : split_headers(block))
+                for (const auto& [name, value] : split_headers(source))
                 {
                     // The authserv-id comes after any comments and folding, and may be quoted (RFC 8601 2.2).
                     std::string_view v = value;
@@ -279,11 +284,11 @@ void mailboxes::deliver(const entry_ptr& e, const std::string& user, const std::
                         continue;
                     kept.append(name.data(), name.size()).append(":").append(value.data(), value.size()).append("\r\n");
                     if (socketley::ascii::iequals(name, "From"))
-                        w->from = header_value(block, "From").substr(0, 256);
+                        w->from = header_value(source, "From").substr(0, 256);
                     else if (socketley::ascii::iequals(name, "Subject"))
-                        w->subject = header_value(block, "Subject").substr(0, 512);
+                        w->subject = header_value(source, "Subject").substr(0, 512);
                 }
-                if (block.ends_with("\r\n\r\n") || block == "\r\n")
+                if (source.ends_with("\r\n\r\n") || source == "\r\n")
                     kept += "\r\n";
             }
             else

@@ -1,6 +1,7 @@
 #include "doctest.h"
 
 #include <chrono>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,7 @@ std::string summary(const outcome& o)
             case kind::discard: out += "discard"; break;
             case kind::reject: out += (a.ereject ? "ereject:" : "reject:") + a.arg; break;
             case kind::vacation: out += "vacation"; break;
+            case kind::notify: out += "notify:" + a.arg; break;
         }
     }
     return out;
@@ -487,7 +489,7 @@ Back soon.
 ;)");
     v = find(o, kind::vacation);
     REQUIRE(v);
-    CHECK(v->v->seconds == 0);
+    CHECK(v->v->seconds == 3600);
     CHECK(v->v->subject == "Gone");
     CHECK(v->v->from == "me@example.com");
     CHECK(v->v->handle == "h1");
@@ -688,4 +690,213 @@ TEST_CASE("sieve: a run never fails on what a message holds")
         CHECK(o.error.empty());
         CHECK_FALSE(o.actions.empty());
     }
+}
+
+TEST_CASE("sieve: regex matches an extended expression and gives its groups")
+{
+    CHECK(summary_of(R"S(require ["regex", "variables", "fileinto"];
+if header :regex "subject" "^hel+o (t[a-z]*)" { fileinto "${1}"; })S") == "fileinto:there");
+    CHECK(summary_of(R"(require ["regex", "fileinto"];
+if header :regex :comparator "i;octet" "subject" "^hello" { fileinto "x"; })") == "keep");
+    CHECK(compile_error(R"(require "regex"; if header :regex "subject" "(a)\\1" { keep; })").find("refers back") !=
+          std::string::npos);
+    CHECK(compile_error(R"(require "regex"; if header :regex "subject" "a(" { keep; })").find("does not compile") !=
+          std::string::npos);
+    CHECK(compile_error(R"(if header :regex "subject" "a" { keep; })").find("regex") != std::string::npos);
+    CHECK(set_value("require \"regex\"; set :quoteregex \"b\" \"a.b*(c)\";") == "a\\.b\\*\\(c\\)");
+}
+
+TEST_CASE("sieve: index picks one occurrence of a header, counted from either end")
+{
+    constexpr std::string_view two = "Received: from a.example\nReceived: from b.example\nSubject: x\n\nbody\n";
+    CHECK(summary_of(R"(require ["index", "fileinto"];
+if header :index 2 :contains "received" "b.example" { fileinto "second"; })", two) == "fileinto:second");
+    CHECK(summary_of(R"(require ["index", "fileinto"];
+if header :index 1 :last :contains "received" "a.example" { fileinto "x"; })", two) == "keep");
+    CHECK(summary_of(R"(require ["index", "fileinto"];
+if header :index 3 :contains "received" "example" { fileinto "x"; })", two) == "keep");
+    CHECK(compile_error(R"(require "index"; if header :last "a" "b" { keep; })").find(":last needs :index") !=
+          std::string::npos);
+}
+
+TEST_CASE("sieve: editheader changes the header later tests read and the message kept")
+{
+    sieve::outcome o = run(R"(require ["editheader", "fileinto"];
+addheader "X-Filtered" "by sieve";
+deleteheader "Subject";
+deleteheader "Received";
+addheader :last "X-Tail" "end";
+if header :is "x-filtered" "by sieve" { fileinto "seen"; }
+if exists "subject" { fileinto "no"; })");
+    CHECK(o.error.empty());
+    CHECK(summary(o) == "fileinto:seen");
+    REQUIRE(o.header);
+    CHECK(o.header->starts_with("X-Filtered: by sieve\r\n"));
+    CHECK(o.header->find("Subject:") == std::string::npos);
+    CHECK(o.header->ends_with("X-Tail: end\r\n\r\n"));
+    CHECK_FALSE(run("keep;").header);
+    o = run(R"(require "editheader"; deleteheader :contains "subject" "nothing";)");
+    CHECK_FALSE(o.header);
+    o = run(R"(require "editheader"; deleteheader :contains "subject" "hello";)");
+    REQUIRE(o.header);
+    CHECK(o.header->find("Subject") == std::string::npos);
+    // A value's line ends are no way to write a header of one's own.
+    o = run(R"(require ["editheader", "variables"]; set "v" "a${unicode:0d}${unicode:0a}Bcc: x@y"; addheader "X-A" "${v}";)");
+    REQUIRE(o.header);
+    CHECK(o.header->find("\r\nBcc:") == std::string::npos);
+    CHECK(compile_error(R"(require "editheader"; addheader "Bad Name" "x";)").find("no header name") !=
+          std::string::npos);
+}
+
+TEST_CASE("sieve: duplicate asks what was seen and tells what to keep")
+{
+    sieve::context c;
+    std::string asked;
+    c.seen = [&](std::string_view key) {
+        asked = std::string(key);
+        return false;
+    };
+    sieve::outcome o = run(R"(require ["duplicate", "fileinto"]; if duplicate { fileinto "dup"; })", plain, c);
+    CHECK(summary(o) == "keep");
+    CHECK(asked == std::string("\0<1@example.org>", 16));
+    REQUIRE(o.seen.size() == 1);
+    CHECK(o.seen[0].second == 12 * 3600);
+    c.seen = [](std::string_view) { return true; };
+    o = run(R"(require ["duplicate", "fileinto"]; if duplicate :seconds 60 :handle "h" { fileinto "dup"; })", plain, c);
+    CHECK(summary(o) == "fileinto:dup");
+    CHECK(o.seen.empty());
+    o = run(R"(require ["duplicate", "fileinto"]; if duplicate :last :uniqueid "u" { fileinto "dup"; })", plain, c);
+    REQUIRE(o.seen.size() == 1);
+    CHECK(o.seen[0].first == std::string("\0u", 2));
+    // A message without the ID is no duplicate, and nothing of it is kept.
+    o = run(R"(require "duplicate"; if duplicate :header "X-None" { discard; })", plain, c);
+    CHECK(summary(o) == "keep");
+    CHECK(o.seen.empty());
+}
+
+TEST_CASE("sieve: include runs another script with its own variables and the global ones shared")
+{
+    const std::map<std::string, std::string> scripts = {
+        {"lib", "require \"fileinto\"; fileinto \"Lib\";"},
+        {"sub", "require [\"include\", \"variables\", \"fileinto\"]; global \"x\"; fileinto \"${x}${y}\";"},
+        {"ret", "require [\"include\", \"fileinto\"]; return; fileinto \"no\";"},
+        {"loop", "require \"include\"; include \"loop\";"},
+    };
+    const sieve::loader load = [&](bool global, std::string_view name, std::string& text) {
+        const auto it = scripts.find((global ? "g:" : "") + std::string(name));
+        if (it == scripts.end())
+            return false;
+        text = it->second;
+        return true;
+    };
+    const auto with = [&](std::string_view text) {
+        std::string err;
+        const auto s = sieve::script::compile(text, err, load);
+        INFO(err);
+        REQUIRE(s);
+        const std::string bytes = crlf_lines(plain);
+        return s->run({bytes, "alice@example.org", "me@example.com"}, {});
+    };
+    CHECK(summary(with("require \"include\"; include \"lib\";")) == "fileinto:Lib");
+    CHECK(summary(with("require \"include\"; include :once \"lib\"; include :once \"lib\";")) == "fileinto:Lib");
+    CHECK(summary(with(R"(require ["include", "variables"]; global "x"; set "x" "v"; set "y" "local"; include "sub";)")) ==
+          "fileinto:v");
+    CHECK(summary(with(R"(require ["include", "variables", "fileinto"]; include "ret"; fileinto "after";)")) ==
+          "fileinto:after");
+    const sieve::outcome missing = with("require \"include\"; include \"nowhere\";");
+    CHECK(missing.error.find("not there") != std::string::npos);
+    CHECK(summary(with("require \"include\"; include :optional \"nowhere\";")) == "keep");
+    std::string err;
+    CHECK_FALSE(sieve::script::compile("require \"include\"; include \"loop\";", err, load));
+    CHECK(err.find("includes itself") != std::string::npos);
+    const auto s = sieve::script::compile("require \"include\"; include :global \"x\"; include \"lib\";", err, load);
+    REQUIRE(s);
+    CHECK(s->included().size() == 2);
+}
+
+TEST_CASE("sieve: environment, spamtest and virustest read what the server says")
+{
+    sieve::context c;
+    c.host = "mx.example.com";
+    c.remote_ip = "192.0.2.7";
+    c.spam = 8;
+    c.spam_percent = 75;
+    c.virus = 1;
+    const auto go = [&](std::string_view t) { return summary(run(t, plain, c)); };
+    CHECK(go(R"(require ["environment", "fileinto"]; if environment "host" "mx.example.com" { fileinto "h"; })") ==
+          "fileinto:h");
+    CHECK(go(R"(require ["environment", "fileinto"]; if environment :matches "remote-ip" "192.0.2.*" { fileinto "ip"; })") ==
+          "fileinto:ip");
+    CHECK(go(R"(require ["environment", "fileinto"]; if environment "no-such-item" "" { fileinto "x"; })") == "keep");
+    CHECK(go(R"(require ["spamtest", "relational", "comparator-i;ascii-numeric", "fileinto"];
+if spamtest :value "ge" :comparator "i;ascii-numeric" "6" { fileinto "Junk"; })") == "fileinto:Junk");
+    CHECK(go(R"(require ["spamtestplus", "relational", "comparator-i;ascii-numeric", "fileinto"];
+if spamtest :percent :value "gt" :comparator "i;ascii-numeric" "70" { fileinto "Junk"; })") == "fileinto:Junk");
+    CHECK(go(R"(require ["virustest", "fileinto"]; if virustest "1" { fileinto "clean"; })") == "fileinto:clean");
+    CHECK(summary_of(R"(require ["spamtest", "fileinto"]; if spamtest "0" { fileinto "untested"; })") == "fileinto:untested");
+    CHECK(compile_error(R"(require "spamtest"; if spamtest :percent "1" { keep; })").find("spamtestplus") !=
+          std::string::npos);
+}
+
+TEST_CASE("sieve: enotify sends by mailto, and not about a message a machine sent")
+{
+    sieve::outcome o = run(R"(require ["enotify", "variables"];
+set :encodeurl "s" "a b&c";
+notify :importance "1" :message "New mail" "mailto:me@example.com?subject=${s}";)");
+    CHECK(o.error.empty());
+    CHECK(summary(o) == "notify:mailto:me@example.com?subject=a%20b%26c,keep");
+    REQUIRE(o.actions[0].n);
+    CHECK(o.actions[0].n->importance == "1");
+    CHECK(o.actions[0].n->message == "New mail");
+    std::vector<std::string> to;
+    std::string subject, body;
+    CHECK(sieve::parse_mailto(o.actions[0].arg, to, subject, body));
+    CHECK(to == std::vector<std::string>{"me@example.com"});
+    CHECK(subject == "a b&c");
+    constexpr std::string_view automatic = "From: a@b.example\nAuto-Submitted: auto-replied\nSubject: x\n\nbody\n";
+    CHECK(summary_of(R"(require "enotify"; notify "mailto:me@example.com";)", automatic) == "keep");
+    CHECK(summary_of(R"(require ["enotify", "fileinto"];
+if valid_notify_method ["mailto:a@b.example", "mailto:c@d.example"] { fileinto "ok"; }
+if valid_notify_method "xmpp:a@b.example" { fileinto "no"; }
+if notify_method_capability "mailto:a@b.example" "online" "maybe" { fileinto "maybe"; })") ==
+          "fileinto:ok,fileinto:maybe");
+    CHECK(compile_error(R"(require "enotify"; notify "xmpp:me@example.com";)").find("mailto") != std::string::npos);
+}
+
+TEST_CASE("sieve: ihave lets a block use what it names, and skips one naming what is not here")
+{
+    CHECK(summary_of(R"(require "ihave";
+if ihave "fileinto" { fileinto "has"; })") == "fileinto:has");
+    CHECK(summary_of(R"(require "ihave";
+if ihave "x-unknown" { x_command :weird ["a"] { nested; } } else { discard; })") == "discard");
+    const sieve::outcome o = run(R"(require "ihave"; error "no way";)");
+    CHECK(o.error.find("no way") != std::string::npos);
+    CHECK(compile_error(R"(if true { fileinto "x"; })").find("fileinto") != std::string::npos);
+}
+
+TEST_CASE("sieve: a text: line's single leading dot is its stuffing, and an unclosed one says where it began")
+{
+    CHECK(set_value("set \"b\" text:\n.note\n..two\n.\n;") == "note\r\n.two\r\n");
+    CHECK(compile_error("require \"variables\";\nset \"b\" text:\nnever ended\n").starts_with("line 2:"));
+}
+
+TEST_CASE("sieve: vacation answers no message any Auto-Submitted makes automatic, and :from is a mailbox")
+{
+    constexpr std::string_view second = "From: Alice <alice@example.org>\nTo: me@example.com\nAuto-Submitted: no\n"
+                                        "Auto-Submitted: auto-generated\nSubject: x\n\nbody\n";
+    CHECK(summary_of(R"(require "vacation"; vacation "away";)", second) == "keep");
+    const sieve::outcome o = run(R"(require ["vacation", "variables"];
+set "f" "Me <me@example.com>${unicode:0d}${unicode:0a}Bcc: x@y.example";
+vacation :from "${f}" "away";)");
+    const auto* v = find(o, kind::vacation);
+    REQUIRE(v);
+    CHECK(v->v->from.find('\n') == std::string::npos);
+    CHECK(v->v->from.find("Bcc") == std::string::npos);
+}
+
+TEST_CASE("sieve: a zone a variable gives that is no zone fails the run")
+{
+    const sieve::outcome o = run(R"(require ["date", "variables"]; set "z" "nowhere";
+if currentdate :zone "${z}" "year" "2020" { discard; })");
+    CHECK(o.error.find("zone") != std::string::npos);
 }

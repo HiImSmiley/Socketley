@@ -12915,18 +12915,32 @@ local id, err = socketley.mail.send("m", { to = "ops@example.com",
 A user files their own mail with Sieve (RFC 5228) and its extensions fileinto,
 reject, ereject, envelope, encoded\-character, imap4flags, copy, vacation,
 vacation\-seconds, subaddress, body, relational, comparator\-i;ascii\-numeric,
-variables, date and mailbox. Their scripts are put over ManageSieve (RFC 5804)
+variables, date, index, mailbox, regex, editheader, duplicate, include,
+environment, spamtest, spamtestplus, virustest, enotify (mailto) and ihave.
+Their scripts are put over ManageSieve (RFC 5804)
 on
 .B \-\-sieve
 (STARTTLS, and SASL PLAIN with the password IMAP takes) or with
 .BR "socketley mail" " ... " sieve ,
 compiled as they are put, at most 32 of 64 KiB and 1 MiB in all, and kept
-under the runtime's state for every shard. The active one is run on a thread
-for each message that reaches the user's mailbox, its first mebibyte what it
-reads: keep and fileinto file it, with the imap4flags' flags IMAP shows;
-discard keeps nothing; reject bounces it to its sender; redirect sends it on
-from the user's own address, never again if it comes back; vacation answers a
-sender once in its days, from the null sender. A script that fails keeps the
+under the runtime's state for every shard; one is made active only where it
+compiles with what it includes. The active one is run on a thread for each
+message that reaches the user's mailbox, the whole message what it reads: keep
+and fileinto file it, with the imap4flags' flags IMAP shows, fileinto into a
+folder not there only with :create (else into INBOX); discard keeps nothing;
+reject bounces it to its sender; redirect sends it on from the user's own
+address, never again if it comes back; vacation answers a sender once in its
+days or seconds, an hour at least, from the null sender; notify mails a mailto
+URI, auto\-notified, from the null sender, at most three times a message.
+What editheader adds or deletes is in what is kept and sent on, the Received
+and Auto\-Submitted headers excepted. duplicate keeps a message's ID twelve
+hours unless :seconds says, a week at most; it and vacation remember at most
+10,000 per user. include :global reads the scripts put for the user
+.B .global
+.RB ( "socketley mail" " m " "sieve .global put" " name file ),
+include :personal the user's own. environment tells host, domain,
+remote\-ip, location MDA, phase during, name and version; spamtest and
+virustest are 0 until a scanner says more. A script that fails keeps the
 message in INBOX.
 .PP
 .B Lua.

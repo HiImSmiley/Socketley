@@ -5,6 +5,7 @@
 #include <charconv>
 #include <cstring>
 #include <random>
+#include <set>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -646,18 +647,30 @@ void delivery::deliver_local(const entry_ptr& e, const target& t)
         std::string head = "Return-Path: <" + e.from + ">\r\nDelivered-To: " + to + "\r\n";
         if (!e.auth.empty())
             head += "Authentication-Results: " + m_run.hostname() + "; " + e.auth + "\r\n";
-        // The user's Sieve script decides where it goes, where they have one active.
+        const auto plain = [this, it, user, settle, alive](std::string head) {
+            m_run.boxes()->deliver(it->e, user, it->e->folder.empty() ? "INBOX" : it->e->folder, std::move(head),
+                                   [settle, alive](int code, std::string text) {
+                                       if (*alive)
+                                           settle(code, text);
+                                   });
+        };
+        // The user's Sieve script decides where it goes, where they have one active; it is looked for off the loop,
+        // as a change of it is read and compiled there.
         if (sieve_store* f = m_run.filters())
-            if (auto script = f->active(user))
-            {
-                filter(it, user, email, std::move(head), std::move(script), settle);
-                return;
-            }
-        m_run.boxes()->deliver(it->e, user, e.folder.empty() ? "INBOX" : e.folder, std::move(head),
-                               [settle, alive](int code, std::string text) {
-                                   if (*alive)
-                                       settle(code, text);
-                               });
+        {
+            auto script = std::make_shared<std::shared_ptr<const sieve::script>>();
+            m_run.pool().submit(0, [f, user, script] { *script = f->active(user); },
+                                [this, it, user, email, head = std::move(head), script, settle, plain, alive] {
+                                    if (!*alive)
+                                        return;
+                                    if (*script)
+                                        filter(it, user, email, head, *script, settle);
+                                    else
+                                        plain(head);
+                                });
+            return;
+        }
+        plain(std::move(head));
     });
 }
 
@@ -717,6 +730,20 @@ void delivery::filter(const std::shared_ptr<item>& it, const std::string& user, 
         if (::localtime_r(&now, &tm))
             ctx.zone_min = static_cast<int32_t>(tm.tm_gmtoff / 60);
         const std::string to = it->to[0].rcpt < e->rcpts.size() ? e->rcpts[it->to[0].rcpt].addr : own;
+        ctx.host = m_run.hostname();
+        ctx.domain = m_run.domains().empty() ? std::string() : m_run.domains().front();
+        ctx.remote_ip = e->peer;
+        // The folders the index knows, read here on the loop, so the run's question is answered from a copy.
+        if (imap_store* imap = m_run.imap())
+        {
+            const std::vector<std::string> known = imap->folder_names(user);
+            auto names = std::make_shared<const std::set<std::string>>(known.begin(), known.end());
+            ctx.mailbox_exists = [names](std::string_view f) {
+                return socketley::ascii::iequals(f, "INBOX") || names->count(std::string(f)) > 0;
+            };
+        }
+        if (sieve_store* store = m_run.filters())
+            ctx.seen = [store, user, now = ctx.now_s](std::string_view key) { return store->seen(user, key, now); };
         auto out = std::make_shared<sieve::outcome>();
         // A run is bounded by its step budget, and spent on a thread rather than the loop.
         m_run.pool().submit(
@@ -735,8 +762,8 @@ void delivery::filter(const std::shared_ptr<item>& it, const std::string& user, 
         go(e->body);
         return;
     }
-    // A message not kept in memory is filtered by its first mebibyte, its header and as much body as that holds.
-    const uint32_t want = static_cast<uint32_t>(std::min<uint64_t>(e->body_len, 1u << 20));
+    // A message not kept in memory is read whole, as --max-size bounds it, so size and body see all of it.
+    const uint32_t want = static_cast<uint32_t>(std::min<uint64_t>(e->body_len, UINT32_MAX));
     m_run.queue().read(e, 0, want, [go, settle, alive = m_alive](bool ok, std::string_view b) {
         if (!*alive)
             return;
@@ -763,10 +790,16 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
     };
     std::vector<put_to> puts;
     std::vector<std::string> redirects;
+    std::vector<sieve::notification> notes;
     std::optional<sieve::vacation> vac;
     std::string rejected;
     bool reject = false;
     const std::string inbox = e->folder.empty() ? "INBOX" : e->folder;
+    // A folder fileinto names without :create is filed into only where it is there (RFC 5490 3.2); the index knows.
+    std::set<std::string> there;
+    if (imap_store* imap = m_run.imap())
+        for (auto& n : imap->folder_names(user))
+            there.insert(std::move(n));
     for (const auto& a : out.actions)
     {
         switch (a.k)
@@ -781,6 +814,14 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
                 if (socketley::ascii::iequals(std::string_view(folder).substr(0, 5), "inbox") &&
                     (folder.size() == 5 || folder[5] == '/'))
                     folder.replace(0, 5, "INBOX");
+                if (a.k == sieve::action::kind::fileinto && !a.create && m_run.imap() && folder != "INBOX" &&
+                    !there.count(folder))
+                {
+                    LOG_INFO(("mail: " + user + "'s filter files into " + folder +
+                              ", which is not there and not :create'd, so into INBOX")
+                                 .c_str());
+                    folder = inbox;
+                }
                 // Two actions into one folder are one copy, its flags those of both.
                 auto f = std::find_if(puts.begin(), puts.end(), [&](const put_to& p) { return p.folder == folder; });
                 if (f == puts.end())
@@ -799,10 +840,20 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
             case sieve::action::kind::vacation:
                 vac = a.v;
                 break;
+            case sieve::action::kind::notify:
+                if (a.n)
+                    notes.push_back(*a.n);
+                break;
             case sieve::action::kind::discard:
                 break;
         }
     }
+    // What duplicate saw is kept once the actions are taken, off the loop.
+    if (sieve_store* store = m_run.filters(); store && !out.seen.empty())
+        m_run.pool().submit(0, [store, user, seen = out.seen, now = wall::now_ms() / 1000] {
+            for (const auto& [key, seconds] : seen)
+                store->keep_seen(user, key, seconds, now);
+        }, [] {});
     if (reject)
     {
         // A message the user's filter refuses goes back to its sender as a failure (RFC 5429 2.1).
@@ -811,9 +862,22 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
         return;
     }
     const std::string_view headers = header_block(bytes);
-    if (vac && !e->bounce && m_run.filters() &&
-        !m_run.filters()->answered(user, vac->handle, vac->to, vac->seconds, wall::now_ms() / 1000))
-        vacation(own, *vac, header_value(headers, "Message-ID"));
+    // Whether this sender was answered is asked of the memory off the loop, which may read and write a file.
+    if (sieve_store* store = m_run.filters(); vac && !e->bounce && store)
+    {
+        auto fresh = std::make_shared<bool>(false);
+        m_run.pool().submit(0,
+                            [store, user, v = *vac, fresh, now = wall::now_ms() / 1000] {
+                                *fresh = !store->answered(user, v.handle, v.to, v.seconds, now);
+                            },
+                            [this, own, v = *vac, fresh, msgid = std::string(header_value(headers, "Message-ID")),
+                             alive = m_alive] {
+                                if (*alive && *fresh)
+                                    vacation(own, v, msgid);
+                            });
+    }
+    for (const auto& n : notes)
+        notify(own, n, headers);
     // A message that came back to the user it was sent on from is not sent on again.
     const bool looped = headers.find("Delivered-To: " + own + "\r\n") != std::string_view::npos;
     if (!redirects.empty() && looped)
@@ -824,13 +888,14 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
             puts.push_back({inbox, 0});
     }
     // Sent on once the copies kept are in, so a retry of them sends nothing twice and a refusal sends nothing on.
-    const auto then = [this, e, own, redirects, settle, kept = !puts.empty()](int code, const std::string& text) {
+    const std::string edited = out.header ? *out.header : std::string();
+    const auto then = [this, e, own, redirects, settle, edited, kept = !puts.empty()](int code, const std::string& text) {
         if (redirects.empty() || code / 100 != 2)
         {
             settle(code, text);
             return;
         }
-        redirect(e, own, redirects, [own, settle, kept, code, text](bool ok) {
+        redirect(e, own, redirects, edited, [own, settle, kept, code, text](bool ok) {
             if (ok || kept)
             {
                 if (!ok)
@@ -860,18 +925,23 @@ void delivery::apply(const std::shared_ptr<item>& it, const std::string& user, c
                                    if (--*left == 0)
                                        then(worst->first, worst->second);
                                },
-                               p.flags);
+                               p.flags, edited);
 }
 
 void delivery::redirect(const entry_ptr& e, const std::string& own, std::vector<std::string> to,
-                        std::function<void(bool)> done)
+                        const std::string& header, std::function<void(bool)> done)
 {
-    // Sent from the user's own address, so a bounce comes to them and SPF is this runtime's to pass.
-    const auto send = [this, own, to = std::move(to), done](std::string_view whole) {
+    // Sent from the user's own address, so a bounce comes to them and SPF is this runtime's to pass; with the header
+    // editheader left, where it changed it.
+    const auto send = [this, own, header, to = std::move(to), done](std::string_view whole) {
+        const std::string_view block = header_block(whole);
+        const std::string message = header.empty() || block.size() >= whole.size()
+                                        ? std::string(whole)
+                                        : header + std::string(whole.substr(block.size()));
         for (const auto& t : to)
         {
             ++m_sieve_redirected;
-            m_run.queue_message(own, {t}, "Delivered-To: " + own + "\r\n" + std::string(whole), false, {},
+            m_run.queue_message(own, {t}, "Delivered-To: " + own + "\r\n" + message, false, {},
                                 [](bool, std::string) {});
         }
         done(true);
@@ -909,6 +979,34 @@ void delivery::vacation(const std::string& own, const sieve::vacation& v, std::s
     ++m_sieve_vacations;
     // From the null sender, so nothing answers it in turn (RFC 5230 5.1).
     m_run.queue_message("", {v.to}, std::move(msg), true, {}, [](bool, std::string) {});
+}
+
+void delivery::notify(const std::string& own, const sieve::notification& n, std::string_view headers)
+{
+    std::vector<std::string> to;
+    std::string subject, body;
+    if (!sieve::parse_mailto(n.method, to, subject, body))
+        return;
+    // The subject the URI names, or the script's message, or what the mail said (RFC 5436 2.7).
+    const std::string about = std::string(header_value(headers, "Subject")).substr(0, 200);
+    const std::string from = std::string(header_value(headers, "From")).substr(0, 200);
+    if (subject.empty())
+        subject = !n.message.empty() ? n.message : "[SIEVE] New mail" + (about.empty() ? "" : ": " + about);
+    if (body.empty())
+        body = (n.message.empty() ? "New mail" : n.message) + "\nFrom: " + from + "\nSubject: " + about + "\n";
+    std::string msg = "From: " + (n.from.empty() ? own : n.from) + "\r\nTo: ";
+    for (size_t i = 0; i < to.size(); ++i)
+        msg += (i ? ", " : "") + to[i];
+    msg += "\r\nSubject: " + encode_header_value("Subject", subject) + "\r\nDate: " + rfc5322_date(wall::now_ms()) +
+           "\r\nMessage-ID: <" + socketley::random_hex(12) + "@" + m_run.hostname() + ">\r\n" +
+           "Auto-Submitted: auto-notified\r\nImportance: " +
+           (n.importance == "1" ? "high" : n.importance == "3" ? "low" : "normal") +
+           "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n"
+           "Content-Transfer-Encoding: quoted-printable\r\n\r\n" +
+           quoted_printable(body);
+    ++m_sieve_notified;
+    // From the null sender, so nothing answers it in turn and a failed one makes no bounce.
+    m_run.queue_message("", to, std::move(msg), true, {}, [](bool, std::string) {});
 }
 
 void delivery::fail_waiting(route& r, int code, const std::string& text, bool temporary)
@@ -1690,6 +1788,7 @@ void delivery::stats(std::string& out) const
     put(out, "mail_over_quota", m_over_quota);
     put(out, "mail_sieve_redirected", m_sieve_redirected);
     put(out, "mail_sieve_vacations", m_sieve_vacations);
+    put(out, "mail_sieve_notified", m_sieve_notified);
     put(out, "mail_out_connections", m_conns.size());
     put(out, "mail_out_connects", m_connects);
     put(out, "mail_out_tls", m_tls_sessions);

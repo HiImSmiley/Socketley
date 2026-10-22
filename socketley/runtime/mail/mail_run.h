@@ -186,6 +186,7 @@ private:
         void data_abort(bool too_big) override;
         void close() override;
         void login(std::string user, std::string password, std::function<void(account, std::string)> done) override;
+        void offload(std::function<void()> job, std::function<void()> done) override;
         void acknowledge() override;
         void reply_shared(const std::shared_ptr<const std::string>& bytes, size_t off, size_t len) override;
         size_t backlog() const override { return owed + zplain.size(); }

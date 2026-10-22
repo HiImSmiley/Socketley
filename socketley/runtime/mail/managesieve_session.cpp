@@ -1,7 +1,9 @@
 #include "managesieve_session.h"
 
+#include <algorithm>
 #include <charconv>
 #include <cstring>
+#include <memory>
 
 #include "mail_sieve.h"
 #include "mail_sieve_store.h"
@@ -58,7 +60,7 @@ void managesieve_session::capabilities()
     out += "\"SIEVE\" " + quoted(sieve::extensions()) + "\r\n";
     if (m_cfg.tls_offered && !m_cfg.tls_active)
         out += "\"STARTTLS\"\r\n";
-    out += "\"MAXREDIRECTS\" \"4\"\r\n\"VERSION\" \"1.0\"\r\n";
+    out += "\"NOTIFY\" \"mailto\"\r\n\"MAXREDIRECTS\" \"4\"\r\n\"VERSION\" \"1.0\"\r\n";
     m_hooks.reply(out);
 }
 
@@ -245,9 +247,13 @@ void managesieve_session::sign_in(std::string_view b64)
         if (!*alive)
             return;
         m_waiting = false;
+        // A name with a control character is none a store keeps scripts under.
+        const bool plain = std::none_of(name.begin(), name.end(), [](char c) {
+            return static_cast<unsigned char>(c) < 0x20 || c == 0x7f;
+        });
         if (a == account::unreachable)
             no("TRYLATER", "The accounts cannot be checked now");
-        else if (a == account::yes)
+        else if (a == account::yes && plain && !name.empty())
         {
             m_user = std::move(name);
             ok("Logged in");
@@ -258,6 +264,25 @@ void managesieve_session::sign_in(std::string_view b64)
         if (!m_running)
             run();
     });
+}
+
+void managesieve_session::store_work(std::function<bool(std::string&, std::string&)> job, std::string done_text)
+{
+    auto code = std::make_shared<std::string>(), why = std::make_shared<std::string>();
+    auto done = std::make_shared<bool>(false);
+    m_waiting = true;
+    m_hooks.offload([job = std::move(job), code, why, done] { *done = job(*code, *why); },
+                    [this, code, why, done, done_text = std::move(done_text), alive = m_alive] {
+                        if (!*alive)
+                            return;
+                        m_waiting = false;
+                        if (*done)
+                            ok(done_text);
+                        else
+                            no(*code, *why);
+                        if (!m_running)
+                            run();
+                    });
 }
 
 void managesieve_session::command()
@@ -369,6 +394,8 @@ void managesieve_session::command()
                                  .ec == std::errc();
         if (!name || !num)
             no({}, "HAVESPACE takes a name and a size");
+        else if (!sieve_store::name_ok(*name))
+            no({}, "A script's name is printable and holds no /");
         else if (!m_store.fits(m_user, *name, size, code))
             no(code, "There is no room for it");
         else
@@ -384,10 +411,17 @@ void managesieve_session::command()
             no({}, put ? "PUTSCRIPT takes a name and a script" : "CHECKSCRIPT takes a script");
         else if (m_dropping)
             no("QUOTA/MAXSIZE", "The script is larger than one may be");
-        else if (put ? !m_store.put(m_user, *name, *text, code, why) : !sieve::script::compile(*text, why))
-            no(code, why);
+        else if (!put)
+        {
+            if (!sieve::script::compile(*text, why))
+                no(code, why);
+            else
+                ok("Script is valid");
+        }
         else
-            ok(put ? "Putscript completed" : "Script is valid");
+            store_work([store = &m_store, user = m_user, name = *name, text = *text](std::string& c, std::string& w) {
+                return store->put(user, name, text, c, w);
+            }, "Putscript completed");
         return;
     }
     if (iequals(verb, "GETSCRIPT"))
@@ -408,10 +442,10 @@ void managesieve_session::command()
         const std::string* name = str(1);
         if (!name)
             no({}, "SETACTIVE takes a name, \"\" for none");
-        else if (!m_store.activate(m_user, *name, code, why))
-            no(code, why);
         else
-            ok(name->empty() ? "No script is active" : "Setactive completed");
+            store_work([store = &m_store, user = m_user, name = *name](std::string& c, std::string& w) {
+                return store->activate(user, name, c, w);
+            }, name->empty() ? "No script is active" : "Setactive completed");
         return;
     }
     if (iequals(verb, "DELETESCRIPT"))
@@ -419,10 +453,10 @@ void managesieve_session::command()
         const std::string* name = str(1);
         if (!name)
             no({}, "DELETESCRIPT takes a name");
-        else if (!m_store.remove(m_user, *name, code, why))
-            no(code, why);
         else
-            ok("Deletescript completed");
+            store_work([store = &m_store, user = m_user, name = *name](std::string& c, std::string& w) {
+                return store->remove(user, name, c, w);
+            }, "Deletescript completed");
         return;
     }
     if (iequals(verb, "RENAMESCRIPT"))
@@ -431,10 +465,10 @@ void managesieve_session::command()
         const std::string* to = str(2);
         if (!from || !to)
             no({}, "RENAMESCRIPT takes the old name and the new");
-        else if (!m_store.rename(m_user, *from, *to, code, why))
-            no(code, why);
         else
-            ok("Renamescript completed");
+            store_work([store = &m_store, user = m_user, from = *from, to = *to](std::string& c, std::string& w) {
+                return store->rename(user, from, to, c, w);
+            }, "Renamescript completed");
         return;
     }
     no({}, "Unknown command");

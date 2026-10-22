@@ -1652,6 +1652,22 @@ void mail_run::conn::login(std::string user, std::string password, std::function
     authenticate("IMAP", std::move(user), std::move(password), std::move(done));
 }
 
+void mail_run::conn::offload(std::function<void()> job, std::function<void()> done)
+{
+    const uint64_t me = id;
+    run->pool().submit(0, std::move(job), [r = run, me, done = std::move(done), alive = run->m_alive] {
+        if (!*alive)
+            return;
+        if (conn* c = r->find(me); c && !c->dead)
+        {
+            c->in_input = true;
+            done();
+            c->in_input = false;
+            r->flush(*c);
+        }
+    });
+}
+
 void mail_run::conn::reply_shared(const std::shared_ptr<const std::string>& bytes, size_t off, size_t len)
 {
     // TLS and COMPRESS make a copy anyway, and a slice is at most what 32 bits count.
@@ -2099,7 +2115,10 @@ void mail_run::command(uint64_t ticket, std::string_view payload)
         }
         case verb::sieve:
         {
-            answer(sieve_command(arg));
+            // A change of the scripts waits on the disk, so the loop does not.
+            auto out = std::make_shared<std::string>();
+            m_pool.submit(0, [this, arg, out] { *out = sieve_command(arg); },
+                          [answer, out] { answer(*out); });
             return;
         }
         case verb::forgive:
@@ -2179,10 +2198,14 @@ std::string mail_run::sieve_command(const std::string& arg)
         rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
         return std::string(l);
     };
-    const std::string user = line(), what = line(), name = line();
+    const std::string asked = line(), what = line(), name = line();
     const std::string_view text = rest;
-    if (!sieve_store::name_ok(user))
+    // ".global" names the scripts any user's include :global reads, which no login can name.
+    const std::string user = asked == ".global" ? sieve_store::global_user : asked;
+    if (user != sieve_store::global_user && !sieve_store::name_ok(user))
         return "error: " + user + " is no user";
+    if (user == sieve_store::global_user && (what == "activate" || what == "deactivate"))
+        return "error: a global script is included, never active";
     std::string code, why;
     if (what == "list")
     {

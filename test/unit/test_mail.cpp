@@ -936,6 +936,11 @@ TEST_CASE("ManageSieve: a sign-in answered at once, the commands pipelined behin
             done(u == "alice" && p == "pw" ? account::yes : account::no, u);
         }
         void close() override {}
+        void offload(std::function<void()> job, std::function<void()> done) override
+        {
+            job();
+            done();
+        }
     } hooks;
     const std::string dir = "/tmp/test-mail-sieve-" + std::to_string(::getpid());
     std::filesystem::remove_all(dir);

@@ -151,9 +151,12 @@ private:
                const std::string& head, std::string_view bytes, const sieve::outcome& out,
                std::function<void(int, const std::string&)> settle);
     // The message sent on to each of `to`, `done` once it is queued for them or false where it could not be read.
-    void redirect(const entry_ptr& e, const std::string& own, std::vector<std::string> to,
+    // Sent on to `to`, its header the one editheader left where `header` is not empty.
+    void redirect(const entry_ptr& e, const std::string& own, std::vector<std::string> to, const std::string& header,
                   std::function<void(bool)> done);
     void vacation(const std::string& own, const sieve::vacation& v, std::string_view msgid);
+    // A notification enotify decided, mailed to the URI's recipients.
+    void notify(const std::string& own, const sieve::notification& n, std::string_view headers);
     std::string signing_domain(std::string_view from_header) const;
 
     // ── one connection ─────────────────────────────────────────────────────
@@ -224,6 +227,7 @@ private:
     uint64_t m_over_quota{0};
     uint64_t m_sieve_redirected{0};
     uint64_t m_sieve_vacations{0};
+    uint64_t m_sieve_notified{0};
     uint64_t m_connects{0};
     uint64_t m_tls_sessions{0};
     uint64_t m_transactions{0};

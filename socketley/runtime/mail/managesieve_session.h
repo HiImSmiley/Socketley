@@ -37,6 +37,8 @@ public:
         virtual void start_tls() = 0;
         virtual void login(std::string user, std::string password, std::function<void(account, std::string)> done) = 0;
         virtual void close() = 0;
+        // `job` run off the loop, as a change of the scripts waits on the disk, and `done` on it after.
+        virtual void offload(std::function<void()> job, std::function<void()> done) = 0;
     };
 
     managesieve_session(const managesieve_config& cfg, hooks& h, sieve_store& store);
@@ -72,6 +74,8 @@ private:
     void no(std::string_view code, std::string_view text);
     void authenticate();
     void sign_in(std::string_view b64);
+    // A change of the store made on the pool, answered OK with `done_text` or NO with what it said.
+    void store_work(std::function<bool(std::string& code, std::string& why)> job, std::string done_text);
     std::string quoted(std::string_view s) const;
 
     managesieve_config m_cfg;

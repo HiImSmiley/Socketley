@@ -246,7 +246,17 @@ void sieve_case(std::string_view in)
     const std::string_view text = in.substr(0, nul);
     const std::string_view msg = nul == std::string_view::npos ? std::string_view{} : in.substr(nul + 1);
     std::string err;
-    const auto s = sieve::script::compile(text, err);
+    // A script may include one of a few, itself among them, so a loop of includes is refused rather than run.
+    const sieve::loader load = [text](bool global, std::string_view name, std::string& out) {
+        if (name == "self")
+            out = std::string(text);
+        else if (name == "lib")
+            out = global ? "require \"editheader\"; addheader \"X-G\" \"1\";" : "require \"include\"; return;";
+        else
+            return false;
+        return true;
+    };
+    const auto s = sieve::script::compile(text, err, load);
     FUZZ_CHECK(s || err.starts_with("line "), "a script refused without the line it is wrong at");
     if (!s)
         return;
@@ -255,6 +265,10 @@ void sieve_case(std::string_view in)
     c.now_s = 1700000000;
     c.zone_min = 60;
     c.mailbox_exists = [](std::string_view f) { return f.size() % 2 == 0; };
+    c.seen = [](std::string_view key) { return key.size() % 3 == 0; };
+    c.host = "mx.example.com";
+    c.spam = 5;
+    c.spam_percent = 50;
     const sieve::outcome o = s->run({msg, "alice@example.org", "me+tag@example.com"}, c);
     FUZZ_CHECK(!o.actions.empty(), "an outcome with no action");
     if (!o.error.empty())
@@ -276,6 +290,29 @@ void sieve_case(std::string_view in)
         if (a.v)
             FUZZ_CHECK(a.v->to == "alice@example.org" && !a.v->handle.empty(), "a vacation answering no sender");
     }
+    size_t notifies = 0;
+    for (const auto& a : o.actions)
+        if (a.k == sieve::action::kind::notify)
+        {
+            ++notifies;
+            std::vector<std::string> to;
+            std::string subject, body;
+            FUZZ_CHECK(a.n && sieve::parse_mailto(a.n->method, to, subject, body), "a notify by no mailto URI");
+        }
+    FUZZ_CHECK(notifies <= 3, "more than 3 notifies");
+    if (o.header)
+    {
+        FUZZ_CHECK(o.header->ends_with("\r\n\r\n") || *o.header == "\r\n", "an edited header not ended by a blank line");
+        // What editheader wrote has no line end of its own; a bare LF the message brought it passes on as it was.
+        const auto bare = [](std::string_view h) {
+            for (size_t i = 0; i < h.size(); ++i)
+                if (h[i] == '\n' && (i == 0 || h[i - 1] != '\r'))
+                    return true;
+            return false;
+        };
+        FUZZ_CHECK(bare(header_block(msg)) || !bare(*o.header), "an edited header with a bare LF the message had not");
+        FUZZ_CHECK(o.error.empty(), "an edited header from a failed run");
+    }
     FUZZ_CHECK(redirects <= 4, "more than 4 redirects");
     FUZZ_CHECK(rejects <= 1 && vacations <= 1, "a second reject or vacation");
     FUZZ_CHECK(rejects == 0 || redirects + vacations == 0, "a reject beside a redirect or a vacation");
@@ -292,6 +329,11 @@ struct sieve_hooks : managesieve_session::hooks
         done(user == "u" && password == "p" ? account::yes : user == "x" ? account::unreachable : account::no, user);
     }
     void close() override { closed = true; }
+    void offload(std::function<void()> job, std::function<void()> done) override
+    {
+        job();
+        done();
+    }
 };
 
 void managesieve_case(std::string_view in)
