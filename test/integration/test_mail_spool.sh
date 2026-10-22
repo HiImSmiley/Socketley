@@ -12,6 +12,10 @@
 #   * a record a crash cut taken as a message, or the messages before it lost with it
 #   * a segment a deferred message keeps never used again, or the message lost by its move
 #   * a message of a commit read back from where another, begun while that commit ended, put its own
+#   * a message delivered and gone brought back by the second restart after it, its record still in a segment
+#   * a message of many recipients lost at a restart: a file whose envelope is past 64 KiB, or a record past 2 MiB
+#   * a large message waiting for its next try holding a descriptor of its file
+#   * a remove deleting mail the runtime still holds, or leaving its users' IMAP and Sieve state behind
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -42,8 +46,9 @@ trap cleanup EXIT
 
 echo "=== Integration: a mail runtime's spool, its segments and their commits ==="
 
+# down.test's exchanger answers no connection, so its mail waits.
 python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 \
-    >/dev/null 2>&1 &
+    down.test=MX:10:mx.down.test mx.down.test=127.0.0.9 >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
 # A segment emptied but for a deferred message is moved out of at once; a body past 64 KiB is read back from it.
@@ -55,7 +60,7 @@ PIDS+=($!)
 ready_tcp 127.0.0.1 "$SINK" || bad "the sink listens" "-"
 daemon_start "$BIN"
 
-"$BIN" create mail s -p "$P" --mail-domain example.test --no-reply -s >/dev/null 2>&1
+"$BIN" create mail s -p "$P" --mail-domain example.test --no-reply --max-recipients 6000 -s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$P" || bad "the mail runtime listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 stat_of() { "$BIN" stats s 2>/dev/null | sed -n "s/^$1://p"; }
 spool_dir() { find "$HOME/.local/share" -type d -path '*/mail/s/spool' 2>/dev/null | head -1; }
@@ -196,6 +201,67 @@ check "and the moved message is kept across a restart" "$(kept)" "2"
     | grep -q 'rcpt: later@remote.test' && ok "and still shows" || bad "and still shows" "$("$BIN" mail s queue 2>&1)"
 n=$(ls "$D" | grep -c '^seg-.*\.spool$')
 [ "$n" -le 4 ] && ok "segments are used again rather than piling up ($n)" || bad "segments are used again" "$(ls "$D")"
+
+# ─── what a restart brings back ─────────────────────────────────────────────
+restart() { "$BIN" stop "$1" >/dev/null 2>&1; "$BIN" start "$1" >/dev/null 2>&1; ready_tcp 127.0.0.1 "$2" >/dev/null; }
+# A fresh spool: messages that wait fill more than a quarter of its first segment, so it is neither moved out of nor
+# used again, and the delivered one's record stays in it.
+P2=$((SL_PORT_BASE+1993))
+"$BIN" create mail s2 -p "$P2" --mail-domain example.test -s >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$P2" >/dev/null
+head -c 600000 /dev/zero | tr '\0' 'k' | fold -w 76 > "$T/keep.txt"
+for i in $(seq 1 12); do
+    "$BIN" send s2 --from a@example.test --to "keepalive$i@down.test" --subject waits --text "waits on" \
+        --attach "$T/keep.txt" >/dev/null 2>&1
+done
+"$BIN" send s2 --from a@example.test --to once@remote.test --subject once --text "delivered once" >/dev/null 2>&1
+for _ in $(seq 1 50); do grep -l 'delivered once' "$T"/sink/*.eml >/dev/null 2>&1 && break; sleep 0.1; done
+restart s2 "$P2"; restart s2 "$P2"; sleep 1.5
+check "a message delivered is not delivered again by the second restart after it" \
+    "$(grep -l 'delivered once' "$T"/sink/*.eml 2>/dev/null | wc -l)" "1"
+# Many recipients, waiting: one message past a mebibyte whose envelope is past 64 KiB, and one under a mebibyte whose
+# envelope is past one.
+python3 - "$P" <<'PY'
+import smtplib, sys
+port = int(sys.argv[1])
+def send(n, local_len, body, tag, orcpt=0):
+    s = smtplib.SMTP("127.0.0.1", port, timeout=120); s.ehlo("x")
+    s.mail("many@remote.test")
+    for i in range(n):
+        s.rcpt("%s%05d%s@down.test" % (tag, i, "r" * local_len),
+               ["ORCPT=rfc822;" + "o" * orcpt + "%05d@else.test" % i] if orcpt else [])
+    s.data(b"Subject: " + tag.encode() + b"\r\n\r\n" + body)
+    s.quit()
+send(1200, 40, (b"b" * 78 + b"\r\n") * 15000, "wide")
+send(5000, 50, b"short body\r\n", "tall", 400)
+PY
+restart s "$P"
+check "a file of its own whose envelope is past 64 KiB is kept across a restart" \
+    "$("$BIN" mail s queue 2>/dev/null | grep -c 'many@remote.test.*0/1200')" "1"
+check "and so is a message whose envelope is past a mebibyte" \
+    "$("$BIN" mail s queue 2>/dev/null | grep -c 'many@remote.test.*0/5000')" "1"
+# Large messages from this runtime's domain are read whole to be signed; waiting, they hold no descriptor.
+head -c 1500000 /dev/zero | tr '\0' 'z' | fold -w 76 > "$T/large.txt"
+for i in 1 2 3 4 5 6; do
+    "$BIN" send s --from a@example.test --to "w$i@down.test" --subject "large $i" --text large --attach "$T/large.txt" \
+        >/dev/null 2>&1
+done
+sleep 3
+w=$(ss -ltnpH "sport = :$P" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+check "six large messages waiting for their next try hold no descriptor of their files" \
+    "$(ls -l /proc/"$w"/fd 2>/dev/null | grep -c '\.msg$')" "0"
+# A remove keeps aside mail the runtime took and still holds, and takes its users' state with it.
+mkdir -p "$(dirname "$D")/../s.imap" "$(dirname "$D")/../s.sieve"
+held_n=$("$BIN" mail s queue 2>/dev/null | grep -c .)
+"$BIN" remove s >/dev/null 2>&1
+base=$(dirname "$(dirname "$D")")
+# What the runtime leaves is dealt with once its worker has stopped.
+for _ in $(seq 1 100); do [ ! -e "$base/s" ] && break; sleep 0.1; done
+held=$(ls -d "$base"/s.held-* 2>/dev/null | head -1)
+[ -n "$held" ] && [ "$(ls "$held/spool" | grep -c '\.msg$')" -ge 1 ] && ok "a removed runtime's queued mail is kept aside ($held_n)" \
+    || bad "a removed runtime's queued mail is kept aside" "$(ls "$base")"
+[ ! -e "$base/s.imap" ] && [ ! -e "$base/s.sieve" ] && ok "and its users' IMAP and Sieve state go with it" \
+    || bad "and its users' IMAP and Sieve state go with it" "$(ls "$base")"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

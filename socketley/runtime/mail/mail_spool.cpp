@@ -311,7 +311,13 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
         bool ok = ::fstat(fd, &st) == 0 && st.st_size > 0;
         if (ok)
         {
-            read_at(fd, head, std::min<size_t>(static_cast<size_t>(st.st_size), 64u << 10), 0);
+            // The envelope of many recipients can be long: it is read until its blank line, up to 16 MiB.
+            for (size_t want = 64u << 10;; want *= 4)
+            {
+                read_at(fd, head, std::min<size_t>(static_cast<size_t>(st.st_size), want), 0);
+                if (head.find("\n\n") != std::string::npos || head.size() < want || want >= (16u << 20))
+                    break;
+            }
             ok = parse_header(head, *e, header_len);
         }
         if (ok)
@@ -445,39 +451,16 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
         if (const auto it = m_entries.find(id); it != m_entries.end())
             for (auto& r : it->second->rcpts)
                 r.state = rcpt_state::failed;
-    std::string compact;
     std::vector<std::string> over;
     for (const auto& [id, e] : m_entries)
-    {
         if (e->waiting() == 0)
-        {
             over.push_back(id);
-            continue;
-        }
-        if (e->attempts)
-            compact += id + " r " + std::to_string(e->attempts) + " " + std::to_string(e->next_ms) + "\n";
-        if (!e->auth.empty())
-            compact += id + " a " + (e->folder.empty() ? "INBOX" : e->folder) + " " + e->auth + "\n";
-        if (e->delay_told)
-            compact += id + " w\n";
-        for (size_t i = 0; i < e->rcpts.size(); ++i)
-        {
-            const spool_rcpt& r = e->rcpts[i];
-            if (r.state != rcpt_state::waiting)
-                compact += id + (r.state == rcpt_state::delivered ? " d " : " f ") + std::to_string(i) + " " +
-                           one_line(r.why) + "\n";
-            if (r.told)
-                compact += id + " b " + std::to_string(i) + "\n";
-            for (const auto& t : r.targets_done)
-                compact += id + " t " + std::to_string(i) + " " + t + "\n";
-            for (const auto& t : r.targets_failed)
-                compact += id + " u " + std::to_string(i) + " " + t + "\n";
-        }
-    }
     for (const auto& id : over)
     {
         if (m_entries[id]->seg == 0)
             std::filesystem::remove(path_of(id), ec);
+        else
+            m_gone_in_seg[id] = m_entries[id]->seg;
         m_bytes -= m_entries[id]->body_len;
         m_entries.erase(id);
     }
@@ -541,6 +524,7 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
         m_cur = s.gen;
         m_segs.emplace(s.gen, std::move(s));
     }
+    const std::string compact = log_text();
     const std::string tmp = log_path + ".tmp";
     const int wfd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (wfd < 0 || !write_all(wfd, compact.data(), compact.size()) || ::fsync(wfd) != 0 ||
@@ -552,6 +536,11 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
         return false;
     }
     ::close(wfd);
+    m_log_base = compact.size();
+    m_log_grown = 0;
+    // A file named in a directory is the directory's to keep: it is synced after a file is made or renamed in it.
+    m_dir_fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (m_dir_fd >= 0 && ::fsync(m_dir_fd) != 0) {}
     m_log_fd = ::open(log_path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
     if (m_log_fd < 0)
     {
@@ -564,27 +553,34 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
 
 void spool::close()
 {
+    // Each descriptor is closed through the loop, which holds it until what is in flight on it is back.
     if (m_log_fd >= 0)
     {
         // What the log still holds goes in line, since nothing after this waits for the ring.
         if (!m_log_buf.empty() && !write_all(m_log_fd, m_log_buf.data(), m_log_buf.size())) {}
-        ::close(m_log_fd);
+        m_log_buf.clear();
+        m_loop.close_fd(m_log_fd);
         m_log_fd = -1;
+    }
+    if (m_dir_fd >= 0)
+    {
+        m_loop.close_fd(m_dir_fd);
+        m_dir_fd = -1;
     }
     for (auto& [id, r] : m_readers)
         if (r.fd >= 0)
-            ::close(r.fd);
+            m_loop.close_fd(r.fd);
     m_readers.clear();
     for (auto* list : {&m_spare, &m_free})
     {
         for (auto& s : *list)
             if (s.fd >= 0)
-                ::close(s.fd);
+                m_loop.close_fd(s.fd);
         list->clear();
     }
     for (auto& [gen, s] : m_segs)
         if (s.fd >= 0)
-            ::close(s.fd);
+            m_loop.close_fd(s.fd);
     m_segs.clear();
     m_cur = 0;
 }
@@ -623,9 +619,13 @@ void spool::append(uint64_t w, std::string_view bytes)
     if (it == m_writers.end())
         return;
     writer& x = *it->second;
-    x.buf.append(bytes);
     x.e->body_len += bytes.size();
-    if (!x.own && x.e->body_len > keep_one)
+    // A writer whose file failed keeps counting what comes, to refuse it at its end, and holds none of it.
+    if (x.failed)
+        return;
+    x.buf.append(bytes);
+    // A record with its envelope stays within what a restart reads as one, however many recipients it has.
+    if (!x.own && x.buf.size() > keep_one)
         go_own(w);
     else if (x.own && x.buf.size() >= flush_at)
         pump(w);
@@ -715,7 +715,8 @@ void spool::pump(uint64_t w)
         {
             m_loop.close_fd(x.fd);
             x.fd = -1;
-            if (!m_io.unlinkat(AT_FDCWD, path_of(x.e->id), 0, [](int64_t) {})) {}
+            if (!m_io.unlinkat(AT_FDCWD, path_of(x.e->id), 0, [](int64_t) {}))
+                ::unlink(path_of(x.e->id).c_str());
         }
         if (x.aborted)
             m_writers.erase(it);
@@ -765,7 +766,12 @@ void spool::pump(uint64_t w)
                     pump(w);
                     return;
                 }
-                end(w, true);
+                // The file's name is the directory's, which is synced too before the sender is told it is taken.
+                if (m_dir_fd < 0 || !m_io.sync(m_dir_fd, false, [this, w, alive = m_alive](int64_t r) {
+                        if (*alive)
+                            end(w, r >= 0);
+                    }))
+                    end(w, m_dir_fd < 0 || ::fsync(m_dir_fd) == 0);
             }))
         {
             x.writing = false;
@@ -797,9 +803,9 @@ void spool::end(uint64_t w, bool ok)
                 settings::number<uint64_t>("SOCKETLEY_MAIL_SPOOL_KEEP_BYTES").value_or(keep_all);
             if (m_kept + e.body_len <= room)
             {
-                x->buf.erase(0, x->head);
-                m_kept += x->buf.size();
-                e.body = std::make_shared<const std::string>(std::move(x->buf));
+                // A copy of the body alone, its size what is counted, not the buffer's growth room.
+                e.body = std::make_shared<const std::string>(x->buf, x->head);
+                m_kept += e.body->size();
             }
             segment& s = m_segs[e.seg];
             ++s.live;
@@ -940,6 +946,13 @@ void spool::committed(bool ok)
             e.seg = gen;
             e.rec_len = static_cast<uint32_t>(q.len);
             e.body_off = body_off;
+            // A sync that failed may still have put the record on the disk; its sender is told to try again, so a
+            // restart must not deliver it as well.
+            if (!ok)
+            {
+                log(e.id + " x\n");
+                m_gone_in_seg[e.id] = gen;
+            }
             end(q.writer, ok);
             continue;
         }
@@ -971,6 +984,8 @@ void spool::prepare()
     {
         *job = std::move(m_free.back());
         m_free.pop_back();
+        // Its records end with its old generation, so the messages gone from it need no word in the log.
+        forget_gone(job->gen);
     }
     else
         job->path = m_dir + "/seg-" + std::to_string(m_next_file++) + ".spool";
@@ -1033,11 +1048,13 @@ void spool::recycle(uint32_t gen)
         return;
     segment s = std::move(it->second);
     m_segs.erase(it);
+    s.moving = false;
     if (m_free.size() + m_spare.size() < 2)
     {
         m_free.push_back(std::move(s));
         return;
     }
+    forget_gone(s.gen);
     m_loop.close_fd(s.fd);
     if (!m_io.unlinkat(AT_FDCWD, s.path, 0, [](int64_t) {}))
         ::unlink(s.path.c_str());
@@ -1045,6 +1062,8 @@ void spool::recycle(uint32_t gen)
 
 void spool::move_out(uint32_t gen)
 {
+    if (const auto s = m_segs.find(gen); s != m_segs.end())
+        s->second.moving = true;
     for (const auto& [id, e] : m_entries)
     {
         if (e->seg != gen)
@@ -1074,8 +1093,11 @@ void spool::tick(int64_t now_ms)
     if (now_ms - m_moved_ms < std::min<int64_t>(after, 10000))
         return;
     m_moved_ms = now_ms;
+    // The log written whole again once its appends outgrow it fourfold, past a mebibyte.
+    if (!m_log_compacting && m_log_grown > std::max<uint64_t>(1u << 20, m_log_base * 4))
+        compact_log();
     for (const auto& [gen, s] : m_segs)
-        if (s.sealed && s.live && s.live_bytes * 4 < seg_size && now_ms - s.sealed_ms >= after)
+        if (s.sealed && !s.moving && s.live && s.live_bytes * 4 < seg_size && now_ms - s.sealed_ms >= after)
         {
             move_out(gen);
             return;
@@ -1086,8 +1108,10 @@ void spool::log(std::string line)
 {
     if (m_log_fd < 0)
         return;
+    m_log_grown += line.size();
     m_log_buf += line;
-    if (m_log_writing)
+    // While the log is written whole, what is said meanwhile waits for the new file.
+    if (m_log_writing || m_log_compacting)
         return;
     m_log_writing = true;
     auto flying = std::make_shared<std::string>();
@@ -1105,6 +1129,109 @@ void spool::log(std::string line)
         // The ring had no room: the line goes in line, a small append to the page cache.
         if (!write_all(m_log_fd, flying->data(), flying->size())) {}
         m_log_writing = false;
+    }
+}
+
+std::string spool::log_text() const
+{
+    std::string out;
+    for (const auto& [id, gen] : m_gone_in_seg)
+        out += id + " x\n";
+    for (const auto& [id, e] : m_entries)
+    {
+        if (e->attempts)
+            out += id + " r " + std::to_string(e->attempts) + " " + std::to_string(e->next_ms) + "\n";
+        if (!e->auth.empty())
+            out += id + " a " + (e->folder.empty() ? "INBOX" : e->folder) + " " + e->auth + "\n";
+        if (e->delay_told)
+            out += id + " w\n";
+        for (size_t i = 0; i < e->rcpts.size(); ++i)
+        {
+            const spool_rcpt& r = e->rcpts[i];
+            if (r.state != rcpt_state::waiting)
+                out += id + (r.state == rcpt_state::delivered ? " d " : " f ") + std::to_string(i) + " " +
+                       one_line(r.why) + "\n";
+            if (r.told)
+                out += id + " b " + std::to_string(i) + "\n";
+            for (const auto& t : r.targets_done)
+                out += id + " t " + std::to_string(i) + " " + t + "\n";
+            for (const auto& t : r.targets_failed)
+                out += id + " u " + std::to_string(i) + " " + t + "\n";
+        }
+    }
+    return out;
+}
+
+void spool::compact_log()
+{
+    // What memory holds is the log's truth: it is written whole on a thread, and moved into the old one's place.
+    m_log_compacting = true;
+    auto text = std::make_shared<std::string>(log_text());
+    auto fd = std::make_shared<int>(-1);
+    m_pool.submit(0,
+                  [text, fd, dir = m_dir] {
+                      const std::string path = dir + "/state.log", tmp = path + ".tmp";
+                      const int w = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                      // The descriptor appends go to is opened before the move, so it is the new file's either way.
+                      const int a = w >= 0 ? ::open(tmp.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC) : -1;
+                      if (a < 0 || !write_all(w, text->data(), text->size()) || ::fsync(w) != 0 ||
+                          ::rename(tmp.c_str(), path.c_str()) != 0)
+                      {
+                          if (w >= 0)
+                              ::close(w);
+                          if (a >= 0)
+                              ::close(a);
+                          ::unlink(tmp.c_str());
+                          return;
+                      }
+                      ::close(w);
+                      const int d = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                      if (d >= 0)
+                      {
+                          if (::fsync(d) != 0) {}
+                          ::close(d);
+                      }
+                      *fd = a;
+                  },
+                  [this, text, fd, alive = m_alive] {
+                      if (!*alive)
+                      {
+                          if (*fd >= 0)
+                              ::close(*fd);
+                          return;
+                      }
+                      m_log_compacting = false;
+                      if (*fd >= 0)
+                      {
+                          if (m_log_fd >= 0)
+                              m_loop.close_fd(m_log_fd);
+                          m_log_fd = *fd;
+                          m_log_base = text->size();
+                          m_log_grown = m_log_buf.size();
+                      }
+                      if (!m_log_buf.empty() && !m_log_writing)
+                          log({});
+                  });
+}
+
+void spool::forget_gone(uint32_t gen)
+{
+    std::erase_if(m_gone_in_seg, [gen](const auto& kv) { return kv.second == gen; });
+}
+
+void spool::release_reader(const std::string& id)
+{
+    const auto it = m_readers.find(id);
+    if (it == m_readers.end())
+        return;
+    reader& r = it->second;
+    r.users -= std::min<uint32_t>(r.users, 1);
+    // A message waiting for its next try holds no descriptor: a queue of large ones would hold one each.
+    if (r.users == 0 && !r.opening)
+    {
+        if (r.fd >= 0)
+            m_loop.close_fd(r.fd);
+        m_readers.erase(it);
     }
 }
 
@@ -1169,14 +1296,19 @@ void spool::remove(const std::string& id)
     log(id + " x\n");
     if (e->seg)
     {
+        m_gone_in_seg[id] = e->seg;
         release(*e);
         return;
     }
     if (const auto r = m_readers.find(id); r != m_readers.end())
     {
+        // Reads waiting for the file to open are answered, not dropped.
+        auto waiting = std::move(r->second.waiting);
         if (r->second.fd >= 0)
             m_loop.close_fd(r->second.fd);
         m_readers.erase(r);
+        for (auto& f : waiting)
+            f(-1);
     }
     if (!m_io.unlinkat(AT_FDCWD, path_of(id), 0, [](int64_t) {}))
         ::unlink(path_of(id).c_str());
@@ -1235,21 +1367,27 @@ void spool::read(const entry_ptr& e, uint64_t off, uint32_t len,
             return;
         if (fd < 0)
         {
+            release_reader(id);
             cb(false, {});
             return;
         }
         auto buf = std::make_shared<std::string>(len, '\0');
-        if (!m_io.pread(fd, buf->data(), len, file_off, [buf, cb, len, alive](int64_t res) {
+        if (!m_io.pread(fd, buf->data(), len, file_off, [this, id, buf, cb, len, alive](int64_t res) {
                 if (!*alive)
                     return;
+                release_reader(id);
                 if (res != static_cast<int64_t>(len))
                     cb(false, {});
                 else
                     cb(true, *buf);
             }))
+        {
+            release_reader(id);
             cb(false, {});
+        }
     };
     reader& r = m_readers[id];
+    ++r.users;
     if (r.fd >= 0)
     {
         go(r.fd);

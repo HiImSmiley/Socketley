@@ -19,6 +19,7 @@
 #include "mail_verify.h"
 #include "../idp/idp_session.h"
 #include "../storage/password_hash.h"
+#include "../../shared/loop/blocking_write.h"
 #include "../../shared/crypto/tls_context.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/net/dns_feed.h"
@@ -415,6 +416,17 @@ void mail_run::stop()
         close_conn(*c);
     m_pool.stop();
     m_checks.stop();
+    // How many messages the spool still holds, for a remove that would otherwise delete mail it took.
+    if (!m_spool.dir().empty())
+    {
+        const std::string n = std::to_string(m_spool.entries().size()) + "\n";
+        const int fd = ::open((m_spool.dir() + "/queued").c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd >= 0)
+        {
+            if (!socketley::write_all(fd, n.data(), n.size())) {}
+            ::close(fd);
+        }
+    }
     m_spool.close();
     *m_alive = false;
 }

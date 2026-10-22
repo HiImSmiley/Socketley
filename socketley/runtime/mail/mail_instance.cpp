@@ -1,12 +1,15 @@
 #include "mail_instance.h"
 
+#include <charconv>
 #include <filesystem>
 
 #include "mail_run.h"
 #include "../../shared/net/dns_feed.h"
 #include "../../shared/persist/paths.h"
+#include "../../shared/persist/read_file.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/text_list.h"
+#include "../../shared/util/wall_clock.h"
 
 std::string mail_state_dir(std::string_view runtime_name, uint32_t shard, uint32_t shards)
 {
@@ -39,14 +42,37 @@ void mail_forget_state(std::string_view runtime_name)
     const std::filesystem::path base = socketley_paths::resolve().state_dir / "mail";
     const std::string stem(runtime_name);
     std::error_code ec;
+    std::vector<std::filesystem::path> gone;
     for (const auto& e : std::filesystem::directory_iterator(base, ec))
     {
         const std::string f = e.path().filename().string();
         const std::string_view rest = std::string_view(f).substr(std::min(f.size(), stem.size()));
         if (f.starts_with(stem) && (rest.empty() || rest.starts_with(".dkim.") || rest == ".suppressed" ||
+                                    rest == ".imap" || rest == ".sieve" ||
                                     (rest.front() == '.' && rest.size() > 1 &&
                                      rest.find_first_not_of("0123456789", 1) == std::string_view::npos)))
-            std::filesystem::remove_all(e.path(), ec);
+            gone.push_back(e.path());
+    }
+    for (const auto& p : gone)
+    {
+        // A spool that still holds mail it answered 250 for is kept aside, not deleted with the runtime.
+        std::string queued;
+        uint64_t n = 0;
+        if (socketley::read_file((p / "spool" / "queued").string(), queued) &&
+            std::from_chars(queued.data(), queued.data() + queued.size(), n).ec == std::errc() && n > 0)
+        {
+            const std::filesystem::path aside =
+                base / (p.filename().string() + ".held-" + std::to_string(socketley::wall::now_ms() / 1000));
+            std::filesystem::rename(p, aside, ec);
+            if (!ec)
+            {
+                LOG_WARN(("mail " + stem + ": " + std::to_string(n) + " queued message(s) are kept in " +
+                          aside.string() + "; delete it once they are not wanted")
+                             .c_str());
+                continue;
+            }
+        }
+        std::filesystem::remove_all(p, ec);
     }
     // And the records it gave a dns runtime.
     dns_feed::write_records(runtime_name, {});

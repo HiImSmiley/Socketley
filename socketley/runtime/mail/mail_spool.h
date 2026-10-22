@@ -175,6 +175,8 @@ private:
         uint32_t    reading{0};
         bool        sealed{false};
         int64_t     sealed_ms{0};
+        // Its messages are being moved out, which the next look at the segments does not start again.
+        bool        moving{false};
     };
     // A record waiting for the next commit: a writer's message, or a message moved out of a sparse segment.
     struct queued
@@ -197,6 +199,12 @@ private:
     void recycle(uint32_t gen);
     void move_out(uint32_t gen);
     void log(std::string line);
+    // The log as the messages here say it, and the messages gone whose records a segment still holds.
+    std::string log_text() const;
+    void compact_log();
+    void forget_gone(uint32_t gen);
+    // A message's file a read is done with, closed once no read holds it.
+    void release_reader(const std::string& id);
     std::string path_of(const std::string& id) const { return m_dir + "/" + id + ".msg"; }
     // The opened file of a message being read, kept while its delivery reads it.
     struct reader
@@ -213,8 +221,15 @@ private:
     std::string m_dir;
     bool        m_relaxed{false};
     int         m_log_fd{-1};
+    int         m_dir_fd{-1};
     std::string m_log_buf;
     bool        m_log_writing{false};
+    // Appended since the log was last written whole, and whether it is being written whole now.
+    uint64_t    m_log_grown{0};
+    uint64_t    m_log_base{0};
+    bool        m_log_compacting{false};
+    // Messages gone whose records stay in a segment until it is used again, so a restart does not bring them back.
+    std::unordered_map<std::string, uint32_t> m_gone_in_seg;
     std::map<std::string, entry_ptr> m_entries;
     std::unordered_map<uint64_t, std::unique_ptr<writer>> m_writers;
     std::unordered_map<std::string, reader> m_readers;
