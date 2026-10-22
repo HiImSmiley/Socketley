@@ -22,6 +22,7 @@
 #include "../../shared/persist/replaced_file.h"
 #include "../../shared/storage/storage_rpc.h"
 #include "../../shared/util/base64.h"
+#include "../../shared/util/crc.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/logging.h"
@@ -38,6 +39,40 @@ namespace rpc = socketley::storage_rpc;
 
 // A folder looked at again in the bucket no sooner than this after the last time.
 constexpr int64_t sync_ms = 2000;
+
+// A record of the trigram filters' file: magic, the length of what follows up to the CRC32C of it, the EMAILID's
+// length, the EMAILID and the filter.
+constexpr uint32_t filter_magic = 0x54464B53;   // "SKFT" as it lies in the file
+// The filters held for every user together, past which the least lately searched user's are let go until asked again.
+constexpr size_t filters_most_bytes = 64u << 20;
+
+uint32_t get32(const char* p)
+{
+    uint32_t v;
+    std::memcpy(&v, p, 4);
+    return v;
+}
+
+void put32(std::string& out, uint32_t v)
+{
+    char b[4];
+    std::memcpy(b, &v, 4);
+    out.append(b, 4);
+}
+
+std::string filter_record(const std::string& id, std::string_view filter)
+{
+    std::string body;
+    body += static_cast<char>(id.size());
+    body += id;
+    body += filter;
+    std::string out;
+    put32(out, filter_magic);
+    put32(out, static_cast<uint32_t>(body.size()));
+    out += body;
+    put32(out, socketley::crc::crc32c(body));
+    return out;
+}
 
 std::string canonical(const std::string& folder)
 {
@@ -1148,6 +1183,7 @@ void imap_store::tick(int64_t)
     }
     for (auto& [name, u] : m_users)
     {
+        write_text_filters(name, u);
         if (!u.loaded)
             continue;
         catch_up(u);
@@ -1170,6 +1206,21 @@ void imap_store::tick(int64_t)
         if (!u.compacting && u.log_off > (256u << 10) && u.log_off > u.snapshot_bytes &&
             (u.log_off >= u.compact_after || settled))
             compact(name, u);
+    }
+    // Past what every user's filters may take together, the least lately searched user's are read again when asked.
+    while (m_filter_bytes > filters_most_bytes)
+    {
+        user_state* oldest = nullptr;
+        for (auto& [name, u] : m_users)
+            if (u.filters_bytes && (!oldest || u.filters_used_ms < oldest->filters_used_ms))
+                oldest = &u;
+        if (!oldest)
+            break;
+        m_filter_bytes -= oldest->filters_bytes;
+        oldest->filters.clear();
+        oldest->filters_bytes = 0;
+        oldest->filters_ino = 0;
+        oldest->filters_off = 0;
     }
 }
 
@@ -1247,6 +1298,142 @@ void imap_store::freshen(const std::string& name, std::function<void()> done)
         for (const auto& f : names)
             open(name, f, [one](std::shared_ptr<imap_folder>) { one(); }, false, 60000);
         one();
+    });
+}
+
+void imap_store::read_text_filters(const std::string& name)
+{
+    user_state& u = user(name);
+    u.filters_used_ms = wall::now_ms_coarse();
+    const std::string path = u.base + ".fts";
+    struct stat st{};
+    const bool there = ::stat(path.c_str(), &st) == 0;
+    // A file compacted by another shard, or gone since it was read, is read again from its start; one not written yet
+    // leaves what this shard made alone.
+    if ((there && (st.st_ino != u.filters_ino || static_cast<uint64_t>(st.st_size) < u.filters_off)) ||
+        (!there && u.filters_ino))
+    {
+        m_filter_bytes -= u.filters_bytes;
+        u.filters.clear();
+        u.filters_bytes = 0;
+        u.filters_ino = there ? st.st_ino : 0;
+        u.filters_off = 0;
+    }
+    if (!there || static_cast<uint64_t>(st.st_size) == u.filters_off)
+        return;
+    // A file far past what a mailbox's filters take is not this runtime's to read, and its messages are read instead.
+    if (static_cast<uint64_t>(st.st_size) - u.filters_off > (256u << 20))
+    {
+        u.filters_off = static_cast<uint64_t>(st.st_size);
+        return;
+    }
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    std::string buf(static_cast<size_t>(st.st_size) - u.filters_off, '\0');
+    size_t got = 0;
+    while (got < buf.size())
+    {
+        const ssize_t n = ::pread(fd, buf.data() + got, buf.size() - got, static_cast<off_t>(u.filters_off + got));
+        if (n <= 0)
+            break;
+        got += static_cast<size_t>(n);
+    }
+    ::close(fd);
+    buf.resize(got);
+    // A record cut by a crash, or torn by a write still under way, is passed over to the next magic that checks out.
+    size_t at = 0;
+    while (at + 12 <= buf.size())
+    {
+        const uint32_t len = get32(buf.data() + at + 4);
+        if (get32(buf.data() + at) != filter_magic || len < 2 || len > (1u << 16))
+        {
+            ++at;
+            continue;
+        }
+        if (at + 12 + len > buf.size())
+            break;
+        const std::string_view body(buf.data() + at + 8, len);
+        const auto id_len = static_cast<unsigned char>(body[0]);
+        if (socketley::crc::crc32c(body) != get32(buf.data() + at + 8 + len) || 1u + id_len > len)
+        {
+            ++at;
+            continue;
+        }
+        hold_filter(u, std::string(body.substr(1, id_len)), std::string(body.substr(1 + id_len)));
+        at += 12 + len;
+    }
+    u.filters_off += at;
+}
+
+std::string_view imap_store::text_filter_of(const std::string& name, const std::string& email_id)
+{
+    const user_state& u = user(name);
+    const auto it = u.filters.find(email_id);
+    return it == u.filters.end() ? std::string_view{} : std::string_view(it->second);
+}
+
+void imap_store::keep_text_filter(const std::string& name, const std::string& email_id, std::string filter)
+{
+    user_state& u = user(name);
+    u.filters_out += filter_record(email_id, filter);
+    hold_filter(u, email_id, std::move(filter));
+}
+
+void imap_store::hold_filter(user_state& u, std::string id, std::string filter)
+{
+    const auto [it, fresh] = u.filters.try_emplace(std::move(id));
+    const size_t was = fresh ? 0 : it->first.size() + it->second.size();
+    it->second = std::move(filter);
+    const size_t now = it->first.size() + it->second.size();
+    u.filters_bytes = u.filters_bytes + now - was;
+    m_filter_bytes = m_filter_bytes + now - was;
+}
+
+void imap_store::write_text_filters(const std::string& name, user_state& u)
+{
+    if (u.filters_out.empty())
+        return;
+    // Every record in one write to the end, which another shard's appends do not cut into.
+    const std::string path = u.base + ".fts";
+    struct stat before{};
+    const bool had = ::stat(path.c_str(), &before) == 0;
+    // Where this shard had read the file to its end, what it appends is read already.
+    const bool current = had ? before.st_ino == u.filters_ino && static_cast<uint64_t>(before.st_size) == u.filters_off
+                             : u.filters_ino == 0;
+    const int fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    if (fd >= 0)
+    {
+        struct stat after{};
+        if (socketley::write_all(fd, u.filters_out.data(), u.filters_out.size()) && current && ::fstat(fd, &after) == 0 &&
+            static_cast<uint64_t>(after.st_size) == (had ? static_cast<uint64_t>(before.st_size) : 0) + u.filters_out.size())
+        {
+            u.filters_ino = after.st_ino;
+            u.filters_off = static_cast<uint64_t>(after.st_size);
+        }
+        ::close(fd);
+    }
+    u.filters_out.clear();
+    // A file grown past three times what the messages still there need is written again with theirs alone.
+    struct stat st{};
+    if (u.filters_compacting || ::stat((u.base + ".fts").c_str(), &st) != 0 || st.st_size < (1 << 20))
+        return;
+    std::set<std::string> live;
+    for (const auto& [n, f] : u.folders)
+        for (const auto& m : f->msgs)
+            live.insert(email_id(m.key));
+    std::string keep;
+    for (const auto& [id, f] : u.filters)
+        if (live.count(id))
+            keep += filter_record(id, f);
+    if (static_cast<uint64_t>(st.st_size) < 3 * keep.size())
+        return;
+    u.filters_compacting = true;
+    m_run.pool().submit(0, [path = u.base + ".fts", keep = std::move(keep)] {
+        if (!socketley::replace_file(path, keep, socketley::durability::none)) {}
+    }, [this, name, alive = m_alive] {
+        if (*alive)
+            user(name).filters_compacting = false;
     });
 }
 

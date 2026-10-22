@@ -10,6 +10,7 @@
 #include "imap_utf7.h"
 #include "mail_compose.h"
 #include "mail_mime.h"
+#include "mail_text.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/base64.h"
 #include "../../shared/crypto/mac.h"
@@ -398,26 +399,61 @@ struct query_cand
     std::string id;
     imap_message m;
     std::string mailbox;
-    std::string head, whole;
+    std::string head;
+    bool hit{false};
 };
 
-bool has_text(std::string_view hay, std::string_view needle)
+// The strings a FilterCondition looks for in an Email, given to `take`.
+template <typename F>
+void needles_of(const jvalue& f, F&& take)
 {
-    std::string a(hay), b(needle);
-    socketley::ascii::lower_in_place(a);
-    socketley::ascii::lower_in_place(b);
-    return a.find(b) != std::string::npos;
+    for (const char* k : {"text", "body", "from", "to", "cc", "bcc", "subject"})
+        if (const std::string_view v = json::string_of(f, k); !v.empty())
+            take(v);
+    if (const jvalue* hv = json::member(f, "header"); hv && hv->k == jvalue::kind::array && hv->items.size() > 1)
+        take(std::string_view(hv->items[1].s));
 }
 
-// Whether an Email meets a FilterCondition or a FilterOperator, read off the index and what was read of it.
-bool meets(const jvalue& f, const query_cand& c, int depth = 0)
+// Whether a filter looks for a string a trigram filter can rule out.
+bool filters_out(const jvalue& f, int depth = 0)
+{
+    bool any = false;
+    needles_of(f, [&](std::string_view v) { any = any || v.size() >= 3; });
+    if (const jvalue* conds = json::member(f, "conditions"); conds && conds->k == jvalue::kind::array && depth < 16)
+        for (const auto& x : conds->items)
+            any = any || filters_out(x, depth + 1);
+    return any;
+}
+
+// Whether an Email whose trigram filter is `filter` may meet `f`: false only where it cannot.
+bool may_meet(const jvalue& f, std::string_view filter, int depth = 0)
+{
+    if (const jvalue* conds = json::member(f, "conditions"); conds && conds->k == jvalue::kind::array)
+    {
+        const std::string_view op = json::string_of(f, "operator");
+        // A NOT of what a filter says may be there cannot be ruled out by it.
+        if (op == "NOT" || depth >= 16)
+            return true;
+        size_t may = 0;
+        for (const auto& x : conds->items)
+            may += may_meet(x, filter, depth + 1);
+        return op == "OR" ? may > 0 : may == conds->items.size();
+    }
+    bool may = true;
+    needles_of(f, [&](std::string_view v) { may = may && may_hold(filter, v); });
+    return may;
+}
+
+// Whether an Email meets a FilterCondition or a FilterOperator, read off the index and what was read of it: `whole` its
+// bytes and `root` their structure where a condition reads the body.
+bool meets(const jvalue& f, const query_cand& c, std::string_view whole, const mime::part* root, int depth = 0)
 {
     if (const jvalue* conds = json::member(f, "conditions"); conds && conds->k == jvalue::kind::array)
     {
         const std::string_view op = json::string_of(f, "operator");
         size_t yes = 0;
         for (const auto& x : conds->items)
-            yes += depth < 16 && meets(x, c, depth + 1);
+            yes += depth < 16 && meets(x, c, whole, root, depth + 1);
         return op == "OR" ? yes > 0 : op == "NOT" ? yes == 0 : yes == conds->items.size();
     }
     if (const jvalue* v = json::member(f, "inMailbox"); v && v->k == jvalue::kind::string && v->s != c.mailbox)
@@ -443,25 +479,28 @@ bool meets(const jvalue& f, const query_cand& c, int depth = 0)
         if (const std::string_view want = json::string_of(f, h); !want.empty())
         {
             const std::string v = header_value(c.head, h);
-            if (!has_text(std::string_view(h) == "subject" ? mime::decode_words(v) : v + " " + mime::decode_words(v), want))
+            if (!contains_ci(mime::decode_words(v), want) && (std::string_view(h) == "subject" || !contains_ci(v, want)))
                 return false;
         }
     if (const jvalue* hv = json::member(f, "header"); hv && hv->k == jvalue::kind::array && !hv->items.empty())
     {
         const std::string v = header_value(c.head, hv->items[0].s);
-        if (v.empty() || (hv->items.size() > 1 && !has_text(v, hv->items[1].s)))
+        if (v.empty() || (hv->items.size() > 1 && !contains_ci(v, hv->items[1].s)))
             return false;
     }
-    if (const std::string_view b = json::string_of(f, "body"); !b.empty() && !has_text(std::string_view(c.whole).substr(header_block(c.whole).size()), b))
+    if (const std::string_view b = json::string_of(f, "body"); !b.empty() && !body_has(whole, header_block(whole), root, b))
         return false;
-    if (const std::string_view t = json::string_of(f, "text"); !t.empty() && !has_text(c.whole, t))
+    if (const std::string_view t = json::string_of(f, "text"); !t.empty() && !text_has(whole, header_block(whole), root, t))
         return false;
     if (const jvalue* a = json::member(f, "hasAttachment"); a && a->k == jvalue::kind::boolean)
     {
-        const mime::part root = mime::parse(c.whole);
-        body_part tree = number_parts(root, root.multipart() ? std::string() : std::string("1"));
+        // An Email that could not be read has no attachment.
         std::vector<const body_part*> text, html, att;
-        pick({&tree}, "mixed", false, &html, &text, att);
+        if (root)
+        {
+            body_part tree = number_parts(*root, root->multipart() ? std::string() : std::string("1"));
+            pick({&tree}, "mixed", false, &html, &text, att);
+        }
         if (a->b != !att.empty())
             return false;
     }
@@ -1049,6 +1088,8 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
         std::string sort_by{"receivedAt"};
         bool ascending{false};
         bool looping{false}, waiting{false};
+        // Whether trigram filters may rule Emails out, and whether the one being read had none yet.
+        bool filtering{false}, unfiltered{false};
     };
     auto j = std::make_shared<job>();
     j->args = args;
@@ -1080,37 +1121,66 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
     }
     for (const auto& f : m_store.known(m_user))
         for (const auto& m : f->msgs)
-            j->all.push_back({imap_store::email_id(m.key), m, f->id(), {}, {}});
+            j->all.push_back({imap_store::email_id(m.key), m, f->id(), {}, false});
+    j->filtering = j->whole && filter && filters_out(*filter);
+    if (j->filtering)
+        m_store.read_text_filters(m_user);
     auto step = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak = step;
     *step = [this, j, weak, done, alive = m_alive] {
         auto self = weak.lock();
         if (!*alive || !self)
             return;
-        // What the filter or the sort reads is read for each Email, one after the other; one the store holds goes on
-        // in this loop rather than a call deeper.
+        // What the filter or the sort reads is read for each Email, one after the other, and judged as it comes, so
+        // only its header is kept; one the store holds goes on in this loop rather than a call deeper.
+        const jvalue* filter = json::member(j->args, "filter");
         j->looping = true;
-        while ((j->head || j->whole) && j->at < j->all.size())
+        while (j->at < j->all.size())
         {
             const size_t i = j->at++;
+            cand& c = j->all[i];
+            if (!j->head && !j->whole)
+            {
+                c.hit = !filter || meets(*filter, c, {}, nullptr);
+                continue;
+            }
+            // An Email its trigram filter rules out is passed without being read; one without a filter is given one.
+            if (j->filtering)
+            {
+                const std::string_view f = m_store.text_filter_of(m_user, c.id);
+                j->unfiltered = f.empty();
+                if (!j->unfiltered && !may_meet(*filter, f))
+                    continue;
+            }
             j->waiting = true;
-            const auto got = [j, self, alive, i](std::shared_ptr<const std::string> b) {
+            const auto got = [this, j, self, alive, i, filter](std::shared_ptr<const std::string> b) {
                 if (!*alive)
                     return;
-                if (b)
+                cand& c = j->all[i];
+                const std::string_view whole = b ? std::string_view(*b) : std::string_view{};
+                c.head = std::string(header_block(whole));
+                const std::shared_ptr<const mime::part> root =
+                    j->whole && b && !b->empty() ? m_store.structure(c.m.key, b) : nullptr;
+                // An Email read for want of a filter is given one first, which may spare it the filter itself.
+                bool may = true;
+                if (j->filtering && j->unfiltered && root)
                 {
-                    j->all[i].head = std::string(header_block(*b));
-                    if (j->whole)
-                        j->all[i].whole = *b;
+                    std::string tf = text_filter(whole, c.head, root.get());
+                    may = may_meet(*filter, tf);
+                    m_store.keep_text_filter(m_user, c.id, std::move(tf));
                 }
+                c.hit = may && (!filter || meets(*filter, c, whole, root.get()));
+                // The header is kept only where the sort reads it.
+                if (!c.hit || j->sort_by == "receivedAt" || j->sort_by == "size")
+                    std::string().swap(c.head);
                 j->waiting = false;
                 if (!j->looping)
                     (*self)();
             };
             if (j->whole)
-                m_store.body(j->all[i].m.key, j->all[i].m.size, got);
+                m_store.body(c.m.key, c.m.size, got);
             else
-                m_store.head(j->all[i].m.key, j->all[i].m.size, got);
+                m_store.head(c.m.key, c.m.size, got);
             if (j->waiting)
             {
                 j->looping = false;
@@ -1118,10 +1188,9 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
             }
         }
         j->looping = false;
-        const jvalue* filter = json::member(j->args, "filter");
         std::vector<cand*> hits;
         for (auto& c : j->all)
-            if (!filter || meets(*filter, c))
+            if (c.hit)
                 hits.push_back(&c);
         const auto key = [&](const cand& c) -> std::string {
             if (j->sort_by == "subject")

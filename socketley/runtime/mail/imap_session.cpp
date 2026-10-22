@@ -11,6 +11,7 @@
 #include "imap_order.h"
 #include "imap_utf7.h"
 #include "mail_compose.h"
+#include "mail_text.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/base64.h"
 
@@ -155,70 +156,6 @@ bool wildmatch(std::string_view pat, std::string_view name)
         can.swap(next);
     }
     return can[name.size()];
-}
-
-// Whether `hay` holds `needle`, letters of either case alike: Knuth-Morris-Pratt, so a long needle of a repeated
-// letter costs the haystack's length and not its product with the needle's.
-bool contains_ci(std::string_view hay, std::string_view needle)
-{
-    const size_t m = needle.size();
-    if (m == 0)
-        return true;
-    if (hay.size() < m)
-        return false;
-    using socketley::ascii::lower;
-    std::vector<size_t> fail(m, 0);
-    for (size_t i = 1, k = 0; i < m; ++i)
-    {
-        while (k > 0 && lower(needle[i]) != lower(needle[k]))
-            k = fail[k - 1];
-        if (lower(needle[i]) == lower(needle[k]))
-            ++k;
-        fail[i] = k;
-    }
-    for (size_t i = 0, k = 0; i < hay.size(); ++i)
-    {
-        while (k > 0 && lower(hay[i]) != lower(needle[k]))
-            k = fail[k - 1];
-        if (lower(hay[i]) == lower(needle[k]) && ++k == m)
-            return true;
-    }
-    return false;
-}
-
-// Whether a header of `head` named `name` holds `needle`, as it is written or with its encoded words decoded; every
-// header of the name, not only the first (RFC 3501 6.4.4).
-bool header_has(std::string_view head, std::string_view name, std::string_view needle)
-{
-    for (const auto& [n, v] : split_headers(head))
-    {
-        std::string_view nn = n;
-        while (!nn.empty() && (nn.back() == ' ' || nn.back() == '\t'))
-            nn.remove_suffix(1);
-        if (!name.empty() && !socketley::ascii::iequals(nn, name))
-            continue;
-        if (contains_ci(v, needle) || (v.find("=?") != std::string_view::npos && contains_ci(mime::decode_words(v), needle)))
-            return true;
-    }
-    return false;
-}
-
-// Whether a text part of the message holds `needle` once its transfer encoding and its charset are undone.
-bool text_has(std::string_view msg, const mime::part& p, std::string_view needle, int depth = 0)
-{
-    if (depth > 32)
-        return false;
-    for (const auto& c : p.children)
-        if (text_has(msg, c, needle, depth + 1))
-            return true;
-    if (!p.children.empty() || p.type != "text" || p.body_off + p.body_len > msg.size())
-        return false;
-    std::string charset;
-    for (const auto& [k, v] : p.params)
-        if (socketley::ascii::iequals(k, "charset"))
-            charset = v;
-    const std::string body = mime::decoded_body(msg.substr(p.body_off, p.body_len), p.encoding);
-    return contains_ci(mime::to_utf8(body, charset), needle);
 }
 
 // UIDs as a sequence set, runs written as ranges: 1:3,7,9:12.
@@ -2491,10 +2428,42 @@ bool matches(const crit& c, const imap_message& m, size_t idx, std::string_view 
     if (k == "FROM" || k == "TO" || k == "CC" || k == "BCC" || k == "SUBJECT")
         return header_has(head, k, c.arg);
     if (k == "BODY")
-        return contains_ci(msg.substr(head.size()), c.arg) || (root && text_has(msg, *root, c.arg));
+        return body_has(msg, head, root, c.arg);
     if (k == "TEXT")
-        return contains_ci(msg, c.arg) || header_has(head, {}, c.arg) || (root && text_has(msg, *root, c.arg));
+        return text_has(msg, head, root, c.arg);
     return false;
+}
+
+// The string a criterion looks for in the message, empty where it looks for none.
+std::string_view needle_of(const crit& c)
+{
+    if (c.key == "BODY" || c.key == "TEXT" || c.key == "FROM" || c.key == "TO" || c.key == "CC" || c.key == "BCC" ||
+        c.key == "SUBJECT")
+        return c.arg;
+    return c.key == "HEADER" ? std::string_view(c.arg2) : std::string_view{};
+}
+
+// Whether a criterion looks for a string a trigram filter can rule out.
+bool filters_out(const crit& c)
+{
+    if (needle_of(c).size() >= 3)
+        return true;
+    return std::any_of(c.kids.begin(), c.kids.end(), [](const crit& k) { return filters_out(k); });
+}
+
+// Whether message `m`, whose trigram filter is `filter`, may meet `c`: false only where it cannot.
+bool may_meet(const crit& c, const imap_message& m, size_t idx, std::string_view filter)
+{
+    if (!c.content())
+        return matches(c, m, idx, {}, {}, nullptr);
+    if (c.key == "AND")
+        return std::all_of(c.kids.begin(), c.kids.end(), [&](const crit& k) { return may_meet(k, m, idx, filter); });
+    if (c.key == "OR")
+        return may_meet(c.kids[0], m, idx, filter) || may_meet(c.kids[1], m, idx, filter);
+    // A NOT of what a filter says may be there cannot be ruled out by it.
+    if (c.key == "NOT")
+        return true;
+    return may_hold(filter, needle_of(c));
 }
 
 }   // namespace
@@ -2566,10 +2535,16 @@ void imap_session::cmd_search(const std::string& tag, const std::vector<token>& 
         std::shared_ptr<const std::string> bytes;
         bool looping{false}, waiting{false};
         size_t ahead{0};
+        // The EMAILID of the message being read, and whether it had no trigram filter yet.
+        std::string id;
+        bool unfiltered{false};
     };
     auto j = std::make_shared<job>();
     j->all = std::move(all);
     const bool content = j->all.content();
+    const bool filtering = content && filters_out(j->all);
+    if (filtering)
+        m_store.read_text_filters(m_owner);
     // A search of headers reads the headers alone; one of the text, the whole message.
     const bool whole = j->all.decoded();
     const bool modseq = asks_modseq(j->all);
@@ -2578,7 +2553,7 @@ void imap_session::cmd_search(const std::string& tag, const std::vector<token>& 
     m_waiting = true;
     auto step = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak = step;
-    *step = [this, j, tag, uid, content, whole, modseq, esearch, want, weak, alive = m_alive]() {
+    *step = [this, j, tag, uid, content, whole, filtering, modseq, esearch, want, weak, alive = m_alive]() {
         auto self = weak.lock();
         if (!*alive || !self)
             return;
@@ -2599,6 +2574,18 @@ void imap_session::cmd_search(const std::string& tag, const std::vector<token>& 
                 j->looping = false;
                 m_hooks.later([self] { (*self)(); });
                 return;
+            }
+            // A message its trigram filter rules out is passed without being read; one without a filter is given one.
+            if (filtering && !j->bytes)
+            {
+                j->id = imap_store::email_id(m->key);
+                const std::string_view f = m_store.text_filter_of(m_owner, j->id);
+                j->unfiltered = f.empty();
+                if (!j->unfiltered && !may_meet(j->all, *m, idx, f))
+                {
+                    ++j->at;
+                    continue;
+                }
             }
             if (content && !j->bytes)
             {
@@ -2637,7 +2624,15 @@ void imap_session::cmd_search(const std::string& tag, const std::vector<token>& 
             const std::string_view head = header_block(msg);
             const std::shared_ptr<const mime::part> root =
                 whole && j->bytes && !j->bytes->empty() ? m_store.structure(m->key, j->bytes) : nullptr;
-            if (matches(j->all, *m, idx, msg, head, root.get()))
+            // A message read for want of a filter is given one first, which may spare it the search itself.
+            bool may = true;
+            if (filtering && j->unfiltered && root)
+            {
+                std::string f = text_filter(msg, head, root.get());
+                may = may_meet(j->all, *m, idx, f);
+                m_store.keep_text_filter(m_owner, j->id, std::move(f));
+            }
+            if (may && matches(j->all, *m, idx, msg, head, root.get()))
             {
                 j->hits.push_back(uid ? m->uid : static_cast<uint32_t>(idx + 1));
                 j->top_modseq = std::max(j->top_modseq, m->modseq);
@@ -2764,16 +2759,22 @@ void imap_session::cmd_order(const std::string& tag, const std::vector<token>& a
         std::shared_ptr<const std::string> bytes;
         bool looping{false}, waiting{false};
         size_t ahead{0};
+        // The EMAILID of the message being read, and whether it had no trigram filter yet.
+        std::string id;
+        bool unfiltered{false};
     };
     auto j = std::make_shared<job>();
     j->all = std::move(all);
     const bool read_bytes = headers || j->all.content();
     // SORT and THREAD read headers; only a search of the text needs the whole message.
     const bool whole = j->all.decoded();
+    const bool filtering = j->all.content() && filters_out(j->all);
+    if (filtering)
+        m_store.read_text_filters(m_owner);
     m_waiting = true;
     auto step = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak = step;
-    *step = [this, j, tag, uid, thread, keys, algorithm, what, read_bytes, whole, weak, alive = m_alive]() {
+    *step = [this, j, tag, uid, thread, keys, algorithm, what, read_bytes, whole, filtering, weak, alive = m_alive]() {
         auto self = weak.lock();
         if (!*alive || !self)
             return;
@@ -2793,6 +2794,18 @@ void imap_session::cmd_order(const std::string& tag, const std::vector<token>& a
                 j->looping = false;
                 m_hooks.later([self] { (*self)(); });
                 return;
+            }
+            // A message its trigram filter rules out is passed without being read; one without a filter is given one.
+            if (filtering && !j->bytes)
+            {
+                j->id = imap_store::email_id(m->key);
+                const std::string_view f = m_store.text_filter_of(m_owner, j->id);
+                j->unfiltered = f.empty();
+                if (!j->unfiltered && !may_meet(j->all, *m, idx, f))
+                {
+                    ++j->at;
+                    continue;
+                }
             }
             if (read_bytes && !j->bytes)
             {
@@ -2831,7 +2844,15 @@ void imap_session::cmd_order(const std::string& tag, const std::vector<token>& a
             const std::string_view head = header_block(msg);
             const std::shared_ptr<const mime::part> root =
                 whole && j->bytes && !j->bytes->empty() ? m_store.structure(m->key, j->bytes) : nullptr;
-            if (matches(j->all, *m, idx, msg, head, root.get()))
+            // A message read for want of a filter is given one first, which may spare it the search itself.
+            bool may = true;
+            if (filtering && j->unfiltered && root)
+            {
+                std::string f = text_filter(msg, head, root.get());
+                may = may_meet(j->all, *m, idx, f);
+                m_store.keep_text_filter(m_owner, j->id, std::move(f));
+            }
+            if (may && matches(j->all, *m, idx, msg, head, root.get()))
             {
                 imap_order::entry e;
                 e.number = uid ? m->uid : static_cast<uint32_t>(idx + 1);

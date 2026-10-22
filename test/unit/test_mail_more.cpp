@@ -2,6 +2,7 @@
 #include "doctest.h"
 
 #include <ctime>
+#include <random>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -13,6 +14,8 @@
 #include "runtime/mail/mail_reports.h"
 #include "runtime/mail/mail_rspamd.h"
 #include "runtime/mail/mail_srs.h"
+#include "runtime/mail/mail_text.h"
+#include "runtime/mail/mail_compose.h"
 #include "runtime/mail/pop3_session.h"
 #include "shared/util/inflate.h"
 
@@ -235,4 +238,134 @@ TEST_CASE("rspamd: the top-level score, not a symbol's, and the levels spamtest 
     CHECK(v.level() == 1);
     v.score = 40;
     CHECK(v.level() == 10);
+}
+
+namespace
+{
+
+// A message with what search reads in every form: a folded header, encoded words, a quoted-printable text part, a
+// base64 text part in another charset, and an attachment.
+std::string search_message()
+{
+    return "From: =?UTF-8?Q?J=C3=BCrgen_M=C3=BCller?= <jm@else.test>\r\n"
+           "To: alice@example.test\r\n"
+           "Subject: a subject that is folded\r\n"
+           " over two lines\r\n"
+           "Message-ID: <s1@else.test>\r\n"
+           "MIME-Version: 1.0\r\n"
+           "Content-Type: multipart/mixed; boundary=b\r\n"
+           "\r\n"
+           "--b\r\n"
+           "Content-Type: text/plain; charset=utf-8\r\n"
+           "Content-Transfer-Encoding: quoted-printable\r\n"
+           "\r\n"
+           "Gr=C3=BC=C3=9Fe aus K=C3=B6ln, the meeting is at noon and the long word is extraordin=\r\n"
+           "arily split\r\n"
+           "--b\r\n"
+           "Content-Type: text/plain; charset=iso-8859-1\r\n"
+           "Content-Transfer-Encoding: base64\r\n"
+           "\r\n"
+           "U2No9m5lIEfkc3RlIGluIExhdGluLTE=\r\n"
+           "--b\r\n"
+           "Content-Type: application/octet-stream\r\n"
+           "Content-Disposition: attachment; filename=report.bin\r\n"
+           "Content-Transfer-Encoding: base64\r\n"
+           "\r\n"
+           "c2VjcmV0aW5zaWRldGhlYXR0YWNobWVudA==\r\n"
+           "--b--\r\n";
+}
+
+}   // namespace
+
+TEST_CASE("search: what a client looks for is found decoded, and what an attachment holds is not")
+{
+    const std::string msg = search_message();
+    const std::string_view head = header_block(msg);
+    const mime::part root = mime::parse(msg);
+    // A quoted-printable soft break, and a charset undone.
+    CHECK(body_has(msg, head, &root, "extraordinarily"));
+    CHECK(body_has(msg, head, &root, "GRÜßE AUS KÖLN") == false);
+    CHECK(body_has(msg, head, &root, "Grüße aus Köln"));
+    CHECK(body_has(msg, head, &root, "schöne gäste"));
+    // As written, too.
+    CHECK(body_has(msg, head, &root, "K=C3=B6ln"));
+    // An encoded word, and a header the body does not hold.
+    CHECK(header_has(head, "From", "jürgen müller"));
+    CHECK(text_has(msg, head, &root, "jürgen"));
+    CHECK(body_has(msg, head, &root, "jürgen") == false);
+    // What only an attachment holds, written or decoded, is nowhere; its name is in its part's header.
+    CHECK(text_has(msg, head, &root, "c2VjcmV0") == false);
+    CHECK(text_has(msg, head, &root, "secretinside") == false);
+    CHECK(text_has(msg, head, &root, "report.bin"));
+}
+
+TEST_CASE("search: a message's trigram filter lets through every string the search finds in it")
+{
+    const std::string msg = search_message();
+    const std::string_view head = header_block(msg);
+    const mime::part root = mime::parse(msg);
+    const std::string filter = text_filter(msg, head, &root);
+    // Every piece of the message as written, of its decoded text and of its headers as a client reads them.
+    std::vector<std::string> sources = {msg, "Grüße aus Köln, the meeting is at noon and the long word is extraordinarily split",
+                                        "Schöne Gäste in Latin-1", "Jürgen Müller <jm@else.test>",
+                                        "a subject that is folded over two lines"};
+    size_t tried = 0, missed = 0;
+    for (const auto& src : sources)
+        for (size_t len = 3; len <= 12; ++len)
+            for (size_t at = 0; at + len <= src.size(); ++at)
+            {
+                const std::string_view needle(src.data() + at, len);
+                // As IMAP finds it, and as JMAP reads a header: its folds undone.
+                const bool found = text_has(msg, head, &root, needle) || contains_ci(header_value(head, "Subject"), needle) ||
+                                   contains_ci(mime::decode_words(header_value(head, "From")), needle);
+                if (!found)
+                    continue;
+                ++tried;
+                if (!may_hold(filter, needle))
+                    ++missed;
+                std::string upper(needle);
+                for (char& c : upper)
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (!may_hold(filter, upper))
+                    ++missed;
+            }
+    CHECK(tried > 5000);
+    CHECK(missed == 0);
+    // A string shorter than a trigram, and a filter this build cannot read, rule nothing out.
+    CHECK(may_hold(filter, "zq"));
+    CHECK(may_hold("", "anything at all"));
+    CHECK(may_hold(std::string("\x07\x08", 2), "anything at all"));
+}
+
+TEST_CASE("search: a trigram filter rules out nearly every string a message does not hold")
+{
+    const std::string msg = search_message();
+    const std::string_view head = header_block(msg);
+    const mime::part root = mime::parse(msg);
+    const std::string filter = text_filter(msg, head, &root);
+    std::mt19937 rnd(7);
+    size_t through = 0;
+    for (int i = 0; i < 20000; ++i)
+    {
+        std::string w;
+        for (int k = 0; k < 8; ++k)
+            w += static_cast<char>('a' + rnd() % 26);
+        if (!text_has(msg, head, &root, w) && may_hold(filter, w))
+            ++through;
+    }
+    CHECK(through < 20);
+    // What only the attachment holds is ruled out like the rest.
+    CHECK(may_hold(filter, "secretinsidetheattachment") == false);
+}
+
+TEST_CASE("search: past a mebibyte a message's filter holds anything, and an empty message's nothing")
+{
+    std::string big = "Subject: big\r\n\r\n";
+    for (int i = 0; i < 40000; ++i)
+        big += "line " + std::to_string(i) + " of a long message\r\n";
+    const mime::part root = mime::parse(big);
+    CHECK(may_hold(text_filter(big, header_block(big), &root), "nowhere in it"));
+    const std::string empty = "\r\n";
+    const mime::part none = mime::parse(empty);
+    CHECK(may_hold(text_filter(empty, header_block(empty), &none), "anything") == false);
 }

@@ -12997,7 +12997,14 @@ quota counts it at once. The bucket stays what counts: listed when a folder is
 selected, and every minute under NOOP and IDLE, what went from it is expunged,
 and a message no line names is given the next UID once it is a minute old. Every change of a message has the folder's next
 mod\-sequence, so a client that reconnects asks for what changed and vanished
-since it last looked. A user's
+since it last looked. SEARCH, SORT and THREAD, like JMAP's text, body and
+header filters, read a message's header as written and with its encoded words
+decoded and its text parts as written and with their transfer encoding and
+charset undone, not its attachments. A filter of each message's trigrams, made
+the first time a search reads the message and kept in
+.IB state /mail/ name .imap/ user .fts
+for every shard, rules out what cannot hold the string asked for, so a search
+reads only the messages that may. A user's
 .B mail_quota
 field in the idp runtime
 .RB ( "socketley idp\-user" " ... " "\-\-set mail_quota=500M" )

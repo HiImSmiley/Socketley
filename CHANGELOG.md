@@ -26,7 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with `socketley mail <name> sieve` or over ManageSieve on `--sieve`) into a
   bucket, bounded by their `mail_quota`, and read over IMAP4rev1 with IDLE,
   CONDSTORE and QRESYNC, SORT, THREAD, QUOTA and COMPRESS=DEFLATE from every
-  shard, which share each user's UIDs through a journal. `socketley send`, a
+  shard, which share each user's UIDs through a journal. A search reads the
+  text decoded, not the attachments, and only the messages a filter of their
+  trigrams does not rule out: a word in none of 2,000 messages is answered in
+  6 ms where reading them took 186. `socketley send`, a
   script's `socketley.mail.send`, a storage's `mail://` notification target
   and `daemon.alert_mail` send through it. Measured against Postfix on this
   machine it took 7,140 messages of 1 KB a second from 50 clients to Postfix's

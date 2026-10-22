@@ -108,6 +108,12 @@ public:
     void folders(const std::string& user, std::function<void(std::vector<std::string>)> done);
     // The user's folders listed and each brought up to the bucket at most once a minute, for a client that never SELECTs.
     void freshen(const std::string& user, std::function<void()> done);
+    // The trigram filters of the user's messages read in as far as any shard wrote them, before a search asks for them.
+    void read_text_filters(const std::string& user);
+    // A message's trigram filter by its EMAILID, empty where none was made yet.
+    std::string_view text_filter_of(const std::string& user, const std::string& email_id);
+    // A message's filter kept for later searches, and written for every shard at the next tick.
+    void keep_text_filter(const std::string& user, const std::string& email_id, std::string filter);
     // A folder brought up to what the bucket holds, listed again where it was last listed longer than `max_age_ms` ago;
     // null when it does not exist and is not one every mailbox has.
     void open(const std::string& user, const std::string& folder, std::function<void(std::shared_ptr<imap_folder>)> done,
@@ -240,8 +246,21 @@ private:
         size_t meta_count{0};
         // When freshen last listed the bucket for this user.
         int64_t listed_ms{0};
+        // Trigram filters by EMAILID, as far as their file was read, and those made here and not yet written to it.
+        std::unordered_map<std::string, std::string> filters;
+        uint64_t filters_ino{0};
+        uint64_t filters_off{0};
+        size_t filters_bytes{0};
+        std::string filters_out;
+        int64_t filters_used_ms{0};
+        bool filters_compacting{false};
     };
     user_state& user(const std::string& name);
+    // A filter held in memory and counted against what every user's may take together.
+    void hold_filter(user_state& u, std::string id, std::string filter);
+    // The filters made here appended to the user's file, which is written again once it is mostly for messages gone.
+    void write_text_filters(const std::string& name, user_state& u);
+    size_t m_filter_bytes{0};
     // Uploads older than a day taken away, a page of them each hour.
     void sweep_uploads(std::string after = {});
     int64_t m_uploads_swept_ms{0};
