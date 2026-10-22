@@ -173,7 +173,8 @@ case "$id" in queued\ *) ok "socketley send queues a message" ;; *) bad "socketl
 f=$(mail_with "cli body")
 [ -n "$f" ] && grep -q '^DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.test; s=skl;' "$f" \
     && ok "and it arrives signed for its domain" || bad "and it arrives signed for its domain" "$(head -12 "$f" 2>/dev/null)"
-"$BIN" send m --subject x >/dev/null 2>&1; check "a message with no recipient is refused" "$?" "1"
+r=$("$BIN" send m --subject x 2>&1); rc=$?
+check "a message with no recipient is refused, and said why" "$rc ${r%%:*}" "1 send to a mail runtime needs a recipient"
 
 # ─── what the other side refuses ────────────────────────────────────────────
 "$BIN" send m --from erin@remote.test --to bad@remote.test --subject "will bounce" --text "bounced body" >/dev/null 2>&1
@@ -275,7 +276,8 @@ LUA
 mail_with "lua body" >/dev/null && ok "socketley.mail.send from another runtime's script queues and sends" \
     || bad "socketley.mail.send from another runtime's script queues and sends" "$(tail -3 "$SOCKETLEY_DLOG")"
 
-"$BIN" mail m show nosuchid >/dev/null 2>&1; check "show of a message not queued says so" "$?" "1"
+r=$("$BIN" mail m show nosuchid 2>&1); rc=$?
+check "show of a message not queued says so" "$rc $r" "1 error: no message nosuchid is queued"
 
 # ─── a blocklist ────────────────────────────────────────────────────────────
 "$BIN" create mail mb -p $((SL_PORT_BASE+1987)) --mail-domain example.test --aliases "$T/aliases" --dnsbl bl.test -s \

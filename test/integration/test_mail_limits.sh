@@ -6,6 +6,7 @@
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
 #   * one address holding every connection, or a full runtime closing a connection without a word
+#   * more recipients taken in one message than --max-recipients
 #   * input a client pipelines while a command waits, or replies it never reads, held in memory without bound
 #   * passwords guessed from one address without end, spread over connections
 #   * --rate-limit accepted and not applied
@@ -40,6 +41,7 @@ SINK=$((SL_PORT_BASE+1972))
 NS=$((SL_PORT_BASE+1973))
 PF=$((SL_PORT_BASE+1974))
 PR=$((SL_PORT_BASE+1975))
+PRC=$((SL_PORT_BASE+1976))
 PIDS=()
 cleanup() {
     for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
@@ -69,7 +71,8 @@ daemon_start "$BIN"
     --cert "$T/cert.pem" --key "$T/key.pem" --max-size 1000000 -s >/dev/null 2>&1
 "$BIN" create mail full -p "$PF" --mail-domain example.test --max-connections 3 -s >/dev/null 2>&1
 "$BIN" create mail rated -p "$PR" --mail-domain example.test --rate-limit 2 -s >/dev/null 2>&1
-for p in "$P" "$SUB" "$PF" "$PR"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens" "$(tail -3 "$SOCKETLEY_DLOG")"; done
+"$BIN" create mail capped -p "$PRC" --mail-domain example.test --aliases "$T/aliases" --max-recipients 3 -s >/dev/null 2>&1
+for p in "$P" "$SUB" "$PF" "$PR" "$PRC"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens" "$(tail -3 "$SOCKETLEY_DLOG")"; done
 
 # ─── connections ────────────────────────────────────────────────────────────
 r=$(python3 - "$P" <<'PY'
@@ -99,6 +102,18 @@ if python3 -c "import socket; socket.create_connection(('::1', $P), timeout=3).r
 else
     bad "SMTP is taken over IPv6 as well" "no connection to [::1]:$P"
 fi
+
+# ─── recipients of one message ──────────────────────────────────────────────
+r=$(python3 - "$PRC" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1])); s.ehlo("x"); s.mail("a@remote.test")
+print(*[s.rcpt("info@example.test")[0] if i == 0 else s.rcpt("r%d@remote.test" % i)[0] for i in range(4)])
+s.rset(); s.mail("a@remote.test")
+print(s.rcpt("info@example.test")[0])
+PY
+)
+check "past --max-recipients a RCPT is told 452, the ones before it taken" "$(sed -n 1p <<<"$r")" "250 250 250 452"
+check "and the next transaction starts with none" "$(sed -n 2p <<<"$r")" "250"
 
 # ─── what a client sends and does not read ──────────────────────────────────
 # A wrong password holds the session a second, while three mebibytes are pipelined behind it.

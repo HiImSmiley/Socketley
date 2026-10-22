@@ -8,9 +8,13 @@
 #   * an alias's target that took the message sent it again when another target is tried later
 #   * an exchanger that greets with 554 ending the message rather than the next exchanger being tried, or a lone
 #     such exchanger's refusal tried for days rather than final
-#   * a domain once found not to exist bounced for good, never looked up again
+#   * a domain once found not to exist bounced for good, never looked up again; one whose lookup fails for now
+#     bounced at all
 #   * a smarthost's 454 to AUTH bouncing everything queued for it; AUTH LOGIN not spoken; credentials in a URL
-#     not percent-decoded
+#     not percent-decoded; smtps:// not TLS from the first byte; a password sent to a smarthost elsewhere in the
+#     clear
+#   * a flush of a sharded runtime trying only one shard's queue
+#   * an exchanger without PIPELINING sent what it cannot take, or a refusal at the end of the data not final
 #   * a script's on_rcpt that fails refusing the recipient for good
 #   * a recipient refused for good told only once the others are over
 set -uo pipefail
@@ -38,6 +42,9 @@ PR=$((SL_PORT_BASE+1963)); RELAY=$((SL_PORT_BASE+1964))
 PR2=$((SL_PORT_BASE+1965)); RELAY2=$((SL_PORT_BASE+1966))
 PR3=$((SL_PORT_BASE+1967)); RELAY3=$((SL_PORT_BASE+1968))
 PL=$((SL_PORT_BASE+1969))
+PR4=$((SL_PORT_BASE+1970)); RELAY4=$((SL_PORT_BASE+1971))
+PR5=$((SL_PORT_BASE+1972)); RELAY5=$((SL_PORT_BASE+1973))
+PSH=$((SL_PORT_BASE+1974))
 PIDS=()
 cleanup() {
     for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
@@ -51,7 +58,10 @@ echo "=== Integration: a mail runtime's deliveries, final only where the answers
 # one554.test has only the 554 one; later.test does not exist for two seconds from the first question about it.
 python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 \
     two.test=MX:10:mx1.two.test two.test=MX:20:mx2.two.test mx1.two.test=127.0.0.4 mx2.two.test=127.0.0.5 \
-    one554.test=MX:10:mx1.two.test later.test=NXFOR:2 later.test=MX:10:mx.remote.test >/dev/null 2>&1 &
+    one554.test=MX:10:mx1.two.test later.test=NXFOR:2 later.test=MX:10:mx.remote.test relay.test=127.0.0.6 \
+    broken.test=SERVFAIL nopipe.test=MX:10:mx.nopipe.test mx.nopipe.test=127.0.0.7 \
+    dataref.test=MX:10:mx.dataref.test mx.dataref.test=127.0.0.8 \
+    >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
 # The resolver keeps no answer, so a domain looked up again is asked again.
@@ -72,7 +82,30 @@ python3 "$HERE/lib_smtp_sink.py" "$RELAY2" "$T/relay2" --auth 'login:secret' --a
 PIDS+=($!)
 python3 "$HERE/lib_smtp_sink.py" "$RELAY3" "$T/relay3" --auth 'x:y' --auth-code 454 >/dev/null 2>&1 &
 PIDS+=($!)
-for p in "$SINK" "$RELAY" "$RELAY2" "$RELAY3"; do ready_tcp 127.0.0.1 "$p" || bad "the sink on $p listens" "-"; done
+# A smarthost that speaks TLS from the first byte, its certificate for 127.0.0.1 by a CA of the test's; and one on
+# another host that offers no TLS at all.
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=test CA" -keyout "$T/ca.key" -out "$T/ca.pem" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" -keyout "$T/relay.key" -out "$T/relay.csr" >/dev/null 2>&1
+printf 'subjectAltName=IP:127.0.0.1\n' > "$T/relay.ext"
+openssl x509 -req -in "$T/relay.csr" -CA "$T/ca.pem" -CAkey "$T/ca.key" -CAcreateserial -days 2 -extfile "$T/relay.ext" \
+    -out "$T/relay.pem" >/dev/null 2>&1
+mkdir -p "$T/relay4" "$T/relay5"
+python3 "$HERE/lib_smtp_sink.py" "$RELAY4" "$T/relay4" --implicit-tls "$T/relay.pem" "$T/relay.key" --auth 'tls:secret' \
+    >/dev/null 2>&1 &
+PIDS+=($!)
+FAKESINK_ADDR=127.0.0.6 python3 "$HERE/lib_smtp_sink.py" "$RELAY5" "$T/relay5" --auth 'x:y' >/dev/null 2>&1 &
+PIDS+=($!)
+# An exchanger without PIPELINING, and one that refuses at the end of the data.
+mkdir -p "$T/nopipe" "$T/dataref"
+FAKESINK_ADDR=127.0.0.7 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/nopipe" --no-pipelining >/dev/null 2>&1 &
+PIDS+=($!)
+FAKESINK_ADDR=127.0.0.8 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/dataref" --data 554 >/dev/null 2>&1 &
+PIDS+=($!)
+export SOCKETLEY_MAIL_TLS_CA="$T/ca.pem"
+for p in "$SINK" "$RELAY" "$RELAY2" "$RELAY3" "$RELAY4"; do ready_tcp 127.0.0.1 "$p" || bad "the sink on $p listens" "-"; done
+ready_tcp 127.0.0.6 "$RELAY5" || bad "the smarthost without TLS listens" "-"
+ready_tcp 127.0.0.7 "$SINK" || bad "the exchanger without PIPELINING listens" "-"
+ready_tcp 127.0.0.8 "$SINK" || bad "the exchanger that refuses the data listens" "-"
 ready_tcp 127.0.0.4 "$SINK" || bad "the 554 sink listens" "-"
 ready_tcp 127.0.0.5 "$SINK" || bad "the second exchanger listens" "-"
 daemon_start "$BIN"
@@ -84,12 +117,15 @@ printf 'list@example.test a@remote.test,b@remote.test\n' > "$T/aliases"
 "$BIN" create mail r2 -p "$PR2" --mail-domain example.test --relay "smtp://login:secret@127.0.0.1:$RELAY2" -s \
     >/dev/null 2>&1
 "$BIN" create mail r3 -p "$PR3" --mail-domain example.test --relay "smtp://x:y@127.0.0.1:$RELAY3" -s >/dev/null 2>&1
+"$BIN" create mail r4 -p "$PR4" --mail-domain example.test --relay "smtps://tls:secret@127.0.0.1:$RELAY4" -s >/dev/null 2>&1
+"$BIN" create mail r5 -p "$PR5" --mail-domain example.test --relay "smtp://x:y@relay.test:$RELAY5" -s >/dev/null 2>&1
+"$BIN" create mail msh -p "$PSH" --mail-domain example.test --shards 3 -s >/dev/null 2>&1
 cat > "$T/broken.lua" <<'LUA'
 function on_rcpt(rcpt, default) error("the script broke") end
 LUA
 "$BIN" create mail ml -p "$PL" --mail-domain example.test --aliases "$T/aliases" --lua "$T/broken.lua" -s \
     >/dev/null 2>&1
-for p in "$P" "$PR" "$PR2" "$PR3" "$PL"; do
+for p in "$P" "$PR" "$PR2" "$PR3" "$PR4" "$PR5" "$PSH" "$PL"; do
     ready_tcp 127.0.0.1 "$p" || bad "the mail runtime on $p listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 done
 
@@ -160,6 +196,34 @@ check "while the other still waits" "$(state m "$id" slow@remote.test)" "waiting
 sleep 1
 check "and the refused one is not told twice" "$(at sink 'Final-Recipient: rfc822; gone@remote.test')" "1"
 
+# ─── an exchanger without PIPELINING, and one that refuses the data ────────
+send "$P" s@remote.test np1@nopipe.test np2@nopipe.test >/dev/null
+wait_for "at nopipe 'rcpt np2@nopipe.test'" 1 && grep -l 'rcpt np1@nopipe.test' "$T"/nopipe/*.eml >/dev/null 2>&1 \
+    && ok "an exchanger without PIPELINING is sent each command in turn, and takes the message" \
+    || bad "an exchanger without PIPELINING is sent each command in turn, and takes the message" "$(ls "$T/nopipe")"
+id=$(send "$P" told2@remote.test dr@dataref.test)
+wait_for "at sink 'Final-Recipient: rfc822; dr@dataref.test'" 1 && \
+    grep -l 'Final-Recipient: rfc822; dr@dataref.test' "$T"/sink/*.eml | xargs grep -q '554' \
+    && ok "a 554 at the end of the data is final, and told to the sender with its words" \
+    || bad "a 554 at the end of the data is final, and told to the sender with its words" "$(state m "$id" dr@dataref.test)"
+
+# ─── a domain whose nameservers fail ────────────────────────────────────────
+id=$(send "$P" s@remote.test sf@broken.test)
+wait_for "\"\$BIN\" mail m show $id 2>/dev/null | grep -c '4.4.3'" 1
+check "a domain whose lookup fails for now has its mail wait, not bounce" "$(state m "$id" sf@broken.test)" "waiting"
+check "and no notice goes to the sender" "$(at sink 'sf@broken.test')" "0"
+
+# ─── a flush of three shards ────────────────────────────────────────────────
+for _ in $(seq 1 50); do [ "$(ss -ltnpH "sport = :$PSH" | grep -o 'pid=[0-9]*' | sort -u | wc -l)" -ge 3 ] && break; sleep 0.1; done
+ids=()
+for i in 1 2 3 4 5 6 7 8 9; do ids+=("$(send "$PSH" s@remote.test slow@remote.test)"); done
+tries_all() { for id in "${ids[@]}"; do "$BIN" mail msh show "$id" 2>/dev/null | sed -n 's/^tries: //p'; done | sort -u | tr '\n' ' '; }
+wait_for "tries_all" "1 " && ok "nine messages a sharded runtime took wait after their first try" \
+    || bad "nine messages a sharded runtime took wait after their first try" "$(tries_all)"
+"$BIN" mail msh flush >/dev/null 2>&1
+wait_for "tries_all" "2 " && ok "and one flush tries again what every shard holds, not a minute later" \
+    || bad "and one flush tries again what every shard holds, not a minute later" "$(tries_all)"
+
 # ─── smarthosts ─────────────────────────────────────────────────────────────
 send "$PR" s@example.test p@far.test >/dev/null
 wait_for "at relay 'rcpt p@far.test'" 1 && ok "percent-encoded credentials in --relay are decoded" \
@@ -170,6 +234,14 @@ wait_for "at relay2 'rcpt l@far.test'" 1 && ok "a smarthost that offers only AUT
 id=$(send "$PR3" s@example.test q@far.test)
 wait_for "\"\$BIN\" mail r3 show $id 2>/dev/null | grep -c 'tries: [1-9]'" 1
 check "a smarthost's 454 to AUTH leaves the mail waiting" "$(state r3 "$id" q@far.test)" "waiting"
+send "$PR4" s@example.test t@far.test >/dev/null
+wait_for "at relay4 'rcpt t@far.test'" 1 && grep -lq '^tls 1' "$T"/relay4/*.eml 2>/dev/null \
+    && ok "smtps:// speaks TLS from the first byte, its certificate checked, and signs in over it" \
+    || bad "smtps:// speaks TLS from the first byte, its certificate checked, and signs in over it" "$(ls "$T/relay4")"
+id=$(send "$PR5" s@example.test u@far.test)
+wait_for "\"\$BIN\" mail r5 show $id 2>/dev/null | grep -c 'is not sent in the clear'" 1
+check "a smarthost elsewhere that offers no TLS is sent no password, and the mail waits" "$(state r5 "$id" u@far.test)" "waiting"
+check "and it is sent nothing" "$(ls "$T/relay5" | grep -c '\.eml$')" "0"
 
 # ─── a script that fails ────────────────────────────────────────────────────
 r=$(python3 - "$PL" <<'PY'

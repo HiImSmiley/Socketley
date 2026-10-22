@@ -68,6 +68,7 @@ public:
 
     // The delays between tries, in seconds, the last repeated until the lifetime is over.
     static constexpr uint32_t retry_delays[] = {60, 300, 900, 1800, 3600, 7200, 14400, 28800};
+    static int64_t queue_scale();
 
 private:
     // Who a recipient's mail is sent to: its index in the envelope, and the address, an alias's target perhaps.
@@ -120,7 +121,9 @@ private:
     // The policy that counts for `domain` now, null where there is none or it says none.
     const tls_policy::sts* sts_for(const std::string& domain) const;
     void sts_save();
-    void poll_lookups();
+    // A lookup still out for the route `key` or the connection `conn` looked at again shortly, those alone, sooner
+    // after an answer came and later while none does.
+    void poll_lookups(const std::string* key = nullptr, uint64_t conn = 0);
     void open_conn(route& r);
     void finished(const entry_ptr& e);
     void attempt_over(const entry_ptr& e);
@@ -236,6 +239,9 @@ private:
     bool m_dane{false};
     bool m_stopped{false};
     bool m_polling{false};
+    std::set<std::string> m_wait_routes;
+    std::set<uint64_t> m_wait_conns;
+    int64_t m_poll_ms{2};
     std::shared_ptr<bool> m_alive;
 
     uint64_t m_delivered{0};

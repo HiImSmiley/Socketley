@@ -17,7 +17,8 @@
 #   * redirect :copy not sending a copy, or not keeping one
 #   * a message past a mebibyte a filter sends on lost, or sent on again by every try of the copy it keeps
 #   * a command of literals before sign-in held in memory past what any command takes
-#   * a vacation answered twice to one sender, or not at all, or from a sender a bounce could answer
+#   * a vacation answered twice to one sender, or not at all, or from a sender a bounce could answer, or again after
+#     a restart; the active script forgotten by one
 #   * a script deactivated still run
 set -uo pipefail
 
@@ -212,14 +213,23 @@ f=$(at_sink "body of please share")
 [ -n "$f" ] && grep -q '^rcpt friend@remote.test' "$f" && grep -q '^from alice@example.test' "$f" \
     && ok "redirect sends a copy on, from the user's own address" || bad "redirect sends a copy on, from the user's own address" "$(head -4 "$f" 2>/dev/null)"
 case "$inbox" in *"please share"*) ok "and :copy keeps one" ;; *) bad "and :copy keeps one" "$inbox" ;; esac
-for _ in $(seq 1 30); do [ "$(grep -l '^Subject: Away' "$T"/sink/*.eml 2>/dev/null | wc -l)" -ge 1 ] && break; sleep 0.1; done
-sleep 0.5
+# A second answer would be in the queue until it reached the sink.
+for _ in $(seq 1 60); do [ "$(grep -l '^Subject: Away' "$T"/sink/*.eml 2>/dev/null | wc -l)" -ge 1 ] && \
+    [ -z "$("$BIN" mail m queue 2>/dev/null)" ] && break; sleep 0.1; done
 v=$(grep -l '^Subject: Away' "$T"/sink/*.eml 2>/dev/null)
 check "a vacation answers bob once for his messages" "$(printf '%s\n' "$v" | grep -c .)" "1"
 f=$(printf '%s\n' "$v" | head -1)
 [ -n "$f" ] && grep -q '^from $' "$f" && grep -q '^Auto-Submitted: auto-replied' "$f" && grep -q '^In-Reply-To: <' "$f" \
     && ok "from the null sender, auto-replied, in reply to his message" \
     || bad "from the null sender, auto-replied, in reply to his message" "$(head -12 "$f" 2>/dev/null)"
+# Across a restart the script still files, and whom the vacation answered it remembers.
+"$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$P" >/dev/null
+send bob@remote.test "another invoice"
+send bob@remote.test "third plain"
+for _ in $(seq 1 60); do [ "$(keys Bills | wc -l)" -ge 2 ] && [ -z "$("$BIN" mail m queue 2>/dev/null)" ] && break; sleep 0.1; done
+check "after a restart the active script still files" "$(keys Bills | wc -l)" "2"
+check "and the vacation does not answer bob again" "$(grep -l '^Subject: Away' "$T"/sink/*.eml 2>/dev/null | wc -l)" "1"
 
 # ─── what is sent on ────────────────────────────────────────────────────────
 # Past a mebibyte the message is a file of its own, read back to be sent on before the spool lets it go.

@@ -17829,6 +17829,22 @@ or to take no mail, before it looks it up again, ten minutes when unset.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_MAIL_IDLE_MS
+A test aid: the milliseconds any connection to a mail runtime may be quiet, or
+its TLS handshake take, before it is told so and closed; unset, five minutes
+for SMTP, POP3 and ManageSieve, thirty for IMAP, and thirty seconds for a
+handshake.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MAIL_QUEUE_SCALE
+A test aid: how many times faster a mail runtime's retries and
+.B \-\-queue\-lifetime
+run, so a test sees a message tried again and given up within seconds; 1 when
+unset.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_MAIL_BUSY_HOLD_MS
 A test aid: the milliseconds a mail runtime opens no new connection to a domain
 after one of its exchangers answered 421, doubled by each 421 until a message is

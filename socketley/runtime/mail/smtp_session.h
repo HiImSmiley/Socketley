@@ -194,6 +194,13 @@ private:
     // DATA: the state of the line being read, what was counted, and whether the message is refused already.
     uint8_t     m_dstate{0};
     uint64_t    m_size{0};
+    // The header as it streams by: whether it is still being read, the start of the line being read, and the
+    // Received lines so far, a count past which the message is a loop (RFC 5321 6.3).
+    bool        m_in_header{true};
+    std::string m_line_head;
+    uint32_t    m_received{0};
+    void scan_header(std::string_view bytes);
+    static constexpr uint32_t max_hops = 50;
     bool        m_dropping{false};
     // A line past max_command was cut, and what is left of it is dropped when it comes.
     bool        m_discarding{false};

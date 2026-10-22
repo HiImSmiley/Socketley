@@ -154,7 +154,9 @@ grep -q '^mailparams .*RET=HDRS' "$f" 2>/dev/null && grep -q '^mailparams .*ENVI
     && ok "RET and ENVID go on to a server that takes DSN" || bad "RET and ENVID go on to a server that takes DSN" "$(grep params "$f" 2>/dev/null)"
 grep -q '^rcptparams w@remote.test NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;orig@remote.test' "$f" 2>/dev/null \
     && ok "and NOTIFY and ORCPT with each recipient" || bad "and NOTIFY and ORCPT with each recipient" "$(grep params "$f" 2>/dev/null)"
-sleep 0.5
+# Nothing is queued once every message and every report made of it is out, so an absence is read after that.
+settled() { for _ in $(seq 1 100); do [ -z "$("$BIN" mail d queue 2>/dev/null)" ] && return 0; sleep 0.1; done; return 1; }
+settled || bad "the queue empties" "$("$BIN" mail d queue 2>&1 | head -3)"
 check "and no report is made here for what that server reports" \
     "$(grep -l 'Successful Mail Delivery Report' "$T"/rich/*.eml 2>/dev/null | wc -l)" "0"
 
@@ -170,25 +172,38 @@ talk "EHLO c\r\nMAIL FROM:<s@remote.test> RET=FULL\r\nRCPT TO:<bad@plain.test>\r
 f=$(mail_in rich "bad@plain.test")
 [ -n "$f" ] && grep -q '^Content-Type: message/rfc822' "$f" && grep -q '^the whole body' "$f" \
     && ok "RET=FULL is answered with the whole message" || bad "RET=FULL is answered with the whole message" "$(cat "$f" 2>/dev/null | tail -12)"
-sleep 0.5
+settled || bad "the queue empties" "$("$BIN" mail d queue 2>&1 | head -3)"
 check "NOTIFY=NEVER is bounced to nobody" "$(grep -l 'never@plain.test' "$T"/rich/*.eml 2>/dev/null | wc -l)" "0"
-talk "EHLO c\r\nMAIL FROM:<s@remote.test>\r\nRCPT TO:<later@plain.test> NOTIFY=DELAY,FAILURE\r\nDATA\r\nSubject: late\r\n\r\nx\r\n.\r\nQUIT\r\n" >/dev/null
+late=$(talk "EHLO c\r\nMAIL FROM:<s@remote.test>\r\nRCPT TO:<later@plain.test> NOTIFY=DELAY,FAILURE\r\nDATA\r\nSubject: late\r\n\r\nx\r\n.\r\nQUIT\r\n" \
+       | sed -n 's/.*queued as \([^ ]*\).*/\1/p')
 f=$(mail_in rich "Delayed Mail")
 [ -n "$f" ] && grep -q '^Action: delayed' "$f" && grep -q '^Will-Retry-Until:' "$f" \
     && ok "DELAY is told once the message is late" || bad "DELAY is told once the message is late" "$(cat "$f" 2>/dev/null | head -30)"
-"$BIN" mail d flush >/dev/null 2>&1; sleep 1
+tries() { "$BIN" mail d show "$1" 2>/dev/null | sed -n 's/^tries: //p'; }
+was=$(tries "$late")
+"$BIN" mail d flush >/dev/null 2>&1
+for _ in $(seq 1 100); do [ "$(tries "$late")" -gt "${was:-0}" ] 2>/dev/null && break; sleep 0.1; done
+[ "$(tries "$late")" -gt "${was:-0}" ] 2>/dev/null && ok "a flush tries the late message again" \
+    || bad "a flush tries the late message again" "tries ${was:-?} then $(tries "$late")"
+# A second notice would be a message from <> in the queue until it reached the sink.
+for _ in $(seq 1 100); do "$BIN" mail d queue 2>/dev/null | grep -q $'\t<>\t' || break; sleep 0.1; done
 check "and told once" "$(grep -l 'Delayed Mail' "$T"/rich/*.eml 2>/dev/null | wc -l)" "1"
-s=$("$BIN" stats d 2>/dev/null | sed -n 's/^mail_reports://p')
+# The stats are the worker's, pushed a moment after.
+for _ in $(seq 1 30); do s=$("$BIN" stats d 2>/dev/null | sed -n 's/^mail_reports://p'); [ "${s:-0}" -ge 2 ] && break; sleep 0.2; done
 [ "${s:-0}" -ge 2 ] && ok "stats count mail_reports ($s)" || bad "stats count mail_reports" "${s:-absent}"
 
 # ─── a report the spool cannot take ─────────────────────────────────────────
 # With the spool's directory shut, a message just under a mebibyte is a record and its RET=FULL report a file it cannot
 # make: the message waits for the report rather than going without one.
 SPD=$(find "$HOME/.local/share" -type d -path '*/mail/d/spool' 2>/dev/null | head -1)
-if [ "$(id -u)" = 0 ] || [ -z "$SPD" ]; then
-    echo "  SKIP: a report the spool cannot take needs a spool directory root cannot write past"
+# Root writes past a mode, so it shuts the directory as immutable instead, where the filesystem has the attribute.
+shut() { if [ "$(id -u)" = 0 ]; then chattr +i "$SPD" 2>/dev/null; else chmod 555 "$SPD"; fi; }
+open_up() { if [ "$(id -u)" = 0 ]; then chattr -i "$SPD" 2>/dev/null; else chmod 755 "$SPD"; fi; }
+if [ -z "$SPD" ]; then
+    bad "the spool directory is found" "none under $HOME/.local/share"
+elif ! shut; then
+    bad "the spool directory can be shut" "chattr +i as root failed: the filesystem has no immutable attribute"
 else
-    chmod 555 "$SPD"
     id=$(python3 - "$P" <<'PY'
 import re, smtplib, sys
 head = "Subject: unwritable\r\n\r\n"
@@ -206,10 +221,11 @@ for size in range(1048570, 1046000, -40):
     break
 PY
 )
-    sleep 2
-    "$BIN" mail d show "$id" >/dev/null 2>&1
-    check "a message whose report cannot be queued is kept for it" "$?" "0"
-    chmod 755 "$SPD"
+    # Kept once its recipient failed and its report could not be made, not merely before it was tried.
+    failed() { "$BIN" mail d show "$id" 2>/dev/null | grep -c $'^rcpt: bad@plain.test\tfailed'; }
+    for _ in $(seq 1 100); do [ "$(failed)" = 1 ] && break; sleep 0.1; done
+    check "a message whose report cannot be queued is kept for it, its recipient failed" "$(failed)" "1"
+    open_up
     "$BIN" mail d flush "$id" >/dev/null 2>&1
     f=$(mail_in rich "^Subject: unwritable")
     [ -n "$f" ] && grep -q '^Action: failed' "$f" && ok "and its report goes once it can" \

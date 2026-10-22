@@ -30,6 +30,8 @@
 #     not saying CLOSED; STATUS without DELETED
 #   * a folder shared by ACL not listed, read or written as its rights say, a right not given taken anyway, or one
 #     taken away kept; a MOVE into another's folder
+#   * AUTHENTICATE PLAIN not signing in, with its response at once or after the continuation; DELETE INBOX taken; an
+#     APPEND past the largest message waited for; the command parser answering differently as its input is cut
 #   * BINARY giving a part still encoded, a NUL in a plain literal, or an encoding it cannot undo answered OK
 set -uo pipefail
 
@@ -135,6 +137,19 @@ if step == "first":
     say("ENABLE before a login is refused", r[-1].split()[1] in ("NO", "BAD") and not any("ENABLED" in x for x in r), r)
     r = c.cmd("AUTHENTICATE PLAIN " + base64.b64encode(b"alice\0bob\0bobpassword12").decode())
     say("an authzid that is not the user is refused", r[-1].split()[1] == "NO", r)
+    r = C().cmd("AUTHENTICATE PLAIN " + base64.b64encode(b"\0bob\0bobpassword12").decode())
+    say("AUTHENTICATE PLAIN with its response at once signs in", r[-1].split()[1] == "OK", r)
+    a2 = C(); a2.n += 1
+    a2.s.sendall(b"ap AUTHENTICATE PLAIN\r\n")
+    cont = a2.f.readline()
+    a2.s.sendall(base64.b64encode(b"bob\0bob\0bobpassword12") + b"\r\n")
+    done = a2.f.readline().decode()
+    say("and with it after the continuation, an authzid that is the user's own taken", cont.startswith(b"+") and done.startswith("ap OK"), (cont, done))
+    r = b.cmd("DELETE INBOX")
+    say("DELETE of INBOX is refused", r[-1].split()[1] == "NO", r)
+    b.s.sendall(b"big APPEND INBOX {30000000}\r\n")
+    r = b.f.readline().decode()
+    say("an APPEND past the largest message is refused TOOBIG before its bytes come", r.startswith("big NO [TOOBIG]"), r)
     # TRYCREATE, RENAME, DELETE, CREATE
     b.cmd("SELECT INBOX")
     r = b.cmd("UID COPY %d Nowhere" % uid)
@@ -434,6 +449,28 @@ elif step == "acl":
     r = a.cmd('SELECT "Other Users/bob/Team"')
     l = a.cmd('LIST "" "Other Users/*"')
     say("DELETEACL takes it all away: not selected, not listed", "[NONEXISTENT]" in r[-1] and not any("Team" in x for x in l), (r, l))
+elif step == "cuts":
+    # The same commands sent whole, a byte at a time and cut at odd places are answered the same.
+    script = (b"c1 LOGIN {3+}\r\nbob {13+}\r\nbobpassword12\r\nc2 EXAMINE INBOX\r\n"
+              b"c3 UID SEARCH SUBJECT {4+}\r\nkw-2 ALL\r\nc4 FETCH 1 (FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (SUBJECT)])\r\n"
+              b'c5 STATUS "INBOX" (MESSAGES UIDNEXT)\r\nc6 LIST "" "W*"\r\nc7 NOOP\r\nc8 LOGOUT\r\n')
+    def run(pieces):
+        s = socket.create_connection(("127.0.0.1", port), timeout=20); s.recv(4096)
+        for p in pieces:
+            s.sendall(p)
+            if len(pieces) > 1: time.sleep(0.002)
+        out = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk: break
+            out += chunk
+        s.close()
+        return out
+    whole = run([script])
+    bytewise = run([script[i:i + 1] for i in range(len(script))])
+    odd = run([script[i:i + 7] for i in range(0, len(script), 7)])
+    say("the parser answers whole, byte-wise and odd cuts the same", whole == bytewise == odd and b"c8 OK" in whole,
+        (len(whole), len(bytewise), len(odd), whole[-200:]))
 elif step == "after":
     b = C(("bob", "bobpassword12")); b.cmd("SELECT INBOX")
     r = b.cmd("UID SEARCH KEYWORD project-x")
@@ -469,6 +506,7 @@ tally < <(run meta | grep -E '^(ok|bad) ')
 tally < <(run notify | grep -E '^(ok|bad) ')
 tally < <(run rev2 | grep -E '^(ok|bad) ')
 tally < <(run acl | grep -E '^(ok|bad) ')
+tally < <(run cuts | grep -E '^(ok|bad) ')
 "$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1; ready_tcp 127.0.0.1 "$IM" >/dev/null
 tally < <(run after | grep -E '^(ok|bad) ')
 

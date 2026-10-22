@@ -8,7 +8,8 @@
 #   * a record of the four missing from the zone, or the host the MX names left without an address
 #   * a DKIM record that is not the key the runtime signs with
 #   * a message without a sender not sent from no-reply@, or mail to no-reply@ taken from anyone
-#   * a bounce to no-reply@ dropped unread, so a dead address is mailed again and again
+#   * a bounce to no-reply@ dropped unread, so a dead address is mailed again and again, after a restart or by
+#     another shard
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -115,8 +116,10 @@ check "the bounce to no-reply@ suppresses the address it says failed" "$("$BIN" 
 for _ in $(seq 1 30); do s=$("$BIN" stats m 2>/dev/null | sed -n 's/^mail_bounces_taken://p'); [ "${s:-0}" -ge 1 ] && break; sleep 0.2; done
 [ "${s:-0}" -ge 1 ] && ok "and is counted taken" || bad "and is counted taken" "${s:-absent}"
 id=$("$BIN" send m --to dead@remote.test --subject "again" --text "again body" 2>&1 | sed -n 's/^queued //p')
-before=$(ls "$T"/sink/*.eml 2>/dev/null | wc -l)
-sleep 1
+# Its attempt is over once it is out of the queue, after which what it sent would be at the sink.
+for _ in $(seq 1 100); do "$BIN" mail m show "$id" >/dev/null 2>&1 || break; sleep 0.1; done
+"$BIN" mail m show "$id" >/dev/null 2>&1 && bad "a suppressed address's message is over at once" "still queued" \
+    || ok "a suppressed address's message is over at once"
 grep -l "again body" "$T"/sink/*.eml >/dev/null 2>&1 && bad "a suppressed address is not mailed again" "it was sent" \
     || ok "a suppressed address is not mailed again"
 "$BIN" mail m forgive dead@remote.test >/dev/null 2>&1; check "forgive lets it go" "$?" "0"
@@ -138,6 +141,33 @@ bounce "$tagged" amy@remote.test
 for _ in $(seq 1 50); do "$BIN" mail m suppressed 2>/dev/null | grep -q amy@ && break; sleep 0.1; done
 check "a bounce under the tag for remote.test suppresses an address there" "$("$BIN" mail m suppressed 2>/dev/null | grep -c '^amy@remote.test$')" "1"
 check "but not one under no tag, nor one of another domain" "$("$BIN" mail m suppressed 2>/dev/null | grep -c 'victim')" "0"
+
+# What was learned is kept across a restart, and every shard knows it.
+"$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$P" >/dev/null
+check "a suppressed address is still suppressed after a restart" "$("$BIN" mail m suppressed 2>/dev/null | grep -c '^amy@remote.test$')" "1"
+PSH=$((SL_PORT_BASE+1994))
+"$BIN" create mail msh -p "$PSH" --mail-domain example.test --no-reply --shards 3 -s >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$PSH" || bad "the sharded runtime listens" "$(tail -3 "$SOCKETLEY_DLOG")"
+for _ in $(seq 1 50); do [ "$(ss -ltnpH "sport = :$PSH" | grep -o 'pid=[0-9]*' | sort -u | wc -l)" -ge 3 ] && break; sleep 0.1; done
+"$BIN" send msh --to tagme@remote.test --subject "for the tag" --text "shard tag body" >/dev/null 2>&1
+f=$(mail_with "shard tag body")
+tag2=$(sed -n 's/^from //p' "$f" 2>/dev/null | head -1)
+python3 - "$PSH" "$tag2" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=("127.0.0.2", 0)); s.ehlo("x")
+s.sendmail("", [sys.argv[2]], "From: MAILER-DAEMON@remote.test\r\nSubject: failed\r\n\r\n"
+           "Final-Recipient: rfc822; zed@remote.test\r\nAction: failed\r\nStatus: 5.1.1\r\n")
+PY
+for _ in $(seq 1 50); do "$BIN" mail msh suppressed 2>/dev/null | grep -q zed@ && break; sleep 0.1; done
+ids=()
+for i in 1 2 3 4 5 6; do
+    ids+=("$("$BIN" send msh --to zed@remote.test --subject "zed $i" --text "zed body $i" 2>&1 | sed -n 's/^queued //p')")
+done
+for id in "${ids[@]}"; do
+    for _ in $(seq 1 100); do "$BIN" mail msh show "$id" >/dev/null 2>&1 || break; sleep 0.1; done
+done
+check "an address one shard learned is suppressed by every shard" "$(grep -l 'zed body' "$T"/sink/*.eml 2>/dev/null | wc -l)" "0"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

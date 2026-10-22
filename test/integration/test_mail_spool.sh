@@ -149,6 +149,8 @@ check "a message over a mebibyte is a file of its own" "$(ls "$D" 2>/dev/null | 
 for _ in $(seq 1 50); do [ "$(kept)" = 2 ] && break; sleep 0.1; done
 id=$("$BIN" send s --from a@example.test --to later@remote.test --subject dropped --text "dropped body" 2>&1 \
      | sed -n 's/^queued //p')
+[ -n "$id" ] && "$BIN" mail s show "$id" >/dev/null 2>&1 && ok "the message to drop is queued" \
+    || bad "the message to drop is queued" "${id:-no id}"
 "$BIN" mail s drop "$id" >/dev/null 2>&1
 "$BIN" stop s >/dev/null 2>&1; "$BIN" start s >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$P" >/dev/null
@@ -161,6 +163,8 @@ id=$("$BIN" send s --from a@example.test --to later@remote.test --subject cut --
      | sed -n 's/^queued //p')
 "$BIN" stop s >/dev/null 2>&1
 seg=$(grep -l "cut body" "$D"/seg-*.spool 2>/dev/null | head -1)
+[ -n "$id" ] && [ -n "$seg" ] && ok "the message a crash will cut is queued, in a segment" \
+    || bad "the message a crash will cut is queued, in a segment" "id ${id:-none}, segment ${seg:-none}"
 # The last byte of the message's record, its trailer's line end, overwritten as a torn write would leave it.
 python3 - "$seg" <<'PY'
 import sys
@@ -179,6 +183,34 @@ check "a record a crash cut is not a message" "$?" "1"
 check "and the messages before it are kept" "$(kept)" "2"
 grep -q "cut short by a crash while it was written" "$SOCKETLEY_DLOG" && ok "and the log says one was dropped" \
     || bad "and the log says one was dropped" "$(grep -i 'mail' "$SOCKETLEY_DLOG" | tail -3)"
+
+# ─── a record damaged in the middle of a segment ────────────────────────────
+mids=()
+for i in 1 2 3; do
+    mids+=("$("$BIN" send s --from "mid$i@example.test" --to later@remote.test --subject "mid $i" --text "mid body $i" 2>&1 \
+              | sed -n 's/^queued //p')")
+done
+"$BIN" stop s >/dev/null 2>&1
+seg=$(grep -l "mid body 1" "$D"/seg-*.spool 2>/dev/null | head -1)
+python3 - "$seg" <<'PY'
+import sys
+p = sys.argv[1]
+b = open(p, "rb").read()
+at = b.find(b"mid body 1")
+with open(p, "r+b") as f:
+    f.seek(at); f.write(b"M")
+PY
+"$BIN" start s >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$P" >/dev/null
+"$BIN" mail s show "${mids[0]}" >/dev/null 2>&1
+check "a record damaged on disk is not a message" "$?" "1"
+for i in 1 2; do
+    "$BIN" mail s show "${mids[$i]}" >/dev/null 2>&1
+    check "and the one after it, $((i+1)), is kept" "$?" "0"
+done
+grep -q "was damaged on disk, and is dropped; the messages after it are kept" "$SOCKETLEY_DLOG" \
+    && ok "and the log says one was damaged" || bad "and the log says one was damaged" "$(grep -i 'mail' "$SOCKETLEY_DLOG" | tail -3)"
+for i in 1 2; do "$BIN" mail s drop "${mids[$i]}" >/dev/null 2>&1; done
 
 # ─── a segment kept by a deferred message ───────────────────────────────────
 # Forty messages of most of a mebibyte fill the segment the deferred ones are in; they are delivered and leave it.

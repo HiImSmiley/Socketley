@@ -146,17 +146,18 @@ if step == "first":
     say("EXPUNGE takes what is deleted", data == [b"1"], data)
     typ, data = M.select("INBOX")
     say("leaving one", data == [b"1"], data)
-    # Mail that comes while the folder is selected is told by NOOP.
+    # Mail that comes while the folder is selected is told by NOOP, as an EXISTS of one more than there was.
+    M.untagged_responses.pop("EXISTS", None)
     s = __import__("smtplib").SMTP("127.0.0.1", smtp_port); s.ehlo("x")
     s.sendmail("fred@else.test", ["alice@example.test"], "From: fred@else.test\r\nSubject: four\r\n\r\nfourth\r\n")
-    told = False
+    told = []
     for _ in range(40):
         typ, data = M.noop()
-        if any(b"EXISTS" in d for d in M.untagged_responses.get("EXISTS", [])) or M.untagged_responses.get("EXISTS"):
-            told = True
+        told = M.untagged_responses.pop("EXISTS", [])
+        if told:
             break
         time.sleep(0.25)
-    say("new mail is told by NOOP", told, M.untagged_responses)
+    say("new mail is told by NOOP", told == [b"2"], told)
     typ, data = M.select("Sent")
     say("Sent holds what was appended", data == [b"1"], data)
     M.logout()

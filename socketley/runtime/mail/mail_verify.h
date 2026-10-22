@@ -36,6 +36,9 @@ struct check_resolver
 // The system's resolver, through res_nquery, pointed at the servers of SOCKETLEY_RESOLV_CONF where it is set; its
 // state and the last minute's answers are the calling thread's, and a lookup past `budget_ms` from now fails.
 std::unique_ptr<check_resolver> system_check_resolver(int64_t budget_ms = 20000);
+// One query of that resolver, its answer in `buf`: its length, or -1 with `answered` where the name or the type
+// does not exist and `no_domain` where the name does not.
+int system_query(const std::string& name, int type, uint8_t* buf, int len, bool& no_domain, bool& answered);
 
 // SPF's verdict for `ip` sending as `domain` (pass, fail, softfail, neutral, none, temperror, permerror), `helo` what
 // %{h} stands for.

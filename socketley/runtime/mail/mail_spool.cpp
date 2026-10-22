@@ -367,10 +367,21 @@ bool spool::open(const std::string& dir, bool relaxed, std::string& why)
             if (len > rec_max || pos + rec_head + len > seg_size || !read_at(s.fd, payload, len, pos + rec_head) ||
                 socketley::crc::crc32c(payload) != get32(rh.data() + 12))
             {
-                LOG_WARN(("mail: a message in " + s.path + " was cut short by a crash while it was written, and is "
-                          "dropped; its sender was never told it was taken")
+                // A record whose bytes went bad with a whole record of this use after it is one damaged message, the
+                // ones after it taken and kept; with none after it, it is the tail a crash cut.
+                std::string next;
+                const bool more = len <= rec_max && pos + rec_head + len + rec_head <= seg_size &&
+                                  read_at(s.fd, next, rec_head, pos + rec_head + len) &&
+                                  get32(next.data()) == rec_magic && get32(next.data() + 8) == s.gen;
+                LOG_WARN(("mail: a message in " + s.path +
+                          (more ? std::string(" was damaged on disk, and is dropped; the messages after it are kept")
+                                : std::string(" was cut short by a crash while it was written, and is dropped; its "
+                                              "sender was never told it was taken")))
                              .c_str());
-                break;
+                if (!more)
+                    break;
+                pos += rec_head + len;
+                continue;
             }
             auto e = std::make_shared<spool_entry>();
             size_t header_len = 0;

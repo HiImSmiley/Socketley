@@ -10,7 +10,7 @@
 #   * TLSA records believed that DNSSEC did not validate, so a forged answer could turn TLS off or on
 #   * an exchanger an enforced policy does not name tried, or a certificate for another name taken
 #   * a policy in testing mode acted on rather than only told of
-#   * a fetched policy not kept for the next start
+#   * a fetched policy not kept for the next start, not used from there, or not fetched again once its id changes
 #   * a policy that never ends read to its end
 #   * REQUIRETLS offered or taken outside TLS, or its mail sent on to a server DANE or MTA-STS did not vouch for, or
 #     to one that does not keep the requirement on, or without saying REQUIRETLS
@@ -67,6 +67,8 @@ OTHER=$(spki wrong.pem)
 cd - >/dev/null || exit 2
 
 # ─── the zone: which answers DNSSEC signed ──────────────────────────────────
+# The zone, given the id sts.test's policy has, so a test can change it and start the nameserver again.
+start_dns() {
 python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal \
     dane.test=MX:10:mx.dane.test dane.test=AD mx.dane.test=127.0.0.4 \
     _${SINK}._tcp.mx.dane.test=TLSA:3:1:1:$DANE _${SINK}._tcp.mx.dane.test=AD \
@@ -76,7 +78,7 @@ python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal \
     _${SINK}._tcp.mx.daneclear.test=TLSA:3:1:1:$DANE _${SINK}._tcp.mx.daneclear.test=AD \
     unsigned.test=MX:10:mx.unsigned.test mx.unsigned.test=127.0.0.4 \
     _${SINK}._tcp.mx.unsigned.test=TLSA:3:1:1:$OTHER \
-    sts.test=MX:10:mx.sts.test mx.sts.test=127.0.0.6 "_mta-sts.sts.test=TXT:v=STSv1; id=one" \
+    sts.test=MX:10:mx.sts.test mx.sts.test=127.0.0.6 "_mta-sts.sts.test=TXT:v=STSv1; id=$1" \
     sts2.test=MX:10:mx.elsewhere.test mx.elsewhere.test=127.0.0.6 "_mta-sts.sts2.test=TXT:v=STSv1; id=one" \
     sts3.test=MX:10:mx.sts3.test mx.sts3.test=127.0.0.7 "_mta-sts.sts3.test=TXT:v=STSv1; id=one" \
     stt.test=MX:10:mx.stt.test mx.stt.test=127.0.0.7 "_mta-sts.stt.test=TXT:v=STSv1; id=one" \
@@ -84,7 +86,10 @@ python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal \
     huge.test=MX:10:mx.sts.test "_mta-sts.huge.test=TXT:v=STSv1; id=one" \
     plain.test=MX:10:mx.plain.test mx.plain.test=127.0.0.6 \
     >/dev/null 2>&1 &
-PIDS+=($!)
+DNS_PID=$!
+}
+start_dns one
+PIDS+=($DNS_PID)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
 
 # ─── the exchangers and the policies' server ────────────────────────────────
@@ -202,6 +207,21 @@ for _ in $(seq 1 30); do [ "${n:-0}" -ge 1 ] && break; n=$(stat_of mail_sts_test
 cache=$(find "$HOME/.local/share" -name mta-sts -path '*/mail/t/*' 2>/dev/null | head -1)
 grep -q '^sts.test one enforce [0-9]* mx.sts.test$' "$cache" 2>/dev/null && ok "a fetched policy is kept for the next start" \
     || bad "a fetched policy is kept for the next start" "$(cat "$cache" 2>&1)"
+# And read back at it: the mail goes under it without its being fetched again, until its id changes.
+"$BIN" stop t >/dev/null 2>&1; "$BIN" start t >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$P" >/dev/null
+send_to u2@sts.test >/dev/null
+at_sink s6 "for u2@sts.test" >/dev/null && ok "after a restart the kept policy is used" || bad "after a restart the kept policy is used" "-"
+check "without its being fetched again" "$(grep -c '^mta-sts.sts.test$' "$T/fetches")" "1"
+kill "$DNS_PID" 2>/dev/null; wait "$DNS_PID" 2>/dev/null
+start_dns two
+PIDS+=($DNS_PID)
+for _ in $(seq 1 50); do dig +short +time=1 +tries=1 -p "$NS" @127.0.0.1 _mta-sts.sts.test TXT 2>/dev/null | grep -q 'id=two' && break; sleep 0.1; done
+"$BIN" stop t >/dev/null 2>&1; "$BIN" start t >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$P" >/dev/null
+send_to u3@sts.test >/dev/null
+at_sink s6 "for u3@sts.test" >/dev/null
+check "a policy whose id changed is fetched again" "$(grep -c '^mta-sts.sts.test$' "$T/fetches")" "2"
 
 # A policy that takes its time is fetched once while the mail for its domain waits on it.
 for i in 1 2 3 4 5; do send_to "u$i@slow.test" >/dev/null; done

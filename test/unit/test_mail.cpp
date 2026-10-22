@@ -320,6 +320,34 @@ TEST_CASE("the end of a message is found wherever the reads cut it")
     CHECK(f.messages[0] == want);
 }
 
+TEST_CASE("a message past fifty Received lines is a loop, refused by DATA and BDAT alike, and fifty pass")
+{
+    std::string many, fifty;
+    for (int i = 0; i < 51; ++i)
+        many += "Received: from h" + std::to_string(i) + " by x\r\n";
+    for (int i = 0; i < 50; ++i)
+        fifty += "received: from h" + std::to_string(i) + " by x\r\n";
+    fake f;
+    smtp_session s(plain_config(), f);
+    s.input("HELO x\r\nMAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\n");
+    f.codes();
+    s.input(many + "Subject: loop\r\n\r\nbody\r\nReceived: in the body counts for nothing\r\n.\r\n");
+    CHECK(f.codes() == std::vector<int>{554});
+    CHECK(f.messages.empty());
+    CHECK(f.aborted == 1);
+    // Fifty pass, and Received lines past the header do not count.
+    s.input("MAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\n" + fifty + "\r\n" + many + ".\r\n");
+    CHECK(f.codes() == std::vector<int>{250, 250, 354, 250});
+    CHECK(f.messages.size() == 1);
+    // BDAT, the header cut across chunks.
+    const std::string msg = many + "\r\nbody\r\n";
+    const std::string a = msg.substr(0, 700), b = msg.substr(700);
+    s.input("MAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nBDAT " + std::to_string(a.size()) + "\r\n" + a + "BDAT " +
+            std::to_string(b.size()) + " LAST\r\n" + b);
+    CHECK(f.codes() == std::vector<int>{250, 250, 250, 554});
+    CHECK(f.messages.size() == 1);
+}
+
 TEST_CASE("a bare LF is a line's end written as CRLF, and a dot between bare LFs ends nothing")
 {
     fake f;
@@ -533,6 +561,12 @@ TEST_CASE("DKIM: what this signs, it verifies, and the canonicalizations are RFC
     std::string two = signed_msg;
     two.insert(two.find("To: "), "From: evil@else.test\r\n");
     CHECK(dkim::verify(two, sigs[0], dkim::public_record(key.get()), 1000) == dkim::result::fail);
+    // x= is when the signature stops vouching: it passes before and fails after (RFC 6376 3.5).
+    const std::string expiring = dkim::sign(msg, "example.test", "skl", key.get(), 1000, "DKIM-Signature", "x=1500; ") + msg;
+    const auto xs = dkim::signatures(expiring);
+    REQUIRE(xs.size() == 1);
+    CHECK(dkim::verify(expiring, xs[0], dkim::public_record(key.get()), 1400) == dkim::result::pass);
+    CHECK(dkim::verify(expiring, xs[0], dkim::public_record(key.get()), 1600) == dkim::result::fail);
     std::filesystem::remove_all(tmpl);
 }
 
@@ -565,7 +599,7 @@ TEST_CASE("compose: headers encoded, text quoted-printable, parts and attachment
     // Every line ends in CRLF.
     for (size_t i = 0; i < out.message.size(); ++i)
         if (out.message[i] == '\n')
-            REQUIRE(i > 0);
+            REQUIRE((i > 0 && out.message[i - 1] == '\r'));
     CHECK(out.message.find("\r\r") == std::string::npos);
     compose none;
     CHECK_FALSE(compose_message(none, from, "", "x@y", 0, out, why));
@@ -674,6 +708,27 @@ TEST_CASE("SPF: mechanisms, qualifiers, include, redirect, macros and the lookup
     r.addresses["host.cidr.test"] = {"192.0.2.200"};
     CHECK(spf_check("192.0.2.9", "cidr.test", "x@cidr.test", r) == "pass");
     CHECK(spf_check("192.0.3.9", "cidr.test", "x@cidr.test", r) == "fail");
+    // ip6 with and without a length, and an IPv6 client against ip4 alone.
+    r.txts["six.test"] = {"v=spf1 ip6:2001:db8::/32 ip6:2001:db9::7 ip4:192.0.2.0/24 -all"};
+    CHECK(spf_check("2001:db8:ffff::1", "six.test", "x@six.test", r) == "pass");
+    CHECK(spf_check("2001:db9::7", "six.test", "x@six.test", r) == "pass");
+    CHECK(spf_check("2001:db9::8", "six.test", "x@six.test", r) == "fail");
+    CHECK(spf_check("2001:db7::1", "six.test", "x@six.test", r) == "fail");
+    r.txts["badsix.test"] = {"v=spf1 ip6:2001:db8::/129 -all"};
+    CHECK(spf_check("2001:db8::1", "badsix.test", "x@badsix.test", r) == "permerror");
+    // ptr matches nothing, as RFC 7208 5.5 says not to rely on it, and the mechanisms after it still decide.
+    r.txts["ptr.test"] = {"v=spf1 ptr ip4:192.0.2.0/24 -all"};
+    CHECK(spf_check("192.0.2.1", "ptr.test", "x@ptr.test", r) == "pass");
+    CHECK(spf_check("198.51.100.1", "ptr.test", "x@ptr.test", r) == "fail");
+    // exp= explains a fail and changes nothing of it; a modifier twice is no record, whatever matches first.
+    r.txts["exp.test"] = {"v=spf1 -all exp=explain.%{d}"};
+    CHECK(spf_check("1.2.3.4", "exp.test", "x@exp.test", r) == "fail");
+    r.txts["twice.test"] = {"v=spf1 +all exp=a.test exp=b.test"};
+    CHECK(spf_check("1.2.3.4", "twice.test", "x@twice.test", r) == "permerror");
+    r.txts["redir2.test"] = {"v=spf1 redirect=example.org redirect=soft.test"};
+    CHECK(spf_check("192.0.2.1", "redir2.test", "x@redir2.test", r) == "permerror");
+    r.txts["unknown.test"] = {"v=spf1 future=thing ip4:1.2.3.4 -all"};
+    CHECK(spf_check("1.2.3.4", "unknown.test", "x@unknown.test", r) == "pass");
 }
 
 TEST_CASE("DMARC: aligned SPF or DKIM passes, a policy is taken from the organizational domain")
@@ -919,11 +974,16 @@ TEST_CASE("the Public Suffix List: rules, wildcards and exceptions decide the re
     CHECK(l.registrable("me.blogspot.com") == "me.blogspot.com");
     CHECK(l.registrable("a.b.example.test") == "example.test");
     CHECK(l.registrable("localhost") == "localhost");
-    // The system's list, where the publicsuffix package put one.
+    // The system's list where the publicsuffix package put one, and a name its own where it did not.
     if (!socketley::public_suffix::system_list().empty())
     {
         CHECK(organizational_domain("mail.example.co.uk") == "example.co.uk");
         CHECK(organizational_domain("a.b.example.com.au") == "example.com.au");
+    }
+    else
+    {
+        MESSAGE("no system public suffix list: alignment is strict");
+        CHECK(organizational_domain("mail.example.co.uk") == "mail.example.co.uk");
     }
 }
 

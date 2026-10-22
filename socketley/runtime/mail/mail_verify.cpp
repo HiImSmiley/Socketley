@@ -352,6 +352,17 @@ std::string check_host(const std::string& domain, spf_state& s, int depth)
         }
     if (!record)
         return "none";
+    // redirect= and exp= each at most once, wherever in the record and whatever matches first (RFC 7208 6).
+    int redirects = 0, exps = 0;
+    for (const std::string_view term : words(std::string_view(*record).substr(6)))
+        if (const size_t eq = term.find('='); eq != std::string_view::npos && term.find(':') > eq)
+        {
+            const std::string name = lower(term.substr(0, eq));
+            redirects += name == "redirect";
+            exps += name == "exp";
+        }
+    if (redirects > 1 || exps > 1)
+        return "permerror";
     std::string redirect;
     for (const std::string_view term : words(std::string_view(*record).substr(6)))
     {
@@ -477,6 +488,12 @@ struct thread_resolver
     }
 };
 
+thread_resolver& resolver_here()
+{
+    static thread_local thread_resolver t;
+    return t;
+}
+
 class system_resolver : public check_resolver
 {
 public:
@@ -509,7 +526,7 @@ private:
     bool ask(const std::string& name, uint16_t type, std::vector<std::string>& out, bool& nx)
     {
         nx = false;
-        static thread_local thread_resolver t;
+        thread_resolver& t = resolver_here();
         if (!t.ok)
             return false;
         const int64_t now = socketley::wall::now_ms();
@@ -601,6 +618,23 @@ thread_resolver::thread_resolver()
 }
 
 }   // namespace
+
+int system_query(const std::string& name, int type, uint8_t* buf, int len, bool& no_domain, bool& answered)
+{
+    thread_resolver& t = resolver_here();
+    no_domain = answered = false;
+    if (!t.ok)
+        return -1;
+    const int n = res_nquery(&t.st, name.c_str(), ns_c_in, type, buf, len);
+    if (n < 0)
+    {
+        no_domain = t.st.res_h_errno == HOST_NOT_FOUND;
+        answered = no_domain || t.st.res_h_errno == NO_DATA;
+    }
+    else
+        answered = true;
+    return n;
+}
 
 std::unique_ptr<check_resolver> system_check_resolver(int64_t budget_ms)
 {

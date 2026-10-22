@@ -21,6 +21,7 @@
 #include "mail_mailbox.h"
 #include "mail_rspamd.h"
 #include "mail_srs.h"
+#include "mail_verify.h"
 #include "mail_run.h"
 #include "../dns/dns_wire.h"
 #include "../../shared/crypto/tls_context.h"
@@ -1174,7 +1175,7 @@ void delivery::lookup(route& r)
     if (st == dns_client::state::pending)
     {
         r.looking = true;
-        poll_lookups();
+        poll_lookups(&r.key);
         return;
     }
     const auto take = [this](route& rt, std::vector<dns_client::record> rs, bool no_domain) {
@@ -1225,12 +1226,14 @@ void delivery::lookup(route& r)
     const std::string key = r.key;
     m_run.pool().submit(0,
                         [key, out, no, ok] {
+                            // The system's resolver, at the nameservers a test points the loop's at too.
                             uint8_t buf[8192];
-                            const int n = ::res_query(key.c_str(), C_IN, T_MX, buf, sizeof buf);
+                            bool nx = false, answered = false;
+                            const int n = system_query(key, T_MX, buf, sizeof buf, nx, answered);
                             if (n < 0)
                             {
-                                *no = h_errno == HOST_NOT_FOUND;
-                                *ok = *no || h_errno == NO_DATA;
+                                *no = nx;
+                                *ok = answered;
                                 return;
                             }
                             *ok = parse_answer(buf, static_cast<size_t>(n), dns::type::MX, *out, *no);
@@ -1261,7 +1264,7 @@ void delivery::sts_check(route& r)
     const dns_client::state st = dns_client::here().ask_records("_mta-sts." + r.key, dns::type::TXT, recs, nx);
     if (st == dns_client::state::pending)
     {
-        poll_lookups();
+        poll_lookups(&r.key);
         return;
     }
     if (st == dns_client::state::unsure)
@@ -1393,44 +1396,63 @@ void delivery::sts_save()
         ::unlink(tmp.c_str());
 }
 
-void delivery::poll_lookups()
+void delivery::poll_lookups(const std::string* key, uint64_t conn)
 {
-    if (m_polling)
+    // A lookup newly out is looked at again soon; one asked again because its answer has not come waits longer.
+    if (key && m_wait_routes.insert(*key).second)
+        m_poll_ms = 2;
+    if (conn && m_wait_conns.insert(conn).second)
+        m_poll_ms = 2;
+    if (m_polling || (m_wait_routes.empty() && m_wait_conns.empty()))
         return;
-    bool any = false;
-    for (auto& [k, r] : m_routes)
-        any = any || (r.looking && !m_relay) || r.sts_state == 1;
-    for (auto& [id, c] : m_conns)
-        any = any || c->state == out_conn::st::resolving;
-    if (!any)
-        return;
-    m_polling = m_io.after(std::chrono::milliseconds(2), [this, alive = m_alive](int64_t) {
+    m_polling = m_io.after(std::chrono::milliseconds(m_poll_ms), [this, alive = m_alive](int64_t) {
         if (!*alive)
             return;
-        m_polling = false;
-        for (auto& [k, r] : m_routes)
+        // Held while the lookups are asked again, so each one still out does not set a timer of its own.
+        bool answered = false;
+        const std::vector<std::string> routes(m_wait_routes.begin(), m_wait_routes.end());
+        for (const auto& key : routes)
         {
-            if (r.looking && !m_relay)
+            const auto it = m_routes.find(key);
+            route* r = it == m_routes.end() ? nullptr : &it->second;
+            // Off the list before the route is pumped, which may put it back for its MTA-STS lookup.
+            if (r && r->looking && !m_relay)
             {
-                r.looked = false;
-                lookup(r);
-                if (r.looked)
-                    pump(r);
+                r->looked = false;
+                lookup(*r);
+                if (!r->looked)
+                    continue;
+                m_wait_routes.erase(key);
+                pump(*r);
             }
-            else if (r.sts_state == 1)
+            else if (r && r->sts_state == 1)
             {
-                sts_check(r);
-                if (r.sts_state == 2)
-                    pump(r);
+                sts_check(*r);
+                if (r->sts_state == 1)
+                    continue;
+                m_wait_routes.erase(key);
+                pump(*r);
             }
+            else
+                m_wait_routes.erase(key);
+            answered = true;
         }
-        std::vector<uint64_t> ids;
-        for (auto& [id, c] : m_conns)
-            if (c->state == out_conn::st::resolving)
-                ids.push_back(id);
+        const std::vector<uint64_t> ids(m_wait_conns.begin(), m_wait_conns.end());
         for (const uint64_t id : ids)
-            if (const auto it = m_conns.find(id); it != m_conns.end())
+        {
+            const auto it = m_conns.find(id);
+            if (it != m_conns.end() && it->second->state == out_conn::st::resolving)
+            {
                 conn_connect(*it->second);
+                // conn_connect may have closed it.
+                if (const auto again = m_conns.find(id); again != m_conns.end() && again->second->state == out_conn::st::resolving)
+                    continue;
+            }
+            m_wait_conns.erase(id);
+            answered = true;
+        }
+        m_poll_ms = answered ? 2 : std::min<int64_t>(m_poll_ms * 2, 32);
+        m_polling = false;
         poll_lookups();
     });
 }
@@ -1643,7 +1665,7 @@ void delivery::attempt_over(const entry_ptr& e)
         return;
     }
     const int64_t now = wall::now_ms_coarse();
-    if (now - e->at_ms > static_cast<int64_t>(m_run.owner().get_queue_lifetime()) * 1000)
+    if (now - e->at_ms > static_cast<int64_t>(m_run.owner().get_queue_lifetime()) * 1000 / queue_scale())
     {
         for (size_t i = 0; i < e->rcpts.size(); ++i)
             if (e->rcpts[i].state == rcpt_state::waiting)
@@ -1677,8 +1699,15 @@ void delivery::attempt_over(const entry_ptr& e)
     }
     constexpr size_t n = std::size(retry_delays);
     const uint32_t delay = retry_delays[std::min<size_t>(e->attempts, n - 1)];
-    m_run.queue().retry(*e, e->attempts + 1, now + static_cast<int64_t>(delay) * 1000);
+    m_run.queue().retry(*e, e->attempts + 1, now + static_cast<int64_t>(delay) * 1000 / queue_scale());
     schedule(e, e->next_ms);
+}
+
+int64_t delivery::queue_scale()
+{
+    // A test aid: the retries and the queue lifetime run this many times faster.
+    static const int64_t scale = std::max<int64_t>(1, settings::number<int64_t>("SOCKETLEY_MAIL_QUEUE_SCALE").value_or(1));
+    return scale;
 }
 
 void delivery::finished(const entry_ptr& e)
@@ -1949,7 +1978,7 @@ void delivery::conn_connect(out_conn& c)
                 if (ts == dns_client::state::pending)
                 {
                     c.state = out_conn::st::resolving;
-                    poll_lookups();
+                    poll_lookups(nullptr, c.id);
                     return;
                 }
                 if (ts == dns_client::state::unsure)
@@ -1986,7 +2015,7 @@ void delivery::conn_connect(out_conn& c)
             if (st == dns_client::state::pending)
             {
                 c.state = out_conn::st::resolving;
-                poll_lookups();
+                poll_lookups(nullptr, c.id);
                 return;
             }
             if (st == dns_client::state::unsure)
@@ -2574,6 +2603,15 @@ void delivery::conn_reply(out_conn& c, int code, std::string text)
                     conn_body(c);
                     return;
                 }
+                // A server that waits for the data though it took no recipient is sent an empty message's end, or
+                // what comes next would be read as the data (RFC 2920 3.1); each recipient keeps its own answer.
+                if (code == 354)
+                {
+                    c.state = st::dot;
+                    c.deadline_ms = wall::now_ms_coarse() + final_ms;
+                    conn_send(c, ".\r\n");
+                    return;
+                }
                 // Nobody took it: each recipient is told what its own command was answered.
                 conn_end_item(c, c.mail_code / 100 != 2 ? c.mail_code : code,
                               c.mail_code / 100 != 2 ? c.mail_text : said);
@@ -2919,7 +2957,7 @@ void delivery::conn_end_item(out_conn& c, int code, const std::string& text)
         result(*it, t, rc, rt.empty() ? std::to_string(rc) : rt, rc / 100 == 4 || rc == 0, c.dsn ? 0 : 2);
     }
     // A domain that takes its mail is given more connections, up to the most.
-    if (data_answered && code / 100 == 2)
+    if (data_answered && code / 100 == 2 && c.rcpt_ok > 0)
     {
         route& r = m_routes[c.route];
         r.hold_ms = 0;

@@ -17,6 +17,11 @@
 #   * a server's LIMITS RCPTMAX ignored, so recipients past it are put off to a retry
 #   * a server that said 421 connected to again at once by the next message
 #   * what Rspamd says to reject taken, what it says to mark kept in INBOX, or its score not told to the mailbox
+#   * mail taken by a sharded runtime's shards not all delivered, or not listed together as it waits
+#   * a quiet connection, or a TLS handshake that never comes, held open for ever
+#   * a message refused for now not tried again by itself, or kept past --queue-lifetime rather than given up
+#     and bounced; a server that answers 354 to a pipelined DATA after refusing every RCPT left waiting for the
+#     data, so the connection hangs and the retry never comes
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -48,6 +53,8 @@ SINK=$((SL_PORT_BASE+1908))
 PB=$((SL_PORT_BASE+1909))
 POPS=$((SL_PORT_BASE+1910))
 RSP=$((SL_PORT_BASE+1911))
+PLT=$((SL_PORT_BASE+1913))
+PSH=$((SL_PORT_BASE+1914))
 PSP=$((SL_PORT_BASE+1912))
 PIDS=()
 cleanup() {
@@ -61,10 +68,12 @@ echo "=== Integration: POP3, LMTP, greylisting, SRS, MTA-STS, sub-addresses, quo
 # remote.test takes mail at the sink; busy.test at a server that says 421; few.test at one that takes two at a time.
 python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 \
     busy.test=MX:10:mx.busy.test mx.busy.test=127.0.0.3 few.test=MX:10:mx.few.test mx.few.test=127.0.0.4 \
+    temp.test=MX:10:mx.temp.test mx.temp.test=127.0.0.5 \
     "b.test=TXT:v=spf1 ip4:127.0.0.2 -all" >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
-export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_BUSY_HOLD_MS=3000
+export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK" SOCKETLEY_MAIL_BUSY_HOLD_MS=3000 \
+    SOCKETLEY_MAIL_QUEUE_SCALE=60 SOCKETLEY_MAIL_IDLE_MS=3000
 mkdir -p "$T/sink"
 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/sink" >/dev/null 2>&1 &
 PIDS+=($!)
@@ -84,7 +93,7 @@ def serve(conn, kind):
     note(kind + " connect")
     if kind == "busy":
         say("421 4.7.0 busy, try later\r\n"); conn.close(); return
-    say("220 few ESMTP\r\n")
+    say("220 %s ESMTP\r\n" % kind)
     rcpts = 0
     while True:
         line = f.readline()
@@ -94,7 +103,8 @@ def serve(conn, kind):
         elif v.startswith("MAIL"): rcpts = 0; say("250 ok\r\n")
         elif v.startswith("RCPT"):
             rcpts += 1
-            say("250 ok\r\n" if rcpts <= 2 else "452 4.5.3 too many recipients\r\n")
+            if kind == "temp": say("451 4.3.0 not now\r\n")
+            else: say("250 ok\r\n" if rcpts <= 2 else "452 4.5.3 too many recipients\r\n")
         elif v == "DATA":
             say("354 go\r\n")
             while f.readline() not in (b".\r\n", b""): pass
@@ -107,6 +117,7 @@ def listen(addr, kind):
     while True:
         c, _ = s.accept(); threading.Thread(target=serve, args=(c, kind), daemon=True).start()
 threading.Thread(target=listen, args=("127.0.0.3", "busy"), daemon=True).start()
+threading.Thread(target=listen, args=("127.0.0.5", "temp"), daemon=True).start()
 listen("127.0.0.4", "few")
 PY
 : > "$T/servers.log"
@@ -114,6 +125,7 @@ python3 "$T/servers.py" "$SINK" "$T/servers.log" >/dev/null 2>&1 &
 PIDS+=($!)
 ready_tcp 127.0.0.1 "$SINK" || bad "the sink listens" "-"
 ready_tcp 127.0.0.4 "$SINK" || bad "few.test's server listens" "-"
+ready_tcp 127.0.0.5 "$SINK" || bad "temp.test's server listens" "-"
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=mail.example.test" \
     -keyout "$T/key.pem" -out "$T/cert.pem" >/dev/null 2>&1
@@ -132,7 +144,9 @@ printf 'info@example.test bob@remote.test\n' > "$T/aliases"
     --default-quota 4K --quota-warn 50 --tls --cert "$T/cert.pem" --key "$T/key.pem" -s >/dev/null 2>&1
 "$BIN" create mail g -p "$PG" --mail-domain example.test --aliases "$T/aliases" --greylist 1s -s >/dev/null 2>&1
 "$BIN" create mail b -p "$PB" --mail-domain example.test -s >/dev/null 2>&1
-for p in "$P" "$POP" "$POPS" "$LMTP" "$STS" "$PG" "$PB"; do
+"$BIN" create mail lt -p "$PLT" --mail-domain example.test --queue-lifetime 1m -s >/dev/null 2>&1
+"$BIN" create mail sh -p "$PSH" --mail-domain example.test --shards 3 -s >/dev/null 2>&1
+for p in "$P" "$POP" "$POPS" "$LMTP" "$STS" "$PG" "$PB" "$PLT" "$PSH"; do
     ready_tcp 127.0.0.1 "$p" || bad "port $p listens" "$(tail -3 "$SOCKETLEY_DLOG")"
 done
 
@@ -333,6 +347,55 @@ sleep 1.5
 check "after a 421 the next message does not connect again at once" "$(grep -c 'busy connect' "$T/servers.log")" "1"
 for _ in $(seq 1 60); do [ "$(grep -c 'busy connect' "$T/servers.log")" -ge 2 ] && break; sleep 0.1; done
 check "but once the pause is over it does" "$([ "$(grep -c 'busy connect' "$T/servers.log")" -ge 2 ] && echo yes)" "yes"
+
+# ─── quiet connections ──────────────────────────────────────────────────────
+r=$(python3 - "$PB" "$POPS" <<'PY'
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+f = s.makefile("rb"); f.readline()
+t0 = time.time(); said = f.readline().decode(errors="replace").strip(); gone = s.recv(1) == b""
+print(said.split()[0] if said else "-", gone, 2 <= time.time() - t0 <= 8)
+# A TLS port whose client never begins the handshake.
+p = socket.create_connection(("127.0.0.1", int(sys.argv[2])), timeout=10)
+t0 = time.time()
+try:
+    closed = p.recv(1) == b""
+except OSError:
+    closed = True
+print(closed, 2 <= time.time() - t0 <= 8)
+PY
+)
+check "a quiet SMTP connection is told 421 and closed, once its time is up" "$(sed -n 1p <<<"$r")" "421 True True"
+check "and a TLS handshake that never begins is closed" "$(sed -n 2p <<<"$r")" "True True"
+
+# ─── tried again, and given up ──────────────────────────────────────────────
+"$BIN" send lt --from ops@remote.test --to x@temp.test --subject "never taken" --text "never taken" >/dev/null 2>&1
+f=""
+for _ in $(seq 1 100); do f=$(grep -l "5.4.7 given up after" "$T"/sink/* 2>/dev/null | head -1); [ -n "$f" ] && break; sleep 0.1; done
+tries=$(grep -c 'temp connect' "$T/servers.log")
+[ "$tries" -ge 2 ] && ok "a message refused for now is tried again by itself ($tries tries)" \
+    || bad "a message refused for now is tried again by itself" "$tries tries"
+[ -n "$f" ] && grep -q '^Action: failed' "$f" && grep -q 'x@temp.test' "$f" \
+    && ok "and past --queue-lifetime it is given up and bounced to its sender" \
+    || bad "and past --queue-lifetime it is given up and bounced to its sender" \
+           "$(ls "$T/sink" | wc -l) at the sink, queue: $("$BIN" mail lt queue 2>&1 | head -3 | tr '\n' ' ')"
+
+# ─── a runtime of three shards ──────────────────────────────────────────────
+for _ in $(seq 1 50); do [ "$(ss -ltnpH "sport = :$PSH" | grep -o 'pid=[0-9]*' | sort -u | wc -l)" -ge 3 ] && break; sleep 0.1; done
+r=$(python3 - "$PSH" <<'PY'
+import smtplib, sys
+# Each a connection of its own, so the kernel spreads them over the shards.
+for i in range(12):
+    s = smtplib.SMTP("127.0.0.1", int(sys.argv[1])); s.ehlo("x")
+    s.sendmail("ops@remote.test", ["good%d@remote.test" % i], "From: ops@remote.test\r\nSubject: sharded %d\r\n\r\nsharded body\r\n" % i)
+    s.sendmail("shard@remote.test", ["held%d@temp.test" % i], "From: shard@remote.test\r\nSubject: held %d\r\n\r\nheld\r\n" % i)
+    s.quit()
+print("sent")
+PY
+)
+for _ in $(seq 1 100); do [ "$(grep -l 'sharded body' "$T"/sink/* 2>/dev/null | wc -l)" -ge 12 ] && break; sleep 0.1; done
+check "twelve messages over connections the shards share are all delivered" "$(grep -l 'sharded body' "$T"/sink/* 2>/dev/null | wc -l)" "12"
+check "and twelve that wait are each in a shard's queue, listed together" "$("$BIN" mail sh queue 2>/dev/null | grep -c $'\tshard@remote.test\t')" "12"
 
 # ─── Rspamd ─────────────────────────────────────────────────────────────────
 python3 - "$RSP" >/dev/null 2>&1 <<'PY' &

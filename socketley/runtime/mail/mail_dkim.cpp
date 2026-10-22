@@ -327,7 +327,8 @@ std::string sign(std::string_view message, std::string_view domain, std::string_
     // From named once more than it is there, so a second From added on the way breaks the signature.
     h += ":from";
     const std::string bh = sha256_b64(relaxed_body(body));
-    std::string value = " " + std::string(first_tags) + (first_tags.empty() ? "v=1; " : "") + "a=" +
+    // A DKIM-Signature says its version first, whatever tags come with it; ARC's signature has none.
+    std::string value = " " + std::string(header == "DKIM-Signature" ? "v=1; " : "") + std::string(first_tags) + "a=" +
                         algorithm_of(key) + "; c=relaxed/relaxed; d=" + std::string(domain) + "; s=" +
                         std::string(selector) + ";\r\n\tt=" + std::to_string(now_s) + "; h=" + h + ";\r\n\tbh=" + bh +
                         ";\r\n\tb=";

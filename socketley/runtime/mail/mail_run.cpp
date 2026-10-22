@@ -43,6 +43,7 @@
 #include "../../shared/util/base64.h"
 #include "../../shared/util/logging.h"
 #include "../../shared/util/text_list.h"
+#include "../../shared/util/settings.h"
 #include "../../shared/util/wall_clock.h"
 
 namespace socketley::mail
@@ -2346,8 +2347,11 @@ void mail_run::tick()
     for (auto& [id, c] : m_conns)
     {
         const bool shaking = c->ssl && !c->handshaken;
-        const int64_t quiet = c->imap ? imap_idle_ms : idle_ms;
-        if (!c->closing && ((shaking && now - c->closing_ms > handshake_ms) || now - c->heard_ms > quiet))
+        // A test aid shortens every one of them alike.
+        static const int64_t aid = settings::number<int64_t>("SOCKETLEY_MAIL_IDLE_MS").value_or(0);
+        const int64_t quiet = aid ? aid : c->imap ? imap_idle_ms : idle_ms;
+        const int64_t shake = aid ? std::min(aid, handshake_ms) : handshake_ms;
+        if (!c->closing && ((shaking && now - c->closing_ms > shake) || now - c->heard_ms > quiet))
             late.push_back(c.get());
         // One closing with output its client does not read is closed once its grace is over.
         else if (c->closing && now - c->closing_ms >= close_grace_ms)

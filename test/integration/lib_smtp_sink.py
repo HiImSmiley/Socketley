@@ -1,6 +1,7 @@
 # A mail server for a test: lib_smtp_sink.py <port> <dir> [options], each message written to <dir> as it is taken,
 # the envelope first ("from <addr>", "rcpt <addr>" lines, "tls 0|1", a blank line) and the data after.
 #   --tls <cert> <key>    offer STARTTLS
+#   --implicit-tls <cert> <key>  speak TLS from the first byte, as a submissions port does
 #   --auth <user:pass>    offer AUTH PLAIN, and take mail only from it
 #   --auth-login          offer AUTH LOGIN instead of PLAIN
 #   --auth-code <code>    answer every AUTH with <code> (e.g. 454)
@@ -17,7 +18,7 @@
 import base64, os, socket, ssl, sys, threading, time
 port, out = int(sys.argv[1]), sys.argv[2]
 args = sys.argv[3:]
-tls = auth = None
+tls = auth = implicit = None
 replies, data_code, pipelining, chunking, dsn = {}, None, True, False, False
 requiretls = False
 auth_login, auth_code, mail_replies, greet = False, None, {}, "220"
@@ -25,6 +26,7 @@ i = 0
 while i < len(args):
     a = args[i]
     if a == "--tls": tls = (args[i + 1], args[i + 2]); i += 3
+    elif a == "--implicit-tls": implicit = (args[i + 1], args[i + 2]); i += 3
     elif a == "--auth": auth = args[i + 1]; i += 2
     elif a == "--auth-login": auth_login = True; i += 1
     elif a == "--auth-code": auth_code = args[i + 1]; i += 2
@@ -48,8 +50,15 @@ def take_code(table, key):
             return c[:-1]
         return c
 def serve(conn):
-    f = conn.makefile("rb")
     secure = [False]
+    if implicit:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(*implicit)
+        try:
+            conn = ctx.wrap_socket(conn, server_side=True)
+        except (ssl.SSLError, OSError):
+            conn.close(); return
+        secure[0] = True
+    f = conn.makefile("rb")
     def say(x): conn.sendall(x.encode())
     say("%s sink ESMTP\r\n" % greet)
     if greet != "220":

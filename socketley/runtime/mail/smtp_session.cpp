@@ -453,6 +453,9 @@ void smtp_session::command(std::string_view line)
         m_phase = phase::data;
         m_dstate = s_bol;
         m_size = 0;
+        m_in_header = true;
+        m_line_head.clear();
+        m_received = 0;
         m_dropping = false;
         say(354, {}, "End data with <CR><LF>.<CR><LF>");
         return;
@@ -944,7 +947,10 @@ bool smtp_session::data(std::string_view& in)
             m_hooks.data_abort(true);
         }
         else
+        {
+            scan_header(out);
             m_hooks.data_bytes(out);
+        }
     }
     if (!ended)
         return false;
@@ -962,8 +968,40 @@ bool smtp_session::data(std::string_view& in)
     return true;
 }
 
+void smtp_session::scan_header(std::string_view bytes)
+{
+    // Only the start of each header line is looked at, so a long header costs what it is long.
+    for (size_t i = 0; m_in_header && i < bytes.size(); ++i)
+    {
+        const char c = bytes[i];
+        if (c == '\n')
+        {
+            if (m_line_head == "\r" || m_line_head.empty())
+                m_in_header = false;
+            m_line_head.clear();
+            continue;
+        }
+        if (m_line_head.size() < 9)
+        {
+            m_line_head += c;
+            if (m_line_head.size() == 9 && socketley::ascii::iequals(m_line_head, "Received:"))
+                ++m_received;
+        }
+    }
+}
+
 void smtp_session::message_end()
 {
+    // A message that came through more hosts than a path has is going round in a loop, and goes no further.
+    if (m_received > max_hops)
+    {
+        m_hooks.data_abort(false);
+        for (size_t i = 0; i < (m_cfg.lmtp ? std::max<size_t>(1, m_rcpts.size()) : 1); ++i)
+            say(554, "5.4.6", "Too many hops: the message is in a loop");
+        reset();
+        m_phase = phase::command;
+        return;
+    }
     wait();
     m_hooks.data_end([this, alive = m_alive](rcpt_verdict v) {
         if (!*alive)
@@ -1017,6 +1055,9 @@ void smtp_session::bdat(std::string_view arg)
         {
             m_chunking = true;
             m_size = 0;
+            m_in_header = true;
+            m_line_head.clear();
+            m_received = 0;
             m_dropping = false;
             m_chunk_cr = false;
         }
@@ -1066,7 +1107,10 @@ bool smtp_session::chunk(std::string_view& in)
             m_hooks.data_abort(true);
         }
         else
+        {
+            scan_header(out);
             m_hooks.data_bytes(out);
+        }
     }
     if (m_chunk_left > 0)
         return false;
