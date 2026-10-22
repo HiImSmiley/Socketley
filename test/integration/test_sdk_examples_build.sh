@@ -87,6 +87,8 @@ build_one() {
     else
         printf 'bad %s\n' "$tag" >> "$WORK/results"
     fi
+    # Only the verdict is kept, since a sanitizer build of an example is half a gigabyte and 23 of them filled the disk.
+    rm -f "$WORK/$tag.bin"
 }
 export -f build_one sdk_cxx
 
@@ -132,6 +134,7 @@ fi
 # an archive of LTO bytecode.
 TOTAL=$((TOTAL+1))
 if sdk_cxx -fno-use-linker-plugin "${SOURCES[0]}" $SDKFLAGS -o "$WORK/noplugin.bin" 2>"$WORK/noplugin.err"; then
+    rm -f "$WORK/noplugin.bin"
     PASS=$((PASS+1))
 else
     FAIL=$((FAIL+1))
