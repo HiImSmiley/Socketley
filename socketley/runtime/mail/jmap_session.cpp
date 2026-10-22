@@ -19,6 +19,7 @@ namespace
 constexpr std::string_view core = "urn:ietf:params:jmap:core";
 constexpr std::string_view mail_cap = "urn:ietf:params:jmap:mail";
 constexpr std::string_view submission_cap = "urn:ietf:params:jmap:submission";
+constexpr std::string_view vacation_cap = "urn:ietf:params:jmap:vacationresponse";
 
 std::string reason_of(int code)
 {
@@ -447,6 +448,8 @@ std::string jmap_session::session_json(const request& rq) const
     json::quote_into(out, mail_cap);
     out += ":{},";
     json::quote_into(out, submission_cap);
+    out += ":{},";
+    json::quote_into(out, vacation_cap);
     out += ":{}},\"accounts\":{" + a + ":{\"name\":";
     json::quote_into(out, m_user);
     out += ",\"isPersonal\":true,\"isReadOnly\":false,\"accountCapabilities\":{";
@@ -457,10 +460,14 @@ std::string jmap_session::session_json(const request& rq) const
            ",\"emailQuerySortOptions\":[\"receivedAt\",\"size\",\"subject\",\"from\",\"to\",\"sentAt\"],"
            "\"mayCreateTopLevelMailbox\":true},";
     json::quote_into(out, submission_cap);
-    out += ":{\"maxDelayedSend\":0,\"submissionExtensions\":{}}}}},\"primaryAccounts\":{";
+    out += ":{\"maxDelayedSend\":0,\"submissionExtensions\":{}},";
+    json::quote_into(out, vacation_cap);
+    out += ":{}}}},\"primaryAccounts\":{";
     json::quote_into(out, mail_cap);
     out += ":" + a + ",";
     json::quote_into(out, submission_cap);
+    out += ":" + a + ",";
+    json::quote_into(out, vacation_cap);
     out += ":" + a + "},\"username\":";
     json::quote_into(out, m_user);
     out += ",\"apiUrl\":";
@@ -495,7 +502,8 @@ void jmap_session::api(const request& rq)
         return finished();
     }
     for (const auto& u : using_->items)
-        if (u.k != json::jvalue::kind::string || (u.s != core && u.s != mail_cap && u.s != submission_cap))
+        if (u.k != json::jvalue::kind::string ||
+            (u.s != core && u.s != mail_cap && u.s != submission_cap && u.s != vacation_cap))
         {
             fail(400, "urn:ietf:params:jmap:error:unknownCapability", "a capability this server does not have: " + u.s);
             return finished();
@@ -635,8 +643,20 @@ void jmap_session::method(const std::string& name, const json::jvalue& args, con
         return email_import(args, cs, std::move(done));
     if (name == "Thread/get")
         return thread_get(args, std::move(done));
+    if (name == "Email/parse")
+        return email_parse(args, std::move(done));
+    if (name == "VacationResponse/get")
+        return vacation_get(args, std::move(done));
+    if (name == "VacationResponse/set")
+        return vacation_set(args, std::move(done));
+    if (name == "PushSubscription/get")
+        return push_get(args, std::move(done));
+    if (name == "PushSubscription/set")
+        return push_set(args, cs, std::move(done));
     if (name == "Identity/get")
         return identity_get(args, std::move(done));
+    if (name == "Identity/set")
+        return identity_set(args, std::move(done));
     if (name == "EmailSubmission/set")
         return submission_set(args, cs, std::move(done));
     if (name == "Mailbox/changes" || name == "Email/changes" || name == "Thread/changes" ||

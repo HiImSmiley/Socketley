@@ -11,6 +11,8 @@
 #include "mail_compose.h"
 #include "mail_mime.h"
 #include "../../shared/json/json_escape.h"
+#include "../../shared/util/base64.h"
+#include "../../shared/crypto/mac.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/random_id.h"
 #include "../../shared/util/wall_clock.h"
@@ -457,6 +459,159 @@ bool meets(const jvalue& f, const query_cand& c, int depth = 0)
     return true;
 }
 
+// What Email/get and Email/parse say of a message: its properties as `v` asks, from the index entry `m` where it is
+// one of the account's, and from its bytes where they were read.
+struct email_view
+{
+    std::vector<std::string> props;
+    const jvalue* body_props{nullptr};
+    bool whole{false}, text_values{false}, html_values{false}, all_values{false};
+    size_t max_value{0};
+};
+
+std::string email_object(const email_view& view, const std::string& id, const imap_message* m, const std::string& mailbox,
+                         const std::string* bytes)
+{
+    std::string o = "{";
+    const auto add = [&](std::string_view k, const std::string& val) {
+        o += (o.size() > 1 ? "," : "") + q(k) + ":" + val;
+    };
+    std::string_view msg = bytes ? std::string_view(*bytes) : std::string_view{};
+    const std::string_view head = header_block(msg);
+    mime::part root;
+    body_part tree;
+    std::vector<const body_part*> text, html, att;
+    if (view.whole && bytes)
+    {
+        root = mime::parse(msg);
+        tree = number_parts(root, root.multipart() ? std::string() : std::string("1"));
+        pick({&tree}, "mixed", false, &html, &text, att);
+    }
+    for (const auto& p : view.props)
+    {
+        // A blob parsed as an Email is no Email of the account: it has no id, mailbox, keywords or arrival.
+        if (p == "id")
+            add(p, m ? q(id) : "null");
+        else if (p == "blobId")
+            add(p, q(id));
+        else if (p == "threadId")
+            add(p, m ? q("T" + id.substr(1)) : "null");
+        else if (p == "mailboxIds")
+            add(p, m ? "{" + q(mailbox) + ":true}" : "null");
+        else if (p == "keywords")
+            add(p, m ? keywords_json(*m) : "null");
+        else if (p == "size")
+            add(p, std::to_string(m ? m->size : bytes ? bytes->size() : 0));
+        else if (p == "receivedAt")
+            add(p, m ? q(utc(m->date_ms)) : "null");
+        else if (p == "messageId" || p == "inReplyTo" || p == "references")
+            add(p, ids_json(header_value(head, p == "messageId" ? "Message-ID" : p == "inReplyTo" ? "In-Reply-To" : "References")));
+        else if (p == "sender" || p == "from" || p == "to" || p == "cc" || p == "bcc" || p == "replyTo")
+            add(p, addresses_json(header_value(head, p == "replyTo" ? "Reply-To" : p)));
+        else if (p == "subject")
+        {
+            const std::string s = header_value(head, "Subject");
+            add(p, bytes && !s.empty() ? q(mime::decode_words(s)) : "null");
+        }
+        else if (p == "sentAt")
+        {
+            int64_t t = 0;
+            int zone = 0;
+            const std::string d = header_value(head, "Date");
+            add(p, !d.empty() && mime::parse_date(d, t, zone) ? q(dated(t, zone)) : "null");
+        }
+        else if (p == "headers")
+        {
+            std::string hs = "[";
+            for (const auto& [n, v] : split_headers(head))
+                hs += (hs.size() > 1 ? "," : "") + std::string("{\"name\":") + q(n) + ",\"value\":" + q(v) + "}";
+            add(p, hs + "]");
+        }
+        else if (p.starts_with("header:"))
+        {
+            // header:<name>[:asText], the first of its name.
+            std::string_view rest = std::string_view(p).substr(7);
+            const bool as_text = rest.ends_with(":asText");
+            const bool as_addr = rest.ends_with(":asAddresses");
+            if (as_text)
+                rest.remove_suffix(7);
+            if (as_addr)
+                rest.remove_suffix(12);
+            const std::string v = header_value(head, rest);
+            add(p, v.empty() ? "null" : as_addr ? addresses_json(v) : q(as_text ? mime::decode_words(v) : " " + v));
+        }
+        else if (p == "hasAttachment")
+            add(p, bytes ? (att.empty() ? "false" : "true") : "false");
+        else if (p == "preview")
+        {
+            std::string pv;
+            if (!text.empty())
+                pv = text_of(msg, *text.front()->p);
+            else if (!html.empty())
+            {
+                // HTML with its tags taken out, as a preview reads.
+                bool tag = false;
+                for (const char c : text_of(msg, *html.front()->p))
+                {
+                    if (c == '<')
+                        tag = true;
+                    else if (c == '>')
+                        tag = false;
+                    else if (!tag)
+                        pv += c;
+                }
+            }
+            std::string flat;
+            for (const char c : pv)
+            {
+                const bool ws = c == ' ' || c == '\t' || c == '\r' || c == '\n';
+                if (ws && (flat.empty() || flat.back() == ' '))
+                    continue;
+                flat += ws ? ' ' : c;
+            }
+            add(p, q(utf8_prefix(flat, 256)));
+        }
+        else if (p == "bodyStructure")
+            add(p, bytes ? part_json(msg, tree, id, view.body_props) : "null");
+        else if (p == "textBody" || p == "htmlBody" || p == "attachments")
+        {
+            const auto& v = p == "textBody" ? text : p == "htmlBody" ? html : att;
+            std::string arr = "[";
+            for (const body_part* bp : v)
+                arr += (arr.size() > 1 ? "," : "") + part_json(msg, *bp, id, view.body_props);
+            add(p, arr + "]");
+        }
+        else if (p == "bodyValues")
+        {
+            std::string vals = "{";
+            std::set<std::string> done_ids;
+            const auto value_of = [&](const body_part* bp) {
+                if (!done_ids.insert(bp->id).second || bp->p->type != "text")
+                    return;
+                std::string v = text_of(msg, *bp->p);
+                const bool cut = view.max_value && v.size() > view.max_value;
+                if (cut)
+                    v = std::string(utf8_prefix(v, view.max_value));
+                vals += (vals.size() > 1 ? "," : "") + q(bp->id) + ":{\"value\":" + q(v) +
+                        ",\"isEncodingProblem\":false,\"isTruncated\":" + (cut ? "true" : "false") + "}";
+            };
+            if (view.text_values || view.all_values)
+                for (const body_part* bp : text)
+                    value_of(bp);
+            if (view.html_values || view.all_values)
+                for (const body_part* bp : html)
+                    value_of(bp);
+            if (view.all_values)
+                for (const body_part* bp : att)
+                    value_of(bp);
+            add(p, vals + "}");
+        }
+        else
+            add(p, "null");
+    }
+    return o + "}";
+}
+
 std::string set_error(std::string_view type, std::string_view description = {})
 {
     std::string out = "{\"type\":" + q(type);
@@ -837,144 +992,10 @@ void jmap_session::email_get(const jvalue& args, std::function<void(answer)> don
             }
             const imap_message m = *w.m();
             const std::string mailbox = w.f->id();
-            const auto write = [this, j, id, m, mailbox](const std::string* bytes) {
-                std::string o = "{";
-                const auto add = [&](std::string_view k, const std::string& v) {
-                    o += (o.size() > 1 ? "," : "") + q(k) + ":" + v;
-                };
-                std::string_view msg = bytes ? std::string_view(*bytes) : std::string_view{};
-                const std::string_view head = header_block(msg);
-                mime::part root;
-                body_part tree;
-                std::vector<const body_part*> text, html, att;
-                if (j->whole && bytes)
-                {
-                    root = mime::parse(msg);
-                    tree = number_parts(root, root.multipart() ? std::string() : std::string("1"));
-                    pick({&tree}, "mixed", false, &html, &text, att);
-                }
-                for (const auto& p : j->props)
-                {
-                    if (p == "id")
-                        add(p, q(id));
-                    else if (p == "blobId")
-                        add(p, q(id));
-                    else if (p == "threadId")
-                        add(p, q("T" + id.substr(1)));
-                    else if (p == "mailboxIds")
-                        add(p, "{" + q(mailbox) + ":true}");
-                    else if (p == "keywords")
-                        add(p, keywords_json(m));
-                    else if (p == "size")
-                        add(p, std::to_string(m.size));
-                    else if (p == "receivedAt")
-                        add(p, q(utc(m.date_ms)));
-                    else if (p == "messageId" || p == "inReplyTo" || p == "references")
-                        add(p, ids_json(header_value(head, p == "messageId" ? "Message-ID" : p == "inReplyTo" ? "In-Reply-To" : "References")));
-                    else if (p == "sender" || p == "from" || p == "to" || p == "cc" || p == "bcc" || p == "replyTo")
-                        add(p, addresses_json(header_value(head, p == "replyTo" ? "Reply-To" : p)));
-                    else if (p == "subject")
-                    {
-                        const std::string s = header_value(head, "Subject");
-                        add(p, bytes && !s.empty() ? q(mime::decode_words(s)) : "null");
-                    }
-                    else if (p == "sentAt")
-                    {
-                        int64_t t = 0;
-                        int zone = 0;
-                        const std::string d = header_value(head, "Date");
-                        add(p, !d.empty() && mime::parse_date(d, t, zone) ? q(dated(t, zone)) : "null");
-                    }
-                    else if (p == "headers")
-                    {
-                        std::string hs = "[";
-                        for (const auto& [n, v] : split_headers(head))
-                            hs += (hs.size() > 1 ? "," : "") + std::string("{\"name\":") + q(n) + ",\"value\":" + q(v) + "}";
-                        add(p, hs + "]");
-                    }
-                    else if (p.starts_with("header:"))
-                    {
-                        // header:<name>[:asText], the first of its name.
-                        std::string_view rest = std::string_view(p).substr(7);
-                        const bool as_text = rest.ends_with(":asText");
-                        const bool as_addr = rest.ends_with(":asAddresses");
-                        if (as_text)
-                            rest.remove_suffix(7);
-                        if (as_addr)
-                            rest.remove_suffix(12);
-                        const std::string v = header_value(head, rest);
-                        add(p, v.empty() ? "null" : as_addr ? addresses_json(v) : q(as_text ? mime::decode_words(v) : " " + v));
-                    }
-                    else if (p == "hasAttachment")
-                        add(p, bytes ? (att.empty() ? "false" : "true") : "false");
-                    else if (p == "preview")
-                    {
-                        std::string pv;
-                        if (!text.empty())
-                            pv = text_of(msg, *text.front()->p);
-                        else if (!html.empty())
-                        {
-                            // HTML with its tags taken out, as a preview reads.
-                            bool tag = false;
-                            for (const char c : text_of(msg, *html.front()->p))
-                            {
-                                if (c == '<')
-                                    tag = true;
-                                else if (c == '>')
-                                    tag = false;
-                                else if (!tag)
-                                    pv += c;
-                            }
-                        }
-                        std::string flat;
-                        for (const char c : pv)
-                        {
-                            const bool ws = c == ' ' || c == '\t' || c == '\r' || c == '\n';
-                            if (ws && (flat.empty() || flat.back() == ' '))
-                                continue;
-                            flat += ws ? ' ' : c;
-                        }
-                        add(p, q(utf8_prefix(flat, 256)));
-                    }
-                    else if (p == "bodyStructure")
-                        add(p, bytes ? part_json(msg, tree, id, j->body_props) : "null");
-                    else if (p == "textBody" || p == "htmlBody" || p == "attachments")
-                    {
-                        const auto& v = p == "textBody" ? text : p == "htmlBody" ? html : att;
-                        std::string arr = "[";
-                        for (const body_part* bp : v)
-                            arr += (arr.size() > 1 ? "," : "") + part_json(msg, *bp, id, j->body_props);
-                        add(p, arr + "]");
-                    }
-                    else if (p == "bodyValues")
-                    {
-                        std::string vals = "{";
-                        std::set<std::string> done_ids;
-                        const auto value_of = [&](const body_part* bp) {
-                            if (!done_ids.insert(bp->id).second || bp->p->type != "text")
-                                return;
-                            std::string v = text_of(msg, *bp->p);
-                            const bool cut = j->max_value && v.size() > j->max_value;
-                            if (cut)
-                                v = std::string(utf8_prefix(v, j->max_value));
-                            vals += (vals.size() > 1 ? "," : "") + q(bp->id) + ":{\"value\":" + q(v) +
-                                    ",\"isEncodingProblem\":false,\"isTruncated\":" + (cut ? "true" : "false") + "}";
-                        };
-                        if (j->text_values || j->all_values)
-                            for (const body_part* bp : text)
-                                value_of(bp);
-                        if (j->html_values || j->all_values)
-                            for (const body_part* bp : html)
-                                value_of(bp);
-                        if (j->all_values)
-                            for (const body_part* bp : att)
-                                value_of(bp);
-                        add(p, vals + "}");
-                    }
-                    else
-                        add(p, "null");
-                }
-                j->list += (j->list.size() > 1 ? "," : "") + o + "}";
+            const email_view view{j->props, j->body_props, j->whole, j->text_values, j->html_values, j->all_values,
+                                  j->max_value};
+            const auto write = [j, view, id, m, mailbox](const std::string* bytes) {
+                j->list += (j->list.size() > 1 ? "," : "") + email_object(view, id, &m, mailbox, bytes);
             };
             if (!j->head && !j->whole)
             {
@@ -1177,10 +1198,75 @@ void jmap_session::thread_get(const jvalue& args, std::function<void(answer)> do
 
 void jmap_session::identity_get(const jvalue&, std::function<void(answer)> done)
 {
+    // The one address the user sends as, with what they set of it.
     const std::string email = m_hooks.address_of(m_user);
-    done({{"Identity/get", "{\"accountId\":" + q(account_of(m_user)) + ",\"state\":\"s0\",\"list\":[{\"id\":\"i0\",\"name\":\"\"," +
-                               "\"email\":" + q(email) + ",\"replyTo\":null,\"bcc\":null,\"textSignature\":\"\"," +
-                               "\"htmlSignature\":\"\",\"mayDelete\":false}],\"notFound\":[]}"}});
+    const std::string* kept = m_store.meta(m_user, {}, std::string(identity_entry));
+    jvalue v;
+    const bool have = kept && json::json_reader(*kept).document(v);
+    const auto field = [&](std::string_view k, std::string_view otherwise) -> std::string {
+        const jvalue* x = have ? json::member(v, k) : nullptr;
+        return x ? json::written(*x) : std::string(otherwise);
+    };
+    done({{"Identity/get", "{\"accountId\":" + q(account_of(m_user)) + ",\"state\":" +
+                               q("s" + std::to_string(kept ? kept->size() : 0)) + ",\"list\":[{\"id\":\"i0\",\"name\":" +
+                               field("name", "\"\"") + ",\"email\":" + q(email) + ",\"replyTo\":" + field("replyTo", "null") +
+                               ",\"bcc\":" + field("bcc", "null") + ",\"textSignature\":" + field("textSignature", "\"\"") +
+                               ",\"htmlSignature\":" + field("htmlSignature", "\"\"") + ",\"mayDelete\":false}],\"notFound\":[]}"}});
+}
+
+void jmap_session::identity_set(const jvalue& args, std::function<void(answer)> done)
+{
+    // The address is the account's, so an Identity is neither made nor taken away here; the rest is the user's.
+    std::string updated = "{", not_updated = "{", not_created = "{", not_destroyed = "{";
+    const std::string* kept = m_store.meta(m_user, {}, std::string(identity_entry));
+    const std::string old_state = "s" + std::to_string(kept ? kept->size() : 0);
+    jvalue v;
+    if (!kept || !json::json_reader(*kept).document(v))
+    {
+        v = jvalue{};
+        v.k = jvalue::kind::object;
+    }
+    if (const jvalue* c = json::member(args, "create"); c && c->k == jvalue::kind::object)
+        for (const auto& [cid, obj] : c->members)
+            not_created += (not_created.size() > 1 ? "," : "") + q(cid) + ":" +
+                           set_error("forbiddenFrom", "the address a user sends as is the account's");
+    for (const auto& id : strings_of(json::member(args, "destroy")))
+        not_destroyed += (not_destroyed.size() > 1 ? "," : "") + q(id) + ":" + set_error("forbidden");
+    if (const jvalue* u = json::member(args, "update"); u && u->k == jvalue::kind::object)
+        for (const auto& [id, patch] : u->members)
+        {
+            bool fine = id == "i0" && patch.k == jvalue::kind::object;
+            for (const auto& [k, x] : patch.members)
+            {
+                const bool text = k == "name" || k == "textSignature" || k == "htmlSignature";
+                const bool list = k == "replyTo" || k == "bcc";
+                fine = fine && ((text && x.k == jvalue::kind::string && x.s.size() <= 16384) ||
+                                (list && (x.k == jvalue::kind::null || x.k == jvalue::kind::array)));
+            }
+            if (!fine)
+            {
+                not_updated += (not_updated.size() > 1 ? "," : "") + q(id) + ":" +
+                               set_error(id == "i0" ? "invalidProperties" : "notFound");
+                continue;
+            }
+            for (const auto& [k, x] : patch.members)
+                if (jvalue* have = json::member(v, k))
+                    *have = x;
+                else
+                    v.members.emplace_back(k, x);
+            const std::string text = json::written(v);
+            if (m_store.set_meta(m_user, {}, std::string(identity_entry), &text) != imap_store::meta_refusal::none)
+            {
+                not_updated += (not_updated.size() > 1 ? "," : "") + q(id) + ":" + set_error("tooLarge");
+                continue;
+            }
+            updated += (updated.size() > 1 ? "," : "") + q(id) + ":null";
+        }
+    const std::string* now = m_store.meta(m_user, {}, std::string(identity_entry));
+    done({{"Identity/set", "{\"accountId\":" + q(account_of(m_user)) + ",\"oldState\":" + q(old_state) +
+                               ",\"newState\":" + q("s" + std::to_string(now ? now->size() : 0)) +
+                               ",\"created\":{},\"updated\":" + updated + "},\"destroyed\":[],\"notCreated\":" +
+                               not_created + "},\"notUpdated\":" + not_updated + "},\"notDestroyed\":" + not_destroyed + "}}"}});
 }
 
 void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_state>& cs, std::function<void(answer)> done)
@@ -1591,6 +1677,353 @@ void jmap_session::email_import(const jvalue& args, const std::shared_ptr<call_s
              });
     };
     (*step)();
+}
+
+void jmap_session::email_parse(const jvalue& args, std::function<void(answer)> done)
+{
+    struct job
+    {
+        std::vector<std::string> blobs;
+        email_view view;
+        size_t at{0};
+        std::string parsed = "{", not_parsable = "[", not_found = "[";
+    };
+    auto j = std::make_shared<job>();
+    j->blobs = strings_of(json::member(args, "blobIds"));
+    if (j->blobs.size() > 1000)
+        return done({{"error", set_error("requestTooLarge")}});
+    const jvalue* props = json::member(args, "properties");
+    j->view.props = props && props->k == jvalue::kind::array
+                        ? strings_of(props)
+                        : std::vector<std::string>{"messageId", "inReplyTo", "references", "sender", "from", "to", "cc",
+                                                   "bcc", "replyTo", "subject", "sentAt", "hasAttachment", "preview",
+                                                   "bodyValues", "textBody", "htmlBody", "attachments"};
+    // What a parsed blob's view reads is the whole of it, which is all it has.
+    j->view.whole = true;
+    const auto flag = [&](std::string_view k) {
+        const jvalue* v = json::member(args, k);
+        return v && v->k == jvalue::kind::boolean && v->b;
+    };
+    j->view.text_values = flag("fetchTextBodyValues");
+    j->view.html_values = flag("fetchHTMLBodyValues");
+    j->view.all_values = flag("fetchAllBodyValues");
+    j->view.max_value = static_cast<size_t>(std::max<int64_t>(0, json::int_of(args, "maxBodyValueBytes", 0)));
+    // A body property list given is kept by the request, which outlives this job.
+    j->view.body_props = nullptr;
+    auto step = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weak = step;
+    *step = [this, j, weak, done, alive = m_alive] {
+        auto self = weak.lock();
+        if (!*alive || !self)
+            return;
+        if (j->at >= j->blobs.size())
+            return done({{"Email/parse", "{\"accountId\":" + q(account_of(m_user)) + ",\"parsed\":" + j->parsed +
+                                             "},\"notParsable\":" + j->not_parsable + "],\"notFound\":" + j->not_found +
+                                             "]}"}});
+        const std::string id = j->blobs[j->at++];
+        blob(id, [j, self, id, alive](std::shared_ptr<const std::string> b) {
+            if (!*alive)
+                return;
+            if (!b)
+                j->not_found += (j->not_found.size() > 1 ? "," : "") + q(id);
+            // A blob is a message where it has a header of at least one field.
+            else if (split_headers(header_block(*b)).empty())
+                j->not_parsable += (j->not_parsable.size() > 1 ? "," : "") + q(id);
+            else
+                j->parsed += (j->parsed.size() > 1 ? "," : "") + q(id) + ":" + email_object(j->view, id, nullptr, {}, b.get());
+            (*self)();
+        });
+    };
+    (*step)();
+}
+
+// ─── VacationResponse ───────────────────────────────────────────────────────
+
+void jmap_session::vacation_get(const jvalue&, std::function<void(answer)> done)
+{
+    // The one VacationResponse an account has, off until it is set.
+    const std::string* kept = m_store.meta(m_user, {}, std::string(vacation_entry));
+    jvalue v;
+    json::json_policy policy;
+    const bool have = kept && json::json_reader(*kept, policy).document(v);
+    const auto field = [&](std::string_view k, std::string_view otherwise) -> std::string {
+        const jvalue* x = have ? json::member(v, k) : nullptr;
+        return x ? json::written(*x) : std::string(otherwise);
+    };
+    done({{"VacationResponse/get", "{\"accountId\":" + q(account_of(m_user)) + ",\"state\":" +
+                                       q("s" + std::to_string(kept ? kept->size() : 0)) +
+                                       ",\"list\":[{\"id\":\"singleton\",\"isEnabled\":" + field("isEnabled", "false") +
+                                       ",\"fromDate\":" + field("fromDate", "null") + ",\"toDate\":" +
+                                       field("toDate", "null") + ",\"subject\":" + field("subject", "null") +
+                                       ",\"textBody\":" + field("textBody", "null") + ",\"htmlBody\":" +
+                                       field("htmlBody", "null") + "}],\"notFound\":[]}"}});
+}
+
+void jmap_session::vacation_set(const jvalue& args, std::function<void(answer)> done)
+{
+    std::string updated = "{", not_updated = "{";
+    const std::string* kept = m_store.meta(m_user, {}, std::string(vacation_entry));
+    jvalue v;
+    json::json_policy policy;
+    if (!kept || !json::json_reader(*kept, policy).document(v))
+    {
+        v = jvalue{};
+        v.k = jvalue::kind::object;
+    }
+    if (const jvalue* c = json::member(args, "create"); c && c->k == jvalue::kind::object && !c->members.empty())
+        return done({{"error", set_error("invalidArguments", "a VacationResponse is a singleton: update it")}});
+    if (const jvalue* u = json::member(args, "update"); u && u->k == jvalue::kind::object)
+        for (const auto& [id, patch] : u->members)
+        {
+            if (id != "singleton" || patch.k != jvalue::kind::object)
+            {
+                not_updated += (not_updated.size() > 1 ? "," : "") + q(id) + ":" + set_error("notFound");
+                continue;
+            }
+            bool fine = true;
+            for (const auto& [k, x] : patch.members)
+            {
+                const bool known = k == "isEnabled" || k == "fromDate" || k == "toDate" || k == "subject" ||
+                                   k == "textBody" || k == "htmlBody";
+                const bool typed = k == "isEnabled" ? x.k == jvalue::kind::boolean
+                                   : k == "fromDate" || k == "toDate"
+                                       ? x.k == jvalue::kind::null || (x.k == jvalue::kind::string && utc_ms(x.s) >= 0)
+                                       : x.k == jvalue::kind::null || x.k == jvalue::kind::string;
+                fine = fine && known && typed;
+            }
+            if (!fine)
+            {
+                not_updated += (not_updated.size() > 1 ? "," : "") + q(id) + ":" + set_error("invalidProperties");
+                continue;
+            }
+            for (const auto& [k, x] : patch.members)
+            {
+                if (jvalue* have = json::member(v, k))
+                    *have = x;
+                else
+                    v.members.emplace_back(k, x);
+            }
+            const std::string text = json::written(v);
+            if (m_store.set_meta(m_user, {}, std::string(vacation_entry), &text) != imap_store::meta_refusal::none)
+            {
+                not_updated += (not_updated.size() > 1 ? "," : "") + q(id) + ":" + set_error("tooLarge");
+                continue;
+            }
+            updated += (updated.size() > 1 ? "," : "") + q(id) + ":null";
+        }
+    if (const jvalue* d = json::member(args, "destroy"); d && d->k == jvalue::kind::array && !d->items.empty())
+        return done({{"error", set_error("invalidArguments", "a VacationResponse is not destroyed: turn it off")}});
+    const std::string* now = m_store.meta(m_user, {}, std::string(vacation_entry));
+    done({{"VacationResponse/set", "{\"accountId\":" + q(account_of(m_user)) + ",\"oldState\":" +
+                                       q("s" + std::to_string(kept ? kept->size() : 0)) + ",\"newState\":" +
+                                       q("s" + std::to_string(now ? now->size() : 0)) + ",\"updated\":" + updated +
+                                       "},\"notUpdated\":" + not_updated + "}}"}});
+}
+
+// ─── PushSubscription ───────────────────────────────────────────────────────
+
+namespace
+{
+
+// The user's subscriptions as kept, an empty array where there are none.
+jvalue subscriptions_of(imap_store& store, const std::string& user)
+{
+    jvalue v;
+    const std::string* kept = store.meta(user, {}, std::string(jmap_session::push_entry));
+    if (kept && json::json_reader(*kept).document(v))
+        if (const jvalue* subs = json::member(v, "subs"); subs && subs->k == jvalue::kind::array)
+            return *subs;
+    v = jvalue{};
+    v.k = jvalue::kind::array;
+    return v;
+}
+
+jvalue string_value(std::string s)
+{
+    jvalue v;
+    v.k = jvalue::kind::string;
+    v.s = std::move(s);
+    return v;
+}
+
+void put(jvalue& obj, const std::string& k, jvalue x)
+{
+    if (jvalue* have = json::member(obj, k))
+        *have = std::move(x);
+    else
+        obj.members.emplace_back(k, std::move(x));
+}
+
+}   // namespace
+
+void jmap_session::push_get(const jvalue& args, std::function<void(answer)> done)
+{
+    // Neither its URL, its keys nor its code are said back: they are the push service's and the client's alone.
+    const jvalue subs = subscriptions_of(m_store, m_user);
+    const jvalue* ids = json::member(args, "ids");
+    std::string list = "[", missing = "[";
+    std::set<std::string> found;
+    for (const auto& sub : subs.items)
+    {
+        const std::string id(json::string_of(sub, "id"));
+        if (ids && ids->k == jvalue::kind::array &&
+            std::none_of(ids->items.begin(), ids->items.end(), [&](const jvalue& x) { return x.s == id; }))
+            continue;
+        found.insert(id);
+        const jvalue* types = json::member(sub, "types");
+        list += (list.size() > 1 ? "," : "") + std::string("{\"id\":") + q(id) + ",\"deviceClientId\":" +
+                q(json::string_of(sub, "deviceClientId")) + ",\"expires\":" + q(json::string_of(sub, "expires")) +
+                ",\"types\":" + (types ? json::written(*types) : std::string("null")) + "}";
+    }
+    if (ids && ids->k == jvalue::kind::array)
+        for (const auto& x : ids->items)
+            if (!found.count(x.s))
+                missing += (missing.size() > 1 ? "," : "") + q(x.s);
+    done({{"PushSubscription/get", "{\"list\":" + list + "],\"notFound\":" + missing + "]}"}});
+}
+
+void jmap_session::push_set(const jvalue& args, const std::shared_ptr<call_state>& cs, std::function<void(answer)> done)
+{
+    jvalue subs = subscriptions_of(m_store, m_user);
+    std::string created = "{", not_created = "{", updated = "{", not_updated = "{", destroyed = "[", not_destroyed = "{";
+    const auto comma = [](std::string& s) {
+        if (s.size() > 1)
+            s += ",";
+    };
+    // A subscription lasts a week at most, and is renewed by setting its expires again (RFC 8620 7.2.2).
+    const int64_t now = wall::now_ms();
+    const auto capped = [now](const jvalue* asked) {
+        const int64_t want = asked && asked->k == jvalue::kind::string ? utc_ms(asked->s) : -1;
+        return utc(want > now && want < now + 7 * 86400000ll ? want : now + 7 * 86400000ll);
+    };
+    std::vector<std::tuple<std::string, std::string, std::string, std::string>> to_verify;
+    if (const jvalue* c = json::member(args, "create"); c && c->k == jvalue::kind::object)
+        for (const auto& [cid, obj] : c->members)
+        {
+            const std::string url(json::string_of(obj, "url"));
+            const std::string device(json::string_of(obj, "deviceClientId"));
+            std::string p256dh, auth;
+            bool keys_ok = true;
+            if (const jvalue* k = json::member(obj, "keys"); k && k->k == jvalue::kind::object)
+                keys_ok = socketley::base64url::decode(json::string_of(*k, "p256dh"), p256dh) && p256dh.size() == 65 &&
+                          p256dh[0] == '\x04' && socketley::base64url::decode(json::string_of(*k, "auth"), auth) &&
+                          auth.size() == 16;
+            // A push URL is the push service's, over HTTPS, without a fragment or white space.
+            const bool url_ok = url.starts_with("https://") && url.size() <= 2048 &&
+                                url.find_first_of(" \t\r\n#") == std::string::npos;
+            if (!url_ok || device.empty() || device.size() > 255 || !keys_ok || subs.items.size() >= 50)
+            {
+                comma(not_created);
+                not_created += q(cid) + ":" +
+                               set_error(subs.items.size() >= 50 ? "overQuota" : "invalidProperties",
+                                         !url_ok ? "url is an https:// URL" : !keys_ok ? "keys are a P-256 point and 16 bytes"
+                                                                                       : "deviceClientId is needed");
+                continue;
+            }
+            const std::string id = "P" + socketley::random_hex(8);
+            const std::string code = socketley::random_hex(16);
+            jvalue sub;
+            sub.k = jvalue::kind::object;
+            put(sub, "id", string_value(id));
+            put(sub, "deviceClientId", string_value(device));
+            put(sub, "url", string_value(url));
+            put(sub, "p256dh", string_value(socketley::base64url::encode(p256dh)));
+            put(sub, "auth", string_value(socketley::base64url::encode(auth)));
+            put(sub, "verificationCode", string_value(code));
+            put(sub, "verified", jvalue{});
+            const std::string expires = capped(json::member(obj, "expires"));
+            put(sub, "expires", string_value(expires));
+            if (const jvalue* t = json::member(obj, "types"); t && t->k == jvalue::kind::array)
+                put(sub, "types", *t);
+            subs.items.push_back(std::move(sub));
+            cs->created[cid] = id;
+            comma(created);
+            created += q(cid) + ":{\"id\":" + q(id) + ",\"keys\":null,\"expires\":" + q(expires) + "}";
+            to_verify.emplace_back(url, p256dh, auth,
+                                   "{\"@type\":\"PushVerification\",\"pushSubscriptionId\":" + q(id) +
+                                       ",\"verificationCode\":" + q(code) + "}");
+        }
+    const auto find = [&subs, &cs](std::string id) -> jvalue* {
+        if (!id.empty() && id.front() == '#')
+            id = cs->created.count(id.substr(1)) ? cs->created[id.substr(1)] : std::string();
+        for (auto& sub : subs.items)
+            if (json::string_of(sub, "id") == id)
+                return &sub;
+        return nullptr;
+    };
+    if (const jvalue* u = json::member(args, "update"); u && u->k == jvalue::kind::object)
+        for (const auto& [id, patch] : u->members)
+        {
+            jvalue* sub = find(id);
+            if (!sub)
+            {
+                comma(not_updated);
+                not_updated += q(id) + ":" + set_error("notFound");
+                continue;
+            }
+            bool fine = true;
+            std::string answer_expires;
+            for (const auto& [k, v] : patch.members)
+            {
+                if (k == "verificationCode" && v.k == jvalue::kind::string)
+                {
+                    // The code the push service carried to the client, which proves the client reads that URL.
+                    if (!socketley::crypto::secure_equal(v.s, json::string_of(*sub, "verificationCode")))
+                        fine = false;
+                    else
+                    {
+                        jvalue yes;
+                        yes.k = jvalue::kind::boolean;
+                        yes.b = true;
+                        put(*sub, "verified", yes);
+                    }
+                }
+                else if (k == "expires")
+                {
+                    answer_expires = capped(&v);
+                    put(*sub, "expires", string_value(answer_expires));
+                }
+                else if (k == "types" && (v.k == jvalue::kind::array || v.k == jvalue::kind::null))
+                    put(*sub, "types", v);
+                else
+                    fine = false;
+            }
+            comma(fine ? updated : not_updated);
+            if (fine)
+                updated += q(id) + ":" + (answer_expires.empty() ? std::string("null") : "{\"expires\":" + q(answer_expires) + "}");
+            else
+                not_updated += q(id) + ":" + set_error("invalidProperties", "the verificationCode is not the one pushed");
+        }
+    for (const auto& id : strings_of(json::member(args, "destroy")))
+    {
+        jvalue* sub = find(id);
+        if (!sub)
+        {
+            comma(not_destroyed);
+            not_destroyed += q(id) + ":" + set_error("notFound");
+            continue;
+        }
+        const std::string real(json::string_of(*sub, "id"));
+        std::erase_if(subs.items, [&](const jvalue& x) { return json::string_of(x, "id") == real; });
+        comma(destroyed);
+        destroyed += q(id);
+    }
+    // Kept with the states as they are now, from which the pushes begin, whenever the first look at them comes.
+    jvalue entry;
+    entry.k = jvalue::kind::object;
+    put(entry, "state", string_value(email_state(m_store, m_user) + " " + mailbox_state(m_store, m_user)));
+    put(entry, "subs", subs);
+    const std::string text = json::written(entry);
+    if (subs.items.empty())
+        m_store.set_meta(m_user, {}, std::string(push_entry), nullptr);
+    else if (m_store.set_meta(m_user, {}, std::string(push_entry), &text) != imap_store::meta_refusal::none)
+        return done({{"error", set_error("serverFail", "the subscriptions could not be kept")}});
+    m_store.note_push_user(m_user, !subs.items.empty());
+    for (auto& [url, p256dh, auth, body] : to_verify)
+        m_hooks.push(url, p256dh, auth, std::move(body));
+    done({{"PushSubscription/set", "{\"created\":" + created + "},\"updated\":" + updated + "},\"destroyed\":" +
+                                       destroyed + "],\"notCreated\":" + not_created + "},\"notUpdated\":" +
+                                       not_updated + "},\"notDestroyed\":" + not_destroyed + "}}"}});
 }
 
 // ─── EmailSubmission ────────────────────────────────────────────────────────

@@ -2401,6 +2401,7 @@ void mail_run::tick()
     if (now >= m_next_files_ms)
     {
         m_next_files_ms = now + 1000;
+        push_tick();
         // An address with no connection, no lockout and no failure or message lately is forgotten.
         std::erase_if(m_clients, [now](const auto& kv) {
             const client& cl = kv.second;
@@ -2864,6 +2865,8 @@ std::string mail_run::stats() const
     put(out, "mail_spam_junked", m_spam_junked);
     put(out, "mail_greylisted", m_greylisted);
     put(out, "mail_reports_sent", m_reports_sent);
+    put(out, "mail_jmap_pushes", m_pushes_sent);
+    put(out, "mail_jmap_push_failures", m_pushes_failed);
     put(out, "auth_ok", m_auth_ok);
     put(out, "auth_failed", m_auth_failed);
     put(out, "auth_locked_out", m_auth_locked);

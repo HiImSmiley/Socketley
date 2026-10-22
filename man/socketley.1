@@ -13010,7 +13010,10 @@ has
 A user whose mailboxes pass
 .B \-\-quota\-warn
 percent of their quota (90 unless it says) is mailed a warning once, and again
-only after they fell below it. IMAP also offers MULTIAPPEND, which puts every
+only after they fell below it. All of a runtime's mailboxes together, every
+domain's, are bounded by the quota of their bucket (PutBucketQuota on the
+storage runtime): a delivery past it waits, 452 4.2.2, until room is made, and a
+bound for each domain is a mail runtime for each, on a bucket of its own. IMAP also offers MULTIAPPEND, which puts every
 message it is given in or none, UTF8=ACCEPT, under which folder names come and
 go as UTF\-8 and a message may be a literal8, CREATE\-SPECIAL\-USE, which takes
 a special use only of the folder whose name has it, BINARY, which gives a part
@@ -13045,7 +13048,14 @@ which a move keeps, each Email its own Thread, a keyword an IMAP flag, so a
 client of either sees what the other did at once. A state is a digest of the
 index, the same on every shard, and a */changes since another answers
 cannotCalculateChanges, after which a client reads again. An upload is kept a
-day; an EmailSubmission sends as the user's own address only.
+day; an EmailSubmission sends as the user's own address only. Email/parse reads
+a blob, an upload or an attached message, as an Email. VacationResponse, kept
+in the user's METADATA, answers what their mailbox takes, once a week a
+sender, never a list, a bounce, spam or what answers itself (RFC 3834), whether
+or not a Sieve script runs. A PushSubscription (at most 50 a user, a week each
+until renewed) is verified by the code pushed to its URL, then sent a
+StateChange whenever the types it asked for change, over HTTPS to a public
+address, encrypted where it gave keys (RFC 8291).
 .PP
 .B From the other runtimes.
 .B socketley send
@@ -17826,6 +17836,21 @@ Inherited by worker processes, which have no command line of their own.
 .B SOCKETLEY_MAIL_DEAD_DOMAIN_MS
 A test aid: the milliseconds a mail runtime holds a domain it found not to exist,
 or to take no mail, before it looks it up again, ten minutes when unset.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MAIL_PUSH_CONNECT
+A test aid: the
+.IR host : port
+every JMAP push is posted to, the name in its URL still the one its
+certificate is checked for, so a test can receive the pushes of a URL it does
+not own; the URL's own host when unset.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_MAIL_PUSH_CA
+A test aid: a file of CA certificates a JMAP push URL's certificate is checked
+against; the system's when unset.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

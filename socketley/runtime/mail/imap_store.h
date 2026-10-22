@@ -135,6 +135,11 @@ public:
     std::map<std::string, std::string> acl(const std::string& owner, const std::string& folder);
     // The folders others gave `who`, or anyone, a right on, as owner and folder, from the runtime's list of shares.
     std::vector<std::pair<std::string, std::string>> shared_with(const std::string& who);
+    // A runtime-wide file beside the users' indexes, which no user's name can be (".shares", ".push-users").
+    std::string list_path(std::string_view name) const;
+    // The users with a JMAP PushSubscription, whose states the runtime watches to push their changes.
+    void note_push_user(const std::string& user, bool on);
+    std::vector<std::string> push_users();
     static bool meta_name_ok(std::string_view entry);
     void remove(const std::string& user, const std::string& folder, std::function<void(bool)> done);
     void rename(const std::string& user, const std::string& from, const std::string& to, std::function<void(bool)> done);
@@ -233,11 +238,13 @@ private:
         size_t meta_count{0};
     };
     user_state& user(const std::string& name);
-    std::string shares_path() const;
     // Uploads older than a day taken away, a page of them each hour.
     void sweep_uploads(std::string after = {});
     int64_t m_uploads_swept_ms{0};
     void note_share(const std::string& owner, const std::string& folder, const std::string& who, bool on);
+    // A runtime-wide list of keys, each on or off by its last line, folded past a mebibyte.
+    void note_line(const std::string& path, const std::string& key, bool on);
+    std::vector<std::string> live_lines(const std::string& path);
     // The snapshot and the whole journal read, everything known before forgotten.
     void reload(user_state& u);
     // The journal's lines from `text`, applied; `fresh` says a message they add is \Recent.

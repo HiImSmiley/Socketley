@@ -49,6 +49,9 @@ public:
         // What was put into a folder, for imapsieve.
         virtual void acted(const std::string& /*user*/, const std::string& /*folder*/, std::string /*cause*/,
                            std::vector<uint32_t> /*uids*/) {}
+        // A push to a PushSubscription's URL, encrypted for its keys where they are given (RFC 8620 7.2).
+        virtual void push(const std::string& /*url*/, const std::string& /*p256dh*/, const std::string& /*auth*/,
+                          std::string /*body*/) {}
     };
 
     jmap_session(const jmap_config& cfg, hooks& h, imap_store& store);
@@ -69,6 +72,12 @@ public:
     static std::string account_of(const std::string& user);
     // The state of a user's Emails and of their Mailboxes as the index has them now.
     static std::string email_state(imap_store& store, const std::string& user);
+    // Where a user's VacationResponse is kept: a server entry of their METADATA, as JSON.
+    static constexpr std::string_view vacation_entry = "/private/vendor/socketley/vacation";
+    // And their PushSubscriptions, {"state": the states when they last changed, "subs": [...]}, at most 50.
+    static constexpr std::string_view push_entry = "/private/vendor/socketley/push";
+    // And what they set of their one Identity: its name, replyTo, bcc and signatures.
+    static constexpr std::string_view identity_entry = "/private/vendor/socketley/identity";
     static std::string mailbox_state(imap_store& store, const std::string& user);
 
     struct request
@@ -127,6 +136,12 @@ private:
     void email_query(const json::jvalue& args, std::function<void(answer)> done);
     void email_set(const json::jvalue& args, const std::shared_ptr<call_state>& cs, std::function<void(answer)> done);
     void email_import(const json::jvalue& args, const std::shared_ptr<call_state>& cs, std::function<void(answer)> done);
+    void email_parse(const json::jvalue& args, std::function<void(answer)> done);
+    void vacation_get(const json::jvalue& args, std::function<void(answer)> done);
+    void vacation_set(const json::jvalue& args, std::function<void(answer)> done);
+    void push_get(const json::jvalue& args, std::function<void(answer)> done);
+    void identity_set(const json::jvalue& args, std::function<void(answer)> done);
+    void push_set(const json::jvalue& args, const std::shared_ptr<call_state>& cs, std::function<void(answer)> done);
     void thread_get(const json::jvalue& args, std::function<void(answer)> done);
     void identity_get(const json::jvalue& args, std::function<void(answer)> done);
     void submission_set(const json::jvalue& args, const std::shared_ptr<call_state>& cs,

@@ -132,6 +132,9 @@ public:
     // FLAG, and what it decided done to them.
     void imap_sieve(const std::string& user, const std::string& folder, std::string cause, std::vector<uint32_t> uids,
                     std::string changed);
+    // A JMAP push posted from the pool (mail_push.cpp), and the users with subscriptions looked at for changes.
+    void push_send(const std::string& url, const std::string& p256dh, const std::string& auth, std::string body);
+    void push_tick();
 
 private:
     enum class port_kind : uint8_t { smtp, submission, submissions, imap, imaps, sieve, pop3, pop3s, lmtp, sts, jmap };
@@ -234,6 +237,10 @@ private:
             run->imap_sieve(user, folder, std::move(cause), std::move(uids), {});
         }
         void bearer(std::string token, std::function<void(account, std::string)> done) override;
+        void push(const std::string& url, const std::string& p256dh, const std::string& auth, std::string body) override
+        {
+            run->push_send(url, p256dh, auth, std::move(body));
+        }
         std::string address_of(const std::string& user) override;
         void submit(const std::string& user, const std::string& from, std::vector<std::string> rcpts, std::string message,
                     std::function<void(bool, std::string)> done) override;
@@ -375,6 +382,10 @@ private:
     uint64_t m_next_cookie{1};
     void imap_sieve_apply(const std::string& user, const std::shared_ptr<imap_folder>& f, uint32_t uid,
                           std::string_view bytes, const sieve::outcome& out, const std::string& own);
+    std::vector<std::string> m_push_users;
+    std::unordered_map<std::string, std::string> m_push_seen;
+    int64_t m_push_list_mtime{-1};
+    uint64_t m_pushes_sent{0}, m_pushes_failed{0};
     std::shared_ptr<bool> m_alive;
 
     uint64_t m_received{0};

@@ -192,17 +192,16 @@ std::map<std::string, std::string> imap_store::acl(const std::string& owner, con
     return it == folders.end() ? std::map<std::string, std::string>{} : it->second->acl;
 }
 
-std::string imap_store::shares_path() const
+std::string imap_store::list_path(std::string_view name) const
 {
     return (socketley_paths::resolve().state_dir / "mail" / (std::string(m_run.owner().get_name()) + ".imap") /
-            ".shares")
+            std::string(name))
         .string();
 }
 
-void imap_store::note_share(const std::string& owner, const std::string& folder, const std::string& who, bool on)
+void imap_store::note_line(const std::string& path, const std::string& key, bool on)
 {
-    // A line a share, appended under a lock of its own; a share is checked against the owner's ACL whenever it is used.
-    const std::string path = shares_path();
+    // A line a key and whether it is on, appended under a lock of its own.
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
     const int lock = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
@@ -212,11 +211,11 @@ void imap_store::note_share(const std::string& owner, const std::string& folder,
             ::close(lock);
         return;
     }
-    const std::string line = owner + "\t" + folder + "\t" + who + "\t" + (on ? "+" : "-") + "\n";
+    const std::string line = key + "\t" + (on ? "+" : "-") + "\n";
     struct stat st{};
     if (::stat(path.c_str(), &st) == 0 && st.st_size > (1 << 20))
     {
-        // Past a mebibyte the list is written again with the shares that are on, this one with them.
+        // Past a mebibyte the list is written again with the keys that are on, this one among them.
         std::string text;
         socketley::read_file(path, text, {.missing_ok = true}, nullptr);
         text += line;
@@ -246,39 +245,62 @@ void imap_store::note_share(const std::string& owner, const std::string& folder,
     if (fd >= 0)
     {
         if (!socketley::write_all(fd, line.data(), line.size()))
-            LOG_WARN(("mail: the IMAP shares list " + path + " could not be written").c_str());
+            LOG_WARN(("mail: the list " + path + " could not be written").c_str());
         ::close(fd);
     }
     ::close(lock);
 }
 
-std::vector<std::pair<std::string, std::string>> imap_store::shared_with(const std::string& who)
+std::vector<std::string> imap_store::live_lines(const std::string& path)
 {
     std::string text;
-    socketley::read_file(shares_path(), text, {.missing_ok = true}, nullptr);
-    std::set<std::pair<std::string, std::string>> on;
+    socketley::read_file(path, text, {.missing_ok = true}, nullptr);
+    std::map<std::string, bool> on;
     for (std::string_view rest = text; !rest.empty();)
     {
         const std::string_view line = socketley::take_item(rest, '\n');
-        const size_t a = line.find('\t'), b = a == std::string_view::npos ? a : line.find('\t', a + 1),
-                     c = b == std::string_view::npos ? b : line.find('\t', b + 1);
-        if (c == std::string_view::npos)
-            continue;
-        const std::string_view grantee = line.substr(b + 1, c - b - 1);
-        if (grantee != who && grantee != "anyone")
-            continue;
-        std::pair<std::string, std::string> key{std::string(line.substr(0, a)), std::string(line.substr(a + 1, b - a - 1))};
-        if (key.first == who)
-            continue;
-        if (line.substr(c + 1) == "+")
-            on.insert(std::move(key));
-        else
-            on.erase(key);
+        const size_t last = line.rfind('\t');
+        if (last != std::string_view::npos)
+            on[std::string(line.substr(0, last))] = line.substr(last + 1) == "+";
     }
+    std::vector<std::string> out;
+    for (const auto& [k, is_on] : on)
+        if (is_on)
+            out.push_back(k);
+    return out;
+}
+
+void imap_store::note_share(const std::string& owner, const std::string& folder, const std::string& who, bool on)
+{
+    // A share is checked against the owner's ACL whenever it is used, so a stale line gives nothing.
+    note_line(list_path(".shares"), owner + "\t" + folder + "\t" + who, on);
+}
+
+void imap_store::note_push_user(const std::string& user, bool on)
+{
+    note_line(list_path(".push-users"), user, on);
+}
+
+std::vector<std::string> imap_store::push_users()
+{
+    return live_lines(list_path(".push-users"));
+}
+
+std::vector<std::pair<std::string, std::string>> imap_store::shared_with(const std::string& who)
+{
     std::vector<std::pair<std::string, std::string>> out;
-    for (const auto& [owner, folder] : on)
-        if (rights(owner, folder, who).find('l') != std::string::npos)
+    for (const auto& key : live_lines(list_path(".shares")))
+    {
+        // owner \t folder \t grantee.
+        const size_t a = key.find('\t'), b = a == std::string::npos ? a : key.find('\t', a + 1);
+        if (b == std::string::npos)
+            continue;
+        const std::string owner = key.substr(0, a), folder = key.substr(a + 1, b - a - 1), grantee = key.substr(b + 1);
+        if ((grantee == who || grantee == "anyone") && owner != who &&
+            rights(owner, folder, who).find('l') != std::string::npos &&
+            std::find(out.begin(), out.end(), std::make_pair(owner, folder)) == out.end())
             out.emplace_back(owner, folder);
+    }
     return out;
 }
 

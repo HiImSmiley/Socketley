@@ -15,6 +15,10 @@
 #   * */changes on the current state not empty, on an old one not cannotCalculateChanges
 #   * an EventSource not told of new mail
 #   * a password taken in the clear from another machine
+#   * Email/parse not reading an upload as an Email
+#   * a VacationResponse not answering, answering a sender twice, or answering a list
+#   * a PushSubscription pushed before it is verified, its verification not readable by the keys it gave, a
+#     StateChange not sent when mail comes, or its URL and keys told back
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -40,6 +44,7 @@ PI=$((SL_PORT_BASE+1923))
 PS=$((SL_PORT_BASE+1924))
 NS=$((SL_PORT_BASE+1925))
 SINK=$((SL_PORT_BASE+1926))
+PUSH=$((SL_PORT_BASE+1927))
 PIDS=()
 cleanup() {
     for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
@@ -52,6 +57,32 @@ echo "=== Integration: JMAP on a mail runtime's mailboxes ==="
 python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
+# A push service of the test's: HTTPS for push.test under a CA of its own, each POST written down as it came.
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=test CA" -keyout "$T/ca.key" -out "$T/ca.pem" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -subj "/CN=push.test" -keyout "$T/push.key" -out "$T/push.csr" >/dev/null 2>&1
+printf 'subjectAltName=DNS:push.test\n' > "$T/push.ext"
+openssl x509 -req -in "$T/push.csr" -CA "$T/ca.pem" -CAkey "$T/ca.key" -CAcreateserial -days 2 -extfile "$T/push.ext" \
+    -out "$T/push.pem" >/dev/null 2>&1
+mkdir -p "$T/pushes"
+python3 - "$PUSH" "$T/push.pem" "$T/push.key" "$T/pushes" >/dev/null 2>&1 <<'PY' &
+import http.server, os, ssl, sys, time
+port, cert, key, out = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        name = os.path.join(out, "%f-%s" % (time.time(), self.path.strip("/").replace("/", "_")))
+        with open(name + ".tmp", "wb") as f:
+            f.write(("encoding %s\n" % self.headers.get("Content-Encoding", "")).encode() + body)
+        os.rename(name + ".tmp", name)
+        self.send_response(201); self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a): pass
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()
+PY
+PIDS+=($!)
+export SOCKETLEY_MAIL_PUSH_CONNECT="127.0.0.1:$PUSH" SOCKETLEY_MAIL_PUSH_CA="$T/ca.pem"
 export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK"
 mkdir -p "$T/sink"
 python3 "$HERE/lib_smtp_sink.py" "$SINK" "$T/sink" >/dev/null 2>&1 &
@@ -204,6 +235,11 @@ say("SearchSnippet/get answers for each Email it knows", [x["emailId"] for x in 
     r["sn"][0][1]["notFound"] == ["Mnone"], r)
 r = api(["Identity/get", {"accountId": acct}, "i"])
 say("Identity/get gives the user's address", r["i"][0][1]["list"][0]["email"] == "alice@example.test", r)
+r = api(["Identity/set", {"accountId": acct, "update": {"i0": {"name": "Alice A.", "textSignature": "-- \nAlice"}},
+         "create": {"n": {"email": "someone@else.test"}}}, "is"], ["Identity/get", {"accountId": acct}, "ig"])
+ident = r["ig"][0][1]["list"][0]
+say("Identity/set keeps a name and a signature, and makes no other address", r["is"][0][1]["updated"] == {"i0": None} and
+    "n" in r["is"][0][1]["notCreated"] and ident["name"] == "Alice A." and ident["textSignature"] == "-- \nAlice", r)
 # EventSource
 es = socket.create_connection(("127.0.0.1", jm), timeout=10)
 es.sendall(("GET /jmap/eventsource?types=*&closeafter=state&ping=0 HTTP/1.1\r\nHost: x\r\nAuthorization: %s\r\n\r\n" % AUTH).encode())
@@ -220,11 +256,99 @@ while time.time() < end and b"event: state" not in got:
     except socket.timeout:
         break
 say("an EventSource is told of new mail", b"text/event-stream" in got and b"event: state" in got and b"StateChange" in got, got[:300])
+# Email/parse
+st, _, data = call("POST", "/jmap/upload/%s/" % acct, b"From: zoe@else.test\r\nSubject: only parsed\r\n\r\nnot kept\r\n",
+                   {"Content-Type": "message/rfc822"})
+pb = json.loads(data).get("blobId") if st == 201 else None
+r = api(["Email/parse", {"accountId": acct, "blobIds": [pb, "Unone"], "properties": ["subject", "from", "id"]}, "p"])
+pr = r["p"][0][1]
+say("Email/parse reads an upload as an Email that is not the account's", pr["parsed"].get(pb, {}).get("subject") == "only parsed"
+    and pr["parsed"][pb].get("id") is None and pr["notFound"] == ["Unone"], pr)
+# VacationResponse
+r = api(["VacationResponse/set", {"accountId": acct, "update": {"singleton": {"isEnabled": True, "subject": "Away now",
+         "textBody": "Back on Monday."}}}, "v"], ["VacationResponse/get", {"accountId": acct}, "g"])
+vr = r["g"][0][1]["list"][0]
+say("VacationResponse/set turns it on, and get says so", r["v"][0][1].get("updated") == {"singleton": None} and
+    vr["isEnabled"] is True and vr["textBody"] == "Back on Monday.", r)
+sm = smtplib.SMTP("127.0.0.1", int(sys.argv[4])); sm.ehlo("x")
+for subject in ("first while away", "second while away"):
+    sm.sendmail("vera@remote.test", ["alice@example.test"], "From: vera@remote.test\r\nSubject: %s\r\n\r\nhi\r\n" % subject)
+sm.sendmail("list@remote.test", ["alice@example.test"], "From: list@remote.test\r\nList-Id: <l.remote.test>\r\nSubject: digest\r\n\r\nhi\r\n")
+sm.quit()
+def sink_with(text, n=1, secs=8):
+    end = time.time() + secs
+    while time.time() < end:
+        hits = [x for x in os.listdir(sink) if not x.startswith(".") and text in open(os.path.join(sink, x), "rb").read()]
+        if len(hits) >= n: return hits
+        time.sleep(0.1)
+    return [x for x in os.listdir(sink) if not x.startswith(".") and text in open(os.path.join(sink, x), "rb").read()]
+away = sink_with(b"Subject: Away now")
+time.sleep(1.5)
+away = sink_with(b"Subject: Away now", 2, 0)
+body = open(os.path.join(sink, away[0]), "rb").read() if away else b""
+say("a VacationResponse answers a sender once, from the user, auto-replied", len(away) == 1 and b"rcpt vera@remote.test" in body
+    and b"Auto-Submitted: auto-replied" in body and b"Back on Monday." in body, (away, body[:300]))
+say("and answers no list", not sink_with(b"rcpt list@remote.test", 1, 0), "a list was answered")
+api(["VacationResponse/set", {"accountId": acct, "update": {"singleton": {"isEnabled": False}}}, "off"])
+# PushSubscription, its pushes read with the keys it gave
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes, hmac, serialization
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+ua = ec.generate_private_key(ec.SECP256R1())
+ua_pub = ua.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+secret = os.urandom(16)
+b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+def mac(k, m):
+    h = hmac.HMAC(k, hashes.SHA256()); h.update(m); return h.finalize()
+def opened(raw):
+    salt, keyid = raw[:16], raw[21:86]
+    shared = ua.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), keyid))
+    ikm = mac(mac(secret, shared), b"WebPush: info\0" + ua_pub + keyid + b"\x01")
+    prk = mac(salt, ikm)
+    cek, nonce = mac(prk, b"Content-Encoding: aes128gcm\0\x01")[:16], mac(prk, b"Content-Encoding: nonce\0\x01")[:12]
+    return json.loads(AESGCM(cek).decrypt(nonce, raw[86:], None).rstrip(b"\0")[:-1])
+def pushes(path, n, secs=8):
+    end = time.time() + secs
+    while True:
+        got = sorted(x for x in os.listdir(pushdir) if x.endswith(path) and not x.endswith(".tmp"))
+        if len(got) >= n or time.time() > end:
+            out = []
+            for x in got:
+                raw = open(os.path.join(pushdir, x), "rb").read()
+                head, _, rest = raw.partition(b"\n")
+                out.append(opened(rest) if head.endswith(b"aes128gcm") else json.loads(rest))
+            return out
+        time.sleep(0.1)
+pushdir = sys.argv[5]
+r = api(["PushSubscription/set", {"create": {"a": {"deviceClientId": "dev1", "url": "https://push.test/one",
+         "keys": {"p256dh": b64(ua_pub), "auth": b64(secret)}},
+         "b": {"deviceClientId": "dev2", "url": "https://push.test/two"},
+         "c": {"deviceClientId": "dev3", "url": "http://push.test/three"}}}, "ps"])
+made = r["ps"][0][1]
+say("PushSubscription/set takes https URLs and refuses another", "a" in made["created"] and "b" in made["created"] and
+    "c" in made["notCreated"], made)
+v1 = pushes("one", 1)
+say("its PushVerification is sent encrypted for the keys it gave", v1 and v1[0].get("@type") == "PushVerification" and
+    v1[0].get("pushSubscriptionId") == made["created"]["a"]["id"], v1)
+r = api(["PushSubscription/set", {"update": {made["created"]["a"]["id"]: {"verificationCode": "wrong"}}}, "w"])
+say("a wrong verificationCode is refused", made["created"]["a"]["id"] in r["w"][0][1]["notUpdated"], r)
+r = api(["PushSubscription/set", {"update": {made["created"]["a"]["id"]: {"verificationCode": v1[0]["verificationCode"]}}}, "u"],
+        ["PushSubscription/get", {"ids": None}, "g"])
+lst = r["g"][0][1]["list"]
+say("and the right one verifies it; get tells neither URL nor keys", r["u"][0][1].get("updated") == {made["created"]["a"]["id"]: None}
+    and len(lst) == 2 and not any("url" in x or "keys" in x or "verificationCode" in x for x in lst), r)
+sm = smtplib.SMTP("127.0.0.1", int(sys.argv[4])); sm.ehlo("x")
+sm.sendmail("x@else.test", ["alice@example.test"], "From: x@else.test\r\nSubject: pushed by state\r\n\r\nhi\r\n"); sm.quit()
+p1 = pushes("one", 2)
+say("new mail is pushed as a StateChange to the verified one", len(p1) >= 2 and p1[1].get("@type") == "StateChange" and
+    "Email" in p1[1].get("changed", {}).get(acct, {}), p1)
+p2 = pushes("two", 2, 2)
+say("and only its verification to the one not verified", len(p2) == 1 and p2[0].get("@type") == "PushVerification", p2)
 # The clear from elsewhere
 st, _, _ = call("GET", "/.well-known/jmap", source="127.0.0.2")
 say("a password in the clear from another machine is refused", st == 403, st)
 PY
-tally < <(timeout 120 python3 "$T/client.py" "$JM" "$IM" "$T/sink" "$P" 2>&1 | grep -E '^(ok|bad) ')
+tally < <(timeout 180 python3 "$T/client.py" "$JM" "$IM" "$T/sink" "$P" "$T/pushes" 2>&1 | grep -E '^(ok|bad) ')
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || { echo "  FAILED"; exit 1; }

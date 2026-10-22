@@ -50,7 +50,10 @@ std::string relaxed_header(std::string_view name, std::string_view value);
 // The DKIM-Signature header for `message`, its headers and body, ended by CRLF, to put ahead of it; `header` and
 // `first_tags` make ARC's ARC-Message-Signature of it instead ("i=1; ").
 std::string sign(std::string_view message, std::string_view domain, std::string_view selector, EVP_PKEY* key,
-                 int64_t now_s, std::string_view header = "DKIM-Signature", std::string_view first_tags = {});
+                 int64_t now_s, std::string_view header = "DKIM-Signature", std::string_view first_tags = {},
+                 std::string_view body_hash = {});
+// The bh= of `message`: its relaxed body's SHA-256, which two signatures of one message share.
+std::string body_hash(std::string_view message);
 
 struct signature
 {

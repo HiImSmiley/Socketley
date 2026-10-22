@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <charconv>
 #include <cstring>
+#include <ctime>
 #include <random>
 #include <set>
 
@@ -19,6 +20,8 @@
 #include "mail_compose.h"
 #include "mail_instance.h"
 #include "mail_mailbox.h"
+#include "mail_mime.h"
+#include "jmap_session.h"
 #include "mail_rspamd.h"
 #include "mail_srs.h"
 #include "mail_verify.h"
@@ -676,11 +679,18 @@ void delivery::deliver_local(const entry_ptr& e, const target& t)
         std::string head = "Return-Path: <" + e.from + ">\r\nDelivered-To: " + to + "\r\n";
         if (!e.auth.empty())
             head += "Authentication-Results: " + m_run.hostname() + "; " + e.auth + "\r\n";
-        const auto plain = [this, it, user, settle, alive](std::string head) {
+        // Taken, by a filter or as it is, the message is one a VacationResponse answers.
+        const std::string own = email.empty() ? to : email;
+        const auto taken = [this, it, user, own, settle](int code, const std::string& text) {
+            if (code / 100 == 2)
+                jmap_vacation(it->e, user, own);
+            settle(code, text);
+        };
+        const auto plain = [this, it, user, taken, alive](std::string head) {
             m_run.boxes()->deliver(it->e, user, it->e->folder.empty() ? "INBOX" : it->e->folder, std::move(head),
-                                   [settle, alive](int code, std::string text) {
+                                   [taken, alive](int code, std::string text) {
                                        if (*alive)
-                                           settle(code, text);
+                                           taken(code, text);
                                    });
         };
         // The user's Sieve script decides where it goes, where they have one active; it is looked for off the loop,
@@ -689,11 +699,11 @@ void delivery::deliver_local(const entry_ptr& e, const target& t)
         {
             auto script = std::make_shared<std::shared_ptr<const sieve::script>>();
             m_run.pool().submit(0, [f, user, script] { *script = f->active(user); },
-                                [this, it, user, email, head = std::move(head), script, settle, plain, alive] {
+                                [this, it, user, email, head = std::move(head), script, taken, plain, alive] {
                                     if (!*alive)
                                         return;
                                     if (*script)
-                                        filter(it, user, email, head, *script, settle);
+                                        filter(it, user, email, head, *script, taken);
                                     else
                                         plain(head);
                                 });
@@ -1004,6 +1014,82 @@ void delivery::redirect(const entry_ptr& e, const std::string& own, std::vector<
                            else
                                done(false);
                        });
+}
+
+void delivery::jmap_vacation(const entry_ptr& e, const std::string& user, const std::string& own)
+{
+    imap_store* store = m_run.imap();
+    sieve_store* memory = m_run.filters();
+    // Spam is answered by nobody, which would tell its sender the address is read.
+    if (!store || !memory || e->bounce || e->from.empty() || e->folder == "Junk" ||
+        e->auth.find("x-spam=yes") != std::string::npos)
+        return;
+    const std::string* kept = store->meta(user, {}, std::string(jmap_session::vacation_entry));
+    socketley::json::jvalue v;
+    if (!kept || !socketley::json::json_reader(*kept).document(v))
+        return;
+    const auto* on = socketley::json::member(v, "isEnabled");
+    if (!on || on->k != socketley::json::jvalue::kind::boolean || !on->b)
+        return;
+    // Between fromDate and toDate, where they are set (RFC 8621 8).
+    const int64_t now_ms = wall::now_ms();
+    const auto at = [](std::string_view t) -> int64_t {
+        std::tm tm{};
+        const std::string s(t);
+        return ::strptime(s.c_str(), "%Y-%m-%dT%H:%M:%S", &tm) ? static_cast<int64_t>(::timegm(&tm)) * 1000 : -1;
+    };
+    if (const std::string_view f = socketley::json::string_of(v, "fromDate"); !f.empty() && at(f) > now_ms)
+        return;
+    if (const std::string_view t = socketley::json::string_of(v, "toDate"); !t.empty() && at(t) >= 0 && at(t) <= now_ms)
+        return;
+    // Nothing that answers by itself, comes from a list or is a bounce is answered (RFC 3834 2).
+    const auto answer = [this, user, own, v, from = e->from, alive = m_alive](std::string_view whole) {
+        if (!*alive)
+            return;
+        const std::string_view head = header_block(whole);
+        const std::string auto_sub = header_value(head, "Auto-Submitted");
+        std::string precedence = header_value(head, "Precedence");
+        socketley::ascii::lower_in_place(precedence);
+        std::string local = from.substr(0, from.find('@'));
+        socketley::ascii::lower_in_place(local);
+        if ((!auto_sub.empty() && !socketley::ascii::iequals(auto_sub, "no")) || precedence == "bulk" ||
+            precedence == "list" || precedence == "junk" || !header_value(head, "List-Id").empty() ||
+            local == "mailer-daemon" || local.starts_with("owner-") || local.ends_with("-request") ||
+            socketley::ascii::iequals(from, own))
+            return;
+        sieve::vacation r;
+        r.handle = "jmap";
+        r.seconds = 7 * 86400;
+        r.to = from;
+        r.from = own;
+        const std::string_view subject = socketley::json::string_of(v, "subject");
+        r.subject = subject.empty() ? "Re: " + mime::decode_words(header_value(head, "Subject")) : std::string(subject);
+        r.reason = std::string(socketley::json::string_of(v, "textBody"));
+        if (r.reason.empty())
+            r.reason = std::string(socketley::json::string_of(v, "htmlBody"));
+        if (r.reason.empty())
+            return;
+        sieve_store* memory = m_run.filters();
+        auto fresh = std::make_shared<bool>(false);
+        m_run.pool().submit(0,
+                            [memory, user, r, fresh, now = wall::now_ms() / 1000] {
+                                *fresh = !memory->answered(user, r.handle, r.to, r.seconds, now);
+                            },
+                            [this, own, r, fresh, msgid = header_value(head, "Message-ID"), alive = m_alive] {
+                                if (*alive && *fresh)
+                                    vacation(own, r, msgid);
+                            });
+    };
+    if (e->body)
+    {
+        answer(*e->body);
+        return;
+    }
+    const uint32_t want = static_cast<uint32_t>(std::min<uint64_t>(e->body_len, 64u << 10));
+    m_run.queue().read(e, 0, want, [answer](bool ok, std::string_view b) {
+        if (ok)
+            answer(b);
+    });
 }
 
 void delivery::vacation(const std::string& own, const sieve::vacation& v, std::string_view msgid)
@@ -1470,6 +1556,16 @@ void delivery::sign_then(const entry_ptr& e, std::function<void(bool)> go)
         return;
     auto j = std::make_shared<sign_job>();
     j->e = e;
+    // A message held in memory is signed at once, as its bytes cost nothing more; only one read back waits its turn.
+    if (e->body)
+    {
+        ++m_signs_out;
+        ++m_signs_held;
+        j->kept = e->body;
+        j->in_memory = true;
+        sign_read(j);
+        return;
+    }
     m_signs_waiting.push_back(std::move(j));
     sign_next();
 }
@@ -1477,7 +1573,7 @@ void delivery::sign_then(const entry_ptr& e, std::function<void(bool)> go)
 void delivery::sign_next()
 {
     // A queue read back at a start is signed a few messages at a time, not every one read into memory at once.
-    while (m_signs_out < 8 && !m_signs_waiting.empty())
+    while (m_signs_out - m_signs_held < 8 && !m_signs_waiting.empty())
     {
         auto j = std::move(m_signs_waiting.front());
         m_signs_waiting.pop_front();
@@ -1516,8 +1612,10 @@ void delivery::sign_read(const std::shared_ptr<sign_job>& j)
     }
     j->looping = false;
     const std::string id = j->e->id;
-    const auto done = [this, id](bool ok) {
+    const auto done = [this, id, in_memory = j->in_memory](bool ok) {
         --m_signs_out;
+        if (in_memory)
+            --m_signs_held;
         auto gos = std::move(m_signing[id]);
         m_signing.erase(id);
         for (auto& g : gos)
@@ -1555,7 +1653,10 @@ void delivery::sign_read(const std::shared_ptr<sign_job>& j)
                                 *sig = arc::seal(w, authserv, auth, seal_domain, sel, key.get(), now, cv);
                                 return;
                             }
-                            *sig = dkim::sign(w, dom, sel, key.get(), now) + dkim::sign(w, dom, sel + "-ed", ed.get(), now);
+                            // The body is hashed once for both signatures.
+                            const std::string bh = dkim::body_hash(w);
+                            *sig = dkim::sign(w, dom, sel, key.get(), now, "DKIM-Signature", {}, bh) +
+                                   dkim::sign(w, dom, sel + "-ed", ed.get(), now, "DKIM-Signature", {}, bh);
                         },
                         [this, id, sig, done, alive = m_alive] {
                             if (!*alive)

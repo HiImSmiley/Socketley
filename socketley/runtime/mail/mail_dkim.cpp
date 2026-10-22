@@ -301,8 +301,13 @@ std::string sign_bytes(EVP_PKEY* key, std::string_view data)
     return sig.empty() ? std::string() : socketley::base64::encode(sig);
 }
 
+std::string body_hash(std::string_view message)
+{
+    return sha256_b64(relaxed_body(message.substr(header_block(message).size())));
+}
+
 std::string sign(std::string_view message, std::string_view domain, std::string_view selector, EVP_PKEY* key,
-                 int64_t now_s, std::string_view header, std::string_view first_tags)
+                 int64_t now_s, std::string_view header, std::string_view first_tags, std::string_view body_hash_given)
 {
     const std::string_view head = header_block(message);
     const std::string_view body = message.substr(head.size());
@@ -326,7 +331,7 @@ std::string sign(std::string_view message, std::string_view domain, std::string_
     }
     // From named once more than it is there, so a second From added on the way breaks the signature.
     h += ":from";
-    const std::string bh = sha256_b64(relaxed_body(body));
+    const std::string bh = body_hash_given.empty() ? sha256_b64(relaxed_body(body)) : std::string(body_hash_given);
     // A DKIM-Signature says its version first, whatever tags come with it; ARC's signature has none.
     std::string value = " " + std::string(header == "DKIM-Signature" ? "v=1; " : "") + std::string(first_tags) + "a=" +
                         algorithm_of(key) + "; c=relaxed/relaxed; d=" + std::string(domain) + "; s=" +

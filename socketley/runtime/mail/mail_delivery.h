@@ -150,9 +150,13 @@ private:
         bool failed{false};
         bool waiting{false};
         bool looping{false};
+        // Its bytes were in memory already, so it is not one of the eight read back at a time.
+        bool in_memory{false};
     };
     void sign_read(const std::shared_ptr<sign_job>& j);
     void deliver_local(const entry_ptr& e, const target& t);
+    // The VacationResponse a user set over JMAP answered, once a week to a sender, for a message their mailbox took.
+    void jmap_vacation(const entry_ptr& e, const std::string& user, const std::string& own);
     // A mailbox delivery the user's Sieve script decides: run on the pool, and its actions taken on the loop.
     void filter(const std::shared_ptr<item>& it, const std::string& user, const std::string& email, std::string head,
                 std::shared_ptr<const sieve::script> script, std::function<void(int, const std::string&)> settle);
@@ -205,6 +209,7 @@ private:
     std::set<std::string> m_held;
     // Messages read whole to be signed, at most a few at once, and those that wait for a turn.
     uint32_t m_signs_out{0};
+    uint32_t m_signs_held{0};
     std::deque<std::shared_ptr<sign_job>> m_signs_waiting;
     // How many of a message's items this try still has out, and how many targets each recipient still waits on.
     std::unordered_map<std::string, uint32_t> m_out;
