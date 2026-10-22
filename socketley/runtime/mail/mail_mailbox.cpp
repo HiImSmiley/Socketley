@@ -252,12 +252,30 @@ void mailboxes::deliver(const entry_ptr& e, const std::string& user, const std::
             {
                 for (const auto& [name, value] : split_headers(block))
                 {
+                    // The authserv-id comes after any comments and folding, and may be quoted (RFC 8601 2.2).
                     std::string_view v = value;
-                    while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
+                    for (int depth = 0; !v.empty();)
+                    {
+                        const char ch = v.front();
+                        if (ch == '(')
+                            ++depth;
+                        else if (ch == ')' && depth > 0)
+                            --depth;
+                        else if (depth == 0 && ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n')
+                            break;
                         v.remove_prefix(1);
-                    const std::string_view id = v.substr(0, v.find_first_of("; \t\r"));
-                    if (socketley::ascii::iequals(name, "Authentication-Results") &&
+                    }
+                    std::string_view id = v.substr(0, v.find_first_of("; \t\r\n("));
+                    if (id.size() >= 2 && id.front() == '"')
+                        id = v.substr(1, v.find('"', 1) == std::string_view::npos ? 0 : v.find('"', 1) - 1);
+                    std::string_view n = name;
+                    while (!n.empty() && (n.back() == ' ' || n.back() == '\t'))
+                        n.remove_suffix(1);
+                    if (socketley::ascii::iequals(n, "Authentication-Results") &&
                         socketley::ascii::iequals(id, m_run.hostname()))
+                        continue;
+                    // The Return-Path is the one this delivery writes (RFC 5321 4.4); a sender's is not kept beside it.
+                    if (socketley::ascii::iequals(n, "Return-Path"))
                         continue;
                     kept.append(name.data(), name.size()).append(":").append(value.data(), value.size()).append("\r\n");
                     if (socketley::ascii::iequals(name, "From"))

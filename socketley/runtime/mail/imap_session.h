@@ -67,6 +67,8 @@ public:
     // The selected folder looked at again, for IDLE, once a second.
     void poll();
     bool idling() const { return m_idle; }
+    // What came and is not taken yet, the command being gathered included.
+    size_t buffered() const { return m_in.size() + m_cmd.size(); }
     const std::string& user() const { return m_user; }
 
     static constexpr size_t max_line = 65536;

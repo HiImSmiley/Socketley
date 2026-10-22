@@ -172,6 +172,16 @@ for k in mail_stored mail_checked mail_dmarc_rejected mail_quarantined; do
     [ "${v:-0}" -ge 1 ] && ok "stats count $k" || bad "stats count $k" "${v:-absent}"
 done
 
+# ─── what a sender may not say for this host ────────────────────────────────
+n0=$(keys alice/INBOX | wc -l)
+printf 'Return-Path: <forged@evil.test>\r\nAuthentication-Results: (a comment) mail.example.test; dkim=pass header.d=forged.test\r\nAuthentication-Results: "mail.example.test"; spf=pass smtp.mailfrom=forged.test\r\nFrom: carol@else.test\r\nSubject: forged results\r\n\r\nforged\r\n' > "$T/m7"
+check "a message with results forged under this host's name is taken" "$(smtp "$P" carol@else.test alice@example.test "$T/m7")" "sent"
+wait_keys alice/INBOX $((n0 + 1))
+k=$(for x in $(keys alice/INBOX); do obj "$x" | grep -q 'forged results' && echo "$x"; done | head -1)
+body=$(obj "$k" | tr -d '\r')
+check "and keeps none of them, behind a comment or in quotes" "$(printf '%s\n' "$body" | grep -c 'forged.test')" "0"
+check "nor the sender's Return-Path beside its own" "$(printf '%s\n' "$body" | grep -c '^Return-Path:')" "1"
+
 # ─── an alias of a user here ────────────────────────────────────────────────
 n0=$(keys alice/INBOX | wc -l)
 printf 'From: carol@else.test\r\nTo: team@example.test\r\nSubject: to the team\r\n\r\nfor the team\r\n' > "$T/m6"

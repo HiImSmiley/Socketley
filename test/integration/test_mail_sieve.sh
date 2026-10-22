@@ -264,6 +264,17 @@ print(grown < 8192, r1[:2].decode(), f.readline()[:2].decode())
 PY
 )
 check "a command of three hundred literals before sign-in is held small, refused, and the next one answered" "$r" "True NO OK"
+r=$(python3 - "$SV" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5); f = s.makefile("rb")
+while not f.readline().startswith(b"OK"): pass
+s.sendall(b'NOOP "' + b"a" * 9000 + b'"\r\nNOOP "next"\r\n')
+r1 = f.readline()
+while r1[:2] not in (b"OK", b"NO", b"BY"): r1 = f.readline()
+print(r1[:2].decode(), f.readline()[:2].decode())
+PY
+)
+check "a line past the limit that comes whole is refused, the next one answered" "$r" "NO OK"
 
 # INBOX is one name whatever its case, so fileinto "inbox" files where IMAP lists it.
 n0=$(keys INBOX | wc -l)

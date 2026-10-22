@@ -107,17 +107,29 @@ void managesieve_session::run()
         const void* nl = std::memchr(start, '\n', m_in.size() - m_at);
         if (!nl)
         {
+            // Past a line's limit what came is dropped, and so is the rest of that line when it comes, said once.
             if (m_in.size() - m_at > max_line)
             {
                 m_in.clear();
                 m_at = 0;
                 m_args.clear();
-                no({}, "Line too long");
+                if (!m_discarding)
+                    no({}, "Line too long");
+                m_discarding = true;
             }
             break;
         }
         std::string_view line(start, static_cast<size_t>(static_cast<const char*>(nl) - start));
         m_at += line.size() + 1;
+        if (m_discarding || line.size() > max_line + 1)
+        {
+            if (!m_discarding)
+                no({}, "Line too long");
+            m_discarding = false;
+            m_args.clear();
+            m_dropping = false;
+            continue;
+        }
         if (!line.empty() && line.back() == '\r')
             line.remove_suffix(1);
         // The arguments of the line, a literal at its end continued by the bytes that follow it.

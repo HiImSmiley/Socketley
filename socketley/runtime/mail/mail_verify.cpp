@@ -5,6 +5,8 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
+#include <vector>
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -17,6 +19,7 @@
 #include "../../shared/net/public_suffix.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/settings.h"
+#include "../../shared/util/wall_clock.h"
 
 namespace socketley::mail
 {
@@ -383,72 +386,45 @@ bool parse(const uint8_t* msg, int len, uint16_t type, std::vector<std::string>&
     return true;
 }
 
+// A helper thread's resolver state, made once and kept, with the answers it had in the last minute.
+struct thread_resolver
+{
+    struct __res_state st;
+    bool ok{false};
+    struct cached
+    {
+        bool ok{false};
+        bool nx{false};
+        std::vector<std::string> out;
+        int64_t until_ms{0};
+    };
+    std::unordered_map<std::string, cached> answers;
+    thread_resolver();
+    ~thread_resolver()
+    {
+        if (ok)
+            res_nclose(&st);
+    }
+};
+
 class system_resolver : public check_resolver
 {
 public:
-    system_resolver()
-    {
-        std::memset(&m_st, 0, sizeof m_st);
-        m_ok = res_ninit(&m_st) == 0;
-        // A test's nameserver, on a port of its own, as the loop's resolver takes it.
-        const char* conf = settings::text("SOCKETLEY_RESOLV_CONF");
-        if (!m_ok || !conf)
-            return;
-        std::ifstream in(conf);
-        std::vector<in_addr> servers;
-        int port = 53;
-        for (std::string line; std::getline(in, line);)
-        {
-            std::istringstream ls(line);
-            std::string key;
-            ls >> key;
-            if (key == "nameserver")
-            {
-                std::string a;
-                ls >> a;
-                in_addr x{};
-                if (::inet_pton(AF_INET, a.c_str(), &x) == 1)
-                    servers.push_back(x);
-            }
-            else if (key == "options")
-                for (std::string o; ls >> o;)
-                {
-                    if (o.starts_with("port:"))
-                        port = std::atoi(o.c_str() + 5);
-                    else if (o.starts_with("timeout:"))
-                        m_st.retrans = std::atoi(o.c_str() + 8);
-                    else if (o.starts_with("attempts:"))
-                        m_st.retry = std::atoi(o.c_str() + 9);
-                }
-        }
-        m_st.nscount = 0;
-        for (const auto& x : servers)
-            if (m_st.nscount < MAXNS)
-            {
-                sockaddr_in& sa = m_st.nsaddr_list[m_st.nscount++];
-                sa = sockaddr_in{};
-                sa.sin_family = AF_INET;
-                sa.sin_port = htons(static_cast<uint16_t>(port));
-                sa.sin_addr = x;
-            }
-    }
-    ~system_resolver() override
-    {
-        if (m_ok)
-            res_nclose(&m_st);
-    }
+    explicit system_resolver(int64_t budget_ms) : m_deadline_ms(socketley::wall::now_ms() + budget_ms) {}
     bool txt(const std::string& name, std::vector<std::string>& out, bool& nx) override
     {
         return ask(name, dns::type::TXT, out, nx);
     }
     bool addrs(const std::string& name, std::vector<std::string>& out, bool& nx) override
     {
+        // Both families answered, each with addresses or none; one that failed is a failure of the whole.
         bool nx6 = false;
         std::vector<std::string> v6;
         const bool a = ask(name, dns::type::A, out, nx);
         const bool b = ask(name, dns::type::AAAA, v6, nx6);
         out.insert(out.end(), v6.begin(), v6.end());
-        return a || b;
+        nx = nx && nx6;
+        return a && b;
     }
     bool mx(const std::string& name, std::vector<std::string>& out, bool& nx) override
     {
@@ -459,28 +435,102 @@ private:
     bool ask(const std::string& name, uint16_t type, std::vector<std::string>& out, bool& nx)
     {
         nx = false;
-        if (!m_ok)
+        static thread_local thread_resolver t;
+        if (!t.ok)
+            return false;
+        const int64_t now = socketley::wall::now_ms();
+        const std::string key = std::to_string(type) + " " + name;
+        if (const auto it = t.answers.find(key); it != t.answers.end() && it->second.until_ms > now)
+        {
+            nx = it->second.nx;
+            out.insert(out.end(), it->second.out.begin(), it->second.out.end());
+            return it->second.ok;
+        }
+        // A message's checks have a budget, past which a lookup is a temporary failure rather than a wait.
+        if (now >= m_deadline_ms)
             return false;
         uint8_t buf[8192];
-        const int n = res_nquery(&m_st, name.c_str(), ns_c_in, type, buf, sizeof buf);
+        thread_resolver::cached c;
+        const int n = res_nquery(&t.st, name.c_str(), ns_c_in, type, buf, sizeof buf);
         if (n < 0)
         {
             // No such name and no record of the type are answers; anything else is a failure to ask.
-            nx = m_st.res_h_errno == HOST_NOT_FOUND;
-            return m_st.res_h_errno == HOST_NOT_FOUND || m_st.res_h_errno == NO_DATA;
+            c.nx = t.st.res_h_errno == HOST_NOT_FOUND;
+            c.ok = t.st.res_h_errno == HOST_NOT_FOUND || t.st.res_h_errno == NO_DATA;
         }
-        return parse(buf, n, type, out);
+        else
+            c.ok = parse(buf, n, type, c.out);
+        // An answer is kept a minute, a failure not at all.
+        if (c.ok)
+        {
+            if (t.answers.size() >= 8192)
+                t.answers.clear();
+            c.until_ms = now + 60000;
+            t.answers[key] = c;
+        }
+        nx = c.nx;
+        out.insert(out.end(), c.out.begin(), c.out.end());
+        return c.ok;
     }
 
-    struct __res_state m_st;
-    bool m_ok{false};
+    int64_t m_deadline_ms;
 };
+
+thread_resolver::thread_resolver()
+{
+    std::memset(&st, 0, sizeof st);
+    ok = res_ninit(&st) == 0;
+    // Each query is tried twice, two seconds apart, unless a test's configuration says otherwise.
+    st.retrans = 2;
+    st.retry = 2;
+    // A test's nameserver, on a port of its own, as the loop's resolver takes it.
+    const char* conf = settings::text("SOCKETLEY_RESOLV_CONF");
+    if (!ok || !conf)
+        return;
+    std::ifstream in(conf);
+    std::vector<in_addr> servers;
+    int port = 53;
+    for (std::string line; std::getline(in, line);)
+    {
+        std::istringstream ls(line);
+        std::string key;
+        ls >> key;
+        if (key == "nameserver")
+        {
+            std::string a;
+            ls >> a;
+            in_addr x{};
+            if (::inet_pton(AF_INET, a.c_str(), &x) == 1)
+                servers.push_back(x);
+        }
+        else if (key == "options")
+            for (std::string o; ls >> o;)
+            {
+                if (o.starts_with("port:"))
+                    port = std::atoi(o.c_str() + 5);
+                else if (o.starts_with("timeout:"))
+                    st.retrans = std::atoi(o.c_str() + 8);
+                else if (o.starts_with("attempts:"))
+                    st.retry = std::atoi(o.c_str() + 9);
+            }
+    }
+    st.nscount = 0;
+    for (const auto& x : servers)
+        if (st.nscount < MAXNS)
+        {
+            sockaddr_in& sa = st.nsaddr_list[st.nscount++];
+            sa = sockaddr_in{};
+            sa.sin_family = AF_INET;
+            sa.sin_port = htons(static_cast<uint16_t>(port));
+            sa.sin_addr = x;
+        }
+}
 
 }   // namespace
 
-std::unique_ptr<check_resolver> system_check_resolver()
+std::unique_ptr<check_resolver> system_check_resolver(int64_t budget_ms)
 {
-    return std::make_unique<system_resolver>();
+    return std::make_unique<system_resolver>(budget_ms);
 }
 
 std::string organizational_domain(std::string_view domain)
@@ -541,10 +591,33 @@ inbound_result check_inbound(std::string_view message, const std::string& ip, co
 
     // DMARC of the domain From names, the one a reader sees.
     std::vector<address> from;
-    const std::string from_header = header_value(header_block(message), "From");
-    if (!parse_mailbox_list(from_header, from) || from.size() != 1 || from[0].domain.empty())
+    const std::string_view head = header_block(message);
+    const std::string from_header = header_value(head, "From");
+    size_t from_headers = 0;
+    for (std::string_view rest = head; !rest.empty();)
     {
-        out.dmarc = "permerror";
+        const size_t nl = rest.find('\n');
+        const std::string_view line = rest.substr(0, nl);
+        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+        from_headers += line.size() > 5 && socketley::ascii::iequals(line.substr(0, 5), "From:");
+    }
+    // A message with no From names no author to pass for, and DMARC has nothing to say of it.
+    if (from_headers == 0)
+    {
+        out.dmarc = "none";
+        return out;
+    }
+    // One whose author cannot be told -- two From headers, one that does not read, or authors of several domains --
+    // would pass DMARC by no domain's policy, so it is refused as a failing one would be (RFC 7489 6.6.1).
+    const bool authors_ok = parse_mailbox_list(from_header, from) && !from.empty() && from_headers == 1 &&
+                            std::all_of(from.begin(), from.end(), [&](const address& a) {
+                                return !a.domain.empty() && a.domain == from[0].domain;
+                            });
+    if (!authors_ok)
+    {
+        out.dmarc = "fail";
+        out.dmarc_policy = "reject";
+        out.why = "its From names no single author's domain";
         return out;
     }
     out.from_domain = from[0].domain;

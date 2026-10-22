@@ -23,6 +23,8 @@ void mail_forget_state(std::string_view runtime_name);
 // The addresses no shard of the runtime sends to again: <state>/mail/<name>.suppressed.
 std::string mail_suppressed_path(std::string_view runtime_name);
 // The DKIM key every shard of the runtime signs with: <state>/mail/<name>.dkim.<selector>.key.
+// The key no-reply mail's tags are made with, which every shard reads.
+std::string mail_verp_key_path(std::string_view runtime_name);
 std::string mail_key_path(std::string_view runtime_name, std::string_view selector);
 // Where the users' Sieve scripts are kept, the same for every shard.
 std::string mail_sieve_dir(std::string_view runtime_name);
@@ -78,6 +80,8 @@ public:
     uint64_t get_max_size() const { return m_max_size; }
     void set_max_recipients(uint32_t n) { m_max_rcpt = n; }
     uint32_t get_max_recipients() const { return m_max_rcpt; }
+    // One message of --global-rate-limit's allowance taken, false where there is none left this second.
+    bool take_global_token() { return check_global_rate_limit(); }
     // How long a message is tried before it is bounced, in seconds.
     void set_queue_lifetime(uint32_t s) { m_lifetime = s; }
     uint32_t get_queue_lifetime() const { return m_lifetime; }

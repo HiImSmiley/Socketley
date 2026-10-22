@@ -88,8 +88,10 @@ check "socketley mail dns prints the five for a zone kept elsewhere" "$("$BIN" m
 # ─── no-reply ───────────────────────────────────────────────────────────────
 "$BIN" send m --to amy@remote.test --subject "notice" --text "noreply body" >/dev/null 2>&1
 f=$(mail_with "noreply body")
-[ -n "$f" ] && grep -q '^from no-reply@example.test$' "$f" && grep -q '^From: no-reply@example.test' "$f" \
-    && ok "a message without a sender goes from no-reply@ its domain" || bad "a message without a sender goes from no-reply@ its domain" "$(head -3 "$f" 2>/dev/null)"
+[ -n "$f" ] && grep -q '^from no-reply+[0-9a-f]\{16\}@example.test$' "$f" && grep -q '^From: no-reply@example.test' "$f" \
+    && ok "a message without a sender goes from no-reply@ its domain, tagged for the domain it goes to" \
+    || bad "a message without a sender goes from no-reply@ its domain, tagged for the domain it goes to" "$(head -3 "$f" 2>/dev/null)"
+tagged=$(sed -n 's/^from //p' "$f" 2>/dev/null | head -1)
 r=$(python3 - "$P" <<'PY'
 import smtplib, sys
 s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=("127.0.0.2", 0))
@@ -114,6 +116,22 @@ grep -l "again body" "$T"/sink/*.eml >/dev/null 2>&1 && bad "a suppressed addres
 "$BIN" mail m forgive dead@remote.test >/dev/null 2>&1; check "forgive lets it go" "$?" "0"
 check "and the list is empty after" "$("$BIN" mail m suppressed 2>/dev/null)" ""
 "$BIN" mail m forgive dead@remote.test >/dev/null 2>&1; check "forgiving one not there says so" "$?" "1"
+
+# A bounce from elsewhere counts only under the tag mail went out with, and only for that tag's domain.
+bounce() { # bounce <to> <failed address>
+    python3 - "$P" "$1" "$2" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=("127.0.0.2", 0)); s.ehlo("x")
+s.sendmail("", [sys.argv[2]], "From: MAILER-DAEMON@remote.test\r\nSubject: failed\r\n\r\n"
+           "Final-Recipient: rfc822; %s\r\nAction: failed\r\nStatus: 5.1.1\r\n" % sys.argv[3])
+PY
+}
+bounce no-reply@example.test victim@remote.test
+bounce "$tagged" victim2@else.test
+bounce "$tagged" amy@remote.test
+for _ in $(seq 1 50); do "$BIN" mail m suppressed 2>/dev/null | grep -q amy@ && break; sleep 0.1; done
+check "a bounce under the tag for remote.test suppresses an address there" "$("$BIN" mail m suppressed 2>/dev/null | grep -c '^amy@remote.test$')" "1"
+check "but not one under no tag, nor one of another domain" "$("$BIN" mail m suppressed 2>/dev/null | grep -c 'victim')" "0"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

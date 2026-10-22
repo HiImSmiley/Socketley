@@ -26,7 +26,8 @@ struct address
     std::string local;
     std::string domain;
     bool empty() const { return local.empty() && domain.empty(); }
-    std::string text() const { return empty() ? std::string() : local + "@" + domain; }
+    // The postmaster may be named with no domain (RFC 5321 4.5.1), and is then that word alone.
+    std::string text() const { return empty() ? std::string() : domain.empty() ? local : local + "@" + domain; }
 };
 
 // What a client asked to be told of a recipient (RFC 3461): NOTIFY as bits, none of them for the default, and ORCPT
@@ -138,6 +139,8 @@ public:
 
     // Lines are commands until DATA, and the client may not send one longer than this (RFC 5321 4.5.3.1.4 says 512).
     static constexpr size_t max_command = 4096;
+    // What came and is not read yet, which the connection stops reading past while a command waits.
+    size_t buffered() const { return m_in.size() - m_at; }
     static constexpr uint32_t max_errors = 20;
 
 private:
@@ -188,6 +191,8 @@ private:
     uint8_t     m_dstate{0};
     uint64_t    m_size{0};
     bool        m_dropping{false};
+    // A line past max_command was cut, and what is left of it is dropped when it comes.
+    bool        m_discarding{false};
     // BDAT: the bytes of the chunk still to come, whether it is the last, whether the message began, and whether the
     // chunk is refused already and read only to be dropped.
     uint64_t    m_chunk_left{0};

@@ -12622,7 +12622,10 @@ one that speaks TLS from the first byte, and
 .B \-\-imap
 and
 .B \-\-imaps
-the same two for reading the mailboxes.
+the same two for reading the mailboxes. With no
+.B \-\-bind
+a port takes IPv6 and IPv4 alike; an IPv4 client is seen, checked and logged by
+its IPv4 address.
 .PP
 .B Whose mail it takes.
 Its domains are
@@ -12650,14 +12653,36 @@ past
 .B \-\-max\-size
 is refused, said at MAIL when its SIZE says so, after its end otherwise. Its end
 is a CRLF, a dot and a CRLF and nothing else, or the chunk BDAT says is the
-last, and a bare LF in it is written as CRLF, so a dot between bare LFs ends no
-message here or on the next server; what
-a client sent after STARTTLS before the handshake is dropped. AUTH is offered
+last, and a bare LF or a lone CR in it is written as CRLF, so a dot after either
+ends no message here or on the next server; what
+a client sent after STARTTLS before the handshake is dropped. A recipient given
+twice is one recipient, and an EHLO name with a control byte or a space is
+refused. AUTH is offered
 over TLS, and in the clear to 127.0.0.1 alone; a wrong password is answered a
-second later. On the submission ports nothing is taken from a client that has
-not signed in, and a user of the idp runtime sends only as their own address,
-their username at one of its domains or their account's email. A connection
-quiet for five minutes is closed.
+second later, and ten from one address within ten minutes lock that address out
+for ten minutes, the right password too (454; IMAP's [UNAVAILABLE]). On the
+submission ports nothing is taken from a client that has
+not signed in, and a signed-in user sends only as their own address, in MAIL
+FROM and in the From header alike: their username at one of its domains, the
+email their idp account names, or the username where it is an address. A
+connection quiet for five minutes is closed.
+.PP
+.B Limits.
+One client address holds at most 50 connections to port 25 and 200 to each
+other port, 127.0.0.1 none of these; a runtime with no
+.B \-\-max\-connections
+holds 8192. One past a limit is told 421 (BYE on IMAP and ManageSieve) and
+closed. A client that sends more than its largest message and a mebibyte while a
+command waits, or that reads none of 32 MiB of replies, is told 421 and closed,
+reset if it still reads none five seconds later.
+.B \-\-rate\-limit
+.I n
+takes
+.I n
+messages a second from one client address, or one signed-in user, and tells the
+next MAIL 450;
+.B \-\-global\-rate\-limit
+does the same for the whole runtime.
 .PP
 .B What it checks.
 With
@@ -12673,13 +12698,18 @@ bounce; every DKIM signature (up to five); and DMARC (RFC 7489) for the domain
 of From, with SPF or DKIM aligned as its record says. A message DMARC fails
 under
 .B p=reject
-is refused with 550 and not kept; under
+is refused with 550 and not kept, as is one whose author cannot be told
+\(em two From headers, one that does not read, or authors of two domains; under
 .B p=quarantine
 it goes to the recipient's Junk folder. What each said is written into the
 mailbox's
 .B Authentication\-Results
-line, and one a sender put there under this host's name is taken out. The
-lookups run on a pool of their own and never on the loop. The organizational
+line, and one a sender put there under this host's name is taken out, as is
+the sender's Return-Path. The
+lookups run on sixteen threads of their own and never on the loop, a message's
+together within twenty seconds, past which they are a temporary error; an
+answer is kept a minute. Past 512 messages waiting to be checked, the next is
+told 451. The organizational
 domain DMARC compares is a name's registrable domain by the Public Suffix List
 of the publicsuffix package
 .RB ( /usr/share/publicsuffix ),
@@ -12795,15 +12825,20 @@ a message
 .B socketley send
 or a script writes without a sender goes from
 .BI no\-reply@ domain\fR.
-Mail to that address is refused, but a bounce is taken and read: every
-recipient its report says failed is suppressed, not mailed again by any shard
-until
+Mail to that address is refused, but a bounce is taken and read. Such a message
+goes out under
+.BI no\-reply+ tag @ domain\fR,
+the tag a keyed hash of the recipient's domain that only this runtime can make,
+so a bounce that comes back under the tag of an address's domain suppresses that
+address: it is not mailed again by any shard until
 .B socketley mail
 .I m
 .B forgive
 .I address
-lets it go. The runtime's own bounce of such a message arrives there too, so an
-address is learned dead from its first try.
+lets it go, or ninety days pass. A bounce under no tag, or another domain's, is
+read and acts on nothing, so no stranger can stop mail to an address. The
+runtime's own bounce of such a message is its own word, so an address is learned
+dead from its first try.
 .PP
 .B Mailboxes.
 With

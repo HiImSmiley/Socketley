@@ -32,6 +32,11 @@ std::string mail_sieve_dir(std::string_view runtime_name)
     return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".sieve")).string();
 }
 
+std::string mail_verp_key_path(std::string_view runtime_name)
+{
+    return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".verp")).string();
+}
+
 std::string mail_suppressed_path(std::string_view runtime_name)
 {
     return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".suppressed")).string();
@@ -48,7 +53,8 @@ void mail_forget_state(std::string_view runtime_name)
         const std::string f = e.path().filename().string();
         const std::string_view rest = std::string_view(f).substr(std::min(f.size(), stem.size()));
         if (f.starts_with(stem) && (rest.empty() || rest.starts_with(".dkim.") || rest == ".suppressed" ||
-                                    rest == ".imap" || rest == ".sieve" ||
+                                    rest == ".suppressed.lock" || rest == ".verp" || rest == ".imap" ||
+                                    rest == ".sieve" ||
                                     (rest.front() == '.' && rest.size() > 1 &&
                                      rest.find_first_not_of("0123456789", 1) == std::string_view::npos)))
             gone.push_back(e.path());

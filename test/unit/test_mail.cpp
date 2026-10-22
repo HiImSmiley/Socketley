@@ -328,10 +328,10 @@ TEST_CASE("a bare LF is a line's end written as CRLF, and a dot between bare LFs
     CHECK(f.codes() == std::vector<int>{250});
     REQUIRE(f.messages.size() == 1);
     CHECK(f.messages[0] == "one\r\n\r\nMAIL FROM:<evil@b.org>\r\nRCPT TO:<victim@d.org>\r\nDATA\r\nforged\r\n");
-    // A bare CR is kept as it came.
-    s.input("MAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\nx\ry\r\n.\r\n");
+    // A lone CR is a line's end too, so a server that ends lines at one reads the lines this one read.
+    s.input("MAIL FROM:<a@b.org>\r\nRCPT TO:<c@d.org>\r\nDATA\r\nx\ry\r.\r\nz\r\n.\r\n");
     REQUIRE(f.messages.size() == 2);
-    CHECK(f.messages[1] == "x\ry\r\n");
+    CHECK(f.messages[1] == "x\r\ny\r\n.\r\nz\r\n");
 }
 
 TEST_CASE("a message past the size is read to its end and refused, and the next one is taken")
@@ -699,9 +699,10 @@ TEST_CASE("DMARC: aligned SPF or DKIM passes, a policy is taken from the organiz
     // No record: none, whatever SPF says.
     res = check_inbound("From: a@nodmarc.test\r\n\r\nx\r\n", "1.2.3.4", "h", "a@nodmarc.test", r, 0);
     CHECK(res.dmarc == "none");
-    // Two From addresses are no domain DMARC can judge.
+    // Authors of two domains pass for no domain's policy, and are refused as a failing one would be.
     res = check_inbound("From: a@example.test, b@else.test\r\n\r\nx\r\n", "1.2.3.4", "h", "", r, 0);
-    CHECK(res.dmarc == "permerror");
+    CHECK(res.dmarc == "fail");
+    CHECK(res.reject());
     // A bounce's SPF is HELO's.
     res = check_inbound(own, "192.0.2.1", "example.test", "", r, 0);
     CHECK(res.spf_domain == "example.test");

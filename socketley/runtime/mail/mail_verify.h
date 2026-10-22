@@ -22,8 +22,9 @@ struct check_resolver
     virtual bool mx(const std::string& name, std::vector<std::string>& out, bool& nx) = 0;
 };
 
-// The system's resolver, through res_nquery, pointed at the servers of SOCKETLEY_RESOLV_CONF where it is set.
-std::unique_ptr<check_resolver> system_check_resolver();
+// The system's resolver, through res_nquery, pointed at the servers of SOCKETLEY_RESOLV_CONF where it is set; its
+// state and the last minute's answers are the calling thread's, and a lookup past `budget_ms` from now fails.
+std::unique_ptr<check_resolver> system_check_resolver(int64_t budget_ms = 20000);
 
 // SPF's verdict for `ip` sending as `domain` (pass, fail, softfail, neutral, none, temperror, permerror).
 std::string spf_check(const std::string& ip, const std::string& domain, const std::string& sender, check_resolver& r);
@@ -37,6 +38,8 @@ struct inbound_result
     std::string dmarc;
     std::string dmarc_policy;
     std::string from_domain;
+    // Why it is refused where that is not a domain's policy.
+    std::string why;
     // The value of the Authentication-Results this host writes, after its own name.
     std::string header() const;
     bool reject() const { return dmarc == "fail" && dmarc_policy == "reject"; }

@@ -90,9 +90,14 @@ public:
     const alias_table& aliases() const { return m_aliases.value(); }
     // An address a bounce said is dead, which mail is not sent to again until it is forgiven.
     bool suppressed(std::string_view addr) const;
-    void suppress(std::string addr);
-    // A bounce taken for no-reply@: the recipients it says failed, suppressed.
-    void bounce_taken(std::string_view message);
+    // A bounce taken for `to`, no-reply+<token>@: the recipients it says failed, suppressed where the token is the
+    // one this runtime sent mail for their domain under, so no one else's word suppresses an address.
+    // A report this runtime made itself is its own word, `trusted`.
+    void bounce_taken(std::string_view message, std::string_view to, bool trusted);
+    // The tag of no-reply mail sent to `domain`, which its bounces come back with.
+    std::string verp_token(std::string_view domain) const;
+    // no-reply, or no-reply with a tag.
+    static bool no_reply_local(std::string_view local);
     // Where mail for `a` goes, by the aliases, the no-reply address and the mailboxes.
     route_to route(const address& a, bool from_null) const;
     // A message of this runtime's own making queued, as a bounce or `socketley send` is: false when it cannot be.
@@ -118,7 +123,9 @@ private:
         mail_run* run{nullptr};
         uint64_t id{0};
         int fd{-1};
-        sockaddr_in peer{};
+        sockaddr_storage peer{};
+        // Its address as text, IPv4 for a client a dual-stack listener took over IPv4.
+        std::string ip;
         port_kind kind{port_kind::smtp};
         io_request rd{}, wr{};
         bool rd_pending{false}, wr_pending{false}, dead{false};
@@ -156,6 +163,11 @@ private:
         // An idp user signed in, and the address the account names, which with its username are what it sends as.
         bool idp_user{false};
         std::string user_email;
+        // Whether the user signed in on it may send as `a`: their username at one of the domains, the account's email,
+        // or the username where it is an address.
+        bool owns(const address& a) const;
+        // The header of the message being received, up to its blank line, for its From to be checked.
+        std::string head_seen;
         // Its address in --dnsbl's lists: not asked, being asked, listed nowhere, listed by `listed_by`; and the
         // MAIL that waits for the answer.
         uint8_t blocklist{0};
@@ -209,6 +221,9 @@ private:
     void close_soon(conn& c);
     void close_conn(conn& c);
     void settle();
+    // A connection whose read or write the ring could not take now, tried again at the loop's turn.
+    void retry_io(conn& c);
+    std::vector<uint64_t> m_retry_io;
     void arm_tick();
     void tick();
     void refresh_files();
@@ -219,9 +234,11 @@ private:
     std::string m_published;
     std::unordered_set<std::string> m_suppressed;
     std::optional<socketley::file_stamp> m_suppressed_stamp;
-    // Read again when another shard changed it, or merged with what is here before this one writes.
-    void load_suppressed(bool merge);
-    void save_suppressed();
+    // Read again when another shard changed it; changed on a thread, under the file's lock, merged with what the
+    // other shards wrote, and entries past ninety days let go.
+    void load_suppressed();
+    void edit_suppressed(std::vector<std::string> add, std::vector<std::string> remove);
+    std::string m_verp_key;
     // The session of a connection once it may speak: at the accept, or once its TLS handshake is done.
     void begin_session(conn& c);
     smtp_config session_config(const conn& c) const;
@@ -259,6 +276,21 @@ private:
     listener m_smtp, m_sub, m_subs, m_imap_l, m_imaps_l, m_sieve_l;
     std::unique_ptr<imap_store> m_imap;
     std::unordered_map<uint64_t, std::unique_ptr<conn>> m_conns;
+    // Connections and failed sign-ins by client address, and each address's message rate, for the limits on them.
+    struct client
+    {
+        uint32_t conns{0};
+        uint32_t failures{0};
+        int64_t first_failure_ms{0};
+        int64_t locked_until_ms{0};
+        double tokens{0};
+        int64_t tokens_ms{0};
+    };
+    std::unordered_map<std::string, client> m_clients;
+    // Whether `ip` may send another message now, by --rate-limit's bucket of it and --global-rate-limit's.
+    bool may_send(const std::string& ip);
+    // An accept refused with EMFILE waits a moment before the next, rather than spinning on the same failure.
+    int64_t m_accept_paused_until_ms{0};
     std::vector<std::unique_ptr<conn>> m_closing;
     std::vector<uint64_t> m_close_soon;
     uint64_t m_next_id{1};
@@ -282,12 +314,16 @@ private:
     uint64_t m_refused_relay{0};
     uint64_t m_auth_ok{0};
     uint64_t m_auth_failed{0};
+    uint64_t m_auth_locked{0};
+    uint64_t m_rate_limited{0};
     uint64_t m_tls_failures{0};
     uint64_t m_starttls{0};
     uint64_t m_too_big{0};
     uint64_t m_spool_failed{0};
     uint64_t m_bounces_taken{0};
     uint64_t m_suppressions{0};
+    uint64_t m_bounces_unverified{0};
+    uint32_t m_checks_out{0};
     uint64_t m_checked{0};
     uint64_t m_dmarc_rejected{0};
     uint64_t m_blocklisted{0};

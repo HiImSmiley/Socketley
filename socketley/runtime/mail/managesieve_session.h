@@ -50,6 +50,8 @@ public:
     // The handshake STARTTLS began is done: the capabilities again, as RFC 5804 2.2 asks.
     void tls_started();
     const std::string& user() const { return m_user; }
+    // What came and is not taken yet.
+    size_t buffered() const { return m_in.size() - m_at; }
 
     static constexpr size_t max_line = 8192;
     // More arguments than any command takes.
@@ -81,6 +83,8 @@ private:
     std::vector<arg> m_args;
     uint64_t m_literal{0};
     bool m_dropping{false};
+    // A line past max_line was cut, and what is left of it is dropped when it comes.
+    bool m_discarding{false};
     // AUTHENTICATE waiting for the client's SASL response on a line of its own.
     bool m_sasl{false};
     bool m_waiting{false};

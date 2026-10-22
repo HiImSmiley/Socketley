@@ -206,6 +206,19 @@ tally < <(timeout 60 python3 "$T/client.py" "$IM" "$P" after "$T/status.after" 2
 v1=$(printf '%s' "$before" | grep -o 'UIDVALIDITY [0-9]*'); v2=$(grep -o 'UIDVALIDITY [0-9]*' "$T/status.after" 2>/dev/null)
 [ -n "$v1" ] && [ "$v1" = "$v2" ] && ok "UIDVALIDITY is the same after a restart" || bad "UIDVALIDITY is the same after a restart" "$v1 / $v2"
 
+# Over TLS, a reply larger than what the record layer holds at once goes out whole.
+r=$(timeout 60 python3 - "$IM" <<'PY'
+import imaplib, ssl, sys
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1]), timeout=30); M.starttls(ssl_context=ctx); M.login("alice", "alicepassword1")
+big = b"Subject: large over tls\r\n\r\n" + (b"t" * 78 + b"\r\n") * 30000
+M.create("Large"); M.append("Large", None, None, big); M.select("Large")
+typ, data = M.fetch("1", "(BODY.PEEK[])")
+print(len(data[0][1]) == len(big))
+PY
+)
+check "a body past 2 MiB is fetched whole over TLS" "$r" "True"
+
 # A literal sent as Python's imaplib sends it, its line end in a write of its own that Nagle holds until the literal is
 # acknowledged: the ACK must not wait for the 40 ms delayed-ACK timer.
 acked=$(timeout 60 python3 - "$IM" <<'PY'

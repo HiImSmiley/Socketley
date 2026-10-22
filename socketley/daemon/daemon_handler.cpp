@@ -3059,8 +3059,8 @@ int daemon_handler::cmd_mail(ipc_connection* conn, const parsed_args& pa)
         if (v == ml::verb::flush || v == ml::verb::drop || v == ml::verb::forgive)
             continue;
         all += one;
-        // Every shard's records are the same, and its show is of one message.
-        if (v == ml::verb::show || v == ml::verb::dns)
+        // Every shard's records and suppressed list are the same, and its show is of one message.
+        if (v == ml::verb::show || v == ml::verb::dns || v == ml::verb::suppressed)
             break;
     }
     if (!found)

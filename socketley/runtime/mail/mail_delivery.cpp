@@ -474,9 +474,11 @@ void delivery::dispatch(const entry_ptr& e)
             {
                 // A bounce to no-reply@: whom it says failed is not mailed again.
                 const uint32_t want = static_cast<uint32_t>(std::min<uint64_t>(e->body_len, 256u << 10));
-                m_run.queue().read(e, 0, want, [this, alive = m_alive](bool ok, std::string_view b) {
+                const bool own = e->bounce && e->peer == "local";
+                m_run.queue().read(e, 0, want, [this, to = e->rcpts[i].addr, own, alive = m_alive](bool ok,
+                                                                                                   std::string_view b) {
                     if (*alive && ok)
-                        m_run.bounce_taken(b);
+                        m_run.bounce_taken(b, to, own);
                 });
                 m_run.queue().mark(*e, i, rcpt_state::delivered, "taken as a bounce");
                 continue;
@@ -2460,7 +2462,12 @@ void delivery::conn_begin(out_conn& c)
     for (const auto& t : it.to)
         for (const unsigned char ch : t.addr)
             utf8 = utf8 || ch >= 0x80;
-    std::string mail = "MAIL FROM:<" + e.from + ">";
+    // no-reply mail goes out under a tag of the domain it goes to, which a bounce of it must come back with.
+    std::string sender = e.from;
+    if (address na; m_run.owner().get_no_reply() && parse_address(e.from, na) &&
+                    socketley::ascii::iequals(na.local, "no-reply") && m_run.is_local_domain(na.domain) && !it.to.empty())
+        sender = "no-reply+" + m_run.verp_token(domain_of(it.to.front().addr)) + "@" + na.domain;
+    std::string mail = "MAIL FROM:<" + sender + ">";
     if (c.size_max)
         mail += " SIZE=" + std::to_string(size);
     if (c.eightbit)

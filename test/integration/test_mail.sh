@@ -149,6 +149,12 @@ case "$r" in
     "auth 535 "1.*|"auth 535 "2.*) ok "a wrong password is refused a second later" ;;
     *) bad "a wrong password is refused a second later" "$r" ;;
 esac
+check "a user of --users may not send as another's address" \
+    "$(smtp "$SUB" bob@example.test carol@remote.test 'x' starttls login alice alicepass1)" "sender 553"
+check "nor under a From header of another" "$(smtp "$SUB" alice@example.test carol@remote.test 'From: ceo@example.test
+Subject: forged
+
+the ceo says' starttls login alice alicepass1)" "refused 553"
 
 # ─── socketley send ─────────────────────────────────────────────────────────
 id=$("$BIN" send m --from alice@example.test --to dave@remote.test --subject "Hello from the CLI" --text "cli body" 2>&1)

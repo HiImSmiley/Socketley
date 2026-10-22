@@ -1,6 +1,7 @@
 #include "smtp_session.h"
 
 #include <charconv>
+#include <algorithm>
 #include <cstring>
 
 #include "../../shared/util/ascii.h"
@@ -37,13 +38,23 @@ bool atext(unsigned char c, bool utf8)
            std::strchr("!#$%&'*+-/=?^_`{|}~", c) != nullptr;
 }
 
+// Printable text with no space, as an address literal's or a HELO name's must be to go into a header.
+bool printable(std::string_view s, bool utf8)
+{
+    for (const unsigned char c : s)
+        if (c <= 0x20 || c == 0x7f || (c >= 0x80 && !utf8))
+            return false;
+    return true;
+}
+
 // A domain of letters, digits and hyphens in dotted labels, or an address literal in brackets.
 bool domain_ok(std::string_view d, bool utf8)
 {
     if (d.empty() || d.size() > 255)
         return false;
     if (d.front() == '[')
-        return d.size() > 2 && d.back() == ']' && d.substr(1, d.size() - 2).find_first_of(" \\[]") == std::string_view::npos;
+        return d.size() > 2 && d.back() == ']' && d.substr(1, d.size() - 2).find_first_of("\\[]") == std::string_view::npos &&
+               printable(d.substr(1, d.size() - 2), false);
     size_t label = 0;
     for (size_t i = 0; i < d.size(); ++i)
     {
@@ -61,6 +72,21 @@ bool domain_ok(std::string_view d, bool utf8)
             return false;
     }
     return label > 0 && d.back() != '-';
+}
+
+// `n` bytes of a message's line, a CR among them that no LF follows written CRLF, so a server that ends lines at a
+// lone CR reads the lines this one read; `cr_last_lone` says the last byte, if a CR, has no LF after it either.
+void append_lines(std::string& out, const char* p, size_t n, bool cr_last_lone)
+{
+    size_t from = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (p[i] == '\r' && (i + 1 < n ? p[i + 1] != '\n' : cr_last_lone))
+        {
+            out.append(p + from, i + 1 - from);
+            out += '\n';
+            from = i + 1;
+        }
+    out.append(p + from, n - from);
 }
 
 }   // namespace
@@ -86,7 +112,11 @@ bool parse_address(std::string_view in, address& out, bool utf8)
             const auto c = static_cast<unsigned char>(local[i]);
             if (c == '\\')
             {
+                // A quoted pair is a printable byte or a space (RFC 5321 4.1.2), never a control.
                 if (++i + 1 >= local.size())
+                    return false;
+                const auto q = static_cast<unsigned char>(local[i]);
+                if (q < 0x20 || q == 0x7f || (q >= 0x80 && !utf8))
                     return false;
                 continue;
             }
@@ -304,18 +334,25 @@ void smtp_session::run()
         const void* nl = std::memchr(start, '\n', m_in.size() - m_at);
         if (!nl)
         {
-            if (m_in.size() - m_at > max_command)
+            // Past a command and its CR, the line so far is dropped and so is the rest of it when it comes, said once.
+            if (m_in.size() - m_at > max_command + 1)
             {
-                // The line so far is dropped and its end looked for, since the client says no more than that.
                 m_in.clear();
                 m_at = 0;
-                error(500, "5.5.2", "Line too long");
+                if (!m_discarding)
+                    error(500, "5.5.2", "Line too long");
+                m_discarding = true;
             }
             break;
         }
         const size_t len = static_cast<const char*>(nl) - start;
         std::string_view line(start, len);
         m_at += len + 1;
+        if (m_discarding)
+        {
+            m_discarding = false;
+            continue;
+        }
         if (!line.empty() && line.back() == '\r')
             line.remove_suffix(1);
         if (line.size() > max_command)
@@ -469,6 +506,9 @@ void smtp_session::ehlo(std::string_view arg, bool extended)
 {
     if (arg.empty())
         return error(501, "5.5.4", extended ? "EHLO requires a domain or address" : "HELO requires a domain");
+    // The name goes into the Received line, so it is printable text with no space.
+    if (arg.size() > 255 || !printable(arg, true))
+        return error(501, "5.5.4", "Invalid domain name");
     reset();
     m_helo = std::string(arg.substr(0, 255));
     m_esmtp = extended;
@@ -626,8 +666,15 @@ void smtp_session::rcpt(std::string_view arg)
             const std::string_view v = p.substr(6);
             const size_t semi = v.find(';');
             std::string plain;
+            // Its address type is an atom (RFC 3461 4.2), as it goes on to the next server and into a report.
+            const auto atom = [](std::string_view t) {
+                for (const unsigned char c : t)
+                    if (!atext(c, false))
+                        return false;
+                return !t.empty();
+            };
             if (!dsn.orcpt.empty() || semi == 0 || semi == std::string_view::npos || v.size() > 500 ||
-                !xtext_decode(v.substr(semi + 1), plain))
+                !atom(v.substr(0, semi)) || !xtext_decode(v.substr(semi + 1), plain))
                 return error(501, "5.5.4", "Bad ORCPT");
             dsn.orcpt = std::string(v);
         }
@@ -642,8 +689,14 @@ void smtp_session::rcpt(std::string_view arg)
             return;
         if (v.code / 100 == 2)
         {
-            m_rcpts.push_back(to);
-            m_rcpt_dsn.push_back(dsn);
+            // An address given twice is one recipient, and gets one copy.
+            const std::string text = to.text();
+            if (std::none_of(m_rcpts.begin(), m_rcpts.end(),
+                             [&](const address& a) { return socketley::ascii::iequals(a.text(), text); }))
+            {
+                m_rcpts.push_back(to);
+                m_rcpt_dsn.push_back(dsn);
+            }
             say(250, "2.1.5", v.text.empty() ? "OK" : v.text);
         }
         else
@@ -788,16 +841,19 @@ bool smtp_session::data(std::string_view& in)
                         --stop;
                         m_dstate = s_cr;
                     }
-                    out.append(p, static_cast<size_t>(stop - p));
+                    append_lines(out, p, static_cast<size_t>(stop - p), true);
                     p = end;
                     break;
                 }
-                // A bare LF ends the line as a CRLF would.
+                // A bare LF ends the line as a CRLF would, and so does a lone CR.
                 if (nl > p && nl[-1] == '\r')
-                    out.append(p, static_cast<size_t>(nl + 1 - p));
+                {
+                    append_lines(out, p, static_cast<size_t>(nl - p), false);
+                    out += '\n';
+                }
                 else
                 {
-                    out.append(p, static_cast<size_t>(nl - p));
+                    append_lines(out, p, static_cast<size_t>(nl - p), true);
                     out.append("\r\n");
                 }
                 p = nl + 1;
@@ -822,7 +878,7 @@ bool smtp_session::data(std::string_view& in)
                 }
                 else
                 {
-                    out.push_back('\r');
+                    out.append("\r\n");
                     m_dstate = s_mid;
                 }
                 break;
@@ -850,7 +906,7 @@ bool smtp_session::data(std::string_view& in)
                 }
                 else
                 {
-                    out.push_back('\r');
+                    out.append("\r\n");
                     m_dstate = s_mid;
                 }
                 break;
@@ -959,15 +1015,24 @@ bool smtp_session::chunk(std::string_view& in)
     m_chunk_left -= n;
     if (!m_chunk_refused && !m_dropping && !piece.empty())
     {
-        // A bare LF is written as CRLF, as DATA writes it, so what is relayed by DATA ends where this one ends.
+        // A bare LF and a lone CR are written as CRLF, as DATA writes them, so what is relayed by DATA ends where
+        // this one ends; a CR that ended the last piece is lone where this one begins with no LF.
         std::string out;
         out.reserve(piece.size() + 16);
+        if (m_chunk_cr && piece.front() != '\n')
+            out += '\n';
         size_t from = 0;
         for (size_t i = 0; i < piece.size(); ++i)
             if (piece[i] == '\n' && !(i ? piece[i - 1] == '\r' : m_chunk_cr))
             {
                 out.append(piece, from, i - from);
                 out.append("\r\n");
+                from = i + 1;
+            }
+            else if (piece[i] == '\r' && i + 1 < piece.size() && piece[i + 1] != '\n')
+            {
+                out.append(piece, from, i + 1 - from);
+                out += '\n';
                 from = i + 1;
             }
         out.append(piece, from, piece.size() - from);
@@ -1004,6 +1069,12 @@ bool smtp_session::chunk(std::string_view& in)
         return true;
     }
     m_chunking = false;
+    // A message that ends with a lone CR ends with a line.
+    if (m_chunk_cr)
+    {
+        m_chunk_cr = false;
+        m_hooks.data_bytes("\n");
+    }
     message_end();
     return true;
 }
