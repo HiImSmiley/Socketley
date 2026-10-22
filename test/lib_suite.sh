@@ -52,6 +52,11 @@ suite_mem_slots() {   # bytes per job -> how many fit
     echo "$n"
 }
 
+# How many sanitizer files run at once: each holds about 2 GiB, and its binary's pages are counted beside it.
+suite_sanitize_slots() {
+    suite_mem_slots 2684354560
+}
+
 # Where the last run's per-file seconds are kept, so the longest files start
 # first and the run does not end on one 85-second file started last.
 SUITE_DURATIONS="${SUITE_DURATIONS:-/tmp/socketley-test-durations-$(id -u)}"

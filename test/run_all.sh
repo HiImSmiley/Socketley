@@ -323,9 +323,8 @@ for script in "$SCRIPT_DIR"/integration/test_*.sh; do
 done
 PAR="${SUITE_PAR:-$(suite_free_windows)}"
 [ "$PAR" -gt "$(nproc)" ] && PAR=$(nproc)
-# A sanitizer build's file takes about 1.5 GiB.
 if [ "$SOCKETLEY_CONFIG" = Sanitize ] && [ -z "${SUITE_PAR:-}" ]; then
-    MEM_PAR=$(suite_mem_slots 1610612736)
+    MEM_PAR=$(suite_sanitize_slots)
     [ "$PAR" -gt "$MEM_PAR" ] && PAR=$MEM_PAR
 fi
 # Marks every process of this run, so a daemon a parallel file leaked can be
