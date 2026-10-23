@@ -592,32 +592,36 @@ std::string email_object(const email_view& view, const std::string& id, const im
             add(p, bytes ? (att.empty() ? "false" : "true") : "false");
         else if (p == "preview")
         {
-            std::string pv;
-            if (!text.empty())
-                pv = text_of(msg, *text.front()->p);
-            else if (!html.empty())
-            {
-                // HTML with its tags taken out, as a preview reads.
-                bool tag = false;
-                for (const char c : text_of(msg, *html.front()->p))
-                {
-                    if (c == '<')
-                        tag = true;
-                    else if (c == '>')
-                        tag = false;
-                    else if (!tag)
-                        pv += c;
-                }
-            }
+            // The text with its runs of white space made one space, HTML's tags taken out, read only until it is
+            // longer than the preview, which what follows cannot change.
+            constexpr size_t preview_bytes = 256;
             std::string flat;
-            for (const char c : pv)
-            {
-                const bool ws = c == ' ' || c == '\t' || c == '\r' || c == '\n';
-                if (ws && (flat.empty() || flat.back() == ' '))
-                    continue;
-                flat += ws ? ' ' : c;
-            }
-            add(p, q(utf8_prefix(flat, 256)));
+            const auto take = [&](const mime::part& part) {
+                // A textBody holds the HTML of an Email that has no plain text.
+                const bool tags = socketley::ascii::iequals(part.subtype, "html");
+                const std::string s = text_of(msg, part);
+                bool tag = false;
+                for (size_t i = 0; i < s.size() && flat.size() <= preview_bytes; ++i)
+                {
+                    const char c = s[i];
+                    if (tags && (c == '<' || c == '>'))
+                        tag = c == '<';
+                    else if (tag)
+                        continue;
+                    else if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+                    {
+                        if (!flat.empty() && flat.back() != ' ')
+                            flat += ' ';
+                    }
+                    else
+                        flat += c;
+                }
+            };
+            if (!text.empty())
+                take(*text.front()->p);
+            else if (!html.empty())
+                take(*html.front()->p);
+            add(p, q(utf8_prefix(flat, preview_bytes)));
         }
         else if (p == "bodyStructure")
             add(p, bytes ? part_json(msg, tree, id, view.body_props) : "null");

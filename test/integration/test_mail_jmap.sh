@@ -16,6 +16,7 @@
 #   * an EventSource not told of new mail
 #   * a password taken in the clear from another machine
 #   * Email/parse not reading an upload as an Email
+#   * a preview with runs of white space or HTML's tags in it, longer than 256 bytes, or cut inside a character
 #   * a VacationResponse not answering, answering a sender twice, or answering a list
 #   * a PushSubscription pushed before it is verified, its verification not readable by the keys it gave, a
 #     StateChange not sent when mail comes, or its URL and keys told back
@@ -268,6 +269,20 @@ r = api(["Email/parse", {"accountId": acct, "blobIds": [pb, "Unone"], "propertie
 pr = r["p"][0][1]
 say("Email/parse reads an upload as an Email that is not the account's", pr["parsed"].get(pb, {}).get("subject") == "only parsed"
     and pr["parsed"][pb].get("id") is None and pr["notFound"] == ["Unone"], pr)
+# A preview is the text's start with each run of white space one space and HTML's tags taken out, cut where a character
+# begins: here the 256th byte is the first of a "ü".
+def preview_of(head, body):
+    st, _, data = call("POST", "/jmap/upload/%s/" % acct, head + b"\r\n\r\n" + body, {"Content-Type": "message/rfc822"})
+    b = json.loads(data).get("blobId") if st == 201 else None
+    r = api(["Email/parse", {"accountId": acct, "blobIds": [b], "properties": ["preview"]}, "p"])
+    return r["p"][0][1]["parsed"].get(b, {}).get("preview")
+long_text = preview_of(b"From: zoe@else.test\r\nContent-Type: text/plain; charset=utf-8",
+                       b"  lead\r\n\r\n\t" + b"x" * 250 + "ü".encode() * 40 + b"\r\n")
+say("a preview is cut where a character begins", long_text == "lead " + "x" * 250, long_text)
+html = preview_of(b"From: zoe@else.test\r\nContent-Type: text/html; charset=utf-8",
+                  b"<html><body><p>Hello</p>\r\n\r\n<b>big</b>   world " + b"<i>word</i> " * 80 + b"</body></html>")
+want = ("Hello big world " + "word " * 80)[:256]
+say("and an HTML one has its tags taken out", html == want, (html, want))
 # VacationResponse
 r = api(["VacationResponse/get", {"accountId": acct}, "g0"],
         ["VacationResponse/set", {"accountId": acct, "update": {"singleton": {"isEnabled": True, "subject": "Away now",
