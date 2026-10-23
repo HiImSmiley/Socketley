@@ -110,10 +110,10 @@ public:
     void freshen(const std::string& user, std::function<void()> done);
     // The trigram filters of the user's messages read in as far as any shard wrote them, before a search asks for them.
     void read_text_filters(const std::string& user);
-    // A message's trigram filter by its EMAILID, empty where none was made yet.
-    std::string_view text_filter_of(const std::string& user, const std::string& email_id);
+    // A message's trigram filter by the hash its EMAILID spells, empty where none was made yet.
+    std::string_view text_filter_of(const std::string& user, uint64_t email_hash);
     // A message's filter kept for later searches, and written for every shard at the next tick.
-    void keep_text_filter(const std::string& user, const std::string& email_id, std::string filter);
+    void keep_text_filter(const std::string& user, uint64_t email_hash, std::string filter);
     // A folder brought up to what the bucket holds, listed again where it was last listed longer than `max_age_ms` ago;
     // null when it does not exist and is not one every mailbox has.
     void open(const std::string& user, const std::string& folder, std::function<void(std::shared_ptr<imap_folder>)> done,
@@ -123,6 +123,8 @@ public:
     std::string mailbox_id(const std::string& user, const std::string& folder);
     // A message's EMAILID (RFC 8474): of its object, which nothing changes while it is in the folder.
     static std::string email_id(std::string_view key);
+    // The number its EMAILID spells in hex, which a search looks a message up by without making the string.
+    static uint64_t email_hash(std::string_view key);
 
     // METADATA (RFC 5464): the entries of a folder, "" the server's, kept in the index for every shard.  An entry is
     // its name in lower case, /private/... or /shared/..., at most 1000 a user, of 64 KiB each and 1 MiB in all.
@@ -175,6 +177,8 @@ public:
     }
     // Its structure, parsed once.
     std::shared_ptr<const mime::part> structure(const std::string& key, const std::shared_ptr<const std::string>& bytes);
+    // Its bytes and structure where the cache holds both, read now; false where it does not.
+    bool parsed(const std::string& key, std::shared_ptr<const std::string>& bytes, std::shared_ptr<const mime::part>& part);
     // True where a message too large to parse on the loop is parsed on the pool, `done` called once structure() has it.
     bool parse_later(const std::string& key, const std::shared_ptr<const std::string>& bytes, std::function<void()> done);
 
@@ -246,8 +250,8 @@ private:
         size_t meta_count{0};
         // When freshen last listed the bucket for this user.
         int64_t listed_ms{0};
-        // Trigram filters by EMAILID, as far as their file was read, and those made here and not yet written to it.
-        std::unordered_map<std::string, std::string> filters;
+        // Trigram filters by EMAILID's hash, as far as their file was read, and those made here and not yet written to it.
+        std::unordered_map<uint64_t, std::string> filters;
         uint64_t filters_ino{0};
         uint64_t filters_off{0};
         size_t filters_bytes{0};
@@ -257,7 +261,7 @@ private:
     };
     user_state& user(const std::string& name);
     // A filter held in memory and counted against what every user's may take together.
-    void hold_filter(user_state& u, std::string id, std::string filter);
+    void hold_filter(user_state& u, uint64_t id, std::string filter);
     // The filters made here appended to the user's file, which is written again once it is mostly for messages gone.
     void write_text_filters(const std::string& name, user_state& u);
     size_t m_filter_bytes{0};

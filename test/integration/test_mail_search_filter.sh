@@ -9,6 +9,7 @@
 #   * a word split by a quoted-printable soft break, or in a base64 text part, not found
 #   * what only an attachment holds found as if it were text, decoded or as written
 #   * no filter file kept for the next search, or one a restart or a damaged record makes a search answer wrongly
+#   * the kept filters not found by the messages they are for after a restart, so a search reads every message again
 #   * JMAP's text or body filter reading the message as written, or answering otherwise than IMAP
 set -uo pipefail
 
@@ -123,6 +124,19 @@ tally < <(python3 "$T/search.py" "$IM" "$JM" "again, through the filters" 2>&1)
 
 "$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1
 for p in "$IM" "$JM"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens again" "$(tail -3 "$SOCKETLEY_DLOG")"; done
+# The first search after the restart has every message ruled out by the filters the file kept, and touches none: a
+# shard's figures reach the daemon a quarter of a second after they change, so each read waits a little longer.
+touched() { sleep 1.5; "$BIN" stats m 2>/dev/null | awk -F: '/^imap_(reads|cache_hits):/ {n += $2} END {print n + 0}'; }
+T0=$(touched)
+HITS=$(python3 - "$IM" 2>&1 <<'PY'
+import imaplib, sys
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1])); M.login("alice", "alicepassword1"); M.select("INBOX")
+print(len(M.uid("SEARCH", "BODY", "xylophonic")[1][0].split()))
+PY
+)
+T1=$(touched)
+if [ "$HITS" = 0 ] && [ "$T0" = 0 ] && [ "$T1" = 0 ]; then ok "a search after a restart touches no message its kept filter rules out"
+else bad "a search after a restart touches no message its kept filter rules out" "found $HITS, touched $T0 then $T1"; fi
 tally < <(python3 "$T/search.py" "$IM" "$JM" "after a restart" 2>&1)
 
 # A record torn in the middle of the file and garbage at its end are passed over.
@@ -140,4 +154,4 @@ for p in "$IM" "$JM"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens again"
 tally < <(python3 "$T/search.py" "$IM" "$JM" "past a damaged file" 2>&1)
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
-[ "$FAIL" -eq 0 ] && [ "$TOTAL" -eq 53 ] || exit 1
+[ "$FAIL" -eq 0 ] && [ "$TOTAL" -eq 54 ] || exit 1

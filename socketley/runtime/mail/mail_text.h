@@ -3,8 +3,10 @@
 // words decoded, the text parts as written and with their transfer encoding and charset undone, and nothing of a part
 // that is not text, an attachment.  A filter of each message's trigrams says which messages cannot hold a string, so a
 // search reads only those that may.
+#include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "mail_mime.h"
 
@@ -25,5 +27,9 @@ bool text_has(std::string_view msg, std::string_view head, const mime::part* roo
 std::string text_filter(std::string_view msg, std::string_view head, const mime::part* root);
 // Whether a message whose filter is `filter` may hold `needle`: false only where it cannot.
 bool may_hold(std::string_view filter, std::string_view needle);
+// A needle's trigrams hashed once, for the filters of the many messages a search tries it on.
+std::vector<uint64_t> trigrams_of(std::string_view needle);
+// Whether a message whose filter is `filter` may hold the needle whose trigrams are `grams`.
+bool may_hold(std::string_view filter, const std::vector<uint64_t>& grams);
 
 }   // namespace socketley::mail

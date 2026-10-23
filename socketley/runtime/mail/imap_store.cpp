@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <set>
+#include <unordered_set>
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -60,6 +61,32 @@ void put32(std::string& out, uint32_t v)
     out.append(b, 4);
 }
 
+// The EMAILID a hash spells, M and its sixteen hex digits.
+std::string id_of_hash(uint64_t h)
+{
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out(17, 'M');
+    for (size_t i = 1; i < 17; ++i)
+        out[i] = hex[(h >> (64 - 4 * i)) & 15];
+    return out;
+}
+
+// The hash an EMAILID spells, false where it spells none.
+bool hash_of_id(std::string_view id, uint64_t& h)
+{
+    if (id.size() != 17 || id[0] != 'M')
+        return false;
+    h = 0;
+    for (const char c : id.substr(1))
+    {
+        const int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+        if (d < 0)
+            return false;
+        h = h << 4 | static_cast<uint64_t>(d);
+    }
+    return true;
+}
+
 std::string filter_record(const std::string& id, std::string_view filter)
 {
     std::string body;
@@ -92,7 +119,7 @@ std::string imap_folder::id() const
     return out;
 }
 
-std::string imap_store::email_id(std::string_view key)
+uint64_t imap_store::email_hash(std::string_view key)
 {
     // FNV-1a over the object's name past its folder, which a copy and a move keep: the same on every shard and at
     // every start, and as unique as those names are among a user's.
@@ -101,11 +128,12 @@ std::string imap_store::email_id(std::string_view key)
     uint64_t h = 1469598103934665603ull;
     for (const unsigned char c : base)
         h = (h ^ c) * 1099511628211ull;
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string out = "M";
-    for (int i = 60; i >= 0; i -= 4)
-        out += hex[(h >> i) & 15];
-    return out;
+    return h;
+}
+
+std::string imap_store::email_id(std::string_view key)
+{
+    return id_of_hash(email_hash(key));
 }
 
 bool imap_store::meta_name_ok(std::string_view entry)
@@ -1360,32 +1388,33 @@ void imap_store::read_text_filters(const std::string& name)
             ++at;
             continue;
         }
-        hold_filter(u, std::string(body.substr(1, id_len)), std::string(body.substr(1 + id_len)));
+        if (uint64_t h = 0; hash_of_id(body.substr(1, id_len), h))
+            hold_filter(u, h, std::string(body.substr(1 + id_len)));
         at += 12 + len;
     }
     u.filters_off += at;
 }
 
-std::string_view imap_store::text_filter_of(const std::string& name, const std::string& email_id)
+std::string_view imap_store::text_filter_of(const std::string& name, uint64_t email_hash)
 {
     const user_state& u = user(name);
-    const auto it = u.filters.find(email_id);
+    const auto it = u.filters.find(email_hash);
     return it == u.filters.end() ? std::string_view{} : std::string_view(it->second);
 }
 
-void imap_store::keep_text_filter(const std::string& name, const std::string& email_id, std::string filter)
+void imap_store::keep_text_filter(const std::string& name, uint64_t email_hash, std::string filter)
 {
     user_state& u = user(name);
-    u.filters_out += filter_record(email_id, filter);
-    hold_filter(u, email_id, std::move(filter));
+    u.filters_out += filter_record(id_of_hash(email_hash), filter);
+    hold_filter(u, email_hash, std::move(filter));
 }
 
-void imap_store::hold_filter(user_state& u, std::string id, std::string filter)
+void imap_store::hold_filter(user_state& u, uint64_t id, std::string filter)
 {
-    const auto [it, fresh] = u.filters.try_emplace(std::move(id));
-    const size_t was = fresh ? 0 : it->first.size() + it->second.size();
+    const auto [it, fresh] = u.filters.try_emplace(id);
+    const size_t was = fresh ? 0 : sizeof(id) + it->second.size();
     it->second = std::move(filter);
-    const size_t now = it->first.size() + it->second.size();
+    const size_t now = sizeof(id) + it->second.size();
     u.filters_bytes = u.filters_bytes + now - was;
     m_filter_bytes = m_filter_bytes + now - was;
 }
@@ -1418,14 +1447,14 @@ void imap_store::write_text_filters(const std::string& name, user_state& u)
     struct stat st{};
     if (u.filters_compacting || ::stat((u.base + ".fts").c_str(), &st) != 0 || st.st_size < (1 << 20))
         return;
-    std::set<std::string> live;
+    std::unordered_set<uint64_t> live;
     for (const auto& [n, f] : u.folders)
         for (const auto& m : f->msgs)
-            live.insert(email_id(m.key));
+            live.insert(email_hash(m.key));
     std::string keep;
     for (const auto& [id, f] : u.filters)
         if (live.count(id))
-            keep += filter_record(id, f);
+            keep += filter_record(id_of_hash(id), f);
     if (static_cast<uint64_t>(st.st_size) < 3 * keep.size())
         return;
     u.filters_compacting = true;
@@ -1821,6 +1850,19 @@ std::shared_ptr<const mime::part> imap_store::structure(const std::string& key,
     auto part = c.part;
     evict();
     return part;
+}
+
+bool imap_store::parsed(const std::string& key, std::shared_ptr<const std::string>& bytes,
+                        std::shared_ptr<const mime::part>& part)
+{
+    const auto it = m_cache.find(key);
+    if (it == m_cache.end() || !it->second.bytes || !it->second.part)
+        return false;
+    ++m_hits;
+    m_lru.splice(m_lru.begin(), m_lru, it->second.lru);
+    bytes = it->second.bytes;
+    part = it->second.part;
+    return true;
 }
 
 bool imap_store::parse_later(const std::string& key, const std::shared_ptr<const std::string>& bytes,

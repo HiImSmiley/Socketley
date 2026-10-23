@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   shard, which share each user's UIDs through a journal. A search reads the
   text decoded, not the attachments, and only the messages a filter of their
   trigrams does not rule out: a word in none of 2,000 messages is answered in
-  6 ms where reading them took 186. `socketley send`, a
+  0.2 ms where reading them took 19. `socketley send`, a
   script's `socketley.mail.send`, a storage's `mail://` notification target
   and `daemon.alert_mail` send through it. Measured against Postfix on this
   machine it took 7,140 messages of 1 KB a second from 50 clients to Postfix's

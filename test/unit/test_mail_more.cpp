@@ -17,6 +17,7 @@
 #include "runtime/mail/mail_text.h"
 #include "runtime/mail/mail_compose.h"
 #include "runtime/mail/pop3_session.h"
+#include "shared/util/ascii.h"
 #include "shared/util/inflate.h"
 
 using namespace socketley::mail;
@@ -297,6 +298,46 @@ TEST_CASE("search: what a client looks for is found decoded, and what an attachm
     CHECK(text_has(msg, head, &root, "c2VjcmV0") == false);
     CHECK(text_has(msg, head, &root, "secretinside") == false);
     CHECK(text_has(msg, head, &root, "report.bin"));
+}
+
+TEST_CASE("search: contains_ci finds just what a plain scan with letters of either case alike finds")
+{
+    // Few letters, both cases and a byte past ASCII, so needles repeat themselves and their first letter is everywhere.
+    std::mt19937 rng(11);
+    const std::string alphabet = "aAbBn \xc3";
+    const auto random_text = [&](size_t n) {
+        std::string t;
+        for (size_t i = 0; i < n; ++i)
+            t += alphabet[rng() % alphabet.size()];
+        return t;
+    };
+    const auto plain = [](std::string_view hay, std::string_view needle) {
+        for (size_t i = 0; i + needle.size() <= hay.size(); ++i)
+        {
+            size_t k = 0;
+            while (k < needle.size() && socketley::ascii::lower(hay[i + k]) == socketley::ascii::lower(needle[k]))
+                ++k;
+            if (k == needle.size())
+                return true;
+        }
+        return false;
+    };
+    size_t wrong = 0, found = 0;
+    for (int round = 0; round < 20000; ++round)
+    {
+        const std::string hay = random_text(rng() % 40), needle = random_text(1 + rng() % 6);
+        const bool want = plain(hay, needle);
+        found += want;
+        wrong += contains_ci(hay, needle) != want;
+    }
+    CHECK(wrong == 0);
+    // Both answers came up often enough to mean something.
+    CHECK(found > 2000);
+    CHECK(found < 18000);
+    // A needle longer than the stack holds, and one of a repeated letter that falls back at its last byte.
+    const std::string long_needle = std::string(100, 'a') + "B";
+    CHECK(contains_ci(std::string(300, 'A') + "b", long_needle));
+    CHECK(contains_ci(std::string(300, 'A') + "c", long_needle) == false);
 }
 
 TEST_CASE("search: a message's trigram filter lets through every string the search finds in it")

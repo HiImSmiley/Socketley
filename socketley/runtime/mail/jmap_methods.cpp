@@ -425,23 +425,57 @@ bool filters_out(const jvalue& f, int depth = 0)
     return any;
 }
 
-// Whether an Email whose trigram filter is `filter` may meet `f`: false only where it cannot.
-bool may_meet(const jvalue& f, std::string_view filter, int depth = 0)
+// What a trigram filter can say of a FilterCondition or a FilterOperator, read off it once for every Email a query tries.
+struct probe
 {
+    enum class kind : uint8_t { all, either, maybe, grams };
+    kind k{kind::all};
+    std::vector<probe> kids;
+    std::vector<uint64_t> grams;
+};
+
+probe probe_of(const jvalue& f, int depth = 0)
+{
+    probe p;
     if (const jvalue* conds = json::member(f, "conditions"); conds && conds->k == jvalue::kind::array)
     {
         const std::string_view op = json::string_of(f, "operator");
         // A NOT of what a filter says may be there cannot be ruled out by it.
         if (op == "NOT" || depth >= 16)
-            return true;
-        size_t may = 0;
-        for (const auto& x : conds->items)
-            may += may_meet(x, filter, depth + 1);
-        return op == "OR" ? may > 0 : may == conds->items.size();
+            p.k = probe::kind::maybe;
+        else
+        {
+            p.k = op == "OR" ? probe::kind::either : probe::kind::all;
+            for (const auto& x : conds->items)
+                p.kids.push_back(probe_of(x, depth + 1));
+        }
+        return p;
     }
-    bool may = true;
-    needles_of(f, [&](std::string_view v) { may = may && may_hold(filter, v); });
-    return may;
+    needles_of(f, [&](std::string_view v) {
+        probe g;
+        g.k = probe::kind::grams;
+        g.grams = trigrams_of(v);
+        p.kids.push_back(std::move(g));
+    });
+    return p;
+}
+
+// Whether an Email whose trigram filter is `filter` may meet what `p` was read off: false only where it cannot.
+bool may_meet(const probe& p, std::string_view filter)
+{
+    const auto may = [&](const probe& k) { return may_meet(k, filter); };
+    switch (p.k)
+    {
+    case probe::kind::all:
+        return std::all_of(p.kids.begin(), p.kids.end(), may);
+    case probe::kind::either:
+        return std::any_of(p.kids.begin(), p.kids.end(), may);
+    case probe::kind::grams:
+        return may_hold(filter, p.grams);
+    case probe::kind::maybe:
+        break;
+    }
+    return true;
 }
 
 // Whether an Email meets a FilterCondition or a FilterOperator, read off the index and what was read of it: `whole` its
@@ -1092,8 +1126,10 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
         std::string sort_by{"receivedAt"};
         bool ascending{false};
         bool looping{false}, waiting{false};
-        // Whether trigram filters may rule Emails out, and whether the one being read had none yet.
+        // Whether trigram filters may rule Emails out, what they can say of the filter, and whether the Email being
+        // read had none yet.
         bool filtering{false}, unfiltered{false};
+        probe sieve;
     };
     auto j = std::make_shared<job>();
     j->args = args;
@@ -1128,7 +1164,10 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
             j->all.push_back({imap_store::email_id(m.key), m, f->id(), {}, false});
     j->filtering = j->whole && filter && filters_out(*filter);
     if (j->filtering)
+    {
+        j->sieve = probe_of(*filter);
         m_store.read_text_filters(m_user);
+    }
     auto step = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak = step;
     *step = [this, j, weak, done, alive = m_alive] {
@@ -1151,9 +1190,9 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
             // An Email its trigram filter rules out is passed without being read; one without a filter is given one.
             if (j->filtering)
             {
-                const std::string_view f = m_store.text_filter_of(m_user, c.id);
+                const std::string_view f = m_store.text_filter_of(m_user, imap_store::email_hash(c.m.key));
                 j->unfiltered = f.empty();
-                if (!j->unfiltered && !may_meet(*filter, f))
+                if (!j->unfiltered && !may_meet(j->sieve, f))
                     continue;
             }
             j->waiting = true;
@@ -1170,8 +1209,8 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
                 if (j->filtering && j->unfiltered && root)
                 {
                     std::string tf = text_filter(whole, c.head, root.get());
-                    may = may_meet(*filter, tf);
-                    m_store.keep_text_filter(m_user, c.id, std::move(tf));
+                    may = may_meet(j->sieve, tf);
+                    m_store.keep_text_filter(m_user, imap_store::email_hash(c.m.key), std::move(tf));
                 }
                 c.hit = may && (!filter || meets(*filter, c, whole, root.get()));
                 // The header is kept only where the sort reads it.

@@ -86,12 +86,17 @@ uint32_t trigram(unsigned char a, unsigned char b, unsigned char c)
            static_cast<unsigned char>(lower(static_cast<char>(c)));
 }
 
-// The bits a trigram sets in a filter of 2^`log` bits, three of them.
-template <typename F>
-void bits_of(uint32_t key, unsigned log, F&& each)
+// A trigram's key mixed into the hash its bits are drawn from.
+uint64_t mixed(uint32_t key)
 {
     uint64_t h = key * 0x9E3779B97F4A7C15ull;
-    h ^= h >> 29;
+    return h ^ h >> 29;
+}
+
+// The bits a trigram of hash `h` sets in a filter of 2^`log` bits, three of them.
+template <typename F>
+void bits_of(uint64_t h, unsigned log, F&& each)
+{
     const uint32_t mask = (1u << log) - 1;
     const uint32_t h1 = static_cast<uint32_t>(h), h2 = static_cast<uint32_t>(h >> 32) | 1;
     for (uint32_t i = 0; i < 3; ++i)
@@ -113,20 +118,38 @@ bool contains_ci(std::string_view hay, std::string_view needle)
     if (hay.size() < m)
         return false;
     using socketley::ascii::lower;
-    std::vector<size_t> fail(m, 0);
+    // The needle in lower case and its failure table, on the stack for a needle of the length searches have.
+    constexpr size_t on_stack = 64;
+    char low_here[on_stack];
+    size_t fail_here[on_stack];
+    std::string low_heap;
+    std::vector<size_t> fail_heap;
+    char* low = low_here;
+    size_t* fail = fail_here;
+    if (m > on_stack)
+    {
+        low_heap.resize(m);
+        fail_heap.resize(m);
+        low = low_heap.data();
+        fail = fail_heap.data();
+    }
+    for (size_t i = 0; i < m; ++i)
+        low[i] = lower(needle[i]);
+    fail[0] = 0;
     for (size_t i = 1, k = 0; i < m; ++i)
     {
-        while (k > 0 && lower(needle[i]) != lower(needle[k]))
+        while (k > 0 && low[i] != low[k])
             k = fail[k - 1];
-        if (lower(needle[i]) == lower(needle[k]))
+        if (low[i] == low[k])
             ++k;
         fail[i] = k;
     }
     for (size_t i = 0, k = 0; i < hay.size(); ++i)
     {
-        while (k > 0 && lower(hay[i]) != lower(needle[k]))
+        const char c = lower(hay[i]);
+        while (k > 0 && c != low[k])
             k = fail[k - 1];
-        if (lower(hay[i]) == lower(needle[k]) && ++k == m)
+        if (c == low[k] && ++k == m)
             return true;
     }
     return false;
@@ -224,25 +247,38 @@ std::string text_filter(std::string_view msg, std::string_view head, const mime:
     out[1] = static_cast<char>(log);
     for (const auto p : pieces)
         for (size_t i = 0; i + 3 <= p.size(); ++i)
-            bits_of(trigram(static_cast<unsigned char>(p[i]), static_cast<unsigned char>(p[i + 1]),
-                            static_cast<unsigned char>(p[i + 2])),
+            bits_of(mixed(trigram(static_cast<unsigned char>(p[i]), static_cast<unsigned char>(p[i + 1]),
+                                  static_cast<unsigned char>(p[i + 2]))),
                     log, [&](uint32_t bit) { out[2 + (bit >> 3)] |= static_cast<char>(1u << (bit & 7)); });
     return out;
 }
 
 bool may_hold(std::string_view filter, std::string_view needle)
 {
-    if (needle.size() < 3 || filter.size() < 2 || filter[0] != filter_format)
+    return may_hold(filter, trigrams_of(needle));
+}
+
+std::vector<uint64_t> trigrams_of(std::string_view needle)
+{
+    std::vector<uint64_t> out;
+    for (size_t i = 0; i + 3 <= needle.size(); ++i)
+        out.push_back(mixed(trigram(static_cast<unsigned char>(needle[i]), static_cast<unsigned char>(needle[i + 1]),
+                                    static_cast<unsigned char>(needle[i + 2]))));
+    return out;
+}
+
+bool may_hold(std::string_view filter, const std::vector<uint64_t>& grams)
+{
+    if (grams.empty() || filter.size() < 2 || filter[0] != filter_format)
         return true;
     const auto log = static_cast<unsigned>(static_cast<unsigned char>(filter[1]));
     if (log < 10 || log > 15 || filter.size() != 2 + ((size_t{1} << log) >> 3))
         return true;
-    for (size_t i = 0; i + 3 <= needle.size(); ++i)
+    const auto* bits = reinterpret_cast<const unsigned char*>(filter.data() + 2);
+    for (const uint64_t h : grams)
     {
         bool all = true;
-        bits_of(trigram(static_cast<unsigned char>(needle[i]), static_cast<unsigned char>(needle[i + 1]),
-                        static_cast<unsigned char>(needle[i + 2])),
-                log, [&](uint32_t bit) { all = all && (filter[2 + (bit >> 3)] & (1u << (bit & 7))); });
+        bits_of(h, log, [&](uint32_t bit) { all = all && (bits[bit >> 3] & (1u << (bit & 7))); });
         if (!all)
             return false;
     }
