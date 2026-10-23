@@ -399,6 +399,41 @@ TEST_CASE("search: a trigram filter rules out nearly every string a message does
     CHECK(may_hold(filter, "secretinsidetheattachment") == false);
 }
 
+TEST_CASE("search: a filter is as large as the different trigrams a message holds, not its length")
+{
+    // A newsletter of one row a hundred and twenty times over has some 600 trigrams in 16 KB.
+    std::string rows;
+    for (int i = 0; i < 120; ++i)
+        rows += "<table><tr><td style=\"padding:0;font-family:Arial\"><a href=\"https://news.example.com/track?id=" +
+                std::to_string(i) + "\">Article " + std::to_string(i) + "</a></td></tr></table>\r\n";
+    const std::string letter = "From: news@example.com\r\nSubject: this week\r\nContent-Type: text/html\r\n\r\n" + rows;
+    const mime::part root = mime::parse(letter);
+    const std::string filter = text_filter(letter, header_block(letter), &root);
+    CHECK(filter.size() <= 2 + 512);
+    for (const char* held : {"Article 117", "track?id=99", "font-family:Arial", "this week"})
+        CHECK(may_hold(filter, held));
+    std::mt19937 rnd(5);
+    size_t through = 0;
+    for (int i = 0; i < 20000; ++i)
+    {
+        std::string w;
+        for (int k = 0; k < 8; ++k)
+            w += static_cast<char>('a' + rnd() % 26);
+        through += !contains_ci(letter, w) && may_hold(filter, w);
+    }
+    CHECK(through < 20);
+    // Text of many different words gets the largest filter.
+    std::string varied = "Subject: words\r\n\r\n";
+    while (varied.size() < 200000)
+    {
+        for (int k = 0; k < 7; ++k)
+            varied += static_cast<char>('a' + rnd() % 26);
+        varied += ' ';
+    }
+    const mime::part vroot = mime::parse(varied);
+    CHECK(text_filter(varied, header_block(varied), &vroot).size() == 2 + 4096);
+}
+
 TEST_CASE("search: past a mebibyte a message's filter holds anything, and an empty message's nothing")
 {
     std::string big = "Subject: big\r\n\r\n";

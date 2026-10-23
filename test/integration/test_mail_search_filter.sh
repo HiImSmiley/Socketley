@@ -10,6 +10,7 @@
 #   * what only an attachment holds found as if it were text, decoded or as written
 #   * no filter file kept for the next search, or one a restart or a damaged record makes a search answer wrongly
 #   * the kept filters not found by the messages they are for after a restart, so a search reads every message again
+#   * a message delivered or APPENDed without its filter, so the first search reads it to make one
 #   * JMAP's text or body filter reading the message as written, or answering otherwise than IMAP
 set -uo pipefail
 
@@ -110,11 +111,35 @@ def jsubjects(flt):
 say("JMAP text finds a word a soft break splits", jsubjects({"text": "extraordinarily"}) == ["quoted"], jsubjects({"text": "extraordinarily"}))
 say("JMAP body finds a word in a base64 Latin-1 part", jsubjects({"body": "zebrafish"}) == ["latin"], jsubjects({"body": "zebrafish"}))
 say("JMAP text does not find what only an attachment holds", jsubjects({"text": "secretinside"}) == [], jsubjects({"text": "secretinside"}))
-say("JMAP's NOT leaves the rest", len(jsubjects({"operator": "NOT", "conditions": [{"body": "zebrafish"}]})) == 43,
+say("JMAP's NOT leaves the rest, the five notes too", len(jsubjects({"operator": "NOT", "conditions": [{"body": "zebrafish"}]})) == 48,
     len(jsubjects({"operator": "NOT", "conditions": [{"body": "zebrafish"}]})))
 PY
 
-tally < <(python3 "$T/search.py" "$IM" "$JM" "first, reading every message" 2>&1)
+# A shard's figures reach the daemon a quarter of a second after they change, so each read waits a little longer.
+touched() { sleep 1.5; "$BIN" stats m 2>/dev/null | awk -F: '/^imap_(reads|cache_hits):/ {n += $2} END {print n + 0}'; }
+# Mail delivered or APPENDed is given its filter as it is stored, so even the first search touches none of it; the
+# filters reach the other shard through the file, written at the next tick.
+python3 - "$IM" <<'PY' >/dev/null 2>&1
+import imaplib, sys
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1])); M.login("alice", "alicepassword1"); M.create("Notes")
+for i in range(5):
+    M.append("Notes", None, None, ("From: alice@example.test\r\nSubject: note %d\r\n\r\na note of mine, %d\r\n" % (i, i)).encode())
+PY
+sleep 3
+T0=$(touched)
+HITS=$(python3 - "$IM" 2>&1 <<'PY'
+import imaplib, sys
+M = imaplib.IMAP4("127.0.0.1", int(sys.argv[1])); M.login("alice", "alicepassword1")
+n = []
+for box in ("INBOX", "Notes"):
+    M.select(box); n.append(len(M.uid("SEARCH", "BODY", "xylophonic")[1][0].split()))
+print(" ".join(map(str, n)))
+PY
+)
+T1=$(touched)
+if [ "$HITS" = "0 0" ] && [ "$T1" = "$T0" ]; then ok "the first search touches no message delivered or APPENDed"
+else bad "the first search touches no message delivered or APPENDed" "found $HITS, touched $((T1 - T0))"; fi
+tally < <(python3 "$T/search.py" "$IM" "$JM" "first" 2>&1)
 # The filters a search made are written at the store's next tick.
 sleep 3
 FTS=$(find "$T" -name 'alice.fts' 2>/dev/null | head -1)
@@ -124,9 +149,7 @@ tally < <(python3 "$T/search.py" "$IM" "$JM" "again, through the filters" 2>&1)
 
 "$BIN" stop m >/dev/null 2>&1; "$BIN" start m >/dev/null 2>&1
 for p in "$IM" "$JM"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens again" "$(tail -3 "$SOCKETLEY_DLOG")"; done
-# The first search after the restart has every message ruled out by the filters the file kept, and touches none: a
-# shard's figures reach the daemon a quarter of a second after they change, so each read waits a little longer.
-touched() { sleep 1.5; "$BIN" stats m 2>/dev/null | awk -F: '/^imap_(reads|cache_hits):/ {n += $2} END {print n + 0}'; }
+# The first search after the restart has every message ruled out by the filters the file kept, and touches none.
 T0=$(touched)
 HITS=$(python3 - "$IM" 2>&1 <<'PY'
 import imaplib, sys
@@ -154,4 +177,4 @@ for p in "$IM" "$JM"; do ready_tcp 127.0.0.1 "$p" || bad "port $p listens again"
 tally < <(python3 "$T/search.py" "$IM" "$JM" "past a damaged file" 2>&1)
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
-[ "$FAIL" -eq 0 ] && [ "$TOTAL" -eq 54 ] || exit 1
+[ "$FAIL" -eq 0 ] && [ "$TOTAL" -eq 55 ] || exit 1

@@ -1,6 +1,7 @@
 #include "mail_text.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -237,19 +238,30 @@ std::string text_filter(std::string_view msg, std::string_view head, const mime:
         bytes += p.size();
     if (bytes > filter_most_bytes)
         return std::string{filter_format, 0};
-    // Two bits a byte read, between 1,024 and 32,768 of them, are some five a trigram in a message's text: a word of
-    // eight letters it does not hold gets through about once in a million.
+    const auto each_trigram = [&](auto&& take) {
+        for (const auto p : pieces)
+            for (size_t i = 0; i + 3 <= p.size(); ++i)
+                take(mixed(trigram(static_cast<unsigned char>(p[i]), static_cast<unsigned char>(p[i + 1]),
+                                   static_cast<unsigned char>(p[i + 2]))));
+    };
+    // How many different trigrams the message holds, from the share of a map of 65,536 bits they leave clear.
+    std::vector<uint64_t> seen(1024, 0);
+    each_trigram([&](uint64_t h) { seen[(h >> 6) & 1023] |= uint64_t{1} << (h & 63); });
+    size_t clear = 0;
+    for (const uint64_t w : seen)
+        clear += 64 - static_cast<size_t>(__builtin_popcountll(w));
+    const double distinct = clear ? -65536.0 * std::log(static_cast<double>(clear) / 65536.0) : 65536.0;
+    // Five bits or more for each, between 1,024 and 32,768 of them: a word of eight letters the message does not hold
+    // gets through about once in a million.
     unsigned log = 10;
-    while (log < 15 && (size_t{1} << log) < bytes * 2)
+    while (log < 15 && static_cast<double>(size_t{1} << log) < 5 * distinct)
         ++log;
     std::string out(2 + ((size_t{1} << log) >> 3), '\0');
     out[0] = filter_format;
     out[1] = static_cast<char>(log);
-    for (const auto p : pieces)
-        for (size_t i = 0; i + 3 <= p.size(); ++i)
-            bits_of(mixed(trigram(static_cast<unsigned char>(p[i]), static_cast<unsigned char>(p[i + 1]),
-                                  static_cast<unsigned char>(p[i + 2]))),
-                    log, [&](uint32_t bit) { out[2 + (bit >> 3)] |= static_cast<char>(1u << (bit & 7)); });
+    each_trigram([&](uint64_t h) {
+        bits_of(h, log, [&](uint32_t bit) { out[2 + (bit >> 3)] |= static_cast<char>(1u << (bit & 7)); });
+    });
     return out;
 }
 

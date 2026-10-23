@@ -114,6 +114,8 @@ public:
     std::string_view text_filter_of(const std::string& user, uint64_t email_hash);
     // A message's filter kept for later searches, and written for every shard at the next tick.
     void keep_text_filter(const std::string& user, uint64_t email_hash, std::string filter);
+    // The filter of a message just stored, made on the pool from its bytes, so no search reads the message to make it.
+    void note_text(const std::string& user, const std::string& key, std::shared_ptr<const std::string> bytes);
     // A folder brought up to what the bucket holds, listed again where it was last listed longer than `max_age_ms` ago;
     // null when it does not exist and is not one every mailbox has.
     void open(const std::string& user, const std::string& folder, std::function<void(std::shared_ptr<imap_folder>)> done,
@@ -258,6 +260,8 @@ private:
         std::string filters_out;
         int64_t filters_used_ms{0};
         bool filters_compacting{false};
+        // The file's size when it was last weighed for compaction.
+        uint64_t filters_weighed{0};
     };
     user_state& user(const std::string& name);
     // A filter held in memory and counted against what every user's may take together.

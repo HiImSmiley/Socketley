@@ -13004,7 +13004,9 @@ since it last looked. SEARCH, SORT and THREAD, like JMAP's text, body and
 header filters, read a message's header as written and with its encoded words
 decoded and its text parts as written and with their transfer encoding and
 charset undone, not its attachments. A filter of each message's trigrams, made
-the first time a search reads the message and kept in
+as a delivery or an APPEND stores it (or, for one over a mebibyte delivered,
+the first time a search reads it), as large as the different trigrams it holds
+and kept in
 .IB state /mail/ name .imap/ user .fts
 for every shard, rules out what cannot hold the string asked for, so a search
 reads only the messages that may. A user's

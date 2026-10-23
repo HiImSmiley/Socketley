@@ -17,6 +17,7 @@
 #include "mail_mailbox.h"
 #include "mail_run.h"
 #include "mail_spool.h"
+#include "mail_text.h"
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/persist/paths.h"
 #include "../../shared/persist/read_file.h"
@@ -1409,6 +1410,23 @@ void imap_store::keep_text_filter(const std::string& name, uint64_t email_hash, 
     hold_filter(u, email_hash, std::move(filter));
 }
 
+void imap_store::note_text(const std::string& name, const std::string& key, std::shared_ptr<const std::string> bytes)
+{
+    if (!bytes || bytes->empty())
+        return;
+    auto filter = std::make_shared<std::string>();
+    m_run.pool().submit(
+        m_run.cpu_lane(),
+        [bytes, filter] {
+            const mime::part root = mime::parse(*bytes);
+            *filter = text_filter(*bytes, header_block(*bytes), &root);
+        },
+        [this, name, key, filter, alive = m_alive] {
+            if (*alive)
+                keep_text_filter(name, email_hash(key), std::move(*filter));
+        });
+}
+
 void imap_store::hold_filter(user_state& u, uint64_t id, std::string filter)
 {
     const auto [it, fresh] = u.filters.try_emplace(id);
@@ -1443,10 +1461,17 @@ void imap_store::write_text_filters(const std::string& name, user_state& u)
         ::close(fd);
     }
     u.filters_out.clear();
-    // A file grown past three times what the messages still there need is written again with theirs alone.
+    // A file grown past three times what the messages still there need is written again with theirs alone, weighed
+    // once it is twice what it was when last weighed.
     struct stat st{};
-    if (u.filters_compacting || ::stat((u.base + ".fts").c_str(), &st) != 0 || st.st_size < (1 << 20))
+    if (u.filters_compacting || ::stat((u.base + ".fts").c_str(), &st) != 0 || st.st_size < (1 << 20) ||
+        static_cast<uint64_t>(st.st_size) < 2 * u.filters_weighed)
         return;
+    u.filters_weighed = static_cast<uint64_t>(st.st_size);
+    // Against every record the file holds, which a shard that only delivers has not read, and not as a search.
+    const int64_t used = u.filters_used_ms;
+    read_text_filters(name);
+    u.filters_used_ms = used;
     std::unordered_set<uint64_t> live;
     for (const auto& [n, f] : u.folders)
         for (const auto& m : f->msgs)
@@ -1458,11 +1483,15 @@ void imap_store::write_text_filters(const std::string& name, user_state& u)
     if (static_cast<uint64_t>(st.st_size) < 3 * keep.size())
         return;
     u.filters_compacting = true;
-    m_run.pool().submit(0, [path = u.base + ".fts", keep = std::move(keep)] {
+    const uint64_t kept = keep.size();
+    // Off the lane the spool's syncs take, which a large file's write would hold up.
+    m_run.pool().submit(m_run.cpu_lane(), [path = u.base + ".fts", keep = std::move(keep)] {
         if (!socketley::replace_file(path, keep, socketley::durability::none)) {}
-    }, [this, name, alive = m_alive] {
-        if (*alive)
-            user(name).filters_compacting = false;
+    }, [this, name, kept, alive = m_alive] {
+        if (!*alive)
+            return;
+        user(name).filters_compacting = false;
+        user(name).filters_weighed = kept;
     });
 }
 
@@ -2276,8 +2305,9 @@ void imap_store::append(const std::string& name, const std::string& folder, std:
         done(refusal::quota, 0, 0);
         return;
     }
-    put_object(key, std::move(message),
-               [this, name, f, key, size, flags, keywords = std::move(keywords), date_ms, done](bool ok) {
+    auto bytes = std::make_shared<const std::string>(std::move(message));
+    put_object(key, *bytes,
+               [this, name, f, key, size, flags, keywords = std::move(keywords), date_ms, done, bytes](bool ok) {
         unreserve(name, size);
         if (!ok)
         {
@@ -2292,6 +2322,7 @@ void imap_store::append(const std::string& name, const std::string& folder, std:
             done(refusal::no_folder, 0, 0);
             return;
         }
+        note_text(name, key, bytes);
         done(refusal::none, f->uidvalidity, uid);
     });
 }

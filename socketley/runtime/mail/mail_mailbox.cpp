@@ -69,6 +69,8 @@ struct mailboxes::writing
     std::string from, subject;
     // The header block a filter's editheader left, written in place of the message's own.
     std::string header;
+    // The message as stored where it went in one piece, for the IMAP index's trigram filter of it.
+    std::shared_ptr<const std::string> whole;
     std::function<void(int, std::string)> done;
     bool retried{false};
 };
@@ -330,7 +332,14 @@ void mailboxes::put_small(const std::shared_ptr<writing>& w)
     rq.bucket = m_bucket;
     rq.key = w->key;
     rq.content_type = "message/rfc822";
-    rq.data = std::move(w->pending);
+    if (m_run.imap())
+    {
+        w->whole = std::make_shared<const std::string>(std::move(w->pending));
+        rq.data = *w->whole;
+    }
+    else
+        rq.data = std::move(w->pending);
+    w->pending.clear();
     if (!w->from.empty())
         rq.metadata.emplace_back("from", w->from);
     if (!w->subject.empty())
@@ -470,6 +479,7 @@ void mailboxes::finish(const std::shared_ptr<writing>& w, int code, std::string 
             {
                 imap->delivered(w->key.substr(0, first), w->key.substr(first + 1, last - first - 1), w->key, w->total,
                                 w->e->at_ms);
+                imap->note_text(w->key.substr(0, first), w->key, std::move(w->whole));
                 m_run.stored(w->key.substr(0, first), w->total);
             }
         }
