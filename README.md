@@ -1,11 +1,12 @@
 # Socketley
 
-A high-performance Linux daemon and CLI that manages network runtimes (servers, clients, proxies, Redis-compatible caches) in a Docker-like style - with clustering, WebSocket, Lua scripting, and io_uring async I/O.
+A high-performance Linux daemon and CLI that manages network runtimes (servers, clients, proxies, Redis-compatible caches, S3 storage, DNS, sign-in, documents, MQTT and mail) in a Docker-like style - with clustering, WebSocket, Lua scripting, and io_uring async I/O.
 
 **[Documentation](https://hiimsmiley.github.io/Socketley/)**
 
-> **TLS, on every role that has a handshake to put it on.** All four runtime
-> types do:
+> **TLS, on every role that has a handshake to put it on.** The four first
+> runtime types do, and so do storage, idp, db, mqtt and mail on their
+> listeners; dns refuses it:
 >
 > - a **server** listener, so one port serves `https://` and `wss://` too
 > - a **cache** listener, which also refuses to replicate out of one in cleartext
@@ -174,6 +175,12 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 - **Proxy**:HTTP/TCP reverse proxy with round-robin, random, or Lua-based routing
 - **Cache**:In-memory key-value store with strings, lists, sets, hashes, sorted sets, streams with consumer groups and blocking reads, TTL, pub/sub, RESP2 (Redis wire protocol), LRU eviction, persistence, leader-follower replication, and DB-backend Lua hooks for read-through / write-behind caching. It has no password, so it serves only this machine unless created with `--public` or given mutual TLS
 - **DNS**:Authoritative name server for zone files (RFC 1035 master format): UDP and TCP on one port, wildcards, aliases followed within the zone, delegations with glue, EDNS kept to 1232 bytes, truncation to TCP, AXFR to the secondaries `--transfer` names and NOTIFY to those `--notify` names, an edited zone served within a second, and response rate limiting. It answers for its own zones only — no recursion, nothing cached — so it is no open resolver. With `--publish <your IPs>` it also answers for the names runtimes are given with `--domain`, and it proves wildcard certificates over ACME DNS-01
+- **Storage**:An S3 endpoint over one directory that unmodified S3 clients use: SigV4, multipart uploads, versioning, object lock, lifecycle, replication, server-side encryption, event notifications, a cluster of nodes, and a web interface with drive, links, media and git repositories
+- **Sync**:A directory carried to a storage, out, in or both ways, one runtime per job
+- **IdP**:An OpenID Connect provider with its own accounts, the one sign-in for applications, proxies, storages and the dashboard
+- **DB**:JSON documents for applications, owned by an idp runtime's accounts: queries on declared indexes, transactions, a change stream, replication and scheduled backups
+- **MQTT**:A broker for MQTT 3.1, 3.1.1 and 5.0 on TCP, TLS and WebSocket, with sessions kept across restarts and rules that hand messages to the other runtimes
+- **Mail**:A mail server for a dns runtime's domains and an idp runtime's users: SMTP with SPF, DKIM, DMARC, DANE and MTA-STS, a spool synced before 250, mailboxes in a storage read over IMAP, POP3 and JMAP, Sieve filters and ManageSieve
 - **Lua scripting**:Per-runtime callbacks (`on_message`, `on_connect`, `on_auth`, `on_route`, etc.) with hot-reload, timers, HTTP client, cross-runtime pub/sub
 - **Cluster mode**:Multi-daemon discovery via shared directory, `@group` backend routing, Lua cluster API
 - **Sharding**:`--shards N` runs one runtime across N worker processes behind a single port via `SO_REUSEPORT`, on servers, proxies and caches — a sharded cache keeps one keyspace, so `mget`, `dbsize` and `publish` still answer for the whole runtime. On a **cache** add `--cluster` and point a cluster-aware client at it: behind one address the shard a connection lands on relays every key it does not own, which measured 1.75× for 3.95 cores at four shards against 2.80× slot-routed — see **Sharding a cache** under Performance
@@ -740,7 +747,7 @@ socketley stats myapp
 
 ```
 socketley daemon                          # start the daemon (systemd does this when installed)
-socketley create <type> <name> [flags]    # types: server, client, proxy, cache, storage, dns, sync
+socketley create <type> <name> [flags]    # types: server, client, proxy, cache, storage, dns, sync, idp, db, mqtt, mail
 socketley add <path> [--name <n>] [-s]    # register and manage an external SDK binary
 socketley attach <type> <name> <port> [--owner <n>] [--pid <pid>]  # register an external process
 socketley start <name|pattern>... [-i]    # start runtime(s), -i for interactive
@@ -761,6 +768,12 @@ socketley --lua <file.lua>                # run Lua orchestration script
 socketley cluster ls|ps|group|show|stats|watch  # multi-daemon cluster inspection
 socketley dashboard                       # print the web dashboard URL
 socketley ping                            # ask the daemon to identify itself
+socketley send <mail> --to <address>      # write and queue a message through a mail runtime
+socketley mail <mail> queue|show|flush|sieve ...  # a mail runtime's spool and its users' filters
+socketley idp-user <idp> add|passwd|list ...      # an idp runtime's accounts
+socketley db-backup|db-restore <db> <file>        # a db runtime to a file and back
+socketley mqtt-pub|mqtt-sub <mqtt> ...            # publish on a broker, or read from it
+socketley acme issue --domains <names>    # a certificate from Let's Encrypt
 socketley version                         # print the version; needs no daemon
 ```
 

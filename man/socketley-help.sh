@@ -1436,6 +1436,162 @@ flags_options() {
     echo "└────────────────────────┴─────────────────────────────────────┘"
     echo ""
 
+    echo -e "${BOLD}Storage Flags (S3 over a directory; man: STORAGE FLAGS):${NC}"
+    echo "┌────────────────────────┬─────────────────────────────────────┐"
+    echo "│ --dir <path>           │ Where the buckets live (required)   │"
+    echo "│ --access-key           │ One SigV4 key pair                  │"
+    echo "│ --secret-key           │                                     │"
+    echo "│ --credentials <file>   │ Several key pairs, one a line       │"
+    echo "│ --anonymous            │ Accept requests with no credentials │"
+    echo "│ --idp <runtime>        │ Web interface and WebDAV sign in    │"
+    echo "│                        │ there                               │"
+    echo "│ --domain <name,...>    │ Names for virtual-hosted buckets    │"
+    echo "│ --website-domain       │ Names buckets' websites answer on   │"
+    echo "│ <n,..>                 │                                     │"
+    echo "│ --fsync                │ When an answered write is on disk   │"
+    echo "│ always|interval|never  │                                     │"
+    echo "│ --sse-key-file <file>  │ Master key for server-side          │"
+    echo "│                        │ encryption                          │"
+    echo "│ --max-bytes <size>     │ Quota on the bytes the runtime      │"
+    echo "│                        │ holds                               │"
+    echo "│ --nodes <file>         │ Be a node of a cluster of storages  │"
+    echo "│ --tiers                │ Lifecycle tiers, event webhooks,    │"
+    echo "│ --notify-targets       │ replication endpoints               │"
+    echo "│ --replication-targets  │                                     │"
+    echo "│ <file>                 │                                     │"
+    echo "│ --scrub --compress     │ Read back, or compress, versions    │"
+    echo "│ <dur>                  │ this old                            │"
+    echo "│ --shards <N>           │ N workers on one port               │"
+    echo "└────────────────────────┴─────────────────────────────────────┘"
+    echo ""
+
+    echo -e "${BOLD}DNS Flags (authoritative name server; man: DNS FLAGS):${NC}"
+    echo "┌────────────────────────┬─────────────────────────────────────┐"
+    echo "│ --zone <name|file>     │ A zone to serve, once for each      │"
+    echo "│ --publish <addrs>      │ This machine's public IPv4/IPv6     │"
+    echo "│ --transfer <list>      │ Who may copy a zone by AXFR         │"
+    echo "│ --notify <list>        │ Secondaries told of a change        │"
+    echo "│ --proxy <name|none>    │ The entrance runtimes' names go to  │"
+    echo "│ --proxy-port <port>    │ The port that entrance listens on   │"
+    echo "│ --rrl <n>              │ Answers a second to one client /24  │"
+    echo "└────────────────────────┴─────────────────────────────────────┘"
+    echo ""
+
+    echo -e "${BOLD}Sync Flags (a directory carried to a storage; man: SYNC FLAGS):${NC}"
+    echo "┌────────────────────────┬─────────────────────────────────────┐"
+    echo "│ --dir <path>           │ The directory whose files are       │"
+    echo "│                        │ carried                             │"
+    echo "│ --storage <target,...> │ Where they go, the bucket last      │"
+    echo "│ --mode out|in|inout    │ Which way the files go              │"
+    echo "│ --credentials <file>   │ The key pair the job signs with     │"
+    echo "│ --prefix <key>         │ The key everything is written under │"
+    echo "│ --every <duration>     │ How often the whole tree is walked  │"
+    echo "│ --exclude <pat,...>    │ Shell patterns left out             │"
+    echo "│ --repositories <file>  │ Pull a user's git repositories      │"
+    echo "└────────────────────────┴─────────────────────────────────────┘"
+    echo ""
+
+    echo -e "${BOLD}IdP Flags (sign-in for applications; man: IDP FLAGS):${NC}"
+    echo "┌────────────────────────┬─────────────────────────────────────┐"
+    echo "│ --clients <file>       │ The applications that sign in       │"
+    echo "│                        │ through it                          │"
+    echo "│ --issuer <url>         │ The https address every token names │"
+    echo "│ --cookie-domain        │ Names that share the sign-in cookie │"
+    echo "│ <domain>               │                                     │"
+    echo "│ --shards <N>           │ Workers; shard 0 writes the         │"
+    echo "│                        │ accounts                            │"
+    echo "│ --tls --cert --key     │ Terminate TLS on its port           │"
+    echo "└────────────────────────┴─────────────────────────────────────┘"
+    echo ""
+
+    echo -e "${BOLD}DB Flags (JSON documents; man: DB FLAGS):${NC}"
+    echo "┌────────────────────────┬─────────────────────────────────────┐"
+    echo "│ --idp <runtime>        │ Whose accounts own documents        │"
+    echo "│ --schema <file>        │ Collections, who reaches them,      │"
+    echo "│                        │ indexes                             │"
+    echo "│ --keys <file>          │ Service keys for backends           │"
+    echo "│ --origins <list>       │ Web origins a browser may call from │"
+    echo "│ --max-bytes <size>     │ Most the documents hold (507 past   │"
+    echo "│                        │ it)                                 │"
+    echo "│ --cache <size>         │ Memory for documents last read      │"
+    echo "│                        │ (64M)                               │"
+    echo "│ --replicate <url>      │ Copy another database               │"
+    echo "│ --replicate-key <file> │ The secret of that database's key   │"
+    echo "│ --backup-dir <dir>     │ Where scheduled backups go          │"
+    echo "│ --backup-every         │ How often (1d), how many kept (7)   │"
+    echo "│ --backup-keep          │                                     │"
+    echo "│ --shards <N>           │ Workers; shard 0 writes             │"
+    echo "└────────────────────────┴─────────────────────────────────────┘"
+    echo ""
+
+    echo -e "${BOLD}MQTT Flags (a broker, 3.1.1 and 5.0; man: MQTT FLAGS):${NC}"
+    echo "┌────────────────────────┬─────────────────────────────────────┐"
+    echo "│ --anonymous            │ Let in clients without credentials  │"
+    echo "│ --users <file>         │ Password accounts (mqtt-passwd)     │"
+    echo "│ --idp <runtime>        │ Access tokens as passwords          │"
+    echo "│ --acl <file>           │ Who may publish and subscribe to    │"
+    echo "│                        │ what                                │"
+    echo "│ --routes <file>        │ Where messages go besides           │"
+    echo "│                        │ subscribers                         │"
+    echo "│ --ws <port>            │ MQTT over WebSocket on a second     │"
+    echo "│                        │ port                                │"
+    echo "│ --persistent <file|on> │ Snapshot of sessions and retained   │"
+    echo "│ --persistent-interval  │ How often changes reach it (1s)     │"
+    echo "│ <d>                    │                                     │"
+    echo "│ --max-packet <size>    │ Largest packet a client may send    │"
+    echo "│ --session-expiry <dur> │ Longest a session outlives its      │"
+    echo "│                        │ client                              │"
+    echo "│ --session-queue <n>    │ Messages kept for one session       │"
+    echo "│                        │ (1000)                              │"
+    echo "│ --retained-max <size>  │ Bytes retained messages take (64M)  │"
+    echo "│ --max-sessions <n>     │ Most sessions (100000)              │"
+    echo "│ --keepalive-max <s>    │ Longest keep alive granted (1200)   │"
+    echo "│ --shards <N>           │ One broker over N workers           │"
+    echo "└────────────────────────┴─────────────────────────────────────┘"
+    echo ""
+
+    echo -e "${BOLD}Mail Flags (SMTP, IMAP, POP3, JMAP; man: MAIL FLAGS):${NC}"
+    echo "┌────────────────────────┬─────────────────────────────────────┐"
+    echo "│ --mail-domain <d,...>  │ The domains whose mail it takes     │"
+    echo "│ --dns <runtime>        │ Its zones are the domains, given    │"
+    echo "│                        │ MX, SPF, DKIM, DMARC and SRV        │"
+    echo "│ --hostname <name>      │ Greeting and MX name                │"
+    echo "│                        │ (mail.<domain>)                     │"
+    echo "│ --idp <runtime>        │ Whose users have mailboxes and sign │"
+    echo "│                        │ in                                  │"
+    echo "│ --storage              │ Where the mailboxes are kept        │"
+    echo "│ <rt>[/bucket]          │                                     │"
+    echo "│ --users --aliases      │ Send-only accounts; extra addresses │"
+    echo "│ <file>                 │                                     │"
+    echo "│ --relay <smtp[s]://..> │ A smarthost for mail to elsewhere   │"
+    echo "│ --submission <port>    │ Users send with STARTTLS, e.g. 587  │"
+    echo "│ --submissions <port>   │ Users send over TLS, e.g. 465       │"
+    echo "│ --imap --imaps <port>  │ IMAP4rev1, STARTTLS or TLS          │"
+    echo "│ --pop3 --pop3s <port>  │ POP3, STLS or TLS                   │"
+    echo "│ --jmap <port>          │ JMAP over HTTPS                     │"
+    echo "│ --sieve <port>         │ ManageSieve for the users' filters  │"
+    echo "│ --lmtp <port>          │ This machine's programs, into       │"
+    echo "│                        │ mailboxes                           │"
+    echo "│ --tls --cert --key     │ Certificate for STARTTLS and TLS    │"
+    echo "│                        │ ports                               │"
+    echo "│ --no-reply             │ Send from no-reply@ and learn       │"
+    echo "│                        │ bounces                             │"
+    echo "│ --max-size <size>      │ Largest message taken (25M)         │"
+    echo "│ --queue-lifetime <dur> │ Tried this long, then bounced (5d)  │"
+    echo "│ --dkim-selector <name> │ Selector it signs under (skl)       │"
+    echo "│ --mta-sts              │ Publish an MTA-STS policy           │"
+    echo "│ enforce|testing        │                                     │"
+    echo "│ --dmarc-rua --tls-rpt  │ Where DMARC and TLS reports go      │"
+    echo "│ <a>                    │                                     │"
+    echo "│ --greylist <dur>       │ Greylist strangers this long        │"
+    echo "│ --dnsbl <zone,...>     │ DNS blocklists for strangers        │"
+    echo "│ --rspamd <url>         │ Rspamd that scans mail from         │"
+    echo "│                        │ elsewhere                           │"
+    echo "│ --default-quota <size> │ Quota where the account names none  │"
+    echo "│ --shards <N>           │ Workers; shard 0 takes the intake   │"
+    echo "└────────────────────────┴─────────────────────────────────────┘"
+    echo ""
+
     read -p "Press Enter to continue..." || true
     main_menu
 }
@@ -3345,7 +3501,7 @@ sdk_cross() {
 plain_help() {
     cat <<'EOF'
 socketley — a daemon for long-living network runtimes (server, client, proxy, cache, storage, dns, sync, idp,
-db, mqtt)
+db, mqtt, mail)
 
 USAGE
   socketley <command> [options]
@@ -3355,7 +3511,7 @@ USAGE
 
 RUNTIMES
   create <type> <name> [flags]   create a server, client, proxy, cache, storage, dns, sync, idp,
-                                 db, mqtt, or a manifest-registered type (man: REGISTERED TYPES)
+                                 db, mqtt, mail, or a manifest-registered type (man: REGISTERED TYPES)
   start|stop|restart <name>      lifecycle
   remove <name>                  remove a runtime
   ls | ps [-a] [--json]          list runtimes
@@ -3363,6 +3519,7 @@ RUNTIMES
   edit <name> [flags]            change a runtime's configuration
   rename <old> <new>             rename a runtime
   send <name> <data>             send through a runtime
+  send <mail> --to <address>     write and queue a message (--subject, --text, --html, --attach)
   reload | reload-lua <name>     stop and start on the stored configuration, or reload the Lua script
 
 OTHER
@@ -3372,6 +3529,13 @@ OTHER
   attach <type> <name> <port>    register a process the daemon did not start
   dashboard                      terminal dashboard
   ping                           is the daemon answering
+  settings [-a] [--json]         every SOCKETLEY_* setting and where it came from
+  acme issue --domains <names>   a certificate from Let's Encrypt
+  git-sync --url <url> ...       mirror a git repository into a storage library
+  idp-user <idp> add|passwd|...  an idp runtime's accounts
+  db-backup | db-restore         a db runtime to a file, or back from one
+  mail <mail> queue|show|flush   a mail runtime's spool; dns, suppressed, forgive
+  mail <mail> sieve <user> ...   a user's Sieve filters: list, get, put, check, activate
   mqtt-pub | mqtt-sub            publish on a broker, or read what it accepts
   mqtt-sessions | mqtt-kick      a broker's sessions, or one disconnected
   mqtt-retained | mqtt-passwd    retained messages, or a --users file's password

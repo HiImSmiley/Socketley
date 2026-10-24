@@ -11,6 +11,9 @@ examples/
 ├── server/             # Server flags, and the Lua handlers you attach to one
 ├── proxy/              # HTTP/TCP proxy configurations
 ├── cache/              # Caching, persistence, sharding
+├── storage/            # A storage runtime reached from a script, and its hooks
+├── mqtt/               # An MQTT broker, and servers that publish through one
+├── mail/               # A mail server for a domain, its filters and its script
 ├── lua-config/         # Lua configuration and scripting
 ├── cluster/            # Several daemons discovering each other
 ├── managed/            # Binaries the daemon supervises, via `socketley add`
@@ -85,6 +88,32 @@ examples/
   command naming another shard's key is answered by that shard. Shows the
   keyspace-wide commands answering for the runtime, the per-shard dumps, and a
   restart at a different shard count with every key still there
+
+### Storage
+- `storage-from-a-script.lua` - a server whose `save`, `load` and `list`
+  commands keep their notes as objects in a storage runtime, through
+  `socketley.storage`
+- `storage-hooks.lua` - policy and an audit trail on a storage runtime: its
+  hooks refuse what another storage's rules name, and write each change to an
+  audit bucket there
+
+### MQTT
+- `broker.sh` - a broker with a password file, read and write rules, a
+  WebSocket port and sessions kept across restarts, whose sensors' readings
+  also go to a cache's stream
+- `game-moves.lua` - a server that checks a game's moves and hands them to a
+  broker, where each player's session keeps them while the player is away
+- `presence.lua` - who is online, published retained on connect and
+  disconnect, and devices that sign in with a token of their own
+
+### Mail
+- `server.sh` - a mail server for a domain: a dns runtime given its MX, SPF,
+  DKIM, DMARC and SRV records, the users of an idp runtime with mailboxes in a
+  storage runtime, submission, IMAP on every shard, ManageSieve and a blocklist
+- `filter.sieve` - a user's Sieve filter: mailing lists into their own folders,
+  a vacation reply and flags, put with `socketley mail m sieve`
+- `orders.lua` - a mail runtime's script: mail to an address no mailbox has is
+  published to a broker and its sender answered
 
 ### Lua Config
 Each of these is a **pair**: a configuration read by the CLI, and a handler

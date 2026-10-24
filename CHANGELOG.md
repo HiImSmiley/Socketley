@@ -36,6 +36,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   machine it took 7,140 messages of 1 KB a second from 50 clients to Postfix's
   2,654, and against Dovecot it answered eight clients' SEARCH in a tenth of
   the time.
+- **An `mqtt` runtime: a broker for MQTT 3.1, 3.1.1 and 5.0, on TCP, TLS and
+  WebSocket.** QoS 0, 1 and 2, retained messages, wills, and sessions that keep
+  a client's subscriptions and the messages sent to them while it was away,
+  until it comes back or the session expires; of 5.0 also message expiry,
+  topic aliases, shared subscriptions, request and response, user properties
+  and reason codes. Clients sign in with a `--users` file (made with
+  `socketley mqtt-passwd`), with an `idp` runtime's access tokens or not at
+  all with `--anonymous`, and an `--acl` file in Mosquitto's form says who
+  reads and writes what. `--routes` hands messages to a cache, a db, a
+  storage, a server or another broker beside the subscribers, queued while a
+  target is down; a storage's events and a script's `socketley.mqtt.publish`
+  reach its subscribers. `--persistent` keeps sessions and retained messages
+  across a stop and a killed worker, `--shards N` is one broker over N
+  workers, and `on_auth`, `on_publish`, `on_subscribe` and `on_connect` let a
+  script decide. `mqtt-pub`, `mqtt-sub`, `mqtt-sessions`, `mqtt-kick` and
+  `mqtt-retained` reach it from the shell.
 - **A `db` runtime: JSON documents for applications, owned by the accounts
   of an `idp` runtime.** Collections of documents at `/c/<collection>/<id>`,
   read with GET, replaced with PUT, changed in place with PATCH (`set`,

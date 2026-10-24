@@ -5,7 +5,7 @@
 #
 # Passwords in a file of its own, rules for who reads and writes what, a
 # WebSocket port for browsers, and sessions kept across restarts. Then the
-# same messages handed to a cache's stream and a db, beside the subscribers.
+# sensors' readings handed to a cache's stream, beside the subscribers.
 # =============================================================================
 
 set -e
