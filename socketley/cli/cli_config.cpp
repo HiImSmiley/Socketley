@@ -536,7 +536,7 @@ int cli_export(int argc, char** argv)
             else if (k == "auth" && v.k == jvalue::kind::string && v.s.find(":/") != std::string::npos)
                 outside.insert(v.s.substr(v.s.find(':') + 1));
         }
-        std::string text = "-- " + name + ", a " + type + " runtime.\nreturn {\n    type = \"" + type + "\",\n    name = " +
+        std::string text = "-- The " + type + " runtime " + name + ".\nreturn {\n    type = \"" + type + "\",\n    name = " +
                            lua_setup::lua_literal([&] { jvalue s; s.k = jvalue::kind::string; s.s = name; return s; }()) + ",\n";
         for (const auto& [k, v] : settings)
             text += "    " + k + " = " + lua_setup::lua_literal(v) + ",\n";
