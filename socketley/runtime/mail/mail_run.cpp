@@ -2704,6 +2704,13 @@ std::string mail_run::records_text() const
     const auto keys = m_delivery ? m_delivery->dkim_records() : std::vector<std::pair<std::string, std::string>>{};
     // Mail for elsewhere through a smarthost leaves from its addresses, which SPF cannot name here, so it only softfails.
     const std::string spf = m_owner.get_relay().empty() ? "v=spf1 mx -all" : "v=spf1 mx ~all";
+    // The name it greets with has an SPF of its own, which a receiver checking the HELO identity asks (RFC 7208 2.3).
+    for (const auto& d : m_domains)
+        if (m_hostname.size() > d.size() + 1 && m_hostname.ends_with("." + d))
+        {
+            out += m_hostname + ". 300 IN TXT \"v=spf1 a -all\"\n";
+            break;
+        }
     for (const auto& d : m_domains)
     {
         out += d + ". 300 IN MX 10 " + m_hostname + ".\n";

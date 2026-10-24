@@ -13111,7 +13111,10 @@ unless
 .B \-\-hostname
 says another, the addresses the dns runtime's
 .B \-\-publish
-gives its names. A record the zone file has at the name wins. With
+gives its names, and an SPF record of its own,
+.BR "v=spf1 a \-all" ,
+for a receiver that checks the name it greets with (RFC 7208 2.3). A record the
+zone file has at the name wins. With
 .B \-\-relay
 SPF ends in ~all, since mail leaves from the smarthost's addresses. Without a
 dns runtime,

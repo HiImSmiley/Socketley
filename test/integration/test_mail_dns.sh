@@ -78,6 +78,7 @@ check "the zone has its MX, naming its host" "$(q example.test MX)" "10 mail.exa
 check "and its host the dns runtime's address" "$(q mail.example.test A)" "192.0.2.10"
 check "and SPF for its exchanger" "$(q example.test TXT)" '"v=spf1 mx -all"'
 check "and DMARC" "$(q _dmarc.example.test TXT)" '"v=DMARC1; p=quarantine; adkim=r; aspf=r"'
+check "and SPF for the name it greets with, which a receiver checks as well (RFC 7208 2.3)" "$(q mail.example.test TXT)" '"v=spf1 a -all"'
 served=$(q skl._domainkey.example.test TXT | tr -d '" \n')
 want=$("$BIN" mail m dns 2>/dev/null | sed -n 's/^skl._domainkey.example.test. 300 IN TXT "\(.*\)"$/\1/p' | tr -d ' ')
 [ -n "$want" ] && [ "$served" = "$want" ] && ok "and its DKIM key, whole across the 255-byte strings" \
@@ -90,7 +91,7 @@ tlsa=$("$BIN" mail m dns 2>/dev/null | sed -n 's/^_25._tcp.mail.example.test. 30
 want=$(openssl x509 -in "$T/cert.pem" -noout -pubkey | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
 check "and DANE's TLSA for its certificate's key (RFC 7672)" "$tlsa" "$want"
 check "which the dns runtime serves" "$(q _25._tcp.mail.example.test TLSA | tr -d ' ' | tr 'A-F' 'a-f')" "311$want"
-check "socketley mail dns prints the seven for a zone kept elsewhere" "$("$BIN" mail m dns 2>/dev/null | wc -l)" "7"
+check "socketley mail dns prints the eight for a zone kept elsewhere" "$("$BIN" mail m dns 2>/dev/null | wc -l)" "8"
 
 # ─── no-reply ───────────────────────────────────────────────────────────────
 "$BIN" send m --to amy@remote.test --subject "notice" --text "noreply body" >/dev/null 2>&1
