@@ -811,6 +811,7 @@ int cli_mail_overview(const char* runtime)
               << "  received   " << stat("mail_received") << ", stored in mailboxes " << stat("mail_stored") << "\n"
               << "  lists      " << stat("mail_suppressed") << " suppressed after a bounce, " << stat("mail_unsubscribed")
               << " unsubscribed\n"
+              << (stat("mail_self_listed_by") == "0" ? std::string() : "  BLOCKLISTED its address is on " + stat("mail_self_listed_by") + "\n")
               << "  spam       " << (cfg_s("rspamd").empty() ? "" : "scored by " + cfg_s("rspamd") + ", else ")
               << "learned from the users: " << stat("mail_bayes_spam") << " spam, " << stat("mail_bayes_ham")
               << " not, " << stat("mail_bayes_junked") << " put in Junk\n"
@@ -821,10 +822,63 @@ int cli_mail_overview(const char* runtime)
 
 }   // namespace
 
-// `socketley mail <mail>`, or `socketley mail <mail> queue|show|flush|drop|dns|suppressed|forgive|unsubscribed|
-// resubscribe [arg]`.
+namespace
+{
+
+constexpr std::string_view mail_verbs[] = {"queue", "show", "flush", "drop", "dns", "suppressed", "forgive",
+                                           "sieve", "unsubscribed", "resubscribe", "learn", "trace", "usage"};
+
+// The one mail runtime the daemon has, for a command that names none; empty, said why, where there is none or more.
+std::string only_mail_runtime()
+{
+    std::string listing;
+    if (const int rc = ipc_send("ls --json", listing); rc < 0)
+    {
+        ipc_report_failure(rc);
+        return {};
+    }
+    socketley::json::jvalue all;
+    socketley::json::json_policy any;
+    any.object_root = false;
+    std::vector<std::string> names;
+    if (socketley::json::json_reader(trimmed_text(listing), any).document(all))
+        for (const auto& r : all.items)
+            if (socketley::json::string_of(r, "type") == "mail")
+                names.emplace_back(socketley::json::string_of(r, "name"));
+    if (names.size() == 1)
+        return names.front();
+    std::string list;
+    for (const auto& n : names)
+        list += (list.empty() ? "" : ", ") + n;
+    std::cout << (names.empty() ? std::string("there is no mail runtime\n")
+                                : "name the mail runtime, one of " + list + ": socketley mail <mail> ...\n");
+    return {};
+}
+
+}   // namespace
+
+// `socketley mail [<mail>]`, or `socketley mail [<mail>] queue|show|flush|drop|dns|suppressed|forgive|unsubscribed|
+// resubscribe|learn|sieve [arg]`: the runtime's name may go unsaid where the daemon has one mail runtime alone.
 int cli_mail(int argc, char** argv)
 {
+    std::vector<char*> args(argv, argv + argc);
+    std::string only;
+    const bool verb_first = argc >= 3 && std::find(std::begin(mail_verbs), std::end(mail_verbs), argv[2]) != std::end(mail_verbs);
+    if (argc == 2 || verb_first)
+    {
+        // A mail runtime whose name is a verb is still that runtime.
+        std::string shown;
+        const bool named = verb_first && ipc_send("show " + std::string(argv[2]), shown) == 0 &&
+                           shown.find("\"type\": \"mail\"") != std::string::npos;
+        if (!named)
+        {
+            if (only = only_mail_runtime(); only.empty())
+                return 1;
+            args.insert(args.begin() + 2, only.data());
+        }
+    }
+    argc = static_cast<int>(args.size());
+    argv = args.data();
     if (argc == 3)
         return cli_mail_overview(argv[2]);
     if (argc < 4)
@@ -833,30 +887,65 @@ int cli_mail(int argc, char** argv)
         return 1;
     }
     const std::string_view verb = argv[3];
-    if (verb != "queue" && verb != "show" && verb != "flush" && verb != "drop" && verb != "dns" &&
-        verb != "suppressed" && verb != "forgive" && verb != "sieve" && verb != "unsubscribed" &&
-        verb != "resubscribe" && verb != "learn")
+    if (std::find(std::begin(mail_verbs), std::end(mail_verbs), verb) == std::end(mail_verbs))
     {
         std::cerr << command_usage::line("mail");
         return 1;
     }
     if (verb == "sieve")
         return cli_mail_sieve(argc, argv);
-    // `learn <user> spam|ham <folder>`: the three in one argument, as the runtime reads them.
+    // `learn <user>/<folder> --as spam|ham`: the user, the class and the folder in one argument, as the runtime reads them.
     if (verb == "learn")
     {
-        if (argc != 7 || (std::string_view(argv[5]) != "spam" && std::string_view(argv[5]) != "ham"))
+        const std::string_view where = argc == 7 ? argv[4] : "";
+        const size_t slash = where.find('/');
+        const std::string_view as = argc == 7 ? argv[6] : "";
+        if (argc != 7 || std::string_view(argv[5]) != "--as" || (as != "spam" && as != "ham") || slash == 0 ||
+            slash == std::string_view::npos || slash + 1 == where.size())
         {
-            std::cerr << "usage: socketley mail <mail> learn <user> spam|ham <folder>\n";
+            std::cerr << "usage: socketley mail [<mail>] learn <user>/<folder> --as spam|ham\n";
             return 1;
         }
         std::string cmd = "mail ";
         ipc_frame::append_arg(cmd, argv[2]);
         cmd += " learn ";
-        ipc_frame::append_arg(cmd, socketley::base64::encode(std::string(argv[4]) + "\n" + argv[5] + "\n" + argv[6]));
+        ipc_frame::append_arg(cmd, socketley::base64::encode(std::string(where.substr(0, slash)) + "\n" + std::string(as) +
+                                                             "\n" + std::string(where.substr(slash + 1))));
         return ask(cmd);
     }
-    if ((verb == "show" || verb == "drop" || verb == "forgive" || verb == "resubscribe") && argc < 5)
+    // `usage` alone is every user of the runtime's idp, asked of the idp here.
+    if (verb == "usage" && argc == 4)
+    {
+        std::string shown, list;
+        socketley::json::jvalue cfg;
+        if (ipc_send("show " + std::string(argv[2]), shown) != 0 || !socketley::json::json_reader(trimmed_text(shown)).document(cfg) ||
+            socketley::json::string_of(cfg, "idp").empty())
+        {
+            std::cout << "usage names users' mailboxes, which a mail runtime with --idp keeps\n";
+            return 1;
+        }
+        if (ipc_send("idp-user " + std::string(socketley::json::string_of(cfg, "idp")) + " list", list) != 0)
+        {
+            std::cout << list;
+            return 1;
+        }
+        std::string users;
+        for (std::string_view rest = list; !rest.empty();)
+        {
+            const size_t nl = rest.find('\n');
+            const std::string_view line = rest.substr(0, nl);
+            rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+            const std::string_view name = line.substr(0, line.find('\t'));
+            if (!name.empty())
+                users += (users.empty() ? "" : ",") + std::string(name);
+        }
+        std::string cmd = "mail ";
+        ipc_frame::append_arg(cmd, argv[2]);
+        cmd += " usage ";
+        ipc_frame::append_arg(cmd, users);
+        return ask(cmd);
+    }
+    if ((verb == "show" || verb == "drop" || verb == "forgive" || verb == "resubscribe" || verb == "trace") && argc < 5)
     {
         std::cerr << command_usage::line("mail");
         return 1;

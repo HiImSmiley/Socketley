@@ -269,6 +269,7 @@ struct runtime_config
     uint64_t mail_max_size = 25ull << 20;
     uint32_t mail_max_rcpt = 100;
     uint32_t mail_lifetime = 5 * 86400;
+    uint32_t mail_autoexpunge = 0;
     std::string mail_selector = "skl";
 
     // A registered type's own fields in declaration order, opaque here, held

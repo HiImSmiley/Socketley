@@ -205,7 +205,7 @@ inline constexpr setting table[] = {
     {"SOCKETLEY_MAIL_BAYES_FOLD_MS", kind::number, audience::test, 100, no_max, "600000",
      "milliseconds a mail runtime's spam filter leaves what the shards learned in its journal before it is folded in"},
     {"SOCKETLEY_MAIL_QUEUE_SCALE", kind::number, audience::test, 1, 100000, "1",
-     "how many times faster a mail runtime's retries and queue lifetime run"},
+     "how many times faster a mail runtime's retries, queue lifetime and --autoexpunge run"},
     {"SOCKETLEY_MAIL_BUSY_HOLD_MS", kind::number, audience::test, 0, no_max, "30000",
      "milliseconds a mail runtime opens no connection to a domain after a 421 from it"},
     {"SOCKETLEY_MAIL_SPOOL_KEEP_BYTES", kind::number, audience::test, 0, no_max, "67108864",

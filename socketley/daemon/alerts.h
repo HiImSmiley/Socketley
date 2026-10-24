@@ -35,6 +35,8 @@ struct facts
     // A sync's failures since the last thing it carried, and what it said last.
     uint64_t failing{0};
     std::string error;
+    // A mail runtime's messages waiting, and whether a blocklist names the address it sends from.
+    uint64_t queued{0}, listed{0};
 };
 
 struct alert

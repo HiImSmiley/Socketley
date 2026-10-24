@@ -49,6 +49,8 @@ struct imap_message
     std::vector<std::string> keywords;
     // The conversation it is part of, a hash of its root's Message-ID (imap_order::thread_of); 0 until it is known.
     uint64_t    thread{0};
+    // When it was put into its folder, 0 where that was before the store kept it (RFC 8514's SAVEDATE).
+    int64_t     saved_ms{0};
 };
 
 // What STORE or APPEND asks of a message's keywords: none, these as they are, or these added or taken away.
@@ -313,6 +315,9 @@ private:
 
     mail_run& m_run;
     std::unordered_map<std::string, user_state> m_users;
+    int64_t m_expunge_swept_ms{0};
+    // Junk and Trash of every user known emptied of what they held longer than --autoexpunge.
+    void autoexpunge(int64_t now);
     // Bytes read, least recently used first out, up to cache_max.
     struct cached
     {

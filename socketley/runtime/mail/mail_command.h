@@ -35,6 +35,10 @@ enum class verb : uint8_t
     // A folder of a user's learned by the spam filter: the argument is the user, spam or ham, and the folder, a line
     // each, in base64.
     learn        = 13,
+    // What became of recent mail from or to an address, the argument.
+    trace        = 14,
+    // How much the mailboxes of the users, the argument's comma-separated names, hold against their quota.
+    usage        = 15,
 };
 
 struct attachment

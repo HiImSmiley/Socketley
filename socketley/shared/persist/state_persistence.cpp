@@ -784,6 +784,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.mail_max_size = ml->get_max_size();
             cfg.mail_max_rcpt = ml->get_max_recipients();
             cfg.mail_lifetime = ml->get_queue_lifetime();
+            cfg.mail_autoexpunge = ml->get_autoexpunge();
             cfg.mail_selector = std::string(ml->get_dkim_selector());
             break;
         }
@@ -1275,6 +1276,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             append_int_field("max_size", cfg.mail_max_size);
             append_int_field("max_recipients", cfg.mail_max_rcpt);
             append_int_field("queue_lifetime", cfg.mail_lifetime);
+            if (cfg.mail_autoexpunge)
+                append_int_field("autoexpunge", cfg.mail_autoexpunge);
             append_str_field("dkim_selector", cfg.mail_selector);
             break;
     }
@@ -1558,6 +1561,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.mail_max_size = json_get_size(json, "max_size", 25ull << 20);
             cfg.mail_max_rcpt = json_get_uint32(json, "max_recipients", 100);
             cfg.mail_lifetime = json_get_uint32(json, "queue_lifetime", 5 * 86400);
+            cfg.mail_autoexpunge = json_get_uint32(json, "autoexpunge", 0);
             if (json_has_key(json, "dkim_selector"))
                 cfg.mail_selector = json_get_string(json, "dkim_selector");
             break;

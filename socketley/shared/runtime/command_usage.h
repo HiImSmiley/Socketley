@@ -57,8 +57,8 @@ inline constexpr std::string_view for_verb(std::string_view verb)
     if (verb == "mqtt-retained") return "mqtt-retained <mqtt> [filter] | --clear <topic>";
     if (verb == "mqtt-passwd")   return "mqtt-passwd <file> <user> [--delete]";
     if (verb == "mail")
-        return "mail <mail> [queue [filter] | show <id> | flush [id] | drop <id> | dns | suppressed | forgive <address> | "
-               "unsubscribed | resubscribe <address> | learn <user> spam|ham <folder> | "
+        return "mail [<mail>] [queue [filter] | show <id> | flush [id] | drop <id> | dns [--check] | suppressed | forgive <address> | "
+               "unsubscribed | resubscribe <address> | learn <user>/<folder> --as spam|ham | trace <address> | usage [user] | "
                "sieve <user> list|get <name>|put <name> <file|->|check <file|->|activate <name>|deactivate|delete <name>]";
     if (verb == "cluster")
         return "cluster [ls|ps|group <name>|stats|watch|show <daemon>|raft-status|placement|"

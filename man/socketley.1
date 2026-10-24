@@ -1135,7 +1135,8 @@ socketley mqtt\-passwd /etc/socketley/mqtt.users sensor\-17
 .fi
 .RE
 .TP
-.BI "mail " "mail " "\fR[\fBqueue \fR[\fIfilter\fR] | \fBshow \fIid\fR | \fBflush \fR[\fIid\fR] | \fBdrop \fIid\fR | \fBdns\fR | \fBsuppressed\fR | \fBforgive \fIaddress\fR | \fBunsubscribed\fR | \fBresubscribe \fIaddress\fR | \fBlearn \fIuser \fBspam\fR|\fBham \fIfolder\fR | \fBsieve \fIuser \fBlist\fR|\fBget \fIname\fR|\fBput \fIname file\fR|\fBcheck \fIfile\fR|\fBactivate \fIname\fR|\fBdeactivate\fR|\fBdelete \fIname\fR]"
+.BI "mail " "\fR[\fImail\fR] " "\fR[\fBqueue \fR[\fIfilter\fR] | \fBshow \fIid\fR | \fBflush \fR[\fIid\fR] | \fBdrop \fIid\fR | \fBdns \fR[\fB\-\-check\fR] | \fBtrace \fIaddress\fR | \fBusage \fR[\fIuser\fR] | \fBsuppressed\fR | \fBforgive \fIaddress\fR | \fBunsubscribed\fR | \fBresubscribe \fIaddress\fR | \fBlearn \fIuser\fB/\fIfolder \fB\-\-as spam\fR|\fBham\fR | \fBsieve \fIuser \fBlist\fR|\fBget \fIname\fR|\fBput \fIname file\fR|\fBcheck \fIfile\fR|\fBactivate \fIname\fR|\fBdeactivate\fR|\fBdelete \fIname\fR]"
+The runtime's name may go unsaid where the daemon has one mail runtime alone.
 Alone, a few lines of what the runtime is and how it does: its domains, users
 and mailboxes, its ports, the webmail's name, what waits, what was delivered,
 deferred, bounced, received and stored, and its lists. A mail runtime's spool,
@@ -1153,7 +1154,19 @@ tries every message, or the one named, now;
 deletes one, told to nobody.
 .B dns
 prints the MX, SPF, DKIM, DMARC and SRV records its domains need, for a zone kept
-elsewhere than a dns runtime of this daemon;
+elsewhere than a dns runtime of this daemon, and with
+.B \-\-check
+asks this machine's resolvers for each and says which are there, missing or
+otherwise;
+.B trace
+.I address
+says what became of the latest mail from or to an address, the newest last:
+delivered, deferred with why, bounced, or refused and with what answer, each
+also a line of the log;
+.B usage
+.RI [ user ]
+what each user's mailboxes hold against their quota, every user of its idp
+where none is named;
 .B suppressed
 the addresses bounces said are dead, which are not mailed again until
 .B forgive
@@ -11339,7 +11352,22 @@ is
 .B socketley_storage_stat
 with its name as the label
 .BR stat ,
-so nothing a runtime counts is missing from a scrape.
+so nothing a runtime counts is missing from a scrape. A mail runtime's figures
+are
+.BR socketley_mail_received_total ,
+.BR _delivered_total ,
+.BR _deferred_total ,
+.BR _bounced_total ,
+.BR _stored_total ,
+.BR _quarantined_total ,
+.B _auth_failed_total
+and the gauges
+.B socketley_mail_queued
+and
+.BR _queued_bytes ,
+the rest
+.B socketley_mail_stat
+by name.
 .SS Lua
 A script attached with
 .B \-\-lua
@@ -13370,7 +13398,7 @@ function on_rcpt(r, default)          -- r.to, r.from, r.peer, r.user
     if r.to == "orders@example.com" then return true end   -- the script's alone
     if r.from:match("@spam%.test$") then return false end  -- refused 550
 end                                   -- nil keeps the default
-function on_message(m)                -- m.id, m.from, m.to, m.size, m.subject, m.message
+function on_message(m)                -- m.id, m.from, m.to, m.size, m.subject, m.message, m.peer, m.user
     socketley.mqtt.publish("bus", "mail/in", m.subject or "", { qos = 1 })
 end
 .fi
@@ -13452,6 +13480,11 @@ answered 452.
 .TP
 .BI "\-\-queue\-lifetime " duration
 How long a message is tried before it is bounced, 1m to 30d, 5d unless given.
+.TP
+.BI "\-\-autoexpunge " duration
+How long a message stays in a user's Junk or Trash, from when it was put there,
+before it is expunged, 1h to 3650d; never unless given. The first shard sweeps
+every user it has met hourly.
 .TP
 .BI "\-\-dkim\-selector " name
 The selector its DKIM key is published and signed under, skl unless given; its
@@ -13545,9 +13578,9 @@ links' hosts, weighed as SpamBayes does (Robinson's chi\-square of Fisher); a
 message is learned once, and one said otherwise is learned again. Once it has
 learned 20 of each, every message is given its score as x\-spam\-bayes, and one
 of 0.9 or more is put in Junk; nothing is refused for it.
-.B "socketley mail"
-.I m
-.B learn
+.B "socketley mail learn"
+.IB user / folder
+.B \-\-as spam\fR|\fBham
 teaches it a folder at once, and
 .B "socketley stats"
 says how much it learned
@@ -16344,7 +16377,11 @@ memory, at 90% (critical at 95%); a storage runtime at 90% of its
 .B \-\-max\-bytes
 or a cache that refuses writes at 90% of its
 .BR \-\-maxmemory ;
-a git repository whose last pull failed. A level that comes and goes is raised
+a git repository whose last pull failed; a mail runtime with a hundred messages
+waiting for five readings (critical at a thousand), or whose own address a
+blocklist of its
+.B \-\-dnsbl
+names. A level that comes and goes is raised
 after three readings and every alert is cleared after three without it; both
 are logged, listed on the page with the last hundred, shown on the overview,
 and \(em with

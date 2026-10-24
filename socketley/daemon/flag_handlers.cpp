@@ -2084,6 +2084,16 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             ml->set_max_recipients(static_cast<uint32_t>(n));
             return 0;
         }
+        case fnv1a("--autoexpunge"):
+        {
+            uint64_t secs = 0;
+            if (!take_duration(pa, i, 3600, 3650ull * 86400,
+                               "--autoexpunge requires how long Junk and Trash keep a message, from 1h to 3650d, such as 30d\n",
+                               secs))
+                return 1;
+            ml->set_autoexpunge(static_cast<uint32_t>(secs));
+            return 0;
+        }
         case fnv1a("--queue-lifetime"):
         {
             uint64_t secs = 0;

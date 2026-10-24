@@ -1,4 +1,5 @@
 #include "mail_run.h"
+#include "mail_text.h"
 
 #include <openssl/crypto.h>
 
@@ -692,6 +693,10 @@ bool mail_run::start(std::string& why)
     if (::chmod(m_state_dir.c_str(), 0700) != 0) {}
     if (!m_spool.open(m_state_dir + "/spool", false, why))
         return false;
+    m_spool.on_outcome = [this](const spool_entry& e, size_t i, rcpt_state s) {
+        trace(e.id, e.from, e.rcpts[i].addr,
+              s == rcpt_state::delivered ? "delivered" : s == rcpt_state::failed ? "bounced" : "deferred", e.rcpts[i].why);
+    };
     m_domains = m_owner.domains();
     m_arc_trusted.clear();
     for (std::string_view rest = m_owner.get_arc_trust(); !rest.empty();)
@@ -1893,6 +1898,12 @@ void mail_run::conn::rcpt_to(const address& to, std::function<void(rcpt_verdict)
     mail_run& r = *run;
     // The script has the last word on each recipient, told what would be answered without it.
     const std::string sender = smtp->sender().text(), who = smtp->user();
+    // A recipient refused for good is traced, so `mail trace` can say why mail never came.
+    answer = [&r, inner = std::move(answer), sender, rcpt = to.text()](rcpt_verdict v) {
+        if (v.code >= 500)
+            r.trace("", sender, rcpt, "refused", std::to_string(v.code) + " " + v.text);
+        inner(std::move(v));
+    };
     std::function<void(rcpt_verdict)> done = [&r, answer, to, sender, who, ip = ip](rcpt_verdict v) {
         if (!r.m_lua || !r.m_lua->wants_rcpt())
         {
@@ -2067,6 +2078,19 @@ void mail_run::conn::release_head(bool at_end)
 void mail_run::conn::data_end(std::function<void(rcpt_verdict)> done)
 {
     mail_run& r = *run;
+    // A message refused for good once it was whole -- by DMARC, the spam filter, a rule -- is traced for each recipient.
+    if (entry)
+    {
+        std::vector<std::string> rcpts;
+        for (const auto& rc : entry->rcpts)
+            rcpts.push_back(rc.addr);
+        done = [&r, inner = std::move(done), id = entry->id, from = entry->from, rcpts](rcpt_verdict v) {
+            if (v.code >= 500)
+                for (const auto& rc : rcpts)
+                    r.trace(id, from, rc, "refused", std::to_string(v.code) + " " + v.text);
+            inner(std::move(v));
+        };
+    }
     if (holding)
         release_head(true);
     const uint64_t w = writer;
@@ -2583,6 +2607,15 @@ void mail_run::arm_tick()
 void mail_run::tick()
 {
     const int64_t now = wall::now_ms_coarse();
+    // Whether a blocklist names this host: as it starts, and hourly after that.
+    if (m_owner.get_shard_index() == 0 && m_dnsbl && m_dnsbl->enabled())
+    {
+        if (!m_self_checked_ms || now - m_self_checked_ms > 3600000)
+        {
+            m_self_checked_ms = now;
+            check_own_listing();
+        }
+    }
     // What the shards learned, into the table; folded into its file every ten minutes or past 8 MiB of journal.
     if (m_bayes)
     {
@@ -2966,8 +2999,18 @@ void mail_run::command(uint64_t ticket, std::string_view payload)
             answer(show_text(arg));
             return;
         case verb::dns:
-            answer(records_text());
+        {
+            if (arg != "--check")
+            {
+                answer(records_text());
+                return;
+            }
+            // Asked of the resolvers this machine uses, off the loop, as a sender elsewhere would ask them.
+            auto out = std::make_shared<std::string>();
+            m_pool.submit(0, [records = records_text(), out] { *out = dns_check_text(records); },
+                          [answer, out] { answer(*out); });
             return;
+        }
         case verb::unsubscribed:
         {
             load_list(m_unsubscribed);
@@ -3001,6 +3044,44 @@ void mail_run::command(uint64_t ticket, std::string_view payload)
             std::string out;
             for (const auto& a : all)
                 out += a + "\n";
+            answer(out);
+            return;
+        }
+        case verb::trace:
+            answer(trace_text(arg));
+            return;
+        case verb::usage:
+        {
+            if (!m_imap)
+            {
+                answer("error: there are no mailboxes, which need --idp and --storage");
+                return;
+            }
+            const auto size = [](uint64_t b) {
+                char buf[32];
+                if (b >= (1ull << 30))
+                    std::snprintf(buf, sizeof buf, "%.1f GiB", static_cast<double>(b) / (1ull << 30));
+                else if (b >= (1ull << 20))
+                    std::snprintf(buf, sizeof buf, "%.1f MiB", static_cast<double>(b) / (1ull << 20));
+                else
+                    std::snprintf(buf, sizeof buf, "%.1f KiB", static_cast<double>(b) / 1024);
+                return std::string(buf);
+            };
+            std::string out;
+            for (std::string_view rest = arg; !rest.empty();)
+            {
+                const size_t comma = rest.find(',');
+                const std::string user(rest.substr(0, comma));
+                rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+                if (user.empty())
+                    continue;
+                const uint64_t used = m_imap->usage(user), quota = m_imap->quota(user);
+                char line[160];
+                std::snprintf(line, sizeof line, "%-24s %12s  of %s%s\n", user.c_str(), size(used).c_str(),
+                              quota ? size(quota).c_str() : "no quota",
+                              quota ? (" (" + std::to_string(used * 100 / quota) + "%)").c_str() : "");
+                out += line;
+            }
             answer(out);
             return;
         }
@@ -3089,6 +3170,138 @@ void mail_run::send_command(uint64_t ticket, socketley::bytes::reader& r)
     queue_message(from, rcpts, std::move(body), false, "local", [answer](bool ok, std::string id) {
         answer(ok ? "queued " + id : "error: the message could not be written to the spool");
     });
+}
+
+void mail_run::trace(const std::string& id, const std::string& from, const std::string& rcpt, std::string_view what,
+                     std::string_view why)
+{
+    if (m_traced.size() >= 20000)
+        m_traced.pop_front();
+    m_traced.push_back({wall::now_ms(), id, from, rcpt, std::string(what), std::string(why)});
+    LOG_INFO(("mail " + std::string(m_owner.get_name()) + ": " + (id.empty() ? std::string("-") : id) + " from <" + from +
+              "> to <" + rcpt + ">: " + std::string(what) + (why.empty() ? "" : " (" + std::string(why) + ")"))
+                 .c_str());
+}
+
+void mail_run::check_own_listing()
+{
+    auto addrs = std::make_shared<std::vector<std::string>>();
+    m_pool.submit(0,
+                  [host = m_hostname, addrs] {
+                      bool nx = false;
+                      auto r = system_check_resolver(5000);
+                      if (!r->addrs4(host, *addrs, nx))
+                          addrs->clear();
+                  },
+                  [this, alive = m_alive, addrs] {
+                      if (!*alive || addrs->empty() || !m_dnsbl)
+                          return;
+                      auto listed = std::make_shared<std::string>();
+                      auto left = std::make_shared<size_t>(addrs->size());
+                      for (const auto& ip : *addrs)
+                          m_dnsbl->check(ip, [this, alive, ip, listed, left](std::string zone) {
+                              if (!*alive)
+                                  return;
+                              if (!zone.empty())
+                                  *listed += (listed->empty() ? "" : ", ") + zone + " (" + ip + ")";
+                              if (--*left)
+                                  return;
+                              if (*listed != m_self_listed)
+                                  LOG_WARN(("mail " + std::string(m_owner.get_name()) +
+                                            (listed->empty() ? ": no blocklist names it any more"
+                                                             : ": its address is on a blocklist: " + *listed))
+                                               .c_str());
+                              m_self_listed = *listed;
+                          });
+                  });
+}
+
+std::string mail_run::dns_check_text(const std::string& records)
+{
+    auto resolver = system_check_resolver(10000);
+    std::string out;
+    size_t ok = 0, asked = 0;
+    for (std::string_view rest = records; !rest.empty();)
+    {
+        const size_t nl = rest.find('\n');
+        const std::string_view line = rest.substr(0, nl);
+        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+        // <name>. <ttl> IN <type> <value>
+        std::vector<std::string_view> w;
+        std::string_view l = line;
+        for (int i = 0; i < 4 && !l.empty(); ++i)
+        {
+            const size_t sp = l.find(' ');
+            w.push_back(l.substr(0, sp));
+            l = sp == std::string_view::npos ? std::string_view{} : l.substr(sp + 1);
+        }
+        if (w.size() < 4 || l.empty())
+            continue;
+        std::string name(w[0]), want(l);
+        if (!name.empty() && name.back() == '.')
+            name.pop_back();
+        const std::string_view type = w[3];
+        std::vector<std::string> have;
+        bool nx = false, answered = false;
+        if (type == "TXT")
+        {
+            if (want.size() >= 2 && want.front() == '"' && want.back() == '"')
+                want = want.substr(1, want.size() - 2);
+            answered = resolver->txt(name, have, nx);
+        }
+        else if (type == "MX")
+        {
+            want = want.substr(want.find(' ') == std::string::npos ? 0 : want.find(' ') + 1);
+            if (!want.empty() && want.back() == '.')
+                want.pop_back();
+            answered = resolver->mx(name, have, nx);
+        }
+        else if (type == "A" || type == "AAAA")
+            answered = resolver->addrs(name, have, nx);
+        else
+        {
+            out += "unchecked  " + name + " " + std::string(type) + "\n";
+            continue;
+        }
+        ++asked;
+        const bool found = std::any_of(have.begin(), have.end(), [&](const std::string& h) {
+            return type == "MX" ? socketley::ascii::iequals(h, want) : h == want;
+        });
+        if (found)
+        {
+            ++ok;
+            out += "ok         " + name + " " + std::string(type) + "\n";
+        }
+        else if (!answered && !nx)
+            out += "unasked    " + name + " " + std::string(type) + ": no resolver answered\n";
+        else if (have.empty())
+            out += "missing    " + name + " " + std::string(type) + ": want " + want + "\n";
+        else
+            out += "differs    " + name + " " + std::string(type) + ": is " + have.front() + ", want " + want + "\n";
+    }
+    return out + std::to_string(ok) + " of " + std::to_string(asked) + " records as they should be\n";
+}
+
+std::string mail_run::trace_text(const std::string& address) const
+{
+    std::string out;
+    size_t shown = 0;
+    // The newest last, at most 200 of them.
+    for (auto it = m_traced.rbegin(); it != m_traced.rend() && shown < 200; ++it)
+    {
+        if (!address.empty() && !contains_ci(it->from, address) && !contains_ci(it->rcpt, address))
+            continue;
+        char when[32];
+        const std::time_t t = static_cast<std::time_t>(it->ms / 1000);
+        std::tm tm{};
+        ::localtime_r(&t, &tm);
+        std::strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", &tm);
+        out.insert(0, std::string(when) + "  " + (it->id.empty() ? std::string("-") : it->id) + "  " +
+                          (it->from.empty() ? "<>" : it->from) + " -> " + it->rcpt + "  " + it->what +
+                          (it->why.empty() ? "" : ": " + it->why) + "\n");
+        ++shown;
+    }
+    return out;
 }
 
 void mail_run::learn(const std::string& user, const std::string& key, uint64_t size, bool spam)
@@ -3193,7 +3406,7 @@ std::string mail_run::learn_command(const std::string& arg, std::function<void(s
         return "error: the command did not arrive whole";
     const size_t a = all.find('\n'), b = a == std::string::npos ? a : all.find('\n', a + 1);
     if (b == std::string::npos)
-        return "usage: socketley mail <mail> learn <user> spam|ham <folder>";
+        return "usage: socketley mail [<mail>] learn <user>/<folder> --as spam|ham";
     const std::string user = all.substr(0, a), cls = all.substr(a + 1, b - a - 1), folder = all.substr(b + 1);
     if (cls != "spam" && cls != "ham")
         return "error: learn takes spam or ham, not " + cls;
@@ -3267,6 +3480,10 @@ std::string mail_run::stats() const
     put(out, "mail_received", m_received);
     put(out, "mail_queued", m_spool.entries().size());
     put(out, "mail_queued_bytes", m_spool.bytes());
+    if (m_owner.get_shard_index() == 0)
+        put(out, "mail_self_listed", m_self_listed.empty() ? 0 : 1);
+    if (!m_self_listed.empty())
+        put(out, "mail_self_listed_by", std::string_view(m_self_listed));
     put(out, "mail_refused_recipients", m_refused_rcpt);
     put(out, "mail_refused_relay", m_refused_relay);
     put(out, "mail_too_big", m_too_big);

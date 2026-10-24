@@ -9,14 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Running a mail server.** `socketley mail` takes no runtime name where
+  there is one mail runtime; `mail trace <address>` says what became of the
+  latest mail from or to it (delivered, deferred, bounced, refused, with the
+  answer), each also a line of the log; `mail usage [user]` what mailboxes
+  hold against their quota; `mail dns --check` which of the records the
+  domains need this machine's resolvers have. `--autoexpunge 30d` empties
+  Junk and Trash of mail put there longer ago, the time a message was filed
+  now kept beside it. The metrics carry a mail runtime's figures
+  (`socketley_mail_*`), and the alerts a queue that keeps a hundred
+  messages and a blocklist of `--dnsbl` naming the runtime's own address,
+  which `socketley mail` says as well.
 - **A spam filter that learns from the users.** Without `--rspamd`, a mail
   runtime scores mail with a filter of its own (SpamBayes' chi-square of
   the words of the subject, the text and the HTML, the From's domain and the
   links' hosts), taught by what users move into Junk and out of it, or file
   into a folder of their own, over IMAP, JMAP and the webmail's Report junk
   and Not junk alike. Trained on 20 of each it scores every message as
-  `x-spam-bayes` and puts one of 0.9 or more in Junk; `socketley mail <m>
-  learn <user> spam|ham <folder>` teaches it a folder at once, and `stats`
+  `x-spam-bayes` and puts one of 0.9 or more in Junk; `socketley mail
+  learn <user>/<folder> --as spam|ham` teaches it a folder at once, and `stats`
   says what it learned. Every shard learns into a journal the first, which
   takes mail, folds into its file.
 - **A mail runtime takes its entrance's certificate.** `--tls` with `--dns`

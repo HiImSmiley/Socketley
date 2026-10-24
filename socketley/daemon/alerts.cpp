@@ -209,6 +209,21 @@ void monitor::check(int64_t now, const std::vector<facts>& runtimes, const std::
                   size_text(static_cast<double>(r.used)) + " of " + size_text(static_cast<double>(r.limit)), 3);
         }
 
+    // A mail runtime whose queue keeps what it cannot deliver, held for five readings so a burst is not news, and one
+    // whose own address a blocklist of its --dnsbl names, where its mail goes to spam or nowhere.
+    for (const facts& r : runtimes)
+    {
+        if (r.type != "mail")
+            continue;
+        if (r.queued >= 100)
+            raise("mailqueue:" + r.name, r.queued >= 1000 ? "critical" : "warning", r.name,
+                  r.name + " has " + std::to_string(r.queued) + " messages waiting",
+                  "socketley mail " + r.name + " queue says why", 5);
+        if (r.listed)
+            raise("blocklisted:" + r.name, "critical", r.name, "A blocklist names the address " + r.name + " sends from",
+                  "socketley mail " + r.name + " says which", 1);
+    }
+
     std::erase_if(m_cert_left, [&](const auto& kv) { return !certs_named.count(kv.first); });
 
     // Git repositories whose last pull failed, read every minute and when a storage runtime is first seen: the first

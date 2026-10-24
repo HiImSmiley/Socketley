@@ -53,7 +53,7 @@ trap cleanup EXIT
 echo "=== Integration: a mail runtime takes, keeps, signs, sends, retries and bounces mail ==="
 
 python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 \
-    2.0.0.127.bl.test=127.0.0.2 4.0.0.127.bl.test=127.255.255.254 >/dev/null 2>&1 &
+    2.0.0.127.bl.test=127.0.0.2 4.0.0.127.bl.test=127.255.255.254 listed-host.test=127.0.0.2 >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
 export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK"
@@ -295,6 +295,14 @@ PY
 check "an address the list names sends nothing" "$(from_ip 127.0.0.2)" "554 127.0.0.2 is listed by bl.test"
 check "one it does not name is taken" "$(from_ip 127.0.0.3)" "250 "
 check "and a list's error answer names nobody" "$(from_ip 127.0.0.4)" "250 "
+# A runtime whose own address the list names says so, in its summary and to the alerts.
+"$BIN" create mail mlisted -p $((SL_PORT_BASE+1979)) --mail-domain other.test --hostname listed-host.test --dnsbl bl.test -s \
+    >/dev/null 2>&1
+for _ in $(seq 1 50); do "$BIN" mail mlisted 2>/dev/null | grep -q BLOCKLISTED && break; sleep 0.1; done
+case "$("$BIN" mail mlisted 2>&1)" in *"BLOCKLISTED its address is on bl.test (127.0.0.2)"*) ok "a runtime whose own address a blocklist names says so" ;;
+    *) bad "a runtime whose own address a blocklist names says so" "$("$BIN" mail mlisted 2>&1 | head -4)" ;; esac
+case "$("$BIN" mail mb 2>&1)" in *BLOCKLISTED*) bad "one whose address no list names says nothing" "$("$BIN" mail mb 2>&1)" ;;
+    *) ok "one whose address no list names says nothing" ;; esac
 
 # ─── the CLI and the daemon ─────────────────────────────────────────────────
 "$BIN" send luasend -1 >/dev/null 2>&1; check "send of a message that begins with - to a server reaches it" "$?" "0"

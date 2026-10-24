@@ -11,7 +11,7 @@
 # template asks for a value the first customer has not, and a later one who has
 # not is skipped; --rate-limit keeps a new sender out of the spam folder. Whoever
 # unsubscribed is skipped, and `socketley mail m unsubscribed` lists them.
-# logo.png is the shop's logo, beside this script.
+# logo.png, beside this script, stands for the shop's logo.
 # =============================================================================
 
 set -e

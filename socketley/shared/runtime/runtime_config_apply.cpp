@@ -264,6 +264,8 @@ void apply_mail_config(mail_instance& ml, const runtime_config& cfg, bool by_pre
         ml.set_max_recipients(cfg.mail_max_rcpt);
     if (asked("queue_lifetime", cfg.mail_lifetime != defaults.mail_lifetime))
         ml.set_queue_lifetime(cfg.mail_lifetime);
+    if (asked("autoexpunge", cfg.mail_autoexpunge != defaults.mail_autoexpunge))
+        ml.set_autoexpunge(cfg.mail_autoexpunge);
     if (asked("dkim_selector", cfg.mail_selector != defaults.mail_selector))
         ml.set_dkim_selector(cfg.mail_selector);
 }

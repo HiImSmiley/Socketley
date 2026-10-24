@@ -3121,7 +3121,8 @@ int daemon_handler::cmd_mail(ipc_connection* conn, const parsed_args& pa)
                      : what == "forgive" ? ml::verb::forgive : what == "sieve" ? ml::verb::sieve
                      : what == "unsubscribed" ? ml::verb::unsubscribed
                      : what == "resubscribe" ? ml::verb::resubscribe
-                     : what == "learn" ? ml::verb::learn : ml::verb::send;
+                     : what == "learn" ? ml::verb::learn : what == "trace" ? ml::verb::trace
+                     : what == "usage" ? ml::verb::usage : ml::verb::send;
     if (v == ml::verb::send)
     {
         conn->write_buf = command_usage::line("mail");
@@ -3130,7 +3131,8 @@ int daemon_handler::cmd_mail(ipc_connection* conn, const parsed_args& pa)
     const std::string arg = pa.count > 3 ? std::string(pa.args[3]) : std::string();
     const std::string payload = ml::command_text(v, arg);
     // The users' scripts and the unsubscribed are files every shard reads, so the first shard answers for them.
-    if (v == ml::verb::sieve || v == ml::verb::unsubscribed || v == ml::verb::resubscribe || v == ml::verb::learn)
+    if (v == ml::verb::sieve || v == ml::verb::unsubscribed || v == ml::verb::resubscribe || v == ml::verb::learn ||
+        v == ml::verb::usage)
     {
         std::string one;
         if (!ask_worker(conn, name, payload, one, std::chrono::seconds(10), 0))

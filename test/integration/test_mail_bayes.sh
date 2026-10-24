@@ -8,6 +8,10 @@
 #   * a MOVE into Junk not learned as spam, or `learn` not reading the folder it names
 #   * a trained filter not scoring new mail, putting what is like the spam anywhere but Junk, or the rest in Junk
 #   * what it learned not folded into its file, or lost across a restart
+#   * `mail trace` not saying what was delivered to an address or why a recipient was refused, or no log line of it
+#   * `mail` without a name not finding the one mail runtime, or guessing between two
+#   * the mail runtime's figures missing from the daemon's metrics, or `mail usage` not saying what a user holds
+#   * --autoexpunge leaving Junk full, or reaching the INBOX
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -36,7 +40,13 @@ echo "=== Integration: a spam filter that learns from what users move ==="
 python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
-export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_BAYES_FOLD_MS=1500
+# An hour of --autoexpunge is a second here.
+export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_BAYES_FOLD_MS=1500 SOCKETLEY_MAIL_QUEUE_SCALE=3600
+# The daemon's metrics, for the mail runtime's figures among them.
+MP=$((P+7))
+unset SOCKETLEY_CONFIG
+mkdir -p "$HOME/.config/socketley"
+printf 'daemon = { metrics_port = %s }\n' "$MP" > "$HOME/.config/socketley/config.lua"
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=mail.example.test" \
     -keyout "$T/key.pem" -out "$T/cert.pem" >/dev/null 2>&1
 daemon_start "$BIN"
@@ -92,7 +102,7 @@ print(len(uids))
 PY
 )
 [ "$moved" = 25 ] && ok "alice moves the 25 into Junk over IMAP" || bad "the MOVE" "$moved"
-out=$("$BIN" mail m learn alice ham INBOX 2>&1)
+out=$("$BIN" mail learn alice/INBOX --as ham 2>&1)
 case "$out" in "learning 25 messages of alice's INBOX as not spam") ok "learn reads the folder it names" ;;
     *) bad "learn reads the folder it names" "$out" ;; esac
 for _ in $(seq 1 200); do [ "$(stat_of mail_bayes_spam)" = 25 ] && [ "$(stat_of mail_bayes_ham)" = 25 ] && break; sleep 0.1; done
@@ -115,6 +125,43 @@ for _ in $(seq 1 100); do [ -n "$(find "$T" -name m.bayes 2>/dev/null)" ] && [ -
 ready_tcp 127.0.0.1 "$IM" >/dev/null 2>&1
 python3 "$T/mail.py" "$P" "$PS" spam 1 97
 wait_count Junk 27 && ok "and what it learned is what a restart scores with" || bad "kept across a restart" "Junk $(keys Junk | wc -l)"
+
+# What became of the mail: delivered into the mailbox, and a recipient refused, both traced.
+case "$("$BIN" mail trace alice@example.test 2>&1)" in *"-> alice@example.test  delivered"*) ok "mail trace says what was delivered to an address" ;;
+    *) bad "mail trace says what was delivered" "$("$BIN" mail trace alice@example.test 2>&1 | tail -3)" ;; esac
+python3 - "$P" <<'PY'
+import smtplib, sys
+s = smtplib.SMTP("127.0.0.1", int(sys.argv[1]), source_address=("127.0.0.2", 0))
+s.ehlo("x")
+s.mail("someone@else.test")
+s.rcpt("nobody@example.test")
+s.quit()
+PY
+case "$("$BIN" mail trace nobody@ 2>&1)" in *"someone@else.test -> nobody@example.test  refused: 550"*) ok "and why a recipient was refused" ;;
+    *) bad "and why a recipient was refused" "$("$BIN" mail trace nobody@ 2>&1)" ;; esac
+grep -q "from <someone@else.test> to <nobody@example.test>: refused" "$SOCKETLEY_DLOG" && ok "each a line of the log as well" \
+    || bad "the log line" "$(grep -c 'to <' "$SOCKETLEY_DLOG")"
+
+metrics=$(curl -s "http://127.0.0.1:$MP/metrics")
+echo "$metrics" | grep -qE '^socketley_mail_delivered_total\{name="m"\} [1-9]' && echo "$metrics" | grep -q '^socketley_mail_stat{name="m",stat="mail_bayes_spam"} 25' \
+    && ok "the daemon's metrics carry the mail runtime's figures" || bad "mail metrics" "$(echo "$metrics" | grep -c socketley_mail)"
+
+case "$("$BIN" mail usage 2>&1)" in *"alice"*"KiB  of no quota"*) ok "mail usage says what each user's mailboxes hold" ;;
+    *) bad "mail usage" "$("$BIN" mail usage 2>&1)" ;; esac
+
+# Junk emptied of what it held longer than --autoexpunge, the INBOX left as it is.
+inbox=$(keys INBOX | wc -l)
+"$BIN" import m --restart '{"autoexpunge": 3600}' >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$IM" >/dev/null 2>&1
+python3 "$T/mail.py" "$P" "$PS" ham 1 96
+for _ in $(seq 1 100); do [ "$(keys Junk | wc -l)" -eq 0 ] && break; sleep 0.1; done
+[ "$(keys Junk | wc -l)" -eq 0 ] && [ "$(keys INBOX | wc -l)" -eq $((inbox+1)) ] && ok "--autoexpunge empties Junk of old mail and leaves the INBOX" \
+    || bad "--autoexpunge" "Junk $(keys Junk | wc -l), INBOX $(keys INBOX | wc -l) of $((inbox+1))"
+
+# The runtime's name goes unsaid while it is the only one, and is asked for once there are two.
+"$BIN" create mail m2 -p $((P+6)) --mail-domain other.test -s >/dev/null 2>&1
+case "$("$BIN" mail queue 2>&1)" in "name the mail runtime, one of "*) ok "with two mail runtimes the name is asked for" ;;
+    *) bad "with two the name is asked for" "$("$BIN" mail queue 2>&1)" ;; esac
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || exit 1

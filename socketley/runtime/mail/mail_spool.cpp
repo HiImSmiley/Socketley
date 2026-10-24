@@ -1257,6 +1257,8 @@ void spool::mark(spool_entry& e, size_t rcpt, rcpt_state s, std::string_view why
     e.rcpts[rcpt].state = s;
     e.rcpts[rcpt].why = one_line(why);
     log(e.id + (s == rcpt_state::delivered ? " d " : " f ") + std::to_string(rcpt) + " " + e.rcpts[rcpt].why + "\n");
+    if (on_outcome)
+        on_outcome(e, rcpt, s);
 }
 
 void spool::target_over(spool_entry& e, size_t rcpt, std::string_view addr, bool ok, std::string_view why)
@@ -1282,6 +1284,10 @@ void spool::retry(spool_entry& e, uint32_t attempts, int64_t next_ms)
     e.attempts = attempts;
     e.next_ms = next_ms;
     log(e.id + " r " + std::to_string(attempts) + " " + std::to_string(next_ms) + "\n");
+    if (on_outcome)
+        for (size_t i = 0; i < e.rcpts.size(); ++i)
+            if (e.rcpts[i].state == rcpt_state::waiting)
+                on_outcome(e, i, rcpt_state::waiting);
 }
 
 void spool::delay_told(spool_entry& e)

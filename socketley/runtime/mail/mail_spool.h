@@ -105,6 +105,8 @@ public:
 
     // A recipient delivered or failed for good, its answer kept.
     void mark(spool_entry& e, size_t rcpt, rcpt_state s, std::string_view why);
+    // Told of each recipient delivered or failed for good, and of each still waiting when a try is put off.
+    std::function<void(const spool_entry&, size_t rcpt, rcpt_state)> on_outcome;
     // One of the targets an alias made of a recipient took the message, or refused it for good.
     void target_over(spool_entry& e, size_t rcpt, std::string_view addr, bool ok, std::string_view why);
     // Its sender was told of the recipient.

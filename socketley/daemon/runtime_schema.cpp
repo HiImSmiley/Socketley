@@ -215,6 +215,7 @@ constexpr row rows[] = {
     {"--notify-targets", "E", "path", "Event targets", "Where each message stored in a mailbox is told: webhooks and other runtimes, `name url` a line.", "Mail", {}, "/etc/socketley/mail.targets"},
     {"--max-size", "E", "size", "Max message", "The largest message taken; 25M unless given.", "Mail limits", {}, "25M"},
     {"--max-recipients", "E", "int", "Max recipients", "The most recipients of one message; 100 unless given.", "Mail limits", {}, "100"},
+    {"--autoexpunge", "E", "duration", "Empty Junk and Trash", "How long a message stays in Junk or Trash before it is gone; never unless given.", "Mail limits", {}, "30d"},
     {"--queue-lifetime", "E", "duration", "Queue lifetime", "How long a message is tried before it is bounced; 5d unless given.", "Mail limits", {}, "5d"},
     {"--dkim-selector", "E", "text", "DKIM selector", "The selector its DKIM key is published under; skl unless given.", "Mail", {}, "skl"},
 };
@@ -372,6 +373,7 @@ constexpr state_key_row state_keys[] = {
     {"--max-size", "max_size"},
     {"--max-recipients", "max_recipients"},
     {"--queue-lifetime", "queue_lifetime"},
+    {"--autoexpunge", "autoexpunge"},
     {"--dkim-selector", "dkim_selector"},
 };
 

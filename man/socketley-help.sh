@@ -518,18 +518,21 @@ cli_commands() {
     echo "  for twice, kept as a scrypt hash; needs no daemon."
     echo -e "  ${CYAN}socketley mqtt-passwd /etc/socketley/mqtt.users sensor-17${NC}"
     echo ""
-    echo -e "${BOLD}mail <mail> [queue [filter] | show <id> | flush [id] | drop <id> | dns | suppressed | forgive <a>]${NC}"
-    echo -e "${BOLD}mail <mail> unsubscribed | resubscribe <a> | learn <user> spam|ham <folder>${NC}"
-    echo -e "${BOLD}mail <mail> sieve <user> list | get|put|activate|delete <name> [file] | check <file> | deactivate${NC}"
+    echo -e "${BOLD}mail [<mail>] [queue [filter] | show <id> | flush [id] | drop <id> | dns [--check] | suppressed | forgive <a>]${NC}"
+    echo -e "${BOLD}mail [<mail>] trace <address> | usage [user]${NC}"
+    echo -e "${BOLD}mail [<mail>] unsubscribed | resubscribe <a> | learn <user>/<folder> --as spam|ham${NC}"
+    echo -e "${BOLD}mail [<mail>] sieve <user> list | get|put|activate|delete <name> [file] | check <file> | deactivate${NC}"
+    echo "  The name may go unsaid where there is one mail runtime alone."
     echo "  Alone, what the runtime is and how it does. Its spool: what waits and why, tried now or"
     echo "  dropped; the DNS records its domains need; the addresses bounces said are dead; those"
-    echo "  that unsubscribed from its advertisements; a folder the spam filter learns from, which"
+    echo "  that unsubscribed from its advertisements; what became of mail from or to an address;"
+    echo "  what each mailbox holds; a folder the spam filter learns from, which"
     echo "  learns by itself what users move into Junk and out; a user's Sieve filters, and as user"
     echo "  .global the scripts any user's include :global reads."
     echo -e "  ${CYAN}socketley mail m${NC}"
     echo -e "  ${CYAN}socketley mail m queue${NC}"
     echo -e "  ${CYAN}socketley mail m sieve alice put main filter.sieve${NC}"
-    echo -e "  ${CYAN}socketley mail m learn alice ham INBOX${NC}"
+    echo -e "  ${CYAN}socketley mail learn alice/INBOX --as ham${NC}"
     echo -e "  ${CYAN}socketley mail m sieve .global put spam spam.sieve${NC}"
     echo ""
 
@@ -1621,6 +1624,18 @@ flags_options() {
     echo "│ --rspamd <url>         │ Rspamd that scans mail from         │"
     echo "│                        │ elsewhere                           │"
     echo "│ --default-quota <size> │ Quota where the account names none  │"
+    echo "│ --quota-warn <percent> │ How full before users are told (90) │"
+    echo "│ --autoexpunge <dur>    │ Empty Junk and Trash of older mail  │"
+    echo "│ --max-recipients <n>   │ Recipients a message may have (100) │"
+    echo "│ --recipient-delimiter  │ What divides user from tag (+)      │"
+    echo "│ <chars>|none           │                                     │"
+    echo "│ --mta-sts-port <port>  │ Serve the MTA-STS policy itself     │"
+    echo "│ --reports              │ Send the DMARC and TLS reports      │"
+    echo "│                        │ other domains ask for               │"
+    echo "│ --arc-trust <d,...>    │ Forwarders whose ARC seal is taken  │"
+    echo "│ --dkim-next <selector> │ Publish the next key before using   │"
+    echo "│                        │ it, to rotate                       │"
+    echo "│ --notify-targets <f>   │ Where each stored message is told   │"
     echo "│ --shards <N>           │ Workers; shard 0 takes the intake   │"
     echo "└────────────────────────┴─────────────────────────────────────┘"
     echo ""
@@ -3571,8 +3586,8 @@ OTHER
   idp-user <idp> add|passwd|...  an idp runtime's accounts
   db-backup | db-restore         a db runtime to a file, or back from one
   db-query <db> <collection>     the documents a query of a db runtime finds
-  mail <mail>                    what a mail runtime is and how it does
-  mail <mail> queue|show|flush   its spool; dns, suppressed, forgive, unsubscribed, resubscribe
+  mail [<mail>]                  what a mail runtime is and how it does (the name where there are more)
+  mail <mail> queue|show|flush   its spool; dns [--check], trace, usage, suppressed, forgive, unsubscribed
   mail <mail> sieve <user> ...   a user's Sieve filters: list, get, put, check, activate
   mqtt-pub | mqtt-sub            publish on a broker, or read what it accepts
   mqtt-sessions | mqtt-kick      a broker's sessions, or one disconnected

@@ -359,6 +359,22 @@ private:
     std::vector<std::string> m_arc_trusted;
     std::string m_state_dir;
 
+    // The blocklists of --dnsbl that name the address it sends from, asked hourly on the first shard; empty for none.
+    std::string m_self_listed;
+    int64_t m_self_checked_ms{0};
+    void check_own_listing();
+    // What became of recent mail, for `socketley mail trace`: delivered, deferred, bounced or refused.
+    struct traced
+    {
+        int64_t ms{0};
+        std::string id, from, rcpt, what, why;
+    };
+    std::deque<traced> m_traced;
+    void trace(const std::string& id, const std::string& from, const std::string& rcpt, std::string_view what,
+               std::string_view why);
+    std::string trace_text(const std::string& address) const;
+    // Each record records_text() says the domains need, as the resolvers of this machine answer it.
+    static std::string dns_check_text(const std::string& records);
     // The spam filter, scored with on the first shard, which reads what every shard learned from their journal.
     std::unique_ptr<bayes> m_bayes;
     uint64_t m_bayes_off{0}, m_bayes_junked{0}, m_bayes_learned{0};

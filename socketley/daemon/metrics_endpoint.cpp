@@ -775,6 +775,55 @@ static void append_storage_series(std::string& out, const std::vector<storage_ro
         }
 }
 
+// A mail runtime's `stats` figures: what it took, delivered, deferred and bounced, what waits, and every other by name.
+static void append_mail_series(std::string& out, const std::vector<storage_row>& rows)
+{
+    if (rows.empty())
+        return;
+    std::vector<std::string_view> named;
+    const auto family = [&](std::string_view metric, std::string_view type, std::string_view help, std::string_view key) {
+        named.push_back(key);
+        out += '\n';
+        metric_head(out, metric, type, help);
+        for (const auto& r : rows)
+        {
+            uint64_t v = 0;
+            if (!r.get(key, v))
+                continue;
+            out += metric;
+            out += "{name=\"";
+            label_escape_into(out, r.name);
+            out += "\"} ";
+            json_append_uint(out, v);
+            out += '\n';
+        }
+    };
+    family("socketley_mail_received_total", "counter", "Messages a mail runtime took.", "mail_received");
+    family("socketley_mail_delivered_total", "counter", "Recipients a mail runtime delivered to.", "mail_delivered");
+    family("socketley_mail_deferred_total", "counter", "Tries a mail runtime put off.", "mail_deferred");
+    family("socketley_mail_bounced_total", "counter", "Recipients a mail runtime failed for good.", "mail_bounced");
+    family("socketley_mail_stored_total", "counter", "Messages put into mailboxes.", "mail_stored");
+    family("socketley_mail_queued", "gauge", "Messages waiting in a mail runtime's queue.", "mail_queued");
+    family("socketley_mail_queued_bytes", "gauge", "Bytes waiting in a mail runtime's queue.", "mail_queued_bytes");
+    family("socketley_mail_quarantined_total", "counter", "Messages put into Junk.", "mail_quarantined");
+    family("socketley_mail_auth_failed_total", "counter", "Sign-ins a mail runtime refused.", "auth_failed");
+    out += '\n';
+    metric_head(out, "socketley_mail_stat", "untyped", "A mail runtime's other stats figures, by name.");
+    for (const auto& r : rows)
+        for (const auto& [key, v] : r.figures)
+        {
+            if (std::find(named.begin(), named.end(), key) != named.end())
+                continue;
+            out += "socketley_mail_stat{name=\"";
+            label_escape_into(out, r.name);
+            out += "\",stat=\"";
+            label_escape_into(out, key);
+            out += "\"} ";
+            json_append_uint(out, v);
+            out += '\n';
+        }
+}
+
 // One runtime as every view of the fleet reads it, taken under the manager's lock and written out after it.
 struct runtime_row
 {
@@ -798,7 +847,8 @@ static std::vector<runtime_row> runtime_rows(const runtime_manager& manager)
     for (const auto& [name, rt] : runtimes)
         // The bound port, the one `ps` prints: an unset -p is the type's default.
         rows.push_back({name, rt->get_type(), rt->get_state(), rt->effective_port(), rt->worker_figures(),
-                        rt->get_type() == runtime_storage ? rt->stat_detail_snapshot() : std::string{},
+                        rt->get_type() == runtime_storage || rt->get_type() == runtime_mail ? rt->stat_detail_snapshot()
+                                                                                             : std::string{},
                         rt->shard_pids()});
     return rows;
 }
@@ -988,6 +1038,12 @@ std::string metrics_endpoint::build_metrics() const
         }
     append_storage_series(out, storage_rows);
 
+    std::vector<storage_row> mail_rows;
+    for (const auto& s : snapshots)
+        if (s.type == runtime_mail && s.state == runtime_running && !s.detail.empty())
+            mail_rows.push_back(parse_storage_row(s.name, s.detail));
+    append_mail_series(out, mail_rows);
+
     return out;
 }
 
@@ -1077,6 +1133,11 @@ void metrics_endpoint::sample()
             {
                 row.get("failing", a.failing);
                 a.error = socketley::stats_text::field(rt->stat_detail_snapshot(), "last_error");
+            }
+            else if (rt->get_type() == runtime_mail && rt->get_state() == runtime_running)
+            {
+                row.get("mail_queued", a.queued);
+                row.get("mail_self_listed", a.listed);
             }
             else if (uint64_t ev = 1; rt->get_type() == runtime_cache && row.get("eviction", ev) && ev == 0)
             {

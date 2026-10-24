@@ -145,6 +145,9 @@ public:
     // One message of --global-rate-limit's allowance taken, false where there is none left this second.
     bool take_global_token() { return check_global_rate_limit(); }
     // How long a message is tried before it is bounced, in seconds.
+    // How long a message stays in Junk or Trash before it is expunged, 0 for ever.
+    void set_autoexpunge(uint32_t s) { m_autoexpunge = s; }
+    uint32_t get_autoexpunge() const { return m_autoexpunge; }
     void set_queue_lifetime(uint32_t s) { m_lifetime = s; }
     uint32_t get_queue_lifetime() const { return m_lifetime; }
     void set_dkim_selector(std::string_view s) { m_selector = std::string(s); }
@@ -208,6 +211,7 @@ private:
     uint64_t    m_max_size{25ull << 20};
     uint32_t    m_max_rcpt{100};
     uint32_t    m_lifetime{5 * 86400};
+    uint32_t    m_autoexpunge{0};
     std::string m_selector{"skl"};
     std::vector<std::string> m_resolved;
 

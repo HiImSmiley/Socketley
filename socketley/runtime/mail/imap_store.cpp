@@ -1,4 +1,5 @@
 #include "imap_store.h"
+#include "mail_delivery.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -776,6 +777,14 @@ void imap_store::apply(user_state& u, std::string_view text, bool fresh)
                 ++f->version;
                 break;
             }
+            case 'V':
+            {
+                const auto w = words(l, 2);
+                if (imap_folder* f = folder(l))
+                    if (imap_message* m = f->by_uid(static_cast<uint32_t>(num(w[0]))))
+                        m->saved_ms = static_cast<int64_t>(num(w[1]));
+                break;
+            }
             case 'H':
             {
                 // H <uid> <thread> <folder>: the conversation a message is part of, which never changes.
@@ -910,6 +919,8 @@ void imap_store::reload(user_state& u)
                 apply(u, std::string(line) + "\n", false);
             else if (line[0] == 'H' && f && !f->msgs.empty())
                 f->msgs.back().thread = std::strtoull(std::string(line.substr(2)).c_str(), nullptr, 16);
+            else if (line[0] == 'S' && f && !f->msgs.empty())
+                f->msgs.back().saved_ms = static_cast<int64_t>(num(line.substr(2)));
             else if (line[0] == 'W' && f && !f->msgs.empty())
             {
                 // W <keyword> ...: the keywords of the message on the line before.
@@ -1119,9 +1130,11 @@ void imap_store::compact(const std::string& name, user_state& u)
                     text += " " + k;
                 text += "\n";
             }
-            // H <thread>: the conversation of the message on the line before.
+            // H <thread>: the conversation of the message on the line before, S <saved> when it was put there.
             if (m.thread)
                 text += "H " + hex64(m.thread) + "\n";
+            if (m.saved_ms)
+                text += "S " + std::to_string(m.saved_ms) + "\n";
         }
     }
     for (const auto& [fname, entries] : u.meta)
@@ -1322,12 +1335,42 @@ void imap_store::sweep_uploads(std::string after)
     });
 }
 
+void imap_store::autoexpunge(int64_t now)
+{
+    const int64_t before = now - static_cast<int64_t>(m_run.owner().get_autoexpunge()) * 1000 / delivery::queue_scale();
+    for (auto& [name, u] : m_users)
+    {
+        if (!u.loaded)
+            continue;
+        for (const char* folder : {"Junk", "Trash"})
+        {
+            const auto it = u.folders.find(folder);
+            if (it == u.folders.end())
+                continue;
+            // Put there before the store kept that, a message is as old as it is.
+            std::vector<uint32_t> old;
+            for (const auto& m : it->second->msgs)
+                if ((m.saved_ms ? m.saved_ms : m.date_ms) < before)
+                    old.push_back(m.uid);
+            if (!old.empty())
+                expunge(name, it->second, old, true, [](std::vector<uint32_t>) {});
+        }
+    }
+}
+
 void imap_store::tick(int64_t)
 {
     if (const int64_t now = wall::now_ms_coarse(); now - m_uploads_swept_ms > 3600000)
     {
         m_uploads_swept_ms = now;
         sweep_uploads();
+    }
+    // Hourly, on the first shard alone, so two do not expunge one message.
+    if (const int64_t now = wall::now_ms(); m_run.owner().get_autoexpunge() && m_run.owner().get_shard_index() == 0 &&
+                                            now - m_expunge_swept_ms > 3600000 / delivery::queue_scale())
+    {
+        m_expunge_swept_ms = now;
+        autoexpunge(now);
     }
     for (auto& [name, u] : m_users)
     {
@@ -2185,9 +2228,12 @@ std::vector<uint32_t> imap_store::add_messages(const std::string& name, const st
                 imap_message m{f->uidnext++, in.key,    in.size,    in.date_ms, in.flags,
                                true,         ++f->highestmodseq, in.keywords, in.thread};
                 uid = m.uid;
+                m.saved_ms = wall::now_ms();
                 lines += "A " + std::to_string(m.uid) + " " + std::to_string(m.flags) + " " + std::to_string(m.size) +
                          " " + std::to_string(m.date_ms) + " " + std::to_string(m.modseq) + " " + f->name + "\t" +
                          m.key + "\n";
+                // V <uid> <saved> <folder>: when it was put there, beside the line that put it.
+                lines += "V " + std::to_string(m.uid) + " " + std::to_string(m.saved_ms) + " " + f->name + "\n";
                 if (!m.keywords.empty())
                 {
                     lines += "K " + std::to_string(m.uid) + " " + std::to_string(m.modseq) + " " + f->name + "\t";

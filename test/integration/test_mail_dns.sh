@@ -43,8 +43,9 @@ trap cleanup EXIT
 
 echo "=== Integration: a mail runtime's records in a dns runtime, and its no-reply sender ==="
 
+# example.test's MX and SPF as this machine's resolver answers them, and no DMARC, for `mail dns --check`.
 python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal remote.test=MX:10:mx.remote.test mx.remote.test=127.0.0.1 \
-    >/dev/null 2>&1 &
+    example.test=MX:10:mail.example.test "example.test=TXT:v=spf1 mx -all" >/dev/null 2>&1 &
 PIDS+=($!)
 printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
 export SOCKETLEY_RESOLV_CONF="$T/resolv.conf" SOCKETLEY_MAIL_MX_PORT="$SINK"
@@ -91,6 +92,10 @@ tlsa=$("$BIN" mail m dns 2>/dev/null | sed -n 's/^_25._tcp.mail.example.test. 30
 want=$(openssl x509 -in "$T/cert.pem" -noout -pubkey | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
 check "and DANE's TLSA for its certificate's key (RFC 7672)" "$tlsa" "$want"
 check "which the dns runtime serves" "$(q _25._tcp.mail.example.test TLSA | tr -d ' ' | tr 'A-F' 'a-f')" "311$want"
+checked=$("$BIN" mail m dns --check 2>&1)
+case "$checked" in *"ok         example.test MX"*"ok         example.test TXT"*"missing    _dmarc.example.test TXT: want v=DMARC1"*" records as they should be") \
+    ok "mail dns --check says which records the resolvers have, and which they lack" ;;
+    *) bad "mail dns --check" "$checked" ;; esac
 check "socketley mail dns prints the eight for a zone kept elsewhere" "$("$BIN" mail m dns 2>/dev/null | wc -l)" "8"
 
 # ─── no-reply ───────────────────────────────────────────────────────────────

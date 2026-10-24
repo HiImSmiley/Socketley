@@ -40,7 +40,8 @@ S2=$((SL_PORT_BASE+1953))
 S3=$((SL_PORT_BASE+1954))
 S4=$((SL_PORT_BASE+1955))
 HOOK_PID=""
-trap '[ -n "$HOOK_PID" ] && kill "$HOOK_PID" 2>/dev/null; daemon_stop' EXIT
+DNS_PID=""
+trap '[ -n "$HOOK_PID" ] && kill "$HOOK_PID" 2>/dev/null; [ -n "$DNS_PID" ] && kill "$DNS_PID" 2>/dev/null; daemon_stop' EXIT
 
 echo "=== Integration: the daemon's alerts ==="
 
@@ -74,6 +75,13 @@ cat > "$T/daemon.lua" <<EOF
 daemon = { metrics_port = $M, dashboard_credentials = "$T/creds", alert_webhook = "http://127.0.0.1:$HP/hook" }
 EOF
 export SOCKETLEY_CONFIG="$T/daemon.lua"
+# A resolver for the mail runtime below: its own name on a blocklist, and an exchanger nothing answers on.
+NS=$((SL_PORT_BASE+1955))
+python3 "$HERE/lib_fake_dns.py" "$NS" 0 normal listed-host.test=127.0.0.2 2.0.0.127.bl.test=127.0.0.2 \
+    far.test=MX:10:mx.far.test mx.far.test=127.0.0.9 >/dev/null 2>&1 &
+DNS_PID=$!
+printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1 port:%s\n' "$NS" > "$T/resolv.conf"
+export SOCKETLEY_RESOLV_CONF="$T/resolv.conf"
 daemon_start "$BIN"
 U="http://127.0.0.1:$M"
 for _ in $(seq 1 50); do curl -s -o /dev/null "$U/" && break; sleep 0.1; done
@@ -182,6 +190,16 @@ expect "an alert raised while the hook was down reaches it once it is up, though
     "$(hook "(d['state'], d['alert']['id']) if 'alert' in d else ()" | grep -c "('firing', 'failed:broke2')")" 1
 sleep 2
 expect "and once" "$(hook "d['alert']['id'] if 'alert' in d else ''" | grep -c '^failed:broke2$')" 1
+
+# A mail runtime whose own address a blocklist names, and whose queue holds what it cannot deliver.
+signin
+"$BIN" create mail mlisted -p $((SL_PORT_BASE+1956)) --mail-domain other.test --hostname listed-host.test --dnsbl bl.test -s \
+    >/dev/null 2>&1
+until_al 45 "any(a['id'] == 'blocklisted:mlisted' and a['level'] == 'critical' for a in d['active'])" \
+    && ok "a mail runtime whose own address a blocklist names is an alert" || bad "blocklisted" "$(al)"
+for i in $(seq 1 100); do "$BIN" send mlisted --to "u$i@far.test" --from a@other.test --subject x --text x >/dev/null 2>&1; done
+until_al 60 "any(a['id'] == 'mailqueue:mlisted' for a in d['active'])" \
+    && ok "and one whose queue holds a hundred it cannot deliver" || bad "mail queue" "$("$BIN" mail mlisted | grep queue) $(al)"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
