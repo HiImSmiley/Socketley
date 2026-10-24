@@ -963,9 +963,9 @@ document.addEventListener('keydown', e => {
 
 // ─── start ──────────────────────────────────────────────────────────────────
 function wire() {
-  $('#compose').append(ico('pen'), el('span', { text: 'Compose' }));
+  $('#compose').append(ico('pen'), el('span', { text: 'New' }));
   $('#compose').addEventListener('click', () => compose());
-  $('#fab').append(ico('pen'), el('span', { text: 'Compose' }));
+  $('#fab').append(ico('pen'), el('span', { text: 'New' }));
   $('#fab').addEventListener('click', () => compose());
   $('#menuB').append(ico('menu')); $('#menuB').title = 'Folders';
   $('#menuB').addEventListener('click', () => $('#side').classList.toggle('open'));
