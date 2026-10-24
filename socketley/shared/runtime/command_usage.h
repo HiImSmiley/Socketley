@@ -29,7 +29,9 @@ inline constexpr std::string_view for_verb(std::string_view verb)
     if (verb == "send")
         return "send <name> <message> | send <mail> --to <address> [--cc|--bcc <address>] [--from <address>] "
                "[--reply-to <address>] [--subject <text>] [--text <text>] [--html <file>] [--attach <file>[:type]] "
-               "[--header 'Name: value'] [--raw]";
+               "[--inline <image>] [--header 'Name: value'] [--raw] | send <mail> --template <file> "
+               "--to <address>|idp:<idp>[/<group>]|db:<db>/<collection>|json:<file> [--set name=value] [--ad] "
+               "[--check] [--rate <n>/s|/min|/h] [--dry-run] [--test-to <address>]";
     if (verb == "edit")   return "edit <name> [flags]";
     if (verb == "show")   return "show <name|pattern>...";
     if (verb == "import") return "import <name> <json>";
@@ -47,6 +49,7 @@ inline constexpr std::string_view for_verb(std::string_view verb)
                "remove|show <user> | list | import <storage>";
     if (verb == "db-backup")  return "db-backup <db> <file>";
     if (verb == "db-restore") return "db-restore <db> <file>";
+    if (verb == "db-query")   return "db-query <db> <collection> ['{\"where\":..,\"sort\":..,\"limit\":..,\"skip\":..}']";
     if (verb == "mqtt-pub")      return "mqtt-pub <mqtt> [--qos 0|1|2] [--retain] <topic> [payload]";
     if (verb == "mqtt-sub")      return "mqtt-sub <mqtt> <filter> [--count <n>]";
     if (verb == "mqtt-sessions") return "mqtt-sessions <mqtt>";
@@ -54,8 +57,9 @@ inline constexpr std::string_view for_verb(std::string_view verb)
     if (verb == "mqtt-retained") return "mqtt-retained <mqtt> [filter] | --clear <topic>";
     if (verb == "mqtt-passwd")   return "mqtt-passwd <file> <user> [--delete]";
     if (verb == "mail")
-        return "mail <mail> queue [filter] | show <id> | flush [id] | drop <id> | dns | suppressed | forgive <address> | "
-               "sieve <user> list|get <name>|put <name> <file|->|check <file|->|activate <name>|deactivate|delete <name>";
+        return "mail <mail> [queue [filter] | show <id> | flush [id] | drop <id> | dns | suppressed | forgive <address> | "
+               "unsubscribed | resubscribe <address> | "
+               "sieve <user> list|get <name>|put <name> <file|->|check <file|->|activate <name>|deactivate|delete <name>]";
     if (verb == "cluster")
         return "cluster [ls|ps|group <name>|stats|watch|show <daemon>|raft-status|placement|"
                "create <type> <name> [flags] [--replicas <n>]|scale <name> <n>|remove <name>]";

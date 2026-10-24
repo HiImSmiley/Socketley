@@ -22,6 +22,8 @@ std::string mail_state_dir(std::string_view runtime_name, uint32_t shard, uint32
 void mail_forget_state(std::string_view runtime_name);
 // The addresses no shard of the runtime sends to again: <state>/mail/<name>.suppressed.
 std::string mail_suppressed_path(std::string_view runtime_name);
+// The addresses that unsubscribed from its advertisements, for good: <state>/mail/<name>.unsubscribed.
+std::string mail_unsubscribed_path(std::string_view runtime_name);
 // The DKIM key every shard of the runtime signs with: <state>/mail/<name>.dkim.<selector>.key.
 // The key no-reply mail's tags are made with, which every shard reads.
 std::string mail_verp_key_path(std::string_view runtime_name);

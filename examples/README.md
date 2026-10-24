@@ -114,6 +114,9 @@ examples/
   a vacation reply and flags, put with `socketley mail m sieve`
 - `orders.lua` - a mail runtime's script: mail to an address no mailbox has is
   published to a broker and its sender answered
+- `campaign.sh` + `autumn.html` - an advertisement to a db runtime's customers,
+  each filled with their name and code, the logo inside the message, a link to
+  unsubscribe of their own, checked on the first and paced
 
 ### Lua Config
 Each of these is a **pair**: a configuration read by the CLI, and a handler

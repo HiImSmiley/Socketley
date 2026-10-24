@@ -369,6 +369,11 @@ void jmap_session::handle(request rq)
             page(rq);
             return after();
         }
+        if (rq.path == "/unsubscribe")
+        {
+            unsubscribe_page(rq);
+            return after();
+        }
     }
     if (rq.method == "OPTIONS")
     {
@@ -860,6 +865,51 @@ void jmap_session::page(const request& rq)
            "\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n\r\n";
     if (!same && rq.method != "HEAD")
         out += w.html;
+    m_hooks.reply(out);
+}
+
+void jmap_session::unsubscribe_page(const request& rq)
+{
+    // The token is the link's own, base64url and hex: one with any other character is no link this runtime made.
+    const std::string token = percent_decoded(query_param(rq.query, "t"));
+    const bool shaped = !token.empty() && token.size() < 600 &&
+                        token.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.") ==
+                            std::string::npos;
+    std::string text, form;
+    int code = 200;
+    if (!shaped)
+    {
+        code = 404;
+        text = "This link to unsubscribe is not one of this mail server's.";
+    }
+    else if (rq.method == "POST")
+    {
+        const bool done = m_hooks.unsubscribe(token);
+        code = done ? 200 : 404;
+        text = done ? "You are unsubscribed, and will get no more of these mails."
+                    : "This link to unsubscribe is not one of this mail server's.";
+    }
+    else
+    {
+        // A GET only asks, as a mail scanner that opens every link would otherwise unsubscribe its reader.
+        text = "Unsubscribe from these mails?";
+        form = "<form method=\"post\" action=\"/unsubscribe?t=" + token +
+               "\"><button type=\"submit\">Unsubscribe</button></form>";
+    }
+    const std::string body =
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" "
+        "content=\"width=device-width,initial-scale=1\"><title>Unsubscribe</title><style>body{margin:0;min-height:100vh;"
+        "display:flex;align-items:center;justify-content:center;background:#07080c;color:#eef0f7;font:16px/1.5 system-ui,"
+        "sans-serif}main{max-width:420px;padding:32px;text-align:center}button{margin-top:18px;font:inherit;font-weight:600;"
+        "padding:10px 22px;border:0;border-radius:10px;background:linear-gradient(120deg,#c084fc,#f472b6);color:#fff;"
+        "cursor:pointer}</style></head><body><main><p>" + text + "</p>" + form + "</main></body></html>";
+    std::string out = "HTTP/1.1 " + std::to_string(code) + " " + reason_of(code) +
+                      "\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " + std::to_string(body.size()) +
+                      "\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
+                      "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+                      "frame-ancestors 'none'\r\n\r\n";
+    if (rq.method != "HEAD")
+        out += body;
     m_hooks.reply(out);
 }
 

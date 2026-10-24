@@ -769,9 +769,11 @@ socketley cluster ls|ps|group|show|stats|watch  # multi-daemon cluster inspectio
 socketley dashboard                       # print the web dashboard URL
 socketley ping                            # ask the daemon to identify itself
 socketley send <mail> --to <address>      # write and queue a message through a mail runtime
-socketley mail <mail> queue|show|flush|sieve ...  # a mail runtime's spool and its users' filters
+socketley send <mail> --template f.html --to db:<db>/<coll> --ad  # one each, filled, with a link to unsubscribe
+socketley mail <mail> [queue|show|flush|unsubscribed|sieve ...]   # a mail runtime: how it does, its spool and lists
 socketley idp-user <idp> add|passwd|list ...      # an idp runtime's accounts
 socketley db-backup|db-restore <db> <file>        # a db runtime to a file and back
+socketley db-query <db> <collection> ['{..}']     # the documents a query of a db finds
 socketley mqtt-pub|mqtt-sub <mqtt> ...            # publish on a broker, or read from it
 socketley acme issue --domains <names>    # a certificate from Let's Encrypt
 socketley version                         # print the version; needs no daemon

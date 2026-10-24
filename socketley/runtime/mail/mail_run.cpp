@@ -1,5 +1,7 @@
 #include "mail_run.h"
 
+#include <openssl/crypto.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -350,6 +352,9 @@ route_to mail_run::route(const address& a, bool from_null) const
         return first.find('@') == std::string::npos ? route_to{route_to::mailbox, first}
                                                      : route_to{route_to::remote, first};
     }
+    // The address an advertisement's mailto: unsubscribes at, its token in the Subject (RFC 2369).
+    if (socketley::ascii::iequals(a.local, "unsubscribe"))
+        return {route_to::unsubscribe, {}};
     // A user's own address, which the mailboxes say is one or is not.
     if (m_mailboxes && m_mailboxes->enabled() && !m_owner.get_idp().empty())
         return {route_to::mailbox, base};
@@ -360,7 +365,145 @@ bool mail_run::suppressed(std::string_view addr) const
 {
     std::string a(addr);
     socketley::ascii::lower_in_place(a);
-    return m_suppressed.count(a) > 0;
+    return m_suppressed.set.count(a) > 0;
+}
+
+std::string mail_run::unsubscribe_token(std::string_view addr) const
+{
+    std::string a(addr);
+    socketley::ascii::lower_in_place(a);
+    const std::string mac = socketley::crypto::hmac_sha256(m_verp_key, "unsubscribe\n" + a);
+    static const char* hex = "0123456789abcdef";
+    std::string out = socketley::base64url::encode(a) + ".";
+    for (size_t i = 0; i < 12 && i < mac.size(); ++i)
+    {
+        out += hex[static_cast<uint8_t>(mac[i]) >> 4];
+        out += hex[static_cast<uint8_t>(mac[i]) & 15];
+    }
+    return out;
+}
+
+std::string mail_run::unsubscribe_address(std::string_view token) const
+{
+    const size_t dot = token.rfind('.');
+    std::string a;
+    if (dot == std::string_view::npos || !socketley::base64url::decode(token.substr(0, dot), a) || a.empty() ||
+        a.size() > 320 || a.find_first_of(" \t\r\n<>") != std::string::npos)
+        return {};
+    // Compared whole and in constant time, so a guess learns nothing from how long the answer took.
+    const std::string want = unsubscribe_token(a);
+    return want.size() == token.size() && CRYPTO_memcmp(want.data(), token.data(), want.size()) == 0 ? a : std::string();
+}
+
+std::string mail_run::web_url() const
+{
+    if (!m_owner.get_web_port())
+        return {};
+    std::string_view names = m_owner.get_domains();
+    std::string name;
+    for (const char ch : socketley::take_item(names))
+        if (ch != ' ' && ch != '\t')
+            name += ch;
+    if (name.empty())
+        return {};
+    if (name.find('.') == std::string::npos)
+    {
+        if (m_domains.empty())
+            return {};
+        name += "." + m_domains.front();
+    }
+    return "https://" + name;
+}
+
+bool mail_run::advertise(compose& c, std::string& why, bool& skipped)
+{
+    skipped = false;
+    const size_t n = c.to.size() + c.cc.size() + c.bcc.size();
+    if (n != 1)
+    {
+        why = "an advertisement goes to one recipient at a time, so each has a link to unsubscribe of their own";
+        return false;
+    }
+    const std::string& one = !c.to.empty() ? c.to.front() : !c.cc.empty() ? c.cc.front() : c.bcc.front();
+    address a;
+    if (!parse_mailbox(one, a, nullptr) || a.domain.empty())
+    {
+        why = one + " is not an address";
+        return false;
+    }
+    std::string addr = a.text();
+    socketley::ascii::lower_in_place(addr);
+    load_list(m_unsubscribed);
+    if (m_unsubscribed.set.count(addr))
+    {
+        skipped = true;
+        why = addr + " unsubscribed";
+        return false;
+    }
+    const std::string token = unsubscribe_token(addr);
+    const std::string base = web_url();
+    const std::string https = base.empty() ? std::string() : base + "/unsubscribe?t=" + token;
+    const std::string mailto = m_domains.empty() ? std::string() : "mailto:unsubscribe@" + m_domains.front() + "?subject=" + token;
+    const std::string link = !https.empty() ? https : mailto;
+    if (link.empty())
+    {
+        why = "an advertisement needs a way to unsubscribe: a domain, from --mail-domain or --dns, or --web with --domain";
+        return false;
+    }
+    // Where the template says, or below what it says; the link is the same in the text and in the HTML.
+    const auto put = [&link](std::string& body, bool html) {
+        if (body.empty())
+            return;
+        const std::string mark = "{{unsubscribe}}";
+        std::string shown = link;
+        if (html)
+            for (size_t at = 0; (at = shown.find('&', at)) != std::string::npos; at += 5)
+                shown.replace(at, 1, "&amp;");
+        if (body.find(mark) != std::string::npos)
+        {
+            for (size_t at = 0; (at = body.find(mark, at)) != std::string::npos; at += shown.size())
+                body.replace(at, mark.size(), shown);
+            return;
+        }
+        if (!html)
+        {
+            body += "\n\n--\nUnsubscribe: " + link + "\n";
+            return;
+        }
+        const std::string footer = "<p style=\"margin:24px 0 0;font-size:12px;color:#888\"><a href=\"" + shown +
+                                   "\" style=\"color:#888\">Unsubscribe</a></p>";
+        std::string lower = body;
+        socketley::ascii::lower_in_place(lower);
+        const size_t end = lower.rfind("</body>");
+        body.insert(end == std::string::npos ? body.size() : end, footer);
+    };
+    put(c.text, false);
+    put(c.html, true);
+    std::string header = "List-Unsubscribe: ";
+    if (!https.empty())
+        header += "<" + https + ">";
+    if (!mailto.empty())
+        header += std::string(https.empty() ? "" : ", ") + "<" + mailto + ">";
+    c.headers.push_back(header);
+    // One click at the provider unsubscribes, a POST to the https link (RFC 8058).
+    if (!https.empty())
+        c.headers.push_back("List-Unsubscribe-Post: List-Unsubscribe=One-Click");
+    return true;
+}
+
+bool mail_run::unsubscribe(std::string_view token)
+{
+    const std::string a = unsubscribe_address(token);
+    if (a.empty())
+        return false;
+    load_list(m_unsubscribed);
+    if (!m_unsubscribed.set.count(a))
+    {
+        ++m_unsubscribes;
+        LOG_INFO(("mail " + std::string(m_owner.get_name()) + ": " + a + " unsubscribed").c_str());
+        edit_list(m_unsubscribed, {a}, {});
+    }
+    return true;
 }
 
 bool mail_run::no_reply_local(std::string_view local)
@@ -387,8 +530,8 @@ std::string mail_run::verp_token(std::string_view domain) const
 namespace
 {
 
-// The suppressed list as its file holds it: an address and when it bounced, a line each.
-std::unordered_map<std::string, int64_t> parse_suppressed(std::string_view text, int64_t now_s)
+// An address list as its file holds it: an address and when it went in, a line each.
+std::unordered_map<std::string, int64_t> parse_list(std::string_view text, int64_t now_s)
 {
     std::unordered_map<std::string, int64_t> out;
     while (!text.empty())
@@ -409,42 +552,42 @@ constexpr int64_t suppressed_for_s = 90 * 86400;
 
 }   // namespace
 
-void mail_run::load_suppressed()
+void mail_run::load_list(address_list& l)
 {
-    const std::string path = mail_suppressed_path(m_owner.get_name());
-    const auto stamp = socketley::file_stamp::of(path);
-    if (m_suppressed_stamp && *m_suppressed_stamp == stamp)
+    const auto stamp = socketley::file_stamp::of(l.path);
+    if (l.stamp && *l.stamp == stamp)
         return;
-    m_suppressed_stamp = stamp;
+    l.stamp = stamp;
     std::string text;
-    if (!socketley::read_file(path, text, {.missing_ok = true}, nullptr))
+    if (!socketley::read_file(l.path, text, {.missing_ok = true}, nullptr))
         return;
     std::unordered_set<std::string> got;
-    for (auto& [a, at] : parse_suppressed(text, wall::now_ms() / 1000))
+    for (auto& [a, at] : parse_list(text, wall::now_ms() / 1000))
         got.insert(a);
-    m_suppressed = std::move(got);
+    l.set = std::move(got);
 }
 
-void mail_run::edit_suppressed(std::vector<std::string> add, std::vector<std::string> remove)
+void mail_run::edit_list(address_list& l, std::vector<std::string> add, std::vector<std::string> remove)
 {
     for (const auto& a : add)
-        m_suppressed.insert(a);
+        l.set.insert(a);
     for (const auto& a : remove)
-        m_suppressed.erase(a);
+        l.set.erase(a);
     // Read, merged and written under a lock of the file, so two shards' changes are both kept; never on the loop.
     auto result = std::make_shared<std::unordered_set<std::string>>();
     auto why = std::make_shared<std::string>();
-    const std::string path = mail_suppressed_path(m_owner.get_name());
+    const std::string path = l.path;
     m_pool.submit(0,
-                  [path, add = std::move(add), remove = std::move(remove), result, why] {
+                  [path, keep_s = l.keep_s, add = std::move(add), remove = std::move(remove), result, why] {
                       const int lock = ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
                       if (lock >= 0 && ::flock(lock, LOCK_EX) != 0) {}
                       std::string text;
                       const int64_t now_s = socketley::wall::now_ms() / 1000;
                       auto all = socketley::read_file(path, text, {.missing_ok = true}, nullptr)
-                                     ? parse_suppressed(text, now_s)
+                                     ? parse_list(text, now_s)
                                      : std::unordered_map<std::string, int64_t>{};
-                      std::erase_if(all, [now_s](const auto& kv) { return now_s - kv.second > suppressed_for_s; });
+                      if (keep_s)
+                          std::erase_if(all, [now_s, keep_s](const auto& kv) { return now_s - kv.second > keep_s; });
                       for (const auto& a : add)
                           all[a] = now_s;
                       for (const auto& a : remove)
@@ -460,17 +603,17 @@ void mail_run::edit_suppressed(std::vector<std::string> add, std::vector<std::st
                       if (lock >= 0)
                           ::close(lock);
                   },
-                  [this, result, why, path, alive = m_alive] {
+                  [this, &l, result, why, path, alive = m_alive] {
                       if (!*alive)
                           return;
                       if (!why->empty())
                       {
-                          LOG_WARN(("mail " + std::string(m_owner.get_name()) +
-                                    ": the suppressed addresses could not be kept: " + *why).c_str());
+                          LOG_WARN(("mail " + std::string(m_owner.get_name()) + ": " + path + " could not be kept: " + *why)
+                                       .c_str());
                           return;
                       }
-                      m_suppressed = std::move(*result);
-                      m_suppressed_stamp = socketley::file_stamp::of(path);
+                      l.set = std::move(*result);
+                      l.stamp = socketley::file_stamp::of(path);
                   });
 }
 
@@ -515,7 +658,7 @@ void mail_run::bounce_taken(std::string_view message, std::string_view to, bool 
             {
                 if (trusted || (!token.empty() && token == verp_token(std::string_view(recipient).substr(ra + 1))))
                 {
-                    if (!m_suppressed.count(recipient) &&
+                    if (!m_suppressed.set.count(recipient) &&
                         std::find(dead.begin(), dead.end(), recipient) == dead.end())
                         dead.push_back(recipient);
                 }
@@ -529,7 +672,7 @@ void mail_run::bounce_taken(std::string_view message, std::string_view to, bool 
     if (dead.empty())
         return;
     m_suppressions += dead.size();
-    edit_suppressed(std::move(dead), {});
+    edit_list(m_suppressed, std::move(dead), {});
 }
 
 // ── Starting and stopping ───────────────────────────────────────────────────
@@ -563,7 +706,11 @@ bool mail_run::start(std::string& why)
         m_dnsbl->set_zones(m_owner.get_dnsbl());
     }
     refresh_domains();
-    load_suppressed();
+    m_suppressed.path = mail_suppressed_path(m_owner.get_name());
+    m_suppressed.keep_s = suppressed_for_s;
+    m_unsubscribed.path = mail_unsubscribed_path(m_owner.get_name());
+    load_list(m_suppressed);
+    load_list(m_unsubscribed);
     // The key of no-reply mail's tags, made by the first shard to start and read by the others.
     {
         const std::string path = mail_verp_key_path(m_owner.get_name());
@@ -1779,6 +1926,7 @@ void mail_run::conn::rcpt_to(const address& to, std::function<void(rcpt_verdict)
             return;
         }
         case route_to::sink:
+        case route_to::unsubscribe:
             done({250, ""});
             return;
         case route_to::remote:
@@ -2447,7 +2595,8 @@ void mail_run::tick()
         });
         refresh_files();
         refresh_domains();
-        load_suppressed();
+        load_list(m_suppressed);
+        load_list(m_unsubscribed);
         // Below four messages of the largest size, or 256 MiB, of room on the spool's disk, MAIL is told 452.
         struct statvfs fs{};
         if (::statvfs(m_spool.dir().c_str(), &fs) == 0)
@@ -2730,9 +2879,35 @@ void mail_run::command(uint64_t ticket, std::string_view payload)
         case verb::dns:
             answer(records_text());
             return;
+        case verb::unsubscribed:
+        {
+            load_list(m_unsubscribed);
+            std::vector<std::string> all(m_unsubscribed.set.begin(), m_unsubscribed.set.end());
+            std::sort(all.begin(), all.end());
+            std::string out;
+            for (const auto& a : all)
+                out += a + "\n";
+            answer(out);
+            return;
+        }
+        case verb::resubscribe:
+        {
+            std::string a = arg;
+            socketley::ascii::lower_in_place(a);
+            load_list(m_unsubscribed);
+            if (!m_unsubscribed.set.count(a))
+            {
+                answer("error: " + arg + " has not unsubscribed");
+                return;
+            }
+            edit_list(m_unsubscribed, {}, {a});
+            answer("ok");
+            return;
+        }
         case verb::suppressed:
         {
-            std::vector<std::string> all(m_suppressed.begin(), m_suppressed.end());
+            load_list(m_suppressed);
+            std::vector<std::string> all(m_suppressed.set.begin(), m_suppressed.set.end());
             std::sort(all.begin(), all.end());
             std::string out;
             for (const auto& a : all)
@@ -2752,13 +2927,13 @@ void mail_run::command(uint64_t ticket, std::string_view payload)
         {
             std::string a = arg;
             socketley::ascii::lower_in_place(a);
-            load_suppressed();
-            if (!m_suppressed.count(a))
+            load_list(m_suppressed);
+            if (!m_suppressed.set.count(a))
             {
                 answer("error: " + arg + " is not suppressed");
                 return;
             }
-            edit_suppressed({}, {a});
+            edit_list(m_suppressed, {}, {a});
             answer("ok");
             return;
         }
@@ -2800,6 +2975,15 @@ void mail_run::send_command(uint64_t ticket, socketley::bytes::reader& r)
         return;
     }
     std::string body, from, why;
+    if (c.ad)
+    {
+        bool skipped = false;
+        if (!advertise(c, why, skipped))
+        {
+            answer((skipped ? "skipped: " : "error: ") + why);
+            return;
+        }
+    }
     std::vector<std::string> rcpts;
     if (!m_delivery->compose_message(c, from, rcpts, body, why))
     {
@@ -2874,7 +3058,9 @@ std::string mail_run::stats() const
     put(out, "mail_spool_segments", m_spool.segments());
     put(out, "mail_spool_moved", m_spool.moved());
     put(out, "mail_bounces_taken", m_bounces_taken);
-    put(out, "mail_suppressed", m_suppressed.size());
+    put(out, "mail_suppressed", m_suppressed.set.size());
+    put(out, "mail_unsubscribed", m_unsubscribed.set.size());
+    put(out, "mail_unsubscribes", m_unsubscribes);
     if (m_imap)
     {
         size_t imap = 0;

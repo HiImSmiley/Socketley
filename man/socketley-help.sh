@@ -304,6 +304,16 @@ cli_commands() {
     echo "  A message written and queued by a mail runtime, its text from stdin or --text;"
     echo "  --cc, --bcc, --from, --reply-to, --header 'Name: value', --raw for a whole one."
     echo -e "  ${CYAN}df -h | socketley send m --to ops@example.com --subject Disks${NC}"
+    echo "  --inline logo.png sends an image inside the message, shown by the HTML as cid:logo.png."
+    echo ""
+    echo -e "${BOLD}send <mail> --template f --to <a>|idp:<idp>[/group]|db:<db>/<coll>|json:<file> [--set k=v]${NC}"
+    echo "  A message for each recipient from a template: {{name}} is their value, {{name|other}}"
+    echo "  stands where they have none, {{{name}}} goes into the HTML unescaped. --ad marks an"
+    echo "  advertisement: a link to unsubscribe of their own, List-Unsubscribe, and no mail to one"
+    echo "  who unsubscribed. --check stops before sending when the first message has a placeholder"
+    echo "  without a value, and skips a later one; --rate 5/s paces them (2/s unless said);"
+    echo "  --dry-run shows the first, --test-to <a> sends it to you alone."
+    echo -e "  ${CYAN}socketley send m --template autumn.html --to db:shop/customers --subject 'Hi {{name}}' --ad --check${NC}"
     echo ""
 
     echo -e "${BOLD}restart <name> [edit flags] [-i]${NC}"
@@ -467,6 +477,11 @@ cli_commands() {
     echo -e "  ${CYAN}socketley db-restore data /var/backups/data.dbbackup${NC}"
     echo ""
 
+    echo -e "${BOLD}db-query <db> <collection> ['{\"where\":..,\"limit\":..}']${NC}"
+    echo "  The documents a query of the db's API finds, as {\"docs\":[...]}."
+    echo -e "  ${CYAN}socketley db-query shop customers '{\"limit\":10}'${NC}"
+    echo ""
+
     echo -e "${BOLD}mqtt-pub <mqtt> [--qos 0|1|2] [--retain] <topic> [payload]${NC}"
     echo "  A message published on a broker as its own; the payload is the"
     echo "  words after the topic, or stdin. Silent when the broker has it."
@@ -500,11 +515,14 @@ cli_commands() {
     echo "  for twice, kept as a scrypt hash; needs no daemon."
     echo -e "  ${CYAN}socketley mqtt-passwd /etc/socketley/mqtt.users sensor-17${NC}"
     echo ""
-    echo -e "${BOLD}mail <mail> queue [filter] | show <id> | flush [id] | drop <id> | dns | suppressed | forgive <a>${NC}"
+    echo -e "${BOLD}mail <mail> [queue [filter] | show <id> | flush [id] | drop <id> | dns | suppressed | forgive <a>]${NC}"
+    echo -e "${BOLD}mail <mail> unsubscribed | resubscribe <a>${NC}"
     echo -e "${BOLD}mail <mail> sieve <user> list | get|put|activate|delete <name> [file] | check <file> | deactivate${NC}"
-    echo "  A mail runtime's spool: what waits and why, tried now or dropped; the DNS records"
-    echo "  its domains need; the addresses bounces said are dead; a user's Sieve filters,"
-    echo "  and as user .global the scripts any user's include :global reads."
+    echo "  Alone, what the runtime is and how it does. Its spool: what waits and why, tried now or"
+    echo "  dropped; the DNS records its domains need; the addresses bounces said are dead; those"
+    echo "  that unsubscribed from its advertisements; a user's Sieve filters, and as user .global"
+    echo "  the scripts any user's include :global reads."
+    echo -e "  ${CYAN}socketley mail m${NC}"
     echo -e "  ${CYAN}socketley mail m queue${NC}"
     echo -e "  ${CYAN}socketley mail m sieve alice put main filter.sieve${NC}"
     echo -e "  ${CYAN}socketley mail m sieve .global put spam spam.sieve${NC}"
@@ -3522,7 +3540,8 @@ RUNTIMES
   edit <name> [flags]            change a runtime's configuration
   rename <old> <new>             rename a runtime
   send <name> <data>             send through a runtime
-  send <mail> --to <address>     write and queue a message (--subject, --text, --html, --attach)
+  send <mail> --to <address>     write and queue a message (--subject, --text, --html, --attach, --inline)
+  send <mail> --template <file>  one for each recipient of --to idp:|db:|json:, filled; --ad, --check, --rate
   reload | reload-lua <name>     stop and start on the stored configuration, or reload the Lua script
 
 OTHER
@@ -3537,7 +3556,9 @@ OTHER
   git-sync --url <url> ...       mirror a git repository into a storage library
   idp-user <idp> add|passwd|...  an idp runtime's accounts
   db-backup | db-restore         a db runtime to a file, or back from one
-  mail <mail> queue|show|flush   a mail runtime's spool; dns, suppressed, forgive
+  db-query <db> <collection>     the documents a query of a db runtime finds
+  mail <mail>                    what a mail runtime is and how it does
+  mail <mail> queue|show|flush   its spool; dns, suppressed, forgive, unsubscribed, resubscribe
   mail <mail> sieve <user> ...   a user's Sieve filters: list, get, put, check, activate
   mqtt-pub | mqtt-sub            publish on a broker, or read what it accepts
   mqtt-sessions | mqtt-kick      a broker's sessions, or one disconnected

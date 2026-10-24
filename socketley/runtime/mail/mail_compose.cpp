@@ -268,6 +268,44 @@ std::string base64_lines(std::string_view data)
     return out;
 }
 
+namespace
+{
+
+// A part's name as its header parameter: quoted where it is ASCII, as RFC 2231 has it, UTF-8''%XX, where not -- never
+// an encoded word inside quotes, which RFC 2047 5 forbids and a client shows as it is.
+std::string name_param(const std::string& name)
+{
+    if (plain_ascii(name))
+        return "name=\"" + name + "\"";
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string named = "name*=UTF-8''";
+    for (const char ch : name)
+    {
+        const auto u = static_cast<unsigned char>(ch);
+        if (std::isalnum(u) || ch == '.' || ch == '-' || ch == '_')
+            named += ch;
+        else
+        {
+            named += '%';
+            named += hex[u >> 4];
+            named += hex[u & 15];
+        }
+    }
+    return named;
+}
+
+// A name and a type a header can hold, as a part's, and an inline one's name its Content-ID's too.
+bool part_fits(const attachment& a, bool inline_one, std::string& why)
+{
+    if (a.name.find_first_of(inline_one ? "\"\r\n\\<> " : "\"\r\n\\") == std::string::npos &&
+        a.type.find_first_of("\r\n\";") == std::string::npos && !(inline_one && a.name.empty()))
+        return true;
+    why = "the attachment " + a.name + " has a name or type no header can hold";
+    return false;
+}
+
+}   // namespace
+
 bool compose_message(const compose& c, const address& from, std::string_view from_name, std::string_view msgid,
                      int64_t now_ms, composed& out, std::string& why)
 {
@@ -353,15 +391,31 @@ bool compose_message(const compose& c, const address& from, std::string_view fro
     std::string body;
     const bool text = !c.text.empty() || (c.html.empty() && c.attachments.empty());
     std::string main;
-    if (text && !c.html.empty())
+    // The HTML with the images it shows by cid:<name> beside it, one related whole (RFC 2387).
+    std::string html = c.html.empty() ? std::string() : text_part("text/html", c.html);
+    if (!html.empty() && !c.inlines.empty())
+    {
+        const std::string b = boundary();
+        std::string related = "Content-Type: multipart/related; boundary=\"" + b + "\"\r\n\r\n--" + b + "\r\n" + html + "\r\n";
+        for (const auto& a : c.inlines)
+        {
+            if (!part_fits(a, true, why))
+                return false;
+            const std::string type = a.type.empty() ? "application/octet-stream" : a.type;
+            related += "--" + b + "\r\nContent-Type: " + type + "; " + name_param(a.name) + "\r\nContent-ID: <" + a.name +
+                       ">\r\nContent-Disposition: inline; file" + name_param(a.name) +
+                       "\r\nContent-Transfer-Encoding: base64\r\n\r\n" + base64_lines(a.data) + "\r\n";
+        }
+        html = related + "--" + b + "--\r\n";
+    }
+    if (text && !html.empty())
     {
         const std::string b = boundary();
         main = "Content-Type: multipart/alternative; boundary=\"" + b + "\"\r\n\r\n--" + b + "\r\n" +
-               text_part("text/plain", c.text) + "\r\n--" + b + "\r\n" + text_part("text/html", c.html) + "\r\n--" +
-               b + "--\r\n";
+               text_part("text/plain", c.text) + "\r\n--" + b + "\r\n" + html + "\r\n--" + b + "--\r\n";
     }
-    else if (!c.html.empty())
-        main = text_part("text/html", c.html);
+    else if (!html.empty())
+        main = html;
     else if (text)
         main = text_part("text/plain", c.text);
     if (c.attachments.empty())
@@ -375,33 +429,9 @@ bool compose_message(const compose& c, const address& from, std::string_view fro
         for (const auto& a : c.attachments)
         {
             const std::string type = a.type.empty() ? "application/octet-stream" : a.type;
-            if (a.name.find_first_of("\"\r\n\\") != std::string::npos || type.find_first_of("\r\n\";") != std::string::npos)
-            {
-                why = "the attachment " + a.name + " has a name or type no header can hold";
+            if (!part_fits(a, false, why))
                 return false;
-            }
-            // A name past ASCII is written as RFC 2231 has it, UTF-8''%XX, never as an encoded word inside quotes,
-            // which RFC 2047 5 forbids and a client shows as it is.
-            std::string named;
-            if (plain_ascii(a.name))
-                named = "name=\"" + a.name + "\"";
-            else
-            {
-                static constexpr char hex[] = "0123456789ABCDEF";
-                named = "name*=UTF-8''";
-                for (const char ch : a.name)
-                {
-                    const auto u = static_cast<unsigned char>(ch);
-                    if (std::isalnum(u) || ch == '.' || ch == '-' || ch == '_')
-                        named += ch;
-                    else
-                    {
-                        named += '%';
-                        named += hex[u >> 4];
-                        named += hex[u & 15];
-                    }
-                }
-            }
+            const std::string named = name_param(a.name);
             body += "--" + b + "\r\nContent-Type: " + type + "; " + named +
                     "\r\nContent-Disposition: attachment; file" + named +
                     "\r\nContent-Transfer-Encoding: base64\r\n\r\n" + base64_lines(a.data) + "\r\n";

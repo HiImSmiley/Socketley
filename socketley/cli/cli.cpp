@@ -689,6 +689,8 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("mqtt-kick"):
         case fnv1a("mqtt-retained"):
             return cli_forward(argc, argv);
+        case fnv1a("db-query"):
+            return cli_forward(argc, argv);
         case fnv1a("db-restore"):
         {
             // The backup is read by the daemon, against whose directory a relative path means something else.
@@ -955,7 +957,8 @@ int cli_send(int argc, char** argv)
     // "--" among them, are a message for a server or a client as they are.
     static constexpr std::string_view mail_flags[] = {"--to",   "-t",     "--cc",   "--bcc",  "--from",   "--reply-to",
                                                       "--subject", "-s", "--text", "--header", "--html", "--attach",
-                                                      "--raw"};
+                                                      "--raw", "--template", "--set", "--inline", "--ad", "--check",
+                                                      "--dry-run", "--test-to", "--rate"};
     if (argc >= 4 && std::any_of(std::begin(mail_flags), std::end(mail_flags),
                                  [&](std::string_view f) { return f == argv[3]; }))
         return cli_mail_send(argc, argv);

@@ -60,17 +60,23 @@ std::string mail_suppressed_path(std::string_view runtime_name)
     return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".suppressed")).string();
 }
 
+std::string mail_unsubscribed_path(std::string_view runtime_name)
+{
+    return (socketley_paths::resolve().state_dir / "mail" / (std::string(runtime_name) + ".unsubscribed")).string();
+}
+
 namespace
 {
 
 // What follows a runtime's name in a file of its state, where the file is its: its spool or a shard's, its keys,
-// suppressed list, VERP key, IMAP index, Sieve scripts and outbox; empty where the file is none of them.
+// suppressed and unsubscribed lists, VERP key, IMAP index, Sieve scripts and outbox; empty where the file is none of them.
 std::string_view state_suffix(std::string_view file, std::string_view stem)
 {
     if (!file.starts_with(stem))
         return "-";
     const std::string_view rest = file.substr(stem.size());
     if (rest.empty() || rest.starts_with(".dkim.") || rest == ".suppressed" || rest == ".suppressed.lock" ||
+        rest == ".unsubscribed" || rest == ".unsubscribed.lock" ||
         rest == ".verp" || rest == ".imap" || rest == ".sieve" || rest == ".outbox" ||
         (rest.front() == '.' && rest.size() > 1 && rest.find_first_not_of("0123456789", 1) == std::string_view::npos))
         return rest.empty() ? std::string_view(".") : rest;

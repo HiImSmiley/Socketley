@@ -36,6 +36,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   machine it took 7,140 messages of 1 KB a second from 50 clients to Postfix's
   2,654, and against Dovecot it answered eight clients' SEARCH in a tenth of
   the time.
+- **Mail from a template, for each recipient of a source, and advertisements
+  people can unsubscribe from.** `socketley send <mail> --template f.html`
+  sends each recipient a message of their own, `{{name}}` filled from their
+  values (`{{name|otherwise}}` where they have none, `{{{name}}}` unescaped in
+  the HTML), the plain part written from the HTML; the recipients are
+  addresses, `idp:<idp>[/<group>]` (its accounts and their fields),
+  `db:<db>/<collection>` (its documents) or `json:<file>`, `--set` gives
+  values for all, and `--rate` paces them (2/s unless said). `--check` stops
+  before sending when the first message has a placeholder without a value or
+  is refused, and skips a later one; `--dry-run` shows the first and
+  `--test-to` sends it to one address. `--ad` marks an advertisement: one
+  recipient each, never one who unsubscribed, with their own link where
+  `{{unsubscribe}}` is or below, List-Unsubscribe with a mailto: and the
+  one-click POST of RFC 8058, served by the webmail's port (its GET asks, so a
+  link scanner unsubscribes no one); the token is the address with an HMAC
+  under the runtime's key. `--inline` sends an image inside the message for its
+  HTML's `cid:`. `socketley mail <mail>` alone sums the runtime up, `mail
+  <mail> unsubscribed|resubscribe` keeps the list, and `socketley db-query`
+  prints what a query of a db finds.
 - **A webmail on the mail runtime.** `--web <port>` serves a mail client in the
   browser, and JMAP beside it, in plain HTTP on 127.0.0.1, and `--domain mail`
   has a dns runtime's entrance reach it under `mail.<zone>` with its TLS, as

@@ -697,7 +697,7 @@ For servers, the message is broadcast to all connected clients.
 For clients, the message is sent to the connected server.
 Respects the runtime's mode setting (fails if mode is receive-only).
 .TP
-.BI "send " "mail " "\fB\-\-to \fIaddress\fR [\fB\-\-cc\fR|\fB\-\-bcc \fIaddress\fR] [\fB\-\-from \fIaddress\fR] [\fB\-\-reply\-to \fIaddress\fR] [\fB\-\-subject \fItext\fR] [\fB\-\-text \fItext\fR] [\fB\-\-html \fIfile\fR] [\fB\-\-attach \fIfile\fR[:\fItype\fR]] [\fB\-\-header \fR'\fIName\fR: \fIvalue\fR'] [\fB\-\-raw\fR]"
+.BI "send " "mail " "\fB\-\-to \fIaddress\fR [\fB\-\-cc\fR|\fB\-\-bcc \fIaddress\fR] [\fB\-\-from \fIaddress\fR] [\fB\-\-reply\-to \fIaddress\fR] [\fB\-\-subject \fItext\fR] [\fB\-\-text \fItext\fR] [\fB\-\-html \fIfile\fR] [\fB\-\-attach \fIfile\fR[:\fItype\fR]] [\fB\-\-inline \fIimage\fR] [\fB\-\-header \fR'\fIName\fR: \fIvalue\fR'] [\fB\-\-raw\fR]"
 A message written and queued by a mail runtime, which answers its queue id:
 its text from
 .B \-\-text
@@ -720,7 +720,11 @@ is sent whole; a message to a server or a client that begins with \- is given
 after \-\-. A
 .B :type
 after an attachment is taken as its type only where it is one, type/subtype,
-and the file does not exist with it. See
+and the file does not exist with it.
+.B \-\-inline
+sends an image inside the message, which its HTML shows as
+.BI cid: name
+by the image's file name, so a reader sees it without fetching anything. See
 .BR "MAIL FLAGS" .
 .RS
 .PP
@@ -728,6 +732,78 @@ and the file does not exist with it. See
 socketley send m \-\-to ops@example.com \-\-subject "Backup done" \-\-text ok
 df \-h | socketley send m \-\-to "Ops <ops@example.com>" \-\-subject "Disks" \e
     \-\-attach report.pdf:application/pdf
+.fi
+.RE
+.TP
+.BI "send " "mail " "\fB\-\-template \fIfile\fR \fB\-\-to \fIaddress\fR|\fBidp:\fIidp\fR[\fB/\fIgroup\fR]|\fBdb:\fIdb\fB/\fIcollection\fR|\fBjson:\fIfile\fR [\fB\-\-set \fIname\fB=\fIvalue\fR] [\fB\-\-ad\fR] [\fB\-\-check\fR] [\fB\-\-rate \fIn\fB/s\fR|\fB/min\fR|\fB/h\fR] [\fB\-\-dry\-run\fR] [\fB\-\-test\-to \fIaddress\fR]"
+A message for each recipient, of their own, from a template: an HTML file, or
+.B \-\-text
+for plain text alone, and the subject, with placeholders.
+.B {{name}}
+is the recipient's value of that name,
+.B {{name|otherwise}}
+says what stands where they have none, and
+.B {{{name}}}
+puts a value into the HTML as it is, which escapes every other. The values are
+.BR \-\-set ,
+given for every recipient, and what each recipient's source says of them: an
+address of
+.B \-\-to
+has its
+.BR email ;
+.BI idp: idp
+the idp's accounts that are not disabled, those of a group after a slash, each
+with its username, name, email and every field it keeps but its password;
+.BI db: db / collection
+the collection's documents, each with its fields, an object's below its name
+.RB ( address.city );
+.BI json: file
+a JSON array of objects, or one a line. Each needs an
+.BR email ,
+and a
+.B name
+is written into its To. With an HTML template the plain part beside it is the
+HTML's text, its links written out. The messages go at
+.B \-\-rate
+(two a second unless it says), so a new sender's first thousand do not land in
+the spam folder for coming at once; what was skipped or failed is said by
+recipient, and a line says how many were sent.
+.IP
+.B \-\-check
+fills strictly: a recipient whose message has a placeholder with no value and
+no default is skipped, and one whose message is the first stops them all before
+any is sent, as is a first the runtime refuses, since a template that fails its
+first recipient is wrong for all of them. Without it a placeholder with no value
+is empty.
+.B \-\-dry\-run
+shows the first recipient's message and how many there are, and sends nothing;
+.B \-\-test\-to
+sends that message, its subject marked [test], to the address it names alone.
+.IP
+.B \-\-ad
+marks an advertisement. Each goes to one recipient, never to one who
+unsubscribed, with a link to unsubscribe of their own where the template says
+.BR {{unsubscribe}} ,
+or below what it says, and List-Unsubscribe naming it and a mailto: (RFC 2369),
+with List-Unsubscribe-Post for a provider's one click (RFC 8058). The link is
+.BI https:// webmail /unsubscribe
+where the runtime has
+.B \-\-web
+and
+.BR \-\-domain ,
+whose GET asks and whose POST unsubscribes, so a scanner opening every link
+unsubscribes no one; the mailto: is
+.BI unsubscribe@ domain
+with the token in its subject. A token is the address and an HMAC of it under the
+runtime's key, so it is kept nowhere and forged by no one. What is no
+advertisement still goes to an address that unsubscribed.
+.RS
+.PP
+.nf
+socketley send m \-\-template autumn.html \-\-inline logo.png \-\-to db:shop/customers \e
+    \-\-from news@example.com \-\-subject "Hello {{name|there}}, your code {{code}}" \e
+    \-\-ad \-\-check \-\-rate 5/s
+socketley send m \-\-template autumn.html \-\-to idp:auth/vip \-\-set code=VIP30 \-\-dry\-run
 .fi
 .RE
 .PP
@@ -927,6 +1003,22 @@ documents kept aside beside them as
 .IB dir .before\-restore ,
 the backup put in their place, and the runtime started again if it was running.
 .TP
+.BI "db\-query " "db collection " "\fR['\fIquery\fR']"
+The documents of a collection a query of the db's API finds, printed as its
+answer,
+.BR {"docs":[...]} :
+.I query
+is the object
+.B POST /c/\fIcollection\fB/_query
+takes, its where, sort, limit (up to 1000) and skip, every document up to the
+limit without one. It is asked as the operator, as a script is.
+.RS
+.PP
+.nf
+socketley db\-query shop customers '{"where":{"country":"de"},"limit":50}'
+.fi
+.RE
+.TP
 .BI "mqtt\-pub " "mqtt " "\fR[\fB\-\-qos \fR0|1|2] [\fB\-\-retain\fR] \fItopic\fR [\fIpayload\fR]"
 A message published on an mqtt runtime as its own, at the QoS and retained when
 asked: the payload is the words after the topic, or stdin when there are none,
@@ -999,8 +1091,11 @@ socketley mqtt\-passwd /etc/socketley/mqtt.users sensor\-17
 .fi
 .RE
 .TP
-.BI "mail " "mail " "queue \fR[\fIfilter\fR] | \fBshow \fIid\fR | \fBflush \fR[\fIid\fR] | \fBdrop \fIid\fR | \fBdns\fR | \fBsuppressed\fR | \fBforgive \fIaddress\fR | \fBsieve \fIuser \fBlist\fR|\fBget \fIname\fR|\fBput \fIname file\fR|\fBcheck \fIfile\fR|\fBactivate \fIname\fR|\fBdeactivate\fR|\fBdelete \fIname"
-A mail runtime's spool, of every shard:
+.BI "mail " "mail " "\fR[\fBqueue \fR[\fIfilter\fR] | \fBshow \fIid\fR | \fBflush \fR[\fIid\fR] | \fBdrop \fIid\fR | \fBdns\fR | \fBsuppressed\fR | \fBforgive \fIaddress\fR | \fBunsubscribed\fR | \fBresubscribe \fIaddress\fR | \fBsieve \fIuser \fBlist\fR|\fBget \fIname\fR|\fBput \fIname file\fR|\fBcheck \fIfile\fR|\fBactivate \fIname\fR|\fBdeactivate\fR|\fBdelete \fIname\fR]"
+Alone, a few lines of what the runtime is and how it does: its domains, users
+and mailboxes, its ports, the webmail's name, what waits, what was delivered,
+deferred, bounced, received and stored, and its lists. A mail runtime's spool,
+of every shard:
 .B queue
 lists what waits (its id, size, sender, the recipients still waiting and the
 tries), those whose id or sender holds
@@ -1018,7 +1113,11 @@ elsewhere than a dns runtime of this daemon;
 .B suppressed
 the addresses bounces said are dead, which are not mailed again until
 .B forgive
-lets one go.
+lets one go;
+.B unsubscribed
+the addresses that unsubscribed from its advertisements, until
+.B resubscribe
+takes one back.
 .B sieve
 lists a user's Sieve scripts, the active one marked, prints one, puts one from
 a file

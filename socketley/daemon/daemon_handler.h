@@ -205,6 +205,7 @@ private:
     int cmd_action(ipc_connection* conn, const parsed_args& pa);
     int cmd_idp_user(ipc_connection* conn, const parsed_args& pa);
     int cmd_db_backup(ipc_connection* conn, const parsed_args& pa);
+    int cmd_db_query(ipc_connection* conn, const parsed_args& pa);
     int cmd_db_restore(ipc_connection* conn, const parsed_args& pa);
     // One request to a runtime's worker and its answer, waited for here; false with the reason in conn's write_buf.
     bool ask_worker(ipc_connection* conn, std::string_view runtime, std::string_view payload, std::string& reply,

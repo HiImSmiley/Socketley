@@ -29,6 +29,9 @@ enum class verb : uint8_t
     // A message to send too large for the channel, its send command in a file of the runtime's outbox: the
     // argument is the file's name, and the file is gone once it is read.
     send_file  = 10,
+    // The addresses that unsubscribed from advertisements, and one of them taken back.
+    unsubscribed = 11,
+    resubscribe  = 12,
 };
 
 struct attachment
@@ -52,6 +55,10 @@ struct compose
     std::string raw;
     // A message kept rather than sent, as JMAP makes one: written with its Bcc, and with no recipient yet if it has none.
     bool draft{false};
+    // Images the HTML shows by cid:<name>, sent inside the message rather than fetched.
+    std::vector<attachment> inlines;
+    // An advertisement: to one recipient, not one who unsubscribed, with a link to unsubscribe at {{unsubscribe}}.
+    bool ad{false};
 };
 
 inline void put_list(socketley::bytes::writer& w, const std::vector<std::string>& v)
@@ -94,6 +101,14 @@ inline std::string command_send(const compose& c)
         w.bytes(a.data);
     }
     w.bytes(c.raw);
+    w.u32(static_cast<uint32_t>(c.inlines.size()));
+    for (const auto& a : c.inlines)
+    {
+        w.bytes(a.name);
+        w.bytes(a.type);
+        w.bytes(a.data);
+    }
+    w.flag(c.ad);
     return w.take();
 }
 
@@ -108,7 +123,17 @@ inline bool decode_send(socketley::bytes::reader& r, compose& c, size_t max_size
     for (auto& a : c.attachments)
         if (!r.bytes(a.name, 1024) || !r.bytes(a.type, 256) || !r.bytes(a.data, max_size))
             return false;
-    return r.bytes(c.raw, max_size);
+    if (!r.bytes(c.raw, max_size) || !r.u32(n) || n > 1000)
+        return false;
+    c.inlines.resize(n);
+    for (auto& a : c.inlines)
+        if (!r.bytes(a.name, 1024) || !r.bytes(a.type, 256) || !r.bytes(a.data, max_size))
+            return false;
+    uint8_t ad = 0;
+    if (!r.u8(ad))
+        return false;
+    c.ad = ad != 0;
+    return true;
 }
 
 // A verb with one text argument, or none: queue, show, flush, drop.

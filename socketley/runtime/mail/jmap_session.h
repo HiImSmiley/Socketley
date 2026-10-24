@@ -54,6 +54,8 @@ public:
         virtual std::string idp_logout(const std::string& /*back*/) { return {}; }
         // The client the entrance forwards, whose failed sign-ins count against it.
         virtual void forward(std::string /*client*/) {}
+        // An advertisement's recipient unsubscribed by the token its link carries, false where the token is none.
+        virtual bool unsubscribe(const std::string& /*token*/) { return false; }
         // The address a signed-in user sends as.
         virtual std::string address_of(const std::string& user) = 0;
         // A message queued to go from `from` to `rcpts`, answered with its spool id.
@@ -119,6 +121,8 @@ private:
     void eventsource(const request& rq);
     // The webmail page, and who it is signed in as.
     void page(const request& rq);
+    // An advertisement's link to unsubscribe: a page asking to, and its POST, as a provider's one click sends it.
+    void unsubscribe_page(const request& rq);
     void web_session(const request& rq);
 
     // The calls of a request, one after the other, each with what came before it to refer back to.

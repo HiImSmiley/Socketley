@@ -58,7 +58,7 @@ class mail_lua;
 // Where a recipient's mail goes: a mailbox of this runtime, an address elsewhere, or nowhere.
 struct route_to
 {
-    enum kind : uint8_t { none, mailbox, remote, sink } k{none};
+    enum kind : uint8_t { none, mailbox, remote, sink, unsubscribe } k{none};
     // The mailbox's owner, or the address mail is sent on to.
     std::string target;
 };
@@ -95,6 +95,14 @@ public:
     const alias_table& aliases() const { return m_aliases.value(); }
     // An address a bounce said is dead, which mail is not sent to again until it is forgiven.
     bool suppressed(std::string_view addr) const;
+    // What an advertisement to `addr` carries to unsubscribe it, and the address a token stands for, empty where the
+    // token is not this runtime's.
+    std::string unsubscribe_token(std::string_view addr) const;
+    std::string unsubscribe_address(std::string_view token) const;
+    // `addr` unsubscribed by its token, false where the token is none.
+    bool unsubscribe(std::string_view token);
+    // Where the webmail is reached through the entrance, https://<its --domain>, empty without one.
+    std::string web_url() const;
     // A bounce taken for `to`, no-reply+<token>@: the recipients it says failed, suppressed where the token is the
     // one this runtime sent mail for their domain under, so no one else's word suppresses an address.
     // A report this runtime made itself is its own word, `trusted`.
@@ -243,6 +251,7 @@ private:
         std::string idp_login(const std::string& back) override;
         std::string idp_logout(const std::string& back) override;
         void forward(std::string client) override { forwarded = std::move(client); }
+        bool unsubscribe(const std::string& token) override { return run->unsubscribe(token); }
         void push(const std::string& url, const std::string& p256dh, const std::string& auth, std::string body) override
         {
             run->push_send(url, p256dh, auth, std::move(body));
@@ -293,12 +302,22 @@ private:
     void publish_records();
     std::string records_text() const;
     std::string m_published;
-    std::unordered_set<std::string> m_suppressed;
-    std::optional<socketley::file_stamp> m_suppressed_stamp;
+    // An address list a file keeps for every shard: the suppressed for 90 days after a bounce, the unsubscribed for good.
+    struct address_list
+    {
+        std::string path;
+        int64_t keep_s{0};
+        std::unordered_set<std::string> set;
+        std::optional<socketley::file_stamp> stamp;
+    };
+    address_list m_suppressed, m_unsubscribed;
     // Read again when another shard changed it; changed on a thread, under the file's lock, merged with what the
     // other shards wrote, and entries past ninety days let go.
-    void load_suppressed();
-    void edit_suppressed(std::vector<std::string> add, std::vector<std::string> remove);
+    // An advertisement made ready for its one recipient: its link to unsubscribe where {{unsubscribe}} is, or added,
+    // and List-Unsubscribe; false with `why`, `skipped` where the recipient unsubscribed.
+    bool advertise(compose& c, std::string& why, bool& skipped);
+    void load_list(address_list& l);
+    void edit_list(address_list& l, std::vector<std::string> add, std::vector<std::string> remove);
     std::string m_verp_key;
     // The session of a connection once it may speak: at the accept, or once its TLS handshake is done.
     void begin_session(conn& c);
@@ -408,6 +427,7 @@ private:
     uint64_t m_spool_failed{0};
     uint64_t m_bounces_taken{0};
     uint64_t m_suppressions{0};
+    uint64_t m_unsubscribes{0};
     uint64_t m_bounces_unverified{0};
     uint32_t m_checks_out{0};
     uint64_t m_checked{0};

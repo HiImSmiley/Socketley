@@ -503,6 +503,22 @@ void delivery::dispatch(const entry_ptr& e)
                     m_run.queue().mark(*e, i, rcpt_state::failed, "550 5.1.1 no such user here");
                 continue;
             }
+            if (r.k == route_to::unsubscribe)
+            {
+                // A mailto: of an advertisement's List-Unsubscribe: its token is in the Subject.
+                m_run.queue().read(e, 0, static_cast<uint32_t>(std::min<uint64_t>(e->body_len, 64u << 10)),
+                                   [this, alive = m_alive](bool ok, std::string_view b) {
+                                       if (!*alive || !ok)
+                                           return;
+                                       std::string token = header_value(header_block(b), "Subject");
+                                       while (!token.empty() && (token.back() == ' ' || token.back() == '\t'))
+                                           token.pop_back();
+                                       const size_t sp = token.find_last_of(" \t");
+                                       m_run.unsubscribe(sp == std::string::npos ? token : token.substr(sp + 1));
+                                   });
+                m_run.queue().mark(*e, i, rcpt_state::delivered, "taken as an unsubscribe");
+                continue;
+            }
             if (r.k == route_to::sink)
             {
                 // A bounce to no-reply@: whom it says failed is not mailed again.

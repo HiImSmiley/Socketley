@@ -1507,6 +1507,7 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("mail-send"):
         case fnv1a("mail"):          return cmd_mail(conn, pa);
         case fnv1a("db-restore"):    return cmd_db_restore(conn, pa);
+        case fnv1a("db-query"):      return cmd_db_query(conn, pa);
         case fnv1a("startup"):       return cmd_startup(conn, pa);
         default:
             std::cout << "unknown command: " << pa.args[0] << "\n";
@@ -3044,7 +3045,9 @@ int daemon_handler::cmd_mail(ipc_connection* conn, const parsed_args& pa)
     const ml::verb v = what == "queue" ? ml::verb::queue : what == "show" ? ml::verb::show
                      : what == "flush" ? ml::verb::flush : what == "drop" ? ml::verb::drop
                      : what == "dns"   ? ml::verb::dns   : what == "suppressed" ? ml::verb::suppressed
-                     : what == "forgive" ? ml::verb::forgive : what == "sieve" ? ml::verb::sieve : ml::verb::send;
+                     : what == "forgive" ? ml::verb::forgive : what == "sieve" ? ml::verb::sieve
+                     : what == "unsubscribed" ? ml::verb::unsubscribed
+                     : what == "resubscribe" ? ml::verb::resubscribe : ml::verb::send;
     if (v == ml::verb::send)
     {
         conn->write_buf = command_usage::line("mail");
@@ -3052,8 +3055,8 @@ int daemon_handler::cmd_mail(ipc_connection* conn, const parsed_args& pa)
     }
     const std::string arg = pa.count > 3 ? std::string(pa.args[3]) : std::string();
     const std::string payload = ml::command_text(v, arg);
-    // The users' scripts are files every shard reads, so the first shard keeps them.
-    if (v == ml::verb::sieve)
+    // The users' scripts and the unsubscribed are files every shard reads, so the first shard answers for them.
+    if (v == ml::verb::sieve || v == ml::verb::unsubscribed || v == ml::verb::resubscribe)
     {
         std::string one;
         if (!ask_worker(conn, name, payload, one, std::chrono::seconds(10), 0))
@@ -3326,6 +3329,51 @@ int daemon_handler::cmd_mqtt(ipc_connection* conn, const parsed_args& pa)
 
 // A backup of a db runtime into a file: started by the worker, which answers its number at once, and asked after by
 // that number, so a database of any size never holds the daemon up waiting for it.
+// A collection's documents as a query of the db's API finds them, answered as its JSON body, {"docs":[...]}.
+int daemon_handler::cmd_db_query(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count != 3 && pa.count != 4)
+    {
+        conn->write_buf = command_usage::line("db-query");
+        return 1;
+    }
+    const std::string_view name = pa.args[1];
+    auto* instance = m_manager.get(name);
+    if (!instance || instance->get_type() != runtime_db)
+    {
+        conn->write_buf = "no db runtime named " + std::string(name) + "\n";
+        return 1;
+    }
+    if (instance->get_state() != runtime_running)
+    {
+        conn->write_buf = "runtime is not running: " + std::string(name) + "\n";
+        return 1;
+    }
+    std::string payload(socketley::db::call_marker);
+    payload += "{\"method\":\"POST\",\"path\":";
+    socketley::json::quote_into(payload, "/c/" + std::string(pa.args[2]) + "/_query");
+    payload += ",\"body\":" + (pa.count == 4 ? std::string(pa.args[3]) : std::string("{}")) + "}";
+    std::string reply;
+    if (!ask_worker(conn, name, payload, reply))
+        return 2;
+    socketley::db::jvalue v;
+    const socketley::db::jvalue* status = nullptr;
+    const socketley::db::jvalue* body = nullptr;
+    if (!socketley::db::json_reader(reply).document(v) || !(status = socketley::db::member(v, "status")) ||
+        !(body = socketley::db::member(v, "body")))
+    {
+        conn->write_buf = "the database's answer could not be read\n";
+        return 2;
+    }
+    if (status->s != "200")
+    {
+        conn->write_buf = "error: " + status->s + " " + socketley::json::written(*body) + "\n";
+        return 1;
+    }
+    conn->write_buf = socketley::json::written(*body) + "\n";
+    return 0;
+}
+
 int daemon_handler::cmd_db_backup(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count != 3 && !(pa.count == 4 && pa.args[2] == "--status"))
