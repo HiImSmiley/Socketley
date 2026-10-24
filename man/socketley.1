@@ -13070,6 +13070,41 @@ until renewed) is verified by the code pushed to its URL, then sent a
 StateChange whenever the types it asked for change, over HTTPS to a public
 address, encrypted where it gave keys (RFC 8291).
 .PP
+.B Webmail.
+With
+.B \-\-web
+and
+.B \-\-domain
+the entrance serves a mail client in the browser under the name, in the look
+of the storage interface: the mailboxes with their unread counts and a starred
+view, the messages a page at a time, a search over all of them, reading,
+writing, replying and forwarding with attachments, drafts, moving, flags and
+deletion, a name, a signature and an out-of-office answer, and new mail as it
+comes. It signs in through the idp runtime, whose session cookie under its
+.B \-\-cookie\-domain
+signs the user in to every runtime of it at once, and sends a page not signed
+in to the idp's
+.BR /login .
+A change the cookie alone signs carries the page's
+.B X\-Socketley\-UI
+header, which another site cannot make a browser send, and an answer to the
+cookie is readable by no other origin. A message's HTML is cleaned of what
+runs, submits or reaches out, and shown in a frame sandboxed without scripts;
+its remote images wait until the reader asks for them, for that message or
+for its sender from then on. The page's one script runs by its hash alone. On
+the same port a JMAP client signs in as on
+.BR \-\-jmap ,
+with a password only where the entrance forwarded HTTPS, and a client that
+fails ten times is locked out by the address the entrance forwards for it.
+.RS
+.PP
+.nf
+socketley create mail m \-p 25 \-\-dns ns \-\-idp auth \-\-storage files/mail \e
+    \-\-imaps 993 \-\-submissions 465 \-\-tls \-\-cert mail.pem \-\-key mail.key \e
+    \-\-web 9480 \-\-domain mail \-s
+.fi
+.RE
+.PP
 .B From the other runtimes.
 .B socketley send
 and a script's
@@ -13258,6 +13293,25 @@ needs
 .B \-\-idp
 and
 .BR \-\-storage .
+.TP
+.BI "\-\-web " port
+The webmail, and JMAP beside it, in plain HTTP on 127.0.0.1 for the entrance in
+front of it, which takes the TLS (see
+.BR Webmail );
+needs
+.B \-\-idp
+and
+.BR \-\-storage .
+.TP
+.BI "\-\-domain " name\fR[,\fIname\fR...]
+The names the entrance of a dns runtime with
+.B \-\-proxy
+reaches the webmail under, a name without a dot under each of its zones, as
+.B webmail
+or
+.BR mail ;
+needs
+.BR \-\-web .
 .TP
 .BI "\-\-lmtp " port
 LMTP for this machine's own programs, into the mailboxes only; a connection

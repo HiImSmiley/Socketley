@@ -691,6 +691,8 @@ bool mail_run::start(std::string& why)
             return false;
         if (m_owner.get_jmap_port() && !open_listener(m_jmap_l, m_owner.get_jmap_port(), port_kind::jmap, why))
             return false;
+        if (m_owner.get_web_port() && !open_listener(m_web_l, m_owner.get_web_port(), port_kind::web, why))
+            return false;
     }
     if (takes_mail && m_mailboxes && m_mailboxes->enabled() && m_owner.get_lmtp_port() &&
         !open_listener(m_lmtp_l, m_owner.get_lmtp_port(), port_kind::lmtp, why))
@@ -727,7 +729,9 @@ bool mail_run::open_listener(listener& l, uint16_t port, port_kind kind, std::st
     l.kind = kind;
     // With no address to bind, one socket takes IPv6 and IPv4 alike, as an MX reachable over both must; an IPv6
     // address binds that alone, and an IPv4 one, or a kernel without IPv6, IPv4.
-    const std::string_view bind = m_owner.get_bind_address();
+    // The webmail port is the entrance's alone, which reaches it on 127.0.0.1 and takes its TLS.
+    const bool local = kind == port_kind::web;
+    const std::string_view bind = local ? std::string_view("127.0.0.1") : m_owner.get_bind_address();
     in6_addr v6{};
     const bool v6_bind = bind.find(':') != std::string_view::npos &&
                          ::inet_pton(AF_INET6, std::string(bind).c_str(), &v6) == 1;
@@ -761,7 +765,7 @@ bool mail_run::open_listener(listener& l, uint16_t port, port_kind kind, std::st
     {
         auto& a = reinterpret_cast<sockaddr_in&>(st);
         a.sin_family = AF_INET;
-        a.sin_addr.s_addr = m_owner.bind_in_addr();
+        a.sin_addr.s_addr = local ? htonl(INADDR_LOOPBACK) : m_owner.bind_in_addr();
         a.sin_port = htons(port);
         len = sizeof a;
     }
@@ -965,12 +969,14 @@ void mail_run::begin_session(conn& c)
     }
     else if (c.kind == port_kind::sts)
         c.sts = true;
-    else if (c.kind == port_kind::jmap)
+    else if (c.kind == port_kind::jmap || c.kind == port_kind::web)
     {
         jmap_config cfg;
         cfg.hostname = m_hostname;
         cfg.tls_active = c.ssl != nullptr && c.handshaken;
-        cfg.login_in_clear = loopback(c.peer);
+        cfg.web = c.kind == port_kind::web;
+        // Behind the entrance every peer is 127.0.0.1, so a password goes only where it forwards HTTPS.
+        cfg.login_in_clear = loopback(c.peer) && !cfg.web;
         cfg.max_size = m_owner.get_max_size();
         c.jmap = std::make_unique<jmap_session>(cfg, c, *m_imap);
     }
@@ -1542,15 +1548,17 @@ void mail_run::conn::authenticate(std::string_view, std::string user, std::strin
     mail_run& r = *run;
     // An address that failed too often lately is told to come back later, its password not looked at.
     const int64_t now = wall::now_ms_coarse();
-    const bool guarded = !loopback(peer);
-    if (guarded && r.m_clients[ip].locked_until_ms > now)
+    // Behind the entrance it is the client it forwards, which loopback never exempts.
+    const std::string& from = forwarded.empty() ? ip : forwarded;
+    const bool guarded = !forwarded.empty() || !loopback(peer);
+    if (guarded && r.m_clients[from].locked_until_ms > now)
     {
         ++r.m_auth_locked;
         done(account::unreachable, {});
         return;
     }
     // A wrong answer waits a second before it is said, and counts against its address.
-    auto finish = [&r, alive = r.m_alive, done, guarded, ip = ip](account a, std::string name) {
+    auto finish = [&r, alive = r.m_alive, done, guarded, ip = from](account a, std::string name) {
         if (!*alive)
             return;
         if (a != account::no)
@@ -2080,6 +2088,29 @@ void mail_run::conn::bearer(std::string token, std::function<void(account, std::
     done(account::yes, who.username.empty() ? who.sub : who.username);
 }
 
+void mail_run::conn::cookie(std::string cookies, std::function<void(account, std::string)> done)
+{
+    socketley::idp::session_verifier::who who;
+    if (!run->m_idp || !run->m_idp->check(cookies, who))
+    {
+        done(account::no, {});
+        return;
+    }
+    idp_user = true;
+    user_email = who.email;
+    done(account::yes, who.username.empty() ? who.sub : who.username);
+}
+
+std::string mail_run::conn::idp_login(const std::string& back)
+{
+    return run->m_idp ? run->m_idp->login_url(back) : std::string();
+}
+
+std::string mail_run::conn::idp_logout(const std::string& back)
+{
+    return run->m_idp ? run->m_idp->logout_url(back) : std::string();
+}
+
 std::string mail_run::conn::address_of(const std::string& user)
 {
     if (!user_email.empty())
@@ -2294,6 +2325,8 @@ void mail_run::on_cqe(struct io_uring_cqe* cqe)
         accept_done(m_sts_l, cqe);
     else if (req == &m_jmap_l.req)
         accept_done(m_jmap_l, cqe);
+    else if (req == &m_web_l.req)
+        accept_done(m_web_l, cqe);
     else if (conn* c = conn_of(req))
     {
         if (req == &c->rd)

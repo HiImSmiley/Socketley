@@ -143,9 +143,13 @@ bool parse_mailbox(std::string_view in, address& out, std::string* display)
         if (display)
         {
             std::string_view name = trim(in.substr(0, lt));
+            display->clear();
+            // A quoted name is read with its quoted pairs, \" and \\, as the characters they stand for (RFC 5322 3.2.4).
             if (name.size() >= 2 && name.front() == '"' && name.back() == '"')
-                name = name.substr(1, name.size() - 2);
-            *display = std::string(name);
+                for (size_t i = 1; i + 1 < name.size(); ++i)
+                    display->push_back(name[i] == '\\' && i + 2 < name.size() ? name[++i] : name[i]);
+            else
+                *display = std::string(name);
         }
     }
     else if (display)
@@ -269,7 +273,7 @@ bool compose_message(const compose& c, const address& from, std::string_view fro
 {
     out = {};
     out.from = from.text();
-    std::vector<std::string> to_h, cc_h;
+    std::vector<std::string> to_h, cc_h, bcc_h;
     const auto take = [&](const std::vector<std::string>& list, std::vector<std::string>* header) {
         for (const auto& one : list)
         {
@@ -286,9 +290,9 @@ bool compose_message(const compose& c, const address& from, std::string_view fro
         }
         return true;
     };
-    if (!take(c.to, &to_h) || !take(c.cc, &cc_h) || !take(c.bcc, nullptr))
+    if (!take(c.to, &to_h) || !take(c.cc, &cc_h) || !take(c.bcc, c.draft ? &bcc_h : nullptr))
         return false;
-    if (out.rcpts.empty())
+    if (out.rcpts.empty() && !c.draft)
     {
         why = "the message names no recipient";
         return false;
@@ -311,6 +315,8 @@ bool compose_message(const compose& c, const address& from, std::string_view fro
         h += "To: " + list(to_h) + "\r\n";
     if (!cc_h.empty())
         h += "Cc: " + list(cc_h) + "\r\n";
+    if (!bcc_h.empty())
+        h += "Bcc: " + list(bcc_h) + "\r\n";
     if (!c.reply_to.empty())
     {
         address a;

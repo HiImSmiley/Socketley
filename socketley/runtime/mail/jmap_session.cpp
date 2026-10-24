@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "mail_mime.h"
+#include "mail_web.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/util/ascii.h"
 #include "../../shared/util/base64.h"
@@ -28,6 +29,7 @@ std::string reason_of(int code)
         case 200: return "OK";
         case 201: return "Created";
         case 204: return "No Content";
+        case 304: return "Not Modified";
         case 400: return "Bad Request";
         case 401: return "Unauthorized";
         case 403: return "Forbidden";
@@ -294,8 +296,10 @@ void jmap_session::respond(int code, std::string_view type, std::string_view bod
     if (!type.empty())
         out += "Content-Type: " + std::string(type) + "\r\n";
     out += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-    // A web client of another origin may call it; what it reads still needs the user's credentials.
-    out += "Access-Control-Allow-Origin: *\r\nCache-Control: no-store\r\n";
+    // A web client of another origin may call it with the user's credentials, never with the webmail's cookie.
+    if (!m_from_page)
+        out += "Access-Control-Allow-Origin: *\r\n";
+    out += "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n";
     out.append(extra);
     out += "\r\n";
     out.append(body);
@@ -309,8 +313,13 @@ void jmap_session::fail(int code, std::string_view type, std::string_view detail
     body += ",\"status\":" + std::to_string(code) + ",\"detail\":";
     json::quote_into(body, detail);
     body += "}";
-    respond(code, "application/problem+json", body,
-            code == 401 ? "WWW-Authenticate: Basic realm=\"jmap\", charset=\"UTF-8\"\r\n" : "");
+    // The webmail page is sent to the idp to sign in, not shown the browser's own prompt for a password.
+    std::string extra;
+    if (code == 401 && !m_from_page)
+        extra = "WWW-Authenticate: Basic realm=\"jmap\", charset=\"UTF-8\"\r\n";
+    else if (code == 401 && !m_login.empty())
+        extra = "X-Socketley-Idp-Login: " + m_login + "\r\n";
+    respond(code, "application/problem+json", body, extra);
 }
 
 void jmap_session::finished()
@@ -332,7 +341,7 @@ std::string jmap_session::base_url(const request& rq) const
     std::string host = rq.header("host");
     if (host.empty() || host.find_first_of(" /\\\"<>") != std::string::npos)
         host = m_cfg.hostname;
-    return std::string(m_cfg.tls_active ? "https://" : "http://") + host;
+    return std::string(m_cfg.tls_active || m_https ? "https://" : "http://") + host;
 }
 
 void jmap_session::handle(request rq)
@@ -340,6 +349,27 @@ void jmap_session::handle(request rq)
     // A request is answered, and the next taken, once it is done.
     m_keep = rq.keep_alive;
     const auto after = [this] { finished(); };
+    m_https = m_from_page = false;
+    m_login.clear();
+    if (m_cfg.web)
+    {
+        // Behind the entrance: the scheme it was reached over and the client it forwards are the ones that count.
+        m_https = socketley::ascii::iequals(rq.header("x-forwarded-proto"), "https");
+        const std::string forwarded_for = rq.header("x-forwarded-for");
+        std::string_view xff = forwarded_for;
+        if (const size_t comma = xff.rfind(','); comma != std::string_view::npos)
+            xff.remove_prefix(comma + 1);
+        while (!xff.empty() && xff.front() == ' ')
+            xff.remove_prefix(1);
+        if (!xff.empty() && xff.size() <= 45 && xff.find_first_not_of("0123456789abcdefABCDEF:.") == std::string_view::npos)
+            m_hooks.forward(std::string(xff));
+        m_from_page = !rq.header("x-socketley-ui").empty() || !rq.header("cookie").empty();
+        if ((rq.method == "GET" || rq.method == "HEAD") && rq.path == "/")
+        {
+            page(rq);
+            return after();
+        }
+    }
     if (rq.method == "OPTIONS")
     {
         respond(204, {}, {}, "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
@@ -348,13 +378,13 @@ void jmap_session::handle(request rq)
         return after();
     }
     const std::string auth = rq.header("authorization");
-    if (auth.empty())
-    {
-        fail(401, "about:blank", "sign in with HTTP Basic or a bearer token");
-        return after();
-    }
     const auto serve = [this, after](request r) {
         const std::string& p = r.path;
+        if (p == "/~mail/session" && r.method == "GET" && m_cfg.web)
+        {
+            web_session(r);
+            return after();
+        }
         if ((p == "/.well-known/jmap" || p == "/jmap/session") && r.method == "GET")
         {
             respond(200, "application/json", session_json(r));
@@ -395,6 +425,38 @@ void jmap_session::handle(request rq)
         fail(404, "about:blank", "nothing is here");
         return after();
     };
+    if (auth.empty())
+    {
+        const std::string cookies = m_cfg.web ? rq.header("cookie") : std::string();
+        if (m_cfg.web)
+            m_login = m_hooks.idp_login(base_url(rq) + "/");
+        if (cookies.empty())
+        {
+            fail(401, "about:blank", "sign in with HTTP Basic or a bearer token");
+            return after();
+        }
+        // A change signed in by the cookie alone carries the page's header, which another site cannot make a browser send.
+        if (rq.method != "GET" && rq.method != "HEAD" && rq.header("x-socketley-ui").empty())
+        {
+            fail(403, "about:blank", "a change signed in by the webmail's cookie carries X-Socketley-UI");
+            return after();
+        }
+        // The cookie is looked at on every request, so a session that ended or was signed out ends here at once.
+        return m_hooks.cookie(cookies, [this, serve, after, rq, alive = m_alive](account a, std::string name) mutable {
+            if (!*alive)
+                return;
+            if (a != account::yes || name.empty())
+            {
+                m_user.clear();
+                m_auth_seen.clear();
+                fail(401, "about:blank", "the session has ended: sign in again");
+                return after();
+            }
+            m_user = std::move(name);
+            m_auth_seen.clear();
+            serve(std::move(rq));
+        });
+    }
     if (!m_user.empty() && auth == m_auth_seen)
         return serve(std::move(rq));
     const auto signed_in = [this, auth, serve, after, rq, alive = m_alive](account a, std::string name) mutable {
@@ -423,8 +485,8 @@ void jmap_session::handle(request rq)
         fail(401, "about:blank", "sign in with HTTP Basic or a bearer token");
         return after();
     }
-    // A password goes over TLS, or in the clear from this machine alone.
-    if (!m_cfg.tls_active && !m_cfg.login_in_clear)
+    // A password goes over TLS, the entrance's HTTPS, or in the clear from this machine alone.
+    if (!m_cfg.tls_active && !m_https && !m_cfg.login_in_clear)
     {
         fail(403, "about:blank", "a password is taken over TLS only");
         return after();
@@ -784,6 +846,36 @@ void jmap_session::download(const request&, const std::string& account, const st
     });
 }
 
+void jmap_session::page(const request& rq)
+{
+    // The page changes only with the binary, so a browser's copy is asked after and answered 304 while it holds.
+    const web_page& w = webmail_page();
+    const bool same = rq.header("if-none-match").find(w.etag) != std::string::npos;
+    std::string out = same ? "HTTP/1.1 304 Not Modified\r\n" : "HTTP/1.1 200 OK\r\n";
+    out += "ETag: " + w.etag + "\r\nCache-Control: no-cache\r\n";
+    if (!same)
+        out += "Content-Type: text/html; charset=utf-8\r\nContent-Length: " + std::to_string(w.html.size()) + "\r\n";
+    out += "Content-Security-Policy: " + w.csp +
+           "\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n\r\n";
+    if (!same && rq.method != "HEAD")
+        out += w.html;
+    m_hooks.reply(out);
+}
+
+void jmap_session::web_session(const request& rq)
+{
+    std::string out = "{\"user\":";
+    json::quote_into(out, m_user);
+    out += ",\"account\":";
+    json::quote_into(out, account_of(m_user));
+    out += ",\"address\":";
+    json::quote_into(out, m_hooks.address_of(m_user));
+    out += ",\"logout\":";
+    json::quote_into(out, m_hooks.idp_logout(base_url(rq) + "/"));
+    out += "}";
+    respond(200, "application/json", out);
+}
+
 void jmap_session::eventsource(const request& rq)
 {
     // ping is seconds between pings, the least a client may ask 30 (RFC 8620 7.3).
@@ -795,8 +887,8 @@ void jmap_session::eventsource(const request& rq)
     m_stream = true;
     m_stream_state = email_state(m_store, m_user) + mailbox_state(m_store, m_user);
     m_last_sent_ms = wall::now_ms_coarse();
-    m_hooks.reply("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
-                  "Access-Control-Allow-Origin: *\r\n\r\n");
+    m_hooks.reply(std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n") +
+                  (m_from_page ? "" : "Access-Control-Allow-Origin: *\r\n") + "\r\n");
     m_busy = false;
 }
 

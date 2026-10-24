@@ -30,7 +30,7 @@ constexpr row rows[] = {
     {"--bind", "SPKTDIBME", "text", "Bind address", "The address the port is bound on alone, such as 127.0.0.1 for one only a proxy here reaches.", "Network", {}, "127.0.0.1"},
     {"--listen", "SPKT", "text", "Unix socket", "Listen on a unix socket instead of a port.", "Network", {}, "unix:/run/socketley/app.sock"},
     {"--shards", "SPKTDIBME", "int", "Shards", "Worker processes sharing the port: the way one runtime uses more than one core.", "Network", {}, "4"},
-    {"--domain", "SPKTIB", "list", "Names", "The names it is reached by through the entrance; empty for its own name.", "Network", {}, "chat, api.example.com"},
+    {"--domain", "SPKTIBE", "list", "Names", "The names it is reached by through the entrance; empty for its own name.", "Network", {}, "chat, api.example.com"},
     {"--cpus", "SCPKTDIBME", "text", "CPUs", "The CPUs its I/O may run on, as 0-3,6.", "Network", {}, "0-3"},
 
     // ── TLS ─────────────────────────────────────────────────────────────────
@@ -198,6 +198,7 @@ constexpr row rows[] = {
     {"--pop3", "E", "int", "POP3 port", "A port mail clients fetch the INBOX on with POP3.", "Mail ports", {}, "110"},
     {"--pop3s", "E", "int", "POP3 over TLS", "A port mail clients fetch the INBOX on over TLS.", "Mail ports", {}, "995"},
     {"--jmap", "E", "int", "JMAP port", "A port mail clients and web apps read and send mail on with JMAP.", "Mail ports", {}, "8443"},
+    {"--web", "E", "int", "Webmail port", "The webmail and JMAP in plain HTTP on 127.0.0.1, for the entrance --domain names it through.", "Mail ports", {}, "9480"},
     {"--lmtp", "E", "int", "LMTP port", "A port a mail server on this machine hands mail for the mailboxes to.", "Mail ports", {}, "24"},
     {"--mta-sts-port", "E", "int", "MTA-STS port", "An HTTPS port the MTA-STS policy of its domains is served on.", "Mail ports", {}, "443"},
     {"--greylist", "E", "duration", "Greylist delay", "Tell a first sender, recipient and network to come back after this long.", "Mail limits", {}, "5m"},
@@ -353,6 +354,7 @@ constexpr state_key_row state_keys[] = {
     {"--pop3", "pop3"},
     {"--pop3s", "pop3s"},
     {"--jmap", "jmap"},
+    {"--web", "web"},
     {"--lmtp", "lmtp"},
     {"--mta-sts-port", "mta_sts_port"},
     {"--greylist", "greylist"},

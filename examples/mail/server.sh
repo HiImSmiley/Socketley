@@ -6,10 +6,10 @@
 # A dns runtime serves example.com and the mail runtime gives the zone its MX,
 # SPF, DKIM, DMARC and SRV records. The users of an idp runtime get mailboxes
 # in a storage runtime, within a quota, send on 587 with their password, read
-# over IMAP on every shard and put Sieve filters over ManageSieve; the apps
-# send from no-reply@example.com, and the daemon's alerts are mailed. A
-# blocklist keeps out what it lists. Ports 25, 587 and 143 need the daemon to
-# be allowed to bind them.
+# over IMAP on every shard or at https://mail.example.com in the browser, and
+# put Sieve filters over ManageSieve; the apps send from no-reply@example.com,
+# and the daemon's alerts are mailed. A blocklist keeps out what it lists.
+# Ports 25, 587 and 143 need the daemon to be allowed to bind them.
 # =============================================================================
 
 set -e
@@ -22,7 +22,7 @@ socketley idp-user auth add alice --password - --email alice@example.com \
 
 socketley create mail m -p 25 --dns ns --no-reply \
     --idp auth --storage files/mail \
-    --submission 587 --imap 143 --sieve 4190 --shards 2 \
+    --submission 587 --imap 143 --sieve 4190 --shards 2 --web 9480 --domain mail \
     --dnsbl zen.spamhaus.org \
     --tls --cert /etc/ssl/mail.example.com.pem --key /etc/ssl/mail.example.com.key -s
 

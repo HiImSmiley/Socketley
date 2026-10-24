@@ -36,6 +36,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   machine it took 7,140 messages of 1 KB a second from 50 clients to Postfix's
   2,654, and against Dovecot it answered eight clients' SEARCH in a tenth of
   the time.
+- **A webmail on the mail runtime.** `--web <port>` serves a mail client in the
+  browser, and JMAP beside it, in plain HTTP on 127.0.0.1, and `--domain mail`
+  has a dns runtime's entrance reach it under `mail.<zone>` with its TLS, as
+  the storage interface and the dashboard are reached. It signs in through the
+  idp runtime's session cookie, so one sign-in is every runtime's, and looks as
+  the storage interface does: the mailboxes with their unread counts and a
+  starred view, the messages a page at a time, a search over all of them,
+  reading, writing, replying and forwarding with attachments, drafts, moving,
+  flags and deletion, a name, a signature and an out-of-office answer, and new
+  mail as it comes, with keys for each. A message's HTML is cleaned and shown
+  in a frame sandboxed without scripts, its remote images held back until the
+  reader asks for them. A change the cookie alone signs needs the page's own
+  header, the page's script runs by its hash alone, and behind the entrance a
+  password is taken only over the HTTPS it forwarded and failed sign-ins lock
+  out the client it forwards.
 - **An `mqtt` runtime: a broker for MQTT 3.1, 3.1.1 and 5.0, on TCP, TLS and
   WebSocket.** QoS 0, 1 and 2, retained messages, wills, and sessions that keep
   a client's subscriptions and the messages sent to them while it was away,
@@ -749,6 +764,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `self.route()` reach a runtime in another process. Despite the name neither
   hands a descriptor over — the origin keeps the socket and relays.
 ### Fixed
+
+- **JMAP's Email/set lost what a webmail writes into a draft.** A Bcc was not
+  kept, so sending the draft without an envelope never reached it; a draft
+  with no recipient yet, or with a Message-ID of its own, was refused; the
+  recipients' names were dropped; and a move written as RFC 8621's example
+  writes it, the old mailbox's null before the new one's true, was refused,
+  its keywords changed all the same. A quoted display name read from a message
+  kept its backslashes, which a reply then doubled.
 
 - **`import name '{"key": value}'` was "invalid JSON", or applied nothing.** A
   document without `name` was refused, and one without `type` had every field of

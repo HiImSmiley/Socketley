@@ -3,6 +3,7 @@
 // secret (/~ui/session); the films each user has part watched (/~ui/progress); and who else a library is shared with
 // (/~ui/access).
 #include "storage_run.h"
+#include "storage_ui_kit.h"
 
 #include <sys/file.h>
 #include <sys/stat.h>

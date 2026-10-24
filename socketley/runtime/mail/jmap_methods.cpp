@@ -1464,12 +1464,30 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
             c.from = first_address("from", &from_name);
             if (c.from.empty())
                 c.from = m_hooks.address_of(m_user);
+            // An address with its name, quoted, as the message writes it.
+            const auto mailbox = [](std::string_view name, std::string_view email) {
+                if (name.empty())
+                    return std::string(email);
+                std::string q = "\"";
+                for (const char ch : name)
+                {
+                    if (ch == '"' || ch == '\\')
+                        q += '\\';
+                    if (ch != '\r' && ch != '\n')
+                        q += ch;
+                }
+                return q + "\" <" + std::string(email) + ">";
+            };
             for (const char* k : {"to", "cc", "bcc"})
                 if (const jvalue* v = json::member(obj, k); v && v->k == jvalue::kind::array)
                     for (const auto& a : v->items)
                         (std::string_view(k) == "to" ? c.to : std::string_view(k) == "cc" ? c.cc : c.bcc)
-                            .emplace_back(json::string_of(a, "email"));
-            c.reply_to = first_address("replyTo", nullptr);
+                            .push_back(mailbox(json::string_of(a, "name"), json::string_of(a, "email")));
+            {
+                std::string reply_name;
+                const std::string reply_email = first_address("replyTo", &reply_name);
+                c.reply_to = reply_email.empty() ? std::string() : mailbox(reply_name, reply_email);
+            }
             c.subject = std::string(json::string_of(obj, "subject"));
             const jvalue* values = json::member(obj, "bodyValues");
             const auto value_for = [&](std::string_view list) -> std::string {
@@ -1481,8 +1499,9 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
             };
             c.text = value_for("textBody");
             c.html = value_for("htmlBody");
-            for (const auto& id : strings_of(json::member(obj, "messageId")))
-                c.headers.push_back("Message-ID: <" + id + ">");
+            c.draft = true;
+            // A Message-ID the client gives is the message's own, which it writes once.
+            const auto given_ids = strings_of(json::member(obj, "messageId"));
             for (const char* h : {"inReplyTo", "references"})
             {
                 std::string v;
@@ -1503,11 +1522,14 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
             struct parts
             {
                 compose c;
+                std::string msgid;
                 std::vector<std::tuple<std::string, std::string, std::string>> blobs;
                 size_t at{0};
             };
             auto pj = std::make_shared<parts>();
             pj->c = std::move(c);
+            if (!given_ids.empty())
+                pj->msgid = given_ids.front();
             if (const jvalue* a = json::member(obj, "attachments"); a && a->k == jvalue::kind::array)
                 for (const auto& x : a->items)
                     pj->blobs.emplace_back(json::string_of(x, "blobId"), json::string_of(x, "type"), json::string_of(x, "name"));
@@ -1538,7 +1560,7 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
                 address from;
                 composed out;
                 std::string why;
-                const std::string msgid = socketley::random_hex(16) + "@" + m_cfg.hostname;
+                const std::string msgid = !pj->msgid.empty() ? pj->msgid : socketley::random_hex(16) + "@" + m_cfg.hostname;
                 if (!parse_address(pj->c.from, from, true) ||
                     !compose_message(pj->c, from, from_name, msgid, wall::now_ms(), out, why))
                 {
@@ -1596,6 +1618,7 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
             std::vector<std::string> kws = keywords_of(m);
             bool keywords_changed = false;
             std::string move_to;
+            bool leaves = false;
             for (const auto& [k, v] : patch.members)
             {
                 if (k == "keywords" && v.k == jvalue::kind::object)
@@ -1631,15 +1654,11 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
                 }
                 else if (k.starts_with("mailboxIds/"))
                 {
+                    // Out of its mailbox and into another, in either order, as RFC 8621's own example has it.
                     if (v.k == jvalue::kind::boolean && v.b)
                         move_to = resolve(k.substr(11));
-                    else if (resolve(k.substr(11)) == w.f->id() && move_to.empty())
-                    {
-                        // Out of its one mailbox with nowhere else to be is no Email at all.
-                        comma(j->not_updated);
-                        j->not_updated += q(given) + ":" + set_error("invalidProperties", "an Email is in a mailbox");
-                        return (*self)();
-                    }
+                    else if (resolve(k.substr(11)) == w.f->id())
+                        leaves = true;
                 }
                 else
                 {
@@ -1648,13 +1667,12 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
                     return (*self)();
                 }
             }
-            if (keywords_changed)
+            // Out of its one mailbox with nowhere else to be is no Email at all.
+            if (leaves && (move_to.empty() || move_to == w.f->id()))
             {
-                std::vector<std::string> words;
-                const uint8_t bits = flags_of(kws, words);
-                m_store.set_flags(m_user, w.f, {w.uid},
-                                  [bits](uint8_t f) { return static_cast<uint8_t>((f & flag_deleted) | bits); },
-                                  keyword_change{keyword_change::kind::set, std::move(words)});
+                comma(j->not_updated);
+                j->not_updated += q(given) + ":" + set_error("invalidProperties", "an Email is in a mailbox");
+                return (*self)();
             }
             const auto to = move_to.empty() || move_to == w.f->id() ? nullptr : mailbox_by_id(move_to);
             if (!move_to.empty() && move_to != w.f->id() && !to)
@@ -1662,6 +1680,15 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
                 comma(j->not_updated);
                 j->not_updated += q(given) + ":" + set_error("invalidProperties", "no such mailbox");
                 return (*self)();
+            }
+            // Its keywords change only once the update as a whole is known to be one it can make.
+            if (keywords_changed)
+            {
+                std::vector<std::string> words;
+                const uint8_t bits = flags_of(kws, words);
+                m_store.set_flags(m_user, w.f, {w.uid},
+                                  [bits](uint8_t f) { return static_cast<uint8_t>((f & flag_deleted) | bits); },
+                                  keyword_change{keyword_change::kind::set, std::move(words)});
             }
             if (!to)
             {

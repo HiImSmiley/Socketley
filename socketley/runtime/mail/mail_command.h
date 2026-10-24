@@ -50,6 +50,8 @@ struct compose
     std::vector<std::string> headers;
     std::vector<attachment> attachments;
     std::string raw;
+    // A message kept rather than sent, as JMAP makes one: written with its Bcc, and with no recipient yet if it has none.
+    bool draft{false};
 };
 
 inline void put_list(socketley::bytes::writer& w, const std::vector<std::string>& v)

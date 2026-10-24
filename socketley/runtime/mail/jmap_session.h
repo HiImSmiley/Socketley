@@ -28,6 +28,9 @@ struct jmap_config
     bool login_in_clear{false};
     // The largest upload, and the largest message an Email/set or an import makes.
     uint64_t max_size{25ull << 20};
+    // The port the entrance reaches on 127.0.0.1: the webmail page at /, the idp's session cookie, and the client and
+    // scheme the entrance forwards.
+    bool web{false};
 };
 
 class jmap_session
@@ -41,6 +44,16 @@ public:
         virtual void login(std::string user, std::string password, std::function<void(account, std::string)> done) = 0;
         // An idp bearer token, the user it was given to.
         virtual void bearer(std::string token, std::function<void(account, std::string)> done) = 0;
+        // The user the idp's session cookie among a request's Cookie fields names.
+        virtual void cookie(std::string /*cookies*/, std::function<void(account, std::string)> done)
+        {
+            done(account::no, {});
+        }
+        // Where a browser signs in at the idp, or out, and is sent back to `back`; empty without one.
+        virtual std::string idp_login(const std::string& /*back*/) { return {}; }
+        virtual std::string idp_logout(const std::string& /*back*/) { return {}; }
+        // The client the entrance forwards, whose failed sign-ins count against it.
+        virtual void forward(std::string /*client*/) {}
         // The address a signed-in user sends as.
         virtual std::string address_of(const std::string& user) = 0;
         // A message queued to go from `from` to `rcpts`, answered with its spool id.
@@ -104,6 +117,9 @@ private:
     void download(const request& rq, const std::string& account, const std::string& blob, const std::string& type,
                   const std::string& name);
     void eventsource(const request& rq);
+    // The webmail page, and who it is signed in as.
+    void page(const request& rq);
+    void web_session(const request& rq);
 
     // The calls of a request, one after the other, each with what came before it to refer back to.
     struct call_state
@@ -170,6 +186,11 @@ private:
     std::string m_user;
     // The Authorization header the last request was signed in with, which the next one need not check again.
     std::string m_auth_seen;
+    // The request being answered came over HTTPS to the entrance, from the webmail page, signed in by its cookie.
+    bool m_https{false};
+    bool m_from_page{false};
+    // Where its browser signs in, for a 401 the page answers by going there.
+    std::string m_login;
     // The EventSource this connection is: what it was last told, how often to ping, and whether to stop after a state.
     bool m_stream{false};
     std::string m_stream_state;

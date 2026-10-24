@@ -1,5 +1,6 @@
 #include "runtime_names.h"
 #include "runtime_instance.h"
+#include "../../runtime/mail/mail_instance.h"
 #include "../../runtime/proxy/proxy_instance.h"
 #include "../../runtime/storage/storage_instance.h"
 #include "../../runtime/dns/dns_instance.h"
@@ -74,10 +75,32 @@ bool speaks_http(const runtime_instance& rt)
             return true;
         case runtime_proxy:
             return static_cast<const proxy_instance&>(rt).get_protocol() == protocol_http && !is_entrance(rt);
+        case runtime_mail:
+            return static_cast<const mail_instance&>(rt).get_web_port() != 0;
         default:
             return false;
     }
 }
+
+namespace
+{
+
+// Where the entrance reaches a runtime, empty for none: a mail runtime's webmail port, whose TLS is the entrance's
+// while its own --tls is for SMTP and IMAP, and any other's own port where it does not terminate TLS itself.
+std::string http_address(const runtime_instance& r)
+{
+    if (r.get_type() == runtime_mail)
+        return "127.0.0.1:" + std::to_string(static_cast<const mail_instance&>(r).get_web_port());
+    if (r.get_tls())
+        return {};
+    if (!r.get_listen_path().empty())
+        return "unix:" + std::string(r.get_listen_path());
+    const std::string_view bind = r.get_bind_address();
+    return (bind.empty() || bind == "0.0.0.0" ? std::string("127.0.0.1") : std::string(bind)) + ":" +
+           std::to_string(r.effective_port());
+}
+
+}   // namespace
 
 std::string refusal(const runtime_instance& rt, const std::vector<const runtime_instance*>& others)
 {
@@ -127,17 +150,11 @@ std::string entrance_table(const runtime_instance& entrance, const std::vector<c
     };
     for (const runtime_instance* r : all)
     {
-        if (!r || r == &entrance || !speaks_http(*r) || r->get_tls())
+        if (!r || r == &entrance || !speaks_http(*r))
             continue;
-        std::string addr;
-        if (!r->get_listen_path().empty())
-            addr = "unix:" + std::string(r->get_listen_path());
-        else
-        {
-            const std::string_view bind = r->get_bind_address();
-            addr = (bind.empty() || bind == "0.0.0.0" ? std::string("127.0.0.1") : std::string(bind)) + ":" +
-                   std::to_string(r->effective_port());
-        }
+        const std::string addr = http_address(*r);
+        if (addr.empty())
+            continue;
         for (const auto& n : of(*r, /*with_buckets=*/true))
         {
             const bool relative = n.find('.') == std::string::npos ||

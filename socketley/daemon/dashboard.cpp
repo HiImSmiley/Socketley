@@ -17,6 +17,7 @@
 #include "runtime_schema.h"
 #include "ipc_client.h"
 #include "../runtime/proxy/proxy_auth.h"
+#include "../runtime/storage/storage_ui_kit.h"
 #include "../shared/json/json_doc.h"
 #include "../shared/loop/blocking_write.h"
 #include "../shared/util/logging.h"
@@ -49,12 +50,6 @@
 #include <map>
 #include <shared_mutex>
 #include <sstream>
-
-namespace socketley::storage
-{
-std::string_view storage_ui_style();
-std::string storage_ui_kit();
-}
 
 namespace dashboard
 {

@@ -187,6 +187,10 @@ std::string mail_instance::config_refusal() const
         return "mail: --pop3 reads the mailboxes of --storage, whose users are --idp's\n";
     if (m_jmap && (m_storage.empty() || m_idp.empty()))
         return "mail: --jmap reads the mailboxes of --storage, whose users are --idp's\n";
+    if (m_web && (m_storage.empty() || m_idp.empty()))
+        return "mail: --web serves the mailboxes of --storage to the users of --idp, which both need giving\n";
+    if (!get_domains().empty() && !m_web)
+        return "mail: --domain names the webmail through the entrance, which --web serves\n";
     if (m_lmtp && m_storage.empty())
         return "mail: --lmtp hands mail to the mailboxes of --storage, which is not given\n";
     if ((m_pop3s || m_sts_port) && !get_tls())

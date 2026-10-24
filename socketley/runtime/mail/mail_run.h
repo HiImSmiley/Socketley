@@ -137,7 +137,7 @@ public:
     void push_tick();
 
 private:
-    enum class port_kind : uint8_t { smtp, submission, submissions, imap, imaps, sieve, pop3, pop3s, lmtp, sts, jmap };
+    enum class port_kind : uint8_t { smtp, submission, submissions, imap, imaps, sieve, pop3, pop3s, lmtp, sts, jmap, web };
     struct conn : smtp_session::hooks, imap_session::hooks, managesieve_session::hooks, pop3_session::hooks,
                   jmap_session::hooks
     {
@@ -147,6 +147,8 @@ private:
         sockaddr_storage peer{};
         // Its address as text, IPv4 for a client a dual-stack listener took over IPv4.
         std::string ip;
+        // The client the entrance in front of the webmail port forwards, whose failed sign-ins count against it.
+        std::string forwarded;
         port_kind kind{port_kind::smtp};
         io_request rd{}, wr{};
         bool rd_pending{false}, wr_pending{false}, dead{false};
@@ -237,6 +239,10 @@ private:
             run->imap_sieve(user, folder, std::move(cause), std::move(uids), {});
         }
         void bearer(std::string token, std::function<void(account, std::string)> done) override;
+        void cookie(std::string cookies, std::function<void(account, std::string)> done) override;
+        std::string idp_login(const std::string& back) override;
+        std::string idp_logout(const std::string& back) override;
+        void forward(std::string client) override { forwarded = std::move(client); }
         void push(const std::string& url, const std::string& p256dh, const std::string& auth, std::string body) override
         {
             run->push_send(url, p256dh, auth, std::move(body));
@@ -330,12 +336,13 @@ private:
     std::vector<std::string> m_arc_trusted;
     std::string m_state_dir;
 
-    listener m_smtp, m_sub, m_subs, m_imap_l, m_imaps_l, m_sieve_l, m_pop3_l, m_pop3s_l, m_lmtp_l, m_sts_l, m_jmap_l;
+    listener m_smtp, m_sub, m_subs, m_imap_l, m_imaps_l, m_sieve_l, m_pop3_l, m_pop3s_l, m_lmtp_l, m_sts_l, m_jmap_l,
+        m_web_l;
     // Every listener, for the loops over them.
-    std::array<listener*, 11> listeners()
+    std::array<listener*, 12> listeners()
     {
         return {&m_smtp, &m_sub, &m_subs, &m_imap_l, &m_imaps_l, &m_sieve_l, &m_pop3_l, &m_pop3s_l, &m_lmtp_l, &m_sts_l,
-                &m_jmap_l};
+                &m_jmap_l, &m_web_l};
     }
     // The MTA-STS policy its domains publish, and the id its TXT names it by.
     std::string sts_policy() const;

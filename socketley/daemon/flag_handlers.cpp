@@ -1900,6 +1900,8 @@ int parse_mail_flags(mail_instance* ml, const parsed_args& pa, size_t& i, std::s
             return port("--pop3s requires a port from 1 to 65535, such as 995\n", &mail_instance::set_pop3s_port);
         case fnv1a("--jmap"):
             return port("--jmap requires a port from 1 to 65535, such as 8443\n", &mail_instance::set_jmap_port);
+        case fnv1a("--web"):
+            return port("--web requires a port from 1 to 65535, such as 9480\n", &mail_instance::set_web_port);
         case fnv1a("--lmtp"):
             return port("--lmtp requires a port from 1 to 65535, such as 24\n", &mail_instance::set_lmtp_port);
         case fnv1a("--mta-sts-port"):

@@ -69,6 +69,9 @@ public:
     // JMAP (RFC 8620, RFC 8621) for the mailboxes, over HTTPS where --tls is given.
     void set_jmap_port(uint16_t v) { m_jmap = v; }
     uint16_t get_jmap_port() const { return m_jmap; }
+    // The webmail and JMAP in plain HTTP on 127.0.0.1, for the entrance that --domain names it through.
+    void set_web_port(uint16_t v) { m_web = v; }
+    uint16_t get_web_port() const { return m_web; }
     // LMTP (RFC 2033) from this machine, for the mailboxes.
     void set_lmtp_port(uint16_t v) { m_lmtp = v; }
     uint16_t get_lmtp_port() const { return m_lmtp; }
@@ -175,6 +178,7 @@ private:
     uint16_t m_pop3{0};
     uint16_t m_pop3s{0};
     uint16_t m_jmap{0};
+    uint16_t m_web{0};
     uint16_t m_lmtp{0};
     uint16_t m_sts_port{0};
     uint32_t m_greylist_s{0};
