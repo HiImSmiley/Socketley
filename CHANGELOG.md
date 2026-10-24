@@ -40,7 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   people can unsubscribe from.** `socketley send <mail> --template f.html`
   sends each recipient a message of their own, `{{name}}` filled from their
   values (`{{name|otherwise}}` where they have none, `{{{name}}}` unescaped in
-  the HTML), the plain part written from the HTML; the recipients are
+  the HTML), the plain part written from the HTML. A template is Lua:
+  `{{ expr }}` is any expression, `{% if %}` and `{% for %}` blocks run where
+  they stand (a list from a db document walked into rows), `include("f.html")`
+  puts in another, and `--script f.lua` defines functions for them plus
+  `on_recipient(r)`, to change or leave out a recipient, and `on_link(url, r)`,
+  to rewrite each link; a template reaches no file and no process, its
+  script does. The recipients are
   addresses, `idp:<idp>[/<group>]` (its accounts and their fields),
   `db:<db>/<collection>` (its documents) or `json:<file>`, `--set` gives
   values for all, and `--rate` paces them (2/s unless said). Sending stops

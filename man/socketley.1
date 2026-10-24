@@ -769,12 +769,49 @@ HTML's text, its links written out. The messages go at
 the spam folder for coming at once; what was skipped or failed is said by
 recipient, and a line says how many were sent.
 .IP
-A template is filled strictly: a recipient whose message has a placeholder with
-no value and no default is skipped, and one whose message is the first stops
+A template is Lua.
+.B {{ expr }}
+is the value of any Lua expression and
+.B {% code %}
+runs where it stands, a tag alone on its line taking the line with it:
+.RS
+.PP
+.nf
+{% if vip then %}<p>Your code: {{code}}</p>{% end %}
+{% for _, p in ipairs(products) do %}
+<li>{{p.title}}: {{ string.format("%.2f", p.price) }}</li>
+{% end %}
+.fi
+.RE
+.IP
+A name with dots is a field below another, no value rather than an error where
+one on the way is missing, and a list of words is written joined by commas.
+.BR html (s),
+.BR url (s)
+and
+.BR raw (s)
+escape, percent-encode, and keep a value unescaped;
+.BR include (\(dqfile\(dq)
+puts in another template, from beside this one, filled for the same recipient.
+A template reaches its recipient's values, what the script defines, string,
+table, math, os.date and os.time, and no file and no process.
+.B \-\-script
+.I file.lua
+runs once before the first recipient and reaches all of Lua;
+.BI on_recipient( r )
+is called with each recipient's values before their message is written, to
+change them, or to leave the recipient out by returning false and why, and
+.BI on_link( url ", " r )
+with each link of the HTML but the one to unsubscribe, its answer the link
+written and nil keeping it. An error in Lua is a message that cannot be
+written, said with its file and line.
+.IP
+A template is filled strictly: a recipient whose message has a name with no
+value and no default is skipped, and one whose message is the first stops
 them all before any is sent, as does a first the runtime refuses, since a
 template that fails its first recipient is wrong for all of them.
 .B \-\-no\-check
-lets a placeholder with no value be empty, and sends on past a first refused.
+lets a name with no value be empty, and sends on past a first refused.
 .B \-\-dry\-run
 shows the first recipient's message and how many there are, and sends nothing;
 .B \-\-test\-to
@@ -804,6 +841,7 @@ socketley send m \-\-template autumn.html \-\-inline logo.png \-\-to db:shop/cus
     \-\-from news@example.com \-\-subject "Hello {{name|there}}, your code {{code}}" \e
     \-\-ad \-\-rate 5/s
 socketley send m \-\-template autumn.html \-\-to idp:auth/vip \-\-set code=VIP30 \-\-dry\-run
+socketley send m \-\-template order.html \-\-script shop.lua \-\-to db:shop/orders \-\-test\-to me@example.com
 .fi
 .RE
 .PP

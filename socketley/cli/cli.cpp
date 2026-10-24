@@ -958,7 +958,7 @@ int cli_send(int argc, char** argv)
     static constexpr std::string_view mail_flags[] = {"--to",   "-t",     "--cc",   "--bcc",  "--from",   "--reply-to",
                                                       "--subject", "-s", "--text", "--header", "--html", "--attach",
                                                       "--raw", "--template", "--set", "--inline", "--ad", "--no-check",
-                                                      "--dry-run", "--test-to", "--rate"};
+                                                      "--dry-run", "--test-to", "--rate", "--script"};
     if (argc >= 4 && std::any_of(std::begin(mail_flags), std::end(mail_flags),
                                  [&](std::string_view f) { return f == argv[3]; }))
         return cli_mail_send(argc, argv);

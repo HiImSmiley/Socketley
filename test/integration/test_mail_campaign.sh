@@ -11,6 +11,10 @@
 #   * a template sent when the first recipient's message cannot be written, or stopping at a later one rather than
 #     skipping it; with --no-check a missing value refused, or {{unsubscribe}} filled without --ad
 #   * --inline not sending the image inside the message, by the Content-ID the HTML names
+#   * a template's Lua -- {% if %}, {% for %}, a field below another, include() -- not written as it says, a template
+#     reaching a file or a process, on_recipient not changing or leaving out a recipient, on_link not rewriting a link
+#     or rewriting the one to unsubscribe, or Lua that fails not said with its file and line before anything is sent
+#   * the example's template and script not writing what campaign.sh says
 #   * --ad without List-Unsubscribe, its one-click POST, or a link of the recipient's own where {{unsubscribe}} is, or
 #     below the message where it is not
 #   * a link's GET unsubscribing (a mail scanner opening it would), its POST not, a forged token taken, a mailto:
@@ -146,6 +150,108 @@ rm -f "$T"/sink/*
 out=$("$BIN" send m --template "$T/promo.html" --to cat@remote.test --subject 'Hi' --from news@example.test --no-check 2>&1); rc=$?
 [ "$rc" -eq 0 ] && wait_for cat@remote.test && ok "with --no-check a placeholder without a value is empty, and the message goes" \
     || bad "with --no-check a missing value is empty" "rc $rc: $out"
+
+# A template is Lua: a condition, a list walked into rows, a field below another, a script's function, include(),
+# on_recipient changing and leaving out recipients, and on_link rewriting each link but the one to unsubscribe.
+cat > "$T/shop.html" <<'EOF'
+<html><body><h1>Hi {{first|you}}</h1>
+{% if vip then %}<p>VIP {{code}}</p>{% else %}<p>regular</p>{% end %}
+<table>
+{% for _, p in ipairs(picks) do %}
+<tr><td>{{p.title}}</td><td>{{ euro(p.price) }}</td></tr>
+{% end %}
+</table>
+<p>from {{address.city|somewhere}}; {{ io and "files" or "no files" }}, {{ os.execute and "processes" or "no processes" }}</p>
+<a href="https://shop.test/sale?a=1&amp;b=2">sale</a> <a href="{{unsubscribe}}">unsubscribe</a>
+{{ include("foot.html") }}
+</body></html>
+EOF
+printf '<p>footer of {{email}}</p>' > "$T/foot.html"
+cat > "$T/shop.lua" <<'EOF'
+function euro(n) return string.format("%.2f EUR", n) end
+function on_recipient(r)
+    if r.optout then return false, "opted out in the shop" end
+    r.first = r.name:match("^(%S+)")
+end
+function on_link(link, r) return link .. "&to=" .. url(r.email) end
+EOF
+cat > "$T/shop.json" <<'EOF'
+[{"email":"vic@remote.test","name":"Vic Vale","vip":true,"code":"V-1","address":{"city":"Bonn"},
+  "picks":[{"title":"Pen <i>","price":3.5},{"title":"Book","price":22}]},
+ {"email":"opt@remote.test","name":"Opt Out","optout":true,"picks":[]},
+ {"email":"reg@remote.test","name":"Reg","picks":[]}]
+EOF
+rm -f "$T"/sink/*
+out=$("$BIN" send m --template "$T/shop.html" --script "$T/shop.lua" --to "json:$T/shop.json" --subject 'For {{first}}' \
+      --from news@example.test --ad --rate 50/s 2>&1); rc=$?
+case "$out" in *"skipped opt@remote.test: opted out in the shop"*"sent 2 of 3, skipped 1"*) [ "$rc" -eq 0 ] \
+    && ok "on_recipient leaves a recipient out with why, and a name in the branch not taken asks for no value" || bad "on_recipient" "rc $rc: $out" ;;
+    *) bad "on_recipient leaves a recipient out with why, and a name in the branch not taken asks for no value" "rc $rc: $out" ;; esac
+wait_for vic@remote.test; wait_for reg@remote.test
+tally < <(python3 - "$(sent_to vic@remote.test)" "$(sent_to reg@remote.test)" <<'PY'
+import email, email.policy, re, sys
+def check(name, ok, info=""):
+    print(("ok " if ok else "bad ") + name + ("" if ok else ": " + repr(info)[:500]))
+def msg(path):
+    raw = open(path, "rb").read().split(b"\n\n", 1)[1] if path else b""
+    return email.message_from_bytes(raw, policy=email.policy.default)
+vic, reg = msg(sys.argv[1]), msg(sys.argv[2])
+def html(m):
+    b = m.get_body(("html",))
+    return b.get_content().replace("\r\n", "\n") if b else ""
+v, r = html(vic), html(reg)
+check("on_recipient changes the values a template is filled from", vic["Subject"] == "For Vic" and "<h1>Hi Vic</h1>" in v, (vic["Subject"], v[:200]))
+check("{% if %} writes the branch taken", "<p>VIP V-1</p>" in v and "regular" not in v and "<p>regular</p>" in r and "VIP" not in r, (v[:300], r[:300]))
+check("{% for %} writes a row for each of a list, each value escaped and a script's function called",
+      "<tr><td>Pen &lt;i&gt;</td><td>3.50 EUR</td></tr>\n<tr><td>Book</td><td>22.00 EUR</td></tr>" in v, v)
+check("a tag alone on its line takes the line with it", "<table>\n</table>" in r, r)
+check("a name with dots is a field below another, its default where one on the way is missing", "from Bonn;" in v and "from somewhere;" in r, (v, r))
+check("a template reaches no file and no process", "no files, no processes" in v, v)
+check("on_link rewrites a link, its &amp; read as & and written back", 'href="https://shop.test/sale?a=1&amp;b=2&amp;to=vic%40remote.test"' in v, v)
+check("but not the link to unsubscribe, which the runtime writes", bool(re.search(r'href="https://mail\.example\.test/unsubscribe\?t=[A-Za-z0-9_-]+\.[0-9a-f]+"', v)) and "{{unsubscribe}}" not in v, v)
+check("include() puts in another template, filled for the same recipient and not escaped again", "<p>footer of vic@remote.test</p>" in v, v)
+t = vic.get_body(("plain",)).get_content()
+check("the plain part's links are the rewritten ones", "(https://shop.test/sale?a=1&b=2&to=vic%40remote.test)" in t, t)
+PY
+)
+
+# A template that is no Lua is said with its file and line before anything is sent; so is a first that fails in Lua.
+printf '<p>a</p>\n<p>{{ 1 + }}</p>\n' > "$T/broken.html"
+out=$("$BIN" send m --template "$T/broken.html" --to "json:$T/people.json" --from news@example.test 2>&1); rc=$?
+case "$out" in *"broken.html:2:"*) [ "$rc" -eq 1 ] && ok "a template that is no Lua is refused with its file and line" || bad "a broken template" "rc $rc: $out" ;;
+    *) bad "a template that is no Lua is refused with its file and line" "rc $rc: $out" ;; esac
+printf '<p>{%% local n = 2 -- a comment %%}n{{ n }}</p>\n<p>{{ email:nosuch() }}</p>\n' > "$T/comment.html"
+out=$("$BIN" send m --template "$T/comment.html" --to amy@remote.test --from news@example.test --dry-run 2>&1); rc=$?
+case "$out" in *"comment.html:2: attempt to call method 'nosuch'"*) [ "$rc" -eq 1 ] && ok "a comment in a tag ends with it, and the lines after keep their numbers" || bad "a comment in a tag" "rc $rc: $out" ;;
+    *) bad "a comment in a tag ends with it, and the lines after keep their numbers" "rc $rc: $out" ;; esac
+printf '<p>{%% local n = 2 -- a comment %%}n{{ n }}</p>\n' > "$T/comment.html"
+out=$("$BIN" send m --template "$T/comment.html" --to amy@remote.test --from news@example.test --dry-run 2>&1)
+case "$out" in *"n2"*) ok "and what follows the tag on its line is written" ;; *) bad "and what follows the tag on its line is written" "$out" ;; esac
+printf '<p>{{ string.rep("x", #email) }}</p>\n{%% if email:find("amy") then error("amy is not to be written") end %%}\n' > "$T/fails.html"
+out=$("$BIN" send m --template "$T/fails.html" --to "json:$T/people.json" --from news@example.test --rate 50/s 2>&1); rc=$?
+case "$out" in *"stopped before sending"*"fails.html:2: amy is not to be written"*) [ "$rc" -eq 1 ] && ok "a first message that fails in Lua stops them all, said with its file and line" \
+    || bad "a first failing in Lua" "rc $rc: $out" ;; *) bad "a first message that fails in Lua stops them all, said with its file and line" "rc $rc: $out" ;; esac
+sleep 0.5; [ "$(count)" -eq 2 ] && ok "and nothing more went" || bad "and nothing more went" "$(count)"
+
+mkdir -p "$T/sub"; printf 'secret' > "$T/secret"
+printf '<p>{{ include("../secret") }}</p>' > "$T/sub/up.html"; printf '<p>{{ include("%s") }}</p>' "$T/secret" > "$T/sub/root.html"
+for f in up root; do
+    out=$("$BIN" send m --template "$T/sub/$f.html" --to amy@remote.test --from news@example.test --dry-run 2>&1); rc=$?
+    case "$out" in *"include() takes a template beside this one"*) [ "$rc" -eq 1 ] && ok "include() reads a template beside this one alone ($f)" || bad "include() outside ($f)" "rc $rc: $out" ;;
+        *) bad "include() reads a template beside this one alone ($f)" "rc $rc: $out" ;; esac
+done
+
+# The example's template and script, as campaign.sh sends them.
+EX="$HERE/../../examples/mail"
+cat > "$T/customers.json" <<'EOF'
+[{"email":"zed@remote.test","name":"Zed","orders":0,"code":"Z"},
+ {"email":"lee@remote.test","name":"Ann Lee","orders":2,"code":"AUTUMN30","picks":[{"id":"scarf 1","title":"Scarf","price":40}]}]
+EOF
+out=$("$BIN" send m --template "$EX/autumn.html" --script "$EX/campaign.lua" --to "json:$T/customers.json" \
+      --from news@example.test --subject 'Hello {{name|there}}, your code: {{code}}' --ad --dry-run 2>&1); rc=$?
+case "$out" in *'To: "Ann Lee" <lee@remote.test>'*"Picked for you, Ann:"*"Scarf (https://shop.example.com/p/scarf%201?utm_source=mail&utm_campaign=autumn)"*"28.00 €"*"(2 recipients in all; nothing sent)"*) [ "$rc" -eq 0 ] \
+    && ok "the example's template and script write the message campaign.sh says" || bad "the example" "rc $rc: $out" ;;
+    *) bad "the example's template and script write the message campaign.sh says" "rc $rc: $out" ;; esac
 
 # An advertisement: List-Unsubscribe, its one-click POST, and the recipient's own link.
 rm -f "$T"/sink/*

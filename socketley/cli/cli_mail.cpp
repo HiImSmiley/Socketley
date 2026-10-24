@@ -25,6 +25,7 @@
 #include "../shared/runtime/command_usage.h"
 #include "../shared/util/base64.h"
 #include "../shared/util/random_id.h"
+#include "mail_template.h"
 
 namespace
 {
@@ -112,22 +113,6 @@ int deliver(const char* runtime, const socketley::mail::compose& c, std::string&
     return rc;
 }
 
-std::string html_escaped(std::string_view v)
-{
-    std::string out;
-    for (const char ch : v)
-        switch (ch)
-        {
-            case '&': out += "&amp;"; break;
-            case '<': out += "&lt;"; break;
-            case '>': out += "&gt;"; break;
-            case '"': out += "&quot;"; break;
-            case '\'': out += "&#39;"; break;
-            default: out += ch;
-        }
-    return out;
-}
-
 std::string_view trimmed(std::string_view v)
 {
     while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
@@ -145,57 +130,6 @@ std::string_view trimmed_text(std::string_view v)
     while (!v.empty() && std::isspace(static_cast<unsigned char>(v.back())))
         v.remove_suffix(1);
     return v;
-}
-
-// A template with its {{name}} filled from `vars`: {{name|otherwise}} where it has none, and {{{name}}} as it is in
-// HTML, which escapes every other value. A placeholder neither has is empty, and `missing` names the first such.
-// {{unsubscribe}} is left to the runtime where `keep_unsubscribe`, which writes each recipient's own link there.
-std::string fill(std::string_view t, const std::map<std::string, std::string>& vars, bool html, bool keep_unsubscribe,
-                 std::string& missing)
-{
-    std::string out;
-    size_t i = 0;
-    while (i < t.size())
-    {
-        const size_t open = t.find("{{", i);
-        if (open == std::string_view::npos)
-        {
-            out.append(t.substr(i));
-            break;
-        }
-        out.append(t.substr(i, open - i));
-        const bool raw = t.substr(open, 3) == "{{{";
-        const std::string_view closer = raw ? "}}}" : "}}";
-        const size_t from = open + (raw ? 3 : 2), close = t.find(closer, from);
-        if (close == std::string_view::npos)
-        {
-            out.append(t.substr(open));
-            break;
-        }
-        const std::string_view inner = t.substr(from, close - from);
-        const size_t bar = inner.find('|');
-        const std::string key(trimmed(inner.substr(0, bar)));
-        const bool named = !key.empty() && key.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-                                                                  "0123456789_.-") == std::string::npos;
-        const size_t end = close + closer.size();
-        // Braces that hold no name are text, as in a style sheet or a script's example.
-        if (!named || (keep_unsubscribe && key == "unsubscribe"))
-        {
-            out.append(t.substr(open, end - open));
-            i = end;
-            continue;
-        }
-        std::string v;
-        if (const auto it = vars.find(key); it != vars.end() && !it->second.empty())
-            v = it->second;
-        else if (bar != std::string_view::npos)
-            v = std::string(trimmed(inner.substr(bar + 1)));
-        else if (missing.empty())
-            missing = key;
-        out += html && !raw ? html_escaped(v) : v;
-        i = end;
-    }
-    return out;
 }
 
 // The text of an HTML message, for the plain part beside it: its links written out, its tags and styles gone.
@@ -256,11 +190,22 @@ std::string text_of_html(std::string_view h)
         for (auto& ch : t)
             ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
         if (t.starts_with("<br") || t.starts_with("</p") || t.starts_with("</div") || t.starts_with("</tr") ||
-            t.starts_with("</h") || t.starts_with("<li") || t.starts_with("</table"))
+            t.starts_with("</h") || t.starts_with("<li") || t.starts_with("</table") || t.starts_with("</ul") ||
+            t.starts_with("</ol"))
             out += "\n";
         if (t.starts_with("<a "))
             if (const size_t at = t.find("href=\""); at != std::string::npos)
-                href = std::string(tag.substr(at + 6, tag.find('"', at + 6) - at - 6));
+            {
+                // The attribute's &amp; is the link's &.
+                href.clear();
+                const std::string_view v = tag.substr(at + 6, tag.find('"', at + 6) - at - 6);
+                for (size_t k = 0; k < v.size(); ++k)
+                {
+                    href += v[k];
+                    if (v.substr(k, 5) == "&amp;")
+                        k += 4;
+                }
+            }
         if (t.starts_with("</a") && !href.empty())
         {
             if (!href.starts_with("mailto:") && out.find(href, out.size() > 300 ? out.size() - 300 : 0) == std::string::npos)
@@ -290,28 +235,17 @@ std::string text_of_html(std::string_view h)
     return text;
 }
 
-// A recipient's values from a JSON object: its strings, numbers and booleans by name, an object's below its name.
-void flatten(const socketley::json::jvalue& v, const std::string& prefix, std::map<std::string, std::string>& out)
+// A recipient's value of `name`, as its source gave it.
+void put(socketley::json::jvalue& row, const std::string& name, const std::string& value)
 {
-    using kind = socketley::json::jvalue::kind;
-    for (const auto& [k, m] : v.members)
-    {
-        const std::string name = prefix.empty() ? k : prefix + "." + k;
-        if (m.k == kind::object)
-            flatten(m, name, out);
-        else if (m.k == kind::string || m.k == kind::number)
-            out[name] = m.s;
-        else if (m.k == kind::boolean)
-            out[name] = m.b ? "true" : "false";
-        else if (m.k == kind::array)
-        {
-            std::string joined;
-            for (const auto& x : m.items)
-                if (x.k == kind::string || x.k == kind::number)
-                    joined += (joined.empty() ? "" : ", ") + x.s;
-            out[name] = joined;
-        }
-    }
+    socketley::json::jvalue v;
+    v.k = socketley::json::jvalue::kind::string;
+    v.s = value;
+    row.k = socketley::json::jvalue::kind::object;
+    if (socketley::json::jvalue* had = socketley::json::member(row, name))
+        *had = std::move(v);
+    else
+        row.members.emplace_back(name, std::move(v));
 }
 
 // "5/s", "300/min", "1000/h" or a bare number a second, as messages a second.
@@ -343,7 +277,7 @@ int cli_mail_send(int argc, char** argv)
     bool raw = false, have_text = false, templated = false, check = true, dry = false;
     std::vector<std::string> sources;
     std::map<std::string, std::string> sets;
-    std::string test_to;
+    std::string test_to, html_path, script_path;
     double rate = 2;
     for (int i = 3; i < argc; ++i)
     {
@@ -381,7 +315,8 @@ int cli_mail_send(int argc, char** argv)
             c.headers.push_back(value());
         else if ((a == "--html" || a == "--template") && has)
         {
-            if (!file_arg(argv[++i], c.html))
+            html_path = value();
+            if (!file_arg(html_path, c.html))
                 return 1;
             templated = templated || a == "--template";
         }
@@ -442,6 +377,11 @@ int cli_mail_send(int argc, char** argv)
             test_to = value();
             templated = true;
         }
+        else if (a == "--script" && has)
+        {
+            script_path = value();
+            templated = true;
+        }
         else if (a == "--ad")
             c.ad = templated = true;
         else if (a == "--no-check")
@@ -492,10 +432,10 @@ int cli_mail_send(int argc, char** argv)
         std::cout << "--raw, --cc and --bcc write one message to all; a template writes each recipient their own\n";
         return 1;
     }
-    // Each recipient's values: --set for everyone, then what their source says of them.
-    std::vector<std::map<std::string, std::string>> rows;
+    // Each recipient's values: what their source says of them, then --set for everyone where it says nothing.
+    std::vector<socketley::json::jvalue> rows;
     for (const auto& to : c.to)
-        rows.push_back({{"email", to}});
+        put(rows.emplace_back(), "email", to);
     // A command of the daemon's, its answer in `out`; false, said, where it failed.
     const auto daemon = [](const std::string& cmd, std::string& out) {
         const int rc = ipc_send(cmd, out);
@@ -549,7 +489,8 @@ int cli_mail_send(int argc, char** argv)
                 ipc_frame::append_arg(cmd, std::string(cols[0]));
                 if (!daemon(cmd, shown))
                     return 1;
-                std::map<std::string, std::string> row{{"username", std::string(cols[0])}};
+                socketley::json::jvalue& row = rows.emplace_back();
+                put(row, "username", std::string(cols[0]));
                 for (std::string_view r = shown; !r.empty();)
                 {
                     const size_t n2 = r.find('\n');
@@ -557,11 +498,10 @@ int cli_mail_send(int argc, char** argv)
                     r = n2 == std::string_view::npos ? std::string_view{} : r.substr(n2 + 1);
                     const size_t sep = l.find(": ");
                     if (sep != std::string_view::npos && l.substr(0, sep) != "password")
-                        row[std::string(l.substr(0, sep))] = std::string(l.substr(sep + 2));
+                        put(row, std::string(l.substr(0, sep)), std::string(l.substr(sep + 2)));
                 }
-                if (!row.count("email") && cols[0].find('@') != std::string_view::npos)
-                    row["email"] = std::string(cols[0]);
-                rows.push_back(std::move(row));
+                if (socketley::json::string_of(row, "email").empty() && cols[0].find('@') != std::string_view::npos)
+                    put(row, "email", std::string(cols[0]));
             }
             continue;
         }
@@ -624,12 +564,9 @@ int cli_mail_send(int argc, char** argv)
                 objects.push_back(std::move(one));
             }
         }
-        for (const auto& o : objects)
-        {
-            std::map<std::string, std::string> row;
-            flatten(o, "", row);
-            rows.push_back(std::move(row));
-        }
+        for (auto& o : objects)
+            if (o.k == socketley::json::jvalue::kind::object)
+                rows.push_back(std::move(o));
     }
     if (rows.empty())
     {
@@ -638,51 +575,62 @@ int cli_mail_send(int argc, char** argv)
     }
     for (auto& row : rows)
         for (const auto& [k, v] : sets)
-            row.emplace(k, v);
+            if (!socketley::json::member(row, k))
+                put(row, k, v);
 
-    // A recipient's message, false with why where it cannot be written: no address, or, unless --no-check, a
-    // placeholder without a value.
-    const auto message_for = [&](const std::map<std::string, std::string>& row, socketley::mail::compose& m,
-                                 std::string& why) {
-        const auto field = [&row](const char* k) {
-            const auto it = row.find(k);
-            return it == row.end() ? std::string() : it->second;
-        };
-        std::string email = field("email");
-        if (email.empty())
-            email = field("to");
-        if (email.empty() || email.find('@') == std::string::npos)
+    // The templates and the script, read and compiled before the first recipient.
+    const size_t dir_end = html_path.rfind('/');
+    socketley::mail::campaign tpl(c.ad, dir_end == std::string::npos ? "." : html_path.substr(0, dir_end));
+    std::string why;
+    using part = socketley::mail::campaign::part;
+    const bool text_template = have_text || !c.text.empty();
+    if ((!script_path.empty() && !tpl.script(script_path, why)) ||
+        (!c.subject.empty() && !tpl.add(part::subject, "--subject", c.subject, why)) ||
+        (!c.html.empty() && !tpl.add(part::html, html_path, c.html, why)) ||
+        (text_template && !tpl.add(part::text, "--text", c.text, why)))
+    {
+        std::cout << why << "\n";
+        return 1;
+    }
+
+    using result = socketley::mail::campaign::result;
+    // A recipient's message: written, skipped where the script says so, or failed with why where it cannot be
+    // written -- no address, Lua that fails, or, unless --no-check, a name without a value.
+    const auto message_for = [&](const socketley::json::jvalue& row, socketley::mail::compose& m, std::string& why) {
+        socketley::mail::campaign::message f;
+        const result r = tpl.fill(row, check, f, why);
+        if (r == result::missing)
+            why = why == "unsubscribe" ? "{{unsubscribe}} is filled for an advertisement, --ad, alone"
+                                       : "nothing fills {{" + why + "}}";
+        if (r != result::written)
+            return r == result::skipped ? r : result::failed;
+        if (f.email.empty() || f.email.find('@') == std::string::npos)
         {
             why = "no email address";
-            return false;
+            return result::failed;
         }
         m = c;
         m.to.clear();
-        std::string name = field("name");
-        if (name.find_first_of("\"\r\n<>") != std::string::npos)
-            name.clear();
-        m.to.push_back(name.empty() ? email : "\"" + name + "\" <" + email + ">");
-        std::string missing;
-        m.subject = fill(c.subject, row, false, c.ad, missing);
-        m.html = fill(c.html, row, true, c.ad, missing);
-        m.text = have_text || !c.text.empty() ? fill(c.text, row, false, c.ad, missing)
-                                              : (m.html.empty() ? std::string() : text_of_html(m.html));
-        if (check && !missing.empty())
-        {
-            why = missing == "unsubscribe" ? "{{unsubscribe}} is filled for an advertisement, --ad, alone"
-                                           : "nothing fills {{" + missing + "}}";
-            return false;
-        }
-        return true;
+        if (f.name.find_first_of("\"\r\n<>") != std::string::npos)
+            f.name.clear();
+        m.to.push_back(f.name.empty() ? f.email : "\"" + f.name + "\" <" + f.email + ">");
+        m.subject = std::move(f.subject);
+        m.html = std::move(f.html);
+        m.text = text_template ? std::move(f.text) : (m.html.empty() ? std::string() : text_of_html(m.html));
+        return result::written;
     };
 
     socketley::mail::compose m;
-    std::string why;
     if (dry || !test_to.empty())
     {
-        if (!message_for(rows.front(), m, why))
+        // The first recipient the script does not leave out.
+        size_t first = 0;
+        result r = result::skipped;
+        while (first < rows.size() && (r = message_for(rows[first], m, why)) == result::skipped)
+            ++first;
+        if (r != result::written)
         {
-            std::cout << "the first recipient's message cannot be written: " << why << "\n";
+            std::cout << (first == rows.size() ? "the script left every recipient out" : "the first recipient's message cannot be written: " + why) << "\n";
             return 1;
         }
         if (dry)
@@ -711,12 +659,20 @@ int cli_mail_send(int argc, char** argv)
     for (size_t i = 0; i < rows.size(); ++i)
     {
         const auto row_name = [&] {
-            const auto it = rows[i].find("email");
-            return it != rows[i].end() ? it->second : "recipient " + std::to_string(i + 1);
+            const std::string_view e = socketley::json::string_of(rows[i], "email");
+            return e.empty() ? "recipient " + std::to_string(i + 1) : std::string(e);
         };
-        if (!message_for(rows[i], m, why))
+        const bool first = sent + failed == 0;
+        const result r = message_for(rows[i], m, why);
+        if (r == result::skipped)
         {
-            if (check && i == 0)
+            std::cout << "skipped " << row_name() << ": " << why << "\n";
+            ++skipped;
+            continue;
+        }
+        if (r != result::written)
+        {
+            if (check && first)
             {
                 std::cout << "stopped before sending: the first recipient's message cannot be written: " << why << "\n";
                 return 1;
@@ -742,7 +698,7 @@ int cli_mail_send(int argc, char** argv)
         }
         else
         {
-            if (check && i == 0)
+            if (check && first)
             {
                 std::cout << "stopped before sending more: the first was refused: " << reply << "\n";
                 return 1;

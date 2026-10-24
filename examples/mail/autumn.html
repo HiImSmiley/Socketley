@@ -6,6 +6,14 @@
 <tr><td style="padding:8px 32px"><h1 style="color:#7c2d12;font-weight:normal">Autumn, {{name|dear customer}}</h1>
 <p style="color:#333;line-height:1.6">Everything in the autumn collection is 30% off until Sunday.</p>
 <p style="color:#333">Your code: <b style="font-size:20px;letter-spacing:2px">{{code}}</b></p>
+{% if picks and #picks > 0 then %}
+<p style="color:#333">Picked for you, {{first|dear customer}}:</p>
+<table cellpadding="6">
+{% for _, p in ipairs(picks) do %}
+<tr><td><a href="https://shop.example.com/p/{{ url(p.id) }}" style="color:#7c2d12">{{p.title}}</a></td><td align="right">{{ euro(p.price * 0.7) }}</td></tr>
+{% end %}
+</table>
+{% end %}
 <p><a href="https://shop.example.com/autumn" style="background:#7c2d12;color:#fff;padding:12px 22px;border-radius:8px;text-decoration:none">Shop now</a></p></td></tr>
 <tr><td style="padding:24px 32px;color:#999;font-size:12px">You get this as a customer of shop.example.com.
 <a href="{{unsubscribe}}" style="color:#999">Unsubscribe</a></td></tr>

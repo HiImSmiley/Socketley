@@ -30,7 +30,7 @@ inline constexpr std::string_view for_verb(std::string_view verb)
         return "send <name> <message> | send <mail> --to <address> [--cc|--bcc <address>] [--from <address>] "
                "[--reply-to <address>] [--subject <text>] [--text <text>] [--html <file>] [--attach <file>[:type]] "
                "[--inline <image>] [--header 'Name: value'] [--raw] | send <mail> --template <file> "
-               "--to <address>|idp:<idp>[/<group>]|db:<db>/<collection>|json:<file> [--set name=value] [--ad] "
+               "--to <address>|idp:<idp>[/<group>]|db:<db>/<collection>|json:<file> [--set name=value] [--script <file.lua>] [--ad] "
                "[--no-check] [--rate <n>/s|/min|/h] [--dry-run] [--test-to <address>]";
     if (verb == "edit")   return "edit <name> [flags]";
     if (verb == "show")   return "show <name|pattern>...";
