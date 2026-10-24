@@ -82,7 +82,7 @@ constexpr std::string_view mail_web_page = R"HTML(<!doctype html>
 .hdr .who{overflow:hidden}
 .hdr .who .line{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hdr .who .addr{color:var(--mut);font-size:13px;margin-left:4px}
-.hdr .rcp{color:var(--dim);font-size:12.5px;margin-top:2px;word-break:break-word}
+.hdr .rcp{color:var(--dim);font-size:12.5px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hdr .when{color:var(--dim);font-size:12.5px;white-space:nowrap;flex:none;margin-top:2px}
 .imgbar{display:flex;align-items:center;gap:10px;padding:9px 12px;margin-bottom:12px;border-radius:11px;background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.22);font-size:13px;color:#e9dcb5}
 .imgbar .btn{height:30px;font-size:12.5px;margin-left:auto}
