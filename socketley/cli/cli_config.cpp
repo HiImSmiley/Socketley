@@ -473,8 +473,9 @@ int cli_export(int argc, char** argv)
     std::set<std::string> outside;
     for (const jvalue& r : all.items)
     {
-        // One another runtime made is made again by it.
-        if (!socketley::json::string_of(r, "owner").empty())
+        // One another runtime made is made again by it, and one the cluster placed by the cluster.
+        const jvalue* placed = socketley::json::member(r, "cluster");
+        if (!socketley::json::string_of(r, "owner").empty() || (placed && placed->k == jvalue::kind::boolean && placed->b))
             continue;
         const std::string name(socketley::json::string_of(r, "name"));
         std::string shown, line = "show ";

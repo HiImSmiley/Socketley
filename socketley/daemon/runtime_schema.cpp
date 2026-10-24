@@ -296,6 +296,7 @@ constexpr state_key_row state_keys[] = {
     {"--tls-offloaded", "tls_offloaded"},
     {"--max-bytes", "max_bytes"},
     {"--fsync", "fsync"},
+    {"--sync", "sync"},
     {"--fsync-interval", "fsync_interval"},
     {"--scrub", "scrub"},
     {"--compress", "compress"},

@@ -67,7 +67,7 @@ return { type = "idp", name = "auth", port = $((P+1)), bind = "127.0.0.1", issue
 EOF
 cat > "$S/runtimes/more/1-store.lua" <<EOF
 return { type = "storage", name = "store", port = $((P+2)), bind = "127.0.0.1", dir = "$W/data/store",
-         credentials = "secrets/store.creds", start = true }
+         credentials = "secrets/store.creds", idp = "auth", sync = "per-user", start = true }
 EOF
 mail_lua() {
     cat > "$S/runtimes/more/2-mail.lua" <<EOF
@@ -122,6 +122,7 @@ case "$out" in *"unknown key: prot"*) [ "$rc" -eq 1 ] && ok "an unknown key is r
     || bad "export" "rc $rc: $(cat "$W/out") $(ls -R "$W/exp" 2>&1 | head -20)"
 grep -q 'www  A    127.0.0.9' "$W/exp/zones/try.test.zone" && grep -q 'submission = ' "$W/exp/runtimes/post.lua" \
     && grep -q '"zones/try.test.zone"' "$W/exp/runtimes/ns.lua" && ! grep -q 'sieve' "$W/exp/runtimes/post.lua" \
+    && grep -q 'sync = "per-user"' "$W/exp/runtimes/store.lua" \
     && ok "with the zone's own records and every setting, and nothing the runtime no longer has" \
     || bad "the export's content" "$(cat "$W/exp/runtimes/post.lua" "$W/exp/runtimes/ns.lua")"
 grep -q "$S/secrets/store.creds" "$W/exp/config.lua" && ok "what the setup reads and does not hold is named in config.lua" \

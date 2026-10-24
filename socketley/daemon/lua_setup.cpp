@@ -212,7 +212,7 @@ bool volatile_key(std::string_view key)
 {
     static constexpr std::string_view keys[] = {"name", "id", "type", "was_running", "owner", "pid", "shard_index",
                                                 "mesh_wired", "managed", "exec_path", "child_policy", "companion_path",
-                                                "external_runtime"};
+                                                "external_runtime", "cluster_replica"};
     return std::find(std::begin(keys), std::end(keys), key) != std::end(keys);
 }
 
