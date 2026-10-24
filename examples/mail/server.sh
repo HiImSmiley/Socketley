@@ -23,8 +23,7 @@ socketley idp-user auth add alice --password - --email alice@example.com \
 socketley create mail m -p 25 --dns ns --no-reply \
     --idp auth --storage files/mail \
     --submission 587 --imap 143 --sieve 4190 --shards 2 --web 9480 --domain mail \
-    --dnsbl zen.spamhaus.org \
-    --tls --cert /etc/ssl/mail.example.com.pem --key /etc/ssl/mail.example.com.key -s
+    --dnsbl zen.spamhaus.org --tls -s
 
 # alice's filter, as she would put it from her mail client.
 socketley mail m sieve alice put main "$(dirname "$0")/filter.sieve"

@@ -189,6 +189,25 @@ static void entrance_cert_default(runtime_instance* inst)
     }
 }
 
+// A mail runtime asked for --tls with no certificate of its own takes its dns runtime's entrance's, the one the names
+// it serves under are certified in; the entrance a dns runtime not yet made would make is its <dns>-proxy.
+static void mail_cert_default(runtime_manager& manager, runtime_instance* inst)
+{
+    if (!inst || inst->get_type() != runtime_mail || !inst->get_tls() || !inst->get_cert_path().empty() ||
+        !inst->get_key_path().empty())
+        return;
+    const std::string dns(static_cast<mail_instance*>(inst)->get_dns());
+    if (dns.empty())
+        return;
+    std::string entrance = dns + "-proxy";
+    if (auto* d = manager.get(dns); d && d->get_type() == runtime_dns)
+        entrance = std::string(static_cast<dns_instance*>(d)->get_proxy());
+    if (entrance.empty() || entrance == "none")
+        return;
+    inst->set_cert_path(cert_keeper::entrance_cert_path(entrance));
+    inst->set_key_path(cert_keeper::entrance_key_path(entrance));
+}
+
 static std::string instance_tls_refusal(const runtime_instance* inst)
 {
     if (!inst)
@@ -1663,6 +1682,7 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     // which is the first point the question can be answered, and refusing here
     // keeps the runtime from being created at all.
     entrance_cert_default(instance);
+    mail_cert_default(m_manager, instance);
     if (const std::string msg = instance_tls_refusal(instance); !msg.empty())
     {
         std::cout << msg;
@@ -4696,6 +4716,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
     }
 
     entrance_cert_default(instance);
+    mail_cert_default(m_manager, instance);
     if (const std::string msg = instance_tls_refusal(instance); !msg.empty())
     {
         restore_edit();

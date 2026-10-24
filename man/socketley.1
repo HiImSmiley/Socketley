@@ -12803,7 +12803,7 @@ socketley create mail m \-p 25 \-\-dns ns \-\-no\-reply \-s
 socketley send m \-\-to ops@example.com \-\-subject "Backup done" \-\-text ok
 
 socketley create mail m \-p 25 \-\-dns ns \-\-idp auth \-\-storage files/mail \e
-    \-\-submission 587 \-\-imap 143 \-\-tls \-\-cert mail.pem \-\-key mail.key \-s
+    \-\-submission 587 \-\-imap 143 \-\-tls \-s
 .fi
 .PP
 It listens for SMTP on 25 unless
@@ -12835,6 +12835,21 @@ from another server is passed on as it came. With no
 .B \-\-bind
 a port takes IPv6 and IPv4 alike; an IPv4 client is seen, checked and logged by
 its IPv4 address.
+.PP
+.B \-\-tls
+with
+.B \-\-dns
+and no
+.B \-\-cert
+takes the certificate of the dns runtime's entrance, which holds the names it is
+reached by and is renewed there, and the runtime takes the renewed one as it
+does any. One the entrance has still to write \(em a runtime made before its
+dns runtime, or on a machine where the entrance has not yet been given its
+names \(em is waited for: mail is taken meanwhile on SMTP without STARTTLS, and
+what takes a password or speaks TLS from the first byte opens within a second
+of the certificate being there. A certificate given with
+.B \-\-cert
+is there when the runtime starts, or it does not start.
 .PP
 .B Whose mail it takes.
 Its domains are

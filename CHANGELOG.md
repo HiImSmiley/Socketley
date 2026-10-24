@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A mail runtime takes its entrance's certificate.** `--tls` with `--dns`
+  and no `--cert` is the certificate the dns runtime's entrance keeps for its
+  names, renewed there; one still to be written is waited for, mail taken on
+  SMTP meanwhile and submission, IMAP and the TLS ports opened once it is
+  there, so a new machine's mail runtime starts without being told where
+  ACME keeps its files, and an export does not name them.
 - **A machine's setup as Lua files.** `/etc/socketley/config.lua` may say
   its `runtimes` as well as its `daemon`, and `include "runtimes/mail.lua"`
   or `include "runtimes/"` (each `.lua` in name order) splits them into a file

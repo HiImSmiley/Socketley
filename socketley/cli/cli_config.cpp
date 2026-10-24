@@ -503,6 +503,16 @@ int cli_export(int argc, char** argv)
             std::cout << ", so a setup cannot say them\n";
             return 2;
         }
+        // A mail runtime's certificate that is its entrance's is the one --tls with --dns takes without being told.
+        if (rt == runtime_mail && !socketley::json::string_of(state, "dns").empty())
+        {
+            const std::string acme = (socketley_paths::resolve().state_dir / ".acme" / "entrance-").string();
+            const auto entrance_file = [&](std::string_view key) {
+                return std::string(socketley::json::string_of(state, key)).starts_with(acme);
+            };
+            if (entrance_file("cert_path") && entrance_file("key_path"))
+                std::erase_if(settings, [](const auto& s) { return s.first == "cert" || s.first == "key"; });
+        }
         std::string why;
         for (auto& [k, v] : settings)
         {

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <sys/stat.h>
 #include <cstring>
 #include <filesystem>
 #include <charconv>
@@ -35,6 +36,7 @@
 #include "../../shared/util/random_id.h"
 #include "../../shared/loop/blocking_write.h"
 #include "../../shared/crypto/tls_context.h"
+#include "../../shared/persist/paths.h"
 #include "../../shared/json/json_escape.h"
 #include "../../shared/net/dns_feed.h"
 #include "../../shared/persist/read_file.h"
@@ -734,7 +736,15 @@ bool mail_run::start(std::string& why)
             return false;
         }
     }
-    if (m_owner.get_tls())
+    // A certificate the entrance has still to write is waited for, mail taken meanwhile by the listeners that need none.
+    if (m_owner.get_tls() && certificate_to_come())
+    {
+        m_cert_wait = true;
+        LOG_INFO(("mail " + std::string(m_owner.get_name()) + ": waiting for its certificate, " +
+                  std::string(m_owner.get_cert_path()) + "; what takes a password or speaks TLS opens when it is there")
+                     .c_str());
+    }
+    else if (m_owner.get_tls())
     {
         m_tls = std::make_unique<tls_context>();
         if (!m_tls->init_server(m_owner.get_cert_path(), m_owner.get_key_path(), m_owner.get_ca_path()))
@@ -801,50 +811,24 @@ bool mail_run::start(std::string& why)
     const bool takes_mail = m_owner.get_shard_index() == 0;
     if (takes_mail && !open_listener(m_smtp, m_owner.effective_port(), port_kind::smtp, why))
         return false;
-    if (takes_mail && m_owner.get_submission_port() &&
-        !open_listener(m_sub, m_owner.get_submission_port(), port_kind::submission, why))
-        return false;
-    if (takes_mail && m_owner.get_submissions_port() &&
-        !open_listener(m_subs, m_owner.get_submissions_port(), port_kind::submissions, why))
-        return false;
     // IMAP on every shard, each reading the others' changes from the users' journals.
     if (m_mailboxes && m_mailboxes->enabled())
-    {
         m_imap = std::make_unique<imap_store>(*this);
-        if (m_owner.get_imap_port() && !open_listener(m_imap_l, m_owner.get_imap_port(), port_kind::imap, why))
-            return false;
-        if (m_owner.get_imaps_port() && !open_listener(m_imaps_l, m_owner.get_imaps_port(), port_kind::imaps, why))
-            return false;
-    }
     // Sieve filters the mail a mailbox takes, so its scripts are every shard's, and ManageSieve listens on each.
     if (m_mailboxes && m_mailboxes->enabled())
-    {
         m_sieve = std::make_unique<sieve_store>(mail_sieve_dir(m_owner.get_name()));
-        if (m_owner.get_sieve_port() &&
-            !open_listener(m_sieve_l, m_owner.get_sieve_port(), port_kind::sieve, why))
-            return false;
-    }
     else if (m_owner.get_sieve_port())
     {
         why = "--sieve keeps the filters of mailboxes, which need --idp and --storage";
         return false;
     }
-    // POP3 reads the INBOX IMAP keeps, and LMTP hands mail to the mailboxes, on every shard.
-    if (m_mailboxes && m_mailboxes->enabled() && m_imap)
-    {
-        if (m_owner.get_pop3_port() && !open_listener(m_pop3_l, m_owner.get_pop3_port(), port_kind::pop3, why))
-            return false;
-        if (m_owner.get_pop3s_port() && !open_listener(m_pop3s_l, m_owner.get_pop3s_port(), port_kind::pop3s, why))
-            return false;
-        if (m_owner.get_jmap_port() && !open_listener(m_jmap_l, m_owner.get_jmap_port(), port_kind::jmap, why))
-            return false;
-        if (m_owner.get_web_port() && !open_listener(m_web_l, m_owner.get_web_port(), port_kind::web, why))
-            return false;
-    }
-    if (takes_mail && m_mailboxes && m_mailboxes->enabled() && m_owner.get_lmtp_port() &&
+    // The webmail is the entrance's, which takes its TLS, and LMTP hands mail to the mailboxes, on every shard.
+    if (m_imap && m_owner.get_web_port() && !open_listener(m_web_l, m_owner.get_web_port(), port_kind::web, why))
+        return false;
+    if (takes_mail && m_imap && m_owner.get_lmtp_port() &&
         !open_listener(m_lmtp_l, m_owner.get_lmtp_port(), port_kind::lmtp, why))
         return false;
-    if (m_owner.get_mta_sts_port() && !open_listener(m_sts_l, m_owner.get_mta_sts_port(), port_kind::sts, why))
+    if (!m_cert_wait && !open_secured(why))
         return false;
     if (m_owner.get_greylist())
         m_greylist = std::make_unique<greylist>(
@@ -869,6 +853,41 @@ bool mail_run::start(std::string& why)
               " as " + m_hostname + ", " + std::to_string(m_spool.entries().size()) + " message(s) queued")
                  .c_str());
     return true;
+}
+
+bool mail_run::certificate_to_come() const
+{
+    // Only one socketley writes, beside the entrance's ACME, is waited for; a path the operator gave is there or wrong.
+    const std::string acme = (socketley_paths::resolve().state_dir / ".acme").string() + "/";
+    struct stat st{};
+    for (const std::string_view p : {m_owner.get_cert_path(), m_owner.get_key_path()})
+        if (std::string(p).starts_with(acme) && ::stat(std::string(p).c_str(), &st) != 0 && errno == ENOENT)
+            return true;
+    return false;
+}
+
+bool mail_run::open_secured(std::string& why, std::vector<listener*>* opened)
+{
+    const bool takes_mail = m_owner.get_shard_index() == 0;
+    const auto open = [&](bool wanted, listener& l, uint16_t port, port_kind kind) {
+        if (!wanted || !port)
+            return true;
+        if (!open_listener(l, port, kind, why))
+            return false;
+        if (opened)
+            opened->push_back(&l);
+        return true;
+    };
+    // POP3 reads the INBOX IMAP keeps; all of them take a password, so they wait with the TLS ones for the certificate.
+    return open(takes_mail, m_sub, m_owner.get_submission_port(), port_kind::submission) &&
+           open(takes_mail, m_subs, m_owner.get_submissions_port(), port_kind::submissions) &&
+           open(m_imap != nullptr, m_imap_l, m_owner.get_imap_port(), port_kind::imap) &&
+           open(m_imap != nullptr, m_imaps_l, m_owner.get_imaps_port(), port_kind::imaps) &&
+           open(m_sieve != nullptr, m_sieve_l, m_owner.get_sieve_port(), port_kind::sieve) &&
+           open(m_imap != nullptr, m_pop3_l, m_owner.get_pop3_port(), port_kind::pop3) &&
+           open(m_imap != nullptr, m_pop3s_l, m_owner.get_pop3s_port(), port_kind::pop3s) &&
+           open(m_imap != nullptr, m_jmap_l, m_owner.get_jmap_port(), port_kind::jmap) &&
+           open(true, m_sts_l, m_owner.get_mta_sts_port(), port_kind::sts);
 }
 
 bool mail_run::open_listener(listener& l, uint16_t port, port_kind kind, std::string& why)
@@ -2528,6 +2547,24 @@ void mail_run::arm_tick()
 void mail_run::tick()
 {
     const int64_t now = wall::now_ms_coarse();
+    // The certificate written at last: TLS offered, and what waited for it opened.
+    if (m_cert_wait && !certificate_to_come())
+    {
+        auto tls = std::make_unique<tls_context>();
+        if (tls->init_server(m_owner.get_cert_path(), m_owner.get_key_path(), m_owner.get_ca_path()))
+        {
+            m_tls = std::move(tls);
+            m_cert_wait = false;
+            std::string why;
+            std::vector<listener*> opened;
+            if (!open_secured(why, &opened))
+                LOG_ERROR(("mail " + std::string(m_owner.get_name()) + ": its certificate is there, but " + why).c_str());
+            for (listener* l : opened)
+                arm_accept(*l);
+            publish_records();
+            LOG_INFO(("mail " + std::string(m_owner.get_name()) + ": its certificate is there; TLS is offered").c_str());
+        }
+    }
     std::vector<conn*> late;
     for (auto& [id, c] : m_conns)
     {

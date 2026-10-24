@@ -355,6 +355,11 @@ private:
     std::vector<std::string> m_arc_trusted;
     std::string m_state_dir;
 
+    // A certificate the entrance has still to write, the listeners that need it waiting for it.
+    bool m_cert_wait = false;
+    bool certificate_to_come() const;
+    // The listeners that take a password or speak TLS, those opened added to `opened`.
+    bool open_secured(std::string& why, std::vector<listener*>* opened = nullptr);
     listener m_smtp, m_sub, m_subs, m_imap_l, m_imaps_l, m_sieve_l, m_pop3_l, m_pop3s_l, m_lmtp_l, m_sts_l, m_jmap_l,
         m_web_l;
     // Every listener, for the loops over them.
