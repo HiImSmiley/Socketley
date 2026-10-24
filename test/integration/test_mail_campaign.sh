@@ -8,8 +8,8 @@
 #   * a placeholder not filled from the recipient's values, --set, or its default, a value put into the HTML unescaped,
 #     or {{{raw}}} escaped; no plain text part beside the HTML
 #   * --dry-run sending anything, or not showing the first recipient's message
-#   * --check sending when the first recipient's message cannot be written, or stopping at a later one rather than
-#     skipping it; without --check a missing value refused
+#   * a template sent when the first recipient's message cannot be written, or stopping at a later one rather than
+#     skipping it; with --no-check a missing value refused, or {{unsubscribe}} filled without --ad
 #   * --inline not sending the image inside the message, by the Content-ID the HTML names
 #   * --ad without List-Unsubscribe, its one-click POST, or a link of the recipient's own where {{unsubscribe}} is, or
 #     below the message where it is not
@@ -96,24 +96,27 @@ count() { ls "$T"/sink 2>/dev/null | grep -vc '^\.' ; }
 
 # --dry-run: the first message shown, nothing sent.
 out=$("$BIN" send m --template "$T/promo.html" --to "json:$T/people.json" --subject 'Hi {{name|there}}' \
-      --from news@example.test --set banner='<i>autumn</i>' --dry-run 2>&1); rc=$?
+      --from news@example.test --set banner='<i>autumn</i>' --ad --dry-run 2>&1); rc=$?
 case "$out" in *"To: \"Amy <b>\" <amy@remote.test>"*|*"amy@remote.test"*) ;; *) rc=99 ;; esac
 case "$out" in *"Subject: Hi Amy <b>"*"Your code: A-1"*"(3 recipients in all; nothing sent)"*) [ "$rc" -eq 0 ] && ok "--dry-run shows the first message filled, and sends nothing" \
     || bad "--dry-run" "rc $rc: $out" ;; *) bad "--dry-run shows the first message filled, and sends nothing" "rc $rc: $out" ;; esac
 sleep 0.5; [ "$(count)" -eq 0 ] && ok "and the sink got nothing" || bad "and the sink got nothing" "$(count)"
 
-# --check: a first recipient whose message cannot be written stops them all.
+# Strict unless said: a first recipient whose message cannot be written stops them all.
 printf '[{"email":"cat@remote.test"},{"email":"amy@remote.test","code":"A-1"}]' > "$T/first-bad.json"
-out=$("$BIN" send m --template "$T/promo.html" --to "json:$T/first-bad.json" --subject 'x' --from news@example.test --check 2>&1); rc=$?
-case "$out" in *"stopped before sending"*"{{code}}"*) [ "$rc" -eq 1 ] && ok "--check stops before sending when the first message has a placeholder without a value" \
-    || bad "--check stops on the first" "rc $rc: $out" ;; *) bad "--check stops before sending when the first message has a placeholder without a value" "rc $rc: $out" ;; esac
+out=$("$BIN" send m --template "$T/promo.html" --to "json:$T/first-bad.json" --subject 'x' --from news@example.test --set banner=x --ad 2>&1); rc=$?
+case "$out" in *"stopped before sending"*"{{code}}"*) [ "$rc" -eq 1 ] && ok "a template stops before sending when the first message has a placeholder without a value" \
+    || bad "a template stops on the first" "rc $rc: $out" ;; *) bad "a template stops before sending when the first message has a placeholder without a value" "rc $rc: $out" ;; esac
 sleep 0.5; [ "$(count)" -eq 0 ] && ok "and nothing went" || bad "and nothing went" "$(count)"
+out=$("$BIN" send m --template "$T/promo.html" --to amy@remote.test --set code=A-1 --set banner=x --subject 'x' --from news@example.test 2>&1); rc=$?
+case "$out" in *"{{unsubscribe}} is filled for an advertisement, --ad, alone"*) [ "$rc" -eq 1 ] && ok "a template with {{unsubscribe}} sent without --ad says --ad" \
+    || bad "{{unsubscribe}} without --ad" "rc $rc: $out" ;; *) bad "a template with {{unsubscribe}} sent without --ad says --ad" "rc $rc: $out" ;; esac
 
-# --check past the first: a later recipient without a value is skipped, the rest sent.
+# Past the first: a later recipient without a value is skipped, the rest sent.
 out=$("$BIN" send m --template "$T/promo.html" --to "json:$T/people.json" --subject 'Hi {{name|there}}' \
-      --from news@example.test --set banner='<i>autumn</i>' --inline "$T/logo.png" --ad --check --rate 50/s 2>&1); rc=$?
-case "$out" in *"skipped cat@remote.test: nothing fills {{code}}"*"sent 2 of 3, skipped 1"*) [ "$rc" -eq 0 ] && ok "--check skips a later recipient without a value and sends the rest" \
-    || bad "--check skips a later one" "rc $rc: $out" ;; *) bad "--check skips a later recipient without a value and sends the rest" "rc $rc: $out" ;; esac
+      --from news@example.test --set banner='<i>autumn</i>' --inline "$T/logo.png" --ad --rate 50/s 2>&1); rc=$?
+case "$out" in *"skipped cat@remote.test: nothing fills {{code}}"*"sent 2 of 3, skipped 1"*) [ "$rc" -eq 0 ] && ok "a later recipient without a value is skipped and the rest sent" \
+    || bad "a later one is skipped" "rc $rc: $out" ;; *) bad "a later recipient without a value is skipped and the rest sent" "rc $rc: $out" ;; esac
 wait_for amy@remote.test; wait_for bob@remote.test
 tally < <(python3 - "$(sent_to amy@remote.test)" "$(sent_to bob@remote.test)" <<'PY'
 import email, email.policy, sys
@@ -138,15 +141,15 @@ check("--inline sends the image inside the message, by the Content-ID the HTML n
 PY
 )
 
-# Without --check a missing value is empty, and the message goes.
+# With --no-check a missing value is empty, and the message goes.
 rm -f "$T"/sink/*
-out=$("$BIN" send m --template "$T/promo.html" --to cat@remote.test --subject 'Hi' --from news@example.test 2>&1); rc=$?
-[ "$rc" -eq 0 ] && wait_for cat@remote.test && ok "without --check a placeholder without a value is empty, and the message goes" \
-    || bad "without --check a missing value is empty" "rc $rc: $out"
+out=$("$BIN" send m --template "$T/promo.html" --to cat@remote.test --subject 'Hi' --from news@example.test --no-check 2>&1); rc=$?
+[ "$rc" -eq 0 ] && wait_for cat@remote.test && ok "with --no-check a placeholder without a value is empty, and the message goes" \
+    || bad "with --no-check a missing value is empty" "rc $rc: $out"
 
 # An advertisement: List-Unsubscribe, its one-click POST, and the recipient's own link.
 rm -f "$T"/sink/*
-out=$("$BIN" send m --template "$T/promo.html" --to dan@remote.test --set code=D-4 --subject 'Sale' --from news@example.test --ad 2>&1); rc=$?
+out=$("$BIN" send m --template "$T/promo.html" --to dan@remote.test --set code=D-4 --set banner=x --subject 'Sale' --from news@example.test --ad 2>&1); rc=$?
 printf 'Plain offer, no link in it.\n' > "$T/plain.txt"
 out2=$("$BIN" send m --to eve@remote.test --set x=1 --subject 'Offer' --from news@example.test --ad --text "$(cat "$T/plain.txt")" 2>&1)
 wait_for dan@remote.test; wait_for eve@remote.test
@@ -220,7 +223,7 @@ case "$out" in *"sent 1 of 1"*) wait_for ben@remote.test && ok "idp:<runtime>/<g
 # --test-to: one message, the first recipient's, to the address it names.
 rm -f "$T"/sink/*
 out=$("$BIN" send m --template "$T/promo.html" --to "json:$T/people.json" --subject 'Hi {{name|there}}' --from news@example.test \
-      --test-to me@remote.test 2>&1); rc=$?
+      --set banner=x --ad --test-to me@remote.test 2>&1); rc=$?
 sleep 0.5
 wait_for me@remote.test && [ "$(count)" -eq 1 ] && grep -q '^Subject: \[test\] Hi Amy' "$(sent_to me@remote.test)" \
     && ok "--test-to sends the first recipient's message to that address alone" || bad "--test-to sends one message" "rc $rc: $out / $(count)"

@@ -334,12 +334,13 @@ bool parse_rate(std::string_view v, double& per_s)
 }   // namespace
 
 // `socketley send <mail> --to ...`: the message is written by the runtime, its body from stdin or --text. With a
-// template -- placeholders, --set, a source of recipients, --ad, --check, --dry-run, --test-to or --rate -- each
-// recipient is sent a message of their own, the placeholders filled from their values, at --rate.
+// template -- placeholders, --set, a source of recipients, --ad, --no-check, --dry-run, --test-to or --rate -- each
+// recipient is sent a message of their own, the placeholders filled from their values, at --rate, strictly unless
+// --no-check says a placeholder without a value may be empty.
 int cli_mail_send(int argc, char** argv)
 {
     socketley::mail::compose c;
-    bool raw = false, have_text = false, templated = false, check = false, dry = false;
+    bool raw = false, have_text = false, templated = false, check = true, dry = false;
     std::vector<std::string> sources;
     std::map<std::string, std::string> sets;
     std::string test_to;
@@ -443,8 +444,11 @@ int cli_mail_send(int argc, char** argv)
         }
         else if (a == "--ad")
             c.ad = templated = true;
-        else if (a == "--check")
-            check = templated = true;
+        else if (a == "--no-check")
+        {
+            check = false;
+            templated = true;
+        }
         else if (a == "--dry-run")
             dry = templated = true;
         else if (a == "--raw")
@@ -636,8 +640,8 @@ int cli_mail_send(int argc, char** argv)
         for (const auto& [k, v] : sets)
             row.emplace(k, v);
 
-    // A recipient's message, false with why where it cannot be written: no address, or with --check a placeholder
-    // without a value.
+    // A recipient's message, false with why where it cannot be written: no address, or, unless --no-check, a
+    // placeholder without a value.
     const auto message_for = [&](const std::map<std::string, std::string>& row, socketley::mail::compose& m,
                                  std::string& why) {
         const auto field = [&row](const char* k) {
@@ -700,7 +704,7 @@ int cli_mail_send(int argc, char** argv)
         return rc != 0 || !reply.starts_with("queued") ? 1 : 0;
     }
 
-    // At --rate, the first a check: with --check a first that cannot be written or is refused stops them all.
+    // At --rate, the first a check: a first that cannot be written or is refused stops them all, unless --no-check.
     const auto gap = std::chrono::microseconds(static_cast<int64_t>(1e6 / rate));
     auto next = std::chrono::steady_clock::now();
     size_t sent = 0, skipped = 0, failed = 0;

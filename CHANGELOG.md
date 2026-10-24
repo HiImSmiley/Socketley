@@ -43,9 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the HTML), the plain part written from the HTML; the recipients are
   addresses, `idp:<idp>[/<group>]` (its accounts and their fields),
   `db:<db>/<collection>` (its documents) or `json:<file>`, `--set` gives
-  values for all, and `--rate` paces them (2/s unless said). `--check` stops
-  before sending when the first message has a placeholder without a value or
-  is refused, and skips a later one; `--dry-run` shows the first and
+  values for all, and `--rate` paces them (2/s unless said). Sending stops
+  before the first when its message has a placeholder without a value or is
+  refused, and skips a later one, unless `--no-check` lets them be empty; `--dry-run` shows the first and
   `--test-to` sends it to one address. `--ad` marks an advertisement: one
   recipient each, never one who unsubscribed, with their own link where
   `{{unsubscribe}}` is or below, List-Unsubscribe with a mailto: and the

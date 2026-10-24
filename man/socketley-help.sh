@@ -310,10 +310,10 @@ cli_commands() {
     echo "  A message for each recipient from a template: {{name}} is their value, {{name|other}}"
     echo "  stands where they have none, {{{name}}} goes into the HTML unescaped. --ad marks an"
     echo "  advertisement: a link to unsubscribe of their own, List-Unsubscribe, and no mail to one"
-    echo "  who unsubscribed. --check stops before sending when the first message has a placeholder"
-    echo "  without a value, and skips a later one; --rate 5/s paces them (2/s unless said);"
+    echo "  who unsubscribed. Sending stops before the first when its message has a placeholder"
+    echo "  without a value, and skips a later one, unless --no-check; --rate 5/s paces them (2/s);"
     echo "  --dry-run shows the first, --test-to <a> sends it to you alone."
-    echo -e "  ${CYAN}socketley send m --template autumn.html --to db:shop/customers --subject 'Hi {{name}}' --ad --check${NC}"
+    echo -e "  ${CYAN}socketley send m --template autumn.html --to db:shop/customers --subject 'Hi {{name}}' --ad${NC}"
     echo ""
 
     echo -e "${BOLD}restart <name> [edit flags] [-i]${NC}"
@@ -3541,7 +3541,7 @@ RUNTIMES
   rename <old> <new>             rename a runtime
   send <name> <data>             send through a runtime
   send <mail> --to <address>     write and queue a message (--subject, --text, --html, --attach, --inline)
-  send <mail> --template <file>  one for each recipient of --to idp:|db:|json:, filled; --ad, --check, --rate
+  send <mail> --template <file>  one for each recipient of --to idp:|db:|json:, filled; --ad, --no-check, --rate
   reload | reload-lua <name>     stop and start on the stored configuration, or reload the Lua script
 
 OTHER

@@ -735,7 +735,7 @@ df \-h | socketley send m \-\-to "Ops <ops@example.com>" \-\-subject "Disks" \e
 .fi
 .RE
 .TP
-.BI "send " "mail " "\fB\-\-template \fIfile\fR \fB\-\-to \fIaddress\fR|\fBidp:\fIidp\fR[\fB/\fIgroup\fR]|\fBdb:\fIdb\fB/\fIcollection\fR|\fBjson:\fIfile\fR [\fB\-\-set \fIname\fB=\fIvalue\fR] [\fB\-\-ad\fR] [\fB\-\-check\fR] [\fB\-\-rate \fIn\fB/s\fR|\fB/min\fR|\fB/h\fR] [\fB\-\-dry\-run\fR] [\fB\-\-test\-to \fIaddress\fR]"
+.BI "send " "mail " "\fB\-\-template \fIfile\fR \fB\-\-to \fIaddress\fR|\fBidp:\fIidp\fR[\fB/\fIgroup\fR]|\fBdb:\fIdb\fB/\fIcollection\fR|\fBjson:\fIfile\fR [\fB\-\-set \fIname\fB=\fIvalue\fR] [\fB\-\-ad\fR] [\fB\-\-no\-check\fR] [\fB\-\-rate \fIn\fB/s\fR|\fB/min\fR|\fB/h\fR] [\fB\-\-dry\-run\fR] [\fB\-\-test\-to \fIaddress\fR]"
 A message for each recipient, of their own, from a template: an HTML file, or
 .B \-\-text
 for plain text alone, and the subject, with placeholders.
@@ -769,12 +769,12 @@ HTML's text, its links written out. The messages go at
 the spam folder for coming at once; what was skipped or failed is said by
 recipient, and a line says how many were sent.
 .IP
-.B \-\-check
-fills strictly: a recipient whose message has a placeholder with no value and
-no default is skipped, and one whose message is the first stops them all before
-any is sent, as is a first the runtime refuses, since a template that fails its
-first recipient is wrong for all of them. Without it a placeholder with no value
-is empty.
+A template is filled strictly: a recipient whose message has a placeholder with
+no value and no default is skipped, and one whose message is the first stops
+them all before any is sent, as does a first the runtime refuses, since a
+template that fails its first recipient is wrong for all of them.
+.B \-\-no\-check
+lets a placeholder with no value be empty, and sends on past a first refused.
 .B \-\-dry\-run
 shows the first recipient's message and how many there are, and sends nothing;
 .B \-\-test\-to
@@ -802,7 +802,7 @@ advertisement still goes to an address that unsubscribed.
 .nf
 socketley send m \-\-template autumn.html \-\-inline logo.png \-\-to db:shop/customers \e
     \-\-from news@example.com \-\-subject "Hello {{name|there}}, your code {{code}}" \e
-    \-\-ad \-\-check \-\-rate 5/s
+    \-\-ad \-\-rate 5/s
 socketley send m \-\-template autumn.html \-\-to idp:auth/vip \-\-set code=VIP30 \-\-dry\-run
 .fi
 .RE
