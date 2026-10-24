@@ -397,24 +397,47 @@ bool is_path_flag(std::string_view flag)
     return false;
 }
 
-bool offered(std::string_view flag, runtime_type type)
+namespace
 {
-    char letter = 0;
+
+char letter_of(runtime_type type)
+{
     switch (type)
     {
-        case runtime_server:  letter = 'S'; break;
-        case runtime_client:  letter = 'C'; break;
-        case runtime_proxy:   letter = 'P'; break;
-        case runtime_cache:   letter = 'K'; break;
-        case runtime_storage: letter = 'T'; break;
-        case runtime_dns:     letter = 'D'; break;
-        case runtime_sync:    letter = 'Y'; break;
-        case runtime_idp:     letter = 'I'; break;
-        case runtime_db:      letter = 'B'; break;
-        case runtime_mqtt:    letter = 'M'; break;
-        case runtime_mail:    letter = 'E'; break;
-        default: return false;
+        case runtime_server:  return 'S';
+        case runtime_client:  return 'C';
+        case runtime_proxy:   return 'P';
+        case runtime_cache:   return 'K';
+        case runtime_storage: return 'T';
+        case runtime_dns:     return 'D';
+        case runtime_sync:    return 'Y';
+        case runtime_idp:     return 'I';
+        case runtime_db:      return 'B';
+        case runtime_mqtt:    return 'M';
+        case runtime_mail:    return 'E';
+        default:              return 0;
     }
+}
+
+}   // namespace
+
+std::vector<flag_entry> flags_for(runtime_type type)
+{
+    std::vector<flag_entry> out;
+    const char letter = letter_of(type);
+    if (!letter)
+        return out;
+    for (const row& r : rows)
+        if (r.types.find(letter) != std::string_view::npos)
+            out.push_back({r.flag, r.kind, state_key(r)});
+    return out;
+}
+
+bool offered(std::string_view flag, runtime_type type)
+{
+    const char letter = letter_of(type);
+    if (!letter)
+        return false;
     for (const row& r : rows)
         if ((r.flag == flag || r.aliases == flag) && r.types.find(letter) != std::string_view::npos)
             return true;

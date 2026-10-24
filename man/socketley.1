@@ -119,6 +119,10 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .B socketley
 .B \-\-lua
 .I lua_file
+.br
+.B socketley
+.B export
+.I dir
 .SH DESCRIPTION
 .B socketley
 is a high-performance Linux daemon and CLI that manages network runtimes
@@ -1530,6 +1534,34 @@ After saving, changes are validated and applied.
 Interactive editor mode with auto-reload. After saving changes, the
 runtime's Lua script is automatically hot-reloaded. Alias:
 .BR \-\-reload .
+.TP
+.BI "export " dir
+This daemon's setup written as Lua into
+.IR dir :
+.B config.lua
+with an
+.B include
+of a file for each runtime under
+.BR runtimes/ ,
+a dns runtime's zones under
+.B zones/
+and a handler script under
+.BR lua/ ,
+in an order that makes a runtime before those that name it. A runtime another
+made, such as a dns runtime's entrance, is made again by that one and left out;
+the daemon's own settings are carried from its configuration file. What the
+runtimes read and the setup does not hold \(em a credentials file, a token
+file, a certificate outside the state directory \(em is named at the top of
+.BR config.lua ,
+to be put on the next machine as well. Their data is not in it. The setup is
+read back and each runtime planned from it before the command ends, so one that
+it would make otherwise is named and the exit code is 1; a directory that holds
+a
+.B config.lua
+already is refused. See
+.B "A machine's setup"
+under
+.BR "LUA CONFIGURATION" .
 .TP
 .BI "import " "name " "[\-\-restart] " "json"
 Update a runtime's configuration from a JSON string. With no
@@ -13588,10 +13620,9 @@ This runs in the CLI process, is read for its
 .B daemon
 and
 .B runtimes
-tables, is turned into
-.B create
-commands and then exits. It never reaches the daemon and never becomes part of
-any runtime. A callback defined in such a file is dead code: nothing loads it,
+tables, brings the daemon to what they say and then exits; the daemon reads the
+same tables from its own configuration file when it starts. It never becomes
+part of any runtime. A callback defined in such a file is dead code: nothing loads it,
 nothing calls it, and nothing says so.
 .IP \(bu 2
 A
@@ -13713,7 +13744,8 @@ Its keys \(em
 names, at startup. The last three of those are settled before the ring exists
 and cannot be told to a daemon that is already serving, so
 .B "socketley \-\-lua"
-refuses them by name rather than dropping them. A flag typed on
+refuses them by name rather than dropping them \(em except in the daemon's own
+file, where they are its next start's. A flag typed on
 .B "socketley daemon"
 outranks the same setting in the file.
 .B config
@@ -13790,8 +13822,19 @@ replicate                  \-\-replicate
 cluster (bool)             \-\-cluster
 .fi
 .PP
-A key this list does not name is refused, naming it, rather than dropped in
-silence: a misspelled
+Every other flag of a type is the key of its own name, its dashes gone and a
+hyphen an underscore:
+.B \-\-mail\-domain
+is
+.BR mail_domain ,
+.B \-\-submission
+is
+.BR submission ,
+.B \-\-queue\-lifetime
+is
+.BR queue_lifetime .
+A list key takes a table, or one string for the list of one. A key no flag of
+the type has is refused, naming it, rather than dropped in silence: a misspelled
 .B http_cache
 used to configure nothing while the runtime came up looking correct. A value of
 the wrong shape is refused the same way, and so is a value containing a tab
@@ -13858,6 +13901,63 @@ and
 are open because a configuration computes names and port numbers, and the
 daemon's own configuration file opens the same set, so one file can be read
 by either.
+.SS A machine's setup
+A setup is the runtimes of a machine as Lua files, so that another machine
+given the files is given the same runtimes; their data is not in them.
+.B include
+reads a file and is what it returns, or reads each
+.B .lua
+of a directory in the order of their names and is the list of what they return;
+a list among the
+.B runtimes
+is its entries. A relative path, whether an include's or a value's \(em a
+credentials file, a certificate, a handler script, a zone file \(em is one
+beside the first file, wherever the command was typed:
+.RS
+.PP
+.nf
+\-\- /etc/socketley/config.lua
+daemon = { metrics_port = 9190, dashboard_idp = "auth" }
+runtimes = {
+    include "runtimes/ns.lua",
+    include "runtimes/auth.lua",
+    include "runtimes/sites",            \-\- every .lua in it
+}
+
+\-\- /etc/socketley/runtimes/ns.lua
+return { type = "dns", name = "ns", zone = { "zones/example.com.zone" },
+         publish = { "203.0.113.7" }, start = true }
+.fi
+.RE
+.PP
+.B "socketley \-\-lua"
+brings the daemon to what the files say. A runtime it does not have is made; one
+it has is planned as
+.B create
+would make it from the file and compared with what
+.B show
+says of it, and where they differ it is told what differs \(em a setting the
+file no longer says is cleared \(em across a restart where it runs, and asked
+again, so a runtime that does not take a setting is named, exit 1. One that is
+as the file says is not touched.
+.B start
+starts or stops it; a runtime without
+.B start
+is left running or stopped as it is. A runtime of the daemon's that the files do
+not name is left alone.
+.PP
+The daemon reads the
+.B runtimes
+of its own configuration file when it starts, after the runtimes it kept, and
+makes each it has not, started where
+.B start
+says so; one it has is left as it is, for
+.B "socketley \-\-lua"
+to bring to the file. A new machine therefore needs the files in
+.B /etc/socketley
+and nothing else run.
+.B "socketley export"
+writes a running machine's setup this way.
 .SS Handler Privileges
 .B "A Lua handler runs with the daemon's full privileges."
 It is not sandboxed and there is no supported way to sandbox it. Read a

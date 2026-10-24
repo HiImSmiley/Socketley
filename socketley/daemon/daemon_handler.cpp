@@ -43,13 +43,15 @@
 
 static void publish_dns_names(runtime_manager& manager);
 
-// Why `rt`'s names may not stand beside every other runtime's (runtime_names.h), empty when they may.
-static std::string names_refusal(runtime_manager& manager, const runtime_instance& rt)
+// Why `rt`'s names may not stand beside every other runtime's (runtime_names.h), empty when they may; a plan stands
+// for the runtime `instead_of`, whose names it would take over.
+static std::string names_refusal(runtime_manager& manager, const runtime_instance& rt, std::string_view instead_of = {})
 {
     std::shared_lock lock(manager.mutex);
     std::vector<const runtime_instance*> others;
     for (const auto& [name, inst] : manager.list())
-        others.push_back(inst.get());
+        if (instead_of.empty() || name != instead_of)
+            others.push_back(inst.get());
     return runtime_names::refusal(rt, others);
 }
 #include "../runtime/server/server_instance.h"
@@ -1464,6 +1466,7 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
     switch (pa.hashes[0])
     {
         case fnv1a("create"):     return cmd_create(conn, pa);
+        case fnv1a("plan"):       return cmd_plan(conn, pa);
         case fnv1a("start"):     return cmd_start(conn, pa);
         case fnv1a("stop"):      return cmd_stop(conn, pa);
         case fnv1a("remove"):    return cmd_remove(conn, pa);
@@ -1668,7 +1671,7 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     }
 
     // A name belongs to one runtime, checked once every flag is in.
-    if (const std::string msg = names_refusal(m_manager, *instance); !msg.empty())
+    if (const std::string msg = names_refusal(m_manager, *instance, m_plan_for); !msg.empty())
     {
         std::cout << msg;
         m_manager.remove(name);
@@ -1869,8 +1872,58 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     // an instance and there is nothing to validate against without one -- and
     // this is the form the two refusals above already use.
     if (instance->get_test_mode())
+    {
+        // What `plan` asks for: the runtime as `show` would write it, before it is gone -- a dns runtime's entrance
+        // named as make_dns_entrance names it, which a dry run does not reach.
+        if (m_plan_out && m_persistence)
+        {
+            if (type == runtime_dns)
+            {
+                auto* dns = static_cast<dns_instance*>(instance);
+                const std::string proxy(dns->get_proxy());
+                dns->set_proxy(proxy == "none" ? std::string() : proxy.empty() ? std::string(name) + "-proxy" : proxy);
+            }
+            *m_plan_out = m_persistence->format_json_pretty(m_persistence->read_from_instance(instance));
+        }
         m_manager.remove(name);
+    }
 
+    return 0;
+}
+
+// `plan <type> <name> [flags]`: what `create` would keep of the runtime, as `show` writes it, kept nowhere -- made
+// under a name of its own, so a runtime that exists by that name is planned as well.
+int daemon_handler::cmd_plan(ipc_connection* conn, const parsed_args& pa)
+{
+    if (pa.count < 3 || pa.count + 1 >= MAX_ARGS)
+    {
+        std::cout << "usage: plan <type> <name> [flags]\n";
+        return 1;
+    }
+    const std::string name(pa.args[2]);
+    std::string scratch = name + ".plan";
+    while (m_manager.get(scratch))
+        scratch += '_';
+    parsed_args p = pa;
+    p.args[0] = "create";
+    p.hashes[0] = fnv1a("create");
+    p.args[2] = scratch;
+    p.hashes[2] = fnv1a(scratch);
+    p.args[p.count] = "--test";
+    p.hashes[p.count] = fnv1a("--test");
+    ++p.count;
+    std::string json;
+    m_plan_out = &json;
+    m_plan_for = name;
+    const int rc = cmd_create(conn, p);
+    m_plan_out = nullptr;
+    m_plan_for.clear();
+    if (rc != 0)
+        return rc;
+    // A value made of the name, as a default path is, is the one the real name gives.
+    for (size_t at = json.find(scratch); at != std::string::npos; at = json.find(scratch, at + name.size()))
+        json.replace(at, scratch.size(), name);
+    std::cout << json;
     return 0;
 }
 

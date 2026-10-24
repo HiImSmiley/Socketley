@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A machine's setup as Lua files.** `/etc/socketley/config.lua` may say
+  its `runtimes` as well as its `daemon`, and `include "runtimes/mail.lua"`
+  or `include "runtimes/"` (each `.lua` in name order) splits them into a file
+  each; a relative path in them is beside `config.lua`. The daemon makes the
+  runtimes it has not when it starts, so a new machine needs the files and
+  nothing else run. `socketley --lua <file>` brings a running daemon to the
+  files: it makes what is missing, tells a runtime what differs from what
+  `create` would make (a setting no longer said is cleared) across a restart
+  where it runs, and leaves one that is as said untouched. `socketley export
+  <dir>` writes a running machine's setup that way, with its zones and
+  handler scripts beside it and the files it reads but does not hold named,
+  and reads it back to check that each runtime would be made as it is. Every
+  flag of a type is a Lua key of its own name (`submission`, `mail_domain`,
+  `queue_lifetime`), where a mail runtime and the ACME flags had none.
 - **A `mail` runtime: a mail server for the domains of a dns runtime and the
   users of an idp runtime, its mailboxes in a storage runtime.** It takes
   ESMTP on 25 (PIPELINING, SIZE, 8BITMIME, SMTPUTF8, STARTTLS, AUTH, CHUNKING

@@ -1,511 +1,29 @@
 #include "cli.h"
-#include <cmath>
+#include <algorithm>
 #include <cstdio>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <functional>
 #include <iostream>
+#include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <sol/sol.hpp>
 
 #include "runtime_type_parser.h"
 #include "../daemon/ipc_client.h"
-#include "../shared/ipc/ipc_framing.h"
-#include "command_hashing.h"
+#include "../daemon/lua_setup.h"
 #include "../daemon/type_manifest.h"
+#include "../shared/ipc/ipc_framing.h"
+#include "../shared/json/json_doc.h"
 #include "../shared/persist/paths.h"
+#include "../shared/util/settings.h"
 
 namespace {
 
-// What a value in a configuration is allowed to be, which is also what it
-// becomes on the command line.
-enum class key_kind : uint8_t
-{
-    text,       // --flag <string>
-    integer,    // --flag <whole number>
-    number,     // --flag <number>
-    scalar,     // --flag <string or number>, for values like 256M and 0-3
-    boolean,    // --flag, emitted only when the value is true
-    list,       // --flag a,b,c
-    list_semi,  // --flag a;b;c
-};
-
-struct config_key
-{
-    std::string_view name;
-    std::string_view flag;
-    key_kind         kind;
-};
-
-// Every flag a create accepts, one row each, because the two sets drifting
-// apart is the whole defect this table exists to close: a key this file did
-// not name used to be dropped in silence, and the health-check, circuit,
-// retry and TLS families could not be reached from a configuration at all.
-// Keys the daemon has no flag for are handled beside the table, not in it.
-constexpr config_key config_keys[] = {
-    // ── Every type ──────────────────────────────────────────────────────────
-    { "port",               "-p",                   key_kind::integer },
-    { "bind",               "--bind",               key_kind::text    },
-    { "listen",             "--listen",             key_kind::text    },
-    { "shards",             "--shards",             key_kind::integer },
-    { "log",                "--log",                key_kind::text    },
-    { "write",              "-w",                   key_kind::text    },
-    { "group",              "-g",                   key_kind::text    },
-    { "cpus",               "--cpus",               key_kind::scalar  },
-    { "max_connections",    "--max-connections",    key_kind::integer },
-    { "rate_limit",         "--rate-limit",         key_kind::number  },
-    { "global_rate_limit",  "--global-rate-limit",  key_kind::number  },
-    // scalar, not integer: a duration key takes `300` or `"5m"`, and the
-    // daemon's duration parser is the one judge of both spellings.
-    { "idle_timeout",       "--idle-timeout",       key_kind::scalar  },
-    { "write_buffer",       "--write-buffer",       key_kind::scalar  },
-    { "read_buffer",        "--read-buffer",        key_kind::scalar  },
-    { "drain",              "--drain",              key_kind::boolean },
-    { "test",               "--test",               key_kind::boolean },
-    { "tls",                "--tls",                key_kind::boolean },
-    { "cert",               "--cert",               key_kind::text    },
-    { "key",                "--key",                key_kind::text    },
-    { "ca",                 "--ca",                 key_kind::text    },
-
-    // ── Server ──────────────────────────────────────────────────────────────
-    { "mode",               "--mode",               key_kind::text    },
-    { "send_to",            "--send-to",            key_kind::text    },
-    { "udp",                "--udp",                key_kind::boolean },
-    { "http",               "--http",               key_kind::text    },
-    { "http_cache",         "--http-cache",         key_kind::boolean },
-    { "master_pw",          "--master-pw",          key_kind::text    },
-    { "cache",              "--cache",              key_kind::text    },
-    { "upstreams",          "--upstream",           key_kind::list_semi },
-
-    // ── Client ──────────────────────────────────────────────────────────────
-    { "target",             "-t",                   key_kind::text    },
-
-    // ── Proxy ───────────────────────────────────────────────────────────────
-    { "backends",           "--backend",            key_kind::list    },
-    { "protocol",           "--protocol",           key_kind::text    },
-    { "strategy",           "--strategy",           key_kind::text    },
-    { "health_check",       "--health-check",       key_kind::text    },
-    { "health_interval",    "--health-interval",    key_kind::scalar  },
-    { "health_path",        "--health-path",        key_kind::text    },
-    { "health_threshold",   "--health-threshold",   key_kind::integer },
-    { "circuit_threshold",  "--circuit-threshold",  key_kind::integer },
-    { "circuit_timeout",    "--circuit-timeout",    key_kind::scalar  },
-    { "backend_timeout",    "--backend-timeout",    key_kind::scalar  },
-    { "retry",              "--retry",              key_kind::integer },
-    { "retry_all",          "--retry-all",          key_kind::boolean },
-    { "client_ca",          "--client-ca",          key_kind::text    },
-    { "client_cert",        "--client-cert",        key_kind::text    },
-    { "client_key",         "--client-key",         key_kind::text    },
-    { "sidecar",            "--sidecar",            key_kind::boolean },
-    { "auth",               "--auth",               key_kind::text    },
-    { "redirect_https",     "--redirect-https",     key_kind::integer },
-
-    // ── Cache ───────────────────────────────────────────────────────────────
-    { "persistent",         "--persistent",         key_kind::text    },
-    { "persistent_interval","--persistent-interval",key_kind::scalar  },
-    { "maxmemory",          "--maxmemory",          key_kind::scalar  },
-    { "eviction",           "--eviction",           key_kind::text    },
-    { "resp",               "--resp",               key_kind::boolean },
-    { "replicate",          "--replicate",          key_kind::text    },
-    { "cluster",            "--cluster",            key_kind::boolean },
-    { "public",             "--public",             key_kind::boolean },
-
-    // ── Storage ─────────────────────────────────────────────────────────────
-    { "dir",                "--dir",                key_kind::text    },
-    { "anonymous",          "--anonymous",          key_kind::boolean },
-    { "acls",               "--acls",               key_kind::boolean },
-    { "max_bytes",          "--max-bytes",          key_kind::scalar  },
-    { "access_key",         "--access-key",         key_kind::text    },
-    { "secret_key",         "--secret-key",         key_kind::text    },
-    { "credentials",        "--credentials",        key_kind::text    },
-    { "sse_key_file",       "--sse-key-file",       key_kind::text    },
-    { "domain",             "--domain",             key_kind::text    },
-    { "website_domain",     "--website-domain",     key_kind::text    },
-    { "notify_targets",     "--notify-targets",     key_kind::text    },
-    { "replication_targets", "--replication-targets", key_kind::text   },
-    { "tiers",              "--tiers",              key_kind::text    },
-    { "federation",         "--federation",         key_kind::text    },
-    { "tls_offloaded",      "--tls-offloaded",      key_kind::text    },
-    { "nodes",              "--nodes",              key_kind::text    },
-    { "fsync",              "--fsync",              key_kind::text    },
-    { "sync",               "--sync",               key_kind::text    },
-    { "fsync_interval",     "--fsync-interval",     key_kind::scalar  },
-    { "mpu_expire",         "--mpu-expire",         key_kind::scalar  },
-    { "scrub",              "--scrub",              key_kind::scalar  },
-    { "compress",           "--compress",           key_kind::scalar  },
-
-    // ── DNS ─────────────────────────────────────────────────────────────────
-    { "zone",               "--zone",               key_kind::list    },
-    { "transfer",           "--transfer",           key_kind::list    },
-    { "notify",             "--notify",             key_kind::list    },
-    { "publish",            "--publish",            key_kind::list    },
-    { "proxy",              "--proxy",              key_kind::text    },
-    { "rrl",                "--rrl",                key_kind::integer },
-
-    // ── sync ────────────────────────────────────────────────────────────────
-    // dir, credentials and mode are above, shared with the storage and the server's.
-    { "storage",            "--storage",            key_kind::list    },
-    { "prefix",             "--prefix",             key_kind::text    },
-    { "exclude",            "--exclude",            key_kind::list    },
-    { "repositories",       "--repositories",       key_kind::text    },
-    { "every",              "--every",              key_kind::scalar  },
-
-    // ── idp ─────────────────────────────────────────────────────────────────
-    { "clients",            "--clients",            key_kind::text    },
-    { "issuer",             "--issuer",             key_kind::text    },
-    { "cookie_domain",      "--cookie-domain",      key_kind::text    },
-    { "idp",                "--idp",                key_kind::text    },
-    // ── db ──────────────────────────────────────────────────────────────────
-    { "schema",             "--schema",             key_kind::text    },
-    { "keys",               "--keys",               key_kind::text    },
-    { "origins",            "--origins",            key_kind::text    },
-    { "cache",              "--cache",              key_kind::scalar  },
-    { "replicate",          "--replicate",          key_kind::text    },
-    { "replicate_key",      "--replicate-key",      key_kind::text    },
-    { "backup_dir",         "--backup-dir",         key_kind::text    },
-    { "backup_every",       "--backup-every",       key_kind::scalar  },
-    { "backup_keep",        "--backup-keep",        key_kind::integer },
-    // ── mqtt ────────────────────────────────────────────────────────────────
-    // idp, anonymous, persistent and persistent_interval are above, shared with the storage's and the cache's.
-    { "users",              "--users",              key_kind::text    },
-    { "acl",                "--acl",                key_kind::text    },
-    { "routes",             "--routes",             key_kind::text    },
-    { "ws",                 "--ws",                 key_kind::integer },
-    { "max_packet",         "--max-packet",         key_kind::scalar  },
-    { "session_expiry",     "--session-expiry",     key_kind::scalar  },
-    { "session_queue",      "--session-queue",      key_kind::integer },
-    { "retained_max",       "--retained-max",       key_kind::scalar  },
-    { "max_sessions",       "--max-sessions",       key_kind::integer },
-    { "keepalive_max",      "--keepalive-max",      key_kind::integer },
-};
-
-// Keys with no flag of their own, listed so an unknown key can still be
-// refused by name.
-constexpr std::string_view special_keys[] = {
-    "type", "name", "config", "lua", "bash", "start", "reconnect",
-    "daemon_process",
-};
-
-// %.10g rather than std::to_string, which writes a rate of 1.5 as 1.500000 and
-// would put six digits of noise into every command the daemon logs.
-std::string number_to_text(double v)
-{
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "%.10g", v);
-    return buf;
-}
-
-// A space travels inside its argument, a tab does not, so a value with one would arrive as two arguments.
-std::string refuse_whitespace(std::string_view key, const std::string& value)
-{
-    if (value.find('\t') == std::string::npos)
-        return {};
-
-    return std::string(key) + ": a value cannot contain a tab, because the "
-           "daemon's command line splits on it (\"" + value + "\")\n";
-}
-
-// One key, appended to the command or refused with the reason, returning the
-// empty string when the key was absent.
-std::string emit_key(const config_key& key, const sol::table& entry, std::string& command)
-{
-    const sol::object obj = entry[key.name];
-    if (!obj.valid() || obj == sol::nil)
-        return {};
-
-    const std::string name(key.name);
-
-    switch (key.kind)
-    {
-        case key_kind::boolean:
-        {
-            if (obj.get_type() != sol::type::boolean)
-                return name + ": expected true or false\n";
-            if (obj.as<bool>())
-                command += " " + std::string(key.flag);
-            return {};
-        }
-
-        case key_kind::integer:
-        case key_kind::number:
-        {
-            if (obj.get_type() != sol::type::number)
-                return name + ": expected a number\n";
-            const double v = obj.as<double>();
-            if (key.kind == key_kind::integer && v != std::floor(v))
-                return name + ": expected a whole number\n";
-            command += " " + std::string(key.flag) + " " + number_to_text(v);
-            return {};
-        }
-
-        case key_kind::text:
-        case key_kind::scalar:
-        {
-            std::string value;
-            if (obj.get_type() == sol::type::string)
-                value = obj.as<std::string>();
-            else if (key.kind == key_kind::scalar && obj.get_type() == sol::type::number)
-                value = number_to_text(obj.as<double>());
-            else if (key.kind == key_kind::scalar)
-                return name + ": expected a string or a number\n";
-            else
-                return name + ": expected a string\n";
-
-            if (value.empty())
-                return name + ": the value is empty\n";
-            if (std::string why = refuse_whitespace(key.name, value); !why.empty())
-                return why;
-
-            command += " " + std::string(key.flag) + " ";
-            ipc_frame::append_arg(command, value);
-            return {};
-        }
-
-        case key_kind::list:
-        case key_kind::list_semi:
-        {
-            if (obj.get_type() != sol::type::table)
-                return name + ": expected a list of strings\n";
-
-            const char sep = key.kind == key_kind::list ? ',' : ';';
-            std::string joined;
-
-            for (auto& element : obj.as<sol::table>())
-            {
-                if (element.second.get_type() != sol::type::string)
-                    return name + ": every entry has to be a string\n";
-
-                const std::string value = element.second.as<std::string>();
-                if (value.empty())
-                    return name + ": an entry is empty\n";
-                if (std::string why = refuse_whitespace(key.name, value); !why.empty())
-                    return why;
-                // An entry holding the separator would arrive as two.
-                if (value.find(sep) != std::string::npos)
-                    return name + ": an entry cannot hold '" + std::string(1, sep) + "', which separates the list (\"" +
-                           value + "\")\n";
-
-                if (!joined.empty())
-                    joined += sep;
-                joined += value;
-            }
-
-            // An empty list is the operator asking for nothing rather than for
-            // a flag with no value, which the daemon would refuse.
-            if (!joined.empty())
-            {
-                command += " " + std::string(key.flag) + " ";
-                ipc_frame::append_arg(command, joined);
-            }
-            return {};
-        }
-    }
-
-    return {};
-}
-
-// The keys with no straightforward flag: an alias, a tri-state, a value that
-// may be a bool or a number, and one key that is refused outright.
-std::string emit_special_keys(const sol::table& entry, std::string& command, bool& autostart)
-{
-    // `daemon_process` is refused rather than ignored, for either value,
-    // because a key that means nothing still implies this build has an
-    // opinion about it.
-    if (entry["daemon_process"].valid())
-        return "daemon_process is no longer a setting: every runtime runs in "
-               "its own process. Remove the line.\n";
-
-    // Two spellings of the handler script, with `config` winning, because a
-    // file naming both means two different scripts and only one can run.
-    {
-        const sol::object cfg = entry["config"];
-        const sol::object lua = entry["lua"];
-        const bool has_cfg = cfg.valid() && cfg != sol::nil;
-        const bool has_lua = lua.valid() && lua != sol::nil;
-
-        if (has_cfg && has_lua)
-            return "config and lua are two spellings of one key: name the "
-                   "handler script once\n";
-
-        if (has_cfg || has_lua)
-        {
-            const sol::object& obj = has_cfg ? cfg : lua;
-            if (obj.get_type() != sol::type::string)
-                return "config: expected a string\n";
-            const std::string value = obj.as<std::string>();
-            if (value.empty())
-                return "config: the value is empty\n";
-            if (std::string why = refuse_whitespace("config", value); !why.empty())
-                return why;
-            command += " --lua ";
-            ipc_frame::append_arg(command, value);
-        }
-    }
-
-    // Infinite when true and bounded when a number, which is the flag's own
-    // shape: --reconnect alone means keep trying.
-    {
-        const sol::object obj = entry["reconnect"];
-        if (obj.valid() && obj != sol::nil)
-        {
-            if (obj.get_type() == sol::type::boolean)
-            {
-                if (obj.as<bool>())
-                    command += " --reconnect";
-            }
-            else if (obj.get_type() == sol::type::number)
-            {
-                const double v = obj.as<double>();
-                if (v != std::floor(v) || v < 0)
-                    return "reconnect: expected true or a count of attempts\n";
-                command += " --reconnect " + number_to_text(v);
-            }
-            else
-            {
-                return "reconnect: expected true or a count of attempts\n";
-            }
-        }
-    }
-
-    {
-        const sol::object obj = entry["bash"];
-        if (obj.valid() && obj != sol::nil)
-        {
-            if (obj.get_type() != sol::type::string)
-                return "bash: expected a string\n";
-
-            switch (fnv1a(obj.as<std::string>()))
-            {
-                case fnv1a("pt"):
-                case fnv1a("tp"):
-                case fnv1a("bpt"):
-                case fnv1a("btp"):
-                    command += " -bpt";
-                    break;
-                case fnv1a("p"):
-                case fnv1a("bp"):
-                    command += " -bp";
-                    break;
-                case fnv1a("t"):
-                case fnv1a("bt"):
-                    command += " -bt";
-                    break;
-                default:
-                    command += " -b";
-                    break;
-            }
-        }
-    }
-
-    {
-        const sol::object obj = entry["start"];
-        if (obj.valid() && obj != sol::nil)
-        {
-            if (obj.get_type() != sol::type::boolean)
-                return "start: expected true or false\n";
-            autostart = obj.as<bool>();
-        }
-    }
-
-    return {};
-}
-
-// A key nobody handles is a typo, and a typo used to configure nothing while
-// the runtime came up looking correct.
-std::string refuse_unknown_keys(const sol::table& entry,
-                                const type_manifest::manifest* man)
-{
-    for (auto& pair : entry)
-    {
-        if (pair.first.get_type() != sol::type::string)
-            return "a runtime entry takes named keys, not a list\n";
-
-        const std::string name = pair.first.as<std::string>();
-        bool known = false;
-
-        for (const config_key& key : config_keys)
-            if (key.name == name) { known = true; break; }
-
-        if (!known)
-            for (std::string_view key : special_keys)
-                if (key == name) { known = true; break; }
-
-        // A registered type's manifest schema is part of the key set, held to
-        // the same rule as the table above.
-        if (!known && man)
-            for (const auto& sk : man->schema)
-                if (sk.name == name) { known = true; break; }
-
-        if (!known)
-            return "unknown key: " + name + "\n";
-    }
-
-    return {};
-}
-
-// A registered type's schema keys through the same emit_key the table rows
-// take, one synthesized row each -- except a bool, which is emitted with an
-// explicit value because omitting it must mean "take the manifest's default"
-// rather than "false".
-std::string emit_manifest_keys(const type_manifest::manifest& man,
-                               const sol::table& entry, std::string& command)
-{
-    for (const auto& sk : man.schema)
-    {
-        const std::string flag = "--" + sk.name;
-
-        if (sk.kind == type_manifest::key_kind::bool_key)
-        {
-            const sol::object obj = entry[sk.name];
-            if (!obj.valid() || obj == sol::nil)
-                continue;
-            if (obj.get_type() != sol::type::boolean)
-                return sk.name + ": expected true or false\n";
-            command += " " + flag + (obj.as<bool>() ? " true" : " false");
-            continue;
-        }
-
-        const key_kind kind = sk.kind == type_manifest::key_kind::int_key
-                                  ? key_kind::integer
-                                  : key_kind::text;
-        const config_key row{sk.name, flag, kind};
-        if (std::string why = emit_key(row, entry, command); !why.empty())
-            return why;
-    }
-
-    return {};
-}
-
-// The whole entry, in table order so two runs of one file produce the same
-// command, with the first refusal ending it because a half-built command line
-// configures something nobody asked for.
-std::string build_create_command(const std::string& type_str, const std::string& name,
-                                 const sol::table& entry, std::string& command,
-                                 const type_manifest::manifest* man)
-{
-    bool autostart = false;
-
-    if (std::string why = refuse_unknown_keys(entry, man); !why.empty())
-        return why;
-
-    command = "create " + type_str + " ";
-    ipc_frame::append_arg(command, name);
-
-    for (const config_key& key : config_keys)
-        if (std::string why = emit_key(key, entry, command); !why.empty())
-            return why;
-
-    if (man)
-        if (std::string why = emit_manifest_keys(*man, entry, command); !why.empty())
-            return why;
-
-    if (std::string why = emit_special_keys(entry, command, autostart); !why.empty())
-        return why;
-
-    // Last, so a runtime is fully configured before it is asked to run.
-    if (autostart)
-        command += " -s";
-
-    return {};
-}
+using socketley::json::jvalue;
 
 // A daemon setting the daemon reads at startup and cannot be told afterwards,
 // refused by name rather than dropped, because a file that sets a log level
@@ -525,8 +43,102 @@ std::string refuse_startup_only_daemon_keys(const sol::table& daemon)
     return {};
 }
 
+// The file the daemon reads its own settings from, as it finds it.
+std::string daemon_config_path()
+{
+    const char* env = socketley::settings::text("SOCKETLEY_CONFIG");
+    return env && env[0] ? std::string(env) : socketley_paths::resolve().config_path.string();
+}
+
+bool same_file(const std::string& a, const std::string& b)
+{
+    std::error_code ec1, ec2;
+    return std::filesystem::equivalent(a, b, ec1) && !ec1 && !ec2;
+}
+
+// A command's words as the daemon's line, each quoted where it has to be.
+std::string line_of(const std::vector<std::string>& words, size_t from = 0)
+{
+    std::string line;
+    for (size_t i = from; i < words.size(); ++i)
+    {
+        if (!line.empty())
+            line += ' ';
+        ipc_frame::append_arg(line, words[i]);
+    }
+    return line;
+}
+
+bool parse(const std::string& text, jvalue& out)
+{
+    std::string_view v = text;
+    while (!v.empty() && std::isspace(static_cast<unsigned char>(v.back())))
+        v.remove_suffix(1);
+    return socketley::json::json_reader(v).document(out) && out.k == jvalue::kind::object;
+}
+
+std::string compact(const jvalue& v)
+{
+    std::string out;
+    socketley::json::write_into(out, v);
+    return out;
+}
+
+// The settings in which two states of a runtime differ, what is volatile aside, each with what `want` says of it --
+// nothing, as zero of its kind, where it says nothing.
+jvalue differences(const jvalue& want, const jvalue& have)
+{
+    jvalue doc;
+    doc.k = jvalue::kind::object;
+    for (const auto& [k, v] : want.members)
+    {
+        if (lua_setup::volatile_key(k))
+            continue;
+        const jvalue* h = socketley::json::member(have, k);
+        if (!h || compact(*h) != compact(v))
+            doc.members.emplace_back(k, v);
+    }
+    for (const auto& [k, v] : have.members)
+    {
+        if (lua_setup::volatile_key(k) || socketley::json::member(want, k))
+            continue;
+        jvalue zero;
+        zero.k = v.k;
+        if (v.k == jvalue::kind::number)
+            zero.s = "0";
+        if (zero.k == jvalue::kind::object || zero.k == jvalue::kind::null)
+            continue;
+        if (compact(zero) != compact(v))
+            doc.members.emplace_back(k, std::move(zero));
+    }
+    return doc;
+}
+
+// The daemon's answer to one command; false, said under the runtime's name, where it refused.
+bool ask(const std::string& name, const std::string& line, std::string& out, int& failure,
+         const char* what = "create")
+{
+    const int rc = ipc_send(line, out);
+    if (rc < 0)
+    {
+        failure = ipc_report_failure(rc);
+        return false;
+    }
+    if (rc == 0)
+        return true;
+    std::cerr << "could not " << what << " " << name << ":\n";
+    if (out.empty())
+        std::cerr << "  the daemon refused it and said nothing (exit " << rc << ")\n";
+    std::istringstream lines(out);
+    for (std::string l; std::getline(lines, l);)
+        std::cerr << "  " << l << "\n";
+    return false;
+}
+
 } // namespace
 
+// `socketley --lua <file>`: the daemon brought to what the file says -- each runtime made where it is missing, changed
+// where it differs, left alone where it is as said, and started or stopped as its `start` says.
 int cli_config(int argc, char** argv)
 {
     if (argc < 3)
@@ -539,15 +151,12 @@ int cli_config(int argc, char** argv)
     // resolves through the registry these fill.
     type_manifest::load_dir(socketley_paths::resolve().types_dir);
 
+    std::error_code ec;
+    const std::string top = std::filesystem::absolute(argv[2], ec).string();
     sol::state lua;
+    lua_setup::open(lua, top);
 
-    // string and math are open because a configuration builds names and port
-    // numbers, while os and io stay shut: this file describes runtimes and
-    // reaching the filesystem from it is a second thing to review.
-    lua.open_libraries(sol::lib::base, sol::lib::package, sol::lib::table,
-                       sol::lib::string, sol::lib::math);
-
-    sol::load_result script = lua.load_file(argv[2]);
+    sol::load_result script = lua.load_file(top);
 
     if (!script.valid())
     {
@@ -572,46 +181,34 @@ int cli_config(int argc, char** argv)
     sol::optional<sol::table> daemon = lua["daemon"].get<sol::optional<sol::table>>();
     if (daemon)
     {
-        if (std::string why = refuse_startup_only_daemon_keys(*daemon); !why.empty())
+        // The daemon's own file says them for its next start, so they are no mistake in it.
+        if (std::string why = refuse_startup_only_daemon_keys(*daemon); !why.empty() && !same_file(top, daemon_config_path()))
         {
             std::cerr << why;
             return 1;
         }
 
-        sol::optional<std::string> name = (*daemon)["name"].get<sol::optional<std::string>>();
-        if (name && !name->empty())
+        for (const char* key : {"name", "cluster"})
         {
+            sol::optional<std::string> v = (*daemon)[key].get<sol::optional<std::string>>();
+            if (!v || v->empty())
+                continue;
             std::string response;
-            std::string line = "daemon-name ";
-            ipc_frame::append_arg(line, *name);
-            int rc = ipc_send(line, response);
-            if (rc < 0) { return ipc_report_failure(rc); }
-            if (rc != 0) { if (!response.empty()) std::cerr << response; return rc; }
-        }
-
-        sol::optional<std::string> cluster = (*daemon)["cluster"].get<sol::optional<std::string>>();
-        if (cluster && !cluster->empty())
-        {
-            std::string response;
-            std::string line = "daemon-cluster ";
-            ipc_frame::append_arg(line, *cluster);
+            std::string line = std::string("daemon-") + key + " ";
+            ipc_frame::append_arg(line, *v);
             int rc = ipc_send(line, response);
             if (rc < 0) { return ipc_report_failure(rc); }
             if (rc != 0) { if (!response.empty()) std::cerr << response; return rc; }
         }
     }
 
-    // Its type asked first: a reference that is valid() may still be a number or a string, which Release reads as a
-    // table without a word.
-    const sol::object runtimes_obj = lua["runtimes"];
-    if (!runtimes_obj.valid() || runtimes_obj.get_type() == sol::type::lua_nil)
-        return 0;
-    if (runtimes_obj.get_type() != sol::type::table)
+    std::string why;
+    std::vector<lua_setup::runtime_entry> entries = lua_setup::runtimes(lua, top, why);
+    if (!why.empty())
     {
-        std::cerr << "`runtimes` is a list of tables, one per runtime\n";
+        std::cerr << why;
         return 1;
     }
-    sol::table runtimes = runtimes_obj.as<sol::table>();
 
     // The daemon's exit code and sentence are read rather than only whether
     // the socket answered, because a config file whose every runtime failed
@@ -619,104 +216,418 @@ int cli_config(int argc, char** argv)
     // at the first failure.
     int failed = 0;
 
-    for (auto& pair : runtimes)
+    for (lua_setup::runtime_entry& e : entries)
     {
-        if (pair.second.get_type() != sol::type::table)
+        if (!e.refused.empty())
         {
-            std::cerr << "every entry in `runtimes` is a table with a name and a type\n";
-            ++failed;
-            continue;
-        }
-        sol::table t = pair.second;
-
-        // sol::optional like every other field below, because a plain
-        // std::string read converts whatever is there in Release rather than
-        // throwing on a misspelled key.
-        sol::optional<std::string> type_opt = t["type"].get<sol::optional<std::string>>();
-        sol::optional<std::string> name_opt = t["name"].get<sol::optional<std::string>>();
-
-        if (!name_opt || name_opt->empty())
-        {
-            std::cerr << "runtime entry without a name: every entry in `runtimes` "
-                         "needs name and type\n";
-            ++failed;
-            continue;
-        }
-        if (!type_opt || type_opt->empty())
-        {
-            std::cerr << "runtime \"" << *name_opt << "\" has no type "
-                         "(server, client, proxy, cache, storage, dns, or a registered type)\n";
+            std::cerr << "could not create " << (e.name.empty() ? std::string("an entry") : e.name) << ":\n  " << e.refused;
             ++failed;
             continue;
         }
 
-        const std::string type_str = *type_opt;
-        const std::string name     = *name_opt;
-
-        runtime_type type;
-
-        if (!parse_runtime_type(type_str.c_str(), type))
+        // What create would keep, the flags judged as create judges them.
+        int failure = 0;
+        std::vector<std::string> plan_words = e.create;
+        plan_words[0] = "plan";
+        std::string planned, shown;
+        if (!ask(e.name, line_of(plan_words), planned, failure))
         {
-            std::cerr << "unknown runtime type: " << type_str << "\n";
+            if (failure)
+                return failure;
             ++failed;
             continue;
         }
 
-        std::string command;
+        std::string show_line = "show ";
+        ipc_frame::append_arg(show_line, e.name);
+        const int src = ipc_send(show_line, shown);
+        if (src < 0)
+            return ipc_report_failure(src);
 
-        if (std::string why = build_create_command(type_str, name, t, command,
-                                                   type_manifest::find(type));
-            !why.empty())
+        jvalue want, have;
+        if (src != 0)
         {
-            std::cerr << "could not create " << name << ":\n  " << why;
-            ++failed;
-            continue;
-        }
-
-        std::string response;
-        const int rc = ipc_send(command, response);
-
-        if (rc < 0)
-        {
-            // No daemon is a different thing from a runtime that would not
-            // build: nothing after this can succeed either, so it stops here.
-            return ipc_report_failure(rc);
-        }
-
-        if (rc != 0)
-        {
-            std::cerr << "could not create " << name << ":\n";
+            // Missing: made as the file says, and started where it says so.
+            std::vector<std::string> words = e.create;
+            if (e.start == 1)
+                words.emplace_back("-s");
+            std::string response;
+            if (!ask(e.name, line_of(words), response, failure))
+            {
+                if (failure)
+                    return failure;
+                ++failed;
+                continue;
+            }
+            // Success is silent, but a create that printed something while succeeding has something to say.
             if (!response.empty())
-            {
-                // The daemon's own sentence, indented so a multi-line refusal
-                // reads as belonging to the runtime named above it.
-                std::istringstream lines(response);
-                std::string line;
-                while (std::getline(lines, line))
-                    std::cerr << "  " << line << "\n";
-            }
-            else
-            {
-                std::cerr << "  the daemon refused it and said nothing "
-                             "(exit " << rc << ")\n";
-            }
+                std::cout << response;
+            continue;
+        }
+
+        if (!parse(planned, want) || !parse(shown, have))
+        {
+            std::cerr << "could not create " << e.name << ":\n  the daemon's account of it was not JSON\n";
             ++failed;
             continue;
         }
 
-        // Success is silent, but a create that printed something while
-        // succeeding has something to say and dropping it here is what this
-        // change is about.
-        if (!response.empty())
-            std::cout << response;
+        if (socketley::json::string_of(have, "type") != socketley::json::string_of(want, "type"))
+        {
+            std::cerr << "could not create " << e.name << ":\n  a runtime of that name is a "
+                      << socketley::json::string_of(have, "type") << ", and the file says " << e.type << "\n";
+            ++failed;
+            continue;
+        }
+
+        const jvalue changes = differences(want, have);
+        const bool running = [&] {
+            const jvalue* r = socketley::json::member(have, "was_running");
+            return r && r->k == jvalue::kind::boolean && r->b;
+        }();
+        if (!changes.members.empty())
+        {
+            // Across a restart where it runs, so what it reads at its start is read again.
+            std::string line = "import ";
+            ipc_frame::append_arg(line, e.name);
+            if (running)
+                line += " --restart";
+            line += ' ' + compact(changes);
+            std::string response;
+            if (!ask(e.name, line, response, failure, "change"))
+            {
+                if (failure)
+                    return failure;
+                ++failed;
+                continue;
+            }
+            // Asked again, since a document the runtime takes in part is a setup half made.
+            std::string again;
+            jvalue now;
+            if (ipc_send(show_line, again) == 0 && parse(again, now))
+                if (const jvalue left = differences(want, now); !left.members.empty())
+                {
+                    std::cerr << "could not change " << e.name << ":\n  it does not take what the file says of";
+                    for (const auto& [k, v] : left.members)
+                        std::cerr << " " << k;
+                    std::cerr << "\n";
+                    ++failed;
+                    continue;
+                }
+        }
+
+        if (e.start != -1 && (e.start == 1) != running)
+        {
+            std::string line = e.start == 1 ? "start " : "stop ";
+            ipc_frame::append_arg(line, e.name);
+            std::string response;
+            if (!ask(e.name, line, response, failure, e.start == 1 ? "start" : "stop"))
+            {
+                if (failure)
+                    return failure;
+                ++failed;
+            }
+        }
     }
 
     if (failed > 0)
     {
-        std::cerr << failed << " of " << runtimes.size()
+        std::cerr << failed << " of " << entries.size()
                   << " runtimes in this configuration were not created\n";
         return 1;
     }
 
     return 0;
+}
+
+namespace
+{
+
+// A dns runtime's zone kept by name is a file of the state directory's, and one given by path is that file.
+std::filesystem::path zone_file(const std::string& entry)
+{
+    if (entry.find('/') != std::string::npos)
+        return entry;
+    std::string n = entry;
+    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    while (!n.empty() && n.back() == '.')
+        n.pop_back();
+    return socketley_paths::resolve().state_dir / "zones" / (n + ".zone");
+}
+
+bool copy_into(const std::filesystem::path& from, const std::filesystem::path& to, std::string& why)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(to.parent_path(), ec);
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec)
+        why = from.string() + " could not be copied to " + to.string() + ": " + ec.message();
+    return !ec;
+}
+
+// The order a setup makes runtimes in, a runtime before those that name it: names first, then accounts, storage and
+// data, then what serves and routes, then what reads them.
+int rank(std::string_view type)
+{
+    static constexpr std::string_view order[] = {"dns", "idp", "storage", "db", "cache", "mqtt", "server",
+                                                 "client", "proxy", "mail", "sync"};
+    const auto at = std::find(std::begin(order), std::end(order), type);
+    return static_cast<int>(at - std::begin(order));
+}
+
+// The daemon's own settings, as its file says them, for the setup to say them as well.
+std::string daemon_table()
+{
+    const std::string path = daemon_config_path();
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec))
+        return {};
+    sol::state lua;
+    lua_setup::open(lua, path);
+    if (!lua.safe_script_file(path, sol::script_pass_on_error).valid())
+        return {};
+    sol::object d = lua["daemon"];
+    if (d.get_type() != sol::type::table)
+        d = lua["config"];
+    if (d.get_type() != sol::type::table)
+        return {};
+    // A value as Lua, a table of them in order where it is a list and by name where it is not.
+    std::function<std::string(const sol::object&, int)> lit = [&](const sol::object& o, int depth) -> std::string {
+        switch (o.get_type())
+        {
+            case sol::type::boolean: return o.as<bool>() ? "true" : "false";
+            case sol::type::number:
+            {
+                char buf[32];
+                std::snprintf(buf, sizeof buf, "%.10g", o.as<double>());
+                return buf;
+            }
+            case sol::type::string:
+            {
+                jvalue s;
+                s.k = jvalue::kind::string;
+                s.s = o.as<std::string>();
+                return lua_setup::lua_literal(s);
+            }
+            case sol::type::table:
+            {
+                if (depth > 8)
+                    return "{}";
+                std::map<std::string, std::string> fields;
+                for (const auto& [k, v] : o.as<sol::table>())
+                    if (k.get_type() == sol::type::string)
+                        fields[k.as<std::string>()] = lit(v, depth + 1);
+                std::string out = "{\n";
+                const std::string pad(4 * static_cast<size_t>(depth + 1), ' ');
+                for (const auto& [k, v] : fields)
+                    out += pad + k + " = " + v + ",\n";
+                return out + std::string(4 * static_cast<size_t>(depth), ' ') + "}";
+            }
+            default: return "nil";
+        }
+    };
+    return "daemon = " + lit(d, 0) + "\n";
+}
+
+}   // namespace
+
+// `socketley export <dir>`: this daemon's setup as Lua -- <dir>/config.lua, a file a runtime under runtimes/, its zones
+// under zones/ and its scripts under lua/ -- which `socketley --lua`, or the daemon reading it as its own, makes again.
+int cli_export(int argc, char** argv)
+{
+    if (argc < 3)
+    {
+        std::cerr << "usage: socketley export <dir>\n";
+        return 1;
+    }
+    type_manifest::load_dir(socketley_paths::resolve().types_dir);
+    const std::filesystem::path dir = argv[2];
+    std::error_code ec;
+    if (std::filesystem::exists(dir / "config.lua", ec))
+    {
+        std::cout << (dir / "config.lua").string() << " exists: export writes a setup into a directory that has none\n";
+        return 1;
+    }
+
+    std::string listing;
+    const int lrc = ipc_send("ls --json", listing);
+    if (lrc < 0)
+        return ipc_report_failure(lrc);
+    jvalue all;
+    socketley::json::json_policy any;
+    any.object_root = false;
+    std::string_view lv = listing;
+    while (!lv.empty() && std::isspace(static_cast<unsigned char>(lv.back())))
+        lv.remove_suffix(1);
+    if (lrc != 0 || !socketley::json::json_reader(lv, any).document(all) || all.k != jvalue::kind::array)
+    {
+        std::cout << "the daemon's list of runtimes was not JSON: " << listing.substr(0, 200) << "\n";
+        return 2;
+    }
+
+    struct one
+    {
+        std::string name, type, text;
+    };
+    std::vector<one> written;
+    std::set<std::string> outside;
+    for (const jvalue& r : all.items)
+    {
+        // One another runtime made is made again by it.
+        if (!socketley::json::string_of(r, "owner").empty())
+            continue;
+        const std::string name(socketley::json::string_of(r, "name"));
+        std::string shown, line = "show ";
+        ipc_frame::append_arg(line, name);
+        jvalue state;
+        if (ipc_send(line, shown) != 0 || !parse(shown, state))
+        {
+            std::cout << name << ": the daemon did not show it\n";
+            return 2;
+        }
+        const std::string type(socketley::json::string_of(state, "type"));
+        runtime_type rt;
+        if (!parse_runtime_type(type.c_str(), rt))
+        {
+            std::cout << name << ": its type " << type << " is none this build knows\n";
+            return 2;
+        }
+        std::vector<std::string> unmapped;
+        auto settings = lua_setup::settings_of(state, rt, unmapped);
+        if (!unmapped.empty())
+        {
+            std::cout << name << ": no flag sets";
+            for (const auto& k : unmapped)
+                std::cout << " " << k;
+            std::cout << ", so a setup cannot say them\n";
+            return 2;
+        }
+        std::string why;
+        for (auto& [k, v] : settings)
+        {
+            // Its zones and its script go with it, beside the file; what else it reads is named above the setup.
+            if (rt == runtime_dns && k == "zone")
+                for (jvalue& z : v.items)
+                {
+                    const std::filesystem::path from = zone_file(z.s);
+                    const std::string to = "zones/" + from.filename().string();
+                    if (!copy_into(from, dir / to, why))
+                    {
+                        std::cout << why << "\n";
+                        return 2;
+                    }
+                    z.s = to;
+                }
+            else if (k == "lua" && v.k == jvalue::kind::string)
+            {
+                const std::string to = "lua/" + name + ".lua";
+                if (!copy_into(v.s, dir / to, why))
+                {
+                    std::cout << why << "\n";
+                    return 2;
+                }
+                v.s = to;
+            }
+            // A runtime's data directory and what it writes are its own, made where they are missing.
+            else if (v.k == jvalue::kind::string && v.s.starts_with("/") && k != "dir" && k != "backup_dir" && k != "log" &&
+                     k != "write" && !v.s.starts_with(socketley_paths::resolve().state_dir.string()))
+                outside.insert(v.s);
+            else if (k == "auth" && v.k == jvalue::kind::string && v.s.find(":/") != std::string::npos)
+                outside.insert(v.s.substr(v.s.find(':') + 1));
+        }
+        std::string text = "-- " + name + ", a " + type + " runtime.\nreturn {\n    type = \"" + type + "\",\n    name = " +
+                           lua_setup::lua_literal([&] { jvalue s; s.k = jvalue::kind::string; s.s = name; return s; }()) + ",\n";
+        for (const auto& [k, v] : settings)
+            text += "    " + k + " = " + lua_setup::lua_literal(v) + ",\n";
+        const jvalue* running = socketley::json::member(state, "was_running");
+        text += std::string("    start = ") + (running && running->b ? "true" : "false") + ",\n}\n";
+        written.push_back({name, type, std::move(text)});
+    }
+    std::stable_sort(written.begin(), written.end(), [](const one& a, const one& b) { return rank(a.type) < rank(b.type); });
+
+    std::filesystem::create_directories(dir / "runtimes", ec);
+    for (const one& w : written)
+    {
+        std::ofstream f(dir / "runtimes" / (w.name + ".lua"));
+        f << w.text;
+        if (!f)
+        {
+            std::cout << (dir / "runtimes" / (w.name + ".lua")).string() << " could not be written\n";
+            return 2;
+        }
+    }
+    char date[32];
+    const std::time_t now = std::time(nullptr);
+    std::strftime(date, sizeof date, "%Y-%m-%d", std::localtime(&now));
+    std::string top = std::string("-- This machine's socketley setup, written by `socketley export` on ") + date + ".\n"
+                      "-- Its runtimes, made in this order by `socketley --lua config.lua`, or by the daemon at its start\n"
+                      "-- where this is its own configuration file; their data is not in it.\n";
+    if (!outside.empty())
+    {
+        top += "--\n-- What they read and the setup does not hold, to be on the machine as well:\n";
+        for (const auto& p : outside)
+            top += "--   " + p + "\n";
+    }
+    const std::string d = daemon_table();
+    top += "\n" + d + (d.empty() ? "" : "\n") + "runtimes = {\n";
+    for (const one& w : written)
+        top += "    include \"runtimes/" + w.name + ".lua\",\n";
+    top += "}\n";
+    {
+        std::ofstream f(dir / "config.lua");
+        f << top;
+        if (!f)
+        {
+            std::cout << (dir / "config.lua").string() << " could not be written\n";
+            return 2;
+        }
+    }
+
+    // Read back as `--lua` reads it, each runtime planned and held to what the daemon shows of it.
+    const std::string written_top = std::filesystem::absolute(dir / "config.lua", ec).string();
+    sol::state lua;
+    lua_setup::open(lua, written_top);
+    if (auto r = lua.safe_script_file(written_top, sol::script_pass_on_error); !r.valid())
+    {
+        const sol::error err = r;
+        std::cout << "the setup written does not run: " << err.what() << "\n";
+        return 2;
+    }
+    std::string why;
+    int differing = 0;
+    for (const lua_setup::runtime_entry& e : lua_setup::runtimes(lua, written_top, why))
+    {
+        std::string planned, shown, line = "show ";
+        ipc_frame::append_arg(line, e.name);
+        std::vector<std::string> words = e.create;
+        int failure = 0;
+        jvalue want, have;
+        if (!e.refused.empty())
+            planned = e.refused;
+        else if (words[0] = "plan"; !ask(e.name, line_of(words), planned, failure, "plan"))
+        {
+            if (failure)
+                return failure;
+            ++differing;
+            continue;
+        }
+        if (!e.refused.empty() || ipc_send(line, shown) != 0 || !parse(planned, want) || !parse(shown, have))
+        {
+            std::cout << e.name << ": the setup written does not make it: " << planned;
+            ++differing;
+            continue;
+        }
+        jvalue left = differences(want, have);
+        // Its zones and its script are the copies beside the setup, which the runtime is not reading yet.
+        std::erase_if(left.members, [](const auto& m) { return m.first == "zones" || m.first == "lua_script"; });
+        if (!left.members.empty())
+        {
+            std::cout << e.name << ": the setup written makes it otherwise in";
+            for (const auto& [k, v] : left.members)
+                std::cout << " " << k;
+            std::cout << "\n";
+            ++differing;
+        }
+    }
+    return differing ? 1 : 0;
 }

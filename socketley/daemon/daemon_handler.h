@@ -167,6 +167,7 @@ private:
     int dispatch_command(ipc_connection* conn, const parsed_args& pa);
 
     int cmd_create(ipc_connection* conn, const parsed_args& pa);
+    int cmd_plan(ipc_connection* conn, const parsed_args& pa);
     int cmd_start(ipc_connection* conn, const parsed_args& pa);
     int cmd_stop(ipc_connection* conn, const parsed_args& pa);
     int cmd_remove(ipc_connection* conn, const parsed_args& pa);
@@ -321,6 +322,10 @@ private:
     std::unique_ptr<cluster_reconciler> m_reconciler;
     // Set while the daemon runs a command as itself, which is what lets the cluster act on the replicas it owns.
     bool m_cluster_internal = false;
+    // Where `plan` takes the runtime a dry run made, set while one is asked for.
+    std::string* m_plan_out = nullptr;
+    // The runtime a plan stands for, whose names its dry run may take.
+    std::string m_plan_for;
     bool m_cluster_creating = false;
     std::string m_cluster_want_dir;
 

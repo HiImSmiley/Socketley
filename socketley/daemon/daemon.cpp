@@ -40,10 +40,12 @@
 #include <unistd.h>
 #include <iostream>
 #include <fstream>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #ifndef SOCKETLEY_NO_LUA
 #include <sol/sol.hpp>
+#include "lua_setup.h"
 #endif
 
 static int g_signal_write_fd = -1;
@@ -111,10 +113,10 @@ static daemon_config load_daemon_config(const std::string& config_path)
 #else
     sol::state lua;
 
-    // The same set `socketley --lua` opens, so one file can be read by either
-    // and os and io stay shut in both.
-    lua.open_libraries(sol::lib::base, sol::lib::package, sol::lib::table,
-                       sol::lib::string, sol::lib::math);
+    // The same set `socketley --lua` opens, and its include(), so one file can be read by either and os and io stay
+    // shut in both.
+    std::error_code abs_ec;
+    lua_setup::open(lua, std::filesystem::absolute(path, abs_ec).string());
 
     // Bounded like every other chunk in this process, against the process
     // default rather than a `callback_timeout_ms` of the config's own, because
@@ -393,6 +395,52 @@ static void adopt_legacy_state(const socketley_paths& paths)
                   " could not be copied and will not be restored").c_str());
     }
 }
+
+#ifndef SOCKETLEY_NO_LUA
+// The runtimes the configuration file's `runtimes` names that the daemon has not, made as it says and started where it
+// says so; one it has is left as it is, for `socketley --lua` to bring to what the file says.
+static void make_setup_runtimes(const std::string& path, daemon_handler& handler, runtime_manager& manager)
+{
+    std::error_code ec;
+    if (path.empty() || !std::filesystem::exists(path, ec))
+        return;
+    sol::state lua;
+    const std::string top = std::filesystem::absolute(path, ec).string();
+    lua_setup::open(lua, top);
+    std::string why;
+    std::vector<lua_setup::runtime_entry> entries;
+    {
+        lua_deadline::install(lua.lua_state(), lua_deadline::default_ms());
+        lua_deadline::scope guard("the daemon configuration file", lua_deadline::default_ms());
+        if (auto r = lua.safe_script_file(top, sol::script_pass_on_error); !r.valid())
+        {
+            const sol::error err = r;
+            LOG_ERROR(("[config] " + path + ": its runtimes were not read: " + err.what()).c_str());
+            return;
+        }
+        entries = lua_setup::runtimes(lua, top, why);
+    }
+    if (!why.empty())
+        LOG_ERROR(("[config] " + path + ": " + why).c_str());
+    for (lua_setup::runtime_entry& e : entries)
+    {
+        if (!e.refused.empty())
+        {
+            LOG_ERROR(("[config] " + (e.name.empty() ? std::string("an entry") : e.name) + " was not made: " + e.refused).c_str());
+            continue;
+        }
+        if (manager.get(e.name))
+            continue;
+        if (e.start == 1)
+            e.create.emplace_back("-s");
+        std::string out;
+        if (handler.run_internal(e.create, out, false) != 0)
+            LOG_ERROR(("[config] " + e.name + " was not made: " + out).c_str());
+        else
+            LOG_INFO(("[config] made " + e.name).c_str());
+    }
+}
+#endif
 
 static void restore_runtimes(state_persistence& persistence,
                               runtime_manager& manager, event_loop& loop)
@@ -966,6 +1014,11 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // daemon logged "daemon started" with every restored out-of-process
     // runtime reading `Up` and no process behind it for up to two seconds.
     handler.start_restored_workers();
+
+#ifndef SOCKETLEY_NO_LUA
+    // After the restore, so what the daemon kept is what it has, and the file adds what it has not.
+    make_setup_runtimes(resolve_config_path(paths.config_path.string()), handler, manager);
+#endif
 
     // After the socket is served and before the loop, so an entry exists only
     // for a daemon that is actually answering.

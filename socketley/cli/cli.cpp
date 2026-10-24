@@ -514,6 +514,9 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("--lua"):
             return cli_config(argc, argv);
 
+        case fnv1a("export"):
+            return cli_export(argc, argv);
+
         case fnv1a("help"):
         case fnv1a("--help"):
         case fnv1a("-h"):

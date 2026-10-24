@@ -548,8 +548,15 @@ cli_commands() {
     echo ""
 
     echo -e "${BOLD}--lua <file.lua>${NC}"
-    echo "  Load Lua configuration"
-    echo -e "  ${CYAN}socketley --lua setup.lua${NC}"
+    echo "  Bring the daemon to what a setup says: make what is missing, change what"
+    echo "  differs, leave the rest alone. include 'runtimes/' reads a directory of them."
+    echo -e "  ${CYAN}socketley --lua /etc/socketley/config.lua${NC}"
+    echo ""
+
+    echo -e "${BOLD}export <dir>${NC}"
+    echo "  Write this daemon's setup as Lua: config.lua, runtimes/, zones/, lua/. Copied"
+    echo "  to /etc/socketley on another machine, its daemon makes the same runtimes."
+    echo -e "  ${CYAN}socketley export /root/setup${NC}"
     echo ""
 
     echo -e "${BOLD}cluster [subcommand]${NC}"
@@ -1628,9 +1635,9 @@ lua_config() {
     echo -e "${BOLD}${RED}Two kinds of .lua file, and they do not mix:${NC}"
     echo "  1. A DAEMON CONFIG   - socketley --lua config.lua"
     echo "     Runs in the CLI process, is read for its 'daemon' and 'runtimes'"
-    echo "     tables, turned into create commands, and exits.  It never reaches"
-    echo "     the daemon.  A callback defined here is DEAD CODE: nothing loads"
-    echo "     it, nothing calls it, and nothing warns you."
+    echo "     tables, brings the daemon to what they say, and exits; the daemon"
+    echo "     reads its own at start.  A callback defined here is DEAD CODE:"
+    echo "     nothing loads it, nothing calls it, and nothing warns you."
     echo "  2. A RUNTIME HANDLER - create ... --lua handler.lua, or a runtime's"
     echo "     config = \"handler.lua\" key inside a config.  The daemon loads this"
     echo "     one into that runtime's interpreter.  Only its on_* callbacks,"
@@ -3532,6 +3539,7 @@ USAGE
   socketley daemon [--cpus <set>] [--fast-lo [own|all|trust]] [--fast-lo-limit P,G] [--name <name>]
   socketley daemon stop | stats
   socketley --lua <file>
+  socketley export <dir>
 
 RUNTIMES
   create <type> <name> [flags]   create a server, client, proxy, cache, storage, dns, sync, idp,
@@ -3550,6 +3558,7 @@ RUNTIMES
 OTHER
   add <path> [--name <name>]     adopt a runtime from a file
   import | show | owner          state and relationships
+  export <dir>                   this machine's setup as Lua, for --lua or another daemon to make again
   cluster [ls|ps|group|show|stats|watch]
   attach <type> <name> <port>    register a process the daemon did not start
   dashboard                      terminal dashboard
