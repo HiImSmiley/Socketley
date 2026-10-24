@@ -19,6 +19,7 @@
 #   * the entrance given no route to the webmail, or not serving the page through it
 #   * a reply not in the conversation it answers, Thread/get or collapseThreads not grouping it across mailboxes, or a
 #     conversation lost when the index's lines of it are, as an older binary's compaction drops them
+#   * an image the HTML shows, sent inline, counted as an attachment
 #   * --domain on a mail runtime without --web taken
 set -uo pipefail
 
@@ -303,6 +304,34 @@ sed -i '/^H /d' $idx 2>/dev/null
 "$BIN" start m >/dev/null 2>&1
 ready_tcp 127.0.0.1 "$W" || bad "the webmail port listens again" "$(tail -3 "$SOCKETLEY_DLOG")"
 tally < <(thread_check again)
+
+# An image only the HTML shows, sent inside the message, is no attachment to download.
+printf '\x89PNG\r\n\x1a\nlogo' > "$T/logo.png"
+printf '<p>logo:</p><img src="cid:logo.png">' > "$T/inline.html"
+"$BIN" send m --to alice@example.test --from shop@example.test --subject 'inline only' --html "$T/inline.html" \
+    --inline "$T/logo.png" --text 'logo' </dev/null >/dev/null 2>&1
+inline=$(python3 - "$W" <<'PY'
+import base64, http.client, json, sys, time
+W = int(sys.argv[1])
+H = {"Authorization": "Basic " + base64.b64encode(b"alice:alicepassword1").decode(), "X-Forwarded-Proto": "https",
+     "X-Forwarded-For": "192.0.2.60", "Content-Type": "application/json"}
+A = "a" + base64.urlsafe_b64encode(b"alice").decode().rstrip("=")
+for _ in range(100):
+    c = http.client.HTTPConnection("127.0.0.1", W, timeout=20)
+    c.request("POST", "/jmap/api", json.dumps({"using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"], "methodCalls": [
+        ["Email/query", {"accountId": A, "filter": {"subject": "inline only"}}, "q"],
+        ["Email/get", {"accountId": A, "#ids": {"resultOf": "q", "name": "Email/query", "path": "/ids"}, "properties": ["hasAttachment"]}, "g"],
+        ["Email/query", {"accountId": A, "filter": {"subject": "inline only", "hasAttachment": True}}, "a"]]}), H)
+    r = json.loads(c.getresponse().read()); c.close()
+    got = r["methodResponses"][1][1].get("list") or []
+    if got:
+        print(got[0].get("hasAttachment"), len(r["methodResponses"][2][1].get("ids", [])))
+        break
+    time.sleep(0.1)
+PY
+)
+[ "$inline" = "False 0" ] && ok "an image the HTML shows inline is no attachment, to hasAttachment and its filter" \
+    || bad "an image the HTML shows inline is no attachment" "$inline"
 
 # The entrance's route to the webmail, and the page through it.
 route=$(find "$HOME" -path '*.dns*' -name 'routes-*' -exec cat {} + 2>/dev/null | grep '^route webmail.example.test ')

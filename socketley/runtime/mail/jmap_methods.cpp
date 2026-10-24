@@ -236,6 +236,15 @@ struct body_part
     std::vector<body_part> sub;
 };
 
+// Whether an Email's attachments offer one to download: an inline part, such as an image its HTML shows, is not one
+// (RFC 8621 4.1.4).
+bool offers_attachment(const std::vector<const body_part*>& att)
+{
+    return std::any_of(att.begin(), att.end(), [](const body_part* a) {
+        return !socketley::ascii::iequals(a->p->disposition, "inline");
+    });
+}
+
 body_part number_parts(const mime::part& p, const std::string& id)
 {
     body_part out{&p, id, {}};
@@ -550,7 +559,7 @@ bool meets(const jvalue& f, const query_cand& c, std::string_view whole, const m
             body_part tree = number_parts(*root, root->multipart() ? std::string() : std::string("1"));
             pick({&tree}, "mixed", false, &html, &text, att);
         }
-        if (a->b != !att.empty())
+        if (a->b != offers_attachment(att))
             return false;
     }
     return true;
@@ -643,7 +652,7 @@ std::string email_object(const email_view& view, const std::string& id, const im
             add(p, v.empty() ? "null" : as_addr ? addresses_json(v) : q(as_text ? mime::decode_words(v) : " " + v));
         }
         else if (p == "hasAttachment")
-            add(p, bytes ? (att.empty() ? "false" : "true") : "false");
+            add(p, bytes && offers_attachment(att) ? "true" : "false");
         else if (p == "preview")
         {
             // The text with its runs of white space made one space, HTML's tags taken out, read only until it is
