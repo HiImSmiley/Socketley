@@ -191,6 +191,10 @@ private:
     bool m_from_page{false};
     // Where its browser signs in, for a 401 the page answers by going there.
     std::string m_login;
+    // Every message of the user has its conversation known for this request, read once where one was not.
+    bool m_threads_ready{false};
+    // `then` once every message of the user has its conversation.
+    void with_threads(std::function<void()> then);
     // The EventSource this connection is: what it was last told, how often to ping, and whether to stop after a state.
     bool m_stream{false};
     std::string m_stream_state;

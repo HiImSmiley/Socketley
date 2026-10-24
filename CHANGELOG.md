@@ -45,7 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   starred view, the messages a page at a time, a search over all of them,
   reading, writing, replying and forwarding with attachments, drafts, moving,
   flags and deletion, a name, a signature and an out-of-office answer, and new
-  mail as it comes, with keys for each. A message's HTML is cleaned and shown
+  mail as it comes, with keys for each. A mailbox lists conversations, a row
+  each with its people and its count, and a conversation reads as its messages
+  in order, from every mailbox, the read ones folded and what each quotes
+  hidden; a message's attachments come above its text. A message's HTML is cleaned and shown
   in a frame sandboxed without scripts, its remote images held back until the
   reader asks for them. A change the cookie alone signs needs the page's own
   header, the page's script runs by its hash alone, and behind the entrance a
@@ -765,6 +768,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   hands a descriptor over — the origin keeps the socket and relays.
 ### Fixed
 
+- **JMAP had no conversations.** Every Email was a Thread of its own and
+  collapseThreads was ignored. A message's conversation is now the hash of the
+  Message-ID its References begin with (else In-Reply-To, else its own), taken
+  at delivery and APPEND, kept in the IMAP index on every shard, and read for
+  older messages the first time a client asks; Thread/get gives every Email of
+  one across mailboxes, oldest first, and Email/query collapses by it.
 - **JMAP's Email/set lost what a webmail writes into a draft.** A Bcc was not
   kept, so sending the draft without an envelope never reached it; a draft
   with no recipient yet, or with a Message-ID of its own, was refused; the

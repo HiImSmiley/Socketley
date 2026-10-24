@@ -4,6 +4,8 @@
 #include "jmap_session.h"
 
 #include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
 #include <ctime>
 #include <set>
 
@@ -25,6 +27,17 @@ using json::jvalue;
 
 namespace
 {
+
+// A message's conversation as JMAP names it, T and its hash; one the index has not yet read is its own until it has.
+std::string thread_id(const imap_message& m)
+{
+    static constexpr char digits[] = "0123456789abcdef";
+    uint64_t v = m.thread ? m.thread : imap_store::email_hash(m.key) | 1;
+    std::string out = "T" + std::string(16, '0');
+    for (size_t i = 16; i > 0; --i, v >>= 4)
+        out[i] = digits[v & 15];
+    return out;
+}
 
 std::string q(std::string_view s)
 {
@@ -582,7 +595,7 @@ std::string email_object(const email_view& view, const std::string& id, const im
         else if (p == "blobId")
             add(p, q(id));
         else if (p == "threadId")
-            add(p, m ? q("T" + id.substr(1)) : "null");
+            add(p, m ? q(thread_id(*m)) : "null");
         else if (p == "mailboxIds")
             add(p, m ? "{" + q(mailbox) + ":true}" : "null");
         else if (p == "keywords")
@@ -1017,6 +1030,14 @@ void jmap_session::mailbox_set(const jvalue& args, const std::shared_ptr<call_st
 
 void jmap_session::email_get(const jvalue& args, std::function<void(answer)> done)
 {
+    // A threadId asked for is the conversation's, read for any message the index does not know it of yet.
+    const jvalue* asked = json::member(args, "properties");
+    bool wants_thread = !asked || asked->k != jvalue::kind::array;
+    if (!wants_thread)
+        for (const auto& p : asked->items)
+            wants_thread = wants_thread || (p.k == jvalue::kind::string && p.s == "threadId");
+    if (wants_thread && !m_threads_ready)
+        return with_threads([this, args, done] { email_get(args, done); });
     static const std::vector<std::string> defaults = {
         "id", "blobId", "threadId", "mailboxIds", "keywords", "size", "receivedAt", "messageId", "inReplyTo",
         "references", "sender", "from", "to", "cc", "bcc", "replyTo", "subject", "sentAt", "hasAttachment", "preview",
@@ -1142,6 +1163,10 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
         bool filtering{false}, unfiltered{false};
         probe sieve;
     };
+    const jvalue* collapse = json::member(args, "collapseThreads");
+    const bool collapsing = collapse && collapse->k == jvalue::kind::boolean && collapse->b;
+    if (collapsing && !m_threads_ready)
+        return with_threads([this, args, done] { email_query(args, done); });
     auto j = std::make_shared<job>();
     j->args = args;
     const jvalue* filter = json::member(j->args, "filter");
@@ -1290,6 +1315,15 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
             }
             return j->ascending ? less : more;
         });
+        // Collapsed, a conversation is answered once, by the Email of it the sort puts first.
+        const jvalue* collapse = json::member(j->args, "collapseThreads");
+        const bool collapsing = collapse && collapse->k == jvalue::kind::boolean && collapse->b;
+        if (collapsing)
+        {
+            std::unordered_set<std::string> seen;
+            hits.erase(std::remove_if(hits.begin(), hits.end(), [&](const cand* c) { return !seen.insert(thread_id(c->m)).second; }),
+                       hits.end());
+        }
         int64_t position = json::int_of(j->args, "position", 0);
         if (const std::string_view anchor = json::string_of(j->args, "anchor"); !anchor.empty())
         {
@@ -1306,23 +1340,50 @@ void jmap_session::email_query(const jvalue& args, std::function<void(answer)> d
             ids += (ids.size() > 1 ? "," : "") + q(hits[static_cast<size_t>(i)]->id);
         done({{"Email/query", "{\"accountId\":" + q(account_of(m_user)) + ",\"queryState\":" +
                                   q(email_state(m_store, m_user)) + ",\"canCalculateChanges\":false,\"position\":" +
-                                  std::to_string(position) + ",\"collapseThreads\":false,\"ids\":" + ids + "],\"total\":" +
+                                  std::to_string(position) + ",\"collapseThreads\":" + (collapsing ? "true" : "false") +
+                                  ",\"ids\":" + ids + "],\"total\":" +
                                   std::to_string(hits.size()) + "}"}});
     };
     (*step)();
 }
 
+void jmap_session::with_threads(std::function<void()> then)
+{
+    if (m_threads_ready)
+        return then();
+    m_threads_ready = true;
+    m_store.know_threads(m_user, [then = std::move(then), alive = m_alive] {
+        if (*alive)
+            then();
+    });
+}
+
 void jmap_session::thread_get(const jvalue& args, std::function<void(answer)> done)
 {
-    // Each Email is a Thread of its own, its id the Email's with T for M.
+    if (!m_threads_ready)
+        return with_threads([this, args, done] { thread_get(args, done); });
+    // A Thread is every Email of the conversation, in any mailbox, oldest first (RFC 8621 3).
+    std::unordered_map<std::string, std::vector<std::pair<int64_t, std::string>>> threads;
+    for (const auto& f : m_store.known(m_user))
+        for (const auto& m : f->msgs)
+            threads[thread_id(m)].emplace_back(m.date_ms, imap_store::email_id(m.key));
     std::string list = "[", missing = "[";
     for (const auto& id : strings_of(json::member(args, "ids")))
     {
-        where w;
-        if (id.size() > 1 && id[0] == 'T' && locate("M" + id.substr(1), w))
-            list += (list.size() > 1 ? "," : "") + std::string("{\"id\":") + q(id) + ",\"emailIds\":[" + q("M" + id.substr(1)) + "]}";
-        else
+        auto it = threads.find(id);
+        if (it == threads.end())
+        {
             missing += (missing.size() > 1 ? "," : "") + q(id);
+            continue;
+        }
+        auto& emails = it->second;
+        std::sort(emails.begin(), emails.end());
+        std::string ids;
+        std::unordered_set<std::string> seen;
+        for (const auto& [at, email] : emails)
+            if (seen.insert(email).second)
+                ids += (ids.empty() ? "" : ",") + q(email);
+        list += (list.size() > 1 ? "," : "") + std::string("{\"id\":") + q(id) + ",\"emailIds\":[" + ids + "]}";
     }
     done({{"Thread/get", "{\"accountId\":" + q(account_of(m_user)) + ",\"state\":" + q(email_state(m_store, m_user)) +
                              ",\"list\":" + list + "],\"notFound\":" + missing + "]}"}});
@@ -1593,7 +1654,7 @@ void jmap_session::email_set(const jvalue& args, const std::shared_ptr<call_stat
                                    cs->created[cid] = id;
                                    comma(j->created);
                                    j->created += q(cid) + ":{\"id\":" + q(id) + ",\"blobId\":" + q(id) +
-                                                 ",\"threadId\":" + q("T" + id.substr(1)) + ",\"size\":" +
+                                                 ",\"threadId\":" + q(thread_id(*m)) + ",\"size\":" +
                                                  std::to_string(size) + "}";
                                    m_hooks.acted(m_user, f->name, "APPEND", {uid});
                                    (*self)();
@@ -1828,7 +1889,7 @@ void jmap_session::email_import(const jvalue& args, const std::shared_ptr<call_s
                                     cs->created[cid] = id;
                                     comma(j->created);
                                     j->created += q(cid) + ":{\"id\":" + q(id) + ",\"blobId\":" + q(id) +
-                                                  ",\"threadId\":" + q("T" + id.substr(1)) + ",\"size\":" +
+                                                  ",\"threadId\":" + q(thread_id(*m)) + ",\"size\":" +
                                                   std::to_string(size) + "}";
                                     m_hooks.acted(m_user, f->name, "APPEND", {uid});
                                     (*self)();

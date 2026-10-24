@@ -71,6 +71,8 @@ struct mailboxes::writing
     std::string header;
     // The message as stored where it went in one piece, for the IMAP index's trigram filter of it.
     std::shared_ptr<const std::string> whole;
+    // Its conversation, as imap_store::thread_of reads it from the header; 0 where the header was not whole.
+    uint64_t thread{0};
     std::function<void(int, std::string)> done;
     bool retried{false};
 };
@@ -308,6 +310,8 @@ void mailboxes::deliver(const entry_ptr& e, const std::string& user, const std::
                     else if (socketley::ascii::iequals(name, "Subject"))
                         w->subject = utf8_cut(header_value(source, "Subject"), 512);
                 }
+                // Its conversation, from the References the header names, so the index has it at once.
+                w->thread = imap_store::thread_of(source, w->key);
                 if (source.ends_with("\r\n\r\n") || source == "\r\n")
                     kept += "\r\n";
             }
@@ -478,7 +482,7 @@ void mailboxes::finish(const std::shared_ptr<writing>& w, int code, std::string 
             if (first != std::string::npos && last > first)
             {
                 imap->delivered(w->key.substr(0, first), w->key.substr(first + 1, last - first - 1), w->key, w->total,
-                                w->e->at_ms);
+                                w->e->at_ms, w->thread);
                 imap->note_text(w->key.substr(0, first), w->key, std::move(w->whole));
                 m_run.stored(w->key.substr(0, first), w->total);
             }

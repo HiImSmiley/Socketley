@@ -13047,7 +13047,8 @@ leaves it empty. A connection quiet for thirty minutes is closed.
 is the session; the API at
 .B /jmap/api
 takes Core/echo, Mailbox/get, query, set and changes, Email/get, query, set,
-import and changes, Thread/get, Identity/get and EmailSubmission/set with its
+import and changes, Thread/get with every Email of a conversation in any
+mailbox, Identity/get and EmailSubmission/set with its
 onSuccessUpdateEmail and onSuccessDestroyEmail, back\-references among them;
 .B /jmap/upload
 and
@@ -13057,7 +13058,8 @@ move blobs, and
 tells of state changes. A user signs in with HTTP Basic, their idp password,
 over TLS or from 127.0.0.1, or with an idp bearer token. Their account is the
 mailboxes IMAP reads: a Mailbox id is its MAILBOXID and an Email id its EMAILID,
-which a move keeps, each Email its own Thread, a keyword an IMAP flag, so a
+which a move keeps, a Thread the conversation the Message-ID its References
+begin with names, which collapseThreads folds a query by, a keyword an IMAP flag, so a
 client of either sees what the other did at once. A state is a digest of the
 index, the same on every shard, and a */changes since another answers
 cannotCalculateChanges, after which a client reads again. An upload is kept a
@@ -13077,7 +13079,8 @@ and
 .B \-\-domain
 the entrance serves a mail client in the browser under the name, in the look
 of the storage interface: the mailboxes with their unread counts and a starred
-view, the messages a page at a time, a search over all of them, reading,
+view, the conversations a page at a time, each read as its messages from every
+mailbox with what they quote folded away, a search over all of them, reading,
 writing, replying and forwarding with attachments, drafts, moving, flags and
 deletion, a name, a signature and an out-of-office answer, and new mail as it
 comes. It signs in through the idp runtime, whose session cookie under its

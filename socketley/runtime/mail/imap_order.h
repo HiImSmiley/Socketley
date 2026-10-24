@@ -32,6 +32,9 @@ struct entry
 std::string base_subject(std::string_view raw, bool* reply = nullptr);
 // `e`'s keys from the message's header block.
 void read(entry& e, std::string_view header);
+// The Message-ID a conversation began with, as the header names it: the first of References, else In-Reply-To, else
+// the message's own; empty where it names none.
+std::string thread_root(std::string_view header);
 
 struct key
 {

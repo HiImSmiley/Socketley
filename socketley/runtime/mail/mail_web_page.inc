@@ -78,7 +78,9 @@ constexpr std::string_view mail_web_page = R"HTML(<!doctype html>
 .hdr{display:flex;gap:12px;align-items:flex-start;margin-bottom:14px}
 .hdr .av{width:42px;height:42px;font-size:16px}
 .hdr .who{flex:1;min-width:0}
-.hdr .who b{font-weight:650}
+.hdr .who b{font-weight:650;white-space:nowrap}
+.hdr .who{overflow:hidden}
+.hdr .who .line{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hdr .who .addr{color:var(--mut);font-size:13px;margin-left:4px}
 .hdr .rcp{color:var(--dim);font-size:12.5px;margin-top:2px;word-break:break-word}
 .hdr .when{color:var(--dim);font-size:12.5px;white-space:nowrap;flex:none;margin-top:2px}
@@ -89,7 +91,7 @@ constexpr std::string_view mail_web_page = R"HTML(<!doctype html>
 .mtext{white-space:pre-wrap;word-break:break-word;font:14px/1.6 inherit;padding:2px 2px}
 .mtext .q{color:var(--dim);border-left:2px solid var(--line2);padding-left:10px;display:block}
 .mtext a,.hdr a{color:var(--a1)}
-.atts{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px}
+.atts{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 16px}
 .att{display:flex;align-items:center;gap:10px;padding:8px 12px 8px 8px;border-radius:12px;background:rgba(255,255,255,.04);border:1px solid var(--line);max-width:300px;color:var(--fg);text-decoration:none}
 .att:hover{background:rgba(255,255,255,.07)}
 .att .ti{width:38px;height:38px;border-radius:8px;background:rgba(var(--glow),.14);display:flex;align-items:center;justify-content:center;flex:none;overflow:hidden}
@@ -97,6 +99,21 @@ constexpr std::string_view mail_web_page = R"HTML(<!doctype html>
 .att .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
 .att .sz{font-size:11.5px;color:var(--dim)}
 .att>div{min-width:0}
+.r1 .who .tn{display:inline-block;margin-left:6px;font-size:11.5px;font-weight:600;color:var(--dim);vertical-align:1px}
+.row.unread .who .tn{color:var(--mut)}
+.msg{border:1px solid var(--line);border-radius:16px;padding:14px 16px 16px;margin-bottom:10px;background:rgba(255,255,255,.02)}
+.msg .hdr{cursor:default;margin-bottom:12px}
+.msg .hdr .ib{width:32px;height:32px;flex:none;margin-top:-4px}
+.msg.shut{display:flex;align-items:center;gap:12px;padding:10px 16px;cursor:pointer;background:rgba(255,255,255,.015)}
+.msg.shut:hover{background:rgba(255,255,255,.045)}
+.msg.shut .av{width:30px;height:30px;font-size:13px}
+.msg.shut b{font-weight:600;flex:none;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.msg.shut .pv{flex:1;min-width:0;color:var(--dim);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.msg.shut .when{color:var(--dim);font-size:12px;flex:none}
+.qt{display:inline-flex;align-items:center;justify-content:center;height:20px;width:34px;margin-top:10px;border-radius:7px;background:rgba(255,255,255,.08);color:var(--mut)}
+.qt .i{width:16px;height:16px}
+.qt:hover,.qt.on{background:rgba(var(--glow),.22);color:var(--fg)}
+.mtext.quoted{margin-top:8px;color:var(--mut)}
 .blank{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--dim);gap:12px;text-align:center;padding:24px}
 .blank .ring{width:92px;height:92px;border-radius:28px;background:linear-gradient(140deg,rgba(var(--glow),.22),rgba(var(--glow2),.06));display:flex;align-items:center;justify-content:center;box-shadow:0 20px 50px -20px rgba(var(--glow),.6)}
 .blank .ring .i{width:42px;height:42px;color:var(--fg);opacity:.85}
@@ -326,11 +343,26 @@ function cleanHtml(html, images, cids) {
   }
   return { doc: '<!doctype html><html><head><meta charset="utf-8"><style>' + FRAME_CSS + '</style><style>' + css.replace(/<\/style/gi, '') + '</style></head><body>' + (d.body ? d.body.innerHTML : '') + '</body></html>', blocked };
 }
-function frame(docHtml) {
+// The quotes of what a reply answers, as Gmail, Outlook, Apple Mail and Thunderbird mark them.
+const QUOTES = 'blockquote[type=cite],.gmail_quote,.gmail_extra,#divRplyFwdMsg,#divRplyFwdMsg~*,#appendonsend~*,.moz-cite-prefix,.yahoo_quoted,#mail-editor-reference-message-container';
+function frame(docHtml, quotes) {
   const f = el('iframe', { sandbox: 'allow-same-origin allow-popups allow-popups-to-escape-sandbox', referrerpolicy: 'no-referrer', title: 'Message' });
   f.srcdoc = docHtml;
   const fit = () => { try { const b = f.contentDocument; if (b && b.documentElement) f.style.height = Math.max(80, b.documentElement.scrollHeight + 2) + 'px'; } catch (e) {} };
+  // What a reply quotes is folded away behind a button, as a conversation shows each message above it already.
+  f.quoteToggle = quotes ? el('button', { class: 'qt', title: 'Show the quoted text', hidden: true, onclick: e => {
+    const on = !e.currentTarget.classList.contains('on'); e.currentTarget.classList.toggle('on', on);
+    try { f.contentDocument.documentElement.classList.toggle('showq', on); } catch (x) {}
+    setTimeout(fit, 0);
+  } }, ico('more')) : null;
   f.addEventListener('load', () => {
+    try {
+      const d = f.contentDocument;
+      if (quotes && d.querySelector(QUOTES)) {
+        d.head.append(Object.assign(d.createElement('style'), { textContent: 'html:not(.showq) :is(' + QUOTES + '){display:none!important}' }));
+        f.quoteToggle.hidden = false;
+      }
+    } catch (e) {}
     fit();
     try { new ResizeObserver(fit).observe(f.contentDocument.documentElement); for (const i of f.contentDocument.images) i.addEventListener('load', fit); } catch (e) {}
   });
@@ -412,7 +444,7 @@ async function folderMenu(at, b) {
 function go(v) {
   view = { box: v.box || '', starred: !!v.starred, q: v.q || '' };
   if (!view.q) $('#q').value = '';
-  picked.clear(); open = null; openMsg = null; document.body.classList.remove('reading');
+  picked.clear(); open = null; openMsg = null; thread = []; document.body.classList.remove('reading');
   location.hash = view.q ? 'search/' + encodeURIComponent(view.q) : view.starred ? 'starred' : 'box/' + encodeURIComponent(view.box);
   paintBoxes(); paintReader(); loadList();
 }
@@ -421,20 +453,46 @@ function filter() {
   if (view.starred) return { hasKeyword: '$flagged' };
   return { inMailbox: view.box };
 }
+const inDrafts = () => !view.q && !view.starred && byId[view.box] && byId[view.box].role === 'drafts';
+const sentView = () => !view.q && !view.starred && byId[view.box] && ['sent', 'drafts'].includes(byId[view.box].role);
+// Drafts are listed one by one; any other view a conversation a row, by its newest message there, with every message of
+// it in any mailbox beside.
+const MEMBER_PROPS = ['id', 'threadId', 'from', 'to', 'keywords', 'mailboxIds', 'receivedAt'];
+function listCalls(position, limit) {
+  const calls = [['Email/query', { accountId: acct, filter: filter(), sort: [{ property: 'receivedAt', isAscending: false }], collapseThreads: !inDrafts(), position, limit, calculateTotal: position === 0 }, 'q'],
+    ['Email/get', { accountId: acct, '#ids': { resultOf: 'q', name: 'Email/query', path: '/ids' }, properties: LIST_PROPS }, 'g']];
+  if (!inDrafts())
+    calls.push(['Thread/get', { accountId: acct, '#ids': { resultOf: 'g', name: 'Email/get', path: '/list/*/threadId' } }, 't'],
+      ['Email/get', { accountId: acct, '#ids': { resultOf: 't', name: 'Thread/get', path: '/list/*/emailIds' }, properties: MEMBER_PROPS }, 'e']);
+  return calls;
+}
+function rowsOf(res) {
+  const q = one(res, 'q'), by = Object.fromEntries((one(res, 'g').list || []).map(m => [m.id, m]));
+  const threads = Object.fromEntries((one(res, 't').list || []).map(t => [t.id, t.emailIds]));
+  const members = Object.fromEntries((one(res, 'e').list || []).map(m => [m.id, m]));
+  const rows = (q.ids || []).map(id => by[id]).filter(Boolean).map(m => {
+    m.members = (threads[m.threadId] || [m.id]).map(id => members[id] || (id === m.id ? m : null)).filter(Boolean);
+    if (!m.members.length) m.members = [m];
+    return m;
+  });
+  return { q, rows };
+}
 async function loadList(keep) {
   const my = ++seq;
   if (!keep) { mails = []; total = 0; paintList(true); }
   try {
-    const res = await jmap(
-      ['Email/query', { accountId: acct, filter: filter(), sort: [{ property: 'receivedAt', isAscending: false }], position: 0, limit: Math.max(PAGE, keep ? mails.length : 0), calculateTotal: true }, 'q'],
-      ['Email/get', { accountId: acct, '#ids': { resultOf: 'q', name: 'Email/query', path: '/ids' }, properties: LIST_PROPS }, 'g']);
+    const res = await jmap(...listCalls(0, Math.max(PAGE, keep ? mails.length : 0)));
     if (my !== seq) return;
-    const q = one(res, 'q'), got = one(res, 'g').list || [];
-    const by = Object.fromEntries(got.map(m => [m.id, m]));
-    mails = (q.ids || []).map(id => by[id]).filter(Boolean);
+    const { q, rows } = rowsOf(res);
+    mails = rows;
     total = q.total != null ? q.total : mails.length;
-    for (const m of mails.slice(0, 20)) remember(view.box && byId[view.box] && byId[view.box].role === 'sent' ? m.to : m.from);
+    for (const m of mails.slice(0, 20)) remember(sentView() ? m.to : m.from);
     paintList();
+    // A conversation being read that grew, a reply come in, is read again.
+    if (open && thread.length) {
+      const r = mails.find(x => x.threadId === thread[0].threadId);
+      if (r && r.members.length !== thread.length) openMail(r.id, true);
+    }
   } catch (e) { if (my === seq) { paintList(); fail(e); } }
 }
 async function loadMore() {
@@ -442,13 +500,10 @@ async function loadMore() {
   loadingMore = true;
   const my = seq;
   try {
-    const res = await jmap(
-      ['Email/query', { accountId: acct, filter: filter(), sort: [{ property: 'receivedAt', isAscending: false }], position: mails.length, limit: PAGE }, 'q'],
-      ['Email/get', { accountId: acct, '#ids': { resultOf: 'q', name: 'Email/query', path: '/ids' }, properties: LIST_PROPS }, 'g']);
+    const res = await jmap(...listCalls(mails.length, PAGE));
     if (my !== seq) return;
-    const q = one(res, 'q'), by = Object.fromEntries((one(res, 'g').list || []).map(m => [m.id, m]));
     const have = new Set(mails.map(m => m.id));
-    for (const id of q.ids || []) if (by[id] && !have.has(id)) mails.push(by[id]);
+    for (const r of rowsOf(res).rows) if (!have.has(r.id)) mails.push(r);
     paintList();
   } catch (e) { fail(e); }
   finally { loadingMore = false; }
@@ -466,23 +521,35 @@ function paintList(loading) {
     R.append(el('div', { class: 'empty' }, ico(view.q ? 'search' : view.starred ? 'star' : 'inbox'), el('b', { text: view.q ? 'Nothing matches “' + view.q + '”' : 'Nothing here' }), el('span', { text: view.q ? 'Try other words, or a name or address.' : view.starred ? 'Star a message to find it here.' : 'New mail shows up here as it arrives.' })));
     return;
   }
-  const sentish = !view.q && !view.starred && byId[view.box] && ['sent', 'drafts'].includes(byId[view.box].role);
+  const sentish = sentView();
   for (const m of mails) R.append(rowOf(m, sentish));
   if (mails.length < total) R.append(el('div', { class: 'more', text: 'Loading more…' }));
 }
+// Who a conversation is between: one sender by name, several by their first names, the user as "me".
+function people(ms) {
+  const mine = me.address.toLowerCase(), seen = new Map();
+  for (const x of ms) for (const a of (x.from || []).slice(0, 1)) {
+    const k = a.email.toLowerCase();
+    if (!seen.has(k)) seen.set(k, k === mine ? 'me' : a.name || a.email);
+  }
+  const names = [...seen.values()];
+  if (names.length < 2) return names[0] || '(unknown sender)';
+  const short = names.map(n => n === 'me' ? n : n.includes('@') ? n.split('@')[0] : n.split(/\s+/)[0]);
+  return short.length > 3 ? short.slice(0, 2).join(', ') + ' … ' + short[short.length - 1] : short.join(', ');
+}
 function rowOf(m, sentish) {
-  const k = m.keywords || {}, seen = k.$seen, flagged = k.$flagged;
-  const party = sentish ? (m.to && m.to.length ? 'To: ' + whoShort(m.to) : '(no recipient)') : whoShort(m.from) || '(unknown sender)';
+  const ms = m.members && m.members.length ? m.members : [m];
+  const unread = ms.some(x => !(x.keywords || {}).$seen), flagged = ms.some(x => (x.keywords || {}).$flagged);
+  const party = sentish ? (m.to && m.to.length ? 'To: ' + whoShort(m.to) : '(no recipient)') : people(ms);
   const boxName = view.q || view.starred ? Object.keys(m.mailboxIds || {}).map(id => byId[id]).filter(b => b && b.role !== 'inbox').map(boxLabel)[0] : '';
   const tick = el('div', { class: 'tick', onclick: e => { e.stopPropagation(); togglePick(m.id); } }, ico('check'));
-  const r = el('div', { class: 'row' + (seen ? '' : ' unread') + (open === m.id ? ' on' : '') + (picked.has(m.id) ? ' ck' : ''), 'data-id': m.id, onclick: () => openMail(m.id) },
+  return el('div', { class: 'row' + (unread ? ' unread' : '') + (open === m.id ? ' on' : '') + (picked.has(m.id) ? ' ck' : ''), 'data-id': m.id, onclick: () => openMail(m.id) },
     el('div', { class: 'avw' }, avatar(sentish ? (m.to || [])[0] : (m.from || [])[0]), tick),
     el('div', { class: 'rm' },
-      el('div', { class: 'r1' }, el('span', { class: 'who', text: party }), el('span', { class: 'when', text: short(m.receivedAt), title: full(m.receivedAt) })),
+      el('div', { class: 'r1' }, el('span', { class: 'who' }, party, ms.length > 1 ? el('span', { class: 'tn', text: String(ms.length) }) : null), el('span', { class: 'when', text: short(m.receivedAt), title: full(m.receivedAt) })),
       el('div', { class: 'r2' }, el('span', { class: 'subj', text: m.subject || '(no subject)' }), boxName ? el('span', { class: 'tag', text: boxName }) : null, m.hasAttachment ? ico('clip') : null),
       el('div', { class: 'r3', text: m.preview || '' })),
     ibtn('star', flagged ? 'Unstar' : 'Star', e => { e.stopPropagation(); star([m.id], !flagged); }, 'st' + (flagged ? ' on' : '')));
-  return r;
 }
 function paintBulk() {
   const B = $('#bulk'); B.textContent = '';
@@ -493,126 +560,162 @@ function paintBulk() {
     ibtn('star', 'Star', () => star(ids, true)), ibtn('folder', 'Move to', e => moveMenu(e.currentTarget, ids)), ibtn('trash', 'Delete', () => remove(ids)));
 }
 function togglePick(id) { if (picked.has(id)) picked.delete(id); else picked.add(id); paintList(); }
-function patchLocal(ids, fn) { for (const m of mails) if (ids.includes(m.id)) fn(m); if (openMsg && ids.includes(openMsg.id)) fn(openMsg); }
 
-// ─── acting on messages ─────────────────────────────────────────────────────
-async function update(ids, patch, after) {
+// ─── acting on conversations ────────────────────────────────────────────────
+const rowOfId = id => mails.find(m => m.id === id);
+// The messages rows stand for: every one of their conversations, or those in the mailbox shown where `here`.
+function memberIds(rowIds, here) {
+  const out = new Set();
+  for (const id of rowIds) {
+    const r = rowOfId(id);
+    for (const x of r && r.members ? r.members : [{ id, mailboxIds: {} }])
+      if (!here || view.q || view.starred || !view.box || (x.mailboxIds || {})[view.box]) out.add(x.id);
+    out.add(id);
+  }
+  return [...out];
+}
+function patchLocal(ids, fn) {
+  for (const m of mails) { if (ids.includes(m.id)) fn(m); for (const x of m.members || []) if (x !== m && ids.includes(x.id)) fn(x); }
+  for (const x of thread) if (ids.includes(x.id)) fn(x);
+}
+async function update(ids, patch) {
   const res = await jmap(['Email/set', { accountId: acct, update: Object.fromEntries(ids.map(id => [id, patch])) }, 'u']);
   setErrors(one(res, 'u'));
-  if (after) after();
 }
-async function markSeen(ids, on) {
+async function markSeen(rowIds, on, exact) {
+  const ids = exact ? rowIds : memberIds(rowIds, false);
   patchLocal(ids, m => { m.keywords = m.keywords || {}; if (on) m.keywords.$seen = true; else delete m.keywords.$seen; });
   paintList(); paintReaderBar();
   try { await update(ids, { 'keywords/$seen': on ? true : null }); await loadBoxes(); } catch (e) { fail(e); loadList(true); }
 }
-async function star(ids, on) {
+// A star goes on the conversation's newest message and comes off every one, as a conversation shows starred while any is.
+async function star(rowIds, on) {
+  const ids = on ? rowIds : memberIds(rowIds, false);
   patchLocal(ids, m => { m.keywords = m.keywords || {}; if (on) m.keywords.$flagged = true; else delete m.keywords.$flagged; });
   paintList(); paintReaderBar();
   try { await update(ids, { 'keywords/$flagged': on ? true : null }); if (view.starred && !on) loadList(true); } catch (e) { fail(e); loadList(true); }
 }
-async function move(ids, to, said) {
+async function move(rowIds, to, said) {
   try {
-    await update(ids, { mailboxIds: { [to]: true } });
-    dropFromList(ids);
+    await update(memberIds(rowIds, true), { mailboxIds: { [to]: true } });
+    dropFromList(rowIds);
     toast(said || 'Moved to ' + boxLabel(byId[to]));
     await loadBoxes();
   } catch (e) { fail(e); loadList(true); }
 }
-function dropFromList(ids) {
-  const at = open && ids.includes(open) ? mails.findIndex(m => m.id === open) : -1;
-  mails = mails.filter(m => !ids.includes(m.id)); total = Math.max(0, total - ids.length);
-  for (const id of ids) picked.delete(id);
-  if (at >= 0) { const next = mails[Math.min(at, mails.length - 1)]; open = null; openMsg = null; if (next && innerWidth > 900) openMail(next.id); else { document.body.classList.remove('reading'); paintReader(); } }
+function dropFromList(rowIds) {
+  const at = open && rowIds.includes(open) ? mails.findIndex(m => m.id === open) : -1;
+  mails = mails.filter(m => !rowIds.includes(m.id)); total = Math.max(0, total - rowIds.length);
+  for (const id of rowIds) picked.delete(id);
+  if (at >= 0) { const next = mails[Math.min(at, mails.length - 1)]; open = null; openMsg = null; thread = []; if (next && innerWidth > 900) openMail(next.id); else { document.body.classList.remove('reading'); paintReader(); } }
   paintList();
 }
-async function remove(ids) {
+async function remove(rowIds) {
   const trash = byRole.trash;
-  const inTrash = mails.filter(m => ids.includes(m.id)).every(m => trash && m.mailboxIds && m.mailboxIds[trash.id]);
+  const inTrash = rowIds.every(id => { const r = rowOfId(id); return trash && r && r.mailboxIds && r.mailboxIds[trash.id]; });
   if (!trash || inTrash) {
-    if (!await ask({ title: ids.length > 1 ? 'Delete ' + ids.length + ' messages for good?' : 'Delete this message for good?', text: 'It cannot be brought back.', ok: 'Delete', danger: true })) return;
-    try { const res = await jmap(['Email/set', { accountId: acct, destroy: ids }, 'd']); setErrors(one(res, 'd')); dropFromList(ids); toast('Deleted'); await loadBoxes(); } catch (e) { fail(e); }
+    if (!await ask({ title: rowIds.length > 1 ? 'Delete ' + rowIds.length + ' conversations for good?' : 'Delete this for good?', text: 'It cannot be brought back.', ok: 'Delete', danger: true })) return;
+    try { const res = await jmap(['Email/set', { accountId: acct, destroy: memberIds(rowIds, true) }, 'd']); setErrors(one(res, 'd')); dropFromList(rowIds); toast('Deleted'); await loadBoxes(); } catch (e) { fail(e); }
     return;
   }
-  await move(ids, trash.id, ids.length > 1 ? ids.length + ' messages moved to Trash' : 'Moved to Trash');
+  await move(rowIds, trash.id, rowIds.length > 1 ? rowIds.length + ' conversations moved to Trash' : 'Moved to Trash');
 }
-function moveMenu(at, ids) {
-  const here = mails.find(m => m.id === ids[0]);
+function moveMenu(at, rowIds) {
+  const here = rowOfId(rowIds[0]);
   const cur = here ? Object.keys(here.mailboxIds || {})[0] : '';
-  popup(at, [{ head: 'Move to' }, ...boxes.filter(b => b.id !== cur && b.role !== 'drafts').map(b => ({ icon: b.role && ROLE_ICON[b.role] || 'folder', label: boxLabel(b), fn: () => move(ids, b.id) }))]);
+  popup(at, [{ head: 'Move to' }, ...boxes.filter(b => b.id !== cur && b.role !== 'drafts').map(b => ({ icon: b.role && ROLE_ICON[b.role] || 'folder', label: boxLabel(b), fn: () => move(rowIds, b.id) }))]);
 }
 
 // ─── reading ────────────────────────────────────────────────────────────────
-async function openMail(id) {
+const FULL_PROPS = [...LIST_PROPS, 'cc', 'bcc', 'replyTo', 'sentAt', 'messageId', 'inReplyTo', 'references', 'textBody', 'htmlBody', 'attachments', 'bodyValues'];
+// The conversation's messages, oldest first, and which of them are open: the unread ones and the newest.
+let thread = [], expanded = new Set();
+async function openMail(id, quiet) {
   open = id; picked.clear();
   for (const r of document.querySelectorAll('.row')) r.classList.toggle('on', r.dataset.id === id);
   document.body.classList.add('reading');
-  const listed = mails.find(m => m.id === id);
-  if (listed && byId[Object.keys(listed.mailboxIds || {})[0]] && byId[Object.keys(listed.mailboxIds)[0]].role === 'drafts') { editDraft(id); return; }
-  $('#readp').textContent = ''; $('#readp').append(el('div', { class: 'blank' }, el('span', { text: 'Opening…' })));
+  const row = rowOfId(id);
+  if (inDrafts()) { editDraft(id); return; }
+  if (!quiet) { $('#readp').textContent = ''; $('#readp').append(el('div', { class: 'blank' }, el('span', { text: 'Opening…' }))); }
+  const ids = row && row.members && row.members.length ? row.members.map(x => x.id) : [id];
   try {
-    const res = await jmap(['Email/get', { accountId: acct, ids: [id], properties: [...LIST_PROPS, 'cc', 'bcc', 'replyTo', 'sentAt', 'messageId', 'inReplyTo', 'references', 'textBody', 'htmlBody', 'attachments', 'bodyValues'],
+    const res = await jmap(['Email/get', { accountId: acct, ids, properties: FULL_PROPS,
       bodyProperties: ['partId', 'blobId', 'size', 'name', 'type', 'charset', 'disposition', 'cid'], fetchTextBodyValues: true, fetchHTMLBodyValues: true, maxBodyValueBytes: 4000000 }, 'g']);
     if (open !== id) return;
-    openMsg = (one(res, 'g').list || [])[0];
-    if (!openMsg) { paintReader(); toast('That message is no longer there', 'bad'); return; }
+    const drafts = byRole.drafts;
+    thread = (one(res, 'g').list || []).filter(m => !(drafts && m.mailboxIds && m.mailboxIds[drafts.id]) || ids.length === 1).sort((a, b) => new Date(a.sentAt || a.receivedAt) - new Date(b.sentAt || b.receivedAt));
+    if (!thread.length) { openMsg = null; paintReader(); toast('That conversation is no longer there', 'bad'); return; }
+    openMsg = thread[thread.length - 1];
+    const keep = quiet ? expanded : new Set();
+    expanded = new Set([...keep].filter(x => thread.some(m => m.id === x)));
+    for (const m of thread) if (!(m.keywords || {}).$seen) expanded.add(m.id);
+    expanded.add(openMsg.id);
     paintReader();
-    if (!(openMsg.keywords || {}).$seen) markSeen([id], true);
+    const unseen = thread.filter(m => !(m.keywords || {}).$seen).map(m => m.id);
+    if (unseen.length) markSeen(unseen, true, true);
   } catch (e) { fail(e); }
 }
 function paintReaderBar() {
   const bar = $('#rbar'); if (!bar || !openMsg) return;
-  const m = openMsg, flagged = (m.keywords || {}).$flagged, junk = byRole.junk, inJunk = junk && m.mailboxIds && m.mailboxIds[junk.id];
+  const flagged = thread.some(m => (m.keywords || {}).$flagged), junk = byRole.junk, row = open;
+  const inJunk = junk && openMsg.mailboxIds && openMsg.mailboxIds[junk.id];
   bar.textContent = '';
-  const back = ibtn('left', 'Back to the list', () => { document.body.classList.remove('reading'); open = null; openMsg = null; paintList(); });
+  const back = ibtn('left', 'Back to the list', () => { document.body.classList.remove('reading'); open = null; openMsg = null; thread = []; paintList(); });
   back.id = 'backB';
-  bar.append(back);
-  bar.append(ibtn('reply', 'Reply  (r)', () => reply(m, false)), ibtn('replyall', 'Reply all  (a)', () => reply(m, true)), ibtn('forward', 'Forward  (f)', () => forward(m)),
+  bar.append(...[back, ibtn('reply', 'Reply  (r)', () => reply(openMsg, false)), ibtn('replyall', 'Reply all  (a)', () => reply(openMsg, true)), ibtn('forward', 'Forward  (f)', () => forward(openMsg)),
     el('div', { class: 'grow' }),
-    ibtn('star', flagged ? 'Unstar  (s)' : 'Star  (s)', () => star([m.id], !flagged), 'st' + (flagged ? ' on' : '')),
-    ibtn('mail', 'Mark as unread  (u)', () => { markSeen([m.id], false); document.body.classList.remove('reading'); }),
-    ibtn('folder', 'Move to', e => moveMenu(e.currentTarget, [m.id])),
-    junk && !inJunk ? ibtn('junk', 'Report junk', () => move([m.id], junk.id, 'Moved to Junk')) : null,
-    ibtn('trash', 'Delete  (#)', () => remove([m.id])),
-    ibtn('more', 'More', e => popup(e.currentTarget, [
-      inJunk && byRole.inbox ? { icon: 'inbox', label: 'Not junk', fn: () => move([m.id], byRole.inbox.id, 'Moved to Inbox') } : null,
-      { icon: 'download', label: 'Download message (.eml)', fn: () => { location.href = dl(m.id, (m.subject || 'message').replace(/[\\/:*?"<>|]+/g, ' ').slice(0, 80) + '.eml', 'message/rfc822'); } }
-    ])));
+    ibtn('star', flagged ? 'Unstar  (s)' : 'Star  (s)', () => star([row], !flagged), 'st' + (flagged ? ' on' : '')),
+    ibtn('mail', 'Mark as unread  (u)', () => { markSeen([row], false); document.body.classList.remove('reading'); }),
+    ibtn('folder', 'Move to', e => moveMenu(e.currentTarget, [row])),
+    junk && !inJunk ? ibtn('junk', 'Report junk', () => move([row], junk.id, 'Moved to Junk')) : null,
+    ibtn('trash', 'Delete  (#)', () => remove([row])),
+    inJunk && byRole.inbox ? ibtn('inbox', 'Not junk', () => move([row], byRole.inbox.id, 'Moved to Inbox')) : null].filter(Boolean));
 }
 function paintReader() {
   const R = $('#readp'); R.textContent = '';
-  const m = openMsg;
-  if (!m) {
-    R.append(el('div', { class: 'blank' }, el('div', { class: 'ring' }, ico('mail')), el('b', { text: mails.length ? 'Pick a message to read it' : 'Nothing selected' }),
+  if (!openMsg) {
+    R.append(el('div', { class: 'blank' }, el('div', { class: 'ring' }, ico('mail')), el('b', { text: mails.length ? 'Pick a conversation to read it' : 'Nothing selected' }),
       el('span', {}, 'Press ', el('span', { class: 'kbd', text: 'c' }), ' to write one, ', el('span', { class: 'kbd', text: '/' }), ' to search.')));
     return;
   }
+  const first = thread[0];
+  const box = byId[Object.keys(openMsg.mailboxIds || {})[0]];
+  const d = el('div', { class: 'rd' }, el('div', { class: 'rbar', id: 'rbar' }),
+    el('h1', {}, first.subject || openMsg.subject || '(no subject)', thread.length > 1 ? el('span', { class: 'tag', text: thread.length + ' messages' }) : null, box && box.role !== 'inbox' ? el('span', { class: 'tag', text: boxLabel(box) }) : null));
+  for (const m of thread) d.append(expanded.has(m.id) ? openCard(m) : shutCard(m));
+  R.append(d);
+  paintReaderBar();
+  if (thread.length > 1) { const last = d.querySelector('.msg:last-child'); if (last) setTimeout(() => last.scrollIntoView({ block: 'start' }), 0); } else R.scrollTop = 0;
+}
+function shutCard(m) {
+  const from = (m.from || [])[0];
+  return el('div', { class: 'msg shut', onclick: () => { expanded.add(m.id); paintReader(); } },
+    avatar(from), el('b', { text: nameOf(from) || '(unknown sender)' }), el('span', { class: 'pv', text: m.preview || '' }), el('span', { class: 'when', text: short(m.receivedAt), title: full(m.receivedAt) }));
+}
+function openCard(m) {
   const from = (m.from || [])[0];
   const rcp = [];
   if (m.to && m.to.length) rcp.push('to ' + who(m.to));
   if (m.cc && m.cc.length) rcp.push('cc ' + who(m.cc));
   if (m.bcc && m.bcc.length) rcp.push('bcc ' + who(m.bcc));
-  const box = byId[Object.keys(m.mailboxIds || {})[0]];
-  const d = el('div', { class: 'rd' },
-    el('div', { class: 'rbar', id: 'rbar' }),
-    el('h1', {}, m.subject || '(no subject)', box && box.role !== 'inbox' ? el('span', { class: 'tag', text: boxLabel(box) }) : null),
-    el('div', { class: 'hdr' }, avatar(from),
-      el('div', { class: 'who' }, el('b', { text: nameOf(from) || '(unknown sender)' }), from && from.name ? el('span', { class: 'addr', text: '<' + from.email + '>' }) : null, el('div', { class: 'rcp', text: rcp.join(' · ') })),
-      el('div', { class: 'when', text: full(m.sentAt || m.receivedAt) })));
+  const card = el('div', { class: 'msg' });
+  const head = el('div', { class: 'hdr', onclick: e => { if (thread.length > 1 && !e.target.closest('button,a')) { expanded.delete(m.id); paintReader(); } } }, avatar(from),
+    el('div', { class: 'who' }, el('div', { class: 'line' }, el('b', { text: nameOf(from) || '(unknown sender)' }), from && from.name ? el('span', { class: 'addr', text: '<' + from.email + '>' }) : null), el('div', { class: 'rcp', text: rcp.join(' · ') })),
+    el('div', { class: 'when', text: full(m.sentAt || m.receivedAt) }),
+    ibtn('reply', 'Reply', () => reply(m, false)),
+    ibtn('more', 'More', e => popup(e.currentTarget, [
+      { icon: 'replyall', label: 'Reply all', fn: () => reply(m, true) },
+      { icon: 'forward', label: 'Forward', fn: () => forward(m) },
+      '-',
+      { icon: 'mail', label: 'Mark this one unread', fn: () => markSeen([m.id], false, true) },
+      { icon: 'download', label: 'Download message (.eml)', fn: () => { location.href = dl(m.id, (m.subject || 'message').replace(/[\\/:*?"<>|]+/g, ' ').slice(0, 80) + '.eml', 'message/rfc822'); } }
+    ])));
+  card.append(head);
   const values = m.bodyValues || {};
   const cids = {};
   for (const p of m.attachments || []) if (p.cid) cids[p.cid.replace(/^<|>$/g, '').toLowerCase()] = dl(p.blobId, p.name || 'image', p.type);
   const html = (m.htmlBody || []).filter(p => p.type === 'text/html').map(p => (values[p.partId] || {}).value || '').join('');
   const text = (m.textBody || []).filter(p => p.type !== 'text/html').map(p => (values[p.partId] || {}).value || '').join('\n');
-  if (html.trim()) {
-    const allow = showImages.has(m.id) || showImages.has('*' + ((from && from.email) || ''));
-    const c = cleanHtml(html, allow, cids);
-    if (c.blocked && !allow)
-      d.append(el('div', { class: 'imgbar' }, ico('image'), el('span', { text: 'Remote images are hidden, so the sender cannot see when you read this.' }),
-        btn(null, 'Show images', () => { showImages.add(m.id); paintReader(); }),
-        from ? btn(null, 'Always from this sender', () => { showImages.add('*' + from.email); store.set('skl-mail-img', JSON.stringify([...showImages].filter(x => x.startsWith('*')))); paintReader(); }) : null));
-    d.append(el('div', { class: 'mbody' }, frame(c.doc)));
-  } else d.append(el('div', { class: 'mtext' }, linkify(text || m.preview || '')));
   const atts = (m.attachments || []).filter(p => !(p.cid && html.includes(p.cid.replace(/^<|>$/g, ''))) || p.disposition === 'attachment');
   if (atts.length) {
     const A = el('div', { class: 'atts' });
@@ -623,11 +726,40 @@ function paintReader() {
         el('div', { class: 'ti' }, isImg ? el('img', { src: url, alt: '' }) : ico(ICON[kind(p.name || '', p.type)] || 'file')),
         el('div', {}, el('div', { class: 'nm', text: p.name || 'attachment' }), el('div', { class: 'sz', text: human(p.size) }))));
     }
-    d.append(A);
+    card.append(A);
   }
-  R.append(d);
-  paintReaderBar();
-  R.scrollTop = 0;
+  if (html.trim()) {
+    const allow = showImages.has(m.id) || showImages.has('*' + ((from && from.email) || ''));
+    const c = cleanHtml(html, allow, cids);
+    if (c.blocked && !allow)
+      card.append(el('div', { class: 'imgbar' }, ico('image'), el('span', { text: 'Remote images are hidden, so the sender cannot see when you read this.' }),
+        btn(null, 'Show images', () => { showImages.add(m.id); paintReader(); }),
+        from ? btn(null, 'Always from this sender', () => { showImages.add('*' + from.email); store.set('skl-mail-img', JSON.stringify([...showImages].filter(x => x.startsWith('*')))); paintReader(); }) : null));
+    const f = frame(c.doc, true);
+    card.append(el('div', { class: 'mbody' }, f), f.quoteToggle);
+  } else {
+    const [mine, quoted] = splitQuote(text || m.preview || '');
+    const box = el('div', { class: 'mtext' }, linkify(mine));
+    card.append(box);
+    if (quoted) {
+      const q = el('div', { class: 'mtext quoted', hidden: true }, linkify(quoted));
+      card.append(el('button', { class: 'qt', title: 'Show the quoted text', onclick: e => { q.hidden = !q.hidden; e.currentTarget.classList.toggle('on', !q.hidden); } }, ico('more')), q);
+    }
+  }
+  return card;
+}
+// What a reply wrote, and what it quotes below it: from "On … wrote:", a forwarded or original message's marker, or
+// the run of "> " lines it ends with.
+function splitQuote(t) {
+  const lines = t.split('\n');
+  let at = lines.findIndex(l => /^\s*(On\s.{0,300}\swrote:|Am\s.{0,300}\sschrieb.{0,60}:|-{2,}\s*(Original|Forwarded) Message\s*-{2,}|From:\s.+\s<?\S+@\S+>?)\s*$/i.test(l));
+  if (at < 0) {
+    let i = lines.length;
+    while (i > 0 && (/^\s*>/.test(lines[i - 1]) || !lines[i - 1].trim())) i--;
+    if (i < lines.length && lines.slice(i).some(l => /^\s*>/.test(l))) at = i;
+  }
+  if (at <= 0) return [t, ''];
+  return [lines.slice(0, at).join('\n').replace(/\s+$/, ''), lines.slice(at).join('\n')];
 }
 
 // ─── writing ────────────────────────────────────────────────────────────────
@@ -824,9 +956,9 @@ document.addEventListener('keydown', e => {
   else if (openMsg && k === 'r') { e.preventDefault(); reply(openMsg, false); }
   else if (openMsg && k === 'a') { e.preventDefault(); reply(openMsg, true); }
   else if (openMsg && k === 'f') { e.preventDefault(); forward(openMsg); }
-  else if (openMsg && k === 's') { star([openMsg.id], !(openMsg.keywords || {}).$flagged); }
-  else if (openMsg && k === 'u') { markSeen([openMsg.id], false); }
-  else if (openMsg && (k === '#' || k === 'Delete')) { remove([openMsg.id]); }
+  else if (openMsg && open && k === 's') { star([open], !thread.some(m => (m.keywords || {}).$flagged)); }
+  else if (openMsg && open && k === 'u') { markSeen([open], false); }
+  else if (openMsg && open && (k === '#' || k === 'Delete')) { remove([open]); }
 });
 
 // ─── start ──────────────────────────────────────────────────────────────────

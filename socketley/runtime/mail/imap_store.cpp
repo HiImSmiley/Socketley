@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "imap_order.h"
 #include "mail_compose.h"
 #include "mail_instance.h"
 #include "mail_mailbox.h"
@@ -47,6 +48,21 @@ constexpr int64_t sync_ms = 2000;
 constexpr uint32_t filter_magic = 0x54464B53;   // "SKFT" as it lies in the file
 // The filters held for every user together, past which the least lately searched user's are let go until asked again.
 constexpr size_t filters_most_bytes = 64u << 20;
+
+std::string hex64(uint64_t v)
+{
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string out(16, '0');
+    for (int i = 15; i >= 0; --i, v >>= 4)
+        out[static_cast<size_t>(i)] = digits[v & 15];
+    return out;
+}
+
+// The journal's line giving a message its conversation.
+std::string thread_line(uint32_t uid, uint64_t thread, const std::string& folder)
+{
+    return "H " + std::to_string(uid) + " " + hex64(thread) + " " + folder + "\n";
+}
 
 uint32_t get32(const char* p)
 {
@@ -130,6 +146,95 @@ uint64_t imap_store::email_hash(std::string_view key)
     for (const unsigned char c : base)
         h = (h ^ c) * 1099511628211ull;
     return h;
+}
+
+uint64_t imap_store::thread_of(std::string_view header, std::string_view key)
+{
+    // FNV-1a over the root's Message-ID, the same for every message of the conversation on every shard; a message
+    // naming none is a conversation of its own, by its object's name as its email id is.
+    const std::string root = imap_order::thread_root(header);
+    if (root.empty())
+        return email_hash(key) | 1;
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char c : root)
+        h = (h ^ c) * 1099511628211ull;
+    return h | 1;
+}
+
+void imap_store::know_threads(const std::string& name, std::function<void()> done)
+{
+    refresh(name);
+    struct one
+    {
+        std::string folder, key;
+        uint32_t uid;
+        uint64_t size;
+        uint64_t thread;
+    };
+    struct job
+    {
+        std::vector<one> todo;
+        size_t next{0}, open{0}, left{0};
+        bool pumping{false}, finished{false};
+        std::function<void()> done;
+    };
+    auto j = std::make_shared<job>();
+    for (const auto& [n, f] : user(name).folders)
+        for (const auto& m : f->msgs)
+            if (!m.thread)
+                j->todo.push_back({n, m.key, m.uid, m.size, 0});
+    if (j->todo.empty())
+    {
+        done();
+        return;
+    }
+    j->left = j->todo.size();
+    j->done = std::move(done);
+    // What was read is logged in one go, a message another shard gave a conversation meanwhile kept as it is.
+    const auto finish = [this, name, j] {
+        j->finished = true;
+        mutate(name, [&](user_state& u, std::string& lines) {
+            for (const auto& t : j->todo)
+                if (t.thread)
+                    if (const auto it = u.folders.find(t.folder); it != u.folders.end())
+                        if (imap_message* m = it->second->by_uid(t.uid); m && !m->thread)
+                        {
+                            m->thread = t.thread;
+                            lines += thread_line(t.uid, t.thread, t.folder);
+                        }
+        });
+        j->done();
+    };
+    auto pump = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weak = pump;
+    // Eight headers asked for at once, as SORT and THREAD read ahead; one a cache answers at once is taken by the loop
+    // that asked, not by a call deeper into it.
+    *pump = [this, j, weak, finish, alive = m_alive] {
+        auto self = weak.lock();
+        if (!*alive || !self || j->pumping || j->finished)
+            return;
+        j->pumping = true;
+        while (j->next < j->todo.size() && j->open < 8)
+        {
+            const size_t i = j->next++;
+            ++j->open;
+            head(j->todo[i].key, j->todo[i].size, [j, i, self, alive](std::shared_ptr<const std::string> h) {
+                if (!*alive)
+                    return;
+                --j->open;
+                --j->left;
+                // A message that cannot be read now is left for the next time.
+                if (h)
+                    j->todo[i].thread = thread_of(*h, j->todo[i].key);
+                if (!j->pumping)
+                    (*self)();
+            });
+        }
+        j->pumping = false;
+        if (j->left == 0 && !j->finished)
+            finish();
+    };
+    (*pump)();
 }
 
 std::string imap_store::email_id(std::string_view key)
@@ -671,6 +776,15 @@ void imap_store::apply(user_state& u, std::string_view text, bool fresh)
                 ++f->version;
                 break;
             }
+            case 'H':
+            {
+                // H <uid> <thread> <folder>: the conversation a message is part of, which never changes.
+                const auto w = words(l, 2);
+                if (imap_folder* f = folder(l))
+                    if (imap_message* m = f->by_uid(static_cast<uint32_t>(num(w[0]))))
+                        m->thread = std::strtoull(std::string(w[1]).c_str(), nullptr, 16);
+                break;
+            }
             case 'K':
             {
                 // K <uid> <modseq> <folder>\t<keyword> ...: a message's keywords as they are now.
@@ -794,6 +908,8 @@ void imap_store::reload(user_state& u)
                 f->objectid = std::string(line.substr(2));
             else if (line[0] == 'T' || line[0] == 'L')
                 apply(u, std::string(line) + "\n", false);
+            else if (line[0] == 'H' && f && !f->msgs.empty())
+                f->msgs.back().thread = std::strtoull(std::string(line.substr(2)).c_str(), nullptr, 16);
             else if (line[0] == 'W' && f && !f->msgs.empty())
             {
                 // W <keyword> ...: the keywords of the message on the line before.
@@ -1003,6 +1119,9 @@ void imap_store::compact(const std::string& name, user_state& u)
                     text += " " + k;
                 text += "\n";
             }
+            // H <thread>: the conversation of the message on the line before.
+            if (m.thread)
+                text += "H " + hex64(m.thread) + "\n";
         }
     }
     for (const auto& [fname, entries] : u.meta)
@@ -2035,9 +2154,10 @@ void imap_store::put_made(std::string key, std::string data, std::function<void(
 }
 
 uint32_t imap_store::add_message(const std::string& name, const std::shared_ptr<imap_folder>& f, const std::string& key,
-                                 uint64_t size, int64_t date_ms, uint8_t flags, const std::vector<std::string>& keywords)
+                                 uint64_t size, int64_t date_ms, uint8_t flags, const std::vector<std::string>& keywords,
+                                 uint64_t thread)
 {
-    const auto uids = add_messages(name, f, {imap_message{0, key, size, date_ms, flags, true, 0, keywords}});
+    const auto uids = add_messages(name, f, {imap_message{0, key, size, date_ms, flags, true, 0, keywords, thread}});
     return uids.empty() ? 0 : uids.front();
 }
 
@@ -2062,7 +2182,8 @@ std::vector<uint32_t> imap_store::add_messages(const std::string& name, const st
                 }
             if (uid == 0)
             {
-                imap_message m{f->uidnext++, in.key, in.size, in.date_ms, in.flags, true, ++f->highestmodseq, in.keywords};
+                imap_message m{f->uidnext++, in.key,    in.size,    in.date_ms, in.flags,
+                               true,         ++f->highestmodseq, in.keywords, in.thread};
                 uid = m.uid;
                 lines += "A " + std::to_string(m.uid) + " " + std::to_string(m.flags) + " " + std::to_string(m.size) +
                          " " + std::to_string(m.date_ms) + " " + std::to_string(m.modseq) + " " + f->name + "\t" +
@@ -2074,6 +2195,8 @@ std::vector<uint32_t> imap_store::add_messages(const std::string& name, const st
                         lines += (i ? " " : "") + m.keywords[i];
                     lines += "\n";
                 }
+                if (m.thread)
+                    lines += thread_line(m.uid, m.thread, f->name);
                 u.used += m.size;
                 f->msgs.push_back(std::move(m));
             }
@@ -2275,7 +2398,7 @@ void imap_store::copy(const std::string& name, const std::shared_ptr<imap_folder
 }
 
 void imap_store::delivered(const std::string& name, const std::string& folder, const std::string& key, uint64_t size,
-                           int64_t date_ms)
+                           int64_t date_ms, uint64_t thread)
 {
     user_state& u = user(name);
     const std::string fname = canonical(folder);
@@ -2283,7 +2406,7 @@ void imap_store::delivered(const std::string& name, const std::string& folder, c
         return;
     const auto it = u.folders.find(fname);
     if (it != u.folders.end())
-        add_message(name, it->second, key, size, date_ms, flags_of_key(key));
+        add_message(name, it->second, key, size, date_ms, flags_of_key(key), {}, thread);
 }
 
 void imap_store::append(const std::string& name, const std::string& folder, std::string message, uint8_t flags,
@@ -2314,7 +2437,8 @@ void imap_store::append(const std::string& name, const std::string& folder, std:
             done(refusal::storage, 0, 0);
             return;
         }
-        const uint32_t uid = add_message(name, f, key, size, date_ms, flags, keywords);
+        const uint32_t uid =
+            add_message(name, f, key, size, date_ms, flags, keywords, thread_of(header_block(*bytes), key));
         if (uid == 0)
         {
             // Its folder went while it was written: the object goes too, rather than stay where nothing lists it.

@@ -548,6 +548,7 @@ std::string jmap_session::session_json(const request& rq) const
 
 void jmap_session::api(const request& rq)
 {
+    m_threads_ready = false;
     auto cs = std::make_shared<call_state>();
     json::json_policy policy;
     policy.max_depth = 32;

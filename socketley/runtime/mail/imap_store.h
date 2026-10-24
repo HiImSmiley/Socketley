@@ -47,6 +47,8 @@ struct imap_message
     uint64_t    modseq{1};
     // The keywords a client set on it ($Forwarded, $Junk, its own), as it gave them.
     std::vector<std::string> keywords;
+    // The conversation it is part of, a hash of its root's Message-ID (imap_order::thread_of); 0 until it is known.
+    uint64_t    thread{0};
 };
 
 // What STORE or APPEND asks of a message's keywords: none, these as they are, or these added or taken away.
@@ -202,7 +204,11 @@ public:
     // A message a delivery put into the bucket, given its UID now, so IDLE and every shard know of it at once and
     // its bytes count against the quota; the folder is made where a filter named one not there.
     void delivered(const std::string& user, const std::string& folder, const std::string& key, uint64_t size,
-                   int64_t date_ms);
+                   int64_t date_ms, uint64_t thread = 0);
+    // The conversation of a message whose header is `header`, never 0: its root's, or its own where it names none.
+    static uint64_t thread_of(std::string_view header, std::string_view key);
+    // Every message of a user given its conversation, those not yet known read for it, before `done`.
+    void know_threads(const std::string& user, std::function<void()> done);
     // A message put into a folder, as APPEND does.
     // Its answer is false with why: over the quota, no such folder, or the storage refused it.
     enum class refusal : uint8_t { none, quota, no_folder, storage };
@@ -287,7 +293,8 @@ private:
     // A message put into `f`, given the next UID under the lock and logged.
     // 0 where the folder went meanwhile, or the journal took no line.
     uint32_t add_message(const std::string& name, const std::shared_ptr<imap_folder>& f, const std::string& key,
-                         uint64_t size, int64_t date_ms, uint8_t flags, const std::vector<std::string>& keywords = {});
+                         uint64_t size, int64_t date_ms, uint8_t flags, const std::vector<std::string>& keywords = {},
+                         uint64_t thread = 0);
     // Messages put into `f` together, their UIDs in order under one lock and one write; empty where the folder went.
     std::vector<uint32_t> add_messages(const std::string& name, const std::shared_ptr<imap_folder>& f,
                                        const std::vector<imap_message>& ms);

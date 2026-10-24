@@ -17,6 +17,8 @@
 #   * a message sent from the page not reaching its recipients, a Bcc not reaching its own, or showing in the copy
 #   * an EventSource refused to the cookie, or not told of new mail
 #   * the entrance given no route to the webmail, or not serving the page through it
+#   * a reply not in the conversation it answers, Thread/get or collapseThreads not grouping it across mailboxes, or a
+#     conversation lost when the index's lines of it are, as an older binary's compaction drops them
 #   * --domain on a mail runtime without --web taken
 set -uo pipefail
 
@@ -229,6 +231,78 @@ es.close()
 check("the EventSource takes the cookie and tells of new mail", head.startswith(b"HTTP/1.1 200") and b"event: state" in seen, seen[:300])
 PY
 )
+
+# Conversations: what a reply's References tie together is one Thread across mailboxes, collapsed in a query, kept
+# across a restart, and read again for messages whose index lines lost it, as an older binary's compaction drops them.
+thread_check() {
+python3 - "$W" "$PI" "$P" "$1" "$T/thread" <<'PY'
+import base64, http.client, json, smtplib, sys, time, urllib.parse
+W, PI, P, phase, saved = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
+def check(name, ok, info=""):
+    print(("ok " if ok else "bad ") + name + ("" if ok else ": " + str(info)[:400].replace("\n", " ")))
+H = {"Authorization": "Basic " + base64.b64encode(b"alice:alicepassword1").decode(), "X-Forwarded-Proto": "https",
+     "X-Forwarded-For": "192.0.2.50", "Content-Type": "application/json"}
+USING = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail", "urn:ietf:params:jmap:submission"]
+A = "a" + base64.urlsafe_b64encode(b"alice").decode().rstrip("=")
+def api(*calls):
+    c = http.client.HTTPConnection("127.0.0.1", W, timeout=20)
+    c.request("POST", "/jmap/api", json.dumps({"using": USING, "methodCalls": list(calls)}), H)
+    r = c.getresponse(); d = r.read(); c.close()
+    out = {}
+    if r.status == 200:
+        for name, args, cid in json.loads(d)["methodResponses"]:
+            out.setdefault(cid, args)
+    return out
+boxes = {b.get("role"): b["id"] for b in api(["Mailbox/get", {"accountId": A}, "b"])["b"]["list"]}
+def find(subject):
+    for _ in range(100):
+        r = api(["Email/query", {"accountId": A, "filter": {"subject": subject}}, "q"],
+                ["Email/get", {"accountId": A, "#ids": {"resultOf": "q", "name": "Email/query", "path": "/ids"}, "properties": ["threadId", "subject"]}, "g"])
+        if r.get("g", {}).get("list"):
+            return r["g"]["list"]
+        time.sleep(0.1)
+    return []
+if phase == "first":
+    s = smtplib.SMTP("127.0.0.1", P)
+    s.sendmail("eve@else.test", ["alice@example.test"], "From: Eve <eve@else.test>\r\nTo: alice@example.test\r\nSubject: plans\r\n"
+               "Message-ID: <t1@else.test>\r\nDate: Wed, 21 Oct 2026 09:00:00 +0000\r\n\r\nshall we?\r\n")
+    s.sendmail("eve@else.test", ["alice@example.test"], "From: Eve <eve@else.test>\r\nTo: alice@example.test\r\nSubject: Re: plans\r\n"
+               "Message-ID: <t3@else.test>\r\nIn-Reply-To: <t2@example.test>\r\nReferences: <t1@else.test> <t2@example.test>\r\n"
+               "Date: Wed, 21 Oct 2026 11:00:00 +0000\r\n\r\nyes\r\n")
+    s.quit()
+    t1, t3 = find("plans"), find("Re: plans")
+    r = api(["Email/set", {"accountId": A, "create": {"r": {"mailboxIds": {boxes["sent"]: True}, "keywords": {"$seen": True},
+        "from": [{"email": "alice@example.test"}], "to": [{"email": "eve@else.test"}], "subject": "Re: plans",
+        "messageId": ["t2@example.test"], "inReplyTo": ["t1@else.test"], "references": ["t1@else.test"],
+        "textBody": [{"partId": "t", "type": "text/plain"}], "bodyValues": {"t": {"value": "maybe"}}}}}, "c"])
+    mine = r.get("c", {}).get("created", {}).get("r", {})
+    ids = {m["threadId"] for m in t1 + t3 if "plans" in m["subject"]} | {mine.get("threadId")}
+    check("a message, a reply filed in Sent and the answer to it are one conversation", len(ids) == 1 and None not in ids, (t1, t3, mine))
+    tid = ids.pop() if len(ids) == 1 else ""
+    open(saved, "w").write(tid)
+    r = api(["Thread/get", {"accountId": A, "ids": [tid]}, "t"])
+    check("Thread/get gives all three, across Inbox and Sent, oldest first",
+          len((r.get("t", {}).get("list") or [{}])[0].get("emailIds", [])) == 3, r)
+    r = api(["Email/query", {"accountId": A, "filter": {"text": "plans"}, "collapseThreads": True}, "q"],
+            ["Email/query", {"accountId": A, "filter": {"text": "plans"}}, "a"])
+    check("collapsed, a query answers the conversation once", r.get("q", {}).get("collapseThreads") is True and
+          len(r["q"]["ids"]) == 1 and len(r.get("a", {}).get("ids", [])) == 3, r)
+else:
+    tid = open(saved).read()
+    r = api(["Thread/get", {"accountId": A, "ids": [tid]}, "t"])
+    check("after a restart, with the index's thread lines gone, the conversation is read again as it was",
+          len((r.get("t", {}).get("list") or [{}])[0].get("emailIds", [])) == 3, (tid, r))
+PY
+}
+tally < <(thread_check first)
+"$BIN" stop m >/dev/null 2>&1
+idx=$(find "$HOME" -path '*.imap/alice*' -type f ! -name '*.fts' ! -name '*.lock' 2>/dev/null)
+had=$(cat $idx 2>/dev/null | grep -c '^H ')
+sed -i '/^H /d' $idx 2>/dev/null
+[ "$had" -gt 0 ] && ok "the index keeps each message's conversation ($had lines)" || bad "the index keeps each message's conversation" "$idx"
+"$BIN" start m >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$W" || bad "the webmail port listens again" "$(tail -3 "$SOCKETLEY_DLOG")"
+tally < <(thread_check again)
 
 # The entrance's route to the webmail, and the page through it.
 route=$(find "$HOME" -path '*.dns*' -name 'routes-*' -exec cat {} + 2>/dev/null | grep '^route webmail.example.test ')

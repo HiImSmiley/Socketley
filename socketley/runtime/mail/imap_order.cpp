@@ -218,6 +218,14 @@ void read(entry& e, std::string_view header)
         e.references.erase(e.references.begin(), e.references.end() - 100);
 }
 
+std::string thread_root(std::string_view header)
+{
+    for (const char* name : {"References", "In-Reply-To", "Message-ID"})
+        if (const auto ids = ids_in(header_value(header, name)); !ids.empty())
+            return ids.front();
+    return {};
+}
+
 bool parse_keys(const std::vector<std::string>& words, std::vector<key>& out)
 {
     out.clear();
